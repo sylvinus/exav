@@ -1,0 +1,48 @@
+[package]
+name = "exav-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core engine for the exav malware scanner: signature-database parsing, pattern/hash matching, YARA support, and a sandboxed bytecode interpreter."
+
+[dependencies]
+aho-corasick.workspace = true
+# fast substring search (SIMD memmem) for the bytecode file_find/memstr APIs
+memchr = "2"
+# hashing (RustCrypto)
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+# executable parsing (PE/ELF/Mach-O)
+goblin = "0.10"
+# x86 instruction decoder for the bytecode disasm_x86 API; decode-only,
+# pure-Rust, no native codegen (keeps the no-JIT security posture).
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info"] }
+# archive/container extraction (its own crate)
+exav-unpack = { path = "../exav-unpack", version = "0.1.0" }
+# CVD containers are gzip'd tar; used directly by the db loader (cvd.rs)
+flate2 = "1"
+tar = "0.4"
+# fuzzy hashing
+tlsh2 = { version = "0.4", features = ["diff"] }
+# HTTP(S) range-request backend (optional)
+ureq = { version = "2", optional = true }
+daachorse = "3"
+serde = { version = "1.0.228", features = ["derive"] }
+rmp-serde = "1.3.1"
+regex = "1.12.4"
+# Full YARA rule support (ClamAV loads .yar/.yara by default, so a drop-in must
+# too). The `pulley` feature makes yara-x execute compiled rules on wasmtime's
+# Pulley *interpreter* — no native JIT / no runtime codegen (W^X) — preserving
+# the no-JIT security posture. (Cranelift is still linked but never executed.)
+yara-x = { version = "1.5.0", features = ["pulley"] }
+
+[features]
+# Enables the HTTP(S) range-request seekable backend (HttpRangeReader).
+http = ["dep:ureq"]
+
+[dev-dependencies]
+tempfile = "3"
+# only for building test ZIPs in unit tests
+zip = { version = "2", default-features = false, features = ["deflate"] }

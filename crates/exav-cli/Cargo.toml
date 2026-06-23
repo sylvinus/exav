@@ -1,0 +1,22 @@
+[package]
+name = "exav-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Command-line interface and scanning daemon for the exav malware scanner (clamscan-compatible)."
+
+[[bin]]
+name = "exav"
+path = "src/main.rs"
+
+[dependencies]
+exav-core = { path = "../exav-core", version = "0.1.0", features = ["http"] }
+clap.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true
+libc = "0.2.186"
+regex = "1.12.4"
+
+[dev-dependencies]
+tempfile = "3"

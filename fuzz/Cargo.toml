@@ -1,0 +1,65 @@
+[package]
+name = "exav-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+exav-core = { path = "../crates/exav-core" }
+
+[[bin]]
+name = "analyze"
+path = "fuzz_targets/analyze.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack"
+path = "fuzz_targets/unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cvd"
+path = "fuzz_targets/cvd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pe"
+path = "fuzz_targets/pe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filetype"
+path = "fuzz_targets/filetype.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigs"
+path = "fuzz_targets/sigs.rs"
+test = false
+doc = false
+bench = false
+
+# Keep fuzz binaries debuggable while optimized.
+[profile.release]
+debug = 1
+
+[workspace]
+
+[[bin]]
+name = "bytecode"
+path = "fuzz_targets/bytecode.rs"
+test = false

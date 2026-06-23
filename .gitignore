@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+# downloaded signature DB and built caches (see `make cache`)
+/exav-db/
+*.cache
+*.exavcache
+# real-malware corpus must never be committed
+/corpus/
+*.malware
+/yara-x/
+# internal strategy notes — never commit
+/tmp/
+/.claude/

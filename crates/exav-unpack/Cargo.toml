@@ -1,0 +1,27 @@
+[package]
+name = "exav-unpack"
+description = "Bounded, memory-safe archive/container extraction for the exav scanner."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# fast substring search (locating the UPX PackHeader magic)
+memchr = "2"
+# archive / compression formats
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+lzma-rs = "0.3.0"
+bzip2-rs = "0.1.2"
+cab = "0.6.0"
+# structured documents that contain embedded files
+cfb = "0.14.0"
+mail-parser = "0.11.4"
+lopdf = "0.41.0"
+# 7-Zip and LHA/LZH
+sevenz-rust2 = "0.20.2"
+delharc = "0.6.1"
+
+[dev-dependencies]

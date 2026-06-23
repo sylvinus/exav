@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/exav-core", "crates/exav-cli", "crates/exav-unpack"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sylvinus/exav"
+rust-version = "1.85"
+
+[workspace.dependencies]
+aho-corasick = "1.1"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+walkdir = "2.5"
+
+# Catch integer overflow in release too: on hostile input a silent wraparound
+# could bypass a size/offset budget. A panic here is contained by the
+# per-file catch_unwind in the CLI.
+[profile.release]
+overflow-checks = true

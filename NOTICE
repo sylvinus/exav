@@ -1,0 +1,137 @@
+exav — THIRD-PARTY NOTICES
+==========================
+
+exav itself is licensed under the MIT License (see the LICENSE file).
+
+The exav binary statically links a number of third-party Rust crates. Those
+crates retain their own licenses; the binary distribution must carry their
+notices. This file enumerates the major components and reproduces the notice
+texts that the BSD-3-Clause and Apache-2.0-WITH-LLVM-exception licenses require.
+
+This is a hand-maintained summary of the principal components, not a byte-exact
+dump of every transitive crate's license. To regenerate a complete, per-crate
+attribution list from the resolved dependency graph, install one of:
+
+    cargo install cargo-about        # then: cargo about generate about.hbs
+    cargo install cargo-bundle-licenses
+
+and run it against this workspace. `cargo deny check licenses` (run in CI)
+confirms every dependency resolves to a permissive license on the allowlist in
+deny.toml.
+
+Versions below reflect Cargo.lock at the time of writing.
+
+
+-------------------------------------------------------------------------------
+1. yara-x — BSD-3-Clause
+-------------------------------------------------------------------------------
+
+Components: yara-x 1.18.0, yara-x-macros, yara-x-parser, yara-x-proto and the
+related yara-x-* crates.
+Upstream: https://github.com/VirusTotal/yara-x
+Copyright (c) VirusTotal and contributors.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+  3. Neither the name of the copyright holder nor the names of its contributors
+     may be used to endorse or promote products derived from this software
+     without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Other BSD-3-Clause components linked by exav (same 3-clause terms above, with
+their respective copyright holders): encoding_rs, subtle, tlsh2.
+
+Other BSD-2-Clause components: mach2, zerocopy.
+
+
+-------------------------------------------------------------------------------
+2. wasmtime / cranelift / pulley stack — Apache-2.0 WITH LLVM-exception
+-------------------------------------------------------------------------------
+
+Components (pulled in transitively via yara-x's WebAssembly backend):
+wasmtime 43.0.2, wasmtime-environ and the wasmtime-internal-* crates,
+cranelift-* 0.130.2 (codegen, frontend, entity, bforest, ...),
+pulley-interpreter / pulley-macros 43.0.2, regalloc2 0.15.1, target-lexicon.
+Upstream: https://github.com/bytecodealliance/wasmtime
+Copyright (c) The Wasmtime / Bytecode Alliance project authors.
+
+Licensed under the Apache License, Version 2.0, with the LLVM exception. You may
+obtain a copy of the Apache License at http://www.apache.org/licenses/LICENSE-2.0
+
+The LLVM exception text that accompanies these crates:
+
+    ---- LLVM Exceptions to the Apache 2.0 License ----
+
+    As an exception, if, as a result of your compiling your source code, portions
+    of this Software are embedded into an Object form of such source code, you
+    may redistribute such embedded portions in such Object form without complying
+    with the conditions of Sections 4(a), 4(b) and 4(d) of the License.
+
+    In addition, if you combine or link compiled forms of this Software with
+    software that is licensed under the GPLv2 ("Combined Software") and if a
+    court of competent jurisdiction determines that the patent provision (Section
+    3), the indemnity provision (Section 9) or other Section of the License
+    conflicts with the conditions of the GPLv2, you may retroactively and
+    prospectively choose to deem waived or otherwise exclude such Section(s) of
+    the License, but only in their entirety and only with respect to the Combined
+    Software.
+
+The Apache License, Version 2.0, requires retaining the copyright, patent,
+trademark, and attribution notices from the source, and reproducing any NOTICE
+text that upstream distributes. See the upstream LICENSE/NOTICE files in the
+wasmtime repository for the full text.
+
+
+-------------------------------------------------------------------------------
+3. ISC-licensed components
+-------------------------------------------------------------------------------
+
+ring 0.17.14 (Apache-2.0 AND ISC), rustls 0.23.41, rustls-webpki, untrusted.
+These carry ISC permission-notice terms; reproduce the copyright notice and the
+permission/disclaimer notice in distributions.
+
+
+-------------------------------------------------------------------------------
+4. MIT / Apache-2.0 dual-licensed components (the bulk of the graph)
+-------------------------------------------------------------------------------
+
+The majority of exav's dependencies are dual-licensed "MIT OR Apache-2.0" (or a
+superset including Unlicense / 0BSD / Zlib), so the MIT or Apache terms apply at
+the distributor's choice. Notable examples:
+
+  aho-corasick, memchr, daachorse        pattern matching / Aho-Corasick
+  serde, rmp-serde                       serialization
+  clap                                   CLI parsing
+  sha1, sha2, md-5, digest (RustCrypto)  hashing
+  flate2, miniz_oxide, xz2, bzip2,       decompression
+    sevenz-rust2, zip
+  walkdir                                directory traversal
+  regex                                  path-filter regexes
+  libc                                   syscall bindings (daemon)
+
+RustCrypto crates are MIT OR Apache-2.0. Zlib-licensed components present:
+miniz_oxide, zlib-rs, tinyvec, foldhash. Unicode-3.0: the ICU / unicode-ident
+crates. Other permissive licenses in the graph: CC0-1.0 and MIT-0 (ppmd-rust via
+sevenz-rust2), CDLA-Permissive-2.0 (webpki-roots, TLS root store), bzip2-1.0.6
+(libbz2-rs-sys).
+
+Full MIT and Apache-2.0 license texts are widely available and are reproduced in
+each crate's source distribution; the exav LICENSE file contains the MIT text.
