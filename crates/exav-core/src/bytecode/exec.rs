@@ -369,7 +369,7 @@ struct Machine<'a> {
     /// construction, so it costs nothing in the hot path when off.
     trace: bool,
     /// Opt-in (`EXAV_BC_FN=<idx>`) per-instruction value trace of one function,
-    /// for clean-room debugging of a divergent computation. `None` when off.
+    /// for debugging a divergent computation. `None` when off.
     trace_fn: Option<usize>,
 }
 
@@ -665,7 +665,11 @@ impl<'a> Machine<'a> {
     }
     fn write_region(&mut self, p: i64, bytes: &[u8]) {
         for (i, &b) in bytes.iter().enumerate() {
-            self.store_int(compose(ptr_region(p), ptr_off(p) + i as u32), 1, b as i64);
+            self.store_int(
+                compose(ptr_region(p), ptr_off(p).wrapping_add(i as u32)),
+                1,
+                b as i64,
+            );
         }
     }
 

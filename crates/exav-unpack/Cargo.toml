@@ -7,21 +7,52 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# typed error type
+thiserror = "2"
 # fast substring search (locating the UPX PackHeader magic)
 memchr = "2"
 # archive / compression formats
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-tar = "0.4"
+# `default-features = false` drops `tar`'s `xattr` feature (extended-attribute
+# *restore* on disk extraction) — we extract to memory and never restore xattrs,
+# so it's unused. This removes the `rustix` + `linux-raw-sys` syscall crates
+# entirely (~8,600 `unsafe` ops, the single largest source in the dep tree).
+tar = { version = "0.4", default-features = false }
 lzma-rs = "0.3.0"
 bzip2-rs = "0.1.2"
 cab = "0.6.0"
 # structured documents that contain embedded files
 cfb = "0.14.0"
 mail-parser = "0.11.4"
-lopdf = "0.41.0"
-# 7-Zip and LHA/LZH
-sevenz-rust2 = "0.20.2"
+# PDF: read-only stream extraction. pdf-rs (`pdf`) is depth-bounded against the
+# nested-object stack overflow that lopdf has (RUSTSEC-2026-0187) and pulls no
+# `rand`/`getrandom` — so extraction stays fully deterministic and RNG-free.
+pdf = "0.10.0"
+# 7-Zip: keep the decompression codecs (+ `compress`, the LZMA encoder used by
+# tests) but drop `aes256` — encrypted-archive support we can't use without a
+# password, and the only thing in the 7z path that pulls crypto + `getrandom`.
+sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
 delharc = "0.6.1"
+# ARJ archives (pure-Rust, MIT)
+unarj-rs = "0.2.1"
+# Pure-Rust crypto for decrypting password-known encrypted archive members
+# (ZIP ZipCrypto + WinZip AES). DECRYPTION needs only a cipher + a KDF, no RNG,
+# so none of these pull `getrandom` (verified) — the hard no-getrandom default
+# build is preserved. We do NOT enable the `zip` crate's `aes-crypto`/encryption
+# features, which would pull `getrandom` for salt/IV generation we never do.
+aes = "0.8"
+hmac = "0.12"
+sha1 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+constant_time_eq = "0.3"
+
+[features]
+# Verify RAR5-decompressed output against the header CRC-32 (debug assert).
+# Off by default; enabled by the rar5_check example/tests.
+rar5-crc-check = []
 
 [dev-dependencies]
+# Reference PPMd7 (var.H) encoder, used only to validate the vendored PPMd7
+# model in `formats/ppmd7` against a known-good 7z-coder stream (CC0-1.0/MIT-0).
+ppmd-rust = "1"

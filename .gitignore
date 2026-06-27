@@ -1,4 +1,6 @@
-/target
+# build artifacts at the root and in any per-crate workspace (the wasm crate
+# builds its own `crates/exav-unpack-wasm/target`)
+target/
 **/*.rs.bk
 Cargo.lock.orig
 # downloaded signature DB and built caches (see `make cache`)
@@ -12,3 +14,7 @@ Cargo.lock.orig
 # internal strategy notes — never commit
 /tmp/
 /.claude/
+# local secrets (API keys, e.g. MalwareBazaar Auth-Key) — never commit
+.env.local
+.env*.local
+.env

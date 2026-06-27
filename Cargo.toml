@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/exav-core", "crates/exav-cli", "crates/exav-unpack"]
-exclude = ["fuzz"]
+members = ["crates/exav-core", "crates/exav-cli", "crates/exav-unpack", "crates/exav-unpack-cli"]
+exclude = ["fuzz", "crates/exav-unpack-wasm"]
 
 [workspace.package]
 version = "0.1.0"

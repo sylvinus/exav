@@ -1,0 +1,15 @@
+[package]
+name = "exav-unpack-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Memory-safe universal archive extractor CLI (zip, rar, 7z, cab, arj, lha, tar, gz, xz, bz2, iso, cpio, ar, xar, ole, pdf, email, upx) built on exav-unpack."
+
+[[bin]]
+name = "exav-unpack"
+path = "src/main.rs"
+
+[dependencies]
+exav-unpack = { path = "../exav-unpack", version = "0.1.0" }

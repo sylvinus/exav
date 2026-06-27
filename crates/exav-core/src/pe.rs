@@ -372,6 +372,126 @@ pub fn embedded_pe_offsets(data: &[u8]) -> Vec<usize> {
     out
 }
 
+/// Offsets of ELF images embedded at a **non-zero** offset (a validated
+/// `\x7fELF` identification header). Linux file-infectors and droppers append or
+/// embed ELF payloads the same way Windows ones embed PE; carving them lets the
+/// engine re-type the payload as ELF so `Target:6` and ELF-specific signatures
+/// match at the embedded offset. Validated (class/data/version + a plausible
+/// `e_type`) so a coincidental `\x7fELF` byte run is not carved. The image at
+/// offset 0, if any, is handled by the normal scan and skipped.
+pub fn embedded_elf_offsets(data: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if data.len() < 0x14 {
+        return out;
+    }
+    let mut from = 1usize; // skip a top-level image at offset 0
+    while out.len() < MAX_EMBEDDED_PE {
+        let Some(rel) = memchr::memmem::find(&data[from..], b"\x7fELF") else {
+            break;
+        };
+        let off = from + rel;
+        from = off + 1;
+        if off + 18 > data.len() {
+            break;
+        }
+        let class = data[off + 4]; // EI_CLASS: 1=32-bit, 2=64-bit
+        let endian = data[off + 5]; // EI_DATA: 1=LE, 2=BE
+        let version = data[off + 6]; // EI_VERSION: 1
+        if !matches!(class, 1 | 2) || !matches!(endian, 1 | 2) || version != 1 {
+            continue;
+        }
+        // e_type at offset 16 (2 bytes, endianness per EI_DATA): REL/EXEC/DYN/CORE.
+        let etype = if endian == 1 {
+            u16::from_le_bytes([data[off + 16], data[off + 17]])
+        } else {
+            u16::from_be_bytes([data[off + 16], data[off + 17]])
+        };
+        if matches!(etype, 1 | 2 | 3 | 4) {
+            out.push(off);
+        }
+    }
+    out
+}
+
+/// A Mach-O `cputype` we accept when validating a fat/universal header (used to
+/// tell a real fat Mach-O from a Java `.class`, which shares the `CA FE BA BE`
+/// magic). x86/x86_64/arm/arm64/arm64_32/ppc/ppc64.
+fn is_macho_cputype(ct: u32) -> bool {
+    matches!(
+        ct,
+        7 | 0x0100_0007 | 12 | 0x0100_000C | 0x0200_000C | 18 | 0x0100_0012
+    )
+}
+
+/// Offsets of Mach-O images embedded at a **non-zero** offset. macOS malware is
+/// commonly carried inside cross-platform droppers/archives; carving lets the
+/// engine re-type the payload so Mach-O signatures match at the embedded offset.
+/// Handles thin images (32/64-bit, both byte orders) and fat/universal images,
+/// each validated (thin: a sane `filetype` + `ncmds`; fat: `nfat_arch` range and
+/// a real `cputype` for the first arch) so a coincidental magic byte run — in
+/// particular a Java `.class`, which also begins `CA FE BA BE` — is not carved.
+/// The image at offset 0, if any, is handled by the normal scan and skipped.
+pub fn embedded_macho_offsets(data: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if data.len() < 0x20 {
+        return out;
+    }
+    // (magic bytes as stored on disk, is_big_endian)
+    const THIN: [([u8; 4], bool); 4] = [
+        ([0xCE, 0xFA, 0xED, 0xFE], false), // MH_MAGIC    (32-bit), LE host
+        ([0xCF, 0xFA, 0xED, 0xFE], false), // MH_MAGIC_64 (64-bit), LE host
+        ([0xFE, 0xED, 0xFA, 0xCE], true),  // MH_CIGAM    (32-bit), BE host
+        ([0xFE, 0xED, 0xFA, 0xCF], true),  // MH_CIGAM_64 (64-bit), BE host
+    ];
+    let rd_u32 = |o: usize, be: bool| -> u32 {
+        let b = [data[o], data[o + 1], data[o + 2], data[o + 3]];
+        if be {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        }
+    };
+    for (magic, be) in THIN {
+        let mut from = 1usize; // skip a top-level image at offset 0
+        while out.len() < MAX_EMBEDDED_PE {
+            let Some(rel) = memchr::memmem::find(&data[from..], &magic) else {
+                break;
+            };
+            let off = from + rel;
+            from = off + 1;
+            if off + 28 > data.len() {
+                break;
+            }
+            let filetype = rd_u32(off + 12, be); // MH_OBJECT..MH_KEXT_BUNDLE
+            let ncmds = rd_u32(off + 16, be);
+            if (1..=11).contains(&filetype) && (1..=10_000).contains(&ncmds) {
+                out.push(off);
+            }
+        }
+    }
+    // Fat/universal: magic is always big-endian on disk (`CA FE BA BE`).
+    let mut from = 1usize;
+    while out.len() < MAX_EMBEDDED_PE {
+        let Some(rel) = memchr::memmem::find(&data[from..], b"\xCA\xFE\xBA\xBE") else {
+            break;
+        };
+        let off = from + rel;
+        from = off + 1;
+        if off + 28 > data.len() {
+            break;
+        }
+        let nfat = u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        let cputype0 =
+            u32::from_be_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+        if (1..=64).contains(&nfat) && is_macho_cputype(cputype0) {
+            out.push(off);
+        }
+    }
+    out.sort_unstable();
+    out.truncate(MAX_EMBEDDED_PE);
+    out
+}
+
 /// `(raw_size, section_bytes)` for each PE section, for `.mdb`/`.msb`
 /// section-hash matching. The caller computes whatever digests it needs (so
 /// SHA can be skipped when no `.msb` signatures are loaded). Empty if `data`
@@ -401,6 +521,57 @@ pub fn section_slices(data: &[u8]) -> Vec<(u64, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_macho_carved_and_java_rejected() {
+        // A 64-bit LE Mach-O executable header (MH_MAGIC_64 = CF FA ED FE) at a
+        // non-zero offset.
+        let mut macho = vec![0u8; 0x40];
+        macho[..4].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]);
+        macho[12..16].copy_from_slice(&2u32.to_le_bytes()); // filetype = MH_EXECUTE
+        macho[16..20].copy_from_slice(&20u32.to_le_bytes()); // ncmds
+        let mut blob = vec![0x90u8; 200];
+        blob.extend_from_slice(&macho);
+        assert_eq!(embedded_macho_offsets(&blob), vec![200]);
+
+        // A Java class file shares the fat magic CA FE BA BE but has a large
+        // pseudo-`nfat_arch` / non-Mach-O cputype, so it must NOT be carved.
+        let mut java = vec![0x11u8; 64];
+        java[..4].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        java[4..8].copy_from_slice(&0x0000_0034u32.to_be_bytes()); // minor/major = Java 8
+        let mut jblob = vec![0u8; 100];
+        jblob.extend_from_slice(&java);
+        assert!(embedded_macho_offsets(&jblob).is_empty());
+    }
+
+    #[test]
+    fn embedded_elf_carved_and_validated() {
+        // A 64-bit LE ELF executable header embedded after some prefix bytes.
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // class 64
+        elf[5] = 1; // little-endian
+        elf[6] = 1; // version
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = EXEC
+        let mut buf = vec![0xAA; 100];
+        buf.extend_from_slice(&elf);
+        assert_eq!(embedded_elf_offsets(&buf), vec![100]);
+        // A bare `\x7fELF` with a junk identification header must NOT be carved.
+        let mut junk = vec![0xAA; 50];
+        junk.extend_from_slice(b"\x7fELF\xff\xff\xff and random text after");
+        assert!(embedded_elf_offsets(&junk).is_empty());
+        // An ELF at offset 0 is left to the normal scan (not re-carved).
+        assert!(embedded_elf_offsets(&elf).is_empty());
+    }
+
+    #[test]
+    fn embedded_pe_offsets_no_panic_on_tiny_input() {
+        // Regression: `&data[1..]` panicked on an empty/sub-header buffer.
+        for n in 0..0x41 {
+            assert!(embedded_pe_offsets(&vec![b'M'; n]).is_empty() || n >= 0x40);
+        }
+        assert!(embedded_pe_offsets(b"").is_empty());
+    }
 
     /// Build a minimal PE32+ with one `.text` section holding `section`.
     fn minimal_pe(section: &[u8]) -> Vec<u8> {

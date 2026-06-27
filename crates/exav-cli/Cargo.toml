@@ -10,8 +10,20 @@ description = "Command-line interface and scanning daemon for the exav malware s
 name = "exav"
 path = "src/main.rs"
 
+[features]
+default = ["yara"]
+# Full YARA rule matching (yara-x). ON by default — it's pure-Rust. Disable with
+# `--no-default-features` for a much smaller build (~146 fewer crates: drops the
+# wasmtime/Cranelift/rsa/bincode subtree).
+yara = ["exav-core/yara"]
+# HTTP(S) URL/range scanning (scan an `http(s)://` argument + the daemon
+# `SCANURL` command). OFF by default so the standard build is 100% pure-Rust and
+# links no TLS stack — `ureq → rustls → ring` is the only C/asm in the tree.
+# Build with `--features http` to enable it (see the dependency audit).
+http = ["exav-core/http"]
+
 [dependencies]
-exav-core = { path = "../exav-core", version = "0.1.0", features = ["http"] }
+exav-core = { path = "../exav-core", version = "0.1.0", default-features = false }
 clap.workspace = true
 anyhow.workspace = true
 walkdir.workspace = true

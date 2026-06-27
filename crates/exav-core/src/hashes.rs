@@ -33,8 +33,13 @@ struct SortedTable<K> {
     /// (offset, len) into `names`, parallel to `keys`.
     spans: Vec<(u32, u32)>,
     names: String,
+    /// Per-entry provenance (parallel to `keys`): whether the signature came from
+    /// an unofficial (non-`.cvd`) database. The clean name is stored in `names`;
+    /// the `.UNOFFICIAL` suffix is applied by the report layer (compat mode).
+    #[serde(default)]
+    unofficial: Vec<bool>,
     #[serde(skip)]
-    pending: Vec<(K, String)>,
+    pending: Vec<(K, String, bool)>,
 }
 
 impl<K> Default for SortedTable<K> {
@@ -43,14 +48,15 @@ impl<K> Default for SortedTable<K> {
             keys: Vec::new(),
             spans: Vec::new(),
             names: String::new(),
+            unofficial: Vec::new(),
             pending: Vec::new(),
         }
     }
 }
 
 impl<K: Ord + Clone> SortedTable<K> {
-    fn insert(&mut self, key: K, name: &str) {
-        self.pending.push((key, name.to_string()));
+    fn insert(&mut self, key: K, name: &str, unofficial: bool) {
+        self.pending.push((key, name.to_string(), unofficial));
     }
 
     fn len(&self) -> usize {
@@ -68,6 +74,7 @@ impl<K: Ord + Clone> SortedTable<K> {
         p.sort_by(|a, b| a.0.cmp(&b.0));
         self.keys = Vec::with_capacity(p.len());
         self.spans = Vec::with_capacity(p.len());
+        self.unofficial = Vec::with_capacity(p.len());
         self.names = String::new();
         let mut i = 0;
         while i < p.len() {
@@ -78,15 +85,20 @@ impl<K: Ord + Clone> SortedTable<K> {
             let off = self.names.len() as u32;
             self.names.push_str(&p[j].1);
             self.spans.push((off, p[j].1.len() as u32));
+            self.unofficial.push(p[j].2);
             self.keys.push(p[j].0.clone());
             i = j + 1;
         }
     }
 
-    fn get(&self, key: &K) -> Option<&str> {
+    /// Return `(clean_name, unofficial)` for `key`.
+    fn get(&self, key: &K) -> Option<(&str, bool)> {
         let i = self.keys.binary_search(key).ok()?;
         let (off, len) = self.spans[i];
-        Some(&self.names[off as usize..(off + len) as usize])
+        // `unofficial` may be empty when loading an older cache (serde default);
+        // treat a missing entry as official.
+        let unofficial = self.unofficial.get(i).copied().unwrap_or(false);
+        Some((&self.names[off as usize..(off + len) as usize], unofficial))
     }
 }
 
@@ -115,13 +127,13 @@ macro_rules! digest_table {
                 self.sized.finalize();
             }
             /// `size == None` means the `*` wildcard.
-            fn insert(&mut self, key: [u8; $n], size: Option<u64>, name: &str) {
+            fn insert(&mut self, key: [u8; $n], size: Option<u64>, name: &str, unofficial: bool) {
                 match size {
-                    Some(s) => self.sized.insert((s, key), name),
-                    None => self.any.insert(key, name),
+                    Some(s) => self.sized.insert((s, key), name, unofficial),
+                    None => self.any.insert(key, name, unofficial),
                 }
             }
-            fn get(&self, key: &[u8; $n], size: u64) -> Option<&str> {
+            fn get(&self, key: &[u8; $n], size: u64) -> Option<(&str, bool)> {
                 self.sized.get(&(size, *key)).or_else(|| self.any.get(key))
             }
         }
@@ -182,6 +194,13 @@ impl HashDb {
     /// (32=MD5, 40=SHA1, 64=SHA256). `SIZE` may be `*` (any) or a byte count
     /// that the file length must match. Call [`HashDb::finalize`] when done.
     pub fn extend_from_text(&mut self, text: &str) {
+        self.extend_from_text_prov(text, false);
+    }
+
+    /// As [`HashDb::extend_from_text`], tagging every parsed entry with `unofficial`
+    /// provenance (set for signatures from a non-`.cvd` database). The clean name
+    /// is stored; `.UNOFFICIAL` is applied at report time in compat mode.
+    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -193,17 +212,17 @@ impl HashDb {
             match hash.len() {
                 32 => {
                     if let Some(k) = hex_array::<16>(hash) {
-                        self.md5.insert(k, size, name);
+                        self.md5.insert(k, size, name, unofficial);
                     }
                 }
                 40 => {
                     if let Some(k) = hex_array::<20>(hash) {
-                        self.sha1.insert(k, size, name);
+                        self.sha1.insert(k, size, name, unofficial);
                     }
                 }
                 64 => {
                     if let Some(k) = hex_array::<32>(hash) {
-                        self.sha256.insert(k, size, name);
+                        self.sha256.insert(k, size, name, unofficial);
                     }
                 }
                 _ => {}
@@ -211,23 +230,23 @@ impl HashDb {
         }
     }
 
-    /// Look up computed digests for a file of `size` bytes; returns the
-    /// matching signature name. A sized signature matches only at that exact
-    /// length; a `*` signature matches any length.
-    pub fn lookup(&self, digests: &Digests, size: u64) -> Option<String> {
+    /// Look up computed digests for a file of `size` bytes; returns the matching
+    /// signature's `(clean_name, unofficial)`. A sized signature matches only at
+    /// that exact length; a `*` signature matches any length.
+    pub fn lookup(&self, digests: &Digests, size: u64) -> Option<(String, bool)> {
         if let Some(k) = hex_array::<16>(&digests.md5) {
-            if let Some(n) = self.md5.get(&k, size) {
-                return Some(n.to_string());
+            if let Some((n, u)) = self.md5.get(&k, size) {
+                return Some((n.to_string(), u));
             }
         }
         if let Some(k) = hex_array::<20>(&digests.sha1) {
-            if let Some(n) = self.sha1.get(&k, size) {
-                return Some(n.to_string());
+            if let Some((n, u)) = self.sha1.get(&k, size) {
+                return Some((n.to_string(), u));
             }
         }
         if let Some(k) = hex_array::<32>(&digests.sha256) {
-            if let Some(n) = self.sha256.get(&k, size) {
-                return Some(n.to_string());
+            if let Some((n, u)) = self.sha256.get(&k, size) {
+                return Some((n.to_string(), u));
             }
         }
         None
@@ -274,6 +293,12 @@ impl SectionHashDb {
     /// field is the size, the second the hash — the opposite field order from
     /// `.hdb`, so this does not reuse [`parse_hash_line`].
     pub fn extend_from_text(&mut self, text: &str) {
+        self.extend_from_text_prov(text, false);
+    }
+
+    /// As [`SectionHashDb::extend_from_text`], tagging each entry's `unofficial`
+    /// provenance.
+    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -300,17 +325,17 @@ impl SectionHashDb {
             match hash.len() {
                 32 => {
                     if let Some(k) = hex_array::<16>(hash) {
-                        self.md5.insert(k, size, name);
+                        self.md5.insert(k, size, name, unofficial);
                     }
                 }
                 40 => {
                     if let Some(k) = hex_array::<20>(hash) {
-                        self.sha1.insert(k, size, name);
+                        self.sha1.insert(k, size, name, unofficial);
                     }
                 }
                 64 => {
                     if let Some(k) = hex_array::<32>(hash) {
-                        self.sha256.insert(k, size, name);
+                        self.sha256.insert(k, size, name, unofficial);
                     }
                 }
                 _ => {}
@@ -318,21 +343,22 @@ impl SectionHashDb {
         }
     }
 
-    /// Look up a section by its raw size and computed digests.
-    pub fn lookup(&self, size: u64, digests: &Digests) -> Option<String> {
+    /// Look up a section by its raw size and computed digests; returns the
+    /// matching signature's `(clean_name, unofficial)`.
+    pub fn lookup(&self, size: u64, digests: &Digests) -> Option<(String, bool)> {
         if let Some(k) = hex_array::<16>(&digests.md5) {
-            if let Some(n) = self.md5.get(&k, size) {
-                return Some(n.to_string());
+            if let Some((n, u)) = self.md5.get(&k, size) {
+                return Some((n.to_string(), u));
             }
         }
         if let Some(k) = hex_array::<20>(&digests.sha1) {
-            if let Some(n) = self.sha1.get(&k, size) {
-                return Some(n.to_string());
+            if let Some((n, u)) = self.sha1.get(&k, size) {
+                return Some((n.to_string(), u));
             }
         }
         if let Some(k) = hex_array::<32>(&digests.sha256) {
-            if let Some(n) = self.sha256.get(&k, size) {
-                return Some(n.to_string());
+            if let Some((n, u)) = self.sha256.get(&k, size) {
+                return Some((n.to_string(), u));
             }
         }
         None
@@ -414,10 +440,23 @@ pub fn section_digests(data: &[u8], want_sha: bool) -> Digests {
 /// Compute digests over a byte slice (used for already-buffered content
 /// such as extracted archive entries).
 pub fn digests_of(data: &[u8]) -> Digests {
+    // Single pass: feed each cache-resident chunk to all three hashers at once,
+    // rather than three independent full passes over `data`. For large buffers
+    // (e.g. a big archive member) three passes evict the buffer from cache
+    // between each, tripling memory traffic; chunking keeps each ~16 KiB slice
+    // hot in L1/L2 across md5+sha1+sha256. Output is byte-identical.
+    let mut md5 = Md5::new();
+    let mut sha1 = Sha1::new();
+    let mut sha256 = Sha256::new();
+    for chunk in data.chunks(16 * 1024) {
+        md5.update(chunk);
+        sha1.update(chunk);
+        sha256.update(chunk);
+    }
     Digests {
-        md5: encode_hex(&Md5::digest(data)),
-        sha1: encode_hex(&Sha1::digest(data)),
-        sha256: encode_hex(&Sha256::digest(data)),
+        md5: encode_hex(&md5.finalize()),
+        sha1: encode_hex(&sha1.finalize()),
+        sha256: encode_hex(&sha256.finalize()),
     }
 }
 
@@ -454,7 +493,7 @@ mod tests {
         let n = "malware".len() as u64;
         db.extend_from_text(&format!("{}:*:Test.Malware\n", d.md5));
         db.finalize();
-        assert_eq!(db.lookup(&d, n).as_deref(), Some("Test.Malware"));
+        assert_eq!(db.lookup(&d, n).map(|(n, _)| n).as_deref(), Some("Test.Malware"));
         assert!(db.lookup(&digests_of(b"clean"), 5).is_none());
     }
 
@@ -465,7 +504,7 @@ mod tests {
         let d = digests_of(b"malware");
         db.extend_from_text(&format!("{}:7:Test.Sized\n", d.md5));
         db.finalize();
-        assert_eq!(db.lookup(&d, 7).as_deref(), Some("Test.Sized")); // size matches
+        assert_eq!(db.lookup(&d, 7).map(|(n, _)| n).as_deref(), Some("Test.Sized")); // size matches
         assert!(db.lookup(&d, 8).is_none()); // same hash, wrong size -> miss
     }
 
@@ -475,7 +514,7 @@ mod tests {
         let d = digests_of(b"payload");
         db.extend_from_text(&format!("{}:*:Test.BySha256\n", d.sha256));
         db.finalize();
-        assert_eq!(db.lookup(&d, 7).as_deref(), Some("Test.BySha256"));
+        assert_eq!(db.lookup(&d, 7).map(|(n, _)| n).as_deref(), Some("Test.BySha256"));
     }
 
     #[test]
@@ -492,12 +531,12 @@ mod tests {
         db.finalize();
         assert!(db.wants_sha());
         // exact size+md5
-        assert_eq!(db.lookup(4096, &s).as_deref(), Some("Sig.Sized"));
+        assert_eq!(db.lookup(4096, &s).map(|(n, _)| n).as_deref(), Some("Sig.Sized"));
         // wrong size, not a wildcard entry -> miss
         assert!(db.lookup(512, &s).is_none());
         // wildcard size matches any size (md5 and sha both registered for `other`)
         assert!(matches!(
-            db.lookup(12345, &other).as_deref(),
+            db.lookup(12345, &other).map(|(n, _)| n).as_deref(),
             Some("Sig.AnySize") | Some("Sig.BySha")
         ));
         // unrelated content -> miss

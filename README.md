@@ -8,7 +8,14 @@ exav loads ClamAV's own signature databases (`.cvd`/`.cld`, `.ndb`/`.ldb`/`.hdb`
 
 ClamAV has a long-standing large-file limitation: files over ~2 GB are read but scanned as **zero bytes** and still reported **`OK` / clean** (as of ClamAV 1.5, Dec 2025) — a *silent* clean verdict on a file that wasn't actually inspected. exav exists to close that gap.
 
-exav's core invariant: **never report a file clean unless it was actually scanned.** If a limit prevents a full scan, it says so (`LIMITS-EXCEEDED`) — it never silently returns `OK`.
+exav's core invariant: **never report a file clean unless it was actually scanned.** A scanner's limits are an attack surface — anything that makes it *stop looking* is a bypass an adversary will reach for — so exav treats them as load-bearing security properties:
+
+1. **A detection always beats a limit.** A signature match is reported `FOUND`, never downgraded because some *other* part of the input tripped a budget.
+2. **Never refuse by size without scanning.** A file over `--max-scan-size` isn't skipped wholesale — the flat pattern/hash core still runs over the in-budget bytes, so a payload in the scanned prefix is still caught (otherwise `cat malware huge.pad > evil` would be a one-line bypass).
+3. **Not-fully-scanned is never clean.** Anything exav couldn't fully examine gets a distinct non-clean verdict, never a silent `OK`:
+   - **`LIMITS-EXCEEDED`** — a resource limit (size/ratio/recursion/scan-bytes) stopped the scan.
+   - **`UNSCANNABLE`** — a container was recognised but couldn't be decoded (unsupported codec, e.g. a RAR solid/multi-volume stream).
+   - **`PASSWORD-PROTECTED`** — an encrypted member; *actionable* — re-scan with a password supplied.
 
 ```console
 # Built in: only the EICAR test signature. Load a real database for real coverage.
@@ -40,11 +47,11 @@ purpose.
 |---|---|---|
 | Files > 2 GB | reads them, scans **zero bytes**, reports `OK` | scanned in constant memory, any size |
 | Can't fully scan a file | silently `OK` | explicit `LIMITS-EXCEEDED` — **never** a false `OK` |
-| Engine safety | C (the 32-bit-overflow / parser-CVE class) | Rust — memory-safe by construction, audited `unsafe` only at the OS boundary |
+| Engine safety | C (the 32-bit-overflow / parser-CVE class) | Rust — safe-Rust engine + parsers; residual `unsafe` only in audited compression/crypto/SIMD deps and syscalls (being driven down) |
 | YARA rules | restricted subset (no modules, ≤64 strings/rule) | near-full YARA via yara-x, **on by default** |
 | YARA execution | n/a | bytecode **interpreter** (Pulley) — no runtime JIT / no W^X pages |
 | Scanning S3 / streams | download to a temp file first | stream from stdin / pipe / HTTP range — no temp file |
-| `.cbc` bytecode sigs | bundled JIT/interpreter | from-scratch sandboxed interpreter, no `unsafe`, step-capped |
+| `.cbc` bytecode sigs | bundled JIT/interpreter | from-scratch safe-Rust interpreter — no native codegen (W^X), step-capped |
 | License | GPLv2 | MIT |
 | Distribution | system packages | single static binary |
 
@@ -116,7 +123,20 @@ path (the daemon scans the file directly, any size), and `INSTREAM` chunks feed
 straight into the constant-memory scanner — a 4 GiB stream adds only a **flat
 ~3 MiB to the daemon's working set** regardless of size (on top of the
 already-loaded signature database). A limit that prevents a full scan is reported as
-`ERROR`/`LIMITS-EXCEEDED`, never a silent `OK`.
+`ERROR`/`LIMITS-EXCEEDED` (or `UNSCANNABLE`/`PASSWORD-PROTECTED`), never a silent `OK`.
+
+**Worker pool & per-scan kill (`--workers N`, Unix).** By default the daemon runs
+a **prefork pool of one worker process per CPU core** (`--workers 0` forces the
+older in-process thread model). Workers are forked *after* the DB loads, so they
+share the signature database copy-on-write (no re-load); each handles one scan at
+a time under **kernel-enforced per-job limits** — `--max-scan-time` (wall-clock,
+default 120 s), `--max-scan-memory` (RLIMIT_AS, default 2 G), and CPU time — and
+is recycled every `--max-jobs-per-worker` scans (default 1000) to bound leaks.
+This is the only way to *safely* hard-kill a scan that gets stuck inside a
+dependency: a runaway worker is `SIGKILL`ed and respawned without touching the
+rest of the pool (a thread model fundamentally can't do this). It's the last line
+of a layered defense — deterministic in-core caps (scan-byte/ratio/recursion)
+fire first, in milliseconds; the pool is the backstop for the residual tail.
 
 ### Prebuilt cache
 
@@ -139,7 +159,7 @@ input).
 - **Constant-memory streaming core** — Aho-Corasick multi-pattern matching + MD5/SHA1/SHA256 hashing in a single forward pass, matching across buffer boundaries, on inputs larger than RAM.
 - **ClamAV signature formats**: `.ndb` byte signatures **including wildcards** (`??`, nibble `a?`/`?a`, `*`, `{n}`/`{n-m}` gaps, `(aa|bb)` alternation, `!(...)` negation), `.ldb` **logical signatures** (full boolean expressions incl. grouped match-counts `(0|1|2)>2,3`, plus `i`/`w`/`a` subsig modifiers and offset prefixes), `.hdb`/`.hsb` whole-file hashes, `.mdb`/`.mdu` **PE section hashes**, `.cdb` **container-metadata signatures**, `.fdb`/`.imp` fuzzy/imphash sets, **`EP`/section-relative offsets**, `.fp`/`.ign` allowlists, and `.cvd`/`.cld` containers. On a live ClamAV `daily.cvd` exav loads and matches **~99.8% of its signatures** (355,407 of 356,208); the rest — PCRE subsignatures (~640) and bytecode — are skipped (see Limitations) and counted, never silently ignored.
 - **YARA rule support** via [yara-x](https://github.com/VirusTotal/yara-x) (on by default — `yara-x` is a hard dependency of the core engine): `.yar`/`.yara` rule files load alongside ClamAV signatures and match in the same scan.
-- **Recursive unpacking** (the separate `exav-unpack` crate) of zip / gzip / tar / **xz / bzip2 / cab / 7z / ISO (CD001) / LHA** archives **and structured documents — OLE2 (legacy Office/MSI streams), PDF (object streams, FlateDecode), and MIME email (decoded attachments/parts)** — all pure-Rust, with **decompression-bomb defenses** (output-byte, ratio, file-count, recursion-depth budgets) — a bomb is `LIMITS-EXCEEDED`, never `OK`. **UPX-packed executables** are also walked (NRV2B + stored methods only — see Limitations).
+- **Recursive unpacking** (the separate `exav-unpack` crate) of zip / gzip / tar / **xz / bzip2 / cab / 7z / ISO (CD001) / LHA / ARJ / RAR (RAR3 LZ+PPMd, RAR5 LZ) / ar (.deb) / cpio (RPM) / xar (.pkg)** archives **and structured documents — OLE2 (legacy Office/MSI streams), PDF (object streams, FlateDecode), and MIME email (decoded attachments/parts)** — all pure-Rust, with **decompression-bomb defenses** (output-byte, ratio, file-count, recursion-depth, and cumulative scan-byte budgets) — a bomb is `LIMITS-EXCEEDED`, never `OK`; a member with an unsupported codec or encryption is `UNSCANNABLE`/`PASSWORD-PROTECTED`, never silently dropped. **UPX-packed executables** are walked with **all UCL methods + LZMA + DEFLATE** (NRV2B/NRV2D/NRV2E/LZMA/DEFLATE). **Embedded executables** appended/carved inside other files are detected too — **PE, ELF, and Mach-O** images at non-zero offsets are located and re-scanned in their own type context.
 - **Structural heuristics** (`--heuristics`): PE section entropy, packer detection, suspicious-import flags, **imphash**, **TLSH** fuzzy matching, and a static **ML feature pipeline** with a transparent baseline scorer.
 - **Content-based file typing** (magic bytes, never extension-trust).
 - **HTTP(S) range-request backend** (`http` feature, on in the CLI): scan an `http(s)://` object — including a public/presigned S3 URL — by fetching only the byte ranges touched. For a ZIP that means the central directory plus the members actually scanned, stopping at the first detection, so a 50 GB archive isn't downloaded.
@@ -180,19 +200,30 @@ This is early. Known gaps, none of which silently affect a verdict:
 - **Scan throughput on large inputs against the full DB.** Much improved (longest-literal anchors cut spurious verification; logical-sig expressions are parsed once at load; clean files skip the logical pass), but scanning very large binaries against the full signature set can still be slower than ClamAV; further matcher tuning is ongoing.
 - The ML scorer is a **transparent heuristic baseline**, not a trained classifier (the `Model` trait is ready for a real EMBER-trained model).
 - imphash skips ordinal-only imports (minor VirusTotal-interop nuance).
-- Unpacks zip/gzip/tar/xz/bzip2/cab/7z/ISO/LHA + OLE2/PDF/MIME-email; **RAR is pending**, as is **VBA-macro decompression** (OLE2 streams are extracted raw, so the compressed macro source isn't yet exposed to signatures) and PDF filters beyond FlateDecode.
-- **UPX unpacking currently supports the NRV2B and stored methods only.** NRV2E (the UPX default), NRV2D, and LZMA are detected but **not yet decompressed** — for those, the UPX walk stops and the packed payload is still pattern/hash scanned in place (never silently cleared).
+- Unpacks zip/gzip/tar/xz/bzip2/cab/7z/ISO/LHA/ARJ/ar/cpio/xar + RAR + OLE2/PDF/MIME-email. **RAR3 LZ + PPMd and RAR5 LZ are decoded** (PPMd byte-exact validated; RAR5 has no PPMd — it was removed from the format). **RAR solid / multi-volume / RAR7 algo-v1 (big-dictionary) members are not decoded** — reported `UNSCANNABLE`, never silently cleared. **VBA-macro decompression** (OLE2 streams are extracted raw, so the compressed macro source isn't yet exposed to signatures) and PDF filters beyond FlateDecode are still pending.
+- **Encrypted archives/documents** are detected and reported `PASSWORD-PROTECTED`, never a silent clean. **ZIP decryption is implemented** — WinZip **AES-128/192/256** and legacy **ZipCrypto** members are decrypted and scanned when the password is supplied via `--password` (repeatable) or a ClamAV **`.pwdb`** database; without the right password they stay `PASSWORD-PROTECTED`. The decryption is pure-Rust (no `getrandom`). **Still detect-only** (flagged, not yet decrypted): **7z AES**, **RAR AES**, and **PDF/Office** native encryption — the password pool is threaded but those decryptors are pending.
 - Parsers are memory-safe (Rust), panic-isolated per file, and fuzzed (`cargo-fuzz`, see `fuzz/`). Continuous fuzzing (e.g. OSS-Fuzz) is still recommended before high-assurance production use.
 
 ## Security
 
 exav parses hostile input. See [`SECURITY.md`](SECURITY.md) for the threat model and the hardening: bounded (budget-before-allocation) extraction, in-memory-only unpacking, the never-report-clean-unless-scanned invariant, `overflow-checks` in release, per-file panic isolation, fuzz targets for every parser, and `cargo audit` / `cargo deny` in CI.
 
+**On `unsafe`.** exav's own scanning and extraction code is safe Rust (`exav-unpack` is moving to a crate-wide `#![forbid(unsafe_code)]`), and it runs **no C, no UnRAR, and no native JIT** — the historical AV remote-code-execution classes. It is **not** zero-`unsafe`, though: the residual lives in audited, widely-used dependency *primitives* (compression and crypto SIMD code, and OS syscalls), not in attacker-driven parsing logic. The posture is: **minimize** it (drop deps we don't need — e.g. `tar`'s `xattr`, which removed the largest syscall-`unsafe` source), **contain** it (per-file panic isolation; a prefork worker-process pool that `SIGKILL`s a corrupted worker; the WASM build sandboxes the extractor entirely), and **detect** bugs in it (fuzzing + Miri). Reviewing and driving down dependency `unsafe` is an explicit ongoing goal (see the roadmap).
+
 ## Roadmap
 
 - **Now → next**: signature-matching performance · **broader bytecode coverage** (trigger-gated execution is live — see [`docs/BYTECODE.md`](docs/BYTECODE.md); remaining work is the `disasm_x86`/PDF/codec host APIs and differential validation vs `clamscan`) · PCRE subsigs · extended/continuous fuzzing and the >10 GB no-silent-skip CI suite.
 - **v2**: trained static-ML model, broader fuzzy/similarity, more file-type parsers (LNK, OneNote), RAR and VBA-macro decompression.
 - **v3 (optional)**: QEMU/KVM dynamic detonation — a separate, heavyweight feature, only if demand warrants.
+
+### Hardening TODO: review & drive down dependency `unsafe`
+
+Our own code is safe Rust, but dependencies still carry `unsafe`. Goal: review **all** of it and shrink the reachable surface.
+- **Audit** every production dependency's `unsafe` (e.g. `cargo geiger`), categorising by kind (syscall/FFI · SIMD/perf · decode tables · containers · parsers/decompressors) and by whether it's reachable from a scan path with hostile input.
+- **Drop** deps we don't need (done: `tar` `xattr` → removed `rustix`/`linux-raw-sys`; candidates: `iced-x86` disasm, the `rustfft`/`rustdct` DCT, `sevenz-rust2` PPMd — feature-gate each behind its capability).
+- **Make safe** what we can: prefer portable/no-SIMD builds of compression/crypto where the speed cost is acceptable, and vendor-then-make-safe (our RAR PPMd decoder is zero-`unsafe`, and `exav-unpack` carries `#![forbid(unsafe_code)]`); apply the same forbid to every crate that can hold it.
+- **Reuse our own safe code** instead of an `unsafe` dependency where we already have an equivalent: **7z PPMd** decodes through `sevenz-rust2`'s `ppmd-rust` (146 `unsafe` ops), but our own RAR `ppmd7` is the same PPMd var.H and is zero-`unsafe` — wire 7z's PPMd through it (or upstream the safe decoder to `sevenz-rust2`) to drop `ppmd-rust`.
+- **Verify** the residual: `cargo-fuzz` + Miri over every reachable parser/decompressor, and document containment (panic isolation, the prefork process boundary, the WASM-sandboxed extractor) for the `unsafe` that must stay.
 
 ## Contributing
 

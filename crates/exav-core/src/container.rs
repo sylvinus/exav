@@ -64,8 +64,18 @@ impl CType {
             "CL_TYPE_MAIL" => CType::Is(FileType::Email),
             "CL_TYPE_GZ" => CType::Is(FileType::Gzip),
             "CL_TYPE_BZ" => CType::Is(FileType::Bzip2),
+            "CL_TYPE_XZ" => CType::Is(FileType::Xz),
             "CL_TYPE_OLE2" => CType::Is(FileType::Ole),
-            "CL_TYPE_POSIX_TAR" | "CL_TYPE_OLD_TAR" => CType::Is(FileType::Tar),
+            "CL_TYPE_PDF" => CType::Is(FileType::Pdf),
+            "CL_TYPE_ISO9660" => CType::Is(FileType::Iso),
+            "CL_TYPE_LHA_LZH" => CType::Is(FileType::Lha),
+            "CL_TYPE_ARJ" => CType::Is(FileType::Arj),
+            "CL_TYPE_CPIO_OLD" | "CL_TYPE_CPIO_ODC" | "CL_TYPE_CPIO_NEWC" | "CL_TYPE_CPIO_CRC" => {
+                CType::Is(FileType::Cpio)
+            }
+            "CL_TYPE_AR" => CType::Is(FileType::Ar),
+            "CL_TYPE_XAR" => CType::Is(FileType::Xar),
+            "CL_TYPE_POSIX_TAR" | "CL_TYPE_OLD_TAR" | "CL_TYPE_GNU_TAR" => CType::Is(FileType::Tar),
             _ => CType::Unmodeled,
         }
     }
@@ -81,6 +91,10 @@ impl CType {
 #[derive(Serialize, Deserialize)]
 struct CdbSig {
     name: String,
+    /// Whether the signature came from an unofficial (non-`.cvd`) database. The
+    /// `.UNOFFICIAL` suffix is applied at report time (compat mode), not baked in.
+    #[serde(default)]
+    unofficial: bool,
     ctype: CType,
     csize: Range,
     /// The filename regex source; compiled lazily (regexes aren't serializable,
@@ -135,20 +149,27 @@ impl CdbDb {
     }
 
     pub fn extend_from_text(&mut self, text: &str) {
+        self.extend_from_text_prov(text, false);
+    }
+
+    /// As [`CdbDb::extend_from_text`], tagging each parsed signature's
+    /// `unofficial` provenance.
+    pub fn extend_from_text_prov(&mut self, text: &str, unofficial: bool) {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some(sig) = parse_cdb(line) {
+            if let Some(mut sig) = parse_cdb(line) {
+                sig.unofficial = unofficial;
                 self.sigs.push(sig);
             }
         }
     }
 
     /// Return the first signature that matches the given member of a container
-    /// of type `ct`/size `csize`.
-    pub fn matches(&self, ct: FileType, csize: u64, m: &Member) -> Option<String> {
+    /// of type `ct`/size `csize`, as `(clean_name, unofficial)`.
+    pub fn matches(&self, ct: FileType, csize: u64, m: &Member) -> Option<(String, bool)> {
         for s in &self.sigs {
             if s.ctype.matches(ct)
                 && s.csize.matches(csize)
@@ -158,7 +179,7 @@ impl CdbDb {
                 && s.encrypted.map(|e| e == m.encrypted).unwrap_or(true)
                 && s.name_matches(m.name.as_bytes())
             {
-                return Some(s.name.clone());
+                return Some((s.name.clone(), s.unofficial));
             }
         }
         None
@@ -190,6 +211,7 @@ fn parse_cdb(line: &str) -> Option<CdbSig> {
     };
     Some(CdbSig {
         name: f[0].to_string(),
+        unofficial: false,
         ctype: CType::parse(f[1]),
         csize: Range::parse(f[2])?,
         name_pat,
@@ -220,7 +242,7 @@ mod tests {
             pos: 1,
         };
         assert_eq!(
-            db.matches(FileType::Zip, 5000, &m).as_deref(),
+            db.matches(FileType::Zip, 5000, &m).map(|(n, _)| n).as_deref(),
             Some("Test.Cdb")
         );
         // Wrong container type -> no match.
@@ -241,7 +263,7 @@ mod tests {
             encrypted: false,
             pos: 2,
         };
-        assert_eq!(db.matches(FileType::Zip, 150, &ok).as_deref(), Some("R"));
+        assert_eq!(db.matches(FileType::Zip, 150, &ok).map(|(n, _)| n).as_deref(), Some("R"));
         // container size out of range
         assert!(db.matches(FileType::Zip, 250, &ok).is_none());
         // wrong position

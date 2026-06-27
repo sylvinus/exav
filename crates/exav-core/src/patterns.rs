@@ -13,13 +13,29 @@ use crate::hexsig::{parse_ndb_body, NdbPattern};
 pub struct Pattern {
     pub name: String,
     pub bytes: Vec<u8>,
+    /// Whether this pattern came from an unofficial (non-`.cvd`) database. The
+    /// clean name is stored; the `.UNOFFICIAL` suffix is applied at report time
+    /// (compat mode). Defaults to `false` so older caches load as official.
+    #[serde(default)]
+    pub unofficial: bool,
 }
 
 impl Pattern {
+    /// A new official (non-suffixed) pattern.
     pub fn new(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
         Self {
             name: name.into(),
             bytes: bytes.into(),
+            unofficial: false,
+        }
+    }
+
+    /// A new pattern carrying explicit `unofficial` provenance.
+    pub fn with_prov(name: impl Into<String>, bytes: impl Into<Vec<u8>>, unofficial: bool) -> Self {
+        Self {
+            name: name.into(),
+            bytes: bytes.into(),
+            unofficial,
         }
     }
 }
@@ -63,14 +79,15 @@ impl PatternSet {
         })
     }
 
-    /// Signature name for a pattern index.
-    pub(crate) fn name(&self, i: usize) -> &str {
-        &self.src[i].name
+    /// `(clean_name, unofficial)` for a pattern index — the report layer applies
+    /// the `.UNOFFICIAL` suffix in compat mode.
+    pub(crate) fn name_prov(&self, i: usize) -> (&str, bool) {
+        (&self.src[i].name, self.src[i].unofficial)
     }
 
     /// A set containing only the EICAR test signature.
     pub fn builtin() -> Self {
-        Self::build(&[Pattern::new("Exav.Test.EICAR", EICAR)], 0)
+        Self::build(&[Pattern::new("Eicar-Test-Signature", EICAR)], 0)
             .expect("builtin pattern set builds")
     }
 
@@ -78,6 +95,12 @@ impl PatternSet {
     /// literal patterns, returning the patterns and the number of bodies
     /// skipped because they use wildcards.
     pub fn parse_ndb(text: &str) -> (Vec<Pattern>, usize) {
+        Self::parse_ndb_prov(text, false)
+    }
+
+    /// As [`PatternSet::parse_ndb`], tagging each parsed literal with `unofficial`
+    /// provenance (set for `.ndb` files from a non-`.cvd` database).
+    pub fn parse_ndb_prov(text: &str, unofficial: bool) -> (Vec<Pattern>, usize) {
         let mut patterns = Vec::new();
         let mut unsupported = 0usize;
         for line in text.lines() {
@@ -98,7 +121,7 @@ impl PatternSet {
             };
             match parse_ndb_body(body) {
                 NdbPattern::Literal(bytes) if !bytes.is_empty() => {
-                    patterns.push(Pattern::new(name, bytes));
+                    patterns.push(Pattern::with_prov(name, bytes, unofficial));
                 }
                 _ => unsupported += 1,
             }

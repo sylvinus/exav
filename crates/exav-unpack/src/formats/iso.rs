@@ -6,18 +6,21 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 /// descriptor's directory tree and emits each file's extent. Bounded by the
 /// budget and a fixed directory-recursion depth. Rock Ridge / Joliet name
 /// extensions are ignored (the raw payload is what matters for scanning).
-pub(crate) fn extract_iso(data: &[u8], budget: &mut Budget) -> Result<Vec<Entry>, LimitHit> {
+pub(crate) fn extract_iso<R>(
+    data: &[u8],
+    budget: &mut Budget,
+    visit: Sink<R>,
+) -> Result<Option<R>, LimitHit> {
     const SECTOR: usize = 2048;
     // Primary Volume Descriptor at sector 16; root directory record at PVD+156.
     let pvd = 16 * SECTOR;
     let rd = pvd + 156;
     if data.len() < rd + 34 || data.get(pvd + 1..pvd + 6) != Some(b"CD001") {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let le32 = |o: usize| -> u64 {
         u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as u64
     };
-    let mut entries = Vec::new();
     // (extent_lba, data_len) of directories still to visit.
     let mut dirs = vec![(le32(rd + 2), le32(rd + 10))];
     let mut visited = 0usize;
@@ -43,7 +46,10 @@ pub(crate) fn extract_iso(data: &[u8], budget: &mut Budget) -> Result<Vec<Entry>
                 p = next;
                 continue;
             }
-            if p + 33 > dir.len() || p + rec_len > dir.len() {
+            // `rec_len` is the record's own declared length; it must cover the
+            // 33-byte fixed area we index below. A short (but non-zero) length is
+            // corrupt — bail rather than slice `rec` too short and panic.
+            if rec_len < 33 || p + rec_len > dir.len() {
                 break;
             }
             let rec = &dir[p..p + rec_len];
@@ -81,10 +87,12 @@ pub(crate) fn extract_iso(data: &[u8], budget: &mut Budget) -> Result<Vec<Entry>
                     return Err(LimitHit::new(format!("iso member '{name}' exceeds budget")));
                 }
                 budget.commit(content.len() as u64);
-                entries.push(Entry::new(name, content.to_vec()));
+                if let Some(r) = visit(Entry::new(name, content.to_vec()), budget) {
+                    return Ok(Some(r));
+                }
             }
             p += rec_len;
         }
     }
-    Ok(entries)
+    Ok(None)
 }

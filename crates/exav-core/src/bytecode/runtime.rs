@@ -84,7 +84,10 @@ impl BytecodeRuntime {
             // kind. Only a bytecode with no logical signature (a bare hook
             // name) runs unconditionally, on every file of its hook's type.
             if let Some(line) = retrigger(&bc.trigger, idx) {
-                eb.add_ldb(&line);
+                // Internal trigger-gate sig; its name is never reported (the
+                // bytecode program supplies the detection name), so provenance
+                // is irrelevant — load as official.
+                eb.add_ldb(&line, false);
             } else {
                 match bc.header.kind {
                     KIND_PE_UNPACKER | KIND_PE_ALL => hooks.push((idx, Some(FileType::Pe))),
@@ -150,7 +153,8 @@ impl BytecodeRuntime {
         // offset so `__clambc_match_offsets` reflects where the pattern matched.
         if !self.triggers.is_empty() {
             let mut matches = Vec::new();
-            self.triggers.scan_logical_offsets(data, ft, layout, &mut matches);
+            self.triggers
+                .scan_logical_offsets(data, ft, layout, None, &mut matches);
             for (name, suboffs) in &matches {
                 if let Some(idx) = name
                     .strip_prefix("__bc__")

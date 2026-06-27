@@ -28,7 +28,16 @@ use crate::Database;
 const MAGIC: &[u8; 8] = b"EXAVCAC\x01";
 /// Bumped whenever the serialized layout changes (not live yet, so stale
 /// on-disk caches are simply deleted rather than version-bumped).
-const VERSION: u32 = 1;
+///
+/// v8: per-signature `unofficial` provenance added to the engine bodies/logical
+/// sigs, the hash/section tables, `.cdb` sigs and the streaming literal patterns,
+/// so the `.UNOFFICIAL` suffix is applied at report time (compat mode) instead of
+/// being baked into names at load — one cache now serves both compat and
+/// non-compat scans.
+///
+/// v9: `.pwdb` password pool serialized into the payload (decryption candidates
+/// for encrypted archive members).
+const VERSION: u32 = 9;
 /// Fixed header: 8-byte magic + 4-byte little-endian version.
 const HEADER_LEN: u64 = 12;
 /// Trailing SHA-256 of the payload (integrity stamp).
@@ -94,6 +103,9 @@ fn write_payload<W: Write>(db: &Database, w: &mut W) -> io::Result<()> {
     enc(&db.ignored, w)?;
     enc(&db.bytecode.sources(), w)?;
     enc(&db.ml_threshold, w)?;
+    enc(&db.ftm, w)?;
+    enc(&db.icons, w)?;
+    enc(&db.passwords, w)?;
     Ok(())
 }
 
@@ -130,6 +142,9 @@ fn read_payload<R: Read>(mut r: R) -> io::Result<Database> {
     let ignored = dec(&mut r)?;
     let bytecode_sources: Vec<String> = dec(&mut r)?;
     let ml_threshold = dec(&mut r)?;
+    let ftm = dec(&mut r)?;
+    let icons = dec(&mut r)?;
+    let passwords: Vec<String> = dec(&mut r)?;
     Ok(Database {
         patterns,
         engine,
@@ -143,6 +158,9 @@ fn read_payload<R: Read>(mut r: R) -> io::Result<Database> {
         bytecode: crate::bytecode::runtime::BytecodeRuntime::from_sources(bytecode_sources),
         model: Box::new(HeuristicModel),
         ml_threshold,
+        ftm,
+        icons,
+        passwords,
     })
 }
 
@@ -294,5 +312,36 @@ mod tests {
         );
         // The buffered `read` path must reject it too.
         assert!(super::read(std::io::Cursor::new(&bytes)).is_err());
+    }
+
+    /// Per-signature `unofficial` provenance survives the cache round-trip, so a
+    /// single cached database yields clean names in a default scan and
+    /// `.UNOFFICIAL` names in a compat scan.
+    #[test]
+    fn provenance_round_trips_for_compat_naming() {
+        use crate::Verdict;
+        let dir = tempfile::tempdir().unwrap();
+        // 6d616c77617265 = "malware"; a loose `.ndb` is unofficial.
+        std::fs::write(dir.path().join("a.ndb"), "Demo.Loose:0:*:6d616c77617265\n").unwrap();
+        let fresh = crate::db::load(dir.path()).unwrap();
+        let path = dir.path().join("db.exavcache");
+        super::save(&fresh, &path).unwrap();
+        let loaded = super::load(&path).unwrap();
+
+        let data = b"xx malware xx";
+        let mut compat = ScanOptions::default();
+        compat.compat = true;
+        for db in [&fresh, &loaded] {
+            match analyze(db, data, &ScanOptions::default()).verdict {
+                Verdict::Infected { signature, .. } => assert_eq!(signature, "Demo.Loose"),
+                other => panic!("expected detection, got {other:?}"),
+            }
+            match analyze(db, data, &compat).verdict {
+                Verdict::Infected { signature, .. } => {
+                    assert_eq!(signature, "Demo.Loose.UNOFFICIAL")
+                }
+                other => panic!("expected detection, got {other:?}"),
+            }
+        }
     }
 }

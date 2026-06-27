@@ -1,0 +1,17 @@
+# Excluded from the workspace (a wasm32-target artifact), so values are explicit.
+[package]
+name = "exav-unpack-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sylvinus/exav"
+rust-version = "1.85"
+description = "WebAssembly bindings for exav-unpack: in-browser, memory-safe universal archive extraction. Build with `wasm-pack build`."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+exav-unpack = { path = "../exav-unpack", version = "0.1.0" }
+wasm-bindgen = "0.2"
+js-sys = "0.3"

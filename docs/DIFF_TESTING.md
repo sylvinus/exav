@@ -20,9 +20,15 @@ static-scan only, never executed).
    `main+daily` (needs a capable build host). Both engines must use the *same*
    set or the comparison is meaningless.
 
-2. **Build the exav cache once** so the daemon starts fast and avoids the
-   build-time peak on every run:
+2. **Delete any stale cache and rebuild it from the freshly-built binary.**
+   The cache embeds engine/version-specific state, so a cache produced by an
+   *earlier* `exav` build silently tests old code and invalidates the whole
+   comparison. ALWAYS `rm` the existing cache and rebuild from the binary under
+   test at the **start of every diff run** (the prebuilt cache also avoids the
+   build-time memory peak on every later daemon start):
    ```sh
+   cargo build --release -p exav-cli      # build the binary under test FIRST
+   rm -f /tmp/daily.cache                  # drop any cache from a previous build
    exav -d /tmp/difdb_daily --build-cache /tmp/daily.cache
    ```
 
@@ -53,8 +59,19 @@ static-scan only, never executed).
    ```sh
    DUR=300 corpus/difftest.sh        # 5 minutes; Ctrl-C-safe, just re-run to continue
    ```
-   The script prints a summary (AGREE / clean / FN / FP counts, average per-file
-   ms for each engine) and lists the FN/FP cases to investigate.
+   The script prints a summary (AGREE / clean / FN / FP / CAREFUL counts, average
+   per-file ms for each engine) and lists the disagreement cases to investigate.
+
+5. **Tear down — ALWAYS, when you're done.** A diff leaves **both engines
+   resident** (clamd + the exav daemon, each holding the loaded DB — gigabytes)
+   plus large prebuilt caches and matched-DB dirs on disk. On a small box these
+   silently starve the next run (the step-0 "free memory" problem). Run:
+   ```sh
+   corpus/difftest_teardown.sh   # stops clamd+exav, removes sockets/caches/scratch
+   ```
+   It's idempotent. Note clamd may run as the `clamav` (root) user, so the script
+   uses `sudo` to signal it; verify with `pgrep -x clamd` that nothing is left.
+   **Never leave a diff's daemons running** — kill everything and leave clean.
 
 Key choices, and why:
 - **Daemons, not one-shot.** exav reloads a ~1 GB cache per invocation; clamscan

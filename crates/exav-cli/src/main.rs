@@ -7,6 +7,7 @@
 //! that can't be fully scanned is reported `LIMITS-EXCEEDED`, not `OK`.
 
 mod daemon;
+mod perf;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,33 @@ struct Cli {
     #[arg(long = "tcp", value_name = "ADDR")]
     tcp: Option<String>,
 
+    /// Daemon worker model (Unix). Default: one prefork worker process per CPU
+    /// core, each scanning one job at a time under kernel-enforced per-job limits
+    /// (see --max-scan-time/-memory) and recycled per --max-jobs-per-worker, so a
+    /// runaway scan is isolated and hard-killed (the thread model can't).
+    /// --workers 0 forces the in-process thread model. [default: CPU cores]
+    #[arg(long = "workers", value_name = "N")]
+    workers: Option<usize>,
+
+    /// Prefork only (requires --workers N): hard wall-clock budget per scan, in
+    /// seconds (0 = none). On expiry the worker is killed and the connection
+    /// dropped; also caps CPU time (RLIMIT_CPU). The deterministic in-core caps
+    /// still apply first in every mode. [default: 120]
+    #[arg(long = "max-scan-time", value_name = "SECS")]
+    max_scan_time: Option<u64>,
+
+    /// Prefork only (requires --workers N): per-worker address-space cap
+    /// (RLIMIT_AS), bounding memory bombs. K/M/G/T suffixes; 0 = none.
+    /// [default: 2G]
+    #[arg(long = "max-scan-memory", value_name = "SIZE", value_parser = parse_size)]
+    max_scan_memory: Option<u64>,
+
+    /// Prefork only (requires --workers N): recycle a worker process after this
+    /// many jobs to bound slow leaks/fragmentation (0 = never). Mirrors Apache
+    /// MaxRequestsPerChild. [default: 1000]
+    #[arg(long = "max-jobs-per-worker", value_name = "N")]
+    max_jobs_per_worker: Option<u64>,
+
     /// Files larger than this are reported LIMITS-EXCEEDED (never OK).
     /// Accepts K/M/G/T suffixes. Default: no limit.
     #[arg(long = "max-filesize", value_name = "SIZE", value_parser = parse_size)]
@@ -84,6 +112,32 @@ struct Cli {
     /// Enable structural heuristics / fuzzy / ML analysis.
     #[arg(long = "heuristics")]
     heuristics: bool,
+
+    /// Password to try when decrypting encrypted archive members (ZIP
+    /// ZipCrypto/AES). Repeatable: `--password a --password b` builds a pool,
+    /// tried in order. Unioned with any passwords loaded from `.pwdb` databases.
+    /// When a scan reports `password-protected`, re-run with the right password.
+    #[arg(long = "password", value_name = "PW")]
+    password: Vec<String>,
+
+    /// Restrict to a stock ClamAV build's default limits and capabilities
+    /// (skips exav-exclusive extractors: ar/cpio/xar/UPX). For apples-to-apples
+    /// differential testing against clamscan. Off by default (full capability).
+    #[arg(long = "clamav-compat")]
+    clamav_compat: bool,
+
+    /// Detect Potentially Unwanted Applications (ClamAV `--detect-pua`): load the
+    /// `.??u` PUA databases and keep `PUA.*` signatures. Off by default, matching
+    /// ClamAV. Applied at DB load / cache build time.
+    #[arg(long = "detect-pua")]
+    detect_pua: bool,
+
+    /// Emit a CSV row per file with a per-matcher timing breakdown (one column
+    /// group per matcher: `_us`, `_calls`, `_bytes`) instead of the normal
+    /// output — for building a performance matrix across a dataset. A header row
+    /// is printed first. Adds light timing overhead.
+    #[arg(long = "perf-csv")]
+    perf_csv: bool,
 
     /// Print informational findings (type, entropy, imphash, ml score).
     #[arg(short = 'v', long = "verbose")]
@@ -157,6 +211,23 @@ struct Totals {
     infected: u64,
     errors: u64,
     limits: u64,
+    /// Total bytes of the scanned files (for the clamscan-style "Data scanned").
+    data_scanned: u64,
+}
+
+/// Default daemon worker count: one per CPU core on Unix (the prefork pool),
+/// 0 elsewhere (the thread model — Unix-only `fork` isn't available).
+fn default_workers() -> usize {
+    #[cfg(unix)]
+    {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn main() -> ExitCode {
@@ -173,6 +244,34 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // The per-job limits are enforced by the kernel inside worker processes, so
+    // they only exist with a prefork pool. Reject them with workers=0 rather
+    // than silently ignoring them.
+    // The prefork pool (and its per-job limits) only exists for the daemon, with
+    // workers > 0. Default to the CPU-core count on Unix; --workers 0 forces the
+    // in-process thread model. One-shot scans never use the pool.
+    let pool_workers = if cli.daemon {
+        cli.workers.unwrap_or_else(default_workers)
+    } else {
+        0
+    };
+    if pool_workers == 0 {
+        let offender = [
+            cli.max_scan_time.map(|_| "--max-scan-time"),
+            cli.max_scan_memory.map(|_| "--max-scan-memory"),
+            cli.max_jobs_per_worker.map(|_| "--max-jobs-per-worker"),
+        ]
+        .into_iter()
+        .flatten()
+        .next();
+        if let Some(flag) = offender {
+            eprintln!(
+                "exav: {flag} only applies to the daemon worker pool (needs --daemon and --workers > 0)"
+            );
+            return ExitCode::from(2);
+        }
+    }
+
     let db = match load_db(&cli) {
         Ok(db) => db,
         Err(e) => {
@@ -186,11 +285,16 @@ fn main() -> ExitCode {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let opts = ScanOptions {
-            max_scan_size: max,
-            heuristics: cli.heuristics,
-            ..Default::default()
+        let mut opts = if cli.clamav_compat {
+            ScanOptions::clamav_compat()
+        } else {
+            ScanOptions::default()
         };
+        opts.heuristics = cli.heuristics;
+        if max.is_some() {
+            opts.max_scan_size = max;
+        }
+        opts.passwords = cli.password.clone();
         let addr = match &cli.tcp {
             Some(a) => daemon::ListenAddr::Tcp(a.clone()),
             #[cfg(unix)]
@@ -205,6 +309,34 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+        // A prefork worker pool (--workers N > 0) is the isolated/killable model;
+        // it's Unix-only (relies on fork for COW DB-sharing + kernel limits).
+        #[cfg(unix)]
+        if pool_workers > 0 {
+            // Defaults live here (not in clap) so an unset flag is distinguishable
+            // from an explicit one for the workers=0 validation above.
+            let scan_time = cli.max_scan_time.unwrap_or(120);
+            let cfg = daemon::PoolConfig {
+                workers: pool_workers,
+                max_scan_time: std::time::Duration::from_secs(scan_time),
+                max_memory_bytes: cli.max_scan_memory.unwrap_or(2 * 1024 * 1024 * 1024),
+                // Bound CPU time too (catches a busy loop that an I/O-wait-free
+                // wall clock would also catch, but as a kernel-level backstop).
+                max_cpu_secs: scan_time,
+                max_jobs: cli.max_jobs_per_worker.unwrap_or(1000),
+            };
+            return match daemon::run_prefork(db, addr, opts, cfg) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("exav: daemon error: {e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        #[cfg(not(unix))]
+        if pool_workers > 0 {
+            eprintln!("exav: --workers is only supported on Unix; using in-process threads");
+        }
         return match daemon::run(db, addr, opts) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -237,11 +369,16 @@ fn main() -> ExitCode {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    let opts = ScanOptions {
-        max_scan_size: max,
-        heuristics: cli.heuristics,
-        ..Default::default()
+    let mut opts = if cli.clamav_compat {
+        ScanOptions::clamav_compat()
+    } else {
+        ScanOptions::default()
     };
+    opts.heuristics = cli.heuristics;
+    if max.is_some() {
+        opts.max_scan_size = max;
+    }
+    opts.passwords = cli.password.clone();
 
     let filters = match Filters::compile(&cli) {
         Ok(f) => f,
@@ -252,18 +389,28 @@ fn main() -> ExitCode {
     };
 
     let mut totals = Totals::default();
+    let scan_start = std::time::Instant::now();
+    if cli.perf_csv {
+        println!("{}", perf::header());
+    }
     for path in &cli.paths {
         match path.to_str() {
             Some("-") => scan_stdin(&db, &cli, &mut totals),
+            #[cfg(feature = "http")]
             Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
                 scan_url(s, &db, &opts, &cli, &mut totals)
+            }
+            #[cfg(not(feature = "http"))]
+            Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
+                totals.errors += 1;
+                eprintln!("{s}: URL scanning needs a build with `--features http` ERROR");
             }
             _ => scan_target(path, &db, &opts, &cli, &filters, &mut totals),
         }
     }
 
-    if !cli.no_summary && !cli.quiet {
-        print_summary(&db, &totals);
+    if !cli.no_summary && !cli.quiet && !cli.perf_csv {
+        print_summary(&db, &totals, scan_start.elapsed(), cli.verbose);
     }
 
     if totals.infected > 0 {
@@ -276,8 +423,11 @@ fn main() -> ExitCode {
 }
 
 fn load_db(cli: &Cli) -> Result<Database, String> {
+    // `--clamav-compat` enables exact ClamAV naming (the `.UNOFFICIAL` suffix /
+    // `YARA.` prefix on unofficial-database signatures).
+    let suffix = cli.clamav_compat;
     if let Some(path) = &cli.database {
-        return db::load(path);
+        return db::load_with_options(path, cli.detect_pua, suffix).map_err(|e| e.to_string());
     }
     if cli.datadir.is_dir() {
         // Use the data dir if it actually contains something loadable.
@@ -285,7 +435,8 @@ fn load_db(cli: &Cli) -> Result<Database, String> {
             .map(|mut d| d.next().is_some())
             .unwrap_or(false)
         {
-            return db::load(&cli.datadir);
+            return db::load_with_options(&cli.datadir, cli.detect_pua, suffix)
+                .map_err(|e| e.to_string());
         }
     }
     Ok(Database::builtin())
@@ -328,10 +479,44 @@ fn scan_one(path: &Path, db: &Database, opts: &ScanOptions, cli: &Cli, totals: &
         return scan_one_allmatch(path, db, opts, cli, totals);
     }
     totals.scanned += 1;
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    totals.data_scanned += size;
     // Isolate each file: a parser panic on a crafted input must not abort
     // the whole run, and must count as an error — never a clean result.
+    let t0 = std::time::Instant::now();
+    if cli.perf_csv {
+        exav_core::profile::enable();
+    }
     let scanned =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_path(db, path, opts)));
+    if cli.perf_csv {
+        let prof = exav_core::profile::take();
+        let (verdict, sig) = match &scanned {
+            Ok(Ok(r)) => match &r.verdict {
+                Verdict::Clean => ("clean", String::new()),
+                Verdict::Infected { signature, .. } => {
+                    totals.infected += 1;
+                    ("infected", signature.clone())
+                }
+                Verdict::LimitsExceeded { reason } => ("limits", reason.clone()),
+                Verdict::Unscannable { reason } => ("unscannable", reason.clone()),
+                Verdict::PasswordProtected { reason } => ("password-protected", reason.clone()),
+            },
+            Ok(Err(e)) => {
+                totals.errors += 1;
+                ("error", e.to_string())
+            }
+            Err(_) => {
+                totals.errors += 1;
+                ("panic", String::new())
+            }
+        };
+        println!(
+            "{}",
+            perf::row(path, verdict, &sig, prof.as_ref(), t0.elapsed(), size)
+        );
+        return;
+    }
     match scanned {
         Ok(Ok(report)) => report_result(&path.display().to_string(), report, cli, totals),
         Ok(Err(e)) => {
@@ -370,6 +555,7 @@ fn scan_stdin(db: &Database, cli: &Cli, totals: &mut Totals) {
 
 /// Scan an http(s):// URL via range requests, fetching only the bytes the
 /// scan touches (e.g. a ZIP's directory + the members it reads).
+#[cfg(feature = "http")]
 fn scan_url(url: &str, db: &Database, opts: &ScanOptions, cli: &Cli, totals: &mut Totals) {
     totals.scanned += 1;
     let reader = match exav_core::source::HttpRangeReader::open(url) {
@@ -613,6 +799,17 @@ fn report_result(name: &str, report: ScanReport, cli: &Cli, totals: &mut Totals)
             totals.limits += 1;
             println!("{name}: {reason} LIMITS-EXCEEDED");
         }
+        Verdict::Unscannable { reason } => {
+            // Recognised but undecodable content (unsupported codec) — not clean.
+            // Counted with limits so it's never reported as a pass.
+            totals.limits += 1;
+            println!("{name}: {reason} UNSCANNABLE");
+        }
+        Verdict::PasswordProtected { reason } => {
+            // Encrypted — not clean, and actionable: re-scan with --password.
+            totals.limits += 1;
+            println!("{name}: {reason} PASSWORD-PROTECTED");
+        }
         Verdict::Clean => {
             if !cli.infected_only && !cli.quiet {
                 println!("{name}: OK");
@@ -626,22 +823,40 @@ fn report_result(name: &str, report: ScanReport, cli: &Cli, totals: &mut Totals)
     }
 }
 
-fn print_summary(db: &Database, totals: &Totals) {
+/// ClamAV functionality level exav emulates (see `engine::EXAV_FLEVEL`), and the
+/// ClamAV release that flevel corresponds to — reported as the engine version so
+/// clamscan-parsing tooling sees a recognised, recent engine.
+const CLAMAV_COMPAT_VERSION: &str = "1.4.3";
+
+/// Print a clamscan-compatible `SCAN SUMMARY` (same field names and order, so
+/// existing clamscan-output parsers work). exav-specific counters are shown only
+/// with `-v`/`--verbose`.
+fn print_summary(db: &Database, totals: &Totals, elapsed: std::time::Duration, verbose: bool) {
+    let mb = totals.data_scanned as f64 / (1024.0 * 1024.0);
+    let secs = elapsed.as_secs_f64();
+    let (m, s) = (elapsed.as_secs() / 60, elapsed.as_secs() % 60);
     println!("\n----------- SCAN SUMMARY -----------");
-    println!("Known signatures: {}", db.signature_count());
-    if db.unsupported_count() > 0 {
-        println!("Unsupported sigs skipped: {}", db.unsupported_count());
-    }
-    if db.bytecode_count() > 0 {
-        println!("Bytecode programs loaded: {}", db.bytecode_count());
-    }
+    println!("Known viruses: {}", db.signature_count());
+    println!("Engine version: {CLAMAV_COMPAT_VERSION}");
+    println!("Scanned directories: 0");
     println!("Scanned files: {}", totals.scanned);
     println!("Infected files: {}", totals.infected);
     if totals.limits > 0 {
-        println!("Limits exceeded (unscanned, not clean): {}", totals.limits);
+        println!("Total errors: {}", totals.limits + totals.errors);
+    } else if totals.errors > 0 {
+        println!("Total errors: {}", totals.errors);
     }
-    if totals.errors > 0 {
-        println!("Errors: {}", totals.errors);
+    println!("Data scanned: {mb:.2} MB");
+    println!("Data read: {mb:.2} MB (ratio 0.00:1)");
+    println!("Time: {secs:.3} sec ({m} m {s} s)");
+    if verbose {
+        // exav-specific detail (not part of clamscan's summary).
+        println!("Engine signatures: {}", db.signature_count());
+        println!("Unsupported sigs skipped: {}", db.unsupported_count());
+        println!("Bytecode programs loaded: {}", db.bytecode_count());
+        if totals.limits > 0 {
+            println!("Limits exceeded (unscanned, not clean): {}", totals.limits);
+        }
     }
 }
 

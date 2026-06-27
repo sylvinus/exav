@@ -4,12 +4,15 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 
 /// MIME email: emit each text/binary part (already base64/QP-decoded by the
 /// parser), so attachments and bodies are scanned.
-pub(crate) fn extract_email(data: &[u8], budget: &mut Budget) -> Result<Vec<Entry>, LimitHit> {
+pub(crate) fn extract_email<R>(
+    data: &[u8],
+    budget: &mut Budget,
+    visit: Sink<R>,
+) -> Result<Option<R>, LimitHit> {
     use mail_parser::{MessageParser, PartType};
     let msg = MessageParser::default()
         .parse(data)
         .ok_or_else(|| LimitHit::new("email: parse failed".to_string()))?;
-    let mut entries = Vec::new();
     for (i, part) in msg.parts.iter().enumerate() {
         let bytes: Vec<u8> = match &part.body {
             PartType::Text(t) | PartType::Html(t) => t.as_bytes().to_vec(),
@@ -23,7 +26,9 @@ pub(crate) fn extract_email(data: &[u8], budget: &mut Budget) -> Result<Vec<Entr
             return Err(LimitHit::new("email part exceeds budget".to_string()));
         }
         budget.commit(bytes.len() as u64);
-        entries.push(Entry::new(format!("email-part-{i}"), bytes));
+        if let Some(r) = visit(Entry::new(format!("email-part-{i}"), bytes), budget) {
+            return Ok(Some(r));
+        }
     }
-    Ok(entries)
+    Ok(None)
 }

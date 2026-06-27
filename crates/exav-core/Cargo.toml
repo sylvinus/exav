@@ -8,6 +8,8 @@ description = "Core engine for the exav malware scanner: signature-database pars
 
 [dependencies]
 aho-corasick.workspace = true
+# typed error type
+thiserror = "2"
 # fast substring search (SIMD memmem) for the bytecode file_find/memstr APIs
 memchr = "2"
 # hashing (RustCrypto)
@@ -21,28 +23,48 @@ goblin = "0.10"
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info"] }
 # archive/container extraction (its own crate)
 exav-unpack = { path = "../exav-unpack", version = "0.1.0" }
-# CVD containers are gzip'd tar; used directly by the db loader (cvd.rs)
-flate2 = "1"
-tar = "0.4"
 # fuzzy hashing
 tlsh2 = { version = "0.4", features = ["diff"] }
+# image fuzzy hashing (ClamAV `fuzzy_img#` subsigs). These are the SAME public
+# crates ClamAV's own Rust code uses for its perceptual hash, so the decode +
+# Lanczos3 resize + DCT-II are byte-exact. Pinned to image 0.24.x (the version
+# ClamAV 1.4.x ships) for hash fidelity.
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "tiff", "bmp", "webp"] }
+rustdct = "0.7"
+transpose = "0.2"
 # HTTP(S) range-request backend (optional)
 ureq = { version = "2", optional = true }
 daachorse = "3"
 serde = { version = "1.0.228", features = ["derive"] }
 rmp-serde = "1.3.1"
 regex = "1.12.4"
+# Backtracking-regex fallback for the few PCRE subsigs using lookaround /
+# backreferences (which are not regular languages, so the linear-time `regex`
+# engine can't express them). Pure-Rust. Operates on `&str`, so byte content is
+# fed via a lossless latin-1 mapping (each byte 0x00..=0xff -> U+0000..=U+00FF).
+# Bounded backtrack budget + trigger-gating keep it DoS- and FP-safe.
+fancy-regex = "0.18.0"
 # Full YARA rule support (ClamAV loads .yar/.yara by default, so a drop-in must
-# too). The `pulley` feature makes yara-x execute compiled rules on wasmtime's
-# Pulley *interpreter* — no native JIT / no runtime codegen (W^X) — preserving
-# the no-JIT security posture. (Cranelift is still linked but never executed.)
-yara-x = { version = "1.5.0", features = ["pulley"] }
+# too). The `pulley` feature runs compiled rules on wasmtime's Pulley
+# *interpreter* — no runtime JIT / native codegen at scan time (W^X). Optional:
+# it's by far the largest dependency subtree (a WASM runtime + Cranelift, ~200
+# crates), so a lean build can drop it with `--no-default-features`. On by
+# default — it's pure-Rust, so keeping it doesn't add any C.
+yara-x = { version = "1.5.0", features = ["pulley"], optional = true }
 
 [features]
-# Enables the HTTP(S) range-request seekable backend (HttpRangeReader).
+default = ["yara"]
+# Full YARA rule matching (yara-x). On by default; disable for a much smaller
+# pure-Rust build that loads everything except `.yar`/`.yara` rules.
+yara = ["dep:yara-x"]
+# Enables the HTTP(S) range-request seekable backend (HttpRangeReader). OFF by
+# default — the only feature that pulls a C/asm TLS stack (ureq → rustls → ring).
 http = ["dep:ureq"]
 
 [dev-dependencies]
 tempfile = "3"
 # only for building test ZIPs in unit tests
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# test fixtures only: build gzip/tar CVD fixtures + gzip scan inputs
+flate2 = "1"
+tar = "0.4"

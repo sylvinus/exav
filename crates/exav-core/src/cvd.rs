@@ -5,9 +5,7 @@
 //! same header followed by an uncompressed tar. [`read`] returns the header
 //! and the contained files for the loaders to consume.
 
-use std::io::Cursor;
-
-use crate::unpack::{bounded_read, Budget, Limits};
+use crate::unpack::{self, Budget, Limits};
 
 /// Parsed CVD header fields (colon-separated, first 512 bytes).
 #[derive(Debug, Clone)]
@@ -86,65 +84,52 @@ pub fn read_with_limits(
     let header = parse_header(data)?;
     let payload = &data[512..];
 
-    // CVD payload is gzip-compressed; CLD is a raw tar. Bounded so an
-    // oversized payload is rejected rather than silently truncated.
+    // A CVD payload is a gzip-compressed tar; a CLD's is a raw tar. Both are
+    // unpacked through exav-unpack's gzip/tar extractors. The signature container
+    // is TRUSTED, so the budget only caps total size/count to reject a corrupt or
+    // oversized database; the ratio/scan-byte/recursion bomb defenses (for hostile
+    // scan input) are disabled.
     let tar_bytes: Vec<u8> = if payload.starts_with(&[0x1f, 0x8b]) {
-        use flate2::read::GzDecoder;
-        let (out, truncated) =
-            bounded_read(GzDecoder::new(Cursor::new(payload)), limits.max_tar_bytes)
-                .map_err(|e| format!("cvd gunzip: {e}"))?;
-        if truncated {
-            return Err(format!(
-                "cvd payload exceeds {} bytes",
-                limits.max_tar_bytes
-            ));
-        }
-        out
+        let mut budget = cvd_budget(limits.max_tar_bytes, 2);
+        unpack::extract(unpack::Format::Gzip, payload, &mut budget)
+            .map_err(|h| format!("cvd gunzip: {}", h.reason))?
+            .into_iter()
+            .next()
+            .map(|e| e.data)
+            .ok_or_else(|| "cvd: empty gzip payload".to_string())?
     } else {
         if payload.len() as u64 > limits.max_tar_bytes {
-            return Err(format!(
-                "cvd payload exceeds {} bytes",
-                limits.max_tar_bytes
-            ));
+            return Err(format!("cvd payload exceeds {} bytes", limits.max_tar_bytes));
         }
         payload.to_vec()
     };
 
-    // Reuse the archive budget for per-member size/count accounting (no
-    // ratio or per-member cap beyond the shared total).
-    let mut budget = Budget::new(Limits {
-        max_recursion: 0,
-        max_files: limits.max_files as u64,
-        max_total_bytes: limits.max_total_bytes,
-        max_ratio: u64::MAX,
-        max_entry_bytes: limits.max_total_bytes,
-    });
-
-    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
-    let mut files = Vec::new();
-    for entry in archive.entries().map_err(|e| format!("cvd tar: {e}"))? {
-        budget.count_entry().map_err(|h| h.reason)?;
-        let mut entry = entry.map_err(|e| format!("cvd tar entry: {e}"))?;
-        let name = entry
-            .path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name.is_empty() {
-            continue;
-        }
-        let cap = budget.reserve().map_err(|h| h.reason)?;
-        let (buf, truncated) =
-            bounded_read(&mut entry, cap).map_err(|e| format!("cvd read {name}: {e}"))?;
-        if truncated {
-            return Err(format!(
-                "cvd members exceed {} bytes total",
-                limits.max_total_bytes
-            ));
-        }
-        budget.commit(buf.len() as u64);
-        files.push(DbFile { name, data: buf });
-    }
+    let mut budget = cvd_budget(limits.max_total_bytes, limits.max_files as u64);
+    let files = unpack::extract(unpack::Format::Tar, &tar_bytes, &mut budget)
+        .map_err(|h| format!("cvd tar: {}", h.reason))?
+        .into_iter()
+        .filter(|e| !e.name.is_empty())
+        .map(|e| DbFile {
+            name: e.name,
+            data: e.data,
+        })
+        .collect();
     Ok((header, files))
+}
+
+/// A permissive [`Budget`] for unpacking the TRUSTED CVD/CLD container: it caps
+/// total bytes + file count (so a corrupt or maliciously-oversized database is
+/// rejected rather than OOMing the loader) but disables the ratio / scan-byte /
+/// recursion bomb defenses, which exist for hostile *scan* input, not the DB.
+fn cvd_budget(max_bytes: u64, max_files: u64) -> Budget {
+    Budget::new(Limits {
+        max_recursion: 0,
+        max_files,
+        max_total_bytes: max_bytes,
+        max_ratio: u64::MAX,
+        max_entry_bytes: max_bytes,
+        max_scan_bytes: u64::MAX,
+    })
 }
 
 #[cfg(test)]

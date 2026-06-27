@@ -9,7 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-exav-core = { path = "../crates/exav-core" }
+# default-features off: the fuzz targets exercise the scan/unpack pipeline, not
+# the yara-x integration (which pulls the heavy wasmtime/cranelift tree and has
+# its own fuzz suite). Keeps the ASan build tractable on a single core.
+exav-core = { path = "../crates/exav-core", default-features = false }
 
 [[bin]]
 name = "analyze"

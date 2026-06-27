@@ -63,6 +63,103 @@ Other BSD-2-Clause components: mach2, zerocopy.
 
 
 -------------------------------------------------------------------------------
+1b. libarchive RAR5 reader — BSD-2-Clause (source derivative)
+-------------------------------------------------------------------------------
+
+The RAR5 (unpack50) decompressor in
+crates/exav-unpack/src/formats/rar5_unpack.rs is a Rust port of the
+decompression core of libarchive's archive_read_support_format_rar5.c. As a
+source derivative, BSD-2-Clause requires retaining the upstream copyright and
+licence text reproduced below.
+
+Upstream: https://github.com/libarchive/libarchive
+Copyright (c) 2018 Grzegorz Antoniak (http://antoniak.org)
+All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
+  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+  IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+-------------------------------------------------------------------------------
+1c. nwaples/rardecode RAR3 reader — BSD-2-Clause (source derivative)
+-------------------------------------------------------------------------------
+
+The RAR3/RAR4 (unpack29) decompressor in
+crates/exav-unpack/src/formats/rar3_unpack.rs is a Rust port of the
+decompression core of the Go package nwaples/rardecode. As a source
+derivative, BSD-2-Clause requires retaining the upstream copyright and licence
+text reproduced below.
+
+Upstream: https://github.com/nwaples/rardecode
+Copyright (c) 2015, Nicholas Waples
+All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+
+-------------------------------------------------------------------------------
+1d. ppmd-rust PPMd7 (var.H) model — CC0-1.0 OR MIT-0 (source derivative)
+-------------------------------------------------------------------------------
+
+The PPMd variant H decoder in crates/exav-unpack/src/formats/ppmd7/ is vendored
+and adapted from the `ppmd-rust` crate (version 1.4.0), generalised over a range
+decoder trait so it can be driven by either the 7-Zip or the RAR range coder.
+`ppmd-rust` is dual-licensed CC0-1.0 OR MIT-0 (public-domain-equivalent) and is
+itself a Rust port of Igor Pavlov's 7-Zip PPMd7, which implements
+Dmitry Shkarin's public-domain PPMd var.H (2001). It does NOT derive from
+UnRAR/RARLAB.
+
+Upstream: https://crates.io/crates/ppmd-rust
+License: CC0-1.0 OR MIT-0 (https://spdx.org/licenses/CC0-1.0,
+         https://spdx.org/licenses/MIT-0). Both place the work in (or treat it
+         as) the public domain; no attribution is legally required, and this
+         entry is recorded for completeness.
+
+The RAR-specific framing wired into crates/exav-unpack/src/formats/rar3_unpack.rs
+(the PPMd block header: order/sub-allocator-memory/escape bits; the RAR
+Subbotin carry-less range decoder in ppmd7/rangedec.rs; and the escape-symbol
+handling for the PPMd↔LZSS conversion) is reproduced from the public format
+description in libarchive's BSD-2-Clause archive_read_support_format_rar.c /
+archive_ppmd7.c (already attributed in section 1b above), NOT from UnRAR.
+
+
+-------------------------------------------------------------------------------
 2. wasmtime / cranelift / pulley stack — Apache-2.0 WITH LLVM-exception
 -------------------------------------------------------------------------------
 
