@@ -18,3 +18,4 @@ Cargo.lock.orig
 .env.local
 .env*.local
 .env
+.DS_Store

@@ -262,6 +262,8 @@ pub enum Format {
     Cpio,
     /// XAR archive (macOS `.pkg`/`.xip`).
     Xar,
+    /// Apple DMG disk image (UDIF).
+    Dmg,
 }
 
 /// Best-effort detection of an extractable container by magic bytes. Returns
@@ -310,6 +312,9 @@ pub fn detect(data: &[u8]) -> Option<Format> {
     }
     if data.starts_with(b"xar!") {
         return Some(Format::Xar);
+    }
+    if is_dmg(data) {
+        return Some(Format::Dmg);
     }
     if data.starts_with(b"!<arch>\n") {
         return Some(Format::Ar);
@@ -395,6 +400,7 @@ fn dispatch_extract<R>(
         Format::Ar => extract_ar(data, budget, visit),
         Format::Cpio => extract_cpio(data, budget, visit),
         Format::Xar => extract_xar(data, budget, visit),
+        Format::Dmg => extract_dmg(data, budget, visit),
     }
 }
 

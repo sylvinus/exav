@@ -11,8 +11,6 @@ rust-version.workspace = true
 thiserror = "2"
 # fast substring search (locating the UPX PackHeader magic)
 memchr = "2"
-# archive / compression formats
-flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # `default-features = false` drops `tar`'s `xattr` feature (extended-attribute
 # *restore* on disk extraction) — we extract to memory and never restore xattrs,
@@ -46,6 +44,15 @@ hmac = "0.12"
 sha1 = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 constant_time_eq = "0.3"
+# DMG support
+hfsplus = "0.2"
+apfs = "0.2"
+des = { version = "0.8", default-features = false }
+cbc = "0.1"
+bincode = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+flate2 = "1.1.9"
+dmg-core = "0.1.2"
 
 [features]
 # Verify RAR5-decompressed output against the header CRC-32 (debug assert).

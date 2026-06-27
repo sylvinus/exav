@@ -12,9 +12,9 @@ its members. Supported formats:
 `zip` · `rar` (pure-Rust, independent of UnRAR) · `7z` · `cab` · `arj` · `lha/lzh` ·
 `tar` · `gzip` · `xz` · `bzip2` · `iso9660` · `cpio` · `ar` · `xar` ·
 `ole2` (Office/MSI streams) · `pdf` (stream objects) · `email` (MIME parts) ·
-`upx` (decompressed original)
+`dmg` (Apple disk images, HFS+/APFS, including encrypted) · `upx` (decompressed original)
 
-Notably this includes a **pure-Rust RAR and UPX** decompressor — uncommon among
+Notably this includes a **pure-Rust RAR, UPX, and DMG** decompressor — uncommon among
 memory-safe tools.
 
 ## Usage

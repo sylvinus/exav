@@ -23,6 +23,8 @@ mod ppmd7;
 mod rar;
 mod rar3_unpack;
 mod rar5_unpack;
+mod dmg;
+mod udif;
 
 // Re-export the extractor entry points used by the dispatch in `lib.rs`.
 pub(crate) use gzip::extract_gzip;
@@ -44,6 +46,7 @@ pub(crate) use ar::extract_ar;
 pub(crate) use cpio::extract_cpio;
 pub(crate) use xar::extract_xar;
 pub(crate) use rar::extract_rar;
+pub(crate) use dmg::{extract_dmg, is_dmg};
 // Exposed for the rar5_check example / integration tests.
 pub use rar5_unpack::{unpack50, window_size_from_comp_info};
 // Exposed for the rar3_check example / integration tests.
