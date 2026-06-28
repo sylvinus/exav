@@ -19,7 +19,14 @@ fn be_u16(d: &[u8], p: usize) -> u64 {
 }
 fn be_u64(d: &[u8], p: usize) -> u64 {
     u64::from_be_bytes([
-        d[p], d[p + 1], d[p + 2], d[p + 3], d[p + 4], d[p + 5], d[p + 6], d[p + 7],
+        d[p],
+        d[p + 1],
+        d[p + 2],
+        d[p + 3],
+        d[p + 4],
+        d[p + 5],
+        d[p + 6],
+        d[p + 7],
     ])
 }
 

@@ -61,7 +61,7 @@ purpose.
 |---|---|
 | Signature coverage | ClamAV's curated DB is mature and enormous; exav *runs* those signatures but adds none of its own |
 | Large-DB memory | loading the full `main.cvd` is currently far more memory-hungry in exav — being worked on |
-| Archive breadth | exav unpacks zip/gzip/tar/bz2/xz/7z/cab/iso/lha/ole/pdf/email/DMG + UPX (NRV2B + stored only — the **default NRV2E**, plus NRV2D/LZMA, aren't decompressed yet); **RAR is not done** |
+| Archive breadth | exav unpacks zip/gzip/tar/bz2/xz/7z/cab/iso/lha/ole/pdf/email/DMG + UPX (all UCL methods + LZMA + DEFLATE); RAR3 (LZ + PPMd) + RAR5 (LZ) |
 | Maturity | ClamAV is 20+ years battle-tested; exav is alpha |
 
 exav re-uses ClamAV's signature *formats* (so the ecosystem's signatures work)
@@ -154,6 +154,51 @@ input).
 
 **clamscan-compatible** where it counts: exit codes `0` (clean) / `1` (found) / `2` (error), the `PATH: Signature FOUND` / `PATH: OK` output format, and the common flags (`-r -i --bell -d --datadir --max-filesize --max-scansize --allmatch --exclude --exclude-dir --include --quiet --no-summary`). `--datadir` (default `exav-db`) is the directory exav auto-loads signatures from when `-d` is omitted. It diverges only by *adding* — notably the never-silent-skip behavior, `http(s)://` URL targets, the prebuilt cache, the daemon, and informational findings under `-v`.
 
+### WASM sandbox (untrusted signatures)
+
+If you're loading **untrusted signature databases** — third-party `.ndb` sets,
+community YARA rules, anything you didn't build yourself — run the scanner
+inside a **WASM sandbox**. The same `exav-core` engine compiles to
+`wasm32-wasip1` and runs under [wasmtime](https://wasmtime.dev/) with **no
+custom host binary**: you bring your own audited runtime.
+
+```sh
+# Build the WASM module
+cargo build --release --target wasm32-wasip1 -p exav-wasm
+wasm-tools strip -a target/wasm32-wasip1/release/exav_wasm.wasm -o exav.wasm
+
+# Scan a file (sigs mounted at /db, CWD mounted at /)
+wasmtime \
+  --dir /path/to/sigs::/db \
+  --dir .::. \
+  exav.wasm \
+  /db malware.exe
+
+# Multiple files
+wasmtime --dir ./sigs::/db --dir .::. exav.wasm /db *.exe
+```
+
+JSON results go to stdout (pipe to `jq`), progress/errors to stderr:
+
+```json
+{"verdict":{"Infected":{"signature":"Win.Trojan.Agent-1234","offset":0,"method":"Pattern"}},"findings":[]}
+```
+
+**Why this matters:**
+
+| | Native `exav` | WASM sandbox |
+|---|---|---|
+| Signature trust | full host access | memory-limited WASM instance |
+| Runtime | your code | wasmtime (ByteCode Alliance, audited) |
+| Blast radius | entire host | isolated WASM module, fuel-limited |
+| Custom host code | N/A | **none** — users bring their own wasmtime |
+| Overhead | native speed | ~10-20% (JIT compilation) |
+
+The module is a standard WASI command — no `unsafe` ABI, no custom wire
+protocol, no embed-by-importing-a-crate. Any WASM runtime that supports
+`wasm32-wasip1` works. See [`docs/WASM.md`](docs/WASM.md) for the full
+architecture and threat model.
+
 ## What works today
 
 - **Constant-memory streaming core** — Aho-Corasick multi-pattern matching + MD5/SHA1/SHA256 hashing in a single forward pass, matching across buffer boundaries, on inputs larger than RAM.
@@ -186,6 +231,7 @@ Two input modes:
 | `exav-unpack` | bounded, in-memory archive/document extraction (zip/gzip/tar/xz/bzip2/cab/7z/ISO/LHA/DMG, OLE2/PDF/MIME, UPX), with the decompression-bomb budget |
 | `exav-core` | engine: streaming + seekable scan, signatures (`patterns`/`hashes`/`cvd`/`db`), YARA (`yara`, via yara-x), bytecode (`bytecode`), `cache` (prebuilt DB serialization), `pe`, `fuzzy`, `ml`, `filetype`, `source` (HTTP range backend) |
 | `exav-cli`  | the `exav` binary, clamscan-compatible front-end + daemon |
+| `exav-wasm` | WASI command: same scanner compiled to `wasm32-wasip1`, runs inside any WASM runtime (wasmtime, wasmer) with zero custom host code |
 
 ## Limitations
 

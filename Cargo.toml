@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/exav-core", "crates/exav-cli", "crates/exav-unpack", "crates/exav-unpack-cli"]
-exclude = ["fuzz", "crates/exav-unpack-wasm"]
+members = ["crates/exav-core", "crates/exav-cli", "crates/exav-unpack", "crates/exav-unpack-cli", "crates/exav-wasm"]
+exclude = ["fuzz", "crates/exav-unpack/fuzz", "crates/exav-unpack-wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,3 +21,9 @@ walkdir = "2.5"
 # per-file catch_unwind in the CLI.
 [profile.release]
 overflow-checks = true
+
+# Upstream PR: https://github.com/mdsteele/rust-cab/pull/38
+# Fixes panic on CAB folders with zero data blocks (folder.rs:134 OOB).
+# Drop this patch once cab 0.7.0+ ships the fix.
+[patch.crates-io]
+cab = { git = "https://github.com/ozzieba/rust-cab", branch = "fix-empty-data-blocks-panic" }

@@ -134,7 +134,8 @@ fn parse_encrypted_header(data: &[u8]) -> Result<EncryptedDmgHeader, LimitHit> {
 
 /// Derive a 24-byte key from password using PBKDF2-HMAC-SHA1.
 fn derive_key_dmg(password: &[u8], salt: &[u8; 32], salt_len: u32, iterations: u32) -> [u8; 24] {
-    let iter = std::num::NonZeroU32::new(iterations).unwrap_or(std::num::NonZeroU32::new(1000).unwrap());
+    let iter =
+        std::num::NonZeroU32::new(iterations).unwrap_or(std::num::NonZeroU32::new(1000).unwrap());
     let mut key = [0u8; 24];
     pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, &salt[..salt_len as usize], iter.get(), &mut key);
     key
@@ -170,7 +171,9 @@ fn decrypt_keyblob(
         .map_err(|_| LimitHit::corrupt("invalid 3DES key/iv length".into()))?;
     let plaintext = decryptor
         .decrypt_padded_mut::<NoPadding>(&mut buf)
-        .map_err(|_| LimitHit::corrupt("3DES keyblob decryption failed (wrong password?)".into()))?;
+        .map_err(|_| {
+            LimitHit::corrupt("3DES keyblob decryption failed (wrong password?)".into())
+        })?;
     Ok(plaintext.to_vec())
 }
 
@@ -221,7 +224,9 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
     // Decrypt keyblob to get AES key + HMAC key.
     let keyblob = decrypt_keyblob(&header, &derived_key)?;
     if keyblob.len() < aes_key_bytes + hmac_key_bytes {
-        return Err(LimitHit::corrupt("keyblob too short after decryption".into()));
+        return Err(LimitHit::corrupt(
+            "keyblob too short after decryption".into(),
+        ));
     }
     let aes_key = &keyblob[..aes_key_bytes];
     let hmac_key = &keyblob[aes_key_bytes..aes_key_bytes + hmac_key_bytes];
@@ -264,7 +269,11 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
             let mut buf = chunk_buf[..chunk_size].to_vec();
             match decryptor.decrypt_padded_mut::<NoPadding>(&mut buf) {
                 Ok(pt) => plaintext.extend_from_slice(&pt[..to_write]),
-                Err(_) => return Err(LimitHit::corrupt("AES-128 decryption failed (wrong password?)".into())),
+                Err(_) => {
+                    return Err(LimitHit::corrupt(
+                        "AES-128 decryption failed (wrong password?)".into(),
+                    ))
+                }
             }
         } else {
             let decryptor = Aes256Cbc::new_from_slices(aes_key, &iv)
@@ -272,7 +281,11 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
             let mut buf = chunk_buf[..chunk_size].to_vec();
             match decryptor.decrypt_padded_mut::<NoPadding>(&mut buf) {
                 Ok(pt) => plaintext.extend_from_slice(&pt[..to_write]),
-                Err(_) => return Err(LimitHit::corrupt("AES-256 decryption failed (wrong password?)".into())),
+                Err(_) => {
+                    return Err(LimitHit::corrupt(
+                        "AES-256 decryption failed (wrong password?)".into(),
+                    ))
+                }
             }
         }
     }
@@ -393,15 +406,12 @@ fn extract_hfs_with_crate<R>(
         if we.entry.kind != hfsplus::EntryKind::File {
             continue;
         }
-        match vol.read_file(&we.path) {
-            Ok(file_data) => {
-                budget.count_entry()?;
-                let entry = Entry::new(we.path, file_data);
-                if let Some(r) = visit(entry, budget) {
-                    return Ok(Some(r));
-                }
+        if let Ok(file_data) = vol.read_file(&we.path) {
+            budget.count_entry()?;
+            let entry = Entry::new(we.path, file_data);
+            if let Some(r) = visit(entry, budget) {
+                return Ok(Some(r));
             }
-            Err(_) => {}
         }
     }
     Ok(None)
@@ -425,15 +435,12 @@ fn extract_apfs<R>(
         if we.entry.kind != apfs::EntryKind::File {
             continue;
         }
-        match vol.read_file(&we.path) {
-            Ok(file_data) => {
-                budget.count_entry()?;
-                let entry = Entry::new(we.path, file_data);
-                if let Some(r) = visit(entry, budget) {
-                    return Ok(Some(r));
-                }
+        if let Ok(file_data) = vol.read_file(&we.path) {
+            budget.count_entry()?;
+            let entry = Entry::new(we.path, file_data);
+            if let Some(r) = visit(entry, budget) {
+                return Ok(Some(r));
             }
-            Err(_) => {}
         }
     }
     Ok(None)

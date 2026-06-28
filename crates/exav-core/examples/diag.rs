@@ -10,8 +10,17 @@ fn main() {
     let db = cache::load(std::path::Path::new(&cache_path)).expect("load cache");
     let data = std::fs::read(&file).unwrap();
     let ft = filetype::identify(&data);
-    let layout = if ft == filetype::FileType::Pe { pe::layout(&data) } else { None };
-    eprintln!("{} bytes, ft={:?}, sigs={}", data.len(), ft, db.signature_count());
+    let layout = if ft == filetype::FileType::Pe {
+        pe::layout(&data)
+    } else {
+        None
+    };
+    eprintln!(
+        "{} bytes, ft={:?}, sigs={}",
+        data.len(),
+        ft,
+        db.signature_count()
+    );
 
     // Real scan path (early-return + budget), averaged over a few runs.
     let mut real_ms = f64::MAX;
@@ -41,7 +50,10 @@ fn main() {
         d[2] as f64 / (d[0] + d[1]).max(1) as f64,
     );
     let (us, bid) = db.engine.diag_slowest();
-    eprintln!("  slowest verify: {us} us  body[{bid}] = {}", db.engine.describe_body(bid));
+    eprintln!(
+        "  slowest verify: {us} us  body[{bid}] = {}",
+        db.engine.describe_body(bid)
+    );
     eprintln!("  anchor-length histogram (len: hits fanout):");
     for (len, (hits, fan)) in db.engine.scan_diag_hist(&data, ft).into_iter().enumerate() {
         if hits > 0 {

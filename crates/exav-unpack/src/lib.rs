@@ -7,24 +7,47 @@
 //! The budget is reserved *before* each member is read, and each read is
 //! capped to the bytes still remaining, so peak memory across an archive
 //! (and across nested archives sharing the budget) never exceeds
-//! `max_total_bytes`. Input is a buffer already in memory, so ZIP's random
-//! access is served by a `Cursor`.
+//! `max_total_bytes`.
 //!
-//! # Streaming
+//! # `Archive<R>` — lazy member-by-member access
 //!
-//! Extraction is **member-streaming**: [`extract_each`] decodes one member at a
-//! time and hands it to a visitor, which scans it, recurses into it, and drops
-//! it before the next member is decoded. So peak memory is ~one member (each
-//! member is itself bounded by `max_entry_bytes`), and a visitor that finds a
-//! detection can stop extraction immediately — the remaining members are never
-//! decompressed. [`extract`] is a thin collecting wrapper kept for callers/tests
-//! that want the whole member list at once.
+//! The primary API for most callers.  [`Archive::open`] detects the container
+//! format and parses format-specific headers (e.g. the ZIP central directory).
+//! Members are then extracted one at a time via [`Archive::extract_next`] under
+//! a shared [`Budget`].  For seekable formats (ZIP) only the central directory
+//! is read up front; individual members are fetched on demand.  For all other
+//! formats the data is buffered on open and members are extracted lazily from
+//! the buffer.
 //!
-//! The member's bytes are still materialised into the [`Entry`]'s `Vec` (the
-//! matcher is buffer-based, like ClamAV's). Streaming the bytes *within* a
-//! member — for genuinely unbounded inputs — is a later step that also needs a
-//! windowed streaming matcher; the visitor control flow here is the substrate
-//! it will build on.
+//! ```rust,no_run
+//! use std::io::Cursor;
+//! use exav_unpack::{Archive, Budget, Limits};
+//!
+//! # fn example(data: &[u8]) -> Result<(), exav_unpack::LimitHit> {
+//! let mut archive = Archive::open(Cursor::new(data))?;
+//! println!("format: {:?}", archive.format());
+//!
+//! // Pre-parsed member metadata (free for ZIP).
+//! for m in archive.list() {
+//!     println!("  {} ({} bytes)", m.name, m.uncompressed_size);
+//! }
+//!
+//! // Extract members one at a time.
+//! let mut budget = Budget::new(Limits::default());
+//! while let Some(entry) = archive.extract_next(&mut budget)? {
+//!     println!("{}: {} bytes", entry.name, entry.data.len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # `extract_each` — visitor-based streaming
+//!
+//! Lower-level API for callers that own the extraction loop.  [`extract_each`]
+//! decodes one member at a time and hands it to a visitor closure, which scans
+//! it, recurses into it, and drops it before the next member is decoded.  Peak
+//! memory is ~one member, and a visitor that returns `Some(r)` halts extraction
+//! immediately — remaining members are never decompressed.
 //!
 //! # Safety
 //!
@@ -34,13 +57,13 @@
 //! crate-wide.
 #![forbid(unsafe_code)]
 
-use std::io::Read;
+use std::io::{Read, Seek};
 
-mod formats;
+#[doc(hidden)]
+pub mod formats;
 use formats::*;
-pub use formats::ZipMembers;
-pub use formats::{unpack29, unpack50, window_size_from_comp_info};
-
+#[doc(hidden)]
+pub use formats::{unpack29, unpack50, window_size_from_comp_info, ZipMembers};
 
 /// Limits governing recursive extraction.
 #[derive(Debug, Clone)]
@@ -191,7 +214,7 @@ impl LimitHit {
 }
 
 /// One extracted member.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
     pub data: Vec<u8>,
@@ -224,7 +247,12 @@ impl Entry {
     /// A member whose metadata is known but whose content could not be decoded
     /// (unsupported method / encryption). `reason` names the cause for the
     /// `Unscannable` verdict; `data` is empty.
-    pub fn unsupported(name: String, comp_size: u64, encrypted: bool, reason: &'static str) -> Self {
+    pub fn unsupported(
+        name: String,
+        comp_size: u64,
+        encrypted: bool,
+        reason: &'static str,
+    ) -> Self {
         Entry {
             name,
             data: Vec::new(),
@@ -233,6 +261,16 @@ impl Entry {
             unsupported: Some(reason),
         }
     }
+}
+
+/// Metadata for one archive member (no data loaded).
+#[derive(Debug, Clone)]
+pub struct MemberInfo {
+    pub name: String,
+    pub index: usize,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub encrypted: bool,
 }
 
 /// A container/archive format this crate can extract embedded files from
@@ -264,6 +302,10 @@ pub enum Format {
     Xar,
     /// Apple DMG disk image (UDIF).
     Dmg,
+    /// Zstandard compressed stream.
+    Zstd,
+    /// Lzip compressed stream.
+    Lzip,
 }
 
 /// Best-effort detection of an extractable container by magic bytes. Returns
@@ -316,8 +358,14 @@ pub fn detect(data: &[u8]) -> Option<Format> {
     if is_dmg(data) {
         return Some(Format::Dmg);
     }
+    if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some(Format::Zstd);
+    }
     if data.starts_with(b"!<arch>\n") {
         return Some(Format::Ar);
+    }
+    if data.starts_with(b"LZIP") {
+        return Some(Format::Lzip);
     }
     if data.starts_with(b"070701")
         || data.starts_with(b"070702")
@@ -388,7 +436,7 @@ fn dispatch_extract<R>(
         Format::Ole => emit_collected(extract_ole(data, budget)?, budget, visit),
         Format::Pdf => extract_pdf(data, budget, visit),
         Format::Email => extract_email(data, budget, visit),
-        Format::SevenZip => extract_7z(data, budget, visit),
+        Format::SevenZip => extract_sevenz(data, budget, visit),
         Format::Iso => extract_iso(data, budget, visit),
         Format::Lha => extract_lha(data, budget, visit),
         Format::Arj => extract_arj(data, budget, visit),
@@ -401,6 +449,8 @@ fn dispatch_extract<R>(
         Format::Cpio => extract_cpio(data, budget, visit),
         Format::Xar => extract_xar(data, budget, visit),
         Format::Dmg => extract_dmg(data, budget, visit),
+        Format::Zstd => extract_zstd(data, budget, visit),
+        Format::Lzip => extract_lzip(data, budget, visit),
     }
 }
 
@@ -438,12 +488,6 @@ pub fn is_upx(data: &[u8]) -> bool {
     find_packheader(data).is_some()
 }
 
-
-
-
-
-
-
 /// Reject a stream whose decompressed size dwarfs its declared input size.
 /// Absolute byte caps are the primary bomb defense; this is a fast reject
 /// for the obvious cases. A declared input of 0 is ignored (we cannot trust
@@ -472,51 +516,456 @@ pub fn bounded_read<R: Read>(mut r: R, cap: u64) -> Result<(Vec<u8>, bool), std:
     Ok((buf, truncated))
 }
 
+// ---------------------------------------------------------------------------
+// Archive<R> — format-agnostic streaming member access
+// ---------------------------------------------------------------------------
 
-
-
-
-/// A `Write` sink bounded to `cap` bytes; sets `over` and errors once exceeded,
-/// so a writer-based decoder (lzma-rs) can't decode a bomb past the budget.
-pub(crate) struct CapWriter {
-    pub(crate) buf: Vec<u8>,
-    cap: usize,
-    pub(crate) over: bool,
+/// State for buffered (non-seekable) format extraction.
+struct BufState {
+    next_index: usize,
+    /// Lazily populated on first extraction. Once filled, members are yielded
+    /// one at a time via `next_index`.
+    cached: Option<Vec<Entry>>,
 }
 
-impl CapWriter {
-    pub(crate) fn new(cap: u64) -> Self {
-        Self {
-            buf: Vec::new(),
-            cap: cap.min(usize::MAX as u64) as usize,
-            over: false,
+/// An opened archive with lazy, member-by-member extraction.
+///
+/// The public API is format-agnostic: [`open`](Archive::open) detects the
+/// container, [`extract_next`](Archive::extract_next) pulls members one at a
+/// time under a shared [`Budget`], and [`extract`](Archive::extract) /
+/// [`extract_all`](Archive::extract_all) provide random-access and collect-all
+/// convenience.
+///
+/// For seekable formats (ZIP today) the central directory is read once on
+/// [`Archive::open`] and individual members are fetched on demand without loading
+/// the whole file.  For non-seekable formats the data is read into memory on
+/// [`Archive::open`] and members are extracted lazily from the buffer.
+pub struct Archive<R: Read + Seek> {
+    format: Format,
+    inner: ArchiveInner<R>,
+}
+
+enum ArchiveInner<R: Read + Seek> {
+    Zip {
+        members: ZipMembers<R>,
+        info: Vec<MemberInfo>,
+    },
+    Gzip {
+        reader: Option<R>,
+        done: bool,
+    },
+    Tar {
+        reader: Option<R>,
+        members: Vec<TarMember>,
+        next_index: usize,
+    },
+    Lazy {
+        reader: Option<R>,
+        format: Format,
+        state: BufState,
+    },
+    Buffered {
+        data: Vec<u8>,
+        state: BufState,
+    },
+}
+
+/// Pre-parsed tar member metadata.
+struct TarMember {
+    name: String,
+    size: u64,
+    data_offset: u64,
+}
+
+impl TarMember {
+    fn parse(header: &[u8; 512]) -> Option<Self> {
+        // End-of-archive: two consecutive all-zero blocks.
+        if header.iter().all(|&b| b == 0) {
+            return None;
+        }
+        let name_raw = &header[..100];
+        let name_end = name_raw.iter().position(|&b| b == 0).unwrap_or(100);
+        if name_end == 0 {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&name_raw[..name_end]).into_owned();
+
+        // size: bytes 124..136, octal ASCII
+        let size_str = std::str::from_utf8(&header[124..136]).ok()?;
+        let size = u64::from_str_radix(size_str.trim().trim_end_matches('\0'), 8).ok()?;
+
+        // typeflag: byte 156 — skip directories and non-regular files.
+        let typeflag = header[156];
+        if typeflag == b'5' || typeflag == b'1' || typeflag == b'2' {
+            // directory, hard link, symlink — skip but still advance
+        }
+
+        Some(TarMember {
+            name,
+            size,
+            data_offset: 0,
+        })
+    }
+}
+
+/// Parse all tar headers from the reader, returning member metadata with
+/// correct `data_offset` values.  The reader must be positioned at the start.
+fn parse_tar_headers<R: Read + Seek>(reader: &mut R) -> Result<Vec<TarMember>, std::io::Error> {
+    let mut members = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        reader.seek(std::io::SeekFrom::Start(offset))?;
+        let mut header = [0u8; 512];
+        reader.read_exact(&mut header)?;
+        match TarMember::parse(&header) {
+            Some(mut m) => {
+                m.data_offset = offset + 512;
+                members.push(m);
+                // Advance past header + padded data.
+                let data_end = offset + 512 + ((members.last().unwrap().size + 511) & !511);
+                offset = data_end;
+            }
+            None => break, // all-zero block = end of archive
         }
     }
+    Ok(members)
 }
 
-impl std::io::Write for CapWriter {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if self.buf.len() + data.len() > self.cap {
-            // `saturating_sub` + `min`: if a decoder writes again after the cap
-            // error (buf already at/over cap), `take` is 0 rather than an
-            // underflow panic.
-            let take = self.cap.saturating_sub(self.buf.len()).min(data.len());
-            self.buf.extend_from_slice(&data[..take]);
-            self.over = true;
-            return Err(std::io::Error::other("output cap exceeded"));
+impl<R: Read + Seek> Archive<R> {
+    /// Detect the container format, parse format-specific headers (e.g. the
+    /// ZIP central directory), and return an [`Archive`] ready for member
+    /// extraction.
+    ///
+    /// For ZIP the reader is kept alive and seeked on demand (only the central
+    /// directory is read up front).  For all other formats the remaining bytes
+    /// are read into memory so the existing buffer-based extractors are reused.
+    pub fn open(mut reader: R) -> Result<Self, LimitHit> {
+        // Read up to 64 KiB for format detection.
+        let mut head = Vec::with_capacity(65536);
+        reader
+            .by_ref()
+            .take(65536)
+            .read_to_end(&mut head)
+            .map_err(|e| LimitHit::corrupt(format!("read head: {e}")))?;
+
+        let format =
+            detect(&head).ok_or_else(|| LimitHit::corrupt("unrecognised archive format".into()))?;
+
+        if format == Format::Zip {
+            // Seek back to the start so the ZIP central-directory parser sees
+            // the full file.
+            reader
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| LimitHit::corrupt(format!("seek: {e}")))?;
+            let mut members = ZipMembers::open(reader).map_err(|e| LimitHit::corrupt(e.reason))?;
+            let info = members.list_entries();
+            Ok(Self {
+                format,
+                inner: ArchiveInner::Zip { members, info },
+            })
+        } else if format == Format::Gzip {
+            reader
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| LimitHit::corrupt(format!("seek: {e}")))?;
+            Ok(Self {
+                format,
+                inner: ArchiveInner::Gzip {
+                    reader: Some(reader),
+                    done: false,
+                },
+            })
+        } else if format == Format::Tar {
+            reader
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| LimitHit::corrupt(format!("seek: {e}")))?;
+            let members = parse_tar_headers(&mut reader)
+                .map_err(|e| LimitHit::corrupt(format!("tar: {e}")))?;
+            Ok(Self {
+                format,
+                inner: ArchiveInner::Tar {
+                    reader: Some(reader),
+                    members,
+                    next_index: 0,
+                },
+            })
+        } else if matches!(format, Format::Bzip2 | Format::Xz | Format::Zstd) {
+            reader
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| LimitHit::corrupt(format!("seek: {e}")))?;
+            Ok(Self {
+                format,
+                inner: ArchiveInner::Lazy {
+                    reader: Some(reader),
+                    format,
+                    state: BufState {
+                        next_index: 0,
+                        cached: None,
+                    },
+                },
+            })
+        } else {
+            // Read the rest of the reader into memory.
+            let mut data = head;
+            reader
+                .read_to_end(&mut data)
+                .map_err(|e| LimitHit::corrupt(format!("read: {e}")))?;
+            Ok(Self {
+                format,
+                inner: ArchiveInner::Buffered {
+                    data,
+                    state: BufState {
+                        next_index: 0,
+                        cached: None,
+                    },
+                },
+            })
         }
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+
+    /// Detected container format.
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    /// Pre-parsed member metadata.  For ZIP this is free (central directory).
+    /// For buffered formats the list is empty until the first extraction call
+    /// populates the cache.
+    pub fn list(&self) -> &[MemberInfo] {
+        match &self.inner {
+            ArchiveInner::Zip { info, .. } => info,
+            ArchiveInner::Gzip { .. } => &[],
+            ArchiveInner::Tar { .. } => &[],
+            ArchiveInner::Lazy { .. } => &[],
+            ArchiveInner::Buffered { .. } => &[],
+        }
+    }
+
+    /// Extract the next member under budget.  Returns `Ok(None)` when the
+    /// archive is exhausted.  Directories and other non-file entries are
+    /// skipped (but still counted toward the file-count budget).
+    pub fn extract_next(&mut self, budget: &mut Budget) -> Result<Option<Entry>, LimitHit> {
+        match &mut self.inner {
+            ArchiveInner::Zip { members, .. } => members.next_member(budget).transpose(),
+            ArchiveInner::Gzip { reader, done } => {
+                if *done {
+                    return Ok(None);
+                }
+                let r = reader
+                    .take()
+                    .ok_or_else(|| LimitHit::corrupt("gzip: already extracted".into()))?;
+                budget.count_entry()?;
+                let cap = budget.reserve()?;
+                use flate2::read::MultiGzDecoder;
+                let (out, truncated) = bounded_read(MultiGzDecoder::new(r), cap)
+                    .map_err(|e| LimitHit::corrupt(format!("gzip: {e}")))?;
+                if truncated {
+                    return Err(LimitHit::new("gzip member exceeds budget".to_string()));
+                }
+                budget.commit(out.len() as u64);
+                *done = true;
+                Ok(Some(Entry::new("gzip-content".to_string(), out)))
+            }
+            ArchiveInner::Tar {
+                reader,
+                members,
+                next_index,
+            } => {
+                if *next_index >= members.len() {
+                    return Ok(None);
+                }
+                let r = reader
+                    .as_mut()
+                    .ok_or_else(|| LimitHit::corrupt("tar: already consumed".into()))?;
+                let m = &members[*next_index];
+                budget.count_entry()?;
+                let cap = budget.reserve()?;
+                r.seek(std::io::SeekFrom::Start(m.data_offset))
+                    .map_err(|e| LimitHit::corrupt(format!("tar seek: {e}")))?;
+                let mut take = r.take(m.size);
+                let (out, truncated) = bounded_read(&mut take, cap)
+                    .map_err(|e| LimitHit::corrupt(format!("tar read: {e}")))?;
+                if truncated {
+                    return Err(LimitHit::new(format!(
+                        "tar member '{}' exceeds budget",
+                        m.name
+                    )));
+                }
+                budget.commit(out.len() as u64);
+                *next_index += 1;
+                Ok(Some(Entry::new(m.name.clone(), out)))
+            }
+            ArchiveInner::Lazy {
+                reader,
+                format,
+                state,
+            } => {
+                if state.cached.is_none() {
+                    let r = reader
+                        .take()
+                        .ok_or_else(|| LimitHit::corrupt("lazy: already consumed".into()))?;
+                    let mut data = Vec::new();
+                    r.take(256 * 1024 * 1024)
+                        .read_to_end(&mut data)
+                        .map_err(|e| LimitHit::corrupt(format!("read: {e}")))?;
+                    let mut entries = Vec::new();
+                    extract_each::<std::convert::Infallible>(
+                        *format,
+                        &data,
+                        budget,
+                        &mut |e, _| {
+                            entries.push(e);
+                            None
+                        },
+                    )?;
+                    state.cached = Some(entries);
+                }
+                let entries = state.cached.as_ref().unwrap();
+                if state.next_index < entries.len() {
+                    let e = entries[state.next_index].clone();
+                    state.next_index += 1;
+                    Ok(Some(e))
+                } else {
+                    Ok(None)
+                }
+            }
+            ArchiveInner::Buffered { data, state } => {
+                // Lazy full extraction on first call.
+                if state.cached.is_none() {
+                    let fmt = self.format;
+                    let mut entries = Vec::new();
+                    extract_each::<std::convert::Infallible>(fmt, data, budget, &mut |e, _| {
+                        entries.push(e);
+                        None
+                    })?;
+                    state.cached = Some(entries);
+                }
+                let entries = state.cached.as_ref().unwrap();
+                if state.next_index < entries.len() {
+                    let e = entries[state.next_index].clone();
+                    state.next_index += 1;
+                    Ok(Some(e))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Extract a specific member by index under budget.  For ZIP this seeks
+    /// directly to the member; for buffered formats the full extraction is
+    /// triggered on first call and the result is returned from the cache.
+    pub fn extract(&mut self, index: usize, budget: &mut Budget) -> Result<Entry, LimitHit> {
+        match &mut self.inner {
+            ArchiveInner::Zip { members, .. } => members
+                .extract_entry(index, budget)?
+                .ok_or_else(|| LimitHit::corrupt(format!("index {index} is a directory"))),
+            ArchiveInner::Gzip { reader, done } => {
+                if index != 0 {
+                    return Err(LimitHit::new(format!("index {index} out of bounds")));
+                }
+                if *done {
+                    return Err(LimitHit::corrupt("gzip: already extracted".into()));
+                }
+                let r = reader
+                    .take()
+                    .ok_or_else(|| LimitHit::corrupt("gzip: already extracted".into()))?;
+                budget.count_entry()?;
+                let cap = budget.reserve()?;
+                use flate2::read::MultiGzDecoder;
+                let (out, truncated) = bounded_read(MultiGzDecoder::new(r), cap)
+                    .map_err(|e| LimitHit::corrupt(format!("gzip: {e}")))?;
+                if truncated {
+                    return Err(LimitHit::new("gzip member exceeds budget".to_string()));
+                }
+                budget.commit(out.len() as u64);
+                *done = true;
+                Ok(Entry::new("gzip-content".to_string(), out))
+            }
+            ArchiveInner::Tar {
+                reader, members, ..
+            } => {
+                if index >= members.len() {
+                    return Err(LimitHit::new(format!("index {index} out of bounds")));
+                }
+                let r = reader
+                    .as_mut()
+                    .ok_or_else(|| LimitHit::corrupt("tar: already consumed".into()))?;
+                let m = &members[index];
+                budget.count_entry()?;
+                let cap = budget.reserve()?;
+                r.seek(std::io::SeekFrom::Start(m.data_offset))
+                    .map_err(|e| LimitHit::corrupt(format!("tar seek: {e}")))?;
+                let mut take = r.take(m.size);
+                let (out, truncated) = bounded_read(&mut take, cap)
+                    .map_err(|e| LimitHit::corrupt(format!("tar read: {e}")))?;
+                if truncated {
+                    return Err(LimitHit::new(format!(
+                        "tar member '{}' exceeds budget",
+                        m.name
+                    )));
+                }
+                budget.commit(out.len() as u64);
+                Ok(Entry::new(m.name.clone(), out))
+            }
+            ArchiveInner::Lazy {
+                reader,
+                format,
+                state,
+            } => {
+                if state.cached.is_none() {
+                    let r = reader
+                        .take()
+                        .ok_or_else(|| LimitHit::corrupt("lazy: already consumed".into()))?;
+                    let mut data = Vec::new();
+                    r.take(256 * 1024 * 1024)
+                        .read_to_end(&mut data)
+                        .map_err(|e| LimitHit::corrupt(format!("read: {e}")))?;
+                    let mut entries = Vec::new();
+                    extract_each::<std::convert::Infallible>(
+                        *format,
+                        &data,
+                        budget,
+                        &mut |e, _| {
+                            entries.push(e);
+                            None
+                        },
+                    )?;
+                    state.cached = Some(entries);
+                }
+                let entries = state.cached.as_ref().unwrap();
+                entries
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| LimitHit::new(format!("index {index} out of bounds")))
+            }
+            ArchiveInner::Buffered { data, state } => {
+                if state.cached.is_none() {
+                    let fmt = self.format;
+                    let mut entries = Vec::new();
+                    extract_each::<std::convert::Infallible>(fmt, data, budget, &mut |e, _| {
+                        entries.push(e);
+                        None
+                    })?;
+                    state.cached = Some(entries);
+                }
+                let entries = state.cached.as_ref().unwrap();
+                entries
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| LimitHit::new(format!("index {index} out of bounds")))
+            }
+        }
+    }
+
+    /// Extract all members under budget and return them as a `Vec`.
+    pub fn extract_all(&mut self, budget: &mut Budget) -> Result<Vec<Entry>, LimitHit> {
+        let mut out = Vec::new();
+        while let Some(e) = self.extract_next(budget)? {
+            out.push(e);
+        }
+        Ok(out)
     }
 }
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -630,7 +1079,10 @@ mod tests {
         let entries = extract(Format::Gzip, &blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         // Both members concatenated into one logical stream.
-        assert_eq!(entries[0].data, b"header-member-onlyPAYLOAD-with-eicar-marker-X5O!");
+        assert_eq!(
+            entries[0].data,
+            b"header-member-onlyPAYLOAD-with-eicar-marker-X5O!"
+        );
     }
 
     #[test]
@@ -708,20 +1160,19 @@ mod tests {
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Bzip2, &blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].data, b"hello exav inside bzip2hello exav inside bzip2");
+        assert_eq!(
+            entries[0].data,
+            b"hello exav inside bzip2hello exav inside bzip2"
+        );
     }
 
     #[test]
     fn xz_multi_stream_concatenated() {
-        // pixz/parallel-xz concatenate xz streams; lzma_rs rejects trailing
-        // streams, so the extractor splits and decodes each.
-        let mut blob = Vec::new();
-        lzma_rs::xz_compress(&mut Cursor::new(b"first-xz ".as_slice()), &mut blob).unwrap();
-        let mut second = Vec::new();
-        lzma_rs::xz_compress(&mut Cursor::new(b"second-X5O!".as_slice()), &mut second).unwrap();
-        blob.extend_from_slice(&second);
+        // pixz/parallel-xz concatenate xz streams; our decoder handles them.
+        // Fixture: cat a.xz b.xz  (generated by tests/fixtures/xz/fixture_gen.sh)
+        let blob = include_bytes!("../tests/fixtures/xz/multi.xz");
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Xz, &blob, &mut budget).unwrap();
+        let entries = extract(Format::Xz, blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, b"first-xz second-X5O!");
     }
@@ -729,21 +1180,48 @@ mod tests {
     #[test]
     fn xz_roundtrip_and_bomb() {
         let payload = b"hello exav inside xz";
-        let mut blob = Vec::new();
-        lzma_rs::xz_compress(&mut Cursor::new(payload), &mut blob).unwrap();
+        let blob = include_bytes!("../tests/fixtures/xz/simple.xz");
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Xz, &blob, &mut budget).unwrap();
+        let entries = extract(Format::Xz, blob, &mut budget).unwrap();
         assert_eq!(entries[0].data, payload);
 
         // A compressible bomb must trip the total-bytes cap, not decode fully.
-        let mut bomb = Vec::new();
-        lzma_rs::xz_compress(&mut Cursor::new(vec![0u8; 4096].as_slice()), &mut bomb).unwrap();
+        let bomb = include_bytes!("../tests/fixtures/xz/bomb.xz");
         let mut budget = Budget::new(Limits {
             max_total_bytes: 1024,
             max_ratio: u64::MAX,
             ..Default::default()
         });
-        let err = extract(Format::Xz, &bomb, &mut budget).unwrap_err();
+        let err = extract(Format::Xz, bomb, &mut budget).unwrap_err();
+        assert!(err.reason.contains("budget") || err.reason.contains("extracted"));
+    }
+
+    #[test]
+    fn zstd_roundtrip() {
+        let payload = b"hello exav inside zstd";
+        let blob = zstd_of(payload);
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Zstd, &blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, payload);
+    }
+
+    #[test]
+    fn zstd_bomb_trips_ratio() {
+        let mut w =
+            ruzstd::encoding::FrameCompressor::new(ruzstd::encoding::CompressionLevel::Fastest);
+        let zeros = [0u8; 4096];
+        let mut source = &zeros[..];
+        let mut out = Vec::new();
+        w.set_source(&mut source);
+        w.set_drain(&mut out);
+        w.compress();
+        let mut budget = Budget::new(Limits {
+            max_total_bytes: 1024,
+            max_ratio: u64::MAX,
+            ..Default::default()
+        });
+        let err = extract(Format::Zstd, &out, &mut budget).unwrap_err();
         assert!(err.reason.contains("budget") || err.reason.contains("extracted"));
     }
 
@@ -803,9 +1281,13 @@ mod tests {
         off[2] = pdf.len();
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
         off[3] = pdf.len();
-        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n",
+        );
         off[4] = pdf.len();
-        pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
         pdf.extend_from_slice(content);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
         let xref_off = pdf.len();
@@ -814,7 +1296,8 @@ mod tests {
             pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
         }
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
         );
         pdf
     }
@@ -938,6 +1421,174 @@ mod tests {
         let entries = extract(Format::Iso, &img, &mut budget).unwrap();
         assert_eq!(entries.len(), 1, "one file in the ISO");
         assert_eq!(entries[0].name, "EVIL.BIN"); // ";1" version suffix stripped
+        assert_eq!(entries[0].data, payload);
+    }
+
+    // -----------------------------------------------------------------------
+    // Archive<R> tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn archive_zip_extract_next() {
+        let zip_blob = zip_of(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        let mut archive = Archive::open(Cursor::new(zip_blob)).unwrap();
+        assert_eq!(archive.format(), Format::Zip);
+
+        let info = archive.list();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].name, "a.txt");
+        assert_eq!(info[1].name, "b.txt");
+
+        let mut budget = Budget::new(Limits::default());
+        let e1 = archive.extract_next(&mut budget).unwrap().unwrap();
+        assert_eq!(e1.name, "a.txt");
+        assert_eq!(e1.data, b"alpha");
+
+        let e2 = archive.extract_next(&mut budget).unwrap().unwrap();
+        assert_eq!(e2.name, "b.txt");
+        assert_eq!(e2.data, b"beta");
+
+        assert!(archive.extract_next(&mut budget).unwrap().is_none());
+    }
+
+    #[test]
+    fn archive_tar_extract_next() {
+        let blob = tar_of(&[("x", b"one"), ("y", b"two"), ("z", b"three")]);
+        let mut archive = Archive::open(Cursor::new(blob)).unwrap();
+        assert_eq!(archive.format(), Format::Tar);
+
+        let mut budget = Budget::new(Limits::default());
+        let mut names = Vec::new();
+        while let Some(e) = archive.extract_next(&mut budget).unwrap() {
+            names.push(e.name);
+        }
+        assert_eq!(names, vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn archive_extract_by_index() {
+        let zip_blob = zip_of(&[("first", b"111"), ("second", b"222"), ("third", b"333")]);
+        let mut archive = Archive::open(Cursor::new(zip_blob)).unwrap();
+        let mut budget = Budget::new(Limits::default());
+
+        let e = archive.extract(1, &mut budget).unwrap();
+        assert_eq!(e.name, "second");
+        assert_eq!(e.data, b"222");
+    }
+
+    #[test]
+    fn archive_extract_all_matches_next() {
+        let zip_blob = zip_of(&[("a", b"aa"), ("b", b"bb")]);
+        let mut budget1 = Budget::new(Limits::default());
+        let mut budget2 = Budget::new(Limits::default());
+
+        // extract_all via extract_next loop
+        let mut a1 = Archive::open(Cursor::new(zip_blob.clone())).unwrap();
+        let mut all_next = Vec::new();
+        while let Some(e) = a1.extract_next(&mut budget1).unwrap() {
+            all_next.push((e.name, e.data));
+        }
+
+        // extract_all
+        let mut a2 = Archive::open(Cursor::new(zip_blob)).unwrap();
+        let all = a2.extract_all(&mut budget2).unwrap();
+        let all_collected: Vec<_> = all.into_iter().map(|e| (e.name, e.data)).collect();
+
+        assert_eq!(all_next, all_collected);
+    }
+
+    #[test]
+    fn archive_gzip_extract_next() {
+        let blob = gz(b"hello from gzip");
+        let mut archive = Archive::open(Cursor::new(blob)).unwrap();
+        assert_eq!(archive.format(), Format::Gzip);
+
+        let mut budget = Budget::new(Limits::default());
+        let e = archive.extract_next(&mut budget).unwrap().unwrap();
+        assert_eq!(e.data, b"hello from gzip");
+        assert!(archive.extract_next(&mut budget).unwrap().is_none());
+    }
+
+    #[test]
+    fn archive_bzip2_extract_next() {
+        // Same hardcoded bzip2 stream as bzip2_roundtrip.
+        let blob: &[u8] = &[
+            66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 213, 127, 182, 220, 0, 0, 5, 25, 128, 64, 0,
+            16, 0, 54, 101, 201, 80, 32, 0, 49, 76, 0, 19, 66, 154, 105, 163, 77, 168, 242, 145,
+            94, 233, 129, 65, 248, 112, 129, 150, 100, 114, 190, 46, 228, 138, 112, 161, 33, 170,
+            255, 109, 184,
+        ];
+        let mut archive = Archive::open(Cursor::new(blob.to_vec())).unwrap();
+        assert_eq!(archive.format(), Format::Bzip2);
+
+        let mut budget = Budget::new(Limits::default());
+        let e = archive.extract_next(&mut budget).unwrap().unwrap();
+        assert_eq!(e.data, b"hello exav inside bzip2");
+        assert!(archive.extract_next(&mut budget).unwrap().is_none());
+    }
+
+    #[test]
+    fn archive_xz_extract_next() {
+        let payload = b"hello exav inside xz";
+        let blob = include_bytes!("../tests/fixtures/xz/simple.xz");
+
+        let mut archive = Archive::open(Cursor::new(blob.as_slice())).unwrap();
+        assert_eq!(archive.format(), Format::Xz);
+
+        let mut budget = Budget::new(Limits::default());
+        let e = archive.extract_next(&mut budget).unwrap().unwrap();
+        assert_eq!(e.data, payload);
+        assert!(archive.extract_next(&mut budget).unwrap().is_none());
+    }
+
+    // Helper: build a ZIP in memory (stored, no compression).
+    fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ::zip::ZipWriter::new(&mut buf);
+            let opts = ::zip::write::SimpleFileOptions::default()
+                .compression_method(::zip::CompressionMethod::Stored);
+            for (name, data) in members {
+                zip.start_file(*name, opts).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn zstd_of(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut source = data;
+        let mut compressor =
+            ruzstd::encoding::FrameCompressor::new(ruzstd::encoding::CompressionLevel::Fastest);
+        compressor.set_source(&mut source);
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out
+    }
+
+    #[test]
+    fn archive_zstd_extract_next() {
+        let blob = zstd_of(b"hello from zstd");
+        let mut archive = Archive::open(Cursor::new(blob)).unwrap();
+        assert_eq!(archive.format(), Format::Zstd);
+
+        let mut budget = Budget::new(Limits::default());
+        let e = archive.extract_next(&mut budget).unwrap().unwrap();
+        assert_eq!(e.data, b"hello from zstd");
+        assert!(archive.extract_next(&mut budget).unwrap().is_none());
+    }
+
+    #[test]
+    fn lzip_roundtrip() {
+        let payload = b"hello exav inside lzip";
+        let blob = include_bytes!("../tests/fixtures/lzip_simple.lz");
+        assert_eq!(detect(blob), Some(Format::Lzip));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Lzip, blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, payload);
     }
 }

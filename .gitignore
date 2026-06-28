@@ -19,3 +19,11 @@ Cargo.lock.orig
 .env*.local
 .env
 .DS_Store
+node_modules
+test-results/
+playwright-report/
+# fuzz corpora and artifacts — never commit
+crates/exav-unpack/fuzz/corpus/
+crates/exav-unpack/fuzz/artifacts/
+crates/exav-unpack/fuzz/target/
+fuzz/corpora/

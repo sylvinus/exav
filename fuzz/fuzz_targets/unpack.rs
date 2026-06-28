@@ -3,12 +3,11 @@
 //! default budgets. Must terminate and stay within the budget (libFuzzer's
 //! rss limit catches runaway allocation).
 use libfuzzer_sys::fuzz_target;
-use exav_core::filetype::FileType;
-use exav_core::unpack::{extract, Budget, Limits};
+use exav_unpack::{Format, Budget, Limits, extract};
 
 fuzz_target!(|data: &[u8]| {
-    for ft in [FileType::Zip, FileType::Gzip, FileType::Tar] {
+    for fmt in [Format::Zip, Format::Gzip, Format::Tar, Format::Zstd] {
         let mut budget = Budget::new(Limits::default());
-        let _ = extract(ft, data, &mut budget);
+        let _ = extract(fmt, data, &mut budget);
     }
 });

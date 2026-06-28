@@ -40,13 +40,13 @@ pub mod filetype;
 pub mod fuzzy;
 pub mod fuzzy_img;
 pub mod hashes;
-pub mod icon;
-pub mod profile;
 pub mod hexsig;
+pub mod icon;
 pub mod ml;
 pub mod normalize;
 pub mod patterns;
 pub mod pe;
+pub mod profile;
 pub mod source;
 /// Archive/container extraction lives in its own crate; re-exported so
 /// `exav_core::unpack` and the `ScanOptions::limits` type stay stable.
@@ -85,6 +85,7 @@ fn unpack_format(ft: FileType) -> Option<unpack::Format> {
         FileType::Ar => unpack::Format::Ar,
         FileType::Cpio => unpack::Format::Cpio,
         FileType::Xar => unpack::Format::Xar,
+        FileType::Zstd => unpack::Format::Zstd,
         _ => return None,
     })
 }
@@ -137,6 +138,7 @@ fn container_cltype(fmt: unpack::Format, data: &[u8]) -> Option<engine::ClType> 
         Format::Xz => ClType::Xz,
         Format::Cpio => ClType::Cpio,
         Format::Ar => ClType::Ar,
+        Format::Zstd => ClType::Zstd,
         Format::Zip => ooxml_subtype(data).unwrap_or(ClType::Zip),
         _ => return None,
     })
@@ -155,8 +157,7 @@ fn ooxml_subtype(data: &[u8]) -> Option<engine::ClType> {
     if !contains_window(data, b"[Content_Types].xml") {
         return None;
     }
-    if contains_window(data, b"word/document.xml") || contains_window(data, b"word/document2.xml")
-    {
+    if contains_window(data, b"word/document.xml") || contains_window(data, b"word/document2.xml") {
         Some(ClType::OoxmlWord)
     } else if contains_window(data, b"xl/workbook.xml") {
         Some(ClType::OoxmlXl)
@@ -189,7 +190,7 @@ pub(crate) fn report_name(name: &str, unofficial: bool, compat: bool) -> String 
 }
 
 /// How a detection was made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Method {
     Pattern,
     Hash,
@@ -215,7 +216,7 @@ impl Method {
 }
 
 /// Outcome of scanning one input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Verdict {
     Clean,
     Infected {
@@ -247,7 +248,7 @@ pub enum Verdict {
 }
 
 /// An informational finding (type, entropy, imphash, skipped sub-objects).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
     pub label: String,
     pub detail: String,
@@ -263,7 +264,7 @@ impl Finding {
 }
 
 /// Full result of a scan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScanReport {
     pub verdict: Verdict,
     pub findings: Vec<Finding>,
@@ -291,7 +292,12 @@ impl ScanReport {
     /// applying the `.UNOFFICIAL` suffix at report time when `compat` is set.
     fn infected_hit(hit: CoreHit, compat: bool, findings: Vec<Finding>) -> Self {
         let (sig, offset, method, unofficial) = hit;
-        Self::infected(report_name(&sig, unofficial, compat), offset, method, findings)
+        Self::infected(
+            report_name(&sig, unofficial, compat),
+            offset,
+            method,
+            findings,
+        )
     }
     fn limits(reason: String, findings: Vec<Finding>) -> Self {
         Self {
@@ -499,7 +505,9 @@ pub fn scan_path(db: &Database, path: &Path, opts: &ScanOptions) -> io::Result<S
                 return Ok(ScanReport::infected_hit(hit, opts.compat, Vec::new()));
             }
             return Ok(ScanReport::limits(
-                format!("file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"),
+                format!(
+                    "file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"
+                ),
                 Vec::new(),
             ));
         }
@@ -612,7 +620,9 @@ pub fn scan_seekable<R: Read + Seek>(
                 return Ok(ScanReport::infected_hit(hit, opts.compat, Vec::new()));
             }
             return Ok(ScanReport::limits(
-                format!("file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"),
+                format!(
+                    "file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"
+                ),
                 Vec::new(),
             ));
         }
@@ -785,7 +795,12 @@ pub fn analyze(db: &Database, data: &[u8], opts: &ScanOptions) -> ScanReport {
 
 fn analyze_inner(db: &Database, data: &[u8], opts: &ScanOptions) -> ScanReport {
     if let Some((sig, off, method, unofficial)) = scan_bytes_core(db, data) {
-        return ScanReport::infected(report_name(&sig, unofficial, opts.compat), off, method, Vec::new());
+        return ScanReport::infected(
+            report_name(&sig, unofficial, opts.compat),
+            off,
+            method,
+            Vec::new(),
+        );
     }
     let mut findings = Vec::new();
     let mut budget = scan_budget(db, opts);
@@ -802,9 +817,7 @@ fn analyze_inner(db: &Database, data: &[u8], opts: &ScanOptions) -> ScanReport {
         // harness should bucket exav-`UNSCANNABLE` vs clam-`OK` as an expected
         // capability difference, not have exav lie.)
         DeepOutcome::Unscannable(reason) => ScanReport::unscannable(reason, findings),
-        DeepOutcome::PasswordProtected(reason) => {
-            ScanReport::password_protected(reason, findings)
-        }
+        DeepOutcome::PasswordProtected(reason) => ScanReport::password_protected(reason, findings),
         DeepOutcome::Clean => ScanReport::clean(findings),
     }
 }
@@ -850,16 +863,31 @@ fn suppress_name(db: &Database, report: ScanReport) -> ScanReport {
 /// heuristics/ML are not. An allowlisted file yields nothing; ignored names are
 /// dropped (the same suppression as a normal scan).
 pub fn analyze_all(db: &Database, data: &[u8], opts: &ScanOptions) -> Vec<(String, Method)> {
-    if !db.allow.is_empty() && db.allow.lookup(&digests_of(data), data.len() as u64).is_some() {
+    if !db.allow.is_empty()
+        && db
+            .allow
+            .lookup(&digests_of(data), data.len() as u64)
+            .is_some()
+    {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut budget = scan_budget(db, opts);
-    collect_all(db, data, &mut budget, 0, &mut out, &mut seen, opts.compat, None);
+    collect_all(
+        db,
+        data,
+        &mut budget,
+        0,
+        &mut out,
+        &mut seen,
+        opts.compat,
+        None,
+    );
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_all(
     db: &Database,
     data: &[u8],
@@ -883,8 +911,14 @@ fn collect_all(
     };
     let icon_ctx = engine::IconCtx::new(&db.icons, &icon_metrics);
     let mut eng = Vec::new();
-    db.engine
-        .scan_all_with_icons(data, ft, layout.as_ref(), container, Some(&icon_ctx), &mut eng);
+    db.engine.scan_all_with_icons(
+        data,
+        ft,
+        layout.as_ref(),
+        container,
+        Some(&icon_ctx),
+        &mut eng,
+    );
     if !db.engine.is_empty() && normalize::is_textual(data) {
         for norm in [normalize::html(data), normalize::text(data)] {
             db.engine
@@ -952,7 +986,16 @@ fn collect_all(
                         push_sig(db, out, seen, sig, unofficial, compat, Method::Hash);
                     }
                 }
-                collect_all(db, &e.data, budget, depth + 1, out, seen, compat, member_container);
+                collect_all(
+                    db,
+                    &e.data,
+                    budget,
+                    depth + 1,
+                    out,
+                    seen,
+                    compat,
+                    member_container,
+                );
                 None
             },
         );
@@ -1017,6 +1060,7 @@ enum DeepOutcome {
 }
 
 /// Recursive structural analysis of an in-memory buffer.
+#[allow(clippy::too_many_arguments)]
 fn deep_analyze(
     db: &Database,
     data: &[u8],
@@ -1066,11 +1110,10 @@ fn deep_analyze(
         // (actionable) PasswordProtected verdict can take precedence.
         let mut unscannable: Option<String> = None;
         let mut password: Option<String> = None;
-        let outcome = unpack::extract_each(
-            fmt,
-            data,
-            budget,
-            &mut |e: unpack::Entry, budget: &mut Budget| -> Option<DeepOutcome> {
+        let outcome =
+            unpack::extract_each(fmt, data, budget, &mut |e: unpack::Entry,
+                                                          budget: &mut Budget|
+             -> Option<DeepOutcome> {
                 // `.cdb` container-metadata signatures match on the member's
                 // name/size/encryption/position within this container. `FilePos`
                 // is 0-based (first member = 0), matching ClamAV.
@@ -1125,7 +1168,16 @@ fn deep_analyze(
                         method: m,
                     });
                 }
-                match deep_analyze(db, &e.data, opts, budget, depth + 1, member_container, true, findings) {
+                match deep_analyze(
+                    db,
+                    &e.data,
+                    opts,
+                    budget,
+                    depth + 1,
+                    member_container,
+                    true,
+                    findings,
+                ) {
                     DeepOutcome::Clean => None,
                     // Nested unscannable/encrypted members are remembered, not
                     // propagated as a stop — keep scanning the rest of this
@@ -1140,8 +1192,7 @@ fn deep_analyze(
                     }
                     other => Some(other),
                 }
-            },
-        );
+            });
         return match outcome {
             Ok(Some(o)) => o,
             // Precedence among incomplete outcomes: PasswordProtected (actionable)
@@ -1377,8 +1428,9 @@ fn scan_bytes_depth(
         }
         // Bytecode programs whose trigger/hook fires (gated execution). Bytecode
         // detection names are reported verbatim (not `.UNOFFICIAL`-suffixed).
-        let (det, extracted) =
-            profile::timed("bytecode", data.len() as u64, || db.bytecode.scan(data, ft, layout.as_ref()));
+        let (det, extracted) = profile::timed("bytecode", data.len() as u64, || {
+            db.bytecode.scan(data, ft, layout.as_ref())
+        });
         if let Some((name, _idx)) = det {
             return Some((name, 0, Method::Bytecode, false));
         }
@@ -1419,8 +1471,15 @@ fn scan_bytes_depth(
                                 return Some(None);
                             }
                             *extract_budget -= ec;
-                            scan_bytes_depth(db, &e.data, depth + 1, extract_budget, None, inner_container)
-                                .map(Some)
+                            scan_bytes_depth(
+                                db,
+                                &e.data,
+                                depth + 1,
+                                extract_budget,
+                                None,
+                                inner_container,
+                            )
+                            .map(Some)
                         },
                     );
                     if let Ok(Some(Some(hit))) = res {
@@ -1470,7 +1529,12 @@ fn stream_core<R: Read>(db: &Database, reader: R) -> io::Result<Option<CoreHit>>
         if let Some(mat) = db.patterns.ac().stream_find_iter(reader).next() {
             let mat = mat?;
             let (name, unofficial) = db.patterns.name_prov(mat.pattern().as_usize());
-            return Ok(Some((name.to_string(), mat.start() as u64, Method::Pattern, unofficial)));
+            return Ok(Some((
+                name.to_string(),
+                mat.start() as u64,
+                Method::Pattern,
+                unofficial,
+            )));
         }
         return Ok(None);
     }
@@ -1480,7 +1544,12 @@ fn stream_core<R: Read>(db: &Database, reader: R) -> io::Result<Option<CoreHit>>
     if let Some(mat) = db.patterns.ac().stream_find_iter(&mut tee).next() {
         let mat = mat?;
         let (name, unofficial) = db.patterns.name_prov(mat.pattern().as_usize());
-        return Ok(Some((name.to_string(), mat.start() as u64, Method::Pattern, unofficial)));
+        return Ok(Some((
+            name.to_string(),
+            mat.start() as u64,
+            Method::Pattern,
+            unofficial,
+        )));
     }
     let size = tee.bytes_read();
     let digests = tee.finalize();
@@ -1519,7 +1588,10 @@ mod tests {
         );
         // A plain ZIP (no OOXML package descriptor) stays CL_TYPE_ZIP.
         let plain = build_zip(&[("readme.txt", b"hello")]);
-        assert_eq!(container_cltype(unpack::Format::Zip, &plain), Some(ClType::Zip));
+        assert_eq!(
+            container_cltype(unpack::Format::Zip, &plain),
+            Some(ClType::Zip)
+        );
         // Non-ZIP containers map to their fixed types.
         assert_eq!(
             container_cltype(unpack::Format::Email, b""),
@@ -1557,8 +1629,11 @@ mod tests {
         let mut zbuf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut zbuf));
-            zw.start_file("payload_dropper.exe", zip::write::SimpleFileOptions::default())
-                .unwrap();
+            zw.start_file(
+                "payload_dropper.exe",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
             zw.write_all(b"harmless looking bytes").unwrap();
             zw.finish().unwrap();
         }

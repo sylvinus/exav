@@ -72,9 +72,7 @@ impl Bytecode {
     /// True if every API this program uses is one exav implements — a
     /// prerequisite (necessary, not sufficient) for ever executing it.
     pub fn apis_supported(&self) -> bool {
-        self.apis
-            .iter()
-            .all(|(_, a)| super::exec::api_supported(a))
+        self.apis.iter().all(|(_, a)| super::exec::api_supported(a))
     }
 }
 

@@ -37,7 +37,9 @@ pub(crate) fn find_packheader(data: &[u8]) -> Option<usize> {
         let magic = search + rel;
         search = magic + 1;
         // l_info starts 4 bytes before the magic (the checksum).
-        let Some(li) = magic.checked_sub(4) else { continue };
+        let Some(li) = magic.checked_sub(4) else {
+            continue;
+        };
         // Need l_info(12) + p_info(12) + first b_info(12).
         if li + 36 > data.len() {
             continue;
@@ -89,7 +91,9 @@ pub(crate) fn extract_upx<R>(
             break; // malformed chain — stop, keep what we have
         }
         if out.len() as u64 + sz_unc as u64 > cap {
-            return Err(LimitHit::new("upx: decompressed size exceeds budget".into()));
+            return Err(LimitHit::new(
+                "upx: decompressed size exceeds budget".into(),
+            ));
         }
         let cdata = &data[dstart..dstart + sz_cpr];
         let block = if sz_cpr == sz_unc {
@@ -131,7 +135,10 @@ pub(crate) fn extract_upx<R>(
         return Ok(None);
     }
     budget.commit(out.len() as u64);
-    Ok(visit(Entry::new("upx-decompressed".to_string(), out), budget))
+    Ok(visit(
+        Entry::new("upx-decompressed".to_string(), out),
+        budget,
+    ))
 }
 
 /// Decompress a UPX DEFLATE (method 15) block: a raw DEFLATE stream (no zlib
@@ -155,7 +162,7 @@ fn u32_le(d: &[u8], off: usize) -> u32 {
 /// properties in a 2-byte header at the start of the compressed payload (NOT the
 /// standard 5-byte header), and the uncompressed size comes from `b_info.sz_unc`
 /// (not embedded). Reconstruct the `.lzma` (alone) framing and decode with
-/// `lzma-rs`.
+/// `lzma_rust2`.
 fn lzma_block_decompress(cdata: &[u8], sz_unc: usize) -> Result<Vec<u8>, LimitHit> {
     if cdata.len() < 2 {
         return Err(LimitHit::new("upx lzma: short block".into()));
@@ -178,8 +185,10 @@ fn lzma_block_decompress(cdata: &[u8], sz_unc: usize) -> Result<Vec<u8>, LimitHi
     framed.extend_from_slice(&dict.to_le_bytes());
     framed.extend_from_slice(&(sz_unc as u64).to_le_bytes());
     framed.extend_from_slice(&cdata[2..]);
+    let mut reader = lzma_rust2::LzmaReader::new_mem_limit(Cursor::new(framed), u32::MAX, None)
+        .map_err(|e| LimitHit::new(format!("upx lzma: {e}")))?;
     let mut out = Vec::with_capacity(sz_unc.min(1 << 20));
-    lzma_rs::lzma_decompress(&mut Cursor::new(framed), &mut out)
+    std::io::Read::read_to_end(&mut reader, &mut out)
         .map_err(|e| LimitHit::new(format!("upx lzma: {e}")))?;
     Ok(out)
 }
@@ -197,7 +206,12 @@ struct Br<'a> {
 impl<'a> Br<'a> {
     #[inline]
     fn new(src: &'a [u8]) -> Self {
-        Br { src, ip: 0, bb: 0, bc: 0 }
+        Br {
+            src,
+            ip: 0,
+            bb: 0,
+            bc: 0,
+        }
     }
     #[inline]
     fn bit(&mut self) -> Result<u32, LimitHit> {
@@ -231,7 +245,12 @@ impl<'a> Br<'a> {
 /// Copy an LZ back-reference: `count` bytes from `out[len-off..]`, byte-by-byte
 /// (overlap-safe). `Ok(true)` once `dst_len` is reached.
 #[inline]
-fn copy_match(out: &mut Vec<u8>, off: usize, count: usize, dst_len: usize) -> Result<bool, LimitHit> {
+fn copy_match(
+    out: &mut Vec<u8>,
+    off: usize,
+    count: usize,
+    dst_len: usize,
+) -> Result<bool, LimitHit> {
     if off == 0 || off > out.len() {
         return Err(LimitHit::new("upx nrv: bad back-reference".into()));
     }
@@ -503,8 +522,14 @@ mod tests {
         let d = decode(include_bytes!("../../tests/fixtures/upx_nrv2d.upx"));
         let e = decode(include_bytes!("../../tests/fixtures/upx_nrv2e.upx"));
         let l = decode(include_bytes!("../../tests/fixtures/upx_lzma.upx"));
-        assert!(!d.is_empty() && d == e && e == l, "nrv2d/nrv2e/lzma must agree");
-        assert!(d.windows(MARKER.len()).any(|w| w == MARKER), "marker recovered");
+        assert!(
+            !d.is_empty() && d == e && e == l,
+            "nrv2d/nrv2e/lzma must agree"
+        );
+        assert!(
+            d.windows(MARKER.len()).any(|w| w == MARKER),
+            "marker recovered"
+        );
     }
 
     #[test]

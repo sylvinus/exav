@@ -313,19 +313,12 @@ fn parse_block_header(p: &[u8], off: usize) -> Option<(usize, usize, u8)> {
         0 => *p.get(off + 2)? as u32,
         1 => u16::from_le_bytes([*p.get(off + 2)?, *p.get(off + 3)?]) as u32,
         _ => {
-            u32::from_le_bytes([
-                *p.get(off + 2)?,
-                *p.get(off + 3)?,
-                *p.get(off + 4)?,
-                0,
-            ]) & 0x00FF_FFFF
+            u32::from_le_bytes([*p.get(off + 2)?, *p.get(off + 3)?, *p.get(off + 4)?, 0])
+                & 0x00FF_FFFF
         }
     };
-    let calc = 0x5A
-        ^ flags
-        ^ (block_size as u8)
-        ^ ((block_size >> 8) as u8)
-        ^ ((block_size >> 16) as u8);
+    let calc =
+        0x5A ^ flags ^ (block_size as u8) ^ ((block_size >> 8) as u8) ^ ((block_size >> 16) as u8);
     if calc != cksum {
         return None;
     }
@@ -805,8 +798,8 @@ pub fn unpack50(
             if consumed >= packed.len() {
                 break;
             }
-            let (block_size, hdr_len, flags) = parse_block_header(&input, consumed)
-                .ok_or_else(|| err("bad block header"))?;
+            let (block_size, hdr_len, flags) =
+                parse_block_header(&input, consumed).ok_or_else(|| err("bad block header"))?;
             let table_present = (flags >> 7) & 1 == 1;
             u.last_block = (flags >> 6) & 1 == 1;
             u.bit_size = 1 + (flags & 7);

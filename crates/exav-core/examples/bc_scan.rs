@@ -43,8 +43,16 @@ fn main() {
         // The forced pass (every program, ignoring triggers) is expensive on
         // real binaries; only run it when explicitly requested.
         let forced = if std::env::var("EXAV_FORCED").is_ok() {
-            let f: Vec<String> = rt.run_all_forced(&data).into_iter().map(|(n, _)| n).collect();
-            if f.is_empty() { "-".into() } else { f.join(",") }
+            let f: Vec<String> = rt
+                .run_all_forced(&data)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            if f.is_empty() {
+                "-".into()
+            } else {
+                f.join(",")
+            }
         } else {
             "off".to_string()
         };

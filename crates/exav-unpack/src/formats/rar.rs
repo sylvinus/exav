@@ -151,7 +151,9 @@ fn extract_rar4(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
             };
             let name = read_name(data, p, name_size);
             let encrypted = flags & 0x04 != 0; // LHD_PASSWORD
-            let data_off = pos + head_size;
+            let data_off = pos
+                .checked_add(head_size)
+                .ok_or_else(|| LimitHit::corrupt("rar: header size overflow".to_string()))?;
             // Stored method (0x30) and not a directory (flag 0xE0 dictionary bits).
             let is_dir = (flags & 0xE0) == 0xE0;
             // Window size bits from the dictionary flags (0..7) + 16.
@@ -160,10 +162,7 @@ fn extract_rar4(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                 // skip directories
             } else if method == 0x30 && pack == unp {
                 push_stored(&mut out, budget, name, data, data_off, pack, encrypted)?;
-            } else if !encrypted
-                && unp_ver == 29
-                && (0x31..=0x35).contains(&method)
-            {
+            } else if !encrypted && unp_ver == 29 && (0x31..=0x35).contains(&method) {
                 // RAR3 (unpack29) compressed LZ member: attempt decompression.
                 budget.count_entry()?;
                 let dend = data_off.saturating_add(pack as usize).min(data.len());
@@ -244,7 +243,9 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
             None => break,
         };
         let hdr = hs_off + hs_len; // header content start
-        let data_off = hdr + hsize as usize; // packed data start
+        let Some(data_off) = hdr.checked_add(hsize as usize) else {
+            break;
+        }; // packed data start
         if hsize == 0 || data_off > data.len() {
             break;
         }
@@ -257,7 +258,10 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
             Some(v) => v,
             None => break,
         };
-        let mut q = hdr + t1 + t2;
+        let mut q = match hdr.checked_add(t1).and_then(|v| v.checked_add(t2)) {
+            Some(v) => v,
+            None => break,
+        };
         let mut extra_size = 0u64;
         if hflags & 0x01 != 0 {
             // extra_area_size
@@ -322,11 +326,7 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                             #[cfg(any(test, feature = "rar5-crc-check"))]
                             if f.has_crc {
                                 let c = crc32_ieee(&bytes);
-                                debug_assert_eq!(
-                                    c, f.crc,
-                                    "rar5 CRC mismatch for {}",
-                                    "<member>"
-                                );
+                                debug_assert_eq!(c, f.crc, "rar5 CRC mismatch for {}", "<member>");
                             }
                             out.push(Entry {
                                 comp_size: data_size,
@@ -351,7 +351,9 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                 }
             }
         }
-        let next = data_off + data_size as usize;
+        let Some(next) = data_off.checked_add(data_size as usize) else {
+            break;
+        };
         if next <= pos {
             break; // no progress — malformed
         }
@@ -386,7 +388,7 @@ fn rar5_file_fields(
     hsize: u64,
     extra_size: u64,
 ) -> Option<Rar5File> {
-    let end = hdr + hsize as usize;
+    let end = hdr.checked_add(hsize as usize)?;
     let (file_flags, n) = vint(data, q)?;
     q += n;
     let (unp_size, n) = vint(data, q)?; // unpacked size
@@ -445,7 +447,10 @@ fn rar5_extra_has_crypt(data: &[u8], end: usize, extra_size: u64) -> bool {
             Some(v) => v,
             None => break,
         };
-        let rec_start = p + n1;
+        let rec_start = match p.checked_add(n1) {
+            Some(v) => v,
+            None => break,
+        };
         let (rec_type, n2) = match vint(data, rec_start) {
             Some(v) => v,
             None => break,
@@ -456,7 +461,10 @@ fn rar5_extra_has_crypt(data: &[u8], end: usize, extra_size: u64) -> bool {
         }
         // Advance to the next record: `rec_size` counts bytes after its own
         // size vint (i.e. the record type plus its body).
-        let advance = n1 + rec_size as usize;
+        let advance = match n1.checked_add(rec_size as usize) {
+            Some(v) => v,
+            None => break,
+        };
         if advance == 0 {
             break;
         }
@@ -499,7 +507,7 @@ mod tests {
         v.extend_from_slice(&0u16.to_le_bytes()); // flags
         v.extend_from_slice(&13u16.to_le_bytes()); // head_size
         v.extend_from_slice(&[0; 6]); // reserved1(2)+reserved2(4) = 6 -> total 13
-        // file header (type 0x74), flags 0x8000 (ADD_SIZE present)
+                                      // file header (type 0x74), flags 0x8000 (ADD_SIZE present)
         let mut fh = Vec::new();
         fh.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // PACK_SIZE
         fh.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // UNP_SIZE
@@ -511,8 +519,8 @@ mod tests {
         fh.extend_from_slice(&(name.len() as u16).to_le_bytes()); // NAME_SIZE
         fh.extend_from_slice(&0u32.to_le_bytes()); // ATTR
         fh.extend_from_slice(name); // NAME
-        // PACK_SIZE (first field of `fh`) doubles as the block's ADD_SIZE; there
-        // is no separate ADD_SIZE field. Header = generic(7) + fields.
+                                    // PACK_SIZE (first field of `fh`) doubles as the block's ADD_SIZE; there
+                                    // is no separate ADD_SIZE field. Header = generic(7) + fields.
         let head_size = 7 + fh.len();
         v.extend_from_slice(&[0, 0]); // crc
         v.push(0x74);
@@ -604,6 +612,7 @@ mod tests {
     /// decompressed member against the CRC-32 stored in its file header. Runs
     /// only when the malware corpus is present (skipped otherwise).
     #[test]
+    #[ignore = "extracts 114 RAR5 samples (310 MB); run with --ignored"]
     fn rar5_real_samples_crc() {
         use std::path::Path;
         // Walk up to find the repo's corpus dir from the crate dir.

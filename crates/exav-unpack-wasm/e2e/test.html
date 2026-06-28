@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>wasm test runner</title></head>
+<body>
+<pre id="output"></pre>
+<script type="module">
+  import init, { Archive, unpack, detect_format } from "/pkg/exav_unpack_wasm.js";
+
+  window.__test = {
+    Archive, unpack, detect_format,
+    ready: (async () => { await init(); return true; })(),
+  };
+</script>
+</body>
+</html>

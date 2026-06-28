@@ -1,25 +1,25 @@
 #![allow(unused_imports)]
-use crate::*;
 use super::zip_crypto;
+use crate::*;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 
 /// The encryption scheme + real (post-decrypt) compression method of an
 /// encrypted ZIP member, plus the raw stored bytes.
-struct EncryptedMember {
-    raw: Vec<u8>,
+pub struct EncryptedMember {
+    pub raw: Vec<u8>,
     /// `None` = legacy PKWARE ZipCrypto; `Some(strength)` = WinZip AES
     /// (strength 1=AES-128, 2=AES-192, 3=AES-256).
-    aes_strength: Option<u8>,
+    pub aes_strength: Option<u8>,
     /// Real compression method of the *decrypted* payload (0 = Store, 8 = Deflate).
-    method: u16,
+    pub method: u16,
 }
 
 /// Read the raw stored bytes of an encrypted member and classify its encryption
 /// scheme + underlying compression method. For WinZip AES the member's
 /// `compression()` is the `AesCrypto` wrapper, so the *real* method comes from
 /// the 0x9901 AES extra field (parsed from the member's local extra data).
-fn read_encrypted_member(
-    file: &mut zip::read::ZipFile<'_>,
+pub fn read_encrypted_member(
+    file: &mut ::zip::read::ZipFile<'_, impl Read>,
 ) -> Result<EncryptedMember, std::io::Error> {
     // The `zip` crate models a WinZip-AES member's `compression()` as a special
     // `Aes` method and stores the real method in the 0x9901 extra field.
@@ -38,18 +38,17 @@ fn read_encrypted_member(
 /// Map the crate's `CompressionMethod` to the ZIP numeric method code we need
 /// for post-decrypt decompression. Only Store/Deflate are decoded; anything else
 /// is reported as Store (the bytes are passed through and scanned raw).
-fn compression_to_u16(m: zip::CompressionMethod) -> u16 {
+pub fn compression_to_u16(m: ::zip::CompressionMethod) -> u16 {
     match m {
-        zip::CompressionMethod::Stored => 0,
-        #[allow(deprecated)]
-        zip::CompressionMethod::Deflated => 8,
+        ::zip::CompressionMethod::Stored => 0,
+        ::zip::CompressionMethod::Deflated => 8,
         _ => 0xffff,
     }
 }
 
 /// Parse the WinZip-AES 0x9901 extra field: `len(2)=7, ver(2), "AE"(2),
 /// strength(1), method(2)`. Returns `(strength, real_method)`.
-fn parse_aes_extra(extra: Option<&[u8]>) -> Option<(u8, u16)> {
+pub(crate) fn parse_aes_extra(extra: Option<&[u8]>) -> Option<(u8, u16)> {
     let mut data = extra?;
     while data.len() >= 4 {
         let id = u16::from_le_bytes([data[0], data[1]]);
@@ -68,7 +67,7 @@ fn parse_aes_extra(extra: Option<&[u8]>) -> Option<(u8, u16)> {
 /// Try each pool password against the encrypted member; on the first that
 /// decrypts (verifier/MAC for AES, CRC check byte for ZipCrypto), decompress per
 /// the real method and return the plaintext. `None` if no password worked.
-fn decrypt_zip_member(
+pub fn decrypt_zip_member(
     enc: &EncryptedMember,
     crc: u32,
     budget: &mut Budget,
@@ -149,7 +148,7 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    let mut zip = zip::ZipArchive::new(reader).map_err(|e| LimitHit::new(format!("zip: {e}")))?;
+    let mut zip = ::zip::ZipArchive::new(reader).map_err(|e| LimitHit::new(format!("zip: {e}")))?;
     for i in 0..zip.len() {
         // Count every central-directory entry, including directories, so a
         // directory-only archive cannot iterate past the file-count budget.
@@ -223,7 +222,12 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
         // of the archive is still scanned.
         let mut oversized = |budget: &mut Budget| -> Option<R> {
             visit(
-                Entry::unsupported(name.clone(), comp, false, "archive member exceeds size budget"),
+                Entry::unsupported(
+                    name.clone(),
+                    comp,
+                    false,
+                    "archive member exceeds size budget",
+                ),
                 budget,
             )
         };
@@ -251,7 +255,7 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
         ratio_guard(comp, buf.len() as u64, budget)?;
         budget.commit(buf.len() as u64);
         drop(file); // release the &mut zip borrow before the visitor runs
-        // Compressed size is meaningful for `.cdb` `FileSizeInContainer`.
+                    // Compressed size is meaningful for `.cdb` `FileSizeInContainer`.
         let entry = Entry {
             comp_size: comp,
             encrypted: false,
@@ -272,14 +276,14 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
 /// first detection — without touching later members. This is the seekable
 /// counterpart to [`extract`], which buffers everything.
 pub struct ZipMembers<R: Read + Seek> {
-    zip: zip::ZipArchive<R>,
+    zip: ::zip::ZipArchive<R>,
     next: usize,
 }
 
 impl<R: Read + Seek> ZipMembers<R> {
     /// Open a seekable ZIP (reads only the central directory up front).
     pub fn open(reader: R) -> Result<Self, LimitHit> {
-        let zip = zip::ZipArchive::new(reader).map_err(|e| LimitHit::new(format!("zip: {e}")))?;
+        let zip = ::zip::ZipArchive::new(reader).map_err(|e| LimitHit::new(format!("zip: {e}")))?;
         Ok(Self { zip, next: 0 })
     }
 
@@ -289,6 +293,24 @@ impl<R: Read + Seek> ZipMembers<R> {
     }
     pub fn is_empty(&self) -> bool {
         self.zip.is_empty()
+    }
+
+    /// Pre-parsed member metadata from the central directory. Directories are
+    /// included (with `uncompressed_size` 0). No member data is decompressed.
+    pub fn list_entries(&mut self) -> Vec<crate::MemberInfo> {
+        let mut out = Vec::with_capacity(self.zip.len());
+        for i in 0..self.zip.len() {
+            if let Ok(file) = self.zip.by_index_raw(i) {
+                out.push(crate::MemberInfo {
+                    name: file.name().to_string(),
+                    index: i,
+                    compressed_size: file.compressed_size(),
+                    uncompressed_size: file.size(),
+                    encrypted: file.encrypted(),
+                });
+            }
+        }
+        out
     }
 
     /// Read and decompress the next *file* member under `budget`; `None` when
@@ -301,103 +323,109 @@ impl<R: Read + Seek> ZipMembers<R> {
             if let Err(h) = budget.count_entry() {
                 return Some(Err(h));
             }
-            let res = (|| -> Result<Option<Entry>, LimitHit> {
-                // Peek with the RAW reader: it never invokes the crate decryptor,
-                // so it succeeds for encrypted members too (we build `zip` WITHOUT
-                // `aes-crypto`). Cleartext members are re-opened decompressing below.
-                let mut file = self
-                    .zip
-                    .by_index_raw(i)
-                    .map_err(|e| LimitHit::new(format!("zip entry {i}: {e}")))?;
-                if !file.is_file() {
-                    return Ok(None);
-                }
-                let name = file.name().to_string();
-                let comp = file.compressed_size();
-                // Encrypted member: try the password pool; on success yield the
-                // decrypted+decompressed bytes, else a metadata-only encrypted
-                // member so the caller surfaces PasswordProtected (never a panic
-                // or an abort that would mask later members).
-                if file.encrypted() {
-                    let crc = file.crc32();
-                    let enc = match read_encrypted_member(&mut file) {
-                        Ok(e) => e,
-                        Err(_) => {
-                            return Ok(Some(Entry::unsupported(
-                                name,
-                                comp,
-                                true,
-                                "encrypted ZIP member",
-                            )))
-                        }
-                    };
-                    drop(file);
-                    return match decrypt_zip_member(&enc, crc, budget)? {
-                        Some(plain) => {
-                            budget.commit(plain.len() as u64);
-                            Ok(Some(Entry {
-                                comp_size: comp,
-                                encrypted: false,
-                                unsupported: None,
-                                name,
-                                data: plain,
-                            }))
-                        }
-                        None => Ok(Some(Entry::unsupported(
-                            name,
-                            comp,
-                            true,
-                            "encrypted ZIP member",
-                        ))),
-                    };
-                }
-                // Cleartext member: re-open decompressing so `bounded_read` yields
-                // the *decompressed* content.
-                drop(file);
-                let mut file = self
-                    .zip
-                    .by_index(i)
-                    .map_err(|e| LimitHit::new(format!("zip entry {i}: {e}")))?;
-                // A member too large for the budget yields a metadata-only member
-                // (Unscannable, empty data) rather than aborting the archive walk,
-                // so name/size `.cdb` sigs still match and later members are scanned.
-                let cap = match budget.reserve() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Ok(Some(Entry::unsupported(
-                            name,
-                            comp,
-                            false,
-                            "archive member exceeds size budget",
-                        )))
-                    }
-                };
-                let (buf, truncated) = bounded_read(&mut file, cap)
-                    .map_err(|e| LimitHit::new(format!("zip read: {e}")))?;
-                if truncated {
-                    return Ok(Some(Entry::unsupported(
-                        name,
-                        comp,
-                        false,
-                        "archive member exceeds size budget",
-                    )));
-                }
-                ratio_guard(comp, buf.len() as u64, budget)?;
-                budget.commit(buf.len() as u64);
-                Ok(Some(Entry {
-                    comp_size: comp,
-                    encrypted: false,
-                    unsupported: None,
-                    name,
-                    data: buf,
-                }))
-            })();
-            match res {
+            match self.extract_entry(i, budget) {
                 Ok(Some(e)) => return Some(Ok(e)),
                 Ok(None) => continue,
                 Err(h) => return Some(Err(h)),
             }
         }
         None
+    }
+
+    /// Extract a specific member by index. Returns `Ok(None)` for directories.
+    pub(crate) fn extract_entry(
+        &mut self,
+        i: usize,
+        budget: &mut Budget,
+    ) -> Result<Option<Entry>, LimitHit> {
+        // Peek with the RAW reader: it never invokes the crate decryptor,
+        // so it succeeds for encrypted members too (we build `zip` WITHOUT
+        // `aes-crypto`). Cleartext members are re-opened decompressing below.
+        let mut file = self
+            .zip
+            .by_index_raw(i)
+            .map_err(|e| LimitHit::new(format!("zip entry {i}: {e}")))?;
+        if !file.is_file() {
+            return Ok(None);
+        }
+        let name = file.name().to_string();
+        let comp = file.compressed_size();
+        // Encrypted member: try the password pool; on success yield the
+        // decrypted+decompressed bytes, else a metadata-only encrypted
+        // member so the caller surfaces PasswordProtected (never a panic
+        // or an abort that would mask later members).
+        if file.encrypted() {
+            let crc = file.crc32();
+            let enc = match read_encrypted_member(&mut file) {
+                Ok(e) => e,
+                Err(_) => {
+                    return Ok(Some(Entry::unsupported(
+                        name,
+                        comp,
+                        true,
+                        "encrypted ZIP member",
+                    )))
+                }
+            };
+            drop(file);
+            return match decrypt_zip_member(&enc, crc, budget)? {
+                Some(plain) => {
+                    budget.commit(plain.len() as u64);
+                    Ok(Some(Entry {
+                        comp_size: comp,
+                        encrypted: false,
+                        unsupported: None,
+                        name,
+                        data: plain,
+                    }))
+                }
+                None => Ok(Some(Entry::unsupported(
+                    name,
+                    comp,
+                    true,
+                    "encrypted ZIP member",
+                ))),
+            };
+        }
+        // Cleartext member: re-open decompressing so `bounded_read` yields
+        // the *decompressed* content.
+        drop(file);
+        let mut file = self
+            .zip
+            .by_index(i)
+            .map_err(|e| LimitHit::new(format!("zip entry {i}: {e}")))?;
+        // A member too large for the budget yields a metadata-only member
+        // (Unscannable, empty data) rather than aborting the archive walk,
+        // so name/size `.cdb` sigs still match and later members are scanned.
+        let cap = match budget.reserve() {
+            Ok(c) => c,
+            Err(_) => {
+                return Ok(Some(Entry::unsupported(
+                    name,
+                    comp,
+                    false,
+                    "archive member exceeds size budget",
+                )))
+            }
+        };
+        let (buf, truncated) =
+            bounded_read(&mut file, cap).map_err(|e| LimitHit::new(format!("zip read: {e}")))?;
+        if truncated {
+            return Ok(Some(Entry::unsupported(
+                name,
+                comp,
+                false,
+                "archive member exceeds size budget",
+            )));
+        }
+        ratio_guard(comp, buf.len() as u64, budget)?;
+        budget.commit(buf.len() as u64);
+        Ok(Some(Entry {
+            comp_size: comp,
+            encrypted: false,
+            unsupported: None,
+            name,
+            data: buf,
+        }))
     }
 }

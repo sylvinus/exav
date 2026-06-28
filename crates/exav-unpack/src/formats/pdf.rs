@@ -1,55 +1,49 @@
-#![allow(unused_imports)]
 use crate::*;
-use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::collections::HashMap;
+use std::io::Cursor;
+
+use super::pdf_parse::crypt::{CryptDict, Decoder};
+use super::pdf_parse::lex::Lexer;
+use super::pdf_parse::parse::{dict_has_flate, parse_indirect_object_body, parse_object};
+use super::pdf_parse::types::Primitive;
 
 /// PDF: emit each stream object's content. FlateDecode streams are decompressed
 /// through the bounded reader (so a Flate bomb trips the budget); other streams
 /// are passed through raw.
 ///
-/// Uses pdf-rs's object scanner, which lexes indirect objects directly (so a
-/// broken xref — common in malicious PDFs — doesn't stop extraction) and is
-/// depth-bounded (`MAX_DEPTH`), avoiding the nested-object stack overflow of
-/// other PDF parsers. No RNG is linked.
+/// Uses a linear byte-scanning approach that finds `N G obj` patterns directly,
+/// so a broken xref — common in malicious PDFs — doesn't stop extraction. The
+/// parser is depth-bounded (`MAX_DEPTH`), avoiding nested-object stack overflow.
 pub(crate) fn extract_pdf<R>(
     data: &[u8],
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    use pdf::file::{FileOptions, ScanItem};
-    use pdf::primitive::Primitive;
+    // --- Phase 1: detect encryption ---
+    let crypt_info = detect_encryption(data);
 
-    // Encrypted PDF: try the empty (standard) password first, then each pool
-    // password. The `pdf` crate decrypts streams transparently once loaded with a
-    // working password, so a correctly-passworded encrypted PDF is scanned like
-    // any other. If the document is encrypted (`/Encrypt` present) and no password
-    // unlocks it, emit a `PasswordProtected` signal instead of treating the
-    // (undecryptable) streams as clean.
-    let mut candidates: Vec<&[u8]> = vec![b""];
-    for pw in &budget.passwords {
-        candidates.push(pw.as_bytes());
-    }
-    let mut file = None;
-    let mut saw_encrypt = false;
-    for pw in candidates {
-        match FileOptions::uncached().password(pw).load(data.to_vec()) {
-            Ok(f) => {
-                saw_encrypt = f.trailer.encrypt_dict.is_some();
-                file = Some(f);
-                break;
-            }
-            Err(e) => {
-                // An `InvalidPassword` (or any error after we know it's encrypted)
-                // means the file is encrypted but this password didn't work.
-                if format!("{e}").to_ascii_lowercase().contains("password") {
-                    saw_encrypt = true;
+    let decoder = if let Some(ref encrypt_dict) = crypt_info {
+        let doc_id = find_doc_id(data).unwrap_or_default();
+        let mut candidates: Vec<&[u8]> = vec![b""];
+        for pw in &budget.passwords {
+            candidates.push(pw.as_bytes());
+        }
+        let mut found = None;
+        let mut any_password_error = false;
+        for pw in candidates {
+            match Decoder::from_password(encrypt_dict, &doc_id, pw) {
+                Ok(d) => {
+                    found = Some(d);
+                    break;
+                }
+                Err(_) => {
+                    any_password_error = true;
                 }
             }
         }
-    }
-    let file = match file {
-        Some(f) => f,
-        None => {
-            if saw_encrypt {
+        match found {
+            Some(d) => Some(d),
+            None if any_password_error => {
                 budget.count_entry()?;
                 let e = Entry::unsupported(
                     "pdf-encrypted".to_string(),
@@ -59,53 +53,136 @@ pub(crate) fn extract_pdf<R>(
                 );
                 return Ok(visit(e, budget));
             }
-            return Err(LimitHit::new("pdf: failed to load".to_string()));
+            None => None,
         }
+    } else {
+        None
     };
-    // A PDF that loaded but is encrypted with a password we don't have (e.g. it
-    // opened with the empty user password yet streams remain undecryptable) is
-    // still surfaced below via normal scanning; the explicit signal above covers
-    // the load-failure case.
-    let resolver = file.resolver();
-    for item in file.scan() {
-        let Ok(ScanItem::Object(id, Primitive::Stream(stream))) = item else {
+
+    // --- Phase 2: linear scan for objects ---
+    let mut lex = Lexer::new(data);
+    while let Some((obj_id, gen, obj_start)) = lex.find_next_obj() {
+        lex.set_pos(obj_start);
+        let Some((obj, _end)) = parse_indirect_object_body(&mut lex) else {
             continue;
         };
         budget.count_entry()?;
-        let cap = budget.reserve()?;
-        // Raw (still-encoded) stream bytes; exav does the flate itself.
-        let raw = stream
-            .raw_data(&resolver)
-            .map_err(|e| LimitHit::new(format!("pdf raw: {e}")))?;
-        let (buf, truncated) = if stream_is_flate(&stream.info) {
-            bounded_read(flate2::read::ZlibDecoder::new(Cursor::new(&raw[..])), cap)
+
+        if let Primitive::Stream {
+            info,
+            data: mut stream_data,
+        } = obj
+        {
+            if let Some(ref dec) = decoder {
+                dec.decrypt_stream(obj_id, &mut stream_data);
+            }
+            let raw_len = stream_data.len() as u64;
+            let cap = budget.reserve()?;
+            let (buf, truncated) = if dict_has_flate(&info) {
+                bounded_read(
+                    flate2::read::ZlibDecoder::new(Cursor::new(&stream_data)),
+                    cap,
+                )
                 .map_err(|e| LimitHit::new(format!("pdf flate: {e}")))?
-        } else {
-            // Uncompressed (or a filter we don't decode): cap the raw content.
-            let take = (raw.len() as u64).min(cap) as usize;
-            (raw[..take].to_vec(), raw.len() as u64 > cap)
-        };
-        if truncated {
-            return Err(LimitHit::new("pdf stream exceeds budget".to_string()));
-        }
-        ratio_guard(raw.len() as u64, buf.len() as u64, budget)?;
-        budget.commit(buf.len() as u64);
-        if let Some(r) = visit(Entry::new(format!("pdf-obj-{}-{}", id.id, id.gen), buf), budget) {
-            return Ok(Some(r));
+            } else {
+                let take = (stream_data.len() as u64).min(cap) as usize;
+                (stream_data[..take].to_vec(), stream_data.len() as u64 > cap)
+            };
+            if truncated {
+                return Err(LimitHit::new("pdf stream exceeds budget".to_string()));
+            }
+            ratio_guard(raw_len, buf.len() as u64, budget)?;
+            budget.commit(buf.len() as u64);
+            if let Some(r) = visit(Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf), budget) {
+                return Ok(Some(r));
+            }
         }
     }
     Ok(None)
 }
 
-/// Whether a stream's `/Filter` includes `FlateDecode` (a bare name or in an
-/// array of names).
-fn stream_is_flate(info: &pdf::primitive::Dictionary) -> bool {
-    use pdf::primitive::Primitive;
-    match info.get("Filter") {
-        Some(Primitive::Name(n)) => n.as_str() == "FlateDecode",
-        Some(Primitive::Array(a)) => a
-            .iter()
-            .any(|p| matches!(p, Primitive::Name(n) if n.as_str() == "FlateDecode")),
-        _ => false,
+/// Parse the trailer dictionary (after the `trailer` keyword).
+fn parse_trailer_dict(data: &[u8]) -> Option<HashMap<String, Primitive>> {
+    let trailer_pos = data.windows(7).position(|w| w == b"trailer")?;
+    let mut lex = Lexer::new(data);
+    lex.set_pos(trailer_pos + 7);
+    if let Some(Primitive::Dictionary(dict)) = parse_object(&mut lex) {
+        Some(dict)
+    } else {
+        None
     }
+}
+
+/// Check if a dictionary looks like a PDF encryption dictionary.
+fn is_encrypt_dict(dict: &HashMap<String, Primitive>) -> bool {
+    dict.get("V").is_some()
+        && dict.get("R").is_some()
+        && dict.get("O").is_some()
+        && dict.get("U").is_some()
+}
+
+/// Linear scan for an /Encrypt dictionary.
+///
+/// Two strategies:
+/// 1. Look for an object whose dictionary contains `/Encrypt` (some generators embed it in the catalog).
+/// 2. Look for a standalone encryption dictionary (has /V, /R, /O, /U keys) — pypdf puts it
+///    as a separate object, referenced from the trailer via indirect ref.
+/// 3. Check the trailer dict directly for `/Encrypt` key.
+fn detect_encryption(data: &[u8]) -> Option<CryptDict> {
+    let mut lex = Lexer::new(data);
+    while let Some((_obj_id, _gen, obj_start)) = lex.find_next_obj() {
+        lex.set_pos(obj_start);
+        if let Some((Primitive::Dictionary(dict) | Primitive::Stream { info: dict, .. }, _end)) =
+            parse_indirect_object_body(&mut lex)
+        {
+            // Strategy 1: dict contains an /Encrypt key
+            if let Some(Primitive::Dictionary(enc)) = dict.get("Encrypt") {
+                if let Some(cd) = CryptDict::from_primitive(enc) {
+                    return Some(cd);
+                }
+            }
+            // Strategy 2: this IS the encrypt dict (standalone)
+            if is_encrypt_dict(&dict) {
+                if let Some(cd) = CryptDict::from_primitive(&dict) {
+                    return Some(cd);
+                }
+            }
+        }
+    }
+    // Strategy 3: check trailer
+    if let Some(trailer) = parse_trailer_dict(data) {
+        if let Some(Primitive::Dictionary(enc)) = trailer.get("Encrypt") {
+            if let Some(cd) = CryptDict::from_primitive(enc) {
+                return Some(cd);
+            }
+        }
+    }
+    None
+}
+
+/// Find the document ID from the first /ID array found in any dictionary (objects or trailer).
+fn find_doc_id(data: &[u8]) -> Option<Vec<u8>> {
+    // Check indirect objects
+    let mut lex = Lexer::new(data);
+    while let Some((_obj_id, _gen, obj_start)) = lex.find_next_obj() {
+        lex.set_pos(obj_start);
+        if let Some((Primitive::Dictionary(dict) | Primitive::Stream { info: dict, .. }, _end)) =
+            parse_indirect_object_body(&mut lex)
+        {
+            if let Some(Primitive::Array(arr)) = dict.get("ID") {
+                if let Some(Primitive::String(s)) = arr.first() {
+                    return Some(s.clone());
+                }
+            }
+        }
+    }
+    // Check the trailer
+    if let Some(trailer) = parse_trailer_dict(data) {
+        if let Some(Primitive::Array(arr)) = trailer.get("ID") {
+            if let Some(Primitive::String(s)) = arr.first() {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
 }

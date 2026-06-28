@@ -1,0 +1,52 @@
+{
+  "name": "exav-unpack-wasm",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "WebAssembly bindings for exav-unpack: in-browser, memory-safe universal archive extraction. Supports zip, rar, 7z, tar, gz, bz2, xz, cab, arj, lha, iso, cpio, ar, xar, ole, pdf, email, UPX.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sylvinus/exav.git"
+  },
+  "files": [
+    "pkg/exav_unpack_wasm_bg.wasm",
+    "pkg/exav_unpack_wasm.js",
+    "pkg/exav_unpack_wasm.d.ts"
+  ],
+  "main": "pkg/exav_unpack_wasm.js",
+  "types": "pkg/exav_unpack_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "keywords": [
+    "wasm",
+    "webassembly",
+    "archive",
+    "zip",
+    "rar",
+    "7z",
+    "tar",
+    "extract",
+    "unpack",
+    "decompress",
+    "security",
+    "sandbox"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "build": "wasm-pack build --release --target web",
+    "serve": "npx serve pkg -l 3847"
+  },
+  "author": "",
+  "bugs": {
+    "url": "https://github.com/sylvinus/exav/issues"
+  },
+  "homepage": "https://github.com/sylvinus/exav#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "serve": "^14.2.6",
+    "vitest": "^4.1.9"
+  }
+}

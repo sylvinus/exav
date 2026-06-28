@@ -22,7 +22,7 @@ static-scan only, never executed).
 
 2. **Delete any stale cache and rebuild it from the freshly-built binary.**
    The cache embeds engine/version-specific state, so a cache produced by an
-   *earlier* `exav` build silently tests old code and invalidates the whole
+   earlier `exav` build silently tests old code and invalidates the whole
    comparison. ALWAYS `rm` the existing cache and rebuild from the binary under
    test at the **start of every diff run** (the prebuilt cache also avoids the
    build-time memory peak on every later daemon start):
@@ -32,46 +32,24 @@ static-scan only, never executed).
    exav -d /tmp/difdb_daily --build-cache /tmp/daily.cache
    ```
 
-3. **Start both engines as resident daemons** (loaded once — no per-file reload,
-   so timing is honest and runs are fast):
+3. **Run `corpus/difftest.sh`.** It manages the full daemon lifecycle
+   automatically — starts clamd (in Docker) and exav, runs the comparison,
+   and tears everything down on exit. No prereq steps needed.
    ```sh
-   # exav daemon
-   exav --daemon -d /tmp/daily.cache --socket /tmp/exav.sock &
-
-   # clamd on the same DB (clamscan itself is one-shot; its daemon is clamd,
-   # its client is clamdscan)
-   cat > /tmp/clamd_daily.conf <<CONF
-   DatabaseDirectory /tmp/difdb_daily
-   LocalSocket /tmp/clamd.sock
-   Foreground yes
-   MaxThreads 4
-   MaxScanSize 2000M
-   MaxFileSize 2000M
-   CONF
-   clamd --config-file=/tmp/clamd_daily.conf &
+   DUR=300 corpus/difftest.sh         # 5 minutes; Ctrl-C-safe, just re-run to continue
    ```
+   The script prints a summary (AGREE / clean / FN / FP / ERROR / CAREFUL
+   counts, average per-file ms for each engine) and lists the disagreement
+   cases to investigate. It also runs a preflight check to verify both engines
+   detect a known sample before starting — if either engine can't scan, the
+   script exits immediately with a clear error.
 
-4. **Iterate, timed and logged.** Run `corpus/difftest.sh` for a bounded time;
-   it scans files in random (`shuf`) order through both daemons, appends one row
-   per file to `/tmp/difftest/results.tsv`
-   (`path  clam  exav  verdict  clam_ms  exav_ms`), and is **resumable** — a
-   re-run skips already-logged files, so repeated short runs accumulate coverage.
-   ```sh
-   DUR=300 corpus/difftest.sh        # 5 minutes; Ctrl-C-safe, just re-run to continue
-   ```
-   The script prints a summary (AGREE / clean / FN / FP / CAREFUL counts, average
-   per-file ms for each engine) and lists the disagreement cases to investigate.
-
-5. **Tear down — ALWAYS, when you're done.** A diff leaves **both engines
-   resident** (clamd + the exav daemon, each holding the loaded DB — gigabytes)
-   plus large prebuilt caches and matched-DB dirs on disk. On a small box these
-   silently starve the next run (the step-0 "free memory" problem). Run:
+4. **Tear down (if needed).** The script has an EXIT trap that stops both
+   daemons and removes all scratch automatically. If you need to tear down
+   manually (e.g. after an abnormal exit):
    ```sh
    corpus/difftest_teardown.sh   # stops clamd+exav, removes sockets/caches/scratch
    ```
-   It's idempotent. Note clamd may run as the `clamav` (root) user, so the script
-   uses `sudo` to signal it; verify with `pgrep -x clamd` that nothing is left.
-   **Never leave a diff's daemons running** — kill everything and leave clean.
 
 Key choices, and why:
 - **Daemons, not one-shot.** exav reloads a ~1 GB cache per invocation; clamscan

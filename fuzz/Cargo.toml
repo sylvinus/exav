@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4"
 # the yara-x integration (which pulls the heavy wasmtime/cranelift tree and has
 # its own fuzz suite). Keeps the ASan build tractable on a single core.
 exav-core = { path = "../crates/exav-core", default-features = false }
+exav-unpack = { path = "../crates/exav-unpack", default-features = false }
 
 [[bin]]
 name = "analyze"
@@ -66,3 +67,10 @@ debug = 1
 name = "bytecode"
 path = "fuzz_targets/bytecode.rs"
 test = false
+
+[[bin]]
+name = "rar3_ppmd"
+path = "fuzz_targets/rar3_ppmd.rs"
+test = false
+doc = false
+bench = false

@@ -11,29 +11,20 @@ rust-version.workspace = true
 thiserror = "2"
 # fast substring search (locating the UPX PackHeader magic)
 memchr = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # `default-features = false` drops `tar`'s `xattr` feature (extended-attribute
 # *restore* on disk extraction) — we extract to memory and never restore xattrs,
 # so it's unused. This removes the `rustix` + `linux-raw-sys` syscall crates
 # entirely (~8,600 `unsafe` ops, the single largest source in the dep tree).
 tar = { version = "0.4", default-features = false }
-lzma-rs = "0.3.0"
 bzip2-rs = "0.1.2"
 cab = "0.6.0"
 # structured documents that contain embedded files
 cfb = "0.14.0"
 mail-parser = "0.11.4"
-# PDF: read-only stream extraction. pdf-rs (`pdf`) is depth-bounded against the
-# nested-object stack overflow that lopdf has (RUSTSEC-2026-0187) and pulls no
-# `rand`/`getrandom` — so extraction stays fully deterministic and RNG-free.
-pdf = "0.10.0"
-# 7-Zip: keep the decompression codecs (+ `compress`, the LZMA encoder used by
-# tests) but drop `aes256` — encrypted-archive support we can't use without a
-# password, and the only thing in the 7z path that pulls crypto + `getrandom`.
-sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
 delharc = "0.6.1"
-# ARJ archives (pure-Rust, MIT)
-unarj-rs = "0.2.1"
+# ARJ decompression: bitstream-io for the "fastest" LZ77 codec
+bitstream-io = "4.10.0"
 # Pure-Rust crypto for decrypting password-known encrypted archive members
 # (ZIP ZipCrypto + WinZip AES). DECRYPTION needs only a cipher + a KDF, no RNG,
 # so none of these pull `getrandom` (verified) — the hard no-getrandom default
@@ -47,12 +38,23 @@ constant_time_eq = "0.3"
 # DMG support
 hfsplus = "0.2"
 apfs = "0.2"
+lzfse_rust = "0.2.1"
+base64 = "0.22"
+quick-xml = "0.37"
 des = { version = "0.8", default-features = false }
 cbc = "0.1"
 bincode = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 flate2 = "1.1.9"
-dmg-core = "0.1.2"
+lzma-rust2 = { version = "0.16.4", default-features = false, features = ["std", "lzip"] }
+# PDF crypto primitives (replacing hand-rolled implementations)
+md-5 = "0.10"
+sha2 = "0.10"
+digest = "0.10"
+stringprep = "0.1"
+xz4rust = { version = "0.2.1", default-features = false, features = ["std", "bcj", "crc64", "delta", "no_unsafe"] }
+ruzstd = "0.8"
+crc32fast = "1.5.0"
 
 [features]
 # Verify RAR5-decompressed output against the header CRC-32 (debug assert).
@@ -63,3 +65,5 @@ rar5-crc-check = []
 # Reference PPMd7 (var.H) encoder, used only to validate the vendored PPMd7
 # model in `formats/ppmd7` against a known-good 7z-coder stream (CC0-1.0/MIT-0).
 ppmd-rust = "1"
+# Used only in tests to create 7z archives for roundtrip testing.
+sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }

@@ -85,7 +85,7 @@ fn synth_cbc(name: &str, marker: &[u8]) -> String {
     b.push(nib(2)); // opcode hi nibble
     b.push(nib(0)); // numOps = fixed(1) 0
     b.push_str(&num(5)); // funcid number (decoded = 5-1 = 4 -> global id 5)
-    // terminator: ret_void (opcode 20 = 0x14).
+                         // terminator: ret_void (opcode 20 = 0x14).
     b.push('T');
     b.push(nib(4));
     b.push(nib(1));

@@ -7,17 +7,21 @@ use exav_unpack::{extract, Budget, Format, Limits};
 
 /// Regression for a fuzz-found crash: this 291-byte cabinet drove `cab-0.6.0`'s
 /// `seek_to_uncompressed_offset` into an out-of-bounds index (`folder.rs:134`,
-/// "len is 0 but the index is 0"). It must return an error, not panic/abort.
+/// "len is 0 but the index is 0"). Patched via [patch.crates-io]; must not panic.
 #[test]
 fn malformed_cab_does_not_panic() {
     let data = include_bytes!("fixtures/cab_folder_panic.cab");
     let mut budget = Budget::new(Limits::default());
-    // The call must return (Ok or Err), never unwind past here.
-    let res = extract(Format::Cab, data, &mut budget);
-    assert!(
-        res.is_err(),
-        "expected a contained error for the malformed cabinet, got {res:?}"
-    );
+    let _ = extract(Format::Cab, data, &mut budget);
+}
+
+/// Regression for fuzz-found crash (2026-06-30): 122-byte CAB with zero-length
+/// folder data — same `folder.rs:134` OOB but different input shape.
+#[test]
+fn malformed_cab_zero_folder_does_not_panic() {
+    let data = include_bytes!("fixtures/cab_folder_panic2.cab");
+    let mut budget = Budget::new(Limits::default());
+    let _ = extract(Format::Cab, data, &mut budget);
 }
 
 /// Regression for a fuzz-found crash: a binary cpio (`0o070707`) header with a

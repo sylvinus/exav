@@ -149,10 +149,7 @@ impl FuzzyDb {
         if imphash.is_empty() {
             return None;
         }
-        if let Some(n) = self
-            .imp_sized
-            .get(&(imphash.to_string(), import_count))
-        {
+        if let Some(n) = self.imp_sized.get(&(imphash.to_string(), import_count)) {
             return Some(n.clone());
         }
         self.imphash.get(imphash).cloned()
@@ -225,7 +222,10 @@ mod tests {
             .match_imphash("98c88d882f01a3f6ac1e5f7dfd761624", 40)
             .is_none());
         // `*` size matches any count.
-        assert_eq!(db.match_imphash("aabbcc", 7).as_deref(), Some("Win.AnyCount"));
+        assert_eq!(
+            db.match_imphash("aabbcc", 7).as_deref(),
+            Some("Win.AnyCount")
+        );
     }
 
     #[test]

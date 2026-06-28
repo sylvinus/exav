@@ -214,25 +214,72 @@ pub fn api_of(name: &str) -> Api {
         "version_compare" => Api::VersionCompare,
         "entropy_buffer" => Api::EntropyBuffer,
         // No-op / informational APIs → 0 (success/none/inactive).
-        "check_platform" | "running_on_jit" | "disable_bytecode_if" | "disable_jit_if"
-        | "engine_db_options" | "engine_scan_options" | "engine_scan_options_ex"
-        | "get_file_reliability" | "input_switch" | "test1" | "test2" | "trace_directory"
-        | "trace_op" | "trace_ptr" | "trace_scope" | "trace_source" | "trace_value"
-        | "extract_set_container" | "pdf_set_flags" | "pdf_setobjflags" | "pdf_getobjflags"
-        | "pdf_get_flags_unused" | "json_is_active"
-        | "hashset_done" | "map_done" | "buffer_pipe_done" | "inflate_done" | "bzip2_done"
-        | "lzma_done" | "jsnorm_done" | "buffer_pipe_read_stopped" | "buffer_pipe_write_stopped"
-        | "buffer_pipe_read_avail" | "buffer_pipe_write_avail" | "pdf_get_obj_num" => Api::StubZero,
+        "check_platform"
+        | "running_on_jit"
+        | "disable_bytecode_if"
+        | "disable_jit_if"
+        | "engine_db_options"
+        | "engine_scan_options"
+        | "engine_scan_options_ex"
+        | "get_file_reliability"
+        | "input_switch"
+        | "test1"
+        | "test2"
+        | "trace_directory"
+        | "trace_op"
+        | "trace_ptr"
+        | "trace_scope"
+        | "trace_source"
+        | "trace_value"
+        | "extract_set_container"
+        | "pdf_set_flags"
+        | "pdf_setobjflags"
+        | "pdf_getobjflags"
+        | "pdf_get_flags_unused"
+        | "json_is_active"
+        | "hashset_done"
+        | "map_done"
+        | "buffer_pipe_done"
+        | "inflate_done"
+        | "bzip2_done"
+        | "lzma_done"
+        | "jsnorm_done"
+        | "buffer_pipe_read_stopped"
+        | "buffer_pipe_write_stopped"
+        | "buffer_pipe_read_avail"
+        | "buffer_pipe_write_avail"
+        | "pdf_get_obj_num" => Api::StubZero,
         // Lookup/alloc/process that must fail-safe (-1) so callers don't loop.
-        "hashset_new" | "hashset_add" | "hashset_contains" | "hashset_remove" | "hashset_empty"
-        | "map_new" | "map_addkey" | "map_find" | "map_setvalue" | "map_getvaluesize"
-        | "map_remove" | "buffer_pipe_new" | "buffer_pipe_new_fromfile" | "inflate_init"
-        | "inflate_process" | "bzip2_init" | "bzip2_process" | "lzma_init" | "lzma_process"
-        | "jsnorm_init" | "jsnorm_process" | "json_get_object" | "json_get_array_idx"
-        | "json_get_array_length" | "json_get_boolean" | "json_get_int" | "json_get_string"
-        | "json_get_string_length" | "json_get_type" | "pdf_get_dumpedobjid" => {
-            Api::StubNeg
-        }
+        "hashset_new"
+        | "hashset_add"
+        | "hashset_contains"
+        | "hashset_remove"
+        | "hashset_empty"
+        | "map_new"
+        | "map_addkey"
+        | "map_find"
+        | "map_setvalue"
+        | "map_getvaluesize"
+        | "map_remove"
+        | "buffer_pipe_new"
+        | "buffer_pipe_new_fromfile"
+        | "inflate_init"
+        | "inflate_process"
+        | "bzip2_init"
+        | "bzip2_process"
+        | "lzma_init"
+        | "lzma_process"
+        | "jsnorm_init"
+        | "jsnorm_process"
+        | "json_get_object"
+        | "json_get_array_idx"
+        | "json_get_array_length"
+        | "json_get_boolean"
+        | "json_get_int"
+        | "json_get_string"
+        | "json_get_string_length"
+        | "json_get_type"
+        | "pdf_get_dumpedobjid" => Api::StubNeg,
         // Pointer-returning APIs that fail-safe with NULL (0).
         "buffer_pipe_read_get" | "buffer_pipe_write_get" | "map_getvalue" | "pdf_getobj" => {
             Api::StubNull
@@ -570,7 +617,12 @@ impl<'a> Machine<'a> {
         if region == R_MATCHOFF {
             // match_offsets[i] is a u32; index = byte offset / 4.
             let i = off as usize / 4;
-            return self.ctx.match_offsets.get(i).map(|&v| v as i64).unwrap_or(0);
+            return self
+                .ctx
+                .match_offsets
+                .get(i)
+                .map(|&v| v as i64)
+                .unwrap_or(0);
         }
         if region >= R_GLOBAL {
             let g = (region - R_GLOBAL) as usize;
@@ -632,7 +684,11 @@ impl<'a> Machine<'a> {
     /// Read `len` bytes through a pointer (for API arguments and memops).
     fn read_region(&mut self, p: i64, len: usize) -> Vec<u8> {
         let (region, off) = (ptr_region(p), ptr_off(p) as usize);
-        let slice = |buf: &[u8]| buf.get(off..(off + len).min(buf.len())).unwrap_or(&[]).to_vec();
+        let slice = |buf: &[u8]| {
+            buf.get(off..(off + len).min(buf.len()))
+                .unwrap_or(&[])
+                .to_vec()
+        };
         if region == R_PEDATA {
             return self.ctx.pe.map(|p| slice(&p.pedata)).unwrap_or_default();
         }
@@ -676,7 +732,12 @@ impl<'a> Machine<'a> {
     fn read_cstring(&self, p: i64) -> Option<String> {
         let (region, off) = (ptr_region(p), ptr_off(p) as usize);
         let take = |b: &[u8]| -> Option<String> {
-            let s: Vec<u8> = b.get(off..)?.iter().take_while(|&&x| x != 0).copied().collect();
+            let s: Vec<u8> = b
+                .get(off..)?
+                .iter()
+                .take_while(|&&x| x != 0)
+                .copied()
+                .collect();
             Some(String::from_utf8_lossy(&s).into_owned())
         };
         if region >= R_GLOBAL {
@@ -684,7 +745,12 @@ impl<'a> Machine<'a> {
         } else if region >= R_HEAP {
             take(self.heaps.get((region - R_HEAP) as usize)?.as_slice())
         } else if region >= R_STACK {
-            take(self.frames.get((region - R_STACK) as usize)?.stack.as_slice())
+            take(
+                self.frames
+                    .get((region - R_STACK) as usize)?
+                    .stack
+                    .as_slice(),
+            )
         } else {
             None
         }
@@ -717,8 +783,9 @@ impl<'a> Machine<'a> {
                 0
             }
             Api::Read => {
-                let size =
-                    self.value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let size = self
+                    .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 let avail = self.ctx.file.len().saturating_sub(self.cursor).min(size);
                 if let Some(op) = args.first() {
                     let p = self.ptr(fi, op);
@@ -745,7 +812,10 @@ impl<'a> Machine<'a> {
                 }
                 self.cursor = pos as usize;
                 if self.trace {
-                    eprintln!("[trace] seek(off={off}, whence={whence}) -> cursor={}", self.cursor);
+                    eprintln!(
+                        "[trace] seek(off={off}, whence={whence}) -> cursor={}",
+                        self.cursor
+                    );
                 }
                 self.cursor as i64
             }
@@ -758,10 +828,12 @@ impl<'a> Machine<'a> {
                 }
             }
             Api::FileFind | Api::FileFindLimit => {
-                let len =
-                    self.value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let len = self
+                    .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 let limit = if matches!(api, Api::FileFindLimit) {
-                    self.value_nat(fi, args.get(2).unwrap_or(&Operand::Const(0))).max(0) as usize
+                    self.value_nat(fi, args.get(2).unwrap_or(&Operand::Const(0)))
+                        .max(0) as usize
                 } else {
                     self.ctx.file.len()
                 };
@@ -796,7 +868,9 @@ impl<'a> Machine<'a> {
                     return -1;
                 };
                 // rva, vsz, raw, rsz, chr, then the "unaligned" mirror fields.
-                let fields = [s.rva, s.vsz, s.raw, s.rsz, s.chr, s.rva, s.vsz, s.raw, s.rsz];
+                let fields = [
+                    s.rva, s.vsz, s.raw, s.rsz, s.chr, s.rva, s.vsz, s.raw, s.rsz,
+                ];
                 let mut buf = Vec::with_capacity(36);
                 for f in fields {
                     buf.extend_from_slice(&f.to_le_bytes());
@@ -807,7 +881,11 @@ impl<'a> Machine<'a> {
             }
             Api::PeRawaddr => {
                 let rva = self.value_nat(fi, args.first().unwrap_or(&Operand::Const(0))) as u32;
-                match self.ctx.pe.and_then(|pe| pe.rawaddr(rva, self.ctx.file.len())) {
+                match self
+                    .ctx
+                    .pe
+                    .and_then(|pe| pe.rawaddr(rva, self.ctx.file.len()))
+                {
                     Some(raw) => raw as i64,
                     None => 0xffff_ffff, // PE_INVALID_RVA
                 }
@@ -847,7 +925,11 @@ impl<'a> Machine<'a> {
                         eprintln!("[trace] malloc({size}) -> NULL (over MAX_ALLOC {MAX_ALLOC})");
                         for (hi, h) in self.heaps.iter().enumerate() {
                             let n = h.len().min(32);
-                            eprintln!("[trace]   heap#{hi} ({} bytes) [0..{n}]={:02x?}", h.len(), &h[..n]);
+                            eprintln!(
+                                "[trace]   heap#{hi} ({} bytes) [0..{n}]={:02x?}",
+                                h.len(),
+                                &h[..n]
+                            );
                         }
                     }
                     return 0; // null
@@ -861,7 +943,9 @@ impl<'a> Machine<'a> {
             }
             Api::Write => {
                 // write(data, len): append to the current extraction buffer.
-                let len = self.value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let len = self
+                    .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 let p = self.ptr(fi, args.first().unwrap_or(&Operand::Const(0)));
                 let bytes = self.read_region(p, len);
                 let n = bytes.len();
@@ -869,7 +953,10 @@ impl<'a> Machine<'a> {
                     self.extract_cur.extend_from_slice(&bytes);
                 }
                 if self.trace {
-                    eprintln!("[trace] write(len={len}) -> {n} bytes (extract_cur={})", self.extract_cur.len());
+                    eprintln!(
+                        "[trace] write(len={len}) -> {n} bytes (extract_cur={})",
+                        self.extract_cur.len()
+                    );
                 }
                 n as i64
             }
@@ -877,7 +964,10 @@ impl<'a> Machine<'a> {
                 // extract_new(id): finalize the current extraction buffer as a
                 // new embedded file for the engine to re-scan; reset.
                 if self.trace {
-                    eprintln!("[trace] extract_new -> flush {} bytes", self.extract_cur.len());
+                    eprintln!(
+                        "[trace] extract_new -> flush {} bytes",
+                        self.extract_cur.len()
+                    );
                 }
                 if !self.extract_cur.is_empty() {
                     self.extracted.push(std::mem::take(&mut self.extract_cur));
@@ -888,9 +978,13 @@ impl<'a> Machine<'a> {
                 // memstr(haystack, hlen, needle, nlen): substring search,
                 // returns the offset within the haystack or -1.
                 let hp = self.ptr(fi, args.first().unwrap_or(&Operand::Const(0)));
-                let hlen = self.value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let hlen = self
+                    .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 let np = self.ptr(fi, args.get(2).unwrap_or(&Operand::Const(0)));
-                let nlen = self.value_nat(fi, args.get(3).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let nlen = self
+                    .value_nat(fi, args.get(3).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 if nlen == 0 || nlen > hlen {
                     return -1;
                 }
@@ -910,7 +1004,8 @@ impl<'a> Machine<'a> {
             Api::EngineDconfLevel => self.ctx.flevel as i64,
             Api::GetEnvironment => {
                 // Zero-fill the caller's cli_environment (platform unknown).
-                let len = self.value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
+                let len = self
+                    .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
                     .clamp(0, MAX_ALLOC as i64) as usize;
                 let p = self.ptr(fi, args.first().unwrap_or(&Operand::Const(0)));
                 self.write_region(p, &vec![0u8; len]);
@@ -947,7 +1042,10 @@ impl<'a> Machine<'a> {
                         if i + 1 == p.objs.len() {
                             (p.size - p.objs[i].1) as i64
                         } else {
-                            (p.objs[i + 1].1.saturating_sub(p.objs[i].1).saturating_sub(4)) as i64
+                            (p.objs[i + 1]
+                                .1
+                                .saturating_sub(p.objs[i].1)
+                                .saturating_sub(4)) as i64
                         }
                     }
                     _ => 0,
@@ -956,7 +1054,9 @@ impl<'a> Machine<'a> {
             Api::PdfGetOffset => {
                 let idx = self.value_nat(fi, args.first().unwrap_or(&Operand::Const(0)));
                 match self.ctx.pdf {
-                    Some(p) if idx >= 0 && (idx as usize) < p.objs.len() => p.objs[idx as usize].1 as i64,
+                    Some(p) if idx >= 0 && (idx as usize) < p.objs.len() => {
+                        p.objs[idx as usize].1 as i64
+                    }
                     _ => -1,
                 }
             }
@@ -1015,7 +1115,9 @@ impl<'a> Machine<'a> {
             }
             Api::Atoi => {
                 let p = self.ptr(fi, args.first().unwrap_or(&Operand::Const(0)));
-                let len = self.value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let len = self
+                    .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 let bytes = self.read_region(p, len);
                 let s = bytes.iter().skip_while(|b| b.is_ascii_whitespace());
                 let s: Vec<u8> = s.copied().collect();
@@ -1023,7 +1125,11 @@ impl<'a> Machine<'a> {
                 if s.first().map(|b| b.is_ascii_digit()) != Some(true) {
                     return -1;
                 }
-                let digits: String = s.iter().take_while(|b| b.is_ascii_digit()).map(|&b| b as char).collect();
+                let digits: String = s
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .map(|&b| b as char)
+                    .collect();
                 digits.parse::<i64>().unwrap_or(-1)
             }
             Api::Hex2ui => {
@@ -1036,9 +1142,13 @@ impl<'a> Machine<'a> {
             }
             Api::VersionCompare => {
                 let lp = self.ptr(fi, args.first().unwrap_or(&Operand::Const(0)));
-                let ll = self.value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let ll = self
+                    .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 let rp = self.ptr(fi, args.get(2).unwrap_or(&Operand::Const(0)));
-                let rl = self.value_nat(fi, args.get(3).unwrap_or(&Operand::Const(0))).max(0) as usize;
+                let rl = self
+                    .value_nat(fi, args.get(3).unwrap_or(&Operand::Const(0)))
+                    .max(0) as usize;
                 let (l, r) = (self.read_region(lp, ll), self.read_region(rp, rl));
                 version_compare(&l, &r)
             }
@@ -1243,7 +1353,8 @@ impl<'a> Machine<'a> {
                             .unwrap_or(1)
                             .max(1) as i64;
                         let base = self.ptr(fi, base);
-                        let delta: i64 = idxs.iter().map(|o| self.value_nat(fi, o)).sum::<i64>() * esz;
+                        let delta: i64 =
+                            idxs.iter().map(|o| self.value_nat(fi, o)).sum::<i64>() * esz;
                         compose(ptr_region(base), ptr_off(base).wrapping_add(delta as u32))
                     }
                     None => {
@@ -1549,7 +1660,9 @@ pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
         halt: false,
         stubbed: std::collections::BTreeSet::new(),
         trace: std::env::var_os("EXAV_BC_TRACE").is_some(),
-        trace_fn: std::env::var("EXAV_BC_FN").ok().and_then(|s| s.parse().ok()),
+        trace_fn: std::env::var("EXAV_BC_FN")
+            .ok()
+            .and_then(|s| s.parse().ok()),
     };
     m.exec_fn(funcs, entry, &[], 0);
     Outcome {
@@ -1713,15 +1826,57 @@ mod tests {
             num_bb: 3,
             blocks: vec![
                 vec![
-                    Inst { opcode: 32, dest: 0, ty: 32, body: Body::Call { api: false, func: 1, args: vec![Operand::Const(0x4d)] } },
-                    Inst { opcode: 21, dest: 1, ty: 8, body: Body::Ops(vec![Operand::Reg(0), Operand::Const(0x4d)]) },
-                    Inst { opcode: OP_BRANCH, dest: 0, ty: 0, body: Body::Branch { cond: Operand::Reg(1), t: 1, f: 2 } },
+                    Inst {
+                        opcode: 32,
+                        dest: 0,
+                        ty: 32,
+                        body: Body::Call {
+                            api: false,
+                            func: 1,
+                            args: vec![Operand::Const(0x4d)],
+                        },
+                    },
+                    Inst {
+                        opcode: 21,
+                        dest: 1,
+                        ty: 8,
+                        body: Body::Ops(vec![Operand::Reg(0), Operand::Const(0x4d)]),
+                    },
+                    Inst {
+                        opcode: OP_BRANCH,
+                        dest: 0,
+                        ty: 0,
+                        body: Body::Branch {
+                            cond: Operand::Reg(1),
+                            t: 1,
+                            f: 2,
+                        },
+                    },
                 ],
                 vec![
-                    Inst { opcode: 33, dest: 0, ty: 32, body: Body::Call { api: true, func: 0, args: vec![] } },
-                    Inst { opcode: OP_RET_VOID, dest: 0, ty: 0, body: Body::Ret(None) },
+                    Inst {
+                        opcode: 33,
+                        dest: 0,
+                        ty: 32,
+                        body: Body::Call {
+                            api: true,
+                            func: 0,
+                            args: vec![],
+                        },
+                    },
+                    Inst {
+                        opcode: OP_RET_VOID,
+                        dest: 0,
+                        ty: 0,
+                        body: Body::Ret(None),
+                    },
                 ],
-                vec![Inst { opcode: OP_RET_VOID, dest: 0, ty: 0, body: Body::Ret(None) }],
+                vec![Inst {
+                    opcode: OP_RET_VOID,
+                    dest: 0,
+                    ty: 0,
+                    body: Body::Ret(None),
+                }],
             ],
         };
         let fn1 = Function {
@@ -1732,8 +1887,22 @@ mod tests {
             num_bb: 1,
             blocks: vec![vec![
                 // void call to fn2 (dest=0, ty=0): must not overwrite Reg0 (arg).
-                Inst { opcode: 32, dest: 0, ty: 0, body: Body::Call { api: false, func: 2, args: vec![] } },
-                Inst { opcode: 19, dest: 0, ty: 32, body: Body::Ret(Some(Operand::Reg(0))) },
+                Inst {
+                    opcode: 32,
+                    dest: 0,
+                    ty: 0,
+                    body: Body::Call {
+                        api: false,
+                        func: 2,
+                        args: vec![],
+                    },
+                },
+                Inst {
+                    opcode: 19,
+                    dest: 0,
+                    ty: 32,
+                    body: Body::Ret(Some(Operand::Reg(0))),
+                },
             ]],
         };
         let fn2 = Function {
@@ -1742,7 +1911,12 @@ mod tests {
             types: vec![],
             num_insts: 1,
             num_bb: 1,
-            blocks: vec![vec![Inst { opcode: OP_RET_VOID, dest: 0, ty: 0, body: Body::Ret(None) }]],
+            blocks: vec![vec![Inst {
+                opcode: OP_RET_VOID,
+                dest: 0,
+                ty: 0,
+                body: Body::Ret(None),
+            }]],
         };
         let apis = vec![(1, "setvirusname".to_string())];
         let (globals, types) = (Globals::default(), TypeTable::default());

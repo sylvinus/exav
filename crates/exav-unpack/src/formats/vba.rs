@@ -186,7 +186,10 @@ fn parse_dir(d: &[u8]) -> DirInfo {
             0x0006 => {
                 // PROJECTHELPFILEPATH: HelpFile1[size], Reserved(0x003D) u16,
                 // SizeOfHelpFile2 u32, HelpFile2[..]
-                headers.push(format!("REM PROJECTHELPFILEPATH: {}", read_str(d, body, size)));
+                headers.push(format!(
+                    "REM PROJECTHELPFILEPATH: {}",
+                    read_str(d, body, size)
+                ));
                 let h2_off = body + size + 2;
                 let h2_sz = read_u32(d, h2_off).unwrap_or(0) as usize;
                 headers.push(format!(
@@ -417,7 +420,10 @@ pub(crate) fn build_artifacts(streams: &[(String, &[u8])]) -> Option<(Vec<u8>, V
         out.push_str("REM MODULEDOCSTRING: \n");
         out.push_str("REM MODULEDOCSTRINGUNICODE: \n");
         out.push_str(&format!("REM MODULEOFFSET: 0x{:08x}\n", m.text_offset));
-        out.push_str(&format!("REM MODULEHELPCONTEXT: 0x{:08x}\n", m.help_context));
+        out.push_str(&format!(
+            "REM MODULEHELPCONTEXT: 0x{:08x}\n",
+            m.help_context
+        ));
         out.push_str(&format!("REM MODULECOOKIE: 0x{:04x}\n", m.cookie));
         out.push_str(if m.is_class {
             "REM MODULETYPE: Class\n"

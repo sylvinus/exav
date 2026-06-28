@@ -258,9 +258,12 @@ pub fn bytecode_pe(data: &[u8]) -> Option<BcPe> {
 /// it out (offsets verified against the field accesses real programs make).
 fn build_pedata(pe: &PE, bc: &BcPe, file_size: usize) -> Vec<u8> {
     let mut b = vec![0u8; PEDATA_SIZE];
-    let put16 = |b: &mut [u8], off: usize, v: u16| b[off..off + 2].copy_from_slice(&v.to_le_bytes());
-    let put32 = |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    let put64 = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |b: &mut [u8], off: usize, v: u16| b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    let put32 =
+        |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 
     let coff = &pe.header.coff_header;
     let e_lfanew = pe.header.dos_header.pe_pointer;
@@ -282,8 +285,8 @@ fn build_pedata(pe: &PE, bc: &BcPe, file_size: usize) -> Vec<u8> {
         let w = &oh.windows_fields;
         let ep = s.address_of_entry_point;
         put32(&mut b, 4, bc.rawaddr(ep, file_size).unwrap_or(0)); // ep as file offset
-        // The compiler's struct inlines DataDirectory[16] into each opt header,
-        // so opt32 spans 36..260 and opt64 spans 264..504.
+                                                                  // The compiler's struct inlines DataDirectory[16] into each opt header,
+                                                                  // so opt32 spans 36..260 and opt64 spans 264..504.
         if s.magic == 0x20b {
             let base = 264;
             put16(&mut b, base, s.magic);
@@ -406,7 +409,7 @@ pub fn embedded_elf_offsets(data: &[u8]) -> Vec<usize> {
         } else {
             u16::from_be_bytes([data[off + 16], data[off + 17]])
         };
-        if matches!(etype, 1 | 2 | 3 | 4) {
+        if matches!(etype, 1..=4) {
             out.push(off);
         }
     }
@@ -615,7 +618,10 @@ mod tests {
         assert_eq!(slices.len(), 1, "expected one section");
         assert_eq!(slices[0].0, body.len() as u64);
         assert_eq!(slices[0].1, body);
-        assert_eq!(encode_hex(&Md5::digest(slices[0].1)), encode_hex(&Md5::digest(body)));
+        assert_eq!(
+            encode_hex(&Md5::digest(slices[0].1)),
+            encode_hex(&Md5::digest(body))
+        );
     }
 
     #[test]

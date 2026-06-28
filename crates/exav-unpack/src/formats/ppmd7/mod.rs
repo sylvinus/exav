@@ -26,7 +26,6 @@ mod tagged_offset;
 
 pub(crate) use model::Ppmd7;
 pub(crate) use rangedec::RarRangeDecoder;
-#[cfg(test)]
 pub(crate) use rangedec::SevenZRangeDecoder;
 
 /// A range decoder symbol decode returned this end-of-stream marker.

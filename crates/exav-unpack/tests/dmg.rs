@@ -8,15 +8,14 @@ use exav_unpack::{detect, extract, Budget, Format, Limits};
 const MARKER: &[u8] = b"hello hfs+";
 
 fn fixture(name: &str) -> Vec<u8> {
-    let p = format!(
-        "{}/tests/fixtures/dmg/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let p = format!("{}/tests/fixtures/dmg/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn contains_marker(entries: &[exav_unpack::Entry]) -> bool {
-    entries.iter().any(|e| e.data.windows(MARKER.len()).any(|w| w == MARKER))
+    entries
+        .iter()
+        .any(|e| e.data.windows(MARKER.len()).any(|w| w == MARKER))
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +117,10 @@ fn extract_encrypted_correct_password_extracts_files() {
     let data = fixture("encrypted.dmg");
     let mut budget = Budget::with_passwords(Limits::default(), vec!["test123".into()]);
     let entries = extract(Format::Dmg, &data, &mut budget).unwrap();
-    assert!(!entries.is_empty(), "should extract files from encrypted DMG");
+    assert!(
+        !entries.is_empty(),
+        "should extract files from encrypted DMG"
+    );
     assert!(contains_marker(&entries));
 }
 

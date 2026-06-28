@@ -325,9 +325,9 @@ fn bind_listener(addr: &ListenAddr) -> io::Result<BoundListener> {
     match addr {
         ListenAddr::Unix(path) => {
             let _ = std::fs::remove_file(path);
-            Ok(BoundListener::Unix(
-                std::os::unix::net::UnixListener::bind(path)?,
-            ))
+            Ok(BoundListener::Unix(std::os::unix::net::UnixListener::bind(
+                path,
+            )?))
         }
         ListenAddr::Tcp(a) => Ok(BoundListener::Tcp(TcpListener::bind(a)?)),
     }
@@ -498,12 +498,7 @@ fn spawn_worker(
 /// connections one at a time until it hits its job limit (then exits cleanly so
 /// the supervisor recycles it). Never returns.
 #[cfg(unix)]
-fn worker_main(
-    listener: &BoundListener,
-    db: &Database,
-    opts: &ScanOptions,
-    cfg: &PoolConfig,
-) -> ! {
+fn worker_main(listener: &BoundListener, db: &Database, opts: &ScanOptions, cfg: &PoolConfig) -> ! {
     // Apply the kernel-enforced resource caps to *this* process.
     set_rlimit(libc::RLIMIT_AS as libc::c_int, cfg.max_memory_bytes);
     set_rlimit(libc::RLIMIT_CPU as libc::c_int, cfg.max_cpu_secs);
@@ -843,8 +838,9 @@ fn scan_one_path(db: &Database, opts: &ScanOptions, path: &str) -> String {
     // Isolate a panic on a malicious file: report ERROR for this target rather
     // than letting it tear down the connection (or, with the per-file recursion
     // in scan_tree, the rest of the walk).
-    let scanned =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_path(db, Path::new(path), opts)));
+    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scan_path(db, Path::new(path), opts)
+    }));
     match scanned {
         Ok(Ok(report)) => verdict_line(path, &report),
         Ok(Err(e)) => format!("{path}: {e} ERROR"),

@@ -329,8 +329,10 @@ mod tests {
         let loaded = super::load(&path).unwrap();
 
         let data = b"xx malware xx";
-        let mut compat = ScanOptions::default();
-        compat.compat = true;
+        let compat = ScanOptions {
+            compat: true,
+            ..ScanOptions::default()
+        };
         for db in [&fresh, &loaded] {
             match analyze(db, data, &ScanOptions::default()).verdict {
                 Verdict::Infected { signature, .. } => assert_eq!(signature, "Demo.Loose"),

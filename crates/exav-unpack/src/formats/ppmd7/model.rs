@@ -849,7 +849,8 @@ impl<RC: RangeDec> Ppmd7<RC> {
         }
 
         let ns = self.ctx_num_stats(mc) as u32;
-        let s0 = (self.ctx_summ_freq(mc) as u32) - ns - ((self.state_freq(self.found_state) as u32) - 1);
+        let s0 =
+            (self.ctx_summ_freq(mc) as u32) - ns - ((self.state_freq(self.found_state) as u32) - 1);
 
         while c != mc {
             let mut sum;

@@ -1,0 +1,33 @@
+[package]
+name = "exav-unpack-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.exav-unpack]
+path = ".."
+
+[[bin]]
+name = "fuzz_all_formats"
+path = "fuzz_targets/fuzz_all_formats.rs"
+test = false
+doc = false
+
+# Disable ASAN so third-party crate panics (unarj-rs) are properly caught by
+# catch_unwind instead of being intercepted by the sanitizer's signal handler.
+[profile.fuzz]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
+# Keep in sync with workspace root — same cab fix from PR #38.
+[patch.crates-io]
+cab = { git = "https://github.com/ozzieba/rust-cab", branch = "fix-empty-data-blocks-panic" }

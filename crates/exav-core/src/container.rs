@@ -26,7 +26,10 @@ impl Range {
             return Some(Range::Any);
         }
         if let Some((a, b)) = s.split_once('-') {
-            Some(Range::Between(a.trim().parse().ok()?, b.trim().parse().ok()?))
+            Some(Range::Between(
+                a.trim().parse().ok()?,
+                b.trim().parse().ok()?,
+            ))
         } else {
             Some(Range::Exact(s.parse().ok()?))
         }
@@ -231,9 +234,7 @@ mod tests {
     fn cdb_matches_zip_member() {
         let mut db = CdbDb::new();
         // Any-size ZIP containing a file named like an invoice .exe, encrypted.
-        db.extend_from_text(
-            "Test.Cdb:CL_TYPE_ZIP:*:(?i)invoice.*\\.exe:*:*:1:*:*:\n",
-        );
+        db.extend_from_text("Test.Cdb:CL_TYPE_ZIP:*:(?i)invoice.*\\.exe:*:*:1:*:*:\n");
         let m = Member {
             name: "Invoice_2024.exe",
             size_in_container: 1000,
@@ -242,13 +243,18 @@ mod tests {
             pos: 1,
         };
         assert_eq!(
-            db.matches(FileType::Zip, 5000, &m).map(|(n, _)| n).as_deref(),
+            db.matches(FileType::Zip, 5000, &m)
+                .map(|(n, _)| n)
+                .as_deref(),
             Some("Test.Cdb")
         );
         // Wrong container type -> no match.
         assert!(db.matches(FileType::Tar, 5000, &m).is_none());
         // Not encrypted -> no match (sig requires encrypted=1).
-        let m2 = Member { encrypted: false, ..m_clone(&m) };
+        let m2 = Member {
+            encrypted: false,
+            ..m_clone(&m)
+        };
         assert!(db.matches(FileType::Zip, 5000, &m2).is_none());
     }
 
@@ -263,11 +269,19 @@ mod tests {
             encrypted: false,
             pos: 2,
         };
-        assert_eq!(db.matches(FileType::Zip, 150, &ok).map(|(n, _)| n).as_deref(), Some("R"));
+        assert_eq!(
+            db.matches(FileType::Zip, 150, &ok)
+                .map(|(n, _)| n)
+                .as_deref(),
+            Some("R")
+        );
         // container size out of range
         assert!(db.matches(FileType::Zip, 250, &ok).is_none());
         // wrong position
-        let bad = Member { pos: 3, ..m_clone(&ok) };
+        let bad = Member {
+            pos: 3,
+            ..m_clone(&ok)
+        };
         assert!(db.matches(FileType::Zip, 150, &bad).is_none());
     }
 

@@ -99,7 +99,10 @@ pub fn read_with_limits(
             .ok_or_else(|| "cvd: empty gzip payload".to_string())?
     } else {
         if payload.len() as u64 > limits.max_tar_bytes {
-            return Err(format!("cvd payload exceeds {} bytes", limits.max_tar_bytes));
+            return Err(format!(
+                "cvd payload exceeds {} bytes",
+                limits.max_tar_bytes
+            ));
         }
         payload.to_vec()
     };

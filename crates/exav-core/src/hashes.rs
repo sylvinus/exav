@@ -493,7 +493,10 @@ mod tests {
         let n = "malware".len() as u64;
         db.extend_from_text(&format!("{}:*:Test.Malware\n", d.md5));
         db.finalize();
-        assert_eq!(db.lookup(&d, n).map(|(n, _)| n).as_deref(), Some("Test.Malware"));
+        assert_eq!(
+            db.lookup(&d, n).map(|(n, _)| n).as_deref(),
+            Some("Test.Malware")
+        );
         assert!(db.lookup(&digests_of(b"clean"), 5).is_none());
     }
 
@@ -504,7 +507,10 @@ mod tests {
         let d = digests_of(b"malware");
         db.extend_from_text(&format!("{}:7:Test.Sized\n", d.md5));
         db.finalize();
-        assert_eq!(db.lookup(&d, 7).map(|(n, _)| n).as_deref(), Some("Test.Sized")); // size matches
+        assert_eq!(
+            db.lookup(&d, 7).map(|(n, _)| n).as_deref(),
+            Some("Test.Sized")
+        ); // size matches
         assert!(db.lookup(&d, 8).is_none()); // same hash, wrong size -> miss
     }
 
@@ -514,7 +520,10 @@ mod tests {
         let d = digests_of(b"payload");
         db.extend_from_text(&format!("{}:*:Test.BySha256\n", d.sha256));
         db.finalize();
-        assert_eq!(db.lookup(&d, 7).map(|(n, _)| n).as_deref(), Some("Test.BySha256"));
+        assert_eq!(
+            db.lookup(&d, 7).map(|(n, _)| n).as_deref(),
+            Some("Test.BySha256")
+        );
     }
 
     #[test]
@@ -531,7 +540,10 @@ mod tests {
         db.finalize();
         assert!(db.wants_sha());
         // exact size+md5
-        assert_eq!(db.lookup(4096, &s).map(|(n, _)| n).as_deref(), Some("Sig.Sized"));
+        assert_eq!(
+            db.lookup(4096, &s).map(|(n, _)| n).as_deref(),
+            Some("Sig.Sized")
+        );
         // wrong size, not a wildcard entry -> miss
         assert!(db.lookup(512, &s).is_none());
         // wildcard size matches any size (md5 and sha both registered for `other`)

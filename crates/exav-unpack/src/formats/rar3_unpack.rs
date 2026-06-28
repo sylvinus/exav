@@ -431,9 +431,9 @@ const LENGTH_EXTRA_BITS: [u32; 28] = [
 const OFFSET_BASE: [i32; 60] = [
     0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536,
     2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608,
-    262144, 327680, 393216, 458752, 524288, 589824, 655360, 720896, 786432, 851968, 917504,
-    983040, 1048576, 1310720, 1572864, 1835008, 2097152, 2359296, 2621440, 2883584, 3145728,
-    3407872, 3670016, 3932160,
+    262144, 327680, 393216, 458752, 524288, 589824, 655360, 720896, 786432, 851968, 917504, 983040,
+    1048576, 1310720, 1572864, 1835008, 2097152, 2359296, 2621440, 2883584, 3145728, 3407872,
+    3670016, 3932160,
 ];
 const OFFSET_EXTRA_BITS: [u32; 60] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
@@ -589,10 +589,7 @@ impl Lz29 {
                 self.length += br.read_bits(bits).ok_or_else(|| err("eof"))? as i32;
             }
 
-            let oi = self
-                .offset_dec
-                .read_sym(br)
-                .ok_or_else(|| err("eof off"))? as usize;
+            let oi = self.offset_dec.read_sym(br).ok_or_else(|| err("eof off"))? as usize;
             if oi >= 60 {
                 return Err(err("off index oob"));
             }
@@ -657,7 +654,7 @@ struct FilterBlock {
     length: usize,
     offset: usize, // relative to previous filter / read index
     reset: bool,
-    filter_index: usize,             // index into Decoder29.filters
+    filter_index: usize, // index into Decoder29.filters
     regs: [Option<u32>; VM_REGS - 1],
     global: Vec<u8>,
 }
@@ -1329,12 +1326,15 @@ fn get_v3_filter(code: &[u8]) -> Result<V3Filter, LimitHit> {
     let n = r.read_bits(1).ok_or_else(|| err("eof vm static"))?;
     if n > 0 {
         let m = r.read_uint32().ok_or_else(|| err("eof vm static len"))?;
-        let len = (m as usize).checked_add(1).ok_or_else(|| err("static ovf"))?;
+        let len = (m as usize)
+            .checked_add(1)
+            .ok_or_else(|| err("static ovf"))?;
         if len > VM_SIZE {
             return Err(err("static too large"));
         }
         let mut s = vec![0u8; len];
-        r.read_full(&mut s).ok_or_else(|| err("eof vm static data"))?;
+        r.read_full(&mut s)
+            .ok_or_else(|| err("eof vm static data"))?;
         vf.static_data = s;
     }
     // readCommands: returns whatever it parses; io.EOF is a normal terminator.

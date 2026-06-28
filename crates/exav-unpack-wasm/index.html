@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>exav-unpack-wasm demo</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; background: #fafafa; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    p.subtitle { color: #666; margin-top: 0; font-size: 0.9rem; }
+    #drop-zone { border: 2px dashed #bbb; border-radius: 8px; padding: 2rem; text-align: center; color: #888; transition: all 0.2s; cursor: pointer; }
+    #drop-zone.drag-over { border-color: #4a90d9; background: #eef4fc; color: #4a90d9; }
+    #file-input { display: none; }
+    #status { margin-top: 1rem; font-size: 0.9rem; color: #555; }
+    #status.error { color: #c0392b; }
+    #status.success { color: #27ae60; }
+    #result { margin-top: 1.5rem; }
+    .format-badge { display: inline-block; background: #e8f0fe; color: #1a56db; padding: 0.2rem 0.6rem; border-radius: 4px; font-weight: 600; font-size: 0.85rem; margin-bottom: 1rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th { text-align: left; padding: 0.5rem 0.75rem; background: #f0f0f0; border-bottom: 2px solid #ddd; }
+    td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #eee; vertical-align: middle; }
+    tr:hover { background: #f8f8f8; }
+    .name-cell { word-break: break-all; font-family: monospace; font-size: 0.8rem; }
+    .size-cell { white-space: nowrap; color: #666; }
+    .unsupported { color: #999; font-style: italic; }
+    .encrypted { color: #e67e22; }
+    .preview-row { background: #f5f5f5; }
+    .preview-cell { padding: 0.5rem 0.75rem 1rem; }
+    pre.preview { background: #1e1e1e; color: #d4d4d4; padding: 0.75rem; border-radius: 4px; overflow-x: auto; font-size: 0.75rem; max-height: 200px; overflow-y: auto; margin: 0; }
+    .btn { background: #4a90d9; color: white; border: none; padding: 0.3rem 0.6rem; border-radius: 4px; cursor: pointer; font-size: 0.75rem; }
+    .btn:hover { background: #3a7bc8; }
+    .summary { font-size: 0.85rem; color: #666; margin-bottom: 0.75rem; }
+    #loading { display: none; }
+    .spinner { display: inline-block; width: 1rem; height: 1rem; border: 2px solid #ccc; border-top-color: #4a90d9; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 0.5rem; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #password-dialog { display: none; margin-top: 1rem; padding: 1rem; background: #fff8e1; border: 1px solid #f9a825; border-radius: 8px; }
+    #password-dialog label { font-size: 0.9rem; font-weight: 600; }
+    #password-dialog input { margin: 0.5rem 0; padding: 0.4rem 0.6rem; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9rem; width: 250px; }
+    #password-dialog .pw-actions { margin-top: 0.5rem; }
+    #password-dialog .pw-error { color: #c0392b; font-size: 0.85rem; margin-top: 0.25rem; display: none; }
+    #password-dialog .btn { margin-right: 0.5rem; }
+    .btn-secondary { background: #888; }
+    .btn-secondary:hover { background: #666; }
+  </style>
+</head>
+<body>
+  <h1>exav-unpack-wasm</h1>
+  <p class="subtitle">In-browser archive extraction — no server, no native dependencies. Supports zip, rar, 7z, tar, gz, bz2, xz, cab, arj, lha, iso, cpio, ar, xar, ole, pdf, email, UPX. Handles encrypted archives.</p>
+
+  <div id="drop-zone">
+    <p><strong>Drop an archive here</strong> or click to browse</p>
+    <input type="file" id="file-input" />
+  </div>
+
+  <div id="password-dialog">
+    <label for="password-input">This archive is encrypted. Enter password:</label><br>
+    <input type="password" id="password-input" placeholder="Password" autocomplete="off" />
+    <div class="pw-actions">
+      <button class="btn" id="pw-submit">Unlock</button>
+      <button class="btn btn-secondary" id="pw-cancel">Cancel</button>
+    </div>
+    <div class="pw-error" id="pw-error"></div>
+  </div>
+
+  <div id="loading"><span class="spinner"></span> Extracting…</div>
+  <div id="status"></div>
+  <div id="result"></div>
+
+  <script type="module">
+    import init, { Archive } from "./pkg/exav_unpack_wasm.js";
+
+    const dropZone = document.getElementById("drop-zone");
+    const fileInput = document.getElementById("file-input");
+    const status = document.getElementById("status");
+    const result = document.getElementById("result");
+    const loading = document.getElementById("loading");
+    const pwDialog = document.getElementById("password-dialog");
+    const pwInput = document.getElementById("password-input");
+    const pwSubmit = document.getElementById("pw-submit");
+    const pwCancel = document.getElementById("pw-cancel");
+    const pwError = document.getElementById("pw-error");
+
+    let wasmReady = false;
+    let currentArchive = null;
+    let currentFile = null;
+    let currentPasswords = [];
+
+    status.textContent = "Loading WASM module…";
+    try {
+      await init();
+      wasmReady = true;
+      status.textContent = "";
+      status.className = "";
+    } catch (e) {
+      status.textContent = `Failed to load WASM: ${e}`;
+      status.className = "error";
+    }
+
+    dropZone.addEventListener("click", () => fileInput.click());
+    dropZone.addEventListener("dragover", (e) => { e.preventDefault(); dropZone.classList.add("drag-over"); });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+    dropZone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropZone.classList.remove("drag-over");
+      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener("change", () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+    pwSubmit.addEventListener("click", submitPassword);
+    pwCancel.addEventListener("click", () => { pwDialog.style.display = "none"; });
+    pwInput.addEventListener("keydown", (e) => { if (e.key === "Enter") submitPassword(); });
+
+    function submitPassword() {
+      const pw = pwInput.value;
+      if (!pw) return;
+      pwDialog.style.display = "none";
+      currentPasswords.push(pw);
+      refreshResults();
+    }
+
+    async function handleFile(file) {
+      if (!wasmReady) return;
+      status.textContent = "";
+      status.className = "";
+      result.innerHTML = "";
+      loading.style.display = "block";
+      pwDialog.style.display = "none";
+      currentFile = file;
+      currentPasswords = [];
+
+      try {
+        currentArchive = await Archive.open(file);
+        await refreshResults();
+      } catch (e) {
+        loading.style.display = "none";
+        status.textContent = `Error: ${e}`;
+        status.className = "error";
+      }
+    }
+
+    async function refreshResults() {
+      loading.style.display = "block";
+      status.textContent = "";
+      status.className = "";
+      result.innerHTML = "";
+      pwError.style.display = "none";
+
+      try {
+        const t0 = performance.now();
+        const members = await currentArchive.list(
+          currentPasswords.length > 0 ? currentPasswords : null
+        );
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+
+        loading.style.display = "none";
+
+        const hasEncryptedUnsupported = Array.from(members).some(
+          m => m.encrypted && m.unsupported
+        );
+
+        if (hasEncryptedUnsupported) {
+          status.textContent = `Listed in ${elapsed}s — archive contains encrypted members`;
+          status.className = "";
+          renderMembers(members);
+          showPasswordPrompt();
+          return;
+        }
+
+        const fmt = currentArchive.format();
+        status.textContent = `Listed in ${elapsed}s`;
+        status.className = "success";
+        renderMembers(members);
+      } catch (e) {
+        loading.style.display = "none";
+        status.textContent = `Error: ${e}`;
+        status.className = "error";
+      }
+    }
+
+    function showPasswordPrompt() {
+      pwDialog.style.display = "block";
+      pwInput.value = "";
+      pwInput.focus();
+      if (currentPasswords.length > 0) {
+        pwError.textContent = "Wrong password — try again.";
+        pwError.style.display = "block";
+      }
+    }
+
+    async function renderMembers(members) {
+      const fmt = currentArchive.format();
+      let totalSize = 0;
+      for (const m of members) {
+        totalSize += m.compressedSize || 0;
+      }
+
+      let html = `<span class="format-badge">${fmt}</span>`;
+      html += `<p class="summary">${members.length} member${members.length !== 1 ? "s" : ""}</p>`;
+      html += `<table><thead><tr><th>#</th><th>Name</th><th>Size</th><th></th></tr></thead><tbody>`;
+
+      members.forEach((m, i) => {
+        const isUnsupported = m.unsupported && m.unsupported !== "";
+        const isEncrypted = !!m.encrypted;
+        const nameClass = isUnsupported ? "unsupported" : isEncrypted ? "encrypted" : "";
+        const sizeLabel = m.uncompressedSize >= 0
+          ? formatSize(m.uncompressedSize)
+          : (m.compressedSize > 0 ? formatSize(m.compressedSize) + " (compressed)" : "?");
+
+        html += `<tr>`;
+        html += `<td>${i + 1}</td>`;
+        html += `<td class="name-cell ${nameClass}">${escapeHtml(m.name)}</td>`;
+        html += `<td class="size-cell">${sizeLabel}</td>`;
+        html += `<td>`;
+        if (!isUnsupported) {
+          html += `<button class="btn" data-idx="${i}">Extract</button>`;
+        }
+        if (isEncrypted) html += ` <span class="encrypted">&#128274;</span>`;
+        if (isUnsupported) html += ` <span class="unsupported">${escapeHtml(m.unsupported || "")}</span>`;
+        html += `</td></tr>`;
+        html += `<tr class="preview-row" id="preview-${i}" style="display:none"><td colspan="4" class="preview-cell"><pre class="preview" id="pre-${i}"></pre></td></tr>`;
+      });
+
+      html += `</tbody></table>`;
+      result.innerHTML = html;
+
+      result.querySelectorAll("[data-idx]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const idx = parseInt(btn.dataset.idx);
+          btn.disabled = true;
+          btn.textContent = "Extracting…";
+          try {
+            const entry = await currentArchive.extract(
+              idx,
+              currentPasswords.length > 0 ? currentPasswords : null
+            );
+            const row = document.getElementById(`preview-${idx}`);
+            const pre = document.getElementById(`pre-${idx}`);
+            if (row.style.display === "none") {
+              // Read the ReadableStream
+              const reader = entry.data.getReader();
+              const chunks = [];
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+              }
+              const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+              const combined = new Uint8Array(totalLen);
+              let offset = 0;
+              for (const c of chunks) {
+                combined.set(c, offset);
+                offset += c.length;
+              }
+
+              if (entry.unsupported) {
+                pre.textContent = `[${entry.unsupported}]`;
+              } else if (isText(combined)) {
+                pre.textContent = new TextDecoder().decode(combined);
+              } else {
+                pre.textContent = `[Binary data — ${formatSize(combined.length)}]`;
+              }
+              row.style.display = "";
+
+              // Add download button
+              const td = btn.closest("td");
+              const dlBtn = document.createElement("button");
+              dlBtn.className = "btn";
+              dlBtn.textContent = "Download";
+              dlBtn.addEventListener("click", () => {
+                const blob = new Blob([combined]);
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                a.download = entry.name.split("/").pop() || "file";
+                a.click();
+                URL.revokeObjectURL(a.href);
+              });
+              td.appendChild(document.createTextNode(" "));
+              td.appendChild(dlBtn);
+              btn.textContent = "Hide";
+            } else {
+              row.style.display = "none";
+              btn.textContent = "Extract";
+            }
+          } catch (e) {
+            btn.textContent = `Error: ${e}`;
+          }
+          btn.disabled = false;
+        });
+      });
+    }
+
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+      return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function isText(data) {
+      if (data.length > 1024 * 100) return false;
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] === 0) return false;
+      }
+      return true;
+    }
+  </script>
+</body>
+</html>

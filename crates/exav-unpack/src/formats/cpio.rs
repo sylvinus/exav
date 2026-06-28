@@ -77,7 +77,9 @@ fn extract_bin<R>(
             budget.count_entry()?;
             let cap = budget.reserve()?;
             if filesize as u64 > cap {
-                return Err(LimitHit::new(format!("cpio member '{name}' exceeds budget")));
+                return Err(LimitHit::new(format!(
+                    "cpio member '{name}' exceeds budget"
+                )));
             }
             let member = data[data_start..data_end].to_vec();
             budget.commit(member.len() as u64);
@@ -122,7 +124,9 @@ fn extract_newc<R>(
             budget.count_entry()?;
             let cap = budget.reserve()?;
             if filesize as u64 > cap {
-                return Err(LimitHit::new(format!("cpio member '{name}' exceeds budget")));
+                return Err(LimitHit::new(format!(
+                    "cpio member '{name}' exceeds budget"
+                )));
             }
             let member = data[data_start..data_end].to_vec();
             budget.commit(member.len() as u64);
@@ -136,11 +140,7 @@ fn extract_newc<R>(
 }
 
 /// Old POSIX "portable": 76-byte header of octal fields, no padding.
-fn extract_odc<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+fn extract_odc<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
     let mut pos = 0usize;
     while pos + 76 <= data.len() {
         let h = &data[pos..pos + 76];
@@ -165,7 +165,9 @@ fn extract_odc<R>(
             budget.count_entry()?;
             let cap = budget.reserve()?;
             if filesize as u64 > cap {
-                return Err(LimitHit::new(format!("cpio member '{name}' exceeds budget")));
+                return Err(LimitHit::new(format!(
+                    "cpio member '{name}' exceeds budget"
+                )));
             }
             let member = data[data_start..data_end].to_vec();
             budget.commit(member.len() as u64);
@@ -192,21 +194,7 @@ mod tests {
         // ino,mode,uid,gid,nlink,mtime,filesize,devmajor,devminor,rdevmajor,
         // rdevminor,namesize,check (13 × 8 hex).
         let name_z = format!("{name}\0");
-        let fields = [
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            data.len(),
-            0,
-            0,
-            0,
-            0,
-            name_z.len(),
-            0,
-        ];
+        let fields = [0, 0, 0, 0, 1, 0, data.len(), 0, 0, 0, 0, name_z.len(), 0];
         let mut h = String::from("070701");
         for f in fields {
             h.push_str(&format!("{f:08x}"));

@@ -55,7 +55,9 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, DbError> {
     };
     let f = File::open(path).map_err(io_err)?;
     let mut buf = Vec::new();
-    f.take(MAX_DB_FILE + 1).read_to_end(&mut buf).map_err(io_err)?;
+    f.take(MAX_DB_FILE + 1)
+        .read_to_end(&mut buf)
+        .map_err(io_err)?;
     if buf.len() as u64 > MAX_DB_FILE {
         return Err(DbError::TooLarge {
             path: path.display().to_string(),
@@ -173,9 +175,9 @@ impl Loader {
                 }
                 Ok(())
             }
-            "ndb" | "ndu" | "db" | "hdb" | "hdu" | "hsb" | "hsu" | "fdb" | "imp" | "ldb" | "ldu"
-            | "mdb" | "mdu" | "msb" | "cdb" | "ftm" | "pdb" | "gdb" | "wdb" | "crb" | "yar"
-            | "yara" | "fp" | "sfp" | "ign" | "ign2" | "cbc" | "idb" | "pwdb" => {
+            "ndb" | "ndu" | "db" | "hdb" | "hdu" | "hsb" | "hsu" | "fdb" | "imp" | "ldb"
+            | "ldu" | "mdb" | "mdu" | "msb" | "cdb" | "ftm" | "pdb" | "gdb" | "wdb" | "crb"
+            | "yar" | "yara" | "fp" | "sfp" | "ign" | "ign2" | "cbc" | "idb" | "pwdb" => {
                 // A loose signature file is unofficial (not a signed container).
                 let data = read_capped(path)?;
                 self.add_named_text(name, &String::from_utf8_lossy(&data), false);
@@ -189,7 +191,7 @@ impl Loader {
 
     /// Route raw bytes from a CVD member by its name/extension. `official` is
     /// true for members of a signed `.cvd`/`.cld`.
-    fn add_named_bytes(&mut self, name: &str, data: &[u8], official: bool) {
+    pub fn add_named_bytes(&mut self, name: &str, data: &[u8], official: bool) {
         // db members are text; lossy decode is fine for signature lines.
         let text = String::from_utf8_lossy(data);
         self.add_named_text(name, &text, official);
@@ -342,11 +344,10 @@ fn parse_pwdb_into(text: &str, out: &mut Vec<String>) {
         // in the cleartext case, but ClamAV's format treats the 4th field as the
         // remainder, so `splitn(4, ';')` keeps a `;` inside a cleartext password.
         let mut it = line.splitn(4, ';');
-        let (_name, _target, storage, pw) =
-            match (it.next(), it.next(), it.next(), it.next()) {
-                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-                _ => continue,
-            };
+        let (_name, _target, storage, pw) = match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => continue,
+        };
         let password = match storage.trim() {
             "0" => pw.to_string(),
             "1" => match hex_decode(pw.trim()) {
@@ -510,8 +511,10 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         };
         assert_eq!(clean, "Demo.Loose");
 
-        let mut compat = ScanOptions::default();
-        compat.compat = true;
+        let compat = ScanOptions {
+            compat: true,
+            ..ScanOptions::default()
+        };
         let suffixed = match analyze(&db, data, &compat).verdict {
             Verdict::Infected { signature, .. } => signature,
             other => panic!("expected detection, got {other:?}"),
@@ -532,14 +535,19 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         loader.add_named_text("extra.ndb", "Demo.Loose:0:*:6d616c77617265\n", false);
         let db = loader.build().unwrap();
 
-        let mut compat = ScanOptions::default();
-        compat.compat = true;
+        let compat = ScanOptions {
+            compat: true,
+            ..ScanOptions::default()
+        };
 
         let official = match analyze(&db, b"-- official --", &compat).verdict {
             Verdict::Infected { signature, .. } => signature,
             other => panic!("expected detection, got {other:?}"),
         };
-        assert_eq!(official, "Demo.Official", "official sig must not be suffixed");
+        assert_eq!(
+            official, "Demo.Official",
+            "official sig must not be suffixed"
+        );
 
         let loose = match analyze(&db, b"-- malware --", &compat).verdict {
             Verdict::Infected { signature, .. } => signature,
@@ -560,8 +568,10 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         let db = load(dir.path()).unwrap();
         let data = b"xx malware xx";
 
-        let mut compat = ScanOptions::default();
-        compat.compat = true;
+        let compat = ScanOptions {
+            compat: true,
+            ..ScanOptions::default()
+        };
         // In compat the detection name is suffixed and matches the ign entry.
         assert_eq!(analyze(&db, data, &compat).verdict, Verdict::Clean);
         // In non-compat the detection is the clean `Demo.Loose`, which the

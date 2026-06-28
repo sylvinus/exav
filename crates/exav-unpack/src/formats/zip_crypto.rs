@@ -87,7 +87,8 @@ fn aes_ctr_le(key: &[u8], data: &mut [u8], key_len: usize) -> Option<()> {
         ($ty:ty) => {{
             let cipher = <$ty>::new_from_slice(key).ok()?;
             for chunk in data.chunks_mut(16) {
-                let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&counter);
+                let mut block =
+                    aes::cipher::generic_array::GenericArray::clone_from_slice(&counter);
                 cipher.encrypt_block(&mut block);
                 for (b, k) in chunk.iter_mut().zip(block.iter()) {
                     *b ^= *k;

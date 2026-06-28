@@ -2,25 +2,27 @@
 use crate::*;
 use std::io::{Cursor, Read};
 
-/// ARJ: decode each member with the pure-Rust `unarj-rs` reader. Methods 1-3 are
-/// LHA `-lh6-`-compatible (decoded via `delharc`), method 4 is ARJ's own
-/// "fastest" codec, method 0 is stored; each member is CRC-32 verified.
+/// ARJ: decode each member with the vendored `arj_parse` reader.
+///
+/// Header parsing and encryption code vendored from
+/// [unarc-rs](https://github.com/mkrueger/unarc-rs) (MIT OR Apache-2.0,
+/// copyright Mike Krüger). Methods 1-3 are LHA `-lh6-`-compatible (decoded
+/// via `delharc`), method 4 is ARJ's own "fastest" codec, method 0 is stored;
+/// each member is CRC-32 verified.
 pub(crate) fn extract_arj<R>(
     data: &[u8],
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    use unarj_rs::arj_archive::ArjArchieve;
-    use unarj_rs::local_file_header::{CompressionMethod, FileType as ArjFileType};
+    use crate::formats::arj_parse::arj_archive::ArjArchive;
+    use crate::formats::arj_parse::local_file_header::{
+        CompressionMethod, FileType as ArjFileType,
+    };
 
-    let mut arc =
-        ArjArchieve::new(Cursor::new(data)).map_err(|e| LimitHit::new(format!("arj: {e}")))?;
-    while let Some(header) = arc
-        .get_next_entry()
-        .map_err(|e| LimitHit::new(format!("arj: {e}")))?
-    {
-        // Count every entry (including skipped ones) so a malformed archive
-        // whose member offsets don't advance can't loop unbounded.
+    let mut arc = ArjArchive::new(data.to_vec())
+        .ok_or_else(|| LimitHit::corrupt("arj: invalid header or CRC".to_string()))?;
+
+    while let Some(header) = arc.get_next_entry() {
         budget.count_entry()?;
         let supported = matches!(
             header.compression_method,
@@ -30,16 +32,13 @@ pub(crate) fn extract_arj<R>(
                 | CompressionMethod::CompressedFaster
                 | CompressionMethod::CompressedFastest
         );
-        // Directories (and members in an unsupported/no-data method) carry no
-        // file content: advance past the compressed bytes and move on.
         if matches!(header.file_type, ArjFileType::Directory) || !supported {
-            arc.skip(&header)
-                .map_err(|e| LimitHit::new(format!("arj skip: {e}")))?;
+            if !arc.skip(&header) {
+                return Err(LimitHit::corrupt("arj: truncated entry".to_string()));
+            }
             continue;
         }
         let cap = budget.reserve()?;
-        // `read()` decompresses the whole member into memory, so bound it by the
-        // declared uncompressed size *before* decoding to cap an extraction bomb.
         if header.original_size as u64 > cap {
             return Err(LimitHit::new(format!(
                 "arj member '{}' exceeds budget",
@@ -47,11 +46,9 @@ pub(crate) fn extract_arj<R>(
             )));
         }
         let name = header.name.clone();
-        let buf = arc
-            .read(&header)
-            .map_err(|e| LimitHit::new(format!("arj read '{name}': {e}")))?;
-        // Reject an implausible expansion ratio early, consistent with the other
-        // extractors; the absolute `cap` above is the hard bound.
+        let buf = arc.read(&header).ok_or_else(|| {
+            LimitHit::corrupt(format!("arj read '{name}': decompression or CRC failed"))
+        })?;
         ratio_guard(header.compressed_size as u64, buf.len() as u64, budget)?;
         budget.commit(buf.len() as u64);
         if let Some(r) = visit(Entry::new(name, buf), budget) {
@@ -74,5 +71,45 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "payload.txt");
         assert_eq!(entries[0].data, b"INNER-ARJ-PAYLOAD-12345");
+    }
+
+    #[test]
+    fn arj_short_header_no_panic() {
+        // Crafted ARJ: magic + header_size=4 + 4 bytes of header + valid CRC.
+        // unarj-rs 0.2.1 panics in MainHeader::load_from when it tries to read
+        // byte 5 of a 4-byte header.  After vendoring unarc-rs, this must
+        // return an error instead of panicking.
+        //
+        // Layout:  [60 EA] [04 00] [00 00 00 00] [CRC32 LE]
+        //            magic   hsize=4  header data    crc of header data
+        let header_data: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+        let crc = crc32fast::hash(&header_data);
+        let crc_bytes = crc.to_le_bytes();
+
+        let data = [
+            0x60,
+            0xEA, // ARJ magic
+            0x04,
+            0x00, // header size = 4
+            0x00,
+            0x00,
+            0x00,
+            0x00, // 4-byte header data
+            crc_bytes[0],
+            crc_bytes[1],
+            crc_bytes[2],
+            crc_bytes[3], // CRC32
+        ];
+
+        // Call extract_arj directly (bypassing the catch_unwind in extract)
+        // to prove the decoder does NOT panic on this input.
+        let mut budget = Budget::new(Limits::default());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::extract_arj::<()>(&data, &mut budget, &mut |_, _| None)
+        }));
+        assert!(
+            result.is_ok(),
+            "ARJ decoder panicked on 4-byte header input"
+        );
     }
 }

@@ -32,9 +32,10 @@ pub(crate) fn extract_cab<R>(
                 // MSZIP) — record the member as unscannable and keep going rather
                 // than aborting the whole cabinet (a truncated cabinet is a known
                 // evasion: a strict parser bails and misses the other members).
-                if let Some(r) =
-                    visit(Entry::unsupported(name, 0, false, "corrupt CAB member"), budget)
-                {
+                if let Some(r) = visit(
+                    Entry::unsupported(name, 0, false, "corrupt CAB member"),
+                    budget,
+                ) {
                     return Ok(Some(r));
                 }
                 continue;

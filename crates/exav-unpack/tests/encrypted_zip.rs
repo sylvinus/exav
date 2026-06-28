@@ -19,7 +19,10 @@ use exav_unpack::{extract, Budget, Format, Limits};
 const EICAR_PREFIX: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 
 fn fixture(name: &str) -> Vec<u8> {
-    let p = format!("{}/tests/fixtures/encrypted/{name}", env!("CARGO_MANIFEST_DIR"));
+    let p = format!(
+        "{}/tests/fixtures/encrypted/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
     std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
@@ -37,8 +40,7 @@ fn decrypts_with_password() {
         "zip_zipcrypto_deflate.zip",
     ] {
         let blob = fixture(name);
-        let mut budget =
-            Budget::with_passwords(Limits::default(), vec!["secret".to_string()]);
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["secret".to_string()]);
         let entries = extract(Format::Zip, &blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1, "{name}: one member");
         let e = &entries[0];
@@ -47,8 +49,14 @@ fn decrypts_with_password() {
             "{name}: should have decrypted, got unsupported={:?}",
             e.unsupported
         );
-        assert!(!e.encrypted, "{name}: decrypted member is not flagged encrypted");
-        assert!(has_eicar(&e.data), "{name}: EICAR not recovered from decrypted bytes");
+        assert!(
+            !e.encrypted,
+            "{name}: decrypted member is not flagged encrypted"
+        );
+        assert!(
+            has_eicar(&e.data),
+            "{name}: EICAR not recovered from decrypted bytes"
+        );
     }
 }
 
@@ -80,7 +88,10 @@ fn no_password_reports_encrypted() {
         assert_eq!(entries.len(), 1, "{name}");
         let e = &entries[0];
         assert!(e.encrypted, "{name}: member must be flagged encrypted");
-        assert!(e.unsupported.is_some(), "{name}: must be unsupported (no password)");
+        assert!(
+            e.unsupported.is_some(),
+            "{name}: must be unsupported (no password)"
+        );
         assert!(e.data.is_empty(), "{name}: undecrypted member has no data");
         assert!(!has_eicar(&e.data));
     }
@@ -91,11 +102,13 @@ fn no_password_reports_encrypted() {
 fn wrong_password_reports_encrypted() {
     for name in ["zip_aes256_store.zip", "zip_zipcrypto_store.zip"] {
         let blob = fixture(name);
-        let mut budget =
-            Budget::with_passwords(Limits::default(), vec!["nope".to_string()]);
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["nope".to_string()]);
         let entries = extract(Format::Zip, &blob, &mut budget).unwrap();
         let e = &entries[0];
-        assert!(e.encrypted, "{name}: wrong password must still report encrypted");
+        assert!(
+            e.encrypted,
+            "{name}: wrong password must still report encrypted"
+        );
         assert!(e.unsupported.is_some(), "{name}");
     }
 }
@@ -116,8 +129,13 @@ fn sevenz_encrypted_detected() {
     let entries = extract(Format::SevenZip, &blob, &mut budget).unwrap();
     assert!(!entries.is_empty(), "must emit an encrypted signal");
     assert!(
-        entries.iter().any(|e| e.encrypted && e.unsupported.is_some()),
+        entries
+            .iter()
+            .any(|e| e.encrypted && e.unsupported.is_some()),
         "7z AES must be reported encrypted, got {:?}",
-        entries.iter().map(|e| (&e.name, e.encrypted, e.unsupported)).collect::<Vec<_>>()
+        entries
+            .iter()
+            .map(|e| (&e.name, e.encrypted, e.unsupported))
+            .collect::<Vec<_>>()
     );
 }

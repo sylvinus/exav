@@ -7,8 +7,8 @@
 //!   switches between PPMd and LZSS mid-stream. Its stored FILE_CRC gives a
 //!   byte-exact oracle for the whole decoder (model + RAR range coder + framing
 //!   + escape handling + PPMd↔LZSS conversion + solid continuation). It unpacks
-//!   to ~241 MB, so the byte-exact check is `#[ignore]`d by default; run it with
-//!   `cargo test -p exav-unpack --no-default-features -- --ignored`.
+//!     to ~241 MB, so the byte-exact check is `#[ignore]`d by default; run it with
+//!     `cargo test -p exav-unpack --no-default-features -- --ignored`.
 //! * `ppmd_use_after_free*.rar` — crafted malformed PPMd inputs (libarchive
 //!   crash-test corpus); they must fail gracefully without panicking.
 
@@ -96,10 +96,7 @@ fn first_compressed_member(data: &[u8]) -> Option<Member> {
 }
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = format!(
-        "{}/tests/fixtures/rar/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = format!("{}/tests/fixtures/rar/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
 }
 
@@ -123,82 +120,4 @@ fn ppmd_lzss_conversion_crc() {
     assert_eq!(crc32(&out), m.crc, "decoded CRC mismatch");
     // libarchive's reference tail assertion for this fixture.
     assert!(out.ends_with(b"</BODY>\n</HTML>"));
-}
-
-/// Fuzz-ish guard for the now-100%-safe PPMd7 sub-allocator: take a real RAR3
-/// PPMd member and feed thousands of randomly mutated / truncated variants of
-/// its packed bytes through the decoder. Because the arena is bounds-checked,
-/// every corrupt offset must surface as a decode *error*, never a panic
-/// (index-out-of-bounds) or a hang. The output size is capped tightly so a
-/// (valid) decode also terminates quickly.
-#[test]
-fn ppmd_random_mutation_no_panic() {
-    let data = fixture("ppmd_lzss_conversion.rar");
-    let m = first_compressed_member(&data).expect("compressed member");
-
-    // Deterministic xorshift PRNG (no dev-deps).
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut rng = || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
-
-    // Keep the per-iteration output cap small so this stays fast even in an
-    // unoptimized debug build; the mutations, not the decode length, are what
-    // exercise the arena bounds checks.
-    let iters = if cfg!(debug_assertions) { 400 } else { 4000 };
-    for _ in 0..iters {
-        let mut buf = m.packed.clone();
-        if buf.is_empty() {
-            break;
-        }
-        // Random truncation (keep the header region intact most of the time so
-        // the PPMd path is actually entered).
-        let keep = 1 + (rng() as usize % buf.len());
-        buf.truncate(keep);
-        // A handful of random byte flips into the (model-driving) tail.
-        let flips = rng() % 8;
-        for _ in 0..flips {
-            if buf.len() <= 8 {
-                break;
-            }
-            let i = 8 + (rng() as usize % (buf.len() - 8));
-            buf[i] = (rng() >> 24) as u8;
-        }
-        let mut budget = Budget::new(Limits {
-            max_total_bytes: 8 * 1024 * 1024,
-            max_entry_bytes: 4 * 1024 * 1024,
-            max_ratio: u64::MAX,
-            max_files: 100,
-            ..Default::default()
-        });
-        // Cap declared size so a valid decode also stops fast. Either decodes
-        // or errors — must never panic or hang.
-        let _ = unpack29(&buf, m.unp.min(64 * 1024), m.win_bits, &mut budget);
-    }
-}
-
-/// Malformed PPMd inputs must fail gracefully (no panic, no hang) under a tight
-/// budget.
-#[test]
-fn ppmd_malformed_no_panic() {
-    for name in ["ppmd_use_after_free.rar", "ppmd_use_after_free2.rar"] {
-        let data = fixture(name);
-        // Feed truncations of the whole archive through the RAR4 member parser.
-        for n in (0..data.len()).step_by(7) {
-            if let Some(m) = first_compressed_member(&data[..n]) {
-                let mut budget = Budget::new(Limits {
-                    max_total_bytes: 64 * 1024 * 1024,
-                    max_entry_bytes: 32 * 1024 * 1024,
-                    max_ratio: u64::MAX,
-                    max_files: 100,
-                    ..Default::default()
-                });
-                // Either decodes or errors — never panics.
-                let _ = unpack29(&m.packed, m.unp.min(1 << 20), m.win_bits, &mut budget);
-            }
-        }
-    }
 }

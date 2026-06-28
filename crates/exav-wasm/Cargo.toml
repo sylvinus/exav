@@ -1,0 +1,15 @@
+[package]
+name = "exav-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WASM-compiled scanning core for exav: compile to wasm32-wasip1 and run inside a WASM runtime (wasmi/wasmtime) for sandboxed malware scanning."
+
+[[bin]]
+name = "exav_wasm"
+path = "src/main.rs"
+
+[dependencies]
+exav-core = { path = "../exav-core", version = "0.1.0", default-features = false }
+serde_json = "1.0.140"

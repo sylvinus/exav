@@ -204,7 +204,6 @@ impl BytecodeRuntime {
         }
         out
     }
-
 }
 
 /// Run one program's entry function (0) under a bounded, panic-isolated VM.

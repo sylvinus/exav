@@ -145,6 +145,8 @@ pub enum FileType {
     Ar,     // Unix ar archive (.a, .deb)
     Cpio,   // cpio archive (RPM payload, initramfs)
     Xar,    // XAR archive (macOS .pkg/.xip)
+    Zstd,   // Zstandard compressed stream
+    Lzip,   // Lzip compressed stream
     Script, // shell/script with a shebang
     Html,   // HTML document (content-detected; for `Target:3` HTML signatures)
     Text,   // ASCII/UTF-8 text (content-detected; for `Target:7` text signatures)
@@ -169,6 +171,8 @@ impl FileType {
                 | FileType::Ar
                 | FileType::Cpio
                 | FileType::Xar
+                | FileType::Zstd
+                | FileType::Lzip
         )
     }
 
@@ -199,6 +203,8 @@ impl FileType {
             FileType::Ar => "AR",
             FileType::Cpio => "CPIO",
             FileType::Xar => "XAR",
+            FileType::Zstd => "ZSTD",
+            FileType::Lzip => "LZIP",
             FileType::Script => "script",
             FileType::Html => "HTML",
             FileType::Text => "ASCII text",
@@ -255,6 +261,9 @@ pub fn identify(buf: &[u8]) -> FileType {
             Format::Xar => FileType::Xar,
             // UPX is content-detected on executables, never by `detect`.
             Format::Upx => FileType::Unknown,
+            Format::Dmg => FileType::Unknown,
+            Format::Zstd => FileType::Zstd,
+            Format::Lzip => FileType::Lzip,
         };
     }
     // Content-sniffed text-ish types (core-specific).
@@ -398,12 +407,18 @@ mod tests {
         assert_eq!(identify(b"#!/bin/sh\n"), FileType::Script);
         // Printable prose → text; non-printable bytes → binary Unknown.
         assert_eq!(identify(b"random bytes"), FileType::Text);
-        assert_eq!(identify(&[0x00, 0xff, 0x01, 0xfe, 0x80, 0x90]), FileType::Unknown);
+        assert_eq!(
+            identify(&[0x00, 0xff, 0x01, 0xfe, 0x80, 0x90]),
+            FileType::Unknown
+        );
     }
 
     #[test]
     fn html_typed_but_js_is_not() {
-        assert_eq!(identify(b"<!DOCTYPE html><html><body>hi</body></html>"), FileType::Html);
+        assert_eq!(
+            identify(b"<!DOCTYPE html><html><body>hi</body></html>"),
+            FileType::Html
+        );
         assert_eq!(identify(b"<script>alert(1)</script>"), FileType::Html);
         // Obfuscated JS with no HTML tags must NOT be Html (so Target:3 HTML
         // exploit sigs don't fire on it — the npm-package FP). It is text, so it
@@ -413,7 +428,10 @@ mod tests {
             FileType::Text
         );
         // Binary containing an angle-bracket sequence must not be mis-typed HTML.
-        assert_eq!(identify(b"\x00\x01\x02<script>\xff\xfe\x00\x00"), FileType::Unknown);
+        assert_eq!(
+            identify(b"\x00\x01\x02<script>\xff\xfe\x00\x00"),
+            FileType::Unknown
+        );
     }
 
     #[test]

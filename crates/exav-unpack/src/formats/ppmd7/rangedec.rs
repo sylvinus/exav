@@ -25,14 +25,12 @@ const PPMD_BIN_SCALE: u32 = 1 << 14;
 /// A byte source over an in-memory slice that yields 0 past the end and records
 /// that it ran out (so the model can detect truncation). Only the test-only
 /// `SevenZRangeDecoder` uses it; `RarRangeDecoder` owns its buffer directly.
-#[cfg(test)]
 struct ByteIn<'a> {
     data: &'a [u8],
     pos: usize,
     out_of_data: bool,
 }
 
-#[cfg(test)]
 impl<'a> ByteIn<'a> {
     fn new(data: &'a [u8]) -> Self {
         ByteIn {
@@ -61,7 +59,6 @@ impl<'a> ByteIn<'a> {
 // 7z range coder (vendored from ppmd-rust)
 // -------------------------------------------------------------------------
 
-#[cfg(test)]
 pub(crate) struct SevenZRangeDecoder<'a> {
     range: u32,
     code: u32,
@@ -69,7 +66,6 @@ pub(crate) struct SevenZRangeDecoder<'a> {
     init_ok: bool,
 }
 
-#[cfg(test)]
 impl<'a> SevenZRangeDecoder<'a> {
     /// 7z init: a leading byte (must be 0) then four code bytes; `code` must be
     /// `< 0xFFFFFFFF`. `init_ok` is false if the framing byte is non-zero.
@@ -105,7 +101,6 @@ impl<'a> SevenZRangeDecoder<'a> {
     }
 }
 
-#[cfg(test)]
 impl<'a> RangeDec for SevenZRangeDecoder<'a> {
     #[inline(always)]
     fn get_threshold(&mut self, total: u32) -> u32 {

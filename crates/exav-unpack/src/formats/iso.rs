@@ -53,10 +53,8 @@ pub(crate) fn extract_iso<R>(
                 break;
             }
             let rec = &dir[p..p + rec_len];
-            let child_lba =
-                u32::from_le_bytes([rec[2], rec[3], rec[4], rec[5]]) as u64;
-            let child_len =
-                u32::from_le_bytes([rec[10], rec[11], rec[12], rec[13]]) as u64;
+            let child_lba = u32::from_le_bytes([rec[2], rec[3], rec[4], rec[5]]) as u64;
+            let child_len = u32::from_le_bytes([rec[10], rec[11], rec[12], rec[13]]) as u64;
             let name_len = rec[32] as usize;
             let flags = rec[25];
             // First two records are "." and ".." (name_len 1, names 0x00/0x01).
@@ -78,9 +76,7 @@ pub(crate) fn extract_iso<R>(
                     .unwrap_or("")
                     .to_string();
                 let fstart = child_lba as usize * SECTOR;
-                let fend = fstart
-                    .saturating_add(child_len as usize)
-                    .min(data.len());
+                let fend = fstart.saturating_add(child_len as usize).min(data.len());
                 let content = data.get(fstart..fend).unwrap_or(&[]);
                 let cap = budget.reserve()?;
                 if content.len() as u64 > cap {

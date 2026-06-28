@@ -244,16 +244,21 @@ impl IconDb {
             return Some(GroupSel::All);
         }
         // Case-sensitive, byte-exact strcmp; no hex decoding of names.
-        match table.iter().position(|g| g == name) {
-            Some(i) => Some(GroupSel::One(i as u32)),
-            None => None,
-        }
+        table
+            .iter()
+            .position(|g| g == name)
+            .map(|i| GroupSel::One(i as u32))
     }
 
     /// Run the icon matcher: does `metric` (a PE icon) match any `.idb` entry
     /// whose group1/group2 satisfy `grp1`/`grp2` (each `None` ⇒ `"*"`)?
     /// Returns the matching entry's signature name, or `None`.
-    fn match_metric(&self, metric: &IconMetric, grp1: Option<&str>, grp2: Option<&str>) -> Option<String> {
+    fn match_metric(
+        &self,
+        metric: &IconMetric,
+        grp1: Option<&str>,
+        grp2: Option<&str>,
+    ) -> Option<String> {
         if !self.has_groups() {
             return None;
         }
@@ -318,7 +323,7 @@ fn parse_hashblob(blob: &str) -> Option<IconMetric> {
     if blob.len() != 124 || !blob.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let h: Vec<u32> = blob.bytes().map(|b| hex_nibble(b)).collect();
+    let h: Vec<u32> = blob.bytes().map(hex_nibble).collect();
     let mut c = 0usize; // nibble cursor
     let take = |c: &mut usize, n: usize| -> u32 {
         let mut v = 0u32;
@@ -420,7 +425,8 @@ const MAX_ICONS: usize = 100;
 
 /// Little-endian readers, all bounds-checked.
 fn rd_u16(d: &[u8], off: usize) -> Option<u16> {
-    d.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+    d.get(off..off + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
 }
 fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
     d.get(off..off + 4)
@@ -738,8 +744,8 @@ fn parse_icon(blob: &[u8]) -> Option<DecodedIcon> {
     };
 
     // Line sizes (4-byte row alignment).
-    let scanlinesz = 4 * (width * (depth as usize) / 32)
-        + 4 * (((width * (depth as usize)) % 32 != 0) as usize);
+    let scanlinesz =
+        4 * (width * (depth as usize) / 32) + 4 * (((width * (depth as usize)) % 32 != 0) as usize);
     let andlinesz_base = 4 * (width / 32) + 4 * ((width % 32 != 0) as usize);
 
     let npix = width * height;
@@ -995,9 +1001,9 @@ fn get_metrics(side: usize, pixels: &[u32]) -> Option<IconMetric> {
         if s > 85 && v > 85 {
             // delta != 0 guaranteed (s>85).
             ccount += 1;
-            rsum += (100 - 100 * (g as i64 - b as i64).unsigned_abs() / delta as u64) as u64;
-            gsum += (100 - 100 * (r as i64 - b as i64).unsigned_abs() / delta as u64) as u64;
-            bsum += (100 - 100 * (r as i64 - g as i64).unsigned_abs() / delta as u64) as u64;
+            rsum += 100 - 100 * (g as i64 - b as i64).unsigned_abs() / delta as u64;
+            gsum += 100 - 100 * (r as i64 - b as i64).unsigned_abs() / delta as u64;
+            bsum += 100 - 100 * (r as i64 - g as i64).unsigned_abs() / delta as u64;
         }
     }
     // Window sums (plain double loop; identical totals to a running sum).
@@ -1184,9 +1190,9 @@ fn pick_extreme(field: &[u32], wspan: usize, ksize: usize, max: bool, n: usize) 
 // --- Lab / Sobel / Gaussian (§5.4) -----------------------------------------
 
 /// Reference Lab colour (mid-gray 0x7f7f7f), the distance origin for `labdiff`.
-const REF_L: f64 = 53.192777691077211;
+const REF_L: f64 = 53.192_777_691_077_21;
 const REF_A: f64 = 0.0031420942181448197;
-const REF_B: f64 = -0.0062075877844014471;
+const REF_B: f64 = -0.006_207_587_784_401_447;
 
 /// Perceptual distance of an ARGB pixel's colour from mid-gray (CIE Lab L2).
 fn labdiff(c: u32) -> f64 {
@@ -1258,6 +1264,7 @@ fn edge_image(side: usize, pixels: &[u32]) -> Vec<u32> {
 
     // Normalize to 0..255 → gray pixel; border stays untouched, then forced black.
     let mut img = vec![0xff00_0000u32; side * side];
+    #[allow(clippy::manual_checked_ops)]
     if maxmag > 0 {
         for y in 1..side - 1 {
             for x in 1..side - 1 {
@@ -1360,11 +1367,7 @@ fn matches(a: &IconMetric, b: &IconMetric) -> bool {
     // Color-spread sub-score.
     let sub = |x: u32, y: u32| -> u32 {
         let d = (x as i64 - y as i64).unsigned_abs() as u32 * 10;
-        if d < 100 {
-            100 - d
-        } else {
-            0
-        }
+        100_u32.saturating_sub(d)
     };
     let reds = sub(a.rsum, b.rsum);
     let greens = sub(a.gsum, b.gsum);
@@ -1373,8 +1376,7 @@ fn matches(a: &IconMetric, b: &IconMetric) -> bool {
     let colors = (reds + greens + blues + ccnt) / 4;
 
     let positivematch = 64 + 4 * (2u32.wrapping_sub(enginesize));
-    let confidence =
-        (color + (gray + bright + noedge) * 2 / 3 + dark + edge + colors) / 6;
+    let confidence = (color + (gray + bright + noedge) * 2 / 3 + dark + edge + colors) / 6;
     confidence >= positivematch
 }
 
@@ -1493,7 +1495,7 @@ mod tests {
         v.extend_from_slice(&0u32.to_le_bytes()); // yppm
         v.extend_from_slice(&0u32.to_le_bytes()); // clrused
         v.extend_from_slice(&0u32.to_le_bytes()); // clrimportant
-        // XOR rows: 24bpp, row-aligned to 4 bytes. side*3 bytes, padded.
+                                                  // XOR rows: 24bpp, row-aligned to 4 bytes. side*3 bytes, padded.
         let rowbytes = side * 3;
         let pad = (4 - rowbytes % 4) % 4;
         for _y in 0..side {
@@ -1502,20 +1504,14 @@ mod tests {
                 v.push(g);
                 v.push(r);
             }
-            for _ in 0..pad {
-                v.push(0);
-            }
+            v.resize(v.len() + pad, 0);
         }
         // AND mask: 1bpp, row-aligned to 4 bytes; all opaque (bits = 0).
-        let androw = (side + 7) / 8;
+        let androw = side.div_ceil(8);
         let andpad = (4 - androw % 4) % 4;
+        let and_row_and_pad = androw + andpad;
         for _y in 0..side {
-            for _ in 0..androw {
-                v.push(0);
-            }
-            for _ in 0..andpad {
-                v.push(0);
-            }
+            v.resize(v.len() + and_row_and_pad, 0);
         }
         v
     }
@@ -1638,12 +1634,16 @@ mod tests {
     fn different_side_never_matches() {
         let m16 = get_metrics(
             16,
-            &normalize(parse_icon(&make_dib(16, 0x10, 0x80, 0xc0)).unwrap()).unwrap().1,
+            &normalize(parse_icon(&make_dib(16, 0x10, 0x80, 0xc0)).unwrap())
+                .unwrap()
+                .1,
         )
         .unwrap();
         let m32 = get_metrics(
             32,
-            &normalize(parse_icon(&make_dib(32, 0x10, 0x80, 0xc0)).unwrap()).unwrap().1,
+            &normalize(parse_icon(&make_dib(32, 0x10, 0x80, 0xc0)).unwrap())
+                .unwrap()
+                .1,
         )
         .unwrap();
         assert!(!matches(&m16, &m32));

@@ -17,7 +17,7 @@
 //!   Lanczos3 (stretch) → luma/255 f32 → 2-D DCT-II (×2 per pass) → top-left 8×8
 //!   (DC included) → median threshold (strict `>`) → MSB-first pack → 8 bytes.
 
-use image::{DynamicImage, GrayImage, imageops::FilterType};
+use image::{imageops::FilterType, DynamicImage, GrayImage};
 
 /// Cheap magic-byte gate: does this buffer plausibly start an image the `image`
 /// crate can decode? Avoids invoking the full decoder on non-image content on
@@ -137,9 +137,18 @@ mod tests {
         // A flat non-black field: only the DC coefficient is positive, the median
         // is 0, so only bit 0 (MSB of byte 0) is set ⇒ 0x80,0,0,... (decoder-
         // independent anchor from the spec).
-        for color in [[255, 255, 255], [128, 128, 128], [200, 30, 30], [10, 10, 200]] {
+        for color in [
+            [255, 255, 255],
+            [128, 128, 128],
+            [200, 30, 30],
+            [10, 10, 200],
+        ] {
             let png = solid_png(64, 64, color);
-            assert_eq!(hex(phash(&png).unwrap()), "8000000000000000", "color {color:?}");
+            assert_eq!(
+                hex(phash(&png).unwrap()),
+                "8000000000000000",
+                "color {color:?}"
+            );
         }
     }
 

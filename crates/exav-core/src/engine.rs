@@ -52,6 +52,7 @@ pub enum ClType {
     Xz,
     Cpio,
     Ar,
+    Zstd,
 }
 
 impl ClType {
@@ -76,9 +77,11 @@ impl ClType {
             "CL_TYPE_GZ" => ClType::Gzip,
             "CL_TYPE_BZ" => ClType::Bzip,
             "CL_TYPE_XZ" => ClType::Xz,
-            "CL_TYPE_CPIO_NEWC" | "CL_TYPE_CPIO_CRC" | "CL_TYPE_CPIO_ODC"
-            | "CL_TYPE_CPIO_OLD" => ClType::Cpio,
+            "CL_TYPE_CPIO_NEWC" | "CL_TYPE_CPIO_CRC" | "CL_TYPE_CPIO_ODC" | "CL_TYPE_CPIO_OLD" => {
+                ClType::Cpio
+            }
             "CL_TYPE_AR" => ClType::Ar,
+            "CL_TYPE_ZSTD" => ClType::Zstd,
             _ => return None,
         })
     }
@@ -512,10 +515,7 @@ impl BcompSub {
                     BcompKind::Raw => unreachable!(),
                 };
                 let s = s.trim_start_matches("0x").trim_start_matches("0X");
-                let digits: String = s
-                    .chars()
-                    .take_while(|c| c.is_digit(radix))
-                    .collect();
+                let digits: String = s.chars().take_while(|c| c.is_digit(radix)).collect();
                 match i64::from_str_radix(&digits, radix) {
                     Ok(v) => v,
                     Err(_) => return false,
@@ -735,7 +735,10 @@ impl EngineBuilder {
                     let mut it = r.splitn(3, ':');
                     let hex = it.next().unwrap_or("");
                     let min = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-                    let max = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(u32::MAX);
+                    let max = it
+                        .next()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(u32::MAX);
                     (Some(hex), flevel_ok(min, max))
                 }
                 None => (None, true),
@@ -744,7 +747,8 @@ impl EngineBuilder {
                 continue; // sig is for a different engine flevel — skip like ClamAV
             }
             match (offset, body) {
-                (Some(offset), Some(hex)) => match compile_body(hex, matches!(offset, Offset::Any)) {
+                (Some(offset), Some(hex)) => match compile_body(hex, matches!(offset, Offset::Any))
+                {
                     Some((elems, anchor, prefix)) => {
                         let elems = if is_literal_only(&elems, &prefix) {
                             None
@@ -1097,8 +1101,7 @@ impl SigEngine {
     }
 
     /// Reverse of [`write_cache`]. The daachorse bytes come from a cache file
-    /// this build wrote and validated (magic + version), so the unchecked
-    /// deserialize is sound.
+    /// this build wrote and validated (magic + version).
     pub(crate) fn read_cache<R: std::io::Read>(mut r: R) -> std::io::Result<Self> {
         use crate::cache::dec;
         let ac_bytes: Option<Vec<u8>> = dec(&mut r)?;
@@ -1108,7 +1111,7 @@ impl SigEngine {
         let bodies: Vec<Body> = dec(&mut r)?;
         let ldbs: Vec<Ldb> = dec(&mut r)?;
         let unsupported = dec(&mut r)?;
-        let deser = |b: Vec<u8>| unsafe { DoubleArrayAhoCorasick::deserialize_unchecked(&b).0 };
+        let deser = |b: Vec<u8>| DoubleArrayAhoCorasick::deserialize(&b).unwrap().0;
         let (body_ldb, fires_empty) = ldb_indexes(bodies.len(), &ldbs);
         let targets = bodies.iter().map(|b| b.target).collect();
         let fuzzy_ldbs = fuzzy_ldb_indices(&ldbs);
@@ -1167,7 +1170,9 @@ impl SigEngine {
                     Elem::AnyByte => "?".to_string(),
                     Elem::HiNibble(_) | Elem::LoNibble(_) => "n".to_string(),
                     Elem::Gap { min, max } => format!("G{{{},{:?}}}", min, max),
-                    Elem::Alt { opts, neg } => format!("A{}{}", if *neg { "!" } else { "" }, opts.len()),
+                    Elem::Alt { opts, neg } => {
+                        format!("A{}{}", if *neg { "!" } else { "" }, opts.len())
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -1188,7 +1193,12 @@ impl SigEngine {
         let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
         let passes: [(_, _, _, usize); 2] = [
             (&self.ac, &self.cs_groups, buf, 0usize),
-            (&self.ac_ci, &self.ci_groups, lower.as_deref().unwrap_or(&[]), 1),
+            (
+                &self.ac_ci,
+                &self.ci_groups,
+                lower.as_deref().unwrap_or(&[]),
+                1,
+            ),
         ];
         let (mut cs_hits, mut ci_hits, mut fanout) = (0u64, 0u64, 0u64);
         let (mut treject, mut lit, mut tok, mut ok) = (0u64, 0u64, 0u64, 0u64);
@@ -1236,7 +1246,11 @@ impl SigEngine {
         let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
         let passes: [(_, _, _); 2] = [
             (&self.ac, &self.cs_groups, buf),
-            (&self.ac_ci, &self.ci_groups, lower.as_deref().unwrap_or(&[])),
+            (
+                &self.ac_ci,
+                &self.ci_groups,
+                lower.as_deref().unwrap_or(&[]),
+            ),
         ];
         for (ac, groups, hay) in passes {
             let Some(ac) = ac else { continue };
@@ -1281,9 +1295,14 @@ impl SigEngine {
     /// each with its discriminability — the best single secondary byte offset and
     /// the fraction of bodies it constrains. Prints nothing; returns rows of
     /// `(anchor_len, group_size, hits, fanout_contrib, best_off, coverage_pct)`.
-    pub fn scan_diag_groups(&self, buf: &[u8], _ft: FileType) -> Vec<(usize, usize, u64, u64, i32, u32)> {
+    pub fn scan_diag_groups(
+        &self,
+        buf: &[u8],
+        _ft: FileType,
+    ) -> Vec<(usize, usize, u64, u64, i32, u32)> {
         // Count hits per group value (case-sensitive pass only — it dominates).
-        let mut hits: std::collections::HashMap<u32, (u64, usize)> = std::collections::HashMap::new();
+        let mut hits: std::collections::HashMap<u32, (u64, usize)> =
+            std::collections::HashMap::new();
         if let Some(ac) = &self.ac {
             for m in ac.find_overlapping_iter(buf) {
                 let len = m.end() - m.start();
@@ -1304,8 +1323,10 @@ impl SigEngine {
             // minimizes the worst-case bucket = unconstrained + largest value
             // bucket. Lower max-bucket = more fan-out eliminated.
             // off -> (byte -> count), and per-off unconstrained count.
-            let mut buckets: std::collections::HashMap<i32, [u32; 256]> = std::collections::HashMap::new();
-            let mut constrained: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+            let mut buckets: std::collections::HashMap<i32, [u32; 256]> =
+                std::collections::HashMap::new();
+            let mut constrained: std::collections::HashMap<i32, u32> =
+                std::collections::HashMap::new();
             for &bid in group {
                 self.body_constraints(bid, &mut cons);
                 let mut seen_off: std::collections::HashSet<i32> = std::collections::HashSet::new();
@@ -1469,7 +1490,8 @@ impl SigEngine {
         let img_hash = self.maybe_img_hash(buf);
         for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container) {
+            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container)
+            {
                 continue;
             }
             if ldb.eval(buf, &|b| counts[b], &body_off, img_hash, icon_ctx) {
@@ -1560,7 +1582,8 @@ impl SigEngine {
         let img_hash = self.maybe_img_hash(buf);
         for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container) {
+            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container)
+            {
                 continue;
             }
             if ldb.eval(buf, &|b| counts[b], &body_off, img_hash, icon_ctx)
@@ -1595,7 +1618,11 @@ impl SigEngine {
         let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
         let passes: [Pass; 2] = [
             (&self.ac, &self.cs_groups, buf),
-            (&self.ac_ci, &self.ci_groups, lower.as_deref().unwrap_or(&[])),
+            (
+                &self.ac_ci,
+                &self.ci_groups,
+                lower.as_deref().unwrap_or(&[]),
+            ),
         ];
         for (ac, groups, hay) in passes {
             let Some(ac) = ac else { continue };
@@ -1634,7 +1661,8 @@ impl SigEngine {
         let img_hash = self.maybe_img_hash(buf);
         for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container) {
+            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container)
+            {
                 continue;
             }
             if ldb.eval(buf, &|b| counts[b], &body_off, img_hash, None) {
@@ -1676,11 +1704,7 @@ fn target_ok(target: u8, ft: FileType) -> bool {
         // text sigs only on text. `Target:0` still covers everything.
         4 | 7 => matches!(
             ft,
-            FileType::Text
-                | FileType::Rtf
-                | FileType::Script
-                | FileType::Email
-                | FileType::Html
+            FileType::Text | FileType::Rtf | FileType::Script | FileType::Email | FileType::Html
         ),
         // graphics(5)/flash(11)/Java(12)/internal(13)/other(14)/...: exav can't
         // positively identify these content types, so running a target-N sig
@@ -1730,8 +1754,14 @@ fn verify(body: &Body, buf: &[u8], anchor_start: usize, layout: Option<&PeLayout
             if !off_at(anchor_start) {
                 None
             } else {
-                match_forward(&elems[anchor_idx..], buf, anchor_start, body.nocase, &mut budget)
-                    .then_some(anchor_start)
+                match_forward(
+                    &elems[anchor_idx..],
+                    buf,
+                    anchor_start,
+                    body.nocase,
+                    &mut budget,
+                )
+                .then_some(anchor_start)
             }
         }
         // Anchor sits past variable gaps: confirm the suffix forward from the
@@ -1739,9 +1769,21 @@ fn verify(body: &Body, buf: &[u8], anchor_start: usize, layout: Option<&PeLayout
         // The start is only known after backward matching, so the offset gate
         // runs last (these are `Offset::Any`-only, so it is a no-op anyway).
         Prefix::Internal { anchor_idx } => {
-            if match_forward(&elems[anchor_idx..], buf, anchor_start, body.nocase, &mut budget) {
-                match_backward(&elems[..anchor_idx], buf, anchor_start, body.nocase, &mut budget)
-                    .filter(|&start| off_at(start))
+            if match_forward(
+                &elems[anchor_idx..],
+                buf,
+                anchor_start,
+                body.nocase,
+                &mut budget,
+            ) {
+                match_backward(
+                    &elems[..anchor_idx],
+                    buf,
+                    anchor_start,
+                    body.nocase,
+                    &mut budget,
+                )
+                .filter(|&start| off_at(start))
             } else {
                 None
             }
@@ -1862,10 +1904,7 @@ fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &m
                         // the first occurrence, a later occurrence (further right,
                         // less room) can't either.
                         let greedy = max.is_none()
-                            && matches!(
-                                tail.first(),
-                                None | Some(Elem::Gap { max: None, .. })
-                            );
+                            && matches!(tail.first(), None | Some(Elem::Gap { max: None, .. }));
                         if greedy {
                             return match memchr::memmem::find(&buf[lo..end], lit) {
                                 Some(off) => {
@@ -1924,7 +1963,13 @@ fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &m
 /// variable gaps. `budget` bounds backtracking work. Only reached on the rare,
 /// selective internal anchors, so it keeps the simple scalar gap loop (no SIMD
 /// fast path) — clarity over a micro-optimization that never runs hot.
-fn match_backward(toks: &[Elem], buf: &[u8], end: usize, nocase: bool, budget: &mut u64) -> Option<usize> {
+fn match_backward(
+    toks: &[Elem],
+    buf: &[u8],
+    end: usize,
+    nocase: bool,
+    budget: &mut u64,
+) -> Option<usize> {
     if *budget == 0 {
         return None;
     }
@@ -1986,9 +2031,7 @@ fn match_backward(toks: &[Elem], buf: &[u8], end: usize, nocase: bool, budget: &
                 match_backward(rest, buf, end - l, nocase, budget)
             } else {
                 for o in opts {
-                    if end >= o.len()
-                        && bytes_eq(&buf[end - o.len()..end], o, nocase)
-                    {
+                    if end >= o.len() && bytes_eq(&buf[end - o.len()..end], o, nocase) {
                         if let Some(s) = match_backward(rest, buf, end - o.len(), nocase, budget) {
                             return Some(s);
                         }
@@ -2422,9 +2465,9 @@ fn anchor_score(b: &[u8]) -> usize {
         }
     }
     match distinct {
-        0 | 1 => 1,                 // constant run: near-useless anchor
-        2 => 3.min(b.len()),        // 2-symbol repeat (e.g. ababab): weak
-        _ => b.len(),               // varied: length is the selectivity
+        0 | 1 => 1,          // constant run: near-useless anchor
+        2 => 3.min(b.len()), // 2-symbol repeat (e.g. ababab): weak
+        _ => b.len(),        // varied: length is the selectivity
     }
 }
 
@@ -2457,7 +2500,14 @@ fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix> {
                     None => true,
                 };
                 if in_fixed_prefix && better(&best_fixed) {
-                    best_fixed = Some((score, b.len(), Prefix::Fixed { anchor_idx: i, len: fixed }));
+                    best_fixed = Some((
+                        score,
+                        b.len(),
+                        Prefix::Fixed {
+                            anchor_idx: i,
+                            len: fixed,
+                        },
+                    ));
                 }
                 let any_better = match &best_any {
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
@@ -3014,7 +3064,7 @@ mod tests {
         b.add_ndb("S.Bound:0:*:aabb{0-3}ccdd", false);
         let e = b.build();
         assert!(e.scan(&hx("aabb 00 ccdd"), FileType::Unknown).is_some()); // gap 1
-        // 6-byte gap > max 3 → must NOT match.
+                                                                           // 6-byte gap > max 3 → must NOT match.
         assert!(e
             .scan(&hx("aabb 0011223344 55 ccdd"), FileType::Unknown)
             .is_none());
@@ -3112,7 +3162,10 @@ mod tests {
         // Anchor present, prefix present, but the gap (10 bytes) exceeds max 8 →
         // backward gap bound must reject.
         assert!(e
-            .scan(&hx("e8 7a 000000 00112233445566778899 8606"), FileType::Unknown)
+            .scan(
+                &hx("e8 7a 000000 00112233445566778899 8606"),
+                FileType::Unknown
+            )
             .is_none());
         // A buffer full of zero triples (what made the old anchor explode) but no
         // `8606` → the selective internal anchor never fires → no match, no work.
@@ -3148,7 +3201,9 @@ mod tests {
         // 6-byte object containing the pattern → within range → matches.
         assert!(e.scan(&hx("00 deadbeef 00"), FileType::Unknown).is_some());
         // 7-byte object → outside range → suppressed despite the pattern match.
-        assert!(e.scan(&hx("00 deadbeef 00 00"), FileType::Unknown).is_none());
+        assert!(e
+            .scan(&hx("00 deadbeef 00 00"), FileType::Unknown)
+            .is_none());
     }
 
     #[test]
@@ -3163,27 +3218,41 @@ mod tests {
             out.into_inner()
         };
         let mut b = EngineBuilder::new();
-        b.add_ldb("Demo.FuzzyImg;Engine:150-255,Target:0;0;fuzzy_img#8000000000000000", false);
+        b.add_ldb(
+            "Demo.FuzzyImg;Engine:150-255,Target:0;0;fuzzy_img#8000000000000000",
+            false,
+        );
         let e = b.build();
         // Matches the image with the right hash (a fuzzy-only sig has no AC body,
         // so this also exercises the image-input candidate path).
         assert!(e.scan(&png, FileType::Unknown).is_some());
         // A different hash must not match.
         let mut b2 = EngineBuilder::new();
-        b2.add_ldb("Demo.FuzzyImg2;Engine:150-255,Target:0;0;fuzzy_img#deadbeefdeadbeef", false);
+        b2.add_ldb(
+            "Demo.FuzzyImg2;Engine:150-255,Target:0;0;fuzzy_img#deadbeefdeadbeef",
+            false,
+        );
         assert!(b2.build().scan(&png, FileType::Unknown).is_none());
         // Non-image input never matches a fuzzy sig (and pays no hashing cost).
-        assert!(e.scan(b"plain text, not an image", FileType::Unknown).is_none());
+        assert!(e
+            .scan(b"plain text, not an image", FileType::Unknown)
+            .is_none());
         // Non-zero hamming distance is unsupported ⇒ subsig dropped ⇒ no match.
         let mut b3 = EngineBuilder::new();
-        b3.add_ldb("Demo.FuzzyDist;Engine:150-255,Target:0;0;fuzzy_img#8000000000000000#5", false);
+        b3.add_ldb(
+            "Demo.FuzzyDist;Engine:150-255,Target:0;0;fuzzy_img#8000000000000000#5",
+            false,
+        );
         assert!(b3.build().scan(&png, FileType::Unknown).is_none());
     }
 
     #[test]
     fn ldb_container_constraint_enforced() {
         let mut b = EngineBuilder::new();
-        b.add_ldb("Demo.Contained;Engine:80-255,Container:CL_TYPE_OOXML_WORD,Target:0;0;deadbeef", false);
+        b.add_ldb(
+            "Demo.Contained;Engine:80-255,Container:CL_TYPE_OOXML_WORD,Target:0;0;deadbeef",
+            false,
+        );
         let e = b.build();
         let buf = hx("00 deadbeef 00");
         // Top level (no container) -> a Container-scoped sig must NOT fire.
@@ -3270,7 +3339,10 @@ mod tests {
         // subsig0: literal "malware"; subsig1: a PCRE (triggered by subsig 0)
         // matching `payload[0-9]+`. Expression requires both.
         let mut b = EngineBuilder::new();
-        b.add_ldb("Demo.Pcre;Engine:81-255,Target:0;0&1;6d616c77617265;0/payload[0-9]+/", false);
+        b.add_ldb(
+            "Demo.Pcre;Engine:81-255,Target:0;0&1;6d616c77617265;0/payload[0-9]+/",
+            false,
+        );
         assert_eq!(b.unsupported(), 0, "PCRE subsig should load");
         let e = b.build();
         assert!(e
@@ -3285,7 +3357,10 @@ mod tests {
 
         // Case-insensitive flag.
         let mut bi = EngineBuilder::new();
-        bi.add_ldb("Demo.PcreI;Engine:81-255,Target:0;0&1;6d616c77617265;0/PAYLOAD/i", false);
+        bi.add_ldb(
+            "Demo.PcreI;Engine:81-255,Target:0;0&1;6d616c77617265;0/PAYLOAD/i",
+            false,
+        );
         assert!(bi
             .build()
             .scan(b"malware payload", FileType::Unknown)
@@ -3297,7 +3372,10 @@ mod tests {
         // subsig0: literal "ANCHOR"; subsig1: byte-compare reading 4 decimal
         // ASCII bytes at +6 from the anchor and testing `= 1234`.
         let mut b = EngineBuilder::new();
-        b.add_ldb("Demo.Bcomp;Engine:81-255,Target:0;0&1;414e43484f52;0(>>6#d4#=1234)", false);
+        b.add_ldb(
+            "Demo.Bcomp;Engine:81-255,Target:0;0&1;414e43484f52;0(>>6#d4#=1234)",
+            false,
+        );
         assert_eq!(b.unsupported(), 0, "byte-compare subsig should load");
         let e = b.build();
         assert!(e.scan(b"ANCHOR1234tail", FileType::Unknown).is_some());
@@ -3306,7 +3384,10 @@ mod tests {
 
         // Raw little-endian binary compare: 2 bytes at the anchor start `> 0`.
         let mut br = EngineBuilder::new();
-        br.add_ldb("Demo.BcompRaw;Engine:81-255,Target:0;0&1;414e43484f52;0(>>6#il2#>0)", false);
+        br.add_ldb(
+            "Demo.BcompRaw;Engine:81-255,Target:0;0&1;414e43484f52;0(>>6#il2#>0)",
+            false,
+        );
         assert!(br
             .build()
             .scan(b"ANCHOR\x01\x00rest", FileType::Unknown)
@@ -3339,7 +3420,10 @@ mod tests {
     fn ldb_group_count() {
         // (0|1|2)>1: total matches across subsigs 0,1,2 must exceed 1.
         let mut b = EngineBuilder::new();
-        b.add_ldb("Demo.Grp;Target:0;(0|1|2)>1;deadbeef;cafebabe;0badf00d", false);
+        b.add_ldb(
+            "Demo.Grp;Target:0;(0|1|2)>1;deadbeef;cafebabe;0badf00d",
+            false,
+        );
         let e = b.build();
         assert!(e
             .scan(&hx("deadbeef cafebabe"), FileType::Unknown)
