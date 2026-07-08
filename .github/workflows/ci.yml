@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --features exav-core/http -- -D warnings
+      - run: cargo test --all
+      - run: cargo test -p exav-core --features http
+      # Checksum verification is opt-in; exercise the verify path.
+      - run: cargo test -p exav-unpack --features checksums
+      # Decryption is default-on but off-able; the no-decrypt build must compile
+      # (no cipher stack) and report encrypted members as unsupported.
+      - run: cargo test -p exav-unpack --no-default-features --features all-formats
+      # The `unstable-internals` surface (engine/bytecode tooling, plus the
+      # gated examples and the `bytecode_gating` integration test) is excluded
+      # from the default build, so lint and run it in a dedicated pass.
+      - run: cargo clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
+      - run: cargo test -p exav-core --features unstable-internals
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1, wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # The scanning core compiled to WASI, and the archive-extractor WASM
+      # bindings (excluded from the workspace, built on their own target).
+      - run: cargo build -p exav-wasm --target wasm32-wasip1
+      - run: cargo build --manifest-path crates/exav-unpack-wasm/Cargo.toml --target wasm32-unknown-unknown
+      # Run the extractor unit tests on 32-bit wasm32-wasip1 under wasmtime. On a
+      # 64-bit host `usize` is 64-bit, so integer/capacity-overflow bugs on parsed
+      # offsets/lengths stay hidden; wasm32's 32-bit `usize` makes them abort, so
+      # the hostile-input regression tests catch that class here (and it's the
+      # actual sandbox exav ships). See scripts/test-wasm.sh.
+      - name: Install wasmtime
+        run: |
+          WT=v46.0.1
+          curl -sSL "https://github.com/bytecodealliance/wasmtime/releases/download/$WT/wasmtime-$WT-x86_64-linux.tar.xz" | tar xJ -C /tmp
+          echo "/tmp/wasmtime-$WT-x86_64-linux" >> "$GITHUB_PATH"
+      - run: make test-wasm
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: cargo-deny
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check advisories bans sources licenses
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo-fuzz smoke run
+        run: |
+          cargo install cargo-fuzz --locked
+          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+          done

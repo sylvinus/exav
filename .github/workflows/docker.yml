@@ -1,0 +1,76 @@
+# Build, smoke-test, and (on version tags) publish the container image.
+#
+# `build-test` runs on every push/PR: it builds the image and exercises the
+# clamd-compatible daemon end-to-end (PING + an EICAR INSTREAM scan) so a broken
+# image can't merge. `publish` runs only on `v*` tags and pushes the multi-arch
+# image to ghcr.io with the built-in GITHUB_TOKEN. Pull with:
+#   docker run -d -p 3310:3310 -v exav-db:/var/lib/clamav ghcr.io/sylvinus/exav
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (amd64, load into docker)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: exav:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test the clamd-compatible daemon
+        run: |
+          # Empty volume + no mirror: skip the wait-for-signatures and serve the
+          # built-in baseline immediately (it detects EICAR), so CI is fast.
+          docker run -d --name exav -p 3310:3310 \
+            -e CLAMAV_NO_FRESHCLAMD=true -e CLAMD_STARTUP_TIMEOUT=0 exav:ci
+          if ! python3 .github/docker-smoke.py 127.0.0.1 3310; then
+            docker logs exav
+            exit 1
+          fi
+          docker logs exav
+          docker rm -f exav
+
+  publish:
+    needs: build-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3 # for multi-arch (arm64) builds
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/exav
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

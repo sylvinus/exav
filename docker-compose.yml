@@ -1,0 +1,39 @@
+# Keeping exav's signatures fresh in Docker. exav bundles no database and no
+# mirror URL, so you choose the source. Three options:
+#
+#  1. Prebaked/managed volume — mount a `/var/lib/clamav` you populate yourself
+#     with `cvdupdate`/`freshclam`. Just the `exav` service below, no updater.
+#
+#  2. Built-in auto-update — set EXAV_DB_MIRROR on the `exav` service to a CVD
+#     mirror you trust; it fetches on start and every FRESHCLAM_CHECKS/day. No
+#     sidecar needed; delete the `updater` service.
+#
+#  3. Sidecar (shown as the default) — a second container writes the shared
+#     volume and the scanner hot-reloads it. Here the sidecar is the same image
+#     in updater-only mode (CLAMAV_NO_CLAMD=true). You could instead run the
+#     official `clamav/clamav` freshclam container as the sidecar; its
+#     NotifyClamd RELOAD is protocol-compatible with exav's daemon.
+#
+# Run with:  EXAV_DB_MIRROR=https://your-mirror/ docker compose up -d
+
+services:
+  exav:
+    image: ghcr.io/sylvinus/exav:latest
+    ports:
+      - "3310:3310" # clamd-compatible; `clamdscan --stream` over TCP works
+    volumes:
+      - exav-db:/var/lib/clamav
+    restart: unless-stopped
+
+  updater:
+    image: ghcr.io/sylvinus/exav:latest
+    environment:
+      CLAMAV_NO_CLAMD: "true" # updater-only: fetch into the volume, don't scan
+      EXAV_DB_MIRROR: "${EXAV_DB_MIRROR:?set EXAV_DB_MIRROR to a CVD mirror you trust}"
+      FRESHCLAM_CHECKS: "2" # update checks per day
+    volumes:
+      - exav-db:/var/lib/clamav
+    restart: unless-stopped
+
+volumes:
+  exav-db:

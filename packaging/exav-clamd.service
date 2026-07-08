@@ -1,0 +1,45 @@
+# A clamd-compatible scanning daemon, as a drop-in for clamav-daemon.
+#
+# It serves the SAME Unix socket clamd uses, so `clamdscan`, mail milters, and
+# clamd client libraries talk to exav unchanged. Enable it *instead of*
+# clamav-daemon (don't run both on the same socket):
+#
+#   sudo systemctl stop  clamav-daemon        # free the socket
+#   sudo systemctl disable clamav-daemon
+#   sudo systemctl enable --now exav-clamd
+#   clamdscan --ping 1                         # verify it answers
+#
+# The socket path below is the Debian/Ubuntu default. On Fedora/RHEL clamd uses
+# /run/clamd.scan/clamd.sock — edit ExecStart + RuntimeDirectory to match, or
+# copy your existing clamd.conf's LocalSocket value.
+[Unit]
+Description=exav clamd-compatible malware scanning daemon
+Documentation=https://github.com/sylvinus/exav
+After=network.target
+
+[Service]
+Type=simple
+# --workers defaults to one prefork process per CPU core (kernel-enforced per-job
+# limits + hard-kill isolation). Reads signatures from the freshclam DB dir.
+ExecStart=/usr/bin/exav --daemon --socket /run/clamav/clamd.ctl -d /var/lib/clamav
+Restart=on-failure
+RestartSec=2
+
+# Run as the existing clamav user (present from a ClamAV install).
+User=clamav
+Group=clamav
+RuntimeDirectory=clamav
+RuntimeDirectoryMode=0755
+
+# Hardening — the daemon only needs to read files and the signature DB.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadOnlyPaths=/var/lib/clamav
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

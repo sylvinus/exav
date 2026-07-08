@@ -1,0 +1,20 @@
+# Keep the Docker build context small and free of large/secret/local data.
+# `**/target/` catches every Cargo build dir (root, crates/*, fuzz/…), which
+# otherwise dominate the context (GBs of artifacts).
+**/target/
+target/
+exav-db/
+corpus/
+fuzz/
+tmp/
+docs/
+packaging/
+.git/
+.github/
+.claude/
+.env
+.env*.local
+*.cache
+*.exavcache
+yara-x/
+node_modules/

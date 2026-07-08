@@ -1,0 +1,48 @@
+# Tag-driven binary releases. Push a tag like `v0.1.0` and this cross-compiles
+# the `exav` CLI for each target, archives it, and attaches it to the GitHub
+# Release for that tag. Static musl Linux builds run on any distro (no glibc).
+#
+# For a fancier setup (a `curl | sh` installer + auto-generated Homebrew
+# formula), migrate to `dist` (https://opensource.axo.dev/cargo-dist/) later;
+# this hand-rolled workflow is the transparent baseline.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # needed to create/upload to the Release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Builds the `exav` binary (from exav-cli), cross-compiling musl targets
+      # via `cross` as needed, archives it as `exav-<target>.tar.gz`/`.zip`, and
+      # uploads it to the Release for the pushed tag.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav
+          target: ${{ matrix.target }}
+          archive: exav-$tag-$target
+          # YARA (wasmtime/Cranelift) is on by default; keep it for full parity.
+          # For a smaller pure-Rust binary, add: features: "" / no-default-features.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checksum: sha256

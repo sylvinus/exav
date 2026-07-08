@@ -1,0 +1,18 @@
+[package]
+name = "exav-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities"]
+description = "Standalone signature-database updater for exav: fetch ClamAV-format CVD containers from a user-supplied mirror (no bundled URL). Isolated so the pure-Rust scanning core links no TLS stack."
+
+# Deliberately isolated: this is the ONE place a TLS stack (ureq → rustls → ring)
+# enters the tree, kept out of exav-core so the scanning engine stays pure-Rust.
+# ureq 2.12 bundles webpki-roots, so HTTPS works on a scratch/distroless image
+# with no OS certificate store.
+[dependencies]
+ureq = "2"

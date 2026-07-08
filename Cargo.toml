@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/exav-core", "crates/exav-cli", "crates/exav-unpack", "crates/exav-unpack-cli", "crates/exav-update", "crates/exav-wasm"]
+exclude = ["fuzz", "crates/exav-unpack-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sylvinus/exav"
+homepage = "https://github.com/sylvinus/exav"
+rust-version = "1.91"
+# crates.io discovery. keywords: max 5, <=20 chars each. categories must be from
+# https://crates.io/category_slugs (an invalid one fails `cargo publish`).
+keywords = ["antivirus", "clamav", "malware", "scanner", "security"]
+categories = ["command-line-utilities", "filesystem"]
+
+[workspace.dependencies]
+aho-corasick = "1.1"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+walkdir = "2.5"
+
+# Catch integer overflow in release too: on hostile input a silent wraparound
+# could bypass a size/offset budget. A panic here is contained by the
+# per-file catch_unwind in the CLI.
+[profile.release]
+overflow-checks = true
+

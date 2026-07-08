@@ -1,0 +1,96 @@
+[package]
+name = "exav-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# default-features off: the fuzz targets exercise the scan/unpack pipeline, not
+# the yara-x integration (which pulls the heavy wasmtime/cranelift tree and has
+# its own fuzz suite). Keeps the ASan build tractable on a single core.
+# `unstable-internals` re-exposes the engine internals (engine/bytecode/pe/
+# patterns/hashes/…) that several targets fuzz directly — those modules are
+# crate-private in the default build. `all-formats` fuzzes every extractor
+# (the `unpack`/`analyze`/`full_pipeline` targets rely on it).
+# `decrypt` is enabled so the decryption code paths (ZipCrypto/WinZip-AES, 7z
+# AES, PDF/DMG crypto) are compiled in and fuzzed, not skipped.
+exav-core = { path = "../crates/exav-core", default-features = false, features = ["unstable-internals", "all-formats", "decrypt", "dlp", "phishing"] }
+exav-unpack = { path = "../crates/exav-unpack", default-features = false, features = ["all-formats", "decrypt"] }
+
+[[bin]]
+name = "analyze"
+path = "fuzz_targets/analyze.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack"
+path = "fuzz_targets/unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cvd"
+path = "fuzz_targets/cvd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pe"
+path = "fuzz_targets/pe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filetype"
+path = "fuzz_targets/filetype.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigs"
+path = "fuzz_targets/sigs.rs"
+test = false
+doc = false
+bench = false
+
+# Keep fuzz binaries debuggable while optimized.
+[profile.release]
+debug = 1
+
+[workspace]
+
+[[bin]]
+name = "bytecode"
+path = "fuzz_targets/bytecode.rs"
+test = false
+
+[[bin]]
+name = "rar3_ppmd"
+path = "fuzz_targets/rar3_ppmd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ndb_compile"
+path = "fuzz_targets/ndb_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "full_pipeline"
+path = "fuzz_targets/full_pipeline.rs"
+test = false
+doc = false
+bench = false

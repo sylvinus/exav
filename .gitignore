@@ -1,0 +1,32 @@
+# build artifacts at the root and in any per-crate workspace (the wasm crate
+# builds its own `crates/exav-unpack-wasm/target`)
+target/
+**/*.rs.bk
+**/*.bak
+Cargo.lock.orig
+# downloaded signature DB and built caches (see `make cache`)
+/exav-db/
+*.cache
+*.exavcache
+# real-malware corpus must never be committed
+/corpus/
+*.malware
+# real-malware test samples: kept locally (gitignored) for extra decoder
+# coverage, NEVER committed — the tests that use them skip when absent, and CI
+# relies on the synthetic/EICAR fixtures. Provenance (sha256) is in each dir's
+# README.md. The synthetic `eicar.lnk` and the READMEs stay committed.
+crates/exav-unpack/tests/fixtures/**/real-malware-*
+/yara-x/
+# internal strategy notes — never commit
+/tmp/
+/.claude/
+# local secrets (API keys, e.g. MalwareBazaar Auth-Key) — never commit
+.env.local
+.env*.local
+.env
+.DS_Store
+node_modules
+test-results/
+playwright-report/
+# fuzz corpora and artifacts — never commit
+fuzz/corpora/

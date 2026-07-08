@@ -1,0 +1,73 @@
+# Excluded from the workspace (a wasm32-target artifact), so values are explicit.
+[package]
+name = "exav-unpack-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sylvinus/exav"
+rust-version = "1.85"
+description = "WebAssembly bindings for exav-unpack: in-browser, memory-safe universal archive extraction. Build with `wasm-pack build`."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Forward exav-unpack's per-format features so a WASM build can include only the
+# formats it needs (e.g. `wasm-pack build -- --no-default-features --features zip`
+# for a ZIP-only extractor). `default = ["all-formats"]` keeps the full build.
+[features]
+default = ["all-formats", "decrypt"]
+all-formats = ["exav-unpack/all-formats"]
+checksums = ["exav-unpack/checksums"]
+decrypt = ["exav-unpack/decrypt"]
+zip = ["exav-unpack/zip"]
+gzip = ["exav-unpack/gzip"]
+tar = ["exav-unpack/tar"]
+bzip2 = ["exav-unpack/bzip2"]
+xz = ["exav-unpack/xz"]
+zstd = ["exav-unpack/zstd"]
+lzip = ["exav-unpack/lzip"]
+cab = ["exav-unpack/cab"]
+sevenz = ["exav-unpack/sevenz"]
+rar = ["exav-unpack/rar"]
+arj = ["exav-unpack/arj"]
+lha = ["exav-unpack/lha"]
+iso = ["exav-unpack/iso"]
+ole = ["exav-unpack/ole"]
+pdf = ["exav-unpack/pdf"]
+email = ["exav-unpack/email"]
+dmg = ["exav-unpack/dmg"]
+upx = ["exav-unpack/upx"]
+ar = ["exav-unpack/ar"]
+cpio = ["exav-unpack/cpio"]
+xar = ["exav-unpack/xar"]
+
+# Size-optimised WASM release (this crate ships as a `.wasm`). `strip` drops the
+# name/debug sections; `wasm-pack`/`wasm-opt` then remove the wasm-bindgen
+# metadata section and shrink further. Panic stays `unwind` so the extractor's
+# `catch_unwind` containment still turns decoder panics into a clean result.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[dependencies]
+exav-unpack = { path = "../exav-unpack", version = "0.1.0", default-features = false }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+flate2 = "1"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "File",
+    "FileReader",
+    "ReadableStream",
+    "ReadableStreamDefaultController",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamGetReaderOptions",
+    "ReadableStreamType",
+    "Response",
+    "Window",
+    "WorkerGlobalScope",
+] }

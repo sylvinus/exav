@@ -1,0 +1,209 @@
+[package]
+name = "exav-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["filesystem", "parser-implementations"]
+readme = "README.md"
+description = "Core engine for the exav malware scanner: signature-database parsing, pattern/hash matching, YARA support, and a sandboxed bytecode interpreter."
+
+[dependencies]
+aho-corasick.workspace = true
+# typed error type
+thiserror = "2"
+# fast substring search (SIMD memmem) for the bytecode file_find/memstr APIs
+memchr = "2"
+# hashing (RustCrypto)
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+# executable parsing (PE/ELF/Mach-O)
+goblin = "0.10"
+# x86 instruction decoder for the bytecode disasm_x86 API; decode-only,
+# pure-Rust, no native codegen (keeps the no-JIT security posture).
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info"] }
+# archive/container extraction (its own crate). Formats are selected via this
+# crate's forwarding features (see `[features]`); `default-features = false` so a
+# lean build can pick only the formats it needs.
+exav-unpack = { path = "../exav-unpack", version = "0.1.0", default-features = false }
+# fuzzy hashing
+tlsh2 = { version = "0.4", features = ["diff"] }
+# image fuzzy hashing (ClamAV `fuzzy_img#` subsigs). These are the SAME public
+# crates ClamAV's own Rust code uses for its perceptual hash, so the decode +
+# Lanczos3 resize + DCT-II are byte-exact. Pinned to image 0.24.x (the version
+# ClamAV 1.4.x ships) for hash fidelity.
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "tiff", "bmp", "webp"] }
+rustdct = "0.7"
+transpose = "0.2"
+# HTTP(S) range-request backend (optional)
+ureq = { version = "2", optional = true }
+daachorse = "3"
+serde = { version = "1.0.228", features = ["derive"] }
+rmp-serde = "1.3.1"
+regex = "1.12.4"
+# Backtracking-regex fallback for the few PCRE subsigs using lookaround /
+# backreferences (which are not regular languages, so the linear-time `regex`
+# engine can't express them). Pure-Rust. Operates on `&str`, so byte content is
+# fed via a lossless latin-1 mapping (each byte 0x00..=0xff -> U+0000..=U+00FF).
+# Bounded backtrack budget + trigger-gating keep it DoS- and FP-safe.
+fancy-regex = "0.18.0"
+# YARA rule support (ClamAV loads .yar/.yara by default, so a drop-in must too).
+# The `pulley` feature runs compiled rules on wasmtime's Pulley *interpreter* —
+# no runtime JIT / native codegen at scan time (W^X). It is by far the largest
+# dependency subtree (a WASM runtime + Cranelift, ~200 crates), so a lean build
+# can drop it with `--no-default-features`.
+#
+# We disable yara-x's default feature set and re-enable only what we need,
+# specifically OMITTING the `pe`/`macho`/`dotnet`/`crx` modules: those pull the
+# `crypto` feature (→ the `rsa` crate, RUSTSEC-2023-0071) for authenticode /
+# certificate parsing. ClamAV's own YARA subset supports no modules at all, so
+# dropping the crypto-backed ones keeps drop-in parity while removing `rsa`
+# entirely. Trade-off: `.yar` rules that reference `pe.`/`macho.`/`dotnet.` won't
+# compile (exav rejects them, as ClamAV does). All non-crypto modules are kept.
+# NOTE: `cranelift` is NOT removable here — yara-x hard-codes it in its wasmtime
+# dependency regardless of features; only dropping YARA entirely removes it.
+yara-x = { version = "1.5.0", default-features = false, features = [
+    "constant-folding",
+    "exact-atoms",
+    "fast-regexp",
+    "generate-proto-code",
+    "pulley",
+    # Non-crypto modules (no `rsa`): kept for real-world rule compatibility.
+    "console-module",
+    "cuckoo-module",
+    "elf-module",
+    "hash-module",
+    "lnk-module",
+    "math-module",
+    "string-module",
+    "time-module",
+], optional = true }
+
+[features]
+default = ["yara", "all-formats", "decrypt", "dlp", "phishing"]
+# Full YARA rule matching (yara-x). On by default; disable for a much smaller
+# pure-Rust build that loads everything except `.yar`/`.yara` rules.
+yara = ["dep:yara-x"]
+
+# Opt-in DLP structured-data heuristic (credit-card / SSN counting, ClamAV's
+# `--structured-*-count`). Tiny, pure-Rust, no extra deps; on by default. The
+# detection itself is still off unless a ScanOptions threshold is set.
+dlp = []
+
+# Opt-in phishing heuristic (ClamAV `--alert-phishing`, `phishcheck.c` analogue):
+# HTML/email link-spoofing detection. Tiny, pure-Rust, no extra deps; on by
+# default. The detection itself is off unless `ScanOptions::alert_phishing` is
+# set.
+phishing = []
+
+# Verify archive checksums during extraction (see `ScanOptions::verify_checksums`).
+# Off by default — the scanner scans content regardless of CRC. Forwarded to
+# exav-unpack.
+checksums = ["exav-unpack/checksums"]
+
+# Decryption of encrypted archive members (ZIP/PDF/DMG). ON by default; the only
+# thing that pulls the cipher/KDF crates. Drop it for a build with no crypto
+# stack (encrypted members are then reported password-protected). Forwarded to
+# exav-unpack.
+decrypt = ["exav-unpack/decrypt"]
+
+# Archive/container format selection, forwarded to `exav-unpack`. `all-formats`
+# (in `default`) enables every extractor; disable default features and pick
+# individual formats for a smaller build (e.g. `features = ["zip"]`). A format
+# exav recognises but wasn't compiled to unpack is reported unsupported, never
+# silently clean.
+all-formats = ["exav-unpack/all-formats"]
+zip = ["exav-unpack/zip"]
+gzip = ["exav-unpack/gzip"]
+tar = ["exav-unpack/tar"]
+bzip2 = ["exav-unpack/bzip2"]
+xz = ["exav-unpack/xz"]
+zstd = ["exav-unpack/zstd"]
+lzip = ["exav-unpack/lzip"]
+cab = ["exav-unpack/cab"]
+chm = ["exav-unpack/chm"]
+sevenz = ["exav-unpack/sevenz"]
+rar = ["exav-unpack/rar"]
+arj = ["exav-unpack/arj"]
+lha = ["exav-unpack/lha"]
+iso = ["exav-unpack/iso"]
+ole = ["exav-unpack/ole"]
+pdf = ["exav-unpack/pdf"]
+email = ["exav-unpack/email"]
+dmg = ["exav-unpack/dmg"]
+upx = ["exav-unpack/upx"]
+ar = ["exav-unpack/ar"]
+cpio = ["exav-unpack/cpio"]
+xar = ["exav-unpack/xar"]
+uuencode = ["exav-unpack/uuencode"]
+xdp = ["exav-unpack/xdp"]
+szdd = ["exav-unpack/szdd"]
+tnef = ["exav-unpack/tnef"]
+swf = ["exav-unpack/swf"]
+binhex = ["exav-unpack/binhex"]
+lnk = ["exav-unpack/lnk"]
+partition = ["exav-unpack/partition"]
+pyc = ["exav-unpack/pyc"]
+nsis = ["exav-unpack/nsis"]
+autoit = ["exav-unpack/autoit"]
+onenote = ["exav-unpack/onenote"]
+rtf = ["exav-unpack/rtf"]
+machofat = ["exav-unpack/machofat"]
+sfx = ["exav-unpack/sfx"]
+# Enables the HTTP(S) range-request seekable backend (HttpRangeReader). OFF by
+# default — the only feature that pulls a C/asm TLS stack (ureq → rustls → ring).
+http = ["dep:ureq"]
+# Expose the engine's internal modules (signature IR/matcher `engine`, the
+# `bytecode` interpreter, `pe`/`icon`/`hashes`/`patterns`/… primitives) as `pub`
+# for low-level tooling and the in-crate `examples/`. OFF by default: these are
+# NOT part of the semver-stable API and may change in any release. The supported
+# public surface is the crate root (`Database`, `ScanOptions`, `Verdict`,
+# `ScanReport`, the `scan_*`/`analyze*` fns) plus the `db`, `cache`, `source`,
+# `profile`, `filetype`, and `unpack` modules.
+unstable-internals = []
+
+[dev-dependencies]
+tempfile = "3"
+# only for building test ZIPs in unit tests
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# test fixtures only: build gzip/tar CVD fixtures + gzip scan inputs
+flate2 = "1"
+tar = "0.4"
+cfb = "0.14"
+
+# All examples reach into the (unstable) engine internals (the `engine`/
+# `bytecode`/`pe` modules or `Database::engine()`), so they only build with the
+# `unstable-internals` feature.
+[[example]]
+name = "bc_scan"
+required-features = ["unstable-internals"]
+
+[[example]]
+name = "diag"
+required-features = ["unstable-internals"]
+
+[[example]]
+name = "fzcount"
+required-features = ["unstable-internals"]
+
+# Integration test that drives the internal bytecode runtime directly; needs the
+# unstable-internals surface. CI runs it via the `unstable-internals` job.
+[[test]]
+name = "bytecode_gating"
+required-features = ["unstable-internals"]
+
+[[example]]
+name = "dump_bc"
+required-features = ["unstable-internals"]
+
+[[example]]
+name = "probe_trigger"
+required-features = ["unstable-internals"]
+
+[[example]]
+name = "triage_bc"
+required-features = ["unstable-internals"]

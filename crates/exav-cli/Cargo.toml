@@ -1,0 +1,118 @@
+[package]
+name = "exav-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "filesystem"]
+readme = "README.md"
+description = "Command-line interface and scanning daemon for the exav malware scanner (clamscan-compatible)."
+
+[[bin]]
+name = "exav"
+path = "src/main.rs"
+
+[features]
+default = ["yara", "all-formats", "decrypt", "dlp"]
+# Full YARA rule matching (yara-x). ON by default — it's pure-Rust. Disable with
+# `--no-default-features` for a much smaller build (~140 fewer crates: drops the
+# wasmtime/Cranelift subtree).
+yara = ["exav-core/yara"]
+# HTTP(S) URL/range scanning (scan an `http(s)://` argument + the daemon
+# `SCANURL` command). OFF by default so the standard build is 100% pure-Rust and
+# links no TLS stack — `ureq → rustls → ring` is the only C/asm in the tree.
+# Build with `--features http` to enable it (see the dependency audit). It also
+# pulls in the standalone `exav-update` crate, so the container's `--serve` mode
+# can fetch signatures from a user-supplied mirror (EXAV_DB_MIRROR).
+http = ["exav-core/http", "dep:exav-update"]
+checksums = ["exav-core/checksums"]
+# DLP structured-data heuristic (credit-card / SSN counting). Enables the
+# `--structured-cc-count` / `--structured-ssn-count` flags. Tiny, pure-Rust.
+dlp = ["exav-core/dlp"]
+decrypt = ["exav-core/decrypt"]
+
+# Archive/container formats, forwarded to exav-core → exav-unpack. `all-formats`
+# (in `default`) is every extractor; pick individual formats for a smaller
+# binary (e.g. `--no-default-features --features yara,zip`).
+all-formats = ["exav-core/all-formats"]
+zip = ["exav-core/zip"]
+gzip = ["exav-core/gzip"]
+tar = ["exav-core/tar"]
+bzip2 = ["exav-core/bzip2"]
+xz = ["exav-core/xz"]
+zstd = ["exav-core/zstd"]
+lzip = ["exav-core/lzip"]
+cab = ["exav-core/cab"]
+chm = ["exav-core/chm"]
+sevenz = ["exav-core/sevenz"]
+rar = ["exav-core/rar"]
+arj = ["exav-core/arj"]
+lha = ["exav-core/lha"]
+iso = ["exav-core/iso"]
+ole = ["exav-core/ole"]
+pdf = ["exav-core/pdf"]
+email = ["exav-core/email"]
+dmg = ["exav-core/dmg"]
+upx = ["exav-core/upx"]
+ar = ["exav-core/ar"]
+cpio = ["exav-core/cpio"]
+xar = ["exav-core/xar"]
+uuencode = ["exav-core/uuencode"]
+xdp = ["exav-core/xdp"]
+szdd = ["exav-core/szdd"]
+tnef = ["exav-core/tnef"]
+swf = ["exav-core/swf"]
+binhex = ["exav-core/binhex"]
+lnk = ["exav-core/lnk"]
+partition = ["exav-core/partition"]
+pyc = ["exav-core/pyc"]
+nsis = ["exav-core/nsis"]
+autoit = ["exav-core/autoit"]
+onenote = ["exav-core/onenote"]
+rtf = ["exav-core/rtf"]
+machofat = ["exav-core/machofat"]
+sfx = ["exav-core/sfx"]
+
+[dependencies]
+exav-core = { path = "../exav-core", version = "0.1.0", default-features = false }
+# Standalone signature updater (its own TLS stack), enabled by the `http`
+# feature so the default pure-Rust build never links it.
+exav-update = { path = "../exav-update", version = "0.1.0", optional = true }
+clap.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true
+libc = "0.2.186"
+regex = "1.12.4"
+# Machine-readable `--json` output.
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# `.deb` packaging via cargo-deb (https://github.com/kornelski/cargo-deb):
+#   cargo build --release -p exav-cli && cargo deb -p exav-cli --no-build
+# Produces a Debian package that installs the `exav` binary and the optional
+# clamd-compatible systemd unit (disabled by default).
+[package.metadata.deb]
+name = "exav"
+maintainer = "exav contributors <https://github.com/sylvinus/exav>"
+copyright = "The exav authors, MIT"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+A drop-in, memory-safe ClamAV replacement written in Rust: a clamscan-compatible \
+CLI and a clamd-compatible scanning daemon that load ClamAV's own signature \
+databases, with no file-size limit and constant-memory streaming."""
+assets = [
+    ["target/release/exav", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/exav/README.md", "644"],
+    ["../../docs/MIGRATION.md", "usr/share/doc/exav/MIGRATION.md", "644"],
+    ["../../NOTICE", "usr/share/doc/exav/NOTICE", "644"],
+    ["../../packaging/exav-clamd.service", "lib/systemd/system/exav-clamd.service", "644"],
+]
+
