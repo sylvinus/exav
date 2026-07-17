@@ -165,3 +165,4 @@ mod tests {
         assert!(looks_like_image(&solid_png(8, 8, [1, 2, 3])));
     }
 }
+

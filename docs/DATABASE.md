@@ -89,10 +89,19 @@ not the build peak. Measured: 62 MB (cache) vs 284 MB (build) for 20k ldb;
 
 Recommended deployment: **build the cache once on a capable machine (or in CI),
 distribute the `.exavcache`, and load it cheaply everywhere.** Constrained hosts
-never pay the build peak.
+never pay the build peak. On a small *build* host, `--build-shard-memory <SIZE>`
+bounds the per-shard construction transient (e.g. `--build-shard-memory 1G` keeps
+the full main+daily build near 3.3 GB peak) at a small scan-speed cost.
 
 > Note: the environment matters too. RAM-backed `/tmp` (tmpfs) and a resident
 > `clamd` can each consume ~1–2 GB; account for those when sizing a build host.
+
+**Updating a running cache-based daemon** is just recompile → atomic-swap: the
+daemon mtime-polls the cache file (like clamd's `SelfCheck`), so swapping it in
+hot-reloads within a poll tick — no explicit `RELOAD` needed. The framing
+`MAGIC | VERSION | payload | SHA-256` lets the daemon reject a torn/wrong-version
+cache on reload and keep serving the current DB. See
+[DEPLOYMENT.md → Updating a cache-based deployment](DEPLOYMENT.md#updating-a-cache-based-deployment).
 
 ## Future ideas
 

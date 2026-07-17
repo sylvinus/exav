@@ -116,7 +116,7 @@ decrypt = ["exav-unpack/decrypt"]
 # individual formats for a smaller build (e.g. `features = ["zip"]`). A format
 # exav recognises but wasn't compiled to unpack is reported unsupported, never
 # silently clean.
-all-formats = ["exav-unpack/all-formats"]
+all-formats = ["exav-unpack/all-formats", "pdf"]
 zip = ["exav-unpack/zip"]
 gzip = ["exav-unpack/gzip"]
 tar = ["exav-unpack/tar"]

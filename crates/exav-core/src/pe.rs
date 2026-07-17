@@ -368,11 +368,34 @@ pub fn embedded_pe_offsets(data: &[u8]) -> Vec<usize> {
         if e_lfanew < 0x40 || pe + 4 > data.len() {
             continue;
         }
-        if &data[pe..pe + 4] == b"PE\0\0" {
+        if &data[pe..pe + 4] == b"PE\0\0" && valid_pe_coff(data, pe) {
             out.push(off);
         }
     }
     out
+}
+
+/// A carved `MZ…PE\0\0` region is treated as a scannable embedded PE only when
+/// its COFF + optional header pass basic structural sanity. Without this, any
+/// bytes in a compressed/encrypted stream that merely contain the `MZ` and
+/// `PE\0\0` markers get carved and scanned as a bogus PE — where a short
+/// entry-point-anchored signature can false-positive on the garbage, since
+/// [`layout`] still computes an "entry" from the junk section table. ClamAV
+/// gates embedded-PE extraction the same way. `pe` is the offset of `PE\0\0`.
+fn valid_pe_coff(data: &[u8], pe: usize) -> bool {
+    // 20-byte COFF header after `PE\0\0`, then the optional-header magic.
+    if pe + 26 > data.len() {
+        return false;
+    }
+    let rd16 = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]);
+    let machine = rd16(pe + 4);
+    let n_sections = rd16(pe + 6);
+    let opt_size = rd16(pe + 20);
+    let magic = rd16(pe + 24);
+    // Machine must be set, section count within the PE-spec maximum (96), an
+    // optional header must be present, and its magic must be PE32 (0x10b) or
+    // PE32+ (0x20b). Random data clears all four only vanishingly rarely.
+    machine != 0 && (1..=96).contains(&n_sections) && opt_size != 0 && matches!(magic, 0x10b | 0x20b)
 }
 
 /// Offsets of ELF images embedded at a **non-zero** offset (a validated
@@ -495,6 +518,45 @@ pub fn embedded_macho_offsets(data: &[u8]) -> Vec<usize> {
     out
 }
 
+/// Offsets (> 0) where a supported container's magic appears — an archive
+/// appended to or embedded in another file: SFX stubs, PE overlays (data after
+/// the last section), and droppers that staple a ZIP/CAB/7z/RAR/GZIP/XZ onto a
+/// carrier. The normal scan only types the buffer at offset 0, so these embedded
+/// containers are invisible without carving. Candidates are validated by the
+/// caller (via the extractor's `detect`) before extraction, so a coincidental
+/// magic byte-run isn't treated as a real archive. Bounded to keep a buffer full
+/// of magic-like bytes from blowing up the work.
+pub fn embedded_archive_offsets(data: &[u8]) -> Vec<usize> {
+    const MAGICS: &[&[u8]] = &[
+        b"PK\x03\x04",          // ZIP / OOXML / APK / JAR
+        b"\x1f\x8b\x08",        // GZIP
+        b"BZh",                 // BZIP2
+        b"\xfd7zXZ\x00",        // XZ
+        b"7z\xbc\xaf\x27\x1c",  // 7-Zip
+        b"Rar!\x1a\x07",        // RAR
+        b"MSCF",                // CAB
+    ];
+    const MAX_OFFS: usize = 32;
+    let mut out = Vec::new();
+    if data.is_empty() {
+        return out; // `data[from..]` below would panic on an empty buffer
+    }
+    for m in MAGICS {
+        let mut from = 1usize; // offset > 0 only (offset 0 is the normal scan)
+        while out.len() < MAX_OFFS {
+            let Some(rel) = memchr::memmem::find(&data[from..], m) else {
+                break;
+            };
+            out.push(from + rel);
+            from += rel + 1;
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(MAX_OFFS);
+    out
+}
+
 /// `(raw_size, section_bytes)` for each PE section, for `.mdb`/`.msb`
 /// section-hash matching. The caller computes whatever digests it needs (so
 /// SHA can be skipped when no `.msb` signatures are loaded). Empty if `data`
@@ -574,6 +636,29 @@ mod tests {
             assert!(embedded_pe_offsets(&vec![b'M'; n]).is_empty() || n >= 0x40);
         }
         assert!(embedded_pe_offsets(b"").is_empty());
+    }
+
+    #[test]
+    fn embedded_pe_carve_requires_valid_coff() {
+        // A real minimal PE embedded after a prefix IS carved.
+        let pe = minimal_pe(b"abcdefgh");
+        let mut buf = vec![0xAAu8; 128];
+        buf.extend_from_slice(&pe);
+        assert_eq!(embedded_pe_offsets(&buf), vec![128]);
+
+        // Regression (the Zbot FP family): `MZ` … `PE\0\0` followed by a junk
+        // COFF header (zero machine, no optional header, bogus magic) must NOT be
+        // carved — otherwise compressed/encrypted bytes that merely contain those
+        // markers get scanned as a bogus PE, where a short entry-point-anchored
+        // signature false-positives on the garbage.
+        let mut junk = vec![0u8; 0x80];
+        junk[0] = b'M';
+        junk[1] = b'Z';
+        junk[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes()); // e_lfanew -> 0x40
+        junk[0x40..0x44].copy_from_slice(b"PE\0\0"); // COFF beyond is all zero
+        let mut buf2 = vec![0xAAu8; 64];
+        buf2.extend_from_slice(&junk);
+        assert!(embedded_pe_offsets(&buf2).is_empty());
     }
 
     /// Build a minimal PE32+ with one `.text` section holding `section`.

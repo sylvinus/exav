@@ -8,6 +8,11 @@ pub(crate) enum Primitive {
     Real,
     Name(String),
     String(Vec<u8>),
+    /// An indirect reference `n g R`; carries the object number `n`. Consuming
+    /// the `g R` tokens is what matters (so the dict parser stays aligned); the
+    /// number itself is retained for callers that resolve references.
+    #[allow(dead_code)]
+    Reference(u32),
     Array(Vec<Primitive>),
     Dictionary(HashMap<String, Primitive>),
     Stream {

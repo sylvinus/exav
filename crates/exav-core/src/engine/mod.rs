@@ -13,9 +13,11 @@
 //! a boolean expression. Verification runs only on a bounded in-memory buffer
 //! (the streaming path stays literal-only).
 //!
-//! Not supported (counted, never silently dropped): `EP`/`Sx`-relative
-//! offsets, PCRE subsignatures, bytecode, and patterns whose only literal run
-//! is shorter than [`MIN_ANCHOR`] or sits behind a non-leading variable gap.
+//! Supported subsignature features: `EP`- and section-relative offsets, and
+//! PCRE (via `fancy-regex` for lookaround/backreferences). Not supported
+//! (counted, never silently dropped): `VI`/`SEx` offset kinds, bytecode
+//! subsignatures, and patterns whose only literal run is shorter than
+//! [`MIN_ANCHOR`] or sits behind a non-leading variable gap.
 
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,9 @@ mod logic;
 mod parse;
 use logic::*;
 use parse::*;
+// Re-exported so crate-root matchers (e.g. `.cdb`) can gate signatures on the
+// same engine feature-level window the pattern engine uses.
+pub(crate) use parse::flevel_ok;
 
 /// The container types referenced by `Container:CL_TYPE_*` TDB constraints in
 /// the logical-signature format that exav can determine provenance for. A
@@ -238,9 +243,9 @@ impl Elem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Prefix {
     /// All elements before the anchor are fixed-width (sum = n).
-    Fixed { anchor_idx: usize, len: usize },
+    Fixed { anchor_idx: u32, len: u32 },
     /// A single leading variable gap precedes the anchor (start floats).
-    Floating { anchor_idx: usize },
+    Floating { anchor_idx: u32 },
     /// The anchor sits past one or more *variable* gaps from the pattern start
     /// (`elems[..anchor_idx]` contains a `Gap`/`Alt`). Verification matches both
     /// forward from the anchor and *backward* across the preceding gaps. Chosen
@@ -248,14 +253,23 @@ enum Prefix {
     /// in the fixed prefix (e.g. a constant zero-run is the only pre-gap literal)
     /// — and only for `Offset::Any` patterns, so the floating pattern start never
     /// needs to satisfy a fixed offset.
-    Internal { anchor_idx: usize },
+    Internal { anchor_idx: u32 },
 }
 
-/// Offset constraint on where the pattern start may sit. `shift` is the
-/// optional `,maxshift` window width.
+/// Offset constraint on where the pattern start may sit. The overwhelmingly
+/// common case is [`Offset::Any`] (no constraint); the rare constrained kinds
+/// are boxed so this enum stays one word, keeping `Body` small across the
+/// millions of loaded signatures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Offset {
     Any,
+    Constrained(Box<OffsetKind>),
+}
+
+/// A concrete offset constraint (boxed inside [`Offset::Constrained`]). `shift`
+/// is the optional `,maxshift` window width.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OffsetKind {
     /// start in [n, n+shift]
     Abs {
         n: u64,
@@ -910,52 +924,91 @@ impl EngineBuilder {
             + self.ldbs.len()
     }
 
-    pub fn build(mut self) -> SigEngine {
-        // Case-sensitive and ASCII-case-insensitive (`i` modifier) anchors go
-        // into separate automatons. Identical anchors are de-duplicated into one
-        // automaton pattern that fans out to every body sharing it (a full
-        // a full DB has ~1M anchors, ~24% of them duplicates).
-        //
-        // Building the double-array automaton is memory-heavy, so keep the
-        // build-time peak down: the case-sensitive anchors (the bulk) are kept
-        // as borrowed slices into `anchor_buf` rather than copied, and each
-        // de-dup map is dropped before its automaton is built.
+    pub fn build(self) -> SigEngine {
+        self.build_with_budget(None)
+    }
+
+    /// As [`EngineBuilder::build`], but bounds the per-shard automaton-build
+    /// transient to roughly `max_build_mem` bytes by sharding each large
+    /// `(target, case)` partition into multiple automatons. `None` builds one
+    /// automaton per partition (fastest, largest transient). Only the build-time
+    /// peak is affected — scan results are identical.
+    ///
+    /// Anchors are partitioned by `(target, case)`: a scan then runs only the
+    /// partitions whose `target` matches the file type (a PE file never
+    /// traverses the ELF/HTML/text automatons), so the per-body target check is
+    /// implied by which partition a body lives in. Within a partition, identical
+    /// anchors de-duplicate into one automaton pattern that fans out to every
+    /// body sharing it.
+    pub fn build_with_budget(mut self, max_build_mem: Option<u64>) -> SigEngine {
+        // The double-array construction transient scales ~linearly with the
+        // anchor count, at a rough `BUILD_BYTES_PER_ANCHOR`; capping anchors per
+        // shard bounds that peak so a huge set (main+daily) builds on a small
+        // host. Omit the budget for the fastest build (one automaton per class).
+        const BUILD_BYTES_PER_ANCHOR: u64 = 3072;
+        let max_anchors = match max_build_mem {
+            Some(m) => (m / BUILD_BYTES_PER_ANCHOR).max(1) as usize,
+            None => usize::MAX,
+        };
         let anchor_buf = std::mem::take(&mut self.anchor_buf);
         let anchor_ranges = std::mem::take(&mut self.anchor_ranges);
-        let mut cs: AnchorGroups<&[u8]> = AnchorGroups::new();
-        // The case-insensitive automaton matches a lowercased haystack, so its
-        // anchors are stored lowercased (and thus owned).
-        let mut ci: AnchorGroups<Vec<u8>> = AnchorGroups::new();
+        // Case-sensitive anchors (the bulk) stay borrowed slices into
+        // `anchor_buf`; case-insensitive anchors match a lowercased haystack so
+        // they are stored lowercased (owned).
+        let mut cs: std::collections::BTreeMap<u8, AnchorGroups<&[u8]>> =
+            std::collections::BTreeMap::new();
+        let mut ci: std::collections::BTreeMap<u8, AnchorGroups<Vec<u8>>> =
+            std::collections::BTreeMap::new();
         for (id, b) in self.bodies.iter().enumerate() {
             let (s, l) = anchor_ranges[id];
             let anchor = &anchor_buf[s as usize..(s + l) as usize];
             if b.nocase {
-                ci.add(anchor.to_ascii_lowercase(), id);
+                ci.entry(b.target)
+                    .or_insert_with(AnchorGroups::new)
+                    .add(anchor.to_ascii_lowercase(), id);
             } else {
-                cs.add(anchor, id);
+                cs.entry(b.target)
+                    .or_insert_with(AnchorGroups::new)
+                    .add(anchor, id);
             }
         }
-        let (ac, cs_groups) = cs.finish();
-        let (ac_ci, ci_groups) = ci.finish();
+        let mut partitions = Vec::new();
+        for (target, g) in cs {
+            for (ac, groups) in g.finish_sharded(max_anchors) {
+                partitions.push(Partition {
+                    target,
+                    nocase: false,
+                    ac,
+                    groups,
+                });
+            }
+        }
+        for (target, g) in ci {
+            for (ac, groups) in g.finish_sharded(max_anchors) {
+                partitions.push(Partition {
+                    target,
+                    nocase: true,
+                    ac,
+                    groups,
+                });
+            }
+        }
         drop(anchor_buf);
         drop(anchor_ranges);
         let (body_ldb, fires_empty) = ldb_indexes(self.bodies.len(), &self.ldbs);
-        let targets = self.bodies.iter().map(|b| b.target).collect();
         let fuzzy_ldbs = fuzzy_ldb_indices(&self.ldbs);
         let has_fuzzy = !fuzzy_ldbs.is_empty();
+        let has_ooxml_container = any_ooxml_container(&self.ldbs);
         SigEngine {
-            ac,
-            ac_ci,
-            cs_groups,
-            ci_groups,
+            partitions,
             bodies: self.bodies,
             ldbs: self.ldbs,
             unsupported: self.unsupported,
-            targets,
             body_ldb,
             fires_empty,
             has_fuzzy,
             fuzzy_ldbs,
+            has_ooxml_container,
         }
     }
 }
@@ -993,18 +1046,43 @@ impl<K: Eq + std::hash::Hash + Clone + AsRef<[u8]>> AnchorGroups<K> {
         self.groups[g].push(body);
     }
 
-    fn finish(mut self) -> (Option<DoubleArrayAhoCorasick<u32>>, Vec<Vec<usize>>) {
+    /// Build one or more automatons over the accumulated anchors. When
+    /// `max_anchors == usize::MAX` (no budget) a single automaton is built over
+    /// the whole set; otherwise the anchors (and their parallel `groups`) are
+    /// split into shards of at most `max_anchors` patterns each, so no single
+    /// double-array construction exceeds the memory budget. Each returned
+    /// automaton stores values `0..chunk_len`, indexing that shard's `groups`.
+    fn finish_sharded(mut self, max_anchors: usize) -> Vec<(DoubleArrayAhoCorasick<u32>, Vec<Vec<usize>>)> {
         // The de-dup map isn't needed for the build; free it first so it
         // doesn't coexist with the automaton's construction peak.
         self.index = std::collections::HashMap::new();
         if self.patterns.is_empty() {
-            return (None, Vec::new());
+            return Vec::new();
         }
-        let ac = DoubleArrayAhoCorasickBuilder::new()
-            .match_kind(daachorse::MatchKind::Standard)
-            .build_with_values(self.patterns.iter().zip(0u32..))
-            .ok();
-        (ac, self.groups)
+        let build = |pats: &[K], groups: Vec<Vec<usize>>| -> Option<(DoubleArrayAhoCorasick<u32>, Vec<Vec<usize>>)> {
+            DoubleArrayAhoCorasickBuilder::new()
+                .match_kind(daachorse::MatchKind::Standard)
+                .build_with_values(pats.iter().zip(0u32..))
+                .ok()
+                .map(|ac| (ac, groups))
+        };
+        if max_anchors == usize::MAX || self.patterns.len() <= max_anchors {
+            return build(&self.patterns, self.groups).into_iter().collect();
+        }
+        let mut out = Vec::new();
+        let mut p_iter = self.patterns.into_iter();
+        let mut g_iter = self.groups.into_iter();
+        loop {
+            let chunk_pat: Vec<K> = p_iter.by_ref().take(max_anchors).collect();
+            if chunk_pat.is_empty() {
+                break;
+            }
+            let chunk_grp: Vec<Vec<usize>> = g_iter.by_ref().take(max_anchors).collect();
+            if let Some(part) = build(&chunk_pat, chunk_grp) {
+                out.push(part);
+            }
+        }
+        out
     }
 }
 
@@ -1012,20 +1090,29 @@ impl<K: Eq + std::hash::Hash + Clone + AsRef<[u8]>> AnchorGroups<K> {
 /// (case-sensitive and case-insensitive) + per-body verifiers + logical-sig
 /// expressions. Each automaton's stored value indexes a group of body ids that
 /// share that anchor.
+/// One Aho-Corasick automaton over the anchors of the bodies sharing a single
+/// `(target, case)` class. `groups[value]` is the list of body ids that share
+/// the anchor the automaton stored under `value`. A case-insensitive partition
+/// (`nocase`) matches against the lowercased haystack. A class larger than the
+/// build budget is split across several `Partition`s (shards) with the same
+/// `(target, nocase)`.
+struct Partition {
+    target: u8,
+    nocase: bool,
+    ac: DoubleArrayAhoCorasick<u32>,
+    groups: Vec<Vec<usize>>,
+}
+
 pub struct SigEngine {
-    ac: Option<DoubleArrayAhoCorasick<u32>>,
-    ac_ci: Option<DoubleArrayAhoCorasick<u32>>,
-    cs_groups: Vec<Vec<usize>>,
-    ci_groups: Vec<Vec<usize>>,
+    /// One (or, when sharded, several) Aho-Corasick automaton per `(target,
+    /// case)` class. A scan runs only the partitions whose `target` matches the
+    /// file type (`target_ok`) — a PE file never traverses the ELF/HTML/text
+    /// automatons — so the per-body target check is implied by which partition a
+    /// body lives in.
+    partitions: Vec<Partition>,
     bodies: Vec<Body>,
     ldbs: Vec<Ldb>,
     pub unsupported: usize,
-    /// Per-body target type, in a compact array parallel to `bodies`. Checked
-    /// before the (large, cache-cold) `bodies` array on every anchor fan-out, so
-    /// a body whose target doesn't match the file type is rejected from L2 cache
-    /// instead of paying a random miss into the full body table — the dominant
-    /// cost on type-mismatched fan-out (the common case). Derived from `bodies`.
-    targets: Vec<u8>,
     /// For each body id, the index of the logical signature it belongs to (a
     /// subsignature body), or `u32::MAX` for `.ndb` bodies. Lets a scan evaluate
     /// only the logical sigs whose subsigs actually matched, instead of all of
@@ -1043,6 +1130,21 @@ pub struct SigEngine {
     /// evaluated for image inputs regardless of which bodies matched. Empty in
     /// the common case. Derived from `ldbs`.
     fuzzy_ldbs: Vec<u32>,
+    /// Whether any loaded logical sig carries a `Container:CL_TYPE_OOXML_*`
+    /// constraint. When false, container scans can skip the OOXML sub-type probe
+    /// (a leading-prefix read) entirely — nothing depends on the distinction.
+    /// Derived from `ldbs` (recomputed after a cache load).
+    has_ooxml_container: bool,
+}
+
+/// Whether any logical signature is scoped to an OOXML container sub-type.
+fn any_ooxml_container(ldbs: &[Ldb]) -> bool {
+    ldbs.iter().any(|l| {
+        matches!(
+            l.container,
+            Some(ClType::OoxmlWord | ClType::OoxmlXl | ClType::OoxmlPpt)
+        )
+    })
 }
 
 /// Indices of logical signatures carrying a `fuzzy_img#` subsignature.
@@ -1091,16 +1193,53 @@ impl SigEngine {
         self.bodies.is_empty()
     }
 
+    /// The partitions to run for file type `ft`: those whose `target` matches
+    /// (`target_ok`), each yielded as `(automaton, groups, haystack)` where the
+    /// haystack is the lowercased copy for a `nocase` partition and `buf`
+    /// otherwise. `lower` must be the lowercased `buf` when [`needs_lower`]
+    /// returns true (else it is never read).
+    fn active<'a>(
+        &'a self,
+        ft: FileType,
+        buf: &'a [u8],
+        lower: &'a [u8],
+    ) -> impl Iterator<Item = (&'a DoubleArrayAhoCorasick<u32>, &'a [Vec<usize>], &'a [u8])> {
+        // A `Target:5` (graphics) partition is normally skipped — exav doesn't
+        // model graphics as a `FileType`. But when the buffer IS an image, its
+        // Target:5 signatures legitimately apply, so run those partitions too
+        // (their subsignature anchors must match for an image-scoped LDB — e.g. a
+        // `Win.Phishing.*` raw-image sig — to become a candidate).
+        let is_image = crate::fuzzy_img::looks_like_image(buf);
+        self.partitions
+            .iter()
+            .filter(move |p| target_ok(p.target, ft) || (p.target == 5 && is_image))
+            .map(move |p| {
+                let hay: &[u8] = if p.nocase { lower } else { buf };
+                (&p.ac, p.groups.as_slice(), hay)
+            })
+    }
+
+    /// Whether any active partition for `ft` is case-insensitive — i.e. whether
+    /// a lowercased copy of the haystack must be allocated for this scan.
+    fn needs_lower(&self, ft: FileType, buf: &[u8]) -> bool {
+        let is_image = crate::fuzzy_img::looks_like_image(buf);
+        self.partitions
+            .iter()
+            .any(|p| p.nocase && (target_ok(p.target, ft) || (p.target == 5 && is_image)))
+    }
+
     /// Serialize to the on-disk cache: each double-array automaton via
     /// daachorse's own format, the rest via bincode (by reference, no clone).
     pub(crate) fn write_cache<W: std::io::Write>(&self, mut w: W) -> std::io::Result<()> {
         use crate::cache::enc;
-        let ac = self.ac.as_ref().map(|a| a.serialize());
-        let ac_ci = self.ac_ci.as_ref().map(|a| a.serialize());
-        enc(&ac, &mut w)?;
-        enc(&ac_ci, &mut w)?;
-        enc(&self.cs_groups, &mut w)?;
-        enc(&self.ci_groups, &mut w)?;
+        // Each partition: (target, nocase, serialized automaton bytes, groups).
+        enc(&(self.partitions.len() as u32), &mut w)?;
+        for p in &self.partitions {
+            enc(&p.target, &mut w)?;
+            enc(&p.nocase, &mut w)?;
+            enc(&p.ac.serialize(), &mut w)?;
+            enc(&p.groups, &mut w)?;
+        }
         enc(&self.bodies, &mut w)?;
         enc(&self.ldbs, &mut w)?;
         enc(&self.unsupported, &mut w)?;
@@ -1111,13 +1250,6 @@ impl SigEngine {
     /// this build wrote and validated (magic + version).
     pub(crate) fn read_cache<R: std::io::Read>(mut r: R) -> std::io::Result<Self> {
         use crate::cache::dec;
-        let ac_bytes: Option<Vec<u8>> = dec(&mut r)?;
-        let ac_ci_bytes: Option<Vec<u8>> = dec(&mut r)?;
-        let cs_groups = dec(&mut r)?;
-        let ci_groups = dec(&mut r)?;
-        let bodies: Vec<Body> = dec(&mut r)?;
-        let ldbs: Vec<Ldb> = dec(&mut r)?;
-        let unsupported = dec(&mut r)?;
         let deser = |b: Vec<u8>| -> std::io::Result<DoubleArrayAhoCorasick<u32>> {
             DoubleArrayAhoCorasick::deserialize(&b)
                 .map(|(dfa, _)| dfa)
@@ -1128,23 +1260,37 @@ impl SigEngine {
                     )
                 })
         };
+        let n_parts: u32 = dec(&mut r)?;
+        let mut partitions = Vec::with_capacity(n_parts as usize);
+        for _ in 0..n_parts {
+            let target: u8 = dec(&mut r)?;
+            let nocase: bool = dec(&mut r)?;
+            let ac_bytes: Vec<u8> = dec(&mut r)?;
+            let groups: Vec<Vec<usize>> = dec(&mut r)?;
+            partitions.push(Partition {
+                target,
+                nocase,
+                ac: deser(ac_bytes)?,
+                groups,
+            });
+        }
+        let bodies: Vec<Body> = dec(&mut r)?;
+        let ldbs: Vec<Ldb> = dec(&mut r)?;
+        let unsupported = dec(&mut r)?;
         let (body_ldb, fires_empty) = ldb_indexes(bodies.len(), &ldbs);
-        let targets = bodies.iter().map(|b| b.target).collect();
         let fuzzy_ldbs = fuzzy_ldb_indices(&ldbs);
         let has_fuzzy = !fuzzy_ldbs.is_empty();
+        let has_ooxml_container = any_ooxml_container(&ldbs);
         Ok(SigEngine {
-            ac: ac_bytes.map(deser).transpose()?,
-            ac_ci: ac_ci_bytes.map(deser).transpose()?,
-            cs_groups,
-            ci_groups,
+            partitions,
             bodies,
             ldbs,
             unsupported,
-            targets,
             body_ldb,
             fires_empty,
             has_fuzzy,
             fuzzy_ldbs,
+            has_ooxml_container,
         })
     }
 
@@ -1155,6 +1301,13 @@ impl SigEngine {
             .filter(|b| matches!(b.owner, Owner::Ndb { .. }))
             .count()
             + self.ldbs.len()
+    }
+
+    /// Whether any loaded logical sig is scoped to an OOXML container sub-type
+    /// (`Container:CL_TYPE_OOXML_*`). When false, a container scan can skip the
+    /// OOXML sub-type probe (a leading-prefix read) with no loss of coverage.
+    pub fn has_ooxml_container_sigs(&self) -> bool {
+        self.has_ooxml_container
     }
 
     /// Number of loaded logical sigs carrying a `fuzzy_img#` subsig (diagnostic).
@@ -1206,33 +1359,28 @@ impl SigEngine {
     /// split. `(cs_hits, ci_hits, fanout, target_reject, literal, token, ok)`.
     pub fn scan_diag(&self, buf: &[u8], ft: FileType, layout: Option<&PeLayout>) -> [u64; 7] {
         DIAG_SLOW.with(|c| c.set((0, 0)));
-        let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
-        let passes: [(_, _, _, usize); 2] = [
-            (&self.ac, &self.cs_groups, buf, 0usize),
-            (
-                &self.ac_ci,
-                &self.ci_groups,
-                lower.as_deref().unwrap_or(&[]),
-                1,
-            ),
-        ];
+        let lower = if self.needs_lower(ft, buf) {
+            buf.to_ascii_lowercase()
+        } else {
+            Vec::new()
+        };
         let (mut cs_hits, mut ci_hits, mut fanout) = (0u64, 0u64, 0u64);
-        let (mut treject, mut lit, mut tok, mut ok) = (0u64, 0u64, 0u64, 0u64);
-        for (ac, groups, hay, which) in passes {
-            let Some(ac) = ac else { continue };
-            for m in ac.find_overlapping_iter(hay) {
-                if which == 0 {
-                    cs_hits += 1;
-                } else {
+        // Partition membership implies the target match, so there is no per-body
+        // target rejection any more; `treject` stays 0 (kept for the stable
+        // tuple shape).
+        let treject = 0u64;
+        let (mut lit, mut tok, mut ok) = (0u64, 0u64, 0u64);
+        for p in self.partitions.iter().filter(|p| target_ok(p.target, ft)) {
+            let hay: &[u8] = if p.nocase { &lower } else { buf };
+            for m in p.ac.find_overlapping_iter(hay) {
+                if p.nocase {
                     ci_hits += 1;
+                } else {
+                    cs_hits += 1;
                 }
-                let group = &groups[m.value() as usize];
+                let group = &p.groups[m.value() as usize];
                 fanout += group.len() as u64;
                 for &bid in group {
-                    if !target_ok(self.targets[bid], ft) {
-                        treject += 1;
-                        continue;
-                    }
                     let body = &self.bodies[bid];
                     if body.elems.is_none() {
                         lit += 1;
@@ -1259,20 +1407,12 @@ impl SigEngine {
     /// verify explosion on dense content.
     pub fn scan_diag_hist(&self, buf: &[u8], _ft: FileType) -> Vec<(u64, u64)> {
         let mut hist = vec![(0u64, 0u64); 16];
-        let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
-        let passes: [(_, _, _); 2] = [
-            (&self.ac, &self.cs_groups, buf),
-            (
-                &self.ac_ci,
-                &self.ci_groups,
-                lower.as_deref().unwrap_or(&[]),
-            ),
-        ];
-        for (ac, groups, hay) in passes {
-            let Some(ac) = ac else { continue };
-            for m in ac.find_overlapping_iter(hay) {
+        let lower = buf.to_ascii_lowercase();
+        for p in &self.partitions {
+            let hay: &[u8] = if p.nocase { &lower } else { buf };
+            for m in p.ac.find_overlapping_iter(hay) {
                 let len = (m.end() - m.start()).min(15);
-                let g = groups[m.value() as usize].len() as u64;
+                let g = p.groups[m.value() as usize].len() as u64;
                 hist[len].0 += 1;
                 hist[len].1 += g;
             }
@@ -1289,7 +1429,9 @@ impl SigEngine {
         let Some(elems) = &body.elems else { return };
         let (start_idx, mut off) = match body.prefix {
             Prefix::Fixed { len, .. } => (0usize, -(len as i32)),
-            Prefix::Floating { anchor_idx } | Prefix::Internal { anchor_idx } => (anchor_idx, 0i32),
+            Prefix::Floating { anchor_idx } | Prefix::Internal { anchor_idx } => {
+                (anchor_idx as usize, 0i32)
+            }
         };
         for e in &elems[start_idx..] {
             match e {
@@ -1316,19 +1458,24 @@ impl SigEngine {
         buf: &[u8],
         _ft: FileType,
     ) -> Vec<(usize, usize, u64, u64, i32, u32)> {
-        // Count hits per group value (case-sensitive pass only — it dominates).
-        let mut hits: std::collections::HashMap<u32, (u64, usize)> =
+        // Count hits per group value (case-sensitive partitions only — they
+        // dominate). Keyed by `(partition index, value)` since sharded
+        // partitions reuse the same local value space.
+        let mut hits: std::collections::HashMap<(usize, u32), (u64, usize)> =
             std::collections::HashMap::new();
-        if let Some(ac) = &self.ac {
-            for m in ac.find_overlapping_iter(buf) {
+        for (pidx, p) in self.partitions.iter().enumerate() {
+            if p.nocase {
+                continue;
+            }
+            for m in p.ac.find_overlapping_iter(buf) {
                 let len = m.end() - m.start();
-                hits.entry(m.value()).or_insert((0, len)).0 += 1;
+                hits.entry((pidx, m.value())).or_insert((0, len)).0 += 1;
             }
         }
         let mut rows: Vec<(usize, usize, u64, u64, i32, u32)> = Vec::new();
         let mut cons = Vec::new();
-        for (val, (h, anchor_len)) in hits {
-            let group = &self.cs_groups[val as usize];
+        for ((pidx, val), (h, anchor_len)) in hits {
+            let group = &self.partitions[pidx].groups[val as usize];
             let gsize = group.len();
             let fanout = h * gsize as u64;
             if fanout < 50_000 {
@@ -1453,26 +1600,18 @@ impl SigEngine {
         // against a lowercased copy of the haystack; positions line up with the
         // original (ASCII lowercasing preserves length), so verification still
         // runs against `buf`.
-        // Only allocate the lowercased copy if there are case-insensitive sigs.
-        let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
-        let passes: [Pass; 2] = [
-            (&self.ac, &self.cs_groups, buf),
-            (
-                &self.ac_ci,
-                &self.ci_groups,
-                lower.as_deref().unwrap_or(&[]),
-            ),
-        ];
-        for (ac, groups, hay) in passes {
-            let Some(ac) = ac else { continue };
+        // Only allocate the lowercased copy if a case-insensitive partition runs.
+        let lower = if self.needs_lower(ft, buf) {
+            buf.to_ascii_lowercase()
+        } else {
+            Vec::new()
+        };
+        for (ac, groups, hay) in self.active(ft, buf, &lower) {
             for m in ac.find_overlapping_iter(hay) {
                 let group = &groups[m.value() as usize];
                 for &bid in group {
-                    // Compact target prefilter: reject type-mismatched bodies
-                    // from L2 cache before the random miss into `bodies`.
-                    if !target_ok(self.targets[bid], ft) {
-                        continue;
-                    }
+                    // The partition already guarantees this body's target matches
+                    // `ft`, so no per-body target check is needed here.
                     let body = &self.bodies[bid];
                     if let Some(start) = verify(body, buf, m.start(), layout) {
                         match &body.owner {
@@ -1507,7 +1646,18 @@ impl SigEngine {
         let img_hash = self.maybe_img_hash(buf);
         for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container)
+            // `Target:5` (graphics) signatures — perceptual `fuzzy_img#` hashes
+            // and raw-byte image matches alike — are dropped by `target_ok(5)`,
+            // since exav does not model graphics as a `FileType`. But when the
+            // scanned object IS an image, Target:5 is in fact satisfied, so let
+            // such a signature through the target gate; its actual fire is still
+            // gated by the subsignature match and the size/container constraints
+            // (a benign image only trips a sig whose exact bytes/hash it carries).
+            // Matches clamd, which runs Target:5 signatures on graphics.
+            if !(target_ok(ldb.target, ft)
+                || ldb.target == 5 && crate::fuzzy_img::looks_like_image(buf))
+                || !ldb.size_ok(buf.len())
+                || !ldb.container_ok(container)
             {
                 continue;
             }
@@ -1550,22 +1700,15 @@ impl SigEngine {
         let offs = &mut sc.offs;
         let touched = &mut sc.touched;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
-        let passes: [Pass; 2] = [
-            (&self.ac, &self.cs_groups, buf),
-            (
-                &self.ac_ci,
-                &self.ci_groups,
-                lower.as_deref().unwrap_or(&[]),
-            ),
-        ];
-        for (ac, groups, hay) in passes {
-            let Some(ac) = ac else { continue };
+        let lower = if self.needs_lower(ft, buf) {
+            buf.to_ascii_lowercase()
+        } else {
+            Vec::new()
+        };
+        for (ac, groups, hay) in self.active(ft, buf, &lower) {
             for m in ac.find_overlapping_iter(hay) {
                 for &bid in &groups[m.value() as usize] {
-                    if !target_ok(self.targets[bid], ft) {
-                        continue;
-                    }
+                    // Partition membership implies the target match.
                     let body = &self.bodies[bid];
                     if let Some(start) = verify(body, buf, m.start(), layout) {
                         match &body.owner {
@@ -1598,7 +1741,18 @@ impl SigEngine {
         let img_hash = self.maybe_img_hash(buf);
         for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container)
+            // `Target:5` (graphics) signatures — perceptual `fuzzy_img#` hashes
+            // and raw-byte image matches alike — are dropped by `target_ok(5)`,
+            // since exav does not model graphics as a `FileType`. But when the
+            // scanned object IS an image, Target:5 is in fact satisfied, so let
+            // such a signature through the target gate; its actual fire is still
+            // gated by the subsignature match and the size/container constraints
+            // (a benign image only trips a sig whose exact bytes/hash it carries).
+            // Matches clamd, which runs Target:5 signatures on graphics.
+            if !(target_ok(ldb.target, ft)
+                || ldb.target == 5 && crate::fuzzy_img::looks_like_image(buf))
+                || !ldb.size_ok(buf.len())
+                || !ldb.container_ok(container)
             {
                 continue;
             }
@@ -1631,22 +1785,15 @@ impl SigEngine {
         let counts = &mut sc.counts;
         let offs = &mut sc.offs;
         let touched = &mut sc.touched;
-        let lower = self.ac_ci.as_ref().map(|_| buf.to_ascii_lowercase());
-        let passes: [Pass; 2] = [
-            (&self.ac, &self.cs_groups, buf),
-            (
-                &self.ac_ci,
-                &self.ci_groups,
-                lower.as_deref().unwrap_or(&[]),
-            ),
-        ];
-        for (ac, groups, hay) in passes {
-            let Some(ac) = ac else { continue };
+        let lower = if self.needs_lower(ft, buf) {
+            buf.to_ascii_lowercase()
+        } else {
+            Vec::new()
+        };
+        for (ac, groups, hay) in self.active(ft, buf, &lower) {
             for m in ac.find_overlapping_iter(hay) {
                 for &bid in &groups[m.value() as usize] {
-                    if !target_ok(self.targets[bid], ft) {
-                        continue;
-                    }
+                    // Partition membership implies the target match.
                     let body = &self.bodies[bid];
                     if let Some(start) = verify(body, buf, m.start(), layout) {
                         if let Owner::LdbSub = &body.owner {
@@ -1677,7 +1824,18 @@ impl SigEngine {
         let img_hash = self.maybe_img_hash(buf);
         for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            if !target_ok(ldb.target, ft) || !ldb.size_ok(buf.len()) || !ldb.container_ok(container)
+            // `Target:5` (graphics) signatures — perceptual `fuzzy_img#` hashes
+            // and raw-byte image matches alike — are dropped by `target_ok(5)`,
+            // since exav does not model graphics as a `FileType`. But when the
+            // scanned object IS an image, Target:5 is in fact satisfied, so let
+            // such a signature through the target gate; its actual fire is still
+            // gated by the subsignature match and the size/container constraints
+            // (a benign image only trips a sig whose exact bytes/hash it carries).
+            // Matches clamd, which runs Target:5 signatures on graphics.
+            if !(target_ok(ldb.target, ft)
+                || ldb.target == 5 && crate::fuzzy_img::looks_like_image(buf))
+                || !ldb.size_ok(buf.len())
+                || !ldb.container_ok(container)
             {
                 continue;
             }
@@ -1748,10 +1906,10 @@ fn verify(body: &Body, buf: &[u8], anchor_start: usize, layout: Option<&PeLayout
     let off_at = |start: usize| offset_ok(&body.offset, start as u64, filelen, layout);
     let result = match body.prefix {
         Prefix::Fixed { len, .. } => {
-            if anchor_start < len {
+            if anchor_start < len as usize {
                 None
             } else {
-                let start = anchor_start - len;
+                let start = anchor_start - len as usize;
                 // The pattern start is known up front, so apply the (cheap)
                 // offset constraint BEFORE the expensive backtracking match.
                 // Offset-pinned sigs (EP+0/Abs/Sec) whose only viable anchor is a
@@ -1771,7 +1929,7 @@ fn verify(body: &Body, buf: &[u8], anchor_start: usize, layout: Option<&PeLayout
                 None
             } else {
                 match_forward(
-                    &elems[anchor_idx..],
+                    &elems[anchor_idx as usize..],
                     buf,
                     anchor_start,
                     body.nocase,
@@ -1786,14 +1944,14 @@ fn verify(body: &Body, buf: &[u8], anchor_start: usize, layout: Option<&PeLayout
         // runs last (these are `Offset::Any`-only, so it is a no-op anyway).
         Prefix::Internal { anchor_idx } => {
             if match_forward(
-                &elems[anchor_idx..],
+                &elems[anchor_idx as usize..],
                 buf,
                 anchor_start,
                 body.nocase,
                 &mut budget,
             ) {
                 match_backward(
-                    &elems[..anchor_idx],
+                    &elems[..anchor_idx as usize],
                     buf,
                     anchor_start,
                     body.nocase,
@@ -1819,21 +1977,24 @@ fn bytes_eq(a: &[u8], b: &[u8], nocase: bool) -> bool {
 
 fn offset_ok(off: &Offset, start: u64, filelen: u64, layout: Option<&PeLayout>) -> bool {
     let window = |base: u64, shift: u64| start >= base && start <= base.saturating_add(shift);
-    match *off {
-        Offset::Any => true,
-        Offset::Abs { n, shift } => window(n, shift),
+    let kind = match off {
+        Offset::Any => return true,
+        Offset::Constrained(k) => k.as_ref(),
+    };
+    match *kind {
+        OffsetKind::Abs { n, shift } => window(n, shift),
         // `EOF-n` anchors `n` bytes before end of file. If `n` exceeds the
         // file length the anchor is before offset 0 — treated as no
         // match; without this guard `saturating_sub` collapses it to offset 0
         // and a pattern at the start of a short file would falsely match.
-        Offset::Eof { n, shift } => n <= filelen && window(filelen - n, shift),
-        Offset::Ep { delta, shift } => match layout.and_then(|l| l.entry) {
+        OffsetKind::Eof { n, shift } => n <= filelen && window(filelen - n, shift),
+        OffsetKind::Ep { delta, shift } => match layout.and_then(|l| l.entry) {
             Some(ep) => add_delta(ep, delta)
                 .map(|t| window(t, shift))
                 .unwrap_or(false),
             None => false,
         },
-        Offset::Sec { idx, delta, shift } => {
+        OffsetKind::Sec { idx, delta, shift } => {
             match layout.and_then(|l| l.section_rawptrs.get(idx).copied()) {
                 Some(p) => add_delta(p, delta)
                     .map(|t| window(t, shift))
@@ -1841,7 +2002,7 @@ fn offset_ok(off: &Offset, start: u64, filelen: u64, layout: Option<&PeLayout>) 
                 None => false,
             }
         }
-        Offset::SecLast { delta, shift } => {
+        OffsetKind::SecLast { delta, shift } => {
             match layout.and_then(|l| l.section_rawptrs.last().copied()) {
                 Some(p) => add_delta(p, delta)
                     .map(|t| window(t, shift))
@@ -2074,6 +2235,46 @@ enum Cmp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_img_ldb_fires_despite_target5_gate() {
+        // Regression: a `fuzzy_img#` signature is written `Target:5` (graphics),
+        // a type exav doesn't model, so `target_ok(5)` is false and the sig used
+        // to be dropped — even though the perceptual hash matched exactly. Now a
+        // fuzzy sig fires on an image regardless of the Target:5 gate.
+        let mut img = image::RgbImage::new(64, 64);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([(x.wrapping_mul(4)) as u8, (y.wrapping_mul(4)) as u8, 128]);
+        }
+        let mut png = Vec::new();
+        {
+            use image::ImageEncoder;
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(img.as_raw(), 64, 64, image::ColorType::Rgb8)
+                .unwrap();
+        }
+        let hash = crate::fuzzy_img::phash(&png).expect("image hashes");
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+
+        let mut b = EngineBuilder::new();
+        b.add_ldb(
+            &format!("Test.FuzzyImg;Engine:1-999,Target:5;0;fuzzy_img#{hex}"),
+            false,
+        );
+        let eng = b.build();
+        // Scanned as a non-graphics type: `target_ok(5, Unknown)` is false, but
+        // the buffer is an image, so the exact-hash fuzzy sig must still fire.
+        let hit = eng.scan(&png, FileType::Unknown);
+        assert_eq!(hit.map(|(n, _, _)| n).as_deref(), Some("Test.FuzzyImg"));
+
+        // Guard: a fuzzy sig with a DIFFERENT hash must NOT fire on this image.
+        let mut b2 = EngineBuilder::new();
+        b2.add_ldb(
+            "Test.FuzzyImg2;Engine:1-999,Target:5;0;fuzzy_img#0123456789abcdef",
+            false,
+        );
+        assert!(b2.build().scan(&png, FileType::Unknown).is_none());
+    }
 
     fn ndb(line: &str) -> SigEngine {
         let mut b = EngineBuilder::new();

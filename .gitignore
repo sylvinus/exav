@@ -8,7 +8,8 @@ Cargo.lock.orig
 /exav-db/
 *.cache
 *.exavcache
-# real-malware corpus must never be committed
+# real-malware corpus must never be committed (the reproducible harness lives in
+# scripts/, not here — corpus/ holds only local, gitignored samples + data)
 /corpus/
 *.malware
 # real-malware test samples: kept locally (gitignored) for extra decoder
@@ -25,6 +26,8 @@ crates/exav-unpack/tests/fixtures/**/real-malware-*
 .env*.local
 .env
 .DS_Store
+__pycache__/
+*.pyc
 node_modules
 test-results/
 playwright-report/

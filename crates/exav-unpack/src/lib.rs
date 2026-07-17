@@ -70,6 +70,7 @@ pub use stream::{
 // RAR decompression primitives, exposed for the rar3/rar5 examples + tests.
 #[cfg(feature = "zip")]
 #[doc(hidden)]
+pub use formats::has_obfuscated_name_object;
 pub use formats::ZipMembers;
 #[cfg(feature = "rar")]
 #[doc(hidden)]

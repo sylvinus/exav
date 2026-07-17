@@ -314,48 +314,72 @@ async fn extract_zip_member_from_source(
     }
 
     if meta.encrypted {
-        let header_bytes = read_bytes(file, reader, data, meta.local_header_offset, 30 + 256).await?;
-        let name_len =
-            u16::from_le_bytes(header_bytes[26..28].try_into().unwrap()) as u64;
-        let extra_len =
-            u16::from_le_bytes(header_bytes[28..30].try_into().unwrap()) as u64;
-        let data_offset = meta.local_header_offset + 30 + name_len + extra_len;
+        // Member decryption lives behind exav-unpack's `decrypt` feature (the
+        // cipher/KDF stack). When that feature is off — e.g. a minimal
+        // single-format WASM build — report the member as encrypted-unsupported
+        // rather than failing to compile.
+        #[cfg(feature = "decrypt")]
+        {
+            let header_bytes =
+                read_bytes(file, reader, data, meta.local_header_offset, 30 + 256).await?;
+            let name_len = u16::from_le_bytes(header_bytes[26..28].try_into().unwrap()) as u64;
+            let extra_len = u16::from_le_bytes(header_bytes[28..30].try_into().unwrap()) as u64;
+            let data_offset = meta.local_header_offset + 30 + name_len + extra_len;
 
-        let raw = read_bytes(file, reader, data, data_offset, meta.compressed_size).await?;
+            let raw = read_bytes(file, reader, data, data_offset, meta.compressed_size).await?;
 
-        let crc = meta.crc32;
-        let enc = exav_unpack::formats::zip::EncryptedMember {
-            raw,
-            aes_strength: None,
-            method: meta.compression_method,
-        };
-        match exav_unpack::formats::zip::decrypt_zip_member(&enc, crc, &mut Budget::new(Limits::default())) {
-            Ok(Some(plain)) => {
-                let data = if plain.len() as u64 > budget_cap {
-                    plain[..budget_cap as usize].to_vec()
-                } else {
-                    plain
-                };
-                return Ok(Entry {
-                    name: meta.name.clone(),
-                    data,
-                    encrypted: true,
-                    unsupported: String::new(),
-                });
-            }
-            _ => {
-                let passwords_tried = !passwords.is_empty();
-                return Ok(Entry {
-                    name: meta.name.clone(),
-                    data: Vec::new(),
-                    encrypted: true,
-                    unsupported: if passwords_tried {
-                        "wrong password".into()
+            let crc = meta.crc32;
+            let enc = exav_unpack::formats::zip::EncryptedMember {
+                raw,
+                aes_strength: None,
+                method: meta.compression_method,
+                // The DOS mod-time high byte (streaming ZipCrypto password check)
+                // isn't threaded through this JS-reader path; `None` falls back to
+                // the CRC-based check, and AES ignores it.
+                dos_time_hi: None,
+            };
+            match exav_unpack::formats::zip::decrypt_zip_member(
+                &enc,
+                crc,
+                &mut Budget::new(Limits::default()),
+            ) {
+                Ok(Some(plain)) => {
+                    let data = if plain.len() as u64 > budget_cap {
+                        plain[..budget_cap as usize].to_vec()
                     } else {
-                        "encrypted (no password provided)".into()
-                    },
-                });
+                        plain
+                    };
+                    return Ok(Entry {
+                        name: meta.name.clone(),
+                        data,
+                        encrypted: true,
+                        unsupported: String::new(),
+                    });
+                }
+                _ => {
+                    let passwords_tried = !passwords.is_empty();
+                    return Ok(Entry {
+                        name: meta.name.clone(),
+                        data: Vec::new(),
+                        encrypted: true,
+                        unsupported: if passwords_tried {
+                            "wrong password".into()
+                        } else {
+                            "encrypted (no password provided)".into()
+                        },
+                    });
+                }
             }
+        }
+        #[cfg(not(feature = "decrypt"))]
+        {
+            let _ = (passwords, budget_cap);
+            return Ok(Entry {
+                name: meta.name.clone(),
+                data: Vec::new(),
+                encrypted: true,
+                unsupported: "encrypted (decryption not built)".into(),
+            });
         }
     }
 

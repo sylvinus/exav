@@ -19,18 +19,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --features exav-core/http -- -D warnings
-      - run: cargo test --all
-      - run: cargo test -p exav-core --features http
-      # Checksum verification is opt-in; exercise the verify path.
-      - run: cargo test -p exav-unpack --features checksums
-      # Decryption is default-on but off-able; the no-decrypt build must compile
-      # (no cipher stack) and report encrypted members as unsupported.
-      - run: cargo test -p exav-unpack --no-default-features --features all-formats
-      # The `unstable-internals` surface (engine/bytecode tooling, plus the
-      # gated examples and the `bytecode_gating` integration test) is excluded
-      # from the default build, so lint and run it in a dedicated pass.
+      # The `unstable-internals` surface (engine/bytecode tooling, plus the gated
+      # examples and the `bytecode_gating` integration test) is excluded from the
+      # default build, so lint it in a dedicated pass.
       - run: cargo clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
-      - run: cargo test -p exav-core --features unstable-internals
+      # The full native test matrix (default + http + checksums + no-decrypt +
+      # unstable-internals feature passes). Defined once in the Makefile so this
+      # and a local `make test-all` can't drift.
+      - run: make test-native
 
   wasm:
     runs-on: ubuntu-latest
@@ -40,10 +36,18 @@ jobs:
         with:
           targets: wasm32-wasip1, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
       # The scanning core compiled to WASI, and the archive-extractor WASM
-      # bindings (excluded from the workspace, built on their own target).
+      # bindings (excluded from the workspace, built on their own target) — both
+      # the default (all-formats + decrypt) build and a minimal single-format,
+      # no-decrypt build, so the feature-gated paths can't silently rot.
       - run: cargo build -p exav-wasm --target wasm32-wasip1
       - run: cargo build --manifest-path crates/exav-unpack-wasm/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo build --manifest-path crates/exav-unpack-wasm/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features zip
+      # Report the per-format WASM extractor sizes into the run summary.
+      - name: WASM size per format
+        run: make wasm-sizes
       # Run the extractor unit tests on 32-bit wasm32-wasip1 under wasmtime. On a
       # 64-bit host `usize` is 64-bit, so integer/capacity-overflow bugs on parsed
       # offsets/lengths stay hidden; wasm32's 32-bit `usize` makes them abort, so

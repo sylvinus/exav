@@ -53,7 +53,7 @@ pub(super) struct Archive {
 
 // ─── Public entry point ────────────────────────────────────────────────────
 
-pub(super) fn parse_archive(data: &[u8]) -> Result<Archive, LimitHit> {
+pub(super) fn parse_archive(data: &[u8], passwords: &[String]) -> Result<Archive, LimitHit> {
     if data.len() < 32 {
         return Err(LimitHit::corrupt("7z: file too small".into()));
     }
@@ -94,7 +94,36 @@ pub(super) fn parse_archive(data: &[u8]) -> Result<Archive, LimitHit> {
     let streams_data = match first_nid {
         NID_ENCODED_HEADER => {
             let mut streams_info = parse_streams_info(&mut nr)?;
-            decompress_encoded_header(data, &mut streams_info)?
+            let uses_aes = streams_info
+                .blocks
+                .first()
+                .map(|b| {
+                    b.coders
+                        .iter()
+                        .any(|c| c.method_id.as_slice() == super::parse::ID_AES)
+                })
+                .unwrap_or(false);
+            if uses_aes && !passwords.is_empty() {
+                // Encrypted header (`-mhe=on`): try each candidate password; the
+                // correct one yields bytes that parse as a valid 7z header.
+                let mut decoded = None;
+                for pw in passwords {
+                    if let Ok(bytes) = decompress_encoded_header(data, &mut streams_info, Some(pw))
+                    {
+                        if parse_header(&bytes).is_ok() {
+                            decoded = Some(bytes);
+                            break;
+                        }
+                    }
+                }
+                decoded.ok_or_else(|| {
+                    LimitHit::corrupt("7z: encrypted header (no password matched)".into())
+                })?
+            } else {
+                // No password (or no AES): a `-mhe` header without a password
+                // surfaces as unsupported via the AES coder, never a silent clean.
+                decompress_encoded_header(data, &mut streams_info, None)?
+            }
         }
         NID_HEADER => nh.to_vec(),
         _ => {
@@ -679,6 +708,7 @@ fn calculate_stream_map(blocks: &[Block], files: &[FileEntry], pack_sizes: &[u64
 fn decompress_encoded_header(
     data: &[u8],
     streams_info: &mut StreamsInfo,
+    password: Option<&str>,
 ) -> Result<Vec<u8>, LimitHit> {
     if streams_info.blocks.is_empty() {
         return Err(LimitHit::corrupt("7z: encoded header has no blocks".into()));
@@ -741,11 +771,10 @@ fn decompress_encoded_header(
     let chain = ordered_coder_iter(block);
     for coder_idx in chain {
         let coder = &block.coders[coder_idx];
-        // Header decompression: AES-encrypted headers (`-mhe=on`) are not
-        // decrypted here (no password threaded), so they still surface as
-        // encrypted/unsupported. Only the data layer is decrypted (see entry.rs).
+        // Header decompression: `password` is threaded so AES-encrypted headers
+        // (`-mhe=on`) can be decrypted when a candidate password is supplied.
         current =
-            super::decode::wrap_coder(current, coder, total_unpack as usize, None, max_buffer)?;
+            super::decode::wrap_coder(current, coder, total_unpack as usize, password, max_buffer)?;
     }
 
     let (buf, truncated) = crate::bounded_read(&mut current, max_buffer)
@@ -949,7 +978,7 @@ mod tests {
         // route through the public `extract` to exercise the full pipeline (its
         // catch_unwind makes this call infallible-by-panic; the direct call above
         // is what actually regresses the fix).
-        let _ = parse_archive(data);
+        let _ = parse_archive(data, &[]);
         let mut budget = crate::Budget::new(crate::Limits::default());
         let _ = crate::extract(crate::Format::SevenZip, data, &mut budget);
     }

@@ -100,7 +100,8 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
                 }
                 ATT_ATTACHDATA | ATT_ATTACHMENT => {
                     out.push((
-                        name.clone().unwrap_or_else(|| "tnef-attachment".to_string()),
+                        name.clone()
+                            .unwrap_or_else(|| "tnef-attachment".to_string()),
                         data_start,
                         clamped,
                     ));
@@ -158,7 +159,9 @@ pub(crate) fn extract_tnef<R>(
                     if clamped as u64 > cap {
                         return Err(LimitHit::new("tnef attachment exceeds budget".to_string()));
                     }
-                    let member_name = name.clone().unwrap_or_else(|| "tnef-attachment".to_string());
+                    let member_name = name
+                        .clone()
+                        .unwrap_or_else(|| "tnef-attachment".to_string());
                     let bytes = record.to_vec();
                     budget.commit(bytes.len() as u64);
                     if let Some(r) = visit(Entry::new(member_name, bytes), budget) {
@@ -225,6 +228,8 @@ mod tests {
     #[test]
     fn non_tnef_yields_nothing() {
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Tnef, b"not a tnef file", &mut budget).unwrap().is_empty());
+        assert!(extract(Format::Tnef, b"not a tnef file", &mut budget)
+            .unwrap()
+            .is_empty());
     }
 }

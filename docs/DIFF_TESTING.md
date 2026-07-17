@@ -8,35 +8,84 @@ a false positive (exav detects, clamscan clean).
 The corpus is live MalwareBazaar malware under `corpus/` (gitignored,
 static-scan only, never executed).
 
+The harness lives in `scripts/` (tracked, reproducible, no secrets):
+
+| Script | Role |
+|---|---|
+| `scripts/test-clamav-diff.sh` | the runner — starts both daemons, compares, tears down |
+| `scripts/test-clamav-diff-teardown.sh` | manual teardown (the runner also cleans up on exit) |
+| `scripts/clamd-docker.sh` | standalone start/stop/status for the Dockerised clamd |
+| `scripts/bc-difftest.sh` | narrower bytecode-engine differential harness |
+| `scripts/fetch-corpus*.py`, `scripts/query-clamav-hits.py` | build the (gitignored) corpus from MalwareBazaar |
+
+## Prerequisites (one-time setup)
+
+Everything below is reproducible from a clean checkout; nothing secret is
+committed (the corpus and the API key are both gitignored).
+
+1. **Build the binary under test** — `cargo build --release -p exav-cli`.
+2. **Tools:** Docker (runs the reference `clamd`), `clamdscan` on the host
+   (Debian/Ubuntu: `apt-get install clamdscan`), and `python3` with `pyzipper`
+   (`pip install pyzipper`) only if you fetch the corpus.
+3. **Signatures** into the clamd DB dir the runner expects (`DBDIR`,
+   default `/tmp/difdb_daily`) — both engines must load the *same* set:
+   ```sh
+   mkdir -p /tmp/difdb_daily
+   cvd config set --dbdir /tmp/difdb_daily && cvd update   # Cisco's cvdupdate
+   # (or copy an existing daily.cvd there; `main.cvd` too for full coverage)
+   ```
+4. **Corpus** under `corpus/samples/` (gitignored). Put your own samples there,
+   or fetch from MalwareBazaar — needs a free Auth-Key, read from
+   `MALWAREBAZAAR_API_KEY` in a gitignored `.env.local` at the repo root (never
+   committed; get a key at <https://bazaar.abuse.ch/account/>):
+   ```sh
+   echo 'MALWAREBAZAAR_API_KEY=<your-key>' >> .env.local
+   pip install pyzipper
+   python3 scripts/fetch-corpus-bulk.py       # writes corpus/samples/_bulk/…
+   ```
+
 ## Protocol
 
-0. **Free memory.** The signature automaton is memory-heavy to *build* (see
-   [DATABASE.md](DATABASE.md)), and this is easy to get wrong:
+0. **Memory & temp layout on a small host.** The signature automaton is
+   memory-heavy to *build* (see [DATABASE.md](DATABASE.md)), and RAM is the usual
+   failure:
    - `/tmp` is often **tmpfs (RAM-backed)** — anything there counts against RAM.
    - A resident `clamd` from a previous run can hold ~1 GB.
+   - clamd extracts **every scanned file's members into temp**; over a run that
+     can reach gigabytes. The harness bind-mounts `$SOCK_DIR` as clamd's `/tmp`,
+     so `$SOCK_DIR` **must be on real disk, not tmpfs**, or a big scan (or a
+     container killed mid-scan, which leaks its temp) will exhaust RAM and wedge
+     the box. The script now auto-picks a disk-backed `TMPROOT` (falls off `/tmp`
+     to `/var/tmp` when `/tmp` is tmpfs); override with `TMPROOT=` / `SOCK_DIR=`.
    - Check with `free -h`, `df -h /tmp`, `ps aux --sort=-%mem | head`.
 
 1. **Pick the DB scope.** `daily.cvd` only (fits in RAM here) or full
    `main+daily` (needs a capable build host). Both engines must use the *same*
    set or the comparison is meaningless.
 
-2. **Delete any stale cache and rebuild it from the freshly-built binary.**
-   The cache embeds engine/version-specific state, so a cache produced by an
-   earlier `exav` build silently tests old code and invalidates the whole
-   comparison. ALWAYS `rm` the existing cache and rebuild from the binary under
-   test at the **start of every diff run** (the prebuilt cache also avoids the
-   build-time memory peak on every later daemon start):
+2. **Cache the signatures once (from the binary under test).** The prebuilt
+   cache avoids the build-time memory peak on every later daemon start. The cache
+   format is **versioned**: any change that alters how signatures are parsed or
+   compiled bumps the version, which makes an old cache fail to load. Build it
+   once when RAM is free:
    ```sh
    cargo build --release -p exav-cli      # build the binary under test FIRST
-   rm -f /tmp/daily.cache                  # drop any cache from a previous build
    exav -d /tmp/difdb_daily --build-cache /tmp/daily.cache
    ```
+   The harness then **reuses a cache that still loads** with the current binary
+   and only rebuilds when it is missing or fails to load (a format bump) — so a
+   format-compatible binary change does **not** pay the RAM-heavy rebuild. If you
+   want to force a clean rebuild, `rm -f /tmp/daily.cache` first. (On a host too
+   small to build the cache at all, build it elsewhere and copy it in, or point
+   `CACHE=` / `TMPROOT=` at disk — the script prints this hint if a build OOMs.)
 
-3. **Run `corpus/difftest.sh`.** It manages the full daemon lifecycle
-   automatically — starts clamd (in Docker) and exav, runs the comparison,
-   and tears everything down on exit. No prereq steps needed.
+3. **Run `scripts/test-clamav-diff.sh`.** It manages the full daemon lifecycle
+   automatically — resolves a disk-backed temp dir, reuses-or-builds the cache,
+   starts clamd (in Docker) and exav, runs the comparison, and tears everything
+   down on exit. On a host where `/tmp` is tmpfs and `/var/tmp` is disk (the
+   common case) a bare invocation now "just works" with no env overrides.
    ```sh
-   DUR=300 corpus/difftest.sh         # 5 minutes; Ctrl-C-safe, just re-run to continue
+   DUR=300 scripts/test-clamav-diff.sh         # 5 minutes; Ctrl-C-safe, just re-run to continue
    ```
    The script prints a summary (AGREE / clean / FN / FP / ERROR / CAREFUL
    counts, average per-file ms for each engine) and lists the disagreement
@@ -48,7 +97,7 @@ static-scan only, never executed).
    daemons and removes all scratch automatically. If you need to tear down
    manually (e.g. after an abnormal exit):
    ```sh
-   corpus/difftest_teardown.sh   # stops clamd+exav, removes sockets/caches/scratch
+   scripts/test-clamav-diff-teardown.sh   # stops clamd+exav, removes sockets/caches/scratch
    ```
 
 Key choices, and why:

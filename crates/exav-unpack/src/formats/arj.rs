@@ -26,6 +26,9 @@ pub(crate) fn extract_arj<R>(
     }
     let mut arc = ArjArchive::new(data.to_vec())
         .ok_or_else(|| LimitHit::corrupt("arj: invalid header or CRC".to_string()))?;
+    // Candidate passwords for garbled (encrypted) members. ARJ's GOST/garble
+    // decryptors are wired to the same pool as every other archive.
+    arc.set_passwords(&budget.passwords);
 
     while let Some(header) = arc.get_next_entry() {
         budget.count_entry()?;
@@ -51,9 +54,31 @@ pub(crate) fn extract_arj<R>(
             )));
         }
         let name = header.name.clone();
-        let buf = arc
-            .read(&header, budget.should_verify_checksums())
-            .ok_or_else(|| LimitHit::corrupt(format!("arj read '{name}': decompression failed")))?;
+        let buf = match arc.read(&header, budget.should_verify_checksums()) {
+            Some(b) => b,
+            // A garbled member we couldn't decrypt (no password worked / none
+            // supplied) is surfaced as an encrypted member — never a silent skip,
+            // and it must not abort the rest of the archive.
+            None if header.is_garbled() => {
+                if let Some(r) = visit(
+                    Entry::unsupported(
+                        name,
+                        header.original_size as u64,
+                        true,
+                        "encrypted ARJ member",
+                    ),
+                    budget,
+                ) {
+                    return Ok(Some(r));
+                }
+                continue;
+            }
+            None => {
+                return Err(LimitHit::corrupt(format!(
+                    "arj read '{name}': decompression failed"
+                )))
+            }
+        };
         ratio_guard(header.compressed_size as u64, buf.len() as u64, budget)?;
         budget.commit(buf.len() as u64);
         if let Some(r) = visit(Entry::new(name, buf), budget) {
@@ -66,6 +91,44 @@ pub(crate) fn extract_arj<R>(
 #[cfg(test)]
 mod tests {
     use crate::{extract, Budget, Format, Limits};
+
+    /// A garbled (encrypted, `arj -g`) member is decrypted with a pool password
+    /// and its plaintext recovered — identical to the unencrypted `sample.arj`.
+    #[test]
+    fn garbled_member_decrypts_with_pool_password() {
+        let data = include_bytes!("../../tests/fixtures/sample_garbled.arj");
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["secret".to_string()]);
+        let entries = extract(Format::Arj, data, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "payload.txt");
+        assert_eq!(entries[0].data, b"INNER-ARJ-PAYLOAD-12345");
+    }
+
+    /// A decoy password before the real one still finds it (pool tried in order).
+    #[test]
+    fn garbled_member_decrypts_with_pool_second_password() {
+        let data = include_bytes!("../../tests/fixtures/sample_garbled.arj");
+        let mut budget = Budget::with_passwords(
+            Limits::default(),
+            vec!["decoy".to_string(), "secret".to_string()],
+        );
+        let entries = extract(Format::Arj, data, &mut budget).unwrap();
+        assert_eq!(entries[0].data, b"INNER-ARJ-PAYLOAD-12345");
+    }
+
+    /// A garbled member with no/wrong password is surfaced as an encrypted member
+    /// (never a silent skip) and must not abort the archive.
+    #[test]
+    fn garbled_member_wrong_password_is_encrypted_not_error() {
+        let data = include_bytes!("../../tests/fixtures/sample_garbled.arj");
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["wrong".to_string()]);
+        let entries = extract(Format::Arj, data, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].encrypted && entries[0].data.is_empty(),
+            "wrong password must yield an encrypted (metadata-only) member"
+        );
+    }
 
     #[test]
     fn extracts_arj_member() {

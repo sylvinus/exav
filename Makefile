@@ -11,21 +11,39 @@ DBDIR   ?= exav-db
 CACHE   ?= exav.cache
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-wasm lint fmt fuzz db cache daily clean help
+.PHONY: build release test test-native test-all test-wasm wasm-sizes lint fmt fuzz db cache daily clean help
 
 ## build: compile the release binary
 build release:
 	$(CARGO) build --release
 
-## test: run the workspace test suite
+## test: quick default-feature workspace tests (subset — see test-all)
 test:
 	$(CARGO) test --workspace
+
+## test-native: the FULL native test matrix (every feature pass CI runs, no wasm).
+##              Mirrors the `test` job in .github/workflows/ci.yml — keep in sync.
+test-native:
+	$(CARGO) test --workspace
+	$(CARGO) test -p exav-core --features http
+	$(CARGO) test -p exav-unpack --features checksums
+	$(CARGO) test -p exav-unpack --no-default-features --features all-formats
+	$(CARGO) test -p exav-core --features unstable-internals
+
+## test-all: EVERY test (native matrix + wasm); excludes only diff-testing & fuzz.
+##           The one command to run before pushing. Needs `wasmtime` for the wasm
+##           pass (see test-wasm).
+test-all: test-native test-wasm
 
 ## test-wasm: run the extractor unit tests on 32-bit wasm32-wasip1 under wasmtime
 ##            (catches integer/capacity-overflow bugs a 64-bit host hides).
 ##            Needs `wasmtime` on PATH (or $$WASMTIME). See scripts/test-wasm.sh.
 test-wasm:
 	./scripts/test-wasm.sh
+
+## wasm-sizes: per-format exav-unpack WASM size table (how big is a min extractor)
+wasm-sizes:
+	./scripts/wasm-format-sizes.sh
 
 ## lint: clippy + rustfmt check
 lint:

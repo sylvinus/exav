@@ -8,6 +8,11 @@
 //!   `Heuristics.Encrypted.*` (was [`Verdict::PasswordProtected`]).
 //! * `alert_macros` — an OLE2 document carrying a VBA project becomes
 //!   `Heuristics.OLE2.ContainsMacros`.
+//!
+//! It also covers the `clamav_heuristics` / `heuristics` split: the
+//! ClamAV-default `Heuristics.PDF.ObfuscatedNameObject` heuristic is **on by
+//! default** (FP-safe parity with clamscan), can be turned off by clearing
+//! `clamav_heuristics`, and is also enabled by the broader `heuristics` flag.
 
 use std::io::Write;
 
@@ -149,5 +154,82 @@ fn alert_macros_flags_vba_project() {
             assert_eq!(method, Method::Heuristic);
         }
         other => panic!("expected Heuristics.OLE2.ContainsMacros, got {other:?}"),
+    }
+}
+
+// --- clamav-default heuristics: PDF ObfuscatedNameObject --------------------
+
+/// A minimal PDF whose `/JavaScript` name object hex-escapes an alphanumeric
+/// (`#61` = 'a') to hide the keyword — the exact trick ClamAV flags by default.
+fn obfuscated_pdf() -> Vec<u8> {
+    b"%PDF-1.5\n1 0 obj<</Type/Catalog/Open#41ction<</J#61vaScript(x)>>>>endobj\n%%EOF".to_vec()
+}
+
+#[test]
+fn pdf_obfuscated_name_fires_by_default() {
+    // On by default: this ClamAV-default heuristic is FP-safe, so exav out of the
+    // box detects it (matching stock clamscan's default behavior).
+    let db = builtin_db();
+    let blob = obfuscated_pdf();
+    match analyze(&db, &blob, &ScanOptions::default()).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.PDF.ObfuscatedNameObject");
+        }
+        other => panic!("expected Heuristics.PDF.ObfuscatedNameObject by default, got {other:?}"),
+    }
+}
+
+#[test]
+fn pdf_obfuscated_name_can_be_disabled() {
+    // The parity subset is a distinct switch: clearing `clamav_heuristics` (with
+    // the exclusive `heuristics` also off) turns the heuristic off for a raw scan.
+    let db = builtin_db();
+    let blob = obfuscated_pdf();
+    let opts = ScanOptions {
+        clamav_heuristics: false,
+        ..ScanOptions::default()
+    };
+    match analyze(&db, &blob, &opts).verdict {
+        Verdict::Clean => {}
+        other => panic!("expected Clean with clamav_heuristics off, got {other:?}"),
+    }
+}
+
+#[test]
+fn pdf_obfuscated_name_fires_under_clamav_heuristics() {
+    // What `--clamav-compat` sets: the ClamAV-default heuristics on, exclusive
+    // TLSH/ML off. The PDF obfuscation heuristic must fire to match stock clamscan.
+    let db = builtin_db();
+    let blob = obfuscated_pdf();
+    let opts = ScanOptions {
+        clamav_heuristics: true,
+        ..ScanOptions::default()
+    };
+    match analyze(&db, &blob, &opts).verdict {
+        Verdict::Infected {
+            signature, method, ..
+        } => {
+            assert_eq!(signature, "Heuristics.PDF.ObfuscatedNameObject");
+            assert_eq!(method, Method::Heuristic);
+        }
+        other => panic!("expected Heuristics.PDF.ObfuscatedNameObject, got {other:?}"),
+    }
+}
+
+#[test]
+fn pdf_obfuscated_name_fires_under_full_heuristics() {
+    // `--heuristics` is the superset, so it includes the ClamAV-default subset.
+    let db = builtin_db();
+    let blob = obfuscated_pdf();
+    let opts = ScanOptions {
+        heuristics: true,
+        clamav_heuristics: true,
+        ..ScanOptions::default()
+    };
+    match analyze(&db, &blob, &opts).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.PDF.ObfuscatedNameObject");
+        }
+        other => panic!("expected Heuristics.PDF.ObfuscatedNameObject, got {other:?}"),
     }
 }

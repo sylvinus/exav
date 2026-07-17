@@ -22,6 +22,10 @@ Type=simple
 # --workers defaults to one prefork process per CPU core (kernel-enforced per-job
 # limits + hard-kill isolation). Reads signatures from the freshclam DB dir.
 ExecStart=/usr/bin/exav --daemon --socket /run/clamav/clamd.ctl -d /var/lib/clamav
+# `systemctl reload exav-clamd` re-reads the signature database without dropping
+# the socket: the prefork supervisor reloads and re-forks its workers on SIGHUP.
+# (Use this after swapping in a rebuilt prebuilt cache — see docs/DEPLOYMENT.md.)
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 

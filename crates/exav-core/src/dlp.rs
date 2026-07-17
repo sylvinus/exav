@@ -42,21 +42,111 @@ struct Bin {
 /// Major-network IIN/BIN prefix ranges (6-digit prefixes), public information.
 /// Sorted ascending by `lo` so the lookup can stop early.
 const BINS: &[Bin] = &[
-    Bin { lo: 100_000, hi: 199_999, len_lo: 15, len_hi: 15, credit: false }, // UATP (not credit)
-    Bin { lo: 222_100, hi: 272_099, len_lo: 16, len_hi: 16, credit: true },  // Mastercard 2-series
-    Bin { lo: 300_000, hi: 305_999, len_lo: 14, len_hi: 16, credit: true },  // Diners Club
-    Bin { lo: 309_500, hi: 309_599, len_lo: 14, len_hi: 16, credit: true },  // Diners Club Intl
-    Bin { lo: 340_000, hi: 349_999, len_lo: 15, len_hi: 15, credit: true },  // American Express
-    Bin { lo: 352_800, hi: 358_999, len_lo: 16, len_hi: 16, credit: true },  // JCB
-    Bin { lo: 360_000, hi: 369_999, len_lo: 14, len_hi: 16, credit: true },  // Diners Club Intl
-    Bin { lo: 370_000, hi: 379_999, len_lo: 15, len_hi: 15, credit: true },  // American Express
-    Bin { lo: 380_000, hi: 399_999, len_lo: 16, len_hi: 16, credit: true },  // Diners Club Intl
-    Bin { lo: 400_000, hi: 499_999, len_lo: 16, len_hi: 16, credit: true },  // Visa
-    Bin { lo: 500_000, hi: 509_999, len_lo: 16, len_hi: 16, credit: false }, // Maestro (not credit)
-    Bin { lo: 510_000, hi: 559_999, len_lo: 16, len_hi: 16, credit: true },  // Mastercard
-    Bin { lo: 601_100, hi: 601_199, len_lo: 16, len_hi: 16, credit: true },  // Discover
-    Bin { lo: 620_000, hi: 629_999, len_lo: 16, len_hi: 16, credit: true },  // UnionPay
-    Bin { lo: 644_000, hi: 659_999, len_lo: 16, len_hi: 16, credit: true },  // Discover
+    Bin {
+        lo: 100_000,
+        hi: 199_999,
+        len_lo: 15,
+        len_hi: 15,
+        credit: false,
+    }, // UATP (not credit)
+    Bin {
+        lo: 222_100,
+        hi: 272_099,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // Mastercard 2-series
+    Bin {
+        lo: 300_000,
+        hi: 305_999,
+        len_lo: 14,
+        len_hi: 16,
+        credit: true,
+    }, // Diners Club
+    Bin {
+        lo: 309_500,
+        hi: 309_599,
+        len_lo: 14,
+        len_hi: 16,
+        credit: true,
+    }, // Diners Club Intl
+    Bin {
+        lo: 340_000,
+        hi: 349_999,
+        len_lo: 15,
+        len_hi: 15,
+        credit: true,
+    }, // American Express
+    Bin {
+        lo: 352_800,
+        hi: 358_999,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // JCB
+    Bin {
+        lo: 360_000,
+        hi: 369_999,
+        len_lo: 14,
+        len_hi: 16,
+        credit: true,
+    }, // Diners Club Intl
+    Bin {
+        lo: 370_000,
+        hi: 379_999,
+        len_lo: 15,
+        len_hi: 15,
+        credit: true,
+    }, // American Express
+    Bin {
+        lo: 380_000,
+        hi: 399_999,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // Diners Club Intl
+    Bin {
+        lo: 400_000,
+        hi: 499_999,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // Visa
+    Bin {
+        lo: 500_000,
+        hi: 509_999,
+        len_lo: 16,
+        len_hi: 16,
+        credit: false,
+    }, // Maestro (not credit)
+    Bin {
+        lo: 510_000,
+        hi: 559_999,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // Mastercard
+    Bin {
+        lo: 601_100,
+        hi: 601_199,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // Discover
+    Bin {
+        lo: 620_000,
+        hi: 629_999,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // UnionPay
+    Bin {
+        lo: 644_000,
+        hi: 659_999,
+        len_lo: 16,
+        len_hi: 16,
+        credit: true,
+    }, // Discover
 ];
 
 /// Maximum separator characters tolerated inside one card number.
@@ -95,7 +185,9 @@ fn luhn_valid(digits: &[u8]) -> bool {
 }
 
 fn digits_to_u32(d: &[u8]) -> u32 {
-    d.iter().fold(0u32, |a, &c| a.wrapping_mul(10).wrapping_add((c - b'0') as u32))
+    d.iter().fold(0u32, |a, &c| {
+        a.wrapping_mul(10).wrapping_add((c - b'0') as u32)
+    })
 }
 
 /// Try to read a payment-card number at the front of `buf`: a recognised 6-digit
@@ -343,7 +435,9 @@ mod tests {
             ..ScanOptions::default()
         };
         match analyze(&db, &buf, &opts).verdict {
-            Verdict::Infected { signature, method, .. } => {
+            Verdict::Infected {
+                signature, method, ..
+            } => {
                 assert_eq!(signature, "Heuristics.Structured.CreditCardNumber");
                 assert_eq!(method, Method::Heuristic);
             }

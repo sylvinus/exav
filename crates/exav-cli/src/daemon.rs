@@ -17,9 +17,35 @@
 //!   `SCAN <path>`          -> `<path>: OK` / `<path>: <sig> FOUND` / `… ERROR`
 //!   `CONTSCAN <path>`      -> recurse a directory, one reply line per file
 //!   `MULTISCAN <path>`     -> alias of CONTSCAN
-//!   `INSTREAM`             -> scan a `<u32 len><data>…<u32 0>` chunked stream,
-//!                             fed straight into the constant-memory scanner so
-//!                             total size is unbounded; reply `stream: …`
+//!   `INSTREAM`             -> scan a `<u32 len><data>…<u32 0>` chunked stream.
+//!                             The payload is materialized to a seekable source
+//!                             (kept in RAM when small, spilled to an auto-deleted
+//!                             temp file when large) and given the FULL
+//!                             container-aware scan — so malware inside an archive
+//!                             is detected, matching clamd. Bounded by
+//!                             `--max-scansize` (disk is the ceiling). Reply
+//!                             `stream: …`
+//!   `EXINSTREAM`           -> exav extension: same chunk framing as INSTREAM, but
+//!                             the payload is buffered (≤ `--max-scansize`) and
+//!                             run through full container-aware analysis, and the
+//!                             reply is ONE line of compact JSON with the nested
+//!                             match location. Schema (compact, no raw newlines):
+//!                               {"v":1,"verdict":"clean"}
+//!                               {"v":1,"verdict":"malware","signature":S
+//!                                 [,"location":"outer.zip/…/inside.txt"]}
+//!                                 (location present only for a NESTED hit; it is
+//!                                 the `/`-joined container member-name path from
+//!                                 the stream to the matched leaf — control bytes
+//!                                 sanitised, capped ~512 chars)
+//!                               {"v":1,"verdict":"unscannable","tag":T[,"message":M]}
+//!                                 (T ∈ LIMITS-EXCEEDED / UNSCANNABLE /
+//!                                 PASSWORD-PROTECTED — a not-fully-scanned stream
+//!                                 is unscannable, NEVER clean)
+//!                               {"v":1,"verdict":"error","message":M}
+//!                                 (transient/infra failure the client may retry)
+//!                             Verdict classification matches INSTREAM (a
+//!                             detection beats a limit; one detection per scan).
+//!                             Unknown to old clients → `UNKNOWN COMMAND` (below).
 //!   `SCANURL <url>`        -> exav extension: scan an http(s)// object via
 //!                             range requests (no download); reply `<url>: …`
 //!   `IDSESSION` / `END`    -> session mode; each reply is prefixed `<n>: `
@@ -31,12 +57,83 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use exav_core::{
-    analyze_all, scan_path, scan_stream, Database, ScanOptions, ScanReport, VerdictCategory,
+    analyze_all, scan_path, scan_seekable_located, scan_stream, Database, ScanOptions, ScanReport,
+    VerdictCategory,
 };
 use walkdir::WalkDir;
+
+/// Worker/thread count advertised as `max` in the clamd-compatible `STATS`
+/// reply. Set once at daemon startup (prefork: the configured worker count) and
+/// inherited by every forked worker via copy-on-write. `0` = unset (unit tests
+/// and direct `dispatch` calls), where [`daemon_max_workers`] falls back to the
+/// host's CPU parallelism.
+static DAEMON_MAX_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// The `max` thread count to report in `STATS`, falling back to CPU parallelism
+/// when the daemon startup hook hasn't run (tests / direct dispatch).
+fn daemon_max_workers() -> usize {
+    match DAEMON_MAX_WORKERS.load(Ordering::Relaxed) {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        n => n,
+    }
+}
+
+/// The clamd-compatible `VERSION` string: `ClamAV <flevel-release>/<db-version>/
+/// <db-build-time>` when a signed container is loaded (what `clamdtop` parses
+/// into its ENGINE / DBVER / DBTIME columns), degrading to just `ClamAV
+/// <release>` for the loose-signature / built-in-baseline case (no container to
+/// report a version for).
+fn clamav_version(db: &Database) -> String {
+    match db.db_version() {
+        Some((ver, btime)) => format!(
+            "ClamAV {}/{}/{}",
+            crate::CLAMAV_COMPAT_VERSION,
+            ver,
+            ctime_from_btime(btime)
+        ),
+        None => format!("ClamAV {}", crate::CLAMAV_COMPAT_VERSION),
+    }
+}
+
+/// Reformat a CVD build-time (`"17 Jul 2026 06-24 +0000"`) into the ctime-style
+/// stamp clamd puts in its `VERSION` reply (`"Fri Jul 17 06:24:00 2026"`), the
+/// shape `clamdtop` parses for its DBTIME column. The input's own timezone is
+/// preserved (UTC in practice); on any parse failure the original string is
+/// returned unchanged so a client still sees *something*.
+fn ctime_from_btime(btime: &str) -> String {
+    fn parse(btime: &str) -> Option<String> {
+        const MON: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let mut it = btime.split_whitespace();
+        let day: u32 = it.next()?.parse().ok()?;
+        let mon_name = it.next()?;
+        let year: i64 = it.next()?.parse().ok()?;
+        let (hh, mm) = it.next()?.split_once(['-', ':'])?;
+        let mon = MON.iter().position(|m| m.eq_ignore_ascii_case(mon_name))? + 1;
+        // Sakamoto's algorithm: day-of-week (0 = Sunday) for a Gregorian date.
+        let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+        let y = if mon < 3 { year - 1 } else { year };
+        let w = ((y + y / 4 - y / 100 + y / 400 + t[mon - 1] + day as i64) % 7 + 7) % 7;
+        Some(format!(
+            "{} {} {:>2} {}:{}:00 {}",
+            WDAY[w as usize],
+            MON[mon - 1],
+            day,
+            hh,
+            mm,
+            year
+        ))
+    }
+    parse(btime).unwrap_or_else(|| btime.to_string())
+}
 
 /// A reader that can also surface file descriptors passed over the socket as
 /// `SCM_RIGHTS` ancillary data (the `FILDES` command). Non-fd transports
@@ -458,19 +555,31 @@ pub fn request_reload() {
     }
 }
 
-/// The supervisor's poll cadence: how often it reaps workers and checks the data
-/// dir mtime. Kept short so a data-dir write by a sidecar (no `RELOAD`) is picked
-/// up quickly; a signal (SIGCHLD/SIGHUP) interrupts the sleep for immediacy.
+/// The supervisor's **idle** poll cadence — the upper bound on how long a
+/// *signal-less* database change (a sidecar that writes the volume without
+/// `RELOAD`) can go unnoticed. Everything urgent is signal-driven and interrupts
+/// the sleep immediately, so this timer's only job is the mtime poll: a worker
+/// exit (SIGCHLD) triggers instant reap+respawn, `RELOAD`/the updater/`SIGHUP`
+/// trigger an instant reload, and SIGTERM/SIGINT an instant shutdown. It is
+/// therefore a few seconds, not sub-second — polling the filesystem twice a
+/// second for a database that changes a few times a day would wake the process
+/// (and, on an NFS-mounted DB directory, generate GETATTR/READDIR traffic) for
+/// nothing. Still ~60× more responsive than clamd's 600 s `SelfCheck`; use
+/// `RELOAD`/`NotifyClamd`/`SIGHUP` when you want a change picked up instantly.
 #[cfg(unix)]
-const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Newest mtime across the data dir and its entries — the reload trigger for a
-/// sidecar that writes the volume without sending `RELOAD` (clamd's `SelfCheck`).
-/// A rename (freshclam / our updater) or a new file bumps the dir mtime; scanning
-/// entries too catches an in-place overwrite. `None` if the dir can't be read.
+/// Newest mtime of the watched source — the reload trigger for a sidecar that
+/// writes the volume without sending `RELOAD` (clamd's `SelfCheck`). For a
+/// **directory** this is the newest mtime across it and its entries (a rename or
+/// a new file bumps the dir mtime; scanning entries too catches an in-place
+/// overwrite). For a single **file** (a prebuilt cache) it is just that file's
+/// mtime — an atomic swap replaces it with a newer-mtime inode, so the poll fires.
+/// `None` if the path can't be stat'd.
 #[cfg(unix)]
 fn datadir_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
     let mut newest = std::fs::metadata(dir).and_then(|m| m.modified()).ok()?;
+    // `read_dir` fails on a file, leaving `newest` as the file's own mtime.
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
@@ -591,6 +700,10 @@ pub fn run_prefork(
         cfg.max_cpu_secs,
         cfg.max_jobs,
     );
+
+    // Record the pool size for the STATS `max` field before forking, so every
+    // worker inherits it via copy-on-write.
+    DAEMON_MAX_WORKERS.store(cfg.workers.max(1), Ordering::Relaxed);
 
     install_handler(libc::SIGTERM, on_shutdown);
     install_handler(libc::SIGINT, on_shutdown);
@@ -1061,26 +1174,44 @@ fn dispatch<R: Read>(
     let arg = cmd[word.len()..].trim();
     let reply = match word.to_ascii_uppercase().as_str() {
         "PING" => vec!["PONG".to_string()],
-        "VERSION" => vec![format!("exav {}", env!("CARGO_PKG_VERSION"))],
+        // clamd-compatible `ClamAV <release>/<db-version>/<db-time>` so version-
+        // parsing clients (clamdtop, health checks) recognise a clamd and can
+        // read the signature freshness. The exav build version is available via
+        // the CLI `--version`.
+        "VERSION" => vec![clamav_version(db)],
         // Feature-detection: clients (incl. clamdscan) query this to learn which
         // commands the daemon speaks. Format matches clamd: `<version>| COMMANDS:
         // <space-separated list>`.
         "VERSIONCOMMANDS" => vec![format!(
-            "exav {}| COMMANDS: SCAN CONTSCAN MULTISCAN ALLMATCHSCAN INSTREAM FILDES \
+            "{}| COMMANDS: SCAN CONTSCAN MULTISCAN ALLMATCHSCAN INSTREAM EXINSTREAM FILDES \
              STATS VERSION VERSIONCOMMANDS RELOAD SHUTDOWN PING IDSESSION SESSION END",
-            env!("CARGO_PKG_VERSION")
+            clamav_version(db)
         )],
         // RELOAD is intercepted in `run_command` (it needs the supervisor hook).
-        "STATS" => vec![format!(
-            "POOLS: 1\nSTATE: VALID\nKNOWN SIGNATURES: {}\nEND",
-            db.signature_count()
-        )],
+        // clamd-compatible status block: POOLS/STATE/THREADS/QUEUE/MEMSTATS/END,
+        // the shape `clamdtop` parses for its live columns. exav has no custom
+        // allocator instrumentation, so the heap/mmap memory figures are `N/A`
+        // (clamd reports the same when built without its pools allocator).
+        "STATS" => {
+            let max = daemon_max_workers();
+            vec![format!(
+                "POOLS: 1\n\nSTATE: VALID PRIMARY\n\
+                 THREADS: live 1  idle 0 max {max} idle-timeout 30\n\
+                 QUEUE: 0 items\n\tSTATS 0.000000 \n\n\
+                 MEMSTATS: heap N/A mmap N/A used N/A free N/A releasable N/A \
+                 pools 1 pools_used N/A pools_total N/A\nEND"
+            )]
+        }
         "SCAN" => vec![scan_one_path(db, opts, arg)],
         "CONTSCAN" | "MULTISCAN" => scan_tree(db, opts, arg),
         // All-match: report every matching signature per file (not just the
         // first), one reply line each — clamd's ALLMATCHSCAN semantics.
         "ALLMATCHSCAN" => scan_tree_allmatch(db, opts, arg),
         "INSTREAM" => vec![instream(db, opts, reader)?],
+        // Extended INSTREAM: same chunk framing, structured JSON reply with the
+        // nested match location. Older/newer clients that don't know it fall to
+        // the `UNKNOWN COMMAND` arm below and degrade cleanly.
+        "EXINSTREAM" => vec![exinstream(db, opts, reader)?],
         #[cfg(feature = "http")]
         "SCANURL" => vec![scan_url(db, opts, arg)],
         #[cfg(not(feature = "http"))]
@@ -1093,19 +1224,17 @@ fn dispatch<R: Read>(
 }
 
 fn write_reply<W: Write>(w: &mut W, id: Option<u64>, reply: &str, delim: Delim) -> io::Result<()> {
-    // A multi-line reply (e.g. STATS) keeps its internal newlines; in session
-    // mode every line is prefixed with the command id.
-    let prefix = id.map(|n| format!("{n}: ")).unwrap_or_default();
-    let body = if prefix.is_empty() {
-        reply.to_string()
-    } else {
-        reply
-            .lines()
-            .map(|l| format!("{prefix}{l}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    w.write_all(body.as_bytes())?;
+    // In session (IDSESSION) mode each reply MESSAGE is tagged with its command
+    // id on its FIRST line only; the remaining lines of a multi-line reply (the
+    // STATS block) travel raw, exactly as clamd frames them. Prefixing every line
+    // (as we once did) breaks clamd-session clients like clamdtop, which then see
+    // `2: STATE:`/`2: THREADS:` instead of the bare field lines and can't parse
+    // the body. Each CONTSCAN file result is a separate reply message (its own
+    // call here), so it still gets its own id — only intra-message lines change.
+    if let Some(n) = id {
+        write!(w, "{n}: ")?;
+    }
+    w.write_all(reply.as_bytes())?;
     w.write_all(&[delim.byte()])?;
     w.flush()
 }
@@ -1251,9 +1380,74 @@ fn scan_url(db: &Database, opts: &ScanOptions, url: &str) -> String {
     }
 }
 
-/// Scan an INSTREAM chunk stream. The chunks are fed into the constant-memory
-/// streaming scanner via [`Instream`], so the total size is unbounded and RAM
-/// stays flat. After scanning, any unread chunks are drained so the connection
+/// Small streams below this stay in RAM; larger ones spill to a temp file.
+const STREAM_SPILL_THRESHOLD: usize = 16 * 1024 * 1024;
+
+/// A stream payload materialized into a **seekable** source — in RAM when small,
+/// else spilled to an auto-deleting temp file. A seekable view is what lets a
+/// streamed input (INSTREAM/EXINSTREAM, and the CLI's stdin) get full
+/// container-aware scanning (a ZIP's central directory is at the end) at ANY size
+/// with bounded memory, matching clamd. `.len()` reports its size.
+pub(crate) enum StreamPayload {
+    Mem(Vec<u8>),
+    Disk(tempfile::NamedTempFile, u64),
+}
+
+impl StreamPayload {
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            StreamPayload::Mem(v) => v.len() as u64,
+            StreamPayload::Disk(_, n) => *n,
+        }
+    }
+}
+
+/// Buffer an (already de-chunked / pre-capped) reader into a [`StreamPayload`]:
+/// up to `STREAM_SPILL_THRESHOLD` in RAM, then spill the rest to a temp file.
+/// Shared by the daemon stream verbs and the CLI stdin path so both get the same
+/// seekable, container-aware scan.
+pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<StreamPayload> {
+    let mut buf = Vec::new();
+    reader
+        .by_ref()
+        .take(STREAM_SPILL_THRESHOLD as u64)
+        .read_to_end(&mut buf)?;
+    if buf.len() < STREAM_SPILL_THRESHOLD {
+        return Ok(StreamPayload::Mem(buf));
+    }
+    // More data remains — spill the RAM head, then stream the rest to disk.
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    tmp.write_all(&buf)?;
+    io::copy(reader, tmp.as_file_mut())?;
+    let len = tmp.as_file().metadata()?.len();
+    Ok(StreamPayload::Disk(tmp, len))
+}
+
+/// Scan a materialized payload via the seekable (container-aware) path, returning
+/// the report and the nested match location (`None` for a top-level hit).
+pub(crate) fn scan_payload(
+    db: &Database,
+    opts: &ScanOptions,
+    payload: StreamPayload,
+) -> io::Result<(ScanReport, Option<String>)> {
+    match payload {
+        StreamPayload::Mem(v) => {
+            let n = v.len() as u64;
+            scan_seekable_located(db, std::io::Cursor::new(v), n, opts)
+        }
+        StreamPayload::Disk(tmp, len) => {
+            // A fresh handle positioned at 0; the `NamedTempFile` stays alive
+            // (and thus the file) until it drops at the end of this scope.
+            let file = tmp.reopen()?;
+            scan_seekable_located(db, file, len, opts)
+        }
+    }
+}
+
+/// Scan an INSTREAM chunk stream. The payload is materialized to a seekable
+/// source (RAM or a temp file) and given the full container-aware scan — so
+/// malware inside an archive sent over INSTREAM is detected, matching clamd (the
+/// old flat-only path missed it). Any unread chunks are drained so the connection
 /// stays in sync for the next command.
 fn instream<R: Read>(
     db: &Database,
@@ -1262,7 +1456,7 @@ fn instream<R: Read>(
 ) -> io::Result<String> {
     let max = opts.max_scan_size;
     let mut stream = Instream::new(reader, max);
-    let report = scan_stream(db, &mut stream)?;
+    let payload = buffer_to_seekable(&mut stream)?;
     let over = stream.over_limit;
     stream.drain()?;
     if over {
@@ -1271,7 +1465,90 @@ fn instream<R: Read>(
             "stream: LIMITS-EXCEEDED (size exceeds {max}) ERROR"
         ));
     }
+    let (report, _loc) = scan_payload(db, opts, payload)?;
     Ok(verdict_line("stream", &report))
+}
+
+/// `EXINSTREAM`: scan a file sent over the exact INSTREAM chunk framing and reply
+/// with one line of compact JSON — `{"v":1,"verdict":...}`. Unlike INSTREAM's
+/// flat scan, the payload is buffered (bounded by `--max-scansize`) and run
+/// through the full container-aware analysis, so a detection carries its nested
+/// `location` (the `/`-joined member path). The verdict *classification* matches
+/// INSTREAM: a detection beats a limit; a not-fully-scanned stream is
+/// `unscannable`, never `clean`. An over-limit stream is `unscannable` (never
+/// clean). One detection per scan (first / most relevant).
+fn exinstream<R: Read>(
+    db: &Database,
+    opts: &ScanOptions,
+    reader: &mut BufReader<R>,
+) -> io::Result<String> {
+    // Materialize to a seekable source (RAM small / temp file large) — same path
+    // as INSTREAM — bounded by `--max-scansize` (disk is the ceiling).
+    let mut stream = Instream::new(reader, opts.max_scan_size);
+    let payload = match buffer_to_seekable(&mut stream) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = stream.drain();
+            return Ok(json_error(&format!("stream read error: {e}")));
+        }
+    };
+    let over = stream.over_limit;
+    stream.drain()?;
+    if over {
+        return Ok(json_unscannable(
+            "LIMITS-EXCEEDED",
+            Some("stream exceeds max-scansize; not fully scanned"),
+        ));
+    }
+    match scan_payload(db, opts, payload) {
+        Ok((report, loc)) => Ok(verdict_json(&report, loc)),
+        Err(e) => Ok(json_error(&format!("scan error: {e}"))),
+    }
+}
+
+/// Render a scan verdict as one line of compact JSON for `EXINSTREAM`.
+fn verdict_json(report: &ScanReport, location: Option<String>) -> String {
+    use serde_json::json;
+    let v = &report.verdict;
+    let val = match v.category() {
+        VerdictCategory::Clean => json!({"v": 1, "verdict": "clean"}),
+        VerdictCategory::Infected => {
+            let mut o = json!({
+                "v": 1,
+                "verdict": "malware",
+                "signature": v.detail().unwrap_or_default(),
+            });
+            // `location` only for a nested hit; omitted for a top-level match.
+            if let Some(l) = location {
+                o["location"] = json!(l);
+            }
+            o
+        }
+        VerdictCategory::NotScanned => {
+            let mut o = json!({
+                "v": 1,
+                "verdict": "unscannable",
+                "tag": v.status_tag(),
+            });
+            if let Some(m) = v.detail() {
+                o["message"] = json!(m);
+            }
+            o
+        }
+    };
+    val.to_string()
+}
+
+fn json_error(message: &str) -> String {
+    serde_json::json!({"v": 1, "verdict": "error", "message": message}).to_string()
+}
+
+fn json_unscannable(tag: &str, message: Option<&str>) -> String {
+    let mut o = serde_json::json!({"v": 1, "verdict": "unscannable", "tag": tag});
+    if let Some(m) = message {
+        o["message"] = serde_json::json!(m);
+    }
+    o.to_string()
 }
 
 /// A `Read` over a clamd INSTREAM chunk sequence: `<u32 be len><data>` repeated,
@@ -1415,10 +1692,168 @@ mod tests {
         m
     }
 
+    fn exinstream_msg(data: &[u8]) -> Vec<u8> {
+        let mut m = b"zEXINSTREAM\0".to_vec();
+        m.extend(frame(data));
+        m
+    }
+
+    /// One command on a fresh connection using a custom `ScanOptions`.
+    fn one_with(send: &[u8], delim: u8, opts: ScanOptions) -> String {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let db = Database::builtin();
+        std::thread::spawn(move || {
+            let reader = AncillaryReader::new(&server);
+            let _ = handle_conn(reader, &server, &db, &opts, &|| {}, &|| {}, &|| {}, &|| {
+                false
+            });
+        });
+        let mut r = BufReader::new(client.try_clone().unwrap());
+        client.write_all(send).unwrap();
+        client.flush().unwrap();
+        let mut buf = Vec::new();
+        r.read_until(delim, &mut buf).unwrap();
+        if buf.last() == Some(&delim) {
+            buf.pop();
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    // A WinZip-AES-encrypted `.zip` (member `secret.txt`) whose password is NOT in
+    // exav's built-in crack list, so it stays password-protected (Python pyzipper).
+    const ZIP_ENCRYPTED: &[u8] = &[
+        80, 75, 3, 4, 20, 0, 1, 0, 99, 0, 110, 191, 244, 92, 0, 0, 0, 0, 98, 0, 0, 0, 68, 0, 0, 0,
+        10, 0, 11, 0, 115, 101, 99, 114, 101, 116, 46, 116, 120, 116, 1, 153, 7, 0, 2, 0, 65, 69,
+        3, 8, 0, 120, 66, 88, 172, 93, 251, 129, 161, 38, 115, 22, 250, 22, 191, 47, 17, 190, 137,
+        204, 88, 222, 212, 135, 250, 93, 233, 195, 111, 201, 62, 52, 85, 104, 162, 35, 193, 74,
+        126, 203, 204, 215, 217, 57, 104, 3, 45, 230, 104, 142, 131, 151, 224, 83, 15, 227, 187,
+        255, 32, 117, 59, 209, 121, 227, 46, 15, 41, 174, 124, 135, 85, 69, 132, 135, 45, 50, 163,
+        38, 6, 248, 241, 54, 111, 216, 138, 215, 134, 100, 248, 99, 248, 49, 84, 220, 171, 177,
+        119, 57, 208, 80, 75, 1, 2, 20, 3, 20, 0, 1, 0, 99, 0, 110, 191, 244, 92, 0, 0, 0, 0, 98,
+        0, 0, 0, 68, 0, 0, 0, 10, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 0, 0, 115, 101,
+        99, 114, 101, 116, 46, 116, 120, 116, 1, 153, 7, 0, 2, 0, 65, 69, 3, 8, 0, 80, 75, 5, 6, 0,
+        0, 0, 0, 1, 0, 1, 0, 67, 0, 0, 0, 149, 0, 0, 0, 0, 0,
+    ];
+
+    // Real DEFLATE ZIPs (generated by Python's zipfile). Compressed so the EICAR
+    // is NOT visible to a flat scan of the container, forcing real extraction of
+    // each level — which is what exercises the nested-location chain.
+    // `ZIP_EICAR_INSIDE`: a `.zip` with member `inside.txt` = EICAR.
+    const ZIP_EICAR_INSIDE: &[u8] = &[
+        80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 230, 190, 244, 92, 60, 207, 81, 104, 70, 0, 0, 0, 68, 0,
+        0, 0, 10, 0, 0, 0, 105, 110, 115, 105, 100, 101, 46, 116, 120, 116, 139, 48, 245, 87, 12,
+        80, 117, 112, 12, 136, 54, 137, 9, 136, 138, 48, 53, 209, 8, 136, 211, 52, 119, 118, 214,
+        52, 175, 85, 113, 245, 116, 118, 12, 210, 13, 14, 113, 244, 115, 113, 12, 114, 209, 117,
+        244, 11, 241, 12, 243, 12, 10, 13, 214, 13, 113, 13, 14, 209, 117, 243, 244, 113, 85, 84,
+        241, 208, 246, 208, 2, 0, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 230, 190, 244, 92, 60,
+        207, 81, 104, 70, 0, 0, 0, 68, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0,
+        0, 0, 105, 110, 115, 105, 100, 101, 46, 116, 120, 116, 80, 75, 5, 6, 0, 0, 0, 0, 1, 0, 1,
+        0, 56, 0, 0, 0, 110, 0, 0, 0, 0, 0,
+    ];
+    // `ZIP_IN_ZIP_EICAR`: a `.zip` whose member `inner.zip` is itself a DEFLATE
+    // zip with member `inside.txt` = EICAR (two compressed levels).
+    const ZIP_IN_ZIP_EICAR: &[u8] = &[
+        80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 230, 190, 244, 92, 166, 221, 172, 86, 140, 0, 0, 0, 188,
+        0, 0, 0, 9, 0, 0, 0, 105, 110, 110, 101, 114, 46, 122, 105, 112, 11, 240, 102, 102, 17, 97,
+        96, 96, 224, 96, 120, 182, 239, 75, 140, 205, 249, 192, 12, 55, 32, 207, 5, 136, 185, 128,
+        56, 51, 175, 56, 51, 37, 85, 175, 164, 162, 164, 219, 224, 107, 56, 79, 64, 105, 1, 79,
+        135, 89, 39, 103, 71, 151, 129, 233, 69, 142, 142, 203, 38, 229, 101, 215, 76, 214, 135,
+        22, 126, 45, 41, 227, 185, 196, 203, 87, 248, 165, 184, 144, 167, 232, 98, 233, 23, 238,
+        143, 60, 159, 121, 184, 120, 175, 241, 22, 242, 242, 93, 44, 253, 252, 165, 48, 52, 228,
+        227, 133, 111, 23, 152, 24, 2, 188, 25, 153, 68, 152, 113, 219, 7, 3, 13, 140, 12, 40, 182,
+        7, 120, 179, 178, 129, 68, 24, 129, 208, 2, 72, 231, 129, 85, 1, 0, 80, 75, 1, 2, 20, 3,
+        20, 0, 0, 0, 8, 0, 230, 190, 244, 92, 166, 221, 172, 86, 140, 0, 0, 0, 188, 0, 0, 0, 9, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 0, 0, 105, 110, 110, 101, 114, 46, 122, 105,
+        112, 80, 75, 5, 6, 0, 0, 0, 0, 1, 0, 1, 0, 55, 0, 0, 0, 179, 0, 0, 0, 0, 0,
+    ];
+
+    #[test]
+    fn instream_extracts_archives() {
+        // Regression: INSTREAM must detect malware INSIDE an archive (clamd does;
+        // the old flat-only path missed it). EICAR is DEFLATE-compressed inside
+        // the zip, so a flat scan of the raw stream can't see it — extraction is
+        // required.
+        let r = one(&instream_msg(ZIP_EICAR_INSIDE), 0);
+        assert!(
+            r.contains("FOUND"),
+            "INSTREAM must extract the zip; got {r}"
+        );
+    }
+
+    #[test]
+    fn exinstream_clean() {
+        assert_eq!(
+            one(&exinstream_msg(b"totally benign content"), 0),
+            r#"{"v":1,"verdict":"clean"}"#
+        );
+    }
+
+    #[test]
+    fn exinstream_eicar_top_level_no_location() {
+        let r = one(&exinstream_msg(EICAR), 0);
+        assert!(r.contains(r#""verdict":"malware""#), "got {r}");
+        assert!(r.contains(r#""signature":"#), "got {r}");
+        assert!(
+            !r.contains("location"),
+            "top-level hit must have no location: {r}"
+        );
+    }
+
+    #[test]
+    fn exinstream_eicar_in_zip_has_location() {
+        let r = one(&exinstream_msg(ZIP_EICAR_INSIDE), 0);
+        assert!(r.contains(r#""verdict":"malware""#), "got {r}");
+        assert!(r.contains(r#""location":"inside.txt""#), "got {r}");
+    }
+
+    #[test]
+    fn exinstream_zip_in_zip_full_path() {
+        let r = one(&exinstream_msg(ZIP_IN_ZIP_EICAR), 0);
+        assert!(r.contains(r#""verdict":"malware""#), "got {r}");
+        assert!(
+            r.contains(r#""location":"inner.zip/inside.txt""#),
+            "nested path chain expected, got {r}"
+        );
+    }
+
+    #[test]
+    fn exinstream_password_protected() {
+        let r = one(&exinstream_msg(ZIP_ENCRYPTED), 0);
+        assert!(r.contains(r#""verdict":"unscannable""#), "got {r}");
+        assert!(r.contains(r#""tag":"PASSWORD-PROTECTED""#), "got {r}");
+    }
+
+    #[test]
+    fn exinstream_oversized_is_unscannable_never_clean() {
+        // A stream past `--max-scansize` can't be fully scanned → it must be
+        // `unscannable`, never `clean`.
+        let opts = ScanOptions {
+            max_scan_size: Some(8),
+            ..ScanOptions::default()
+        };
+        let r = one_with(
+            &exinstream_msg(b"way more than eight bytes of benign content"),
+            0,
+            opts,
+        );
+        assert!(r.contains(r#""verdict":"unscannable""#), "got {r}");
+        assert!(
+            !r.contains(r#""verdict":"clean""#),
+            "must never be clean: {r}"
+        );
+    }
+
+    #[test]
+    fn exinstream_unknown_verb_degrades() {
+        // A made-up verb must get the normal clamd UNKNOWN COMMAND reply.
+        assert!(one(b"zBOGUSVERB\0", 0).starts_with("UNKNOWN COMMAND"));
+    }
+
     #[test]
     fn ping_and_version() {
         assert_eq!(one(b"zPING\0", 0), "PONG");
-        assert!(one(b"zVERSION\0", 0).starts_with("exav"));
+        // clamd-compatible VERSION: `ClamAV <release>[/<dbver>/<dbtime>]`.
+        assert!(one(b"zVERSION\0", 0).starts_with("ClamAV "));
     }
 
     #[test]
@@ -1494,6 +1929,52 @@ mod tests {
     #[test]
     fn unknown_command_errors() {
         assert!(one(b"zBOGUS\0", 0).ends_with("ERROR"));
+    }
+
+    #[test]
+    fn stats_reports_clamd_fields() {
+        // clamdtop parses these lines out of the STATS block; all must be present.
+        let r = one(b"zSTATS\0", 0);
+        for field in [
+            "POOLS:",
+            "STATE: VALID",
+            "THREADS: live",
+            "QUEUE:",
+            "MEMSTATS:",
+            "END",
+        ] {
+            assert!(r.contains(field), "STATS missing {field:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn idsession_stats_prefixes_first_line_only() {
+        // Regression: in a session, clamd tags a multi-line reply's command id on
+        // its FIRST line only and sends the body raw. Prefixing every line (as we
+        // once did) makes clamdtop see `1: STATE:`/`1: THREADS:` and fail to parse
+        // the block, leaving its table empty.
+        let mut w = serve();
+        let mut r = BufReader::new(w.try_clone().unwrap());
+        w.write_all(b"zIDSESSION\0").unwrap();
+        w.write_all(b"zSTATS\0").unwrap();
+        w.flush().unwrap();
+        let mut b = Vec::new();
+        r.read_until(0, &mut b).unwrap();
+        let reply = String::from_utf8_lossy(&b);
+        let reply = reply.trim_end_matches('\0');
+        let mut lines = reply.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "1: POOLS: 1",
+            "first line carries the command id"
+        );
+        for l in lines {
+            assert!(!l.starts_with("1: "), "body line must be raw, got {l:?}");
+        }
+        assert!(
+            reply.contains("\nSTATE: VALID PRIMARY") && reply.contains("\nEND"),
+            "raw body lines present: {reply:?}"
+        );
     }
 
     /// Send `data` plus one file descriptor as SCM_RIGHTS over the socket.

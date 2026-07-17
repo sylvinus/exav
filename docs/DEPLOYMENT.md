@@ -226,8 +226,11 @@ daemon honours. Either way the two containers only need to share the
 The daemon refreshes its signatures, without a restart, on any of:
 
 - the clamd **`RELOAD`** command over the socket/port (what `freshclam`'s
-  `NotifyClamd` sends — strictly protocol-compatible);
-- a change on disk in the database directory (the sidecar / `freshclam` case);
+  `NotifyClamd` sends — strictly protocol-compatible; the reply is `RELOADING`);
+- an external **`SIGHUP`** (`kill -HUP <pid>`, e.g. `systemctl reload`) — an exav
+  convenience beyond clamd, which uses `SIGHUP` only to reopen its log;
+- a change on disk in the database **directory** (the sidecar / `freshclam`
+  case);
 - a successful fetch by the built-in updater.
 
 On each, the prefork supervisor reloads the database and re-forks the worker
@@ -235,10 +238,83 @@ pool, so the per-job hard-kill isolation is preserved across reloads. (In the
 non-default single-thread model, `--workers 0`, `RELOAD` is accepted but does not
 re-fork.)
 
-The updater performs a **plain HTTPS fetch** with an HTTP-range version check —
-it does **not** verify the container's digital signature. Point `EXAV_DB_MIRROR`
-only at a mirror you trust; for cryptographically verified, bandwidth-efficient
-updates use `freshclam`/`cvdupdate` (Section 4) and let exav hot-reload the volume.
+### How the signature watch works (and why it crosses volumes)
+
+The watch is **mtime polling**, not inotify: every ~10 seconds the
+supervisor stats the `-d` source and reloads when its newest `modified()` time
+advances — exactly clamd's `SelfCheck`. It watches whichever form `-d` points at:
+
+- a **directory** of raw `.cvd`/`.cld` — the newest mtime across the dir and its
+  entries; a rename, a new file, or an in-place overwrite bumps it;
+- a single **cache file** (`-d db.exavcache`) — that file's own mtime; an atomic
+  swap replaces it with a newer-mtime inode.
+
+Because it polls rather than subscribing to kernel events, it fires reliably
+across **Docker volumes, bind mounts, and NFS**, where inotify events do not
+propagate. This is what makes the dual-container pattern (Section 4) work — the
+updater renames a new `.cvd` into the shared volume and the scanner's next poll
+re-forks — and it means a **prebuilt-cache deployment hot-reloads on swap too**,
+with no explicit `RELOAD` needed (next section).
+
+The built-in updater performs a **plain HTTPS fetch** with an HTTP-range version
+check — it does **not** verify the container's digital signature. Point
+`EXAV_DB_MIRROR` only at a mirror you trust; for cryptographically verified,
+bandwidth-efficient updates use `freshclam`/`cvdupdate` (Section 4) and let exav
+hot-reload the volume.
+
+---
+
+## Updating a cache-based deployment
+
+The [prebuilt cache](DATABASE.md#the-cache-is-the-answer) (`--build-cache`) gives
+near-instant startup and low steady-state memory, so it is the recommended form
+for fast/small scanners. The daemon **mtime-polls the cache file** (previous
+section), so updating it is just **recompile → atomic swap** — the swap
+auto-reloads within ~10 seconds, no explicit reload required:
+
+```sh
+# 0. Fetch fresh raw databases into a staging dir (host or shared volume).
+cvdupdate download -o /srv/exav/staging       # or freshclam
+
+# 1. Recompile the cache to a TEMP path (the daemon keeps serving the old one).
+#    Add --build-shard-memory 1G on a small host to bound the build's peak RSS.
+exav -d /srv/exav/staging --build-cache /srv/exav/live.exavcache.tmp
+
+# 2. Atomically swap it in (rename on the SAME filesystem is atomic).
+#    The daemon's next poll (within ~10s) reloads and re-forks with the new sigs.
+mv /srv/exav/live.exavcache.tmp /srv/exav/live.exavcache
+
+# (optional) reload immediately instead of waiting for the poll:
+#    printf 'nRELOAD\n' | nc -U /run/exav/exav.sock    # or: systemctl reload exav-clamd
+```
+
+The daemon is started with `--daemon -d /srv/exav/live.exavcache`.
+
+**Why atomic swap, not an in-place rebuild.** The cache is framed
+`MAGIC | VERSION | payload | SHA-256`. A reload that lands on a truncated,
+half-written, or wrong-version file **fails its integrity check and is rejected —
+the daemon keeps the currently loaded database and stays up**, logging:
+
+```
+exav: signature reload failed, keeping current DB: cache integrity check failed (digest mismatch)
+```
+
+So a torn write never crashes the daemon or serves garbage. But building *in
+place* lets the poll fire mid-write (rejected, then stale until the write
+finishes and bumps the mtime again). A temp file + `rename()` avoids that window
+entirely: the poll only ever sees a complete cache. (All verified behavior, not
+aspiration.)
+
+> **Note.** A bare `RELOAD`/`SIGHUP` without a recompile is a no-op — it re-reads
+> the identical bytes and keeps the current signatures. What changes the loaded
+> set is the cache file's contents (and mtime) changing; the reload just picks
+> that up (and the mtime poll already does, so the manual reload is only for
+> immediacy).
+
+The zero-touch `freshclam`/volume-watch flow works the same either way: point the
+scanner at the **raw directory** (`-d /srv/exav/staging`, recompiling on every
+reload) or at a **cache file** you swap from the update job — both hot-reload on a
+volume write with no cross-container signalling.
 
 ---
 

@@ -109,13 +109,14 @@ pub(crate) fn stream_sevenz<T>(
     visit: crate::stream::StreamVisit<T>,
 ) -> Result<Option<T>, LimitHit> {
     use crate::stream::{visit_member, MemberMeta};
-    let archive = match parse_archive(data) {
+    let archive = match parse_archive(data, &budget.passwords) {
         Ok(a) => a,
         Err(e) => {
             let reason = e.reason.as_str();
             let is_encrypted = reason.contains("unsupported codec")
                 || reason.contains("unsupported 7z codec")
-                || reason.contains("AES");
+                || reason.contains("AES")
+                || reason.contains("encrypted header");
             if is_encrypted {
                 budget.count_entry()?;
                 let meta = MemberMeta {
@@ -286,7 +287,7 @@ pub(crate) fn extract_sevenz<R>(
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    let archive = match parse_archive(data) {
+    let archive = match parse_archive(data, &budget.passwords) {
         Ok(a) => a,
         Err(e) => {
             // If parsing fails (e.g. encrypted header), emit a single
@@ -294,7 +295,8 @@ pub(crate) fn extract_sevenz<R>(
             let reason = e.reason.as_str();
             let is_encrypted = reason.contains("unsupported codec")
                 || reason.contains("unsupported 7z codec")
-                || reason.contains("AES");
+                || reason.contains("AES")
+                || reason.contains("encrypted header");
             if is_encrypted {
                 budget.count_entry()?;
                 let entry = Entry::unsupported(

@@ -110,11 +110,16 @@ pub(crate) fn extract_onenote<R>(
         budget.count_entry()?;
         let cap = budget.reserve()?;
         if len as u64 > cap {
-            return Err(LimitHit::new("onenote embedded file exceeds budget".to_string()));
+            return Err(LimitHit::new(
+                "onenote embedded file exceeds budget".to_string(),
+            ));
         }
         let member = data[off..off + len].to_vec();
         budget.commit(member.len() as u64);
-        if let Some(r) = visit(Entry::new(format!("onenote-embedded-{idx}"), member), budget) {
+        if let Some(r) = visit(
+            Entry::new(format!("onenote-embedded-{idx}"), member),
+            budget,
+        ) {
             return Ok(Some(r));
         }
     }
@@ -194,7 +199,9 @@ mod tests {
         blob.extend_from_slice(&FILE_DATA_STORE_GUID);
         blob.extend_from_slice(&[0u8; 3]);
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::OneNote, &blob, &mut budget).unwrap().is_empty());
+        assert!(extract(Format::OneNote, &blob, &mut budget)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -203,6 +210,8 @@ mod tests {
         blob.extend_from_slice(&ONENOTE_HEADER_GUID);
         blob.extend_from_slice(b"a section with no embedded files");
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::OneNote, &blob, &mut budget).unwrap().is_empty());
+        assert!(extract(Format::OneNote, &blob, &mut budget)
+            .unwrap()
+            .is_empty());
     }
 }

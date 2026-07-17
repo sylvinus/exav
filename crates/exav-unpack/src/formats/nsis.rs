@@ -109,7 +109,12 @@ pub(crate) fn extract_nsis<R>(
                 visit(Entry::new(format!("nsis-{n}"), bytes), budget)
             }
             None => visit(
-                Entry::unsupported(format!("nsis-{n}"), clamped as u64, false, "NSIS block codec"),
+                Entry::unsupported(
+                    format!("nsis-{n}"),
+                    clamped as u64,
+                    false,
+                    "NSIS block codec",
+                ),
                 budget,
             ),
         };
@@ -165,7 +170,10 @@ fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
 /// NSIS's modified bzip2 (header stripped); the stock decoder usually rejects it,
 /// in which case the block is reported unsupported.
 fn decode_bzip2(block: &[u8], cap: u64) -> Option<Vec<u8>> {
-    nonempty(bounded_read(bzip2_rs::DecoderReader::new(Cursor::new(block)), cap))
+    nonempty(bounded_read(
+        bzip2_rs::DecoderReader::new(Cursor::new(block)),
+        cap,
+    ))
 }
 
 #[cfg(test)]
@@ -203,7 +211,9 @@ mod tests {
         assert_eq!(detect(&blob), Some(Format::Nsis));
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
-        assert!(entries.iter().any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
+        assert!(entries
+            .iter()
+            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
     }
 
     #[test]
@@ -212,7 +222,9 @@ mod tests {
         blob.extend_from_slice(&[0u8; 512]);
         assert!(!is_nsis(&blob));
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Nsis, &blob, &mut budget).unwrap().is_empty());
+        assert!(extract(Format::Nsis, &blob, &mut budget)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -221,7 +233,9 @@ mod tests {
         blob.extend_from_slice(&[0u8; 8]);
         blob.extend_from_slice(&NSIS_SIG);
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Nsis, &blob, &mut budget).unwrap().is_empty());
+        assert!(extract(Format::Nsis, &blob, &mut budget)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -231,7 +245,9 @@ mod tests {
         let blob = synthetic_nsis(&junk);
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
-        assert!(entries.iter().all(|e| e.unsupported.is_some() || !e.data.is_empty()));
+        assert!(entries
+            .iter()
+            .all(|e| e.unsupported.is_some() || !e.data.is_empty()));
     }
 
     #[test]

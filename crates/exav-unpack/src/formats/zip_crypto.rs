@@ -115,11 +115,19 @@ fn aes_ctr_le(key: &[u8], data: &mut [u8], key_len: usize) -> Option<()> {
 }
 
 /// Legacy PKWARE "ZipCrypto" stream cipher. The member body is
-/// `12-byte encryption header | ciphertext`. The last header byte must equal the
-/// high byte of the CRC-32 (`check_byte`) for the password to be accepted; we
-/// return the decrypted *payload* (header stripped) on a match. `check_byte` is
-/// the file's CRC-32 >> 24 (from the local/central header).
-pub(crate) fn decrypt_zipcrypto(body: &[u8], password: &[u8], check_byte: u8) -> Option<Vec<u8>> {
+/// `12-byte encryption header | ciphertext`. The last decrypted header byte is a
+/// one-byte password check that must equal one of `check_bytes`; we return the
+/// decrypted *payload* (header stripped) on a match. Per the ZIP spec the
+/// reference byte is the high byte of the CRC-32, EXCEPT when the archive was
+/// written with a streaming data descriptor (general-purpose bit 3), where the
+/// CRC isn't known at encryption time and the high byte of the DOS mod-time is
+/// used instead — the form Info-ZIP's `zip` emits. The caller passes whichever
+/// candidate(s) apply; the full-payload CRC check downstream is the real gate.
+pub(crate) fn decrypt_zipcrypto(
+    body: &[u8],
+    password: &[u8],
+    check_bytes: &[u8],
+) -> Option<Vec<u8>> {
     if body.len() < 12 {
         return None;
     }
@@ -132,8 +140,9 @@ pub(crate) fn decrypt_zipcrypto(body: &[u8], password: &[u8], check_byte: u8) ->
         keys.update(c);
         *b = c;
     }
-    // The classic password check: header[11] == high byte of CRC-32.
-    if header[11] != check_byte {
+    // The classic password check: header[11] == high byte of CRC-32 (or DOS
+    // mod-time for streaming archives — see the doc comment).
+    if !check_bytes.contains(&header[11]) {
         return None;
     }
     let mut out = Vec::with_capacity(body.len() - 12);

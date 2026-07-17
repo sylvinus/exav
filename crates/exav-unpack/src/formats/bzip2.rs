@@ -66,6 +66,8 @@ fn bzip2_stream_starts(data: &[u8]) -> Vec<usize> {
 
 /// Decode a single bzip2 stream, capped at `cap` output bytes.
 fn decode_one_bzip2(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitHit> {
+    // A decode failure (bad block-size, corrupt stream) is undecodable content,
+    // not a resource limit — `corrupt` → `Unscannable`, never `LimitsExceeded`.
     bounded_read(bzip2_rs::DecoderReader::new(Cursor::new(data)), cap)
-        .map_err(|e| LimitHit::new(format!("bzip2: {e}")))
+        .map_err(|e| LimitHit::corrupt(format!("bzip2: {e}")))
 }

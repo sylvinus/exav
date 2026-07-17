@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use exav_core::{
-    db, scan_path, scan_stream, Database, ScanOptions, ScanReport, Verdict, VerdictCategory,
-};
+use exav_core::{db, scan_path, Database, ScanOptions, ScanReport, Verdict, VerdictCategory};
 
 /// Status tags the daemon appends (before ` ERROR`) for a verdict that was not
 /// fully scanned — as opposed to a hard scan error. The client classifies these
@@ -128,6 +126,16 @@ struct Cli {
     #[arg(long = "max-scan-memory", value_name = "SIZE", value_parser = parse_size)]
     max_scan_memory: Option<u64>,
 
+    /// Cap the per-shard automaton-BUILD transient (`--build-cache` only): shard
+    /// each large partition so no single Aho-Corasick construction exceeds ~this
+    /// many bytes. NOTE this bounds the per-shard *transient*, not the total peak
+    /// — the resident parsed-signature set (~2 GB for main+daily) sits under it,
+    /// so peak ≈ this + that floor. Lets huge sets build on smaller hosts at a
+    /// small scan-speed cost. Omit for the fastest build (one automaton per
+    /// partition). K/M/G/T suffixes.
+    #[arg(long = "build-shard-memory", value_name = "SIZE", value_parser = parse_size)]
+    max_build_memory: Option<u64>,
+
     /// Prefork only (requires --workers N): recycle a worker process after this
     /// many jobs to bound slow leaks/fragmentation (0 = never). Mirrors Apache
     /// MaxRequestsPerChild. [default: 1000]
@@ -174,10 +182,12 @@ struct Cli {
     #[arg(long = "max-files", value_name = "N")]
     max_files: Option<u64>,
 
-    /// Restrict archive extraction to stock ClamAV's set: skip `ar`
-    /// (Unix archive / `.deb` / `.a`), the only extractor exav has that ClamAV
-    /// lacks (cpio/xar/UPX are supported by both). For apples-to-apples
-    /// differential testing. Off by default. Also enabled by `--clamav-compat`.
+    /// Narrow exav's unpacking reach to stock ClamAV's, for apples-to-apples
+    /// differential testing: skip `ar` (Unix archive / `.deb` / `.a`, which
+    /// ClamAV lacks); restrict UPX to PE (ClamAV never UPX-unpacks ELF/Mach-O);
+    /// disable other PE packers (Petite/FSG/NsPack/aPLib). cpio/xar stay on
+    /// (both support them). This reduces detection capability — a diff aid, not
+    /// for production. Off by default. Also enabled by `--clamav-compat`.
     #[arg(long = "clamav-formats")]
     clamav_formats: bool,
 
@@ -240,8 +250,13 @@ struct Cli {
     /// Shortcut that sets exav to a stock ClamAV build's documented defaults for
     /// apples-to-apples differential testing. Equivalent to: `--max-filesize 100M
     /// --max-scansize 400M --max-recursion 17 --max-files 10000 --clamav-formats
-    /// --unofficial-names`. Each of those can be set (or overridden) on its own;
-    /// an explicit flag wins over the preset. Off by default (full capability).
+    /// --unofficial-names`, and additionally narrows exav's unpacking reach to
+    /// ClamAV's (UPX restricted to PE — ClamAV never UPX-unpacks ELF/Mach-O; other
+    /// PE packers Petite/FSG/NsPack/aPLib off). This DELIBERATELY REDUCES exav's
+    /// detection capability so results reproduce clamscan's — it is a diff-testing
+    /// mode, NOT recommended for production. Off by default (full capability).
+    /// Each preset flag can still be set or overridden on its own; an explicit
+    /// flag wins over the preset.
     #[arg(long = "clamav-compat")]
     clamav_compat: bool,
 
@@ -775,13 +790,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// The directory the daemon should watch for on-disk signature changes (a
-/// sidecar/freshclam rewriting the volume), mirroring how `load_db` picks its
-/// source. `None` for a single-file `--database` or the built-in baseline, where
-/// there's no directory to poll (an explicit `RELOAD` still reloads).
+/// The path the daemon should watch for on-disk signature changes, mirroring how
+/// `load_db` picks its source. For `--database` this is the given path whether it
+/// is a **directory** (a sidecar/freshclam rewriting the volume) or a single
+/// **file** (a prebuilt cache atomically swapped in place) — the mtime poll
+/// handles both, so a cache-file deployment hot-reloads on swap without needing
+/// an explicit `RELOAD`. `None` only for the built-in baseline (no source path).
 fn reload_watch_dir(cli: &Cli) -> Option<PathBuf> {
     if let Some(p) = &cli.database {
-        return p.is_dir().then(|| p.clone());
+        return p.exists().then(|| p.clone());
     }
     cli.datadir.is_dir().then(|| cli.datadir.clone())
 }
@@ -836,6 +853,10 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     opts.unofficial_suffix = cli.unofficial_names || compat;
 
     opts.heuristics = cli.heuristics;
+    // `clamav_heuristics` (PDF ObfuscatedNameObject, imphash `.imp` matching) is on
+    // by default from `ScanOptions::default()` — a faithful out-of-the-box scan —
+    // and `--clamav-compat` / `--heuristics` keep it on. Nothing turns it off from
+    // the CLI, so no assignment here.
     opts.passwords = cli.password.clone();
     opts.structured_cc_count = cli.structured_cc_count;
     opts.structured_ssn_count = cli.structured_ssn_count;
@@ -853,8 +874,10 @@ fn load_db(cli: &Cli) -> Result<Database, String> {
     // `ScanOptions::unofficial_suffix`; this load-time flag is retained for
     // provenance/API compatibility.
     let suffix = cli.unofficial_names || cli.clamav_compat;
+    let bmem = cli.max_build_memory;
     if let Some(path) = &cli.database {
-        return db::load_with_options(path, cli.detect_pua, suffix).map_err(|e| e.to_string());
+        return db::load_with_options_mem(path, cli.detect_pua, suffix, bmem)
+            .map_err(|e| e.to_string());
     }
     if cli.datadir.is_dir() {
         // Use the data dir if it actually contains something loadable.
@@ -862,7 +885,7 @@ fn load_db(cli: &Cli) -> Result<Database, String> {
             .map(|mut d| d.next().is_some())
             .unwrap_or(false)
         {
-            return db::load_with_options(&cli.datadir, cli.detect_pua, suffix)
+            return db::load_with_options_mem(&cli.datadir, cli.detect_pua, suffix, bmem)
                 .map_err(|e| e.to_string());
         }
     }
@@ -960,11 +983,34 @@ fn scan_one(path: &Path, db: &Database, opts: &ScanOptions, cli: &Cli, totals: &
 }
 
 fn scan_stdin(db: &Database, cli: &Cli, totals: &mut Totals) {
+    use std::io::Read;
     totals.scanned += 1;
-    let stdin = io::stdin();
-    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        scan_stream(db, stdin.lock())
-    }));
+    let opts = build_scan_options(cli);
+    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> io::Result<exav_core::ScanReport> {
+            // Buffer stdin to a SEEKABLE source (RAM small / temp file large) and
+            // run the full container-aware scan — so `cat archive.zip | exav -`
+            // detects malware INSIDE the archive, like clamscan. The old
+            // `scan_stream` was flat and missed it (and ignored `opts`).
+            let max = opts.max_scan_size;
+            let limit = max.map(|m| m.saturating_add(1)).unwrap_or(u64::MAX);
+            let stdin = io::stdin();
+            let mut capped = stdin.lock().take(limit);
+            let payload = daemon::buffer_to_seekable(&mut capped)?;
+            if let Some(m) = max {
+                if payload.len() > m {
+                    return Ok(exav_core::ScanReport {
+                        verdict: exav_core::Verdict::LimitsExceeded {
+                            reason: format!("stdin exceeds max-scansize {m}"),
+                        },
+                        findings: Vec::new(),
+                    });
+                }
+            }
+            let (report, _loc) = daemon::scan_payload(db, &opts, payload)?;
+            Ok(report)
+        },
+    ));
     match scanned {
         Ok(Ok(report)) => report_result("stdin", report, cli, totals),
         Ok(Err(e)) => {
@@ -1365,7 +1411,7 @@ fn emit_json_result(name: &str, report: &ScanReport, cli: &Cli) {
 /// ClamAV functionality level exav emulates (see `engine::EXAV_FLEVEL`), and the
 /// ClamAV release that flevel corresponds to — reported as the engine version so
 /// clamscan-parsing tooling sees a recognised, recent engine.
-const CLAMAV_COMPAT_VERSION: &str = "1.4.3";
+pub(crate) const CLAMAV_COMPAT_VERSION: &str = "1.4.3";
 
 /// Print a clamscan-compatible `SCAN SUMMARY` (same field names and order, so
 /// existing clamscan-output parsers work). exav-specific counters are shown only

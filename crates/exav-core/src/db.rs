@@ -7,7 +7,7 @@
 //!   `.hdb/.hsb/...`  whole-file hash signatures
 //!   `.fdb`           exav fuzzy signatures (imphash/tlsh)
 //!   `.cvd/.cld`      signature container (extracted, then routed)
-//!   `.ldb`           logical signatures (not yet matched; counted)
+//!   `.ldb`           logical signatures (subexpressions, PCRE, offsets)
 
 use std::fs::File;
 use std::io::Read;
@@ -107,9 +107,19 @@ pub struct Loader {
     ftm: crate::filetype::FtmMagics,
     /// `.idb` PE-icon perceptual-hash signatures.
     icons: crate::icon::IconDb,
+    /// `.crb` certificate block-list (Authenticode signer certs to flag).
+    crb: crate::authenticode::CrbDb,
     /// Passwords parsed from `.pwdb` files, used to decrypt encrypted archive
     /// members. User-supplied (the official CVDs ship no `.pwdb`).
     passwords: Vec<String>,
+    /// Optional per-shard memory budget for the signature-automaton build
+    /// (`--max-build-memory`). `None` = build each partition as a single
+    /// automaton (fastest). A budget shards large partitions so a huge set
+    /// (`main+daily`) can build on a small host. Affects `--build-cache` builds.
+    max_build_mem: Option<u64>,
+    /// Version + build-time of the newest loaded `.cvd`/`.cld` container, for the
+    /// clamd-compatible daemon `VERSION` reply. See [`Database::db_version`].
+    db_version: Option<(u32, String)>,
     /// `.pdb`/`.gdb` domain-list + `.wdb` allow-list, consulted by the opt-in
     /// phishing heuristic for brand scoping and false-positive suppression.
     #[cfg(feature = "phishing")]
@@ -127,6 +137,12 @@ impl Loader {
     pub fn set_detect_pua(&mut self, on: bool) {
         self.detect_pua = on;
         self.engine.set_detect_pua(on);
+    }
+
+    /// Set the per-shard automaton-build memory budget (`--max-build-memory`).
+    /// `None` (default) builds each partition as one automaton.
+    pub fn set_max_build_mem(&mut self, bytes: Option<u64>) {
+        self.max_build_mem = bytes;
     }
 
     /// Retained for API/CLI compatibility (`--clamav-compat`). The unofficial
@@ -173,7 +189,17 @@ impl Loader {
                 // A `.cvd`/`.cld` is an official (signed) container: its members
                 // keep their names verbatim (no `.UNOFFICIAL`).
                 let data = read_capped(path)?;
-                let (_hdr, files) = cvd::read(&data).map_err(DbError::Container)?;
+                let (hdr, files) = cvd::read(&data).map_err(DbError::Container)?;
+                // Track the newest container (highest version) so the daemon's
+                // clamd-compatible VERSION reply can report the daily set's
+                // version/build-time (what `clamdtop` displays as DBVER/DBTIME).
+                if self
+                    .db_version
+                    .as_ref()
+                    .is_none_or(|(v, _)| hdr.version > *v)
+                {
+                    self.db_version = Some((hdr.version, hdr.build_time.clone()));
+                }
                 for f in files {
                     self.add_named_bytes(&f.name, &f.data, true);
                 }
@@ -248,11 +274,11 @@ impl Loader {
             "pdb" | "gdb" | "wdb" => self.phishing.add_text(ext.as_str(), text),
             #[cfg(not(feature = "phishing"))]
             "pdb" | "gdb" | "wdb" => {}
-            // Authenticode-cert database (`.crb`): PKCS#7/ASN.1 cert verification
-            // is a separate subsystem deliberately not applied (would reintroduce
-            // the excluded `rsa` crate — see docs/DEPENDENCIES.md). Explicit no-op
-            // so it isn't silently misrouted.
-            "crb" => {}
+            // Authenticode-cert database (`.crb`): block-list of signer certs.
+            // We match on the certificate identity (subject-hash + serial) — RSA
+            // signature *verification* remains out of scope (would reintroduce the
+            // excluded `rsa` crate — see docs/DEPENDENCIES.md).
+            "crb" => self.crb.parse_into(text),
             "yar" | "yara" => self.yara.extend_from_text(text, unofficial),
             // Whole-file hash allowlist (clears a detection).
             "fp" | "sfp" => self.allow.extend_from_text(text),
@@ -312,7 +338,7 @@ impl Loader {
         // stored in the cache and scans don't recompile on first use.
         self.yara.finalize();
 
-        let engine = self.engine.build();
+        let engine = self.engine.build_with_budget(self.max_build_mem);
 
         let mut pats = self.patterns;
         pats.push(Pattern::new("Eicar-Test-Signature", EICAR));
@@ -335,7 +361,9 @@ impl Loader {
             ml_threshold: 0.85,
             ftm: self.ftm,
             icons: self.icons,
+            crb: self.crb,
             passwords: self.passwords,
+            db_version: self.db_version,
             #[cfg(feature = "phishing")]
             phishing: self.phishing,
         })
@@ -426,6 +454,17 @@ pub fn load_with_options(
     detect_pua: bool,
     unofficial_suffix: bool,
 ) -> Result<Database, DbError> {
+    load_with_options_mem(path, detect_pua, unofficial_suffix, None)
+}
+
+/// As [`load_with_options`], with a per-shard automaton-build memory budget
+/// (`--max-build-memory`). Ignored when `path` is a prebuilt cache file.
+pub fn load_with_options_mem(
+    path: &Path,
+    detect_pua: bool,
+    unofficial_suffix: bool,
+    max_build_mem: Option<u64>,
+) -> Result<Database, DbError> {
     if path.is_file() && crate::cache::is_cache_file(path) {
         return crate::cache::load(path).map_err(|e| DbError::Cache {
             path: path.display().to_string(),
@@ -435,6 +474,7 @@ pub fn load_with_options(
     let mut loader = Loader::new();
     loader.set_detect_pua(detect_pua);
     loader.set_unofficial_suffix(unofficial_suffix);
+    loader.set_max_build_mem(max_build_mem);
     loader.add_path(path)?;
     loader.build()
 }

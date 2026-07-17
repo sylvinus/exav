@@ -231,7 +231,11 @@ impl std::fmt::Display for PdfCryptError {
 fn resolve_crypt_method(dict: &CryptDict) -> Result<(u32, CryptMethod), PdfCryptError> {
     match dict.v {
         1 => Ok((40, CryptMethod::V2)),
-        2 => {
+        // V==3 is the (undocumented) variable-length RC4 variant; in practice its
+        // key derivation matches the published V==2 algorithm, so treat it the
+        // same — best effort. If the derived key doesn't verify against /U|/O we
+        // report the PDF encrypted anyway, so a mismatch is never a silent clean.
+        2 | 3 => {
             if !dict.bits.is_multiple_of(8) {
                 Err(PdfCryptError::InvalidData(format!(
                     "invalid key length {}",
@@ -246,6 +250,12 @@ fn resolve_crypt_method(dict: &CryptDict) -> Result<(u32, CryptMethod), PdfCrypt
                 .default_stream_filter
                 .as_ref()
                 .ok_or_else(|| PdfCryptError::MissingEntry("StmF".into()))?;
+            // `Identity` is the built-in no-op filter: streams are NOT encrypted
+            // (only strings/embedded files might be). Treat as a decryptable
+            // no-op so such a document isn't falsely reported unsupported.
+            if filter_name == "Identity" {
+                return Ok((dict.bits, CryptMethod::None));
+            }
             let cf = dict
                 .crypt_filters
                 .get(filter_name)
@@ -614,10 +624,11 @@ fn revision_6_kdf(password: &[u8], salt: &[u8], u: &[u8]) -> [u8; 32] {
         iv.copy_from_slice(&block[16..32]);
 
         i += 1;
-        if i >= 64 {
-            break;
-        }
-        if i >= 32 && block[63] as u32 >= 32 {
+        // ISO 32000-2 Algorithm 2.B: run at least 64 rounds, then stop once the
+        // LAST byte of the AES output E is <= (round number − 32). (A hard cap
+        // guards against a pathological input never satisfying the condition.)
+        let e_last = encrypted[encrypted.len() - 1] as u32;
+        if (i >= 64 && e_last <= i - 32) || i >= 100_000 {
             break;
         }
     }
@@ -643,11 +654,19 @@ fn aes_128_cbc_decrypt(key: &[u8], iv: &[u8], data: &mut [u8]) {
 }
 
 fn aes_256_cbc_decrypt(key: &[u8], iv: &[u8], data: &mut [u8]) {
-    if key.len() < 32 || iv.len() < 16 || data.is_empty() {
+    if key.len() < 32 || iv.len() < 16 {
         return;
     }
-    let cipher = Aes256CbcDec::new_from_slices(&key[..32], &iv[..16]);
-    if let Ok(cipher) = cipher {
-        let _ = cipher.decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(data);
+    // CBC needs whole 16-byte blocks, but PDF stream extraction can include a
+    // trailing EOL after the ciphertext — decrypt only the block-aligned prefix.
+    // NoPadding keeps the full plaintext (incl. any PKCS#7 padding bytes) so a
+    // signature near the tail stays visible and a crafted/edited stream with bad
+    // padding still yields its content.
+    let n = data.len() - data.len() % 16;
+    if n == 0 {
+        return;
+    }
+    if let Ok(cipher) = Aes256CbcDec::new_from_slices(&key[..32], &iv[..16]) {
+        let _ = cipher.decrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut data[..n]);
     }
 }

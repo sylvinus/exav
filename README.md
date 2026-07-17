@@ -221,18 +221,40 @@ testing against `clamscan`. It is exactly the row-by-row combination below —
 **every knob is also an individual flag**, and an explicit flag always wins over
 the preset:
 
+> ⚠️ **`--clamav-compat` is a diff-testing tool, not a production mode.** It
+> *deliberately reduces* exav's detection capability — narrowing limits and
+> unpacking reach — so results reproduce `clamscan`'s as closely as possible.
+> That means it can **miss malware exav would otherwise catch** (e.g. UPX-packed
+> Mirai ELFs, whose config exav decompresses and detects but ClamAV leaves
+> packed). Run exav at its default full capability in production; reach for
+> `--clamav-compat` only when comparing against ClamAV. It is off by default and
+> should stay that way outside a differential harness.
+
 | Flag | exav default | `--clamav-compat` | Effect |
 |---|---|---|---|
 | `--max-filesize` | *unlimited* | `100M` | Per top-level file cap. Over it → `LIMITS-EXCEEDED` (ClamAV: silent `OK`). |
 | `--max-scansize` | `256M` | `400M` | Total data-scanned budget: deep/structural-analysis size + summed extracted bytes. |
 | `--max-recursion` | `16` | `17` | Max nesting depth for recursive unpacking. |
 | `--max-files` | `10000` | `10000` | Max files extracted per archive (same value — exposed for parity/overriding). |
-| `--clamav-formats` | off | on | Skip `ar` (`.deb`/`.a`) extraction — see below. **Functional.** |
+| `--clamav-formats` | off | on | Narrow unpacking to ClamAV's reach: skip `ar` (`.deb`/`.a`); restrict UPX to PE (not ELF/Mach-O); disable other PE packers (Petite/FSG/NsPack/aPLib) — see below. **Functional — reduces detection.** |
 | `--unofficial-names` | off | on | Append `.UNOFFICIAL` / `YARA.` to unofficial-DB signature names. **Cosmetic** — never changes whether a detection fires. |
 
 So `--clamav-compat` ≡ `--max-filesize 100M --max-scansize 400M --max-recursion
 17 --max-files 10000 --clamav-formats --unofficial-names`. The four limit values
 are ClamAV's own documented engine defaults (ClamAV 1.6.0).
+
+**Heuristics: a default-on parity subset vs the opt-in `--heuristics` superset.**
+The heuristics stock clamscan runs **by default** — `Heuristics.PDF.ObfuscatedNameObject`
+and imphash (`.imp`) matching — are **on in exav by default too** (they're FP-safe:
+imphash is an exact DB signature, the PDF check counts only gratuitous escapes), so
+an out-of-the-box scan already matches ClamAV's default detection surface. They stay
+on under `--clamav-compat` and can be turned off only via the library
+(`ScanOptions::clamav_heuristics`). exav's own `--heuristics` flag is a **superset**
+that additionally turns on exav-*exclusive* analysis with no ClamAV analog — TLSH
+fuzzy matching, the static ML scorer (`Heuristics.ML.Suspect.*`), and the
+packed-with-injection heuristic. Those carry higher FP risk, so they are **opt-in**
+and stay **off** under `--clamav-compat` (enabling them would show up as false
+positives in a differential run against `clamscan`).
 
 **Functional differences from stock ClamAV** (what changes *whether/what* gets
 detected, verified against ClamAV 1.6.0 behavior — not cosmetics):
@@ -244,13 +266,41 @@ detected, verified against ClamAV 1.6.0 behavior — not cosmetics):
   on data it never inspected. exav instead reports `LIMITS-EXCEEDED` /
   `UNSCANNABLE` / `PASSWORD-PROTECTED` and exits `2`. `--clamav-compat` matches
   ClamAV's *limits*, but exav still surfaces the outcome rather than hiding it.
-- **Extractor coverage — only `ar` differs.** exav and ClamAV both natively
-  extract **cpio** and **xar**, and unpack **UPX** (inside PE scanning). The
-  *only* archive exav extracts that
-  stock ClamAV does not is **`ar`** (Unix archive / `.deb` / `.a`) — it has no
-  `CL_TYPE_AR`. `--clamav-formats` (and thus `--clamav-compat`) skips exactly
-  that one so a differential run doesn't count exav's `ar` reach as a
-  disagreement; cpio/xar/UPX stay on in every mode.
+- **Unpacking reach — exav goes further, and `--clamav-formats` reins it in.**
+  exav and ClamAV both natively extract **cpio** and **xar** (these stay on in
+  every mode). Where exav reaches further, `--clamav-formats` (and thus
+  `--clamav-compat`) narrows it to ClamAV's scope so a differential run doesn't
+  count exav's extra reach as a disagreement:
+  - **`ar`** (Unix archive / `.deb` / `.a`) — stock ClamAV has no `CL_TYPE_AR`;
+    skipped under compat.
+  - **UPX** — ClamAV's UPX unpacker runs only from its PE path; it never
+    UPX-unpacks **ELF** or **Mach-O**. Under compat, exav restricts UPX to PE to
+    match. (This is why a UPX-packed Mirai ELF that exav detects at full
+    capability shows as clean under `--clamav-compat` — like ClamAV.)
+  - **Other PE packers** (Petite/FSG/NsPack/aPLib) — exav decompresses these and
+    scans the payload; reproducing ClamAV's exact per-packer coverage isn't
+    practical, so compat disables them outright.
+
+  All three reductions apply **only** under `--clamav-formats`/`--clamav-compat`;
+  at full capability exav unpacks everything above.
+
+**Scope of `--clamav-compat`: standard knobs, not quirk-for-quirk mimicry.**
+`--clamav-compat` reduces the divergences a differential run reports by matching
+ClamAV's *documented, well-defined boundaries* — the limit values, the extractor
+set, and the unpacking scope above. It deliberately stops there. It does **not**
+try to reproduce ClamAV's *implementation quirks* — the internal parser caps and
+bail-outs that make ClamAV stop early on some inputs. For example, a `.docx`
+carrying a `Giant.rtf` (an RTF padded with oversized control words, a deliberate
+parser-evasion trick) makes ClamAV's RTF parser abort — `Invalid control word
+param: maximum size exceeded` — so it never reaches the embedded payload;
+ClamAV only recurses one level deep (`recursion_level: 1/17`, nowhere near the
+limit) and reports clean. exav's parser is more robust, reaches the payload, and
+detects. Matching ClamAV *there* would mean re-implementing each format parser's
+weaknesses one by one — deliberately degrading exav to mirror a limitation the
+malware is actively exploiting. We won't: those residual divergences are exav
+being more robust, not bugs, and they stay even under `--clamav-compat`. In a
+differential run they're explained by "ClamAV's parser bailed," not by a knob
+exav is missing.
 
 Everything else is an exav *addition* (never-silent-skip, URL targets, the
 prebuilt cache, the daemon), so it doesn't create a false disagreement in a
@@ -307,7 +357,7 @@ architecture and threat model.
 - **ClamAV signature formats**: `.ndb` byte signatures **including wildcards** (`??`, nibble `a?`/`?a`, `*`, `{n}`/`{n-m}` gaps, `(aa|bb)` alternation, `!(...)` negation), `.ldb` **logical signatures** (full boolean expressions incl. grouped match-counts `(0|1|2)>2,3`, plus `i`/`w`/`a` subsig modifiers and offset prefixes), `.hdb`/`.hsb` whole-file hashes, `.mdb`/`.mdu` **PE section hashes**, `.cdb` **container-metadata signatures**, `.fdb`/`.imp` fuzzy/imphash sets, **`EP`/section-relative offsets**, `.fp`/`.ign` allowlists, `.pdb`/`.wdb`/`.gdb` **phishing databases** (protected-brand domain-list + legitimate-pair allow-list, consulted by `--alert-phishing`), and `.cvd`/`.cld` containers. On a live ClamAV `daily.cvd` exav loads and matches **~99.8% of its signatures** (355,407 of 356,208); the rest — PCRE subsignatures (~640) and bytecode — are skipped (see Limitations) and counted, never silently ignored.
 - **YARA rule support** via [yara-x](https://github.com/VirusTotal/yara-x) (the `yara` feature, **on by default** but off-able with `--no-default-features`): `.yar`/`.yara` rule files load alongside ClamAV signatures and match in the same scan. `yara-x` is by far the heaviest dependency (it pulls a WASM runtime + Cranelift); disabling the feature drops that whole tree — see the [dependency policy](docs/DEPENDENCIES.md).
 - **Recursive unpacking** (the separate `exav-unpack` crate) of zip / gzip / tar / **xz / bzip2 / cab / 7z / ISO (CD001) / LHA / ARJ / RAR (RAR3 LZ+PPMd, RAR5 LZ) / ar (.deb) / cpio (RPM) / xar (.pkg)** archives **and structured documents — OLE2 (legacy Office/MSI streams, with VBA-macro decompression and Excel 4.0 (XLM) macro-sheet surfacing), PDF (object streams; FlateDecode + LZW/ASCII85/ASCIIHex/RunLength filters and filter chains, plus **JavaScript / URI / launch-action** harvesting), RTF (embedded hex objects), and MIME email (decoded attachments/parts)** — all pure-Rust, with **decompression-bomb defenses** (output-byte, ratio, file-count, recursion-depth, and cumulative scan-byte budgets) — a bomb is `LIMITS-EXCEEDED`, never `OK`; a member with an unsupported codec or encryption is `UNSCANNABLE`/`PASSWORD-PROTECTED`, never silently dropped. Also unpacked: **CHM** (ITSF + LZX help files), **NSIS** and **SFX** installers, **AutoIt** (EA05) compiled scripts, **OneNote** embedded files, **TNEF** (`winmail.dat`), **SWF** (CWS/ZWS), **MS-SZDD/KWAJ**, **BinHex**, **uuencode**, **Adobe XDP**, **LNK** command-line strings, Python **`.pyc`**, **GPT/APM/MBR partition maps**, **Java `.class`** constant-pool strings, **AI models** (Python **pickle** import/opcode surfacing + **safetensors** header), and the **Microsoft Script Encoder** (`#@~^` VBScript/JScript.Encode). **Apple DMG** disk images (UDIF, including encrypted DMGs with password) are decompressed and their HFS+/APFS filesystems extracted. **UPX-packed executables** are walked with **all UCL methods + LZMA + DEFLATE** (NRV2B/NRV2D/NRV2E/LZMA/DEFLATE), and other **PE runtime packers** are handled — the **aPLib-based families (Petite 2.x / FSG 2.0 / NsPack)** are decompressed back to the original PE (verified by an in-tree clean-room aPLib codec, round-trip byte-exact), while **Aspack / MEW / Upack / wwpack32 / PeSpin / Yoda's Cryptor** are detected. **Embedded executables** appended/carved inside other files are detected too — **PE, ELF, and Mach-O** images at non-zero offsets are located and re-scanned in their own type context, and **Mach-O universal ("fat")** binaries are split per-architecture.
-- **Structural heuristics** (`--heuristics`): PE section entropy, packer detection, suspicious-import flags, **imphash**, **TLSH** fuzzy matching, and a static **ML feature pipeline** with a transparent baseline scorer.
+- **Structural heuristics.** On by default (ClamAV-parity, FP-safe): **imphash** (`.imp`) matching and the `Heuristics.PDF.ObfuscatedNameObject` check. Opt-in behind `--heuristics` (exav-exclusive, higher FP risk): PE section entropy, packer detection, suspicious-import flags, **TLSH** fuzzy matching, and a static **ML feature pipeline** with a transparent baseline scorer.
 - **Content-based file typing** (magic bytes, never extension-trust).
 - **HTTP(S) range-request backend** (`http` feature — **off by default**; build with `cargo build --release --features http`): scan an `http(s)://` object — including a public/presigned S3 URL — by fetching only the byte ranges touched. For a ZIP that means the central directory plus the members actually scanned, stopping at the first detection, so a 50 GB archive isn't downloaded. It is off by default so the standard build is 100% pure-Rust and links no TLS stack (`ureq → rustls → ring`); without it, an `http(s)://` argument errors out telling you to rebuild with the feature.
 - Reads ClamAV `.cvd`/`.cld` containers directly — populate them with Cisco's own `cvdupdate`/`freshclam` (exav never bundles the GPL DB).

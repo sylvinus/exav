@@ -1,21 +1,78 @@
 #![allow(unused_imports)]
 use crate::*;
+use std::collections::HashSet;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 
-/// Reader-based streaming: walk the ISO 9660 directory tree via targeted reads
+const SECTOR: u64 = 2048;
+
+/// Decode a directory-record file identifier. Joliet supplementary descriptors
+/// store names as UCS-2 (UTF-16) big-endian; the primary descriptor uses a
+/// byte string. A trailing `;1` version suffix is stripped either way.
+fn decode_name(raw: &[u8], joliet: bool) -> String {
+    let name = if joliet {
+        let units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(raw).into_owned()
+    };
+    name.split(';').next().unwrap_or("").to_string()
+}
+
+/// The root directory records worth walking, as `(joliet, root_lba, root_len)`.
+///
+/// A malicious ISO commonly lists its payload in only ONE directory tree — often
+/// the Joliet supplementary tree, leaving the primary tree empty — to hide from
+/// readers that parse only the other. So we enumerate every volume descriptor
+/// (they run from sector 16 until a terminator, type 255) and return the root of
+/// each primary (type 1) and Joliet (type 2) tree. Joliet roots come first so
+/// their long, real names win when a file appears in both trees. `read(off,len)`
+/// fetches raw bytes; a short/`CD001`-less read ends enumeration.
+fn vd_roots(read: &mut dyn FnMut(u64, usize) -> Vec<u8>) -> Vec<(bool, u64, u64)> {
+    let mut primary = Vec::new();
+    let mut joliet = Vec::new();
+    for i in 0..32u64 {
+        let vd = read((16 + i) * SECTOR, 190);
+        if vd.len() < 190 || vd.get(1..6) != Some(b"CD001") {
+            break;
+        }
+        let ty = vd[0];
+        if ty == 255 {
+            break; // volume-descriptor set terminator
+        }
+        if ty != 1 && ty != 2 {
+            continue; // boot record or something we don't walk
+        }
+        let le32 = |o: usize| u32::from_le_bytes([vd[o], vd[o + 1], vd[o + 2], vd[o + 3]]) as u64;
+        let root = (le32(156 + 2), le32(156 + 10));
+        // A Joliet SVD carries a UCS-2 escape sequence (`%/@`, `%/C`, `%/E`) at
+        // offset 88; that flags UTF-16 names. A type-2 without it is treated as a
+        // plain (byte-named) tree.
+        if ty == 2 && vd.get(88) == Some(&0x25) {
+            joliet.push((true, root.0, root.1));
+        } else {
+            primary.push((false, root.0, root.1));
+        }
+    }
+    joliet.into_iter().chain(primary).collect()
+}
+
+/// Reader-based streaming: walk the ISO 9660 directory tree(s) via targeted reads
 /// (directory records are small) and return each file as `(name, offset, size)`.
 /// File extents — the bulk of a disc image — stream via seek+take. Mirrors
 /// [`extract_iso`]'s tree walk and emission order; `max_buffer` bounds each
-/// directory read.
+/// directory read. Both the primary and Joliet trees are walked; a file present
+/// in both (by extent) is emitted once.
 pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
     max_buffer: u64,
 ) -> Result<Vec<(String, u64, u64)>, LimitHit> {
-    const SECTOR: u64 = 2048;
     let total_len = source
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("iso: {e}")))?;
-    let read_at = |source: &mut R, off: u64, len: usize| -> Vec<u8> {
+    let mut read_at = |off: u64, len: usize| -> Vec<u8> {
         let mut buf = vec![0u8; len];
         if source.seek(std::io::SeekFrom::Start(off)).is_err() {
             return Vec::new();
@@ -36,15 +93,16 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
             .map(|s| u32::from_le_bytes(s.try_into().unwrap()) as u64)
             .unwrap_or(0)
     };
-    let pvd = 16 * SECTOR;
-    let head = read_at(source, pvd, 200); // PVD + root directory record (at +156)
-    if head.len() < 190 || head.get(1..6) != Some(b"CD001") {
+    let roots = vd_roots(&mut read_at);
+    if roots.is_empty() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    let mut dirs = vec![(le32(&head, 156 + 2), le32(&head, 156 + 10))];
+    let mut seen_files: HashSet<u64> = HashSet::new();
     let mut visited = 0usize;
-    while let Some((lba, len)) = dirs.pop() {
+    // Each queued dir carries the Joliet flag of the tree it belongs to.
+    let mut dirs: Vec<(bool, u64, u64)> = roots;
+    while let Some((joliet, lba, len)) = dirs.pop() {
         visited += 1;
         if visited > 1024 {
             break;
@@ -52,7 +110,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         let start = lba.saturating_mul(SECTOR);
         let avail = total_len.saturating_sub(start);
         let read_len = len.min(avail).min(max_buffer) as usize;
-        let dir = read_at(source, start, read_len);
+        let dir = read_at(start, read_len);
         let mut p = 0usize;
         while p < dir.len() {
             let rec_len = dir[p] as usize;
@@ -78,14 +136,10 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
                 continue;
             }
             if flags & 0x02 != 0 {
-                dirs.push((child_lba, child_len));
-            } else {
+                dirs.push((joliet, child_lba, child_len));
+            } else if seen_files.insert(child_lba) {
                 let raw = rec.get(33..33 + name_len.min(rec_len - 33)).unwrap_or(&[]);
-                let name = String::from_utf8_lossy(raw)
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+                let name = decode_name(raw, joliet);
                 let fstart = child_lba.saturating_mul(SECTOR);
                 let fend = fstart.saturating_add(child_len).min(total_len);
                 if fend > fstart {
@@ -98,34 +152,38 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     Ok(out)
 }
 
-/// ISO 9660: a minimal, dependency-free reader that walks the primary volume
-/// descriptor's directory tree and emits each file's extent. Bounded by the
-/// budget and a fixed directory-recursion depth. Rock Ridge / Joliet name
-/// extensions are ignored (the raw payload is what matters for scanning).
+/// ISO 9660: a minimal, dependency-free reader that walks the volume descriptors'
+/// directory trees (primary + Joliet) and emits each file's extent. Bounded by
+/// the budget and a fixed directory-count guard. A file listed in more than one
+/// tree (by extent) is emitted once. Rock Ridge extensions are ignored (the raw
+/// payload is what matters for scanning); Joliet is honored for both reach and
+/// the real long file names.
 pub(crate) fn extract_iso<R>(
     data: &[u8],
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    const SECTOR: usize = 2048;
-    // Primary Volume Descriptor at sector 16; root directory record at PVD+156.
-    let pvd = 16 * SECTOR;
-    let rd = pvd + 156;
-    if data.len() < rd + 34 || data.get(pvd + 1..pvd + 6) != Some(b"CD001") {
+    let mut read_at = |off: u64, len: usize| -> Vec<u8> {
+        let o = off as usize;
+        data.get(o..o.saturating_add(len))
+            .or_else(|| data.get(o..))
+            .unwrap_or(&[])
+            .to_vec()
+    };
+    let roots = vd_roots(&mut read_at);
+    if roots.is_empty() {
         return Ok(None);
     }
-    let le32 = |o: usize| -> u64 {
-        u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as u64
-    };
-    // (extent_lba, data_len) of directories still to visit.
-    let mut dirs = vec![(le32(rd + 2), le32(rd + 10))];
+    let sector = SECTOR as usize;
+    let mut seen_files: HashSet<u64> = HashSet::new();
+    let mut dirs: Vec<(bool, u64, u64)> = roots;
     let mut visited = 0usize;
-    while let Some((lba, len)) = dirs.pop() {
+    while let Some((joliet, lba, len)) = dirs.pop() {
         visited += 1;
         if visited > 1024 {
             break; // directory-count guard
         }
-        let start = lba as usize * SECTOR;
+        let start = lba as usize * sector;
         let end = start.saturating_add(len as usize).min(data.len());
         let Some(dir) = data.get(start..end) else {
             continue;
@@ -135,7 +193,7 @@ pub(crate) fn extract_iso<R>(
             let rec_len = dir[p] as usize;
             if rec_len == 0 {
                 // Records don't span sector boundaries; advance to the next.
-                let next = (p / SECTOR + 1) * SECTOR;
+                let next = (p / sector + 1) * sector;
                 if next <= p {
                     break;
                 }
@@ -161,17 +219,12 @@ pub(crate) fn extract_iso<R>(
             }
             if flags & 0x02 != 0 {
                 // Subdirectory: queue it (depth bounded by the count guard).
-                dirs.push((child_lba, child_len));
-            } else {
+                dirs.push((joliet, child_lba, child_len));
+            } else if seen_files.insert(child_lba) {
                 budget.count_entry()?;
-                // Strip a trailing ";1" version suffix from the name.
                 let raw = rec.get(33..33 + name_len.min(rec_len - 33)).unwrap_or(&[]);
-                let name = String::from_utf8_lossy(raw)
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let fstart = child_lba as usize * SECTOR;
+                let name = decode_name(raw, joliet);
+                let fstart = child_lba as usize * sector;
                 let fend = fstart.saturating_add(child_len as usize).min(data.len());
                 let content = data.get(fstart..fend).unwrap_or(&[]);
                 let cap = budget.reserve()?;

@@ -40,6 +40,16 @@ impl Pattern {
     }
 }
 
+/// Whether an `.ndb` signature's `Target`/`Offset` columns make it safe to add
+/// to the streaming literal set — i.e. it is valid at any offset in any file
+/// type. Only `Target:0` (any type) combined with `Offset:*` (any offset)
+/// qualifies; anything else carries a constraint the constraint-free streaming
+/// matcher cannot honor. Blank columns (malformed line) are treated as
+/// constrained (excluded) so uncertainty never widens the match.
+fn stream_safe(target: &str, offset: &str) -> bool {
+    target.trim() == "0" && offset.trim() == "*"
+}
+
 /// A set of literal patterns for the streaming path. The Aho-Corasick
 /// automaton is built lazily on first use: in-memory (file) scans go through
 /// the full engine, which already covers these literals, so only stdin/pipe
@@ -110,8 +120,8 @@ impl PatternSet {
             }
             let mut parts = line.splitn(4, ':');
             let name = parts.next().unwrap_or("");
-            let _type = parts.next();
-            let _offset = parts.next();
+            let target = parts.next().unwrap_or("");
+            let offset = parts.next().unwrap_or("");
             let body = match parts.next() {
                 Some(b) => b,
                 None => {
@@ -119,6 +129,19 @@ impl PatternSet {
                     continue;
                 }
             };
+            // The streaming literal set matches over raw, unbuffered bytes where
+            // no PE layout and no per-buffer file type exist, so it may only
+            // carry signatures that are valid *anywhere, in any file type*:
+            // `Target:0` (any) with `Offset:*` (any). A type- or offset-
+            // constrained signature — e.g. a short pattern pinned to a PE entry
+            // point (`1:EP+0,64:5746c3`) — would false-positive if matched
+            // unanchored here, since the constraint can't be checked. Such sigs
+            // are still loaded and correctly enforced by the full (buffered)
+            // engine, so they are simply excluded from the streaming set rather
+            // than counted unsupported.
+            if !stream_safe(target, offset) {
+                continue;
+            }
             match parse_ndb_body(body) {
                 NdbPattern::Literal(bytes) if !bytes.is_empty() => {
                     patterns.push(Pattern::with_prov(name, bytes, unofficial));
@@ -186,5 +209,33 @@ mod tests {
         let set = PatternSet::from_ndb(db).unwrap();
         assert_eq!(set.len(), 2); // A and C literal; B wildcard skipped
         assert_eq!(set.unsupported, 1);
+    }
+
+    #[test]
+    fn stream_set_excludes_constrained_sigs() {
+        // Regression: the streaming literal set matches over raw bytes with no
+        // file-type/offset context, so a `Target`- or `Offset`-constrained sig
+        // (e.g. the real `Win.Spyware.Zbot-1290:1:EP+0,64:5746c3` — a 3-byte
+        // pattern pinned to a PE entry point) must NOT enter it, or it
+        // false-positives unanchored on any file that happens to contain those
+        // bytes. Only `Target:0` + `Offset:*` (valid anywhere) qualifies.
+        let db = concat!(
+            "Generic.Any:0:*:deadbeef\n",       // kept: any type, any offset
+            "Pe.Ep.Short:1:EP+0,64:5746c3\n",   // dropped: PE-only, entry-point
+            "Any.AtOffset:0:512:cafebabe\n",    // dropped: absolute offset
+            "Elf.Anywhere:6:*:0badf00d\n",      // dropped: ELF target only
+        );
+        let (patterns, _unsupported) = PatternSet::parse_ndb(db);
+        let names: Vec<&str> = patterns.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Generic.Any"], "only the unconstrained sig is stream-safe");
+    }
+
+    #[test]
+    fn stream_safe_predicate() {
+        assert!(stream_safe("0", "*"));
+        assert!(!stream_safe("1", "*")); // PE target
+        assert!(!stream_safe("0", "EP+0")); // entry-point anchored
+        assert!(!stream_safe("0", "0")); // absolute offset 0
+        assert!(!stream_safe("", "")); // malformed → treated as constrained
     }
 }

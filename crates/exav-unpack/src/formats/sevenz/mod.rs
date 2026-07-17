@@ -5,7 +5,8 @@
 //! to use our own PPMd7 model (zero-`unsafe`) instead of `ppmd-rust`.
 //!
 //! Supports: LZMA, LZMA2, Copy, BCJ (x86/ARM/ARM64), Delta, BZip2, Deflate,
-//! PPMd7. Encryption and writing are not supported.
+//! PPMd7, and AES-256 (data streams + `-mhe=on` encrypted headers, password
+//! required). Writing is not supported.
 
 #[cfg(feature = "decrypt")]
 mod aes;
@@ -152,6 +153,36 @@ mod tests {
         let entries =
             extract(Format::SevenZip, blob, &mut budget).expect("extract should not fail");
         entries.into_iter().map(|e| (e.name, e.data)).collect()
+    }
+
+    /// A real 7-Zip archive with an AES-encrypted *header* (`7z a -psecret
+    /// -mhe=on`) decrypts with the password — the encoded header itself is
+    /// decrypted so the file listing and content are recovered.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn mhe_encrypted_header_decrypts_with_password() {
+        let data = fixture("eicar_mhe.7z");
+        let files = extract_entries_pw(&data, &["secret"]);
+        assert!(files.contains_key("eicar.txt"), "file list: {files:?}");
+        assert!(
+            files["eicar.txt"].windows(5).any(|w| w == b"EICAR"),
+            "encrypted-header 7z must decrypt to EICAR"
+        );
+    }
+
+    /// The same `-mhe` archive with no password is reported encrypted, never a
+    /// silent clean.
+    #[test]
+    fn mhe_encrypted_header_no_password_is_unsupported() {
+        let data = fixture("eicar_mhe.7z");
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::SevenZip, &data, &mut budget).expect("should not error");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.encrypted && e.unsupported.is_some()),
+            "no-password -mhe must report unsupported: {entries:?}"
+        );
     }
 
     /// Real 7-Zip-produced AES-256 archives (password `hunter2`) decrypt back to

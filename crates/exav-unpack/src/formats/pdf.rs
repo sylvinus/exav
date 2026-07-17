@@ -20,6 +20,76 @@ use super::pdf_parse::types::Primitive;
 /// Uses a linear byte-scanning approach that finds `N G obj` patterns directly,
 /// so a broken xref — common in malicious PDFs — doesn't stop extraction. The
 /// parser is depth-bounded (`MAX_DEPTH`), avoiding nested-object stack overflow.
+/// ClamAV `Heuristics.PDF.ObfuscatedNameObject`: a PDF **name object** (`/Name`)
+/// that hex-escapes (`#XX`) a character that never requires escaping — an ASCII
+/// letter or digit — *and* whose de-escaped form is one of the sensitive
+/// action/feature keywords malware hides this way (`/J#61vaScript` → `JavaScript`,
+/// `/Ope#6eAction` → `OpenAction`). The PDF spec only needs `#`-escaping for
+/// whitespace, the delimiters `()<>[]{}/%#`, and bytes outside `0x21..=0x7E`, so
+/// escaping a plain alphanumeric is gratuitous.
+///
+/// Requiring the de-escaped name to be a *sensitive keyword* is deliberate: a lone
+/// incidental escape in an ordinary name (e.g. `/C#31` → `C1`) is common in benign
+/// PDFs and must not fire — stock ClamAV likewise flags the systematic
+/// keyword-hiding case, not any single gratuitous escape. This keeps the heuristic
+/// FP-safe enough to run by default.
+pub fn has_obfuscated_name_object(data: &[u8]) -> bool {
+    // Action/feature name objects abused to launch code or fetch remote content;
+    // obfuscating one of these is the evasion signal (PDF spec keywords).
+    const SENSITIVE: &[&[u8]] = &[
+        b"JavaScript",
+        b"JS",
+        b"OpenAction",
+        b"AA",
+        b"Launch",
+        b"URI",
+        b"SubmitForm",
+        b"ImportData",
+        b"GoToR",
+        b"GoToE",
+        b"RichMediaExecute",
+        b"EmbeddedFile",
+        b"EmbeddedFiles",
+        b"XFA",
+    ];
+    // Name-object terminators: PDF whitespace and delimiters.
+    const TERM: &[u8] = b" \t\r\n\0()<>[]{}/%";
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != b'/' {
+            i += 1;
+            continue;
+        }
+        // Scan the name token following `/`, decoding `#XX` escapes into `decoded`
+        // and noting whether any escaped a gratuitous alphanumeric.
+        let mut j = i + 1;
+        let mut decoded: Vec<u8> = Vec::new();
+        let mut gratuitous = false;
+        while j < data.len() && !TERM.contains(&data[j]) {
+            if data[j] == b'#' && j + 2 < data.len() {
+                if let Ok(b) =
+                    u8::from_str_radix(std::str::from_utf8(&data[j + 1..j + 3]).unwrap_or("x"), 16)
+                {
+                    if b.is_ascii_alphanumeric() {
+                        gratuitous = true;
+                    }
+                    decoded.push(b);
+                    j += 3;
+                    continue;
+                }
+            }
+            decoded.push(data[j]);
+            j += 1;
+        }
+        // Flag only an obfuscated *sensitive* name, not any incidental escape.
+        if gratuitous && SENSITIVE.contains(&decoded.as_slice()) {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
+}
+
 pub(crate) fn extract_pdf<R>(
     data: &[u8],
     budget: &mut Budget,
@@ -242,8 +312,30 @@ fn apply_filters(
         let parm = parms.get(idx).copied().flatten();
         let (out, truncated) = match name.as_str() {
             "FlateDecode" | "Fl" => {
-                bounded_read(flate2::read::ZlibDecoder::new(Cursor::new(&buf)), cap)
-                    .map_err(|e| LimitHit::new(format!("pdf flate: {e}")))?
+                // Salvage: keep whatever inflated before a truncation/corruption
+                // error rather than discarding the object — malware content is
+                // often in the recoverable prefix, and PDF streams are commonly
+                // truncated or patched. A leading-junk retry handles streams whose
+                // zlib header is preceded by stray bytes.
+                let (mut out, mut truncated) = bounded_read_salvage(
+                    flate2::read::ZlibDecoder::new(Cursor::new(&buf)),
+                    cap,
+                    true,
+                )
+                .unwrap_or((Vec::new(), false));
+                if out.is_empty() {
+                    if let Some(z) = buf.iter().position(|&b| b == 0x78) {
+                        let r = bounded_read_salvage(
+                            flate2::read::ZlibDecoder::new(Cursor::new(&buf[z..])),
+                            cap,
+                            true,
+                        )
+                        .unwrap_or((Vec::new(), false));
+                        out = r.0;
+                        truncated = r.1;
+                    }
+                }
+                (out, truncated)
             }
             "LZWDecode" | "LZW" => filters::lzw_decode(&buf, early_change(parm), cap),
             "ASCII85Decode" | "A85" => filters::ascii85_decode(&buf, cap),
@@ -411,6 +503,28 @@ fn find_doc_id(data: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn obfuscated_name_object_detection() {
+        // Gratuitous escapes that spell a *sensitive* keyword → flagged.
+        assert!(has_obfuscated_name_object(b"<</#4f#70enAction 2 0 R>>")); // /OpenAction
+        assert!(has_obfuscated_name_object(b"/J#61vaScript")); // → JavaScript
+        assert!(has_obfuscated_name_object(b"/La#75nch")); // → Launch
+                                                           // An incidental escape in an *ordinary* name is benign and must NOT fire
+                                                           // (this is the false positive that made it unsafe to run by default).
+        assert!(!has_obfuscated_name_object(b"/Ty#70e")); // → Type (not sensitive)
+        assert!(!has_obfuscated_name_object(b"/C#31")); // → C1 (a real benign-PDF FP)
+                                                        // No escapes, or only legitimate ones → not flagged.
+        assert!(!has_obfuscated_name_object(b"/Type/Catalog/OpenAction"));
+        assert!(!has_obfuscated_name_object(b"/JavaScript")); // unobfuscated → not flagged
+        assert!(!has_obfuscated_name_object(b"/Weird#20Name")); // #20 = space, needs escaping
+        assert!(!has_obfuscated_name_object(b"/Paren#28Name")); // #28 = '(', a delimiter
+        assert!(!has_obfuscated_name_object(
+            b"plain text with # but no name"
+        ));
+        // A trailing bare `#` must not panic or match.
+        assert!(!has_obfuscated_name_object(b"/Name#"));
+    }
 
     /// Minimal ASCII85 encoder (no `z` shorthand) for building chain fixtures.
     fn ascii85_encode(data: &[u8]) -> Vec<u8> {

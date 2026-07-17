@@ -40,7 +40,13 @@ const MAGIC: &[u8; 8] = b"EXAVCAC\x01";
 ///
 /// v11: the `.idb` icon database was reimplemented with a different serialized
 /// layout (bucketed entries), invalidating older caches.
-const VERSION: u32 = 11;
+/// v12: added the loaded-container version/build-time (`db_version`) for the
+/// clamd-compatible daemon `VERSION` reply.
+/// v13: added the `.crb` Authenticode certificate block-list (raw sources).
+/// v16: streaming literal set excludes target/offset-constrained `.ndb` sigs
+/// (they over-matched unanchored in `stream_core`); a v15 cache would carry the
+/// stale, FP-prone set, so it must be rebuilt.
+const VERSION: u32 = 16;
 /// Fixed header: 8-byte magic + 4-byte little-endian version.
 const HEADER_LEN: u64 = 12;
 /// Trailing SHA-256 of the payload (integrity stamp).
@@ -108,6 +114,7 @@ fn write_payload<W: Write>(db: &Database, w: &mut W) -> io::Result<()> {
     enc(&db.ml_threshold, w)?;
     enc(&db.ftm, w)?;
     enc(&db.icons, w)?;
+    enc(&db.crb.sources(), w)?;
     enc(&db.passwords, w)?;
     // Phishing DB (`.pdb`/`.wdb`) — serialised feature-independently (empty tuple
     // when the `phishing` feature is off) so the cache layout doesn't fork on
@@ -120,6 +127,7 @@ fn write_payload<W: Write>(db: &Database, w: &mut W) -> io::Result<()> {
         let empty: crate::PhishingPartsOwned = Default::default();
         enc(&empty, w)?;
     }
+    enc(&db.db_version, w)?;
     Ok(())
 }
 
@@ -158,11 +166,13 @@ fn read_payload<R: Read>(mut r: R) -> io::Result<Database> {
     let ml_threshold = dec(&mut r)?;
     let ftm = dec(&mut r)?;
     let icons = dec(&mut r)?;
+    let crb_sources: Vec<String> = dec(&mut r)?;
     let passwords: Vec<String> = dec(&mut r)?;
     // Phishing DB parts (always present in the format; empty when built without
     // the `phishing` feature). Regexes are recompiled from the sources on load.
     #[cfg_attr(not(feature = "phishing"), allow(unused_variables))]
     let phishing_parts: crate::PhishingPartsOwned = dec(&mut r)?;
+    let db_version: Option<(u32, String)> = dec(&mut r)?;
     Ok(Database {
         patterns,
         engine,
@@ -178,7 +188,9 @@ fn read_payload<R: Read>(mut r: R) -> io::Result<Database> {
         ml_threshold,
         ftm,
         icons,
+        crb: crate::authenticode::CrbDb::from_sources(&crb_sources),
         passwords,
+        db_version,
         #[cfg(feature = "phishing")]
         phishing: crate::phishing::PhishingDb::from_cache_parts(phishing_parts),
     })

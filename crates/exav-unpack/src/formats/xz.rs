@@ -17,8 +17,9 @@ pub(crate) fn extract_xz<R>(
 }
 
 /// Decode all concatenated XZ streams using xz4rust's block-based API
-/// (pure Rust, no unsafe, zero runtime deps with no_unsafe + no sha256).
-fn decode_xz(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitHit> {
+/// (pure Rust, no unsafe, zero runtime deps with no_unsafe + no sha256). Shared
+/// with the ZIP path (method 95 = XZ) via [`super::zip`].
+pub(crate) fn decode_xz(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitHit> {
     let mut decoder = xz4rust::XzDecoder::with_alloc_dict_size(8192, 64 * 1024 * 1024);
     let mut out = Vec::new();
     let mut input_pos = 0;
@@ -61,7 +62,12 @@ fn decode_xz(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitHit> {
                 input_pos += feed;
             }
             Err(e) => {
-                return Err(LimitHit::new(format!("xz: {e}")));
+                // A malformed/undecodable xz stream is a *corruption*, not a
+                // resource limit. Marking it `corrupt` makes it an Unscannable
+                // signal that does NOT abort the enclosing container: a bad `.xz`
+                // member inside a tar must not stop the sibling members (which may
+                // carry the actual detection) from being scanned.
+                return Err(LimitHit::corrupt(format!("xz: {e}")));
             }
         }
     }

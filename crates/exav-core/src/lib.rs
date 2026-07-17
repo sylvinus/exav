@@ -38,6 +38,9 @@
 // ---- Stable public API surface -------------------------------------------
 // These modules are covered by semver. `filetype` is public because it is
 // returned by `Database::identify`.
+/// Authenticode (PE code-signing) triage without RSA — recompute the PE hash and
+/// compare it to the signature's embedded digest, and extract signer-cert fields.
+pub mod authenticode;
 pub mod cache;
 pub mod db;
 /// Opt-in structured-data (DLP) heuristics: credit-card / SSN counting, a
@@ -152,17 +155,30 @@ fn unpack_target(ft: FileType, data: &[u8], restrict: bool) -> Option<unpack::Fo
         }
         return Some(fmt);
     }
-    // UPX unpacking: ClamAV does this too (inside PE scanning), so it is not
-    // gated by `restrict`.
-    if ft.is_executable() && unpack::is_upx(data) {
-        return Some(unpack::Format::Upx);
+    // UPX unpacking. ClamAV's UPX unpacker is invoked only from its PE scan path;
+    // it never UPX-unpacks ELF or Mach-O. Under `restrict` (compat) we match that
+    // scope so exav's broader reach — e.g. UPX-packed Mirai ELFs, which exav
+    // decompresses and detects but ClamAV leaves packed and misses — isn't
+    // counted as a disagreement. PE-UPX stays on either way (ClamAV does it too).
+    if unpack::is_upx(data) {
+        let upx_in_scope = if restrict {
+            ft == FileType::Pe
+        } else {
+            ft.is_executable()
+        };
+        if upx_in_scope {
+            return Some(unpack::Format::Upx);
+        }
     }
-    // Other PE runtime packers (Petite/FSG/NsPack aPLib families are
-    // decompressed; other packers are detected only). Checked after UPX since a
-    // file is packed by at most one. ClamAV unpacks these inside PE scanning too,
-    // so it is not gated by `restrict`. Only meaningful for PE (the detector
-    // requires a PE image), but `is_executable` keeps it symmetric with UPX.
-    if ft.is_executable() && unpack::is_pepack(data) {
+    // Other PE runtime packers (Petite/FSG/NsPack/aPLib families are decompressed;
+    // other packers are detected only). Checked after UPX since a file is packed
+    // by at most one. Reproducing ClamAV's exact per-packer coverage isn't
+    // practical, so under `restrict` (compat) these are gated off entirely: compat
+    // deliberately trades reach for reproducibility (it is a differential-testing
+    // mode, not for production — see the crate/CLI docs). Full capability stays in
+    // normal mode. Only meaningful for PE (the detector requires a PE image), but
+    // `is_executable` keeps it symmetric with UPX.
+    if !restrict && ft.is_executable() && unpack::is_pepack(data) {
         return Some(unpack::Format::PePacked);
     }
     None
@@ -206,6 +222,12 @@ fn container_cltype(fmt: unpack::Format, data: &[u8]) -> Option<engine::ClType> 
 /// way keeps such sigs firing on real Office documents while staying off plain
 /// ZIPs. The marker is the conventional top-level part for each kind plus the
 /// OOXML `[Content_Types].xml` package descriptor.
+/// Bytes read from the front of a ZIP to detect its OOXML sub-type: the OOXML
+/// part names (`[Content_Types].xml`, `word/document.xml`, …) sit in the leading
+/// local file headers, so a bounded prefix reliably classifies real Office docs
+/// without buffering a large archive.
+const OOXML_DETECT_PREFIX: usize = 1 << 20;
+
 fn ooxml_subtype(data: &[u8]) -> Option<engine::ClType> {
     use engine::ClType;
     // Cheap necessary condition: every OOXML package carries this part.
@@ -444,17 +466,34 @@ pub struct ScanOptions {
     /// stream-scanned (pattern+hash); the skipped structural step is
     /// reported as a finding. Default 256 MiB.
     pub deep_analysis_max: u64,
-    /// Enable structural heuristics / fuzzy / ML analysis (archive
-    /// extraction is always performed regardless of this flag).
+    /// Enable exav's *exclusive* structural heuristics: TLSH fuzzy matching, the
+    /// static ML scorer (`Heuristics.ML.Suspect.*`), and the packed-with-injection
+    /// heuristic. These have no stock-ClamAV analog, so they stay off under
+    /// `--clamav-compat` (enabling them would count as false positives in a diff
+    /// run). Archive extraction is always performed regardless of this flag.
     pub heuristics: bool,
+    /// The heuristics stock ClamAV runs *by default* and that carry exact
+    /// ClamAV-compatible names: `Heuristics.PDF.ObfuscatedNameObject` and imphash
+    /// (`.imp`) matching. **On by default** — these are FP-safe (imphash is an
+    /// exact DB signature; the PDF check counts only gratuitous escapes), so exav
+    /// out of the box does every reasonable ClamAV-default match. Kept separate
+    /// from [`heuristics`](Self::heuristics) so this parity subset stays on under
+    /// `--clamav-compat` while the exav-exclusive TLSH/ML analysis (higher FP risk,
+    /// no ClamAV analog) does not. `--heuristics` is the superset and implies this.
+    pub clamav_heuristics: bool,
     /// Limits for recursive unpacking / bomb defenses.
     pub limits: unpack::Limits,
-    /// Restrict archive extraction to the set stock ClamAV has, i.e. skip the
-    /// extractors exav has that ClamAV lacks, so a differential run against
-    /// `clamscan` doesn't count exav's extra reach as a disagreement. In practice
-    /// this is only `ar` (Unix archive / `.deb` / `.a`) — verified against ClamAV
-    /// 1.6.0, which handles cpio/xar/UPX natively. Default off — exav extracts
-    /// `ar` too. (One of the two behaviours the CLI's `--clamav-compat` turns on.)
+    /// Restrict exav's unpacking reach to stock ClamAV's, so a differential run
+    /// against `clamscan` doesn't count exav's extra reach as a disagreement.
+    /// Narrows three things to ClamAV's scope: (1) archive extractors — skip `ar`
+    /// (Unix archive / `.deb` / `.a`) and `lzip`, which stock ClamAV lacks
+    /// (verified against 1.4.x, which handles cpio/xar natively); (2) UPX — to PE
+    /// only (ClamAV's UPX unpacker runs only from its PE path, never ELF/Mach-O);
+    /// (3) other PE runtime packers (Petite/FSG/NsPack/aPLib) — off entirely, as
+    /// their exact per-packer coverage can't be reproduced. Default off. This
+    /// deliberately *reduces* exav's detection capability for reproducibility, so
+    /// it is a diff-testing aid, **not for production** — it is one of the
+    /// behaviours the CLI's `--clamav-compat` turns on.
     pub restrict_extractors: bool,
     /// Append `.UNOFFICIAL` (and the `YARA.` prefix) to signature names that come
     /// from unofficial databases, matching stock `clamscan`'s output. Purely
@@ -502,6 +541,12 @@ pub struct ScanOptions {
     /// the real host behind userinfo, or points at an IP literal under a brand
     /// name. Off by default.
     pub alert_phishing: bool,
+    /// Opt-in Authenticode heuristic: report `Heuristics.Authenticode.HashMismatch`
+    /// when a code-signed PE's embedded digest does NOT cover the current file
+    /// bytes (i.e. the file was modified or had data appended after signing — a
+    /// classic trojanized-signed-binary trick). Triage only: exav does not verify
+    /// the RSA signature (see `authenticode`). Off by default.
+    pub alert_broken_authenticode: bool,
 }
 
 impl Default for ScanOptions {
@@ -510,6 +555,10 @@ impl Default for ScanOptions {
             max_scan_size: None,
             deep_analysis_max: 256 * 1024 * 1024,
             heuristics: false,
+            // ClamAV-default matchings (PDF obfuscation, imphash) are on out of the
+            // box — FP-safe and part of a faithful default scan. The exav-exclusive
+            // TLSH/ML heuristics above stay opt-in.
+            clamav_heuristics: true,
             limits: unpack::Limits::default(),
             restrict_extractors: false,
             unofficial_suffix: false,
@@ -521,6 +570,7 @@ impl Default for ScanOptions {
             alert_macros: false,
             alert_broken_media: false,
             alert_phishing: false,
+            alert_broken_authenticode: false,
         }
     }
 }
@@ -537,7 +587,10 @@ impl ScanOptions {
         Self {
             max_scan_size: Some(100 * 1024 * 1024),
             deep_analysis_max: 400 * 1024 * 1024,
+            // exav-exclusive TLSH/ML stay off (they'd be diff-run false positives);
+            // the ClamAV-default heuristics are on to match stock clamscan.
             heuristics: false,
+            clamav_heuristics: true,
             limits: unpack::Limits {
                 max_recursion: 17,
                 max_files: 10_000,
@@ -555,6 +608,7 @@ impl ScanOptions {
             alert_macros: false,
             alert_broken_media: false,
             alert_phishing: false,
+            alert_broken_authenticode: false,
         }
     }
 }
@@ -594,10 +648,18 @@ pub struct Database {
     /// `.idb` PE-icon perceptual-hash database, used to satisfy `IconGroup1/2`
     /// constraints on logical signatures (see [`icon`]).
     pub(crate) icons: icon::IconDb,
+    /// `.crb` Authenticode certificate block-list: a signed PE carrying a matching
+    /// signer certificate is reported (identity match, no RSA verification).
+    pub(crate) crb: authenticode::CrbDb,
     /// Passwords loaded from `.pwdb` files (ClamAV password database). Tried
     /// (unioned with [`ScanOptions::passwords`]) when decrypting encrypted
     /// archive members. The official CVDs ship none — this is user-supplied.
     pub(crate) passwords: Vec<String>,
+    /// Version number and build-time of the newest loaded `.cvd`/`.cld` container
+    /// (the one with the highest version — the daily set in a normal ClamAV DB
+    /// dir), for the clamd-compatible daemon `VERSION`/`VERSIONCOMMANDS` replies.
+    /// `None` when only loose signatures or the built-in baseline were loaded.
+    pub(crate) db_version: Option<(u32, String)>,
     /// `.pdb`/`.gdb` domain-list + `.wdb` allow-list, consulted by the opt-in
     /// phishing heuristic (`--alert-phishing`) for scoping / FP suppression.
     #[cfg(feature = "phishing")]
@@ -668,10 +730,20 @@ impl Database {
             ml_threshold: 0.85,
             ftm: filetype::FtmMagics::default(),
             icons: icon::IconDb::new(),
+            crb: authenticode::CrbDb::default(),
             passwords: Vec::new(),
+            db_version: None,
             #[cfg(feature = "phishing")]
             phishing: phishing::PhishingDb::default(),
         }
+    }
+
+    /// Version number and build-time of the newest loaded signature container
+    /// (the daily CVD in a normal ClamAV database dir), or `None` if only loose
+    /// files / the baseline were loaded. Feeds the clamd-compatible daemon
+    /// `VERSION` reply (its `/<dbver>/<dbtime>` fields, which `clamdtop` shows).
+    pub fn db_version(&self) -> Option<(u32, &str)> {
+        self.db_version.as_ref().map(|(v, t)| (*v, t.as_str()))
     }
 
     /// File type of `data`: content-based [`filetype::identify`], falling back to
@@ -858,6 +930,90 @@ pub fn scan_stream<R: Read>(db: &Database, reader: R) -> io::Result<ScanReport> 
     Ok(ScanReport::clean(Vec::new()))
 }
 
+thread_local! {
+    /// Stack of container-member names for the scan in progress (deepest last).
+    /// Pushed/popped by [`MatchPathGuard`] as the walk descends into members, so
+    /// that at any detection point the joined stack is the member's location.
+    static MATCH_PATH: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The member path of the first detection recorded during the current scan,
+    /// or `None` for a top-level (non-member) detection or a clean scan.
+    static MATCH_LOC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard: pushes a (sanitized) container-member name onto [`MATCH_PATH`]
+/// for the duration of that member's scan, popping it on drop. `let _mpg = …`
+/// keeps it alive for the enclosing block.
+struct MatchPathGuard;
+impl MatchPathGuard {
+    fn enter(name: &str) -> MatchPathGuard {
+        MATCH_PATH.with(|p| p.borrow_mut().push(sanitize_member_name(name)));
+        MatchPathGuard
+    }
+}
+impl Drop for MatchPathGuard {
+    fn drop(&mut self) {
+        MATCH_PATH.with(|p| {
+            p.borrow_mut().pop();
+        });
+    }
+}
+
+/// Record the current member path as the detection location, unless one is
+/// already recorded (first detection wins, matching first-match scan
+/// semantics). A no-op at top level (empty path) — a top-level detection has no
+/// member location.
+fn match_loc_record() {
+    MATCH_PATH.with(|p| {
+        let path = p.borrow();
+        if path.is_empty() {
+            return;
+        }
+        MATCH_LOC.with(|loc| {
+            let mut loc = loc.borrow_mut();
+            if loc.is_none() {
+                *loc = Some(path.join("/"));
+            }
+        });
+    });
+}
+
+/// Clear the per-scan location state at the start of a located scan.
+fn match_loc_reset() {
+    MATCH_PATH.with(|p| p.borrow_mut().clear());
+    MATCH_LOC.with(|loc| *loc.borrow_mut() = None);
+}
+
+/// Take the recorded detection location, leaving `None` behind.
+fn match_loc_take() -> Option<String> {
+    MATCH_LOC.with(|loc| loc.borrow_mut().take())
+}
+
+/// Sanitize a container-member name for a reported location: strip control
+/// characters and cap the length so a hostile archive can't inject terminal
+/// escapes or unbounded strings into the location field.
+fn sanitize_member_name(name: &str) -> String {
+    const MAX: usize = 200;
+    name.chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .take(MAX)
+        .collect()
+}
+
+/// As [`scan_seekable`], additionally returning the container-member path of the
+/// detection (e.g. `"inner.zip/evil.exe"`), or `None` for a top-level detection
+/// or a clean scan. Used by the daemon's location-aware `EXINSTREAM` reply.
+pub fn scan_seekable_located<R: Read + Seek>(
+    db: &Database,
+    reader: R,
+    size: u64,
+    opts: &ScanOptions,
+) -> io::Result<(ScanReport, Option<String>)> {
+    match_loc_reset();
+    let report = scan_seekable(db, reader, size, opts)?;
+    let loc = match_loc_take();
+    Ok((report, loc))
+}
+
 /// Scan a seekable input (a local file, or [`source::HttpRangeReader`]). A ZIP
 /// is read through the seekable reader, so only its central directory and the
 /// members actually scanned are touched, and scanning stops at the first
@@ -1036,7 +1192,9 @@ fn scan_buffered_member(
     container: Option<engine::ClType>,
     findings: &mut Vec<Finding>,
 ) -> MemberScan {
-    if let Some((sig, off, method, unofficial)) = scan_bytes_core(db, buf) {
+    // Pass the container context so `Container:CL_TYPE_*`-scoped signatures fire
+    // on members of the intended container (e.g. an OOXML Word document's parts).
+    if let Some((sig, off, method, unofficial)) = scan_bytes_member(db, buf, None, container) {
         let sig = report_name(&sig, unofficial, opts.unofficial_suffix);
         if !is_suppressed(db, buf, &sig) {
             return MemberScan::Infected(sig, off, method);
@@ -1083,11 +1241,36 @@ fn scan_stream_member(
     let mut buf = Vec::new();
     let mut head = reader.take(cap.saturating_add(1));
     if let Err(e) = head.read_to_end(&mut buf) {
-        return if unpack::is_budget_overflow(&e) {
-            MemberScan::Limits("member exceeds per-member decompression budget".to_string())
-        } else {
-            MemberScan::Unscannable(format!("member decode error: {e}"))
-        };
+        if unpack::is_budget_overflow(&e) {
+            return MemberScan::Limits(
+                "member exceeds per-member decompression budget".to_string(),
+            );
+        }
+        // A decode error still leaves the bytes decoded *before* the error in
+        // `buf` — `Read::read_to_end` appends them. Scan that salvaged prefix so
+        // malware in the recoverable part is caught (a truncated gzip/tar must
+        // not hide its payload — observed on real samples).
+        if !budget.should_verify_checksums() && !buf.is_empty() {
+            buf.truncate(cap as usize);
+            let scanned = scan_buffered_member(db, &buf, opts, budget, depth, container, findings);
+            // We scanned every byte the stream yielded. If it simply ran out of
+            // input (truncation — the missing tail is *absent*, not hidden), a
+            // clean result is a real Clean: exav scans for malware, it is not a
+            // file-integrity validator, so a damaged-but-payload-free file is not
+            // flagged. A mid-stream *corruption* (undecodable bytes still present)
+            // keeps the not-fully-scanned verdict on a clean salvage.
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return scanned;
+            }
+            return match scanned {
+                MemberScan::Clean => MemberScan::Unscannable(format!(
+                    "member decode error (salvaged {} B, no match): {e}",
+                    buf.len()
+                )),
+                other => other,
+            };
+        }
+        return MemberScan::Unscannable(format!("member decode error: {e}"));
     }
     if buf.len() as u64 <= cap {
         // Whole member in hand → full structural analysis on the bounded buffer.
@@ -1130,30 +1313,92 @@ fn scan_container_stream<R: Read + Seek>(
     let mut findings = vec![Finding::new("type", ft.as_str())];
     let mut budget = scan_budget(db, opts);
     let fmt = unpack_format(ft).unwrap_or(unpack::Format::Zip);
+    let mut reader = reader;
+
+    // Container `CL_TYPE_*` for `Container:`-scoped signatures, so each member
+    // inherits it. A ZIP is sub-typed as OOXML Word/Excel/PowerPoint by its part
+    // names; read a bounded prefix (the OOXML part names sit in the leading local
+    // file headers) and rewind, so streamed OOXML members are scanned with the
+    // right container context (e.g. `Container:CL_TYPE_OOXML_WORD` sigs fire).
+    let container = if fmt == unpack::Format::Zip && db.engine.has_ooxml_container_sigs() {
+        // Seek to the start FIRST: an earlier raw pass (`stream_core`) may have
+        // consumed the reader to EOF, so reading without rewinding yields nothing.
+        // Gated on the DB actually having `Container:CL_TYPE_OOXML_*` sigs: the
+        // probe reads a leading prefix, which over a range-fetched source (HTTP)
+        // would otherwise pull megabytes for a distinction nothing depends on.
+        let _ = reader.seek(std::io::SeekFrom::Start(0));
+        let mut prefix = vec![0u8; OOXML_DETECT_PREFIX];
+        let n = fill_prefix(&mut reader, &mut prefix).unwrap_or(0);
+        let _ = reader.seek(std::io::SeekFrom::Start(0));
+        container_cltype(fmt, &prefix[..n])
+    } else {
+        container_cltype(fmt, &[])
+    };
 
     if unpack::is_streamable(fmt) {
-        return scan_streamed_container(db, reader, opts, fmt, findings, &mut budget);
+        return scan_streamed_container(
+            db,
+            reader,
+            opts,
+            fmt,
+            ft,
+            container,
+            findings,
+            &mut budget,
+        );
     }
 
-    // ZIP and other Archive-walkable containers: seekable member walk. Members
-    // are still materialized one at a time by the Archive layer (ZIP member-body
-    // streaming is the next conversion), but the container is never buffered.
+    // Non-streamable Archive-walkable containers: seekable member walk. Members
+    // are still materialized one at a time by the Archive layer, but the container
+    // is never buffered.
     let encrypted_name = encrypted_heuristic_name(fmt);
+    // Container size for `.cdb` `ContainerSize` matching (seek to end, rewind).
+    let container_size = reader
+        .seek(std::io::SeekFrom::End(0))
+        .and_then(|n| reader.seek(std::io::SeekFrom::Start(0)).map(|_| n))
+        .unwrap_or(0);
     let mut archive = match unpack::Archive::open(reader) {
         Ok(a) => a,
         Err(h) => return report_for_hit(h, findings),
     };
     let mut unscannable: Option<String> = None;
     let mut password: Option<String> = None;
+    // `.cdb` member position, 1-based (ClamAV `FilePos` counts from 1).
+    let mut pos = 1u64;
     loop {
         let entry = match archive.extract_next(&mut budget) {
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(h) => return report_for_hit(h, findings),
         };
+        // Track this member on the location stack for the duration of its scan,
+        // so a detection inside it (or a nested member) reports the full path.
+        let _mpg = MatchPathGuard::enter(&entry.name);
+        // `.cdb` container-metadata match on the member's name/size/pos/encryption
+        // (matches even when the member body couldn't be decoded).
+        if !db.cdb.is_empty() {
+            let member = container::Member {
+                name: &entry.name,
+                size_in_container: entry.comp_size,
+                size_real: entry.data.len() as u64,
+                encrypted: entry.encrypted,
+                pos,
+            };
+            if let Some((sig, unofficial)) = db.cdb.matches(ft, container_size, &member) {
+                match_loc_record();
+                return ScanReport::infected(
+                    report_name(&sig, unofficial, opts.unofficial_suffix),
+                    0,
+                    Method::Hash,
+                    findings,
+                );
+            }
+        }
+        pos += 1;
         if let Some(r) = entry.unsupported {
             if entry.encrypted {
                 if opts.alert_encrypted {
+                    match_loc_record();
                     return ScanReport::infected(
                         encrypted_name.to_string(),
                         0,
@@ -1167,9 +1412,18 @@ fn scan_container_stream<R: Read + Seek>(
             }
             continue;
         }
-        match scan_buffered_member(db, &entry.data, opts, &mut budget, 1, None, &mut findings) {
+        match scan_buffered_member(
+            db,
+            &entry.data,
+            opts,
+            &mut budget,
+            1,
+            container,
+            &mut findings,
+        ) {
             MemberScan::Infected(sig, off, method) => {
-                return ScanReport::infected(sig, off, method, findings)
+                match_loc_record();
+                return ScanReport::infected(sig, off, method, findings);
             }
             MemberScan::Limits(r) => return ScanReport::limits(r, findings),
             MemberScan::Unscannable(r) => {
@@ -1192,33 +1446,73 @@ fn scan_container_stream<R: Read + Seek>(
 /// reader decoded on demand, scanned via [`scan_stream_member`] with no
 /// full-member buffer. The visitor returns `Some(())` to halt the walk on a
 /// terminal outcome (detection / limit), leaving the report in `terminal`.
+#[allow(clippy::too_many_arguments)]
 fn scan_streamed_container<R: Read + Seek>(
     db: &Database,
     reader: R,
     opts: &ScanOptions,
     fmt: unpack::Format,
+    ft: FileType,
+    container: Option<engine::ClType>,
     mut findings: Vec<Finding>,
     budget: &mut Budget,
 ) -> ScanReport {
     let encrypted_name = encrypted_heuristic_name(fmt);
+    // Container size for `.cdb` `ContainerSize` matching (seek to end, rewind).
+    let mut reader = reader;
+    let container_size = reader
+        .seek(std::io::SeekFrom::End(0))
+        .and_then(|n| reader.seek(std::io::SeekFrom::Start(0)).map(|_| n))
+        .unwrap_or(0);
     let mut unscannable: Option<String> = None;
     let mut password: Option<String> = None;
     let mut terminal: Option<ScanReport> = None;
+    // `.cdb` member position, 1-based (ClamAV `FilePos` counts from 1).
+    let mut pos = 1u64;
     let walk = {
         let findings = &mut findings;
         let unscannable = &mut unscannable;
         let password = &mut password;
         let terminal = &mut terminal;
+        let pos = &mut pos;
         let mut visit = |meta: &unpack::MemberMeta,
                          rdr: Option<&mut dyn Read>,
                          budget: &mut Budget|
          -> Option<()> {
+            // Track this member on the location stack for its scan (see
+            // [`MatchPathGuard`]) so a detection reports the member path.
+            let _mpg = MatchPathGuard::enter(&meta.name);
+            // `.cdb` container-metadata match on the member's name/size/pos/
+            // encryption (fires even when the body can't be decoded — the streamed
+            // path is how ZIP/OOXML members reach this, so filename sigs like
+            // `Archive.Filetype.*` are matched here).
+            if !db.cdb.is_empty() {
+                let member = container::Member {
+                    name: &meta.name,
+                    size_in_container: meta.comp_size,
+                    size_real: meta.comp_size,
+                    encrypted: meta.encrypted,
+                    pos: *pos,
+                };
+                if let Some((sig, unofficial)) = db.cdb.matches(ft, container_size, &member) {
+                    match_loc_record();
+                    *terminal = Some(ScanReport::infected(
+                        report_name(&sig, unofficial, opts.unofficial_suffix),
+                        0,
+                        Method::Hash,
+                        std::mem::take(findings),
+                    ));
+                    return Some(());
+                }
+            }
+            *pos += 1;
             if let Some(r) = meta.unsupported {
                 if meta.encrypted {
                     // Opt-in ClamAV heuristic (`--alert-encrypted`): an encrypted
                     // member is a detection under the flag; otherwise it surfaces
                     // as the actionable PasswordProtected verdict.
                     if opts.alert_encrypted {
+                        match_loc_record();
                         *terminal = Some(ScanReport::infected(
                             encrypted_name.to_string(),
                             0,
@@ -1234,8 +1528,9 @@ fn scan_streamed_container<R: Read + Seek>(
                 return None;
             }
             let rdr = rdr?;
-            match scan_stream_member(db, rdr, opts, budget, 1, None, findings) {
+            match scan_stream_member(db, rdr, opts, budget, 1, container, findings) {
                 MemberScan::Infected(sig, off, method) => {
+                    match_loc_record();
                     *terminal = Some(ScanReport::infected(
                         sig,
                         off,
@@ -1501,13 +1796,14 @@ fn collect_all(
         // from each and recursing. Streams one member at a time to bound memory.
         let container_size = data.len() as u64;
         let member_container = container_cltype(fmt, data);
-        let mut pos = 0u64;
+        let mut pos = 1u64;
         let _ = unpack::extract_each::<std::convert::Infallible>(
             fmt,
             data,
             budget,
             &mut |e: unpack::Entry, budget: &mut Budget| {
-                // `.cdb` `FilePos` is 0-based (first member = 0), matching ClamAV.
+                // `.cdb` `FilePos` counts members from 1, matching ClamAV (`pos`
+                // is seeded to 1). A sig with `FilePos:1` targets the first member.
                 let member_pos = pos;
                 pos += 1;
                 if !db.cdb.is_empty() {
@@ -1562,6 +1858,31 @@ fn collect_all(
                 break;
             }
             // Carved image inherits the container its host sits in.
+            collect_all(
+                db,
+                sub,
+                budget,
+                depth + 1,
+                out,
+                seen,
+                restrict_extractors,
+                unofficial_suffix,
+                container,
+            );
+        }
+
+        // Embedded archives appended to / stapled inside a carrier — same as the
+        // first-match path in `deep_analyze`, so `--allmatch` doesn't miss a
+        // detection in an appended ZIP/CAB/7z/RAR overlay. Validated by the
+        // unpacker's `detect` before recursing.
+        for off in pe::embedded_archive_offsets(data) {
+            let sub = &data[off..];
+            if unpack::detect(sub).is_none() {
+                continue;
+            }
+            if budget.charge_scan(sub.len() as u64).is_err() {
+                break;
+            }
             collect_all(
                 db,
                 sub,
@@ -1639,14 +1960,16 @@ fn deep_analyze_streamed(
         let unscannable = &mut unscannable;
         let password = &mut password;
         let terminal = &mut terminal;
-        let mut visit = |_meta: &unpack::MemberMeta,
+        let mut visit = |meta: &unpack::MemberMeta,
                          rdr: Option<&mut dyn Read>,
                          budget: &mut Budget|
          -> Option<()> {
             // A single-stream compressor never yields an undecodable member.
+            let _mpg = MatchPathGuard::enter(&meta.name);
             let rdr = rdr?;
             match scan_stream_member(db, rdr, opts, budget, depth + 1, container, findings) {
                 MemberScan::Infected(signature, offset, method) => {
+                    match_loc_record();
                     *terminal = Some(DeepOutcome::Infected {
                         signature,
                         offset,
@@ -1709,6 +2032,24 @@ fn deep_analyze(
         findings.push(Finding::new("type", ft.as_str()));
     }
 
+    // ClamAV `Heuristics.PDF.ObfuscatedNameObject`: a PDF whose name objects
+    // hex-escape plain alphanumerics (`/J#61vaScript`, `/Ope#6eAction`) to hide
+    // keywords from naive scanners. Structural and FP-safe (only gratuitous
+    // escapes count). A ClamAV default heuristic, so on by default via
+    // `clamav_heuristics` (`--heuristics` enables it too). Checked here (before the
+    // PDF is unpacked) so it applies to the raw document structure.
+    #[cfg(feature = "pdf")]
+    if (opts.clamav_heuristics || opts.heuristics)
+        && ft == FileType::Pdf
+        && unpack::has_obfuscated_name_object(data)
+    {
+        return DeepOutcome::Infected {
+            signature: "Heuristics.PDF.ObfuscatedNameObject".to_string(),
+            offset: 0,
+            method: Method::Heuristic,
+        };
+    }
+
     // Archives (and UPX-packed executables) are unpacked regardless of the
     // heuristics flag.
     if let Some(fmt) = unpack_target(ft, data, opts.restrict_extractors) {
@@ -1751,7 +2092,7 @@ fn deep_analyze(
         // container (computed once per container; a ZIP is sub-typed as OOXML
         // Word/Excel/PowerPoint when applicable).
         let member_container = container_cltype(fmt, data);
-        let mut pos = 0u64;
+        let mut pos = 1u64;
         // A member we recognised but couldn't decode is remembered here — it
         // must not be reported clean, but it also must not stop us scanning the
         // remaining members. Encrypted members are tracked separately so the
@@ -1762,9 +2103,13 @@ fn deep_analyze(
             unpack::extract_each(fmt, data, budget, &mut |e: unpack::Entry,
                                                           budget: &mut Budget|
              -> Option<DeepOutcome> {
+                // Track this member on the location stack for its scan (see
+                // [`MatchPathGuard`]); a detection here or in a nested member
+                // reports the full path.
+                let _mpg = MatchPathGuard::enter(&e.name);
                 // `.cdb` container-metadata signatures match on the member's
                 // name/size/encryption/position within this container. `FilePos`
-                // is 0-based (first member = 0), matching ClamAV.
+                // counts members from 1, matching ClamAV (`pos` seeded to 1).
                 let member_pos = pos;
                 pos += 1;
                 // The member's metadata (name/size/pos) is still valid even when
@@ -1778,6 +2123,7 @@ fn deep_analyze(
                         // `Heuristics.Encrypted.*`. A detection beats a limit, so
                         // return eagerly. Off by default → verdict untouched.
                         if opts.alert_encrypted {
+                            match_loc_record();
                             return Some(DeepOutcome::Infected {
                                 signature: encrypted_heuristic_name(fmt).to_string(),
                                 offset: 0,
@@ -1793,6 +2139,7 @@ fn deep_analyze(
                 // carrying a VBA project surfaces `vba_project*` artifacts from the
                 // OLE extractor — their presence means the document has macros.
                 if opts.alert_macros && container_is_ole && is_vba_member(&e.name) {
+                    match_loc_record();
                     return Some(DeepOutcome::Infected {
                         signature: "Heuristics.OLE2.ContainsMacros".to_string(),
                         offset: 0,
@@ -1810,6 +2157,7 @@ fn deep_analyze(
                     if let Some((sig, unofficial)) =
                         profile::timed("cdb", 0, || db.cdb.matches(ft, container_size, &member))
                     {
+                        match_loc_record();
                         return Some(DeepOutcome::Infected {
                             signature: report_name(&sig, unofficial, opts.unofficial_suffix),
                             offset: 0,
@@ -1832,6 +2180,7 @@ fn deep_analyze(
                     scan_bytes_member(db, &e.data, None, member_container)
                 };
                 if let Some((sig, off, m, unofficial)) = hit {
+                    match_loc_record();
                     return Some(DeepOutcome::Infected {
                         signature: report_name(&sig, unofficial, opts.unofficial_suffix),
                         offset: off,
@@ -1914,6 +2263,26 @@ fn deep_analyze(
                 other => return other,
             }
         }
+
+        // Embedded archives: a ZIP/CAB/7z/RAR/GZIP/XZ appended to or stapled
+        // inside a carrier (droppers, SFX stubs, PE overlays). The offset-0 scan
+        // never types these, so carve each candidate whose magic is confirmed by
+        // the unpacker's own `detect` (skips coincidental byte-runs) and recurse
+        // to extract it. carve=false on recursion: the archive's own members are
+        // handled by extraction, not by re-carving overlapping regions.
+        for off in pe::embedded_archive_offsets(data) {
+            let sub = &data[off..];
+            if unpack::detect(sub).is_none() {
+                continue;
+            }
+            if let Err(h) = budget.charge_scan(sub.len() as u64) {
+                return DeepOutcome::Limits(h.reason);
+            }
+            match deep_analyze(db, sub, opts, budget, depth + 1, container, false, findings) {
+                DeepOutcome::Clean => {}
+                other => return other,
+            }
+        }
     }
 
     // DLP structured-data heuristic (opt-in, ClamAV `--structured-*-count`): count
@@ -1936,40 +2305,59 @@ fn deep_analyze(
         return o;
     }
 
-    if !opts.heuristics {
+    // Authenticode inspection (independent of `--heuristics`, like phishing/DLP).
+    // One PE parse serves both checks:
+    //   * `.crb` certificate block-list — a signed PE carrying a blocked signer
+    //     cert is reported (always on when a `.crb` DB is loaded);
+    //   * opt-in `alert_broken_authenticode` — the embedded digest does not cover
+    //     the file (tampered with / appended-to after signing).
+    if opts.alert_broken_authenticode || !db.crb.is_empty() {
+        if let Some(sig) = authenticode::analyze_pe(data) {
+            for cert in &sig.certs {
+                if let Some(name) = db.crb.blocked(cert) {
+                    return DeepOutcome::Infected {
+                        signature: name.to_string(),
+                        offset: 0,
+                        method: Method::Hash,
+                    };
+                }
+            }
+            if opts.alert_broken_authenticode && !sig.digest_matches {
+                return DeepOutcome::Infected {
+                    signature: "Heuristics.Authenticode.HashMismatch".to_string(),
+                    offset: 0,
+                    method: Method::Heuristic,
+                };
+            }
+        }
+    }
+
+    // Nothing below fires unless at least the ClamAV-default heuristics are on
+    // (on by default; `--heuristics` is the superset and also enables them).
+    if !opts.clamav_heuristics && !opts.heuristics {
         return DeepOutcome::Clean;
     }
 
-    if let Some(hit) = profile::timed("fuzzy", data.len() as u64, || db.fuzzy.match_tlsh(data)) {
-        return DeepOutcome::Infected {
-            signature: hit,
-            offset: 0,
-            method: Method::Fuzzy,
-        };
+    // TLSH fuzzy matching is exav-exclusive (ClamAV has no TLSH), so it stays
+    // behind the full `--heuristics` flag and off under `--clamav-compat`.
+    if opts.heuristics {
+        if let Some(hit) = profile::timed("fuzzy", data.len() as u64, || db.fuzzy.match_tlsh(data))
+        {
+            return DeepOutcome::Infected {
+                signature: hit,
+                offset: 0,
+                method: Method::Fuzzy,
+            };
+        }
     }
 
     if ft == FileType::Pe {
         if let Some(info) = pe::analyze(data) {
-            if depth == 0 {
-                findings.push(Finding::new(
-                    "imphash",
-                    if info.imphash.is_empty() {
-                        "-".into()
-                    } else {
-                        info.imphash.clone()
-                    },
-                ));
-                findings.push(Finding::new(
-                    "max-section-entropy",
-                    format!("{:.2}", info.max_entropy),
-                ));
-                if !info.suspicious_imports.is_empty() {
-                    findings.push(Finding::new(
-                        "suspicious-imports",
-                        info.suspicious_imports.join(", "),
-                    ));
-                }
-            }
+            // imphash (`.imp`) matching is a ClamAV default — matched whenever the
+            // loaded DB carries `.imp` sigs — so it runs under `clamav_heuristics`
+            // (i.e. under `--clamav-compat` too). The exav-exclusive ML scorer,
+            // packed-injection heuristic, and the `-v` diagnostic findings below
+            // stay behind the full `--heuristics` flag.
             if let Some(hit) = db
                 .fuzzy
                 .match_imphash(&info.imphash, info.import_count as u64)
@@ -1980,28 +2368,50 @@ fn deep_analyze(
                     method: Method::Fuzzy,
                 };
             }
-            let score = profile::timed("ml", data.len() as u64, || {
-                db.model.score(&ml::extract(data, Some(&info)))
-            });
-            if depth == 0 {
-                findings.push(Finding::new(
-                    "ml-score",
-                    format!("{score:.2} ({})", db.model.name()),
-                ));
-            }
-            if score >= db.ml_threshold {
-                return DeepOutcome::Infected {
-                    signature: format!("Heuristics.ML.Suspect.{:.0}", score * 100.0),
-                    offset: 0,
-                    method: Method::Ml,
-                };
-            }
-            if info.looks_packed() && info.suspicious_imports.len() >= 2 {
-                return DeepOutcome::Infected {
-                    signature: "Heuristics.PE.PackedWithInjectionImports".to_string(),
-                    offset: 0,
-                    method: Method::Heuristic,
-                };
+            if opts.heuristics {
+                if depth == 0 {
+                    findings.push(Finding::new(
+                        "imphash",
+                        if info.imphash.is_empty() {
+                            "-".into()
+                        } else {
+                            info.imphash.clone()
+                        },
+                    ));
+                    findings.push(Finding::new(
+                        "max-section-entropy",
+                        format!("{:.2}", info.max_entropy),
+                    ));
+                    if !info.suspicious_imports.is_empty() {
+                        findings.push(Finding::new(
+                            "suspicious-imports",
+                            info.suspicious_imports.join(", "),
+                        ));
+                    }
+                }
+                let score = profile::timed("ml", data.len() as u64, || {
+                    db.model.score(&ml::extract(data, Some(&info)))
+                });
+                if depth == 0 {
+                    findings.push(Finding::new(
+                        "ml-score",
+                        format!("{score:.2} ({})", db.model.name()),
+                    ));
+                }
+                if score >= db.ml_threshold {
+                    return DeepOutcome::Infected {
+                        signature: format!("Heuristics.ML.Suspect.{:.0}", score * 100.0),
+                        offset: 0,
+                        method: Method::Ml,
+                    };
+                }
+                if info.looks_packed() && info.suspicious_imports.len() >= 2 {
+                    return DeepOutcome::Infected {
+                        signature: "Heuristics.PE.PackedWithInjectionImports".to_string(),
+                        offset: 0,
+                        method: Method::Heuristic,
+                    };
+                }
             }
         }
     }
@@ -2365,11 +2775,11 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn restrict_extractors_gates_only_ar() {
+    fn restrict_extractors_gates_absent_formats() {
         // Of exav's extractors, `ar` and `lzip` are absent from stock ClamAV;
-        // cpio/xar/UPX are supported by both, so the compat mask gates the
-        // absent formats alone — gating cpio/xar/upx would make exav miss
-        // detections ClamAV makes.
+        // cpio/xar are supported by both, so the compat mask gates the absent
+        // formats alone — gating cpio/xar would make exav miss detections
+        // ClamAV makes.
         // `ar` — restricted only when `restrict` is set.
         assert_eq!(
             unpack_target(FileType::Ar, b"", false),
@@ -2386,6 +2796,45 @@ mod tests {
                 unpack_target(ft, b"", true),
                 Some(fmt),
                 "{ft:?} must not be gated"
+            );
+        }
+    }
+
+    /// A minimal buffer whose UPX `PackHeader` passes `find_packheader` (so
+    /// `is_upx` is true), without needing a real compressed payload.
+    #[cfg(feature = "upx")]
+    fn fake_upx() -> Vec<u8> {
+        let mut b = vec![0u8; 40];
+        b[4..8].copy_from_slice(b"UPX!"); // magic (l_info starts at 0)
+        b[16..20].copy_from_slice(&100u32.to_le_bytes()); // filesize
+        b[24..28].copy_from_slice(&8u32.to_le_bytes()); // first block sz_unc
+        b[28..32].copy_from_slice(&4u32.to_le_bytes()); // first block sz_cpr (fits: 36+4=40)
+        b
+    }
+
+    /// Compat restricts UPX unpacking to PE — ClamAV's UPX unpacker runs only
+    /// from its PE path, so exav's ELF/Mach-O UPX reach (e.g. UPX-packed Mirai
+    /// ELFs) must be gated off under `restrict` to stay apples-to-apples.
+    #[cfg(feature = "upx")]
+    #[test]
+    fn restrict_scopes_upx_to_pe() {
+        let buf = fake_upx();
+        assert!(unpack::is_upx(&buf), "test buffer must look like UPX");
+        // Normal mode: UPX unpacked for every executable type.
+        for ft in [FileType::Pe, FileType::Elf, FileType::MachO] {
+            assert_eq!(unpack_target(ft, &buf, false), Some(unpack::Format::Upx));
+        }
+        // Compat: PE stays on, ELF/Mach-O are gated off.
+        assert_eq!(
+            unpack_target(FileType::Pe, &buf, true),
+            Some(unpack::Format::Upx),
+            "PE-UPX must stay on under compat (ClamAV does it too)"
+        );
+        for ft in [FileType::Elf, FileType::MachO] {
+            assert_eq!(
+                unpack_target(ft, &buf, true),
+                None,
+                "{ft:?}-UPX must be gated off under compat"
             );
         }
     }

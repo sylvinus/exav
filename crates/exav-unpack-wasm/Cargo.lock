@@ -213,9 +213,9 @@ dependencies = [
 
 [[package]]
 name = "delharc"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c93ba2617f5094875af777b3e1e5d66e79d7c832e4ae2e25722c965a482e5a1"
+checksum = "3658b90877f637514897c3dcbd628e0d290bcc7fee551a398b3994ebdc62d51e"
 dependencies = [
  "bitflags",
  "chrono",

@@ -184,3 +184,6 @@ ppmd-rust = "1"
 sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
 # Used only in tests to build CAB fixtures for roundtrip testing.
 cab = "0.6.0"
+# Used only in tests to prove the strict CFB reader rejects a malformed
+# compound file that exav's lenient OLE fallback still recovers.
+cfb = "0.14.0"

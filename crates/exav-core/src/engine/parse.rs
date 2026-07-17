@@ -227,7 +227,7 @@ pub(super) fn compile_wide(body: &str, allow_internal: bool) -> Option<(Vec<Elem
         | Prefix::Floating { anchor_idx }
         | Prefix::Internal { anchor_idx } => anchor_idx,
     };
-    let anchor = match &elems[anchor_idx] {
+    let anchor = match &elems[anchor_idx as usize] {
         Elem::Bytes(b) => b.clone(),
         _ => return None,
     };
@@ -283,7 +283,7 @@ pub(super) fn compile_body(hex: &str, allow_internal: bool) -> Option<(Vec<Elem>
         | Prefix::Floating { anchor_idx }
         | Prefix::Internal { anchor_idx } => anchor_idx,
     };
-    let anchor = match &elems[anchor_idx] {
+    let anchor = match &elems[anchor_idx as usize] {
         Elem::Bytes(b) => b.clone(),
         _ => return None,
     };
@@ -486,8 +486,8 @@ pub(super) fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix
                         score,
                         b.len(),
                         Prefix::Fixed {
-                            anchor_idx: i,
-                            len: fixed,
+                            anchor_idx: i as u32,
+                            len: fixed as u32,
                         },
                     ));
                 }
@@ -516,7 +516,7 @@ pub(super) fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix
                     return Some(Prefix::Floating { anchor_idx: 1 });
                 }
                 if idx > 0 {
-                    return Some(Prefix::Internal { anchor_idx: idx });
+                    return Some(Prefix::Internal { anchor_idx: idx as u32 });
                 }
             }
         }
@@ -544,34 +544,35 @@ pub(super) fn parse_offset(s: &str) -> Option<Offset> {
         Some((a, b)) => (a.trim(), b.trim().parse().unwrap_or(0)),
         None => (s, 0),
     };
+    let boxed = |k: OffsetKind| Offset::Constrained(Box::new(k));
     if let Some(rest) = spec.strip_prefix("EOF-") {
-        Some(Offset::Eof {
+        Some(boxed(OffsetKind::Eof {
             n: rest.trim().parse().ok()?,
             shift,
-        })
+        }))
     } else if let Some(rest) = spec.strip_prefix("EP") {
-        Some(Offset::Ep {
+        Some(boxed(OffsetKind::Ep {
             delta: parse_delta(rest)?,
             shift,
-        })
+        }))
     } else if let Some(rest) = spec.strip_prefix('S') {
         if let Some(d) = rest.strip_prefix('L') {
-            Some(Offset::SecLast {
+            Some(boxed(OffsetKind::SecLast {
                 delta: parse_delta(d)?,
                 shift,
-            })
+            }))
         } else {
             // S<idx>[+/-delta]
             let cut = rest.find(['+', '-']).unwrap_or(rest.len());
             let idx: usize = rest[..cut].parse().ok()?;
-            Some(Offset::Sec {
+            Some(boxed(OffsetKind::Sec {
                 idx,
                 delta: parse_delta(&rest[cut..])?,
                 shift,
-            })
+            }))
         }
     } else if let Ok(n) = spec.parse::<u64>() {
-        Some(Offset::Abs { n, shift })
+        Some(boxed(OffsetKind::Abs { n, shift }))
     } else {
         // VI, SEx, and other offset kinds are not yet supported.
         None
@@ -600,10 +601,10 @@ pub(super) fn is_pua(name: &str) -> bool {
 /// (1.4.x ⇒ 213), so we load exactly the sigs ClamAV would — skipping ones meant
 /// for a newer engine (features we may lack) and, importantly, *deprecated* ones
 /// (`max < 213`) that ClamAV no longer runs, which would otherwise false-positive.
-pub(super) const EXAV_FLEVEL: u32 = 213;
+pub(crate) const EXAV_FLEVEL: u32 = 213;
 
 /// Whether `EXAV_FLEVEL` falls within a sig's `[min, max]` engine window.
-pub(super) fn flevel_ok(min: u32, max: u32) -> bool {
+pub(crate) fn flevel_ok(min: u32, max: u32) -> bool {
     EXAV_FLEVEL >= min && EXAV_FLEVEL <= max
 }
 

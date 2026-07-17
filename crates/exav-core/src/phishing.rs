@@ -66,9 +66,11 @@ impl PhishingDb {
                         }
                     } else if let Some(rest) = line.strip_prefix("X:") {
                         if let Some((real, disp)) = rest.split_once(':') {
-                            if let (Ok(re), Ok(rd)) = (compile_pattern(real), compile_pattern(disp)) {
+                            if let (Ok(re), Ok(rd)) = (compile_pattern(real), compile_pattern(disp))
+                            {
                                 self.allow_regex.push((re, rd));
-                                self.allow_regex_src.push((real.to_string(), disp.to_string()));
+                                self.allow_regex_src
+                                    .push((real.to_string(), disp.to_string()));
                             }
                         }
                     }
@@ -102,7 +104,12 @@ impl PhishingDb {
                 kept.push((real, disp));
             }
         }
-        PhishingDb { protected: protected.into_iter().collect(), allow_hosts, allow_regex_src: kept, allow_regex }
+        PhishingDb {
+            protected: protected.into_iter().collect(),
+            allow_hosts,
+            allow_regex_src: kept,
+            allow_regex,
+        }
     }
 
     /// A `.pdb` domain-list is loaded → scope the spoof check to its brands.
@@ -234,13 +241,18 @@ fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
 /// Value of the `href="…"` attribute in an anchor region.
 fn extract_href(region: &str, region_lc: &str) -> Option<String> {
     let at = region_lc.find("href")?;
-    let after = region[at + 4..].trim_start().strip_prefix('=')?.trim_start();
+    let after = region[at + 4..]
+        .trim_start()
+        .strip_prefix('=')?
+        .trim_start();
     let val = if let Some(rest) = after.strip_prefix('"') {
         rest.split('"').next()?
     } else if let Some(rest) = after.strip_prefix('\'') {
         rest.split('\'').next()?
     } else {
-        after.split(|c: char| c.is_whitespace() || c == '>').next()?
+        after
+            .split(|c: char| c.is_whitespace() || c == '>')
+            .next()?
     };
     Some(val.trim().to_string())
 }
@@ -278,7 +290,10 @@ fn split_host(url: &str) -> Option<(Option<&str>, &str)> {
         None => (None, authority),
     };
     let host = match hostport.rfind(':') {
-        Some(c) if !hostport[c + 1..].is_empty() && hostport[c + 1..].bytes().all(|b| b.is_ascii_digit()) => {
+        Some(c)
+            if !hostport[c + 1..].is_empty()
+                && hostport[c + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
             &hostport[..c]
         }
         _ => hostport,
@@ -305,11 +320,20 @@ fn display_host(display: &str) -> Option<String> {
             return Some(h.to_ascii_lowercase());
         }
     }
-    let token = d.split_whitespace().next().unwrap_or("").trim_start_matches("www.");
+    let token = d
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches("www.");
     if token.contains('.')
-        && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
         && token.split('.').count() >= 2
-        && token.rsplit('.').next().is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
+        && token
+            .rsplit('.')
+            .next()
+            .is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
     {
         return Some(token.to_ascii_lowercase());
     }
@@ -332,7 +356,10 @@ fn is_ipv4(host: &str) -> bool {
     let p: Vec<&str> = host.split('.').collect();
     p.len() == 4
         && p.iter().all(|s| {
-            !s.is_empty() && s.len() <= 3 && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+            !s.is_empty()
+                && s.len() <= 3
+                && s.bytes().all(|b| b.is_ascii_digit())
+                && s.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
         })
 }
 
@@ -375,10 +402,22 @@ mod tests {
 
     #[test]
     fn benign_no_hits() {
-        assert_eq!(scan0(br#"<a href="http://example.com/page">example.com</a>"#), None);
-        assert_eq!(scan0(br#"<a href="http://login.example.com/">www.example.com</a>"#), None);
-        assert_eq!(scan0(br#"<a href="http://bob@example.com/">example.com</a>"#), None);
-        assert_eq!(scan0(br#"<a href="http://track.example.net/abc">Click here</a>"#), None);
+        assert_eq!(
+            scan0(br#"<a href="http://example.com/page">example.com</a>"#),
+            None
+        );
+        assert_eq!(
+            scan0(br#"<a href="http://login.example.com/">www.example.com</a>"#),
+            None
+        );
+        assert_eq!(
+            scan0(br#"<a href="http://bob@example.com/">example.com</a>"#),
+            None
+        );
+        assert_eq!(
+            scan0(br#"<a href="http://track.example.net/abc">Click here</a>"#),
+            None
+        );
     }
 
     #[test]
@@ -395,16 +434,25 @@ mod tests {
         let mut db = PhishingDb::default();
         db.add_text("wdb", "M:info.searscard.com:sears.com\n");
         let html = br#"<a href="http://info.searscard.com/x">sears.com</a>"#;
-        assert_eq!(scan(html, &PhishingDb::default()), Some(Phish::SpoofedDomain));
+        assert_eq!(
+            scan(html, &PhishingDb::default()),
+            Some(Phish::SpoofedDomain)
+        );
         assert_eq!(scan(html, &db), None);
     }
 
     #[test]
     fn wdb_x_regex_suppresses_spoof() {
         let mut db = PhishingDb::default();
-        db.add_text("wdb", "X:.+\\.etradefinancial\\.com([/?].*)?:(.+\\.)?etrade\\.com([/?].*)?\n");
+        db.add_text(
+            "wdb",
+            "X:.+\\.etradefinancial\\.com([/?].*)?:(.+\\.)?etrade\\.com([/?].*)?\n",
+        );
         let html = br#"<a href="http://email.etradefinancial.com/login">www.etrade.com</a>"#;
-        assert_eq!(scan(html, &PhishingDb::default()), Some(Phish::SpoofedDomain));
+        assert_eq!(
+            scan(html, &PhishingDb::default()),
+            Some(Phish::SpoofedDomain)
+        );
         assert_eq!(scan(html, &db), None);
     }
 
@@ -416,7 +464,10 @@ mod tests {
         let miss = br#"<a href="http://evil.example/login">www.example.org</a>"#;
         assert_eq!(scan(hit, &db), Some(Phish::SpoofedDomain));
         assert_eq!(scan(miss, &db), None);
-        assert_eq!(scan(miss, &PhishingDb::default()), Some(Phish::SpoofedDomain));
+        assert_eq!(
+            scan(miss, &PhishingDb::default()),
+            Some(Phish::SpoofedDomain)
+        );
     }
 
     #[test]

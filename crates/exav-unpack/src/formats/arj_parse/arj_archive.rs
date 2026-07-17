@@ -96,7 +96,7 @@ fn read_extended_headers(data: &[u8], pos: &mut usize) -> bool {
 pub struct ArjArchive {
     data: Vec<u8>,
     pos: usize,
-    password: Option<String>,
+    passwords: Vec<String>,
 }
 
 impl ArjArchive {
@@ -112,12 +112,13 @@ impl ArjArchive {
         Some(Self {
             data,
             pos,
-            password: None,
+            passwords: Vec::new(),
         })
     }
 
-    pub fn set_password(&mut self, password: &str) {
-        self.password = Some(password.to_string());
+    /// Candidate passwords tried against garbled (encrypted) members.
+    pub fn set_passwords(&mut self, passwords: &[String]) {
+        self.passwords = passwords.to_vec();
     }
 
     pub fn get_encryption_type(&self) -> Option<ArjEncryption> {
@@ -148,33 +149,42 @@ impl ArjArchive {
     }
 
     pub fn read(&mut self, header: &LocalFileHeader, verify_checksum: bool) -> Option<Vec<u8>> {
-        if header.is_garbled() && self.password.is_none() {
+        let end = self.pos + header.compressed_size as usize;
+        if end > self.data.len() {
             self.skip(header);
             return None;
         }
-
-        let end = self.pos + header.compressed_size as usize;
-        if end > self.data.len() {
-            return None;
-        }
-        let mut compressed_buffer = self.data[self.pos..end].to_vec();
+        let raw = self.data[self.pos..end].to_vec();
         self.pos = end;
 
         if header.is_garbled() {
-            if let Some(ref password) = self.password {
-                let ftime: u32 = header.date_time_modified.into();
-                decrypt_arj_data(
-                    &mut compressed_buffer,
-                    self.get_encryption_type(),
-                    password,
-                    header.password_modifier,
-                    ftime,
-                );
+            // Garbled (encrypted) member: try each candidate password. The content
+            // CRC-32 is the only reliable password check for garbled data, so it
+            // is enforced here even when checksum verification is otherwise off —
+            // otherwise a wrong password could yield right-sized garbage. Returns
+            // `None` (→ surfaced as an encrypted member) when no password works.
+            let enc = self.get_encryption_type();
+            let ftime: u32 = header.date_time_modified.into();
+            for pw in &self.passwords {
+                let mut buf = raw.clone();
+                decrypt_arj_data(&mut buf, enc, pw, header.password_modifier, ftime);
+                if let Some(out) = self.decompress_chunk(
+                    &buf,
+                    header.original_size as usize,
+                    &header.compression_method,
+                ) {
+                    if out.len() == header.original_size as usize
+                        && crc32fast::hash(&out) == header.original_crc32
+                    {
+                        return Some(out);
+                    }
+                }
             }
+            return None;
         }
 
         let uncompressed = self.decompress_chunk(
-            &compressed_buffer,
+            &raw,
             header.original_size as usize,
             &header.compression_method,
         )?;

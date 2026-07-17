@@ -147,7 +147,10 @@ mod tests {
     #[test]
     fn extracts_single_object() {
         let payload = b"MALWARETEST-inside-rtf-object";
-        let rtf = format!("{{\\rtf1\\ansi {{\\object\\objemb{{\\objdata {}}}}}}}", hex(payload));
+        let rtf = format!(
+            "{{\\rtf1\\ansi {{\\object\\objemb{{\\objdata {}}}}}}}",
+            hex(payload)
+        );
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
@@ -202,9 +205,13 @@ mod tests {
     #[test]
     fn empty_and_nonrtf() {
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Rtf, b"{\\rtf1{\\object{\\objdata }}}", &mut budget)
+        assert!(
+            extract(Format::Rtf, b"{\\rtf1{\\object{\\objdata }}}", &mut budget)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(extract(Format::Rtf, b"not rtf", &mut budget)
             .unwrap()
             .is_empty());
-        assert!(extract(Format::Rtf, b"not rtf", &mut budget).unwrap().is_empty());
     }
 }

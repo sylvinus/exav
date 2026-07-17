@@ -17,7 +17,22 @@ fn parse_object_depth(lex: &mut Lexer, depth: usize) -> Option<Primitive> {
         Token::Null => Some(Primitive::Null),
         Token::True => Some(Primitive::Boolean(true)),
         Token::False => Some(Primitive::Boolean(false)),
-        Token::Integer(n) => Some(Primitive::Integer(n)),
+        Token::Integer(n) => {
+            // An integer may begin an indirect reference `n g R` (e.g. a dict
+            // value like `/Root 1 0 R`). Consume the `g R` so the enclosing dict
+            // or array stays token-aligned — otherwise the dangling `g R` derails
+            // the rest of the parse (this dropped the trailer's `/ID`, breaking
+            // encrypted-PDF key derivation). The reference target isn't resolved
+            // here, so it surfaces as the leading integer.
+            let saved = lex.pos();
+            if let Token::Integer(_gen) = lex.next_token() {
+                if let Token::R = lex.next_token() {
+                    return Some(Primitive::Reference(n as u32));
+                }
+            }
+            lex.set_pos(saved);
+            Some(Primitive::Integer(n))
+        }
         Token::Real(_) => Some(Primitive::Real),
         Token::Name(n) => Some(Primitive::Name(n)),
         Token::String(s) => Some(Primitive::String(s)),

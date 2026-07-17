@@ -32,6 +32,8 @@ mod lha;
 mod lzip;
 #[cfg(feature = "ole")]
 mod ole;
+#[cfg(all(feature = "ole", feature = "decrypt"))]
+mod ole_crypto;
 #[cfg(feature = "pdf")]
 mod pdf;
 #[cfg(feature = "pdf")]
@@ -159,6 +161,7 @@ pub(crate) use onenote::{extract_onenote, is_onenote};
 pub(crate) use partition::{extract_partition, is_partition};
 #[cfg(feature = "pdf")]
 pub(crate) use pdf::extract_pdf;
+pub use pdf::has_obfuscated_name_object;
 #[cfg(feature = "pepack")]
 pub(crate) use pepack::{extract_pepack, is_pepack};
 #[cfg(feature = "pyc")]

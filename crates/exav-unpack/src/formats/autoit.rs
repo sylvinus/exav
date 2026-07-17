@@ -65,7 +65,12 @@ pub(crate) fn extract_autoit<R>(
     if let Some(off) = find_marker(data, MARKER_EA06) {
         budget.count_entry()?;
         let size = (data.len() - (off + 8).min(data.len())) as u64;
-        let e = Entry::unsupported("autoit-ea06".to_string(), size, false, "AutoIt EA06 unsupported");
+        let e = Entry::unsupported(
+            "autoit-ea06".to_string(),
+            size,
+            false,
+            "AutoIt EA06 unsupported",
+        );
         return Ok(visit(e, budget));
     }
     Ok(None)
@@ -77,7 +82,9 @@ fn ea05<R>(body: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>
         return Ok(None);
     }
     // The first 16 bytes are summed into the content-decrypt checksum.
-    let checksum: u32 = body[..16].iter().fold(0u32, |a, &b| a.wrapping_add(b as u32));
+    let checksum: u32 = body[..16]
+        .iter()
+        .fold(0u32, |a, &b| a.wrapping_add(b as u32));
 
     let mut pos = 16usize;
     let mut emitted = 0u32;
@@ -244,7 +251,11 @@ struct Bits<'a> {
 
 impl<'a> Bits<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Bits { data, bit: 0, err: false }
+        Bits {
+            data,
+            bit: 0,
+            err: false,
+        }
     }
     fn get(&mut self, n: u32) -> u32 {
         let mut v = 0u32;
@@ -265,7 +276,13 @@ impl<'a> Bits<'a> {
 /// Read an EA05 match length via the variable-length ladder (min 3).
 fn read_match_len(bits: &mut Bits) -> usize {
     // (base, bits, sentinel)
-    const LADDER: &[(usize, u32, u32)] = &[(3, 2, 0b11), (6, 3, 0b111), (13, 5, 0b11111), (44, 8, 255), (299, 8, 255)];
+    const LADDER: &[(usize, u32, u32)] = &[
+        (3, 2, 0b11),
+        (6, 3, 0b111),
+        (13, 5, 0b11111),
+        (44, 8, 255),
+        (299, 8, 255),
+    ];
     let mut base = 3usize;
     let mut nbits = 2u32;
     let mut sentinel = 0b11u32;
@@ -340,13 +357,19 @@ mod tests {
         d.extend_from_slice(MARKER_EA05);
         d.extend_from_slice(&[0u8; 16]); // checksum region
         d.extend_from_slice(&mt_apply(b"FILE", KEY_FILE_TAG)); // tag
-        // subtype string
+                                                               // subtype string
         d.extend_from_slice(&((subtype.len() as u32) ^ KEY_SUBTYPE_LEN).to_le_bytes());
-        d.extend_from_slice(&mt_apply(subtype, (subtype.len() as u32).wrapping_add(KEY_SUBTYPE_DATA)));
+        d.extend_from_slice(&mt_apply(
+            subtype,
+            (subtype.len() as u32).wrapping_add(KEY_SUBTYPE_DATA),
+        ));
         // name string ("x")
         let name = b"x";
         d.extend_from_slice(&((name.len() as u32) ^ KEY_NAME_LEN).to_le_bytes());
-        d.extend_from_slice(&mt_apply(name, (name.len() as u32).wrapping_add(KEY_NAME_DATA)));
+        d.extend_from_slice(&mt_apply(
+            name,
+            (name.len() as u32).wrapping_add(KEY_NAME_DATA),
+        ));
         // data header
         d.push(0); // comp = 0 (stored)
         d.extend_from_slice(&((script.len() as u32) ^ KEY_SIZE).to_le_bytes()); // csize
@@ -456,6 +479,8 @@ mod tests {
             let _ = extract(Format::Autoit, &full[..cut.min(full.len())], &mut budget).unwrap();
         }
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Autoit, b"not autoit", &mut budget).unwrap().is_empty());
+        assert!(extract(Format::Autoit, b"not autoit", &mut budget)
+            .unwrap()
+            .is_empty());
     }
 }

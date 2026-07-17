@@ -6,7 +6,7 @@
 //!
 //! * `zip_aes256_store.zip`      — WinZip AES-256
 //! * `zip_zipcrypto_store.zip`   — legacy PKWARE ZipCrypto
-//! * `aes256_hdr.7z`             — header-encrypted 7z (detect-only)
+//! * `aes256_hdr.7z`             — header-encrypted 7z (`-mhe=on`)
 //!
 //! With the password the inner EICAR is FOUND (`Infected`); without it the scan
 //! is `PasswordProtected` — never `Clean`, never `Infected`.
@@ -72,15 +72,23 @@ fn zip_zipcrypto_decrypts_and_finds_eicar() {
 }
 
 #[test]
-fn sevenz_encrypted_is_password_protected() {
+fn sevenz_encrypted_header_decrypts_and_finds_eicar() {
     let db = builtin_db();
     let blob = fixture("aes256_hdr.7z");
-    // 7z AES is detect-only (no decrypt to keep getrandom out), so even with the
-    // password the verdict is PasswordProtected — but crucially never Clean.
-    for opts in [ScanOptions::default(), with_pw("password")] {
+    // With the password, the AES-encrypted header (`-mhe=on`) and the data are
+    // decrypted, so the inner EICAR is found.
+    match analyze(&db, &blob, &with_pw("password")).verdict {
+        Verdict::Infected { signature, .. } => assert!(
+            signature.to_ascii_uppercase().contains("EICAR"),
+            "unexpected signature {signature}"
+        ),
+        other => panic!("expected Infected with password, got {other:?}"),
+    }
+    // Without the password: PasswordProtected — never Clean, never Infected.
+    for opts in [ScanOptions::default(), with_pw("wrong")] {
         match analyze(&db, &blob, &opts).verdict {
             Verdict::PasswordProtected { .. } => {}
-            other => panic!("expected PasswordProtected for encrypted 7z, got {other:?}"),
+            other => panic!("expected PasswordProtected without password, got {other:?}"),
         }
     }
 }

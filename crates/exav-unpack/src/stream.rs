@@ -380,11 +380,70 @@ fn stream_gzip<R: Read + Seek, T>(
 /// limit; that buffered plaintext is then presented as a reader.
 #[cfg(feature = "zip")]
 fn stream_zip<R: Read + Seek, T>(
-    source: R,
+    mut source: R,
     budget: &mut Budget,
     visit: StreamVisit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    let mut zip = ::zip::ZipArchive::new(source).map_err(|e| LimitHit::new(format!("zip: {e}")))?;
+    // Borrow the source for the central-directory parse so it survives a parse
+    // failure. A forged/corrupt central directory (bad CDFH offset in the EOCD,
+    // etc.) makes the seekable member walk impossible — but the members' Local
+    // File Headers are still in the file. Fall back to buffering (bounded by
+    // `max-buffer`) and the local-header salvage the buffered extractor performs,
+    // then present each recovered member to the streaming visitor, so a malformed
+    // archive still gets its members scanned instead of being written off whole
+    // (matching clamd). This was previously reported as `LimitsExceeded`, masking
+    // the detection inside.
+    let mut zip = match ::zip::ZipArchive::new(source.by_ref()) {
+        Ok(z) => z,
+        Err(_) => {
+            source
+                .seek(io::SeekFrom::Start(0))
+                .map_err(|e| LimitHit::corrupt(format!("zip seek: {e}")))?;
+            let max = budget.limits.max_buffer_bytes();
+            let mut data = Vec::new();
+            source
+                .by_ref()
+                .take(max.saturating_add(1))
+                .read_to_end(&mut data)
+                .map_err(|e| LimitHit::corrupt(format!("zip read: {e}")))?;
+            if data.len() as u64 > max {
+                return Err(LimitHit::corrupt(format!(
+                    "corrupt zip exceeds max-buffer {max}"
+                )));
+            }
+            // Collect salvaged members (local-header scan), then hand each to the
+            // streaming visitor. Collecting first keeps the visitor's `Result`
+            // error path clean (the buffered `Sink` can't propagate errors).
+            let mut entries = Vec::new();
+            crate::formats::zip::extract_zip::<std::convert::Infallible>(
+                &data,
+                budget,
+                &mut |e, _| {
+                    entries.push(e);
+                    None
+                },
+            )?;
+            for entry in entries {
+                budget.count_entry()?;
+                let meta = MemberMeta {
+                    name: entry.name,
+                    comp_size: entry.comp_size,
+                    encrypted: entry.encrypted,
+                    unsupported: entry.unsupported,
+                };
+                let hit = if entry.unsupported.is_some() {
+                    visit(&meta, None, budget)
+                } else {
+                    let mut cur = io::Cursor::new(&entry.data[..]);
+                    visit_member(&meta, &mut cur, budget, visit)?
+                };
+                if let Some(t) = hit {
+                    return Ok(Some(t));
+                }
+            }
+            return Ok(None);
+        }
+    };
     for i in 0..zip.len() {
         budget.count_entry()?;
         // Peek metadata with the RAW reader — it never invokes the crate

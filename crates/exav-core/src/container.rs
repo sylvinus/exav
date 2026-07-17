@@ -212,6 +212,19 @@ fn parse_cdb(line: &str) -> Option<CdbSig> {
         "0" => Some(false),
         _ => return None,
     };
+    // Optional engine feature-level window (`…:Res1:Res2:MinFL[:MaxFL]`). Like
+    // `.ndb`/`.ldb`, ClamAV loads a `.cdb` sig only when the running flevel is in
+    // range; skip out-of-range sigs so a rule targeting a different engine can't
+    // fire here. A blank/absent bound is unbounded on that side.
+    let min_fl = f.get(10).map(|s| s.trim()).filter(|s| !s.is_empty());
+    let max_fl = f.get(11).map(|s| s.trim()).filter(|s| !s.is_empty());
+    if min_fl.is_some() || max_fl.is_some() {
+        let min = min_fl.and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let max = max_fl.and_then(|s| s.parse::<u32>().ok()).unwrap_or(u32::MAX);
+        if !crate::engine::flevel_ok(min, max) {
+            return None;
+        }
+    }
     Some(CdbSig {
         name: f[0].to_string(),
         unofficial: false,
@@ -229,6 +242,29 @@ fn parse_cdb(line: &str) -> Option<CdbSig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdb_flevel_window_filters() {
+        // A `.cdb` sig whose engine feature-level window (MinFL:MaxFL) excludes
+        // the running flevel must not load — the same gate the pattern engine
+        // applies to `.ndb`/`.ldb`. EXAV_FLEVEL is 213.
+        let mut db = CdbDb::new();
+        // Deprecated window (max 200 < 213): skipped at load.
+        db.extend_from_text("Old.Cdb:CL_TYPE_ZIP:*:evil\\.exe:*:*:*:*:0:0:100:200\n");
+        // Current window (200..=255 includes 213): loaded.
+        db.extend_from_text("Cur.Cdb:CL_TYPE_ZIP:*:evil\\.exe:*:*:*:*:0:0:200:255\n");
+        let m = Member {
+            name: "evil.exe",
+            size_in_container: 10,
+            size_real: 10,
+            encrypted: false,
+            pos: 1,
+        };
+        assert_eq!(
+            db.matches(FileType::Zip, 100, &m).map(|(n, _)| n).as_deref(),
+            Some("Cur.Cdb"),
+        );
+    }
 
     #[test]
     fn cdb_matches_zip_member() {
@@ -256,6 +292,35 @@ mod tests {
             ..m_clone(&m)
         };
         assert!(db.matches(FileType::Zip, 5000, &m2).is_none());
+    }
+
+    /// The real daily.cvd `Archive.Filetype.DualExtJS` sig (double-extension JS in
+    /// a ZIP) must match its member. Its `FilePos` is `1` — ClamAV counts members
+    /// from 1, so the first member is position 1 (regression: exav numbered from 0
+    /// and missed these).
+    #[test]
+    fn cdb_dual_extension_js() {
+        let mut db = CdbDb::new();
+        db.extend_from_text(
+            r"Archive.Filetype.DualExtJS-6168221-2:CL_TYPE_ZIP:*:^[^/\\]+\.(doc|xls|ppt|pdf|png|gif|jpeg)\.js$:*:*:*:1:*:",
+        );
+        let m = Member {
+            name: "PurchaseOrder_006231_Shanghuigou_20260605.pdf.js",
+            size_in_container: 500,
+            size_real: 900,
+            encrypted: false,
+            pos: 1, // first member, 1-based (ClamAV semantics)
+        };
+        assert_eq!(
+            db.matches(FileType::Zip, 5000, &m).map(|(n, _)| n).as_deref(),
+            Some("Archive.Filetype.DualExtJS-6168221-2")
+        );
+        // A benign single-extension name must NOT match.
+        let benign = Member {
+            name: "report.pdf",
+            ..m_clone(&m)
+        };
+        assert!(db.matches(FileType::Zip, 5000, &benign).is_none());
     }
 
     #[test]

@@ -114,9 +114,48 @@ fn wrong_password_reports_encrypted() {
     }
 }
 
-/// 7z: AES-256 header-encrypted archive is DETECTED as encrypted (not decrypted
-/// — the `aes256` feature is off to keep `getrandom` out). It must surface as an
-/// encrypted member, never silently clean.
+/// Regression: a ZipCrypto archive written with a streaming **data descriptor**
+/// (general-purpose bit 3), as Info-ZIP's `zip -e`/`-P` emits by default. Here
+/// the one-byte password check is the high byte of the DOS mod-time, not the
+/// CRC-32 — exav previously only ever checked against the CRC byte, so the
+/// correct password was rejected and the member reported password-protected even
+/// with `secret`. (The other `zip_zipcrypto_*` fixtures are `7z`-made with bit 3
+/// clear, so they never exercised this path.)
+#[test]
+fn zipcrypto_data_descriptor_decrypts_with_password() {
+    let blob = fixture("zip_zipcrypto_datadesc.zip");
+    let mut budget = Budget::with_passwords(Limits::default(), vec!["secret".to_string()]);
+    let entries = extract(Format::Zip, &blob, &mut budget).unwrap();
+    assert_eq!(entries.len(), 1);
+    let e = &entries[0];
+    assert!(
+        e.unsupported.is_none() && !e.encrypted,
+        "data-descriptor ZipCrypto should decrypt with the right password, got unsupported={:?}",
+        e.unsupported
+    );
+    assert!(
+        has_eicar(&e.data),
+        "EICAR not recovered from decrypted bytes"
+    );
+}
+
+/// The same data-descriptor fixture with the wrong password must still report
+/// encrypted — the mod-time check byte widens acceptance but the full-payload
+/// CRC check still rejects bad credentials (no false decrypt).
+#[test]
+fn zipcrypto_data_descriptor_wrong_password_reports_encrypted() {
+    let blob = fixture("zip_zipcrypto_datadesc.zip");
+    let mut budget = Budget::with_passwords(Limits::default(), vec!["nope".to_string()]);
+    let entries = extract(Format::Zip, &blob, &mut budget).unwrap();
+    let e = &entries[0];
+    assert!(e.encrypted && e.unsupported.is_some());
+    assert!(!has_eicar(&e.data));
+}
+
+/// 7z: an AES-256 header-encrypted (`-mhe=on`) archive without a valid password
+/// must surface as an encrypted member, never silently clean. With the correct
+/// password and decryption compiled in, the header + data decrypt and the inner
+/// EICAR is recovered.
 #[test]
 fn sevenz_encrypted_detected() {
     let p = format!(
@@ -125,20 +164,31 @@ fn sevenz_encrypted_detected() {
     );
     let blob = std::fs::read(&p).unwrap();
     assert_eq!(exav_unpack::detect(&blob), Some(Format::SevenZip));
-    // Even with a password supplied we currently only DETECT (no 7z decrypt yet).
-    let mut budget = Budget::with_passwords(Limits::default(), vec!["password".to_string()]);
+
+    // No valid password → encrypted signal, never clean.
+    let mut budget = Budget::with_passwords(Limits::default(), vec!["wrong".to_string()]);
     let entries = extract(Format::SevenZip, &blob, &mut budget).unwrap();
-    assert!(!entries.is_empty(), "must emit an encrypted signal");
     assert!(
         entries
             .iter()
             .any(|e| e.encrypted && e.unsupported.is_some()),
-        "7z AES must be reported encrypted, got {:?}",
+        "7z AES must be reported encrypted without a password, got {:?}",
         entries
             .iter()
             .map(|e| (&e.name, e.encrypted, e.unsupported))
             .collect::<Vec<_>>()
     );
+
+    // Correct password + decryption → the encrypted header decrypts to EICAR.
+    #[cfg(feature = "decrypt")]
+    {
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["password".to_string()]);
+        let entries = extract(Format::SevenZip, &blob, &mut budget).unwrap();
+        assert!(
+            entries.iter().any(|e| has_eicar(&e.data)),
+            "-mhe 7z must decrypt to EICAR with the password"
+        );
+    }
 }
 
 /// Verify that MSI stream names are correctly decompressed by exav-unpack.

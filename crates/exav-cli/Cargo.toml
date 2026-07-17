@@ -88,9 +88,11 @@ libc = "0.2.186"
 regex = "1.12.4"
 # Machine-readable `--json` output.
 serde_json = "1"
+# Spill large INSTREAM/EXINSTREAM payloads to a temp file so container-aware
+# scanning works at any stream size (like clamd) with bounded memory.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 
 # `.deb` packaging via cargo-deb (https://github.com/kornelski/cargo-deb):
 #   cargo build --release -p exav-cli && cargo deb -p exav-cli --no-build
