@@ -99,7 +99,10 @@ fn decode_zws_lzma(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), ()> {
     // and memory is bounded by `bounded_read(cap)` regardless of how large it is.
     let want = file_length.saturating_sub(8);
     let props = data[12];
-    let dict_size = u32::from_le_bytes([data[13], data[14], data[15], data[16]]);
+    let dict_size = crate::bounded_dict(
+        u32::from_le_bytes([data[13], data[14], data[15], data[16]]),
+        cap,
+    );
     let stream = &data[17..];
     let reader =
         lzma_rust2::LzmaReader::new_with_props(Cursor::new(stream), want, props, dict_size, None)
@@ -164,8 +167,8 @@ mod tests {
         enc.write_all(&body).unwrap();
         cws.extend_from_slice(&enc.finish().unwrap());
         let mut budget = Budget::new(Limits {
-            max_total_bytes: 1024,
-            max_ratio: u64::MAX,
+            max_extracted_bytes: 1024,
+            max_compression_ratio: u64::MAX,
             ..Default::default()
         });
         let err = extract(Format::Swf, &cws, &mut budget).unwrap_err();

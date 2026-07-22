@@ -9,16 +9,14 @@ yanked = "deny"
 # release available; none is reachable in exav's usage. Revisit on every
 # dependency bump (a fixed release should drop the ignore, not keep it).
 ignore = [
-    # NOTE: RUSTSEC-2023-0071 (rsa "Marvin" timing side-channel) is no longer
-    # listed — the `rsa` crate was removed from the tree by disabling yara-x's
-    # crypto-backed modules (pe/macho/dotnet/crx); see the yara-x dependency note
-    # in crates/exav-core/Cargo.toml.
-    #
     # bincode is flagged unmaintained (informational, not a vulnerability). Used
     # only for fixed-layout, big-endian header parsing of DMG/encrcdsa headers
-    # (crates/exav-unpack/src/formats/dmg.rs) and transitively by yara-x. No
-    # decode of untrusted length-prefixed collections; no known defect.
+    # (crates/exav-unpack/src/formats/dmg.rs). No decode of untrusted
+    # length-prefixed collections; no known defect.
     "RUSTSEC-2025-0141",
+    # NOTE: RUSTSEC-2023-0071 (`rsa` "Marvin") is intentionally NOT listed. `rsa`
+    # is not in the tree: the native YARA engine does `pe` via `goblin`
+    # and needs no Authenticode RSA, so the advisory has nothing to apply to.
 ]
 
 [bans]
@@ -43,7 +41,6 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "Unicode-DFS-2016",
-    "MPL-2.0",
     "CC0-1.0",
     "MIT-0",
     # webpki-roots (TLS root store, via the HTTP range backend).

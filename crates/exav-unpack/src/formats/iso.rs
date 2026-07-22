@@ -5,6 +5,9 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 
 const SECTOR: u64 = 2048;
 
+/// Directory-walk guard. Hitting it is reported, never a quiet stop.
+const MAX_DIRS: usize = 1024;
+
 /// Decode a directory-record file identifier. Joliet supplementary descriptors
 /// store names as UCS-2 (UTF-16) big-endian; the primary descriptor uses a
 /// byte string. A trailing `;1` version suffix is stripped either way.
@@ -104,7 +107,13 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     let mut dirs: Vec<(bool, u64, u64)> = roots;
     while let Some((joliet, lba, len)) = dirs.pop() {
         visited += 1;
-        if visited > 1024 {
+        if visited > MAX_DIRS {
+            // A zero-length marker region, the same channel the partition walker
+            // uses for its own caps. Breaking out silently would leave every
+            // remaining directory in the image unenumerated while the file could
+            // still be reported clean — and ISO is streamable, so this is the
+            // path a top-level scan takes.
+            out.push((format!("<iso-directories-beyond-{MAX_DIRS}>"), 0, 0));
             break;
         }
         let start = lba.saturating_mul(SECTOR);
@@ -171,7 +180,7 @@ pub(crate) fn extract_iso<R>(
             .to_vec()
     };
     let roots = vd_roots(&mut read_at);
-    if roots.is_empty() {
+    if roots.is_empty() && !udf::has_udf(data) {
         return Ok(None);
     }
     let sector = SECTOR as usize;
@@ -180,12 +189,29 @@ pub(crate) fn extract_iso<R>(
     let mut visited = 0usize;
     while let Some((joliet, lba, len)) = dirs.pop() {
         visited += 1;
-        if visited > 1024 {
-            break; // directory-count guard
+        if visited > MAX_DIRS {
+            // Say so. Breaking here silently would leave every remaining
+            // directory in the image unenumerated while the file could still be
+            // reported clean.
+            budget.count_entry()?;
+            if let Some(r) = visit(
+                Entry::unsupported(
+                    format!("<iso-directories-beyond-{MAX_DIRS}>"),
+                    0,
+                    false,
+                    "too many ISO directories to walk them all",
+                ),
+                budget,
+            ) {
+                return Ok(Some(r));
+            }
+            break;
         }
         let start = lba as usize * sector;
         let end = start.saturating_add(len as usize).min(data.len());
         let Some(dir) = data.get(start..end) else {
+            // A directory extent lying outside the image: the image is truncated,
+            // so those bytes are absent rather than hidden. Nothing to report.
             continue;
         };
         let mut p = 0usize;
@@ -204,6 +230,20 @@ pub(crate) fn extract_iso<R>(
             // 33-byte fixed area we index below. A short (but non-zero) length is
             // corrupt — bail rather than slice `rec` too short and panic.
             if rec_len < 33 || p + rec_len > dir.len() {
+                // Corrupt record. Everything after it in this directory is
+                // unreachable, so report rather than stop quietly.
+                budget.count_entry()?;
+                if let Some(r) = visit(
+                    Entry::unsupported(
+                        format!("<iso-directory@lba{lba}-truncated>"),
+                        0,
+                        false,
+                        "corrupt ISO directory record; remaining entries unreadable",
+                    ),
+                    budget,
+                ) {
+                    return Ok(Some(r));
+                }
                 break;
             }
             let rec = &dir[p..p + rec_len];
@@ -226,6 +266,10 @@ pub(crate) fn extract_iso<R>(
                 let name = decode_name(raw, joliet);
                 let fstart = child_lba as usize * sector;
                 let fend = fstart.saturating_add(child_len as usize).min(data.len());
+                // A short read means the image is truncated: the declared bytes
+                // are absent from the file rather than hidden in it, so scanning
+                // what exists is the honest answer. exav scans for malware, it is
+                // not a file-integrity validator. See docs/QUIRKS.md.
                 let content = data.get(fstart..fend).unwrap_or(&[]);
                 let cap = budget.reserve()?;
                 if content.len() as u64 > cap {
@@ -238,6 +282,13 @@ pub(crate) fn extract_iso<R>(
             }
             p += rec_len;
         }
+    }
+    // Most `.iso` files a modern tool writes carry UDF as well, over the same
+    // extents ("UDF bridge"), and a UDF-only image has no ISO 9660 tree at all.
+    // `seen_files` is keyed on the extent's first block, so a file both trees
+    // name is emitted once.
+    if udf::has_udf(data) {
+        return udf::extract_udf(data, budget, visit, &mut seen_files);
     }
     Ok(None)
 }

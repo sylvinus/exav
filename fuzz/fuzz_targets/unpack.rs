@@ -15,11 +15,11 @@ use libfuzzer_sys::fuzz_target;
 use exav_unpack::{extract, Budget, Format, Limits};
 
 const TIGHT_LIMITS: Limits = Limits {
-    max_total_bytes: 256 * 1024,
-    max_files: 5,
-    max_ratio: 50,
-    max_entry_bytes: 128 * 1024,
-    max_scan_bytes: 256 * 1024,
+    max_extracted_bytes: 256 * 1024,
+    max_members: 5,
+    max_compression_ratio: 50,
+    max_buffer_bytes: 128 * 1024,
+    max_scanned_bytes: 256 * 1024,
     max_recursion: 2,
 };
 

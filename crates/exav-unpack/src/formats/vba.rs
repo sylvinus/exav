@@ -349,17 +349,63 @@ fn decode_utf16(d: &[u8], p: usize, n: usize) -> String {
 /// (e.g. `environ("WINDIR")`); we produce that form for compatibility. A bare
 /// `"` toggles in/out of a string; `""` (an escaped quote) toggles twice, which
 /// keeps the state correct.
-fn lowercase_vba_code(src: &[u8]) -> Vec<u8> {
+fn normalize_vba_code(src: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len());
     let mut in_str = false;
-    for &b in src {
+    let mut prev_ws = false;
+    let mut i = 0;
+    while i < src.len() {
+        let b = src[i];
         if b == b'"' {
             in_str = !in_str;
+            prev_ws = false;
             out.push(b);
+            i += 1;
         } else if in_str {
             out.push(b);
+            i += 1;
+        } else if b == b'_' {
+            // VBA line continuation: an underscore followed by optional trailing
+            // spaces/tabs then a line terminator joins the next physical line into
+            // one logical line. ClamAV resolves these before matching, so a macro
+            // subsig written as one line (`sub userform_activate`) matches source
+            // split as `Sub _<newline>UserForm_Activate`. A `_` that is part of an
+            // identifier (followed by more code) is left alone.
+            let mut j = i + 1;
+            while j < src.len() && (src[j] == b' ' || src[j] == b'\t') {
+                j += 1;
+            }
+            if j < src.len() && (src[j] == b'\r' || src[j] == b'\n') {
+                if src[j] == b'\r' && j + 1 < src.len() && src[j + 1] == b'\n' {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+                i = j;
+                // Join the lines with a single separating space.
+                if !prev_ws {
+                    out.push(b' ');
+                    prev_ws = true;
+                }
+            } else {
+                out.push(b'_');
+                prev_ws = false;
+                i += 1;
+            }
+        } else if b == b' ' || b == b'\t' {
+            // Collapse each run of spaces/tabs to a single space (ClamAV's VBA
+            // dump does the same), so a macro subsig written with canonical single
+            // spacing matches source aligned/indented with runs of whitespace
+            // (e.g. `suhq as long` vs source `SUHq  As Long`).
+            if !prev_ws {
+                out.push(b' ');
+                prev_ws = true;
+            }
+            i += 1;
         } else {
+            prev_ws = false;
             out.push(b.to_ascii_lowercase());
+            i += 1;
         }
     }
     out
@@ -444,10 +490,11 @@ pub(crate) fn build_artifacts(streams: &[(String, &[u8])], cap: u64) -> Option<(
         if let Some(stream) = find_stream(&m.stream_name) {
             let off = m.text_offset as usize;
             if let Some(src) = stream.get(off..).and_then(|s| decompress(s, cap)) {
-                // Dump: code-lowercased (string literals preserved) after the
-                // uppercase REM headers, so a header+source logical sig matches in
-                // one buffer. Raw: original case, for Target:2 OLE sigs.
-                out.push_str(&String::from_utf8_lossy(&lowercase_vba_code(&src)));
+                // Dump: code lowercased + whitespace-collapsed (string literals
+                // preserved) after the uppercase REM headers, so a header+source
+                // logical sig matches in one buffer. Raw: original case, for
+                // Target:2 OLE sigs.
+                out.push_str(&String::from_utf8_lossy(&normalize_vba_code(&src)));
                 raw.extend_from_slice(&src);
                 raw.push(b'\n');
             }
@@ -466,6 +513,42 @@ pub(crate) fn build_artifacts(streams: &[(String, &[u8])], cap: u64) -> Option<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn norm(s: &str) -> String {
+        String::from_utf8(normalize_vba_code(s.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn vba_normalize_lowercases_and_collapses_whitespace() {
+        // Case-fold code + collapse runs of spaces/tabs to one space, so a subsig
+        // written `private const suhq as long = &h100` matches aligned source.
+        assert_eq!(
+            norm("Private Const SUHq  As Long = &H100"),
+            "private const suhq as long = &h100"
+        );
+        assert_eq!(norm("A\t\tB   C"), "a b c");
+    }
+
+    #[test]
+    fn vba_normalize_resolves_line_continuation() {
+        // `_` at line end joins the next physical line (VBA continuation), so a
+        // one-line subsig matches `Sub _<newline>UserForm_Activate()`.
+        assert_eq!(
+            norm("Sub _\nUserForm_Activate()"),
+            "sub userform_activate()"
+        );
+        assert_eq!(norm("Sub _\r\nFoo"), "sub foo");
+        // Trailing spaces between `_` and the newline are tolerated.
+        assert_eq!(norm("a + _  \n  b"), "a + b");
+    }
+
+    #[test]
+    fn vba_normalize_preserves_identifiers_and_strings() {
+        // A `_` inside an identifier (followed by code, not a newline) is kept.
+        assert_eq!(norm("user_form = 1"), "user_form = 1");
+        // String literals keep original case and internal spacing.
+        assert_eq!(norm("MsgBox \"A  B\" & X"), "msgbox \"A  B\" & x");
+    }
 
     #[test]
     fn copy_token_bit_allocation() {

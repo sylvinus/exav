@@ -16,7 +16,7 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
     use crate::stream::{visit_member, MemberMeta};
     let (folder_metas, files) =
         Cabinet::layout(source).map_err(|e| LimitHit::new(format!("cab: {e}")))?;
-    let max_buffer = budget.limits.max_buffer_bytes();
+    let max_buffer = budget.limits.max_buffer_bytes;
     for (folder_idx, meta) in folder_metas.iter().enumerate() {
         let mut folder_files: Vec<&crate::formats::cab_parse::file::FileEntry> = files
             .iter()
@@ -37,13 +37,39 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
         let mut pos = 0u64;
         for f in folder_files {
             let want = f.data_offset as u64;
+            // Both of these are members the cabinet's own directory names, so
+            // they exist; this reader just cannot reach them. Reporting is the
+            // whole difference between "no malware here" and "did not look".
             if want < pos {
-                continue; // out-of-order within folder (forward-only reader)
+                budget.count_entry()?;
+                let m = MemberMeta {
+                    name: f.name().to_string(),
+                    comp_size: f.uncompressed_size as u64,
+                    encrypted: false,
+                    unsupported: Some(
+                        "CAB member lies before the current position in its folder \
+                         (this walker reads forward only)",
+                    ),
+                };
+                if let Some(t) = visit(&m, None, budget) {
+                    return Ok(Some(t));
+                }
+                continue;
             }
             let skipped = skip_forward(&mut reader, want - pos);
             pos += skipped;
             if pos < want {
-                continue; // folder ended before this file's offset
+                budget.count_entry()?;
+                let m = MemberMeta {
+                    name: f.name().to_string(),
+                    comp_size: f.uncompressed_size as u64,
+                    encrypted: false,
+                    unsupported: Some("CAB folder ended before this member's offset"),
+                };
+                if let Some(t) = visit(&m, None, budget) {
+                    return Ok(Some(t));
+                }
+                continue;
             }
             budget.count_entry()?;
             let meta_m = MemberMeta {
@@ -94,7 +120,7 @@ pub(crate) fn extract_cab<R>(
     let mut cursor = Cursor::new(src);
     let cabinet = crate::formats::cab_parse::cabinet::Cabinet::new(
         &mut cursor,
-        budget.limits.max_buffer_bytes(),
+        budget.limits.max_buffer_bytes,
     )
     .map_err(|e| LimitHit::new(format!("cab: {e}")))?;
 
@@ -102,7 +128,9 @@ pub(crate) fn extract_cab<R>(
         budget.count_entry()?;
         let cap = budget.reserve()?;
         let name = file_entry.name().to_string();
-        let reader = match cabinet.read_file(&name) {
+        // By entry, not by name: two members can share a name, and a name lookup
+        // would hand back the first one's bytes twice and never the second's.
+        let reader = match cabinet.read_entry(file_entry) {
             Ok(r) => r,
             Err(_) => {
                 if let Some(r) = visit(

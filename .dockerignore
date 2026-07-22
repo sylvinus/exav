@@ -15,6 +15,6 @@ packaging/
 .env
 .env*.local
 *.cache
-*.exavcache
+*.exavdb
 yara-x/
 node_modules/

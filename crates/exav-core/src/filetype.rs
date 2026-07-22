@@ -90,9 +90,9 @@ fn parse_literal_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Map a ClamAV `CL_TYPE_*` to the exav [`FileType`] it corresponds to, or
-/// `None` for types exav doesn't model (graphics, compiled python, swf, …) —
-/// assigning those would gain nothing since no `Target` keys on them.
-fn cl_type_to_filetype(t: &str) -> Option<FileType> {
+/// `None` for types exav doesn't model (compiled python, …) — assigning those
+/// would gain nothing since no `Target` keys on them.
+pub(crate) fn cl_type_to_filetype(t: &str) -> Option<FileType> {
     Some(match t {
         "CL_TYPE_MSEXE" => FileType::Pe,
         "CL_TYPE_ELF" => FileType::Elf,
@@ -119,12 +119,20 @@ fn cl_type_to_filetype(t: &str) -> Option<FileType> {
         }
         "CL_TYPE_XAR" => FileType::Xar,
         "CL_TYPE_GPT" | "CL_TYPE_MBR" | "CL_TYPE_APM" => FileType::Partition,
+        "CL_TYPE_SWF" => FileType::Swf,
+        "CL_TYPE_GRAPHICS" => FileType::Graphics,
+        "CL_TYPE_SCRIPT" => FileType::Script,
+        "CL_TYPE_TEXT_ASCII"
+        | "CL_TYPE_TEXT_UTF8"
+        | "CL_TYPE_TEXT_UTF16LE"
+        | "CL_TYPE_TEXT_UTF16BE" => FileType::Text,
         _ => return None,
     })
 }
 
 /// Recognised file types relevant to scanning/unpacking decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum FileType {
     Pe,
     Elf,
@@ -141,20 +149,45 @@ pub enum FileType {
     SevenZip,
     Rar,
     Cab,
-    Chm,       // MS Compiled HTML Help (ITSS container)
-    Iso,       // ISO 9660 CD/DVD image
-    Lha,       // LHA/LZH archive
-    Arj,       // ARJ archive
-    Ar,        // Unix ar archive (.a, .deb)
-    Cpio,      // cpio archive (RPM payload, initramfs)
-    Xar,       // XAR archive (macOS .pkg/.xip)
-    Zstd,      // Zstandard compressed stream
-    Lzip,      // Lzip compressed stream
-    Uuencode,  // uuencode / base64-uuencode wrapped file
-    Xdp,       // Adobe XDP (XML-wrapped base64 PDF)
-    Szdd,      // MS-Compress SZDD / KWAJ
-    Tnef,      // TNEF (winmail.dat) MS email attachment container
-    Swf,       // SWF (Adobe Flash) movie (CWS/ZWS compressed)
+    Chm,         // MS Compiled HTML Help (ITSS container)
+    Iso,         // ISO 9660 CD/DVD image
+    Lha,         // LHA/LZH archive
+    Arj,         // ARJ archive
+    Ar,          // Unix ar archive (.a, .deb)
+    Cpio,        // cpio archive (RPM payload, initramfs)
+    Xar,         // XAR archive (macOS .pkg/.xip)
+    Wim,         // Windows Imaging Format (.wim/.esd)
+    Lz4,         // LZ4 frame
+    Arc,         // ARC / PKARC / PAK archive
+    Ace,         // ACE archive (recognised, not decoded)
+    Alz,         // ALZ archive (recognised, not decoded)
+    Egg,         // EGG archive (recognised, not decoded)
+    Hwp3,        // Hangul HWP v3 document (recognised, not decoded)
+    IshieldMsi,  // InstallShield MSI installer (recognised, not unpacked)
+    IshieldCab,  // InstallShield InstallScript cabinet (recognised, not unpacked)
+    IshieldZ,    // InstallShield `.z` archive (decoded)
+    CryptFf,     // CryptFF-encrypted file (recognised, not decrypted)
+    Ext,         // ext2/3/4 filesystem image (walked)
+    Lrzip,       // lrzip stream (recognised, not decoded)
+    Zoo,         // ZOO archive (decoded)
+    AppleSingle, // AppleSingle/AppleDouble container (recognised, not read)
+    StuffIt,     // StuffIt / StuffIt X archive (recognised, not decoded)
+    Fat,         // FAT12/16/32 filesystem
+    Inno,        // Inno Setup installer (recognised, not decoded)
+    Ntfs,        // NTFS filesystem
+    Zstd,        // Zstandard compressed stream
+    Lzip,        // Lzip compressed stream
+    Uuencode,    // uuencode / base64-uuencode wrapped file
+    Xdp,         // Adobe XDP (XML-wrapped base64 PDF)
+    Szdd,        // MS-Compress SZDD / KWAJ
+    Tnef,        // TNEF (winmail.dat) MS email attachment container
+    Swf,         // SWF (Adobe Flash) movie (CWS/ZWS compressed)
+    // Raster image. Never produced by content detection — `Target:5` signatures
+    // reach images through `fuzzy_img::looks_like_image` instead. This exists
+    // only so a `HandlerType:CL_TYPE_GRAPHICS` signature has a type to re-type
+    // *to*; giving it one costs nothing precisely because nothing else can
+    // produce it.
+    Graphics,
     Binhex,    // BinHex 4.0 (.hqx) classic-Mac 6-bit-encoded file
     Lnk,       // Windows Shell Link (.lnk) shortcut
     Partition, // raw disk image partition map (GPT / APM / MBR)
@@ -192,6 +225,24 @@ impl FileType {
                 | FileType::Ar
                 | FileType::Cpio
                 | FileType::Xar
+                | FileType::Wim
+                | FileType::Lz4
+                | FileType::Arc
+                | FileType::Ace
+                | FileType::Alz
+                | FileType::Egg
+                | FileType::Hwp3
+                | FileType::IshieldMsi
+                | FileType::IshieldCab
+                | FileType::IshieldZ
+                | FileType::CryptFf
+                | FileType::Ext
+                | FileType::Lrzip
+                | FileType::Zoo
+                | FileType::AppleSingle
+                | FileType::Fat
+                | FileType::Inno
+                | FileType::Ntfs
                 | FileType::Zstd
                 | FileType::Lzip
                 | FileType::Partition
@@ -226,6 +277,25 @@ impl FileType {
             FileType::Ar => "AR",
             FileType::Cpio => "CPIO",
             FileType::Xar => "XAR",
+            FileType::Wim => "WIM",
+            FileType::Lz4 => "LZ4",
+            FileType::Arc => "ARC",
+            FileType::Ace => "ACE",
+            FileType::Alz => "ALZ",
+            FileType::Egg => "EGG",
+            FileType::Hwp3 => "HWP3",
+            FileType::IshieldMsi => "InstallShieldMSI",
+            FileType::IshieldCab => "InstallShieldCAB",
+            FileType::IshieldZ => "InstallShieldZ",
+            FileType::CryptFf => "CryptFF",
+            FileType::Ext => "ext",
+            FileType::Lrzip => "lrzip",
+            FileType::Zoo => "ZOO",
+            FileType::AppleSingle => "AppleSingle",
+            FileType::StuffIt => "StuffIt",
+            FileType::Fat => "FAT",
+            FileType::Inno => "InnoSetup",
+            FileType::Ntfs => "NTFS",
             FileType::Zstd => "ZSTD",
             FileType::Lzip => "LZIP",
             FileType::Uuencode => "uuencode",
@@ -233,6 +303,7 @@ impl FileType {
             FileType::Szdd => "SZDD",
             FileType::Tnef => "TNEF",
             FileType::Swf => "SWF",
+            FileType::Graphics => "graphics",
             FileType::Binhex => "BinHex",
             FileType::Lnk => "LNK",
             FileType::Partition => "partition",
@@ -279,57 +350,22 @@ pub fn identify(buf: &[u8]) -> FileType {
     if buf.starts_with(b"{\\rtf") {
         return FileType::Rtf;
     }
+    // Uncompressed Flash. `CWS`/`ZWS` (the compressed variants) are containers
+    // and belong to `unpack::detect`; `FWS` has nothing to decompress, so core
+    // types it directly — without this, `Target:11` signatures would never see
+    // an uncompressed movie, nor the `FWS` body exav rebuilds from a `CWS`/`ZWS`
+    // one. The magic is the bare three bytes, matching ClamAV: probing clamscan
+    // with a `Target:11` signature shows `FWS` + garbage version + a nonsense
+    // length field still types as SWF, so validating the header here would drop
+    // detections ClamAV keeps.
+    if buf.starts_with(b"FWS") {
+        return FileType::Swf;
+    }
     // Archive/container formats: the magic detection is owned solely by
     // `exav-unpack::detect` (single source of truth); map its `Format` to the
-    // broader `FileType`. (`Format::Email` is never returned by magic — email is
-    // content-sniffed below — but is handled for completeness.)
+    // broader `FileType`.
     if let Some(fmt) = crate::unpack::detect(buf) {
-        use crate::unpack::Format;
-        return match fmt {
-            Format::Zip => FileType::Zip,
-            Format::Gzip => FileType::Gzip,
-            Format::Tar => FileType::Tar,
-            Format::Bzip2 => FileType::Bzip2,
-            Format::Xz => FileType::Xz,
-            Format::Cab => FileType::Cab,
-            Format::Chm => FileType::Chm,
-            Format::Ole => FileType::Ole,
-            Format::Pdf => FileType::Pdf,
-            Format::Email => FileType::Email,
-            Format::SevenZip => FileType::SevenZip,
-            Format::Iso => FileType::Iso,
-            Format::Lha => FileType::Lha,
-            Format::Rar => FileType::Rar,
-            Format::Arj => FileType::Arj,
-            Format::Ar => FileType::Ar,
-            Format::Cpio => FileType::Cpio,
-            Format::Xar => FileType::Xar,
-            // UPX and other PE runtime packers are content-detected on
-            // executables, never by `detect`.
-            Format::Upx => FileType::Unknown,
-            Format::PePacked => FileType::Unknown,
-            Format::JavaClass => FileType::JavaClass,
-            Format::AiModel => FileType::AiModel,
-            Format::Screnc => FileType::Screnc,
-            Format::Dmg => FileType::Unknown,
-            Format::Zstd => FileType::Zstd,
-            Format::Lzip => FileType::Lzip,
-            Format::Uuencode => FileType::Uuencode,
-            Format::Xdp => FileType::Xdp,
-            Format::Szdd => FileType::Szdd,
-            Format::Tnef => FileType::Tnef,
-            Format::Swf => FileType::Swf,
-            Format::Binhex => FileType::Binhex,
-            Format::Lnk => FileType::Lnk,
-            Format::Partition => FileType::Partition,
-            Format::Pyc => FileType::Pyc,
-            Format::Nsis => FileType::Nsis,
-            Format::Machofat => FileType::Machofat,
-            Format::Sfx => FileType::Sfx,
-            Format::Autoit => FileType::Autoit,
-            Format::OneNote => FileType::OneNote,
-            Format::Rtf => FileType::Rtf,
-        };
+        return filetype_of_format(fmt);
     }
     // Content-sniffed text-ish types (core-specific).
     if buf.starts_with(b"#!") {
@@ -354,7 +390,7 @@ pub fn identify(buf: &[u8]) -> FileType {
 /// Generous on purpose: a NUL byte or a high density of non-whitespace control
 /// bytes marks binary, but high bytes (0x80..=0xff) are accepted so non-ASCII
 /// UTF-8 text still types as text — otherwise non-English text malware would
-/// lose its `Target:7` coverage (which previously matched via `Unknown`).
+/// type as binary and lose its `Target:7` (ASCII-text) coverage.
 fn looks_textual(buf: &[u8]) -> bool {
     let head = &buf[..buf.len().min(8192)];
     if head.is_empty() {
@@ -439,8 +475,192 @@ fn looks_like_email(buf: &[u8]) -> bool {
     first_is_header && (text.contains("MIME-Version:") || text.contains("Content-Type:"))
 }
 
+/// Whether a MIME document is an **MHTML web archive** rather than a mail
+/// message — a saved web page (`.mht`), not something that travelled through a
+/// mail server.
+///
+/// The discriminator is the mail envelope, not the multipart subtype: probed
+/// with `Container:CL_TYPE_MHTML` and `Container:CL_TYPE_MAIL` signatures,
+/// clamscan types a `multipart/related` document *with* `From:`/`To:` as mail
+/// and a `multipart/mixed` document *without* them as MHTML. The two are
+/// mutually exclusive, so a document is one or the other, never both.
+pub(crate) fn looks_like_mhtml(buf: &[u8]) -> bool {
+    let head = &buf[..buf.len().min(8192)];
+    let text = String::from_utf8_lossy(head);
+    if text.starts_with("From ") {
+        return false; // mbox is mail by definition
+    }
+    // Only the header block counts: a quoted `From:` inside the body is not an
+    // envelope.
+    let headers = text.split("\r\n\r\n").next().unwrap_or(&text);
+    let has_envelope = headers.lines().any(|l| {
+        let key = l.split_once(':').map(|(k, _)| k).unwrap_or("");
+        matches!(
+            key,
+            "Received" | "Return-Path" | "From" | "To" | "Delivered-To" | "Message-ID"
+        )
+    });
+    !has_envelope && headers.contains("Content-Type:")
+}
+
+/// The [`FileType`] a magic-detected [`Format`] corresponds to.
+///
+/// (`Format::Email` is never returned by magic — email is content-sniffed — but
+/// is mapped for completeness.)
+///
+/// Several formats have no ClamAV `CL_TYPE_*` of their own and land on
+/// `FileType::Unknown`. Since the scanner reaches an extractor through
+/// `FileType`, such a format would never be extracted at all; they are listed in
+/// [`MAGIC_DISPATCH_ONLY`] and dispatched straight from the magic instead.
+/// `scan_dispatch_covers_every_format` holds the two lists together.
+pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
+    use crate::unpack::Format;
+    match fmt {
+        Format::Zip => FileType::Zip,
+        Format::Gzip => FileType::Gzip,
+        Format::Tar => FileType::Tar,
+        Format::Bzip2 => FileType::Bzip2,
+        Format::Xz => FileType::Xz,
+        Format::Cab => FileType::Cab,
+        Format::Chm => FileType::Chm,
+        Format::Ole => FileType::Ole,
+        Format::Pdf => FileType::Pdf,
+        Format::Email => FileType::Email,
+        Format::SevenZip => FileType::SevenZip,
+        Format::Iso => FileType::Iso,
+        Format::Lha => FileType::Lha,
+        Format::Rar => FileType::Rar,
+        Format::Arj => FileType::Arj,
+        Format::Ar => FileType::Ar,
+        Format::Cpio => FileType::Cpio,
+        Format::Xar => FileType::Xar,
+        // UPX and other PE runtime packers are content-detected on
+        // executables, never by `detect`.
+        Format::Upx => FileType::Unknown,
+        Format::PePacked => FileType::Unknown,
+        Format::JavaClass => FileType::JavaClass,
+        Format::AiModel => FileType::AiModel,
+        Format::Screnc => FileType::Screnc,
+        Format::Dmg => FileType::Unknown,
+        // A disk image has no ClamAV `CL_TYPE_*` of its own; what matters is
+        // the filesystem inside, which is typed when the member is scanned.
+        Format::Vhd => FileType::Unknown,
+        Format::Lzw => FileType::Unknown,
+        Format::Qcow2 | Format::Vmdk | Format::Vhdx => FileType::Unknown,
+        Format::Wim => FileType::Wim,
+        Format::Lz4 => FileType::Lz4,
+        Format::Arc => FileType::Arc,
+        Format::Ace => FileType::Ace,
+        Format::Alz => FileType::Alz,
+        Format::Egg => FileType::Egg,
+        Format::Hwp3 => FileType::Hwp3,
+        Format::IshieldMsi => FileType::IshieldMsi,
+        Format::IshieldCab => FileType::IshieldCab,
+        Format::IshieldZ => FileType::IshieldZ,
+        Format::CryptFf => FileType::CryptFf,
+        Format::Ext => FileType::Ext,
+        Format::Lrzip => FileType::Lrzip,
+        Format::Zoo => FileType::Zoo,
+        Format::AppleSingle => FileType::AppleSingle,
+        Format::StuffIt => FileType::StuffIt,
+        Format::Fat => FileType::Fat,
+        Format::Inno => FileType::Inno,
+        Format::Ntfs => FileType::Ntfs,
+        Format::Zstd => FileType::Zstd,
+        Format::Lzip => FileType::Lzip,
+        Format::Uuencode => FileType::Uuencode,
+        Format::Xdp => FileType::Xdp,
+        Format::Szdd => FileType::Szdd,
+        Format::Tnef => FileType::Tnef,
+        Format::Swf => FileType::Swf,
+        Format::Binhex => FileType::Binhex,
+        Format::Lnk => FileType::Lnk,
+        Format::Partition => FileType::Partition,
+        Format::Pyc => FileType::Pyc,
+        Format::Nsis => FileType::Nsis,
+        Format::Machofat => FileType::Machofat,
+        Format::Sfx => FileType::Sfx,
+        Format::Autoit => FileType::Autoit,
+        Format::OneNote => FileType::OneNote,
+        Format::Rtf => FileType::Rtf,
+        // `Format` is `#[non_exhaustive]`, so the compiler can no longer prove
+        // this mapping is total. `scan_dispatch_covers_every_format` proves it
+        // instead, walking `Format::ALL` and failing on any variant that does
+        // not round-trip — which catches a missing arm here for the same reason
+        // the compiler used to, and with a better message.
+        _ => FileType::Unknown,
+    }
+}
+
+/// Formats that [`filetype_of_format`] maps to `FileType::Unknown` yet still
+/// have real content to extract, so the scanner dispatches them from the magic
+/// rather than from the file type.
+///
+/// `Upx`/`PePacked` are deliberately absent: they are content-detected on an
+/// already-typed executable, not returned by `detect`.
+/// Containers that live *inside* an executable: an installer or self-extractor
+/// whose payload is appended to a PE/ELF stub.
+///
+/// `identify` answers `Pe`/`Elf` for these — correctly, since they are real
+/// executables and the PE signature scan has to run on them — and
+/// `unpack_format` has no mapping from an executable to a container, so the
+/// extractor is never reached. Embedded-archive carving covers the case where
+/// the appended data is a *recognisable* archive (a ZIP glued to a stub), but
+/// not where it is the installer's own format: NSIS's compressed blocks and
+/// Inno Setup's chunked LZMA look like nothing in particular, so a carve finds
+/// no candidate and the file scans clean with every packaged file unexamined.
+///
+/// So these are dispatched from the magic instead, exactly as
+/// [`MAGIC_DISPATCH_ONLY`] is. `scan_dispatch_covers_every_format` holds the
+/// lists and the mapping together.
+pub(crate) const EXECUTABLE_CONTAINERS: &[crate::unpack::Format] = &[
+    crate::unpack::Format::Nsis,
+    crate::unpack::Format::Sfx,
+    crate::unpack::Format::Autoit,
+    crate::unpack::Format::Inno,
+];
+
+pub(crate) const MAGIC_DISPATCH_ONLY: &[crate::unpack::Format] = &[
+    crate::unpack::Format::Dmg,
+    crate::unpack::Format::Vhd,
+    crate::unpack::Format::Lzw,
+    crate::unpack::Format::Qcow2,
+    crate::unpack::Format::Vmdk,
+    crate::unpack::Format::Vhdx,
+];
+
 #[cfg(test)]
 mod tests {
+    use crate::unpack::Format;
+
+    /// Every format the magic detector recognises must be reachable by the
+    /// scanner. A format that lands on `FileType::Unknown` and is not listed in
+    /// [`MAGIC_DISPATCH_ONLY`] is never handed to an extractor at all: its
+    /// members are simply not scanned, and the file is reported clean on the
+    /// strength of a raw pattern scan that cannot see compressed content.
+    ///
+    /// This is a real regression that shipped — `.Z`, DMG, VHD, QCOW2 and VMDK
+    /// each had a working extractor that nothing ever called.
+    #[test]
+    fn scan_dispatch_covers_every_format() {
+        for &fmt in Format::ALL {
+            // Runtime packers are detected on an already-typed executable
+            // rather than by `detect`, so they have no file type to map.
+            if matches!(fmt, Format::Upx | Format::PePacked) {
+                continue;
+            }
+            if super::MAGIC_DISPATCH_ONLY.contains(&fmt) {
+                continue;
+            }
+            let ft = super::filetype_of_format(fmt);
+            assert_eq!(
+                crate::unpack_format(ft),
+                Some(fmt),
+                "{fmt:?} maps to {ft:?}, which the scanner does not dispatch                  back to {fmt:?} — its contents would go unscanned. Give it a                  FileType, or add it to MAGIC_DISPATCH_ONLY."
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -467,7 +687,10 @@ mod tests {
         assert_eq!(identify(b"MZ\x90\x00"), FileType::Pe);
         assert_eq!(identify(b"\x7fELF"), FileType::Elf);
         assert_eq!(identify(b"PK\x03\x04...."), FileType::Zip);
-        assert_eq!(identify(&[0x1f, 0x8b, 0x08]), FileType::Gzip);
+        assert_eq!(identify(&[0x1f, 0x8b, 0x08, 0x00]), FileType::Gzip);
+        // A bare `1f 8b` prefix without a valid deflate CM + flag byte is not gzip
+        // (it collides with binary data); must not be typed as an archive.
+        assert_ne!(identify(&[0x1f, 0x8b, 0x99, 0xff]), FileType::Gzip);
         assert_eq!(identify(b"%PDF-1.7"), FileType::Pdf);
         assert_eq!(identify(b"#!/bin/sh\n"), FileType::Script);
         // Printable prose → text; non-printable bytes → binary Unknown.

@@ -43,6 +43,30 @@ fn starts_with_exe(data: &[u8]) -> bool {
 /// Locate the *earliest* embedded archive magic strictly past offset 0. Returns
 /// `(offset, label)` or `None`. Searching from offset 1 skips the container's
 /// own magic so a bare archive isn't reported as its own SFX payload.
+/// Does a plausible ARJ main header start here?
+///
+/// `60 EA` is two bytes, so across a megabyte of executable it turns up by
+/// chance roughly once — and a false hit is not harmless: the carve hands the
+/// ARJ extractor a fragment of the stub, extraction fails, and an ordinary file
+/// is reported `UNSCANNABLE`. A .NET assembly did exactly that.
+///
+/// The three fields after the magic settle it. The basic header size is bounded
+/// by the format at 2600 bytes, the first header is at least the 30 bytes of
+/// fixed fields and cannot exceed the header holding it, and the host OS is one
+/// of a dozen defined values.
+fn plausible_arj_header(data: &[u8], off: usize) -> bool {
+    let Some(h) = data.get(off..off + 11) else {
+        return false;
+    };
+    let basic_size = u16::from_le_bytes([h[2], h[3]]) as usize;
+    let first_size = h[4] as usize;
+    let host_os = h[8];
+    (30..=2600).contains(&basic_size)
+        && first_size >= 30
+        && first_size <= basic_size
+        && host_os <= 11
+}
+
 fn find_embedded_archive(data: &[u8]) -> Option<(usize, &'static str)> {
     if data.len() < 2 {
         return None;
@@ -50,8 +74,17 @@ fn find_embedded_archive(data: &[u8]) -> Option<(usize, &'static str)> {
     let hay = &data[1..]; // past offset 0
     let mut best: Option<(usize, &'static str)> = None;
     for &(sig, name) in SIGS {
-        if let Some(rel) = memchr::memmem::find(hay, sig) {
-            let off = rel + 1; // re-base onto the full buffer
+        // ARJ's magic is weak enough that the first hit is often noise, so its
+        // matches are walked until one carries a header that checks out. The
+        // other signatures are four bytes or more and are taken as they come.
+        let found = if name == "arj" {
+            memchr::memmem::find_iter(hay, sig)
+                .map(|rel| rel + 1)
+                .find(|&off| plausible_arj_header(data, off))
+        } else {
+            memchr::memmem::find(hay, sig).map(|rel| rel + 1)
+        };
+        if let Some(off) = found {
             if best.is_none_or(|(b, _)| off < b) {
                 best = Some((off, name));
             }

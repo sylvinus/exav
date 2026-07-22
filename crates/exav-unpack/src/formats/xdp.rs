@@ -51,8 +51,8 @@ pub(crate) fn extract_xdp<R>(
         // before we decode (4 base64 chars -> 3 bytes).
         let cap_peek = budget
             .limits
-            .max_entry_bytes
-            .min(budget.limits.max_total_bytes);
+            .max_buffer_bytes
+            .min(budget.limits.max_extracted_bytes);
         if b64.len() as u64 > cap_peek.saturating_mul(2).saturating_add(64) {
             return Err(LimitHit::new(
                 "xdp: embedded PDF exceeds budget".to_string(),

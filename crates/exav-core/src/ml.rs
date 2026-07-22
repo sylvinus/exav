@@ -79,8 +79,17 @@ pub trait Model: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// A weighted combination of interpretable signals (entropy, suspicious
-/// imports). Not a trained model; a placeholder until one is plugged in.
+/// A weighted combination of interpretable signals: entropy, packing shape and
+/// suspicious imports, each contributing a fixed amount to a score.
+///
+/// The weights are hand-chosen, not learned. That is a design point rather than
+/// a gap — every contribution is inspectable, so a detection can be explained
+/// by naming which signals fired, and the score cannot drift with a retrain.
+/// The [`Model`] trait exists so a trained classifier can replace this without
+/// touching the callers, and nothing here reports itself as one: the detection
+/// is `Heuristics.Static.Suspect.*` and the method is [`Method::Static`].
+///
+/// [`Method::Static`]: crate::Method::Static
 pub struct HeuristicModel;
 
 impl Model for HeuristicModel {

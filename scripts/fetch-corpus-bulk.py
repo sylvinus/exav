@@ -12,14 +12,12 @@ import io
 import os
 import sys
 import json
-import time
 import shutil
-import urllib.request
 
 import pyzipper
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mb_common import mb_key, corpus_dir
+from mb_common import mb_key, mb_post, save_info, corpus_dir
 
 API = "https://mb-api.abuse.ch/api/v1/"
 KEY = mb_key()
@@ -43,16 +41,7 @@ MIN_FREE_GB = 4.0  # stop before filling the disk
 
 
 def post(fields, retries=3):
-    data = "&".join(f"{k}={v}" for k, v in fields.items()).encode()
-    last = None
-    for _ in range(retries):
-        try:
-            req = urllib.request.Request(API, data=data, headers={"Auth-Key": KEY})
-            return urllib.request.urlopen(req, timeout=90).read()
-        except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(2)
-    raise last
+    return mb_post(fields, KEY, retries=retries)
 
 
 def list_type(ft):
@@ -117,8 +106,15 @@ def main():
                 continue
             if not payload:
                 continue
-            with open(os.path.join(d, sha + ".bin"), "wb") as f:
+            sample_path = os.path.join(d, sha + ".bin")
+            with open(sample_path, "wb") as f:
                 f.write(payload)
+            # Save the full MalwareBazaar metadata (family/tags/clamav/yara/…)
+            # as a sibling <sha>.json so the corpus is self-describing.
+            try:
+                save_info(sample_path, KEY)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! meta {sha[:12]} {e}")
             seen.add(sha)
             got += 1
             total += 1

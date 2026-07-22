@@ -35,10 +35,9 @@ impl MsZipDecompressor {
         // The pure-Rust `flate2` backend (miniz_oxide) has no
         // `inflateSetDictionary`, so we carry the history by prepending it as a
         // synthetic *stored* deflate block and decoding `[dict][block]` in ONE
-        // pass, then dropping the `dict` prefix. Doing it in a single
-        // `decompress_vec` call (rather than two, dict then data) is what makes
-        // the window correct for the 2nd+ block — the previous two-call priming
-        // decoded only the first block.
+        // pass, then dropping the `dict` prefix. The single call matters: priming
+        // in one call and decoding in another leaves the window wrong for every
+        // block after the first.
         self.decompressor.reset(false);
         let dict_len = self.dictionary.len();
         let mut input: Vec<u8> = Vec::with_capacity(dict_len + 5 + data.len());
@@ -47,9 +46,10 @@ impl MsZipDecompressor {
             let length = dict_len as u16;
             // A raw-deflate *stored* block: a header byte (BFINAL=0, BTYPE=00,
             // remaining bits ignored → 0x00), then LEN/NLEN, then the literal
-            // bytes. The previous code omitted this header byte, so the decoder
-            // consumed the first LEN byte as the block header and mis-primed the
-            // window — which is why every 2nd+ MSZIP block decoded to garbage.
+            // bytes. The header byte is easy to leave out and the failure is
+            // quiet: the decoder then takes the first LEN byte for the header,
+            // mis-primes the window, and every block after the first decodes to
+            // garbage that still looks like data.
             input.push(0x00);
             input.extend_from_slice(&length.to_le_bytes());
             input.extend_from_slice(&(!length).to_le_bytes());

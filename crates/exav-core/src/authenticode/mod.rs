@@ -7,7 +7,7 @@
 //!   * `goblin` (already a dependency) for the certificate table + the byte
 //!     ranges to hash ([`goblin::pe::PE::authenticode_ranges`]);
 //!   * `sha1`/`sha2` (already dependencies) for the hash + thumbprint;
-//!   * a small **vendored** DER reader ([`der`]) — so no `rsa`/`der`/`x509`/`nom`
+//!   * a small **vendored** DER reader (the `der` module) — so no `rsa`/`der`/`x509`/`nom`
 //!     crate enters the tree and everything stays `#![forbid(unsafe_code)]`.
 //!
 //! What this gives, with no signature-verification crypto:
@@ -83,8 +83,8 @@ struct CrbEntry {
 #[derive(Default)]
 pub struct CrbDb {
     blocked: Vec<CrbEntry>,
-    /// Raw `.crb` texts, retained so the on-disk DB cache can round-trip the
-    /// database by re-parsing (mirrors how bytecode sources are cached).
+    /// Raw `.crb` texts, retained so the on-disk database can round-trip the
+    /// database by re-parsing (mirrors how bytecode sources are stored).
     sources: Vec<String>,
 }
 
@@ -93,12 +93,12 @@ impl CrbDb {
         self.blocked.is_empty()
     }
 
-    /// The raw `.crb` source texts (for cache serialization).
+    /// The raw `.crb` source texts (for database serialization).
     pub fn sources(&self) -> &[String] {
         &self.sources
     }
 
-    /// Rebuild a database from cached raw `.crb` source texts.
+    /// Rebuild a database from stored raw `.crb` source texts.
     pub fn from_sources(sources: &[String]) -> Self {
         let mut db = Self::default();
         for s in sources {
@@ -268,10 +268,27 @@ fn parse_authenticode(pkcs7: &[u8]) -> Option<AuthContent> {
         return None;
     }
 
-    // SignedData: version, digestAlgorithms SET, encapContentInfo SEQUENCE,
-    // [0] certificates (optional), [1] crls (optional), signerInfos SET.
+    // SignedData ::= SEQUENCE { version INTEGER, digestAlgorithms SET,
+    //   encapContentInfo SEQUENCE, certificates [0] OPTIONAL,
+    //   crls [1] OPTIONAL, signerInfos SET }
+    //
+    // The first three fields are read BY POSITION, and their tags are checked.
+    // Taking `encapContentInfo` to be "the first SEQUENCE child" instead lets a
+    // blob that tags `digestAlgorithms` as a SEQUENCE substitute its own
+    // structure for the real one, and the digest read out of it then decides
+    // whether the signature is reported as covering the file. Position plus tag
+    // is what an ASN.1 template does, so a blob rejected here is a blob a real
+    // verifier rejects too.
     let sd: Vec<der::Tlv> = der::children(signed_data.content).collect();
-    let encap = sd.iter().find(|t| t.tag == der::SEQUENCE)?; // encapContentInfo
+    let version = sd.first()?;
+    let digest_algorithms = sd.get(1)?;
+    let encap = sd.get(2)?;
+    if version.tag != der::INTEGER
+        || digest_algorithms.tag != der::SET
+        || encap.tag != der::SEQUENCE
+    {
+        return None;
+    }
     let (digest_alg, message_digest) = parse_spc_digest(encap.content)?;
 
     // certificates [0] IMPLICIT: a concatenation of Certificate SEQUENCEs.
@@ -437,6 +454,40 @@ mod tests {
         assert_eq!(a.certs.len(), 1);
         assert_eq!(a.certs[0].subject_cn.as_deref(), Some("exav Test Signer"));
         assert!(a.certs[0].self_signed);
+    }
+
+    /// `encapContentInfo` is the THIRD field of `SignedData`, not "the first
+    /// child that happens to be a SEQUENCE".
+    ///
+    /// Retagging `digestAlgorithms` from SET to SEQUENCE puts an attacker-chosen
+    /// structure in front of the real `encapContentInfo`. A by-tag search reads
+    /// its digest instead of the signature's, and that digest is what decides
+    /// whether the signature is reported as covering the file. A real verifier
+    /// walks the template positionally and rejects the blob, so exav does too.
+    #[test]
+    fn a_retagged_digest_algorithms_field_cannot_stand_in_for_encap() {
+        let p7 = fixture("signeddata.p7b");
+        assert!(parse_authenticode(&p7).is_some(), "the fixture must parse");
+
+        // Locate the digestAlgorithms SET inside the buffer by walking the same
+        // structure the parser walks.
+        let ci = der::top(&p7).expect("ContentInfo");
+        let mut ci_children = der::children(ci.content);
+        let _content_type = ci_children.next().expect("contentType");
+        let content = ci_children.next().expect("[0] content");
+        let signed_data = der::children(content.content).next().expect("SignedData");
+        let sd: Vec<der::Tlv> = der::children(signed_data.content).collect();
+        let algs = sd.get(1).expect("digestAlgorithms");
+        assert_eq!(algs.tag, der::SET, "field 2 of SignedData is a SET");
+        let at = algs.full.as_ptr() as usize - p7.as_ptr() as usize;
+
+        let mut tampered = p7.clone();
+        tampered[at] = der::SEQUENCE;
+        assert!(
+            parse_authenticode(&tampered).is_none(),
+            "a SignedData whose second field is not a SET is malformed; parsing \
+             it anyway lets the wrong element supply the embedded digest"
+        );
     }
 
     /// A `.crb` block entry matches the fixture signer certificate by subject

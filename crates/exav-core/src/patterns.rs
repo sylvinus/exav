@@ -15,7 +15,7 @@ pub struct Pattern {
     pub bytes: Vec<u8>,
     /// Whether this pattern came from an unofficial (non-`.cvd`) database. The
     /// clean name is stored; the `.UNOFFICIAL` suffix is applied at report time
-    /// (compat mode). Defaults to `false` so older caches load as official.
+    /// (compat mode). Defaults to `false` so older databases load as official.
     #[serde(default)]
     pub unofficial: bool,
 }
@@ -59,6 +59,11 @@ pub struct PatternSet {
     /// The source patterns; the automaton is (re)built from these on demand.
     pub(crate) src: Vec<Pattern>,
     /// Number of source signatures skipped, e.g. wildcard `.ndb` bodies.
+    /// How many `.ndb` lines the STREAMING set could not carry. Most are
+    /// wildcard bodies, which the full buffered engine loads and matches
+    /// perfectly well — so this is streaming-set bookkeeping, **not** a
+    /// coverage gap, and must not be reported to users as skipped signatures.
+    /// See `Db::unsupported_count`.
     pub unsupported: usize,
 }
 
@@ -68,7 +73,7 @@ pub const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRU
 impl PatternSet {
     /// Build from literal patterns. `unsupported` records how many source
     /// signatures could not be represented (e.g. wildcard `.ndb` sigs). The
-    /// automaton itself is constructed lazily (see [`PatternSet::ac`]).
+    /// automaton itself is constructed lazily (see `PatternSet::ac`).
     pub fn build(patterns: &[Pattern], unsupported: usize) -> Result<Self, String> {
         Ok(Self {
             ac: OnceLock::new(),
@@ -239,3 +244,4 @@ mod tests {
         assert!(!stream_safe("", "")); // malformed → treated as constrained
     }
 }
+

@@ -22,7 +22,7 @@ fn hex_array<const N: usize>(hex: &str) -> Option<[u8; N]> {
 /// into a sorted key array plus a single concatenated `names` buffer (one
 /// allocation for all names, not one `String` per entry). Lookups binary-search
 /// the keys. Compared to a `HashMap<K, Box<str>>` over millions of entries this
-/// cuts both memory (no per-bucket/per-name overhead) and load time (a cache
+/// cuts both memory (no per-bucket/per-name overhead) and load time (a database
 /// deserializes into packed `Vec`s, not millions of hash inserts and string
 /// allocations).
 ///
@@ -95,7 +95,7 @@ impl<K: Ord + Clone> SortedTable<K> {
     fn get(&self, key: &K) -> Option<(&str, bool)> {
         let i = self.keys.binary_search(key).ok()?;
         let (off, len) = self.spans[i];
-        // `unofficial` may be empty when loading an older cache (serde default);
+        // `unofficial` may be empty when loading an older database (serde default);
         // treat a missing entry as official.
         let unofficial = self.unofficial.get(i).copied().unwrap_or(false);
         Some((&self.names[off as usize..(off + len) as usize], unofficial))
@@ -291,7 +291,7 @@ impl SectionHashDb {
 
     /// Parse `.mdb`/`.mdu`/`.msb` lines (`SectionSize:HASH:Name`). The first
     /// field is the size, the second the hash — the opposite field order from
-    /// `.hdb`, so this does not reuse [`parse_hash_line`].
+    /// `.hdb`, so this does not reuse `parse_hash_line`.
     pub fn extend_from_text(&mut self, text: &str) {
         self.extend_from_text_prov(text, false);
     }

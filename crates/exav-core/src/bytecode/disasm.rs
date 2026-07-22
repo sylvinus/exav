@@ -2,16 +2,24 @@
 //!
 //! The bytecode `disasm_x86(DISASM_RESULT*, len)` API decodes one instruction at
 //! the file cursor into a fixed 64-byte `DISASM_RESULT`, which programs read to
-//! match (poly/metamorphic) code patterns. We decode with `iced-x86` (pure
-//! Rust, decode-only — no native codegen, keeping the no-JIT posture) and
-//! translate into the ABI layout: a 287-value `real_op`, a `(reg/size/value)`
-//! per operand, and the operand-access encoding the format specifies.
+//! match (poly/metamorphic) code patterns. Decoding is `exav-x86` — pure Rust,
+//! decode-only, no dependencies — and this module translates its output into the
+//! ABI layout: a 287-value `real_op`, a `(reg/size/value)` per operand, and the
+//! operand-access encoding the format specifies.
 //!
-//! The translation is best-effort: opcodes/registers outside the common set map
-//! to `INVALID`. It is exercised but not yet validated against real polymorphic
-//! samples, so disasm-using programs stay gated like the rest.
+//! The translation is best-effort: opcodes and registers outside the ABI's set
+//! map to `INVALID`. It is exercised but not yet validated against real
+//! polymorphic samples, so disasm-using programs stay gated like the rest.
+//!
+//! **A decode this crate declines is not a decode that failed.** `exav-x86`
+//! returns `None` both for bytes that are not an instruction and for
+//! instructions outside its scope, and it cannot tell them apart. The caller in
+//! `exec.rs` therefore treats `None` as an *unsupported operation*, which
+//! discards the whole program's result, rather than as the ABI's "could not
+//! disassemble" return — a program that silently took a different branch would
+//! be a false negative with nothing to show for it.
 
-use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
+use exav_x86::{Insn, Mn, Op, Seg, Size};
 
 /// Size of `struct DISASM_RESULT`.
 pub const RESULT_SIZE: usize = 64;
@@ -33,9 +41,9 @@ const SIZEF: u8 = 3; // 6-byte (seg+reg pair)
 const SIZEQ: u8 = 4;
 const SIZET: u8 = 5; // 10-byte
 
-/// Map an iced memory-operand size to the `enum DIS_SIZE` value.
-fn mem_size(m: MemorySize) -> u8 {
-    match m.info().size() {
+/// Map a memory-operand width in bytes to the `enum DIS_SIZE` value.
+fn mem_size(bytes: u32) -> u8 {
+    match bytes {
         1 => SIZEB,
         2 => SIZEW,
         4 => SIZED,
@@ -338,6 +346,12 @@ const X86OPS: &[&str] = &[
 ];
 
 /// `enum X86REGS` names in order; the index is the register value.
+///
+/// The ABI transports a register as that index, so nothing here reads the
+/// names — but they are what makes the numbering in [`reg`] and [`seg_reg_num`]
+/// checkable against the ABI rather than trusted, and the length assertion in
+/// the tests is what keeps the table and the numbering in step.
+#[allow(dead_code)]
 const X86REGS: &[&str] = &[
     "EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI", "AX", "CX", "DX", "BX", "SP", "BP",
     "SI", "DI", "AH", "CH", "DH", "BH", "AL", "CL", "DL", "BL", "ES", "CS", "SS", "DS", "FS", "GS",
@@ -346,50 +360,71 @@ const X86REGS: &[&str] = &[
 ];
 const REG_INVALID: u8 = 54;
 
-/// Map an iced mnemonic to the `real_op` index.
-fn real_op(mn: Mnemonic) -> u16 {
-    let raw = format!("{mn:?}").to_uppercase();
-    // Reconcile the spellings that differ between iced and the ABI.
+/// Map a decoded mnemonic to the `real_op` index.
+fn real_op(mn: Mn) -> u16 {
+    let raw = mn.name().to_uppercase();
+    // Reconcile the spellings that differ between the decoder and the ABI.
     let name: &str = match raw.as_str() {
         "RET" => "RETN",
         "JE" => "JZ",
         "JNE" => "JNZ",
-        "JB" | "JNAE" => "JC",
-        "JAE" | "JNB" => "JNC",
-        "JNA" => "JBE",
-        "JNBE" => "JA",
-        "JNGE" => "JL",
-        "JNL" => "JGE",
-        "JNG" => "JLE",
-        "JNLE" => "JG",
-        "JPE" => "JP",
-        "JPO" => "JNP",
+        "JB" => "JC",
+        "JAE" => "JNC",
+        "XLATB" => "XLAT",
+        "IRETD" | "IRET" => "IRET",
         "MOVSXD" => "MOVSX",
         other => other,
     };
     X86OPS.iter().position(|&n| n == name).unwrap_or(0) as u16
 }
 
-/// Map an iced register to the `X86REGS` value.
-fn reg(r: Register) -> u8 {
-    if r == Register::None {
+/// Map a general-purpose register number and width to the `X86REGS` value.
+///
+/// The ABI orders its register file by width — eight 32-bit, then eight 16-bit,
+/// then the four high and four low byte registers — so the encoding's number
+/// indexes into the block its width selects.
+fn reg(num: u8, size: Size) -> u8 {
+    if num > 7 {
         return REG_INVALID;
     }
-    let name = format!("{r:?}").to_uppercase();
-    X86REGS
-        .iter()
-        .position(|&n| n == name)
-        .map(|i| i as u8)
-        .unwrap_or(REG_INVALID)
+    match size {
+        Size::B4 => num,
+        Size::B2 => 8 + num,
+        // The byte registers are `AL CL DL BL AH CH DH BH` by encoding number,
+        // but the ABI lists the high four before the low four.
+        Size::B1 => {
+            if num < 4 {
+                20 + num // AL..BL
+            } else {
+                16 + (num - 4) // AH..BH
+            }
+        }
+    }
 }
 
-fn imm_size(k: OpKind) -> u8 {
-    match k {
-        OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32 => SIZEB,
-        OpKind::Immediate16 => SIZEW,
-        OpKind::Immediate32 | OpKind::Immediate8to64 | OpKind::Immediate32to64 => SIZED,
-        OpKind::Immediate64 => SIZEQ,
-        _ => SIZED,
+/// Map a segment register to its `X86REGS` value.
+fn seg_reg_num(s: Seg) -> u8 {
+    match s {
+        Seg::Es => 24,
+        Seg::Cs => 25,
+        Seg::Ss => 26,
+        Seg::Ds => 27,
+        Seg::Fs => 28,
+        Seg::Gs => 29,
+    }
+}
+
+/// The `enum DIS_SIZE` value for an immediate, chosen by the width it needs
+/// rather than the width the encoding happened to store it in.
+fn imm_size(v: i64) -> u8 {
+    if i64::from(i8::MIN) <= v && v <= i64::from(i8::MAX) {
+        SIZEB
+    } else if i64::from(i16::MIN) <= v && v <= i64::from(i16::MAX) {
+        SIZEW
+    } else if i64::from(i32::MIN) <= v && v <= i64::from(i32::MAX) {
+        SIZED
+    } else {
+        SIZEQ
     }
 }
 
@@ -420,79 +455,102 @@ fn prefix_flags(bytes: &[u8], len: usize) -> (u8, u8) {
 pub fn disasm_one(bytes: &[u8]) -> Option<([u8; RESULT_SIZE], usize)> {
     let n = bytes.len().min(MAX_INSN);
     let slice = bytes.get(..n)?;
-    let mut dec = Decoder::new(32, slice, DecoderOptions::NONE);
-    if !dec.can_decode() {
-        return None;
-    }
-    let insn = dec.decode();
-    if insn.is_invalid() || insn.len() == 0 {
+    // The instruction is decoded as if it sat at address zero, so a relative
+    // branch resolves to a target the ABI's "displacement from the next
+    // instruction" can be recovered from by subtracting the length.
+    let insn = exav_x86::decode(slice, 0)?;
+    if insn.len == 0 {
         return None;
     }
 
     let mut r = [0u8; RESULT_SIZE];
-    r[0..2].copy_from_slice(&real_op(insn.mnemonic()).to_le_bytes());
+    r[0..2].copy_from_slice(&real_op(insn.mn).to_le_bytes());
     // opsize/adsize are flags (0 = default 32-bit, 1 = 16-bit via a 0x66/0x67
     // prefix), NOT a bit width — the ABI uses `s.opsize`/`s.adsize` verbatim.
-    // Detect the prefixes from the leading instruction bytes (skipping the
-    // other legacy prefixes), matching the reference decoder.
-    let (opsize, adsize) = prefix_flags(slice, insn.len());
+    let (opsize, adsize) = prefix_flags(slice, insn.len);
     r[2] = opsize;
     r[3] = adsize;
     r[4] = 0; // segment
 
-    for i in 0..3u32 {
-        let base = 5 + (i as usize) * 10;
-        if i >= insn.op_count() {
-            r[base] = ACCESS_NOARG;
-            continue;
-        }
+    for i in 0..3usize {
+        let base = 5 + i * 10;
         fill_arg(&mut r[base..base + 10], &insn, i);
     }
-    Some((r, insn.len()))
+    Some((r, insn.len))
 }
 
-fn fill_arg(arg: &mut [u8], insn: &Instruction, i: u32) {
-    match insn.op_kind(i) {
-        OpKind::Register => {
+fn fill_arg(arg: &mut [u8], insn: &Insn, i: usize) {
+    match insn.ops[i] {
+        Op::None => arg[0] = ACCESS_NOARG,
+        Op::Reg(num, size) => {
             arg[0] = ACCESS_REG;
-            arg[1] = reg(insn.op_register(i)); // for REG, [1] holds the register
+            arg[1] = reg(num, size); // for REG, [1] holds the register
         }
-        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+        Op::SegReg(s) => {
+            arg[0] = ACCESS_REG;
+            arg[1] = seg_reg_num(s);
+        }
+        // The x87 stack and the vector register files are not in the ABI's
+        // register file, which holds general-purpose registers only. A slot or
+        // a vector register therefore has no representation, and is reported as
+        // absent rather than as a general-purpose register of the same number —
+        // which would name `eax` for `xmm0` and read as a real operand.
+        Op::St(_) | Op::Xmm(_) | Op::Mmx(_) => arg[0] = ACCESS_NOARG,
+        Op::Rel(target) => {
             arg[0] = ACCESS_REL;
             arg[1] = SIZED;
-            // The ABI stores the relative displacement from the next instruction
-            // as a 64-bit value split low/high (`arg.q` then `arg.q >> 32`).
-            let target = insn.near_branch_target();
-            let next = insn.next_ip();
-            let q = target.wrapping_sub(next) as i32 as i64; // sign-extend
+            // The ABI stores the displacement from the *next* instruction as a
+            // 64-bit value split low/high (`arg.q` then `arg.q >> 32`).
+            let q = (target as i64).wrapping_sub(insn.len as i64) as i32 as i64;
             put32(arg, 2, q as u32);
             put32(arg, 6, (q >> 32) as u32);
         }
-        OpKind::Memory => {
+        Op::Mem {
+            base,
+            index,
+            scale,
+            disp,
+            size,
+            ..
+        } => {
             arg[0] = ACCESS_MEM;
-            arg[1] = mem_size(insn.memory_size()); // the ABI sets size for every arg
-            arg[2] = reg(insn.memory_index()); // r1 (scaled)
-            arg[3] = reg(insn.memory_base()); // r2 (added)
-            arg[4] = insn.memory_index_scale() as u8;
+            arg[1] = mem_size(size.bytes()); // the ABI sets size for every arg
+            arg[2] = index.map_or(REG_INVALID, |n| reg(n, Size::B4)); // r1 (scaled)
+            arg[3] = base.map_or(REG_INVALID, |n| reg(n, Size::B4)); // r2 (added)
+            arg[4] = scale;
             arg[5] = 0;
-            put32(arg, 6, insn.memory_displacement32());
+            put32(arg, 6, disp as u32);
         }
-        k @ (OpKind::Immediate8
-        | OpKind::Immediate8_2nd
-        | OpKind::Immediate16
-        | OpKind::Immediate32
-        | OpKind::Immediate64
-        | OpKind::Immediate8to16
-        | OpKind::Immediate8to32
-        | OpKind::Immediate8to64
-        | OpKind::Immediate32to64) => {
+        Op::MemWide {
+            base,
+            index,
+            scale,
+            disp,
+            bytes,
+            ..
+        } => {
+            arg[0] = ACCESS_MEM;
+            arg[1] = mem_size(u32::from(bytes));
+            arg[2] = index.map_or(REG_INVALID, |n| reg(n, Size::B4));
+            arg[3] = base.map_or(REG_INVALID, |n| reg(n, Size::B4));
+            arg[4] = scale;
+            arg[5] = 0;
+            put32(arg, 6, disp as u32);
+        }
+        Op::Imm(v) => {
             arg[0] = ACCESS_IMM;
-            arg[1] = imm_size(k);
-            let v = insn.immediate(i);
+            arg[1] = imm_size(v);
             put32(arg, 2, v as u32);
             put32(arg, 6, (v >> 32) as u32);
         }
-        _ => arg[0] = ACCESS_NOARG,
+        // A far pointer is two values where the ABI has one slot; the offset is
+        // the part a pattern would match on.
+        Op::FarPtr { offset, .. } => {
+            arg[0] = ACCESS_IMM;
+            arg[1] = SIZED;
+            put32(arg, 2, offset);
+            put32(arg, 6, 0);
+        }
     }
 }
 
@@ -517,7 +575,7 @@ mod tests {
         assert_eq!(len, 1);
         assert_eq!(u16::from_le_bytes([r[0], r[1]]), push);
         assert_eq!(r[5], ACCESS_REG);
-        assert_eq!(r[6], reg(Register::EBP));
+        assert_eq!(r[6], reg(5, Size::B4), "EBP");
 
         // 0xc3 = ret -> RETN
         let (r, _) = disasm_one(&[0xc3]).unwrap();
@@ -528,8 +586,11 @@ mod tests {
     fn reg_and_op_tables_have_expected_sizes() {
         assert_eq!(X86OPS.len(), 287);
         assert_eq!(X86REGS.len(), 54);
-        assert_eq!(reg(Register::EAX), 0);
-        assert_eq!(reg(Register::EDI), 7);
+        assert_eq!(reg(0, Size::B4), 0, "EAX");
+        assert_eq!(reg(7, Size::B4), 7, "EDI");
+        assert_eq!(reg(0, Size::B2), 8, "AX");
+        assert_eq!(reg(0, Size::B1), 20, "AL");
+        assert_eq!(reg(4, Size::B1), 16, "AH");
     }
 
     #[test]

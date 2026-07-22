@@ -163,25 +163,25 @@ impl Cabinet {
         &self.file_entries
     }
 
-    pub(crate) fn read_file(&self, name: &str) -> io::Result<FileReader<'_>> {
-        for file_entry in &self.file_entries {
-            if file_entry.name == name {
-                let start = file_entry.data_offset as usize;
-                let end = start + file_entry.uncompressed_size as usize;
-                if end > self.decompressed_data.len() {
-                    invalid_data!(
-                        "File extends past end of decompressed data (offset {}, size {})",
-                        start,
-                        file_entry.uncompressed_size
-                    );
-                }
-                return Ok(FileReader {
-                    data: &self.decompressed_data[start..end],
-                    pos: 0,
-                });
-            }
+    /// Read the member at a specific entry.
+    ///
+    /// A cabinet may hold two members under one name. Looking a member up by
+    /// name then yields the first one's bytes twice and never the second's, so a
+    /// walk over [`Self::file_entries`] reads each entry directly.
+    pub(crate) fn read_entry(&self, file_entry: &FileEntry) -> io::Result<FileReader<'_>> {
+        let start = file_entry.data_offset as usize;
+        let end = start + file_entry.uncompressed_size as usize;
+        if end > self.decompressed_data.len() {
+            invalid_data!(
+                "File extends past end of decompressed data (offset {}, size {})",
+                start,
+                file_entry.uncompressed_size
+            );
         }
-        not_found!("File not found in cabinet: {}", name);
+        Ok(FileReader {
+            data: &self.decompressed_data[start..end],
+            pos: 0,
+        })
     }
 }
 

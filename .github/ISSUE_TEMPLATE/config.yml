@@ -1,0 +1,13 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/sylvinus/exav/blob/main/SECURITY.md
+    about: >-
+      Do not open a public issue. SECURITY.md says how to report privately, and
+      what counts as a vulnerability in a scanner that is expected to be handed
+      hostile files.
+  - name: A file was missed, or wrongly detected
+    url: https://github.com/sylvinus/exav/blob/main/docs/DIFF_TESTING.md
+    about: >-
+      Detection differences are usually a signature question rather than an
+      engine bug. Check here first, and give a SHA-256 rather than the file.

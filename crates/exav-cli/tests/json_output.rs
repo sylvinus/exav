@@ -2,8 +2,18 @@
 
 use std::process::Command;
 
+// The binary's own temp-directory type, so the test suite needs no temp-file
+// dependency either.
+#[path = "../src/tmpfile.rs"]
+mod tmpfile;
+use tmpfile::TempDir;
+
 fn exav() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_exav"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_exav"));
+    // These tests deliberately run against the built-in EICAR-only baseline (empty
+    // `-d`); exav otherwise refuses to run with no real database.
+    c.env("EXAV_ALLOW_NO_DB", "1");
+    c
 }
 
 const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
@@ -11,8 +21,8 @@ const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TE
 #[test]
 fn json_output_is_valid_jsonl_with_expected_fields() {
     // Empty datadir -> only the builtin EICAR pattern loads (fast, no DB needed).
-    let db = tempfile::tempdir().unwrap();
-    let files = tempfile::tempdir().unwrap();
+    let db = TempDir::new().unwrap();
+    let files = TempDir::new().unwrap();
     let eicar = files.path().join("eicar.txt");
     std::fs::write(&eicar, EICAR).unwrap();
     let clean = files.path().join("clean.txt");
@@ -57,8 +67,8 @@ fn json_output_is_valid_jsonl_with_expected_fields() {
 
 #[test]
 fn json_infected_only_suppresses_clean() {
-    let db = tempfile::tempdir().unwrap();
-    let files = tempfile::tempdir().unwrap();
+    let db = TempDir::new().unwrap();
+    let files = TempDir::new().unwrap();
     let eicar = files.path().join("eicar.txt");
     std::fs::write(&eicar, EICAR).unwrap();
     let clean = files.path().join("clean.txt");
@@ -68,8 +78,9 @@ fn json_infected_only_suppresses_clean() {
         .arg("-d")
         .arg(db.path())
         .arg("--json")
-        .arg("--infected")
-        .arg("--no-summary")
+        // `--quiet` is the whole output dial: it suppresses the clean records
+        // and the summary together.
+        .arg("--quiet")
         .arg(&eicar)
         .arg(&clean)
         .output()

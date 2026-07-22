@@ -11,11 +11,27 @@ keywords.workspace = true
 categories = ["filesystem", "compression", "parser-implementations"]
 readme = "README.md"
 
+# The extractor CLI ships with the library rather than as a separate package.
+# It is a thin shell over the public API and needs nothing the library does not
+# already have — no argument parser, no error crate — so a library consumer pays
+# nothing for it (Cargo builds only the lib target for a dependency), and
+# `cargo install exav-unpack` gives the command, which is where people look for
+# it.
+[[bin]]
+name = "exav-unpack"
+path = "src/main.rs"
+
 [dependencies]
 # Always-on (format-agnostic) deps.
 thiserror = "2"
 # fast substring search (locating the UPX PackHeader magic, etc.)
 memchr = "2"
+
+# The x86 emulator that runs a packer's stub (`exav-pe-emu`). Its own crate because
+# it is useful on its own and because it is the only thing that needs a CPU
+# decoder: keeping it out of here means a build without `pepack` never compiles
+# `iced-x86` at all.
+exav-pe-emu = { version = "0.1.0", path = "../exav-pe-emu", optional = true }
 
 # --- Per-format optional deps. Each is pulled in only by the feature(s) below
 # that need it; a dep shared by several formats (e.g. `flate2`) is compiled if
@@ -29,6 +45,19 @@ tar = { version = "0.4", default-features = false, optional = true }
 bzip2-rs = { version = "0.1.2", optional = true }
 byteorder = { version = "1", optional = true }
 lzxd = { version = "0.2", optional = true }
+# FAT filesystem reader. Zero `unsafe`; `chrono` (timestamps) is left off, so the
+# only transitive deps are `bitflags` and `log`.
+fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"], optional = true }
+# LZNT1, the compression NTFS applies per compression unit. Single-purpose and
+# dependency-free; the MFT walk itself is in-tree.
+lznt1 = { version = "0.1", optional = true }
+# ext2/3/4 reader. Read-only by construction, no `unsafe`, no dependencies.
+ext4-view = { version = "0.9", optional = true }
+# LZW, for ZOO's LZD codec. Dependency-free.
+salzweg = { version = "0.1", optional = true }
+# InstallShield `.z` reader. Its only real dep is `explode` (MIT), a leaf
+# decoder for the PKWARE DCL "implode" codec those archives use.
+unshield = { version = "0.2", default-features = false, optional = true }
 # structured documents that contain embedded files
 cfb = { version = "0.14.0", optional = true }
 mail-parser = { version = "0.11.4", optional = true }
@@ -56,6 +85,12 @@ cbc = { version = "0.1", optional = true }
 bincode = { version = "1", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 flate2 = { version = "1.1.9", optional = true }
+# ZIP method 9 (Deflate64 / "enhanced deflate"). A leaf dep: zero runtime
+# dependencies, MIT, and `#![forbid(unsafe_code)]` like this crate. It is the
+# same decoder the `zip` crate uses behind its own `deflate64` feature; we depend
+# on it directly so the raw-bytes path (orphan local headers, where we never go
+# through the `zip` crate's reader) decodes method 9 too.
+deflate64 = { version = "0.1.12", optional = true }
 lzma-rust2 = { version = "0.16.4", default-features = false, features = ["std", "lzip"], optional = true }
 # PDF crypto primitives (replacing hand-rolled implementations)
 md-5 = { version = "0.10", optional = true }
@@ -68,21 +103,33 @@ crc32fast = { version = "1.5.0", optional = true }
 
 [features]
 default = ["all-formats", "decrypt"]
+# Makes a reserved byte prefix panic from inside the format dispatch, so the
+# `catch_unwind` boundary in `extract_each` can be tested for what it is: the
+# thing that turns an arbitrary decoder panic into a reported limit instead of a
+# dead process. Never enabled by a shipped build; the test suite turns it on.
+testing-faults = []
 # Every container/format exav can extract. Disable this (with
 # `default-features = false`) and enable only the formats you need for a smaller
 # build — e.g. `features = ["zip"]` for a ZIP-only extractor. A format exav
 # recognises but wasn't compiled to unpack is reported as unsupported (never
 # silently treated as clean), same as any undecodable member.
-all-formats = [
+all-formats = ["all-formats-no-emu", "pe-emu"]
+
+# Everything except the packer emulator, for a deployment that will not follow
+# attacker-supplied control flow. `pepack` stays in: it decompresses known
+# packers with native decoders and does not execute anything.
+all-formats-no-emu = [
     "zip", "gzip", "tar", "bzip2", "xz", "zstd", "lzip", "cab", "sevenz", "rar",
     "arj", "lha", "iso", "ole", "pdf", "email", "dmg", "upx", "ar", "cpio", "xar", "chm",
-    "uuencode", "xdp", "szdd", "tnef", "swf", "binhex", "lnk", "partition", "pyc",
+    "uuencode", "xdp", "szdd", "tnef", "swf", "binhex", "lnk", "partition", "vhd", "lzw",
+    "diskimage", "wim", "lz4", "arc", "ace", "stuffit", "alz", "egg", "hwp3",
+    "fat", "ext", "zoo", "ishieldz", "inno", "ntfs", "pyc",
     "nsis", "machofat", "sfx", "autoit", "onenote", "rtf", "pepack",
-    "javaclass", "aimodel", "screnc",
+    "javaclass", "aimodel", "screnc", "base64scan",
 ]
 
 # Archives / compressors.
-zip = ["dep:zip", "dep:flate2"]
+zip = ["dep:zip", "dep:flate2", "dep:deflate64"]
 gzip = ["dep:flate2"]
 tar = ["dep:tar"]
 bzip2 = ["dep:bzip2-rs"]
@@ -101,6 +148,8 @@ cpio = []
 # Single-file text/wrapper decoders.
 uuencode = ["dep:base64"]
 xdp = ["dep:base64"]
+# Scan text/script buffers for embedded base64-encoded executables.
+base64scan = ["dep:base64"]
 szdd = []
 tnef = []
 swf = ["dep:flate2", "dep:lzma-rust2"]
@@ -115,9 +164,16 @@ onenote = []
 rtf = []
 machofat = []
 sfx = []
-# PE runtime packers (aPLib-family unpack: Petite/FSG2/NsPack; detect-only for
-# the emulation-required protectors). No extra deps — pure Rust.
+# PE runtime packers: detection plus the aPLib-family static unpack
+# (Petite/FSG2/NsPack). Pure Rust, parses only — nothing is executed.
 pepack = []
+# Emulation-based unpacking: run the packer's own stub under `exav-pe-emu` and
+# capture the image it rebuilds. Its own switch, because it is the one thing in
+# the scanner that follows attacker-supplied *control flow* rather than parsing
+# attacker-supplied data; a deployment that will not accept that can compile it
+# out and keep the rest. Doing so costs coverage, never silence: a packed file
+# that no static unpacker opens is still reported `UNSCANNABLE`.
+pe-emu = ["pepack", "dep:exav-pe-emu"]
 # Java `.class` constant-pool surfacer (strings + class/name refs). Pure Rust.
 javaclass = []
 # AI model scanning: Python pickle opcode disassembly (dangerous-import
@@ -126,7 +182,36 @@ aimodel = []
 # Microsoft Script Encoder (VBScript/JScript.Encode, `#@~^`) decoder. Pure Rust.
 screnc = []
 xar = ["dep:flate2"]
-upx = ["dep:flate2", "dep:lzma-rust2"]
+vhd = []
+lzw = []
+diskimage = ["dep:flate2"]
+# WIM resources are verified against the SHA-1 the image records for each one.
+wim = ["dep:sha1"]
+lz4 = []
+arc = []
+ace = []
+stuffit = []
+# ESTsoft/Hancom Korean formats, all decoded.
+alz = ["dep:flate2", "dep:bzip2-rs"]
+egg = ["dep:flate2", "dep:bzip2-rs", "dep:lzma-rust2"]
+hwp3 = ["dep:flate2"]
+# FAT filesystem reader. Zero `unsafe`; `chrono` (timestamps) is left off, so the
+# only transitive deps are `bitflags` and `log`.
+fat = ["dep:fatfs"]
+# ext2/3/4, walked as a filesystem for the same reason as FAT: a fragmented file
+# comes back whole from the inode's block map and in pieces from a carve.
+ext = ["dep:ext4-view"]
+# ZOO carries LZD (LZW) and LZH — the latter is `lh5` on the wire, so `delharc`
+# already covers it.
+zoo = ["dep:salzweg", "dep:delharc"]
+# InstallShield `.z`. NOT the `ISc(` InstallScript cabinet, whose only
+# implementation is LGPL and which stays recognised-but-unopened.
+ishieldz = ["dep:unshield"]
+inno = []
+# NTFS is walked through the MFT rather than as a filesystem tree: a scanner
+# wants every file's bytes, and the MFT also still holds deleted records.
+ntfs = ["dep:lznt1"]
+upx = ["dep:flate2", "dep:lzma-rust2", "dep:base64"]
 
 # Structured documents.
 ole = ["dep:cfb"]
@@ -177,6 +262,8 @@ name = "rar5_check"
 required-features = ["rar"]
 
 [dev-dependencies]
+# Used only in tests to compare decoder output against external-oracle digests.
+sha2 = "0.10"
 # Reference PPMd7 (var.H) encoder, used only to validate the vendored PPMd7
 # model in `formats/ppmd7` against a known-good 7z-coder stream (CC0-1.0/MIT-0).
 ppmd-rust = "1"
@@ -187,3 +274,10 @@ cab = "0.6.0"
 # Used only in tests to prove the strict CFB reader rejects a malformed
 # compound file that exav's lenient OLE fallback still recovers.
 cfb = "0.14.0"
+
+# docs.rs builds with every feature on, so the parts gated behind a feature
+# (in particular exav-core's `unstable-internals`) appear on the rendered page
+# instead of silently missing from it.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

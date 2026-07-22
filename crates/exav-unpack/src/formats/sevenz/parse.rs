@@ -43,6 +43,9 @@ pub(super) const ID_PPMD: [u8; 3] = [0x03, 0x04, 0x01];
 pub(super) const ID_BZIP2: [u8; 3] = [0x04, 0x02, 0x02];
 pub(super) const ID_DEFLATE: [u8; 3] = [0x04, 0x01, 0x08];
 pub(super) const ID_BCJ_X86: [u8; 4] = [0x03, 0x03, 0x01, 0x03];
+/// BCJ2: the four-input x86 branch converter 7-Zip picks for executables at
+/// high compression settings.
+pub(super) const ID_BCJ2: [u8; 4] = [0x03, 0x03, 0x01, 0x1B];
 pub(super) const ID_BCJ_ARM: [u8; 4] = [0x03, 0x03, 0x05, 0x01];
 pub(super) const ID_BCJ_ARM64: [u8; 1] = [0x0A];
 pub(super) const ID_DELTA: [u8; 1] = [0x03];

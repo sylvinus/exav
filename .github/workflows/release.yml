@@ -42,7 +42,7 @@ jobs:
           bin: exav
           target: ${{ matrix.target }}
           archive: exav-$tag-$target
-          # YARA (wasmtime/Cranelift) is on by default; keep it for full parity.
-          # For a smaller pure-Rust binary, add: features: "" / no-default-features.
+          # YARA rule support is on by default; keep it for full parity.
+          # For a smaller binary, add: features: "" / no-default-features.
           token: ${{ secrets.GITHUB_TOKEN }}
           checksum: sha256

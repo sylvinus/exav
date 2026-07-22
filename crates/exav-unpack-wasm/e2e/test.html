@@ -4,10 +4,12 @@
 <body>
 <pre id="output"></pre>
 <script type="module">
-  import init, { Archive, unpack, detect_format } from "/pkg/exav_unpack_wasm.js";
+  // The facade, not the raw wasm module: the facade is what a page imports,
+  // and it is what decides whether an archive goes through a Worker.
+  import init, { Archive, unpack, detectFormat, joinVolumes, isVolumePart } from "/js/index.js";
 
   window.__test = {
-    Archive, unpack, detect_format,
+    Archive, unpack, detectFormat, joinVolumes, isVolumePart,
     ready: (async () => { await init(); return true; })(),
   };
 </script>

@@ -7,7 +7,7 @@ Cargo.lock.orig
 # downloaded signature DB and built caches (see `make cache`)
 /exav-db/
 *.cache
-*.exavcache
+*.exavdb
 # real-malware corpus must never be committed (the reproducible harness lives in
 # scripts/, not here — corpus/ holds only local, gitignored samples + data)
 /corpus/
@@ -28,8 +28,16 @@ crates/exav-unpack/tests/fixtures/**/real-malware-*
 .DS_Store
 __pycache__/
 *.pyc
+# …except the committed `.pyc` test fixtures, which are inputs to the scanner
+# rather than build output of the scripts. Without this they are tracked while
+# matching an ignore rule, so `git status` stays quiet about them but
+# `git ls-files -ci` flags them, and the next person to trust the pattern
+# deletes one.
+!crates/exav-unpack/tests/fixtures/**/*.pyc
 node_modules
 test-results/
 playwright-report/
 # fuzz corpora and artifacts — never commit
 fuzz/corpora/
+.cargo/lld/
+.cargo/config.toml

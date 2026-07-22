@@ -173,9 +173,20 @@ fn parse_streams_info(r: &mut SevenZReader) -> Result<StreamsInfo, LimitHit> {
                 sub_streams_info = Some(parse_sub_streams_info(r, &mut blocks)?);
             }
             NID_ADDITIONAL_STREAMS_INFO => {
-                // Skip additional streams info (encoded header chains)
-                // For now, just skip this and hope NID_END follows
-                // A proper implementation would recursively decode
+                // An encoded header chain, whose length is only knowable by
+                // decoding it. There is no way to step over it, so continuing
+                // would leave the reader misaligned and every field after this
+                // point would be read from the wrong offset — which does not
+                // announce itself, and can end as a short member list rather
+                // than an error.
+                //
+                // Reporting is the safer half of that trade: an archive using
+                // this comes back `Unscannable`, which says "nobody looked
+                // inside", where a misaligned parse can say "looked, found
+                // nothing".
+                return Err(LimitHit::corrupt(
+                    "7z: additional-streams info (encoded header chain) is not decoded".into(),
+                ));
             }
             _ => {
                 return Err(LimitHit::corrupt(format!(
@@ -766,7 +777,7 @@ fn decompress_encoded_header(
     // the *default* global peak-buffer limit. A header is metadata (not the
     // operator's tuning surface), and it must be buffered whole for random-access
     // parsing — so a fixed default ceiling is the right bound here.
-    let max_buffer = crate::Limits::default().max_buffer_bytes();
+    let max_buffer = crate::Limits::default().max_buffer_bytes;
 
     let chain = ordered_coder_iter(block);
     for coder_idx in chain {

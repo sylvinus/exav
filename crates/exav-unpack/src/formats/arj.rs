@@ -21,9 +21,17 @@ pub(crate) fn extract_arj<R>(
 
     // `ArjArchive` owns the whole input (it seeks by absolute offset). Bound that
     // buffer by the global peak-buffer limit.
-    if data.len() as u64 > budget.limits.max_buffer_bytes() {
+    if data.len() as u64 > budget.limits.max_buffer_bytes {
         return Err(LimitHit::new("arj archive exceeds max-buffer".to_string()));
     }
+    // A main header that will not parse means the archive cannot be opened at
+    // all. Reported `corrupt` (→ Unscannable), never silently clean.
+    //
+    // No local-header salvage here, unlike ZIP: the vendored reader is built
+    // around a main header, and an ARJ local file header is a different
+    // structure it cannot be started from. Recovering members without a main
+    // header is a new capability rather than a fallback, and pretending
+    // otherwise would report an archive as walked when nothing was enumerated.
     let mut arc = ArjArchive::new(data.to_vec())
         .ok_or_else(|| LimitHit::corrupt("arj: invalid header or CRC".to_string()))?;
     // Candidate passwords for garbled (encrypted) members. ARJ's GOST/garble
@@ -41,6 +49,23 @@ pub(crate) fn extract_arj<R>(
                 | CompressionMethod::CompressedFastest
         );
         if matches!(header.file_type, ArjFileType::Directory) || !supported {
+            // A directory carries no content, so skipping it hides nothing. An
+            // unsupported compression method is different: the member is there
+            // and the victim's extractor will unpack it, so report rather than
+            // step over it.
+            if !supported && !matches!(header.file_type, ArjFileType::Directory) {
+                if let Some(r) = visit(
+                    Entry::unsupported(
+                        header.name.clone(),
+                        header.compressed_size as u64,
+                        false,
+                        "unsupported ARJ compression method",
+                    ),
+                    budget,
+                ) {
+                    return Ok(Some(r));
+                }
+            }
             if !arc.skip(&header) {
                 return Err(LimitHit::corrupt("arj: truncated entry".to_string()));
             }
@@ -48,10 +73,25 @@ pub(crate) fn extract_arj<R>(
         }
         let cap = budget.reserve()?;
         if header.original_size as u64 > cap {
-            return Err(LimitHit::new(format!(
-                "arj member '{}' exceeds budget",
-                header.name
-            )));
+            // Too big to decompress within budget — but its metadata is still
+            // valid, so yield a metadata-only member rather than abandoning the
+            // archive. `.cdb` name/size signatures still match, and the members
+            // after this one still get scanned.
+            if let Some(r) = visit(
+                Entry::unsupported(
+                    header.name.clone(),
+                    header.original_size as u64,
+                    false,
+                    "ARJ member exceeds size budget",
+                ),
+                budget,
+            ) {
+                return Ok(Some(r));
+            }
+            if !arc.skip(&header) {
+                return Err(LimitHit::corrupt("arj: truncated entry".to_string()));
+            }
+            continue;
         }
         let name = header.name.clone();
         let buf = match arc.read(&header, budget.should_verify_checksums()) {
@@ -73,15 +113,47 @@ pub(crate) fn extract_arj<R>(
                 }
                 continue;
             }
+            // A member that will not decompress costs only itself. Aborting here
+            // strands every member after it: the archive is walked no further and
+            // nothing reports what was skipped, so a payload sitting behind one
+            // damaged member is never scanned. Same rule the ZIP walkers follow.
             None => {
-                return Err(LimitHit::corrupt(format!(
-                    "arj read '{name}': decompression failed"
-                )))
+                if let Some(r) = visit(
+                    Entry::unsupported(
+                        name,
+                        header.original_size as u64,
+                        false,
+                        "ARJ member failed to decompress",
+                    ),
+                    budget,
+                ) {
+                    return Ok(Some(r));
+                }
+                continue;
             }
         };
         ratio_guard(header.compressed_size as u64, buf.len() as u64, budget)?;
         budget.commit(buf.len() as u64);
         if let Some(r) = visit(Entry::new(name, buf), budget) {
+            return Ok(Some(r));
+        }
+    }
+    // The iterator can only say "no more entries". If it stopped on a malformed
+    // header rather than the archive's end marker, everything after that point
+    // was never enumerated — say so instead of returning as though the archive
+    // had been walked to the end. A wrong header CRC in particular must not be
+    // able to hide the rest of an archive.
+    if arc.stopped_early() {
+        budget.count_entry()?;
+        if let Some(r) = visit(
+            Entry::unsupported(
+                "<arj-headers-truncated>".to_string(),
+                0,
+                false,
+                "malformed ARJ header; remaining members not enumerated",
+            ),
+            budget,
+        ) {
             return Ok(Some(r));
         }
     }
@@ -141,43 +213,57 @@ mod tests {
         assert_eq!(entries[0].data, b"INNER-ARJ-PAYLOAD-12345");
     }
 
+    /// A header that declares less than it holds must be an error, not a panic.
+    ///
+    /// The header reader walks fixed-width fields off a slice whose length the
+    /// archive chose. Any declared size that runs out mid-field is ordinary
+    /// attacker input — and the CRC is over the header bytes, so an attacker
+    /// computes a valid one for whatever length they like. `extract` wraps the
+    /// decoder in a panic boundary, so this calls `extract_arj` directly: the
+    /// decoder itself has to hold.
+    ///
+    /// Every length from 0 up past the largest fixed field is covered, because
+    /// each one runs out at a different field.
     #[test]
     fn arj_short_header_no_panic() {
-        // Crafted ARJ: magic + header_size=4 + 4 bytes of header + valid CRC.
-        // unarj-rs 0.2.1 panics in MainHeader::load_from when it tries to read
-        // byte 5 of a 4-byte header.  After vendoring unarc-rs, this must
-        // return an error instead of panicking.
-        //
-        // Layout:  [60 EA] [04 00] [00 00 00 00] [CRC32 LE]
-        //            magic   hsize=4  header data    crc of header data
-        let header_data: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-        let crc = crc32fast::hash(&header_data);
-        let crc_bytes = crc.to_le_bytes();
+        for hsize in 0u16..40 {
+            let header_data = vec![0u8; hsize as usize];
+            let crc = crc32fast::hash(&header_data);
 
-        let data = [
-            0x60,
-            0xEA, // ARJ magic
-            0x04,
-            0x00, // header size = 4
-            0x00,
-            0x00,
-            0x00,
-            0x00, // 4-byte header data
-            crc_bytes[0],
-            crc_bytes[1],
-            crc_bytes[2],
-            crc_bytes[3], // CRC32
-        ];
+            // [60 EA] [hsize LE] [header bytes] [CRC32 LE]
+            let mut data = vec![0x60, 0xEA];
+            data.extend_from_slice(&hsize.to_le_bytes());
+            data.extend_from_slice(&header_data);
+            data.extend_from_slice(&crc.to_le_bytes());
 
-        // Call extract_arj directly (bypassing the catch_unwind in extract)
-        // to prove the decoder does NOT panic on this input.
-        let mut budget = Budget::new(Limits::default());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::extract_arj::<()>(&data, &mut budget, &mut |_, _| None)
-        }));
-        assert!(
-            result.is_ok(),
-            "ARJ decoder panicked on 4-byte header input"
-        );
+            let mut budget = Budget::new(Limits::default());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::extract_arj::<()>(&data, &mut budget, &mut |_, _| None)
+            }));
+            assert!(
+                result.is_ok(),
+                "the ARJ decoder panicked on a header declaring {hsize} bytes"
+            );
+        }
+    }
+
+    /// A back-reference is `res.len() - 1 - back_ptr`, so a reference equal to
+    /// the output written so far underflows. An empty output has nothing to
+    /// point back at, which makes the first token of a stream the easiest place
+    /// to reach it.
+    #[test]
+    fn arj_fastest_back_reference_bounds() {
+        use super::super::arj_parse::decode_fastest::decode_fastest;
+        // The bit patterns that decode to a back-reference are not obvious from
+        // the outside, so sweep short inputs instead of hand-crafting one: any
+        // stream whose first token is a match hits the empty-output case.
+        for seed in 0u16..=u16::MAX {
+            let bytes = seed.to_be_bytes();
+            let r = std::panic::catch_unwind(|| decode_fastest(&bytes, 64));
+            assert!(
+                r.is_ok(),
+                "decode_fastest panicked on the two-byte stream {bytes:02x?}"
+            );
+        }
     }
 }

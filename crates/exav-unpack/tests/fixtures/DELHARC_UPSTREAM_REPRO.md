@@ -69,9 +69,21 @@ length that exceeds the bytes actually remaining in the reader (or a sane
 absolute cap), rather than reserving the full declared size up front.
 
 ## exav mitigation
-exav's `Budget` can't see this (delharc allocates internally before yielding
-output), and `catch_unwind` doesn't catch an allocation. The network-facing
-prefork daemon contains it via `RLIMIT_AS` (worker killed + respawned). A robust
-library/CLI fix needs the upstream change above. The `lha_delharc_oom.lha`
-fixture is intentionally **not** wired into a live test (it would OOM CI on a
-large runner) until delharc bounds the allocation.
+`Budget` cannot see this allocation — delharc makes it internally, before
+yielding any output — and `catch_unwind` does not catch an allocation, which
+aborts rather than unwinding. So the bound has to be applied before the reader
+is handed the bytes.
+
+`header_worth_reading` in `src/formats/lha.rs` refuses a header that both reaches
+past the end of the archive *and* declares a size no archiver writes
+(`MAX_PLAUSIBLE_HEADER`, 16 MiB). Both conditions are required. Over-declaring
+alone is not grounds for refusal: this extractor is handed carved and embedded
+regions, where a genuine archive's header can legitimately describe more than
+the slice holds, and turning one of those into an `Unscannable` would hide a
+member from the scan — worth more to an attacker than the allocation it avoids.
+Requiring the size to be implausible as well keeps the check inside the region
+where delharc cannot succeed either: it would allocate, read short, and fail.
+
+The daemon's `RLIMIT_AS` remains the backstop for anything this misses.
+`lha_delharc_oom.lha` is wired into `tests/suites/lha_header_bounds.rs`, which is
+safe because the gate refuses it before delharc reserves.

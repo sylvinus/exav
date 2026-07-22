@@ -374,7 +374,7 @@ mod tests {
         d.push(0); // comp = 0 (stored)
         d.extend_from_slice(&((script.len() as u32) ^ KEY_SIZE).to_le_bytes()); // csize
         d.extend_from_slice(&((script.len() as u32) ^ KEY_SIZE).to_le_bytes()); // usize
-        d.extend_from_slice(&(0u32 ^ KEY_CRC).to_le_bytes()); // crc
+        d.extend_from_slice(&KEY_CRC.to_le_bytes()); // crc
         d.extend_from_slice(&[0u8; 16]); // two u64 timestamps
         d.extend_from_slice(&mt_apply(script, checksum.wrapping_add(KEY_CONTENT))); // content
         d
@@ -447,12 +447,12 @@ mod tests {
         d.extend_from_slice(MARKER_EA05);
         d.extend_from_slice(&[0u8; 16]);
         d.extend_from_slice(&mt_apply(b"FILE", KEY_FILE_TAG));
-        d.extend_from_slice(&(0u32 ^ KEY_SUBTYPE_LEN).to_le_bytes()); // empty subtype
-        d.extend_from_slice(&(0u32 ^ KEY_NAME_LEN).to_le_bytes()); // empty name
+        d.extend_from_slice(&KEY_SUBTYPE_LEN.to_le_bytes()); // empty subtype
+        d.extend_from_slice(&KEY_NAME_LEN.to_le_bytes()); // empty name
         d.push(1); // compressed
         d.extend_from_slice(&((comp.len() as u32) ^ KEY_SIZE).to_le_bytes());
         d.extend_from_slice(&((script.len() as u32) ^ KEY_SIZE).to_le_bytes());
-        d.extend_from_slice(&(0u32 ^ KEY_CRC).to_le_bytes());
+        d.extend_from_slice(&KEY_CRC.to_le_bytes());
         d.extend_from_slice(&[0u8; 16]);
         d.extend_from_slice(&mt_apply(&comp, KEY_CONTENT)); // checksum 0
         let mut budget = Budget::new(Limits::default());

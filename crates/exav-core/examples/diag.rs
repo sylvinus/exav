@@ -1,13 +1,13 @@
-// Diagnostic: load a cache, scan a file's raw bytes through the engine, and
+// Diagnostic: load a database, scan a file's raw bytes through the engine, and
 // print the match-work breakdown + timing. Temporary perf-analysis tool.
-use exav_core::{cache, filetype, pe};
+use exav_core::{database, filetype, pe};
 use std::time::Instant;
 
 fn main() {
     let mut a = std::env::args().skip(1);
-    let cache_path = a.next().unwrap();
+    let db_path = a.next().unwrap();
     let file = a.next().unwrap();
-    let db = cache::load(std::path::Path::new(&cache_path)).expect("load cache");
+    let db = database::load(std::path::Path::new(&db_path)).expect("load database");
     let data = std::fs::read(&file).unwrap();
     let ft = filetype::identify(&data);
     let layout = if ft == filetype::FileType::Pe {

@@ -10,7 +10,8 @@
 
 #[cfg(feature = "decrypt")]
 mod aes;
-mod decode;
+mod bcj2;
+pub(crate) mod decode;
 mod entry;
 mod header;
 mod parse;

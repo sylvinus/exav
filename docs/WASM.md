@@ -11,11 +11,11 @@ custom host code**.
 ```sh
 # 1. Build the WASM module
 rustup target add wasm32-wasip1
-cargo build --release --target wasm32-wasip1 -p exav-wasm
+cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 
 # 2. Strip debug names (~10% smaller)
 cargo install wasm-tools  # if not installed
-wasm-tools strip -a target/wasm32-wasip1/release/exav_wasm.wasm \
+wasm-tools strip -a target/wasm32-wasip1/release/exav-wasm.wasm \
   -o exav.wasm
 
 # 3. Install wasmtime (if you don't have it)
@@ -50,7 +50,7 @@ The WASM module is a plain WASI command — same as any CLI tool, but sandboxed:
 Progress and errors go to stderr. Results go to stdout — pipe to `jq`:
 
 ```sh
-wasmtime --dir ./sigs::/db --dir .::. exav_wasm.wasm /db *.exe 2>/dev/null | jq '.verdict'
+wasmtime --dir ./sigs::/db --dir .::. exav-wasm.wasm /db *.exe 2>/dev/null | jq '.verdict'
 ```
 
 ## Output format
@@ -148,15 +148,15 @@ trap — the host process is unaffected. This is the same isolation as the nativ
 ```sh
 # Requires Rust 1.85+ and the wasm32-wasip1 target
 rustup target add wasm32-wasip1
-cargo build --release --target wasm32-wasip1 -p exav-wasm
+cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 ```
 
-The output is `target/wasm32-wasip1/release/exav_wasm.wasm` (~5-6 MB).
+The output is `target/wasm32-wasip1/release/exav-wasm.wasm` (~5-6 MB).
 
 ## Limitations
 
 - **No daemon mode** — each `wasmtime run` invocation loads the DB from scratch.
-  For high-throughput scanning, use the native `exav --daemon` instead.
+  For high-throughput scanning, use a native `exav --listen` instead.
 - **No stdin streaming** — files must be on a mounted filesystem (WASI doesn't
   support the pipe-from-stdin pattern that native `exav` uses for streaming).
 - **No HTTP(S) scanning** — the WASM module can't make network requests, so
@@ -165,7 +165,47 @@ The output is `target/wasm32-wasip1/release/exav_wasm.wasm` (~5-6 MB).
   sandboxing layer adds some cost.
 - **DB loading is slower** — the full ClamAV DB build wants ~6 GiB transient
   RAM; in a WASM sandbox this is bounded by the runtime's memory limit. Use a
-  prebuilt cache for large DBs.
+  prebuilt database for large signature sets.
+
+## Two WASM surfaces, and how a third gets added
+
+"exav on WASM" means two different things, and the difference decides where new
+bindings go:
+
+| | `exav-core --features wasi-bin` | `exav-unpack-wasm` |
+|---|---|---|
+| target | `wasm32-wasip1` | `wasm32-unknown-unknown` |
+| artifact | a WASI **command** (`[[bin]]`) | a **`cdylib`** + JS glue |
+| runs in | wasmtime / wasmer / wazero | a browser, or Node |
+| talks over | argv, stdio, mounted dirs | `wasm-bindgen`, 848 lines of it |
+| in the workspace | yes | no — it needs its own `[profile.release]` and `wasm-pack` metadata |
+
+The WASI side needs no bindings at all: a `main()` and the standard library. The
+browser side is the one with a cost, and the cost is the binding layer, not the
+port — `exav-unpack`, `exav-core`, `exav-grep` and `exav-pe-emu` all already
+compile clean for `wasm32-unknown-unknown` with no changes.
+
+**Bindings live in one crate, not one crate per library.** Cargo's `crate-type`
+is a property of the `[lib]` target and cannot be turned on by a feature, so
+`#[wasm_bindgen]` cannot live inside `exav-unpack` itself and produce a `cdylib`
+only for WASM builds — every native build would link a `.so` too. That leaves two
+shapes, and the second is the one to grow into:
+
+- *One `-wasm` sibling per library.* Each is a crate, a `package.json`, a
+  `wasm-pack` invocation, a test suite and a publish step, with the same
+  `Uint8Array`-marshalling glue copied N times.
+- *One bindings crate, one surface per feature.* `unpack`, `scan`, `grep` and
+  `pe-emu` become Cargo features of a single `cdylib`; the JS glue for byte
+  marshalling, `ReadableStream` and error mapping is written once. Separate npm
+  packages still come out of it — the same source built N times with different
+  `--no-default-features --features …` and `--out-dir`, each rewritten to its own
+  package name — so a consumer who only wants the extractor still downloads only
+  the extractor's bytes.
+
+Module size is the reason to keep the feature gates honest rather than ship one
+fat bundle: `scripts/wasm-format-sizes.sh` measures each format's contribution on
+its own, and `docs/DEPENDENCIES.md` explains why that measurement must be taken
+after `wasm-opt`.
 
 ## Alternatives
 

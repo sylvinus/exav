@@ -15,4 +15,5 @@ pub(crate) mod ctype;
 pub(crate) mod file;
 pub(crate) mod folder;
 pub(crate) mod mszip;
+mod qtm;
 pub(crate) mod string;

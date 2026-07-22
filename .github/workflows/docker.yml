@@ -4,7 +4,7 @@
 # clamd-compatible daemon end-to-end (PING + an EICAR INSTREAM scan) so a broken
 # image can't merge. `publish` runs only on `v*` tags and pushes the multi-arch
 # image to ghcr.io with the built-in GITHUB_TOKEN. Pull with:
-#   docker run -d -p 3310:3310 -v exav-db:/var/lib/clamav ghcr.io/sylvinus/exav
+#   docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
 name: docker
 
 on:
@@ -32,10 +32,12 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Smoke-test the clamd-compatible daemon
         run: |
-          # Empty volume + no mirror: skip the wait-for-signatures and serve the
-          # built-in baseline immediately (it detects EICAR), so CI is fast.
+          # Empty volume + no mirror (no EXAV_SIG_SOURCES/EXAV_DB_URL = nothing
+          # to fetch): explicitly opt into serving the built-in EICAR-only
+          # baseline (--allow-no-db — refused by default) and skip the wait for a
+          # sidecar that is not coming, so CI is fast.
           docker run -d --name exav -p 3310:3310 \
-            -e CLAMAV_NO_FRESHCLAMD=true -e CLAMD_STARTUP_TIMEOUT=0 exav:ci
+            -e EXAV_STARTUP_WAIT_SECS=0 -e EXAV_ALLOW_NO_DB=1 exav:ci
           if ! python3 .github/docker-smoke.py 127.0.0.1 3310; then
             docker logs exav
             exit 1

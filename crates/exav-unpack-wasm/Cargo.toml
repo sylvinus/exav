@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
-rust-version = "1.85"
+rust-version = "1.91"
 description = "WebAssembly bindings for exav-unpack: in-browser, memory-safe universal archive extraction. Build with `wasm-pack build`."
 
 [lib]
@@ -13,10 +13,51 @@ crate-type = ["cdylib", "rlib"]
 
 # Forward exav-unpack's per-format features so a WASM build can include only the
 # formats it needs (e.g. `wasm-pack build -- --no-default-features --features zip`
-# for a ZIP-only extractor). `default = ["all-formats"]` keeps the full build.
+# for a ZIP-only extractor).
 [features]
-default = ["all-formats", "decrypt"]
+# ---------------------------------------------------------------------------
+# Build presets. Pick one; each is a complete choice rather than a starting
+# point. `npm run build:<name>` builds each.
+# ---------------------------------------------------------------------------
+#
+# `standard` — the default. Every format except the packer emulator.
+#
+#   `pe-emu` runs a packed executable's own stub under an x86 interpreter, which
+#   makes it the one component that follows control flow the scanned file
+#   supplies rather than parsing data it supplies. Its bounds are a fixed
+#   120M-instruction budget that no caller can lower, so a page that hits it
+#   hangs the tab. That is the wrong default for a browser, and the wrong thing
+#   to discover from a hung tab.
+#
+# `full` — everything, emulator included. Use it when packed executables are
+#   part of what you are opening and you have somewhere to put the work: a Web
+#   Worker, or a server-side runtime where a stalled instance costs nothing a
+#   user sees. Same code the CLI runs.
+#
+# `minimal` — zip, gzip and tar, which covers the overwhelming majority of
+#   browser uploads at a fraction of the module size.
+default = ["standard"]
+standard = ["all-formats-no-emu", "decrypt"]
+full = ["all-formats", "decrypt"]
+minimal = ["zip", "gzip", "tar"]
+
+# Makes a few reserved member names fail during extraction, each the way a
+# decoder can fail, so the browser tests can prove what happens when one does.
+#
+# `wasm32-unknown-unknown` is a `panic = "abort"` target, and none of these are
+# catchable in Rust: a panic traps, a failed allocation aborts, an exhausted
+# stack traps. The containment for all three is in JS. Containment nobody has
+# ever fired is a claim rather than a guarantee — and since no real input is
+# supposed to fail this way, the only way to fire it is to build one in.
+#
+# Deliberately absent from `default`, `standard`, `full` and `minimal`: reachable
+# only from a build that asks for it by name (`npm run build:e2e`), never from
+# anything published.
+testing-faults = []
+
+all-formats-no-emu = ["exav-unpack/all-formats-no-emu"]
 all-formats = ["exav-unpack/all-formats"]
+pe-emu = ["exav-unpack/pe-emu"]
 checksums = ["exav-unpack/checksums"]
 decrypt = ["exav-unpack/decrypt"]
 zip = ["exav-unpack/zip"]
@@ -43,13 +84,37 @@ xar = ["exav-unpack/xar"]
 
 # Size-optimised WASM release (this crate ships as a `.wasm`). `strip` drops the
 # name/debug sections; `wasm-pack`/`wasm-opt` then remove the wasm-bindgen
-# metadata section and shrink further. Panic stays `unwind` so the extractor's
-# `catch_unwind` containment still turns decoder panics into a clean result.
+# metadata section and shrink further.
+#
+# `wasm32-unknown-unknown` is a `panic = "abort"` target — check it with
+# `rustc --target wasm32-unknown-unknown --print cfg`. So the `catch_unwind`
+# that turns a decoder panic into a returned limit everywhere else in exav
+# catches NOTHING here: a panic traps the module, the instance's memory is gone,
+# and every later call into it fails. Input validation is the only containment
+# this build has, which is why the ZIP paths check offsets against the source
+# size before they index rather than relying on a boundary that is not there.
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# rustc targets a wasm baseline newer than the `wasm-opt` binary wasm-pack
+# downloads, and that wasm-opt rejects any instruction whose feature is not named
+# on the command line — so `wasm-pack build` fails outright without this list.
+# `memory.copy`/`memory.fill` come from bulk-memory, `i64.trunc_sat_f64_u` from
+# nontrapping-float-to-int. Every engine that can run this module has had all of
+# these since 2021.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    '-O',
+    '--enable-bulk-memory',
+    '--enable-nontrapping-float-to-int',
+    '--enable-sign-ext',
+    '--enable-mutable-globals',
+    '--enable-reference-types',
+    '--enable-multivalue',
+]
 
 [dependencies]
 exav-unpack = { path = "../exav-unpack", version = "0.1.0", default-features = false }
@@ -62,6 +127,10 @@ web-sys = { version = "0.3", features = [
     "BlobPropertyBag",
     "File",
     "FileReader",
+    # The only synchronous way to read a `Blob`, and so the only way an
+    # archive reader that is `Read + Seek` can run against one. Worker-only,
+    # which is why the `File` path runs in a Worker.
+    "FileReaderSync",
     "ReadableStream",
     "ReadableStreamDefaultController",
     "ReadableStreamDefaultReader",

@@ -97,6 +97,11 @@ pub struct ArjArchive {
     data: Vec<u8>,
     pos: usize,
     passwords: Vec<String>,
+    /// Set when header parsing failed part-way rather than reaching the archive's
+    /// end marker. The iterator can only say "no more entries", so without this
+    /// the caller cannot tell a clean end from a walk that stopped early — and
+    /// members after the break would vanish silently.
+    stopped_early: bool,
 }
 
 impl ArjArchive {
@@ -113,6 +118,7 @@ impl ArjArchive {
             data,
             pos,
             passwords: Vec::new(),
+            stopped_early: false,
         })
     }
 
@@ -129,13 +135,27 @@ impl ArjArchive {
     }
 
     pub fn get_next_entry(&mut self) -> Option<LocalFileHeader> {
-        let header_bytes = read_header(&self.data, &mut self.pos)?;
-        if header_bytes.is_empty() {
+        let Some(header_bytes) = read_header(&self.data, &mut self.pos) else {
+            // A bad header CRC, an implausible header size or a truncated read.
+            // Any of these ends the walk with members still ahead of us.
+            self.stopped_early = true;
             return None;
+        };
+        if header_bytes.is_empty() {
+            return None; // the archive's own end marker: a clean finish
         }
-        let hdr = LocalFileHeader::load_from(&header_bytes)?;
+        let Some(hdr) = LocalFileHeader::load_from(&header_bytes) else {
+            self.stopped_early = true;
+            return None;
+        };
         read_extended_headers(&self.data, &mut self.pos);
         Some(hdr)
+    }
+
+    /// Did enumeration stop on a malformed header rather than the end marker?
+    /// When true, members after the break were never seen.
+    pub fn stopped_early(&self) -> bool {
+        self.stopped_early
     }
 
     pub fn skip(&mut self, header: &LocalFileHeader) -> bool {
@@ -196,7 +216,7 @@ impl ArjArchive {
         // Content CRC-32: only enforced when checksum verification is on. By
         // default a scanner scans the decompressed bytes regardless of the CRC
         // (a corrupted checksum must not hide the payload). The size check above
-        // still guards against a genuinely truncated/garbage decode.
+        // still guards against a truncated or garbage decode.
         if verify_checksum && crc32fast::hash(&uncompressed) != header.original_crc32 {
             return None;
         }

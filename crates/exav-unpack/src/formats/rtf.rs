@@ -115,16 +115,54 @@ pub(crate) fn extract_rtf<R>(
         let (name, after) = control_token(data, i);
         if name == b"objdata" || name == b"datastore" {
             let (bytes, next) = decode_object(data, after);
+            // `next` sits just past the `}` that closed the destination, so drop
+            // that byte: the artifact should be the destination's content and
+            // nothing else.
+            let hex_end = match next.checked_sub(1) {
+                Some(e) if e >= after && data.get(e) == Some(&b'}') => e,
+                _ => next,
+            };
+            let hex = data.get(after..hex_end).unwrap_or(&[]);
             i = next;
             if bytes.is_empty() {
                 continue;
+            }
+            // Hex digits are case-insensitive by definition — `4D` and `4d` name
+            // the same byte — so a signature written against this destination's
+            // hex TEXT should match whichever case the writer chose. Emitting a
+            // lowercased copy makes that true for exactly the region where the
+            // format says case carries no meaning.
+            //
+            // The alternative in place today is a blunt instrument: exav
+            // lowercases any pure-ASCII file it types as text, which turns EVERY
+            // case-sensitive signature case-insensitive on a whole class of files
+            // to fix this one case, and flips behaviour on a single NUL byte.
+            // This rule can be stated in one sentence and defended; that one
+            // cannot.
+            //
+            // Only when it would differ: an already-lowercase destination is
+            // identical to bytes the raw scan has covered, so copying it would
+            // cost memory for nothing.
+            index += 1;
+            if hex.iter().any(|b| b.is_ascii_uppercase()) {
+                budget.count_entry()?;
+                let cap = budget.reserve()?;
+                if hex.len() as u64 <= cap {
+                    budget.commit(hex.len() as u64);
+                    let folded = hex.to_ascii_lowercase();
+                    if let Some(r) = visit(
+                        Entry::new(format!("rtf-objdata-hex-{index}"), folded),
+                        budget,
+                    ) {
+                        return Ok(Some(r));
+                    }
+                }
             }
             budget.count_entry()?;
             let cap = budget.reserve()?;
             if bytes.len() as u64 > cap {
                 return Err(LimitHit::new("rtf object exceeds budget".to_string()));
             }
-            index += 1;
             budget.commit(bytes.len() as u64);
             if let Some(r) = visit(Entry::new(format!("rtf-object-{index}"), bytes), budget) {
                 return Ok(Some(r));
@@ -169,6 +207,43 @@ mod tests {
         let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, payload);
+    }
+
+    #[test]
+    fn uppercase_hex_also_reaches_the_matcher_as_lowercase() {
+        // Hex digits are case-insensitive by definition, so a signature written
+        // against a destination's hex TEXT must match whichever case the writer
+        // used. Without this, catching the uppercase variant relied on exav
+        // lowercasing any pure-ASCII file it types as text — a rule that changes
+        // matching for EVERY signature on a whole class of files, and that flips
+        // on a single NUL byte.
+        let payload = b"MALWARETEST-upper";
+        let rtf = format!(
+            "{{\\rtf1{{\\object{{\\objdata {}}}}}}}",
+            hex(payload).to_uppercase()
+        );
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
+        let folded = entries
+            .iter()
+            .find(|e| e.name == "rtf-objdata-hex-1")
+            .expect("an uppercase destination must also be offered lowercased");
+        assert_eq!(folded.data, hex(payload).as_bytes());
+        // The decoded object is unaffected either way.
+        assert!(entries.iter().any(|e| e.data == payload));
+    }
+
+    #[test]
+    fn lowercase_hex_is_not_duplicated() {
+        // Already lowercase: identical to bytes the raw scan covers, so copying
+        // it would cost memory for nothing.
+        let payload = b"MALWARETEST-lower";
+        let rtf = format!("{{\\rtf1{{\\object{{\\objdata {}}}}}}}", hex(payload));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
+        assert!(entries
+            .iter()
+            .all(|e| !e.name.starts_with("rtf-objdata-hex")));
     }
 
     #[test]

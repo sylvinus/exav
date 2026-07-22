@@ -1,0 +1,140 @@
+---
+title: Prebuilt database
+description: Compile ClamAV signatures into a portable .exavdb once for a near-instant, low-memory cold start — and hot-reload it on atomic swap.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Loading raw ClamAV signatures means building a large in-memory automaton — tens
+of seconds and gigabytes of transient RAM. `--build-db` does that work **once**
+and writes a self-contained, portable `.exavdb` file; pointing `-d` at that file
+loads it directly, restoring the automaton instead of rebuilding it.
+
+## Rebuild after an engine upgrade
+
+A `.exavdb` is a compiled artefact, and its layout is tied to the engine that
+wrote it. When a release changes what the engine stores per signature, an older
+database will not load, and exav says so rather than starting with a
+partially-understood database:
+
+```text
+exav: loading database daily.exavdb: invalid type: boolean `false`, expected a tuple of size 2
+```
+
+The fix is to rebuild it from the signature sources with `--build-db`. Nothing
+is lost: the sources are the `.cvd`/`.cld` files `freshclam` or `cvdupdate`
+already fetched. If you ship a prebuilt database to other hosts, rebuild it as
+part of upgrading the binary, and keep the two versioned together.
+
+## Why it matters
+
+For the full Cisco/ClamAV official database (`main.cvd`+`daily.cvd`, ~3.7M
+signatures), the prebuilt database
+turns a **75 s / 5.6 GiB** raw load into a **3.5 s / 1.2 GiB** database load —
+roughly **19× faster** and **5× lighter** at cold start.
+
+The reason is where the memory goes. Building the daachorse double-array
+Aho-Corasick automaton from raw signatures spikes to ~3.6 GB transient for the
+full daily set — a one-shot construction burst, not steady state (the live
+structures are ~470 MB). Loading a prebuilt database deserializes ~the final
+size, skipping the construction transient entirely.
+
+<Aside type="note">
+Signatures vs the database are two distinct things:
+**signatures** are the raw ClamAV-format files you fetch with `cvdupdate` /
+`freshclam`; **the database** is the single compiled `.exavdb` exav builds from
+them. See [Signatures](/guides/signatures/) for the former.
+</Aside>
+
+## Build and load
+
+<Steps>
+
+1. Build the database on a host with enough RAM (the full build wants ~6–8 GiB):
+
+   ```sh
+   exav -d ~/.cvdupdate/database --build-db exav.exavdb
+   ```
+
+2. Distribute `exav.exavdb`, then load it cheaply everywhere:
+
+   ```sh
+   exav -d exav.exavdb /data                    # ~sub-second cold start
+   exav --listen 0.0.0.0:3310 -d exav.exavdb    # or serve it
+   ```
+
+</Steps>
+
+The intended workflow: **build the database daily on a capable host (or in CI),
+distribute the file, and have every CLI/daemon instance load it.** Constrained
+hosts never pay the build peak.
+
+## Building on a small host
+
+If you must build where RAM is tight, `--build-shard-memory <SIZE>` shards each
+large partition so no single automaton construction exceeds that transient (at a
+small scan-speed cost):
+
+```sh
+exav -d ~/.cvdupdate/database --build-db exav.exavdb --build-shard-bytes 1G
+```
+
+This bounds the per-shard *transient*, not the total peak — the resident parsed
+signature set (~2 GB for main+daily) sits under it, so peak ≈ shard size + that
+floor.
+
+<Aside type="caution">
+The database is a **trusted artifact** — build and fetch it over a channel you
+trust. It is framed `MAGIC | VERSION | payload | SHA-256`, so a torn or
+wrong-version file is rejected on load. It is not meant for arbitrary untrusted
+input.
+</Aside>
+
+## Updating a running deployment
+
+The daemon mtime-polls the database file (like clamd's `SelfCheck`), so updating
+it is just **recompile → atomic swap**:
+
+```sh
+# 1. Fetch fresh signatures, then recompile to a TEMP path (daemon keeps serving the old DB).
+cvd update -o /srv/exav/staging
+exav -d /srv/exav/staging --build-db /srv/exav/live.exavdb.tmp
+
+# 2. Atomically swap it in (rename on the same filesystem). The next poll (~10s)
+#    reloads and re-forks with the new signatures.
+mv /srv/exav/live.exavdb.tmp /srv/exav/live.exavdb
+```
+
+Building to a temp file + `rename()` means the poll only ever sees a complete
+database — a half-written file never gets served. The integrity frame lets the
+daemon reject a bad reload and keep serving the current DB.
+
+## Pulling the database over HTTP (build once, serve many)
+
+When the `.exavdb` is compiled on a build server and the scanners live elsewhere,
+the daemon can pull it over HTTP instead of sharing a volume — give it `--db-url`
+and ask for the signature lifecycle with `--auto-update` (needs an `http-update`
+build):
+
+```sh
+exav --listen /run/exav/exav.sock --auto-update --workers 4 \
+  --db-url https://build.internal/exav/live.exavdb \
+  -d /var/lib/exav/live.exavdb
+```
+
+`-d` names where the pulled database is written and therefore loaded from.
+Without it the destination is `<--sigs-dir>/remote.exavdb`.
+
+`--update-interval-secs` sets the re-check cadence here as it does for signature
+files, and defaults to **300 seconds** rather than a day: a prebuilt database is
+re-checked with a conditional `HEAD` that transfers nothing when it has not
+moved, so asking often costs almost nothing. One knob either way — how often exav
+re-checks is one question, and the default follows from how expensive the check
+is.
+
+Each poll is a cheap `HEAD` comparing the `ETag` / `Last-Modified`; only a
+changed validator triggers a conditional `GET`. A download is installed only
+after its `Content-Length` and trailing SHA-256 verify — a corrupt or interrupted
+download is rejected and the current database kept. Basic-auth credentials in the
+URL are sent as a header and **redacted from all logs**. See the
+[Docker guide](/guides/docker/) for the container equivalent.

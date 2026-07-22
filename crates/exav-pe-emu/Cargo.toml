@@ -1,0 +1,37 @@
+[package]
+name = "exav-pe-emu"
+description = "A sandboxed, bounded x86-32 emulator for unpacking PE runtime packers: runs a packer's stub and captures the image it rebuilds."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["emulator", "x86", "malware", "unpacking", "security"]
+categories = ["emulators", "parser-implementations"]
+readme = "README.md"
+
+# `cargo install exav-pe-emu` gives the command-line unpacker. The binary needs
+# nothing the library does not already have — no argument-parsing crate, no
+# error-handling crate — so shipping it here costs a library consumer nothing:
+# Cargo builds only the lib target for a dependency.
+[[bin]]
+name = "exav-pe-emu"
+path = "src/main.rs"
+
+[dependencies]
+# Decode-only: this crate turns bytes into instruction descriptions and supplies
+# the semantics itself. No assembler, no code generation, nothing executes.
+#
+# The decoder is dependency-free and `#![forbid(unsafe_code)]`, which matters
+# here more than anywhere else in exav: this is the one component where a
+# scanned file supplies control flow rather than data, so the bytes reach the
+# decoder directly and in volume.
+exav-x86 = { path = "../exav-x86", version = "0.1.0" }
+
+# docs.rs builds with every feature on, so the parts gated behind a feature
+# (in particular exav-core's `unstable-internals`) appear on the rendered page
+# instead of silently missing from it.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

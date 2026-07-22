@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="exav">
+  <!-- A shield (the safety claim) holding the wordmark as a 2x2 monogram. -->
+  <rect width="32" height="32" rx="8" fill="#0f9e8e"/>
+  <path fill="#fff" d="M16 3.4 26 6.6v12.1c0 4.9-4.1 8.1-10 10-5.9-1.9-10-5.1-10-10V6.6Z"/>
+  <g fill="#0f9e8e" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" font-weight="700" text-anchor="middle">
+    <text x="12.6" y="15.3">e</text>
+    <text x="19.4" y="15.3">x</text>
+    <text x="12.6" y="22.9">a</text>
+    <text x="19.4" y="22.9">v</text>
+  </g>
+</svg>

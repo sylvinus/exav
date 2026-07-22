@@ -31,15 +31,18 @@ fn err(reason: &str) -> LimitHit {
 
 /// Big-endian (MSB-first) bit reader over an in-memory byte slice, matching
 /// `rarBitReader`. Returns `None` on EOF (out of input).
-struct BitReader<'a> {
-    data: &'a [u8],
+struct BitReader {
+    /// Owned rather than borrowed so the decoder can outlive any one member's
+    /// packed data: a solid group hands the same decoder a fresh input stream
+    /// per member while keeping its window and tables.
+    data: Vec<u8>,
     pos: usize, // next byte index
     v: u64,     // accumulated bits
     n: u32,     // number of valid bits in v
 }
 
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+impl BitReader {
+    fn new(data: Vec<u8>) -> Self {
         BitReader {
             data,
             pos: 0,
@@ -225,9 +228,9 @@ impl HuffmanDecoder {
     /// readSym: decode one symbol. Returns None on decode failure / EOF.
     fn read_sym(&self, br: &mut BitReader) -> Option<i32> {
         let mut bits = MAX_CODE_LENGTH;
-        let v = match br.read_bits(MAX_CODE_LENGTH) {
-            Some(v) => v as i32,
-            None => return None, // out of data
+        let v = {
+            let v = br.read_bits(MAX_CODE_LENGTH)?;
+            v as i32
         };
 
         if v < self.limit[self.quickbits as usize] {
@@ -444,11 +447,18 @@ const SHORT_OFFSET_BASE: [i32; 8] = [0, 4, 8, 16, 32, 64, 128, 192];
 const SHORT_OFFSET_EXTRA_BITS: [u32; 8] = [2, 2, 3, 4, 5, 6, 6, 6];
 
 /// Result of a single decode operation.
+/// What the decoder found at the end of a block, from the two bits symbol 256
+/// is followed by.
 enum DecodeStep {
     Continue,
     Filter(Vec<u8>),
+    /// A new block, with new tables, in the same member.
     EndOfBlock,
+    /// The member ends here and the next one continues with the same tables.
     EndOfFile,
+    /// The member ends here and the next one starts a block of its own. In a
+    /// solid group this distinction decides whether the following member's data
+    /// begins with a table, so getting it wrong decodes table bits as symbols.
     EndOfBlockAndFile,
 }
 
@@ -907,7 +917,7 @@ impl Decoder29 {
             return Err(err("empty filter"));
         }
         let flags = buf[0];
-        let mut br = BitReader::new(&buf[1..]);
+        let mut br = BitReader::new(buf[1..].to_vec());
         let mut fb = FilterBlock {
             length: 0,
             offset: 0,
@@ -1001,14 +1011,18 @@ impl Decoder29 {
 const MAX_QUEUED_FILTERS: usize = 8192;
 
 /// The streaming decode reader, ported from `decodeReader`.
-struct DecodeReader<'a> {
+struct DecodeReader {
     win: Window,
     dec: Decoder29,
-    br: BitReader<'a>,
+    br: BitReader,
     tot: i64,
     outbuf: Vec<u8>,
     outbuf_pos: usize,
     eof: bool,
+    /// Whether the current block's tables are still in force. Cleared when a
+    /// member ends on `EndOfBlockAndFile`, so the next member of a solid group
+    /// reads its own block header.
+    tables_read: bool,
     err: Option<LimitHit>,
     // queued filterBlocks; offsets relative to previous filter in list.
     filters: VecDeque<QueuedFilter>,
@@ -1023,7 +1037,7 @@ struct QueuedFilter {
     global: Vec<u8>,
 }
 
-impl<'a> DecodeReader<'a> {
+impl DecodeReader {
     fn queue_filter(&mut self, mut f: FilterBlock) -> Result<(), LimitHit> {
         if f.reset {
             self.filters.clear();
@@ -1085,6 +1099,7 @@ impl<'a> DecodeReader<'a> {
                 }
                 Ok(DecodeStep::EndOfBlockAndFile) => {
                     self.eof = true;
+                    self.tables_read = false;
                     break;
                 }
                 Err(e) => {
@@ -1194,77 +1209,121 @@ impl<'a> DecodeReader<'a> {
 
 // ---- entry point ----------------------------------------------------------
 
-/// Decompress a RAR3 (unpack version 29) LZ-compressed member.
+/// A RAR3 (unpack version 29) decoder that can be reused across the members of
+/// a **solid** group.
 ///
-/// `packed` is the compressed data, `unpacked_size` the declared output size,
-/// `win_bits` the window log2 size (from the file-header window flag, typically
-/// 16..23). A fresh window is used (correct for non-solid single files).
+/// In a solid archive the files are compressed as one continuous LZ stream:
+/// each member has its own byte range of packed data and its own restarted bit
+/// reader, but the sliding window, the Huffman tables and the PPMd model carry
+/// over from the previous member. Decoding a solid member on a fresh window
+/// therefore does not fail — it produces plausible-looking wrong bytes, which
+/// is why every member's output is checked against the CRC the archive records.
+pub struct Unpacker29 {
+    dr: DecodeReader,
+}
+
+impl Unpacker29 {
+    /// `win_bits` is the window log2 size from the file header (typically
+    /// 16..23). All members of a solid group share the window, so it is sized
+    /// once, from the first member.
+    pub fn new(win_bits: u32, budget: &mut Budget) -> Result<Self, LimitHit> {
+        // The LZ sliding window is a whole-buffer allocation (RAR3 permits up to
+        // a 1 GiB dictionary). Bound it by the global peak-buffer limit so it
+        // can't dominate peak memory; a legitimate archive needing a larger
+        // window is reported rather than silently OOMing (operators raise
+        // --max-object-bytes).
+        let win_bytes = 1u64 << win_bits.min(30);
+        if win_bytes > budget.limits.max_buffer_bytes {
+            return Err(err("RAR window exceeds max-buffer"));
+        }
+        let mut dec = Decoder29::new();
+        dec.init_filters();
+        dec.lz.reset();
+        Ok(Unpacker29 {
+            dr: DecodeReader {
+                win: Window::new(win_bits),
+                dec,
+                br: BitReader::new(Vec::new()),
+                tot: 0,
+                outbuf: Vec::new(),
+                outbuf_pos: 0,
+                eof: false,
+                tables_read: false,
+                err: None,
+                filters: VecDeque::new(),
+            },
+        })
+    }
+
+    /// Decode one member. `solid` says the member continues the previous one's
+    /// stream, in which case the window and tables are kept.
+    pub fn member(
+        &mut self,
+        packed: &[u8],
+        unpacked_size: u64,
+        solid: bool,
+        budget: &mut Budget,
+    ) -> Result<Vec<u8>, LimitHit> {
+        let cap = budget.reserve()?;
+        if unpacked_size > cap {
+            return Err(err("declared size exceeds budget"));
+        }
+        // Pad the input with a few zero bytes: RAR's LZSS/PPMd encoders don't
+        // pad the bitstream, so decoding the final symbols of the last block can
+        // require reading a bit or two past the packed data. Output is bounded
+        // by `unpacked_size`, so the trailing zeros are never actually emitted.
+        // Mirrors the RAR5 unpacker's input padding.
+        let mut padded = Vec::with_capacity(packed.len() + 16);
+        padded.extend_from_slice(packed);
+        padded.extend_from_slice(&[0u8; 16]);
+        self.dr.br = BitReader::new(padded);
+        self.dr.eof = false;
+        self.dr.err = None;
+        if !solid {
+            // Filters never span the members of a solid group, so they are reset
+            // either way.
+            self.dr.filters.clear();
+            self.dr.dec.init_filters();
+        }
+        // A non-solid member starts its own block; a solid one resumes the block
+        // its predecessor was in the middle of, and reading a header here would
+        // consume symbols as if they were table data.
+        if !solid || !self.dr.tables_read {
+            self.dr.dec.read_block_header(&mut self.dr.br)?;
+            self.dr.tables_read = true;
+        }
+
+        let mut out: Vec<u8> = Vec::with_capacity(unpacked_size.min(1 << 20) as usize);
+        let mut buf = [0u8; 16 * 1024];
+        while (out.len() as u64) < unpacked_size {
+            let want = (unpacked_size - out.len() as u64).min(buf.len() as u64) as usize;
+            let n = self.dr.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            if out.len() as u64 + n as u64 > cap {
+                return Err(err("output exceeds budget"));
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+
+        if (out.len() as u64) < unpacked_size {
+            return Err(err("decoded fewer bytes than declared"));
+        }
+        out.truncate(unpacked_size as usize);
+        budget.commit(out.len() as u64);
+        Ok(out)
+    }
+}
+
+/// Decompress a single, non-solid RAR3 member on a fresh window.
 pub fn unpack29(
     packed: &[u8],
     unpacked_size: u64,
     win_bits: u32,
     budget: &mut Budget,
 ) -> Result<Vec<u8>, LimitHit> {
-    let cap = budget.reserve()?;
-    if unpacked_size > cap {
-        return Err(err("declared size exceeds budget"));
-    }
-    // The LZ sliding window is a whole-buffer allocation (RAR3 permits up to a
-    // 1 GiB dictionary). Bound it by the global peak-buffer limit so it can't
-    // dominate peak memory; a legitimate archive needing a larger window is
-    // reported rather than silently OOMing (operators raise --max-buffer).
-    let win_bytes = 1u64 << win_bits.min(30);
-    if win_bytes > budget.limits.max_buffer_bytes() {
-        return Err(err("RAR window exceeds max-buffer"));
-    }
-
-    let mut dec = Decoder29::new();
-    dec.init_filters();
-    dec.lz.reset();
-    // Pad the input with a few zero bytes: RAR's LZSS/PPMd encoders don't pad
-    // the bitstream, so decoding the final symbols of the last block can require
-    // reading a bit or two past the packed data. Output is bounded by
-    // `unpacked_size`, so the trailing zeros are never actually emitted. Mirrors
-    // the RAR5 unpacker's input padding.
-    let mut padded = Vec::with_capacity(packed.len() + 16);
-    padded.extend_from_slice(packed);
-    padded.extend_from_slice(&[0u8; 16]);
-    // First block header selects lz/ppm and initialises tables.
-    let mut br = BitReader::new(&padded);
-    dec.read_block_header(&mut br)?;
-
-    let mut dr = DecodeReader {
-        win: Window::new(win_bits),
-        dec,
-        br,
-        tot: 0,
-        outbuf: Vec::new(),
-        outbuf_pos: 0,
-        eof: false,
-        err: None,
-        filters: VecDeque::new(),
-    };
-
-    let mut out: Vec<u8> = Vec::with_capacity(unpacked_size.min(1 << 20) as usize);
-    let mut buf = [0u8; 16 * 1024];
-    while (out.len() as u64) < unpacked_size {
-        let want = (unpacked_size - out.len() as u64).min(buf.len() as u64) as usize;
-        let n = dr.read(&mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
-        if out.len() as u64 + n as u64 > cap {
-            return Err(err("output exceeds budget"));
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-
-    if (out.len() as u64) < unpacked_size {
-        return Err(err("decoded fewer bytes than declared"));
-    }
-    out.truncate(unpacked_size as usize);
-    budget.commit(out.len() as u64);
-    Ok(out)
+    Unpacker29::new(win_bits, budget)?.member(packed, unpacked_size, false, budget)
 }
 
 // ---- RAR3 filters (filters.go) --------------------------------------------
@@ -1324,7 +1383,7 @@ fn get_v3_filter(code: &[u8]) -> Result<V3Filter, LimitHit> {
         return Err(err("empty filter code"));
     }
     // Build a VM filter from the program.
-    let mut r = BitReader::new(&code[1..]); // skip xor check byte
+    let mut r = BitReader::new(code[1..].to_vec()); // skip xor check byte
     let mut vf = VmFilter {
         exec_count: 0,
         global: Vec::new(),

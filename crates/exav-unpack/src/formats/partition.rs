@@ -42,6 +42,12 @@ fn le_u32(d: &[u8], off: usize) -> u32 {
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
         .unwrap_or(0)
 }
+/// Read a little-endian `u16` at `off`, or `0` if out of bounds.
+fn le_u16(d: &[u8], off: usize) -> u16 {
+    d.get(off..off + 2)
+        .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+        .unwrap_or(0)
+}
 /// Read a big-endian `u32` at `off`, or `0` if out of bounds (APM is big-endian).
 fn be_u32(d: &[u8], off: usize) -> u32 {
     d.get(off..off + 4)
@@ -90,10 +96,57 @@ fn lba_range(
     Some((name, start, end - start))
 }
 
+/// The ClamAV alert name for an overlapping partition table in `data`, or
+/// `None` when the table is well-formed (or is not a partition map at all).
+///
+/// Two partitions that claim the same sectors are not a thing an installer
+/// produces. It is how an image shows one filesystem to the tool that mounts it
+/// and another to the tool that scans it — the same parser-confusion idea as
+/// overlapping ZIP records, one layer down.
+///
+/// The three names are ClamAV's exactly, **including the doubled `n` in
+/// `MBRPartitionnIntersect`**. That is a typo upstream, but the name is the API:
+/// a gateway filtering on it would not match a corrected spelling.
+pub fn intersection_alert(data: &[u8]) -> Option<&'static str> {
+    let mut cur = std::io::Cursor::new(data);
+    let regions = stream_offsets(&mut cur).ok()?;
+    // Only real partitions count; `stream_offsets` also emits zero-length marker
+    // regions for truncated tables, which are not partitions and cannot overlap.
+    let mut ranges: Vec<(u64, u64)> = regions
+        .iter()
+        .filter(|(_, _start, len)| *len > 0)
+        .map(|(_, start, len)| (*start, start.saturating_add(*len)))
+        .collect();
+    if ranges.len() < 2 {
+        return None;
+    }
+    ranges.sort_unstable();
+    let mut furthest = 0u64;
+    let mut intersects = false;
+    for (start, end) in ranges {
+        if start < furthest {
+            intersects = true;
+            break;
+        }
+        furthest = furthest.max(end);
+    }
+    if !intersects {
+        return None;
+    }
+    let head = &data[..data.len().min(2 * SECTOR)];
+    if is_gpt(head) {
+        Some("Heuristics.GPTPartitionIntersection")
+    } else if is_apm(head) {
+        Some("Heuristics.APMPartitionIntersection")
+    } else {
+        Some("Heuristics.MBRPartitionnIntersect")
+    }
+}
+
 /// Reader-based streaming: parse the GPT/APM/MBR table (tiny, near the start) via
 /// targeted reads and return each partition as `(name, offset, size)`. The
 /// partition data itself — which is the bulk of a disk image — streams via
-/// seek+take. Mirrors [`extract_partition`]'s ranges, validated against the true
+/// seek+take. Mirrors `extract_partition`'s ranges, validated against the true
 /// file length rather than an in-memory buffer.
 pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
     source: &mut R,
@@ -105,7 +158,15 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
     let mut out = Vec::new();
     if is_gpt(&head) {
         let entries_lba = le_u64(&head, SECTOR + 72);
-        let num_entries = le_u32(&head, SECTOR + 80).min(GPT_MAX_ENTRIES);
+        // Same truncation as the buffered path: clamping a parsed count silently
+        // discards the entries past the cap. `stream_offsets` has no reporting
+        // channel, so it emits a zero-length marker region that the caller
+        // surfaces rather than dropping the fact on the floor.
+        let declared = le_u32(&head, SECTOR + 80);
+        let num_entries = declared.min(GPT_MAX_ENTRIES);
+        if declared > GPT_MAX_ENTRIES {
+            out.push((format!("<gpt-partitions-beyond-{GPT_MAX_ENTRIES}>"), 0, 0));
+        }
         let entry_size = le_u32(&head, SECTOR + 84);
         if !(GPT_MIN_ENTRY_SIZE..=GPT_MAX_ENTRY_SIZE).contains(&entry_size) {
             return Ok(out);
@@ -141,7 +202,11 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             }
         }
     } else if is_apm(&head) {
-        let map_entries = be_u32(&head, SECTOR + 4).min(MAX_PARTS as u32);
+        let declared_map = be_u32(&head, SECTOR + 4);
+        let map_entries = declared_map.min(MAX_PARTS as u32);
+        if declared_map > MAX_PARTS as u32 {
+            out.push((format!("<apm-partitions-beyond-{MAX_PARTS}>"), 0, 0));
+        }
         let mut emitted = 0usize;
         for i in 0..map_entries as usize {
             if emitted >= MAX_PARTS {
@@ -167,9 +232,12 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             }
         }
     } else if head.get(510..512) == Some(&[0x55, 0xAA][..])
+        && !is_volume_boot_record(&head)
         && (0..4).any(|i| {
             // is_mbr, but ranges validated against the true file length rather
             // than the 1 KiB head, so a real (large) MBR image still qualifies.
+            // The guards must match `is_mbr` exactly: a check that lives in only
+            // one of the two paths leaves the other one wrong.
             let e = 0x1BE + i * 16;
             let status = head.get(e).copied().unwrap_or(0xFF);
             let ptype = head.get(e + 4).copied().unwrap_or(0);
@@ -179,6 +247,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
                 && ptype != 0x00
                 && ptype != 0xEE
                 && sectors > 0
+                && lba_first > 0
                 && lba_first.saturating_mul(SECTOR as u64) < total_len
         })
     {
@@ -220,8 +289,43 @@ fn is_apm(data: &[u8]) -> bool {
 
 /// Conservative MBR test: the `55 AA` boot signature at offset 510 plus at least
 /// one partition-table entry that actually looks like a partition.
+/// Does this sector look like a **volume boot record** — the first sector of a
+/// filesystem — rather than a partition table?
+///
+/// Both end in `55 AA` at offset 510, and a VBR's boot code occupies exactly the
+/// bytes where an MBR keeps its partition table, so boot code can read as a
+/// plausible partition entry. Getting this wrong is not a harmless false
+/// positive: the "partition" it invents can span the whole image, and a member
+/// identical to its container recurses until the depth limit, spending the
+/// budget that the filesystem's real contents needed.
+///
+/// The BIOS Parameter Block is what separates them. An MBR has no BPB; a FAT or
+/// NTFS VBR has a printable OEM name at offset 3 and a sector/cluster geometry
+/// that has to be powers of two in a narrow range.
+fn is_volume_boot_record(data: &[u8]) -> bool {
+    let Some(oem) = data.get(3..11) else {
+        return false;
+    };
+    if !oem.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+        return false;
+    }
+    // exFAT zeroes the classic BPB fields, so it is recognised by name.
+    if oem.starts_with(b"EXFAT") {
+        return true;
+    }
+    let bytes_per_sector = le_u16(data, 11);
+    let sectors_per_cluster = data.get(13).copied().unwrap_or(0);
+    matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096)
+        && sectors_per_cluster > 0
+        && sectors_per_cluster <= 128
+        && sectors_per_cluster.is_power_of_two()
+}
+
 fn is_mbr(data: &[u8]) -> bool {
     if data.get(510..512) != Some(&[0x55, 0xAA][..]) {
+        return false;
+    }
+    if is_volume_boot_record(data) {
         return false;
     }
     (0..4).any(|i| {
@@ -231,12 +335,16 @@ fn is_mbr(data: &[u8]) -> bool {
         let lba_first = le_u32(data, e + 8);
         let sectors = le_u32(data, e + 12);
         // status must be 0x00 (inactive) or 0x80 (bootable); a non-empty,
-        // non-protective type; a non-zero size; and a start that lands inside
-        // the image (so random bytes with 55 AA at 510 don't qualify).
+        // non-protective type; a non-zero size; a start that lands inside the
+        // image (so random bytes with 55 AA at 510 don't qualify); and a start
+        // past sector 0, which is where the MBR itself lives — a partition
+        // claiming to begin there would carve the whole image, including this
+        // very sector, and recurse into itself.
         (status == 0x00 || status == 0x80)
             && ptype != 0x00
             && ptype != 0xEE
             && sectors > 0
+            && lba_first > 0
             && (lba_first as usize).saturating_mul(SECTOR) < data.len()
     })
 }
@@ -298,20 +406,81 @@ fn extract_gpt<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Op
                       //   +80 num_entries (u32)
                       //   +84 entry_size (u32)
     let entries_lba = le_u64(data, hdr + 72);
-    let num_entries = le_u32(data, hdr + 80).min(GPT_MAX_ENTRIES);
+    let declared_entries = le_u32(data, hdr + 80);
+    // Clamping here is the guard, but it is also a truncation: entries past the
+    // cap describe real regions of the image that will not be walked. Report it
+    // rather than let `.min()` quietly discard them. (The `emitted >= MAX_PARTS`
+    // check further down can then never fire — this clamp is what bounds the
+    // loop — but it is kept as a belt-and-braces bound.)
+    let num_entries = declared_entries.min(GPT_MAX_ENTRIES);
+    if declared_entries > GPT_MAX_ENTRIES {
+        budget.count_entry()?;
+        if let Some(r) = visit(
+            Entry::unsupported(
+                format!("<gpt-partitions-beyond-{GPT_MAX_ENTRIES}>"),
+                0,
+                false,
+                "too many GPT partitions to walk them all",
+            ),
+            budget,
+        ) {
+            return Ok(Some(r));
+        }
+    }
     let entry_size = le_u32(data, hdr + 84);
     if !(GPT_MIN_ENTRY_SIZE..=GPT_MAX_ENTRY_SIZE).contains(&entry_size) {
-        return Ok(None); // implausible stride — refuse to walk it
+        // Refusing to walk an implausible stride is right, but the partitions
+        // are still there — say so instead of returning "nothing found".
+        budget.count_entry()?;
+        if let Some(r) = visit(
+            Entry::unsupported(
+                "<gpt>".to_string(),
+                0,
+                false,
+                "implausible GPT entry size; partition table not walked",
+            ),
+            budget,
+        ) {
+            return Ok(Some(r));
+        }
+        return Ok(None);
     }
     let base = (entries_lba as usize).saturating_mul(SECTOR);
     let mut emitted = 0usize;
     for i in 0..num_entries as usize {
         if emitted >= MAX_PARTS {
+            // Report the cap. Breaking quietly leaves the remaining partitions
+            // unscanned while the image could still be called clean.
+            budget.count_entry()?;
+            if let Some(r) = visit(
+                Entry::unsupported(
+                    format!("<gpt-partitions-beyond-{MAX_PARTS}>"),
+                    0,
+                    false,
+                    "too many GPT partitions to walk them all",
+                ),
+                budget,
+            ) {
+                return Ok(Some(r));
+            }
             break;
         }
         let e = base.saturating_add(i.saturating_mul(entry_size as usize));
-        // An entry we can't fully read (past EOF) ends the walk.
+        // An entry table running past EOF: the partitions it describes exist in
+        // the layout but cannot be read here.
         let Some(entry) = data.get(e..e.saturating_add(56)) else {
+            budget.count_entry()?;
+            if let Some(r) = visit(
+                Entry::unsupported(
+                    "<gpt-entry-table-truncated>".to_string(),
+                    0,
+                    false,
+                    "GPT partition entry table extends past the end of the image",
+                ),
+                budget,
+            ) {
+                return Ok(Some(r));
+            }
             break;
         };
         // All-zero type GUID marks an unused slot.
@@ -334,8 +503,25 @@ fn extract_gpt<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Op
 /// APM (big-endian): sector 0 is Block0 (`ER`); sectors 1.. each hold one
 /// partition-map entry (`PM`). The first entry's `mapEntries` bounds the count.
 fn extract_apm<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
-    // mapEntries from the first entry (sector 1), capped.
-    let map_entries = be_u32(data, SECTOR + 4).min(MAX_PARTS as u32);
+    // mapEntries from the first entry (sector 1), capped. The cap is a real
+    // truncation — entries past it describe regions of the image that will not
+    // be walked — so report it rather than let `.min()` discard them quietly.
+    let declared = be_u32(data, SECTOR + 4);
+    let map_entries = declared.min(MAX_PARTS as u32);
+    if declared > MAX_PARTS as u32 {
+        budget.count_entry()?;
+        if let Some(r) = visit(
+            Entry::unsupported(
+                format!("<apm-partitions-beyond-{MAX_PARTS}>"),
+                0,
+                false,
+                "too many APM partitions to walk them all",
+            ),
+            budget,
+        ) {
+            return Ok(Some(r));
+        }
+    }
     let mut emitted = 0usize;
     for i in 0..map_entries as usize {
         if emitted >= MAX_PARTS {
@@ -390,8 +576,62 @@ fn extract_mbr<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Op
     Ok(None)
 }
 
-#[cfg(test)]
+// The module compiles unconditionally (for the intersection heuristic), but
+// these drive `extract(Format::Partition, …)`, which needs the walker.
+#[cfg(all(test, feature = "partition"))]
 mod tests {
+    /// A FAT boot sector: a jump instruction, an OEM name, a BIOS Parameter
+    /// Block — and, at 446, ordinary boot code that happens to read as a
+    /// partition entry. Modelled on what `mformat` writes.
+    fn fat_boot_sector() -> Vec<u8> {
+        let mut b = vec![0u8; 2 * SECTOR];
+        b[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        b[3..11].copy_from_slice(b"MTOO4048");
+        b[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes per sector
+        b[13] = 1; // sectors per cluster
+                   // Boot code that parses as: bootable, type 0x01 (FAT12), LBA 0, 4096
+                   // sectors — i.e. a "partition" covering the entire image.
+        b[446] = 0x80;
+        b[446 + 4] = 0x01;
+        b[446 + 8..446 + 12].copy_from_slice(&0u32.to_le_bytes());
+        b[446 + 12..446 + 16].copy_from_slice(&4096u32.to_le_bytes());
+        b[510..512].copy_from_slice(&[0x55, 0xAA]);
+        b
+    }
+
+    #[test]
+    fn a_filesystem_boot_sector_is_not_a_partition_table() {
+        // Both a volume boot record and an MBR end in `55 AA`, and a VBR's boot
+        // code sits exactly where an MBR keeps its partition table. Reading one
+        // as the other invents a partition starting at LBA 0 that spans the whole
+        // image — a member identical to its container, which then re-detects the
+        // same way until the recursion limit is spent. The filesystem's real
+        // contents never get reached: a FAT image holding a zipped payload came
+        // back LIMITS-EXCEEDED instead of infected.
+        assert!(
+            !is_partition(&fat_boot_sector()),
+            "a FAT boot sector must not be taken for a partition table"
+        );
+    }
+
+    #[test]
+    fn a_partition_claiming_to_start_at_sector_zero_is_rejected() {
+        // Sector 0 is where the MBR itself lives, so no real partition begins
+        // there. Such an entry can only carve the whole image, including the
+        // table being read.
+        let mut b = vec![0u8; 2 * SECTOR];
+        b[510..512].copy_from_slice(&[0x55, 0xAA]);
+        b[446] = 0x80;
+        b[446 + 4] = 0x0C;
+        b[446 + 8..446 + 12].copy_from_slice(&0u32.to_le_bytes());
+        b[446 + 12..446 + 16].copy_from_slice(&2u32.to_le_bytes());
+        assert!(!is_mbr(&b));
+
+        // The same entry one sector in is a normal partition.
+        b[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(is_mbr(&b));
+    }
+
     use super::*;
 
     const MARKER: &[u8] = b"MALWARETEST";

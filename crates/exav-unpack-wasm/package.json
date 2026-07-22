@@ -9,15 +9,25 @@
     "url": "git+https://github.com/sylvinus/exav.git"
   },
   "files": [
+    "js/index.js",
+    "js/index.d.ts",
+    "js/worker.js",
     "pkg/exav_unpack_wasm_bg.wasm",
     "pkg/exav_unpack_wasm.js",
-    "pkg/exav_unpack_wasm.d.ts"
+    "pkg/exav_unpack_wasm.d.ts",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
   ],
-  "main": "pkg/exav_unpack_wasm.js",
-  "types": "pkg/exav_unpack_wasm.d.ts",
-  "sideEffects": [
-    "./snippets/*"
-  ],
+  "main": "js/index.js",
+  "types": "js/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./js/index.d.ts",
+      "default": "./js/index.js"
+    },
+    "./worker": "./js/worker.js"
+  },
   "keywords": [
     "wasm",
     "webassembly",
@@ -35,11 +45,15 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test",
+    "test:e2e": "npm run build:e2e && playwright test",
     "build": "wasm-pack build --release --target web",
-    "serve": "npx serve pkg -l 3847"
+    "build:e2e": "wasm-pack build --release --target web -- --features testing-faults",
+    "build:full": "wasm-pack build --release --target web -- --no-default-features --features full",
+    "build:minimal": "wasm-pack build --release --target web -- --no-default-features --features minimal",
+    "prepublishOnly": "npm run build && node -e \"for (const f of ['LICENSE','NOTICE','README.md']) if (!require('fs').existsSync(f)) { console.error('refusing to publish without ' + f + ': publish from the crate root, not pkg/'); process.exit(1); }\"",
+    "serve": "npx serve . -l 3847"
   },
-  "author": "",
+  "author": "Sylvain Zimmer",
   "bugs": {
     "url": "https://github.com/sylvinus/exav/issues"
   },

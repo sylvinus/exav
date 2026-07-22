@@ -20,9 +20,9 @@ It does **not** make the process unkillable. Safe Rust still terminates on:
 - **Hangs** — infinite loops or super-linear algorithms (algorithmic DoS).
 
 These are all **denial-of-service, not memory corruption** — far less severe (no
-code execution, no out-of-bounds disclosure), but a robust scanner must still
-contain them. That reframing is the whole point of the rewrite: the *same* logic
-error that is a silent out-of-bounds read in a C parser (potential RCE) is a
+code execution, no out-of-bounds disclosure), but the scanner must still
+contain them. That reframing is what memory safety buys: the *same* logic error
+that is a silent out-of-bounds read in a C parser (potential RCE) is a
 deterministic, safe `panic_bounds_check` here (at worst a DoS). Fuzzing finds
 those panics/aborts/hangs so we can eliminate or contain them.
 
@@ -41,8 +41,8 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | target          | entry point                       | covers                                   |
 |-----------------|-----------------------------------|------------------------------------------|
 | `analyze`       | `analyze()` — the whole scanner   | format detection → every extractor (recursively) → pattern/hash matching → PE/ML/fuzzy heuristics → bytecode. **Broadest; the primary target.** |
-| `full_pipeline` | all DB subsystems + scan API      | populates all DB subsystems (ndb/ldb/hdb/mdb/ldb/pdb/hsb/etc.) from fuzz text, then exercises `analyze()`, `analyze_all()`, `scan_seekable()`, and cache round-trip. **Most comprehensive single target.** |
-| `unpack`        | `unpack::extract()`               | all 21 archive formats with tight budgets; every parser exercised on every input |
+| `full_pipeline` | all DB subsystems + scan API      | populates all DB subsystems (ndb/ldb/hdb/mdb/ldb/pdb/hsb/etc.) from fuzz text, then exercises `analyze()`, `analyze_all()`, `scan_seekable()`, and database round-trip. **Widest single target.** |
+| `unpack`        | `unpack::extract()`               | every container format with tight budgets; every parser exercised on every input |
 | `ndb_compile`   | `EngineBuilder::add_ndb/ldb`      | NDB/LDB signature compilation edge cases |
 | `pe`            | PE parsing                        | section/import/resource parsing          |
 | `filetype`      | magic/type detection              | type sniffing                            |
@@ -50,20 +50,30 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | `sigs`          | signature compilation             | DB rule parsing                          |
 | `bytecode`      | `.cbc` bytecode loader            | bytecode verification                    |
 | `rar3_ppmd`     | RAR3 PPMd decompression          | PPMd/LZSS conversion path               |
+| `pe_emulator`   | `exav_pe_emu::unpack()`               | the x86 emulator that runs packer stubs: instruction decode + semantics, the emulated Windows environment, SEH, and the dump path. **The only target where the input supplies control flow rather than data** — and the only path from a scanned file to a dependency containing `unsafe` (the instruction decoder), so it is fuzzed through the entry point the scanner uses. Asserts the invariant the scanner relies on: anything emitted parses as a PE. |
+| `parser_recursion` | nesting depth, constructed        | Builds deep nesting from a couple of input bytes rather than waiting for the mutator to find it — every extra level needs another well-formed delimiter pair, so byte mutation stalls at two or three while this reaches thousands. Targets the failure the panic boundary cannot contain: `catch_unwind` catches a bounds check, not a stack overflow, and `max_recursion` bounds containers-inside-containers rather than a grammar that nests into itself. A finding looks like a crash with **no panic message**. |
+| `x86_decode`    | `exav_x86::decode()`                  | **differential against `iced-x86`**, which is compiled in as the oracle. Asserts six properties per input: never claim an encoding iced rejects; agree on length; agree on mnemonic; agree on the memory operand's base/index/scale/displacement and on every register operand's file, number and position; re-decoding from exactly the reported length gives the same answer; and no proper prefix of an instruction decodes. Declining is not a failure — `None` means "not an encoding this decoder claims", which the caller reports as unsupported. |
 
-The fuzz crate builds `exav-core` with **`default-features = false`** (no
-`yara-x`): the yara path pulls the heavy wasmtime/cranelift tree, which is
-pathological to compile under ASan on a constrained host and isn't exercised by
-the builtin-DB harness anyway (yara-x has its own fuzz suite). Everything we
-touch — archive parsers, decryption, PE, icon, the matcher — is reached without
-it.
+`x86_decode` earns its place beside the crate's own differential tests because
+those sweep the opcode maps with a **fixed instruction body** — one ModRM byte
+and a constant tail. The mistakes that survive a sweep live in the body: a SIB
+byte that decides whether a displacement exists, a `mod` field that changes its
+width, a prefix run that pushes the instruction past fifteen bytes. Mutation
+reaches those combinations; enumeration does not. A wrong length is the failure
+to watch, because it desynchronises every instruction after it rather than
+staying local.
+
+The fuzz crate builds `exav-core` with **`default-features = false`** (YARA off):
+the YARA path isn't exercised by the builtin-DB harness, and dropping it keeps
+ASan compile times down on a constrained host. Everything we touch — archive
+parsers, decryption, PE, icon, the matcher — is reached without it.
 
 All fuzz targets live in a single workspace (`fuzz/`). The `unpack` target
-exercises all 21 archive formats with tight budgets; `full_pipeline` exercises
-the full scan path including all DB subsystems and cache round-trip; `ndb_compile`
-exercises signature compilation edge cases. The separate `exav-unpack` fuzz
-workspace was removed since `analyze()` already reaches all extractors recursively
-through the `full_pipeline` target.
+exercises every container format with tight budgets; `full_pipeline` exercises
+the full scan path including all DB subsystems and database round-trip; `ndb_compile`
+exercises signature compilation edge cases. A single `full_pipeline` target covers
+all extractors — `analyze()` reaches them recursively — so there is no separate
+`exav-unpack` fuzz workspace.
 
 ## Seeding strategy (the multiplier)
 
@@ -80,10 +90,38 @@ Seeds and fuzzer-discovered inputs live in a **gitignored** work dir
 (`tmp/data/fuzzwork_analyze`), never the committed corpus, so a run never bloats
 the tree. The corpus accumulates across runs — coverage climbs monotonically.
 
-> One pitfall worth noting: don't seed a deliberately-pathological input. The
+> One pitfall: don't seed a deliberately-pathological input. The
 > `ppmd_lzss_conversion.rar` fixture decodes ~241 MB (its real test is
 > `#[ignore]`d); seeded, it just makes libFuzzer time out on it immediately and
 > abort. Exclude known-slow fixtures from the seed set.
+
+## Running a campaign
+
+`scripts/fuzz-campaign.sh` splits a wall-clock budget across every target, in
+fork mode, and reports what each one found:
+
+```sh
+scripts/fuzz-campaign.sh                          # one hour, split evenly
+TOTAL=1800 scripts/fuzz-campaign.sh               # half an hour
+TARGETS="analyze x86_decode" scripts/fuzz-campaign.sh
+```
+
+It builds every target **before** running any of them and refuses to start if
+one fails. That gate is not ceremony: `cargo fuzz run` per target, with its
+output piped away, turns a compile error into a target that "ran" and found
+nothing — the same shape in the log as a clean run, which is the worst possible
+way to be wrong about test coverage. It also reports only the artifacts *this*
+campaign produced, so a stale directory does not read as new findings.
+
+### Memory
+
+Building `exav-core` under AddressSanitizer is the memory peak of the whole
+repository: one rustc process, full instrumentation, and `codegen-units=1`,
+which `cargo fuzz` sets by default. On a small host that combination is what the
+OOM killer reaches for, and rustc dies with `signal: 9` rather than an error
+message. The campaign script therefore passes `--codegen-units 16` and builds
+one crate at a time; raise `CODEGEN_UNITS` on a larger machine for slightly
+faster fuzzing.
 
 ## Run modes
 
@@ -122,7 +160,7 @@ For each artifact (`fuzz/artifacts/<target>/{crash,timeout,oom}-*`):
      dep in place; the boundary makes hostile input a non-event for *every*
      decoder uniformly.)
    - **Timeout** → decide algorithmic-DoS vs budget-bound. RAR/PPMd decode is
-     CPU-heavy but bounded by `max_entry_bytes`/`max_total_bytes`; in production
+     CPU-heavy but bounded by `max_buffer_bytes`/`max_extracted_bytes`; in production
      the daemon's `RLIMIT_CPU`/`SIGALRM` cap wall-clock. A *super-linear* loop on
      small input is a real bug to fix.
    - **OOM** → an allocation sized from an attacker length field escaped the

@@ -21,7 +21,7 @@ const SAMPLE: usize = 8192;
 
 /// Heuristic: does this buffer look like text worth running normalised
 /// signatures over? Empty input is not textual; a buffer with more than ~1% NUL
-/// bytes, or fewer than [`TEXT_PERCENT`]% printable/whitespace/high bytes in its
+/// bytes, or fewer than `TEXT_PERCENT`% printable/whitespace/high bytes in its
 /// leading sample, is treated as binary.
 pub fn is_textual(data: &[u8]) -> bool {
     if data.is_empty() {

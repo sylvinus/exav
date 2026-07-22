@@ -1,0 +1,35 @@
+[package]
+name = "exav-grep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["grep", "search", "archive", "zip", "extract"]
+categories = ["command-line-utilities", "filesystem"]
+readme = "README.md"
+description = "grep for the inside of archives: search text across zip/rar/7z/tar/iso/OLE/PDF/email members, recursively, in memory."
+
+[[bin]]
+name = "exav-grep"
+path = "src/main.rs"
+
+[dependencies]
+exav-unpack = { path = "../exav-unpack", version = "0.1.0", default-features = false, features = ["all-formats"] }
+regex = "1"
+clap = { workspace = true }
+walkdir = { workspace = true }
+
+[features]
+default = ["decrypt"]
+# Decrypt encrypted members (ZIP/7z/DMG/Office) so their contents are searchable
+# rather than reported as unreadable.
+decrypt = ["exav-unpack/decrypt"]
+
+# docs.rs builds with every feature on, so the parts gated behind a feature
+# appear on the rendered page
+# instead of silently missing from it.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

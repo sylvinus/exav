@@ -111,7 +111,18 @@ mod http {
             }
             let off = (self.pos - self.block_start) as usize;
             if off >= self.block.len() {
-                return Ok(0);
+                // `self.pos < self.len` was established above, so the object is
+                // NOT finished — the server just did not give us the bytes it
+                // said existed (a short 206, a range it declined to honour, a
+                // truncated body). Returning `Ok(0)` here would report EOF, and
+                // every reader upstream would treat the object as merely
+                // truncated: a partial scan that comes back clean. Fail loudly
+                // instead so it surfaces as an error, never a quiet OK.
+                return Err(io::Error::other(format!(
+                    "range request for {} returned no data at offset {} \
+                     (object declares {} bytes)",
+                    self.url, self.pos, self.len
+                )));
             }
             let n = out.len().min(self.block.len() - off);
             out[..n].copy_from_slice(&self.block[off..off + n]);

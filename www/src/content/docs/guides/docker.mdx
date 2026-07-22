@@ -1,0 +1,172 @@
+---
+title: Docker
+description: Run exav as a container — a wire-level drop-in for the ClamAV Docker image, with four ways to populate signatures and a dual-container updater pattern.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The published image (`ghcr.io/sylvinus/exav`) is a **drop-in for the
+[ClamAV Docker image](https://docs.clamav.net/manual/Installing/Docker.html)** on
+the wire: same clamd port **3310**, same `clamd` protocol. It runs the
+clamd-compatible daemon by default, so a host `clamdscan` (or any clamd client)
+pointed at the container's TCP 3310 just works.
+
+It's **distroless and rootless**: a static-musl binary on `distroless/static`
+(no shell, no package manager) running as the `nonroot` user (uid 65532).
+Bind-mounted database volumes must be writable by that uid.
+
+## Run it
+
+```sh
+# Start the daemon; persist signatures in a named volume.
+docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+clamdscan --stream file.bin                       # host clamdscan over TCP
+
+# One-shot scan (overrides the default daemon):
+docker run --rm -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+```
+
+The image's default command is `--auto-update`, with `EXAV_LISTEN` set to
+`clamd://0.0.0.0:3310`: serve the clamd protocol, and keep the signature volume
+current — bootstrap it, wait for a sidecar to fill it if that is where signatures
+come from, refresh the configured sources on a schedule, and hot-reload on every
+change. Everything else comes from the environment, and **any flag on the command
+line overrides the matching variable**, never the other way round:
+
+```sh
+# EXAV_WORKERS is overridden; every other variable still applies.
+docker run -d -p 3310:3310 -e EXAV_WORKERS=8 -v exav-db:/var/lib/exav \
+  ghcr.io/sylvinus/exav --auto-update --workers 2
+```
+
+The signatures directory is `/var/lib/exav` (exav's own). To reuse an existing
+ClamAV volume, mount it there or set `EXAV_SIGS_DIR=/var/lib/clamav`.
+
+<Aside type="caution" title="Signatures are never bundled">
+exav ships no GPL database and no CDN URL. With no real signatures the daemon
+**refuses to serve** (unless `--allow-no-db` / `EXAV_ALLOW_NO_DB=1`, testing
+only). You must populate `/var/lib/exav` — the daemon hot-reloads it whenever it
+changes.
+</Aside>
+
+## Four ways to populate signatures
+
+<Tabs>
+  <TabItem label="Managed volume">
+    Mount a `/var/lib/exav` you keep current yourself with `cvd` / `freshclam`.
+    No updater in the container.
+  </TabItem>
+  <TabItem label="Built-in updater">
+    Set `EXAV_SIG_SOURCES` to CVD mirror bases you trust (a trailing `/` makes a
+    URL a mirror, expanding to `main`/`daily`/`bytecode.cvd`) or to exact feed
+    URLs; they merge. The container fetches on start and every
+    `EXAV_UPDATE_INTERVAL_SECS` after that. Needs the `http-update` build (the
+    default image). It's a plain HTTPS fetch with **no signature verification** —
+    trust the mirror.
+  </TabItem>
+  <TabItem label="Sidecar">
+    A second container writes the shared volume and the scanner hot-reloads it.
+    See the dual-container pattern below.
+  </TabItem>
+  <TabItem label="Prebuilt database">
+    Set `EXAV_DB_URL` to an `.exavdb` built elsewhere; the container pulls it
+    (integrity-checked) and hot-reloads on change. Build once, serve many.
+  </TabItem>
+</Tabs>
+
+## Environment variables
+
+Configure the container with exav's own `EXAV_*` variables — the four that
+matter for most deployments:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EXAV_SIGS_DIR` | `/var/lib/exav` | Signatures directory (loaded recursively). |
+| `EXAV_SIG_SOURCES` | *(unset)* | Where to fetch signatures from: exact URLs, mirror bases (trailing `/`), or a file of either. Comma-separated for more than one. |
+| `EXAV_DB_URL` | *(unset)* | URL of a prebuilt `.exavdb` to pull and serve; hot-reloads, and replaces the signature-file sources rather than merging with them. |
+| `EXAV_LISTEN` | `clamd://0.0.0.0:3310` | What the container serves, and where. Comma-separated for more than one. |
+
+Every flag has a variable spelled the same way, so
+**[Configuration](/reference/configuration/) documents the rest** — the startup
+wait, update interval, `EXAV_ALLOW_NO_DB`, `EXAV_ALLOW_SHUTDOWN`, and where a
+pulled database is stored.
+
+## Replacing a c-icap container
+
+The same image serves **ICAP (RFC 3507)** on port 1344 when `EXAV_LISTEN` names
+an `icap://` address, as a drop-in for a `c-icap` container running the
+`virus_scan` service against ClamAV. Adding one **adds** the listener, so one
+container replaces the `c-icap` + `clamav` pair rather than standing in for half
+of it:
+
+```sh
+docker run -d -p 3310:3310 -p 1344:1344 \
+  -e EXAV_LISTEN=clamd://0.0.0.0:3310,icap://0.0.0.0:1344 \
+  -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+```
+
+Both protocols are then served by one process, over one loaded database — which
+is the saving, since a full signature set costs seconds and gigabytes to load and
+a second container mostly exists to avoid paying that twice.
+
+For ICAP and nothing else, name the listener instead of taking the default
+command:
+
+```sh
+docker run -d -p 1344:1344 -v exav-db:/var/lib/exav \
+  ghcr.io/sylvinus/exav --listen icap://0.0.0.0:1344 --auto-update
+```
+
+The port is bound only when asked for. See the [ICAP guide](/guides/icap/) for
+the verdict mapping and the full settings table.
+
+When swapping over from the ClamAV image, translate that image's
+`CLAMAV_*`/`FRESHCLAM_*` settings to their `EXAV_*` equivalents — the mapping is
+in [Configuration](/reference/configuration/).
+
+## Rootless bind mounts
+
+When you bind-mount a host directory (instead of a named volume), make it
+writable by uid 65532 so the daemon can write signatures and temp files:
+
+```sh
+mkdir -p ./exav-db && sudo chown 65532:65532 ./exav-db
+docker run -d -p 3310:3310 -v "$PWD/exav-db:/var/lib/exav" ghcr.io/sylvinus/exav
+```
+
+## Dual container (shared volume)
+
+Separate the updater from the scanner: an updater container refreshes a shared
+volume and the **scanner** hot-reloads it — the setup in `docker-compose.yml`.
+"Updater" is `--auto-update` with nothing to listen on, so what each container
+does is on the line that starts it and neither can contradict itself:
+
+```yaml
+services:
+  exav:                       # scanner
+    image: ghcr.io/sylvinus/exav:latest
+    ports: ["3310:3310"]
+    volumes: [exav-db:/var/lib/exav]
+
+  updater:                    # writes the shared volume, doesn't scan
+    image: ghcr.io/sylvinus/exav:latest
+    command: ["--auto-update", "--update-interval-secs", "43200"]
+    environment:
+      EXAV_LISTEN: ""         # the image's default listener, switched off
+      EXAV_SIG_SOURCES: "${EXAV_SIG_SOURCES}"
+    volumes: [exav-db:/var/lib/exav]
+
+volumes:
+  exav-db:
+```
+
+The scanner notices the updated files on the shared mount (an mtime watch, like
+clamd's `SelfCheck`) and re-forks its worker pool with the new signatures — no
+restart, no cross-container signalling.
+
+<Aside type="tip">
+Because the reload is protocol-compatible, you can instead run Cisco's own
+`clamav/clamav` freshclam container as the updater and point its `NotifyClamd`
+at the exav scanner's clamd port — the `RELOAD` it sends is exactly what exav
+honors.
+</Aside>

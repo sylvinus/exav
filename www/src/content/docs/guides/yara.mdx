@@ -1,0 +1,100 @@
+---
+title: YARA rules
+description: exav's native YARA engine — load .yar/.yara rules alongside ClamAV signatures, with near-full feature coverage and no wasmtime or Cranelift.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+ClamAV loads `.yar`/`.yara` rules by default, so exav does too. `.yar`/`.yara`
+rule files load alongside ClamAV signatures and match in the same scan.
+
+## Using YARA rules
+
+Just drop rule files in your signature directory — they load recursively with
+everything else:
+
+```sh
+exav -d ./sigs -r /data          # sigs/ contains .cvd, .ndb, and .yar files
+```
+
+A YARA detection is reported like any other:
+
+```console
+sample.bin: YARA.SomeRuleName FOUND
+```
+
+YARA support is behind the **default-on** `yara` feature. Disable it with
+`--no-default-features` at build time if you want a lighter binary — the whole
+YARA dependency tree compiles away.
+
+## A native engine, not a wrapper
+
+exav ships its **own native YARA engine**. It keeps the light half of the
+[`yara-x`](https://github.com/VirusTotal/yara-x) crate (the parser) and replaces
+the heavy WASM back-end with a native tree-walking evaluator. That means:
+
+- **No wasmtime, no Cranelift, no `rsa`**, no runtime codegen at scan time (W^X
+  preserved). Depending on `yara-x` as a library pulls a large
+  WebAssembly-runtime subtree for its backend; the native engine links none of it.
+- YARA-X is BSD-3-Clause (permissive, MIT-compatible); exav legitimately reuses
+  and adapts its source and test vectors under that license, with attribution.
+
+<Aside type="note">
+This is categorically different from exav's hard "never derive from ClamAV" rule
+— that rule is GPL-specific and does not apply to BSD-licensed YARA-X.
+</Aside>
+
+## Feature coverage
+
+**Supported:** text / hex / regexp strings and all modifiers (`nocase`, `ascii`,
+`wide`, `fullword`, `xor`, `base64`, `base64wide`, `private`); full condition
+logic (boolean / `of` / counts / offsets / lengths / anchors / arithmetic /
+bitwise / float / comparisons / string operators / `matches`); `for … in` /
+`for … of` / `with`; integer reads (`uint`/`int` 8/16/32 + `_be`); `filesize`;
+`entrypoint`; **external variables** (`filename` / `filepath` / `extension` /
+`filetype` / `owner`); rule references; global/private rules; and the `pe`,
+`math`, `hash`, `string`, `time`, `elf`, and `dotnet` modules.
+
+**Not supported** — and rejected as **explicit compile errors**, never
+silently mis-evaluated: the `macho` / `dex` / `cuckoo` /
+`androguard` / … modules; `include`; `floatN()` reads; the `wide` modifier on
+*regexp* patterns; and a few fields of the implemented modules (`pe.rich_signature`,
+`pe.version_info`, resources, `pe.signatures`, `dotnet.classes`).
+
+<Aside type="tip" title="Rejections are never silent">
+exav compiles **per rule**, so one unsupported rule can't drop a whole feed.
+Every rejection is recorded (name + reason) and logged at database-build time —
+the coverage gap is always visible.
+</Aside>
+
+## Measured real-world coverage
+
+Compiled against public rulesets:
+
+| Ruleset | Rules | Compile clean |
+|---|---|---|
+| A large THOR-grade community ruleset | 5,904 | **98.3%** |
+| An older, broader community ruleset | 12,911 | **99.1%** |
+| A commercial vendor ruleset | 173 | **100%** |
+
+**Correctness:** ~17,300 rules were cross-checked against the real `yara-x` over
+varied inputs — **0 disagreements** on matching-rule sets. The coverage figures
+reflect correct matching rather than lenient parsing.
+
+The cross-check runs yara-x as a program (`yr`) rather than linking it: as a
+dependency it brings its WebAssembly-runtime subtree in for the benefit of two
+test files, and exav's own build contains no JIT backend at all. Install it with
+`cargo install yara-x-cli` and run `make test-yara-diff`; without it the harness
+skips, so read its output rather than only its exit code.
+
+## Using the engine directly
+
+The engine is `exav_core::yara`, and it works as a standalone YARA library:
+
+```rust
+use exav_core::yara::{Compiler, Scanner};
+let mut c = Compiler::new();
+c.add_source(r#"rule demo { strings: $a = "evil" condition: $a }"#)?;
+let rules = c.build();
+let hit = Scanner::new(&rules).scan(b"...evil...").matching_rules().next().is_some();
+```

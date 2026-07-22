@@ -16,18 +16,37 @@ name = "exav"
 path = "src/main.rs"
 
 [features]
-default = ["yara", "all-formats", "decrypt", "dlp"]
-# Full YARA rule matching (yara-x). ON by default — it's pure-Rust. Disable with
-# `--no-default-features` for a much smaller build (~140 fewer crates: drops the
-# wasmtime/Cranelift subtree).
+default = ["yara", "all-formats", "decrypt", "dlp", "icap"]
+# ICAP (RFC 3507) server, so exav can stand in for a `c-icap` container at a
+# proxy's adaptation hook. ON by default — pure-Rust, std-only, no extra crates
+# — because the published image has to be able to serve it. It still binds
+# nothing unless `--icap` asks it to.
+icap = []
+# Full YARA rule matching via the native engine in exav-core. ON by default —
+# pure-Rust, no runtime codegen. Disable with `--no-default-features` for a
+# smaller build (~13 fewer crates: drops the YARA parser + regex-automata).
 yara = ["exav-core/yara"]
-# HTTP(S) URL/range scanning (scan an `http(s)://` argument + the daemon
-# `SCANURL` command). OFF by default so the standard build is 100% pure-Rust and
+# Lets a scanned file ask a decoder to panic, abort or exhaust the stack, so the
+# tests can check what the CLI reports when one does. A crash that a caller
+# cannot tell from a clean scan is the worst outcome exav has, and that is only
+# observable from outside the process. Never enabled by a shipped build.
+testing-faults = ["exav-core/testing-faults"]
+# HTTP(S) support. OFF by default so the standard build is 100% pure-Rust and
 # links no TLS stack — `ureq → rustls → ring` is the only C/asm in the tree.
-# Build with `--features http` to enable it (see the dependency audit). It also
-# pulls in the standalone `exav-update` crate, so the container's `--serve` mode
-# can fetch signatures from a user-supplied mirror (EXAV_DB_MIRROR).
-http = ["exav-core/http", "dep:exav-update"]
+# Split into two independently-selectable halves so a deployment can take the
+# signature updater WITHOUT exposing the network-facing scan verb (or vice versa):
+#
+#   * `http-scan`   — scan an `http(s)://` argument + the daemon `SCANURL` command.
+#                     This lets a daemon *client* make the daemon fetch a URL, so
+#                     leave it off on an updater-only or untrusted-client daemon.
+#   * `http-update` — what `--auto-update` fetches with: `--sig-sources` (exact
+#                     URLs, CVD mirror bases, or a file of either) and `--db-url`
+#                     (pull a prebuilt `.exavdb`). Pulls the `exav-update` crate.
+#
+# `http` enables both (unchanged meaning; the published image builds with it).
+http = ["http-scan", "http-update"]
+http-scan = ["exav-core/http"]
+http-update = ["dep:exav-update"]
 checksums = ["exav-core/checksums"]
 # DLP structured-data heuristic (credit-card / SSN counting). Enables the
 # `--structured-cc-count` / `--structured-ssn-count` flags. Tiny, pure-Rust.
@@ -68,6 +87,16 @@ swf = ["exav-core/swf"]
 binhex = ["exav-core/binhex"]
 lnk = ["exav-core/lnk"]
 partition = ["exav-core/partition"]
+vhd = ["exav-core/vhd"]
+lzw = ["exav-core/lzw"]
+diskimage = ["exav-core/diskimage"]
+wim = ["exav-core/wim"]
+lz4 = ["exav-core/lz4"]
+arc = ["exav-core/arc"]
+ace = ["exav-core/ace"]
+fat = ["exav-core/fat"]
+inno = ["exav-core/inno"]
+ntfs = ["exav-core/ntfs"]
 pyc = ["exav-core/pyc"]
 nsis = ["exav-core/nsis"]
 autoit = ["exav-core/autoit"]
@@ -88,9 +117,10 @@ libc = "0.2.186"
 regex = "1.12.4"
 # Machine-readable `--json` output.
 serde_json = "1"
-# Spill large INSTREAM/EXINSTREAM payloads to a temp file so container-aware
-# scanning works at any stream size (like clamd) with bounded memory.
-tempfile = "3"
+# Spilling large INSTREAM/EXINSTREAM payloads to a temp file is `src/tmpfile.rs`,
+# deliberately not a dependency: the ready-made crates reach it through `rustix`
+# + `linux-raw-sys`, thousands of unsafe blocks for a feature that never touches
+# a scanned byte.
 
 [dev-dependencies]
 
@@ -113,8 +143,14 @@ databases, with no file-size limit and constant-memory streaming."""
 assets = [
     ["target/release/exav", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/exav/README.md", "644"],
-    ["../../docs/MIGRATION.md", "usr/share/doc/exav/MIGRATION.md", "644"],
     ["../../NOTICE", "usr/share/doc/exav/NOTICE", "644"],
     ["../../packaging/exav-clamd.service", "lib/systemd/system/exav-clamd.service", "644"],
 ]
 
+
+# docs.rs builds with every feature on, so the parts gated behind a feature
+# (in particular exav-core's `unstable-internals`) appear on the rendered page
+# instead of silently missing from it.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

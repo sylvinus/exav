@@ -3,7 +3,7 @@
 exav runs ClamAV `.cbc` bytecode programs in a memory-safe sandbox (see
 `crates/exav-core/src/bytecode/`). Execution is gated behind each program's
 trigger; a forced mode (`BytecodeRuntime::run_forced` / `run_all_forced`, and
-`Database::run_bytecodes_forced`) runs programs regardless of their gate for
+`Scanner::run_bytecodes_forced`) runs programs regardless of their gate for
 testing and differential validation.
 
 Validating the interpreter has two layers: **opcode/API conformance** (benign,
@@ -18,7 +18,8 @@ against, before touching any live sample:
 - `Cisco-Talos/clamav` → `unit_tests/input/bytecode_sigs/*.cbc`
   (e.g. `arith.cbc`, `apicalls.cbc`, `inflate.cbc`, `pdf.cbc`, `div0.cbc`)
 - scan target: `unit_tests/input/bytecode_scanfiles/apitestfile`
-- expected-results oracle: the corresponding checks in ClamAV's public `unit_tests` suite
+- expected-results oracle: run the reference engine over the same `.cbc` and
+  scan target and compare its output with exav's
 - bytecode compiler (to build your own `.cbc`): `Cisco-Talos/clamav-bytecode-compiler`
 
 Extracting the real production programs (the 85 we target) from a DB:

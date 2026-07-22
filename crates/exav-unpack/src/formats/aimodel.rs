@@ -21,6 +21,17 @@
 //! hostile input: on any unknown opcode or short read we stop and emit what we
 //! have collected so far.
 
+//!
+//! ## On the early exits in this module
+//!
+//! The `break`s in the opcode walk below stop *disassembly*, not scanning: a
+//! truncated or malformed pickle stops being interpreted at that point. That is
+//! safe rather than a silent skip, because the caller pattern-scans the raw
+//! buffer before it ever asks for extraction (`member_content_scan` in
+//! `exav-core`), so no byte goes unexamined — what is lost is the *surfaced*
+//! opcode text, which only affects signatures written against the disassembled
+//! form. Recorded here so the next reader can tell this apart from a member
+//! being dropped, which would be a defect.
 use crate::*;
 
 /// A safetensors file starts with a little-endian `u64` header length; we only
@@ -113,7 +124,25 @@ fn extract_safetensors<R>(
 
     budget.count_entry()?;
     let cap = budget.reserve()?;
-    // Emit at most `cap` header bytes.
+    // The header is the model's JSON metadata, and what a rule looks for in it
+    // can sit anywhere. Clamping to the budget and emitting the prefix as though
+    // it were the header hides whatever falls past the cut, so an over-cap header
+    // is reported — and the part that fits is still handed over, since a prefix
+    // is content even when it is not all of it.
+    if header.len() as u64 > cap {
+        if let Some(r) = visit(
+            Entry::unsupported(
+                "safetensors-header".into(),
+                header.len() as u64,
+                false,
+                "safetensors header exceeds the per-member size budget; \
+                 the part that fits was scanned",
+            ),
+            budget,
+        ) {
+            return Ok(Some(r));
+        }
+    }
     let take = (header.len() as u64).min(cap) as usize;
     let member = header[..take].to_vec();
     budget.commit(member.len() as u64);

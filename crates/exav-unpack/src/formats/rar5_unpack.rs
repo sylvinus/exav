@@ -731,138 +731,187 @@ fn apply_filters(u: &mut Unpacker) -> Result<bool, LimitHit> {
 }
 
 /// Entry point: decompress `packed` into at most `unpacked_size` bytes.
+/// A RAR5 decoder that can be reused across the members of a **solid** group.
+///
+/// Each member carries its own block headers, but a solid member's first block
+/// may declare no tables and continues writing into the window its predecessor
+/// filled. Decoding it on a fresh window therefore yields plausible-looking
+/// wrong bytes rather than an error, which is why every member's output is
+/// checked against the CRC the archive records.
+pub struct Unpacker50 {
+    u: Unpacker,
+}
+
+impl Unpacker50 {
+    /// All members of a solid group share the window, so it is sized once, from
+    /// the first member.
+    pub fn new(window_size: u64) -> Result<Self, LimitHit> {
+        if window_size == 0 || window_size > MAX_WINDOW_SIZE || !window_size.is_power_of_two() {
+            return Err(err("invalid window size"));
+        }
+        let ws = window_size as usize;
+        Ok(Unpacker50 {
+            u: Unpacker {
+                window_buf: vec![0u8; ws],
+                window_mask: ws - 1,
+                window_size: ws,
+                write_ptr: 0,
+                last_write_ptr: 0,
+                last_len: 0,
+                dist_cache: [0; 4],
+                filters: std::collections::VecDeque::new(),
+                last_block_start: 0,
+                last_block_length: 0,
+                bd: DecodeTable::new(),
+                ld: DecodeTable::new(),
+                dd: DecodeTable::new(),
+                ldd: DecodeTable::new(),
+                rd: DecodeTable::new(),
+                cur_block_size: 0,
+                block_parsing_finished: true,
+                last_block: false,
+                bit_size: 0,
+                out: Vec::new(),
+                cap: 0,
+            },
+        })
+    }
+
+    /// Decode one member. `solid` says the member continues the previous one's
+    /// stream, in which case the window and tables are kept.
+    pub fn member(
+        &mut self,
+        packed: &[u8],
+        unpacked_size: u64,
+        solid: bool,
+        budget: &mut Budget,
+    ) -> Result<Vec<u8>, LimitHit> {
+        // Bound output to the budget. We refuse members whose declared unpacked
+        // size already exceeds what the budget allows.
+        let cap = budget.reserve()?;
+        if unpacked_size > cap {
+            return Err(err("declared size exceeds budget"));
+        }
+        if !solid {
+            // A fresh stream: forget the previous member's window position, its
+            // repeat-distance history and any half-run filters.
+            self.u.write_ptr = 0;
+            self.u.last_write_ptr = 0;
+            self.u.last_len = 0;
+            self.u.dist_cache = [0; 4];
+            self.u.last_block_start = 0;
+            self.u.last_block_length = 0;
+            self.u.window_buf.fill(0);
+        }
+        self.u.filters.clear();
+        self.u.block_parsing_finished = true;
+        self.u.last_block = false;
+        self.u.out = Vec::new();
+        self.u.cap = unpacked_size;
+        let u = &mut self.u;
+        let _ = cap;
+
+        // Pad the input so the bit reader can always read 4 bytes past in_addr.
+        let mut input = Vec::with_capacity(packed.len() + 8);
+        input.extend_from_slice(packed);
+        input.extend_from_slice(&[0u8; 8]);
+
+        let mut consumed: usize = 0; // bytes of `packed` consumed for finished blocks
+        let mut br = BitReader::new();
+        // Slice covering the current block's data (set when a block starts).
+        let mut block_off: usize = 0;
+
+        let max_iters: u64 = unpacked_size.saturating_mul(2) + (packed.len() as u64) * 4 + 1024;
+        let mut iters: u64 = 0;
+
+        while u.out.len() as u64 + (u.write_ptr - u.last_write_ptr) < unpacked_size
+            || !u.filters.is_empty()
+        {
+            iters += 1;
+            if iters > max_iters {
+                return Err(err("decode made no progress"));
+            }
+
+            if u.block_parsing_finished {
+                if consumed >= packed.len() {
+                    break;
+                }
+                let (block_size, hdr_len, flags) =
+                    parse_block_header(&input, consumed).ok_or_else(|| err("bad block header"))?;
+                let table_present = (flags >> 7) & 1 == 1;
+                u.last_block = (flags >> 6) & 1 == 1;
+                u.bit_size = 1 + (flags & 7);
+
+                let data_start = consumed + hdr_len;
+                if data_start > packed.len() {
+                    return Err(err("block header past end"));
+                }
+                // cur_block_size is the in-file block data (clamp to available).
+                let avail = packed.len() - data_start;
+                u.cur_block_size = block_size.min(avail);
+                block_off = data_start;
+                u.block_parsing_finished = false;
+
+                br.in_addr = 0;
+                br.bit_addr = 0;
+
+                // The block buffer starts at block_off in `input` (padded).
+                if table_present {
+                    let p = &input[block_off..];
+                    parse_tables(u, &mut br, p)?;
+                }
+                // Advance `consumed` past this whole block now (single-volume:
+                // the block data is fully present).
+                consumed = data_start + u.cur_block_size;
+            }
+
+            let finished = {
+                let p = &input[block_off..];
+                do_uncompress_block(u, &mut br, p)?
+            };
+            u.block_parsing_finished = finished;
+
+            // Drain output: run filters / push window data, looping until no more
+            // progress can be made without further decoding.
+            loop {
+                if apply_filters(u)? {
+                    continue;
+                }
+                // No filter could run. Determine how far we can safely write.
+                let max_end_pos = match u.filters.front() {
+                    Some(flt) => flt.block_start.min(u.write_ptr),
+                    None => u.write_ptr,
+                };
+                if max_end_pos > u.last_write_ptr {
+                    let lw = u.last_write_ptr;
+                    push_window_data(u, lw, max_end_pos)?;
+                    u.last_write_ptr = max_end_pos;
+                }
+                break;
+            }
+
+            if finished && u.last_block && u.filters.is_empty() {
+                break;
+            }
+            if u.out.len() as u64 >= unpacked_size {
+                break;
+            }
+        }
+
+        u.out.truncate(unpacked_size as usize);
+        budget.commit(u.out.len() as u64);
+        Ok(std::mem::take(&mut u.out))
+    }
+}
+
+/// Decompress a single, non-solid RAR5 member on a fresh window.
 pub fn unpack50(
     packed: &[u8],
     unpacked_size: u64,
     window_size: u64,
     budget: &mut Budget,
 ) -> Result<Vec<u8>, LimitHit> {
-    if window_size == 0 || window_size > MAX_WINDOW_SIZE || !window_size.is_power_of_two() {
-        return Err(err("invalid window size"));
-    }
-    // Bound output to the budget. We refuse members whose declared unpacked
-    // size already exceeds what the budget allows.
-    let cap = budget.reserve()?;
-    if unpacked_size > cap {
-        return Err(err("declared size exceeds budget"));
-    }
-
-    let ws = window_size as usize;
-    let mut u = Unpacker {
-        window_buf: vec![0u8; ws],
-        window_mask: ws - 1,
-        window_size: ws,
-        write_ptr: 0,
-        last_write_ptr: 0,
-        last_len: 0,
-        dist_cache: [0; 4],
-        filters: std::collections::VecDeque::new(),
-        last_block_start: 0,
-        last_block_length: 0,
-        bd: DecodeTable::new(),
-        ld: DecodeTable::new(),
-        dd: DecodeTable::new(),
-        ldd: DecodeTable::new(),
-        rd: DecodeTable::new(),
-        cur_block_size: 0,
-        block_parsing_finished: true,
-        last_block: false,
-        bit_size: 0,
-        out: Vec::new(),
-        cap: unpacked_size,
-    };
-    let _ = cap;
-
-    // Pad the input so the bit reader can always read 4 bytes past in_addr.
-    let mut input = Vec::with_capacity(packed.len() + 8);
-    input.extend_from_slice(packed);
-    input.extend_from_slice(&[0u8; 8]);
-
-    let mut consumed: usize = 0; // bytes of `packed` consumed for finished blocks
-    let mut br = BitReader::new();
-    // Slice covering the current block's data (set when a block starts).
-    let mut block_off: usize = 0;
-
-    let max_iters: u64 = unpacked_size.saturating_mul(2) + (packed.len() as u64) * 4 + 1024;
-    let mut iters: u64 = 0;
-
-    while u.out.len() as u64 + (u.write_ptr - u.last_write_ptr) < unpacked_size
-        || !u.filters.is_empty()
-    {
-        iters += 1;
-        if iters > max_iters {
-            return Err(err("decode made no progress"));
-        }
-
-        if u.block_parsing_finished {
-            if consumed >= packed.len() {
-                break;
-            }
-            let (block_size, hdr_len, flags) =
-                parse_block_header(&input, consumed).ok_or_else(|| err("bad block header"))?;
-            let table_present = (flags >> 7) & 1 == 1;
-            u.last_block = (flags >> 6) & 1 == 1;
-            u.bit_size = 1 + (flags & 7);
-
-            let data_start = consumed + hdr_len;
-            if data_start > packed.len() {
-                return Err(err("block header past end"));
-            }
-            // cur_block_size is the in-file block data (clamp to available).
-            let avail = packed.len() - data_start;
-            u.cur_block_size = block_size.min(avail);
-            block_off = data_start;
-            u.block_parsing_finished = false;
-
-            br.in_addr = 0;
-            br.bit_addr = 0;
-
-            // The block buffer starts at block_off in `input` (padded).
-            if table_present {
-                let p = &input[block_off..];
-                parse_tables(&mut u, &mut br, p)?;
-            }
-            // Advance `consumed` past this whole block now (single-volume:
-            // the block data is fully present).
-            consumed = data_start + u.cur_block_size;
-        }
-
-        let finished = {
-            let p = &input[block_off..];
-            do_uncompress_block(&mut u, &mut br, p)?
-        };
-        u.block_parsing_finished = finished;
-
-        // Drain output: run filters / push window data, looping until no more
-        // progress can be made without further decoding.
-        loop {
-            if apply_filters(&mut u)? {
-                continue;
-            }
-            // No filter could run. Determine how far we can safely write.
-            let max_end_pos = match u.filters.front() {
-                Some(flt) => flt.block_start.min(u.write_ptr),
-                None => u.write_ptr,
-            };
-            if max_end_pos > u.last_write_ptr {
-                let lw = u.last_write_ptr;
-                push_window_data(&mut u, lw, max_end_pos)?;
-                u.last_write_ptr = max_end_pos;
-            }
-            break;
-        }
-
-        if finished && u.last_block && u.filters.is_empty() {
-            break;
-        }
-        if u.out.len() as u64 >= unpacked_size {
-            break;
-        }
-    }
-
-    u.out.truncate(unpacked_size as usize);
-    budget.commit(u.out.len() as u64);
-    Ok(u.out)
+    Unpacker50::new(window_size)?.member(packed, unpacked_size, false, budget)
 }
 
 /// Compute the RAR5 window size from the file header's `comp_info` field.

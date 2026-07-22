@@ -1,6 +1,6 @@
 # Bytecode signatures (`.cbc`) — design, scope, and security
 
-ClamAV's most powerful signature type is **bytecode**: a small program (written
+ClamAV's most expressive signature type is **bytecode**: a small program (written
 in C, compiled to a custom VM bytecode, shipped as a `.cbc` file in
 `bytecode.cvd`) that runs against a candidate file and decides whether it's
 malicious. It expresses detection logic that pattern/logical signatures can't.
@@ -8,7 +8,7 @@ malicious. It expresses detection logic that pattern/logical signatures can't.
 exav implements a reader and a **memory-safe, sandboxed interpreter** for this
 format. This document records what the format is, what's actually in the live
 database, the scope we target, and — the main point — **why exav's approach is
-fundamentally safer than ClamAV's**, which has a documented history of remote
+structurally safer than ClamAV's**, which has a documented history of remote
 code execution in exactly this subsystem.
 
 > ClamAV is GPL; exav is MIT. The `.cbc` format is treated here purely as an
@@ -121,7 +121,7 @@ that trade-off** — a real reason to switch.
 - **`deserialize_unchecked`-style trust** → N/A *for the bytecode subsystem*:
   no `.cbc` content is loaded unchecked, and the DB itself is signature-verified
   by `freshclam`/`cvdupdate`. (The one `deserialize_unchecked` in the project is
-  the prebuilt-cache loader in `engine.rs`, which is a SHA-256-verified trusted
+  the prebuilt-database loader in `engine.rs`, which is a SHA-256-verified trusted
   artifact — a separate trust model, see SECURITY.md.)
 
 ## 6. Status
@@ -159,7 +159,7 @@ that trade-off** — a real reason to switch.
 interpreter over the decoded IR: value array, integer
 arithmetic/bitwise/compare/cast/select, `branch`/`jmp`/`ret`, host-API dispatch,
 and the `(region, offset)` pointer addressing model — and it runs in the live
-scan path (`Database::bytecode.scan`), trigger-gated per program, emitting
+scan path (`Scanner::bytecode.scan`), trigger-gated per program, emitting
 `Method::Bytecode` detections. The remaining work is **coverage, not gating**:
 programs needing not-yet-implemented host APIs (`disasm_x86`, the PDF/JSON
 object APIs, the inflate/lzma/bzip2 codecs) are skipped rather than executed, and
@@ -170,7 +170,7 @@ detection-validated against `clamscan` (see `BYTECODE_VALIDATION.md`).
 
 Numerically tiny — 85 of ~3.7M signatures (0.002%) — but uneven in value:
 
-- **Unpackers (~6, `BC.Win.Packer`/`Packed`) are the high-leverage set.** Some
+- **Unpackers (~6, `BC.Win.Packer`/`Packed`) matter most.** Some
   of ClamAV's unpacking is *implemented as bytecode*; an unpacker deobfuscates a
   packed PE so the other ~3.7M signatures can match the payload. Missing one
   silently weakens detection across *many* packed samples — far beyond one sig.

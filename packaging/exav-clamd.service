@@ -14,17 +14,40 @@
 # copy your existing clamd.conf's LocalSocket value.
 [Unit]
 Description=exav clamd-compatible malware scanning daemon
-Documentation=https://github.com/sylvinus/exav
+Documentation=https://exav.org/guides/daemon/
 After=network.target
 
 [Service]
 Type=simple
 # --workers defaults to one prefork process per CPU core (kernel-enforced per-job
 # limits + hard-kill isolation). Reads signatures from the freshclam DB dir.
-ExecStart=/usr/bin/exav --daemon --socket /run/clamav/clamd.ctl -d /var/lib/clamav
+ExecStart=/usr/bin/exav --listen /run/clamav/clamd.ctl -d /var/lib/exav
+#
+# The socket is created 0600, reachable only by the clamav user this runs as.
+# A client under another UID — Amavis, Rspamd, a web server — needs it widened,
+# which is what clamd.conf spells LocalSocketMode. The mode rides on the address,
+# since it is a property of that socket:
+#   ExecStart=... --listen 'clamd:///run/clamav/clamd.ctl?mode=660'
+# with the client's user in the clamav group. Every user the mode admits can
+# submit scans and read the verdicts, so grant the narrowest set that works
+# rather than 666.
+#
+# --- Pulling a prebuilt database over HTTP (build once, serve many) --------------
+# To instead fetch an `.exavdb` built by another server, point -d at a WRITABLE
+# file and give the URL. Requires an `http-update`-featured build. Swap the
+# ExecStart above and replace the `ReadOnlyPaths` line in the hardening block
+# with `ReadWritePaths` on the database's directory:
+#   ExecStart=/usr/bin/exav --listen /run/clamav/clamd.ctl --auto-update \
+#       --db-url https://build.internal/exav/live.exavdb \
+#       -d /var/lib/exav/live.exavdb
+#   ReadWritePaths=/var/lib/exav          # the daemon writes the pulled database + temp file here
+# (Basic auth: --db-url https://user:pass@build.internal/... — kept out of logs.)
+# See https://exav.org/guides/prebuilt-database/
+# ------------------------------------------------------------------------------
+#
 # `systemctl reload exav-clamd` re-reads the signature database without dropping
 # the socket: the prefork supervisor reloads and re-forks its workers on SIGHUP.
-# (Use this after swapping in a rebuilt prebuilt cache — see docs/DEPLOYMENT.md.)
+# (Use this after swapping in a rebuilt prebuilt database.)
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
@@ -40,7 +63,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-ReadOnlyPaths=/var/lib/clamav
+ReadOnlyPaths=/var/lib/exav
 ProtectControlGroups=true
 ProtectKernelTunables=true
 RestrictSUIDSGID=true

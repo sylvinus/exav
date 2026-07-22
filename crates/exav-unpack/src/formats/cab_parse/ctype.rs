@@ -66,9 +66,9 @@ impl CompressionType {
         match self {
             CompressionType::None => Ok(Decompressor::Uncompressed),
             CompressionType::MsZip => Ok(Decompressor::MsZip(Box::new(MsZipDecompressor::new()))),
-            CompressionType::Quantum(_, _) => {
-                invalid_data!("Quantum decompression is not yet supported.")
-            }
+            CompressionType::Quantum(_level, window) => Ok(Decompressor::Quantum(Box::new(
+                super::qtm::QuantumDecompressor::new(window)?,
+            ))),
             CompressionType::Lzx(window_size) => {
                 Ok(Decompressor::Lzx(Box::new(Lzxd::new(window_size))))
             }
@@ -80,6 +80,7 @@ pub(crate) enum Decompressor {
     Uncompressed,
     MsZip(Box<MsZipDecompressor>),
     Lzx(Box<Lzxd>),
+    Quantum(Box<super::qtm::QuantumDecompressor>),
 }
 
 impl Decompressor {
@@ -97,6 +98,9 @@ impl Decompressor {
                 .decompress_next(&data, uncompressed_size)
                 .map(|slice| slice.to_vec())
                 .map_err(io::Error::other),
+            Decompressor::Quantum(decompressor) => {
+                decompressor.decompress_block(&data, uncompressed_size)
+            }
         }
     }
 }

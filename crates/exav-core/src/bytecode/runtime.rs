@@ -32,7 +32,7 @@ const KIND_PE_ALL: u32 = 259;
 /// All loaded bytecode programs plus their gates.
 pub struct BytecodeRuntime {
     programs: Vec<Bytecode>,
-    /// Raw `.cbc` texts of the kept programs (so the runtime can be cached and
+    /// Raw `.cbc` texts of the kept programs (so the runtime can be serialized and
     /// rebuilt without a custom serializer for the parsed form).
     sources: Vec<String>,
     /// Logical triggers, each named `__bc__<index>`.

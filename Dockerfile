@@ -6,18 +6,18 @@
 # in memory, so nothing else is needed at runtime.
 #
 # Default (`docker run`) starts the clamd-compatible daemon on TCP 3310 with a
-# data dir of /var/lib/clamav, drop-in compatible with the ClamAV image:
+# data dir of /var/lib/exav (wire-compatible with the ClamAV image):
 #
-#   docker run -d -p 3310:3310 -v exav-db:/var/lib/clamav ghcr.io/sylvinus/exav
+#   docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
 #   clamdscan --stream file.bin           # host clamdscan over TCP works
 #
 # Signatures are NOT bundled (exav ships no GPL DB and no CDN URL). Provide them
 # by mounting a populated volume, running a sidecar that writes it (see
-# docker-compose.yml), or setting EXAV_DB_MIRROR to auto-download from a mirror
-# you trust. See README "Docker" for the env vars.
+# docker-compose.yml), or setting EXAV_SIG_SOURCES to auto-download from a mirror
+# you trust. See https://exav.org/guides/docker/ for the env vars.
 #
 # One-shot scan (overrides the default daemon CMD):
-#   docker run --rm -v "$PWD:/scan" ghcr.io/sylvinus/exav -r /scan
+#   docker run --rm -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 
 # ---- build: static musl binary, updater (http feature) enabled ---------------
 # rust:alpine targets *-unknown-linux-musl and links statically. `build-base`
@@ -29,9 +29,9 @@ FROM rust:1.91-alpine AS build
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /src
 COPY . .
-# `--features http` pulls in the standalone exav-update crate so `--serve` can
-# fetch from EXAV_DB_MIRROR. For a smaller, pure-Rust image without the updater,
-# drop it (and set up signatures via a volume/sidecar instead).
+# `--features http` pulls in the standalone exav-update crate so `--auto-update`
+# can fetch from EXAV_SIG_SOURCES. For a smaller, pure-Rust image without the
+# updater, drop it (and set up signatures via a volume/sidecar instead).
 RUN cargo build --release -p exav-cli --features http \
     && strip target/release/exav
 
@@ -44,10 +44,34 @@ RUN mkdir -p /data && chown 65532:65532 /data
 # ---- runtime: distroless static, nonroot -------------------------------------
 FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /src/target/release/exav /exav
-COPY --from=dirs --chown=65532:65532 /data /var/lib/clamav
-# Persist signatures across restarts (mirrors ClamAV's /var/lib/clamav volume).
-VOLUME ["/var/lib/clamav"]
+COPY --from=dirs --chown=65532:65532 /data /var/lib/exav
+# Persist signatures across restarts. To reuse an existing ClamAV database
+# volume, mount it here (or set EXAV_SIGS_DIR=/var/lib/clamav and mount there).
+VOLUME ["/var/lib/exav"]
+# The image's own configuration, in the form every other setting takes: an
+# environment variable a flag on the command line can override. Listening on all
+# interfaces is what makes a published port reachable.
+ENV EXAV_LISTEN=clamd://0.0.0.0:3310
 # clamd-compatible service port (publish with -p 3310:3310).
 EXPOSE 3310
+# ICAP (RFC 3507) service port, for replacing a c-icap container at a proxy's
+# adaptation hook. Nothing binds it unless an `icap://` address is listed, and
+# listing one ADDS the listener — both protocols are then served from the one
+# process, over the one loaded database:
+#
+#   docker run -d -p 3310:3310 -p 1344:1344 \
+#     -e EXAV_LISTEN=clamd://0.0.0.0:3310,icap://0.0.0.0:1344 \
+#     -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+#
+# For ICAP and nothing else, name the listener instead of the default command:
+#
+#   docker run -d -p 1344:1344 -v exav-db:/var/lib/exav \
+#     ghcr.io/sylvinus/exav --listen icap://0.0.0.0:1344 --auto-update
+#
+# EXPOSE is documentation, not a listener — see the ICAP guide for the env vars.
+EXPOSE 1344
 ENTRYPOINT ["/exav"]
-CMD ["--serve"]
+# Serve whatever EXAV_LISTEN names, and keep the signature volume current:
+# bootstrap it, wait for a sidecar to fill it if that is where signatures come
+# from, refresh the configured sources on a schedule, and hot-reload on change.
+CMD ["--auto-update"]

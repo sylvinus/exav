@@ -87,6 +87,9 @@ pub(crate) fn extract_ar<R>(
         let size = parse_decimal(&hdr[48..58]) as usize;
         let body = pos + 60;
         let end = body.saturating_add(size).min(data.len());
+        // Clamped to EOF: a member declaring more than the archive holds is
+        // truncated, and every byte that exists is still scanned. Absent, not
+        // hidden — so this stays a normal member. See docs/QUIRKS.md.
         let member = &data[body..end];
 
         let name = resolve_name(raw_name, &name_table);
@@ -94,7 +97,7 @@ pub(crate) fn extract_ar<R>(
             // GNU string table: holds long names referenced as "/<offset>".
             // Bounded by the global peak-buffer limit like any materialized blob.
             "//" => {
-                if member.len() as u64 > budget.limits.max_buffer_bytes() {
+                if member.len() as u64 > budget.limits.max_buffer_bytes {
                     return Err(LimitHit::new(
                         "ar name table exceeds max-buffer".to_string(),
                     ));

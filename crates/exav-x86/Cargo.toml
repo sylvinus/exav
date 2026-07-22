@@ -1,0 +1,38 @@
+[package]
+name = "exav-x86"
+description = "A dependency-free, decode-only x86-32 instruction decoder: turns bytes into instruction descriptions, and declines anything it does not claim."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["x86", "disassembler", "decoder", "malware", "security"]
+categories = ["parser-implementations", "no-std"]
+readme = "README.md"
+
+# No dependencies at all. That is the point of the crate: the two places exav
+# decodes x86 — the packer emulator and the bytecode `disasm_x86` API — need a
+# few hundred encodings, and the general-purpose decoders that cover the whole
+# ISA carry hundreds of `unsafe` blocks to do it.
+[dependencies]
+
+[dev-dependencies]
+# The oracle for the differential tests, and only for those: every encoding this
+# crate claims is checked against it for the same length and mnemonic. It is a
+# dev-dependency, so nothing it contains reaches a shipped binary.
+# `instr_info` is what exposes `MemorySize::size()`, which the differential
+# tests compare against: the access WIDTH is what an emulator sizes its read or
+# write from, so a decoder that gets it wrong touches bytes it must not.
+iced-x86 = { version = "1", default-features = false, features = [
+    "std",
+    "decoder",
+    "instr_info",
+] }
+
+# docs.rs builds with every feature on, so the parts gated behind a feature
+# (in particular exav-core's `unstable-internals`) appear on the rendered page
+# instead of silently missing from it.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,0 +1,83 @@
+---
+title: exav
+description: A fast, memory-safe malware scanner written in Rust — streaming any file size, and drop-in compatible with ClamAV signature databases and tooling.
+hero:
+  tagline: A fast, memory-safe malware scanner written in Rust.
+  image:
+    file: ../../assets/logo.svg
+  actions:
+    - text: Get started
+      link: /getting-started/introduction/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/sylvinus/exav
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+exav is a malware scanner written in memory-safe Rust: a single static
+MIT-licensed binary that scans files of any size in constant memory and runs a
+native YARA engine. It reads ClamAV's signature databases, answers the `clamd`
+and ICAP protocols, and takes `clamscan`'s command line — so it drops into an
+existing ClamAV setup without changing anything around it.
+
+<CardGrid>
+  <Card title="Memory-safe Rust engine" icon="rocket">
+    The scanning and extraction code is safe Rust (`#![forbid(unsafe_code)]`
+    in the core crates) — no C, no native JIT. Whole classes of CVE are ruled
+    out by construction rather than patched one at a time.
+  </Card>
+  <Card title="Constant-memory streaming" icon="bars">
+    Scans multi-GB files in a single forward pass — a 6 GiB file on a
+    4.8 GiB-RAM machine is detected, with a flat ~2 MiB per-scan working set
+    regardless of file size. Formats that cannot be read forward-only (a ZIP's
+    directory is at its end) are buffered to a temp file first, under
+    [budgets you set](/reference/cli/#buffering-a-stream-spill).
+  </Card>
+  <Card title="Native YARA engine" icon="puzzle">
+    Near-full YARA support via a native tree-walking evaluator — no runtime
+    codegen at scan time, a lean pure-Rust dependency tree, on by default.
+  </Card>
+  <Card title="Drop-in compatible" icon="random">
+    Loads existing `.cvd`/`.ndb`/`.ldb`/`.hdb`/YARA signature databases and
+    answers the `clamd` protocol — so `clamdscan`, milters, and existing
+    tooling talk to exav unchanged.
+  </Card>
+  <Card title="Prebuilt `.exavdb`" icon="download">
+    Compile a large signature set once, then load it in seconds everywhere —
+    a ~19× faster, ~5× lighter cold start.
+  </Card>
+  <Card title="WASM sandbox" icon="seti:wasm">
+    The whole engine compiles to a WASI module, so you can load **untrusted**
+    signatures without giving them host access — with zero custom host code.
+  </Card>
+  <Card title="Never a silent clean" icon="approve-check">
+    exav's core safety rule: **never report a file clean unless it was fully
+    scanned.** Anything that stops the scan early surfaces as a distinct
+    verdict — never absorbed into `OK`. A deployment can choose to deliver such
+    an object anyway, but only by saying so, and it is still reported.
+  </Card>
+  <Card title="MIT licensed" icon="open-book">
+    A single static binary under a permissive license, built clean-room from
+    public specifications — nothing derived from GPL sources.
+  </Card>
+</CardGrid>
+
+:::note[Status: beta]
+exav is young. It is tested hard — differentially against ClamAV on a large
+corpus, plus fuzzing — but a scanner earns trust from use, and there has not been
+much of that yet. Please [report anything that looks
+wrong](https://github.com/sylvinus/exav/issues); fixes ship quickly.
+:::
+
+## Start here
+
+<CardGrid>
+  <LinkCard title="Why exav exists" href="/getting-started/introduction/" description="What exav is, and the design principles it is built around." />
+  <LinkCard title="Install" href="/getting-started/installation/" description="Build from source, packages, containers, and the WASM module." />
+  <LinkCard title="Quick start" href="/getting-started/quick-start/" description="Get signatures, run your first scan, understand the output." />
+  <LinkCard title="Design principles" href="/concepts/design-principles/" description="Memory safety, no runtime codegen, constant-memory streaming, never a silent clean, and more." />
+</CardGrid>

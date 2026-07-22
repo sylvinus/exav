@@ -1,5 +1,12 @@
+// Each of these runs off a header slice whose length came from the archive, so
+// every one checks before it indexes. An ARJ header declaring a size shorter
+// than the fields it claims to hold is ordinary attacker input, and the caller
+// returns `None` for it rather than panicking out through the decoder.
 macro_rules! convert_u32 {
     ( $t:ident, $x:expr ) => {
+        if $x.len() < 4 {
+            return None;
+        }
         let $t = $x[0] as u32 | ($x[1] as u32) << 8 | ($x[2] as u32) << 16 | ($x[3] as u32) << 24;
         #[allow(unused_assignments)]
         {
@@ -10,6 +17,9 @@ macro_rules! convert_u32 {
 
 macro_rules! convert_u16 {
     ( $t:ident, $x:expr ) => {
+        if $x.len() < 2 {
+            return None;
+        }
         let $t = $x[0] as u16 | ($x[1] as u16) << 8;
         #[allow(unused_assignments)]
         {

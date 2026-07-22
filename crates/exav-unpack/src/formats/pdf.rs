@@ -192,7 +192,26 @@ pub(crate) fn extract_pdf<R>(
             }
             ratio_guard(raw_len, buf.len() as u64, budget)?;
             budget.commit(buf.len() as u64);
-            if let Some(r) = visit(Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf), budget) {
+            // A stream that HAD raw bytes and decoded to nothing is content we
+            // failed to produce, not an empty object. Emitting it as a zero-byte
+            // member says "scanned, nothing there" about bytes nobody read —
+            // the silent skip this scanner exists to avoid. Say so instead.
+            //
+            // The usual cause is an image codec: `apply_filters` stops at a
+            // filter it does not implement (DCTDecode, JPXDecode, CCITTFaxDecode)
+            // and passes the remainder through, which yields nothing when that
+            // filter was the only one and the caller expected decoded output.
+            let entry = if buf.is_empty() && raw_len > 0 {
+                Entry::unsupported(
+                    format!("pdf-obj-{obj_id}-{gen}"),
+                    raw_len,
+                    false,
+                    "PDF stream could not be decoded",
+                )
+            } else {
+                Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf)
+            };
+            if let Some(r) = visit(entry, budget) {
                 return Ok(Some(r));
             }
         }

@@ -53,6 +53,25 @@ fn decode_bzip2_streams(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitH
     Ok((out, false))
 }
 
+/// A reader over the decompressed content of `data`, for the streaming path.
+///
+/// The COMMON case — a single stream — is handed back as a decoder, so content
+/// decompressing to any size is scanned without being materialized. That is the
+/// whole point: a `.bz2` output can be orders of magnitude larger than the file.
+///
+/// The multi-stream case is decoded whole instead. It cannot stream: recovering
+/// from a spurious `BZh` needs re-decoding the entire input as one stream (see
+/// [`decode_bzip2_streams`]), and a reader that has already handed bytes to the
+/// scanner cannot take them back. Multi-stream files are rare, so the common
+/// case keeps the win and the rare one keeps the recovery.
+pub(crate) fn content_reader(data: &[u8], cap: u64) -> Result<Box<dyn Read + '_>, LimitHit> {
+    if bzip2_stream_starts(data).len() <= 1 {
+        return Ok(Box::new(bzip2_rs::DecoderReader::new(Cursor::new(data))));
+    }
+    let (out, _truncated) = decode_bzip2_streams(data, cap)?;
+    Ok(Box::new(Cursor::new(out)))
+}
+
 /// Offsets of bzip2 stream headers (`BZh` followed by a `1`-`9` block-size).
 fn bzip2_stream_starts(data: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();

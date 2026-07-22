@@ -68,13 +68,310 @@ pub(crate) fn find_packheader(data: &[u8]) -> Option<usize> {
     None
 }
 
+/// Strong evidence the image really is UPX-packed: the `UPX!` PackHeader magic
+/// or the conventional `UPX0`/`UPX1` section names. Used to decide whether a
+/// failed unpack is worth REPORTING — speculative calls on unrelated bytes must
+/// stay silent, but a file that advertises itself as UPX and whose payload we
+/// could not recover is content present-and-unexamined.
+fn looks_upx(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(64 << 10)];
+    memchr::memmem::find(head, b"UPX!").is_some()
+        || memchr::memmem::find(head, b"UPX0").is_some()
+        || memchr::memmem::find(head, b"UPX1").is_some()
+}
+
+/// What to do when a UPX-packed image could not be decompressed.
+///
+/// Stripping or patching the `PackHeader` is a routine anti-unpack move, and it
+/// is aimed exactly here: the file says UPX on its face, the static reader
+/// cannot unfold it, and a scan that shrugged would report clean. Real samples
+/// ship this way.
+///
+/// Before reporting, the stub is *run*: a patched header defeats the static
+/// reader, which needs the header to find the compressed blocks, but it does not
+/// defeat the stub — the stub still has to decompress the image to run it. Only
+/// when that comes back empty too is the file reported unopened.
+fn report_packed<R>(
+    data: &[u8],
+    budget: &mut Budget,
+    visit: Sink<R>,
+) -> Result<Option<R>, LimitHit> {
+    #[cfg(feature = "pe-emu")]
+    {
+        match super::pepack::emulated_unpack(data, budget, visit, "UPX")? {
+            super::pepack::Recovered::Halt(r) => return Ok(Some(r)),
+            super::pepack::Recovered::Emitted => return Ok(None),
+            super::pepack::Recovered::Nothing => {}
+        }
+    }
+    budget.count_entry()?;
+    Ok(visit(
+        Entry::unsupported(
+            "upx-packed image".to_string(),
+            data.len() as u64,
+            false,
+            "UPX-packed executable that could not be decompressed (PackHeader \
+             missing or damaged); the packed bytes were scanned but the original \
+             image was not",
+        ),
+        budget,
+    ))
+}
+
+/// Adler-32 as UPX computes it over the uncompressed image.
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &c in data {
+        a = (a + c as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+/// Recover the original image from a UPX **PackHeader**, the layout
+/// `find_packheader` does not model.
+///
+/// That function understands the `l_info`/`p_info`/`b_info` chain. A PE can
+/// instead carry a 32-byte PackHeader — `UPX!`, version, format, method, level,
+/// the two Adler-32 sums, then `u_len`/`c_len`/`u_file_size` — with the
+/// compressed stream following immediately. Read as an `l_info`, that header's
+/// `c_len`/`u_file_size` fields land where a `b_info` block's sizes are expected
+/// and fail validation, so the file matched no unpacker at all and scanned
+/// clean. A live GandCrab sample was packed exactly this way.
+///
+/// The header carries `u_adler`, so acceptance is decided by checksum rather
+/// than by plausibility: a decode that does not reproduce the recorded Adler-32
+/// over exactly `u_len` bytes is discarded. That makes a wrong guess
+/// unrepresentable rather than merely unlikely.
+pub(crate) fn has_packheader_layout(data: &[u8]) -> bool {
+    let mut search = 0usize;
+    while let Some(rel) = memchr::memmem::find(&data[search..], b"UPX!") {
+        let m = search + rel;
+        search = m + 1;
+        if m + 32 > data.len() {
+            break;
+        }
+        let method = data[m + 6];
+        let u_len = u32_le(data, m + 16) as usize;
+        let c_len = u32_le(data, m + 20) as usize;
+        if u_len != 0
+            && c_len != 0
+            && m + 32 + c_len <= data.len()
+            && matches!(method, M_NRV2B | M_NRV2D | M_NRV2E)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn packheader_image(data: &[u8], cap: u64) -> Option<Vec<u8>> {
+    let mut search = 0usize;
+    while let Some(rel) = memchr::memmem::find(&data[search..], b"UPX!") {
+        let m = search + rel;
+        search = m + 1;
+        if m + 32 > data.len() {
+            break;
+        }
+        let method = data[m + 6];
+        let u_adler = u32_le(data, m + 8);
+        let u_len = u32_le(data, m + 16) as usize;
+        let c_len = u32_le(data, m + 20) as usize;
+        let start = m + 32;
+        if u_len == 0 || c_len == 0 || u_len as u64 > cap || start + c_len > data.len() {
+            continue;
+        }
+        let cdata = &data[start..start + c_len];
+        let out = match method {
+            M_NRV2B => nrv2b_decompress(cdata, u_len),
+            M_NRV2D => nrv2d_decompress(cdata, u_len),
+            M_NRV2E => nrv2e_decompress(cdata, u_len),
+            _ => continue,
+        };
+        let Ok(out) = out else { continue };
+        if out.len() == u_len && adler32(&out) == u_adler {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Ceiling on a rebuilt image, mirroring the packed-PE path.
+const MAX_INNER: usize = 128 << 20;
+
+fn u16_le(d: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([
+        d.get(off).copied().unwrap_or(0),
+        d.get(off + 1).copied().unwrap_or(0),
+    ])
+}
+
+/// The 208-byte DOS header + stub that must sit at the front of a rebuilt PE,
+/// base64-encoded.
+///
+/// Reproduced byte-for-byte because it has to be: a large family of ClamAV
+/// signatures for packed malware is an **MD5 over ClamAV's own rebuilt
+/// artifact**, so the hash only matches an image identical down to this stub and
+/// the header rewrites in [`rebuild_clamav_pe`]. It is a compatibility constant,
+/// like the signature-file formats exav already parses.
+///
+/// Kept encoded so the stub text isn't over-interpreted as a credit of any kind.
+const CLAMAV_DOS_STUB_B64: &str = concat!(
+    "TVqQAAIAAAAEAA8A//8AALAAAAAAAAAAQAAaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAA0AAAAA4ftAm6DQDNIbRMzSFUaGlzIGZpbGUgd2FzIGNyZWF0ZWQgYnkgQ2xhbUFWIGZvciBp",
+    "bnRlcm5hbCB1c2UgYW5kIHNob3VsZCBub3QgYmUgcnVuLg0KQ2xhbUFWIC0gQSBHUEwgdmlydXMg",
+    "c2Nhbm5lciAtIGh0dHA6Ly93d3cuY2xhbWF2Lm5ldA0KJAAAAA==",
+);
+
+/// Length of the decoded stub; `e_lfanew` points just past it.
+const STUB_LEN: usize = 208;
+
+/// Decode [`CLAMAV_DOS_STUB_B64`]. The input is a constant this crate controls,
+/// so a failure here is a build-time mistake, not bad input — the unit test
+/// below pins both the length and an Adler-32 of the result.
+fn clamav_dos_stub() -> Option<[u8; STUB_LEN]> {
+    use base64::Engine;
+    let v = base64::engine::general_purpose::STANDARD
+        .decode(CLAMAV_DOS_STUB_B64)
+        .ok()?;
+    let mut out = [0u8; STUB_LEN];
+    if v.len() != STUB_LEN {
+        return None;
+    }
+    out.copy_from_slice(&v);
+    Some(out)
+}
+
+/// Rebuild a PE image from a decompressed UPX stream, in the layout ClamAV
+/// produces, so hash signatures computed over that layout match.
+///
+/// `image` is the decompressed memory image beginning at `first_rva` (UPX
+/// compresses the original sections as one contiguous run from the first
+/// section's RVA). The original PE header block survives in the tail of that
+/// run, which is what makes the rebuild possible at all.
+///
+/// The transformations are ClamAV's, recovered by diffing against its output —
+/// black-box, not from its source:
+///
+/// * `TimeDateStamp` := `"CLAM"`,
+/// * `FileAlignment` := `SectionAlignment`,
+/// * every section: `VirtualSize` = `SizeOfRawData` = `VirtualSize` rounded up
+///   to `SectionAlignment`, and `PointerToRawData` := `VirtualAddress` — i.e.
+///   the file is flattened so a file offset equals its RVA.
+fn rebuild_clamav_pe(image: &[u8], first_rva: u32) -> Option<Vec<u8>> {
+    // The original header block sits near the end of the decompressed run; take
+    // the last `PE\0\0` whose COFF/optional fields are self-consistent.
+    let mut i = image.len();
+    let hdr = loop {
+        i = memchr::memmem::rfind(&image[..i], b"PE\0\0")?;
+        let nsec = u16_le(image, i + 6) as usize;
+        let optsz = u16_le(image, i + 20) as usize;
+        if (1..=96).contains(&nsec)
+            && (optsz == 224 || optsz == 240)
+            && i + 24 + optsz + nsec * 40 <= image.len()
+            && matches!(u16_le(image, i + 24), 0x10b | 0x20b)
+        {
+            break i;
+        }
+        if i == 0 {
+            return None;
+        }
+    };
+    let nsec = u16_le(image, hdr + 6) as usize;
+    let optsz = u16_le(image, hdr + 20) as usize;
+    let hdrlen = 24 + optsz + nsec * 40;
+    let mut blk = image.get(hdr..hdr + hdrlen)?.to_vec();
+    blk[8..12].copy_from_slice(b"CLAM");
+
+    let sa = u32_le(&blk, 24 + 32);
+    if sa == 0 || sa > (1 << 24) {
+        return None;
+    }
+    blk[24 + 36..24 + 40].copy_from_slice(&sa.to_le_bytes());
+
+    let st = 24 + optsz;
+    let mut total: u64 = 0;
+    for s in 0..nsec {
+        let o = st + s * 40;
+        let vsz = u32_le(&blk, o + 8);
+        let va = u32_le(&blk, o + 12);
+        let n = (vsz as u64).div_ceil(sa as u64) * sa as u64;
+        if n > u32::MAX as u64 {
+            return None;
+        }
+        let n = n as u32;
+        blk[o + 8..o + 12].copy_from_slice(&n.to_le_bytes());
+        blk[o + 16..o + 20].copy_from_slice(&n.to_le_bytes());
+        blk[o + 20..o + 24].copy_from_slice(&va.to_le_bytes());
+        total = total.max(va as u64 + n as u64);
+    }
+    if total == 0 || total > MAX_INNER as u64 {
+        return None;
+    }
+
+    let stub = clamav_dos_stub()?;
+    let mut out = vec![0u8; total as usize];
+    out[..stub.len()].copy_from_slice(&stub);
+    let hs = stub.len();
+    if hs + hdrlen > out.len() {
+        return None;
+    }
+    out[hs..hs + hdrlen].copy_from_slice(&blk);
+    let at = first_rva as usize;
+    if at < out.len() {
+        let n = image.len().min(out.len() - at);
+        out[at..at + n].copy_from_slice(&image[..n]);
+    }
+    Some(out)
+}
+
+/// RVA of the first section of a PE, which is where the decompressed run starts.
+fn first_section_rva(data: &[u8]) -> Option<u32> {
+    let e = u32_le(data, 0x3c) as usize;
+    if data.get(e..e + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let nsec = u16_le(data, e + 6) as usize;
+    let optsz = u16_le(data, e + 20) as usize;
+    if nsec == 0 {
+        return None;
+    }
+    let st = e + 24 + optsz;
+    data.get(st..st + 40)?;
+    Some(u32_le(data, st + 12))
+}
+
 pub(crate) fn extract_upx<R>(
     data: &[u8],
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
     let Some(li) = find_packheader(data) else {
-        return Ok(None);
+        // No `l_info` chain. Try the PackHeader layout before giving up; if that
+        // fails too and the image still advertises UPX, the payload is there and
+        // unexamined — say so rather than returning clean.
+        budget.count_entry()?;
+        let cap = budget.reserve()?;
+        if let Some(image) = packheader_image(data, cap) {
+            // Hand over the rebuilt PE rather than the raw run: it carries the
+            // same bytes plus the headers, so ordinary pattern signatures still
+            // match, and ClamAV's hash signatures over packed malware — computed
+            // across its own rebuilt artifact — match too. Fall back to the raw
+            // image if the headers could not be recovered, since scanning the
+            // content still beats reporting nothing.
+            let out = first_section_rva(data)
+                .and_then(|rva| rebuild_clamav_pe(&image, rva))
+                .unwrap_or(image);
+            if out.len() as u64 <= cap {
+                budget.commit(out.len() as u64);
+                return Ok(visit(Entry::new("upx-rebuilt-pe".to_string(), out), budget));
+            }
+        }
+        return if looks_upx(data) {
+            report_packed(data, budget, visit)
+        } else {
+            Ok(None)
+        };
     };
     budget.count_entry()?;
     let cap = budget.reserve()?;
@@ -137,7 +434,12 @@ pub(crate) fn extract_upx<R>(
     // unvalidated (a wrong inverse would corrupt code bytes).
 
     if out.is_empty() {
-        return Ok(None);
+        // Decompression yielded nothing: same situation, same duty to report.
+        return if looks_upx(data) {
+            report_packed(data, budget, visit)
+        } else {
+            Ok(None)
+        };
     }
     budget.commit(out.len() as u64);
     Ok(visit(
@@ -271,7 +573,7 @@ fn copy_match(
 }
 
 /// Upper bound for any NRV gamma (offset/length) value. UPX match offsets and
-/// lengths are bounded by the output size (≤ `max_entry_bytes`, ~256 MiB), far
+/// lengths are bounded by the output size (≤ `max_buffer_bytes`, ~256 MiB), far
 /// below this; a larger value means a corrupt stream and would only ever be a
 /// rejected match. Capping keeps the doubling loops and the downstream
 /// `(m-3)*256` arithmetic from overflowing on hostile input.
@@ -467,6 +769,65 @@ fn nrv2e_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
 }
 
 #[cfg(test)]
+mod rebuild_tests {
+    use super::*;
+
+    /// The stub is a compatibility constant: a large family of ClamAV hash
+    /// signatures is computed over a rebuilt PE that begins with exactly these
+    /// bytes. If it is ever "tidied up", those signatures stop matching and the
+    /// failure is silent — detections just stop happening — so pin it by
+    /// checksum rather than by quoting the text back.
+    #[test]
+    fn clamav_dos_stub_is_byte_stable() {
+        let stub = clamav_dos_stub().expect("stub decodes");
+        assert_eq!(stub.len(), STUB_LEN);
+        assert_eq!(&stub[..2], b"MZ");
+        // e_lfanew must point at where the rebuild writes the PE header block.
+        assert_eq!(u32_le(&stub, 0x3c), STUB_LEN as u32);
+        assert_eq!(adler32(&stub), 0xda33_34a5, "stub bytes changed");
+    }
+
+    /// The header rewrites, checked on a synthetic block: sizes rounded up to
+    /// `SectionAlignment`, raw offsets equal to RVAs, timestamp `"CLAM"`.
+    #[test]
+    fn rebuild_applies_the_clamav_header_rules() {
+        let mut image = vec![0u8; 0x2000];
+        let hdr = 0x1000;
+        image[hdr..hdr + 4].copy_from_slice(b"PE\0\0");
+        image[hdr + 6..hdr + 8].copy_from_slice(&1u16.to_le_bytes());
+        image[hdr + 20..hdr + 22].copy_from_slice(&224u16.to_le_bytes());
+        let opt = hdr + 24;
+        image[opt..opt + 2].copy_from_slice(&0x010bu16.to_le_bytes());
+        image[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        let sec = opt + 224;
+        image[sec..sec + 5].copy_from_slice(b".text");
+        image[sec + 8..sec + 12].copy_from_slice(&0x800u32.to_le_bytes());
+        image[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        let out = rebuild_clamav_pe(&image, 0x1000).expect("rebuild");
+        let e = u32_le(&out, 0x3c) as usize;
+        assert_eq!(&out[e..e + 4], b"PE\0\0");
+        assert_eq!(&out[e + 8..e + 12], b"CLAM", "TimeDateStamp");
+        let o = e + 24;
+        assert_eq!(
+            u32_le(&out, o + 36),
+            0x1000,
+            "FileAlignment := SectionAlignment"
+        );
+        let s = o + 224;
+        assert_eq!(u32_le(&out, s + 8), 0x1000, "VirtualSize rounded up");
+        assert_eq!(u32_le(&out, s + 16), 0x1000, "SizeOfRawData := VirtualSize");
+        assert_eq!(
+            u32_le(&out, s + 20),
+            0x1000,
+            "PointerToRawData := VirtualAddress"
+        );
+        assert_eq!(out.len(), 0x2000, "image ends at the last section");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -510,9 +871,9 @@ mod tests {
         const MARKER: &[u8] = b"EXAV_UNIQUE_MARKER";
         let decode = |data: &[u8]| -> Vec<u8> {
             let mut b = Budget::new(Limits {
-                max_total_bytes: 1 << 30,
-                max_entry_bytes: 1 << 30,
-                max_ratio: u64::MAX,
+                max_extracted_bytes: 1 << 30,
+                max_buffer_bytes: 1 << 30,
+                max_compression_ratio: u64::MAX,
                 ..Default::default()
             });
             extract(Format::Upx, data, &mut b)

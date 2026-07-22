@@ -156,11 +156,23 @@ fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
     if block.len() < 5 {
         return None;
     }
+    // The dictionary size comes straight out of the file and the decoder
+    // allocates it UP FRONT, before a byte is decompressed — so an attacker sets
+    // it to whatever they like and exav allocates that much. Measured: a 766 KB
+    // installer declaring a 1.5 GB dictionary, which aborted the process under
+    // the daemon's per-job RLIMIT_AS. Under the daemon that abort closes the
+    // client connection with no reply at all, which reads as a clean scan.
+    //
+    // Clamp it to the caller's budget. A dictionary bigger than the output it is
+    // used to produce cannot help — LZMA only ever looks back into bytes it has
+    // already emitted — so capping at `cap` costs nothing on a real stream while
+    // making the allocation bounded by the same limit as everything else.
+    let dict = crate::bounded_dict(u32le(block, 1), cap);
     let reader = lzma_rust2::LzmaReader::new_with_props(
         Cursor::new(&block[5..]),
         u64::MAX,
         block[0],
-        u32le(block, 1),
+        dict,
         None,
     )
     .ok()?;
@@ -181,6 +193,21 @@ mod tests {
     use super::*;
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
+
+    /// A declared dictionary size is attacker input and is allocated UP FRONT.
+    /// Clamping it is what stops a small file committing gigabytes — measured at
+    /// 1.5 GB from a 766 KB installer, which aborted the process.
+    #[test]
+    fn a_huge_declared_dictionary_is_clamped_to_the_budget() {
+        // 4 GiB-1 declared, 1 MiB of budget.
+        assert_eq!(crate::bounded_dict(u32::MAX, 1 << 20), 1 << 20);
+        // A modest declaration inside the budget is untouched.
+        assert_eq!(crate::bounded_dict(1 << 16, 1 << 20), 1 << 16);
+        // A budget larger than any u32 cannot overflow the clamp.
+        assert_eq!(crate::bounded_dict(1 << 16, u64::MAX), 1 << 16);
+        // A nonsense-small declaration still gets a workable floor.
+        assert_eq!(crate::bounded_dict(0, 1 << 20), 1 << 12);
+    }
 
     fn synthetic_nsis(deflate_block: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();

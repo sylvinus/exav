@@ -29,36 +29,70 @@ pub(crate) fn is_dmg(data: &[u8]) -> bool {
     if data.len() >= 8 && &data[0..8] == ENCRCDSA_SIG {
         return true;
     }
-    let limit = data.len().min(64 * 1024);
-    for off in (0..limit).step_by(16) {
-        if data.len() >= off + 2 && data[off..off + 2] == HFS_PLUS_SIG {
-            return true;
-        }
-        if data.len() >= off + 4 && &data[off..off + 4] == APFS_SIG {
-            return true;
-        }
+    // Both signatures are checked through the same validators the extractor
+    // uses, so `detect` cannot claim a file the extractor will then refuse.
+    find_hfs_offset(data).is_some() || find_apfs_offset(data).is_some()
+}
+
+/// HFSX, the case-sensitive variant, uses a different signature and version.
+const HFSX_SIG: [u8; 2] = [0x48, 0x58];
+
+/// Does a plausible HFS+/HFSX volume header start at `off`?
+///
+/// The signature alone is **two bytes**. Scanning 64 KiB at 16-byte steps gives
+/// about four thousand chances for it to appear by accident, so on arbitrary
+/// data — a compressed archive, say — it hits perhaps one time in twenty. That
+/// is not a theoretical worry: it costs the file its real format, because
+/// whatever it actually was is never tried once `detect` has answered `Dmg`.
+///
+/// So the signature has to be corroborated. The two fields right after it are
+/// enough: the version is 4 (HFS+) or 5 (HFSX), and the allocation block size is
+/// a power of two of at least 512. Together they take the false-positive rate to
+/// somewhere around one in a billion.
+fn plausible_hfs_header(data: &[u8], off: usize) -> bool {
+    let Some(h) = data.get(off..off + 44) else {
+        return false;
+    };
+    let sig = [h[0], h[1]];
+    let version = u16::from_be_bytes([h[2], h[3]]);
+    let ok_sig = (sig == HFS_PLUS_SIG && version == 4) || (sig == HFSX_SIG && version == 5);
+    if !ok_sig {
+        return false;
     }
-    false
+    // `blockSize` sits at offset 40 of the volume header.
+    let block_size = u32::from_be_bytes([h[40], h[41], h[42], h[43]]);
+    block_size >= 512 && block_size.is_power_of_two()
 }
 
 fn find_hfs_offset(data: &[u8]) -> Option<usize> {
     let limit = data.len().min(64 * 1024);
-    for off in (0..limit).step_by(16) {
-        if data.len() >= off + 2 && data[off..off + 2] == HFS_PLUS_SIG {
-            return Some(off);
-        }
+    (0..limit)
+        .step_by(16)
+        .find(|&off| plausible_hfs_header(data, off))
+}
+
+/// The APFS container superblock's `nx_block_size`, which corroborates the
+/// four-byte signature the same way the HFS+ check does. Four bytes is a much
+/// stronger start than two, but the object header before it is free to check.
+/// `off` is where `NXSB` itself sits, which is 32 bytes into the superblock —
+/// the object header (checksum, oid, xid, type, subtype) comes first.
+/// `nx_block_size` is the field immediately after the magic.
+fn plausible_apfs_header(data: &[u8], off: usize) -> bool {
+    let Some(h) = data.get(off..off + 8) else {
+        return false;
+    };
+    if &h[0..4] != APFS_SIG {
+        return false;
     }
-    None
+    let block_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+    block_size >= 512 && block_size.is_power_of_two()
 }
 
 fn find_apfs_offset(data: &[u8]) -> Option<usize> {
     let limit = data.len().min(64 * 1024);
-    for off in (0..limit).step_by(16) {
-        if data.len() >= off + 4 && &data[off..off + 4] == APFS_SIG {
-            return Some(off);
-        }
-    }
-    None
+    (0..limit)
+        .step_by(16)
+        .find(|&off| plausible_apfs_header(data, off))
 }
 
 #[cfg(feature = "decrypt")]
@@ -246,7 +280,7 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
     // single chunk allocation by the (default) global peak-buffer limit and
     // reject a zero block size (which would divide-by-zero below).
     let chunk_size = header.blocksize as usize;
-    if chunk_size == 0 || chunk_size as u64 > crate::Limits::default().max_buffer_bytes() {
+    if chunk_size == 0 || chunk_size as u64 > crate::Limits::default().max_buffer_bytes {
         return Err(LimitHit::new(
             "DMG block size invalid or exceeds max-buffer".into(),
         ));
@@ -361,7 +395,7 @@ pub(crate) fn extract_dmg<R>(
                         ));
                         continue;
                     }
-                    let raw = decompress_udif(&decrypted, budget.limits.max_buffer_bytes())?;
+                    let raw = decompress_udif(&decrypted, budget.limits.max_buffer_bytes)?;
                     return extract_from_raw(&raw, budget, visit);
                 }
                 Err(e) => {
@@ -370,25 +404,25 @@ pub(crate) fn extract_dmg<R>(
             }
         }
 
-        // All passwords failed.
-        let reason = if let Some(e) = last_err {
-            format!("encrypted DMG (wrong password): {e}")
+        // All passwords failed. The reason is `&'static str`, so it is one of a
+        // fixed set rather than a formatted string: leaking a fresh allocation
+        // per attempt would let anyone grow a long-running daemon without bound
+        // by resubmitting encrypted images. Which decryption step objected does
+        // not change what the operator does about it — supply the password.
+        let reason = if last_err.is_some() {
+            "encrypted DMG (wrong password, decryption failed)"
         } else {
-            "encrypted DMG (wrong password)".into()
+            "encrypted DMG (wrong password)"
         };
-        let entry = Entry::unsupported(
-            "encrypted.dmg".to_string(),
-            data.len() as u64,
-            true,
-            Box::leak(reason.into_boxed_str()),
-        );
+        let entry =
+            Entry::unsupported("encrypted.dmg".to_string(), data.len() as u64, true, reason);
         if let Some(r) = visit(entry, budget) {
             return Ok(Some(r));
         }
         return Ok(None);
     }
 
-    let raw = decompress_udif(data, budget.limits.max_buffer_bytes())?;
+    let raw = decompress_udif(data, budget.limits.max_buffer_bytes)?;
     extract_from_raw(&raw, budget, visit)
 }
 
@@ -513,26 +547,70 @@ mod tests {
         assert!(is_dmg(&buf));
     }
 
+    /// Write a well-formed HFS+ volume header at `off`.
+    fn put_hfs(buf: &mut [u8], off: usize) {
+        buf[off] = 0x48;
+        buf[off + 1] = 0x2B;
+        buf[off + 2..off + 4].copy_from_slice(&4u16.to_be_bytes()); // version
+        buf[off + 40..off + 44].copy_from_slice(&4096u32.to_be_bytes()); // blockSize
+    }
+
+    /// Write a well-formed APFS container superblock at `off`.
+    fn put_apfs(buf: &mut [u8], off: usize) {
+        buf[off..off + 4].copy_from_slice(b"NXSB");
+        buf[off + 4..off + 8].copy_from_slice(&4096u32.to_le_bytes()); // nx_block_size
+    }
+
     #[test]
     fn detect_raw_hfs() {
         let mut buf = vec![0u8; 2048];
-        buf[1024] = 0x48;
-        buf[1025] = 0x2B;
+        put_hfs(&mut buf, 1024);
         assert!(is_dmg(&buf));
     }
 
     #[test]
     fn detect_raw_apfs() {
         let mut buf = vec![0u8; 2048];
-        buf[1024..1028].copy_from_slice(b"NXSB");
+        put_apfs(&mut buf, 1024);
         assert!(is_dmg(&buf));
     }
 
     #[test]
     fn detect_apfs_unaligned() {
         let mut buf = vec![0u8; 0x6000];
-        buf[0x5020..0x5024].copy_from_slice(b"NXSB");
+        put_apfs(&mut buf, 0x5020);
         assert!(is_dmg(&buf));
+    }
+
+    #[test]
+    fn a_bare_signature_without_a_plausible_header_is_not_a_dmg() {
+        // `H+` is two bytes. Across 64 KiB scanned at 16-byte steps it turns up
+        // by chance in roughly one arbitrary buffer in twenty — and a false hit
+        // is not a wasted check, it is a stolen file: `detect` answers `Dmg`, so
+        // whatever the buffer really was never gets tried.
+        //
+        // Found by fuzzing chains of nested formats, where a compressed member
+        // hit it and the whole branch came back UNSCANNABLE.
+        let mut buf = vec![0u8; 4096];
+        buf[1024] = 0x48;
+        buf[1025] = 0x2B;
+        assert!(
+            !is_dmg(&buf),
+            "the signature alone must not be enough; the version and block size \
+             fields have to agree"
+        );
+
+        // Right signature, wrong version.
+        let mut buf = vec![0u8; 4096];
+        put_hfs(&mut buf, 1024);
+        buf[1026..1028].copy_from_slice(&9u16.to_be_bytes());
+        assert!(!is_dmg(&buf));
+
+        // Right signature and version, implausible block size.
+        let mut buf = vec![0u8; 4096];
+        put_hfs(&mut buf, 1024);
+        buf[1064..1068].copy_from_slice(&3000u32.to_be_bytes());
+        assert!(!is_dmg(&buf));
     }
 
     #[test]

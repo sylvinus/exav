@@ -1,0 +1,55 @@
+/* exav — a small accent on top of the default Starlight theme.
+   Keep this minimal: the clean default look is the goal. */
+:root {
+  /* A calm teal accent (evokes "safe"/verified). */
+  --sl-color-accent-low: #002b2b;
+  --sl-color-accent: #0f9e8e;
+  --sl-color-accent-high: #a8ede2;
+
+  /* Give the main content column more room by trimming both sidebars. These
+     Starlight layout properties only apply at the larger breakpoints, so mobile
+     (single-column) is unaffected. */
+  --sl-sidebar-width: 15rem; /* left nav (was 18.75rem) */
+  --sl-content-width: 56rem; /* content column (was 45rem) */
+}
+
+/* Narrow the right-hand "On this page" table-of-contents column. Starlight's
+   `--sl-sidebar-width` only controls the LEFT nav, so the right TOC needs its
+   own width. Only on wide screens (the TOC is hidden/inline on smaller ones). */
+@media (min-width: 72rem) {
+  .right-sidebar {
+    width: 14rem; /* narrower than default, but wide enough for the longest TOC entry */
+  }
+  .right-sidebar .right-sidebar-panel {
+    width: 14rem;
+  }
+  /* TOC entries wrap rather than clip if one is very long. */
+  .right-sidebar a {
+    overflow-wrap: break-word;
+  }
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #c5efe8;
+  --sl-color-accent: #0c8375;
+  --sl-color-accent-high: #063d37;
+}
+
+/* Homepage hero. The mark is a square, so left unconstrained it fills half the
+   hero; cap it and keep the tagline measure short. */
+.hero > .stack .tagline {
+  max-width: 44ch;
+}
+.hero > img,
+.hero > .hero-html img {
+  max-width: 9rem;
+  margin-inline: auto;
+}
+
+/* Verdict tags rendered inline in prose (e.g. `FOUND`, `LIMITS-EXCEEDED`). */
+.verdict-tag {
+  font-family: var(--sl-font-mono);
+  font-size: 0.85em;
+  font-weight: 600;
+  white-space: nowrap;
+}

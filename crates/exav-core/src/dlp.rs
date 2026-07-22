@@ -423,8 +423,8 @@ mod tests {
 
     #[test]
     fn integration_structured_cc_verdict() {
-        use crate::{analyze, Database, Method, ScanOptions, Verdict};
-        let db = Database::builtin();
+        use crate::{analyze, Method, ScanOptions, Scanner, Verdict};
+        let db = Scanner::builtin();
         let mut buf = Vec::new();
         for card in [VISA, MC, AMEX, DISCOVER] {
             buf.extend_from_slice(card);

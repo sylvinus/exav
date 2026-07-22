@@ -106,6 +106,10 @@ fn push_stored(
 fn extract_rar4(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<Entry>, LimitHit> {
     let mut out = Vec::new();
     let mut pos = start;
+    // Kept across members: in a solid archive the files form one continuous LZ
+    // stream, so a member flagged solid needs the window and tables its
+    // predecessor left behind.
+    let mut solid_dec: Option<rar3_unpack::Unpacker29> = None;
     while pos + 7 <= data.len() {
         let flags = match u16le(data, pos + 3) {
             Some(f) => f,
@@ -125,6 +129,26 @@ fn extract_rar4(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
         } else {
             0
         };
+        if htype == 0x73 && flags & 0x0080 != 0 {
+            // MHD_PASSWORD: the BLOCK HEADERS themselves are encrypted (`rar -hp`),
+            // so the file table cannot be read at all — not one member name, let
+            // alone its content.
+            //
+            // Without this the walk simply finds no file headers and returns an
+            // empty list, and an archive with nothing in it scans CLEAN. That is
+            // the worst outcome available: a password-protected archive reported
+            // as containing no malware, when the truth is that nothing inside it
+            // was ever looked at. Report it, exactly as a member-level
+            // `LHD_PASSWORD` is reported below.
+            budget.count_entry()?;
+            out.push(Entry::unsupported(
+                "rar-encrypted-headers".to_string(),
+                data.len() as u64,
+                true,
+                "RAR archive with encrypted headers",
+            ));
+            break;
+        }
         if htype == 0x7B {
             break; // archive-end block
         }
@@ -158,24 +182,70 @@ fn extract_rar4(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
             let is_dir = (flags & 0xE0) == 0xE0;
             // Window size bits from the dictionary flags (0..7) + 16.
             let win_bits = (((flags & 0xE0) >> 5) as u32) + 16;
+            // LHD_SPLIT_BEFORE / LHD_SPLIT_AFTER. A member split across volumes
+            // has only part of its compressed data in this file; the rest is in
+            // a sibling `.partN.rar` that exav is not scanning. Reporting the
+            // real reason keeps a volume set from looking like a corrupt
+            // archive, and the member is still surfaced rather than skipped.
+            let split = flags & 0x03 != 0;
             if is_dir {
                 // skip directories
-            } else if method == 0x30 && pack == unp {
+            } else if method == 0x30 && (pack == unp || split) {
+                // Stored: what is in this volume is the file's own bytes. For a
+                // split member that is only part of the file, but part of a file
+                // is real content and scanning it beats reporting the whole
+                // member unreadable.
+                //
+                // A split member must ALSO be reported, though. The bytes handed
+                // over are a prefix, and an `Entry` with no `unsupported` reason
+                // reads as a complete member — so a stored member continuing
+                // into a sibling volume scanned as a clean OK, which is a silent
+                // truncation. Emit both: the readable prefix, and the reason the
+                // rest is missing.
+                if split {
+                    budget.count_entry()?;
+                    out.push(Entry::unsupported(
+                        name.clone(),
+                        pack,
+                        encrypted,
+                        "RAR member continues in another volume; only the part in \
+                         this volume was scanned",
+                    ));
+                }
                 push_stored(&mut out, budget, name, data, data_off, pack, encrypted)?;
+            } else if split {
+                budget.count_entry()?;
+                out.push(Entry::unsupported(
+                    name,
+                    pack,
+                    encrypted,
+                    "RAR member continues in another volume",
+                ));
             } else if !encrypted && unp_ver == 29 && (0x31..=0x35).contains(&method) {
                 // RAR3 (unpack29) compressed LZ member: attempt decompression.
                 budget.count_entry()?;
                 let dend = data_off.saturating_add(pack as usize).min(data.len());
                 let packed = &data[data_off.min(data.len())..dend];
-                let decoded = rar3_unpack::unpack29(packed, unp, win_bits, budget).ok();
+                // LHD_SOLID. The window is sized once, from the first member of
+                // the group; a solid member's own dictionary flags describe the
+                // same shared window.
+                let solid = flags & 0x10 != 0;
+                if solid_dec.is_none() {
+                    solid_dec = rar3_unpack::Unpacker29::new(win_bits, budget).ok();
+                }
+                let decoded = match solid_dec.as_mut() {
+                    Some(dec) => dec.member(packed, unp, solid, budget).ok(),
+                    None => None,
+                };
+                // A member that failed mid-group leaves the shared window out of
+                // step with the stream, so every later member would decode to
+                // garbage. Dropping the decoder makes them fail their CRC and be
+                // reported rather than quietly mis-scanned.
+                if decoded.is_none() {
+                    solid_dec = None;
+                }
                 match decoded {
-                    Some(bytes) => {
-                        #[cfg(any(test, feature = "rar5-crc-check"))]
-                        {
-                            let c = crc32_ieee(&bytes);
-                            debug_assert_eq!(c, crc, "rar3 CRC mismatch for {name}");
-                        }
-                        let _ = crc;
+                    Some(bytes) if crc32_ieee(&bytes) == crc => {
                         out.push(Entry {
                             comp_size: pack,
                             encrypted: false,
@@ -183,6 +253,14 @@ fn extract_rar4(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                             name,
                             data: bytes,
                         });
+                    }
+                    Some(_) => {
+                        out.push(Entry::unsupported(
+                            name,
+                            pack,
+                            false,
+                            "RAR member did not match its recorded CRC after decoding",
+                        ));
                     }
                     None => {
                         out.push(Entry::unsupported(
@@ -233,6 +311,9 @@ fn read_name(data: &[u8], off: usize, len: usize) -> String {
 // ---- RAR5 ------------------------------------------------------------------
 
 fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<Entry>, LimitHit> {
+    // Kept across members: a solid RAR5 group's files share one window, and a
+    // solid member's first block may declare no tables of its own.
+    let mut solid_dec: Option<rar5_unpack::Unpacker50> = None;
     let mut out = Vec::new();
     let mut pos = start;
     while pos + 4 < data.len() {
@@ -293,9 +374,37 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
             // File header content continues at q.
             if let Some(f) = rar5_file_fields(data, q, hdr, hsize, extra_size) {
                 let is_dir = f.file_flags & 0x01 != 0;
+                // Header flags 0x08 / 0x10: the member's data starts in the
+                // previous volume or continues into the next one.
+                let split = hflags & 0x18 != 0;
                 if is_dir {
                     // skip
+                } else if split && f.method != 0 {
+                    budget.count_entry()?;
+                    out.push(Entry::unsupported(
+                        f.name,
+                        data_size,
+                        f.encrypted,
+                        "RAR member continues in another volume",
+                    ));
                 } else if f.method == 0 {
+                    // Stored. A split stored member is only a PREFIX of the
+                    // file — the rest lives in a sibling volume — so it must be
+                    // reported as well as scanned. Without this the partial
+                    // bytes go out with no `unsupported` reason, which reads as
+                    // a complete member, and a multi-volume archive scans as a
+                    // clean OK. The `method != 0` branch above already reports
+                    // its split members; the stored branch did not.
+                    if split {
+                        budget.count_entry()?;
+                        out.push(Entry::unsupported(
+                            f.name.clone(),
+                            data_size,
+                            f.encrypted,
+                            "RAR member continues in another volume; only the part in \
+                             this volume was scanned",
+                        ));
+                    }
                     push_stored(&mut out, budget, f.name, data, data_off, data_size, false)?;
                 } else if f.encrypted {
                     budget.count_entry()?;
@@ -315,19 +424,23 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                     };
                     let ws = rar5_unpack::window_size_from_comp_info(f.comp_info);
                     budget.count_entry()?;
-                    let decoded = if ws != 0 {
-                        rar5_unpack::unpack50(packed, f.unp_size, ws, budget).ok()
-                    } else {
-                        None
+                    if ws != 0 && solid_dec.is_none() {
+                        solid_dec = rar5_unpack::Unpacker50::new(ws).ok();
+                    }
+                    let decoded = match solid_dec.as_mut() {
+                        Some(dec) => dec.member(packed, f.unp_size, f.solid, budget).ok(),
+                        None => None,
                     };
+                    // A member that failed mid-group leaves the shared window out
+                    // of step with the stream, so every later member would decode
+                    // to garbage. Dropping the decoder makes them fail their CRC
+                    // and be reported rather than quietly mis-scanned.
+                    if decoded.is_none() {
+                        solid_dec = None;
+                    }
+                    let crc_ok = |b: &[u8]| !f.has_crc || crc32_ieee(b) == f.crc;
                     match decoded {
-                        Some(bytes) => {
-                            // CRC check in debug/test builds (see unit checks).
-                            #[cfg(any(test, feature = "rar5-crc-check"))]
-                            if f.has_crc {
-                                let c = crc32_ieee(&bytes);
-                                debug_assert_eq!(c, f.crc, "rar5 CRC mismatch for {}", "<member>");
-                            }
+                        Some(bytes) if crc_ok(&bytes) => {
                             out.push(Entry {
                                 comp_size: data_size,
                                 encrypted: false,
@@ -335,6 +448,14 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                                 name: f.name,
                                 data: bytes,
                             });
+                        }
+                        Some(_) => {
+                            out.push(Entry::unsupported(
+                                f.name,
+                                data_size,
+                                false,
+                                "RAR member did not match its recorded CRC after decoding",
+                            ));
                         }
                         None => {
                             // Couldn't decode (unsupported method/filter/PPMd or
@@ -369,11 +490,12 @@ struct Rar5File {
     file_flags: u64,
     unp_size: u64,
     comp_info: u64,
-    /// Stored unpacked-data CRC-32 (only meaningful when `has_crc`); used by the
-    /// `rar5-crc-check` feature to validate decompression.
-    #[cfg_attr(not(any(test, feature = "rar5-crc-check")), allow(dead_code))]
+    /// `comp_info` bit 6: the member continues the previous member's compressed
+    /// stream and cannot be decoded without its window.
+    solid: bool,
+    /// Stored unpacked-data CRC-32, only meaningful when `has_crc`. Every
+    /// decoded member is checked against it.
     crc: u32,
-    #[cfg_attr(not(any(test, feature = "rar5-crc-check")), allow(dead_code))]
     has_crc: bool,
     encrypted: bool,
 }
@@ -416,8 +538,9 @@ fn rar5_file_fields(
     } else {
         "rar-entry".to_string()
     };
-    // compression method = bits 7..9 of comp_info.
+    // compression method = bits 7..9 of comp_info; bit 6 marks a solid member.
     let method = (comp_info >> 7) & 0x7;
+    let solid = comp_info & (1 << 6) != 0;
     // The extra area lives at the tail of the header; scan it for an EX_CRYPT
     // (0x01) record, which marks the file data as encrypted.
     let encrypted = rar5_extra_has_crypt(data, end, extra_size);
@@ -427,6 +550,7 @@ fn rar5_file_fields(
         file_flags,
         unp_size,
         comp_info,
+        solid,
         crc,
         has_crc,
         encrypted,
@@ -473,8 +597,12 @@ fn rar5_extra_has_crypt(data: &[u8], end: usize, extra_size: u64) -> bool {
     false
 }
 
-/// CRC-32 (IEEE, poly 0xEDB88320) over `data`. Used to validate RAR5 output.
-#[cfg(any(test, feature = "rar5-crc-check"))]
+/// CRC-32 (IEEE, poly 0xEDB88320) over `data`. Every decoded RAR member is
+/// checked against the CRC the archive records, in every build: a decoder that
+/// produces plausible-looking wrong bytes — which is exactly what happens when
+/// a solid member is decoded without the preceding member's window — would
+/// otherwise hand the scanner content that is not the file, and a pattern that
+/// does not match garbage reads as clean.
 pub(crate) fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
@@ -490,6 +618,35 @@ pub(crate) fn crc32_ieee(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rar -hp` encrypts the BLOCK HEADERS, so the file table itself is
+    /// unreadable — the walk finds no file headers at all.
+    ///
+    /// Returning an empty member list for that is a silent clean: a
+    /// password-protected archive reported as containing no malware, when
+    /// nothing inside it was ever examined. The archive-level MHD_PASSWORD flag
+    /// (0x0080) is the only evidence available, so it has to be acted on.
+    #[test]
+    fn header_encrypted_archive_is_reported_not_empty() {
+        // Marker, then an archive header with MHD_PASSWORD set and nothing after
+        // it — exactly what a header-encrypted archive looks like to a reader
+        // without the password.
+        let mut rar = b"Rar!\x1a\x07\x00".to_vec();
+        rar.extend_from_slice(&[0xef, 0xb4]); // HEAD_CRC
+        rar.push(0x73); // HEAD_TYPE: archive header
+        rar.extend_from_slice(&0x0080u16.to_le_bytes()); // HEAD_FLAGS: MHD_PASSWORD
+        rar.extend_from_slice(&13u16.to_le_bytes()); // HEAD_SIZE
+        rar.extend_from_slice(&[0u8; 6]); // reserved fields
+        rar.extend_from_slice(&[0xab; 64]); // encrypted block headers
+
+        let mut b = budget();
+        let entries = crate::extract(crate::Format::Rar, &rar, &mut b).expect("extract");
+        let e = entries
+            .first()
+            .expect("a header-encrypted archive must be reported, not returned empty");
+        assert!(e.encrypted, "must be flagged encrypted");
+        assert!(e.unsupported.is_some(), "must carry an unsupported reason");
+    }
 
     fn budget() -> Budget {
         Budget::new(Limits::default())
@@ -653,9 +810,9 @@ mod tests {
                 continue;
             }
             let mut b = Budget::new(Limits {
-                max_total_bytes: 256 * 1024 * 1024,
-                max_entry_bytes: 256 * 1024 * 1024,
-                max_ratio: u64::MAX,
+                max_extracted_bytes: 256 * 1024 * 1024,
+                max_buffer_bytes: 256 * 1024 * 1024,
+                max_compression_ratio: u64::MAX,
                 ..Default::default()
             });
             // The extractor's debug_assert (cfg(test)) checks the CRC; here we

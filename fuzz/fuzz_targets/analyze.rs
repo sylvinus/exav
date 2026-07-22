@@ -3,10 +3,10 @@
 //! heuristics on (pattern + hash, recursive unpack, PE/ML/fuzzy). Must
 //! never panic, hang, or exhaust memory regardless of input.
 use libfuzzer_sys::fuzz_target;
-use exav_core::{analyze, Database, ScanOptions};
+use exav_core::{analyze, Scanner, ScanOptions};
 
 fuzz_target!(|data: &[u8]| {
-    let db = Database::builtin();
+    let db = Scanner::builtin();
     let opts = ScanOptions { heuristics: true, ..Default::default() };
     let _ = analyze(&db, data, &opts);
 });

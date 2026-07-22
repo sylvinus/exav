@@ -1,0 +1,23 @@
+{
+  "name": "exav-www",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Documentation website for exav (exav.org) — a memory-safe, ClamAV-compatible malware scanner.",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.41.4",
+    "astro": "^7.1.3",
+    "sharp": "^0.35.3"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.9",
+    "typescript": "^6.0.3"
+  }
+}

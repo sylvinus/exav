@@ -1,7 +1,7 @@
 //! Type table (`T` record) and constant globals (`G` record) decoding.
 //!
 //! Type ids `<= 64` are integers of that many bits; ids `>= 65` index a table
-//! whose first [`NUM_STATIC`] entries are predefined pointer types and the rest
+//! whose first `NUM_STATIC` entries are predefined pointer types and the rest
 //! are declared in the `T` record. Globals are constant initializers laid out
 //! as a flat list of 64-bit components (a pointer is two components), needed by
 //! the VM to resolve pointer operands.

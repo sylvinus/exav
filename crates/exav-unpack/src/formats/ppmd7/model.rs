@@ -1319,7 +1319,18 @@ impl<RC: RangeDec> Ppmd7<RC> {
             let mut mc = self.min_context;
             let num_masked = self.ctx_num_stats(mc) as u32;
 
+            // Valid suffix chains are at most `max_order` deep. Following one
+            // without a step bound lets a cyclic chain — every link in range, so
+            // nothing else objects — spin forever, and the only thing outside
+            // this crate that would stop it is a CPU rlimit the library
+            // embedding does not have.
+            let mut steps = 0u32;
             while self.ctx_num_stats(mc) as u32 == num_masked {
+                steps += 1;
+                if steps > self.max_order {
+                    self.corrupt = true;
+                    return SYM_ERROR;
+                }
                 self.order_fall += 1;
                 if self.ctx_suffix(mc).is_null() {
                     return SYM_END;

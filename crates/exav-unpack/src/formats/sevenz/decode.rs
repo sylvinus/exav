@@ -15,6 +15,7 @@ pub(super) fn is_known_codec(id: &[u8]) -> bool {
         || id == ID_BZIP2
         || id == ID_DEFLATE
         || id == ID_BCJ_X86
+        || id == ID_BCJ2
         || id == ID_BCJ_ARM
         || id == ID_BCJ_ARM64
         || id == ID_DELTA
@@ -64,6 +65,10 @@ pub(super) fn wrap_coder(
                     1u32 << 11
                 }
             };
+            // Bound the up-front dictionary allocation by the declared output —
+            // a dictionary larger than the bytes it will be used to look back
+            // into cannot be consulted, and the size is attacker-controlled.
+            let dict_size = crate::bounded_dict(dict_size, expected_size as u64);
             let decoder = lzma_rust2::LzmaReader::new_with_props(
                 inner,
                 expected_size as u64,
@@ -151,7 +156,7 @@ pub(super) fn wrap_coder(
 
 // ─── Our own PPMd7 reader for 7z ───────────────────────────────────────────
 
-struct Ppmd7ZReader<R: Read> {
+pub(crate) struct Ppmd7ZReader<R: Read> {
     inner: R,
     buffer: Vec<u8>,
     pos: usize,
@@ -163,7 +168,12 @@ struct Ppmd7ZReader<R: Read> {
 }
 
 impl<R: Read> Ppmd7ZReader<R> {
-    fn new(inner: R, order: u32, mem_size: u32, max_buffer: u64) -> Result<Self, LimitHit> {
+    pub(crate) fn new(
+        inner: R,
+        order: u32,
+        mem_size: u32,
+        max_buffer: u64,
+    ) -> Result<Self, LimitHit> {
         if !(2..=64).contains(&order) {
             return Err(LimitHit::corrupt(format!(
                 "7z: PPMD order {order} out of range [2, 64]"
@@ -172,6 +182,17 @@ impl<R: Read> Ppmd7ZReader<R> {
         if mem_size < 2048 {
             return Err(LimitHit::corrupt(format!(
                 "7z: PPMD memory size {mem_size} too small"
+            )));
+        }
+        // The model arena is `mem_size` bytes and the field is a full u32, so a
+        // tiny archive can otherwise ask for ~4 GiB before decoding anything.
+        // The allocation is fallible, so this is not a crash — but the caller's
+        // buffer cap is what says how much memory this scan may claim, and the
+        // model has to answer to it like everything else. The ZIP method-98 path
+        // clamps for the same reason.
+        if u64::from(mem_size) > max_buffer {
+            return Err(LimitHit::new(format!(
+                "7z: PPMD model memory {mem_size} exceeds max-buffer {max_buffer}"
             )));
         }
 

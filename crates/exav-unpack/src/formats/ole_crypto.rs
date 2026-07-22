@@ -10,8 +10,14 @@
 //! password) automatically so the real content is scanned.
 //!
 //! Only the `Workbook`/`Book` stream is encrypted; other storages (e.g. the VBA
-//! project) are not. The XOR obfuscation scheme (`wEncryptionType == 0`) and the
-//! OOXML AES schemes are detected elsewhere but not decrypted here.
+//! project) are not.
+//!
+//! This module also implements the legacy **XOR obfuscation** scheme
+//! (`wEncryptionType == 0`, [MS-OFFCRYPTO] §2.3.7) and both OOXML schemes —
+//! **standard** (AES-ECB, SHA-1 spun 50000×) and **agile** (AES-CBC with a
+//! per-blob KDF), §2.3.4. `ole.rs` routes an `EncryptionInfo` +
+//! `EncryptedPackage` compound file here and scans the recovered `.zip`; a
+//! document that still won't open is reported password-protected, never clean.
 
 use md5::{Digest, Md5};
 use sha1::Sha1;
@@ -1076,6 +1082,77 @@ mod tests {
         assert!(
             out.windows(eicar.len()).any(|w| w == eicar),
             "EICAR must be recovered from the decrypted OOXML package"
+        );
+    }
+
+    /// End-to-end wiring: a real OLE2/CFB container holding `EncryptionInfo` +
+    /// `EncryptedPackage` must be routed through the decryptor by the OLE
+    /// extractor, not merely reported password-protected. The crypto is covered
+    /// above; this pins the plumbing between `ole.rs` and this module.
+    #[test]
+    fn encrypted_ooxml_in_a_cfb_container_is_decrypted_by_the_extractor() {
+        use crate::{Budget, Limits};
+        use std::io::{Cursor, Write};
+
+        // Same standard-scheme (AES-128-ECB, empty password) construction as the
+        // test above, kept local so the two can't drift into sharing a bug.
+        let salt = [0x42u8; 16];
+        let key = ooxml_standard_key(&salt, "", 16);
+        let verifier = [0x24u8; 16];
+        let enc_verifier = aes_ecb_encrypt(&key, &verifier);
+        let vhash = sha1(&verifier);
+        let mut vhash_padded = vhash.to_vec();
+        while !vhash_padded.len().is_multiple_of(16) {
+            vhash_padded.push(0);
+        }
+        let enc_vhash = aes_ecb_encrypt(&key, &vhash_padded);
+
+        let mut info = Vec::new();
+        info.extend_from_slice(&3u16.to_le_bytes());
+        info.extend_from_slice(&2u16.to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        let mut hdr = vec![0u8; 32];
+        hdr[16..20].copy_from_slice(&128u32.to_le_bytes());
+        info.extend_from_slice(&(hdr.len() as u32).to_le_bytes());
+        info.extend_from_slice(&hdr);
+        info.extend_from_slice(&16u32.to_le_bytes());
+        info.extend_from_slice(&salt);
+        info.extend_from_slice(&enc_verifier);
+        info.extend_from_slice(&20u32.to_le_bytes());
+        info.extend_from_slice(&enc_vhash);
+
+        let mut plain = EICAR.to_vec();
+        while !plain.len().is_multiple_of(16) {
+            plain.push(0);
+        }
+        let mut package = (EICAR.len() as u64).to_le_bytes().to_vec();
+        package.extend_from_slice(&aes_ecb_encrypt(&key, &plain));
+
+        // Wrap both streams in a genuine compound file.
+        let mut cf = cfb::CompoundFile::create(Cursor::new(Vec::new())).expect("create cfb");
+        cf.create_stream("/EncryptionInfo")
+            .expect("EncryptionInfo")
+            .write_all(&info)
+            .expect("write info");
+        cf.create_stream("/EncryptedPackage")
+            .expect("EncryptedPackage")
+            .write_all(&package)
+            .expect("write package");
+        cf.flush().expect("flush cfb");
+        let blob = cf.into_inner().into_inner();
+
+        let mut budget = Budget::new(Limits::default());
+        let entries = crate::formats::ole::extract_ole(&blob, &mut budget).expect("extract ole");
+        assert!(
+            entries.iter().all(|e| e.unsupported.is_none()),
+            "the container must be decrypted, not reported password-protected: {:?}",
+            entries.iter().map(|e| e.unsupported).collect::<Vec<_>>()
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.data.windows(EICAR.len()).any(|w| w == EICAR)),
+            "EICAR must be recovered through the full container path"
         );
     }
 

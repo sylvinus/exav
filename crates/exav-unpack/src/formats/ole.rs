@@ -13,7 +13,7 @@ pub(crate) fn extract_ole(data: &[u8], budget: &mut Budget) -> Result<Vec<Entry>
         // malware carry. The streams are still readable; fall back to a lenient flat
         // directory walk (ClamAV-style) so we scan the content instead of returning
         // "not fully scanned". Only surface the error if it is not a compound file.
-        Err(e) => match lenient_cfb_streams(data, budget.limits.max_buffer_bytes()) {
+        Err(e) => match lenient_cfb_streams(data, budget.limits.max_buffer_bytes) {
             Some(streams) => assemble_ole_entries(streams, data.len() as u64, budget),
             None => Err(LimitHit::new(format!("ole: {e}"))),
         },
@@ -86,7 +86,7 @@ fn collect_ole_entries<R: Read + Seek>(
     ) {
         let mut read_full = |p: &std::path::Path| -> Option<Vec<u8>> {
             let s = comp.open_stream(p).ok()?;
-            bounded_read(s, budget.limits.max_buffer_bytes())
+            bounded_read(s, budget.limits.max_buffer_bytes)
                 .ok()
                 .map(|(b, _)| b)
         };
@@ -139,7 +139,7 @@ fn collect_ole_entries<R: Read + Seek>(
         if let Ok(s) = comp.open_stream(p) {
             // Read the whole stream (Excel decryption needs it all); bounded by
             // the peak-buffer cap.
-            let (wb, truncated) = bounded_read(s, budget.limits.max_buffer_bytes())
+            let (wb, truncated) = bounded_read(s, budget.limits.max_buffer_bytes)
                 .map_err(|e| LimitHit::new(format!("ole read: {e}")))?;
             let encrypted = if is_word {
                 wb.len() >= 12 && (u16::from_le_bytes([wb[10], wb[11]]) & 0x0100) != 0
@@ -202,11 +202,195 @@ fn collect_ole_entries<R: Read + Seek>(
         } else {
             p.to_string_lossy().into_owned()
         };
-        entries.push(Entry::new(name, buf));
+        // A stream we DECRYPTED carries its plaintext and stays marked encrypted.
+        // Both facts are true: the content is available to scan, and the document
+        // was protected. Reporting only the content is what let a document exav
+        // opened with the `VelvetSweatshop` default password come back with no
+        // mention of encryption at all — 552 files, 6.3% of a corpus.
+        let was_decrypted = matches!(&decrypted_workbook, Some((wp, _)) if wp == p);
+        let mut entry = Entry::new(name, buf);
+        entry.encrypted = was_decrypted;
+        entries.push(entry);
     }
 
+    append_ole10native_payloads(&mut entries, budget);
+    // Before the macro pass: an embedded storage can itself hold the VBA
+    // project, and the artifacts are synthesised from whatever is present.
+    append_ppt_embedded_storages(&mut entries, budget);
     append_macro_artifacts(&mut entries, budget);
     Ok(entries)
+}
+
+/// Carve the payload out of every `\x01Ole10Native` stream and append it.
+///
+/// `Ole10Native` is how Office stores a "Package" embedded object — the thing you
+/// get by dropping a file onto a document. The stream is NOT the file: it opens
+/// with an embedded-object header (a 4-byte total size, a 2-byte flag, then three
+/// NUL-terminated strings — label, original path, temp path — and a 4-byte
+/// payload size) and only then the bytes themselves.
+///
+/// Nothing looked past that header, and the format sniffer only ever inspects
+/// offset 0, so an embedded executable or compound file was invisible. Measured:
+/// 13 corpus documents carried an encrypted OLE2 this way that exav never saw,
+/// and the detection was already correct once the payload was carved by hand.
+/// It is a routine malware-delivery shape, so the value is well beyond those 13.
+fn append_ole10native_payloads(entries: &mut Vec<Entry>, budget: &mut Budget) {
+    let mut carved: Vec<Entry> = Vec::new();
+    for e in entries.iter() {
+        // Stream names arrive as paths (`/\x01Ole10Native`), and the `\x01`
+        // prefix marks the stream as an OLE-reserved one; match on the leaf with
+        // both stripped.
+        let leaf = e
+            .name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&e.name)
+            .trim_start_matches('\u{1}');
+        if !leaf.eq_ignore_ascii_case("Ole10Native") {
+            continue;
+        }
+        let Some(payload) = ole10native_payload(&e.data) else {
+            continue;
+        };
+        if budget.count_entry().is_err() {
+            break;
+        }
+        let Ok(cap) = budget.reserve() else { break };
+        if payload.len() as u64 > cap {
+            continue;
+        }
+        budget.commit(payload.len() as u64);
+        carved.push(Entry::new(format!("{leaf}-payload"), payload.to_vec()));
+    }
+    entries.extend(carved);
+}
+
+/// Inflate every object PowerPoint 97 embedded in its own record stream and
+/// append it.
+///
+/// A `.ppt` is a compound file, but its interesting content is not in the
+/// streams — it is in a *record tree* inside the single `PowerPoint Document`
+/// stream. An embedded object (a VBA project, or any OLE object dropped into a
+/// slide) lives there as an `RT_ExternalOleObjectStg` record holding a whole
+/// compound file, usually deflated. Emitting the streams alone stops at the
+/// container: the object is present, readable, and invisible.
+///
+/// Measured: three corpus documents where `clamd` reported
+/// `Heuristics.OLE2.ContainsMacros.VBA` and exav said nothing. Their CFB
+/// directory has five streams and no VBA storage; the macro project is a
+/// 10,752-byte compound file deflated inside one of these records, and exav's
+/// own OLE reader decompresses the module source from it once it is handed over.
+/// The value is wider than macros — *any* embedded object was unreachable.
+fn append_ppt_embedded_storages(entries: &mut Vec<Entry>, budget: &mut Budget) {
+    let mut carved: Vec<Entry> = Vec::new();
+    for e in entries.iter() {
+        let leaf = e.name.rsplit(['/', '\\']).next().unwrap_or(&e.name);
+        if !leaf.eq_ignore_ascii_case("PowerPoint Document") {
+            continue;
+        }
+        for (i, blob) in ppt_embedded_storages(&e.data, budget)
+            .into_iter()
+            .enumerate()
+        {
+            if budget.count_entry().is_err() {
+                break;
+            }
+            budget.commit(blob.len() as u64);
+            carved.push(Entry::new(format!("ppt-embedded-{i}"), blob));
+        }
+    }
+    entries.extend(carved);
+}
+
+/// Walk a `PowerPoint Document` record tree and return the payload of every
+/// `RT_ExternalOleObjectStg` record, inflating the compressed form.
+///
+/// A record header is `[verInstance:u16][type:u16][length:u32]`. The low nibble
+/// of `verInstance` is the version, and `0xF` marks a *container* whose body is
+/// more records — so a container is descended into rather than skipped, which is
+/// how a record nested three levels down is reached at all. The instance (the
+/// high twelve bits) selects the storage form: `0` is stored, `1` is
+/// `[uncompressedSize:u32]` followed by a zlib stream.
+fn ppt_embedded_storages(stream: &[u8], budget: &mut Budget) -> Vec<Vec<u8>> {
+    /// `RT_ExternalOleObjectStg`.
+    const EXT_OLE_OBJ_STG: u16 = 0x1011;
+    /// A record tree deep enough to need more steps than this is malformed, and
+    /// bounding the walk is cheaper than reasoning about whether it can loop.
+    const MAX_RECORDS: usize = 100_000;
+
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for _ in 0..MAX_RECORDS {
+        let Some(hdr) = stream.get(off..off + 8) else {
+            break;
+        };
+        let ver_instance = u16::from_le_bytes([hdr[0], hdr[1]]);
+        let rec_type = u16::from_le_bytes([hdr[2], hdr[3]]);
+        let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        // A container's body is more records, so step *into* it.
+        if ver_instance & 0x0f == 0x0f {
+            off += 8;
+            continue;
+        }
+        if rec_type == EXT_OLE_OBJ_STG {
+            if let Some(body) = stream.get(off + 8..off + 8 + len) {
+                if let Some(blob) = ppt_storage_payload(ver_instance >> 4, body, budget) {
+                    out.push(blob);
+                }
+            }
+        }
+        // `len` is attacker-controlled; a wrapping step would walk the stream
+        // again from the top.
+        match off.checked_add(8).and_then(|o| o.checked_add(len)) {
+            Some(next) if next > off => off = next,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// One storage record's bytes: stored as-is, or inflated, bounded by the budget.
+fn ppt_storage_payload(instance: u16, body: &[u8], budget: &mut Budget) -> Option<Vec<u8>> {
+    let cap = budget.reserve().ok()?;
+    if instance == 0 {
+        // Stored. The record is the compound file.
+        return (body.len() as u64 <= cap).then(|| body.to_vec());
+    }
+    // Compressed: a declared size then a zlib stream. The declared size is a
+    // hint from the file, so it is not trusted for allocation — the read is
+    // bounded by the budget and salvages a truncated tail, which is how a
+    // deliberately-truncated object still gets scanned rather than dropped.
+    let deflated = body.get(4..)?;
+    let (data, _truncated) = bounded_read_salvage(
+        flate2::read::ZlibDecoder::new(Cursor::new(deflated)),
+        cap,
+        true,
+    )
+    .ok()?;
+    (!data.is_empty()).then_some(data)
+}
+
+/// The payload bytes inside an `Ole10Native` stream, or `None` when the header
+/// does not hold together.
+///
+/// Layout ([MS-OLEDS] 2.3.6): `NativeDataSize` u32, `Flags` u16, then `Label`,
+/// `FileName` and `Reserved`/temp path as NUL-terminated byte strings, then
+/// `NativeDataSize2` u32 and the data. The strings are attacker-controlled, so
+/// every step is bounds-checked and the declared size is clamped to what is
+/// actually present rather than trusted.
+fn ole10native_payload(data: &[u8]) -> Option<&[u8]> {
+    let mut p = 4usize + 2; // total size + flags
+    for _ in 0..3 {
+        let rel = data.get(p..)?.iter().position(|&b| b == 0)?;
+        p += rel + 1;
+    }
+    let size_bytes = data.get(p..p + 4)?;
+    let size =
+        u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]) as usize;
+    p += 4;
+    let avail = data.len().checked_sub(p)?;
+    let take = size.min(avail);
+    (take > 0).then(|| &data[p..p + take])
 }
 
 /// Synthesize VBA/XLM macro text artifacts from the extracted OLE streams and
@@ -227,33 +411,66 @@ fn append_macro_artifacts(entries: &mut Vec<Entry>, budget: &mut Budget) {
             .iter()
             .map(|e| (e.name.clone(), e.data.as_slice()))
             .collect();
-        let vba = super::vba::build_artifacts(&streams, budget.limits.max_buffer_bytes());
+        let vba = super::vba::build_artifacts(&streams, budget.limits.max_buffer_bytes);
         let xlm = super::xlm::xlm_macro_artifact(&streams);
         (vba, xlm)
     };
 
     if let Some((dump, raw)) = vba_arts {
         for (name, art) in [("vba_project", dump), ("vba_project_raw", raw)] {
-            if art.is_empty() || budget.count_entry().is_err() {
-                continue;
-            }
-            let cap = budget.reserve().unwrap_or(0);
-            if (art.len() as u64) <= cap {
-                budget.commit(art.len() as u64);
-                entries.push(Entry::new(name.to_string(), art));
-            }
+            push_artifact(entries, budget, name, art);
         }
     }
 
     if let Some(art) = xlm_art {
-        if !art.is_empty() && budget.count_entry().is_ok() {
-            let cap = budget.reserve().unwrap_or(0);
-            if (art.len() as u64) <= cap {
-                budget.commit(art.len() as u64);
-                entries.push(Entry::new("xlm_macro".to_string(), art));
-            }
-        }
+        push_artifact(entries, budget, "xlm_macro", art);
     }
+}
+
+/// Append one macro artifact, or say why it could not be appended.
+///
+/// Dropping the artifact quietly would be worst here of anywhere: the artifact
+/// *is* the decompressed macro source, so losing it leaves the document scanned
+/// as an opaque OLE container, coming back clean. A budget that is exhausted, or
+/// an artifact bigger than the per-member cap, surfaces as a limit rather than
+/// as nothing.
+fn push_artifact(entries: &mut Vec<Entry>, budget: &mut Budget, name: &str, art: Vec<u8>) {
+    // Nothing to scan: no macro of this kind in the document.
+    if art.is_empty() {
+        return;
+    }
+    let size = art.len() as u64;
+    if budget.count_entry().is_err() {
+        entries.push(Entry::unsupported(
+            name.to_string(),
+            size,
+            false,
+            "macro source not scanned: the archive-wide file count was exhausted",
+        ));
+        return;
+    }
+    // `reserve` failing is a limit, not an absence — treating it as a cap of
+    // zero silently discarded every artifact.
+    let Ok(cap) = budget.reserve() else {
+        entries.push(Entry::unsupported(
+            name.to_string(),
+            size,
+            false,
+            "macro source not scanned: the extraction budget was exhausted",
+        ));
+        return;
+    };
+    if size > cap {
+        entries.push(Entry::unsupported(
+            name.to_string(),
+            size,
+            false,
+            "macro source exceeds the per-member size budget",
+        ));
+        return;
+    }
+    budget.commit(size);
+    entries.push(Entry::new(name.to_string(), art));
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +508,10 @@ fn le64(b: &[u8], o: usize) -> u64 {
 /// original strict-parse error instead of masking a genuine non-OLE input.
 ///
 /// `cap` bounds the bytes read for any single stream (the peak-buffer limit).
-fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>)>> {
+/// Each stream comes back as `(name, bytes, truncated)`. The flag matters: the
+/// readers below stop at `cap`, and a prefix delivered as a whole stream would
+/// hide whatever sits past it.
+fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>, bool)>> {
     if data.len() < 512 || data[..8] != CFB_SIGNATURE {
         return None;
     }
@@ -461,6 +681,11 @@ fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>)>> 
         let name_len = le16(e, 64) as usize;
         let name = cfb_entry_name(&e[..64], name_len);
         if name.is_empty() {
+            // A nameless stream entry (malformed directory). Its sectors are
+            // stored UNCOMPRESSED inside this same file, so the caller's raw
+            // pattern scan already covers those bytes — skipping the member here
+            // loses the name/size metadata for `.cdb` matching, not the content,
+            // so nothing goes unscanned by skipping it here.
             continue;
         }
         let start = le32(e, 116);
@@ -474,7 +699,13 @@ fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>)>> 
         } else {
             read_fat_stream(start, size)
         };
-        streams.push((name, bytes));
+        // Both readers stop at `cap`. Compare what came back with what the
+        // directory entry declared: short means the budget cut the stream, and
+        // the caller has to be told, because a prefix handed over as a whole
+        // stream is a payload past the cap that nothing ever scanned and
+        // nothing ever reported.
+        let truncated = (bytes.len() as u64) < size;
+        streams.push((name, bytes, truncated));
         if streams.len() >= 4096 {
             break;
         }
@@ -503,7 +734,7 @@ fn cfb_entry_name(raw: &[u8], name_len: usize) -> String {
 /// name decompression, OOXML/legacy encryption detection + decryption, and VBA/XLM
 /// macro artifacts.
 fn assemble_ole_entries(
-    streams: Vec<(String, Vec<u8>)>,
+    streams: Vec<(String, Vec<u8>, bool)>,
     total_len: u64,
     budget: &mut Budget,
 ) -> Result<Vec<Entry>, LimitHit> {
@@ -511,11 +742,11 @@ fn assemble_ole_entries(
     let find = |want: &str| -> Option<&Vec<u8>> {
         streams
             .iter()
-            .find(|(n, _)| leaf(n).eq_ignore_ascii_case(want))
-            .map(|(_, d)| d)
+            .find(|(n, _, _)| leaf(n).eq_ignore_ascii_case(want))
+            .map(|(_, d, _)| d)
     };
 
-    let msi = streams.iter().any(|(n, _)| {
+    let msi = streams.iter().any(|(n, _, _)| {
         let d = decompress_msi_name(&leaf(n));
         d == "_Tables" || d == "!_Tables"
     });
@@ -548,7 +779,7 @@ fn assemble_ole_entries(
 
     // Legacy `.doc`/`.xls` encryption.
     let mut decrypted_workbook: Option<(String, Vec<u8>)> = None;
-    if let Some((wname, wb)) = streams.iter().find(|(n, _)| {
+    if let Some((wname, wb, _)) = streams.iter().find(|(n, _, _)| {
         let l = leaf(n).to_ascii_lowercase();
         l == "worddocument" || l == "workbook" || l == "book"
     }) {
@@ -587,7 +818,7 @@ fn assemble_ole_entries(
     }
 
     let mut entries = Vec::new();
-    for (name, data) in streams {
+    for (name, data, truncated) in streams {
         budget.count_entry()?;
         let cap = budget.reserve()?;
         let buf = match &decrypted_workbook {
@@ -603,9 +834,31 @@ fn assemble_ole_entries(
         } else {
             leaf(&name)
         };
-        entries.push(Entry::new(out_name, buf));
+        // A stream the reader had to cut short is reported alongside the part
+        // that fits, the same way an over-budget safetensors header is. Handing
+        // back only the prefix would let a payload past the cap go unscanned
+        // with nothing said about it.
+        if truncated {
+            entries.push(Entry::unsupported(
+                out_name.clone(),
+                buf.len() as u64,
+                false,
+                "stream exceeds the per-member size budget; only its head was read",
+            ));
+        }
+        // Decrypted streams stay marked encrypted — same rule as the strict path
+        // above, applied here too because the lenient fallback is the one a
+        // malformed compound file actually takes.
+        let was_decrypted = matches!(&decrypted_workbook, Some((wn, _)) if *wn == name);
+        let mut entry = Entry::new(out_name, buf);
+        entry.encrypted = was_decrypted;
+        entries.push(entry);
     }
 
+    append_ole10native_payloads(&mut entries, budget);
+    // Before the macro pass: an embedded storage can itself hold the VBA
+    // project, and the artifacts are synthesised from whatever is present.
+    append_ppt_embedded_storages(&mut entries, budget);
     append_macro_artifacts(&mut entries, budget);
     Ok(entries)
 }
@@ -718,5 +971,56 @@ mod tests {
         // !File = '!' (U+4840) + 'Fi' (U+430F) + 'le' (U+422F)
         let compressed = "\u{4840}\u{430F}\u{422F}";
         assert_eq!(decompress_msi_name(compressed), "!File");
+    }
+}
+
+#[cfg(test)]
+mod macro_artifact_tests {
+    use super::*;
+    use crate::Limits;
+
+    /// Every path out of [`push_artifact`] must either deliver the artifact or
+    /// say why it could not.
+    ///
+    /// This is the VBA/XLM macro *source*, so a quiet drop leaves the document
+    /// scanned as an opaque OLE container and reported clean with its macros
+    /// never examined. The case is reachable in the ordinary way: VBA
+    /// decompression expands, and `vba_project` concatenates every module, so a
+    /// document whose raw streams all fit the per-member cap can still produce
+    /// an artifact that does not.
+    #[test]
+    fn an_artifact_is_delivered_or_explained_but_never_dropped() {
+        // Comfortably within budget: delivered.
+        let mut b = Budget::new(Limits::default());
+        let mut e = Vec::new();
+        push_artifact(&mut e, &mut b, "vba_project", vec![b'x'; 1000]);
+        assert_eq!(e.len(), 1);
+        assert!(e[0].unsupported.is_none() && e[0].data.len() == 1000);
+
+        // Larger than the per-member cap: reported, not dropped.
+        let mut b = Budget::new(Limits {
+            max_buffer_bytes: 16,
+            ..Limits::default()
+        });
+        let mut e = Vec::new();
+        push_artifact(&mut e, &mut b, "vba_project", vec![b'x'; 1000]);
+        assert_eq!(e.len(), 1, "an oversized artifact must still be reported");
+        assert!(
+            e[0].unsupported.is_some(),
+            "and reported as unreadable, not handed over"
+        );
+        assert_eq!(
+            e[0].comp_size, 1000,
+            "with its real size, so the report is actionable"
+        );
+    }
+
+    #[test]
+    fn an_absent_macro_is_not_reported() {
+        // No macro of this kind in the document: nothing to scan, nothing to say.
+        let mut b = Budget::new(Limits::default());
+        let mut e = Vec::new();
+        push_artifact(&mut e, &mut b, "xlm_macro", Vec::new());
+        assert!(e.is_empty());
     }
 }

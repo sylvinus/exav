@@ -9,7 +9,7 @@
 //! We walk the BIFF record stream, detect any macro sheet, and — when present —
 //! surface a synthetic `xlm_macro` artifact carrying the macro-sheet names, the
 //! recovered string constants, and each macro formula's tokens decoded from the
-//! `ptg` stream: crucially the **built-in function names** (`EXEC`/`CALL`/
+//! `ptg` stream, including the **built-in function names** (`EXEC`/`CALL`/
 //! `ALERT`/…) which are stored as numeric ids and so are *invisible to a raw
 //! byte scan*. So the engine's `Target:2`/`Doc.*` signatures match the real
 //! function calls and `--alert-macros` fires for XLM the same way it does for

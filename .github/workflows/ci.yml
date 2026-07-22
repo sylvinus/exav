@@ -25,8 +25,23 @@ jobs:
       - run: cargo clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
       # The full native test matrix (default + http + checksums + no-decrypt +
       # unstable-internals feature passes). Defined once in the Makefile so this
-      # and a local `make test-all` can't drift.
+      # and a local `make test` can't drift.
       - run: make test-native
+
+  # The yara-x A/B differential harness. Deliberately NOT part of `make test`
+  # (see the Makefile) — a differential test can go red because the other engine
+  # changed, so it is not a merge gate. It runs here anyway, unlike the clamav
+  # harness, only because it is self-contained: no signature database, no second
+  # engine to install. Its own job so the optional `yara-x` dependency — 83 extra
+  # crates, 21 of them cranelift/wasmtime — never lands in the `test` job, and so
+  # it costs no wall clock.
+  yara-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make test-yara-diff
 
   wasm:
     runs-on: ubuntu-latest
@@ -42,7 +57,7 @@ jobs:
       # bindings (excluded from the workspace, built on their own target) — both
       # the default (all-formats + decrypt) build and a minimal single-format,
       # no-decrypt build, so the feature-gated paths can't silently rot.
-      - run: cargo build -p exav-wasm --target wasm32-wasip1
+      - run: cargo build -p exav-core --features wasi-bin --target wasm32-wasip1
       - run: cargo build --manifest-path crates/exav-unpack-wasm/Cargo.toml --target wasm32-unknown-unknown
       - run: cargo build --manifest-path crates/exav-unpack-wasm/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features zip
       # Report the per-format WASM extractor sizes into the run summary.
@@ -59,6 +74,32 @@ jobs:
           curl -sSL "https://github.com/bytecodealliance/wasmtime/releases/download/$WT/wasmtime-$WT-x86_64-linux.tar.xz" | tar xJ -C /tmp
           echo "/tmp/wasmtime-$WT-x86_64-linux" >> "$GITHUB_PATH"
       - run: make test-wasm
+      # The bindings' own test suites. `cargo build` above proves the crate
+      # compiles to wasm; it does not execute one line of the JS API that npm
+      # consumers actually call (the `Archive` class, streaming extraction, the
+      # custom-reader protocol, every error path). `test-js` rebuilds pkg/ with
+      # wasm-pack and drives it in headless Chromium. See scripts/test-js.sh.
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: make test-js
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: www/package-lock.json
+      # exav.org is the authoritative answer on format coverage and CLI flags,
+      # and it is edited alongside the code it documents. A broken internal link
+      # or a sidebar entry pointing at a deleted page is a reader-visible bug
+      # that nothing else in CI catches. See scripts/test-www.sh.
+      - run: make test-www
 
   audit:
     runs-on: ubuntu-latest
@@ -73,6 +114,17 @@ jobs:
         run: |
           cargo install cargo-deny --locked
           cargo deny check advisories bans sources licenses
+      # `crates/exav-unpack-wasm` is workspace-excluded (it needs its own
+      # release profile and a `cdylib` crate-type), so the run above cannot see
+      # it. It is the crate that ships to npm, which makes it the one whose
+      # dependency licences reach the most people.
+      # `--config` is not optional here: that crate is its own workspace, so
+      # cargo-deny would look for a `deny.toml` beside its manifest, find none,
+      # and quietly fall back to defaults instead of this repository's policy.
+      - name: cargo-deny (npm bindings)
+        run: |
+          cargo deny --manifest-path crates/exav-unpack-wasm/Cargo.toml \
+            --config deny.toml check advisories bans sources licenses
 
   fuzz-smoke:
     runs-on: ubuntu-latest

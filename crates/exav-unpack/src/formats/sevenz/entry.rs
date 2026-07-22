@@ -56,16 +56,193 @@ fn decode_block_reader(
     Ok(current)
 }
 
+/// Decode a block whose coder graph is **not** a simple chain — in practice a
+/// folder containing BCJ2, which takes four input streams instead of one.
+///
+/// The linear path above walks coders in order, feeding each the previous one's
+/// output. That cannot express a coder with several inputs, so this resolves the
+/// folder's bind-pair graph instead: every coder input is either bound to
+/// another coder's output or fed by one of the block's packed streams, and each
+/// is materialised on demand.
+fn decode_block_graph(
+    block: &super::header::Block,
+    pack_streams: &[&[u8]],
+    password: Option<&str>,
+    max_buffer: u64,
+) -> Result<Vec<u8>, LimitHit> {
+    // Exclusive prefix sums: the global index of each coder's first in/out stream.
+    let mut in_base = Vec::with_capacity(block.coders.len());
+    let mut out_base = Vec::with_capacity(block.coders.len());
+    let (mut i_acc, mut o_acc) = (0u64, 0u64);
+    for c in &block.coders {
+        in_base.push(i_acc);
+        out_base.push(o_acc);
+        i_acc += c.num_in_streams;
+        o_acc += c.num_out_streams;
+    }
+    // Which coder produces a given global output index?
+    let producer =
+        |out_idx: u64| -> Option<usize> {
+            block.coders.iter().enumerate().position(|(i, c)| {
+                out_idx >= out_base[i] && out_idx < out_base[i] + c.num_out_streams
+            })
+        };
+
+    // Materialise one coder's output, recursing through its inputs. Depth is
+    // bounded by the coder count, and `seen` stops a bind-pair cycle in a forged
+    // header from recursing forever.
+    struct Graph<'a> {
+        block: &'a super::header::Block,
+        pack_streams: &'a [&'a [u8]],
+        in_base: &'a [u64],
+        out_base: &'a [u64],
+        producer: &'a dyn Fn(u64) -> Option<usize>,
+        password: Option<&'a str>,
+        max_buffer: u64,
+    }
+
+    fn materialise(
+        g: &Graph<'_>,
+        coder_idx: usize,
+        seen: &mut Vec<usize>,
+    ) -> Result<Vec<u8>, LimitHit> {
+        let block = g.block;
+        let pack_streams = g.pack_streams;
+        let in_base = g.in_base;
+        let out_base = g.out_base;
+        let producer = g.producer;
+        let password = g.password;
+        let max_buffer = g.max_buffer;
+        if seen.contains(&coder_idx) {
+            return Err(LimitHit::corrupt("7z: cyclic coder graph".to_string()));
+        }
+        seen.push(coder_idx);
+        let coder = block
+            .coders
+            .get(coder_idx)
+            .ok_or_else(|| LimitHit::corrupt("7z: coder index out of range".to_string()))?;
+
+        // Resolve each input of this coder to a concrete buffer.
+        let mut inputs: Vec<Vec<u8>> = Vec::new();
+        for k in 0..coder.num_in_streams {
+            let gi = in_base[coder_idx] + k;
+            if let Some(bp) = block.bind_pairs.iter().find(|b| b.in_index == gi) {
+                let src = producer(bp.out_index)
+                    .ok_or_else(|| LimitHit::corrupt("7z: bind pair names no coder".to_string()))?;
+                inputs.push(materialise(g, src, seen)?);
+            } else {
+                // Fed directly by one of the block's packed streams; their order
+                // in `packed_streams` is the order of the packed data.
+                let pos = block
+                    .packed_streams
+                    .iter()
+                    .position(|&p| p as u64 == gi)
+                    .ok_or_else(|| {
+                        LimitHit::corrupt("7z: coder input has no source".to_string())
+                    })?;
+                let s = pack_streams
+                    .get(pos)
+                    .ok_or_else(|| LimitHit::corrupt("7z: packed stream missing".to_string()))?;
+                inputs.push(s.to_vec());
+            }
+        }
+        seen.pop();
+
+        // Each coder declares its OWN output size; handing a sub-coder the
+        // whole folder's size makes it decode far past its stream (LZMA reports
+        // a distance overflow), so look up this coder's entry.
+        let out_size = block
+            .unpack_sizes
+            .get(out_base[coder_idx] as usize)
+            .copied()
+            .unwrap_or_else(|| super::header::folder_out_size(block))
+            as usize;
+        if coder.method_id.as_slice() == super::parse::ID_BCJ2 {
+            if inputs.len() != 4 {
+                return Err(LimitHit::corrupt(
+                    "7z BCJ2: expected four input streams".to_string(),
+                ));
+            }
+            // BCJ2 writes into a buffer instead of through a `Read`, so the
+            // `bounded_read` cap the linear chain below relies on never sees
+            // this path. `out_size` is a header var-int and nothing else bounds
+            // it, so refuse here — an allocation this large fails, and a failed
+            // allocation aborts the process rather than unwinding, which the
+            // per-file panic boundary cannot catch.
+            if out_size as u64 > max_buffer {
+                return Err(LimitHit::new("7z BCJ2 output exceeds max-buffer".into()));
+            }
+            return super::bcj2::decode(&inputs[0], &inputs[1], &inputs[2], &inputs[3], out_size);
+        }
+        let single = inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| LimitHit::corrupt("7z: coder has no input".to_string()))?;
+        let mut r = super::decode::wrap_coder(
+            Box::new(Cursor::new(single)),
+            coder,
+            out_size,
+            password,
+            max_buffer,
+        )?;
+        let (buf, truncated) = crate::bounded_read(&mut r, max_buffer)
+            .map_err(|e| LimitHit::corrupt(format!("7z: coder read: {e}")))?;
+        if truncated {
+            return Err(LimitHit::new("7z block exceeds max-buffer".into()));
+        }
+        Ok(buf)
+    }
+
+    // The block's result is the output nothing else consumes.
+    let final_coder = (0..block.coders.len())
+        .find(|&i| {
+            let o = out_base[i];
+            !block.bind_pairs.iter().any(|b| b.out_index == o)
+        })
+        .ok_or_else(|| LimitHit::corrupt("7z: no terminal coder".to_string()))?;
+    let mut seen = Vec::new();
+    let graph = Graph {
+        block,
+        pack_streams,
+        in_base: &in_base,
+        out_base: &out_base,
+        producer: &producer,
+        password,
+        max_buffer,
+    };
+    materialise(&graph, final_coder, &mut seen)
+}
+
 /// Run a block's full coder chain over its packed data and return the whole
 /// decompressed block. `password` is threaded to an AES coder (if any). Used by
 /// the buffered extractor and the AES branch of the streaming one.
 fn decode_block(
     block: &super::header::Block,
     pack_data: &[u8],
+    pack_sizes: &[u64],
     expected_total: u64,
     password: Option<&str>,
     max_buffer: u64,
 ) -> Result<Vec<u8>, LimitHit> {
+    // A folder whose coders take more inputs than there are coders cannot be a
+    // simple chain (BCJ2 is the case in practice), so resolve the bind-pair
+    // graph instead. `pack_data` covers the block's packed streams laid end to
+    // end; split them by their declared sizes.
+    if block.coders.iter().any(|c| c.num_in_streams > 1) {
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(pack_sizes.len());
+        let mut off = 0usize;
+        for s in pack_sizes {
+            let end = off.saturating_add(*s as usize);
+            if end > pack_data.len() {
+                return Err(LimitHit::corrupt(
+                    "7z: packed stream extends past the archive".to_string(),
+                ));
+            }
+            slices.push(&pack_data[off..end]);
+            off = end;
+        }
+        return decode_block_graph(block, &slices, password, max_buffer);
+    }
     let mut current = decode_block_reader(block, pack_data, expected_total, password, max_buffer)?;
     // A 7z block is a *solid* unit that may hold many members; its decompressed
     // size can amplify far beyond the packed input. Bound it by the global
@@ -131,7 +308,7 @@ pub(crate) fn stream_sevenz<T>(
         }
     };
     let passwords: Vec<String> = budget.passwords.clone();
-    let max_buffer = budget.limits.max_buffer_bytes();
+    let max_buffer = budget.limits.max_buffer_bytes;
 
     for (file_idx, file) in archive.files.iter().enumerate() {
         if !file.has_stream || file.size == 0 {
@@ -180,7 +357,14 @@ pub(crate) fn stream_sevenz<T>(
             Some(v) => v,
             None => continue,
         };
-        let pack_size = archive.pack_sizes[pack_stream_idx] as usize;
+        // A folder can have several packed streams (BCJ2 folders have four),
+        // laid end to end. Cover all of them, and keep the individual sizes so
+        // the graph decoder can split them apart again.
+        let n_pack = block.packed_streams.len().max(1);
+        let block_pack_sizes: Vec<u64> = (0..n_pack)
+            .filter_map(|k| archive.pack_sizes.get(pack_stream_idx + k).copied())
+            .collect();
+        let pack_size: usize = block_pack_sizes.iter().sum::<u64>() as usize;
         let pack_end = match pack_offset.checked_add(pack_size) {
             Some(e) if e <= data.len() => e,
             _ => continue,
@@ -209,7 +393,14 @@ pub(crate) fn stream_sevenz<T>(
             // password — the buffered path, since streaming can't retry/verify.
             let mut file_data: Option<Vec<u8>> = None;
             for pw in passwords.iter().map(|p| Some(p.as_str())) {
-                match decode_block(block, pack_data, block_total, pw, max_buffer) {
+                match decode_block(
+                    block,
+                    pack_data,
+                    &block_pack_sizes,
+                    block_total,
+                    pw,
+                    max_buffer,
+                ) {
                     Ok(dec) => {
                         let start = bytes_to_skip as usize;
                         if start >= dec.len() {
@@ -258,14 +449,52 @@ pub(crate) fn stream_sevenz<T>(
         }
 
         // Non-AES: stream. A file whose start is past the peak-buffer limit sits
-        // in a block bigger than we would decode buffered — skip it, matching the
-        // buffered path's `start >= decoded_len` guard.
+        // in a block bigger than we would decode buffered. Its bytes are not
+        // reachable, and a member nobody looked at is reported rather than
+        // dropped — the rest of the archive still scans.
         if bytes_to_skip > max_buffer {
+            let meta = MemberMeta {
+                name,
+                comp_size: file.size,
+                encrypted: false,
+                unsupported: Some("7z: member starts past the peak-buffer limit"),
+            };
+            if let Some(t) = visit(&meta, None, budget) {
+                return Ok(Some(t));
+            }
             continue;
         }
-        let mut reader = decode_block_reader(block, pack_data, block_total, None, max_buffer)?;
+        // A multi-input folder (BCJ2) cannot be streamed as a linear chain: its
+        // filter needs all four streams present at once. Decode the block
+        // buffered instead, bounded by the same peak-buffer limit.
+        let mut reader: Box<dyn Read> = if block.coders.iter().any(|c| c.num_in_streams > 1) {
+            let decoded = decode_block(
+                block,
+                pack_data,
+                &block_pack_sizes,
+                block_total,
+                None,
+                max_buffer,
+            )?;
+            Box::new(Cursor::new(decoded))
+        } else {
+            decode_block_reader(block, pack_data, block_total, None, max_buffer)?
+        };
         if skip_reader(reader.as_mut(), bytes_to_skip) < bytes_to_skip {
-            continue; // block ended before this file's offset
+            // The block ended before this file's offset: the sub-stream table
+            // claims more content than the block decodes to. Every later member
+            // of a solid block is in the same position, so leaving these out
+            // quietly turns a truncated archive into a short, clean-looking one.
+            let meta = MemberMeta {
+                name,
+                comp_size: file.size,
+                encrypted: false,
+                unsupported: Some("7z: solid block ended before this member"),
+            };
+            if let Some(t) = visit(&meta, None, budget) {
+                return Ok(Some(t));
+            }
+            continue;
         }
         let mut window = reader.take(file.size);
         let meta = MemberMeta {
@@ -372,7 +601,14 @@ pub(crate) fn extract_sevenz<R>(
                     Some(v) => v,
                     None => continue,
                 };
-                let pack_size = archive.pack_sizes[pack_stream_idx] as usize;
+                // Cover every packed stream of the folder (BCJ2 folders have
+                // four, laid end to end), keeping the individual sizes so the
+                // graph decoder can split them apart.
+                let n_pack = block.packed_streams.len().max(1);
+                let block_pack_sizes: Vec<u64> = (0..n_pack)
+                    .filter_map(|k| archive.pack_sizes.get(pack_stream_idx + k).copied())
+                    .collect();
+                let pack_size: usize = block_pack_sizes.iter().sum::<u64>() as usize;
 
                 let pack_end = match pack_offset.checked_add(pack_size) {
                     Some(e) if e <= data.len() => e,
@@ -418,9 +654,10 @@ pub(crate) fn extract_sevenz<R>(
                     match decode_block(
                         block,
                         pack_data,
+                        &block_pack_sizes,
                         block_total,
                         pw,
-                        budget.limits.max_buffer_bytes(),
+                        budget.limits.max_buffer_bytes,
                     ) {
                         Ok(decompressed) => {
                             let start = bytes_to_skip as usize;
@@ -476,7 +713,23 @@ pub(crate) fn extract_sevenz<R>(
                             return Ok(Some(r));
                         }
                     }
-                    None => {}
+                    // Not encrypted, and still no data: the block decoded
+                    // shorter than the sub-stream table says it should, so this
+                    // member's offset falls past the end of it. In a solid block
+                    // every member after the cut is in the same position, and
+                    // dropping them quietly leaves a truncated archive looking
+                    // like a short and harmless one.
+                    None => {
+                        let entry = Entry::unsupported(
+                            name,
+                            file.size,
+                            false,
+                            "7z: solid block ended before this member",
+                        );
+                        if let Some(r) = visit(entry, budget) {
+                            return Ok(Some(r));
+                        }
+                    }
                 }
             }
             _ => {

@@ -407,9 +407,21 @@ pub(crate) fn extract_chm<R>(
         let (entry, committed) = if e.section == 0 {
             // Uncompressed: slice straight out of the file.
             match read_sec0(data, dir.sec0_offset, e) {
+                // Cutting the entry down to the cap and handing it over as the
+                // file is a silent truncation: the rest of the bytes are in the
+                // container, and a signature past the cut would never fire on a
+                // member that looks complete.
+                Some(bytes) if bytes.len() as u64 > cap => (
+                    Entry::unsupported(
+                        e.name.clone(),
+                        e.length,
+                        false,
+                        "CHM entry exceeds the per-member size budget",
+                    ),
+                    0,
+                ),
                 Some(bytes) => {
-                    let take = (bytes.len() as u64).min(cap) as usize;
-                    let buf = bytes[..take].to_vec();
+                    let buf = bytes.to_vec();
                     let n = buf.len() as u64;
                     (Entry::new(e.name.clone(), buf), n)
                 }
@@ -423,12 +435,22 @@ pub(crate) fn extract_chm<R>(
             let start = usize::try_from(e.offset).ok();
             let len = usize::try_from(e.length).ok();
             match (lzx_ok, start, len) {
+                // Same again for the compressed section: report rather than
+                // deliver a prefix dressed up as the whole entry.
+                (true, Some(_), Some(l)) if l as u64 > cap => (
+                    Entry::unsupported(
+                        e.name.clone(),
+                        e.length,
+                        false,
+                        "CHM entry exceeds the per-member size budget",
+                    ),
+                    0,
+                ),
                 (true, Some(s), Some(l))
                     if s.checked_add(l)
                         .is_some_and(|end| end <= decompressed.len()) =>
                 {
-                    let take = (l as u64).min(cap) as usize;
-                    let buf = decompressed[s..s + take].to_vec();
+                    let buf = decompressed[s..s + l].to_vec();
                     let n = buf.len() as u64;
                     (Entry::new(e.name.clone(), buf), n)
                 }

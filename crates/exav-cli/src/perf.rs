@@ -19,7 +19,7 @@ const MATCHERS: &[&str] = &[
     "cdb",
     "fuzzy",
     "bytecode",
-    "ml",
+    "static",
     "normalize",
 ];
 

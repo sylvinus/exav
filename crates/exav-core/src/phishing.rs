@@ -15,7 +15,7 @@
 /// Cap on anchors examined per document (bounds cost on hostile input).
 const MAX_ANCHORS: usize = 4096;
 
-/// Serialisable phishing-DB parts for the prebuilt cache: `(protected domains,
+/// Serialisable phishing-DB parts for the prebuilt database: `(protected domains,
 /// `M:` allow-list host pairs, `X:` allow-list regex source pairs)`. Compiled
 /// regexes aren't serialisable, so only the sources travel and are recompiled by
 /// [`PhishingDb::from_cache_parts`].
@@ -94,7 +94,7 @@ impl PhishingDb {
         )
     }
 
-    /// Rebuild from cached parts, recompiling the `X:` regexes.
+    /// Rebuild from the stored parts, recompiling the `X:` regexes.
     pub fn from_cache_parts((protected, allow_hosts, allow_regex_src): PhishingParts) -> Self {
         let mut allow_regex = Vec::new();
         let mut kept = Vec::new();
@@ -158,6 +158,10 @@ pub enum Phish {
     SpoofedDomain,
     CloakedUsername,
     CloakedIp,
+    /// The visible text advertises `https://`, the `href` is plain `http://`.
+    /// The domains agree, so no other check fires — the lie is about transport,
+    /// and transport is what the link is advertising.
+    SslSpoof,
 }
 
 impl Phish {
@@ -165,7 +169,9 @@ impl Phish {
         match self {
             Phish::SpoofedDomain => "Heuristics.Phishing.Email.SpoofedDomain",
             Phish::CloakedUsername => "Heuristics.Phishing.Email.Cloaked.Username",
-            Phish::CloakedIp => "Heuristics.Phishing.Email.Cloaked.IP",
+            // ClamAV's name is `Cloaked.NumericIP`, not `Cloaked.IP`.
+            Phish::CloakedIp => "Heuristics.Phishing.Email.Cloaked.NumericIP",
+            Phish::SslSpoof => "Heuristics.Phishing.Email.SSL-Spoof",
         }
     }
 }
@@ -226,14 +232,32 @@ fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
         }
         return None;
     }
-    // Display names a different registered domain than the href.
-    if let Some(dh) = disp_host {
-        if !dh.is_empty() && registered(&dh) != registered(host) {
-            if db.scoped() && !db.is_protected(&dh) {
+    // Display names a different registered domain than the href. Checked BEFORE
+    // the transport lie below: a link that spoofs the domain *and* downgrades
+    // the scheme is a domain spoof, the more specific finding. (Getting this
+    // order wrong made a paypal.com-spoofing link report as a mere SSL
+    // mismatch — the existing `spoofed_domain` test caught it.)
+    if let Some(dh) = &disp_host {
+        if !dh.is_empty() && registered(dh) != registered(host) {
+            if db.scoped() && !db.is_protected(dh) {
                 return None;
             }
             return Some(Phish::SpoofedDomain);
         }
+    }
+    // Transport lie: the display promises https, the href is plain http, and the
+    // domains agree — the one phishing shape where everything except the scheme
+    // matches, so no other check can catch it.
+    if display
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("https://")
+        && href
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+    {
+        return Some(Phish::SslSpoof);
     }
     None
 }

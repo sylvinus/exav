@@ -57,8 +57,10 @@ CONF
 
   wait_for_socket
 
-  # Write a clamdscan client config that points to the real socket, at the path
-  # test-clamav-diff.sh expects ($CCONF defaults to /tmp/clamd_daily.conf).
+  # Write a clamdscan client config pointing at the real socket, so ad-hoc
+  # `clamdscan --config-file=...` works against this container. (The difftest
+  # runner starts its own clamd and speaks the protocol directly; this script is
+  # for manual poking.)
   cat > /tmp/clamd_daily.conf <<CLIENTCONF
 LocalSocket $SOCK
 CLIENTCONF

@@ -21,7 +21,7 @@ const BUDGET_OVERFLOW: &str = "exav:member-budget-overflow";
 
 /// A `Read` that yields at most `cap` bytes from `inner`, counting what it
 /// delivers and refusing to deliver a single byte past the cap. When `inner`
-/// still has data at the cap, the next `read` fails with [`BUDGET_OVERFLOW`]
+/// still has data at the cap, the next `read` fails with `BUDGET_OVERFLOW`
 /// rather than returning EOF — so an over-budget (bomb) member is reported, not
 /// silently cut short and treated as fully scanned.
 pub struct BudgetReader<'a> {
@@ -103,16 +103,23 @@ pub struct MemberMeta {
 pub type StreamVisit<'a, T> =
     &'a mut dyn FnMut(&MemberMeta, Option<&mut dyn Read>, &mut Budget) -> Option<T>;
 
-/// True for the formats [`stream_members`] can walk without ever holding a whole
-/// member (let alone the whole container) in memory: the single-stream
-/// sequential compressors (gzip/zstd/lzip), the seekable stored container (tar),
-/// and ZIP (each member decompressed on demand via the crate's `Read`; encrypted
-/// members are decrypted whole, which decryption inherently requires). bzip2/xz
-/// are excluded — they must scan the whole buffer to find concatenated-stream
-/// boundaries, so streaming them would drop later streams.
+/// True for the formats [`stream_members`] can walk with each member's decoded
+/// bytes produced on demand — no decompressed member is ever materialized
+/// whole. Some arms (bzip2, xz, 7z among them) do buffer the COMPRESSED
+/// container first, bounded by the peak-buffer limit; the win is on the output
+/// side, where one stream can decompress to orders of magnitude more than the
+/// file occupies. A decoding step that inherently needs a whole object — an
+/// encrypted ZIP member's decryption needs the full ciphertext — is likewise
+/// bounded by the peak-buffer limit.
 pub fn is_streamable(fmt: Format) -> bool {
     match fmt {
         Format::Gzip | Format::Tar => true,
+        // Same shape as gzip: one stream whose output can be orders of
+        // magnitude larger than the file, so it must not be materialized.
+        #[cfg(feature = "bzip2")]
+        Format::Bzip2 => true,
+        #[cfg(feature = "xz")]
+        Format::Xz => true,
         #[cfg(feature = "sevenz")]
         Format::SevenZip => true,
         #[cfg(feature = "cab")]
@@ -191,9 +198,83 @@ fn dispatch_stream<R: Read + Seek, T>(
     budget: &mut Budget,
     visit: StreamVisit<T>,
 ) -> Result<Option<T>, LimitHit> {
+    // Fail on demand, to test the boundary rather than the decoders — the
+    // streaming half of the hook in `dispatch_extract`. The top-level scan
+    // routes every natively-streaming container here, never through the
+    // buffered dispatch, so a hook only there is unreachable from a real
+    // `exav <file>` run. The source is a reader, not a slice, so the marker is
+    // looked for in a bounded prefix of the raw container bytes; a marker
+    // carried in a stored member or a header field near the start of a
+    // well-formed container lands inside it.
+    #[cfg(feature = "testing-faults")]
+    {
+        let mut prefix = vec![0u8; 64 * 1024];
+        if source.seek(io::SeekFrom::Start(0)).is_ok() {
+            let mut n = 0;
+            while n < prefix.len() {
+                match source.read(&mut prefix[n..]) {
+                    Ok(0) => break,
+                    Ok(k) => n += k,
+                    Err(_) => break,
+                }
+            }
+            prefix.truncate(n);
+            // Each format arm seeks to where it needs to be; rewinding here
+            // keeps the probe invisible to arms that read without seeking.
+            let _ = source.seek(io::SeekFrom::Start(0));
+            crate::provoke(&prefix);
+        }
+    }
     match fmt {
         #[cfg(feature = "gzip")]
         Format::Gzip => stream_gzip(&mut source, budget, visit),
+        #[cfg(feature = "bzip2")]
+        Format::Bzip2 => {
+            // Same trade as 7z below: the COMPRESSED input is buffered (bounded
+            // by the peak-buffer limit — it is the file on disk, not its
+            // output), and the decompressed content then streams. That is the
+            // win, since a `.bz2` decompresses to far more than it occupies.
+            source
+                .seek(io::SeekFrom::Start(0))
+                .map_err(|e| LimitHit::corrupt(format!("bzip2: {e}")))?;
+            let (buf, truncated) = crate::bounded_read(&mut source, budget.limits.max_buffer_bytes)
+                .map_err(|e| LimitHit::corrupt(format!("bzip2: {e}")))?;
+            if truncated {
+                return Err(LimitHit::new(
+                    "bzip2 container exceeds max-buffer".to_string(),
+                ));
+            }
+            budget.count_entry()?;
+            let mut dec =
+                crate::formats::bzip2::content_reader(&buf, budget.limits.max_buffer_bytes)?;
+            let meta = MemberMeta {
+                name: "bzip2-content".to_string(),
+                comp_size: buf.len() as u64,
+                encrypted: false,
+                unsupported: None,
+            };
+            visit_member(&meta, &mut dec, budget, visit)
+        }
+        #[cfg(feature = "xz")]
+        Format::Xz => {
+            source
+                .seek(io::SeekFrom::Start(0))
+                .map_err(|e| LimitHit::corrupt(format!("xz: {e}")))?;
+            let (buf, truncated) = crate::bounded_read(&mut source, budget.limits.max_buffer_bytes)
+                .map_err(|e| LimitHit::corrupt(format!("xz: {e}")))?;
+            if truncated {
+                return Err(LimitHit::new("xz container exceeds max-buffer".to_string()));
+            }
+            budget.count_entry()?;
+            let mut dec = crate::formats::xz::content_reader(&buf);
+            let meta = MemberMeta {
+                name: "xz-content".to_string(),
+                comp_size: buf.len() as u64,
+                encrypted: false,
+                unsupported: None,
+            };
+            visit_member(&meta, &mut dec, budget, visit)
+        }
         #[cfg(feature = "sevenz")]
         Format::SevenZip => {
             // 7z's header is at the end (random access), so the *compressed*
@@ -203,9 +284,8 @@ fn dispatch_stream<R: Read + Seek, T>(
             source
                 .seek(io::SeekFrom::Start(0))
                 .map_err(|e| LimitHit::corrupt(format!("7z: {e}")))?;
-            let (buf, truncated) =
-                crate::bounded_read(&mut source, budget.limits.max_buffer_bytes())
-                    .map_err(|e| LimitHit::corrupt(format!("7z: {e}")))?;
+            let (buf, truncated) = crate::bounded_read(&mut source, budget.limits.max_buffer_bytes)
+                .map_err(|e| LimitHit::corrupt(format!("7z: {e}")))?;
             if truncated {
                 return Err(LimitHit::new("7z container exceeds max-buffer".to_string()));
             }
@@ -232,7 +312,7 @@ fn dispatch_stream<R: Read + Seek, T>(
         #[cfg(feature = "ar")]
         Format::Ar => {
             let members =
-                crate::formats::ar::stream_offsets(&mut source, budget.limits.max_buffer_bytes())?;
+                crate::formats::ar::stream_offsets(&mut source, budget.limits.max_buffer_bytes)?;
             stream_stored(&mut source, budget, visit, &members)
         }
         #[cfg(feature = "cpio")]
@@ -253,15 +333,13 @@ fn dispatch_stream<R: Read + Seek, T>(
         #[cfg(feature = "sfx")]
         Format::Sfx => {
             let members =
-                crate::formats::sfx::stream_offsets(&mut source, budget.limits.max_buffer_bytes())?;
+                crate::formats::sfx::stream_offsets(&mut source, budget.limits.max_buffer_bytes)?;
             stream_stored(&mut source, budget, visit, &members)
         }
         #[cfg(feature = "tnef")]
         Format::Tnef => {
-            let members = crate::formats::tnef::stream_offsets(
-                &mut source,
-                budget.limits.max_buffer_bytes(),
-            )?;
+            let members =
+                crate::formats::tnef::stream_offsets(&mut source, budget.limits.max_buffer_bytes)?;
             stream_stored(&mut source, budget, visit, &members)
         }
         #[cfg(feature = "partition")]
@@ -272,14 +350,14 @@ fn dispatch_stream<R: Read + Seek, T>(
         #[cfg(feature = "iso")]
         Format::Iso => {
             let members =
-                crate::formats::iso::stream_offsets(&mut source, budget.limits.max_buffer_bytes())?;
+                crate::formats::iso::stream_offsets(&mut source, budget.limits.max_buffer_bytes)?;
             stream_stored(&mut source, budget, visit, &members)
         }
         #[cfg(feature = "onenote")]
         Format::OneNote => {
             let members = crate::formats::onenote::stream_offsets(
                 &mut source,
-                budget.limits.max_buffer_bytes(),
+                budget.limits.max_buffer_bytes,
             )?;
             stream_stored(&mut source, budget, visit, &members)
         }
@@ -323,9 +401,9 @@ fn stream_single<R: Read + Seek, T>(
 /// an over-budget overflow to a [`LimitHit`].
 ///
 /// A streamed member is **never retained**, so it is bounded by the cumulative
-/// *scan* budget ([`Budget::remaining_scan`] = `max_scan_bytes − scanned`), a
-/// processing limit — not by the per-member *buffer* cap (`max_entry_bytes`)
-/// that governs buffered extraction. The caller (`exav-core::scan_stream_member`)
+/// *scan* budget ([`Budget::remaining_scan`] = `max_scanned_bytes − scanned`), a
+/// processing limit — not by the per-member *buffer* cap (`max_buffer_bytes`)
+/// that governs buffered extraction. The caller (`exav-core::member_stream_scan`)
 /// holds only a bounded prefix (`deep_analysis_max`) in RAM and streams the rest
 /// through the constant-memory matcher, so a member far larger than the RAM
 /// buffer is scanned in full without ever being materialized. Consumed bytes are
@@ -343,7 +421,7 @@ pub(crate) fn visit_member<T>(
     if br.overflowed {
         return Err(LimitHit::new(format!(
             "member '{}' exceeds scan budget {}",
-            meta.name, budget.limits.max_scan_bytes
+            meta.name, budget.limits.max_scanned_bytes
         )));
     }
     budget.charge_scan(br.count)?;
@@ -391,15 +469,15 @@ fn stream_zip<R: Read + Seek, T>(
     // `max-buffer`) and the local-header salvage the buffered extractor performs,
     // then present each recovered member to the streaming visitor, so a malformed
     // archive still gets its members scanned instead of being written off whole
-    // (matching clamd). This was previously reported as `LimitsExceeded`, masking
-    // the detection inside.
+    // (matching clamd). Without this fallback, such an archive is written off as
+    // `LimitsExceeded`, masking the detection inside.
     let mut zip = match ::zip::ZipArchive::new(source.by_ref()) {
         Ok(z) => z,
         Err(_) => {
             source
                 .seek(io::SeekFrom::Start(0))
                 .map_err(|e| LimitHit::corrupt(format!("zip seek: {e}")))?;
-            let max = budget.limits.max_buffer_bytes();
+            let max = budget.limits.max_buffer_bytes;
             let mut data = Vec::new();
             source
                 .by_ref()
@@ -448,10 +526,31 @@ fn stream_zip<R: Read + Seek, T>(
         budget.count_entry()?;
         // Peek metadata with the RAW reader — it never invokes the crate
         // decryptor, so it succeeds for encrypted members too.
+        // A member whose header will not parse costs only itself — see the same
+        // guard in `formats::zip::extract_zip_from`. Abandoning the walk here
+        // strands every later member: this pass drops them and the salvage pass
+        // skips them as already covered, so a payload behind one bad directory
+        // pointer is never scanned and the file reports unreadable, not infected.
+        if let Err(e) = zip.by_index_raw(i).map(|_| ()) {
+            let hit = crate::formats::zip::zip_entry_error(i, &e);
+            if !hit.corrupt {
+                return Err(hit);
+            }
+            let meta = MemberMeta {
+                name: format!("zip entry {i}"),
+                comp_size: 0,
+                encrypted: false,
+                unsupported: Some("ZIP member header will not parse"),
+            };
+            if let Some(t) = visit(&meta, None, budget) {
+                return Ok(Some(t));
+            }
+            continue;
+        }
         let (name, is_file, encrypted, comp) = {
             let f = zip
                 .by_index_raw(i)
-                .map_err(|e| LimitHit::new(format!("zip entry {i}: {e}")))?;
+                .map_err(|e| crate::formats::zip::zip_entry_error(i, &e))?;
             (
                 f.name().to_string(),
                 f.is_file(),
@@ -459,7 +558,13 @@ fn stream_zip<R: Read + Seek, T>(
                 f.compressed_size(),
             )
         };
-        if !is_file {
+        // `is_file()` is false purely because the name ends in '/'. A JAR packer
+        // buys exactly that: `kingDavid/9.class/` holds a real deflate-compressed
+        // class that the JVM loads by name, while every ZIP tool discards it as a
+        // folder. Skip only what carries nothing at all — a "directory" with
+        // content is content. (The same guard lives in `formats/zip.rs`; this is
+        // the streaming walker the top-level scan actually takes.)
+        if !is_file && comp == 0 {
             continue; // directory — counted toward the file budget above, skipped
         }
         if encrypted {
@@ -469,9 +574,36 @@ fn stream_zip<R: Read + Seek, T>(
             continue;
         }
         // Cleartext member: stream the decompressing reader on demand.
-        let mut file = zip
-            .by_index(i)
-            .map_err(|e| LimitHit::new(format!("zip entry {i}: {e}")))?;
+        //
+        // A codec the `zip` crate lacks fails here rather than in our own
+        // decoder, so fall back to the raw bytes and decode them ourselves —
+        // otherwise a member exav CAN decode (Deflate64, LZMA, bzip2, zstd, XZ)
+        // is reported unsupported purely because of which walker reached it.
+        // The buffered walker already does this; the top-level scan takes this
+        // one, so a fix in only one of the two never reaches the scanner.
+        // Probe first so the borrow of `zip` ends before the fallback needs it.
+        let decodable = zip.by_index(i).is_ok();
+        let mut file = match decodable {
+            true => zip
+                .by_index(i)
+                .map_err(|e| crate::formats::zip::zip_entry_error(i, &e))?,
+            false => {
+                if let Some(t) = stream_zip_raw_decode(&mut zip, i, &name, comp, budget, visit)? {
+                    return Ok(Some(t));
+                }
+                // Nothing we can decode either: surface it, never drop it.
+                let meta = MemberMeta {
+                    name,
+                    comp_size: comp,
+                    encrypted: false,
+                    unsupported: Some("unsupported zip compression method"),
+                };
+                if let Some(t) = visit(&meta, None, budget) {
+                    return Ok(Some(t));
+                }
+                continue;
+            }
+        };
         let meta = MemberMeta {
             name,
             comp_size: comp,
@@ -483,6 +615,47 @@ fn stream_zip<R: Read + Seek, T>(
         }
     }
     Ok(None)
+}
+
+/// Decode a member the `zip` crate refused, from its RAW bytes, using exav's own
+/// codec set. Returns `Ok(None)` when we cannot decode it either.
+#[cfg(feature = "zip")]
+fn stream_zip_raw_decode<R: Read + Seek, T>(
+    zip: &mut ::zip::ZipArchive<R>,
+    i: usize,
+    name: &str,
+    comp: u64,
+    budget: &mut Budget,
+    visit: StreamVisit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let cap = budget.limits.max_buffer_bytes;
+    let (method, usz, raw) = {
+        let Ok(f) = zip.by_index_raw(i) else {
+            return Ok(None);
+        };
+        let method = crate::formats::zip::zip_method_code(&f.compression());
+        let usz = f.size();
+        let mut raw = Vec::new();
+        if f.take(cap).read_to_end(&mut raw).is_err() {
+            return Ok(None);
+        }
+        (method, usz, raw)
+    };
+    let Some((out, truncated)) = crate::formats::zip::decode_zip_raw(method, &raw, usz, cap) else {
+        return Ok(None);
+    };
+    if truncated {
+        return Ok(None);
+    }
+    budget.commit(out.len() as u64);
+    let meta = MemberMeta {
+        name: name.to_string(),
+        comp_size: comp,
+        encrypted: false,
+        unsupported: None,
+    };
+    let mut cur = io::Cursor::new(out);
+    Ok(visit(&meta, Some(&mut cur), budget))
 }
 
 /// Handle one encrypted ZIP member: try the password pool, present the decrypted
@@ -503,31 +676,55 @@ fn stream_zip_encrypted<R: Read + Seek, T>(
         encrypted: true,
         unsupported: Some("encrypted ZIP member"),
     };
+    // Disprove the flag BEFORE any `decrypt` gating: the check decrypts nothing,
+    // it proves by CRC-32 that these bytes were never ciphertext.
+    let max_buffer = budget.limits.max_buffer_bytes;
+    let (crc, enc) = {
+        let mut f = zip
+            .by_index_raw(i)
+            .map_err(|e| crate::formats::zip::zip_entry_error(i, &e))?;
+        let crc = f.crc32();
+        match crate::formats::zip::read_encrypted_member(&mut f, max_buffer) {
+            Ok(e) => (crc, e),
+            Err(_) => return Ok(visit(&unsupported_meta, None, budget)),
+        }
+    };
+    // The bit can lie — an APK packer sets it on every member because
+    // Android's ZIP reader ignores it, buying a PASSWORD-PROTECTED report on
+    // an archive the platform installs happily. A CRC-32 match over a plain
+    // decode proves the bytes were never encrypted. (Same guard as the
+    // buffered walker in `formats/zip.rs`; this is the path the top-level
+    // scan takes, and a fix in only one of the two does not reach the
+    // scanner.)
+    if let Some(plain) = crate::formats::zip::cleartext_despite_flag(&enc, crc) {
+        budget.commit(plain.len() as u64);
+        let meta = MemberMeta {
+            name,
+            comp_size: comp,
+            encrypted: false,
+            unsupported: None,
+        };
+        let mut cur = io::Cursor::new(plain);
+        return Ok(visit(&meta, Some(&mut cur), budget));
+    }
+    // Actually encrypted. Without the `decrypt` feature there is no cipher
+    // stack compiled in, so report it — never decrypted, never silently clean.
     #[cfg(not(feature = "decrypt"))]
     {
-        let _ = (zip, i);
         Ok(visit(&unsupported_meta, None, budget))
     }
     #[cfg(feature = "decrypt")]
     {
-        let max_buffer = budget.limits.max_buffer_bytes();
-        let (crc, enc) = {
-            let mut f = zip
-                .by_index_raw(i)
-                .map_err(|e| LimitHit::new(format!("zip entry {i}: {e}")))?;
-            let crc = f.crc32();
-            match crate::formats::zip::read_encrypted_member(&mut f, max_buffer) {
-                Ok(e) => (crc, e),
-                Err(_) => return Ok(visit(&unsupported_meta, None, budget)),
-            }
-        };
         match crate::formats::zip::decrypt_zip_member(&enc, crc, budget)? {
             Some(plain) => {
                 budget.commit(plain.len() as u64);
+                // Decrypted: the plaintext is scanned AND the member is still
+                // reported as having been encrypted. Clearing the flag on success
+                // is what made cracking a password erase the report of one.
                 let meta = MemberMeta {
                     name,
                     comp_size: comp,
-                    encrypted: false,
+                    encrypted: true,
                     unsupported: None,
                 };
                 let mut cur = io::Cursor::new(plain);
@@ -737,7 +934,7 @@ fn stream_szdd<R: Read + Seek, T>(
     source
         .seek(io::SeekFrom::Start(0))
         .map_err(|e| LimitHit::corrupt(format!("szdd: {e}")))?;
-    let (buf, truncated) = crate::bounded_read(&mut *source, budget.limits.max_buffer_bytes())
+    let (buf, truncated) = crate::bounded_read(&mut *source, budget.limits.max_buffer_bytes)
         .map_err(|e| LimitHit::corrupt(format!("szdd: {e}")))?;
     if truncated {
         return Err(LimitHit::new("szdd input exceeds max-buffer".to_string()));
@@ -822,7 +1019,12 @@ fn stream_swf<R: Read + Seek, T>(
         let file_length = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
         let want = file_length.saturating_sub(8);
         let props = hdr[12];
-        let dict_size = u32::from_le_bytes([hdr[13], hdr[14], hdr[15], hdr[16]]);
+        // Attacker-controlled and allocated up front — bound it by what the
+        // stream will actually produce.
+        let dict_size = crate::bounded_dict(
+            u32::from_le_bytes([hdr[13], hdr[14], hdr[15], hdr[16]]),
+            want,
+        );
         source
             .seek(io::SeekFrom::Start(17))
             .map_err(|e| LimitHit::corrupt(format!("swf: {e}")))?;
@@ -848,6 +1050,25 @@ pub(crate) fn stream_stored<R: Read + Seek, T>(
 ) -> Result<Option<T>, LimitHit> {
     for (name, offset, size) in members {
         budget.count_entry()?;
+        // A zero-length `<…>` region is a walker saying it stopped short — too
+        // many partitions, too many ISO directories. It names content that was
+        // never enumerated, so it has to arrive as UNSUPPORTED. Emitting it as
+        // an ordinary empty member would make "we did not look" indistinguishable
+        // from "we looked and it was empty", which is the shape of a silent
+        // clean. The buffered walkers say this with `Entry::unsupported`; this
+        // is the streamed half of the same statement.
+        if *size == 0 && name.starts_with('<') && name.ends_with('>') {
+            let meta = MemberMeta {
+                name: name.clone(),
+                comp_size: 0,
+                encrypted: false,
+                unsupported: Some("container walk stopped at its limit"),
+            };
+            if let Some(t) = visit(&meta, None, budget) {
+                return Ok(Some(t));
+            }
+            continue;
+        }
         source
             .seek(io::SeekFrom::Start(*offset))
             .map_err(|e| LimitHit::corrupt(format!("stored member seek: {e}")))?;
@@ -871,23 +1092,44 @@ fn stream_tar<R: Read + Seek, T>(
     budget: &mut Budget,
     visit: StreamVisit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    let members =
-        crate::parse_tar_headers(source).map_err(|e| LimitHit::corrupt(format!("tar: {e}")))?;
-    for m in members {
+    // The SAME reader the buffered `extract` path uses. Two readers of one
+    // format can disagree, and when the scan path holds the weaker one, a header
+    // form it mishandles makes the scanner see nothing while `exav-unpack list`
+    // shows every member — the diagnostic tool contradicting the defect. One
+    // reader cannot disagree with itself.
+    //
+    // No cost to memory: `entries()` needs only `Read`, and each entry IS a
+    // reader bounded to its member, so nothing is buffered.
+    source
+        .seek(io::SeekFrom::Start(0))
+        .map_err(|e| LimitHit::corrupt(format!("tar seek: {e}")))?;
+    let mut archive = ::tar::Archive::new(source);
+    let entries = archive
+        .entries()
+        .map_err(|e| LimitHit::corrupt(format!("tar: {e}")))?;
+    for entry in entries {
         budget.count_entry()?;
-        source
-            .seek(io::SeekFrom::Start(m.data_offset))
-            .map_err(|e| LimitHit::corrupt(format!("tar seek: {e}")))?;
-        // A stored (uncompressed) member: the reader is a bounded window over the
-        // source at the member's offset — nothing is decoded or buffered.
-        let mut window = source.take(m.size);
+        let mut entry = match entry {
+            Ok(e) => e,
+            // A truncated archive: entries before the cut were already scanned,
+            // and the missing tail is absent rather than hidden. exav scans for
+            // malware, it is not an integrity validator — the buffered path makes
+            // the same call for the same reason.
+            Err(e) if crate::formats::tar::is_truncation(&e) => return Ok(None),
+            Err(e) => return Err(LimitHit::corrupt(format!("tar entry: {e}"))),
+        };
+        let name = entry
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "tar-entry".to_string());
+        let size = entry.size();
         let meta = MemberMeta {
-            name: m.name.clone(),
-            comp_size: m.size,
+            name,
+            comp_size: size,
             encrypted: false,
             unsupported: None,
         };
-        if let Some(t) = visit_member(&meta, &mut window, budget, visit)? {
+        if let Some(t) = visit_member(&meta, &mut entry, budget, visit)? {
             return Ok(Some(t));
         }
     }

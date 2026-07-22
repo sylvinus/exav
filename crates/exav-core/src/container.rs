@@ -101,7 +101,7 @@ struct CdbSig {
     ctype: CType,
     csize: Range,
     /// The filename regex source; compiled lazily (regexes aren't serializable,
-    /// so the cache stores the pattern and recompiles on first use).
+    /// so the database stores the pattern and recompiles on first use).
     name_pat: Option<String>,
     #[serde(skip)]
     name_re: std::sync::OnceLock<Option<regex::bytes::Regex>>,

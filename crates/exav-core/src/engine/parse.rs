@@ -13,14 +13,50 @@ pub(super) enum ParsedSub {
     Bodies(Vec<Compiled>),
     Pcre(PcreSub),
     Bcomp(BcompSub),
-    Fuzzy([u8; 8]),
+    /// `fuzzy_img#<hash>[#<dist>]`: the 8-byte perceptual hash and the max Hamming
+    /// distance (0 when unspecified) at which the scanned image's hash matches.
+    Fuzzy([u8; 8], u32),
+}
+
+/// Why [`classify_subsig`] rejected `s`. Used to attribute a skipped `.ldb`
+/// signature to a concrete missing feature instead of an opaque counter.
+pub(super) fn classify_failure_reason(s: &str) -> &'static str {
+    // Attribution is a feature ("counted and attributable by cause"), so it has
+    // to name the real cause. An earlier version guessed from punctuation and
+    // called anything containing '(' a byte-compare subsignature — which
+    // mislabelled every *alternation* as byte-compare, i.e. 6 of the 16 skipped
+    // signatures in a live daily set were filed under the wrong missing feature.
+    if s.starts_with("fuzzy_img#") {
+        return "ldb: malformed fuzzy_img# subsignature";
+    }
+    // Byte-compare has the shape `N(offset#properties#value)`: a subsignature
+    // reference, then a parenthesised triple separated by '#'.
+    let byte_compare = s
+        .split_once('(')
+        .is_some_and(|(head, tail)| {
+            !head.is_empty()
+                && head.chars().all(|c| c.is_ascii_digit())
+                && tail.matches('#').count() >= 2
+        });
+    if byte_compare {
+        return "ldb: unsupported byte-compare subsignature";
+    }
+    if s.contains('/') {
+        return "ldb: unsupported PCRE subsignature";
+    }
+    // `(a|b)` alternations, including the empty-branch form `(abc|)` that makes
+    // a run optional, and branches that themselves contain nibble wildcards.
+    if s.contains('(') && s.contains('|') {
+        return "ldb: unsupported alternation in pattern body";
+    }
+    "ldb: subsignature body has no usable literal anchor"
 }
 
 /// Classify and parse one subsignature: byte-compare (`N(..#..#..)`), PCRE
 /// (`Trigger/regex/flags`), or a normal hex/pattern body.
 pub(super) fn classify_subsig(s: &str) -> Option<ParsedSub> {
     if let Some(rest) = s.strip_prefix("fuzzy_img#") {
-        return parse_fuzzy_subsig(rest).map(ParsedSub::Fuzzy);
+        return parse_fuzzy_subsig(rest).map(|(h, d)| ParsedSub::Fuzzy(h, d));
     }
     if let Some(b) = parse_bcomp_subsig(s) {
         return Some(ParsedSub::Bcomp(b));
@@ -32,17 +68,18 @@ pub(super) fn classify_subsig(s: &str) -> Option<ParsedSub> {
 }
 
 /// Parse the body of a `fuzzy_img#<16-hex>[#<distance>]` subsignature (the
-/// `fuzzy_img#` prefix already stripped). Returns the 8-byte hash. Only Hamming
-/// distance 0 is supported by the current signature format, so a non-zero
-/// `#distance` suffix makes the subsig unsupported (dropped).
-pub(super) fn parse_fuzzy_subsig(rest: &str) -> Option<[u8; 8]> {
+/// `fuzzy_img#` prefix already stripped). Returns the 8-byte perceptual hash and
+/// the max Hamming distance at which it matches — the optional `#distance` suffix,
+/// defaulting to 0 (exact) when absent. A signature that specifies a tolerance is
+/// honored (perceptual hashing is meant to match near-duplicates), where before
+/// any non-zero distance dropped the whole signature.
+pub(super) fn parse_fuzzy_subsig(rest: &str) -> Option<([u8; 8], u32)> {
     let mut parts = rest.split('#');
     let hash = parts.next()?;
-    if let Some(dist) = parts.next() {
-        if dist.trim().parse::<u32>().ok()? != 0 {
-            return None;
-        }
-    }
+    let dist = match parts.next() {
+        Some(d) => d.trim().parse::<u32>().ok()?,
+        None => 0,
+    };
     if parts.next().is_some() || hash.len() != 16 {
         return None;
     }
@@ -55,7 +92,7 @@ pub(super) fn parse_fuzzy_subsig(rest: &str) -> Option<[u8; 8]> {
     for (i, b) in out.iter_mut().enumerate() {
         *b = u8::from_str_radix(&hash[i * 2..i * 2 + 2], 16).ok()?;
     }
-    Some(out)
+    Some((out, dist))
 }
 
 /// Parse a numeric value that may be hex (`0x..`) or decimal.
@@ -78,7 +115,28 @@ pub(super) fn parse_pcre_subsig(s: &str) -> Option<PcreSub> {
     if last <= first {
         return None;
     }
-    let trigger = parse_expr(&s[..first])?;
+    // `[Offset:]Trigger/PCRE/Flags`. An offset prefix constrains where the match
+    // may start; on a live `daily.cvd` 368 of the 369 that use one are `EOF-n`
+    // (a trailing marker), so leaving it unparsed dropped those signatures.
+    let head = &s[..first];
+    let (offset, trigger_src) = match head.split_once(':') {
+        Some((o, t)) => (parse_offset(o)?, t),
+        None => (Offset::Any, head),
+    };
+    // Only offsets resolvable from the file length alone. `EP`/`Sx` need a PE
+    // layout `PcreSub::is_match` does not carry, and matching one without it
+    // would silently never fire — so it stays counted-unsupported instead.
+    if !matches!(
+        offset,
+        Offset::Any | Offset::Constrained(_)
+    ) || matches!(
+        &offset,
+        Offset::Constrained(k)
+            if !matches!(k.as_ref(), OffsetKind::Abs { .. } | OffsetKind::Eof { .. })
+    ) {
+        return None;
+    }
+    let trigger = parse_expr(trigger_src)?;
     let pattern = &s[first + 1..last];
     if pattern.is_empty() {
         return None;
@@ -86,12 +144,14 @@ pub(super) fn parse_pcre_subsig(s: &str) -> Option<PcreSub> {
     let flags = &s[last + 1..];
     Some(PcreSub {
         trigger,
+        offset,
         pattern: pattern.to_string(),
         ci: flags.contains('i'),
         dotall: flags.contains('s'),
         multiline: flags.contains('m'),
         re: std::sync::OnceLock::new(),
         fancy: std::sync::OnceLock::new(),
+        prefilter: std::sync::OnceLock::new(),
     })
 }
 
@@ -114,10 +174,9 @@ pub(super) fn parse_bcomp_subsig(s: &str) -> Option<BcompSub> {
     // offset: `>>N` positive, `<<N` negative.
     let (neg, num) = if let Some(n) = off_s.strip_prefix(">>") {
         (false, n)
-    } else if let Some(n) = off_s.strip_prefix("<<") {
-        (true, n)
     } else {
-        return None;
+        let n = off_s.strip_prefix("<<")?;
+        (true, n)
     };
     let mag = parse_num(num)?;
     let offset = if neg { -mag } else { mag };
@@ -194,16 +253,21 @@ pub(super) fn parse_subsig(s: &str) -> Option<Vec<Compiled>> {
     let nocase = flags.contains('i');
     let wide = flags.contains('w');
     let ascii = flags.contains('a') || !wide;
+    // `f` — fullword: the match must be bounded by non-alphanumeric bytes.
+    // Carried through to the verifier rather than dropped; dropping it makes the
+    // subsignature match as a plain substring, i.e. fire on strictly more than
+    // its author asked for.
+    let fullword = flags.contains('f');
 
     let allow_internal = matches!(offset, Offset::Any);
     let mut out = Vec::new();
     if ascii {
         let (e, a, p) = compile_body(body, allow_internal)?;
-        out.push((e, a, p, nocase, offset.clone()));
+        out.push((e, a, p, nocase, offset.clone(), fullword));
     }
     if wide {
         match compile_wide(body, allow_internal) {
-            Some((e, a, p)) => out.push((e, a, p, nocase, offset)),
+            Some((e, a, p)) => out.push((e, a, p, nocase, offset, fullword)),
             // A wide pattern we can't widen (non-literal): keep the ascii
             // variant if we made one, otherwise the subsig is unsupported.
             None if ascii => {}
@@ -267,6 +331,21 @@ pub(super) fn widen_elems(elems: Vec<Elem>) -> Vec<Elem> {
             Elem::Alt { opts, neg } => out.push(Elem::Alt {
                 opts: opts.iter().map(|o| widen_bytes(o)).collect(),
                 neg,
+            }),
+            // Widening a masked branch interleaves a literal NUL after each
+            // byte, and a NUL is fully known — mask 0xff.
+            Elem::AltMasked { opts } => out.push(Elem::AltMasked {
+                opts: opts
+                    .iter()
+                    .map(|o| {
+                        let mut w = Vec::with_capacity(o.len() * 2);
+                        for &(v, m) in o {
+                            w.push((v, m));
+                            w.push((0, 0xff));
+                        }
+                        w
+                    })
+                    .collect(),
             }),
         }
     }
@@ -418,17 +497,61 @@ pub(super) fn parse_gap(spec: &str) -> Option<Elem> {
 }
 
 pub(super) fn parse_alt(spec: &str, neg: bool) -> Option<Elem> {
-    let mut opts = Vec::new();
-    for part in spec.split('|') {
-        opts.push(decode_plain_hex(part.trim())?);
-    }
-    if opts.is_empty() || opts.iter().any(|o| o.is_empty()) {
+    let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
+    if parts.is_empty() {
         return None;
     }
-    if neg && !opts.iter().all(|o| o.len() == opts[0].len()) {
-        return None; // negated alternates must be equal length
+    // An empty branch means "or nothing": `(2d4120|)` makes the run optional.
+    // The alternation is then variable-width, which the matchers already handle
+    // for unequal-length branches — but a *negated* one has a single fixed width
+    // by definition, so it cannot have one.
+    if neg && parts.iter().any(|p| p.is_empty()) {
+        return None;
     }
-    Some(Elem::Alt { opts, neg })
+
+    // Fast path: every branch is plain hex, so branches stay literal byte
+    // strings and keep their substring-search matching.
+    if let Some(opts) = parts
+        .iter()
+        .map(|p| decode_plain_hex(p))
+        .collect::<Option<Vec<_>>>()
+    {
+        if neg && !opts.iter().all(|o| o.len() == opts[0].len()) {
+            return None; // negated alternates must be equal length
+        }
+        return Some(Elem::Alt { opts, neg });
+    }
+
+    // A branch carries nibble wildcards (`5?`, `?4`, `??`). Compile every branch
+    // to `(value, mask)` pairs. Only for non-negated alternations: a negated
+    // masked form does not appear in any database tracked here, and refusing it
+    // keeps it counted rather than guessed at.
+    if neg {
+        return None;
+    }
+    let mut opts: Vec<Vec<(u8, u8)>> = Vec::with_capacity(parts.len());
+    for part in &parts {
+        opts.push(decode_masked_hex(part)?);
+    }
+    Some(Elem::AltMasked { opts })
+}
+
+/// Decode a hex run that may carry nibble wildcards into `(value, mask)` pairs:
+/// `5?` is `(0x50, 0xf0)`, `?4` is `(0x04, 0x0f)`, `??` is `(0, 0)`. An empty
+/// run decodes to an empty branch, which matches zero bytes.
+fn decode_masked_hex(s: &str) -> Option<Vec<(u8, u8)>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in b.chunks_exact(2) {
+        let (hi, lo) = (pair[0], pair[1]);
+        let (hv, hm) = if hi == b'?' { (0, 0) } else { (nibble(hi)?, 0xf) };
+        let (lv, lm) = if lo == b'?' { (0, 0) } else { (nibble(lo)?, 0xf) };
+        out.push(((hv << 4) | lv, (hm << 4) | lm));
+    }
+    Some(out)
 }
 
 /// Choose the literal anchor and classify its prefix.
@@ -436,7 +559,7 @@ pub(super) fn parse_alt(spec: &str, neg: bool) -> Option<Elem> {
 /// byte like a zero/0xFF pad, or a 2-symbol repeat) matches repetitive content
 /// — PE padding, BSS — millions of times, so it is a terrible prefilter even
 /// when long. Down-rank such runs sharply so a shorter but varied run wins; a
-/// genuinely varied run scores its length (longer = rarer = better).
+/// varied run scores its length (longer = rarer = better).
 pub(super) fn anchor_score(b: &[u8]) -> usize {
     let mut seen = [false; 256];
     let mut distinct = 0usize;
@@ -545,7 +668,9 @@ pub(super) fn parse_offset(s: &str) -> Option<Offset> {
         None => (s, 0),
     };
     let boxed = |k: OffsetKind| Offset::Constrained(Box::new(k));
-    if let Some(rest) = spec.strip_prefix("EOF-") {
+    if spec == "VI" {
+        Some(boxed(OffsetKind::VersionInfo))
+    } else if let Some(rest) = spec.strip_prefix("EOF-") {
         Some(boxed(OffsetKind::Eof {
             n: rest.trim().parse().ok()?,
             shift,
@@ -556,7 +681,13 @@ pub(super) fn parse_offset(s: &str) -> Option<Offset> {
             shift,
         }))
     } else if let Some(rest) = spec.strip_prefix('S') {
-        if let Some(d) = rest.strip_prefix('L') {
+        if let Some(n) = rest.strip_prefix('E') {
+            // `SEn` — anywhere inside section n. No delta and no shift: the
+            // whole section IS the window.
+            Some(boxed(OffsetKind::SecIn {
+                idx: n.trim().parse().ok()?,
+            }))
+        } else if let Some(d) = rest.strip_prefix('L') {
             Some(boxed(OffsetKind::SecLast {
                 delta: parse_delta(d)?,
                 shift,
@@ -574,7 +705,6 @@ pub(super) fn parse_offset(s: &str) -> Option<Offset> {
     } else if let Ok(n) = spec.parse::<u64>() {
         Some(boxed(OffsetKind::Abs { n, shift }))
     } else {
-        // VI, SEx, and other offset kinds are not yet supported.
         None
     }
 }
@@ -599,7 +729,7 @@ pub(super) fn is_pua(name: &str) -> bool {
 /// `.ndb` lines); ClamAV loads a sig only when its flevel falls in that window.
 /// We match that with the flevel of the ClamAV release whose databases we read
 /// (1.4.x ⇒ 213), so we load exactly the sigs ClamAV would — skipping ones meant
-/// for a newer engine (features we may lack) and, importantly, *deprecated* ones
+/// for a newer engine (features we may lack) and also *deprecated* ones
 /// (`max < 213`) that ClamAV no longer runs, which would otherwise false-positive.
 pub(crate) const EXAV_FLEVEL: u32 = 213;
 
@@ -610,6 +740,125 @@ pub(crate) fn flevel_ok(min: u32, max: u32) -> bool {
 
 /// Parse an LDB `Engine:min-max` TDB attribute into `(min, max)`; absent or
 /// unparseable ⇒ `(0, u32::MAX)` (no constraint).
+/// The `TargetDescriptionBlock` attributes exav evaluates. Anything else in a
+/// TDB means the signature carries a constraint this engine cannot apply.
+pub(super) const TDB_IMPLEMENTED: &[&str] = &[
+    "Target",
+    "Engine",
+    "FileSize",
+    "Container",
+    "IconGroup1",
+    "IconGroup2",
+    "EntryPoint",
+    "NumberOfSections",
+    "HandlerType",
+    "Intermediates",
+];
+
+/// The nine section-range attributes. The format defines these names but no
+/// engine has ever implemented them: they parse into fields nothing reads, and
+/// a signature using one gets dropped at load. exav dropping it too is parity,
+/// not a gap, and there are zero occurrences across the official and
+/// third-party databases we track.
+///
+/// (Not to be confused with the `SEn:`/`Sn+n` *subsignature offset* modifiers,
+/// which are a different, live feature handled by the offset parser.)
+pub(super) const TDB_SECTION_ATTRS: &[&str] = &[
+    "SectOff", "SectRVA", "SectVSZ", "SectRAW", "SectRSZ", "SectURVA", "SectUVSZ", "SectURAW",
+    "SectURSZ",
+];
+
+/// The first TDB attribute present that exav cannot evaluate, if any.
+///
+/// This exists because the alternative is worse than a missing feature. TDB
+/// parsing works by looking for the attributes we know, so an attribute we do
+/// NOT know was simply never read — and its constraint silently vanished. A
+/// signature restricted to `NumberOfSections:3` then fired on any section count,
+/// matching more broadly than ClamAV would allow. That is a false positive
+/// waiting to happen, and unlike a missing decoder it is invisible.
+///
+/// Reporting it turns a silent behavioural difference into a counted, named
+/// skip — the same treatment every other unsupported construct gets.
+///
+/// An attribute name the format does not define at all — a typo, or one added
+/// by a newer engine — is refused for the same reason, and no engine does
+/// anything else with it either.
+pub(super) fn unsupported_tdb_attr(tdb: &str) -> Option<&'static str> {
+    for field in tdb.split(',') {
+        let Some((key, _)) = field.trim().split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if TDB_IMPLEMENTED.contains(&key) {
+            continue;
+        }
+        if let Some(known) = TDB_SECTION_ATTRS.iter().find(|k| **k == key) {
+            return Some(known);
+        }
+        return Some("unknown");
+    }
+    None
+}
+
+/// State of one TDB range attribute (`FileSize`, `EntryPoint`,
+/// `NumberOfSections`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum TdbRange {
+    /// Attribute not present — no constraint.
+    Absent,
+    /// Present and well-formed; inclusive on both ends.
+    Range(u64, u64),
+    /// Present but not of the form `min-max` with digits-only sides. The
+    /// signature is refused, because a constraint we cannot read is a
+    /// constraint we would otherwise drop — and dropping it makes the signature
+    /// fire more widely than intended.
+    Malformed,
+}
+
+/// Parse an inclusive `Attr:min-max` TDB range as the format actually defines
+/// one.
+///
+/// The hyphen is **mandatory** and the split happens at the first one; each side
+/// must be digits or empty, and empty means zero. That last rule is the one
+/// worth stating, because it is not what it looks like: `FileSize:100-` is not
+/// an open-ended upper bound, it is the range 100..=0, which matches nothing.
+/// Reading it as `100..=u64::MAX` — the intuitive interpretation, and the
+/// tempting one — turns a signature that never fires into one that fires on
+/// every file above 100 bytes. `-100` really is 0..=100.
+///
+/// A bare `Attr:100` with no hyphen is malformed and aborts the whole database
+/// load elsewhere; exav refuses just the one signature, since taking down a
+/// database file over one bad line helps nobody.
+pub(super) fn parse_tdb_range(tdb: &str, attr: &str) -> TdbRange {
+    let want = format!("{attr}:");
+    for field in tdb.split(',') {
+        let Some(v) = field.trim().strip_prefix(&want) else {
+            continue;
+        };
+        let Some((a, b)) = v.split_once('-') else {
+            return TdbRange::Malformed;
+        };
+        return match (digits_or_empty(a), digits_or_empty(b)) {
+            (Some(min), Some(max)) => TdbRange::Range(min, max),
+            _ => TdbRange::Malformed,
+        };
+    }
+    TdbRange::Absent
+}
+
+/// A digits-only run as a number; the empty string is zero, per the format.
+/// Whitespace, signs and hex prefixes are rejected.
+fn digits_or_empty(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return Some(0);
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Saturate rather than fail — a bound that large is nonsense either way.
+    Some(s.parse().unwrap_or(u64::MAX))
+}
+
 pub(super) fn parse_tdb_engine(tdb: &str) -> (u32, u32) {
     for field in tdb.split(',') {
         if let Some(v) = field.trim().strip_prefix("Engine:") {
@@ -636,21 +885,8 @@ pub(super) fn parse_tdb_target(tdb: &str) -> u8 {
 /// Parse a `FileSize:min-max` TDB attribute into an inclusive `(min, max)`
 /// range. Accepts `n` (exact), `n-m`, `n-` (min only), and `-m` (max only).
 /// Returns `None` if absent or unparseable (treated as "no constraint").
-pub(super) fn parse_tdb_filesize(tdb: &str) -> Option<(u64, u64)> {
-    for field in tdb.split(',') {
-        if let Some(v) = field.trim().strip_prefix("FileSize:") {
-            let v = v.trim();
-            return match v.split_once('-') {
-                Some((a, b)) => {
-                    let min = a.trim().parse().unwrap_or(0);
-                    let max = b.trim().parse().unwrap_or(u64::MAX);
-                    Some((min, max))
-                }
-                None => v.parse().ok().map(|n| (n, n)),
-            };
-        }
-    }
-    None
+pub(super) fn parse_tdb_filesize(tdb: &str) -> TdbRange {
+    parse_tdb_range(tdb, "FileSize")
 }
 
 pub(super) fn nibble(c: u8) -> Option<u8> {

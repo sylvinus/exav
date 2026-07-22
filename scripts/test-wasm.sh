@@ -41,7 +41,7 @@ cargo test --lib -p exav-unpack --target wasm32-wasip1 "$@"
 
 # 2) The scanning core, minus `yara` (yara-x pulls wasmtime/cranelift, which
 #    can't target wasm) — so the engine/pe/patterns/phishing/dlp byte-processing
-#    logic is checked on a 32-bit `usize` too. Host-filesystem tests (DB/cache
+#    logic is checked on a 32-bit `usize` too. Host-filesystem tests (DB/database
 #    loaders) are `#[cfg_attr(target_family = "wasm", ignore)]` and run natively.
 cargo test --lib -p exav-core \
   --no-default-features --features "all-formats,decrypt,dlp,phishing" \

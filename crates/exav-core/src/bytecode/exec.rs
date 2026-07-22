@@ -15,20 +15,40 @@
 //! can write through a pointer into its caller's frame), the read-only globals
 //! (resolved structurally from the `G` record), and the predefined file size.
 //! Every access is bounds-checked against its region.
+//!
+//! # Where the API shapes come from
+//!
+//! Several structures named here — `cli_exe_section`, `cli_pe_hook_data`,
+//! `cli_environment` — are the ABI a `.cbc` program was compiled against, so an
+//! interpreter has to reproduce them field for field or the program reads
+//! garbage. Their layouts are established from the accesses real programs make:
+//! run a program, watch which offsets it loads and what it does with them. That
+//! is the same method used for the signature formats, and it is the only one
+//! available — the shapes are an interface, and interfaces have to be matched
+//! exactly whatever their provenance.
 
 use super::decode::Operand;
 use super::instr::{Body, Function, Inst};
 use super::instr::{OP_GEP1, OP_ICMP_FIRST, OP_ICMP_LAST, OP_SEXT, OP_TRUNC, OP_ZEXT};
 use super::types::{Globals, TypeTable};
-/// Deterministic instruction cap per program run — a *failsafe* against our own
-/// interpreter bugs (a runaway loop), NOT a budget on the trusted bytecode.
-/// Deliberately bounded by step count, not wall-clock: a wall-clock budget
-/// would make detection depend on machine load, letting an attacker (or a busy
-/// server) push a program past the deadline to evade detection. Step count
-/// depends only on the input, so the verdict is reproducible everywhere. Set
-/// generously so legitimate bytecode programs (unpackers looping over a whole
-/// section) always finish — correctness first; the cap only trips on our bugs.
-const MAX_STEPS: u64 = 100_000_000;
+/// Deterministic instruction cap per program run — a *failsafe* against a
+/// runaway loop in this interpreter, NOT a budget on the trusted bytecode.
+///
+/// Bounded by step count, not wall clock: a wall-clock budget would make
+/// detection depend on machine load, letting an attacker (or a busy server) push
+/// a program past the deadline to evade detection. A step count depends only on
+/// the input, so the verdict is reproducible everywhere.
+///
+/// Set far above what real programs need. An unpacker in the published bytecode
+/// set loops over a whole PE section, and the ones that unpack MPRESS run into
+/// the hundreds of millions of opcodes for a single sample. A cap that trips on
+/// one of those is worse than no cap at all: exav loads the program, matches its
+/// trigger, starts running it and gives up just short of the answer, so the
+/// packed payload goes unexamined and the file scans clean.
+///
+/// The daemon's per-job wall-clock and memory limits bound the time a scan may
+/// take; this only has to stop a program that never terminates.
+const MAX_STEPS: u64 = 1_000_000_000;
 const MAX_BYTES: usize = 16 << 20;
 const MAX_DEPTH: usize = 64;
 
@@ -299,7 +319,7 @@ pub struct Outcome {
     /// Buffers the program extracted (via `write`+`extract_new`) for the engine
     /// to recursively re-scan (how unpacker programs surface embedded files).
     pub extracted: Vec<Vec<u8>>,
-    /// Data-fabricating stub APIs this run invoked (see [`Machine::stubbed`]).
+    /// Data-fabricating stub APIs this run invoked.
     /// Non-empty means the result leaned on at least one unimplemented API and
     /// should be treated with suspicion even when no unsupported op was hit.
     pub stubbed: Vec<String>,
@@ -429,7 +449,7 @@ impl<'a> Machine<'a> {
     /// `EXAV_BC_WARN`) warn once so a missing implementation is never silent.
     fn note_stub(&mut self, name: &str) {
         if self.stubbed.insert(name.to_string()) && std::env::var_os("EXAV_BC_WARN").is_some() {
-            eprintln!("[exav bytecode] WARN: stubbed API `{name}` returned a fail-safe value; result may diverge from the reference engine");
+            eprintln!("[exav bytecode] WARN: stubbed API `{name}` returned a fail-safe value; result may diverge from ClamAV");
         }
     }
 
@@ -912,6 +932,14 @@ impl<'a> Machine<'a> {
                         if self.trace {
                             eprintln!("[trace] disasm_x86 @cursor={} -> NONE", self.cursor);
                         }
+                        // The decoder cannot distinguish "not an instruction"
+                        // from "an instruction outside my scope", so neither can
+                        // this. Returning the ABI's -1 would let the program
+                        // carry on down a branch it would not have taken with a
+                        // full decoder, and report a verdict built on it. Mark
+                        // the run unsupported instead: the result is discarded
+                        // rather than quietly changed.
+                        self.unsupported = true;
                         -1
                     }
                 }
@@ -1665,6 +1693,18 @@ pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
             .and_then(|s| s.parse().ok()),
     };
     m.exec_fn(funcs, entry, &[], 0);
+    // Flush whatever the program wrote but never explicitly finalized.
+    //
+    // `extract_new` finalizes a buffer, but a program is not obliged to call it:
+    // in ClamAV, `write` appends to an implicitly-opened tempfile that gets
+    // scanned when the program ends, so an unpacker that writes its output and
+    // returns is complete and correct. Requiring the explicit call meant exav
+    // ran ClamAV's MPRESS unpacker to completion, received the full 994 KB
+    // decompressed image through `write`, and then discarded it — the payload
+    // was recovered and thrown away, and the file scanned clean.
+    if !m.extract_cur.is_empty() {
+        m.extracted.push(std::mem::take(&mut m.extract_cur));
+    }
     Outcome {
         detection: m.detection,
         steps: m.steps,

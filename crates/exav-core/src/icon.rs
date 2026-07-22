@@ -64,7 +64,7 @@ struct IconBucket {
 }
 
 /// A loaded `.idb` PE-icon signature database, bucketed by icon side
-/// (16/24/32 → enginesize 0/1/2). Serializable so it can be cached to disk.
+/// (16/24/32 → enginesize 0/1/2). Serializable so it can be stored on disk.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IconDb {
     buckets: Vec<IconBucket>,
@@ -408,6 +408,109 @@ impl<'a> Resources<'a> {
         }
         out
     }
+}
+
+/// File offsets of every `String` entry inside a PE's `VS_VERSION_INFO`
+/// resource — the anchor set an `VI:` signature offset matches against.
+///
+/// A `VI:` pattern is anchored, not windowed: probed against two real binaries,
+/// a pattern matches only when it begins exactly at the start of a version-info
+/// key (`CompanyName`, `FileDescription`, …), never one byte either side and
+/// never elsewhere in the resource. Every offset clamscan accepted was such a
+/// key start.
+///
+/// clamscan accepts a *subset* of these — on one binary it took the first eight
+/// of nine keys, on another six of nine, with no positional or uniqueness rule
+/// that accounts for which. exav anchors on all of them deliberately. The set is
+/// a superset, so no `VI:` signature that fires there fails to fire here, and
+/// widening it cannot invent a match: the pattern still has to equal the bytes
+/// at the anchor, and those bytes are a genuine version-info string either way.
+pub fn version_info_anchors(data: &[u8]) -> Vec<u64> {
+    /// The resource type id of `RT_VERSION`.
+    const RT_VERSION: u16 = 16;
+    /// Cap on entries walked, so a crafted resource cannot spin.
+    const MAX_ENTRIES: usize = 256;
+
+    let Some((res, rbase)) = resource_view(data) else {
+        return Vec::new();
+    };
+    let Some(t16) = res.find_id_subdir(rbase, RT_VERSION) else {
+        return Vec::new();
+    };
+    let Some((off, size)) = res.first_data_leaf(t16, 0) else {
+        return Vec::new();
+    };
+    let end = match off.checked_add(size) {
+        Some(e) if e <= data.len() => e,
+        _ => data.len(),
+    };
+    let block = &data[off.min(data.len())..end];
+
+    // Walk the block for `String` entries. Each is
+    // `wLength|wValueLength|wType|szKey…`, 4-byte aligned, so a scan on the
+    // alignment grid finds every one without needing to model the full nested
+    // `StringFileInfo`/`StringTable` hierarchy — which packers routinely
+    // malform anyway.
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 8 <= block.len() && out.len() < MAX_ENTRIES {
+        let wlen = u16::from_le_bytes([block[i], block[i + 1]]) as usize;
+        let wtype = u16::from_le_bytes([block[i + 4], block[i + 5]]);
+        // A `String` entry is text-typed and its length must be sane and stay
+        // inside the block.
+        if wtype == 1 && wlen > 6 && i + wlen <= block.len() {
+            let key = i + 6;
+            // The key is a NUL-terminated UTF-16 run of printable ASCII — the
+            // known version-info key names all are, and requiring it keeps the
+            // grid scan from anchoring on arbitrary binary.
+            let mut j = key;
+            let mut chars = 0;
+            while j + 1 < block.len() && block[j..j + 2] != [0, 0] {
+                if block[j + 1] != 0 || !block[j].is_ascii_graphic() && block[j] != b' ' {
+                    chars = 0;
+                    break;
+                }
+                chars += 1;
+                j += 2;
+            }
+            if chars >= 3 {
+                out.push((off + key) as u64);
+            }
+        }
+        i += 4;
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Shared setup for the resource-tree walkers: parse the PE, map the resource
+/// directory to a file offset, and build the view over it.
+fn resource_view(data: &[u8]) -> Option<(Resources<'_>, usize)> {
+    let pe = goblin::pe::PE::parse(data).ok()?;
+    let oh = pe.header.optional_header?;
+    let rsrc = oh.data_directories.get_resource_table()?;
+    if rsrc.virtual_address == 0 || rsrc.size == 0 {
+        return None;
+    }
+    let mut sections = Vec::with_capacity(pe.sections.len());
+    for s in &pe.sections {
+        let extent = if s.size_of_raw_data != 0 {
+            s.size_of_raw_data
+        } else {
+            s.virtual_size.max(s.size_of_raw_data)
+        };
+        sections.push((s.virtual_address, extent, s.pointer_to_raw_data));
+    }
+    let map = SectionMap {
+        size_of_headers: oh.windows_fields.size_of_headers,
+        sections,
+    };
+    let rbase = map.rva_to_off(rsrc.virtual_address)?;
+    if rbase >= data.len() {
+        return None;
+    }
+    Some((Resources { data, rbase, map }, rbase))
 }
 
 /// Parse a PE and return the DIB slices of its first icon group.
@@ -1322,22 +1425,18 @@ mod tests {
         put_u32(&mut v, 0); // colours used
         put_u32(&mut v, 0); // colours important
 
-        let rowsz = ((side * 3 + 3) / 4) * 4;
+        let rowsz = (side * 3).div_ceil(4) * 4;
         for _y in 0..side {
             for _x in 0..side {
                 v.push(b);
                 v.push(g);
                 v.push(r);
             }
-            for _ in 0..(rowsz - side * 3) {
-                v.push(0);
-            }
+            v.resize(v.len() + (rowsz - side * 3), 0); // row padding to 4 bytes
         }
         // AND mask: side rows, each 4 bytes (side ≤ 32), all zero (opaque).
-        let andsz = 4 * (side / 32) + if side % 32 != 0 { 4 } else { 0 };
-        for _ in 0..side * andsz {
-            v.push(0);
-        }
+        let andsz = 4 * (side / 32) + if !side.is_multiple_of(32) { 4 } else { 0 };
+        v.resize(v.len() + side * andsz, 0);
         v
     }
 

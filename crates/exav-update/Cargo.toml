@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories = ["command-line-utilities"]
+readme = "README.md"
 description = "Standalone signature-database updater for exav: fetch ClamAV-format CVD containers from a user-supplied mirror (no bundled URL). Isolated so the pure-Rust scanning core links no TLS stack."
 
 # Deliberately isolated: this is the ONE place a TLS stack (ureq → rustls → ring)
@@ -16,3 +17,14 @@ description = "Standalone signature-database updater for exav: fetch ClamAV-form
 # with no OS certificate store.
 [dependencies]
 ureq = "2"
+# Verify a downloaded `.exavdb`'s embedded SHA-256 before installing it, so an
+# interrupted/corrupt download is rejected rather than clobbering a good cache.
+# Same hash exav-core stamps into the cache; RustCrypto, no C/asm.
+sha2 = "0.10"
+
+# docs.rs builds with every feature on, so the parts gated behind a feature
+# appear on the rendered page
+# instead of silently missing from it.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

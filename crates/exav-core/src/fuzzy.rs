@@ -99,7 +99,7 @@ impl FuzzyDb {
         }
     }
 
-    /// Decompose into serializable parts for the on-disk cache. TLSH digests
+    /// Decompose into serializable parts for the on-disk database. TLSH digests
     /// are stored by their hex string (the parsed form isn't serializable) and
     /// re-parsed on load.
     pub(crate) fn to_cache(&self) -> FuzzyCache {
@@ -124,7 +124,7 @@ impl FuzzyDb {
         }
     }
 
-    /// Rebuild from cached parts.
+    /// Rebuild from the stored parts.
     pub(crate) fn from_cache(c: FuzzyCache) -> Self {
         let mut tlsh = Vec::with_capacity(c.tlsh.len());
         for (hex, name, dist) in c.tlsh {

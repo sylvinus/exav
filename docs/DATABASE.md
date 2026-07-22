@@ -1,10 +1,19 @@
-# Signature databases: contents, how exav uses them, and memory
+# Signatures and the compiled database: contents, how exav uses them, and memory
 
-This documents what a ClamAV-format signature database actually contains, how
-exav turns each part into a runtime structure, and where the memory goes —
-based on measurements against a real `daily.cvd` (ClamAV 1.4 era).
+Two things are easy to conflate, so this doc keeps them distinct:
 
-## What's in the database
+- **signatures** — the raw ClamAV-format files (`.cvd`/`.cld` containers and the
+  loose `.ndb`/`.ldb`/`.hsb`/… inside them) that you fetch with
+  `cvdupdate`/`freshclam`;
+- **the database** — the single compiled `.exavdb` file exav builds from those
+  signatures (`--build-db`), which loads far faster and lighter.
+
+This documents what the signatures actually contain, how exav turns each part
+into a runtime structure, where the memory goes, and why the compiled database is
+the answer to the build-time memory spike — based on measurements against a real
+`daily.cvd` (ClamAV 1.4 era).
+
+## What's in the signatures
 
 A `.cvd`/`.cld` is a signed, gzip'd tar of typed signature files. Measured
 contents of one `daily.cvd` (≈356k signatures total):
@@ -40,7 +49,7 @@ Different signature types compile to different runtime structures — there is
 | `.cdb` | container-metadata matchers | matched on archive members (name/size/encryption/position) |
 | `.imp` | size-constrained import-hash map | PE imphash lookup |
 | `.cbc` | a sandboxed **bytecode interpreter** (no JIT) | trigger-gated programs run on extracted buffers |
-| `.yar`/`.yara` | compiled by **yara-x**, executed on the Pulley interpreter (no JIT) | full-ish YARA |
+| `.yar`/`.yara` | exav's **native YARA engine** — a tree-walking evaluator (no JIT, no runtime codegen) | full-ish YARA |
 
 So the engine is really: *one Aho-Corasick automaton (fed by ndb + ldb literal
 subsigs) + several cheap hash tables + lazy regex + an interpreter.*
@@ -60,7 +69,7 @@ Measured peak RSS by signature type (each loaded alone, scanning a 1-byte file):
 `.ldb` costs ~14 KB/signature; hash tables are ~free. **All the memory is the
 automaton**, and almost all of *that* is one specific thing — see below.
 
-### Build peak vs steady state vs cache load
+### Build peak vs steady state vs database load
 
 For the full `daily.cvd` (≈356k sigs, 961,830 anchor patterns, 1.36M bodies):
 
@@ -69,7 +78,7 @@ For the full `daily.cvd` (≈356k sigs, 961,830 anchor patterns, 1.36M bodies):
 | After parsing all signatures, **before** building the automaton | ~740 MB |
 | **Building** the automaton (from raw signatures) | **~3.6 GB** |
 | Final live structures (Body 148 MB + automaton 237 MB + groups 32 MB + …) | ~470 MB |
-| **Loading the same DB from a prebuilt cache** | **~1.0 GB** |
+| **Loading the same signatures from a prebuilt database** | **~1.0 GB** |
 
 The ~2.9 GB spike is the **daachorse double-array Aho-Corasick construction
 transient** — a one-shot allocation burst while the automaton is built. It is
@@ -79,38 +88,33 @@ construction, anchor buffers after, the two automatons build sequentially). The
 transient simply can't be reduced by freeing things between steps — it's a
 single construction event.
 
-### The cache is the answer
+### The prebuilt database is the answer
 
-`exav --build-cache FILE -d <db>` serializes the built engine (the daachorse
-automaton via its own format, the rest via bincode). **Loading a cache skips the
-construction transient entirely** — deserialization allocates ~the final size,
-not the build peak. Measured: 62 MB (cache) vs 284 MB (build) for 20k ldb;
-**1.0 GB (cache) vs 3.6 GB (build)** for full daily.cvd.
+`exav --build-db FILE -d <sigs>` serializes the built engine (the daachorse
+automaton via its own format, the rest via bincode) into a single `.exavdb`.
+**Loading the database skips the construction transient entirely** —
+deserialization allocates ~the final size, not the build peak. Measured: 62 MB
+(database) vs 284 MB (build) for 20k ldb; **1.0 GB (database) vs 3.6 GB (build)**
+for full daily.cvd.
 
-Recommended deployment: **build the cache once on a capable machine (or in CI),
-distribute the `.exavcache`, and load it cheaply everywhere.** Constrained hosts
-never pay the build peak. On a small *build* host, `--build-shard-memory <SIZE>`
-bounds the per-shard construction transient (e.g. `--build-shard-memory 1G` keeps
+Recommended deployment: **build the database once on a capable machine (or in
+CI), distribute the `.exavdb`, and load it cheaply everywhere.** Constrained hosts
+never pay the build peak. On a small *build* host, `--build-shard-bytes <SIZE>`
+bounds the per-shard construction transient (e.g. `--build-shard-bytes 1G` keeps
 the full main+daily build near 3.3 GB peak) at a small scan-speed cost.
 
 > Note: the environment matters too. RAM-backed `/tmp` (tmpfs) and a resident
 > `clamd` can each consume ~1–2 GB; account for those when sizing a build host.
 
-**Updating a running cache-based daemon** is just recompile → atomic-swap: the
-daemon mtime-polls the cache file (like clamd's `SelfCheck`), so swapping it in
+**Updating a running database-based daemon** is just recompile → atomic-swap: the
+daemon mtime-polls the database file (like clamd's `SelfCheck`), so swapping it in
 hot-reloads within a poll tick — no explicit `RELOAD` needed. The framing
 `MAGIC | VERSION | payload | SHA-256` lets the daemon reject a torn/wrong-version
-cache on reload and keep serving the current DB. See
-[DEPLOYMENT.md → Updating a cache-based deployment](DEPLOYMENT.md#updating-a-cache-based-deployment).
+database on reload and keep serving the current one. See
+[Updating a running deployment](https://exav.org/guides/prebuilt-database/#updating-a-running-deployment).
 
 ## Future ideas
 
-- **`--shard-anchors N` (build-time):** build N smaller automatons sequentially
-  instead of one, dividing the build peak by ~N at the cost of N scan passes
-  (×N Aho-Corasick time). Default N=1 (fastest matching); N>1 for building from
-  raw signatures *on* a constrained machine without a prebuilt cache. The shard
-  count would be baked into the cache, so one optimal N=1 build can still serve
-  everyone.
 - **`malloc_trim` after load** to return glibc-retained freed memory to the OS
   (shrinks steady RSS; does not affect the transient build peak).
 - **More compact body/token representation** (a flat byte-code instead of

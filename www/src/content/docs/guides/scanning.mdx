@@ -1,0 +1,161 @@
+---
+title: Scanning
+description: Scan files, directories, streams, and URLs with exav — output formats, filters, all-match mode, and exit codes.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+exav's CLI is `clamscan`-compatible: the same output format, exit codes, and the
+common flags. This guide covers everyday scanning; see the
+[CLI reference](/reference/cli/) for every flag.
+
+## Targets
+
+```sh
+exav file.bin                     # scan one file
+exav /var/www                     # scan a directory, recursively
+exav --no-recursive /var/www      # just the directory's own files
+exav --quiet /data                # only print errors and detections
+cat file.zip | exav -             # scan stdin (constant memory, any size)
+exav https://host/obj.zip         # scan over HTTP range requests (needs an `http-scan` build)
+exav -d ./mydb /data              # use a signature database (file or dir)
+```
+
+A named directory recurses by default. Naming one and getting some of it is the
+kind of surprise that reads as a clean result: the files that were never opened
+are indistinguishable, in the output, from files that were and were fine.
+
+All examples assume signatures are loaded — either via `-d` / `--sigs-dir`, or the
+default `--sigs-dir` directory. See [Signatures](/guides/signatures/).
+
+### Streaming vs seekable
+
+exav has two input modes, and the difference matters for what gets analysed:
+
+- **Stream** (a forward-only pipe, `exav -`): runs the constant-memory
+  pattern + hash core. Unlimited size. Structural unpacking of archives requires
+  seeking, so a pure pipe does pattern+hash only.
+- **Seekable** (local files, or `http(s)://` URLs): additionally drives archive
+  extraction and full structural analysis.
+
+<Aside type="tip">
+`cat archive.zip | exav -` still detects malware *inside* the archive: exav
+buffers stdin to a seekable source (RAM if small, a temp file if large) and runs
+the full container-aware scan. A true unbounded stream (larger than the buffer
+budget) falls back to the flat pattern+hash core.
+</Aside>
+
+### Scanning over HTTP costs bandwidth, not memory
+
+A seekable source may be read **more than once**. Some checks need a whole
+object at a time — overlapping ZIP records, overlapping MBR partitions, broken
+media and executable headers — while extraction walks members one at a time, so
+the object is read again to run them.
+
+That is deliberate. **exav optimises for memory, not bandwidth.** The bound it
+holds to is the working set: a 4 GB archive is scanned without a 4 GB
+allocation, whatever the transfer costs. Over `http(s)://` this means a range
+source is fetched a small, constant number of times rather than once, and an
+object under the deep-analysis limit is likely fetched in full.
+
+If you would rather pay in memory or disk than in transfer — metered egress, a
+slow link, an object store that bills per request — download the object and hand
+exav the file:
+
+```console
+curl -sO https://host/obj.zip && exav obj.zip
+```
+
+An object too large to hold is never held: it is scanned member-by-member, and
+the whole-object checks are **reported as skipped** rather than quietly
+dropped.
+
+## Output format
+
+The human-readable output is one line per file:
+
+```console
+/path/to/file: Win.Trojan.Agent-1234 FOUND
+/path/to/clean: OK
+/path/to/huge.bin: LIMITS-EXCEEDED
+/path/to/secret.zip: PASSWORD-PROTECTED
+```
+
+followed by a `clamscan`-style summary. `--quiet` is the single output dial —
+it suppresses the `OK` lines and the summary together, with `-v` at the other
+end of the same dial.
+
+### JSON output
+
+For tooling and pipelines, `--json` emits newline-delimited JSON — one object
+per scanned input, plus a final summary object:
+
+```sh
+exav --json /data | jq 'select(.category=="infected")'
+```
+
+### Verbose findings
+
+`-v` / `--verbose` prints informational findings (detected file type, entropy,
+imphash, ML score) alongside the verdict.
+
+## All-match mode
+
+By default exav stops at the first matching signature per file. `--all-matches`
+reports **every** match (what `clamscan` spells `--allmatch`):
+
+```sh
+exav --all-matches /data
+```
+
+## Filters
+
+Include/exclude by path regex — repeatable, matching `clamscan`'s semantics:
+
+```sh
+exav /data --exclude '\.log$' --exclude-dir '/node_modules/' --include '\.exe$'
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Clean — everything fully scanned, no matches. |
+| `1` | At least one detection. |
+| `2` | Error, or a file that couldn't be fully scanned (`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`). |
+
+This is the [never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean): a file exav
+couldn't finish examining never counts as a pass. See
+[Verdicts & exit codes](/reference/verdicts/) for the full table.
+
+## Encrypted archives
+
+An encrypted member is reported `PASSWORD-PROTECTED`, never a silent clean.
+Supply passwords to decrypt and scan inside:
+
+```sh
+exav --passwords secret --passwords hunter2 /data     # try a pool, in order
+```
+
+Passwords also load from a ClamAV `.pwdb` database in the signature directory.
+ZIP (ZipCrypto + WinZip AES), encrypted DMG, 7z AES-256, PDF and Office —
+legacy XLS (RC4-basic, RC4-CryptoAPI, XOR) and OOXML (AES standard and agile) —
+are all decrypted. Office additionally auto-tries Excel's default
+`VelvetSweatshop` and the empty password, so no `--passwords` is needed for the
+common malware case. RAR AES and PKWARE Strong Encryption are detected but not
+decrypted.
+
+## Heuristics
+
+exav runs a small **FP-safe, ClamAV-parity** heuristic subset by default
+(imphash matching and the PDF obfuscated-name check). `--detect heuristics`
+turns on the exav-exclusive superset (PE entropy, packer detection, TLSH fuzzy
+matching, a static ML baseline scorer) — higher FP risk, so it's opt-in:
+
+```sh
+exav --detect heuristics -v sample.exe
+```
+
+`--detect` is the one dial for every heuristic detector: `all`, `none`, or a
+comma-separated list of `heuristics`, `macros`, `broken`, `broken-media`,
+`partition-intersection`, `phishing`, `packed`, `pua`.

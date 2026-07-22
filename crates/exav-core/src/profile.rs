@@ -3,7 +3,8 @@
 //! When enabled on the current thread (via [`enable`]), each instrumented
 //! matcher records its wall time, invocation count, and bytes of input through
 //! [`timed`]. After a scan, [`take`] returns the accumulated [`Profile`] so a
-//! caller can emit a per-file breakdown (the CLI's `--perf-json` mode). When
+//! caller can emit a per-file breakdown (the CLI's `--perf-csv` mode) or fold it
+//! into a running total (its `--profile-scans` mode, on the listeners). When
 //! profiling is *not* enabled, [`timed`] is just the wrapped call plus one cheap
 //! thread-local check, so it's safe to leave on the hot scan path.
 

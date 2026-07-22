@@ -7,30 +7,47 @@ in-memory buffer**, why each one must, and which limit bounds it.
 
 ## Two independent knobs: memory vs. reach
 
-Peak **memory** and scan **reach** are now separate, because a streamed member is
+Peak **memory** and scan **reach** are separate, because a streamed member is
 never held in RAM.
 
-**1. `--max-buffer` — the peak-memory knob.**
-- API: `unpack::Limits::max_buffer_bytes()` (backed by `Limits::max_entry_bytes`),
-  default **256 MiB**; and core `ScanOptions::deep_analysis_max`, default
-  **256 MiB** (the structural-buffer ceiling). `--max-buffer` sets both.
-- Every forced-materialization site caps its single largest allocation here, so
-  lowering it lowers the scanner's peak memory.
+**1. `--max-object-bytes` — the largest *single* buffer.**
+- API: `unpack::Limits::max_buffer_bytes`, default **256 MiB**; and core
+  `ScanOptions::deep_analysis_max`, default **256 MiB** (the structural-buffer
+  ceiling). `--max-object-bytes` sets both.
+- Every forced-materialization site caps its single largest allocation here.
 
-**2. `--max-scan-total` — the scan-reach (CPU/time) knob.**
-- API: `Limits::max_scan_bytes`, default **10 GiB**.
+  It is **not** a cap on peak memory, and reading it as one is a mistake worth
+  spelling out. Several buffers are alive at once — a container, its member and
+  that member's own member are each mid-scan while the walk is inside them — so
+  what bounds the total is `Limits::max_extracted_bytes` below, not this.
+  Measured: a 1.1 MB 7z peaked at 2331 MB with this knob at its 256 MiB default.
+
+**1b. `Limits::max_extracted_bytes` — what actually bounds live extraction memory.**
+- Default **1 GiB**. `Budget::reserve`/`commit` charge it cumulatively and never
+  release, so it is simultaneously the total-output bound and the ceiling on how
+  much extracted data can be resident at one moment.
+- It therefore has to fit inside the address space the process is given. In the
+  daemon it does: `fit_limits_to_job_memory` clamps it to half of the per-job
+  grant once that grant is known, so the deterministic in-core limit produces a
+  `LIMITS-EXCEEDED` verdict instead of `RLIMIT_AS` killing the worker. Before
+  that clamp the ordering was inverted — a 1 GiB budget inside a ~750 MiB grant
+  — and 48 workers were aborted in an 8,978-file run for reaching a limit that
+  should have been reported.
+
+**2. `--max-matcher-bytes` — the scan-reach (CPU/time) knob.**
+- API: `Limits::max_scanned_bytes`, default **10 GiB**.
 - Bounds the cumulative bytes fed to the matcher across one top-level file
   (streamed members + re-carved/re-scanned regions). This is **not** a memory
   cost: the streaming member API (`stream_members` + `BudgetReader`) decodes a
-  member on demand and the caller (`exav-core::scan_stream_member`) holds only a
+  member on demand and the caller (`exav-core::member_stream_scan`) holds only a
   bounded prefix (≤ `deep_analysis_max`) in RAM, streaming the rest through the
   constant-memory matcher. So this knob can be raised **far higher** (10 GiB,
   100 GiB, …) to fully scan enormous members — paying only in scan *time*, with
-  peak RAM still fixed by `--max-buffer`. Its only job is DoS resistance
+  peak RAM still fixed by `--max-object-bytes`. Its only job is DoS resistance
   (re-scanning bombs / runaway scan time).
 
 Concretely: a member decompressing to `N` bytes is scanned in full when
-`N ≤ max_scan_bytes`, using `≈ deep_analysis_max` RAM regardless of `N`. Buffered
+`N ≤ max_scanned_bytes`, using `≈ deep_analysis_max` RAM regardless of `N`. Buffered
 (non-streaming) formats still hold their member whole, so for them
 `max_buffer_bytes` remains both the memory and the size cap.
 
@@ -69,11 +86,12 @@ Each STORED-OFFSET conversion has a `stream_offsets(source) -> [(name,off,size)]
 parser validated by an `assert_stream_matches_buffered` equivalence test (streamed
 members byte-for-byte match `extract`).
 
-**Nested (recursive) streaming**: the single-stream compressors gzip/zstd/lzip are
-streamed *inside* other archives too (`deep_analyze_streamed`), so a small nested
-member decompressing to gigabytes is scanned in full (RAM bounded by
-`deep_analysis_max`) instead of being truncated at `max_entry_bytes`. Multi-member
-nested containers stay on the buffered `extract_each` path there, preserving
+**Nested (recursive) streaming**: every [`is_streamable`] format — the
+single-stream compressors gzip/bzip2/xz/zstd/lzip included — is streamed
+*inside* other archives too, at any depth, so a small nested member
+decompressing to gigabytes is scanned in full (RAM bounded by
+`deep_analysis_max`) instead of being truncated at `max_buffer_bytes`. Formats
+with no streaming walk stay on the buffered `extract_each` path there, preserving
 `.cdb`/OLE per-member metadata matching.
 
 **Panic containment**: `stream_members` runs its dispatch inside `catch_unwind`
@@ -84,7 +102,7 @@ clean `Unscannable`, never a process abort.
 1. *Convertible (incremental `Read` decoder needed)*: swf, nsis, uuencode, xdp,
    szdd, screnc, rtf. bzip2/xz are excluded (concatenated-stream boundary needs a
    whole-buffer scan). These decode sequentially to a `Vec` today.
-2. *Fundamentally random-access* (the decoder needs the whole decoded object, so
+2. *Inherently random-access* (the decoder needs the whole decoded object, so
    only the buffer *size* is boundable, via `max_buffer_bytes`): 7z solid blocks,
    cab folders, rar LZ window, dmg/iso-as-filesystem crates, ole/pdf/email/chm
    structured parsers, autoit/upx/pepack, binhex/aimodel/javaclass/vba.
@@ -110,7 +128,7 @@ For these, streaming is impossible without replacing the decoder — so the rule
 ### Tier 1 — bounded now (obey `max_buffer_bytes` / `deep_analysis_max`)
 
 - **exav-core scan buffers** — `scan_path`, `scan_seekable` (whole top-level file
-  for structural analysis) and `scan_stream_member` (per-member structural
+  for structural analysis) and `member_stream_scan` (per-member structural
   prefix) all use `.take(deep_analysis_max + 1).read_to_end`; a larger member is
   chained through the constant-memory `stream_core`, never materialized.
 - **Streaming member API** — `stream.rs::BudgetReader` caps each member at
@@ -121,9 +139,9 @@ For these, streaming is impossible without replacing the decoder — so the rule
 - **All Class-C per-format sites** (the majority — see table C) — every
   `Entry.data` and decoded blob goes through `bounded_read(_, cap)` /
   `bounded_read_salvage` / an explicit `len > cap` check with
-  `cap = budget.reserve() = min(max_total_bytes − used, max_entry_bytes)`.
+  `cap = budget.reserve() = min(max_extracted_bytes − used, max_buffer_bytes)`.
 - **The former Tier-2 amplifiers — now wired** (each threads
-  `budget.limits.max_buffer_bytes()`, or the default limit where the decoder
+  `budget.limits.max_buffer_bytes`, or the default limit where the decoder
   parser carries no `Budget`, and errors past it):
   - **A2/A3 CAB** — `Cabinet::new`/`Folder::new` take `max_buffer`; each folder
     and the combined buffer are bounded.
@@ -157,7 +175,7 @@ cannot exceed the limit; no independent guard was added.
 | id | file:line — fn | what | why already bounded |
 |----|----------------|------|---------------------|
 | A16/A17/A18 | `pdf_parse/parse.rs`, `pdf.rs` — stream bodies | PDF stream body / whole-tail copy / filter working copy | slices of the input PDF (≤ `max_buffer`); decoded *output* is Class C |
-| A21/A22 | `rar3_unpack.rs`, `rar5_unpack.rs` — input pad / PPMd remainder | compressed-member copy (+pad) | copy of `packed`, the compressed member (≤ `max_entry_bytes`) |
+| A21/A22 | `rar3_unpack.rs`, `rar5_unpack.rs` — input pad / PPMd remainder | compressed-member copy (+pad) | copy of `packed`, the compressed member (≤ `max_buffer_bytes`) |
 | A4 | `cab.rs:65` — `repair_cab_size` | clone of input CAB to patch 4 bytes | clone of the input member (≤ `max_buffer`) |
 
 ### Tier 3 — remaining hardcoded literals (Class B), lower priority
@@ -169,7 +187,7 @@ Bounded today, but by a literal rather than the knob. Left as follow-ups:
   `pdf.rs:182` (4 MiB). These are already ≤ the default `max_buffer_bytes`, so
   they never *raise* peak memory above the knob's default; routing them through
   the knob would let an operator *lower* them further.
-- `lib.rs` `256*1024*1024` in the `Archive` Lazy arm → **done** (`max_buffer_bytes()`).
+- `lib.rs` `256*1024*1024` in the `Archive` Lazy arm → **done** (`max_buffer_bytes`).
 - `PREALLOC_CAP = 16 MiB` — a *prealloc* clamp only (growth is capped elsewhere),
   not a peak-memory determinant; left as-is.
 
@@ -179,7 +197,8 @@ Bounded today, but by a literal rather than the knob. Left as follow-ups:
   input); must be hashed/deserialized whole. Bounded by `CvdLimits` when unpacked.
 - `source.rs` 64 KiB HTTP range block, `Archive::open` 64 KiB detection head,
   `ole.rs` 8 KiB sniff — fixed small protocol/detection buffers.
-- Protocol constants (deflate 32 KiB dict, LZW 4096-entry table, 255-byte names)
+- Protocol constants (deflate 32 KiB dict, Deflate64 64 KiB dict, LZW
+  4096-entry table, 255-byte names)
   — fixed by the format, not memory-tunable.
 
 ---

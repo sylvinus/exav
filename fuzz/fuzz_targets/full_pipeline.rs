@@ -1,5 +1,5 @@
 #![no_main]
-//! Single comprehensive fuzz target that populates every Database subsystem
+//! Single comprehensive fuzz target that populates every Scanner subsystem
 //! from fuzz-generated text and exercises all major entry points:
 //! `analyze()`, `analyze_all()`, `scan_seekable()`, and `scan_path()`.
 //!
@@ -24,7 +24,7 @@
 use std::io::Cursor;
 use libfuzzer_sys::fuzz_target;
 use exav_core::{
-    analyze, analyze_all, cache, scan_seekable, Database, ScanOptions,
+    analyze, analyze_all, database, scan_seekable, Scanner, ScanOptions,
 };
 use exav_core::engine::EngineBuilder;
 use exav_core::hashes::HashDb;
@@ -109,7 +109,7 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    let db = Database::from_parts(engine, hashes, fuzzy, cdb, icons, allow, ignored);
+    let db = Scanner::from_parts(engine, hashes, fuzzy, cdb, icons, allow, ignored);
 
     let opts = ScanOptions {
         heuristics: true,
@@ -126,11 +126,11 @@ fuzz_target!(|data: &[u8]| {
     let cursor = Cursor::new(scan_data);
     let _ = scan_seekable(&db, cursor, scan_data.len() as u64, &opts);
 
-    // --- Entry point 4: cache round-trip (serialize → deserialize → scan) ---
+    // --- Entry point 4: database round-trip (serialize → deserialize → scan) ---
     {
         let mut buf = Vec::with_capacity(4096);
-        if cache::write(&db, &mut buf).is_ok() {
-            if let Ok(loaded) = cache::read(buf.as_slice()) {
+        if database::write(&db, &mut buf).is_ok() {
+            if let Ok(loaded) = database::read(buf.as_slice()) {
                 let _ = analyze(&loaded, scan_data, &opts);
             }
         }

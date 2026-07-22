@@ -6,7 +6,7 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 /// as opposed to structurally invalid data. The `tar` crate surfaces the
 /// end-of-input case both as `UnexpectedEof` and as a generic-kind error whose
 /// message names it, so check both.
-fn is_truncation(e: &std::io::Error) -> bool {
+pub(crate) fn is_truncation(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::UnexpectedEof || {
         let m = e.to_string();
         m.contains("unexpected EOF") || m.contains("unexpected end")
@@ -18,7 +18,7 @@ pub(crate) fn extract_tar<R>(
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    let mut archive = tar::Archive::new(Cursor::new(data));
+    let mut archive = ::tar::Archive::new(Cursor::new(data));
     let iter = archive
         .entries()
         .map_err(|e| LimitHit::new(format!("tar: {e}")))?;

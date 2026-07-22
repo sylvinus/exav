@@ -60,6 +60,10 @@ pub(crate) fn extract_xar<R>(
     for (name, blk) in iter_data_blocks(&toc) {
         let off = heap_start.saturating_add(blk.offset);
         let end = off.saturating_add(blk.length).min(data.len());
+        // A zero-length block has nothing to scan; a block starting past EOF, or
+        // one the bound above clamped short, is truncated — the declared bytes
+        // are absent from this file rather than hidden in it, so what exists is
+        // scanned and a clean result is honest. See docs/QUIRKS.md.
         if off >= data.len() || blk.length == 0 {
             continue;
         }
@@ -76,6 +80,20 @@ pub(crate) fn extract_xar<R>(
                 .read_to_end(&mut out)
                 .is_err()
             {
+                // The TOC names this member and its bytes are in the heap; the
+                // stream just would not inflate. Dropping it would leave a file
+                // the archive contains with no trace in the result.
+                if let Some(r) = visit(
+                    Entry::unsupported(
+                        name,
+                        blk.size as u64,
+                        false,
+                        "XAR member would not inflate",
+                    ),
+                    budget,
+                ) {
+                    return Ok(Some(r));
+                }
                 continue;
             }
             if out.len() as u64 > cap {

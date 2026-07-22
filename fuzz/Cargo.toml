@@ -20,6 +20,16 @@ libfuzzer-sys = "0.4"
 # AES, PDF/DMG crypto) are compiled in and fuzzed, not skipped.
 exav-core = { path = "../crates/exav-core", default-features = false, features = ["unstable-internals", "all-formats", "decrypt", "dlp", "phishing"] }
 exav-unpack = { path = "../crates/exav-unpack", default-features = false, features = ["all-formats", "decrypt"] }
+# The x86 emulator, fuzzed directly: it is the only component where the scanned
+# file supplies control flow rather than data, and the only path from those bytes
+# to a dependency that contains `unsafe` (the instruction decoder).
+exav-pe-emu = { path = "../crates/exav-pe-emu" }
+# The instruction decoder, fuzzed differentially against `iced-x86`. Bytes from
+# a scanned file reach it directly, and a decoder that gets a length wrong
+# desynchronises everything after it — so the oracle is compiled in here, and
+# only here.
+exav-x86 = { path = "../crates/exav-x86" }
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
 
 [[bin]]
 name = "analyze"
@@ -31,6 +41,20 @@ bench = false
 [[bin]]
 name = "unpack"
 path = "fuzz_targets/unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pe_emulator"
+path = "fuzz_targets/pe_emulator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x86_decode"
+path = "fuzz_targets/x86_decode.rs"
 test = false
 doc = false
 bench = false
@@ -67,6 +91,16 @@ bench = false
 [profile.release]
 debug = 1
 
+# `exav-core` is the memory peak of the whole build. cargo-fuzz forces
+# `codegen-units=1` and full ASan instrumentation through RUSTFLAGS, and on a
+# small host rustc is killed part way through compiling it — which reads in the
+# log exactly like a target that ran and found nothing. Compiling this one crate
+# at a lower optimisation level keeps the peak inside a few gigabytes. It is the
+# harness that gets slower, not the coverage: the instrumentation, the seeds and
+# the assertions are unchanged.
+[profile.release.package.exav-core]
+opt-level = 1
+
 [workspace]
 
 [[bin]]
@@ -91,6 +125,16 @@ bench = false
 [[bin]]
 name = "full_pipeline"
 path = "fuzz_targets/full_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+# Nesting depth, which the byte-mutating targets do not reach: every extra level
+# needs another well-formed delimiter pair, so random mutation stalls at two or
+# three. This one constructs the depth instead.
+[[bin]]
+name = "parser_recursion"
+path = "fuzz_targets/parser_recursion.rs"
 test = false
 doc = false
 bench = false

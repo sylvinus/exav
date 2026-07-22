@@ -1,0 +1,20 @@
+# The opcode-table generator for exav-x86.
+#
+# Its own workspace, deliberately. The tables it writes define the shape of
+# `exav-x86::generated`, so whenever that shape changes the crate does not
+# compile until the generator has run — and a generator that were a member of
+# the same workspace could not run, because building it would build the crate
+# it is meant to repair.
+[package]
+name = "exav-x86-gen-tables"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# `instr_info` is what exposes `MemorySize::size()`, which is how the operand
+# shapes learn how wide a SIMD memory operand is — a fact the ModRM byte does
+# not carry and a manual would have to be transcribed for.
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info"] }
+
+[workspace]

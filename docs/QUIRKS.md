@@ -48,10 +48,10 @@ clean-room):
 - *OOXML agile encryption* (modern default) — AES-256-CBC with a per-blob KDF;
   more involved, same idea.
 
-**exav's implementation:** exav now auto-decrypts the legacy XLS **RC4-basic**
+**exav's implementation:** exav auto-decrypts the legacy XLS **RC4-basic**
 and **RC4-CryptoAPI** schemes (`crates/exav-unpack/src/formats/ole_crypto.rs`),
 trying `VelvetSweatshop` and the empty password by default (plus any
-`--password`), then scanning the recovered `Workbook` content — so the hidden
+`--passwords`), then scanning the recovered `Workbook` content — so the hidden
 macros/strings become visible. It was implemented clean-room from [MS-OFFCRYPTO]
 §2.3.6 / §2.3.5 and [MS-XLS] §2.4.117, verified **byte-exact against an
 independent oracle** on real samples (RC4-basic) and cross-checked against the
@@ -59,13 +59,16 @@ reference verifier (CryptoAPI). On a live malware corpus, ~240 XLS that were
 opaque `PASSWORD-PROTECTED` now decrypt — 180 surfacing
 `Heuristics.OLE2.ContainsMacros`, the rest scanned clean; only the handful using
 a *non-default* password stay `PASSWORD-PROTECTED` (correctly — we don't know
-it). The XOR obfuscation scheme and OOXML standard/agile AES are still reported
-`PASSWORD-PROTECTED` (never a silent clean); closing those is the remaining
-follow-up.
+it). The same module also covers the legacy **XOR obfuscation** scheme
+([MS-OFFCRYPTO] §2.3.7) and both OOXML schemes — **standard** (AES-ECB, SHA-1
+spun 50000×) and **agile** (AES-CBC, per-blob KDF) — with `ole.rs` routing an
+`EncryptionInfo` + `EncryptedPackage` compound file through the decryptor and
+scanning the recovered `.zip`. A document that still won't open is reported
+`PASSWORD-PROTECTED`, never a silent clean.
 
 > Talk aside: the string `VelvetSweatshop` has been the Excel default since the
 > late 1990s. It is, as far as anyone can tell, an inside joke that shipped — and
-> two decades later it's load-bearing malware infrastructure.
+> two decades later it is still active malware infrastructure.
 
 ---
 
@@ -78,7 +81,7 @@ oversized, or hits a limit, exav says so — `PASSWORD-PROTECTED`,
 
 This is a deliberate divergence from ClamAV. ClamAV's default triage collapses
 *every* limit/parse/decrypt failure to **clean/OK**; the only knob that surfaces
-them (`--alert-exceeds-max`) is off by default, and there is no knob at all for
+them (ClamAV's `--alert-exceeds-max`) is off by default, and there is no knob at all for
 the "unsupported codec / unpack failed" case. So out of the box ClamAV silently
 reports OK for a broad class of not-fully-scanned files. exav treats that class
 as *not a pass*.
@@ -88,11 +91,11 @@ numbers on the categories exav flags where ClamAV stayed silent:
 
 | exav verdict | Real cause seen in the corpus | Legit vs actionable |
 |---|---|---|
-| `PASSWORD-PROTECTED` | Encrypted OLE2/OOXML Office docs (the `VelvetSweatshop` set); genuinely encrypted ZIP members inside APKs | Legit flag; decryption is the coverage gap |
+| `PASSWORD-PROTECTED` | Encrypted OLE2/OOXML Office docs (the `VelvetSweatshop` set); truly encrypted ZIP members inside APKs | Legit flag; decryption is the coverage gap |
 | `UNSCANNABLE` | Truncated gzip (recoverable content — now salvaged, see below); >256 MB decompressed members (pattern-scanned, structural analysis skipped) | Mixed — one was a real gap, now fixed |
 | `LIMITS-EXCEEDED` | Corrupt PDF deflate streams; malformed OLE2 directory ordering; truncated ZIP extra fields; compression ratio > 1000 (bomb guard); CAB folder over the buffer cap | Some legit guards, some over-strict (see gaps) |
 
-Crucially, in that run the "clam found but exav flagged not-fully-scanned"
+In that run the "clam found but exav flagged not-fully-scanned"
 bucket was **empty** — exav's carefulness never turned a real ClamAV detection
 into a miss. It only ever flagged files ClamAV also called clean.
 
@@ -120,11 +123,11 @@ happily recovers everything before the cut; a lot of real malware lives in that
 recoverable part (one corpus sample was a `gzip(tar(...))` of a Linux cron/shell
 dropper).
 
-exav originally treated the decode error as fatal for that member: it discarded
-the bytes decoded so far and reported `UNSCANNABLE`. That's a genuine miss — the
-payload was right there in the recovered prefix.
+Treating the decode error as fatal for that member — discarding the bytes decoded
+so far and reporting `UNSCANNABLE` — would be a genuine miss: the payload is right
+there in the recovered prefix.
 
-exav now **salvages** the prefix: on a decode error in the streaming member path,
+exav **salvages** the prefix instead: on a decode error in the streaming member path,
 the bytes decoded before the error (which `Read::read_to_end` already collected)
 are scanned. The salvage nests — a truncated `gzip(tar(...))` decompresses the
 gzip, walks the tar entries that are intact, and scans each. If a signature
@@ -139,15 +142,18 @@ not-fully-scanned flag is reserved for content that is **present but unscanned**
 an encrypted member exav can't decrypt, a member in an unsupported codec, or a
 member skipped to stay under a resource limit. Those are the cases where "there's
 stuff here I didn't look at" is true and worth telling the user; a merely damaged
-file is not. (Checksum-verify mode, `--verify-checksums`, opts back into strict
-integrity.)
+file is not. (A build with the `checksums` feature plus
+`Budget::set_verify_checksums(true)` opts back into strict integrity; there is no
+CLI flag for it.)
 
 > Nuance for indexed formats: a truncated *zip* is subtler than a truncated
 > gzip/tar — a cut central directory can leave *present* member data that a
-> naive reader never enumerates. Calling that "clean" is only honest once exav
-> also scans orphan local-file-header members (the ClamAV "dual-indexing"
-> behaviour); until then a damaged zip whose index we couldn't fully read is a
-> coverage gap, not a clean verdict.
+> naive reader never enumerates, so "clean" would be a claim about bytes nobody
+> read. exav closes that by scanning orphan local-file-header members
+> (`scan_orphan_locals`), and by reporting rather than dropping any orphan it
+> can't decode: encrypted, unsupported codec, deferred size, or extent past EOF
+> each yield a metadata-only `Entry::unsupported` → `UNSCANNABLE`. A damaged zip
+> is only `OK` when every member it still contains was actually read.
 
 (Interesting footnote from studying the ecosystem: ClamAV salvages a *truncated*
 deflate stream but **discards** the recovered prefix on a hard mid-stream data
@@ -155,11 +161,44 @@ error — so on that specific case exav is now the more thorough of the two.)
 
 ---
 
+## The unpacked image has to be reproducible
+
+`exav-pe-emu` runs a packer's stub and captures the image it rebuilds. That
+image is a scan target like any other: it gets hashed, matched against
+signatures, and compared between runs. So the same input must produce the same
+bytes, every time, and for a while it did not.
+
+`GetProcAddress` resolved an export by scanning the trap table for a matching
+`(module, name)`. The trap table is a hash map, whose iteration order depends on
+a seed chosen per process, and more than one entry can match — a module created
+twice under two spellings of its name, or an alias resolved after the export
+table was built. The winner therefore varied from run to run. Because the
+address is written into the **import table the stub rebuilds**, it landed inside
+the recovered image: 45 of 276 corpus samples produced a different dump on
+different runs of the same binary, differing by a handful of bytes in the IAT.
+
+Nothing about that is visible in a verdict. The scan still completed, the stub
+still unpacked, the tests still passed. What it broke is the ability to *check*
+anything: a differential run against the previous build reports dozens of false
+regressions, and a hash-based signature over the unpacked image matches only
+sometimes.
+
+The resolver now takes the lowest matching address, which is stable and also
+prefers the module's own export table over a trap allocated later for an unknown
+name. `an_export_resolves_to_the_same_address_whatever_the_map_order` pins it by
+constructing the ambiguity in both insertion orders.
+
+The general rule this is an instance of: **anything that reaches a scan result
+must not be ordered by a hash map.** A `HashMap` lookup is fine; iterating one
+to pick a winner is not.
+
+---
+
 ## How these were found
 
 All of the above came out of **differential testing** — running exav and a
 reference `clamd` over the same live-malware corpus with the same signature set
-and diffing every verdict (`scripts/test-clamav-diff.sh`, see
+and diffing every verdict (`scripts/difftest.sh`, see
 [DIFF_TESTING.md](DIFF_TESTING.md)). Disagreements and exav's "not fully scanned"
 bucket are where the interesting behavior hides; reviewing them is how the gzip
 salvage gap and the `VelvetSweatshop` coverage gap surfaced.

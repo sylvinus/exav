@@ -1,0 +1,109 @@
+---
+title: Installation
+description: Build exav from source with a Rust toolchain, install packages, run the container, or build the WASM sandbox module.
+---
+
+import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
+
+exav is cross-platform (Linux, macOS, Windows) and ships as a single static
+binary with no runtime dependencies.
+
+<Aside type="note">
+No prebuilt binaries or `cargo install` release are published yet — building
+from source with a Rust toolchain (1.91+, the workspace `rust-version`) is the
+primary method today. Package
+and release-artifact instructions below describe the intended distribution once
+tagged releases land.
+</Aside>
+
+## Build from source
+
+<Steps>
+
+1. Install a Rust toolchain (1.91 or newer — the workspace `rust-version` in
+   `Cargo.toml` is authoritative) via [rustup](https://rustup.rs/).
+
+2. Clone and build:
+
+   ```sh
+   git clone https://github.com/sylvinus/exav
+   cd exav
+   cargo build --release -p exav-cli      # -> target/release/exav
+   ./target/release/exav --help
+   ```
+
+3. Put the binary somewhere on your `PATH`:
+
+   ```sh
+   sudo install -m755 target/release/exav /usr/local/bin/exav
+   ```
+
+</Steps>
+
+The default build includes YARA and every archive format, and is already a
+pure-Rust binary with no TLS stack. For an even smaller build (dropping YARA,
+DLP, and HTTP):
+
+```sh
+cargo build --release -p exav-cli --no-default-features --features all-formats,decrypt
+```
+
+See [Feature flags](/reference/feature-flags/) for the full list of build-time
+features (including `http` for URL scanning and signature auto-update).
+
+## Packages & release artifacts
+
+Once tagged releases are published, CI produces these on each `v*` tag:
+
+<Tabs>
+  <TabItem label="Prebuilt binaries">
+    Static-musl Linux binaries run on any distro. Targets:
+    `{x86_64,aarch64}-linux-musl`, `{x86_64,aarch64}-apple-darwin`,
+    `x86_64-windows` — attached to the GitHub Release.
+  </TabItem>
+  <TabItem label="Debian / Ubuntu">
+    ```sh
+    cargo install cargo-deb
+    cargo build --release -p exav-cli
+    cargo deb -p exav-cli --no-build      # binary + optional systemd unit
+    ```
+  </TabItem>
+  <TabItem label="crates.io">
+    Once published:
+
+    ```sh
+    cargo install exav-cli
+    ```
+  </TabItem>
+</Tabs>
+
+## Container
+
+The published image is a wire-level drop-in for the ClamAV Docker image — same
+clamd port 3310, same protocol:
+
+```sh
+docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+```
+
+See the [Docker guide](/guides/docker/) for signature population, environment
+variables, and the dual-container updater pattern.
+
+## WASM sandbox module
+
+To run the scanner sandboxed (for untrusted signatures), build the
+`wasm32-wasip1` module:
+
+```sh
+rustup target add wasm32-wasip1
+cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
+```
+
+The output is `target/wasm32-wasip1/release/exav-wasm.wasm` (~5–6 MB). See the
+[WASM sandbox guide](/guides/wasm-sandbox/) for how to run it under wasmtime.
+
+## Next
+
+You have the binary — now [get signatures and run your first scan](/getting-started/quick-start/).
+exav ships with **no** real signature database of its own, so this step is
+required.

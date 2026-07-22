@@ -28,6 +28,7 @@ macro_rules! invalid_input {
     };
 }
 
+#[allow(unused_macros)] // part of the vendored surface; kept with its siblings
 macro_rules! not_found {
     ($e:expr) => {
         return Err(::std::io::Error::new(::std::io::ErrorKind::NotFound, $e))

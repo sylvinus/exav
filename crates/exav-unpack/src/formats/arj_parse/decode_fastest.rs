@@ -34,7 +34,11 @@ pub fn decode_fastest(data: &[u8], original_size: usize) -> Option<Vec<u8>> {
         } else {
             let rep_count = len as usize + THRESHOLD - 1;
             let back_ptr = decode_val(&mut r, 9, 13)? as usize;
-            if back_ptr > res.len() {
+            // `start` is `res.len() - 1 - back_ptr`, so the reference is only in
+            // range when `back_ptr` is strictly below the output written so far.
+            // Allowing equality underflows, and an empty output has nothing to
+            // point back at at all.
+            if back_ptr >= res.len() {
                 return None;
             }
             let start = res.len() - 1 - back_ptr;

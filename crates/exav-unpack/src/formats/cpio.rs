@@ -214,6 +214,11 @@ fn extract_bin<R>(
         let data_end = data_start.saturating_add(filesize).min(data.len());
         if filesize > 0 {
             budget.count_entry()?;
+            // The clamp above keeps the slice in bounds. A member whose declared
+            // size runs past EOF is simply truncated: every byte that EXISTS is
+            // scanned, and the missing tail is absent rather than hidden — so a
+            // clean result here is a real clean. exav scans for malware, it is
+            // not a file-integrity validator. See docs/QUIRKS.md.
             let cap = budget.reserve()?;
             if filesize as u64 > cap {
                 return Err(LimitHit::new(format!(
@@ -261,6 +266,11 @@ fn extract_newc<R>(
         let data_end = data_start.saturating_add(filesize).min(data.len());
         if filesize > 0 {
             budget.count_entry()?;
+            // The clamp above keeps the slice in bounds. A member whose declared
+            // size runs past EOF is simply truncated: every byte that EXISTS is
+            // scanned, and the missing tail is absent rather than hidden — so a
+            // clean result here is a real clean. exav scans for malware, it is
+            // not a file-integrity validator. See docs/QUIRKS.md.
             let cap = budget.reserve()?;
             if filesize as u64 > cap {
                 return Err(LimitHit::new(format!(
@@ -302,6 +312,11 @@ fn extract_odc<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Op
         let data_end = data_start.saturating_add(filesize).min(data.len());
         if filesize > 0 {
             budget.count_entry()?;
+            // The clamp above keeps the slice in bounds. A member whose declared
+            // size runs past EOF is simply truncated: every byte that EXISTS is
+            // scanned, and the missing tail is absent rather than hidden — so a
+            // clean result here is a real clean. exav scans for malware, it is
+            // not a file-integrity validator. See docs/QUIRKS.md.
             let cap = budget.reserve()?;
             if filesize as u64 > cap {
                 return Err(LimitHit::new(format!(

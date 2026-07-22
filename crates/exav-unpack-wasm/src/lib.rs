@@ -1,443 +1,149 @@
+// `wasm_bindgen`'s expansion contains `unsafe`, so this crate cannot `forbid` it
+// outright the way the rest of the workspace does. Denying it covers the code
+// exav writes, which is where the guarantee is available to give: nothing
+// hand-written here is unsafe, and the generated glue is the only exception.
+#![deny(unsafe_code)]
+
 //! WebAssembly bindings for `exav-unpack` — memory-safe, in-browser archive
 //! extraction with no native/C dependencies.
 //!
-//! Build a browser package with `wasm-pack build --target web` (or `bundler`),
-//! then from JavaScript:
+//! This module is SYNCHRONOUS throughout, and that is the design rather than an
+//! omission. `exav_unpack::Archive` is `Read + Seek`; meeting it on its own
+//! terms is what lets a browser build share exav's archive readers instead of
+//! carrying a second set, and a second set is a second set of answers about the
+//! same bytes. Reading a `File` synchronously needs `FileReaderSync`, which
+//! exists only inside a Worker — so the `File` path runs in a Worker, and
+//! `js/index.js` presents the async API a caller on the main thread uses.
+//! Bytes already in memory need no Worker and take the same code through a
+//! `Cursor`.
+//!
+//! From JavaScript, through the facade:
 //!
 //! ```js
-//! import init, { Archive, unpack } from "./pkg/exav_unpack_wasm.js";
+//! import init, { Archive, unpack } from "exav-unpack-wasm";
 //! await init();
 //!
-//! // Low-level streaming API
 //! const archive = await Archive.open(file);
-//! const members = await archive.list();
+//! const members = archive.list();
 //! const entry = await archive.extract(0);
-//! const chunks = entry.data.getReader();
 //!
-//! // High-level convenience
-//! const entries = await unpack(file);
+//! const entries = await unpack(bytes);
 //! ```
 
-use exav_unpack::{detect, extract, Budget, Entry as UnpackEntry, Format, Limits};
+mod source;
+
+use exav_unpack::{Budget, Entry as UnpackEntry, Format, Limits};
 use js_sys::{Array, Object, Reflect, Uint8Array};
+use source::Src;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/// Metadata for one archive member (no decompressed data).
-struct MemberInfo {
-    name: String,
-    index: usize,
-    compressed_size: u64,
-    uncompressed_size: u64,
-    encrypted: bool,
-}
-
-/// An extracted archive member with streaming data.
-struct Entry {
-    name: String,
-    data: Vec<u8>,
-    encrypted: bool,
-    unsupported: String,
+/// Carry any error's message out to JS.
+fn err<E: std::fmt::Display>(e: E) -> JsValue {
+    JsValue::from_str(&e.to_string())
 }
 
 // ---------------------------------------------------------------------------
-// ZIP central-directory metadata (for streaming from File)
+// Helpers: format names, limits, JS conversions
 // ---------------------------------------------------------------------------
-
-struct ZipEntryMeta {
-    name: String,
-    local_header_offset: u64,
-    compressed_size: u64,
-    uncompressed_size: u64,
-    compression_method: u16,
-    encrypted: bool,
-    crc32: u32,
-}
-
-/// Parse the ZIP End-of-Central-Directory record and central-directory entries
-/// from the tail bytes. Returns entry metadata for listing and extraction.
-fn parse_zip_central_directory(
-    data: &[u8],
-    file_size: u64,
-) -> Result<Vec<ZipEntryMeta>, JsValue> {
-    // Find EOCD: signature 0x06054b50. Search backwards from end.
-    let mut eocd_offset = None;
-    let search_end = data.len().saturating_sub(22);
-    let search_start = search_end.saturating_sub(65535);
-    for i in (search_start..=search_end).rev() {
-        if i + 22 <= data.len()
-            && data[i] == 0x50
-            && data[i + 1] == 0x4b
-            && data[i + 2] == 0x05
-            && data[i + 3] == 0x06
-        {
-            eocd_offset = Some(i);
-            break;
-        }
-    }
-    let eocd = eocd_offset
-        .ok_or_else(|| JsValue::from_str("ZIP: End-of-Central-Directory not found"))?;
-
-    let cd_offset =
-        u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap()) as u64;
-    let _cd_size =
-        u32::from_le_bytes(data[eocd + 12..eocd + 16].try_into().unwrap()) as u64;
-    let num_entries =
-        u16::from_le_bytes(data[eocd + 10..eocd + 12].try_into().unwrap()) as usize;
-
-    // The central directory in `data` starts at `cd_offset` relative to file start,
-    // but `data` may be a tail slice. Compute the local offset.
-    let data_start = file_size.saturating_sub(data.len() as u64);
-    let cd_local = cd_offset.saturating_sub(data_start) as usize;
-
-    let mut entries = Vec::with_capacity(num_entries);
-    let mut pos = cd_local;
-
-    for _ in 0..num_entries {
-        if pos + 46 > data.len() {
-            break;
-        }
-        // Central directory signature: 0x02014b50
-        if data[pos] != 0x50
-            || data[pos + 1] != 0x4b
-            || data[pos + 2] != 0x01
-            || data[pos + 3] != 0x02
-        {
-            break;
-        }
-        let compression_method =
-            u16::from_le_bytes(data[pos + 10..pos + 12].try_into().unwrap());
-        let crc32 = u32::from_le_bytes(data[pos + 16..pos + 20].try_into().unwrap());
-        let comp_size =
-            u32::from_le_bytes(data[pos + 20..pos + 24].try_into().unwrap()) as u64;
-        let uncomp_size =
-            u32::from_le_bytes(data[pos + 24..pos + 28].try_into().unwrap()) as u64;
-        let name_len =
-            u16::from_le_bytes(data[pos + 28..pos + 30].try_into().unwrap()) as usize;
-        let extra_len =
-            u16::from_le_bytes(data[pos + 30..pos + 32].try_into().unwrap()) as usize;
-        let comment_len =
-            u16::from_le_bytes(data[pos + 32..pos + 34].try_into().unwrap()) as usize;
-        let local_header_offset =
-            u32::from_le_bytes(data[pos + 42..pos + 46].try_into().unwrap()) as u64;
-
-        let name_start = pos + 46;
-        let name_end = name_start + name_len;
-        let name = if name_end <= data.len() {
-            String::from_utf8_lossy(&data[name_start..name_end]).into_owned()
-        } else {
-            String::new()
-        };
-
-        // Detect encryption from general-purpose bit flag (bit 0 of bytes 8..10)
-        let flags = u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap());
-        let encrypted = (flags & 0x0001) != 0;
-
-        entries.push(ZipEntryMeta {
-            name,
-            local_header_offset,
-            compressed_size: comp_size,
-            uncompressed_size: uncomp_size,
-            compression_method,
-            encrypted,
-            crc32,
-        });
-
-        pos += 46 + name_len + extra_len + comment_len;
-    }
-
-    Ok(entries)
-}
-
-/// Fetch bytes from a File via slice().arrayBuffer().
-async fn file_slice(file: &web_sys::File, offset: u64, len: u64) -> Result<Vec<u8>, JsValue> {
-    let blob: web_sys::Blob = file.clone().into();
-    let sliced = blob
-        .slice_with_i32_and_i32(offset as i32, (offset + len) as i32)
-        .map_err(|e| JsValue::from_str(&format!("slice: {e:?}")))?;
-    let p = sliced.array_buffer();
-    let ab = JsFuture::from(p)
-        .await
-        .map_err(|e| JsValue::from_str(&format!("arrayBuffer: {e:?}")))?;
-    let arr = Uint8Array::new(&ab);
-    Ok(arr.to_vec())
-}
-
-/// Read the tail of a File (last `max_bytes` bytes).
-async fn file_tail(
-    file: &web_sys::File,
-    file_size: u64,
-    max_bytes: u64,
-) -> Result<Vec<u8>, JsValue> {
-    let len = file_size.min(max_bytes);
-    let offset = file_size.saturating_sub(len);
-    file_slice(file, offset, len).await
-}
-
-/// Fetch bytes from a custom reader JS object via reader.read(offset, length).
-/// The reader must have a `read(offset: number, length: number): Promise<Uint8Array>` method.
-async fn reader_read(reader: &JsValue, offset: u64, len: u64) -> Result<Vec<u8>, JsValue> {
-    let read_fn = Reflect::get(reader, &"read".into())
-        .map_err(|_| JsValue::from_str("reader missing `read` method"))?;
-    let read_fn = read_fn
-        .dyn_ref::<js_sys::Function>()
-        .ok_or_else(|| JsValue::from_str("`read` is not a function"))?;
-    let args = Array::new();
-    args.push(&JsValue::from_f64(offset as f64));
-    args.push(&JsValue::from_f64(len as f64));
-    let result = read_fn
-        .call2(reader, &args.get(0), &args.get(1))
-        .map_err(|e| JsValue::from_str(&format!("reader.read() failed: {e:?}")))?;
-    let promise: js_sys::Promise = result.dyn_into()
-        .map_err(|_| JsValue::from_str("reader.read() did not return a Promise"))?;
-    let result = JsFuture::from(promise)
-        .await
-        .map_err(|e| JsValue::from_str(&format!("reader.read() promise rejected: {e:?}")))?;
-    let arr = Uint8Array::new(&result);
-    Ok(arr.to_vec())
-}
-
-/// Read the tail from a custom reader.
-async fn reader_tail(
-    reader: &JsValue,
-    file_size: u64,
-    max_bytes: u64,
-) -> Result<Vec<u8>, JsValue> {
-    let len = file_size.min(max_bytes);
-    let offset = file_size.saturating_sub(len);
-    reader_read(reader, offset, len).await
-}
-
-/// Unified read source: reads from File, reader, in-memory data, or returns an error.
-async fn read_bytes(
-    file: &Option<web_sys::File>,
-    reader: &Option<JsValue>,
-    data: &[u8],
-    offset: u64,
-    len: u64,
-) -> Result<Vec<u8>, JsValue> {
-    if let Some(f) = file {
-        file_slice(f, offset, len).await
-    } else if let Some(r) = reader {
-        reader_read(r, offset, len).await
-    } else if !data.is_empty() {
-        let start = offset as usize;
-        let end = ((offset + len) as usize).min(data.len());
-        if start >= data.len() {
-            Ok(Vec::new())
-        } else {
-            Ok(data[start..end].to_vec())
-        }
-    } else {
-        Err(JsValue::from_str("no read source"))
-    }
-}
-
-/// Read the tail from the unified source.
-async fn read_tail(
-    file: &Option<web_sys::File>,
-    reader: &Option<JsValue>,
-    data: &[u8],
-    file_size: u64,
-    max_bytes: u64,
-) -> Result<Vec<u8>, JsValue> {
-    if let Some(f) = file {
-        file_tail(f, file_size, max_bytes).await
-    } else if let Some(r) = reader {
-        reader_tail(r, file_size, max_bytes).await
-    } else if !data.is_empty() {
-        let len = (file_size.min(max_bytes)) as usize;
-        let start = data.len().saturating_sub(len);
-        Ok(data[start..].to_vec())
-    } else {
-        Err(JsValue::from_str("no read source"))
-    }
-}
-
-/// Decompress a ZIP member's raw bytes into plaintext.
-fn decompress_zip_member(
-    compressed: &[u8],
-    method: u16,
-    cap: u64,
-) -> Result<Vec<u8>, JsValue> {
-    match method {
-        0 => {
-            // Stored
-            let take = (compressed.len() as u64).min(cap) as usize;
-            Ok(compressed[..take].to_vec())
-        }
-        8 => {
-            // Deflate
-            use std::io::Read;
-            let mut decoder =
-                flate2::read::DeflateDecoder::new(std::io::Cursor::new(compressed));
-            let mut buf = Vec::new();
-            (&mut decoder)
-                .take(cap + 1)
-                .read_to_end(&mut buf)
-                .map_err(|e| JsValue::from_str(&format!("deflate: {e}")))?;
-            if buf.len() as u64 > cap {
-                return Err(JsValue::from_str("member exceeds budget"));
-            }
-            Ok(buf)
-        }
-        _ => {
-            // Unknown method — pass through raw bytes (scannable)
-            let take = (compressed.len() as u64).min(cap) as usize;
-            Ok(compressed[..take].to_vec())
-        }
-    }
-}
-
-/// Extract a single ZIP member from a unified source by index.
-async fn extract_zip_member_from_source(
-    file: &Option<web_sys::File>,
-    reader: &Option<JsValue>,
-    data: &[u8],
-    _file_size: u64,
-    meta: &ZipEntryMeta,
-    passwords: &[String],
-) -> Result<Entry, JsValue> {
-    let budget_cap: u64 = 256 * 1024 * 1024; // 256 MiB per-member cap
-
-    if meta.compressed_size == 0 && !meta.encrypted {
-        return Ok(Entry {
-            name: meta.name.clone(),
-            data: Vec::new(),
-            encrypted: false,
-            unsupported: String::new(),
-        });
-    }
-
-    if meta.encrypted {
-        // Member decryption lives behind exav-unpack's `decrypt` feature (the
-        // cipher/KDF stack). When that feature is off — e.g. a minimal
-        // single-format WASM build — report the member as encrypted-unsupported
-        // rather than failing to compile.
-        #[cfg(feature = "decrypt")]
-        {
-            let header_bytes =
-                read_bytes(file, reader, data, meta.local_header_offset, 30 + 256).await?;
-            let name_len = u16::from_le_bytes(header_bytes[26..28].try_into().unwrap()) as u64;
-            let extra_len = u16::from_le_bytes(header_bytes[28..30].try_into().unwrap()) as u64;
-            let data_offset = meta.local_header_offset + 30 + name_len + extra_len;
-
-            let raw = read_bytes(file, reader, data, data_offset, meta.compressed_size).await?;
-
-            let crc = meta.crc32;
-            let enc = exav_unpack::formats::zip::EncryptedMember {
-                raw,
-                aes_strength: None,
-                method: meta.compression_method,
-                // The DOS mod-time high byte (streaming ZipCrypto password check)
-                // isn't threaded through this JS-reader path; `None` falls back to
-                // the CRC-based check, and AES ignores it.
-                dos_time_hi: None,
-            };
-            match exav_unpack::formats::zip::decrypt_zip_member(
-                &enc,
-                crc,
-                &mut Budget::new(Limits::default()),
-            ) {
-                Ok(Some(plain)) => {
-                    let data = if plain.len() as u64 > budget_cap {
-                        plain[..budget_cap as usize].to_vec()
-                    } else {
-                        plain
-                    };
-                    return Ok(Entry {
-                        name: meta.name.clone(),
-                        data,
-                        encrypted: true,
-                        unsupported: String::new(),
-                    });
-                }
-                _ => {
-                    let passwords_tried = !passwords.is_empty();
-                    return Ok(Entry {
-                        name: meta.name.clone(),
-                        data: Vec::new(),
-                        encrypted: true,
-                        unsupported: if passwords_tried {
-                            "wrong password".into()
-                        } else {
-                            "encrypted (no password provided)".into()
-                        },
-                    });
-                }
-            }
-        }
-        #[cfg(not(feature = "decrypt"))]
-        {
-            let _ = (passwords, budget_cap);
-            return Ok(Entry {
-                name: meta.name.clone(),
-                data: Vec::new(),
-                encrypted: true,
-                unsupported: "encrypted (decryption not built)".into(),
-            });
-        }
-    }
-
-    let local_header = read_bytes(file, reader, data, meta.local_header_offset, 30 + 256).await?;
-    let name_len =
-        u16::from_le_bytes(local_header[26..28].try_into().unwrap()) as u64;
-    let extra_len =
-        u16::from_le_bytes(local_header[28..30].try_into().unwrap()) as u64;
-    let data_offset = meta.local_header_offset + 30 + name_len + extra_len;
-
-    let compressed = read_bytes(file, reader, data, data_offset, meta.compressed_size).await?;
-    let decompressed = decompress_zip_member(&compressed, meta.compression_method, budget_cap)?;
-
-    Ok(Entry {
-        name: meta.name.clone(),
-        data: decompressed,
-        encrypted: false,
-        unsupported: String::new(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Helper: format detection + member-to-JS conversions
-// ---------------------------------------------------------------------------
-
-fn detect_format_from_data(data: &[u8]) -> Option<Format> {
-    detect(data)
-}
 
 fn format_name(fmt: Format) -> String {
     format!("{fmt:?}")
 }
 
-fn entry_to_js(e: &Entry) -> Result<JsValue, JsValue> {
+/// Refuse a format the caller excluded.
+///
+/// `allowedFormats` is a per-call control — "open only these; anything else is
+/// reported" — and it has to be checked on the way IN. `Limits::allows` is also
+/// consulted during extraction, but an archive that was never allowed should
+/// not open at all.
+fn check_allowed(fmt: Format, limits: &Limits) -> Result<(), JsValue> {
+    if limits.allows(fmt) {
+        Ok(())
+    } else {
+        Err(JsValue::from_str(&format!(
+            "{} is not in allowedFormats",
+            format_name(fmt)
+        )))
+    }
+}
+
+/// One extracted member, as JS receives it.
+///
+/// `data` is a `Uint8Array` rather than a stream: an entry crosses the Worker
+/// boundary by structured clone, which a `ReadableStream` does not survive
+/// without being transferred. `js/index.js` wraps it into the stream the public
+/// API promises, on whichever side the caller is.
+fn entry_to_js(name: &str, data: &[u8], encrypted: bool, unsupported: &str) -> Result<JsValue, JsValue> {
     let obj = Object::new();
-    Reflect::set(&obj, &"name".into(), &JsValue::from_str(&e.name))?;
-    let bytes = Uint8Array::from(e.data.as_slice());
-    // Wrap in ReadableStream
-    let chunks = Array::new();
-    chunks.push(&bytes);
-    let blob = web_sys::Blob::new_with_u8_array_sequence(&chunks)
-        .map_err(|e| JsValue::from_str(&format!("blob: {e:?}")))?;
-    let stream = blob.stream();
-    Reflect::set(&obj, &"data".into(), &stream)?;
-    Reflect::set(
-        &obj,
-        &"encrypted".into(),
-        &JsValue::from_bool(e.encrypted),
-    )?;
+    Reflect::set(&obj, &"name".into(), &JsValue::from_str(name))?;
+    Reflect::set(&obj, &"data".into(), &Uint8Array::from(data))?;
+    Reflect::set(&obj, &"encrypted".into(), &JsValue::from_bool(encrypted))?;
     Reflect::set(
         &obj,
         &"unsupported".into(),
-        &JsValue::from_str(&e.unsupported),
+        &JsValue::from_str(unsupported),
     )?;
     Ok(obj.into())
 }
 
-fn member_to_js(m: &MemberInfo) -> Result<JsValue, JsValue> {
+fn unpack_entry_to_js(e: &UnpackEntry) -> Result<JsValue, JsValue> {
+    #[cfg(feature = "testing-faults")]
+    provoke(&e.name);
+    entry_to_js(&e.name, &e.data, e.encrypted, e.unsupported.unwrap_or(""))
+}
+
+/// Fail the way a decoder can, for a member named to ask for it.
+///
+/// Every one of these is beyond Rust's reach on this target — `panic = "abort"`
+/// means no unwind to catch, a failed allocation aborts rather than returning,
+/// and an exhausted stack traps. That is precisely why they are worth firing on
+/// purpose: the containment for them lives in JS, and containment that has never
+/// been triggered is an assumption.
+///
+/// Sited here because both `extract` and `extractAll` produce entries through
+/// this function, so one hook covers both.
+#[cfg(feature = "testing-faults")]
+fn provoke(name: &str) {
+    match name {
+        "__exav_panic__" => panic!("deliberate panic from the testing-faults feature"),
+        "__exav_oom__" => {
+            // Reserved, never written: the point is to exhaust the address
+            // space, and writing would only make it slower. wasm32 tops out at
+            // 4 GiB, so this ends quickly.
+            let mut held: Vec<Vec<u8>> = Vec::new();
+            loop {
+                held.push(Vec::<u8>::with_capacity(256 * 1024 * 1024));
+                std::hint::black_box(&held);
+            }
+        }
+        "__exav_stack__" => {
+            // Not tail-recursive, and the result is used, so it cannot be
+            // optimised into a loop.
+            fn deeper(n: u64) -> u64 {
+                if n == 0 {
+                    0
+                } else {
+                    1 + std::hint::black_box(deeper(n + 1))
+                }
+            }
+            std::hint::black_box(deeper(1));
+        }
+        _ => {}
+    }
+}
+
+/// A member that could not be produced, reported as a member rather than
+/// dropped.
+///
+/// A limit reached part-way through is not "the archive ends here". Returning
+/// the members extracted so far and saying nothing about the rest turns "I
+/// stopped" into "there was no more", which is the one answer this crate must
+/// never give.
+fn limit_marker_to_js(why: &str) -> Result<JsValue, JsValue> {
+    entry_to_js(&format!("<{why}>"), &[], false, why)
+}
+
+fn member_to_js(m: &exav_unpack::MemberInfo) -> Result<JsValue, JsValue> {
     let obj = Object::new();
     Reflect::set(&obj, &"name".into(), &JsValue::from_str(&m.name))?;
     Reflect::set(&obj, &"index".into(), &JsValue::from_f64(m.index as f64))?;
@@ -451,315 +157,395 @@ fn member_to_js(m: &MemberInfo) -> Result<JsValue, JsValue> {
         &"uncompressedSize".into(),
         &JsValue::from_f64(m.uncompressed_size as f64),
     )?;
-    Reflect::set(
-        &obj,
-        &"encrypted".into(),
-        &JsValue::from_bool(m.encrypted),
-    )?;
+    Reflect::set(&obj, &"encrypted".into(), &JsValue::from_bool(m.encrypted))?;
     Ok(obj.into())
 }
 
-fn unpack_entry_to_entry(e: &UnpackEntry) -> Entry {
-    Entry {
-        name: e.name.clone(),
-        data: e.data.clone(),
-        encrypted: e.encrypted,
-        unsupported: e
-            .unsupported
-            .unwrap_or("")
-            .to_string(),
+fn parse_passwords(passwords: &JsValue) -> Vec<String> {
+    let Some(arr) = passwords.dyn_ref::<Array>() else {
+        return Vec::new();
+    };
+    arr.iter().filter_map(|v| v.as_string()).collect()
+}
+
+/// Bounds for a browser, which are not the bounds for a server.
+///
+/// `Limits::default()` is sized for a scanner on a host with real memory: 1 GiB
+/// of extraction, 256 MiB for one member. wasm32 caps the whole address space
+/// at 4 GiB and a browser commonly allows far less, so those defaults let a
+/// page ask for more than the tab can give. Running out is not an error the
+/// caller sees — the module aborts and takes its instance with it, so the JS
+/// side gets no verdict at all.
+///
+/// The two byte budgets are therefore cut to an eighth, 128 MiB and 32 MiB. The
+/// rest of `Limits` is kept as it stands: member count, recursion depth and
+/// compression ratio bound counts and shapes rather than bytes, so the address
+/// space is not what constrains them. Raise any of them through the `limits`
+/// argument if the page can afford it.
+fn browser_limits() -> Limits {
+    Limits {
+        max_extracted_bytes: 128 * 1024 * 1024,
+        max_buffer_bytes: 32 * 1024 * 1024,
+        ..Limits::default()
     }
 }
 
-fn parse_passwords(passwords: &JsValue) -> Vec<String> {
-    let arr = match passwords.dyn_ref::<Array>() {
-        Some(a) => a,
-        None => return Vec::new(),
+/// Read a `{ maxExtractedBytes, maxBufferBytes, maxMembers, maxRecursion,
+/// maxCompressionRatio }` object from JS. Absent keys keep the browser default;
+/// a caller sets only what it cares about.
+fn limits_from_js(v: &JsValue) -> Limits {
+    let mut l = browser_limits();
+    if v.is_undefined() || v.is_null() {
+        return l;
+    }
+    let num = |k: &str| -> Option<f64> {
+        Reflect::get(v, &JsValue::from_str(k))
+            .ok()
+            .and_then(|x| x.as_f64())
+            .filter(|n| *n >= 0.0 && n.is_finite())
     };
-    let mut list = Vec::new();
-    for i in 0..arr.length() {
-        if let Some(s) = arr.get(i).as_string() {
-            list.push(s);
+    if let Some(n) = num("maxExtractedBytes") {
+        l.max_extracted_bytes = n as u64;
+    }
+    if let Some(n) = num("maxBufferBytes") {
+        l.max_buffer_bytes = n as u64;
+    }
+    if let Some(n) = num("maxMembers") {
+        l.max_members = n as u64;
+    }
+    if let Some(n) = num("maxRecursion") {
+        l.max_recursion = n as u32;
+    }
+    if let Some(n) = num("maxCompressionRatio") {
+        l.max_compression_ratio = n as u64;
+    }
+    // `allowedFormats: ["Zip", "Tar"]` — names as `detectFormat` reports them.
+    // An unknown name is ignored rather than rejected: a page pinned to an
+    // older module should not fail outright because it listed a format that
+    // build does not have, and anything not listed is excluded anyway.
+    if let Ok(v) = Reflect::get(v, &JsValue::from_str("allowedFormats")) {
+        if let Some(arr) = v.dyn_ref::<Array>() {
+            let mut set = std::collections::BTreeSet::new();
+            for item in arr.iter() {
+                if let Some(f) = item.as_string().and_then(|n| format_by_name(&n)) {
+                    set.insert(f);
+                }
+            }
+            l.allowed_formats = Some(set);
         }
     }
-    list
+    l
 }
 
-fn make_budget(passwords: Vec<String>) -> Budget {
-    Budget::with_passwords(Limits::default(), passwords)
+/// Look a `Format` up by the name `format_name` prints, so the JS side names
+/// formats the same way it reads them back.
+fn format_by_name(name: &str) -> Option<Format> {
+    Format::ALL
+        .iter()
+        .copied()
+        .find(|f| format_name(*f).eq_ignore_ascii_case(name))
 }
 
 // ---------------------------------------------------------------------------
-// Archive class
+// Archive
 // ---------------------------------------------------------------------------
 
+/// An open archive.
+///
+/// Every method is synchronous. On the main thread this type is reached only
+/// with bytes already in memory; for a `File` it lives inside a Worker and
+/// `js/index.js` is what a page talks to.
 #[wasm_bindgen]
 pub struct Archive {
-    file: Option<web_sys::File>,
-    reader: Option<JsValue>,
-    file_size: u64,
-    data: Vec<u8>,
-    format_name: String,
-    detected_format: Option<Format>,
-    zip_entries: Option<Vec<ZipEntryMeta>>,
+    inner: exav_unpack::Archive<Src>,
+    limits: Limits,
+    /// The members of an archive that carries no index, once walked.
+    ///
+    /// `exav_unpack::Archive::list` reports an index where the format has one.
+    /// Where it does not, it reports an empty slice — and passing that straight
+    /// out would tell a page the archive holds NOTHING, which is the one answer
+    /// this crate must never give. So an archive without an index is walked
+    /// once and held: its members are not knowable any other way, since finding
+    /// them and extracting them are the same operation.
+    ///
+    /// Nothing here is decided per format. Whatever `exav_unpack` can index, it
+    /// indexes, and this never runs for it.
+    walked: Option<Walk>,
+}
+
+/// What one walk of a directory-less archive found, and why it stopped.
+struct Walk {
+    entries: Vec<UnpackEntry>,
+    /// Set when a limit ended the walk early, so the caller is told the list is
+    /// short rather than left to read it as complete.
+    stopped: Option<String>,
 }
 
 #[wasm_bindgen]
 impl Archive {
-    /// Open from a File, Uint8Array, or custom reader object.
-    /// A reader must implement: { read(offset: number, length: number): Promise<Uint8Array>, size: number }
+    /// Open from a `Uint8Array`, a `File`/`Blob` inside a Worker, or a
+    /// caller-supplied `{ read(offset, length): Uint8Array, size: number }`.
+    ///
+    /// A supplied `read` is SYNCHRONOUS and returns bytes rather than a promise
+    /// of them: the archive readers are `Read + Seek`, and there is nowhere in
+    /// a `read` that returns bytes to await anything.
+    ///
+    /// `limits` is optional and bounds every extraction from this archive:
+    /// `{ maxExtractedBytes, maxBufferBytes, maxMembers, maxRecursion,
+    /// maxCompressionRatio, allowedFormats }`. Absent keys keep the browser
+    /// default, which is an order of magnitude below the library's own — a tab
+    /// has far less room than a server, and running out of it aborts the module
+    /// rather than returning an error.
     #[wasm_bindgen(js_name = "open")]
-    pub async fn open(source: JsValue) -> Result<Archive, JsValue> {
-        // Detect File vs Uint8Array vs custom reader
-        if let Some(file) = source.dyn_ref::<web_sys::File>() {
-            let size = file.size() as u64;
-            // Read head (for magic-byte detection) and tail (for ZIP central directory).
-            let head = file_slice(file, 0, 256.min(size)).await?;
-            let tail = if size > 256 { file_tail(file, size, 65536).await? } else { Vec::new() };
-            // Merge: head first, then tail (skipping overlapping bytes).
-            let mut probe = head;
-            let tail_start = size.saturating_sub(tail.len() as u64) as usize;
-            if tail_start > probe.len() {
-                probe.extend_from_slice(&tail);
-            }
-            let fmt = detect_format_from_data(&probe)
-                .ok_or_else(|| JsValue::from_str("unrecognised archive format"))?;
-            let fmt_name = format_name(fmt);
-
-            let zip_entries = if fmt == Format::Zip {
-                if size <= 65536 * 2 {
-                    let all = file_slice(file, 0, size).await?;
-                    Some(parse_zip_central_directory(&all, size)?)
-                } else {
-                    let cd_tail = file_tail(file, size, 1024 * 1024).await?;
-                    Some(parse_zip_central_directory(&cd_tail, size)?)
-                }
-            } else {
-                None
-            };
-
-            Ok(Archive {
-                file: Some(file.clone()),
-                reader: None,
-                file_size: size,
-                data: Vec::new(),
-                format_name: fmt_name,
-                detected_format: Some(fmt),
-                zip_entries,
-            })
-        } else if let Some(arr) = source.dyn_ref::<Uint8Array>() {
-            let data = arr.to_vec();
-            let fmt = detect_format_from_data(&data)
-                .ok_or_else(|| JsValue::from_str("unrecognised archive format"))?;
-            let fmt_name = format_name(fmt);
-
-            let zip_entries = if fmt == Format::Zip {
-                Some(parse_zip_central_directory(&data, data.len() as u64)?)
-            } else {
-                None
-            };
-
-            Ok(Archive {
-                file: None,
-                reader: None,
-                file_size: 0,
-                data,
-                format_name: fmt_name,
-                detected_format: Some(fmt),
-                zip_entries,
-            })
+    pub fn open(source: JsValue, limits: Option<JsValue>) -> Result<Archive, JsValue> {
+        let limits = limits_from_js(&limits.unwrap_or(JsValue::UNDEFINED));
+        let src = if let Some(bytes) = source.dyn_ref::<Uint8Array>() {
+            Src::Memory(std::io::Cursor::new(bytes.to_vec()))
+        } else if let Some(blob) = source.dyn_ref::<web_sys::Blob>() {
+            // `File` is a `Blob`, so one branch covers both.
+            Src::from_blob(blob.clone())?
         } else if let Some(obj) = source.dyn_ref::<Object>() {
-            // Custom reader: { read(offset, length): Promise<Uint8Array>, size: number }
-            let size_val = Reflect::get(obj, &"size".into())
-                .map_err(|_| JsValue::from_str("reader missing `size` property"))?;
-            let size = size_val
-                .as_f64()
-                .ok_or_else(|| JsValue::from_str("`size` is not a number"))? as u64;
-
-            let tail = read_tail(&None, &Some(source.clone()), &[], size, 65536).await?;
-            let fmt = detect_format_from_data(&tail)
-                .ok_or_else(|| JsValue::from_str("unrecognised archive format"))?;
-            let fmt_name = format_name(fmt);
-
-            let zip_entries = if fmt == Format::Zip {
-                let cd_tail = read_tail(&None, &Some(source.clone()), &[], size, 1024 * 1024).await?;
-                Some(parse_zip_central_directory(&cd_tail, size)?)
-            } else {
-                None
-            };
-
-            Ok(Archive {
-                file: None,
-                reader: Some(source.clone()),
-                file_size: size,
-                data: Vec::new(),
-                format_name: fmt_name,
-                detected_format: Some(fmt),
-                zip_entries,
-            })
+            Src::from_js_reader(obj)?
         } else {
-            Err(JsValue::from_str(
-                "expected File, Uint8Array, or reader object",
-            ))
-        }
+            return Err(JsValue::from_str(
+                "expected a Uint8Array, a File/Blob inside a Worker, \
+                 or a { read(offset, length), size } object",
+            ));
+        };
+
+        let inner = exav_unpack::Archive::open(src).map_err(err)?;
+        check_allowed(inner.format(), &limits)?;
+        Ok(Archive {
+            inner,
+            limits,
+            walked: None,
+        })
     }
 
-    /// Detected format name. Sync.
+    /// Whether this archive carries an index that can be read without
+    /// extracting anything.
+    ///
+    /// A capability, asked of the archive, rather than a list of formats kept
+    /// here — as `exav_unpack` learns to index another format, this starts
+    /// reporting it with no change on this side.
+    fn is_indexed(&self) -> bool {
+        !self.inner.list().is_empty()
+    }
+
+    /// Walk a directory-less archive once, and keep what it found.
+    ///
+    /// The walk is what extraction does, so doing it twice would decompress
+    /// everything twice — and for a source that only reads forward, the second
+    /// walk would find nothing at all.
+    fn walk(&mut self, passwords: Vec<String>) -> &Walk {
+        if self.walked.is_none() {
+            let mut budget = Budget::with_passwords(self.limits.clone(), passwords);
+            let mut entries = Vec::new();
+            let mut stopped = None;
+            loop {
+                match self.inner.extract_next(&mut budget) {
+                    Ok(Some(e)) => entries.push(e),
+                    Ok(None) => break,
+                    Err(hit) => {
+                        stopped = Some(hit.to_string());
+                        break;
+                    }
+                }
+            }
+            self.walked = Some(Walk { entries, stopped });
+        }
+        self.walked.as_ref().expect("just populated")
+    }
+
+    /// The detected format's name.
     pub fn format(&self) -> String {
-        self.format_name.clone()
+        format_name(self.inner.format())
     }
 
-    /// Ensure `self.data` is populated. For File/reader sources where data is
-    /// still empty, this reads the entire source into memory. For in-memory
-    /// sources it's a no-op.  Returns a reference to the (now non-empty) data.
-    async fn ensure_data_loaded(&self) -> Result<Vec<u8>, JsValue> {
-        if !self.data.is_empty() {
-            return Ok(self.data.clone());
-        }
-        if let Some(f) = &self.file {
-            let all = file_slice(f, 0, self.file_size).await?;
-            return Ok(all);
-        }
-        if let Some(r) = &self.reader {
-            let all = reader_read(r, 0, self.file_size).await?;
-            return Ok(all);
-        }
-        Err(JsValue::from_str("no data source"))
-    }
-
-    /// List archive members. Async.
-    pub async fn list(&self, passwords: Option<JsValue>) -> Result<Array, JsValue> {
-        let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
-
-        if let Some(zip_entries) = &self.zip_entries {
-            // ZIP fast path: return pre-parsed metadata, no I/O
-            let out = Array::new();
-            for (i, ze) in zip_entries.iter().enumerate() {
-                out.push(&member_to_js(&MemberInfo {
-                    name: ze.name.clone(),
-                    index: i,
-                    compressed_size: ze.compressed_size,
-                    uncompressed_size: ze.uncompressed_size,
-                    encrypted: ze.encrypted,
-                })?);
+    /// The members, as metadata.
+    ///
+    /// Where the archive carries an index — a ZIP's central directory, a tar's
+    /// headers — this reads what `open` already parsed: no further I/O, and no
+    /// member decompressed. Where it does not, the members are only knowable by
+    /// walking, so the walk happens here and is kept.
+    pub fn list(&mut self, passwords: Option<JsValue>) -> Result<Array, JsValue> {
+        let out = Array::new();
+        if self.is_indexed() {
+            for m in self.inner.list() {
+                out.push(&member_to_js(m)?);
             }
             return Ok(out);
         }
-
-        let data = self.ensure_data_loaded().await?;
-        let fmt = self.detected_format
-            .ok_or_else(|| JsValue::from_str("unrecognised archive format"))?;
-        let budget = make_budget(pw);
-        let mut budget = budget;
-        let entries =
-            extract(fmt, &data, &mut budget).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let out = Array::new();
-        for (i, e) in entries.iter().enumerate() {
-            out.push(&member_to_js(&MemberInfo {
+        let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
+        let walk = self.walk(pw);
+        for (index, e) in walk.entries.iter().enumerate() {
+            out.push(&member_to_js(&exav_unpack::MemberInfo {
                 name: e.name.clone(),
-                index: i,
+                index,
                 compressed_size: e.comp_size,
                 uncompressed_size: e.data.len() as u64,
                 encrypted: e.encrypted,
             })?);
         }
+        if let Some(why) = walk.stopped.clone() {
+            out.push(&limit_marker_to_js(&why)?);
+        }
         Ok(out)
     }
 
-    /// Extract one member by index. Async.
-    pub async fn extract(
-        &self,
-        index: usize,
-        passwords: Option<JsValue>,
-    ) -> Result<JsValue, JsValue> {
+    /// Extract one member by index.
+    pub fn extract(&mut self, index: usize, passwords: Option<JsValue>) -> Result<JsValue, JsValue> {
         let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
-
-        if let Some(zip_entries) = &self.zip_entries {
-            if index < zip_entries.len() {
-                let entry = extract_zip_member_from_source(
-                    &self.file,
-                    &self.reader,
-                    &self.data,
-                    self.file_size,
-                    &zip_entries[index],
-                    &pw,
-                ).await?;
-                return entry_to_js(&entry);
-            }
-            return Err(JsValue::from_str("index out of bounds"));
+        if self.is_indexed() {
+            let mut budget = Budget::with_passwords(self.limits.clone(), pw);
+            let entry = self.inner.extract(index, &mut budget).map_err(err)?;
+            return unpack_entry_to_js(&entry);
         }
-
-        let data = self.ensure_data_loaded().await?;
-        let fmt = self.detected_format
-            .ok_or_else(|| JsValue::from_str("unrecognised archive format"))?;
-        let budget = make_budget(pw);
-        let mut budget = budget;
-        let entries =
-            extract(fmt, &data, &mut budget).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        if index < entries.len() {
-            let entry = unpack_entry_to_entry(&entries[index]);
-            entry_to_js(&entry)
-        } else {
-            Err(JsValue::from_str("index out of bounds"))
+        let walk = self.walk(pw);
+        match walk.entries.get(index) {
+            Some(e) => unpack_entry_to_js(e),
+            None => Err(JsValue::from_str(&format!("index {index} out of bounds"))),
         }
     }
 
-    /// Extract all members. Async.
-    pub async fn extract_all(
-        &self,
-        passwords: Option<JsValue>,
-    ) -> Result<Array, JsValue> {
+    /// Extract every member.
+    ///
+    /// One budget across the whole archive, so `maxMembers`,
+    /// `maxExtractedBytes` and the compression-ratio guard bound the ARCHIVE
+    /// rather than each member of it. A limit reached part-way is reported as a
+    /// final member saying so, because a list that simply ends reads as an
+    /// archive that simply ended.
+    #[wasm_bindgen(js_name = "extractAll")]
+    pub fn extract_all(&mut self, passwords: Option<JsValue>) -> Result<Array, JsValue> {
         let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
-
-        if let Some(zip_entries) = &self.zip_entries {
-            let out = Array::new();
-            for ze in zip_entries {
-                let entry = extract_zip_member_from_source(
-                    &self.file,
-                    &self.reader,
-                    &self.data,
-                    self.file_size,
-                    ze,
-                    &pw,
-                ).await?;
-                out.push(&entry_to_js(&entry)?);
+        let out = Array::new();
+        if !self.is_indexed() {
+            let walk = self.walk(pw);
+            for e in &walk.entries {
+                out.push(&unpack_entry_to_js(e)?);
+            }
+            if let Some(why) = walk.stopped.clone() {
+                out.push(&limit_marker_to_js(&why)?);
             }
             return Ok(out);
         }
-
-        // Buffer fallback: extract all
-        let data = self.ensure_data_loaded().await?;
-        let fmt = self.detected_format
-            .ok_or_else(|| JsValue::from_str("unrecognised archive format"))?;
-        let budget = make_budget(pw);
-        let mut budget = budget;
-        let entries =
-            extract(fmt, &data, &mut budget).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let out = Array::new();
-        for e in &entries {
-            let entry = unpack_entry_to_entry(e);
-            out.push(&entry_to_js(&entry)?);
+        let mut budget = Budget::with_passwords(self.limits.clone(), pw);
+        loop {
+            match self.inner.extract_next(&mut budget) {
+                Ok(Some(e)) => out.push(&unpack_entry_to_js(&e)?),
+                Ok(None) => break,
+                Err(hit) => {
+                    out.push(&limit_marker_to_js(&hit.to_string())?);
+                    break;
+                }
+            };
         }
         Ok(out)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Standalone functions (backward compat + convenience)
+// Standalone functions
 // ---------------------------------------------------------------------------
 
 /// Detect the archive/container format from magic bytes.
-#[wasm_bindgen]
+#[wasm_bindgen(js_name = "detectFormat")]
 pub fn detect_format(data: &[u8]) -> Option<String> {
-    exav_unpack::detect(data).map(|f| format!("{f:?}"))
+    exav_unpack::detect(data).map(format_name)
 }
 
-/// Extract all members from an archive (buffered). Convenience wrapper.
+/// Extract every member from bytes already in memory.
+///
+/// `limits` takes the same object as [`Archive::open`].
 #[wasm_bindgen]
-pub async fn unpack(data: Uint8Array, passwords: Option<JsValue>) -> Result<Array, JsValue> {
-    let archive = Archive::open(data.into()).await?;
-    archive.extract_all(passwords).await
+pub fn unpack(
+    data: Uint8Array,
+    passwords: Option<JsValue>,
+    limits: Option<JsValue>,
+) -> Result<Array, JsValue> {
+    let mut archive = Archive::open(data.into(), limits)?;
+    archive.extract_all(passwords)
+}
+
+/// Rejoin the **multi-volume archives** among a group of files handed over
+/// together — a multi-file drop, a directory picker, a set of uploads.
+///
+/// A set like `big.7z.001`, `.002`, `.003` is one archive cut into pieces at
+/// arbitrary byte offsets. Opened one file at a time, none of them is a
+/// recognisable archive at all; only the whole set is. This is what turns the
+/// group back into files [`Archive::open`] can take.
+///
+/// Input: an array of `{ name: string, data: Uint8Array }`.
+///
+/// Output: an array of `{ name, data: Uint8Array, parts: string[], incomplete }`
+/// — one entry per set. `incomplete` is `null` for a set that rejoined, and
+/// otherwise a string saying why it could not, with `data` holding the pieces
+/// that were present. Those pieces are returned rather than dropped on purpose:
+/// their bytes belong to an archive nothing can now read, and letting them
+/// vanish is precisely the failure this crate exists to prevent.
+///
+/// Files that are not part of a set are simply absent from the result — the
+/// caller already has them. Names are labels: nothing here resolves a path.
+///
+/// Format-aware volumes (RAR `.partN`, ZIP `.zNN`) are not rejoined here. Each
+/// carries its own headers and a member's data resumes *past* the next volume's
+/// header, so concatenating them yields garbage that still looks like an
+/// archive — that join belongs to the format's decoder.
+#[wasm_bindgen(js_name = "joinVolumes")]
+pub fn join_volumes(files: &Array) -> Result<Array, JsValue> {
+    // No cap of its own: the caller already holds every one of these buffers, so
+    // holding them once more is what it asked for.
+    let mut collector = exav_unpack::volume::Collector::new(u64::MAX);
+    for f in files.iter() {
+        let obj = f
+            .dyn_ref::<Object>()
+            .ok_or_else(|| JsValue::from_str("each file must be { name, data }"))?;
+        let name = Reflect::get(obj, &"name".into())?
+            .as_string()
+            .ok_or_else(|| JsValue::from_str("`name` must be a string"))?;
+        let data = Reflect::get(obj, &"data".into())?;
+        let data = data
+            .dyn_ref::<Uint8Array>()
+            .ok_or_else(|| JsValue::from_str("`data` must be a Uint8Array"))?
+            .to_vec();
+        collector.offer(&name, data);
+    }
+    let held = collector.finish();
+    let out = Array::new();
+    for j in held.joined {
+        let obj = Object::new();
+        Reflect::set(&obj, &"name".into(), &JsValue::from_str(&j.name))?;
+        Reflect::set(&obj, &"data".into(), &Uint8Array::from(j.data.as_slice()))?;
+        let parts = Array::new();
+        for p in &j.parts {
+            parts.push(&JsValue::from_str(p));
+        }
+        Reflect::set(&obj, &"parts".into(), &parts)?;
+        Reflect::set(&obj, &"incomplete".into(), &JsValue::NULL)?;
+        out.push(&obj);
+    }
+    for u in held.unjoined {
+        // A lone numbered file is not a set — plenty of ordinary files end in
+        // `.001` — and the caller already has it.
+        let Some(reason) = u.incomplete_set else {
+            continue;
+        };
+        let obj = Object::new();
+        Reflect::set(&obj, &"name".into(), &JsValue::from_str(&u.name))?;
+        Reflect::set(&obj, &"data".into(), &Uint8Array::from(u.data.as_slice()))?;
+        let parts = Array::new();
+        parts.push(&JsValue::from_str(&u.name));
+        Reflect::set(&obj, &"parts".into(), &parts)?;
+        Reflect::set(&obj, &"incomplete".into(), &JsValue::from_str(reason))?;
+        out.push(&obj);
+    }
+    Ok(out)
+}
+
+/// Whether a filename marks a file as one part of a **byte-split** archive
+/// (`big.7z.001`). Names only: nothing is read, so this is cheap enough to run
+/// over a whole directory listing before deciding what to load.
+#[wasm_bindgen(js_name = "isVolumePart")]
+pub fn is_volume_part(name: &str) -> bool {
+    exav_unpack::volume::parse(name).is_some_and(|v| v.scheme.is_byte_split())
 }
