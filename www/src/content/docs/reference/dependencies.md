@@ -4,7 +4,7 @@ description: Full transparency on exav's third-party dependencies — what the d
 ---
 
 exav is a security tool, so what it links is part of its threat model. This page
-lists the dependencies of the shipped binary (`exav-cli`, default features): the
+lists the dependencies of the shipped binary (`exav`, default features): the
 **direct** ones first — what each is for, its license, and its `unsafe`
 posture — then [every transitive crate](#every-transitive-dependency) with the
 direct dependency that pulls it in, so the full supply chain is on one page. The
@@ -40,7 +40,7 @@ The default binary resolves to **151 third-party crates** in total: the 60 direc
 dependencies exav explicitly chose (below) plus
 [91 transitive ones](#every-transitive-dependency).
 
-## CLI & runtime (`exav-cli`)
+## CLI & runtime (`exav`)
 
 | Crate | Purpose | License | `unsafe` posture |
 |---|---|---|---|
@@ -52,7 +52,7 @@ dependencies exav explicitly chose (below) plus
 | [`libc`](https://crates.io/crates/libc) | Syscall bindings for the prefork daemon (signals, resource limits) | MIT OR Apache-2.0 | `unsafe` FFI declarations |
 
 Spilling an oversized stream to a temp file is **not** a dependency: it is
-`exav-cli/src/tmpfile.rs`, a page of `std::fs` with the properties that matter
+`exav/src/tmpfile.rs`, a page of `std::fs` with the properties that matter
 (`O_CREAT|O_EXCL`, so a pre-planted symlink cannot be followed; `0600`; delete on
 drop). The ready-made crates for it reach the filesystem through `rustix` and
 `linux-raw-sys`, which would add more `unsafe` than the rest of the tree
@@ -143,17 +143,17 @@ network fetch never link it.
 
 The tables above are the crates exav *chose*. Those crates pull in their own
 dependencies, and a security tool's real supply chain is the whole closure — so
-here it is: every remaining crate in the default `exav-cli` build, with the
+here it is: every remaining crate in the default `exav` build, with the
 direct dependency (or dependencies) that pulls it in.
 
-The default `exav-cli` build resolves to **159 packages**, five of which are
-exav's own workspace crates (`exav-cli`, `exav-core`, `exav-unpack`,
+The default `exav` build resolves to **159 packages**, five of which are
+exav's own workspace crates (`exav`, `exav-core`, `exav-unpack`,
 `exav-pe-emu`, `exav-x86`). `bitflags`, `hashbrown` and `rustc-hash` each resolve
 at two major versions, so the count of distinct *projects* is lower still. Check
 it against the current lockfile with:
 
 ```sh
-cargo tree -e no-dev -p exav-cli --prefix none | sed 's/ (\*)$//' \
+cargo tree -e no-dev -p exav --prefix none | sed 's/ (\*)$//' \
   | awk '{print $1}' | sort -u | wc -l
 ```
 
@@ -171,7 +171,7 @@ the perceptual image hash), `hashbrown` and `bytemuck` are 2,496 of the 3,490
 occurrences in this table, and none of them sits on a path that parses scanned
 bytes. There are no raw-syscall binding crates here at all — the two that would
 otherwise dominate the count, `rustix` and `linux-raw-sys`, are kept out by
-[writing the daemon's spill file in-tree](#cli--runtime-exav-cli) and by building
+[writing the daemon's spill file in-tree](#cli--runtime-exav) and by building
 `tar` without `xattr`. Reproduce the count with `cargo geiger`, or per crate
 with:
 
@@ -281,7 +281,7 @@ them:
 ```sh
 # Direct + transitive dependencies of the default binary, with licenses.
 # --no-dedupe (or --invert <crate>) is what shows every "pulled in by" edge:
-cargo tree -p exav-cli -e normal --no-dedupe --format "{p} {l}"
+cargo tree -p exav -e normal --no-dedupe --format "{p} {l}"
 
 # Audit advisories, bans, and the license allowlist (also run in CI):
 cargo deny check

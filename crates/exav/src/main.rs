@@ -1149,7 +1149,44 @@ fn metrics_interval(cli: &Cli) -> std::time::Duration {
     std::time::Duration::from_secs(cli.metrics_secs.unwrap_or(DEFAULT_METRICS_SECS))
 }
 
+/// Die quietly when the reader of our output goes away, the way every other
+/// Unix filter does.
+///
+/// Rust's runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so a write to a
+/// closed pipe returns `EPIPE` instead of killing the process — and `println!`
+/// turns that error into a panic. `exav /data | head -3` would then print a Rust
+/// backtrace at a user who did something completely ordinary.
+///
+/// Restoring the default disposition makes the process die on the signal
+/// instead, silently, which is what `head` closing its end is supposed to mean.
+/// The listeners want the opposite — a client hanging up must not stop a daemon
+/// — so each of them sets `SIG_IGN` back when it starts serving.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: `signal` here only sets this process's own disposition for one
+    // signal, before any thread is spawned or any output is written.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
+/// The listener's disposition: a peer that hangs up costs one connection, not
+/// the process. The inverse of [`restore_default_sigpipe`], which `main` runs
+/// first for the sake of the one-shot scan.
+#[cfg(all(unix, feature = "icap"))]
+fn ignore_sigpipe() {
+    // SAFETY: as above — this process's own disposition for one signal, before
+    // any connection is accepted.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
 fn main() -> ExitCode {
+    restore_default_sigpipe();
     let mut cli = Cli::parse();
 
     // Before any role is chosen, so it covers every one of them.
@@ -1554,6 +1591,11 @@ fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
     #[cfg(feature = "icap")]
     if clamd.is_none() {
         let server = icap_server.expect("an icap:// address is the only listener asked for");
+        // A proxy that hangs up mid-response must cost one connection, not the
+        // listener — the same reason the clamd daemon does this. Set here rather
+        // than inside the ICAP module, which is `forbid(unsafe_code)` and stays
+        // that way.
+        ignore_sigpipe();
         return icap::serve_alone(server, db, opts, watch, &reload, metrics_interval(cli));
     }
 

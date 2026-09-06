@@ -27,7 +27,7 @@ path = "src/main.rs"
 # here more than anywhere else in exav: this is the one component where a
 # scanned file supplies control flow rather than data, so the bytes reach the
 # decoder directly and in volume.
-exav-x86 = { path = "../exav-x86", version = "0.1.0" }
+exav-x86 = { path = "../exav-x86", version = "0.0.1" }
 
 # docs.rs builds with every feature on, so the parts gated behind a feature
 # (in particular exav-core's `unstable-internals`) appear on the rendered page

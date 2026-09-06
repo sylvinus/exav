@@ -481,5 +481,5 @@ from `clamd.conf.sample`, both from the upstream `rel/1.4` branch, since no
 `clamd` binary was installed to interrogate — every claim about a `clamd.conf`
 directive's own behaviour is read from those, not run.
 
-exav's side is read from the clap definitions in `exav-cli` and checked by
+exav's side is read from the clap definitions in the `exav` crate and checked by
 running the built binary against each flag.

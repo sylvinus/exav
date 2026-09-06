@@ -23,5 +23,5 @@ let report = scan_path(&scanner, std::path::Path::new("sample.bin"), &ScanOption
 assert!(matches!(report.verdict, Verdict::Clean));
 ```
 
-For the CLI and daemon, see [`exav-cli`](https://crates.io/crates/exav-cli).
+For the CLI and daemon, see [`exav`](https://crates.io/crates/exav).
 Licensed under MIT.

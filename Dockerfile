@@ -32,7 +32,7 @@ COPY . .
 # `--features http` pulls in the standalone exav-update crate so `--auto-update`
 # can fetch from EXAV_SIG_SOURCES. For a smaller, pure-Rust image without the
 # updater, drop it (and set up signatures via a volume/sidecar instead).
-RUN cargo build --release -p exav-cli --features http \
+RUN cargo build --release -p exav --features http \
     && strip target/release/exav
 
 # ---- dirs: an empty, nonroot-owned data dir to COPY in -----------------------

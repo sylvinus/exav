@@ -116,9 +116,10 @@ streams member by member and can stop early.
 | `exav-x86` | An x86-32 decoder with no dependencies |
 | `exav-pe-emu` | Running a packer stub in a sandbox |
 | `exav-update` | Fetching signature databases |
-| `exav-cli` | Nothing — it is a binary, not a library |
+| `exav` | Nothing — it is the binary, not a library |
 
-`exav-cli` publishes no `[lib]` target, so there is no `use exav_cli::…`. Its
+`exav` is the package `cargo install exav` installs, and it publishes no `[lib]`
+target, so there is no `use exav::…`. Its
 job is orchestration: flag parsing, output formatting, the daemon and ICAP
 listeners, the process-level limits. Everything that decides a verdict lives in
 `exav-core` and `exav-unpack`, which is what you embed. To drive the CLI's
@@ -128,7 +129,9 @@ caller, talk to the daemon over the `clamd` protocol or to the
 
 ## Stability
 
-exav is `0.1.x`: any release may break any API. Pin an exact version.
+exav is `0.0.x`: any release may break any API. Cargo treats every `0.0.x` as
+incompatible with the last, so a dependency on one is pinned exactly whatever you
+write.
 
 Modules behind the `unstable-internals` feature (`engine`, `bytecode`,
 `patterns`, `pe`) exist so the tests and diagnostic examples can reach inside.

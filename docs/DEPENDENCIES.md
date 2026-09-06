@@ -23,7 +23,7 @@ So we are deliberate about what we pull in.
 3. **Gate optional capability behind features.** Anything not everyone needs is a
    Cargo feature, so a build only compiles the code and dependencies it uses:
    - **Archive/container formats** are per-format features on `exav-unpack`,
-     forwarded through `exav-core`, `exav-cli`, and the WASM crates. A ZIP-only
+     forwarded through `exav-core`, `exav`, and the WASM crates. A ZIP-only
      build is `--no-default-features --features zip`; it drops every non-ZIP
      extractor and its deps. (A recognised-but-not-compiled format is reported
      `UNSCANNABLE`, never silently clean.)
@@ -33,7 +33,7 @@ So we are deliberate about what we pull in.
 
 4. **Prefer pure-Rust, and keep the tree pruned.** The default build links no C
    and no native JIT. Concretely:
-   - The daemon's stream-spill temp file is in-tree (`exav-cli/src/tmpfile.rs`,
+   - The daemon's stream-spill temp file is in-tree (`exav/src/tmpfile.rs`,
      a page of `std::fs`) and `tar` is built without `xattr`. Together those keep
      the `rustix`/`linux-raw-sys` syscall crates out — 8,624 `unsafe`
      occurrences, which would outweigh the rest of the tree twice over, for code
@@ -162,7 +162,7 @@ binary links it now.** Both x86 call sites run on `exav-x86`:
 `iced-x86` remains in the workspace in exactly one role, as a **test oracle**:
 `exav-x86`'s differential suite, its table generator, and the `x86_decode` fuzz
 target. It is a dev-dependency of one crate and reaches no shipped artifact —
-`cargo tree -e no-dev -p exav-cli` does not list it.
+`cargo tree -e no-dev -p exav` does not list it.
 
 The emulator move was gated on output, not on the tests passing:
 `crates/exav-pe-emu/examples/corpus-outcomes.rs` records the outcome, entry

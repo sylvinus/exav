@@ -16,7 +16,7 @@ name = "exav-grep"
 path = "src/main.rs"
 
 [dependencies]
-exav-unpack = { path = "../exav-unpack", version = "0.1.0", default-features = false, features = ["all-formats"] }
+exav-unpack = { path = "../exav-unpack", version = "0.0.1", default-features = false, features = ["all-formats"] }
 regex = "1"
 clap = { workspace = true }
 walkdir = { workspace = true }

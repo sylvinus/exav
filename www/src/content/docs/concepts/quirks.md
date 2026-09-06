@@ -699,7 +699,7 @@ if you get it wrong.
 **The daemon identifies itself as ClamAV.** `VERSION` over the wire returns
 `ClamAV <flevel-release>/<db-version>/<db-build-time>`, with the build time
 reformatted into the ctime-style stamp `clamdtop` parses for its DBTIME column
-(`crates/exav-cli/src/daemon.rs`). Health checks and monitoring tools parse that
+(`crates/exav/src/daemon.rs`). Health checks and monitoring tools parse that
 string; returning anything else means they don't recognise a scanner is running.
 
 The `clamd` protocol itself has four oddities:

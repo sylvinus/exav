@@ -29,14 +29,26 @@ internal work budget) surfaces as a distinct verdict (`LIMITS-EXCEEDED` /
 
 ## Install
 
-Build from source with a Rust toolchain. **exav needs 1.91 or newer**, which is
-recent enough that a distribution-packaged Rust will often be too old — if the
-build fails on syntax rather than on your code, check `rustc --version` first:
+```sh
+cargo install exav
+```
+
+**exav needs Rust 1.91 or newer**, which is recent enough that a
+distribution-packaged toolchain will often be too old — if the build fails on
+syntax rather than on your code, check `rustc --version` first.
+
+From a clone instead:
 
 ```sh
 git clone https://github.com/sylvinus/exav && cd exav
-cargo build --release -p exav-cli      # -> target/release/exav
+cargo build --release -p exav      # -> target/release/exav
 ```
+
+Prebuilt binaries are attached to each [release][releases], and
+`ghcr.io/sylvinus/exav` is a wire-compatible drop-in for the ClamAV Docker
+image. See [Installation](https://exav.org/getting-started/installation/).
+
+[releases]: https://github.com/sylvinus/exav/releases
 
 ## Quick start
 
@@ -59,8 +71,10 @@ reference, and more.
 
 ## API stability
 
-exav is `0.1.x`, and 0.1 means what SemVer says it means: **any release may
-break any API.** Pin an exact version if you depend on the library crates.
+exav is `0.0.x`, which under Cargo's rules means **every release is treated as
+incompatible with the one before it**: `0.0.1` and `0.0.2` never satisfy the same
+requirement. That is the intent — any release may break any API — and it means a
+dependency on a library crate is already pinned exactly, whatever you write.
 
 Within that, the intent is:
 

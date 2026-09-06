@@ -1,15 +1,22 @@
 [package]
-name = "exav-cli"
+# The package is `exav` so `cargo install exav` installs the scanner, and the
+# binary it ships is `exav` too. The library crates it is built from keep their
+# `exav-*` names.
+name = "exav"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
+# Named explicitly because this package has no library: docs.rs, which crates.io
+# links by default, would render an empty page. The library crates leave it unset
+# and get their docs.rs link.
+documentation = "https://exav.org"
 keywords.workspace = true
 categories = ["command-line-utilities", "filesystem"]
 readme = "README.md"
-description = "Command-line interface and scanning daemon for the exav malware scanner (clamscan-compatible)."
+description = "A fast, memory-safe malware scanner: a clamscan-compatible CLI and a clamd- and ICAP-compatible scanning daemon that load ClamAV's own signature databases."
 
 [[bin]]
 name = "exav"
@@ -106,10 +113,10 @@ machofat = ["exav-core/machofat"]
 sfx = ["exav-core/sfx"]
 
 [dependencies]
-exav-core = { path = "../exav-core", version = "0.1.0", default-features = false }
+exav-core = { path = "../exav-core", version = "0.0.1", default-features = false }
 # Standalone signature updater (its own TLS stack), enabled by the `http`
 # feature so the default pure-Rust build never links it.
-exav-update = { path = "../exav-update", version = "0.1.0", optional = true }
+exav-update = { path = "../exav-update", version = "0.0.1", optional = true }
 clap.workspace = true
 anyhow.workspace = true
 walkdir.workspace = true
@@ -125,7 +132,7 @@ serde_json = "1"
 [dev-dependencies]
 
 # `.deb` packaging via cargo-deb (https://github.com/kornelski/cargo-deb):
-#   cargo build --release -p exav-cli && cargo deb -p exav-cli --no-build
+#   cargo build --release -p exav && cargo deb -p exav --no-build
 # Produces a Debian package that installs the `exav` binary and the optional
 # clamd-compatible systemd unit (disabled by default).
 [package.metadata.deb]

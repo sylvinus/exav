@@ -26,13 +26,13 @@ goblin = "0.10"
 # x86 instruction decoder for the bytecode disasm_x86 API. Decode-only, in the
 # workspace, and dependency-free: a general-purpose decoder covers the whole ISA
 # at the cost of hundreds of `unsafe` blocks, which is a poor trade for one API.
-exav-x86 = { path = "../exav-x86", version = "0.1.0" }
+exav-x86 = { path = "../exav-x86", version = "0.0.1" }
 # archive/container extraction (its own crate). Formats are selected via this
 # crate's forwarding features (see `[features]`); `default-features = false` so a
 # lean build can pick only the formats it needs.
 # gzip+tar are not optional: a `.cvd` is a gzip'd tar, a `.cld` a raw one, so
 # loading any signature database needs both.
-exav-unpack = { path = "../exav-unpack", version = "0.1.0", default-features = false, features = ["gzip", "tar"] }
+exav-unpack = { path = "../exav-unpack", version = "0.0.1", default-features = false, features = ["gzip", "tar"] }
 # fuzzy hashing
 tlsh2 = { version = "0.4", features = ["diff"] }
 # image fuzzy hashing (ClamAV `fuzzy_img#` subsigs). The pinned versions are the

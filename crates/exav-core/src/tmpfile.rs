@@ -18,7 +18,7 @@
 //! * **Cleaned up.** Dropping removes the file (or the directory tree); a crash
 //!   can leave one behind.
 //!
-//! `exav-cli` carries the same file — there it is not test-only, the daemon
+//! The `exav` binary carries the same file — there it is not test-only, the daemon
 //! spills oversized streams through it. The two are meant to stay identical.
 
 #![allow(dead_code)]

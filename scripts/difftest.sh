@@ -302,7 +302,7 @@ HEUR
 
 # ── Phase 2: exav ────────────────────────────────────────────────────────────
 phase_exav() {
-  [ -x "$EXAV" ] || { echo "FATAL: $EXAV not built (cargo build --release -p exav-cli)"; exit 1; }
+  [ -x "$EXAV" ] || { echo "FATAL: $EXAV not built (cargo build --release -p exav)"; exit 1; }
   # A rebuilt exav can bump the database format, making a stale database
   # unloadable — but `--build-db` needs several GB of RAM, so do NOT rebuild
   # merely because the binary is newer. Rebuild when it is missing or fails to

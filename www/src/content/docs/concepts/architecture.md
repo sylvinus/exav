@@ -21,7 +21,7 @@ possible:
 
 See [Streaming & memory](/concepts/streaming-memory/) for the core.
 
-The code is split across a handful of crates — `exav-cli` and the WASI build are
+The code is split across a handful of crates — `exav` and the WASI build are
 the front-ends, `exav-core` is the engine, `exav-unpack` does extraction (and
 backs the standalone `exav-grep`). See
 [How the crates compose](#how-the-crates-compose) below, and
@@ -60,11 +60,11 @@ lets the extraction crates be taken on their own.
 
 <svg viewBox="0 0 790 620" role="img" aria-labelledby="craten crated" style="width:100%;height:auto;max-width:790px">
   <title id="craten">exav crate dependency graph</title>
-  <desc id="crated">Four front ends sit on top: exav-cli, exav-core built for
-  wasm32-wasip1, exav-grep and exav-unpack-wasm. exav-cli and the wasi binary
+  <desc id="crated">Four front ends sit on top: exav, exav-core built for
+  wasm32-wasip1, exav-grep and exav-unpack-wasm. exav and the wasi binary
   depend on exav-core; exav-core, exav-grep and exav-unpack-wasm all depend on
   exav-unpack, which depends on exav-pe-emu, which depends on exav-x86.
-  exav-update hangs off exav-cli alone and feeds signature files out of
+  exav-update hangs off exav alone and feeds signature files out of
   band.</desc>
   <defs>
     <marker id="crate-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
@@ -84,7 +84,7 @@ lets the extraction crates be taken on their own.
     <rect x="4" y="550" width="185" height="62" rx="6"/>
   </g>
   <g fill="currentColor" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="600" text-anchor="middle">
-    <text x="96" y="48">exav-cli</text>
+    <text x="96" y="48">exav</text>
     <text x="295" y="48">exav-core</text>
     <text x="494" y="48">exav-grep</text>
     <text x="693" y="48">exav-unpack-wasm</text>

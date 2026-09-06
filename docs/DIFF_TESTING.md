@@ -114,7 +114,7 @@ either scanner. Use `LIMIT` while iterating.
 Everything below is reproducible from a clean checkout; nothing secret is
 committed (the corpus and the API key are both gitignored).
 
-1. **Build the binary under test** — `cargo build --release -p exav-cli`.
+1. **Build the binary under test** — `cargo build --release -p exav`.
 2. **Tools:** Docker (runs the reference `clamd`), `clamdscan` on the host
    (Debian/Ubuntu: `apt-get install clamdscan`), and `python3` with `pyzipper`
    (`pip install pyzipper`) only if you fetch the corpus.
@@ -169,7 +169,7 @@ committed (the corpus and the API key are both gitignored).
    Build it once when RAM is free. Paths below assume the usual
    `TMPROOT=/var/tmp` (see step 3 of the prerequisites):
    ```sh
-   cargo build --release -p exav-cli      # build the binary under test FIRST
+   cargo build --release -p exav      # build the binary under test FIRST
    exav -d /var/tmp/difdb_daily --build-db /var/tmp/daily.exavdb
    ```
    The harness does this itself when needed, so run it by hand only to control

@@ -22,7 +22,7 @@
 # rather than the inner format and reports "reached all" for images ClamAV never
 # opens — a mistake made and caught while producing docs/VERDICT_PROTOCOL_PLAN.md.
 #
-# REQUIREMENTS: clamscan on PATH; `cargo build --release -p exav-cli` and
+# REQUIREMENTS: clamscan on PATH; `cargo build --release -p exav` and
 # `cargo build -p exav-unpack`.
 set -u
 

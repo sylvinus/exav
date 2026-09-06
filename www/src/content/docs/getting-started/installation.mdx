@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Build exav from source with a Rust toolchain, install packages, run the container, or build the WASM sandbox module.
+description: Install exav with cargo, from a prebuilt binary, as a package, as a container, or build it from source.
 ---
 
 import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
@@ -8,27 +8,34 @@ import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
 exav is cross-platform (Linux, macOS, Windows) and ships as a single static
 binary with no runtime dependencies.
 
-<Aside type="note">
-No prebuilt binaries or `cargo install` release are published yet — building
-from source with a Rust toolchain (1.91+, the workspace `rust-version`) is the
-primary method today. Package
-and release-artifact instructions below describe the intended distribution once
-tagged releases land.
+## From crates.io
+
+```sh
+cargo install exav
+```
+
+That installs the `exav` binary with the default features — YARA, every archive
+format, decryption, and the ICAP server. The package is `exav`; the library
+crates it is built from are the `exav-*` ones, and are not needed to install it.
+
+<Aside type="caution" title="Rust 1.91 or newer">
+A distribution-packaged toolchain is often older than that. If the build fails
+on syntax rather than on your code, check `rustc --version` first — the
+workspace `rust-version` in `Cargo.toml` is authoritative.
 </Aside>
 
 ## Build from source
 
 <Steps>
 
-1. Install a Rust toolchain (1.91 or newer — the workspace `rust-version` in
-   `Cargo.toml` is authoritative) via [rustup](https://rustup.rs/).
+1. Install a Rust toolchain (1.91 or newer) via [rustup](https://rustup.rs/).
 
 2. Clone and build:
 
    ```sh
    git clone https://github.com/sylvinus/exav
    cd exav
-   cargo build --release -p exav-cli      # -> target/release/exav
+   cargo build --release -p exav      # -> target/release/exav
    ./target/release/exav --help
    ```
 
@@ -45,7 +52,7 @@ pure-Rust binary with no TLS stack. For an even smaller build (dropping YARA,
 DLP, and HTTP):
 
 ```sh
-cargo build --release -p exav-cli --no-default-features --features all-formats,decrypt
+cargo build --release -p exav --no-default-features --features all-formats,decrypt
 ```
 
 See [Feature flags](/reference/feature-flags/) for the full list of build-time
@@ -53,7 +60,7 @@ features (including `http` for URL scanning and signature auto-update).
 
 ## Packages & release artifacts
 
-Once tagged releases are published, CI produces these on each `v*` tag:
+CI produces these on each `v*` tag:
 
 <Tabs>
   <TabItem label="Prebuilt binaries">
@@ -64,15 +71,8 @@ Once tagged releases are published, CI produces these on each `v*` tag:
   <TabItem label="Debian / Ubuntu">
     ```sh
     cargo install cargo-deb
-    cargo build --release -p exav-cli
-    cargo deb -p exav-cli --no-build      # binary + optional systemd unit
-    ```
-  </TabItem>
-  <TabItem label="crates.io">
-    Once published:
-
-    ```sh
-    cargo install exav-cli
+    cargo build --release -p exav
+    cargo deb -p exav --no-build      # binary + optional systemd unit
     ```
   </TabItem>
 </Tabs>

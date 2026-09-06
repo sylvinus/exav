@@ -5,7 +5,7 @@ description: Cargo build features for exav — YARA, HTTP, decryption, DLP, and 
 
 exav favors small leaf crates and feature-gates optional capability, so a build
 compiles only what it uses — for control, auditability, `unsafe` surface, and
-binary/WASM size. These are Cargo `--features` on `exav-cli` (they forward
+binary/WASM size. These are Cargo `--features` on `exav` (they forward
 through `exav-core` → `exav-unpack`).
 
 ## Default features
@@ -43,7 +43,7 @@ the default set of none of them:
 |---|---|
 | `exav-unpack` | the leaf — the marker is matched and the fault raised here |
 | `exav-core` | forwards to `exav-unpack/testing-faults` |
-| `exav-cli` | forwards to `exav-core/testing-faults` |
+| `exav` | forwards to `exav-core/testing-faults` |
 | `exav-unpack-wasm` | an independent leaf, keyed on the member *name* |
 
 With it on, a reserved byte marker anywhere in the data reaching the format
@@ -60,7 +60,7 @@ a stack overflow are the two that no in-process boundary can contain, and the
 tests pin which is which.
 
 CI runs the containment suites with it — `make test-native` covers
-`panic_containment` in `exav-unpack` and the `decoder_crash` suite in `exav-cli`,
+`panic_containment` in `exav-unpack` and the `decoder_crash` suite in `exav`,
 each built with the feature so the tests have a decoder that can be asked to
 fail. Without it those tests skip themselves and the question goes unasked. The
 browser package has the parallel path in `npm run test:e2e`, which builds with
@@ -76,13 +76,13 @@ Turn off the defaults and pick only what you need:
 
 ```sh
 # Pure-Rust scanner with no TLS stack (drop YARA + DLP + HTTP):
-cargo build --release -p exav-cli --no-default-features --features all-formats,decrypt
+cargo build --release -p exav --no-default-features --features all-formats,decrypt
 
 # A ZIP-only scanner with YARA:
-cargo build --release -p exav-cli --no-default-features --features yara,zip
+cargo build --release -p exav --no-default-features --features yara,zip
 
 # An updater-only daemon (no SCANURL):
-cargo build --release -p exav-cli --features http-update
+cargo build --release -p exav --features http-update
 ```
 
 ## Per-format features
@@ -105,8 +105,8 @@ machofat · sfx
 `diskimage` covers the virtual disks that need reconstruction (VHDX, QCOW2,
 VMDK); `vhd` is separate because the older format needs no decompressor.
 
-Some extractors are lower-level features that are not forwarded to `exav-cli`,
-so they cannot be named on a `cargo build -p exav-cli` line (all of them are in
+Some extractors are lower-level features that are not forwarded to `exav`,
+so they cannot be named on a `cargo build -p exav` line (all of them are in
 the default `all-formats` build): `stuffit`, `alz`, `egg`, `hwp3`, `ext`, `zoo`,
 `ishieldz`, `pepack`, `javaclass`, `aimodel`, `screnc` and `base64scan`. Select
 those when building `exav-unpack` (or the WASM package) directly.

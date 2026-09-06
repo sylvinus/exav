@@ -31,7 +31,7 @@ the project *is* rather than what changed in it.
 
 ### Memory safety
 
-`#![forbid(unsafe_code)]` on every crate except `exav-cli`, whose only
+`#![forbid(unsafe_code)]` on every crate except `exav`, whose only
 exception is the prefork daemon's process management (`fork`, `waitpid`,
 `setrlimit`, descriptor passing). No scanned byte reaches any of it.
 

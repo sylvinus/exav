@@ -61,6 +61,13 @@
 //! contradicted by a stale table.
 
 #![forbid(unsafe_code)]
+// The decoder is a pure function from `&[u8]` to a description: no allocation,
+// no I/O, no `alloc`. Saying so lets it be used from a kernel, a bootloader or
+// a sandbox, and makes the `no-std` category on crates.io a fact rather than a
+// claim. The tests are the one thing that needs the standard library.
+#![no_std]
+#[cfg(test)]
+extern crate std;
 
 mod generated;
 

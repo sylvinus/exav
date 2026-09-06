@@ -88,7 +88,7 @@ The three-way split inside `NotScanned` is real and worth keeping:
 Each points at a different person, which is the only justification a verdict
 distinction ever needs.
 
-**On the clamd wire** (`crates/exav-cli/src/daemon.rs`), all three become:
+**On the clamd wire** (`crates/exav/src/daemon.rs`), all three become:
 
 ```
 <path>: <TAG> (<reason>) ERROR
@@ -548,7 +548,7 @@ comparison set except the extractors themselves misses it.
 ## Reproducing the measurements
 
 ```sh
-cargo build --release -p exav-cli && cargo build -p exav-unpack
+cargo build --release -p exav && cargo build -p exav-unpack
 # For each container: exav extracts, members are hashed into an .hdb,
 # clamscan rescans the untouched container with every alert flag.
 scripts/clamav-reach.sh crates/exav-unpack/tests/fixtures/{lzw,wim,egg,alz}/*

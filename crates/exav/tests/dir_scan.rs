@@ -1,10 +1,12 @@
-//! `exav DIR` scans the directory's immediate files; `exav -r DIR` descends.
+//! `exav DIR` descends the whole tree; `exav --no-recursive DIR` stops at its
+//! immediate files.
 //!
-//! `clamscan DIR` is a working command line: it scans the files in DIR and
-//! leaves the subdirectories alone. Every expectation below was checked against
-//! ClamAV 1.4.3 on the same trees — a clean directory exits 0 having scanned one
-//! directory and its files, an infected one exits 1, and neither reads a
-//! subdirectory without `-r`.
+//! Recursion is the default because a directory scanned one level deep reads, in
+//! the output, exactly like one that was scanned in full and was clean — the
+//! files never opened are indistinguishable from the files that were fine. That
+//! is the one place exav's default differs from `clamscan DIR`, which needs `-r`
+//! to descend. The counting and exit codes below were checked against ClamAV
+//! 1.4.3 on the same trees: a clean directory exits 0, an infected one exits 1.
 
 use std::process::Command;
 
@@ -24,8 +26,8 @@ fn exav() -> Command {
     c
 }
 
-/// A tree with one clean file beside one infected file in a subdirectory:
-/// without `-r` only the first is reachable, with `-r` both are.
+/// A tree with one clean file beside one infected file in a subdirectory: a
+/// default scan reaches both, `--no-recursive` reaches only the first.
 fn tree() -> (TempDir, TempDir) {
     let db = TempDir::new().unwrap();
     let dir = TempDir::new().unwrap();

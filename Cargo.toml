@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/exav-core", "crates/exav-cli", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update"]
+members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update"]
 exclude = ["fuzz", "crates/exav-unpack-wasm"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
-homepage = "https://github.com/sylvinus/exav"
+homepage = "https://exav.org"
 rust-version = "1.91"
 # crates.io discovery. keywords: max 5, <=20 chars each. categories must be from
 # https://crates.io/category_slugs (an invalid one fails `cargo publish`).

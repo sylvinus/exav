@@ -99,7 +99,7 @@ fn scan_with(marker: &[u8]) -> (Option<i32>, String) {
 ///
 /// Not `cfg!(feature = "testing-faults")`: that asks whether this test crate was
 /// compiled with the flag, and the thing being tested is a separate process. The
-/// two can disagree — the feature has to travel `exav-cli → exav-core →
+/// two can disagree — the feature has to travel `exav → exav-core →
 /// exav-unpack` to reach a decoder, and if it does not arrive, the flag is on
 /// here and the fault is absent there. Asking the binary itself is the only
 /// question worth asking.

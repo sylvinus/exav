@@ -7,7 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
-categories = ["command-line-utilities"]
+# A library, not a CLI: it ships no binary, so `command-line-utilities` would be
+# the wrong shelf for anyone browsing the category.
+categories = ["web-programming::http-client", "filesystem"]
 readme = "README.md"
 description = "Standalone signature-database updater for exav: fetch ClamAV-format CVD containers from a user-supplied mirror (no bundled URL). Isolated so the pure-Rust scanning core links no TLS stack."
 

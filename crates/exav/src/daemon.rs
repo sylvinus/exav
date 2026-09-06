@@ -416,10 +416,14 @@ pub fn run(
 ) -> io::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let conns = Arc::new(AtomicUsize::new(0));
-    // A client that disconnects right after reading a reply would otherwise
-    // deliver SIGPIPE on the next write and (Rust resets SIGPIPE to default)
-    // kill the whole daemon. Ignore it so writes fail per-connection with EPIPE.
+    // A client that disconnects right after reading a reply delivers SIGPIPE on
+    // the next write. `main` set the default disposition — which kills the
+    // process — so that a one-shot scan piped into `head` ends quietly; a
+    // listener wants the opposite. Ignoring it makes the write fail with EPIPE
+    // and cost one connection instead of the daemon.
     #[cfg(unix)]
+    // SAFETY: sets this process's own disposition for one signal, before any
+    // connection is accepted or any worker forked.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
