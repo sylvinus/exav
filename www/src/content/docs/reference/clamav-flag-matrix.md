@@ -115,7 +115,7 @@ Grouped in the order `clamscan --help` prints them.
 
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
-| `--remove[=yes/no]` | Delete infected files | — | absent | [Out of scope by design](/project/comparison-with-clamav/#out-of-scope-for-now): exav reports, your script acts. Exit codes are `clamscan`-compatible. |
+| `--remove[=yes/no]` | Delete infected files | — | absent | [Out of scope by design](/project/comparison-with-clamav/#out-of-scope-for-now): exav reports, your script acts. Read the exit code. |
 | `--move=DIRECTORY` | Move infected files | — | absent | Same. |
 | `--copy=DIRECTORY` | Copy infected files | — | absent | Same. |
 
@@ -174,7 +174,7 @@ command line fails and the change is visible rather than silent.
 ### Alerts
 
 ClamAV has a boolean per condition. exav has two dials: **`--detect`** says what
-to look for, and **`--not-scanned`** says what becomes of an object it could
+to look for, and **`--partial-as`** says what becomes of an object it could
 not fully examine. A boolean each cannot express "all of them" without the reader
 knowing the whole set, and spreading one condition over several switches lets a
 command line ask for two answers at once.
@@ -183,11 +183,11 @@ command line ask for two answers at once.
 |---|---|---|---|---|
 | `--alert-broken[=yes/no]` | Alert on broken PE/ELF | `--detect broken` | renamed | exav also covers Mach-O. |
 | `--alert-broken-media[=yes/no]` | Alert on broken JPEG/TIFF/PNG/GIF | `--detect broken-media` | renamed | |
-| `--alert-encrypted[=yes/no]` | Alert on encrypted archives and documents | `--not-scanned password-protected=alert` | differs | exav reports an encrypted member as `PASSWORD-PROTECTED` **by default** (ClamAV returns a clean `OK`). `alert` converts that verdict into a `Heuristics.Encrypted.*` detection — a verdict question, which is why it is not under `--detect`. |
+| `--alert-encrypted[=yes/no]` | Alert on encrypted archives and documents | `--partial-as password-protected=found` | differs | exav reports an encrypted member as `PASSWORD-PROTECTED` **by default** (ClamAV returns a clean `OK`). `found` converts that verdict into a `Heuristics.Encrypted.*` detection — a verdict question, which is why it is not under `--detect`. |
 | `--alert-encrypted-archive[=yes/no]` | Alert on encrypted archives only | — | absent | The one policy covers archives and documents together. |
 | `--alert-encrypted-doc[=yes/no]` | Alert on encrypted documents only | — | absent | Same. |
 | `--alert-macros[=yes/no]` | Alert on VBA macros in OLE2 | `--detect macros` | renamed | exav also raises it for XLM and OOXML. |
-| `--alert-exceeds-max[=yes/no]` | Alert on files exceeding a limit | `--not-scanned limits-exceeded=alert` | differs | exav reports a limit stop as `LIMITS-EXCEEDED` (exit 2) **by default** rather than as clean. `alert` converts it into a `Heuristics.Limits.Exceeded.*` detection, which is the form a ClamAV-shaped pipeline expects. |
+| `--alert-exceeds-max[=yes/no]` | Alert on files exceeding a limit | `--partial-as limits-exceeded=found` | differs | exav reports a limit stop as `LIMITS-EXCEEDED` (status `PARTIAL`, exit 3) **by default** rather than as clean. `found` converts it into a `Heuristics.Limits.Exceeded.*` detection, which is the form a ClamAV-shaped pipeline expects. |
 | `--alert-phishing-ssl[=yes/no]` | Alert on SSL mismatches in email URLs | `--detect phishing` | renamed | Raises `Heuristics.Phishing.Email.SSL-Spoof` among others; there is no per-check switch. |
 | `--alert-phishing-cloak[=yes/no]` | Alert on cloaked URLs in email | `--detect phishing` | renamed | Same one detector. |
 | `--alert-partition-intersection[=yes/no]` | Alert on overlapping DMG partitions | `--detect partition-intersection` | renamed | exav also covers GPT, APM and MBR. |
@@ -329,10 +329,10 @@ nothing does.
 | `HeuristicAlerts`, `HeuristicScanPrecedence` | Heuristic policy | — | |
 | `AlertBrokenExecutables` | Alert on broken PE/ELF | `--detect broken` | |
 | `AlertBrokenMedia` | Alert on broken graphics | `--detect broken-media` | |
-| `AlertEncrypted` | Alert on encrypted content | `--not-scanned password-protected=alert` | exav reports encrypted members as `PASSWORD-PROTECTED` without it. |
-| `AlertEncryptedArchive` / `AlertEncryptedDoc` | Split encrypted alerts | `--not-scanned password-protected=alert` | One policy covers both. |
+| `AlertEncrypted` | Alert on encrypted content | `--partial-as password-protected=found` | exav reports encrypted members as `PASSWORD-PROTECTED` without it. |
+| `AlertEncryptedArchive` / `AlertEncryptedDoc` | Split encrypted alerts | `--partial-as password-protected=found` | One policy covers both. |
 | `AlertOLE2Macros` | Alert on VBA macros | `--detect macros` | |
-| `AlertExceedsMax` | Alert on a limit stop | `--not-scanned limits-exceeded=alert` | exav reports `LIMITS-EXCEEDED` without it. |
+| `AlertExceedsMax` | Alert on a limit stop | `--partial-as limits-exceeded=found` | exav reports `LIMITS-EXCEEDED` without it. |
 | `AlertPartitionIntersection` | Alert on overlapping partitions | `--detect partition-intersection` | |
 | `AlertPhishingSSLMismatch` / `AlertPhishingCloak` | Phishing alert detail | `--detect phishing` | One detector, no per-check switch. |
 | `StructuredDataDetection` | Enable DLP detection | `--alert-credit-cards` / `--alert-ssns` | Giving a threshold enables it. |
@@ -422,7 +422,7 @@ Two client-mode behaviours have no flag to name them:
 | `--max-object-bytes <SIZE>` | The most memory a single materialized object may use. |
 | `--max-matcher-bytes <SIZE>` | Cumulative bytes fed to the matcher — a CPU bound, not a memory one. |
 | `--spill-dir`, `--spill-threshold-bytes`, `--max-spill-bytes`, `--max-total-spill-bytes` | Where a streamed object waits while it is scanned, and how much RAM and temp space it may take. |
-| `--not-scanned <POLICY>` | What becomes of an object exav could not fully examine: `block`, `alert` or `pass`, whole or per condition. |
+| `--partial-as <POLICY>` | What becomes of an object exav could not fully examine: `block`, `alert` or `pass`, whole or per condition. |
 | `--clamav-compat` | Preset reproducing a stock ClamAV build's limits and extractor set, for differential testing. Reduces detection on purpose. |
 | `--base64 on\|off` | Decode base64-embedded executables in text and script files. On by default. |
 | `--detect packed` | Report `Heuristics.Packed.*`, naming the packer wrapping an executable exav could not unpack. |

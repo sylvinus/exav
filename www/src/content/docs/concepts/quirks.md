@@ -291,7 +291,7 @@ records the regression.)
 
 Two more places encryption shows up as signal:
 
-- `--not-scanned password-protected=alert` turns a password-protected member
+- `--partial-as password-protected=found` turns a password-protected member
   into an actual detection,
   `Heuristics.Encrypted.Zip` / `.RAR` / `.7Zip` / `.PDF` / `.Doc`
   (`encrypted_heuristic_name` in `crates/exav-core/src/lib.rs`).

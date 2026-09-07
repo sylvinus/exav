@@ -5,8 +5,8 @@ description: Scan files, directories, streams, and URLs with exav — output for
 
 import { Aside } from '@astrojs/starlight/components';
 
-exav's CLI is `clamscan`-compatible: the same output format, exit codes, and the
-common flags. This guide covers everyday scanning; see the
+exav prints `clamscan`'s output format. The flags are exav's own, and there is a
+fourth exit code. This guide covers everyday scanning; see the
 [CLI reference](/reference/cli/) for every flag.
 
 ## Targets
@@ -118,14 +118,20 @@ exav /data --exclude '\.log$' --exclude-dir '/node_modules/' --include '\.exe$'
 
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| `0` | Clean — everything fully scanned, no matches. |
-| `1` | At least one detection. |
-| `2` | Error, or a file that couldn't be fully scanned (`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`). |
+Each code is a status word, and the status is the last word on the result line:
 
-This is the [never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean): a file exav
-couldn't finish examining never counts as a pass. See
+| Code | Status | Meaning |
+|---|---|---|
+| `0` | `OK` | Clean — everything fully scanned, no matches. |
+| `1` | `FOUND` | At least one detection. |
+| `2` | `ERROR` | exav could not do its job — an unreadable path, a database that would not load. |
+| `3` | `PARTIAL` | A file couldn't be fully examined: `LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`. |
+
+`3` is the [never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean)
+made visible: a file exav couldn't finish examining never counts as a pass, and
+it is kept apart from `2` so "the scanner broke" and "this object needs a
+decision" are not one signal. [`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes)
+folds `3` into any of the others. See
 [Verdicts & exit codes](/reference/verdicts/) for the full table.
 
 ## Encrypted archives

@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting & FAQ
-description: Common exav questions and problems — the no-database refusal, exit code 2, high memory at load, encrypted/unscannable members, handling false positives, and real-time scanning.
+description: Common exav questions and problems — the no-database refusal, exit code 3, high memory at load, encrypted/unscannable members, handling false positives, and real-time scanning.
 ---
 
 Answers to the questions that come up most often when running exav. See also
@@ -15,15 +15,21 @@ bypass exav exists to prevent. Point `-d`/`--sigs-dir` at a directory (or a preb
 tiny built-in EICAR-only baseline is opt-in for testing via `--allow-no-db`
 (`EXAV_ALLOW_NO_DB=1`).
 
-## exav exits `2` on files ClamAV called clean
+## exav exits `3` on files ClamAV called clean
 
-Exit `2` means **at least one file could not be fully scanned** —
+Exit `3` is status `PARTIAL`: **at least one file could not be fully examined** —
 `LIMITS-EXCEEDED`, `UNSCANNABLE`, or `PASSWORD-PROTECTED`. This is deliberate:
 exav never reports an incompletely-scanned file as clean (see
-[Never silently clean](/concepts/design-principles/#never-a-silent-clean)). In CI, treat exit 2 as "could
-not fully scan", not as a scanner crash. If you are comparing against `clamscan`
-for a differential run, `--clamav-compat` matches its documented limits — but exav
-still surfaces the outcome rather than hiding it.
+[Never silently clean](/concepts/design-principles/#never-a-silent-clean)).
+
+In CI, treat `3` as "not a pass", not as a scanner crash — that is still `2`,
+with the same meaning it has in ClamAV. `--partial-as ok|found|error` folds `3`
+into another status if your pipeline would rather read three codes than four.
+
+If you are comparing against `clamscan` for a differential run, `--clamav-compat`
+matches its documented limits *and* its answer here: it implies `--partial-as ok`,
+so the two agree file for file. On its own the flag changes what exav reports, not
+what it saw — an explicit `--partial-as` after it wins.
 
 ## A file came back `PASSWORD-PROTECTED` or `UNSCANNABLE`
 

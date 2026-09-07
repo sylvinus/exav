@@ -5,10 +5,10 @@ description: Replace clamscan and clamd with exav in place — same signatures, 
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-exav is designed as a **drop-in**: it uses ClamAV's signature formats, matches
-`clamscan`'s output and exit codes and its common flags, and speaks the `clamd`
-wire protocol. In most setups the switch is changing one command or one socket —
-your signature databases, updater, and client tooling stay exactly as they are.
+exav is designed as a **drop-in**: it uses ClamAV's signature formats, prints
+`clamscan`'s output format, and speaks the `clamd` wire protocol. In most setups
+the switch is changing one command or one socket — your signature databases,
+updater, and client tooling stay exactly as they are.
 
 The flags are the part to check first. exav implements the ones day-to-day
 commands use and refuses the ones it does not implement, so a command line
@@ -78,8 +78,10 @@ everything else through:
   your daemon or of the service unit. `--connect HOST:PORT` wraps a client for a
   daemon on another host.
 
-Exit codes are `clamscan`'s: `0` clean, `1` a detection, `2` an error or a file
-exav could not fully scan.
+`clamscan`'s exit codes mean the same thing here — `0` clean, `1` a detection,
+`2` the scanner failed — and there is a fourth, `3`, for a file exav could not
+fully examine. `--partial-as ok` folds it back into `0`, which is what ClamAV
+answers.
 
 A `clamscan` line's flags do not all survive: exav's are its own, and a
 `clamscan` flag exav does not have **stops the run** rather than being ignored,
@@ -164,11 +166,13 @@ exav --max-files 500 /data
 
 | | ClamAV | exav |
 |---|---|---|
-| A file it couldn't fully scan (size/ratio/recursion limit, unsupported codec, encrypted) | often reports `OK`, exit **0** | reports `LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`, exit **2** |
+| A file it couldn't fully scan (size/ratio/recursion limit, unsupported codec, encrypted) | often reports `OK`, exit **0** | status `PARTIAL` under `LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`, exit **3** |
 
 This makes exav *safer* (see [Never silently clean](/concepts/design-principles/#never-a-silent-clean)),
-but a script may notice: a CI job that treats exit 2 as "scanner error" may need
-to treat it as "could not fully scan" — which is not a pass.
+and it is a new code rather than a reused one, so nothing a script already reads
+changes meaning: `2` still means the scanner failed. What a CI job has to add is
+`3`, and it should read it as "not a pass". `--partial-as ok` restores ClamAV's
+answer if that is what the pipeline wants; `--clamav-compat` sets it for you.
 
 By default exav runs at **full capability**. To match a stock ClamAV build's
 documented limits and extractor set for apples-to-apples differential testing,

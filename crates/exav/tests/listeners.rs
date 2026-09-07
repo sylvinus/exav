@@ -132,9 +132,33 @@ fn dial(port: u16, what: &str) -> TcpStream {
     panic!("nothing ever answered on the {what} port {port}");
 }
 
+/// Retry `f` until it answers or the deadline passes.
+///
+/// `dial` succeeds as soon as the listener is bound, which the daemon does
+/// *before* it warms the database and forks its pool — so a connection made in
+/// that window can be reset. Under a loaded test host, every suite running at
+/// once and each daemon forking one worker per core, that window is wide enough
+/// to hit. A real client retries a reset against a daemon that has just started;
+/// a test standing in for one does the same.
+///
+/// This excuses a dropped connection, never a wrong answer: whatever finally
+/// comes back is still asserted on.
+fn until_answered<T>(what: &str, mut f: impl FnMut() -> io::Result<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(e) if Instant::now() >= deadline => {
+                panic!("the daemon never answered a {what}: {e}")
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
 /// Send one clamd `INSTREAM` and return the verdict line.
 fn clamd_instream(port: u16, body: &[u8]) -> String {
-    try_clamd_instream(port, body).expect("the daemon answered the scan")
+    until_answered("scan", || try_clamd_instream(port, body))
 }
 
 /// The same, reporting a dropped connection instead of panicking on it.
@@ -153,13 +177,16 @@ fn try_clamd_instream(port: u16, body: &[u8]) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out).trim_end_matches('\0').into())
 }
 
-/// Send one clamd `PING` and return the reply.
+/// Send one clamd `PING` and return the reply. Retries a dropped connection for
+/// the same reason [`clamd_instream`] does.
 fn clamd_ping(port: u16) -> String {
-    let mut s = dial(port, "clamd");
-    s.write_all(b"zPING\0").unwrap();
-    let mut out = Vec::new();
-    s.read_to_end(&mut out).unwrap();
-    String::from_utf8_lossy(&out).trim_end_matches('\0').into()
+    until_answered("ping", || {
+        let mut s = dial(port, "clamd");
+        s.write_all(b"zPING\0")?;
+        let mut out = Vec::new();
+        s.read_to_end(&mut out)?;
+        Ok(String::from_utf8_lossy(&out).trim_end_matches('\0').into())
+    })
 }
 
 /// Send one ICAP `RESPMOD` carrying `body` and return the whole answer.

@@ -578,7 +578,7 @@ exav emits 60-odd heuristic names, all from code. The parity picture:
 | `Heuristics.PDF.ObfuscatedNameObject` | same | exact parity, on by default |
 | `Heuristics.Zip.OverlappingFiles` | same | exact parity, on by default |
 | `Heuristics.XZ.DicSizeLimit` | same | exact parity, always on (ClamAV has no flag for it either) |
-| `Heuristics.Limits.Exceeded.{MaxScanSize,MaxFileSize,MaxFiles,MaxRecursion}` | same | parity, via `--not-scanned limits-exceeded=alert` |
+| `Heuristics.Limits.Exceeded.{MaxScanSize,MaxFileSize,MaxFiles,MaxRecursion}` | same | parity, via `--partial-as limits-exceeded=found` |
 | `Heuristics.GPTPartitionIntersection`, `…APMPartitionIntersection`, `…MBRPartitionnIntersect` | same | parity, via `--detect partition-intersection`. The doubled `n` is upstream's typo and is reproduced verbatim — the name is the API |
 | `Heuristics.Broken.Executable` | same | parity, via `--detect broken` |
 | `Heuristics.Phishing.Email.SSL-Spoof` | same | parity, via `--detect phishing` |
@@ -635,9 +635,9 @@ fits the three clamd reply shapes (it is a `FOUND`), where exav's needs the
 file is interesting*.
 
 Two of the three bridges exist, and one flag reaches both:
-`--not-scanned password-protected=alert` converts the password-protected
-verdict into `Heuristics.Encrypted.*`, and `--not-scanned
-limits-exceeded=alert` converts a budget stop into
+`--partial-as password-protected=found` converts the password-protected
+verdict into `Heuristics.Encrypted.*`, and `--partial-as
+limits-exceeded=found` converts a budget stop into
 `Heuristics.Limits.Exceeded.<which budget>`. The alert name comes from a typed
 limit kind carried on the error, never from parsing the human-readable reason —
 deriving a detection name from prose is how a reworded message silently becomes

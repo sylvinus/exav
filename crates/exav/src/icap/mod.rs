@@ -23,7 +23,7 @@
 //! |---|---|---|
 //! | `Clean` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message unmodified | — |
 //! | `Infected` | `200 OK` + a block page | `X-Infection-Found: Type=0; Resolution=2; Threat=<name>;` |
-//! | `LimitsExceeded` / `Unscannable` / `PasswordProtected` | `200 OK` + a block page, or the clean answer above when [`PassUnscanned`] covers the tag | `X-Infection-Found` naming `Heuristics.Exav.<Condition>` on a block only, plus `X-Exav-Verdict` + `X-Exav-Reason` either way |
+//! | `LimitsExceeded` / `Unscannable` / `PasswordProtected` | `200 OK` + a block page, or the clean answer above when [`PartialAs`](crate::policy::PartialAs) says `ok` | `X-Infection-Found` naming `Heuristics.Exav.<Condition>` on a block only, plus `X-Exav-Status: PARTIAL` + `X-Exav-Category` + `X-Exav-Reason` either way |
 //!
 //! Every non-clean verdict blocks, and every block says so in the c-icap
 //! vocabulary. Both halves are needed, because ICAP clients split into two
@@ -31,16 +31,15 @@
 //! body instead of the object and stops it, whatever the headers say. A scan
 //! wrapper acts on the headers alone — it hands a file over and greps the
 //! response for `X-Infection-Found`, and a `200` without that header is what it
-//! calls clean. Withholding the header from a not-scanned block therefore turns
+//! calls clean. Withholding the header from a partial block therefore turns
 //! exav's fail-closed answer into a fail-open one on the second kind of client,
 //! which is the one answer exav must never give for an object nobody examined.
 //!
 //! What keeps the two distinguishable is the threat name, not the header's
-//! presence. A database hit is reported under its signature name; a not-scanned
-//! block under `Heuristics.Exav.<Condition>` — the prefix ClamAV uses for a
+//! presence. A database hit is reported under its signature name; //! block under `Heuristics.Exav.<Condition>` — the prefix ClamAV uses for a
 //! policy block rather than a database entry, qualified by the scanner that
 //! synthesised it. An analyst reading an incident log can tell them apart, and
-//! [`X-Exav-Verdict`](IcapConfig) still carries the exact condition for a client
+//! [`X-Exav-Category`](IcapConfig) still carries the exact condition for a client
 //! that reads it. [`InfectionHeader::Detections`] restores the strict split for
 //! a deployment that wants the header to mean a database hit and nothing else.
 //!
@@ -49,7 +48,7 @@
 //!
 //! ## Passing what could not be examined
 //!
-//! Blocking is the default, not the only option. [`PassUnscanned`] lets a
+//! Blocking is the default, not the only option. [`PartialAs`](crate::policy::PartialAs) lets a
 //! deployment take delivery of the objects exav could not fully examine, named
 //! by verdict tag or all at once, which is the trade an upload service makes
 //! when rejecting a user's encrypted archive costs it more than delivering one.
@@ -57,21 +56,21 @@
 //!
 //! A pass here is never silent. It is logged per object, the listener says at
 //! startup that it is running that way, and the response still carries
-//! `X-Exav-Verdict` / `X-Exav-Reason` naming what was skipped — never
+//! `X-Exav-Category` / `X-Exav-Reason` naming what was skipped — never
 //! `X-Infection-Found`, which on a delivered object would be false and would
 //! make the header-only client the setting exists for block it anyway.
 //!
 //! One object cannot be passed whatever the policy says: one past
-//! [`IcapConfig::max_body_bytes`] whose client sent no `Allow: 204`. Its tail was
+//! `--max-input-bytes` whose client sent no `Allow: 204`. Its tail was
 //! discarded to reach the next request boundary, so handing the message back
 //! would mean handing back the head as though it were the whole thing.
 //!
 //! ## What is exav-specific
 //!
 //! c-icap's `virus_scan.MaxObjectSize` lets an object **through unscanned** once
-//! it is larger than the ceiling. [`IcapConfig::max_body_bytes`] is the same knob
+//! it is larger than the ceiling. `--max-input-bytes` is the same knob
 //! with the opposite default: past the ceiling the object is blocked with
-//! `X-Exav-Verdict: LIMITS-EXCEEDED`. [`PassUnscanned`] can ask for c-icap's
+//! `X-Exav-Category: LIMITS-EXCEEDED`. [`PartialAs`](crate::policy::PartialAs) can ask for c-icap's
 //! answer back, and the difference that remains is the one that matters — exav
 //! says which objects it delivered without examining, where c-icap says nothing
 //! at all.
@@ -125,11 +124,12 @@ pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
 
     // Naming services replaces the default set rather than adding to it: an
     // operator who names them means that set exactly, and silently adding the
-    // defaults back would answer on names they did not configure.
-    let services = if cli.icap_service.is_empty() {
-        d.services
-    } else {
-        cli.icap_service.clone()
+    // defaults back would answer on names they did not configure. They come off
+    // the address — the path of the ICAP URL, or `?service=` — because that is
+    // where a proxy's configuration already carries them.
+    let services = match endpoint.as_ref().map(|e| e.services.as_slice()) {
+        Some([]) | None => d.services,
+        Some(named) => named.to_vec(),
     };
 
     Ok(IcapConfig {
@@ -174,7 +174,7 @@ pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
             .max(1024),
         service_label: d.service_label,
         infection_header: cli.icap_infection_header.unwrap_or(d.infection_header),
-        not_scanned: cli.not_scanned.unwrap_or(d.not_scanned),
+        partial_as: cli.partial_as.unwrap_or(d.partial_as),
     })
 }
 
@@ -203,11 +203,11 @@ fn announce(server: &Server) {
     // what it could not examine should be legible from its logs alone — nobody
     // reconstructs a running container's command line to answer "are we
     // delivering unscanned files?".
-    if cfg.not_scanned.any_pass() {
+    if cfg.partial_as.reports_any_as_ok() {
         eprintln!(
             "exav: icap: objects that could not be fully examined are PASSED to the client, \
-             not blocked (--not-scanned {})",
-            cfg.not_scanned
+             not blocked (--partial-as {})",
+            cfg.partial_as
         );
     }
 }

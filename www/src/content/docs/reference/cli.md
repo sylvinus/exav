@@ -238,22 +238,37 @@ One detector list rather than a switch per detector: a boolean each cannot say
 ### What an unscannable object becomes
 
 `--detect` says what to *look for*. What happens to an object exav could not
-fully examine is a different question, and `--not-scanned` is the only flag
+fully examine is a different question, and `--partial-as` is the only flag
 that answers it.
 
-| Value | Effect |
-|---|---|
-| `block` *(default)* | The verdict stands. Exit 2, a clamd `ERROR` reply, an ICAP block. |
-| `alert` | Report it as a detection named `Heuristics.*`. Exit 1, `FOUND`, `X-Infection-Found` — an ordinary hit to any client. |
-| `pass` | Deliver it. Exit 0, `OK`, a `204`. |
+The value **is** the status it reports as, and each status is one exit code — so
+the value names the code you get, with nothing to look up:
 
-It also takes a per-condition list — `--not-scanned
-password-protected=pass,limits-exceeded=alert` — over the three conditions
+| Value | Status | Exit | Effect |
+|---|---|---|---|
+| `partial` *(default)* | `PARTIAL` | 3 | The verdict stands, under its category. A clamd `ERROR` reply, an ICAP block. |
+| `ok` | `OK` | 0 | Deliver it as clean. An ICAP `204`. |
+| `found` | `FOUND` | 1 | Report it as a detection named `Heuristics.*` — an ordinary hit to any client, and what ClamAV's `--alert-exceeds-max` / `--alert-encrypted` produce. |
+| `error` | `ERROR` | 2 | Report it as an operational failure, for a caller that would rather not learn a fourth exit code. |
+
+It also takes a per-category list — `--partial-as
+password-protected=ok,limits-exceeded=found` — over the three categories
 `limits-exceeded`, `unscannable` and `password-protected`.
 
-`pass` is what ClamAV does for an encrypted archive and what `c-icap` does past
+`ok` is what ClamAV does for an encrypted archive and what `c-icap` does past
 `MaxObjectSize`. It is a real trade rather than a mistake, and exav will not make
-it quietly: **every passed object is logged.**
+it quietly: **every such object is logged**, and the listener says so at startup.
+
+`--clamav-compat` implies `--partial-as ok`, because that is what a stock ClamAV
+build answers for this whole class. An explicit value still wins over the preset.
+
+Refused together with `--connect`: the policy belongs to whatever does the
+scanning, and a client only ever sees the reply the daemon already decided.
+
+On the clamd wire, `partial` and `error` are both an `ERROR` reply. That
+protocol's vocabulary is `OK`/`FOUND`/`ERROR`, and a real `clamdscan` reads a
+word outside it as `OK` — a fail-open exav will not risk. They differ only where
+there is an exit code to differ in.
 
 ## Output
 
@@ -288,7 +303,7 @@ Three ways to read them:
 $ printf 'zSTATS\0' | nc 127.0.0.1 3310
 …
 SCANSTATS: scans 3 bytes 20135159 scan-seconds 5.435 mean-ms 1811.617
-  slowest-ms 5382.013 throughput-MBps 3.7 in-flight 0 slow 0 infected 1 not-scanned 0
+  slowest-ms 5382.013 throughput-MBps 3.7 in-flight 0 slow 0 infected 1 partial 0
 MATCHERSTATS: engine=2278.692ms/7calls/60405341b normalize=566.013ms/4calls/40270182b
 END
 ```
@@ -329,35 +344,42 @@ Both take the same address grammar, with the protocol in the value:
 clamd://0.0.0.0:3310         the clamd protocol over TCP
 clamd:///var/run/exav.sock   the clamd protocol over a Unix socket
 icap://0.0.0.0:1344          ICAP (RFC 3507), for a proxy's adaptation hook
+icap://0.0.0.0:1344/avscan   ICAP answering on that service only
 0.0.0.0:3310                 no scheme — clamd
 /var/run/exav.sock           no scheme, a path — clamd over a Unix socket
 ```
 
-A leading `/` is a socket path; anything else is `host:port`. Nothing listens
-without `--listen`, and there is no default address.
+A leading `/` is a socket path; anything else is `host:port`, optionally
+followed by `/<service>` for ICAP. A TCP address without a port is refused rather
+than carried to a bind that fails obscurely. Nothing listens without `--listen`,
+and there is no default address.
 
 ### What belongs to one listener
 
-Two settings ride on the address's `?key=value` tail rather than on a flag,
-because each is a property of *that listener* rather than of the run:
+Some settings belong to *one listener* rather than to the run, so they ride on
+its address instead of on a flag. An ICAP service is the URL path; the rest are a
+`?key=value` tail:
 
-| Option | Default | Meaning |
+| On the address | Default | Meaning |
 |---|---|---|
-| `mode=660` | `0600` | Permission bits for a Unix socket. |
-| `max-connections=200` | `128` clamd, `100` ICAP | Concurrent connections this listener accepts. |
+| `/avscan` *(the path)* | `avscan`, `srv_clamav`, `virus_scan` | The ICAP service to answer on. Naming one replaces the default set. |
+| `?service=a&service=b` | — | Several ICAP services. Repeat the key; a comma separates *addresses*, not names. |
+| `?mode=660` | `0600` | Permission bits for a Unix socket. |
+| `?max-connections=200` | `128` clamd, `100` ICAP | Concurrent connections this listener accepts. |
 
 ```sh
 exav --listen 'clamd:///run/exav.sock?mode=660' \
-     --listen 'icap://0.0.0.0:1344?max-connections=200'
+     --listen 'icap://0.0.0.0:1344/avscan?max-connections=200'
 ```
 
-A flag for either would have to say *which* listener it meant: a socket mode
-applied to a `host:port` means nothing, and a connection cap has to pick a
-protocol — so two listeners would need two flags, and the one without a flag
-would be stuck on a constant. On the address there is exactly one thing each can
-attach to, so there is nothing to cross-check and nothing to get wrong. Both are
-refused where they cannot apply, and an unknown option is an error rather than an
-ignored word.
+A flag for any of these would have to say *which* listener it meant: a socket
+mode applied to a `host:port` means nothing, a connection cap has to pick a
+protocol, and a service name only exists for one of the two. Two listeners would
+need two flags, and the one without a flag would be stuck on a constant. On the
+address there is exactly one thing each can attach to, so there is nothing to
+cross-check and nothing to get wrong. Each is refused where it cannot apply — a
+path on a `clamd://` address, a mode on a `host:port` — and an unknown option is
+an error rather than an ignored word.
 
 `max-connections` bounds the **clamd** listener only under `--workers threads`;
 the prefork pool bounds concurrency by its worker count instead, so a second cap
@@ -452,7 +474,7 @@ container. These tune it; none of them binds anything on its own.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--icap-service <NAME>` | `avscan`, `srv_clamav`, `virus_scan` | Service name in `icap://host/<service>`. Repeatable (comma-separated in the environment); naming any replaces the defaults. |
+| the path of the `--listen` address | `avscan`, `srv_clamav`, `virus_scan` | Service name to answer on — `icap://host:1344/avscan`. Not a flag: it is the path of the URL a proxy is already configured with. Naming one replaces the defaults; `?service=a&service=b` names several. See [address options](#what-belongs-to-one-listener). |
 | `--icap-preview-bytes <N>` | `4096` | Bytes advertised in the `Preview` header. |
 | `--icap-transfer-preview <PATTERN\|off>` | `*` | `Transfer-Preview` value; `off` omits the header. |
 | `?max-connections=` on the address | `100` | Concurrent connections, also advertised as `Max-Connections`. Not a flag — see [address options](#what-belongs-to-one-listener). |
@@ -460,7 +482,7 @@ container. These tune it; none of them binds anything on its own.
 | `--icap-max-requests <N>` | `100` | Requests served on one connection before it is closed. |
 | `--icap-idle-secs <SECS>` | `600` | How long an idle connection is held open. |
 | `--icap-max-header-bytes <N>` | `65536` | Largest ICAP head plus encapsulated HTTP headers. |
-| `--icap-infection-header <WHEN>` | `blocks` | Which blocks carry `X-Infection-Found`: `blocks` (every one; a not-scanned verdict under `Heuristics.Exav.*`) or `detections` (a signature match only). |
+| `--icap-infection-header <WHEN>` | `blocks` | Which blocks carry `X-Infection-Found`: `blocks` (every one; a `PARTIAL` verdict under `Heuristics.Exav.*`) or `detections` (a signature match only). |
 
 There is no ICAP-specific size ceiling. An object's fate is decided by the same
 `--max-input-bytes` and spill budgets a clamd client's is, so the same file gets
@@ -482,7 +504,7 @@ the [ClamAV flag matrix](/reference/clamav-flag-matrix/).
 
 ## Exit codes
 
-`0` clean · `1` at least one detection · `2` error or not-fully-scanned
-(`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`, unless
-`--not-scanned` says otherwise). See
+`0` `OK` clean · `1` `FOUND` a detection · `2` `ERROR` exav could not do its job
+· `3` `PARTIAL` something could not be fully examined (`LIMITS-EXCEEDED` /
+`UNSCANNABLE` / `PASSWORD-PROTECTED`), unless `--partial-as` says otherwise. See
 [Verdicts & exit codes](/reference/verdicts/).

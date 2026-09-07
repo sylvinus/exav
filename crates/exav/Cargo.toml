@@ -16,7 +16,7 @@ documentation = "https://exav.org"
 keywords.workspace = true
 categories = ["command-line-utilities", "filesystem"]
 readme = "README.md"
-description = "A fast, memory-safe malware scanner: a clamscan-compatible CLI and a clamd- and ICAP-compatible scanning daemon that load ClamAV's own signature databases."
+description = "A fast, memory-safe malware scanner: a scanning CLI and a clamd- and ICAP-compatible daemon that load ClamAV's own signature databases, with no file-size limit."
 
 [[bin]]
 name = "exav"
@@ -144,9 +144,10 @@ section = "utils"
 priority = "optional"
 depends = "$auto"
 extended-description = """\
-A drop-in, memory-safe ClamAV replacement written in Rust: a clamscan-compatible \
-CLI and a clamd-compatible scanning daemon that load ClamAV's own signature \
-databases, with no file-size limit and constant-memory streaming."""
+A memory-safe malware scanner written in Rust: a scanning CLI and a clamd- and \
+ICAP-compatible daemon that load ClamAV's own signature databases, with no \
+file-size limit and constant-memory streaming. Its output format and exit codes \
+match clamscan's; its flags are its own."""
 assets = [
     ["target/release/exav", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/exav/README.md", "644"],

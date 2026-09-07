@@ -469,13 +469,20 @@ pub enum Verdict {
 /// cost of the break is small and lands on the people who caused it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictCategory {
-    /// Fully scanned, nothing found. Exit contribution: `0`.
+    /// Fully scanned, nothing found. Reported `OK`, exit `0`.
     Clean,
-    /// A signature matched. Exit contribution: `1`.
+    /// A signature matched. Reported `FOUND`, exit `1`.
     Infected,
-    /// Could not be fully examined (limit/undecodable/encrypted) — never a
-    /// silent pass. Exit contribution: `2`.
-    NotScanned,
+    /// Work happened and stopped short of the end: a budget ran out, a
+    /// container would not decode, or the content is encrypted. Reported
+    /// `PARTIAL` under one of the three categories
+    /// ([`Verdict::status_tag`]), exit `3` — never a silent pass.
+    ///
+    /// Distinct from an *error*, which is exav failing to do its job at all
+    /// (an unreadable path, a database that would not load) and exits `2`.
+    /// A caller needs to tell "the scanner is broken" from "this object needs
+    /// a decision", so they do not share a code.
+    Partial,
 }
 
 impl Verdict {
@@ -486,7 +493,7 @@ impl Verdict {
             Verdict::Infected { .. } => VerdictCategory::Infected,
             Verdict::LimitsExceeded { .. }
             | Verdict::Unscannable { .. }
-            | Verdict::PasswordProtected { .. } => VerdictCategory::NotScanned,
+            | Verdict::PasswordProtected { .. } => VerdictCategory::Partial,
         }
     }
 
@@ -504,7 +511,7 @@ impl Verdict {
     }
 
     /// The human-readable detail: the signature name for `Infected`, the reason
-    /// string for the not-scanned verdicts, `None` for `Clean`.
+    /// string for the partial verdicts, `None` for `Clean`.
     pub fn detail(&self) -> Option<&str> {
         match self {
             Verdict::Clean => None,
@@ -1081,12 +1088,7 @@ pub fn scan_path(db: &Scanner, path: &Path, opts: &ScanOptions) -> io::Result<Sc
                     Vec::new(),
                 ));
             }
-            return Ok(ScanReport::limits(
-                format!(
-                    "file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"
-                ),
-                Vec::new(),
-            ));
+            return Ok(max_file_size_report(size, max, opts));
         }
     }
 
@@ -1321,12 +1323,7 @@ pub fn scan_seekable<R: Read + Seek>(
                     Vec::new(),
                 ));
             }
-            return Ok(ScanReport::limits(
-                format!(
-                    "file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"
-                ),
-                Vec::new(),
-            ));
+            return Ok(max_file_size_report(size, max, opts));
         }
     }
     let mut prefix = [0u8; 4096];
@@ -1436,6 +1433,32 @@ fn limits_alert_name(kind: unpack::LimitKind) -> Option<&'static str> {
         // one budget's name on another budget's stop.
         _ => None,
     }
+}
+
+/// The report for a top-level file larger than `max_scan_size`.
+///
+/// This is ClamAV's `MaxFileSize` condition, so under `--partial-as found` it
+/// reports under ClamAV's own name for it. The two entry points that enforce the
+/// ceiling reached this by way of a bare `ScanReport::limits`, which named it
+/// `Heuristics.Exav.LimitsExceeded` — a name no ClamAV-shaped pipeline matches,
+/// for the one limit ClamAV does have a name for. The kind is passed as a type
+/// here, as everywhere else, so the name is looked up and never guessed.
+fn max_file_size_report(size: u64, max: u64, opts: &ScanOptions) -> ScanReport {
+    let reason = format!("file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only");
+    if opts.alert_exceeds_max {
+        if let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize) {
+            match_loc_record();
+            return ScanReport {
+                verdict: Verdict::Infected {
+                    signature: name.to_string(),
+                    offset: 0,
+                    method: Method::Heuristic,
+                },
+                findings: Vec::new(),
+            };
+        }
+    }
+    ScanReport::limits(reason, Vec::new())
 }
 
 /// Turn a budget stop into an outcome, honouring `--alert-exceeds-max`.
@@ -2370,7 +2393,7 @@ fn analyze_all_raw(
 }
 
 /// Every detection on `data`, as [`analyze_all_with_outcome`], discarding the
-/// not-scanned outcome.
+/// partial outcome.
 ///
 /// Callers that report to a user want [`analyze_all_with_outcome`]: dropping the
 /// outcome turns "this file was not fully scanned" into silence, and an empty
@@ -2380,7 +2403,7 @@ pub fn analyze_all(db: &Scanner, data: &[u8], opts: &ScanOptions) -> Vec<(String
     analyze_all_with_outcome(db, data, opts).0
 }
 
-/// The not-scanned outcome of an all-match scan, when there is one.
+/// The partial outcome of an all-match scan, when there is one.
 ///
 /// All-match and a normal scan may legitimately differ in HOW MANY signatures
 /// they list. They must never differ on whether the file was fully scanned —
@@ -4092,7 +4115,7 @@ mod tests {
                 Verdict::LimitsExceeded {
                     reason: "too big".into(),
                 },
-                VerdictCategory::NotScanned,
+                VerdictCategory::Partial,
                 "LIMITS-EXCEEDED",
                 Some("too big"),
             ),
@@ -4100,7 +4123,7 @@ mod tests {
                 Verdict::Unscannable {
                     reason: "rar ppmd".into(),
                 },
-                VerdictCategory::NotScanned,
+                VerdictCategory::Partial,
                 "UNSCANNABLE",
                 Some("rar ppmd"),
             ),
@@ -4108,7 +4131,7 @@ mod tests {
                 Verdict::PasswordProtected {
                     reason: "encrypted".into(),
                 },
-                VerdictCategory::NotScanned,
+                VerdictCategory::Partial,
                 "PASSWORD-PROTECTED",
                 Some("encrypted"),
             ),
@@ -4446,7 +4469,7 @@ mod tests {
     ///
     /// The bytes it failed to deliver still exist — this is not truncation,
     /// where the content really is absent and a clean answer is honest — so
-    /// the only truthful outcomes are a detection, a not-scanned verdict, or an
+    /// the only truthful outcomes are a detection, a partial verdict, or an
     /// error to the caller.
     #[test]
     fn a_source_that_fails_on_re_read_is_never_reported_clean() {

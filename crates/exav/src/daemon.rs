@@ -30,19 +30,24 @@
 //!                             run through full container-aware analysis, and the
 //!                             reply is ONE line of compact JSON with the nested
 //!                             match location. Schema (compact, no raw newlines):
-//!                               {"v":1,"verdict":"clean"}
-//!                               {"v":1,"verdict":"malware","signature":S
+//!                               {"status":"OK","v":1}
+//!                               {"v":1,"status":"FOUND","signature":S
 //!                                 [,"location":"outer.zip/…/inside.txt"]}
 //!                                 (location present only for a NESTED hit; it is
 //!                                 the `/`-joined container member-name path from
 //!                                 the stream to the matched leaf — control bytes
 //!                                 sanitised, capped ~512 chars)
-//!                               {"v":1,"verdict":"unscannable","tag":T[,"message":M]}
-//!                                 (T ∈ LIMITS-EXCEEDED / UNSCANNABLE /
-//!                                 PASSWORD-PROTECTED — a not-fully-scanned stream
-//!                                 is unscannable, NEVER clean)
-//!                               {"v":1,"verdict":"error","message":M}
-//!                                 (transient/infra failure the client may retry)
+//!                               {"v":1,"status":"PARTIAL","category":C[,"reason":R]}
+//!                                 (C ∈ LIMITS-EXCEEDED / UNSCANNABLE /
+//!                                 PASSWORD-PROTECTED / TRUNCATED — a stream that
+//!                                 was not fully scanned is PARTIAL, NEVER OK)
+//!                               {"v":1,"status":"ERROR","reason":R}
+//!                                 (transient/infra failure the client may retry,
+//!                                 or a PARTIAL under `--partial-as error`)
+//!                             `status` is the same four-word vocabulary the CLI
+//!                             prints and `--json` emits, and each word names the
+//!                             exit code a one-shot scan would give: OK 0,
+//!                             FOUND 1, ERROR 2, PARTIAL 3.
 //!                             Verdict classification matches INSTREAM (a
 //!                             detection beats a limit; one detection per scan).
 //!                             Unknown to old clients → `UNKNOWN COMMAND` (below).
@@ -913,10 +918,13 @@ extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
     const MSG: &[u8] = b"exav: scan exceeded --max-scan-time\n";
     unsafe {
         libc::write(2, MSG.as_ptr().cast(), MSG.len());
-        // Exit 2, the code for "not scanned", rather than the pool's dedicated
-        // timeout code: to a caller this is one more file exav declined to call
-        // clean, and it should sort with the others.
-        libc::_exit(2)
+        // Exit 3, the `PARTIAL` code, rather than the pool's dedicated timeout
+        // code: a scan that ran out of time is one more object exav declined to
+        // call clean, and it should sort with the others. The handler cannot
+        // consult `--partial-as` — reading it here would not be
+        // async-signal-safe — so a run that folds partials elsewhere still gets
+        // 3 from this path alone.
+        libc::_exit(3)
     }
 }
 
@@ -1771,13 +1779,13 @@ fn write_reply<W: Write>(w: &mut W, id: Option<u64>, reply: &str, delim: Delim) 
 }
 
 /// Format a scan verdict into a clamd-style reply line, from the shared
-/// [`exav_core::Verdict`] classification. A not-scanned verdict is surfaced as
+/// [`exav_core::Verdict`] classification. A partial verdict is surfaced as
 /// `<TAG> (<reason>) ERROR` (never `OK`) so the never-silent-skip invariant
 /// holds on the wire, and the tag/detail come from the same source the one-shot
 /// CLI uses — the two surfaces cannot drift apart.
 fn verdict_line(target: &str, report: &ScanReport) -> String {
     let mut owned;
-    let report = if report.verdict.category() == VerdictCategory::NotScanned {
+    let report = if report.verdict.category() == VerdictCategory::Partial {
         owned = report.clone();
         crate::policy::apply(&mut owned, crate::policy::current());
         &owned
@@ -1788,11 +1796,29 @@ fn verdict_line(target: &str, report: &ScanReport) -> String {
     match v.category() {
         VerdictCategory::Infected => format!("{target}: {} FOUND", v.detail().unwrap_or_default()),
         VerdictCategory::Clean => format!("{target}: OK"),
-        VerdictCategory::NotScanned => format!(
-            "{target}: {} ({}) ERROR",
-            v.status_tag(),
-            v.detail().unwrap_or_default()
-        ),
+        // The same grammar the one-shot CLI prints — `reason CATEGORY STATUS` —
+        // so the two surfaces do not describe one verdict two ways. Only the
+        // status word differs, and it has to: clamd's vocabulary is `OK`,
+        // `FOUND` and `ERROR`, and a real client reads a word outside it as
+        // `OK`. Measured against clamdscan 1.4.3, which rewrites an unknown
+        // status to `OK` and exits 0 — so `PARTIAL` on this wire would turn
+        // exav's fail-closed answer into a fail-open one at every existing
+        // client. `ERROR` is the only word here that fails closed.
+        //
+        // The category is what tells the two apart, so `--partial-as error`
+        // drops it: it asks for this object to be an operational failure, and a
+        // categorised reply is exactly what an exav client reads back as a
+        // partial and exits 3 for. The reason still says what happened.
+        VerdictCategory::Partial => {
+            let reason = v.detail().unwrap_or_default();
+            if crate::policy::current().for_tag(v.status_tag())
+                == crate::policy::PartialStatus::Error
+            {
+                format!("{target}: {reason} ERROR")
+            } else {
+                format!("{target}: {reason} {} ERROR", v.status_tag())
+            }
+        }
     }
 }
 
@@ -1810,7 +1836,7 @@ fn scan_one_path(db: &Scanner, opts: &ScanOptions, path: &str) -> String {
     }));
     let category = match &scanned {
         Ok(Ok(report)) => report.verdict.category().into(),
-        _ => crate::metrics::Category::NotScanned,
+        _ => crate::metrics::Category::Partial,
     };
     timer.finish(path, size, category);
     match scanned {
@@ -2127,8 +2153,8 @@ fn scan_payload_timed(
     let category = match &result {
         Ok((report, _)) => report.verdict.category().into(),
         // A scan that failed is a scan that did not finish, which is the
-        // not-scanned column wherever else exav counts it.
-        Err(_) => crate::metrics::Category::NotScanned,
+        // partial column wherever else exav counts it.
+        Err(_) => crate::metrics::Category::Partial,
     };
     timer.finish(target, payload.len(), category);
     result
@@ -2210,14 +2236,14 @@ fn exinstream<R: Read>(
     // connection will not be reusable.
     let _reached_terminator = stream.drain()?;
     if over {
-        return Ok(json_unscannable(
+        return Ok(json_partial(
             "LIMITS-EXCEEDED",
             Some("stream exceeds max-filesize; not fully scanned"),
         ));
     }
     // As in INSTREAM: a prefix is not the file, so it gets no verdict.
     if truncated {
-        return Ok(json_unscannable(
+        return Ok(json_partial(
             "TRUNCATED",
             Some("stream ended before its terminator; not fully received"),
         ));
@@ -2335,20 +2361,20 @@ fn exinstream_multi<R: Read>(
         }
         let fields = if over {
             json!({
-                "verdict": "unscannable",
-                "tag": "LIMITS-EXCEEDED",
-                "message": "stream exceeds max-filesize; not fully scanned",
+                "status": "PARTIAL",
+                "category": "LIMITS-EXCEEDED",
+                "reason": "stream exceeds max-filesize; not fully scanned",
             })
         } else if truncated {
             json!({
-                "verdict": "unscannable",
-                "tag": "TRUNCATED",
-                "message": "stream ended before its terminator; not fully received",
+                "status": "PARTIAL",
+                "category": "TRUNCATED",
+                "reason": "stream ended before its terminator; not fully received",
             })
         } else {
             match scan_payload_timed(db, opts, &payload, &name) {
                 Ok((report, loc)) => verdict_fields(&report, loc),
-                Err(e) => json!({"verdict": "error", "message": format!("scan error: {e}")}),
+                Err(e) => json!({"status": "ERROR", "reason": format!("scan error: {e}")}),
             }
         };
         match &payload {
@@ -2391,7 +2417,7 @@ fn exinstream_multi<R: Read>(
         // The archive's verdict replaces the part's own `clean`: on its own the
         // part decoded to nothing, so that `clean` says only "this fragment is
         // not itself malware". A verdict the part earned by itself stands.
-        if entries[i]["verdict"] != "clean" {
+        if entries[i]["status"] != "OK" {
             continue;
         }
         entries[i] = named_entry(&v.name, verdict_fields(&v.report, None), Some(&v.set));
@@ -2427,7 +2453,7 @@ fn named_entry(name: &str, fields: serde_json::Value, set: Option<&str>) -> serd
 fn verdict_fields(report: &ScanReport, location: Option<String>) -> serde_json::Value {
     use serde_json::json;
     let mut owned;
-    let report = if report.verdict.category() == VerdictCategory::NotScanned {
+    let report = if report.verdict.category() == VerdictCategory::Partial {
         owned = report.clone();
         crate::policy::apply(&mut owned, crate::policy::current());
         &owned
@@ -2435,11 +2461,17 @@ fn verdict_fields(report: &ScanReport, location: Option<String>) -> serde_json::
         report
     };
     let v = &report.verdict;
+    // `status` / `category` / `reason` — the same three names the one-shot
+    // `--json` uses, so one schema describes both. The old `verdict`/`tag`/
+    // `message` trio named the same things differently here, and its
+    // `"unscannable"` collided with the *category* of that name: a
+    // `{"verdict":"unscannable","tag":"PASSWORD-PROTECTED"}` read as a
+    // contradiction.
     match v.category() {
-        VerdictCategory::Clean => json!({"verdict": "clean"}),
+        VerdictCategory::Clean => json!({"status": "OK"}),
         VerdictCategory::Infected => {
             let mut o = json!({
-                "verdict": "malware",
+                "status": "FOUND",
                 "signature": v.detail().unwrap_or_default(),
             });
             // `location` only for a nested hit; omitted for a top-level match.
@@ -2448,10 +2480,17 @@ fn verdict_fields(report: &ScanReport, location: Option<String>) -> serde_json::
             }
             o
         }
-        VerdictCategory::NotScanned => {
-            let mut o = json!({"verdict": "unscannable", "tag": v.status_tag()});
+        VerdictCategory::Partial => {
+            let status = if crate::policy::current().for_tag(v.status_tag())
+                == crate::policy::PartialStatus::Error
+            {
+                "ERROR"
+            } else {
+                "PARTIAL"
+            };
+            let mut o = json!({"status": status, "category": v.status_tag()});
             if let Some(m) = v.detail() {
-                o["message"] = json!(m);
+                o["reason"] = json!(m);
             }
             o
         }
@@ -2460,8 +2499,9 @@ fn verdict_fields(report: &ScanReport, location: Option<String>) -> serde_json::
 
 /// Render a scan verdict as one line of compact JSON for `EXINSTREAM`.
 fn verdict_json(report: &ScanReport, location: Option<String>) -> String {
-    // `"v"` first: the reply is a documented wire schema and key order is part
-    // of what clients have already been handed.
+    // `"v"` is the schema version every reply carries. Key *order* is not part
+    // of the contract — the object is serialised with sorted keys, and a JSON
+    // consumer reads by name — so nothing here depends on where it lands.
     let mut o = serde_json::json!({"v": 1});
     if let Some(fields) = verdict_fields(report, location).as_object() {
         for (k, val) in fields {
@@ -2472,13 +2512,13 @@ fn verdict_json(report: &ScanReport, location: Option<String>) -> String {
 }
 
 fn json_error(message: &str) -> String {
-    serde_json::json!({"v": 1, "verdict": "error", "message": message}).to_string()
+    serde_json::json!({"v": 1, "status": "ERROR", "reason": message}).to_string()
 }
 
-fn json_unscannable(tag: &str, message: Option<&str>) -> String {
-    let mut o = serde_json::json!({"v": 1, "verdict": "unscannable", "tag": tag});
+fn json_partial(tag: &str, message: Option<&str>) -> String {
+    let mut o = serde_json::json!({"v": 1, "status": "PARTIAL", "category": tag});
     if let Some(m) = message {
-        o["message"] = serde_json::json!(m);
+        o["reason"] = serde_json::json!(m);
     }
     o.to_string()
 }
@@ -2827,14 +2867,14 @@ mod tests {
     fn exinstream_clean() {
         assert_eq!(
             one(&exinstream_msg(b"totally benign content"), 0),
-            r#"{"v":1,"verdict":"clean"}"#
+            r#"{"status":"OK","v":1}"#
         );
     }
 
     #[test]
     fn exinstream_eicar_top_level_no_location() {
         let r = one(&exinstream_msg(EICAR), 0);
-        assert!(r.contains(r#""verdict":"malware""#), "got {r}");
+        assert!(r.contains(r#""status":"FOUND""#), "got {r}");
         assert!(r.contains(r#""signature":"#), "got {r}");
         assert!(
             !r.contains("location"),
@@ -2845,14 +2885,14 @@ mod tests {
     #[test]
     fn exinstream_eicar_in_zip_has_location() {
         let r = one(&exinstream_msg(ZIP_EICAR_INSIDE), 0);
-        assert!(r.contains(r#""verdict":"malware""#), "got {r}");
+        assert!(r.contains(r#""status":"FOUND""#), "got {r}");
         assert!(r.contains(r#""location":"inside.txt""#), "got {r}");
     }
 
     #[test]
     fn exinstream_zip_in_zip_full_path() {
         let r = one(&exinstream_msg(ZIP_IN_ZIP_EICAR), 0);
-        assert!(r.contains(r#""verdict":"malware""#), "got {r}");
+        assert!(r.contains(r#""status":"FOUND""#), "got {r}");
         assert!(
             r.contains(r#""location":"inner.zip/inside.txt""#),
             "nested path chain expected, got {r}"
@@ -2890,9 +2930,9 @@ mod tests {
         let files = v["files"].as_array().expect("files array");
         assert_eq!(files.len(), 2, "got {r}");
         assert_eq!(files[0]["name"], "a.txt");
-        assert_eq!(files[0]["verdict"], "clean");
+        assert_eq!(files[0]["status"], "OK");
         assert_eq!(files[1]["name"], "b.txt");
-        assert_eq!(files[1]["verdict"], "malware", "got {r}");
+        assert_eq!(files[1]["status"], "FOUND", "got {r}");
     }
 
     #[test]
@@ -2904,7 +2944,7 @@ mod tests {
         for (name, part) in &parts {
             let solo = one(&exinstream_msg(part), 0);
             assert!(
-                solo.contains(r#""verdict":"clean""#),
+                solo.contains(r#""status":"OK""#),
                 "{name} is detectable alone — the fixture proves nothing: {solo}"
             );
         }
@@ -2919,7 +2959,7 @@ mod tests {
         let files = v["files"].as_array().expect("files array");
         assert_eq!(files.len(), 3, "got {r}");
         for f in files {
-            assert_eq!(f["verdict"], "malware", "every part is a piece of it: {r}");
+            assert_eq!(f["status"], "FOUND", "every part is a piece of it: {r}");
             assert_eq!(f["set"], "payload.zip", "named for the archive: {r}");
         }
     }
@@ -2938,7 +2978,7 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&r).unwrap_or_else(|e| panic!("{e}: {r}"));
         for f in v["files"].as_array().expect("files array") {
-            assert_eq!(f["verdict"], "unscannable", "got {r}");
+            assert_eq!(f["status"], "PARTIAL", "got {r}");
         }
     }
 
@@ -2949,7 +2989,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&r).unwrap_or_else(|e| panic!("{e}: {r}"));
         let files = v["files"].as_array().expect("files array");
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0]["verdict"], "clean", "got {r}");
+        assert_eq!(files[0]["status"], "OK", "got {r}");
     }
 
     #[test]
@@ -2958,15 +2998,15 @@ mod tests {
         // never sends MULTI must not be able to tell this landed.
         assert_eq!(
             one(&exinstream_msg(b"hello"), 0),
-            r#"{"v":1,"verdict":"clean"}"#
+            r#"{"status":"OK","v":1}"#
         );
     }
 
     #[test]
     fn exinstream_password_protected() {
         let r = one(&exinstream_msg(ZIP_ENCRYPTED), 0);
-        assert!(r.contains(r#""verdict":"unscannable""#), "got {r}");
-        assert!(r.contains(r#""tag":"PASSWORD-PROTECTED""#), "got {r}");
+        assert!(r.contains(r#""status":"PARTIAL""#), "got {r}");
+        assert!(r.contains(r#""category":"PASSWORD-PROTECTED""#), "got {r}");
     }
 
     #[test]
@@ -2982,9 +3022,9 @@ mod tests {
             0,
             opts,
         );
-        assert!(r.contains(r#""verdict":"unscannable""#), "got {r}");
+        assert!(r.contains(r#""status":"PARTIAL""#), "got {r}");
         assert!(
-            !r.contains(r#""verdict":"clean""#),
+            !r.contains(r#""status":"OK""#),
             "must never be clean: {r}"
         );
     }

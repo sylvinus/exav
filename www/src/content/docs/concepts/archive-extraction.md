@@ -255,7 +255,7 @@ malware distribution actually uses (`infected`, `virus`, …). Beyond that,
 
 An archive that stays encrypted is still not nothing: "this member is encrypted"
 is itself a detectable property via `.cdb` signatures, and
-`--not-scanned password-protected=alert` turns it into a detection.
+`--partial-as password-protected=found` turns it into a detection.
 
 ## Hostile input, everywhere
 

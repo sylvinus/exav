@@ -69,7 +69,7 @@ reports `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED` rather than
 of them will reasonably choose to deliver the object anyway rather than reject a
 user's upload.
 
-Where a deployment makes that choice — [`--not-scanned pass`](/guides/icap/)
+Where a deployment makes that choice — [`--partial-as ok`](/guides/icap/)
 is the one that does — it is opt-in, named per verdict, announced at startup,
 logged per object, and still reported in the response. What the invariant rules
 out is not an operator accepting a risk; it is a scanner *hiding* one. A pass

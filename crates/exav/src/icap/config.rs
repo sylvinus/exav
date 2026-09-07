@@ -17,8 +17,8 @@ pub(super) const DEFAULT_PORT: u16 = 1344;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum InfectionHeader {
     /// Every block carries it. A signature match is reported under its own
-    /// name; a not-scanned verdict under a `Heuristics.Exav.*` name that says
-    /// which condition blocked it, alongside the `X-Exav-Verdict` /
+    /// name; a partial verdict under a `Heuristics.Exav.*` name that says
+    /// which condition blocked it, alongside the `X-Exav-Category` /
     /// `X-Exav-Reason` pair that spells it out for a client that reads them.
     #[default]
     Blocks,
@@ -92,8 +92,8 @@ pub(crate) struct IcapConfig {
     pub infection_header: InfectionHeader,
     /// What becomes of an object exav could not fully examine.
     ///
-    /// Not an ICAP setting — `--not-scanned` answers the same question for
-    /// the CLI's exit code and the daemon's reply — but the listener needs it in
+    /// Not an ICAP setting — `--partial-as` answers the same question for the
+    /// CLI's exit code and the daemon's reply — but the listener needs it in
     /// hand to shape a response, and to say at startup that it is running that
     /// way.
     ///
@@ -101,7 +101,7 @@ pub(crate) struct IcapConfig {
     /// passes an oversized object, and ClamAV calls an encrypted archive clean
     /// unless asked not to. exav starts from the opposite end and makes each of
     /// those a named, logged choice.
-    pub not_scanned: crate::policy::NotScanned,
+    pub partial_as: crate::policy::PartialAs,
 }
 
 impl Default for IcapConfig {
@@ -126,7 +126,7 @@ impl Default for IcapConfig {
             max_header_bytes: 64 * 1024,
             service_label: format!("exav/{} ICAP service", super::VERSION),
             infection_header: InfectionHeader::default(),
-            not_scanned: crate::policy::NotScanned::default(),
+            partial_as: crate::policy::PartialAs::default(),
         }
     }
 }

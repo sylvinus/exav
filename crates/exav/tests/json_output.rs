@@ -47,15 +47,17 @@ fn json_output_is_valid_jsonl_with_expected_fields() {
         .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
         .collect();
 
-    // First: the EICAR detection.
-    assert_eq!(objs[0]["category"], "infected");
+    // First: the EICAR detection. `status` is the same word the human line ends
+    // with, and `category` is absent — it sub-classifies a PARTIAL and there is
+    // nothing to sub-classify here.
     assert_eq!(objs[0]["status"], "FOUND");
+    assert!(objs[0]["category"].is_null());
     assert!(objs[0]["signature"].is_string());
     assert_eq!(objs[0]["method"], "pattern");
 
     // Second: the clean file.
-    assert_eq!(objs[1]["category"], "clean");
     assert_eq!(objs[1]["status"], "OK");
+    assert!(objs[1]["category"].is_null());
 
     // Third: the summary.
     assert_eq!(objs[2]["summary"]["scanned"], 2);

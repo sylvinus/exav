@@ -137,7 +137,7 @@ fn a_split_archive_in_a_directory_is_rejoined_and_reported() {
         .collect();
     assert_eq!(part_lines.len(), 3, "one line per file: {objs:#?}");
     assert!(
-        part_lines.iter().all(|o| o["category"] == "clean"),
+        part_lines.iter().all(|o| o["status"] == "OK"),
         "a fragment is not itself malware: {objs:#?}"
     );
 
@@ -146,7 +146,7 @@ fn a_split_archive_in_a_directory_is_rejoined_and_reported() {
         .iter()
         .find(|o| o["file"].as_str().unwrap_or("").ends_with("payload.zip"))
         .unwrap_or_else(|| panic!("no line for the rejoined archive: {objs:#?}"));
-    assert_eq!(archive["category"], "infected", "{objs:#?}");
+    assert_eq!(archive["status"], "FOUND", "{objs:#?}");
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn a_set_with_a_hole_is_reported_never_clean() {
         .iter()
         .find(|o| o["file"].as_str().unwrap_or("").ends_with("gap.zip"))
         .unwrap_or_else(|| panic!("an incomplete set must be reported: {objs:#?}"));
-    assert_eq!(archive["category"], "not-scanned", "{objs:#?}");
+    assert_eq!(archive["status"], "PARTIAL", "{objs:#?}");
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn a_lone_numbered_file_adds_no_line() {
     std::fs::write(dir.path().join("notes.dat.001"), b"nothing to see here").unwrap();
     let objs = scan_dir_json(dir.path());
     assert_eq!(objs.len(), 1, "exactly the one real file: {objs:#?}");
-    assert_eq!(objs[0]["category"], "clean");
+    assert_eq!(objs[0]["status"], "OK");
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn parts_in_different_directories_are_not_one_set() {
     }
     let objs = scan_dir_json(dir.path());
     assert!(
-        objs.iter().all(|o| o["category"] == "clean"),
+        objs.iter().all(|o| o["status"] == "OK"),
         "nothing should have been joined across directories: {objs:#?}"
     );
 }
@@ -199,7 +199,7 @@ fn an_ordinary_directory_is_unaffected() {
     let objs = scan_dir_json(dir.path());
     assert_eq!(objs.len(), 2, "no extra lines: {objs:#?}");
     assert_eq!(
-        objs.iter().filter(|o| o["category"] == "infected").count(),
+        objs.iter().filter(|o| o["status"] == "FOUND").count(),
         1
     );
 }

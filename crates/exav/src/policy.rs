@@ -2,7 +2,7 @@
 //!
 //! Two questions an operator answers, each with one flag:
 //!
-//! * [`NotScannedPolicy`] — what becomes of an object exav could not fully
+//! * [`PartialStatus`] — what becomes of an object exav could not fully
 //!   examine. Blocked, reported as a detection, or delivered.
 //! * [`Detectors`] — which heuristic detectors run at all, over and above the
 //!   signature database.
@@ -19,54 +19,58 @@ use std::sync::OnceLock;
 
 use exav_core::{ScanReport, Verdict, VerdictCategory};
 
-static CURRENT: OnceLock<NotScanned> = OnceLock::new();
+static CURRENT: OnceLock<PartialAs> = OnceLock::new();
 
-/// Install the not-scanned policy, once, at startup.
+/// Install the partial policy, once, at startup.
 ///
 /// Process-global, the way the spill settings are, because every surface asks
 /// the same question about the same verdict and threading it through six call
 /// sites would give six chances for one of them to answer differently.
-pub(crate) fn configure(policy: NotScanned) {
+pub(crate) fn configure(policy: PartialAs) {
     let _ = CURRENT.set(policy);
 }
 
 /// The policy in force, defaulting to `block` for any caller that never
 /// configured one.
-pub(crate) fn current() -> NotScanned {
-    *CURRENT.get_or_init(NotScanned::default)
+pub(crate) fn current() -> PartialAs {
+    *CURRENT.get_or_init(PartialAs::default)
 }
 
 /// Apply the policy to a finished report, in place.
 ///
-/// The single point where `pass` and `alert` take effect, so a not-scanned
+/// The single point where `pass` and `alert` take effect, so a partial
 /// object reaches an exit code, a `clamd` reply, a JSON record and a summary
 /// counter having already been through it. Doing it per surface would be four
 /// chances to forget one, and forgetting the CLI's would mean an object the
 /// operator asked to pass still exiting 2.
 ///
-/// `alert` is a no-op for the two conditions the engine renames itself
-/// (`--not-scanned password-protected=alert` becomes
-/// `Heuristics.Encrypted.*` upstream, under ClamAV's own names, which are
-/// better than anything synthesised here). It reaches this function only for a
-/// condition the engine has no heuristic for.
-pub(crate) fn apply(report: &mut ScanReport, policy: NotScanned) {
-    if report.verdict.category() != VerdictCategory::NotScanned {
+/// `found` is a no-op for the conditions the engine names itself
+/// (`--partial-as password-protected=found` becomes `Heuristics.Encrypted.*`
+/// upstream, under ClamAV's own names, which are better than anything
+/// synthesised here). It reaches this function only for a condition the engine
+/// has no heuristic for.
+///
+/// `error` is not handled here at all: it changes no verdict, only which exit
+/// code the verdict contributes. Rewriting the report would lose the category
+/// the line still has to name.
+pub(crate) fn apply(report: &mut ScanReport, policy: PartialAs) {
+    if report.verdict.category() != VerdictCategory::Partial {
         return;
     }
     let tag = report.verdict.status_tag();
     match policy.for_tag(tag) {
-        NotScannedPolicy::Block => {}
-        NotScannedPolicy::Pass => {
+        PartialStatus::Partial | PartialStatus::Error => {}
+        PartialStatus::Ok => {
             // Loud, per object. A pass an operator configured is a risk they
             // accepted; a pass they cannot count is one they cannot review.
             eprintln!(
-                "exav: passing an object that could not be fully examined ({tag}: {}) \
-                 — --not-scanned says so",
+                "exav: reporting an object that could not be fully examined as OK ({tag}: {}) \
+                 — --partial-as says so",
                 report.verdict.detail().unwrap_or_default()
             );
             report.verdict = Verdict::Clean;
         }
-        NotScannedPolicy::Alert => {
+        PartialStatus::Found => {
             report.verdict = Verdict::Infected {
                 signature: heuristic_name(tag),
                 offset: 0,
@@ -76,7 +80,7 @@ pub(crate) fn apply(report: &mut ScanReport, policy: NotScanned) {
     }
 }
 
-/// The detection name a not-scanned condition is reported under when the engine
+/// The detection name a partial condition is reported under when the engine
 /// has no heuristic of its own for it: `UNSCANNABLE` becomes
 /// `Heuristics.Exav.Unscannable`.
 ///
@@ -95,54 +99,64 @@ pub(crate) fn heuristic_name(tag: &str) -> String {
     out
 }
 
-/// What happens to an object exav could not fully examine.
+/// Which status a partial verdict is reported as.
 ///
-/// The three answers are exhaustive and mutually exclusive, which is why this
-/// is one setting rather than a set of switches: an object is stopped, or it is
-/// called a detection, or it is delivered.
+/// The values are the four statuses themselves, so the name of the value is the
+/// name of the outcome — and, because status and exit code are 1:1, the value
+/// also names the exit code it produces. Nothing to look up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum NotScannedPolicy {
-    /// Stop it. The verdict stays `LIMITS-EXCEEDED` / `UNSCANNABLE` /
-    /// `PASSWORD-PROTECTED` and every surface treats it as a failure: exit 2,
-    /// a clamd `ERROR` reply, an ICAP block.
+pub(crate) enum PartialStatus {
+    /// Report it for what it is: `PARTIAL` under its category, exit `3`. On the
+    /// clamd wire that is an `ERROR` reply, because the protocol's vocabulary is
+    /// closed and a word it does not know is read as `OK` by real clients.
     #[default]
-    Block,
-    /// Call it a detection, named `Heuristics.*`. Exit 1, `FOUND`,
-    /// `X-Infection-Found` — an ordinary hit as far as any client is concerned.
-    Alert,
-    /// Deliver it. Exit 0, `OK`, a `204`.
+    Partial,
+    /// Deliver it as clean: `OK`, exit `0`, an ICAP `204`.
     ///
-    /// Never silently: a passed object is logged wherever it happens, and on
-    /// ICAP the response still carries `X-Exav-Verdict` saying what was skipped.
-    Pass,
+    /// Never silently — a passed object is logged wherever it happens, and the
+    /// ICAP response still carries the headers saying what was skipped.
+    Ok,
+    /// Call it a detection, named `Heuristics.*`: `FOUND`, exit `1`,
+    /// `X-Infection-Found`. An ordinary hit as far as any client is concerned,
+    /// and what ClamAV's `--alert-exceeds-max` / `--alert-encrypted` do.
+    Found,
+    /// Call it an operational failure: `ERROR`, exit `2`.
+    ///
+    /// For a caller that would rather not learn a fourth exit code, or that
+    /// wants any unexaminable object to stop the pipeline as loudly as a broken
+    /// scanner does. Identical to `partial` on every surface that has no exit
+    /// code of its own — the clamd wire and ICAP.
+    Error,
 }
 
-impl NotScannedPolicy {
+impl PartialStatus {
     fn parse(s: &str) -> Result<Self, String> {
         match s {
-            "block" => Ok(Self::Block),
-            "alert" => Ok(Self::Alert),
-            "pass" => Ok(Self::Pass),
+            "partial" => Ok(Self::Partial),
+            "ok" => Ok(Self::Ok),
+            "found" => Ok(Self::Found),
+            "error" => Ok(Self::Error),
             other => Err(format!(
-                "unknown policy `{other}` (expected block, alert or pass)"
+                "unknown status `{other}` (expected partial, ok, found or error)"
             )),
         }
     }
 }
 
-impl fmt::Display for NotScannedPolicy {
+impl fmt::Display for PartialStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Block => "block",
-            Self::Alert => "alert",
-            Self::Pass => "pass",
+            Self::Partial => "partial",
+            Self::Ok => "ok",
+            Self::Found => "found",
+            Self::Error => "error",
         })
     }
 }
 
-/// The status tags a not-scanned verdict reports under — the values
+/// The status tags a partial verdict reports under — the values
 /// [`Verdict::status_tag`](exav_core::Verdict::status_tag) returns for the
-/// `NotScanned` category — paired with the name an operator writes.
+/// `PartialAs` category — paired with the name an operator writes.
 ///
 /// The two spellings differ on purpose: the wire tag is shouted
 /// (`PASSWORD-PROTECTED`) because it appears in a protocol reply, and the flag
@@ -154,32 +168,39 @@ pub(crate) const TAGS: [(&str, &str); 3] = [
     ("password-protected", "PASSWORD-PROTECTED"),
 ];
 
-/// The policy for each not-scanned condition.
+/// The policy for each partial condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct NotScanned {
+pub(crate) struct PartialAs {
     /// One slot per entry of [`TAGS`], in that order.
-    per_tag: [NotScannedPolicy; TAGS.len()],
+    per_tag: [PartialStatus; TAGS.len()],
 }
 
-impl NotScanned {
-    /// Parse `--not-scanned`: one policy for everything (`pass`), or a
-    /// comma-separated list of `tag=policy` pairs.
+impl PartialAs {
+    /// One status for every category — what a bare `--partial-as ok` means, and
+    /// what `--clamav-compat` installs.
+    pub(crate) fn uniform(status: PartialStatus) -> Self {
+        Self {
+            per_tag: [status; TAGS.len()],
+        }
+    }
+
+    /// Parse `--partial-as`: one status for everything (`ok`), or a
+    /// comma-separated list of `category=status` pairs
+    /// (`password-protected=ok,limits-exceeded=found`).
     ///
-    /// A tag exav does not know is refused rather than ignored. A policy that
-    /// parsed but named nothing would read as a setting that never fires — an
+    /// A category exav does not know is refused rather than ignored. A setting
+    /// that parsed but named nothing would read as one that never fires — an
     /// operator believing they had opened a hole they had not, or closed one
     /// they had not, and finding out from traffic.
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
-        if let Ok(uniform) = NotScannedPolicy::parse(s) {
-            return Ok(Self {
-                per_tag: [uniform; TAGS.len()],
-            });
+        if let Ok(uniform) = PartialStatus::parse(s) {
+            return Ok(Self::uniform(uniform));
         }
         if !s.contains('=') {
             return Err(format!(
-                "expected block, alert, pass, or a list like \
-                 `password-protected=pass` (tags: {})",
+                "expected partial, ok, found, error, or a list like \
+                 `password-protected=ok` (categories: {})",
                 TAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
             ));
         }
@@ -199,7 +220,7 @@ impl NotScanned {
                         TAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
                     )
                 })?;
-            out.per_tag[idx] = NotScannedPolicy::parse(policy.trim())?;
+            out.per_tag[idx] = PartialStatus::parse(policy.trim())?;
         }
         Ok(out)
     }
@@ -207,34 +228,34 @@ impl NotScanned {
     /// The policy for a wire status tag (`UNSCANNABLE`, …). An unrecognised tag
     /// blocks, which is the answer that cannot turn a verdict into a pass by
     /// accident.
-    pub(crate) fn for_tag(&self, tag: &str) -> NotScannedPolicy {
+    pub(crate) fn for_tag(&self, tag: &str) -> PartialStatus {
         TAGS.iter()
             .position(|(_, wire)| *wire == tag)
             .map(|i| self.per_tag[i])
-            .unwrap_or(NotScannedPolicy::Block)
+            .unwrap_or(PartialStatus::Partial)
     }
 
     /// Whether any condition is set to `pass`, for the line a listener
     /// announces itself with — a deployment delivering what it could not
     /// examine should be legible from its logs alone.
-    pub(crate) fn any_pass(&self) -> bool {
-        self.per_tag.contains(&NotScannedPolicy::Pass)
+    pub(crate) fn reports_any_as_ok(&self) -> bool {
+        self.per_tag.contains(&PartialStatus::Ok)
     }
 
     /// Whether `password-protected` is reported as a detection, which the
     /// engine implements itself under ClamAV's `Heuristics.Encrypted.*` names.
-    pub(crate) fn alerts_encrypted(&self) -> bool {
-        self.for_tag("PASSWORD-PROTECTED") == NotScannedPolicy::Alert
+    pub(crate) fn reports_encrypted_as_found(&self) -> bool {
+        self.for_tag("PASSWORD-PROTECTED") == PartialStatus::Found
     }
 
     /// Whether `limits-exceeded` is reported as a detection, which the engine
     /// implements itself under `Heuristics.Limits.Exceeded.*`.
-    pub(crate) fn alerts_limits(&self) -> bool {
-        self.for_tag("LIMITS-EXCEEDED") == NotScannedPolicy::Alert
+    pub(crate) fn reports_limits_as_found(&self) -> bool {
+        self.for_tag("LIMITS-EXCEEDED") == PartialStatus::Found
     }
 }
 
-impl fmt::Display for NotScanned {
+impl fmt::Display for PartialAs {
     /// Spelled the way it was asked for, so a log line can be pasted back onto
     /// a command line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -346,57 +367,57 @@ mod tests {
 
     #[test]
     fn blocking_is_what_you_get_without_asking() {
-        let p = NotScanned::default();
+        let p = PartialAs::default();
         for (_, wire) in TAGS {
-            assert_eq!(p.for_tag(wire), NotScannedPolicy::Block, "{wire}");
+            assert_eq!(p.for_tag(wire), PartialStatus::Partial, "{wire}");
         }
-        assert!(!p.any_pass());
-        assert_eq!(p.to_string(), "block");
+        assert!(!p.reports_any_as_ok());
+        assert_eq!(p.to_string(), "partial");
     }
 
     #[test]
     fn one_word_sets_every_condition() {
-        let p = NotScanned::parse("pass").unwrap();
+        let p = PartialAs::parse("ok").unwrap();
         for (_, wire) in TAGS {
-            assert_eq!(p.for_tag(wire), NotScannedPolicy::Pass, "{wire}");
+            assert_eq!(p.for_tag(wire), PartialStatus::Ok, "{wire}");
         }
-        assert!(p.any_pass());
-        assert_eq!(p.to_string(), "pass");
+        assert!(p.reports_any_as_ok());
+        assert_eq!(p.to_string(), "ok");
     }
 
     #[test]
     fn conditions_can_be_set_apart() {
-        let p = NotScanned::parse("password-protected=pass, limits-exceeded=alert").unwrap();
-        assert_eq!(p.for_tag("PASSWORD-PROTECTED"), NotScannedPolicy::Pass);
-        assert_eq!(p.for_tag("LIMITS-EXCEEDED"), NotScannedPolicy::Alert);
+        let p = PartialAs::parse("password-protected=ok, limits-exceeded=found").unwrap();
+        assert_eq!(p.for_tag("PASSWORD-PROTECTED"), PartialStatus::Ok);
+        assert_eq!(p.for_tag("LIMITS-EXCEEDED"), PartialStatus::Found);
         // Unnamed conditions keep the safe answer rather than inheriting one.
-        assert_eq!(p.for_tag("UNSCANNABLE"), NotScannedPolicy::Block);
-        assert!(p.any_pass());
-        assert!(p.alerts_limits() && !p.alerts_encrypted());
+        assert_eq!(p.for_tag("UNSCANNABLE"), PartialStatus::Partial);
+        assert!(p.reports_any_as_ok());
+        assert!(p.reports_limits_as_found() && !p.reports_encrypted_as_found());
         assert_eq!(
             p.to_string(),
-            "limits-exceeded=alert,unscannable=block,password-protected=pass"
+            "limits-exceeded=found,unscannable=partial,password-protected=ok"
         );
     }
 
     #[test]
     fn a_tag_the_engine_reports_but_nobody_named_still_blocks() {
         // The answer that cannot turn a verdict into a pass by accident.
-        let p = NotScanned::parse("pass").unwrap();
-        assert_eq!(p.for_tag("SOME-FUTURE-TAG"), NotScannedPolicy::Block);
+        let p = PartialAs::parse("ok").unwrap();
+        assert_eq!(p.for_tag("SOME-FUTURE-TAG"), PartialStatus::Partial);
     }
 
     #[test]
     fn misspellings_are_refused_rather_than_ignored() {
         for bad in [
             "passs",
-            "password_protected=pass",
-            "encrypted=pass",
+            "password_protected=ok",
+            "encrypted=ok",
             "password-protected=allow",
             "password-protected",
             "",
         ] {
-            assert!(NotScanned::parse(bad).is_err(), "{bad:?} parsed");
+            assert!(PartialAs::parse(bad).is_err(), "{bad:?} parsed");
         }
     }
 
@@ -413,7 +434,7 @@ mod tests {
             Verdict::Unscannable { reason: reason() },
             Verdict::PasswordProtected { reason: reason() },
         ] {
-            if v.category() != VerdictCategory::NotScanned {
+            if v.category() != VerdictCategory::Partial {
                 continue;
             }
             let tag = v.status_tag();
@@ -440,7 +461,7 @@ mod tests {
     }
 
     /// The two conditions ClamAV spells `--alert-encrypted` and
-    /// `--alert-exceeds-max` belong to `--not-scanned`, because they answer
+    /// `--alert-exceeds-max` belong to `--partial-as`, because they answer
     /// "what does this verdict become", not "what should exav look for".
     /// Accepting them here would put one question under two flags.
     #[test]
@@ -448,7 +469,7 @@ mod tests {
         for not_a_detector in ["encrypted", "exceeds-max", "limits-exceeded"] {
             assert!(
                 Detectors::parse(not_a_detector).is_err(),
-                "{not_a_detector} belongs to --not-scanned"
+                "{not_a_detector} belongs to --partial-as"
             );
         }
     }

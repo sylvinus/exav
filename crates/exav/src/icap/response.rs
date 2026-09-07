@@ -19,7 +19,7 @@ pub(super) enum Decision {
     /// The object was not fully examined, so it is blocked. Carries the verdict
     /// tag (`LIMITS-EXCEEDED`, `UNSCANNABLE`, `PASSWORD-PROTECTED`) and the
     /// detail behind it.
-    NotScanned(&'static str, String),
+    Partial(&'static str, String),
 }
 
 impl Decision {
@@ -36,8 +36,8 @@ impl Decision {
             VerdictCategory::Infected => {
                 Self::Infected(v.detail().unwrap_or("unnamed signature").to_string())
             }
-            VerdictCategory::NotScanned => {
-                Self::NotScanned(v.status_tag(), v.detail().unwrap_or_default().to_string())
+            VerdictCategory::Partial => {
+                Self::Partial(v.status_tag(), v.detail().unwrap_or_default().to_string())
             }
         }
     }
@@ -52,30 +52,30 @@ impl Decision {
         match self {
             Self::Clean => crate::metrics::Category::Clean,
             Self::Infected(_) => crate::metrics::Category::Infected,
-            Self::NotScanned(_, _) => crate::metrics::Category::NotScanned,
+            Self::Partial(_, _) => crate::metrics::Category::Partial,
         }
     }
 
     /// The ICAP headers this decision adds to a `200` response.
     ///
     /// A detection always carries `X-Infection-Found` under its signature name.
-    /// A not-scanned verdict carries the `X-Exav-Verdict` / `X-Exav-Reason`
-    /// pair, which names the condition exactly, and — under
-    /// [`InfectionHeader::Blocks`] — `X-Infection-Found` as well, so that a
-    /// client reading only the c-icap vocabulary still learns the object was
-    /// blocked. The two are never confusable: a not-scanned block is reported
-    /// under `Heuristics.Exav.*`, a namespace no signature database occupies.
+    /// A partial verdict carries the `X-Exav-*` trio — `Status`, `Category`,
+    /// `Reason` — which is the same three-word vocabulary the CLI prints and the
+    /// JSON emits, and — under [`InfectionHeader::Blocks`] —
+    /// `X-Infection-Found` as well, so that a client reading only the c-icap
+    /// vocabulary still learns the object was blocked. The two are never
+    /// confusable: a partial block is reported under `Heuristics.Exav.*`, a
+    /// namespace no signature database occupies.
     fn headers(&self, policy: InfectionHeader) -> Vec<(&'static str, String)> {
         match self {
             Self::Clean => Vec::new(),
             Self::Infected(name) => vec![infection_found(name)],
-            Self::NotScanned(tag, reason) => {
-                let mut headers = Vec::with_capacity(3);
+            Self::Partial(tag, reason) => {
+                let mut headers = Vec::with_capacity(4);
                 if policy == InfectionHeader::Blocks {
                     headers.push(infection_found(&heuristic_name(tag)));
                 }
-                headers.push(("X-Exav-Verdict", (*tag).to_string()));
-                headers.push(("X-Exav-Reason", header_safe(reason)));
+                headers.extend(partial_headers(tag, reason));
                 headers
             }
         }
@@ -92,10 +92,7 @@ impl Decision {
     fn pass_headers(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Clean | Self::Infected(_) => Vec::new(),
-            Self::NotScanned(tag, reason) => vec![
-                ("X-Exav-Verdict", (*tag).to_string()),
-                ("X-Exav-Reason", header_safe(reason)),
-            ],
+            Self::Partial(tag, reason) => partial_headers(tag, reason),
         }
     }
 
@@ -104,9 +101,29 @@ impl Decision {
         match self {
             Self::Clean => "clean".to_string(),
             Self::Infected(name) => format!("infected: {}", header_safe(name)),
-            Self::NotScanned(tag, reason) => format!("{tag}: {}", header_safe(reason)),
+            Self::Partial(tag, reason) => format!("{tag}: {}", header_safe(reason)),
         }
     }
+}
+
+/// The `X-Exav-*` trio describing a partial verdict.
+///
+/// The same three words the CLI line and the JSON use — status, category,
+/// reason — so a client reading headers, a script reading stdout and a consumer
+/// reading JSON all learn the object's fate in one vocabulary.
+///
+/// `Status` is `PARTIAL` even under `--partial-as error`: ICAP has no exit code,
+/// which is the only thing those two statuses differ in, and reporting `ERROR`
+/// here would tell a proxy the *scanner* failed. Squid answers that by counting
+/// service failures and eventually bypassing the service — so relabelling an
+/// encrypted archive could take the scanner out of rotation and start failing
+/// open, which is the one outcome exav must never cause.
+fn partial_headers(tag: &str, reason: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("X-Exav-Status", "PARTIAL".to_string()),
+        ("X-Exav-Category", tag.to_string()),
+        ("X-Exav-Reason", header_safe(reason)),
+    ]
 }
 
 /// The `X-Infection-Found` header naming `threat`.
@@ -120,7 +137,7 @@ fn infection_found(threat: &str) -> (&'static str, String) {
     )
 }
 
-/// The threat name a not-scanned block is reported under, derived from the
+/// The threat name a partial block is reported under, derived from the
 /// verdict's status tag: `LIMITS-EXCEEDED` becomes
 /// `Heuristics.Exav.LimitsExceeded`.
 ///
@@ -147,7 +164,7 @@ fn heuristic_name(tag: &str) -> String {
 
 /// Make a string safe to put in a header value.
 ///
-/// Signature names come from the database, but the *reason* on a not-scanned
+/// Signature names come from the database, but the *reason* on a partial
 /// verdict can quote a container member's name, and that name came out of the
 /// file being scanned. A newline in it would end the header and let the rest be
 /// read as headers of its own — the attacker choosing what a proxy sees. So
@@ -396,7 +413,7 @@ fn block_page(decision: &Decision) -> String {
                 html_escape(name)
             ),
         ),
-        Decision::NotScanned(tag, reason) => (
+        Decision::Partial(tag, reason) => (
             "Not scannable",
             format!(
                 "exav could not fully examine this object ({}): {}. \
@@ -432,7 +449,7 @@ mod tests {
         }
     }
 
-    /// The not-scanned verdicts, with the status tag each one reports under.
+    /// The partial verdicts, with the status tag each one reports under.
     const NOT_SCANNED: [(&str, &str); 3] = [
         ("size exceeds 1024", "LIMITS-EXCEEDED"),
         ("rar: ppmd", "UNSCANNABLE"),
@@ -498,11 +515,19 @@ mod tests {
             let headers = d.headers(InfectionHeader::Blocks);
             assert_eq!(
                 names(&headers),
-                vec!["X-Infection-Found", "X-Exav-Verdict", "X-Exav-Reason"],
+                vec![
+                    "X-Infection-Found",
+                    "X-Exav-Status",
+                    "X-Exav-Category",
+                    "X-Exav-Reason"
+                ],
                 "{tag}"
             );
-            assert_eq!(headers[1].1, tag);
-            assert_eq!(headers[2].1, reason);
+            // `PARTIAL` whatever the category, because ICAP has no exit code —
+            // the one thing `--partial-as error` changes.
+            assert_eq!(headers[1].1, "PARTIAL");
+            assert_eq!(headers[2].1, tag);
+            assert_eq!(headers[3].1, reason);
             // Named so that no analyst reading a log, and no rule matching on
             // the threat name, can take it for a database detection.
             assert!(
@@ -520,10 +545,11 @@ mod tests {
             let headers = d.headers(InfectionHeader::Detections);
             assert_eq!(
                 names(&headers),
-                vec!["X-Exav-Verdict", "X-Exav-Reason"],
+                vec!["X-Exav-Status", "X-Exav-Category", "X-Exav-Reason"],
                 "{tag}"
             );
-            assert_eq!(headers[0].1, tag);
+            assert_eq!(headers[0].1, "PARTIAL");
+            assert_eq!(headers[1].1, tag);
         }
     }
 
@@ -546,13 +572,15 @@ mod tests {
 
     #[test]
     fn header_values_cannot_carry_a_line_break() {
-        let d = Decision::NotScanned(
+        let d = Decision::Partial(
             "UNSCANNABLE",
             "member\r\nX-Injected: yes\r\n\r\nevil".to_string(),
         );
         let headers = d.headers(InfectionHeader::Detections);
-        assert_eq!(headers[1].1, "member__X-Injected: yes____evil");
-        assert!(!headers[1].1.contains('\r') && !headers[1].1.contains('\n'));
+        // Status, Category, Reason — the reason is the one carrying attacker
+        // bytes, since it can quote a container member's name.
+        assert_eq!(headers[2].1, "member__X-Injected: yes____evil");
+        assert!(!headers[2].1.contains('\r') && !headers[2].1.contains('\n'));
     }
 
     #[test]
@@ -564,7 +592,7 @@ mod tests {
 
     #[test]
     fn long_header_values_are_truncated() {
-        let d = Decision::NotScanned("UNSCANNABLE", "x".repeat(5000));
+        let d = Decision::Partial("UNSCANNABLE", "x".repeat(5000));
         assert!(d.headers(InfectionHeader::Detections)[1].1.len() <= 210);
     }
 

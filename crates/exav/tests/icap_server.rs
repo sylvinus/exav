@@ -31,7 +31,7 @@ const REQ_HDR: &[u8] = b"POST /upload HTTP/1.1\r\nHost: example.test\r\n\r\n";
 /// A one-member ZIP with the encryption bit set, so exav reports it
 /// `PASSWORD-PROTECTED`.
 ///
-/// The tests that need a not-scanned verdict *other than* a size limit use
+/// The tests that need a partial verdict *other than* a size limit use
 /// this: since the ICAP listener took its size ceiling from `--max-input-bytes`
 /// like every other surface, an over-limit object no longer has its whole body
 /// in hand, and some of these properties are about what happens when it does.
@@ -534,13 +534,17 @@ fn every_configured_service_alias_answers() {
     assert_eq!(c.recv().code, 200);
 }
 
+/// The path of the listen address names the set exactly: a deployment that asks
+/// for one name must not keep answering on three it never configured.
+///
+/// The address is the ICAP URL a proxy is pointed at, so this is the same string
+/// on both sides — what a `squid.conf` contains is what exav is started with.
 #[test]
-fn a_named_service_replaces_the_defaults() {
-    // `--icap-service` names the set exactly: a deployment that asks for one
-    // name must not keep answering on three it never configured.
-    let s = Server::start(
+fn the_path_of_the_address_replaces_the_default_services() {
+    let s = Server::start_at(
+        "icap://127.0.0.1:0/only_this_one",
         TempDir::new().unwrap(),
-        &["--icap-service", "only_this_one"],
+        &[],
     );
     let mut c = s.connect();
     c.send(b"OPTIONS icap://127.0.0.1/only_this_one ICAP/1.0\r\n\r\n");
@@ -549,6 +553,29 @@ fn a_named_service_replaces_the_defaults() {
     let mut c = s.connect();
     c.send(b"OPTIONS icap://127.0.0.1/avscan ICAP/1.0\r\n\r\n");
     assert_eq!(c.recv().code, 404, "a default name is not served as well");
+}
+
+/// A repeated `?service=` is the escape hatch the path cannot express: two
+/// proxies whose configurations disagree about the name, pointed at one exav.
+#[test]
+fn a_repeated_service_names_more_than_one() {
+    let s = Server::start_at(
+        "icap://127.0.0.1:0?service=one&service=two",
+        TempDir::new().unwrap(),
+        &[],
+    );
+    for name in ["one", "two"] {
+        let mut c = s.connect();
+        c.send(format!("OPTIONS icap://127.0.0.1/{name} ICAP/1.0\r\n\r\n").as_bytes());
+        assert_eq!(c.recv().code, 200, "{name} was configured");
+    }
+    let mut c = s.connect();
+    c.send(b"OPTIONS icap://127.0.0.1/avscan ICAP/1.0\r\n\r\n");
+    assert_eq!(
+        c.recv().code,
+        404,
+        "and the defaults are replaced, not added to"
+    );
 }
 
 #[test]
@@ -579,7 +606,7 @@ fn a_clean_respmod_with_allow_204_gets_204() {
     assert_eq!(r.code, 204, "{r:?}");
     assert!(r.body.is_empty());
     assert!(!r.has_header("X-Infection-Found"));
-    assert!(!r.has_header("X-Exav-Verdict"));
+    assert!(!r.has_header("X-Exav-Category"));
 }
 
 #[test]
@@ -649,7 +676,7 @@ fn eicar_over_respmod_is_blocked_with_the_c_icap_header() {
         found.to_ascii_uppercase().contains("EICAR"),
         "the threat name is the signature that matched: {found}"
     );
-    assert!(!r.has_header("X-Exav-Verdict"));
+    assert!(!r.has_header("X-Exav-Category"));
 
     // The original message is replaced, not passed through.
     let hdr = String::from_utf8_lossy(&r.encapsulated_hdr).into_owned();
@@ -725,7 +752,7 @@ fn eicar_over_reqmod_is_blocked_with_a_response() {
     assert!(String::from_utf8_lossy(&r.encapsulated_hdr).starts_with("HTTP/1.1 403 Forbidden"));
 }
 
-// ────────────────────── not-scanned verdicts ──────────────────────
+// ────────────────────── partial verdicts ──────────────────────
 
 #[test]
 fn an_object_past_the_size_limit_blocks_rather_than_passing() {
@@ -744,7 +771,7 @@ fn an_object_past_the_size_limit_blocks_rather_than_passing() {
     let r = c.recv();
 
     assert_eq!(r.code, 200, "an unscanned object must not get a 204: {r:?}");
-    assert_eq!(r.header("X-Exav-Verdict"), Some("LIMITS-EXCEEDED"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     // Word for word what the clamd listener says about a stream this size.
     // There is one size setting, and it does not answer differently depending
     // on which port the object arrived at.
@@ -763,7 +790,7 @@ fn every_block_is_legible_to_a_client_that_reads_only_x_infection_found() {
     // A whole class of ICAP client decides clean-or-not from that header alone
     // — a script that hands a file to `c-icap-client` and greps the response,
     // for one. Such a client reads a 200 without the header as a pass, so
-    // withholding it from a not-scanned block would turn exav's fail-closed
+    // withholding it from a partial block would turn exav's fail-closed
     // answer into a fail-open one.
     let s = Server::start(TempDir::new().unwrap(), &["--max-input-bytes", "1024"]);
 
@@ -845,7 +872,7 @@ fn the_detections_policy_keeps_the_infection_header_for_database_hits_alone() {
     let r = c.recv();
 
     assert_eq!(r.code, 200, "the object is still blocked: {r:?}");
-    assert_eq!(r.header("X-Exav-Verdict"), Some("LIMITS-EXCEEDED"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(!r.has_header("X-Infection-Found"), "{r:?}");
     assert!(r.body_text().contains("Not scannable"));
 
@@ -883,7 +910,7 @@ fn an_over_limit_object_still_gets_its_verdict_delivered() {
         &["Allow: 204"],
     ));
     let r = c.recv();
-    assert_eq!(r.header("X-Exav-Verdict"), Some("LIMITS-EXCEEDED"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert_eq!(r.header("Connection"), Some("keep-alive"));
 
     // And the stream is back at a request boundary, so the connection is
@@ -912,7 +939,7 @@ fn malware_in_the_head_of_an_over_limit_object_is_reported_as_the_detection() {
     let r = c.recv();
     assert_eq!(r.code, 200, "{r:?}");
     assert!(r.has_header("X-Infection-Found"), "{r:?}");
-    assert!(!r.has_header("X-Exav-Verdict"), "{r:?}");
+    assert!(!r.has_header("X-Exav-Category"), "{r:?}");
 }
 
 // ───────────────── passing what could not be examined ─────────────────
@@ -924,7 +951,7 @@ fn a_deployment_can_take_delivery_of_what_exav_could_not_examine() {
     // by name, and gets the ordinary clean answer.
     let s = Server::start(
         TempDir::new().unwrap(),
-        &["--max-input-bytes", "1024", "--not-scanned", "pass"],
+        &["--max-input-bytes", "1024", "--partial-as", "ok"],
     );
     let mut c = s.connect();
     c.send(&request(
@@ -941,7 +968,7 @@ fn a_deployment_can_take_delivery_of_what_exav_could_not_examine() {
     // Delivered, but not passed off as clean: the client is told what was
     // skipped, and never told it was an infection — that would be false, and it
     // would make the header-only client this setting exists for block anyway.
-    assert_eq!(r.header("X-Exav-Verdict"), Some("LIMITS-EXCEEDED"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(r.has_header("X-Exav-Reason"), "{r:?}");
     assert!(!r.has_header("X-Infection-Found"), "{r:?}");
 
@@ -969,8 +996,8 @@ fn a_pass_policy_covers_the_tags_it_names_and_no_others() {
         &[
             "--max-input-bytes",
             "1024",
-            "--not-scanned",
-            "unscannable=pass",
+            "--partial-as",
+            "unscannable=ok",
         ],
     );
     let mut c = s.connect();
@@ -986,7 +1013,7 @@ fn a_pass_policy_covers_the_tags_it_names_and_no_others() {
 
     // LIMITS-EXCEEDED was not named, so it blocks exactly as it did before.
     assert_eq!(r.code, 200, "{r:?}");
-    assert_eq!(r.header("X-Exav-Verdict"), Some("LIMITS-EXCEEDED"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(r.has_header("X-Infection-Found"), "{r:?}");
 }
 
@@ -994,7 +1021,7 @@ fn a_pass_policy_covers_the_tags_it_names_and_no_others() {
 fn a_pass_still_hands_back_a_whole_message_when_the_client_wants_one() {
     // Without `Allow: 204` the client is owed its own message back, and a pass
     // has to produce it byte for byte rather than a block page.
-    let s = Server::start(TempDir::new().unwrap(), &["--not-scanned", "pass"]);
+    let s = Server::start(TempDir::new().unwrap(), &["--partial-as", "ok"]);
     let body = encrypted_zip();
     let mut c = s.connect();
     c.send(&request(
@@ -1013,7 +1040,7 @@ fn a_pass_still_hands_back_a_whole_message_when_the_client_wants_one() {
         "the original headers come back"
     );
     assert_eq!(r.body, body, "the original body comes back unmodified");
-    assert_eq!(r.header("X-Exav-Verdict"), Some("PASSWORD-PROTECTED"));
+    assert_eq!(r.header("X-Exav-Category"), Some("PASSWORD-PROTECTED"));
     assert!(!r.has_header("X-Infection-Found"), "{r:?}");
 }
 
@@ -1025,7 +1052,7 @@ fn an_over_limit_object_cannot_be_passed_to_a_client_that_wants_it_back() {
     // object as though it were the whole one. The block stands.
     let s = Server::start(
         TempDir::new().unwrap(),
-        &["--max-input-bytes", "1024", "--not-scanned", "pass"],
+        &["--max-input-bytes", "1024", "--partial-as", "ok"],
     );
     let mut c = s.connect();
     c.send(&request(
@@ -1039,7 +1066,7 @@ fn an_over_limit_object_cannot_be_passed_to_a_client_that_wants_it_back() {
     let r = c.recv();
 
     assert_eq!(r.code, 200, "{r:?}");
-    assert_eq!(r.header("X-Exav-Verdict"), Some("LIMITS-EXCEEDED"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(
         String::from_utf8_lossy(&r.encapsulated_hdr).starts_with("HTTP/1.1 403 Forbidden"),
         "a truncated object must not be delivered as the real one: {r:?}"
@@ -1078,8 +1105,8 @@ fn a_misspelled_pass_policy_stops_the_server_rather_than_never_firing() {
         .arg("icap://127.0.0.1:0")
         .arg("-d")
         .arg(dir.path())
-        .arg("--not-scanned")
-        .arg("unscannble=pass")
+        .arg("--partial-as")
+        .arg("unscannble=ok")
         .env("EXAV_ALLOW_NO_DB", "1")
         .output()
         .expect("run exav");
@@ -1123,7 +1150,7 @@ fn an_object_too_big_to_scan_is_the_same_object_on_either_listener() {
     let icap = c.recv();
     let clamd_reply = clamd_instream(clamd, &body);
 
-    assert_eq!(icap.header("X-Exav-Verdict"), Some("LIMITS-EXCEEDED"));
+    assert_eq!(icap.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(
         clamd_reply.contains("LIMITS-EXCEEDED"),
         "clamd: {clamd_reply:?}"
@@ -1179,7 +1206,7 @@ fn an_object_with_nowhere_to_spill_gets_a_verdict_rather_than_a_dropped_connecti
     let r = c.recv();
 
     assert_eq!(r.code, 200, "an object nobody buffered is not a 204: {r:?}");
-    assert_eq!(r.header("X-Exav-Verdict"), Some("UNSCANNABLE"));
+    assert_eq!(r.header("X-Exav-Category"), Some("UNSCANNABLE"));
     assert!(
         r.header("X-Exav-Reason")
             .unwrap_or_default()
@@ -1234,7 +1261,7 @@ fn no_spill_keeps_scanned_bytes_off_the_disk() {
     ));
     let r = c.recv();
     assert_eq!(r.code, 200, "{r:?}");
-    assert_eq!(r.header("X-Exav-Verdict"), Some("UNSCANNABLE"));
+    assert_eq!(r.header("X-Exav-Category"), Some("UNSCANNABLE"));
     assert!(
         r.header("X-Exav-Reason")
             .unwrap_or_default()
@@ -1422,7 +1449,7 @@ fn an_object_far_past_the_spill_threshold_is_scanned_whole() {
         r.has_header("X-Infection-Found"),
         "malware 24 MB into an object must still be found: {r:?}"
     );
-    assert!(!r.has_header("X-Exav-Verdict"), "{r:?}");
+    assert!(!r.has_header("X-Exav-Category"), "{r:?}");
 }
 
 // ───────────────────────────── Preview ─────────────────────────────

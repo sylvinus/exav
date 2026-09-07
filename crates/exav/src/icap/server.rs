@@ -353,7 +353,7 @@ fn modify<W: Write>(
             // the object is never requested. A *clean* preview is not: it is
             // the head of a file, and the head of a file being clean is exactly
             // the bypass that answering early would create. Nor is a
-            // not-scanned verdict acted on here — a truncated archive is
+            // partial verdict acted on here — a truncated archive is
             // undecodable because it is truncated, which says nothing about the
             // whole one.
             // Scanned from the RAM head, which for any preview a client actually
@@ -394,7 +394,7 @@ fn modify<W: Write>(
     let mut decision = match &rejected {
         // Nothing was buffered, so there is nothing to scan and no detection to
         // lose by saying so.
-        Some(reason) => Decision::NotScanned("UNSCANNABLE", reason.clone()),
+        Some(reason) => Decision::Partial("UNSCANNABLE", reason.clone()),
         None => scan(
             scanner,
             opts,
@@ -407,7 +407,7 @@ fn modify<W: Write>(
         // The same ceiling, reported with the same words, as a stream this size
         // arriving at the clamd listener: it is one scan setting, not a property
         // of the port the object came in on.
-        decision = Decision::NotScanned(
+        decision = Decision::Partial(
             "LIMITS-EXCEEDED",
             format!("size exceeds {}", opts.max_scan_size.unwrap_or(0)),
         );
@@ -419,8 +419,8 @@ fn modify<W: Write>(
     // the client wants the message handed back: the tail was discarded to reach
     // the next request boundary, so the bytes are gone, and echoing the head
     // alone would deliver a truncated object as if it were the real one.
-    let pass_wanted = matches!(&decision, Decision::NotScanned(tag, _)
-        if cfg.not_scanned.for_tag(tag) == crate::policy::NotScannedPolicy::Pass);
+    let pass_wanted = matches!(&decision, Decision::Partial(tag, _)
+        if cfg.partial_as.for_tag(tag) == crate::policy::PartialStatus::Ok);
     let passing = pass_wanted && (!over_limit || req.allow_204());
 
     if decision.blocks() && !passing {
@@ -526,15 +526,15 @@ fn decide(
 ) -> Decision {
     let decision = match scanned {
         Ok(Ok((report, _loc))) => Decision::from_report(&report),
-        Ok(Err(e)) => Decision::NotScanned("UNSCANNABLE", format!("scan failed: {e}")),
-        Err(_) => Decision::NotScanned("UNSCANNABLE", "scan failed (internal error)".to_string()),
+        Ok(Err(e)) => Decision::Partial("UNSCANNABLE", format!("scan failed: {e}")),
+        Err(_) => Decision::Partial("UNSCANNABLE", "scan failed (internal error)".to_string()),
     };
     // `alert` is settled here; `pass` is not, because whether this listener can
     // honour a pass depends on whether it still holds the object's bytes — a
     // question only the request loop can answer.
     match &decision {
-        Decision::NotScanned(tag, _)
-            if crate::policy::current().for_tag(tag) == crate::policy::NotScannedPolicy::Alert =>
+        Decision::Partial(tag, _)
+            if crate::policy::current().for_tag(tag) == crate::policy::PartialStatus::Found =>
         {
             Decision::Infected(crate::policy::heuristic_name(tag))
         }

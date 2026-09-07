@@ -80,6 +80,16 @@ pub(crate) struct Endpoint {
     /// so two listeners would need two flags — and the one without a flag would
     /// be stuck on a constant nobody could reach.
     pub max_connections: Option<usize>,
+    /// ICAP service names to answer on, from the path (`icap://h:1344/avscan`)
+    /// or from a repeated `?service=avscan&service=srv_clamav`. Empty keeps
+    /// the default set.
+    ///
+    /// A service name *is* the path of the ICAP URL a proxy is configured with,
+    /// so the address is where it already lives: `icap://scanner:1344/avscan`
+    /// out of a `squid.conf` is pasted here unchanged. Naming it separately
+    /// would split one URL across two flags, which is what putting the protocol
+    /// in the value removed for the scheme.
+    pub services: Vec<String>,
 }
 
 /// The `?…` options of one address, before they are attached to a place.
@@ -87,6 +97,7 @@ pub(crate) struct Endpoint {
 struct Options {
     mode: Option<u32>,
     max_connections: Option<usize>,
+    services: Option<Vec<String>>,
 }
 
 impl Endpoint {
@@ -95,9 +106,10 @@ impl Endpoint {
     /// A missing scheme means `clamd`, because that is the protocol exav
     /// answered before it answered any other and the one a bare `host:port` in
     /// an existing deployment means. A value beginning `/` is a Unix socket
-    /// path; anything else is `host:port`. That rule needs no third spelling and
-    /// cannot be ambiguous — a filesystem path and a host:port pair have
-    /// disjoint first characters.
+    /// path; anything else is `host:port`, optionally followed by `/<service>`
+    /// for ICAP. That rule needs no third spelling and cannot be ambiguous — a
+    /// filesystem path and a host:port pair have disjoint first characters, so
+    /// the leading `/` decides before any `/` inside can matter.
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
         if s.is_empty() {
@@ -115,11 +127,16 @@ impl Endpoint {
             return Err(format!("`{s}` names a protocol but no address"));
         }
         let opts = parse_query(query, s)?;
-        let addr = if rest.starts_with('/') {
-            Addr::Unix {
-                path: PathBuf::from(rest),
-                mode: opts.mode,
-            }
+        let (addr, path) = if rest.starts_with('/') {
+            // Every `/` belongs to the socket path — a filesystem path is not a
+            // URL, and splitting one would name a directory as a service.
+            (
+                Addr::Unix {
+                    path: PathBuf::from(rest),
+                    mode: opts.mode,
+                },
+                None,
+            )
         } else {
             if opts.mode.is_some() {
                 return Err(format!(
@@ -127,7 +144,11 @@ impl Endpoint {
                      listener has none — restrict it with the bind address and a firewall"
                 ));
             }
-            Addr::Tcp(rest.to_string())
+            let (hostport, path) = match rest.split_once('/') {
+                Some((hostport, path)) => (hostport, Some(path)),
+                None => (rest, None),
+            };
+            (Addr::Tcp(check_host_port(hostport, s)?), path)
         };
         // The ICAP server binds a TCP listener; RFC 3507 has no Unix-socket
         // form, and a proxy has no way to reach one. Refused rather than bound
@@ -137,12 +158,97 @@ impl Endpoint {
                 "`{s}`: ICAP is a TCP protocol; give it a host:port"
             ));
         }
+        let services = resolve_services(proto, path, opts.services, s)?;
         Ok(Self {
             proto,
             addr,
             max_connections: opts.max_connections,
+            services,
         })
     }
+}
+
+/// A listener needs a port, so `host` alone is refused rather than carried to a
+/// bind that fails with `invalid socket address`.
+///
+/// This also catches the one mistake the comma grammar makes reachable.
+/// `--listen` separates addresses with commas and the argument parser splits on
+/// them before this ever runs, so `?service=one,two` arrives as two values —
+/// `icap://h:1344?service=one` and a bare `two`. Both would otherwise look like
+/// addresses, and exav would bind an ICAP listener answering on the wrong set
+/// plus a clamd listener on a host called `two`. Requiring a port turns that
+/// into an error that names the real problem.
+fn check_host_port(hostport: &str, whole: &str) -> Result<String, String> {
+    if hostport.contains(':') {
+        return Ok(hostport.to_string());
+    }
+    Err(format!(
+        "`{whole}`: `{hostport}` has no port, so nothing can be bound to it. If you \
+         meant several ICAP services, a comma separates addresses rather than names \
+         — repeat the key instead: `?service=…&service=…`"
+    ))
+}
+
+/// Reconcile the two ways an ICAP service can be named: the URL path, and
+/// `?service=`.
+///
+/// Giving both is refused rather than resolved. They are two spellings of one
+/// setting, and picking a winner means the losing half sits on the command line
+/// looking like it is in force — the failure this whole address grammar exists
+/// to remove.
+fn resolve_services(
+    proto: Proto,
+    path: Option<&str>,
+    query: Option<Vec<String>>,
+    whole: &str,
+) -> Result<Vec<String>, String> {
+    // A path on a clamd address is a mistake with a plausible cause: an ICAP
+    // URL pasted under the wrong scheme. Say which protocol has services.
+    if proto == Proto::Clamd && path.is_some() {
+        return Err(format!(
+            "`{whole}`: the clamd protocol has no services, so a path means nothing here \
+             — an `icap://` address is the one that takes `/<service>`"
+        ));
+    }
+    match (path, query) {
+        (Some(_), Some(_)) => Err(format!(
+            "`{whole}`: the service is named twice, by the path and by `service=`; give one"
+        )),
+        (Some(p), None) => Ok(vec![service_name(p, whole)?]),
+        (None, Some(list)) => Ok(list),
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
+/// One service name out of a URL path.
+///
+/// A path names exactly one, because that is what a proxy's ICAP URL carries.
+/// A comma in it is an operator reaching for a list, so it is answered with the
+/// spelling that takes one rather than accepted as a service whose name has a
+/// comma in it.
+fn service_name(path: &str, whole: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Err(format!(
+            "`{whole}`: a trailing `/` names no service; drop it to answer on the \
+             default set, or give a name"
+        ));
+    }
+    if path.contains(',') {
+        let repeated = path
+            .split(',')
+            .map(|n| format!("service={}", n.trim()))
+            .collect::<Vec<_>>()
+            .join("&");
+        return Err(format!(
+            "`{whole}`: a path names one service; for several, use `?{repeated}`"
+        ));
+    }
+    if path.contains('/') {
+        return Err(format!(
+            "`{whole}`: a service name is one path segment, and `{path}` has a `/` in it"
+        ));
+    }
+    Ok(path.to_string())
 }
 
 /// Parse the `?…` options of an address. An unknown key is an error rather than
@@ -158,15 +264,54 @@ fn parse_query(query: Option<&str>, whole: &str) -> Result<Options, String> {
         match k {
             "mode" => opts.mode = Some(parse_mode(v, whole)?),
             "max-connections" => opts.max_connections = Some(parse_max_connections(v, whole)?),
+            // Singular, and repeated rather than replaced: each occurrence adds
+            // one name, so the key describes its own value. `services=a` reading
+            // as one name would be a plural that never holds a list.
+            "service" => opts
+                .services
+                .get_or_insert_with(Vec::new)
+                .push(parse_service(v, whole)?),
             other => {
                 return Err(format!(
                     "`{whole}`: unknown address option `{other}` \
-                     (known: mode, max-connections)"
+                     (known: mode, max-connections, service)"
                 ))
             }
         }
     }
     Ok(opts)
+}
+
+/// One more ICAP service name to answer on, from a `service=` key.
+///
+/// The escape hatch from the path form, for the one deployment shape the path
+/// cannot express: two proxies whose configurations disagree about which name to
+/// use, pointed at one exav. Repeat the key for each —
+/// `?service=avscan&service=srv_clamav`.
+///
+/// A comma-separated `service=a,b` cannot do it: `--listen` separates
+/// *addresses* with a comma, so it would end this address before this parser
+/// ever saw it. One separator per level — commas between addresses, `&` between
+/// one address's options — which leaves each key naming exactly one value.
+fn parse_service(v: &str, whole: &str) -> Result<String, String> {
+    let name = v.trim();
+    if name.is_empty() {
+        return Err(format!(
+            "`{whole}`: `service=` names none; drop it to answer on the default set"
+        ));
+    }
+    if name.contains(',') {
+        return Err(format!(
+            "`{whole}`: a comma separates addresses, not service names; repeat the key \
+             instead — `?service=…&service=…`"
+        ));
+    }
+    if name.contains('/') {
+        return Err(format!(
+            "`{whole}`: a service name is one path segment, and `{name}` has a `/` in it"
+        ));
+    }
+    Ok(name.to_string())
 }
 
 /// Concurrent connections a listener accepts. `0` is refused rather than read as
@@ -208,7 +353,20 @@ impl std::fmt::Display for Endpoint {
         let p = self.proto.as_str();
         let mut sep = '?';
         match &self.addr {
-            Addr::Tcp(a) => write!(f, "{p}://{a}")?,
+            Addr::Tcp(a) => {
+                write!(f, "{p}://{a}")?;
+                // One service goes back in the path it came from, so what `-v`
+                // prints is the URL a proxy is pointed at. Several cannot, and
+                // take the option that spells a list.
+                if let [only] = self.services.as_slice() {
+                    write!(f, "/{only}")?;
+                } else {
+                    for name in &self.services {
+                        write!(f, "{sep}service={name}")?;
+                        sep = '&';
+                    }
+                }
+            }
             Addr::Unix { path, mode } => {
                 write!(f, "{p}://{}", path.display())?;
                 if let Some(m) = mode {
@@ -377,6 +535,80 @@ mod tests {
         // A TCP listener has no file to permission.
         let e = Endpoint::parse("0.0.0.0:3310?mode=660").unwrap_err();
         assert!(e.contains("host:port"), "{e}");
+    }
+
+    #[test]
+    fn an_icap_service_is_the_path_of_the_url() {
+        // The whole point: what a squid.conf contains is what exav is started
+        // with, unchanged.
+        let e = ep("icap://scanner:1344/avscan");
+        assert_eq!(e.addr, Addr::Tcp("scanner:1344".to_string()));
+        assert_eq!(e.services, ["avscan"]);
+        // No path keeps the three names a c-icap `virus_scan` answers on, so
+        // exav stands in for one without being told which the proxy asks for.
+        assert!(ep("icap://scanner:1344").services.is_empty());
+        // And it round-trips, so `-v` prints a URL that can be pasted back.
+        assert_eq!(e.to_string(), "icap://scanner:1344/avscan");
+    }
+
+    #[test]
+    fn several_services_take_the_option_that_spells_a_list() {
+        let e = ep("icap://h:1344?service=one&service=two");
+        assert_eq!(e.services, ["one", "two"]);
+        assert_eq!(e.to_string(), "icap://h:1344?service=one&service=two");
+        // A comma cannot spell the list: `--listen` separates addresses with
+        // one, so it would end this address before this parser saw it. One
+        // separator per level — commas between addresses, `&` within one —
+        // which is also why the key is singular: each one names a single value.
+        let err = Endpoint::parse("icap://h:1344?service=one,two").unwrap_err();
+        assert!(err.contains("repeat the key"), "{err}");
+        // And the same mistake as the argument parser actually delivers it: the
+        // comma has already split the value, so what reaches here is a bare word
+        // that would otherwise have been bound as a host.
+        let err = listeners(&["icap://h:1344?service=one".into(), "two".into()]).unwrap_err();
+        assert!(err.contains("no port") && err.contains("service="), "{err}");
+        // A comma in the path is an operator reaching for a list. Answer with
+        // the spelling that works, rather than accepting a service whose name
+        // contains a comma — which would 404 every request and look right.
+        let err = Endpoint::parse("icap://h:1344/one,two").unwrap_err();
+        assert!(err.contains("?service=one&service=two"), "{err}");
+    }
+
+    #[test]
+    fn a_service_named_twice_is_refused() {
+        // Two spellings of one setting, disagreeing. Picking a winner leaves the
+        // loser on the command line looking like it is in force.
+        let err = Endpoint::parse("icap://h:1344/a?service=b").unwrap_err();
+        assert!(err.contains("named twice"), "{err}");
+    }
+
+    #[test]
+    fn a_path_belongs_to_icap_alone() {
+        // The likely cause is an ICAP URL pasted under the wrong scheme, so the
+        // message names the protocol that has services.
+        let err = Endpoint::parse("clamd://h:3310/avscan").unwrap_err();
+        assert!(err.contains("icap://"), "{err}");
+        // A socket path is not a URL: every `/` in it belongs to the filesystem,
+        // and splitting one would name a directory as a service.
+        assert_eq!(
+            ep("clamd:///var/run/exav.sock").addr,
+            Addr::Unix {
+                path: PathBuf::from("/var/run/exav.sock"),
+                mode: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_service_that_cannot_be_one_is_refused() {
+        for bad in [
+            "icap://h:1344/",         // a trailing slash names nothing
+            "icap://h:1344/a/b",      // a name is one path segment
+            "icap://h:1344?service=", // ditto, spelled as an option
+            "icap://h:1344?service=a/b",
+        ] {
+            assert!(Endpoint::parse(bad).is_err(), "{bad:?} parsed");
+        }
     }
 
     #[test]

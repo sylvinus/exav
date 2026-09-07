@@ -94,7 +94,7 @@ static NANOS: AtomicU64 = AtomicU64::new(0);
 static SLOWEST_NS: AtomicU64 = AtomicU64::new(0);
 static SLOW: AtomicU64 = AtomicU64::new(0);
 static INFECTED: AtomicU64 = AtomicU64::new(0);
-static NOT_SCANNED: AtomicU64 = AtomicU64::new(0);
+static PARTIAL: AtomicU64 = AtomicU64::new(0);
 static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the per-matcher breakdown is being collected.
@@ -199,8 +199,8 @@ impl ScanTimer {
             Category::Infected => {
                 INFECTED.fetch_add(1, Ordering::Relaxed);
             }
-            Category::NotScanned => {
-                NOT_SCANNED.fetch_add(1, Ordering::Relaxed);
+            Category::Partial => {
+                PARTIAL.fetch_add(1, Ordering::Relaxed);
             }
             Category::Clean => {}
         }
@@ -238,7 +238,7 @@ impl ScanTimer {
 pub(crate) enum Category {
     Clean,
     Infected,
-    NotScanned,
+    Partial,
 }
 
 impl From<exav_core::VerdictCategory> for Category {
@@ -246,7 +246,7 @@ impl From<exav_core::VerdictCategory> for Category {
         match c {
             exav_core::VerdictCategory::Clean => Self::Clean,
             exav_core::VerdictCategory::Infected => Self::Infected,
-            exav_core::VerdictCategory::NotScanned => Self::NotScanned,
+            exav_core::VerdictCategory::Partial => Self::Partial,
         }
     }
 }
@@ -284,7 +284,7 @@ pub(crate) struct Snapshot {
     slowest_ns: u64,
     slow: u64,
     infected: u64,
-    not_scanned: u64,
+    partial: u64,
     in_flight: u64,
     profiling: bool,
     /// `(name, ns, calls, bytes)` per matcher that ran.
@@ -299,7 +299,7 @@ fn snapshot() -> Snapshot {
         slowest_ns: SLOWEST_NS.load(Ordering::Relaxed),
         slow: SLOW.load(Ordering::Relaxed),
         infected: INFECTED.load(Ordering::Relaxed),
-        not_scanned: NOT_SCANNED.load(Ordering::Relaxed),
+        partial: PARTIAL.load(Ordering::Relaxed),
         in_flight: IN_FLIGHT.load(Ordering::Relaxed),
         profiling: profiling(),
         matchers: MATCHERS
@@ -338,7 +338,7 @@ fn render(s: &Snapshot) -> String {
     let mut out = format!(
         "SCANSTATS: scans {scans} bytes {bytes} scan-seconds {secs:.3} \
          mean-ms {mean:.3} slowest-ms {slowest:.3} throughput-MBps {tput:.1} \
-         in-flight {inflight} slow {slow} infected {infected} not-scanned {not_scanned}",
+         in-flight {inflight} slow {slow} infected {infected} partial {partial}",
         mean = if scans == 0 {
             0.0
         } else {
@@ -356,7 +356,7 @@ fn render(s: &Snapshot) -> String {
         inflight = s.in_flight,
         slow = s.slow,
         infected = s.infected,
-        not_scanned = s.not_scanned,
+        partial = s.partial,
     );
 
     if !s.profiling {
@@ -445,7 +445,7 @@ mod tests {
         let before = IN_FLIGHT.load(Ordering::Relaxed);
         let t = ScanTimer::start();
         assert!(IN_FLIGHT.load(Ordering::Relaxed) > before);
-        t.finish("gone", 0, Category::NotScanned);
+        t.finish("gone", 0, Category::Partial);
         assert_eq!(IN_FLIGHT.load(Ordering::Relaxed), before);
     }
 }

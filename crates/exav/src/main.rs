@@ -1,10 +1,14 @@
-//! exav CLI: a clamscan-compatible front-end.
+//! exav CLI: the scanner, the client, and the listeners.
 //!
 //! Exit codes and output match clamscan (0 = clean, 1 = found, 2 = error;
-//! `PATH: Signature FOUND` / `PATH: OK`). `-` reads stdin, so input can be
-//! streamed, e.g. `aws s3 cp s3://… - | exav -`. Unlike clamscan,
-//! the size bounds accept values above 2 GB, and a file
-//! that can't be fully scanned is reported `LIMITS-EXCEEDED`, not `OK`.
+//! `PATH: Signature FOUND` / `PATH: OK`), so a script reading either keeps
+//! working. The *flags* are exav's own — one clamscan has and exav does not
+//! stops the run rather than being swallowed, so a migrated command line never
+//! scans under settings nobody asked for.
+//!
+//! `-` reads stdin, so input can be streamed, e.g. `aws s3 cp s3://… - | exav -`.
+//! Unlike clamscan, the size bounds accept values above 2 GB, and a file that
+//! can't be fully scanned is reported `LIMITS-EXCEEDED`, not `OK`.
 //!
 //! # `unsafe`
 //!
@@ -38,10 +42,27 @@ use std::process::ExitCode;
 use clap::Parser;
 use exav_core::{loader, scan_path, ScanOptions, ScanReport, Scanner, Verdict, VerdictCategory};
 
-/// Status tags the daemon appends (before ` ERROR`) for a verdict that was not
-/// fully scanned — as opposed to a hard scan error. The client classifies these
-/// as "limits" (not errors) so its summary/exit match a local one-shot scan.
-const NOT_SCANNED_TAGS: [&str; 3] = ["LIMITS-EXCEEDED", "UNSCANNABLE", "PASSWORD-PROTECTED"];
+/// Categories the daemon names before the closing ` ERROR` when a verdict is
+/// `PARTIAL` — as opposed to a hard scan error, which has no category. The
+/// client reads them back so its summary and exit code match a local one-shot
+/// scan of the same file.
+const PARTIAL_TAGS: [&str; 3] = ["LIMITS-EXCEEDED", "UNSCANNABLE", "PASSWORD-PROTECTED"];
+
+/// The category of a `PARTIAL` daemon reply, or `None` for a hard error.
+///
+/// The wire grammar is `<path>: <reason> <CATEGORY> ERROR`, the same
+/// `reason CATEGORY STATUS` order the one-shot CLI prints. So the category is
+/// the second-to-last word — not a prefix of anything, and not a substring
+/// search: a reason is free text and a path like `/data/UNSCANNABLE/x` would
+/// otherwise turn a real error into a partial, moving it out of the error
+/// counter and off stderr.
+fn partial_category(line: &str) -> Option<&'static str> {
+    let head = line.strip_suffix(" ERROR")?;
+    PARTIAL_TAGS
+        .iter()
+        .copied()
+        .find(|t| head.strip_suffix(t).is_some_and(|h| h.ends_with(' ')))
+}
 
 use walkdir::WalkDir;
 
@@ -353,8 +374,16 @@ struct Cli {
     ///   clamd://0.0.0.0:3310        the clamd protocol over TCP
     ///   clamd:///var/run/exav.sock  the clamd protocol over a Unix socket
     ///   icap://0.0.0.0:1344         ICAP (RFC 3507), for a proxy's hook
+    ///   icap://0.0.0.0:1344/avscan  ICAP answering on that service only
     ///   0.0.0.0:3310                no scheme — clamd
     ///   /var/run/exav.sock          no scheme, a path — clamd over a socket
+    ///
+    /// An ICAP service name is the path of the URL a proxy is configured with,
+    /// so it goes where it already lives: paste `icap://scanner:1344/avscan`
+    /// out of a squid.conf unchanged. With no path exav answers on all three
+    /// names a c-icap `virus_scan` deployment does — avscan, srv_clamav,
+    /// virus_scan — so it stands in for one without knowing which the proxy
+    /// asks for. Naming one replaces that set rather than adding to it.
     ///
     /// A `?key=value` tail sets what belongs to this listener alone:
     ///
@@ -366,6 +395,9 @@ struct Cli {
     ///                        as `Max-Connections`). Bounds the clamd listener
     ///                        only under `--workers threads`; the prefork pool
     ///                        bounds concurrency by its worker count.
+    ///   service=a&service=b  several ICAP service names, for two proxies whose
+    ///                        configurations disagree about the path. One name
+    ///                        belongs in the path instead.
     ///
     /// Naming both protocols serves both from one process over one loaded
     /// database, which is what replaces a `c-icap` + `clamav` container pair.
@@ -386,19 +418,6 @@ struct Cli {
     /// --connect makes one.
     #[arg(long = "connect", value_name = "ADDR", env = "EXAV_CONNECT")]
     connect: Option<String>,
-
-    /// ICAP service name to answer on, i.e. the path in
-    /// `icap://host:1344/<service>`. Repeatable (comma-separated in the
-    /// environment). Naming any replaces the whole default set (avscan,
-    /// srv_clamav, virus_scan). [c-icap.conf: Service/ServiceAlias]
-    #[cfg(feature = "icap")]
-    #[arg(
-        long = "icap-service",
-        value_name = "NAME",
-        env = "EXAV_ICAP_SERVICE",
-        value_delimiter = ','
-    )]
-    icap_service: Vec<String>,
 
     /// Bytes of a body an ICAP client should send before pausing for a verdict
     /// (the `Preview` header). [default: 4096]
@@ -461,7 +480,7 @@ struct Cli {
     icap_max_header_size: Option<usize>,
 
     /// Which ICAP blocks carry the c-icap `X-Infection-Found` header: `blocks`
-    /// (every one, a not-scanned verdict under `Heuristics.Exav.*`) or
+    /// (every one, a partial verdict under `Heuristics.Exav.*`) or
     /// `detections` (a signature match only). [default: blocks]
     ///
     /// The default is what makes a block visible to a client that decides
@@ -781,7 +800,7 @@ struct Cli {
     ///                           Applied at database load, not per scan.
     ///
     /// What an *unscannable* object becomes is not here — that is a verdict
-    /// question, and --not-scanned answers it.
+    /// question, and --partial-as answers it.
     #[arg(
         long = "detect",
         value_name = "LIST",
@@ -791,26 +810,39 @@ struct Cli {
     )]
     detect: Option<policy::Detectors>,
 
-    /// What becomes of an object exav could not fully examine: `block`
-    /// (default), `alert`, `pass` — or per condition, e.g.
-    /// `password-protected=pass,limits-exceeded=alert`.
-    /// Conditions: limits-exceeded, unscannable, password-protected.
+    /// Which status an object exav could not fully examine is reported as.
+    /// One value for all of them, or per category, e.g.
+    /// `password-protected=ok,limits-exceeded=found`.
     ///
-    ///   block   The verdict stands. Exit 2, a clamd ERROR reply, an ICAP block.
-    ///   alert   Report it as a detection named `Heuristics.*`. Exit 1, FOUND,
-    ///           X-Infection-Found — an ordinary hit to any client.
-    ///   pass    Deliver it. Exit 0, OK, a 204. This is what ClamAV does for an
-    ///           encrypted archive and what c-icap does past MaxObjectSize; it
-    ///           is a real trade, not a mistake, and exav will not make it
-    ///           quietly — every passed object is logged.
+    ///   partial  What it is. Exit 3, under one of the three categories below.
+    ///            [default]
+    ///   ok       Deliver it as clean. Exit 0, OK, an ICAP 204. This is what
+    ///            ClamAV does for an encrypted archive and what c-icap does past
+    ///            MaxObjectSize; a real trade, not a mistake, and exav will not
+    ///            make it quietly — every such object is logged.
+    ///   found    Report it as a detection named `Heuristics.*`. Exit 1, FOUND,
+    ///            X-Infection-Found — an ordinary hit to any client, and what
+    ///            ClamAV's --alert-exceeds-max / --alert-encrypted produce.
+    ///   error    Report it as an operational failure. Exit 2, for a caller that
+    ///            would rather not learn a fourth exit code.
+    ///
+    /// The value names the status, and status and exit code are the same thing
+    /// said twice: OK 0, FOUND 1, ERROR 2, PARTIAL 3.
+    ///
+    /// Categories: limits-exceeded, unscannable, password-protected.
+    ///
+    /// On the clamd wire `partial` and `error` are both an `ERROR` reply: that
+    /// protocol's vocabulary is closed, and a real client reads a word it does
+    /// not know as OK — a fail-open exav will not risk. They differ only where
+    /// there is an exit code to differ in.
     #[arg(
-        long = "not-scanned",
-        value_name = "POLICY",
-        env = "EXAV_NOT_SCANNED",
-        value_parser = policy::NotScanned::parse,
+        long = "partial-as",
+        value_name = "STATUS",
+        env = "EXAV_PARTIAL_AS",
+        value_parser = policy::PartialAs::parse,
         verbatim_doc_comment
     )]
-    not_scanned: Option<policy::NotScanned>,
+    partial_as: Option<policy::PartialAs>,
 
     /// Password to try when decrypting encrypted archive members (ZIP
     /// ZipCrypto/AES). Repeatable (comma-separated in the environment):
@@ -1205,7 +1237,19 @@ fn main() -> ExitCode {
 
     // Same reason, same place: every scan on every surface asks these before it
     // reports anything, so they have to be installed before the first one runs.
-    policy::configure(cli.not_scanned.unwrap_or_default());
+    //
+    // `--clamav-compat` reports a partial as `ok`, because that is what a stock
+    // ClamAV build answers for this whole class — over `--max-filesize`, an
+    // encrypted archive, a container it cannot decode: `OK`, exit 0. A
+    // differential run that answered `PARTIAL` where clamscan answers `OK` would
+    // report a difference on every such file that is nothing to do with
+    // detection. An explicit `--partial-as` still wins, as every value in the
+    // preset does, and the objects are logged either way.
+    policy::configure(cli.partial_as.unwrap_or(if cli.clamav_compat {
+        policy::PartialAs::uniform(policy::PartialStatus::Ok)
+    } else {
+        policy::PartialAs::default()
+    }));
     metrics::configure(
         cli.profile,
         match cli.slow_scan_secs.unwrap_or(DEFAULT_SLOW_SCAN_SECS) {
@@ -1493,10 +1537,37 @@ fn main() -> ExitCode {
         }
     }
 
+    exit_code(&totals)
+}
+
+/// What a finished run exits with.
+///
+///   0  clean — everything was scanned, nothing matched
+///   1  a detection
+///   2  an error: exav could not do its job (an unreadable path, a database that
+///      would not load). This is `clamscan`'s meaning of 2, and only that.
+///   3  not scanned: exav worked, but something could not be fully examined —
+///      `LIMITS-EXCEEDED`, `UNSCANNABLE`, `PASSWORD-PROTECTED`.
+///
+/// The last two are separated because they ask different things of a caller. A
+/// `2` says the scanner is broken or misconfigured and the run's result cannot
+/// be trusted; a `3` says the scanner worked and this particular object needs a
+/// policy decision. Collapsing them into one code — which is what `clamscan`
+/// does, by calling the whole third class `OK` and exiting 0 — is what leaves an
+/// operator unable to tell "my scanner is down" from "someone uploaded an
+/// encrypted zip".
+///
+/// A detection outranks both. Finding malware is conclusive: that a limit was
+/// also hit, or another file failed to open, does not make the match less true.
+/// An error outranks a partial file for the opposite reason — it casts doubt
+/// on the whole run, where a partial file is a fact *about that file*.
+fn exit_code(totals: &Totals) -> ExitCode {
     if totals.infected > 0 {
         ExitCode::from(1)
-    } else if totals.errors > 0 || totals.limits > 0 {
+    } else if totals.errors > 0 {
         ExitCode::from(2)
+    } else if totals.limits > 0 {
+        ExitCode::from(3)
     } else {
         ExitCode::SUCCESS
     }
@@ -1813,13 +1884,13 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     opts.passwords = cli.password.clone();
     opts.structured_cc_count = cli.structured_cc_count;
     opts.structured_ssn_count = cli.structured_ssn_count;
-    // The detectors say what to look for; the not-scanned policy says what a
+    // The detectors say what to look for; the partial policy says what a
     // verdict becomes. Two of the engine's `alert_*` fields belong to the
     // second question, not the first: they turn a condition into a detection
     // under ClamAV's own `Heuristics.Encrypted.*` / `Heuristics.Limits.*`
-    // names, which is exactly what `--not-scanned … =alert` asks for.
+    // names, which is exactly what `--partial-as … =alert` asks for.
     let detect = cli.detect.unwrap_or_default();
-    let not_scanned = cli.not_scanned.unwrap_or_default();
+    let partial_as = cli.partial_as.unwrap_or_default();
     opts.heuristics = detect.heuristics();
     opts.alert_macros = detect.macros();
     opts.alert_broken_media = detect.broken_media();
@@ -1827,8 +1898,8 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     opts.alert_partition_intersection = detect.partition_intersection();
     opts.alert_broken = detect.broken();
     opts.alert_phishing = detect.phishing();
-    opts.alert_encrypted = not_scanned.alerts_encrypted();
-    opts.alert_exceeds_max = not_scanned.alerts_limits();
+    opts.alert_encrypted = partial_as.reports_encrypted_as_found();
+    opts.alert_exceeds_max = partial_as.reports_limits_as_found();
     opts
 }
 
@@ -1921,6 +1992,18 @@ fn configure_spill(cli: &Cli) -> Result<(), String> {
 }
 
 fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
+    // The policy belongs to whoever scans. A client only ever sees the reply the
+    // daemon already decided, so this flag would parse, look like it was in
+    // force, and change nothing — and it cannot be made to work: once the daemon
+    // has reported `OK` for something it passed, the fact is gone from the wire.
+    if cli.partial_as.is_some() && cli.connect.is_some() {
+        return Err(
+            "--partial-as decides how a scan reports what it could not examine, so it \
+             belongs to whatever does the scanning; set it on the daemon you are \
+             --connect-ing to"
+                .to_string(),
+        );
+    }
     if cli.connect.is_some() && serves(cli) {
         return Err(
             "--listen accepts connections and --connect makes one; a run does one or the \
@@ -2666,7 +2749,7 @@ fn client_stream_set(cli: &Cli, dir: &Path, parts: &[PathBuf], totals: &mut Tota
     };
     let Some(entries) = doc.get("files").and_then(|f| f.as_array()) else {
         let msg = doc
-            .get("message")
+            .get("reason")
             .and_then(|m| m.as_str())
             .unwrap_or("the daemon refused the request");
         report_error(&dirname, msg, cli, totals);
@@ -2733,15 +2816,18 @@ fn set_entry_line(target: &str, entry: &serde_json::Value) -> String {
         Some(s) => format!(" (in {s})"),
         None => String::new(),
     };
-    match field("verdict") {
-        "clean" => format!("{target}: OK"),
-        "malware" => format!("{target}: {} FOUND{from_set}", field("signature")),
-        "unscannable" => format!(
-            "{target}: {} ({}) ERROR{from_set}",
-            field("tag"),
-            field("message")
+    // The same grammar every other line uses — `reason CATEGORY STATUS` — built
+    // from the reply's own `status` / `category` / `reason`. The wire word for a
+    // partial is `ERROR`, as it is everywhere on the clamd protocol.
+    match field("status") {
+        "OK" => format!("{target}: OK"),
+        "FOUND" => format!("{target}: {} FOUND{from_set}", field("signature")),
+        "PARTIAL" => format!(
+            "{target}: {} {} ERROR{from_set}",
+            field("reason"),
+            field("category")
         ),
-        _ => format!("{target}: {} ERROR", field("message")),
+        _ => format!("{target}: {} ERROR", field("reason")),
     }
 }
 
@@ -3028,15 +3114,10 @@ fn client_summary(cli: &Cli, totals: &Totals, elapsed: std::time::Duration) -> E
             print_client_summary(totals);
         }
     }
-    // Same precedence as a local scan: a detection is exit 1; anything not fully
-    // scanned (limits) or a hard error is exit 2.
-    if totals.infected > 0 {
-        ExitCode::from(1)
-    } else if totals.errors > 0 || totals.limits > 0 {
-        ExitCode::from(2)
-    } else {
-        ExitCode::SUCCESS
-    }
+    // The same rule as a local scan, from the same place: a client and a local
+    // run answering differently about the same verdicts would be a difference
+    // nobody could see until it mattered.
+    exit_code(totals)
 }
 
 /// The human client summary: the counters the daemon's replies produced. A
@@ -3079,20 +3160,13 @@ fn print_daemon_reply(line: &str, cli: &Cli, totals: &mut Totals) {
             print!("\x07");
         }
     } else if verdict.ends_with("ERROR") {
-        // The daemon renders a not-scanned verdict as
-        // `<path>: <TAG> (<reason>) ERROR`. Count those as "limits" (never
-        // clean, but not a hard error) and print them like a one-shot scan does,
-        // so the two paths agree; only a genuine scan error falls through to the
-        // error counter and stderr.
-        //
-        // Matched at the START of the status, not anywhere in the line: a path
-        // that merely contains the word — `/data/UNSCANNABLE/x` — would
-        // otherwise turn a real error into a limit, changing the summary bucket
-        // and sending it to stdout instead of stderr. The status is whatever
-        // follows the last `": "`, since the reason text can carry colons of its
-        // own and the status is always last.
-        let status = verdict.rsplit_once(": ").map_or(verdict, |(_, s)| s);
-        if NOT_SCANNED_TAGS.iter().any(|t| status.starts_with(t)) {
+        // A `PARTIAL` verdict travels as `ERROR` because clamd's vocabulary has
+        // no fourth word, so the category is what separates it from a scan that
+        // actually failed. Count a categorised reply as a partial and print it
+        // like a one-shot scan does, so the two paths agree; only an
+        // uncategorised `ERROR` is a genuine failure, and it goes to the error
+        // counter and stderr.
+        if partial_category(verdict).is_some() {
             totals.limits += 1;
             outln!("{line}");
         } else {
@@ -3134,20 +3208,27 @@ fn json_daemon_reply(line: &str, cli: &Cli, totals: &mut Totals) {
     let obj = if line.ends_with("FOUND") {
         totals.infected += 1;
         let sig = status.strip_suffix(" FOUND").unwrap_or(status);
-        serde_json::json!({
-            "file": file, "category": "infected", "status": "FOUND", "detail": sig
-        })
+        serde_json::json!({"file": file, "status": "FOUND", "signature": sig})
     } else if line.ends_with("ERROR") {
-        if let Some(tag) = NOT_SCANNED_TAGS.iter().find(|t| status.starts_with(**t)) {
+        if let Some(tag) = partial_category(line) {
             totals.limits += 1;
+            // The reason is what is left once the category and the status word
+            // are taken off — the same string `emit_json_result` puts under
+            // `reason` for a local scan. Split from the FRONT here, unlike the
+            // other two branches: a reason is a sentence and can carry `": "`,
+            // where a signature name cannot.
+            let head = line
+                .strip_suffix(" ERROR")
+                .and_then(|h| h.strip_suffix(tag))
+                .map_or(line, str::trim_end);
+            let (file, reason) = head.split_once(": ").unwrap_or((head, ""));
             serde_json::json!({
-                "file": file, "category": "not-scanned", "status": tag, "detail": status
+                "file": file, "status": "PARTIAL", "category": tag, "reason": reason
             })
         } else {
             totals.errors += 1;
-            serde_json::json!({
-                "file": file, "category": "error", "status": "ERROR", "detail": status
-            })
+            let reason = status.strip_suffix(" ERROR").unwrap_or(status);
+            serde_json::json!({"file": file, "status": "ERROR", "reason": reason})
         }
     } else {
         if cli.quiet {
@@ -3268,7 +3349,7 @@ fn scan_one_allmatch(
             // `totals.limits`, matching `report_result` on the single-match
             // path. These three outcomes are "not scanned", not "the scan went
             // wrong": counting them as errors makes the same file produce a
-            // different summary — and a different `not_scanned` in JSON —
+            // different summary — and a different `partial_as` in JSON —
             // depending only on whether `--all-matches` was passed.
             if status != "OK" {
                 totals.limits += 1;
@@ -3303,7 +3384,7 @@ fn emit_json_summary(totals: &Totals, elapsed: std::time::Duration) {
             "summary": {
                 "scanned": totals.scanned,
                 "infected": totals.infected,
-                "not_scanned": totals.limits,
+                "partial_as": totals.limits,
                 "errors": totals.errors,
                 "data_scanned_bytes": totals.data_scanned,
                 "elapsed_secs": elapsed.as_secs_f64(),
@@ -3314,7 +3395,7 @@ fn emit_json_summary(totals: &Totals, elapsed: std::time::Duration) {
 
 fn report_result(name: &str, mut report: ScanReport, cli: &Cli, totals: &mut Totals) {
     // Every scan the CLI reports comes through here — human output, JSON,
-    // counters and therefore the exit code — so the not-scanned policy is
+    // counters and therefore the exit code — so the partial policy is
     // applied once, in front of all of them. Applied per output mode instead, a
     // `pass` would have had to be remembered four times, and forgetting the
     // counters would mean an object the operator asked to pass still exiting 2.
@@ -3326,7 +3407,17 @@ fn report_result(name: &str, mut report: ScanReport, cli: &Cli, totals: &mut Tot
     // Update counters first (identical in every output mode), then render.
     match v.category() {
         VerdictCategory::Infected => totals.infected += 1,
-        VerdictCategory::NotScanned => totals.limits += 1,
+        // `--partial-as error` is the one status `apply` cannot express in the
+        // report: it changes no verdict, only which counter — and therefore
+        // which exit code — this object contributes to. The line still names
+        // the category, so the report has to keep it.
+        VerdictCategory::Partial => {
+            if policy::current().for_tag(v.status_tag()) == policy::PartialStatus::Error {
+                totals.errors += 1;
+            } else {
+                totals.limits += 1;
+            }
+        }
         VerdictCategory::Clean => {}
     }
     if cli.json {
@@ -3351,12 +3442,23 @@ fn report_result(name: &str, mut report: ScanReport, cli: &Cli, totals: &mut Tot
                 print!("\x07");
             }
         }
-        // Limit hit / undecodable / encrypted — all "not clean, not fully
-        // scanned". Counted together (never a silent pass); the tag distinguishes
-        // them. Encrypted is actionable: re-scan with --password.
-        VerdictCategory::NotScanned => {
+        // Limit hit / undecodable / encrypted — all "work happened and stopped
+        // short". One grammar with every other line: `path: [reason ][CATEGORY ]
+        // STATUS`, the status word last, which is where `clamscan` puts `OK` and
+        // `FOUND` and therefore where anything reading these lines looks.
+        //
+        // `--partial-as error` prints the same line: the object is still partial
+        // and the category still has to be named. Only the exit code differs,
+        // which is the one thing a line cannot carry.
+        VerdictCategory::Partial => {
+            let status = if policy::current().for_tag(v.status_tag()) == policy::PartialStatus::Error
+            {
+                "ERROR"
+            } else {
+                "PARTIAL"
+            };
             outln!(
-                "{name}: {} {}",
+                "{name}: {} {} {status}",
                 v.detail().unwrap_or_default(),
                 v.status_tag()
             );
@@ -3374,12 +3476,22 @@ fn report_result(name: &str, mut report: ScanReport, cli: &Cli, totals: &mut Tot
     }
 }
 
-/// Coarse `category()` as a stable machine string for `--json`.
-fn category_str(c: VerdictCategory) -> &'static str {
+/// The status word for a report, in JSON as on a line.
+///
+/// The same four values everywhere — `OK`, `FOUND`, `ERROR`, `PARTIAL` — each
+/// naming the exit code it contributes, so a machine consumer and a human read
+/// the same vocabulary and neither needs a translation table.
+fn status_str(c: VerdictCategory, tag: &str) -> &'static str {
     match c {
-        VerdictCategory::Clean => "clean",
-        VerdictCategory::Infected => "infected",
-        VerdictCategory::NotScanned => "not-scanned",
+        VerdictCategory::Clean => "OK",
+        VerdictCategory::Infected => "FOUND",
+        VerdictCategory::Partial => {
+            if policy::current().for_tag(tag) == policy::PartialStatus::Error {
+                "ERROR"
+            } else {
+                "PARTIAL"
+            }
+        }
     }
 }
 
@@ -3394,8 +3506,13 @@ fn emit_json_result(name: &str, report: &ScanReport, cli: &Cli) {
     }
     let mut obj = serde_json::Map::new();
     obj.insert("file".into(), name.into());
-    obj.insert("category".into(), category_str(cat).into());
-    obj.insert("status".into(), v.status_tag().into());
+    // `status` is the same word the line ends with; `category` says which of the
+    // three conditions produced a PARTIAL, and is absent for the other statuses
+    // because they have no sub-classification to give.
+    obj.insert("status".into(), status_str(cat, v.status_tag()).into());
+    if cat == VerdictCategory::Partial {
+        obj.insert("category".into(), v.status_tag().into());
+    }
     if let Some(d) = v.detail() {
         // For Infected this is the signature name; otherwise the reason string.
         let key = if cat == VerdictCategory::Infected {
@@ -4049,22 +4166,18 @@ mod tests {
         // c-icap container behind such a client.
         assert_eq!(cfg.infection_header, icap::InfectionHeader::Blocks);
         // exav does not take the c-icap trade on a deployment's behalf.
-        assert_eq!(cfg.not_scanned, policy::NotScanned::default());
+        assert_eq!(cfg.partial_as, policy::PartialAs::default());
 
         let cfg = icap::config_from_cli(&Cli::parse_from([
             "exav",
             "--listen",
-            "icap://127.0.0.1:2000",
-            "--icap-service",
-            "one",
-            "--icap-service",
-            "two",
+            "icap://127.0.0.1:2000?service=one&service=two",
             "--icap-preview-bytes",
             "512",
             "--icap-infection-header",
             "detections",
-            "--not-scanned",
-            "password-protected=pass",
+            "--partial-as",
+            "password-protected=ok",
         ]))
         .unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:2000");
@@ -4079,13 +4192,13 @@ mod tests {
             "a per-listener size ceiling would answer differently from the daemon"
         );
         assert_eq!(cfg.infection_header, icap::InfectionHeader::Detections);
-        // The ICAP listener does not have its own pass policy: `--not-scanned`
+        // The ICAP listener does not have its own pass policy: `--partial-as`
         // answers the same question for the CLI's exit code and the daemon's
         // reply, and one question with two answers is how two surfaces come to
         // disagree about the same object.
         assert_eq!(
-            cfg.not_scanned,
-            policy::NotScanned::parse("password-protected=pass").unwrap()
+            cfg.partial_as,
+            policy::PartialAs::parse("password-protected=ok").unwrap()
         );
 
         // A value neither flag recognises is refused at parse time rather than
@@ -4094,7 +4207,7 @@ mod tests {
         // parsed would be a hole nobody knows they are running.
         for bad in [
             &["--icap-infection-header", "sometimes"][..],
-            &["--not-scanned", "unscannble"],
+            &["--partial-as", "unscannble"],
         ] {
             assert!(
                 Cli::try_parse_from(["exav"].iter().chain(bad.iter()).copied()).is_err(),
@@ -4262,21 +4375,18 @@ mod tests {
         assert_eq!(f.startup_timeout, Some(5));
         assert_eq!(f.log, Some(PathBuf::from("/flag/scan.log")));
 
-        // A repeatable list is one setting too: the flag replaces the
-        // environment's list rather than appending to it, so a run answers on
-        // exactly the services it was given.
+        // The ICAP services ride on the address, so they inherit the one
+        // precedence rule rather than having their own: a `--listen` replaces
+        // the environment's address entire, services included. Nothing can
+        // half-override, because there is only ever one address in play.
         #[cfg(feature = "icap")]
         {
-            let _services = EnvVars::set(&[("EXAV_ICAP_SERVICE", "from_env,also_env")]);
-            let listen = ["--listen", "icap://0.0.0.0:1344"];
-            let e = icap::config_from_cli(&cli(&listen)).unwrap();
-            assert_eq!(e.services, ["from_env", "also_env"]);
-            let with_flag: Vec<&str> = listen
-                .iter()
-                .copied()
-                .chain(["--icap-service", "from_flag"])
-                .collect();
-            let f = icap::config_from_cli(&cli(&with_flag)).unwrap();
+            let _listen =
+                EnvVars::set(&[("EXAV_LISTEN", "icap://0.0.0.0:1344?service=a&service=b")]);
+            let e = icap::config_from_cli(&cli(&[])).unwrap();
+            assert_eq!(e.services, ["a", "b"]);
+            let f = icap::config_from_cli(&cli(&["--listen", "icap://0.0.0.0:1344/from_flag"]))
+                .unwrap();
             assert_eq!(f.services, ["from_flag"]);
         }
     }
@@ -4351,7 +4461,7 @@ mod tests {
             "a clean line stays clean"
         );
 
-        // A not-scanned verdict from a set is a limit, not a hard error.
+        // A partial verdict from a set is a limit, not a hard error.
         let mut totals = Totals::default();
         print_daemon_reply(
             "/x/set.7z.001: LIMITS-EXCEEDED (too big) ERROR (in set.7z)",

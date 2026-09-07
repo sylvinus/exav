@@ -1,12 +1,14 @@
 # exav
 
-**A fast, memory-safe malware scanner.** A `clamscan`-compatible CLI and a
-`clamd`- and ICAP-compatible daemon, loading ClamAV's own signature databases,
-with no file-size limit.
+**A fast, memory-safe malware scanner.** A scanning CLI and a `clamd`- and
+ICAP-compatible daemon, loading ClamAV's own signature databases, with no
+file-size limit.
 
 This crate is the `exav` binary. It reads `.cvd`/`.cld`, `.ndb`/`.ldb`/`.hdb`/…
 and YARA `.yar`/`.yara`, and answers the `clamd` wire protocol — so `clamdscan`,
-milters and existing client libraries talk to it unchanged.
+milters and existing client libraries talk to it unchanged. It prints
+`clamscan`'s output format; its flags are its own, and one `clamscan` has that
+exav lacks stops the run rather than being ignored.
 
 ```sh
 cargo install exav
