@@ -268,6 +268,21 @@ required-features = ["rar"]
 name = "rar5_check"
 required-features = ["rar"]
 
+# Drives the PE-packer emulator, which `emulate_pe` only exposes behind
+# `pe-emu`. Undeclared it would be built by every feature pass, so the
+# minimal-build pass would fail to compile on a diagnostic example.
+[[example]]
+name = "pepack_emu"
+required-features = ["pe-emu"]
+
+# The CLI suite drives `list`/`extract` over ZIP fixtures, so without `zip`
+# every archive it builds lists zero members and the assertions fail on a build
+# that is behaving correctly. The usage-error cases it also covers are format-
+# independent, but they run in every other feature pass.
+[[test]]
+name = "cli"
+required-features = ["zip"]
+
 [dev-dependencies]
 # Used only in tests to compare decoder output against external-oracle digests.
 sha2 = "0.10"

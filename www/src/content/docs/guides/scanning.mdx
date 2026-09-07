@@ -77,9 +77,13 @@ The human-readable output is one line per file:
 ```console
 /path/to/file: Win.Trojan.Agent-1234 FOUND
 /path/to/clean: OK
-/path/to/huge.bin: LIMITS-EXCEEDED
-/path/to/secret.zip: PASSWORD-PROTECTED
+/path/to/huge.bin: file size 9663676416 exceeds max-scan-size 4294967296; scanned first 4294967296 bytes only LIMITS-EXCEEDED PARTIAL
+/path/to/secret.zip: encrypted archive member PASSWORD-PROTECTED PARTIAL
 ```
+
+A line that could not be fully examined ends with two words, not one: the
+[category](/reference/verdicts/) saying which condition stopped the scan, and
+the status `PARTIAL` that every category shares. The reason comes first.
 
 followed by a `clamscan`-style summary. `--quiet` is the single output dial —
 it suppresses the `OK` lines and the summary together, with `-v` at the other

@@ -88,8 +88,11 @@ fn read_ptgstr(rgce: &[u8], i: usize) -> Option<(String, usize)> {
     let chars = rgce.get(i + 2..i + 2 + nbytes)?;
     let s = if high {
         let units: Vec<u16> = chars
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
             .collect();
         String::from_utf16_lossy(&units)
     } else {

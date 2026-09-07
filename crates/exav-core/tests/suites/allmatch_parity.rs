@@ -134,6 +134,7 @@ fn allmatch_runs_the_same_heuristics_as_a_normal_scan() {
 }
 
 #[test]
+#[cfg(feature = "dlp")]
 fn allmatch_reports_structured_data_findings() {
     // DLP is the other shape: driven by its own thresholds rather than by
     // `--detect heuristics`, and applied at every recursion level.
@@ -179,6 +180,7 @@ fn compressor_fixture(name: &str) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(all(feature = "gzip", feature = "bzip2", feature = "xz"))]
 fn every_single_stream_compressor_streams_its_content() {
     // gzip, bzip2 and xz are the same shape: one stream whose output can be
     // orders of magnitude larger than the file. Each has to be walked as a
@@ -237,6 +239,7 @@ fn tar_wrapping(name: &str, data: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(all(feature = "zip", feature = "tar"))]
 fn nesting_depth_does_not_change_what_a_scan_finds() {
     // A container whose members can be streamed must be walked that way at every
     // depth. When only the OUTERMOST container streamed, the same ZIP answered
@@ -457,6 +460,7 @@ fn allmatch_does_not_re_carve_a_container_into_itself() {
 /// differently depending on the container they sit in, which is the divergence
 /// `--all-matches` exists to not have.
 #[test]
+#[cfg(feature = "zip")]
 fn allmatch_reports_every_signature_inside_a_single_streamed_member() {
     const SIG_A: &[u8] = b"exavProbeAlphaSignatureBody";
     const SIG_B: &[u8] = b"exavProbeBetaSignatureBody";

@@ -80,6 +80,7 @@ fn reported_reason(pe: &[u8]) -> Option<&'static str> {
 }
 
 #[test]
+#[cfg(feature = "pepack")]
 fn every_virtualizing_protector_is_recognised() {
     for (name, sections) in [
         ("VMProtect", vec![&b".vmp0"[..], &b".vmp1"[..]]),
@@ -108,6 +109,7 @@ fn every_virtualizing_protector_is_recognised() {
 }
 
 #[test]
+#[cfg(feature = "pepack")]
 fn an_ordinary_pe_is_not_flagged() {
     // The markers must be specific. Flagging every PE as protected would make
     // the verdict meaningless.

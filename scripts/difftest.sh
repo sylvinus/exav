@@ -351,7 +351,13 @@ phase_exav() {
   #   * `--max-scan-time` defaults to 120s. If the client's own timeout is
   #     longer, a killed worker looks like a slow file; if shorter, the client
   #     gives up on work the daemon then completes for nobody. Keep them equal.
-  local flags="--workers $JOBS --max-scan-secs ${TMO%.*}"
+  #     `--max-scan-secs` takes whole seconds, so a fractional TMO is rounded
+  #     UP. Truncating it (`2.5` -> `2`, and `0.5` -> `0`) hands the daemon a
+  #     cap SHORTER than the client's timeout, which is the second failure
+  #     above: the worker is killed on a file the client is still waiting for.
+  local max_scan_secs
+  max_scan_secs=$(awk -v t="$TMO" 'BEGIN { printf "%d", (t == int(t) ? t : int(t) + 1) }')
+  local flags="--workers $JOBS --max-scan-secs $max_scan_secs"
   [ "$COMPAT" = 1 ] && flags="$flags --clamav-compat"
   # Cover every alert class clamd was configured with. Anything clamd is asked
   # to alert on and exav is not becomes a fake FN — the file is bucketed as

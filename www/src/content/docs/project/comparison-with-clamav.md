@@ -55,7 +55,7 @@ Two wire-level differences to know about before you swap a socket:
   applies to local files too.
 - **An over-limit stream is refused in exav's own words.** clamd replies
   `INSTREAM size limit exceeded. ERROR` and closes; exav replies
-  `stream: LIMITS-EXCEEDED (size exceeds N) ERROR`. A client matching clamd's
+  `stream: <reason> LIMITS-EXCEEDED ERROR`. A client matching clamd's
   exact string will not recognise it. The verdict class is the same, and
   [never clean](/reference/verdicts/).
 

@@ -2295,40 +2295,54 @@ fn scan_one(path: &Path, db: &Scanner, opts: &ScanOptions, cli: &Cli, totals: &m
     if cli.profile {
         exav_core::profile::enable();
     }
-    let scanned =
+    let mut scanned =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_path(db, path, opts)));
     if cli.profile {
         let prof = exav_core::profile::take();
+        // `--profile` returns before `report_result`, so the partial policy has
+        // to be applied here too. Without it `--partial-as` reaches every mode
+        // except this one: the same files would exit 3 under `--profile` and 0
+        // without it, and the CSV would name a verdict the operator asked to be
+        // reported as something else.
+        if let Ok(Ok(r)) = &mut scanned {
+            policy::apply(r, policy::current());
+        }
         let (verdict, sig) = match &scanned {
-            Ok(Ok(r)) => match &r.verdict {
-                Verdict::Clean => ("clean", String::new()),
-                Verdict::Infected { signature, .. } => {
-                    totals.infected += 1;
-                    ("infected", signature.clone())
+            Ok(Ok(r)) => {
+                let v = &r.verdict;
+                // Counted, not just labelled, and counted the way `report_result`
+                // counts — through the exhaustive `VerdictCategory`. The CSV row
+                // records what happened, but the exit code is the machine-readable
+                // answer, and a run whose files all hit limits exiting 0 tells a
+                // script every one of them was scanned and clean.
+                match v.category() {
+                    VerdictCategory::Infected => totals.infected += 1,
+                    // As in `report_result`: `--partial-as error` changes no
+                    // verdict, only which counter — and so which exit code —
+                    // this object contributes to.
+                    VerdictCategory::Partial => {
+                        if policy::current().for_tag(v.status_tag()) == policy::PartialStatus::Error
+                        {
+                            totals.errors += 1;
+                        } else {
+                            totals.limits += 1;
+                        }
+                    }
+                    VerdictCategory::Clean => {}
                 }
-                // Counted, not just labelled. The CSV row records what happened,
-                // but the exit code is the machine-readable answer, and a run
-                // whose files all hit limits exiting 0 tells a script every one
-                // of them was scanned and clean.
-                Verdict::LimitsExceeded { reason } => {
-                    totals.limits += 1;
-                    ("limits", reason.clone())
+                match v {
+                    Verdict::Clean => ("clean", String::new()),
+                    Verdict::Infected { signature, .. } => ("infected", signature.clone()),
+                    Verdict::LimitsExceeded { reason } => ("limits", reason.clone()),
+                    Verdict::Unscannable { reason } => ("unscannable", reason.clone()),
+                    Verdict::PasswordProtected { reason } => ("password-protected", reason.clone()),
+                    // `Verdict` is `#[non_exhaustive]`. This is a profiling
+                    // column, not a verdict decision — the counters above already
+                    // classified it — so an unrecognised outcome is labelled
+                    // rather than guessed at, and never labelled clean.
+                    _ => ("other", String::new()),
                 }
-                Verdict::Unscannable { reason } => {
-                    totals.limits += 1;
-                    ("unscannable", reason.clone())
-                }
-                Verdict::PasswordProtected { reason } => {
-                    totals.limits += 1;
-                    ("password-protected", reason.clone())
-                }
-                // `Verdict` is `#[non_exhaustive]`. This is a profiling column,
-                // not a verdict decision — exit codes and the scan result come
-                // from `VerdictCategory`, which is exhaustive on purpose — so
-                // an unrecognised outcome is labelled rather than guessed at,
-                // and never labelled clean.
-                _ => ("other", String::new()),
-            },
+            }
             Ok(Err(e)) => {
                 totals.errors += 1;
                 ("error", e.to_string())
@@ -3409,6 +3423,8 @@ fn report_result(name: &str, mut report: ScanReport, cli: &Cli, totals: &mut Tot
     // applied once, in front of all of them. Applied per output mode instead, a
     // `pass` would have had to be remembered four times, and forgetting the
     // counters would mean an object the operator asked to pass still exiting 2.
+    // (`--profile` is the one path that does not reach here: it prints a CSV row
+    // and returns, so it applies the policy itself and counts the same way.)
     policy::apply(&mut report, policy::current());
     // Classification, status tag and detail all come from exav-core so this
     // human output and the daemon's wire output can't disagree (see

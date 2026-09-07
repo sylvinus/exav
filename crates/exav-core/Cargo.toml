@@ -256,6 +256,32 @@ required-features = ["unstable-internals"]
 name = "triage_bc"
 required-features = ["unstable-internals"]
 
+# The YARA engine lives behind the `yara` feature, so the targets that drive it
+# have to be gated too. Auto-discovered targets are built by every feature pass,
+# including `--no-default-features` — where `exav_core::yara::compile` and
+# friends are configured out and these fail to COMPILE, taking the minimal-build
+# pass down with them. That pass exists to check the `cfg(not(feature = ...))`
+# fallbacks, so it is the one that must not be blocked by an unrelated target.
+[[example]]
+name = "yara_coverage"
+required-features = ["yara"]
+
+[[test]]
+name = "yara_conformance"
+required-features = ["yara"]
+
+[[test]]
+name = "yara_difftest"
+required-features = ["yara"]
+
+[[test]]
+name = "yara_coverage_difftest"
+required-features = ["yara"]
+
+[[test]]
+name = "yara_elf_module"
+required-features = ["yara"]
+
 # docs.rs builds with every feature on, so the parts gated behind a feature
 # (in particular exav-core's `unstable-internals`) appear on the rendered page
 # instead of silently missing from it.

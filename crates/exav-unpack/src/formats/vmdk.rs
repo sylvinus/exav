@@ -145,8 +145,8 @@ pub(crate) fn extract_vmdk<R>(
             visit,
         );
     };
-    for (i, gde_chunk) in gd.chunks_exact(4).enumerate() {
-        let gde = u32::from_le_bytes(gde_chunk.try_into().unwrap_or([0; 4]));
+    for (i, gde_chunk) in gd.as_chunks::<4>().0.iter().enumerate() {
+        let gde = u32::from_le_bytes(*gde_chunk);
         if gde == GDE_UNALLOCATED {
             continue;
         }
@@ -155,8 +155,8 @@ pub(crate) fn extract_vmdk<R>(
         let Some(gt) = data.get(gt_byte..gt_byte + 512 * 4) else {
             continue;
         };
-        for (j, gte_chunk) in gt.chunks_exact(4).enumerate() {
-            let gte = u32::from_le_bytes(gte_chunk.try_into().unwrap_or([0; 4]));
+        for (j, gte_chunk) in gt.as_chunks::<4>().0.iter().enumerate() {
+            let gte = u32::from_le_bytes(*gte_chunk);
             if gte == 0 {
                 continue;
             }

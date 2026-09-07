@@ -375,8 +375,11 @@ fn collect_names(meta: &[u8], out: &mut HashMap<[u8; HASH_LEN], String>) {
                 .get(name_at..name_at + name_len)
                 .map(|raw| {
                     let units: Vec<u16> = raw
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u16::from_le_bytes)
                         .collect();
                     String::from_utf16_lossy(&units)
                 })

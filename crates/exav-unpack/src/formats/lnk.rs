@@ -121,8 +121,11 @@ pub(crate) fn extract_lnk<R>(
         let take = needed.min(avail);
         let s = if unicode {
             let units: Vec<u16> = data[pos..pos + take]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
                 .collect();
             String::from_utf16_lossy(&units)
         } else {

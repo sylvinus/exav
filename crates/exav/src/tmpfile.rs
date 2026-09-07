@@ -22,8 +22,9 @@
 //! * **Cleaned up.** Dropping removes the file (or the directory tree); a crash
 //!   can leave one behind.
 //!
-//! `exav-core` carries a test-only copy of this file for the same reason; the
-//! two are meant to stay identical.
+//! `exav-core` carries a smaller, test-only copy for the same reason. It shares
+//! the security properties above; the spill-specific parts — `new_in`,
+//! unlink-on-create, and the refusal to write after a read-back — live only here.
 
 // The binary uses the spill file; the integration tests that include this module
 // by path use only the directory. Neither has to use all of it.

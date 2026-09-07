@@ -65,10 +65,12 @@ pub(super) fn wrap_coder(
                     1u32 << 11
                 }
             };
-            // Bound the up-front dictionary allocation by the declared output —
-            // a dictionary larger than the bytes it will be used to look back
-            // into cannot be consulted, and the size is attacker-controlled.
-            let dict_size = crate::bounded_dict(dict_size, expected_size as u64);
+            // Bound the up-front dictionary allocation. `expected_size` is a
+            // header var-int and nothing else bounds it, so it is no ceiling on
+            // its own; `max_buffer` is. Keep the declared output as the tighter
+            // of the two — a dictionary larger than the bytes it will be used to
+            // look back into cannot be consulted.
+            let dict_size = crate::bounded_dict(dict_size, (expected_size as u64).min(max_buffer));
             let decoder = lzma_rust2::LzmaReader::new_with_props(
                 inner,
                 expected_size as u64,

@@ -111,17 +111,27 @@ down means traffic flows unscanned.
 
 ## Verdict mapping
 
-| Verdict | ICAP response | Headers |
-|---|---|---|
-| `Clean` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message back byte for byte | — |
-| `Infected` | `200 OK` + a block page | `X-Infection-Found: Type=0; Resolution=2; Threat=<signature>;` |
-| `LimitsExceeded` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.LimitsExceeded;`, `X-Exav-Status: PARTIAL`, `X-Exav-Category: LIMITS-EXCEEDED`, `X-Exav-Reason: <detail>` |
-| `Unscannable` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.Unscannable;`, `X-Exav-Status: PARTIAL`, `X-Exav-Category: UNSCANNABLE`, `X-Exav-Reason: <detail>` |
-| `PasswordProtected` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.PasswordProtected;`, `X-Exav-Status: PARTIAL`, `X-Exav-Category: PASSWORD-PROTECTED`, `X-Exav-Reason: <detail>` |
+The mapping is keyed on the verdict's **category** — `CLEAN`, `INFECTED`,
+`PARTIAL` — not on the individual verdicts behind it, so a partial condition
+added to the engine arrives here already mapped, and on the blocking side.
 
-The bottom three rows are the default, not the only option —
-[`--partial-as`](#delivering-what-exav-could-not-examine) hands those objects
-to the client instead. A detection is never affected by it.
+| Category | ICAP response | Headers |
+|---|---|---|
+| `CLEAN` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message back byte for byte | — |
+| `INFECTED` | `200 OK` + a block page | `X-Infection-Found: Type=0; Resolution=2; Threat=<signature>;` |
+| `PARTIAL` | `200 OK` + a block page | `X-Exav-Status: PARTIAL`, `X-Exav-Category: <condition>`, `X-Exav-Reason: <detail>` — plus `X-Infection-Found: … Threat=Heuristics.Exav.<Condition>;` under the default [`--icap-infection-header blocks`](#if-you-want-the-header-to-mean-a-database-hit-and-nothing-else) |
+
+`X-Exav-Category` carries the condition, and the threat name is derived from it:
+
+| `X-Exav-Category` | Threat name in `X-Infection-Found` |
+|---|---|
+| `LIMITS-EXCEEDED` | `Heuristics.Exav.LimitsExceeded` |
+| `UNSCANNABLE` | `Heuristics.Exav.Unscannable` |
+| `PASSWORD-PROTECTED` | `Heuristics.Exav.PasswordProtected` |
+
+`X-Exav-Status` is `PARTIAL` for every one of them. Blocking them is the default,
+not the only option — [`--partial-as`](#delivering-what-exav-could-not-examine)
+hands those objects to the client instead. A detection is never affected by it.
 
 **Every non-clean verdict blocks, and every block says so in the c-icap
 vocabulary.** This is the ICAP face of exav's [never a silent
@@ -381,18 +391,13 @@ Connection: keep-alive
 Encapsulated: null-body=0
 ```
 
-## What is behind the port
+## Framing, and why the feature is on by default
 
-ICAP is a line protocol whose every byte arrives from the network, so the parsers
-a hostile client reaches first are exav's own code: the request line, the header
-block, the `Encapsulated` offset list and the chunked body decoder are written
-against `std` alone, in a module that carries `#![forbid(unsafe_code)]` inside a
-binary that cannot forbid it outright (the prefork daemon needs libc). `forbid`
-rather than `deny`, because `deny` is one `#[allow]` away from being switched off
-inside the very module it guards. No HTTP
-library is involved. ICAP's framing is close to HTTP's without being the same —
-an HTTP chunked decoder has no `0; ieof`, and a decoder that reads it as a plain
-end-of-body cannot tell a complete small object from the head of a large one.
+ICAP's framing resembles HTTP's without being it: an HTTP chunked decoder has no
+`0; ieof`, and one that reads that marker as an ordinary end-of-body cannot tell
+a complete small object from the head of a large one. So exav parses the request
+line, the header block, the `Encapsulated` offset list and the chunked body
+itself, against `std` alone — no HTTP library is involved.
 
 Serving ICAP therefore adds no dependency to the binary, which is why the `icap`
 [feature](/reference/feature-flags/) is on by default: it costs a build nothing

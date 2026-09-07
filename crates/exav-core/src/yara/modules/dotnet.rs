@@ -483,7 +483,9 @@ impl<'a> Meta<'a> {
 
         let guids: Vec<Value> = self
             .guids
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|g| Value::Str(format_guid(g).into_bytes()))
             .collect();
         f.insert("number_of_guids".into(), Value::Int(guids.len() as i64));

@@ -336,8 +336,11 @@ fn parse_dir(d: &[u8]) -> DirInfo {
 fn decode_utf16(d: &[u8], p: usize, n: usize) -> String {
     let bytes = d.get(p..p + n).unwrap_or(&[]);
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect();
     String::from_utf16_lossy(&units)
 }

@@ -52,7 +52,7 @@ test-native:
 	# question goes unasked — a scanner that dies on crafted input and exits 0
 	# is indistinguishable, to a pipeline reading `$$?`, from a clean scan.
 	$(CARGO) test -p exav-unpack --features testing-faults panic_containment
-	$(CARGO) test -p exav-cli --features testing-faults --test decoder_crash
+	$(CARGO) test -p exav --features testing-faults --test decoder_crash
 
 ## test-yara-diff: the yara-x A/B differential harness — compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT

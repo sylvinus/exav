@@ -144,3 +144,63 @@ fn all_matches_still_reports_a_file_past_the_size_ceiling() {
     assert_eq!(seen[0].2, "LIMITS-EXCEEDED");
     assert_eq!(seen[0].0, Some(3));
 }
+
+/// `--profile` must not change the answer, only add timings beside it.
+///
+/// It prints a CSV row and returns before the reporting path where every other
+/// mode applies `--partial-as`, so the policy has to be applied there too.
+/// Without that, asking for over-limit files to pass still exits 3 under
+/// `--profile` — a flag about *where the time went* silently overriding a flag
+/// about *what the verdict is*, in the direction a CI gate would notice only by
+/// failing.
+#[test]
+fn profile_reports_the_same_verdict_as_a_plain_scan() {
+    let db = TempDir::new().unwrap();
+    let files = TempDir::new().unwrap();
+    let big = files.path().join("big.bin");
+    std::fs::write(&big, vec![b'a'; 3 * 1024 * 1024]).unwrap();
+
+    // The CSV `verdict` column against the exit code the same policy produces
+    // without `--profile`: partial keeps it, `ok` passes it, `error` fails it.
+    for (policy, exit, column) in [
+        ("partial", 3, "limits"),
+        ("ok", 0, "clean"),
+        ("error", 2, "limits"),
+        ("found", 1, "infected"),
+    ] {
+        let run = |extra: &[&str]| {
+            exav()
+                .arg("-d")
+                .arg(db.path())
+                .arg("--max-input-bytes")
+                .arg("1M")
+                .arg("--partial-as")
+                .arg(policy)
+                .args(extra)
+                .arg(&big)
+                .output()
+                .expect("run exav")
+        };
+        let plain = run(&[]);
+        let profiled = run(&["--profile"]);
+        assert_eq!(
+            profiled.status.code(),
+            plain.status.code(),
+            "--partial-as {policy}: --profile changed the exit code"
+        );
+        assert_eq!(
+            plain.status.code(),
+            Some(exit),
+            "--partial-as {policy}: unexpected exit code"
+        );
+
+        // Row after the header; `verdict` is the third column.
+        let stdout = String::from_utf8_lossy(&profiled.stdout);
+        let row = stdout.lines().nth(1).unwrap_or_default().to_string();
+        assert_eq!(
+            row.split(',').nth(2),
+            Some(column),
+            "--partial-as {policy}: CSV verdict column disagrees with the policy"
+        );
+    }
+}
