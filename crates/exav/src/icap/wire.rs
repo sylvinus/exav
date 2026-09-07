@@ -74,8 +74,14 @@ const MAX_LINE: usize = 16 * 1024;
 /// which is how a keep-alive connection normally ends and is not an error.
 pub(super) fn read_head<R: BufRead>(r: &mut R, max: usize) -> io::Result<Option<Vec<u8>>> {
     let mut head: Vec<u8> = Vec::new();
+    // Leading blank lines are skipped rather than accumulated, so they have to
+    // be counted separately or they would not be counted at all: a client
+    // sending `\r\n` forever would loop here with `head` permanently empty,
+    // never reaching the ceiling and never being cut off. Charging them to the
+    // same budget keeps the tolerance and bounds it.
+    let mut skipped = 0usize;
     loop {
-        let remaining = max.saturating_sub(head.len());
+        let remaining = max.saturating_sub(head.len() + skipped);
         if remaining == 0 {
             return Err(io::Error::other("ICAP head exceeds the configured ceiling"));
         }
@@ -96,6 +102,7 @@ pub(super) fn read_head<R: BufRead>(r: &mut R, max: usize) -> io::Result<Option<
         // A stray CRLF before the request line is tolerated the way HTTP
         // tolerates it: some clients leave one behind after a previous body.
         if blank && head.is_empty() {
+            skipped += line.len();
             continue;
         }
         head.extend_from_slice(&line);

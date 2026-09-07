@@ -191,6 +191,19 @@ fn fetch_into(
         .build();
 
     let (url, auth) = split_basic_auth(url);
+    // Credentials over cleartext are refused rather than sent. `https_only`
+    // above covers the downgrade an attacker causes; this covers the one the
+    // operator wrote, which is the easier mistake to make and the one nothing
+    // else here would catch — a `Basic` header is the password in base64, and a
+    // fetch that succeeded looks identical either way. A plain `http://` source
+    // with no userinfo still works, so an air-gapped mirror is unaffected.
+    if auth.is_some() && url.starts_with("http://") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to send credentials over http:// — use https://, or drop \
+             the `user:pass@` and authenticate another way",
+        ));
+    }
     let url = url.as_str();
     let with_auth = |mut r: ureq::Request| -> ureq::Request {
         if let Some(a) = &auth {

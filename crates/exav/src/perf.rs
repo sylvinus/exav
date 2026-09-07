@@ -53,10 +53,10 @@ pub fn row(
 ) -> String {
     let mut row = format!(
         "{},{},{},{},{}",
-        quote(&path.display().to_string()),
+        text(&path.display().to_string()),
         size,
         verdict,
-        quote(signature),
+        text(signature),
         wall.as_micros(),
     );
     for m in MATCHERS {
@@ -66,6 +66,28 @@ pub fn row(
         let _ = write!(row, ",{},{},{}", s.ns / 1000, s.calls, s.bytes);
     }
     row
+}
+
+/// A text field: neutralised, then quoted.
+///
+/// The two text columns are the only ones exav does not produce itself. The
+/// path came off the filesystem being scanned and the signature name out of a
+/// database, so both can be chosen by whoever chose what exav scanned — and
+/// this file exists to be opened in a spreadsheet, where a cell starting `=`,
+/// `+`, `-` or `@` is a formula rather than a string. Excel and Sheets both
+/// treat a leading apostrophe as "this is text", so one in front costs a
+/// character of display and takes the whole class away.
+fn text(s: &str) -> Cow<'_, str> {
+    let neutral: Cow<'_, str> = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        Cow::Owned(format!("'{s}"))
+    } else {
+        Cow::Borrowed(s)
+    };
+    match quote(&neutral) {
+        // `quote` borrowed its argument, so the field is `neutral` unchanged.
+        Cow::Borrowed(_) => neutral,
+        Cow::Owned(q) => Cow::Owned(q),
+    }
 }
 
 /// RFC-4180 quote a field only if it contains a comma, quote, or newline. Used

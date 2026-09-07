@@ -202,11 +202,19 @@ fn resolve_services(
     query: Option<Vec<String>>,
     whole: &str,
 ) -> Result<Vec<String>, String> {
-    // A path on a clamd address is a mistake with a plausible cause: an ICAP
+    // A service on a clamd address is a mistake with a plausible cause: an ICAP
     // URL pasted under the wrong scheme. Say which protocol has services.
-    if proto == Proto::Clamd && path.is_some() {
+    // Refused in either spelling — accepting `?service=` here and dropping it
+    // would leave the operator a listener answering on names they configured
+    // and a command line that says otherwise.
+    if proto == Proto::Clamd && (path.is_some() || query.is_some()) {
+        let given = if path.is_some() {
+            "a path"
+        } else {
+            "`service=`"
+        };
         return Err(format!(
-            "`{whole}`: the clamd protocol has no services, so a path means nothing here \
+            "`{whole}`: the clamd protocol has no services, so {given} means nothing here \
              — an `icap://` address is the one that takes `/<service>`"
         ));
     }
@@ -583,11 +591,17 @@ mod tests {
     }
 
     #[test]
-    fn a_path_belongs_to_icap_alone() {
+    fn a_service_belongs_to_icap_alone() {
         // The likely cause is an ICAP URL pasted under the wrong scheme, so the
-        // message names the protocol that has services.
-        let err = Endpoint::parse("clamd://h:3310/avscan").unwrap_err();
-        assert!(err.contains("icap://"), "{err}");
+        // message names the protocol that has services. Both spellings are
+        // refused: accepting the query form and dropping it would leave a
+        // listener answering on names the command line does not describe.
+        for bad in ["clamd://h:3310/avscan", "clamd://h:3310?service=avscan"] {
+            let err = Endpoint::parse(bad).unwrap_err();
+            assert!(err.contains("icap://"), "{bad}: {err}");
+        }
+        // The default form has no scheme at all and must stay unaffected.
+        assert!(ep("h:3310").services.is_empty());
         // A socket path is not a URL: every `/` in it belongs to the filesystem,
         // and splitting one would name a directory as a service.
         assert_eq!(

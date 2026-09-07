@@ -1928,20 +1928,22 @@ fn volume_set_lines(
             Ok(data)
         });
         for v in verdicts {
-            if matches!(v.report.verdict.category(), VerdictCategory::Clean) {
-                continue;
-            }
             // Named for the archive, not the fragment: `big.7z FOUND …` tells an
             // operator what was actually found, which `big.7z.002` does not.
-            let status = match v.report.verdict.category() {
-                VerdictCategory::Infected => format!(
-                    "{} FOUND (in {})",
-                    v.report.verdict.detail().unwrap_or_default(),
-                    v.set
-                ),
-                _ => format!("{} ERROR (in {})", v.report.verdict.status_tag(), v.set),
-            };
-            out.insert(dir.join(&v.name), status);
+            //
+            // Built by `verdict_line` so a part's reply and a whole file's reply
+            // share one grammar — including `--partial-as`, which `verdict_line`
+            // applies. The empty target leaves a bare `": "` in front for the
+            // caller to fill in with the part's path.
+            let line = verdict_line("", &v.report);
+            let status = line.trim_start_matches(": ");
+            // Checked on the rendered line, not on the raw verdict: under
+            // `--partial-as ok` a part exav could not fully examine has become
+            // clean by this point, and a clean part earns no reply at all.
+            if status == "OK" {
+                continue;
+            }
+            out.insert(dir.join(&v.name), format!("{status} (in {})", v.set));
         }
     }
     out
@@ -3023,10 +3025,7 @@ mod tests {
             opts,
         );
         assert!(r.contains(r#""status":"PARTIAL""#), "got {r}");
-        assert!(
-            !r.contains(r#""status":"OK""#),
-            "must never be clean: {r}"
-        );
+        assert!(!r.contains(r#""status":"OK""#), "must never be clean: {r}");
     }
 
     #[test]

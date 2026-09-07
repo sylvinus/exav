@@ -21,9 +21,11 @@ exav --listen 0.0.0.0:3310 -d /var/lib/exav       # serve the clamd protocol
 ```
 
 Two things it does that ClamAV does not. **A file too large to scan is never
-reported clean** — anything that stops a full scan comes back
-`LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`, and exits 2, where
-`clamscan` reports `OK` and exits 0. And **one process serves both protocols**:
+reported clean** — anything that stops a full scan comes back as status
+`PARTIAL` under `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`, and
+exits 3, where `clamscan` reports `OK` and exits 0. Exit `2` keeps ClamAV's
+meaning, the scanner itself failing, so `3` is an addition rather than a
+reused code. And **one process serves both protocols**:
 naming a `clamd://` and an `icap://` address on `--listen` replaces a
 `c-icap` + `clamav` container pair over one loaded database.
 

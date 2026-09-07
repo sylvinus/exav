@@ -198,8 +198,5 @@ fn an_ordinary_directory_is_unaffected() {
     std::fs::write(dir.path().join("bad.txt"), EICAR).unwrap();
     let objs = scan_dir_json(dir.path());
     assert_eq!(objs.len(), 2, "no extra lines: {objs:#?}");
-    assert_eq!(
-        objs.iter().filter(|o| o["status"] == "FOUND").count(),
-        1
-    );
+    assert_eq!(objs.iter().filter(|o| o["status"] == "FOUND").count(), 1);
 }

@@ -1438,27 +1438,22 @@ fn limits_alert_name(kind: unpack::LimitKind) -> Option<&'static str> {
 /// The report for a top-level file larger than `max_scan_size`.
 ///
 /// This is ClamAV's `MaxFileSize` condition, so under `--partial-as found` it
-/// reports under ClamAV's own name for it. The two entry points that enforce the
-/// ceiling reached this by way of a bare `ScanReport::limits`, which named it
-/// `Heuristics.Exav.LimitsExceeded` — a name no ClamAV-shaped pipeline matches,
-/// for the one limit ClamAV does have a name for. The kind is passed as a type
-/// here, as everywhere else, so the name is looked up and never guessed.
+/// reports under ClamAV's own name for it — `Heuristics.Limits.Exceeded.*`,
+/// which a ClamAV-shaped pipeline matches, rather than a synthesised
+/// `Heuristics.Exav.*` that nothing does. Both entry points that enforce the
+/// ceiling come through here, so the two cannot name one condition two ways,
+/// and the kind is passed as a type so the name is looked up and never guessed.
 fn max_file_size_report(size: u64, max: u64, opts: &ScanOptions) -> ScanReport {
-    let reason = format!("file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only");
     if opts.alert_exceeds_max {
         if let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize) {
             match_loc_record();
-            return ScanReport {
-                verdict: Verdict::Infected {
-                    signature: name.to_string(),
-                    offset: 0,
-                    method: Method::Heuristic,
-                },
-                findings: Vec::new(),
-            };
+            return ScanReport::infected(name.to_string(), 0, Method::Heuristic, Vec::new());
         }
     }
-    ScanReport::limits(reason, Vec::new())
+    ScanReport::limits(
+        format!("file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"),
+        Vec::new(),
+    )
 }
 
 /// Turn a budget stop into an outcome, honouring `--alert-exceeds-max`.

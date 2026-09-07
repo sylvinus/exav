@@ -106,9 +106,15 @@ reference, and more.
 ## API stability
 
 exav is `0.0.x`, which under Cargo's rules means **every release is treated as
-incompatible with the one before it**: `0.0.1` and `0.0.2` never satisfy the same
-requirement. That is the intent — any release may break any API — and it means a
-dependency on a library crate is already pinned exactly, whatever you write.
+incompatible with the one before it**: the usual `exav-core = "0.0.1"` is the
+range `>=0.0.1, <0.0.2`, which no other release satisfies. That is the intent —
+any release may break any API — and it means the ordinary way of writing a
+dependency already gives you one version and keeps giving it to you.
+
+It is the requirement that does that, not the version number, so the looser
+spellings still float: `>=0.0.1` and `*` will take `0.0.2` when it lands. Write
+`=0.0.1` if you want the pin to survive changing your mind about the
+requirement.
 
 Within that, the intent is:
 

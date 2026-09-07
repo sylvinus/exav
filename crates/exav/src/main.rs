@@ -548,7 +548,8 @@ struct Cli {
     /// Hard wall-clock budget, in seconds (0 = none). Unix only. In the prefork
     /// pool it is per scan job, and on expiry the worker is killed and the
     /// connection dropped; it also caps CPU time (RLIMIT_CPU). In a one-shot
-    /// run it bounds the whole run, which then exits 2 saying so. The
+    /// run it bounds the whole run, which then exits 3 saying so — running out
+    /// of time is a scan that stopped short, not a scanner that failed. The
     /// deterministic in-core caps still apply first in every mode.
     /// [default in the pool: 120; unset otherwise]
     #[arg(
@@ -1740,6 +1741,12 @@ fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
     if let Some(server) = icap_server {
         let (clamd_db, clamd_opts) = (std::sync::Arc::clone(&db), std::sync::Arc::clone(&opts));
         let allow_shutdown = shutdown_allowed(cli.allow_shutdown);
+        // Before the thread starts, for the same reason the ICAP-only path sets
+        // it before serving. The disposition is process-wide, so leaving it to
+        // `daemon::run` on the new thread would leave this one serving ICAP
+        // under `SIG_DFL` until that thread got there — a window in which a
+        // proxy hanging up mid-response kills the whole process.
+        ignore_sigpipe();
         std::thread::spawn(move || {
             if let Err(e) = daemon::run(
                 clamd_db,
@@ -3274,7 +3281,17 @@ fn scan_one_allmatch(
     // scan that skipped its contents, and is expensive to tell apart from one.
     totals.data_scanned += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let name = path.display().to_string();
-    let cap = opts.deep_analysis_max;
+    // Two ceilings, one fallback. `deep_analysis_max` is how much this path can
+    // buffer; `max_scan_size` is how much the operator said may be scanned at
+    // all, and `analyze_all` — which takes bytes, not a file — cannot see it.
+    // Whichever is lower decides, because a file over the second must reach the
+    // single-match path: that is where the ceiling is enforced, and without this
+    // `--all-matches` would answer `OK` for a file `--max-input-bytes` says was
+    // never fully examined. A silent clean, produced by adding a flag about how
+    // many signatures to report.
+    let cap = opts.max_scan_size.map_or(opts.deep_analysis_max, |max| {
+        opts.deep_analysis_max.min(max)
+    });
     let mut data = Vec::new();
     let read = std::fs::File::open(path).and_then(|f| {
         f.take(cap.saturating_add(1))
@@ -3286,7 +3303,9 @@ fn scan_one_allmatch(
         return;
     }
     if data.len() as u64 > cap {
-        // Too big to buffer for all-match; fall back to a single-match scan.
+        // Too big for all-match; fall back to a single-match scan, which scans
+        // the budgeted prefix before reporting the limit, so a detection in the
+        // part that did fit still wins.
         let scanned =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_path(db, path, opts)));
         match scanned {
@@ -3312,11 +3331,13 @@ fn scan_one_allmatch(
                         serde_json::json!({"signature": sig, "method": method.as_str()})
                     })
                     .collect();
+                // `status` and no `category`, the shape `emit_json_result` uses:
+                // `signatures` is the plural of its `signature`, which is the
+                // one thing all-match genuinely adds.
                 println!(
                     "{}",
                     serde_json::json!({
-                        "file": name, "category": "infected", "status": "FOUND",
-                        "signatures": sigs
+                        "file": name, "status": "FOUND", "signatures": sigs
                     })
                 );
             } else {
@@ -3333,43 +3354,32 @@ fn scan_one_allmatch(
         }
         // No detections — but "found nothing" and "did not look at all of it" are
         // different answers, and printing OK for both is a silent clean.
+        //
+        // Turned back into a `ScanReport` and handed to `report_result` rather
+        // than rendered here. That is the single-match path, so `--partial-as`,
+        // the counters, the exit code, the line grammar and the JSON schema all
+        // come from one place: the same file must not answer differently for
+        // having been passed `--all-matches`.
         Ok((_, outcome)) => {
-            let (category, status, detail) = match &outcome {
-                exav_core::AllMatchOutcome::Complete => ("clean", "OK", String::new()),
-                exav_core::AllMatchOutcome::LimitsExceeded(r) => {
-                    ("limits", "LIMITS-EXCEEDED", r.clone())
+            let verdict = match outcome {
+                exav_core::AllMatchOutcome::Complete => Verdict::Clean,
+                exav_core::AllMatchOutcome::LimitsExceeded(reason) => {
+                    Verdict::LimitsExceeded { reason }
                 }
-                exav_core::AllMatchOutcome::Unscannable(r) => {
-                    ("unscannable", "UNSCANNABLE", r.clone())
-                }
-                exav_core::AllMatchOutcome::PasswordProtected(r) => {
-                    ("password", "PASSWORD-PROTECTED", r.clone())
+                exav_core::AllMatchOutcome::Unscannable(reason) => Verdict::Unscannable { reason },
+                exav_core::AllMatchOutcome::PasswordProtected(reason) => {
+                    Verdict::PasswordProtected { reason }
                 }
             };
-            // `totals.limits`, matching `report_result` on the single-match
-            // path. These three outcomes are "not scanned", not "the scan went
-            // wrong": counting them as errors makes the same file produce a
-            // different summary — and a different `partial_as` in JSON —
-            // depending only on whether `--all-matches` was passed.
-            if status != "OK" {
-                totals.limits += 1;
-            }
-            if cli.quiet && status == "OK" {
-            } else if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "file": name, "category": category,
-                        "status": status, "detail": detail
-                    })
-                );
-            } else if !cli.quiet || status != "OK" {
-                if detail.is_empty() {
-                    outln!("{name}: {status}");
-                } else {
-                    outln!("{name}: {detail} {status}");
-                }
-            }
+            report_result(
+                &name,
+                ScanReport {
+                    verdict,
+                    findings: Vec::new(),
+                },
+                cli,
+                totals,
+            );
         }
         Err(_) => report_error(&name, "internal error while scanning", cli, totals),
     }
@@ -3384,7 +3394,7 @@ fn emit_json_summary(totals: &Totals, elapsed: std::time::Duration) {
             "summary": {
                 "scanned": totals.scanned,
                 "infected": totals.infected,
-                "partial_as": totals.limits,
+                "partial": totals.limits,
                 "errors": totals.errors,
                 "data_scanned_bytes": totals.data_scanned,
                 "elapsed_secs": elapsed.as_secs_f64(),
@@ -3451,12 +3461,12 @@ fn report_result(name: &str, mut report: ScanReport, cli: &Cli, totals: &mut Tot
         // and the category still has to be named. Only the exit code differs,
         // which is the one thing a line cannot carry.
         VerdictCategory::Partial => {
-            let status = if policy::current().for_tag(v.status_tag()) == policy::PartialStatus::Error
-            {
-                "ERROR"
-            } else {
-                "PARTIAL"
-            };
+            let status =
+                if policy::current().for_tag(v.status_tag()) == policy::PartialStatus::Error {
+                    "ERROR"
+                } else {
+                    "PARTIAL"
+                };
             outln!(
                 "{name}: {} {} {status}",
                 v.detail().unwrap_or_default(),
@@ -4461,10 +4471,12 @@ mod tests {
             "a clean line stays clean"
         );
 
-        // A partial verdict from a set is a limit, not a hard error.
+        // A partial verdict from a set is a limit, not a hard error. The
+        // annotation moves the status off the end of the line, so the category
+        // is only where `partial_category` looks for it once it is stripped.
         let mut totals = Totals::default();
         print_daemon_reply(
-            "/x/set.7z.001: LIMITS-EXCEEDED (too big) ERROR (in set.7z)",
+            "/x/set.7z.001: part 2 is missing LIMITS-EXCEEDED ERROR (in set.7z)",
             &cli,
             &mut totals,
         );
@@ -4473,6 +4485,16 @@ mod tests {
             (1, 0),
             "a set-annotated limit must land in the limits bucket"
         );
+
+        // And an uncategorised ERROR from a set is a real failure, so the two
+        // cannot be told apart by the annotation alone.
+        let mut totals = Totals::default();
+        print_daemon_reply(
+            "/x/set.7z.001: cannot open file ERROR (in set.7z)",
+            &cli,
+            &mut totals,
+        );
+        assert_eq!((totals.limits, totals.errors), (0, 1));
     }
 
     /// Regression guard for the no-DB footgun: the built-in baseline must count as

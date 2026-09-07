@@ -181,7 +181,7 @@ impl SpillFile {
     /// already been exceeded by the time it says so.
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), SpillError> {
         self.charge(bytes.len() as u64)?;
-        self.file.as_file_mut().write_all(bytes)?;
+        self.file.as_file_mut()?.write_all(bytes)?;
         Ok(())
     }
 

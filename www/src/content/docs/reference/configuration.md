@@ -31,7 +31,7 @@ front.
 |---|---|
 | `--listen` | `EXAV_LISTEN` |
 | `--max-input-bytes` | `EXAV_MAX_INPUT_BYTES` |
-| `--partial-as` | `EXAV_NOT_SCANNED` |
+| `--partial-as` | `EXAV_PARTIAL_AS` |
 | `--icap-max-requests` | `EXAV_ICAP_MAX_REQUESTS` |
 
 That holds for all 59 of them, and `exav --help` prints the `[env: …]` line under

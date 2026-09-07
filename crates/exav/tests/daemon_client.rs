@@ -225,10 +225,15 @@ fn the_thread_model_socket_is_permissioned_too() {
 /// `666` read as decimal is 0o1232 — a setgid socket nobody asked for.
 #[test]
 fn a_mode_that_is_not_a_mode_is_refused() {
+    // Under the test's own directory rather than a fixed `/tmp` name: the
+    // assertion below is that the socket was NOT created, and a shared path
+    // makes that a claim about every process on the machine.
+    let dir = TempDir::new().expect("tempdir");
+    let sock = dir.path().join("refused.sock");
     for bad in ["999", "abc", "1660", "", "444"] {
         let out = exav()
             .arg("--listen")
-            .arg(format!("clamd:///tmp/exav-never-created.sock?mode={bad}"))
+            .arg(format!("clamd://{}?mode={bad}", sock.display()))
             .output()
             .expect("run exav");
         assert_eq!(
@@ -237,7 +242,7 @@ fn a_mode_that_is_not_a_mode_is_refused() {
             "?mode={bad:?} must be refused, not applied"
         );
         assert!(
-            !Path::new("/tmp/exav-never-created.sock").exists(),
+            !sock.exists(),
             "nothing may be bound for a mode that was refused"
         );
     }

@@ -29,6 +29,9 @@ const TIGHT: Limits = Limits {
     max_buffer_bytes: 64 * 1024,
     max_scanned_bytes: 256 * 1024,
     max_recursion: 2,
+    // Every format stays reachable — this target is about depth, and a format
+    // filter would decide in advance which nestings are even tried.
+    allowed_formats: None,
 };
 
 /// Wrap `inner` in `depth` copies of `open`/`close`.

@@ -146,8 +146,9 @@ depends = "$auto"
 extended-description = """\
 A memory-safe malware scanner written in Rust: a scanning CLI and a clamd- and \
 ICAP-compatible daemon that load ClamAV's own signature databases, with no \
-file-size limit and constant-memory streaming. Its output format and exit codes \
-match clamscan's; its flags are its own."""
+file-size limit and constant-memory streaming. It prints clamscan's output \
+format; its flags are its own, and it adds a fourth exit code (3, PARTIAL) for \
+an object it could not fully examine."""
 assets = [
     ["target/release/exav", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/exav/README.md", "644"],

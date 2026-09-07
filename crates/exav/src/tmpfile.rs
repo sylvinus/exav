@@ -33,7 +33,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Per-process seed, taken once from the standard library's randomly-seeded
 /// hasher. `RandomState` is seeded by the OS, so this is unpredictable across
@@ -59,9 +59,14 @@ fn next_name(prefix: &str) -> String {
 }
 
 /// A temporary file that deletes itself when dropped.
+///
+/// Write it, then read it back through [`TempFile::reopen`] — in that order, and
+/// not interleaved. [`TempFile::reopen`] says why, and enforces it.
 pub struct TempFile {
     path: PathBuf,
     file: File,
+    /// Set by the first [`TempFile::reopen`]; refuses every write after it.
+    read_back: AtomicBool,
 }
 
 impl TempFile {
@@ -102,7 +107,11 @@ impl TempFile {
                     // client cares to trigger it.
                     #[cfg(unix)]
                     let _ = std::fs::remove_file(&path);
-                    return Ok(TempFile { path, file });
+                    return Ok(TempFile {
+                        path,
+                        file,
+                        read_back: AtomicBool::new(false),
+                    });
                 }
                 Err(e) => last = e,
             }
@@ -111,8 +120,18 @@ impl TempFile {
     }
 
     /// The open handle, for writing the payload in.
-    pub fn as_file_mut(&mut self) -> &mut File {
-        &mut self.file
+    ///
+    /// Fallible for the reason in [`TempFile::reopen`]: a reader shares this
+    /// handle's offset and rewound it, so a write issued after a read-back
+    /// would land at byte 0. Handing out a `&mut File` that could do that is
+    /// the one thing this type has to prevent, since the corruption is silent.
+    pub fn as_file_mut(&mut self) -> io::Result<&mut File> {
+        if self.read_back.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "a temp file cannot be written after it has been read back",
+            ));
+        }
+        Ok(&mut self.file)
     }
 
     pub fn as_file(&self) -> &File {
@@ -121,11 +140,15 @@ impl TempFile {
 
     /// A handle positioned at the start, for reading the payload back.
     ///
-    /// On Unix the file has no name to open, so this duplicates the descriptor.
-    /// A duplicate shares the file offset, which is why it is rewound here
-    /// rather than by the caller: every reader starts at 0 and seeks for itself
-    /// afterwards, and readers of one payload never overlap.
+    /// On Unix the file was unlinked at creation, so there is no name left to
+    /// open and this duplicates the descriptor instead. A duplicate shares the
+    /// file **offset**, which is why the rewind happens here rather than in the
+    /// caller — and why writing after a read-back is refused rather than
+    /// documented. Left to a convention it would fail silently and expensively:
+    /// the write would land at byte 0, overwriting the payload with a fragment
+    /// of itself, and the scan would then run over bytes no client ever sent.
     pub fn reopen(&self) -> io::Result<File> {
+        self.read_back.store(true, Ordering::Release);
         #[cfg(unix)]
         {
             use std::io::Seek;
@@ -146,6 +169,13 @@ impl TempFile {
 
 impl io::Write for TempFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // See `reopen`: a reader shares this handle's offset and rewound it, so
+        // this write would land at byte 0 rather than at the end.
+        if self.read_back.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "a temp file cannot be written after it has been read back",
+            ));
+        }
         self.file.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -202,7 +232,7 @@ mod tests {
         {
             let mut t = TempFile::new().unwrap();
             path = t.path.clone();
-            t.as_file_mut().write_all(b"payload").unwrap();
+            t.as_file_mut().unwrap().write_all(b"payload").unwrap();
             let mut back = String::new();
             t.reopen().unwrap().read_to_string(&mut back).unwrap();
             assert_eq!(back, "payload", "a second handle reads what was written");
@@ -228,10 +258,31 @@ mod tests {
             "the name must be gone at once, or a killed process leaves the \
              payload behind"
         );
-        t.as_file_mut().write_all(b"still works").unwrap();
+        t.as_file_mut().unwrap().write_all(b"still works").unwrap();
         let mut back = String::new();
         t.reopen().unwrap().read_to_string(&mut back).unwrap();
         assert_eq!(back, "still works", "and the handle still reads and writes");
+    }
+
+    /// A reader holds a duplicate of the write handle and rewound the shared
+    /// offset, so a write after it would land at byte 0 and eat the payload.
+    /// Refused loudly, through both ways of reaching the handle — silent
+    /// corruption of a spilled object means scanning bytes no client sent.
+    #[test]
+    fn writing_after_a_read_back_is_refused() {
+        let mut t = TempFile::new().unwrap();
+        t.as_file_mut().unwrap().write_all(b"payload").unwrap();
+        let mut back = String::new();
+        t.reopen().unwrap().read_to_string(&mut back).unwrap();
+        assert_eq!(back, "payload");
+
+        assert!(t.as_file_mut().is_err(), "the accessor must refuse");
+        assert!(t.write(b"more").is_err(), "and so must the Write impl");
+
+        // And the payload is intact, which is the property the refusal buys.
+        let mut again = String::new();
+        t.reopen().unwrap().read_to_string(&mut again).unwrap();
+        assert_eq!(again, "payload");
     }
 
     #[test]

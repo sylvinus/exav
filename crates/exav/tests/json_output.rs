@@ -98,3 +98,49 @@ fn json_infected_only_suppresses_clean() {
     let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(v["status"], "FOUND");
 }
+
+/// `--all-matches` must not answer `OK` for a file `--max-input-bytes` says was
+/// never fully examined.
+///
+/// The all-match engine entry takes bytes rather than a file, so it cannot see
+/// the ceiling; the CLI has to route an over-limit file to the single-match path,
+/// which enforces it. Without that, adding a flag about *how many signatures to
+/// report* silently turns a `PARTIAL` into a clean pass — the exact failure the
+/// never-a-silent-clean invariant exists to prevent, and one no signature change
+/// would ever reveal.
+#[test]
+fn all_matches_still_reports_a_file_past_the_size_ceiling() {
+    let db = TempDir::new().unwrap();
+    let files = TempDir::new().unwrap();
+    let big = files.path().join("big.bin");
+    std::fs::write(&big, vec![b'a'; 3 * 1024 * 1024]).unwrap();
+
+    let mut seen = Vec::new();
+    for extra in [&[][..], &["--all-matches"][..]] {
+        let out = exav()
+            .arg("-d")
+            .arg(db.path())
+            .arg("--json")
+            .arg("--max-input-bytes")
+            .arg("1M")
+            .args(extra)
+            .arg(&big)
+            .output()
+            .expect("run exav");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first = stdout.lines().next().unwrap_or_default().to_string();
+        let v: serde_json::Value = serde_json::from_str(&first).expect(&first);
+        seen.push((
+            out.status.code(),
+            v["status"].clone(),
+            v["category"].clone(),
+        ));
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "--all-matches must give the same answer as a single-match scan"
+    );
+    assert_eq!(seen[0].1, "PARTIAL");
+    assert_eq!(seen[0].2, "LIMITS-EXCEEDED");
+    assert_eq!(seen[0].0, Some(3));
+}

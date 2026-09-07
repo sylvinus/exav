@@ -412,6 +412,14 @@ fn modify<W: Write>(
             format!("size exceeds {}", opts.max_scan_size.unwrap_or(0)),
         );
     }
+    // Both partials above were decided here rather than by the engine, so
+    // neither has been through the policy `decide` applies. Run it on the
+    // finished decision, which is the only place every partial passes through:
+    // otherwise `--partial-as limits-exceeded=found` would turn an over-size
+    // object into a detection when the engine reported the limit and leave it a
+    // bare block when this listener did, for the same object and the same
+    // reason. Idempotent — a decision already remapped is no longer `Partial`.
+    decision = apply_found_policy(decision);
 
     // A deployment can choose to take delivery of an object exav could not
     // fully examine. Whether that choice can be honoured for *this* object is a
@@ -529,9 +537,20 @@ fn decide(
         Ok(Err(e)) => Decision::Partial("UNSCANNABLE", format!("scan failed: {e}")),
         Err(_) => Decision::Partial("UNSCANNABLE", "scan failed (internal error)".to_string()),
     };
-    // `alert` is settled here; `pass` is not, because whether this listener can
-    // honour a pass depends on whether it still holds the object's bytes — a
-    // question only the request loop can answer.
+    apply_found_policy(decision)
+}
+
+/// Turn a partial decision into a detection where `--partial-as` says `found`.
+///
+/// `found` is settled here; `ok` is not, because whether this listener can
+/// honour a pass depends on whether it still holds the object's bytes — a
+/// question only the request loop can answer. `partial` and `error` change
+/// nothing: ICAP has no exit code, which is all those two differ in.
+///
+/// Applied to every partial, not only the ones the engine produced, so a
+/// deployment's answer to "what becomes of an object I could not examine" does
+/// not depend on which layer noticed.
+fn apply_found_policy(decision: Decision) -> Decision {
     match &decision {
         Decision::Partial(tag, _)
             if crate::policy::current().for_tag(tag) == crate::policy::PartialStatus::Found =>

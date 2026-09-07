@@ -422,7 +422,7 @@ Two client-mode behaviours have no flag to name them:
 | `--max-object-bytes <SIZE>` | The most memory a single materialized object may use. |
 | `--max-matcher-bytes <SIZE>` | Cumulative bytes fed to the matcher — a CPU bound, not a memory one. |
 | `--spill-dir`, `--spill-threshold-bytes`, `--max-spill-bytes`, `--max-total-spill-bytes` | Where a streamed object waits while it is scanned, and how much RAM and temp space it may take. |
-| `--partial-as <POLICY>` | What becomes of an object exav could not fully examine: `block`, `alert` or `pass`, whole or per condition. |
+| `--partial-as <POLICY>` | What becomes of an object exav could not fully examine: `partial` (default), `ok`, `found` or `error`, whole or per condition (`limits-exceeded=`, `unscannable=`, `password-protected=`). |
 | `--clamav-compat` | Preset reproducing a stock ClamAV build's limits and extractor set, for differential testing. Reduces detection on purpose. |
 | `--base64 on\|off` | Decode base64-embedded executables in text and script files. On by default. |
 | `--detect packed` | Report `Heuristics.Packed.*`, naming the packer wrapping an executable exav could not unpack. |

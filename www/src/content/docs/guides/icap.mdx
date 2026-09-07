@@ -115,9 +115,9 @@ down means traffic flows unscanned.
 |---|---|---|
 | `Clean` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message back byte for byte | — |
 | `Infected` | `200 OK` + a block page | `X-Infection-Found: Type=0; Resolution=2; Threat=<signature>;` |
-| `LimitsExceeded` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.LimitsExceeded;`, `X-Exav-Category: LIMITS-EXCEEDED`, `X-Exav-Reason: <detail>` |
-| `Unscannable` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.Unscannable;`, `X-Exav-Category: UNSCANNABLE`, `X-Exav-Reason: <detail>` |
-| `PasswordProtected` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.PasswordProtected;`, `X-Exav-Category: PASSWORD-PROTECTED`, `X-Exav-Reason: <detail>` |
+| `LimitsExceeded` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.LimitsExceeded;`, `X-Exav-Status: PARTIAL`, `X-Exav-Category: LIMITS-EXCEEDED`, `X-Exav-Reason: <detail>` |
+| `Unscannable` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.Unscannable;`, `X-Exav-Status: PARTIAL`, `X-Exav-Category: UNSCANNABLE`, `X-Exav-Reason: <detail>` |
+| `PasswordProtected` | `200 OK` + a block page | `X-Infection-Found: … Threat=Heuristics.Exav.PasswordProtected;`, `X-Exav-Status: PARTIAL`, `X-Exav-Category: PASSWORD-PROTECTED`, `X-Exav-Reason: <detail>` |
 
 The bottom three rows are the default, not the only option —
 [`--partial-as`](#delivering-what-exav-could-not-examine) hands those objects
@@ -133,7 +133,7 @@ takes both halves because ICAP clients come in two kinds:
 * A **scan wrapper** acts on the headers alone. It hands a file over, greps the
   response for `X-Infection-Found`, and calls a `200` without that header clean.
 
-So a not-scanned block carries `X-Infection-Found` too. What keeps it
+So a partial block carries `X-Infection-Found` too. What keeps it
 distinguishable from a database hit is the threat name, not the header's
 presence: `Heuristics.` is the prefix ClamAV puts on a policy block rather than a
 database entry, and `.Exav.` says which scanner synthesised it. No signature
@@ -152,8 +152,8 @@ RFC 3507's request satisfaction.
 ### If you want the header to mean a database hit and nothing else
 
 `--icap-infection-header detections` restores the strict split: only a signature
-match carries `X-Infection-Found`, and a not-scanned object blocks with the
-`X-Exav-*` pair alone.
+match carries `X-Infection-Found`, and a partial object blocks with the
+`X-Exav-*` trio alone.
 
 <Aside type="danger" title="What that costs">
 The block still happens — but a client that reads only `X-Infection-Found` will
@@ -203,8 +203,8 @@ than switched off:
 * the listener says so at startup, so a container's logs answer "are we
   delivering unscanned files?" without anyone reconstructing its command line;
 * every passed object is logged with the verdict and the reason;
-* the response still carries `X-Exav-Category` and `X-Exav-Reason`, so a client
-  that reads them knows what it was handed.
+* the response still carries `X-Exav-Status`, `X-Exav-Category` and
+  `X-Exav-Reason`, so a client that reads them knows what it was handed.
 
 It never carries `X-Infection-Found`, whatever `--icap-infection-header` says.
 The object is being delivered, so claiming an infection would be false — and it
@@ -213,7 +213,7 @@ of what you asked for.
 
 <Aside type="caution" title="One object no policy can pass">
 An object past `--max-input-bytes` whose client sent no `Allow: 204` is blocked
-even under `pass`. Its tail was read and discarded to reach the next request
+even under `--partial-as ok`. Its tail was read and discarded to reach the next request
 boundary, so the bytes needed to hand the message back no longer exist, and
 returning the head alone would deliver a truncated object as though it were the
 whole one. `--max-input-bytes` is unset by default and every ICAP client that

@@ -737,12 +737,15 @@ above it.
 The flat streaming core would scan those bytes and find nothing inside the
 archive.
 
-And a wart the protocol forces: clamd has no third status. "Not fully scanned"
-goes on the wire as `ERROR`, so exav's own client re-derives the distinction by
-string-matching three tags (`LIMITS-EXCEEDED`, `UNSCANNABLE`,
-`PASSWORD-PROTECTED`) out of the error line, purely so that a remote scan's
-summary and exit code match a local one. Exit code 2 covers both hard errors and
-merely-not-fully-scanned files — that is the CLI-level expression of never a
+And a wart the protocol forces: clamd's status vocabulary is closed at `OK`,
+`FOUND` and `ERROR`, and a client reads a fourth word as `OK` — so `PARTIAL` on
+that wire would turn a fail-closed answer into a fail-open one. It goes out as
+`ERROR` instead, with the category named just before it
+(`<reason> LIMITS-EXCEEDED ERROR`), and exav's own client reads that word back
+to recover the distinction, purely so that a remote scan's summary and exit code
+match a local one. Locally there is no such constraint: `PARTIAL` is its own
+status with its own exit code, `3`, and `2` stays what it is in ClamAV — the
+scanner itself failed. Keeping them apart is the CLI-level expression of never a
 silent OK.
 
 And the third, which surprised us most: **exav has a mode that deliberately makes

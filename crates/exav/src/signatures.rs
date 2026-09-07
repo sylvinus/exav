@@ -250,10 +250,21 @@ fn update_signatures(
     updated
 }
 
-/// Hide any `user:pass@` userinfo when echoing a URL to logs, so Basic-auth
-/// credentials in `--db-url` never land in the daemon's output.
+/// Hide the secret-bearing parts of a URL when echoing it to logs, so a
+/// credential in `--db-url` never lands in the daemon's output.
+///
+/// Two places carry one. `user:pass@` is the obvious one. The query string is
+/// the one that gets missed, and it is where the common forms live — a
+/// presigned S3 or Azure SAS URL is a bearer token in `?…`, and anyone holding
+/// the logged line holds the database. So the query and fragment are dropped
+/// rather than masked in place: what is left still names the source, which is
+/// all a log line is for.
 #[cfg(feature = "http-update")]
 fn redact_url(url: &str) -> String {
+    let url = match url.find(['?', '#']) {
+        Some(i) => format!("{}…", &url[..i]),
+        None => url.to_string(),
+    };
     if let Some(scheme) = url.find("://") {
         let after = scheme + 3;
         let auth_end = url[after..].find('/').map_or(url.len(), |i| after + i);
@@ -261,7 +272,7 @@ fn redact_url(url: &str) -> String {
             return format!("{}***@{}", &url[..after], &url[after + at + 1..]);
         }
     }
-    url.to_string()
+    url
 }
 
 /// Whether a reload has anything to act on: only the prefork supervisor re-forks
