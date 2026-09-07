@@ -636,6 +636,10 @@ mod tests {
         // What removes the need for a per-listener size ceiling: an object costs
         // the spill threshold in RAM however large it is, so how big a client's
         // object may be is a scan question rather than a memory one.
+        //
+        // Held while the body exists: crossing the threshold charges the
+        // process-wide spill budget, which `spill`'s budget test asserts on.
+        let _budget = spill::budget_guard();
         let threshold = spill::config().threshold as usize;
         let mut body = Body::new();
         let block = vec![b'Z'; 1024 * 1024];
@@ -668,6 +672,10 @@ mod tests {
     fn a_streamed_body_encodes_back_to_what_went_in() {
         // The echo path: a message handed back to a client that wanted one is
         // written straight out of wherever it was buffered.
+        //
+        // The last length crosses the spill threshold, charging the process-wide
+        // budget that `spill`'s budget test asserts on.
+        let _budget = spill::budget_guard();
         for len in [0usize, 1, 4096, spill::config().threshold as usize + 7] {
             let mut body = Body::new();
             let payload_bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();

@@ -192,6 +192,9 @@ pub fn stream_members<R: Read + Seek, T>(
 
 /// Format dispatch for [`stream_members`]; kept separate so the panic-containment
 /// boundary wraps every streaming decoder uniformly.
+// Every arm of the match below is behind a format feature, so in a build with
+// none of them the body is `match fmt {}` and no parameter is read.
+#[allow(unused_variables, unused_mut)]
 fn dispatch_stream<R: Read + Seek, T>(
     fmt: Format,
     mut source: R,
@@ -1053,6 +1056,10 @@ fn swf_dict_size(declared: u32, want: u64, max_buffer: u64) -> u32 {
 /// by seeking to each and handing the visitor a bounded window — the shared tail
 /// of every STORED-OFFSET format (ar/cpio/machofat/…). No member data is ever
 /// buffered here.
+// Dead only in a build with none of the STORED-OFFSET formats (ar, cpio,
+// machofat, pyc, sfx, tnef, partition, iso, onenote); see
+// `crate::cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn stream_stored<R: Read + Seek, T>(
     source: &mut R,
     budget: &mut Budget,
@@ -1162,6 +1169,10 @@ mod tests {
     use std::io::Cursor;
 
     /// Collect every member `(name, bytes)` the streaming API yields for `blob`.
+    ///
+    /// Every test using it is behind a format feature, so it is dead in a build
+    /// with none of them compiled in.
+    #[allow(dead_code)]
     fn streamed_members(fmt: Format, blob: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut budget = Budget::new(Limits::default());
         let mut out: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1180,6 +1191,7 @@ mod tests {
     /// The streaming path must yield the same member `(name, bytes)` as the
     /// buffered [`crate::extract`] path — the correctness contract for every
     /// STORED-OFFSET conversion.
+    #[allow(dead_code)] // see `streamed_members`
     fn assert_stream_matches_buffered(fmt: Format, blob: &[u8]) {
         let mut budget = Budget::new(Limits::default());
         let buffered: Vec<(String, Vec<u8>)> = crate::extract(fmt, blob, &mut budget)

@@ -110,10 +110,13 @@ fmt:
 ##       Nothing else checks it, and a version nobody verifies drifts upward the
 ##       first time someone uses a newer feature — silently breaking anyone who
 ##       pinned the toolchain we promised.
+##       `rustup run` rather than `cargo +VERSION`: the `+toolchain` prefix is a
+##       rustup *shim* feature, so it fails with "no such command" whenever
+##       $(CARGO) is a real cargo binary instead of the shim.
 msrv:
 	@v=$$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
 	  rustup toolchain install $$v --profile minimal >/dev/null 2>&1 || true; \
-	  echo "checking MSRV $$v"; $(CARGO) +$$v check --workspace --all-targets
+	  echo "checking MSRV $$v"; rustup run $$v cargo check --workspace --all-targets
 
 ## fuzz: smoke-build the fuzz targets
 fuzz:

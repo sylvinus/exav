@@ -61,6 +61,9 @@ use std::io::{Read, Seek};
 
 #[doc(hidden)]
 pub mod formats;
+// Every name this pulls in is behind a format feature, so the glob imports
+// nothing at all in a build with none of them compiled in.
+#[allow(unused_imports)]
 use formats::*;
 
 mod stream;
@@ -1730,9 +1733,15 @@ pub fn is_pepack(data: &[u8]) -> bool {
 /// by the budget-checked reads — so this only prevents a crafted header from
 /// forcing a huge up-front allocation (the over-allocation DoS class; cf. the
 /// ClamAV 7z/InstallShield advisories and the fuzz-found delharc OOM).
+// Dead only in a build with none of the formats that pre-allocate (dmg, cab,
+// 7z, ppmd7). Listing those features here instead would have to be corrected
+// every time one of them starts or stops calling this, and getting that list
+// wrong is a warning rather than an error — so it would rot quietly.
+#[allow(dead_code)]
 pub(crate) const PREALLOC_CAP: usize = 16 * 1024 * 1024;
 
 /// Cap a pre-allocation request from an attacker-declared byte size.
+#[allow(dead_code)] // see PREALLOC_CAP
 pub(crate) fn cap_prealloc(requested: usize) -> usize {
     requested.min(PREALLOC_CAP)
 }
@@ -1741,6 +1750,9 @@ pub(crate) fn cap_prealloc(requested: usize) -> usize {
 /// Absolute byte caps are the primary bomb defense; this is a fast reject
 /// for the obvious cases. A declared input of 0 is ignored (we cannot trust
 /// it) and left to the absolute caps.
+// Dead only in a build with none of the compressing formats; see
+// `cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn ratio_guard(input: u64, output: u64, budget: &Budget) -> Result<(), LimitHit> {
     if input > 0 && output / input > budget.limits.max_compression_ratio {
         return Err(LimitHit::new(format!(
@@ -1833,6 +1845,9 @@ pub fn bounded_read<R: Read>(mut r: R, cap: u64) -> Result<(Vec<u8>, bool), std:
 /// decompressor (e.g. a gzip CRC-32 or ISIZE mismatch, a ZIP CRC) must not throw
 /// away already-decompressed content that a scanner still needs to inspect. With
 /// `salvage` false it is exactly [`bounded_read`] (errors propagate).
+// Dead only in a build with none of the formats that salvage a partial member;
+// see `cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn bounded_read_salvage<R: Read>(
     mut r: R,
     cap: u64,
@@ -3356,6 +3371,9 @@ mod tests {
 /// Clamping is free on real streams: LZMA only ever looks back into bytes it has
 /// already produced, so a dictionary larger than the output cannot be consulted.
 /// The floor keeps a nonsense-small declaration from breaking a legitimate one.
+// Dead only in a build with none of the LZMA-bearing formats (swf, egg, nsis,
+// zip, 7z); see `cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn bounded_dict(declared: u32, cap: u64) -> u32 {
     const MIN_DICT: u32 = 1 << 12;
     declared.min(cap.min(u32::MAX as u64) as u32).max(MIN_DICT)

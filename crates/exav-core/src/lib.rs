@@ -331,6 +331,10 @@ fn markup_cltype(ft: FileType, data: &[u8]) -> Option<engine::ClType> {
 /// The container type a *text carrier* lends to content decoded out of it (a
 /// `data:` URI payload, an embedded base64 blob). Only the carriers exav can
 /// name; `None` means the caller keeps whatever container it already had.
+///
+/// Its one caller sits behind `base64scan`, so this is dead in a build without
+/// it — a configuration that decodes nothing out of a carrier in the first place.
+#[cfg_attr(not(feature = "base64scan"), allow(dead_code))]
 fn carrier_cltype(ft: FileType) -> Option<engine::ClType> {
     use engine::ClType;
     Some(match ft {

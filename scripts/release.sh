@@ -86,13 +86,63 @@ make test-native || fail "make test-native"
 step "MSRV $MSRV actually builds"
 # `rust-version` is a promise to anyone pinning an older toolchain, and nothing
 # else in the build checks it. A number no one verifies drifts upward silently.
-rustup toolchain install "$MSRV" --profile minimal >/dev/null 2>&1 || true
-$CARGO "+$MSRV" check --workspace --all-targets || fail "workspace does not build on its declared MSRV $MSRV"
+#
+# Driven through `rustup run` rather than `cargo +$MSRV`: the `+toolchain`
+# prefix is understood by the rustup *shim*, so it fails with "no such command"
+# whenever `$CARGO` is a real cargo binary instead — which is what a toolchain
+# path in `CARGO`, or a non-rustup install, gives you.
+if command -v rustup >/dev/null 2>&1; then
+  rustup toolchain install "$MSRV" --profile minimal >/dev/null 2>&1 || true
+  rustup run "$MSRV" cargo check --workspace --all-targets \
+    || fail "workspace does not build on its declared MSRV $MSRV"
+else
+  echo "  SKIPPED: needs rustup to install and select the $MSRV toolchain"
+fi
 
 step "Package contents"
 # What actually lands in the tarballs, which is not what `cargo build` sees:
 # `exclude` keys, missing files, and anything accidentally swept in.
 $CARGO package --workspace --no-verify || fail "cargo package"
+
+step "The published tarballs build on their own"
+# The check `cargo publish --dry-run` cannot do on a first release.
+#
+# A dry run builds each crate as crates.io would, resolving its dependencies
+# FROM crates.io — so on a first release every dependent fails with "no matching
+# package named exav-…" and goes unverified. That is exactly when the risk is
+# highest: an `exclude` key that drops a file the library needs compiles fine
+# here, where the file is still on disk, and fails for the first person to run
+# `cargo install`.
+#
+# So the registry is reconstructed from the tarballs themselves and the binary
+# is built from those alone — the same thing `cargo install exav` does. Building
+# `exav` covers exav-core, exav-unpack, exav-pe-emu and exav-x86 transitively;
+# `exav-grep` is the other dependent. exav-x86 and exav-update have no internal
+# dependencies, so their own dry runs verify them completely.
+tb="$(mktemp -d)"
+trap 'rm -rf "$tb"' EXIT
+for c in "${CRATES[@]}"; do
+  tar xzf "target/package/$c-$VERSION.crate" -C "$tb" || fail "extracting $c-$VERSION.crate"
+done
+cat > "$tb/Cargo.toml" <<EOF
+[workspace]
+members = ["exav-$VERSION", "exav-grep-$VERSION"]
+resolver = "2"
+
+[patch.crates-io]
+exav-x86 = { path = "exav-x86-$VERSION" }
+exav-pe-emu = { path = "exav-pe-emu-$VERSION" }
+exav-unpack = { path = "exav-unpack-$VERSION" }
+exav-core = { path = "exav-core-$VERSION" }
+exav-update = { path = "exav-update-$VERSION" }
+exav-grep = { path = "exav-grep-$VERSION" }
+EOF
+( cd "$tb" && $CARGO build --release ) \
+  || fail "the packaged crates do not build on their own — a published file is missing (check the \`exclude\` keys)"
+[ -x "$tb/target/release/exav" ] || fail "the packaged build produced no exav binary"
+# It has to answer, not just link: a binary that cannot start is not installable.
+"$tb/target/release/exav" --version >/dev/null || fail "the packaged exav binary does not run"
+echo "  built and ran exav $VERSION from the tarballs alone"
 
 step "No EICAR literal in any published tarball"
 # The self-scan test covers the source tree; this covers the artifacts, which is

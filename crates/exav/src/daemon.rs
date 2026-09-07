@@ -1192,6 +1192,42 @@ pub fn run_prefork(
     Ok(())
 }
 
+/// Ask the kernel to kill this process when its parent goes.
+///
+/// A worker spends its life blocked in `accept()`, so it cannot notice that the
+/// supervisor has died — and when the supervisor is killed outright rather than
+/// asked to stop (the OOM killer, `kill -9`, a container stop, a test harness
+/// dropping the child) it never gets to take its pool down with it. The workers
+/// are reparented to init and block forever on a socket nobody will connect to
+/// again, holding their descriptors and process slots. Measured at 64 orphans
+/// per run of this crate's daemon tests, accumulating across runs until the
+/// process table or the descriptor ceiling gives out.
+///
+/// `PR_SET_PDEATHSIG` is Linux-only and there is no portable equivalent — the
+/// alternatives all need the worker to be watching a descriptor it is not
+/// watching. On other Unixes a supervisor killed outright still leaves its
+/// workers behind; one asked to stop takes them with it as it always did.
+#[cfg(unix)]
+fn die_with_parent() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: reads this process's own parent id and sets its own
+        // parent-death signal. Neither touches another process.
+        let parent = unsafe { libc::getppid() };
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+        }
+        // The parent can die between `fork` and the `prctl`, in which case the
+        // signal it would have raised was already missed and this worker would
+        // block forever — the exact leak, just through a narrower window. A
+        // parent that changed (or was already init) in that gap is a parent
+        // that is gone, and a worker with no supervisor has nothing to serve.
+        if parent == 1 || unsafe { libc::getppid() } != parent {
+            unsafe { libc::_exit(0) }
+        }
+    }
+}
+
 /// Fork the side listener's child. It resets the signal dispositions the
 /// supervisor installed, so the supervisor's `SIGTERM` terminates it and no
 /// inherited handler fires there, and then never returns.
@@ -1213,6 +1249,10 @@ fn spawn_side(
                 libc::signal(libc::SIGHUP, libc::SIG_DFL);
                 libc::signal(libc::SIGCHLD, libc::SIG_DFL);
             }
+            // After the resets above, so the SIGTERM it arranges is the default
+            // disposition — a handler inherited from the supervisor would
+            // otherwise decide what parent death means here.
+            die_with_parent();
             (side.serve)(Arc::clone(db), Arc::clone(opts));
             // The listener was the child's whole job, so there is nothing left
             // for it to do but let the supervisor respawn it.
@@ -1276,6 +1316,11 @@ fn worker_main(listener: &BoundListener, db: &Scanner, opts: &ScanOptions, cfg: 
         libc::signal(libc::SIGHUP, libc::SIG_DFL);
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
+    // Only now, with SIGTERM back to its default disposition: arranged before
+    // the reset, parent death would run the handler this worker inherited from
+    // the supervisor, which only sets a flag — and the worker would go on to
+    // block in `accept()` exactly as if nothing had been arranged at all.
+    die_with_parent();
     let arm = || set_timer(cfg.max_scan_time);
     let disarm = || set_timer(std::time::Duration::ZERO);
     // A `RELOAD` command reaches a worker, not the supervisor; forward it by
@@ -3125,6 +3170,11 @@ mod tests {
         // crosses it reaches the temp file at all. Cross it by one byte, with
         // the signature at the very end so a truncated or mis-sized spill
         // cannot pass.
+        //
+        // Held for the lifetime of the payload: the spill budget is a process
+        // -wide counter, and the 16 MiB charged here is what the budget test
+        // would otherwise see appear inside its own measurement.
+        let _budget = crate::spill::budget_guard();
         let threshold = crate::spill::config().threshold as usize;
         let mut payload = vec![b'.'; threshold + 1 - eicar().len()];
         payload.extend_from_slice(eicar());

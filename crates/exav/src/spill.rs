@@ -114,6 +114,31 @@ pub(crate) fn in_use() -> u64 {
     IN_USE.load(Ordering::Relaxed)
 }
 
+/// Serialises the tests that assert on [`IN_USE`] against the tests that move
+/// it.
+///
+/// The counter is process-wide, which is the point of it — and `cargo test`
+/// runs this binary's tests on threads inside one process. So a test reading
+/// `in_use()` around a payload it owns is also reading every other test's
+/// spilling, and asserting on an absolute value races them. It showed up as
+/// `a_dropped_payload_returns_its_share_of_the_budget` finding 16 MiB more than
+/// it put there: exactly the threshold-crossing payload of
+/// `an_oversized_stream_spills_to_disk_and_reads_back`, landing between its two
+/// reads.
+///
+/// Every test that reads the counter or crosses the spill threshold takes this
+/// first. Poison is ignored deliberately: an unrelated test panicking while
+/// holding it says nothing about the budget, and turning that into a second
+/// failure buries the first.
+#[cfg(test)]
+pub(crate) static BUDGET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`BUDGET_LOCK`], ignoring poison.
+#[cfg(test)]
+pub(crate) fn budget_guard() -> std::sync::MutexGuard<'static, ()> {
+    BUDGET_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Why an object could not be buffered.
 #[derive(Debug)]
 pub(crate) enum SpillError {
@@ -280,6 +305,7 @@ mod tests {
     /// remembers to give it back — including the paths that leave early.
     #[test]
     fn a_dropped_payload_returns_its_share_of_the_budget() {
+        let _budget = budget_guard();
         let before = in_use();
         {
             let mut f = SpillFile::create().expect("a temp file");

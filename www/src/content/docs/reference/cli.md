@@ -392,7 +392,7 @@ it to clients as `Max-Connections`.
 | `--connect <ADDR>` | — | Scan by handing each file to a daemon already running here, instead of loading a database. |
 | `--send-as <WHAT>` | `path` | What a `--connect` client hands the daemon: `path`, `contents` or `fd`. |
 | `--workers <N\|threads>` | CPU cores | Daemon worker model (Unix): a count runs a prefork pool, `threads` runs the listeners in one process. |
-| `--max-scan-secs <SECS>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`); the worker is killed on expiry. In a one-shot run it bounds the whole run, which exits 2 saying so. Refused for a listener under `--workers threads`. |
+| `--max-scan-secs <SECS>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`); the worker is killed on expiry. In a one-shot run it bounds the whole run, which exits 3 saying so — running out of time is a scan that stopped short, not a scanner that failed. Refused for a listener under `--workers threads`. |
 | `--max-process-bytes <SIZE>` | `2G` in the pool, unset otherwise | Unix. Address space (`RLIMIT_AS`): per worker in the pool, whole-process in a one-shot run or the thread model. Also lowers the in-core extraction budget to fit inside it. |
 | `--max-jobs-per-worker <N>` | `1000` | Prefork only: recycle a worker after this many jobs. |
 | `--allow-shutdown` | off | Honour the clamd `SHUTDOWN` command, letting any client that can reach the daemon stop it. |

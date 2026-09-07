@@ -8,6 +8,9 @@
 //! excluded container is REPORTED. "I declined to open this" and "there was
 //! nothing here" must never look the same to whatever reads the result.
 
+// `extract` and `Budget` are used only by the tests that open a real container,
+// which are behind the `zip` feature; `Format` and `Limits` are always needed.
+#[allow(unused_imports)]
 use exav_unpack::{extract, Budget, Format, Limits};
 use std::collections::BTreeSet;
 

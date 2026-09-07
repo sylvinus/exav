@@ -80,22 +80,28 @@ fn collect_ole_entries<R: Read + Seek>(
             })
             .cloned()
     };
+    // The stream paths are what the decryptor needs; without `decrypt` there is
+    // nothing to hand them to, and the member is reported unsupported below
+    // without either stream being read.
+    #[cfg_attr(not(feature = "decrypt"), allow(unused_variables))]
     if let (Some(info_p), Some(pkg_p)) = (
         stream_named("EncryptionInfo"),
         stream_named("EncryptedPackage"),
     ) {
-        let mut read_full = |p: &std::path::Path| -> Option<Vec<u8>> {
-            let s = comp.open_stream(p).ok()?;
-            bounded_read(s, budget.limits.max_buffer_bytes)
-                .ok()
-                .map(|(b, _)| b)
-        };
         #[cfg(feature = "decrypt")]
-        let decrypted = match (read_full(&info_p), read_full(&pkg_p)) {
-            (Some(info), Some(pkg)) => {
-                super::ole_crypto::try_decrypt_ooxml(&info, &pkg, &budget.passwords)
+        let decrypted = {
+            let mut read_full = |p: &std::path::Path| -> Option<Vec<u8>> {
+                let s = comp.open_stream(p).ok()?;
+                bounded_read(s, budget.limits.max_buffer_bytes)
+                    .ok()
+                    .map(|(b, _)| b)
+            };
+            match (read_full(&info_p), read_full(&pkg_p)) {
+                (Some(info), Some(pkg)) => {
+                    super::ole_crypto::try_decrypt_ooxml(&info, &pkg, &budget.passwords)
+                }
+                _ => None,
             }
-            _ => None,
         };
         #[cfg(not(feature = "decrypt"))]
         let decrypted: Option<Vec<u8>> = None;
@@ -753,6 +759,7 @@ fn assemble_ole_entries(
 
     // OOXML encrypted container: decrypt the standard scheme or surface an
     // encrypted member — never a silent clean.
+    #[cfg_attr(not(feature = "decrypt"), allow(unused_variables))]
     if let (Some(info), Some(pkg)) = (find("EncryptionInfo"), find("EncryptedPackage")) {
         #[cfg(feature = "decrypt")]
         let decrypted = super::ole_crypto::try_decrypt_ooxml(
