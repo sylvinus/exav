@@ -1218,6 +1218,13 @@ fn ignore_sigpipe() {
     }
 }
 
+/// Nothing to do off Unix: there is no `SIGPIPE`, and a peer that hangs up
+/// mid-response surfaces as an ordinary write error on the socket. Provided so
+/// the ICAP listener's call sites stay unconditional — gating each of them
+/// instead is how this came to not compile for Windows at all.
+#[cfg(all(not(unix), feature = "icap"))]
+fn ignore_sigpipe() {}
+
 fn main() -> ExitCode {
     restore_default_sigpipe();
     let mut cli = Cli::parse();
@@ -2482,7 +2489,7 @@ fn client_dial(cli: &Cli) -> io::Result<Box<dyn ReadWrite>> {
             Ok(Box::new(std::os::unix::net::UnixStream::connect(path)?))
         }
         #[cfg(not(unix))]
-        Some(endpoint::Addr::Unix(_)) => Err(io::Error::other(
+        Some(endpoint::Addr::Unix { .. }) => Err(io::Error::other(
             "a Unix-socket address needs a Unix platform",
         )),
         None => Err(io::Error::other("--connect ADDR required for client mode")),

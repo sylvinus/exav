@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv release-check fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -115,12 +115,6 @@ msrv:
 	  rustup toolchain install $$v --profile minimal >/dev/null 2>&1 || true; \
 	  echo "checking MSRV $$v"; $(CARGO) +$$v check --workspace --all-targets
 
-## release: the pre-publish gate, then crates.io in dependency order. Stops for
-##          a human between the two. `scripts/release.sh --gate-only` runs just
-##          the checks; `--dry-run` adds `cargo publish --dry-run`.
-release-check:
-	./scripts/release.sh --gate-only
-
 ## fuzz: smoke-build the fuzz targets
 fuzz:
 	cd fuzz && $(CARGO) build
@@ -154,35 +148,20 @@ www-dev:
 www-build:
 	cd www && ([ -d node_modules ] || npm install) && npm run build
 
-# The order is the crate graph, leaves first. It is not a preference: a crate
-# cannot be published before the crates it depends on exist on the registry,
-# because cargo resolves the `version` alongside each path dependency from
-# there. Publishing out of order fails partway and leaves some crates at the new
-# version and some not — and a published version can be yanked but never
-# replaced or reused, so a botched run burns that version number permanently.
-PUBLISH_ORDER := exav-x86 exav-pe-emu exav-unpack exav-core exav-update exav-grep exav-cli
+# Both delegate to scripts/release.sh, which owns the publish order and the
+# pre-publish gate. One list, in one place: the order is the crate graph and a
+# crate cannot go up before the crates it depends on exist on the registry, so a
+# list that drifts fails partway and leaves some crates at the new version and
+# some not — and a published version can be yanked but never replaced or reused,
+# so a botched run burns that version number permanently.
 
-## publish-check: dry-run every crate in dependency order, publishing nothing
+## publish-check: run the pre-publish gate and dry-run every crate, publishing nothing
 publish-check:
-	@for c in $(PUBLISH_ORDER); do \
-		echo "=== $$c"; \
-		$(CARGO) publish --dry-run -p $$c || exit 1; \
-	done
-	@echo "All crates package cleanly. Review the file lists above before publishing."
+	./scripts/release.sh --dry-run
 
-## publish: publish every crate in dependency order (asks once, then commits)
+## publish: gate, stop for review, then publish every crate in dependency order
 publish:
-	@echo "About to publish to crates.io, in this order:"
-	@echo "  $(PUBLISH_ORDER)"
-	@echo "This cannot be undone: a version can be yanked but never reused."
-	@read -p "Type the version to confirm: " v; \
-	 test "$$v" = "$$($(CARGO) metadata --no-deps --format-version 1 | \
-	   sed -n 's/.*"name":"exav-core","version":"\([^"]*\)".*/\1/p')" || \
-	   { echo "Version mismatch; nothing published."; exit 1; }
-	@for c in $(PUBLISH_ORDER); do \
-		echo "=== publishing $$c"; \
-		$(CARGO) publish -p $$c || exit 1; \
-	done
+	./scripts/release.sh
 
 # The npm package is published from the CRATE directory, never from `pkg/`.
 # `wasm-pack` writes its own `package.json` into `pkg/`, so running `npm publish`
