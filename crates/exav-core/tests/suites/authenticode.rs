@@ -9,7 +9,7 @@ fn fixture(name: &str) -> Vec<u8> {
         "{}/tests/fixtures/authenticode/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 /// A `.crb` block-list entry for the signer certificate flags the signed PE by

@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv release-check fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -105,6 +105,21 @@ lint:
 ## fmt: format the code
 fmt:
 	$(CARGO) fmt
+
+## msrv: build the workspace on the `rust-version` floor declared in Cargo.toml.
+##       Nothing else checks it, and a version nobody verifies drifts upward the
+##       first time someone uses a newer feature — silently breaking anyone who
+##       pinned the toolchain we promised.
+msrv:
+	@v=$$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
+	  rustup toolchain install $$v --profile minimal >/dev/null 2>&1 || true; \
+	  echo "checking MSRV $$v"; $(CARGO) +$$v check --workspace --all-targets
+
+## release: the pre-publish gate, then crates.io in dependency order. Stops for
+##          a human between the two. `scripts/release.sh --gate-only` runs just
+##          the checks; `--dry-run` adds `cargo publish --dry-run`.
+release-check:
+	./scripts/release.sh --gate-only
 
 ## fuzz: smoke-build the fuzz targets
 fuzz:

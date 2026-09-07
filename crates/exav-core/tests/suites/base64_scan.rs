@@ -6,7 +6,11 @@ use base64::Engine;
 use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 
 // The standard EICAR test string — the built-in DB carries a signature for it.
-const EICAR: &[u8] = br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+// Assembled at runtime; see `exav_core::unpack::eicar` for why it is never a
+// literal anywhere in this tree.
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 /// A minimal but structurally valid PE (MZ + e_lfanew → `PE\0\0`) that embeds the
 /// EICAR string, padded so its base64 encoding exceeds the scan's minimum run.
@@ -16,7 +20,7 @@ fn eicar_pe() -> Vec<u8> {
     pe[1] = b'Z';
     pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
     pe[0x40..0x44].copy_from_slice(b"PE\x00\x00");
-    pe[0x80..0x80 + EICAR.len()].copy_from_slice(EICAR);
+    pe[0x80..0x80 + eicar().len()].copy_from_slice(eicar());
     pe
 }
 

@@ -15,7 +15,9 @@
 use exav_core::{scan_seekable_located, ScanOptions, Scanner, Verdict};
 use std::io::Cursor;
 
-const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn eicar_db() -> Scanner {
     // The built-in baseline knows EICAR, which is all this test needs.
@@ -99,7 +101,7 @@ fn zip_with(name: &str, data: &[u8]) -> Vec<u8> {
 #[test]
 fn a_hit_inside_a_member_reports_its_location() {
     let db = eicar_db();
-    let blob = zip_with("payload/evil.txt", EICAR);
+    let blob = zip_with("payload/evil.txt", eicar());
     let (report, location) = scan(&db, &blob);
     assert!(
         matches!(report.verdict, Verdict::Infected { .. }),
@@ -120,7 +122,7 @@ fn a_top_level_hit_reports_no_location() {
     // The converse: a hit on the scanned object itself has no member path, and
     // inventing one would be worse than omitting it.
     let db = eicar_db();
-    let (report, location) = scan(&db, EICAR);
+    let (report, location) = scan(&db, eicar());
     assert!(matches!(report.verdict, Verdict::Infected { .. }));
     assert!(
         location.is_none(),

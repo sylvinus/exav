@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 mod tmpfile;
 use tmpfile::TempDir;
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 /// A signature set with enough in it to count as a real database: exav refuses
 /// to serve anything that adds nothing to the built-in EICAR-only baseline, and
@@ -598,8 +600,8 @@ fn the_baseline_still_answers_on_an_opted_in_run() {
             sigs.path().to_str().unwrap(),
         ],
     );
-    assert!(clamd_instream(clamd, EICAR).contains("FOUND"));
-    assert!(icap_respmod(icap, EICAR).contains("Exav.Test.EICAR"));
+    assert!(clamd_instream(clamd, eicar()).contains("FOUND"));
+    assert!(icap_respmod(icap, eicar()).contains("Exav.Test.EICAR"));
 }
 
 /// Paths outside a temp dir are never touched by this suite; the helper exists

@@ -25,7 +25,9 @@ const MACRO_SIG_BODY: &[u8] = b"Attribute VB_Name = \"exavProbeModule\"";
 
 /// Carried by the builtin baseline, so a scanner with no database still detects
 /// it — which is what lets the depth test below use `Scanner::builtin()`.
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn scanner() -> Scanner {
     let hex: String = MACRO_SIG_BODY.iter().map(|b| format!("{b:02x}")).collect();
@@ -176,7 +178,7 @@ fn compressor_fixture(name: &str) -> Vec<u8> {
         "{}/tests/fixtures/compressors/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 #[test]
@@ -249,7 +251,7 @@ fn nesting_depth_does_not_change_what_a_scan_finds() {
     //
     // Identical bytes must give an identical verdict wherever they sit.
     let db = Scanner::builtin();
-    let inner = zip_with_oversized_member(EICAR);
+    let inner = zip_with_oversized_member(eicar());
     let nested = tar_wrapping("inner.zip", &inner);
     // A cap far below the member's decompressed size, so buffering cannot reach
     // the payload at its end.

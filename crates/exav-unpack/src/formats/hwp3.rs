@@ -193,7 +193,7 @@ mod tests {
     fn a_compressed_body_is_decompressed_and_scannable() {
         // The point of the whole module: the payload is behind deflate, so
         // without this a signature in the text can never match.
-        let secret = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let secret = crate::eicar();
         let seen = members(&build(true, 0, 4, secret));
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert!(seen[0].unsupported.is_none(), "{seen:?}");

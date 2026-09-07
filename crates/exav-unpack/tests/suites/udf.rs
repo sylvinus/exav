@@ -30,7 +30,7 @@ const PAYLOAD_SHA256: &str = "13d029085fab073b6c20dd01a423c97e324dc430ca8186795a
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/udf/{name}", env!("CARGO_MANIFEST_DIR"));
-    let raw = std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let raw = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
     let mut out = Vec::new();
     std::io::Read::read_to_end(
         &mut flate2::read::GzDecoder::new(std::io::Cursor::new(raw)),

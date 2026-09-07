@@ -413,7 +413,7 @@ mod tests {
             "{}/tests/fixtures/authenticode/{name}",
             env!("CARGO_MANIFEST_DIR")
         );
-        std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+        crate::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
     }
 
     /// The vendored X.509 parser extracts the exact fields of a real

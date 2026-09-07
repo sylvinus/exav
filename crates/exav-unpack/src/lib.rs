@@ -1752,6 +1752,68 @@ pub(crate) fn ratio_guard(input: u64, output: u64, budget: &Budget) -> Result<()
     Ok(())
 }
 
+/// The EICAR anti-virus test string, assembled at runtime from its reverse.
+///
+/// The 68-byte sequence exists nowhere in this source tree, and nowhere in any
+/// binary built from it. That is deliberate: a scanner is a file every other
+/// scanner reads. Stored as a plain literal it would travel into the compiled
+/// binary, the `.crate` tarballs on crates.io and the container image, and every
+/// AV worth installing would quarantine all three on sight — which reads as a
+/// broken release rather than as the test string it is. ClamAV keeps EICAR in a
+/// signature database, not in its binary, for the same reason.
+///
+/// Reversed rather than encrypted so a reader can still verify it by eye: no
+/// signature matches the reversed bytes, but `RACIE` is legible enough that
+/// nobody has to trust a hex blob.
+///
+/// `exav`'s `scans_its_own_source_and_binary_clean` test holds this property for
+/// the whole tree, so a literal reintroduced anywhere fails the build.
+#[doc(hidden)]
+pub fn eicar() -> &'static [u8] {
+    const REVERSED: &[u8] =
+        br#"*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\4[PA@%P!O5X"#;
+    static FORWARD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    FORWARD.get_or_init(|| REVERSED.iter().rev().copied().collect())
+}
+
+/// The byte a masked test fixture is XORed with. Any non-zero value does the
+/// job; this one is arbitrary.
+#[doc(hidden)]
+pub const FIXTURE_MASK: u8 = 0x5A;
+
+/// Undo the mask on a committed test fixture.
+///
+/// A committed fixture that a scanner detects is a fixture that gets quarantined
+/// on `git clone`, deleted by an AV-scanned CI runner, and flagged by whatever
+/// watches a contributor's laptop — for files whose entire job is to be detected.
+/// Masking them removes the archive magic and the payload in one step, so no
+/// scanner has anything to match, while the bytes stay one XOR away.
+///
+/// XOR rather than the password-protected ZIP that is standard for distributing
+/// samples: these fixtures are the corpus for an archive extractor, so wrapping
+/// them in archives would make the ZIP and 7z tests depend on working ZIP and
+/// decryption support to load their own inputs — and the `--no-default-features`
+/// build has neither compiled in.
+#[doc(hidden)]
+pub fn unmask_fixture(masked: &[u8]) -> Vec<u8> {
+    masked.iter().map(|b| b ^ FIXTURE_MASK).collect()
+}
+
+/// Read a test fixture, unmasking it when the masked form is what is committed.
+///
+/// Prefers `<path>.xor` and falls back to `<path>`, so only the fixtures a
+/// scanner actually reacts to have to be masked and the rest stay readable with
+/// ordinary tools. Missing-file errors name the plain path, which is the one a
+/// reader is looking for.
+#[doc(hidden)]
+pub fn read_fixture(path: &str) -> std::io::Result<Vec<u8>> {
+    let masked = format!("{path}.xor");
+    if std::fs::exists(&masked)? {
+        return Ok(unmask_fixture(&std::fs::read(&masked)?));
+    }
+    std::fs::read(path)
+}
+
 /// Read up to `cap` bytes; the returned flag is true if the source had more
 /// (so the caller can treat it as exceeding the budget rather than silently
 /// truncating).
@@ -2850,7 +2912,9 @@ mod tests {
         assert_eq!(entries[0].data, b"hello exav inside cab");
     }
 
-    const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    fn eicar() -> &'static [u8] {
+        crate::eicar()
+    }
 
     fn has_eicar(entries: &[Entry]) -> bool {
         entries
@@ -2866,7 +2930,7 @@ mod tests {
             let mut comp = cfb::CompoundFile::create(&mut buf).unwrap();
             comp.create_storage("Macros").unwrap();
             let mut s = comp.create_stream("Macros/Module1").unwrap();
-            std::io::Write::write_all(&mut s, EICAR).unwrap();
+            std::io::Write::write_all(&mut s, eicar()).unwrap();
         }
         let data = buf.into_inner();
         let mut budget = Budget::new(Limits::default());
@@ -2909,7 +2973,7 @@ mod tests {
 
     #[test]
     fn pdf_stream_extracted() {
-        let pdf = minimal_pdf_with_stream(EICAR);
+        let pdf = minimal_pdf_with_stream(eicar());
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
         assert!(has_eicar(&entries), "EICAR not found in PDF streams");

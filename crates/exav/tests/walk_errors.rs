@@ -23,7 +23,9 @@ fn exav() -> Command {
     c
 }
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 /// Returns `None` when the platform or the test environment cannot make a
 /// directory unreadable — running as root defeats mode 0, and non-Unix has no
@@ -37,7 +39,7 @@ fn unreadable_tree() -> Option<TempDir> {
     std::fs::create_dir_all(&readable).ok()?;
     std::fs::create_dir_all(&secret).ok()?;
     std::fs::write(readable.join("ordinary.txt"), b"nothing here").ok()?;
-    std::fs::write(secret.join("payload.com"), EICAR).ok()?;
+    std::fs::write(secret.join("payload.com"), eicar()).ok()?;
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).ok()?;
     // Confirm the environment actually enforces it.
     if std::fs::read_dir(&secret).is_ok() {

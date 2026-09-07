@@ -16,7 +16,9 @@ use std::process::Command;
 mod tmpfile;
 use tmpfile::TempDir;
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn exav() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_exav"));
@@ -34,7 +36,7 @@ fn tree() -> (TempDir, TempDir) {
     std::fs::write(dir.path().join("clean.txt"), b"nothing bad here\n").unwrap();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
-    std::fs::write(sub.join("deep.txt"), EICAR).unwrap();
+    std::fs::write(sub.join("deep.txt"), eicar()).unwrap();
     (db, dir)
 }
 
@@ -92,7 +94,7 @@ fn a_named_directory_is_scanned_all_the_way_down() {
 #[test]
 fn an_infected_file_in_the_directory_itself_exits_1() {
     let (db, dir) = tree();
-    std::fs::write(dir.path().join("bad.txt"), EICAR).unwrap();
+    std::fs::write(dir.path().join("bad.txt"), eicar()).unwrap();
     let (code, stdout) = scan(&db, &dir, &[]);
     assert!(
         stdout.contains("bad.txt: Eicar-Test-Signature FOUND"),
@@ -129,7 +131,7 @@ fn no_recursive_stops_at_the_top_level() {
 #[test]
 fn exclude_applies_at_the_top_level_too() {
     let (db, dir) = tree();
-    std::fs::write(dir.path().join("bad.txt"), EICAR).unwrap();
+    std::fs::write(dir.path().join("bad.txt"), eicar()).unwrap();
     // `--no-recursive` so the fixture's own infected file below is out of the
     // way and this test is about the filter and nothing else.
     let (code, stdout) = scan(&db, &dir, &["--no-recursive", "--exclude", "bad"]);

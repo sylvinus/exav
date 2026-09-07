@@ -66,9 +66,13 @@ fn malformed_iso_short_record_does_not_panic() {
 /// `usize` (upx.rs nrv_gamma/nrv_gamma_de). Capped now; must not panic.
 #[test]
 fn malformed_upx_nrv_gamma_does_not_panic() {
-    let data = include_bytes!("../fixtures/upx_nrv_gamma_overflow.upx");
+    // Masked on disk: a fuzzer-built UPX'd i386 ELF matches ClamAV's generic
+    // Mirai signature, so committed in the clear it gets this repository
+    // quarantined on clone. See `exav_unpack::unmask_fixture`.
+    let data =
+        exav_unpack::unmask_fixture(include_bytes!("../fixtures/upx_nrv_gamma_overflow.upx.xor"));
     let mut budget = Budget::new(Limits::default());
-    let _ = extract(Format::Upx, data, &mut budget);
+    let _ = extract(Format::Upx, &data, &mut budget);
 }
 
 /// Regression for fuzz-found crash (2026-07-01): a truncated CAB with LZX

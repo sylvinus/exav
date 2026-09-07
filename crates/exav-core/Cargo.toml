@@ -10,6 +10,13 @@ keywords.workspace = true
 categories = ["filesystem", "parser-implementations"]
 readme = "README.md"
 description = "Core engine for the exav malware scanner: signature-database parsing, pattern/hash matching, YARA support, and a sandboxed bytecode interpreter."
+# The integration fixtures stay out of the published crate, as they do for
+# exav-unpack. Several are archives built around the EICAR test string, and a
+# `.crate` carrying it is quarantined by whatever scanner watches the machine
+# that runs `cargo add` — the tarball would be the thing setting off alarms.
+# They are test inputs read at run time, so nothing in a published build needs
+# them; `src/yara/testdata` stays because `include_bytes!` needs it to compile.
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 aho-corasick.workspace = true

@@ -2663,7 +2663,9 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    fn eicar() -> &'static [u8] {
+        exav_core::unpack::eicar()
+    }
 
     /// The in-core extraction budget must fit inside the memory a job is
     /// granted, so a size limit is *reported* rather than the worker being
@@ -2875,7 +2877,7 @@ mod tests {
 
     #[test]
     fn exinstream_eicar_top_level_no_location() {
-        let r = one(&exinstream_msg(EICAR), 0);
+        let r = one(&exinstream_msg(eicar()), 0);
         assert!(r.contains(r#""status":"FOUND""#), "got {r}");
         assert!(r.contains(r#""signature":"#), "got {r}");
         assert!(
@@ -2925,7 +2927,7 @@ mod tests {
     #[test]
     fn exinstream_multi_reports_one_entry_per_file() {
         let r = one(
-            &exinstream_multi_msg(&[("a.txt", b"hello"), ("b.txt", EICAR)]),
+            &exinstream_multi_msg(&[("a.txt", b"hello"), ("b.txt", eicar())]),
             0,
         );
         let v: serde_json::Value = serde_json::from_str(&r).unwrap_or_else(|e| panic!("{e}: {r}"));
@@ -3048,7 +3050,7 @@ mod tests {
 
     #[test]
     fn instream_detects_eicar_and_passes_clean() {
-        assert!(one(&instream_msg(EICAR), 0).contains("FOUND"));
+        assert!(one(&instream_msg(eicar()), 0).contains("FOUND"));
         assert_eq!(
             one(&instream_msg(b"totally benign content"), 0),
             "stream: OK"
@@ -3066,7 +3068,7 @@ mod tests {
         // The payload sits entirely in the part that never arrives, so a scan of
         // what did arrive would come back clean.
         let mut payload = vec![b'.'; 64];
-        payload.extend_from_slice(EICAR);
+        payload.extend_from_slice(eicar());
 
         // Announce the full length, then send only the benign head and close.
         let mut msg = b"zINSTREAM\0".to_vec();
@@ -3109,7 +3111,7 @@ mod tests {
     fn instream_chunked_across_frames() {
         // EICAR split across several INSTREAM chunks must still match.
         let mut msg = b"zINSTREAM\0".to_vec();
-        for chunk in EICAR.chunks(7) {
+        for chunk in eicar().chunks(7) {
             msg.extend((chunk.len() as u32).to_be_bytes());
             msg.extend_from_slice(chunk);
         }
@@ -3124,8 +3126,8 @@ mod tests {
         // the signature at the very end so a truncated or mis-sized spill
         // cannot pass.
         let threshold = crate::spill::config().threshold as usize;
-        let mut payload = vec![b'.'; threshold + 1 - EICAR.len()];
-        payload.extend_from_slice(EICAR);
+        let mut payload = vec![b'.'; threshold + 1 - eicar().len()];
+        payload.extend_from_slice(eicar());
         let expected = payload.len() as u64;
 
         let materialized = buffer_to_seekable(&mut &payload[..]).unwrap();
@@ -3157,7 +3159,7 @@ mod tests {
     fn scan_path_eicar_and_clean() {
         let dir = crate::tmpfile::TempDir::new().unwrap();
         let bad = dir.path().join("bad");
-        std::fs::write(&bad, EICAR).unwrap();
+        std::fs::write(&bad, eicar()).unwrap();
         let good = dir.path().join("good");
         std::fs::write(&good, b"hello there").unwrap();
         let rb = one(format!("zSCAN {}\0", bad.display()).as_bytes(), 0);
@@ -3240,7 +3242,7 @@ mod tests {
     fn contscan_is_unchanged_for_ordinary_files() {
         let dir = crate::tmpfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-        std::fs::write(dir.path().join("bad"), EICAR).unwrap();
+        std::fs::write(dir.path().join("bad"), eicar()).unwrap();
         let lines = scan_tree(
             &Scanner::builtin(),
             &ScanOptions::default(),
@@ -3256,7 +3258,7 @@ mod tests {
         let mut w = serve();
         let mut r = BufReader::new(w.try_clone().unwrap());
         w.write_all(b"zIDSESSION\0").unwrap();
-        w.write_all(&instream_msg(EICAR)).unwrap();
+        w.write_all(&instream_msg(eicar())).unwrap();
         w.flush().unwrap();
         let mut b1 = Vec::new();
         r.read_until(0, &mut b1).unwrap();
@@ -3321,7 +3323,7 @@ mod tests {
         // The counters are process-global and this binary's tests run in
         // parallel, so this asserts movement rather than an absolute count.
         let before = crate::metrics::scans();
-        let reply = one(&instream_msg(EICAR), 0);
+        let reply = one(&instream_msg(eicar()), 0);
         assert!(reply.contains("FOUND"), "{reply}");
         assert!(
             crate::metrics::scans() > before,
@@ -3396,7 +3398,7 @@ mod tests {
         use std::os::fd::AsRawFd;
         let dir = crate::tmpfile::TempDir::new().unwrap();
         let bad = dir.path().join("bad");
-        std::fs::write(&bad, EICAR).unwrap();
+        std::fs::write(&bad, eicar()).unwrap();
         let f = std::fs::File::open(&bad).unwrap();
 
         let mut w = serve();
@@ -3445,7 +3447,7 @@ mod tests {
     fn allmatchscan_reports_detection() {
         let dir = crate::tmpfile::TempDir::new().unwrap();
         let bad = dir.path().join("bad");
-        std::fs::write(&bad, EICAR).unwrap();
+        std::fs::write(&bad, eicar()).unwrap();
         let r = one(format!("zALLMATCHSCAN {}\0", bad.display()).as_bytes(), 0);
         assert!(r.contains("FOUND"), "got {r}");
         let good = dir.path().join("good");

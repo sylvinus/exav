@@ -16,7 +16,11 @@ fn exav() -> Command {
     c
 }
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+// `eicar_bytes`, not `eicar`: the tests below bind `eicar` to the path they
+// write these bytes to, and a same-named function would be shadowed by it.
+fn eicar_bytes() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 #[test]
 fn json_output_is_valid_jsonl_with_expected_fields() {
@@ -24,7 +28,7 @@ fn json_output_is_valid_jsonl_with_expected_fields() {
     let db = TempDir::new().unwrap();
     let files = TempDir::new().unwrap();
     let eicar = files.path().join("eicar.txt");
-    std::fs::write(&eicar, EICAR).unwrap();
+    std::fs::write(&eicar, eicar_bytes()).unwrap();
     let clean = files.path().join("clean.txt");
     std::fs::write(&clean, b"nothing bad in here\n").unwrap();
 
@@ -72,7 +76,7 @@ fn json_infected_only_suppresses_clean() {
     let db = TempDir::new().unwrap();
     let files = TempDir::new().unwrap();
     let eicar = files.path().join("eicar.txt");
-    std::fs::write(&eicar, EICAR).unwrap();
+    std::fs::write(&eicar, eicar_bytes()).unwrap();
     let clean = files.path().join("clean.txt");
     std::fs::write(&clean, b"benign\n").unwrap();
 

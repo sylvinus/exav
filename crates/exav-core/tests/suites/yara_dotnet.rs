@@ -31,7 +31,7 @@ fn fixture() -> Vec<u8> {
         "{}/tests/fixtures/dotnet/system_buffers.dll",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 /// Compile one rule into a scanner, via a temporary `.yar` file — the same path

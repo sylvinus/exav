@@ -53,7 +53,11 @@ open(sys.argv[2], 'wb').write(d + b'\0' * (-len(d) % 512))" "$1" "$2"; }
 
 # The payload. Not malware: the EICAR industry test string, which every scanner
 # is expected to detect and nothing else.
-printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > eicar.com
+#
+# Written reversed and flipped back, so the 68-byte sequence is not stored in
+# this script. See `exav_unpack::eicar`: a source file carrying it gets this
+# repository and its releases quarantined by other scanners.
+printf '*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\\4[PA@%%P!O5X' | rev > eicar.com
 
 zip -q -9 a01.zip eicar.com                              ; step ZIP      a01.zip
 lzip -9 -c a01.zip                > a02.lz               ; step lzip     a02.lz

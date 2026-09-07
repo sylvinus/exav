@@ -42,7 +42,7 @@ fn fixture(name: &str) -> Vec<u8> {
         "{}/tests/fixtures/rar_solid/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn sha256_hex(data: &[u8]) -> String {

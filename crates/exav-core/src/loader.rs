@@ -68,7 +68,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, LoadError> {
 use crate::fuzzy::FuzzyDb;
 use crate::hashes::{HashDb, SectionHashDb};
 use crate::ml::HeuristicModel;
-use crate::patterns::{Pattern, PatternSet, EICAR};
+use crate::patterns::{eicar, Pattern, PatternSet};
 use crate::Scanner;
 
 /// Accumulates parsed signatures from multiple files before building.
@@ -344,7 +344,7 @@ impl Builder {
     pub fn build(mut self) -> Result<Scanner, LoadError> {
         // Fold EICAR into the engine so in-memory scans detect it without the
         // streaming automaton; also keep it in the streaming literal set.
-        self.engine.add_literal("Eicar-Test-Signature", EICAR);
+        self.engine.add_literal("Eicar-Test-Signature", eicar());
 
         // Sort + intern the hash tables BEFORE building the (memory-heavy)
         // automaton: finalize collapses millions of per-entry strings into one
@@ -362,7 +362,7 @@ impl Builder {
         let engine = self.engine.build_with_budget(self.max_build_mem);
 
         let mut pats = self.patterns;
-        pats.push(Pattern::new("Eicar-Test-Signature", EICAR));
+        pats.push(Pattern::new("Eicar-Test-Signature", eicar().to_vec()));
         let patterns = PatternSet::build(&pats, 0).map_err(LoadError::Patterns)?;
 
         Ok(Scanner {

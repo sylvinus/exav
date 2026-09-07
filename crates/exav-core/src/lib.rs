@@ -938,7 +938,7 @@ impl Scanner {
         // EICAR goes in the engine (used by in-memory scans) and in the
         // streaming PatternSet (used by stdin/pipe scans).
         let mut eb = engine::EngineBuilder::new();
-        eb.add_literal("Exav.Test.EICAR", patterns::EICAR);
+        eb.add_literal("Exav.Test.EICAR", patterns::eicar());
         Self {
             patterns: PatternSet::builtin(),
             engine: eb.build(),
@@ -4024,7 +4024,7 @@ fn stream_core<R: Read>(db: &Scanner, reader: R) -> io::Result<Option<CoreHit>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use patterns::EICAR;
+    use patterns::eicar;
     use std::io::Cursor;
 
     #[test]
@@ -4185,7 +4185,7 @@ mod tests {
     #[test]
     fn detects_eicar_pattern() {
         let db = Scanner::builtin();
-        let r = scan_stream(&db, Cursor::new(EICAR.to_vec())).unwrap();
+        let r = scan_stream(&db, Cursor::new(eicar().to_vec())).unwrap();
         assert!(matches!(
             r.verdict,
             Verdict::Infected {
@@ -4386,7 +4386,7 @@ mod tests {
     fn detects_across_buffer_boundary() {
         let db = Scanner::builtin();
         let mut data = vec![b'A'; 3_000_000];
-        data.extend_from_slice(EICAR);
+        data.extend_from_slice(eicar());
         data.extend(std::iter::repeat_n(b'B', 3_000_000));
         let r = scan_stream(&db, Cursor::new(data)).unwrap();
         match r.verdict {
@@ -4401,7 +4401,7 @@ mod tests {
         use flate2::Compression;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
-        e.write_all(EICAR).unwrap();
+        e.write_all(eicar()).unwrap();
         let blob = e.finish().unwrap();
         let db = Scanner::builtin();
         let r = analyze(&db, &blob, &ScanOptions::default());
@@ -4530,7 +4530,7 @@ mod tests {
         use flate2::Compression;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
-        e.write_all(EICAR).unwrap();
+        e.write_all(eicar()).unwrap();
         let blob = e.finish().unwrap();
         let f = write_temp(&blob);
         let db = Scanner::builtin();
@@ -4564,9 +4564,9 @@ mod tests {
         h.set_cksum();
         ar.append_data(&mut h, "pad.bin", &pad[..]).unwrap();
         let mut h2 = tar::Header::new_gnu();
-        h2.set_size(EICAR.len() as u64);
+        h2.set_size(eicar().len() as u64);
         h2.set_cksum();
-        ar.append_data(&mut h2, "evil.com", EICAR).unwrap();
+        ar.append_data(&mut h2, "evil.com", eicar()).unwrap();
         let blob = ar.into_inner().unwrap();
         let f = write_temp(&blob);
         let db = Scanner::builtin();
@@ -4628,7 +4628,7 @@ mod tests {
         // gzip whose decompressed content (padding + EICAR at the end) far exceeds
         // the tiny per-member buffer cap set below.
         let mut payload = vec![b'Z'; 4096];
-        payload.extend_from_slice(EICAR);
+        payload.extend_from_slice(eicar());
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
         e.write_all(&payload).unwrap();
         let gz = e.finish().unwrap();
@@ -4664,7 +4664,7 @@ mod tests {
     )]
     fn oversize_flat_text_with_signature_is_found() {
         let mut data = vec![b'A'; 100];
-        data.extend_from_slice(EICAR);
+        data.extend_from_slice(eicar());
         let f = write_temp(&data);
         let db = Scanner::builtin();
         let opts = ScanOptions {
@@ -4714,7 +4714,7 @@ mod tests {
     #[test]
     #[cfg(feature = "all-formats")]
     fn scan_seekable_finds_eicar_in_zip() {
-        let blob = zip_bytes(&[("a.txt", b"hello", false), ("evil", EICAR, false)]);
+        let blob = zip_bytes(&[("a.txt", b"hello", false), ("evil", eicar(), false)]);
         let size = blob.len() as u64;
         let db = Scanner::builtin();
         let r = scan_seekable(&db, Cursor::new(blob), size, &ScanOptions::default()).unwrap();
@@ -4795,7 +4795,7 @@ mod tests {
         use std::thread;
 
         let big: Vec<u8> = (0..1_000_000u32).map(|i| (i as u8) ^ 0x5a).collect();
-        let blob = zip_bytes(&[("evil", EICAR, false), ("big.bin", &big, true)]);
+        let blob = zip_bytes(&[("evil", eicar(), false), ("big.bin", &big, true)]);
         let total = blob.len();
         assert!(
             total > 900_000,

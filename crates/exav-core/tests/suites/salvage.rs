@@ -8,7 +8,9 @@ use std::io::Write;
 
 use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn gzip(payload: &[u8], level: flate2::Compression) -> Vec<u8> {
     let mut e = flate2::write::GzEncoder::new(Vec::new(), level);
@@ -22,7 +24,7 @@ fn truncated_gzip_still_scans_recoverable_content() {
     // EICAR up front, then a large filler tail. Stored (uncompressed) DEFLATE so
     // compressed offsets track payload offsets — cutting the tail predictably
     // removes only filler, leaving EICAR before the cut and recoverable.
-    let mut payload = EICAR.to_vec();
+    let mut payload = eicar().to_vec();
     payload.extend(vec![b'B'; 16384]);
     let full = gzip(&payload, flate2::Compression::none());
     // Drop the trailer + a chunk of the tail: an "unexpected end of file" decode
@@ -91,7 +93,7 @@ fn carrier_with_an_eicar_zip(prefix: Vec<u8>) -> Vec<u8> {
             .compression_method(zip::CompressionMethod::Deflated),
     )
     .unwrap();
-    z.write_all(EICAR).unwrap();
+    z.write_all(eicar()).unwrap();
     blob.extend_from_slice(&z.finish().unwrap().into_inner());
     blob
 }
@@ -117,7 +119,7 @@ fn one_unreadable_member_does_not_take_the_rest_of_the_archive_with_it() {
     for (name, body) in [
         ("first.bin", &b"aaaaaaaaaaaaaaaaaaaaaaaa"[..]),
         ("second.bin", &b"bbbbbbbbbbbbbbbbbbbbbbbb"[..]),
-        ("third.bin", EICAR),
+        ("third.bin", eicar()),
     ] {
         z.start_file(
             name,
@@ -229,7 +231,7 @@ fn intact_gzip_still_works() {
     // Sanity: the salvage path doesn't regress the normal (untruncated) case.
     let db = Scanner::builtin();
     let mut payload = vec![b'x'; 100];
-    payload.extend_from_slice(EICAR);
+    payload.extend_from_slice(eicar());
     let blob = gzip(&payload, flate2::Compression::default());
     matches!(
         analyze(&db, &blob, &ScanOptions::default()).verdict,

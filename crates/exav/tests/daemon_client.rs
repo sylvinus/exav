@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 mod tmpfile;
 use tmpfile::TempDir;
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn exav_bin() -> &'static str {
     env!("CARGO_BIN_EXE_exav")
@@ -151,7 +153,7 @@ impl Daemon {
 fn infected_tree() -> TempDir {
     let t = TempDir::new().unwrap();
     std::fs::write(t.path().join("clean.txt"), b"nothing here\n").unwrap();
-    std::fs::write(t.path().join("eicar.com"), EICAR).unwrap();
+    std::fs::write(t.path().join("eicar.com"), eicar()).unwrap();
     std::fs::create_dir(t.path().join("sub")).unwrap();
     std::fs::write(t.path().join("sub/deep.txt"), b"nothing here\n").unwrap();
     t
@@ -277,7 +279,7 @@ fn the_daemon_logs_what_it_answered() {
     let logdir = TempDir::new().unwrap();
     let log = logdir.path().join("scan.log");
     let d = Daemon::start("077", &["--log", log.to_str().unwrap()]);
-    let bad = d.file("bad.txt", EICAR);
+    let bad = d.file("bad.txt", eicar());
     let clean = d.file("clean.txt", b"nothing here\n");
     let (code, _) = d.client(&[], &[&bad, &clean]);
     assert_eq!(code, 1);
@@ -311,7 +313,7 @@ fn send_as_contents_sends_the_file_by_content() {
     let logdir = TempDir::new().unwrap();
     let log = logdir.path().join("scan.log");
     let d = Daemon::start("077", &["--log", log.to_str().unwrap()]);
-    let bad = d.file("bad.txt", EICAR);
+    let bad = d.file("bad.txt", eicar());
     let clean = d.file("clean.txt", b"nothing here\n");
 
     let (code, stdout) = d.client(&["--send-as", "contents"], &[&bad, &clean]);
@@ -344,7 +346,7 @@ fn send_as_fd_sends_the_file_by_descriptor() {
     let logdir = TempDir::new().unwrap();
     let log = logdir.path().join("scan.log");
     let d = Daemon::start("077", &["--log", log.to_str().unwrap()]);
-    let bad = d.file("bad.txt", EICAR);
+    let bad = d.file("bad.txt", eicar());
 
     let (code, stdout) = d.client(&["--send-as", "fd"], &[&bad]);
     assert!(
@@ -379,7 +381,7 @@ fn stdin_streams_to_the_daemon() {
         .spawn()
         .and_then(|mut c| {
             use std::io::Write;
-            c.stdin.take().unwrap().write_all(EICAR)?;
+            c.stdin.take().unwrap().write_all(eicar())?;
             c.wait_with_output()
         })
         .expect("run the client");
@@ -399,8 +401,8 @@ fn a_split_set_is_rejoined_when_streamed() {
     let d = Daemon::start("077", &[]);
     let dir = TempDir::new().unwrap();
     // Cut through the middle of the signature, so no part can match by itself.
-    std::fs::write(dir.path().join("e.zip.001"), &EICAR[..34]).unwrap();
-    std::fs::write(dir.path().join("e.zip.002"), &EICAR[34..]).unwrap();
+    std::fs::write(dir.path().join("e.zip.001"), &eicar()[..34]).unwrap();
+    std::fs::write(dir.path().join("e.zip.002"), &eicar()[34..]).unwrap();
 
     let (code, stdout) = d.client(&["--send-as", "contents"], &[dir.path()]);
     assert_eq!(
@@ -554,8 +556,8 @@ fn allmatch_rejoins_a_split_set() {
     let d = Daemon::start("077", &[]);
     let dir = TempDir::new().unwrap();
     // Cut through the middle of the signature, so no part can match by itself.
-    std::fs::write(dir.path().join("e.zip.001"), &EICAR[..34]).unwrap();
-    std::fs::write(dir.path().join("e.zip.002"), &EICAR[34..]).unwrap();
+    std::fs::write(dir.path().join("e.zip.001"), &eicar()[..34]).unwrap();
+    std::fs::write(dir.path().join("e.zip.002"), &eicar()[34..]).unwrap();
 
     let (code, stdout) = d.client(&["--all-matches"], &[dir.path()]);
     assert_eq!(

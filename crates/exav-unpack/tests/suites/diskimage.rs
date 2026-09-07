@@ -34,14 +34,16 @@ const RAW_SHA256: &str = "f456367a5c6caff15823c0c77b4711d2b1d01b85dfe32de783077d
 
 /// A deflated ZIP sits at offset 4096 of that image, so the EICAR string is
 /// absent from the fixtures' bytes and cannot be found without reconstruction.
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_unpack::eicar()
+}
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!(
         "{}/tests/fixtures/diskimage/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    let raw = std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let raw = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
     if !name.ends_with(".gz") {
         return raw;
     }
@@ -224,7 +226,7 @@ fn the_payload_is_absent_from_the_compressed_fixtures() {
     for name in ["compressed.qcow2", "streamoptimized.vmdk"] {
         let raw = fixture(name);
         assert!(
-            !raw.windows(EICAR.len()).any(|w| w == EICAR),
+            !raw.windows(eicar().len()).any(|w| w == eicar()),
             "{name} must not expose the payload in its own bytes"
         );
     }

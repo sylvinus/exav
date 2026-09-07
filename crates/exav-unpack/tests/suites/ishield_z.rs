@@ -19,7 +19,7 @@ fn fixture(name: &str) -> Vec<u8> {
         "{}/tests/fixtures/ishieldz/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn members(blob: &[u8]) -> Vec<Entry> {

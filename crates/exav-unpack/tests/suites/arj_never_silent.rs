@@ -13,7 +13,7 @@ use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
 
 fn sample() -> Vec<u8> {
     let p = format!("{}/tests/fixtures/sample.arj", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 /// Collect every member the extractor emits, **including** those emitted before

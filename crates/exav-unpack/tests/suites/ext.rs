@@ -46,7 +46,7 @@ fn fixture() -> Vec<u8> {
         "{}/tests/fixtures/ext/fragmented.img.gz",
         env!("CARGO_MANIFEST_DIR")
     );
-    let raw = std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let raw = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
     let mut out = Vec::new();
     std::io::Read::read_to_end(
         &mut flate2::read::GzDecoder::new(std::io::Cursor::new(raw)),
@@ -129,9 +129,9 @@ fn the_payload_is_absent_from_the_raw_image() {
     // Guards the premise: if EICAR were visible in the blocks, a raw scan would
     // find it without reading the filesystem and this fixture would prove
     // nothing about the extent walk.
-    const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    let eicar = exav_unpack::eicar();
     let img = fixture();
-    assert!(!img.windows(EICAR.len()).any(|w| w == EICAR));
+    assert!(!img.windows(eicar.len()).any(|w| w == eicar));
 }
 
 #[test]

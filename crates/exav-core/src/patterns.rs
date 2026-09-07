@@ -67,8 +67,12 @@ pub struct PatternSet {
     pub unsupported: usize,
 }
 
-/// EICAR anti-virus test string.
-pub const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+/// The EICAR anti-virus test string, assembled at runtime.
+///
+/// Re-exported rather than redefined so the sequence has exactly one home in the
+/// workspace — see [`exav_unpack::eicar`] for why it is never stored as a
+/// literal.
+pub use exav_unpack::eicar;
 
 impl PatternSet {
     /// Build from literal patterns. `unsupported` records how many source
@@ -102,7 +106,7 @@ impl PatternSet {
 
     /// A set containing only the EICAR test signature.
     pub fn builtin() -> Self {
-        Self::build(&[Pattern::new("Eicar-Test-Signature", EICAR)], 0)
+        Self::build(&[Pattern::new("Eicar-Test-Signature", eicar().to_vec())], 0)
             .expect("builtin pattern set builds")
     }
 

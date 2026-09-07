@@ -18,7 +18,7 @@ fn db_with_dualext() -> exav_core::Scanner {
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/cdb/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 #[test]

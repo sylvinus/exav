@@ -58,7 +58,7 @@ fn fixture() -> Vec<u8> {
         "{}/tests/fixtures/matryoshka.uu",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn scan_at(max_recursion: u32) -> Verdict {

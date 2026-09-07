@@ -12,7 +12,7 @@ const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/ole/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn any_has_eicar(entries: &[exav_unpack::Entry]) -> bool {

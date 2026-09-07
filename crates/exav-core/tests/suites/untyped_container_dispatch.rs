@@ -14,17 +14,19 @@
 
 use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn assert_found(name: &str) {
     let blob = fixture(name);
     assert!(
-        !blob.windows(EICAR.len()).any(|w| w == EICAR),
+        !blob.windows(eicar().len()).any(|w| w == eicar()),
         "{name} must not expose the payload in its own bytes, or this test \
          would pass on the raw scan alone and prove nothing"
     );

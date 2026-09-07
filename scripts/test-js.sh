@@ -52,7 +52,12 @@ echo "== building pkg/ from the current Rust source =="
 if ! command -v wasm-pack >/dev/null 2>&1; then
   cargo install wasm-pack --locked
 fi
-wasm-pack build --release --target web
+# `--features testing-faults` is what `npm run build:e2e` passes, and the e2e
+# suite needs it: several cases assert that a decoder panic or a budget
+# exhaustion takes down the archive rather than the page, and the only way to
+# provoke either on demand is the fault-injection feature. Built without it
+# those tests do not skip — they fail, on a build that is working correctly.
+wasm-pack build --release --target web -- --features testing-faults
 
 echo "== playwright (headless chromium, real wasm) =="
 # `--with-deps` needs root and is only wanted on a fresh CI image; locally the

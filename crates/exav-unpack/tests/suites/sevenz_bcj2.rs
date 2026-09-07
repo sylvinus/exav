@@ -25,7 +25,7 @@ fn fixture(name: &str) -> Vec<u8> {
         "{}/tests/fixtures/sevenz/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -100,11 +100,11 @@ fn a_second_bcj2_archive_also_decodes() {
 
 #[test]
 fn a_payload_inside_a_bcj2_archive_is_reachable() {
-    const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    let eicar = exav_unpack::eicar();
     let e = members(&fixture("bcj2.7z"));
     assert!(
         e.iter()
-            .any(|x| x.data.windows(EICAR.len()).any(|w| w == EICAR)),
+            .any(|x| x.data.windows(eicar.len()).any(|w| w == eicar)),
         "the payload must be reachable through a BCJ2 folder"
     );
 }

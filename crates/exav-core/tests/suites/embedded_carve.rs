@@ -7,7 +7,7 @@ use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 #[test]
 fn appended_overlay_zip_is_carved_and_scanned() {
     let db = Scanner::builtin();
-    let blob = std::fs::read(format!(
+    let blob = exav_core::unpack::read_fixture(&format!(
         "{}/tests/fixtures/pe_overlay_zip.bin",
         env!("CARGO_MANIFEST_DIR")
     ))

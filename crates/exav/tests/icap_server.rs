@@ -20,7 +20,9 @@ mod tmpfile;
 use tmpfile::TempDir;
 
 /// The EICAR test file: the industry-standard string every scanner detects.
-const EICAR: &[u8] = br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 /// A minimal HTTP response header block for the encapsulated message.
 const RES_HDR: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n";
@@ -657,7 +659,7 @@ fn eicar_over_respmod_is_blocked_with_the_c_icap_header() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     let r = c.recv();
@@ -737,7 +739,7 @@ fn eicar_over_reqmod_is_blocked_with_a_response() {
         "avscan",
         Some(REQ_HDR),
         None,
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     let r = c.recv();
@@ -801,7 +803,7 @@ fn every_block_is_legible_to_a_client_that_reads_only_x_infection_found() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     let hit = c.recv();
@@ -883,7 +885,7 @@ fn the_detections_policy_keeps_the_infection_header_for_database_hits_alone() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     let threat = c
@@ -926,7 +928,7 @@ fn malware_in_the_head_of_an_over_limit_object_is_reported_as_the_detection() {
     // limit.
     let s = Server::start(TempDir::new().unwrap(), &["--max-input-bytes", "4096"]);
     let mut c = s.connect();
-    let mut payload = EICAR.to_vec();
+    let mut payload = eicar().to_vec();
     payload.extend(std::iter::repeat_n(b'A', 256 * 1024));
     c.send(&request(
         "RESPMOD",
@@ -979,7 +981,7 @@ fn a_deployment_can_take_delivery_of_what_exav_could_not_examine() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     let hit = c.recv();
@@ -1244,7 +1246,7 @@ fn no_spill_keeps_scanned_bytes_off_the_disk() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     assert!(c.recv().has_header("X-Infection-Found"));
@@ -1342,7 +1344,7 @@ fn icap_scans_are_counted_and_reported_through_stats() {
             "avscan",
             Some(REQ_HDR),
             Some(RES_HDR),
-            Some(EICAR),
+            Some(eicar()),
             &["Allow: 204"],
         ));
         assert!(c.recv().has_header("X-Infection-Found"));
@@ -1381,7 +1383,7 @@ fn without_profiling_the_totals_are_still_kept() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     assert!(c.recv().has_header("X-Infection-Found"));
@@ -1432,7 +1434,7 @@ fn an_object_far_past_the_spill_threshold_is_scanned_whole() {
     // listener would have stopped keeping bytes.
     let s = start_default();
     let mut payload = vec![b'A'; 24 * 1024 * 1024];
-    payload.extend_from_slice(EICAR);
+    payload.extend_from_slice(eicar());
     let mut c = s.connect();
     c.send(&request(
         "RESPMOD",
@@ -1506,7 +1508,7 @@ fn a_preview_that_already_contains_malware_is_blocked_without_continue() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(&chunk(EICAR)),
+        Some(&chunk(eicar())),
         &["Allow: 204", "Preview: 68"],
     ));
 
@@ -1531,7 +1533,7 @@ fn malware_that_only_appears_after_the_preview_is_still_caught() {
     ));
 
     assert_eq!(c.recv().code, 100);
-    c.send(&chunk(EICAR));
+    c.send(&chunk(eicar()));
     let r = c.recv();
     assert_eq!(r.code, 200, "{r:?}");
     assert!(r.has_header("X-Infection-Found"));
@@ -1552,7 +1554,7 @@ fn a_zero_length_preview_works() {
     ));
 
     assert_eq!(c.recv().code, 100);
-    c.send(&chunk(EICAR));
+    c.send(&chunk(eicar()));
     let r = c.recv();
     assert_eq!(r.code, 200);
     assert!(r.has_header("X-Infection-Found"));
@@ -1583,7 +1585,7 @@ fn several_requests_share_one_connection() {
         "avscan",
         Some(REQ_HDR),
         Some(RES_HDR),
-        Some(EICAR),
+        Some(eicar()),
         &["Allow: 204"],
     ));
     let infected = c.recv();

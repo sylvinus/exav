@@ -300,10 +300,11 @@ mod tests {
     #[test]
     fn eicar_fixture_data_fork() {
         // A real BinHex 4.0 of the EICAR test file.
-        let blob = include_bytes!("../../tests/fixtures/binhex/eicar.hqx");
-        assert!(looks_like_binhex(blob));
+        let blob =
+            crate::unmask_fixture(include_bytes!("../../tests/fixtures/binhex/eicar.hqx.xor"));
+        assert!(looks_like_binhex(&blob));
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Binhex, blob, &mut budget).unwrap();
+        let entries = extract(Format::Binhex, &blob, &mut budget).unwrap();
         assert!(!entries.is_empty(), "no members extracted");
         // The EICAR signature substring must appear in the decoded data fork.
         assert!(

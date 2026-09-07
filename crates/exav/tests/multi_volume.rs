@@ -23,7 +23,9 @@ fn exav() -> Command {
     c
 }
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn crc32(data: &[u8]) -> u32 {
     let mut c = !0u32;
@@ -85,7 +87,7 @@ fn zip_with(name: &str, data: &[u8]) -> Vec<u8> {
 
 /// Write a byte-split set into `dir` and return the part filenames.
 fn write_split_set(dir: &std::path::Path, stem: &str, n: usize, keep: &[usize]) -> Vec<String> {
-    let blob = zip_with("payload.txt", EICAR);
+    let blob = zip_with("payload.txt", eicar());
     let each = blob.len().div_ceil(n);
     let mut names = Vec::new();
     for (i, chunk) in blob.chunks(each).enumerate() {
@@ -195,7 +197,7 @@ fn parts_in_different_directories_are_not_one_set() {
 fn an_ordinary_directory_is_unaffected() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-    std::fs::write(dir.path().join("bad.txt"), EICAR).unwrap();
+    std::fs::write(dir.path().join("bad.txt"), eicar()).unwrap();
     let objs = scan_dir_json(dir.path());
     assert_eq!(objs.len(), 2, "no extra lines: {objs:#?}");
     assert_eq!(objs.iter().filter(|o| o["status"] == "FOUND").count(), 1);
