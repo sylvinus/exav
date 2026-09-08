@@ -17,4 +17,13 @@ packaging/
 *.cache
 *.exavdb
 yara-x/
-node_modules/
+# `**/`, as with target above: a bare `node_modules/` matches only one at the
+# root of the context, and both of this repo's are nested — `www/` (282 MB) and
+# `crates/exav-unpack-wasm/` (60 MB). They appear the first time anyone runs the
+# docs site or the JS suite, and from then on every image build ships 342 MB it
+# does not use, slowly enough to exhaust the open-file limit and fail outright.
+**/node_modules/
+# Generated the same way and just as unused by the image: the built docs site
+# and the wasm-pack output.
+www/dist/
+**/pkg/

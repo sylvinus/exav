@@ -372,7 +372,7 @@ exav acts as a daemon client when given `--connect` together with paths.
 | `--stdout` | Write to stdout instead of stderr | — | absent | exav already writes results to stdout. |
 | `--log=FILE`, `-l` | Save scan report to FILE | `--log` | same | Client replies are mirrored into the log. **`-l` is absent.** |
 | `--file-list=FILE`, `-f` | Scan files listed in FILE | `--files-from` | renamed | **`-f` is absent.** |
-| `--ping`, `-p A[:I]` | Ping the daemon until it answers | — | absent | The daemon answers `PING` on the wire; there is no client flag to send one. |
+| `--ping`, `-p A[:I]` | Ping the daemon until it answers | `--ping` | differs | One probe, not `A` attempts at `I` seconds — a supervisor or `HEALTHCHECK` already owns the retrying. With no `--connect` it probes the listener this configuration serves, so a container health check needs no address, and it speaks the protocol it finds there: `PING` on clamd, `OPTIONS` on ICAP. |
 | `--wait`, `-w` | Wait for the daemon to start | — | absent | |
 | `--remove` | Delete infected files | — | absent | Out of scope by design. |
 | `--move=DIRECTORY` | Move infected files | — | absent | Same. |
@@ -456,11 +456,11 @@ The rows worth acting on before a migration, rather than reading past:
 - **Every parser toggle is absent.** A configuration that switched a parser off
   cannot be expressed. The command line fails rather than scanning more than the
   operator asked for, so this surfaces immediately.
-- **`--multiscan`, `--ping`, `--wait` and `--reload` are absent in the client.**
-  The daemon answers `MULTISCAN`, `PING` and `RELOAD` on the wire, so a clamd
-  client keeps working; it is exav's own client that has no flag to send them. A
-  script built around `clamdscan --ping 1` as a health check needs another way
-  to ask (`socat`, or the daemon's exit code on startup).
+- **`--multiscan`, `--wait` and `--reload` are absent in the client.** The daemon
+  answers `MULTISCAN` and `RELOAD` on the wire, so a clamd client keeps working;
+  it is exav's own client that has no flag to send them. `--ping` is the one of
+  this group exav does have, because a health check has to come from somewhere
+  and the container image's own `HEALTHCHECK` is built on it.
 - **`--send-as fd` over a TCP `--connect` is refused, not degraded.** `clamdscan`
   accepts the equivalent combination and silently sends the path instead, so the
   daemon scans whatever that path holds on its own host. exav stops and says to

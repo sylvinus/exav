@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv av-audit publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -117,6 +117,25 @@ msrv:
 	@v=$$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
 	  rustup toolchain install $$v --profile minimal >/dev/null 2>&1 || true; \
 	  echo "checking MSRV $$v"; rustup run $$v cargo check --workspace --all-targets
+
+## av-audit: scan the tracked tree with a real engine and signature set, to catch
+##           a committed fixture that other people's scanners will detect. Run it
+##           when fixtures change, not on every release: it needs `clamscan` and
+##           a signature directory ($(DBDIR), via `make db`), neither of which is
+##           present on most machines — so as a release gate it would skip
+##           exactly where it mattered. An independent engine on purpose: asking
+##           exav whether exav's own tree is clean answers the wrong question.
+av-audit:
+	@command -v clamscan >/dev/null 2>&1 || \
+	  { echo "av-audit needs clamscan (apt install clamav / brew install clamav)"; exit 1; }
+	@[ -d $(DBDIR) ] || { echo "av-audit needs $(DBDIR); run 'make db'"; exit 1; }
+	@echo "scanning $$(git ls-files | wc -l | tr -d ' ') tracked files with $(DBDIR)"
+	@hits=$$(git ls-files -z | xargs -0 clamscan -d $(DBDIR) --no-summary 2>/dev/null \
+	          | grep -v ': OK$$' || true); \
+	  if [ -n "$$hits" ]; then echo "$$hits"; \
+	    echo "-> mask these (see crates/exav-unpack/tests/fixtures/README.md)"; exit 1; \
+	  fi; \
+	  echo "no detections"
 
 ## fuzz: smoke-build the fuzz targets
 fuzz:

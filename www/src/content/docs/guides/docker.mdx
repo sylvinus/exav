@@ -18,12 +18,18 @@ Bind-mounted database volumes must be writable by that uid.
 ## Run it
 
 ```sh
-# Start the daemon; persist signatures in a named volume.
-docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
-clamdscan --stream file.bin                       # host clamdscan over TCP
+# Start the daemon; persist signatures in a named volume. Name a source, or
+# fill the volume yourself with `cvd`/`freshclam` first: signatures are not
+# bundled, and rather than serve without them exav waits for them to appear
+# (EXAV_STARTUP_WAIT_SECS, default 1800). Nothing answers on 3310 until they do.
+docker run -d -p 3310:3310 -v exav-db:/var/lib/exav \
+  -e EXAV_SIG_SOURCES=https://your-mirror/ ghcr.io/sylvinus/exav
+clamdscan --stream file.bin                       # once the load is logged
 
-# One-shot scan (overrides the default daemon):
-docker run --rm -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+# One-shot scan. `EXAV_LISTEN` is set in the image, and a listener and paths to
+# scan are different jobs — so clear it, or exav refuses rather than guessing
+# which one you meant.
+docker run --rm -e EXAV_LISTEN= -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 ```
 
 The image's default command is `--auto-update`, with `EXAV_LISTEN` set to
@@ -37,6 +43,38 @@ line overrides the matching variable**, never the other way round:
 # EXAV_WORKERS is overridden; every other variable still applies.
 docker run -d -p 3310:3310 -e EXAV_WORKERS=8 -v exav-db:/var/lib/exav \
   ghcr.io/sylvinus/exav --auto-update --workers 2
+```
+
+## Health
+
+The image carries a `HEALTHCHECK` that runs `exav --ping`: one exchange in
+whatever protocol the listener speaks — `PING` on clamd, `OPTIONS` on ICAP — so
+it goes red on a daemon that accepts connections and then answers nothing, which
+a bare TCP probe would call healthy.
+
+It reads the same `EXAV_LISTEN` the daemon did, so moving the port or serving
+ICAP instead needs no change to the check. Run it yourself against any daemon:
+
+```sh
+docker exec exav /exav --ping                       # what this container serves
+exav --ping --connect clamd://scanner.internal:3310 # from anywhere
+```
+
+A container is **unhealthy while it waits for signatures** — it is not serving
+then, and reporting otherwise would send traffic to something that cannot
+answer. If signatures arrive from a slow sidecar, raise the start period
+(`--health-start-period`) so the orchestrator does not kill it mid-wait.
+
+The check answers for the daemon this image defaults to. Give the container a
+different job — building a database, a `--connect` client, a one-shot scan — and
+it reports unhealthy the whole time while working perfectly, because nothing is
+listening and the check cannot tell that from a daemon that died. Those runs are
+short and exit on their own, so it is cosmetic under `docker run`; add
+`--no-healthcheck` if something would act on it:
+
+```sh
+docker run --rm --no-healthcheck -e EXAV_LISTEN= \
+  -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 ```
 
 The signatures directory is `/var/lib/exav` (exav's own). To reuse an existing

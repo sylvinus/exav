@@ -419,6 +419,20 @@ struct Cli {
     #[arg(long = "connect", value_name = "ADDR", env = "EXAV_CONNECT")]
     connect: Option<String>,
 
+    /// Ask a running daemon whether it is answering, and exit: `0` if it
+    /// replied, `2` if it did not. Scans nothing. [clamdscan: --ping]
+    ///
+    /// The address is `--connect` when given, and otherwise the listener this
+    /// same configuration would serve — so a container health check is
+    /// `exav --ping` and needs no address of its own. That matters because the
+    /// address is often not knowable where the check is written: `EXAV_LISTEN`
+    /// can move the port or serve ICAP instead, and a check pinned to
+    /// `clamd://…:3310` then calls a working daemon dead and has its container
+    /// restarted for it. The probe follows the protocol it finds: `PING` on a
+    /// clamd listener, `OPTIONS` on an ICAP one.
+    #[arg(long = "ping", env = "EXAV_PING", value_parser = env_switch())]
+    ping: bool,
+
     /// Bytes of a body an ICAP client should send before pausing for a verdict
     /// (the `Preview` header). [default: 4096]
     #[cfg(feature = "icap")]
@@ -749,13 +763,20 @@ struct Cli {
     /// win over the compat preset, the way every other preset flag's does: a
     /// negative switch has no way to say "on", so under compat there would be no
     /// way to ask for it back.
+    ///
+    /// Takes `on`/`off`, `true`/`false`, `yes`/`no` or `1`/`0` — the same
+    /// vocabulary every `EXAV_*` switch reads — or nothing at all, which means
+    /// on. Listed here because clap's own summary shows only `true`/`false`,
+    /// which would read as a refusal of the `off` that `--clamav-compat`'s
+    /// description tells you to write.
     #[arg(
         long = "base64",
         value_name = "on|off",
         env = "EXAV_BASE64",
         value_parser = env_switch(),
         num_args = 0..=1,
-        default_missing_value = "true"
+        default_missing_value = "true",
+        hide_possible_values = true
     )]
     base64: Option<bool>,
 
@@ -1225,9 +1246,86 @@ fn ignore_sigpipe() {
 #[cfg(all(not(unix), feature = "icap"))]
 fn ignore_sigpipe() {}
 
+/// Name the exav spelling for the `clamscan` flags a migrating user types from
+/// muscle memory, before clap rejects them as unknown.
+///
+/// exav's flags are its own and clamscan's names are deliberately not hidden
+/// aliases (see the flag matrix) — but `error: unexpected argument '-r' found`
+/// followed by a tip about `-- -r` tells someone nothing about what to use
+/// instead, and `-r` in particular asks for behaviour that is already the
+/// default. The whole audience for this tool arrives with those flags in their
+/// fingers, so the first thing many of them will see is this message.
+///
+/// Returns the guidance for the first recognised flag, if any.
+fn clamscan_flag_hint(args: &[String]) -> Option<String> {
+    // Only the ones whose exav answer is a different spelling or a default, not
+    // every clamscan flag: pointing at the matrix is the answer for the rest.
+    let hint = |s: &str| -> Option<&'static str> {
+        Some(match s {
+            "-r" | "--recursive" => {
+                "a named directory is already scanned recursively; drop the flag \
+                 (--no-recursive stops at its immediate files)"
+            }
+            "-i" | "--infected" => "use --quiet, which is the same dial",
+            "--no-summary" => "use --quiet, which suppresses the OK lines and the summary together",
+            "--remove" | "--move" | "--copy" => {
+                "exav reports and does not move or delete; act on the exit code"
+            }
+            _ => return None,
+        })
+    };
+    args.iter().find_map(|a| {
+        // `--move=DIR` and friends carry their value in the same argument.
+        let bare = a.split('=').next().unwrap_or(a);
+        hint(bare).map(|h| format!("{bare} is a clamscan flag; {h}"))
+    })
+}
+
 fn main() -> ExitCode {
     restore_default_sigpipe();
+    // Before `Cli::parse`, which exits the process on an unknown argument and
+    // would never reach this.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(hint) = clamscan_flag_hint(&argv) {
+        eprintln!("exav: {hint}");
+        eprintln!("exav: the full mapping is at https://exav.org/reference/clamav-flag-matrix/");
+        return ExitCode::from(2);
+    }
     let mut cli = Cli::parse();
+
+    // `--listen` from the ENVIRONMENT is a default, not an instruction, and the
+    // documented precedence is that a flag on the command line wins over the
+    // matching variable. Without this it does not: the container image sets
+    // `EXAV_LISTEN`, so `docker run … image /scan` and `docker exec … --connect`
+    // both die on "a run does one or the other" — the image's own one-shot
+    // example, and any exec-form HEALTHCHECK, which has no shell to unset it.
+    //
+    // Only an environment-supplied listener yields, and only to an explicit
+    // client or paths. A `--listen` typed alongside either is still the
+    // contradiction it always was, and still refused.
+    let listen_from_argv = argv
+        .iter()
+        .any(|a| a == "--listen" || a.starts_with("--listen="));
+    //
+    // Every non-serving role has to be listed, not just the obvious two: with
+    // `EXAV_LISTEN` set, `docker run … --build-db out.exavdb` served the daemon
+    // and never built anything, silently, because the serving branch returns
+    // before `--build-db` is looked at. `--files-from` is here rather than
+    // `paths` because the list is expanded further down, after this runs.
+    let asks_for_a_non_serving_role = cli.connect.is_some()
+        || !cli.paths.is_empty()
+        || cli.build_db.is_some()
+        || cli.file_list.is_some();
+    if !listen_from_argv && !cli.listen.is_empty() && asks_for_a_non_serving_role {
+        cli.listen.clear();
+    }
+
+    // Before the conflict checks and before any role is chosen: `--ping` reads
+    // the serving configuration rather than acting on it, so a listener in the
+    // environment is what it wants to see, not a contradiction to refuse.
+    if cli.ping {
+        return run_ping(&cli);
+    }
 
     // Before any role is chosen, so it covers every one of them.
     if let Err(msg) = check_flag_conflicts(&cli) {
@@ -1424,6 +1522,26 @@ fn main() -> ExitCode {
                  the objects that run long so you can see which they are."
             );
             return ExitCode::from(2);
+        }
+        // `RLIMIT_AS` bounds the whole address space, this process included, and
+        // it is set before the database is even loaded. Below a workable floor
+        // the next allocation therefore fails, and an allocation failure aborts:
+        // `memory allocation of N bytes failed`, no exit code of ours, none of
+        // the limit reporting this flag exists to give. A mistyped `1M` for `1G`
+        // should say so rather than look like a crash in the scanner.
+        const MIN_PROCESS_BYTES: u64 = 64 << 20;
+        if let Some(cap) = cli.max_scan_memory {
+            if cap != 0 && cap < MIN_PROCESS_BYTES {
+                eprintln!(
+                    "exav: --max-process-bytes {} MiB is below the {} MiB this process needs to \
+                     start at all — the cap covers exav itself and the signature database, not \
+                     just a scan's buffers. Raise it (a real database wants ~2G), or pass 0 for \
+                     no cap and bound the scan with --max-input-bytes/--max-extracted-bytes.",
+                    cap >> 20,
+                    MIN_PROCESS_BYTES >> 20,
+                );
+                return ExitCode::from(2);
+            }
         }
         // A memory cap is still meaningful for the thread-model daemon: it
         // bounds the process, which is all there is to bound.
@@ -2085,6 +2203,16 @@ fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
     if serves(cli) && !cli.paths.is_empty() {
         return Err("--listen starts a server; it takes no paths to scan".to_string());
     }
+    // Serving is chosen before `--build-db` is ever looked at, so without this
+    // the pair does not fail — it silently serves, builds nothing, and leaves
+    // the operator waiting on a database that is never written.
+    if serves(cli) && cli.build_db.is_some() {
+        return Err(
+            "--listen starts a server and --build-db compiles a database; a run does one or \
+             the other"
+                .to_string(),
+        );
+    }
     // An `icap://` address in a build with no ICAP listener is a listener that
     // was asked for and will never be bound — the shape of deployment that
     // believes it is scanning. Refused rather than ignored.
@@ -2493,6 +2621,105 @@ fn client_dial(cli: &Cli) -> io::Result<Box<dyn ReadWrite>> {
             "a Unix-socket address needs a Unix platform",
         )),
         None => Err(io::Error::other("--connect ADDR required for client mode")),
+    }
+}
+
+/// Which endpoint `--ping` should probe, and over which protocol.
+///
+/// `--connect` when the caller named one; otherwise the listener this same
+/// configuration serves, clamd first because that is the protocol with a
+/// one-word health command. Reading the serving configuration is the point: a
+/// health check written against a fixed address is wrong the moment
+/// `EXAV_LISTEN` moves the port or asks for ICAP instead.
+fn ping_target(cli: &Cli) -> Result<endpoint::Endpoint, String> {
+    if cli.connect.is_some() {
+        return connect_endpoint(cli).ok_or_else(|| "--connect address is not valid".to_string());
+    }
+    let found = listeners(cli)?;
+    found
+        .iter()
+        .find(|e| e.proto == endpoint::Proto::Clamd)
+        .or_else(|| found.first())
+        .cloned()
+        .ok_or_else(|| {
+            "nothing to ping: pass --connect ADDR, or run where --listen/EXAV_LISTEN is set"
+                .to_string()
+        })
+}
+
+/// Ask the daemon at `target` whether it is answering.
+///
+/// One exchange in the protocol the endpoint actually speaks — `PING`/`PONG` on
+/// clamd, `OPTIONS` on ICAP — because a TCP connect alone goes green on a daemon
+/// that accepts and then answers nothing, which is the failure a health check
+/// exists to catch.
+fn ping_once(target: &endpoint::Endpoint) -> io::Result<String> {
+    use std::io::{Read as _, Write as _};
+    let mut conn: Box<dyn ReadWrite> = match &target.addr {
+        endpoint::Addr::Tcp(addr) => Box::new(std::net::TcpStream::connect(addr)?),
+        #[cfg(unix)]
+        endpoint::Addr::Unix { path, .. } => {
+            Box::new(std::os::unix::net::UnixStream::connect(path)?)
+        }
+        #[cfg(not(unix))]
+        endpoint::Addr::Unix { .. } => {
+            return Err(io::Error::other(
+                "a Unix-socket address needs a Unix platform",
+            ))
+        }
+    };
+    let (probe, want): (&[u8], &str) = match target.proto {
+        endpoint::Proto::Clamd => (b"PING\n", "PONG"),
+        endpoint::Proto::Icap => (
+            b"OPTIONS icap://localhost/avscan ICAP/1.0\r\nHost: localhost\r\n\r\n",
+            "ICAP/1.0 200",
+        ),
+    };
+    conn.write_all(probe)?;
+    conn.flush()?;
+    let mut buf = [0u8; 256];
+    let n = conn.read(&mut buf)?;
+    let reply = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+    if reply.starts_with(want) || reply.contains(want) {
+        Ok(reply.lines().next().unwrap_or_default().to_string())
+    } else {
+        Err(io::Error::other(format!(
+            "expected {want}, got {:?}",
+            reply.lines().next().unwrap_or_default()
+        )))
+    }
+}
+
+/// `--ping`: report whether the daemon answers, and exit.
+fn run_ping(cli: &Cli) -> ExitCode {
+    // `clamdscan --ping 1` means one attempt; `clamdscan --ping 5:2` means five,
+    // two seconds apart. exav probes once and leaves retrying to whatever is
+    // asking — but a number here came from someone expecting attempts, and
+    // silently treating it as a file to scan (or ignoring it) would let them
+    // believe they had configured a retry they have not.
+    if !cli.paths.is_empty() {
+        eprintln!(
+            "exav: --ping takes no arguments and probes once; it does not take clamdscan's \
+             attempts[:interval]. Retry around it — a HEALTHCHECK's --retries, or a loop."
+        );
+        return ExitCode::from(2);
+    }
+    let target = match ping_target(cli) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("exav: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match ping_once(&target) {
+        Ok(reply) => {
+            println!("{target}: {reply}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("exav: {target} is not answering: {e}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -3677,6 +3904,108 @@ fn parse_size(s: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
 
+    /// `--ping` probes what this configuration serves, so a health check need
+    /// not repeat an address that only the environment knows.
+    ///
+    /// The failure this guards is a health check that outlives the config it was
+    /// written against: move the port or ask for ICAP, and a probe pinned to
+    /// `clamd://…:3310` reports a working daemon as dead until something
+    /// restarts it.
+    #[test]
+    fn ping_follows_the_serving_configuration() {
+        let target = |listen: &[&str], connect: Option<&str>| {
+            let mut cli = Cli::parse_from(["exav"]);
+            cli.listen = listen.iter().map(|s| s.to_string()).collect();
+            cli.connect = connect.map(|s| s.to_string());
+            ping_target(&cli)
+        };
+
+        // The listener it would serve, whatever address that is.
+        let t = target(&["clamd://127.0.0.1:3311"], None).expect("a clamd listener");
+        assert_eq!(t.proto, endpoint::Proto::Clamd);
+        assert!(t.to_string().contains("3311"), "{t}");
+
+        // ICAP only: probed as ICAP, not as a clamd port that is not there.
+        let t = target(&["icap://127.0.0.1:1344"], None).expect("an icap listener");
+        assert_eq!(t.proto, endpoint::Proto::Icap);
+
+        // Both: clamd, which has the cheaper health command.
+        let t = target(&["icap://127.0.0.1:1344", "clamd://127.0.0.1:3310"], None).unwrap();
+        assert_eq!(t.proto, endpoint::Proto::Clamd);
+
+        // An explicit --connect wins over the configured listener.
+        let t = target(&["clamd://127.0.0.1:3310"], Some("clamd://10.0.0.1:9999")).unwrap();
+        assert!(t.to_string().contains("10.0.0.1"), "{t}");
+
+        // Nothing to probe is an error, not a silent success.
+        assert!(target(&[], None).is_err());
+    }
+
+    /// `--ping` exists, but not clamdscan's `attempts[:interval]` argument.
+    ///
+    /// It parses — `1` is simply a path as far as clap is concerned — so the
+    /// refusal has to come from `run_ping`. Left to itself the number would be
+    /// quietly dropped and the operator would believe they had asked for five
+    /// attempts when they had asked for one.
+    #[test]
+    fn ping_refuses_clamdscans_attempts_argument() {
+        let bare = Cli::parse_from(["exav", "--ping"]);
+        assert!(bare.ping && bare.paths.is_empty());
+
+        let with_attempts = Cli::parse_from(["exav", "--ping", "1"]);
+        assert!(with_attempts.ping, "--ping still parses");
+        assert_eq!(
+            with_attempts.paths.len(),
+            1,
+            "the attempts count arrives as a path, which is what run_ping refuses"
+        );
+    }
+
+    /// The clamscan flags a migrating user types are answered by name, and
+    /// nothing else is.
+    ///
+    /// The failure this guards is the quiet one: widen the match by accident
+    /// and an exav flag starts being refused with advice about a different
+    /// tool, which is worse than the bare "unexpected argument" it replaced.
+    #[test]
+    fn clamscan_flags_are_answered_and_only_those() {
+        let hint = |a: &str| clamscan_flag_hint(&[a.to_string()]);
+
+        assert!(hint("-r").unwrap().contains("already scanned recursively"));
+        assert!(hint("--recursive").unwrap().contains("drop the flag"));
+        assert!(hint("-i").unwrap().contains("--quiet"));
+        assert!(hint("--infected").unwrap().contains("--quiet"));
+        assert!(hint("--no-summary").unwrap().contains("--quiet"));
+        assert!(hint("--remove").unwrap().contains("act on the exit code"));
+        // Value-carrying spellings are the same flag.
+        assert!(hint("--move=/tmp/quarantine")
+            .unwrap()
+            .contains("does not move"));
+
+        // exav's own flags, and anything else, are left to clap.
+        for a in [
+            "--quiet",
+            "--no-recursive",
+            "--json",
+            "--max-input-bytes",
+            "--nonsense",
+            "-",
+            "/some/path",
+        ] {
+            assert!(
+                hint(a).is_none(),
+                "{a} must not be answered as a clamscan flag"
+            );
+        }
+
+        // The first recognised flag wins, wherever it sits in the line.
+        let argv: Vec<String> = ["--json", "-r", "/tmp"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(clamscan_flag_hint(&argv).unwrap().contains("-r"));
+    }
+
     /// Environment variables set for the length of a test and put back
     /// afterwards, whatever they were, so no test leaves configuration behind
     /// for the next one to read as its own.
@@ -4039,7 +4368,6 @@ mod tests {
             &["--config-file", "clamd.conf"],
             &["--multiscan"],
             &["--reload"],
-            &["--ping", "1"],
             &["--wait"],
             // clamscan's `--flag=yes/no` value form.
             &["--allmatch=yes"],

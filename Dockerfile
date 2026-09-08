@@ -16,8 +16,10 @@
 # docker-compose.yml), or setting EXAV_SIG_SOURCES to auto-download from a mirror
 # you trust. See https://exav.org/guides/docker/ for the env vars.
 #
-# One-shot scan (overrides the default daemon CMD):
-#   docker run --rm -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+# One-shot scan. `EXAV_LISTEN` below is set for the daemon this image defaults
+# to; clear it to scan paths instead, or exav refuses rather than guessing which
+# of the two jobs was meant:
+#   docker run --rm -e EXAV_LISTEN= -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 
 # ---- build: static musl binary, updater (http feature) enabled ---------------
 # rust:alpine targets *-unknown-linux-musl and links statically. `build-base`
@@ -70,6 +72,32 @@ EXPOSE 3310
 #
 # EXPOSE is documentation, not a listener — see the ICAP guide for the env vars.
 EXPOSE 1344
+
+# `--ping` reads the same `EXAV_LISTEN` the daemon did — the health check
+# inherits the container's environment — so it follows the configuration instead
+# of assuming it. A check pinned to `clamd://…:3310` calls a healthy daemon dead
+# the moment that variable moves the port or asks for ICAP instead, and an
+# orchestrator restarts the container for it.
+#
+# It is one exchange in whatever protocol the listener speaks (`PING` on clamd,
+# `OPTIONS` on ICAP), not a bare TCP connect: a daemon that accepts and then
+# answers nothing is exactly what this is for.
+#
+# `/exav` is the probe because the image is distroless — no shell, no curl.
+#
+# Unhealthy while the daemon is still waiting for signatures, deliberately: it
+# is not serving then, and saying otherwise sends traffic somewhere that cannot
+# answer. Raise --start-period when signatures come from a slow sidecar.
+#
+# It answers for the daemon this image defaults to, so a container given a
+# different job — `--build-db`, a `--connect` client, a one-shot scan — reports
+# unhealthy for its lifetime while working perfectly: nothing is listening, and
+# the check cannot tell that from a daemon that died. Those runs are short and
+# exit on their own, so this is cosmetic under `docker run`; pass
+# `--no-healthcheck` if a supervisor would act on it.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["/exav", "--ping"]
+
 ENTRYPOINT ["/exav"]
 # Serve whatever EXAV_LISTEN names, and keep the signature volume current:
 # bootstrap it, wait for a sidecar to fill it if that is where signatures come

@@ -158,27 +158,23 @@ for c in "${CRATES[@]}"; do
   fi
 done
 
-step "Nothing in the tracked tree trips a real scanner"
-# The literal check above is exact-match on one string; this asks a real engine
-# with a real signature set, which is the question that actually matters — a
-# committed fixture any scanner detects gets the repository quarantined on clone
-# and deleted by an AV-scanned CI runner. Fixtures are masked (see
-# `exav_unpack::unmask_fixture`) precisely so this stays quiet.
+step "No EICAR literal anywhere in the tracked tree"
+# The tarball check above cannot see this: fixtures are excluded from every
+# package, so one committed unmasked would ship nothing and still get the
+# repository quarantined on clone and stripped by an AV-scanned CI runner.
 #
-# Skipped rather than failed when no database is present: a signature set is a
-# ~110 MB download, so this cannot be a precondition for every release, and
-# silently passing without one would be worse than saying it was not checked.
-if command -v clamscan >/dev/null 2>&1 && [ -d "${DBDIR:-exav-db}" ]; then
-  hits="$(git ls-files -z | xargs -0 clamscan -d "${DBDIR:-exav-db}" --no-summary 2>/dev/null \
-            | grep -v ': OK$' || true)"
-  if [ -n "$hits" ]; then
-    printf '%s\n' "$hits" >&2
-    fail "a tracked file is detected by clamscan — mask it (unmask_fixture) or drop it"
-  fi
-  echo "  clamscan: no detections across $(git ls-files | wc -l | tr -d ' ') tracked files"
-else
-  echo "  SKIPPED: needs clamscan and a signature directory (\`make db\`)"
+# Deterministic and dependency-free on purpose. Asking a real engine finds
+# strictly more — it is how the Mirai and dual-extension fixtures turned up —
+# but a check that needs a foreign scanner and a 110 MB database is a check
+# that skips on the machine releases are actually cut from, which is a green
+# gate that verified nothing. That sweep lives in `make av-audit`, to be run
+# when fixtures change. This runs every time, everywhere.
+hits="$(git ls-files -z | xargs -0 grep -lF "$needle" 2>/dev/null || true)"
+if [ -n "$hits" ]; then
+  printf '%s\n' "$hits" >&2
+  fail "a tracked file carries the EICAR test string — mask it (see exav_unpack::unmask_fixture)"
 fi
+echo "  clean across $(git ls-files | wc -l | tr -d ' ') tracked files"
 
 step "Gate passed"
 printf 'version   %s\n' "$VERSION"

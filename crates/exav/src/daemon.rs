@@ -869,6 +869,36 @@ pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) 
     );
 }
 
+/// This process's cgroup memory ceiling, if it has one.
+///
+/// v2 first (`memory.max`, the unified hierarchy every current runtime uses),
+/// then the v1 path. Both spell "no limit" as a sentinel — literal `max` on v2,
+/// a number near `u64::MAX` on v1 — which reads as *unlimited*, not as a cap of
+/// that size. Absent or unreadable means no cgroup ceiling to apply.
+fn cgroup_memory_limit() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.max",                   // cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1
+    ] {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw == "max" {
+            return None;
+        }
+        if let Ok(v) = raw.parse::<u64>() {
+            // v1 reports "unlimited" as a huge page-aligned number rather than a
+            // word; anything past the host's own RAM is not a real ceiling.
+            if v > 0 && v < (u64::MAX >> 10) {
+                return Some(v);
+            }
+            return None;
+        }
+    }
+    None
+}
+
 fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
     /// Leave this fraction of total RAM to the rest of the system.
     ///
@@ -900,7 +930,15 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
         .next()?
         .parse()
         .ok()?;
-    let total = total_kb.saturating_mul(1024);
+    // `/proc/meminfo` is the HOST's memory even inside a container, so on its
+    // own it hands a memory-capped container per-job grants its cgroup will
+    // never honour — and the cgroup's OOM killer then arrives before this
+    // process's own `RLIMIT_AS` ever would, costing the scan its answer for
+    // exactly the reason the headroom above exists to avoid. Containers are how
+    // this daemon is mostly run, and every Kubernetes pod carries a limit.
+    let total = cgroup_memory_limit()
+        .unwrap_or(u64::MAX)
+        .min(total_kb.saturating_mul(1024));
     let usable = total
         .saturating_sub(total / HEADROOM_DEN * HEADROOM_NUM)
         .saturating_sub(shared_db_bytes);
@@ -1207,25 +1245,33 @@ pub fn run_prefork(
 /// alternatives all need the worker to be watching a descriptor it is not
 /// watching. On other Unixes a supervisor killed outright still leaves its
 /// workers behind; one asked to stop takes them with it as it always did.
+///
+/// `supervisor` is the pid the parent read of *itself* before forking. Nothing
+/// else identifies it: in a container the daemon is pid 1, so every worker is
+/// legitimately a child of pid 1 and "my parent is init" says nothing at all.
+/// Reading that as orphanhood exits every worker the moment it starts, and the
+/// supervisor refills the pool forever.
 #[cfg(unix)]
-fn die_with_parent() {
+fn die_with_parent(supervisor: libc::pid_t) {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: reads this process's own parent id and sets its own
-        // parent-death signal. Neither touches another process.
-        let parent = unsafe { libc::getppid() };
+        // SAFETY: sets this process's own parent-death signal and reads its own
+        // parent id. Neither touches another process.
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
         }
         // The parent can die between `fork` and the `prctl`, in which case the
         // signal it would have raised was already missed and this worker would
-        // block forever — the exact leak, just through a narrower window. A
-        // parent that changed (or was already init) in that gap is a parent
-        // that is gone, and a worker with no supervisor has nothing to serve.
-        if parent == 1 || unsafe { libc::getppid() } != parent {
+        // block forever — the same leak through a narrower window. Comparing
+        // against the pid the supervisor recorded of itself is what makes that
+        // check sound: a parent that is no longer *that* process is gone,
+        // whatever pid took its place.
+        if unsafe { libc::getppid() } != supervisor {
             unsafe { libc::_exit(0) }
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = supervisor;
 }
 
 /// Fork the side listener's child. It resets the signal dispositions the
@@ -1239,6 +1285,9 @@ fn spawn_side(
 ) -> io::Result<libc::pid_t> {
     use std::io::Write as _;
     let _ = io::stderr().flush();
+    // Read before forking: afterwards the child can only ask who its parent is,
+    // which does not say whether that is still the process that forked it.
+    let supervisor = unsafe { libc::getpid() };
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
@@ -1252,7 +1301,7 @@ fn spawn_side(
             // After the resets above, so the SIGTERM it arranges is the default
             // disposition — a handler inherited from the supervisor would
             // otherwise decide what parent death means here.
-            die_with_parent();
+            die_with_parent(supervisor);
             (side.serve)(Arc::clone(db), Arc::clone(opts));
             // The listener was the child's whole job, so there is nothing left
             // for it to do but let the supervisor respawn it.
@@ -1272,10 +1321,12 @@ fn spawn_worker(
     // Flush so buffered parent output isn't duplicated into the child.
     use std::io::Write as _;
     let _ = io::stderr().flush();
+    // Read before forking; see `die_with_parent`.
+    let supervisor = unsafe { libc::getpid() };
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
-        0 => worker_main(listener, db, opts, cfg), // never returns
+        0 => worker_main(listener, db, opts, cfg, supervisor), // never returns
         n => Ok(n),
     }
 }
@@ -1284,7 +1335,13 @@ fn spawn_worker(
 /// connections one at a time until it hits its job limit (then exits cleanly so
 /// the supervisor recycles it). Never returns.
 #[cfg(unix)]
-fn worker_main(listener: &BoundListener, db: &Scanner, opts: &ScanOptions, cfg: &PoolConfig) -> ! {
+fn worker_main(
+    listener: &BoundListener,
+    db: &Scanner,
+    opts: &ScanOptions,
+    cfg: &PoolConfig,
+    supervisor: libc::pid_t,
+) -> ! {
     // Apply the kernel-enforced resource caps to *this* process.
     //
     // `RLIMIT_AS` bounds the WHOLE address space, and this process already holds
@@ -1320,7 +1377,7 @@ fn worker_main(listener: &BoundListener, db: &Scanner, opts: &ScanOptions, cfg: 
     // the reset, parent death would run the handler this worker inherited from
     // the supervisor, which only sets a flag — and the worker would go on to
     // block in `accept()` exactly as if nothing had been arranged at all.
-    die_with_parent();
+    die_with_parent(supervisor);
     let arm = || set_timer(cfg.max_scan_time);
     let disarm = || set_timer(std::time::Duration::ZERO);
     // A `RELOAD` command reaches a worker, not the supervisor; forward it by
