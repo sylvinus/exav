@@ -95,7 +95,18 @@ For tooling and pipelines, `--json` emits newline-delimited JSON — one object
 per scanned input, plus a final summary object:
 
 ```sh
-exav --json /data | jq 'select(.category=="infected")'
+exav --json /data | jq 'select(.status=="FOUND")'
+```
+
+`status` is the word the human line ends with — `OK`, `FOUND`, `ERROR`,
+`PARTIAL` — and it is on every result object. `category` is **not**: it
+sub-classifies a `PARTIAL` (`LIMITS-EXCEEDED`, `UNSCANNABLE`,
+`PASSWORD-PROTECTED`) and is absent everywhere else, so filtering a pipeline on
+it returns nothing at all rather than failing. Select on `status`:
+
+```sh
+exav --json /data | jq 'select(.status=="PARTIAL")'          # not fully examined
+exav --json /data | jq 'select(.status|test("FOUND|PARTIAL"))'  # everything unclean
 ```
 
 ### Verbose findings
@@ -117,8 +128,14 @@ exav --all-matches /data
 Include/exclude by path regex — repeatable, matching `clamscan`'s semantics:
 
 ```sh
-exav /data --exclude '\.log$' --exclude-dir '/node_modules/' --include '\.exe$'
+exav /data --exclude '\.log$' --exclude-dir 'node_modules' --include '\.exe$'
 ```
+
+`--exclude-dir` matches a **directory's own path**, which has no trailing
+separator — so `node_modules` skips the directory, while `/node_modules/` skips
+only what is nested *below* it and lets files sitting directly inside through.
+The looser pattern is the one to write, or anchor it explicitly as
+`/node_modules($|/)`.
 
 ## Exit codes
 

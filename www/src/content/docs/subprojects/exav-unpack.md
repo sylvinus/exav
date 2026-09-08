@@ -91,7 +91,7 @@ it on your path:
 
 ```bash
 exav-unpack list archive.7z            # what's inside
-exav-unpack extract archive.7z -o out/ # to disk
+exav-unpack extract archive.7z out/    # to disk
 ```
 
 ## In the browser

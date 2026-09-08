@@ -238,6 +238,12 @@ impl PartialAs {
     /// Whether any condition is set to `pass`, for the line a listener
     /// announces itself with — a deployment delivering what it could not
     /// examine should be legible from its logs alone.
+    ///
+    /// Its one caller is the ICAP listener, so a build without `icap` — two of
+    /// which the feature-flag reference offers as copy-paste examples — has
+    /// nothing calling it. The tests below still do, but they are not compiled
+    /// into the binary the warning is raised against.
+    #[cfg_attr(not(feature = "icap"), allow(dead_code))]
     pub(crate) fn reports_any_as_ok(&self) -> bool {
         self.per_tag.contains(&PartialStatus::Ok)
     }

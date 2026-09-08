@@ -91,7 +91,10 @@ struct Cli {
     max_members: Option<u64>,
 
     /// Max nesting depth of archives within archives.
-    #[arg(long = "max-depth", value_name = "N")]
+    ///
+    /// Not directory depth, which `find`/`du`/`tree` spell `--max-depth`; named
+    /// for what it bounds, and matching `exav --max-unpack-depth`.
+    #[arg(long = "max-unpack-depth", value_name = "N")]
     max_depth: Option<u32>,
 
     /// Don't report members that could not be read. Off by default, because

@@ -202,7 +202,7 @@ command line ask for two answers at once.
 | `--max-filesize=#n` | Skip files larger than this | `--max-input-bytes` | renamed | exav's default is **no limit**; ClamAV's is 100M. `--clamav-compat` sets 100M. Over the limit exav reports `LIMITS-EXCEEDED`, never a clean `OK`. |
 | `--max-scansize=#n` | Max data scanned per container | `--max-extracted-bytes` | renamed | exav's defaults are 256M deep-analysis / 1G extracted total; ClamAV's is 400M. `--clamav-compat` sets 400M for both. |
 | `--max-files=#n` | Max files scanned per container | `--max-members` | renamed | exav's default is 100000 against ClamAV's 10000, because exav descends into nested archives ClamAV does not and so counts more members for the same file. `--clamav-compat` sets 10000. |
-| `--max-recursion=#n` | Max archive recursion depth | `--max-depth` | renamed | Different default too: exav 16, ClamAV 17. `--clamav-compat` sets 17. |
+| `--max-recursion=#n` | Max archive recursion depth | `--max-unpack-depth` | renamed | Different default too: exav 16, ClamAV 17. `--clamav-compat` sets 17. |
 | `--max-dir-recursion=#n` | Max directory recursion depth | — | absent | exav's directory walk has no depth cap. |
 | `--max-embeddedpe=#n` | Max size checked for an embedded PE | — | absent | exav applies its global budgets instead of a per-subsystem cap. |
 | `--max-htmlnormalize=#n` | Max HTML size to normalize | — | absent | Same. |
@@ -309,7 +309,7 @@ nothing does.
 |---|---|---|---|
 | `MaxScanSize` | Max data scanned per container | `--max-extracted-bytes` | |
 | `MaxFileSize` | Max file size scanned | `--max-input-bytes` | |
-| `MaxRecursion` | Max archive recursion | `--max-depth` | |
+| `MaxRecursion` | Max archive recursion | `--max-unpack-depth` | |
 | `MaxFiles` | Max files per container | `--max-members` | |
 | `MaxScanTime` | Max scan time | `--max-scan-secs` | Kernel-enforced per job (seconds, Unix), not an in-engine check. |
 | `MaxDirectoryRecursion` | Max directory depth | — | |

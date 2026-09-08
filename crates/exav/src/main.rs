@@ -743,9 +743,19 @@ struct Cli {
     )]
     max_scanned_bytes: Option<u64>,
 
-    /// Maximum nesting depth for recursive unpacking. exav default: 16.
-    /// `--clamav-compat` sets 17.
-    #[arg(long = "max-depth", env = "EXAV_MAX_DEPTH", value_name = "N")]
+    /// Maximum nesting depth for recursive unpacking — a zip inside a tar
+    /// inside a disk image. exav default: 16. `--clamav-compat` sets 17.
+    ///
+    /// Not directory depth: `find`, `du` and `tree` all spell that
+    /// `--max-depth`, so the bare word would be read as a bound on the
+    /// directory walk, which this is not and which only `--no-recursive`
+    /// touches. A flag that silently bounds something other than what the
+    /// reader assumes is worse than a longer name.
+    #[arg(
+        long = "max-unpack-depth",
+        env = "EXAV_MAX_UNPACK_DEPTH",
+        value_name = "N"
+    )]
     max_recursion: Option<u32>,
 
     /// Maximum number of members visited across the whole recursive walk.
@@ -1271,6 +1281,21 @@ fn clamscan_flag_hint(args: &[String]) -> Option<String> {
             "--remove" | "--move" | "--copy" => {
                 "exav reports and does not move or delete; act on the exit code"
             }
+            // The renamed limits. Aliases were rejected on purpose — one
+            // spelling per bound — and the migration guide's promise for that
+            // trade is "a clear error naming the exav flag", which is this.
+            "--max-filesize" => "use --max-input-bytes, the largest top-level input scanned",
+            "--max-scansize" => {
+                "use --max-extracted-bytes, what decompression may produce for one top-level file"
+            }
+            // `--max-depth` never shipped under that name, but it is what
+            // `find`/`du`/`tree` call directory depth, so someone will reach for
+            // it meaning the walk. Answer it too, and say which one it is not.
+            "--max-recursion" | "--max-depth" => {
+                "use --max-unpack-depth, the nesting of containers inside containers — \
+                 the directory walk is all-or-nothing via --no-recursive"
+            }
+            "--max-files" => "use --max-members, members visited across the whole recursive walk",
             _ => return None,
         })
     };
@@ -1518,7 +1543,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "exav: on this listener a scan is bounded by work, not time: \
                  --max-matcher-bytes (default 10G) is the per-object CPU bound, \
-                 with --max-depth and --max-members. --slow-scan-secs logs \
+                 with --max-unpack-depth and --max-members. --slow-scan-secs logs \
                  the objects that run long so you can see which they are."
             );
             return ExitCode::from(2);
@@ -4202,7 +4227,7 @@ mod tests {
                 "102",
                 "--max-matcher-bytes",
                 "103",
-                "--max-depth",
+                "--max-unpack-depth",
                 "104",
                 "--max-members",
                 "105",
@@ -4273,7 +4298,7 @@ mod tests {
             &["--exclude", "re"],
             &["--exclude-dir", "re"],
             &["--include", "re"],
-            &["--max-depth", "5"],
+            &["--max-unpack-depth", "5"],
             &["--alert-ssns", "3"],
             &["--alert-credit-cards", "3"],
             // The ways of handing the daemon a file it cannot open itself.

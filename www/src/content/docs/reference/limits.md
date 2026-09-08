@@ -19,7 +19,7 @@ spelled like the engine field it feeds — `Limits` in
 | `--max-extracted-bytes` | `deep_analysis_max` **and** `Limits::max_extracted_bytes` | 256 MiB / 1 GiB | Cumulative decompressed bytes across the whole recursion |
 | `--max-object-bytes` | `Limits::max_buffer_bytes` (and `deep_analysis_max`) | 256 MiB | The largest **single** buffered object |
 | `--max-matcher-bytes` | `Limits::max_scanned_bytes` | 10 GiB | Cumulative bytes fed to the matcher |
-| `--max-depth` | `Limits::max_recursion` | 16 | Nesting depth, containers inside containers |
+| `--max-unpack-depth` | `Limits::max_recursion` | 16 | Nesting depth, containers inside containers |
 | `--max-members` | `Limits::max_members` | 100000 | Member-count blowup |
 | — | `Limits::max_compression_ratio` | 1000 | One stream that expands absurdly |
 
@@ -35,7 +35,7 @@ per-object cap and the deep-analysis size together, so one knob governs the
 largest single allocation on every materialization path.
 
 `--clamav-compat` moves four of them: `--max-input-bytes` to 100M,
-`--max-extracted-bytes` to 400M (both fields), `--max-depth` to 17 and
+`--max-extracted-bytes` to 400M (both fields), `--max-unpack-depth` to 17 and
 `--max-members` to 10000.
 
 `0` means **no limit** on every size flag here — the reading ClamAV gives a zero,
@@ -116,7 +116,7 @@ one changes nothing.
 - One very large top-level file → `--max-input-bytes`.
 - One very large member inside a container → `--max-object-bytes` (buffered
   formats) or `--max-matcher-bytes` (streamed ones).
-- Deeply nested archives → `--max-depth`.
+- Deeply nested archives → `--max-unpack-depth`.
 - A scan that never returns → `--max-scan-secs`, and consider whether you want
   the file scanned at all.
 

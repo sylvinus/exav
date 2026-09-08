@@ -145,7 +145,7 @@ mechanical — each exav flag is named after the bound it sets:
 |---|---|---|
 | `--max-filesize` | `--max-input-bytes` | The largest top-level input scanned |
 | `--max-scansize` | `--max-extracted-bytes` | What decompression may produce across one top-level file: deep-analysis size and the summed extracted bytes |
-| `--max-recursion` | `--max-depth` | Nesting depth, containers inside containers |
+| `--max-recursion` | `--max-unpack-depth` | Nesting depth, containers inside containers |
 | `--max-files` | `--max-members` | Members visited across the whole recursive walk |
 
 Two more bounds have no `clamscan` counterpart at all: `--max-object-bytes` (the
@@ -159,7 +159,9 @@ clear error naming the exav flag, is the shorter path through a migration:
 
 ```sh
 exav --max-files 500 /data
-# error: unexpected argument '--max-files' found
+# exav: --max-files is a clamscan flag; use --max-members, members visited
+#       across the whole recursive walk
+# exav: the full mapping is at https://exav.org/reference/clamav-flag-matrix/
 ```
 
 ### The one deliberate difference

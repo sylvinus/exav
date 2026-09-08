@@ -160,7 +160,7 @@ engine budget.
 | `--max-extracted-bytes <SIZE>` | `256M` / `1G` | `400M` | What decompression may *produce* across one top-level file: the flag sets deep-analysis size and summed extracted bytes to one value; unset they keep their own defaults. |
 | `--max-object-bytes <SIZE>` | `256M` | — | The most memory a **single** materialized object may use. It bounds one buffer: several are live at once across nesting levels, and `--max-extracted-bytes` bounds their sum. |
 | `--max-matcher-bytes <SIZE>` | `10G` | — | Cumulative scan-reach (CPU/time) bound, decoupled from memory. Raising it scans larger members in full, paying only in time. |
-| `--max-depth <N>` | `16` | `17` | Max nesting depth for recursive unpacking. |
+| `--max-unpack-depth <N>` | `16` | `17` | Max nesting depth for recursive unpacking. |
 | `--max-members <N>` | `100000` | `10000` | Max members visited across the whole recursive walk. Higher than ClamAV's default on purpose: exav descends into nested archives ClamAV does not, so it counts strictly more objects for the same file. |
 
 Each bound has exactly one spelling. `clamscan`'s names (`--max-filesize`,
@@ -328,7 +328,7 @@ listeners, run the thread model (`--workers threads`).
 `--max-scan-secs` is a different thing and is **refused** under `--workers
 threads`: it means "kill the job", and only the prefork pool can do that. There a
 scan is bounded by work rather than time — `--max-matcher-bytes` is the
-per-object CPU bound, with `--max-depth` and `--max-members`.
+per-object CPU bound, with `--max-unpack-depth` and `--max-members`.
 
 ## Serving and connecting
 
@@ -391,6 +391,7 @@ it to clients as `Max-Connections`.
 | `--listen <ADDR>` | — | Serve on this address. Repeatable (comma-separated in the environment). |
 | `--connect <ADDR>` | — | Scan by handing each file to a daemon already running here, instead of loading a database. |
 | `--send-as <WHAT>` | `path` | What a `--connect` client hands the daemon: `path`, `contents` or `fd`. |
+| `--ping` | off | Ask a daemon whether it is answering, and exit `0` or `2`. Scans nothing. Probes `--connect` when given, otherwise the listener this same configuration would serve — so a container health check needs no address of its own — and speaks the protocol it finds there: `PING` on clamd, `OPTIONS` on ICAP. One probe; clamdscan's `attempts[:interval]` argument is refused, because retrying belongs to whatever is asking. |
 | `--workers <N\|threads>` | CPU cores | Daemon worker model (Unix): a count runs a prefork pool, `threads` runs the listeners in one process. |
 | `--max-scan-secs <SECS>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`); the worker is killed on expiry. In a one-shot run it bounds the whole run, which exits 3 saying so — running out of time is a scan that stopped short, not a scanner that failed. Refused for a listener under `--workers threads`. |
 | `--max-process-bytes <SIZE>` | `2G` in the pool, unset otherwise | Unix. Address space (`RLIMIT_AS`): per worker in the pool, whole-process in a one-shot run or the thread model. Also lowers the in-core extraction budget to fit inside it. |
@@ -492,7 +493,7 @@ the same verdict on either port.
 
 | Flag | Description |
 |---|---|
-| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-depth 17 --max-members 10000 --base64 off`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
+| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000 --base64 off`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
 
 Each preset value can still be set on its own, and an explicit flag wins over the
 preset. Narrowing the format set and appending `.UNOFFICIAL` to unofficial-database

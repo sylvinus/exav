@@ -98,7 +98,7 @@ into a **memory** axis and a **CPU/time** axis:
 | `--max-extracted-bytes` | `deep_analysis_max` + `max_extracted_bytes` | data-scanned budget | 256M / 1G (the flag sets both to one value) |
 | `--max-object-bytes` | `max_buffer_bytes` (+ `deep_analysis_max`) | largest **single** materialized object — one buffer, of the several live at once | 256M |
 | `--max-matcher-bytes` | `max_scanned_bytes` | **CPU/time** — cumulative bytes fed to the matcher | 10G |
-| `--max-depth` | `max_recursion` | nesting depth | 16 |
+| `--max-unpack-depth` | `max_recursion` | nesting depth | 16 |
 | `--max-members` | `max_members` | members across the whole recursive walk | 100000 |
 
 Key distinction: raising `--max-matcher-bytes` lets exav fully scan multi-gigabyte
