@@ -40,7 +40,10 @@ if PREFIX:
 EXAV = os.environ.get("EXAV", "target/debug/exav")
 DB = os.environ.get("EXAV_DB", "eicar.ndb")
 
-EICAR = rb'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+# Reversed, and flipped back at run time, so the 68-byte sequence is not stored
+# anywhere in this tree. See `exav_unpack::eicar` for why that matters: a file
+# carrying it is quarantined by any scanner that reads this repo or its releases.
+EICAR = rb'*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\4[PA@%P!O5X'[::-1]
 
 
 def run(cmd, cwd, quiet=True):

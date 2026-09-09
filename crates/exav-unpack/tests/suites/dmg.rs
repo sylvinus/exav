@@ -9,7 +9,7 @@ const MARKER: &[u8] = b"hello hfs+";
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/dmg/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn contains_marker(entries: &[exav_unpack::Entry]) -> bool {

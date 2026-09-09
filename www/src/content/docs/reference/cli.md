@@ -7,7 +7,7 @@ description: Every exav command-line flag — targets, scanning limits, output, 
 
 Scan `PATH`(s) — files or directories — for malware. Use `-` for stdin. An
 `http(s)://` target is scanned over range requests (needs a `http-scan` build).
-With no `-d`/`--sigs-dir` and no real signatures loaded, exav refuses to run
+With no `-d`/`--sig-dir` and no real signatures loaded, exav refuses to run
 unless `--allow-no-db`.
 
 Run `exav --help` for the authoritative list; this page mirrors the clap
@@ -73,13 +73,13 @@ that does not mount your files, send the *contents* instead — see
 | Flag | Default | Description |
 |---|---|---|
 | `-d`, `--database <PATH>` | — | Load signatures from a FILE or DIR (`.ndb`/`.hdb`/`.cvd`/… or a prebuilt `.exavdb`). A DIR is scanned recursively. |
-| `--sigs-dir <DIR>` | `/var/lib/exav` | The directory signatures **live in** — the one `--auto-update` writes into and a sidecar populates. |
+| `--sig-dir <DIR>` | `/var/lib/exav` | The directory signatures **live in** — the one `--auto-update` writes into and a sidecar populates. |
 | `--sig-sources <FILE>` | — | File of signature source URLs (also reads `freshclam.conf` source directives). |
 | `--allow-no-db` | off | **Testing only.** Run against the built-in EICAR-only baseline when no real database is present, instead of refusing. |
 | `--build-db <FILE>` | — | Compile loaded signatures into a prebuilt `.exavdb` and exit. |
 | `--build-shard-bytes <SIZE>` | — | Cap the per-shard automaton-build transient (`--build-db` only). |
 
-`-d` and `--sigs-dir` are not two spellings of one thing. `--sigs-dir` names a
+`-d` and `--sig-dir` are not two spellings of one thing. `--sig-dir` names a
 *directory that is written to*, so it stays a directory even when `-d` points the
 load somewhere else — which is how a deployment serves a prebuilt `.exavdb` from
 one path while an updater keeps a signature directory current at another.
@@ -135,7 +135,7 @@ Anything that is not an `http(s)` URL is a path; that is the same rule `--listen
 uses to tell a socket path from a `host:port`. Pointed at a real `freshclam.conf`,
 exav reads its *source* directives (`DatabaseMirror`/`PrivateMirror`,
 `DatabaseCustomURL`) and warns about every line it ignores — including
-`DatabaseDirectory`, which is `--sigs-dir` and not a source.
+`DatabaseDirectory`, which is `--sig-dir` and not a source.
 
 No source is privileged: every URL is fetched the same way, over plain HTTPS with
 **no signature verification**. Point it at a mirror you trust, or use
@@ -160,7 +160,7 @@ engine budget.
 | `--max-extracted-bytes <SIZE>` | `256M` / `1G` | `400M` | What decompression may *produce* across one top-level file: the flag sets deep-analysis size and summed extracted bytes to one value; unset they keep their own defaults. |
 | `--max-object-bytes <SIZE>` | `256M` | — | The most memory a **single** materialized object may use. It bounds one buffer: several are live at once across nesting levels, and `--max-extracted-bytes` bounds their sum. |
 | `--max-matcher-bytes <SIZE>` | `10G` | — | Cumulative scan-reach (CPU/time) bound, decoupled from memory. Raising it scans larger members in full, paying only in time. |
-| `--max-depth <N>` | `16` | `17` | Max nesting depth for recursive unpacking. |
+| `--max-unpack-depth <N>` | `16` | `17` | Max nesting depth for recursive unpacking. |
 | `--max-members <N>` | `100000` | `10000` | Max members visited across the whole recursive walk. Higher than ClamAV's default on purpose: exav descends into nested archives ClamAV does not, so it counts strictly more objects for the same file. |
 
 Each bound has exactly one spelling. `clamscan`'s names (`--max-filesize`,
@@ -223,7 +223,15 @@ silently resolved.
 | Flag | Default | Description |
 |---|---|---|
 | `--detect <LIST>` | `none` | Heuristic detectors to switch on, over and above the signature database: `none`, `all`, or a comma-separated list of `heuristics`, `macros`, `broken`, `broken-media`, `partition-intersection`, `phishing`, `packed`, `pua`. |
-| `--base64 [<on\|off>]` | on | Decode base64-encoded executables embedded in text/script files. Off under `--clamav-compat`, which has no such reach; an explicit value wins over the preset. |
+| `--no-detect <LIST>` | — | Detectors to leave off, subtracted from `--detect`. What `--detect all` is for: everything, minus the one that is noisy on your corpus. |
+| `--decode <LIST>` | `all` | Encodings to recover a payload from before scanning it: `all`, `none`, or a list. Today that list is `base64`. **On by default**, unlike `--detect`, because a carrier that hides its payload is the ordinary case and skipping it reports clean on a file never really read. `--clamav-compat` sets `none`. |
+| `--no-decode <LIST>` | — | Encodings to leave alone, subtracted from `--decode`. |
+
+A decoder is not an unpacker. An unpacker opens a container the file declares
+itself to be; a decoder finds a payload the carrier does not announce at all,
+such as a PE base64'd into a PowerShell one-liner. `--decode` and `--no-decode`
+compose by subtraction, so `--decode all --no-decode base64` is well defined and
+neither flag has to win.
 | `--passwords <PW>` | — | Password to try when decrypting encrypted archive members. Repeatable (comma-separated in the environment) to build a pool, tried in order, unioned with any `.pwdb` databases. |
 | `--alert-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
 | `--alert-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
@@ -238,22 +246,37 @@ One detector list rather than a switch per detector: a boolean each cannot say
 ### What an unscannable object becomes
 
 `--detect` says what to *look for*. What happens to an object exav could not
-fully examine is a different question, and `--not-scanned` is the only flag
+fully examine is a different question, and `--partial-as` is the only flag
 that answers it.
 
-| Value | Effect |
-|---|---|
-| `block` *(default)* | The verdict stands. Exit 2, a clamd `ERROR` reply, an ICAP block. |
-| `alert` | Report it as a detection named `Heuristics.*`. Exit 1, `FOUND`, `X-Infection-Found` — an ordinary hit to any client. |
-| `pass` | Deliver it. Exit 0, `OK`, a `204`. |
+The value **is** the status it reports as, and each status is one exit code — so
+the value names the code you get, with nothing to look up:
 
-It also takes a per-condition list — `--not-scanned
-password-protected=pass,limits-exceeded=alert` — over the three conditions
+| Value | Status | Exit | Effect |
+|---|---|---|---|
+| `partial` *(default)* | `PARTIAL` | 3 | The verdict stands, under its category. A clamd `ERROR` reply, an ICAP block. |
+| `ok` | `OK` | 0 | Deliver it as clean. An ICAP `204`. |
+| `found` | `FOUND` | 1 | Report it as a detection named `Heuristics.*` — an ordinary hit to any client, and what ClamAV's `--alert-exceeds-max` / `--alert-encrypted` produce. |
+| `error` | `ERROR` | 2 | Report it as an operational failure, for a caller that would rather not learn a fourth exit code. |
+
+It also takes a per-category list — `--partial-as
+password-protected=ok,limits-exceeded=found` — over the three categories
 `limits-exceeded`, `unscannable` and `password-protected`.
 
-`pass` is what ClamAV does for an encrypted archive and what `c-icap` does past
+`ok` is what ClamAV does for an encrypted archive and what `c-icap` does past
 `MaxObjectSize`. It is a real trade rather than a mistake, and exav will not make
-it quietly: **every passed object is logged.**
+it quietly: **every such object is logged**, and the listener says so at startup.
+
+`--clamav-compat` implies `--partial-as ok`, because that is what a stock ClamAV
+build answers for this whole class. An explicit value still wins over the preset.
+
+Refused together with `--connect`: the policy belongs to whatever does the
+scanning, and a client only ever sees the reply the daemon already decided.
+
+On the clamd wire, `partial` and `error` are both an `ERROR` reply. That
+protocol's vocabulary is `OK`/`FOUND`/`ERROR`, and a real `clamdscan` reads a
+word outside it as `OK` — a fail-open exav will not risk. They differ only where
+there is an exit code to differ in.
 
 ## Output
 
@@ -288,7 +311,7 @@ Three ways to read them:
 $ printf 'zSTATS\0' | nc 127.0.0.1 3310
 …
 SCANSTATS: scans 3 bytes 20135159 scan-seconds 5.435 mean-ms 1811.617
-  slowest-ms 5382.013 throughput-MBps 3.7 in-flight 0 slow 0 infected 1 not-scanned 0
+  slowest-ms 5382.013 throughput-MBps 3.7 in-flight 0 slow 0 infected 1 partial 0
 MATCHERSTATS: engine=2278.692ms/7calls/60405341b normalize=566.013ms/4calls/40270182b
 END
 ```
@@ -313,7 +336,7 @@ listeners, run the thread model (`--workers threads`).
 `--max-scan-secs` is a different thing and is **refused** under `--workers
 threads`: it means "kill the job", and only the prefork pool can do that. There a
 scan is bounded by work rather than time — `--max-matcher-bytes` is the
-per-object CPU bound, with `--max-depth` and `--max-members`.
+per-object CPU bound, with `--max-unpack-depth` and `--max-members`.
 
 ## Serving and connecting
 
@@ -329,35 +352,42 @@ Both take the same address grammar, with the protocol in the value:
 clamd://0.0.0.0:3310         the clamd protocol over TCP
 clamd:///var/run/exav.sock   the clamd protocol over a Unix socket
 icap://0.0.0.0:1344          ICAP (RFC 3507), for a proxy's adaptation hook
+icap://0.0.0.0:1344/avscan   ICAP answering on that service only
 0.0.0.0:3310                 no scheme — clamd
 /var/run/exav.sock           no scheme, a path — clamd over a Unix socket
 ```
 
-A leading `/` is a socket path; anything else is `host:port`. Nothing listens
-without `--listen`, and there is no default address.
+A leading `/` is a socket path; anything else is `host:port`, optionally
+followed by `/<service>` for ICAP. A TCP address without a port is refused rather
+than carried to a bind that fails obscurely. Nothing listens without `--listen`,
+and there is no default address.
 
 ### What belongs to one listener
 
-Two settings ride on the address's `?key=value` tail rather than on a flag,
-because each is a property of *that listener* rather than of the run:
+Some settings belong to *one listener* rather than to the run, so they ride on
+its address instead of on a flag. An ICAP service is the URL path; the rest are a
+`?key=value` tail:
 
-| Option | Default | Meaning |
+| On the address | Default | Meaning |
 |---|---|---|
-| `mode=660` | `0600` | Permission bits for a Unix socket. |
-| `max-connections=200` | `128` clamd, `100` ICAP | Concurrent connections this listener accepts. |
+| `/avscan` *(the path)* | `avscan`, `srv_clamav`, `virus_scan` | The ICAP service to answer on. Naming one replaces the default set. |
+| `?service=a&service=b` | — | Several ICAP services. Repeat the key; a comma separates *addresses*, not names. |
+| `?mode=660` | `0600` | Permission bits for a Unix socket. |
+| `?max-connections=200` | `128` clamd, `100` ICAP | Concurrent connections this listener accepts. |
 
 ```sh
 exav --listen 'clamd:///run/exav.sock?mode=660' \
-     --listen 'icap://0.0.0.0:1344?max-connections=200'
+     --listen 'icap://0.0.0.0:1344/avscan?max-connections=200'
 ```
 
-A flag for either would have to say *which* listener it meant: a socket mode
-applied to a `host:port` means nothing, and a connection cap has to pick a
-protocol — so two listeners would need two flags, and the one without a flag
-would be stuck on a constant. On the address there is exactly one thing each can
-attach to, so there is nothing to cross-check and nothing to get wrong. Both are
-refused where they cannot apply, and an unknown option is an error rather than an
-ignored word.
+A flag for any of these would have to say *which* listener it meant: a socket
+mode applied to a `host:port` means nothing, a connection cap has to pick a
+protocol, and a service name only exists for one of the two. Two listeners would
+need two flags, and the one without a flag would be stuck on a constant. On the
+address there is exactly one thing each can attach to, so there is nothing to
+cross-check and nothing to get wrong. Each is refused where it cannot apply — a
+path on a `clamd://` address, a mode on a `host:port` — and an unknown option is
+an error rather than an ignored word.
 
 `max-connections` bounds the **clamd** listener only under `--workers threads`;
 the prefork pool bounds concurrency by its worker count instead, so a second cap
@@ -369,8 +399,9 @@ it to clients as `Max-Connections`.
 | `--listen <ADDR>` | — | Serve on this address. Repeatable (comma-separated in the environment). |
 | `--connect <ADDR>` | — | Scan by handing each file to a daemon already running here, instead of loading a database. |
 | `--send-as <WHAT>` | `path` | What a `--connect` client hands the daemon: `path`, `contents` or `fd`. |
+| `--ping` | off | Ask a daemon whether it is answering, and exit `0` or `2`. Scans nothing. Probes `--connect` when given, otherwise the listener this same configuration would serve — so a container health check needs no address of its own — and speaks the protocol it finds there: `PING` on clamd, `OPTIONS` on ICAP. One probe; clamdscan's `attempts[:interval]` argument is refused, because retrying belongs to whatever is asking. |
 | `--workers <N\|threads>` | CPU cores | Daemon worker model (Unix): a count runs a prefork pool, `threads` runs the listeners in one process. |
-| `--max-scan-secs <SECS>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`); the worker is killed on expiry. In a one-shot run it bounds the whole run, which exits 2 saying so. Refused for a listener under `--workers threads`. |
+| `--max-scan-secs <SECS>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`); the worker is killed on expiry. In a one-shot run it bounds the whole run, which exits 3 saying so — running out of time is a scan that stopped short, not a scanner that failed. Refused for a listener under `--workers threads`. |
 | `--max-process-bytes <SIZE>` | `2G` in the pool, unset otherwise | Unix. Address space (`RLIMIT_AS`): per worker in the pool, whole-process in a one-shot run or the thread model. Also lowers the in-core extraction budget to fit inside it. |
 | `--max-jobs-per-worker <N>` | `1000` | Prefork only: recycle a worker after this many jobs. |
 | `--allow-shutdown` | off | Honour the clamd `SHUTDOWN` command, letting any client that can reach the daemon stop it. |
@@ -443,7 +474,28 @@ scanned rather than each fragment alone; by path the same job is a `CONTSCAN` ov
 the directory, which makes the daemon rejoin them.
 
 A client walks a directory itself in every mode and sends one request per file, so
-the filter flags apply to the tree and every request has one reply.
+`--exclude`, `--exclude-dir`, `--include`, `--files-from` and `--no-recursive`
+apply to the tree, and every request has one reply.
+
+Nothing else about the scan is the client's to set. The daemon holds the database
+and does the scanning, under the configuration **it** was started with, so a
+limit, a `--detect` list or a `--passwords` pool typed next to `--connect` is
+refused rather than accepted and dropped:
+
+```sh
+exav --connect /run/exav.sock --max-input-bytes 1M /data
+# exav: --connect hands each file to the daemon, which scans it under the
+#       configuration it was started with, so a client cannot apply
+#       --max-input-bytes
+```
+
+A cap that silently does not apply is worse than no cap: the output of a file
+scanned without it is identical to the output of a file that was under it. Set
+these where the daemon starts, or drop `--connect` to scan locally. What a client
+keeps is what it does itself — which paths, what gets printed, and where
+(`--quiet`, `--verbose`, `--json`, `--log`, `--bell`, `--all-matches`,
+`--send-as`). Variables are exempt: `EXAV_MAX_INPUT_BYTES` in an image that also
+runs clients is a default for its daemon, not a contradiction.
 
 ### ICAP server
 
@@ -452,7 +504,7 @@ container. These tune it; none of them binds anything on its own.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--icap-service <NAME>` | `avscan`, `srv_clamav`, `virus_scan` | Service name in `icap://host/<service>`. Repeatable (comma-separated in the environment); naming any replaces the defaults. |
+| the path of the `--listen` address | `avscan`, `srv_clamav`, `virus_scan` | Service name to answer on — `icap://host:1344/avscan`. Not a flag: it is the path of the URL a proxy is already configured with. Naming one replaces the defaults; `?service=a&service=b` names several. See [address options](#what-belongs-to-one-listener). |
 | `--icap-preview-bytes <N>` | `4096` | Bytes advertised in the `Preview` header. |
 | `--icap-transfer-preview <PATTERN\|off>` | `*` | `Transfer-Preview` value; `off` omits the header. |
 | `?max-connections=` on the address | `100` | Concurrent connections, also advertised as `Max-Connections`. Not a flag — see [address options](#what-belongs-to-one-listener). |
@@ -460,7 +512,7 @@ container. These tune it; none of them binds anything on its own.
 | `--icap-max-requests <N>` | `100` | Requests served on one connection before it is closed. |
 | `--icap-idle-secs <SECS>` | `600` | How long an idle connection is held open. |
 | `--icap-max-header-bytes <N>` | `65536` | Largest ICAP head plus encapsulated HTTP headers. |
-| `--icap-infection-header <WHEN>` | `blocks` | Which blocks carry `X-Infection-Found`: `blocks` (every one; a not-scanned verdict under `Heuristics.Exav.*`) or `detections` (a signature match only). |
+| `--icap-infection-header <WHEN>` | `blocks` | Which blocks carry `X-Infection-Found`: `blocks` (every one; a `PARTIAL` verdict under `Heuristics.Exav.*`) or `detections` (a signature match only). |
 
 There is no ICAP-specific size ceiling. An object's fate is decided by the same
 `--max-input-bytes` and spill budgets a clamd client's is, so the same file gets
@@ -470,7 +522,7 @@ the same verdict on either port.
 
 | Flag | Description |
 |---|---|
-| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-depth 17 --max-members 10000 --base64 off`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
+| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000 --decode none`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
 
 Each preset value can still be set on its own, and an explicit flag wins over the
 preset. Narrowing the format set and appending `.UNOFFICIAL` to unofficial-database
@@ -482,7 +534,7 @@ the [ClamAV flag matrix](/reference/clamav-flag-matrix/).
 
 ## Exit codes
 
-`0` clean · `1` at least one detection · `2` error or not-fully-scanned
-(`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`, unless
-`--not-scanned` says otherwise). See
+`0` `OK` clean · `1` `FOUND` a detection · `2` `ERROR` exav could not do its job
+· `3` `PARTIAL` something could not be fully examined (`LIMITS-EXCEEDED` /
+`UNSCANNABLE` / `PASSWORD-PROTECTED`), unless `--partial-as` says otherwise. See
 [Verdicts & exit codes](/reference/verdicts/).

@@ -36,7 +36,7 @@ fn fixture() -> Vec<u8> {
         "{}/tests/fixtures/alz/defaults.alz",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn extract_all(data: &[u8]) -> Vec<exav_unpack::Entry> {

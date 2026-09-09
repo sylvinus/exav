@@ -9,7 +9,7 @@ fn recovers_eicar(fixture: &str) -> bool {
         "{}/tests/fixtures/pdf/{fixture}",
         env!("CARGO_MANIFEST_DIR")
     );
-    let blob = std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let blob = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
     let mut b = Budget::new(Limits::default());
     let entries = extract(Format::Pdf, &blob, &mut b).unwrap();
     entries

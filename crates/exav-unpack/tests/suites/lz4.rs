@@ -26,7 +26,7 @@ const BOTH: &str = "eaa51b48ad93";
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/lz4/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -83,10 +83,9 @@ fn a_payload_hidden_behind_a_first_frame_is_still_reached() {
         "both frames must be decoded, got {} bytes",
         d.len()
     );
-    const EICAR_BYTES: &[u8] =
-        br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    let eicar_bytes = exav_unpack::eicar();
     assert!(
-        d.windows(EICAR_BYTES.len()).any(|w| w == EICAR_BYTES),
+        d.windows(eicar_bytes.len()).any(|w| w == eicar_bytes),
         "the payload in the second frame must be reachable"
     );
 }

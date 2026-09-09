@@ -11,7 +11,7 @@ use exav_unpack::{extract, Budget, Format, Limits};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/test_data/pdf/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 /// Unencrypted PDF extracts successfully (returns entries, not an error).

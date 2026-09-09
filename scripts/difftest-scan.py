@@ -121,7 +121,7 @@ def verdict_of(replies):
     * `sig[,sig...]` the SET of signatures, deduped and sorted, so two engines
                      that found the same things in a different order compare
                      equal instead of reading as a disagreement
-    * `!TAG`         a not-scanned outcome (exav reports these; clamd has no
+    * `!TAG`         a PARTIAL outcome (exav reports these; clamd has no
                      equivalent and simply says OK). The `!` cannot collide with
                      a signature name, which is what lets the comparison tell
                      "flagged as unreadable" apart from "found malware".
@@ -147,14 +147,19 @@ def verdict_of(replies):
         if line.endswith(" FOUND"):
             body = line[: -len(" FOUND")]
             sigs.add(body.split(": ")[-1])
-        elif line.endswith("ERROR"):
-            for tag in ("LIMITS-EXCEEDED", "UNSCANNABLE", "PASSWORD-PROTECTED"):
-                if tag in line:
-                    marker = marker or "!" + tag
-                    break
+        elif line.endswith(" ERROR"):
+            # `path: <reason> <CATEGORY> ERROR` — the category is the word
+            # before the status, so match it there rather than anywhere in the
+            # line: a path like /data/UNSCANNABLE/x would otherwise read as a
+            # PARTIAL when the scan really failed.
+            head = line[: -len(" ERROR")]
+            words = head.rsplit(" ", 1)
+            tag = words[-1] if len(words) > 1 else ""
+            if tag in ("LIMITS-EXCEEDED", "UNSCANNABLE", "PASSWORD-PROTECTED"):
+                marker = marker or "!" + tag
             else:
                 marker = marker or "ERROR"
-    # A detection outranks a not-scanned marker: a file that both matched a
+    # A detection outranks a PARTIAL marker: a file that both matched a
     # signature and hit a limit is a detection, and reporting the limit instead
     # would hide it.
     if sigs:

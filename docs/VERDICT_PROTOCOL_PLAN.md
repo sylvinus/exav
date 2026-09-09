@@ -1,10 +1,17 @@
-# Verdicts on the wire: a plan
+# Verdicts on the wire: the investigation
 
 How exav should report *"I could not look at this"* — to a human, to a clamd
 client, and to a new integration — and what that costs in ClamAV compatibility.
 
-Written to be decided on, not merged as-is. Every claim below that could have
-been asserted was measured instead; the commands are given.
+Every claim here that could have been asserted was measured instead; the commands
+are given. That evidence is why this file is kept.
+
+> **This is the question, not the answer.** [`PARTIAL.md`](PARTIAL.md) is the
+> spec: read it for what exav does. Sections 2 and 4 below describe a design that
+> was weighed and not taken — the `NotScanned` category and the `--compat=<mode>`
+> flag do not exist. Section 1 (what ClamAV can and cannot express) and section 3
+> (what real clients do with `ERROR`) are the measurements that decided it, and
+> they still hold.
 
 ---
 
@@ -88,7 +95,7 @@ The three-way split inside `NotScanned` is real and worth keeping:
 Each points at a different person, which is the only justification a verdict
 distinction ever needs.
 
-**On the clamd wire** (`crates/exav-cli/src/daemon.rs`), all three become:
+**On the clamd wire** (`crates/exav/src/daemon.rs`), all three become:
 
 ```
 <path>: <TAG> (<reason>) ERROR
@@ -548,7 +555,7 @@ comparison set except the extractors themselves misses it.
 ## Reproducing the measurements
 
 ```sh
-cargo build --release -p exav-cli && cargo build -p exav-unpack
+cargo build --release -p exav && cargo build -p exav-unpack
 # For each container: exav extracts, members are hashed into an .hdb,
 # clamscan rescans the untouched container with every alert flag.
 scripts/clamav-reach.sh crates/exav-unpack/tests/fixtures/{lzw,wim,egg,alz}/*

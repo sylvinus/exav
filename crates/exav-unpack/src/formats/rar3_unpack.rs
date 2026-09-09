@@ -1557,8 +1557,7 @@ fn filter_rgb(r0: u32, r1: u32, buf: &[u8]) -> Vec<u8> {
         let mut prev_byte = 0i32;
         let mut i = c;
         while i < l {
-            let predicted;
-            if i >= width && i - width >= 3 {
+            let predicted = if i >= width && i - width >= 3 {
                 let upper_pos = i - width;
                 let upper_byte = res[upper_pos] as i32;
                 let upper_left_byte = res[upper_pos - 3] as i32;
@@ -1573,10 +1572,10 @@ fn filter_rgb(r0: u32, r1: u32, buf: &[u8]) -> Vec<u8> {
                 } else {
                     p = upper_left_byte;
                 }
-                predicted = p;
+                p
             } else {
-                predicted = prev_byte;
-            }
+                prev_byte
+            };
             let cur = *buf.get(src).unwrap_or(&0) as i32;
             src += 1;
             prev_byte = (predicted - cur) & 0xFF;

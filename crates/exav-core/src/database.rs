@@ -393,6 +393,10 @@ mod tests {
     /// (incl. the recompiled `X:` regexes) as a fresh `-d <dbdir>` load.
     #[cfg(feature = "phishing")]
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
     fn phishing_db_round_trips_through_database() {
         let dir = crate::tmpfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("p.pdb"), "H:paypal.com\n").unwrap();

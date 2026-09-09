@@ -16,7 +16,9 @@
 
 use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 /// A single-member ustar archive whose size field uses `terminator`.
 ///
@@ -84,7 +86,7 @@ fn finds_eicar_in(tar: &[u8]) -> bool {
 
 fn finds_eicar(tar: &[u8]) -> bool {
     assert!(
-        !tar.windows(EICAR.len()).any(|w| w == EICAR),
+        !tar.windows(eicar().len()).any(|w| w == eicar()),
         "the payload must not appear verbatim anywhere in the archive, or the \
          raw scan finds it without the tar walk being involved at all"
     );
@@ -100,7 +102,7 @@ fn a_size_field_terminated_by_nul_is_parsed() {
     // GNU tar, ustar, pax, python tarfile. The control: this form always worked,
     // so if it ever fails the fixture itself is broken and the sibling test below
     // proves nothing.
-    let body = gz(EICAR);
+    let body = gz(eicar());
     let blob = tar_with_size_terminator("payload.gz", &body, &format!("{:011o}\0", body.len()));
     assert!(
         finds_eicar(&blob),
@@ -111,7 +113,7 @@ fn a_size_field_terminated_by_nul_is_parsed() {
 #[test]
 fn a_size_field_terminated_by_space_and_nul_is_parsed() {
     // node-tar, and therefore every npm package tarball: digits, a space, a NUL.
-    let body = gz(EICAR);
+    let body = gz(eicar());
     let blob = tar_with_size_terminator("payload.gz", &body, &format!("{:010o} \0", body.len()));
     assert!(
         finds_eicar(&blob),
@@ -126,7 +128,7 @@ fn a_size_field_terminated_by_a_space_alone_is_parsed() {
     // Permitted by POSIX and emitted by some older writers. Included because the
     // fix strips both characters from both ends rather than special-casing the
     // one form that was reported.
-    let body = gz(EICAR);
+    let body = gz(eicar());
     let blob = tar_with_size_terminator("payload.gz", &body, &format!("{:011o} ", body.len()));
     assert!(
         finds_eicar(&blob),
@@ -150,7 +152,7 @@ fn both_tar_readers_see_the_same_members() {
     // A COMPRESSED member, so the payload appears nowhere verbatim: the raw scan
     // cannot reach it and only the streaming walk can. With a plain member this
     // test passes whatever the streaming reader does.
-    let body = gz(EICAR);
+    let body = gz(eicar());
     for (label, field) in [
         ("gnu/ustar/pax/python", format!("{:011o}\0", body.len())),
         ("node-tar (npm)", format!("{:010o} \0", body.len())),

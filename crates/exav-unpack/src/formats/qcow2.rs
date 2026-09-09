@@ -118,8 +118,8 @@ pub(crate) fn extract_qcow2<R>(
     // truncated image rather than a hidden payload, and stays quiet.
     let mut undecodable_clusters = 0usize;
 
-    for (i, l1_chunk) in l1.chunks_exact(8).enumerate() {
-        let l1e = u64::from_be_bytes(l1_chunk.try_into().unwrap_or([0; 8]));
+    for (i, l1_chunk) in l1.as_chunks::<8>().0.iter().enumerate() {
+        let l1e = u64::from_be_bytes(*l1_chunk);
         let l2_off = (l1e & OFFSET_MASK) as usize;
         if l2_off == 0 {
             continue; // no L2 table: this whole range is unallocated (zeroes)
@@ -127,8 +127,8 @@ pub(crate) fn extract_qcow2<R>(
         let Some(l2) = data.get(l2_off..l2_off + l2_entries * 8) else {
             continue; // L2 table past the end: truncated image
         };
-        for (j, l2_chunk) in l2.chunks_exact(8).enumerate() {
-            let e = u64::from_be_bytes(l2_chunk.try_into().unwrap_or([0; 8]));
+        for (j, l2_chunk) in l2.as_chunks::<8>().0.iter().enumerate() {
+            let e = u64::from_be_bytes(*l2_chunk);
             let compressed = e & L2_COMPRESSED != 0;
             // Bit 0 means "reads as zeroes" for a *plain* entry only. In a
             // compressed descriptor it is part of the host offset, so testing it

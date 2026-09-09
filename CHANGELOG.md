@@ -4,7 +4,7 @@ Notable changes per release. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely, and versions
 follow [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.0.1] - 2026-09-08
 
 First public release. Everything below is new, so this section describes what
 the project *is* rather than what changed in it.
@@ -31,7 +31,7 @@ the project *is* rather than what changed in it.
 
 ### Memory safety
 
-`#![forbid(unsafe_code)]` on every crate except `exav-cli`, whose only
+`#![forbid(unsafe_code)]` on every crate except `exav`, whose only
 exception is the prefork daemon's process management (`fork`, `waitpid`,
 `setrlimit`, descriptor passing). No scanned byte reaches any of it.
 

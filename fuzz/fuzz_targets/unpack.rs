@@ -21,6 +21,10 @@ const TIGHT_LIMITS: Limits = Limits {
     max_buffer_bytes: 128 * 1024,
     max_scanned_bytes: 256 * 1024,
     max_recursion: 2,
+    // Every format stays reachable. Narrowing the set here would take whole
+    // parsers out of the fuzzer's reach, which is the opposite of what this
+    // target is for.
+    allowed_formats: None,
 };
 
 /// Every extractable format. Kept exhaustive on purpose: a new `Format` variant

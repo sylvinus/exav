@@ -24,7 +24,7 @@ fn fixture() -> Vec<u8> {
         "{}/tests/fixtures/cab/mszip_lzx_qtm.cab",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn members() -> Vec<(String, Vec<u8>)> {

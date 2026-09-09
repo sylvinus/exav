@@ -14,7 +14,10 @@ HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 3310
 
 # The standard EICAR anti-malware test string (harmless; every scanner detects).
-EICAR = rb"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+# Reversed, and flipped back at run time, so the 68-byte sequence is not stored
+# anywhere in this tree. See `exav_unpack::eicar` for why that matters: a file
+# carrying it is quarantined by any scanner that reads this repo or its releases.
+EICAR = rb"*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\4[PA@%P!O5X"[::-1]
 
 
 def wait_for_port(timeout=60):

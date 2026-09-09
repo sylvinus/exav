@@ -291,7 +291,7 @@ records the regression.)
 
 Two more places encryption shows up as signal:
 
-- `--not-scanned password-protected=alert` turns a password-protected member
+- `--partial-as password-protected=found` turns a password-protected member
   into an actual detection,
   `Heuristics.Encrypted.Zip` / `.RAR` / `.7Zip` / `.PDF` / `.Doc`
   (`encrypted_heuristic_name` in `crates/exav-core/src/lib.rs`).
@@ -699,7 +699,7 @@ if you get it wrong.
 **The daemon identifies itself as ClamAV.** `VERSION` over the wire returns
 `ClamAV <flevel-release>/<db-version>/<db-build-time>`, with the build time
 reformatted into the ctime-style stamp `clamdtop` parses for its DBTIME column
-(`crates/exav-cli/src/daemon.rs`). Health checks and monitoring tools parse that
+(`crates/exav/src/daemon.rs`). Health checks and monitoring tools parse that
 string; returning anything else means they don't recognise a scanner is running.
 
 The `clamd` protocol itself has four oddities:
@@ -737,12 +737,15 @@ above it.
 The flat streaming core would scan those bytes and find nothing inside the
 archive.
 
-And a wart the protocol forces: clamd has no third status. "Not fully scanned"
-goes on the wire as `ERROR`, so exav's own client re-derives the distinction by
-string-matching three tags (`LIMITS-EXCEEDED`, `UNSCANNABLE`,
-`PASSWORD-PROTECTED`) out of the error line, purely so that a remote scan's
-summary and exit code match a local one. Exit code 2 covers both hard errors and
-merely-not-fully-scanned files — that is the CLI-level expression of never a
+And a wart the protocol forces: clamd's status vocabulary is closed at `OK`,
+`FOUND` and `ERROR`, and a client reads a fourth word as `OK` — so `PARTIAL` on
+that wire would turn a fail-closed answer into a fail-open one. It goes out as
+`ERROR` instead, with the category named just before it
+(`<reason> LIMITS-EXCEEDED ERROR`), and exav's own client reads that word back
+to recover the distinction, purely so that a remote scan's summary and exit code
+match a local one. Locally there is no such constraint: `PARTIAL` is its own
+status with its own exit code, `3`, and `2` stays what it is in ClamAV — the
+scanner itself failed. Keeping them apart is the CLI-level expression of never a
 silent OK.
 
 And the third, which surprised us most: **exav has a mode that deliberately makes

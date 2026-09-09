@@ -76,8 +76,9 @@ scanning the recovered `.zip`. A document that still won't open is reported
 
 exav's headline safety property is that it **never returns a clean verdict for a
 file it could not fully scan**. If a member is encrypted, truncated, corrupt,
-oversized, or hits a limit, exav says so — `PASSWORD-PROTECTED`,
-`UNSCANNABLE`, or `LIMITS-EXCEEDED` (exit code 2) — rather than `OK`.
+oversized, or hits a limit, exav says so — status `PARTIAL` under one of
+`PASSWORD-PROTECTED`, `UNSCANNABLE` or `LIMITS-EXCEEDED`, exit code 3 — rather
+than `OK`.
 
 This is a deliberate divergence from ClamAV. ClamAV's default triage collapses
 *every* limit/parse/decrypt failure to **clean/OK**; the only knob that surfaces

@@ -18,8 +18,10 @@
 //! * **Cleaned up.** Dropping removes the file (or the directory tree); a crash
 //!   can leave one behind.
 //!
-//! `exav-cli` carries the same file — there it is not test-only, the daemon
-//! spills oversized streams through it. The two are meant to stay identical.
+//! The `exav` binary carries its own copy, where this is not test-only: the daemon
+//! spills oversized streams through it. That copy carries the extra machinery a
+//! spill needs — a caller-chosen directory, unlink-on-create, and a refusal to
+//! write after a read-back. The security properties above are the shared part.
 
 #![allow(dead_code)]
 
@@ -155,6 +157,10 @@ mod tests {
     use std::io::{Read, Write};
 
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
     fn a_temp_file_round_trips_and_disappears() {
         let path;
         {
@@ -170,6 +176,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
     fn names_do_not_repeat() {
         let a = TempFile::new().unwrap();
         let b = TempFile::new().unwrap();
@@ -186,6 +196,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
     fn a_temp_dir_takes_its_contents_with_it() {
         let path;
         {

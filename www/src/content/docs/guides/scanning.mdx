@@ -5,8 +5,8 @@ description: Scan files, directories, streams, and URLs with exav — output for
 
 import { Aside } from '@astrojs/starlight/components';
 
-exav's CLI is `clamscan`-compatible: the same output format, exit codes, and the
-common flags. This guide covers everyday scanning; see the
+exav prints `clamscan`'s output format. The flags are exav's own, and there is a
+fourth exit code. This guide covers everyday scanning; see the
 [CLI reference](/reference/cli/) for every flag.
 
 ## Targets
@@ -25,8 +25,8 @@ A named directory recurses by default. Naming one and getting some of it is the
 kind of surprise that reads as a clean result: the files that were never opened
 are indistinguishable, in the output, from files that were and were fine.
 
-All examples assume signatures are loaded — either via `-d` / `--sigs-dir`, or the
-default `--sigs-dir` directory. See [Signatures](/guides/signatures/).
+All examples assume signatures are loaded — either via `-d` / `--sig-dir`, or the
+default `--sig-dir` directory. See [Signatures](/guides/signatures/).
 
 ### Streaming vs seekable
 
@@ -77,9 +77,13 @@ The human-readable output is one line per file:
 ```console
 /path/to/file: Win.Trojan.Agent-1234 FOUND
 /path/to/clean: OK
-/path/to/huge.bin: LIMITS-EXCEEDED
-/path/to/secret.zip: PASSWORD-PROTECTED
+/path/to/huge.bin: file size 9663676416 exceeds max-scan-size 4294967296; scanned first 4294967296 bytes only LIMITS-EXCEEDED PARTIAL
+/path/to/secret.zip: encrypted archive member PASSWORD-PROTECTED PARTIAL
 ```
+
+A line that could not be fully examined ends with two words, not one: the
+[category](/reference/verdicts/) saying which condition stopped the scan, and
+the status `PARTIAL` that every category shares. The reason comes first.
 
 followed by a `clamscan`-style summary. `--quiet` is the single output dial —
 it suppresses the `OK` lines and the summary together, with `-v` at the other
@@ -91,7 +95,18 @@ For tooling and pipelines, `--json` emits newline-delimited JSON — one object
 per scanned input, plus a final summary object:
 
 ```sh
-exav --json /data | jq 'select(.category=="infected")'
+exav --json /data | jq 'select(.status=="FOUND")'
+```
+
+`status` is the word the human line ends with — `OK`, `FOUND`, `ERROR`,
+`PARTIAL` — and it is on every result object. `category` is **not**: it
+sub-classifies a `PARTIAL` (`LIMITS-EXCEEDED`, `UNSCANNABLE`,
+`PASSWORD-PROTECTED`) and is absent everywhere else, so filtering a pipeline on
+it returns nothing at all rather than failing. Select on `status`:
+
+```sh
+exav --json /data | jq 'select(.status=="PARTIAL")'          # not fully examined
+exav --json /data | jq 'select(.status|test("FOUND|PARTIAL"))'  # everything unclean
 ```
 
 ### Verbose findings
@@ -113,19 +128,31 @@ exav --all-matches /data
 Include/exclude by path regex — repeatable, matching `clamscan`'s semantics:
 
 ```sh
-exav /data --exclude '\.log$' --exclude-dir '/node_modules/' --include '\.exe$'
+exav /data --exclude '\.log$' --exclude-dir 'node_modules' --include '\.exe$'
 ```
+
+`--exclude-dir` matches a **directory's own path**, which has no trailing
+separator — so `node_modules` skips the directory, while `/node_modules/` skips
+only what is nested *below* it and lets files sitting directly inside through.
+The looser pattern is the one to write, or anchor it explicitly as
+`/node_modules($|/)`.
 
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| `0` | Clean — everything fully scanned, no matches. |
-| `1` | At least one detection. |
-| `2` | Error, or a file that couldn't be fully scanned (`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`). |
+Each code is a status word, and the status is the last word on the result line:
 
-This is the [never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean): a file exav
-couldn't finish examining never counts as a pass. See
+| Code | Status | Meaning |
+|---|---|---|
+| `0` | `OK` | Clean — everything fully scanned, no matches. |
+| `1` | `FOUND` | At least one detection. |
+| `2` | `ERROR` | exav could not do its job — an unreadable path, a database that would not load. |
+| `3` | `PARTIAL` | A file couldn't be fully examined: `LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`. |
+
+`3` is the [never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean)
+made visible: a file exav couldn't finish examining never counts as a pass, and
+it is kept apart from `2` so "the scanner broke" and "this object needs a
+decision" are not one signal. [`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes)
+folds `3` into any of the others. See
 [Verdicts & exit codes](/reference/verdicts/) for the full table.
 
 ## Encrypted archives

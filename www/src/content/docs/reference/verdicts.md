@@ -8,27 +8,28 @@ Every scanned file resolves to exactly one verdict. Each maps to a `clamscan`/
 the contract behind the
 [never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean).
 
-## Read exit code 2 as "look at this", not "the scanner broke"
+## Read exit code 3 as "look at this", not "the scanner broke"
 
 This is the first thing to know, and the thing most likely to be got wrong by a
 script migrating from `clamscan`.
 
-Exit code **2 does not mean exav failed.** It means exav declined to call a file
-clean because it could not fully scan it — the file was encrypted, or hit a
+Exit code **3 does not mean exav failed.** It means exav declined to call a file
+clean because it could not fully examine it — the file was encrypted, or hit a
 budget, or used a codec with no decoder. The scan worked; the answer is "I could
 not see inside this."
 
-A pipeline that treats 2 as an infrastructure error will retry it, log it as
-noise, and eventually silence it. That is precisely backwards: **a file exav
-could not read is a better hiding place than one it read and cleared**, so 2 is
-the code that most deserves a human. Route it somewhere a person looks.
-
-`0` means scanned and clean. `1` means a detection. Everything else that could
-happen to a file lands on 2, with the verdict naming which.
+That is exactly why it is not `2`. **`2` is the code that means exav failed** —
+an unreadable path, a database that would not load — and it means the same thing
+in ClamAV. Sharing one code between "the scanner is broken" and "this object
+needs a decision" left an operator unable to tell them apart, which is how the
+second gets retried, logged as noise, and eventually silenced. That is precisely
+backwards: **a file exav could not read is a better hiding place than one it read
+and cleared**, so `3` is the code that most deserves a human. Route it somewhere
+a person looks.
 
 ## `UNSCANNABLE` and `LIMITS-EXCEEDED` answer different questions
 
-Both exit 2, so it is tempting to treat them alike. They point somewhere
+Both are `PARTIAL`, so it is tempting to treat them alike. They point somewhere
 different:
 
 * **`LIMITS-EXCEEDED`** — *raise a limit and try again.* The content is
@@ -39,32 +40,41 @@ different:
 
 ## The mapping
 
-| Verdict | Status tag | Category | Exit code contribution |
-|---|---|---|---|
-| Clean | `OK` | Clean | `0` |
-| Infected | `<Signature> FOUND` | Infected | `1` |
-| Limits exceeded | `LIMITS-EXCEEDED` | Not scanned | `2` |
-| Unscannable | `UNSCANNABLE` | Not scanned | `2` |
-| Password protected | `PASSWORD-PROTECTED` | Not scanned | `2` |
+Every result line ends in its **status**, and each status is one exit code:
 
-For an `Infected` verdict the status tag is the signature name followed by
-`FOUND` (e.g. `Win.Trojan.Agent-1234 FOUND`).
+| Verdict | Line | Status | Exit |
+|---|---|---|---|
+| Clean | `path: OK` | `OK` | `0` |
+| Infected | `path: <Signature> FOUND` | `FOUND` | `1` |
+| *(exav itself failed)* | `path: <message> ERROR` | `ERROR` | `2` |
+| Limits exceeded | `path: <reason> LIMITS-EXCEEDED PARTIAL` | `PARTIAL` | `3` |
+| Unscannable | `path: <reason> UNSCANNABLE PARTIAL` | `PARTIAL` | `3` |
+| Password protected | `path: <reason> PASSWORD-PROTECTED PARTIAL` | `PARTIAL` | `3` |
+
+One grammar throughout — `path: [reason ][CATEGORY ]STATUS` — with the status
+last, which is where `clamscan` puts `OK` and `FOUND` and therefore where
+anything reading these lines looks. The three **categories** sub-classify a
+`PARTIAL`; the other statuses have nothing to sub-classify.
 
 ## Process exit code
 
 The overall exit code across all scanned inputs follows this precedence:
 
-1. **`1`** — if any file was `FOUND` (a detection dominates).
-2. **`2`** — otherwise, if any file hit an error **or** a "not scanned" verdict
-   (`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`).
-3. **`0`** — otherwise (everything fully scanned and clean).
+1. **`1`** — any file was `FOUND`. A detection is conclusive: that a limit was
+   also hit, or another file failed to open, does not make the match less true.
+2. **`2`** — otherwise, any file produced an error. An error casts doubt on the
+   whole run, where a partial is a fact about one object.
+3. **`3`** — otherwise, any file came back `PARTIAL`.
+4. **`0`** — otherwise: everything fully scanned and clean.
 
-This matches `clamscan`'s `0`/`1`/`2` scheme, with one deliberate difference:
-`clamscan` returns `OK` / exit `0` for a file it couldn't fully scan, where exav
-returns a "not scanned" verdict and exit `2`. See
+`0`/`1`/`2` mean what they mean in `clamscan`. `3` is the addition, and it is the
+one deliberate difference: `clamscan` returns `OK` / exit `0` for a file it could
+not fully scan. [`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes)
+folds `3` into any of the other three when a caller wants that — including
+`--partial-as ok`, which is what `--clamav-compat` installs. See
 [Migrating from ClamAV](/guides/migrating-from-clamav/).
 
-## What each "not scanned" verdict means
+## What each `PARTIAL` category means
 
 - **`LIMITS-EXCEEDED`** — a resource or internal-work limit stopped the scan
   before it completed: `--max-input-bytes`, the extracted-bytes / scan-reach
@@ -78,10 +88,36 @@ returns a "not scanned" verdict and exit `2`. See
   re-scan with `--passwords` (repeatable) or a `.pwdb` database to decrypt and
   scan inside.
 
-## In the daemon and JSON output
+## On the clamd wire
 
-- The **daemon** renders a not-scanned verdict as `<TAG> (<reason>) ERROR` over
-  the wire; the exav client re-classifies those tags as "limits" (not hard
-  errors), so a daemon scan's summary and exit code match a local one-shot scan.
-- **`--json`** emits a `category` field (`clean` / `infected` / `limits` /
-  `unscannable` / `password-protected` / `error`) and the `status` tag per file.
+`clamd`'s vocabulary is closed: `OK`, `FOUND`, `ERROR`, and nothing else. A
+fourth word is not an extension — `clamdscan` 1.4.3 rewrites a status it does not
+recognise to `OK` and exits `0`, so putting `PARTIAL` on that wire would turn
+exav's fail-closed answer into a fail-open one at every existing client.
+
+So a `PARTIAL` travels as `ERROR`, keeping the same
+`path: <reason> <CATEGORY> ERROR` grammar as stdout. **The category is what tells
+it apart from a scan that actually failed**, which has none:
+
+```text
+big.bin: file size 3145728 exceeds max-scan-size 1048576; scanned first 1048576 bytes only LIMITS-EXCEEDED ERROR
+gone.bin: cannot open file ERROR
+```
+
+An exav client (`--connect`) reads the category back and reproduces the local
+exit code, so a daemon scan and a one-shot scan of the same file agree. A
+`clamdscan` client sees both as `ERROR` and exits `2` — a stricter answer than
+`clamscan`'s `0`, and the closest the protocol allows.
+
+`--partial-as error` drops the category, which is what makes it mean something
+here: the reply becomes an uncategorised `ERROR` and every client, exav's
+included, reads it as an operational failure.
+
+## In JSON
+
+Both `--json` and the daemon's `EXINSTREAM` emit the same three names:
+
+- **`status`** — `OK` / `FOUND` / `ERROR` / `PARTIAL`, the word the line ends with.
+- **`category`** — `LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`, present
+  only on a `PARTIAL`, because the other statuses have nothing to sub-classify.
+- **`reason`** — the explanatory string (`signature` instead, on a `FOUND`).

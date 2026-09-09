@@ -121,8 +121,11 @@ pub(crate) fn extract_lnk<R>(
         let take = needed.min(avail);
         let s = if unicode {
             let units: Vec<u16> = data[pos..pos + take]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
                 .collect();
             String::from_utf16_lossy(&units)
         } else {
@@ -194,9 +197,9 @@ mod tests {
     fn eicar_fixture_yields_eicar_string() {
         // Real EICAR-in-a-shortcut sample: the EICAR test string lives in the
         // Name field (ASCII, IsUnicode not set).
-        let blob = include_bytes!("../../tests/fixtures/lnk/eicar.lnk");
+        let blob = crate::unmask_fixture(include_bytes!("../../tests/fixtures/lnk/eicar.lnk.xor"));
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Lnk, blob, &mut budget).unwrap();
+        let entries = extract(Format::Lnk, &blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         let text = String::from_utf8_lossy(&entries[0].data);
         assert!(text.contains("X5O!P%@AP"), "EICAR string not extracted");
@@ -217,7 +220,7 @@ mod tests {
         ];
         for name in names {
             let path = format!("{}/tests/fixtures/lnk/{name}", env!("CARGO_MANIFEST_DIR"));
-            let Ok(blob) = std::fs::read(&path) else {
+            let Ok(blob) = crate::read_fixture(&path) else {
                 continue;
             };
             let mut budget = Budget::new(Limits::default());

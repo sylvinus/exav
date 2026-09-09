@@ -63,19 +63,22 @@ coverage. You fetch signatures yourself — that's the first step below.
 
 ## Understand the exit code
 
-exav uses the same scheme as `clamscan`:
+Each code is a status word, and the status is the last word on the result line:
 
-| Exit code | Meaning |
-|---|---|
-| `0` | Clean — every file was fully scanned and nothing matched. |
-| `1` | At least one detection (`FOUND`). |
-| `2` | Error, **or** a file couldn't be fully scanned (`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`). |
+| Exit | Status | Meaning |
+|---|---|---|
+| `0` | `OK` | Clean — every file was fully scanned and nothing matched. |
+| `1` | `FOUND` | At least one detection. |
+| `2` | `ERROR` | exav could not do its job: an unreadable path, a database that would not load. |
+| `3` | `PARTIAL` | exav worked, and something could not be fully examined — `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. |
 
 <Aside type="note">
-The exit-2-for-not-fully-scanned behavior is the one deliberate difference from
-`clamscan`, which would report `OK` and exit `0`. This is the
-[never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean) in action. A CI job
-should treat exit 2 as "could not fully scan" — which is *not* a pass.
+`3` is the deliberate difference from `clamscan`, which reports `OK` and exits
+`0` for a file it could not fully scan. This is the
+[never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean)
+in action: a CI job should treat `3` as "not a pass", and `2` still means what it
+means in ClamAV — the scanner itself failed. To fold `3` into another status, see
+[`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes).
 </Aside>
 
 ## Faster startup: build a database once

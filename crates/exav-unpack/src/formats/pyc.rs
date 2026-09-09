@@ -85,9 +85,9 @@ mod tests {
     fn eicar_pyc_body_contains_signature() {
         // A real CPython `.pyc` whose source embedded the EICAR string in a
         // string literal; the marshalled body carries that literal verbatim.
-        let data = include_bytes!("../../tests/fixtures/pyc/eicar.pyc");
+        let data = crate::unmask_fixture(include_bytes!("../../tests/fixtures/pyc/eicar.pyc.xor"));
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Pyc, data, &mut budget).unwrap();
+        let entries = extract(Format::Pyc, &data, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "pyc-code");
         assert!(

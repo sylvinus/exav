@@ -172,8 +172,8 @@ impl Gost40 {
 
     fn bytes_to_u32s(bytes: &[u8; 32]) -> [u32; 8] {
         let mut words = [0u32; 8];
-        for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-            words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            words[i] = u32::from_le_bytes(*chunk);
         }
         words
     }

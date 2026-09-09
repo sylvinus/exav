@@ -331,6 +331,10 @@ fn markup_cltype(ft: FileType, data: &[u8]) -> Option<engine::ClType> {
 /// The container type a *text carrier* lends to content decoded out of it (a
 /// `data:` URI payload, an embedded base64 blob). Only the carriers exav can
 /// name; `None` means the caller keeps whatever container it already had.
+///
+/// Its one caller sits behind `base64scan`, so this is dead in a build without
+/// it — a configuration that decodes nothing out of a carrier in the first place.
+#[cfg_attr(not(feature = "base64scan"), allow(dead_code))]
 fn carrier_cltype(ft: FileType) -> Option<engine::ClType> {
     use engine::ClType;
     Some(match ft {
@@ -469,13 +473,20 @@ pub enum Verdict {
 /// cost of the break is small and lands on the people who caused it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictCategory {
-    /// Fully scanned, nothing found. Exit contribution: `0`.
+    /// Fully scanned, nothing found. Reported `OK`, exit `0`.
     Clean,
-    /// A signature matched. Exit contribution: `1`.
+    /// A signature matched. Reported `FOUND`, exit `1`.
     Infected,
-    /// Could not be fully examined (limit/undecodable/encrypted) — never a
-    /// silent pass. Exit contribution: `2`.
-    NotScanned,
+    /// Work happened and stopped short of the end: a budget ran out, a
+    /// container would not decode, or the content is encrypted. Reported
+    /// `PARTIAL` under one of the three categories
+    /// ([`Verdict::status_tag`]), exit `3` — never a silent pass.
+    ///
+    /// Distinct from an *error*, which is exav failing to do its job at all
+    /// (an unreadable path, a database that would not load) and exits `2`.
+    /// A caller needs to tell "the scanner is broken" from "this object needs
+    /// a decision", so they do not share a code.
+    Partial,
 }
 
 impl Verdict {
@@ -486,7 +497,7 @@ impl Verdict {
             Verdict::Infected { .. } => VerdictCategory::Infected,
             Verdict::LimitsExceeded { .. }
             | Verdict::Unscannable { .. }
-            | Verdict::PasswordProtected { .. } => VerdictCategory::NotScanned,
+            | Verdict::PasswordProtected { .. } => VerdictCategory::Partial,
         }
     }
 
@@ -504,7 +515,7 @@ impl Verdict {
     }
 
     /// The human-readable detail: the signature name for `Infected`, the reason
-    /// string for the not-scanned verdicts, `None` for `Clean`.
+    /// string for the partial verdicts, `None` for `Clean`.
     pub fn detail(&self) -> Option<&str> {
         match self {
             Verdict::Clean => None,
@@ -931,7 +942,7 @@ impl Scanner {
         // EICAR goes in the engine (used by in-memory scans) and in the
         // streaming PatternSet (used by stdin/pipe scans).
         let mut eb = engine::EngineBuilder::new();
-        eb.add_literal("Exav.Test.EICAR", patterns::EICAR);
+        eb.add_literal("Exav.Test.EICAR", patterns::eicar());
         Self {
             patterns: PatternSet::builtin(),
             engine: eb.build(),
@@ -1081,12 +1092,7 @@ pub fn scan_path(db: &Scanner, path: &Path, opts: &ScanOptions) -> io::Result<Sc
                     Vec::new(),
                 ));
             }
-            return Ok(ScanReport::limits(
-                format!(
-                    "file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"
-                ),
-                Vec::new(),
-            ));
+            return Ok(max_file_size_report(size, max, opts));
         }
     }
 
@@ -1321,12 +1327,7 @@ pub fn scan_seekable<R: Read + Seek>(
                     Vec::new(),
                 ));
             }
-            return Ok(ScanReport::limits(
-                format!(
-                    "file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"
-                ),
-                Vec::new(),
-            ));
+            return Ok(max_file_size_report(size, max, opts));
         }
     }
     let mut prefix = [0u8; 4096];
@@ -1436,6 +1437,27 @@ fn limits_alert_name(kind: unpack::LimitKind) -> Option<&'static str> {
         // one budget's name on another budget's stop.
         _ => None,
     }
+}
+
+/// The report for a top-level file larger than `max_scan_size`.
+///
+/// This is ClamAV's `MaxFileSize` condition, so under `--partial-as found` it
+/// reports under ClamAV's own name for it — `Heuristics.Limits.Exceeded.*`,
+/// which a ClamAV-shaped pipeline matches, rather than a synthesised
+/// `Heuristics.Exav.*` that nothing does. Both entry points that enforce the
+/// ceiling come through here, so the two cannot name one condition two ways,
+/// and the kind is passed as a type so the name is looked up and never guessed.
+fn max_file_size_report(size: u64, max: u64, opts: &ScanOptions) -> ScanReport {
+    if opts.alert_exceeds_max {
+        if let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize) {
+            match_loc_record();
+            return ScanReport::infected(name.to_string(), 0, Method::Heuristic, Vec::new());
+        }
+    }
+    ScanReport::limits(
+        format!("file size {size} exceeds max-scan-size {max}; scanned first {max} bytes only"),
+        Vec::new(),
+    )
 }
 
 /// Turn a budget stop into an outcome, honouring `--alert-exceeds-max`.
@@ -2370,7 +2392,7 @@ fn analyze_all_raw(
 }
 
 /// Every detection on `data`, as [`analyze_all_with_outcome`], discarding the
-/// not-scanned outcome.
+/// partial outcome.
 ///
 /// Callers that report to a user want [`analyze_all_with_outcome`]: dropping the
 /// outcome turns "this file was not fully scanned" into silence, and an empty
@@ -2380,7 +2402,7 @@ pub fn analyze_all(db: &Scanner, data: &[u8], opts: &ScanOptions) -> Vec<(String
     analyze_all_with_outcome(db, data, opts).0
 }
 
-/// The not-scanned outcome of an all-match scan, when there is one.
+/// The partial outcome of an all-match scan, when there is one.
 ///
 /// All-match and a normal scan may legitimately differ in HOW MANY signatures
 /// they list. They must never differ on whether the file was fully scanned —
@@ -4006,7 +4028,7 @@ fn stream_core<R: Read>(db: &Scanner, reader: R) -> io::Result<Option<CoreHit>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use patterns::EICAR;
+    use patterns::eicar;
     use std::io::Cursor;
 
     #[test]
@@ -4092,7 +4114,7 @@ mod tests {
                 Verdict::LimitsExceeded {
                     reason: "too big".into(),
                 },
-                VerdictCategory::NotScanned,
+                VerdictCategory::Partial,
                 "LIMITS-EXCEEDED",
                 Some("too big"),
             ),
@@ -4100,7 +4122,7 @@ mod tests {
                 Verdict::Unscannable {
                     reason: "rar ppmd".into(),
                 },
-                VerdictCategory::NotScanned,
+                VerdictCategory::Partial,
                 "UNSCANNABLE",
                 Some("rar ppmd"),
             ),
@@ -4108,7 +4130,7 @@ mod tests {
                 Verdict::PasswordProtected {
                     reason: "encrypted".into(),
                 },
-                VerdictCategory::NotScanned,
+                VerdictCategory::Partial,
                 "PASSWORD-PROTECTED",
                 Some("encrypted"),
             ),
@@ -4167,7 +4189,7 @@ mod tests {
     #[test]
     fn detects_eicar_pattern() {
         let db = Scanner::builtin();
-        let r = scan_stream(&db, Cursor::new(EICAR.to_vec())).unwrap();
+        let r = scan_stream(&db, Cursor::new(eicar().to_vec())).unwrap();
         assert!(matches!(
             r.verdict,
             Verdict::Infected {
@@ -4368,7 +4390,7 @@ mod tests {
     fn detects_across_buffer_boundary() {
         let db = Scanner::builtin();
         let mut data = vec![b'A'; 3_000_000];
-        data.extend_from_slice(EICAR);
+        data.extend_from_slice(eicar());
         data.extend(std::iter::repeat_n(b'B', 3_000_000));
         let r = scan_stream(&db, Cursor::new(data)).unwrap();
         match r.verdict {
@@ -4383,7 +4405,7 @@ mod tests {
         use flate2::Compression;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
-        e.write_all(EICAR).unwrap();
+        e.write_all(eicar()).unwrap();
         let blob = e.finish().unwrap();
         let db = Scanner::builtin();
         let r = analyze(&db, &blob, &ScanOptions::default());
@@ -4446,7 +4468,7 @@ mod tests {
     ///
     /// The bytes it failed to deliver still exist — this is not truncation,
     /// where the content really is absent and a clean answer is honest — so
-    /// the only truthful outcomes are a detection, a not-scanned verdict, or an
+    /// the only truthful outcomes are a detection, a partial verdict, or an
     /// error to the caller.
     #[test]
     fn a_source_that_fails_on_re_read_is_never_reported_clean() {
@@ -4512,7 +4534,7 @@ mod tests {
         use flate2::Compression;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
-        e.write_all(EICAR).unwrap();
+        e.write_all(eicar()).unwrap();
         let blob = e.finish().unwrap();
         let f = write_temp(&blob);
         let db = Scanner::builtin();
@@ -4546,9 +4568,9 @@ mod tests {
         h.set_cksum();
         ar.append_data(&mut h, "pad.bin", &pad[..]).unwrap();
         let mut h2 = tar::Header::new_gnu();
-        h2.set_size(EICAR.len() as u64);
+        h2.set_size(eicar().len() as u64);
         h2.set_cksum();
-        ar.append_data(&mut h2, "evil.com", EICAR).unwrap();
+        ar.append_data(&mut h2, "evil.com", eicar()).unwrap();
         let blob = ar.into_inner().unwrap();
         let f = write_temp(&blob);
         let db = Scanner::builtin();
@@ -4610,7 +4632,7 @@ mod tests {
         // gzip whose decompressed content (padding + EICAR at the end) far exceeds
         // the tiny per-member buffer cap set below.
         let mut payload = vec![b'Z'; 4096];
-        payload.extend_from_slice(EICAR);
+        payload.extend_from_slice(eicar());
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
         e.write_all(&payload).unwrap();
         let gz = e.finish().unwrap();
@@ -4646,7 +4668,7 @@ mod tests {
     )]
     fn oversize_flat_text_with_signature_is_found() {
         let mut data = vec![b'A'; 100];
-        data.extend_from_slice(EICAR);
+        data.extend_from_slice(eicar());
         let f = write_temp(&data);
         let db = Scanner::builtin();
         let opts = ScanOptions {
@@ -4696,7 +4718,7 @@ mod tests {
     #[test]
     #[cfg(feature = "all-formats")]
     fn scan_seekable_finds_eicar_in_zip() {
-        let blob = zip_bytes(&[("a.txt", b"hello", false), ("evil", EICAR, false)]);
+        let blob = zip_bytes(&[("a.txt", b"hello", false), ("evil", eicar(), false)]);
         let size = blob.len() as u64;
         let db = Scanner::builtin();
         let r = scan_seekable(&db, Cursor::new(blob), size, &ScanOptions::default()).unwrap();
@@ -4777,7 +4799,7 @@ mod tests {
         use std::thread;
 
         let big: Vec<u8> = (0..1_000_000u32).map(|i| (i as u8) ^ 0x5a).collect();
-        let blob = zip_bytes(&[("evil", EICAR, false), ("big.bin", &big, true)]);
+        let blob = zip_bytes(&[("evil", eicar(), false), ("big.bin", &big, true)]);
         let total = blob.len();
         assert!(
             total > 900_000,

@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Builds the `exav` binary (from exav-cli), cross-compiling musl targets
+      # Builds the `exav` binary, cross-compiling musl targets
       # via `cross` as needed, archives it as `exav-<target>.tar.gz`/`.zip`, and
       # uploads it to the Release for the pushed tag.
       - uses: taiki-e/upload-rust-binary-action@v1

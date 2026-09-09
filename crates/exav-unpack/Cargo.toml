@@ -7,9 +7,16 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
+# Its own keywords rather than the workspace's antivirus set: this is a general
+# archive-extraction library, and someone looking for one is not searching for
+# "clamav".
+keywords = ["archive", "extract", "unzip", "decompression", "zip"]
 categories = ["filesystem", "compression", "parser-implementations"]
 readme = "README.md"
+# The test corpus is 9.4 MB of crafted archives — the bulk of this crate on
+# disk, and of no use to anything that depends on it. Every `cargo install exav`
+# would otherwise download it. Clone the repository to run the suites.
+exclude = ["tests/fixtures/**", "test_data/**"]
 
 # The extractor CLI ships with the library rather than as a separate package.
 # It is a thin shell over the public API and needs nothing the library does not
@@ -31,7 +38,7 @@ memchr = "2"
 # it is useful on its own and because it is the only thing that needs a CPU
 # decoder: keeping it out of here means a build without `pepack` never compiles
 # `iced-x86` at all.
-exav-pe-emu = { version = "0.1.0", path = "../exav-pe-emu", optional = true }
+exav-pe-emu = { version = "0.0.1", path = "../exav-pe-emu", optional = true }
 
 # --- Per-format optional deps. Each is pulled in only by the feature(s) below
 # that need it; a dep shared by several formats (e.g. `flate2`) is compiled if
@@ -260,6 +267,21 @@ required-features = ["rar"]
 [[example]]
 name = "rar5_check"
 required-features = ["rar"]
+
+# Drives the PE-packer emulator, which `emulate_pe` only exposes behind
+# `pe-emu`. Undeclared it would be built by every feature pass, so the
+# minimal-build pass would fail to compile on a diagnostic example.
+[[example]]
+name = "pepack_emu"
+required-features = ["pe-emu"]
+
+# The CLI suite drives `list`/`extract` over ZIP fixtures, so without `zip`
+# every archive it builds lists zero members and the assertions fail on a build
+# that is behaving correctly. The usage-error cases it also covers are format-
+# independent, but they run in every other feature pass.
+[[test]]
+name = "cli"
+required-features = ["zip"]
 
 [dev-dependencies]
 # Used only in tests to compare decoder output against external-oracle digests.

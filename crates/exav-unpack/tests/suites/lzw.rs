@@ -19,7 +19,7 @@ use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/lzw/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn emitted(blob: &[u8]) -> Vec<Entry> {
@@ -105,12 +105,12 @@ fn a_stream_with_table_resets_matches_reference() {
 
 #[test]
 fn a_payload_inside_a_real_z_is_reachable() {
-    const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    let eicar = exav_unpack::eicar();
     for bits in ["b16", "b12"] {
         let e = emitted(&fixture(&format!("eicar.{bits}.Z")));
         assert!(
             e.iter()
-                .any(|x| x.data.windows(EICAR.len()).any(|w| w == EICAR)),
+                .any(|x| x.data.windows(eicar.len()).any(|w| w == eicar)),
             "the payload inside a real .Z must be reachable ({bits})"
         );
     }

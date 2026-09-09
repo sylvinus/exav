@@ -57,7 +57,7 @@ freshclam
 exav -d /var/lib/clamav /data
 ```
 
-`-d` / `--sigs-dir` **loads a directory recursively** (hidden `.`-prefixed
+`-d` / `--sig-dir` **loads a directory recursively** (hidden `.`-prefixed
 sub-directories are skipped), so a nested layout is picked up in full.
 
 ## Formats exav loads
@@ -96,13 +96,19 @@ silently ignored — see
 Beyond the official database, a range of **third-party and unofficial signature
 feeds** exist — community YARA rulesets, commercial vendor feeds, and add-on
 signature sets. exav loads any of them the same way: drop the files (or a nested
-directory of them) into your signature directory and `-d`/`--sigs-dir` picks them up
+directory of them) into your signature directory and `-d`/`--sig-dir` picks them up
 recursively.
 
 - Prefer **permissively-licensed** sets where you intend to redistribute them.
 - Several third-party/commercial feeds are distributed through updater tools that
   lay signatures out in a nested directory — exav's recursive load handles that
   layout unchanged.
+- **A database is recognised by its extension**, not its contents: `.cvd`,
+  `.cld`, `.ndb`, `.hdb`, `.hsb`, `.ldb`, `.yar`, `.ign2`, `.pwdb` and the rest of
+  the ClamAV set. Anything else in the directory is passed over without being
+  read, which is what lets `.cdiff`, `.sign`, `.info` and updater state files live
+  there safely. A signature file saved under some other name is skipped just as
+  quietly, so rename it rather than wondering why it never matched.
 
 ## Built-in updater (`--auto-update`)
 
@@ -114,6 +120,12 @@ a one-shot scan that should fetch before it scans; with **no** `--listen` and no
 paths it is an updater and nothing else. See the [Docker guide](/guides/docker/), the
 [CLI reference](/reference/cli/#signature-lifecycle) and
 [Configuration](/reference/configuration/).
+
+Each source is saved under the filename its **URL ends in**, so the URL has to
+name the file it serves: `https://mirror/daily.cvd` works, while a CGI-style
+endpoint like `https://feeds/get.php?db=daily` saves as `get.php` — not an
+extension the loader routes. exav says so at startup rather than fetching it
+every interval and loading nothing.
 
 <Aside type="caution">
 The built-in updater does a plain HTTPS fetch with **no signature verification** —

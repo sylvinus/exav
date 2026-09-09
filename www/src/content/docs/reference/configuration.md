@@ -31,7 +31,7 @@ front.
 |---|---|
 | `--listen` | `EXAV_LISTEN` |
 | `--max-input-bytes` | `EXAV_MAX_INPUT_BYTES` |
-| `--not-scanned` | `EXAV_NOT_SCANNED` |
+| `--partial-as` | `EXAV_PARTIAL_AS` |
 | `--icap-max-requests` | `EXAV_ICAP_MAX_REQUESTS` |
 
 That holds for all 59 of them, and `exav --help` prints the `[env: …]` line under
@@ -40,23 +40,27 @@ covers what does *not* live in a flag, and the engine budgets behind the limits.
 
 ## What lives in the address, not in a flag
 
-Two settings ride on a `--listen` value's `?key=value` tail, because each is a
-property of *that listener* rather than of the run:
+Some settings belong to *one listener* rather than to the run, so they ride on
+its `--listen` address. An ICAP service is the URL path; the rest are a
+`?key=value` tail:
 
-| Option | Default | Meaning |
+| On the address | Default | Meaning |
 |---|---|---|
-| `mode=660` | `0600` | Permission bits for a Unix socket. Owner-only unless widened, because every user the mode admits can submit scans and read the verdicts. |
-| `max-connections=200` | `128` clamd, `100` ICAP | Concurrent connections this listener accepts. ICAP also advertises it as `Max-Connections`. Bounds the clamd listener only under `--workers threads`; the prefork pool bounds concurrency by its worker count. |
+| `/avscan` *(the path)* | `avscan`, `srv_clamav`, `virus_scan` | The ICAP service to answer on — the path of the URL a proxy is already configured with. Naming one replaces the default set. |
+| `?service=a&service=b` | — | Several ICAP services. Repeat the key: a comma separates *addresses*, not names, which is why the key is singular. |
+| `?mode=660` | `0600` | Permission bits for a Unix socket. Owner-only unless widened, because every user the mode admits can submit scans and read the verdicts. |
+| `?max-connections=200` | `128` clamd, `100` ICAP | Concurrent connections this listener accepts. ICAP also advertises it as `Max-Connections`. Bounds the clamd listener only under `--workers threads`; the prefork pool bounds concurrency by its worker count. |
 
 ```sh
 exav --listen 'clamd:///run/exav.sock?mode=660' \
-     --listen 'icap://0.0.0.0:1344?max-connections=200'
+     --listen 'icap://0.0.0.0:1344/avscan?max-connections=200'
 ```
 
-A flag for either would have to say *which* listener it meant — a socket mode
-applied to a `host:port` means nothing, and a connection cap has to pick a
-protocol. On the address there is exactly one thing it can attach to, so there is
-nothing to cross-check and nothing to get wrong.
+A flag for any of these would have to say *which* listener it meant — a socket
+mode applied to a `host:port` means nothing, a connection cap has to pick a
+protocol, and a service name exists for only one of the two. On the address there
+is exactly one thing each can attach to, so there is nothing to cross-check and
+nothing to get wrong.
 
 An unknown option is an error rather than an ignored word: a setting that parses
 and does nothing is one an operator believes is in force.
@@ -94,7 +98,7 @@ into a **memory** axis and a **CPU/time** axis:
 | `--max-extracted-bytes` | `deep_analysis_max` + `max_extracted_bytes` | data-scanned budget | 256M / 1G (the flag sets both to one value) |
 | `--max-object-bytes` | `max_buffer_bytes` (+ `deep_analysis_max`) | largest **single** materialized object — one buffer, of the several live at once | 256M |
 | `--max-matcher-bytes` | `max_scanned_bytes` | **CPU/time** — cumulative bytes fed to the matcher | 10G |
-| `--max-depth` | `max_recursion` | nesting depth | 16 |
+| `--max-unpack-depth` | `max_recursion` | nesting depth | 16 |
 | `--max-members` | `max_members` | members across the whole recursive walk | 100000 |
 
 Key distinction: raising `--max-matcher-bytes` lets exav fully scan multi-gigabyte
@@ -133,11 +137,11 @@ entirely; `0` on the two `--max-` flags means "no ceiling", not "none allowed".
 
 | CLI flag | ScanOptions field | Default |
 |---|---|---|
-| `--base64 off` | `decode_base64` | on |
+| `--decode base64` / `--no-decode base64` | `decode_base64` | on |
 | `--detect heuristics` | `heuristics` | off |
 | `--detect macros` / `phishing` / `broken` / `broken-media` / `packed` / `partition-intersection` | matching `alert_*` fields | off |
 | `--detect pua` | PUA databases loaded, `PUA.*` kept | off |
-| `--not-scanned …=alert` | `alert_encrypted` / `alert_exceeds_max` | block |
+| `--partial-as …=found` | `alert_encrypted` / `alert_exceeds_max` | partial |
 | `--clamav-compat` | `restrict_extractors` + `unofficial_suffix` + `clamav_compat` | off (full reach) |
 | — (always on, FP-safe) | `clamav_heuristics` (imphash + PDF obfuscation) | on |
 
@@ -145,7 +149,7 @@ The ClamAV-parity heuristic subset (`clamav_heuristics`) is on by default and ca
 only be turned off through the library, not the CLI — so an out-of-the-box scan
 already matches ClamAV's default detection surface.
 
-Two of the engine's `alert_*` fields are reached through `--not-scanned`
+Two of the engine's `alert_*` fields are reached through `--partial-as`
 rather than `--detect`, because they answer a verdict question rather than a
 detection one: `alert` turns "could not fully examine this" into a detection
 under ClamAV's own `Heuristics.Encrypted.*` / `Heuristics.Limits.*` names.

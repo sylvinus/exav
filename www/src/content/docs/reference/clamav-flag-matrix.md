@@ -55,8 +55,9 @@ row means the old spelling is refused and the error names what exav calls it.
 bare booleans: `--all-matches` is accepted, `--all-matches=yes` is not. Strip
 the value when translating a command line, and note that the `=no` form has no
 exav equivalent at all — a switch is on when given and off when omitted.
-`--base64 on|off` is the one exception, and it takes a value precisely so an
-explicit choice can beat the `--clamav-compat` preset.
+`--base64` / `--no-base64` is the one pair, because it is on by default and an
+explicit choice has to be able to beat the `--clamav-compat` preset in both
+directions.
 
 ## `clamscan`
 
@@ -67,7 +68,7 @@ Grouped in the order `clamscan --help` prints them.
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
 | `--help`, `-h` | Show help | same spelling | same | |
-| `--version`, `-V` | Print version | same spelling | same | exav reports a `ClamAV <version>` string so `clamscan`-parsing tooling recognises the engine. |
+| `--version`, `-V` | Print version | same spelling | differs | Prints `exav <version>`, naming what is actually running. The `ClamAV <version>` string tooling looks for is what the **daemon** answers to the wire `VERSION` command, so `clamdtop` and clamd client libraries see the engine they expect; a script grepping `clamscan --version` for `ClamAV` does not. |
 | `--verbose`, `-v` | Be verbose | same spelling | differs | exav prints per-file informational findings (type, entropy, imphash, ML score) rather than progress chatter. |
 | `--archive-verbose`, `-a` | Show filenames inside archives | — | absent | Member paths appear in the match location on a detection. |
 | `--debug` | libclamav debug messages | — | absent | |
@@ -91,7 +92,7 @@ Grouped in the order `clamscan --help` prints them.
 
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
-| `--database=FILE/DIR`, `-d` | Load database from FILE or DIR | same spelling | same | Also loads a prebuilt `.exavdb`. Distinct from `--sigs-dir`, which names the directory signatures *live in* and is written to. |
+| `--database=FILE/DIR`, `-d` | Load database from FILE or DIR | same spelling | same | Also loads a prebuilt `.exavdb`. Distinct from `--sig-dir`, which names the directory signatures *live in* and is written to. |
 | `--official-db-only[=yes/no]` | Only load official signatures | — | absent | |
 | `--fail-if-cvd-older-than=days` | Nonzero exit if database is stale | — | absent | |
 | `--log=FILE`, `-l` | Save scan report to FILE | `--log` | same | The long spelling matches; **`-l` is absent**. |
@@ -115,7 +116,7 @@ Grouped in the order `clamscan --help` prints them.
 
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
-| `--remove[=yes/no]` | Delete infected files | — | absent | [Out of scope by design](/project/comparison-with-clamav/#out-of-scope-for-now): exav reports, your script acts. Exit codes are `clamscan`-compatible. |
+| `--remove[=yes/no]` | Delete infected files | — | absent | [Out of scope by design](/project/comparison-with-clamav/#out-of-scope-for-now): exav reports, your script acts. Read the exit code. |
 | `--move=DIRECTORY` | Move infected files | — | absent | Same. |
 | `--copy=DIRECTORY` | Copy infected files | — | absent | Same. |
 
@@ -174,7 +175,7 @@ command line fails and the change is visible rather than silent.
 ### Alerts
 
 ClamAV has a boolean per condition. exav has two dials: **`--detect`** says what
-to look for, and **`--not-scanned`** says what becomes of an object it could
+to look for, and **`--partial-as`** says what becomes of an object it could
 not fully examine. A boolean each cannot express "all of them" without the reader
 knowing the whole set, and spreading one condition over several switches lets a
 command line ask for two answers at once.
@@ -183,11 +184,11 @@ command line ask for two answers at once.
 |---|---|---|---|---|
 | `--alert-broken[=yes/no]` | Alert on broken PE/ELF | `--detect broken` | renamed | exav also covers Mach-O. |
 | `--alert-broken-media[=yes/no]` | Alert on broken JPEG/TIFF/PNG/GIF | `--detect broken-media` | renamed | |
-| `--alert-encrypted[=yes/no]` | Alert on encrypted archives and documents | `--not-scanned password-protected=alert` | differs | exav reports an encrypted member as `PASSWORD-PROTECTED` **by default** (ClamAV returns a clean `OK`). `alert` converts that verdict into a `Heuristics.Encrypted.*` detection — a verdict question, which is why it is not under `--detect`. |
+| `--alert-encrypted[=yes/no]` | Alert on encrypted archives and documents | `--partial-as password-protected=found` | differs | exav reports an encrypted member as `PASSWORD-PROTECTED` **by default** (ClamAV returns a clean `OK`). `found` converts that verdict into a `Heuristics.Encrypted.*` detection — a verdict question, which is why it is not under `--detect`. |
 | `--alert-encrypted-archive[=yes/no]` | Alert on encrypted archives only | — | absent | The one policy covers archives and documents together. |
 | `--alert-encrypted-doc[=yes/no]` | Alert on encrypted documents only | — | absent | Same. |
 | `--alert-macros[=yes/no]` | Alert on VBA macros in OLE2 | `--detect macros` | renamed | exav also raises it for XLM and OOXML. |
-| `--alert-exceeds-max[=yes/no]` | Alert on files exceeding a limit | `--not-scanned limits-exceeded=alert` | differs | exav reports a limit stop as `LIMITS-EXCEEDED` (exit 2) **by default** rather than as clean. `alert` converts it into a `Heuristics.Limits.Exceeded.*` detection, which is the form a ClamAV-shaped pipeline expects. |
+| `--alert-exceeds-max[=yes/no]` | Alert on files exceeding a limit | `--partial-as limits-exceeded=found` | differs | exav reports a limit stop as `LIMITS-EXCEEDED` (status `PARTIAL`, exit 3) **by default** rather than as clean. `found` converts it into a `Heuristics.Limits.Exceeded.*` detection, which is the form a ClamAV-shaped pipeline expects. |
 | `--alert-phishing-ssl[=yes/no]` | Alert on SSL mismatches in email URLs | `--detect phishing` | renamed | Raises `Heuristics.Phishing.Email.SSL-Spoof` among others; there is no per-check switch. |
 | `--alert-phishing-cloak[=yes/no]` | Alert on cloaked URLs in email | `--detect phishing` | renamed | Same one detector. |
 | `--alert-partition-intersection[=yes/no]` | Alert on overlapping DMG partitions | `--detect partition-intersection` | renamed | exav also covers GPT, APM and MBR. |
@@ -202,7 +203,7 @@ command line ask for two answers at once.
 | `--max-filesize=#n` | Skip files larger than this | `--max-input-bytes` | renamed | exav's default is **no limit**; ClamAV's is 100M. `--clamav-compat` sets 100M. Over the limit exav reports `LIMITS-EXCEEDED`, never a clean `OK`. |
 | `--max-scansize=#n` | Max data scanned per container | `--max-extracted-bytes` | renamed | exav's defaults are 256M deep-analysis / 1G extracted total; ClamAV's is 400M. `--clamav-compat` sets 400M for both. |
 | `--max-files=#n` | Max files scanned per container | `--max-members` | renamed | exav's default is 100000 against ClamAV's 10000, because exav descends into nested archives ClamAV does not and so counts more members for the same file. `--clamav-compat` sets 10000. |
-| `--max-recursion=#n` | Max archive recursion depth | `--max-depth` | renamed | Different default too: exav 16, ClamAV 17. `--clamav-compat` sets 17. |
+| `--max-recursion=#n` | Max archive recursion depth | `--max-unpack-depth` | renamed | Different default too: exav 16, ClamAV 17. `--clamav-compat` sets 17. |
 | `--max-dir-recursion=#n` | Max directory recursion depth | — | absent | exav's directory walk has no depth cap. |
 | `--max-embeddedpe=#n` | Max size checked for an embedded PE | — | absent | exav applies its global budgets instead of a per-subsystem cap. |
 | `--max-htmlnormalize=#n` | Max HTML size to normalize | — | absent | Same. |
@@ -243,7 +244,7 @@ configuration is what you rewrite.
 | `--debug` | Enable debug mode | — | absent | |
 | `--config-file=FILE`, `-c` | Read configuration from FILE | — | absent | exav reads no configuration file. |
 | `--fail-if-cvd-older-than=days` | Nonzero exit on a stale database | — | absent | |
-| `--datadir=DIRECTORY` | Load signatures from DIRECTORY | `-d` / `--sigs-dir` | renamed | Different spelling, same job. `--sigs-dir` defaults to `/var/lib/exav`. |
+| `--datadir=DIRECTORY` | Load signatures from DIRECTORY | `-d` / `--sig-dir` | renamed | Different spelling, same job. `--sig-dir` defaults to `/var/lib/exav`. |
 | `--pid=FILE`, `-p` | Write the pid to FILE | — | absent | Use the supervisor's own pid tracking. |
 
 ### `clamd.conf` directives
@@ -297,7 +298,7 @@ nothing does.
 
 | Directive | What it does | exav equivalent | Notes |
 |---|---|---|---|
-| `DatabaseDirectory` | Where signatures live | `-d` / `--sigs-dir DIR` | |
+| `DatabaseDirectory` | Where signatures live | `-d` / `--sig-dir DIR` | |
 | `OfficialDatabaseOnly` | Load only official signatures | — | |
 | `FailIfCvdOlderThan` | Refuse a stale database | — | |
 | `DetectPUA` | Detect potentially unwanted applications | `--detect pua` | |
@@ -309,7 +310,7 @@ nothing does.
 |---|---|---|---|
 | `MaxScanSize` | Max data scanned per container | `--max-extracted-bytes` | |
 | `MaxFileSize` | Max file size scanned | `--max-input-bytes` | |
-| `MaxRecursion` | Max archive recursion | `--max-depth` | |
+| `MaxRecursion` | Max archive recursion | `--max-unpack-depth` | |
 | `MaxFiles` | Max files per container | `--max-members` | |
 | `MaxScanTime` | Max scan time | `--max-scan-secs` | Kernel-enforced per job (seconds, Unix), not an in-engine check. |
 | `MaxDirectoryRecursion` | Max directory depth | — | |
@@ -329,10 +330,10 @@ nothing does.
 | `HeuristicAlerts`, `HeuristicScanPrecedence` | Heuristic policy | — | |
 | `AlertBrokenExecutables` | Alert on broken PE/ELF | `--detect broken` | |
 | `AlertBrokenMedia` | Alert on broken graphics | `--detect broken-media` | |
-| `AlertEncrypted` | Alert on encrypted content | `--not-scanned password-protected=alert` | exav reports encrypted members as `PASSWORD-PROTECTED` without it. |
-| `AlertEncryptedArchive` / `AlertEncryptedDoc` | Split encrypted alerts | `--not-scanned password-protected=alert` | One policy covers both. |
+| `AlertEncrypted` | Alert on encrypted content | `--partial-as password-protected=found` | exav reports encrypted members as `PASSWORD-PROTECTED` without it. |
+| `AlertEncryptedArchive` / `AlertEncryptedDoc` | Split encrypted alerts | `--partial-as password-protected=found` | One policy covers both. |
 | `AlertOLE2Macros` | Alert on VBA macros | `--detect macros` | |
-| `AlertExceedsMax` | Alert on a limit stop | `--not-scanned limits-exceeded=alert` | exav reports `LIMITS-EXCEEDED` without it. |
+| `AlertExceedsMax` | Alert on a limit stop | `--partial-as limits-exceeded=found` | exav reports `LIMITS-EXCEEDED` without it. |
 | `AlertPartitionIntersection` | Alert on overlapping partitions | `--detect partition-intersection` | |
 | `AlertPhishingSSLMismatch` / `AlertPhishingCloak` | Phishing alert detail | `--detect phishing` | One detector, no per-check switch. |
 | `StructuredDataDetection` | Enable DLP detection | `--alert-credit-cards` / `--alert-ssns` | Giving a threshold enables it. |
@@ -366,13 +367,13 @@ exav acts as a daemon client when given `--connect` together with paths.
 | `clamdscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
 | `--help`, `-h` | Show help | same spelling | same | |
-| `--version`, `-V` | Print version | same spelling | same | Answered locally, not by the daemon. |
+| `--version`, `-V` | Print version | same spelling | differs | Answered locally — `exav <version>` — where `clamdscan` asks the daemon and prints its `ClamAV <version>` reply. Use `--ping` to check the daemon is there; the wire `VERSION` still answers the ClamAV string to anything that speaks the protocol. |
 | `--verbose`, `-v` | Be verbose | `--verbose` | differs | `clamdscan -v` prints nothing a plain run does not. exav's names the daemon that answered and the command sent per target (`  [daemon] unix:… ClamAV …`, `  [SCAN] /abs/path`). The informational findings `-v` adds to a local scan come from the scanner, and a daemon reply carries only a verdict. |
 | `--quiet` | Only output error messages | `--quiet` | differs | Same difference as the scanner: exav still prints detections. |
 | `--stdout` | Write to stdout instead of stderr | — | absent | exav already writes results to stdout. |
 | `--log=FILE`, `-l` | Save scan report to FILE | `--log` | same | Client replies are mirrored into the log. **`-l` is absent.** |
 | `--file-list=FILE`, `-f` | Scan files listed in FILE | `--files-from` | renamed | **`-f` is absent.** |
-| `--ping`, `-p A[:I]` | Ping the daemon until it answers | — | absent | The daemon answers `PING` on the wire; there is no client flag to send one. |
+| `--ping`, `-p A[:I]` | Ping the daemon until it answers | `--ping` | differs | One probe, not `A` attempts at `I` seconds — a supervisor or `HEALTHCHECK` already owns the retrying. With no `--connect` it probes the listener this configuration serves, so a container health check needs no address, and it speaks the protocol it finds there: `PING` on clamd, `OPTIONS` on ICAP. |
 | `--wait`, `-w` | Wait for the daemon to start | — | absent | |
 | `--remove` | Delete infected files | — | absent | Out of scope by design. |
 | `--move=DIRECTORY` | Move infected files | — | absent | Same. |
@@ -403,7 +404,7 @@ Two client-mode behaviours have no flag to name them:
 
 | exav flag | What it does |
 |---|---|
-| `--sigs-dir <DIR>` | The directory signatures live in and `--auto-update` writes to (default `/var/lib/exav`). |
+| `--sig-dir <DIR>` | The directory signatures live in and `--auto-update` writes to (default `/var/lib/exav`). |
 | `--sig-sources <URL\|FILE>` | Where `--auto-update` fetches from: exact URLs, mirror bases (trailing `/`), or a file of either — which may be a `freshclam.conf`. |
 | `--db-url <URL>` | A prebuilt `.exavdb` to pull and serve instead of signature files. |
 | `--build-db <FILE>` | Compile the loaded signatures into a prebuilt `.exavdb` and exit. |
@@ -422,9 +423,9 @@ Two client-mode behaviours have no flag to name them:
 | `--max-object-bytes <SIZE>` | The most memory a single materialized object may use. |
 | `--max-matcher-bytes <SIZE>` | Cumulative bytes fed to the matcher — a CPU bound, not a memory one. |
 | `--spill-dir`, `--spill-threshold-bytes`, `--max-spill-bytes`, `--max-total-spill-bytes` | Where a streamed object waits while it is scanned, and how much RAM and temp space it may take. |
-| `--not-scanned <POLICY>` | What becomes of an object exav could not fully examine: `block`, `alert` or `pass`, whole or per condition. |
+| `--partial-as <POLICY>` | What becomes of an object exav could not fully examine: `partial` (default), `ok`, `found` or `error`, whole or per condition (`limits-exceeded=`, `unscannable=`, `password-protected=`). |
 | `--clamav-compat` | Preset reproducing a stock ClamAV build's limits and extractor set, for differential testing. Reduces detection on purpose. |
-| `--base64 on\|off` | Decode base64-embedded executables in text and script files. On by default. |
+| `--decode <LIST>` / `--no-decode <LIST>` | Encodings to recover a payload from before scanning it: `base64` today, meaning both a run long enough to hold an executable and the base64 assets a markup document embeds. On by default, unlike `--detect`. |
 | `--detect packed` | Report `Heuristics.Packed.*`, naming the packer wrapping an executable exav could not unpack. |
 | `--detect phishing` | Report `Heuristics.Phishing.Email.*` for display-versus-href link spoofing. Covers the checks ClamAV splits across `--alert-phishing-ssl` and `--alert-phishing-cloak`. |
 | `--detect heuristics` | Enable exav-exclusive structural / fuzzy / ML analysis. |
@@ -456,11 +457,11 @@ The rows worth acting on before a migration, rather than reading past:
 - **Every parser toggle is absent.** A configuration that switched a parser off
   cannot be expressed. The command line fails rather than scanning more than the
   operator asked for, so this surfaces immediately.
-- **`--multiscan`, `--ping`, `--wait` and `--reload` are absent in the client.**
-  The daemon answers `MULTISCAN`, `PING` and `RELOAD` on the wire, so a clamd
-  client keeps working; it is exav's own client that has no flag to send them. A
-  script built around `clamdscan --ping 1` as a health check needs another way
-  to ask (`socat`, or the daemon's exit code on startup).
+- **`--multiscan`, `--wait` and `--reload` are absent in the client.** The daemon
+  answers `MULTISCAN` and `RELOAD` on the wire, so a clamd client keeps working;
+  it is exav's own client that has no flag to send them. `--ping` is the one of
+  this group exav does have, because a health check has to come from somewhere
+  and the container image's own `HEALTHCHECK` is built on it.
 - **`--send-as fd` over a TCP `--connect` is refused, not degraded.** `clamdscan`
   accepts the equivalent combination and silently sends the path instead, so the
   daemon scans whatever that path holds on its own host. exav stops and says to
@@ -481,5 +482,5 @@ from `clamd.conf.sample`, both from the upstream `rel/1.4` branch, since no
 `clamd` binary was installed to interrogate — every claim about a `clamd.conf`
 directive's own behaviour is read from those, not run.
 
-exav's side is read from the clap definitions in `exav-cli` and checked by
+exav's side is read from the clap definitions in the `exav` crate and checked by
 running the built binary against each flag.

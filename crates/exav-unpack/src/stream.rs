@@ -192,6 +192,9 @@ pub fn stream_members<R: Read + Seek, T>(
 
 /// Format dispatch for [`stream_members`]; kept separate so the panic-containment
 /// boundary wraps every streaming decoder uniformly.
+// Every arm of the match below is behind a format feature, so in a build with
+// none of them the body is `match fmt {}` and no parameter is read.
+#[allow(unused_variables, unused_mut)]
 fn dispatch_stream<R: Read + Seek, T>(
     fmt: Format,
     mut source: R,
@@ -1019,11 +1022,10 @@ fn stream_swf<R: Read + Seek, T>(
         let file_length = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
         let want = file_length.saturating_sub(8);
         let props = hdr[12];
-        // Attacker-controlled and allocated up front — bound it by what the
-        // stream will actually produce.
-        let dict_size = crate::bounded_dict(
+        let dict_size = swf_dict_size(
             u32::from_le_bytes([hdr[13], hdr[14], hdr[15], hdr[16]]),
             want,
+            budget.limits.max_buffer_bytes,
         );
         source
             .seek(io::SeekFrom::Start(17))
@@ -1038,10 +1040,26 @@ fn stream_swf<R: Read + Seek, T>(
     }
 }
 
+/// Pick the LZMA dictionary size for a `ZWS` movie. Both `declared` (the props
+/// header's dictionary field) and `want` (the movie header's own `FileLength`,
+/// less the 8-byte header) are attacker-controlled, and the dictionary is
+/// allocated up front — so `want` is no ceiling on its own: a movie declaring
+/// 4 GiB would buy itself a 4 GiB dictionary. `max_buffer` is the real bound;
+/// `want` only ever tightens it, since a dictionary larger than the bytes it
+/// will be used to look back into cannot be consulted.
+#[cfg(feature = "swf")]
+fn swf_dict_size(declared: u32, want: u64, max_buffer: u64) -> u32 {
+    crate::bounded_dict(declared, want.min(max_buffer))
+}
+
 /// Emit a set of pre-parsed stored (uncompressed) members `(name, offset, size)`
 /// by seeking to each and handing the visitor a bounded window — the shared tail
 /// of every STORED-OFFSET format (ar/cpio/machofat/…). No member data is ever
 /// buffered here.
+// Dead only in a build with none of the STORED-OFFSET formats (ar, cpio,
+// machofat, pyc, sfx, tnef, partition, iso, onenote); see
+// `crate::cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn stream_stored<R: Read + Seek, T>(
     source: &mut R,
     budget: &mut Budget,
@@ -1151,6 +1169,10 @@ mod tests {
     use std::io::Cursor;
 
     /// Collect every member `(name, bytes)` the streaming API yields for `blob`.
+    ///
+    /// Every test using it is behind a format feature, so it is dead in a build
+    /// with none of them compiled in.
+    #[allow(dead_code)]
     fn streamed_members(fmt: Format, blob: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut budget = Budget::new(Limits::default());
         let mut out: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1169,6 +1191,7 @@ mod tests {
     /// The streaming path must yield the same member `(name, bytes)` as the
     /// buffered [`crate::extract`] path — the correctness contract for every
     /// STORED-OFFSET conversion.
+    #[allow(dead_code)] // see `streamed_members`
     fn assert_stream_matches_buffered(fmt: Format, blob: &[u8]) {
         let mut budget = Budget::new(Limits::default());
         let buffered: Vec<(String, Vec<u8>)> = crate::extract(fmt, blob, &mut budget)
@@ -1181,6 +1204,33 @@ mod tests {
         assert_eq!(
             streamed, buffered,
             "{fmt:?}: streamed members differ from buffered"
+        );
+    }
+
+    // A `ZWS` header carries two attacker-chosen sizes, and the LZMA dictionary
+    // is allocated before a single byte is decoded. Neither may set that size.
+    #[cfg(feature = "swf")]
+    #[test]
+    fn swf_dictionary_is_bounded_by_the_buffer_limit() {
+        let max_buffer = Limits::default().max_buffer_bytes;
+        // The sizes from a movie that asked for a 2.7 GiB dictionary by declaring
+        // a ~4 GiB FileLength: neither number may be believed.
+        assert_eq!(
+            swf_dict_size(0xA1A1_C32B, 0xF04A_0957 - 8, max_buffer),
+            max_buffer as u32,
+            "a huge declared dictionary is clamped to the buffer limit"
+        );
+        // A movie small enough to be honest keeps its own (smaller) dictionary.
+        assert_eq!(
+            swf_dict_size(1 << 16, 1 << 20, max_buffer),
+            1 << 16,
+            "a dictionary under both bounds is used as-is"
+        );
+        // `want` still tightens: no point holding more history than output.
+        assert_eq!(
+            swf_dict_size(u32::MAX, 1 << 20, max_buffer),
+            1 << 20,
+            "the declared output bounds the dictionary when it is the smaller"
         );
     }
 

@@ -37,7 +37,7 @@ fn fixture() -> Vec<u8> {
         "{}/tests/fixtures/ntfs/fragmented.img.gz",
         env!("CARGO_MANIFEST_DIR")
     );
-    let raw = std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let raw = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
     let mut out = Vec::new();
     std::io::Read::read_to_end(
         &mut flate2::read::GzDecoder::new(std::io::Cursor::new(raw)),
@@ -163,14 +163,13 @@ fn runs_that_do_not_cover_the_declared_size_are_reported_not_truncated() {
 fn the_payload_is_absent_from_the_raw_volume() {
     // Guards the premise: if EICAR were visible in the sectors, a raw scan would
     // find it without reading the filesystem and none of this would be proven.
-    const EICAR_BYTES: &[u8] =
-        br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    let eicar_bytes = exav_unpack::eicar();
     let img = fixture();
     // `eicar.com` itself is stored in the clear, so search only for the copy
     // inside the deflated ZIP by checking it appears exactly once.
     let hits = img
-        .windows(EICAR_BYTES.len())
-        .filter(|w| *w == EICAR_BYTES)
+        .windows(eicar_bytes.len())
+        .filter(|w| *w == eicar_bytes)
         .count();
     assert_eq!(
         hits, 1,

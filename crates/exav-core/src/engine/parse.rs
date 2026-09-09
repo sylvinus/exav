@@ -545,7 +545,7 @@ fn decode_masked_hex(s: &str) -> Option<Vec<(u8, u8)>> {
     }
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in b.chunks_exact(2) {
+    for pair in b.as_chunks::<2>().0 {
         let (hi, lo) = (pair[0], pair[1]);
         let (hv, hm) = if hi == b'?' { (0, 0) } else { (nibble(hi)?, 0xf) };
         let (lv, lm) = if lo == b'?' { (0, 0) } else { (nibble(lo)?, 0xf) };
@@ -904,7 +904,7 @@ pub(super) fn decode_plain_hex(s: &str) -> Option<Vec<u8>> {
     }
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in b.chunks_exact(2) {
+    for pair in b.as_chunks::<2>().0 {
         out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     Some(out)

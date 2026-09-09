@@ -13,7 +13,9 @@
 
 use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 /// A bare local file header plus payload — no central directory, so every member
 /// is reached through the orphan scan.
@@ -38,7 +40,7 @@ fn lfh(name: &str, method: u16, flags: u16, payload: &[u8], declared_comp: Optio
 #[test]
 fn orphan_member_carrying_eicar_is_found() {
     let db = Scanner::builtin();
-    let blob = lfh("hidden.txt", 0, 0, EICAR, None);
+    let blob = lfh("hidden.txt", 0, 0, eicar(), None);
     match analyze(&db, &blob, &ScanOptions::default()).verdict {
         Verdict::Infected { signature, .. } => assert!(
             signature.to_ascii_uppercase().contains("EICAR"),
@@ -135,7 +137,11 @@ fn damaged_jar_with_hundreds_of_orphans_is_fully_scanned() {
     let db = Scanner::builtin();
     let mut blob = Vec::new();
     for i in 0..400 {
-        let payload: &[u8] = if i == 300 { EICAR } else { b"harmless filler" };
+        let payload: &[u8] = if i == 300 {
+            eicar()
+        } else {
+            b"harmless filler"
+        };
         blob.extend_from_slice(&lfh(&format!("pkg/cls{i}.class"), 0, 0, payload, None));
     }
     // No central directory and no EOCD at all, exactly as observed.

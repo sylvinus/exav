@@ -5,9 +5,42 @@
 exav is a malware scanner written in memory-safe Rust: a single static,
 MIT-licensed binary that scans files of any size in constant memory and runs a
 native YARA engine. It reads ClamAV's signature databases, answers the `clamd`
-and ICAP wire protocols, and matches `clamscan`'s CLI flags, output and exit
-codes — so it drops into an existing ClamAV setup without changing anything
-around it.
+and ICAP wire protocols, and prints `clamscan`'s output format — so it drops
+into an existing ClamAV setup without changing what talks to it.
+
+Two things it deliberately does **not** copy.
+
+The flags are exav's own, and a `clamscan` flag exav lacks stops the run rather
+than being ignored, so a migrated command line never scans under settings nobody
+asked for — the per-flag mapping is in the
+[flag matrix](https://exav.org/reference/clamav-flag-matrix/).
+
+And there is a fourth exit code. `clamscan` exits `2` only when something
+operational went wrong — a path it could not open, a missing database, a bad flag
+— so a file it *failed to scan* still exits `0`:
+
+```console
+$ clamscan --max-filesize=1M big.bin   # a 3 MB file with EICAR inside it
+big.bin: OK
+$ echo $?
+0
+```
+
+exav gives that class its own status and its own code. A password-protected
+archive, a truncated one, a file past a limit: `clamscan` calls all of them `OK`,
+and exav calls them `PARTIAL`.
+
+| Exit | Status | |
+|---|---|---|
+| `0` | `OK` | scanned, nothing found |
+| `1` | `FOUND` | a detection |
+| `2` | `ERROR` | exav could not do its job — **the same meaning as ClamAV's** |
+| `3` | `PARTIAL` | exav worked; this object could not be fully examined |
+
+`2` and `3` are separate because they ask different things of you: `2` says the
+scanner is broken, `3` says one object needs a decision. A CI job should read `3`
+as "not a pass". `--partial-as ok|found|error` folds it into any of the others,
+and `--clamav-compat` folds it to `ok`, which is what ClamAV answers.
 
 > **Status: beta.** exav is young. It is tested hard — differentially against
 > ClamAV on a large corpus, plus fuzzing — but a scanner earns trust from use,
@@ -23,20 +56,33 @@ licensing, and — the one the rest hangs on — **never a silent clean**: an
 incompletely-scanned file never gets `OK`. Anything that stops the scan early (a
 size/ratio/recursion limit, an unsupported codec, an encrypted member, or an
 internal work budget) surfaces as a distinct verdict (`LIMITS-EXCEEDED` /
-`UNSCANNABLE` / `PASSWORD-PROTECTED`, exit code 2), never swallowed into a silent
+`UNSCANNABLE` / `PASSWORD-PROTECTED` — status `PARTIAL`, exit code 3), never
+swallowed into a silent
 `OK` — closing the gap where a traditional engine reads a file over ~2 GB as
 **zero bytes** and still reports it clean.
 
 ## Install
 
-Build from source with a Rust toolchain. **exav needs 1.91 or newer**, which is
-recent enough that a distribution-packaged Rust will often be too old — if the
-build fails on syntax rather than on your code, check `rustc --version` first:
+```sh
+cargo install exav
+```
+
+**exav needs Rust 1.91 or newer**, which is recent enough that a
+distribution-packaged toolchain will often be too old — if the build fails on
+syntax rather than on your code, check `rustc --version` first.
+
+From a clone instead:
 
 ```sh
 git clone https://github.com/sylvinus/exav && cd exav
-cargo build --release -p exav-cli      # -> target/release/exav
+cargo build --release -p exav      # -> target/release/exav
 ```
+
+Prebuilt binaries are attached to each [release][releases], and
+`ghcr.io/sylvinus/exav` is a wire-compatible drop-in for the ClamAV Docker
+image. See [Installation](https://exav.org/getting-started/installation/).
+
+[releases]: https://github.com/sylvinus/exav/releases
 
 ## Quick start
 
@@ -59,8 +105,16 @@ reference, and more.
 
 ## API stability
 
-exav is `0.1.x`, and 0.1 means what SemVer says it means: **any release may
-break any API.** Pin an exact version if you depend on the library crates.
+exav is `0.0.x`, which under Cargo's rules means **every release is treated as
+incompatible with the one before it**: the usual `exav-core = "0.0.1"` is the
+range `>=0.0.1, <0.0.2`, which no other release satisfies. That is the intent —
+any release may break any API — and it means the ordinary way of writing a
+dependency already gives you one version and keeps giving it to you.
+
+It is the requirement that does that, not the version number, so the looser
+spellings still float: `>=0.0.1` and `*` will take `0.0.2` when it lands. Write
+`=0.0.1` if you want the pin to survive changing your mind about the
+requirement.
 
 Within that, the intent is:
 

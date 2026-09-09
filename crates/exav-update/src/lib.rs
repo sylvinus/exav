@@ -94,6 +94,19 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
+/// The URL's scheme, lowercased, or `""` if it has none.
+///
+/// Schemes are case-insensitive (RFC 3986 §3.1) and `ureq` normalises them
+/// before dialling, so anything deciding whether a fetch is cleartext has to
+/// match the normalised form. Comparing the raw prefix instead reads `HTTP://`
+/// as neither http nor https: the credential refusal below would not fire and
+/// `https_only` would be off, which is the combination that puts a password on
+/// the wire in cleartext.
+fn scheme_of(url: &str) -> String {
+    url.split_once("://")
+        .map_or_else(String::new, |(s, _)| s.to_ascii_lowercase())
+}
+
 /// Split `user:pass@` credentials out of a URL's authority. Returns the URL with
 /// the userinfo removed and, when present, a ready-to-send `Basic` Authorization
 /// header value (kept out of the request line; RFC 7617).
@@ -183,14 +196,28 @@ fn fetch_into(
     // the DOWNGRADE, not the scheme — so an air-gapped mirror is unaffected.
     // `redirects` is pinned rather than inherited so a dependency's default
     // cannot quietly change how far this follows.
+    let scheme = scheme_of(url);
     let agent = ureq::AgentBuilder::new()
         .user_agent(concat!("exav-update/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))
-        .https_only(url.starts_with("https://"))
+        .https_only(scheme == "https")
         .redirects(5)
         .build();
 
     let (url, auth) = split_basic_auth(url);
+    // Credentials over cleartext are refused rather than sent. `https_only`
+    // above covers the downgrade an attacker causes; this covers the one the
+    // operator wrote, which is the easier mistake to make and the one nothing
+    // else here would catch — a `Basic` header is the password in base64, and a
+    // fetch that succeeded looks identical either way. A plain `http://` source
+    // with no userinfo still works, so an air-gapped mirror is unaffected.
+    if auth.is_some() && scheme == "http" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to send credentials over http:// — use https://, or drop \
+             the `user:pass@` and authenticate another way",
+        ));
+    }
     let url = url.as_str();
     let with_auth = |mut r: ureq::Request| -> ureq::Request {
         if let Some(a) = &auth {
@@ -413,14 +440,24 @@ pub fn sig_dest(sigdir: &Path, url: &str) -> io::Result<PathBuf> {
     // and overwrites the other, so the two feeds flip-flop forever and the
     // loaded signature set depends on which finished last.
     //
-    // A short digest of the WHOLE url, query included, separates them. It is
-    // appended to the final component so the directory layout still reads as the
-    // origin it came from.
+    // A short digest of the WHOLE url, query included, separates them. It goes
+    // into the final component so the directory layout still reads as the origin
+    // it came from — and it goes in front of the extension, never after it. The
+    // loader dispatches on extension alone: `daily.cvd-473e5c` parses as an
+    // extension of `cvd-473e5c`, matches no arm, and is skipped in silence, so a
+    // digest appended at the end would fetch every source successfully and load
+    // none of them.
     if let Some(last) = parts.last_mut() {
         let mut h = Sha256::new();
         h.update(url.as_bytes());
         let d = h.finalize();
-        last.push_str(&format!("-{:02x}{:02x}{:02x}", d[0], d[1], d[2]));
+        let tag = format!("-{:02x}{:02x}{:02x}", d[0], d[1], d[2]);
+        // Split on the final dot, but only when there is a name in front of it:
+        // a leading-dot name is all extension, and has nothing to tag.
+        *last = match last.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => format!("{stem}{tag}.{ext}"),
+            _ => format!("{last}{tag}"),
+        };
     }
     for p in parts {
         dest.push(p);
@@ -590,6 +627,46 @@ mod tests {
         let (url, auth) = split_basic_auth("http://bob:s3cr3t@host.tld:8080");
         assert_eq!(url, "http://host.tld:8080");
         assert_eq!(auth.as_deref(), Some("Basic Ym9iOnMzY3IzdA=="));
+    }
+
+    #[test]
+    fn scheme_of_is_case_insensitive() {
+        assert_eq!(scheme_of("https://host.tld/db"), "https");
+        assert_eq!(scheme_of("HTTPS://host.tld/db"), "https");
+        assert_eq!(scheme_of("HtTp://host.tld/db"), "http");
+        assert_eq!(scheme_of("http://host.tld/db"), "http");
+        assert_eq!(scheme_of("host.tld/db"), "");
+    }
+
+    /// An uppercase scheme is the same cleartext as a lowercase one, and `ureq`
+    /// normalises it before dialling — so the refusal has to fire for `HTTP://`
+    /// too, or the password goes out in base64 over the wire.
+    ///
+    /// The port is closed on purpose: reaching the network at all would fail as
+    /// a connection error, so `InvalidInput` is what proves nothing was sent.
+    #[test]
+    fn uppercase_http_with_credentials_is_refused_before_any_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // nothing is listening there now
+
+        for url in [
+            format!("HTTP://user:pass@127.0.0.1:{port}/db.cvd"),
+            format!("http://user:pass@127.0.0.1:{port}/db.cvd"),
+        ] {
+            let err = fetch_into(
+                &url,
+                Path::new("/nonexistent/exav-test/db.cvd"),
+                None,
+                |_| Ok(()),
+            )
+            .expect_err("credentials over cleartext must be refused");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "{url}: refused before dialling, not after a failed connection"
+            );
+        }
     }
 
     #[test]

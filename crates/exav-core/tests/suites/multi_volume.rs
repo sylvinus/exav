@@ -13,7 +13,9 @@
 
 use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 
-const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn crc32(data: &[u8]) -> u32 {
     let mut c = !0u32;
@@ -95,7 +97,7 @@ fn split(blob: &[u8], n: usize) -> Vec<Vec<u8>> {
 /// The set that every test below is built from: a ZIP carrying EICAR, cut into
 /// `n` parts. Returns `(part_name, bytes)` pairs.
 fn split_zip(stem: &str, n: usize) -> Vec<(String, Vec<u8>)> {
-    let inner = zip_with(&[("payload.txt", EICAR)]);
+    let inner = zip_with(&[("payload.txt", eicar())]);
     split(&inner, n)
         .into_iter()
         .enumerate()
@@ -127,7 +129,7 @@ fn scan_streamed(blob: &[u8]) -> exav_core::ScanReport {
 fn no_single_part_of_the_fixture_carries_the_payload() {
     for (name, part) in split_zip("x", 3) {
         assert!(
-            !part.windows(EICAR.len()).any(|w| w == EICAR),
+            !part.windows(eicar().len()).any(|w| w == eicar()),
             "{name} contains the whole payload — the fixture proves nothing"
         );
         assert!(
@@ -179,7 +181,7 @@ fn a_prefix_that_looks_complete_is_not_joined_early() {
     // ZIP and would then be scanned as if it were the whole archive, with the
     // payload in `.003` never reached. Splitting into four parts and putting the
     // signature in the last one makes that failure visible.
-    let inner = zip_with(&[("filler.bin", &vec![b'.'; 4096]), ("payload.txt", EICAR)]);
+    let inner = zip_with(&[("filler.bin", &vec![b'.'; 4096]), ("payload.txt", eicar())]);
     let parts: Vec<(String, Vec<u8>)> = split(&inner, 4)
         .into_iter()
         .enumerate()
@@ -232,7 +234,7 @@ fn a_set_missing_its_first_volume_is_reported() {
 fn a_lone_numbered_file_is_still_scanned_and_not_flagged() {
     // Plenty of ordinary files end in `.001`. One part is not a set: it must be
     // scanned normally, and it must not be reported as a broken archive.
-    let infected = zip_with(&[("notes.dat.001", EICAR)]);
+    let infected = zip_with(&[("notes.dat.001", eicar())]);
     assert!(
         matches!(scan(&infected).verdict, Verdict::Infected { .. }),
         "a held member must still reach the scanner"
@@ -254,7 +256,10 @@ fn format_aware_volumes_are_not_concatenated() {
     // the next volume's header, so concatenating them yields garbage that still
     // looks like an archive. They pass through and are scanned individually —
     // which is what finds this payload.
-    let outer = zip_with(&[("a.part1.rar", b"Rar!\x1a\x07\x00"), ("a.part2.rar", EICAR)]);
+    let outer = zip_with(&[
+        ("a.part1.rar", b"Rar!\x1a\x07\x00"),
+        ("a.part2.rar", eicar()),
+    ]);
     assert!(
         matches!(scan(&outer).verdict, Verdict::Infected { .. }),
         "a `.partN.rar` member must still be scanned on its own"
@@ -312,7 +317,7 @@ fn set_with_payload_in_the_tail(stem: &str) -> Vec<(String, Vec<u8>)> {
     vec![
         (format!("{stem}.bin.001"), filler.clone()),
         (format!("{stem}.bin.002"), filler),
-        (format!("{stem}.bin.003"), EICAR.to_vec()),
+        (format!("{stem}.bin.003"), eicar().to_vec()),
     ]
 }
 

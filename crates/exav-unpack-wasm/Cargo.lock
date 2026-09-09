@@ -283,14 +283,14 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "exav-pe-emu"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exav-x86",
 ]
 
 [[package]]
 name = "exav-unpack"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "aes",
  "apfs",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "exav-unpack-wasm"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exav-unpack",
  "flate2",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "exav-x86"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "explode"

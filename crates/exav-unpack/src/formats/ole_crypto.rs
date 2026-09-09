@@ -908,7 +908,9 @@ fn decrypt_agile_package(package: &[u8], secret: &[u8], a: &OoxmlAgile) -> Vec<u
 mod tests {
     use super::*;
 
-    const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    fn eicar() -> &'static [u8] {
+        crate::eicar()
+    }
 
     fn push_rec(v: &mut Vec<u8>, id: u16, data: &[u8]) {
         v.extend_from_slice(&id.to_le_bytes());
@@ -924,14 +926,14 @@ mod tests {
         push_rec(&mut wb, 0x0809, &[0u8; 16]); // BOF
         push_rec(&mut wb, 0x002f, filepass_body); // FilePass
         let off = wb.len() + 4;
-        push_rec(&mut wb, 0x00ff, EICAR); // non-exempt → encrypted
+        push_rec(&mut wb, 0x00ff, eicar()); // non-exempt → encrypted
         push_rec(&mut wb, 0x000a, &[]); // EOF
         let ks = rc4(&d.block_key(0), &vec![0u8; wb.len()]);
-        for i in 0..EICAR.len() {
+        for i in 0..eicar().len() {
             wb[off + i] ^= ks[off + i];
         }
         assert!(
-            !wb.windows(EICAR.len()).any(|w| w == EICAR),
+            !wb.windows(eicar().len()).any(|w| w == eicar()),
             "EICAR encrypted"
         );
         wb
@@ -998,7 +1000,7 @@ mod tests {
         fp.extend_from_slice(&enc[..32]);
         let ct = encrypted_workbook(&d, &fp);
         let recovered = try_decrypt_workbook(&ct, &[]).expect("VelvetSweatshop must decrypt");
-        assert!(recovered.windows(EICAR.len()).any(|w| w == EICAR));
+        assert!(recovered.windows(eicar().len()).any(|w| w == eicar()));
     }
 
     /// End-to-end (RC4-CryptoAPI, 128-bit): VelvetSweatshop default recovers EICAR.
@@ -1026,7 +1028,7 @@ mod tests {
         fp.extend_from_slice(&vblk);
         let ct = encrypted_workbook(&d, &fp);
         let recovered = try_decrypt_workbook(&ct, &[]).expect("CryptoAPI VelvetSweatshop decrypt");
-        assert!(recovered.windows(EICAR.len()).any(|w| w == EICAR));
+        assert!(recovered.windows(eicar().len()).any(|w| w == eicar()));
     }
 
     fn aes_ecb_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -1070,7 +1072,7 @@ mod tests {
         info.extend_from_slice(&enc_vhash);
 
         // EncryptedPackage: 8-byte LE length prefix + AES-ECB(padded plaintext).
-        let eicar = EICAR;
+        let eicar = eicar();
         let mut plain = eicar.to_vec();
         while !plain.len().is_multiple_of(16) {
             plain.push(0);
@@ -1121,11 +1123,11 @@ mod tests {
         info.extend_from_slice(&20u32.to_le_bytes());
         info.extend_from_slice(&enc_vhash);
 
-        let mut plain = EICAR.to_vec();
+        let mut plain = eicar().to_vec();
         while !plain.len().is_multiple_of(16) {
             plain.push(0);
         }
-        let mut package = (EICAR.len() as u64).to_le_bytes().to_vec();
+        let mut package = (eicar().len() as u64).to_le_bytes().to_vec();
         package.extend_from_slice(&aes_ecb_encrypt(&key, &plain));
 
         // Wrap both streams in a genuine compound file.
@@ -1151,7 +1153,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|e| e.data.windows(EICAR.len()).any(|w| w == EICAR)),
+                .any(|e| e.data.windows(eicar().len()).any(|w| w == eicar())),
             "EICAR must be recovered through the full container path"
         );
     }
@@ -1231,14 +1233,14 @@ mod tests {
         let enc_key_value = aes256_cbc_encrypt(&key3, &ek_salt, &secret);
 
         // EncryptedPackage: LE64 length + one 4096-segment AES-CBC(EICAR).
-        let mut plain = EICAR.to_vec();
+        let mut plain = eicar().to_vec();
         while !plain.len().is_multiple_of(16) {
             plain.push(0);
         }
         let mut seg_iv = alg.digest(&[&kd_salt[..], &0u32.to_le_bytes()].concat());
         seg_iv.truncate(16);
         let seg = aes256_cbc_encrypt(&secret, &seg_iv, &plain);
-        let mut package = (EICAR.len() as u64).to_le_bytes().to_vec();
+        let mut package = (eicar().len() as u64).to_le_bytes().to_vec();
         package.extend_from_slice(&seg);
 
         // Agile EncryptionInfo: version 4.4, reserved flags, then the XML.
@@ -1267,7 +1269,7 @@ encryptedVerifierHashInput=\"{}\" encryptedVerifierHashValue=\"{}\" encryptedKey
 
         let out = try_decrypt_ooxml(&info, &package, &[]).expect("agile OOXML must decrypt");
         assert!(
-            out.windows(EICAR.len()).any(|w| w == EICAR),
+            out.windows(eicar().len()).any(|w| w == eicar()),
             "EICAR must be recovered from the decrypted agile package"
         );
     }
@@ -1318,25 +1320,25 @@ encryptedVerifierHashInput=\"{}\" encryptedVerifierHashValue=\"{}\" encryptedKey
         fp.extend_from_slice(&0x9a0au16.to_le_bytes()); // verificationBytes
         push_rec(&mut wb, 0x002f, &fp);
         let rec_off = wb.len(); // stream offset of the EICAR record header
-        push_rec(&mut wb, 0x00ff, EICAR); // non-exempt → obfuscated
+        push_rec(&mut wb, 0x00ff, eicar()); // non-exempt → obfuscated
         push_rec(&mut wb, 0x000a, &[]); // EOF
 
         // Obfuscate the EICAR record's data in place: cipher = ROL(plain,5) ^ pad,
         // with the same end-offset seed the decryptor uses.
         let dstart = rec_off + 4;
-        let dend = dstart + EICAR.len();
+        let dend = dstart + eicar().len();
         let idx0 = dend % 16;
         for (j, k) in (dstart..dend).enumerate() {
             wb[k] = wb[k].rotate_left(5) ^ arr[(idx0 + j) % 16];
         }
         assert!(
-            !wb.windows(EICAR.len()).any(|w| w == EICAR),
+            !wb.windows(eicar().len()).any(|w| w == eicar()),
             "EICAR must be obfuscated in the input"
         );
 
         let recovered = try_decrypt_workbook(&wb, &[]).expect("XOR VelvetSweatshop must decrypt");
         assert!(
-            recovered.windows(EICAR.len()).any(|w| w == EICAR),
+            recovered.windows(eicar().len()).any(|w| w == eicar()),
             "EICAR must be recovered from the de-obfuscated workbook"
         );
     }

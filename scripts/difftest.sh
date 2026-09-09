@@ -145,14 +145,21 @@ trap cleanup EXIT
 # the comparison is meaningless. `freshclam` also fetches main.cvd, so it is
 # removed again — which also keeps the exav database build to ~340k signatures
 # instead of 3.6M, the difference between building and being OOM-killed here.
-if [ ! -f "$DBDIR/daily.cvd" ]; then
+#
+# Called by the phases that need it rather than run up front. Two of them do:
+# clamd loads this directory, and building the exav database reads it. Neither
+# applies to `PHASE=exav` against an already-built `$DB` — the documented way to
+# iterate on exav — and fetching there would make the fast path depend on docker
+# and a network it has no use for.
+need_signatures() {
+  [ -f "$DBDIR/daily.cvd" ] && return 0
   say "fetching signatures (daily only) into $DBDIR"
   mkdir -p "$DBDIR"
   docker run --rm -v "$DBDIR":/var/lib/clamav --entrypoint freshclam "$IMAGE" --stdout \
     >/dev/null 2>&1 || { echo "FATAL: freshclam bootstrap failed"; exit 1; }
   rm -f "$DBDIR"/main.cvd "$DBDIR"/main-*.cvd.sign
   [ -f "$DBDIR/daily.cvd" ] || { echo "FATAL: no daily.cvd after freshclam"; exit 1; }
-fi
+}
 
 # ── Manifest: the exact file list BOTH engines will scan ─────────────────────
 build_manifest() {
@@ -199,6 +206,7 @@ check_cache() {
 
 # ── Phase 1: clamd ───────────────────────────────────────────────────────────
 phase_clam() {
+  need_signatures
   [ "$FRESH_CLAM" = 1 ] && rm -f "$CLAM_TSV"
   check_cache "$CLAM_TSV"
   local todo have
@@ -302,7 +310,7 @@ HEUR
 
 # ── Phase 2: exav ────────────────────────────────────────────────────────────
 phase_exav() {
-  [ -x "$EXAV" ] || { echo "FATAL: $EXAV not built (cargo build --release -p exav-cli)"; exit 1; }
+  [ -x "$EXAV" ] || { echo "FATAL: $EXAV not built (cargo build --release -p exav)"; exit 1; }
   # A rebuilt exav can bump the database format, making a stale database
   # unloadable — but `--build-db` needs several GB of RAM, so do NOT rebuild
   # merely because the binary is newer. Rebuild when it is missing or fails to
@@ -316,10 +324,11 @@ phase_exav() {
       || need=1
   fi
   if [ "$need" = 1 ]; then
+    need_signatures
     say "phase 2: building the exav database from $DBDIR"
     local avail shard=""
     avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    [ "$avail" -gt 0 ] && [ "$avail" -lt 8000000 ] && shard="--build-shard-memory ${BUILD_SHARD_MEMORY:-1G}"
+    [ "$avail" -gt 0 ] && [ "$avail" -lt 8000000 ] && shard="--build-shard-bytes ${BUILD_SHARD_BYTES:-1G}"
     # shellcheck disable=SC2086
     "$EXAV" -d "$DBDIR" --build-db "$DB" $shard || {
       echo "FATAL: exav database build failed (it needs several GB of FREE RAM)"; exit 1; }
@@ -342,21 +351,41 @@ phase_exav() {
   #   * `--max-scan-time` defaults to 120s. If the client's own timeout is
   #     longer, a killed worker looks like a slow file; if shorter, the client
   #     gives up on work the daemon then completes for nobody. Keep them equal.
-  local flags="--workers $JOBS --max-scan-time ${TMO%.*}"
+  #     `--max-scan-secs` takes whole seconds, so a fractional TMO is rounded
+  #     UP. Truncating it (`2.5` -> `2`, and `0.5` -> `0`) hands the daemon a
+  #     cap SHORTER than the client's timeout, which is the second failure
+  #     above: the worker is killed on a file the client is still waiting for.
+  local max_scan_secs
+  max_scan_secs=$(awk -v t="$TMO" 'BEGIN { printf "%d", (t == int(t) ? t : int(t) + 1) }')
+  local flags="--workers $JOBS --max-scan-secs $max_scan_secs"
   [ "$COMPAT" = 1 ] && flags="$flags --clamav-compat"
-  # One exav flag per alert class clamd was configured with. Anything clamd is
-  # asked to alert on and exav is not becomes a fake FN — the file is bucketed
-  # as "clam detected, exav did not" when exav was never asked to look. Measured
-  # before these three were added: 150 of 258 FNs, dominated by 119
+  # Cover every alert class clamd was configured with. Anything clamd is asked
+  # to alert on and exav is not becomes a fake FN — the file is bucketed as
+  # "clam detected, exav did not" when exav was never asked to look. Measured
+  # before these were added: 150 of 258 FNs, dominated by 119
   # Heuristics.Broken.Executable and 33 Heuristics.Limits.Exceeded.*.
   #
-  # Keep this list in step with the AlertX lines in the clamd conf above; they
-  # are two halves of one setting.
-  [ "$HEURISTICS" = 1 ] && flags="$flags --alert-encrypted --alert-macros --alert-phishing --alert-broken-media --alert-broken --alert-exceeds-max --alert-partition-intersection"
+  # Two flags, because the AlertX directives are two different questions.
+  # `--detect` is "also look for this", and covers AlertOLE2Macros,
+  # AlertBrokenExecutables, AlertBrokenMedia, AlertPhishing* and
+  # AlertPartitionIntersection. `--partial-as` is "what becomes of an object
+  # exav could not fully examine", and that is what AlertEncryptedArchive /
+  # AlertEncryptedDoc and AlertExceedsMax actually are: ClamAV reports both as
+  # `Heuristics.* FOUND`, so exav has to as well or the same file is a PARTIAL
+  # here and a detection there. `unscannable` is deliberately left at the
+  # default — ClamAV has no flag for it, so making it a detection would invent a
+  # disagreement rather than remove one.
+  #
+  # Keep both in step with the AlertX lines in the clamd conf above; they are
+  # two halves of one setting.
+  if [ "$HEURISTICS" = 1 ]; then
+    flags="$flags --detect macros,broken,broken-media,phishing,partition-intersection"
+    flags="$flags --partial-as password-protected=found,limits-exceeded=found"
+  fi
   say "phase 2: starting the exav daemon ($flags)"
   pkill -x exav 2>/dev/null; sleep 0.5; rm -f "$ESOCK"
   # shellcheck disable=SC2086
-  "$EXAV" $flags --daemon -d "$DB" --socket "$ESOCK" >"$TMPROOT/difftest-exav-daemon.log" 2>&1 &
+  "$EXAV" $flags --listen "$ESOCK" -d "$DB" >"$TMPROOT/difftest-exav-daemon.log" 2>&1 &
   EXAV_PID=$!
   for _ in $(seq 1 60); do [ -S "$ESOCK" ] && break; sleep 2; done
   [ -S "$ESOCK" ] || {

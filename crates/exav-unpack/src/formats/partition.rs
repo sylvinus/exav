@@ -58,6 +58,7 @@ fn be_u32(d: &[u8], off: usize) -> u32 {
 /// True if `data` looks like a partitioned disk image (GPT, APM, or a
 /// conservatively-validated MBR). Used by `detect()` — placed last there so the
 /// weak MBR boot signature never shadows a more specific format.
+#[cfg(feature = "partition")]
 pub(crate) fn is_partition(data: &[u8]) -> bool {
     is_gpt(data) || is_apm(data) || is_mbr(data)
 }
@@ -321,6 +322,7 @@ fn is_volume_boot_record(data: &[u8]) -> bool {
         && sectors_per_cluster.is_power_of_two()
 }
 
+#[cfg(feature = "partition")]
 fn is_mbr(data: &[u8]) -> bool {
     if data.get(510..512) != Some(&[0x55, 0xAA][..]) {
         return false;
@@ -353,6 +355,7 @@ fn is_mbr(data: &[u8]) -> bool {
 /// charge it against the budget, and hand it to the visitor. Returns
 /// `Ok(Some(r))` if the visitor stopped early. Empty/degenerate ranges are
 /// skipped without consuming a file-count slot.
+#[cfg(feature = "partition")]
 fn emit_region<R>(
     data: &[u8],
     name: String,
@@ -378,6 +381,7 @@ fn emit_region<R>(
     Ok(visit(Entry::new(name, slice.to_vec()), budget))
 }
 
+#[cfg(feature = "partition")]
 pub(crate) fn extract_partition<R>(
     data: &[u8],
     budget: &mut Budget,
@@ -399,6 +403,7 @@ pub(crate) fn extract_partition<R>(
 
 /// GPT: header at offset 512 gives the partition-entry array location, count,
 /// and stride. Each used entry (non-zero type GUID) carves its LBA range.
+#[cfg(feature = "partition")]
 fn extract_gpt<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
     let hdr = SECTOR; // GPT header lives in LBA1.
                       // Real GPT header field offsets (relative to the header start):
@@ -502,6 +507,7 @@ fn extract_gpt<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Op
 
 /// APM (big-endian): sector 0 is Block0 (`ER`); sectors 1.. each hold one
 /// partition-map entry (`PM`). The first entry's `mapEntries` bounds the count.
+#[cfg(feature = "partition")]
 fn extract_apm<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
     // mapEntries from the first entry (sector 1), capped. The cap is a real
     // truncation — entries past it describe regions of the image that will not
@@ -549,6 +555,7 @@ fn extract_apm<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Op
 
 /// MBR: four 16-byte entries at offset 0x1BE. Empty (`type==0`) and protective
 /// (`type==0xEE`, which defers to GPT) entries are skipped.
+#[cfg(feature = "partition")]
 fn extract_mbr<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
     let mut emitted = 0usize;
     for i in 0..4 {

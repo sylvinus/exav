@@ -1,14 +1,22 @@
 [workspace]
 resolver = "2"
-members = ["crates/exav-core", "crates/exav-cli", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update"]
+members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update"]
 exclude = ["fuzz", "crates/exav-unpack-wasm"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
-homepage = "https://github.com/sylvinus/exav"
+homepage = "https://exav.org"
+# Checked by `make msrv` rather than asserted — a floor nothing verifies drifts.
+#
+# The number is set by a dependency, not by this code: `yara-x-parser` declares
+# 1.91, so the resolver refuses anything older for a default build. exav's own
+# source needs only 1.88 (`slice::as_chunks`, `is_multiple_of`, and the
+# let-chains the `zip` dependency uses), which is where this would sit if the
+# YARA parser relaxed. Worth rechecking when that dependency moves; lowering it
+# means confirming with `make msrv`, not editing this line.
 rust-version = "1.91"
 # crates.io discovery. keywords: max 5, <=20 chars each. categories must be from
 # https://crates.io/category_slugs (an invalid one fails `cargo publish`).

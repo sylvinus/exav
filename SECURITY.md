@@ -16,7 +16,7 @@ overridden from inside, so the attribute has to be absent for the crate to
 build at all. The decoders it exposes are the same `forbid`-carrying
 `exav-unpack` code; the exception covers the generated binding layer.
 
-All of exav's own `unsafe` lives in one file, **`crates/exav-cli/src/daemon.rs`**,
+All of exav's own `unsafe` lives in one file, **`crates/exav/src/daemon.rs`**,
 and none of it touches scanned bytes:
 
 - **Process control for the prefork worker pool** — `fork`, `waitpid`, `kill`,

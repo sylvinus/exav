@@ -72,7 +72,7 @@ random sample. The **agreement** is what matters.
 By default exav runs at **full capability**. For an apples-to-apples differential
 run, `--clamav-compat` dials exav back to a stock ClamAV build's documented
 defaults — the limit values (`--max-input-bytes 100M`, `--max-extracted-bytes 400M`,
-`--max-depth 17`, `--max-members 10000`, `--base64 off`), the extractor set, and
+`--max-unpack-depth 17`, `--max-members 10000`, `--decode none`), the extractor set, and
 cosmetic naming (the `.UNOFFICIAL` suffix on unofficial-database signatures). Each
 limit is also an individual flag, and an explicit flag always wins over the
 preset; the extractor set and the naming have no flags of their own, being wanted

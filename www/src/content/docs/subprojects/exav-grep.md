@@ -48,7 +48,7 @@ The familiar set — `-i`, `-v`, `-c`, `-l`, `-r`, `-F`, `-A`/`-B`/`-C`,
 | `--passwords <PASSWORD>` | Try on encrypted members (repeatable) |
 | `--max-object-bytes <BYTES>` | Cap on what any single member may decompress to |
 | `--max-members <N>` | Cap on members visited inside each input file |
-| `--max-depth <N>` | Cap on archive-within-archive nesting |
+| `--max-unpack-depth <N>` | Cap on archive-within-archive nesting |
 | `--quiet-unreadable` | Suppress unreadable-member reports (see above) |
 
 The limits are the same decompression-bomb budget the scanner uses, so pointing

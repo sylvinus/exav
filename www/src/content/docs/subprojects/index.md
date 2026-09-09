@@ -31,8 +31,6 @@ scan flows through them.
 
 ## Why they are separate
 
-Three reasons, in order of how much they matter:
-
 1. **Blast radius.** Extraction is the part that touches hostile bytes first and
    hardest. Keeping it in its own `#![forbid(unsafe_code)]` crate with its own
    budget and panic containment means a malformed archive cannot reach the

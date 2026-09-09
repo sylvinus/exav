@@ -61,6 +61,9 @@ use std::io::{Read, Seek};
 
 #[doc(hidden)]
 pub mod formats;
+// Every name this pulls in is behind a format feature, so the glob imports
+// nothing at all in a build with none of them compiled in.
+#[allow(unused_imports)]
 use formats::*;
 
 mod stream;
@@ -1730,9 +1733,15 @@ pub fn is_pepack(data: &[u8]) -> bool {
 /// by the budget-checked reads — so this only prevents a crafted header from
 /// forcing a huge up-front allocation (the over-allocation DoS class; cf. the
 /// ClamAV 7z/InstallShield advisories and the fuzz-found delharc OOM).
+// Dead only in a build with none of the formats that pre-allocate (dmg, cab,
+// 7z, ppmd7). Listing those features here instead would have to be corrected
+// every time one of them starts or stops calling this, and getting that list
+// wrong is a warning rather than an error — so it would rot quietly.
+#[allow(dead_code)]
 pub(crate) const PREALLOC_CAP: usize = 16 * 1024 * 1024;
 
 /// Cap a pre-allocation request from an attacker-declared byte size.
+#[allow(dead_code)] // see PREALLOC_CAP
 pub(crate) fn cap_prealloc(requested: usize) -> usize {
     requested.min(PREALLOC_CAP)
 }
@@ -1741,6 +1750,9 @@ pub(crate) fn cap_prealloc(requested: usize) -> usize {
 /// Absolute byte caps are the primary bomb defense; this is a fast reject
 /// for the obvious cases. A declared input of 0 is ignored (we cannot trust
 /// it) and left to the absolute caps.
+// Dead only in a build with none of the compressing formats; see
+// `cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn ratio_guard(input: u64, output: u64, budget: &Budget) -> Result<(), LimitHit> {
     if input > 0 && output / input > budget.limits.max_compression_ratio {
         return Err(LimitHit::new(format!(
@@ -1750,6 +1762,68 @@ pub(crate) fn ratio_guard(input: u64, output: u64, budget: &Budget) -> Result<()
         )));
     }
     Ok(())
+}
+
+/// The EICAR anti-virus test string, assembled at runtime from its reverse.
+///
+/// The 68-byte sequence exists nowhere in this source tree, and nowhere in any
+/// binary built from it. That is deliberate: a scanner is a file every other
+/// scanner reads. Stored as a plain literal it would travel into the compiled
+/// binary, the `.crate` tarballs on crates.io and the container image, and every
+/// AV worth installing would quarantine all three on sight — which reads as a
+/// broken release rather than as the test string it is. ClamAV keeps EICAR in a
+/// signature database, not in its binary, for the same reason.
+///
+/// Reversed rather than encrypted so a reader can still verify it by eye: no
+/// signature matches the reversed bytes, but `RACIE` is legible enough that
+/// nobody has to trust a hex blob.
+///
+/// `exav`'s `scans_its_own_source_and_binary_clean` test holds this property for
+/// the whole tree, so a literal reintroduced anywhere fails the build.
+#[doc(hidden)]
+pub fn eicar() -> &'static [u8] {
+    const REVERSED: &[u8] =
+        br#"*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\4[PA@%P!O5X"#;
+    static FORWARD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    FORWARD.get_or_init(|| REVERSED.iter().rev().copied().collect())
+}
+
+/// The byte a masked test fixture is XORed with. Any non-zero value does the
+/// job; this one is arbitrary.
+#[doc(hidden)]
+pub const FIXTURE_MASK: u8 = 0x5A;
+
+/// Undo the mask on a committed test fixture.
+///
+/// A committed fixture that a scanner detects is a fixture that gets quarantined
+/// on `git clone`, deleted by an AV-scanned CI runner, and flagged by whatever
+/// watches a contributor's laptop — for files whose entire job is to be detected.
+/// Masking them removes the archive magic and the payload in one step, so no
+/// scanner has anything to match, while the bytes stay one XOR away.
+///
+/// XOR rather than the password-protected ZIP that is standard for distributing
+/// samples: these fixtures are the corpus for an archive extractor, so wrapping
+/// them in archives would make the ZIP and 7z tests depend on working ZIP and
+/// decryption support to load their own inputs — and the `--no-default-features`
+/// build has neither compiled in.
+#[doc(hidden)]
+pub fn unmask_fixture(masked: &[u8]) -> Vec<u8> {
+    masked.iter().map(|b| b ^ FIXTURE_MASK).collect()
+}
+
+/// Read a test fixture, unmasking it when the masked form is what is committed.
+///
+/// Prefers `<path>.xor` and falls back to `<path>`, so only the fixtures a
+/// scanner actually reacts to have to be masked and the rest stay readable with
+/// ordinary tools. Missing-file errors name the plain path, which is the one a
+/// reader is looking for.
+#[doc(hidden)]
+pub fn read_fixture(path: &str) -> std::io::Result<Vec<u8>> {
+    let masked = format!("{path}.xor");
+    if std::fs::exists(&masked)? {
+        return Ok(unmask_fixture(&std::fs::read(&masked)?));
+    }
+    std::fs::read(path)
 }
 
 /// Read up to `cap` bytes; the returned flag is true if the source had more
@@ -1771,6 +1845,9 @@ pub fn bounded_read<R: Read>(mut r: R, cap: u64) -> Result<(Vec<u8>, bool), std:
 /// decompressor (e.g. a gzip CRC-32 or ISIZE mismatch, a ZIP CRC) must not throw
 /// away already-decompressed content that a scanner still needs to inspect. With
 /// `salvage` false it is exactly [`bounded_read`] (errors propagate).
+// Dead only in a build with none of the formats that salvage a partial member;
+// see `cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn bounded_read_salvage<R: Read>(
     mut r: R,
     cap: u64,
@@ -2850,7 +2927,9 @@ mod tests {
         assert_eq!(entries[0].data, b"hello exav inside cab");
     }
 
-    const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+    fn eicar() -> &'static [u8] {
+        crate::eicar()
+    }
 
     fn has_eicar(entries: &[Entry]) -> bool {
         entries
@@ -2866,7 +2945,7 @@ mod tests {
             let mut comp = cfb::CompoundFile::create(&mut buf).unwrap();
             comp.create_storage("Macros").unwrap();
             let mut s = comp.create_stream("Macros/Module1").unwrap();
-            std::io::Write::write_all(&mut s, EICAR).unwrap();
+            std::io::Write::write_all(&mut s, eicar()).unwrap();
         }
         let data = buf.into_inner();
         let mut budget = Budget::new(Limits::default());
@@ -2909,7 +2988,7 @@ mod tests {
 
     #[test]
     fn pdf_stream_extracted() {
-        let pdf = minimal_pdf_with_stream(EICAR);
+        let pdf = minimal_pdf_with_stream(eicar());
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
         assert!(has_eicar(&entries), "EICAR not found in PDF streams");
@@ -3292,6 +3371,9 @@ mod tests {
 /// Clamping is free on real streams: LZMA only ever looks back into bytes it has
 /// already produced, so a dictionary larger than the output cannot be consulted.
 /// The floor keeps a nonsense-small declaration from breaking a legitimate one.
+// Dead only in a build with none of the LZMA-bearing formats (swf, egg, nsis,
+// zip, 7z); see `cap_prealloc` for why the feature list is not spelled out.
+#[allow(dead_code)]
 pub(crate) fn bounded_dict(declared: u32, cap: u64) -> u32 {
     const MIN_DICT: u32 = 1 << 12;
     declared.min(cap.min(u32::MAX as u64) as u32).max(MIN_DICT)

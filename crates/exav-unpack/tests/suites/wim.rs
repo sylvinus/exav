@@ -31,7 +31,7 @@ const DEEP: &str = "0035fe0884edb216726d771c5bb354fd2150160459cacc18feb0c1f30bcc
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/wim/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn sha256_hex(data: &[u8]) -> String {

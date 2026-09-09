@@ -25,7 +25,9 @@ const MACRO_SIG_BODY: &[u8] = b"Attribute VB_Name = \"exavProbeModule\"";
 
 /// Carried by the builtin baseline, so a scanner with no database still detects
 /// it — which is what lets the depth test below use `Scanner::builtin()`.
-const EICAR: &[u8] = br#"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"#;
+fn eicar() -> &'static [u8] {
+    exav_core::unpack::eicar()
+}
 
 fn scanner() -> Scanner {
     let hex: String = MACRO_SIG_BODY.iter().map(|b| format!("{b:02x}")).collect();
@@ -134,6 +136,7 @@ fn allmatch_runs_the_same_heuristics_as_a_normal_scan() {
 }
 
 #[test]
+#[cfg(feature = "dlp")]
 fn allmatch_reports_structured_data_findings() {
     // DLP is the other shape: driven by its own thresholds rather than by
     // `--detect heuristics`, and applied at every recursion level.
@@ -175,10 +178,11 @@ fn compressor_fixture(name: &str) -> Vec<u8> {
         "{}/tests/fixtures/compressors/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_core::unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 #[test]
+#[cfg(all(feature = "gzip", feature = "bzip2", feature = "xz"))]
 fn every_single_stream_compressor_streams_its_content() {
     // gzip, bzip2 and xz are the same shape: one stream whose output can be
     // orders of magnitude larger than the file. Each has to be walked as a
@@ -237,6 +241,7 @@ fn tar_wrapping(name: &str, data: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(all(feature = "zip", feature = "tar"))]
 fn nesting_depth_does_not_change_what_a_scan_finds() {
     // A container whose members can be streamed must be walked that way at every
     // depth. When only the OUTERMOST container streamed, the same ZIP answered
@@ -246,7 +251,7 @@ fn nesting_depth_does_not_change_what_a_scan_finds() {
     //
     // Identical bytes must give an identical verdict wherever they sit.
     let db = Scanner::builtin();
-    let inner = zip_with_oversized_member(EICAR);
+    let inner = zip_with_oversized_member(eicar());
     let nested = tar_wrapping("inner.zip", &inner);
     // A cap far below the member's decompressed size, so buffering cannot reach
     // the payload at its end.
@@ -457,6 +462,7 @@ fn allmatch_does_not_re_carve_a_container_into_itself() {
 /// differently depending on the container they sit in, which is the divergence
 /// `--all-matches` exists to not have.
 #[test]
+#[cfg(feature = "zip")]
 fn allmatch_reports_every_signature_inside_a_single_streamed_member() {
     const SIG_A: &[u8] = b"exavProbeAlphaSignatureBody";
     const SIG_B: &[u8] = b"exavProbeBetaSignatureBody";

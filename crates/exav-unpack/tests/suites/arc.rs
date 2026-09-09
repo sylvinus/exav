@@ -27,7 +27,7 @@ const DLE: &str = "10fddcc6c3ef0721ffd392913aa7c2bc763ad13738add4105153ef276a20b
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/arc/{name}", env!("CARGO_MANIFEST_DIR"));
-    std::fs::read(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+    exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
 
 fn sha256_hex(data: &[u8]) -> String {

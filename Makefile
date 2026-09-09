@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv av-audit publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -52,7 +52,7 @@ test-native:
 	# question goes unasked — a scanner that dies on crafted input and exits 0
 	# is indistinguishable, to a pipeline reading `$$?`, from a clean scan.
 	$(CARGO) test -p exav-unpack --features testing-faults panic_containment
-	$(CARGO) test -p exav-cli --features testing-faults --test decoder_crash
+	$(CARGO) test -p exav --features testing-faults --test decoder_crash
 
 ## test-yara-diff: the yara-x A/B differential harness — compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT
@@ -106,6 +106,37 @@ lint:
 fmt:
 	$(CARGO) fmt
 
+## msrv: build the workspace on the `rust-version` floor declared in Cargo.toml.
+##       Nothing else checks it, and a version nobody verifies drifts upward the
+##       first time someone uses a newer feature — silently breaking anyone who
+##       pinned the toolchain we promised.
+##       `rustup run` rather than `cargo +VERSION`: the `+toolchain` prefix is a
+##       rustup *shim* feature, so it fails with "no such command" whenever
+##       $(CARGO) is a real cargo binary instead of the shim.
+msrv:
+	@v=$$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
+	  rustup toolchain install $$v --profile minimal >/dev/null 2>&1 || true; \
+	  echo "checking MSRV $$v"; rustup run $$v cargo check --workspace --all-targets
+
+## av-audit: scan the tracked tree with a real engine and signature set, to catch
+##           a committed fixture that other people's scanners will detect. Run it
+##           when fixtures change, not on every release: it needs `clamscan` and
+##           a signature directory ($(DBDIR), via `make db`), neither of which is
+##           present on most machines — so as a release gate it would skip
+##           exactly where it mattered. An independent engine on purpose: asking
+##           exav whether exav's own tree is clean answers the wrong question.
+av-audit:
+	@command -v clamscan >/dev/null 2>&1 || \
+	  { echo "av-audit needs clamscan (apt install clamav / brew install clamav)"; exit 1; }
+	@[ -d $(DBDIR) ] || { echo "av-audit needs $(DBDIR); run 'make db'"; exit 1; }
+	@echo "scanning $$(git ls-files | wc -l | tr -d ' ') tracked files with $(DBDIR)"
+	@hits=$$(git ls-files -z | xargs -0 clamscan -d $(DBDIR) --no-summary 2>/dev/null \
+	          | grep -v ': OK$$' || true); \
+	  if [ -n "$$hits" ]; then echo "$$hits"; \
+	    echo "-> mask these (see crates/exav-unpack/tests/fixtures/README.md)"; exit 1; \
+	  fi; \
+	  echo "no detections"
+
 ## fuzz: smoke-build the fuzz targets
 fuzz:
 	cd fuzz && $(CARGO) build
@@ -139,35 +170,20 @@ www-dev:
 www-build:
 	cd www && ([ -d node_modules ] || npm install) && npm run build
 
-# The order is the crate graph, leaves first. It is not a preference: a crate
-# cannot be published before the crates it depends on exist on the registry,
-# because cargo resolves the `version` alongside each path dependency from
-# there. Publishing out of order fails partway and leaves some crates at the new
-# version and some not — and a published version can be yanked but never
-# replaced or reused, so a botched run burns that version number permanently.
-PUBLISH_ORDER := exav-x86 exav-pe-emu exav-unpack exav-core exav-update exav-grep exav-cli
+# Both delegate to scripts/release.sh, which owns the publish order and the
+# pre-publish gate. One list, in one place: the order is the crate graph and a
+# crate cannot go up before the crates it depends on exist on the registry, so a
+# list that drifts fails partway and leaves some crates at the new version and
+# some not — and a published version can be yanked but never replaced or reused,
+# so a botched run burns that version number permanently.
 
-## publish-check: dry-run every crate in dependency order, publishing nothing
+## publish-check: run the pre-publish gate and dry-run every crate, publishing nothing
 publish-check:
-	@for c in $(PUBLISH_ORDER); do \
-		echo "=== $$c"; \
-		$(CARGO) publish --dry-run -p $$c || exit 1; \
-	done
-	@echo "All crates package cleanly. Review the file lists above before publishing."
+	./scripts/release.sh --dry-run
 
-## publish: publish every crate in dependency order (asks once, then commits)
+## publish: gate, stop for review, then publish every crate in dependency order
 publish:
-	@echo "About to publish to crates.io, in this order:"
-	@echo "  $(PUBLISH_ORDER)"
-	@echo "This cannot be undone: a version can be yanked but never reused."
-	@read -p "Type the version to confirm: " v; \
-	 test "$$v" = "$$($(CARGO) metadata --no-deps --format-version 1 | \
-	   sed -n 's/.*"name":"exav-core","version":"\([^"]*\)".*/\1/p')" || \
-	   { echo "Version mismatch; nothing published."; exit 1; }
-	@for c in $(PUBLISH_ORDER); do \
-		echo "=== publishing $$c"; \
-		$(CARGO) publish -p $$c || exit 1; \
-	done
+	./scripts/release.sh
 
 # The npm package is published from the CRATE directory, never from `pkg/`.
 # `wasm-pack` writes its own `package.json` into `pkg/`, so running `npm publish`
