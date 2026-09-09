@@ -953,7 +953,7 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
 /// handler may use.
 #[cfg(unix)]
 extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
-    const MSG: &[u8] = b"exav: scan exceeded --max-scan-time\n";
+    const MSG: &[u8] = b"exav: scan exceeded --max-scan-secs\n";
     unsafe {
         libc::write(2, MSG.as_ptr().cast(), MSG.len());
         // Exit 3, the `PARTIAL` code, rather than the pool's dedicated timeout
@@ -1066,7 +1066,7 @@ pub fn run_prefork(
             eprintln!(
                 "exav: per-job memory {} MiB x {} workers exceeds what this host can back; \
                  using {} MiB per job (RAM minus the {} MiB shared database). Raise RAM, \
-                 lower --workers, or set a smaller --max-memory to silence this.",
+                 lower --workers, or set a smaller --max-process-bytes to silence this.",
                 cfg.max_memory_bytes >> 20,
                 cfg.workers,
                 afford >> 20,
@@ -2284,7 +2284,7 @@ fn instream<R: Read>(
         // itself — the one outcome an over-full temp filesystem must not buy.
         Err(crate::spill::SpillError::Budget(reason)) => {
             let _ = stream.drain();
-            return Ok(format!("stream: UNSCANNABLE ({reason}) ERROR"));
+            return Ok(format!("stream: {reason} UNSCANNABLE ERROR"));
         }
         Err(crate::spill::SpillError::Io(e)) => return Err(e),
     };
@@ -2295,14 +2295,12 @@ fn instream<R: Read>(
     let _reached_terminator = stream.drain()?;
     if over {
         let max = max.unwrap_or(0);
-        return Ok(format!(
-            "stream: LIMITS-EXCEEDED (size exceeds {max}) ERROR"
-        ));
+        return Ok(format!("stream: size exceeds {max} LIMITS-EXCEEDED ERROR"));
     }
     // Answering a prefix would answer a question the client never finished
     // asking, and `OK` on the benign head of a file is a bypass anyone can drive.
     if truncated {
-        return Ok("stream: UNSCANNABLE (stream ended before its terminator) ERROR".to_string());
+        return Ok("stream: stream ended before its terminator UNSCANNABLE ERROR".to_string());
     }
     let (report, _loc) = scan_payload_timed(db, opts, &payload, "stream")?;
     Ok(verdict_line("stream", &report))

@@ -16,6 +16,32 @@ use std::path::Path;
 use crate::cvd;
 use crate::engine::EngineBuilder;
 
+/// Signed container extensions: a `.cvd`/`.cld` whose members are official.
+pub const CONTAINER_EXTENSIONS: &[&str] = &["cvd", "cld"];
+
+/// Loose signature-file extensions, loaded as unofficial.
+pub const SIGNATURE_EXTENSIONS: &[&str] = &[
+    "ndb", "ndu", "db", "hdb", "hdu", "hsb", "hsu", "fdb", "imp", "ldb", "ldu", "mdb", "mdu",
+    "msb", "cdb", "ftm", "pdb", "gdb", "wdb", "crb", "yar", "yara", "fp", "sfp", "ign", "ign2",
+    "cbc", "idb", "pwdb",
+];
+
+/// Whether a filename's extension is one the loader routes.
+///
+/// A file in a signature directory with any other extension is skipped without
+/// being read — the directory legitimately holds `.cdiff`, `.sign`, `.info` and
+/// updater state alongside the databases, and reading those as signatures would
+/// be worse than ignoring them. The cost is that a file which *should* have been
+/// a database is skipped just as quietly, so anything that puts a file there is
+/// expected to ask this first and say so.
+pub fn loads_by_extension(name: &str) -> bool {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    CONTAINER_EXTENSIONS.contains(&ext.as_str()) || SIGNATURE_EXTENSIONS.contains(&ext.as_str())
+}
+
 /// An error loading a signature database.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -206,7 +232,7 @@ impl Builder {
             .to_ascii_lowercase();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         match ext.as_str() {
-            "cvd" | "cld" => {
+            e if CONTAINER_EXTENSIONS.contains(&e) => {
                 // A `.cvd`/`.cld` is an official (signed) container: its members
                 // keep their names verbatim (no `.UNOFFICIAL`).
                 let data = read_capped(path)?;
@@ -226,9 +252,7 @@ impl Builder {
                 }
                 Ok(())
             }
-            "ndb" | "ndu" | "db" | "hdb" | "hdu" | "hsb" | "hsu" | "fdb" | "imp" | "ldb"
-            | "ldu" | "mdb" | "mdu" | "msb" | "cdb" | "ftm" | "pdb" | "gdb" | "wdb" | "crb"
-            | "yar" | "yara" | "fp" | "sfp" | "ign" | "ign2" | "cbc" | "idb" | "pwdb" => {
+            e if SIGNATURE_EXTENSIONS.contains(&e) => {
                 // A loose signature file is unofficial (not a signed container).
                 let data = read_capped(path)?;
                 self.add_named_text(name, &String::from_utf8_lossy(&data), false);
@@ -504,6 +528,44 @@ pub fn load_with_options_mem(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The predicate anything writing into a signature directory asks, and the
+    /// arms of `add_file`, are the same two lists.
+    ///
+    /// They have to be, because a file this says yes to and the loader skips is
+    /// invisible: it is fetched, reported as updated, and never becomes a
+    /// signature. The directory is also a working area — `.cdiff`, `.sign`,
+    /// `.info` and updater state live beside the databases — so "skip what I do
+    /// not know" is right, and the answer to which is which can only be in one
+    /// place.
+    #[test]
+    fn the_loadable_extensions_are_the_ones_the_loader_routes() {
+        for name in [
+            "main.cvd",
+            "daily.cld",
+            "custom.ndb",
+            "hashes.hsb",
+            "rules.yar",
+            "list.ign2",
+            "pw.pwdb",
+            "MAIN.CVD",
+        ] {
+            assert!(loads_by_extension(name), "{name} is a database");
+        }
+        // A working directory's own files, and the shapes a URL lands on when it
+        // is named after an endpoint rather than a file.
+        for name in [
+            "daily.cdiff",
+            "daily.cvd.sign",
+            "freshclam.dat",
+            "get.php",
+            "download",
+            "feed.txt",
+            "",
+        ] {
+            assert!(!loads_by_extension(name), "{name} is not a database");
+        }
+    }
 
     #[test]
     fn parses_pwdb_cleartext_and_hex() {

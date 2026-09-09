@@ -55,8 +55,9 @@ row means the old spelling is refused and the error names what exav calls it.
 bare booleans: `--all-matches` is accepted, `--all-matches=yes` is not. Strip
 the value when translating a command line, and note that the `=no` form has no
 exav equivalent at all — a switch is on when given and off when omitted.
-`--base64 on|off` is the one exception, and it takes a value precisely so an
-explicit choice can beat the `--clamav-compat` preset.
+`--base64` / `--no-base64` is the one pair, because it is on by default and an
+explicit choice has to be able to beat the `--clamav-compat` preset in both
+directions.
 
 ## `clamscan`
 
@@ -67,7 +68,7 @@ Grouped in the order `clamscan --help` prints them.
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
 | `--help`, `-h` | Show help | same spelling | same | |
-| `--version`, `-V` | Print version | same spelling | same | exav reports a `ClamAV <version>` string so `clamscan`-parsing tooling recognises the engine. |
+| `--version`, `-V` | Print version | same spelling | differs | Prints `exav <version>`, naming what is actually running. The `ClamAV <version>` string tooling looks for is what the **daemon** answers to the wire `VERSION` command, so `clamdtop` and clamd client libraries see the engine they expect; a script grepping `clamscan --version` for `ClamAV` does not. |
 | `--verbose`, `-v` | Be verbose | same spelling | differs | exav prints per-file informational findings (type, entropy, imphash, ML score) rather than progress chatter. |
 | `--archive-verbose`, `-a` | Show filenames inside archives | — | absent | Member paths appear in the match location on a detection. |
 | `--debug` | libclamav debug messages | — | absent | |
@@ -91,7 +92,7 @@ Grouped in the order `clamscan --help` prints them.
 
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
-| `--database=FILE/DIR`, `-d` | Load database from FILE or DIR | same spelling | same | Also loads a prebuilt `.exavdb`. Distinct from `--sigs-dir`, which names the directory signatures *live in* and is written to. |
+| `--database=FILE/DIR`, `-d` | Load database from FILE or DIR | same spelling | same | Also loads a prebuilt `.exavdb`. Distinct from `--sig-dir`, which names the directory signatures *live in* and is written to. |
 | `--official-db-only[=yes/no]` | Only load official signatures | — | absent | |
 | `--fail-if-cvd-older-than=days` | Nonzero exit if database is stale | — | absent | |
 | `--log=FILE`, `-l` | Save scan report to FILE | `--log` | same | The long spelling matches; **`-l` is absent**. |
@@ -243,7 +244,7 @@ configuration is what you rewrite.
 | `--debug` | Enable debug mode | — | absent | |
 | `--config-file=FILE`, `-c` | Read configuration from FILE | — | absent | exav reads no configuration file. |
 | `--fail-if-cvd-older-than=days` | Nonzero exit on a stale database | — | absent | |
-| `--datadir=DIRECTORY` | Load signatures from DIRECTORY | `-d` / `--sigs-dir` | renamed | Different spelling, same job. `--sigs-dir` defaults to `/var/lib/exav`. |
+| `--datadir=DIRECTORY` | Load signatures from DIRECTORY | `-d` / `--sig-dir` | renamed | Different spelling, same job. `--sig-dir` defaults to `/var/lib/exav`. |
 | `--pid=FILE`, `-p` | Write the pid to FILE | — | absent | Use the supervisor's own pid tracking. |
 
 ### `clamd.conf` directives
@@ -297,7 +298,7 @@ nothing does.
 
 | Directive | What it does | exav equivalent | Notes |
 |---|---|---|---|
-| `DatabaseDirectory` | Where signatures live | `-d` / `--sigs-dir DIR` | |
+| `DatabaseDirectory` | Where signatures live | `-d` / `--sig-dir DIR` | |
 | `OfficialDatabaseOnly` | Load only official signatures | — | |
 | `FailIfCvdOlderThan` | Refuse a stale database | — | |
 | `DetectPUA` | Detect potentially unwanted applications | `--detect pua` | |
@@ -366,7 +367,7 @@ exav acts as a daemon client when given `--connect` together with paths.
 | `clamdscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
 | `--help`, `-h` | Show help | same spelling | same | |
-| `--version`, `-V` | Print version | same spelling | same | Answered locally, not by the daemon. |
+| `--version`, `-V` | Print version | same spelling | differs | Answered locally — `exav <version>` — where `clamdscan` asks the daemon and prints its `ClamAV <version>` reply. Use `--ping` to check the daemon is there; the wire `VERSION` still answers the ClamAV string to anything that speaks the protocol. |
 | `--verbose`, `-v` | Be verbose | `--verbose` | differs | `clamdscan -v` prints nothing a plain run does not. exav's names the daemon that answered and the command sent per target (`  [daemon] unix:… ClamAV …`, `  [SCAN] /abs/path`). The informational findings `-v` adds to a local scan come from the scanner, and a daemon reply carries only a verdict. |
 | `--quiet` | Only output error messages | `--quiet` | differs | Same difference as the scanner: exav still prints detections. |
 | `--stdout` | Write to stdout instead of stderr | — | absent | exav already writes results to stdout. |
@@ -403,7 +404,7 @@ Two client-mode behaviours have no flag to name them:
 
 | exav flag | What it does |
 |---|---|
-| `--sigs-dir <DIR>` | The directory signatures live in and `--auto-update` writes to (default `/var/lib/exav`). |
+| `--sig-dir <DIR>` | The directory signatures live in and `--auto-update` writes to (default `/var/lib/exav`). |
 | `--sig-sources <URL\|FILE>` | Where `--auto-update` fetches from: exact URLs, mirror bases (trailing `/`), or a file of either — which may be a `freshclam.conf`. |
 | `--db-url <URL>` | A prebuilt `.exavdb` to pull and serve instead of signature files. |
 | `--build-db <FILE>` | Compile the loaded signatures into a prebuilt `.exavdb` and exit. |
@@ -424,7 +425,7 @@ Two client-mode behaviours have no flag to name them:
 | `--spill-dir`, `--spill-threshold-bytes`, `--max-spill-bytes`, `--max-total-spill-bytes` | Where a streamed object waits while it is scanned, and how much RAM and temp space it may take. |
 | `--partial-as <POLICY>` | What becomes of an object exav could not fully examine: `partial` (default), `ok`, `found` or `error`, whole or per condition (`limits-exceeded=`, `unscannable=`, `password-protected=`). |
 | `--clamav-compat` | Preset reproducing a stock ClamAV build's limits and extractor set, for differential testing. Reduces detection on purpose. |
-| `--base64 on\|off` | Decode base64-embedded executables in text and script files. On by default. |
+| `--decode <LIST>` / `--no-decode <LIST>` | Encodings to recover a payload from before scanning it: `base64` today, meaning both a run long enough to hold an executable and the base64 assets a markup document embeds. On by default, unlike `--detect`. |
 | `--detect packed` | Report `Heuristics.Packed.*`, naming the packer wrapping an executable exav could not unpack. |
 | `--detect phishing` | Report `Heuristics.Phishing.Email.*` for display-versus-href link spoofing. Covers the checks ClamAV splits across `--alert-phishing-ssl` and `--alert-phishing-cloak`. |
 | `--detect heuristics` | Enable exav-exclusive structural / fuzzy / ML analysis. |

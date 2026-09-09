@@ -1,4 +1,4 @@
-//! `--perf-csv` output: turn a per-file [`exav_core::profile::Profile`] into a
+//! `--profile` CSV output: turn a per-file [`exav_core::profile::Profile`] into a
 //! row of a performance matrix (one column group per matcher). Kept out of
 //! `main.rs` so the CLI entry point stays orchestration-only.
 
@@ -8,7 +8,7 @@ use std::fmt::Write;
 use std::path::Path;
 use std::time::Duration;
 
-/// Matchers profiled by `--perf-csv`, in fixed column order so the header and
+/// Matchers profiled by `--profile`, in fixed column order so the header and
 /// every row line up. Must match the names passed to `profile::timed` in the
 /// scan path.
 const MATCHERS: &[&str] = &[

@@ -10,7 +10,7 @@ Answers to the questions that come up most often when running exav. See also
 
 exav **refuses to scan with no real signature database** rather than answer every
 file `OK` against near-zero coverage — a silently-passing scanner is the exact
-bypass exav exists to prevent. Point `-d`/`--sigs-dir` at a directory (or a prebuilt
+bypass exav exists to prevent. Point `-d`/`--sig-dir` at a directory (or a prebuilt
 `.exavdb`) containing real signatures; see [Signatures](/guides/signatures/). The
 tiny built-in EICAR-only baseline is opt-in for testing via `--allow-no-db`
 (`EXAV_ALLOW_NO_DB=1`).

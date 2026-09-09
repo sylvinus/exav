@@ -440,14 +440,24 @@ pub fn sig_dest(sigdir: &Path, url: &str) -> io::Result<PathBuf> {
     // and overwrites the other, so the two feeds flip-flop forever and the
     // loaded signature set depends on which finished last.
     //
-    // A short digest of the WHOLE url, query included, separates them. It is
-    // appended to the final component so the directory layout still reads as the
-    // origin it came from.
+    // A short digest of the WHOLE url, query included, separates them. It goes
+    // into the final component so the directory layout still reads as the origin
+    // it came from — and it goes in front of the extension, never after it. The
+    // loader dispatches on extension alone: `daily.cvd-473e5c` parses as an
+    // extension of `cvd-473e5c`, matches no arm, and is skipped in silence, so a
+    // digest appended at the end would fetch every source successfully and load
+    // none of them.
     if let Some(last) = parts.last_mut() {
         let mut h = Sha256::new();
         h.update(url.as_bytes());
         let d = h.finalize();
-        last.push_str(&format!("-{:02x}{:02x}{:02x}", d[0], d[1], d[2]));
+        let tag = format!("-{:02x}{:02x}{:02x}", d[0], d[1], d[2]);
+        // Split on the final dot, but only when there is a name in front of it:
+        // a leading-dot name is all extension, and has nothing to tag.
+        *last = match last.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => format!("{stem}{tag}.{ext}"),
+            _ => format!("{last}{tag}"),
+        };
     }
     for p in parts {
         dest.push(p);

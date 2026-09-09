@@ -365,6 +365,96 @@ impl Detectors {
     pub(crate) fn heuristics(&self) -> bool {
         self.has("heuristics")
     }
+
+    /// Everything in `self` that is not also in `other`, for `--no-detect`.
+    pub(crate) fn without(self, other: Self) -> Self {
+        let mut out = self;
+        for (o, drop) in out.on.iter_mut().zip(other.on.iter()) {
+            *o &= !drop;
+        }
+        out
+    }
+}
+
+/// An encoding exav recovers a payload from before scanning it.
+///
+/// Distinct from a detector, which decides whether something is *reported*, and
+/// from an unpacker, which opens a container the file declares itself to be.
+/// A decoder finds a payload that the carrier does not announce at all: a PE
+/// base64'd into a script, a long hex run in a PowerShell dropper.
+///
+/// On by default, unlike [`DETECTORS`], because a carrier that hides its payload
+/// is the ordinary case rather than the suspicious one, and a scan that skips it
+/// reports clean on a file it never really read.
+pub(crate) const DECODERS: [&str; 1] = ["base64"];
+
+/// Which decoders are switched on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Decoders {
+    on: [bool; DECODERS.len()],
+}
+
+impl Default for Decoders {
+    fn default() -> Self {
+        Self {
+            on: [true; DECODERS.len()],
+        }
+    }
+}
+
+impl Decoders {
+    /// Parse `--decode` / `--no-decode`: `none`, `all`, or a comma-separated
+    /// list of names.
+    pub(crate) fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        match s {
+            "none" | "" => Ok(Self::none()),
+            "all" => Ok(Self::default()),
+            list => {
+                let mut out = Self::none();
+                for item in list.split(',') {
+                    let item = item.trim();
+                    let idx = DECODERS
+                        .iter()
+                        .position(|d| d.eq_ignore_ascii_case(item))
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown decoder `{item}` (known: {}, plus `all` and `none`)",
+                                DECODERS.join(", ")
+                            )
+                        })?;
+                    out.on[idx] = true;
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// None of them.
+    pub(crate) fn none() -> Self {
+        Self {
+            on: [false; DECODERS.len()],
+        }
+    }
+
+    /// Everything in `self` that is not also in `other`, for `--no-decode`.
+    pub(crate) fn without(self, other: Self) -> Self {
+        let mut out = self;
+        for (o, drop) in out.on.iter_mut().zip(other.on.iter()) {
+            *o &= !drop;
+        }
+        out
+    }
+
+    /// Base64 runs long enough to hold an executable, and base64 assets embedded
+    /// in markup.
+    pub(crate) fn base64(&self) -> bool {
+        DECODERS
+            .iter()
+            .position(|d| *d == "base64")
+            .map(|i| self.on[i])
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

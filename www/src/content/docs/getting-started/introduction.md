@@ -81,7 +81,7 @@ coverage — the honesty property above, applied to its own configuration:
 ```console
 $ exav suspicious.bin
 exav: no signature database loaded — refusing to run (it would report real
-malware as clean). Load signatures with -d/--sigs-dir, or pass --allow-no-db
+malware as clean). Load signatures with -d/--sig-dir, or pass --allow-no-db
 to use the built-in EICAR-only baseline (testing only).
 ```
 

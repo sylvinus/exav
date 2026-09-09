@@ -48,7 +48,7 @@ FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /src/target/release/exav /exav
 COPY --from=dirs --chown=65532:65532 /data /var/lib/exav
 # Persist signatures across restarts. To reuse an existing ClamAV database
-# volume, mount it here (or set EXAV_SIGS_DIR=/var/lib/clamav and mount there).
+# volume, mount it here (or set EXAV_SIG_DIR=/var/lib/clamav and mount there).
 VOLUME ["/var/lib/exav"]
 # The image's own configuration, in the form every other setting takes: an
 # environment variable a flag on the command line can override. Listening on all

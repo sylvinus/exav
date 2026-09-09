@@ -26,11 +26,17 @@ docker run -d -p 3310:3310 -v exav-db:/var/lib/exav \
   -e EXAV_SIG_SOURCES=https://your-mirror/ ghcr.io/sylvinus/exav
 clamdscan --stream file.bin                       # once the load is logged
 
-# One-shot scan. `EXAV_LISTEN` is set in the image, and a listener and paths to
-# scan are different jobs — so clear it, or exav refuses rather than guessing
-# which one you meant.
-docker run --rm -e EXAV_LISTEN= -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+# One-shot scan. Paths win over the image's `EXAV_LISTEN`, so there is nothing
+# to unset — but the scan loads its own database, so it needs the signature
+# volume as well as the tree to scan.
+docker run --rm -v exav-db:/var/lib/exav -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 ```
+
+Naming paths is what makes that run a scanner rather than a daemon: `EXAV_LISTEN`
+is a default the image sets, and a default gives way to what the command line
+asks for. A `--listen` **typed on the command line** alongside paths is a
+different thing — two jobs in one command — and is refused rather than guessed
+at.
 
 The image's default command is `--auto-update`, with `EXAV_LISTEN` set to
 `clamd://0.0.0.0:3310`: serve the clamd protocol, and keep the signature volume
@@ -78,7 +84,7 @@ docker run --rm --no-healthcheck -e EXAV_LISTEN= \
 ```
 
 The signatures directory is `/var/lib/exav` (exav's own). To reuse an existing
-ClamAV volume, mount it there or set `EXAV_SIGS_DIR=/var/lib/clamav`.
+ClamAV volume, mount it there or set `EXAV_SIG_DIR=/var/lib/clamav`.
 
 <Aside type="caution" title="Signatures are never bundled">
 exav ships no GPL database and no CDN URL. With no real signatures the daemon
@@ -119,7 +125,7 @@ matter for most deployments:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EXAV_SIGS_DIR` | `/var/lib/exav` | Signatures directory (loaded recursively). |
+| `EXAV_SIG_DIR` | `/var/lib/exav` | Signatures directory (loaded recursively). |
 | `EXAV_SIG_SOURCES` | *(unset)* | Where to fetch signatures from: exact URLs, mirror bases (trailing `/`), or a file of either. Comma-separated for more than one. |
 | `EXAV_DB_URL` | *(unset)* | URL of a prebuilt `.exavdb` to pull and serve; hot-reloads, and replaces the signature-file sources rather than merging with them. |
 | `EXAV_LISTEN` | `clamd://0.0.0.0:3310` | What the container serves, and where. Comma-separated for more than one. |
@@ -171,6 +177,24 @@ writable by uid 65532 so the daemon can write signatures and temp files:
 mkdir -p ./exav-db && sudo chown 65532:65532 ./exav-db
 docker run -d -p 3310:3310 -v "$PWD/exav-db:/var/lib/exav" ghcr.io/sylvinus/exav
 ```
+
+### `--read-only` needs a writable temp dir
+
+An object larger than `--spill-threshold-bytes` (16M) is written to disk while it
+is scanned, so a container with `--read-only` and nowhere to write fails every
+scan above that size — small objects keep working, which is what makes it look
+intermittent. Give it a temp filesystem:
+
+```sh
+docker run -d -p 3310:3310 --read-only --tmpfs /tmp \
+  -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+```
+
+Without one the daemon logs `connection error: Permission denied` and drops the
+connection, and the client — `clamdscan` or exav's own — reports an error and
+exits `2`. It is never reported as clean, but it is not a verdict either: the
+scan did not happen. `--spill-dir` names somewhere other than `TMPDIR` if that
+suits the mount layout better.
 
 ## Dual container (shared volume)
 

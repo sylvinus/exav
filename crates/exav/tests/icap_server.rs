@@ -1392,7 +1392,7 @@ fn without_profiling_the_totals_are_still_kept() {
     assert!(scans_in(&stats) >= 1, "{stats}");
     assert!(stats.contains("throughput-MBps"), "{stats}");
     assert!(
-        stats.contains("MATCHERSTATS: off (start with --profile-scans)"),
+        stats.contains("MATCHERSTATS: off (start with --profile)"),
         "{stats}"
     );
 }

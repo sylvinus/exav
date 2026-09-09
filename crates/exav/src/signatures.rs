@@ -112,7 +112,7 @@ fn push_mirror_cvds(base: &str, out: &mut Vec<String>) {
 ///   `DatabaseCustomURL <url>`                                 -> one source, verbatim (http/https)
 /// A bare `http(s)` line (no directive) is a source. Every OTHER line is **warned
 /// about and ignored** — including `DatabaseDirectory` (set the dir with
-/// `--sigs-dir`/`EXAV_SIGS_DIR`, it is not a source) and non-source directives like
+/// `--sig-dir`/`EXAV_SIG_DIR`, it is not a source) and non-source directives like
 /// `Foreground` — so pointing at a real `freshclam.conf` reports exactly what was
 /// and wasn't used.
 fn parse_sources_file(path: &Path) -> std::io::Result<Vec<String>> {
@@ -152,10 +152,9 @@ fn parse_sources_file(path: &Path) -> std::io::Result<Vec<String>> {
                     warn(line, "DatabaseCustomURL must be an http(s) URL");
                 }
             }
-            "databasedirectory" => warn(
-                line,
-                "set the signature dir with --sigs-dir / EXAV_SIGS_DIR",
-            ),
+            "databasedirectory" => {
+                warn(line, "set the signature dir with --sig-dir / EXAV_SIG_DIR")
+            }
             _ => warn(line, "not a source URL or a supported freshclam directive"),
         }
     }
@@ -347,7 +346,7 @@ fn startup_timeout(cli: &Cli) -> Duration {
 }
 
 /// The signature path this run loads from and `--auto-update` maintains: the
-/// database named by `-d` when there is one, else the `--sigs-dir` directory.
+/// database named by `-d` when there is one, else the `--sig-dir` directory.
 fn signature_path(cli: &Cli) -> PathBuf {
     cli.database.clone().unwrap_or_else(|| cli.sigs.clone())
 }
@@ -391,6 +390,26 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
         interval.as_secs()
     );
 
+    // A source is saved under the filename its URL ends in, and the loader routes
+    // a database file by extension alone. A URL ending in anything else — a CGI
+    // endpoint like `feed.php?db=daily`, a redirect landing on `download`, a
+    // `.txt` mirror — is fetched successfully and then skipped in silence, which
+    // costs an operator a working command line and a database that is never
+    // there. Nothing later in the run says so: "updated signature X" is printed
+    // by the fetch, and the loader does not report what it passed over.
+    #[cfg(feature = "http-update")]
+    for url in &sources {
+        let name = exav_update::url_basename(url).unwrap_or_default();
+        if !exav_core::loader::loads_by_extension(&name) {
+            eprintln!(
+                "exav: {url} saves as `{name}`, which the loader does not recognise as a \
+                 database — it will be fetched and not loaded. Signatures are routed by \
+                 extension: name the URL after the file it serves (.cvd, .cld, .ndb, .hdb, \
+                 .ldb, .yar, …)."
+            );
+        }
+    }
+
     #[cfg(not(feature = "http-update"))]
     {
         eprintln!(
@@ -418,7 +437,7 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
 
 /// Pull a prebuilt `.exavdb` from `--db-url` and keep it current.
 ///
-/// The destination is `-d` when given, else `<--sigs-dir>/remote.exavdb`;
+/// The destination is `-d` when given, else `<--sig-dir>/remote.exavdb`;
 /// whichever it is becomes the database this run loads. The initial fetch is
 /// synchronous so the first load sees a file, and a background poll re-checks it
 /// every `--update-interval-secs` — cheap when nothing changed, since a `HEAD`

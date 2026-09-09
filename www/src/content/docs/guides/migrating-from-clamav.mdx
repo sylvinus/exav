@@ -57,7 +57,7 @@ Put these earlier on `PATH` than ClamAV's own (`/usr/local/bin` before
 ```sh
 # /usr/local/bin/clamscan
 #!/bin/sh
-exec exav --sigs-dir /var/lib/clamav "$@"
+exec exav --sig-dir /var/lib/clamav "$@"
 ```
 
 ```sh
@@ -69,7 +69,7 @@ exec exav --connect /run/clamav/clamd.ctl "$@"
 Each pins the one thing the caller's command line does not carry, and passes
 everything else through:
 
-- **`--sigs-dir`** names the directory `freshclam` populates. exav's own default
+- **`--sig-dir`** names the directory `freshclam` populates. exav's own default
   is `/var/lib/exav`, so without this a caller that relied on `clamscan`'s default
   database directory gets `no signature database loaded — refusing to run`.
   A caller that passes its own `-d` overrides the pinned directory; the two on
@@ -130,7 +130,7 @@ command line. The simplest swap:
 exav -d /var/lib/clamav /data          # what `clamscan -r /data` scanned
 ```
 
-For an interactive shell, `alias clamscan='exav --sigs-dir /var/lib/clamav'`. For
+For an interactive shell, `alias clamscan='exav --sig-dir /var/lib/clamav'`. For
 scripts and cron jobs, which do not read your shell aliases, use the
 [wrapper on `PATH`](#wrapping-clamscan-and-clamdscan).
 
@@ -270,8 +270,19 @@ Encryption are detected but not decrypted. See
 - **Signature coverage** is ClamAV's — exav runs those signatures but adds none
   of its own. A handful (PCRE subsignatures, some bytecode) are skipped and
   **counted**, never silently ignored.
-- **Large-DB memory** is currently higher in exav than ClamAV (being worked on);
-  use `--build-db` and give the loader host enough RAM.
+- **Large-DB memory** is currently higher in exav than ClamAV, by enough to
+  matter: loading a stock `freshclam` directory (`main` + `daily` + `bytecode`)
+  costs several GB where `clamscan` on the same files costs a fraction of that.
+  On a host or container without the headroom the loader is OOM-killed, and an
+  OOM kill writes nothing to the log — the process is simply gone, which reads
+  like a crash with no cause. `docker inspect --format '{{.State.OOMKilled}}'`
+  confirms it.
+
+  Compile the set **once** with `--build-db` on a machine with room, and give
+  every scanner the `.exavdb`: it loads in under a second and a fraction of the
+  memory. A daemon pays the load once for its whole lifetime, so this is mostly
+  a problem for the one-shot `clamscan` swap, which pays it per invocation.
+  Being worked on.
 - exav is **beta**: treat non-detections with caution and keep ClamAV as a
   fallback until you've validated coverage on your own corpus (see
   [Differential testing](/concepts/differential-testing/)).

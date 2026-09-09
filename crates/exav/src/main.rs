@@ -253,11 +253,11 @@ struct Cli {
     #[arg(long = "log", value_name = "FILE", env = "EXAV_LOG")]
     log: Option<PathBuf>,
 
-    /// Load this exact FILE or DIR instead of --sigs-dir. Recognizes `.ndb`,
+    /// Load this exact FILE or DIR instead of --sig-dir. Recognizes `.ndb`,
     /// `.hdb`/`.hsb`, `.fdb` (fuzzy), exav `.db`, and `.cvd`/`.cld` containers;
     /// a DIR is scanned recursively (hidden `.`-prefixed sub-dirs skipped).
     ///
-    /// Distinct from --sigs-dir, which names the *directory signatures live in* —
+    /// Distinct from --sig-dir, which names the *directory signatures live in* —
     /// the one --auto-update writes into and the one a sidecar populates. This
     /// names what to load, and is how a deployment loads a prebuilt `.exavdb`
     /// that lives somewhere other than that directory. With neither, and no real
@@ -277,9 +277,9 @@ struct Cli {
     /// keep it current — it is the directory written to, so it stays a
     /// directory even when -d points the load somewhere else.
     #[arg(
-        long = "sigs-dir",
+        long = "sig-dir",
         value_name = "DIR",
-        env = "EXAV_SIGS_DIR",
+        env = "EXAV_SIG_DIR",
         default_value = "/var/lib/exav"
     )]
     sigs: PathBuf,
@@ -297,7 +297,7 @@ struct Cli {
     /// legible from the value. A `freshclam.conf` works as-is — exav reads its
     /// *source* directives (`DatabaseMirror`/`PrivateMirror`,
     /// `DatabaseCustomURL`) and warns about the lines it ignores, including
-    /// `DatabaseDirectory` (that is --sigs-dir; it is not a source).
+    /// `DatabaseDirectory` (that is --sig-dir; it is not a source).
     ///
     /// No source is privileged: every URL here is fetched the same way, over
     /// plain HTTPS with no signature verification. Point it at a mirror you
@@ -318,7 +318,7 @@ struct Cli {
     /// Needs a build with `--features http-update`.
     ///
     /// Where it lands, and is therefore loaded from, is `-d` when given, else
-    /// `<--sigs-dir>/remote.exavdb`.
+    /// `<--sig-dir>/remote.exavdb`.
     #[arg(long = "db-url", value_name = "URL", env = "EXAV_DB_URL")]
     db_url: Option<String>,
 
@@ -338,8 +338,9 @@ struct Cli {
     /// not wait. [default: 1800 with --auto-update, 0 otherwise]
     #[arg(
         long = "startup-wait-secs",
-        value_name = "SECS",
-        env = "EXAV_STARTUP_WAIT_SECS"
+        value_name = "SECS|off",
+        env = "EXAV_STARTUP_WAIT_SECS",
+        value_parser = parse_limit_secs
     )]
     startup_timeout: Option<u64>,
 
@@ -348,8 +349,9 @@ struct Cli {
     /// loop with no delay aimed at someone else's servers. [default: 86400]
     #[arg(
         long = "update-interval-secs",
-        value_name = "SECS",
-        env = "EXAV_UPDATE_INTERVAL_SECS"
+        value_name = "SECS|off",
+        env = "EXAV_UPDATE_INTERVAL_SECS",
+        value_parser = parse_limit_secs
     )]
     update_interval_secs: Option<u64>,
 
@@ -438,8 +440,9 @@ struct Cli {
     #[cfg(feature = "icap")]
     #[arg(
         long = "icap-preview-bytes",
-        value_name = "N",
-        env = "EXAV_ICAP_PREVIEW_BYTES"
+        value_name = "SIZE|off",
+        env = "EXAV_ICAP_PREVIEW_BYTES",
+        value_parser = parse_size_usize
     )]
     icap_preview_size: Option<usize>,
 
@@ -458,8 +461,9 @@ struct Cli {
     #[cfg(feature = "icap")]
     #[arg(
         long = "icap-options-ttl-secs",
-        value_name = "SECS",
-        env = "EXAV_ICAP_OPTIONS_TTL_SECS"
+        value_name = "SECS|off",
+        env = "EXAV_ICAP_OPTIONS_TTL_SECS",
+        value_parser = parse_limit_secs_u32
     )]
     icap_options_ttl: Option<u32>,
 
@@ -478,8 +482,9 @@ struct Cli {
     #[cfg(feature = "icap")]
     #[arg(
         long = "icap-idle-secs",
-        value_name = "SECS",
-        env = "EXAV_ICAP_IDLE_SECS"
+        value_name = "SECS|off",
+        env = "EXAV_ICAP_IDLE_SECS",
+        value_parser = parse_limit_secs
     )]
     icap_idle_timeout: Option<u64>,
 
@@ -488,8 +493,9 @@ struct Cli {
     #[cfg(feature = "icap")]
     #[arg(
         long = "icap-max-header-bytes",
-        value_name = "N",
-        env = "EXAV_ICAP_MAX_HEADER_BYTES"
+        value_name = "SIZE|off",
+        env = "EXAV_ICAP_MAX_HEADER_BYTES",
+        value_parser = parse_size_usize
     )]
     icap_max_header_size: Option<usize>,
 
@@ -547,7 +553,8 @@ struct Cli {
     ///
     /// A count runs a prefork pool — one worker process per core, each scanning
     /// one job at a time under kernel-enforced per-job limits (see
-    /// --max-scan-secs/-memory) and recycled per --max-jobs-per-worker, so a
+    /// --max-scan-secs and --max-process-bytes) and recycled per
+    /// --max-jobs-per-worker, so a
     /// runaway scan is isolated and hard-killed. `threads` runs the listeners
     /// in one process instead, which cannot kill a single job but is the only
     /// model where both listeners share one set of counters.
@@ -568,8 +575,9 @@ struct Cli {
     /// [default in the pool: 120; unset otherwise]
     #[arg(
         long = "max-scan-secs",
-        value_name = "SECS",
-        env = "EXAV_MAX_SCAN_SECS"
+        value_name = "SECS|off",
+        env = "EXAV_MAX_SCAN_SECS",
+        value_parser = parse_limit_secs
     )]
     max_scan_time: Option<u64>,
 
@@ -580,7 +588,7 @@ struct Cli {
     /// suffixes; 0 = none. [default in the pool: 2G; unset otherwise]
     #[arg(
         long = "max-process-bytes",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         env = "EXAV_MAX_PROCESS_BYTES",
         value_parser = parse_size
     )]
@@ -610,7 +618,7 @@ struct Cli {
     /// build-memory knob, not a performance one.
     #[arg(
         long = "build-shard-bytes",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         env = "EXAV_BUILD_SHARD_BYTES",
         value_parser = parse_size
     )]
@@ -632,7 +640,7 @@ struct Cli {
     #[arg(
         long = "max-input-bytes",
         env = "EXAV_MAX_INPUT_BYTES",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         value_parser = parse_size
     )]
     max_input_bytes: Option<u64>,
@@ -662,7 +670,7 @@ struct Cli {
     /// files; lowering it does the reverse.
     #[arg(
         long = "spill-threshold-bytes",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         env = "EXAV_SPILL_THRESHOLD_BYTES",
         value_parser = parse_size
     )]
@@ -678,7 +686,7 @@ struct Cli {
     /// one object.
     #[arg(
         long = "max-spill-bytes",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         env = "EXAV_MAX_SPILL_BYTES",
         value_parser = parse_size
     )]
@@ -695,7 +703,7 @@ struct Cli {
     /// size you expect.
     #[arg(
         long = "max-total-spill-bytes",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         env = "EXAV_MAX_TOTAL_SPILL_BYTES",
         value_parser = parse_size
     )]
@@ -709,7 +717,7 @@ struct Cli {
     #[arg(
         long = "max-extracted-bytes",
         env = "EXAV_MAX_EXTRACTED_BYTES",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         value_parser = parse_size
     )]
     max_extracted_bytes: Option<u64>,
@@ -723,7 +731,7 @@ struct Cli {
     #[arg(
         long = "max-object-bytes",
         env = "EXAV_MAX_OBJECT_BYTES",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         value_parser = parse_size
     )]
     max_buffer_bytes: Option<u64>,
@@ -738,7 +746,7 @@ struct Cli {
     #[arg(
         long = "max-matcher-bytes",
         env = "EXAV_MAX_MATCHER_BYTES",
-        value_name = "SIZE",
+        value_name = "SIZE|off",
         value_parser = parse_size
     )]
     max_scanned_bytes: Option<u64>,
@@ -766,29 +774,42 @@ struct Cli {
     #[arg(long = "max-members", env = "EXAV_MAX_MEMBERS", value_name = "N")]
     max_members: Option<u64>,
 
-    /// Decode base64-encoded executables embedded in text/script files.
-    /// On by default; off under --clamav-compat, which has no such reach.
+    /// Encodings to recover a payload from before scanning it: `all` (the
+    /// default), `none`, or a comma-separated list.
     ///
-    /// Spelled as a value rather than as `--no-base64` so an explicit choice can
-    /// win over the compat preset, the way every other preset flag's does: a
-    /// negative switch has no way to say "on", so under compat there would be no
-    /// way to ask for it back.
+    ///   base64  A run long enough to hold an executable, decoded and rescanned
+    ///           when it starts with an executable magic — how a PE reaches a
+    ///           machine inside a PowerShell, JS or RTF dropper. Also the
+    ///           base64 assets a markup document embeds, such as a `data:` URI
+    ///           image on a phishing page.
     ///
-    /// Takes `on`/`off`, `true`/`false`, `yes`/`no` or `1`/`0` — the same
-    /// vocabulary every `EXAV_*` switch reads — or nothing at all, which means
-    /// on. Listed here because clap's own summary shows only `true`/`false`,
-    /// which would read as a refusal of the `off` that `--clamav-compat`'s
-    /// description tells you to write.
+    /// On by default, unlike --detect: a carrier that hides its payload is the
+    /// ordinary case, and skipping it reports clean on a file never really read.
+    /// Off under --clamav-compat, which has no such reach; naming it here asks
+    /// for it back.
+    ///
+    /// A decoder is not an unpacker: an unpacker opens a container the file
+    /// declares itself to be, and a decoder finds a payload the carrier does not
+    /// announce at all.
     #[arg(
-        long = "base64",
-        value_name = "on|off",
-        env = "EXAV_BASE64",
-        value_parser = env_switch(),
-        num_args = 0..=1,
-        default_missing_value = "true",
-        hide_possible_values = true
+        long = "decode",
+        env = "EXAV_DECODE",
+        value_name = "LIST",
+        value_parser = policy::Decoders::parse
     )]
-    base64: Option<bool>,
+    decode: Option<policy::Decoders>,
+
+    /// Encodings NOT to recover a payload from, subtracted from --decode.
+    ///
+    /// The two compose rather than contradict, so `--decode all --no-decode
+    /// base64` is well defined and needs no rule about which flag wins.
+    #[arg(
+        long = "no-decode",
+        env = "EXAV_NO_DECODE",
+        value_name = "LIST",
+        value_parser = policy::Decoders::parse
+    )]
+    no_decode: Option<policy::Decoders>,
 
     /// Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding
     /// N or more valid credit-card numbers. Off unless set.
@@ -842,6 +863,19 @@ struct Cli {
     )]
     detect: Option<policy::Detectors>,
 
+    /// Detectors NOT to switch on, subtracted from --detect.
+    ///
+    /// What `--detect all` is for: everything exav can look for, minus the one
+    /// that is noisy on this corpus. The two compose rather than contradict, so
+    /// no rule is needed about which of them wins.
+    #[arg(
+        long = "no-detect",
+        env = "EXAV_NO_DETECT",
+        value_name = "LIST",
+        value_parser = policy::Detectors::parse
+    )]
+    no_detect: Option<policy::Detectors>,
+
     /// Which status an object exav could not fully examine is reported as.
     /// One value for all of them, or per category, e.g.
     /// `password-protected=ok,limits-exceeded=found`.
@@ -878,7 +912,7 @@ struct Cli {
 
     /// Password to try when decrypting encrypted archive members (ZIP
     /// ZipCrypto/AES). Repeatable (comma-separated in the environment):
-    /// `--password a --password b` builds a pool, tried in order. Unioned with
+    /// `--passwords a --passwords b` builds a pool, tried in order. Unioned with
     /// any passwords loaded from `.pwdb` databases. When a scan reports
     /// `password-protected`, re-run with the right password.
     #[arg(
@@ -891,8 +925,8 @@ struct Cli {
 
     /// Shortcut that sets exav to a stock ClamAV build's documented defaults for
     /// apples-to-apples differential testing. Equivalent to `--max-input-bytes
-    /// 100M --max-extracted-bytes 400M --max-depth 17 --max-members 10000
-    /// --base64 off`, plus narrowing the unpacking reach to the formats stock
+    /// 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000
+    /// --decode none`, plus narrowing the unpacking reach to the formats stock
     /// ClamAV handles and reporting under ClamAV's vocabulary where the two
     /// engines name the same fact differently. This DELIBERATELY REDUCES exav's
     /// detection capability so results reproduce clamscan's — it is a
@@ -1050,6 +1084,20 @@ pub(crate) enum Descent {
     Immediate,
     /// The whole tree below the named directory.
     Recursive,
+}
+
+/// How far a named directory is walked. Naming a directory means the directory:
+/// scanning only its top level by default — as `clamscan` does — answers a
+/// question nobody asked, and answers it in the shape of a clean result, because
+/// the files that were never opened look exactly like the ones that were fine.
+/// `--no-recursive` is the opt-out, and it reads the same on every surface that
+/// walks a tree.
+pub(crate) fn descent(cli: &Cli) -> Descent {
+    if cli.no_recursive {
+        Descent::Immediate
+    } else {
+        Descent::Recursive
+    }
 }
 
 /// Walk `root` for regular files, keeping the paths the walk could not reach.
@@ -1268,19 +1316,50 @@ fn ignore_sigpipe() {}
 ///
 /// Returns the guidance for the first recognised flag, if any.
 fn clamscan_flag_hint(args: &[String]) -> Option<String> {
-    // Only the ones whose exav answer is a different spelling or a default, not
-    // every clamscan flag: pointing at the matrix is the answer for the rest.
+    // Every flag the matrix marks *renamed* answers here, short spellings
+    // included, and `docs_name_the_exav_flag_for_every_renamed_clamscan_flag`
+    // holds the two together. A renamed flag is the case where exav does the
+    // job under another name, so the alternative to naming that name is a
+    // reader with a working command line, a table, and no way to know which row
+    // of it they are on. Flags exav simply does not have are not listed: the
+    // matrix link under every one of these messages is their answer.
     let hint = |s: &str| -> Option<&'static str> {
         Some(match s {
             "-r" | "--recursive" => {
                 "a named directory is already scanned recursively; drop the flag \
                  (--no-recursive stops at its immediate files)"
             }
+            // clamscan spells one output dial three ways.
             "-i" | "--infected" => "use --quiet, which is the same dial",
             "--no-summary" => "use --quiet, which suppresses the OK lines and the summary together",
+            "-o" | "--suppress-ok-results" => {
+                "use --quiet, which drops the OK lines and the summary together"
+            }
             "--remove" | "--move" | "--copy" => {
                 "exav reports and does not move or delete; act on the exit code"
             }
+            "-z" | "--allmatch" => "use --all-matches, which keeps scanning past the first match",
+            "-f" | "--file-list" => "use --files-from, the spelling xargs and tar use",
+            "--datadir" => "use --sig-dir (or -d) to name the directory signatures live in",
+            "--tempdir" => "use --spill-dir, where a streamed object waits while it is scanned",
+            "--statistics" => "use --profile, a per-matcher timing breakdown",
+            "--max-scantime" => "use --max-scan-secs, which is seconds rather than milliseconds",
+            // The client's two transport switches are one dial in exav.
+            "--fdpass" => "use --send-as fd",
+            "--stream" => "use --send-as contents",
+            // The heuristic switches are one flag taking a list.
+            "--detect-pua" => "use --detect pua",
+            "--alert-broken" => "use --detect broken, which covers Mach-O as well as PE and ELF",
+            "--alert-broken-media" => "use --detect broken-media",
+            "--alert-macros" => "use --detect macros, which covers XLM and OOXML as well as OLE2",
+            "--alert-phishing-ssl" | "--alert-phishing-cloak" => {
+                "use --detect phishing, one detector covering both checks"
+            }
+            "--alert-partition-intersection" => {
+                "use --detect partition-intersection, which covers GPT, APM and MBR"
+            }
+            "--structured-ssn-count" => "use --alert-ssns",
+            "--structured-cc-count" => "use --alert-credit-cards",
             // The renamed limits. Aliases were rejected on purpose — one
             // spelling per bound — and the migration guide's promise for that
             // trade is "a clear error naming the exav flag", which is this.
@@ -1356,6 +1435,25 @@ fn main() -> ExitCode {
     if let Err(msg) = check_flag_conflicts(&cli) {
         eprintln!("exav: {msg}");
         return ExitCode::from(2);
+    }
+
+    // The daemon holds the database and does the scanning, so a scanning flag on
+    // the client is one nobody applies. Needs argv rather than the parsed `Cli`:
+    // a variable is a default for whatever the image runs, and only a flag the
+    // caller typed is a contradiction.
+    if cli.connect.is_some() {
+        let ignored = flags_the_client_cannot_honour(&argv);
+        if !ignored.is_empty() {
+            eprintln!(
+                "exav: --connect hands each file to the daemon, which scans it under the \
+                 configuration it was started with, so a client cannot apply {}",
+                ignored.join(", ")
+            );
+            eprintln!(
+                "exav: set it where the daemon starts, or drop --connect to scan here instead"
+            );
+            return ExitCode::from(2);
+        }
     }
 
     // Installed before anything can buffer an object, and once: every surface
@@ -1600,7 +1698,7 @@ fn main() -> ExitCode {
     if is_effectively_empty(&db) && !cli.allow_no_db {
         eprintln!(
             "exav: no signature database loaded — refusing to run (it would report real \
-             malware as clean). Load signatures with -d/--sigs-dir, or pass --allow-no-db \
+             malware as clean). Load signatures with -d/--sig-dir, or pass --allow-no-db \
              to use the built-in EICAR-only baseline (testing only)."
         );
         return ExitCode::from(2);
@@ -2013,7 +2111,7 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     if let Some(s) = cli.max_scanned_bytes {
         opts.limits.max_scanned_bytes = s;
     }
-    // --max-depth: nesting depth. exav default 16; compat 17.
+    // --max-unpack-depth: nesting depth. exav default 16; compat 17.
     if let Some(r) = cli.max_recursion.or_else(|| compat.then_some(17)) {
         opts.limits.max_recursion = r;
     }
@@ -2029,10 +2127,19 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     // ways to ask for one mode.
     opts.restrict_extractors = compat;
     opts.unofficial_suffix = compat;
-    // Base64 executable decoding: exav-exclusive reach, on by default and off
-    // under --clamav-compat for parity — but an explicit `--base64 on/off` wins
-    // over the preset, as every other flag here does.
-    opts.decode_base64 = cli.base64.unwrap_or(!compat);
+    // Decoders: exav-exclusive reach, on by default and off under
+    // --clamav-compat for parity. An explicit --decode wins over the preset, as
+    // every other flag here does, and --no-decode subtracts from whatever that
+    // left, so the two never need a precedence rule between them.
+    let decode = cli
+        .decode
+        .unwrap_or(if compat {
+            policy::Decoders::none()
+        } else {
+            policy::Decoders::default()
+        })
+        .without(cli.no_decode.unwrap_or_else(policy::Decoders::none));
+    opts.decode_base64 = decode.base64();
 
     // `clamav_heuristics` (PDF ObfuscatedNameObject, imphash `.imp` matching) is on
     // by default from `ScanOptions::default()` — a faithful out-of-the-box scan —
@@ -2046,7 +2153,7 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     // second question, not the first: they turn a condition into a detection
     // under ClamAV's own `Heuristics.Encrypted.*` / `Heuristics.Limits.*`
     // names, which is exactly what `--partial-as … =alert` asks for.
-    let detect = cli.detect.unwrap_or_default();
+    let detect = detectors(cli);
     let partial_as = cli.partial_as.unwrap_or_default();
     opts.heuristics = detect.heuristics();
     opts.alert_macros = detect.macros();
@@ -2138,14 +2245,91 @@ fn configure_spill(cli: &Cli) -> Result<(), String> {
     }
     if cfg.threshold > cfg.max_object {
         return Err(format!(
-            "--spill-threshold ({}) exceeds --max-spill-bytes ({}): an object would be refused the \
-             disk it only needs because it outgrew RAM",
+            "--spill-threshold-bytes ({}) exceeds --max-spill-bytes ({}): an object would be \
+             refused the disk it only needs because it outgrew RAM",
             spill::human_bytes(cfg.threshold),
             spill::human_bytes(cfg.max_object)
         ));
     }
     spill::configure(cfg);
     Ok(())
+}
+
+/// What a `--connect` client can act on itself. Everything else exav accepts
+/// configures scanning or serving, and a client does neither: it walks the paths,
+/// hands each one to the daemon, and prints the reply the daemon decided.
+///
+/// The list is the honoured set rather than the ignored one, deliberately. A
+/// flag added later is refused alongside `--connect` until somebody decides it is
+/// client-side and adds it here, so the failure lands on whoever adds the flag
+/// instead of on an operator whose size cap was never applied.
+const CLIENT_HONOURS: &[&str] = &[
+    // Which daemon, and how the file gets there.
+    "--connect",
+    "--send-as",
+    // Which paths, chosen here because the client walks the tree itself.
+    "--files-from",
+    "--no-recursive",
+    "--exclude",
+    "--exclude-dir",
+    "--include",
+    // What is printed, and where.
+    "--quiet",
+    "--verbose",
+    "--json",
+    "--log",
+    "--bell",
+    // Answered before a scan, or asked of the daemon on the wire.
+    "--all-matches",
+    "--ping",
+    "--help",
+    "--version",
+];
+
+/// Flags typed alongside `--connect` that the client cannot honour.
+///
+/// `--max-input-bytes 1M` on a client is a size cap nobody applies: it parses,
+/// it looks like it is in force, and the daemon scans under its own limits.
+/// exav's answer to a flag it cannot honour is to stop, and this is that answer
+/// for the client — the same reasoning `--partial-as` already gets below,
+/// applied to the rest of the engine rather than to the one flag someone
+/// happened to try.
+///
+/// Only what is **typed** counts. A variable is a default for whatever the
+/// container runs, so `docker exec … --connect` inside an image that sets
+/// `EXAV_MAX_INPUT_BYTES` for its daemon is not a contradiction to refuse.
+fn flags_the_client_cannot_honour(argv: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for a in argv {
+        // `-` is stdin, and a bare `--` ends the flags.
+        if a == "-" || a == "--" || !a.starts_with('-') {
+            continue;
+        }
+        let bare = a.split('=').next().unwrap_or(a);
+        // Short spellings map to the long name the message should name.
+        let name = match bare {
+            "-v" => "--verbose",
+            "-h" => "--help",
+            "-V" => "--version",
+            other => other,
+        };
+        if !CLIENT_HONOURS.contains(&name) && !found.iter().any(|f| f == bare) {
+            found.push(bare.to_string());
+        }
+    }
+    found
+}
+
+/// The detectors this run switches on: `--detect` minus `--no-detect`.
+///
+/// One function because two callers need the same answer. `pua` is applied when
+/// the database loads and the rest when a file is scanned, so the two read it
+/// from different places, and a subtraction done in only one of them would load
+/// the PUA databases for a run that asked not to detect PUA.
+fn detectors(cli: &Cli) -> policy::Detectors {
+    cli.detect
+        .unwrap_or_default()
+        .without(cli.no_detect.unwrap_or_default())
 }
 
 fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
@@ -2156,8 +2340,7 @@ fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
     if cli.partial_as.is_some() && cli.connect.is_some() {
         return Err(
             "--partial-as decides how a scan reports what it could not examine, so it \
-             belongs to whatever does the scanning; set it on the daemon you are \
-             --connect-ing to"
+             belongs to whatever does the scanning; set it on the daemon at --connect"
                 .to_string(),
         );
     }
@@ -2184,6 +2367,48 @@ fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
     if cli.workers.is_some() && clamd.is_none() {
         return Err(
             "--workers is the clamd listener's worker model; it needs --listen clamd://…"
+                .to_string(),
+        );
+    }
+    // A listener's settings need that listener, the same way `--workers` above
+    // does. One process serves at most one listener per protocol, so there is
+    // never a question of *which* one these mean; the only way to get them wrong
+    // is to tune a listener that was never started, and then wonder why the
+    // preview size or the shutdown policy had no effect.
+    #[cfg(feature = "icap")]
+    if icap_endpoint(cli).is_none() {
+        let set: Vec<&str> = [
+            ("--icap-preview-bytes", cli.icap_preview_size.is_some()),
+            (
+                "--icap-transfer-preview",
+                cli.icap_transfer_preview.is_some(),
+            ),
+            ("--icap-options-ttl-secs", cli.icap_options_ttl.is_some()),
+            ("--icap-max-requests", cli.icap_keepalive_requests.is_some()),
+            ("--icap-idle-secs", cli.icap_idle_timeout.is_some()),
+            (
+                "--icap-max-header-bytes",
+                cli.icap_max_header_size.is_some(),
+            ),
+            (
+                "--icap-infection-header",
+                cli.icap_infection_header.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect();
+        if !set.is_empty() {
+            return Err(format!(
+                "{} tune the ICAP listener; it needs --listen icap://…",
+                set.join(", ")
+            ));
+        }
+    }
+    if cli.allow_shutdown && clamd.is_none() {
+        return Err(
+            "--allow-shutdown answers the clamd SHUTDOWN command; it needs --listen clamd://… \
+             (ICAP has no such request)"
                 .to_string(),
         );
     }
@@ -2273,7 +2498,7 @@ fn baseline_sig_count() -> usize {
 }
 
 /// Whether `db` carries no real detection capability beyond the built-in
-/// baseline — an absent DB, an empty/junk `--sigs-dir`, OR a *valid-but-empty*
+/// baseline — an absent DB, an empty/junk `--sig-dir`, OR a *valid-but-empty*
 /// loaded database (e.g. a build server that shipped a signature-less `.exavdb`).
 /// Checking the loaded count, not just whether a source path exists, is what
 /// makes this hard to fool: a reachable daemon in this state would report real
@@ -2305,14 +2530,14 @@ fn guard_not_empty(db: Scanner, source: &str, allow_no_db: bool) -> Result<Scann
 }
 
 fn load_db(cli: &Cli) -> Result<Scanner, String> {
-    // `--unofficial-names` (or the `--clamav-compat` preset) selects exact ClamAV
-    // naming (the `.UNOFFICIAL` suffix / `YARA.` prefix on unofficial-database
-    // signatures). The suffix is actually applied at report time from
-    // `ScanOptions::unofficial_suffix`; this load-time flag is retained for
-    // provenance/API compatibility.
+    // `--clamav-compat` selects exact ClamAV naming: the `.UNOFFICIAL` suffix and
+    // `YARA.` prefix on signatures from an unofficial database. Provenance is
+    // recorded per signature at load, always; the suffix itself is applied at
+    // report time from `ScanOptions::unofficial_suffix`, so one loaded database
+    // serves both compat and non-compat scans.
     let suffix = cli.clamav_compat;
     let bmem = cli.max_build_memory;
-    let pua = cli.detect.unwrap_or_default().pua();
+    let pua = detectors(cli).pua();
     if let Some(path) = &cli.database {
         return loader::load_with_options_mem(path, pua, suffix, bmem).map_err(|e| e.to_string());
     }
@@ -2338,15 +2563,7 @@ fn scan_target(
     totals: &mut Totals,
 ) {
     if path.is_dir() {
-        // Naming a directory means the directory. Scanning only its top level by
-        // default — as `clamscan` does, and as exav used to — answers a question
-        // nobody asked, and answers it in the shape of a clean result: the files
-        // that were never opened look exactly like the ones that were fine.
-        let descent = if cli.no_recursive {
-            Descent::Immediate
-        } else {
-            Descent::Recursive
-        };
+        let descent = descent(cli);
         // Parts of a byte-split archive, remembered as they go past. Only a
         // name that parses as one is kept, so a tree of ordinary files costs
         // one parse each and nothing is accumulated.
@@ -2542,9 +2759,15 @@ fn report_error(name: &str, message: &str, cli: &Cli, totals: &mut Totals) {
     if cli.json {
         println!(
             "{}",
+            // `category` sub-classifies a PARTIAL and appears nowhere else, so a
+            // pipeline filtering on it returns nothing rather than failing. It
+            // carried a lowercase `"error"` here, which was both a second
+            // vocabulary for one field and the only lowercase status word
+            // anywhere: the human line, the clamd wire and the ICAP headers all
+            // say ERROR. `reason` is the name the other three surfaces give the
+            // explanation, `detail` was this one site's own.
             serde_json::json!({
-                "file": name, "category": "error",
-                "status": "ERROR", "detail": message
+                "file": name, "status": "ERROR", "reason": message
             })
         );
     } else if !cli.quiet {
@@ -3156,13 +3379,16 @@ fn run_client(cli: &Cli) -> ExitCode {
     for p in &cli.paths {
         if p.as_os_str() == "-" {
             scan_stdin = true;
-        // A directory always recurses in client mode, with or without `-r`:
+        // A directory recurses by default in client mode, with or without `-r`:
         // clamdscan has no such flag, so a command line migrated from it names a
         // tree and expects the tree scanned, and the daemon descends into any
-        // path it is handed anyway. The client does the walking itself so
-        // `--exclude`/`--include` apply and each command has one reply.
+        // path it is handed anyway. `--no-recursive` still opts out — the client
+        // does the walking itself, so it is the one thing here that can honour
+        // it, and a flag that is quietly dropped is how a partial scan comes back
+        // looking complete. `--exclude`/`--include` apply for the same reason,
+        // and each command gets one reply.
         } else if p.is_dir() {
-            let walk = walk_tree(p, Some(&filters), Descent::Recursive);
+            let walk = walk_tree(p, Some(&filters), descent(cli));
             walk_errors.extend(walk.errors);
             if sending_contents {
                 // Grouped by the directory the parts sit in: `a/big.7z.001` and
@@ -3448,7 +3674,15 @@ fn print_daemon_reply(line: &str, cli: &Cli, totals: &mut Totals) {
         // counter and stderr.
         if partial_category(verdict).is_some() {
             totals.limits += 1;
-            outln!("{line}");
+            // `ERROR` is the wire's word, not exav's: the protocol has three
+            // status words and a partial verdict has to travel inside one of
+            // them. Having read the category back, say what a local scan of the
+            // same object says, or the status word depends on which end held
+            // the database.
+            match line.strip_suffix("ERROR") {
+                Some(head) => outln!("{head}PARTIAL"),
+                None => outln!("{line}"),
+            }
         } else {
             totals.errors += 1;
             eprintln!("{line}");
@@ -3514,7 +3748,11 @@ fn json_daemon_reply(line: &str, cli: &Cli, totals: &mut Totals) {
         if cli.quiet {
             return;
         }
-        serde_json::json!({"file": file, "category": "clean", "status": "OK"})
+        // No `category`: a clean result has no condition to sub-classify, and a
+        // local scan of the same file does not emit one either. `--json` has to
+        // mean one schema, or a pipeline written against a local scan breaks the
+        // day it is pointed at a daemon.
+        serde_json::json!({"file": file, "status": "OK"})
     };
     println!("{obj}");
 }
@@ -3902,11 +4140,51 @@ fn parse_secs_or_off(s: &str) -> Result<u64, String> {
     }
 }
 
+/// Seconds for a bound rather than a period: `0` is the documented way to say
+/// "no limit", and `off` says the same thing.
+///
+/// Both spellings, because the surface otherwise asks a question nobody can
+/// answer from the flag: five of these took `0` and refused `off`, two took
+/// `off` and refused `0`, and nothing about a name says which kind it is. A
+/// period cannot honour `0` (a zero-second interval is not "never", it is a
+/// loop), so [`parse_secs_or_off`] still refuses it and says why. Everywhere a
+/// disabled state exists, both words reach it.
+fn parse_limit_secs(s: &str) -> Result<u64, String> {
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(0);
+    }
+    s.parse::<u64>()
+        .map_err(|_| format!("expected a number of seconds or `off`, got `{s}`"))
+}
+
+/// [`parse_limit_secs`] for a flag whose field is a `u32`.
+fn parse_limit_secs_u32(s: &str) -> Result<u32, String> {
+    let n = parse_limit_secs(s)?;
+    u32::try_from(n).map_err(|_| format!("too many seconds: {s}"))
+}
+
 /// Parse a size with optional K/M/G/T suffix (base-1024), like clamscan.
+/// [`parse_size`] for a flag whose field is a `usize`.
+///
+/// Every flag measured in bytes reads the same vocabulary, whatever the width of
+/// the field behind it. A `4K` accepted by one byte-valued flag and refused by
+/// the next is a difference in the code that has no meaning to whoever is typing.
+fn parse_size_usize(s: &str) -> Result<usize, String> {
+    let n = parse_size(s)?;
+    usize::try_from(n).map_err(|_| format!("size too large for this platform: {s}"))
+}
+
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty size".to_string());
+    }
+    // `0` is the documented way to say "no limit" and matches clamscan, which a
+    // migrated command line will already be using. `off` says the same thing,
+    // and is what the time flags say, so one word disables anything that can be
+    // disabled and nobody has to remember which family a flag belongs to.
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(0);
     }
     // Match on the last byte (not char) so a multibyte trailing character
     // can't cause a non-char-boundary slice panic.
@@ -3917,10 +4195,16 @@ fn parse_size(s: &str) -> Result<u64, String> {
         b'T' | b't' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
         _ => (s, 1u64),
     };
-    let base: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid size: {s}"))?;
+    // `45MB` is the likeliest thing to be typed here and the likeliest to be
+    // wrong, so the error says what is accepted rather than only what was not.
+    // The suffixes are binary, and saying so is the difference between sizing a
+    // limit against a disk correctly and being 5% out at `G`.
+    let base: u64 = num.trim().parse().map_err(|_| {
+        format!(
+            "invalid size `{s}`: give bytes, a K/M/G/T suffix as in `45M`, or `off`. \
+             The suffixes are binary, so `45M` is 45 MiB. `MB`/`MiB` are not accepted."
+        )
+    })?;
     base.checked_mul(mult)
         .ok_or_else(|| format!("size overflow: {s}"))
 }
@@ -4029,6 +4313,71 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(clamscan_flag_hint(&argv).unwrap().contains("-r"));
+    }
+
+    /// A client refuses the flags it cannot apply, and keeps the ones it can.
+    ///
+    /// The bug this guards is silent by construction: the daemon scans under its
+    /// own configuration, so a limit on the client parses, prints nothing, and
+    /// leaves the operator with a cap they believe is in force. Nothing in the
+    /// output distinguishes that from a file genuinely under the limit.
+    #[test]
+    fn a_client_refuses_the_flags_only_the_scanner_can_apply() {
+        let ignored = |args: &[&str]| {
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            flags_the_client_cannot_honour(&argv)
+        };
+
+        // Scanning and serving belong to the daemon.
+        for a in [
+            "--max-input-bytes",
+            "--max-extracted-bytes",
+            "--max-unpack-depth",
+            "--max-members",
+            "--detect",
+            "--passwords",
+            "--clamav-compat",
+            "--sig-dir",
+            "-d",
+            "--allow-no-db",
+        ] {
+            assert_eq!(ignored(&[a]), vec![a.to_string()], "{a} must be refused");
+        }
+        // A value in the same argument is the same flag.
+        assert_eq!(
+            ignored(&["--max-input-bytes=1M"]),
+            vec!["--max-input-bytes".to_string()]
+        );
+
+        // What the client itself does: walk, send, print. Short spellings
+        // included — `-v` is `--verbose`, not an unknown flag.
+        assert!(ignored(&[
+            "--connect",
+            "/run/exav.sock",
+            "--send-as",
+            "contents",
+            "--quiet",
+            "--json",
+            "--log",
+            "/tmp/x.log",
+            "--all-matches",
+            "--no-recursive",
+            "--exclude",
+            "\\.log$",
+            "--files-from",
+            "/tmp/list",
+            "-v",
+            "-",
+            "/data",
+        ])
+        .is_empty());
+
+        // Every flag is named, not just the first: fixing one and rerunning into
+        // the next is the slow way to learn there were three.
+        assert_eq!(
+            ignored(&["--max-members", "10", "--workers", "4"]),
+            vec!["--max-members".to_string(), "--workers".to_string()]
+        );
     }
 
     /// Environment variables set for the length of a test and put back
@@ -4534,6 +4883,54 @@ mod tests {
                 "{ok:?} is a working combination: two listeners, one process"
             );
         }
+
+        // A listener's own settings need that listener. One process serves at
+        // most one listener per protocol, so these are never ambiguous about
+        // which listener they mean; the only way to get them wrong is to tune
+        // one that was never started, and a setting with nothing to apply to is
+        // how someone concludes the setting does not work.
+        for (argv, why) in [
+            (
+                &["--listen", "clamd://h:1", "--icap-preview-bytes", "8192"][..],
+                "an ICAP setting with only a clamd listener",
+            ),
+            (
+                &["--icap-idle-secs", "30", "file"][..],
+                "an ICAP setting on a one-shot scan",
+            ),
+            (
+                &["--listen", "icap://h:1", "--allow-shutdown"][..],
+                "SHUTDOWN is a clamd command; ICAP has no such request",
+            ),
+            (
+                &["--allow-shutdown", "file"][..],
+                "SHUTDOWN with nothing listening",
+            ),
+        ] {
+            assert!(
+                check_flag_conflicts(&cli(argv)).is_err(),
+                "{why}: {argv:?} must be refused"
+            );
+        }
+        // And each is fine once the listener it belongs to is there.
+        for ok in [
+            &["--listen", "icap://h:1", "--icap-preview-bytes", "8192"][..],
+            &["--listen", "clamd://h:1", "--allow-shutdown"],
+            &[
+                "--listen",
+                "icap://h:1",
+                "--listen",
+                "clamd://h:2",
+                "--icap-idle-secs",
+                "30",
+                "--allow-shutdown",
+            ],
+        ] {
+            assert!(
+                check_flag_conflicts(&cli(ok)).is_ok(),
+                "{ok:?} tunes a listener it actually starts"
+            );
+        }
     }
 
     /// The ICAP defaults are the service names and bounds a c-icap deployment
@@ -4708,7 +5105,7 @@ mod tests {
         assert!(!d.allow_no_db);
 
         let _vars = EnvVars::set(&[
-            ("EXAV_SIGS_DIR", "/env/sigs"),
+            ("EXAV_SIG_DIR", "/env/sigs"),
             ("EXAV_LISTEN", "clamd://10.0.0.1:3310,icap://10.0.0.1:1344"),
             ("EXAV_WORKERS", "3"),
             ("EXAV_MAX_PROCESS_BYTES", "512M"),
@@ -4739,7 +5136,7 @@ mod tests {
 
         // And a flag beats the environment, for every one of them.
         let f = cli(&[
-            "--sigs-dir",
+            "--sig-dir",
             "/flag/sigs",
             "--listen",
             "127.0.0.1:9999",

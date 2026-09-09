@@ -1,7 +1,7 @@
 //! What a running listener can say about where its time went.
 //!
 //! A one-shot scan can be timed from outside — `time exav file`, or
-//! `--perf-csv` for a per-matcher breakdown. A listener cannot: it is a
+//! `--profile` for a per-matcher breakdown. A listener cannot: it is a
 //! long-lived process serving objects nobody kept, and "the box is at 100% CPU"
 //! is all an operator gets from the outside. Answering *which* objects, and
 //! which matcher inside them, needs the process to keep count itself.
@@ -16,7 +16,7 @@
 //!   measured in milliseconds. Always on; a listener that cannot say how busy it
 //!   is cannot be tuned.
 //! * **The per-matcher breakdown** is a timer around every matcher invocation,
-//!   and there are many per scan. Opt-in, behind `--profile-scans`, because the
+//!   and there are many per scan. Opt-in, behind `--profile`, because the
 //!   overhead is proportional to how much work is being measured.
 //!
 //! ## Under the worker pool
@@ -33,7 +33,7 @@ use std::time::Duration;
 use exav_core::profile::Profile;
 
 /// Matchers reported in the breakdown, in a fixed order so successive `STATS`
-/// replies line up. The same set `--perf-csv` uses; a matcher the engine names
+/// replies line up. The same set `--profile` uses; a matcher the engine names
 /// but this list does not is folded into `other`.
 pub(crate) const MATCHERS: &[&str] = &[
     "engine",
@@ -360,7 +360,7 @@ fn render(s: &Snapshot) -> String {
     );
 
     if !s.profiling {
-        out.push_str("\nMATCHERSTATS: off (start with --profile-scans)");
+        out.push_str("\nMATCHERSTATS: off (start with --profile)");
         return out;
     }
     out.push_str("\nMATCHERSTATS:");

@@ -7,7 +7,7 @@ description: Every exav command-line flag — targets, scanning limits, output, 
 
 Scan `PATH`(s) — files or directories — for malware. Use `-` for stdin. An
 `http(s)://` target is scanned over range requests (needs a `http-scan` build).
-With no `-d`/`--sigs-dir` and no real signatures loaded, exav refuses to run
+With no `-d`/`--sig-dir` and no real signatures loaded, exav refuses to run
 unless `--allow-no-db`.
 
 Run `exav --help` for the authoritative list; this page mirrors the clap
@@ -73,13 +73,13 @@ that does not mount your files, send the *contents* instead — see
 | Flag | Default | Description |
 |---|---|---|
 | `-d`, `--database <PATH>` | — | Load signatures from a FILE or DIR (`.ndb`/`.hdb`/`.cvd`/… or a prebuilt `.exavdb`). A DIR is scanned recursively. |
-| `--sigs-dir <DIR>` | `/var/lib/exav` | The directory signatures **live in** — the one `--auto-update` writes into and a sidecar populates. |
+| `--sig-dir <DIR>` | `/var/lib/exav` | The directory signatures **live in** — the one `--auto-update` writes into and a sidecar populates. |
 | `--sig-sources <FILE>` | — | File of signature source URLs (also reads `freshclam.conf` source directives). |
 | `--allow-no-db` | off | **Testing only.** Run against the built-in EICAR-only baseline when no real database is present, instead of refusing. |
 | `--build-db <FILE>` | — | Compile loaded signatures into a prebuilt `.exavdb` and exit. |
 | `--build-shard-bytes <SIZE>` | — | Cap the per-shard automaton-build transient (`--build-db` only). |
 
-`-d` and `--sigs-dir` are not two spellings of one thing. `--sigs-dir` names a
+`-d` and `--sig-dir` are not two spellings of one thing. `--sig-dir` names a
 *directory that is written to*, so it stays a directory even when `-d` points the
 load somewhere else — which is how a deployment serves a prebuilt `.exavdb` from
 one path while an updater keeps a signature directory current at another.
@@ -135,7 +135,7 @@ Anything that is not an `http(s)` URL is a path; that is the same rule `--listen
 uses to tell a socket path from a `host:port`. Pointed at a real `freshclam.conf`,
 exav reads its *source* directives (`DatabaseMirror`/`PrivateMirror`,
 `DatabaseCustomURL`) and warns about every line it ignores — including
-`DatabaseDirectory`, which is `--sigs-dir` and not a source.
+`DatabaseDirectory`, which is `--sig-dir` and not a source.
 
 No source is privileged: every URL is fetched the same way, over plain HTTPS with
 **no signature verification**. Point it at a mirror you trust, or use
@@ -223,7 +223,15 @@ silently resolved.
 | Flag | Default | Description |
 |---|---|---|
 | `--detect <LIST>` | `none` | Heuristic detectors to switch on, over and above the signature database: `none`, `all`, or a comma-separated list of `heuristics`, `macros`, `broken`, `broken-media`, `partition-intersection`, `phishing`, `packed`, `pua`. |
-| `--base64 [<on\|off>]` | on | Decode base64-encoded executables embedded in text/script files. Off under `--clamav-compat`, which has no such reach; an explicit value wins over the preset. |
+| `--no-detect <LIST>` | — | Detectors to leave off, subtracted from `--detect`. What `--detect all` is for: everything, minus the one that is noisy on your corpus. |
+| `--decode <LIST>` | `all` | Encodings to recover a payload from before scanning it: `all`, `none`, or a list. Today that list is `base64`. **On by default**, unlike `--detect`, because a carrier that hides its payload is the ordinary case and skipping it reports clean on a file never really read. `--clamav-compat` sets `none`. |
+| `--no-decode <LIST>` | — | Encodings to leave alone, subtracted from `--decode`. |
+
+A decoder is not an unpacker. An unpacker opens a container the file declares
+itself to be; a decoder finds a payload the carrier does not announce at all,
+such as a PE base64'd into a PowerShell one-liner. `--decode` and `--no-decode`
+compose by subtraction, so `--decode all --no-decode base64` is well defined and
+neither flag has to win.
 | `--passwords <PW>` | — | Password to try when decrypting encrypted archive members. Repeatable (comma-separated in the environment) to build a pool, tried in order, unioned with any `.pwdb` databases. |
 | `--alert-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
 | `--alert-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
@@ -466,7 +474,28 @@ scanned rather than each fragment alone; by path the same job is a `CONTSCAN` ov
 the directory, which makes the daemon rejoin them.
 
 A client walks a directory itself in every mode and sends one request per file, so
-the filter flags apply to the tree and every request has one reply.
+`--exclude`, `--exclude-dir`, `--include`, `--files-from` and `--no-recursive`
+apply to the tree, and every request has one reply.
+
+Nothing else about the scan is the client's to set. The daemon holds the database
+and does the scanning, under the configuration **it** was started with, so a
+limit, a `--detect` list or a `--passwords` pool typed next to `--connect` is
+refused rather than accepted and dropped:
+
+```sh
+exav --connect /run/exav.sock --max-input-bytes 1M /data
+# exav: --connect hands each file to the daemon, which scans it under the
+#       configuration it was started with, so a client cannot apply
+#       --max-input-bytes
+```
+
+A cap that silently does not apply is worse than no cap: the output of a file
+scanned without it is identical to the output of a file that was under it. Set
+these where the daemon starts, or drop `--connect` to scan locally. What a client
+keeps is what it does itself — which paths, what gets printed, and where
+(`--quiet`, `--verbose`, `--json`, `--log`, `--bell`, `--all-matches`,
+`--send-as`). Variables are exempt: `EXAV_MAX_INPUT_BYTES` in an image that also
+runs clients is a default for its daemon, not a contradiction.
 
 ### ICAP server
 
@@ -493,7 +522,7 @@ the same verdict on either port.
 
 | Flag | Description |
 |---|---|
-| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000 --base64 off`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
+| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000 --decode none`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
 
 Each preset value can still be set on its own, and an explicit flag wins over the
 preset. Narrowing the format set and appending `.UNOFFICIAL` to unofficial-database

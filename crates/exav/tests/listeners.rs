@@ -355,7 +355,7 @@ fn auto_update_waits_for_a_sidecar_to_write_the_signatures() {
             "60",
             "--listen",
             &format!("clamd://127.0.0.1:{clamd}"),
-            "--sigs-dir",
+            "--sig-dir",
             sigs.path().to_str().unwrap(),
         ],
     );
@@ -391,7 +391,7 @@ fn serving_no_signatures_is_refused() {
             "1",
             "--listen",
             &format!("clamd://127.0.0.1:{clamd}"),
-            "--sigs-dir",
+            "--sig-dir",
             sigs.path().to_str().unwrap(),
         ])
         .output()
@@ -410,7 +410,7 @@ fn serving_no_signatures_is_refused() {
             "--allow-no-db",
             "--listen",
             &format!("clamd://127.0.0.1:{}", free_port()),
-            "--sigs-dir",
+            "--sig-dir",
             sigs.path().to_str().unwrap(),
         ],
     );
@@ -429,7 +429,7 @@ fn a_rewritten_signature_directory_is_reloaded() {
         &[
             "--listen",
             &format!("clamd://127.0.0.1:{clamd}"),
-            "--sigs-dir",
+            "--sig-dir",
             sigs.path().to_str().unwrap(),
         ],
     );
@@ -492,7 +492,7 @@ fn an_updater_without_a_source_is_refused() {
 fn configured_sources_without_auto_update_are_reported() {
     let sigs = sig_dir();
     let out = Command::new(exav_bin())
-        .args(["--sigs-dir", sigs.path().to_str().unwrap(), "--build-db"])
+        .args(["--sig-dir", sigs.path().to_str().unwrap(), "--build-db"])
         .arg(sigs.path().join("out.exavdb"))
         .env("EXAV_SIG_SOURCES", "https://mirror.invalid/")
         .output()
@@ -558,10 +558,10 @@ fn a_flag_overrides_the_environments_signature_dir() {
         .args([
             "--listen",
             &format!("clamd://127.0.0.1:{clamd}"),
-            "--sigs-dir",
+            "--sig-dir",
             real.path().to_str().unwrap(),
         ])
-        .env("EXAV_SIGS_DIR", empty.path())
+        .env("EXAV_SIG_DIR", empty.path())
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
         .spawn()
@@ -596,7 +596,7 @@ fn the_baseline_still_answers_on_an_opted_in_run() {
             &format!("clamd://127.0.0.1:{clamd}"),
             "--listen",
             &format!("icap://127.0.0.1:{icap}"),
-            "--sigs-dir",
+            "--sig-dir",
             sigs.path().to_str().unwrap(),
         ],
     );

@@ -440,6 +440,37 @@ fn verbose_names_the_daemon_and_the_command() {
     );
 }
 
+/// A stream the daemon could not examine comes back as `PARTIAL`, exit 3 — the
+/// same answer a local scan of the same object gives.
+///
+/// The wire grammar is `<path>: <reason> <CATEGORY> ERROR`, because clamd has no
+/// word for `PARTIAL` and the category is what carries it across. Emit the two
+/// the other way round and the reply still *reads* right to a person, while the
+/// client sees a category it cannot find, files it under hard errors, and exits
+/// `2`. That difference is the whole point of having a fourth code: `2` says the
+/// scanner broke, `3` says this object needs a decision.
+#[test]
+fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
+    // Nowhere to spill and almost no room in RAM, so any real object is one the
+    // daemon cannot examine — the condition, reached the quickest way.
+    let d = Daemon::start(
+        "077",
+        &["--spill-dir", "off", "--spill-threshold-bytes", "1M"],
+    );
+    let big = d.file("big.bin", &vec![b'A'; 4 << 20]);
+
+    let (code, out) = d.client(&["--send-as", "contents"], &[&big]);
+    assert!(
+        out.contains("UNSCANNABLE"),
+        "the category has to survive the trip: {out}"
+    );
+    assert!(
+        out.contains("PARTIAL"),
+        "and the client must read it back as PARTIAL, not a hard error: {out}"
+    );
+    assert_eq!(code, 3, "which is exit 3, not 2: {out}");
+}
+
 /// `--json` is a machine stream: the informational lines `-v` prints would be
 /// parse errors in it.
 #[test]
@@ -453,14 +484,21 @@ fn verbose_stays_out_of_the_json_stream() {
     }
 }
 
-/// A directory names a tree in client mode, with or without `-r`.
+/// A directory names a tree in client mode, with or without `-r`, and
+/// `--no-recursive` bounds it there exactly as it does locally.
 ///
 /// `clamdscan` has no `-r`, so a command line migrated from it hands the client
 /// a bare directory. Answering for one file in it and exiting 0 is a clean
 /// verdict over a tree that holds a detection, which is the one thing a scanner
-/// may never report — so the two runs must agree, file for file.
+/// may never report — so the default has to be the whole tree.
+///
+/// Asking for the top level is a different matter: `--no-recursive` is exav's
+/// own flag and the caller typed it. The client does its own walking, so it is
+/// the one part of a client run that *can* honour it, and a flag accepted and
+/// dropped is how a scan of two files comes back looking like a scan of the
+/// tree. Same flag, same meaning, whichever end holds the database.
 #[test]
-fn a_directory_recurses_with_or_without_dash_r() {
+fn a_directory_recurses_by_default_and_no_recursive_bounds_it() {
     let d = Daemon::start("077", &[]);
     let t = infected_tree();
 
@@ -470,16 +508,25 @@ fn a_directory_recurses_with_or_without_dash_r() {
         "a detection anywhere in the tree must be reported: {bare}"
     );
     assert_eq!(bare_code, 1, "and the exit code must say so: {bare}");
-
-    // The client walks the tree itself and always walks all of it, so the flag
-    // that bounds a local walk selects nothing here.
-    let (r_code, shallow) = d.client(&["--no-recursive"], &[t.path()]);
-    assert_eq!(
-        verdicts(&bare),
-        verdicts(&shallow),
-        "`--no-recursive` selects nothing in client mode: the same tree, the same answers"
+    assert!(
+        bare.contains("sub/deep.txt"),
+        "a bare directory is the whole tree: {bare}"
     );
-    assert_eq!(r_code, bare_code, "and the same exit code");
+
+    let (r_code, shallow) = d.client(&["--no-recursive"], &[t.path()]);
+    assert!(
+        !shallow.contains("sub/deep.txt"),
+        "`--no-recursive` stops at the directory's own files: {shallow}"
+    );
+    assert!(
+        shallow.contains("eicar.com: Eicar-Test-Signature FOUND"),
+        "and still answers for the files it did reach: {shallow}"
+    );
+    assert_eq!(r_code, bare_code, "a detection is still a detection");
+    assert!(
+        verdicts(&bare).len() > verdicts(&shallow).len(),
+        "the bounded walk must be the smaller one"
+    );
 }
 
 /// The summary counts what the daemon answered about, not how many commands the

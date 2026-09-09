@@ -340,13 +340,12 @@ fn fetch_signature_installs_under_env_namespaced_by_origin() {
     let dest = sig_dest(&dir, &url).unwrap();
     assert!(dest.starts_with(dir.join("env")), "must live under env/");
     // Named for the source, plus a digest of the full URL so two sources that
-    // sanitise to the same name stay apart.
+    // sanitise to the same name stay apart — the digest sitting in front of the
+    // extension, which the loader needs intact to classify the file at all.
+    let name = dest.file_name().unwrap().to_string_lossy().into_owned();
     assert!(
-        dest.file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("main.cvd"),
-        "destination should be recognisable as main.cvd: {dest:?}"
+        name.starts_with("main-") && name.ends_with(".cvd"),
+        "destination should read as main.cvd and keep its extension: {dest:?}"
     );
     assert!(dest.exists());
     assert!(std::fs::read(&dest).unwrap().starts_with(b"ClamAV-VDB:"));
@@ -370,8 +369,8 @@ fn fetch_signature_installs_under_env_namespaced_by_origin() {
     let ndb_dest = sig_dest(&dir, &ndb_url).unwrap();
     let ndb_name = ndb_dest.file_name().unwrap().to_string_lossy().into_owned();
     assert!(
-        ndb_name.starts_with("feed.ndb"),
-        "the filename should read as its source: {ndb_name}"
+        ndb_name.starts_with("feed-") && ndb_name.ends_with(".ndb"),
+        "the filename should read as its source and stay a .ndb: {ndb_name}"
     );
     assert!(
         !ndb_name.contains("token") && !ndb_name.contains("xyz"),
@@ -391,12 +390,31 @@ fn sig_dest_namespaces_by_origin_and_resists_traversal() {
     assert!(a.starts_with("/var/lib/exav/env/"));
     // The layout still reads as the origin it came from; the final component
     // carries a digest of the whole URL, so the exact filename is not pinned.
-    assert!(a
-        .to_string_lossy()
-        .contains("mirror-a.example.com/daily.cvd"));
+    assert!(a.to_string_lossy().contains("mirror-a.example.com/daily"));
     assert!(b
         .to_string_lossy()
-        .contains("mirror-b.example.com/feeds/daily.cvd"));
+        .contains("mirror-b.example.com/feeds/daily"));
+
+    // The extension survives the digest, for every source and every suffix. The
+    // loader routes a database file by extension and nothing else, so a name it
+    // cannot classify is skipped without a word — a fetch that reports success
+    // and a database that never loads. Whatever the digest does to the name, it
+    // must not touch the part the loader reads.
+    for (url, want) in [
+        ("https://mirror-a.example.com/daily.cvd", "cvd"),
+        ("https://mirror-b.example.com/feeds/daily.cvd", "cvd"),
+        ("https://feeds.example/rules.ndb", "ndb"),
+        ("https://feeds.example/x/hashes.hsb?v=2", "hsb"),
+        ("https://feeds.example/set.yar", "yar"),
+    ] {
+        let dest = sig_dest(dir, url).unwrap();
+        assert_eq!(
+            dest.extension().and_then(|e| e.to_str()),
+            Some(want),
+            "{url} lands at {dest:?}, which the loader classifies by extension \
+             and would skip"
+        );
+    }
 
     // Two sources on ONE host differing only in the query must not share a
     // destination. Sharing one is worse than a name collision: each poll finds
