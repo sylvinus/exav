@@ -66,7 +66,10 @@
 //!                             EXINSTREAM reply, plus "set" when the verdict came
 //!                             from a rejoined archive rather than the file itself.
 //!   `SCANURL <url>`        -> exav extension: scan an http(s)// object via
-//!                             range requests (no download); reply `<url>: …`
+//!                             range requests (no download); reply `<url>: …`.
+//!                             Honoured only when the daemon was started with
+//!                             `--allow-http-scan`, and listed in VERSIONCOMMANDS
+//!                             only then.
 //!   `IDSESSION` / `END`    -> session mode; each reply is prefixed `<n>: `
 //!
 //! A limit that prevents a full scan is reported as `ERROR` carrying
@@ -409,6 +412,9 @@ impl Drop for ConnGuard {
 /// Run the daemon until the listener errors (e.g. the process is killed).
 /// `allow_shutdown` controls whether the `SHUTDOWN` command stops the daemon
 /// (here it exits the process; the thread model has no supervisor to unwind).
+/// `allow_http_scan` controls whether the exav-only `SCANURL` command fetches —
+/// off by default, since it lets any client that can reach the socket make the
+/// daemon fetch a URL.
 ///
 /// The database arrives already shared so one load can answer on more than one
 /// listener in the same process.
@@ -417,6 +423,7 @@ pub fn run(
     addr: ListenAddr,
     opts: Arc<ScanOptions>,
     allow_shutdown: bool,
+    allow_http_scan: bool,
     max_connections: usize,
 ) -> io::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -469,6 +476,7 @@ pub fn run(
                         &|| {},
                         &|| {},
                         &shutdown,
+                        allow_http_scan,
                     ) {
                         if !is_benign_disconnect(&e) {
                             eprintln!("exav: connection error: {e}");
@@ -508,6 +516,7 @@ pub fn run(
                         &|| {},
                         &|| {},
                         &shutdown,
+                        allow_http_scan,
                     ) {
                         if !is_benign_disconnect(&e) {
                             eprintln!("exav: connection error: {e}");
@@ -567,6 +576,11 @@ pub struct PoolConfig {
     /// false, `SHUTDOWN` replies with an error instead of stopping the daemon —
     /// useful when the socket/port is reachable by untrusted clients.
     pub allow_shutdown: bool,
+    /// Whether the exav-only `SCANURL` command fetches (default: no). When
+    /// false, `SCANURL` replies with an error instead of fetching — useful for
+    /// the same reason: it lets any client that can reach the socket make the
+    /// daemon fetch a URL.
+    pub allow_http_scan: bool,
 }
 
 /// A bound listening socket the workers share across `fork()`.
@@ -1388,6 +1402,7 @@ fn worker_main(
     // `SHUTDOWN` likewise forwards to the supervisor (SIGTERM → graceful
     // teardown of the whole pool). Disabled → report it wasn't honoured.
     let allow_shutdown = cfg.allow_shutdown;
+    let allow_http_scan = cfg.allow_http_scan;
     let shutdown = move || -> bool {
         if allow_shutdown {
             unsafe {
@@ -1412,8 +1427,17 @@ fn worker_main(
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     let reader = AncillaryReader::new(&stream);
-                    let r =
-                        handle_conn(reader, &stream, db, opts, &arm, &disarm, &reload, &shutdown);
+                    let r = handle_conn(
+                        reader,
+                        &stream,
+                        db,
+                        opts,
+                        &arm,
+                        &disarm,
+                        &reload,
+                        &shutdown,
+                        allow_http_scan,
+                    );
                     CURRENT_CONN_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
                     disarm(); // ensure the timer is off between connections
                     r
@@ -1437,7 +1461,17 @@ fn worker_main(
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     let s = TcpListenerStream(stream);
-                    let r = handle_conn(&s, &s, db, opts, &arm, &disarm, &reload, &shutdown);
+                    let r = handle_conn(
+                        &s,
+                        &s,
+                        db,
+                        opts,
+                        &arm,
+                        &disarm,
+                        &reload,
+                        &shutdown,
+                        allow_http_scan,
+                    );
                     CURRENT_CONN_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
                     disarm();
                     r
@@ -1599,6 +1633,7 @@ fn handle_conn<R, W>(
     disarm: &dyn Fn(),
     reload: &dyn Fn(),
     shutdown: &dyn Fn() -> bool,
+    allow_http_scan: bool,
 ) -> io::Result<()>
 where
     R: Read + FdSource,
@@ -1647,6 +1682,7 @@ where
                 opts,
                 reload,
                 shutdown,
+                allow_http_scan,
             );
             disarm();
             r?;
@@ -1668,6 +1704,7 @@ where
         opts,
         reload,
         shutdown,
+        allow_http_scan,
     );
     disarm();
     r
@@ -1687,6 +1724,7 @@ fn run_command<R, W>(
     opts: &ScanOptions,
     reload: &dyn Fn(),
     shutdown: &dyn Fn() -> bool,
+    allow_http_scan: bool,
 ) -> io::Result<()>
 where
     R: Read + FdSource,
@@ -1714,7 +1752,7 @@ where
             vec!["SHUTDOWN: command disabled ERROR".to_string()]
         }
     } else {
-        dispatch(cmd, word, reader, delim, db, opts)?
+        dispatch(cmd, word, reader, delim, db, opts, allow_http_scan)?
     };
     // Mirror scan results into `--log`. A daemon's results go to whoever asked
     // for them and nowhere else, so this file is the operator's only record of
@@ -1782,6 +1820,7 @@ fn dispatch<R: Read>(
     _delim: Delim,
     db: &Scanner,
     opts: &ScanOptions,
+    allow_http_scan: bool,
 ) -> io::Result<Vec<String>> {
     let arg = cmd[word.len()..].trim();
     let reply = match word.to_ascii_uppercase().as_str() {
@@ -1795,12 +1834,15 @@ fn dispatch<R: Read>(
         // commands the daemon speaks. Format matches clamd: `<version>| COMMANDS:
         // <space-separated list>`.
         // The list is what a client uses to decide what it may send, so a verb
-        // that works and is missing here is a capability nobody discovers.
+        // that works and is missing here is a capability nobody discovers — and
+        // a verb that is listed but refused is a capability nobody can use.
+        // `SCANURL` is therefore listed only when this daemon would honour it:
+        // built with `http-scan` and started with `--allow-http-scan`.
         "VERSIONCOMMANDS" => vec![format!(
             "{}| COMMANDS: SCAN CONTSCAN MULTISCAN ALLMATCHSCAN INSTREAM EXINSTREAM FILDES \
              STATS VERSION VERSIONCOMMANDS RELOAD SHUTDOWN QUIT PING IDSESSION SESSION END{}",
             clamav_version(db),
-            if cfg!(feature = "http-scan") {
+            if cfg!(feature = "http-scan") && allow_http_scan {
                 " SCANURL"
             } else {
                 ""
@@ -1854,7 +1896,13 @@ fn dispatch<R: Read>(
         }
         "EXINSTREAM" => vec![exinstream(db, opts, reader)?],
         #[cfg(feature = "http-scan")]
-        "SCANURL" => vec![scan_url(db, opts, arg)],
+        "SCANURL" => {
+            vec![if allow_http_scan {
+                scan_url(db, opts, arg)
+            } else {
+                format!("{arg}: SCANURL disabled (the daemon was not started with --allow-http-scan) ERROR")
+            }]
+        }
         #[cfg(not(feature = "http-scan"))]
         "SCANURL" => vec![format!(
             "{arg}: SCANURL needs a build with `--features http-scan` ERROR"
@@ -2813,14 +2861,27 @@ mod tests {
 
     /// Spawn a handler on one end of a socket pair; return the client end.
     fn serve() -> UnixStream {
+        serve_allow_http_scan(false)
+    }
+
+    /// Spawn a handler as [`serve`], with `SCANURL` fetching honoured or not.
+    fn serve_allow_http_scan(allow_http_scan: bool) -> UnixStream {
         let (client, server) = UnixStream::pair().unwrap();
         let db = Scanner::builtin();
         let opts = ScanOptions::default();
         std::thread::spawn(move || {
             let reader = AncillaryReader::new(&server);
-            let _ = handle_conn(reader, &server, &db, &opts, &|| {}, &|| {}, &|| {}, &|| {
-                false
-            });
+            let _ = handle_conn(
+                reader,
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                allow_http_scan,
+            );
         });
         client
     }
@@ -2835,7 +2896,13 @@ mod tests {
     /// One command on a fresh connection; read the reply terminated by `delim`
     /// (the daemon closes after a single non-session command).
     fn one(send: &[u8], delim: u8) -> String {
-        let mut w = serve();
+        one_allow_http_scan(send, delim, false)
+    }
+
+    /// One command on a fresh connection as [`one`], with `SCANURL` honoured
+    /// or refused.
+    fn one_allow_http_scan(send: &[u8], delim: u8, allow_http_scan: bool) -> String {
+        let mut w = serve_allow_http_scan(allow_http_scan);
         let mut r = BufReader::new(w.try_clone().unwrap());
         w.write_all(send).unwrap();
         w.flush().unwrap();
@@ -2870,9 +2937,17 @@ mod tests {
         let opts = ScanOptions::default();
         std::thread::spawn(move || {
             let reader = AncillaryReader::new(&server);
-            let _ = handle_conn(reader, &server, &db, &opts, &|| {}, &|| {}, &|| {}, &|| {
-                false
-            });
+            let _ = handle_conn(
+                reader,
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+            );
         });
         let mut r = BufReader::new(client.try_clone().unwrap());
         client.write_all(send).unwrap();
@@ -2891,9 +2966,17 @@ mod tests {
         let db = Scanner::builtin();
         std::thread::spawn(move || {
             let reader = AncillaryReader::new(&server);
-            let _ = handle_conn(reader, &server, &db, &opts, &|| {}, &|| {}, &|| {}, &|| {
-                false
-            });
+            let _ = handle_conn(
+                reader,
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+            );
         });
         let mut r = BufReader::new(client.try_clone().unwrap());
         client.write_all(send).unwrap();
@@ -3117,10 +3200,8 @@ mod tests {
     fn exinstream_oversized_is_unscannable_never_clean() {
         // A stream past `--max-input-bytes` can't be fully scanned → it must be
         // `unscannable`, never `clean`.
-        let opts = ScanOptions {
-            max_scan_size: Some(8),
-            ..ScanOptions::default()
-        };
+        let mut opts = ScanOptions::default();
+        opts.max_scan_size = Some(8);
         let r = one_with(
             &exinstream_msg(b"way more than eight bytes of benign content"),
             0,
@@ -3526,6 +3607,40 @@ mod tests {
     }
 
     #[test]
+    fn scanurl_refused_by_default() {
+        // The default handler refuses SCANURL without fetching: without the
+        // feature it needs a build with it, with the feature it needs
+        // --allow-http-scan on the daemon. Either way nothing is fetched.
+        let r = one(b"zSCANURL http://127.0.0.1:9/x\0", 0);
+        assert!(r.contains("ERROR"), "got {r}");
+        #[cfg(feature = "http-scan")]
+        assert!(r.contains("disabled"), "got {r}");
+        #[cfg(not(feature = "http-scan"))]
+        assert!(r.contains("needs a build"), "got {r}");
+    }
+
+    #[test]
+    fn versioncommands_advertises_scanurl_only_when_allowed() {
+        let r = one(b"zVERSIONCOMMANDS\0", 0);
+        assert!(!r.contains("SCANURL"), "got {r}");
+        #[cfg(feature = "http-scan")]
+        {
+            let r = one_allow_http_scan(b"zVERSIONCOMMANDS\0", 0, true);
+            assert!(r.contains("SCANURL"), "got {r}");
+        }
+    }
+
+    #[cfg(feature = "http-scan")]
+    #[test]
+    fn scanurl_allowed_attempts_fetch() {
+        // Allowed: the daemon tries to fetch rather than refusing. A closed
+        // loopback port fails fast with a fetch ERROR — the point is the
+        // request got past the gate, not that it downloaded anything.
+        let r = one_allow_http_scan(b"zSCANURL http://127.0.0.1:9/x\0", 0, true);
+        assert!(r.contains("ERROR") && !r.contains("disabled"), "got {r}");
+    }
+
+    #[test]
     fn session_replies_are_untagged_until_end() {
         // Legacy SESSION keeps the connection open like IDSESSION but does NOT
         // prefix replies with a sequence id.
@@ -3570,9 +3685,17 @@ mod tests {
         let opts = ScanOptions::default();
         std::thread::spawn(move || {
             let reader = AncillaryReader::new(&server);
-            let _ = handle_conn(reader, &server, &db, &opts, &|| {}, &|| {}, &|| {}, &|| {
-                false
-            });
+            let _ = handle_conn(
+                reader,
+                &server,
+                &db,
+                &opts,
+                &|| {},
+                &|| {},
+                &|| {},
+                &|| false,
+                false,
+            );
         });
         client.write_all(b"zSHUTDOWN\0").unwrap();
         client.flush().unwrap();
@@ -3610,6 +3733,7 @@ mod tests {
                 &|| {},
                 &|| {},
                 &shutdown,
+                false,
             );
         });
         client.write_all(b"zSHUTDOWN\0").unwrap();
@@ -3646,6 +3770,7 @@ mod tests {
                 &|| {},
                 &reload,
                 &|| false,
+                false,
             );
         });
         client.write_all(b"zRELOAD\0").unwrap();

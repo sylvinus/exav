@@ -355,7 +355,7 @@ pub(crate) fn extract_zip<R>(
     match extract_zip_from(Cursor::new(data), budget, &mut *visit) {
         Ok(Some(r)) => return Ok(Some(r)),
         Ok(None) => {}
-        Err(e) if !e.corrupt => return Err(e),
+        Err(e) if !e.is_corrupt() => return Err(e),
         Err(_) => {}
     }
     // Dual indexing: a forged ZIP can hide a member by leaving it OUT of the
@@ -922,7 +922,7 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
                 let hit = zip_entry_error(i, &e);
                 // A real I/O failure is not this member's problem — the source
                 // itself is gone, so there is nothing to keep walking for.
-                if !hit.corrupt {
+                if !hit.is_corrupt() {
                     return Err(hit);
                 }
                 // Named by index: the name lives in the directory record we just
@@ -1415,9 +1415,6 @@ impl<R: Read + Seek> ZipMembers<R> {
     /// returns, so an index below it is addressable.
     pub fn len(&self) -> usize {
         self.zip.len() + self.orphans.len() + usize::from(self.search_truncated)
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Pre-parsed member metadata from the central directory. Directories are

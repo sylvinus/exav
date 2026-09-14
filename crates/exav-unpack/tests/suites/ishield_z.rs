@@ -122,10 +122,9 @@ fn every_member_carries_its_name() {
 
 #[test]
 fn a_member_past_the_budget_is_reported_not_skipped() {
-    let mut b = Budget::new(Limits {
-        max_buffer_bytes: 16,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 16;
+    let mut b = Budget::new(limits);
     let mut out = Vec::new();
     let _ = extract_each(
         Format::IshieldZ,

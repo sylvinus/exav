@@ -38,10 +38,8 @@ fn broken_authenticode_flagged_only_when_opted_in() {
     let pe = fixture("signed_mismatch.exe");
 
     // Opt-in: the digest doesn't cover the file → HashMismatch.
-    let opts = ScanOptions {
-        alert_broken_authenticode: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_broken_authenticode = true;
     match analyze(&db, &pe, &opts).verdict {
         Verdict::Infected { signature, .. } => assert_eq!(
             signature, "Heuristics.Authenticode.HashMismatch",

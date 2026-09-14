@@ -583,7 +583,7 @@ mnemonics![
 // ---------------------------------------------------------------------------
 
 /// Operand width in bytes, after any `66` prefix has been applied.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Size {
     B1 = 1,
     B2 = 2,
@@ -597,7 +597,7 @@ impl Size {
 }
 
 /// A segment register, when an override prefix names one.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Seg {
     Es,
     Cs,
@@ -612,7 +612,8 @@ pub enum Seg {
 /// Register numbers are the encoding's own: `0`–`7` meaning
 /// `(e)ax, (e)cx, (e)dx, (e)bx, (e)sp, (e)bp, (e)si, (e)di`, or
 /// `al, cl, dl, bl, ah, ch, dh, bh` at [`Size::B1`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
 pub enum Op {
     None,
     Reg(u8, Size),
@@ -657,7 +658,7 @@ pub enum Op {
 }
 
 /// A decoded instruction.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Insn {
     pub len: usize,
     pub mn: Mn,

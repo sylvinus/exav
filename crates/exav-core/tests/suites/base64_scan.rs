@@ -53,10 +53,8 @@ fn base64_scan_off_leaves_it_clean() {
     // text is inert — the PE never materializes, so the script scans clean.
     let db = Scanner::builtin();
     let blob = script_with_base64(&eicar_pe());
-    let opts = ScanOptions {
-        decode_base64: false,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.decode_base64 = false;
     assert!(
         matches!(analyze(&db, &blob, &opts).verdict, Verdict::Clean),
         "base64 scan disabled should leave the carrier clean"

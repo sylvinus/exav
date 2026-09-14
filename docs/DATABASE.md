@@ -91,7 +91,7 @@ single construction event.
 ### The prebuilt database is the answer
 
 `exav --build-db FILE -d <sigs>` serializes the built engine (the daachorse
-automaton via its own format, the rest via bincode) into a single `.exavdb`.
+automaton via its own format, the rest via MessagePack through rmp-serde) into a single `.exavdb`.
 **Loading the database skips the construction transient entirely** —
 deserialization allocates ~the final size, not the build peak. Measured: 62 MB
 (database) vs 284 MB (build) for 20k ldb; **1.0 GB (database) vs 3.6 GB (build)**

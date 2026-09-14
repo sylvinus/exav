@@ -23,7 +23,7 @@ fn a_header_larger_than_the_archive_is_rejected() {
     let err = extract(Format::Lha, data, &mut budget)
         .expect_err("a header declaring 4 GiB in a 143-byte file must be refused");
     assert!(
-        err.corrupt,
+        err.is_corrupt(),
         "a header that cannot be true is malformed input, not a budget stop: {}",
         err.reason
     );

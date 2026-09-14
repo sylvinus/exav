@@ -68,10 +68,9 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 fn limits_allowing(formats: &[Format]) -> Limits {
-    Limits {
-        allowed_formats: Some(formats.iter().copied().collect::<BTreeSet<_>>()),
-        ..Limits::default()
-    }
+    let mut l = Limits::default();
+    l.allowed_formats = Some(formats.iter().copied().collect::<BTreeSet<_>>());
+    l
 }
 
 /// The default opens everything the build was compiled with. Narrowing has to

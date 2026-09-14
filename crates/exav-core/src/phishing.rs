@@ -24,7 +24,7 @@ pub type PhishingParts = (Vec<String>, Vec<(String, String)>, Vec<(String, Strin
 /// Phishing databases in the ClamAV `.wdb`/`.pdb` on-disk formats — an allow-list
 /// of legitimate (real, displayed) URL pairs and a monitored-brand domain-list.
 /// Precision-only: never adds a detection the raw heuristic wouldn't raise.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct PhishingDb {
     /// `.pdb` `H:` protected hostnames, stored at registered-domain granularity.
     protected: std::collections::HashSet<String>,

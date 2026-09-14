@@ -37,6 +37,7 @@ pub struct Fault {
 
 pub type MemResult<T> = Result<T, Fault>;
 
+#[derive(Debug)]
 struct Page {
     bytes: Box<[u8; PAGE_SIZE]>,
     /// Set on the first write. Never cleared: the question the unpacker asks is
@@ -49,6 +50,7 @@ struct Page {
 }
 
 /// The emulator's address space.
+#[derive(Debug)]
 pub struct Mem {
     pages: Vec<Page>,
     /// Page number (`addr >> 12`) to slot in `pages`.
@@ -140,19 +142,6 @@ impl Mem {
     #[inline]
     pub fn code_generation(&self) -> u64 {
         self.code_gen
-    }
-
-    /// Whether an instruction has ever been fetched from the page holding
-    /// `addr`. A jump into a page that was written but never executed is the
-    /// tail transfer into freshly unpacked code — including for the packers
-    /// that unpack *inside* the section their stub lives in, where no
-    /// section-level rule can see it.
-    #[inline]
-    pub fn was_executed(&self, addr: u32) -> bool {
-        match self.index.get(&(addr >> PAGE_SHIFT)) {
-            Some(&slot) => self.pages[slot as usize].executed,
-            None => false,
-        }
     }
 
     /// Record that code was fetched from the page holding `addr`.

@@ -17,7 +17,7 @@ exav /var/www                     # scan a directory, recursively
 exav --no-recursive /var/www      # just the directory's own files
 exav --quiet /data                # only print errors and detections
 cat file.zip | exav -             # scan stdin (constant memory, any size)
-exav https://host/obj.zip         # scan over HTTP range requests (needs an `http-scan` build)
+exav https://host/obj.zip         # scan over HTTP range requests (needs an `http-scan` build + `--allow-http-scan`)
 exav -d ./mydb /data              # use a signature database (file or dir)
 ```
 

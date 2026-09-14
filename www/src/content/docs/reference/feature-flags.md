@@ -25,7 +25,7 @@ The default build is 100% pure-Rust and links **no TLS stack** — HTTP is opt-i
 | `decrypt` | yes | Decryption of encrypted archives (ZIP ZipCrypto/AES, 7z AES, PDF, DMG). |
 | `dlp` | yes | The structured-data leak heuristics (`--alert-credit-cards` / `--alert-ssns`). |
 | `icap` | yes | The [ICAP (RFC 3507) server](/guides/icap/) and its `--icap*` flags. Pure-Rust and std-only, so it costs the default build nothing; it binds no port unless an `icap://` address on `--listen` asks it to. |
-| `http` | **no** | HTTP(S) support. Enables both halves below; the only thing that links a TLS stack (`ureq → rustls → ring`). |
+| `http` | **no** | HTTP(S) support. Enables both halves below; the only thing that links a TLS stack (`ureq → rustls → ring`). Note the name is per-crate: in `exav-core` `http` is just the range-request backend (`dep:ureq`), while in `exav` it is the umbrella `http = ["http-scan", "http-update"]`. |
 | `http-scan` | no | Scan an `http(s)://` argument + the daemon `SCANURL` command. |
 | `http-update` | no | Signature auto-update over HTTP (`--sig-sources`, `--db-url`). |
 
@@ -97,19 +97,17 @@ Available per-format features:
 ```text
 zip · gzip · tar · bzip2 · xz · zstd · lzip · lzw · lz4 · cab · chm · sevenz
 rar · arj · arc · ace · lha · iso · ole · pdf · email · dmg · vhd · diskimage
-fat · ntfs · wim · upx · inno · nsis · ar · cpio · xar · uuencode · xdp · szdd
+fat · ext · ntfs · wim · upx · inno · nsis · ar · cpio · xar · uuencode · xdp · szdd
 tnef · swf · binhex · lnk · partition · pyc · autoit · onenote · rtf
-machofat · sfx
+machofat · sfx · stuffit · alz · egg · hwp3 · zoo · ishieldz · pepack
+javaclass · aimodel · screnc · base64scan · pe-emu
 ```
 
 `diskimage` covers the virtual disks that need reconstruction (VHDX, QCOW2,
 VMDK); `vhd` is separate because the older format needs no decompressor.
-
-Some extractors are lower-level features that are not forwarded to `exav`,
-so they cannot be named on a `cargo build -p exav` line (all of them are in
-the default `all-formats` build): `stuffit`, `alz`, `egg`, `hwp3`, `ext`, `zoo`,
-`ishieldz`, `pepack`, `javaclass`, `aimodel`, `screnc` and `base64scan`. Select
-those when building `exav-unpack` (or the WASM package) directly.
+`pepack` is static unpacking (no execution); `pe-emu` runs the stub, so it is
+its own switch. Every name above is forwardable from `exav-unpack` through
+`exav-core` to `exav`, so each can be named on a `cargo build -p exav` line.
 
 See [Supported formats](/reference/formats/) for what each one covers.
 

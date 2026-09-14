@@ -153,6 +153,7 @@ you leave out keeps the browser default.
 const archive = await Archive.open(file, {
   maxExtractedBytes: 64 * 1024 * 1024, // everything this archive may decompress
   maxBufferBytes: 16 * 1024 * 1024,    // the most one buffered object may hold
+  maxScannedBytes: 1024 * 1024 * 1024, // cumulative bytes fed to the matcher
   maxMembers: 5000,
   maxRecursion: 4,                     // archives inside archives
   maxCompressionRatio: 200,            // decompression ratio

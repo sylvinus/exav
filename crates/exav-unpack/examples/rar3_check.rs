@@ -92,12 +92,11 @@ fn check_archive(data: &[u8]) -> (u32, u32, u32, u32, u32) {
             } else if unp_ver == 29 && (0x31..=0x35).contains(&method) {
                 let dend = (data_off + pack as usize).min(data.len());
                 let packed = &data[data_off.min(data.len())..dend];
-                let mut budget = exav_unpack::Budget::new(exav_unpack::Limits {
-                    max_extracted_bytes: 2 * 1024 * 1024 * 1024,
-                    max_buffer_bytes: 512 * 1024 * 1024,
-                    max_compression_ratio: u64::MAX,
-                    ..Default::default()
-                });
+                let mut limits = exav_unpack::Limits::default();
+                limits.max_extracted_bytes = 2 * 1024 * 1024 * 1024;
+                limits.max_buffer_bytes = 512 * 1024 * 1024;
+                limits.max_compression_ratio = u64::MAX;
+                let mut budget = exav_unpack::Budget::new(limits);
                 match exav_unpack::unpack29(packed, unp, win_bits, &mut budget) {
                     Ok(out) => {
                         if crc32(&out) == crc {

@@ -259,6 +259,7 @@ mod m {
 /// unmapped memory" is the difference between a bug to fix and a stub that
 /// defended itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Stop {
     /// Read, write or instruction fetch on an unmapped page.
     Fault(Fault),
@@ -295,6 +296,7 @@ pub const EDI: usize = 7;
 /// Longest x86 instruction, and therefore the fetch window.
 const MAX_INSN: usize = 16;
 
+#[derive(Debug)]
 pub struct Cpu {
     pub regs: [u32; 8],
     pub eip: u32,

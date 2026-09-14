@@ -6,12 +6,12 @@
 /// byte prefix at a fixed offset that assigns a [`FileType`]. Applied ONLY as a
 /// fallback when content-based [`identify`] is inconclusive (`Unknown`), so it
 /// never overrides — and so never regresses — a confidently-typed file.
-#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FtmMagics {
     rules: Vec<FtmRule>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct FtmRule {
     offset: usize,
     magic: Vec<u8>,
@@ -207,48 +207,6 @@ pub enum FileType {
 }
 
 impl FileType {
-    pub fn is_archive(self) -> bool {
-        matches!(
-            self,
-            FileType::Zip
-                | FileType::Gzip
-                | FileType::Bzip2
-                | FileType::Xz
-                | FileType::Tar
-                | FileType::SevenZip
-                | FileType::Rar
-                | FileType::Cab
-                | FileType::Chm
-                | FileType::Iso
-                | FileType::Lha
-                | FileType::Arj
-                | FileType::Ar
-                | FileType::Cpio
-                | FileType::Xar
-                | FileType::Wim
-                | FileType::Lz4
-                | FileType::Arc
-                | FileType::Ace
-                | FileType::Alz
-                | FileType::Egg
-                | FileType::Hwp3
-                | FileType::IshieldMsi
-                | FileType::IshieldCab
-                | FileType::IshieldZ
-                | FileType::CryptFf
-                | FileType::Ext
-                | FileType::Lrzip
-                | FileType::Zoo
-                | FileType::AppleSingle
-                | FileType::Fat
-                | FileType::Inno
-                | FileType::Ntfs
-                | FileType::Zstd
-                | FileType::Lzip
-                | FileType::Partition
-        )
-    }
-
     pub fn is_executable(self) -> bool {
         matches!(self, FileType::Pe | FileType::Elf | FileType::MachO)
     }

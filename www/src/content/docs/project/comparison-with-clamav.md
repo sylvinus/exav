@@ -138,7 +138,8 @@ roughly 3×, so these figures come from a `COMPAT=0` pass over the same files.
 
 **104 exav-only detections — 11.6% of exav's detections, 1.91% of files
 scanned.** (In `--clamav-compat` the same corpus yields 32, or 3.9%; the
-difference is exactly the extraction reach that compat switches off.)
+difference is exactly the extraction reach that compat switches off.) These are
+this run's figures — both engines move, so re-measure before quoting.
 
 Every one was verified rather than assumed. 101 of the 104 report a nested match
 location — the hit is inside a member clamd did not unpack, and re-scanning

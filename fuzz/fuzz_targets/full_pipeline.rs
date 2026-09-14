@@ -111,10 +111,8 @@ fuzz_target!(|data: &[u8]| {
 
     let db = Scanner::from_parts(engine, hashes, fuzzy, cdb, icons, allow, ignored);
 
-    let opts = ScanOptions {
-        heuristics: true,
-        ..Default::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.heuristics = true;
 
     // --- Entry point 1: analyze (in-memory, primary path) ---
     let _ = analyze(&db, scan_data, &opts);

@@ -40,7 +40,6 @@
 //!    scanner that gives up quietly on a deeply nested archive has been evaded
 //!    by nothing more than a shell loop.
 
-use exav_core::unpack::Limits;
 use exav_core::{analyze, ScanOptions, Scanner, Verdict};
 
 /// Recursion levels needed to reach the payload. One less than this and exav
@@ -63,13 +62,8 @@ fn fixture() -> Vec<u8> {
 
 fn scan_at(max_recursion: u32) -> Verdict {
     let db = Scanner::builtin();
-    let opts = ScanOptions {
-        limits: Limits {
-            max_recursion,
-            ..Limits::default()
-        },
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.limits.max_recursion = max_recursion;
     analyze(&db, &fixture(), &opts).verdict
 }
 

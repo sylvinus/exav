@@ -73,16 +73,17 @@ fn check_allowed(fmt: Format, limits: &Limits) -> Result<(), JsValue> {
 /// boundary by structured clone, which a `ReadableStream` does not survive
 /// without being transferred. `js/index.js` wraps it into the stream the public
 /// API promises, on whichever side the caller is.
-fn entry_to_js(name: &str, data: &[u8], encrypted: bool, unsupported: &str) -> Result<JsValue, JsValue> {
+fn entry_to_js(
+    name: &str,
+    data: &[u8],
+    encrypted: bool,
+    unsupported: &str,
+) -> Result<JsValue, JsValue> {
     let obj = Object::new();
     Reflect::set(&obj, &"name".into(), &JsValue::from_str(name))?;
     Reflect::set(&obj, &"data".into(), &Uint8Array::from(data))?;
     Reflect::set(&obj, &"encrypted".into(), &JsValue::from_bool(encrypted))?;
-    Reflect::set(
-        &obj,
-        &"unsupported".into(),
-        &JsValue::from_str(unsupported),
-    )?;
+    Reflect::set(&obj, &"unsupported".into(), &JsValue::from_str(unsupported))?;
     Ok(obj.into())
 }
 
@@ -183,16 +184,15 @@ fn parse_passwords(passwords: &JsValue) -> Vec<String> {
 /// space is not what constrains them. Raise any of them through the `limits`
 /// argument if the page can afford it.
 fn browser_limits() -> Limits {
-    Limits {
-        max_extracted_bytes: 128 * 1024 * 1024,
-        max_buffer_bytes: 32 * 1024 * 1024,
-        ..Limits::default()
-    }
+    let mut l = Limits::default();
+    l.max_extracted_bytes = 128 * 1024 * 1024;
+    l.max_buffer_bytes = 32 * 1024 * 1024;
+    l
 }
 
-/// Read a `{ maxExtractedBytes, maxBufferBytes, maxMembers, maxRecursion,
-/// maxCompressionRatio }` object from JS. Absent keys keep the browser default;
-/// a caller sets only what it cares about.
+/// Read a `{ maxExtractedBytes, maxBufferBytes, maxScannedBytes, maxMembers,
+/// maxRecursion, maxCompressionRatio }` object from JS. Absent keys keep the
+/// browser default; a caller sets only what it cares about.
 fn limits_from_js(v: &JsValue) -> Limits {
     let mut l = browser_limits();
     if v.is_undefined() || v.is_null() {
@@ -209,6 +209,9 @@ fn limits_from_js(v: &JsValue) -> Limits {
     }
     if let Some(n) = num("maxBufferBytes") {
         l.max_buffer_bytes = n as u64;
+    }
+    if let Some(n) = num("maxScannedBytes") {
+        l.max_scanned_bytes = n as u64;
     }
     if let Some(n) = num("maxMembers") {
         l.max_members = n as u64;
@@ -291,8 +294,8 @@ impl Archive {
     /// a `read` that returns bytes to await anything.
     ///
     /// `limits` is optional and bounds every extraction from this archive:
-    /// `{ maxExtractedBytes, maxBufferBytes, maxMembers, maxRecursion,
-    /// maxCompressionRatio, allowedFormats }`. Absent keys keep the browser
+    /// `{ maxExtractedBytes, maxBufferBytes, maxScannedBytes, maxMembers,
+    /// maxRecursion, maxCompressionRatio, allowedFormats }`. Absent keys keep the browser
     /// default, which is an order of magnitude below the library's own — a tab
     /// has far less room than a server, and running out of it aborts the module
     /// rather than returning an error.
@@ -394,7 +397,11 @@ impl Archive {
     }
 
     /// Extract one member by index.
-    pub fn extract(&mut self, index: usize, passwords: Option<JsValue>) -> Result<JsValue, JsValue> {
+    pub fn extract(
+        &mut self,
+        index: usize,
+        passwords: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
         let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
         if self.is_indexed() {
             let mut budget = Budget::with_passwords(self.limits.clone(), pw);

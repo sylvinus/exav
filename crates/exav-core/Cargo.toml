@@ -177,6 +177,20 @@ onenote = ["exav-unpack/onenote"]
 rtf = ["exav-unpack/rtf"]
 machofat = ["exav-unpack/machofat"]
 sfx = ["exav-unpack/sfx"]
+stuffit = ["exav-unpack/stuffit"]
+alz = ["exav-unpack/alz"]
+egg = ["exav-unpack/egg"]
+hwp3 = ["exav-unpack/hwp3"]
+ext = ["exav-unpack/ext"]
+zoo = ["exav-unpack/zoo"]
+ishieldz = ["exav-unpack/ishieldz"]
+pepack = ["exav-unpack/pepack"]
+javaclass = ["exav-unpack/javaclass"]
+aimodel = ["exav-unpack/aimodel"]
+screnc = ["exav-unpack/screnc"]
+# Emulation-based unpacking (see exav-unpack's `pe-emu`): its own switch, so a
+# build can take static unpacking without executing attacker control flow.
+pe-emu = ["exav-unpack/pe-emu"]
 # Enables the HTTP(S) range-request seekable backend (HttpRangeReader). OFF by
 # default — the only feature that pulls a C/asm TLS stack (ureq → rustls → ring).
 http = ["dep:ureq"]
@@ -184,9 +198,9 @@ http = ["dep:ureq"]
 # `bytecode` interpreter, `pe`/`icon`/`hashes`/`patterns`/… primitives) as `pub`
 # for low-level tooling and the in-crate `examples/`. OFF by default: these are
 # NOT part of the semver-stable API and may change in any release. The supported
-# public surface is the crate root (`Database`, `ScanOptions`, `Verdict`,
-# `ScanReport`, the `scan_*`/`analyze*` fns) plus the `db`, `cache`, `source`,
-# `profile`, `filetype`, and `unpack` modules.
+# public surface is the crate root (`Scanner`, `ScanOptions`, `Verdict`,
+# `ScanReport`, the `scan_*`/`analyze*` fns) plus the `database`, `loader`,
+# `source`, `profile`, `filetype`, and `unpack` modules.
 unstable-internals = []
 
 # The WASI command-line scanner, built for `wasm32-wasip1` and run under any

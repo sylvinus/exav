@@ -66,11 +66,10 @@ fn corpus() -> Option<PathBuf> {
 /// a too-eager entry-point heuristic fails: it reports success while handing
 /// back a half-decompressed image.
 fn largest_recovered(file: &[u8]) -> usize {
-    let mut b = Budget::new(Limits {
-        max_extracted_bytes: 1 << 30,
-        max_buffer_bytes: 1 << 30,
-        ..Default::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = 1 << 30;
+    limits.max_buffer_bytes = 1 << 30;
+    let mut b = Budget::new(limits);
     match extract(Format::PePacked, file, &mut b) {
         Ok(entries) => entries.iter().map(|e| e.data.len()).max().unwrap_or(0),
         Err(_) => 0,

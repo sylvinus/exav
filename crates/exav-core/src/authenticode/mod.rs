@@ -67,6 +67,7 @@ pub struct PeSignature {
 // ---- .crb certificate block-list -------------------------------------------
 
 /// One parsed `.crb` line (ClamAV certificate database).
+#[derive(Debug)]
 struct CrbEntry {
     name: String,
     /// SHA-1 of the subject `Name` DER, hex-decoded (the `Subject` field).
@@ -80,7 +81,7 @@ struct CrbEntry {
 /// reported. Trust/whitelist entries (`Trusted == 1`) are ignored, since honoring
 /// them safely would require verifying the RSA signature chain (out of scope —
 /// see the module docs).
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CrbDb {
     blocked: Vec<CrbEntry>,
     /// Raw `.crb` texts, retained so the on-disk database can round-trip the

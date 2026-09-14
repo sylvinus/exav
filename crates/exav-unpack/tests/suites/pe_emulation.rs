@@ -99,11 +99,10 @@ fn payload_of(marker: &[u8], len: usize) -> Vec<u8> {
 }
 
 fn unpack(file: &[u8]) -> Vec<exav_unpack::Entry> {
-    let mut b = Budget::new(Limits {
-        max_extracted_bytes: 1 << 30,
-        max_buffer_bytes: 1 << 30,
-        ..Default::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = 1 << 30;
+    limits.max_buffer_bytes = 1 << 30;
+    let mut b = Budget::new(limits);
     extract(Format::PePacked, file, &mut b).expect("extraction stays within budget")
 }
 
@@ -210,11 +209,10 @@ fn emulation_respects_the_extraction_budget() {
     let cipher: Vec<u8> = plain.iter().map(|b| b ^ 0x11).collect();
     let file = packed_pe(&decrypt_stub(cipher.len() as u32, 0x11), &cipher);
 
-    let mut b = Budget::new(Limits {
-        max_buffer_bytes: 0x2000,
-        max_extracted_bytes: 0x2000,
-        ..Default::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 0x2000;
+    limits.max_extracted_bytes = 0x2000;
+    let mut b = Budget::new(limits);
     let entries = extract(Format::PePacked, &file, &mut b).expect("budget stop is not an error");
     for e in &entries {
         assert!(

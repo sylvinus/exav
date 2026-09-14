@@ -206,6 +206,9 @@ fn main() -> ExitCode {
                         }
                         ev.to_string()
                     }
+                    // `Event` is non-exhaustive: a result kind added later
+                    // renders through its `Display`, like the line kinds do.
+                    _ => ev.to_string(),
                 };
                 // A failed write is not "stop quietly": a closed pipe or a full
                 // disk means results the caller asked for did not arrive, and

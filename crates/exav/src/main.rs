@@ -95,6 +95,22 @@ fn read_path_list(list: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Read a `--passwords-from` file: one password per line, kept byte-identical
+/// except for the line ending. Unlike [`read_path_list`], nothing is trimmed
+/// or skipped — spaces, `#` and empty lines are all legal inside a password,
+/// and only a file's final newline is not one (an actually-empty password is
+/// a blank line anywhere else). `-` is refused: it would read scan stdin,
+/// which is already the scan input.
+fn read_password_list(list: &std::path::Path) -> std::io::Result<Vec<String>> {
+    if list == std::path::Path::new("-") {
+        return Err(std::io::Error::other(
+            "--passwords-from reads a file, not stdin (stdin is already the scan input)",
+        ));
+    }
+    let s = std::fs::read_to_string(list)?;
+    Ok(s.lines().map(str::to_string).collect())
+}
+
 /// The `--log` sink. A process scans once, so one lazily-opened handle is the
 /// whole mechanism; `None` means no `--log` was given.
 static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
@@ -414,7 +430,9 @@ struct Cli {
     listen: Vec<String>,
 
     /// Scan by handing each file to a daemon already running at this address,
-    /// instead of loading a database here. Same address grammar as --listen.
+    /// instead of loading a database here. Same address grammar as --listen,
+    /// but a bare address: query options (`?mode=`, `?max-connections=`,
+    /// `?service=`) tune the listener and are refused here.
     ///
     /// The direction is the flag, not a mode: --listen accepts connections,
     /// --connect makes one.
@@ -547,6 +565,16 @@ struct Cli {
     /// everything. clamd honours `SHUTDOWN`; exav does not unless asked.
     #[arg(long = "allow-shutdown", env = "EXAV_ALLOW_SHUTDOWN", value_parser = env_switch())]
     allow_shutdown: bool,
+
+    /// Fetch `http(s)://` scan targets and honour the daemon `SCANURL`
+    /// command. Off by default.
+    ///
+    /// A URL hands the fetcher to whoever names it: a one-shot `exav URL`
+    /// fetches it directly, and a daemon with this flag lets any client that
+    /// can reach the socket make it fetch. Needs a build with
+    /// `--features http-scan` to fetch anything at all.
+    #[arg(long = "allow-http-scan", env = "EXAV_ALLOW_HTTP_SCAN", value_parser = env_switch())]
+    allow_http_scan: bool,
 
     /// Daemon worker model (Unix): a worker count, or `threads`.
     /// [default: CPU cores]
@@ -923,16 +951,30 @@ struct Cli {
     )]
     password: Vec<String>,
 
+    /// Read passwords from FILE, one per line, appended after `--passwords`.
+    /// Lines are kept verbatim (only the line ending is stripped), so a
+    /// password containing a comma or leading/trailing spaces — inexpressible
+    /// on the command line — goes here. Passwords on a command line stay
+    /// visible in process listings; a file does not.
+    #[arg(
+        long = "passwords-from",
+        value_name = "FILE",
+        env = "EXAV_PASSWORDS_FROM"
+    )]
+    passwords_from: Option<PathBuf>,
+
     /// Shortcut that sets exav to a stock ClamAV build's documented defaults for
     /// apples-to-apples differential testing. Equivalent to `--max-input-bytes
     /// 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000
-    /// --decode none`, plus narrowing the unpacking reach to the formats stock
-    /// ClamAV handles and reporting under ClamAV's vocabulary where the two
-    /// engines name the same fact differently. This DELIBERATELY REDUCES exav's
-    /// detection capability so results reproduce clamscan's — it is a
-    /// diff-testing mode, NOT recommended for production. Off by default (full
-    /// capability). Each preset flag can still be set or overridden on its own;
-    /// an explicit flag wins over the preset.
+    /// --decode none --partial-as ok`, plus narrowing the unpacking reach to the
+    /// formats stock ClamAV handles and reporting under ClamAV's vocabulary
+    /// where the two engines name the same fact differently. It leaves
+    /// `--max-object-bytes`, `--max-matcher-bytes`, spill settings, `--detect`,
+    /// and update/network/worker settings on exav defaults. This DELIBERATELY
+    /// REDUCES exav's detection capability so results reproduce clamscan's — it
+    /// is a diff-testing mode, NOT recommended for production. Off by default
+    /// (full capability). Each preset flag can still be set or overridden on its
+    /// own; an explicit flag wins over the preset.
     #[arg(long = "clamav-compat", env = "EXAV_CLAMAV_COMPAT", value_parser = env_switch())]
     clamav_compat: bool,
 
@@ -1515,6 +1557,20 @@ fn main() -> ExitCode {
         }
     }
 
+    // Expand --passwords-from into the password pool AFTER --passwords, so a
+    // password tried comes from the command line first and the file second.
+    // Fail fast like --files-from: a run that cannot read its passwords must
+    // not scan under fewer than asked for.
+    if let Some(list) = cli.passwords_from.clone() {
+        match read_password_list(&list) {
+            Ok(mut extra) => cli.password.append(&mut extra),
+            Err(e) => {
+                eprintln!("exav: --passwords-from {}: {e}", list.display());
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     // Every listener address is parsed once, here, so a malformed one stops the
     // run before anything is loaded rather than when a bind is attempted.
     if let Err(e) = listeners(&cli) {
@@ -1767,7 +1823,12 @@ fn main() -> ExitCode {
             Some("-") => scan_stdin(&db, &cli, &mut totals),
             #[cfg(feature = "http-scan")]
             Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
-                scan_url(s, &db, &opts, &cli, &mut totals)
+                if cli.allow_http_scan {
+                    scan_url(s, &db, &opts, &cli, &mut totals)
+                } else {
+                    totals.errors += 1;
+                    eprintln!("{s}: URL scanning disabled; pass --allow-http-scan ERROR");
+                }
             }
             #[cfg(not(feature = "http-scan"))]
             Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
@@ -1961,6 +2022,7 @@ fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
             max_cpu_secs: scan_time,
             max_jobs: cli.max_jobs_per_worker.unwrap_or(1000),
             allow_shutdown: shutdown_allowed(cli.allow_shutdown),
+            allow_http_scan: cli.allow_http_scan,
         };
         #[cfg(feature = "icap")]
         let icap_child = icap_server.map(|s| icap::forked_child(s, metrics_interval(cli)));
@@ -1989,6 +2051,7 @@ fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
     if let Some(server) = icap_server {
         let (clamd_db, clamd_opts) = (std::sync::Arc::clone(&db), std::sync::Arc::clone(&opts));
         let allow_shutdown = shutdown_allowed(cli.allow_shutdown);
+        let allow_http_scan = cli.allow_http_scan;
         // Before the thread starts, for the same reason the ICAP-only path sets
         // it before serving. The disposition is process-wide, so leaving it to
         // `daemon::run` on the new thread would leave this one serving ICAP
@@ -2001,6 +2064,7 @@ fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
                 addr,
                 clamd_opts,
                 allow_shutdown,
+                allow_http_scan,
                 clamd_max_connections,
             ) {
                 eprintln!("exav: daemon error: {e}");
@@ -2019,6 +2083,7 @@ fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
         addr,
         opts,
         shutdown_allowed(cli.allow_shutdown),
+        cli.allow_http_scan,
         clamd_max_connections,
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -2453,6 +2518,22 @@ fn check_flag_conflicts(cli: &Cli) -> Result<(), String> {
     if serves(cli) && !cli.paths.is_empty() {
         return Err("--listen starts a server; it takes no paths to scan".to_string());
     }
+    // A --connect client dials the address and honours none of its server-side
+    // tunables, so an address carrying any is refused rather than quietly
+    // dropped — a pasted listen address the operator believes is tuned. Only
+    // the marked options count; a future client-side key passes through.
+    if let Some(addr) = cli.connect.as_deref() {
+        if let Ok(e) = endpoint::Endpoint::parse(addr) {
+            let dropped = e.server_side_options();
+            if !dropped.is_empty() {
+                return Err(format!(
+                    "--connect takes a bare address, but this one carries \
+                     listener settings ({}); drop the query or move it to --listen",
+                    dropped.join(", "),
+                ));
+            }
+        }
+    }
     // Serving is chosen before `--build-db` is ever looked at, so without this
     // the pair does not fail — it silently serves, builds nothing, and leaves
     // the operator waiting on a database that is never written.
@@ -2793,21 +2874,21 @@ fn scan_stdin(db: &Scanner, cli: &Cli, totals: &mut Totals) {
                 Ok(p) => p,
                 // Nowhere to put it is not "nothing found in it".
                 Err(spill::SpillError::Budget(reason)) => {
-                    return Ok(exav_core::ScanReport {
-                        verdict: exav_core::Verdict::Unscannable { reason },
-                        findings: Vec::new(),
-                    })
+                    return Ok(exav_core::ScanReport::new(
+                        exav_core::Verdict::Unscannable { reason },
+                        Vec::new(),
+                    ))
                 }
                 Err(spill::SpillError::Io(e)) => return Err(e),
             };
             if let Some(m) = max {
                 if payload.len() > m {
-                    return Ok(exav_core::ScanReport {
-                        verdict: exav_core::Verdict::LimitsExceeded {
+                    return Ok(exav_core::ScanReport::new(
+                        exav_core::Verdict::LimitsExceeded {
                             reason: format!("stdin exceeds max-input-bytes {m}"),
                         },
-                        findings: Vec::new(),
-                    });
+                        Vec::new(),
+                    ));
                 }
             }
             let (report, _loc) = daemon::scan_payload(db, &opts, &payload)?;
@@ -3504,10 +3585,19 @@ fn run_client(cli: &Cli) -> ExitCode {
     let mut last_id = 0u64;
     for f in &files {
         let abs = std::fs::canonicalize(f).unwrap_or_else(|_| f.clone());
-        client_verbose_cmd(cli, "SCAN", &abs.display().to_string());
+        let name = abs.display().to_string();
+        // A URL is not a path the daemon can open: ask for SCANURL and let
+        // the daemon decide (it honours it only with --allow-http-scan). The
+        // client needs no flag of its own — it fetches nothing itself.
+        let verb = if name.starts_with("http://") || name.starts_with("https://") {
+            "SCANURL"
+        } else {
+            "SCAN"
+        };
+        client_verbose_cmd(cli, verb, &name);
         // `PING` rides behind the scan as its end marker — see
         // [`read_session_replies`] for why a session needs one.
-        let cmd = format!("zSCAN {}\0zPING\0", abs.display());
+        let cmd = format!("z{verb} {name}\0zPING\0");
         if conn
             .write_all(cmd.as_bytes())
             .and_then(|_| conn.flush())
@@ -3882,15 +3972,7 @@ fn scan_one_allmatch(
                     Verdict::PasswordProtected { reason }
                 }
             };
-            report_result(
-                &name,
-                ScanReport {
-                    verdict,
-                    findings: Vec::new(),
-                },
-                cli,
-                totals,
-            );
+            report_result(&name, ScanReport::new(verdict, Vec::new()), cli, totals);
         }
         Err(_) => report_error(&name, "internal error while scanning", cli, totals),
     }
@@ -4270,6 +4352,35 @@ mod tests {
         );
     }
 
+    /// `--passwords-from` keeps every line byte-identical except the ending:
+    /// spaces, `#` and interior blanks are legal inside a password, and only
+    /// the file's final newline is not a password. `-` is refused rather than
+    /// reading scan stdin.
+    #[test]
+    fn passwords_from_keeps_lines_verbatim() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let file = dir.path().join("pw");
+        std::fs::write(&file, "plain\nwith space\nwith,comma\n#hash\n\ntrailing\n").unwrap();
+        assert_eq!(
+            read_password_list(&file).unwrap(),
+            ["plain", "with space", "with,comma", "#hash", "", "trailing"],
+            "lines verbatim; interior blank kept; final newline is not a password"
+        );
+
+        let crlf = dir.path().join("crlf");
+        std::fs::write(&crlf, "a\r\nb\r\n").unwrap();
+        assert_eq!(read_password_list(&crlf).unwrap(), ["a", "b"]);
+
+        assert!(
+            read_password_list(std::path::Path::new("-")).is_err(),
+            "`-` would read scan stdin, which is already the scan input"
+        );
+        assert!(
+            read_password_list(&dir.path().join("absent")).is_err(),
+            "an unreadable password file must error rather than scan under fewer passwords"
+        );
+    }
+
     /// The clamscan flags a migrating user types are answered by name, and
     /// nothing else is.
     ///
@@ -4336,6 +4447,7 @@ mod tests {
             "--max-members",
             "--detect",
             "--passwords",
+            "--passwords-from",
             "--clamav-compat",
             "--sig-dir",
             "-d",
@@ -4835,6 +4947,36 @@ mod tests {
             assert!(
                 check_flag_conflicts(&cli).is_ok(),
                 "{ok:?} is a working combination"
+            );
+        }
+    }
+
+    /// `--connect` takes a bare address: query options tune the listener, and
+    /// a client silently dropping them would scan under settings nobody
+    /// applied. Only the marked server-side options refuse — a future
+    /// client-side key passes through by construction.
+    #[test]
+    fn connect_refuses_listener_tuning() {
+        let _env = env_guard();
+        let cli =
+            |argv: &[&str]| Cli::parse_from(std::iter::once("exav").chain(argv.iter().copied()));
+        for argv in [
+            &["--connect", "h:1?max-connections=5", "f"][..],
+            &["--connect", "/s?mode=660", "f"][..],
+            &["--connect", "icap://h:1/avscan", "f"][..],
+        ] {
+            assert!(
+                check_flag_conflicts(&cli(argv)).is_err(),
+                "{argv:?} carries listener tuning a client would drop"
+            );
+        }
+        for argv in [
+            &["--connect", "h:1", "f"][..],
+            &["--connect", "/s", "f"][..],
+        ] {
+            assert!(
+                check_flag_conflicts(&cli(argv)).is_ok(),
+                "{argv:?} is a bare address and must work"
             );
         }
     }

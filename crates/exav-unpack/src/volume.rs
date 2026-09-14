@@ -17,7 +17,7 @@
 //! the file — that string must be matched against a listing, never opened.
 
 /// How a set names its volumes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scheme {
     /// `stem.partN.rar` — RAR 3 and later. Digit width is fixed across a set.
     RarPart { width: usize },
@@ -32,7 +32,7 @@ pub enum Scheme {
 }
 
 /// One volume's place in its set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VolumeName {
     /// The part of the name shared by every volume in the set.
     pub stem: String,
@@ -226,7 +226,7 @@ pub enum Offer {
 }
 
 /// Everything a [`Collector`] held, resolved once the container has ended.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Finished {
     /// Reassembled files, each named for its set.
     pub joined: Vec<Joined>,
@@ -237,7 +237,7 @@ pub struct Finished {
 }
 
 /// A set put back together.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Joined {
     /// Named for the set, not for a part, so a report points at the archive.
     pub name: String,
@@ -269,7 +269,7 @@ impl Finished {
 }
 
 /// One member still held when a container ended, and why it could not be joined.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Unjoined {
     pub name: String,
     pub data: Vec<u8>,
@@ -293,12 +293,14 @@ pub struct Unjoined {
 /// Held bytes are bounded by `max_held_bytes`; past it, members are passed
 /// through individually rather than accumulated, so a container claiming a huge
 /// volume set cannot turn this into unbounded memory.
+#[derive(Debug)]
 pub struct Collector {
     pending: Vec<Pending>,
     max_held_bytes: u64,
     held_bytes: u64,
 }
 
+#[derive(Debug)]
 struct Pending {
     key: VolumeName,
     /// `(volume index, name, bytes)`, in arrival order.

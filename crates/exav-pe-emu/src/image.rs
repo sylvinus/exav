@@ -17,17 +17,15 @@
 
 use crate::mem::Mem;
 
+#[derive(Debug, Clone)]
 pub struct Section {
-    /// The eight raw name bytes. Used to tell a linker's section from one a
-    /// packer added, which is one of the signals that routes a file here.
-    pub name: [u8; 8],
     pub vaddr: u32,
     pub vsize: u32,
     pub raw_ptr: u32,
     pub raw_size: u32,
-    pub characteristics: u32,
 }
 
+#[derive(Debug)]
 pub struct PeImage {
     pub base: u32,
     pub size_of_image: u32,
@@ -48,10 +46,6 @@ pub struct PeImage {
     /// functions its stub needs, and the *loader* — not the stub — fills those
     /// slots in. Emulating that binding is what lets the stub call them.
     pub import_dir: (u32, u32),
-    /// CLR header directory (RVA, size). A managed assembly has no x86 stub to
-    /// run — its "entry point" is a jump into `mscoree` — so there is nothing
-    /// for the emulator to do with one.
-    pub clr_dir: (u32, u32),
     pub sections: Vec<Section>,
     /// Offset of the section table within the file, so the dump can patch it.
     sec_table_off: usize,
@@ -111,28 +105,16 @@ impl PeImage {
         } else {
             (0, 0)
         };
-        let clr_dir = if num_dirs >= 15 {
-            (
-                u32_at(data, opt + 96 + 14 * 8).unwrap_or(0),
-                u32_at(data, opt + 96 + 14 * 8 + 4).unwrap_or(0),
-            )
-        } else {
-            (0, 0)
-        };
 
         let mut sections = Vec::with_capacity(num_sections);
         for i in 0..num_sections {
             let s = sec_table_off.checked_add(i * 40)?;
             let hdr = data.get(s..s + 40)?;
-            let mut name = [0u8; 8];
-            name.copy_from_slice(&hdr[..8]);
             sections.push(Section {
-                name,
                 vsize: u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
                 vaddr: u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]),
                 raw_size: u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]),
                 raw_ptr: u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]),
-                characteristics: u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]),
             });
         }
         // A `SizeOfImage` that does not cover the sections is common in packed
@@ -158,7 +140,6 @@ impl PeImage {
             file_align,
             is_dll,
             import_dir,
-            clr_dir,
             sections,
             sec_table_off,
             pe_off,

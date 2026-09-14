@@ -137,6 +137,7 @@ impl Default for EmuLimits {
 const TRACE_LEN: usize = 48;
 
 /// The image a stub rebuilt.
+#[derive(Debug)]
 pub struct Unpacked {
     /// The reconstructed PE, in memory layout.
     pub data: Vec<u8>,
@@ -149,6 +150,7 @@ pub struct Unpacked {
 
 /// Outcome of one emulation, including the diagnostics that make a stub which
 /// did *not* unpack actionable.
+#[derive(Debug)]
 pub struct Report {
     pub unpacked: Option<Unpacked>,
     /// Why the run ended, in a form fit for a log line.

@@ -81,6 +81,7 @@ const SAMPLE_PATH: &str = "C:\\sample.exe";
 const PROCESS_HEAP: u32 = 0x0052_0000;
 
 /// A synthetic loaded module.
+#[derive(Debug, Clone)]
 pub struct Module {
     /// Lowercase file name, e.g. `kernel32.dll`.
     pub name: String,
@@ -667,6 +668,7 @@ const PRELOADED: &[(&str, u32)] = &[
 ];
 
 /// A resolved export: the trap address, and what to do when it is reached.
+#[derive(Debug)]
 struct Trap {
     api: Option<Api>,
     argc: u8,
@@ -676,6 +678,7 @@ struct Trap {
 
 /// What servicing an API call asked the driver to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApiEffect {
     /// Execution continues at the return address.
     Continue,
@@ -690,6 +693,7 @@ pub enum ApiEffect {
     Unimplemented,
 }
 
+#[derive(Debug)]
 pub struct Env<'a> {
     pub modules: Vec<Module>,
     /// The bytes of the file being emulated.

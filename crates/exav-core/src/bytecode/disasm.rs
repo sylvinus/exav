@@ -551,6 +551,9 @@ fn fill_arg(arg: &mut [u8], insn: &Insn, i: usize) {
             put32(arg, 2, offset);
             put32(arg, 6, 0);
         }
+        // `Op` is non-exhaustive: an operand form added later has no ABI slot
+        // yet, so it reports as absent rather than as some other operand.
+        _ => arg[0] = ACCESS_NOARG,
     }
 }
 

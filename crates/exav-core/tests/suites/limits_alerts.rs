@@ -39,10 +39,8 @@ fn zip_with_members(n: usize) -> Vec<u8> {
 
 /// Budget tightened so the fixture is guaranteed to trip it.
 fn tight(alert: bool) -> ScanOptions {
-    let mut o = ScanOptions {
-        alert_exceeds_max: alert,
-        ..ScanOptions::default()
-    };
+    let mut o = ScanOptions::default();
+    o.alert_exceeds_max = alert;
     o.limits.max_members = 4;
     o
 }
@@ -94,10 +92,8 @@ fn the_recursion_budget_reports_its_own_name() {
         z.write_all(&blob).unwrap();
         blob = z.finish().unwrap().into_inner();
     }
-    let mut opts = ScanOptions {
-        alert_exceeds_max: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_exceeds_max = true;
     opts.limits.max_recursion = 2;
 
     match analyze(&db, &blob, &opts).verdict {

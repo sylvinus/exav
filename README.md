@@ -134,16 +134,21 @@ Within that, the intent is:
 `Verdict`, `Method`, `FileType`, `Format` and `LimitKind` are
 `#[non_exhaustive]`, so matching on them needs a wildcard arm. Without it, every
 new format or outcome would be a breaking change, and this project adds formats.
+`Limits` and `ScanOptions` are `#[non_exhaustive]` too, so they cannot be built
+with a struct literal at all — start from `::default()` and assign the fields
+you care about:
 
-Two deliberate exceptions:
+```rust
+let mut opts = ScanOptions::default();
+opts.limits.max_members = 100;
+```
+
+One deliberate exception:
 
 - **`VerdictCategory` is exhaustive**, and stays that way. It exists so exit
   codes and output shape are decided in one place, and its value is the compiler
   refusing to build until every consumer has handled a new category. A wildcard
   there would quietly give a future outcome some existing exit code.
-- **`Limits` and `ScanOptions` are plain structs.** Marking them would forbid
-  `..Default::default()` construction entirely, which is how they are meant to
-  be built. Construct them that way and a new field will not break you.
 
 ## Contributing, Security, License
 

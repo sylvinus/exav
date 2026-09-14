@@ -51,6 +51,7 @@ pub const NESTING_SEP: char = '!';
 /// What to search for. Fixed strings are searched literally (no escaping
 /// surprises); regex patterns compile on the linear-time `regex` engine, so a
 /// pathological pattern cannot hang the search.
+#[derive(Debug, Clone)]
 pub struct Matcher {
     re: regex::bytes::Regex,
     invert: bool,
@@ -88,7 +89,7 @@ impl Matcher {
 }
 
 /// Search behaviour.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Options {
     /// Extraction budgets (bomb guards, recursion depth, file count).
     pub limits: Limits,
@@ -105,7 +106,8 @@ pub struct Options {
 }
 
 /// One result of the search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A matching line.
     Match {
@@ -178,6 +180,7 @@ pub type Sink<'a> = &'a mut dyn FnMut(Event) -> bool;
 /// a per-file curiosity. A member that could not be read is reported as
 /// [`Event::Unreadable`], never skipped silently: content the search did not
 /// see is not the same as content with no matches.
+#[derive(Debug)]
 pub struct Searcher {
     matcher: Matcher,
     opts: Options,

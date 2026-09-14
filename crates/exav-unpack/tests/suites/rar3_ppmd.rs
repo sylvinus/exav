@@ -108,13 +108,12 @@ fn fixture(name: &str) -> Vec<u8> {
 fn ppmd_lzss_conversion_crc() {
     let data = fixture("ppmd_lzss_conversion.rar");
     let m = first_compressed_member(&data).expect("compressed member");
-    let mut budget = Budget::new(Limits {
-        max_extracted_bytes: 1 << 31, // 2 GiB
-        max_buffer_bytes: 1 << 30,    // 1 GiB
-        max_compression_ratio: u64::MAX,
-        max_members: 1000,
-        ..Default::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = 1 << 31; // 2 GiB
+    limits.max_buffer_bytes = 1 << 30; // 1 GiB
+    limits.max_compression_ratio = u64::MAX;
+    limits.max_members = 1000;
+    let mut budget = Budget::new(limits);
     let out = unpack29(&m.packed, m.unp, m.win_bits, &mut budget).expect("decode");
     assert_eq!(out.len() as u64, m.unp, "decoded length");
     assert_eq!(crc32(&out), m.crc, "decoded CRC mismatch");

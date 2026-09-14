@@ -125,7 +125,7 @@ pub struct Builder {
     /// Provenance — whether a signature came from an unofficial (non-`.cvd`)
     /// database — is now recorded *per signature*, always, regardless of this
     /// flag. The `.UNOFFICIAL` name suffix / `YARA.` prefix is applied at REPORT
-    /// time (gated on `ScanOptions::compat`), so ONE database serves both compat and
+    /// time (gated on `ScanOptions::unofficial_suffix`), so ONE database serves both compat and
     /// non-compat scans. Official `.cvd`/`.cld` sigs carry `unofficial=false` and
     /// are never suffixed. See `crate::report_name`.
     unofficial_suffix: bool,
@@ -172,7 +172,7 @@ impl Builder {
     }
 
     /// Retained for API/CLI compatibility (`--clamav-compat`). The unofficial
-    /// suffix is applied at scan/report time (gated on `ScanOptions::compat`),
+    /// suffix is applied at scan/report time (gated on `ScanOptions::unofficial_suffix`),
     /// using per-signature provenance recorded at load regardless of this flag, so
     /// one database serves both modes. Exposed as a setter for API/CLI
     /// compatibility; it does not change what gets stored in the database.
@@ -279,15 +279,14 @@ impl Builder {
         // detections with `.UNOFFICIAL` (and YARA rules with a `YARA.` prefix).
         // We record this bit per signature, ALWAYS (independent of any compat
         // flag), and store the CLEAN name. The suffix is applied at report time
-        // (see `crate::report_name`), gated on `ScanOptions::compat`, so a single
+        // (see `crate::report_name`), gated on `ScanOptions::unofficial_suffix`, so a single
         // database serves both compat and non-compat scans.
         let unofficial = !official;
         // The `.??u` databases (`.ndu`/`.ldu`/`.hdu`/`.hsu`/`.mdu`) are ClamAV's
         // PUA signature sets, loaded only with `DetectPUA`. Skip them by default
         // so exav doesn't flag PUA (including hash-based PUA, which has no `PUA.`
         // name gate) on a default config.
-        if !self.detect_pua && matches!(ext.as_str(), "ndu" | "ldu" | "hdu" | "hsu" | "mdu" | "sdu")
-        {
+        if !self.detect_pua && matches!(ext.as_str(), "ndu" | "ldu" | "hdu" | "hsu" | "mdu") {
             return;
         }
         match ext.as_str() {

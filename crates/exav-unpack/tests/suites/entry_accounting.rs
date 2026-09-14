@@ -15,10 +15,9 @@ use std::io::Write;
 
 /// Extract with `max_members` set to `cap`, and say whether the limit fired.
 fn hits_limit(blob: &[u8], fmt: Format, cap: u64) -> bool {
-    let mut budget = Budget::new(Limits {
-        max_members: cap,
-        ..Default::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_members = cap;
+    let mut budget = Budget::new(limits);
     extract(fmt, blob, &mut budget).is_err()
 }
 

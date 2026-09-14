@@ -34,10 +34,9 @@ fn oversize_rar() -> Vec<u8> {
 }
 
 fn tiny_deep_analysis() -> ScanOptions {
-    ScanOptions {
-        deep_analysis_max: 4096,
-        ..ScanOptions::default()
-    }
+    let mut o = ScanOptions::default();
+    o.deep_analysis_max = 4096;
+    o
 }
 
 #[test]

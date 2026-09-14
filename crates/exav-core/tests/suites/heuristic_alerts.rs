@@ -47,10 +47,8 @@ fn encrypted_zip_default_is_password_protected() {
 fn alert_encrypted_upgrades_to_heuristic_detection() {
     let db = builtin_db();
     let blob = fixture("zip_aes256_store.zip");
-    let opts = ScanOptions {
-        alert_encrypted: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_encrypted = true;
     match analyze(&db, &blob, &opts).verdict {
         Verdict::Infected {
             signature, method, ..
@@ -68,11 +66,9 @@ fn alert_encrypted_with_password_still_finds_payload() {
     // EICAR is decrypted and FOUND, not reported as merely "encrypted".
     let db = builtin_db();
     let blob = fixture("zip_aes256_store.zip");
-    let opts = ScanOptions {
-        alert_encrypted: true,
-        passwords: vec!["secret".to_string()],
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_encrypted = true;
+    opts.passwords = vec!["secret".to_string()];
     match analyze(&db, &blob, &opts).verdict {
         Verdict::Infected { signature, .. } => assert!(
             signature.contains("EICAR") || signature.contains("Eicar"),
@@ -142,10 +138,8 @@ fn macro_ole2_default_not_flagged() {
 fn alert_macros_flags_vba_project() {
     let db = builtin_db();
     let blob = macro_ole2();
-    let opts = ScanOptions {
-        alert_macros: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_macros = true;
     match analyze(&db, &blob, &opts).verdict {
         Verdict::Infected {
             signature, method, ..
@@ -186,10 +180,8 @@ fn pdf_obfuscated_name_can_be_disabled() {
     // the exclusive `heuristics` also off) turns the heuristic off for a raw scan.
     let db = builtin_db();
     let blob = obfuscated_pdf();
-    let opts = ScanOptions {
-        clamav_heuristics: false,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.clamav_heuristics = false;
     match analyze(&db, &blob, &opts).verdict {
         Verdict::Clean => {}
         other => panic!("expected Clean with clamav_heuristics off, got {other:?}"),
@@ -202,10 +194,8 @@ fn pdf_obfuscated_name_fires_under_clamav_heuristics() {
     // TLSH/ML off. The PDF obfuscation heuristic must fire to match stock clamscan.
     let db = builtin_db();
     let blob = obfuscated_pdf();
-    let opts = ScanOptions {
-        clamav_heuristics: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.clamav_heuristics = true;
     match analyze(&db, &blob, &opts).verdict {
         Verdict::Infected {
             signature, method, ..
@@ -222,11 +212,9 @@ fn pdf_obfuscated_name_fires_under_full_heuristics() {
     // `--detect heuristics` is the superset, so it includes the ClamAV-default subset.
     let db = builtin_db();
     let blob = obfuscated_pdf();
-    let opts = ScanOptions {
-        heuristics: true,
-        clamav_heuristics: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.heuristics = true;
+    opts.clamav_heuristics = true;
     match analyze(&db, &blob, &opts).verdict {
         Verdict::Infected { signature, .. } => {
             assert_eq!(signature, "Heuristics.PDF.ObfuscatedNameObject");

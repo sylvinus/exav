@@ -17,13 +17,13 @@ thread_local! {
 }
 
 /// Per-matcher accumulated statistics for one scan.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct Profile {
     matchers: BTreeMap<&'static str, Stat>,
 }
 
 /// Time, call count, and input bytes attributed to one matcher.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct Stat {
     /// Total nanoseconds spent in this matcher.
     pub ns: u64,

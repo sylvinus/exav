@@ -167,11 +167,10 @@ impl Packed {
 }
 
 fn unpack(file: &[u8]) -> Vec<Entry> {
-    let mut b = Budget::new(Limits {
-        max_extracted_bytes: 1 << 30,
-        max_buffer_bytes: 1 << 30,
-        ..Default::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = 1 << 30;
+    limits.max_buffer_bytes = 1 << 30;
+    let mut b = Budget::new(limits);
     extract(Format::PePacked, file, &mut b).expect("extraction stays within budget")
 }
 

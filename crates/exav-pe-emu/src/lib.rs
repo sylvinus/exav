@@ -10,18 +10,20 @@
 //!
 //! The pieces:
 //!
-//! * [`mem`] — a sparse 32-bit address space that faults on unmapped access and
+//! * `mem` — a sparse 32-bit address space that faults on unmapped access and
 //!   remembers which pages the stub wrote.
-//! * [`cpu`] — an x86-32 interpreter (decoding via `exav-x86`) that stops, by
+//! * `cpu` — an x86-32 interpreter (decoding via `exav-x86`) that stops, by
 //!   value, on anything it cannot faithfully execute.
-//! * [`win`] — the minimum Windows a stub sees: a TEB/PEB, a loader module
+//! * `win` — the minimum Windows a stub sees: a TEB/PEB, a loader module
 //!   list, and synthetic `kernel32`/`ntdll` images whose exports are trap
 //!   addresses. Both ways a stub resolves imports — calling `GetProcAddress`
 //!   and walking the export directory by hand — therefore work.
-//! * [`image`] — mapping the PE in, and dumping it back out once the stub has
+//! * `image` — mapping the PE in, and dumping it back out once the stub has
 //!   rebuilt it.
 //! * [`run`] — the driver: budgets, the original-entry-point heuristics, and
 //!   the acceptance test a dump must pass before it is emitted.
+//!
+//! The public surface is [`run`] plus [`PAGE_SIZE`]; the rest is internals.
 //!
 //! **Nothing escapes the sandbox.** The emulator has no syscalls, no file or
 //! network access and no host memory beyond the page table; an emulated
@@ -30,12 +32,11 @@
 
 #![forbid(unsafe_code)]
 
-pub mod cpu;
-pub mod image;
-pub mod mem;
+pub(crate) mod cpu;
+pub(crate) mod image;
+pub(crate) mod mem;
 pub mod run;
-pub mod win;
+pub(crate) mod win;
 
-pub use image::PeImage;
-pub use mem::{Mem, PAGE_SIZE};
+pub use mem::PAGE_SIZE;
 pub use run::{unpack, EmuLimits, Report, Unpacked};
