@@ -22,17 +22,19 @@ use exav_unpack::{extract, Budget, Format, Limits};
 use libfuzzer_sys::fuzz_target;
 
 /// Small enough that a bomb cannot make the run about memory instead of depth.
-const TIGHT: Limits = Limits {
-    max_extracted_bytes: 256 * 1024,
-    max_members: 8,
-    max_compression_ratio: 50,
-    max_buffer_bytes: 64 * 1024,
-    max_scanned_bytes: 256 * 1024,
-    max_recursion: 2,
+fn tight_limits() -> Limits {
+    let mut l = Limits::default();
+    l.max_extracted_bytes = 256 * 1024;
+    l.max_members = 8;
+    l.max_compression_ratio = 50;
+    l.max_buffer_bytes = 64 * 1024;
+    l.max_scanned_bytes = 256 * 1024;
+    l.max_recursion = 2;
     // Every format stays reachable — this target is about depth, and a format
     // filter would decide in advance which nestings are even tried.
-    allowed_formats: None,
-};
+    l.allowed_formats = None;
+    l
+}
 
 /// Wrap `inner` in `depth` copies of `open`/`close`.
 fn nest(open: &[u8], close: &[u8], inner: &[u8], depth: usize) -> Vec<u8> {
@@ -76,7 +78,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     for fmt in [Format::Pdf, Format::Xdp] {
-        let mut budget = Budget::new(TIGHT);
+        let mut budget = Budget::new(tight_limits());
         let _ = extract(fmt, &body, &mut budget);
     }
 });

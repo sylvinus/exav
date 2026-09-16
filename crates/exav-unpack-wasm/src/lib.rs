@@ -261,7 +261,11 @@ fn format_by_name(name: &str) -> Option<Format> {
 #[wasm_bindgen]
 pub struct Archive {
     inner: exav_unpack::Archive<Src>,
-    limits: Limits,
+    /// One budget for the whole archive lifetime, so `maxMembers`,
+    /// `maxExtractedBytes` and the scan budget bound the ARCHIVE rather than
+    /// each member. A fresh budget per `extract` call would reset the counters
+    /// and let sequential extracts exceed every cumulative limit.
+    budget: Budget,
     /// The members of an archive that carries no index, once walked.
     ///
     /// `exav_unpack::Archive::list` reports an index where the format has one.
@@ -318,9 +322,10 @@ impl Archive {
 
         let inner = exav_unpack::Archive::open(src).map_err(err)?;
         check_allowed(inner.format(), &limits)?;
+        let budget = Budget::new(limits);
         Ok(Archive {
             inner,
-            limits,
+            budget,
             walked: None,
         })
     }
@@ -342,11 +347,11 @@ impl Archive {
     /// walk would find nothing at all.
     fn walk(&mut self, passwords: Vec<String>) -> &Walk {
         if self.walked.is_none() {
-            let mut budget = Budget::with_passwords(self.limits.clone(), passwords);
+            self.budget.passwords = passwords;
             let mut entries = Vec::new();
             let mut stopped = None;
             loop {
-                match self.inner.extract_next(&mut budget) {
+                match self.inner.extract_next(&mut self.budget) {
                     Ok(Some(e)) => entries.push(e),
                     Ok(None) => break,
                     Err(hit) => {
@@ -404,8 +409,8 @@ impl Archive {
     ) -> Result<JsValue, JsValue> {
         let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
         if self.is_indexed() {
-            let mut budget = Budget::with_passwords(self.limits.clone(), pw);
-            let entry = self.inner.extract(index, &mut budget).map_err(err)?;
+            self.budget.passwords = pw;
+            let entry = self.inner.extract(index, &mut self.budget).map_err(err)?;
             return unpack_entry_to_js(&entry);
         }
         let walk = self.walk(pw);
@@ -436,9 +441,9 @@ impl Archive {
             }
             return Ok(out);
         }
-        let mut budget = Budget::with_passwords(self.limits.clone(), pw);
+        self.budget.passwords = pw;
         loop {
-            match self.inner.extract_next(&mut budget) {
+            match self.inner.extract_next(&mut self.budget) {
                 Ok(Some(e)) => out.push(&unpack_entry_to_js(&e)?),
                 Ok(None) => break,
                 Err(hit) => {

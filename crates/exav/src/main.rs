@@ -1560,13 +1560,16 @@ fn main() -> ExitCode {
     // Expand --passwords-from into the password pool AFTER --passwords, so a
     // password tried comes from the command line first and the file second.
     // Fail fast like --files-from: a run that cannot read its passwords must
-    // not scan under fewer than asked for.
-    if let Some(list) = cli.passwords_from.clone() {
-        match read_password_list(&list) {
-            Ok(mut extra) => cli.password.append(&mut extra),
-            Err(e) => {
-                eprintln!("exav: --passwords-from {}: {e}", list.display());
-                return ExitCode::from(2);
+    // not scan under fewer than asked for. Skipped for a --connect client,
+    // which hands files to the daemon and never scans itself.
+    if cli.connect.is_none() {
+        if let Some(list) = cli.passwords_from.clone() {
+            match read_password_list(&list) {
+                Ok(mut extra) => cli.password.append(&mut extra),
+                Err(e) => {
+                    eprintln!("exav: --passwords-from {}: {e}", list.display());
+                    return ExitCode::from(2);
+                }
             }
         }
     }

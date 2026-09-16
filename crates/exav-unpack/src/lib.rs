@@ -1041,9 +1041,10 @@ pub fn base64_payloads(data: &[u8], cap: u64) -> Vec<Vec<u8>> {
 }
 
 /// Best-effort recognition of a container by magic bytes. Detection is
-/// recognition-only and independent of crate features: it reports what the
-/// bytes look like, not what this build can extract. Whether extraction is
-/// possible is answered at extraction time with `unsupported`.
+/// recognition-only: it reports what the bytes look like under the Cargo
+/// features compiled in, not what any build could extract. A format behind a
+/// disabled feature (CHM, FAT, ARC, among others) returns `None` rather than
+/// reaching extraction as `unsupported`.
 pub fn detect(data: &[u8]) -> Option<Format> {
     if data.len() >= 4 && &data[..2] == b"PK" && matches!(data[2..4], [3, 4] | [5, 6] | [7, 8]) {
         return Some(Format::Zip);

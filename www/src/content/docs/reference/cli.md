@@ -246,7 +246,7 @@ such as a PE base64'd into a PowerShell one-liner. `--decode` and `--no-decode`
 compose by subtraction, so `--decode all --no-decode base64` is well defined and
 neither flag has to win.
 | `--passwords <PW>` | — | Password to try when decrypting encrypted archive members. Repeatable (comma-separated in the environment) to build a pool, tried in order, unioned with any `.pwdb` databases. A password containing a comma goes in `--passwords-from` instead. |
-| `--passwords-from <FILE>` | — | Read passwords from a file, one per line appended after `--passwords`. Lines are kept verbatim (only the line ending is stripped). Unlike the command line, the file never appears in process listings — `chmod 0600` it. |
+| `--passwords-from <FILE>` | — | Read passwords from a file, one per line appended after `--passwords`. Lines are kept verbatim (only the line ending is stripped). Unlike the command line, the password contents are hidden from process listings, though the FILE pathname itself remains visible — `chmod 0600` it. |
 | `--alert-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
 | `--alert-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
 
