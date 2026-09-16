@@ -724,7 +724,7 @@ pub(crate) fn datadir_mtime(dir: &std::path::Path) -> Option<std::time::SystemTi
 #[cfg(unix)]
 fn nap(d: std::time::Duration) {
     let ts = libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
+        tv_sec: d.as_secs() as _,
         tv_nsec: d.subsec_nanos() as _,
     };
     unsafe {
@@ -1012,8 +1012,8 @@ fn set_timer(d: std::time::Duration) {
             tv_usec: 0,
         },
         it_value: libc::timeval {
-            tv_sec: d.as_secs() as libc::time_t,
-            tv_usec: d.subsec_micros() as libc::suseconds_t,
+            tv_sec: d.as_secs() as _,
+            tv_usec: d.subsec_micros() as _,
         },
     };
     unsafe {
