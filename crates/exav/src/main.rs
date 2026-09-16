@@ -843,20 +843,20 @@ struct Cli {
     /// N or more valid credit-card numbers. Off unless set.
     ///
     /// A leak detector rather than a malware one: what it finds is the
-    /// organisation's own data on its way somewhere, so it says `--alert-` and
+    /// organisation's own data on its way somewhere, so it says `--dlp-` and
     /// not `--detect`. Needs the `dlp` feature. [clamscan: --structured-cc-count]
     #[arg(
-        long = "alert-credit-cards",
+        long = "dlp-credit-cards",
         value_name = "N",
-        env = "EXAV_ALERT_CREDIT_CARDS"
+        env = "EXAV_DLP_CREDIT_CARDS"
     )]
     structured_cc_count: Option<u32>,
 
     /// Alert `Heuristics.Structured.SSN` on a textual file holding N or more
     /// valid US Social Security numbers. Off unless set. See
-    /// --alert-credit-cards. Needs the `dlp` feature.
+    /// --dlp-credit-cards. Needs the `dlp` feature.
     /// [clamscan: --structured-ssn-count]
-    #[arg(long = "alert-ssns", value_name = "N", env = "EXAV_ALERT_SSNS")]
+    #[arg(long = "dlp-ssns", value_name = "N", env = "EXAV_DLP_SSNS")]
     structured_ssn_count: Option<u32>,
 
     /// Heuristic detectors to switch on, over and above the signature database:
@@ -879,6 +879,12 @@ struct Cli {
     ///   pua                     Potentially Unwanted Applications: load the
     ///                           `.??u` databases and keep `PUA.*` signatures.
     ///                           Applied at database load, not per scan.
+    ///   exav-heuristics         exav-exclusive statistical suspicion with no
+    ///                           ClamAV equivalent: TLSH fuzzy matching, the
+    ///                           static ML scorer
+    ///                           (`Heuristics.Static.Suspect.*`) and
+    ///                           packed-with-injection-imports. Higher
+    ///                           false-positive risk, so opt-in.
     ///
     /// What an *unscannable* object becomes is not here — that is a verdict
     /// question, and --partial-as answers it.
@@ -1400,8 +1406,8 @@ fn clamscan_flag_hint(args: &[String]) -> Option<String> {
             "--alert-partition-intersection" => {
                 "use --detect partition-intersection, which covers GPT, APM and MBR"
             }
-            "--structured-ssn-count" => "use --alert-ssns",
-            "--structured-cc-count" => "use --alert-credit-cards",
+            "--structured-ssn-count" => "use --dlp-ssns",
+            "--structured-cc-count" => "use --dlp-credit-cards",
             // The renamed limits. Aliases were rejected on purpose — one
             // spelling per bound — and the migration guide's promise for that
             // trade is "a clear error naming the exav flag", which is this.
@@ -2211,7 +2217,7 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
 
     // `clamav_heuristics` (PDF ObfuscatedNameObject, imphash `.imp` matching) is on
     // by default from `ScanOptions::default()` — a faithful out-of-the-box scan —
-    // and `--clamav-compat` / `--detect heuristics` keep it on. Nothing turns it
+    // and `--clamav-compat` / `--detect exav-heuristics` keep it on. Nothing turns it
     // off from the CLI, so no assignment here.
     opts.passwords = cli.password.clone();
     opts.structured_cc_count = cli.structured_cc_count;
@@ -4763,8 +4769,8 @@ mod tests {
             &["--exclude-dir", "re"],
             &["--include", "re"],
             &["--max-unpack-depth", "5"],
-            &["--alert-ssns", "3"],
-            &["--alert-credit-cards", "3"],
+            &["--dlp-ssns", "3"],
+            &["--dlp-credit-cards", "3"],
             // The ways of handing the daemon a file it cannot open itself.
             // Refused outside client mode, which is a conflict check rather
             // than a parse error.

@@ -138,7 +138,7 @@ entirely; `0` on the two `--max-` flags means "no ceiling", not "none allowed".
 | CLI flag | ScanOptions field | Default |
 |---|---|---|
 | `--decode base64` / `--no-decode base64` | `decode_base64` | on |
-| `--detect heuristics` | `heuristics` | off |
+| `--detect exav-heuristics` | `heuristics` | off |
 | `--detect macros` / `phishing` / `broken` / `broken-media` / `packed` / `partition-intersection` | matching `alert_*` fields | off |
 | `--detect pua` | PUA databases loaded, `PUA.*` kept | off |
 | `--partial-as …=found` | `alert_encrypted` / `alert_exceeds_max` | partial |

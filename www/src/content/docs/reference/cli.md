@@ -235,22 +235,22 @@ silently resolved.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--detect <LIST>` | `none` | Heuristic detectors to switch on, over and above the signature database: `none`, `all`, or a comma-separated list of `heuristics`, `macros`, `broken`, `broken-media`, `partition-intersection`, `phishing`, `packed`, `pua`. |
+| `--detect <LIST>` | `none` | Heuristic detectors to switch on, over and above the signature database: `none`, `all`, or a comma-separated list of `exav-heuristics`, `macros`, `broken`, `broken-media`, `partition-intersection`, `phishing`, `packed`, `pua`. |
 | `--no-detect <LIST>` | — | Detectors to leave off, subtracted from `--detect`. What `--detect all` is for: everything, minus the one that is noisy on your corpus. |
 | `--decode <LIST>` | `all` | Encodings to recover a payload from before scanning it: `all`, `none`, or a list. Today that list is `base64`. **On by default**, unlike `--detect`, because a carrier that hides its payload is the ordinary case and skipping it reports clean on a file never really read. `--clamav-compat` sets `none`. |
 | `--no-decode <LIST>` | — | Encodings to leave alone, subtracted from `--decode`. |
+| `--passwords <PW>` | — | Password to try when decrypting encrypted archive members. Repeatable (comma-separated in the environment) to build a pool, tried in order, unioned with any `.pwdb` databases. A password containing a comma goes in `--passwords-from` instead. |
+| `--passwords-from <FILE>` | — | Read passwords from a file, one per line appended after `--passwords`. Lines are kept verbatim (only the line ending is stripped). Unlike the command line, the password contents are hidden from process listings, though the FILE pathname itself remains visible — `chmod 0600` it. |
+| `--dlp-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
+| `--dlp-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
 
 A decoder is not an unpacker. An unpacker opens a container the file declares
 itself to be; a decoder finds a payload the carrier does not announce at all,
 such as a PE base64'd into a PowerShell one-liner. `--decode` and `--no-decode`
 compose by subtraction, so `--decode all --no-decode base64` is well defined and
 neither flag has to win.
-| `--passwords <PW>` | — | Password to try when decrypting encrypted archive members. Repeatable (comma-separated in the environment) to build a pool, tried in order, unioned with any `.pwdb` databases. A password containing a comma goes in `--passwords-from` instead. |
-| `--passwords-from <FILE>` | — | Read passwords from a file, one per line appended after `--passwords`. Lines are kept verbatim (only the line ending is stripped). Unlike the command line, the password contents are hidden from process listings, though the FILE pathname itself remains visible — `chmod 0600` it. |
-| `--alert-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
-| `--alert-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
 
-The two `--alert-` flags are leak detectors rather than malware ones — what they
+The two `--dlp-` flags are leak detectors rather than malware ones — what they
 find is the organisation's own data on its way somewhere — which is why they are
 not values of `--detect`.
 
@@ -283,6 +283,11 @@ it quietly: **every such object is logged**, and the listener says so at startup
 
 `--clamav-compat` implies `--partial-as ok`, because that is what a stock ClamAV
 build answers for this whole class. An explicit value still wins over the preset.
+To mimic ClamAV on an exav build without the preset:
+
+```sh
+exav --partial-as ok /data
+```
 
 Refused together with `--connect`: the policy belongs to whatever does the
 scanning, and a client only ever sees the reply the daemon already decided.

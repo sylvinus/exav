@@ -644,7 +644,7 @@ pub struct ScanOptions {
     /// out of the box does every reasonable ClamAV-default match. Kept separate
     /// from [`heuristics`](Self::heuristics) so this parity subset stays on under
     /// `--clamav-compat` while the exav-exclusive TLSH/ML analysis (higher FP risk,
-    /// no ClamAV analog) does not. `--detect heuristics` is the superset and implies this.
+    /// no ClamAV analog) does not. `--detect exav-heuristics` is the superset and implies this.
     pub clamav_heuristics: bool,
     /// Report findings under ClamAV's vocabulary where the two engines describe
     /// the same fact differently. Set by [`ScanOptions::clamav_compat`].
@@ -3317,7 +3317,7 @@ fn deep_analyze(
     // DLP structured-data heuristic (opt-in, ClamAV `--structured-*-count`): count
     // credit-card / SSN numbers in reasonably-sized textual buffers and alert when
     // a threshold is met. Driven solely by the ScanOptions thresholds, so it runs
-    // independently of `--detect heuristics` (matching ClamAV, where
+    // independently of `--detect exav-heuristics` (matching ClamAV, where
     // `CL_SCAN_HEURISTIC_STRUCTURED` is its own switch). Runs at every recursion
     // level, so structured data inside an extracted archive member is caught too.
     #[cfg(feature = "dlp")]
@@ -3327,14 +3327,14 @@ fn deep_analyze(
 
     // Phishing heuristic (opt-in, ClamAV `--alert-phishing`): flag link-spoofing
     // in HTML/text bodies. Like the DLP heuristic it is driven by its own flag,
-    // independent of `--detect heuristics`, and runs at every recursion level (so a
+    // independent of `--detect exav-heuristics`, and runs at every recursion level (so a
     // phishing HTML part inside an email/archive is caught too).
     #[cfg(feature = "phishing")]
     if let Some(o) = phishing_scan(db, data, opts, sink) {
         return o;
     }
 
-    // Authenticode inspection (independent of `--detect heuristics`, like phishing/DLP).
+    // Authenticode inspection (independent of `--detect exav-heuristics`, like phishing/DLP).
     // One PE parse serves both checks:
     //   * `.crb` certificate block-list — a signed PE carrying a blocked signer
     //     cert is reported (always on when a `.crb` DB is loaded);
@@ -3362,13 +3362,13 @@ fn deep_analyze(
     }
 
     // Nothing below fires unless at least the ClamAV-default heuristics are on
-    // (on by default; `--detect heuristics` is the superset and also enables them).
+    // (on by default; `--detect exav-heuristics` is the superset and also enables them).
     if !opts.clamav_heuristics && !opts.heuristics {
         return deferred;
     }
 
     // TLSH fuzzy matching is exav-exclusive (ClamAV has no TLSH), so it stays
-    // behind the full `--detect heuristics` flag and off under `--clamav-compat`.
+    // behind the full `--detect exav-heuristics` flag and off under `--clamav-compat`.
     if opts.heuristics {
         if let Some(hit) = profile::timed("fuzzy", data.len() as u64, || db.fuzzy.match_tlsh(data))
         {
@@ -3384,7 +3384,7 @@ fn deep_analyze(
             // loaded DB carries `.imp` sigs — so it runs under `clamav_heuristics`
             // (i.e. under `--clamav-compat` too). The exav-exclusive ML scorer,
             // packed-injection heuristic, and the `-v` diagnostic findings below
-            // stay behind the full `--detect heuristics` flag.
+            // stay behind the full `--detect exav-heuristics` flag.
             if let Some(hit) = db
                 .fuzzy
                 .match_imphash(&info.imphash, info.import_count as u64)

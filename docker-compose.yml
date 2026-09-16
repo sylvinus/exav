@@ -18,7 +18,7 @@
 #     container as the sidecar; its NotifyClamd RELOAD is protocol-compatible
 #     with exav's daemon.
 #
-# Run with:  EXAV_SIG_SOURCES=https://your-mirror/ docker compose up -d
+# Run with:  EXAV_SIG_SOURCES=https://database.clamav.net/ docker compose up -d
 
 services:
   exav:

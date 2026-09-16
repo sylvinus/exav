@@ -137,7 +137,7 @@ fn allmatch_runs_the_same_heuristics_as_a_normal_scan() {
 #[cfg(feature = "dlp")]
 fn allmatch_reports_structured_data_findings() {
     // DLP is the other shape: driven by its own thresholds rather than by
-    // `--detect heuristics`, and applied at every recursion level.
+    // `--detect exav-heuristics`, and applied at every recursion level.
     let db = scanner();
     let doc = "4111111111111111\n".repeat(40).into_bytes();
     let mut opts = ScanOptions::default();

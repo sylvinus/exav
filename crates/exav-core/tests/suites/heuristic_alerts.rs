@@ -209,7 +209,7 @@ fn pdf_obfuscated_name_fires_under_clamav_heuristics() {
 
 #[test]
 fn pdf_obfuscated_name_fires_under_full_heuristics() {
-    // `--detect heuristics` is the superset, so it includes the ClamAV-default subset.
+    // `--detect exav-heuristics` is the superset, so it includes the ClamAV-default subset.
     let db = builtin_db();
     let blob = obfuscated_pdf();
     let mut opts = ScanOptions::default();
