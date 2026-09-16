@@ -62,4 +62,4 @@ nested arbitrarily deep, each format behind its own Cargo feature.
 
 ## License
 
-MIT.
+MIT. Full documentation: [exav.org](https://exav.org/subprojects/exav-grep/).

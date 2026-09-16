@@ -2,8 +2,11 @@
 #
 # `build-test` runs on every push/PR: it builds the image and exercises the
 # clamd-compatible daemon end-to-end (PING + an EICAR INSTREAM scan) so a broken
-# image can't merge. `publish` runs only on `v*` tags and pushes the multi-arch
-# image to ghcr.io with the built-in GITHUB_TOKEN. Pull with:
+# image can't merge. On `v*` tags, `binaries` cross-compiles the static musl
+# binaries natively on amd64 (via `cross`, NOT under QEMU) and `publish`
+# assembles the multi-arch image around them with `COPY` — compiling the
+# Rust+ring tree emulated for arm64 is what used to make publishing slow.
+# Pull with:
 #   docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
 name: docker
 
@@ -45,8 +48,49 @@ jobs:
           docker logs exav
           docker rm -f exav
 
+  # Static musl binaries for the published image, cross-compiled natively on
+  # amd64 via `cross` (real cross toolchains in containers — the same mechanism
+  # the `release` workflow already uses for its musl legs). Tag-only: ordinary
+  # pushes/PRs only need `build-test` above.
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        run: cargo install cross --locked
+      # Same flags the Dockerfile compiles with, so the two image paths stay
+      # one build apart: updater (`http`) on, everything else default.
+      - name: Cross-compile static musl binary
+        run: cross build --release -p exav --features http --target ${{ matrix.target }}
+      - name: Stage and strip per-arch binary
+        run: |
+          mkdir -p bins
+          cp "target/${{ matrix.target }}/release/exav" "bins/exav-${{ matrix.arch }}"
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip "bins/exav-${{ matrix.arch }}"
+          else
+            strip "bins/exav-${{ matrix.arch }}"
+          fi
+      - name: Upload per-arch binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: exav-docker-${{ matrix.arch }}
+          path: bins/exav-${{ matrix.arch }}
+          if-no-files-found: error
+
   publish:
-    needs: build-test
+    needs: [build-test, binaries]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -54,7 +98,15 @@ jobs:
       packages: write # push to ghcr.io
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3 # for multi-arch (arm64) builds
+      # No QEMU anywhere in this job: each platform build only COPYs its
+      # prebuilt binary (plus mkdir/chown, pinned to the build machine in the
+      # Dockerfile), so there is nothing to emulate.
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: exav-docker-*
+          path: bins
+          merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -74,5 +126,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # Take bins/exav-$TARGETARCH from the `binaries` job instead of
+          # compiling in-image (Dockerfile documents both branches).
+          build-args: BIN_SOURCE=prebuilt
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

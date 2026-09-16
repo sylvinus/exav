@@ -68,7 +68,10 @@
   <div id="result"></div>
 
   <script type="module">
-    import init, { Archive } from "./pkg/exav_unpack_wasm.js";
+    // The ./js facade, not the raw ./pkg binding: a File can only be read
+    // synchronously inside a Worker (FileReaderSync), so the facade routes it
+    // to js/worker.js and presents the same async Archive API.
+    import init, { Archive } from "./js/index.js";
 
     const dropZone = document.getElementById("drop-zone");
     const fileInput = document.getElementById("file-input");

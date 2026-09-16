@@ -62,7 +62,7 @@ wasm-pack build --release --target web -- --no-default-features --features zip,r
 ## JavaScript API
 
 ```js
-import init, { detectFormat, unpack, Archive } from "exav-unpack-wasm";
+import init, { detectFormat, unpack, Archive } from "@exav/unpack-wasm";
 
 await init();
 
@@ -132,7 +132,7 @@ Bytes already in memory take no Worker at all. If your bundler cannot resolve
 `new URL("./worker.js", import.meta.url)`, pass your own:
 
 ```js
-import workerUrl from "exav-unpack-wasm/worker?url";
+import workerUrl from "@exav/unpack-wasm/worker?url";
 const archive = await Archive.open(file, undefined, {
   worker: new Worker(workerUrl, { type: "module" }),
 });

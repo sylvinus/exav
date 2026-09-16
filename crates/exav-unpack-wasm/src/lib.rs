@@ -20,7 +20,7 @@
 //! From JavaScript, through the facade:
 //!
 //! ```js
-//! import init, { Archive, unpack } from "exav-unpack-wasm";
+//! import init, { Archive, unpack } from "@exav/unpack-wasm";
 //! await init();
 //!
 //! const archive = await Archive.open(file);

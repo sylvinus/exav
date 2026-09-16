@@ -1,6 +1,10 @@
 # Tag-driven binary releases. Push a tag like `v0.1.0` and this cross-compiles
 # the `exav` CLI for each target, archives it, and attaches it to the GitHub
 # Release for that tag. Static musl Linux builds run on any distro (no glibc).
+# The `wasm` job adds the two WebAssembly artifacts: the unpacker npm tarball
+# (`@exav/unpack-wasm`, standard preset — exactly what `npm publish` ships via
+# `prepublishOnly`) and the engine as a WASI module (`exav-core --features
+# wasi-bin`, same command CI's `wasm` job builds).
 #
 # For a fancier setup (a `curl | sh` installer + auto-generated Homebrew
 # formula), migrate to `dist` (https://opensource.axo.dev/cargo-dist/) later;
@@ -15,7 +19,17 @@ permissions:
   contents: write # needed to create/upload to the Release
 
 jobs:
+  # `upload-rust-binary-action` uploads into a Release but never creates one,
+  # so without this every asset job fails with `release not found` (retry loop,
+  # then exit 1). This creates it from the tag if missing — a no-op re-run.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -46,3 +60,44 @@ jobs:
           # For a smaller binary, add: features: "" / no-default-features.
           token: ${{ secrets.GITHUB_TOKEN }}
           checksum: sha256
+
+  # WebAssembly artifacts for the Release: engine (WASI) + unpacker (npm).
+  wasm:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,wasm32-wasip1
+      # Prebuilt wasm-pack — compiling it from source costs ~6 minutes, and
+      # this is the same trusted author as the other taiki-e actions here.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      # The tarball embeds package.json's version, not the tag: fail fast with
+      # a clear message if it wasn't bumped, instead of shipping a mislabeled
+      # artifact next to correctly-labeled native ones.
+      - name: Check npm version matches tag
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          [ "$PKG_VERSION" = "$TAG_VERSION" ] || { echo "package.json ($PKG_VERSION) != tag ($TAG_VERSION)"; exit 1; }
+        working-directory: crates/exav-unpack-wasm
+      - name: Build unpacker wasm (standard preset, as published to npm)
+        run: npm run build
+        working-directory: crates/exav-unpack-wasm
+      - name: Pack npm tarball
+        run: npm pack
+        working-directory: crates/exav-unpack-wasm
+      - name: Build engine WASI module
+        run: cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
+      - name: Upload to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `npm pack` names the tarball from package.json (checked above), the
+        # WASI module is named after the tag like the native `exav-$tag-$target`
+        # archives. `--clobber` makes re-runs idempotent.
+        run: |
+          cp target/wasm32-wasip1/release/exav-wasm.wasm "exav-wasm-$GITHUB_REF_NAME-wasm32-wasip1.wasm"
+          gh release upload "$GITHUB_REF_NAME" --clobber crates/exav-unpack-wasm/*.tgz "exav-wasm-$GITHUB_REF_NAME-wasm32-wasip1.wasm"

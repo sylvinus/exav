@@ -58,4 +58,4 @@ original program in memory and jump to it. This emulator follows that:
 
 ## Licence
 
-MIT.
+MIT. Full documentation: [exav.org](https://exav.org/subprojects/exav-pe-emu/).

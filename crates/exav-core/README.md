@@ -24,4 +24,5 @@ assert!(matches!(report.verdict, Verdict::Clean));
 ```
 
 For the CLI and daemon, see [`exav`](https://crates.io/crates/exav).
+Full documentation: [exav.org](https://exav.org/guides/library-usage/).
 Licensed under MIT.

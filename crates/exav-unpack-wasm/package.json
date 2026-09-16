@@ -1,5 +1,5 @@
 {
-  "name": "exav-unpack-wasm",
+  "name": "@exav/unpack-wasm",
   "version": "0.0.1",
   "type": "module",
   "description": "WebAssembly bindings for exav-unpack: in-browser, memory-safe universal archive extraction. Supports zip, rar, 7z, tar, gz, bz2, xz, cab, arj, lha, iso, cpio, ar, xar, ole, pdf, email, UPX.",
@@ -50,10 +50,13 @@
     "build:e2e": "wasm-pack build --release --target web -- --features testing-faults",
     "build:full": "wasm-pack build --release --target web -- --no-default-features --features full",
     "build:minimal": "wasm-pack build --release --target web -- --no-default-features --features minimal",
-    "prepublishOnly": "npm run build && node -e \"for (const f of ['LICENSE','NOTICE','README.md']) if (!require('fs').existsSync(f)) { console.error('refusing to publish without ' + f + ': publish from the crate root, not pkg/'); process.exit(1); }\"",
+    "prepublishOnly": "node -e \"for (const f of ['LICENSE','NOTICE','README.md','pkg/exav_unpack_wasm.js','pkg/exav_unpack_wasm.d.ts','pkg/exav_unpack_wasm_bg.wasm','pkg/exav_unpack_wasm_bg.wasm.d.ts']) if (!require('fs').existsSync(f)) { console.error('refusing to publish without ' + f + ': the wasm in pkg/ is built elsewhere (CI/VM with wasm-pack) and copied in; publish from the crate root with pkg/ populated'); process.exit(1); }\"",
     "serve": "npx serve . -l 3847"
   },
   "author": "Sylvain Zimmer",
+  "publishConfig": {
+    "access": "public"
+  },
   "bugs": {
     "url": "https://github.com/sylvinus/exav/issues"
   },

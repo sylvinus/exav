@@ -43,4 +43,4 @@ verify a signature without doing so would be worse than not offering it.
 
 ## License
 
-MIT.
+MIT. Full documentation: [exav.org](https://exav.org/subprojects/exav-update/).

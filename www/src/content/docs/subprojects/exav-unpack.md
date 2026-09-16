@@ -96,13 +96,13 @@ exav-unpack extract archive.7z out/    # to disk
 
 ## In the browser
 
-`exav-unpack-wasm` compiles the same code to WebAssembly, published on npm with
-typed JavaScript bindings, so a web app can open user-supplied archives
-client-side without shipping bytes to a server — the sandbox is the browser's,
-and the crate has no `unsafe` of its own.
+`exav-unpack-wasm` compiles the same code to WebAssembly, published on npm as
+`@exav/unpack-wasm` with typed JavaScript bindings, so a web app can open
+user-supplied archives client-side without shipping bytes to a server — the
+sandbox is the browser's, and the crate has no `unsafe` of its own.
 
 ```js
-import init, { Archive } from "exav-unpack-wasm";
+import init, { Archive } from "@exav/unpack-wasm";
 
 const archive = await Archive.open(file);   // a File from a drop or <input>
 for (const m of await archive.list()) {

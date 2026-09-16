@@ -84,4 +84,4 @@ than staying local.
 
 ## License
 
-MIT.
+MIT. Full documentation: [exav.org](https://exav.org/subprojects/exav-x86/).

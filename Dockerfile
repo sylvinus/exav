@@ -1,3 +1,9 @@
+# syntax=docker/dockerfile:1
+# Global build args (must be declared before the first FROM to be usable in
+# FROM lines): BIN_SOURCE selects how the runtime stage gets its binary —
+# `build` compiles it in-image (default; local builds, CI smoke test),
+# `prebuilt` copies bins/exav-$TARGETARCH (release publishing; see below).
+ARG BIN_SOURCE=build
 # Distroless, rootless, ClamAV-Docker-compatible image for exav.
 #
 # The runtime is `distroless/static` (built for static binaries — no OS, no
@@ -21,7 +27,16 @@
 # of the two jobs was meant:
 #   docker run --rm -e EXAV_LISTEN= -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 
-# ---- build: static musl binary, updater (http feature) enabled ---------------
+# ---- binary: compile in-image, or copy a runner-built one --------------------
+# Selected by BIN_SOURCE. Only the selected branch is built; the other is
+# skipped entirely.
+#
+#   * `build` (default): compile the static musl binary here. Used for local
+#     builds and the CI smoke test (`docker build -t exav:ci .`).
+#   * `prebuilt`: copy `bins/exav-$TARGETARCH`, cross-compiled on the runner by
+#     the `binaries` CI job with the same flags as below. Release publishing
+#     uses this: compiling the Rust+ring tree under QEMU for arm64 is an order
+#     of magnitude slower than cross-compiling it.
 # rust:alpine targets *-unknown-linux-musl and links statically. `build-base`
 # provides the C toolchain the TLS stack (ring, via the `http` feature's ureq →
 # rustls) needs to compile under musl. Pinned to 1.91, the current MSRV floor
@@ -34,18 +49,29 @@ COPY . .
 # `--features http` pulls in the standalone exav-update crate so `--auto-update`
 # can fetch from EXAV_SIG_SOURCES. For a smaller, pure-Rust image without the
 # updater, drop it (and set up signatures via a volume/sidecar instead).
+# The `cp` normalises the output path with the `prebuilt` branch below, so the
+# runtime stage copies one location whatever the source was.
 RUN cargo build --release -p exav --features http \
-    && strip target/release/exav
+    && strip target/release/exav \
+    && cp target/release/exav /exav
+
+FROM scratch AS prebuilt
+ARG TARGETARCH
+COPY bins/exav-${TARGETARCH} /exav
+
+FROM ${BIN_SOURCE} AS binsrc
 
 # ---- dirs: an empty, nonroot-owned data dir to COPY in -----------------------
 # distroless has no shell to `mkdir`/`chown`, so stage the mount point here.
 # 65532 is distroless's `nonroot` uid/gid.
-FROM alpine AS dirs
+# Pinned to the build machine: this stage only makes a directory, so emulating
+# it under QEMU on a multi-arch build would be pure overhead.
+FROM --platform=$BUILDPLATFORM alpine AS dirs
 RUN mkdir -p /data && chown 65532:65532 /data
 
 # ---- runtime: distroless static, nonroot -------------------------------------
 FROM gcr.io/distroless/static-debian13:nonroot
-COPY --from=build /src/target/release/exav /exav
+COPY --from=binsrc /exav /exav
 COPY --from=dirs --chown=65532:65532 /data /var/lib/exav
 # Persist signatures across restarts. To reuse an existing ClamAV database
 # volume, mount it here (or set EXAV_SIG_DIR=/var/lib/clamav and mount there).

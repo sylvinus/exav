@@ -32,5 +32,6 @@ if let Some(fmt) = detect(&data) {
 }
 ```
 
-Licensed under MIT. See [`NOTICE`](https://github.com/sylvinus/exav/blob/main/NOTICE)
+Licensed under MIT. Full documentation:
+[exav.org](https://exav.org/subprojects/exav-unpack/). See [`NOTICE`](https://github.com/sylvinus/exav/blob/main/NOTICE)
 for third-party attributions.

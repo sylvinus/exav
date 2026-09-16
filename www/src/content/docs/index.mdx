@@ -21,8 +21,10 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 exav is a malware scanner written in memory-safe Rust: a single static
 MIT-licensed binary that scans files of any size in constant memory and runs a
 native YARA engine. It reads ClamAV's signature databases, answers the `clamd`
-and ICAP protocols, and takes `clamscan`'s command line — so it drops into an
-existing ClamAV setup without changing anything around it.
+and ICAP protocols, and prints `clamscan`'s output format — so it drops into an
+existing ClamAV setup without changing anything around it. Its flags are its
+own: a `clamscan` flag exav lacks stops the run rather than being ignored (see
+the [flag matrix](/reference/clamav-flag-matrix/)).
 
 <CardGrid>
   <Card title="Memory-safe Rust engine" icon="rocket">
