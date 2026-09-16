@@ -61,6 +61,23 @@ coverage. You fetch signatures yourself — that's the first step below.
 
 </Steps>
 
+## Alternate: let exav fetch the signatures itself
+
+If your build has [HTTP support](/reference/feature-flags/#adding-http-support),
+exav can pull Cisco's CVDs directly —
+replacing step 1 above, with no `cvdupdate` or `freshclam` involved:
+
+```sh
+export EXAV_SIG_SOURCES=https://database.clamav.net/
+exav -d ~/.exav-db --auto-update suspicious.bin
+```
+
+The trailing slash makes the value a mirror base, expanding to
+`main`/`daily`/`bytecode.cvd`; an exact `…/daily.cvd` URL is fetched verbatim
+instead. Sources land validated in `-d`, which is then loaded for the scan,
+and `--auto-update` keeps them current for as long as the process runs. This
+needs a `--features http` build — see [Installation](/getting-started/installation/).
+
 ## Understand the exit code
 
 Each code is a status word, and the status is the last word on the result line:

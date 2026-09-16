@@ -28,6 +28,18 @@ jobs:
       # and a local `make test` can't drift.
       - run: make test-native
 
+  # The promised floor is `rust-version` in Cargo.toml (1.91, imposed by
+  # yara-x-parser). `make msrv` reads it there and installs that toolchain on
+  # demand, so a bump flows through with no edit here — and a contributor on
+  # stable can't land a newer feature without this going red.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make msrv
+
   # The yara-x A/B differential harness. Deliberately NOT part of `make test`
   # (see the Makefile) — a differential test can go red because the other engine
   # changed, so it is not a merge gate. It runs here anyway, unlike the clamav

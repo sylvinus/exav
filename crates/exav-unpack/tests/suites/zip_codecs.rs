@@ -413,10 +413,9 @@ fn orphan_member_over_the_size_budget_is_reported_not_truncated() {
     }
     let blob = lfh("huge.bin", 8, 0, &deflated, None);
 
-    let mut budget = Budget::new(Limits {
-        max_buffer_bytes: 64 * 1024, // far below the 4 MiB member
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 64 * 1024; // far below the 4 MiB member
+    let mut budget = Budget::new(limits);
     let entries = extract(Format::Zip, &blob, &mut budget).unwrap_or_default();
     if let Some(m) = entries.iter().find(|e| e.name == "huge.bin") {
         assert!(

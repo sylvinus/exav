@@ -152,10 +152,9 @@ fn a_dynamic_vhd_declaring_an_enormous_disk_is_bounded_not_allocated() {
     blob.extend_from_slice(&vec![0xFFu8; 4_000_000]); // BAT, all unallocated
     blob.extend_from_slice(&footer(3, FOOTER as u64, u64::MAX / 2));
 
-    let mut b = Budget::new(Limits {
-        max_buffer_bytes: 1024 * 1024,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 1024 * 1024;
+    let mut b = Budget::new(limits);
     let mut out = Vec::new();
     let _ = extract_each(
         Format::Vhd,

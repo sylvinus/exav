@@ -443,10 +443,7 @@ mod tests {
     use exav_core::{Method, Verdict};
 
     fn report(verdict: Verdict) -> ScanReport {
-        ScanReport {
-            verdict,
-            findings: Vec::new(),
-        }
+        ScanReport::new(verdict, Vec::new())
     }
 
     /// The partial verdicts, with the status tag each one reports under.

@@ -117,8 +117,8 @@ fn every_counting_flag_refuses_size_suffixes() {
         "--max-unpack-depth",
         "--max-jobs-per-worker",
         "--icap-max-requests",
-        "--alert-ssns",
-        "--alert-credit-cards",
+        "--dlp-ssns",
+        "--dlp-credit-cards",
     ];
     for flag in COUNTS {
         for good in ["10", "0", "10000"] {

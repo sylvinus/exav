@@ -5,7 +5,7 @@
 //! `Read + Seek` source additionally lets [`crate::scan_seekable`] read a
 //! ZIP's central directory and only the entries it extracts.
 //!
-//! [`HttpRangeReader`] (enabled with the `http` feature) is a `Read + Seek`
+//! `HttpRangeReader` (enabled with the `http` feature) is a `Read + Seek`
 //! backend over HTTP(S) range requests, so an object on S3 (via a public or
 //! presigned URL) can be scanned without downloading it whole — only the
 //! ranges the scanner touches are fetched.

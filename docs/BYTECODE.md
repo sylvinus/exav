@@ -166,6 +166,14 @@ object APIs, the inflate/lzma/bzip2 codecs) are skipped rather than executed, an
 the disasm/codec-dependent detections that do run are not yet
 detection-validated against `clamscan` (see `BYTECODE_VALIDATION.md`).
 
+Known limitation (0.0.1): functionality-level handling is unenforced for
+bytecode. Programs observe `FLEVEL=167` via `engine_functionality_level`
+(`bytecode/runtime.rs`), while signature loading gates on `EXAV_FLEVEL=213`
+(`engine/parse.rs`); per-program `min/max_flevel` and `format_level` are parsed
+but not enforced. A program requiring a newer engine may run when it should be
+skipped, or vice versa. This does not affect signature loading, only the value
+reported inside bytecode execution.
+
 ## Real-world importance of the 85 programs
 
 Numerically tiny — 85 of ~3.7M signatures (0.002%) — but uneven in value:

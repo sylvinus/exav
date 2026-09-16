@@ -20,12 +20,11 @@ fuzz_target!(|data: &[u8]| {
     let win_bits = 10 + (win_bits % 15);
     let packed = &data[16..];
 
-    let mut budget = Budget::new(Limits {
-        max_extracted_bytes: 8 * 1024 * 1024,
-        max_buffer_bytes: 4 * 1024 * 1024,
-        max_compression_ratio: u64::MAX,
-        max_members: 100,
-        ..Default::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = 8 * 1024 * 1024;
+    limits.max_buffer_bytes = 4 * 1024 * 1024;
+    limits.max_compression_ratio = u64::MAX;
+    limits.max_members = 100;
+    let mut budget = Budget::new(limits);
     let _ = unpack29(packed, unp, win_bits, &mut budget);
 });

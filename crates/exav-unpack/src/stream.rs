@@ -84,6 +84,7 @@ impl Read for BudgetReader<'_> {
 /// Metadata for a member handed to a [`stream_members`] visitor. The member's
 /// bytes are read separately via the reader argument (or absent for a member
 /// whose content can't be produced — encrypted / undecodable).
+#[derive(Debug, Clone)]
 pub struct MemberMeta {
     pub name: String,
     /// Compressed size within the container (for `.cdb` matching), or the
@@ -536,7 +537,7 @@ fn stream_zip<R: Read + Seek, T>(
         // pointer is never scanned and the file reports unreadable, not infected.
         if let Err(e) = zip.by_index_raw(i).map(|_| ()) {
             let hit = crate::formats::zip::zip_entry_error(i, &e);
-            if !hit.corrupt {
+            if !hit.is_corrupt() {
                 return Err(hit);
             }
             let meta = MemberMeta {

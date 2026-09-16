@@ -40,7 +40,8 @@ const EXAV_DB_DIGEST_LEN: usize = 32; // trailing SHA-256 of the payload
 
 /// Outcome of a conditional fetch. Both variants carry the current validator so
 /// the caller can persist it and short-circuit the next poll.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Fetch {
     /// Nothing was written — the remote matched what we already have.
     Unchanged {

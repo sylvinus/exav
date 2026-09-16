@@ -145,7 +145,11 @@ impl Fetch for JsFetch {
     fn fetch(&self, at: u64, len: u64) -> io::Result<Vec<u8>> {
         let got = self
             .read
-            .call2(&self.this, &JsValue::from_f64(at as f64), &JsValue::from_f64(len as f64))
+            .call2(
+                &self.this,
+                &JsValue::from_f64(at as f64),
+                &JsValue::from_f64(len as f64),
+            )
             .map_err(|e| io::Error::other(format!("reader.read threw: {e:?}")))?;
         let bytes = got.dyn_ref::<js_sys::Uint8Array>().ok_or_else(|| {
             io::Error::other("reader.read must return a Uint8Array synchronously")

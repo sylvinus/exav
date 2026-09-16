@@ -7,6 +7,7 @@ use exav_core::{analyze, Scanner, ScanOptions};
 
 fuzz_target!(|data: &[u8]| {
     let db = Scanner::builtin();
-    let opts = ScanOptions { heuristics: true, ..Default::default() };
+    let mut opts = ScanOptions::default();
+    opts.heuristics = true;
     let _ = analyze(&db, data, &opts);
 });

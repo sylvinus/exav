@@ -110,10 +110,8 @@ fn allmatch_runs_the_same_heuristics_as_a_normal_scan() {
     // pins it against a representative pair.
     let db = scanner();
     let pe = broken_pe();
-    let opts = ScanOptions {
-        alert_broken: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_broken = true;
 
     let normal = matches!(
         analyze(&db, &pe, &opts).verdict,
@@ -139,13 +137,11 @@ fn allmatch_runs_the_same_heuristics_as_a_normal_scan() {
 #[cfg(feature = "dlp")]
 fn allmatch_reports_structured_data_findings() {
     // DLP is the other shape: driven by its own thresholds rather than by
-    // `--detect heuristics`, and applied at every recursion level.
+    // `--detect exav-heuristics`, and applied at every recursion level.
     let db = scanner();
     let doc = "4111111111111111\n".repeat(40).into_bytes();
-    let opts = ScanOptions {
-        structured_cc_count: Some(5),
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.structured_cc_count = Some(5);
 
     assert!(
         matches!(
@@ -190,13 +186,8 @@ fn every_single_stream_compressor_streams_its_content() {
     // which compressor a payload happens to be wrapped in decides whether it is
     // found, which is not a property a scanner may have.
     let db = Scanner::builtin();
-    let opts = ScanOptions {
-        limits: exav_core::unpack::Limits {
-            max_buffer_bytes: 1024 * 1024,
-            ..Default::default()
-        },
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 1024 * 1024;
 
     for name in ["p.gz", "p.bz2", "p.xz"] {
         let blob = compressor_fixture(name);
@@ -255,13 +246,8 @@ fn nesting_depth_does_not_change_what_a_scan_finds() {
     let nested = tar_wrapping("inner.zip", &inner);
     // A cap far below the member's decompressed size, so buffering cannot reach
     // the payload at its end.
-    let opts = ScanOptions {
-        limits: exav_core::unpack::Limits {
-            max_buffer_bytes: 1024 * 1024,
-            ..Default::default()
-        },
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 1024 * 1024;
 
     let flat = analyze(&db, &inner, &opts).verdict;
     let deep = analyze(&db, &nested, &opts).verdict;
@@ -304,10 +290,8 @@ fn a_streamed_container_gets_the_whole_object_checks_too() {
     // What a scan does must not depend on how the bytes arrived.
     let db = Scanner::builtin();
     let img = overlapping_mbr();
-    let opts = ScanOptions {
-        alert_partition_intersection: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_partition_intersection = true;
 
     let buffered = analyze(&db, &img, &opts).verdict;
     let streamed = exav_core::scan_seekable(

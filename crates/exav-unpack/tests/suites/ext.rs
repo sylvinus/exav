@@ -172,10 +172,9 @@ fn an_image_past_the_buffer_budget_is_reported_not_skipped() {
     // The reader owns its bytes, so the image is copied once. An image too
     // large to copy is a gap the operator must be able to see.
     let img = fixture();
-    let mut b = Budget::new(Limits {
-        max_buffer_bytes: 1024,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 1024;
+    let mut b = Budget::new(limits);
     let mut out = Vec::new();
     let _ = extract_each(
         Format::Ext,

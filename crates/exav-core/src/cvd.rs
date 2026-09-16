@@ -125,17 +125,17 @@ pub fn read_with_limits(
 /// rejected rather than OOMing the loader) but disables the ratio / scan-byte /
 /// recursion bomb defenses, which exist for hostile *scan* input, not the DB.
 fn cvd_budget(max_bytes: u64, max_members: u64) -> Budget {
-    Budget::new(Limits {
-        max_recursion: 0,
-        max_members,
-        max_extracted_bytes: max_bytes,
-        max_compression_ratio: u64::MAX,
-        max_buffer_bytes: max_bytes,
-        max_scanned_bytes: u64::MAX,
-        // A database is a gzip'd tar; the caller's scan-time format policy has
-        // no bearing on whether its own signatures can be read.
-        allowed_formats: None,
-    })
+    let mut limits = Limits::default();
+    limits.max_recursion = 0;
+    limits.max_members = max_members;
+    limits.max_extracted_bytes = max_bytes;
+    limits.max_compression_ratio = u64::MAX;
+    limits.max_buffer_bytes = max_bytes;
+    limits.max_scanned_bytes = u64::MAX;
+    // A database is a gzip'd tar; the caller's scan-time format policy has
+    // no bearing on whether its own signatures can be read.
+    limits.allowed_formats = None;
+    Budget::new(limits)
 }
 
 #[cfg(test)]

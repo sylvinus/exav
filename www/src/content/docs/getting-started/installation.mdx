@@ -14,14 +14,22 @@ binary with no runtime dependencies.
 cargo install exav
 ```
 
-That installs the `exav` binary with the default features — YARA, every archive
-format, decryption, and the ICAP server. The package is `exav`; the library
+That installs the `exav` binary with the default pure-Rust build, which handles every
+supported archive format. The package is `exav`; the library
 crates it is built from are the `exav-*` ones, and are not needed to install it.
 
+For a build with [HTTP support](/reference/feature-flags/#adding-http-support) —
+URL scanning and signature updates over HTTP(S):
+
+```sh
+cargo install exav --features http
+```
+
+See [Feature flags](/reference/feature-flags/) for all build options.
+
 <Aside type="caution" title="Rust 1.91 or newer">
-A distribution-packaged toolchain is often older than that. If the build fails
-on syntax rather than on your code, check `rustc --version` first — the
-workspace `rust-version` in `Cargo.toml` is authoritative.
+If the build fails on syntax rather than on your code, check `rustc --version`
+first — the workspace `rust-version` in `Cargo.toml` is authoritative.
 </Aside>
 
 ## Build from source
@@ -47,16 +55,22 @@ workspace `rust-version` in `Cargo.toml` is authoritative.
 
 </Steps>
 
-The default build includes YARA and every archive format, and is already a
-pure-Rust binary with no TLS stack. For an even smaller build (dropping YARA,
-DLP, and HTTP):
+The default build handles every supported archive format and is already a
+pure-Rust binary with no TLS stack. To add [HTTP(S) support](/reference/feature-flags/#adding-http-support)
+(URL scanning and signature auto-update):
+
+```sh
+cargo build --release -p exav --features http
+```
+
+For an even smaller binary with fewer capabilities:
 
 ```sh
 cargo build --release -p exav --no-default-features --features all-formats,decrypt
 ```
 
 See [Feature flags](/reference/feature-flags/) for the full list of build-time
-features (including `http` for URL scanning and signature auto-update).
+options.
 
 ## Packages & release artifacts
 

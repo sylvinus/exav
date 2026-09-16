@@ -24,11 +24,10 @@ fn fixture(name: &str) -> Vec<u8> {
 
 fn emitted(blob: &[u8]) -> Vec<Entry> {
     let mut out = Vec::new();
-    let mut b = Budget::new(Limits {
-        max_buffer_bytes: 8 * 1024 * 1024,
-        max_extracted_bytes: 8 * 1024 * 1024,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 8 * 1024 * 1024;
+    limits.max_extracted_bytes = 8 * 1024 * 1024;
+    let mut b = Budget::new(limits);
     let _ = extract_each(
         Format::Lzw,
         blob,
@@ -140,10 +139,9 @@ fn an_oversized_stream_is_reported_not_truncated_silently() {
     // Decoding past the per-member budget must surface rather than hand back a
     // silently shortened member.
     let z = fixture("bigreset.b16.Z");
-    let mut b = Budget::new(Limits {
-        max_buffer_bytes: 4096,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 4096;
+    let mut b = Budget::new(limits);
     let mut out = Vec::new();
     let _ = extract_each(Format::Lzw, &z, &mut b, &mut |e: Entry, _: &mut Budget| {
         out.push(e);

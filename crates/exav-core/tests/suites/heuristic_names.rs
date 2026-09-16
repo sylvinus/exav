@@ -70,10 +70,8 @@ fn macro_alert_carries_the_dialect_suffix() {
     let db = empty_db();
     let doc = ole_with_vba();
 
-    let opts = ScanOptions {
-        alert_macros: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_macros = true;
     // The fixture MUST fire, or the assertions below are vacuous — which is the
     // failure mode this whole file exists to prevent.
     let name = detection(&db, &doc, &opts)
@@ -107,10 +105,8 @@ fn cloaked_ip_uses_clamavs_numericip_name() {
         <a href=\"http://192.0.2.44/login\">https://www.example-bank.com/login</a>\
         </body></html>";
 
-    let opts = ScanOptions {
-        alert_phishing: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_phishing = true;
     let name = detection(&db, page, &opts)
         .expect("fixture did not trigger the phishing heuristic; the test would prove nothing");
     assert!(
@@ -186,10 +182,8 @@ fn an_encrypted_office_document_uses_clamavs_signature_name() {
     let doc = cf.into_inner().into_inner();
 
     let db = empty_db();
-    let opts = ScanOptions {
-        alert_encrypted: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_encrypted = true;
     let name = detection(&db, &doc, &opts).expect(
         "the encrypted-Office fixture did not trigger the heuristic at all; \
          the assertion below would prove nothing",
@@ -211,10 +205,8 @@ fn ssl_spoof_uses_clamavs_hyphenated_name() {
     let page = b"<html><body>\
         <a href=\"http://www.example-bank.com/login\">https://www.example-bank.com/login</a>\
         </body></html>";
-    let opts = ScanOptions {
-        alert_phishing: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_phishing = true;
     let name =
         detection(&db, page, &opts).expect("an https display over an http href must be reported");
     assert_eq!(
@@ -232,10 +224,8 @@ fn matching_schemes_are_not_a_spoof() {
         &b"<a href=\"https://www.example-bank.com/x\">https://www.example-bank.com/x</a>"[..],
         &b"<a href=\"http://www.example-bank.com/x\">http://www.example-bank.com/x</a>"[..],
     ] {
-        let opts = ScanOptions {
-            alert_phishing: true,
-            ..ScanOptions::default()
-        };
+        let mut opts = ScanOptions::default();
+        opts.alert_phishing = true;
         assert_eq!(
             detection(&db, page, &opts),
             None,
@@ -252,10 +242,8 @@ fn matching_schemes_are_not_a_spoof() {
 #[test]
 fn broken_executable_needs_a_broken_executable() {
     let db = empty_db();
-    let opts = ScanOptions {
-        alert_broken: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_broken = true;
 
     // Claims a PE header at 0x3c, but there is nothing parseable there.
     let mut broken = b"MZ".to_vec();
@@ -281,10 +269,8 @@ fn broken_executable_needs_a_broken_executable() {
 #[test]
 fn ordinary_files_are_not_broken_executables() {
     let db = empty_db();
-    let opts = ScanOptions {
-        alert_broken: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_broken = true;
     for (what, blob) in [
         ("plain text", &b"hello, this is an ordinary text file\n"[..]),
         ("random binary", &[0x00, 0x01, 0x02, 0x03, 0xff, 0xfe][..]),
@@ -326,10 +312,8 @@ fn office_and_adobe_jpeg_marker_order_is_not_broken_media() {
     jpg.extend(seg(0xC0, &[0x08, 0, 16, 0, 16, 1, 1, 0x11, 0]));
     jpg.extend_from_slice(&[0xFF, 0xD9]);
 
-    let opts = ScanOptions {
-        alert_broken_media: true,
-        ..ScanOptions::default()
-    };
+    let mut opts = ScanOptions::default();
+    opts.alert_broken_media = true;
     assert_eq!(
         detection(&empty_db(), &jpg, &opts),
         None,
@@ -407,21 +391,17 @@ fn a_stripped_elf_section_table_is_reported_in_both_modes() {
     elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
     elf[58..60].copy_from_slice(&0u16.to_le_bytes()); // e_shentsize: STRIPPED
 
-    let base = ScanOptions {
-        alert_broken: true,
-        ..ScanOptions::default()
-    };
+    let mut base = ScanOptions::default();
+    base.alert_broken = true;
     assert_eq!(
         detection(&empty_db(), &elf, &base).as_deref(),
         Some("Heuristics.ELF.StrippedSectionHeaders"),
         "exav names what it actually found"
     );
 
-    let compat = ScanOptions {
-        alert_broken: true,
-        clamav_compat: true,
-        ..ScanOptions::default()
-    };
+    let mut compat = ScanOptions::default();
+    compat.alert_broken = true;
+    compat.clamav_compat = true;
     assert_eq!(
         detection(&empty_db(), &elf, &compat).as_deref(),
         Some("Heuristics.Broken.Executable"),

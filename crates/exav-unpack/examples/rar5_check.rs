@@ -119,12 +119,11 @@ fn check_archive(data: &[u8]) -> (u32, u32, u32, u32, u32) {
                         stored += 1;
                     } else {
                         let ws = window_size(comp_info);
-                        let mut budget = exav_unpack::Budget::new(exav_unpack::Limits {
-                            max_extracted_bytes: 2 * 1024 * 1024 * 1024,
-                            max_buffer_bytes: 512 * 1024 * 1024,
-                            max_compression_ratio: u64::MAX,
-                            ..Default::default()
-                        });
+                        let mut limits = exav_unpack::Limits::default();
+                        limits.max_extracted_bytes = 2 * 1024 * 1024 * 1024;
+                        limits.max_buffer_bytes = 512 * 1024 * 1024;
+                        limits.max_compression_ratio = u64::MAX;
+                        let mut budget = exav_unpack::Budget::new(limits);
                         match try_unpack(packed, unp, ws, &mut budget) {
                             Some(out) => {
                                 if has_crc {

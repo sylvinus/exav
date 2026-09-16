@@ -292,7 +292,7 @@ pub(crate) const DETECTORS: [&str; 8] = [
     "phishing",
     "packed",
     "pua",
-    "heuristics",
+    "exav-heuristics",
 ];
 
 /// Which heuristic detectors are switched on.
@@ -359,11 +359,12 @@ impl Detectors {
     pub(crate) fn pua(&self) -> bool {
         self.has("pua")
     }
-    /// TLSH fuzzy matching and the ML scorer — one engine switch, so one name
-    /// here. Splitting it into `fuzzy` and `ml` would be a promise the engine
-    /// cannot keep: `ScanOptions::heuristics` gates both together.
+    /// TLSH fuzzy matching, the ML scorer and packed-injection-imports — one
+    /// engine switch, so one name here. It carries the `exav-` prefix because
+    /// ClamAV has no equivalent: every other value names something both engines
+    /// can look for, this one names what only exav does.
     pub(crate) fn heuristics(&self) -> bool {
-        self.has("heuristics")
+        self.has("exav-heuristics")
     }
 
     /// Everything in `self` that is not also in `other`, for `--no-detect`.

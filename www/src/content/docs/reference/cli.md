@@ -31,6 +31,14 @@ A boolean variable takes `1`/`yes`/`on`/`true` or `0`/`no`/`off`/`false`.
 Anything else stops the run rather than being read as "off" — a typo that silently
 disables a setting is one an operator has no way to see.
 
+Repeatable flags (`--exclude`, `--exclude-dir`, `--include`, `--passwords`)
+follow the same flag-wins rule with no union: naming the flag once on the
+command line replaces the environment value rather than adding to it, so a
+container that sets `EXAV_EXCLUDE` and a command line that adds `--exclude`
+scans under the flag alone. Repeat the flag for two patterns. (The
+environment holds one pattern on purpose: a comma is legal inside a regex, so
+comma-splitting it would silently cut a pattern in half.)
+
 ## Targets, filters and logging
 
 | Flag | Description |
@@ -151,7 +159,12 @@ the check is.
 ## Scan limits
 
 All sizes accept `K`/`M`/`G`/`T` suffixes, and `0` means **no limit** on every one
-of them. See [Configuration](/reference/configuration/) for how each maps to an
+of them. `off` says the same thing wherever a disabled state exists. The one
+exception is a *period* (how often something happens, e.g.
+`--update-interval-secs`): there `0` is refused, because a zero-second interval
+reads as "always" rather than "never" — only `off` disables it. `--workers`
+takes a count or `threads` (the in-process model); a count of `0` is refused.
+See [Configuration](/reference/configuration/) for how each maps to an
 engine budget.
 
 | Flag | exav default | `--clamav-compat` | Description |
@@ -222,21 +235,22 @@ silently resolved.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--detect <LIST>` | `none` | Heuristic detectors to switch on, over and above the signature database: `none`, `all`, or a comma-separated list of `heuristics`, `macros`, `broken`, `broken-media`, `partition-intersection`, `phishing`, `packed`, `pua`. |
+| `--detect <LIST>` | `none` | Heuristic detectors to switch on, over and above the signature database: `none`, `all`, or a comma-separated list of `exav-heuristics`, `macros`, `broken`, `broken-media`, `partition-intersection`, `phishing`, `packed`, `pua`. |
 | `--no-detect <LIST>` | — | Detectors to leave off, subtracted from `--detect`. What `--detect all` is for: everything, minus the one that is noisy on your corpus. |
 | `--decode <LIST>` | `all` | Encodings to recover a payload from before scanning it: `all`, `none`, or a list. Today that list is `base64`. **On by default**, unlike `--detect`, because a carrier that hides its payload is the ordinary case and skipping it reports clean on a file never really read. `--clamav-compat` sets `none`. |
 | `--no-decode <LIST>` | — | Encodings to leave alone, subtracted from `--decode`. |
+| `--passwords <PW>` | — | Password to try when decrypting encrypted archive members. Repeatable (comma-separated in the environment) to build a pool, tried in order, unioned with any `.pwdb` databases. A password containing a comma goes in `--passwords-from` instead. |
+| `--passwords-from <FILE>` | — | Read passwords from a file, one per line appended after `--passwords`. Lines are kept verbatim (only the line ending is stripped). Unlike the command line, the password contents are hidden from process listings, though the FILE pathname itself remains visible — `chmod 0600` it. |
+| `--dlp-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
+| `--dlp-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
 
 A decoder is not an unpacker. An unpacker opens a container the file declares
 itself to be; a decoder finds a payload the carrier does not announce at all,
 such as a PE base64'd into a PowerShell one-liner. `--decode` and `--no-decode`
 compose by subtraction, so `--decode all --no-decode base64` is well defined and
 neither flag has to win.
-| `--passwords <PW>` | — | Password to try when decrypting encrypted archive members. Repeatable (comma-separated in the environment) to build a pool, tried in order, unioned with any `.pwdb` databases. |
-| `--alert-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
-| `--alert-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
 
-The two `--alert-` flags are leak detectors rather than malware ones — what they
+The two `--dlp-` flags are leak detectors rather than malware ones — what they
 find is the organisation's own data on its way somewhere — which is why they are
 not values of `--detect`.
 
@@ -269,6 +283,11 @@ it quietly: **every such object is logged**, and the listener says so at startup
 
 `--clamav-compat` implies `--partial-as ok`, because that is what a stock ClamAV
 build answers for this whole class. An explicit value still wins over the preset.
+To mimic ClamAV on an exav build without the preset:
+
+```sh
+exav --partial-as ok /data
+```
 
 Refused together with `--connect`: the policy belongs to whatever does the
 scanning, and a client only ever sees the reply the daemon already decided.
@@ -397,7 +416,7 @@ it to clients as `Max-Connections`.
 | Flag | Default | Description |
 |---|---|---|
 | `--listen <ADDR>` | — | Serve on this address. Repeatable (comma-separated in the environment). |
-| `--connect <ADDR>` | — | Scan by handing each file to a daemon already running here, instead of loading a database. |
+| `--connect <ADDR>` | — | Scan by handing each file to a daemon already running here, instead of loading a database. A bare address: query options (`?mode=`, `?max-connections=`, `?service=`) tune the listener and are refused here. |
 | `--send-as <WHAT>` | `path` | What a `--connect` client hands the daemon: `path`, `contents` or `fd`. |
 | `--ping` | off | Ask a daemon whether it is answering, and exit `0` or `2`. Scans nothing. Probes `--connect` when given, otherwise the listener this same configuration would serve — so a container health check needs no address of its own — and speaks the protocol it finds there: `PING` on clamd, `OPTIONS` on ICAP. One probe; clamdscan's `attempts[:interval]` argument is refused, because retrying belongs to whatever is asking. |
 | `--workers <N\|threads>` | CPU cores | Daemon worker model (Unix): a count runs a prefork pool, `threads` runs the listeners in one process. |
@@ -405,6 +424,7 @@ it to clients as `Max-Connections`.
 | `--max-process-bytes <SIZE>` | `2G` in the pool, unset otherwise | Unix. Address space (`RLIMIT_AS`): per worker in the pool, whole-process in a one-shot run or the thread model. Also lowers the in-core extraction budget to fit inside it. |
 | `--max-jobs-per-worker <N>` | `1000` | Prefork only: recycle a worker after this many jobs. |
 | `--allow-shutdown` | off | Honour the clamd `SHUTDOWN` command, letting any client that can reach the daemon stop it. |
+| `--allow-http-scan` | off | Fetch `http(s)://` scan targets (`exav URL` in a one-shot run, the daemon `SCANURL` command). Needs an `http-scan` build to fetch anything at all. |
 
 `SHUTDOWN` is off by default because a scanner that is not running does not
 report infected — it reports nothing, and a pipeline that reads "no answer" as
@@ -522,10 +542,12 @@ the same verdict on either port.
 
 | Flag | Description |
 |---|---|
-| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000 --decode none`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
+| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000 --decode none --partial-as ok`, plus narrowing unpacking to the formats stock ClamAV handles and reporting under ClamAV's vocabulary where the two engines name the same fact differently. **Diff-testing only** — it deliberately reduces detection. |
 
 Each preset value can still be set on its own, and an explicit flag wins over the
-preset. Narrowing the format set and appending `.UNOFFICIAL` to unofficial-database
+preset. What the preset leaves on exav defaults: `--max-object-bytes`,
+`--max-matcher-bytes`, spill settings, `--detect`/`--no-detect`, passwords, and
+update/network/worker settings. Narrowing the format set and appending `.UNOFFICIAL` to unofficial-database
 signature names have no flags of their own: both are only ever wanted for a
 differential run, so the preset is the whole interface.
 

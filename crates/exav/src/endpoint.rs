@@ -92,6 +92,28 @@ pub(crate) struct Endpoint {
     pub services: Vec<String>,
 }
 
+impl Endpoint {
+    /// Names of the server-side tunables this address carries: `?mode=`,
+    /// `?max-connections=`, and the ICAP service (path or `?service=`). A
+    /// `--connect` client dials `addr` and honours none of these, so an
+    /// address carrying any of them is refused client-side rather than quietly
+    /// dropped. Unknown keys never reach here — the parser refuses those for
+    /// both flags.
+    pub(crate) fn server_side_options(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.max_connections.is_some() {
+            out.push("max-connections");
+        }
+        if !self.services.is_empty() {
+            out.push("service");
+        }
+        if let Addr::Unix { mode: Some(_), .. } = &self.addr {
+            out.push("mode");
+        }
+        out
+    }
+}
+
 /// The `?…` options of one address, before they are attached to a place.
 #[derive(Default)]
 struct Options {

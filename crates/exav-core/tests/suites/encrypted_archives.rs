@@ -24,10 +24,9 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 fn with_pw(pw: &str) -> ScanOptions {
-    ScanOptions {
-        passwords: vec![pw.to_string()],
-        ..ScanOptions::default()
-    }
+    let mut o = ScanOptions::default();
+    o.passwords = vec![pw.to_string()];
+    o
 }
 
 #[test]

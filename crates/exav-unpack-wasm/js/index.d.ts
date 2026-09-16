@@ -4,6 +4,8 @@ export interface Limits {
   maxExtractedBytes?: number;
   /** The most bytes any single buffered object may hold at once. */
   maxBufferBytes?: number;
+  /** Cumulative bytes fed to the matching core across the whole archive. */
+  maxScannedBytes?: number;
   /** Number of members. */
   maxMembers?: number;
   /** How deep an archive inside an archive may nest. */

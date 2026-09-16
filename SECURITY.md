@@ -46,9 +46,9 @@ hardening below focuses.
 one, exav must:
 
 - never crash the process (panics are isolated per-file);
-- never report a file as clean (`OK`) unless it was actually fully scanned —
+ - never report a file as clean (`OK`) unless it was actually fully scanned —
   anything that prevents a full scan is reported `LIMITS-EXCEEDED`,
-  `UNSCANNABLE` or `PASSWORD-PROTECTED` (exit code 2);
+  `UNSCANNABLE` or `PASSWORD-PROTECTED` (status `PARTIAL`, exit code 3);
 - stay within its budgets, which bound decompressed bytes, per-member size,
   compression ratio, file count and recursion depth.
 

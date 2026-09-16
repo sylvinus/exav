@@ -17,7 +17,7 @@ exav /var/www                     # scan a directory, recursively
 exav --no-recursive /var/www      # just the directory's own files
 exav --quiet /data                # only print errors and detections
 cat file.zip | exav -             # scan stdin (constant memory, any size)
-exav https://host/obj.zip         # scan over HTTP range requests (needs an `http-scan` build)
+exav https://host/obj.zip         # scan over HTTP range requests (needs an `http-scan` build + EXAV_ALLOW_HTTP_SCAN=1)
 exav -d ./mydb /data              # use a signature database (file or dir)
 ```
 
@@ -77,6 +77,7 @@ The human-readable output is one line per file:
 ```console
 /path/to/file: Win.Trojan.Agent-1234 FOUND
 /path/to/clean: OK
+/path/to/missing: No such file or directory ERROR
 /path/to/huge.bin: file size 9663676416 exceeds max-scan-size 4294967296; scanned first 4294967296 bytes only LIMITS-EXCEEDED PARTIAL
 /path/to/secret.zip: encrypted archive member PASSWORD-PROTECTED PARTIAL
 ```
@@ -94,9 +95,15 @@ end of the same dial.
 For tooling and pipelines, `--json` emits newline-delimited JSON — one object
 per scanned input, plus a final summary object:
 
-```sh
-exav --json /data | jq 'select(.status=="FOUND")'
+```console
+$ exav --json /data
+{"file":"/data/file","status":"FOUND","signature":"Win.Trojan.Agent-1234","method":"pattern","offset":1234}
+{"file":"/data/clean","status":"OK"}
+{"file":"/data/huge.bin","status":"PARTIAL","category":"LIMITS-EXCEEDED","reason":"file size 9663676416 exceeds max-scan-size 4294967296; scanned first 4294967296 bytes only"}
+{"summary":{"scanned":3,"infected":1,"partial":1,"errors":0,"data_scanned_bytes":4294972634,"elapsed_secs":0.042}}
 ```
+
+Filter it with `jq`:
 
 `status` is the word the human line ends with — `OK`, `FOUND`, `ERROR`,
 `PARTIAL` — and it is on every result object. `category` is **not**: it
@@ -174,15 +181,16 @@ decrypted.
 
 ## Heuristics
 
-exav runs a small **FP-safe, ClamAV-parity** heuristic subset by default
-(imphash matching and the PDF obfuscated-name check). `--detect heuristics`
+exav runs a small set of low-false-positive heuristics by default, matching what
+ClamAV itself reports
+(imphash matching and the PDF obfuscated-name check). `--detect exav-heuristics`
 turns on the exav-exclusive superset (PE entropy, packer detection, TLSH fuzzy
 matching, a static ML baseline scorer) — higher FP risk, so it's opt-in:
 
 ```sh
-exav --detect heuristics -v sample.exe
+exav --detect exav-heuristics -v sample.exe
 ```
 
 `--detect` is the one dial for every heuristic detector: `all`, `none`, or a
-comma-separated list of `heuristics`, `macros`, `broken`, `broken-media`,
+comma-separated list of `exav-heuristics`, `macros`, `broken`, `broken-media`,
 `partition-intersection`, `phishing`, `packed`, `pua`.

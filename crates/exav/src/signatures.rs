@@ -332,6 +332,19 @@ fn interval(cli: &Cli) -> Duration {
     )
 }
 
+/// How often a `--db-url` prebuilt database is re-checked, from the same flag.
+/// A conditional `HEAD`, so the default cadence is minutes rather than the day
+/// a full source fetch gets — but the same 60-second floor applies: a short
+/// poll aimed at someone else's server is the same loop whatever it checks.
+#[cfg(feature = "http-update")]
+fn db_poll_interval(cli: &Cli) -> Duration {
+    Duration::from_secs(
+        cli.update_interval_secs
+            .unwrap_or(DEFAULT_DB_URL_POLL_SECS)
+            .max(MIN_UPDATE_INTERVAL_SECS),
+    )
+}
+
 /// Seconds to wait for a sidecar to fill an empty signature dir. `--auto-update`
 /// brings a default with it, because a container whose volume is being populated
 /// by another container has to be allowed to come up second; without the flag
@@ -475,11 +488,7 @@ fn start_prebuilt_db(
     // full source fetch gets. One flag either way: how often exav re-checks is
     // one question, and the default answer follows from how expensive the check
     // is rather than from a second setting.
-    let poll = Duration::from_secs(
-        cli.update_interval_secs
-            .unwrap_or(DEFAULT_DB_URL_POLL_SECS)
-            .max(1),
-    );
+    let poll = db_poll_interval(cli);
 
     // Synchronous initial fetch so the first load sees a file.
     eprintln!("exav: fetching database from {shown} -> {}", dest.display());
@@ -747,6 +756,27 @@ mod tests {
                 interval(&cli(&["--update-interval-secs", too_short])).as_secs(),
                 MIN_UPDATE_INTERVAL_SECS,
                 "--update-interval-secs {too_short} must not become a delay-free loop"
+            );
+        }
+    }
+
+    #[cfg(feature = "http-update")]
+    #[test]
+    fn the_database_poll_interval_is_floored_too() {
+        let _env = crate::env_guard();
+        let cli =
+            |args: &[&str]| Cli::parse_from(std::iter::once("exav").chain(args.iter().copied()));
+
+        assert_eq!(
+            db_poll_interval(&cli(&[])).as_secs(),
+            300,
+            "a pulled database re-checks every five minutes by default"
+        );
+        for too_short in ["0", "1", "59"] {
+            assert_eq!(
+                db_poll_interval(&cli(&["--update-interval-secs", too_short])).as_secs(),
+                MIN_UPDATE_INTERVAL_SECS,
+                "--update-interval-secs {too_short} must not hammer the database host"
             );
         }
     }

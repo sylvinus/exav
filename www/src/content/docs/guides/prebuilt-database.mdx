@@ -1,14 +1,17 @@
 ---
 title: Prebuilt database
-description: Compile ClamAV signatures into a portable .exavdb once for a near-instant, low-memory cold start — and hot-reload it on atomic swap.
+description: Compile ClamAV signatures into a .exavdb once for a near-instant, low-memory cold start — and hot-reload it on atomic swap.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
 Loading raw ClamAV signatures means building a large in-memory automaton — tens
 of seconds and gigabytes of transient RAM. `--build-db` does that work **once**
-and writes a self-contained, portable `.exavdb` file; pointing `-d` at that file
-loads it directly, restoring the automaton instead of rebuilding it.
+and writes a self-contained `.exavdb` file; pointing `-d` at that file
+loads it directly, restoring the automaton instead of rebuilding it. The file is
+not portable across exav versions: a database loads only on the exact engine
+build that wrote it (same `VERSION` serial), otherwise it is rejected and must
+be rebuilt.
 
 ## Rebuild after an engine upgrade
 
@@ -31,7 +34,9 @@ part of upgrading the binary, and keep the two versioned together.
 For the full Cisco/ClamAV official database (`main.cvd`+`daily.cvd`, ~3.7M
 signatures), the prebuilt database
 turns a **75 s / 5.6 GiB** raw load into a **3.5 s / 1.2 GiB** database load —
-roughly **19× faster** and **5× lighter** at cold start.
+roughly **19× faster** and **5× lighter** at cold start. (Measured July 2026 on
+a full main+daily build; absolute times depend on hardware and move with the
+engine — the ratio is the point, not the seconds.)
 
 The reason is where the memory goes. Building the daachorse double-array
 Aho-Corasick automaton from raw signatures spikes to ~3.6 GB transient for the

@@ -23,7 +23,7 @@ Bind-mounted database volumes must be writable by that uid.
 # bundled, and rather than serve without them exav waits for them to appear
 # (EXAV_STARTUP_WAIT_SECS, default 1800). Nothing answers on 3310 until they do.
 docker run -d -p 3310:3310 -v exav-db:/var/lib/exav \
-  -e EXAV_SIG_SOURCES=https://your-mirror/ ghcr.io/sylvinus/exav
+  -e EXAV_SIG_SOURCES=https://database.clamav.net/ ghcr.io/sylvinus/exav
 clamdscan --stream file.bin                       # once the load is logged
 
 # One-shot scan. Paths win over the image's `EXAV_LISTEN`, so there is nothing
@@ -32,11 +32,8 @@ clamdscan --stream file.bin                       # once the load is logged
 docker run --rm -v exav-db:/var/lib/exav -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 ```
 
-Naming paths is what makes that run a scanner rather than a daemon: `EXAV_LISTEN`
-is a default the image sets, and a default gives way to what the command line
-asks for. A `--listen` **typed on the command line** alongside paths is a
-different thing — two jobs in one command — and is refused rather than guessed
-at.
+The same image scans when given paths — nothing to unset — but don't combine
+`--listen` with paths: serving and scanning in one command is refused.
 
 The image's default command is `--auto-update`, with `EXAV_LISTEN` set to
 `clamd://0.0.0.0:3310`: serve the clamd protocol, and keep the signature volume
@@ -103,7 +100,8 @@ changes.
   <TabItem label="Built-in updater">
     Set `EXAV_SIG_SOURCES` to CVD mirror bases you trust (a trailing `/` makes a
     URL a mirror, expanding to `main`/`daily`/`bytecode.cvd`) or to exact feed
-    URLs; they merge. The container fetches on start and every
+    URLs; they merge — e.g. `EXAV_SIG_SOURCES=https://database.clamav.net/`.
+    The container fetches on start and every
     `EXAV_UPDATE_INTERVAL_SECS` after that. Needs the `http-update` build (the
     default image). It's a plain HTTPS fetch with **no signature verification** —
     trust the mirror.
@@ -164,10 +162,6 @@ docker run -d -p 1344:1344 -v exav-db:/var/lib/exav \
 The port is bound only when asked for. See the [ICAP guide](/guides/icap/) for
 the verdict mapping and the full settings table.
 
-When swapping over from the ClamAV image, translate that image's
-`CLAMAV_*`/`FRESHCLAM_*` settings to their `EXAV_*` equivalents — the mapping is
-in [Configuration](/reference/configuration/).
-
 ## Rootless bind mounts
 
 When you bind-mount a host directory (instead of a named volume), make it
@@ -222,8 +216,8 @@ volumes:
   exav-db:
 ```
 
-The scanner notices the updated files on the shared mount (an mtime watch, like
-clamd's `SelfCheck`) and re-forks its worker pool with the new signatures — no
+The scanner notices the updated files on the shared mount (an mtime watch)
+and re-forks its worker pool with the new signatures — no
 restart, no cross-container signalling.
 
 <Aside type="tip">

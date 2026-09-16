@@ -61,10 +61,9 @@ fn lenient_fallback_recovers_streams_from_malformed_directory() {
 fn a_stream_cut_short_by_the_budget_is_reported() {
     let blob = fixture("malformed_dir_order.ole");
     // Far below any real stream in the fixture, so every one is cut.
-    let mut budget = Budget::new(Limits {
-        max_buffer_bytes: 16,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 16;
+    let mut budget = Budget::new(limits);
     let Ok(entries) = extract(Format::Ole, &blob, &mut budget) else {
         // Refusing outright is also acceptable: the scan is told something is
         // wrong either way. What must not happen is silent truncation.

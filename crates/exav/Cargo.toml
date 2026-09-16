@@ -111,6 +111,21 @@ onenote = ["exav-core/onenote"]
 rtf = ["exav-core/rtf"]
 machofat = ["exav-core/machofat"]
 sfx = ["exav-core/sfx"]
+base64scan = ["exav-core/base64scan"]
+stuffit = ["exav-core/stuffit"]
+alz = ["exav-core/alz"]
+egg = ["exav-core/egg"]
+hwp3 = ["exav-core/hwp3"]
+ext = ["exav-core/ext"]
+zoo = ["exav-core/zoo"]
+ishieldz = ["exav-core/ishieldz"]
+pepack = ["exav-core/pepack"]
+javaclass = ["exav-core/javaclass"]
+aimodel = ["exav-core/aimodel"]
+screnc = ["exav-core/screnc"]
+# Emulation-based unpacking: its own switch, so a build can take the static
+# unpackers without executing attacker-supplied control flow.
+pe-emu = ["exav-core/pe-emu"]
 
 [dependencies]
 exav-core = { path = "../exav-core", version = "0.0.1", default-features = false }
@@ -137,8 +152,8 @@ serde_json = "1"
 # clamd-compatible systemd unit (disabled by default).
 [package.metadata.deb]
 name = "exav"
-maintainer = "exav contributors <https://github.com/sylvinus/exav>"
-copyright = "The exav authors, MIT"
+maintainer = "Sylvain Zimmer <https://github.com/sylvinus/exav>"
+copyright = "Sylvain Zimmer, MIT"
 license-file = ["../../LICENSE", "0"]
 section = "utils"
 priority = "optional"

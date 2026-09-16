@@ -107,7 +107,7 @@ fmt:
 	$(CARGO) fmt
 
 ## msrv: build the workspace on the `rust-version` floor declared in Cargo.toml.
-##       Nothing else checks it, and a version nobody verifies drifts upward the
+##       CI runs this, so a version nobody verifies drifts upward the
 ##       first time someone uses a newer feature — silently breaking anyone who
 ##       pinned the toolchain we promised.
 ##       `rustup run` rather than `cargo +VERSION`: the `+toolchain` prefix is a

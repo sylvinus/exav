@@ -54,11 +54,10 @@ fn sha256_hex(data: &[u8]) -> String {
 
 fn members(blob: &[u8]) -> Vec<Entry> {
     let mut out = Vec::new();
-    let mut b = Budget::new(Limits {
-        max_buffer_bytes: 8 * 1024 * 1024,
-        max_extracted_bytes: 16 * 1024 * 1024,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 8 * 1024 * 1024;
+    limits.max_extracted_bytes = 16 * 1024 * 1024;
+    let mut b = Budget::new(limits);
     let _ = extract_each(
         Format::Rar,
         blob,

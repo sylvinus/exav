@@ -229,7 +229,9 @@ fn head_etag_short_circuits_and_downloads_on_change() {
 
     let v1 = match fetch_db_if_changed(&url, &dest, None).unwrap() {
         Fetch::Updated { validator } => validator,
-        Fetch::Unchanged { .. } => panic!("first fetch should download"),
+        // `Fetch` is non-exhaustive: anything that is not an install means
+        // the first fetch did not download.
+        _ => panic!("first fetch should download"),
     };
     assert_eq!(v1.as_deref(), Some("\"v1\""));
     assert!(std::fs::read(&dest).unwrap().starts_with(b"EXAVDB\x00\x01"));
@@ -281,7 +283,9 @@ fn conditional_get_304_when_head_lacks_etag() {
 
     let v = match fetch_db_if_changed(&url, &dest, None).unwrap() {
         Fetch::Updated { validator } => validator,
-        Fetch::Unchanged { .. } => panic!("first fetch should download"),
+        // `Fetch` is non-exhaustive: anything that is not an install means
+        // the first fetch did not download.
+        _ => panic!("first fetch should download"),
     };
     assert_eq!(v.as_deref(), Some("\"abc\""));
     assert!(matches!(
@@ -518,7 +522,9 @@ fn redownloads_when_dest_deleted_despite_matching_validator() {
 
     let v = match fetch_db_if_changed(&url, &dest, None).unwrap() {
         Fetch::Updated { validator } => validator,
-        Fetch::Unchanged { .. } => panic!("first fetch should download"),
+        // `Fetch` is non-exhaustive: anything that is not an install means
+        // the first fetch did not download.
+        _ => panic!("first fetch should download"),
     };
     assert_eq!(v.as_deref(), Some("\"v1\""));
     assert!(dest.exists());

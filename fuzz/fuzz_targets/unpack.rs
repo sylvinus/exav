@@ -14,18 +14,20 @@
 use libfuzzer_sys::fuzz_target;
 use exav_unpack::{extract, Budget, Format, Limits};
 
-const TIGHT_LIMITS: Limits = Limits {
-    max_extracted_bytes: 256 * 1024,
-    max_members: 5,
-    max_compression_ratio: 50,
-    max_buffer_bytes: 128 * 1024,
-    max_scanned_bytes: 256 * 1024,
-    max_recursion: 2,
+fn tight_limits() -> Limits {
+    let mut l = Limits::default();
+    l.max_extracted_bytes = 256 * 1024;
+    l.max_members = 5;
+    l.max_compression_ratio = 50;
+    l.max_buffer_bytes = 128 * 1024;
+    l.max_scanned_bytes = 256 * 1024;
+    l.max_recursion = 2;
     // Every format stays reachable. Narrowing the set here would take whole
     // parsers out of the fuzzer's reach, which is the opposite of what this
     // target is for.
-    allowed_formats: None,
-};
+    l.allowed_formats = None;
+    l
+}
 
 /// Every extractable format. Kept exhaustive on purpose: a new `Format` variant
 /// should be added here so its parser's error paths are fuzzed directly, without
@@ -79,7 +81,7 @@ fuzz_target!(|data: &[u8]| {
         // Candidate passwords exercise the decryption paths (7z AES, ZipCrypto,
         // WinZip-AES, PDF/DMG); harmless for every other format.
         let mut budget = Budget::with_passwords(
-            TIGHT_LIMITS,
+            tight_limits(),
             vec!["infected".to_string(), "hunter2".to_string()],
         );
         let _ = extract(fmt, data, &mut budget);

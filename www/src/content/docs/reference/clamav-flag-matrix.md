@@ -136,10 +136,10 @@ Grouped in the order `clamscan --help` prints them.
 
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
-| `--detect-structured[=yes/no]` | Detect SSNs / credit-card numbers | — | absent | exav turns the heuristic on by giving it a threshold — set `--alert-credit-cards` or `--alert-ssns`. A separate on/off switch beside a threshold is a second way to say the same thing. |
+| `--detect-structured[=yes/no]` | Detect SSNs / credit-card numbers | — | absent | exav turns the heuristic on by giving it a threshold — set `--dlp-credit-cards` or `--dlp-ssns`. A separate on/off switch beside a threshold is a second way to say the same thing. |
 | `--structured-ssn-format=X` | SSN format (normal / stripped / both) | — | absent | |
-| `--structured-ssn-count=N` | Minimum SSN count to alert | `--alert-ssns` | renamed | Needs a build with the `dlp` feature (on by default). Named `--alert-` rather than `--detect` because what it finds is the organisation's own data on its way somewhere, not malware. |
-| `--structured-cc-count=N` | Minimum credit-card count to alert | `--alert-credit-cards` | renamed | Same feature note. |
+| `--structured-ssn-count=N` | Minimum SSN count to alert | `--dlp-ssns` | renamed | Needs a build with the `dlp` feature (on by default). Named `--dlp-` rather than `--detect` because what it finds is the organisation's own data on its way somewhere, not malware. |
+| `--structured-cc-count=N` | Minimum credit-card count to alert | `--dlp-credit-cards` | renamed | Same feature note. |
 | `--structured-cc-mode=X` | Credit-card mode | — | absent | |
 
 ### Parser toggles
@@ -336,9 +336,9 @@ nothing does.
 | `AlertExceedsMax` | Alert on a limit stop | `--partial-as limits-exceeded=found` | exav reports `LIMITS-EXCEEDED` without it. |
 | `AlertPartitionIntersection` | Alert on overlapping partitions | `--detect partition-intersection` | |
 | `AlertPhishingSSLMismatch` / `AlertPhishingCloak` | Phishing alert detail | `--detect phishing` | One detector, no per-check switch. |
-| `StructuredDataDetection` | Enable DLP detection | `--alert-credit-cards` / `--alert-ssns` | Giving a threshold enables it. |
-| `StructuredMinCreditCardCount` | Credit-card threshold | `--alert-credit-cards` | |
-| `StructuredMinSSNCount` | SSN threshold | `--alert-ssns` | |
+| `StructuredDataDetection` | Enable DLP detection | `--dlp-credit-cards` / `--dlp-ssns` | Giving a threshold enables it. |
+| `StructuredMinCreditCardCount` | Credit-card threshold | `--dlp-credit-cards` | |
+| `StructuredMinSSNCount` | SSN threshold | `--dlp-ssns` | |
 | `StructuredCCOnly`, `StructuredSSNFormatNormal`, `StructuredSSNFormatStripped` | DLP format policy | — | |
 | `DisableCertCheck` | Skip Authenticode verification | — | exav's Authenticode handling is parse- and blocklist-only. |
 | `CrossFilesystems` | Scan across mount points | — | exav's walk crosses them, matching clamd's default. |
@@ -428,7 +428,7 @@ Two client-mode behaviours have no flag to name them:
 | `--decode <LIST>` / `--no-decode <LIST>` | Encodings to recover a payload from before scanning it: `base64` today, meaning both a run long enough to hold an executable and the base64 assets a markup document embeds. On by default, unlike `--detect`. |
 | `--detect packed` | Report `Heuristics.Packed.*`, naming the packer wrapping an executable exav could not unpack. |
 | `--detect phishing` | Report `Heuristics.Phishing.Email.*` for display-versus-href link spoofing. Covers the checks ClamAV splits across `--alert-phishing-ssl` and `--alert-phishing-cloak`. |
-| `--detect heuristics` | Enable exav-exclusive structural / fuzzy / ML analysis. |
+| `--detect exav-heuristics` | Enable exav-exclusive structural / fuzzy / ML analysis. |
 | `--passwords <PW>` | Password to try for encrypted members. Repeatable. |
 | `--json` | Newline-delimited JSON results, one object per input plus a summary. |
 | `--profile` | Per-matcher timing breakdown: a CSV row per file when scanning, `MATCHERSTATS` through `STATS` on a listener. |

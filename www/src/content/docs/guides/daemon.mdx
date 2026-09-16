@@ -82,7 +82,8 @@ Supported commands: `PING`, `VERSION`, `VERSIONCOMMANDS`, `STATS`, `RELOAD`,
 (fd passing), `IDSESSION` / `SESSION` / `END`, plus the exav extensions
 `SCANURL <url>` (scan an `http(s)://` object via range requests — the object is
 fetched a small constant number of times rather than downloaded once; see
-[scanning over HTTP](/guides/scanning/#scanning-over-http-costs-bandwidth-not-memory)),
+[scanning over HTTP](/guides/scanning/#scanning-over-http-costs-bandwidth-not-memory);
+honoured only with `--allow-http-scan`, and listed in `VERSIONCOMMANDS` only then),
 `EXINSTREAM` and `EXINSTREAM MULTI` (below). Commands may be `z`- or `n`-framed.
 
 `STATS` carries the clamd fields `clamdtop` parses, and then two exav lines

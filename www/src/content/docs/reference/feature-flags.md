@@ -23,15 +23,40 @@ The default build is 100% pure-Rust and links **no TLS stack** — HTTP is opt-i
 | `yara` | yes | Full YARA rule matching via the native engine. Disabling compiles away the YARA parser/evaluator subtree for a lighter binary. |
 | `all-formats` | yes | Every archive/container extractor (see below). |
 | `decrypt` | yes | Decryption of encrypted archives (ZIP ZipCrypto/AES, 7z AES, PDF, DMG). |
-| `dlp` | yes | The structured-data leak heuristics (`--alert-credit-cards` / `--alert-ssns`). |
+| `dlp` | yes | The structured-data leak heuristics (`--dlp-credit-cards` / `--dlp-ssns`). |
 | `icap` | yes | The [ICAP (RFC 3507) server](/guides/icap/) and its `--icap*` flags. Pure-Rust and std-only, so it costs the default build nothing; it binds no port unless an `icap://` address on `--listen` asks it to. |
-| `http` | **no** | HTTP(S) support. Enables both halves below; the only thing that links a TLS stack (`ureq → rustls → ring`). |
+| `http` | **no** | HTTP(S) support. Enables both halves below; the only thing that links a TLS stack (`ureq → rustls → ring`). Note the name is per-crate: in `exav-core` `http` is just the range-request backend (`dep:ureq`), while in `exav` it is the umbrella `http = ["http-scan", "http-update"]`. |
 | `http-scan` | no | Scan an `http(s)://` argument + the daemon `SCANURL` command. |
 | `http-update` | no | Signature auto-update over HTTP (`--sig-sources`, `--db-url`). |
 
 The `http` split lets an updater-only daemon take `http-update` **without**
 exposing the network-facing `SCANURL` verb (a client making the daemon fetch an
 arbitrary URL) — take one, the other, or both.
+
+## Adding HTTP support
+
+HTTP is additive: it stacks on top of the default build, which otherwise links
+no TLS stack.
+
+```sh
+# From source — URL scanning (`http-scan`) plus signature auto-update (`http-update`):
+cargo build --release -p exav --features http
+
+# From crates.io:
+cargo install exav --features http
+```
+
+Take only the half you need:
+
+```sh
+# Scan `http(s)://` arguments, without the updater:
+cargo build --release -p exav --features http-scan
+
+# Fetch signature updates, without exposing SCANURL:
+cargo build --release -p exav --features http-update
+```
+
+The published container image already builds with `http`.
 
 ## The test-only feature: `testing-faults`
 
@@ -97,19 +122,17 @@ Available per-format features:
 ```text
 zip · gzip · tar · bzip2 · xz · zstd · lzip · lzw · lz4 · cab · chm · sevenz
 rar · arj · arc · ace · lha · iso · ole · pdf · email · dmg · vhd · diskimage
-fat · ntfs · wim · upx · inno · nsis · ar · cpio · xar · uuencode · xdp · szdd
+fat · ext · ntfs · wim · upx · inno · nsis · ar · cpio · xar · uuencode · xdp · szdd
 tnef · swf · binhex · lnk · partition · pyc · autoit · onenote · rtf
-machofat · sfx
+machofat · sfx · stuffit · alz · egg · hwp3 · zoo · ishieldz · pepack
+javaclass · aimodel · screnc · base64scan · pe-emu
 ```
 
 `diskimage` covers the virtual disks that need reconstruction (VHDX, QCOW2,
 VMDK); `vhd` is separate because the older format needs no decompressor.
-
-Some extractors are lower-level features that are not forwarded to `exav`,
-so they cannot be named on a `cargo build -p exav` line (all of them are in
-the default `all-formats` build): `stuffit`, `alz`, `egg`, `hwp3`, `ext`, `zoo`,
-`ishieldz`, `pepack`, `javaclass`, `aimodel`, `screnc` and `base64scan`. Select
-those when building `exav-unpack` (or the WASM package) directly.
+`pepack` is static unpacking (no execution); `pe-emu` runs the stub, so it is
+its own switch. Every name above is forwardable from `exav-unpack` through
+`exav-core` to `exav`, so each can be named on a `cargo build -p exav` line.
 
 See [Supported formats](/reference/formats/) for what each one covers.
 

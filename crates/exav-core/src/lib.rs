@@ -529,6 +529,7 @@ impl Verdict {
 
 /// An informational finding (type, entropy, imphash, skipped sub-objects).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct Finding {
     pub label: String,
     pub detail: String,
@@ -550,13 +551,22 @@ impl Finding {
 pub(crate) type PhishingPartsOwned = (Vec<String>, Vec<(String, String)>, Vec<(String, String)>);
 
 /// Full result of a scan.
+///
+/// New fields may appear in any release. Build with [`ScanReport::new`] —
+/// never with a struct literal, which a new field would break.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ScanReport {
     pub verdict: Verdict,
     pub findings: Vec<Finding>,
 }
 
 impl ScanReport {
+    /// A report from a verdict and its findings.
+    pub fn new(verdict: Verdict, findings: Vec<Finding>) -> Self {
+        Self { verdict, findings }
+    }
+
     fn clean(findings: Vec<Finding>) -> Self {
         Self {
             verdict: Verdict::Clean,
@@ -606,7 +616,12 @@ impl ScanReport {
 }
 
 /// Options controlling a scan and its limits.
+///
+/// New fields may appear in any release. Build with
+/// `ScanOptions::default()` and assign the fields you care about — never with
+/// a struct literal, which a new field would break.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ScanOptions {
     /// Max bytes for a single top-level file. `None` = unlimited (default).
     /// Exceeding yields `LimitsExceeded`.
@@ -629,7 +644,7 @@ pub struct ScanOptions {
     /// out of the box does every reasonable ClamAV-default match. Kept separate
     /// from [`heuristics`](Self::heuristics) so this parity subset stays on under
     /// `--clamav-compat` while the exav-exclusive TLSH/ML analysis (higher FP risk,
-    /// no ClamAV analog) does not. `--detect heuristics` is the superset and implies this.
+    /// no ClamAV analog) does not. `--detect exav-heuristics` is the superset and implies this.
     pub clamav_heuristics: bool,
     /// Report findings under ClamAV's vocabulary where the two engines describe
     /// the same fact differently. Set by [`ScanOptions::clamav_compat`].
@@ -804,6 +819,10 @@ impl ScanOptions {
     /// also depend on its build flags (e.g. `libclamunrar`); this matches the
     /// documented defaults, not a specific binary.
     pub fn clamav_compat() -> Self {
+        let mut limits = unpack::Limits::default();
+        limits.max_recursion = 17;
+        limits.max_members = 10_000;
+        limits.max_extracted_bytes = 400 * 1024 * 1024;
         Self {
             max_scan_size: Some(100 * 1024 * 1024),
             deep_analysis_max: 400 * 1024 * 1024,
@@ -812,12 +831,7 @@ impl ScanOptions {
             heuristics: false,
             clamav_heuristics: true,
             clamav_compat: true,
-            limits: unpack::Limits {
-                max_recursion: 17,
-                max_members: 10_000,
-                max_extracted_bytes: 400 * 1024 * 1024,
-                ..unpack::Limits::default()
-            },
+            limits,
             restrict_extractors: true,
             // base64-decoding reaches beyond stock ClamAV; off for parity.
             decode_base64: false,
@@ -1021,7 +1035,9 @@ impl Scanner {
 
     /// Run every loaded bytecode program against `data` ignoring its gate, for
     /// testing/differential validation. Returns `(detection, program_index)`
-    /// for each program that detects with no unsupported op.
+    /// for each program that detects with no unsupported op. Not part of the
+    /// stable API.
+    #[cfg(feature = "unstable-internals")]
     pub fn run_bytecodes_forced(&self, data: &[u8]) -> Vec<(String, usize)> {
         self.bytecode.run_all_forced(data)
     }
@@ -1303,7 +1319,8 @@ pub fn scan_seekable_located<R: Read + Seek>(
     Ok((report, loc))
 }
 
-/// Scan a seekable input (a local file, or [`source::HttpRangeReader`]). A ZIP
+/// Scan a seekable input (a local file, or `source::HttpRangeReader` with the
+/// `http` feature). A ZIP
 /// is read through the seekable reader, so only its central directory and the
 /// members actually scanned are touched, and scanning stops at the first
 /// detection — so a range-backed reader never fetches the rest. Non-ZIP
@@ -1407,7 +1424,7 @@ fn scan_budget(db: &Scanner, opts: &ScanOptions) -> Budget {
 /// Map an extraction [`unpack::LimitHit`] to the right top-level report: a
 /// resource bound is `LimitsExceeded`; undecodable content is `Unscannable`.
 fn report_for_hit(hit: unpack::LimitHit, findings: Vec<Finding>, opts: &ScanOptions) -> ScanReport {
-    if hit.corrupt {
+    if hit.is_corrupt() {
         return ScanReport::unscannable(hit.reason, findings);
     }
     if opts.alert_exceeds_max {
@@ -1481,7 +1498,7 @@ fn limits_outcome(opts: &ScanOptions, kind: unpack::LimitKind, reason: String) -
 
 /// As [`report_for_hit`] but for the recursive [`DeepOutcome`] path.
 fn outcome_for_hit(hit: unpack::LimitHit, opts: &ScanOptions) -> DeepOutcome {
-    if hit.corrupt {
+    if hit.is_corrupt() {
         DeepOutcome::Unscannable(hit.reason)
     } else {
         limits_outcome(opts, hit.kind, hit.reason)
@@ -2075,6 +2092,8 @@ fn scan_streamed_container<R: Read + Seek>(
 }
 
 /// The verdict of a multi-volume archive, reported against one of its parts.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct VolumeSetVerdict {
     /// The part this verdict is attributed to — one of the names given.
     pub name: String,
@@ -2334,6 +2353,13 @@ fn suppress_name(db: &Scanner, report: ScanReport) -> ScanReport {
 ///
 /// An allowlisted file yields nothing; ignored names are dropped, the same
 /// suppression as a normal scan.
+///
+/// The second tuple element tells you whether that walk finished. A scan that
+/// hit a limit, hit content it could not read, or could not decrypt a member
+/// is a *partial* answer: an empty detection list means "nothing found in the
+/// part that was scanned", not "nothing found". Callers that report to a user
+/// must interpret [`AllMatchOutcome`] rather than call [`analyze_all`], which
+/// throws it away.
 pub fn analyze_all_with_outcome(
     db: &Scanner,
     data: &[u8],
@@ -3291,7 +3317,7 @@ fn deep_analyze(
     // DLP structured-data heuristic (opt-in, ClamAV `--structured-*-count`): count
     // credit-card / SSN numbers in reasonably-sized textual buffers and alert when
     // a threshold is met. Driven solely by the ScanOptions thresholds, so it runs
-    // independently of `--detect heuristics` (matching ClamAV, where
+    // independently of `--detect exav-heuristics` (matching ClamAV, where
     // `CL_SCAN_HEURISTIC_STRUCTURED` is its own switch). Runs at every recursion
     // level, so structured data inside an extracted archive member is caught too.
     #[cfg(feature = "dlp")]
@@ -3301,14 +3327,14 @@ fn deep_analyze(
 
     // Phishing heuristic (opt-in, ClamAV `--alert-phishing`): flag link-spoofing
     // in HTML/text bodies. Like the DLP heuristic it is driven by its own flag,
-    // independent of `--detect heuristics`, and runs at every recursion level (so a
+    // independent of `--detect exav-heuristics`, and runs at every recursion level (so a
     // phishing HTML part inside an email/archive is caught too).
     #[cfg(feature = "phishing")]
     if let Some(o) = phishing_scan(db, data, opts, sink) {
         return o;
     }
 
-    // Authenticode inspection (independent of `--detect heuristics`, like phishing/DLP).
+    // Authenticode inspection (independent of `--detect exav-heuristics`, like phishing/DLP).
     // One PE parse serves both checks:
     //   * `.crb` certificate block-list — a signed PE carrying a blocked signer
     //     cert is reported (always on when a `.crb` DB is loaded);
@@ -3336,13 +3362,13 @@ fn deep_analyze(
     }
 
     // Nothing below fires unless at least the ClamAV-default heuristics are on
-    // (on by default; `--detect heuristics` is the superset and also enables them).
+    // (on by default; `--detect exav-heuristics` is the superset and also enables them).
     if !opts.clamav_heuristics && !opts.heuristics {
         return deferred;
     }
 
     // TLSH fuzzy matching is exav-exclusive (ClamAV has no TLSH), so it stays
-    // behind the full `--detect heuristics` flag and off under `--clamav-compat`.
+    // behind the full `--detect exav-heuristics` flag and off under `--clamav-compat`.
     if opts.heuristics {
         if let Some(hit) = profile::timed("fuzzy", data.len() as u64, || db.fuzzy.match_tlsh(data))
         {
@@ -3358,7 +3384,7 @@ fn deep_analyze(
             // loaded DB carries `.imp` sigs — so it runs under `clamav_heuristics`
             // (i.e. under `--clamav-compat` too). The exav-exclusive ML scorer,
             // packed-injection heuristic, and the `-v` diagnostic findings below
-            // stay behind the full `--detect heuristics` flag.
+            // stay behind the full `--detect exav-heuristics` flag.
             if let Some(hit) = db
                 .fuzzy
                 .match_imphash(&info.imphash, info.import_count as u64)

@@ -19,7 +19,8 @@ and run it against this workspace. `cargo deny check licenses` (run in CI)
 confirms every dependency resolves to a permissive license on the allowlist in
 deny.toml.
 
-Versions below reflect Cargo.lock at the time of writing.
+Versions below reflect Cargo.lock at the time of writing (last verified
+2026-09-09).
 
 
 -------------------------------------------------------------------------------
@@ -72,9 +73,7 @@ Copyright (c) VirusTotal and contributors.
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Other BSD-3-Clause components linked by exav (same 3-clause terms above, with
-their respective copyright holders): encoding_rs, subtle, tlsh2.
-
-Other BSD-2-Clause components: mach2, zerocopy.
+their respective copyright holders): subtle, tlsh2.
 
 
 -------------------------------------------------------------------------------
@@ -235,7 +234,7 @@ Copyright (c) Mike Krüger.
 
 
 -------------------------------------------------------------------------------
-1h2. unshield / explode — MIT (linked dependency + test fixtures)
+1h1. unshield / explode — MIT (linked dependency + test fixtures)
 -------------------------------------------------------------------------------
 
 crates/exav-unpack/src/formats/ishield_z.rs reads InstallShield `.z` archives
@@ -257,7 +256,7 @@ Copyright (c) Aaron Griffith.
 
 
 -------------------------------------------------------------------------------
-1h1. iced-x86 — MIT (generated opcode tables)
+1h2. iced-x86 — MIT (generated opcode tables)
 -------------------------------------------------------------------------------
 
 crates/exav-x86/src/generated.rs holds the SIMD, system and VEX regions of the
@@ -415,8 +414,9 @@ the distributor's choice. Notable examples:
   serde, rmp-serde                       serialization
   clap                                   CLI parsing
   sha1, sha2, md-5, digest (RustCrypto)  hashing
-  flate2, miniz_oxide, xz2, bzip2,       decompression
-    sevenz-rust2, zip
+  flate2, miniz_oxide, bzip2, zip        decompression (sevenz-rust2 is dev-only:
+                                        it builds 7z test fixtures; the shipped
+                                        7z reader is native, §1m)
   lzfse_rust, delharc, lzxd,             DMG/LHA/CAB codecs
     bitstream-io, stringprep
   cfb                                    OLE/CFB compound-file reader
@@ -434,7 +434,7 @@ the MIT text is in the exav LICENSE file): cfb, hfsplus, apfs (the two latter
 via DMG/HFS+/APFS support).
 
 RustCrypto crates are MIT OR Apache-2.0. Zlib-licensed components present:
-miniz_oxide, zlib-rs, tinyvec, foldhash. Unicode-3.0: the ICU / unicode-ident
+miniz_oxide, tinyvec. Unicode-3.0: the ICU / unicode-ident
 crates. Other permissive licenses in the graph: CC0-1.0 and MIT-0 (ppmd-rust via
 sevenz-rust2), CDLA-Permissive-2.0 (webpki-roots, TLS root store), bzip2-1.0.6
 (libbz2-rs-sys).

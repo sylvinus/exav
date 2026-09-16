@@ -59,8 +59,7 @@
 
 use std::io::{Read, Seek};
 
-#[doc(hidden)]
-pub mod formats;
+pub(crate) mod formats;
 // Every name this pulls in is behind a format feature, so the glob imports
 // nothing at all in a build with none of them compiled in.
 #[allow(unused_imports)]
@@ -68,14 +67,11 @@ use formats::*;
 
 mod stream;
 pub mod volume;
+#[cfg(feature = "pdf")]
+pub use formats::has_obfuscated_name_object;
 pub use stream::{
     is_budget_overflow, is_streamable, stream_members, BudgetReader, MemberMeta, StreamVisit,
 };
-// RAR decompression primitives, exposed for the rar3/rar5 examples + tests.
-#[cfg(feature = "zip")]
-#[doc(hidden)]
-#[cfg(feature = "pdf")]
-pub use formats::has_obfuscated_name_object;
 
 /// Count of overlapping ZIP local file records — the signal behind ClamAV's
 /// `Heuristics.Zip.OverlappingFiles`. Zero for any well-formed archive.
@@ -125,13 +121,20 @@ pub fn has_obfuscated_name_object(_data: &[u8]) -> bool {
     false
 }
 #[cfg(feature = "zip")]
-pub use formats::ZipMembers;
+use formats::ZipMembers;
+// RAR decompression primitives, exposed for the rar3/rar5 examples + tests.
+// Diagnostic surface, not part of the stable API: may change in any release.
 #[cfg(feature = "rar")]
 #[doc(hidden)]
 pub use formats::{unpack29, unpack50, window_size_from_comp_info};
 
 /// Limits governing recursive extraction.
+///
+/// New fields may appear in any release. Build with `Limits::default()` and
+/// assign the fields you care about — never with a struct literal, which a
+/// new field would break.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Limits {
     pub max_recursion: u32,
     /// Cap on the number of members visited across the whole recursive walk.
@@ -372,16 +375,15 @@ impl Budget {
     }
 }
 
-/// An extraction stopped early. `corrupt` picks the verdict: `true` for
+/// An extraction stopped early. [`LimitHit::is_corrupt`] picks the verdict:
 /// undecodable content (malformed/truncated structure, or a decoder that
-/// panicked → `Unscannable`); `false` for a resource bound being hit
+/// panicked → `Unscannable`) versus a resource bound being hit
 /// (size/recursion/ratio/scan budget → `LimitsExceeded`). Carries the
 /// human-readable reason for the report.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{reason}")]
 pub struct LimitHit {
     pub reason: String,
-    pub corrupt: bool,
     /// Which budget stopped the scan. Carried as a *type*, not inferred from
     /// `reason`: a caller that needs to name the limit (the ClamAV-compatible
     /// `Heuristics.Limits.Exceeded.*` alerts) must not have to pattern-match
@@ -390,7 +392,10 @@ pub struct LimitHit {
 }
 
 /// The budget that stopped a scan, named the way the signature format names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Deliberately no `Default`: there is no neutral kind — a bare default would
+/// read as one verdict or the other, so every construction names its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LimitKind {
     /// Cumulative bytes fed to the matcher (`max_scanned_bytes`).
@@ -404,41 +409,41 @@ pub enum LimitKind {
     MaxRecursion,
     /// Not a budget — the input was malformed. Kept in the same enum so every
     /// `LimitHit` has a kind and nothing has to guess.
-    #[default]
     Corrupt,
 }
 
 impl LimitHit {
+    /// Whether the stop was undecodable content rather than a resource bound —
+    /// the verdict discriminator (`true` → `Unscannable`, `false` →
+    /// `LimitsExceeded`).
+    pub fn is_corrupt(&self) -> bool {
+        matches!(self.kind, LimitKind::Corrupt)
+    }
+
     /// A resource-budget stop → `LimitsExceeded`.
     fn new(reason: String) -> Self {
         Self {
             reason,
-            corrupt: false,
             kind: LimitKind::MaxFileSize,
         }
     }
 
     /// A resource-budget stop, naming which budget it was.
     fn of_kind(kind: LimitKind, reason: String) -> Self {
-        Self {
-            reason,
-            corrupt: false,
-            kind,
-        }
+        Self { reason, kind }
     }
     /// An undecodable-content stop → `Unscannable`: malformed/truncated input, or
     /// a decoder panic contained at the extraction boundary.
     pub(crate) fn corrupt(reason: String) -> Self {
         Self {
             reason,
-            corrupt: true,
             kind: LimitKind::Corrupt,
         }
     }
 }
 
 /// One extracted member.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub name: String,
     pub data: Vec<u8>,
@@ -488,7 +493,7 @@ impl Entry {
 }
 
 /// Metadata for one archive member (no data loaded).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MemberInfo {
     pub name: String,
     pub index: usize,
@@ -533,9 +538,10 @@ pub enum Format {
     /// Apple DMG disk image (UDIF).
     Dmg,
     /// Microsoft Virtual Hard Disk (`conectix`), fixed or dynamic. The variant
-    /// is always defined (like `Iso`/`Xar`) so downstream matches stay
-    /// exhaustive regardless of which crate enabled the feature; only the
-    /// detector and extractor are gated.
+    /// is always defined (like `Iso`/`Xar`) so it can be named in any build;
+    /// only the detector and extractor are gated. Matches still need a
+    /// wildcard arm — the enum is `#[non_exhaustive]`, so no downstream match
+    /// is ever exhaustive.
     Vhd,
     /// Unix `compress` (`.Z`), LZW.
     Lzw,
@@ -1034,9 +1040,11 @@ pub fn base64_payloads(data: &[u8], cap: u64) -> Vec<Vec<u8>> {
     out
 }
 
-/// Best-effort detection of an extractable container by magic bytes. Returns
-/// `None` for content this crate can't unpack. Callers with a richer file-type
-/// classifier may map to [`Format`] themselves instead of using this.
+/// Best-effort recognition of a container by magic bytes. Detection is
+/// recognition-only: it reports what the bytes look like under the Cargo
+/// features compiled in, not what any build could extract. A format behind a
+/// disabled feature (CHM, FAT, ARC, among others) returns `None` rather than
+/// reaching extraction as `unsupported`.
 pub fn detect(data: &[u8]) -> Option<Format> {
     if data.len() >= 4 && &data[..2] == b"PK" && matches!(data[2..4], [3, 4] | [5, 6] | [7, 8]) {
         return Some(Format::Zip);
@@ -1705,7 +1713,7 @@ pub fn is_upx(data: &[u8]) -> bool {
 /// Run the PE-packer emulator over `data` and report what it did, for the
 /// `pepack_emu` example. Returns a one-line summary plus the reconstructed
 /// image when the stub produced one. Diagnostic surface only — the scan path
-/// goes through [`extract`].
+/// goes through [`extract`]; may change in any release.
 #[cfg(feature = "pe-emu")]
 #[doc(hidden)]
 pub fn emulate_pe(data: &[u8], max_ticks: u64, trace: bool) -> (String, Vec<(String, Vec<u8>)>) {
@@ -1780,6 +1788,8 @@ pub(crate) fn ratio_guard(input: u64, output: u64, budget: &Budget) -> Result<()
 ///
 /// `exav`'s `scans_its_own_source_and_binary_clean` test holds this property for
 /// the whole tree, so a literal reintroduced anywhere fails the build.
+///
+/// Test support, not part of the stable API: may change in any release.
 #[doc(hidden)]
 pub fn eicar() -> &'static [u8] {
     const REVERSED: &[u8] =
@@ -1790,6 +1800,8 @@ pub fn eicar() -> &'static [u8] {
 
 /// The byte a masked test fixture is XORed with. Any non-zero value does the
 /// job; this one is arbitrary.
+///
+/// Test support, not part of the stable API: may change in any release.
 #[doc(hidden)]
 pub const FIXTURE_MASK: u8 = 0x5A;
 
@@ -1806,6 +1818,8 @@ pub const FIXTURE_MASK: u8 = 0x5A;
 /// them in archives would make the ZIP and 7z tests depend on working ZIP and
 /// decryption support to load their own inputs — and the `--no-default-features`
 /// build has neither compiled in.
+///
+/// Test support, not part of the stable API: may change in any release.
 #[doc(hidden)]
 pub fn unmask_fixture(masked: &[u8]) -> Vec<u8> {
     masked.iter().map(|b| b ^ FIXTURE_MASK).collect()
@@ -1817,6 +1831,8 @@ pub fn unmask_fixture(masked: &[u8]) -> Vec<u8> {
 /// scanner actually reacts to have to be masked and the rest stay readable with
 /// ordinary tools. Missing-file errors name the plain path, which is the one a
 /// reader is looking for.
+///
+/// Test support, not part of the stable API: may change in any release.
 #[doc(hidden)]
 pub fn read_fixture(path: &str) -> std::io::Result<Vec<u8>> {
     let masked = format!("{path}.xor");
@@ -1829,7 +1845,7 @@ pub fn read_fixture(path: &str) -> std::io::Result<Vec<u8>> {
 /// Read up to `cap` bytes; the returned flag is true if the source had more
 /// (so the caller can treat it as exceeding the budget rather than silently
 /// truncating).
-pub fn bounded_read<R: Read>(mut r: R, cap: u64) -> Result<(Vec<u8>, bool), std::io::Error> {
+pub(crate) fn bounded_read<R: Read>(mut r: R, cap: u64) -> Result<(Vec<u8>, bool), std::io::Error> {
     let mut buf = Vec::new();
     (&mut r).take(cap.saturating_add(1)).read_to_end(&mut buf)?;
     let truncated = buf.len() as u64 > cap;
@@ -1886,6 +1902,25 @@ struct BufState {
     /// Lazily populated on first extraction. Once filled, members are yielded
     /// one at a time via `next_index`.
     cached: Option<Vec<Entry>>,
+    /// The same members as [`MemberInfo`], so `list` can hand out a slice
+    /// without re-walking. Filled together with `cached`, hence complete
+    /// whenever it is non-empty.
+    info: Vec<MemberInfo>,
+}
+
+/// The [`MemberInfo`] projection of fully-extracted members.
+fn member_infos(entries: &[Entry]) -> Vec<MemberInfo> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, e)| MemberInfo {
+            name: e.name.clone(),
+            index,
+            compressed_size: e.comp_size,
+            uncompressed_size: e.data.len() as u64,
+            encrypted: e.encrypted,
+        })
+        .collect()
 }
 
 /// An opened archive with lazy, member-by-member extraction.
@@ -2140,6 +2175,7 @@ impl<R: Read + Seek> Archive<R> {
                     state: BufState {
                         next_index: 0,
                         cached: None,
+                        info: Vec::new(),
                     },
                 },
             });
@@ -2172,6 +2208,7 @@ impl<R: Read + Seek> Archive<R> {
                 state: BufState {
                     next_index: 0,
                     cached: None,
+                    info: Vec::new(),
                 },
             },
         })
@@ -2182,9 +2219,11 @@ impl<R: Read + Seek> Archive<R> {
         self.format
     }
 
-    /// Pre-parsed member metadata.  For ZIP this is free (central directory).
-    /// For buffered formats the list is empty until the first extraction call
-    /// populates the cache.
+    /// Pre-parsed member metadata. For ZIP this is free (central directory);
+    /// for tar it comes from the headers. For lazy/buffered formats the list
+    /// is empty until the first extraction call populates the cache, after
+    /// which it reports every member (the cache always fills completely or
+    /// not at all, so a non-empty list is a complete one).
     pub fn list(&self) -> &[MemberInfo] {
         match &self.inner {
             #[cfg(feature = "zip")]
@@ -2193,8 +2232,8 @@ impl<R: Read + Seek> Archive<R> {
             ArchiveInner::Gzip { .. } => &[],
             #[cfg(feature = "tar")]
             ArchiveInner::Tar { info, .. } => info,
-            ArchiveInner::Lazy { .. } => &[],
-            ArchiveInner::Buffered { .. } => &[],
+            ArchiveInner::Lazy { state, .. } => &state.info,
+            ArchiveInner::Buffered { state, .. } => &state.info,
         }
     }
 
@@ -2289,6 +2328,7 @@ impl<R: Read + Seek> Archive<R> {
                             None
                         },
                     )?;
+                    state.info = member_infos(&entries);
                     state.cached = Some(entries);
                 }
                 let entries = state.cached.as_ref().unwrap();
@@ -2309,6 +2349,7 @@ impl<R: Read + Seek> Archive<R> {
                         entries.push(e);
                         None
                     })?;
+                    state.info = member_infos(&entries);
                     state.cached = Some(entries);
                 }
                 let entries = state.cached.as_ref().unwrap();
@@ -2415,6 +2456,7 @@ impl<R: Read + Seek> Archive<R> {
                             None
                         },
                     )?;
+                    state.info = member_infos(&entries);
                     state.cached = Some(entries);
                 }
                 let entries = state.cached.as_ref().unwrap();
@@ -2431,6 +2473,7 @@ impl<R: Read + Seek> Archive<R> {
                         entries.push(e);
                         None
                     })?;
+                    state.info = member_infos(&entries);
                     state.cached = Some(entries);
                 }
                 let entries = state.cached.as_ref().unwrap();
@@ -3147,6 +3190,59 @@ mod tests {
             names.push(e.name);
         }
         assert_eq!(names, vec!["x", "y", "z"]);
+    }
+
+    // Helper: build a GNU ar archive in memory (short `/`-terminated names).
+    fn ar_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, data) in members {
+            let mut hdr = format!("{name}/");
+            while hdr.len() < 16 {
+                hdr.push(' ');
+            }
+            out.extend_from_slice(hdr.as_bytes());
+            out.extend_from_slice(
+                format!(
+                    "{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                    0,
+                    0,
+                    0,
+                    0o100644,
+                    data.len()
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    /// A buffered format has no index, so `list` is empty on `open` — but the
+    /// first extraction call fills the whole cache, and from then on `list`
+    /// reports every member. An empty list after extraction would tell a caller
+    /// the archive holds nothing, which is the opposite of what just happened.
+    #[test]
+    fn archive_buffered_lists_members_after_first_extraction() {
+        let blob = ar_of(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        assert_eq!(detect(&blob), Some(Format::Ar));
+        let mut archive = Archive::open(Cursor::new(blob)).unwrap();
+        assert!(archive.list().is_empty(), "no index before extraction");
+
+        let mut budget = Budget::new(Limits::default());
+        let e1 = archive.extract_next(&mut budget).unwrap().unwrap();
+        assert_eq!(e1.name, "a.txt");
+
+        let names: Vec<&str> = archive.list().iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a.txt", "b.txt"],
+            "cache fills completely or not at all"
+        );
+        assert_eq!(archive.list()[1].uncompressed_size, 4);
+        assert_eq!(archive.list()[1].index, 1);
     }
 
     /// A tar's headers ARE its index, so `list` must report them.
