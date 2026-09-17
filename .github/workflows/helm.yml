@@ -1,0 +1,64 @@
+# Lint and (on version tags) publish the Helm chart.
+#
+# `lint` runs on every push/PR: it runs `ct lint`, then `make test-helm`, the
+# same render checks a contributor runs locally. `publish` runs only on `v*`
+# tags: it checks the tag against the workspace version in Cargo.toml, then
+# pushes the chart to ghcr.io as an OCI artifact. Install with:
+#   helm install exav oci://ghcr.io/sylvinus/exav-chart --version <X.Y.Z> \
+#     --set 'signatures.sources={https://mirror.example/db/}'
+name: helm
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # ct needs history to diff the target branch
+      - uses: azure/setup-helm@v5
+      - uses: helm/chart-testing-action@v2.8.0
+      - name: ct lint
+        run: ct lint --all --config .github/ct.yaml
+      - run: make test-helm
+
+  publish:
+    needs: lint
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+      - name: Verify the tag matches the workspace version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' Cargo.toml | head -n1)
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "tag version ($tag_version) does not match Cargo.toml workspace version ($cargo_version)" >&2
+            exit 1
+          fi
+          echo "CHART_VERSION=$tag_version" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | helm registry login ghcr.io --username "$GH_ACTOR" --password-stdin
+      - name: Package and push the chart
+        run: |
+          set -euo pipefail
+          v="$CHART_VERSION"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          helm package deploy/helm/exav-chart --version "$v" --app-version "$v" -d dist
+          helm push "dist/exav-chart-$v.tgz" "oci://ghcr.io/$owner"

@@ -1,0 +1,27 @@
+{{- if and .Values.signatures.persistence.enabled (not .Values.signatures.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "exav-chart.fullname" . }}
+  labels:
+    {{- include "exav-chart.labels" . | nindent 4 }}
+  {{- with .Values.signatures.persistence.annotations }}
+  annotations:
+    {{- range $k, $v := . }}
+    {{ $k | quote }}: {{ $v | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.signatures.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.signatures.persistence.size }}
+  {{- if .Values.signatures.persistence.storageClassName }}
+  {{- if eq .Values.signatures.persistence.storageClassName "-" }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ .Values.signatures.persistence.storageClassName }}
+  {{- end }}
+  {{- end }}
+{{- end }}
