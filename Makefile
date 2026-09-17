@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv av-audit publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www test-helm wasm-sizes lint fmt msrv av-audit publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -86,6 +86,12 @@ test-js:
 ##           frontmatter, sidebar entries pointing at deleted pages).
 test-www:
 	./scripts/test-www.sh
+
+## test-helm: render-check the Helm chart (render guards, hardening settings,
+##            packaging). Needs `helm` on PATH, no cluster. CI runs `ct lint`
+##            in addition. See scripts/test-helm.sh.
+test-helm:
+	./scripts/test-helm.sh
 
 ## test-wasm: run the extractor unit tests on 32-bit wasm32-wasip1 under wasmtime
 ##            (catches integer/capacity-overflow bugs a 64-bit host hides).

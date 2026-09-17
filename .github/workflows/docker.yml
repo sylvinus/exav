@@ -23,7 +23,7 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - name: Build image (amd64, load into docker)
         uses: docker/build-push-action@v6
@@ -64,7 +64,7 @@ jobs:
             arch: arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cross
         run: cargo install cross --locked
@@ -97,7 +97,7 @@ jobs:
       contents: read
       packages: write # push to ghcr.io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # No QEMU anywhere in this job: each platform build only COPYs its
       # prebuilt binary (plus mkdir/chown, pinned to the build machine in the
       # Dockerfile), so there is nothing to emulate.

@@ -1,0 +1,54 @@
+# CI render only. Do not copy into a deployment.
+replicaCount: 2
+signatures:
+  dbUrl: https://user:pass@mirror.example.invalid/db.cvd
+  persistence:
+    enabled: true
+    accessModes:
+      - ReadWriteMany
+    size: 4Gi
+icap:
+  enabled: true
+  serviceName: avscan
+spill:
+  sizeLimit: 4Gi
+  medium: Memory
+  thresholdBytes: "2G"
+  maxBytes: "3G"
+workers: "4"
+archivePasswords:
+  existingSecret: exav-archive-passwords
+networkPolicy:
+  enabled: true
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 3310
+        - protocol: TCP
+          port: 1344
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 443
+extraEnv:
+  - name: RUST_LOG
+    value: info
+extraEnvFrom:
+  - configMapRef:
+      name: exav-extra-config
+extraVolumes:
+  - name: tmp-cache
+    emptyDir: {}
+extraVolumeMounts:
+  - name: tmp-cache
+    mountPath: /var/cache/exav

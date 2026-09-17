@@ -1,0 +1,17 @@
+apiVersion: v2
+name: exav-chart
+description: A Helm chart that deploys exav, a clamd- and ICAP-compatible malware scanner.
+type: application
+version: 0.0.0
+appVersion: 0.0.0
+kubeVersion: ">=1.25.0-0"
+home: https://exav.org
+icon: https://exav.org/favicon.svg
+sources:
+  - https://github.com/sylvinus/exav
+keywords:
+  - antivirus
+  - clamav
+  - clamd
+  - icap
+  - malware

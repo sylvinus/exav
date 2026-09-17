@@ -1,0 +1,21 @@
+# CI render only. Do not copy into a deployment.
+signatures:
+  sources:
+    - https://mirror.example.invalid/db/
+  persistence:
+    enabled: true
+    accessModes:
+      - ReadWriteOnce
+    size: 2Gi
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+service:
+  type: NodePort
