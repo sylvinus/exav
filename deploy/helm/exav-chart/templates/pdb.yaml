@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "exav-chart.fullname" . }}
+  labels:
+    {{- include "exav-chart.labels" . | nindent 4 }}
+spec:
+  {{- if include "exav-chart.isSet" .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else if include "exav-chart.isSet" .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "exav-chart.selectorLabels" . | nindent 6 }}
+{{- end }}

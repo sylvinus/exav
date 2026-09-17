@@ -1,0 +1,121 @@
+---
+title: Kubernetes
+description: Run exav on Kubernetes with the official Helm chart. It creates one Deployment, one ClusterIP Service, and no bundled signatures.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The [Helm chart](https://github.com/sylvinus/exav/tree/main/deploy/helm/exav-chart)
+deploys exav as one Deployment behind one ClusterIP Service. The chart is
+`oci://ghcr.io/sylvinus/exav-chart`. It applies a hardened Pod Security
+Standard by default, and it ships with no signature source: you must set one
+before the daemon serves scans. Each resource takes the release name when
+the release name contains `exav`, otherwise it takes `<release>-exav`.
+
+This page covers the concepts. For the full list of chart values, read the
+[chart README](https://github.com/sylvinus/exav/tree/main/deploy/helm/exav-chart#readme)
+on GitHub.
+
+## Install
+
+```sh
+helm install exav oci://ghcr.io/sylvinus/exav-chart --version <X.Y.Z> \
+  --set 'signatures.sources={https://mirror.example/db/}'
+```
+
+The chart version, the app version, and the image tag all match the exav
+git tag, without the leading `v`.
+
+Test the install with a port-forward. In one terminal:
+
+```sh
+kubectl port-forward svc/exav 3310:3310
+```
+
+In another terminal, run a `PING` and a scan:
+
+```sh
+exav --ping --connect clamd://127.0.0.1:3310
+exav --connect clamd://127.0.0.1:3310 --send-as contents file.bin
+```
+
+## Signatures
+
+Set `signatures.sources` to one or more CVD mirror URLs, or set
+`signatures.dbUrl` to a prebuilt `.exavdb`. See
+[Signatures](/guides/signatures/) for the source formats, and
+[Prebuilt database](/guides/prebuilt-database/) for how to build a
+`.exavdb` and why it starts faster.
+
+Both values can carry credentials. The chart stores them in a Secret, and
+`signatures.existingSecret` lets you supply your own. Do not set
+`signatures.sources` or `signatures.dbUrl` together with
+`signatures.existingSecret`. The chart render fails.
+
+<Aside type="caution" title="No default signature source">
+exav ships no signature database and no default mirror. With no source set,
+the chart render fails. Set `signatures.allowNoDb: true` for a test only.
+That mode serves one built-in EICAR test signature.
+</Aside>
+
+## Startup and probes
+
+The chart's only probe is `/exav --ping`, an exec probe. Nothing answers on
+the clamd or ICAP port until signatures finish loading. The startup probe
+allows about 40 minutes by default, which covers the fetch and the first
+load, and the Deployment progress deadline follows the same window.
+`signatures.startupWaitSecs` applies only when no source is set and a
+sidecar fills the volume. A signature hot reload keeps the listener open, so
+it does not fail a readiness probe. The daemon replaces the workers at once,
+so a scan in flight loses its connection.
+
+## Storage
+
+By default, the chart mounts an `emptyDir`: each pod refetches signatures
+on every restart. Turn on `signatures.persistence.enabled` for a
+PersistentVolumeClaim instead. With more than one replica, the PVC needs a
+`ReadWriteMany` access mode, or chart rendering fails.
+
+## Memory and workers
+
+exav sizes each worker from the pod's cgroup memory limit. Without a memory
+limit, the Kubernetes OOM killer can kill the pod. exav then gives no
+verdict at all. With a limit, exav reports `LIMITS-EXCEEDED` instead.
+
+Always set `resources.limits.memory`. Use about `6Gi` for raw sources. Use
+about `3Gi` for a prebuilt database. Add headroom for scans in flight.
+
+Workers default to the number of available CPUs, and this count honors a
+cpu limit but not a cpu request. Set `resources.limits.cpu`, or set
+`workers` yourself, on a large node.
+
+## Security
+
+The chart runs the pod under the Pod Security Standard `restricted`
+profile: non-root uid/gid/fsGroup 65532, all capabilities dropped,
+`readOnlyRootFilesystem: true`, and no auto-mounted ServiceAccount token.
+Neither the clamd port nor the ICAP port has authentication or TLS, so
+network reachability is the whole security boundary. Use a NetworkPolicy to
+restrict which namespaces can reach the Service.
+
+## ICAP
+
+Set `icap.enabled: true` to add an ICAP listener on port 1344, next to the
+clamd listener, over the same loaded signature database. See the
+[ICAP guide](/guides/icap/) for the service names and the verdict mapping.
+
+## Upgrades
+
+To upgrade, run `helm upgrade` with the new chart version:
+
+```sh
+helm upgrade exav oci://ghcr.io/sylvinus/exav-chart --version <X.Y.Z> \
+  -f my-values.yaml
+```
+
+A `helm upgrade` that passes `-f` or `--set` replaces every value from the
+previous release, unless you add `--reuse-values`. Pass the full values file
+each time. A `RollingUpdate` starts a second pod before it stops the first
+one, so the node needs memory for two signature loads at once. When
+persistence is on without `ReadWriteMany`, the chart uses the `Recreate`
+strategy instead.

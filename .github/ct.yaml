@@ -1,0 +1,7 @@
+chart-dirs:
+  - deploy/helm
+# The chart version comes from the git tag at publish time, not from a bump
+# in each commit, so ct must not require a version increment here.
+check-version-increment: false
+validate-maintainers: false
+target-branch: main

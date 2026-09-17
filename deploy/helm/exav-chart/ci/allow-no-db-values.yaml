@@ -1,0 +1,3 @@
+# CI render only. Do not copy into a deployment.
+signatures:
+  allowNoDb: true

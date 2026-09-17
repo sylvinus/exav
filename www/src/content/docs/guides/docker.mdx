@@ -11,6 +11,8 @@ the wire: same clamd port **3310**, same `clamd` protocol. It runs the
 clamd-compatible daemon by default, so a host `clamdscan` (or any clamd client)
 pointed at the container's TCP 3310 just works.
 
+To run the image on Kubernetes, see the [Kubernetes guide](/guides/kubernetes/).
+
 It's **distroless and rootless**: a static-musl binary on `distroless/static`
 (no shell, no package manager) running as the `nonroot` user (uid 65532).
 Bind-mounted database volumes must be writable by that uid.

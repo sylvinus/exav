@@ -1,0 +1,213 @@
+# Number of pod replicas.
+replicaCount: 1
+
+image:
+  # Container image repository.
+  repository: ghcr.io/sylvinus/exav
+  # Image tag. An empty string uses .Chart.AppVersion.
+  tag: ""
+  # Image pull policy.
+  pullPolicy: IfNotPresent
+
+# List of secrets to pull the image from a private registry.
+imagePullSecrets: []
+
+# Override for the chart name part of generated resource names.
+nameOverride: ""
+
+# Override for the full generated resource name.
+fullnameOverride: ""
+
+signatures:
+  # List of raw CVD mirror URLs. Each entry becomes one EXAV_SIG_SOURCES source.
+  sources: []
+  # URL of a prebuilt signature database. Alternative to sources.
+  dbUrl: ""
+  # Name of an existing Secret with keys sig-sources and db-url. Overrides the chart Secret.
+  existingSecret: ""
+  # Allow the pod to start with no signature source. Test use only.
+  # The render fails when a source is also set.
+  allowNoDb: false
+  # Seconds between signature update checks, as a string. exav floors this
+  # at 60 s. Empty string uses the exav default: 86400 with sources, 300 with
+  # dbUrl.
+  updateIntervalSecs: ""
+  # Seconds exav waits for a sidecar to fill an empty signature directory, as
+  # a string. This applies only with no sources and no dbUrl set. Empty string
+  # uses the exav default of 1800. The chart sets 0 when allowNoDb is true.
+  startupWaitSecs: ""
+  persistence:
+    # Store signatures on a PersistentVolumeClaim instead of an emptyDir.
+    enabled: false
+    # Name of an existing PVC. Skips creation of a chart-managed PVC.
+    existingClaim: ""
+    # StorageClass for the chart-managed PVC. "" uses the cluster default class.
+    # "-" sets an empty class, to bind a pre-provisioned PV.
+    storageClassName: ""
+    # Access modes for the chart-managed PVC.
+    accessModes:
+      - ReadWriteOnce
+    # Requested size for the chart-managed PVC.
+    size: 2Gi
+    # Extra annotations for the chart-managed PVC.
+    annotations: {}
+
+archivePasswords:
+  # Name of an existing Secret that holds an archive password list file.
+  existingSecret: ""
+  # Key inside the existing Secret that holds the password list file.
+  key: passwords
+
+spill:
+  # Maximum total spill size on disk. Must match ^[0-9]+(Ki|Mi|Gi|Ti)$.
+  # exav's total spill cap equals this emptyDir limit. Only another process that fills /tmp evicts the pod.
+  # The chart derives the exav byte limit from this value by dropping the "i",
+  # so this field accepts only the Kubernetes Ki/Mi/Gi/Ti suffixes.
+  sizeLimit: 8Gi
+  # Storage medium for the spill emptyDir. Empty string uses node disk.
+  medium: ""
+  # Spill threshold size, as a string like 16M (K/M/G/T, no "i"). Empty string
+  # uses the exav default of 16M.
+  thresholdBytes: ""
+  # Maximum spill size per scan, as a string like 2G (K/M/G/T, no "i"), or 0
+  # or "off" for no cap. Empty string uses the exav default of 2G.
+  maxBytes: ""
+
+# Worker count, or "threads" for a thread pool. Empty string uses the exav default.
+workers: ""
+
+icap:
+  # Serve the ICAP protocol on port 1344, in addition to clamd.
+  enabled: false
+  # ICAP service name, mounted as a URL path under /. Empty string omits the path.
+  serviceName: ""
+
+service:
+  # Kubernetes Service type.
+  type: ClusterIP
+  # Service port for the clamd protocol.
+  clamdPort: 3310
+  # Service port for the ICAP protocol.
+  icapPort: 1344
+  # Extra annotations for the Service.
+  annotations: {}
+
+# Container resource requests and limits.
+resources: {}
+
+serviceAccount:
+  # Create a ServiceAccount for the pod.
+  create: true
+  # Name of the ServiceAccount to use. Empty string uses the generated fullname.
+  name: ""
+  # Extra annotations for the ServiceAccount.
+  annotations: {}
+
+podSecurityContext:
+  # Require the pod to run as a non-root user.
+  runAsNonRoot: true
+  # User ID to run the container process as.
+  runAsUser: 65532
+  # Group ID to run the container process as.
+  runAsGroup: 65532
+  # Group ID that owns mounted volumes.
+  fsGroup: 65532
+  seccompProfile:
+    # Seccomp profile type.
+    type: RuntimeDefault
+
+securityContext:
+  # Forbid privilege escalation from the container process.
+  allowPrivilegeEscalation: false
+  # Mount the root filesystem read-only.
+  readOnlyRootFilesystem: true
+  capabilities:
+    # Linux capabilities to drop.
+    drop:
+      - ALL
+
+probes:
+  startup:
+    # Seconds between startup probe checks.
+    periodSeconds: 10
+    # Seconds before a startup probe check times out.
+    timeoutSeconds: 5
+    # Consecutive startup probe failures before the pod is killed. Empty string computes a default from startupWaitSecs.
+    failureThreshold: ""
+  liveness:
+    # Seconds between liveness probe checks.
+    periodSeconds: 30
+    # Seconds before a liveness probe check times out.
+    timeoutSeconds: 5
+    # Consecutive liveness probe failures before the pod is restarted.
+    failureThreshold: 3
+  readiness:
+    # Seconds between readiness probe checks.
+    periodSeconds: 10
+    # Seconds before a readiness probe check times out.
+    timeoutSeconds: 5
+    # Consecutive readiness probe failures before the pod is marked not ready.
+    failureThreshold: 3
+
+# Seconds the pod gets to shut down after SIGTERM.
+terminationGracePeriodSeconds: 30
+
+# Deployment update strategy. Empty object computes a default from persistence and accessModes.
+updateStrategy: {}
+
+podDisruptionBudget:
+  # Create a PodDisruptionBudget.
+  enabled: false
+  # Minimum available pods. Set at most one of minAvailable and maxUnavailable.
+  # With replicaCount 1, minAvailable 1 blocks a node drain.
+  minAvailable: 1
+  # Maximum unavailable pods. Set at most one of minAvailable and maxUnavailable.
+  maxUnavailable: ""
+
+networkPolicy:
+  # Create a NetworkPolicy. With empty ingress and egress lists, the policy
+  # denies all traffic, including the signature download and every client.
+  # Set both lists.
+  enabled: false
+  # Policy types the NetworkPolicy applies to.
+  policyTypes:
+    - Ingress
+    - Egress
+  # Ingress rules, rendered verbatim.
+  ingress: []
+  # Egress rules, rendered verbatim.
+  egress: []
+
+# Extra annotations for the pod template.
+podAnnotations: {}
+
+# Extra labels for the pod template.
+podLabels: {}
+
+# Extra environment variables for the container.
+# The render fails for EXAV_ALLOW_SHUTDOWN and EXAV_ALLOW_HTTP_SCAN.
+extraEnv: []
+
+# Extra envFrom entries for the container.
+extraEnvFrom: []
+
+# Extra volumes for the pod.
+extraVolumes: []
+
+# Extra volume mounts for the container.
+extraVolumeMounts: []
+
+# Node selector for pod placement.
+nodeSelector: {}
+
+# Tolerations for pod placement.
+tolerations: []
+
+# Affinity rules for pod placement.
+affinity: {}
+
+# Topology spread constraints for pod placement.
+topologySpreadConstraints: []
+
+# Priority class name for the pod.
+priorityClassName: ""

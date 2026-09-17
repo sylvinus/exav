@@ -49,6 +49,7 @@ export default defineConfig({
             { label: 'Daemon mode', slug: 'guides/daemon' },
             { label: 'ICAP server', slug: 'guides/icap' },
             { label: 'Docker', slug: 'guides/docker' },
+            { label: 'Kubernetes', slug: 'guides/kubernetes' },
             { label: 'Signatures', slug: 'guides/signatures' },
             { label: 'Prebuilt database', slug: 'guides/prebuilt-database' },
             { label: 'YARA rules', slug: 'guides/yara' },

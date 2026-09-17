@@ -1,0 +1,32 @@
+{{- $startupFailureThreshold := int (include "exav-chart.startupFailureThreshold" .) -}}
+{{- $startupMinutes := div (add (mul $startupFailureThreshold (int .Values.probes.startup.periodSeconds)) 59) 60 -}}
+exav is running as {{ include "exav-chart.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Reach the clamd protocol at:
+  {{ include "exav-chart.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.clamdPort }}
+{{- if .Values.icap.enabled }}
+
+Reach the ICAP protocol at:
+  {{ include "exav-chart.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.icapPort }}
+{{- end }}
+
+The listener does not open until exav loads its signatures. Give the pod time
+before you test it: the startup window is up to {{ $startupMinutes }} minute{{ if ne $startupMinutes 1 }}s{{ end }}.
+
+Test the clamd protocol from your workstation with exav's own client. The
+daemon in the pod cannot read a path on your workstation, so send the file
+as bytes:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "exav-chart.fullname" . }} 3310:{{ .Values.service.clamdPort }}
+  exav --ping --connect clamd://127.0.0.1:3310
+  exav --connect clamd://127.0.0.1:3310 --send-as contents /path/to/file
+{{- if .Values.signatures.allowNoDb }}
+
+Warning: signatures.allowNoDb is true. This pod can start and answer scans
+with no signature database loaded. Do not use this setting in production.
+{{- end }}
+{{- if ne .Values.service.type "ClusterIP" }}
+
+Warning: service.type is {{ .Values.service.type }}. The clamd and ICAP ports
+have no authentication and no TLS. A NodePort or LoadBalancer service exposes
+them outside the cluster.
+{{- end }}
