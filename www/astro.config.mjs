@@ -142,6 +142,7 @@ export default defineConfig({
                   { label: 'Daemon mode', slug: 'scanner/guides/daemon' },
                   { label: 'ICAP server', slug: 'scanner/guides/icap' },
                   { label: 'Docker', slug: 'scanner/guides/docker' },
+                  { label: 'Kubernetes', slug: 'scanner/guides/kubernetes' },
                   { label: 'Sizing a server', slug: 'scanner/guides/sizing' },
                   { label: 'WASM sandbox', slug: 'scanner/guides/wasm-sandbox' },
                   { label: 'Migrating from ClamAV', slug: 'scanner/guides/migrating-from-clamav' },

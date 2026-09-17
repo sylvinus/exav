@@ -1,0 +1,220 @@
+{{- include "exav-chart.validate" . -}}
+{{- $startupFailureThreshold := int (include "exav-chart.startupFailureThreshold" .) -}}
+{{- $progressDeadlineSeconds := add (mul $startupFailureThreshold (int .Values.probes.startup.periodSeconds)) 60 -}}
+{{- $chartPodLabels := fromYaml (include "exav-chart.selectorLabels" .) -}}
+{{- $podLabels := merge $chartPodLabels (.Values.podLabels | default dict) -}}
+{{- $podAnnotations := .Values.podAnnotations | default dict -}}
+{{- if and (not .Values.signatures.existingSecret) (or .Values.signatures.sources .Values.signatures.dbUrl) -}}
+{{- $podAnnotations = merge (dict "checksum/secret" (include (print $.Template.BasePath "/secret.yaml") . | sha256sum)) $podAnnotations -}}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "exav-chart.fullname" . }}
+  labels:
+    {{- include "exav-chart.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  progressDeadlineSeconds: {{ $progressDeadlineSeconds }}
+  selector:
+    matchLabels:
+      {{- include "exav-chart.selectorLabels" . | nindent 6 }}
+  strategy:
+    {{- if .Values.updateStrategy }}
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+    {{- else if and .Values.signatures.persistence.enabled (not (has "ReadWriteMany" .Values.signatures.persistence.accessModes)) }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- range $k, $v := $podLabels }}
+        {{ $k | quote }}: {{ $v | quote }}
+        {{- end }}
+      {{- with $podAnnotations }}
+      annotations:
+        {{- range $k, $v := . }}
+        {{ $k | quote }}: {{ $v | quote }}
+        {{- end }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "exav-chart.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: exav
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: clamd
+              containerPort: 3310
+              protocol: TCP
+            {{- if .Values.icap.enabled }}
+            - name: icap
+              containerPort: 1344
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: EXAV_LISTEN
+              value: {{ include "exav-chart.listen" . | quote }}
+            {{- /* The image CMD also sets --auto-update; the chart must not depend on the CMD. */}}
+            - name: EXAV_AUTO_UPDATE
+              value: "1"
+            {{- if .Values.signatures.allowNoDb }}
+            - name: EXAV_ALLOW_NO_DB
+              value: "1"
+            {{- end }}
+            {{- if or (include "exav-chart.isSet" .Values.signatures.startupWaitSecs) .Values.signatures.allowNoDb }}
+            - name: EXAV_STARTUP_WAIT_SECS
+              value: {{ include "exav-chart.startupWaitSecs" . | quote }}
+            {{- end }}
+            {{- if include "exav-chart.isSet" .Values.signatures.updateIntervalSecs }}
+            - name: EXAV_UPDATE_INTERVAL_SECS
+              value: {{ .Values.signatures.updateIntervalSecs | quote }}
+            {{- end }}
+            {{- if include "exav-chart.isSet" .Values.workers }}
+            - name: EXAV_WORKERS
+              value: {{ .Values.workers | quote }}
+            {{- end }}
+            - name: EXAV_MAX_TOTAL_SPILL_BYTES
+              value: {{ .Values.spill.sizeLimit | trimSuffix "i" | quote }}
+            {{- if include "exav-chart.isSet" .Values.spill.thresholdBytes }}
+            - name: EXAV_SPILL_THRESHOLD_BYTES
+              value: {{ .Values.spill.thresholdBytes | quote }}
+            {{- end }}
+            {{- if include "exav-chart.isSet" .Values.spill.maxBytes }}
+            - name: EXAV_MAX_SPILL_BYTES
+              value: {{ .Values.spill.maxBytes | quote }}
+            {{- end }}
+            {{- if .Values.archivePasswords.existingSecret }}
+            - name: EXAV_PASSWORDS_FROM
+              value: {{ printf "/etc/exav/passwords/%s" .Values.archivePasswords.key | quote }}
+            {{- end }}
+            {{- if .Values.signatures.existingSecret }}
+            - name: EXAV_SIG_SOURCES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "exav-chart.secretName" . }}
+                  key: sig-sources
+                  optional: true
+            - name: EXAV_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "exav-chart.secretName" . }}
+                  key: db-url
+                  optional: true
+            {{- else }}
+            {{- if .Values.signatures.sources }}
+            - name: EXAV_SIG_SOURCES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "exav-chart.secretName" . }}
+                  key: sig-sources
+            {{- end }}
+            {{- if .Values.signatures.dbUrl }}
+            - name: EXAV_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "exav-chart.secretName" . }}
+                  key: db-url
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          startupProbe:
+            exec:
+              command: ["/exav", "--ping"]
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ $startupFailureThreshold }}
+          livenessProbe:
+            exec:
+              command: ["/exav", "--ping"]
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            exec:
+              command: ["/exav", "--ping"]
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/exav
+            - name: spill
+              mountPath: /tmp
+            {{- if .Values.archivePasswords.existingSecret }}
+            - name: passwords
+              mountPath: /etc/exav/passwords
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.signatures.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.signatures.persistence.existingClaim | default (include "exav-chart.fullname" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: spill
+          emptyDir:
+            sizeLimit: {{ .Values.spill.sizeLimit }}
+            {{- if .Values.spill.medium }}
+            medium: {{ .Values.spill.medium }}
+            {{- end }}
+        {{- if .Values.archivePasswords.existingSecret }}
+        - name: passwords
+          secret:
+            secretName: {{ .Values.archivePasswords.existingSecret }}
+            defaultMode: 0440
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- range $k, $v := . }}
+        {{ $k | quote }}: {{ $v | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}

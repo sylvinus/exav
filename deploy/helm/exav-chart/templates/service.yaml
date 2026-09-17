@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "exav-chart.fullname" . }}
+  labels:
+    {{- include "exav-chart.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- range $k, $v := . }}
+    {{ $k | quote }}: {{ $v | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: clamd
+      port: {{ .Values.service.clamdPort }}
+      targetPort: clamd
+      protocol: TCP
+    {{- if .Values.icap.enabled }}
+    - name: icap
+      port: {{ .Values.service.icapPort }}
+      targetPort: icap
+      protocol: TCP
+    {{- end }}
+  selector:
+    {{- include "exav-chart.selectorLabels" . | nindent 4 }}
