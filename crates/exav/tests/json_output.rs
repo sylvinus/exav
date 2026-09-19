@@ -208,3 +208,90 @@ fn profile_reports_the_same_verdict_as_a_plain_scan() {
         );
     }
 }
+
+/// A detection does not mean the search finished. In `--all-matches` the status
+/// word is `FOUND`, which cannot also say `PARTIAL`, so an incomplete search has
+/// to be reported alongside the detections instead of replacing them — on its
+/// own line in the normal grammar, and as `partial`/`partial_reasons` in JSON.
+///
+/// Before this, the all-match path discarded the outcome whenever it had
+/// detections, so a truncated scan was indistinguishable from a complete one.
+#[test]
+fn all_matches_reports_an_incomplete_search_alongside_detections() {
+    let db = TempDir::new().unwrap();
+    // `Test.Hit` is the detection. `Test.Wild` exists to burn the per-group
+    // step budget: its anchor repeats tens of thousands of times and the tail it
+    // searches for is never present, so every hit scans to the end of the file.
+    std::fs::write(
+        db.path().join("t.ndb"),
+        "Test.Hit:0:*:4558415654455354\nTest.Wild:0:*:51574552*5a584356\n",
+    )
+    .unwrap();
+    let files = TempDir::new().unwrap();
+    let sample = files.path().join("sample.bin");
+    let mut data = b"EXAVTEST".to_vec();
+    data.extend(std::iter::repeat_n(*b"QWER", 50_000).flatten());
+    std::fs::write(&sample, &data).unwrap();
+
+    let run = |cap: Option<&str>, json: bool| {
+        let mut c = exav();
+        c.arg("-d").arg(db.path()).arg("--all-matches");
+        if json {
+            c.arg("--json");
+        }
+        if let Some(cap) = cap {
+            // Forces the repeated-anchor cap to refuse the group after its first
+            // charged verify, which is what flags the search truncated.
+            c.env("EXAV_MAX_GROUP_STEPS", cap);
+        }
+        c.arg(&sample).output().expect("run exav")
+    };
+
+    // Search completes: the detection stands alone, with nothing added.
+    let out = run(None, false);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Test.Hit FOUND"), "{text}");
+    assert!(
+        !text.contains("PARTIAL"),
+        "a complete search must not be reported partial: {text}"
+    );
+    assert_eq!(out.status.code(), Some(1));
+
+    // Search truncated: the detection still stands, and the incompleteness is
+    // reported next to it in the `[reason ][CATEGORY ]STATUS` grammar.
+    let out = run(Some("1"), false);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Test.Hit FOUND"), "{text}");
+    let partial = text
+        .lines()
+        .find(|l| l.ends_with("PARTIAL"))
+        .unwrap_or_else(|| panic!("no PARTIAL line: {text}"));
+    assert!(
+        partial.ends_with("LIMITS-EXCEEDED PARTIAL"),
+        "category must precede the status word: {partial}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a confirmed detection still decides the exit code"
+    );
+
+    // Same thing in JSON, as fields rather than a second record.
+    let out = run(Some("1"), true);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(row["status"], "FOUND");
+    assert_eq!(row["partial"], true);
+    assert!(
+        row["partial_reasons"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty()),
+        "partial_reasons must name the cause: {row}"
+    );
+    // And absent, not false, when the search finished.
+    let out = run(None, true);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(row.get("partial").is_none(), "{row}");
+    assert!(row.get("partial_reasons").is_none(), "{row}");
+}

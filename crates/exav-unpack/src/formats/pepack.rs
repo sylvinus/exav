@@ -58,7 +58,7 @@ pub(crate) fn emulate_pe(
         trace,
         ..Default::default()
     };
-    let r = x86::run::unpack(data, &limits);
+    let r = crate::profile::timed("emu", data.len() as u64, || x86::run::unpack(data, &limits));
     let mut line = format!(
         "ticks={} dirty={}KiB stop={}",
         r.ticks,
@@ -825,8 +825,8 @@ pub(crate) enum Recovered<R> {
 /// Instruction budget for one stub. Runtime packers spend on the order of a
 /// hundred instructions per byte they produce, so this is what bounds the size
 /// of image the emulator can follow to completion — and what bounds the CPU a
-/// hostile file can demand. At roughly 20M ticks a second it is a few seconds
-/// in the worst case, and only for files that already look packed.
+/// hostile file can demand. At tens of millions of ticks a second it is a few
+/// seconds in the worst case, and only for files that already look packed.
 #[cfg(feature = "pe-emu")]
 const MAX_EMU_TICKS: u64 = 120_000_000;
 
@@ -870,7 +870,8 @@ pub(crate) fn emulated_unpack<R>(
         max_pages: cap.min(MAX_EMU_MEMORY) / exav_pe_emu::PAGE_SIZE,
         ..Default::default()
     };
-    let report = x86::run::unpack(data, &limits);
+    let report =
+        crate::profile::timed("emu", data.len() as u64, || x86::run::unpack(data, &limits));
 
     // Payloads the stub built in memory it allocated. Emitted whether or not it
     // also rebuilt its own image: a loader that unfolds the original program

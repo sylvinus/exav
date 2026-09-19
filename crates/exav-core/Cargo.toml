@@ -53,6 +53,9 @@ transpose = "0.2"
 # HTTP(S) range-request backend (optional)
 ureq = { version = "2", optional = true }
 daachorse = "3"
+# Anchor-frequency counting at database build: tens of millions of u64 gram
+# keys, where the hash is the whole cost of the lookup.
+rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 rmp-serde = "1.3.1"
 regex = "1.12.4"

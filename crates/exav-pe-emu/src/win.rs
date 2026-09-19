@@ -26,7 +26,7 @@
 //! that would are present so a stub gets a plausible answer, and they fail the
 //! way they would on a machine where the operation is not permitted.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::cpu::{Cpu, Stop, EAX, ESP};
 use crate::mem::{Mem, PAGE_SIZE};
@@ -707,11 +707,11 @@ pub struct Env<'a> {
     /// touches no host file: the only path that resolves is the program's own.
     file: &'a [u8],
     /// Open handles onto that file, with their read positions.
-    open_files: HashMap<u32, u32>,
+    open_files: FxHashMap<u32, u32>,
     next_handle: u32,
     /// Scratch cell handed back by the CRT's `__p__*` accessors.
     crt_cell: u32,
-    traps: HashMap<u32, Trap>,
+    traps: FxHashMap<u32, Trap>,
     /// Base address of the emulated program image (what `GetModuleHandle(NULL)`
     /// returns).
     pub image_base: u32,
@@ -723,7 +723,7 @@ pub struct Env<'a> {
     last_error: u32,
     tick: u32,
     perf: u64,
-    tls: HashMap<u32, u32>,
+    tls: FxHashMap<u32, u32>,
     tls_next: u32,
     /// Exports that were called but not implemented, for diagnostics.
     pub missing_apis: Vec<String>,
@@ -754,17 +754,17 @@ impl<'a> Env<'a> {
         let mut env = Env {
             modules: Vec::new(),
             file,
-            open_files: HashMap::new(),
+            open_files: FxHashMap::default(),
             next_handle: FILE_HANDLE_BASE,
             crt_cell: ENV_BASE + 0x100,
-            traps: HashMap::new(),
+            traps: FxHashMap::default(),
             image_base,
             heap_next: HEAP_BASE,
             allocations: Vec::new(),
             last_error: 0,
             tick: 0x0001_0000,
             perf: 0x0010_0000,
-            tls: HashMap::new(),
+            tls: FxHashMap::default(),
             tls_next: 1,
             missing_apis: Vec::new(),
             trace: false,

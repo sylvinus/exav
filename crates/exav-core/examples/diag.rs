@@ -38,6 +38,16 @@ fn main() {
     }
     eprintln!("  REAL scan (min of 5): {real_ms:.1} ms");
 
+    // Automaton pass alone (no verification), min of 3.
+    let mut ac_ms = f64::MAX;
+    let mut ac_hits = 0;
+    for _ in 0..3 {
+        let t = Instant::now();
+        ac_hits = db.engine().scan_diag_hits(&data, ft);
+        ac_ms = ac_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!("  AC pass only (min of 3): {ac_ms:.1} ms for {ac_hits} hits");
+
     let t = Instant::now();
     let d = db.engine().scan_diag(&data, ft, layout.as_ref());
     let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -65,6 +75,26 @@ fn main() {
     {
         if hits > 0 {
             eprintln!("    {len:>2}: {hits:>9} {fan:>11}");
+        }
+    }
+    let (fanout, prunable, ldbs, dead) = db.engine().scan_diag_gate(&data, ft);
+    eprintln!(
+        "  lsig anchor gate: {prunable}/{fanout} fan-out prunable ({:.1}%), {dead}/{ldbs} lsigs dead",
+        100.0 * prunable as f64 / fanout.max(1) as f64
+    );
+    eprintln!("  hottest anchors (hits x gsize = fanout | bytes):");
+    for (bytes, hits, gsize, bids) in db.engine().scan_diag_anchors(&data, ft) {
+        eprintln!(
+            "    {hits:>8} x {gsize:>4} = {:>10} | {:?}",
+            hits * gsize as u64,
+            String::from_utf8_lossy(&bytes)
+        );
+        for b in bids {
+            eprintln!(
+                "          body[{b}] = {}\n              {}",
+                db.engine().describe_body(b),
+                db.engine().describe_body_literals(b)
+            );
         }
     }
     eprintln!("  top fan-out groups (alen gsize hits fanout | best_off coverage%):");
