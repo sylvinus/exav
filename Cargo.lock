@@ -560,6 +560,7 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
  "rmp-serde",
+ "rustc-hash 2.1.2",
  "rustdct",
  "serde",
  "serde_json",
@@ -589,6 +590,7 @@ name = "exav-pe-emu"
 version = "0.0.1"
 dependencies = [
  "exav-x86",
+ "rustc-hash 2.1.2",
 ]
 
 [[package]]

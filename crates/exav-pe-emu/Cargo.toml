@@ -28,6 +28,11 @@ path = "src/main.rs"
 # scanned file supplies control flow rather than data, so the bytes reach the
 # decoder directly and in volume.
 exav-x86 = { path = "../exav-x86", version = "0.0.1" }
+# The emulator looks pages and export traps up once per executed instruction,
+# tens of millions of times per packed file. `HashMap`'s DoS-resistant hasher
+# costs more than the lookup; `FxHashMap` hashes a `u32` key in a multiply and
+# an xor. No other use in this crate needs a cryptographic hasher either.
+rustc-hash = "2"
 
 # docs.rs builds with every feature on, so the parts gated behind a feature
 # (in particular exav-core's `unstable-internals`) appear on the rendered page

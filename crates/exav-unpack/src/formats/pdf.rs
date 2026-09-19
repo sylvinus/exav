@@ -186,22 +186,26 @@ pub(crate) fn extract_pdf<R>(
             }
             let raw_len = stream_data.len() as u64;
             let cap = budget.reserve()?;
-            let (buf, truncated) = apply_filters(&stream_data, &info, cap)?;
-            if truncated {
+            let outcome = apply_filters(&stream_data, &info, cap)?;
+            if outcome.truncated {
                 return Err(LimitHit::new("pdf stream exceeds budget".to_string()));
             }
+            let buf = outcome.buf;
             ratio_guard(raw_len, buf.len() as u64, budget)?;
             budget.commit(buf.len() as u64);
-            // A stream that HAD raw bytes and decoded to nothing is content we
-            // failed to produce, not an empty object. Emitting it as a zero-byte
-            // member says "scanned, nothing there" about bytes nobody read —
-            // the silent skip this scanner exists to avoid. Say so instead.
+            // A stream whose bytes an implemented filter failed to decode is
+            // content we failed to produce, not an empty object. Emitting it
+            // as a zero-byte member says "scanned, nothing there" about bytes
+            // nobody read — the silent skip this scanner exists to avoid. Say
+            // so instead. But a stream that DECODED to empty (legal — an
+            // empty page-content stream carries no bytes to hide) is a
+            // scanned empty member, not an undecodable one.
             //
-            // The usual cause is an image codec: `apply_filters` stops at a
-            // filter it does not implement (DCTDecode, JPXDecode, CCITTFaxDecode)
-            // and passes the remainder through, which yields nothing when that
-            // filter was the only one and the caller expected decoded output.
-            let entry = if buf.is_empty() && raw_len > 0 {
+            // Image codecs (`apply_filters` stops at DCTDecode, JPXDecode,
+            // CCITTFaxDecode) pass the raw bytes through, so those streams
+            // are scanned as their raw content — the signatures match the
+            // bytes either way.
+            let entry = if buf.is_empty() && raw_len > 0 && outcome.decode_error {
                 Entry::unsupported(
                     format!("pdf-obj-{obj_id}-{gen}"),
                     raw_len,
@@ -308,68 +312,134 @@ fn harvest_inner(
     }
 }
 
+/// What decoding a stream's `/Filter` chain produced.
+struct FilterOutcome {
+    buf: Vec<u8>,
+    /// An output cap was hit: the caller should treat the stream as over budget.
+    truncated: bool,
+    /// An implemented filter failed and nothing was recovered: the caller
+    /// should report the stream undecodable rather than scan an empty buffer
+    /// as though its bytes were examined. Distinct from "decoded to empty",
+    /// which is a successful decode of an empty stream (legal — e.g. an empty
+    /// page-content stream) and must NOT be reported undecodable.
+    decode_error: bool,
+}
+
 /// Decode a stream's raw bytes by applying its `/Filter` chain left to right,
 /// honouring `/DecodeParms` (a single dict or an array aligned with the
 /// filters). FlateDecode runs on the bounded `flate2` reader; the other PDF
 /// filters use the pure decoders in [`filters`]. An unknown/unsupported filter
 /// (e.g. an image codec like DCTDecode) stops the chain and passes through
-/// whatever was decoded so far. Returns `(bytes, truncated)` where `truncated`
-/// means an output cap was hit and the caller should treat it as over budget.
+/// whatever was decoded so far.
 fn apply_filters(
     stream_data: &[u8],
     info: &HashMap<String, Primitive>,
     cap: u64,
-) -> Result<(Vec<u8>, bool), LimitHit> {
+) -> Result<FilterOutcome, LimitHit> {
     let names = filter_names(info);
     if names.is_empty() {
         let take = (stream_data.len() as u64).min(cap) as usize;
-        return Ok((stream_data[..take].to_vec(), stream_data.len() as u64 > cap));
+        return Ok(FilterOutcome {
+            buf: stream_data[..take].to_vec(),
+            truncated: stream_data.len() as u64 > cap,
+            // No decoding involved: raw bytes pass through, nothing to fail.
+            decode_error: false,
+        });
     }
     let parms = decode_parms_list(info, names.len());
     let mut buf = stream_data.to_vec();
+    // Whether an implemented filter failed with nothing recovered. Sticky
+    // across the chain: only a successful decode producing content clears the
+    // question, and the caller reports `unsupported` solely on
+    // empty-output-with-error — a valid empty decode is a scanned empty member,
+    // not an undecodable stream.
+    let mut decode_error = false;
     for (idx, name) in names.iter().enumerate() {
         let parm = parms.get(idx).copied().flatten();
-        let (out, truncated) = match name.as_str() {
+        let (out, truncated, err) = match name.as_str() {
             "FlateDecode" | "Fl" => {
-                // Salvage: keep whatever inflated before a truncation/corruption
-                // error rather than discarding the object — malware content is
-                // often in the recoverable prefix, and PDF streams are commonly
-                // truncated or patched. A leading-junk retry handles streams whose
-                // zlib header is preceded by stray bytes.
-                let (mut out, mut truncated) = bounded_read_salvage(
-                    flate2::read::ZlibDecoder::new(Cursor::new(&buf)),
-                    cap,
-                    true,
-                )
-                .unwrap_or((Vec::new(), false));
-                if out.is_empty() {
-                    if let Some(z) = buf.iter().position(|&b| b == 0x78) {
-                        let r = bounded_read_salvage(
-                            flate2::read::ZlibDecoder::new(Cursor::new(&buf[z..])),
+                // Strict first: a valid-but-empty stream must succeed (the
+                // caller emits it as a scanned empty member). Only on strict
+                // failure fall back to salvage — and only if salvage ALSO
+                // recovers nothing is the stream genuinely unreadable.
+                // Salvage still matters: malware content is often in the
+                // recoverable prefix, and PDF streams are commonly truncated
+                // or patched. A leading-junk retry handles streams whose zlib
+                // header is preceded by stray bytes.
+                match bounded_read(flate2::read::ZlibDecoder::new(Cursor::new(&buf)), cap) {
+                    Ok((out, truncated)) => (out, truncated, false),
+                    Err(_) => {
+                        let (mut out, mut truncated) = bounded_read_salvage(
+                            flate2::read::ZlibDecoder::new(Cursor::new(&buf)),
                             cap,
                             true,
                         )
                         .unwrap_or((Vec::new(), false));
-                        out = r.0;
-                        truncated = r.1;
+                        if out.is_empty() {
+                            if let Some(z) = buf.iter().position(|&b| b == 0x78) {
+                                let r = bounded_read_salvage(
+                                    flate2::read::ZlibDecoder::new(Cursor::new(&buf[z..])),
+                                    cap,
+                                    true,
+                                )
+                                .unwrap_or((Vec::new(), false));
+                                out = r.0;
+                                truncated = r.1;
+                            }
+                        }
+                        // Empty input decodes vacuously (nothing to fail on);
+                        // only non-empty input decoding to nothing is an error.
+                        let err = out.is_empty() && !buf.is_empty();
+                        (out, truncated, err)
                     }
                 }
-                (out, truncated)
             }
-            "LZWDecode" | "LZW" => filters::lzw_decode(&buf, early_change(parm), cap),
-            "ASCII85Decode" | "A85" => filters::ascii85_decode(&buf, cap),
-            "ASCIIHexDecode" | "AHx" => filters::ascii_hex_decode(&buf, cap),
-            "RunLengthDecode" | "RL" => filters::run_length_decode(&buf, cap),
-            // Unknown/unsupported filter: stop and emit what we have so far.
+            // The pure decoders report no error channel, so an empty output
+            // conservatively counts as a failure — today's behaviour,
+            // unchanged. (A valid-but-empty LZW/ASCII85 stream is legal but
+            // vanishingly rare in the wild, unlike empty Flate streams.)
+            "LZWDecode" | "LZW" => {
+                let (out, truncated) = filters::lzw_decode(&buf, early_change(parm), cap);
+                let err = out.is_empty() && !buf.is_empty();
+                (out, truncated, err)
+            }
+            "ASCII85Decode" | "A85" => {
+                let (out, truncated) = filters::ascii85_decode(&buf, cap);
+                let err = out.is_empty() && !buf.is_empty();
+                (out, truncated, err)
+            }
+            "ASCIIHexDecode" | "AHx" => {
+                let (out, truncated) = filters::ascii_hex_decode(&buf, cap);
+                let err = out.is_empty() && !buf.is_empty();
+                (out, truncated, err)
+            }
+            "RunLengthDecode" | "RL" => {
+                let (out, truncated) = filters::run_length_decode(&buf, cap);
+                let err = out.is_empty() && !buf.is_empty();
+                (out, truncated, err)
+            }
+            // Unknown/unsupported filter: stop and emit what we have so far
+            // (an image codec over raw bytes reads as the raw bytes — same as
+            // ClamAV, which matches signatures against the stream content
+            // without decoding image codecs either).
             _ => break,
         };
+        decode_error |= err;
         if truncated {
-            return Ok((out, true));
+            return Ok(FilterOutcome {
+                buf: out,
+                truncated: true,
+                decode_error,
+            });
         }
         buf = out;
     }
     let truncated = buf.len() as u64 > cap;
-    Ok((buf, truncated))
+    Ok(FilterOutcome {
+        buf,
+        truncated,
+        decode_error,
+    })
 }
 
 /// Collect the ordered list of filter names from `/Filter` (a single name or an
@@ -588,9 +658,111 @@ mod tests {
             ]),
         );
 
-        let (out, truncated) = apply_filters(&raw, &info, 1 << 20).unwrap();
-        assert!(!truncated);
-        assert_eq!(out, original);
+        let outcome = apply_filters(&raw, &info, 1 << 20).unwrap();
+        assert!(!outcome.truncated);
+        assert!(!outcome.decode_error);
+        assert_eq!(outcome.buf, original);
+    }
+
+    /// A valid-but-empty Flate stream (8 bytes of zlib wrapping zero content
+    /// bytes — common as empty page-content) decodes successfully to nothing.
+    /// It must surface as a scanned empty member, never as undecodable: the
+    /// old emptiness check reported whole benign PDFs `UNSCANNABLE` for this.
+    #[test]
+    fn empty_flate_stream_is_clean_not_undecodable() {
+        let raw = zlib_compress(b"");
+        assert!(!raw.is_empty(), "the fixture itself must carry bytes");
+        let mut info: HashMap<String, Primitive> = HashMap::new();
+        info.insert(
+            "Filter".to_string(),
+            Primitive::Name("FlateDecode".to_string()),
+        );
+        let outcome = apply_filters(&raw, &info, 1 << 20).unwrap();
+        assert!(!outcome.truncated);
+        assert!(!outcome.decode_error);
+        assert!(outcome.buf.is_empty());
+
+        // End to end: no `unsupported` member may come out of it.
+        let mut pdf = format!(
+            "%PDF-1.5\n1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            raw.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(&raw);
+        pdf.extend_from_slice(b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF");
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
+        assert!(
+            entries.iter().all(|e| e.unsupported.is_none()),
+            "a valid empty stream must not poison the verdict: {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Garbage behind `/FlateDecode` (no zlib header anywhere for the
+    /// leading-junk retry to find) recovers nothing: still `unsupported`, so a
+    /// file whose bytes are present but unread never scans as clean.
+    #[test]
+    fn corrupt_flate_stream_stays_undecodable() {
+        // No zlib header anywhere (deliberately no 0x78 byte, so even the
+        // leading-junk retry finds nothing to decode).
+        let raw = b"\x00\x01\x02\x03not zlib, nothing usable here....";
+        let mut info: HashMap<String, Primitive> = HashMap::new();
+        info.insert(
+            "Filter".to_string(),
+            Primitive::Name("FlateDecode".to_string()),
+        );
+        let outcome = apply_filters(raw, &info, 1 << 20).unwrap();
+        assert!(!outcome.truncated);
+        assert!(outcome.decode_error);
+        assert!(outcome.buf.is_empty());
+
+        let mut pdf = format!(
+            "%PDF-1.5\n1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            raw.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(raw);
+        pdf.extend_from_slice(b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF");
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.unsupported == Some("PDF stream could not be decoded")),
+            "a corrupt stream must stay surfaced: {:?}",
+            entries
+                .iter()
+                .map(|e| (&e.name, e.unsupported))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A solid-white page image (1 MB of one byte, ratio ~1000:1) is ordinary
+    /// scanner content, not a bomb: it must extract as a clean member, not
+    /// trip the compression-ratio bomb guard into `LIMITS-EXCEEDED`.
+    #[test]
+    fn blank_page_image_is_not_a_ratio_bomb() {
+        let white = vec![0xffu8; 1_030_656]; // 768x1342 grayscale, all white
+        let raw = zlib_compress(&white);
+        assert!(
+            raw.len() as u64 * 1000 < white.len() as u64,
+            "fixture must actually exceed the 1000:1 ratio"
+        );
+        let mut pdf = format!(
+            "%PDF-1.5\n1 0 obj\n<< /Type /XObject /Subtype /Image /Width 768 /Height 1342 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length {} /Filter /FlateDecode >>\nstream\n",
+            raw.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(&raw);
+        pdf.extend_from_slice(b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF");
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
+        let img = entries
+            .iter()
+            .find(|e| e.unsupported.is_none() && e.data == white)
+            .expect("the white image must come back as scanned content");
+        assert_eq!(img.data.len(), white.len());
     }
 
     /// `/DecodeParms << /EarlyChange 0 >>` is threaded to the LZW decoder.

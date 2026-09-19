@@ -3932,8 +3932,43 @@ fn scan_one_allmatch(
         exav_core::analyze_all_with_outcome(db, &data, opts)
     }));
     match found {
-        Ok((dets, _)) if !dets.is_empty() => {
+        Ok((dets, outcome)) if !dets.is_empty() => {
             totals.infected += 1;
+            // A detection does not mean the search finished. All-match exists to
+            // report everything that matched, so "here is what matched" and "we
+            // stopped early, there may be more" are different claims and the
+            // first must not silently imply the second. The no-detection arm
+            // below already turns this outcome into a verdict; with detections
+            // present the status word is FOUND, which cannot also say PARTIAL,
+            // so the incompleteness is reported alongside rather than instead.
+            //
+            // Reusing `Verdict` rather than mapping the outcome to a tag here:
+            // `status_tag`/`detail` then produce the same words as every other
+            // line, and adding a fourth partial condition cannot leave this path
+            // behind.
+            let partial = match outcome {
+                exav_core::AllMatchOutcome::Complete => None,
+                exav_core::AllMatchOutcome::LimitsExceeded(reason) => {
+                    Some(Verdict::LimitsExceeded { reason })
+                }
+                exav_core::AllMatchOutcome::Unscannable(reason) => {
+                    Some(Verdict::Unscannable { reason })
+                }
+                exav_core::AllMatchOutcome::PasswordProtected(reason) => {
+                    Some(Verdict::PasswordProtected { reason })
+                }
+            }
+            // `--partial-as ok` asked for partials to pass and `--partial-as
+            // found` for them to read as detections — which this object already
+            // is. Either way the extra line would be noise the operator asked
+            // not to get, so it is only emitted for the two statuses that mean
+            // "tell me".
+            .filter(|v| {
+                matches!(
+                    policy::current().for_tag(v.status_tag()),
+                    policy::PartialStatus::Partial | policy::PartialStatus::Error
+                )
+            });
             if cli.json {
                 let sigs: Vec<serde_json::Value> = dets
                     .iter()
@@ -3944,18 +3979,38 @@ fn scan_one_allmatch(
                 // `status` and no `category`, the shape `emit_json_result` uses:
                 // `signatures` is the plural of its `signature`, which is the
                 // one thing all-match genuinely adds.
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "file": name, "status": "FOUND", "signatures": sigs
-                    })
-                );
+                let mut obj = serde_json::Map::new();
+                obj.insert("file".into(), name.as_str().into());
+                obj.insert("status".into(), "FOUND".into());
+                obj.insert("signatures".into(), sigs.into());
+                // Absent rather than `false` when the search did finish, like
+                // `category`: a consumer reads "is this key here", never a
+                // tri-state. Plural because one object can stop short for more
+                // than one reason once the outcome carries more than one.
+                if let Some(v) = &partial {
+                    obj.insert("partial".into(), true.into());
+                    obj.insert(
+                        "partial_reasons".into(),
+                        serde_json::Value::Array(vec![v.detail().unwrap_or_default().into()]),
+                    );
+                }
+                println!("{}", serde_json::Value::Object(obj));
             } else {
                 for (sig, method) in dets {
                     outln!("{name}: {sig} FOUND");
                     if cli.verbose {
                         println!("  [method] {}", method.as_str());
                     }
+                }
+                // Same grammar as every other line: `path: [reason ][CATEGORY ]
+                // STATUS`, status word last.
+                if let Some(v) = &partial {
+                    outln!(
+                        "{name}: {} {} {}",
+                        v.detail().unwrap_or_default(),
+                        v.status_tag(),
+                        status_str(VerdictCategory::Partial, v.status_tag())
+                    );
                 }
                 if cli.bell {
                     print!("\x07");

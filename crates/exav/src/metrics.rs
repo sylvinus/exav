@@ -45,6 +45,9 @@ pub(crate) const MATCHERS: &[&str] = &[
     "bytecode",
     "static",
     "normalize",
+    "unpack",
+    "emu",
+    "filetype",
 ];
 
 /// Counters for one matcher.
@@ -76,6 +79,9 @@ const OTHER: usize = MATCHERS.len();
 // `MATCHERS`, so adding a matcher name without adding a cell fails to compile
 // rather than silently dropping that matcher's numbers.
 static MATCHER_CELLS: [MatcherCell; CELLS] = [
+    MatcherCell::new(),
+    MatcherCell::new(),
+    MatcherCell::new(),
     MatcherCell::new(),
     MatcherCell::new(),
     MatcherCell::new(),

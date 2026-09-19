@@ -346,6 +346,135 @@ pub fn scan_was_truncated() -> bool {
     SCAN_TRUNCATED.with(|c| c.get())
 }
 
+/// Cap on simulator steps drawn by one anchor group per scan (see [`GroupCost`]).
+const MAX_GROUP_STEPS: u64 = 16_000_000;
+
+/// Per-scan cap override, via `EXAV_MAX_GROUP_STEPS`. Read once.
+fn max_group_steps() -> u64 {
+    use std::sync::OnceLock;
+    static B: OnceLock<u64> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("EXAV_MAX_GROUP_STEPS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(MAX_GROUP_STEPS)
+    })
+}
+
+/// Per-scan account of simulator steps drawn per anchor group: the bound on
+/// concentrated repeated-boilerplate work.
+///
+/// One anchor shared by many bodies — a mailing-list footer, an XML boilerplate
+/// tag — can hit thousands of times per buffer, and every hit re-verifies every
+/// body in the group over overlapping suffixes. The group whose cumulative
+/// simulator draw passes the cap is skipped from then on, and the scan is
+/// flagged truncated through the same [`SCAN_TRUNCATED`] channel as pool
+/// exhaustion. A would-be `Clean` is then downgraded to `LimitsExceeded`, so
+/// the cap is never a silent clean. Note the limit of that: only the `Clean`
+/// arms consult [`scan_was_truncated`], so in `--all-matches` mode a capped
+/// group leaves no trace once some other signature has matched.
+///
+/// Keyed on cost, not hit count, deliberately: a hit count cannot tell a benign
+/// repetition from a pathological one, because the same shape produces both.
+/// Measured against a live ClamAV set, one 12 MB spreadsheet relationships part
+/// (112,084 hyperlinks) hits a single group 112,084 times, and the dearest
+/// single verify behind those anchors ran 25-35 ms — it is this cap, not the
+/// step pool, that ends that scan. The neighbouring 31 MB sheet part, with
+/// comparable hit counts but cheap bodies, finishes clean and untouched. So the
+/// discriminator has to be accumulated cost: hit counts alone rank these two
+/// the same way round.
+struct GroupCost {
+    steps: std::collections::HashMap<u64, u64>,
+    cap: u64,
+}
+
+impl GroupCost {
+    fn new(cap: u64) -> Self {
+        Self {
+            steps: std::collections::HashMap::new(),
+            cap,
+        }
+    }
+
+    /// Whether partition `pidx`'s group `value` may still verify: false once
+    /// its cumulative simulator draw passed the cap (the scan is then flagged
+    /// truncated — the search did not complete).
+    fn admit(&mut self, pidx: usize, value: u32) -> bool {
+        let key = ((pidx as u64) << 32) | value as u64;
+        if self.steps.get(&key).is_some_and(|&s| s > self.cap) {
+            SCAN_TRUNCATED.with(|c| c.set(true));
+            return false;
+        }
+        true
+    }
+
+    /// Charge simulator steps drawn (both pools — the token path draws from
+    /// exactly one of them) to partition `pidx`'s group `value`.
+    fn charge(&mut self, pidx: usize, value: u32, drawn: u64) {
+        if drawn == 0 {
+            return;
+        }
+        let key = ((pidx as u64) << 32) | value as u64;
+        *self.steps.entry(key).or_insert(0) += drawn;
+    }
+}
+
+/// Whether the build-time anchor re-pick runs, via `EXAV_ANCHOR_STATS=0`. Read
+/// once. Triage and measurement: with it off the anchors are the structural
+/// ones chosen while each body was parsed, which is what the selection did
+/// before the statistics existed. Matching is identical either way — an anchor
+/// is a prefilter and verification re-checks the whole pattern — so this
+/// changes only speed, and lets the two be compared with one binary.
+fn anchor_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("EXAV_ANCHOR_STATS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1)
+            != 0
+    })
+}
+
+/// One automaton sweep's anchor hits, in iteration order:
+/// `(partition index, anchor group value, match start)`.
+///
+/// Buffered rather than consumed inline so the logical-signature gate can run
+/// *between* the sweep and verification. The gate needs to know which anchors
+/// hit anywhere in the buffer, which is only settled once the sweep has
+/// finished — and sweeping a second time to learn it costs more than the
+/// verification it saves (the sweep is over half of a scan's work on hit-dense
+/// content). Replaying a buffer keeps the automaton pass at one, and preserves
+/// hit order exactly, so first-match semantics and the order the step pools are
+/// drawn down are unchanged.
+struct Sweep {
+    hits: Vec<(u32, u32, u32)>,
+}
+
+/// Cap on buffered anchor hits (12 bytes each, so ~48 MiB). Past it the scan
+/// drops the buffer and runs the direct inline path instead: no gate, no
+/// speedup, no growing memory — a hostile hit-dense file costs what it costs
+/// without any of this, plus the abandoned partial sweep.
+const MAX_BUFFERED_HITS: usize = 4_000_000;
+
+/// Hit count from which the gate is worth its own setup (a bitmap over every
+/// body). Below it the sweep is replayed ungated: what gating would save could
+/// not pay for zeroing the bitmap.
+const GATE_MIN_HITS: usize = 50_000;
+
+/// Buffered-hit cap override, via `EXAV_MAX_BUFFERED_HITS`. Read once.
+fn max_buffered_hits() -> usize {
+    use std::sync::OnceLock;
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("EXAV_MAX_BUFFERED_HITS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(MAX_BUFFERED_HITS)
+    })
+}
+
 thread_local! {
     /// Container types of every ancestor of the buffer being scanned, outermost
     /// first — what `Intermediates:` is evaluated against. `None` marks an
@@ -424,8 +553,16 @@ fn scan_verify_budget() -> u64 {
 
 /// Per-buffer pool for the gap-split simulator. The simulator is polynomial and
 /// FP-safe (a positive answer is always a real match), so its backstop sits far
-/// above the backtracking pool — it exists only to bound a deliberately
-/// adversarial input, and on real content is essentially never spent. Kept
+/// above the backtracking pool.
+///
+/// It is NOT only reached by adversarial input, despite what its size suggests:
+/// against a live ClamAV set an ordinary 6.7 MB spreadsheet spends it, because
+/// the 52 MB of XML it unpacks to repeats one shape often enough that short
+/// URL/email anchors hit over a hundred thousand times each. That scan reports
+/// `LimitsExceeded` rather than `Clean` — honestly, since the search really did
+/// not finish, but on a benign file. Raising this pool does not fix such a
+/// scan; it just buys more of the same work (measured: 16x the pool changed
+/// nothing, because the per-group cap ends it first). Kept
 /// separate from the backtracking pool so the (safe, cheap) simulator's generous
 /// headroom can never let the (dangerous, exponential) backtracker run longer.
 /// At the simulator's throughput this bounds a worst-case buffer to a few
@@ -542,6 +679,18 @@ enum Prefix {
     /// — and only for `Offset::Any` patterns, so the floating pattern start never
     /// needs to satisfy a fixed offset.
     Internal { anchor_idx: u32 },
+}
+
+impl Prefix {
+    /// Index into `elems` of the literal serving as the anchor. The three
+    /// variants differ in what precedes it, not in having one.
+    fn anchor_idx(&self) -> u32 {
+        match *self {
+            Prefix::Fixed { anchor_idx, .. }
+            | Prefix::Floating { anchor_idx }
+            | Prefix::Internal { anchor_idx } => anchor_idx,
+        }
+    }
 }
 
 /// Offset constraint on where the pattern start may sit. The overwhelmingly
@@ -1698,7 +1847,96 @@ impl EngineBuilder {
     /// implied by which partition a body lives in. Within a partition, identical
     /// anchors de-duplicate into one automaton pattern that fans out to every
     /// body sharing it.
+    /// Every candidate anchor literal in the database, handed to `f` once per
+    /// body that contains it. Bodies whose `elems` were dropped (a pure literal
+    /// whose anchor IS the whole pattern) still contribute: their literal is in
+    /// `anchor_buf`, and they are a large share of the set, so leaving them out
+    /// would understate how common the commonest literals are.
+    fn for_each_candidate_literal(
+        bodies: &[Body],
+        anchor_buf: &[u8],
+        anchor_ranges: &[(u32, u32)],
+        f: &mut dyn FnMut(&[u8]),
+    ) {
+        for (id, body) in bodies.iter().enumerate() {
+            match &body.elems {
+                Some(elems) => {
+                    for e in elems {
+                        if let Elem::Bytes(b) = e {
+                            if b.len() >= MIN_ANCHOR {
+                                f(b);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let (s, l) = anchor_ranges[id];
+                    f(&anchor_buf[s as usize..(s + l) as usize]);
+                }
+            }
+        }
+    }
+
+    /// Re-choose every anchor now that the whole database is known.
+    ///
+    /// A body's anchor is picked while it is parsed, when the only thing
+    /// available is the pattern itself — so the choice can only be structural
+    /// (longest, most varied run). How *selective* a literal is depends on the
+    /// rest of the set, which does not exist yet. This pass revisits the choice
+    /// with that knowledge: see [`parse::GramStats`].
+    ///
+    /// Cannot change what the engine matches. The anchor is a prefilter and
+    /// verification re-checks the entire pattern whatever triggered it, so a
+    /// different anchor changes only how often the check runs.
+    fn repick_anchors(&mut self) {
+        if !anchor_stats_enabled() {
+            return;
+        }
+        let old_buf = std::mem::take(&mut self.anchor_buf);
+        let old_ranges = std::mem::take(&mut self.anchor_ranges);
+        let bodies = &mut self.bodies;
+        let stats = parse::GramStats::build(bodies.len(), |f| {
+            Self::for_each_candidate_literal(bodies, &old_buf, &old_ranges, f)
+        });
+        let mut buf = Vec::with_capacity(old_buf.len());
+        let mut ranges = Vec::with_capacity(old_ranges.len());
+        for (id, body) in bodies.iter_mut().enumerate() {
+            let (s, l) = old_ranges[id];
+            let old_anchor = &old_buf[s as usize..(s + l) as usize];
+            // A pure literal has one candidate and it is already the anchor.
+            let anchor: &[u8] = match &body.elems {
+                None => old_anchor,
+                Some(elems) => {
+                    match parse::pick_anchor(
+                        elems,
+                        matches!(body.offset, Offset::Any),
+                        Some(&stats),
+                    ) {
+                        // `pick_anchor` succeeded once with no statistics, so a
+                        // `None` here would mean the scores changed which
+                        // candidates are admissible at all. They cannot — the
+                        // `MIN_ANCHOR` gate is on length — but keep the working
+                        // anchor rather than drop a signature if it ever did.
+                        Some(p) => match &elems[p.anchor_idx() as usize] {
+                            Elem::Bytes(b) => {
+                                body.prefix = p;
+                                b
+                            }
+                            _ => old_anchor,
+                        },
+                        None => old_anchor,
+                    }
+                }
+            };
+            ranges.push((buf.len() as u32, anchor.len() as u32));
+            buf.extend_from_slice(anchor);
+        }
+        self.anchor_buf = buf;
+        self.anchor_ranges = ranges;
+    }
+
     pub fn build_with_budget(mut self, max_build_mem: Option<u64>) -> SigEngine {
+        self.repick_anchors();
         // The double-array construction transient scales ~linearly with the
         // anchor count, at a rough `BUILD_BYTES_PER_ANCHOR`; capping anchors per
         // shard bounds that peak so a huge set (main+daily) builds on a small
@@ -1979,19 +2217,30 @@ impl SigEngine {
         ft: FileType,
         buf: &'a [u8],
         lower: &'a [u8],
-    ) -> impl Iterator<Item = (&'a DoubleArrayAhoCorasick<u32>, &'a [Vec<usize>], &'a [u8])> {
+    ) -> impl Iterator<
+        Item = (
+            usize,
+            &'a DoubleArrayAhoCorasick<u32>,
+            &'a [Vec<usize>],
+            &'a [u8],
+        ),
+    > {
         // A `Target:5` (graphics) partition is normally skipped — exav doesn't
         // model graphics as a `FileType`. But when the buffer IS an image, its
         // Target:5 signatures legitimately apply, so run those partitions too
         // (their subsignature anchors must match for an image-scoped LDB — e.g. a
         // `Win.Phishing.*` raw-image sig — to become a candidate).
+        // The yielded partition index keys the per-scan [`GroupCost`] accounts
+        // (partitions shard the automaton value space, so the value alone does
+        // not identify a group).
         let is_image = crate::fuzzy_img::looks_like_image(buf);
         self.partitions
             .iter()
-            .filter(move |p| target_ok(p.target, ft) || (p.target == 5 && is_image))
-            .map(move |p| {
+            .enumerate()
+            .filter(move |(_, p)| target_ok(p.target, ft) || (p.target == 5 && is_image))
+            .map(move |(i, p)| {
                 let hay: &[u8] = if p.nocase { lower } else { buf };
-                (&p.ac, p.groups.as_slice(), hay)
+                (i, &p.ac, p.groups.as_slice(), hay)
             })
     }
 
@@ -2097,6 +2346,30 @@ impl SigEngine {
     /// `.UNOFFICIAL` in compat mode).
     pub fn scan(&self, buf: &[u8], ft: FileType) -> Option<(String, u64, bool)> {
         self.scan_with_layout(buf, ft, None, None)
+    }
+
+    /// Describe a body's compiled pattern with its literal bytes spelled out
+    /// (diagnostic). [`describe_body`] reports literal *lengths*, which cannot
+    /// answer "is a rarer literal available to anchor on instead?" — this can.
+    pub fn describe_body_literals(&self, bid: usize) -> String {
+        let b = &self.bodies[bid];
+        let Some(elems) = &b.elems else {
+            return "<literal-only: the anchor IS the whole body>".to_string();
+        };
+        elems
+            .iter()
+            .map(|x| match x {
+                Elem::Bytes(v) => format!("{:?}", String::from_utf8_lossy(v)),
+                Elem::AnyByte => "?".to_string(),
+                Elem::HiNibble(_) | Elem::LoNibble(_) => "n".to_string(),
+                Elem::Gap { min, max } => format!("G{{{min},{max:?}}}"),
+                Elem::Alt { opts, neg } => {
+                    format!("A{}{}", if *neg { "!" } else { "" }, opts.len())
+                }
+                Elem::AltMasked { opts } => format!("Am{}", opts.len()),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Describe a body's compiled pattern (diagnostic).
@@ -2211,6 +2484,7 @@ impl SigEngine {
         let treject = 0u64;
         let (mut lit, mut tok, mut ok) = (0u64, 0u64, 0u64);
         let mut budgets = Budgets::new();
+        let mut occ = OccCache::new();
         for p in self.partitions.iter().filter(|p| target_ok(p.target, ft)) {
             let hay: &[u8] = if p.nocase { &lower } else { buf };
             for m in p.ac.find_overlapping_iter(hay) {
@@ -2229,7 +2503,7 @@ impl SigEngine {
                         tok += 1;
                     }
                     let t = std::time::Instant::now();
-                    if verify(body, buf, m.start(), layout, &lower, &mut budgets).is_some() {
+                    if verify(body, buf, m.start(), layout, &lower, &mut budgets, &mut occ).is_some() {
                         ok += 1;
                     }
                     let us = t.elapsed().as_micros() as u64;
@@ -2363,6 +2637,113 @@ impl SigEngine {
         rows
     }
 
+    /// Diagnostic: what an anchor-presence gate on logical signatures could
+    /// prune. Returns `(fanout, prunable_fanout, ldbs_touched, ldbs_prunable)`.
+    ///
+    /// A body subsignature is only worth verifying if its logical signature can
+    /// still fire; when a sibling subsig the expression requires has no anchor
+    /// hit anywhere in the buffer, its count is certainly 0 and the whole lsig
+    /// is dead. `prunable_fanout` is how many of the `(hit, body)` verifies that
+    /// would remove — the ceiling on what such a gate can save, before paying
+    /// for whatever pass computes it.
+    pub fn scan_diag_gate(&self, buf: &[u8], ft: FileType) -> (u64, u64, usize, usize) {
+        let lower = buf.to_ascii_lowercase();
+        // Pass 1: which bodies have an anchor hit anywhere.
+        let mut hit = vec![false; self.bodies.len()];
+        for (_pidx, ac, groups, hay) in self.active(ft, buf, &lower) {
+            for m in ac.find_overlapping_iter(hay) {
+                for &bid in &groups[m.value() as usize] {
+                    hit[bid] = true;
+                }
+            }
+        }
+        // Which logical sigs are still satisfiable given that.
+        let mut alive: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+        for (bid, &h) in hit.iter().enumerate() {
+            if !h {
+                continue;
+            }
+            let li = self.body_ldb[bid];
+            if li == u32::MAX {
+                continue;
+            }
+            alive.entry(li).or_insert_with(|| {
+                let ldb = &self.ldbs[li as usize];
+                let absent = |i: usize| match ldb.subs.get(i) {
+                    // Only body subsigs are decided by anchor presence; a
+                    // PCRE/bcomp/fuzzy subsig has no anchor, so it is never
+                    // "certainly absent" and must stay free.
+                    Some(SubSig::Bodies(ids)) => !ids.iter().any(|&b| hit[b]),
+                    _ => false,
+                };
+                ldb.expr.can_be_true_absent(&absent)
+            });
+        }
+        // Pass 2: count the fan-out a gate would skip.
+        let (mut fanout, mut prunable) = (0u64, 0u64);
+        for (_pidx, ac, groups, hay) in self.active(ft, buf, &lower) {
+            for m in ac.find_overlapping_iter(hay) {
+                for &bid in &groups[m.value() as usize] {
+                    fanout += 1;
+                    let li = self.body_ldb[bid];
+                    if li != u32::MAX && !alive.get(&li).copied().unwrap_or(true) {
+                        prunable += 1;
+                    }
+                }
+            }
+        }
+        let dead = alive.values().filter(|&&a| !a).count();
+        (fanout, prunable, alive.len(), dead)
+    }
+
+    /// Diagnostic: total anchor hits, running the automatons and nothing else.
+    /// Isolates the Aho-Corasick pass from the verification that follows it,
+    /// which is what says whether a scheme that trades an extra automaton pass
+    /// for fewer verifies can pay for itself.
+    pub fn scan_diag_hits(&self, buf: &[u8], ft: FileType) -> u64 {
+        let lower = buf.to_ascii_lowercase();
+        let mut n = 0u64;
+        for (_pidx, ac, _groups, hay) in self.active(ft, buf, &lower) {
+            for _m in ac.find_overlapping_iter(hay) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Diagnostic: the anchors that hit most in one scan, as `(anchor bytes,
+    /// hits, group size)`, most fan-out first. `scan_diag_groups` reports an
+    /// anchor's *length*; this reports its *bytes*, which is what shows whether
+    /// a bad prefilter is bad because it is short or because it is ubiquitous in
+    /// real content (`http`, `www.`) despite scoring well on byte variety.
+    pub fn scan_diag_anchors(
+        &self,
+        buf: &[u8],
+        ft: FileType,
+    ) -> Vec<(Vec<u8>, u64, usize, Vec<usize>)> {
+        let lower = buf.to_ascii_lowercase();
+        let mut hits: std::collections::HashMap<(usize, u32), (u64, Vec<u8>)> =
+            std::collections::HashMap::new();
+        for (pidx, ac, _groups, hay) in self.active(ft, buf, &lower) {
+            for m in ac.find_overlapping_iter(hay) {
+                let e = hits
+                    .entry((pidx, m.value()))
+                    .or_insert_with(|| (0, hay[m.start()..m.end()].to_vec()));
+                e.0 += 1;
+            }
+        }
+        let mut rows: Vec<(Vec<u8>, u64, usize, Vec<usize>)> = hits
+            .into_iter()
+            .map(|((pidx, val), (h, bytes))| {
+                let g = &self.partitions[pidx].groups[val as usize];
+                (bytes, h, g.len(), g.iter().copied().take(4).collect())
+            })
+            .collect();
+        rows.sort_by_key(|(_, h, g, _)| std::cmp::Reverse(h * *g as u64));
+        rows.truncate(25);
+        rows
+    }
+
     /// As [`scan`], with PE layout for resolving `EP`/section-relative offsets.
     /// Logical-sig indices to evaluate for a scan: those owning a matched subsig
     /// body (`touched`) plus the always-check `fires_empty` set. Sorted+deduped,
@@ -2400,6 +2781,150 @@ impl SigEngine {
         cand.dedup();
         cand
     }
+
+        /// Sweep the active automatons, buffering every hit. `None` when the
+        /// buffer cap (or a buffer too large for `u32` positions) rules it out,
+        /// which tells the caller to take the direct inline path.
+        fn sweep_hits(&self, ft: FileType, buf: &[u8], lower: &[u8]) -> Option<Sweep> {
+            if buf.len() > u32::MAX as usize {
+                return None;
+            }
+            let cap = max_buffered_hits();
+            let mut hits: Vec<(u32, u32, u32)> = Vec::new();
+            for (pidx, ac, _groups, hay) in self.active(ft, buf, lower) {
+                for m in ac.find_overlapping_iter(hay) {
+                    if hits.len() >= cap {
+                        return None;
+                    }
+                    hits.push((pidx as u32, m.value(), m.start() as u32));
+                }
+            }
+            Some(Sweep { hits })
+        }
+
+        /// Which logical signatures can still fire, indexed by ldb id, given the
+        /// anchors this sweep hit. `None` when gating is not worth setting up.
+        ///
+        /// A body subsignature is only worth verifying while its logical
+        /// signature is still satisfiable. When a subsig the expression requires
+        /// has no anchor hit anywhere in the buffer its count is certainly zero,
+        /// which can kill the whole signature — and with it every verify its
+        /// other subsigs would have drawn. On a spreadsheet relationships part
+        /// that is 86% of the fan-out; on the sheet itself, all of it.
+        ///
+        /// FN-safe: [`Node::can_be_true_absent`] only reports "impossible" when
+        /// no assignment of the free subsigs satisfies the expression, and a
+        /// subsig with no anchor (PCRE/bcomp/fuzzy) is never treated as absent.
+        fn ldb_alive(&self, sweep: &Sweep) -> Option<Vec<bool>> {
+            if self.ldbs.is_empty() || sweep.hits.len() < GATE_MIN_HITS {
+                return None;
+            }
+            let mut hit_body = vec![false; self.bodies.len()];
+            for &(pidx, value, _) in &sweep.hits {
+                for &bid in &self.partitions[pidx as usize].groups[value as usize] {
+                    hit_body[bid] = true;
+                }
+            }
+            let mut alive = vec![true; self.ldbs.len()];
+            let mut seen = vec![false; self.ldbs.len()];
+            for (bid, &h) in hit_body.iter().enumerate() {
+                if !h {
+                    continue;
+                }
+                let li = self.body_ldb[bid];
+                if li == u32::MAX || seen[li as usize] {
+                    continue;
+                }
+                seen[li as usize] = true;
+                let ldb = &self.ldbs[li as usize];
+                let absent = |i: usize| match ldb.subs.get(i) {
+                    // Only body subsigs are decided by anchor presence; one
+                    // without an anchor must stay free, never "absent".
+                    Some(SubSig::Bodies(ids)) => !ids.iter().any(|&b| hit_body[b]),
+                    _ => false,
+                };
+                alive[li as usize] = ldb.expr.can_be_true_absent(&absent);
+            }
+            Some(alive)
+        }
+
+        /// Verify every body reachable from this scan's anchor hits, in
+        /// automaton order, calling `on_match` for each one that matches.
+        /// Stops as soon as `on_match` returns `Break`.
+        ///
+        /// The one place the anchor sweep, the repeated-anchor cap, the step
+        /// pools and the logical-signature gate are applied, so the first-match,
+        /// all-match and logical-offset scans cannot drift apart.
+        fn walk_candidates<F>(
+            &self,
+            buf: &[u8],
+            ft: FileType,
+            layout: Option<&PeLayout>,
+            lower: &[u8],
+            mut on_match: F,
+        ) where
+            F: FnMut(usize, u64) -> std::ops::ControlFlow<()>,
+        {
+            let mut budgets = Budgets::new();
+            let mut occ = OccCache::new();
+            let mut group_cost = GroupCost::new(max_group_steps());
+            // Verify one body against one anchor hit, charging the group cost,
+            // and hand a match to the callback. A macro rather than a closure:
+            // `budgets`, `occ`, `group_cost` and `on_match` are all borrowed
+            // mutably here and in the loops around it.
+            macro_rules! try_body {
+                ($bid:expr, $pidx:expr, $value:expr, $start:expr) => {{
+                    let bid = $bid;
+                    let body = &self.bodies[bid];
+                    let pool_before = budgets.sim + budgets.legacy;
+                    let matched =
+                        verify(body, buf, $start, layout, lower, &mut budgets, &mut occ);
+                    group_cost.charge(
+                        $pidx,
+                        $value,
+                        pool_before - (budgets.sim + budgets.legacy),
+                    );
+                    if let Some(start) = matched {
+                        if on_match(bid, start).is_break() {
+                            return;
+                        }
+                    }
+                }};
+            }
+            match self.sweep_hits(ft, buf, lower) {
+                Some(sweep) => {
+                    let alive = self.ldb_alive(&sweep);
+                    for &(pidx, value, start) in &sweep.hits {
+                        let pidx = pidx as usize;
+                        if !group_cost.admit(pidx, value) {
+                            continue;
+                        }
+                        for &bid in &self.partitions[pidx].groups[value as usize] {
+                            if let Some(alive) = &alive {
+                                let li = self.body_ldb[bid];
+                                if li != u32::MAX && !alive[li as usize] {
+                                    continue;
+                                }
+                            }
+                            try_body!(bid, pidx, value, start as usize);
+                        }
+                    }
+                }
+                // Over the buffer cap: the direct path, exactly as before.
+                None => {
+                    for (pidx, ac, groups, hay) in self.active(ft, buf, lower) {
+                        for m in ac.find_overlapping_iter(hay) {
+                            if !group_cost.admit(pidx, m.value()) {
+                                continue;
+                            }
+                            for &bid in &groups[m.value() as usize] {
+                                try_body!(bid, pidx, m.value(), m.start());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
     /// Scan `buf`, returning the first matching signature as
     /// `(clean_name, offset, unofficial)`.
@@ -2447,34 +2972,31 @@ impl SigEngine {
         } else {
             Vec::new()
         };
-        let mut budgets = Budgets::new();
-        for (ac, groups, hay) in self.active(ft, buf, &lower) {
-            for m in ac.find_overlapping_iter(hay) {
-                let group = &groups[m.value() as usize];
-                for &bid in group {
-                    // The partition already guarantees this body's target matches
-                    // `ft`, so no per-body target check is needed here.
-                    let body = &self.bodies[bid];
-                    if let Some(start) = verify(body, buf, m.start(), layout, &lower, &mut budgets) {
-                        match &body.owner {
-                            Owner::Ndb { name, unofficial } => {
-                                return Some((name.clone(), start, *unofficial))
-                            }
-                            // counts is non-empty whenever LdbSub bodies exist.
-                            Owner::LdbSub => {
-                                if counts[bid] == 0 {
-                                    touched.push(bid);
-                                }
-                                counts[bid] = counts[bid].saturating_add(1);
-                                let s = start.min(u32::MAX as u64 - 1) as u32;
-                                if offs[bid] == u32::MAX || s < offs[bid] {
-                                    offs[bid] = s;
-                                }
-                            }
-                        }
+        // The partition already guarantees each body's target matches `ft`, so
+        // no per-body target check is needed.
+        let mut ndb_hit: Option<(String, u64, bool)> = None;
+        self.walk_candidates(buf, ft, layout, &lower, |bid, start| {
+            match &self.bodies[bid].owner {
+                Owner::Ndb { name, unofficial } => {
+                    ndb_hit = Some((name.clone(), start, *unofficial));
+                    return std::ops::ControlFlow::Break(());
+                }
+                // counts is non-empty whenever LdbSub bodies exist.
+                Owner::LdbSub => {
+                    if counts[bid] == 0 {
+                        touched.push(bid);
+                    }
+                    counts[bid] = counts[bid].saturating_add(1);
+                    let s = start.min(u32::MAX as u64 - 1) as u32;
+                    if offs[bid] == u32::MAX || s < offs[bid] {
+                        offs[bid] = s;
                     }
                 }
             }
+            std::ops::ControlFlow::Continue(())
+        });
+        if let Some(hit) = ndb_hit {
+            return Some(hit);
         }
 
         // If no subsignature matched, only logical sigs that fire on an empty
@@ -2558,34 +3080,27 @@ impl SigEngine {
         } else {
             Vec::new()
         };
-        let mut budgets = Budgets::new();
-        for (ac, groups, hay) in self.active(ft, buf, &lower) {
-            for m in ac.find_overlapping_iter(hay) {
-                for &bid in &groups[m.value() as usize] {
-                    // Partition membership implies the target match.
-                    let body = &self.bodies[bid];
-                    if let Some(start) = verify(body, buf, m.start(), layout, &lower, &mut budgets) {
-                        match &body.owner {
-                            Owner::Ndb { name, unofficial } => {
-                                if seen.insert(name.clone()) {
-                                    out.push((name.clone(), start, *unofficial));
-                                }
-                            }
-                            Owner::LdbSub => {
-                                if counts[bid] == 0 {
-                                    touched.push(bid);
-                                }
-                                counts[bid] = counts[bid].saturating_add(1);
-                                let s = start.min(u32::MAX as u64 - 1) as u32;
-                                if offs[bid] == u32::MAX || s < offs[bid] {
-                                    offs[bid] = s;
-                                }
-                            }
-                        }
+        // Partition membership implies the target match.
+        self.walk_candidates(buf, ft, layout, &lower, |bid, start| {
+            match &self.bodies[bid].owner {
+                Owner::Ndb { name, unofficial } => {
+                    if seen.insert(name.clone()) {
+                        out.push((name.clone(), start, *unofficial));
+                    }
+                }
+                Owner::LdbSub => {
+                    if counts[bid] == 0 {
+                        touched.push(bid);
+                    }
+                    counts[bid] = counts[bid].saturating_add(1);
+                    let s = start.min(u32::MAX as u64 - 1) as u32;
+                    if offs[bid] == u32::MAX || s < offs[bid] {
+                        offs[bid] = s;
                     }
                 }
             }
-        }
+            std::ops::ControlFlow::Continue(())
+        });
         let body_off = |b: usize| -> Option<u32> {
             match offs[b] {
                 u32::MAX => None,
@@ -2658,32 +3173,24 @@ impl SigEngine {
         } else {
             Vec::new()
         };
-        let mut budgets = Budgets::new();
-        for (ac, groups, hay) in self.active(ft, buf, &lower) {
-            for m in ac.find_overlapping_iter(hay) {
-                for &bid in &groups[m.value() as usize] {
-                    // Partition membership implies the target match.
-                    let body = &self.bodies[bid];
-                    if let Some(start) = verify(body, buf, m.start(), layout, &lower, &mut budgets) {
-                        if let Owner::LdbSub = &body.owner {
-                            if counts[bid] == 0 {
-                                touched.push(bid);
-                            }
-                            counts[bid] = counts[bid].saturating_add(1);
-                            // Clamp below `u32::MAX` so a real offset can never
-                            // collide with the `CLI_OFF_NONE` (`u32::MAX`)
-                            // "no match" sentinel used in `offs` (only matters
-                            // for the 4 GiB boundary, where a u32 offset is
-                            // already lossy).
-                            let s = start.min(u32::MAX as u64 - 1) as u32;
-                            if offs[bid] == u32::MAX || s < offs[bid] {
-                                offs[bid] = s;
-                            }
-                        }
-                    }
+        // Partition membership implies the target match.
+        self.walk_candidates(buf, ft, layout, &lower, |bid, start| {
+            if let Owner::LdbSub = &self.bodies[bid].owner {
+                if counts[bid] == 0 {
+                    touched.push(bid);
+                }
+                counts[bid] = counts[bid].saturating_add(1);
+                // Clamp below `u32::MAX` so a real offset can never collide
+                // with the `CLI_OFF_NONE` (`u32::MAX`) "no match" sentinel used
+                // in `offs` (only matters for the 4 GiB boundary, where a u32
+                // offset is already lossy).
+                let s = start.min(u32::MAX as u64 - 1) as u32;
+                if offs[bid] == u32::MAX || s < offs[bid] {
+                    offs[bid] = s;
                 }
             }
-        }
+            std::ops::ControlFlow::Continue(())
+        });
         let body_off = |b: usize| -> Option<u32> {
             match offs[b] {
                 u32::MAX => None,
@@ -2801,8 +3308,9 @@ fn verify(
     layout: Option<&PeLayout>,
     lower: &[u8],
     budgets: &mut Budgets,
+    occ: &mut OccCache,
 ) -> Option<u64> {
-    let start = verify_inner(body, buf, anchor_start, layout, lower, budgets)?;
+    let start = verify_inner(body, buf, anchor_start, layout, lower, budgets, occ)?;
     let Some(len) = body.fullword_len else {
         return Some(start);
     };
@@ -2828,6 +3336,7 @@ fn verify_inner(
     layout: Option<&PeLayout>,
     lower: &[u8],
     budgets: &mut Budgets,
+    occ: &mut OccCache,
 ) -> Option<u64> {
     // Pure literal: the Aho-Corasick hit is already the full match; only the
     // offset constraint remains (no backtracking, so no budget is drawn).
@@ -2862,7 +3371,7 @@ fn verify_inner(
                     SCAN_TRUNCATED.with(|c| c.set(true));
                     return None;
                 }
-                gap_split_match($toks, buf, $at, body.nocase, lower, &mut budgets.sim)
+                gap_split_match($toks, buf, $at, body.nocase, lower, &mut budgets.sim, occ)
             }};
         }
         return match body.prefix {
@@ -2901,6 +3410,7 @@ fn verify_inner(
                     body.nocase,
                     lower,
                     &mut budgets.sim,
+                    occ,
                 )
                 .filter(|&start| off_at(start))
                 .map(|start| start as u64)
@@ -3331,6 +3841,159 @@ fn coalesce(ivs: &mut Vec<(usize, usize)>) {
     ivs.truncate(w + 1);
 }
 
+/// Per-scan memo of literal-token occurrences: the fix for redundant suffix
+/// rescanning.
+///
+/// Every anchor hit re-verifies its bodies over suffixes that overlap the
+/// previous hit's almost entirely, and each `advance_literal` re-runs `memmem`
+/// over megabytes per hit — tens of thousands of times per buffer for a
+/// repeated footer anchor. The occurrence SET of a token in the buffer does not
+/// depend on the hit, so it is enumerated once per scan and every verify reads
+/// its intervals out of it with two binary searches. Same reachable sets as the
+/// direct search (overlapping enumeration, ascending order), so verdicts are
+/// unchanged — only the repeated scanning goes away.
+///
+/// Budget honesty is preserved: cached reads charge one unit per source
+/// interval plus one per occurrence emitted, exactly as the direct path does,
+/// so the per-buffer pool trips at the same verify in the same order. The one
+/// full enumeration itself is uncharged (it costs ~one direct search and is
+/// amortised over every later read).
+///
+/// Memory is bounded: past [`MAX_OCC_TOTAL`] cached positions a token falls
+/// back to the direct per-verify search, remembered so later verifies skip
+/// straight to it instead of re-enumerating just to discard the set again.
+/// Correctness is identical either way — only speed differs — so no truncation
+/// flag is involved.
+struct OccCache {
+    /// Split by case-folding rather than keyed on `(needle, nocase)`: a tuple
+    /// key has to be *built* to be looked up, so every call — cache hits
+    /// included, which is nearly all of them — allocated a `Vec` for the
+    /// needle. `Box<[u8]>` borrows as `[u8]`, so with one map per folding a hit
+    /// is a plain `get(needle)` and only a first insert allocates.
+    cs: std::collections::HashMap<Box<[u8]>, OccEntry>,
+    ci: std::collections::HashMap<Box<[u8]>, OccEntry>,
+    total: usize,
+    /// Position budget left before memoising is refused. A field rather than
+    /// the bare constant so tests can force the direct path.
+    cap: usize,
+}
+
+/// What the memo knows about one token.
+enum OccEntry {
+    /// Enumerated occurrence starts, ascending.
+    Cached(Vec<usize>),
+    /// Refused (would exceed the memory cap): direct search, immediately.
+    Failed,
+}
+
+/// Cap on cached occurrence positions per scan (~32 MB of positions).
+const MAX_OCC_TOTAL: usize = 4_000_000;
+
+/// How one `advance_literal` call should find its occurrences.
+enum OccUse<'a> {
+    /// Binary-search reads on the memoised sorted set.
+    Cached(&'a [usize]),
+    /// The direct per-interval `memmem` search.
+    Direct,
+}
+
+impl OccCache {
+    fn new() -> Self {
+        Self::with_cap(MAX_OCC_TOTAL)
+    }
+
+    /// A memo allowed `cap` cached positions. `0` refuses every token, forcing
+    /// the direct search — which is how the differential tests reach that path
+    /// on the small buffers they generate.
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            cs: std::collections::HashMap::new(),
+            ci: std::collections::HashMap::new(),
+            total: 0,
+            cap,
+        }
+    }
+
+    /// How to find `needle`'s occurrences: the memoised sorted set when the
+    /// token was seen before, else a first full enumeration (later uses read).
+    fn occurrences(
+        &mut self,
+        buf: &[u8],
+        lower: &[u8],
+        needle: &[u8],
+        nocase: bool,
+    ) -> OccUse<'_> {
+        if self.cap == 0 {
+            return OccUse::Direct;
+        }
+        let map = if nocase { &mut self.ci } else { &mut self.cs };
+        // Looked up by borrowed slice, so a hit allocates nothing.
+        if !map.contains_key(needle) {
+            // Bounded by what is left of the budget, so the vector that the cap
+            // exists to bound cannot be built oversized first and measured
+            // after: a single-byte token on a 256 MB buffer would have
+            // allocated gigabytes only to be thrown away.
+            let room = self.cap - self.total;
+            let entry = match Self::enumerate(buf, lower, needle, nocase, room) {
+                Some(v) => {
+                    self.total += v.len();
+                    OccEntry::Cached(v)
+                }
+                None => OccEntry::Failed,
+            };
+            let map = if nocase { &mut self.ci } else { &mut self.cs };
+            map.insert(needle.into(), entry);
+        }
+        let map = if nocase { &self.ci } else { &self.cs };
+        match map.get(needle) {
+            Some(OccEntry::Cached(v)) => OccUse::Cached(v),
+            _ => OccUse::Direct,
+        }
+    }
+
+    /// Every (overlapping) occurrence start of `needle` in the haystack
+    /// (`lower` when `nocase` — same length, so positions line up with `buf`),
+    /// ascending: the same set the direct per-interval search admits, so
+    /// memoised reads stay exact.
+    ///
+    /// `None` as soon as more than `room` positions exist, abandoning the work
+    /// rather than completing a set that would be refused anyway.
+    fn enumerate(
+        buf: &[u8],
+        lower: &[u8],
+        needle: &[u8],
+        nocase: bool,
+        room: usize,
+    ) -> Option<Vec<usize>> {
+        let n = buf.len();
+        let l = needle.len();
+        let haystack: &[u8] = if nocase { lower } else { buf };
+        let folded;
+        let pat: &[u8] = if nocase {
+            folded = needle.to_ascii_lowercase();
+            &folded
+        } else {
+            needle
+        };
+        let mut v = Vec::new();
+        let mut s = 0usize;
+        while s + l <= n {
+            match memchr::memmem::find(&haystack[s..], pat) {
+                Some(off) => {
+                    let q = s + off;
+                    if v.len() == room {
+                        return None;
+                    }
+                    v.push(q);
+                    s = q + 1;
+                }
+                None => break,
+            }
+        }
+        Some(v)
+    }
+}
+
 /// Advance a reachable set across a literal `needle` (length ≥ 1): for every
 /// start position `q` in the set with `buf[q..q+L] == needle` (ASCII-folded when
 /// `nocase`), the position `q+L` is reachable next. `nocase` searches the
@@ -3338,6 +4001,12 @@ fn coalesce(ivs: &mut Vec<(usize, usize)>) {
 /// budget unit per source interval plus one per occurrence found; on exhaustion
 /// it flags truncation and returns whatever was found so the scan is never a
 /// silent clean.
+///
+/// Occurrences come from the per-scan [`OccCache`] (one full enumeration per
+/// token per scan, then binary-search reads) rather than a fresh `memmem` per
+/// interval, which is what made repeated-anchor verifies rescan the same
+/// suffixes thousands of times.
+#[allow(clippy::too_many_arguments)]
 fn advance_literal(
     cur: &[(usize, usize)],
     buf: &[u8],
@@ -3346,6 +4015,7 @@ fn advance_literal(
     nocase: bool,
     out: &mut Vec<(usize, usize)>,
     budget: &mut u64,
+    occ: &mut OccCache,
 ) {
     let n = buf.len();
     let l = needle.len();
@@ -3353,6 +4023,34 @@ fn advance_literal(
         return;
     }
     let last_start = n - l; // greatest position a length-l needle can start at
+    if let OccUse::Cached(all) = occ.occurrences(buf, lower, needle, nocase) {
+        for &(lo, hi) in cur {
+            if lo > last_start {
+                continue;
+            }
+            if *budget == 0 {
+                SCAN_TRUNCATED.with(|c| c.set(true));
+                return;
+            }
+            *budget -= 1;
+            let qmax = hi.min(last_start);
+            // Occurrences in `[lo, qmax]`, by binary search on the memoised
+            // sorted set. Ascending, so `out` keeps the order the direct
+            // enumeration produced (matters only for determinism of downstream
+            // first-match offsets, which read minima).
+            let js = all.partition_point(|&q| q < lo);
+            let je = all.partition_point(|&q| q <= qmax);
+            for &q in &all[js..je] {
+                out.push((q + l, q + l));
+                if *budget == 0 {
+                    SCAN_TRUNCATED.with(|c| c.set(true));
+                    return;
+                }
+                *budget -= 1;
+            }
+        }
+        return;
+    }
     let (hay, folded);
     if nocase {
         folded = needle.to_ascii_lowercase();
@@ -3601,6 +4299,7 @@ fn gap_split_match(
     nocase: bool,
     lower: &[u8],
     budget: &mut u64,
+    occ: &mut OccCache,
 ) -> bool {
     let mut cur: Vec<(usize, usize)> = vec![(pos, pos)];
     let mut next: Vec<(usize, usize)> = Vec::new();
@@ -3615,7 +4314,7 @@ fn gap_split_match(
         match tok {
             Elem::Bytes(b) => {
                 next.clear();
-                advance_literal(&cur, buf, lower, b, nocase, &mut next, budget);
+                advance_literal(&cur, buf, lower, b, nocase, &mut next, budget, occ);
                 coalesce(&mut next);
                 std::mem::swap(&mut cur, &mut next);
             }
@@ -3629,7 +4328,7 @@ fn gap_split_match(
                     if o.is_empty() {
                         next.extend_from_slice(&cur);
                     } else {
-                        advance_literal(&cur, buf, lower, o, nocase, &mut next, budget);
+                        advance_literal(&cur, buf, lower, o, nocase, &mut next, budget, occ);
                     }
                 }
                 coalesce(&mut next);
@@ -3727,6 +4426,7 @@ fn gap_split_match_backward(
     nocase: bool,
     lower: &[u8],
     budget: &mut u64,
+    occ: &mut OccCache,
 ) -> Option<usize> {
     if toks.is_empty() {
         return Some(end); // no preceding context: the pattern starts at `end`
@@ -3752,7 +4452,7 @@ fn gap_split_match_backward(
         let mut next = Vec::new();
         match tok {
             Elem::Bytes(b) => {
-                advance_literal(cur, buf, lower, b, nocase, &mut next, budget);
+                advance_literal(cur, buf, lower, b, nocase, &mut next, budget, occ);
                 coalesce(&mut next);
             }
             Elem::Alt { opts, neg: false } => {
@@ -3760,7 +4460,7 @@ fn gap_split_match_backward(
                     if o.is_empty() {
                         next.extend_from_slice(cur);
                     } else {
-                        advance_literal(cur, buf, lower, o, nocase, &mut next, budget);
+                        advance_literal(cur, buf, lower, o, nocase, &mut next, budget, occ);
                     }
                 }
                 coalesce(&mut next);
@@ -4668,6 +5368,132 @@ mod tests {
         let _ = b.build(); // must not panic
     }
 
+    /// A shorter but rare literal must outrank a longer ubiquitous one, and
+    /// `pick_anchor` must actually anchor on it.
+    ///
+    /// The pair is real. `"http://" {7-15} ":7878"` is a live signature, and a
+    /// 12 MB spreadsheet relationships part drove its `"http://"` anchor to
+    /// 61,489 hits while `":7878"` occurs in it zero times. Length-only ranking
+    /// picks `"http://"`; a live main+daily set has it in 9,225 bodies against
+    /// 1 for `":7878"`, which is what makes the right choice visible without
+    /// any reference corpus.
+    #[test]
+    fn a_rare_literal_outranks_a_popular_one() {
+        use super::parse::{anchor_score, pick_anchor, GramStats};
+        // Each call is one body. The proportions are what the real set looks
+        // like: a literal hundreds of signatures are built around, against one
+        // that appears in a single signature.
+        let stats = GramStats::build(500, |f| {
+            for _ in 0..500 {
+                f(b"http://");
+            }
+            f(b":7878");
+        });
+        let (rare, popular) = (
+            anchor_score(b":7878", Some(&stats)),
+            anchor_score(b"http://", Some(&stats)),
+        );
+        assert!(rare > popular, "\":7878\" ({rare}) must beat \"http://\" ({popular})");
+
+        // With no statistics — which is the state while a body is first parsed
+        // — the ranking is the original length order, so the build-time re-pick
+        // is doing real work rather than confirming a choice already made.
+        assert!(anchor_score(b":7878", None) < anchor_score(b"http://", None));
+
+        // A literal no signature shares keeps scoring its length, so ordinary
+        // binary patterns are untouched.
+        assert_eq!(anchor_score(b"\x9a\x3f\xe1\x07\xb2", Some(&stats)), 5);
+
+        // End to end: the anchor moves past the gap onto the rare literal.
+        let elems = vec![
+            Elem::Bytes(b"http://".to_vec()),
+            Elem::Gap {
+                min: 7,
+                max: Some(15),
+            },
+            Elem::Bytes(b":7878".to_vec()),
+        ];
+        assert!(
+            matches!(
+                pick_anchor(&elems, true, Some(&stats)),
+                Some(Prefix::Internal { anchor_idx: 2 })
+            ),
+            "must anchor past the gap on the rare literal, got {:?}",
+            pick_anchor(&elems, true, Some(&stats))
+        );
+    }
+
+    /// Grams in a single body are dropped to keep the counting map small; that
+    /// must not change any score, since `log2(1)` is already zero.
+    #[test]
+    fn single_body_grams_cost_nothing() {
+        use super::parse::{anchor_score, GramStats};
+        let stats = GramStats::build(2, |f| {
+            f(b"ONLYONCE");
+            f(b"ALSOONCE");
+        });
+        assert_eq!(anchor_score(b"ONLYONCE", Some(&stats)), 8);
+        assert_eq!(anchor_score(b"ONLYONCE", None), 8);
+    }
+
+    /// A short literal must be charged for every body that CONTAINS it, not
+    /// only for bodies that are exactly it.
+    ///
+    /// Regression. Counting credited each literal only at the window width its
+    /// own lookup would use, so the 2-gram `"//"` was counted from two-byte
+    /// literals alone — a handful — while the tens of thousands of longer
+    /// literals containing it credited nothing. `"//"` then scored as rare,
+    /// beat the correctly-penalised `"http://"`, and anchors migrated onto the
+    /// most common fragments in the set: measured, +84% token verifies on one
+    /// spreadsheet part, with `"://"` and `"htt"` becoming hot anchors.
+    #[test]
+    fn a_short_literal_is_charged_for_every_body_containing_it() {
+        use super::parse::{anchor_score, GramStats};
+        // No body IS "//" or "://" — they only ever appear inside a longer one.
+        let stats = GramStats::build(500, |f| {
+            for _ in 0..500 {
+                f(b"http://example");
+            }
+        });
+        for frag in [&b"//"[..], b"://", b"htt"] {
+            assert!(
+                anchor_score(frag, Some(&stats)) < anchor_score(b"http://", Some(&stats)),
+                "{:?} must not outrank the literal it is a fragment of ({} vs {})",
+                String::from_utf8_lossy(frag),
+                anchor_score(frag, Some(&stats)),
+                anchor_score(b"http://", Some(&stats))
+            );
+        }
+    }
+
+    /// The repeat filter is an optimisation, so it must not change an answer.
+    /// Same literals through both paths — the exact single pass a small build
+    /// takes, and the filtered two-pass a full database takes — must score
+    /// identically.
+    #[test]
+    fn the_repeat_filter_changes_no_score() {
+        use super::parse::{anchor_score, GramStats, FILTER_MIN_BODIES};
+        let feed = |f: &mut dyn FnMut(&[u8])| {
+            for _ in 0..300 {
+                f(b"POPULAR!");
+            }
+            for _ in 0..7 {
+                f(b"UNCOMMON");
+            }
+            f(b"SINGLETON");
+        };
+        let exact = GramStats::build(1, feed);
+        let filtered = GramStats::build(FILTER_MIN_BODIES, feed);
+        for lit in [&b"POPULAR!"[..], b"UNCOMMON", b"SINGLETON", b"ABSENT!!"] {
+            assert_eq!(
+                anchor_score(lit, Some(&exact)),
+                anchor_score(lit, Some(&filtered)),
+                "paths disagree on {:?}",
+                String::from_utf8_lossy(lit)
+            );
+        }
+    }
+
     // --- gap-split matcher equivalence -------------------------------------
 
     /// Reference present/absent oracle: a straightforward recursive matcher that
@@ -4833,12 +5659,23 @@ mod tests {
             let lower = buf.to_ascii_lowercase();
 
             let want = bt_match(&toks, &buf, pos, nocase);
+            // Both occurrence paths, every case. These buffers are far too
+            // small to ever exhaust the real memo budget, so with only
+            // `OccCache::new()` the direct search — the path a large buffer
+            // takes once a token blows the position cap — went unexercised
+            // here, and a divergence in it would have passed silently.
+            for cap in [MAX_OCC_TOTAL, 0] {
+                let mut b2 = u64::MAX;
+                let mut occ = OccCache::with_cap(cap);
+                let got = gap_split_match(&toks, &buf, pos, nocase, &lower, &mut b2, &mut occ);
+                assert_eq!(
+                    want, got,
+                    "gap-split wrong (occ cap {cap}): toks={toks:?} buf={buf:?} pos={pos} nocase={nocase}"
+                );
+            }
             let mut b2 = u64::MAX;
-            let got = gap_split_match(&toks, &buf, pos, nocase, &lower, &mut b2);
-            assert_eq!(
-                want, got,
-                "gap-split wrong: toks={toks:?} buf={buf:?} pos={pos} nocase={nocase}"
-            );
+            let mut occ = OccCache::new();
+            let got = gap_split_match(&toks, &buf, pos, nocase, &lower, &mut b2, &mut occ);
             // The legacy walk must never find a match the split path misses.
             let mut b1 = u64::MAX;
             if match_forward(&toks, &buf, pos, nocase, &mut b1) {
@@ -4868,8 +5705,21 @@ mod tests {
 
             let mut b1 = u64::MAX;
             let want = match_backward(&toks, &buf, end, nocase, &mut b1);
+            // Memoised and direct occurrence paths alike — see the forward test.
+            for cap in [MAX_OCC_TOTAL, 0] {
+                let mut b2 = u64::MAX;
+                let mut occ = OccCache::with_cap(cap);
+                let got =
+                    gap_split_match_backward(&toks, &buf, end, nocase, &lower, &mut b2, &mut occ);
+                assert_eq!(
+                    want, got,
+                    "backward split wrong (occ cap {cap}): toks={toks:?} buf={buf:?} end={end} nocase={nocase}"
+                );
+            }
             let mut b2 = u64::MAX;
-            let got = gap_split_match_backward(&toks, &buf, end, nocase, &lower, &mut b2);
+            let mut occ = OccCache::new();
+            let got =
+                gap_split_match_backward(&toks, &buf, end, nocase, &lower, &mut b2, &mut occ);
             assert_eq!(
                 want, got,
                 "backward split wrong: toks={toks:?} buf={buf:?} end={end} nocase={nocase}"
@@ -4899,8 +5749,9 @@ mod tests {
         ];
         let lower = buf.to_ascii_lowercase();
         let mut b = u64::MAX;
+        let mut occ = OccCache::new();
         assert_eq!(
-            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut b),
+            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut b, &mut occ),
             Some(4),
             "must return the start the backtracker returns (shortest gap first)"
         );
@@ -4939,8 +5790,9 @@ mod tests {
         // Simulator: a real "no match", with the budget barely touched.
         reset_scan_truncated();
         let mut sim = VERIFY_BUDGET;
+        let mut occ = OccCache::new();
         assert_eq!(
-            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut sim),
+            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut sim, &mut occ),
             None
         );
         assert!(!scan_was_truncated(), "must not report an incomplete search");
@@ -4964,7 +5816,9 @@ mod tests {
         ];
         let lower = buf.to_ascii_lowercase();
         let mut budget = 5_000_000u64;
-        let got = gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut budget);
+        let mut occ = OccCache::new();
+        let got =
+            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut budget, &mut occ);
         assert!(got.is_some(), "must find the match");
         assert!(!scan_was_truncated(), "must not report truncation");
     }
@@ -4976,7 +5830,8 @@ mod tests {
         let check = |toks: &[Elem], buf: &[u8], pos: usize, nocase: bool| -> bool {
             let lower = buf.to_ascii_lowercase();
             let mut b = u64::MAX;
-            gap_split_match(toks, buf, pos, nocase, &lower, &mut b)
+            let mut occ = OccCache::new();
+            gap_split_match(toks, buf, pos, nocase, &lower, &mut b, &mut occ)
         };
         // Unbounded gap between two literals.
         let t = vec![
@@ -5049,5 +5904,34 @@ mod tests {
             internal.scan(&buf, FileType::Unknown).map(|(_, o, _)| o),
             Some(1)
         );
+    }
+
+    #[test]
+    fn group_cost_caps_concentrated_draw_and_flags_truncation() {
+        // The flag is thread-local and test threads are reused: leave it as
+        // found so no other test observes a truncation it did not cause.
+        reset_scan_truncated();
+        let mut g = GroupCost::new(100);
+        // Cheap verifies never trip the cap, however many run.
+        for _ in 0..10_000 {
+            assert!(g.admit(0, 7));
+            g.charge(0, 7, 0);
+        }
+        assert!(!scan_was_truncated(), "zero-draw groups must not interact");
+        // One group drawing past the cap is refused from then on.
+        g.charge(0, 7, 60);
+        assert!(g.admit(0, 7));
+        g.charge(0, 7, 50);
+        assert!(!g.admit(0, 7), "110 drawn past a cap of 100 trips it");
+        assert!(scan_was_truncated(), "tripping the cap is an incomplete search");
+        // A different group — or the same value in another partition — is
+        // unaffected: the cap bounds concentrated cost, not total work.
+        reset_scan_truncated();
+        let mut g = GroupCost::new(10);
+        g.charge(0, 7, 11);
+        assert!(g.admit(0, 8));
+        assert!(g.admit(1, 7));
+        assert!(!scan_was_truncated(), "distinct groups must not interact");
+        reset_scan_truncated();
     }
 }

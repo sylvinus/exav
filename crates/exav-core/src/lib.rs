@@ -105,6 +105,48 @@ use ml::Model;
 use patterns::PatternSet;
 use unpack::Budget;
 
+/// Smallest object a whole-file hash signature (`.hdb`/`.hsb`) may be matched
+/// against.
+///
+/// ClamAV refuses to scan any object of 5 bytes or fewer at all — `fmap->len <=
+/// 5` in `cli_magic_scan` and its four sibling entry points (libclamav
+/// `scanners.c`, checked against 1.4.3) — so every hash signature it ships with
+/// a smaller declared size is unreachable in ClamAV, standalone file or nested
+/// layer alike. Six such signatures exist in a current main+daily set.
+///
+/// exav extracts more aggressively and had no such floor, which turned those
+/// six pieces of auto-generated junk into live detections. Measured against
+/// ClamAV 1.4.3 on the same inputs, which reports OK for both:
+///
+///   * a 1-byte file holding `V` matched `Win.Trojan.Agent-1720205`;
+///   * the 2 bytes `\x00\x00` that a benign PDF's 2x2 image XObject decodes to
+///     matched `Win.Malware.Agent-7761897-0`.
+///
+/// Note where this does NOT apply: the allow-list (`.fp`/`.sfp`) is matched
+/// with the same machinery but must stay unfloored, since a suppression that
+/// silently stopped working would cause exactly the false positives this
+/// prevents.
+///
+/// Deliberately a bound on hash *matching*, not on scanning: a short object is
+/// still extracted, still pattern-matched, still counted. Only the claim "this
+/// hash identifies a file" is refused for something too small to be one. No
+/// detection is lost, because every signature below the floor is one ClamAV
+/// itself can never fire, so nothing can depend on it.
+/// What a scan reports when a per-buffer bound — the step pool, or the
+/// repeated-anchor cap — ended the signature search before it finished.
+///
+/// Shared by the single-verdict and all-match paths so the two cannot drift
+/// apart in what they call the same condition.
+const SEARCH_INCOMPLETE: &str = "scan budget exhausted — signature search incomplete";
+
+const MIN_HASH_MATCH_BYTES: u64 = 6;
+
+/// Whether a whole-file hash signature may be matched against an object of
+/// this size. See [`MIN_HASH_MATCH_BYTES`].
+fn hash_matchable(size: u64) -> bool {
+    size >= MIN_HASH_MATCH_BYTES
+}
+
 /// Map a detected [`FileType`] to the extraction [`unpack::Format`], or `None`
 /// if the type isn't an extractable container.
 fn unpack_format(ft: FileType) -> Option<unpack::Format> {
@@ -992,6 +1034,10 @@ impl Scanner {
     /// loaded `.ftm` magic rules only when content detection is inconclusive
     /// (`Unknown`), so native typing is never overridden.
     pub fn identify(&self, data: &[u8]) -> FileType {
+        profile::timed("filetype", data.len() as u64, || self.identify_inner(data))
+    }
+
+    fn identify_inner(&self, data: &[u8]) -> FileType {
         let mut ft = filetype::identify(data);
         if ft == FileType::Unknown {
             if let Some(f) = self.ftm.identify(data) {
@@ -1205,7 +1251,9 @@ fn peek_type(file: &File) -> io::Result<FileType> {
     let n = fill_prefix(&mut r, &mut prefix)?;
     let mut s = file;
     s.seek(SeekFrom::Start(0))?;
-    Ok(filetype::identify(&prefix[..n]))
+    Ok(profile::timed("filetype", n as u64, || {
+        filetype::identify(&prefix[..n])
+    }))
 }
 
 /// Scan a sequential stream (Stream mode): stdin, pipes, S3 streaming GET.
@@ -1350,7 +1398,7 @@ pub fn scan_seekable<R: Read + Seek>(
     let mut prefix = [0u8; 4096];
     let n = fill_prefix(&mut reader, &mut prefix)?;
     reader.seek(SeekFrom::Start(0))?;
-    let ft = filetype::identify(&prefix[..n]);
+    let ft = profile::timed("filetype", n as u64, || filetype::identify(&prefix[..n]));
 
     // Natively-streaming containers (ZIP/tar/gzip) are walked member-by-member
     // off the seekable source — the whole container is never buffered and no
@@ -2042,7 +2090,9 @@ fn scan_streamed_container<R: Read + Seek>(
                 None => None,
             }
         };
-        unpack::stream_members(fmt, reader, budget, &mut visit)
+        profile::timed("unpack", container_size, || {
+            unpack::stream_members(fmt, reader, budget, &mut visit)
+        })
     };
     // Reassembly happens only now. Nothing in a byte-split set's names says how
     // many parts it has, so `.001`+`.002` looks contiguous even when `.003`
@@ -2269,10 +2319,11 @@ fn analyze_inner(db: &Scanner, data: &[u8], opts: &ScanOptions) -> ScanReport {
         DeepOutcome::Unscannable(reason) => ScanReport::unscannable(reason, findings),
         DeepOutcome::PasswordProtected(reason) => ScanReport::password_protected(reason, findings),
         // Cardinal rule: a would-be `Clean` is downgraded to `LimitsExceeded` if
-        // any wildcard verification was skipped because its per-buffer step budget
-        // ran out — the search did not fully complete, so we must not report `OK`.
+        // any wildcard verification was skipped because a per-buffer scan bound
+        // ran out (the step pool or the repeated-anchor cap) — the search did
+        // not fully complete, so we must not report `OK`.
         DeepOutcome::Clean if engine::scan_was_truncated() => ScanReport::limits(
-            "verify step budget exhausted — signature search incomplete".into(),
+            SEARCH_INCOMPLETE.into(),
             findings,
         ),
         DeepOutcome::Clean => ScanReport::clean(findings),
@@ -2298,10 +2349,10 @@ fn report_of_outcome(
         DeepOutcome::Unscannable(reason) => ScanReport::unscannable(reason, findings),
         DeepOutcome::PasswordProtected(reason) => ScanReport::password_protected(reason, findings),
         // A would-be `Clean` is downgraded when wildcard verification ran out of
-        // its per-buffer step budget: the search did not complete, so `OK` would
+        // its per-buffer scan bounds: the search did not complete, so `OK` would
         // be a claim the scan cannot support.
         DeepOutcome::Clean if engine::scan_was_truncated() => ScanReport::limits(
-            "verify step budget exhausted — signature search incomplete".into(),
+            SEARCH_INCOMPLETE.into(),
             findings,
         ),
         DeepOutcome::Clean => ScanReport::clean(findings),
@@ -2365,11 +2416,24 @@ pub fn analyze_all_with_outcome(
     data: &[u8],
     opts: &ScanOptions,
 ) -> (Vec<(String, Method)>, AllMatchOutcome) {
+    // The flag is thread-local and sticky, so it has to be cleared per scan the
+    // way `analyze` clears it. Before this function read it the omission was
+    // invisible; with the read below, a stale `true` from an earlier scan on
+    // this thread would report a complete search as truncated.
+    engine::reset_scan_truncated();
     let (names, outcome) = analyze_all_raw(db, data, opts);
     let outcome = match outcome {
         Some(DeepOutcome::Limits(r)) => AllMatchOutcome::LimitsExceeded(r),
         Some(DeepOutcome::Unscannable(r)) => AllMatchOutcome::Unscannable(r),
         Some(DeepOutcome::PasswordProtected(r)) => AllMatchOutcome::PasswordProtected(r),
+        // The same cardinal rule the single-verdict paths apply, which this one
+        // was missing: a search that did not finish must not be presented as a
+        // complete one. There it downgrades a would-be `Clean`; here there is no
+        // verdict to downgrade — the detections stand — so it becomes the
+        // outcome that travels alongside them, and the caller reports both.
+        _ if engine::scan_was_truncated() => {
+            AllMatchOutcome::LimitsExceeded(SEARCH_INCOMPLETE.into())
+        }
         _ => AllMatchOutcome::Complete,
     };
     (names, outcome)
@@ -2866,7 +2930,10 @@ fn member_content_scan(
     // (an embedded PE, etc.) keep their own type so embedded-executable
     // detection is preserved. Either way the member carries its container type
     // so `Container:`-scoped sigs are gated correctly.
-    let ft_override = if cx.container_is_ole && is_textual_type(filetype::identify(data)) {
+    let ft_override = if cx.container_is_ole
+        && is_textual_type(profile::timed("filetype", data.len() as u64, || {
+            filetype::identify(data)
+        })) {
         Some(FileType::Ole)
     } else {
         None
@@ -3124,7 +3191,11 @@ fn deep_analyze(
         // (`x.7z.001`, `.002`, …) are held here and rejoined once the container
         // has ended — see the note at `finish()` below for why not sooner.
         let mut volumes = unpack::volume::Collector::new(budget.limits().max_buffer_bytes);
-        let outcome =
+        // Inclusive wall time: this drives nested member scans, so `unpack_us`
+        // contains the member matchers' time too — pure extraction/dispatch is
+        // `unpack_us` minus the nested matcher columns, and `emu_us` splits the
+        // emulator's share of it out.
+        let outcome = profile::timed("unpack", data.len() as u64, || {
             unpack::extract_each(fmt, data, budget, &mut |mut e: unpack::Entry,
                                                           budget: &mut Budget|
              -> Option<DeepOutcome> {
@@ -3173,7 +3244,8 @@ fn deep_analyze(
                     unpack::volume::Offer::PassThrough { data, .. } => data,
                 };
                 member_content_scan(&cx, &mut tally, &data, budget, findings, sink)
-            });
+            })
+        });
         // Reassembly happens only now. Nothing in a byte-split set's names says
         // how many parts it has, so `.001`+`.002` looks contiguous even when
         // `.003` follows: joining on arrival would emit a truncated prefix that
@@ -3756,7 +3828,7 @@ fn core_scan_all(
             }
         }
     }
-    if !db.hashes.is_empty() {
+    if !db.hashes.is_empty() && hash_matchable(data.len() as u64) {
         if let Some((name, unofficial)) = db.hashes.lookup(&digests_of(data), data.len() as u64) {
             sink.hit(
                 report_name(&name, unofficial, unofficial_suffix),
@@ -3933,7 +4005,8 @@ fn scan_bytes_depth(
                 // A packer may surface an embedded archive (e.g. an unpacked
                 // payload that is itself a ZIP/gzip). Unpack it too, bounded by
                 // the same extraction budget, so the real payload is reached.
-                let bft = filetype::identify(&buf);
+                let bft =
+                    profile::timed("filetype", buf.len() as u64, || filetype::identify(&buf));
                 // This deep bytecode-extracted-buffer rescan runs only behind a
                 // ClamAV `.cbc` unpacker firing; it isn't part of the common
                 // diff-tested path, so it always runs at full capability.
@@ -3993,7 +4066,7 @@ fn scan_bytes_depth(
             return Some((name, 0, Method::Hash, unofficial));
         }
     }
-    if !db.hashes.is_empty() {
+    if !db.hashes.is_empty() && hash_matchable(data.len() as u64) {
         if let Some((name, unofficial)) = profile::timed("hashes", data.len() as u64, || {
             db.hashes.lookup(&digests_of(data), data.len() as u64)
         }) {
@@ -4045,8 +4118,10 @@ fn stream_core<R: Read>(db: &Scanner, reader: R) -> io::Result<Option<CoreHit>> 
     }
     let size = tee.bytes_read();
     let digests = tee.finalize();
-    if let Some((name, unofficial)) = db.hashes.lookup(&digests, size) {
-        return Ok(Some((name, 0, Method::Hash, unofficial)));
+    if hash_matchable(size) {
+        if let Some((name, unofficial)) = db.hashes.lookup(&digests, size) {
+            return Ok(Some((name, 0, Method::Hash, unofficial)));
+        }
     }
     Ok(None)
 }
@@ -4368,6 +4443,66 @@ mod tests {
             }
             other => panic!("expected hash detection, got {other:?}"),
         }
+    }
+
+    /// Whole-file hash signatures stop applying at [`MIN_HASH_MATCH_BYTES`],
+    /// and the boundary is exactly where ClamAV puts it: 5 bytes is refused, 6
+    /// matches. Verified against ClamAV 1.4.3 with an equivalent `.hdb`, which
+    /// reports OK up to 5 bytes and FOUND from 6.
+    #[test]
+    fn hash_signatures_do_not_match_tiny_objects() {
+        for n in 1..=8usize {
+            let data: Vec<u8> = (0..n).map(|i| b'A' + (i % 26) as u8).collect();
+            let mut db = Scanner::builtin();
+            let d = digests_of(&data);
+            db.hashes
+                .extend_from_text(&format!("{}:{}:Test.Tiny{}\n", d.md5, n, n));
+            db.hashes.finalize();
+            let hit = matches!(
+                analyze(&db, &data, &ScanOptions::default()).verdict,
+                Verdict::Infected { .. }
+            );
+            assert_eq!(
+                hit,
+                n >= 6,
+                "{n}-byte object: hash match should be {}",
+                n >= 6
+            );
+            // The streaming core has its own hash path and must agree.
+            let hit = matches!(
+                scan_stream(&db, Cursor::new(data.clone())).unwrap().verdict,
+                Verdict::Infected { .. }
+            );
+            assert_eq!(hit, n >= 6, "{n}-byte object via stream_core");
+        }
+    }
+
+    /// The allow-list shares the hash machinery but must NOT inherit the floor:
+    /// a suppression that quietly stopped working would reintroduce exactly the
+    /// false positives the floor removes.
+    #[test]
+    fn allowlist_still_applies_below_the_hash_floor() {
+        // A 4-byte body carrying a pattern detection, then allow-listed by hash.
+        let mut db = Scanner::builtin();
+        let mut eb = engine::EngineBuilder::new();
+        eb.add_ndb("Test.Tiny.Pattern:0:*:61626364", false); // "abcd"
+        db.engine = eb.build();
+        let r = analyze(&db, b"abcd", &ScanOptions::default());
+        assert!(
+            matches!(r.verdict, Verdict::Infected { .. }),
+            "pattern must still match a 4-byte object: {:?}",
+            r.verdict
+        );
+        let d = digests_of(b"abcd");
+        db.allow
+            .extend_from_text(&format!("{}:4:Test.Allow\n", d.md5));
+        db.allow.finalize();
+        let r = analyze(&db, b"abcd", &ScanOptions::default());
+        assert!(
+            !matches!(r.verdict, Verdict::Infected { .. }),
+            "allow-list must suppress below the hash floor: {:?}",
+            r.verdict
+        );
     }
 
     #[test]

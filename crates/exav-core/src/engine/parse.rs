@@ -285,7 +285,7 @@ pub(super) fn parse_subsig(s: &str) -> Option<Vec<Compiled>> {
 /// with `0x00`, wildcards each match one wide char, and gaps count wide chars.
 pub(super) fn compile_wide(body: &str, allow_internal: bool) -> Option<(Vec<Elem>, Vec<u8>, Prefix)> {
     let elems = widen_elems(parse_elems(body)?);
-    let prefix = pick_anchor(&elems, allow_internal)?;
+    let prefix = pick_anchor(&elems, allow_internal, None)?;
     let anchor_idx = match prefix {
         Prefix::Fixed { anchor_idx, .. }
         | Prefix::Floating { anchor_idx }
@@ -356,7 +356,7 @@ pub(super) fn widen_elems(elems: Vec<Elem>) -> Vec<Elem> {
 /// Returns `None` if it uses an unsupported construct or has no usable anchor.
 pub(super) fn compile_body(hex: &str, allow_internal: bool) -> Option<(Vec<Elem>, Vec<u8>, Prefix)> {
     let elems = parse_elems(hex)?;
-    let prefix = pick_anchor(&elems, allow_internal)?;
+    let prefix = pick_anchor(&elems, allow_internal, None)?;
     let anchor_idx = match prefix {
         Prefix::Fixed { anchor_idx, .. }
         | Prefix::Floating { anchor_idx }
@@ -554,13 +554,189 @@ fn decode_masked_hex(s: &str) -> Option<Vec<(u8, u8)>> {
     Some(out)
 }
 
-/// Choose the literal anchor and classify its prefix.
+/// How many signature bodies contain each short byte sequence, counted over the
+/// database being built.
+///
+/// This is the selectivity signal [`anchor_score`] needs, derived from the
+/// signature set itself rather than shipped alongside it. A literal that
+/// hundreds of signatures are written around — `"http://"`, `"target=\""`,
+/// `"<script"` — is a literal that appears constantly in real files, because
+/// that is *why* so many signatures mention it. Popularity among signatures is
+/// a proxy for popularity in content, and it costs nothing to obtain: no
+/// reference corpus to assemble, nothing to ship, nothing to go stale. Rebuild
+/// the database and the statistic rebuilds with it.
+///
+/// The proxy is not exact. A sequence common in malware but rare in benign
+/// files is over-penalised, and one ubiquitous in benign files that no
+/// signature mentions is under-penalised. Both cost a worse anchor and nothing
+/// else: verification re-checks the whole pattern whatever triggered it, so the
+/// choice can never change a verdict.
+pub(super) struct GramStats {
+    /// Gram (2-4 bytes, length-tagged) to the number of bodies containing it.
+    /// Grams in a single body are absent: `log2(1)` is zero, the same score as
+    /// "never seen", and they are 78% of the distinct grams in a live main+daily
+    /// set — 265 MB of counts to say nothing.
+    counts: rustc_hash::FxHashMap<u64, u32>,
+}
+
+/// Bits per presence filter. 2^28 bits is 32 MiB, ~8% occupancy against the
+/// ~22M distinct grams of a full set, so few singletons are wrongly promoted to
+/// the counting map — and a promotion costs only the memory, never a wrong
+/// count, since the second pass counts what it actually sees.
+const SEEN_BITS: usize = 1 << 28;
+
+/// Body count from which the repeat filter is worth its fixed cost. Below it
+/// the two bitsets would be 64 MiB to filter a handful of grams — which is what
+/// every in-process engine build does, from a unit test to a small sig dir.
+pub(super) const FILTER_MIN_BODIES: usize = 100_000;
+
+/// A gram's key: its bytes, tagged with the length so `"ab"` and the prefix of
+/// `"abcd"` cannot collide. Lengths are 2..=4, so this is lossless.
+fn gram_key(g: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for &b in g {
+        v = (v << 8) | b as u64;
+    }
+    v | ((g.len() as u64) << 56)
+}
+
+/// Every gram of `lit` to CREDIT while counting: all windows of 2, 3 and 4
+/// bytes.
+///
+/// Counting and lookup have to agree on what a gram's count means, and the
+/// obvious shortcut — credit only the window size the lookup will use — is
+/// wrong. Lookup asks a 2-byte literal about a 2-gram; if only 2-byte literals
+/// ever credited 2-grams, `"//"` would be counted from the handful of two-byte
+/// signatures rather than from the tens of thousands of literals that contain
+/// it. Short ubiquitous literals then look rare, score well, and win the
+/// anchor — the exact inversion this is built to prevent. Measured: doing it
+/// that way moved anchors onto `"://"`, `"//"` and `"htt"` and raised token
+/// verifies on one spreadsheet part by 84%.
+fn count_grams_of(lit: &[u8], out: &mut Vec<u64>) {
+    for n in 2..=4usize {
+        if lit.len() < n {
+            break;
+        }
+        for w in lit.windows(n) {
+            out.push(gram_key(w));
+        }
+    }
+}
+
+/// The grams of `lit` to QUERY: the widest window it supports, up to 4. A
+/// literal occurs in at most as many bodies as its rarest gram, and the widest
+/// window gives the tightest such bound.
+fn query_grams_of(lit: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    let n = lit.len().min(4);
+    lit.windows(n).map(gram_key)
+}
+
+impl GramStats {
+    /// Count grams over every candidate literal `each` yields.
+    ///
+    /// `bodies` sizes the work. Past [`FILTER_MIN_BODIES`] the repeat filter
+    /// pays for itself and `each` is called twice — once to find which grams
+    /// repeat, once to count only those. Below it the filter's fixed 64 MiB
+    /// would dwarf the data it is filtering, so the counts are taken exactly in
+    /// a single pass. Both give identical scores: a gram the filter drops
+    /// appears in one body, and `log2(1)` is the zero an absent gram scores.
+    pub(super) fn build(bodies: usize, mut each: impl FnMut(&mut dyn FnMut(&[u8]))) -> Self {
+        let mut buf: Vec<u64> = Vec::new();
+        if bodies < FILTER_MIN_BODIES {
+            let mut counts: rustc_hash::FxHashMap<u64, u32> = rustc_hash::FxHashMap::default();
+            each(&mut |lit| {
+                buf.clear();
+                count_grams_of(lit, &mut buf);
+                buf.sort_unstable();
+                buf.dedup();
+                for &k in &buf {
+                    *counts.entry(k).or_insert(0) += 1;
+                }
+            });
+            return GramStats { counts };
+        }
+        let mut once = vec![0u64; SEEN_BITS / 64];
+        let mut twice = vec![0u64; SEEN_BITS / 64];
+        let mark = |bits: &mut [u64], i: usize| bits[i >> 6] |= 1 << (i & 63);
+        let test = |bits: &[u64], i: usize| bits[i >> 6] >> (i & 63) & 1 == 1;
+        let slot = |k: u64| {
+            // Multiply-shift: the key is already a good integer, it only needs
+            // its high bits spread into the index range.
+            (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SEEN_BITS.trailing_zeros())) as usize
+        };
+        // Pass 1: which grams appear in more than one body.
+        each(&mut |lit| {
+            buf.clear();
+            count_grams_of(lit, &mut buf);
+            buf.sort_unstable();
+            buf.dedup();
+            for &k in &buf {
+                let i = slot(k);
+                if test(&once, i) {
+                    mark(&mut twice, i);
+                } else {
+                    mark(&mut once, i);
+                }
+            }
+        });
+        drop(once);
+        // Pass 2: count the repeats. Per body, not per occurrence, so a literal
+        // repeated inside one signature does not look popular.
+        let mut counts: rustc_hash::FxHashMap<u64, u32> = rustc_hash::FxHashMap::default();
+        each(&mut |lit| {
+            buf.clear();
+            count_grams_of(lit, &mut buf);
+            buf.sort_unstable();
+            buf.dedup();
+            for &k in &buf {
+                if test(&twice, slot(k)) {
+                    *counts.entry(k).or_insert(0) += 1;
+                }
+            }
+        });
+        GramStats { counts }
+    }
+
+    /// How many bodies contain `lit`, bounded above: a literal occurs in at most
+    /// as many bodies as its rarest gram does. Erring high is the safe
+    /// direction — it can only make a literal look like a worse anchor.
+    fn popularity(&self, lit: &[u8]) -> u32 {
+        if lit.len() < 2 {
+            return 0;
+        }
+        query_grams_of(lit)
+            .map(|k| self.counts.get(&k).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+/// `floor(log2(c))`, and 0 for the "nothing known" counts 0 and 1 — so an
+/// unseen literal is never penalised, and the penalty grows with an order of
+/// magnitude rather than with a raw count that spans 1..10^6.
+fn log2_floor(c: u32) -> isize {
+    if c <= 1 {
+        0
+    } else {
+        (31 - c.leading_zeros()) as isize
+    }
+}
+
 /// Selectivity score of a candidate anchor run. A low-entropy run (a constant
 /// byte like a zero/0xFF pad, or a 2-symbol repeat) matches repetitive content
 /// — PE padding, BSS — millions of times, so it is a terrible prefilter even
 /// when long. Down-rank such runs sharply so a shorter but varied run wins; a
 /// varied run scores its length (longer = rarer = better).
-pub(super) fn anchor_score(b: &[u8]) -> usize {
+///
+/// Length alone is not selectivity, though: `"http://"` is 7 varied bytes and
+/// scored best by that rule, yet it is the single worst anchor on web/office
+/// content — one 12 MB spreadsheet relationships part hit it 61,489 times,
+/// while the same body's `":7878"` occurs essentially never. So a literal is
+/// also penalised by how many signature bodies share it ([`GramStats`]), which
+/// lets a shorter but rarer run win. `stats` is `None` while a body is first
+/// parsed, because the count is not known until the whole set has been read —
+/// the choice is then revisited at build time.
+pub(super) fn anchor_score(b: &[u8], stats: Option<&GramStats>) -> isize {
     let mut seen = [false; 256];
     let mut distinct = 0usize;
     for &x in b {
@@ -569,14 +745,26 @@ pub(super) fn anchor_score(b: &[u8]) -> usize {
             distinct += 1;
         }
     }
-    match distinct {
+    let structural = match distinct {
         0 | 1 => 1,          // constant run: near-useless anchor
         2 => 3.min(b.len()), // 2-symbol repeat (e.g. ababab): weak
         _ => b.len(),        // varied: length is the selectivity
-    }
+    } as isize;
+    // Both terms are log-scaled — length stands in for how rare a run should be,
+    // the popularity count for how common it actually is — so the difference
+    // reads as a selectivity estimate. Deliberately signed and unsaturated:
+    // clamping at zero puts every ubiquitous literal in a tie that the length
+    // tie-break then resolves backwards, handing the anchor to the *longest*
+    // common run (`"http://"` at 7 bytes beating `"umber:"` at 6, which is
+    // exactly the pairing that costs a 12 MB relationships part 61,489 hits).
+    structural - stats.map_or(0, |s| log2_floor(s.popularity(b)))
 }
 
-pub(super) fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix> {
+pub(super) fn pick_anchor(
+    elems: &[Elem],
+    allow_internal: bool,
+    stats: Option<&GramStats>,
+) -> Option<Prefix> {
     // Pick the most *selective* literal run as the Aho-Corasick anchor (highest
     // [`anchor_score`], tie-break longer), not merely the longest: a long
     // constant run is a far worse prefilter than a shorter varied one. Fewer
@@ -594,13 +782,13 @@ pub(super) fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix
     let mut in_fixed_prefix = true;
     // (score, len, prefix) for the best fixed-prefix candidate and the best
     // candidate anywhere.
-    let mut best_fixed: Option<(usize, usize, Prefix)> = None;
-    let mut best_any: Option<(usize, usize, usize)> = None; // (score, len, idx)
+    let mut best_fixed: Option<(isize, usize, Prefix)> = None;
+    let mut best_any: Option<(isize, usize, usize)> = None; // (score, len, idx)
     for (i, e) in elems.iter().enumerate() {
         if let Elem::Bytes(b) = e {
             if b.len() >= MIN_ANCHOR {
-                let score = anchor_score(b);
-                let better = |cur: &Option<(usize, usize, Prefix)>| match cur {
+                let score = anchor_score(b, stats);
+                let better = |cur: &Option<(isize, usize, Prefix)>| match cur {
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
                     None => true,
                 };
@@ -631,7 +819,11 @@ pub(super) fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix
     // Prefer an internal anchor only when it beats the fixed-prefix one.
     if allow_internal {
         if let Some((any_score, _, idx)) = best_any {
-            let fixed_score = best_fixed.as_ref().map(|(s, ..)| *s).unwrap_or(0);
+            // No fixed-prefix candidate at all must lose to every real one:
+            // scores are signed, so a `0` floor here would reject a merely
+            // common internal anchor and leave the body with no anchor — i.e.
+            // silently drop the signature rather than prefilter it poorly.
+            let fixed_score = best_fixed.as_ref().map(|(s, ..)| *s).unwrap_or(isize::MIN);
             if any_score > fixed_score {
                 // A single leading gap is the cheap `Floating` fast path, not the
                 // general backward-matching `Internal`.

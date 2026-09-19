@@ -97,6 +97,46 @@ impl Node {
         }
     }
 
+    /// Sound satisfiability over-approximation for pruning *before* any body
+    /// subsignature is verified. `absent(i)` marks a subsig whose count is
+    /// certainly 0 because no body of it has an anchor hit anywhere in the
+    /// buffer; every other subsig is free to take any count.
+    ///
+    /// Distinct from [`Self::can_be_true`], whose unknowns are binary: a body
+    /// subsig can match many times, so a 0-or-1 unknown would wrongly prune
+    /// `SubCmp(i, Gt, 5)` and lose the signature. Returns false only when no
+    /// assignment of the free subsigs can satisfy the expression, so pruning
+    /// stays FN-safe; `total` and `distinct` in a group are over-approximated
+    /// independently, which can only yield a false "possible".
+    pub(super) fn can_be_true_absent(&self, absent: &dyn Fn(usize) -> bool) -> bool {
+        // A free count ranges over all of `u32`, so a comparison is satisfiable
+        // unless the bound itself rules every value out.
+        let free_cmp_ok = |c: Cmp, x: u32| match c {
+            Cmp::Eq => true,
+            Cmp::Gt => x < u32::MAX,
+            Cmp::Lt => x > 0,
+        };
+        match self {
+            Node::Sub(i) => !absent(*i),
+            Node::SubCmp(i, c, x) => {
+                if absent(*i) {
+                    cmp_ok(*c, 0, *x)
+                } else {
+                    free_cmp_ok(*c, *x)
+                }
+            }
+            Node::GroupCmp(ids, c, x, y) => {
+                let nfree = ids.iter().filter(|&&i| !absent(i)).count() as u32;
+                if nfree == 0 {
+                    return cmp_ok(*c, 0, *x) && y.is_none_or(|y| y == 0);
+                }
+                free_cmp_ok(*c, *x) && y.is_none_or(|y| nfree >= y)
+            }
+            Node::And(v) => v.iter().all(|n| n.can_be_true_absent(absent)),
+            Node::Or(v) => v.iter().any(|n| n.can_be_true_absent(absent)),
+        }
+    }
+
     fn collect_ids(&self, out: &mut Vec<usize>) {
         match self {
             Node::Sub(i) | Node::SubCmp(i, _, _) => out.push(*i),

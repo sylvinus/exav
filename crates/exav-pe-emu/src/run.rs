@@ -366,7 +366,20 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
 
         // The tail transfer: into the image, into a different section from the
         // stub's, onto a page the stub wrote.
-        if oep.is_none() && eip >= image.base && eip < image_end {
+        //
+        // The conditions are ordered cheapest-first: the watched-range count is
+        // a field read, and until the stub has rebuilt `min_unpack_dirty` no
+        // jump can be the entry point, so most steps — every spinner, every
+        // stub that faults early — never reach the section lookup or the dirty
+        // hash probe. Reordering is semantics-preserving: every condition is
+        // side-effect free except `rebuilt`, which stays last under the same
+        // call conditions as before (so its recheck throttle behaves identically).
+        if oep.is_none()
+            && mem.watched_dirty_bytes() >= limits.min_unpack_dirty
+            && eip >= image.base
+            && eip < image_end
+            && mem.is_dirty(eip)
+        {
             let rva = eip - image.base;
             let sec = image.section_of(rva);
             // The transfer has to cross into another SECTION, not merely onto a
@@ -377,11 +390,7 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
             // then stops at what only looks like an entry point and dumps a
             // *half-decompressed* image. Stopping late and dumping everything
             // beats stopping at the first plausible-looking jump.
-            if sec != stub_section
-                && mem.watched_dirty_bytes() >= limits.min_unpack_dirty
-                && mem.is_dirty(eip)
-                && rebuilt(&image, sec, &mut mem, &mut recheck, ticks)
-            {
+            if sec != stub_section && rebuilt(&image, sec, &mut mem, &mut recheck, ticks) {
                 oep = Some(rva);
                 stop_reason = format!("reached the original entry point at RVA {rva:#x}");
                 break;

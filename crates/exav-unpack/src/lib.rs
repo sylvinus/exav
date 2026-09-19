@@ -66,6 +66,7 @@ pub(crate) mod formats;
 use formats::*;
 
 mod stream;
+pub mod profile;
 pub mod volume;
 #[cfg(feature = "pdf")]
 pub use formats::has_obfuscated_name_object;
@@ -1758,11 +1759,21 @@ pub(crate) fn cap_prealloc(requested: usize) -> usize {
 /// Absolute byte caps are the primary bomb defense; this is a fast reject
 /// for the obvious cases. A declared input of 0 is ignored (we cannot trust
 /// it) and left to the absolute caps.
+///
+/// Enforced only past [`RATIO_FLOOR_BYTES`] of output: below it the absolute
+/// caps already bound the allocation and the content is cheap to scan, while a
+/// bare ratio trips on ordinary content — a 1 KB-compressed blank scanned page
+/// (1 MB of one byte) has a ratio over 1000:1 without being anyone's bomb. A
+/// real bomb still trips as soon as its output crosses the floor, milliseconds
+/// into the decompression.
 // Dead only in a build with none of the compressing formats; see
 // `cap_prealloc` for why the feature list is not spelled out.
 #[allow(dead_code)]
 pub(crate) fn ratio_guard(input: u64, output: u64, budget: &Budget) -> Result<(), LimitHit> {
-    if input > 0 && output / input > budget.limits.max_compression_ratio {
+    if output >= RATIO_FLOOR_BYTES
+        && input > 0
+        && output / input > budget.limits.max_compression_ratio
+    {
         return Err(LimitHit::new(format!(
             "compression ratio {} > {}",
             output / input,
@@ -1771,6 +1782,21 @@ pub(crate) fn ratio_guard(input: u64, output: u64, budget: &Budget) -> Result<()
     }
     Ok(())
 }
+
+/// Output size from which the compression-ratio bomb check applies (4 MiB).
+///
+/// Below it, rejecting by ratio produces false `LIMITS-EXCEEDED` verdicts on
+/// ordinary content: a blank scanned page is 1 MB of one repeated byte and
+/// compresses past 1000:1 without being anyone's bomb. The absolute caps
+/// (`max_buffer_bytes` per object, `max_extracted_bytes` in total) bound such
+/// output anyway, and it is cheap to scan.
+///
+/// Sized to the evidence rather than generously: 4x the 1 MB page image that
+/// makes the floor necessary. Every byte of headroom past that is ratio
+/// checking given up for nothing — a bomb is still caught the moment its output
+/// crosses the floor, milliseconds into decompression, and real bombs overshoot
+/// by orders of magnitude.
+const RATIO_FLOOR_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The EICAR anti-virus test string, assembled at runtime from its reverse.
 ///
@@ -2619,6 +2645,49 @@ mod tests {
         let mut b = Budget::new(Limits::default());
         b.set_verify_checksums(true);
         assert!(extract(Format::Gzip, &gz_bad_crc(payload), &mut b).is_err());
+    }
+
+    #[test]
+    fn ratio_guard_ignores_small_high_ratio_output() {
+        // A 1 KB-compressed blank scanned page expanding to 1 MB (ratio
+        // ~1000:1) is ordinary content, not a bomb: below the floor the
+        // absolute caps already bound it, so the ratio must not trip.
+        let b = Budget::new(Limits::default());
+        assert!(ratio_guard(1021, 1_030_656, &b).is_ok());
+        assert!(ratio_guard(100, 90_000, &b).is_ok());
+    }
+
+    #[test]
+    fn ratio_guard_still_trips_past_the_floor() {
+        // The same shape at bomb scale must still trip loudly: past the floor
+        // the ratio means resource exhaustion, not a blank page.
+        let b = Budget::new(Limits::default());
+        assert!(ratio_guard(1021, 100 * 1024 * 1024, &b).is_err());
+        assert!(ratio_guard(1021, RATIO_FLOOR_BYTES, &b).is_err());
+    }
+
+    /// Pins the floor at SHIPPED settings. Every other bomb test overrides
+    /// `max_compression_ratio`, so before this one nothing exercised the guard
+    /// as deployed — the floor could have been any value, or ineffective, and
+    /// the suite would have stayed green.
+    #[test]
+    fn ratio_guard_boundary_at_default_limits() {
+        let b = Budget::new(Limits::default());
+        assert_eq!(
+            b.limits().max_compression_ratio,
+            1000,
+            "the shipped ratio; this test is about the default configuration"
+        );
+        // One byte under the floor is exempt no matter how extreme the ratio...
+        assert!(ratio_guard(1, RATIO_FLOOR_BYTES - 1, &b).is_ok());
+        // ...and the guard resumes exactly at it.
+        assert!(ratio_guard(1, RATIO_FLOOR_BYTES, &b).is_err());
+        // The 1 MB blank page that the floor exists for keeps 4x of room.
+        assert!(ratio_guard(1021, 1_030_656, &b).is_ok());
+        assert_eq!(RATIO_FLOOR_BYTES, 4 * 1024 * 1024);
+        // A ratio at or under the limit is fine even well past the floor, so
+        // the floor only ever relaxes the check, never tightens it.
+        assert!(ratio_guard(1024 * 1024, 64 * 1024 * 1024, &b).is_ok());
     }
 
     fn tar_of(members: &[(&str, &[u8])]) -> Vec<u8> {
