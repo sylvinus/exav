@@ -307,10 +307,22 @@ fn dispatch_stream<R: Read + Seek, T>(
                 .map(|d| Box::new(d) as Box<dyn Read + '_>)
                 .map_err(|e| LimitHit::corrupt(format!("zstd: {e}")))
         }),
+        // `LzipReader` takes any failure to read a member header, an I/O error
+        // included, for the end of the stream, so errors are caught underneath.
         #[cfg(feature = "lzip")]
-        Format::Lzip => stream_single(&mut source, budget, visit, "lzip-content", |r| {
-            Ok(Box::new(lzma_rust2::LzipReader::new(r)) as Box<dyn Read + '_>)
-        }),
+        Format::Lzip => {
+            let mut src = ErrorLatch {
+                inner: &mut source,
+                failed: None,
+            };
+            let out = stream_single(&mut src, budget, visit, "lzip-content", |r| {
+                Ok(Box::new(lzma_rust2::LzipReader::new(r)) as Box<dyn Read + '_>)
+            })?;
+            match (out, src.failed) {
+                (None, Some(e)) => Err(LimitHit::corrupt(format!("lzip: read failed: {e}"))),
+                (out, _) => Ok(out),
+            }
+        }
         #[cfg(feature = "lha")]
         Format::Lha => stream_lha(&mut source, budget, visit),
         #[cfg(feature = "ar")]
@@ -401,6 +413,32 @@ fn stream_single<R: Read + Seek, T>(
     visit_member(&meta, &mut *dec, budget, visit)
 }
 
+/// Passes reads and seeks through, keeping the first read error for a caller
+/// whose decoder does not report it.
+#[cfg(feature = "lzip")]
+struct ErrorLatch<R> {
+    inner: R,
+    failed: Option<io::Error>,
+}
+
+#[cfg(feature = "lzip")]
+impl<R: Read> Read for ErrorLatch<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).inspect_err(|e| {
+            if e.kind() != io::ErrorKind::Interrupted && self.failed.is_none() {
+                self.failed = Some(io::Error::new(e.kind(), e.to_string()));
+            }
+        })
+    }
+}
+
+#[cfg(feature = "lzip")]
+impl<R: Seek> Seek for ErrorLatch<R> {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
 /// Run one member's reader through the visitor under a [`BudgetReader`], mapping
 /// an over-budget overflow to a [`LimitHit`].
 ///
@@ -438,12 +476,11 @@ fn stream_gzip<R: Read + Seek, T>(
     budget: &mut Budget,
     visit: StreamVisit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use flate2::read::MultiGzDecoder;
     source
         .seek(io::SeekFrom::Start(0))
         .map_err(|e| LimitHit::corrupt(format!("gzip seek: {e}")))?;
     budget.count_entry()?;
-    let mut dec = MultiGzDecoder::new(source);
+    let mut dec = crate::inflate::Gunzip::new(io::BufReader::new(source));
     let meta = MemberMeta {
         name: "gzip-content".to_string(),
         comp_size: 0,
@@ -505,25 +542,8 @@ fn stream_zip<R: Read + Seek, T>(
                     None
                 },
             )?;
-            for entry in entries {
-                budget.count_entry()?;
-                let meta = MemberMeta {
-                    name: entry.name,
-                    comp_size: entry.comp_size,
-                    encrypted: entry.encrypted,
-                    unsupported: entry.unsupported,
-                };
-                let hit = if entry.unsupported.is_some() {
-                    visit(&meta, None, budget)
-                } else {
-                    let mut cur = io::Cursor::new(&entry.data[..]);
-                    visit_member(&meta, &mut cur, budget, visit)?
-                };
-                if let Some(t) = hit {
-                    return Ok(Some(t));
-                }
-            }
-            return Ok(None);
+            // `extract_zip` already counted each of these toward `max_members`.
+            return visit_entries(entries, budget, visit);
         }
     };
     for i in 0..zip.len() {
@@ -588,21 +608,10 @@ fn stream_zip<R: Read + Seek, T>(
         // Probe first so the borrow of `zip` ends before the fallback needs it.
         let decodable = zip.by_index(i).is_ok();
         let mut file = match decodable {
-            true => zip
-                .by_index(i)
+            true => crate::formats::zip::member_reader(&mut zip, i)
                 .map_err(|e| crate::formats::zip::zip_entry_error(i, &e))?,
             false => {
-                if let Some(t) = stream_zip_raw_decode(&mut zip, i, &name, comp, budget, visit)? {
-                    return Ok(Some(t));
-                }
-                // Nothing we can decode either: surface it, never drop it.
-                let meta = MemberMeta {
-                    name,
-                    comp_size: comp,
-                    encrypted: false,
-                    unsupported: Some("unsupported zip compression method"),
-                };
-                if let Some(t) = visit(&meta, None, budget) {
+                if let Some(t) = stream_zip_raw_decode(&mut zip, i, name, comp, budget, visit)? {
                     return Ok(Some(t));
                 }
                 continue;
@@ -618,48 +627,92 @@ fn stream_zip<R: Read + Seek, T>(
             return Ok(Some(t));
         }
     }
+    // Members left out of the central directory while their local headers and
+    // data stay in the file, which is what the target extracts. The buffered
+    // extractor has always looked for them; this is the walk every scanned ZIP
+    // takes, so without it a hidden member is never read.
+    let hidden = crate::formats::zip::hidden_members(zip, budget)?;
+    visit_entries(hidden, budget, visit)
+}
+
+/// Hand already-decoded members to a streaming visitor, stopping when it does.
+#[cfg(feature = "zip")]
+fn visit_entries<T>(
+    entries: Vec<crate::Entry>,
+    budget: &mut Budget,
+    visit: StreamVisit<T>,
+) -> Result<Option<T>, LimitHit> {
+    for entry in entries {
+        let meta = MemberMeta {
+            name: entry.name,
+            comp_size: entry.comp_size,
+            encrypted: entry.encrypted,
+            unsupported: entry.unsupported,
+        };
+        let hit = if entry.unsupported.is_some() {
+            visit(&meta, None, budget)
+        } else {
+            let mut cur = io::Cursor::new(&entry.data[..]);
+            visit_member(&meta, &mut cur, budget, visit)?
+        };
+        if let Some(t) = hit {
+            return Ok(Some(t));
+        }
+    }
     Ok(None)
 }
 
 /// Decode a member the `zip` crate refused, from its RAW bytes, using exav's own
-/// codec set. Returns `Ok(None)` when we cannot decode it either.
+/// codec set. The member is visited once: decoded, or as a marker saying why
+/// it could not be. Too large for the per-object buffer is a limit.
 #[cfg(feature = "zip")]
 fn stream_zip_raw_decode<R: Read + Seek, T>(
     zip: &mut ::zip::ZipArchive<R>,
     i: usize,
-    name: &str,
+    name: String,
     comp: u64,
     budget: &mut Budget,
     visit: StreamVisit<T>,
 ) -> Result<Option<T>, LimitHit> {
     let cap = budget.limits.max_buffer_bytes;
-    let (method, usz, raw) = {
-        let Ok(f) = zip.by_index_raw(i) else {
-            return Ok(None);
-        };
-        let method = crate::formats::zip::zip_method_code(&f.compression());
-        let usz = f.size();
-        let mut raw = Vec::new();
-        if f.take(cap).read_to_end(&mut raw).is_err() {
-            return Ok(None);
-        }
-        (method, usz, raw)
-    };
-    let Some((out, truncated)) = crate::formats::zip::decode_zip_raw(method, &raw, usz, cap) else {
-        return Ok(None);
-    };
-    if truncated {
-        return Ok(None);
-    }
-    budget.commit(out.len() as u64);
-    let meta = MemberMeta {
-        name: name.to_string(),
+    let mut meta = MemberMeta {
+        name,
         comp_size: comp,
         encrypted: false,
         unsupported: None,
     };
-    let mut cur = io::Cursor::new(out);
-    Ok(visit(&meta, Some(&mut cur), budget))
+    let too_big = |name: &str| {
+        LimitHit::new(format!(
+            "zip member '{name}' is larger than --max-object-bytes {cap}"
+        ))
+    };
+    let decoded = match zip.by_index_raw(i) {
+        Err(_) => Err("ZIP member header will not parse"),
+        Ok(f) => {
+            if f.compressed_size() > cap {
+                return Err(too_big(&meta.name));
+            }
+            let method = crate::formats::zip::zip_method_code(&f.compression());
+            let usz = f.size();
+            let mut raw = Vec::new();
+            match f.take(cap).read_to_end(&mut raw) {
+                Err(_) => Err("ZIP member data could not be read"),
+                Ok(_) => crate::formats::zip::decode_zip_raw(method, &raw, usz, cap)
+                    .ok_or("unsupported zip compression method"),
+            }
+        }
+    };
+    match decoded {
+        Err(reason) => {
+            meta.unsupported = Some(reason);
+            Ok(visit(&meta, None, budget))
+        }
+        Ok((_, true)) => Err(too_big(&meta.name)),
+        Ok((out, false)) => {
+            budget.commit(out.len() as u64);
+            visit_member(&meta, &mut io::Cursor::new(out), budget, visit)
+        }
+    }
 }
 
 /// Handle one encrypted ZIP member: try the password pool, present the decrypted
@@ -908,14 +961,7 @@ fn stream_szdd<R: Read + Seek, T>(
         .seek(io::SeekFrom::Start(0))
         .map_err(|e| LimitHit::corrupt(format!("szdd: {e}")))?;
     let mut hdr = [0u8; 14];
-    let mut n = 0;
-    while n < hdr.len() {
-        match source.read(&mut hdr[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
+    let n = crate::read_full(source, &mut hdr)?;
     if n >= 8 && &hdr[0..8] == SZDD_MAGIC {
         if n < 14 {
             return Err(LimitHit::corrupt("szdd: truncated header".to_string()));
@@ -981,14 +1027,7 @@ fn stream_swf<R: Read + Seek, T>(
         .seek(io::SeekFrom::Start(0))
         .map_err(|e| LimitHit::corrupt(format!("swf: {e}")))?;
     let mut hdr = [0u8; 17];
-    let mut n = 0;
-    while n < hdr.len() {
-        match source.read(&mut hdr[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
+    let n = crate::read_full(source, &mut hdr)?;
     if n < 8 || (&hdr[0..3] != b"CWS" && &hdr[0..3] != b"ZWS") {
         return Ok(None); // FWS / non-SWF: covered by the raw-container scan
     }
@@ -1233,6 +1272,85 @@ mod tests {
             1 << 20,
             "the declared output bounds the dictionary when it is the smaller"
         );
+    }
+
+    /// A ZIP whose central directory will not parse is salvaged from its local
+    /// headers, and each salvaged member counts once toward `max_members`.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_salvaged_zip_counts_each_member_once() {
+        use std::io::Write;
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = ::zip::ZipWriter::new(&mut buf);
+            let opts = ::zip::write::SimpleFileOptions::default()
+                .compression_method(::zip::CompressionMethod::Stored);
+            for name in ["a.txt", "b.txt"] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(b"member").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let mut blob = buf.into_inner();
+        // Point the end-of-central-directory record's directory offset past
+        // the end of the file, so only the local headers remain usable.
+        let eocd = blob.len() - 22;
+        blob[eocd + 16..eocd + 20].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut budget = Budget::new(Limits {
+            max_members: 2,
+            ..Limits::default()
+        });
+        let mut seen = 0;
+        let mut visit = |_: &MemberMeta, _: Option<&mut dyn Read>, _: &mut Budget| -> Option<()> {
+            seen += 1;
+            None
+        };
+        let walk = stream_members(Format::Zip, Cursor::new(blob), &mut budget, &mut visit);
+        assert!(walk.is_ok(), "{:?}", walk.err());
+        assert_eq!(seen, 2);
+    }
+
+    /// A member whose local header and data are in the file but whose entry is
+    /// missing from the central directory is still visited: the target extracts
+    /// it, so the scan has to read it.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_member_hidden_from_the_central_directory_is_visited() {
+        use std::io::Write;
+        let zip_of = |name: &str, data: &[u8]| {
+            let mut buf = Cursor::new(Vec::new());
+            {
+                let mut zip = ::zip::ZipWriter::new(&mut buf);
+                let opts = ::zip::write::SimpleFileOptions::default()
+                    .compression_method(::zip::CompressionMethod::Stored);
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(data).unwrap();
+                zip.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        let cd_offset = |z: &[u8]| {
+            let eocd = z.len() - 22;
+            u32::from_le_bytes(z[eocd + 16..eocd + 20].try_into().unwrap()) as usize
+        };
+        let listed = zip_of("listed.txt", b"listed");
+        let hidden = zip_of("hidden.txt", b"hidden");
+        // Splice `hidden.txt`'s local header and data in ahead of the listed
+        // archive's central directory, and move the directory offset past it.
+        let orphan = &hidden[..cd_offset(&hidden)];
+        let cd = cd_offset(&listed);
+        let mut blob = listed[..cd].to_vec();
+        blob.extend_from_slice(orphan);
+        blob.extend_from_slice(&listed[cd..]);
+        let eocd = blob.len() - 22;
+        blob[eocd + 16..eocd + 20].copy_from_slice(&((cd + orphan.len()) as u32).to_le_bytes());
+
+        let names: Vec<String> = streamed_members(Format::Zip, &blob)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["listed.txt", "hidden.txt"]);
     }
 
     // A member at exactly the cap reads fully, with no overflow.

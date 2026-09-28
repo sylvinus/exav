@@ -255,11 +255,11 @@ fn decode_block(
     Ok(out)
 }
 
-/// Read and discard up to `n` decompressed bytes from `r`, returning how many
-/// were actually skipped (fewer than `n` means the stream ended first). Constant
-/// memory — used to advance a block reader to a file's offset within a solid
-/// block without buffering the skipped prefix.
-fn skip_reader(r: &mut dyn Read, n: u64) -> u64 {
+/// Read and discard up to `n` decompressed bytes from `r`. Returns how many
+/// were skipped (fewer than `n` means the stream ended or failed first) and
+/// whether it failed. Constant memory: used to advance a block reader to a
+/// file's offset within a solid block without buffering the skipped prefix.
+fn skip_reader(r: &mut dyn Read, n: u64) -> (u64, bool) {
     let mut skipped = 0u64;
     let mut buf = [0u8; 8192];
     while skipped < n {
@@ -267,10 +267,11 @@ fn skip_reader(r: &mut dyn Read, n: u64) -> u64 {
         match r.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(k) => skipped += k as u64,
-            Err(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (skipped, true),
         }
     }
-    skipped
+    (skipped, false)
 }
 
 /// Streaming 7z extraction (pattern A): each file's solid block is built as a
@@ -422,11 +423,13 @@ pub(crate) fn stream_sevenz<T>(
                 }
             }
             let r = match file_data {
+                // Decrypted, and still reported as encrypted: the plaintext is
+                // scanned, and cracking the password does not erase the fact.
                 Some(fd) => {
                     let meta = MemberMeta {
                         name,
                         comp_size: file.size,
-                        encrypted: false,
+                        encrypted: true,
                         unsupported: None,
                     };
                     let mut cur = Cursor::new(fd);
@@ -480,7 +483,8 @@ pub(crate) fn stream_sevenz<T>(
         } else {
             decode_block_reader(block, pack_data, block_total, None, max_buffer)?
         };
-        if skip_reader(reader.as_mut(), bytes_to_skip) < bytes_to_skip {
+        let (skipped, failed) = skip_reader(reader.as_mut(), bytes_to_skip);
+        if skipped < bytes_to_skip {
             // The block ended before this file's offset: the sub-stream table
             // claims more content than the block decodes to. Every later member
             // of a solid block is in the same position, so leaving these out
@@ -489,7 +493,11 @@ pub(crate) fn stream_sevenz<T>(
                 name,
                 comp_size: file.size,
                 encrypted: false,
-                unsupported: Some("7z: solid block ended before this member"),
+                unsupported: Some(if failed {
+                    "7z: solid block failed to decode before this member"
+                } else {
+                    "7z: solid block ended before this member"
+                }),
             };
             if let Some(t) = visit(&meta, None, budget) {
                 return Ok(Some(t));

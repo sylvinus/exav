@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv av-audit publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -136,6 +136,17 @@ av-audit:
 	    echo "-> mask these (see crates/exav-unpack/tests/fixtures/README.md)"; exit 1; \
 	  fi; \
 	  echo "no detections"
+
+## miri: run the container-walking tests of exav-unpack under Miri, which checks
+##       the `unsafe` inside dependencies (memchr, the compression and crypto
+##       crates) along real code paths. Needs a nightly toolchain with the
+##       component: `rustup toolchain install nightly --component miri`.
+##       A subset, chosen by test-name filter in MIRI_TESTS: Miri runs code
+##       orders of magnitude slower, and the decoder round-trip tests alone take
+##       hours. Its own target dir, so it never invalidates the normal build.
+MIRI_TESTS ?= formats::zip formats::cpio formats::tar formats::iso formats::partition formats::cab
+miri:
+	CARGO_TARGET_DIR=target/miri rustup run nightly cargo miri test -p exav-unpack --lib -- $(MIRI_TESTS)
 
 ## fuzz: smoke-build the fuzz targets
 fuzz:

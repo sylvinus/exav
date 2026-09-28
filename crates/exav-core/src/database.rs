@@ -10,9 +10,8 @@
 //!
 //! The file starts with a magic tag and a format version; a mismatch is
 //! rejected rather than misread. The database is a trusted artifact (you build
-//! and fetch it yourself, over a channel you trust) — it is not a safe target
-//! for arbitrary untrusted bytes, since the automaton bytes are deserialized
-//! without full validation.
+//! and fetch it yourself, over a channel you trust): its contents decide what is
+//! detected, and nothing here checks who produced it.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;

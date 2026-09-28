@@ -39,10 +39,12 @@
 //!                                 sanitised, capped ~512 chars)
 //!                               {"v":1,"status":"PARTIAL","category":C[,"reason":R]}
 //!                                 (C ∈ LIMITS-EXCEEDED / UNSCANNABLE /
-//!                                 PASSWORD-PROTECTED / TRUNCATED — a stream that
-//!                                 was not fully scanned is PARTIAL, NEVER OK)
+//!                                 PASSWORD-PROTECTED; a stream that was not
+//!                                 fully scanned is PARTIAL unless `--partial-as`
+//!                                 says otherwise)
 //!                               {"v":1,"status":"ERROR","reason":R}
 //!                                 (transient/infra failure the client may retry,
+//!                                 a stream that ended before its terminator,
 //!                                 or a PARTIAL under `--partial-as error`)
 //!                             `status` is the same four-word vocabulary the CLI
 //!                             prints and `--json` emits, and each word names the
@@ -83,8 +85,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use exav_core::{
-    analyze_all_with_outcome, scan_path, scan_seekable_located, scan_stream, AllMatchOutcome,
-    ScanOptions, ScanReport, Scanner, VerdictCategory,
+    analyze_all_with_outcome, scan_path, scan_seekable_located, AllMatchOutcome, ScanOptions,
+    ScanReport, Scanner, Verdict, VerdictCategory,
 };
 use walkdir::WalkDir;
 
@@ -215,8 +217,9 @@ impl<'a> AncillaryReader<'a> {
     /// One `recvmsg` into `buf`, draining any passed fds into `self.fds`.
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use std::os::fd::{AsRawFd, RawFd};
-        // Control buffer sized for a handful of fds.
-        let mut cmsg = [0u8; 256];
+        // Control buffer sized for a handful of fds. `u64` rather than `u8` for
+        // the alignment `cmsghdr` needs, as in `send_fd_command`.
+        let mut cmsg = [0u64; 32];
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
@@ -228,7 +231,7 @@ impl<'a> AncillaryReader<'a> {
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cmsg.len() as _;
+            msg.msg_controllen = std::mem::size_of_val(&cmsg) as _;
             let n = libc::recvmsg(self.stream.as_raw_fd(), &mut msg, 0);
             if n < 0 {
                 return Err(io::Error::last_os_error());
@@ -591,6 +594,24 @@ enum BoundListener {
 }
 
 #[cfg(unix)]
+impl BoundListener {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            BoundListener::Unix(l) => l.as_raw_fd(),
+            BoundListener::Tcp(l) => l.as_raw_fd(),
+        }
+    }
+
+    fn set_nonblocking(&self) -> io::Result<()> {
+        match self {
+            BoundListener::Unix(l) => l.set_nonblocking(true),
+            BoundListener::Tcp(l) => l.set_nonblocking(true),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn bind_listener(addr: &ListenAddr) -> io::Result<BoundListener> {
     match addr {
         ListenAddr::Unix { path, mode } => Ok(BoundListener::Unix(bind_unix_socket(path, *mode)?)),
@@ -653,18 +674,74 @@ static RELOAD_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 #[cfg(unix)]
 extern "C" fn on_shutdown(_sig: libc::c_int) {
     SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    wake();
 }
 
 #[cfg(unix)]
 extern "C" fn on_sighup(_sig: libc::c_int) {
     RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    wake();
 }
 
-/// Empty handler whose only job is to interrupt the supervisor's `nanosleep`
-/// (handlers are installed without `SA_RESTART`) so a worker exit is reaped
-/// promptly rather than after the full poll interval.
+/// Wakes the supervisor so a worker exit is reaped at once.
 #[cfg(unix)]
-extern "C" fn on_sigchld(_sig: libc::c_int) {}
+extern "C" fn on_sigchld(_sig: libc::c_int) {
+    wake();
+}
+
+/// The supervisor's self-pipe: the signal handlers write to it and [`nap`]
+/// polls it. Interrupting a sleep is not enough, because a signal that lands
+/// while the supervisor is awake would then wait out the next full nap.
+#[cfg(unix)]
+static WAKE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static WAKE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// A byte is in the pipe. Keeps it to one, so the handler's `write` never
+/// fails and never changes `errno` under the code it interrupted.
+#[cfg(unix)]
+static WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Create the self-pipe. Idempotent; call before installing the handlers.
+#[cfg(unix)]
+fn arm_wakeup() -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if WAKE_WRITE.load(Ordering::Relaxed) >= 0 {
+        return Ok(());
+    }
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe` writes two descriptors into `fds`.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        // SAFETY: sets flags on descriptors this process just created.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+    }
+    WAKE_READ.store(fds[0], Ordering::Relaxed);
+    WAKE_WRITE.store(fds[1], Ordering::Relaxed);
+    Ok(())
+}
+
+/// Make the next [`nap`] return at once. Async-signal-safe: atomics and one
+/// `write`.
+#[cfg(unix)]
+fn wake() {
+    use std::sync::atomic::Ordering;
+    if WAKE_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let fd = WAKE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: writes one byte from a static to a descriptor this process
+        // owns. The pipe is empty here, so this neither blocks nor fails.
+        unsafe {
+            libc::write(fd, b"!".as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
 
 /// Public so the CLI's updater thread can raise a reload after writing new
 /// signatures to the data dir (equivalent to sending `RELOAD` over the socket).
@@ -693,6 +770,41 @@ pub fn request_reload() {
 #[cfg(unix)]
 const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// A child of a retired generation, finishing the job it had when a reload
+/// replaced it.
+#[cfg(unix)]
+struct Retiring {
+    /// The side listener's child rather than a worker.
+    side: bool,
+    since: std::time::Instant,
+    /// Sent SIGTERM for outliving its grace.
+    stopped: bool,
+}
+
+#[cfg(unix)]
+impl Retiring {
+    fn new(side: bool, since: std::time::Instant) -> Self {
+        Self {
+            side,
+            since,
+            stopped: false,
+        }
+    }
+}
+
+/// How long a retired child may take to finish: one job's time limit, plus a
+/// margin to write its answer. With no time limit, a fixed ceiling.
+#[cfg(unix)]
+fn retire_grace(max_scan_time: std::time::Duration) -> std::time::Duration {
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+    const NO_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+    if max_scan_time.is_zero() {
+        NO_LIMIT
+    } else {
+        max_scan_time + MARGIN
+    }
+}
+
 /// Newest mtime of the watched source — the reload trigger for a sidecar that
 /// writes the volume without sending `RELOAD` (clamd's `SelfCheck`). For a
 /// **directory** this is the newest mtime **across the whole tree**: the loader
@@ -700,7 +812,7 @@ const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 /// subtree), so the watch must too — an in-place overwrite deep in the tree bumps
 /// only its own directory's mtime, which a top-level-only scan would miss. For a
 /// single **file** (a prebuilt database) it is just that file's mtime — an atomic
-/// swap replaces it with a newer-mtime inode, so the poll fires. `None` if the
+/// swap replaces its inode, and so its mtime, so the poll fires. `None` if the
 /// path can't be stat'd. Symlinks are not followed (no cycles).
 ///
 /// Also the ICAP server's reload trigger, which is why it is not Unix-gated:
@@ -720,27 +832,71 @@ pub(crate) fn datadir_mtime(dir: &std::path::Path) -> Option<std::time::SystemTi
     Some(newest)
 }
 
-/// Sleep, but return early if a signal arrives (no `SA_RESTART`).
+/// Whether the watched source changed since the last poll.
+///
+/// Any difference counts, not only a newer time: swapping a database file for
+/// one that carries an older mtime (copied with `cp -p`, unpacked from an
+/// archive, built on a host with a slower clock) is still a new database.
+#[cfg(any(unix, feature = "icap"))]
+pub(crate) fn source_changed(
+    last: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    last != Some(now)
+}
+
+/// Sleep for `d`, or less if a supervisor signal arrived since the last nap.
 #[cfg(unix)]
 fn nap(d: std::time::Duration) {
-    let ts = libc::timespec {
-        tv_sec: d.as_secs() as _,
-        tv_nsec: d.subsec_nanos() as _,
-    };
+    use std::sync::atomic::Ordering;
+    let mut fds = [libc::pollfd {
+        // A negative fd (not armed) is ignored by `poll`: a plain sleep.
+        fd: WAKE_READ.load(Ordering::Relaxed),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let ms = d.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: `fds` is one valid `pollfd` for the duration of the call.
     unsafe {
-        libc::nanosleep(&ts, std::ptr::null_mut());
+        libc::poll(fds.as_mut_ptr(), 1, ms);
     }
+    if fds[0].fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 16];
+    // SAFETY: reads into a local buffer from a nonblocking descriptor this
+    // process owns; stops at EAGAIN.
+    while unsafe { libc::read(fds[0].fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
+    // Cleared after draining: a signal before this point is handled by the
+    // loop the caller is about to run, one after it writes a fresh byte.
+    WAKE_PENDING.store(false, Ordering::SeqCst);
 }
 
 /// The worker's per-job wall-clock alarm. Terminating immediately is the whole
 /// point: the scan blew its time budget (possibly stuck inside a dependency
 /// that never returns to a cooperative checkpoint), and there is no safe way to
 /// unwind in-process — so we `_exit` (async-signal-safe) and let the supervisor
-/// respawn a replacement.
+/// respawn a replacement. The client gets a verdict first, as in
+/// [`on_sigabrt`]: a connection closed with no reply reads as clean to some
+/// clients.
 #[cfg(unix)]
 extern "C" fn on_sigalrm(_sig: libc::c_int) {
+    let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            libc::write(
+                fd,
+                TIMEOUT_REPLY.as_ptr() as *const libc::c_void,
+                TIMEOUT_REPLY.len(),
+            );
+        }
+    }
     unsafe { libc::_exit(EXIT_TIMEOUT) }
 }
+
+/// Reply [`on_sigalrm`] emits, framed like [`ABORT_REPLY`].
+#[cfg(unix)]
+const TIMEOUT_REPLY: &[u8] = b": scan exceeded --max-scan-secs LIMITS-EXCEEDED ERROR\n\0";
 
 /// The fd of the connection this worker is currently serving, for the abort
 /// handler below. `-1` when idle. A raw atomic because a signal handler may read
@@ -782,6 +938,37 @@ extern "C" fn on_sigabrt(_sig: libc::c_int) {
     }
     unsafe { libc::_exit(EXIT_ABORTED) }
 }
+
+/// Whether the worker is inside a job: between `arm` and `disarm`.
+#[cfg(unix)]
+static IN_JOB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reply [`on_sigterm`] emits, framed like [`ABORT_REPLY`].
+#[cfg(unix)]
+const STOPPED_REPLY: &[u8] = b": scan stopped before it finished ERROR\n\0";
+
+/// A worker told to stop (a shutdown, its supervisor gone, or a retired
+/// generation past its grace) answers the job it is in, as [`on_sigalrm`]
+/// does. Between jobs it just exits: a line written then would be read as the
+/// answer to the client's next command.
+#[cfg(unix)]
+extern "C" fn on_sigterm(_sig: libc::c_int) {
+    let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 && IN_JOB.load(std::sync::atomic::Ordering::Relaxed) {
+        unsafe {
+            libc::write(
+                fd,
+                STOPPED_REPLY.as_ptr() as *const libc::c_void,
+                STOPPED_REPLY.len(),
+            );
+        }
+    }
+    unsafe { libc::_exit(EXIT_STOPPED) }
+}
+
+/// Exit code for a worker stopped by [`on_sigterm`].
+#[cfg(unix)]
+const EXIT_STOPPED: libc::c_int = 92;
 
 /// Exit code for a worker that aborted mid-scan and managed to say so.
 #[cfg(unix)]
@@ -829,16 +1016,6 @@ fn current_address_space() -> Option<u64> {
     (page > 0).then(|| pages.saturating_mul(page as u64))
 }
 
-/// How much address space one job may use so the whole pool fits in RAM.
-///
-/// `None` when the host's memory cannot be read, in which case the configured
-/// value stands unmodified.
-///
-/// The signature database is shared copy-on-write by every worker, so it is
-/// subtracted ONCE rather than per worker. A slice of RAM is held back for the
-/// kernel and everything else on the box — running the machine to exactly zero
-/// free just moves the kill from one process to another.
-#[cfg(unix)]
 /// Bring the in-core extraction budget inside the memory a job is actually
 /// granted, so the deterministic cap fires before the kernel one.
 ///
@@ -859,6 +1036,7 @@ fn current_address_space() -> Option<u64> {
 ///
 /// Clamping here restores the intended order. It only ever *lowers* a budget,
 /// so it cannot make a scan look at more than the operator asked for.
+#[cfg(unix)]
 pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) {
     /// Of the memory a job is granted, the share extraction buffers may claim.
     /// The rest covers the matcher's own working set — chiefly the lowercase
@@ -884,35 +1062,82 @@ pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) 
 }
 
 /// This process's cgroup memory ceiling, if it has one.
-///
-/// v2 first (`memory.max`, the unified hierarchy every current runtime uses),
-/// then the v1 path. Both spell "no limit" as a sentinel — literal `max` on v2,
-/// a number near `u64::MAX` on v1 — which reads as *unlimited*, not as a cap of
-/// that size. Absent or unreadable means no cgroup ceiling to apply.
+#[cfg(unix)]
 fn cgroup_memory_limit() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",                   // cgroup v2
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1
-    ] {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let raw = raw.trim();
-        if raw == "max" {
-            return None;
-        }
-        if let Ok(v) = raw.parse::<u64>() {
-            // v1 reports "unlimited" as a huge page-aligned number rather than a
-            // word; anything past the host's own RAM is not a real ceiling.
-            if v > 0 && v < (u64::MAX >> 10) {
-                return Some(v);
-            }
-            return None;
-        }
-    }
-    None
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    cgroup_limit_from(&own, |p| std::fs::read_to_string(p).ok())
 }
 
+/// The smallest memory limit on the cgroup `proc_self_cgroup` names and its
+/// ancestors, reading files through `read`.
+///
+/// v2 first (`memory.max`, the unified hierarchy every current runtime uses),
+/// then v1 (`memory.limit_in_bytes`). Both spell "no limit" as a sentinel
+/// (literal `max` on v2, a number near `u64::MAX` on v1), which reads as
+/// *unlimited*, not as a cap of that size. A path the mount does not show (a
+/// v1 container sees its own cgroup at the mount root) ends up at the root,
+/// which is then the process's own.
+#[cfg(unix)]
+fn cgroup_limit_from(proc_self_cgroup: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+    let mut v2 = None;
+    let mut v1 = None;
+    for line in proc_self_cgroup.lines() {
+        let mut f = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if controllers.is_empty() {
+            v2 = Some(path);
+        } else if controllers.split(',').any(|c| c == "memory") {
+            v1 = Some(path);
+        }
+    }
+    let lowest = |mount: &str, file: &str, own: &str| -> Option<Option<u64>> {
+        let mut dir = own.trim_end_matches('/').to_string();
+        let mut found = None;
+        let mut limit: Option<u64> = None;
+        loop {
+            if let Some(raw) = read(&format!("{mount}{dir}/{file}")) {
+                found = Some(());
+                let raw = raw.trim();
+                // v1 reports "unlimited" as a huge page-aligned number rather
+                // than a word; anything past the host's own RAM is no ceiling.
+                if let Ok(v) = raw.parse::<u64>() {
+                    if v > 0 && v < (u64::MAX >> 10) {
+                        limit = Some(limit.map_or(v, |l| l.min(v)));
+                    }
+                }
+            }
+            match dir.rfind('/') {
+                Some(i) => dir.truncate(i),
+                None => break,
+            }
+        }
+        found.map(|()| limit)
+    };
+    [
+        v2.and_then(|p| lowest("/sys/fs/cgroup", "memory.max", p)),
+        v1.and_then(|p| lowest("/sys/fs/cgroup/memory", "memory.limit_in_bytes", p)),
+        // No `/proc/self/cgroup` to go by: the mount roots, as seen from here.
+        lowest("/sys/fs/cgroup", "memory.max", "/"),
+        lowest("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "/"),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .flatten()
+}
+
+/// How much address space one job may use so the whole pool fits in RAM.
+///
+/// `None` when the host's memory cannot be read, in which case the configured
+/// value stands unmodified.
+///
+/// The signature database is shared copy-on-write by every worker, so it is
+/// subtracted ONCE rather than per worker. A slice of RAM is held back for the
+/// kernel and everything else on the box: running the machine to exactly zero
+/// free just moves the kill from one process to another.
+#[cfg(unix)]
 fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
     /// Leave this fraction of total RAM to the rest of the system.
     ///
@@ -1033,10 +1258,105 @@ fn set_timer(d: std::time::Duration) {
 pub struct SideListener {
     /// Named in the supervisor's log when the child exits.
     pub name: &'static str,
-    /// Serves the listener it captured, in the forked child. Runs until the
-    /// process is stopped; returning at all means the listener is gone.
+    /// Serves the listener it captured, in the forked child. The descriptor is
+    /// the child's generation (see [`await_connection`]): once it is retired,
+    /// the child finishes what it is serving and exits 0.
     #[allow(clippy::type_complexity)]
-    pub serve: Box<dyn Fn(Arc<Scanner>, Arc<ScanOptions>) + Send + Sync>,
+    pub serve: Box<dyn Fn(Arc<Scanner>, Arc<ScanOptions>, std::os::fd::RawFd) + Send + Sync>,
+}
+
+/// One generation of the pool: a pipe whose write end only the supervisor
+/// holds. Its children wait on the read end alongside the listener, and
+/// dropping the generation closes the write end, which they see as end of
+/// file: an idle child leaves at once, a busy one after its current job. A
+/// reload retires the old children this way rather than by signal, so no scan
+/// in progress is cut short.
+#[cfg(unix)]
+struct Generation {
+    retire: std::os::fd::OwnedFd,
+    notice: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl Generation {
+    fn new() -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` writes two descriptors into `fds`.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both descriptors were just created and nothing else owns them.
+        let (retire, notice) = unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        };
+        for fd in fds {
+            // SAFETY: sets a flag on a descriptor this process owns.
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        Ok(Self { retire, notice })
+    }
+
+    /// In a child just forked: drop its copy of the write end, so only the
+    /// supervisor's keeps the generation alive. Returns the end to wait on.
+    fn enter(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        // SAFETY: closes this process's inherited copy. The `OwnedFd` is the
+        // parent's value and is never dropped here: a child does not return.
+        unsafe {
+            libc::close(self.notice.as_raw_fd());
+        }
+        self.retire.as_raw_fd()
+    }
+}
+
+/// An accept error that only means there is nothing to accept right now.
+#[cfg(unix)]
+pub(crate) fn lost_accept_race(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+/// Block until `listener` has a connection to accept (`true`) or the
+/// generation `retire` belongs to has been retired (`false`).
+#[cfg(unix)]
+pub(crate) fn await_connection(listener: std::os::fd::RawFd, retire: std::os::fd::RawFd) -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: retire,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: listener,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: `fds` is two valid `pollfd` for the duration of the call.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Let the accept that follows report the failure.
+            return true;
+        }
+        if fds[0].revents != 0 {
+            return false;
+        }
+        if fds[1].revents != 0 {
+            return true;
+        }
+    }
 }
 
 /// Run the daemon as a prefork pool of `cfg.workers` worker processes.
@@ -1065,11 +1385,14 @@ pub fn run_prefork(
     }
 
     let listener = bind_listener(&addr)?;
+    // Workers wait in `await_connection`, not in `accept`: several may wake for
+    // one connection, and the ones that lose the race must not block in accept.
+    listener.set_nonblocking()?;
 
-    // Warm every lazily-initialised structure (engine automaton, compiled YARA
-    // rules) BEFORE forking, so all workers share them read-only via COW rather
-    // than each compiling its own private copy on first scan.
-    let _ = scan_stream(&db, &b"MZ\x90\x00\x00\x00\x00\x00"[..]);
+    // Warm every lazily-initialised structure BEFORE forking, so all workers
+    // share them read-only via COW rather than each building its own copy on
+    // first scan.
+    exav_core::warm_up(&db);
 
     // Sized here, before the options are shared: the address space is measured
     // once the database is loaded and warmed, and both the per-job ceiling and
@@ -1126,19 +1449,26 @@ pub fn run_prefork(
     // worker inherits it via copy-on-write.
     DAEMON_MAX_WORKERS.store(cfg.workers.max(1), Ordering::Relaxed);
 
+    arm_wakeup()?;
     install_handler(libc::SIGTERM, on_shutdown);
     install_handler(libc::SIGINT, on_shutdown);
     install_handler(libc::SIGHUP, on_sighup);
     install_handler(libc::SIGCHLD, on_sigchld);
 
+    let mut gen = Generation::new()?;
     let mut children = std::collections::HashSet::new();
     for _ in 0..cfg.workers {
-        children.insert(spawn_worker(&listener, &db, &opts, &cfg)?);
+        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
     }
     let mut side_pid = match side {
-        Some(s) => Some(spawn_side(s, &db, &opts)?),
+        Some(s) => Some(spawn_side(s, &db, &opts, &gen)?),
         None => None,
     };
+    // Children of retired generations, still finishing their last job. They
+    // are reaped but not replaced, and stopped once their grace has passed.
+    let mut retiring: std::collections::HashMap<libc::pid_t, Retiring> =
+        std::collections::HashMap::new();
+    let grace = retire_grace(cfg.max_scan_time);
 
     let mut last_mtime = datadir.as_deref().and_then(datadir_mtime);
 
@@ -1157,13 +1487,23 @@ pub fn run_prefork(
             if pid <= 0 {
                 break; // 0 = none exited yet; <0 = no children / error
             }
+            let side_name = side.map_or("worker", |s| s.name);
+            if let Some(r) = retiring.remove(&pid) {
+                log_child_exit(pid, status, if r.side { side_name } else { "worker" }, true);
+                continue;
+            }
             let is_side = side_pid == Some(pid);
             if is_side {
                 side_pid = None;
             } else {
                 children.remove(&pid);
             }
-            log_child_exit(pid, status, side.map_or("worker", |s| s.name), is_side);
+            log_child_exit(
+                pid,
+                status,
+                if is_side { side_name } else { "worker" },
+                false,
+            );
             if !SHUTDOWN.load(Ordering::Relaxed) {
                 if is_side {
                     // Unwrapping is sound: `is_side` is only ever true when a
@@ -1172,9 +1512,10 @@ pub fn run_prefork(
                         side.expect("a side listener exited, so there is one"),
                         &db,
                         &opts,
+                        &gen,
                     )?);
                 } else {
-                    children.insert(spawn_worker(&listener, &db, &opts, &cfg)?);
+                    children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
                 }
             }
         }
@@ -1183,7 +1524,7 @@ pub fn run_prefork(
         // disk (a sidecar wrote it). Coalesce both into one reload per tick.
         let disk_changed = match datadir.as_deref().and_then(datadir_mtime) {
             Some(t) => {
-                let changed = last_mtime.map(|prev| t > prev).unwrap_or(true);
+                let changed = source_changed(last_mtime, t);
                 if changed {
                     last_mtime = Some(t);
                 }
@@ -1199,24 +1540,27 @@ pub fn run_prefork(
                         new_db.signature_count()
                     );
                     // Warm before forking so new workers share it COW.
-                    let _ = scan_stream(&new_db, &b"MZ\x90\x00\x00\x00\x00\x00"[..]);
+                    exav_core::warm_up(&new_db);
                     db = Arc::new(new_db);
-                    // Graceful re-fork: bring up a fresh generation from the new
-                    // DB, then retire the old children (reaped on the next tick).
-                    // The side listener goes with them, which is the whole of its
-                    // signature swap — it comes back forked from the new database.
-                    let mut old: Vec<libc::pid_t> = children.drain().collect();
-                    old.extend(side_pid.take());
+                    // Replacing the generation drops the old one, which is the
+                    // old children's notice to leave once idle. It happens
+                    // before the fork so the new children never hold the old
+                    // write end. The side listener goes with them, which is the
+                    // whole of its signature swap: it comes back forked from
+                    // the new database.
+                    gen = Generation::new()?;
+                    let since = std::time::Instant::now();
+                    retiring.extend(
+                        children
+                            .drain()
+                            .map(|pid| (pid, Retiring::new(false, since))),
+                    );
+                    retiring.extend(side_pid.take().map(|pid| (pid, Retiring::new(true, since))));
                     for _ in 0..cfg.workers {
-                        children.insert(spawn_worker(&listener, &db, &opts, &cfg)?);
+                        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
                     }
                     if let Some(s) = side {
-                        side_pid = Some(spawn_side(s, &db, &opts)?);
-                    }
-                    for pid in old {
-                        unsafe {
-                            libc::kill(pid, libc::SIGTERM);
-                        }
+                        side_pid = Some(spawn_side(s, &db, &opts, &gen)?);
                     }
                 }
                 Err(e) => {
@@ -1225,11 +1569,43 @@ pub fn run_prefork(
             }
         }
 
-        nap(SUPERVISOR_TICK);
+        // A retired child past its grace is stopped: an idle session or a
+        // client that never finishes its request would otherwise keep it, and
+        // the old signatures it serves, alive indefinitely.
+        let now = std::time::Instant::now();
+        let mut tick = SUPERVISOR_TICK;
+        for (&pid, r) in retiring.iter_mut().filter(|(_, r)| !r.stopped) {
+            let due = r.since + grace;
+            if now >= due {
+                let what = if r.side {
+                    side.map_or("worker", |s| s.name)
+                } else {
+                    "worker"
+                };
+                eprintln!(
+                    "exav: {what} {pid} of a retired generation is still busy after {}s; stopping it",
+                    grace.as_secs()
+                );
+                // SAFETY: signals a child of this process that has not been
+                // reaped, so the pid cannot have been reused.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                r.stopped = true;
+            } else {
+                tick = tick.min(due - now);
+            }
+        }
+        nap(tick);
     }
 
     // Graceful teardown: signal every child, then reap them.
-    let all: Vec<libc::pid_t> = children.iter().copied().chain(side_pid).collect();
+    let all: Vec<libc::pid_t> = children
+        .iter()
+        .copied()
+        .chain(side_pid)
+        .chain(retiring.keys().copied())
+        .collect();
     for &pid in &all {
         unsafe {
             libc::kill(pid, libc::SIGTERM);
@@ -1296,6 +1672,7 @@ fn spawn_side(
     side: &SideListener,
     db: &Arc<Scanner>,
     opts: &Arc<ScanOptions>,
+    gen: &Generation,
 ) -> io::Result<libc::pid_t> {
     use std::io::Write as _;
     let _ = io::stderr().flush();
@@ -1306,6 +1683,7 @@ fn spawn_side(
     match pid {
         -1 => Err(io::Error::last_os_error()),
         0 => {
+            let retire = gen.enter();
             unsafe {
                 libc::signal(libc::SIGTERM, libc::SIG_DFL);
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
@@ -1316,7 +1694,7 @@ fn spawn_side(
             // disposition — a handler inherited from the supervisor would
             // otherwise decide what parent death means here.
             die_with_parent(supervisor);
-            (side.serve)(Arc::clone(db), Arc::clone(opts));
+            (side.serve)(Arc::clone(db), Arc::clone(opts), retire);
             // The listener was the child's whole job, so there is nothing left
             // for it to do but let the supervisor respawn it.
             unsafe { libc::_exit(2) }
@@ -1331,6 +1709,7 @@ fn spawn_worker(
     db: &Arc<Scanner>,
     opts: &Arc<ScanOptions>,
     cfg: &PoolConfig,
+    gen: &Generation,
 ) -> io::Result<libc::pid_t> {
     // Flush so buffered parent output isn't duplicated into the child.
     use std::io::Write as _;
@@ -1340,14 +1719,15 @@ fn spawn_worker(
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
-        0 => worker_main(listener, db, opts, cfg, supervisor), // never returns
+        0 => worker_main(listener, db, opts, cfg, supervisor, gen.enter()), // never returns
         n => Ok(n),
     }
 }
 
 /// A worker process: bound by the kernel limits, it accepts and serves
-/// connections one at a time until it hits its job limit (then exits cleanly so
-/// the supervisor recycles it). Never returns.
+/// connections one at a time until it hits its job limit or its generation
+/// `retire` is retired (then exits cleanly, and the supervisor replaces it in
+/// the first case only). Never returns.
 #[cfg(unix)]
 fn worker_main(
     listener: &BoundListener,
@@ -1355,6 +1735,7 @@ fn worker_main(
     opts: &ScanOptions,
     cfg: &PoolConfig,
     supervisor: libc::pid_t,
+    retire: std::os::fd::RawFd,
 ) -> ! {
     // Apply the kernel-enforced resource caps to *this* process.
     //
@@ -1379,21 +1760,27 @@ fn worker_main(
     install_handler(libc::SIGALRM, on_sigalrm);
     // Report an allocation failure to the client instead of dying silently.
     install_handler(libc::SIGABRT, on_sigabrt);
-    // Restore default disposition for the signals the parent handles, so the
-    // supervisor's kill terminates us and inherited handlers don't fire here.
+    // Replace the handlers inherited from the supervisor, so its kill
+    // terminates us and its flag-setting handlers don't fire here.
     unsafe {
-        libc::signal(libc::SIGTERM, libc::SIG_DFL);
         libc::signal(libc::SIGINT, libc::SIG_DFL);
         libc::signal(libc::SIGHUP, libc::SIG_DFL);
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
-    // Only now, with SIGTERM back to its default disposition: arranged before
-    // the reset, parent death would run the handler this worker inherited from
-    // the supervisor, which only sets a flag — and the worker would go on to
-    // block in `accept()` exactly as if nothing had been arranged at all.
+    install_handler(libc::SIGTERM, on_sigterm);
+    // Only now, with SIGTERM handled here: arranged before, parent death would
+    // run the handler this worker inherited from the supervisor, which only
+    // sets a flag, and the worker would go on to block in `accept()` exactly
+    // as if nothing had been arranged at all.
     die_with_parent(supervisor);
-    let arm = || set_timer(cfg.max_scan_time);
-    let disarm = || set_timer(std::time::Duration::ZERO);
+    let arm = || {
+        IN_JOB.store(true, std::sync::atomic::Ordering::Relaxed);
+        set_timer(cfg.max_scan_time)
+    };
+    let disarm = || {
+        set_timer(std::time::Duration::ZERO);
+        IN_JOB.store(false, std::sync::atomic::Ordering::Relaxed);
+    };
     // A `RELOAD` command reaches a worker, not the supervisor; forward it by
     // signalling the parent, which owns the pool and does the re-fork.
     let reload = || unsafe {
@@ -1416,9 +1803,15 @@ fn worker_main(
 
     let mut jobs = 0u64;
     loop {
+        if !await_connection(listener.as_raw_fd(), retire) {
+            unsafe { libc::_exit(0) }
+        }
+        // The listener is non-blocking, and on some systems an accepted socket
+        // inherits that; a job's reads are written for a blocking one.
         let outcome: io::Result<()> = match listener {
             BoundListener::Unix(l) => match l.accept() {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
                     // Record the fd so `on_sigabrt` can answer on this connection
                     // if the scan aborts, instead of closing without a word.
@@ -1442,7 +1835,8 @@ fn worker_main(
                     disarm(); // ensure the timer is off between connections
                     r
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // Another worker took the connection this one woke for.
+                Err(e) if lost_accept_race(&e) => continue,
                 Err(e) => unsafe {
                     eprintln!("exav: worker accept error: {e}");
                     libc::_exit(1);
@@ -1450,6 +1844,7 @@ fn worker_main(
             },
             BoundListener::Tcp(l) => match l.accept() {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
                     // As on the Unix path: without the fd, `on_sigabrt` has
                     // nowhere to send its last word and an aborted scan closes
@@ -1476,7 +1871,7 @@ fn worker_main(
                     disarm();
                     r
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if lost_accept_race(&e) => continue,
                 Err(e) => unsafe {
                     eprintln!("exav: worker accept error: {e}");
                     libc::_exit(1);
@@ -1496,14 +1891,16 @@ fn worker_main(
 }
 
 /// Decode a reaped child's wait-status into a human-readable cause, so the
-/// operator can see *why* it died (timeout / OOM / CPU / recycle). `side_name`
-/// names the extra listener's child when `is_side`; everything else is a worker.
+/// operator can see *why* it died (timeout / OOM / CPU / recycle). `what` names
+/// the child; `retired` says it belonged to a generation a reload replaced.
 #[cfg(unix)]
-fn log_child_exit(pid: libc::pid_t, status: libc::c_int, side_name: &str, is_side: bool) {
+fn log_child_exit(pid: libc::pid_t, status: libc::c_int, what: &str, retired: bool) {
     let cause = if libc::WIFEXITED(status) {
         match libc::WEXITSTATUS(status) {
             EXIT_TIMEOUT => "scan wall-clock timeout".to_string(),
             EXIT_ABORTED => "aborted mid-scan (reported to the client)".to_string(),
+            EXIT_STOPPED => "stopped".to_string(),
+            0 if retired => "retired after a reload".to_string(),
             0 => "recycled (job limit / clean exit)".to_string(),
             code => format!("exit code {code}"),
         }
@@ -1517,7 +1914,6 @@ fn log_child_exit(pid: libc::pid_t, status: libc::c_int, side_name: &str, is_sid
     } else {
         "unknown".to_string()
     };
-    let what = if is_side { side_name } else { "worker" };
     eprintln!("exav: {what} {pid} exited: {cause}");
 }
 
@@ -2219,10 +2615,10 @@ impl StreamPayload {
         }
     }
 
-    /// The payload's bytes, or `None` when it is larger than `cap`. Used to feed
-    /// a payload back for multi-volume rejoining, which is the one thing that
-    /// needs a second look at the same bytes.
-    fn bytes_capped(&self, cap: u64) -> io::Result<Option<Vec<u8>>> {
+    /// The payload's bytes, or `None` when it is larger than `cap`. For the
+    /// second looks at the same bytes: multi-volume rejoining, and
+    /// `--all-matches`.
+    pub(crate) fn bytes_capped(&self, cap: u64) -> io::Result<Option<Vec<u8>>> {
         if self.len() > cap {
             return Ok(None);
         }
@@ -2237,59 +2633,129 @@ impl StreamPayload {
     }
 }
 
+/// A stream read into a seekable payload, as far as it could be held.
+pub(crate) struct Held {
+    pub(crate) payload: StreamPayload,
+    /// Why the payload stops before the stream's end, when it does: there was
+    /// nowhere left to put the rest. The reader is left at that point.
+    pub(crate) short: Option<String>,
+}
+
 /// Buffer an (already de-chunked / pre-capped) reader into a [`StreamPayload`]:
 /// up to the configured threshold in RAM, then spill the rest to a temp file.
-/// Shared by the daemon stream verbs and the CLI stdin path so both get the same
-/// seekable, container-aware scan under the same budgets.
-pub(crate) fn buffer_to_seekable<R: Read>(
-    reader: &mut R,
-) -> Result<StreamPayload, crate::spill::SpillError> {
+/// Shared by the daemon stream verbs and the CLI's stdin so all get the same
+/// seekable, container-aware scan under the same budgets. A stream larger than
+/// the budgets allow is held as far as they allow.
+pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<Held> {
+    use crate::spill::SpillError;
     let threshold = crate::spill::config().threshold;
     let mut buf = Vec::new();
     reader.by_ref().take(threshold).read_to_end(&mut buf)?;
-    if (buf.len() as u64) < threshold {
-        return Ok(StreamPayload::Mem(buf));
+    let mut block = vec![0u8; 64 * 1024];
+    let got = match (buf.len() as u64) < threshold {
+        true => 0,
+        false => read_full(reader, &mut block)?,
+    };
+    if got == 0 {
+        return Ok(Held {
+            payload: StreamPayload::Mem(buf),
+            short: None,
+        });
     }
-    // More data remains — spill the RAM head, then stream the rest to disk. The
+    // More data remains: spill the RAM head, then stream the rest to disk. The
     // budgets live in `SpillFile`: `RLIMIT_AS` caps address space and does not
     // cap a file, so without them a client that never stops sending fills the
-    // temp filesystem — a denial of service against the host rather than the
+    // temp filesystem, a denial of service against the host rather than the
     // scan, and one that outlives the connection.
-    let mut tmp = crate::spill::SpillFile::create()?;
-    tmp.write_all(&buf)?;
-    let mut block = vec![0u8; 64 * 1024];
-    loop {
-        let got = reader.read(&mut block)?;
-        if got == 0 {
+    let mut tmp = match crate::spill::SpillFile::create() {
+        Ok(t) => t,
+        Err(SpillError::Budget(why)) => {
+            return Ok(Held {
+                payload: StreamPayload::Mem(buf),
+                short: Some(why),
+            })
+        }
+        Err(SpillError::Io(e)) => return Err(e),
+    };
+    let mut short = None;
+    for chunk in [&buf[..], &block[..got]] {
+        match tmp.write_all(chunk) {
+            Ok(()) => {}
+            Err(SpillError::Budget(why)) => {
+                short = Some(why);
+                break;
+            }
+            Err(SpillError::Io(e)) => return Err(e),
+        }
+    }
+    while short.is_none() {
+        let n = reader.read(&mut block)?;
+        if n == 0 {
             break;
         }
-        tmp.write_all(&block[..got])?;
+        match tmp.write_all(&block[..n]) {
+            Ok(()) => {}
+            Err(SpillError::Budget(why)) => short = Some(why),
+            Err(SpillError::Io(e)) => return Err(e),
+        }
     }
     let len = tmp.len()?;
-    Ok(StreamPayload::Disk(tmp, len))
+    Ok(Held {
+        payload: StreamPayload::Disk(tmp, len),
+        short,
+    })
+}
+
+/// Scan what was held of a stream of `size` bytes. A payload that stops short
+/// for want of room is treated as `--max-input-bytes` treats an input past it:
+/// the held bytes get the whole scan, and with no detection in them the limit
+/// is reported.
+pub(crate) fn scan_held(
+    db: &Scanner,
+    opts: &ScanOptions,
+    held: &Held,
+    size: u64,
+) -> io::Result<(ScanReport, Option<String>)> {
+    let Some(why) = &held.short else {
+        return scan_payload(db, opts, &held.payload, size);
+    };
+    let kept = held.payload.len();
+    let (report, loc) = scan_payload(db, opts, &held.payload, kept)?;
+    if report.verdict.category() == VerdictCategory::Infected {
+        return Ok((report, loc));
+    }
+    let reason = format!("{why}; scanned the first {kept} bytes only");
+    Ok((
+        ScanReport::new(Verdict::LimitsExceeded { reason }, Vec::new()),
+        None,
+    ))
 }
 
 /// Scan a materialized payload via the seekable (container-aware) path, returning
 /// the report and the nested match location (`None` for a top-level hit).
+///
+/// `size` is the input's full size. It is larger than the payload when the
+/// input went past `--max-input-bytes` and only its start was kept.
 pub(crate) fn scan_payload(
     db: &Scanner,
     opts: &ScanOptions,
     payload: &StreamPayload,
+    size: u64,
 ) -> io::Result<(ScanReport, Option<String>)> {
     match payload {
         StreamPayload::Mem(v) => {
-            scan_seekable_located(db, std::io::Cursor::new(&v[..]), v.len() as u64, opts)
+            scan_seekable_located(db, std::io::Cursor::new(&v[..]), size, opts)
         }
-        StreamPayload::Disk(tmp, len) => {
+        StreamPayload::Disk(tmp, _) => {
             // A fresh handle positioned at 0; the `TempFile` stays alive (and
             // thus the file) for as long as the payload does.
             let file = tmp.reopen()?;
-            scan_seekable_located(db, file, *len, opts)
+            scan_seekable_located(db, file, size, opts)
         }
     }
 }
 
-/// [`scan_payload`], timed into the process counters.
+/// [`scan_held`], timed into the process counters.
 ///
 /// The ICAP listener times its own scans (it names the object from the request
 /// target, which this cannot see), so this is the daemon's stream verbs only —
@@ -2297,18 +2763,19 @@ pub(crate) fn scan_payload(
 fn scan_payload_timed(
     db: &Scanner,
     opts: &ScanOptions,
-    payload: &StreamPayload,
+    held: &Held,
+    size: u64,
     target: &str,
 ) -> io::Result<(ScanReport, Option<String>)> {
     let timer = crate::metrics::ScanTimer::start();
-    let result = scan_payload(db, opts, payload);
+    let result = scan_held(db, opts, held, size);
     let category = match &result {
         Ok((report, _)) => report.verdict.category().into(),
         // A scan that failed is a scan that did not finish, which is the
         // partial column wherever else exav counts it.
         Err(_) => crate::metrics::Category::Partial,
     };
-    timer.finish(target, payload.len(), category);
+    timer.finish(target, held.payload.len(), category);
     result
 }
 
@@ -2322,35 +2789,18 @@ fn instream<R: Read>(
     opts: &ScanOptions,
     reader: &mut BufReader<R>,
 ) -> io::Result<String> {
-    let max = opts.max_scan_size;
-    let mut stream = Instream::new(reader, max);
-    let payload = match buffer_to_seekable(&mut stream) {
-        Ok(p) => p,
-        // A budget with no room is a stream nobody could examine, which is a
-        // verdict the client is owed. Letting it out as an I/O error would drop
-        // the connection instead, and a client with no answer decides for
-        // itself — the one outcome an over-full temp filesystem must not buy.
-        Err(crate::spill::SpillError::Budget(reason)) => {
-            let _ = stream.drain();
-            return Ok(format!("stream: {reason} UNSCANNABLE ERROR"));
-        }
-        Err(crate::spill::SpillError::Io(e)) => return Err(e),
-    };
-    let over = stream.over_limit;
-    let truncated = stream.truncated();
-    // The reply is already decided; a drain that stops at its cap only means the
-    // connection will not be reusable.
+    let mut stream = Instream::new(reader, opts.max_scan_size);
+    let held = buffer_to_seekable(&mut stream)?;
+    // Counts what was not held, so the size is the stream's. A drain that
+    // stops at its cap only means the connection will not be reusable.
     let _reached_terminator = stream.drain()?;
-    if over {
-        let max = max.unwrap_or(0);
-        return Ok(format!("stream: size exceeds {max} LIMITS-EXCEEDED ERROR"));
-    }
     // Answering a prefix would answer a question the client never finished
     // asking, and `OK` on the benign head of a file is a bypass anyone can drive.
-    if truncated {
-        return Ok("stream: stream ended before its terminator UNSCANNABLE ERROR".to_string());
+    // Not a partial either: `--partial-as ok` would turn it back into that `OK`.
+    if stream.truncated() {
+        return Ok(format!("stream: {STREAM_CUT} ERROR"));
     }
-    let (report, _loc) = scan_payload_timed(db, opts, &payload, "stream")?;
+    let (report, _loc) = scan_payload_timed(db, opts, &held, stream.total(), "stream")?;
     Ok(verdict_line("stream", &report))
 }
 
@@ -2373,32 +2823,20 @@ fn exinstream<R: Read>(
     // per-top-level-file bound, which `--max-input-bytes` sets. Naming the other
     // flag here would send an operator to raise a setting that changes nothing.
     let mut stream = Instream::new(reader, opts.max_scan_size);
-    let payload = match buffer_to_seekable(&mut stream) {
-        Ok(p) => p,
+    let held = match buffer_to_seekable(&mut stream) {
+        Ok(h) => h,
         Err(e) => {
             let _ = stream.drain();
             return Ok(json_error(&format!("stream read error: {e}")));
         }
     };
-    let over = stream.over_limit;
-    let truncated = stream.truncated();
-    // The reply is already decided; a drain that stops at its cap only means the
-    // connection will not be reusable.
+    // As in INSTREAM: counts what was not held.
     let _reached_terminator = stream.drain()?;
-    if over {
-        return Ok(json_partial(
-            "LIMITS-EXCEEDED",
-            Some("stream exceeds max-filesize; not fully scanned"),
-        ));
-    }
     // As in INSTREAM: a prefix is not the file, so it gets no verdict.
-    if truncated {
-        return Ok(json_partial(
-            "TRUNCATED",
-            Some("stream ended before its terminator; not fully received"),
-        ));
+    if stream.truncated() {
+        return Ok(json_error(STREAM_CUT));
     }
-    match scan_payload_timed(db, opts, &payload, "stream") {
+    match scan_payload_timed(db, opts, &held, stream.total(), "stream") {
         Ok((report, loc)) => Ok(verdict_json(&report, loc)),
         Err(e) => Ok(json_error(&format!("scan error: {e}"))),
     }
@@ -2460,7 +2898,8 @@ fn exinstream_multi<R: Read>(
 ) -> io::Result<String> {
     use serde_json::json;
     let mut names: Vec<String> = Vec::new();
-    let mut payloads: Vec<StreamPayload> = Vec::new();
+    // `None` for a file the daemon could not hold.
+    let mut payloads: Vec<Option<StreamPayload>> = Vec::new();
     let mut entries: Vec<serde_json::Value> = Vec::new();
     // Set when the request stops before its terminator. Every file already read
     // still gets its verdict — those streams were complete — but the request as
@@ -2496,44 +2935,37 @@ fn exinstream_multi<R: Read>(
         let name = String::from_utf8_lossy(&raw).into_owned();
 
         let mut stream = Instream::new(reader, opts.max_scan_size);
-        let payload = match buffer_to_seekable(&mut stream) {
-            Ok(p) => p,
+        let held = match buffer_to_seekable(&mut stream) {
+            Ok(h) => h,
             Err(e) => {
                 let _ = stream.drain();
                 return Ok(json_error(&format!("stream read error: {e}")));
             }
         };
-        let over = stream.over_limit;
-        let truncated = stream.truncated();
-        stream.drain()?;
-        if truncated {
-            request_truncated = true;
-        }
-        let fields = if over {
-            json!({
-                "status": "PARTIAL",
-                "category": "LIMITS-EXCEEDED",
-                "reason": "stream exceeds max-filesize; not fully scanned",
-            })
-        } else if truncated {
-            json!({
-                "status": "PARTIAL",
-                "category": "TRUNCATED",
-                "reason": "stream ended before its terminator; not fully received",
-            })
+        // Past a drain that stopped at its cap, or at end of input, the next
+        // file's framing is not where the loop would look for it.
+        let cut = !stream.drain()? || stream.truncated();
+        let fields = if stream.truncated() {
+            json!({"status": "ERROR", "reason": STREAM_CUT})
         } else {
-            match scan_payload_timed(db, opts, &payload, &name) {
+            match scan_payload_timed(db, opts, &held, stream.total(), &name) {
                 Ok((report, loc)) => verdict_fields(&report, loc),
                 Err(e) => json!({"status": "ERROR", "reason": format!("scan error: {e}")}),
             }
         };
-        match &payload {
+        match &held.payload {
             StreamPayload::Mem(v) => held_ram += v.len() as u64,
             StreamPayload::Disk(_, n) => held_spill += *n,
         }
         entries.push(named_entry(&name, fields, None));
         names.push(name);
-        payloads.push(payload);
+        // Only a whole file can be a part of a rejoined set.
+        let whole = held.short.is_none() && held.payload.len() == stream.total();
+        payloads.push(whole.then_some(held.payload));
+        if cut {
+            request_truncated = true;
+            break;
+        }
 
         // Stop before accepting the file that would cross the line, so the
         // reply describes a request the daemon actually held rather than one it
@@ -2557,6 +2989,8 @@ fn exinstream_multi<R: Read>(
             .position(|n| n == name)
             .ok_or_else(|| io::Error::other("no such stream"))?;
         payloads[i]
+            .as_ref()
+            .ok_or_else(|| io::Error::other("stream was not held"))?
             .bytes_capped(opts.deep_analysis_max)?
             .ok_or_else(|| io::Error::other("stream too large to rejoin"))
     });
@@ -2665,13 +3099,8 @@ fn json_error(message: &str) -> String {
     serde_json::json!({"v": 1, "status": "ERROR", "reason": message}).to_string()
 }
 
-fn json_partial(tag: &str, message: Option<&str>) -> String {
-    let mut o = serde_json::json!({"v": 1, "status": "PARTIAL", "category": tag});
-    if let Some(m) = message {
-        o["reason"] = serde_json::json!(m);
-    }
-    o.to_string()
-}
+/// The reason for a stream that ended before its terminator.
+const STREAM_CUT: &str = "stream ended before its terminator";
 
 /// A `Read` over a clamd INSTREAM chunk sequence: `<u32 be len><data>` repeated,
 /// ended by a zero length. Presents the de-chunked payload as one stream.
@@ -2767,8 +3196,16 @@ impl<'a, R: Read> Instream<'a, R> {
             }
             self.remaining -= n as u32;
             drained += n as u64;
+            self.total += n as u64;
         }
         Ok(true)
+    }
+
+    /// The stream's size: every byte received, including those past the
+    /// limit that were only counted. A lower bound when `drain` stopped at
+    /// its cap.
+    fn total(&self) -> u64 {
+        self.total
     }
 }
 
@@ -2792,12 +3229,15 @@ impl<R: Read> Read for Instream<'_, R> {
                 return Ok(0);
             }
             self.remaining -= n as u32;
+            let before = self.total;
             self.total += n as u64;
             if let Some(max) = self.max {
                 if self.total > max {
-                    // Stop feeding the scanner; the caller reports the limit.
+                    // Hand over up to one byte past the limit, so the payload
+                    // holds everything the scan looks at and shows it is over;
+                    // the rest is only counted, by `drain`.
                     self.over_limit = true;
-                    return Ok(0);
+                    return Ok((max + 1 - before) as usize);
                 }
             }
             return Ok(n);
@@ -2840,6 +3280,75 @@ mod tests {
             opts.limits.max_buffer_bytes <= opts.limits.max_extracted_bytes,
             "one member may not exceed the whole extraction budget"
         );
+    }
+
+    /// A signal that lands while the supervisor is awake (reaping, reloading)
+    /// still cuts its next nap short, so a crashed worker is replaced and a
+    /// `RELOAD` served at once rather than a tick later. SIGUSR2 stands in for
+    /// SIGCHLD so the children other tests spawn do not reach the handler.
+    #[test]
+    fn a_signal_before_the_nap_ends_it() {
+        arm_wakeup().unwrap();
+        install_handler(libc::SIGUSR2, on_sigchld);
+        // SAFETY: raises a signal on this thread; its handler only wakes.
+        unsafe {
+            libc::raise(libc::SIGUSR2);
+        }
+        let start = std::time::Instant::now();
+        nap(SUPERVISOR_TICK);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "slept {:?} after the signal",
+            start.elapsed()
+        );
+    }
+
+    /// The ceiling is the one on this process's own cgroup and its ancestors,
+    /// not whatever sits at the mount root.
+    #[test]
+    fn the_cgroup_limit_is_read_where_the_process_lives() {
+        let files: std::collections::HashMap<&str, &str> = [
+            ("/sys/fs/cgroup/memory.max", "max\n"),
+            ("/sys/fs/cgroup/system.slice/memory.max", "8589934592\n"),
+            (
+                "/sys/fs/cgroup/system.slice/exav.service/memory.max",
+                "max\n",
+            ),
+            (
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "9223372036854771712\n",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                "1073741824\n",
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let read = |p: &str| files.get(p).map(|s| s.to_string());
+
+        // A service under a slice with a limit: the slice's limit applies.
+        let v2 = "0::/system.slice/exav.service\n";
+        assert_eq!(cgroup_limit_from(v2, read), Some(8 << 30));
+        // A container with its own namespace sees itself at the root.
+        assert_eq!(cgroup_limit_from("0::/\n", read), None);
+        // v1, memory controller listed with others.
+        let v1 = "5:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n";
+        assert_eq!(cgroup_limit_from(v1, read), Some(1 << 30));
+        // A v1 path this mount does not show falls back to the mount root.
+        let v1 = "4:memory:/elsewhere\n";
+        assert_eq!(cgroup_limit_from(v1, read), None);
+    }
+
+    /// A database swapped for one with an older mtime is still a change.
+    #[test]
+    fn an_older_mtime_is_still_a_change() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(source_changed(None, t));
+        assert!(!source_changed(Some(t), t));
+        assert!(source_changed(Some(t), t + Duration::from_secs(1)));
+        assert!(source_changed(Some(t), t - Duration::from_secs(1)));
     }
 
     /// Clamping only ever lowers: a generous grant must leave the operator's
@@ -3316,7 +3825,9 @@ mod tests {
         payload.extend_from_slice(eicar());
         let expected = payload.len() as u64;
 
-        let materialized = buffer_to_seekable(&mut &payload[..]).unwrap();
+        let held = buffer_to_seekable(&mut &payload[..]).unwrap();
+        assert!(held.short.is_none());
+        let materialized = held.payload;
         assert!(
             matches!(materialized, StreamPayload::Disk(_, _)),
             "past the threshold the payload belongs on disk, not in RAM"
@@ -3334,7 +3845,8 @@ mod tests {
         );
 
         let db = Scanner::builtin();
-        let (report, _) = scan_payload(&db, &ScanOptions::default(), &materialized).unwrap();
+        let (report, _) =
+            scan_payload(&db, &ScanOptions::default(), &materialized, expected).unwrap();
         assert!(
             matches!(report.verdict.category(), VerdictCategory::Infected),
             "the spilled bytes are what gets scanned"

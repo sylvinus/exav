@@ -521,6 +521,73 @@ pub fn overlapping_local_records(data: &[u8]) -> usize {
     overlapping
 }
 
+/// Whether `data` holds a ZIP with a consistent central directory: an
+/// end-of-central-directory record, and every directory entry pointing at a
+/// local header with the same name. Offsets may count from the archive or from
+/// an earlier start, as they do in an archive appended to another file. ZIP64
+/// is not followed, so answers `false`.
+pub fn directory_is_consistent(data: &[u8]) -> bool {
+    const EOCD_LEN: usize = 22;
+    const CDH_LEN: usize = 46;
+    let u16_at = |p: usize| {
+        data.get(p..p + 2)
+            .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    let u32_at = |p: usize| {
+        data.get(p..p + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let tail = data.len().saturating_sub(EOCD_LEN + usize::from(u16::MAX));
+    let Some(eocd) = data[tail..]
+        .windows(4)
+        .rposition(|w| w == b"PK\x05\x06")
+        .map(|p| tail + p)
+    else {
+        return false;
+    };
+    let (Some(entries), Some(cd_size), Some(cd_off)) =
+        (u16_at(eocd + 10), u32_at(eocd + 12), u32_at(eocd + 16))
+    else {
+        return false;
+    };
+    if entries == 0 || entries == 0xffff || cd_size == 0xffff_ffff || cd_off == 0xffff_ffff {
+        return false;
+    }
+    let Some(cd_start) = eocd.checked_sub(cd_size) else {
+        return false;
+    };
+    // Where offset 0 of the archive's own numbering sits in `data`.
+    let base = cd_start as i64 - cd_off as i64;
+    let mut p = cd_start;
+    for _ in 0..entries {
+        if data.get(p..p + 4) != Some(b"PK\x01\x02") {
+            return false;
+        }
+        let (Some(n), Some(e), Some(c), Some(local)) = (
+            u16_at(p + 28),
+            u16_at(p + 30),
+            u16_at(p + 32),
+            u32_at(p + 42),
+        ) else {
+            return false;
+        };
+        let Some(name) = data.get(p + CDH_LEN..p + CDH_LEN + n) else {
+            return false;
+        };
+        let Ok(lo) = usize::try_from(base + local as i64) else {
+            return false;
+        };
+        if data.get(lo..lo + 4) != Some(b"PK\x03\x04")
+            || u16_at(lo + 26) != Some(n)
+            || data.get(lo + LFH_LEN..lo + LFH_LEN + n) != Some(name)
+        {
+            return false;
+        }
+        p += CDH_LEN + n + e + c;
+    }
+    p == eocd
+}
+
 /// Does the `PK\x03\x04` at `off` look like a genuine local file header rather
 /// than a chance byte sequence? Checks the fields a real writer must fill in
 /// consistently; deliberately strict, because every false positive here becomes
@@ -632,21 +699,10 @@ fn encryption_flag_is_a_lie(
     let plain = match method {
         0 => raw.to_vec(),
         8 => {
-            let mut out = Vec::new();
-            if bounded_read_salvage(
-                flate2::read::DeflateDecoder::new(Cursor::new(raw)),
-                PROBE_MAX as u64,
-                true,
-            )
-            .map(|(o, truncated)| {
-                out = o;
-                truncated
-            })
-            .unwrap_or(true)
-            {
-                return false;
+            match bounded_read_salvage(crate::inflate::Inflate::new(raw), PROBE_MAX as u64, true) {
+                Ok(s) if !s.over_cap => s.data,
+                _ => return false,
             }
-            out
         }
         // Anything else we would not decode even in the clear.
         _ => return false,
@@ -775,7 +831,7 @@ fn parse_local_member(
     };
     budget.count_entry()?;
     let cap = budget.reserve()?;
-    let out = match method {
+    let (out, part_way) = match method {
         // Stored. The deflate arm below already refuses to hand back a prefix;
         // this one clamped to the cap and returned it as a complete member, so
         // an oversized stored orphan was silently truncated. Same treatment.
@@ -787,23 +843,19 @@ fn parse_local_member(
                 "orphan zip member exceeds size budget",
             )))
         }
-        0 => raw.get(..comp).unwrap_or(raw).to_vec(),
+        0 => (raw.get(..comp).unwrap_or(raw).to_vec(), false),
         8 => {
             // Salvage the bytes decoded before any corruption rather than
             // dropping the whole member: this is a best-effort recovery of a
             // malformed archive, and the payload a signature matches may sit in
             // the valid prefix (matching clamd, which scans partial inflate).
-            let (o, truncated) = bounded_read_salvage(
-                flate2::read::DeflateDecoder::new(Cursor::new(raw)),
-                cap,
-                true,
-            )
-            .map_err(|e| LimitHit::corrupt(format!("orphan zip inflate: {e}")))?;
+            let s = bounded_read_salvage(crate::inflate::Inflate::new(raw), cap, true)
+                .map_err(|e| LimitHit::corrupt(format!("orphan zip inflate: {e}")))?;
             // Over the per-member cap. Yield metadata-only rather than the
             // prefix (which would read as a complete member) and rather than
             // aborting, so the remaining orphans are still scanned — the same
             // shape the central-directory path uses for an oversized member.
-            if truncated {
+            if s.over_cap {
                 return Ok(Some(Entry::unsupported(
                     name,
                     comp as u64,
@@ -811,10 +863,10 @@ fn parse_local_member(
                     "orphan zip member exceeds size budget",
                 )));
             }
-            o
+            (s.data, s.undecoded)
         }
         _ => match decode_zip_raw(method, raw, usz, cap) {
-            Some((o, false)) => o,
+            Some((o, false)) => (o, false),
             // Either a codec exav has no decoder for, or one whose stream was
             // truncated. Both leave content unexamined.
             _ => {
@@ -832,10 +884,37 @@ fn parse_local_member(
     Ok(Some(Entry {
         comp_size: comp as u64,
         encrypted: false,
-        unsupported: None,
+        unsupported: part_way.then_some(PART_WAY),
         name,
         data: out,
     }))
+}
+
+/// Why a ZIP member's entry holds only part of its content.
+const PART_WAY: &str =
+    "zip member failed to decode part way; the bytes before the failure were scanned";
+
+/// A cleartext member's content. Stored and deflated members are decoded here
+/// rather than by the crate: its deflate reader drops what it decoded in the
+/// call that meets damage, and its CRC-32 failure is not told apart from
+/// damage. Other codecs go through the crate as before.
+pub(crate) fn member_reader<'a, R: Read + Seek>(
+    zip: &'a mut ::zip::ZipArchive<R>,
+    i: usize,
+) -> ::zip::result::ZipResult<Box<dyn Read + 'a>> {
+    use crate::inflate::{CrcCheck, Inflate};
+    use ::zip::CompressionMethod as C;
+    let method = zip.by_index_raw(i)?.compression();
+    if !matches!(method, C::Stored | C::Deflated) {
+        return Ok(Box::new(zip.by_index(i)?));
+    }
+    let raw = zip.by_index_raw(i)?;
+    let crc = raw.crc32();
+    Ok(if method == C::Stored {
+        Box::new(CrcCheck::new(raw, crc))
+    } else {
+        Box::new(CrcCheck::new(Inflate::new(BufReader::new(raw)), crc))
+    })
 }
 
 /// Recover the compressed length of a member whose local header deferred its
@@ -1076,12 +1155,12 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
         // unsupported method. A decode we can't do (or an unknown codec) yields a
         // metadata-only unsupported member and the archive keeps going — one bad
         // member never aborts the whole ZIP.
-        let (buf, truncated) = if method != 0 && method != 8 {
+        let (buf, truncated, part_way) = if method != 0 && method != 8 {
             let (raw, _) = bounded_read(&mut file, budget.limits.max_buffer_bytes)
                 .map_err(|e| LimitHit::new(format!("zip raw read: {e}")))?;
             drop(file);
             match decode_zip_raw(method, &raw, usz, cap) {
-                Some(out) => out,
+                Some((out, truncated)) => (out, truncated, false),
                 None => {
                     if let Some(r) = oversized(budget, "archive member: unsupported ZIP codec") {
                         return Ok(Some(r));
@@ -1090,10 +1169,10 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
                 }
             }
         } else {
-            // Store/Deflate: re-open with the decompressing reader (the raw reader
+            // Store/Deflate: re-open with the decoding reader (the raw reader
             // returns still-compressed bytes).
             drop(file);
-            let mut file = match zip.by_index(i) {
+            let mut file = match member_reader(&mut zip, i) {
                 Ok(f) => f,
                 Err(_) => {
                     if let Some(r) = oversized(budget, "archive member: ZIP decode failed") {
@@ -1102,10 +1181,10 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
                     continue;
                 }
             };
-            let r = bounded_read_salvage(&mut file, cap, !budget.should_verify_checksums())
+            let s = bounded_read_salvage(&mut file, cap, !budget.should_verify_checksums())
                 .map_err(|e| LimitHit::new(format!("zip read: {e}")))?;
             drop(file);
-            r
+            (s.data, s.over_cap, s.undecoded)
         };
         if truncated {
             if let Some(r) = oversized(budget, "archive member exceeds size budget") {
@@ -1121,7 +1200,7 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
         let entry = Entry {
             comp_size: comp,
             encrypted: false,
-            unsupported: None,
+            unsupported: part_way.then_some(PART_WAY),
             name,
             data: buf,
         };
@@ -1323,6 +1402,42 @@ fn read_spans<R: Read + Seek>(
 /// bounded — an archive whose directory declares one small member and leaves
 /// gigabytes unclaimed would otherwise turn opening it into a full read.
 const MAX_ORPHAN_SCAN: u64 = 16 * 1024 * 1024;
+
+/// The members `zip`'s central directory omits, decoded, for a walk that has
+/// already been through the ones it lists.
+///
+/// The streaming counterpart of the buffered path's orphan scan, over the same
+/// bounded search [`ZipMembers`] uses: only the space the directory leaves
+/// unaccounted for is read, up to [`MAX_ORPHAN_SCAN`], and a search that stops
+/// there yields a member saying so.
+pub(crate) fn hidden_members<Rd: Read + Seek>(
+    mut zip: ::zip::ZipArchive<Rd>,
+    budget: &mut Budget,
+) -> Result<Vec<Entry>, LimitHit> {
+    let (gaps, known) = unclaimed_spans(&mut zip);
+    if gaps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut reader = zip.into_inner();
+    let (unclaimed, truncated) = read_spans(&mut reader, &gaps, MAX_ORPHAN_SCAN)?;
+    let mut out = Vec::new();
+    for (span, off) in find_orphans(&unclaimed, &known) {
+        if let Some(entry) = parse_local_member(&unclaimed[span].1, off, budget)? {
+            out.push(entry);
+        }
+    }
+    if truncated {
+        budget.count_entry()?;
+        out.push(Entry::unsupported(
+            ZipMembers::<Rd>::TRUNCATED_MARKER.to_string(),
+            0,
+            false,
+            "the search for members hidden from the central directory \
+             reached its size limit with space left unexamined",
+        ));
+    }
+    Ok(out)
+}
 
 impl<R: Read + Seek> ZipMembers<R> {
     /// Open a seekable ZIP (reads only the central directory, and whatever
@@ -1594,7 +1709,7 @@ impl<R: Read + Seek> ZipMembers<R> {
         // Cleartext member: re-open decompressing so `bounded_read` yields
         // the *decompressed* content.
         drop(file);
-        let mut file = self.zip.by_index(i).map_err(|e| zip_entry_error(i, &e))?;
+        let mut file = member_reader(&mut self.zip, i).map_err(|e| zip_entry_error(i, &e))?;
         // A member too large for the budget yields a metadata-only member
         // (Unscannable, empty data) rather than aborting the archive walk,
         // so name/size `.cdb` sigs still match and later members are scanned.
@@ -1609,10 +1724,9 @@ impl<R: Read + Seek> ZipMembers<R> {
                 )))
             }
         };
-        let (buf, truncated) =
-            bounded_read_salvage(&mut file, cap, !budget.should_verify_checksums())
-                .map_err(|e| LimitHit::new(format!("zip read: {e}")))?;
-        if truncated {
+        let s = bounded_read_salvage(&mut file, cap, !budget.should_verify_checksums())
+            .map_err(|e| LimitHit::new(format!("zip read: {e}")))?;
+        if s.over_cap {
             return Ok(Some(Entry::unsupported(
                 name,
                 comp,
@@ -1620,14 +1734,14 @@ impl<R: Read + Seek> ZipMembers<R> {
                 "archive member exceeds size budget",
             )));
         }
-        ratio_guard(comp, buf.len() as u64, budget)?;
-        budget.commit(buf.len() as u64);
+        ratio_guard(comp, s.data.len() as u64, budget)?;
+        budget.commit(s.data.len() as u64);
         Ok(Some(Entry {
             comp_size: comp,
             encrypted: false,
-            unsupported: None,
+            unsupported: s.undecoded.then_some(PART_WAY),
             name,
-            data: buf,
+            data: s.data,
         }))
     }
 }
@@ -1668,6 +1782,63 @@ mod orphan_scan_tests {
             !truncated,
             "a sub-header-sized tail is not a stopped search"
         );
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn two_member_zip() -> Vec<u8> {
+        let mut z = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for name in ["a.txt", "b.txt"] {
+            z.start_file(name, ::zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(b"hello").unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    /// Add `by` to the directory offset and to every entry's local offset,
+    /// as `zip -A` does after prepending `by` bytes.
+    fn shift_offsets(zip: &mut [u8], by: u32) {
+        let eocd = zip.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+        let entries: Vec<usize> = zip
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"PK\x01\x02")
+            .map(|(p, _)| p + 42)
+            .collect();
+        for p in std::iter::once(eocd + 16).chain(entries) {
+            let v = u32::from_le_bytes(zip[p..p + 4].try_into().unwrap()) + by;
+            zip[p..p + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn an_appended_archive_is_consistent_under_either_numbering() {
+        let zip = two_member_zip();
+        assert!(directory_is_consistent(&zip));
+        let prefix = [0x42u8; 100];
+        assert!(directory_is_consistent(&[&prefix[..], &zip[..]].concat()));
+        let mut shifted = zip.clone();
+        shift_offsets(&mut shifted, 100);
+        assert!(directory_is_consistent(
+            &[&prefix[..], &shifted[..]].concat()
+        ));
+    }
+
+    #[test]
+    fn a_directory_that_does_not_match_its_members_is_not_consistent() {
+        let zip = two_member_zip();
+        let cd = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        assert!(!directory_is_consistent(&zip[..cd]));
+        let mut renamed = zip.clone();
+        renamed[cd + 46] = b'z';
+        assert!(!directory_is_consistent(&renamed));
+        assert!(!directory_is_consistent(b"xxPK\x03\x04garbage"));
+        assert!(!directory_is_consistent(b""));
     }
 }
 

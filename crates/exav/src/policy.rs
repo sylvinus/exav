@@ -38,11 +38,11 @@ pub(crate) fn current() -> PartialAs {
 
 /// Apply the policy to a finished report, in place.
 ///
-/// The single point where `pass` and `alert` take effect, so a partial
+/// The single point where `ok` and `found` take effect, so a partial
 /// object reaches an exit code, a `clamd` reply, a JSON record and a summary
 /// counter having already been through it. Doing it per surface would be four
 /// chances to forget one, and forgetting the CLI's would mean an object the
-/// operator asked to pass still exiting 2.
+/// operator asked to pass still exiting 3.
 ///
 /// `found` is a no-op for the conditions the engine names itself
 /// (`--partial-as password-protected=found` becomes `Heuristics.Encrypted.*`

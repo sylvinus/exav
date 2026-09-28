@@ -17,29 +17,11 @@ fn align4_u64(n: u64) -> u64 {
 }
 
 /// Read a member name of `namesize` bytes at `off` (capped, `\0`-trimmed).
-fn read_name<R: Read + Seek>(source: &mut R, off: u64, namesize: u64) -> String {
-    let n = namesize.min(MAX_NAME) as usize;
-    let mut buf = vec![0u8; n];
-    if source.seek(SeekFrom::Start(off)).is_err() {
-        return String::new();
-    }
-    let got = fill(source, &mut buf);
-    String::from_utf8_lossy(&buf[..got])
+fn read_name<R: Read + Seek>(source: &mut R, off: u64, namesize: u64) -> Result<String, LimitHit> {
+    let buf = crate::read_at(source, off, namesize.min(MAX_NAME) as usize)?;
+    Ok(String::from_utf8_lossy(&buf)
         .trim_end_matches('\0')
-        .to_string()
-}
-
-/// Read up to `buf.len()` bytes, tolerating short reads; returns bytes filled.
-fn fill<R: Read>(source: &mut R, buf: &mut [u8]) -> usize {
-    let mut n = 0;
-    while n < buf.len() {
-        match source.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
-    n
+        .to_string())
 }
 
 /// Parse member offsets from a seekable source (reader-based streaming): walk the
@@ -81,11 +63,8 @@ fn stream_walk<R: Read + Seek>(
     let mut out = Vec::new();
     let mut pos = 0u64;
     loop {
-        source
-            .seek(SeekFrom::Start(pos))
-            .map_err(|e| LimitHit::corrupt(format!("cpio seek: {e}")))?;
-        let mut h = vec![0u8; hdr_len];
-        if source.read_exact(&mut h).is_err() {
+        let h = crate::read_at(source, pos, hdr_len)?;
+        if h.len() < hdr_len {
             break;
         }
         let (namesize, filesize, magic_ok) = match &fields {
@@ -115,7 +94,7 @@ fn stream_walk<R: Read + Seek>(
             break;
         }
         let name_start = pos + hdr_len as u64;
-        let name = read_name(source, name_start, namesize);
+        let name = read_name(source, name_start, namesize)?;
         if name == TRAILER {
             break;
         }

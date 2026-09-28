@@ -87,6 +87,8 @@ mod rar_solid;
 #[cfg(feature = "sevenz")]
 mod sevenz_bcj2;
 mod silent_skips;
+#[cfg(feature = "all-formats")]
+mod stream_read_errors;
 #[cfg(feature = "iso")]
 mod udf;
 #[cfg(feature = "upx")]

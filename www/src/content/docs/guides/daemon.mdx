@@ -1,14 +1,14 @@
 ---
 title: Daemon mode
-description: Run exav as a clamd-compatible daemon — load the database once, serve scans over a socket with no per-call cost, and hot-reload signatures.
+description: Run exav as a clamd-compatible daemon that loads the database once, serves scans over a socket with no per-call load cost, and hot-reloads signatures.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
 `--listen clamd://…` loads the signature database once and serves scans over a
-socket, so callers pay **no per-scan cold-start cost**. The wire protocol is a
-subset of ClamAV's `clamd` protocol, so existing tooling — `clamdscan`, milters,
-`clamd` client libraries — talks to exav unchanged.
+socket, so callers pay no per-scan load cost. The wire protocol is a subset of
+ClamAV's `clamd` protocol, so existing tooling (`clamdscan`, milters, `clamd`
+client libraries) talks to exav unchanged.
 
 ## Start a daemon
 
@@ -22,7 +22,7 @@ The protocol travels in the address, and with no scheme it is `clamd`. A leading
 `/` is a socket path; anything else is `host:port`. Nothing listens without
 `--listen`.
 
-Then scan through it — the client pays no DB load cost:
+Then scan through it:
 
 ```sh
 exav --connect /run/clamav/clamd.ctl /data                       # exav as its own client
@@ -32,87 +32,92 @@ clamdscan --stream file.bin                        # the official ClamAV client
 clamdscan --fdpass file.bin                        # fd-passing also works
 ```
 
-The direction is the flag, not a mode: `--listen` accepts connections,
-`--connect` makes one.
+`--listen` accepts connections and `--connect` makes one.
 
-By default the client sends **paths**, which the daemon opens itself, so the
-daemon's filesystem has to be able to see them. `--send-as contents` sends the
-bytes (`INSTREAM`) and `--send-as fd` sends an open descriptor (`FILDES`, Unix
-socket only) — either way the daemon needs no access to the path, which is what a
-container, a remote scanner or a daemon under another user needs. `-` (stdin)
-always streams.
+By default the client sends paths, which the daemon opens itself, so the daemon
+has to be able to see them. `--send-as contents` sends the bytes (`INSTREAM`) and
+`--send-as fd` sends an open descriptor (`FILDES`, Unix socket only); either way
+the daemon needs no access to the path, which suits a container, a remote scanner
+or a daemon running as another user. `-` (stdin) is always sent as contents.
 
 A directory names its whole tree in all three modes, as it does for `clamdscan`.
 The client walks it and sends one request per file, so `--exclude` / `--include`
-apply to the tree and each request has one reply; a directory holding the parts of
-a byte-split archive goes over whole instead, so the daemon can rejoin them.
+apply to the tree and each request has one reply. A directory holding the parts
+of a byte-split archive is sent whole instead, so the daemon can rejoin them.
 
 ## Who may connect
 
-The socket is created **0600**: only the user running the daemon can connect.
-Anyone the mode admits can submit scan jobs and read the verdicts, so widening
-it is a deliberate act rather than a default.
+The socket is created with mode `0600`: only the user running the daemon can
+connect. Anyone the mode admits can submit scans and read verdicts.
 
 ```sh
 exav --listen 'clamd:///run/clamav/clamd.ctl?mode=660' -d /var/lib/exav
 ```
 
-`?mode=` takes octal permission bits, the same value a `clamd.conf` writes as
-`LocalSocketMode`. Prefer a group (`660`, with the daemon's process group shared
-with its clients) over `666`. The mode is applied at creation, so the socket never
-exists more widely open than asked for, whatever the umask the daemon inherited;
-a value that is not a workable mode is refused rather than applied.
+`?mode=` takes octal permission bits, the value `clamd.conf` calls
+`LocalSocketMode`. Prefer a group (`660`, with the daemon's group shared with its
+clients) over `666`. The mode is applied at creation, whatever umask the daemon
+inherited, and a value that is not a workable mode is refused.
 
-It rides on the address rather than living in a flag of its own because it is a
-property of *that socket*. There is nothing else it could be attached to — a
-`host:port` has no file to permission, and asking for one there is refused. Bind
-a TCP listener to the interface that should reach it and firewall the rest.
+The mode belongs to the address because it is a property of that socket. A
+`host:port` has no file to set permissions on, so asking for one there is refused;
+bind a TCP listener to the interface that should reach it and firewall the rest.
 
 <Aside type="note" title="Put the socket somewhere only its owner can write">
-The path is a name another process can replace between the `bind` and the
-`chmod`. `$XDG_RUNTIME_DIR` (typically mode-0700 and user-owned) or `/var/run`
-are safe; world-writable `/tmp` is not, because another local user can pre-create
-the path there.
+The path is a name another process can replace between `bind` and `chmod`.
+`$XDG_RUNTIME_DIR` (usually mode 0700 and user-owned) or `/var/run` are safe;
+world-writable `/tmp` is not, because another local user can create the path
+there first.
 </Aside>
 
 ## Protocol coverage
 
 Supported commands: `PING`, `VERSION`, `VERSIONCOMMANDS`, `STATS`, `RELOAD`,
 `SCAN` / `CONTSCAN` / `MULTISCAN` / `ALLMATCHSCAN <path>`, `INSTREAM`, `FILDES`
-(fd passing), `IDSESSION` / `SESSION` / `END`, plus the exav extensions
-`SCANURL <url>` (scan an `http(s)://` object via range requests — the object is
-fetched a small constant number of times rather than downloaded once; see
-[scanning over HTTP](/guides/scanning/#scanning-over-http-costs-bandwidth-not-memory);
-honoured only with `--allow-http-scan`, and listed in `VERSIONCOMMANDS` only then),
-`EXINSTREAM` and `EXINSTREAM MULTI` (below). Commands may be `z`- or `n`-framed.
+(fd passing), `IDSESSION` / `SESSION` / `END`, and the exav extensions
+`EXINSTREAM`, `EXINSTREAM MULTI` (below) and `SCANURL <url>`. `SCANURL` scans an
+`http(s)://` object through range requests (see
+[scanning over HTTP](/guides/scanning/#scanning-over-http-costs-bandwidth-not-memory))
+and is honoured, and listed in `VERSIONCOMMANDS`, only with `--allow-http-scan`.
+Commands may be `z`- or `n`-framed.
 
-`STATS` carries the clamd fields `clamdtop` parses, and then two exav lines
-answering what clamd's cannot — how much this process scanned, how long it took,
-and (with `--profile`) which matcher the time went to. See
-[finding where the CPU went](/reference/cli/#finding-where-the-cpu-went).
+`STATS` carries the clamd fields `clamdtop` parses, then two exav lines: how much
+this process scanned, how long it took, and (with `--profile`) which matcher the
+time went to. See [finding where the CPU went](/reference/cli/#finding-where-the-cpu-went).
+
+A file that could not be fully scanned comes back as `… ERROR` carrying
+`LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. `ERROR` is the only
+failing word in clamd's vocabulary; an unknown word would be read as `OK` by
+existing clients.
+
+The deprecated `STREAM` (separate port) command is not implemented; `INSTREAM`
+replaces it. `SHUTDOWN` is refused by default so a client cannot stop the daemon;
+send the process a signal instead, or pass `--allow-shutdown` to honour it.
+
+Validated against `clamdscan` (`--fdpass`, `--stream`, `--multiscan`), the Python
+`clamd` library, and raw `socat`.
 
 ## Split archives
 
 An archive spread across `big.7z.001`, `.002`, `.003` is one file cut at
-arbitrary byte offsets. No part decodes on its own, so scanning them one at a
-time reports three clean files and never opens the archive at all.
+arbitrary byte offsets. No part decodes on its own, so scanning them one at a time
+reports three clean files and never opens the archive.
 
-`CONTSCAN` / `MULTISCAN` rejoin such sets per directory and scan the archive
-they make. The reply is still exactly **one line per file** — every part carries
-the archive's verdict, naming it:
+`CONTSCAN` and `MULTISCAN` rejoin such sets per directory and scan the archive
+they make. The reply is still one line per file, and every part carries the
+archive's verdict:
 
 ```text
 /data/big.7z.001: Eicar-Signature FOUND (in big.7z)
 /data/big.7z.002: Eicar-Signature FOUND (in big.7z)
 ```
 
-That is deliberate: a piece of an infected archive is not a clean file, and it
-is the file you have to act on. A set with a hole in it comes back as
-`UNSCANNABLE` rather than `OK` — those bytes belong to an archive nothing can
+A part of an infected archive is the file you have to act on. A set with a part
+missing comes back `UNSCANNABLE`: those bytes belong to an archive nothing can
 read any more.
 
-`EXINSTREAM MULTI` does the same for streamed input, sending several files in
-one request:
+`EXINSTREAM MULTI` does the same for streamed input, with several files in one
+request:
 
 ```text
 EXINSTREAM MULTI
@@ -120,123 +125,114 @@ EXINSTREAM MULTI
 <u32 0>                                          ends the request
 ```
 
-Names are labels — nothing opens or resolves them as paths. The reply is one
-line of JSON, `{"v":1,"files":[…]}`, one entry per file with the same verdict
+Names are labels; nothing opens or resolves them as paths. The reply is one line
+of JSON, `{"v":1,"files":[…]}`, with one entry per file carrying the same verdict
 fields as a single `EXINSTREAM`, plus `"set"` when the verdict came from a
-rejoined archive rather than the file itself.
+rejoined archive. A file the daemon could not hold is answered `UNSCANNABLE` on
+its own, and the rest of the request is still scanned.
 
-RAR `.partN` and ZIP `.zNN` volumes are **not** rejoined this way: each carries
-its own headers, so concatenating them produces garbage that still looks like an
-archive. Each is scanned on its own, and reported for what it is.
+RAR `.partN` and ZIP `.zNN` volumes are not rejoined this way: each carries its
+own headers, so concatenating them produces garbage that still looks like an
+archive. Each is scanned on its own.
 
-Validated against `clamdscan` (`--fdpass` / `--stream` / `--multiscan`), the
-Python `clamd` library, and raw `socat`.
+## Size over the wire
 
-The deprecated `STREAM` (separate-port) command is intentionally **not**
-implemented — `INSTREAM` supersedes it — and `SHUTDOWN` is refused by default so
-a client can't stop the daemon (send the process a signal instead, or pass
-`--allow-shutdown` to honour it).
+`SCAN <path>` sends only the path, and the daemon scans the file as the CLI would.
+An `INSTREAM` body is buffered before it is scanned: in memory up to
+`--spill-threshold-bytes` (16 MiB), then in a temporary file up to
+`--max-spill-bytes` (2 GiB), with `--max-total-spill-bytes` bounding what one
+process holds at once. A stream past those is answered `UNSCANNABLE`. See
+[buffering a stream](/reference/cli/#buffering-a-stream-spill).
 
-A not-fully-scanned member comes back as `... ERROR` carrying
-`LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED` — never a silent `OK`.
+## Worker pool and per-job limits
 
-## No size limit over the wire
-
-The protocol imposes no size limit: `SCAN <path>` sends only the path (the daemon
-scans the file directly, any size), and `INSTREAM` chunks feed straight into the
-constant-memory scanner — a 4 GiB stream adds only a **flat ~3 MiB** to the
-daemon's working set regardless of size (on top of the already-loaded database).
-
-## Worker pool & per-scan kill
-
-By default the daemon runs a **prefork pool of one worker process per CPU core**
-(`--workers threads` forces the in-process thread model). Workers are forked
-*after* the DB loads, so they share the signature database copy-on-write (no
-re-load). Each handles one scan at a time under **kernel-enforced per-job
-limits**:
+By default the daemon runs a prefork pool of one worker process per CPU core
+(`--workers threads` selects the in-process thread model). Workers are forked
+after the database loads, so they share it copy-on-write. Each handles one job at
+a time under kernel-enforced limits:
 
 | Flag | Default | Bounds |
 |---|---|---|
-| `--max-scan-secs` | 120 s | wall-clock (and CPU time, RLIMIT_CPU) |
-| `--max-process-bytes` | 2 G | address space (RLIMIT_AS) |
+| `--max-scan-secs` | 120 s | wall clock (and CPU time, `RLIMIT_CPU`) |
+| `--max-process-bytes` | 2 G | address space (`RLIMIT_AS`) |
 | `--max-jobs-per-worker` | 1000 | jobs before a worker is recycled (bounds leaks) |
 
-This is the only way to *safely* hard-kill a scan stuck inside a dependency: a
-runaway worker is `SIGKILL`ed and respawned without touching the rest of the
-pool. A thread model cannot do this at all: Rust has no safe thread-kill, and
-neither does C. It's the backstop of a layered
-defense — deterministic in-core caps (scan-byte / ratio / recursion) fire first,
-in milliseconds.
+A process is the only thing that can be stopped safely while stuck inside a
+dependency: a worker past its limit answers its client, exits, and is replaced,
+without touching the rest of the pool. A thread cannot be killed safely, in Rust
+or in C. This is the backstop; the in-engine limits (scan bytes, ratio,
+recursion, emulation steps) fire first.
 
 <Aside type="caution">
-**Per-job** limits need the pool. `--max-jobs-per-worker` counts jobs before a
-worker is recycled, so it is refused — not silently ignored — without
-`--workers N`. `--max-scan-secs` is refused for a *serving* daemon under
-`--workers threads`, because the thread model has no way to stop one job without
+Per-job limits need the pool. `--max-jobs-per-worker` is refused without
+`--workers N`, and `--max-scan-secs` is refused for a serving daemon under
+`--workers threads`, because the thread model cannot stop one job without
 stopping the daemon.
 
-Both `--max-scan-secs` and `--max-process-bytes` still apply to a one-shot scan,
-where they bound the whole process rather than a job: the run ends instead of a
-worker being replaced.
+`--max-scan-secs` and `--max-process-bytes` still apply to a one-shot scan, where
+they bound the whole process: the run ends instead of a worker being replaced.
 </Aside>
 
 ## Logging what was answered
 
-`--log FILE` records one line per scan the daemon serves, appended to the file
-and flushed as it goes:
+`--log FILE` records one line per scan the daemon serves, appended and flushed as
+it goes:
 
 ```sh
 exav --listen /run/exav.sock --log /var/log/exav.log -d /var/lib/exav
 ```
 
-The daemon's results otherwise go to the client that asked for them and nowhere
-else, so this is the operator's record of what was scanned and what came back.
-Lines carry the daemon's own view of the target: a path scan under its path, a
-streamed scan as `stream:`, a passed descriptor as `fd:`. `PING`, `VERSION` and
-`STATS` are answers about the daemon rather than about a file and stay out of
-it. Prefork workers share the one appending descriptor and each line is written
-in a single call, so lines never interleave.
+The daemon's results otherwise go only to the client that asked, so this is the
+operator's record. A path scan is logged under its path, a streamed scan as
+`stream:`, a passed descriptor as `fd:`. `PING`, `VERSION` and `STATS` are not
+logged. Workers share one appending descriptor and write each line in a single
+call, so lines never interleave.
 
 ## Hot-reloading signatures
 
 The daemon refreshes signatures without a restart on any of:
 
-- the clamd **`RELOAD`** command (what `freshclam`'s `NotifyClamd` sends — the
-  reply is `RELOADING`);
-- an external **`SIGHUP`** (`kill -HUP <pid>`, `systemctl reload`). This is
-  exav's own addition: clamd uses `SIGHUP` only to reopen its log;
-- a **change on disk** at whatever `-d` points at (see below);
+- the clamd `RELOAD` command (what `freshclam`'s `NotifyClamd` sends; the reply
+  is `RELOADING`);
+- `SIGHUP` (`kill -HUP <pid>`, `systemctl reload`), an exav addition: clamd uses
+  `SIGHUP` only to reopen its log;
+- a change on disk at whatever `-d` points at (see below);
 - a successful fetch by the built-in updater.
 
-On each, the prefork supervisor reloads and re-forks the pool, so the per-job
-hard-kill isolation is preserved across reloads. Under `--workers threads`,
-`RELOAD` is accepted but there is no pool to re-fork. If a reload lands on an
-emptied or corrupt source, the swap is **refused** and the daemon keeps serving
-the current DB rather than downgrading to near-zero coverage.
+On each, the supervisor loads the new database and forks a new pool from it.
+Workers of the old pool finish the job they are serving before they exit, so a
+reload never cuts a scan short; ICAP requests in progress likewise finish, and
+idle ICAP connections are closed. The old pool gets `--max-scan-secs` plus 5
+seconds for this (10 minutes when `--max-scan-secs` is 0). A process still
+there after that, held by an open `IDSESSION` or a client that never finishes
+its request, is stopped and logged; a worker stopped in the middle of a job
+answers it with `ERROR`. Under `--workers threads`, `RELOAD` is accepted
+but there is no pool to re-fork. If the new source is empty or corrupt, the swap
+is refused and the daemon keeps serving the current database.
 
 ### The watch is mtime polling, which is why it crosses volumes
 
-Every ~10 seconds the supervisor stats the `-d` source and reloads when its
-newest `modified()` time advances — exactly what clamd's `SelfCheck` does. It
-watches whichever form `-d` names:
+Every ~10 seconds the supervisor checks the `-d` source and reloads when its
+newest modification time changes, as clamd's `SelfCheck` does. Any change
+counts, not only a later time, so a database replaced by one with an older mtime
+is still picked up. It watches whichever form `-d` names:
 
-- a **directory** of raw `.cvd`/`.cld`: the newest mtime across the directory and
-  its entries, so a rename, a new file or an in-place overwrite all bump it;
-- a single **database file** (`-d db.exavdb`): that file's own mtime, so an
-  atomic swap replaces it with a newer-mtime inode.
+- a directory of raw `.cvd`/`.cld`: the newest mtime across the directory and its
+  entries, so a rename, a new file or an in-place overwrite all count;
+- a single database file (`-d db.exavdb`): that file's own mtime, which an atomic
+  swap changes.
 
-Polling rather than subscribing to kernel events is what makes it fire across
-**Docker volumes, bind mounts and NFS**, where inotify events do not propagate.
-That is what the [dual-container pattern](/guides/docker/#dual-container-shared-volume)
-rests on — the updater renames a new `.cvd` into the shared volume and the
-scanner's next poll re-forks — and it means a
-[prebuilt-database](/guides/prebuilt-database/) deployment hot-reloads on swap
-too, with no explicit `RELOAD`.
+Polling rather than kernel events is what makes it work across Docker volumes,
+bind mounts and NFS, where inotify events do not propagate. The
+[dual-container pattern](/guides/docker/#dual-container-shared-volume) relies on
+it (the updater renames a new `.cvd` into the shared volume and the scanner's
+next poll reloads), and a [prebuilt-database](/guides/prebuilt-database/)
+deployment reloads on swap too, with no explicit `RELOAD`.
 
 ## As a managed service
 
 A systemd unit (`packaging/exav-clamd.service`, also shipped in the `.deb`) runs
-exav as a drop-in for `clamav-daemon` on the same socket:
+exav in place of `clamav-daemon` on the same socket:
 
 ```sh
 sudo systemctl stop clamav-daemon && sudo systemctl disable clamav-daemon

@@ -7,10 +7,11 @@
 //! reach for, and its purpose (killing a job that will not stop) is answered on
 //! this path by the in-engine budgets.
 
-use std::io::{BufReader, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use exav_core::{scan_seekable_located, ScanOptions, Scanner};
 
@@ -18,7 +19,7 @@ use super::chunked::{read_chunked_body, Body, BodyEnd, BodyError, BodyOutcome};
 use super::config::IcapConfig;
 use super::response::{self, Decision};
 use super::wire::{read_head, Entity, IcapMethod, RequestHead};
-use crate::daemon::StreamPayload;
+use crate::daemon::Held;
 
 /// Supplies the signature database to scan the next request with.
 ///
@@ -102,16 +103,34 @@ impl Server {
         &self.cfg
     }
 
-    /// Serve until the listener fails.
+    /// Make accepting non-blocking, for a listener more than one process waits on.
+    #[cfg(unix)]
+    pub(super) fn set_nonblocking(&self) -> std::io::Result<()> {
+        self.listener.set_nonblocking(true)
+    }
+
+    /// Serve until `wait` says to stop, then finish the requests in progress
+    /// and return. `wait` blocks until there is a connection to accept (`true`)
+    /// or the server should stop (`false`). An error means the listener failed.
     pub(super) fn run(
         &self,
         db: Arc<dyn Signatures>,
         opts: Arc<ScanOptions>,
+        wait: &dyn Fn(&TcpListener) -> bool,
     ) -> std::io::Result<()> {
         let live = Arc::new(AtomicUsize::new(0));
-        for stream in self.listener.incoming() {
-            let stream = match stream {
-                Ok(s) => s,
+        let idle = Arc::new(Idle::default());
+        while wait(&self.listener) {
+            let stream = match self.listener.accept() {
+                Ok((s, _)) => s,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
                 // One failed accept (a client that vanished between the SYN and
                 // the accept, say) is not a reason to stop serving.
                 Err(e) => {
@@ -119,6 +138,8 @@ impl Server {
                     continue;
                 }
             };
+            // An accepted socket can inherit the listener's non-blocking mode.
+            let _ = stream.set_nonblocking(false);
             if live.fetch_add(1, Ordering::Relaxed) >= self.cfg.max_connections {
                 live.fetch_sub(1, Ordering::Relaxed);
                 // Nothing is written back: at capacity, the cheapest safe act
@@ -129,18 +150,63 @@ impl Server {
             let _ = stream.set_read_timeout(Some(self.cfg.idle_timeout));
             let _ = stream.set_write_timeout(Some(self.cfg.idle_timeout));
             let _ = stream.set_nodelay(true);
-            let (cfg, db, opts, live) = (
+            let (cfg, db, opts, live, idle) = (
                 Arc::clone(&self.cfg),
                 Arc::clone(&db),
                 Arc::clone(&opts),
                 Arc::clone(&live),
+                Arc::clone(&idle),
             );
             std::thread::spawn(move || {
                 let _guard = LiveGuard(live);
-                serve_connection(stream, &cfg, db.as_ref(), &opts);
+                serve_connection(stream, &cfg, db.as_ref(), &opts, &idle);
             });
         }
+        idle.close_all();
+        while live.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         Ok(())
+    }
+}
+
+/// Connections waiting for their next request, so a server that is stopping
+/// can close them rather than wait out the idle timeout. A connection in the
+/// middle of a request is not in here and is left to finish it.
+#[derive(Default)]
+struct Idle {
+    closing: AtomicBool,
+    next_id: AtomicUsize,
+    waiting: Mutex<HashMap<usize, TcpStream>>,
+}
+
+impl Idle {
+    /// Block until the next request starts arriving on `reader`. `Ok(false)`
+    /// at end of stream, or when the server is stopping.
+    fn next_request(&self, id: usize, reader: &mut BufReader<TcpStream>) -> std::io::Result<bool> {
+        if let Ok(s) = reader.get_ref().try_clone() {
+            self.lock().insert(id, s);
+        }
+        // After registering: either `close_all` sees this connection, or this
+        // sees the flag it set first.
+        let arrived = if self.closing.load(Ordering::SeqCst) {
+            Ok(false)
+        } else {
+            reader.fill_buf().map(|b| !b.is_empty())
+        };
+        self.lock().remove(&id);
+        arrived
+    }
+
+    fn close_all(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        for s in self.lock().values() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<usize, TcpStream>> {
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -159,7 +225,13 @@ enum Next {
     Close,
 }
 
-fn serve_connection(stream: TcpStream, cfg: &IcapConfig, db: &dyn Signatures, opts: &ScanOptions) {
+fn serve_connection(
+    stream: TcpStream,
+    cfg: &IcapConfig,
+    db: &dyn Signatures,
+    opts: &ScanOptions,
+    idle: &Idle,
+) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -168,8 +240,15 @@ fn serve_connection(stream: TcpStream, cfg: &IcapConfig, db: &dyn Signatures, op
         }
     });
     let mut writer = stream;
+    let id = idle.next_id.fetch_add(1, Ordering::Relaxed);
     for _ in 0..cfg.keepalive_requests {
-        match handle_request(&mut reader, &mut writer, cfg, db, opts) {
+        let next = idle
+            .next_request(id, &mut reader)
+            .and_then(|more| match more {
+                true => handle_request(&mut reader, &mut writer, cfg, db, opts),
+                false => Ok(Next::Close),
+            });
+        match next {
             Ok(Next::KeepAlive) => {}
             Ok(Next::Close) => break,
             Err(e) => {
@@ -321,12 +400,13 @@ fn modify<W: Write>(
     std::io::Read::read_exact(reader, &mut headers)?;
 
     let (body_entity, _) = enc.terminal();
-    let mut body: Option<StreamPayload> = None;
+    let mut body: Option<Held> = None;
     let mut over_limit = false;
     let mut abandoned = false;
-    // Set when a spill budget refused the object, which decides the verdict
-    // without a scan: exav had nowhere to put the bytes, so it never saw them.
+    // Set when a spill budget refused the rest of the object: what was held
+    // is scanned, and the verdict is at best the limit.
     let mut rejected: Option<String> = None;
+    let mut total = 0u64;
 
     if body_entity.has_body() {
         let mut buf = Body::new();
@@ -343,6 +423,7 @@ fn modify<W: Write>(
         };
         over_limit = outcome.over_limit;
         abandoned = outcome.abandoned;
+        total = outcome.total;
         take_rejection(&mut rejected, &outcome);
 
         // Preview handling. A `0; ieof` terminator says the preview was the
@@ -383,43 +464,26 @@ fn modify<W: Write>(
             };
             over_limit = o.over_limit;
             abandoned = o.abandoned;
+            total = total.saturating_add(o.total);
             take_rejection(&mut rejected, &o);
         }
-        body = Some(buf.finish()?);
+        body = Some(Held {
+            payload: buf.finish()?,
+            short: rejected.clone(),
+        });
     }
 
-    // The head of an over-limit object is still scanned. Refusing by size
-    // without looking would throw away a detection sitting in the part that did
-    // fit, and the engine's own size handling makes the same choice.
-    let mut decision = match &rejected {
-        // Nothing was buffered, so there is nothing to scan and no detection to
-        // lose by saying so.
-        Some(reason) => Decision::Partial("UNSCANNABLE", reason.clone()),
-        None => scan(
-            scanner,
-            opts,
-            body.as_ref(),
-            &headers,
-            enc.span(Entity::ReqHdr),
-        ),
-    };
-    if over_limit && rejected.is_none() && !matches!(decision, Decision::Infected(_)) {
-        // The same ceiling, reported with the same words, as a stream this size
-        // arriving at the clamd listener: it is one scan setting, not a property
-        // of the port the object came in on.
-        decision = Decision::Partial(
-            "LIMITS-EXCEEDED",
-            format!("size exceeds {}", opts.max_scan_size.unwrap_or(0)),
-        );
-    }
-    // Both partials above were decided here rather than by the engine, so
-    // neither has been through the policy `decide` applies. Run it on the
-    // finished decision, which is the only place every partial passes through:
-    // otherwise `--partial-as limits-exceeded=found` would turn an over-size
-    // object into a detection when the engine reported the limit and leave it a
-    // bare block when this listener did, for the same object and the same
-    // reason. Idempotent — a decision already remapped is no longer `Partial`.
-    decision = apply_found_policy(decision);
+    // The scan every other entry point runs: the part of an object over
+    // `--max-input-bytes`, or past what the spill budgets could hold, is
+    // scanned, and the limit is reported only with no detection in it.
+    let decision = scan(
+        scanner,
+        opts,
+        body.as_ref(),
+        total,
+        &headers,
+        enc.span(Entity::ReqHdr),
+    );
 
     // A deployment can choose to take delivery of an object exav could not
     // fully examine. Whether that choice can be honoured for *this* object is a
@@ -475,7 +539,7 @@ fn modify<W: Write>(
         .map(|(s, e)| &headers[s..e])
         .unwrap_or(&[]);
     Ok(Some(
-        response::echo(hdr_entity, hdr, body).noting(&decision),
+        response::echo(hdr_entity, hdr, body.map(|h| h.payload)).noting(&decision),
     ))
 }
 
@@ -572,14 +636,15 @@ fn apply_found_policy(decision: Decision) -> Decision {
 fn scan(
     scanner: &Scanner,
     opts: &ScanOptions,
-    body: Option<&StreamPayload>,
+    body: Option<&Held>,
+    size: u64,
     headers: &[u8],
     req_hdr: Option<(usize, usize)>,
 ) -> Decision {
-    let Some(payload) = body else {
+    let Some(held) = body else {
         return Decision::Clean;
     };
-    if payload.len() == 0 {
+    if size == 0 {
         return Decision::Clean;
     }
     let owned = named_opts(opts, headers, req_hdr);
@@ -591,11 +656,11 @@ fn scan(
     // something was slow.
     let timer = crate::metrics::ScanTimer::start();
     let decision = decide(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || crate::daemon::scan_payload(scanner, named, payload),
+        || crate::daemon::scan_held(scanner, named, held, size),
     )));
     timer.finish(
         named.filename.as_deref().unwrap_or("<icap object>"),
-        payload.len(),
+        held.payload.len(),
         decision.category(),
     );
     decision

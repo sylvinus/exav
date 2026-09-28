@@ -120,14 +120,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
         .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
     let scan = max_buffer.min(len) as usize;
     let mut prefix = vec![0u8; scan];
-    let mut n = 0;
-    while n < prefix.len() {
-        match source.read(&mut prefix[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
+    let n = crate::read_full(source, &mut prefix)?;
     prefix.truncate(n);
     let Some((off, _)) = find_embedded_archive(&prefix) else {
         return Ok(Vec::new());

@@ -221,7 +221,7 @@ ntfs = ["dep:lznt1"]
 upx = ["dep:flate2", "dep:lzma-rust2", "dep:base64"]
 
 # Structured documents.
-ole = ["dep:cfb"]
+ole = ["dep:cfb", "dep:flate2"]
 pdf = ["dep:flate2"]
 email = ["dep:mail-parser", "dep:base64"]
 

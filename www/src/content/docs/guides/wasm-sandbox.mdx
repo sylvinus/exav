@@ -1,23 +1,22 @@
 ---
 title: WASM sandbox
-description: Run the whole exav engine inside a WebAssembly sandbox — for untrusted signatures, untrusted files, or simply to not have to trust exav itself.
+description: Run the whole exav engine inside a WebAssembly sandbox, for untrusted signatures, untrusted files, or to avoid trusting exav itself.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-Two reasons to run the scanner inside a **WASM sandbox**:
+Two reasons to run the scanner inside a WASM sandbox:
 
-- **You don't trust the signatures.** Third-party `.ndb` sets, community YARA
-  rules, anything you didn't build yourself.
-- **You don't trust exav.** Entirely reasonable — it is a young parser of hostile
-  input, and no amount of `#![forbid(unsafe_code)]` is the same as a boundary the
-  kernel or the runtime enforces. This is the option that needs no assumptions
-  about exav's own code being correct.
+- **You don't trust the signatures:** third-party `.ndb` sets, community YARA
+  rules, anything you did not build yourself.
+- **You don't trust exav.** It is a young parser of hostile input, and
+  `#![forbid(unsafe_code)]` is not a boundary the kernel or a runtime enforces.
+  The sandbox needs no assumption that exav's own code is correct.
 
 The same `exav-core` engine compiles to `wasm32-wasip1` and runs under any WASI
-runtime (wasmtime, wasmer, wazero) with **no custom host code**: you bring your
-own audited runtime, and a bug anywhere inside exav costs you a crashed sandbox
-rather than a compromised host.
+runtime (wasmtime, wasmer, wazero) with no custom host code: you bring your own
+runtime, and a bug inside exav costs a crashed sandbox rather than a compromised
+host.
 
 ## Quick start
 
@@ -30,14 +29,14 @@ rather than a compromised host.
    cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
    ```
 
-2. Strip debug names (~10% smaller):
+2. Optionally strip debug names to make it smaller:
 
    ```sh
    cargo install wasm-tools   # if not installed
    wasm-tools strip -a target/wasm32-wasip1/release/exav-wasm.wasm -o exav.wasm
    ```
 
-3. Scan a file under wasmtime — signatures mounted at `/db`, CWD at `/`:
+3. Scan a file under wasmtime, with the signatures mounted at `/db`:
 
    ```sh
    wasmtime \
@@ -49,9 +48,8 @@ rather than a compromised host.
 
 </Steps>
 
-The `--dir` flags mount directories into the sandbox: `--dir /path/to/sigs::/db`
-mounts the signature DB at `/db`, `--dir .::.` mounts the working directory at
-`/` (so relative paths work).
+`--dir /path/to/sigs::/db` mounts the signature directory at `/db`, and
+`--dir .::.` mounts the working directory so relative paths work.
 
 ## Output
 
@@ -73,46 +71,44 @@ wasmtime --dir ./sigs::/db --dir .::. exav.wasm /db *.exe 2>/dev/null | jq '.ver
 
 ## Why this matters
 
-When you load third-party signatures, the signature parser becomes part of your
-attack surface — a malicious `.ndb` could trigger a parser overflow (RCE),
-excessive allocation (DoS), or try to escape the process. Native code makes any
-of these a host compromise. In a WASM sandbox:
+Loading third-party signatures makes the signature parser part of your attack
+surface: a malicious `.ndb` could aim for a parser bug, excessive allocation, or
+an escape from the process. Natively, any of these reaches the host. In a WASM
+sandbox:
 
 | | Native `exav` | WASM sandbox |
 |---|---|---|
-| Signature trust | full host access | memory-limited WASM instance |
-| Runtime | your code | wasmtime (Bytecode Alliance, audited) |
-| Blast radius | entire host | isolated WASM module, fuel-limited |
-| Custom host code | N/A | **none** — you bring your own wasmtime |
-| Overhead | native speed | ~10–20% |
+| Signature trust | full host access | a memory-limited WASM instance |
+| Runtime | exav itself | wasmtime or another WASI runtime |
+| Blast radius | the host | the module, optionally fuel-limited |
+| Custom host code | n/a | none |
+| Speed | native | slower |
 
-- **Memory is bounded** — the module can't access memory outside its linear
-  memory instance.
-- **No system calls** — WASI restricts file/network access to explicitly mounted
-  paths; the module can't read `/etc/passwd` or reach the network.
-- **Fuel limits** — wasmtime can cap instruction counts, killing runaway modules.
-- **Panic isolation** — a panic on corrupt input becomes a wasmtime trap; the
-  host process is unaffected.
+- **Memory is bounded:** the module cannot reach memory outside its own linear
+  memory.
+- **No ambient system access:** WASI limits file access to the mounted paths,
+  and the module has no network.
+- **Fuel limits:** wasmtime can cap instruction counts and stop a runaway module.
+- **Panic isolation:** a panic becomes a wasmtime trap; the host is unaffected.
 
-<Aside type="tip" title="Zero custom host code">
-The module is a standard WASI command — no `unsafe` ABI, no custom wire protocol.
-The host is wasmtime itself (used in production by Fastly, Cloudflare, and
-others), not code exav wrote. Any runtime supporting `wasm32-wasip1` works.
+<Aside type="tip" title="No custom host code">
+The module is a standard WASI command, with no custom ABI or wire protocol. The
+host is the runtime itself, not code exav wrote. Any runtime supporting
+`wasm32-wasip1` works.
 </Aside>
 
 ## Limitations
 
-- **No daemon mode** — each `wasmtime run` loads the DB from scratch. For
+- **No daemon mode:** each run loads the database from scratch. For
   high-throughput scanning use a native `exav --listen`.
-- **No stdin streaming** — files must be on a mounted filesystem.
-- **No HTTP(S) scanning** — the module can't make network requests.
-- **DB loading is slower / bounded** — the full ClamAV DB build wants ~6 GiB
-  transient RAM, bounded here by the runtime's memory limit. Use a
+- **No stdin:** files must be on a mounted filesystem.
+- **No HTTP(S) scanning:** the module cannot make network requests.
+- **Database size:** `wasm32` memory tops out at 4 GiB, and building the full
+  raw ClamAV database needs more. Use a
   [prebuilt database](/guides/prebuilt-database/) for large signature sets.
 
 ## Alternatives
 
-- **Native `exav`** — best performance and full features, but trusts the scanner
-  with host access.
-- **Docker container** — similar isolation, heavier (a full OS image vs one
-  `.wasm` file).
+- **Native `exav`:** full speed and features, with host access.
+- **A container:** similar isolation, but a full OS image rather than one `.wasm`
+  file.

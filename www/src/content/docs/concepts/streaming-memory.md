@@ -1,89 +1,85 @@
 ---
 title: Streaming & memory
-description: exav's constant-memory streaming core scans inputs larger than RAM in a single forward pass — the 6 GiB-file demo, and where the memory actually goes.
+description: Where exav holds a file in memory, where it streams, what each path matches, and where the memory really goes.
 ---
 
-The reason exav can scan a file ClamAV skips is its **constant-memory streaming
-core**: Aho-Corasick multi-pattern matching plus MD5/SHA1/SHA256 hashing in a
-single forward pass, matching across buffer boundaries, on inputs larger than
-RAM.
+exav matches a file in one of two ways, chosen by size.
 
-## The demo
+## Up to `--max-object-bytes`: the full engine, in memory
 
-A **6 GiB file on a 4.8 GiB-RAM machine** — 3× ClamAV's ~2 GB silent-skip limit
-— with the signature at the very end: **detected.** ClamAV would read that file,
-scan zero bytes, and report `OK`.
+A file up to `--max-object-bytes` (256 MiB by default) is read into memory and
+gets the full engine:
 
-The file-scanning working set stays **flat (~2 MiB) regardless of file size**.
-That's the per-scan working set *on top of* the loaded signature database (which
-is a separate, one-time cost). A 4 GiB stream through the daemon adds only a flat
-~3 MiB to its working set.
+- every `.ndb` form: wildcards, gaps, anchored offsets, file-type targets;
+- `.ldb` logical signatures, with their regexes and byte comparisons;
+- the normalised views of HTML, text and scripts that those signatures are
+  written against;
+- YARA rules, bytecode programs, PE section hashes, whole-file hashes;
+- structural analysis: unpacking, embedded files, heuristics.
 
-## Why it's constant
+Verifying a wildcard or logical signature means looking back and forth around
+each candidate match, which is why this path holds the file. Memory is roughly
+the file's size, plus a lowercase copy for case-insensitive signatures and, for
+text, one normalised copy at a time.
 
-The core never materializes the whole input. It reads the file in fixed-size
-buffers and:
+Archives in a streamable format (ZIP, tar, 7z, CAB, gzip and most others; see
+[archive extraction](/concepts/archive-extraction/)) are walked member by member,
+and each member is treated like a file: in memory up to the same limit.
 
-- feeds each buffer through the Aho-Corasick automaton, carrying just enough
-  state at the boundary to match patterns that straddle two buffers;
-- updates the running MD5/SHA1/SHA256 hashers incrementally.
+## Past it: the streaming core, and `LIMITS-EXCEEDED`
 
-Nothing scales with file size. A multi-gigabyte file and a one-kilobyte file use
-the same forward-pass machinery and the same tiny working set.
+A larger file, or a larger member, goes through the streaming core instead. It
+reads fixed-size buffers in one forward pass and runs:
 
-## Streaming vs seekable
+- an Aho-Corasick automaton over the literal `.ndb` signatures (fixed bytes, any
+  file type, any offset), carrying state across buffer boundaries;
+- MD5, SHA1 and SHA256 over the whole input, for `.hdb`/`.hsb`.
 
-Structural unpacking (archives, embedded documents) needs to *seek*, so it isn't
-available on a pure forward-only pipe — a raw stream does pattern+hash only.
-Local files and `http(s)://` URLs are seekable and get full structural analysis;
-only unbounded pipes are limited. In practice `cat archive.zip | exav -` still
-inspects inside the archive, because exav buffers stdin to a seekable source
-(RAM if small, a temp file if large) before running the container-aware scan.
+Its memory does not grow with the input. But it covers only those two kinds of
+signature, so a file scanned this way is reported `LIMITS-EXCEEDED` unless one of
+them matches. Raise `--max-object-bytes` to give larger files the full engine, at
+the cost of memory. A full engine that streams is on the
+[roadmap](/project/roadmap/#a-streaming-full-engine).
 
-## Where the memory actually goes: the database
+## Stdin, `INSTREAM` and ICAP bodies
 
-The per-scan working set is tiny; the memory that matters is the **signature
-database**, and specifically **building** it. For the full `daily.cvd` the phases
-are:
+Container formats need to seek (a ZIP's directory is at its end), so a stream is
+buffered before it is scanned: in memory up to `--spill-threshold-bytes`
+(16 MiB), then in a temporary file up to `--max-spill-bytes` (2 GiB). The
+buffered stream then goes through the same scan as a file. A stream past
+`--max-input-bytes` or the spill ceiling is scanned as far as it was held and is
+`LIMITS-EXCEEDED` unless that finds something, as a file past
+`--max-input-bytes` is. See
+[buffering a stream](/reference/cli/#buffering-a-stream-spill).
 
-| Phase | Peak RSS |
-|---|---|
-| After parsing all signatures, before building the automaton | ~740 MB |
-| **Building** the automaton from raw signatures | **~3.6 GB** |
-| Final live structures (bodies + automaton + groups + …) | ~470 MB |
-| **Loading the same signatures from a prebuilt database** | **~1.0 GB** |
+## Where the memory really goes: the database
 
-The ~2.9 GB spike is the daachorse double-array Aho-Corasick construction
-transient — a one-shot allocation burst, not steady-state storage and not a leak.
-It can't be reduced by freeing things between steps because it's a single
-construction event.
+Loading raw ClamAV databases builds a double-array Aho-Corasick automaton, and
+for the full `main` + `daily` set that construction needs several GB for a short
+time, far more than the structures it produces. It is one allocation burst, so it
+cannot be reduced by freeing things between steps.
 
-The answer is the [prebuilt database](/guides/prebuilt-database/): compile the
-automaton once on a capable host, serialize it to a portable `.exavdb`, and load
-it cheaply everywhere — deserialization allocates ~the final size, skipping the
-construction transient entirely.
+The [prebuilt database](/guides/prebuilt-database/) avoids it: build the
+automaton once on a capable host, serialize it to a `.exavdb`, and load that
+everywhere else. Loading allocates about the final size and skips the
+construction.
 
-## Tuning knobs
+## Tuning
 
-Memory and CPU/time budgets are separate on purpose:
+Memory and CPU budgets are separate flags:
 
-- **`--max-object-bytes`** (default 256M) — the most memory any *single*
-  materialized object (a decompressed member, an LZ window, a decrypted blob)
-  may use.
+- **`--max-object-bytes`** (256M): the most memory one object may use (a file, a
+  decompressed member, an LZ window, a decrypted blob), and the largest file the
+  full engine scans. Several such buffers are alive at once across nesting
+  levels, so it does not bound the total.
+- **`--max-extracted-bytes`** (1G): what decompression may produce across one
+  top-level file, charged cumulatively. Under the daemon it is clamped to fit the
+  per-job address space, so reaching it is reported as a limit instead of the
+  worker being killed.
+- **`--max-matcher-bytes`** (10G): the most bytes fed to the matcher across one
+  top-level file. A CPU bound, not a memory one.
+- **`--max-pe-emulation-steps`** (1,000,000,000): the instructions the PE
+  unpacking emulator may run across one top-level file.
 
-  It bounds one buffer, not the total. Several are alive at once — a container,
-  its member and that member's own member are each mid-scan while the walk is
-  inside them — so what bounds live extraction memory is `max_extracted_bytes`
-  (default 1G), charged cumulatively and never released. Measured: a 1.1 MB 7z
-  peaked at 2.3 GB with `--max-object-bytes` at its 256M default.
-- **`--max-extracted-bytes`** (which sets `max_extracted_bytes`) — the ceiling on
-  how much extracted data can be resident at once. Under the daemon this is
-  clamped to fit the per-job address space, so hitting it is reported as a limit
-  rather than killing the worker.
-- **`--max-matcher-bytes`** (default 10G) — the cumulative scan-reach limit: the most
-  bytes fed to the matcher across one top-level file. This is a **CPU/time**
-  bound, not a memory bound — streamed members are scanned without being held in
-  RAM, so it can be set far higher to fully scan multi-gigabyte members, paying
-  only in scan time.
-
-See [Configuration](/reference/configuration/) for the full set.
+See [Limits](/reference/limits/) and [Configuration](/reference/configuration/)
+for the full set.

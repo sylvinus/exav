@@ -137,14 +137,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         .map_err(|e| LimitHit::corrupt(format!("machofat: {e}")))?;
     // The largest possible arch table: 8-byte header + MAX_ARCH * 32-byte records.
     let mut header = vec![0u8; 8 + MAX_ARCH as usize * 32];
-    let mut n = 0;
-    while n < header.len() {
-        match source.read(&mut header[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
+    let n = crate::read_full(source, &mut header)?;
     header.truncate(n);
     let Some(archs) = parse_archs_len(&header, total_len) else {
         return Ok(Vec::new());

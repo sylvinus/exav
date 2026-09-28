@@ -226,6 +226,210 @@ fn a_malformed_archive_does_not_hide_a_detection_beside_it() {
     }
 }
 
+/// Damage part way through a compressed stream, in each format that decodes
+/// one. Needs those formats compiled in.
+#[cfg(feature = "all-formats")]
+mod damaged {
+    use super::*;
+
+    /// Deflate data that decodes `prefix`, then hits a block of the reserved type
+    /// with `rest` behind it: content present in the file that no decoder reaches.
+    fn deflate_broken_after(prefix: &[u8], rest: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(prefix).unwrap();
+        // A sync flush ends on a byte boundary with no final block.
+        e.flush().unwrap();
+        let mut raw = e.get_ref().clone();
+        // BFINAL 0, BTYPE 11.
+        raw.push(0x06);
+        raw.extend_from_slice(rest);
+        raw
+    }
+
+    /// Long enough that a decoder hands some of it over before it reaches the
+    /// damage, which is the case a salvage exists for.
+    fn clean_prefix() -> Vec<u8> {
+        (0..4000u32)
+            .flat_map(|i| format!("line {i} of a clean prefix\n").into_bytes())
+            .collect()
+    }
+
+    const UNREACHED: &[u8] = &[0x5a; 4096];
+
+    fn gzip_header() -> Vec<u8> {
+        vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]
+    }
+
+    fn gzip_broken() -> Vec<u8> {
+        let mut g = gzip_header();
+        g.extend(deflate_broken_after(&clean_prefix(), UNREACHED));
+        g
+    }
+
+    /// A gzip that decodes in full and then fails its CRC-32.
+    fn gzip_bad_crc() -> Vec<u8> {
+        let mut g = gzip(&clean_prefix(), flate2::Compression::default());
+        let n = g.len();
+        g[n - 8] ^= 0xff;
+        g
+    }
+
+    fn zip_one(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file(
+            name,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+        z.write_all(body).unwrap();
+        z.finish().unwrap().into_inner()
+    }
+
+    /// A ZIP whose deflated member breaks part way.
+    fn zip_broken() -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file(
+            "m.bin",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        z.write_all(&deflate_broken_after(&clean_prefix(), UNREACHED))
+            .unwrap();
+        let mut blob = z.finish().unwrap().into_inner();
+        // Relabel the stored member as deflated, in its local header and its
+        // directory record.
+        blob[8..10].copy_from_slice(&8u16.to_le_bytes());
+        let cd = blob.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        blob[cd + 10..cd + 12].copy_from_slice(&8u16.to_le_bytes());
+        blob
+    }
+
+    /// A ZIP whose member decodes in full and then fails its CRC-32.
+    fn zip_bad_crc() -> Vec<u8> {
+        let mut blob = zip_one("m.bin", &clean_prefix());
+        blob[14] ^= 0xff;
+        let cd = blob.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        blob[cd + 16] ^= 0xff;
+        blob
+    }
+
+    fn in_zip(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file(
+            name,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        z.write_all(data).unwrap();
+        z.finish().unwrap().into_inner()
+    }
+
+    fn in_tar(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut ar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        ar.append_data(&mut h, name, data).unwrap();
+        ar.into_inner().unwrap()
+    }
+
+    /// A PDF with one FlateDecode stream.
+    fn pdf_with_stream(zlib: &[u8]) -> Vec<u8> {
+        let mut p = format!(
+            "%PDF-1.4\n1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            zlib.len()
+        )
+        .into_bytes();
+        p.extend_from_slice(zlib);
+        p.extend_from_slice(b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+        p
+    }
+
+    fn zlib(payload: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(payload).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn verdict(blob: &[u8]) -> Verdict {
+        analyze(&Scanner::builtin(), blob, &ScanOptions::default()).verdict
+    }
+
+    /// Corruption part way through a compressed stream leaves content in the
+    /// file that was never decoded, so a clean prefix is not a clean file. The
+    /// same answer whether the stream is the file or sits inside another one.
+    #[test]
+    fn content_left_undecoded_is_not_clean() {
+        let mut pdf_broken = vec![0x78, 0x9c];
+        pdf_broken.extend(deflate_broken_after(&clean_prefix(), UNREACHED));
+        for (what, blob) in [
+            ("gzip", gzip_broken()),
+            ("gzip in tar", in_tar("x.gz", &gzip_broken())),
+            ("gzip in zip", in_zip("x.gz", &gzip_broken())),
+            ("zip", zip_broken()),
+            ("zip in tar", in_tar("x.zip", &zip_broken())),
+            ("zip in zip", in_zip("x.zip", &zip_broken())),
+            ("pdf", pdf_with_stream(&pdf_broken)),
+        ] {
+            match verdict(&blob) {
+                Verdict::Unscannable { .. } => {}
+                other => panic!("{what}: expected Unscannable, got {other:?}"),
+            }
+        }
+    }
+
+    /// A stream that decoded in full and then failed its checksum hides nothing:
+    /// every byte it holds was scanned. exav is not an integrity checker.
+    #[test]
+    fn a_bad_checksum_after_a_full_decode_is_clean() {
+        let mut pdf_adler = zlib(&clean_prefix());
+        let n = pdf_adler.len();
+        pdf_adler[n - 1] ^= 0xff;
+        for (what, blob) in [
+            ("gzip", gzip_bad_crc()),
+            ("gzip in tar", in_tar("x.gz", &gzip_bad_crc())),
+            ("gzip in zip", in_zip("x.gz", &gzip_bad_crc())),
+            ("zip", zip_bad_crc()),
+            ("zip in tar", in_tar("x.zip", &zip_bad_crc())),
+            ("zip in zip", in_zip("x.zip", &zip_bad_crc())),
+            ("pdf", pdf_with_stream(&pdf_adler)),
+        ] {
+            match verdict(&blob) {
+                Verdict::Clean => {}
+                other => panic!("{what}: expected Clean, got {other:?}"),
+            }
+        }
+    }
+
+    /// The counterweight: each broken stream still has its prefix scanned, and a
+    /// detection there wins over the damage after it. EICAR sits right before the
+    /// damage, in the output of the very read that fails.
+    #[test]
+    fn a_detection_before_the_damage_is_still_found() {
+        let mut prefix = clean_prefix();
+        prefix.extend_from_slice(eicar());
+        let mut gz = gzip_header();
+        gz.extend(deflate_broken_after(&prefix, UNREACHED));
+        let mut pdf = vec![0x78, 0x9c];
+        pdf.extend(deflate_broken_after(&prefix, UNREACHED));
+        for (what, blob) in [
+            ("gzip", gz.clone()),
+            ("gzip in tar", in_tar("x.gz", &gz)),
+            ("gzip in zip", in_zip("x.gz", &gz)),
+            ("pdf", pdf_with_stream(&pdf)),
+        ] {
+            match verdict(&blob) {
+                Verdict::Infected { .. } => {}
+                other => panic!("{what}: expected Infected, got {other:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn intact_gzip_still_works() {
     // Sanity: the salvage path doesn't regress the normal (untruncated) case.

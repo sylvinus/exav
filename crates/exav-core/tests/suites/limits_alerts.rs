@@ -105,6 +105,66 @@ fn the_recursion_budget_reports_its_own_name() {
     }
 }
 
+/// A PE shaped like a packed file (entry point in a writable section, a
+/// destination section with no raw data) whose stub is `jmp $`.
+#[cfg(any(feature = "pe-emu", feature = "all-formats"))]
+fn spinning_packed_pe() -> Vec<u8> {
+    let (pe, opt_size, raw) = (0x80usize, 0xe0usize, 0x400usize);
+    let mut d = vec![0u8; raw + 0x1000];
+    d[..2].copy_from_slice(b"MZ");
+    d[0x3c..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+    d[pe..pe + 4].copy_from_slice(b"PE\0\0");
+    let coff = pe + 4;
+    d[coff..coff + 2].copy_from_slice(&0x14cu16.to_le_bytes());
+    d[coff + 2..coff + 4].copy_from_slice(&2u16.to_le_bytes());
+    d[coff + 16..coff + 18].copy_from_slice(&(opt_size as u16).to_le_bytes());
+    let opt = coff + 20;
+    d[opt..opt + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+    d[opt + 16..opt + 20].copy_from_slice(&0xe000u32.to_le_bytes());
+    d[opt + 28..opt + 32].copy_from_slice(&0x40_0000u32.to_le_bytes());
+    d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+    d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+    d[opt + 56..opt + 60].copy_from_slice(&0x2_0000u32.to_le_bytes());
+    d[opt + 60..opt + 64].copy_from_slice(&0x400u32.to_le_bytes());
+    let s0 = opt + opt_size;
+    d[s0..s0 + 5].copy_from_slice(b".text");
+    d[s0 + 8..s0 + 12].copy_from_slice(&0xd000u32.to_le_bytes());
+    d[s0 + 12..s0 + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+    d[s0 + 36..s0 + 40].copy_from_slice(&0xe000_0020u32.to_le_bytes());
+    let s1 = s0 + 40;
+    d[s1..s1 + 5].copy_from_slice(b".data");
+    d[s1 + 8..s1 + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+    d[s1 + 12..s1 + 16].copy_from_slice(&0xe000u32.to_le_bytes());
+    d[s1 + 16..s1 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+    d[s1 + 20..s1 + 24].copy_from_slice(&(raw as u32).to_le_bytes());
+    d[s1 + 36..s1 + 40].copy_from_slice(&0xe000_0060u32.to_le_bytes());
+    d[raw..raw + 2].copy_from_slice(&[0xeb, 0xfe]);
+    d
+}
+
+#[cfg(any(feature = "pe-emu", feature = "all-formats"))]
+#[test]
+fn the_emulation_budget_reports_its_own_name() {
+    let db = scanner();
+    let blob = spinning_packed_pe();
+    let mut opts = ScanOptions::default();
+    opts.limits.max_pe_emulation_steps = 10_000;
+    match analyze(&db, &blob, &opts).verdict {
+        Verdict::LimitsExceeded { reason } => assert!(
+            reason.contains("--max-pe-emulation-steps"),
+            "the reason names the flag to raise: {reason}"
+        ),
+        other => panic!("expected LIMITS-EXCEEDED, got {other:?}"),
+    }
+    opts.alert_exceeds_max = true;
+    match analyze(&db, &blob, &opts).verdict {
+        Verdict::Infected { signature, .. } => {
+            assert_eq!(signature, "Heuristics.Limits.Exceeded.MaxScanTime")
+        }
+        other => panic!("expected MaxScanTime, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_real_detection_still_beats_the_limit_alert() {
     // Precedence matters: a file that both trips a budget and carries malware

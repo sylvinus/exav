@@ -63,24 +63,6 @@ pub(crate) fn is_partition(data: &[u8]) -> bool {
     is_gpt(data) || is_apm(data) || is_mbr(data)
 }
 
-/// Read `len` bytes at `off` from a seekable source (tolerant of short reads).
-fn read_at<R: std::io::Read + std::io::Seek>(source: &mut R, off: u64, len: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; len];
-    if source.seek(std::io::SeekFrom::Start(off)).is_err() {
-        return Vec::new();
-    }
-    let mut n = 0;
-    while n < len {
-        match source.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
-    buf.truncate(n);
-    buf
-}
-
 /// One partition as a byte range `[first_lba*512, end_sector*512)` clamped to
 /// `total_len`; `None` for a degenerate/out-of-range slice.
 fn lba_range(
@@ -155,7 +137,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
     let total_len = source
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("partition: {e}")))?;
-    let head = read_at(source, 0, 2 * SECTOR); // covers GPT sig, APM ER/PM, MBR table
+    let head = crate::read_at(source, 0, 2 * SECTOR)?; // covers GPT sig, APM ER/PM, MBR table
     let mut out = Vec::new();
     if is_gpt(&head) {
         let entries_lba = le_u64(&head, SECTOR + 72);
@@ -173,11 +155,11 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             return Ok(out);
         }
         let base = entries_lba.saturating_mul(SECTOR as u64);
-        let table = read_at(
+        let table = crate::read_at(
             source,
             base,
             (num_entries as usize).saturating_mul(entry_size as usize),
-        );
+        )?;
         let mut emitted = 0usize;
         for i in 0..num_entries as usize {
             if emitted >= MAX_PARTS {
@@ -213,7 +195,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             if emitted >= MAX_PARTS {
                 break;
             }
-            let sector = read_at(source, ((i + 1) * SECTOR) as u64, SECTOR);
+            let sector = crate::read_at(source, ((i + 1) * SECTOR) as u64, SECTOR)?;
             if sector.get(0..2) != Some(b"PM".as_slice()) {
                 break;
             }

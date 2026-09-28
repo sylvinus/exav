@@ -339,6 +339,13 @@ pub fn reset_scan_truncated() {
     SCAN_TRUNCATED.with(|c| c.set(false));
 }
 
+/// Record that a matcher outside this module (YARA's condition step budget)
+/// stopped short, so the scan is reported as incomplete.
+#[cfg_attr(not(feature = "yara"), allow(dead_code))]
+pub(crate) fn mark_scan_truncated() {
+    SCAN_TRUNCATED.with(|c| c.set(true));
+}
+
 /// Did any wildcard verification get skipped this scan because its per-buffer
 /// verify budget was exhausted? If so the scan was INCOMPLETE and must not be
 /// reported `Clean`.
@@ -1459,6 +1466,11 @@ impl EngineBuilder {
     /// built-in EICAR test pattern into the engine so in-memory scans don't
     /// also need the streaming literal automaton.
     pub fn add_literal(&mut self, name: &str, bytes: &[u8]) {
+        self.add_literal_prov(name, bytes, false);
+    }
+
+    /// As [`Self::add_literal`], with `unofficial` provenance (a loose `.db`).
+    pub fn add_literal_prov(&mut self, name: &str, bytes: &[u8], unofficial: bool) {
         if bytes.len() < MIN_ANCHOR {
             return;
         }
@@ -1476,7 +1488,7 @@ impl EngineBuilder {
             fullword_len: None,
             owner: Owner::Ndb {
                 name: name.to_string(),
-                unofficial: false,
+                unofficial,
             },
         });
     }
@@ -1835,18 +1847,6 @@ impl EngineBuilder {
         self.build_with_budget(None)
     }
 
-    /// As [`EngineBuilder::build`], but bounds the per-shard automaton-build
-    /// transient to roughly `max_build_mem` bytes by sharding each large
-    /// `(target, case)` partition into multiple automatons. `None` builds one
-    /// automaton per partition (fastest, largest transient). Only the build-time
-    /// peak is affected — scan results are identical.
-    ///
-    /// Anchors are partitioned by `(target, case)`: a scan then runs only the
-    /// partitions whose `target` matches the file type (a PE file never
-    /// traverses the ELF/HTML/text automatons), so the per-body target check is
-    /// implied by which partition a body lives in. Within a partition, identical
-    /// anchors de-duplicate into one automaton pattern that fans out to every
-    /// body sharing it.
     /// Every candidate anchor literal in the database, handed to `f` once per
     /// body that contains it. Bodies whose `elems` were dropped (a pure literal
     /// whose anchor IS the whole pattern) still contribute: their literal is in
@@ -1935,6 +1935,18 @@ impl EngineBuilder {
         self.anchor_ranges = ranges;
     }
 
+    /// As [`EngineBuilder::build`], but bounds the per-shard automaton-build
+    /// transient to roughly `max_build_mem` bytes by sharding each large
+    /// `(target, case)` partition into multiple automatons. `None` builds one
+    /// automaton per partition (fastest, largest transient). Only the build-time
+    /// peak is affected; scan results are identical.
+    ///
+    /// Anchors are partitioned by `(target, case)`: a scan then runs only the
+    /// partitions whose `target` matches the file type (a PE file never
+    /// traverses the ELF/HTML/text automatons), so the per-body target check is
+    /// implied by which partition a body lives in. Within a partition, identical
+    /// anchors de-duplicate into one automaton pattern that fans out to every
+    /// body sharing it.
     pub fn build_with_budget(mut self, max_build_mem: Option<u64>) -> SigEngine {
         self.repick_anchors();
         // The double-array construction transient scales ~linearly with the
@@ -2782,11 +2794,12 @@ impl SigEngine {
         cand
     }
 
-        /// Sweep the active automatons, buffering every hit. `None` when the
-        /// buffer cap (or a buffer too large for `u32` positions) rules it out,
-        /// which tells the caller to take the direct inline path.
+        /// Sweep the active automatons, buffering every hit. `None` when there
+        /// is nothing to gate (no logical signatures), or the buffer cap (or a
+        /// buffer too large for `u32` positions) rules it out, which tells the
+        /// caller to take the direct inline path.
         fn sweep_hits(&self, ft: FileType, buf: &[u8], lower: &[u8]) -> Option<Sweep> {
-            if buf.len() > u32::MAX as usize {
+            if self.ldbs.is_empty() || buf.len() > u32::MAX as usize {
                 return None;
             }
             let cap = max_buffered_hits();
@@ -2948,6 +2961,25 @@ impl SigEngine {
         container: Option<ClType>,
         icon_ctx: Option<&IconCtx>,
     ) -> Option<(String, u64, bool)> {
+        self.scan_first(buf, ft, layout, container, icon_ctx, &|_, _| false)
+    }
+
+    /// As [`Self::scan_with_icons`], passing over every signature for which
+    /// `skip(clean_name, unofficial)` holds and carrying on to the next match.
+    ///
+    /// This is how an ignore list (`.ign`/`.ign2`) takes effect. Filtering the
+    /// result afterwards is not enough: a first-match scan stops at the ignored
+    /// signature, so a real one matching later in the same buffer is never
+    /// looked for.
+    pub(crate) fn scan_first(
+        &self,
+        buf: &[u8],
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        icon_ctx: Option<&IconCtx>,
+        skip: &dyn Fn(&str, bool) -> bool,
+    ) -> Option<(String, u64, bool)> {
         // Per-LDB-subsig match counts; only allocated when there are logical
         // signatures (otherwise no LdbSub body exists and counts is unused).
         let mut sc = Scratch::acquire(if self.ldbs.is_empty() {
@@ -2978,6 +3010,9 @@ impl SigEngine {
         self.walk_candidates(buf, ft, layout, &lower, |bid, start| {
             match &self.bodies[bid].owner {
                 Owner::Ndb { name, unofficial } => {
+                    if skip(name, *unofficial) {
+                        return std::ops::ControlFlow::Continue(());
+                    }
                     ndb_hit = Some((name.clone(), start, *unofficial));
                     return std::ops::ControlFlow::Break(());
                 }
@@ -3035,6 +3070,9 @@ impl SigEngine {
                 // buffer) and keep looking for a real detection.
                 if let Some(ft) = ldb.handler_type {
                     RETYPE.with(|c| c.set(Some((buf.as_ptr() as usize, buf.len(), ft))));
+                    continue;
+                }
+                if skip(&ldb.name, ldb.unofficial) {
                     continue;
                 }
                 return Some((ldb.name.clone(), 0, ldb.unofficial));

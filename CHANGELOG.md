@@ -4,6 +4,95 @@ Notable changes per release. Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely, and versions
 follow [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- A file or archive member larger than `--max-object-bytes` (256 MiB by
+  default) is reported `LIMITS-EXCEEDED` unless a literal signature or a
+  whole-file hash matches it. It was reported `OK` after a literal-and-hash pass
+  that skipped wildcard and logical signatures, YARA and bytecode. An archive over
+  the limit is walked as before and reported `LIMITS-EXCEEDED` too.
+- YARA detections are named `YARA.<rule>` outside `--clamav-compat`; the
+  `.UNOFFICIAL` suffix is compat-only, as for every other signature.
+- A signature reload lets scans in progress finish: old workers and the old ICAP
+  child exit once idle instead of being killed. One still busy after
+  `--max-scan-secs` plus 5 seconds (an open session, a client that never
+  finishes) is stopped.
+- A worker stopped mid-job (shutdown, reload deadline, supervisor gone) answers
+  the job with `ERROR` instead of closing the connection without a reply.
+- `off` and `0` on `--max-object-bytes` and `--max-matcher-bytes` mean no limit,
+  as their help said; they used to set a limit of zero.
+- Every input goes through one scan: a file, stdin, a FIFO given as a path,
+  `INSTREAM`, `EXINSTREAM`, ICAP and `http(s)://`. In particular:
+  - Past `--max-input-bytes`, the first bytes get the whole scan. A file got
+    only literal signatures and hashes there, and stdin and the daemon's stream
+    verbs no scan at all.
+  - A stream larger than the spill budgets is scanned as far as it was held and
+    reported `LIMITS-EXCEEDED`. It was `UNSCANNABLE`, unscanned.
+  - Both follow `--partial-as` as a file does; under `found` they are
+    `Heuristics.Limits.Exceeded.MaxFileSize` everywhere.
+  - A container over `--max-object-bytes` gets the literal and hash pass over
+    its own bytes on every entry point, not only a file path.
+  - Stdin honours `--all-matches`, `--profile` and `--max-process-bytes`, and
+    counts in the summary.
+- exav-core: `scan_stream` is removed (the one scan is `scan_seekable`, and
+  `scan_path` hands a file to it); `warm_up` builds the lazily-initialised
+  structures before a fork.
+- A stream that ends before its terminator is answered `ERROR` on `INSTREAM`
+  and `EXINSTREAM`, whatever `--partial-as` says. `EXINSTREAM` used to answer
+  `PARTIAL` with a `TRUNCATED` category, and `INSTREAM` `UNSCANNABLE`.
+- A compressed stream damaged part way (gzip, ZIP, PDF, embedded PowerPoint
+  storages) is `UNSCANNABLE` when the part before the damage holds no
+  detection, wherever it sits; a checksum mismatch after a full decode is not.
+  Nested in another container it used to be `OK`, and a gzip with only a bad
+  CRC was `UNSCANNABLE` at the top level.
+
+### Added
+
+- `--max-pe-emulation-steps` (default 1,000,000,000): instructions the PE
+  unpacking emulator may run across one top-level file, reported as
+  `LIMITS-EXCEEDED` / `Heuristics.Limits.Exceeded.MaxScanTime`.
+- An encrypted ZIP appended to a picture or document is reported
+  `PASSWORD-PROTECTED` when its central directory checks out.
+- `make miri`.
+
+### Fixed
+
+- A top-level archive now gets the full engine over its own bytes (wildcard and
+  logical signatures, YARA, bytecode, whole-file hashes), as a nested one did, on
+  every entry point including stdin, `INSTREAM` and ICAP.
+- `.ign`/`.ign2` entries and `.fp`/`.sfp` allowlists apply on every scan path,
+  and an ignored signature no longer hides a later detection in the same file.
+- ZIP members absent from the central directory are scanned on the streamed path
+  the top-level scan takes.
+- Clean ZIP members compressed with LZMA, bzip2, XZ, zstd or Deflate64 were also
+  reported as an unsupported codec on the streamed path.
+- `.db` signatures were never matched; PUA literal signatures matched without
+  `--detect pua`.
+- A read error from the source is reported instead of being taken for the end of
+  a container.
+- A job stopped by `--max-scan-secs` is answered `LIMITS-EXCEEDED` instead of the
+  connection closing with no reply.
+- A YARA rule set that runs out of evaluation steps makes the scan
+  `LIMITS-EXCEEDED` instead of a silent non-match.
+- A reload no longer adds a worker to the pool for every worker it retires.
+- A worker exit, `RELOAD` or shutdown signal that arrives while the daemon's
+  supervisor is busy is handled at once, not up to 10 seconds later.
+- `EXINSTREAM` answers a stream it cannot hold with a verdict, as `INSTREAM`
+  does, instead of an error; `EXINSTREAM MULTI` answers that file alone and
+  continues.
+- A FIFO given as a path is scanned; it was an `Illegal seek` error.
+- The daemon reads its cgroup memory limit from its own cgroup and its parents.
+- Percent-encoded credentials in update URLs are decoded before use.
+- The signature count no longer counts literal signatures twice.
+- What a deflate stream (gzip, ZIP, PDF, PowerPoint storages) decoded in the
+  read that met damage, tens of KiB, was dropped unscanned; a detection just
+  before the damage was missed.
+- The bytes a damaged CAB or ZOO member decoded before the damage are scanned;
+  they were reported as scanned and skipped.
+- The `ole` feature builds on its own.
+
 ## [0.0.1] - 2026-09-16
 
 First public release. Everything below is new, so this section describes what

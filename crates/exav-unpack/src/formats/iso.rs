@@ -78,21 +78,14 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     let total_len = source
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("iso: {e}")))?;
+    // `vd_roots` is shared with the in-memory walk and reads infallibly, so a
+    // failure is kept here and reported after the read that hit it.
+    let failed = std::cell::Cell::new(None);
     let mut read_at = |off: u64, len: usize| -> Vec<u8> {
-        let mut buf = vec![0u8; len];
-        if source.seek(std::io::SeekFrom::Start(off)).is_err() {
-            return Vec::new();
-        }
-        let mut n = 0;
-        while n < len {
-            match source.read(&mut buf[n..]) {
-                Ok(0) => break,
-                Ok(k) => n += k,
-                Err(_) => break,
-            }
-        }
-        buf.truncate(n);
-        buf
+        crate::read_at(source, off, len).unwrap_or_else(|e| {
+            failed.set(Some(e));
+            Vec::new()
+        })
     };
     let le32 = |b: &[u8], o: usize| -> u64 {
         b.get(o..o + 4)
@@ -100,6 +93,9 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
             .unwrap_or(0)
     };
     let roots = vd_roots(&mut read_at);
+    if let Some(e) = failed.take() {
+        return Err(e);
+    }
     if roots.is_empty() {
         return Ok(Vec::new());
     }
@@ -123,6 +119,9 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         let avail = total_len.saturating_sub(start);
         let read_len = len.min(avail).min(max_buffer) as usize;
         let dir = read_at(start, read_len);
+        if let Some(e) = failed.take() {
+            return Err(e);
+        }
         let mut p = 0usize;
         while p < dir.len() {
             let rec_len = dir[p] as usize;

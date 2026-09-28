@@ -1,6 +1,6 @@
 ---
 title: Using exav as a Rust library
-description: Embedding exav-core or exav-unpack in your own Rust program — the scan API, the verdict model, and the limits you have to supply yourself.
+description: Embedding exav-core or exav-unpack in your own Rust program, with the scan API, the verdict model, and the limits you have to supply yourself.
 ---
 
 Everything else in this documentation addresses someone running the `exav`
@@ -18,16 +18,18 @@ verdict rather than a corpse. Set it deliberately:
 
 ```rust
 use exav_core::ScanOptions;
-use exav_unpack::Limits;
 
 let mut opts = ScanOptions::default();
-opts.limits = Limits {
-    max_extracted_bytes: 256 * 1024 * 1024,
-    max_buffer_bytes: 64 * 1024 * 1024,
-    max_recursion: 8,
-    ..Limits::default()
-};
+opts.limits.max_extracted_bytes = 256 * 1024 * 1024;
+opts.limits.max_buffer_bytes = 64 * 1024 * 1024;
+opts.deep_analysis_max = 64 * 1024 * 1024;
+opts.limits.max_recursion = 8;
+opts.limits.max_pe_emulation_steps = 200_000_000;
 ```
+
+`Limits` and `ScanOptions` are `#[non_exhaustive]`, so set fields on a default
+value; a struct literal does not compile outside the crate, even with
+`..Default::default()`.
 
 Two failure modes stay outside any in-process budget, and you should decide what
 to do about them before you feed the library hostile input:
@@ -38,7 +40,7 @@ to do about them before you feed the library hostile input:
   `max_recursion` bounds containers inside containers, not recursive descent
   inside one parser.
 
-If your process must survive arbitrary input, scan out of process — or run the
+If your process must survive arbitrary input, scan out of process, or run the
 [WASM build](/guides/wasm-sandbox/), which is bounded by its runtime.
 
 ## A scan
@@ -68,7 +70,7 @@ match report.verdict {
 |---|---|
 | `Clean` | Scanned in full, nothing matched |
 | `Infected` | A signature matched |
-| `LimitsExceeded` | A budget stopped the walk — raise a limit and retry |
+| `LimitsExceeded` | A budget stopped the scan; raise a limit and retry |
 | `Unscannable` | The content could not be decoded; raising a limit changes nothing |
 | `PasswordProtected` | Encrypted, and a password would fix it |
 
@@ -80,8 +82,8 @@ collapse them into a boolean, collapse them toward "suspicious", not away.
 
 ## Extraction without the scanner
 
-`exav-unpack` stands alone — every container format in
-[the supported list](/reference/formats/), `#![forbid(unsafe_code)]`, no
+`exav-unpack` stands alone: every container format in
+[the supported list](/reference/formats/), `#![forbid(unsafe_code)]`, and no
 signature database:
 
 ```rust
@@ -111,19 +113,19 @@ streams member by member and can stop early.
 | Crate | Take it if you want |
 |---|---|
 | `exav-core` | Scanning: signatures, hashes, YARA, heuristics, verdicts |
-| `exav-unpack` | Extraction only — no database, no matching |
+| `exav-unpack` | Extraction only: no database, no matching |
 | `exav-grep` | Searching inside archives |
 | `exav-x86` | An x86-32 decoder with no dependencies |
 | `exav-pe-emu` | Running a packer stub in a sandbox |
 | `exav-update` | Fetching signature databases |
-| `exav` | Nothing — it is the binary, not a library |
+| `exav` | Nothing: it is the binary, not a library |
 
 `exav` is the package `cargo install exav` installs, and it publishes no `[lib]`
 target, so there is no `use exav::…`. Its
 job is orchestration: flag parsing, output formatting, the daemon and ICAP
 listeners, the process-level limits. Everything that decides a verdict lives in
 `exav-core` and `exav-unpack`, which is what you embed. To drive the CLI's
-behaviour from another program, run the binary — or, better for a long-lived
+behaviour from another program, run the binary or, better for a long-lived
 caller, talk to the daemon over the `clamd` protocol or to the
 [ICAP listener](/guides/icap/) instead of paying the database load per scan.
 

@@ -461,7 +461,7 @@ fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
 
     let (code, out) = d.client(&["--send-as", "contents"], &[&big]);
     assert!(
-        out.contains("UNSCANNABLE"),
+        out.contains("LIMITS-EXCEEDED"),
         "the category has to survive the trip: {out}"
     );
     assert!(
@@ -469,6 +469,179 @@ fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
         "and the client must read it back as PARTIAL, not a hard error: {out}"
     );
     assert_eq!(code, 3, "which is exit 3, not 2: {out}");
+}
+
+/// A job cut off by `--max-scan-secs` is answered, not closed in silence: a
+/// connection that ends with no reply reads as a clean scan to some clients.
+#[test]
+fn a_timed_out_job_gets_an_answer() {
+    use std::io::{Read, Write};
+    let d = Daemon::start("077", &["--max-scan-secs", "1"]);
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&4u32.to_be_bytes()).unwrap();
+    s.write_all(b"abcd").unwrap();
+    // Never finished: the job runs into its wall-clock limit.
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out);
+    assert!(
+        reply.contains("LIMITS-EXCEEDED ERROR"),
+        "no verdict for a job the timer stopped: {reply:?}"
+    );
+}
+
+/// `EXINSTREAM` answers a stream it could not hold as `INSTREAM` does: partial,
+/// over a limit, not an error. `MULTI` answers it for that file alone.
+#[test]
+fn an_unexaminable_exinstream_is_partial_too() {
+    use std::io::{Read, Write};
+    let d = Daemon::start(
+        "077",
+        &["--spill-dir", "off", "--spill-threshold-bytes", "1M"],
+    );
+    let big = vec![b'A'; 4 << 20];
+    let chunks = |body: &[u8]| {
+        let mut m = Vec::new();
+        for c in body.chunks(1 << 20) {
+            m.extend_from_slice(&(c.len() as u32).to_be_bytes());
+            m.extend_from_slice(c);
+        }
+        m.extend_from_slice(&0u32.to_be_bytes());
+        m
+    };
+    let ask = |msg: &[u8]| {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(msg).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let text = String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string();
+        serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+    };
+
+    let one = ask(&[&b"zEXINSTREAM\0"[..], &chunks(&big)].concat());
+    assert_eq!(one["status"], "PARTIAL", "{one}");
+    assert_eq!(one["category"], "LIMITS-EXCEEDED", "{one}");
+
+    let mut multi = b"zEXINSTREAM MULTI\0".to_vec();
+    for (name, body) in [("big.bin", &big[..]), ("eicar.txt", eicar())] {
+        multi.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        multi.extend_from_slice(name.as_bytes());
+        multi.extend_from_slice(&chunks(body));
+    }
+    multi.extend_from_slice(&0u32.to_be_bytes());
+    let many = ask(&multi);
+    assert_eq!(many["files"][0]["category"], "LIMITS-EXCEEDED", "{many}");
+    assert_eq!(many["files"][1]["status"], "FOUND", "{many}");
+}
+
+/// A stream the daemon turns down before scanning (over `--max-input-bytes`,
+/// or with nowhere to hold it) is a partial like any other, so `--partial-as`
+/// decides it on `INSTREAM` and `EXINSTREAM` alike.
+#[test]
+fn a_stream_turned_down_follows_partial_as() {
+    use std::io::Write;
+    fn chunks(body: &[u8], terminate: bool) -> Vec<u8> {
+        let mut m = Vec::new();
+        for c in body.chunks(1 << 20) {
+            m.extend_from_slice(&(c.len() as u32).to_be_bytes());
+            m.extend_from_slice(c);
+        }
+        if terminate {
+            m.extend_from_slice(&0u32.to_be_bytes());
+        }
+        m
+    }
+    fn ask(d: &Daemon, verb: &str, body: &[u8], terminate: bool) -> String {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(format!("z{verb}\0").as_bytes()).unwrap();
+        s.write_all(&chunks(body, terminate)).unwrap();
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string()
+    }
+    fn multi(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut m = (name.len() as u32).to_be_bytes().to_vec();
+        m.extend_from_slice(name.as_bytes());
+        m.extend_from_slice(&chunks(body, true));
+        m.extend_from_slice(&0u32.to_be_bytes());
+        m
+    }
+    fn ask_multi(d: &Daemon, body: &[u8]) -> String {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(b"zEXINSTREAM MULTI\0").unwrap();
+        s.write_all(&multi("f.bin", body)).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string()
+    }
+    let big = vec![b'A'; 3 << 20];
+    let limits = [
+        "--max-input-bytes",
+        "2M",
+        "--spill-dir",
+        "off",
+        "--spill-threshold-bytes",
+        "4M",
+    ];
+    let spill = ["--spill-dir", "off", "--spill-threshold-bytes", "1M"];
+
+    // Default policy: the flag the limit comes from is the one exav has.
+    let d = Daemon::start("077", &limits);
+    let line = ask(&d, "INSTREAM", &big, true);
+    assert!(
+        line.contains("max-input-bytes") && line.ends_with("LIMITS-EXCEEDED ERROR"),
+        "{line}"
+    );
+    let json = ask(&d, "EXINSTREAM", &big, true);
+    assert!(json.contains("max-input-bytes"), "{json}");
+    assert!(!json.contains("max-filesize"), "{json}");
+    drop(d);
+
+    for (policy, instream, status) in [
+        ("ok", "stream: OK", "\"status\":\"OK\""),
+        // The name a file over the limit gets, since it is the same scan.
+        (
+            "found",
+            "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND",
+            "\"status\":\"FOUND\"",
+        ),
+    ] {
+        let d = Daemon::start("077", &[&limits[..], &["--partial-as", policy]].concat());
+        assert_eq!(ask(&d, "INSTREAM", &big, true), instream, "{policy}");
+        let json = ask(&d, "EXINSTREAM", &big, true);
+        assert!(json.contains(status), "{policy}: {json}");
+        let json = ask_multi(&d, &big);
+        assert!(json.contains(status), "{policy}: {json}");
+    }
+
+    let d = Daemon::start("077", &[&spill[..], &["--partial-as", "ok"]].concat());
+    assert_eq!(ask(&d, "INSTREAM", &big, true), "stream: OK");
+    let json = ask(&d, "EXINSTREAM", &big, true);
+    assert!(json.contains("\"status\":\"OK\""), "{json}");
+    let json = ask_multi(&d, &big);
+    assert!(json.contains("\"status\":\"OK\""), "{json}");
+
+    // A stream the client never finished is not an object exav could not
+    // examine but a request that never arrived, so no policy passes it: an
+    // `OK` there is a verdict for whoever hangs up after a benign head.
+    let line = ask(&d, "INSTREAM", b"head", false);
+    assert!(
+        line.ends_with(" ERROR") && !line.contains("UNSCANNABLE"),
+        "{line}"
+    );
+    let json = ask(&d, "EXINSTREAM", b"head", false);
+    assert!(json.contains("\"status\":\"ERROR\""), "{json}");
+    assert!(!json.contains("category"), "{json}");
 }
 
 /// `--json` is a machine stream: the informational lines `-v` prints would be

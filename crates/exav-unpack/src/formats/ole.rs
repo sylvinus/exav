@@ -294,7 +294,7 @@ fn append_ppt_embedded_storages(entries: &mut Vec<Entry>, budget: &mut Budget) {
         if !leaf.eq_ignore_ascii_case("PowerPoint Document") {
             continue;
         }
-        for (i, blob) in ppt_embedded_storages(&e.data, budget)
+        for (i, (blob, why)) in ppt_embedded_storages(&e.data, budget)
             .into_iter()
             .enumerate()
         {
@@ -302,7 +302,9 @@ fn append_ppt_embedded_storages(entries: &mut Vec<Entry>, budget: &mut Budget) {
                 break;
             }
             budget.commit(blob.len() as u64);
-            carved.push(Entry::new(format!("ppt-embedded-{i}"), blob));
+            let mut entry = Entry::new(format!("ppt-embedded-{i}"), blob);
+            entry.unsupported = why;
+            carved.push(entry);
         }
     }
     entries.extend(carved);
@@ -317,7 +319,10 @@ fn append_ppt_embedded_storages(entries: &mut Vec<Entry>, budget: &mut Budget) {
 /// how a record nested three levels down is reached at all. The instance (the
 /// high twelve bits) selects the storage form: `0` is stored, `1` is
 /// `[uncompressedSize:u32]` followed by a zlib stream.
-fn ppt_embedded_storages(stream: &[u8], budget: &mut Budget) -> Vec<Vec<u8>> {
+fn ppt_embedded_storages(
+    stream: &[u8],
+    budget: &mut Budget,
+) -> Vec<(Vec<u8>, Option<&'static str>)> {
     /// `RT_ExternalOleObjectStg`.
     const EXT_OLE_OBJ_STG: u16 = 0x1011;
     /// A record tree deep enough to need more steps than this is malformed, and
@@ -355,25 +360,44 @@ fn ppt_embedded_storages(stream: &[u8], budget: &mut Budget) -> Vec<Vec<u8>> {
     out
 }
 
-/// One storage record's bytes: stored as-is, or inflated, bounded by the budget.
-fn ppt_storage_payload(instance: u16, body: &[u8], budget: &mut Budget) -> Option<Vec<u8>> {
+/// One storage record's bytes: stored as-is, or inflated, bounded by the
+/// budget, and why they are not the whole storage when they are not.
+fn ppt_storage_payload(
+    instance: u16,
+    body: &[u8],
+    budget: &mut Budget,
+) -> Option<(Vec<u8>, Option<&'static str>)> {
+    const OVER: &str = "embedded PowerPoint storage exceeds the per-member budget";
+    const BROKEN: &str = "embedded PowerPoint storage could not be decompressed";
+    const PART_WAY: &str = "embedded PowerPoint storage failed to decompress part way; \
+                            the bytes before the failure were scanned";
     let cap = budget.reserve().ok()?;
     if instance == 0 {
         // Stored. The record is the compound file.
-        return (body.len() as u64 <= cap).then(|| body.to_vec());
+        return Some(if body.len() as u64 <= cap {
+            (body.to_vec(), None)
+        } else {
+            (Vec::new(), Some(OVER))
+        });
     }
     // Compressed: a declared size then a zlib stream. The declared size is a
     // hint from the file, so it is not trusted for allocation — the read is
     // bounded by the budget and salvages a truncated tail, which is how a
     // deliberately-truncated object still gets scanned rather than dropped.
     let deflated = body.get(4..)?;
-    let (data, _truncated) = bounded_read_salvage(
-        flate2::read::ZlibDecoder::new(Cursor::new(deflated)),
-        cap,
-        true,
-    )
-    .ok()?;
-    (!data.is_empty()).then_some(data)
+    let Some(zlib) = crate::inflate::zlib_body(deflated) else {
+        return Some((Vec::new(), Some(BROKEN)));
+    };
+    let s = bounded_read_salvage(zlib, cap, true).ok()?;
+    let why = match (s.over_cap, s.undecoded, s.data.is_empty()) {
+        (true, _, _) => Some(OVER),
+        (_, true, true) => Some(BROKEN),
+        (_, true, false) => Some(PART_WAY),
+        // Nothing decoded and nothing left undecoded: an empty storage.
+        (_, false, true) => return None,
+        (_, false, false) => None,
+    };
+    Some((s.data, why))
 }
 
 /// The payload bytes inside an `Ole10Native` stream, or `None` when the header
@@ -1020,6 +1044,53 @@ mod macro_artifact_tests {
             e[0].comp_size, 1000,
             "with its real size, so the report is actionable"
         );
+    }
+
+    /// A storage record hands over its bytes, and says so whenever they are
+    /// not all of it.
+    #[test]
+    fn a_ppt_storage_says_when_it_is_not_whole() {
+        use std::io::Write;
+        let compressed = |payload: &[u8]| {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(payload).unwrap();
+            let mut body = (payload.len() as u32).to_le_bytes().to_vec();
+            body.extend(e.finish().unwrap());
+            body
+        };
+        let mut b = Budget::new(Limits::default());
+
+        let intact = compressed(b"storage");
+        let got = ppt_storage_payload(1, &intact, &mut b).unwrap();
+        assert_eq!(got, (b"storage".to_vec(), None));
+
+        let mut bad_adler = intact.clone();
+        let n = bad_adler.len();
+        bad_adler[n - 1] ^= 1;
+        let got = ppt_storage_payload(1, &bad_adler, &mut b).unwrap();
+        assert_eq!(got, (b"storage".to_vec(), None));
+
+        // Damaged after a long run of content: that run, and a reason.
+        let content: Vec<u8> = (0..20_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(&content).unwrap();
+        e.flush().unwrap();
+        let mut damaged = vec![0, 0, 0, 0, 0x78, 0x9c];
+        damaged.extend_from_slice(e.get_ref());
+        damaged.extend_from_slice(&[0x06, 0x5a, 0x5a]);
+        let (data, why) = ppt_storage_payload(1, &damaged, &mut b).unwrap();
+        assert_eq!(data, content);
+        assert!(why.is_some_and(|w| w.contains("part way")), "{why:?}");
+
+        let (data, why) = ppt_storage_payload(1, b"\0\0\0\0not zlib", &mut b).unwrap();
+        assert!(data.is_empty() && why.is_some());
+
+        let mut small = Budget::new(Limits {
+            max_buffer_bytes: 4,
+            ..Limits::default()
+        });
+        let (data, why) = ppt_storage_payload(0, b"stored storage", &mut small).unwrap();
+        assert!(data.is_empty() && why.is_some());
     }
 
     #[test]

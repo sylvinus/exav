@@ -5,8 +5,9 @@ description: Install exav with cargo, from a prebuilt binary, as a package, as a
 
 import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
 
-exav is cross-platform (Linux, macOS, Windows) and ships as a single static
-binary with no runtime dependencies.
+exav runs on Linux, macOS and Windows and ships as a single binary. The Linux
+release builds are static (musl); the macOS and Windows builds link the system
+libraries.
 
 ## From crates.io
 
@@ -14,12 +15,12 @@ binary with no runtime dependencies.
 cargo install exav
 ```
 
-That installs the `exav` binary with the default pure-Rust build, which handles every
-supported archive format. The package is `exav`; the library
-crates it is built from are the `exav-*` ones, and are not needed to install it.
+That installs the `exav` binary with the default pure-Rust build, which handles
+every supported archive format. The library crates it is built from (`exav-*`)
+are not needed to install it.
 
-For a build with [HTTP support](/reference/feature-flags/#adding-http-support) —
-URL scanning and signature updates over HTTP(S):
+For a build with [HTTP support](/reference/feature-flags/#adding-http-support)
+(URL scanning and signature updates over HTTP(S)):
 
 ```sh
 cargo install exav --features http
@@ -28,8 +29,8 @@ cargo install exav --features http
 See [Feature flags](/reference/feature-flags/) for all build options.
 
 <Aside type="caution" title="Rust 1.91 or newer">
-If the build fails on syntax rather than on your code, check `rustc --version`
-first — the workspace `rust-version` in `Cargo.toml` is authoritative.
+If the build fails on syntax, check `rustc --version` first. The workspace
+`rust-version` in `Cargo.toml` is authoritative.
 </Aside>
 
 ## Build from source
@@ -78,9 +79,8 @@ CI produces these on each `v*` tag:
 
 <Tabs>
   <TabItem label="Prebuilt binaries">
-    Static-musl Linux binaries run on any distro. Targets:
-    `{x86_64,aarch64}-linux-musl`, `{x86_64,aarch64}-apple-darwin`,
-    `x86_64-windows` — attached to the GitHub Release.
+    Attached to the GitHub Release for `{x86_64,aarch64}-linux-musl` (static,
+    any distro), `{x86_64,aarch64}-apple-darwin` and `x86_64-windows`.
   </TabItem>
   <TabItem label="Debian / Ubuntu">
     ```sh
@@ -93,8 +93,8 @@ CI produces these on each `v*` tag:
 
 ## Container
 
-The published image is a wire-level drop-in for the ClamAV Docker image — same
-clamd port 3310, same protocol:
+The published image is a wire-level replacement for the ClamAV Docker image: the
+same clamd port 3310 and protocol.
 
 ```sh
 docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
@@ -113,11 +113,10 @@ rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 ```
 
-The output is `target/wasm32-wasip1/release/exav-wasm.wasm` (~5–6 MB). See the
+The output is `target/wasm32-wasip1/release/exav-wasm.wasm`. See the
 [WASM sandbox guide](/guides/wasm-sandbox/) for how to run it under wasmtime.
 
 ## Next
 
-You have the binary — now [get signatures and run your first scan](/getting-started/quick-start/).
-exav ships with **no** real signature database of its own, so this step is
-required.
+exav ships no signature database of its own, so the next step is to
+[get signatures and run a first scan](/getting-started/quick-start/).

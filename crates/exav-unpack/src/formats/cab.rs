@@ -35,8 +35,24 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
         )
         .map_err(|e| LimitHit::new(format!("cab folder: {e}")))?;
         let mut pos = 0u64;
+        // Set once the folder stream fails: past that, offsets no longer
+        // match what the reader would return.
+        let mut stalled = false;
         for f in folder_files {
             let want = f.data_offset as u64;
+            if stalled {
+                budget.count_entry()?;
+                let m = MemberMeta {
+                    name: f.name().to_string(),
+                    comp_size: f.uncompressed_size as u64,
+                    encrypted: false,
+                    unsupported: Some("CAB folder could not be read up to this member"),
+                };
+                if let Some(t) = visit(&m, None, budget) {
+                    return Ok(Some(t));
+                }
+                continue;
+            }
             // Both of these are members the cabinet's own directory names, so
             // they exist; this reader just cannot reach them. Reporting is the
             // whole difference between "no malware here" and "did not look".
@@ -56,15 +72,20 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
                 }
                 continue;
             }
-            let skipped = skip_forward(&mut reader, want - pos);
+            let (skipped, failed) = skip_forward(&mut reader, want - pos);
             pos += skipped;
+            stalled = failed;
             if pos < want {
                 budget.count_entry()?;
                 let m = MemberMeta {
                     name: f.name().to_string(),
                     comp_size: f.uncompressed_size as u64,
                     encrypted: false,
-                    unsupported: Some("CAB folder ended before this member's offset"),
+                    unsupported: Some(if failed {
+                        "CAB folder could not be read up to this member"
+                    } else {
+                        "CAB folder ended before this member's offset"
+                    }),
                 };
                 if let Some(t) = visit(&m, None, budget) {
                     return Ok(Some(t));
@@ -83,7 +104,7 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
                 let out = visit_member(&meta_m, &mut window, budget, visit)?;
                 // Drain any bytes the visitor left so `pos` advances by the full
                 // size and the next file lands at the right offset.
-                let _ = std::io::copy(&mut window, &mut std::io::sink());
+                stalled = std::io::copy(&mut window, &mut std::io::sink()).is_err();
                 out
             };
             pos = want + f.uncompressed_size as u64;
@@ -95,8 +116,9 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
     Ok(None)
 }
 
-/// Read and discard up to `n` bytes; returns how many were skipped.
-fn skip_forward<R: Read>(r: &mut R, n: u64) -> u64 {
+/// Read and discard up to `n` bytes; returns how many were skipped, and whether
+/// the reader failed rather than ended.
+fn skip_forward<R: Read>(r: &mut R, n: u64) -> (u64, bool) {
     let mut skipped = 0u64;
     let mut buf = [0u8; 8192];
     while skipped < n {
@@ -104,10 +126,11 @@ fn skip_forward<R: Read>(r: &mut R, n: u64) -> u64 {
         match r.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(k) => skipped += k as u64,
-            Err(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (skipped, true),
         }
     }
-    skipped
+    (skipped, false)
 }
 
 pub(crate) fn extract_cab<R>(
@@ -142,16 +165,24 @@ pub(crate) fn extract_cab<R>(
                 continue;
             }
         };
-        let buf = tolerant_read(reader, cap);
+        let (buf, failed) = tolerant_read(reader, cap);
         budget.commit(buf.len() as u64);
-        if let Some(r) = visit(Entry::new(name, buf), budget) {
+        let mut e = Entry::new(name, buf);
+        if failed {
+            e.unsupported = Some(
+                "CAB member data failed to decode part way; the bytes before \
+                 the failure were scanned",
+            );
+        }
+        if let Some(r) = visit(e, budget) {
             return Ok(Some(r));
         }
     }
     Ok(None)
 }
 
-fn tolerant_read<R: Read>(mut r: R, cap: u64) -> Vec<u8> {
+/// Up to `cap` bytes, and whether the reader failed before it ended.
+fn tolerant_read<R: Read>(mut r: R, cap: u64) -> (Vec<u8>, bool) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     while (buf.len() as u64) < cap {
@@ -161,10 +192,11 @@ fn tolerant_read<R: Read>(mut r: R, cap: u64) -> Vec<u8> {
                 let room = (cap - buf.len() as u64) as usize;
                 buf.extend_from_slice(&chunk[..n.min(room)]);
             }
-            Err(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (buf, true),
         }
     }
-    buf
+    (buf, false)
 }
 
 fn repair_cab_size(data: &[u8]) -> Option<Vec<u8>> {

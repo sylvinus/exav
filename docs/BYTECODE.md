@@ -233,3 +233,36 @@ strictly-bounded sandbox is invariant throughout.
 
 Phases A–E (~6–8 weeks) reach ~78% coverage with real, safe detections; the
 `disasm_x86` long tail (Phase F) is the bulk of the remainder.
+
+## Host APIs: 34 of 107
+
+ClamAV's host-API table has 107 entries, byte-identical in 1.4.3 and 1.5.3. exav
+implements 34.
+
+The `maxapi 89` in debug output is not the table size: it is a per-program
+declaration in each `.cbc` header, and 89 is the highest value any shipped
+program declares. So indices 0–89 are the reachable surface: exav implements 34
+of those 90, and 56 are unimplemented. Indices 90–106 (JSON accessors, LZMA and
+bzip2 stream contexts, `get_file_reliability`, `engine_scan_options_ex`) exist in
+ClamAV, but no program in the shipped database references any of them.
+
+| Group | Missing | APIs |
+|---|---|---|
+| Buffer pipes | 9 | `buffer_pipe_new`, `_new_fromfile`, `_read_avail`, `_read_get`, `_read_stopped`, `_write_avail`, `_write_get`, `_write_stopped`, `_done` |
+| Debug / trace | 10 | `debug_print_str`, `debug_print_uint`, `debug_print_str_start`, `debug_print_str_nonl`, `trace_directory`, `trace_scope`, `trace_source`, `trace_op`, `trace_value`, `trace_ptr` |
+| Engine / environment | 9 | `bytecode_rt_error`, `engine_scan_options`, `engine_db_options`, `extract_set_container`, `input_switch`, `disable_bytecode_if`, `disable_jit_if`, `check_platform`, `running_on_jit` |
+| Maps | 8 | `map_new`, `map_addkey`, `map_setvalue`, `map_remove`, `map_find`, `map_getvaluesize`, `map_getvalue`, `map_done` |
+| Hashsets | 6 | `hashset_new`, `_add`, `_remove`, `_contains`, `_done`, `_empty` |
+| PDF extras | 6 | `pdf_get_obj_num`, `pdf_set_flags`, `pdf_getobj`, `pdf_getobjflags`, `pdf_setobjflags`, `pdf_get_dumpedobjid` |
+| Decompression | 3 | `inflate_init`, `inflate_process`, `inflate_done` |
+| JS normalisation | 3 | `jsnorm_init`, `jsnorm_process`, `jsnorm_done` |
+| Self-test | 2 | `test1`, `test2` |
+| **Total** | **56** | of the 90 reachable indices |
+
+At the time of writing all 85 bytecode programs in the official database run to
+completion, and across 400 real malware samples one stub was reached
+(`get_environment`). A program declares a `maxapi` ceiling; it does not call
+every API below it. Some of the 56 are unlikely to matter (the debug and trace
+groups are compile-time instrumentation; `running_on_jit` and `disable_jit_if`
+have an obvious answer on an engine with no JIT). The pipes, maps and `inflate`
+groups would be real work if a future program used them.

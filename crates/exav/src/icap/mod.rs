@@ -36,7 +36,8 @@
 //! which is the one answer exav must never give for an object nobody examined.
 //!
 //! What keeps the two distinguishable is the threat name, not the header's
-//! presence. A database hit is reported under its signature name; //! block under `Heuristics.Exav.<Condition>` — the prefix ClamAV uses for a
+//! presence. A database hit is reported under its signature name; a partial
+//! block under `Heuristics.Exav.<Condition>`, the prefix ClamAV uses for a
 //! policy block rather than a database entry, qualified by the scanner that
 //! synthesised it. An analyst reading an incident log can tell them apart, and
 //! [`X-Exav-Category`](IcapConfig) still carries the exact condition for a client
@@ -232,7 +233,7 @@ pub fn serve_alone(
     let shared = Arc::new(ReloadableDb::from_arc(db));
     let handle: Arc<dyn Signatures> = Arc::clone(&shared) as Arc<dyn Signatures>;
     std::thread::spawn(move || {
-        if let Err(e) = server.run(handle, opts) {
+        if let Err(e) = server.run(handle, opts, &|_| true) {
             eprintln!("exav: icap: listener stopped: {e}");
         }
         // The listener is the whole job. Without it the process is a supervisor
@@ -255,7 +256,7 @@ pub fn serve_alone(
         let Some(now) = crate::daemon::datadir_mtime(&dir) else {
             continue;
         };
-        if last.map(|prev| now > prev).unwrap_or(true) {
+        if crate::daemon::source_changed(last, now) {
             last = Some(now);
             match reload() {
                 Ok(new_db) => {
@@ -282,12 +283,13 @@ pub fn serve_alone(
 /// clamd listener as well. A dedicated child keeps ICAP's threaded model while
 /// still sharing the supervisor's warmed database copy-on-write, and the
 /// supervisor re-forks it from the new database on every reload — so the
-/// signature swap needs no in-process machinery at all.
+/// signature swap needs no in-process machinery at all. The retired child
+/// finishes the requests it is serving before it exits.
 #[cfg(unix)]
 pub fn forked_child(server: Server, metrics_interval: Duration) -> crate::daemon::SideListener {
     crate::daemon::SideListener {
         name: "icap",
-        serve: Box::new(move |db, opts| {
+        serve: Box::new(move |db, opts, retire| {
             announce(&server);
             // A child of its own, so its counters are its own: the clamd
             // workers' `STATS` cannot see them and this log line is where they
@@ -295,8 +297,19 @@ pub fn forked_child(server: Server, metrics_interval: Duration) -> crate::daemon
             // thread does not survive one.
             crate::metrics::spawn_reporter(metrics_interval, "icap");
             let handle: Arc<dyn Signatures> = Arc::new(FixedDb::from_arc(db));
-            if let Err(e) = server.run(handle, opts) {
+            // Shared with the other generation's child during a reload, so
+            // both wait for readiness instead of blocking in accept.
+            let wait = |l: &std::net::TcpListener| {
+                use std::os::fd::AsRawFd;
+                crate::daemon::await_connection(l.as_raw_fd(), retire)
+            };
+            if let Err(e) = server.set_nonblocking() {
                 eprintln!("exav: icap: listener stopped: {e}");
+                std::process::exit(2);
+            }
+            match server.run(handle, opts, &wait) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => eprintln!("exav: icap: listener stopped: {e}"),
             }
             std::process::exit(2);
         }),

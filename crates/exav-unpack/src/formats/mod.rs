@@ -190,7 +190,7 @@ pub(crate) use dmg::{extract_dmg, is_dmg};
 #[cfg(feature = "email")]
 pub(crate) use email::extract_email;
 #[cfg(feature = "gzip")]
-pub(crate) use gzip::extract_gzip;
+pub(crate) use gzip::{extract_gzip, gunzip, gzip_entry};
 #[cfg(feature = "iso")]
 pub(crate) use iso::extract_iso;
 #[cfg(feature = "javaclass")]

@@ -213,7 +213,14 @@ pub(crate) fn extract_pdf<R>(
                     "PDF stream could not be decoded",
                 )
             } else {
-                Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf)
+                let mut e = Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf);
+                if outcome.part_way {
+                    e.unsupported = Some(
+                        "PDF stream failed to decode part way; the bytes before the \
+                         failure were scanned",
+                    );
+                }
+                e
             };
             if let Some(r) = visit(entry, budget) {
                 return Ok(Some(r));
@@ -323,6 +330,22 @@ struct FilterOutcome {
     /// which is a successful decode of an empty stream (legal — e.g. an empty
     /// page-content stream) and must NOT be reported undecodable.
     decode_error: bool,
+    /// A filter decoded part of its input and failed on the rest: `buf` holds
+    /// what came before the failure.
+    part_way: bool,
+}
+
+/// A zlib stream decoded up to any damage, without its Adler-32 check.
+fn salvage_zlib(data: &[u8], cap: u64) -> Salvaged {
+    let failed = Salvaged {
+        data: Vec::new(),
+        over_cap: false,
+        undecoded: true,
+    };
+    match crate::inflate::zlib_body(data) {
+        Some(body) => bounded_read_salvage(body, cap, true).unwrap_or(failed),
+        None => failed,
+    }
 }
 
 /// Decode a stream's raw bytes by applying its `/Filter` chain left to right,
@@ -344,10 +367,12 @@ fn apply_filters(
             truncated: stream_data.len() as u64 > cap,
             // No decoding involved: raw bytes pass through, nothing to fail.
             decode_error: false,
+            part_way: false,
         });
     }
     let parms = decode_parms_list(info, names.len());
     let mut buf = stream_data.to_vec();
+    let mut part_way = false;
     // Whether an implemented filter failed with nothing recovered. Sticky
     // across the chain: only a successful decode producing content clears the
     // question, and the caller reports `unsupported` solely on
@@ -369,28 +394,17 @@ fn apply_filters(
                 match bounded_read(flate2::read::ZlibDecoder::new(Cursor::new(&buf)), cap) {
                     Ok((out, truncated)) => (out, truncated, false),
                     Err(_) => {
-                        let (mut out, mut truncated) = bounded_read_salvage(
-                            flate2::read::ZlibDecoder::new(Cursor::new(&buf)),
-                            cap,
-                            true,
-                        )
-                        .unwrap_or((Vec::new(), false));
-                        if out.is_empty() {
+                        let mut s = salvage_zlib(&buf, cap);
+                        if s.data.is_empty() {
                             if let Some(z) = buf.iter().position(|&b| b == 0x78) {
-                                let r = bounded_read_salvage(
-                                    flate2::read::ZlibDecoder::new(Cursor::new(&buf[z..])),
-                                    cap,
-                                    true,
-                                )
-                                .unwrap_or((Vec::new(), false));
-                                out = r.0;
-                                truncated = r.1;
+                                s = salvage_zlib(&buf[z..], cap);
                             }
                         }
                         // Empty input decodes vacuously (nothing to fail on);
                         // only non-empty input decoding to nothing is an error.
-                        let err = out.is_empty() && !buf.is_empty();
-                        (out, truncated, err)
+                        let err = s.data.is_empty() && !buf.is_empty();
+                        part_way |= s.undecoded && !err;
+                        (s.data, s.over_cap, err)
                     }
                 }
             }
@@ -430,6 +444,7 @@ fn apply_filters(
                 buf: out,
                 truncated: true,
                 decode_error,
+                part_way,
             });
         }
         buf = out;
@@ -439,6 +454,7 @@ fn apply_filters(
         buf,
         truncated,
         decode_error,
+        part_way,
     })
 }
 

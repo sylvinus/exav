@@ -1,12 +1,11 @@
 ---
 title: Feature flags
-description: Cargo build features for exav — YARA, HTTP, decryption, DLP, and per-format extractors — so a build compiles only what it uses.
+description: Cargo build features for exav, covering YARA, HTTP, decryption, DLP, and per-format extractors, so a build compiles only what it uses.
 ---
 
-exav favors small leaf crates and feature-gates optional capability, so a build
-compiles only what it uses — for control, auditability, `unsafe` surface, and
-binary/WASM size. These are Cargo `--features` on `exav` (they forward
-through `exav-core` → `exav-unpack`).
+exav feature-gates optional capability, so a build compiles only what it uses,
+for auditability, `unsafe` surface and binary or WASM size. These are Cargo
+`--features` on `exav`; they forward through `exav-core` to `exav-unpack`.
 
 ## Default features
 
@@ -14,110 +13,97 @@ through `exav-core` → `exav-unpack`).
 default = ["yara", "all-formats", "decrypt", "dlp", "icap"]
 ```
 
-The default build is 100% pure-Rust and links **no TLS stack** — HTTP is opt-in.
+The default build is pure Rust and links no TLS stack; HTTP is opt-in.
 
 ## Capability features
 
 | Feature | In default? | What it adds |
 |---|---|---|
-| `yara` | yes | Full YARA rule matching via the native engine. Disabling compiles away the YARA parser/evaluator subtree for a lighter binary. |
-| `all-formats` | yes | Every archive/container extractor (see below). |
+| `yara` | yes | YARA rule matching through the native engine. Disabling it drops the YARA parser and evaluator. |
+| `all-formats` | yes | Every archive and container extractor (see below). |
 | `decrypt` | yes | Decryption of encrypted archives (ZIP ZipCrypto/AES, 7z AES, PDF, DMG). |
 | `dlp` | yes | The structured-data leak heuristics (`--dlp-credit-cards` / `--dlp-ssns`). |
-| `icap` | yes | The [ICAP (RFC 3507) server](/guides/icap/) and its `--icap*` flags. Pure-Rust and std-only, so it costs the default build nothing; it binds no port unless an `icap://` address on `--listen` asks it to. |
-| `http` | **no** | HTTP(S) support. Enables both halves below; the only thing that links a TLS stack (`ureq → rustls → ring`). Note the name is per-crate: in `exav-core` `http` is just the range-request backend (`dep:ureq`), while in `exav` it is the umbrella `http = ["http-scan", "http-update"]`. |
-| `http-scan` | no | Scan an `http(s)://` argument + the daemon `SCANURL` command. |
+| `icap` | yes | The [ICAP (RFC 3507) server](/guides/icap/) and its `--icap-*` flags. Pure Rust and `std`-only, so it costs the default build nothing, and it binds no port unless an `icap://` address asks for one. |
+| `http` | **no** | HTTP(S) support: both halves below, and the only thing that links a TLS stack (`ureq` → `rustls` → `ring`). In `exav-core`, `http` is only the range-request backend (`dep:ureq`); in `exav` it is `http = ["http-scan", "http-update"]`. |
+| `http-scan` | no | Scanning an `http(s)://` argument, and the daemon's `SCANURL` command. |
 | `http-update` | no | Signature auto-update over HTTP (`--sig-sources`, `--db-url`). |
 
-The `http` split lets an updater-only daemon take `http-update` **without**
-exposing the network-facing `SCANURL` verb (a client making the daemon fetch an
-arbitrary URL) — take one, the other, or both.
+The split lets an updater-only daemon take `http-update` without the
+network-facing `SCANURL` command (a client making the daemon fetch an arbitrary
+URL).
 
 ## Adding HTTP support
 
-HTTP is additive: it stacks on top of the default build, which otherwise links
-no TLS stack.
-
 ```sh
-# From source — URL scanning (`http-scan`) plus signature auto-update (`http-update`):
+# From source: URL scanning (http-scan) plus signature auto-update (http-update)
 cargo build --release -p exav --features http
 
-# From crates.io:
+# From crates.io
 cargo install exav --features http
 ```
 
-Take only the half you need:
+Or only the half you need:
 
 ```sh
-# Scan `http(s)://` arguments, without the updater:
+# Scan http(s):// arguments, without the updater
 cargo build --release -p exav --features http-scan
 
-# Fetch signature updates, without exposing SCANURL:
+# Fetch signature updates, without SCANURL
 cargo build --release -p exav --features http-update
 ```
 
-The published container image already builds with `http`.
+The published container image is built with `http`.
 
 ## The test-only feature: `testing-faults`
 
-`testing-faults` lets a **scanned file ask a decoder to fail**, so the tests can
-check what exav reports when one does. It is declared in four crates and is in
-the default set of none of them:
+`testing-faults` lets a scanned file ask a decoder to fail, so the tests can check
+what exav reports when one does. It is declared in four crates and is in the
+default set of none:
 
 | Crate | Declaration |
 |---|---|
-| `exav-unpack` | the leaf — the marker is matched and the fault raised here |
+| `exav-unpack` | the leaf: the marker is matched and the fault raised here |
 | `exav-core` | forwards to `exav-unpack/testing-faults` |
 | `exav` | forwards to `exav-core/testing-faults` |
-| `exav-unpack-wasm` | an independent leaf, keyed on the member *name* |
+| `exav-unpack-wasm` | an independent leaf, keyed on the member name |
 
-With it on, a reserved byte marker anywhere in the data reaching the format
-dispatch raises the matching fault — `__exav_panic__` a panic,
-`__exav_abort__` an abort, `__exav_stack__` unbounded recursion — from both the
-buffered and the streaming dispatch, since a natively-streaming container never
-goes through the buffered one. The WASM package keys the same idea on a member
-name and offers `__exav_panic__`, `__exav_oom__` and `__exav_stack__`.
+With it on, a reserved byte marker in the data reaching the format dispatch
+raises a fault (`__exav_panic__` a panic, `__exav_abort__` an abort,
+`__exav_stack__` unbounded recursion) from both the buffered and the streaming
+dispatch. The WASM package keys the same idea on a member name and offers
+`__exav_panic__`, `__exav_oom__` and `__exav_stack__`.
 
-This exists because a crash a caller cannot tell apart from a clean scan is the
-worst outcome exav has, and it is only observable from outside the process. A
-panic must come back as a reported limit rather than a dead process; an abort and
-a stack overflow are the two that no in-process boundary can contain, and the
-tests pin which is which.
+A crash a caller cannot tell from a clean scan is the worst outcome exav has, and
+it is only observable from outside the process. A panic must come back as a
+reported result rather than a dead process; an abort and a stack overflow are the
+two no in-process boundary can contain, and the tests pin which is which.
+`make test-native` runs `panic_containment` in `exav-unpack` and the
+`decoder_crash` suite in `exav` with the feature on; without it those tests skip.
+The browser package runs the same checks in `npm run test:e2e`.
 
-CI runs the containment suites with it — `make test-native` covers
-`panic_containment` in `exav-unpack` and the `decoder_crash` suite in `exav`,
-each built with the feature so the tests have a decoder that can be asked to
-fail. Without it those tests skip themselves and the question goes unasked. The
-browser package has the parallel path in `npm run test:e2e`, which builds with
-the feature before running Playwright.
-
-**It is never in a shipped build.** The container image, the release binaries and
-the published npm package are all built without it, and no default enables it, so
-it is reachable only from a build that names it.
+It is never in a shipped build: the container image, release binaries and npm
+package are built without it, and no default enables it.
 
 ## Smaller builds
 
-Turn off the defaults and pick only what you need:
+Turn off the defaults and pick what you need:
 
 ```sh
-# Pure-Rust scanner with no TLS stack (drop YARA + DLP + HTTP):
+# Pure-Rust scanner with no TLS stack, no YARA, no DLP
 cargo build --release -p exav --no-default-features --features all-formats,decrypt
 
-# A ZIP-only scanner with YARA:
+# A ZIP-only scanner with YARA
 cargo build --release -p exav --no-default-features --features yara,zip
 
-# An updater-only daemon (no SCANURL):
+# An updater-only daemon (no SCANURL)
 cargo build --release -p exav --features http-update
 ```
 
 ## Per-format features
 
-`all-formats` is the umbrella; each extractor is also individually selectable
-(e.g. `--no-default-features --features zip` yields a ZIP-only extractor). This
-matters most for the WASM build, where size counts: a ZIP-only extractor is
-~323 KiB vs ~1.2 MiB for the full build.
-
-Available per-format features:
+`all-formats` is the umbrella; each extractor can also be selected on its own
+(`--no-default-features --features zip` builds a ZIP-only extractor), which
+matters most for the WASM build, where size counts.
 
 ```text
 zip · gzip · tar · bzip2 · xz · zstd · lzip · lzw · lz4 · cab · chm · sevenz
@@ -130,17 +116,14 @@ javaclass · aimodel · screnc · base64scan · pe-emu
 
 `diskimage` covers the virtual disks that need reconstruction (VHDX, QCOW2,
 VMDK); `vhd` is separate because the older format needs no decompressor.
-`pepack` is static unpacking (no execution); `pe-emu` runs the stub, so it is
-its own switch. Every name above is forwardable from `exav-unpack` through
-`exav-core` to `exav`, so each can be named on a `cargo build -p exav` line.
-
-See [Supported formats](/reference/formats/) for what each one covers.
+`pepack` is static unpacking; `pe-emu` runs the stub, so it is its own switch.
+Every name can be forwarded from `exav-unpack` through `exav-core` to `exav`, so
+each can be named on a `cargo build -p exav` line. See
+[Supported formats](/reference/formats/) for what each covers.
 
 ## A lean dependency tree
 
-exav's dependency tree is deliberately lean and pure-Rust. The native
-[YARA engine](/guides/yara/) is a tree-walking evaluator with no WASM runtime or
-JIT behind it — there is **no wasmtime and no Cranelift** anywhere in the build,
-just a set of small leaf crates. Reviewing and driving down the residual
-dependency `unsafe` is an explicit ongoing goal — see the
+The native [YARA engine](/guides/yara/) is a tree-walking evaluator with no WASM
+runtime or JIT behind it, so there is no wasmtime or Cranelift anywhere in the
+build. Reducing the remaining dependency `unsafe` is on the
 [roadmap](/project/roadmap/).

@@ -108,9 +108,34 @@ fn scheme_of(url: &str) -> String {
         .map_or_else(String::new, |(s, _)| s.to_ascii_lowercase())
 }
 
+/// Undo a URL's percent-encoding. A `%` not followed by two hex digits is kept.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = b
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (b[i], hex) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Split `user:pass@` credentials out of a URL's authority. Returns the URL with
 /// the userinfo removed and, when present, a ready-to-send `Basic` Authorization
-/// header value (kept out of the request line; RFC 7617).
+/// header value (kept out of the request line; RFC 7617), built from the
+/// decoded credentials.
 fn split_basic_auth(url: &str) -> (String, Option<String>) {
     let Some(scheme) = url.find("://") else {
         return (url.to_string(), None);
@@ -124,7 +149,10 @@ fn split_basic_auth(url: &str) -> (String, Option<String>) {
     let creds = &authority[..at];
     let host = &authority[at + 1..];
     let clean = format!("{}{host}{}", &url[..after], &url[auth_end..]);
-    (clean, Some(format!("Basic {}", base64(creds.as_bytes()))))
+    (
+        clean,
+        Some(format!("Basic {}", base64(&percent_decode(creds)))),
+    )
 }
 
 /// The change-detection validator advertised by a response: `ETag` if present,
@@ -628,6 +656,21 @@ mod tests {
         let (url, auth) = split_basic_auth("http://bob:s3cr3t@host.tld:8080");
         assert_eq!(url, "http://host.tld:8080");
         assert_eq!(auth.as_deref(), Some("Basic Ym9iOnMzY3IzdA=="));
+
+        // A URL carries reserved characters percent-encoded; the server is
+        // owed the characters themselves.
+        let (url, auth) = split_basic_auth("https://a%40b.c:p%2Fw%3Ad%25@host.tld/db");
+        assert_eq!(url, "https://host.tld/db");
+        assert_eq!(
+            auth.as_deref(),
+            Some(format!("Basic {}", base64(b"a@b.c:p/w:d%")).as_str())
+        );
+        // A `%` not followed by two hex digits is taken as written.
+        let (_, auth) = split_basic_auth("https://u:50%zz@host.tld/db");
+        assert_eq!(
+            auth.as_deref(),
+            Some(format!("Basic {}", base64(b"u:50%zz")).as_str())
+        );
     }
 
     #[test]

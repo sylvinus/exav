@@ -1,44 +1,35 @@
 ---
 title: Dependencies
-description: Full transparency on exav's third-party dependencies — what the default binary links, each crate's purpose, license, and unsafe posture, and exav's memory-safety stance.
+description: exav's third-party dependencies, with what the default binary links, each crate's purpose, license and unsafe posture, and exav's memory-safety stance.
 ---
 
 exav is a security tool, so what it links is part of its threat model. This page
 lists the dependencies of the shipped binary (`exav`, default features): the
-**direct** ones first — what each is for, its license, and its `unsafe`
-posture — then [every transitive crate](#every-transitive-dependency) with the
-direct dependency that pulls it in, so the full supply chain is on one page. The
-dependency *policy* behind these choices is in the repository's
-`docs/DEPENDENCIES.md`.
+direct ones first, with what each is for, its license and its `unsafe` posture,
+then [every transitive crate](#every-transitive-dependency) with the direct
+dependency that pulls it in. The dependency policy behind these choices is in
+the repository's `docs/DEPENDENCIES.md`.
 
 ## Memory-safety posture
 
-- **Safe Rust by default.** exav's own scanning and extraction code is written in
-  safe Rust — `exav-core` and `exav-unpack` are `#![forbid(unsafe_code)]`, so
+- **Safe Rust.** `exav-core` and `exav-unpack` are `#![forbid(unsafe_code)]`, so
   the crates that parse hostile input contain no `unsafe` of their own.
-- **Pure Rust, no C, no JIT.** The default build links **no C libraries** and **no
-  native code generator**. Compression (`flate2` uses the pure-Rust
-  `miniz_oxide` backend, plus pure-Rust bzip2/xz/zstd/lzma crates) and crypto are
-  all pure Rust. There is **no wasmtime, no Cranelift, no OpenSSL, and no `ring`**
-  in the default binary.
-- **A network server with no network crates.** The
-  [ICAP server](/guides/icap/) adds no dependency at all: its request framing,
-  chunked decoding and `Encapsulated` offset parsing are written against `std`,
-  in a module that carries `#![deny(unsafe_code)]` — the parsers a hostile
-  client reaches first are exav's own code, not a transitive one.
-- **Minimal, contained `unsafe`.** exav is *not* zero-`unsafe` overall: a small
-  number of dependencies use `unsafe` internally, almost entirely for **SIMD
-  acceleration** (byte search, hashing) and **OS syscalls** (the daemon). None of
-  it is in exav's own parsing logic, and driving the residual surface down is an
-  explicit [roadmap](/project/roadmap/) goal.
+- **Pure Rust, no C, no JIT.** The default build links no C library and no native
+  code generator. Compression (`flate2` with the pure-Rust `miniz_oxide` backend,
+  and pure-Rust bzip2, xz, zstd and lzma crates) and crypto are pure Rust. There
+  is no wasmtime, Cranelift, OpenSSL or `ring` in the default binary.
+- **A network server with no network crates.** The [ICAP server](/guides/icap/)
+  adds no dependency: its framing, chunked decoding and `Encapsulated` parsing
+  are written against `std`, in a module that is `#![forbid(unsafe_code)]`, so
+  the parsers a hostile client reaches first are exav's own.
+- **Contained `unsafe`.** Some dependencies use `unsafe` internally, almost all
+  for SIMD (byte search, hashing) and OS syscalls (the daemon). None of it is in
+  exav's parsing logic, and reducing it is on the [roadmap](/project/roadmap/).
 - **Feature-gated capability.** Optional features (`http`, individual formats)
-  only pull their dependencies when enabled — see [Feature flags](/reference/feature-flags/).
-  The network stack is **opt-in**: it is the only thing that would link a
-  non-pure-Rust crypto library (see [Opt-in dependencies](#opt-in-dependencies-not-in-the-default-binary)).
-
-The default binary resolves to **151 third-party crates** in total: the 60 direct
-dependencies exav explicitly chose (below) plus
-[91 transitive ones](#every-transitive-dependency).
+  pull their dependencies only when enabled (see
+  [Feature flags](/reference/feature-flags/)). The network stack is opt-in, and
+  it is the only thing that would link a crypto library that is not pure Rust
+  (see [Opt-in dependencies](#opt-in-dependencies-not-in-the-default-binary)).
 
 ## CLI & runtime (`exav`)
 
@@ -51,12 +42,11 @@ dependencies exav explicitly chose (below) plus
 | [`regex`](https://crates.io/crates/regex) | Linear-time regex (CLI filters) | MIT OR Apache-2.0 | safe (SIMD via `memchr`/`aho-corasick`) |
 | [`libc`](https://crates.io/crates/libc) | Syscall bindings for the prefork daemon (signals, resource limits) | MIT OR Apache-2.0 | `unsafe` FFI declarations |
 
-Spilling an oversized stream to a temp file is **not** a dependency: it is
+Spilling an oversized stream to a temp file is not a dependency: it is
 `exav/src/tmpfile.rs`, a page of `std::fs` with the properties that matter
-(`O_CREAT|O_EXCL`, so a pre-planted symlink cannot be followed; `0600`; delete on
-drop). The ready-made crates for it reach the filesystem through `rustix` and
-`linux-raw-sys`, which would add more `unsafe` than the rest of the tree
-combined — for a feature that never touches a scanned byte.
+(`O_CREAT|O_EXCL`, so a planted symlink cannot be followed; mode `0600`; delete
+on drop). The ready-made crates reach the filesystem through `rustix` and
+`linux-raw-sys`, which would add more `unsafe` than the rest of the tree.
 
 ## Core engine (`exav-core`)
 
@@ -91,7 +81,7 @@ compression library in the tree.
 | Crate | Purpose | License | `unsafe` posture |
 |---|---|---|---|
 | [`flate2`](https://crates.io/crates/flate2) | DEFLATE / gzip / zlib (pure-Rust `miniz_oxide` backend) | MIT OR Apache-2.0 | safe (no C zlib) |
-| [`deflate64`](https://crates.io/crates/deflate64) | Deflate64 (ZIP method 9) | MIT | **none** — `forbid` |
+| [`deflate64`](https://crates.io/crates/deflate64) | Deflate64 (ZIP method 9) | MIT | **none** (`forbid`) |
 | [`bzip2-rs`](https://crates.io/crates/bzip2-rs) | bzip2 (pure Rust) | MIT OR Apache-2.0 | safe |
 | [`xz4rust`](https://crates.io/crates/xz4rust) | XZ / LZMA (pure Rust) | MIT | safe |
 | [`lzma-rust2`](https://crates.io/crates/lzma-rust2) | LZMA / LZMA2 (7z) | Apache-2.0 | safe |
@@ -100,15 +90,15 @@ compression library in the tree.
 | [`lzfse_rust`](https://crates.io/crates/lzfse_rust) | LZFSE / LZVN (DMG) | MIT OR Apache-2.0 | safe |
 | [`delharc`](https://crates.io/crates/delharc) | LHA / LZH | MIT OR Apache-2.0 | safe |
 | [`bitstream-io`](https://crates.io/crates/bitstream-io) | Bit-level readers for decoders | MIT OR Apache-2.0 | safe |
-| [`tar`](https://crates.io/crates/tar) | tar archives (`xattr` disabled — drops syscall `unsafe`) | MIT OR Apache-2.0 | safe |
+| [`tar`](https://crates.io/crates/tar) | tar archives (`xattr` disabled, which drops its syscall `unsafe`) | MIT OR Apache-2.0 | safe |
 | [`zip`](https://crates.io/crates/zip) | ZIP container parsing | MIT | safe |
 | [`cfb`](https://crates.io/crates/cfb) | OLE2 / Compound File Binary (Office) | MIT | safe |
 | [`quick-xml`](https://crates.io/crates/quick-xml) | OOXML / XML parsing | MIT | safe |
 | [`mail-parser`](https://crates.io/crates/mail-parser) | MIME / email parsing | Apache-2.0 OR MIT | safe |
 | [`apfs`](https://crates.io/crates/apfs) / [`hfsplus`](https://crates.io/crates/hfsplus) | DMG filesystem parsing | MIT | safe |
-| [`ext4-view`](https://crates.io/crates/ext4-view) | ext2/3/4 filesystem walking (virtual disks) | MIT OR Apache-2.0 | **none** — `forbid` |
+| [`ext4-view`](https://crates.io/crates/ext4-view) | ext2/3/4 filesystem walking (virtual disks) | MIT OR Apache-2.0 | **none** (`forbid`) |
 | [`fatfs`](https://crates.io/crates/fatfs) | FAT12/16/32 cluster-chain walking | MIT | 13 |
-| [`lznt1`](https://crates.io/crates/lznt1) | LZNT1 (NTFS compressed streams) | MIT | **none** — `forbid` |
+| [`lznt1`](https://crates.io/crates/lznt1) | LZNT1 (NTFS compressed streams) | MIT | **none** (`forbid`) |
 | [`salzweg`](https://crates.io/crates/salzweg) | LZW (ZOO, Unix `compress`) | MIT | **none** |
 | [`unshield`](https://crates.io/crates/unshield) | InstallShield `.z` archives | MIT | **none** |
 | [`byteorder`](https://crates.io/crates/byteorder) / [`bincode`](https://crates.io/crates/bincode) | Byte-order + binary (de)serialization | Unlicense OR MIT / MIT | safe |
@@ -135,45 +125,35 @@ handled by the separate `exav-update` crate:
 |---|---|---|---|
 | [`ureq`](https://crates.io/crates/ureq) | Minimal blocking HTTP(S) client | MIT OR Apache-2.0 | pulls `rustls` → [`ring`](https://crates.io/crates/ring) |
 
-`ring` bundles C/assembly crypto — it is the one non-pure-Rust component exav can
-pull, which is **exactly why HTTP is off by default**. Builds that don't need
-network fetch never link it.
+`ring` bundles C and assembly crypto; it is the one component exav can pull that
+is not pure Rust, which is why HTTP is off by default.
 
 ## Every transitive dependency
 
-The tables above are the crates exav *chose*. Those crates pull in their own
-dependencies, and a security tool's real supply chain is the whole closure — so
-here it is: every remaining crate in the default `exav` build, with the
-direct dependency (or dependencies) that pulls it in.
-
-The default `exav` build resolves to **159 packages**, five of which are
-exav's own workspace crates (`exav`, `exav-core`, `exav-unpack`,
-`exav-pe-emu`, `exav-x86`). `bitflags`, `hashbrown` and `rustc-hash` each resolve
-at two major versions, so the count of distinct *projects* is lower still. Check
-it against the current lockfile with:
+The tables above are the crates exav chose. The real supply chain is the whole
+closure, so here is every remaining crate in the default `exav` build, with the
+direct dependencies that pull it in. Count the packages against the current
+lockfile with:
 
 ```sh
 cargo tree -e no-dev -p exav --prefix none | sed 's/ (\*)$//' \
   | awk '{print $1}' | sort -u | wc -l
 ```
 
-Nothing here is a C library, a TLS stack, or a code generator. `syn`, `quote` and
-`proc-macro2` are build-time proc-macro machinery and contribute no runtime code
-to the binary.
+Five of those are exav's own workspace crates (`exav`, `exav-core`,
+`exav-unpack`, `exav-pe-emu`, `exav-x86`), and a few crates resolve at two
+versions. None is a C library, a TLS stack or a code generator; `syn`, `quote`
+and `proc-macro2` are build-time proc-macro machinery with no runtime code in the
+binary.
 
-**35 of the 94 packages contain no `unsafe` at all**, 17 of those enforcing it with a
-crate-root `#![forbid(unsafe_code)]`. The `unsafe` uses column counts occurrences
-of the `unsafe` keyword in each crate's shipped `src/` (comments stripped; tests,
-benches and examples excluded) at the exact version this build resolves. Read it
-as *surface area to review*, not as risk: a count is not a defect, and the
-concentration is unsurprising — `rustfft` (SIMD butterflies, reached only through
-the perceptual image hash), `hashbrown` and `bytemuck` are 2,496 of the 3,490
-occurrences in this table, and none of them sits on a path that parses scanned
-bytes. There are no raw-syscall binding crates here at all — the two that would
-otherwise dominate the count, `rustix` and `linux-raw-sys`, are kept out by
-[writing the daemon's spill file in-tree](#cli--runtime-exav) and by building
-`tar` without `xattr`. Reproduce the count with `cargo geiger`, or per crate
-with:
+The `unsafe` column counts occurrences of the `unsafe` keyword in each crate's
+shipped `src/` (comments stripped; tests, benches and examples excluded) at the
+version resolved when the table was written. Read it as surface to review, not as
+risk. Most of it is in `rustfft` (SIMD, reached only through the perceptual image
+hash), `hashbrown` and `bytemuck`, none of which parses scanned bytes. There are
+no raw-syscall binding crates: `rustix` and `linux-raw-sys` are kept out by
+[writing the spill file in-tree](#cli--runtime-exav) and by building `tar`
+without `xattr`. Reproduce the counts with `cargo geiger`, or per crate with:
 
 ```sh
 grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
@@ -181,7 +161,7 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 
 | Crate | License | `unsafe` uses | Pulled in by |
 |---|---|---|---|
-| [`adler2`](https://crates.io/crates/adler2) | 0BSD OR MIT OR Apache-2.0 | **none** — `forbid` | `flate2`, `image`, `zip` |
+| [`adler2`](https://crates.io/crates/adler2) | 0BSD OR MIT OR Apache-2.0 | **none** (`forbid`) | `flate2`, `image`, `zip` |
 | [`anstream`](https://crates.io/crates/anstream) | MIT OR Apache-2.0 | 3 | `clap` |
 | [`anstyle`](https://crates.io/crates/anstyle) | MIT OR Apache-2.0 | 1 | `clap` |
 | [`anstyle-parse`](https://crates.io/crates/anstyle-parse) | MIT OR Apache-2.0 | 3 | `clap` |
@@ -198,27 +178,27 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`cfg-if`](https://crates.io/crates/cfg-if) | MIT OR Apache-2.0 | **none** | `aes`, `bzip2-rs`, `crc32fast`, `flate2`, `image`, `md-5`, `sha1`, `sha2`, `tar`, `zip` |
 | [`chrono`](https://crates.io/crates/chrono) | MIT OR Apache-2.0 | 11 | `delharc` |
 | [`cipher`](https://crates.io/crates/cipher) | MIT OR Apache-2.0 | 2 | `aes`, `cbc`, `des` |
-| [`clap_builder`](https://crates.io/crates/clap_builder) | MIT OR Apache-2.0 | **none** — `forbid` | `clap` |
-| [`clap_derive`](https://crates.io/crates/clap_derive) | MIT OR Apache-2.0 | **none** — `forbid` | `clap` |
+| [`clap_builder`](https://crates.io/crates/clap_builder) | MIT OR Apache-2.0 | **none** (`forbid`) | `clap` |
+| [`clap_derive`](https://crates.io/crates/clap_derive) | MIT OR Apache-2.0 | **none** (`forbid`) | `clap` |
 | [`clap_lex`](https://crates.io/crates/clap_lex) | MIT OR Apache-2.0 | 6 | `clap` |
 | [`color_quant`](https://crates.io/crates/color_quant) | MIT | **none** | `image` |
 | [`colorchoice`](https://crates.io/crates/colorchoice) | MIT OR Apache-2.0 | **none** | `clap` |
 | [`countme`](https://crates.io/crates/countme) | MIT OR Apache-2.0 | 1 | `yara-x-parser` |
 | [`cpufeatures`](https://crates.io/crates/cpufeatures) | MIT OR Apache-2.0 | 9 | `aes`, `sha1`, `sha2` |
-| [`crc`](https://crates.io/crates/crc) | MIT OR Apache-2.0 | **none** — `forbid` | `ext4-view` |
-| [`crc-catalog`](https://crates.io/crates/crc-catalog) | MIT OR Apache-2.0 | **none** — `forbid` | `crc` |
-| [`crypto-common`](https://crates.io/crates/crypto-common) | MIT OR Apache-2.0 | **none** — `forbid` | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
+| [`crc`](https://crates.io/crates/crc) | MIT OR Apache-2.0 | **none** (`forbid`) | `ext4-view` |
+| [`crc-catalog`](https://crates.io/crates/crc-catalog) | MIT OR Apache-2.0 | **none** (`forbid`) | `crc` |
+| [`crypto-common`](https://crates.io/crates/crypto-common) | MIT OR Apache-2.0 | **none** (`forbid`) | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`either`](https://crates.io/crates/either) | MIT OR Apache-2.0 | 2 | `yara-x-parser` |
 | [`equivalent`](https://crates.io/crates/equivalent) | Apache-2.0 OR MIT | **none** | `mail-parser`, `yara-x-parser`, `zip` |
 | [`explode`](https://crates.io/crates/explode) | MIT | 6 | `unshield` |
-| [`fdeflate`](https://crates.io/crates/fdeflate) | MIT OR Apache-2.0 | **none** — `forbid` | `image` |
+| [`fdeflate`](https://crates.io/crates/fdeflate) | MIT OR Apache-2.0 | **none** (`forbid`) | `image` |
 | [`filetime`](https://crates.io/crates/filetime) | MIT/Apache-2.0 | 9 | `tar` |
 | [`fnv`](https://crates.io/crates/fnv) | Apache-2.0 / MIT | **none** | `cfb`, `yara-x-parser` |
 | [`generic-array`](https://crates.io/crates/generic-array) | MIT | 78 | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
-| [`gif`](https://crates.io/crates/gif) | MIT OR Apache-2.0 | **none** — `forbid` | `image` |
+| [`gif`](https://crates.io/crates/gif) | MIT OR Apache-2.0 | **none** (`forbid`) | `image` |
 | [`hashbrown`](https://crates.io/crates/hashbrown) | MIT OR Apache-2.0 | 759 (two versions resolve: 454 + 305) | `mail-parser`, `yara-x-parser`, `zip` |
 | [`hashify`](https://crates.io/crates/hashify) | Apache-2.0 OR MIT | **none** | `mail-parser` |
-| [`heck`](https://crates.io/crates/heck) | MIT OR Apache-2.0 | **none** — `forbid` | `clap` |
+| [`heck`](https://crates.io/crates/heck) | MIT OR Apache-2.0 | **none** (`forbid`) | `clap` |
 | [`iana-time-zone`](https://crates.io/crates/iana-time-zone) | MIT OR Apache-2.0 | 212 | `delharc` |
 | [`indexmap`](https://crates.io/crates/indexmap) | Apache-2.0 OR MIT | 11 | `mail-parser`, `yara-x-parser`, `zip` |
 | [`inout`](https://crates.io/crates/inout) | MIT OR Apache-2.0 | 22 | `aes`, `cbc`, `des` |
@@ -231,13 +211,13 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`logos`](https://crates.io/crates/logos) | MIT OR Apache-2.0 | 18 | `yara-x-parser` |
 | [`logos-codegen`](https://crates.io/crates/logos-codegen) | MIT OR Apache-2.0 | 4 | `yara-x-parser` |
 | [`logos-derive`](https://crates.io/crates/logos-derive) | MIT OR Apache-2.0 | **none** | `yara-x-parser` |
-| [`miniz_oxide`](https://crates.io/crates/miniz_oxide) | MIT OR Zlib OR Apache-2.0 | **none** — `forbid` | `flate2`, `image`, `zip` |
+| [`miniz_oxide`](https://crates.io/crates/miniz_oxide) | MIT OR Zlib OR Apache-2.0 | **none** (`forbid`) | `flate2`, `image`, `zip` |
 | [`no_std_io2`](https://crates.io/crates/no_std_io2) | Apache-2.0 OR MIT | 11 | `bitstream-io` |
 | [`num-complex`](https://crates.io/crates/num-complex) | MIT OR Apache-2.0 | 2 | `rustdct` |
 | [`num-integer`](https://crates.io/crates/num-integer) | MIT OR Apache-2.0 | **none** | `rustdct`, `transpose` |
 | [`num-traits`](https://crates.io/crates/num-traits) | MIT OR Apache-2.0 | 1 | `delharc`, `image`, `rmp-serde`, `rustdct`, `transpose`, `yara-x-parser` |
 | [`plain`](https://crates.io/crates/plain) | MIT/Apache-2.0 | 23 | `goblin` |
-| [`png`](https://crates.io/crates/png) | MIT OR Apache-2.0 | **none** — `forbid` | `image` |
+| [`png`](https://crates.io/crates/png) | MIT OR Apache-2.0 | **none** (`forbid`) | `image` |
 | [`primal-check`](https://crates.io/crates/primal-check) | MIT OR Apache-2.0 | **none** | `rustdct` |
 | [`proc-macro2`](https://crates.io/crates/proc-macro2) | MIT OR Apache-2.0 | 6 | `apfs`, `bincode`, `clap`, `goblin`, `hfsplus`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`quote`](https://crates.io/crates/quote) | MIT OR Apache-2.0 | **none** | `apfs`, `bincode`, `clap`, `goblin`, `hfsplus`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
@@ -252,17 +232,17 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`serde_derive`](https://crates.io/crates/serde_derive) | MIT OR Apache-2.0 | **none** | `bincode`, `rmp-serde`, `serde` |
 | [`simd-adler32`](https://crates.io/crates/simd-adler32) | MIT | 36 | `flate2`, `image`, `zip` |
 | [`strength_reduce`](https://crates.io/crates/strength_reduce) | MIT OR Apache-2.0 | **none** | `rustdct`, `transpose` |
-| [`strsim`](https://crates.io/crates/strsim) | MIT | **none** — `forbid` | `clap` |
+| [`strsim`](https://crates.io/crates/strsim) | MIT | **none** (`forbid`) | `clap` |
 | [`subtle`](https://crates.io/crates/subtle) | BSD-3-Clause | 2 | `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`syn`](https://crates.io/crates/syn) | MIT OR Apache-2.0 | 71 | `apfs`, `bincode`, `clap`, `goblin`, `hfsplus`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
-| [`text-size`](https://crates.io/crates/text-size) | MIT OR Apache-2.0 | **none** — `forbid` | `yara-x-parser` |
+| [`text-size`](https://crates.io/crates/text-size) | MIT OR Apache-2.0 | **none** (`forbid`) | `yara-x-parser` |
 | [`thiserror-impl`](https://crates.io/crates/thiserror-impl) | MIT OR Apache-2.0 | 1 | `apfs`, `hfsplus`, `thiserror` |
 | [`tiff`](https://crates.io/crates/tiff) | MIT | 2 | `image` |
-| [`tinyvec`](https://crates.io/crates/tinyvec) | Zlib OR Apache-2.0 OR MIT | **none** — `forbid` | `bzip2-rs`, `stringprep` |
-| [`tinyvec_macros`](https://crates.io/crates/tinyvec_macros) | MIT OR Apache-2.0 OR Zlib | **none** — `forbid` | `bzip2-rs`, `stringprep` |
+| [`tinyvec`](https://crates.io/crates/tinyvec) | Zlib OR Apache-2.0 OR MIT | **none** (`forbid`) | `bzip2-rs`, `stringprep` |
+| [`tinyvec_macros`](https://crates.io/crates/tinyvec_macros) | MIT OR Apache-2.0 OR Zlib | **none** (`forbid`) | `bzip2-rs`, `stringprep` |
 | [`twox-hash`](https://crates.io/crates/twox-hash) | MIT | 72 | `ruzstd` |
 | [`typed-path`](https://crates.io/crates/typed-path) | MIT OR Apache-2.0 | 32 | `zip` |
-| [`typenum`](https://crates.io/crates/typenum) | MIT OR Apache-2.0 | **none** — `forbid` | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
+| [`typenum`](https://crates.io/crates/typenum) | MIT OR Apache-2.0 | **none** (`forbid`) | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`unicode-bidi`](https://crates.io/crates/unicode-bidi) | MIT OR Apache-2.0 | 1 | `stringprep` |
 | [`unicode-ident`](https://crates.io/crates/unicode-ident) | (MIT OR Apache-2.0) AND Unicode-3.0 | 2 | `apfs`, `bincode`, `clap`, `goblin`, `hfsplus`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`unicode-normalization`](https://crates.io/crates/unicode-normalization) | MIT OR Apache-2.0 | 5 | `stringprep` |
@@ -270,13 +250,12 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`utf8parse`](https://crates.io/crates/utf8parse) | Apache-2.0 OR MIT | 1 | `clap` |
 | [`uuid`](https://crates.io/crates/uuid) | Apache-2.0 OR MIT | 9 | `cfb` |
 | [`web-time`](https://crates.io/crates/web-time) | MIT OR Apache-2.0 | **none** | `cfb` |
-| [`weezl`](https://crates.io/crates/weezl) | MIT OR Apache-2.0 | **none** — `forbid` | `image` |
+| [`weezl`](https://crates.io/crates/weezl) | MIT OR Apache-2.0 | **none** (`forbid`) | `image` |
 | [`zmij`](https://crates.io/crates/zmij) | MIT | 74 | `serde_json` |
 
 ## Verifying this yourself
 
-Nothing here has to be taken on trust — regenerate the tables above and check
-them:
+Regenerate the tables above and check them:
 
 ```sh
 # Direct + transitive dependencies of the default binary, with licenses.

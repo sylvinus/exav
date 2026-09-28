@@ -662,8 +662,9 @@ struct Cli {
     )]
     max_jobs_per_worker: Option<u64>,
 
-    /// Largest top-level input exav will scan. A larger file is reported
-    /// LIMITS-EXCEEDED (never a silent OK, unlike ClamAV). K/M/G/T suffixes;
+    /// Largest top-level input exav will scan. A larger one has its first bytes
+    /// scanned and is reported LIMITS-EXCEEDED unless they hold a detection
+    /// (never a silent OK, unlike ClamAV). K/M/G/T suffixes;
     /// `0` means no limit. exav default: no limit. `--clamav-compat` sets 100M.
     #[arg(
         long = "max-input-bytes",
@@ -721,14 +722,15 @@ struct Cli {
     max_spill_bytes: Option<u64>,
 
     /// The most temp space every in-flight object may occupy **together**,
-    /// across the whole process. K/M/G/T suffixes; `0` means no limit.
+    /// within one process. K/M/G/T suffixes; `0` means no limit.
     /// [default: 8G]
     ///
     /// The one a per-object cap cannot stand in for: a hundred connections at
     /// 2G each is a 200G worst case, and filling the temp filesystem is a denial
     /// of service against the host that outlives the connection causing it.
     /// Size it against the free space on --spill-dir, not against the object
-    /// size you expect.
+    /// size you expect. Under the worker pool each worker and the ICAP child
+    /// counts separately, so the pool as a whole may use this much per process.
     #[arg(
         long = "max-total-spill-bytes",
         value_name = "SIZE|off",
@@ -754,8 +756,13 @@ struct Cli {
     /// member/sub-container, an LZ window, a decrypted blob) may use. Every
     /// forced-materialization site obeys it. Not a cap on total
     /// memory: several buffers are live at once across nesting levels, and
-    /// `--max-extracted-bytes` is what bounds their sum. K/M/G/T suffixes. exav
-    /// default: 256M.
+    /// `--max-extracted-bytes` is what bounds their sum. K/M/G/T suffixes;
+    /// `off` or `0` means no limit. exav default: 256M.
+    ///
+    /// It is also the largest file the full signature engine can scan, and it
+    /// wins over `--max-extracted-bytes` when both are given. A larger file is
+    /// matched against literal signatures and whole-file hashes only, and
+    /// reported LIMITS-EXCEEDED unless one of those matches.
     #[arg(
         long = "max-object-bytes",
         env = "EXAV_MAX_OBJECT_BYTES",
@@ -769,8 +776,8 @@ struct Cli {
     /// **CPU/time** bound, NOT a memory bound — streamed members are scanned
     /// without being held in RAM (that is capped by --max-object-bytes), so this
     /// can be set far higher to fully scan multi-gigabyte members, paying only in
-    /// scan time. Guards re-scanning/decompression-time bombs. K/M/G/T suffixes.
-    /// exav default: 10G.
+    /// scan time. Guards re-scanning/decompression-time bombs. K/M/G/T suffixes;
+    /// `off` or `0` means no limit. exav default: 10G.
     #[arg(
         long = "max-matcher-bytes",
         env = "EXAV_MAX_MATCHER_BYTES",
@@ -778,6 +785,18 @@ struct Cli {
         value_parser = parse_size
     )]
     max_scanned_bytes: Option<u64>,
+
+    /// Most x86 instructions the PE unpacking emulator may run across one
+    /// top-level file, summed over every packed executable it contains. A scan
+    /// that runs out is LIMITS-EXCEEDED. `off` or `0` means no limit. exav
+    /// default: 1000000000 (seconds to tens of seconds of CPU).
+    #[arg(
+        long = "max-pe-emulation-steps",
+        env = "EXAV_MAX_PE_EMULATION_STEPS",
+        value_name = "N|off",
+        value_parser = parse_count
+    )]
+    max_pe_emulation_steps: Option<u64>,
 
     /// Maximum nesting depth for recursive unpacking — a zip inside a tar
     /// inside a disk image. exav default: 16. `--clamav-compat` sets 17.
@@ -1829,7 +1848,7 @@ fn main() -> ExitCode {
     }
     for path in &cli.paths {
         match path.to_str() {
-            Some("-") => scan_stdin(&db, &cli, &mut totals),
+            Some("-") => scan_stdin(&db, &opts, &cli, &mut totals),
             #[cfg(feature = "http-scan")]
             Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
                 if cli.allow_http_scan {
@@ -2174,7 +2193,8 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     // per-object cap and the core-side structural buffer (deep_analysis_max)
     // together, so one knob governs the largest single allocation on every
     // materialization path.
-    if let Some(b) = cli.max_buffer_bytes {
+    let no_limit_at_zero = |n: u64| if n == 0 { u64::MAX } else { n };
+    if let Some(b) = cli.max_buffer_bytes.map(no_limit_at_zero) {
         opts.limits.max_buffer_bytes = b;
         opts.deep_analysis_max = b;
     }
@@ -2182,8 +2202,11 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     // from memory — a streamed member is bounded by this, not by the buffer cap,
     // so raising it scans larger members (in RAM bounded by
     // --max-object-bytes) at the cost of scan time only.
-    if let Some(s) = cli.max_scanned_bytes {
+    if let Some(s) = cli.max_scanned_bytes.map(no_limit_at_zero) {
         opts.limits.max_scanned_bytes = s;
+    }
+    if let Some(n) = cli.max_pe_emulation_steps.map(no_limit_at_zero) {
+        opts.limits.max_pe_emulation_steps = n;
     }
     // --max-unpack-depth: nesting depth. exav default 16; compat 17.
     if let Some(r) = cli.max_recursion.or_else(|| compat.then_some(17)) {
@@ -2620,8 +2643,8 @@ fn guard_not_empty(db: Scanner, source: &str, allow_no_db: bool) -> Result<Scann
 }
 
 fn load_db(cli: &Cli) -> Result<Scanner, String> {
-    // `--clamav-compat` selects exact ClamAV naming: the `.UNOFFICIAL` suffix and
-    // `YARA.` prefix on signatures from an unofficial database. Provenance is
+    // `--clamav-compat` selects exact ClamAV naming: the `.UNOFFICIAL` suffix on
+    // signatures from an unofficial database. Provenance is
     // recorded per signature at load, always; the suffix itself is applied at
     // report time from `ScanOptions::unofficial_suffix`, so one loaded database
     // serves both compat and non-compat scans.
@@ -2749,12 +2772,105 @@ fn scan_volume_sets(
     }
 }
 
+/// Where one object's bytes are. A regular file is scanned in place; stdin
+/// and a FIFO given as a path cannot seek, so they are held first (in RAM,
+/// then a spill file), as the daemon holds a stream. Either way the object
+/// gets the one scan.
+enum Input<'a> {
+    File(&'a Path),
+    /// What was held, and the stream's size.
+    Held(daemon::Held, u64),
+}
+
+impl<'a> Input<'a> {
+    fn open(path: &'a Path, opts: &ScanOptions) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if std::fs::metadata(path)?.file_type().is_fifo() {
+                return Self::hold(std::fs::File::open(path)?, opts);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = opts;
+        Ok(Self::File(path))
+    }
+
+    /// Hold a stream up to one byte past `--max-input-bytes`, which is all the
+    /// scan looks at. What is left is read only to learn the stream's size,
+    /// up to the daemon's drain cap, so a stream that never ends cannot hold
+    /// the scan.
+    fn hold(mut r: impl io::Read, opts: &ScanOptions) -> io::Result<Self> {
+        let limit = opts.max_scan_size.map_or(u64::MAX, |m| m.saturating_add(1));
+        let held = daemon::buffer_to_seekable(&mut io::Read::take(&mut r, limit))?;
+        let mut size = held.payload.len();
+        if held.short.is_some() || size >= limit {
+            size += io::copy(
+                &mut io::Read::take(&mut r, daemon::MAX_DRAIN_BYTES),
+                &mut io::sink(),
+            )?;
+        }
+        Ok(Self::Held(held, size))
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Self::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            Self::Held(_, n) => *n,
+        }
+    }
+
+    fn scan(&self, db: &Scanner, opts: &ScanOptions) -> io::Result<exav_core::ScanReport> {
+        match self {
+            Self::File(p) => scan_path(db, p, opts),
+            Self::Held(held, n) => daemon::scan_held(db, opts, held, *n).map(|(r, _)| r),
+        }
+    }
+
+    /// The object's bytes, or `None` when it is larger than `cap` or was not
+    /// held whole.
+    fn bytes_capped(&self, cap: u64) -> io::Result<Option<Vec<u8>>> {
+        match self {
+            Self::File(p) => {
+                let mut data = Vec::new();
+                io::Read::read_to_end(
+                    &mut io::Read::take(std::fs::File::open(p)?, cap.saturating_add(1)),
+                    &mut data,
+                )?;
+                Ok((data.len() as u64 <= cap).then_some(data))
+            }
+            Self::Held(held, n) if held.short.is_none() && *n <= cap => {
+                held.payload.bytes_capped(cap)
+            }
+            Self::Held(..) => Ok(None),
+        }
+    }
+}
+
 fn scan_one(path: &Path, db: &Scanner, opts: &ScanOptions, cli: &Cli, totals: &mut Totals) {
+    match Input::open(path, opts) {
+        Ok(input) => scan_input(path, &input, db, opts, cli, totals),
+        Err(e) => {
+            totals.scanned += 1;
+            report_error(&path.display().to_string(), &e.to_string(), cli, totals);
+        }
+    }
+}
+
+/// Scan one object, named `path` in the output.
+fn scan_input(
+    path: &Path,
+    input: &Input,
+    db: &Scanner,
+    opts: &ScanOptions,
+    cli: &Cli,
+    totals: &mut Totals,
+) {
     if cli.allmatch {
-        return scan_one_allmatch(path, db, opts, cli, totals);
+        return scan_one_allmatch(path, input, db, opts, cli, totals);
     }
     totals.scanned += 1;
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let size = input.size();
     totals.data_scanned += size;
     // Isolate each file: a parser panic on a crafted input must not abort
     // the whole run, and must count as an error — never a clean result.
@@ -2763,7 +2879,7 @@ fn scan_one(path: &Path, db: &Scanner, opts: &ScanOptions, cli: &Cli, totals: &m
         exav_core::profile::enable();
     }
     let mut scanned =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_path(db, path, opts)));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input.scan(db, opts)));
     if cli.profile {
         let prof = exav_core::profile::take();
         // `--profile` returns before `report_result`, so the partial policy has
@@ -2865,49 +2981,16 @@ fn report_error(name: &str, message: &str, cli: &Cli, totals: &mut Totals) {
     }
 }
 
-fn scan_stdin(db: &Scanner, cli: &Cli, totals: &mut Totals) {
-    use std::io::Read;
-    totals.scanned += 1;
-    let opts = build_scan_options(cli);
-    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || -> io::Result<exav_core::ScanReport> {
-            // Buffer stdin to a SEEKABLE source (RAM small / temp file large) and
-            // run the full container-aware scan — so `cat archive.zip | exav -`
-            // detects malware INSIDE the archive, like clamscan. The old
-            // `scan_stream` was flat and missed it (and ignored `opts`).
-            let max = opts.max_scan_size;
-            let limit = max.map(|m| m.saturating_add(1)).unwrap_or(u64::MAX);
-            let stdin = io::stdin();
-            let mut capped = stdin.lock().take(limit);
-            let payload = match daemon::buffer_to_seekable(&mut capped) {
-                Ok(p) => p,
-                // Nowhere to put it is not "nothing found in it".
-                Err(spill::SpillError::Budget(reason)) => {
-                    return Ok(exav_core::ScanReport::new(
-                        exav_core::Verdict::Unscannable { reason },
-                        Vec::new(),
-                    ))
-                }
-                Err(spill::SpillError::Io(e)) => return Err(e),
-            };
-            if let Some(m) = max {
-                if payload.len() > m {
-                    return Ok(exav_core::ScanReport::new(
-                        exav_core::Verdict::LimitsExceeded {
-                            reason: format!("stdin exceeds max-input-bytes {m}"),
-                        },
-                        Vec::new(),
-                    ));
-                }
-            }
-            let (report, _loc) = daemon::scan_payload(db, &opts, &payload)?;
-            Ok(report)
-        },
-    ));
-    match scanned {
-        Ok(Ok(report)) => report_result("stdin", report, cli, totals),
-        Ok(Err(e)) => report_error("stdin", &e.to_string(), cli, totals),
-        Err(_) => report_error("stdin", "internal error while scanning", cli, totals),
+/// Scan stdin: held like any stream, then the same per-object path as a file,
+/// so `--all-matches`, `--profile` and the totals apply to it too.
+fn scan_stdin(db: &Scanner, opts: &ScanOptions, cli: &Cli, totals: &mut Totals) {
+    let name = Path::new("stdin");
+    match Input::hold(io::stdin().lock(), opts) {
+        Ok(input) => scan_input(name, &input, db, opts, cli, totals),
+        Err(e) => {
+            totals.scanned += 1;
+            report_error("stdin", &e.to_string(), cli, totals);
+        }
     }
 }
 
@@ -3874,22 +3957,22 @@ impl ReadWrite for std::net::TcpStream {
     }
 }
 
-/// `--all-matches` scan of one file: report every matching signature. Works on a
-/// buffered copy (bounded by deep-analysis-max); a larger file falls back to a
-/// normal single-match scan so it is never silently skipped.
+/// `--all-matches` scan of one object: report every matching signature. Works
+/// on a buffered copy (bounded by deep-analysis-max); a larger object falls
+/// back to a normal single-match scan so it is never silently skipped.
 fn scan_one_allmatch(
     path: &Path,
+    input: &Input,
     db: &Scanner,
     opts: &ScanOptions,
     cli: &Cli,
     totals: &mut Totals,
 ) {
-    use std::io::Read;
     totals.scanned += 1;
     // Counted here as well as on the single-match path: a summary reporting
     // "Data scanned: 0.00 MB" for a multi-megabyte archive reads exactly like a
     // scan that skipped its contents, and is expensive to tell apart from one.
-    totals.data_scanned += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    totals.data_scanned += input.size();
     let name = path.display().to_string();
     // Two ceilings, one fallback. `deep_analysis_max` is how much this path can
     // buffer; `max_scan_size` is how much the operator said may be scanned at
@@ -3902,22 +3985,19 @@ fn scan_one_allmatch(
     let cap = opts.max_scan_size.map_or(opts.deep_analysis_max, |max| {
         opts.deep_analysis_max.min(max)
     });
-    let mut data = Vec::new();
-    let read = std::fs::File::open(path).and_then(|f| {
-        f.take(cap.saturating_add(1))
-            .read_to_end(&mut data)
-            .map(|_| ())
-    });
-    if let Err(e) = read {
-        report_error(&name, &e.to_string(), cli, totals);
-        return;
-    }
-    if data.len() as u64 > cap {
+    let data = match input.bytes_capped(cap) {
+        Ok(d) => d,
+        Err(e) => {
+            report_error(&name, &e.to_string(), cli, totals);
+            return;
+        }
+    };
+    let Some(data) = data else {
         // Too big for all-match; fall back to a single-match scan, which scans
         // the budgeted prefix before reporting the limit, so a detection in the
         // part that did fit still wins.
         let scanned =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_path(db, path, opts)));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input.scan(db, opts)));
         match scanned {
             Ok(Ok(report)) => report_result(&name, report, cli, totals),
             // An I/O failure has a cause worth printing; only a panic is truly
@@ -3927,7 +4007,7 @@ fn scan_one_allmatch(
             Err(_) => report_error(&name, "internal error while scanning", cli, totals),
         }
         return;
-    }
+    };
     let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         exav_core::analyze_all_with_outcome(db, &data, opts)
     }));
@@ -4301,6 +4381,15 @@ fn parse_limit_secs(s: &str) -> Result<u64, String> {
     }
     s.parse::<u64>()
         .map_err(|_| format!("expected a number of seconds or `off`, got `{s}`"))
+}
+
+/// A count, or `off`, which reads as `0`.
+fn parse_count(s: &str) -> Result<u64, String> {
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(0);
+    }
+    s.parse::<u64>()
+        .map_err(|_| format!("expected a number or `off`, got `{s}`"))
 }
 
 /// [`parse_limit_secs`] for a flag whose field is a `u32`.
@@ -4785,12 +4874,41 @@ mod tests {
         assert_eq!(opts.limits.max_recursion, 16);
         assert_eq!(opts.limits.max_members, 100_000);
 
+        assert_eq!(opts.limits.max_pe_emulation_steps, 1_000_000_000);
+
         // The --clamav-compat preset supplies ClamAV's documented defaults.
         let opts = build_scan_options(&Cli::parse_from(["exav", "--clamav-compat"]));
         assert_eq!(opts.max_scan_size, Some(100 * 1024 * 1024));
         assert_eq!(opts.limits.max_extracted_bytes, 400 * 1024 * 1024);
         assert_eq!(opts.limits.max_recursion, 17);
         assert_eq!(opts.limits.max_members, 10_000);
+    }
+
+    /// `off` (and `0`) on a limit is "no limit", never a limit of zero.
+    #[test]
+    fn off_lifts_a_limit() {
+        let _env = env_guard();
+        let opts = build_scan_options(&Cli::parse_from(["exav", "--max-pe-emulation-steps", "7"]));
+        assert_eq!(opts.limits.max_pe_emulation_steps, 7);
+        for off in ["off", "0"] {
+            let opts = build_scan_options(&Cli::parse_from([
+                "exav",
+                "--max-object-bytes",
+                off,
+                "--max-matcher-bytes",
+                off,
+                "--max-pe-emulation-steps",
+                off,
+            ]));
+            assert_eq!(opts.limits.max_buffer_bytes, u64::MAX, "{off}: object");
+            assert_eq!(opts.deep_analysis_max, u64::MAX, "{off}: object (deep)");
+            assert_eq!(opts.limits.max_scanned_bytes, u64::MAX, "{off}: matcher");
+            assert_eq!(
+                opts.limits.max_pe_emulation_steps,
+                u64::MAX,
+                "{off}: emulation"
+            );
+        }
     }
 
     /// Pins the ClamAV-compatibility surface documented by the flag matrix

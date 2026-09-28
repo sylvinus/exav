@@ -5,25 +5,24 @@ description: Fetch ClamAV signatures, run your first exav scan, and understand t
 
 import { Steps, Aside } from '@astrojs/starlight/components';
 
-This walks you from a freshly-built binary to a working scan. You'll need
+This walks you from a freshly built binary to a working scan. You need
 [exav installed](/getting-started/installation/) first.
 
 <Aside type="caution" title="exav ships no signatures">
-exav never bundles the GPL-licensed ClamAV signature database. With no real
-signatures loaded, **exav refuses to run** rather than report clean on near-zero
-coverage. You fetch signatures yourself — that's the first step below.
+exav does not bundle the GPL-licensed ClamAV signature database, and with no real
+signatures loaded it refuses to run. Fetching signatures is the first step below.
 </Aside>
 
 <Steps>
 
-1. **Get ClamAV signatures** with Cisco's own updater, onto your own machine:
+1. **Get ClamAV signatures** with Cisco's own updater:
 
    ```sh
    pip install cvdupdate
    cvd update                  # or `freshclam`
    ```
 
-   This populates `~/.cvdupdate/database` with `main.cvd` / `daily.cvd` /
+   This populates `~/.cvdupdate/database` with `main.cvd`, `daily.cvd` and
    `bytecode.cvd`. See [Signatures](/guides/signatures/) for the licensing
    background and third-party feeds.
 
@@ -33,7 +32,7 @@ coverage. You fetch signatures yourself — that's the first step below.
    exav -d ~/.cvdupdate/database suspicious.bin
    ```
 
-   Output is `clamscan`-compatible:
+   The output follows `clamscan`'s format:
 
    ```console
    suspicious.bin: Win.Trojan.Agent-1234 FOUND
@@ -45,93 +44,92 @@ coverage. You fetch signatures yourself — that's the first step below.
    suspicious.bin: OK
    ```
 
-3. **Scan a directory** — recursive by default, printing only errors and
-   detections:
+3. **Scan a directory.** It is recursive by default; `--quiet` prints only errors
+   and detections:
 
    ```sh
    exav -d ~/.cvdupdate/database --quiet /var/www
    ```
 
-4. **Stream from stdin** — constant memory, any size, no temp file:
+4. **Scan stdin** with `-`. The stream is held in memory up to
+   `--spill-threshold-bytes` (16 MiB), then in a temporary file up to
+   `--max-spill-bytes` (2 GiB), and scanned like a file:
 
    ```sh
    cat backup.tar.gz | exav -d ~/.cvdupdate/database -
-   aws s3 cp s3://bucket/backup-50gb.tar.gz - | exav -d ~/.cvdupdate/database -
    ```
 
 </Steps>
 
-## Alternate: let exav fetch the signatures itself
+## Alternative: let exav fetch the signatures
 
-If your build has [HTTP support](/reference/feature-flags/#adding-http-support),
-exav can pull Cisco's CVDs directly —
-replacing step 1 above, with no `cvdupdate` or `freshclam` involved:
+With [HTTP support](/reference/feature-flags/#adding-http-support) built in, exav
+can pull Cisco's CVDs itself, replacing step 1:
 
 ```sh
 export EXAV_SIG_SOURCES=https://database.clamav.net/
 exav -d ~/.exav-db --auto-update suspicious.bin
 ```
 
-The trailing slash makes the value a mirror base, expanding to
-`main`/`daily`/`bytecode.cvd`; an exact `…/daily.cvd` URL is fetched verbatim
-instead. Sources land validated in `-d`, which is then loaded for the scan,
-and `--auto-update` keeps them current for as long as the process runs. This
-needs a `--features http` build — see [Installation](/getting-started/installation/).
+The trailing slash makes the value a mirror base, expanded to
+`main`/`daily`/`bytecode.cvd`; an exact `…/daily.cvd` URL is fetched as given.
+Sources are validated into `-d`, which is then loaded for the scan, and
+`--auto-update` keeps them current while the process runs. This needs a
+`--features http` build (see [Installation](/getting-started/installation/)).
 
-## Understand the exit code
+## Exit codes
 
-Each code is a status word, and the status is the last word on the result line:
+The status is the last word on each result line, and each status has an exit
+code:
 
 | Exit | Status | Meaning |
 |---|---|---|
-| `0` | `OK` | Clean — every file was fully scanned and nothing matched. |
+| `0` | `OK` | Every file was fully scanned and nothing matched. |
 | `1` | `FOUND` | At least one detection. |
 | `2` | `ERROR` | exav could not do its job: an unreadable path, a database that would not load. |
-| `3` | `PARTIAL` | exav worked, and something could not be fully examined — `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. |
+| `3` | `PARTIAL` | Something could not be fully examined: `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. |
 
 <Aside type="note">
-`3` is the deliberate difference from `clamscan`, which reports `OK` and exits
-`0` for a file it could not fully scan. This is the
-[never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean)
-in action: a CI job should treat `3` as "not a pass", and `2` still means what it
-means in ClamAV — the scanner itself failed. To fold `3` into another status, see
-[`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes).
+`clamscan` reports `OK` and exits `0` for a file it could not fully scan; exav
+exits `3`, so a CI job should not treat `3` as a pass. See
+[Verdicts & exit codes](/reference/verdicts/), and
+[`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes) to map `3` to
+another status.
 </Aside>
 
 ## Faster startup: build a database once
 
-Loading Cisco's raw ClamAV database (`main.cvd`+`daily.cvd`) builds a large
-in-memory automaton (tens
-of seconds, several GB of transient RAM). Do that work once and reuse it:
+Loading Cisco's raw database (`main.cvd` + `daily.cvd`) builds a large in-memory
+automaton, which takes time and several GB of transient RAM. Do it once and reuse
+the result:
 
 ```sh
 exav -d ~/.cvdupdate/database --build-db exav.exavdb   # heavy, run daily in CI
-exav -d exav.exavdb /data                              # ~sub-second cold start
+exav -d exav.exavdb /data                              # fast cold start
 ```
 
 See the [prebuilt database guide](/guides/prebuilt-database/).
 
 ## Run it as a daemon
 
-Load the database once and serve scans over a socket, so callers pay no
-per-scan cold-start cost:
+Load the database once and serve scans over a socket, so callers pay no per-scan
+load cost:
 
 ```sh
 exav --listen /run/user/1000/exav.sock -d exav.exavdb   # load once, serve
-exav --connect /run/user/1000/exav.sock /data           # client: no load cost
-clamdscan --stream file.bin                    # the official ClamAV client works too
+exav --connect /run/user/1000/exav.sock /data           # client
 ```
 
-The direction is the flag: `--listen` accepts connections, `--connect` makes
-one. The protocol travels in the address, so `--listen icap://0.0.0.0:1344`
-serves ICAP from the same binary — and naming both serves both from one process
-over one loaded database.
+`--listen` accepts connections and `--connect` makes one. The protocol travels in
+the address: `--listen icap://0.0.0.0:1344` serves ICAP, and naming both serves
+both from one process. ClamAV's own `clamdscan` works too, given a `clamd.conf`
+whose `LocalSocket` or `TCPSocket` points at the daemon.
 
 See the [daemon guide](/guides/daemon/).
 
 ## Next
 
-- [Scanning](/guides/scanning/) — files, directories, output formats, exit codes.
-- [Migrating from ClamAV](/guides/migrating-from-clamav/) — replace `clamscan` /
+- [Scanning](/guides/scanning/): files, directories, output formats.
+- [Migrating from ClamAV](/guides/migrating-from-clamav/): replace `clamscan` and
   `clamd` in place.
-- [CLI reference](/reference/cli/) — every flag.
+- [CLI reference](/reference/cli/): every flag.

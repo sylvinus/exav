@@ -1,58 +1,53 @@
 ---
 title: Migrating from ClamAV
-description: Replace clamscan and clamd with exav in place — same signatures, same flags and output, same clamd protocol. Usually a one-line change.
+description: Replace clamscan and clamd with exav in place, keeping the same signatures, output format and clamd protocol, with flags translated to exav's own.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-exav is designed as a **drop-in**: it uses ClamAV's signature formats, prints
-`clamscan`'s output format, and speaks the `clamd` wire protocol. In most setups
-the switch is changing one command or one socket — your signature databases,
-updater, and client tooling stay exactly as they are.
+exav uses ClamAV's signature formats, prints `clamscan`'s output format, and
+speaks the `clamd` wire protocol. In most setups the switch is one command or one
+socket; signature databases, updater and client tooling stay as they are.
 
-The flags are the part to check first. exav implements the ones day-to-day
-commands use and refuses the ones it does not implement, so a command line
-carrying an unsupported flag fails at startup rather than scanning under
-settings you did not ask for. The
-[ClamAV flag matrix](/reference/clamav-flag-matrix/) has every `clamscan`,
-`clamd` and `clamdscan` flag with its exav status.
+The flags are the part to check. exav's flags are its own, and a `clamscan` flag
+exav does not have stops the run at startup instead of being ignored, so a command
+line never scans under settings nobody asked for. The
+[ClamAV flag matrix](/reference/clamav-flag-matrix/) maps every `clamscan`,
+`clamd` and `clamdscan` flag to exav's.
 
 <Aside type="caution">
-exav is **beta** and unaudited. Migrate in a test environment first, and keep
-ClamAV available to fall back to.
+exav is beta and unaudited. Migrate in a test environment first, and keep ClamAV
+available to fall back to.
 </Aside>
 
 ## One binary, three roles
 
-ClamAV ships three programs; exav ships one that plays all three parts. The
-flags on the command line pick the part:
+ClamAV ships three programs; exav ships one, and the command line picks the role:
 
 | ClamAV binary | exav invocation | Selected by |
 |---|---|---|
 | `clamscan` (local scanner) | `exav PATH…` | paths, neither `--listen` nor `--connect` |
 | `clamd` (daemon) | `exav --listen ADDR` | `--listen` |
-| `clamdscan` (client) | `exav --connect ADDR PATH…` | `--connect` **and** paths |
+| `clamdscan` (client) | `exav --connect ADDR PATH…` | `--connect` and paths |
 
-The direction is the flag: `--listen` is a place exav accepts connections,
-`--connect` a place it makes one. `--connect` plus paths means *ask the daemon*
-— the client loads no database and sends the paths over the socket. Paths on
-their own mean *scan here*, with a database this process loads itself.
-`--connect` with no paths is neither role, and exav says so rather than idling:
+`--listen` accepts connections and `--connect` makes one. `--connect` with paths
+asks the daemon: the client loads no database and sends the paths over the
+socket. Paths alone scan locally, with a database this process loads.
+`--connect` with no paths is neither, and exav says so:
 
 ```sh
 exav --connect /run/clamav/clamd.ctl
 # exav: no input; provide PATH(s), `-` (stdin), or --listen
 ```
 
-exav never inspects the name it was invoked under, so a symlink called
-`clamdscan` pointing at the binary runs a local scan like any other `exav`
-call. Two wrapper scripts are what carry an existing command line across.
+exav ignores the name it was invoked under, so a symlink called `clamdscan` runs
+a local scan like any other `exav` call. Wrapper scripts are the way to carry a
+command line across.
 
 ### Wrapping `clamscan` and `clamdscan`
 
-Put these earlier on `PATH` than ClamAV's own (`/usr/local/bin` before
-`/usr/bin` on most systems), and scripts, cron jobs and CI steps that call
-`clamscan` or `clamdscan` keep their command lines:
+Put these earlier on `PATH` than ClamAV's own (`/usr/local/bin` before `/usr/bin`
+on most systems):
 
 ```sh
 # /usr/local/bin/clamscan
@@ -66,96 +61,78 @@ exec exav --sig-dir /var/lib/clamav "$@"
 exec exav --connect /run/clamav/clamd.ctl "$@"
 ```
 
-Each pins the one thing the caller's command line does not carry, and passes
-everything else through:
+Each pins what the caller's command line does not carry:
 
-- **`--sig-dir`** names the directory `freshclam` populates. exav's own default
-  is `/var/lib/exav`, so without this a caller that relied on `clamscan`'s default
-  database directory gets `no signature database loaded — refusing to run`.
-  A caller that passes its own `-d` overrides the pinned directory; the two on
-  one command line are not a conflict.
-- **`--connect`** has to be the address the daemon listens on — the `--listen` of
-  your daemon or of the service unit. `--connect HOST:PORT` wraps a client for a
-  daemon on another host.
+- `--sig-dir` names the directory `freshclam` populates. exav's own default is
+  `/var/lib/exav`, so without it a caller relying on `clamscan`'s default gets
+  `no signature database loaded — refusing to run`. A caller's own `-d`
+  overrides it.
+- `--connect` is the address the daemon listens on; `--connect HOST:PORT` wraps a
+  client for a daemon on another host.
 
-`clamscan`'s exit codes mean the same thing here — `0` clean, `1` a detection,
-`2` the scanner failed — and there is a fourth, `3`, for a file exav could not
-fully examine. `--partial-as ok` folds it back into `0`, which is what ClamAV
-answers.
+The wrappers pass the rest through, so the callers' flags still have to be
+translated: a `clamscan` flag exav does not have stops the run. The common ones
+are `-i` → `--quiet`, `-r` → nothing (directories recurse by default),
+`--allmatch` → `--all-matches`, `--no-summary` → `--quiet`, and the client's
+`--stream` / `--fdpass` → `--send-as contents` / `--send-as fd`.
 
-A `clamscan` line's flags do not all survive: exav's are its own, and a
-`clamscan` flag exav does not have **stops the run** rather than being ignored,
-so a wrapped command line never scans under settings nobody asked for. The
-[flag matrix](/reference/clamav-flag-matrix/) is the per-flag mapping; the ones
-that come up most are `-i` → `--quiet`, `-r` → nothing (directories recurse by
-default), `--allmatch` → `--all-matches`, and the client's `--stream` /
-`--fdpass` → `--send-as contents` / `--send-as fd`.
+`clamscan`'s exit codes mean the same here (`0` clean, `1` a detection, `2` the
+scanner failed), plus `3` for a file exav could not fully examine.
+`--partial-as ok` maps it back to `0`, ClamAV's answer.
 
 <Aside type="caution" title="A missing --connect scans instead of failing">
-Drop `--connect` from a client command line and it is still a valid command —
-a full local scan. It reads a database this process loads, which need not be
-the one the daemon holds, and pays the load the daemon exists to avoid. Pin the
-address in the wrapper rather than leaving it to whoever writes the next call.
+Without `--connect`, a client command line is still valid: a full local scan,
+with a database this process loads, which need not be the daemon's. Pin the
+address in the wrapper.
 </Aside>
-
-The [ClamAV flag matrix](/reference/clamav-flag-matrix/) covers the rest of a
-command line — every `clamscan`, `clamd` and `clamdscan` flag against exav's.
-It assumes you are already invoking `exav`; these wrappers are what get an
-existing `clamscan` / `clamdscan` line there.
 
 ## 1. Keep your existing signatures
 
-exav reads ClamAV's own DB files — point it at the directory `freshclam` (or
+exav reads ClamAV's own database files; point it at the directory `freshclam` (or
 `cvdupdate`) already populates:
 
 ```sh
 exav -d /var/lib/clamav /data     # Debian/Ubuntu default DB dir
 ```
 
-Nothing changes about updating signatures: keep running `freshclam` / `cvd` on
-your normal schedule. For faster startup on big signature sets,
-[build a database once](/guides/prebuilt-database/):
+Keep running `freshclam` / `cvd` on your normal schedule. For a faster start on
+large signature sets, [build a database once](/guides/prebuilt-database/):
 
 ```sh
 exav -d /var/lib/clamav --build-db /var/lib/clamav/exav.exavdb   # after each freshclam
-exav -d /var/lib/clamav/exav.exavdb /data                        # sub-second cold start
+exav -d /var/lib/clamav/exav.exavdb /data                        # fast cold start
 ```
 
-## 2. Replacing `clamscan` (one-shot scanning)
+## 2. Replacing `clamscan`
 
-Same output format (`PATH: Signature FOUND` / `PATH: OK`), and the same shape of
-command line. The simplest swap:
+The output format is the same (`PATH: Signature FOUND` / `PATH: OK`):
 
 ```sh
 exav -d /var/lib/clamav /data          # what `clamscan -r /data` scanned
 ```
 
-For an interactive shell, `alias clamscan='exav --sig-dir /var/lib/clamav'`. For
-scripts and cron jobs, which do not read your shell aliases, use the
+For an interactive shell, `alias clamscan='exav --sig-dir /var/lib/clamav'`. Scripts
+and cron jobs do not read shell aliases, so use the
 [wrapper on `PATH`](#wrapping-clamscan-and-clamdscan).
 
-### Flag spellings
+### Limit flags
 
-**exav's flags are its own.** A `clamscan` flag exav does not have is **refused**,
-never ignored: the run stops rather than scanning under settings you did not ask
-for. So a migrated command line needs its limit flags renamed, and the rename is
-mechanical — each exav flag is named after the bound it sets:
+Each exav limit flag is named after the bound it sets:
 
 | `clamscan` spelling | exav flag | Bounds |
 |---|---|---|
-| `--max-filesize` | `--max-input-bytes` | The largest top-level input scanned |
-| `--max-scansize` | `--max-extracted-bytes` | What decompression may produce across one top-level file: deep-analysis size and the summed extracted bytes |
-| `--max-recursion` | `--max-unpack-depth` | Nesting depth, containers inside containers |
-| `--max-files` | `--max-members` | Members visited across the whole recursive walk |
+| `--max-filesize` | `--max-input-bytes` | the largest top-level input scanned |
+| `--max-scansize` | `--max-extracted-bytes` | what decompression may produce across one top-level file |
+| `--max-recursion` | `--max-unpack-depth` | nesting depth |
+| `--max-files` | `--max-members` | members visited across the whole recursive walk |
 
-Two more bounds have no `clamscan` counterpart at all: `--max-object-bytes` (the
-most memory a single materialized object may use) and `--max-matcher-bytes`
-(cumulative bytes fed to the matcher — a CPU/time bound, not a memory one).
+Three bounds have no `clamscan` counterpart: `--max-object-bytes` (the most
+memory one object may use, and the largest file the full engine scans),
+`--max-matcher-bytes` (bytes fed to the matcher, a CPU bound) and
+`--max-pe-emulation-steps` (PE unpacking emulator instructions).
 
-Aliases were the alternative, and cost more than they save: two names for one
-bound is two things to document, and a command line that sets the same bound
-under both spellings has to be refused anyway. One spelling per bound, and a
-clear error naming the exav flag, is the shorter path through a migration:
+There is one spelling per bound, and a `clamscan` spelling gets an error naming
+the exav flag:
 
 ```sh
 exav --max-files 500 /data
@@ -168,32 +145,28 @@ exav --max-files 500 /data
 
 | | ClamAV | exav |
 |---|---|---|
-| A file it couldn't fully scan (size/ratio/recursion limit, unsupported codec, encrypted) | often reports `OK`, exit **0** | status `PARTIAL` under `LIMITS-EXCEEDED` / `UNSCANNABLE` / `PASSWORD-PROTECTED`, exit **3** |
+| A file it could not fully scan (size, ratio or recursion limit, unsupported codec, encryption) | often `OK`, exit `0` | `PARTIAL` with `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`, exit `3` |
 
-This makes exav *safer* (see [Never silently clean](/concepts/design-principles/#never-a-silent-clean)),
-and it is a new code rather than a reused one, so nothing a script already reads
-changes meaning: `2` still means the scanner failed. What a CI job has to add is
-`3`, and it should read it as "not a pass". `--partial-as ok` restores ClamAV's
-answer if that is what the pipeline wants; `--clamav-compat` sets it for you.
+`3` is a new code, so nothing a script already reads changes meaning: `2` still
+means the scanner failed. A CI job should read `3` as "not a pass".
+`--partial-as ok` restores ClamAV's answer; `--clamav-compat` sets it for you.
+See [Never a silent clean](/concepts/design-principles/#never-a-silent-clean).
 
-By default exav runs at **full capability**. To match a stock ClamAV build's
-documented limits and extractor set for apples-to-apples differential testing,
-use `--clamav-compat` (or set its individual flags). See
-[Differential testing](/concepts/differential-testing/) and the
-[CLI reference](/reference/cli/).
+By default exav runs at full capability. `--clamav-compat` matches a stock
+ClamAV build's documented limits and extractor set for differential testing (see
+[Differential testing](/concepts/differential-testing/)).
 
-<Aside type="caution" title="--clamav-compat is a diff-testing tool, not a production mode">
-It *deliberately reduces* exav's detection capability — narrowing limits and
-unpacking reach — so results reproduce `clamscan`'s. It can miss malware exav
-would otherwise catch. Run exav at its default full capability in production.
+<Aside type="caution" title="--clamav-compat is for differential testing">
+It reduces exav's detection on purpose (narrower limits and unpacking reach) so
+results reproduce `clamscan`'s, and it can miss malware exav would otherwise
+catch. Do not run it in production.
 </Aside>
 
-## 3. Replacing `clamd` (the resident daemon)
+## 3. Replacing `clamd`
 
-This is the high-value swap for servers and mail gateways: run exav's daemon on
-the **same socket `clamd` uses**, and `clamdscan`, milters (`clamav-milter`,
-Amavis, Rspamd, MailScanner), and every clamd client library keep working
-**unchanged**.
+Run exav's daemon on the socket `clamd` uses, and `clamdscan`, milters
+(`clamav-milter`, Amavis, Rspamd, MailScanner) and clamd client libraries keep
+working unchanged.
 
 <Steps>
 
@@ -209,16 +182,15 @@ Amavis, Rspamd, MailScanner), and every clamd client library keep working
    sudo systemctl stop clamav-daemon
    ```
 
-3. Run exav on that socket, reading the same DB dir:
+3. Run exav on that socket, reading the same database directory:
 
    ```sh
    sudo -u clamav exav --listen /run/clamav/clamd.ctl -d /var/lib/clamav
    ```
 
-   exav creates the socket **0600**, so clients running as another user need the
-   mode the `clamd.conf` gave them (`LocalSocketMode`, often `660` alongside a
-   `LocalSocketGroup`). The mode rides on the address, since it is a property of
-   that socket:
+   exav creates the socket with mode `0600`, so clients running as another user
+   need the mode `clamd.conf` gave them (`LocalSocketMode`, often `660` with a
+   `LocalSocketGroup`). The mode goes on the address:
 
    ```sh
    grep -i localsocketmode /etc/clamav/clamd.conf   # e.g. 660
@@ -226,7 +198,7 @@ Amavis, Rspamd, MailScanner), and every clamd client library keep working
         -d /var/lib/clamav
    ```
 
-4. Verify from another shell — existing clamd clients work as-is:
+4. Check from another shell:
 
    ```sh
    clamdscan --ping 1
@@ -248,41 +220,38 @@ clamdscan --ping 1
 
 The unit runs as the existing `clamav` user on the Debian socket path; edit
 `ExecStart` / `RuntimeDirectory` for Fedora/RHEL or to match your `clamd.conf`.
-See the [daemon guide](/guides/daemon/) for the protocol coverage.
+See the [daemon guide](/guides/daemon/) for protocol coverage.
 
 ## 4. Encrypted archives & passwords
 
-Encrypted members are reported `PASSWORD-PROTECTED` (never a silent clean).
-Supply passwords to decrypt and scan inside:
+Encrypted members are reported `PASSWORD-PROTECTED`. Supply passwords to decrypt
+and scan inside:
 
 ```sh
-exav --passwords secret --passwords hunter2 /data     # try a pool
-# or a ClamAV .pwdb password database in the signature dir
+exav --passwords secret --passwords hunter2 /data     # tried in order
+# or a ClamAV .pwdb password database in the signature directory
 ```
 
-ZIP (ZipCrypto + WinZip AES), 7z AES-256, encrypted DMG, PDF, and the Office
-family (legacy XLS and OOXML) are decrypted; RAR AES and PKWARE Strong
-Encryption are detected but not decrypted. See
+ZIP (ZipCrypto and WinZip AES), 7z AES-256, encrypted DMG, PDF and Office
+(legacy XLS and OOXML) are decrypted; RAR AES and PKWARE Strong Encryption are
+detected but not decrypted. See
 [Encryption support](/reference/formats/#encryption-support).
 
 ## What to watch for
 
-- **Signature coverage** is ClamAV's — exav runs those signatures but adds none
-  of its own. A handful (PCRE subsignatures, some bytecode) are skipped and
-  **counted**, never silently ignored.
-- **Large-DB memory** is currently higher in exav than ClamAV, by enough to
-  matter: loading a stock `freshclam` directory (`main` + `daily` + `bytecode`)
-  costs several GB where `clamscan` on the same files costs a fraction of that.
-  On a host or container without the headroom the loader is OOM-killed, and an
-  OOM kill writes nothing to the log — the process is simply gone, which reads
-  like a crash with no cause. `docker inspect --format '{{.State.OOMKilled}}'`
-  confirms it.
-
-  Compile the set **once** with `--build-db` on a machine with room, and give
-  every scanner the `.exavdb`: it loads in under a second and a fraction of the
-  memory. A daemon pays the load once for its whole lifetime, so this is mostly
-  a problem for the one-shot `clamscan` swap, which pays it per invocation.
-  Being worked on.
-- exav is **beta**: treat non-detections with caution and keep ClamAV as a
-  fallback until you've validated coverage on your own corpus (see
+- **Signature coverage** is ClamAV's: exav runs those signatures and adds none of
+  its own. A signature exav cannot load is counted and reported by cause.
+- **Memory when loading a raw database** is higher than ClamAV's: a stock
+  `freshclam` directory (`main` + `daily` + `bytecode`) costs several GB to load,
+  where `clamscan` needs a fraction of that. Without the headroom the loader is
+  OOM-killed, which leaves nothing in the log;
+  `docker inspect --format '{{.State.OOMKilled}}'` confirms it. Build the set once
+  with `--build-db` on a machine with room and give every scanner the `.exavdb`,
+  which loads quickly and with a fraction of the memory. A daemon pays the load
+  once; the one-shot `clamscan` replacement pays it per run.
+- **Large files:** a file over `--max-object-bytes` (256 MiB) is reported
+  `LIMITS-EXCEEDED` unless a literal signature or a hash matches it (see
+  [Streaming & memory](/concepts/streaming-memory/)).
+- exav is beta: treat non-detections with caution and keep ClamAV as a fallback
+  until you have validated coverage on your own corpus (see
   [Differential testing](/concepts/differential-testing/)).

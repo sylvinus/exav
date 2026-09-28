@@ -65,19 +65,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
         .seek(SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("onenote: {e}")))?;
     let scan = max_buffer.min(file_len) as usize;
-    let mut prefix = vec![0u8; scan];
-    if source.seek(SeekFrom::Start(0)).is_err() {
-        return Ok(Vec::new());
-    }
-    let mut got = 0usize;
-    while got < prefix.len() {
-        match source.read(&mut prefix[got..]) {
-            Ok(0) => break,
-            Ok(k) => got += k,
-            Err(_) => break,
-        }
-    }
-    prefix.truncate(got);
+    let prefix = crate::read_at(source, 0, scan)?;
 
     let mut out = Vec::new();
     for (idx, guid_at) in memchr::memmem::Finder::new(&FILE_DATA_STORE_GUID)

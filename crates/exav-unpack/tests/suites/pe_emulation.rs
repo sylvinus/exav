@@ -157,6 +157,38 @@ fn the_recovered_image_is_a_pe_the_scanner_can_walk() {
     );
 }
 
+/// The emulator's work is bounded per top-level file, not only per stub: an
+/// archive of many packed executables must not multiply it without limit.
+#[test]
+fn emulation_is_bounded_across_the_whole_scan() {
+    let steps = |n: u64| {
+        let mut l = Limits::default();
+        l.max_pe_emulation_steps = n;
+        Budget::new(l)
+    };
+    let looping = packed_pe(&[0xeb, 0xfe], b"payload");
+    let mut b = steps(10_000);
+    match extract(Format::PePacked, &looping, &mut b) {
+        Err(hit) => assert!(!hit.is_corrupt(), "a budget stop, not a decode failure"),
+        Ok(entries) => panic!("the scan-wide emulation budget did not stop the run: {entries:?}"),
+    }
+
+    // Shared, not per stub: a stub that fits alone does not get a fresh budget
+    // after another one spent it. The stub runs four instructions per byte.
+    let plain = payload_of(b"EXAV_SHARED_EMULATION_BUDGET", 0xc000);
+    let cipher: Vec<u8> = plain.iter().map(|b| b ^ 0x5a).collect();
+    let small = packed_pe(&decrypt_stub(cipher.len() as u32, 0x5a), &cipher);
+    let mut b = steps(300_000);
+    assert!(
+        extract(Format::PePacked, &small, &mut b).is_ok(),
+        "fits once"
+    );
+    assert!(
+        extract(Format::PePacked, &small, &mut b).is_err(),
+        "not twice"
+    );
+}
+
 #[test]
 fn a_stub_that_loops_forever_is_bounded_and_yields_nothing() {
     // `jmp $`: the file never unpacks. The run must end on its own budget and

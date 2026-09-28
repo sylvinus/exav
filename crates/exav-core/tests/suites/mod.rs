@@ -35,6 +35,8 @@ mod matryoshka;
 #[cfg(feature = "all-formats")]
 mod multi_volume;
 #[cfg(feature = "all-formats")]
+mod one_scan;
+#[cfg(feature = "all-formats")]
 mod ooxml_container;
 #[cfg(feature = "all-formats")]
 mod oversize_container;

@@ -153,7 +153,8 @@ impl YaraDb {
         self.sources.is_empty()
     }
     /// Add one rule file's source text. `unofficial` marks rules loaded from a
-    /// non-`.cvd` database (the usual case), so matches carry `.UNOFFICIAL`.
+    /// non-`.cvd` database (the usual case), so compat scans name matches
+    /// `.UNOFFICIAL`.
     pub fn extend_from_text(&mut self, text: &str, unofficial: bool) {
         self.sources.push(text.to_string());
         self.unofficial |= unofficial;
@@ -235,9 +236,15 @@ impl YaraDb {
             .as_ref()
     }
 
-    /// Scan `data`; return the name of the first matching rule, formatted as
-    /// ClamAV reports YARA detections: a `YARA.` prefix and, for rules from an
-    /// unofficial database, a `.UNOFFICIAL` suffix.
+    /// Whether any rule came from an unofficial database, for the report
+    /// layer's `.UNOFFICIAL` suffix.
+    pub fn unofficial(&self) -> bool {
+        self.unofficial
+    }
+
+    /// Scan `data`; return every matching rule, in rule order, named as ClamAV
+    /// reports YARA detections (`YARA.<rule>`). The `.UNOFFICIAL` suffix is the
+    /// report layer's, see [`Self::unofficial`].
     ///
     /// `filename` is the identity of the object being scanned (a file path).
     /// When present, the standard THOR/signature-base external variables are set
@@ -252,8 +259,10 @@ impl YaraDb {
     /// `filename` is `None`, all externals stay undefined and rules referencing
     /// them simply do not match.
     #[cfg(feature = "yara")]
-    pub fn scan(&self, data: &[u8], filename: Option<&str>) -> Option<String> {
-        let rules = self.rules()?;
+    pub fn scan(&self, data: &[u8], filename: Option<&str>) -> Vec<String> {
+        let Some(rules) = self.rules() else {
+            return Vec::new();
+        };
         let mut scanner = Scanner::new(rules);
         if let Some(path) = filename {
             scanner.set_global("filepath", path);
@@ -263,16 +272,24 @@ impl YaraDb {
                 scanner.set_global("extension", ext);
             }
         }
-        let results = scanner.scan(data).ok()?;
-        let id = results.matching_rules().next()?.identifier().to_string();
-        let suffix = if self.unofficial { ".UNOFFICIAL" } else { "" };
-        Some(format!("YARA.{id}{suffix}"))
+        let Ok(results) = scanner.scan(data) else {
+            return Vec::new();
+        };
+        // A condition that ran out of steps evaluated to undefined, so a rule
+        // may have failed to match for that reason alone.
+        if results.budget_exhausted() {
+            crate::engine::mark_scan_truncated();
+        }
+        results
+            .matching_rules()
+            .map(|r| format!("YARA.{}", r.identifier()))
+            .collect()
     }
 
     /// Built without the `yara` feature: rules are stored but never matched.
     #[cfg(not(feature = "yara"))]
-    pub fn scan(&self, _data: &[u8], _filename: Option<&str>) -> Option<String> {
-        None
+    pub fn scan(&self, _data: &[u8], _filename: Option<&str>) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -372,6 +389,10 @@ fn preview(rejected: &[String]) -> String {
 mod tests {
     use super::*;
 
+    fn first(db: &YaraDb, data: &[u8], filename: Option<&str>) -> Option<String> {
+        db.scan(data, filename).into_iter().next()
+    }
+
     #[test]
     fn matches_a_simple_rule() {
         let mut db = YaraDb::new();
@@ -384,14 +405,15 @@ mod tests {
                     $a
             }
             "#,
-            true, // unofficial -> YARA.<id>.UNOFFICIAL
+            true,
         );
         assert_eq!(db.len(), 1);
+        assert!(db.unofficial());
         assert_eq!(
-            db.scan(b"....UNIQUE_EXAV_YARA_MARKER....", None).as_deref(),
-            Some("YARA.evil_marker.UNOFFICIAL")
+            first(&db, b"....UNIQUE_EXAV_YARA_MARKER....", None).as_deref(),
+            Some("YARA.evil_marker")
         );
-        assert!(db.scan(b"nothing to see here", None).is_none());
+        assert!(first(&db, b"nothing to see here", None).is_none());
     }
 
     #[test]
@@ -407,13 +429,14 @@ mod tests {
                     $mz at 0 and $s
             }
             "#,
-            false, // official -> YARA. prefix only, no .UNOFFICIAL
+            false,
         );
+        assert!(!db.unofficial());
         assert_eq!(
-            db.scan(b"MZ\x90\x00 ... evilfn ...", None).as_deref(),
+            first(&db, b"MZ\x90\x00 ... evilfn ...", None).as_deref(),
             Some("YARA.pe_with_two")
         );
-        assert!(db.scan(b"xxMZ evilfn", None).is_none());
+        assert!(first(&db, b"xxMZ evilfn", None).is_none());
     }
 
     #[test]
@@ -436,7 +459,7 @@ mod tests {
         db.finalize();
         assert_eq!(db.rejected_count(), 0, "rejected: {:?}", db.rejected());
         assert_eq!(
-            db.scan(b"MZ .... evilfn ....", None).as_deref(),
+            first(&db, b"MZ .... evilfn ....", None).as_deref(),
             Some("YARA.uses_pe")
         );
     }
@@ -475,11 +498,9 @@ mod tests {
         let hit = b"a needle and version42 here";
         let miss = b"a needle but no ver marker";
         for d in [db, reloaded] {
-            assert_eq!(
-                d.scan(hit, None).as_deref(),
-                Some("YARA.blob_demo.UNOFFICIAL")
-            );
-            assert!(d.scan(miss, None).is_none());
+            assert_eq!(first(&d, hit, None).as_deref(), Some("YARA.blob_demo"));
+            assert!(d.unofficial());
+            assert!(first(&d, miss, None).is_none());
         }
     }
 
@@ -494,7 +515,7 @@ mod tests {
         // Simulate a blob written by an incompatible engine version.
         db.blob_version = YARA_BLOB_VERSION.wrapping_add(1);
         // Still detects (recompiled from the retained sources).
-        assert_eq!(db.scan(b"..marker..", None).as_deref(), Some("YARA.v"));
+        assert_eq!(first(&db, b"..marker..", None).as_deref(), Some("YARA.v"));
     }
 
     #[test]
@@ -521,20 +542,20 @@ mod tests {
         let data = b"....payload....";
         // Right name + extension -> match.
         assert_eq!(
-            db.scan(data, Some("/tmp/Invoice_2026.JS")).as_deref(),
-            Some("YARA.js_dropper.UNOFFICIAL")
+            first(&db, data, Some("/tmp/Invoice_2026.JS")).as_deref(),
+            Some("YARA.js_dropper")
         );
         // Windows path, basename still resolves the extension.
         assert_eq!(
-            db.scan(data, Some("C:\\Users\\x\\invoice.js")).as_deref(),
-            Some("YARA.js_dropper.UNOFFICIAL")
+            first(&db, data, Some("C:\\Users\\x\\invoice.js")).as_deref(),
+            Some("YARA.js_dropper")
         );
         // Wrong extension -> no match.
-        assert!(db.scan(data, Some("/tmp/invoice.txt")).is_none());
+        assert!(first(&db, data, Some("/tmp/invoice.txt")).is_none());
         // Wrong filename -> no match.
-        assert!(db.scan(data, Some("/tmp/report.js")).is_none());
+        assert!(first(&db, data, Some("/tmp/report.js")).is_none());
         // No filename at all -> externals undefined -> no match.
-        assert!(db.scan(data, None).is_none());
+        assert!(first(&db, data, None).is_none());
     }
 
     #[test]
@@ -564,8 +585,8 @@ mod tests {
         assert!(db.rejected()[0].contains("bad_rule"));
         // The good rule still matches despite its neighbour being rejected.
         assert_eq!(
-            db.scan(b"....keepme....", None).as_deref(),
-            Some("YARA.good_rule.UNOFFICIAL")
+            first(&db, b"....keepme....", None).as_deref(),
+            Some("YARA.good_rule")
         );
     }
 }

@@ -42,32 +42,16 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
     let len = source
         .seek(SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("tnef: {e}")))?;
-    let mut sig = [0u8; 6];
-    if source
-        .seek(SeekFrom::Start(0))
-        .and_then(|_| source.read_exact(&mut sig))
-        .is_err()
-        || sig[0..4] != TNEF_SIGNATURE_LE
-    {
+    let sig = crate::read_at(source, 0, 6)?;
+    if sig.len() < 6 || sig[0..4] != TNEF_SIGNATURE_LE {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
     let mut name: Option<String> = None;
     let mut pos = 6u64;
     while pos < len {
-        if source.seek(SeekFrom::Start(pos)).is_err() {
-            break;
-        }
-        let mut hdr = [0u8; 9]; // level(1) + type_and_id(4) + length(4)
-        let mut got = 0;
-        while got < 9 {
-            match source.read(&mut hdr[got..]) {
-                Ok(0) => break,
-                Ok(k) => got += k,
-                Err(_) => break,
-            }
-        }
-        if got < 9 || hdr[0] == 0 {
+        let hdr = crate::read_at(source, pos, 9)?; // level(1) + type_and_id(4) + length(4)
+        if hdr.len() < 9 || hdr[0] == 0 {
             break;
         }
         let level = hdr[0];
@@ -84,18 +68,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             match tag {
                 ATT_ATTACHTITLE => {
                     let n = clamped.min(max_buffer) as usize;
-                    let mut buf = vec![0u8; n];
-                    if source.seek(SeekFrom::Start(data_start)).is_ok() {
-                        let mut g = 0;
-                        while g < buf.len() {
-                            match source.read(&mut buf[g..]) {
-                                Ok(0) => break,
-                                Ok(k) => g += k,
-                                Err(_) => break,
-                            }
-                        }
-                        buf.truncate(g);
-                    }
+                    let buf = crate::read_at(source, data_start, n)?;
                     name = Some(attachment_name(&buf));
                 }
                 ATT_ATTACHDATA | ATT_ATTACHMENT => {

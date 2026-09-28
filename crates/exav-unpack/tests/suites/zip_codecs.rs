@@ -30,6 +30,59 @@ fn zip_lzma_member_is_decoded() {
     );
 }
 
+/// The same member on the streamed walk the top-level scan takes: decoded once,
+/// and not also reported as a codec nothing could decode.
+#[test]
+#[cfg(feature = "lzip")]
+fn zip_lzma_member_is_decoded_once_when_streamed() {
+    use exav_unpack::{stream_members, MemberMeta};
+    use std::io::Read;
+    let blob = fixture("eicar_lzma.zip");
+    let mut budget = Budget::new(Limits::default());
+    let mut seen = Vec::new();
+    let mut visit = |m: &MemberMeta, r: Option<&mut dyn Read>, _: &mut Budget| {
+        let mut data = Vec::new();
+        if let Some(r) = r {
+            r.read_to_end(&mut data).unwrap();
+        }
+        seen.push((m.name.clone(), m.unsupported, data));
+        None::<()>
+    };
+    stream_members(
+        Format::Zip,
+        std::io::Cursor::new(blob),
+        &mut budget,
+        &mut visit,
+    )
+    .unwrap();
+    assert_eq!(
+        seen.len(),
+        1,
+        "{:?}",
+        seen.iter().map(|s| (&s.0, s.1)).collect::<Vec<_>>()
+    );
+    assert_eq!(seen[0].1, None);
+    assert!(seen[0].2.windows(EICAR.len()).any(|w| w == EICAR));
+
+    // Too large to hold is a limit, and says which one.
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 16;
+    let mut budget = Budget::new(limits);
+    let blob = fixture("eicar_lzma.zip");
+    let mut visit = |_: &MemberMeta, _: Option<&mut dyn Read>, _: &mut Budget| None::<()>;
+    let hit = stream_members(
+        Format::Zip,
+        std::io::Cursor::new(blob),
+        &mut budget,
+        &mut visit,
+    )
+    .unwrap_err();
+    assert!(
+        !hit.is_corrupt() && hit.reason.contains("--max-object-bytes"),
+        "{hit:?}"
+    );
+}
+
 /// Dual indexing: a member present only as a Local File Header (not in the
 /// central directory) must still be extracted — this defeats central/local
 /// mismatch hiding.

@@ -35,7 +35,7 @@ One line grammar, everywhere: **`path: [reason ][CATEGORY ]STATUS`**, status las
 ```
 path: OK
 path: Win.Trojan.Agent-1234 FOUND
-path: file size 200000 exceeds max-scan-size 1024 LIMITS-EXCEEDED PARTIAL
+path: file size 200000 exceeds max-input-bytes 1024 LIMITS-EXCEEDED PARTIAL
 path: Can't open file ERROR
 ```
 
@@ -127,7 +127,7 @@ has reported `OK` for something it folded, the fact is gone from the wire.
 ### CLI `--json`
 
 ```json
-{"category":"LIMITS-EXCEEDED","file":"big.bin","reason":"file size 200000 exceeds max-scan-size 1024…","status":"PARTIAL"}
+{"category":"LIMITS-EXCEEDED","file":"big.bin","reason":"file size 200000 exceeds max-input-bytes 1024…","status":"PARTIAL"}
 ```
 
 `category` is present only under `PARTIAL` — the other statuses have nothing to
@@ -136,7 +136,7 @@ sub-classify. Key order is not part of the contract; keys serialise sorted.
 ### clamd wire — `SCAN` / `CONTSCAN` / `MULTISCAN` / `INSTREAM` / `FILDES` / `SCANURL`
 
 ```
-path: file size 200000 exceeds max-scan-size 1024 LIMITS-EXCEEDED ERROR
+path: file size 200000 exceeds max-input-bytes 1024 LIMITS-EXCEEDED ERROR
 ```
 
 Same grammar as stdout; **only the status word differs**, and it has to. See §4.

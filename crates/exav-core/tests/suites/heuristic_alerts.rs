@@ -78,6 +78,32 @@ fn alert_encrypted_with_password_still_finds_payload() {
     }
 }
 
+#[test]
+fn a_decrypted_7z_member_is_still_reported_as_encrypted() {
+    // Decrypting with a pool password must not erase the fact that the member
+    // was encrypted: under all-match both the payload and the heuristic are
+    // reported, as they are for ZIP.
+    let db = builtin_db();
+    let blob = fixture("aes256_hdr.7z");
+    let mut opts = ScanOptions::default();
+    opts.alert_encrypted = true;
+    opts.passwords = vec!["password".to_string()];
+    let names: Vec<String> = exav_core::analyze_all(&db, &blob, &opts)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_uppercase().contains("EICAR")),
+        "{names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "Heuristics.Encrypted.7Zip"),
+        "{names:?}"
+    );
+}
+
 // --- alert-macros ----------------------------------------------------------
 
 /// Build a minimal, valid OLE2 (Compound File Binary) document carrying a VBA

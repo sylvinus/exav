@@ -65,8 +65,10 @@ pub(crate) mod formats;
 #[allow(unused_imports)]
 use formats::*;
 
-mod stream;
+#[cfg(any(feature = "gzip", feature = "zip", feature = "pdf", feature = "ole"))]
+mod inflate;
 pub mod profile;
+mod stream;
 pub mod volume;
 #[cfg(feature = "pdf")]
 pub use formats::has_obfuscated_name_object;
@@ -84,6 +86,15 @@ pub use formats::zip::overlapping_local_records;
 #[cfg(not(feature = "zip"))]
 pub fn overlapping_local_records(_data: &[u8]) -> usize {
     0
+}
+
+#[cfg(feature = "zip")]
+pub use formats::zip::directory_is_consistent as zip_directory_is_consistent;
+
+/// Without the `zip` feature no ZIP is ever confirmed.
+#[cfg(not(feature = "zip"))]
+pub fn zip_directory_is_consistent(_data: &[u8]) -> bool {
+    false
 }
 
 /// The dictionary size an XZ stream declares, and the largest exav will
@@ -194,6 +205,13 @@ pub struct Limits {
     /// large file. Deterministic, so it trips identically on every machine
     /// (unlike a wall-clock deadline).
     pub max_scanned_bytes: u64,
+    /// Cap on the instructions the PE stub emulator may run across the whole
+    /// recursive analysis of one top-level file.
+    ///
+    /// Each emulation already has its own instruction budget; this bounds their
+    /// sum, which otherwise grows with the number of packed executables an
+    /// archive carries. A run cut short by it is `LimitsExceeded`.
+    pub max_pe_emulation_steps: u64,
     /// Formats this scan will open, or `None` for every format compiled in.
     ///
     /// A compile-time feature decides what a *binary* can do; this decides what
@@ -235,6 +253,9 @@ impl Default for Limits {
             // and runaway scan time, and lets a multi-gigabyte member be fully
             // scanned.
             max_scanned_bytes: 10 * 1024 * 1024 * 1024,
+            // A few seconds to tens of seconds of emulation per top-level file,
+            // against the per-stub budget of `formats::pepack`.
+            max_pe_emulation_steps: 1_000_000_000,
             // Every format the build was compiled with. Narrowing this is a
             // deployment decision, and a default that narrowed it would hide
             // content from callers who never asked for that.
@@ -258,6 +279,8 @@ pub struct Budget {
     pub(crate) total_out: u64,
     /// Cumulative bytes fed to the matching core (see [`Limits::max_scanned_bytes`]).
     pub(crate) scanned: u64,
+    /// Emulator instructions spent so far (see [`Limits::max_pe_emulation_steps`]).
+    pub(crate) pe_emulation_steps: u64,
     /// Candidate passwords tried (in order) when decrypting an encrypted member
     /// (ZIP ZipCrypto/AES today). Empty by default — an encrypted member with no
     /// password yields an `Entry::unsupported(encrypted=true, …)` so the scanner
@@ -286,6 +309,7 @@ impl Budget {
             files: 0,
             total_out: 0,
             scanned: 0,
+            pe_emulation_steps: 0,
             passwords: Vec::new(),
             verify_checksums: false,
         }
@@ -374,6 +398,30 @@ impl Budget {
     pub fn commit(&mut self, n: u64) {
         self.total_out = self.total_out.saturating_add(n);
     }
+
+    /// Emulator instructions still available to this scan.
+    #[cfg_attr(not(feature = "pe-emu"), allow(dead_code))]
+    pub(crate) fn pe_emulation_room(&self) -> u64 {
+        self.limits
+            .max_pe_emulation_steps
+            .saturating_sub(self.pe_emulation_steps)
+    }
+
+    #[cfg_attr(not(feature = "pe-emu"), allow(dead_code))]
+    pub(crate) fn charge_pe_emulation(&mut self, steps: u64) {
+        self.pe_emulation_steps = self.pe_emulation_steps.saturating_add(steps);
+    }
+
+    #[cfg_attr(not(feature = "pe-emu"), allow(dead_code))]
+    pub(crate) fn pe_emulation_exhausted(&self) -> LimitHit {
+        LimitHit::of_kind(
+            LimitKind::MaxScanTime,
+            format!(
+                "PE emulation steps > {} (--max-pe-emulation-steps)",
+                self.limits.max_pe_emulation_steps
+            ),
+        )
+    }
 }
 
 /// An extraction stopped early. [`LimitHit::is_corrupt`] picks the verdict:
@@ -408,6 +456,8 @@ pub enum LimitKind {
     MaxFiles,
     /// Container nesting depth (`max_recursion`).
     MaxRecursion,
+    /// CPU work: emulator instructions across the scan (`max_pe_emulation_steps`).
+    MaxScanTime,
     /// Not a budget — the input was malformed. Kept in the same enum so every
     /// `LimitHit` has a kind and nothing has to guess.
     Corrupt,
@@ -441,6 +491,41 @@ impl LimitHit {
             kind: LimitKind::Corrupt,
         }
     }
+}
+
+/// Read until `buf` is full or the source ends, and return how much was read.
+///
+/// A read error is reported, never taken for the end: from a source that can
+/// fail part way (a network range reader) it would pass for a short, complete
+/// container, and every member past it would go unseen.
+#[allow(dead_code)]
+pub(crate) fn read_full<R: Read + ?Sized>(src: &mut R, buf: &mut [u8]) -> Result<usize, LimitHit> {
+    let mut n = 0;
+    while n < buf.len() {
+        match src.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(LimitHit::corrupt(format!("read failed after {n} B: {e}"))),
+        }
+    }
+    Ok(n)
+}
+
+/// Up to `len` bytes at `off`; fewer only where the source ends. See
+/// [`read_full`] for why a failure is an error.
+#[allow(dead_code)]
+pub(crate) fn read_at<R: Read + Seek + ?Sized>(
+    src: &mut R,
+    off: u64,
+    len: usize,
+) -> Result<Vec<u8>, LimitHit> {
+    src.seek(std::io::SeekFrom::Start(off))
+        .map_err(|e| LimitHit::corrupt(format!("seek to {off} failed: {e}")))?;
+    let mut buf = vec![0u8; len];
+    let n = read_full(src, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 /// One extracted member.
@@ -1881,12 +1966,52 @@ pub(crate) fn bounded_read<R: Read>(mut r: R, cap: u64) -> Result<(Vec<u8>, bool
     Ok((buf, truncated))
 }
 
+/// A decode error raised after the input was decoded in full, when only its
+/// checksum disagreed. Carried inside the `io::Error` so a caller can tell it
+/// from damage, which leaves content undecoded.
+#[derive(Debug)]
+struct ChecksumMismatch(&'static str);
+
+impl std::fmt::Display for ChecksumMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} mismatch after a full decode", self.0)
+    }
+}
+
+impl std::error::Error for ChecksumMismatch {}
+
+#[allow(dead_code)] // see `bounded_read_salvage`
+pub(crate) fn checksum_mismatch(what: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, ChecksumMismatch(what))
+}
+
+/// Whether a decode error left compressed content in the input that was never
+/// decoded. A stream that ends early (the rest is absent) or that decoded in
+/// full and failed its checksum hides nothing; damage part way does.
+pub fn decode_error_hides_content(e: &std::io::Error) -> bool {
+    e.kind() != std::io::ErrorKind::UnexpectedEof
+        && !e
+            .get_ref()
+            .is_some_and(|inner| inner.is::<ChecksumMismatch>())
+}
+
+/// What [`bounded_read_salvage`] recovered.
+#[allow(dead_code)] // see `bounded_read_salvage`
+pub(crate) struct Salvaged {
+    pub(crate) data: Vec<u8>,
+    /// The source had more than `cap` bytes.
+    pub(crate) over_cap: bool,
+    /// A decode error stopped the read with content left undecoded
+    /// ([`decode_error_hides_content`]).
+    pub(crate) undecoded: bool,
+}
+
 /// Like [`bounded_read`], but when `salvage` is set, a read error does not
-/// discard the bytes decoded so far — it returns them. This is the
-/// scan-everything default: a trailing checksum/integrity error from a
-/// decompressor (e.g. a gzip CRC-32 or ISIZE mismatch, a ZIP CRC) must not throw
-/// away already-decompressed content that a scanner still needs to inspect. With
-/// `salvage` false it is exactly [`bounded_read`] (errors propagate).
+/// discard the bytes decoded so far: it returns them, and says whether the
+/// error left content undecoded. This is the scan-everything default: the
+/// prefix is scanned, and a clean prefix of a damaged stream is not reported
+/// as a clean member. With `salvage` false errors propagate, as in
+/// [`bounded_read`].
 // Dead only in a build with none of the formats that salvage a partial member;
 // see `cap_prealloc` for why the feature list is not spelled out.
 #[allow(dead_code)]
@@ -1894,28 +2019,39 @@ pub(crate) fn bounded_read_salvage<R: Read>(
     mut r: R,
     cap: u64,
     salvage: bool,
-) -> Result<(Vec<u8>, bool), std::io::Error> {
+) -> Result<Salvaged, std::io::Error> {
     if !salvage {
-        return bounded_read(r, cap);
+        let (data, over_cap) = bounded_read(r, cap)?;
+        return Ok(Salvaged {
+            data,
+            over_cap,
+            undecoded: false,
+        });
     }
     let limit = cap.saturating_add(1);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut undecoded = false;
     while (buf.len() as u64) < limit {
         match r.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // Salvage: keep the content decoded before the (likely checksum)
-            // error rather than dropping the whole member.
-            Err(_) => break,
+            Err(e) => {
+                undecoded = decode_error_hides_content(&e);
+                break;
+            }
         }
     }
-    let truncated = buf.len() as u64 > cap;
-    if truncated {
+    let over_cap = buf.len() as u64 > cap;
+    if over_cap {
         buf.truncate(cap as usize);
     }
-    Ok((buf, truncated))
+    Ok(Salvaged {
+        data: buf,
+        over_cap,
+        undecoded,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2280,19 +2416,14 @@ impl<R: Read + Seek> Archive<R> {
                     .ok_or_else(|| LimitHit::corrupt("gzip: already extracted".into()))?;
                 budget.count_entry()?;
                 let cap = budget.reserve()?;
-                use flate2::read::MultiGzDecoder;
-                let (out, truncated) = bounded_read_salvage(
-                    MultiGzDecoder::new(r),
-                    cap,
-                    !budget.should_verify_checksums(),
-                )
-                .map_err(|e| LimitHit::corrupt(format!("gzip: {e}")))?;
-                if truncated {
+                let s = gunzip(std::io::BufReader::new(r), cap, budget)
+                    .map_err(|e| LimitHit::corrupt(format!("gzip: {e}")))?;
+                if s.over_cap {
                     return Err(LimitHit::new("gzip member exceeds budget".to_string()));
                 }
-                budget.commit(out.len() as u64);
+                budget.commit(s.data.len() as u64);
                 *done = true;
-                Ok(Some(Entry::new("gzip-content".to_string(), out)))
+                Ok(Some(gzip_entry(s)))
             }
             #[cfg(feature = "tar")]
             ArchiveInner::Tar {
@@ -2412,19 +2543,14 @@ impl<R: Read + Seek> Archive<R> {
                     .ok_or_else(|| LimitHit::corrupt("gzip: already extracted".into()))?;
                 budget.count_entry()?;
                 let cap = budget.reserve()?;
-                use flate2::read::MultiGzDecoder;
-                let (out, truncated) = bounded_read_salvage(
-                    MultiGzDecoder::new(r),
-                    cap,
-                    !budget.should_verify_checksums(),
-                )
-                .map_err(|e| LimitHit::corrupt(format!("gzip: {e}")))?;
-                if truncated {
+                let s = gunzip(std::io::BufReader::new(r), cap, budget)
+                    .map_err(|e| LimitHit::corrupt(format!("gzip: {e}")))?;
+                if s.over_cap {
                     return Err(LimitHit::new("gzip member exceeds budget".to_string()));
                 }
-                budget.commit(out.len() as u64);
+                budget.commit(s.data.len() as u64);
                 *done = true;
-                Ok(Entry::new("gzip-content".to_string(), out))
+                Ok(gzip_entry(s))
             }
             #[cfg(feature = "tar")]
             ArchiveInner::Tar {

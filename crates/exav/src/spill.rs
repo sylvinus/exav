@@ -15,7 +15,8 @@
 //! * [`SpillConfig::threshold`] — how much stays in RAM before any file exists.
 //! * [`SpillConfig::max_object`] — the largest single object that may be spilled.
 //! * [`SpillConfig::max_total`] — how much every in-flight object *together* may
-//!   occupy, across the whole process.
+//!   occupy within one process. Under the prefork pool that is per worker and
+//!   per ICAP child, not across the pool.
 //!
 //! The third is the one a per-object limit cannot replace. A listener serving a
 //! hundred connections with a 2 GiB per-object cap has a 200 GiB worst case, and

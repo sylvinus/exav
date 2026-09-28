@@ -15,13 +15,13 @@ cargo install exav
 
 exav file.bin                      # scan one file
 exav /var/www                      # scan a directory, recursively
-cat file.zip | exav -              # scan stdin (constant memory, any size)
+cat file.zip | exav -              # scan stdin
 exav -d /var/lib/clamav /data      # use an existing ClamAV signature directory
 exav --listen 0.0.0.0:3310 -d /var/lib/exav       # serve the clamd protocol
 ```
 
 Two things it does that ClamAV does not. **A file too large to scan is never
-reported clean** — anything that stops a full scan comes back as status
+reported clean**: anything that stops a full scan comes back as status
 `PARTIAL` under `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`, and
 exits 3, where `clamscan` reports `OK` and exits 0. Exit `2` keeps ClamAV's
 meaning, the scanner itself failing, so `3` is an addition rather than a
@@ -29,7 +29,7 @@ reused code. And **one process serves both protocols**:
 naming a `clamd://` and an `icap://` address on `--listen` replaces a
 `c-icap` + `clamav` container pair over one loaded database.
 
-exav ships **no signatures** — the ClamAV database is GPL. Fetch them with
+exav ships **no signatures** (the ClamAV database is GPL). Fetch them with
 `freshclam` or `cvd`, or let `--auto-update` keep a directory current.
 
 Full documentation, including the ClamAV flag matrix and the migration guide, is
