@@ -20,11 +20,15 @@ gets the full engine:
 Verifying a wildcard or logical signature means looking back and forth around
 each candidate match, which is why this path holds the file. Memory is roughly
 the file's size, plus a lowercase copy for case-insensitive signatures and, for
-text, one normalised copy at a time.
+text, one normalised copy at a time. The deobfuscated JavaScript view stops at
+32 MiB; a script whose view is longer is reported `LIMITS-EXCEEDED` unless
+something is found, though its raw bytes are still scanned in full.
 
-Archives in a streamable format (ZIP, tar, 7z, CAB, gzip and most others; see
-[archive extraction](/concepts/archive-extraction/)) are walked member by member,
-and each member is treated like a file: in memory up to the same limit.
+Archives in a streamable format (ZIP, tar, 7z, CAB, gzip, ISO and UDF images,
+self-extracting executables and most others; see
+[archive extraction](/concepts/archive-extraction/)) are walked member by member
+at any size, and each member is treated like a file: in memory up to the same
+limit.
 
 ## Past it: the streaming core, and `LIMITS-EXCEEDED`
 

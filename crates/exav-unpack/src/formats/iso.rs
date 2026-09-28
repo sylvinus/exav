@@ -65,16 +65,20 @@ fn vd_roots(read: &mut dyn FnMut(u64, usize) -> Vec<u8>) -> Vec<(bool, u64, u64)
     joliet.into_iter().chain(primary).collect()
 }
 
+/// The ISO 9660 members as `(name, offset, size)`, and the sectors they start at.
+type StreamedTree = (Vec<(String, u64, u64)>, HashSet<u64>);
+
 /// Reader-based streaming: walk the ISO 9660 directory tree(s) via targeted reads
 /// (directory records are small) and return each file as `(name, offset, size)`.
 /// File extents — the bulk of a disc image — stream via seek+take. Mirrors
 /// [`extract_iso`]'s tree walk and emission order; `max_buffer` bounds each
 /// directory read. Both the primary and Joliet trees are walked; a file present
-/// in both (by extent) is emitted once.
+/// in both (by extent) is emitted once. The extents emitted come back too, for
+/// the UDF walk that follows ([`udf::stream_udf`]) to skip.
 pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
     max_buffer: u64,
-) -> Result<Vec<(String, u64, u64)>, LimitHit> {
+) -> Result<StreamedTree, LimitHit> {
     let total_len = source
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("iso: {e}")))?;
@@ -96,11 +100,11 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     if let Some(e) = failed.take() {
         return Err(e);
     }
-    if roots.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
     let mut seen_files: HashSet<u64> = HashSet::new();
+    if roots.is_empty() {
+        return Ok((out, seen_files));
+    }
     let mut visited = 0usize;
     // Each queued dir carries the Joliet flag of the tree it belongs to.
     let mut dirs: Vec<(bool, u64, u64)> = roots;
@@ -134,6 +138,9 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
                 continue;
             }
             if rec_len < 33 || p + rec_len > dir.len() {
+                // Everything after a corrupt record is unreachable; the marker
+                // reports it, as `extract_iso` does.
+                out.push((format!("<iso-directory@lba{lba}-truncated>"), 0, 0));
                 break;
             }
             let rec = &dir[p..p + rec_len];
@@ -160,7 +167,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
             p += rec_len;
         }
     }
-    Ok(out)
+    Ok((out, seen_files))
 }
 
 /// ISO 9660: a minimal, dependency-free reader that walks the volume descriptors'

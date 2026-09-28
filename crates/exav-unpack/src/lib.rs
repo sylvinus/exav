@@ -97,6 +97,22 @@ pub fn zip_directory_is_consistent(_data: &[u8]) -> bool {
     false
 }
 
+/// Whether a seekable source is a self-extracting archive (an executable with
+/// an archive appended past its stub), judged by the check [`detect`] runs on
+/// one held in memory, with the archive looked for in the first `limit` bytes.
+/// Only that check: the installers `detect` tries first are not ruled out. For a
+/// source too large to buffer: those bytes are read a window at a time. Leaves
+/// the source at an unspecified position. `false` without the `sfx` feature.
+pub fn is_sfx<R: Read + Seek>(source: &mut R, limit: u64) -> Result<bool, LimitHit> {
+    #[cfg(feature = "sfx")]
+    return formats::sfx::is_sfx(source, limit);
+    #[cfg(not(feature = "sfx"))]
+    {
+        let _ = (source, limit);
+        Ok(false)
+    }
+}
+
 /// The dictionary size an XZ stream declares, and the largest exav will
 /// allocate. A declaration above the cap is ClamAV's
 /// `Heuristics.XZ.DicSizeLimit`: memory a decoder must commit before producing

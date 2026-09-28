@@ -62,6 +62,52 @@ fn members(blob: &[u8]) -> Vec<Entry> {
     out
 }
 
+/// What [`exav_unpack::stream_members`] yields, as `(name, sha256, unsupported)`.
+fn streamed(blob: &[u8]) -> Vec<(String, String, Option<&'static str>)> {
+    let mut out = Vec::new();
+    let mut b = Budget::new(Limits::default());
+    let _ = exav_unpack::stream_members(
+        Format::Iso,
+        std::io::Cursor::new(blob.to_vec()),
+        &mut b,
+        &mut |m: &exav_unpack::MemberMeta, r: Option<&mut dyn std::io::Read>, _: &mut Budget| {
+            let mut data = Vec::new();
+            if let Some(r) = r {
+                std::io::Read::read_to_end(r, &mut data).expect("read member");
+            }
+            out.push((m.name.clone(), sha256_hex(&data), m.unsupported));
+            None::<()>
+        },
+    );
+    out
+}
+
+#[test]
+fn the_streamed_walk_yields_what_the_buffered_one_does() {
+    // Every ISO the scanner meets goes through the streamed walk, at any depth
+    // and any size. It used to walk ISO 9660 only, so a UDF-only image
+    // streamed as an empty container.
+    let mut damaged = fixture("udf_only.iso.gz");
+    let sectors = damaged.len() / 2048;
+    for s in [256, sectors - 1, sectors - 257] {
+        damaged[s * 2048..s * 2048 + 16].fill(0);
+    }
+    for (name, blob) in [
+        ("udf_only", fixture("udf_only.iso.gz")),
+        ("bridge", fixture("bridge.iso.gz")),
+        ("damaged", damaged),
+        ("metadata", fixture("metadata.iso.gz")),
+        ("mirror_only", mirror_only()),
+    ] {
+        let buffered: Vec<_> = members(&blob)
+            .iter()
+            .map(|e| (e.name.clone(), sha256_hex(&e.data), e.unsupported))
+            .collect();
+        assert!(!buffered.is_empty(), "{name}: the fixture yields nothing");
+        assert_eq!(streamed(&blob), buffered, "{name}");
+    }
+}
+
 #[test]
 fn a_udf_only_image_is_recognised_at_all() {
     // It has no `CD001`, so nothing but the UDF volume recognition sequence
@@ -73,7 +119,32 @@ fn a_udf_only_image_is_recognised_at_all() {
 
 #[test]
 fn a_udf_only_image_yields_every_file_7zip_does() {
-    let e = members(&fixture("udf_only.iso.gz"));
+    assert_every_file(&members(&fixture("udf_only.iso.gz")));
+}
+
+/// `metadata.iso.gz` with its metadata file's entry blanked, leaving the mirror.
+fn mirror_only() -> Vec<u8> {
+    let mut blob = fixture("metadata.iso.gz");
+    blob[257 * 2048..257 * 2048 + 16].fill(0);
+    blob
+}
+
+#[test]
+fn a_metadata_partition_image_yields_every_file() {
+    // UDF 2.50 and later keep the whole tree, file entries and directories, in
+    // a metadata partition: a file whose blocks are addressed through their own
+    // extents. Written by `fixtures/udf/make_metadata_iso.py`, read back by the
+    // Linux kernel with the same digests as `7zz x` gives for `udf_only`.
+    assert_every_file(&members(&fixture("metadata.iso.gz")));
+}
+
+#[test]
+fn the_mirror_serves_when_the_metadata_file_is_unreadable() {
+    assert_every_file(&members(&mirror_only()));
+}
+
+/// The three files of the UDF fixtures, and nothing reported unreadable.
+fn assert_every_file(e: &[Entry]) {
     assert!(
         e.iter().all(|x| x.unsupported.is_none()),
         "a healthy UDF image must not report anything unreadable, got {:?}",

@@ -92,6 +92,26 @@ follow [semantic versioning](https://semver.org/).
 - The bytes a damaged CAB or ZOO member decoded before the damage are scanned;
   they were reported as scanned and skipped.
 - The `ole` feature builds on its own.
+- The files of a UDF-only ISO image are scanned; the image was reported `OK`
+  without them. A corrupt ISO 9660 directory record is reported instead of
+  hiding the entries after it.
+- UDF 2.50 and later images that keep their tree in a metadata partition are
+  read, through the metadata file or its mirror. The partition holding the file
+  set was read from the wrong bytes of the volume descriptor.
+- An ISO or UDF image, or a self-extracting executable, larger than
+  `--max-object-bytes` is walked member by member. It got the literal and hash
+  pass only.
+- `--dlp-credit-cards`, `--dlp-ssns` and `--detect phishing` cover textual
+  objects past 16 MiB, which they skipped, and phishing checks every link in a
+  document, not the first 4096. A link with no `href` no longer borrows the next
+  link's.
+- The deobfuscated JavaScript view of a script runs to 32 MiB, up from 8 MiB. A
+  script whose view is longer is `LIMITS-EXCEEDED` unless something is found;
+  the view was cut without a word.
+- The JavaScript normaliser reads a script in one pass instead of holding it as
+  a token list: scanning a 30 MiB script peaked at 1.8 GB and now at 100 MB.
+  Nested decode calls unroll at any depth (they stopped after 24 levels), and
+  `eval` layers up to 32.
 
 ## [0.0.1] - 2026-09-16
 

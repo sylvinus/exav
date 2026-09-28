@@ -365,9 +365,14 @@ fn dispatch_stream<R: Read + Seek, T>(
         }
         #[cfg(feature = "iso")]
         Format::Iso => {
-            let members =
+            let (members, mut seen) =
                 crate::formats::iso::stream_offsets(&mut source, budget.limits.max_buffer_bytes)?;
-            stream_stored(&mut source, budget, visit, &members)
+            if let Some(t) = stream_stored(&mut source, budget, visit, &members)? {
+                return Ok(Some(t));
+            }
+            // The same order as `extract_iso`: the ISO 9660 trees, then UDF,
+            // skipping the files the first already emitted.
+            crate::formats::udf::stream_udf(&mut source, budget, visit, &mut seen)
         }
         #[cfg(feature = "onenote")]
         Format::OneNote => {

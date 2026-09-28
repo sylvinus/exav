@@ -12,8 +12,8 @@
 //!   and fold string concatenation (`"ab"+"cd"` → `"abcd"`);
 //! * evaluate `String.fromCharCode(<literals>)` and `unescape("…%XX…")` /
 //!   `decodeURIComponent(…)` whose argument is a literal;
-//! * re-parse the argument of `eval("…")` as JavaScript (one static layer,
-//!   depth-bounded), so `eval("un"+"escape(...)")`-style loaders unroll;
+//! * re-parse the argument of `eval("…")` as JavaScript (depth-bounded), so
+//!   `eval("un"+"escape(...)")`-style loaders unroll;
 //! * canonicalise user identifiers to `n001`, `n002`… (keeping reserved words
 //!   and common built-ins), and normalise integer literals to decimal.
 //!
@@ -32,14 +32,32 @@
 //!   covers). The higher-yield lever per corpus evidence, but needs a distinct
 //!   FP-safe gate (base64 text is ubiquitous and benign).
 //!
-//! Everything walks the input a bounded number of times and cannot panic on any
-//! byte sequence.
+//! The script is read in one pass. Each rewrite is a reduction at the point a
+//! token arrives: a string joins the string before it, and a call is replaced
+//! when its `)` closes it. Only what can still change is held back: the last
+//! few tokens, and the calls still open whose argument can still take the form
+//! the call needs. Everything else is renamed and written out as it settles.
+//! Memory is therefore the output, one entry per identifier renamed, and the
+//! open calls, not the whole script. Nothing here can panic on any byte
+//! sequence.
 
-/// Hard ceilings so a hostile script can't blow up time or memory. Output is
-/// capped; `eval` re-parse recursion and total fold passes are bounded.
-const MAX_OUTPUT: usize = 8 * 1024 * 1024;
-const MAX_EVAL_DEPTH: u32 = 8;
-const MAX_FOLD_PASSES: u32 = 24;
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+/// Hard ceilings so a hostile script can't blow up time or memory.
+const MAX_OUTPUT: usize = 32 * 1024 * 1024;
+/// `eval` layers unrolled, counted from the script itself. Each layer re-reads
+/// text that the layer above held as a string, so the work is at most this
+/// many times the input.
+const MAX_EVAL_DEPTH: u32 = 32;
+/// Calls open inside one another at once. Past it the outermost is left as
+/// written, so the tokens held back stay bounded.
+const MAX_OPEN_CALLS: usize = 256;
+/// Tokens held back when no call is open: a `String . fromCharCode` callee and
+/// the `"…" +` before it are the furthest a later reduction looks back.
+const KEEP_BEHIND: usize = 6;
+/// Settled tokens are written out in batches of at least this many.
+const FLUSH_BATCH: usize = 1024;
 
 /// A single lexical token. Comments and whitespace are never emitted.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,11 +75,33 @@ enum Tok {
 }
 
 /// Normalise a JavaScript/script buffer to its canonical form for matching.
-pub fn normalize(data: &[u8]) -> Vec<u8> {
-    let mut toks = tokenize(data);
-    fold(&mut toks, 0);
-    canonicalize_idents(&mut toks);
-    emit(&toks)
+/// The flag is true when the output was cut at [`MAX_OUTPUT`].
+pub fn normalize(data: &[u8]) -> (Vec<u8>, bool) {
+    run(data).finish()
+}
+
+/// Read all of `data` through the normaliser, leaving the end unwritten.
+fn run(data: &[u8]) -> Normalizer {
+    let mut n = Normalizer::default();
+    // The script, and above it the text of each `eval` being unrolled.
+    let mut sources = vec![Lexer::new(Cow::Borrowed(data), 0)];
+    while let Some(src) = sources.last_mut() {
+        if n.out.cut {
+            break;
+        }
+        let depth = src.depth;
+        match src.next() {
+            Some(tok) => {
+                if let Some(inner) = n.push(Held { tok, depth }) {
+                    sources.push(inner);
+                }
+            }
+            None => {
+                sources.pop();
+            }
+        }
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------
@@ -80,91 +120,115 @@ fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x80
 }
 
-/// Split `data` into tokens, decoding string escapes and dropping comments and
+/// Splits text into tokens, decoding string escapes and dropping comments and
 /// whitespace. A `/` is a regex when it appears where a value is expected,
 /// otherwise a comment (`//`, `/*`) or the division operator.
-fn tokenize(data: &[u8]) -> Vec<Tok> {
-    let mut out = Vec::new();
-    let n = data.len();
-    let mut i = 0usize;
-    // "Value expected" position: at the start, or right after an operator /
-    // opening bracket / keyword — a `/` here begins a regex, not division.
-    let mut value_pos = true;
-    while i < n {
-        let b = data[i];
-        match b {
-            b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b => {
-                i += 1;
-            }
-            b'/' if i + 1 < n && data[i + 1] == b'/' => {
-                i += 2;
-                while i < n && data[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < n && data[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < n && !(data[i] == b'*' && data[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(n);
-            }
-            b'/' if value_pos => {
-                let (re, ni) = read_regex(data, i);
-                out.push(Tok::Regex(re));
-                i = ni;
-                value_pos = false;
-            }
-            b'\'' | b'"' | b'`' => {
-                let (s, ni) = read_string(data, i, b);
-                out.push(Tok::Str(s));
-                i = ni;
-                value_pos = false;
-            }
-            b'0'..=b'9' => {
-                let start = i;
-                i += 1;
-                while i < n
-                    && (data[i].is_ascii_alphanumeric()
-                        || data[i] == b'.'
-                        || data[i] == b'_'
-                        || ((data[i] == b'+' || data[i] == b'-')
-                            && matches!(data[i - 1], b'e' | b'E')))
-                {
-                    i += 1;
-                }
-                out.push(Tok::Num(data[start..i].to_vec()));
-                value_pos = false;
-            }
-            b'.' if i + 1 < n && data[i + 1].is_ascii_digit() => {
-                let start = i;
-                i += 1;
-                while i < n && (data[i].is_ascii_digit() || matches!(data[i], b'e' | b'E' | b'+' | b'-')) {
-                    i += 1;
-                }
-                out.push(Tok::Num(data[start..i].to_vec()));
-                value_pos = false;
-            }
-            _ if is_ident_start(b) => {
-                let start = i;
-                i += 1;
-                while i < n && is_ident(data[i]) {
-                    i += 1;
-                }
-                out.push(Tok::Ident(data[start..i].to_vec()));
-                // After an identifier that is a keyword, a value follows.
-                value_pos = ident_is_keyword(&data[start..i]);
-            }
-            _ => {
-                out.push(Tok::Punct(b));
-                // After most punctuation a value is expected; after `)` `]` a
-                // division/regex ambiguity resolves to division.
-                value_pos = !matches!(b, b')' | b']');
-                i += 1;
-            }
+struct Lexer<'a> {
+    data: Cow<'a, [u8]>,
+    i: usize,
+    /// "Value expected" position: at the start, or right after an operator /
+    /// opening bracket / keyword: a `/` here begins a regex, not division.
+    value_pos: bool,
+    /// How many `eval` layers this text is inside.
+    depth: u32,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(data: Cow<'a, [u8]>, depth: u32) -> Self {
+        Lexer {
+            data,
+            i: 0,
+            value_pos: true,
+            depth,
         }
     }
-    out
+
+    fn next(&mut self) -> Option<Tok> {
+        let data: &[u8] = &self.data;
+        let n = data.len();
+        let mut i = self.i;
+        while i < n {
+            let b = data[i];
+            match b {
+                b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b => {
+                    i += 1;
+                }
+                b'/' if i + 1 < n && data[i + 1] == b'/' => {
+                    i += 2;
+                    while i < n && data[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < n && data[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < n && !(data[i] == b'*' && data[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(n);
+                }
+                b'/' if self.value_pos => {
+                    let (re, ni) = read_regex(data, i);
+                    self.i = ni;
+                    self.value_pos = false;
+                    return Some(Tok::Regex(re));
+                }
+                b'\'' | b'"' | b'`' => {
+                    let (s, ni) = read_string(data, i, b);
+                    self.i = ni;
+                    self.value_pos = false;
+                    return Some(Tok::Str(s));
+                }
+                b'0'..=b'9' => {
+                    let start = i;
+                    i += 1;
+                    while i < n
+                        && (data[i].is_ascii_alphanumeric()
+                            || data[i] == b'.'
+                            || data[i] == b'_'
+                            || ((data[i] == b'+' || data[i] == b'-')
+                                && matches!(data[i - 1], b'e' | b'E')))
+                    {
+                        i += 1;
+                    }
+                    self.i = i;
+                    self.value_pos = false;
+                    return Some(Tok::Num(data[start..i].to_vec()));
+                }
+                b'.' if i + 1 < n && data[i + 1].is_ascii_digit() => {
+                    let start = i;
+                    i += 1;
+                    while i < n
+                        && (data[i].is_ascii_digit() || matches!(data[i], b'e' | b'E' | b'+' | b'-'))
+                    {
+                        i += 1;
+                    }
+                    self.i = i;
+                    self.value_pos = false;
+                    return Some(Tok::Num(data[start..i].to_vec()));
+                }
+                _ if is_ident_start(b) => {
+                    let start = i;
+                    i += 1;
+                    while i < n && is_ident(data[i]) {
+                        i += 1;
+                    }
+                    self.i = i;
+                    // After an identifier that is a keyword, a value follows.
+                    self.value_pos = ident_is_keyword(&data[start..i]);
+                    return Some(Tok::Ident(data[start..i].to_vec()));
+                }
+                _ => {
+                    self.i = i + 1;
+                    // After most punctuation a value is expected; after `)` `]` a
+                    // division/regex ambiguity resolves to division.
+                    self.value_pos = !matches!(b, b')' | b']');
+                    return Some(Tok::Punct(b));
+                }
+            }
+        }
+        self.i = i;
+        None
+    }
 }
 
 /// Read a string literal starting at the opening quote `data[i] == quote`.
@@ -318,150 +382,356 @@ fn read_regex(data: &[u8], mut i: usize) -> (Vec<u8>, usize) {
 // Constant folding + eval unrolling
 // ---------------------------------------------------------------------------
 
-/// Repeatedly apply string-concatenation folding, `fromCharCode`/`unescape`
-/// evaluation and `eval("…")` re-parsing until a fixpoint (bounded).
-fn fold(toks: &mut Vec<Tok>, depth: u32) {
-    let mut pass = 0;
-    loop {
-        let mut changed = false;
-        changed |= fold_concat(toks);
-        changed |= fold_calls(toks, depth);
-        pass += 1;
-        if !changed || pass >= MAX_FOLD_PASSES {
-            break;
-        }
-    }
+/// A token not yet written out, with the `eval` depth of the text it came from.
+struct Held {
+    tok: Tok,
+    depth: u32,
 }
 
-/// Merge `Str + Str` (with an optional `+` between them) into one `Str`.
-fn fold_concat(toks: &mut Vec<Tok>) -> bool {
-    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
-    let mut changed = false;
-    let mut i = 0;
-    while i < toks.len() {
-        if let Tok::Str(a) = &toks[i] {
-            // Look for `"a" + "b"` (allowing the `+`), collapsing a whole chain.
-            let mut merged = a.clone();
-            let mut j = i + 1;
-            let mut consumed = false;
-            loop {
-                // optional '+'
-                let mut k = j;
-                if matches!(toks.get(k), Some(Tok::Punct(b'+'))) {
-                    k += 1;
-                }
-                if let Some(Tok::Str(b)) = toks.get(k) {
-                    merged.extend_from_slice(b);
-                    j = k + 1;
-                    consumed = true;
-                    changed = true;
-                } else {
-                    break;
-                }
-            }
-            if consumed {
-                out.push(Tok::Str(merged));
-                i = j;
-                continue;
-            }
-        }
-        out.push(toks[i].clone());
-        i += 1;
-    }
-    if changed {
-        *toks = out;
-    }
-    changed
+/// What an open call is waiting for.
+enum Kind {
+    /// `unescape`, `decodeURI`, `decodeURIComponent`: one string.
+    Decode,
+    /// `eval`: one string, read again as code.
+    Eval,
+    /// `fromCharCode` / `String.fromCharCode`: integers, held as their values
+    /// rather than as tokens. `want_num` is true at the start and after a `,`.
+    FromCharCode { values: Vec<u32>, want_num: bool },
 }
 
-/// Evaluate call-shaped patterns: `String.fromCharCode(n,…)`, `fromCharCode(n,…)`,
-/// `unescape("…")`, `decodeURIComponent("…")`, and re-parse `eval("…")`.
-fn fold_calls(toks: &mut Vec<Tok>, depth: u32) -> bool {
-    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
-    let mut changed = false;
-    let mut i = 0;
-    while i < toks.len() {
-        // Identify a callee identifier, possibly `String.fromCharCode`.
-        if let Tok::Ident(name) = &toks[i] {
-            let lname = name.to_ascii_lowercase();
-            // Resolve `String . fromCharCode` to the method name.
-            let (callee, after_name) = if lname == b"string"
-                && matches!(toks.get(i + 1), Some(Tok::Punct(b'.')))
-                && matches!(toks.get(i + 2), Some(Tok::Ident(m)) if m.eq_ignore_ascii_case(b"fromcharcode"))
-            {
-                (b"fromcharcode".to_vec(), i + 3)
-            } else {
-                (lname.clone(), i + 1)
+/// A call whose `(` has been read and whose `)` has not, and that can still
+/// be replaced by its value.
+struct Call {
+    kind: Kind,
+    /// Index in `Normalizer::held` of the callee's first token.
+    start: usize,
+    /// Index of the `(`. The argument is what is held after it.
+    open: usize,
+    /// `eval` depth of the callee.
+    depth: u32,
+}
+
+/// Reduces the token stream as it arrives. `held` is the tail that can still
+/// change; `calls` are the open calls in it, outermost first, each inside the
+/// argument of the one before.
+#[derive(Default)]
+struct Normalizer {
+    held: Vec<Held>,
+    calls: Vec<Call>,
+    out: Emitter,
+    /// Most tokens held at once.
+    #[cfg(test)]
+    peak_held: usize,
+}
+
+impl Normalizer {
+    /// Take one token. Returns the text of an `eval` just reduced, to be read
+    /// before the rest of the current text.
+    fn push(&mut self, h: Held) -> Option<Lexer<'static>> {
+        let inner = match h.tok {
+            Tok::Punct(b'(') => {
+                self.open(h);
+                None
+            }
+            Tok::Punct(b')') if !self.calls.is_empty() => self.close(h),
+            _ => {
+                self.take(h);
+                None
+            }
+        };
+        #[cfg(test)]
+        {
+            self.peak_held = self.peak_held.max(self.held.len());
+        }
+        self.flush();
+        inner
+    }
+
+    /// A token that neither opens nor closes a call.
+    fn take(&mut self, h: Held) {
+        if self.absorb_char_code(&h) {
+            return;
+        }
+        self.append(h);
+        if let Some(call) = self.calls.last() {
+            let arg = &self.held[call.open + 1..];
+            let possible = match call.kind {
+                // Only an `eval` can still produce numbers here.
+                Kind::FromCharCode { want_num, .. } => {
+                    matches!(arg, [e] if want_num && callee(e).is_some_and(|k| matches!(k, Kind::Eval)))
+                }
+                _ => string_arg_possible(arg),
             };
-            if matches!(toks.get(after_name), Some(Tok::Punct(b'('))) {
-                if let Some((args_end, replacement)) =
-                    eval_call(&callee, toks, after_name, depth)
-                {
-                    out.extend(replacement);
-                    i = args_end;
-                    changed = true;
-                    continue;
-                }
+            if !possible {
+                self.give_up_all();
             }
         }
-        out.push(toks[i].clone());
-        i += 1;
     }
-    if changed {
-        *toks = out;
-    }
-    changed
-}
 
-/// Try to evaluate one known call whose `(` is at `toks[lparen]`. Returns the
-/// index just past the matching `)` and the token(s) to replace the call with.
-fn eval_call(callee: &[u8], toks: &[Tok], lparen: usize, depth: u32) -> Option<(usize, Vec<Tok>)> {
-    match callee {
-        b"fromcharcode" => {
-            // Args must be a comma-separated list of numeric literals.
-            let mut bytes = Vec::new();
-            let mut k = lparen + 1;
-            loop {
-                match toks.get(k) {
-                    Some(Tok::Num(num)) => {
-                        let cp = parse_int(num)?;
-                        bytes.extend_from_slice(&encode_cp(cp));
-                        k += 1;
-                    }
-                    _ => return None,
-                }
-                match toks.get(k) {
-                    Some(Tok::Punct(b',')) => k += 1,
-                    Some(Tok::Punct(b')')) => {
-                        return Some((k + 1, vec![Tok::Str(bytes)]));
-                    }
-                    _ => return None,
-                }
-            }
+    /// A number or `,` in the argument of the innermost call when that is a
+    /// `fromCharCode` still reading its list: kept as a value, not a token.
+    fn absorb_char_code(&mut self, h: &Held) -> bool {
+        let Some(call) = self.calls.last_mut() else {
+            return false;
+        };
+        let Kind::FromCharCode { values, want_num } = &mut call.kind else {
+            return false;
+        };
+        if self.held.len() != call.open + 1 {
+            return false;
         }
-        b"unescape" | b"decodeuricomponent" | b"decodeuri" => {
-            if let (Some(Tok::Str(s)), Some(Tok::Punct(b')'))) =
-                (toks.get(lparen + 1), toks.get(lparen + 2))
+        match &h.tok {
+            // More codes than output bytes would be cut from the output
+            // whether the call reduces or not.
+            Tok::Num(num) if *want_num && values.len() < MAX_OUTPUT => match parse_int(num) {
+                Some(v) => {
+                    values.push(v);
+                    *want_num = false;
+                    true
+                }
+                None => false,
+            },
+            Tok::Punct(b',') if !*want_num => {
+                *want_num = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Hold `h`, joining a string to the string before it (with or without a
+    /// `+` between them).
+    fn append(&mut self, h: Held) {
+        if let Tok::Str(s) = &h.tok {
+            let n = self.held.len();
+            let into = if n >= 1 && matches!(self.held[n - 1].tok, Tok::Str(_)) {
+                Some(n - 1)
+            } else if n >= 2
+                && self.held[n - 1].tok == Tok::Punct(b'+')
+                && matches!(self.held[n - 2].tok, Tok::Str(_))
             {
-                return Some((lparen + 3, vec![Tok::Str(percent_decode(s))]));
+                Some(n - 2)
+            } else {
+                None
+            };
+            if let Some(into) = into {
+                self.held.truncate(into + 1);
+                if let Tok::Str(d) = &mut self.held[into].tok {
+                    d.extend_from_slice(s);
+                }
+                return;
             }
-            None
         }
-        b"eval" => {
-            if depth >= MAX_EVAL_DEPTH {
+        self.held.push(h);
+    }
+
+    /// A `(`: the start of a call when a callee is right before it.
+    fn open(&mut self, h: Held) {
+        let n = self.held.len();
+        let found = self.held.last().and_then(callee).map(|kind| {
+            let string_dot = n >= 3
+                && self.held[n - 2].tok == Tok::Punct(b'.')
+                && is_ident_named(&self.held[n - 3], b"string");
+            let start = if matches!(kind, Kind::FromCharCode { .. }) && string_dot {
+                n - 3
+            } else {
+                n - 1
+            };
+            (kind, start, self.held[n - 1].depth)
+        });
+        match found {
+            Some((kind, start, depth)) => {
+                if self.calls.len() == MAX_OPEN_CALLS {
+                    self.give_up_outermost();
+                }
+                let start = start.min(self.held.len());
+                self.held.push(h);
+                self.calls.push(Call {
+                    kind,
+                    start,
+                    open: self.held.len() - 1,
+                    depth,
+                });
+            }
+            None => {
+                // A bracket in a call's argument: that call cannot reduce, nor
+                // can the calls around it.
+                self.give_up_all();
+                self.held.push(h);
+            }
+        }
+    }
+
+    /// A `)` closing the innermost open call: replace the call by its value
+    /// when the argument has the form it needs.
+    fn close(&mut self, h: Held) -> Option<Lexer<'static>> {
+        let reducible = match self.calls.last() {
+            Some(call) => {
+                let arg = &self.held[call.open + 1..];
+                match &call.kind {
+                    Kind::FromCharCode { values, want_num } => {
+                        arg.is_empty() && !*want_num && !values.is_empty()
+                    }
+                    _ => matches!(arg, [Held { tok: Tok::Str(_), .. }]),
+                }
+            }
+            None => false,
+        };
+        let call = match self.calls.pop() {
+            Some(call) if reducible => call,
+            other => {
+                self.calls.extend(other);
+                self.give_up_all();
+                self.append(h);
                 return None;
             }
-            if let (Some(Tok::Str(s)), Some(Tok::Punct(b')'))) =
-                (toks.get(lparen + 1), toks.get(lparen + 2))
-            {
-                // Re-parse the string as JavaScript and fold it recursively.
-                let mut inner = tokenize(s);
-                fold(&mut inner, depth + 1);
-                return Some((lparen + 3, inner));
+        };
+        let value = match call.kind {
+            Kind::FromCharCode { values, .. } => {
+                values.into_iter().flat_map(encode_cp).collect()
             }
-            None
+            kind => {
+                let text = match self.held.pop() {
+                    Some(Held {
+                        tok: Tok::Str(s), ..
+                    }) => s,
+                    _ => Vec::new(),
+                };
+                if matches!(kind, Kind::Eval) {
+                    self.held.truncate(call.start);
+                    return Some(Lexer::new(Cow::Owned(text), call.depth + 1));
+                }
+                percent_decode(&text)
+            }
+        };
+        self.held.truncate(call.start);
+        self.take(Held {
+            tok: Tok::Str(value),
+            depth: call.depth,
+        });
+        None
+    }
+
+    /// Stop treating the open calls as reducible: their tokens are written as
+    /// they were read.
+    fn give_up_all(&mut self) {
+        let calls = std::mem::take(&mut self.calls);
+        let mut written = 0;
+        for call in calls {
+            // A `fromCharCode`'s list is written in place, after its `(`.
+            if let Kind::FromCharCode { values, want_num } = call.kind {
+                let upto = call.open + 1 - written;
+                self.write_front(upto);
+                written += upto;
+                self.out.char_codes(&values, want_num);
+            }
         }
-        _ => None,
+    }
+
+    /// `give_up_all` for the outermost call only.
+    fn give_up_outermost(&mut self) {
+        if self.calls.is_empty() {
+            return;
+        }
+        let call = self.calls.remove(0);
+        if let Kind::FromCharCode { values, want_num } = call.kind {
+            self.write_front(call.open + 1);
+            self.out.char_codes(&values, want_num);
+        }
+    }
+
+    /// Write out what can no longer change, in batches.
+    fn flush(&mut self) {
+        let settled = match self.calls.first() {
+            // A reduced call's value can join a `"…" +` before it, and an
+            // unrolled `eval` can supply the `(` of a callee just before it.
+            Some(call) => call.start.saturating_sub(3),
+            None => self.held.len().saturating_sub(KEEP_BEHIND),
+        };
+        if settled >= FLUSH_BATCH {
+            self.write_front(settled);
+        }
+    }
+
+    /// Write out the first `n` held tokens.
+    fn write_front(&mut self, n: usize) {
+        let n = n.min(self.held.len());
+        for h in self.held.drain(..n) {
+            self.out.emit(&h.tok);
+        }
+        for call in &mut self.calls {
+            call.start -= n;
+            call.open -= n;
+        }
+    }
+
+    fn finish(mut self) -> (Vec<u8>, bool) {
+        if !self.out.cut {
+            // A call never closed is written as it was read.
+            self.give_up_all();
+            self.write_front(self.held.len());
+        }
+        let mut out = self.out.out;
+        let cut = self.out.cut || out.len() > MAX_OUTPUT;
+        out.truncate(MAX_OUTPUT);
+        (out, cut)
+    }
+}
+
+/// The call a callee token starts, if it is one exav evaluates.
+fn callee(h: &Held) -> Option<Kind> {
+    let Tok::Ident(name) = &h.tok else {
+        return None;
+    };
+    if name.eq_ignore_ascii_case(b"fromcharcode") {
+        Some(Kind::FromCharCode {
+            values: Vec::new(),
+            want_num: true,
+        })
+    } else if [&b"unescape"[..], b"decodeuricomponent", b"decodeuri"]
+        .iter()
+        .any(|c| name.eq_ignore_ascii_case(c))
+    {
+        Some(Kind::Decode)
+    } else if name.eq_ignore_ascii_case(b"eval") && h.depth < MAX_EVAL_DEPTH {
+        Some(Kind::Eval)
+    } else {
+        None
+    }
+}
+
+fn is_ident_named(h: &Held, name: &[u8]) -> bool {
+    matches!(&h.tok, Tok::Ident(n) if n.eq_ignore_ascii_case(name))
+}
+
+/// Whether `arg`, what is held after a string-argument call's `(`, can still
+/// become one string: a string, optionally with a `+` after it, then at most
+/// the callee of a call whose value would join it.
+fn string_arg_possible(arg: &[Held]) -> bool {
+    let mut rest = arg;
+    if let [Held {
+        tok: Tok::Str(_), ..
+    }, tail @ ..] = rest
+    {
+        rest = tail;
+        if let [Held {
+            tok: Tok::Punct(b'+'),
+            ..
+        }, tail @ ..] = rest
+        {
+            rest = tail;
+        }
+    }
+    match rest {
+        [] => true,
+        [c] => callee(c).is_some() || is_ident_named(c, b"string"),
+        [s, dot] => is_ident_named(s, b"string") && dot.tok == Tok::Punct(b'.'),
+        [s, dot, f] => {
+            is_ident_named(s, b"string")
+                && dot.tok == Tok::Punct(b'.')
+                && is_ident_named(f, b"fromcharcode")
+        }
+        _ => false,
     }
 }
 
@@ -534,58 +804,77 @@ fn parse_int(num: &[u8]) -> Option<u32> {
 // Identifier canonicalisation + emission
 // ---------------------------------------------------------------------------
 
-/// Rename user identifiers to `n001`, `n002`… keeping reserved words and common
-/// built-ins so signatures that reference them (and decoded string content)
-/// still match.
-fn canonicalize_idents(toks: &mut [Tok]) {
-    use std::collections::HashMap;
-    let mut map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut counter: u32 = 0;
-    for t in toks.iter_mut() {
-        if let Tok::Ident(name) = t {
-            let lname = name.to_ascii_lowercase();
-            if ident_is_keyword(name) || KEEP_IDENTS.contains(&lname.as_slice()) {
-                continue;
-            }
-            let canon = map.entry(name.clone()).or_insert_with(|| {
-                counter += 1;
-                format!("n{counter:03}").into_bytes()
-            });
-            *name = canon.clone();
-        }
-    }
+/// Writes settled tokens. User identifiers are renamed `n001`, `n002`… in the
+/// order they first appear, keeping reserved words and common built-ins so
+/// signatures that reference them (and decoded string content) still match. A
+/// single space separates two tokens only when their touching characters would
+/// otherwise merge (two identifier/number chars).
+#[derive(Default)]
+struct Emitter {
+    out: Vec<u8>,
+    /// The number each renamed identifier was given.
+    names: HashMap<Box<[u8]>, u32>,
+    /// A token was left out because the output is full.
+    cut: bool,
 }
 
-/// Emit the token stream. A single space separates two tokens only when their
-/// touching characters would otherwise merge (two identifier/number chars).
-fn emit(toks: &[Tok]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for t in toks {
-        if out.len() >= MAX_OUTPUT {
-            break;
+impl Emitter {
+    fn emit(&mut self, tok: &Tok) {
+        if self.cut {
+            return;
         }
-        let piece: Vec<u8> = match t {
-            Tok::Ident(s) => s.clone(),
-            Tok::Num(s) => normalize_num(s),
+        if self.out.len() >= MAX_OUTPUT {
+            self.cut = true;
+            return;
+        }
+        let number;
+        let piece: &[u8] = match tok {
+            Tok::Ident(name) if !is_kept(name) => {
+                let k = match self.names.get(&name[..]) {
+                    Some(&k) => k,
+                    None => {
+                        let k = self.names.len() as u32 + 1;
+                        self.names.insert(name.clone().into_boxed_slice(), k);
+                        k
+                    }
+                };
+                number = format!("n{k:03}").into_bytes();
+                &number
+            }
+            Tok::Ident(name) | Tok::Regex(name) => name,
+            Tok::Num(s) => {
+                number = normalize_num(s);
+                &number
+            }
             Tok::Str(s) => {
-                let mut v = Vec::with_capacity(s.len() + 2);
-                v.push(b'"');
-                v.extend_from_slice(s);
-                v.push(b'"');
-                v
+                self.out.push(b'"');
+                self.out.extend_from_slice(s);
+                self.out.push(b'"');
+                return;
             }
-            Tok::Regex(s) => s.clone(),
-            Tok::Punct(b) => vec![*b],
+            Tok::Punct(b) => std::slice::from_ref(b),
         };
-        if let (Some(&last), Some(&first)) = (out.last(), piece.first()) {
+        if let (Some(&last), Some(&first)) = (self.out.last(), piece.first()) {
             if is_ident(last) && is_ident(first) {
-                out.push(b' ');
+                self.out.push(b' ');
             }
         }
-        out.extend_from_slice(&piece);
+        self.out.extend_from_slice(piece);
     }
-    out.truncate(MAX_OUTPUT);
-    out
+
+    /// The list of a `fromCharCode` that was not reduced, as its tokens would
+    /// have been written: numbers in decimal, and the trailing `,` if any.
+    fn char_codes(&mut self, values: &[u32], want_num: bool) {
+        for (k, v) in values.iter().enumerate() {
+            if k > 0 {
+                self.emit(&Tok::Punct(b','));
+            }
+            self.emit(&Tok::Num(v.to_string().into_bytes()));
+        }
+        if want_num && !values.is_empty() {
+            self.emit(&Tok::Punct(b','));
+        }
+    }
 }
 
 /// Render an integer literal as decimal; leave floats/malformed text as-is.
@@ -596,21 +885,24 @@ fn normalize_num(num: &[u8]) -> Vec<u8> {
     }
 }
 
+/// An identifier written as it is rather than renamed.
+fn is_kept(name: &[u8]) -> bool {
+    ident_is_keyword(name) || KEEP_IDENTS.iter().any(|k| name.eq_ignore_ascii_case(k))
+}
+
 /// JavaScript reserved words and control keywords — never renamed, and a value
 /// is expected right after them (regex disambiguation).
 fn ident_is_keyword(name: &[u8]) -> bool {
-    let l = name.to_ascii_lowercase();
-    matches!(
-        l.as_slice(),
-        b"var" | b"let" | b"const" | b"function" | b"return" | b"if" | b"else"
-            | b"for" | b"while" | b"do" | b"switch" | b"case" | b"default"
-            | b"break" | b"continue" | b"new" | b"delete" | b"typeof" | b"instanceof"
-            | b"in" | b"of" | b"void" | b"this" | b"throw" | b"try" | b"catch"
-            | b"finally" | b"with" | b"yield" | b"await" | b"async" | b"class"
-            | b"extends" | b"super" | b"import" | b"export" | b"true" | b"false"
-            | b"null" | b"undefined"
-    )
+    KEYWORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
 }
+
+const KEYWORDS: &[&[u8]] = &[
+    b"var", b"let", b"const", b"function", b"return", b"if", b"else", b"for", b"while",
+    b"do", b"switch", b"case", b"default", b"break", b"continue", b"new", b"delete",
+    b"typeof", b"instanceof", b"in", b"of", b"void", b"this", b"throw", b"try", b"catch",
+    b"finally", b"with", b"yield", b"await", b"async", b"class", b"extends", b"super",
+    b"import", b"export", b"true", b"false", b"null", b"undefined",
+];
 
 /// Common built-in / global identifiers kept un-renamed so signatures that key
 /// on them still match the normalised stream (lower-cased comparison).
@@ -667,7 +959,70 @@ mod tests {
     use super::*;
 
     fn norm(s: &[u8]) -> String {
-        String::from_utf8_lossy(&normalize(s)).into_owned()
+        String::from_utf8_lossy(&normalize(s).0).into_owned()
+    }
+
+    #[test]
+    fn output_past_the_cap_is_flagged() {
+        let literal = |len: usize| {
+            let mut s = b"var s=\"".to_vec();
+            s.resize(s.len() + len, b'A');
+            s.extend_from_slice(b"\";");
+            s
+        };
+        // `var n001="…";` is 12 bytes around the literal.
+        let (out, cut) = normalize(&literal(MAX_OUTPUT - 12));
+        assert_eq!((out.len(), cut), (MAX_OUTPUT, false));
+        let (out, cut) = normalize(&literal(MAX_OUTPUT - 11));
+        assert_eq!((out.len(), cut), (MAX_OUTPUT, true));
+        // Cut between tokens rather than inside one.
+        let (out, cut) = normalize(&[literal(MAX_OUTPUT - 12), b"x;".to_vec()].concat());
+        assert_eq!((out.len(), cut), (MAX_OUTPUT, true));
+    }
+
+    #[test]
+    fn the_script_is_not_held_whole() {
+        // A long minified script, with a call left open at the start that
+        // stops being reducible straight away: tokens are written out as
+        // they settle rather than kept to the end.
+        let mut script = b"unescape(x".to_vec();
+        for k in 0..200_000 {
+            script.extend_from_slice(format!("a{k}=b.c(d,e)+\"f\";").as_bytes());
+        }
+        let n = run(&script);
+        assert!(n.peak_held < 2 * FLUSH_BATCH, "held {} tokens", n.peak_held);
+        // Calls nested deeper than the cap: the outermost are given up.
+        let deep = [b"unescape(".repeat(100_000), b"'%41'".to_vec(), b")".repeat(100_000)].concat();
+        let n = run(&deep);
+        assert!(n.peak_held < 4 * MAX_OPEN_CALLS + FLUSH_BATCH, "held {} tokens", n.peak_held);
+    }
+
+    #[test]
+    fn values_join_what_is_around_them() {
+        // A reduced call's string joins the strings before and after it.
+        assert_eq!(norm(br#"x="a"+unescape("%42")+"c";"#), r#"n001="aBc";"#);
+        // So do the strings an unrolled eval produces.
+        assert_eq!(norm(br#""a"+eval("'b'")+"c""#), r#""abc""#);
+        // An unrolled eval can supply a callee for what follows it.
+        assert_eq!(norm(br#"eval("unescape")("%41")"#), r#""A""#);
+        assert_eq!(norm(br#"String.eval("fromCharCode")(66)"#), r#""B""#);
+    }
+
+    #[test]
+    fn a_call_that_cannot_reduce_is_written_as_read() {
+        assert_eq!(norm(b"fromCharCode(0x41,x)"), "fromCharCode(65,n001)");
+        assert_eq!(norm(b"fromCharCode(0x41,)"), "fromCharCode(65,)");
+        assert_eq!(norm(b"String.fromCharCode(65,66"), "String.fromCharCode(65,66");
+        assert_eq!(norm(br#"unescape(("%41"))"#), r#"unescape(("%41"))"#);
+        assert_eq!(norm(br#"unescape("%41"+x)"#), r#"unescape("%41"+n001)"#);
+    }
+
+    #[test]
+    fn nesting_is_unrolled_to_the_bottom() {
+        // Thirty nested decodes: one repeated fold pass per level would stop
+        // short of it.
+        let script = [b"unescape(".repeat(30), b"'x'".to_vec(), b")".repeat(30)].concat();
+        assert_eq!(norm(&script), r#""x""#);
     }
 
     #[test]

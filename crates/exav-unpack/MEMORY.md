@@ -1,217 +1,177 @@
 # Forced-materialization inventory & the peak-memory limit
 
-This document is the **exhaustive list of every place in `exav-unpack` and
-`exav-core` that materializes a whole object (file / archive / member / decoded
-sub-container / LZ window / decrypted blob / parsed TOC) into a single contiguous
-in-memory buffer**, why each one must, and which limit bounds it.
+Where `exav-unpack` and `exav-core` hold a whole object (file, archive,
+member, decoded sub-container, LZ window, decrypted blob, parsed TOC) in one
+contiguous buffer, why each one must, and which limit bounds it.
 
 ## Two independent knobs: memory vs. reach
 
 Peak **memory** and scan **reach** are separate, because a streamed member is
 never held in RAM.
 
-**1. `--max-object-bytes` — the largest *single* buffer.**
-- API: `unpack::Limits::max_buffer_bytes`, default **256 MiB**; and core
-  `ScanOptions::deep_analysis_max`, default **256 MiB** (the structural-buffer
-  ceiling). `--max-object-bytes` sets both.
-- Every forced-materialization site caps its single largest allocation here.
+**1. `--max-object-bytes`: the largest *single* buffer.**
+- API: `unpack::Limits::max_buffer_bytes` and core
+  `ScanOptions::deep_analysis_max`, both **256 MiB** by default.
+  `--max-object-bytes` sets both.
+- Every forced-materialization site caps its largest allocation here.
 
-  It is **not** a cap on peak memory, and reading it as one is a mistake worth
-  spelling out. Several buffers are alive at once — a container, its member and
-  that member's own member are each mid-scan while the walk is inside them — so
-  what bounds the total is `Limits::max_extracted_bytes` below, not this.
-  Measured: a 1.1 MB 7z peaked at 2331 MB with this knob at its 256 MiB default.
+  It is **not** a cap on peak memory. Several buffers are alive at once (a
+  container, its member and that member's own member are each mid-scan while
+  the walk is inside them), so what bounds the total is
+  `Limits::max_extracted_bytes` below.
 
-**1b. `Limits::max_extracted_bytes` — what actually bounds live extraction memory.**
+**1b. `Limits::max_extracted_bytes`: what bounds live extraction memory.**
 - Default **1 GiB**. `Budget::reserve`/`commit` charge it cumulatively and never
-  release, so it is simultaneously the total-output bound and the ceiling on how
-  much extracted data can be resident at one moment.
-- It therefore has to fit inside the address space the process is given. In the
-  daemon it does: `fit_limits_to_job_memory` clamps it to half of the per-job
-  grant once that grant is known, so the deterministic in-core limit produces a
-  `LIMITS-EXCEEDED` verdict instead of `RLIMIT_AS` killing the worker. Before
-  that clamp the ordering was inverted — a 1 GiB budget inside a ~750 MiB grant
-  — and 48 workers were aborted in an 8,978-file run for reaching a limit that
-  should have been reported.
+  release, so it is both the total-output bound and the ceiling on how much
+  extracted data can be resident at one moment.
+- It has to fit inside the address space the process is given. The daemon's
+  `fit_limits_to_job_memory` clamps it to half of the per-job memory grant, so
+  the in-core limit produces `LIMITS-EXCEEDED` instead of `RLIMIT_AS` killing
+  the worker.
 
-**2. `--max-matcher-bytes` — the scan-reach (CPU/time) knob.**
+**2. `--max-matcher-bytes`: scan reach (CPU/time).**
 - API: `Limits::max_scanned_bytes`, default **10 GiB**.
-- Bounds the cumulative bytes fed to the matcher across one top-level file
-  (streamed members + re-carved/re-scanned regions). This is **not** a memory
-  cost: the streaming member API (`stream_members` + `BudgetReader`) decodes a
-  member on demand and the caller (`exav-core::member_stream_scan`) holds only a
-  bounded prefix (≤ `deep_analysis_max`) in RAM, streaming the rest through the
-  constant-memory matcher. So this knob can be raised **far higher** (10 GiB,
-  100 GiB, …) to fully scan enormous members — paying only in scan *time*, with
-  peak RAM still fixed by `--max-object-bytes`. Its only job is DoS resistance
-  (re-scanning bombs / runaway scan time).
+- Bounds the cumulative bytes fed to the matcher for one top-level input
+  (streamed members plus re-carved/re-scanned regions). Not a memory cost: a
+  streamed member is decoded on demand (`stream_members` + `BudgetReader`), and
+  `exav-core` holds at most `deep_analysis_max` of it. Raising this knob buys
+  scan time only; its job is DoS resistance.
 
-Concretely: a member decompressing to `N` bytes is scanned in full when
-`N ≤ max_scanned_bytes`, using `≈ deep_analysis_max` RAM regardless of `N`. Buffered
-(non-streaming) formats still hold their member whole, so for them
-`max_buffer_bytes` remains both the memory and the size cap.
+## How an input reaches the extractors
 
-## Streaming coverage (reader-based, never materialize a member)
+Every entry point runs `exav-core::scan_seekable` (`scan_path` opens the file and
+hands it over).
 
-**Streamed top-level** (`exav-core::streams_natively`, walked via `stream_members`
-off the file handle — 15 formats):
-- **Single-stream compressors**: gzip, zstd, lzip (a `Read` decoder over the source).
-- **Seekable stored/decoded containers**: tar, zip, lha.
-- **Stored-offset containers** (parse a small header/table via `Read+Seek`, then
-  seek+take each member — `stream_stored`): ar, cpio, iso, partition, machofat,
-  tnef, onenote, sfx, pyc.
-- **swf**: CWS/ZWS bodies decode through a zlib/LZMA `Read` chained behind the
-  rebuilt FWS header.
-- **Incremental custom decoders**: szdd (SZDD's 4 KiB-window LZSS rewritten as a
-  streaming `Read`; KWAJ falls back to a bounded buffered decode).
-- **Solid-block containers (pattern A)**: 7z and cab. The former random-access
-  "decode the whole solid block/folder to a `Vec`, then slice members by offset"
-  is replaced by "build the block/folder as a forward-only `Read`, skip to each
-  file's offset, hand it a `take(size)` window" — so the decompressed solid unit
-  is never buffered. 7z: `decode_block_reader` over the existing coder chain
-  (LZMA/LZMA2/PPMd/BCJ); AES members keep the buffered CRC/password path. cab:
-  `FolderReader` decodes CFDATA blocks one at a time (the LZX/MSZIP dictionary is
-  the only retained state), driven by a parse-without-decompress `Cabinet::layout`.
-  Both verified with `assert_stream_matches_buffered` (7z across lzma/lzma2-solid/
-  copy/deflate/bzip2 fixtures).
+- **Typing.** From the first 4 KiB. An input over `deep_analysis_max` whose
+  type is not walkable off the reader is typed again from a wider head, because
+  an ISO 9660 descriptor sits at 32 KiB and a UDF one up to 64 KiB in; an
+  executable is also searched for an appended archive in its first
+  `max_buffer_bytes`, read a window at a time (`unpack::is_sfx`).
+- **Walkable containers** (`exav-core::streams_natively`) are walked member by
+  member off the reader, at any size. Up to `deep_analysis_max` the container is
+  also read whole, once, for the full engine and the whole-object checks. Past
+  it the constant-memory `stream_core` (literal signatures and whole-file
+  hashes) runs over its bytes, the members are walked, and the result is
+  `LIMITS-EXCEEDED` unless something is found.
+- **Everything else** up to `deep_analysis_max` is read whole and analysed.
+  Past it, `stream_core` runs over it and the result is `LIMITS-EXCEEDED` unless
+  something is found.
 
-**Raw-container scan**: `exav-core::scan_path` runs a constant-memory
-`stream_core` (whole-file hash + patterns) over a streamed container before
-walking members — restoring the whole-file-hash / raw-pattern detections the
-buffered `scan_bytes_core` did. (`scan_seekable`/range-GET skips it to preserve
-fetch economy.) This also means single-output transforms are safe to stream:
-their raw bytes are always scanned regardless of the decoder.
+## Streaming coverage
 
-Each STORED-OFFSET conversion has a `stream_offsets(source) -> [(name,off,size)]`
-parser validated by an `assert_stream_matches_buffered` equivalence test (streamed
-members byte-for-byte match `extract`).
+`stream_members` walks every `is_streamable` format with each member produced
+on demand, never materialized whole: gzip, bzip2, xz, zstd, lzip, tar, zip,
+lha, ar, cpio, machofat, pyc, sfx, tnef, partition, iso, onenote, swf, szdd, 7z
+and cab.
 
-**Nested (recursive) streaming**: every [`is_streamable`] format — the
-single-stream compressors gzip/bzip2/xz/zstd/lzip included — is streamed
-*inside* other archives too, at any depth, so a small nested member
-decompressing to gigabytes is scanned in full (RAM bounded by
-`deep_analysis_max`) instead of being truncated at `max_buffer_bytes`. Formats
-with no streaming walk stay on the buffered `extract_each` path there, preserving
-`.cdb`/OLE per-member metadata matching.
+- **Single-stream compressors**: a `Read` decoder over the source. bzip2 and xz
+  buffer their compressed input (bounded by `max_buffer_bytes`); the win is on
+  the output side.
+- **Stored-offset containers** parse a small header or table through
+  `Read + Seek`, then seek and `take` each member (`stream_stored`): ar, cpio,
+  partition, machofat, tnef, onenote, sfx, pyc, and the ISO 9660 trees of iso.
+  Where a test holds a streamed walk to the buffered `extract`, it is
+  `assert_stream_matches_buffered` in `stream.rs`, or the `udf` suite for ISO.
+- **ISO** walks its ISO 9660 trees and then its UDF tree, skipping files the
+  first already emitted, as the buffered walk does. The UDF walk reads the image
+  through the same code in both cases (`udf::Image`) and streams each file from
+  the runs of the image it occupies.
+- **SFX** finds the appended archive in the first `max_buffer_bytes` a window at
+  a time and streams `[offset, EOF)` as one member.
+- **swf**: CWS/ZWS bodies decode through a zlib/LZMA `Read` behind the rebuilt
+  FWS header. **szdd**: SZDD's LZSS as a streaming `Read`; KWAJ falls back to a
+  bounded buffered decode.
+- **Solid blocks (7z, cab)**: the block or folder is a forward-only `Read`;
+  each file is a `take(size)` window after skipping to its offset, so the
+  decompressed solid unit is never buffered. 7z still buffers its compressed
+  input, and AES members take the buffered CRC/password path.
 
-**Panic containment**: `stream_members` runs its dispatch inside `catch_unwind`
-(like `extract_each`), so a decoder panic (e.g. delharc on crafted LHA) becomes a
-clean `Unscannable`, never a process abort.
+**At every depth.** `deep_analyze` walks any `is_streamable` format through
+`scan_streamed_container` over a `Cursor` of the member, so a small nested
+member decompressing to gigabytes is scanned in full (memory bounded by
+`deep_analysis_max`). Formats with no streaming walk stay on the buffered
+`extract_each` path.
 
-**Not yet streamed** — two categories:
-1. *Convertible (incremental `Read` decoder needed)*: swf, nsis, uuencode, xdp,
-   szdd, screnc, rtf. bzip2/xz are excluded (concatenated-stream boundary needs a
-   whole-buffer scan). These decode sequentially to a `Vec` today.
-2. *Inherently random-access* (the decoder needs the whole decoded object, so
-   only the buffer *size* is boundable, via `max_buffer_bytes`): 7z solid blocks,
-   cab folders, rar LZ window, dmg/iso-as-filesystem crates, ole/pdf/email/chm
-   structured parsers, autoit/upx/pepack, binhex/aimodel/javaclass/vba.
+**Members.** One that fits in `deep_analysis_max` is held and fully analysed.
+A larger one is not materialized: its buffered prefix is chained with the
+still-streaming tail through `stream_core`, and the member is reported
+`LIMITS-EXCEEDED` unless that finds something.
+
+**Panic containment**: `stream_members` runs its dispatch inside
+`catch_unwind`, like `extract_each`, so a decoder panic becomes `Unscannable`.
+
+Every format not in `is_streamable` is buffered: the container is held whole,
+bounded by `max_buffer_bytes`.
 
 ## Why some buffering is unavoidable
 
-A site *must* hold a whole object when:
-- a decoder/parser needs **random access** over the decoded bytes (7z member
-  offsets into a solid block; a ZIP/7z central directory or TOC; PDF xref;
-  filesystem crates over a whole DMG image);
-- **decryption** needs the full ciphertext before it can produce plaintext
-  (ZipCrypto / WinZip-AES / encrypted 7z header);
+A site must hold a whole object when:
+- a decoder or parser needs **random access** over the decoded bytes (a
+  ZIP/7z central directory or TOC, a PDF xref, the filesystem inside a DMG);
+- **decryption** needs the full ciphertext (ZipCrypto, WinZip-AES, an encrypted
+  7z header);
 - an **LZ sliding window** is inherent to the codec (RAR3/RAR5, LZX);
-- a third-party crate's API takes `&[u8]` / returns `Vec<u8>`.
+- a third-party crate's API takes `&[u8]` or returns `Vec<u8>`.
 
-For these, streaming is impossible without replacing the decoder — so the rule is
-**bound the buffer at `max_buffer_bytes`**, not eliminate it.
+There the rule is to bound the buffer at `max_buffer_bytes`, not to eliminate
+it.
 
 ---
 
 ## Enforcement status
 
-### Tier 1 — bounded now (obey `max_buffer_bytes` / `deep_analysis_max`)
+### Bounded by the knob (`max_buffer_bytes` / `deep_analysis_max`)
 
-- **exav-core scan buffers** — `scan_path`, `scan_seekable` (whole top-level file
-  for structural analysis) and `member_stream_scan` (per-member structural
-  prefix) all use `.take(deep_analysis_max + 1).read_to_end`; a larger member is
-  chained through the constant-memory `stream_core`, never materialized.
-- **Streaming member API** — `stream.rs::BudgetReader` caps each member at
-  `budget.reserve()` and errors (never truncates) past it.
-- **`Archive` Lazy/Buffered arms & `Archive::open` buffered fallback**
-  (`lib.rs`) — now read `≤ max_buffer_bytes` and error past it (previously a
-  hardcoded `256*1024*1024` and an unbounded `read_to_end`).
-- **All Class-C per-format sites** (the majority — see table C) — every
-  `Entry.data` and decoded blob goes through `bounded_read(_, cap)` /
-  `bounded_read_salvage` / an explicit `len > cap` check with
-  `cap = budget.reserve() = min(max_extracted_bytes − used, max_buffer_bytes)`.
-- **The former Tier-2 amplifiers — now wired** (each threads
-  `budget.limits.max_buffer_bytes`, or the default limit where the decoder
-  parser carries no `Budget`, and errors past it):
-  - **A2/A3 CAB** — `Cabinet::new`/`Folder::new` take `max_buffer`; each folder
-    and the combined buffer are bounded.
-  - **A5 7z solid block** — `decode_block` uses `bounded_read(_, max_buffer)`.
-  - **A6 7z encoded header/TOC** — `decompress_encoded_header` bounded by the
-    default limit (a header carries no `Budget`; metadata, not a tuning surface).
-  - **A7/A8 7z PPMd** — both the compressed input and the decode-symbol output
-    loop are bounded.
-  - **A9 7z BCJ (x86/arm/arm64)** — each filter threads `max_buffer` and bounds
-    its `read_to_end`.
-  - **A10 UDIF/DMG image** — `decompress_udif(_, max_buffer)` bounded.
-  - **A11/A12 DMG HFS+/APFS files** — each `read_file` result is
-    `reserve()`/`commit()`-checked before `Entry::new`.
-  - **A13 DMG decrypt** — attacker `blocksize` bounded (and zero-guarded).
-  - **A14/A15 ZIP encrypted member** — `read_encrypted_member(_, max_buffer)`
-    caps the ciphertext read; the decrypt copies then inherit that bound.
-  - **A19/A20 ARJ** — whole-archive buffer bounded on entry; the per-member
-    slice is a subset of it.
-  - **A23 VBA** — `decompress`/`build_artifacts` take `cap`; the RLE output and
-    the combined artifact buffers are bounded.
-  - **A24 `ar` name table** — bounded by `max_buffer_bytes`.
-  - **B6 RAR3 window** — the up-to-1 GiB sliding window is rejected if it exceeds
-    `max_buffer_bytes`.
+- **exav-core buffers**: the whole input, a container read for the full engine,
+  and a member's structural prefix are each read up to `deep_analysis_max`; one
+  larger goes through `stream_core` instead.
+- **Streaming member API**: `BudgetReader` caps each member and errors (never
+  truncates) past it.
+- **Per-format member buffers**: every `Entry.data` and decoded blob goes
+  through `bounded_read` / `bounded_read_salvage` or an explicit `len > cap`
+  check, with `cap = budget.reserve() = min(max_extracted_bytes − used,
+  max_buffer_bytes)`. The UDF walk checks a file's size before copying it out,
+  so unwritten extents (zeroes) cost nothing until then.
+- **Decoders that thread `max_buffer`**: CAB (`Cabinet::new`, each folder and the
+  combined buffer), 7z solid blocks, PPMd input and output, BCJ filters, UDIF
+  (`decompress_udif`), DMG HFS+/APFS files (`reserve`/`commit` before
+  `Entry::new`), encrypted ZIP members
+  (`read_encrypted_member`), ARJ (the whole archive on entry), VBA
+  (`decompress`, `build_artifacts`), the `ar` name table, the RAR3 window
+  (rejected past the limit), ISO and UDF directory reads.
+- **Bounded by the default limit, not the knob**: the 7z encoded header (a
+  header carries no `Budget`), the DMG decrypt block size, and
+  `Archive::open`'s buffered fallback, a public API that predates the budget.
 
-### Tier 2 — input-bounded (obey the limit transitively; no separate cap added)
+### Input-bounded
 
-These copy a slice of their **input** buffer, which the caller already caps at
-`max_buffer_bytes` (a member/file passed into the extractor). They therefore
-cannot exceed the limit; no independent guard was added.
+These copy a slice of their input, which the caller already capped at
+`max_buffer_bytes`, so they cannot exceed it:
+- PDF stream bodies and filter working copies (the decoded output is bounded
+  like any member);
+- the RAR3/RAR5 compressed-member copy and its padding;
+- `cab.rs` `repair_cab_size`, a clone of the input CAB to patch 4 bytes.
 
-| id | file:line — fn | what | why already bounded |
-|----|----------------|------|---------------------|
-| A16/A17/A18 | `pdf_parse/parse.rs`, `pdf.rs` — stream bodies | PDF stream body / whole-tail copy / filter working copy | slices of the input PDF (≤ `max_buffer`); decoded *output* is Class C |
-| A21/A22 | `rar3_unpack.rs`, `rar5_unpack.rs` — input pad / PPMd remainder | compressed-member copy (+pad) | copy of `packed`, the compressed member (≤ `max_buffer_bytes`) |
-| A4 | `cab.rs:65` — `repair_cab_size` | clone of input CAB to patch 4 bytes | clone of the input member (≤ `max_buffer`) |
+### Fixed literals, at or below the knob's default
 
-### Tier 3 — remaining hardcoded literals (Class B), lower priority
-
-Bounded today, but by a literal rather than the knob. Left as follow-ups:
-
-- LZ/decompress-run caps: `rar5_unpack.rs` `MAX_WINDOW_SIZE = 64 MiB`; `xar.rs:52`
-  (64 MiB TOC), `udif.rs:28,262` (64 MiB run + xz dict), `chm.rs`, `nsis.rs`,
-  `pdf.rs:182` (4 MiB). These are already ≤ the default `max_buffer_bytes`, so
-  they never *raise* peak memory above the knob's default; routing them through
-  the knob would let an operator *lower* them further.
-- `lib.rs` `256*1024*1024` in the `Archive` Lazy arm → **done** (`max_buffer_bytes`).
-- `PREALLOC_CAP = 16 MiB` — a *prealloc* clamp only (growth is capped elsewhere),
-  not a peak-memory determinant; left as-is.
+Routing these through the knob would only let an operator lower them:
+- `rar5_unpack.rs` `MAX_WINDOW_SIZE` (64 MiB), the `xar.rs` TOC (64 MiB),
+  `udif.rs` runs and xz dictionary (64 MiB);
+- `PREALLOC_CAP` (16 MiB): a pre-allocation clamp only, growth is capped
+  elsewhere;
+- core's JavaScript normaliser output (32 MiB). The raw bytes are scanned in
+  full; when the normalised view is cut, the scan is reported incomplete
+  (`LIMITS-EXCEEDED` unless something is found). The normaliser reads the
+  script in one pass and holds only the output, the identifiers it renamed and
+  the calls still open (at most 256, a `fromCharCode` list as 4-byte values),
+  so the output cap is what bounds it.
 
 ### Excluded by design
 
-- `cache.rs:172` / `cvd.rs` — the **trusted signature DB** payload (not scan
-  input); must be hashed/deserialized whole. Bounded by `CvdLimits` when unpacked.
-- `source.rs` 64 KiB HTTP range block, `Archive::open` 64 KiB detection head,
-  `ole.rs` 8 KiB sniff — fixed small protocol/detection buffers.
-- Protocol constants (deflate 32 KiB dict, Deflate64 64 KiB dict, LZW
-  4096-entry table, 255-byte names)
-  — fixed by the format, not memory-tunable.
-
----
-
-## Full audit tables
-
-<!-- The complete A/B/C classification produced by the materialization audit.
-     A = unbounded, B = hardcoded literal, C = already bounded by budget/limit.
-     Keep this in sync when adding a decoder or changing a buffer. -->
-
-See the "Enforcement status" section above for the actionable A (Tier 2) and B
-(Tier 3) sites. Class C (already compliant) covers every other format: gzip,
-bzip2, zstd, lzip, xz, tar, ZIP cleartext, xar, ole, iso, chm, onenote, cab
-copy-out, rar output, arj output, lha, upx, swf, nsis, pdf decoded output, cpio,
-ar file arm, partition, machofat, szdd, tnef, screnc, uuencode, binhex, pyc, sfx,
-autoit, email, aimodel — each caps its member buffer at `budget.reserve()`.
+- The **trusted signature database** (`exav-core` `database.rs`, `cvd.rs`): not
+  scan input; hashed and deserialized whole, bounded by `CvdLimits` when
+  unpacked.
+- Fixed small protocol and detection buffers: the 64 KiB HTTP range block
+  (`source.rs`), the 64 KiB head `Archive::open` detects from, the typing heads.
+- Format constants: the deflate 32 KiB and Deflate64 64 KiB dictionaries, the
+  4096-entry LZW table, 255-byte names.

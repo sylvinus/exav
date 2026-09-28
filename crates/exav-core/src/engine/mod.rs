@@ -326,7 +326,8 @@ const SCAN_VERIFY_BUDGET: u64 = 64_000_000;
 
 thread_local! {
     /// Set true when a wildcard `verify` is skipped because the per-buffer
-    /// [`SCAN_VERIFY_BUDGET`] pool was exhausted — i.e. the search did NOT fully
+    /// [`SCAN_VERIFY_BUDGET`] pool was exhausted, or when another check marks
+    /// itself short through [`mark_scan_truncated`]: the search did NOT fully
     /// complete. Per exav's cardinal rule (never a silent `Clean` on an
     /// incomplete scan), the top-level scan converts a would-be `Clean` into
     /// `LimitsExceeded` when this is set. Reset at the start of each top-level
@@ -339,16 +340,15 @@ pub fn reset_scan_truncated() {
     SCAN_TRUNCATED.with(|c| c.set(false));
 }
 
-/// Record that a matcher outside this module (YARA's condition step budget)
-/// stopped short, so the scan is reported as incomplete.
-#[cfg_attr(not(feature = "yara"), allow(dead_code))]
+/// Record that a check outside this module (YARA's condition step budget, the
+/// JavaScript view's output cap, the phishing allow-list budget) stopped short,
+/// so the scan is reported as incomplete.
 pub(crate) fn mark_scan_truncated() {
     SCAN_TRUNCATED.with(|c| c.set(true));
 }
 
-/// Did any wildcard verification get skipped this scan because its per-buffer
-/// verify budget was exhausted? If so the scan was INCOMPLETE and must not be
-/// reported `Clean`.
+/// Did any check stop short this scan (see [`SCAN_TRUNCATED`])? If so the scan
+/// was INCOMPLETE and must not be reported `Clean`.
 pub fn scan_was_truncated() -> bool {
     SCAN_TRUNCATED.with(|c| c.get())
 }

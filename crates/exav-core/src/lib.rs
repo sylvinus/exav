@@ -1405,7 +1405,11 @@ fn scan_within<R: Read + Seek>(
     let mut prefix = [0u8; 4096];
     let n = fill_prefix(&mut reader, &mut prefix)?;
     reader.seek(SeekFrom::Start(0))?;
-    let ft = profile::timed("filetype", n as u64, || filetype::identify(&prefix[..n]));
+    let mut ft = profile::timed("filetype", n as u64, || filetype::identify(&prefix[..n]));
+    // An input that fits is typed again from all of it by `analyze`.
+    if size > opts.deep_analysis_max && !streams_natively(ft) {
+        ft = type_unbuffered(&mut reader, ft, opts)?;
+    }
 
     // Natively-streaming containers (ZIP/tar/gzip) are walked member-by-member
     // off the reader: the whole container is never buffered and no
@@ -1444,6 +1448,42 @@ fn scan_within<R: Read + Seek>(
         return Ok(core_hit_report(db, hit, opts));
     }
     Ok(over_deep_analysis_limit(ft, size, opts))
+}
+
+/// Head an input too large to buffer is typed from: through sector 31, the last
+/// a UDF recognition sequence is looked for in. An ISO 9660 descriptor sits
+/// earlier, at 32 KiB.
+const UNBUFFERED_TYPING_HEAD: usize = 32 * 2048 + 6;
+
+/// The type of an input too large to buffer, when more of it than the 4 KiB
+/// `ft` was read from names a container walked off the reader: an ISO 9660 or
+/// UDF image, or a self-extractor, wherever in the first `max_buffer_bytes` its
+/// archive starts. Either would otherwise get the literal pass alone.
+fn type_unbuffered<R: Read + Seek>(
+    reader: &mut R,
+    ft: FileType,
+    opts: &ScanOptions,
+) -> io::Result<FileType> {
+    let mut head = vec![0u8; UNBUFFERED_TYPING_HEAD];
+    let n = fill_prefix(reader, &mut head)?;
+    reader.seek(SeekFrom::Start(0))?;
+    let head = &head[..n];
+    let wide = filetype::identify(head);
+    if streams_natively(wide) {
+        return Ok(wide);
+    }
+    // In memory an executable is walked as an SFX when `detect` says so, which
+    // it does only after ruling out the installers it knows. One named in the
+    // head is left to that.
+    if wide.is_executable() && matches!(unpack::detect(head), None | Some(unpack::Format::Sfx)) {
+        let sfx = unpack::is_sfx(reader, opts.limits.max_buffer_bytes)
+            .map_err(|h| io::Error::other(h.reason))?;
+        reader.seek(SeekFrom::Start(0))?;
+        if sfx {
+            return Ok(FileType::Sfx);
+        }
+    }
+    Ok(ft)
 }
 
 /// The report for a hit of the constant-memory pass.
@@ -3680,17 +3720,14 @@ fn macro_dialect(name: &str) -> Option<&'static str> {
 
 /// Run the opt-in DLP structured-data heuristic over `data`. Returns an
 /// `Infected` outcome with a ClamAV-compatible name when a configured threshold
-/// is met, else `None`. Only runs when a threshold is set, on textual buffers no
-/// larger than `DLP_MAX_BYTES` (to bound cost on hostile input).
+/// is met, else `None`. Only runs when a threshold is set, on textual buffers.
+/// The counters are linear and allocate nothing, so the whole buffer is counted.
 #[cfg(feature = "dlp")]
 fn structured_data_scan(data: &[u8], opts: &ScanOptions, sink: &mut Sink) -> Option<DeepOutcome> {
-    /// Cap on buffer size the structured-data scan runs over.
-    const DLP_MAX_BYTES: usize = 16 * 1024 * 1024;
-
     if opts.structured_cc_count.is_none() && opts.structured_ssn_count.is_none() {
         return None;
     }
-    if data.len() > DLP_MAX_BYTES || !normalize::is_textual(data) {
+    if !normalize::is_textual(data) {
         return None;
     }
     if let Some(threshold) = opts.structured_cc_count {
@@ -3720,8 +3757,8 @@ fn structured_data_scan(data: &[u8], opts: &ScanOptions, sink: &mut Sink) -> Opt
 
 /// Run the opt-in phishing heuristic over `data`. Returns an `Infected` outcome
 /// with a ClamAV-compatible name when a spoofed link is found, else `None`. Only
-/// runs when the flag is set, on textual buffers no larger than `PHISH_MAX_BYTES`
-/// (to bound cost on hostile input).
+/// runs when the flag is set, on textual buffers. A scan that stopped at its
+/// allow-list budget marks the scan incomplete.
 #[cfg(feature = "phishing")]
 fn phishing_scan(
     db: &Scanner,
@@ -3729,17 +3766,17 @@ fn phishing_scan(
     opts: &ScanOptions,
     sink: &mut Sink,
 ) -> Option<DeepOutcome> {
-    /// Cap on buffer size the phishing scan runs over.
-    const PHISH_MAX_BYTES: usize = 16 * 1024 * 1024;
-
     if !opts.alert_phishing {
         return None;
     }
-    if data.len() > PHISH_MAX_BYTES || !normalize::is_textual(data) {
+    if !normalize::is_textual(data) {
         return None;
     }
-    let p = phishing::scan(data, &db.phishing)?;
-    sink.hit(p.signature().to_string(), 0, Method::Heuristic)
+    let (found, complete) = phishing::scan_complete(data, &db.phishing);
+    if !complete {
+        engine::mark_scan_truncated();
+    }
+    sink.hit(found?.signature().to_string(), 0, Method::Heuristic)
 }
 
 /// Core detection over an in-memory buffer: the full `.ndb`/`.ldb` engine
@@ -3835,7 +3872,14 @@ fn normalizations<'a>(ft: FileType, data: &'a [u8]) -> Vec<Box<dyn FnOnce() -> V
     ];
     if looks_like_script(ft, data) {
         v.push(Box::new(move || normalize::javascript(data)));
-        v.push(Box::new(move || jsnorm::normalize(data)));
+        v.push(Box::new(move || {
+            let (view, cut) = jsnorm::normalize(data);
+            // The raw bytes are still scanned in full; only this view is short.
+            if cut {
+                engine::mark_scan_truncated();
+            }
+            view
+        }));
     }
     v
 }

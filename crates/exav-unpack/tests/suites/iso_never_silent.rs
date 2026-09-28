@@ -103,6 +103,27 @@ fn a_corrupt_directory_record_is_reported() {
 }
 
 #[test]
+fn a_corrupt_directory_record_is_reported_when_streamed() {
+    // The scanner walks every ISO through `stream_members`, where the same
+    // record used to end the directory without a word.
+    let mut img = iso(&[("A.TXT", 19, 4)], 200);
+    let p = 18 * SECTOR + 33 + "A.TXT".len();
+    img[p] = 5;
+    let mut unsupported = Vec::new();
+    let mut b = Budget::new(Limits::default());
+    let _ = exav_unpack::stream_members(
+        Format::Iso,
+        std::io::Cursor::new(img),
+        &mut b,
+        &mut |m: &exav_unpack::MemberMeta, _: Option<&mut dyn std::io::Read>, _: &mut Budget| {
+            unsupported.extend(m.unsupported);
+            None::<()>
+        },
+    );
+    assert!(!unsupported.is_empty(), "a corrupt record must be reported");
+}
+
+#[test]
 fn a_well_formed_member_is_still_extracted_normally() {
     // The counterweight: none of the above may make ordinary images noisy.
     let mut img = iso(&[("A.TXT", 19, 5)], 200);

@@ -17,6 +17,7 @@
 //! slice, so hostile input can neither panic nor blow the budget.
 
 use crate::*;
+use std::io::{Read, Seek};
 
 /// Archive magics we look for embedded in an executable stub, each paired with a
 /// short label for diagnostics. The 2-byte ARJ magic is the loosest and can
@@ -68,10 +69,12 @@ fn plausible_arj_header(data: &[u8], off: usize) -> bool {
 }
 
 fn find_embedded_archive(data: &[u8]) -> Option<(usize, &'static str)> {
-    if data.len() < 2 {
-        return None;
-    }
-    let hay = &data[1..]; // past offset 0
+    find_archive_from(data, 1)
+}
+
+/// [`find_embedded_archive`] over the offsets from `from` on.
+fn find_archive_from(data: &[u8], from: usize) -> Option<(usize, &'static str)> {
+    let hay = data.get(from..)?;
     let mut best: Option<(usize, &'static str)> = None;
     for &(sig, name) in SIGS {
         // ARJ's magic is weak enough that the first hit is often noise, so its
@@ -79,10 +82,10 @@ fn find_embedded_archive(data: &[u8]) -> Option<(usize, &'static str)> {
         // other signatures are four bytes or more and are taken as they come.
         let found = if name == "arj" {
             memchr::memmem::find_iter(hay, sig)
-                .map(|rel| rel + 1)
+                .map(|rel| rel + from)
                 .find(|&off| plausible_arj_header(data, off))
         } else {
-            memchr::memmem::find(hay, sig).map(|rel| rel + 1)
+            memchr::memmem::find(hay, sig).map(|rel| rel + from)
         };
         if let Some(off) = found {
             if best.is_none_or(|(b, _)| off < b) {
@@ -102,37 +105,76 @@ pub(crate) fn looks_like_sfx(data: &[u8]) -> bool {
     matches!(find_embedded_archive(data), Some((off, _)) if off > MIN_SFX_OFFSET)
 }
 
-/// Reader-based streaming: find the appended archive's offset by scanning a
-/// bounded prefix (the stub is small), then stream the payload `[off, EOF)` via
+/// Offset of the archive [`find_embedded_archive`] finds in the first `limit`
+/// bytes of `source`, read a window at a time rather than held whole.
+fn payload_offset<R: Read + Seek>(source: &mut R, limit: u64) -> Result<Option<u64>, LimitHit> {
+    /// Bytes read per window.
+    const WINDOW: usize = 1 << 20;
+    /// Kept from one window into the next: the longest magic and the ARJ
+    /// header check after it, so a match across the seam is seen whole.
+    const OVERLAP: usize = 16;
+    source
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
+    let mut buf: Vec<u8> = Vec::new();
+    // Offset of `buf[0]` in the source.
+    let mut base = 0u64;
+    let mut left = limit;
+    loop {
+        let want = (WINDOW as u64).min(left) as usize;
+        let kept = buf.len();
+        buf.resize(kept + want, 0);
+        let n = crate::read_full(source, &mut buf[kept..])?;
+        buf.truncate(kept + n);
+        left -= n as u64;
+        let last = n < want || left == 0;
+        // Offset 0 is the executable's own magic, never its payload.
+        let from = if base == 0 { 1 } else { 0 };
+        if let Some((off, _)) = find_archive_from(&buf, from) {
+            // Near the end of a window a match may be cut short, and an ARJ
+            // candidate before it wrongly passed over; the next window sees
+            // both whole.
+            if last || off + OVERLAP <= buf.len() {
+                return Ok(Some(base + off as u64));
+            }
+        }
+        if last {
+            return Ok(None);
+        }
+        let drop = buf.len() - OVERLAP.min(buf.len());
+        buf.drain(..drop);
+        base += drop as u64;
+    }
+}
+
+/// Whether `source` is an SFX as [`looks_like_sfx`] judges one in memory, with
+/// the archive looked for in its first `limit` bytes.
+pub(crate) fn is_sfx<R: Read + Seek>(source: &mut R, limit: u64) -> Result<bool, LimitHit> {
+    if !starts_with_exe(&crate::read_at(source, 0, 4)?) {
+        return Ok(false);
+    }
+    Ok(payload_offset(source, limit)?.is_some_and(|off| off > MIN_SFX_OFFSET as u64))
+}
+
+/// Reader-based streaming: find the appended archive's offset in a bounded
+/// prefix (the stub is small), then stream the payload `[off, EOF)` via
 /// seek+take — so a self-extracting installer with a multi-gigabyte payload is
 /// scanned without buffering it. Matches [`extract_sfx`]'s single `sfx-payload`
 /// member.
-pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
+pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
     max_buffer: u64,
 ) -> Result<Vec<(String, u64, u64)>, LimitHit> {
-    use std::io::SeekFrom;
     let len = source
-        .seek(SeekFrom::End(0))
+        .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
-    source
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
-    let scan = max_buffer.min(len) as usize;
-    let mut prefix = vec![0u8; scan];
-    let n = crate::read_full(source, &mut prefix)?;
-    prefix.truncate(n);
-    let Some((off, _)) = find_embedded_archive(&prefix) else {
+    let Some(off) = payload_offset(source, max_buffer.min(len))? else {
         return Ok(Vec::new());
     };
-    if off as u64 >= len {
+    if off >= len {
         return Ok(Vec::new());
     }
-    Ok(vec![(
-        "sfx-payload".to_string(),
-        off as u64,
-        len - off as u64,
-    )])
+    Ok(vec![("sfx-payload".to_string(), off, len - off)])
 }
 
 pub(crate) fn extract_sfx<R>(
@@ -200,6 +242,39 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].data.starts_with(b"7z\xBC\xAF\x27\x1C"));
         assert!(entries[0].data.windows(11).any(|w| w == b"MALWARETEST"));
+    }
+
+    /// The windowed search must answer what the whole-buffer one does, wherever
+    /// the archive sits relative to a window seam.
+    #[test]
+    fn the_windowed_search_agrees_with_the_whole_buffer() {
+        const W: usize = 1 << 20;
+        let search = |blob: &[u8], limit: u64| {
+            payload_offset(&mut std::io::Cursor::new(blob), limit).unwrap()
+        };
+        let whole = |blob: &[u8]| find_embedded_archive(blob).map(|(o, _)| o as u64);
+        // An ARJ main header that passes `plausible_arj_header`.
+        let arj = [0x60, 0xEA, 40, 0, 30, 0, 0, 0, 1, 0, 0];
+        // The same header with a ZIP magic inside it. Cut by the seam, the ARJ
+        // candidate fails its check while the ZIP fits, and a search taking
+        // that answer would miss the earlier archive.
+        let mut arj_zip = arj;
+        arj_zip[6..10].copy_from_slice(b"PK\x03\x04");
+        for at in (W - 24..W + 24).chain([100, 2 * W - 3]) {
+            for magic in [&b"PK\x03\x04"[..], &arj[..], &arj_zip[..]] {
+                let blob = mz_stub(magic, at);
+                assert_eq!(search(&blob, blob.len() as u64), whole(&blob), "{at}");
+            }
+            // A bare `60 EA` cut by the seam, then a real archive after it.
+            let mut blob = mz_stub(&[0x60, 0xEA], at);
+            blob.resize(at + 7, 0);
+            blob.extend_from_slice(b"PK\x03\x04");
+            assert_eq!(search(&blob, blob.len() as u64), whole(&blob), "{at}");
+        }
+        // The limit ends the search as the end of the prefix did.
+        let blob = mz_stub(b"PK\x03\x04", 1000);
+        assert_eq!(search(&blob, 1002), None);
+        assert_eq!(search(&blob, 1004), Some(1000));
     }
 
     #[test]

@@ -41,6 +41,7 @@ mod ooxml_container;
 #[cfg(feature = "all-formats")]
 mod oversize_container;
 mod salvage;
+mod size_caps;
 mod tar_size_terminator;
 mod target_flash;
 #[cfg(feature = "all-formats")]

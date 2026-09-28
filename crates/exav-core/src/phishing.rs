@@ -12,8 +12,13 @@
 //! pairs to suppress false positives, and `.pdb` scopes the spoof check to a set
 //! of monitored brands.
 
-/// Cap on anchors examined per document (bounds cost on hostile input).
-const MAX_ANCHORS: usize = 4096;
+/// Longest span one anchor is read over.
+const MAX_ANCHOR_SPAN: usize = 8192;
+
+/// Cap on `.wdb` allow-list lookups per document. Each one runs every `X:`
+/// regex, and a lookup is made only for a link that would otherwise be
+/// reported, so an ordinary document never comes near it.
+const MAX_ALLOW_CHECKS: usize = 4096;
 
 /// Serialisable phishing-DB parts for the prebuilt database: `(protected domains,
 /// `M:` allow-list host pairs, `X:` allow-list regex source pairs)`. Compiled
@@ -83,6 +88,10 @@ impl PhishingDb {
     /// True if nothing was loaded.
     pub fn is_empty(&self) -> bool {
         self.protected.is_empty() && self.allow_hosts.is_empty() && self.allow_regex_src.is_empty()
+    }
+
+    fn has_allow_list(&self) -> bool {
+        !self.allow_hosts.is_empty() || !self.allow_regex.is_empty()
     }
 
     /// Serialisable parts (compiled regexes omitted, rebuilt on load).
@@ -179,43 +188,68 @@ impl Phish {
 /// Scan an HTML/text buffer for a phishing link; consult `db` for allow-listing
 /// and brand scoping (`&PhishingDb::default()` = standalone heuristic).
 pub fn scan(data: &[u8], db: &PhishingDb) -> Option<Phish> {
-    let text = latin1(data);
-    let lower = text.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    let mut anchors = 0usize;
-    while let Some(rel) = lower[cursor..].find("<a ") {
-        if anchors >= MAX_ANCHORS {
-            break;
-        }
-        anchors += 1;
-        let start = cursor + rel;
-        // Bound one anchor's span so a pathological input can't scan the whole doc.
-        let mut end = start.saturating_add(8192).min(text.len());
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let region = &text[start..end];
-        let region_lc = &lower[start..end];
-        cursor = start + 3;
-        if let Some(href) = extract_href(region, region_lc) {
-            let display = extract_display(region, region_lc);
-            if let Some(p) = classify(&href, &display, db) {
-                return Some(p);
-            }
-        }
-    }
-    None
+    scan_complete(data, db).0
 }
 
+/// [`scan`], also saying whether every link was examined: `false` when the
+/// allow-list budget ran out before the end of `data`.
+pub fn scan_complete(data: &[u8], db: &PhishingDb) -> (Option<Phish>, bool) {
+    let mut allow_checks = 0usize;
+    let mut next = find_anchor(data, 0);
+    while let Some(start) = next {
+        next = find_anchor(data, start + 3);
+        // An anchor is read up to the next one at most, so no byte is read for
+        // two anchors and the whole scan stays linear in `data`.
+        let end = next
+            .unwrap_or(data.len())
+            .min(start.saturating_add(MAX_ANCHOR_SPAN));
+        let region = latin1(&data[start..end]);
+        let region_lc = region.to_ascii_lowercase();
+        let Some(href) = extract_href(&region, &region_lc) else {
+            continue;
+        };
+        let display = extract_display(&region, &region_lc);
+        let Some(p) = classify(&href, &display, db) else {
+            continue;
+        };
+        if db.has_allow_list() {
+            if allow_checks == MAX_ALLOW_CHECKS {
+                return (None, false);
+            }
+            allow_checks += 1;
+            if allow_listed(&href, &display, db) {
+                continue;
+            }
+        }
+        return (Some(p), true);
+    }
+    (None, true)
+}
+
+/// Offset of the next `<a ` (case-insensitive) at or after `from`.
+fn find_anchor(data: &[u8], from: usize) -> Option<usize> {
+    let hay = data.get(from..)?;
+    memchr::memchr_iter(b'<', hay)
+        .find(|&i| matches!(hay.get(i + 1..i + 3), Some([b'a' | b'A', b' '])))
+        .map(|i| from + i)
+}
+
+/// True if the `.wdb` allow-list covers this (href, display) pair.
+fn allow_listed(href: &str, display: &str, db: &PhishingDb) -> bool {
+    let Some((_, host)) = split_host(href) else {
+        return false;
+    };
+    let disp_host = display_host(display).unwrap_or_default();
+    db.allowed(href, host, display, &disp_host)
+}
+
+/// The spoof a link shows, before the `.wdb` allow-list is consulted.
 fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
     let (userinfo, host) = split_host(href)?;
     if host.is_empty() {
         return None;
     }
     let disp_host = display_host(display);
-    if !db.is_empty() && db.allowed(href, host, display, &disp_host.clone().unwrap_or_default()) {
-        return None;
-    }
     // Userinfo cloak: `http://paypal.com@evil/` — flag only when the userinfo
     // itself looks like a hostname of a different registered domain.
     if let Some(ui) = userinfo {
@@ -478,6 +512,29 @@ mod tests {
             Some(Phish::SpoofedDomain)
         );
         assert_eq!(scan(html, &db), None);
+    }
+
+    #[test]
+    fn an_anchor_does_not_borrow_the_next_ones_href() {
+        // The first anchor has no href. Reading it over a fixed span took the
+        // second anchor's href and paired it with the first one's text.
+        let html = br#"<a name="top">www.paypal.com</a> <a href="http://evil.example/">here</a>"#;
+        assert_eq!(scan0(html), None);
+    }
+
+    #[test]
+    fn running_out_of_allow_list_checks_is_reported() {
+        let mut db = PhishingDb::default();
+        db.add_text("wdb", "M:info.searscard.com:sears.com\n");
+        let link = br#"<a href="http://info.searscard.com/x">sears.com</a>"#;
+        assert_eq!(
+            scan_complete(&link.repeat(MAX_ALLOW_CHECKS), &db),
+            (None, true)
+        );
+        assert_eq!(
+            scan_complete(&link.repeat(MAX_ALLOW_CHECKS + 1), &db),
+            (None, false)
+        );
     }
 
     #[test]
