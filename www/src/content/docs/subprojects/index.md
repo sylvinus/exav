@@ -1,12 +1,11 @@
 ---
 title: Subprojects
-description: The tools and libraries built alongside the exav scanner, from archive extraction and grep inside archives to the YARA engine, the updater and the WASM builds, each usable on its own.
+description: The tools and libraries built alongside the exav scanner, from archive extraction and grep inside archives to the x86 emulator and the updater library, each usable on its own.
 ---
 
 exav is a workspace of focused pieces rather than one binary. Several are useful
-without ever running a virus scan: the extractor opens more container formats
-than most dedicated tools, the grep searches inside them, and the YARA engine
-runs without a JIT.
+without ever running a virus scan: the extractor opens a long list of container
+formats, and the grep searches inside them.
 
 [Architecture](/concepts/architecture/) covers
 [how they compose](/concepts/architecture/#how-the-crates-compose) and how a scan
@@ -18,7 +17,6 @@ flows through them.
 |---|---|
 | [exav-unpack](/subprojects/exav-unpack/) | Bounded, memory-safe extraction for the full [supported-format list](/reference/formats/), as a Rust library, a CLI, and a WASM module that runs in a browser |
 | [exav-grep](/subprojects/exav-grep/) | grep for the inside of archives: search recursively through zip/rar/7z/tar/iso/OLE/PDF/email members |
-| [exav-update](/subprojects/exav-update/) | A signature-database fetcher usable without the scanner |
 
 ## Libraries
 
@@ -27,6 +25,7 @@ flows through them.
 | [exav-core](/subprojects/exav-core/) | The scanning engine: database parsing, pattern and hash matching, file typing, and the verdict model |
 | [exav-pe-emu](/subprojects/exav-pe-emu/) | A sandboxed x86-32 emulator that unpacks packed Windows executables by running their stub |
 | [exav-x86](/subprojects/exav-x86/) | A decode-only x86-32 instruction decoder with no dependencies, checked against an independent decoder over real samples |
+| [exav-update](/subprojects/exav-update/) | The signature-fetching library behind `--auto-update` |
 
 ## Why they are separate
 

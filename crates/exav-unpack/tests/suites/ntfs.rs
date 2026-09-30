@@ -21,7 +21,8 @@
 //! # then split payload.zip's single run in two and re-apply the MFT fix-ups
 //! ```
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 /// `sha256sum` of what `ntfscat` returns for each file.
 const PAYLOAD: &str = "49c7e4f4b184954a212c78c87c17705cd4c16f0b8c83a5cd6a750369c47957c5";

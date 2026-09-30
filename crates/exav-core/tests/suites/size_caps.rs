@@ -183,9 +183,10 @@ fn an_iso_too_large_to_buffer_is_walked() {
 #[test]
 #[cfg(feature = "all-formats")]
 fn walking_an_input_too_large_to_buffer_still_reports_the_limit() {
-    // Its own bytes got the literal pass only, whatever the walk found in it.
-    // The loader's baseline EICAR signature is ignored, so the payloads in the
-    // fixtures do not count as a find.
+    // Something too large for the limit went unscanned (a member, with no
+    // spill; a PE's structure), whatever the walk found. The loader's baseline
+    // EICAR signature is ignored, so the payloads in the fixtures do not count
+    // as a find.
     let mut l = exav_core::loader::Builder::new();
     l.add_named_bytes("t.ndb", b"Zzz.Never:0:*:deadbeefdeadbeefdead\n", true);
     l.add_named_bytes("t.ign2", b"Eicar-Test-Signature\n", true);

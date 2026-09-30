@@ -27,7 +27,7 @@ path = "src/main.rs"
 # here more than anywhere else in exav: this is the one component where a
 # scanned file supplies control flow rather than data, so the bytes reach the
 # decoder directly and in volume.
-exav-x86 = { path = "../exav-x86", version = "0.0.1" }
+exav-x86 = { path = "../exav-x86", version = "0.0.2" }
 # The emulator looks pages and export traps up once per executed instruction,
 # tens of millions of times per packed file. `HashMap`'s DoS-resistant hasher
 # costs more than the lookup; `FxHashMap` hashes a `u32` key in a multiply and

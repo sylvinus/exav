@@ -10,7 +10,7 @@ for auditability, `unsafe` surface and binary or WASM size. These are Cargo
 ## Default features
 
 ```toml
-default = ["yara", "all-formats", "decrypt", "dlp", "icap"]
+default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap"]
 ```
 
 The default build is pure Rust and links no TLS stack; HTTP is opt-in.
@@ -19,11 +19,12 @@ The default build is pure Rust and links no TLS stack; HTTP is opt-in.
 
 | Feature | In default? | What it adds |
 |---|---|---|
-| `yara` | yes | YARA rule matching through the native engine. Disabling it drops the YARA parser and evaluator. |
+| `yara` | yes | YARA rule matching through the native engine. Disabling it drops the YARA parser and evaluator; rule files then still load but never match, with a warning at load. |
 | `all-formats` | yes | Every archive and container extractor (see below). |
-| `decrypt` | yes | Decryption of encrypted archives (ZIP ZipCrypto/AES, 7z AES, PDF, DMG). |
+| `decrypt` | yes | Decryption of encrypted archives and documents (ZIP ZipCrypto/AES, 7z AES, PDF, DMG, encrypted Office documents). |
 | `dlp` | yes | The structured-data leak heuristics (`--dlp-credit-cards` / `--dlp-ssns`). |
-| `icap` | yes | The [ICAP (RFC 3507) server](/guides/icap/) and its `--icap-*` flags. Pure Rust and `std`-only, so it costs the default build nothing, and it binds no port unless an `icap://` address asks for one. |
+| `phishing` | yes | The phishing heuristic `--detect phishing` runs, and the `.pdb`/`.gdb`/`.wdb` URL lists it reads. |
+| `icap` | yes | The [ICAP (RFC 3507) server](/guides/icap/) and its `--icap-*` flags. Pure Rust, no extra dependencies; binds nothing unless an `icap://` address is given. |
 | `http` | **no** | HTTP(S) support: both halves below, and the only thing that links a TLS stack (`ureq` → `rustls` → `ring`). In `exav-core`, `http` is only the range-request backend (`dep:ureq`); in `exav` it is `http = ["http-scan", "http-update"]`. |
 | `http-scan` | no | Scanning an `http(s)://` argument, and the daemon's `SCANURL` command. |
 | `http-update` | no | Signature auto-update over HTTP (`--sig-sources`, `--db-url`). |
@@ -75,8 +76,9 @@ dispatch. The WASM package keys the same idea on a member name and offers
 
 A crash a caller cannot tell from a clean scan is the worst outcome exav has, and
 it is only observable from outside the process. A panic must come back as a
-reported result rather than a dead process; an abort and a stack overflow are the
-two no in-process boundary can contain, and the tests pin which is which.
+reported result rather than a dead process. An abort or a stack overflow cannot
+be contained inside the process; the tests check that both are reported, not
+taken for clean.
 `make test-native` runs `panic_containment` in `exav-unpack` and the
 `decoder_crash` suite in `exav` with the feature on; without it those tests skip.
 The browser package runs the same checks in `npm run test:e2e`.
@@ -89,14 +91,11 @@ package are built without it, and no default enables it.
 Turn off the defaults and pick what you need:
 
 ```sh
-# Pure-Rust scanner with no TLS stack, no YARA, no DLP
+# Pure-Rust scanner: no TLS, YARA, DLP, phishing or ICAP
 cargo build --release -p exav --no-default-features --features all-formats,decrypt
 
 # A ZIP-only scanner with YARA
 cargo build --release -p exav --no-default-features --features yara,zip
-
-# An updater-only daemon (no SCANURL)
-cargo build --release -p exav --features http-update
 ```
 
 ## Per-format features

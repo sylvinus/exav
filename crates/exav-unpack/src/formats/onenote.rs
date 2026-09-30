@@ -39,79 +39,39 @@ pub(crate) fn is_onenote(data: &[u8]) -> bool {
     data.starts_with(&ONENOTE_HEADER_GUID)
 }
 
-/// Read the `cbLength` (u64) that follows the GUID at `guid_at`, returning the
-/// data start offset and the length clamped to `end` (the bytes available).
-fn record_at(guid_at: usize, cb_source: &[u8], data_start: u64, end: u64) -> Option<(u64, u64)> {
-    let cb_at = guid_at + FILE_DATA_STORE_GUID.len();
-    let cb = cb_source.get(cb_at..cb_at + 8)?;
-    if data_start > end {
-        return None;
-    }
-    let declared = u64::from_le_bytes(cb.try_into().ok()?);
-    let avail = end - data_start;
-    let take = declared.min(avail);
-    (take > 0).then_some((data_start, take))
-}
-
-/// Streaming variant: scan a bounded prefix for embedded-file records and return
-/// each as `(name, offset, size)`; the (possibly large) payload is streamed by
-/// the caller via seek+take.
-pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
-    source: &mut R,
-    max_buffer: u64,
-) -> Result<Vec<(String, u64, u64)>, LimitHit> {
-    use std::io::SeekFrom;
-    let file_len = source
-        .seek(SeekFrom::End(0))
-        .map_err(|e| LimitHit::corrupt(format!("onenote: {e}")))?;
-    let scan = max_buffer.min(file_len) as usize;
-    let prefix = crate::read_at(source, 0, scan)?;
-
-    let mut out = Vec::new();
-    for (idx, guid_at) in memchr::memmem::Finder::new(&FILE_DATA_STORE_GUID)
-        .find_iter(&prefix)
-        .enumerate()
-    {
-        let data_start = (guid_at + FILE_DATA_STORE_GUID.len() + POST_GUID_HEADER) as u64;
-        if let Some((off, len)) = record_at(guid_at, &prefix, data_start, file_len) {
-            out.push((format!("onenote-embedded-{idx}"), off, len));
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn extract_onenote<R>(
-    data: &[u8],
+/// Walk a OneNote section, each embedded file streamed from where it lies.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    for (idx, guid_at) in memchr::memmem::Finder::new(&FILE_DATA_STORE_GUID)
-        .find_iter(data)
-        .enumerate()
-    {
-        let data_start = (guid_at + FILE_DATA_STORE_GUID.len() + POST_GUID_HEADER) as u64;
-        let Some((off, len)) = record_at(guid_at, data, data_start, data.len() as u64) else {
-            continue;
-        };
-        let (off, len) = (off as usize, len as usize);
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let members = stream_offsets(src);
+    crate::stream::stream_stored(&mut crate::source::Reader::new(src), budget, visit, members)
+}
 
-        budget.count_entry()?;
-        let cap = budget.reserve()?;
-        if len as u64 > cap {
-            return Err(LimitHit::new(
-                "onenote embedded file exceeds budget".to_string(),
-            ));
+/// Every embedded-file record as `(name, offset, size)`, the payloads left in
+/// place for the caller to stream. `cbLength` is clamped to the bytes present.
+pub(crate) fn stream_offsets(src: &dyn crate::source::ByteSource) -> Vec<(String, u64, u64)> {
+    let len = src.len();
+    let mut out = Vec::new();
+    let mut from = 0;
+    let mut idx = 0;
+    while let Some(guid_at) = src.find(&FILE_DATA_STORE_GUID, from, len) {
+        from = guid_at + 1;
+        let cb_at = guid_at + FILE_DATA_STORE_GUID.len();
+        let data_start = cb_at + POST_GUID_HEADER;
+        let cb = src.window(cb_at, 8);
+        if cb.len() == 8 && data_start <= len {
+            let declared =
+                u64::from_le_bytes([cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]]);
+            let take = declared.min((len - data_start) as u64);
+            if take > 0 {
+                out.push((format!("onenote-embedded-{idx}"), data_start as u64, take));
+            }
         }
-        let member = data[off..off + len].to_vec();
-        budget.commit(member.len() as u64);
-        if let Some(r) = visit(
-            Entry::new(format!("onenote-embedded-{idx}"), member),
-            budget,
-        ) {
-            return Ok(Some(r));
-        }
+        idx += 1;
     }
-    Ok(None)
+    out
 }
 
 #[cfg(test)]

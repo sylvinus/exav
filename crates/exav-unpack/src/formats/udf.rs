@@ -39,8 +39,8 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::stream::{visit_member, MemberMeta, StreamVisit};
-use crate::{Budget, Entry, LimitHit, Sink};
+use crate::stream::{emit_stream, MemberMeta, Visit};
+use crate::{Budget, LimitHit};
 
 /// UDF descriptors are addressed in 2048-byte sectors regardless of the logical
 /// block size the volume declares.
@@ -921,42 +921,12 @@ fn walk<T>(
     Ok(None)
 }
 
-/// The UDF tree of an in-memory image, as [`Entry`]s.
-pub(crate) fn extract_udf<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-    seen_extents: &mut HashSet<u64>,
-) -> Result<Option<R>, LimitHit> {
-    let max_dir = budget.limits.max_buffer_bytes;
-    let mut img = data;
-    walk(&mut img, max_dir, seen_extents, &mut |img, item| {
-        budget.count_entry()?;
-        Ok(match item {
-            Item::Unreadable { path, size, reason } => {
-                visit(Entry::unsupported(path, size, false, reason), budget)
-            }
-            Item::File { path, size, runs } => {
-                // Checked before the copy: unwritten extents are zeroes that
-                // cost nothing in the image and everything once copied out.
-                let cap = budget.reserve()?;
-                if size > cap {
-                    return Err(LimitHit::new(format!("udf member '{path}' exceeds budget")));
-                }
-                let content = read_runs(img, &runs)?;
-                budget.commit(content.len() as u64);
-                visit(Entry::new(path, content), budget)
-            }
-        })
-    })
-}
-
 /// The UDF tree of a seekable image, each file streamed from its runs. A no-op
 /// when the image carries no UDF recognition sequence.
 pub(crate) fn stream_udf<R: Read + Seek, T>(
     source: &mut R,
     budget: &mut Budget,
-    visit: StreamVisit<T>,
+    visit: Visit<T>,
     seen_extents: &mut HashSet<u64>,
 ) -> Result<Option<T>, LimitHit> {
     let head = crate::read_at(source, 0, RECOGNITION_END)?;
@@ -975,6 +945,7 @@ pub(crate) fn stream_udf<R: Read + Seek, T>(
                 let meta = MemberMeta {
                     name: path,
                     comp_size: size,
+                    size: Some(size),
                     encrypted: false,
                     unsupported: Some(reason),
                 };
@@ -984,6 +955,7 @@ pub(crate) fn stream_udf<R: Read + Seek, T>(
                 let meta = MemberMeta {
                     name: path,
                     comp_size: size,
+                    size: Some(size),
                     encrypted: false,
                     unsupported: None,
                 };
@@ -992,7 +964,7 @@ pub(crate) fn stream_udf<R: Read + Seek, T>(
                     runs: runs.into_iter(),
                     cur: None,
                 };
-                visit_member(&meta, &mut reader, budget, &mut *visit)
+                emit_stream(&meta, &mut reader, budget, &mut *visit)
             }
         }
     })

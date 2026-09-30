@@ -1,24 +1,32 @@
 //! Seekable input backends.
 //!
-//! The engine scans two ways: a sequential `Read` (stdin, a pipe, an S3
-//! streaming GET) drives the constant-memory pattern+hash core, while a
-//! `Read + Seek` source additionally lets [`crate::scan_seekable`] read a
-//! ZIP's central directory and only the entries it extracts.
+//! [`crate::scan_seekable`] reads a `Read + Seek` source by offset, so a
+//! ZIP's central directory and its members are read where they are. A
+//! sequential `Read` (stdin, a pipe) is buffered by the caller first.
 //!
 //! `HttpRangeReader` (enabled with the `http` feature) is a `Read + Seek`
 //! backend over HTTP(S) range requests, so an object on S3 (via a public or
-//! presigned URL) can be scanned without downloading it whole — only the
+//! presigned URL) can be scanned without downloading it whole: only the
 //! ranges the scanner touches are fetched.
 
 #[cfg(feature = "http")]
 mod http {
     use std::io::{self, Read, Seek, SeekFrom};
 
-    /// Bytes fetched per range request (read-ahead block size).
+    /// Bytes fetched by a range request that does not continue the previous
+    /// one.
     const BLOCK: u64 = 64 * 1024;
 
+    /// Most bytes one range request fetches.
+    const MAX_BLOCK: u64 = 8 * 1024 * 1024;
+
     /// A `Read + Seek` view over an HTTP(S) resource, served by range
-    /// requests with a one-block read-ahead cache.
+    /// requests, the last one's bytes kept.
+    ///
+    /// A request that continues the previous one fetches twice as much, up to
+    /// [`MAX_BLOCK`]: a pass through the object costs a request per 8 MiB
+    /// rather than per 64 KiB, while reads scattered through it (a ZIP's
+    /// directory, then its members) stay small.
     pub struct HttpRangeReader {
         agent: ureq::Agent,
         url: String,
@@ -79,12 +87,18 @@ mod http {
         }
 
         fn fetch_block(&mut self, start: u64) -> io::Result<()> {
+            let continues =
+                !self.block.is_empty() && start == self.block_start + self.block.len() as u64;
+            let size = match continues {
+                true => (self.block.len() as u64 * 2).min(MAX_BLOCK),
+                false => BLOCK,
+            };
             self.block.clear();
             self.block_start = start;
             if start >= self.len {
                 return Ok(());
             }
-            let last = (start + BLOCK).min(self.len) - 1;
+            let last = (start + size).min(self.len) - 1;
             let resp = self
                 .agent
                 .get(&self.url)
@@ -92,7 +106,7 @@ mod http {
                 .call()
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let mut buf = Vec::new();
-            resp.into_reader().take(BLOCK).read_to_end(&mut buf)?;
+            resp.into_reader().take(size).read_to_end(&mut buf)?;
             self.bytes_fetched += buf.len() as u64;
             self.requests += 1;
             self.block = buf;
@@ -106,13 +120,19 @@ mod http {
                 return Ok(0);
             }
             if !self.cached(self.pos) {
-                let aligned = (self.pos / BLOCK) * BLOCK;
-                self.fetch_block(aligned)?;
+                let next = self.block_start + self.block.len() as u64;
+                // Read on from the previous request, or from the aligned block
+                // holding a position elsewhere.
+                let start = match self.pos == next {
+                    true => next,
+                    false => (self.pos / BLOCK) * BLOCK,
+                };
+                self.fetch_block(start)?;
             }
             let off = (self.pos - self.block_start) as usize;
             if off >= self.block.len() {
                 // `self.pos < self.len` was established above, so the object is
-                // NOT finished — the server just did not give us the bytes it
+                // NOT finished; the server just did not give us the bytes it
                 // said existed (a short 206, a range it declined to honour, a
                 // truncated body). Returning `Ok(0)` here would report EOF, and
                 // every reader upstream would treat the object as merely

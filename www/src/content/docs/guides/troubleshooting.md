@@ -6,13 +6,19 @@ description: Common exav questions and problems, from the no-database refusal an
 See also [Verdicts & exit codes](/reference/verdicts/) and
 [Configuration](/reference/configuration/).
 
-## "No signature database loaded — refusing to run"
+## "No signature database loaded, refusing to run"
 
 exav refuses to scan without a real signature database rather than answer every
-file `OK` against near-zero coverage. Point `-d`/`--sig-dir` at a directory (or a
-prebuilt `.exavdb`) containing real signatures; see
-[Signatures](/guides/signatures/). The built-in EICAR-only baseline is available
-for testing with `--allow-no-db` (`EXAV_ALLOW_NO_DB=1`).
+file `OK` against near-zero coverage. Point `-d`/`--database` at a directory of
+signatures or at a prebuilt `.exavdb` file, or put signatures in `--sig-dir`
+(default `/var/lib/exav`); see [Signatures](/guides/signatures/). The built-in
+EICAR-only baseline is available for testing with `--allow-no-db`
+(`EXAV_ALLOW_NO_DB=1`).
+
+## "unsupported database version N (this build expects M)"
+
+A prebuilt `.exavdb` is tied to the exav version that built it. After upgrading,
+rebuild it with `--build-db` from the raw signatures.
 
 ## exav exits `3` on files ClamAV called clean
 
@@ -26,25 +32,33 @@ In CI, treat `3` as "not a pass". A scanner failure is still `2`, as in ClamAV.
 three codes rather than four.
 
 For a differential run against `clamscan`, `--clamav-compat` matches its limits
-and its answer here: it implies `--partial-as ok`, so the two agree file for
-file. An explicit `--partial-as` after it wins.
+and its answer here: it implies `--partial-as ok`. An explicit `--partial-as`
+wins.
 
-## A large file comes back `LIMITS-EXCEEDED`
+## A file comes back `LIMITS-EXCEEDED`
 
-A file over `--max-object-bytes` (256 MiB by default) is only checked against
-literal signatures and whole-file hashes, so unless one of those matches it is
-reported `LIMITS-EXCEEDED`. Raise `--max-object-bytes` to give it the full
-engine, at the cost of memory. See [Streaming & memory](/concepts/streaming-memory/).
+The reason names the limit that stopped the scan; raise that one. The flags bound
+different things, and raising the wrong one changes nothing (see
+[which one do I change](/reference/limits/#which-one-do-i-change)).
+
+The common case is a large file. One over `--max-object-bytes` (256 MiB by
+default) gets the full engine, but the checks that parse a file whole (a PE's
+structure, YARA's `pe` module, a RAR, 7z or OLE container) do not run on it.
+With `--spill-dir off` leaving nowhere to write them, neither do the text views
+of a large text file (the HTML and script forms signatures are written against),
+and an archive member that decodes past the limit is not scanned. Raise
+`--max-object-bytes` to have those checks run, at the cost of memory. See
+[Streaming & memory](/concepts/streaming-memory/).
 
 ## A file came back `PASSWORD-PROTECTED` or `UNSCANNABLE`
 
 - **`PASSWORD-PROTECTED`**: an encrypted member. Supply passwords with
-  `--passwords` (repeatable) or a `.pwdb` database in the signature directory,
-  then scan again. See
+  `--passwords` (repeatable), `--passwords-from FILE` or a `.pwdb` database in
+  the signature directory, then scan again. See
   [Migrating from ClamAV](/guides/migrating-from-clamav/#4-encrypted-archives--passwords).
 - **`UNSCANNABLE`**: the container was recognised but could not be decoded (an
-  unsupported codec, a RAR member split across volumes, a read error). Inspect it
-  manually.
+  unsupported codec, a RAR member split across volumes, a compressed stream
+  damaged part way). Inspect it manually.
 
 ## exav uses a lot of memory when loading signatures
 
@@ -52,7 +66,7 @@ Building the in-memory automaton from a large raw signature set takes several GB
 for a short time. Do it once: build a [prebuilt `.exavdb`](/guides/prebuilt-database/)
 on a capable host and load that everywhere, with a fraction of the RAM and a fast
 start. Memory during a scan is a separate matter, bounded by `--max-object-bytes`
-and `--max-extracted-bytes`.
+and `--max-process-bytes` (see [sizing a server](/guides/sizing/)).
 
 ## Handling false positives
 
@@ -62,6 +76,13 @@ directory:
 
 - `.fp` / `.sfp`: an allowlist by file hash (this file is trusted).
 - `.ign` / `.ign2`: an ignore list by signature name (this signature is off).
+
+For example, to trust one file:
+
+```sh
+f=trusted.bin
+echo "$(md5sum "$f" | cut -d' ' -f1):$(stat -c%s "$f"):trusted-bin" >> /var/lib/exav/local.fp
+```
 
 Report a suspected false positive to the author of the signature (the feed it
 came from); exav runs signatures, it does not write them.
@@ -88,5 +109,6 @@ YARA `.yar`/`.yara` files are often the easiest route for custom rules (see
 
 exav refuses the clamd `SHUTDOWN` command by default, so a client that can reach
 the socket cannot stop the daemon. Stop it from the host (a signal, the service
-manager), or set `EXAV_ALLOW_SHUTDOWN=1` to honour the command. See
+manager), or pass `--allow-shutdown` (`EXAV_ALLOW_SHUTDOWN=1`) to honour the
+command. See
 [Security](/project/security/#daemon-exposure).

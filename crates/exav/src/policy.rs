@@ -64,8 +64,8 @@ pub(crate) fn apply(report: &mut ScanReport, policy: PartialAs) {
             // Loud, per object. A pass an operator configured is a risk they
             // accepted; a pass they cannot count is one they cannot review.
             eprintln!(
-                "exav: reporting an object that could not be fully examined as OK ({tag}: {}) \
-                 — --partial-as says so",
+                "exav: reporting an object that could not be fully examined as OK ({tag}: {}), \
+                 as --partial-as says",
                 report.verdict.detail().unwrap_or_default()
             );
             report.verdict = Verdict::Clean;

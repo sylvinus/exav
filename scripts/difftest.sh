@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # exav vs ClamAV differential testing, in three separable phases.
 #
-#   1. clamd over the corpus  -> results-clam.tsv   (CACHED — see below)
+#   1. clamd over the corpus  -> results-clam.tsv   (CACHED, see below)
 #   2. exav  over the corpus  -> results-exav.tsv
 #   3. compare the two tables
 #
@@ -9,7 +9,7 @@
 #
 #   * **ClamAV does not change.** Its verdicts are a function of the signature
 #     database, which is pinned here. Re-scanning 18k files through it on every
-#     exav change is pure waste — so phase 1 writes a cache and later runs skip
+#     exav change is pure waste, so phase 1 writes a cache and later runs skip
 #     straight to phase 2. Phase 1 is the slow one; you pay it once.
 #   * **Only one engine is resident at a time.** The old harness ran both
 #     daemons together. On a small host that is ~2 GB of clamd plus ~1 GB of
@@ -24,7 +24,7 @@
 # difference in results cannot come from a difference in how they were asked.
 # Every scan is ALL-MATCH: a verdict is the SET of signatures that matched, not
 # whichever one an engine reached first. Comparing first-matches is the single
-# largest source of fake disagreement — both engines find the malware, each
+# largest source of fake disagreement: both engines find the malware, each
 # names a different signature, and the diff calls it a conflict.
 #
 # USAGE
@@ -46,7 +46,7 @@
 # phase 1 has run for a given manifest only exav is re-paid.
 #
 # LIMIT picks a deterministic sample (fixed seed), and BOTH engines scan exactly
-# that list — the manifest is generated once and shared. A sampled run that gave
+# that list: the manifest is generated once and shared. A sampled run that gave
 # each engine its own random subset would compare different files and call the
 # result a difference.
 set -u
@@ -62,7 +62,7 @@ MAXSZ="${MAXSZ:-20971520}"            # skip files > 20 MB
 # Per-file cap. Generous on purpose: under all-match neither engine may stop at
 # the first hit, so a single xlsx or 7z is a full walk of every member, and the
 # disk here reads cold data at ~8.6 MB/s. A tight cap does not make the run
-# faster — it converts slow files into ERROR rows, which is worse than waiting
+# faster; it converts slow files into ERROR rows, which is worse than waiting
 # because they then look like a compliance difference.
 TMO="${TMO:-120}"
 CLAMD_START_TMO="${CLAMD_START_TMO:-900}"  # clamd DB load can take minutes
@@ -71,8 +71,8 @@ FRESH_CLAM="${FRESH_CLAM:-0}"
 COMPAT="${COMPAT:-1}"                 # exav at --clamav-compat (apples-to-apples)
 HEURISTICS="${HEURISTICS:-1}"         # opt-in alert classes, BOTH engines
 SHOW="${SHOW:-15}"                    # examples per bucket in the report
-# Concurrent scans. Both engines run at the SAME value — that is what keeps the
-# two runs comparable at all — and clamd's own thread pool is sized to match.
+# Concurrent scans. Both engines run at the SAME value (that is what keeps the
+# two runs comparable at all), and clamd's own thread pool is sized to match.
 #
 # Default: 2x CPUs, capped at 8. Measured on cold data (see difftest-scan.py),
 # concurrency is worth ~1.75x rather than the job count, because the disk is the
@@ -116,7 +116,7 @@ PROFILE="COMPAT=$COMPAT HEURISTICS=$HEURISTICS JOBS=$JOBS"
 
 # The FILE LIST is part of that identity, not just the flags. The cached clam
 # table is skipped on row count alone, so a cache holding the right NUMBER of
-# rows for the wrong files would be reused and then joined against exav's — and
+# rows for the wrong files would be reused and then joined against exav's, and
 # the join is by path, so the overlap is empty and the run reports on nothing.
 # LIMIT/SEED are not enough on their own either: the corpus itself changes as
 # samples are added. Fingerprint the manifest that was actually scanned.
@@ -130,7 +130,7 @@ say() { echo "[$(date '+%H:%M:%S')] $*"; }
 cleanup() {
   # Save the container's log BEFORE removing it. Removing first is what turned
   # a startup failure into "FATAL: clamd socket never appeared" with no way to
-  # find out why — the evidence was deleted by the handler reporting the error.
+  # find out why: the evidence was deleted by the handler reporting the error.
   if docker inspect "$CONTAINER" >/dev/null 2>&1; then
     docker logs "$CONTAINER" >"$TMPROOT/difftest-clamd.log" 2>&1 || true
   fi
@@ -143,13 +143,13 @@ trap cleanup EXIT
 # ── Signatures ───────────────────────────────────────────────────────────────
 # daily.cvd ONLY, deliberately: both engines must load exactly the same set or
 # the comparison is meaningless. `freshclam` also fetches main.cvd, so it is
-# removed again — which also keeps the exav database build to ~340k signatures
+# removed again, which also keeps the exav database build to ~340k signatures
 # instead of 3.6M, the difference between building and being OOM-killed here.
 #
 # Called by the phases that need it rather than run up front. Two of them do:
 # clamd loads this directory, and building the exav database reads it. Neither
-# applies to `PHASE=exav` against an already-built `$DB` — the documented way to
-# iterate on exav — and fetching there would make the fast path depend on docker
+# applies to `PHASE=exav` against an already-built `$DB` (the documented way to
+# iterate on exav), and fetching there would make the fast path depend on docker
 # and a network it has no use for.
 need_signatures() {
   [ -f "$DBDIR/daily.cvd" ] && return 0
@@ -167,8 +167,8 @@ build_manifest() {
   # `shuf` with a fixed random source so a sampled run is reproducible: the same
   # LIMIT and SEED select the same files, which is what makes two runs
   # comparable at all.
-  # `find -printf` gives size and path in ONE pass. The obvious version — pipe
-  # paths into a shell loop and `stat` each — spawns a process per file and took
+  # `find -printf` gives size and path in ONE pass. The obvious version (pipe
+  # paths into a shell loop and `stat` each) spawns a process per file and took
   # 3m47s over 18.5k files, which is longer than scanning a good few of them.
   find "$CORPUS" -type f \
     ! -name '*.py' ! -name '*.sh' ! -name '*.json' ! -name '*.md' \
@@ -188,7 +188,7 @@ build_manifest() {
   # An empty manifest is not an empty run: every later phase "succeeds" over
   # nothing and the report reads as a clean sweep. Fail where the cause is
   # visible (wrong CORPUS, everything over MAXSZ, a find that matched nothing).
-  [ "$n" -gt 0 ] || { echo "FATAL: manifest is empty — is CORPUS=$CORPUS right, and MAXSZ=$MAXSZ not excluding everything?"; exit 1; }
+  [ "$n" -gt 0 ] || { echo "FATAL: manifest is empty. Is CORPUS=$CORPUS right, and MAXSZ=$MAXSZ not excluding everything?"; exit 1; }
   say "manifest: $n files"
 }
 
@@ -198,7 +198,7 @@ check_cache() {
   local tsv=$1 stamp="$1.profile" now
   now="$(current_profile)"
   if [ -f "$tsv" ] && [ -s "$stamp" ] && [ "$(cat "$stamp")" != "$now" ]; then
-    say "WARNING: $tsv was built under [$(cat "$stamp")], now [$now] — discarding"
+    say "WARNING: $tsv was built under [$(cat "$stamp")], now [$now]: discarding"
     rm -f "$tsv"
   fi
   printf '%s' "$now" > "$stamp"
@@ -221,10 +221,10 @@ phase_clam() {
   if [ -f "$CLAM_TSV" ]; then
     have=$(awk -F'\t' 'NR>1 && $3!="ERROR"' "$CLAM_TSV" | wc -l)
     if [ "$have" -ge "$todo" ]; then
-      say "phase 1: clam results already cached ($have answered rows) — skipping"
+      say "phase 1: clam results already cached ($have answered rows), skipping"
       return 0
     fi
-    say "phase 1: cache has $have answered of $todo — rescanning the rest"
+    say "phase 1: cache has $have answered of $todo, rescanning the rest"
   fi
 
   say "phase 1: starting clamd"
@@ -241,7 +241,7 @@ MaxScanSize 2000M
 MaxFileSize 2000M
 CONF
   # Without this clamd REFUSES ALLMATCHSCAN, and the refusal looks like a clean
-  # file — every reply would read OK and the whole run would be silently void.
+  # file: every reply would read OK and the whole run would be silently void.
   echo "AllowAllMatchScan yes" >> "$conf"
   if [ "$HEURISTICS" = 1 ]; then
     cat >> "$conf" <<'HEUR'
@@ -269,7 +269,7 @@ HEUR
     "$IMAGE" --foreground --config-file=/etc/clamav/clamd.conf >/dev/null || {
       echo "FATAL: could not start the clamd container"; exit 1; }
   # clamd loads ~340k signatures before it binds the socket, and with the alert
-  # classes on it took 7 MINUTES here — a 3-minute wait failed the run for no
+  # classes on it took 7 MINUTES here, and a 3-minute wait failed the run for no
   # reason. Wait generously: the cost of waiting is nothing next to the cost of
   # a wasted phase.
   local waited=0
@@ -284,12 +284,12 @@ HEUR
   [ -S "$CSOCK" ] || {
     echo "FATAL: clamd socket never appeared after ${CLAMD_START_TMO}s"
     docker logs "$CONTAINER" 2>&1 | tail -20; exit 1; }
-  say "phase 1: clamd ready after ${waited}s — scanning"
+  say "phase 1: clamd ready after ${waited}s, scanning"
 
   python3 scripts/difftest-scan.py --socket "$CSOCK" --manifest "$MANIFEST" \
     --out "$CLAM_TSV" --timeout "$TMO" --jobs "$JOBS" --label clam
 
-  # Save the log BEFORE removing the container — `cleanup()` also does this, but
+  # Save the log BEFORE removing the container. `cleanup()` also does this, but
   # only on script EXIT, by which time this `rm` has already destroyed the
   # evidence. The log is the sole record of clamd's own bail-outs (a single run
   # showed 119 bytecode-interpreter timeouts on one program, plus hundreds of
@@ -297,10 +297,10 @@ HEUR
   # that are otherwise unattributable.
   docker logs "$CONTAINER" >"$TMPROOT/difftest-clamd.log" 2>&1 || true
   # A daemon that died mid-run turns every remaining file into an ERROR row, and
-  # a stale socket makes those fail instantly — so the run *finishes*, fast, with
+  # a stale socket makes those fail instantly, so the run *finishes*, fast, with
   # a table full of holes. Say so plainly; the row count alone looks like success.
   if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
-    say "WARNING: clamd was NOT running at the end of the phase — it died mid-run."
+    say "WARNING: clamd was NOT running at the end of the phase: it died mid-run."
     say "         Re-run PHASE=clam to retry the ERROR rows; see $TMPROOT/difftest-clamd.log"
     say "         If it was OOM-killed (log ends mid-line, no shutdown message), raise MEMORY=$MEMORY."
   fi
@@ -312,7 +312,7 @@ HEUR
 phase_exav() {
   [ -x "$EXAV" ] || { echo "FATAL: $EXAV not built (cargo build --release -p exav)"; exit 1; }
   # A rebuilt exav can bump the database format, making a stale database
-  # unloadable — but `--build-db` needs several GB of RAM, so do NOT rebuild
+  # unloadable, but `--build-db` needs several GB of RAM, so do NOT rebuild
   # merely because the binary is newer. Rebuild when it is missing or fails to
   # LOAD, which is the failure that actually matters.
   local need=0
@@ -320,7 +320,7 @@ phase_exav() {
   elif [ "$EXAV" -nt "$DB" ]; then
     mkdir -p "$SOCK_DIR"; : > "$SOCK_DIR/.probe"
     "$EXAV" -d "$DB" "$SOCK_DIR/.probe" >/dev/null 2>&1 \
-      && { say "phase 2: database older than the binary but loads — reusing"; touch "$DB"; } \
+      && { say "phase 2: database older than the binary but loads, reusing"; touch "$DB"; } \
       || need=1
   fi
   if [ "$need" = 1 ]; then
@@ -334,8 +334,8 @@ phase_exav() {
       echo "FATAL: exav database build failed (it needs several GB of FREE RAM)"; exit 1; }
   fi
 
-  # exav's results are NOT cached across binaries — that is the entire reason for
-  # re-running it — so the table is rebuilt unless the caller kept it on purpose.
+  # exav's results are NOT cached across binaries (that is the entire reason for
+  # re-running it), so the table is rebuilt unless the caller kept it on purpose.
   [ "${KEEP_EXAV:-0}" = 1 ] || rm -f "$EXAV_TSV"
   check_cache "$EXAV_TSV"
 
@@ -343,12 +343,12 @@ phase_exav() {
   # the same budget the client waits. Both matter, and getting either wrong is
   # invisible in the results:
   #
-  #   * exav preforks one worker PER CORE by default — 2 here. Sending 4
+  #   * exav preforks one worker PER CORE by default: 2 here. Sending 4
   #     concurrent scans meant half of them sat in the accept queue behind a
   #     long job and timed out having never been looked at. That records as
   #     ERROR, which reads as a compliance difference and is not one. Measured:
   #     27 of 40 files "failed" this way, with 13 worker deaths.
-  #   * `--max-scan-time` defaults to 120s. If the client's own timeout is
+  #   * `--max-scan-secs` defaults to 120. If the client's own timeout is
   #     longer, a killed worker looks like a slow file; if shorter, the client
   #     gives up on work the daemon then completes for nobody. Keep them equal.
   #     `--max-scan-secs` takes whole seconds, so a fractional TMO is rounded
@@ -360,7 +360,7 @@ phase_exav() {
   local flags="--workers $JOBS --max-scan-secs $max_scan_secs"
   [ "$COMPAT" = 1 ] && flags="$flags --clamav-compat"
   # Cover every alert class clamd was configured with. Anything clamd is asked
-  # to alert on and exav is not becomes a fake FN — the file is bucketed as
+  # to alert on and exav is not becomes a fake FN: the file is bucketed as
   # "clam detected, exav did not" when exav was never asked to look. Measured
   # before these were added: 150 of 258 FNs, dominated by 119
   # Heuristics.Broken.Executable and 33 Heuristics.Limits.Exceeded.*.
@@ -373,7 +373,7 @@ phase_exav() {
   # AlertEncryptedDoc and AlertExceedsMax actually are: ClamAV reports both as
   # `Heuristics.* FOUND`, so exav has to as well or the same file is a PARTIAL
   # here and a detection there. `unscannable` is deliberately left at the
-  # default — ClamAV has no flag for it, so making it a detection would invent a
+  # default: ClamAV has no flag for it, so making it a detection would invent a
   # disagreement rather than remove one.
   #
   # Keep both in step with the AlertX lines in the clamd conf above; they are
@@ -390,7 +390,7 @@ phase_exav() {
   for _ in $(seq 1 60); do [ -S "$ESOCK" ] && break; sleep 2; done
   [ -S "$ESOCK" ] || {
     echo "FATAL: exav socket never appeared:"; tail -5 "$TMPROOT/difftest-exav-daemon.log"; exit 1; }
-  say "phase 2: exav ready — scanning"
+  say "phase 2: exav ready, scanning"
 
   python3 scripts/difftest-scan.py --socket "$ESOCK" --manifest "$MANIFEST" \
     --out "$EXAV_TSV" --timeout "$TMO" --jobs "$JOBS" --label exav
@@ -400,9 +400,12 @@ phase_exav() {
   # got to answer", and they are only visible here.
   # `grep -c` prints 0 AND exits 1 when nothing matches, so `|| echo 0` would
   # make this "0\n0" and the numeric test below an error. Assign on failure.
+  # A worker recycled at its job limit, or retired by a reload, answered
+  # everything it was given.
   local dead
-  dead=$(grep -c "worker .* exited" "$TMPROOT/difftest-exav-daemon.log" 2>/dev/null) || dead=0
-  [ "$dead" -gt 0 ] && say "NOTE: $dead worker exits (timeout/OOM) — see $TMPROOT/difftest-exav-daemon.log"
+  dead=$(grep "worker .* exited" "$TMPROOT/difftest-exav-daemon.log" 2>/dev/null \
+    | grep -vc "exited: recycled\|exited: retired") || dead=0
+  [ "$dead" -gt 0 ] && say "NOTE: $dead worker deaths (timeout/OOM/abort), see $TMPROOT/difftest-exav-daemon.log"
 }
 
 # ── Phase 3: compare ─────────────────────────────────────────────────────────

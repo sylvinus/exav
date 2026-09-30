@@ -11,7 +11,7 @@ use super::*;
 /// A subsignature parsed but not yet committed to the engine.
 pub(super) enum ParsedSub {
     Bodies(Vec<Compiled>),
-    Pcre(PcreSub),
+    Pcre(Box<PcreSub>),
     Bcomp(BcompSub),
     /// `fuzzy_img#<hash>[#<dist>]`: the 8-byte perceptual hash and the max Hamming
     /// distance (0 when unspecified) at which the scanned image's hash matches.
@@ -62,7 +62,7 @@ pub(super) fn classify_subsig(s: &str) -> Option<ParsedSub> {
         return Some(ParsedSub::Bcomp(b));
     }
     if s.contains('/') {
-        return parse_pcre_subsig(s).map(ParsedSub::Pcre);
+        return parse_pcre_subsig(s).map(|p| ParsedSub::Pcre(Box::new(p)));
     }
     parse_subsig(s).map(ParsedSub::Bodies)
 }
@@ -152,6 +152,8 @@ pub(super) fn parse_pcre_subsig(s: &str) -> Option<PcreSub> {
         re: std::sync::OnceLock::new(),
         fancy: std::sync::OnceLock::new(),
         prefilter: std::sync::OnceLock::new(),
+        stream_re: std::sync::OnceLock::new(),
+        stream_prefilter: std::sync::OnceLock::new(),
     })
 }
 

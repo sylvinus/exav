@@ -88,10 +88,11 @@ const MAX_UNIMPLEMENTED_CALLS: u32 = 64;
 /// run can end is a number here, and a run that hits any of them stops and
 /// reports rather than continuing on a guess.
 ///
-/// An embedder should set these deliberately. [`Default`] is tuned for the scan
-/// path, where the emulator is one stage among many and a stub that misbehaves
-/// should cost little; a triage tool that wants to watch a single sample to its
-/// conclusion will want larger budgets and `trace` on.
+/// An embedder should set these deliberately. [`Default`] suits one sample on
+/// its own; exav's scan path sets tighter budgets, since there the emulator is
+/// one stage among many and a stub that misbehaves should cost little. A triage
+/// tool that wants to watch a single sample to its conclusion may want larger
+/// budgets still, and `trace` on.
 ///
 /// The bounds are independent, and a stub defeats the emulator by reaching any
 /// one of them. Raising a single limit rarely changes an outcome on its own.

@@ -12,6 +12,7 @@ use std::rc::Rc;
 use memchr::memchr_iter;
 
 use super::FuncId;
+use crate::byte_source::ByteSource;
 use crate::yara::ir::Value;
 
 type ByteDistribution = [u64; 256];
@@ -22,7 +23,7 @@ pub(crate) fn root() -> Value {
     Value::Struct(Rc::new(HashMap::new()))
 }
 
-pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
+pub(crate) fn call(func: FuncId, data: &dyn ByteSource, args: &[Value]) -> Option<Value> {
     use FuncId::*;
     match func {
         MathMin => Some(Value::Int(i64::min(args[0].to_i64()?, args[1].to_i64()?))),
@@ -54,7 +55,11 @@ pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
             // identical to the yara-x port that lived here (same 0..=255 count
             // iteration order, same `p * log2(p)` accumulation, same empty→0.0),
             // so the difftest against yara-x stays at 0 disagreements.
-            Some(Value::Float(crate::pe::shannon_entropy(&data[start..end])))
+            let dist = range_distribution(data, start, end);
+            Some(Value::Float(crate::pe::entropy_of_counts(
+                &dist,
+                end - start,
+            )))
         }
         MathEntropyStr => Some(Value::Float(crate::pe::shannon_entropy(
             args[0].as_bytes()?,
@@ -62,7 +67,7 @@ pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
 
         MathMeanData => {
             let (start, end) = data_range(data, args[0].to_i64()?, args[1].to_i64()?)?;
-            let dist = byte_distribution(&data[start..end]);
+            let dist = range_distribution(data, start, end);
             Some(Value::Float(mean_from_distribution(&dist, end - start)?))
         }
         MathMeanStr => Some(Value::Float(mean(args[0].as_bytes()?)?)),
@@ -70,7 +75,7 @@ pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
         MathDeviationData => {
             let (start, end) = data_range(data, args[0].to_i64()?, args[1].to_i64()?)?;
             let mean = args[2].to_f64()?;
-            let dist = byte_distribution(&data[start..end]);
+            let dist = range_distribution(data, start, end);
             Some(Value::Float(deviation_from_distribution(
                 &dist,
                 end - start,
@@ -83,35 +88,45 @@ pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
         }
 
         MathSerialCorrelationData => {
-            let s = slice_range(data, args[0].to_i64()?, args[1].to_i64()?)?;
-            Some(Value::Float(serial_correlation(s)?))
+            let (start, end) = data_range(data, args[0].to_i64()?, args[1].to_i64()?)?;
+            let mut sc = SerialCorrelation::default();
+            data.chunks(start, end, &mut |_, c| {
+                sc.feed(c);
+                true
+            });
+            Some(Value::Float(sc.finish()))
         }
-        MathSerialCorrelationStr => Some(Value::Float(serial_correlation(args[0].as_bytes()?)?)),
+        MathSerialCorrelationStr => Some(Value::Float(serial_correlation(args[0].as_bytes()?))),
 
         MathMonteCarloPiData => {
-            let s = slice_range(data, args[0].to_i64()?, args[1].to_i64()?)?;
-            Some(Value::Float(monte_carlo_pi(s)?))
+            let (start, end) = data_range(data, args[0].to_i64()?, args[1].to_i64()?)?;
+            let mut mc = MonteCarloPi::default();
+            data.chunks(start, end, &mut |_, c| {
+                mc.feed(c);
+                true
+            });
+            Some(Value::Float(mc.finish()?))
         }
         MathMonteCarloPiStr => Some(Value::Float(monte_carlo_pi(args[0].as_bytes()?)?)),
 
         MathCountRange => {
             let byte: u8 = args[0].to_i64()?.try_into().ok()?;
-            let s = slice_range(data, args[1].to_i64()?, args[2].to_i64()?)?;
-            Some(Value::Int(memchr_iter(byte, s).count() as i64))
+            let (start, end) = data_range(data, args[1].to_i64()?, args[2].to_i64()?)?;
+            Some(Value::Int(count_in(data, byte, start, end) as i64))
         }
         MathCountGlobal => {
             let byte: u8 = args[0].to_i64()?.try_into().ok()?;
-            Some(Value::Int(memchr_iter(byte, data).count() as i64))
+            Some(Value::Int(count_in(data, byte, 0, data.len()) as i64))
         }
 
         MathPercentageRange => {
             let byte: u8 = args[0].to_i64()?.try_into().ok()?;
-            let s = slice_range(data, args[1].to_i64()?, args[2].to_i64()?)?;
-            if s.is_empty() {
+            let (start, end) = data_range(data, args[1].to_i64()?, args[2].to_i64()?)?;
+            if start == end {
                 return None;
             }
             Some(Value::Float(
-                memchr_iter(byte, s).count() as f64 / s.len() as f64,
+                count_in(data, byte, start, end) as f64 / (end - start) as f64,
             ))
         }
         MathPercentageGlobal => {
@@ -120,17 +135,17 @@ pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
                 return None;
             }
             Some(Value::Float(
-                memchr_iter(byte, data).count() as f64 / data.len() as f64,
+                count_in(data, byte, 0, data.len()) as f64 / data.len() as f64,
             ))
         }
 
         MathModeGlobal => {
-            let dist = byte_distribution(data);
+            let dist = range_distribution(data, 0, data.len());
             mode_from_distribution(&dist, data.len()).map(Value::Int)
         }
         MathModeRange => {
             let (start, end) = data_range(data, args[0].to_i64()?, args[1].to_i64()?)?;
-            let dist = byte_distribution(&data[start..end]);
+            let dist = range_distribution(data, start, end);
             mode_from_distribution(&dist, end - start).map(Value::Int)
         }
 
@@ -142,27 +157,44 @@ fn truthy(v: &Value) -> bool {
     matches!(v, Value::Bool(true)) || matches!(v, Value::Int(i) if *i != 0)
 }
 
-fn data_range(data: &[u8], offset: i64, length: i64) -> Option<(usize, usize)> {
+/// `offset..offset+length` of the data, cut where the data ends. Undefined
+/// when `offset` is negative or past the end.
+fn data_range(data: &dyn ByteSource, offset: i64, length: i64) -> Option<(usize, usize)> {
     let length: usize = length.try_into().ok()?;
     let start: usize = offset.try_into().ok()?;
     let end = cmp::min(data.len(), start.saturating_add(length));
-    data.get(start..end)?;
-    Some((start, end))
-}
-
-fn slice_range(data: &[u8], offset: i64, length: i64) -> Option<&[u8]> {
-    let length: usize = length.try_into().ok()?;
-    let start: usize = offset.try_into().ok()?;
-    let end = cmp::min(data.len(), start.saturating_add(length));
-    data.get(start..end)
+    (start <= end).then_some((start, end))
 }
 
 fn byte_distribution(data: &[u8]) -> ByteDistribution {
     let mut distribution = [0u64; 256];
+    add_to_distribution(&mut distribution, data);
+    distribution
+}
+
+fn add_to_distribution(distribution: &mut ByteDistribution, data: &[u8]) {
     for byte in data {
         distribution[*byte as usize] += 1;
     }
+}
+
+fn range_distribution(data: &dyn ByteSource, start: usize, end: usize) -> ByteDistribution {
+    let mut distribution = [0u64; 256];
+    data.chunks(start, end, &mut |_, c| {
+        add_to_distribution(&mut distribution, c);
+        true
+    });
     distribution
+}
+
+/// Occurrences of `byte` in `[start, end)` of the data.
+fn count_in(data: &dyn ByteSource, byte: u8, start: usize, end: usize) -> usize {
+    let mut n = 0;
+    data.chunks(start, end, &mut |_, c| {
+        n += memchr_iter(byte, c).count();
+        true
+    });
+    n
 }
 
 fn deviation(data: &[u8], mean: f64) -> Option<f64> {
@@ -212,45 +244,108 @@ fn mode_from_distribution(distribution: &ByteDistribution, len: usize) -> Option
     Some(mode as i64)
 }
 
-fn serial_correlation(data: &[u8]) -> Option<f64> {
-    let Some((&first, rest)) = data.split_first() else {
-        return Some(-100000.0);
-    };
-    let first = first as f64;
-    let mut prev = first;
-    let mut adjacent_product_sum = 0.0;
-    let mut byte_sum = first;
-    let mut byte_square_sum = first * first;
+fn serial_correlation(data: &[u8]) -> f64 {
+    let mut sc = SerialCorrelation::default();
+    sc.feed(data);
+    sc.finish()
+}
 
-    for byte in rest {
-        let byte = *byte as f64;
-        adjacent_product_sum += prev * byte;
-        byte_sum += byte;
-        byte_square_sum += byte * byte;
-        prev = byte;
+/// Serial correlation, fed the bytes in order a piece at a time.
+#[derive(Default)]
+struct SerialCorrelation {
+    first: Option<f64>,
+    prev: f64,
+    adjacent_product_sum: f64,
+    byte_sum: f64,
+    byte_square_sum: f64,
+    len: usize,
+}
+
+impl SerialCorrelation {
+    fn feed(&mut self, data: &[u8]) {
+        let rest = match self.first {
+            Some(_) => data,
+            None => {
+                let Some((&first, rest)) = data.split_first() else {
+                    return;
+                };
+                let first = first as f64;
+                self.first = Some(first);
+                self.prev = first;
+                self.byte_sum = first;
+                self.byte_square_sum = first * first;
+                self.len = 1;
+                rest
+            }
+        };
+        for byte in rest {
+            let byte = *byte as f64;
+            self.adjacent_product_sum += self.prev * byte;
+            self.byte_sum += byte;
+            self.byte_square_sum += byte * byte;
+            self.prev = byte;
+        }
+        self.len += rest.len();
     }
 
-    adjacent_product_sum += first * prev;
+    fn finish(self) -> f64 {
+        let Some(first) = self.first else {
+            return -100000.0;
+        };
+        let adjacent_product_sum = self.adjacent_product_sum + first * self.prev;
 
-    let len = data.len() as f64;
-    let byte_sum_squared = byte_sum * byte_sum;
-    let scc = (len * adjacent_product_sum - byte_sum_squared)
-        / (len * byte_square_sum - byte_sum_squared);
+        let len = self.len as f64;
+        let byte_sum_squared = self.byte_sum * self.byte_sum;
+        let scc = (len * adjacent_product_sum - byte_sum_squared)
+            / (len * self.byte_square_sum - byte_sum_squared);
 
-    if scc.is_nan() {
-        Some(-100000.0)
-    } else {
-        Some(scc)
+        if scc.is_nan() {
+            -100000.0
+        } else {
+            scc
+        }
     }
 }
 
 fn monte_carlo_pi(data: &[u8]) -> Option<f64> {
-    const INCIRC: f64 = 281474943156225.0_f64; // ((256 ^ 3) - 1) ^ 2
+    let mut mc = MonteCarloPi::default();
+    mc.feed(data);
+    mc.finish()
+}
 
-    let mut inmont = 0;
-    let mut mcount = 0;
+/// The Monte Carlo value of Pi, fed the bytes in order a piece at a time.
+/// Each six bytes are one point; a trailing partial point is ignored.
+#[derive(Default)]
+struct MonteCarloPi {
+    inmont: u64,
+    mcount: u64,
+    /// The start of a point cut by the end of the last piece.
+    partial: Vec<u8>,
+}
 
-    for chunk in data.as_chunks::<6>().0 {
+impl MonteCarloPi {
+    fn feed(&mut self, mut data: &[u8]) {
+        if !self.partial.is_empty() {
+            let take = (6 - self.partial.len()).min(data.len());
+            self.partial.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.partial.len() < 6 {
+                return;
+            }
+            let point: [u8; 6] = self.partial[..].try_into().expect("six bytes");
+            self.point(&point);
+            self.partial.clear();
+        }
+        let (points, rest) = data.as_chunks::<6>();
+        for point in points {
+            self.point(point);
+        }
+        self.partial.extend_from_slice(rest);
+    }
+
+    fn point(&mut self, chunk: &[u8; 6]) {
+        const INCIRC: f64 = 281474943156225.0_f64; // ((256 ^ 3) - 1) ^ 2
+
         let mut mx = 0.0_f64;
         let mut my = 0.0_f64;
 
@@ -260,17 +355,19 @@ fn monte_carlo_pi(data: &[u8]) -> Option<f64> {
         }
 
         if mx * mx + my * my < INCIRC {
-            inmont += 1;
+            self.inmont += 1;
         }
-        mcount += 1;
+        self.mcount += 1;
     }
 
-    if mcount == 0 {
-        return None;
-    }
+    fn finish(self) -> Option<f64> {
+        if self.mcount == 0 {
+            return None;
+        }
 
-    let mpi = 4.0_f64 * (inmont as f64 / mcount as f64);
-    Some((mpi - PI).abs() / PI)
+        let mpi = 4.0_f64 * (self.inmont as f64 / self.mcount as f64);
+        Some((mpi - PI).abs() / PI)
+    }
 }
 
 #[cfg(test)]
@@ -492,5 +589,47 @@ mod tests {
             r#"import "math" rule r { condition: math.to_number(true) == 1 and math.to_number(false) == 0 }"#,
             b""
         ));
+    }
+
+    /// Every function over a range of the data gives, over a source read in
+    /// chunks, exactly the value it gives over the bytes in memory.
+    #[test]
+    fn a_range_read_in_chunks_computes_what_the_slice_does() {
+        use super::super::FuncId::*;
+        use super::{call, Value};
+        use crate::byte_source::{BlockCache, CHUNK};
+
+        let h: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i * 31 % 251) as u8).collect();
+        let cache = BlockCache::with_sizes(std::io::Cursor::new(h.clone()), 7, 64).unwrap();
+        let int = Value::Int;
+        // Ranges starting and ending off the chunk seams, with lengths that
+        // leave a partial Monte Carlo point at each seam.
+        let ranges = [
+            (0, h.len()),
+            (1, CHUNK + 1),
+            (CHUNK - 5, 2 * CHUNK + 3),
+            (7, 11),
+            (h.len(), 4),
+        ];
+        for (off, len) in ranges {
+            let (o, l) = (off as i64, len as i64);
+            for (func, args) in [
+                (MathEntropyData, vec![int(o), int(l)]),
+                (MathMeanData, vec![int(o), int(l)]),
+                (MathDeviationData, vec![int(o), int(l), Value::Float(100.5)]),
+                (MathSerialCorrelationData, vec![int(o), int(l)]),
+                (MathMonteCarloPiData, vec![int(o), int(l)]),
+                (MathCountRange, vec![int(0x1f), int(o), int(l)]),
+                (MathPercentageRange, vec![int(0x1f), int(o), int(l)]),
+                (MathModeRange, vec![int(o), int(l)]),
+                (MathCountGlobal, vec![int(0x1f)]),
+                (MathPercentageGlobal, vec![int(0x1f)]),
+                (MathModeGlobal, vec![]),
+            ] {
+                let want = format!("{:?}", call(func, &h, &args));
+                let got = format!("{:?}", call(func, &cache, &args));
+                assert_eq!(want, got, "{func:?} over {off}+{len}");
+            }
+        }
     }
 }

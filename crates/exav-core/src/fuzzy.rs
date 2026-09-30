@@ -68,6 +68,11 @@ impl FuzzyDb {
         self.len() == 0
     }
 
+    /// Whether any imphash signature is loaded.
+    pub(crate) fn has_imphash(&self) -> bool {
+        !self.imphash.is_empty() || !self.imp_sized.is_empty()
+    }
+
     /// Parse a fuzzy-signature file. One entry per line:
     ///   `imphash:HEX:Name`
     ///   `tlsh:HASH:Name[:MaxDistance]`   (default distance 100)
@@ -158,10 +163,20 @@ impl FuzzyDb {
     /// Distance-based TLSH match; returns the closest signature within its
     /// configured threshold.
     pub fn match_tlsh(&self, data: &[u8]) -> Option<String> {
+        self.match_tlsh_source(&data)
+    }
+
+    /// As [`Self::match_tlsh`], over an object that need not be held in memory.
+    pub(crate) fn match_tlsh_source(&self, data: &dyn crate::byte_source::ByteSource) -> Option<String> {
         if self.tlsh.is_empty() {
             return None;
         }
-        let sample = tlsh_of(data)?;
+        let mut b = TlshDefaultBuilder::new();
+        data.chunks(0, data.len(), &mut |_, piece| {
+            b.update(piece);
+            true
+        });
+        let sample = b.build()?;
         let mut best: Option<(i32, &str)> = None;
         for (t, name, max) in &self.tlsh {
             let d = sample.diff(t, true);
@@ -236,5 +251,17 @@ mod tests {
         db.extend_from_text(&format!("tlsh:{h}:Family.B:10\n"));
         // identical content -> distance 0 -> matches
         assert_eq!(db.match_tlsh(&data).as_deref(), Some("Family.B"));
+    }
+
+    #[test]
+    fn a_digest_fed_in_chunks_is_the_one_made_whole() {
+        use crate::byte_source::{BlockCache, CHUNK};
+        let data: Vec<u8> = (0..5 * CHUNK + 77).map(|i| ((i * 31 % 251) ^ (i / 97)) as u8).collect();
+        let h = tlsh_string(&data).expect("tlsh");
+        let mut db = FuzzyDb::new();
+        db.extend_from_text(&format!("tlsh:{h}:Family.C:0\n"));
+        let cache = BlockCache::with_sizes(std::io::Cursor::new(data), 509, 4096).unwrap();
+        // Distance 0 only: the chunked digest must be exactly the whole one.
+        assert_eq!(db.match_tlsh_source(&cache).as_deref(), Some("Family.C"));
     }
 }

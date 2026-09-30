@@ -103,7 +103,7 @@ fn unpack(file: &[u8]) -> Vec<exav_unpack::Entry> {
     limits.max_extracted_bytes = 1 << 30;
     limits.max_buffer_bytes = 1 << 30;
     let mut b = Budget::new(limits);
-    extract(Format::PePacked, file, &mut b).expect("extraction stays within budget")
+    extract(Format::PePacked, &file, &mut b).expect("extraction stays within budget")
 }
 
 #[test]

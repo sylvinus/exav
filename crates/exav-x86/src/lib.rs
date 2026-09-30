@@ -21,12 +21,13 @@
 //! escape map, the system-instruction space, SSE/MMX with the `0F 38` and
 //! `0F 3A` escapes, 3DNow!, VEX, EVEX and AMD's XOP.
 //!
-//! Operands are modelled for the general-purpose and x87 encodings. For the
-//! SIMD maps the register *file* an operand names — MMX, XMM/YMM, mask — is
-//! not: a register number is reported as the encoding's own, and a vector index
-//! register is not reported at all. Nothing in exav interprets those operands,
-//! and reporting one as a general-purpose register would be a plausible-looking
-//! lie. What those encodings are asked for is their identity and their length.
+//! Operands are modelled for the general-purpose and x87 encodings, and for the
+//! `0F` SIMD encodings whose shape is in the generated table, which report their
+//! register file (`Op::Mmx`, `Op::Xmm`) and memory width. Elsewhere in the SIMD
+//! maps (VEX, EVEX, XOP, and an unmodelled `0F` shape) a register operand is not
+//! reported at all, and a vector index register never is: reporting one as a
+//! general-purpose register would be a plausible-looking lie. What those
+//! encodings are asked for is their identity and their length.
 //!
 //! The scope was measured, not guessed: instrumenting the emulator across the
 //! packed-sample corpus records which encodings real stubs actually execute,
@@ -639,8 +640,8 @@ pub enum Op {
     Xmm(u8),
     /// An MMX register, `mm0`–`mm7`.
     Mmx(u8),
-    /// A memory operand whose width is not one of [`Size`]'s three — the x87
-    /// operand sizes (8, 10, 28 and 108 bytes) and nothing else.
+    /// A memory operand whose width is not one of [`Size`]'s three: the x87
+    /// operand sizes (8, 10, 28 and 108 bytes) and the SIMD widths.
     MemWide {
         base: Option<u8>,
         index: Option<u8>,

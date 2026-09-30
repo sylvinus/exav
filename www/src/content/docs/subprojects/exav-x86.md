@@ -8,6 +8,10 @@ It turns bytes into instruction descriptions and declines anything it does not
 claim. It does not assemble, does not generate code, and nothing it produces is
 executed.
 
+```bash
+cargo add exav-x86
+```
+
 ```rust
 use exav_x86::{decode, Mn};
 

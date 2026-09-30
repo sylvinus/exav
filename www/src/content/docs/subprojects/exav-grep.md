@@ -13,14 +13,45 @@ cargo install exav-grep
 ```bash
 exav-grep -r "AKIA[0-9A-Z]{16}" ./backups/     # leaked keys inside tarballs
 exav-grep -F "password" release.zip            # nested archives too
-exav-grep -l "ProcessBuilder" suspicious.jar   # which member, not just which file
+exav-grep -l "ProcessBuilder" suspicious.jar   # which member, as well as which file
 ```
 
-Matches are reported with the full path through the containers:
+Matches are reported with the full path through the containers. A compressed
+stream (the gzip around a tar) is a layer of its own, named for its content:
 
 ```text
-backups/2026-01.tar.gz!db/dump.sql:412:AKIAIOSFODNN7EXAMPLE
+backups/2026-01.tar.gz!gzip-content!db/dump.sql:412:AKIAIOSFODNN7EXAMPLE
 suspicious.jar!kingDavid/00.class/!java-class-strings:65:java/lang/ProcessBuilder
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | matches found |
+| `1` | no matches |
+| `2` | a usage or I/O error |
+| `3` | no matches, but some members could not be read: the search was incomplete |
+
+`3` is the one a script looking for secrets or indicators has to handle: a clean
+result and an incomplete one are different answers.
+
+## As a library
+
+```bash
+cargo add exav-grep
+```
+
+```rust
+use exav_grep::{Matcher, Options, Searcher};
+
+let matcher = Matcher::fixed("password", false)?;
+let mut searcher = Searcher::new(matcher, Options::default());
+// The sink returns `true` to keep going, `false` to stop the search.
+searcher.search_path(std::path::Path::new("backup.zip"), &mut |ev| {
+    println!("{ev}");
+    true
+})?;
 ```
 
 ## Why not `zgrep` and a loop

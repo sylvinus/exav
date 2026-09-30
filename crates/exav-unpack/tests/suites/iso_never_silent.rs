@@ -46,7 +46,7 @@ fn iso(files: &[(&str, u64, u64)], root_len: u64) -> Vec<u8> {
 
 fn entries(blob: &[u8]) -> Vec<exav_unpack::Entry> {
     let mut b = Budget::new(Limits::default());
-    extract(Format::Iso, blob, &mut b).unwrap_or_default()
+    extract(Format::Iso, &blob, &mut b).unwrap_or_default()
 }
 
 #[test]
@@ -104,18 +104,18 @@ fn a_corrupt_directory_record_is_reported() {
 
 #[test]
 fn a_corrupt_directory_record_is_reported_when_streamed() {
-    // The scanner walks every ISO through `stream_members`, where the same
-    // record used to end the directory without a word.
+    // The scanner walks every ISO through `walk`, where the same record used
+    // to end the directory without a word.
     let mut img = iso(&[("A.TXT", 19, 4)], 200);
     let p = 18 * SECTOR + 33 + "A.TXT".len();
     img[p] = 5;
     let mut unsupported = Vec::new();
     let mut b = Budget::new(Limits::default());
-    let _ = exav_unpack::stream_members(
+    let _ = exav_unpack::walk(
         Format::Iso,
-        std::io::Cursor::new(img),
+        &img,
         &mut b,
-        &mut |m: &exav_unpack::MemberMeta, _: Option<&mut dyn std::io::Read>, _: &mut Budget| {
+        &mut |m: &exav_unpack::MemberMeta, _: Option<exav_unpack::Member<'_>>, _: &mut Budget| {
             unsupported.extend(m.unsupported);
             None::<()>
         },

@@ -39,17 +39,20 @@ test:
 ##              Mirrors the `test` job in .github/workflows/ci.yml — keep in sync.
 test-native:
 	$(CARGO) test --workspace
+	# The CLI as shipped: a `--workspace` build unifies features across crates,
+	# so it can hide an exav-core feature that `exav` itself does not forward.
+	$(CARGO) test -p exav --features http
 	$(CARGO) test -p exav-core --features http
 	$(CARGO) test -p exav-unpack --features checksums
 	$(CARGO) test -p exav-unpack --no-default-features --features all-formats
 	$(CARGO) test -p exav-core --features unstable-internals
 	# Minimal build: compiles the `cfg(not(feature = ...))` fallbacks every other
-	# pass hides — the paths that must report unsupported rather than clean.
+	# pass hides: the paths that must report unsupported rather than clean.
 	$(CARGO) test -p exav-core --no-default-features
 	$(CARGO) test -p exav-unpack --no-default-features
 	# Crash containment, which only runs when a decoder can be asked to fail.
 	# Without this pass the tests that check it skip themselves and the whole
-	# question goes unasked — a scanner that dies on crafted input and exits 0
+	# question goes unasked. A scanner that dies on crafted input and exits 0
 	# is indistinguishable, to a pipeline reading `$$?`, from a clean scan.
 	$(CARGO) test -p exav-unpack --features testing-faults panic_containment
 	$(CARGO) test -p exav --features testing-faults --test decoder_crash

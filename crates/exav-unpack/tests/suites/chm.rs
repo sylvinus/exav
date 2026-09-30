@@ -85,7 +85,7 @@ fn truncated_head_does_not_panic() {
         };
         let head = &data[..64.min(data.len())];
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Chm, head, &mut budget).unwrap();
+        let entries = extract(Format::Chm, &head, &mut budget).unwrap();
         assert!(entries.is_empty(), "{name}: truncated head yielded members");
     }
 }

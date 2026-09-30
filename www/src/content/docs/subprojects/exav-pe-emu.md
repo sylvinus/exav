@@ -3,16 +3,21 @@ title: exav-pe-emu
 description: A sandboxed x86-32 emulator that unpacks runtime-packed Windows executables by running their stub and capturing the image it rebuilds.
 ---
 
-**An x86-32 emulator that unpacks packed executables by running them.** Not a
-decoder per packer, but a machine the packer's own stub runs on, so whatever it
-compresses or encrypts with, the original image is captured when the stub jumps
-to it.
+**An x86-32 emulator that unpacks packed executables by running them.** It runs
+the packer's own stub and captures the original image when the stub jumps to it,
+whatever the packer compresses or encrypts with.
+
+```bash
+cargo add exav-pe-emu
+```
 
 ```rust
 let file = std::fs::read("packed.exe")?;
 let report = exav_pe_emu::unpack(&file, &exav_pe_emu::EmuLimits::default());
 match report.unpacked {
-    Some(u) => std::fs::write("unpacked.exe", &u.data)?,
+    // `u.data` is the rebuilt image in memory layout, for scanning rather than
+    // running; `u.reached_oep` says whether the stub jumped to it.
+    Some(u) => std::fs::write("unpacked.bin", &u.data)?,
     // Nothing is invented: this says why the stub was not followed.
     None => eprintln!("{}", report.stop),
 }
@@ -64,6 +69,7 @@ Enough Windows that a stub cannot tell, and nothing more:
 
 An instruction budget, a resident-page cap, a dump-size cap, and a progress check
 that ends a stub spinning in an anti-emulation delay loop, all set through
-`EmuLimits`; the defaults are what the scanner uses per stub. The scanner also
-caps the total across every packed executable in one file
-(`--max-pe-emulation-steps`).
+`EmuLimits`. The defaults (200 million instructions, 192 MiB of pages, a 64 MiB
+dump) suit one sample on its own; the scanner uses tighter per-stub budgets
+(120 million, 64 MiB, 32 MiB) and also caps the total across every packed
+executable in one file (`--max-pe-emulation-steps`).

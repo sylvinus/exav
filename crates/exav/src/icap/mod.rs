@@ -90,12 +90,10 @@
 // annotation. The lint level applies to every submodule below.
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
-use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use exav_core::{ScanOptions, Scanner};
+use exav_core::ScanOptions;
 
 use crate::Cli;
 
@@ -108,15 +106,11 @@ mod wire;
 pub(crate) use self::config::{IcapConfig, InfectionHeader};
 pub(crate) use self::server::Server;
 
-use self::server::{FixedDb, ReloadableDb, Signatures};
+use self::server::{FixedDb, Signatures};
+use crate::daemon::SharedDb;
 
 /// Version string reported in the `Service` and `Server` headers.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// How often the signature source is polled for a change. Matches the clamd
-/// daemon's supervisor tick, so both surfaces pick up a sidecar's write at the
-/// same rate.
-const RELOAD_TICK: Duration = Duration::from_secs(10);
 
 /// Build the server configuration from the parsed arguments.
 pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
@@ -141,7 +135,7 @@ pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
             _ => d.listen,
         },
         services,
-        preview_size: cli.icap_preview_size.unwrap_or(d.preview_size),
+        preview_size: cli.icap_preview_size.map_or(d.preview_size, |p| p.value()),
         // `off` omits the header. An empty string used to be the way to say
         // that, which is a sentinel nobody guesses and a shell quoting accident
         // away from being set by mistake.
@@ -158,21 +152,17 @@ pub fn config_from_cli(cli: &Cli) -> Result<IcapConfig, String> {
             .as_ref()
             .and_then(|e| e.max_connections)
             .unwrap_or(d.max_connections),
-        options_ttl: cli.icap_options_ttl.unwrap_or(d.options_ttl),
-        keepalive_requests: cli
-            .icap_keepalive_requests
-            .unwrap_or(d.keepalive_requests)
-            .max(1),
-        idle_timeout: Duration::from_secs(
-            cli.icap_idle_timeout
-                .unwrap_or(d.idle_timeout.as_secs())
-                .max(1),
-        ),
+        options_ttl: cli.icap_options_ttl.map_or(d.options_ttl, |t| t.value()),
+        keepalive_requests: match cli.icap_keepalive_requests {
+            Some(0) => u64::MAX,
+            Some(n) => n,
+            None => d.keepalive_requests,
+        },
+        idle_timeout: cli
+            .icap_idle_timeout
+            .map_or(d.idle_timeout, Duration::from_secs),
         max_drain_bytes: d.max_drain_bytes,
-        max_header_bytes: cli
-            .icap_max_header_size
-            .unwrap_or(d.max_header_bytes)
-            .max(1024),
+        max_header_bytes: cli.icap_max_header_size.unwrap_or(d.max_header_bytes),
         service_label: d.service_label,
         infection_header: cli.icap_infection_header.unwrap_or(d.infection_header),
         partial_as: cli.partial_as.unwrap_or(d.partial_as),
@@ -192,13 +182,14 @@ pub fn bind(cfg: IcapConfig) -> std::io::Result<Server> {
 fn announce(server: &Server) {
     let cfg = server.config();
     eprintln!(
-        "exav: serving ICAP on tcp:{} (services: {}; preview {} B)",
+        "exav: serving ICAP on tcp:{} (services: {}; preview {})",
         server
             .local_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| cfg.listen.clone()),
         cfg.services.join(", "),
-        cfg.preview_size,
+        cfg.preview_size
+            .map_or_else(|| "off".to_string(), |n| format!("{n} B")),
     );
     // Said at startup as well as per object, because a deployment that passes
     // what it could not examine should be legible from its logs alone — nobody
@@ -213,25 +204,12 @@ fn announce(server: &Server) {
     }
 }
 
-/// Serve ICAP on its own listener thread, and make this thread the supervisor
-/// that watches the signature source and swaps the database in — which is also
-/// what moves the `ISTag` and so invalidates every downstream ICAP cache.
-///
-/// Never returns: the process serves until it is stopped.
-pub fn serve_alone(
-    server: Server,
-    db: Arc<Scanner>,
-    opts: Arc<ScanOptions>,
-    watch: Option<PathBuf>,
-    reload: &dyn Fn() -> Result<Scanner, String>,
-    metrics_interval: Duration,
-) -> ExitCode {
+/// Serve ICAP on a listener thread of its own, over the database the thread
+/// model's supervisor ([`crate::daemon::supervise`]) swaps on a reload. A swap
+/// moves the `ISTag` and so invalidates every downstream ICAP cache.
+pub fn spawn(server: Server, db: Arc<SharedDb>, opts: Arc<ScanOptions>) {
     announce(&server);
-    // Serving ICAP alone binds no clamd port, so `STATS` cannot be asked here at
-    // all and the log is the only channel the totals have.
-    crate::metrics::spawn_reporter(metrics_interval, "icap");
-    let shared = Arc::new(ReloadableDb::from_arc(db));
-    let handle: Arc<dyn Signatures> = Arc::clone(&shared) as Arc<dyn Signatures>;
+    let handle: Arc<dyn Signatures> = db;
     std::thread::spawn(move || {
         if let Err(e) = server.run(handle, opts, &|_| true) {
             eprintln!("exav: icap: listener stopped: {e}");
@@ -241,37 +219,6 @@ pub fn serve_alone(
         // orchestrator can only restart what it can see has stopped.
         std::process::exit(2);
     });
-
-    let Some(dir) = watch else {
-        // Nothing to watch (the built-in baseline). Park instead of returning,
-        // because returning would drop into the caller's exit path.
-        loop {
-            std::thread::sleep(RELOAD_TICK);
-        }
-    };
-
-    let mut last = crate::daemon::datadir_mtime(&dir);
-    loop {
-        std::thread::sleep(RELOAD_TICK);
-        let Some(now) = crate::daemon::datadir_mtime(&dir) else {
-            continue;
-        };
-        if crate::daemon::source_changed(last, now) {
-            last = Some(now);
-            match reload() {
-                Ok(new_db) => {
-                    eprintln!(
-                        "exav: icap: reloading signatures ({} known)",
-                        new_db.signature_count()
-                    );
-                    shared.replace(new_db);
-                }
-                // Keeping the database already loaded is the safe failure: a
-                // half-written volume must not downgrade a running scanner.
-                Err(e) => eprintln!("exav: icap: signature reload failed, keeping current DB: {e}"),
-            }
-        }
-    }
 }
 
 /// Hand the bound listener to the prefork supervisor as a child process of its

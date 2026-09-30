@@ -937,7 +937,7 @@ pub(crate) fn emulated_unpack<R>(
 fn packer_name(p: Packer) -> &'static str {
     // The vendor's own capitalisation, and the single source of truth for it.
     // These strings reach the user twice — in the member name and, with
-    // `--alert-packed`, inside `Heuristics.Packed.<name>` — and a gateway
+    // `--detect packed`, inside `Heuristics.Packed.<name>` — and a gateway
     // filtering on an exact string needs the name the vendor uses. Spelling them
     // once here means the scanner never has to re-derive a display name, so the
     // two can't drift apart and a packer added below is reportable immediately.
@@ -1277,7 +1277,7 @@ mod tests {
         for junk in [&b"MZ"[..], b"MZ\x00\x00", b"MZ\xff\xff\xff\xff garbage"] {
             let _ = is_pepack(junk);
             let mut b = Budget::new(Limits::default());
-            let _ = extract(Format::PePacked, junk, &mut b);
+            let _ = extract(Format::PePacked, &junk, &mut b);
         }
     }
 

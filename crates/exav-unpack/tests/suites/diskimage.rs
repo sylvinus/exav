@@ -26,7 +26,8 @@
 //! The VHDX is stored gzipped only because its 1 MiB-aligned regions make even a
 //! 256 KiB disk a 9 MiB file; the bytes inside are qemu-img's, unmodified.
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the 256 KiB raw image the fixtures were built from, which is
 /// also what `qemu-img convert -O raw` returns for each of them.

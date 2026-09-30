@@ -1,4 +1,4 @@
-exav — THIRD-PARTY NOTICES
+exav: THIRD-PARTY NOTICES
 ==========================
 
 exav itself is licensed under the MIT License (see the LICENSE file).
@@ -24,7 +24,7 @@ Versions below reflect Cargo.lock at the time of writing (last verified
 
 
 -------------------------------------------------------------------------------
-1. yara-x — BSD-3-Clause (source derivative, and a development dependency)
+1. yara-x, BSD-3-Clause (source derivative, and a development dependency)
 -------------------------------------------------------------------------------
 
 exav's YARA engine is native, in `crates/exav-core/src/yara/`. Parts of it are
@@ -39,8 +39,8 @@ a per-file attribution header, and the license text is reproduced below and in
 yara-x crate is a dependency of any kind.
 
 The differential test that compares exav's engine against yara-x
-(`crates/exav-core/tests/yara_difftest.rs`) invokes yara-x as a PROGRAM — the
-`yr` binary from `PATH` — rather than linking it, and skips when that binary is
+(`crates/exav-core/tests/yara_difftest.rs`) invokes yara-x as a PROGRAM (the
+`yr` binary from `PATH`) rather than linking it, and skips when that binary is
 absent.
 
 Components: yara-x-parser 1.18.
@@ -77,7 +77,7 @@ their respective copyright holders): subtle, tlsh2.
 
 
 -------------------------------------------------------------------------------
-1b. libarchive RAR5 reader — BSD-2-Clause (source derivative)
+1b. libarchive RAR5 reader, BSD-2-Clause (source derivative)
 -------------------------------------------------------------------------------
 
 The RAR5 (unpack50) decompressor in
@@ -112,7 +112,7 @@ All rights reserved.
 
 
 -------------------------------------------------------------------------------
-1c. nwaples/rardecode RAR3 reader — BSD-2-Clause (source derivative)
+1c. nwaples/rardecode RAR3 reader, BSD-2-Clause (source derivative)
 -------------------------------------------------------------------------------
 
 The RAR3/RAR4 (unpack29) decompressor in
@@ -148,7 +148,7 @@ All rights reserved.
 
 
 -------------------------------------------------------------------------------
-1d. ppmd-rust PPMd7 (var.H) model — CC0-1.0 OR MIT-0 (source derivative)
+1d. ppmd-rust PPMd7 (var.H) model, CC0-1.0 OR MIT-0 (source derivative)
 -------------------------------------------------------------------------------
 
 The PPMd variant H decoder in crates/exav-unpack/src/formats/ppmd7/ is vendored
@@ -174,7 +174,7 @@ archive_ppmd7.c (already attributed in section 1b above), NOT from UnRAR.
 
 
 -------------------------------------------------------------------------------
-1e. dmg-core UDIF reader — Apache-2.0 (source derivative)
+1e. dmg-core UDIF reader, Apache-2.0 (source derivative)
 -------------------------------------------------------------------------------
 
 The UDIF/DMG block reader in crates/exav-unpack/src/formats/udif.rs is vendored
@@ -191,11 +191,11 @@ referenced in section 2 below). Upstream ships no separate NOTICE file.
 
 
 -------------------------------------------------------------------------------
-1f. rust-cab CAB reader — MIT (source derivative)
+1f. rust-cab CAB reader, MIT (source derivative)
 -------------------------------------------------------------------------------
 
 The CAB (Microsoft Cabinet) reader in crates/exav-unpack/src/formats/cab_parse/
-is vendored and adapted from the `rust-cab` crate — write support, the datetime
+is vendored and adapted from the `rust-cab` crate: write support, the datetime
 module, unused public types, and tests removed; bounds checks added for
 folder data-block and short-read cases. Licensed MIT; the MIT License requires
 retaining the copyright and permission notice (reproduced in the exav LICENSE
@@ -206,11 +206,11 @@ Copyright (c) Matthew D. Steele <mdsteele@alum.mit.edu>.
 
 
 -------------------------------------------------------------------------------
-1g. unarc-rs ARJ reader — MIT OR Apache-2.0 (source derivative)
+1g. unarc-rs ARJ reader, MIT OR Apache-2.0 (source derivative)
 -------------------------------------------------------------------------------
 
 The ARJ reader in crates/exav-unpack/src/formats/arj_parse/ is vendored and
-adapted from the `unarc-rs` crate — multi-volume support, volume providers, and
+adapted from the `unarc-rs` crate: multi-volume support, volume providers, and
 external error types removed; wired to `delharc` for LH6 decompression.
 Dual-licensed MIT OR Apache-2.0; the MIT or Apache terms apply at the
 distributor's choice (both reproduced/referenced elsewhere in this file).
@@ -234,11 +234,11 @@ Copyright (c) Mike Krüger.
 
 
 -------------------------------------------------------------------------------
-1h1. unshield / explode — MIT (linked dependency + test fixtures)
+1h1. unshield / explode, MIT (linked dependency + test fixtures)
 -------------------------------------------------------------------------------
 
 crates/exav-unpack/src/formats/ishield_z.rs reads InstallShield `.z` archives
-through the `unshield` crate, whose only real dependency is `explode` — a leaf
+through the `unshield` crate, whose only real dependency is `explode`, a leaf
 decoder for the PKWARE Data Compression Library "implode" codec those archives
 use. Both MIT.
 
@@ -248,7 +248,7 @@ own examples, redistributed under the same terms. `undhr.z` is shipped alongside
 against the real file rather than against itself.
 
 This is a DIFFERENT format from the InstallShield `ISc(` InstallScript cabinet,
-whose only implementation is the LGPL `unshield` C project — never read, and the
+whose only implementation is the LGPL `unshield` C project (never read), and the
 reason that format stays recognised-but-unopened.
 
 Upstream: https://github.com/agrif/unshield , https://github.com/agrif/explode
@@ -256,7 +256,7 @@ Copyright (c) Aaron Griffith.
 
 
 -------------------------------------------------------------------------------
-1h2. iced-x86 — MIT (generated opcode tables)
+1h2. iced-x86, MIT (generated opcode tables)
 -------------------------------------------------------------------------------
 
 crates/exav-x86/src/generated.rs holds the SIMD, system and VEX regions of the
@@ -268,7 +268,7 @@ License requires retaining its copyright and permission notice (the MIT text is
 in the exav LICENSE file).
 
 `iced-x86` is also the oracle that exav-x86's differential tests and the
-`x86_decode` fuzz target compare against — including the decoding that
+`x86_decode` fuzz target compare against, including the decoding that
 exav-pe-emu drives. It is a dev-dependency only: the decoder exav-pe-emu uses at
 run time is exav-x86, and no iced code reaches a shipped artifact.
 
@@ -277,7 +277,36 @@ Copyright (C) 2018-present iced project and contributors.
 
 
 -------------------------------------------------------------------------------
-1h. oletools test sample — BSD-2-Clause (test fixture)
+1h3. bzip2-rs bzip2 decoder, MIT OR Apache-2.0 (source derivative)
+-------------------------------------------------------------------------------
+
+The bzip2 decoder in crates/exav-unpack/src/formats/bzip2_rs/ is vendored and
+adapted from the `bzip2-rs` crate (version 0.1.2): the streaming decoder buffers
+enough input for the largest compressed block (upstream buffered only the
+uncompressed block size, which a block of incompressible data exceeds), the
+MSRV and nightly code paths are collapsed, and the doc examples that need the
+upstream test files are removed. Dual-licensed MIT OR Apache-2.0; the MIT or
+Apache terms apply at the distributor's choice.
+
+Upstream: https://github.com/paolobarbolini/bzip2-rs
+Copyright (c) 2021 Paolo Barbolini.
+
+
+-------------------------------------------------------------------------------
+1h4. zip2 test archives, MIT (test fixtures)
+-------------------------------------------------------------------------------
+
+crates/exav-unpack/tests/fixtures/zip/legacy_shrink.zip, legacy_reduce.zip and
+legacy_implode.zip are the `zip` crate's own test archives for the PKZIP 1.x
+methods (Shrink, Reduce, Implode), redistributed under its MIT License. They are
+what checks exav's decoding of those methods against real archives.
+
+Upstream: https://github.com/zip-rs/zip2
+Copyright (c) the zip2 contributors.
+
+
+-------------------------------------------------------------------------------
+1h. oletools test sample, BSD-2-Clause (test fixture)
 -------------------------------------------------------------------------------
 
 The Excel 4.0 macro test fixture
@@ -290,7 +319,7 @@ Copyright (c) Philippe Lagadec.
 
 
 -------------------------------------------------------------------------------
-1i. aPLib reference (depack) — public domain (freeware)
+1i. aPLib reference (depack), public domain (freeware)
 -------------------------------------------------------------------------------
 
 The aPLib depacker in crates/exav-unpack/src/formats/aplib.rs is a clean-room
@@ -304,7 +333,7 @@ Upstream: https://ibsensoftware.com/products_aPLib.html
 
 
 -------------------------------------------------------------------------------
-1j. Microsoft Script Encoder decode tables — public domain
+1j. Microsoft Script Encoder decode tables, public domain
 -------------------------------------------------------------------------------
 
 The substitution/decode tables in crates/exav-unpack/src/formats/screnc.rs are
@@ -316,13 +345,15 @@ Upstream: https://blog.didierstevens.com/programs/
 
 
 -------------------------------------------------------------------------------
-1k. AutoIt-Ripper — MIT (reference implementation)
+1k. AutoIt-Ripper, MIT (reference implementation)
 -------------------------------------------------------------------------------
 
 crates/exav-unpack/src/formats/autoit.rs implements the compiled-AutoIt3 script
-layout — the EA05 record structure, the Mersenne-Twister keystream and its seeds
-— from the MIT-licensed AutoIt-Ripper reference together with the public format
-description.
+layout (the EA05 and EA06 record structures, their keystreams and seeds, the
+LZSS decompressor and the token stream) from the MIT-licensed AutoIt-Ripper
+reference together with the public format description.
+crates/exav-unpack/src/formats/autoit_data.rs holds its keyword and function
+tables, from AutoIt-Ripper's autoit_data.py.
 
 Upstream: https://github.com/nazywam/AutoIt-Ripper
 Copyright (c) nazywam and contributors.
@@ -347,11 +378,11 @@ Copyright (c) nazywam and contributors.
 
 
 -------------------------------------------------------------------------------
-1l. NSIS format headers — zlib
+1l. NSIS format headers, zlib
 -------------------------------------------------------------------------------
 
-crates/exav-unpack/src/formats/nsis.rs implements the installer layout — the
-firstheader and block-table structures — from NSIS's own zlib-licensed format
+crates/exav-unpack/src/formats/nsis.rs implements the installer layout (the
+firstheader and block-table structures) from NSIS's own zlib-licensed format
 header `Source/exehead/fileform.h`, together with public reverse-engineering.
 
 Upstream: https://github.com/kichik/nsis
@@ -377,7 +408,7 @@ Copyright (c) Nullsoft and contributors.
 
 
 -------------------------------------------------------------------------------
-1m. sevenz-rust2 — Apache-2.0 (design reference)
+1m. sevenz-rust2, Apache-2.0 (design reference)
 -------------------------------------------------------------------------------
 
 crates/exav-unpack/src/formats/sevenz/ takes its reader structure from
@@ -426,7 +457,7 @@ the distributor's choice. Notable examples:
                                            engine behind exav-grep
   libc                                   syscall bindings (daemon)
   ureq, rustls, webpki-roots             HTTPS for the signature updater
-  wasm-bindgen, js-sys, web-sys,         WebAssembly/JS bindings — these reach
+  wasm-bindgen, js-sys, web-sys,         WebAssembly/JS bindings; these reach
     wasm-bindgen-futures                   the published npm artifact
 
 MIT-only components (the MIT copyright and permission notice must be retained;
@@ -445,7 +476,7 @@ Format documentation consulted
 Some decoders were written from format descriptions rather than from any code.
 Recorded here because a decoder's provenance is part of what makes it auditable:
 
-  EGG        ESTsoft Corp., "EGG Format Specification, Version 1.0" — the
+  EGG        ESTsoft Corp., "EGG Format Specification, Version 1.0", the
              vendor's own published document. No ESTsoft code was used.
 
   AZO        ESTsoft's own compression algorithm, absent from the EGG spec.
@@ -461,7 +492,7 @@ Recorded here because a decoder's provenance is part of what makes it auditable:
              Copyright the java-hwp authors. Validated against
              `testHWP_3.0.hwp` from the Apache Tika test corpus
              (https://github.com/apache/tika), Apache-2.0, Copyright the
-             Apache Software Foundation — vendored as
+             Apache Software Foundation, vendored as
              `crates/exav-unpack/tests/fixtures/hwp3/tika_testHWP_3.0.hwp`.
 
   ALZ        Structure cross-checked against `unalz` (zlib license) and

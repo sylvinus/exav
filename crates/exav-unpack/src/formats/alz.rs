@@ -149,8 +149,7 @@ fn decode_alz_member(method: u8, body: &[u8], cap: u64) -> Option<(Vec<u8>, bool
     use std::io::Cursor;
     match method {
         0 => Some((body.to_vec(), body.len() as u64 > cap)),
-        #[cfg(feature = "bzip2")]
-        1 => crate::bounded_read(bzip2_rs::DecoderReader::new(Cursor::new(body)), cap).ok(),
+        1 => crate::bounded_read(super::bzip2_rs::DecoderReader::new(Cursor::new(body)), cap).ok(),
         2 => crate::bounded_read(flate2::read::DeflateDecoder::new(Cursor::new(body)), cap).ok(),
         _ => None,
     }

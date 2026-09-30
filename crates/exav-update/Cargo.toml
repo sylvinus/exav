@@ -22,7 +22,7 @@ ureq = "2"
 # Verify a downloaded `.exavdb`'s embedded SHA-256 before installing it, so an
 # interrupted/corrupt download is rejected rather than clobbering a good cache.
 # Same hash exav-core stamps into the cache; RustCrypto, no C/asm.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # docs.rs builds with every feature on, so the parts gated behind a feature
 # appear on the rendered page

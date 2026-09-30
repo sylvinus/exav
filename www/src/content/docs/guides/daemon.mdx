@@ -15,7 +15,7 @@ client libraries) talks to exav unchanged.
 ```sh
 exav --listen /run/clamav/clamd.ctl -d /var/lib/exav      # a Unix socket
 exav --listen 0.0.0.0:3310 -d /var/lib/exav               # TCP instead
-exav --listen clamd://0.0.0.0:3310 -d exav.exavdb         # the same, spelled out
+exav --listen clamd://0.0.0.0:3310 -d /var/lib/exav       # the same, spelled out
 ```
 
 The protocol travels in the address, and with no scheme it is `clamd`. A leading
@@ -43,7 +43,9 @@ or a daemon running as another user. `-` (stdin) is always sent as contents.
 A directory names its whole tree in all three modes, as it does for `clamdscan`.
 The client walks it and sends one request per file, so `--exclude` / `--include`
 apply to the tree and each request has one reply. A directory holding the parts
-of a byte-split archive is sent whole instead, so the daemon can rejoin them.
+of a byte-split archive (`x.001`, `x.002`, ...) is sent whole instead, as one
+`CONTSCAN` by path, so the daemon can rejoin them; the client's filters and
+`--no-recursive` do not apply to that directory.
 
 ## Who may connect
 
@@ -77,9 +79,15 @@ Supported commands: `PING`, `VERSION`, `VERSIONCOMMANDS`, `STATS`, `RELOAD`,
 (fd passing), `IDSESSION` / `SESSION` / `END`, and the exav extensions
 `EXINSTREAM`, `EXINSTREAM MULTI` (below) and `SCANURL <url>`. `SCANURL` scans an
 `http(s)://` object through range requests (see
-[scanning over HTTP](/guides/scanning/#scanning-over-http-costs-bandwidth-not-memory))
-and is honoured, and listed in `VERSIONCOMMANDS`, only with `--allow-http-scan`.
-Commands may be `z`- or `n`-framed.
+[scanning over HTTP](/guides/scanning/#scanning-over-http)) and is honoured, and
+listed in `VERSIONCOMMANDS`, only in a build with `http-scan`
+(`--features http`) and with `--allow-http-scan`. Commands may be `z`- or
+`n`-framed.
+
+`EXINSTREAM` takes `INSTREAM`'s framing and answers one line of JSON with the
+[verdict fields](/reference/verdicts/), for instance
+`{"v":1,"status":"FOUND","signature":"…","location":"a.zip/b.exe"}`, or
+`{"v":1,"status":"PARTIAL","category":"LIMITS-EXCEEDED","reason":"…"}`.
 
 `STATS` carries the clamd fields `clamdtop` parses, then two exav lines: how much
 this process scanned, how long it took, and (with `--profile`) which matcher the
@@ -112,9 +120,9 @@ archive's verdict:
 /data/big.7z.002: Eicar-Signature FOUND (in big.7z)
 ```
 
-A part of an infected archive is the file you have to act on. A set with a part
-missing comes back `UNSCANNABLE`: those bytes belong to an archive nothing can
-read any more.
+A part of an infected archive is the file you have to act on. A set with a gap in
+its numbering comes back `UNSCANNABLE`: those bytes belong to an archive nothing
+can read any more. A missing last part cannot be seen from the names.
 
 `EXINSTREAM MULTI` does the same for streamed input, with several files in one
 request:
@@ -128,8 +136,10 @@ EXINSTREAM MULTI
 Names are labels; nothing opens or resolves them as paths. The reply is one line
 of JSON, `{"v":1,"files":[…]}`, with one entry per file carrying the same verdict
 fields as a single `EXINSTREAM`, plus `"set"` when the verdict came from a
-rejoined archive. A file the daemon could not hold is answered `UNSCANNABLE` on
-its own, and the rest of the request is still scanned.
+rejoined archive. A file the daemon could not hold in full has what it held
+scanned and is answered `LIMITS-EXCEEDED` unless something is found; the rest of
+the request is still scanned. The reply carries `"truncated": true` when the
+request ended before its terminator, so some files never arrived.
 
 RAR `.partN` and ZIP `.zNN` volumes are not rejoined this way: each carries its
 own headers, so concatenating them produces garbage that still looks like an
@@ -141,7 +151,8 @@ archive. Each is scanned on its own.
 An `INSTREAM` body is buffered before it is scanned: in memory up to
 `--spill-threshold-bytes` (16 MiB), then in a temporary file up to
 `--max-spill-bytes` (2 GiB), with `--max-total-spill-bytes` bounding what one
-process holds at once. A stream past those is answered `UNSCANNABLE`. See
+process holds at once. A stream past those is scanned as far as it was held and
+answered `LIMITS-EXCEEDED`. See
 [buffering a stream](/reference/cli/#buffering-a-stream-spill).
 
 ## Worker pool and per-job limits
@@ -157,17 +168,19 @@ a time under kernel-enforced limits:
 | `--max-process-bytes` | 2 G | address space (`RLIMIT_AS`) |
 | `--max-jobs-per-worker` | 1000 | jobs before a worker is recycled (bounds leaks) |
 
-A process is the only thing that can be stopped safely while stuck inside a
-dependency: a worker past its limit answers its client, exits, and is replaced,
-without touching the rest of the pool. A thread cannot be killed safely, in Rust
-or in C. This is the backstop; the in-engine limits (scan bytes, ratio,
+The 2 G is lowered at startup to what the machine can back, and what a scan
+holds is kept to half of it. [Sizing a server](/guides/sizing/) works this
+through for a 4 GB machine.
+
+A worker past its limit answers its client, exits and is replaced, without
+touching the rest of the pool. The in-engine limits (scan bytes, ratio,
 recursion, emulation steps) fire first.
 
 <Aside type="caution">
-Per-job limits need the pool. `--max-jobs-per-worker` is refused without
-`--workers N`, and `--max-scan-secs` is refused for a serving daemon under
-`--workers threads`, because the thread model cannot stop one job without
-stopping the daemon.
+Per-job limits need the pool, which only a clamd listener has.
+`--max-jobs-per-worker` is refused without it, and `--max-scan-secs` is refused
+for a listener under `--workers threads` or for ICAP served alone, because
+neither can stop one job without stopping the daemon.
 
 `--max-scan-secs` and `--max-process-bytes` still apply to a one-shot scan, where
 they bound the whole process: the run ends instead of a worker being replaced.
@@ -185,8 +198,19 @@ exav --listen /run/exav.sock --log /var/log/exav.log -d /var/lib/exav
 The daemon's results otherwise go only to the client that asked, so this is the
 operator's record. A path scan is logged under its path, a streamed scan as
 `stream:`, a passed descriptor as `fd:`. `PING`, `VERSION` and `STATS` are not
-logged. Workers share one appending descriptor and write each line in a single
-call, so lines never interleave.
+logged. The file is opened for appending and each line is written in a single
+call, so lines from different workers never interleave.
+
+`SIGHUP` reopens the file, as it does for clamd, so logrotate can move it:
+
+```text
+/var/log/exav.log {
+    weekly
+    postrotate
+        systemctl kill -s HUP exav.service
+    endscript
+}
+```
 
 ## Hot-reloading signatures
 
@@ -194,8 +218,7 @@ The daemon refreshes signatures without a restart on any of:
 
 - the clamd `RELOAD` command (what `freshclam`'s `NotifyClamd` sends; the reply
   is `RELOADING`);
-- `SIGHUP` (`kill -HUP <pid>`, `systemctl reload`), an exav addition: clamd uses
-  `SIGHUP` only to reopen its log;
+- `SIGUSR2` (`kill -USR2 <pid>`, `systemctl reload`), as for clamd;
 - a change on disk at whatever `-d` points at (see below);
 - a successful fetch by the built-in updater.
 
@@ -206,11 +229,15 @@ idle ICAP connections are closed. The old pool gets `--max-scan-secs` plus 5
 seconds for this (10 minutes when `--max-scan-secs` is 0). A process still
 there after that, held by an open `IDSESSION` or a client that never finishes
 its request, is stopped and logged; a worker stopped in the middle of a job
-answers it with `ERROR`. Under `--workers threads`, `RELOAD` is accepted
-but there is no pool to re-fork. If the new source is empty or corrupt, the swap
-is refused and the daemon keeps serving the current database.
+answers it with `ERROR`. Under `--workers threads`, and for ICAP served alone,
+the new database is swapped in instead: a connection already open keeps the one
+it started with. If the new source is empty or corrupt, the swap is refused and
+the daemon keeps serving the current database.
 
-### The watch is mtime polling, which is why it crosses volumes
+`SIGHUP` does not reload: it reopens the `--log` file, as for clamd. `SIGTERM`
+and `SIGINT` stop the daemon.
+
+### The watch polls mtimes
 
 Every ~10 seconds the supervisor checks the `-d` source and reloads when its
 newest modification time changes, as clamd's `SelfCheck` does. Any change
@@ -231,14 +258,19 @@ deployment reloads on swap too, with no explicit `RELOAD`.
 
 ## As a managed service
 
-A systemd unit (`packaging/exav-clamd.service`, also shipped in the `.deb`) runs
-exav in place of `clamav-daemon` on the same socket:
+A systemd unit (`packaging/exav.service`, also shipped in the `.deb`) runs exav
+in place of `clamav-daemon` on the same socket, reading the signatures
+`freshclam` keeps in `/var/lib/clamav`:
 
 ```sh
-sudo systemctl stop clamav-daemon && sudo systemctl disable clamav-daemon
-sudo systemctl enable --now exav-clamd
+sudo systemctl disable --now clamav-daemon.socket clamav-daemon.service
+sudo systemctl enable --now exav
 clamdscan --ping 1
 ```
+
+Stopping `clamav-daemon.socket` matters on Debian and Ubuntu: while it holds the
+socket, the first connection starts clamd again. `systemctl reload exav` sends
+`SIGUSR2`.
 
 See [Migrating from ClamAV](/guides/migrating-from-clamav/) for the full swap,
 and the [Docker guide](/guides/docker/) for the containerised daemon.

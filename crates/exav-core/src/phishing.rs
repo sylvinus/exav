@@ -194,16 +194,25 @@ pub fn scan(data: &[u8], db: &PhishingDb) -> Option<Phish> {
 /// [`scan`], also saying whether every link was examined: `false` when the
 /// allow-list budget ran out before the end of `data`.
 pub fn scan_complete(data: &[u8], db: &PhishingDb) -> (Option<Phish>, bool) {
+    scan_complete_source(&data, db)
+}
+
+/// [`scan_complete`] over an object that need not be held in memory.
+pub(crate) fn scan_complete_source(
+    data: &dyn crate::byte_source::ByteSource,
+    db: &PhishingDb,
+) -> (Option<Phish>, bool) {
     let mut allow_checks = 0usize;
-    let mut next = find_anchor(data, 0);
+    let mut bytes = crate::byte_source::Stepper::new(data);
+    let mut next = find_anchor(data, &mut bytes, 0);
     while let Some(start) = next {
-        next = find_anchor(data, start + 3);
+        next = find_anchor(data, &mut bytes, start + 3);
         // An anchor is read up to the next one at most, so no byte is read for
         // two anchors and the whole scan stays linear in `data`.
         let end = next
             .unwrap_or(data.len())
             .min(start.saturating_add(MAX_ANCHOR_SPAN));
-        let region = latin1(&data[start..end]);
+        let region = latin1(&data.window(start, end - start));
         let region_lc = region.to_ascii_lowercase();
         let Some(href) = extract_href(&region, &region_lc) else {
             continue;
@@ -226,12 +235,28 @@ pub fn scan_complete(data: &[u8], db: &PhishingDb) -> (Option<Phish>, bool) {
     (None, true)
 }
 
-/// Offset of the next `<a ` (case-insensitive) at or after `from`.
-fn find_anchor(data: &[u8], from: usize) -> Option<usize> {
-    let hay = data.get(from..)?;
-    memchr::memchr_iter(b'<', hay)
-        .find(|&i| matches!(hay.get(i + 1..i + 3), Some([b'a' | b'A', b' '])))
-        .map(|i| from + i)
+/// Offset of the next `<a ` (case-insensitive) at or after `from`. `bytes`
+/// reads `data` when it is not held in memory, and is kept across calls so
+/// the object is read forward once.
+fn find_anchor(
+    data: &dyn crate::byte_source::ByteSource,
+    bytes: &mut crate::byte_source::Stepper,
+    from: usize,
+) -> Option<usize> {
+    use crate::byte_source::Bytes;
+    if let Some(data) = data.as_slice() {
+        let hay = data.get(from..)?;
+        return memchr::memchr_iter(b'<', hay)
+            .find(|&i| matches!(hay.get(i + 1..i + 3), Some([b'a' | b'A', b' '])))
+            .map(|i| from + i);
+    }
+    let n = data.len();
+    (from..n).find(|&i| {
+        bytes.at(i) == b'<'
+            && i + 2 < n
+            && matches!(bytes.at(i + 1), b'a' | b'A')
+            && bytes.at(i + 2) == b' '
+    })
 }
 
 /// True if the `.wdb` allow-list covers this (href, display) pair.
@@ -432,6 +457,32 @@ mod tests {
 
     fn scan0(data: &[u8]) -> Option<Phish> {
         scan(data, &PhishingDb::default())
+    }
+
+    #[test]
+    fn a_page_read_in_blocks_is_judged_as_in_memory() {
+        use crate::byte_source::{BlockCache, CHUNK};
+        let benign: &[u8] = br#"<A href="http://example.com/page">example.com</A> "#;
+        let spoof: &[u8] =
+            br#"<a href="http://evil.example/login">https://www.paypal.com/signin</a>"#;
+        for at in [0, CHUNK - 3, CHUNK - 40, 3 * CHUNK + 1] {
+            let mut page = Vec::new();
+            while page.len() < at {
+                page.extend_from_slice(benign);
+            }
+            page.truncate(at);
+            page.extend_from_slice(spoof);
+            page.extend_from_slice(&benign.repeat(50));
+            let cache =
+                BlockCache::with_sizes(std::io::Cursor::new(page.clone()), 61, 4 * 61).unwrap();
+            let want = scan_complete(&page, &PhishingDb::default());
+            assert_eq!(want.0, Some(Phish::SpoofedDomain), "at {at}");
+            assert_eq!(
+                scan_complete_source(&cache, &PhishingDb::default()),
+                want,
+                "at {at}"
+            );
+        }
     }
 
     #[test]

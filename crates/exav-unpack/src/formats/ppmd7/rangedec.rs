@@ -2,9 +2,8 @@
 //!
 //! Two coders share the var.H model:
 //!
-//! * [`SevenZRangeDecoder`] — the 7-Zip range coder, vendored from `ppmd-rust`
-//!   1.4.0 (CC0-1.0 OR MIT-0). Used to validate the vendored model against
-//!   real `.7z` PPMd streams produced by the `7z` CLI.
+//! * [`SevenZRangeDecoder`]: the 7-Zip range coder, vendored from `ppmd-rust`
+//!   1.4.0 (CC0-1.0 OR MIT-0), for 7z and ZIP PPMd members.
 //! * [`RarRangeDecoder`] — RAR's Subbotin carry-less range coder. Its
 //!   arithmetic (`Low`/`Code`/`Range`/`Bottom`, the `(Low ^ (Low+Range))`
 //!   normalisation, the no-leading-byte init) is reproduced from libarchive's
@@ -15,6 +14,8 @@
 //! stays allocation-free w.r.t. the input. `out_of_data` records truncation:
 //! once the source is exhausted, reads yield 0 and the flag is set, letting the
 //! framing layer stop cleanly instead of looping.
+// Each coder is dead in a build without the format that uses it.
+#![cfg_attr(not(all(feature = "rar", feature = "sevenz")), allow(dead_code))]
 
 use super::RangeDec;
 
@@ -23,8 +24,8 @@ const K_TOP_VALUE: u32 = 1 << 24;
 const PPMD_BIN_SCALE: u32 = 1 << 14;
 
 /// A byte source over an in-memory slice that yields 0 past the end and records
-/// that it ran out (so the model can detect truncation). Only the test-only
-/// `SevenZRangeDecoder` uses it; `RarRangeDecoder` owns its buffer directly.
+/// that it ran out (so the model can detect truncation). `SevenZRangeDecoder`
+/// uses it; `RarRangeDecoder` owns its buffer directly.
 struct ByteIn<'a> {
     data: &'a [u8],
     pos: usize,

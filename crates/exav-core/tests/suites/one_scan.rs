@@ -35,9 +35,9 @@ fn zip_with(member: &[u8], comment: &str) -> Vec<u8> {
     z.finish().unwrap().into_inner()
 }
 
-/// Over `--max-input-bytes` the first bytes get the whole scan, not only the
-/// literal pass: EICAR deflated inside a ZIP is not in the file's bytes, and
-/// only extraction finds it.
+/// Over `--max-input-bytes` the first bytes get the whole scan, extraction
+/// included: EICAR deflated inside a ZIP is not in the file's bytes, and only
+/// extraction finds it.
 #[test]
 fn the_start_of_an_oversize_input_gets_the_whole_scan() {
     // Compressible text first, so the deflater codes EICAR rather than

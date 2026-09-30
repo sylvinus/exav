@@ -348,6 +348,8 @@ fn every_flag_named_in_a_message_exists() {
         "alert-phishing-cloak",
         "alert-partition-intersection",
         "alert-encrypted",
+        "alert-encrypted-archive",
+        "alert-encrypted-doc",
         "alert-exceeds-max",
         "structured-ssn-count",
         "structured-cc-count",
@@ -361,6 +363,8 @@ fn every_flag_named_in_a_message_exists() {
         // Spellings named to explain why they are not the ones exav uses.
         "max-depth",
         "password",
+        // Removed from exav, named in the error that says what replaced it.
+        "max-extracted-bytes",
     ];
 
     let real = flags_in_help();

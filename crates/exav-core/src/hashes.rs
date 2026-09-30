@@ -1,8 +1,5 @@
-//! Hash signatures (`.hdb`/`.hsb`-style) and a streaming
-//! tee-hasher that computes MD5/SHA1/SHA256 in the same single pass used
-//! for pattern matching — so whole-file hash detection works at any size.
-
-use std::io::{self, Read};
+//! Hash signatures (`.hdb`/`.hsb`-style) and the MD5/SHA1/SHA256 digests they
+//! are matched against, computed in one pass over an object of any size.
 
 use md5::Md5;
 use serde::{Deserialize, Serialize};
@@ -136,8 +133,33 @@ macro_rules! digest_table {
             fn get(&self, key: &[u8; $n], size: u64) -> Option<(&str, bool)> {
                 self.sized.get(&(size, *key)).or_else(|| self.any.get(key))
             }
+            /// Whether a signature could match an object of `size` bytes: one
+            /// of any size, or one of exactly that size.
+            fn wants(&self, size: u64) -> bool {
+                let keys = &self.sized.keys;
+                let i = keys.partition_point(|k| k.0 < size);
+                !self.any.keys.is_empty() || keys.get(i).is_some_and(|k| k.0 == size)
+            }
         }
     };
+}
+
+/// Which digests a lookup can use for an object of one size.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Want {
+    pub(crate) md5: bool,
+    pub(crate) sha1: bool,
+    pub(crate) sha256: bool,
+}
+
+impl Want {
+    pub(crate) fn union(self, o: Want) -> Want {
+        Want {
+            md5: self.md5 || o.md5,
+            sha1: self.sha1 || o.sha1,
+            sha256: self.sha256 || o.sha256,
+        }
+    }
 }
 digest_table!(Md5Table, 16);
 digest_table!(Sha1Table, 20);
@@ -230,6 +252,17 @@ impl HashDb {
         }
     }
 
+    /// The digests [`Self::lookup`] can match for an object of `size` bytes:
+    /// only those of an algorithm with a signature of any size, or of that
+    /// size. Most objects need none of the SHA ones, and some none at all.
+    pub(crate) fn wants(&self, size: u64) -> Want {
+        Want {
+            md5: self.md5.wants(size),
+            sha1: self.sha1.wants(size),
+            sha256: self.sha256.wants(size),
+        }
+    }
+
     /// Look up computed digests for a file of `size` bytes; returns the matching
     /// signature's `(clean_name, unofficial)`. A sized signature matches only at
     /// that exact length; a `*` signature matches any length.
@@ -290,7 +323,7 @@ impl SectionHashDb {
     }
 
     /// Parse `.mdb`/`.mdu`/`.msb` lines (`SectionSize:HASH:Name`). The first
-    /// field is the size, the second the hash — the opposite field order from
+    /// field is the size, the second the hash: the opposite field order from
     /// `.hdb`, so this does not reuse `parse_hash_line`.
     pub fn extend_from_text(&mut self, text: &str) {
         self.extend_from_text_prov(text, false);
@@ -373,55 +406,6 @@ pub struct Digests {
     pub sha256: String,
 }
 
-/// A reader wrapper that updates MD5/SHA1/SHA256 with every byte read,
-/// so hashing piggybacks on the streaming pattern-match pass.
-pub struct TeeHasher<R> {
-    inner: R,
-    md5: Md5,
-    sha1: Sha1,
-    sha256: Sha256,
-    len: u64,
-}
-
-impl<R: Read> TeeHasher<R> {
-    pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            md5: Md5::new(),
-            sha1: Sha1::new(),
-            sha256: Sha256::new(),
-            len: 0,
-        }
-    }
-
-    /// Total bytes hashed so far (the file size once the stream is consumed).
-    pub fn bytes_read(&self) -> u64 {
-        self.len
-    }
-
-    /// Finalize and return hex digests. Consumes the hasher.
-    pub fn finalize(self) -> Digests {
-        Digests {
-            md5: encode_hex(&self.md5.finalize()),
-            sha1: encode_hex(&self.sha1.finalize()),
-            sha256: encode_hex(&self.sha256.finalize()),
-        }
-    }
-}
-
-impl<R: Read> Read for TeeHasher<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.md5.update(&buf[..n]);
-            self.sha1.update(&buf[..n]);
-            self.sha256.update(&buf[..n]);
-            self.len += n as u64;
-        }
-        Ok(n)
-    }
-}
-
 /// Digests for section-hash matching: always MD5; SHA1/SHA256 only when
 /// `want_sha` (i.e. `.msb` signatures are loaded), since they are otherwise
 /// unused. Skipped fields are left empty and their lookups simply miss.
@@ -440,30 +424,71 @@ pub fn section_digests(data: &[u8], want_sha: bool) -> Digests {
 /// Compute digests over a byte slice (used for already-buffered content
 /// such as extracted archive entries).
 pub fn digests_of(data: &[u8]) -> Digests {
-    // Single pass: feed each cache-resident chunk to all three hashers at once,
-    // rather than three independent full passes over `data`. For large buffers
-    // (e.g. a big archive member) three passes evict the buffer from cache
-    // between each, tripling memory traffic; chunking keeps each ~16 KiB slice
-    // hot in L1/L2 across md5+sha1+sha256. Output is byte-identical.
-    let mut md5 = Md5::new();
-    let mut sha1 = Sha1::new();
-    let mut sha256 = Sha256::new();
-    for chunk in data.chunks(16 * 1024) {
-        md5.update(chunk);
-        sha1.update(chunk);
-        sha256.update(chunk);
+    digests_of_source(&data)
+}
+
+/// [`digests_of`] an object that need not be held in memory.
+pub(crate) fn digests_of_source(data: &dyn crate::byte_source::ByteSource) -> Digests {
+    let all = Want {
+        md5: true,
+        sha1: true,
+        sha256: true,
+    };
+    digests_wanted(data, all)
+}
+
+/// The digests of `data` that `want` asks for; the others are left empty, and
+/// a lookup of them misses. Wanting none reads nothing.
+pub(crate) fn digests_wanted(data: &dyn crate::byte_source::ByteSource, want: Want) -> Digests {
+    let mut h = Hashing::new(want);
+    if want != Want::default() {
+        data.chunks(0, data.len(), &mut |_, piece| {
+            h.update(piece);
+            true
+        });
     }
-    Digests {
-        md5: encode_hex(&md5.finalize()),
-        sha1: encode_hex(&sha1.finalize()),
-        sha256: encode_hex(&sha256.finalize()),
+    h.finish()
+}
+
+/// The digests [`digests_wanted`] computes, fed an object's bytes in order by
+/// a read that serves other searches too.
+pub(crate) struct Hashing {
+    md5: Option<Md5>,
+    sha1: Option<Sha1>,
+    sha256: Option<Sha256>,
+}
+
+impl Hashing {
+    pub(crate) fn new(want: Want) -> Self {
+        Hashing {
+            md5: want.md5.then(Md5::new),
+            sha1: want.sha1.then(Sha1::new),
+            sha256: want.sha256.then(Sha256::new),
+        }
+    }
+
+    pub(crate) fn update(&mut self, piece: &[u8]) {
+        // Every hasher over a 16 KiB slice before the next, which stays in
+        // L1/L2 across them.
+        for chunk in piece.chunks(16 * 1024) {
+            self.md5.iter_mut().for_each(|h| h.update(chunk));
+            self.sha1.iter_mut().for_each(|h| h.update(chunk));
+            self.sha256.iter_mut().for_each(|h| h.update(chunk));
+        }
+    }
+
+    pub(crate) fn finish(self) -> Digests {
+        Digests {
+            md5: self.md5.map_or_else(String::new, |h| encode_hex(&h.finalize())),
+            sha1: self.sha1.map_or_else(String::new, |h| encode_hex(&h.finalize())),
+            sha256: self.sha256.map_or_else(String::new, |h| encode_hex(&h.finalize())),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn known_md5() {
@@ -472,18 +497,6 @@ mod tests {
         assert_eq!(d.md5, "d41d8cd98f00b204e9800998ecf8427e");
         // sha256("") = e3b0c442...
         assert!(d.sha256.starts_with("e3b0c44298fc1c14"));
-    }
-
-    #[test]
-    fn tee_matches_direct() {
-        let data = b"the quick brown fox";
-        let mut tee = TeeHasher::new(Cursor::new(data.to_vec()));
-        let mut sink = Vec::new();
-        tee.read_to_end(&mut sink).unwrap();
-        let teed = tee.finalize();
-        let direct = digests_of(data);
-        assert_eq!(teed.md5, direct.md5);
-        assert_eq!(teed.sha256, direct.sha256);
     }
 
     #[test]

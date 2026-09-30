@@ -14,6 +14,9 @@ whose required notices are reproduced in `NOTICE`. Among them:
   source and test vectors under BSD-3-Clause, with attribution retained
   (`LICENSE-YARA-X`). It compiles rules to a native tree-walking evaluator, with
   no WASM runtime or JIT behind it.
+- exav also contains code ported from permissively licensed projects (RAR, AZO,
+  CAB, DMG, HWP, PPMd and bzip2 decoders among them, and `iced-x86`'s generated decoder
+  tables), each attributed in `NOTICE`.
 - The WASM sandbox runs exav under a WASI runtime you provide, under its own
   license; exav does not bundle it. See the [WASM sandbox guide](/guides/wasm-sandbox/).
 
@@ -21,7 +24,8 @@ whose required notices are reproduced in `NOTICE`. Among them:
 
 exav does not bundle or redistribute the GPL-licensed ClamAV signature database.
 It can read the CVD format (reading a format is interoperability, not
-redistribution), but the signatures are fetched by you with Cisco's own updater.
+redistribution), but the signatures are fetched by you, with `freshclam` or
+`cvdupdate`, or with exav's `--auto-update` from a URL you supply.
 See [Signatures](/guides/signatures/).
 
 exav ships no signature database of its own, only a built-in EICAR test

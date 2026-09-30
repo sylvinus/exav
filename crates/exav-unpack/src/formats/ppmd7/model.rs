@@ -1224,11 +1224,13 @@ impl<RC: RangeDec> Ppmd7<RC> {
     /// 0x20 reset flag): `PpmdRAR_RangeDec_Init` re-initialises the range coder
     /// over the bytes that follow, but the context tree / SEE / suballocator are
     /// carried over unchanged.
+    #[cfg_attr(not(feature = "rar"), allow(dead_code))]
     pub(crate) fn replace_rc(&mut self, rc: RC) {
         self.rc = rc;
     }
 
     /// Input bytes consumed by the range decoder so far.
+    #[cfg_attr(not(feature = "rar"), allow(dead_code))]
     pub(crate) fn rc_bytes_consumed(&self) -> usize {
         self.rc.bytes_consumed()
     }

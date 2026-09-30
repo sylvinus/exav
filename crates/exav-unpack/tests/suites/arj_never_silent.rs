@@ -9,7 +9,8 @@
 //! so the surrounding structure stays valid and the test exercises the
 //! path it claims to.
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 fn sample() -> Vec<u8> {
     let p = format!("{}/tests/fixtures/sample.arj", env!("CARGO_MANIFEST_DIR"));

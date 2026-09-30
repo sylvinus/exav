@@ -4,6 +4,7 @@
 use super::header::Coder;
 use super::parse::*;
 use crate::LimitHit;
+use lzma_rust2::filter::bcj::BcjReader;
 use std::io::{self, Read};
 
 /// Return true if `id` is a codec we can decode.
@@ -68,7 +69,7 @@ pub(super) fn wrap_coder(
             // Bound the up-front dictionary allocation. `expected_size` is a
             // header var-int and nothing else bounds it, so it is no ceiling on
             // its own; `max_buffer` is. Keep the declared output as the tighter
-            // of the two — a dictionary larger than the bytes it will be used to
+            // of the two: a dictionary larger than the bytes it will be used to
             // look back into cannot be consulted.
             let dict_size = crate::bounded_dict(dict_size, (expected_size as u64).min(max_buffer));
             let decoder = lzma_rust2::LzmaReader::new_with_props(
@@ -115,7 +116,7 @@ pub(super) fn wrap_coder(
         }
 
         x if x == ID_BZIP2 => {
-            let decoder = bzip2_rs::DecoderReader::new(inner);
+            let decoder = crate::formats::bzip2_rs::DecoderReader::new(inner);
             Ok(Box::new(decoder))
         }
 
@@ -124,20 +125,9 @@ pub(super) fn wrap_coder(
             Ok(Box::new(decoder))
         }
 
-        x if x == ID_BCJ_X86 => {
-            let filter = BcjX86Filter::new(inner, max_buffer);
-            Ok(Box::new(filter))
-        }
-
-        x if x == ID_BCJ_ARM => {
-            let filter = BcjArmFilter::new(inner, max_buffer);
-            Ok(Box::new(filter))
-        }
-
-        x if x == ID_BCJ_ARM64 => {
-            let filter = BcjArm64Filter::new(inner, max_buffer);
-            Ok(Box::new(filter))
-        }
+        x if x == ID_BCJ_X86 => Ok(Box::new(BcjReader::new_x86(inner, 0))),
+        x if x == ID_BCJ_ARM => Ok(Box::new(BcjReader::new_arm(inner, 0))),
+        x if x == ID_BCJ_ARM64 => Ok(Box::new(BcjReader::new_arm64(inner, 0))),
 
         x if x == ID_DELTA => {
             let distance = if coder.properties.is_empty() {
@@ -188,7 +178,7 @@ impl<R: Read> Ppmd7ZReader<R> {
         }
         // The model arena is `mem_size` bytes and the field is a full u32, so a
         // tiny archive can otherwise ask for ~4 GiB before decoding anything.
-        // The allocation is fallible, so this is not a crash — but the caller's
+        // The allocation is fallible, so this is not a crash, but the caller's
         // buffer cap is what says how much memory this scan may claim, and the
         // model has to answer to it like everything else. The ZIP method-98 path
         // clamps for the same reason.
@@ -212,7 +202,7 @@ impl<R: Read> Ppmd7ZReader<R> {
 
     fn init_and_decode(&mut self) -> Result<(), LimitHit> {
         // Bound both the compressed input and the decoded output by the global
-        // peak-buffer limit — PPMd amplifies heavily.
+        // peak-buffer limit: PPMd amplifies heavily.
         let (buf, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
             .map_err(|e| LimitHit::corrupt(format!("7z: PPMD read: {e}")))?;
         if truncated {
@@ -276,245 +266,6 @@ impl<R: Read> Read for Ppmd7ZReader<R> {
     }
 }
 
-// ─── BCJ x86 filter ────────────────────────────────────────────────────────
-
-struct BcjX86Filter<R: Read> {
-    inner: R,
-    buf: Vec<u8>,
-    pos: usize,
-    max_buffer: u64,
-}
-
-impl<R: Read> BcjX86Filter<R> {
-    fn new(inner: R, max_buffer: u64) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            pos: 0,
-            max_buffer,
-        }
-    }
-}
-
-impl<R: Read> Read for BcjX86Filter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            let (data, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if truncated {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "7z BCJ input exceeds max-buffer",
-                ));
-            }
-            self.buf = data;
-            apply_bcj_x86(&mut self.buf);
-            self.pos = 0;
-        }
-
-        if self.pos >= self.buf.len() {
-            return Ok(0);
-        }
-
-        let available = &self.buf[self.pos..];
-        let to_copy = buf.len().min(available.len());
-        buf[..to_copy].copy_from_slice(&available[..to_copy]);
-        self.pos += to_copy;
-        Ok(to_copy)
-    }
-}
-
-fn apply_bcj_x86(data: &mut [u8]) {
-    let mut i = 0;
-    let mut ip: u32 = 0;
-
-    while i + 4 < data.len() {
-        let b = data[i];
-
-        if b == 0xE8 || b == 0xE9 {
-            let rel = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
-            let addr = ip.wrapping_add(5).wrapping_add(rel as u32);
-            data[i + 1] = addr as u8;
-            data[i + 2] = (addr >> 8) as u8;
-            data[i + 3] = (addr >> 16) as u8;
-            data[i + 4] = (addr >> 24) as u8;
-        }
-
-        let len = match b {
-            0x0F => {
-                if i + 1 < data.len() {
-                    match data[i + 1] {
-                        0x80..=0x8F => 6,
-                        _ => 2,
-                    }
-                } else {
-                    1
-                }
-            }
-            0x80..=0x83 => 6,
-            0x88..=0x8B => 2,
-            0xA1..=0xA3 => 5,
-            0xB8..=0xBF => 5,
-            0xC2..=0xC3 => 1,
-            0xC8 => 4,
-            0xE8 => 5,
-            0xE9 => 5,
-            0xEB => 2,
-            0x68 => 5,
-            0x6A => 2,
-            0xFF => {
-                if i + 1 < data.len() && (data[i + 1] & 0x38) == 0x10 {
-                    6
-                } else {
-                    2
-                }
-            }
-            _ => 1,
-        };
-
-        i += len;
-        ip = ip.wrapping_add(len as u32);
-    }
-}
-
-// ─── BCJ ARM filter ────────────────────────────────────────────────────────
-
-struct BcjArmFilter<R: Read> {
-    inner: R,
-    buf: Vec<u8>,
-    pos: usize,
-    max_buffer: u64,
-}
-
-impl<R: Read> BcjArmFilter<R> {
-    fn new(inner: R, max_buffer: u64) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            pos: 0,
-            max_buffer,
-        }
-    }
-}
-
-impl<R: Read> Read for BcjArmFilter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            let (data, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if truncated {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "7z BCJ input exceeds max-buffer",
-                ));
-            }
-            self.buf = data;
-            apply_bcj_arm(&mut self.buf);
-            self.pos = 0;
-        }
-        if self.pos >= self.buf.len() {
-            return Ok(0);
-        }
-        let available = &self.buf[self.pos..];
-        let n = buf.len().min(available.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
-fn apply_bcj_arm(data: &mut [u8]) {
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        let w = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        if (w >> 24) == 0xEB || (w >> 24) == 0xFB {
-            let rel = (w & 0x00FFFFFF) << 2;
-            let sign = if w & 0x00800000 != 0 {
-                0xFF000000u32
-            } else {
-                0
-            };
-            let addr = (i as u32).wrapping_add(8).wrapping_add(sign | rel);
-            let corrected = addr.wrapping_sub(i as u32);
-            let new_rel = corrected >> 2;
-            data[i] = (new_rel & 0xFF) as u8;
-            data[i + 1] = ((new_rel >> 8) & 0xFF) as u8;
-            data[i + 2] = ((new_rel >> 16) & 0xFF) as u8;
-            data[i + 3] = (data[i + 3] & 0xF0) | ((new_rel >> 24) as u8 & 0x0F);
-        }
-        i += 4;
-    }
-}
-
-// ─── BCJ ARM64 filter ──────────────────────────────────────────────────────
-
-struct BcjArm64Filter<R: Read> {
-    inner: R,
-    buf: Vec<u8>,
-    pos: usize,
-    max_buffer: u64,
-}
-
-impl<R: Read> BcjArm64Filter<R> {
-    fn new(inner: R, max_buffer: u64) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            pos: 0,
-            max_buffer,
-        }
-    }
-}
-
-impl<R: Read> Read for BcjArm64Filter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            let (data, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if truncated {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "7z BCJ input exceeds max-buffer",
-                ));
-            }
-            self.buf = data;
-            apply_bcj_arm64(&mut self.buf);
-            self.pos = 0;
-        }
-        if self.pos >= self.buf.len() {
-            return Ok(0);
-        }
-        let available = &self.buf[self.pos..];
-        let n = buf.len().min(available.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
-fn apply_bcj_arm64(data: &mut [u8]) {
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        let w = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        if (w >> 26) == 0x05 || (w >> 26) == 0x17 {
-            let imm26 = w & 0x03FFFFFF;
-            let sign = if imm26 & 0x02000000 != 0 {
-                0xFC000000u32
-            } else {
-                0
-            };
-            let addr = (i as u32).wrapping_add(sign | (imm26 << 2));
-            let corrected = addr.wrapping_sub(i as u32);
-            let new_imm = corrected >> 2;
-            data[i] = (new_imm & 0xFF) as u8;
-            data[i + 1] = ((new_imm >> 8) & 0xFF) as u8;
-            data[i + 2] = ((new_imm >> 16) & 0xFF) as u8;
-            data[i + 3] = (data[i + 3] & 0xFC) | ((new_imm >> 24) as u8 & 0x03);
-        }
-        i += 4;
-    }
-}
-
 // ─── Delta filter ──────────────────────────────────────────────────────────
 
 struct DeltaFilter<R: Read> {
@@ -545,18 +296,5 @@ impl<R: Read> Read for DeltaFilter<R> {
             self.pos += 1;
         }
         Ok(n)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bcj_x86_basic() {
-        let mut data = vec![0xE8, 0x10, 0x00, 0x00, 0x00];
-        data.resize(1024, 0);
-        apply_bcj_x86(&mut data);
-        assert_eq!(data[0], 0xE8);
     }
 }

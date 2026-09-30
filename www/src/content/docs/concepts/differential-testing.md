@@ -12,13 +12,15 @@ It is a compliance harness, not a benchmark. It records timings, which help spot
 a wedged file or a much slower engine, but they are taken under concurrency
 against a cold page cache and are not performance numbers.
 
-The harness lives in the repository's `scripts/`; this page is the concept, not
-the runbook.
+The harness lives in the repository's `scripts/`; this page is the concept. The
+runbook is
+[`docs/DIFF_TESTING.md`](https://github.com/sylvinus/exav/blob/main/docs/DIFF_TESTING.md),
+and the smallest run is `LIMIT=500 scripts/difftest.sh`.
 
 ## The setup
 
-- **Corpus:** live malware, scanned statically and never executed (not in the
-  repository).
+- **Corpus:** live malware from MalwareBazaar, scanned statically and never
+  executed (not in the repository).
 - **Same database:** both engines load the same signature set (`daily.cvd` only,
   or the full `main` + `daily`), or the comparison means nothing.
 - **Same client:** one program drives both daemons, so a difference cannot come
@@ -39,12 +41,13 @@ Results are bucketed, because "they disagreed" is rarely useful on its own:
 | Bucket | Meaning |
 |---|---|
 | `AGREE` / `clean` | identical signature sets, or both clean: the headline metric |
-| `PARTIAL` | the sets overlap: same malware, one engine also named more |
+| `PARTIAL` | the sets overlap: same malware, one engine also named more (not the `PARTIAL` verdict) |
 | `NAMEDIFF` | the sets are disjoint: a real disagreement about what this is |
 | `FN` | clamscan detected, exav did not: a real gap |
 | `EXAV_ONLY` | exav detected, clamscan said clean: verify before assuming a false positive |
 | `CAREFUL` | exav reported not fully scanned; clamscan said OK |
 | `CAREFUL_FN` | clamscan detected; exav reported not fully scanned |
+| `CLAM_GAVE_UP` | clamscan hit its own scan limit; exav completed the scan |
 | `ERROR` | a scan failed, so there is nothing to compare |
 
 `EXAV_ONLY` is not called "false positive" because it has mostly been hits inside
@@ -59,10 +62,11 @@ sample. Agreement is what matters.
 
 ## `--clamav-compat`: matching boundaries, not quirks
 
-By default exav runs at full capability. For a like-for-like run,
+By default exav runs at full capability, and the harness runs it with
+`--clamav-compat` (`COMPAT=0` measures what exav adds). For a like-for-like run,
 `--clamav-compat` sets a stock ClamAV build's documented defaults: the limit
-values (`--max-input-bytes 100M`, `--max-extracted-bytes 400M`,
-`--max-unpack-depth 17`, `--max-members 10000`, `--decode none`), the extractor
+values (`--max-input-bytes 100M`, 400M held per file, `--max-unpack-depth 17`,
+`--max-members 10000`, `--decode none`), the extractor
 set, `.UNOFFICIAL` naming for unofficial-database signatures, and
 `--partial-as ok`, so a file ClamAV would call clean is answered `OK` here too.
 Each limit is also its own flag, and an explicit flag wins over the preset.

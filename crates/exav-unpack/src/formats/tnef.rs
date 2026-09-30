@@ -32,6 +32,17 @@ fn attachment_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
+/// Walk a TNEF blob, each attachment streamed from where it lies.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let mut source = crate::source::Reader::new(src);
+    let members = stream_offsets(&mut source, budget.limits().max_buffer_bytes)?;
+    crate::stream::stream_stored(&mut source, budget, visit, members)
+}
+
 /// Streaming variant: walk the TLV records off a seekable source and return each
 /// attachment payload as `(name, offset, size)`; titles are read to name them.
 pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
@@ -88,68 +99,6 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
         }
     }
     Ok(out)
-}
-
-pub(crate) fn extract_tnef<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    let len = data.len();
-    if len < 6 || !data.starts_with(&TNEF_SIGNATURE_LE) {
-        return Ok(None);
-    }
-    let le32 = |p: usize| u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
-    let mut pos = 6usize; // signature + key
-    let mut name: Option<String> = None;
-
-    while pos < len {
-        let level = data[pos];
-        pos += 1;
-        if level == 0 {
-            break;
-        }
-        if pos + 8 > len {
-            break;
-        }
-        let tag = (le32(pos) & 0xFFFF) as u16;
-        let length = le32(pos + 4) as usize;
-        pos += 8;
-        if length == 0 {
-            continue;
-        }
-        let data_start = pos;
-        let clamped = length.min(len - data_start);
-        let truncated = clamped < length;
-        let record = &data[data_start..data_start + clamped];
-
-        if level == LVL_ATTACHMENT {
-            match tag {
-                ATT_ATTACHTITLE => name = Some(attachment_name(record)),
-                ATT_ATTACHDATA | ATT_ATTACHMENT => {
-                    budget.count_entry()?;
-                    let cap = budget.reserve()?;
-                    if clamped as u64 > cap {
-                        return Err(LimitHit::new("tnef attachment exceeds budget".to_string()));
-                    }
-                    let member_name = name
-                        .clone()
-                        .unwrap_or_else(|| "tnef-attachment".to_string());
-                    let bytes = record.to_vec();
-                    budget.commit(bytes.len() as u64);
-                    if let Some(r) = visit(Entry::new(member_name, bytes), budget) {
-                        return Ok(Some(r));
-                    }
-                }
-                _ => {}
-            }
-        }
-        pos = (data_start + clamped).saturating_add(2);
-        if truncated {
-            break;
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]

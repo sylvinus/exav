@@ -18,42 +18,47 @@ signatures loaded it refuses to run. Fetching signatures is the first step below
 1. **Get ClamAV signatures** with Cisco's own updater:
 
    ```sh
-   pip install cvdupdate
-   cvd update                  # or `freshclam`
+   pipx install cvdupdate      # or `pip install --user cvdupdate`
+   cvd update
    ```
 
    This populates `~/.cvdupdate/database` with `main.cvd`, `daily.cvd` and
-   `bytecode.cvd`. See [Signatures](/guides/signatures/) for the licensing
-   background and third-party feeds.
+   `bytecode.cvd`. If `freshclam` already keeps a database current, use its
+   directory instead (usually `/var/lib/clamav`) in the commands below. See
+   [Signatures](/guides/signatures/) for the licensing background and
+   third-party feeds.
 
-2. **Scan a file**, pointing `-d` at that directory:
+2. **Check that detection works** with the EICAR test file, which every scanner
+   detects and which is harmless:
+
+   ```sh
+   printf '%s%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-' \
+     'TEST-FILE!$H+H*' > eicar.com
+   exav -d ~/.cvdupdate/database eicar.com
+   ```
+
+   ```console
+   eicar.com: Eicar-Test-Signature FOUND
+   ```
+
+3. **Scan a file.** The output follows `clamscan`'s format:
 
    ```sh
    exav -d ~/.cvdupdate/database suspicious.bin
    ```
 
-   The output follows `clamscan`'s format:
-
-   ```console
-   suspicious.bin: Win.Trojan.Agent-1234 FOUND
-   ```
-
-   or, for a clean file:
-
    ```console
    suspicious.bin: OK
    ```
 
-3. **Scan a directory.** It is recursive by default; `--quiet` prints only errors
-   and detections:
+4. **Scan a directory.** It is recursive by default; `--quiet` prints only
+   detections, partial results and errors:
 
    ```sh
    exav -d ~/.cvdupdate/database --quiet /var/www
    ```
 
-4. **Scan stdin** with `-`. The stream is held in memory up to
-   `--spill-threshold-bytes` (16 MiB), then in a temporary file up to
-   `--max-spill-bytes` (2 GiB), and scanned like a file:
+5. **Scan stdin** with `-`:
 
    ```sh
    cat backup.tar.gz | exav -d ~/.cvdupdate/database -
@@ -61,33 +66,11 @@ signatures loaded it refuses to run. Fetching signatures is the first step below
 
 </Steps>
 
-## Alternative: let exav fetch the signatures
-
-With [HTTP support](/reference/feature-flags/#adding-http-support) built in, exav
-can pull Cisco's CVDs itself, replacing step 1:
-
-```sh
-export EXAV_SIG_SOURCES=https://database.clamav.net/
-exav -d ~/.exav-db --auto-update suspicious.bin
-```
-
-The trailing slash makes the value a mirror base, expanded to
-`main`/`daily`/`bytecode.cvd`; an exact `…/daily.cvd` URL is fetched as given.
-Sources are validated into `-d`, which is then loaded for the scan, and
-`--auto-update` keeps them current while the process runs. This needs a
-`--features http` build (see [Installation](/getting-started/installation/)).
-
 ## Exit codes
 
 The status is the last word on each result line, and each status has an exit
-code:
-
-| Exit | Status | Meaning |
-|---|---|---|
-| `0` | `OK` | Every file was fully scanned and nothing matched. |
-| `1` | `FOUND` | At least one detection. |
-| `2` | `ERROR` | exav could not do its job: an unreadable path, a database that would not load. |
-| `3` | `PARTIAL` | Something could not be fully examined: `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. |
+code: `0` for `OK`, `1` for `FOUND`, `2` for `ERROR` (exav could not do its job),
+and `3` for `PARTIAL` (something could not be fully examined).
 
 <Aside type="note">
 `clamscan` reports `OK` and exits `0` for a file it could not fully scan; exav
@@ -108,17 +91,23 @@ exav -d ~/.cvdupdate/database --build-db exav.exavdb   # heavy, run daily in CI
 exav -d exav.exavdb /data                              # fast cold start
 ```
 
-See the [prebuilt database guide](/guides/prebuilt-database/).
+A `.exavdb` is tied to the exav version that built it: after upgrading exav,
+rebuild it. See the [prebuilt database guide](/guides/prebuilt-database/).
 
 ## Run it as a daemon
 
 Load the database once and serve scans over a socket, so callers pay no per-scan
-load cost:
+load cost. The daemon stays in the foreground, so run the client from a second
+terminal:
 
 ```sh
-exav --listen /run/user/1000/exav.sock -d exav.exavdb   # load once, serve
-exav --connect /run/user/1000/exav.sock /data           # client
+exav --listen "$XDG_RUNTIME_DIR/exav.sock" -d exav.exavdb   # load once, serve
+exav --connect "$XDG_RUNTIME_DIR/exav.sock" /data           # client
 ```
+
+A daemon can also keep its signatures current itself, fetching from a mirror
+with `--auto-update` (a `--features http` build); see
+[Signatures](/guides/signatures/#built-in-updater---auto-update).
 
 `--listen` accepts connections and `--connect` makes one. The protocol travels in
 the address: `--listen icap://0.0.0.0:1344` serves ICAP, and naming both serves

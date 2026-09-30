@@ -35,26 +35,24 @@ fn zip_lzma_member_is_decoded() {
 #[test]
 #[cfg(feature = "lzip")]
 fn zip_lzma_member_is_decoded_once_when_streamed() {
-    use exav_unpack::{stream_members, MemberMeta};
-    use std::io::Read;
+    use exav_unpack::{walk, Member, MemberMeta};
     let blob = fixture("eicar_lzma.zip");
     let mut budget = Budget::new(Limits::default());
     let mut seen = Vec::new();
-    let mut visit = |m: &MemberMeta, r: Option<&mut dyn Read>, _: &mut Budget| {
-        let mut data = Vec::new();
-        if let Some(r) = r {
-            r.read_to_end(&mut data).unwrap();
-        }
+    let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+        let data = match content {
+            None => Vec::new(),
+            Some(Member::Bytes(d)) => d,
+            Some(Member::Stream(r)) => {
+                let mut d = Vec::new();
+                r.read_to_end(&mut d).unwrap();
+                d
+            }
+        };
         seen.push((m.name.clone(), m.unsupported, data));
         None::<()>
     };
-    stream_members(
-        Format::Zip,
-        std::io::Cursor::new(blob),
-        &mut budget,
-        &mut visit,
-    )
-    .unwrap();
+    walk(Format::Zip, &blob, &mut budget, &mut visit).unwrap();
     assert_eq!(
         seen.len(),
         1,
@@ -69,14 +67,8 @@ fn zip_lzma_member_is_decoded_once_when_streamed() {
     limits.max_buffer_bytes = 16;
     let mut budget = Budget::new(limits);
     let blob = fixture("eicar_lzma.zip");
-    let mut visit = |_: &MemberMeta, _: Option<&mut dyn Read>, _: &mut Budget| None::<()>;
-    let hit = stream_members(
-        Format::Zip,
-        std::io::Cursor::new(blob),
-        &mut budget,
-        &mut visit,
-    )
-    .unwrap_err();
+    let mut visit = |_: &MemberMeta, _: Option<Member<'_>>, _: &mut Budget| None::<()>;
+    let hit = walk(Format::Zip, &blob, &mut budget, &mut visit).unwrap_err();
     assert!(
         !hit.is_corrupt() && hit.reason.contains("--max-object-bytes"),
         "{hit:?}"
@@ -174,6 +166,101 @@ fn zip_bzip2_member_is_decoded() {
     );
 }
 
+/// PKZIP 1.x methods: Shrink (1), Reduce (2-5), Implode (6). The fixtures are
+/// from the `zip` crate's own test data (zip-rs/zip2, MIT), each holding the
+/// same 1092-byte text.
+const LEGACY: [&str; 3] = [
+    "legacy_shrink.zip",
+    "legacy_reduce.zip",
+    "legacy_implode.zip",
+];
+
+#[test]
+fn legacy_methods_are_decoded() {
+    use exav_unpack::{walk, Member, MemberMeta};
+    for name in LEGACY {
+        let blob = fixture(name);
+        let entries = extract(Format::Zip, &blob, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(entries.len(), 1, "{name}");
+        assert_eq!(entries[0].unsupported, None, "{name}");
+        assert_eq!(entries[0].data.len(), 1092, "{name}");
+        assert!(entries[0].data.starts_with(b"The play of Hamlet"), "{name}");
+
+        let mut got = Vec::new();
+        let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, b: &mut Budget| {
+            got.push((
+                m.unsupported,
+                content.map(|c| c.into_bytes(m, b).unwrap().0),
+            ));
+            None::<()>
+        };
+        walk(
+            Format::Zip,
+            &blob,
+            &mut Budget::new(Limits::default()),
+            &mut visit,
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1, "{name}");
+        assert_eq!(got[0].0, None, "{name}");
+        assert_eq!(got[0].1.as_ref().map(Vec::len), Some(1092), "{name}");
+    }
+}
+
+/// The `zip` crate decodes these methods whole, into a buffer it reserves from
+/// the member's declared size. Over the buffer limit, the member is not
+/// decoded and the limit is reported.
+#[test]
+fn legacy_methods_over_the_buffer_limit_are_a_limit() {
+    use exav_unpack::{walk, Member, MemberMeta};
+    for name in LEGACY {
+        let blob = fixture(name);
+        let mut limits = Limits::default();
+        limits.max_buffer_bytes = 1000;
+        let mut visited = 0;
+        let mut visit = |_: &MemberMeta, _: Option<Member<'_>>, _: &mut Budget| {
+            visited += 1;
+            None::<()>
+        };
+        let hit = walk(Format::Zip, &blob, &mut Budget::new(limits), &mut visit).unwrap_err();
+        assert_eq!(visited, 0, "{name}");
+        assert!(
+            !hit.is_corrupt() && hit.reason.contains("--max-object-bytes"),
+            "{name}: {hit:?}"
+        );
+    }
+}
+
+/// A member in a codec the `zip` crate lacks, larger than the buffer limit,
+/// is decoded as it is read, and the member after it is still reached.
+#[test]
+#[cfg(feature = "bzip2")]
+fn a_large_raw_decoded_member_streams_and_the_walk_goes_on() {
+    use exav_unpack::{walk, Member, MemberMeta};
+    // big.bin: 20000 bytes, bzip2 (method 12); after.txt: deflated.
+    let blob = fixture("bzip2_large_then_small.zip");
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 8192;
+    let mut budget = Budget::new(limits);
+    let mut seen = Vec::new();
+    let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+        let mut d = Vec::new();
+        if let Some(Member::Stream(r)) = content {
+            r.read_to_end(&mut d).unwrap();
+        }
+        seen.push((m.name.clone(), m.unsupported, d.len()));
+        None::<()>
+    };
+    walk(Format::Zip, &blob, &mut budget, &mut visit).unwrap();
+    assert_eq!(
+        seen,
+        [
+            ("big.bin".to_string(), None, 20000),
+            ("after.txt".to_string(), None, 72)
+        ]
+    );
+}
+
 // --- Orphan local headers must never be silently dropped --------------------
 //
 // A credible local file header the central directory doesn't cover *is* a member
@@ -202,7 +289,7 @@ fn lfh(name: &str, method: u16, flags: u16, payload: &[u8], declared_comp: Optio
 
 fn orphan_entries(blob: &[u8]) -> Vec<exav_unpack::Entry> {
     let mut budget = Budget::new(Limits::default());
-    extract(Format::Zip, blob, &mut budget).unwrap()
+    extract(Format::Zip, &blob, &mut budget).unwrap()
 }
 
 #[test]
@@ -418,6 +505,7 @@ fn orphan_stored_member_with_deferred_size_is_reported_not_guessed() {
 /// a 2-byte APPNOTE 5.9 header at the front of the member instead of in coder
 /// properties — so this is the part 7z's tests do NOT cover.
 #[test]
+#[cfg(feature = "sevenz")]
 fn zip_ppmd_member_is_decoded() {
     use std::io::Write;
 

@@ -3,16 +3,13 @@
 //! came off live samples in a clamd differential run, where each cost a real
 //! detection.
 //!
-//! Every case is asserted against BOTH ZIP walkers — the buffered
-//! [`extract`] path and the [`stream_members`] path the top-level scan takes.
-//! They are separate implementations with separate copies of the skip logic, and
-//! the first fix for the trailing-slash trick landed in only one of them: the
-//! sample still scanned clean afterwards, because the scanner never went through
-//! the code that was fixed. A test that exercises one walker proves nothing
-//! about the other.
+//! Every case is asserted through [`extract`] and through a [`walk`] visitor
+//! reading each member as it comes, the way the scanner does. The first fix for
+//! the trailing-slash trick once landed in a second ZIP walker the scanner did
+//! not use, and the sample still scanned clean; asserting on the walk the
+//! scanner takes is what catches that.
 
-use exav_unpack::{extract, stream_members, Budget, Entry, Format, Limits, MemberMeta};
-use std::io::Read;
+use exav_unpack::{extract, walk, Budget, Entry, Format, Limits, Member, MemberMeta};
 
 /// Bitwise CRC-32 (IEEE), so the fixtures carry real checksums without pulling a
 /// dependency into the test.
@@ -88,27 +85,31 @@ fn zip_stored(members: &[(&str, &[u8], u16, u32)]) -> Vec<u8> {
     out
 }
 
-/// Members the buffered walker yields.
+/// Members [`extract`] yields.
 fn buffered(blob: &[u8]) -> Vec<Entry> {
     let mut budget = Budget::new(Limits::default());
-    extract(Format::Zip, blob, &mut budget).expect("extract")
+    extract(Format::Zip, &blob, &mut budget).expect("extract")
 }
 
-/// Members the streaming walker yields, as `(name, contents)`. A member with no
-/// reader (nothing decodable) comes back with empty contents.
+/// Members a [`walk`] visitor sees, as `(name, contents)`. A member with no
+/// content (nothing decodable) comes back empty.
 fn streamed(blob: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut budget = Budget::new(Limits::default());
     let mut seen: Vec<(String, Vec<u8>)> = Vec::new();
-    let cur = std::io::Cursor::new(blob.to_vec());
-    let _ = stream_members::<_, ()>(
+    let _ = walk::<()>(
         Format::Zip,
-        cur,
+        &blob,
         &mut budget,
-        &mut |meta: &MemberMeta, rdr: Option<&mut dyn Read>, _b: &mut Budget| {
-            let mut buf = Vec::new();
-            if let Some(r) = rdr {
-                let _ = r.read_to_end(&mut buf);
-            }
+        &mut |meta: &MemberMeta, content: Option<Member<'_>>, _b: &mut Budget| {
+            let buf = match content {
+                None => Vec::new(),
+                Some(Member::Bytes(d)) => d,
+                Some(Member::Stream(r)) => {
+                    let mut d = Vec::new();
+                    let _ = r.read_to_end(&mut d);
+                    d
+                }
+            };
             seen.push((meta.name.clone(), buf));
             None
         },

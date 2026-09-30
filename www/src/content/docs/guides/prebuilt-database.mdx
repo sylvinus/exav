@@ -10,30 +10,16 @@ takes time and gigabytes of transient RAM. `--build-db` does that work once and
 writes a self-contained `.exavdb`; pointing `-d` at that file restores the
 automaton instead of rebuilding it.
 
-## Rebuild after an engine upgrade
-
-A `.exavdb` is a compiled artefact tied to the engine that wrote it: it carries
-a format serial, and a database with another serial is rejected rather than
-loaded half-understood:
-
-```text
-exav: loading database daily.exavdb: invalid type: boolean `false`, expected a tuple of size 2
-```
-
-Rebuild it from the signature sources with `--build-db`; nothing is lost, since
-the sources are the `.cvd`/`.cld` files `freshclam` or `cvdupdate` already
-fetched. If you ship a prebuilt database to other hosts, rebuild it when you
-upgrade the binary and keep the two versioned together.
-
 ## Why it matters
 
 For the full official database (`main.cvd` + `daily.cvd`), a raw load takes over
 a minute and several GiB of RAM; loading the prebuilt database takes seconds and
 about a GiB. Absolute figures depend on hardware and on the engine version.
 
-Building the double-array Aho-Corasick automaton from raw signatures is one large
-allocation burst, far bigger than the structures it produces. Loading a prebuilt
-database allocates about the final size and skips it.
+The build is where exav spends effort so that loading and scanning don't have
+to: whatever can be computed once from the signatures is computed there and
+stored, even when that makes the file larger. See
+[Design principles](/concepts/design-principles/#work-at-build-time).
 
 <Aside type="note">
 **Signatures** are the raw ClamAV-format files you fetch with `cvdupdate` or
@@ -64,6 +50,23 @@ Build the database daily on a capable host or in CI, distribute the file, and
 have every CLI and daemon instance load it. Constrained hosts never pay the build
 peak.
 
+## Rebuild after an exav upgrade
+
+A `.exavdb` is tied to the engine that wrote it: it carries a format version,
+and a database with another version is rejected rather than loaded
+half-understood:
+
+```text
+exav: loading database old.exavdb: unsupported database version 3 (this build expects 5)
+```
+
+exav 0.0.2 reads format 5, so rebuild every `.exavdb` made by 0.0.1. Nothing is
+lost: the sources are the `.cvd`/`.cld` files `freshclam` or `cvdupdate` already
+fetched. If you ship a prebuilt database to other hosts, upgrade the builder and
+the scanners together: a download is checked for integrity, not for its format
+version, so a scanner offered a newer format keeps the database it has on a
+reload, and fails to start from scratch.
+
 ## Building on a small host
 
 Where RAM is tight, `--build-shard-bytes <SIZE>` splits each large partition so
@@ -85,13 +88,15 @@ file is rejected on load, but it is not meant to be parsed from untrusted input.
 
 ## Updating a running deployment
 
-The daemon polls the database file's mtime (like clamd's `SelfCheck`), so an
-update is a rebuild and an atomic swap:
+The daemon polls the database file's mtime (like clamd's `SelfCheck`), in every
+listener mode, so an update is a rebuild and an atomic swap:
 
 ```sh
+# Once: tell cvdupdate where to keep the signatures.
+cvd config set --dbs-directory /srv/exav/staging
+
 # 1. Fetch fresh signatures, then build to a temporary path (the daemon keeps
 #    serving the old database).
-cvd config set --dbs-directory /srv/exav/staging
 cvd update
 exav -d /srv/exav/staging --build-db /srv/exav/live.exavdb.tmp
 

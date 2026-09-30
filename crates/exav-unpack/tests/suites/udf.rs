@@ -21,7 +21,8 @@
 //! past sector 256, making even a three-file image ~900 KiB of mostly zeroes.
 //! The bytes inside are genisoimage's.
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 /// `sha256sum` of what `7zz x` writes for each member.
 const README_SHA256: &str = "8d2f3443b4461106fa29ee57260e553ee6acb25cc0a00a28a777013d2420985e";
@@ -62,19 +63,27 @@ fn members(blob: &[u8]) -> Vec<Entry> {
     out
 }
 
-/// What [`exav_unpack::stream_members`] yields, as `(name, sha256, unsupported)`.
+/// What a [`exav_unpack::walk`] visitor reading each member as it comes sees,
+/// as `(name, sha256, unsupported)`.
 fn streamed(blob: &[u8]) -> Vec<(String, String, Option<&'static str>)> {
     let mut out = Vec::new();
     let mut b = Budget::new(Limits::default());
-    let _ = exav_unpack::stream_members(
+    let _ = exav_unpack::walk(
         Format::Iso,
-        std::io::Cursor::new(blob.to_vec()),
+        &blob,
         &mut b,
-        &mut |m: &exav_unpack::MemberMeta, r: Option<&mut dyn std::io::Read>, _: &mut Budget| {
-            let mut data = Vec::new();
-            if let Some(r) = r {
-                std::io::Read::read_to_end(r, &mut data).expect("read member");
-            }
+        &mut |m: &exav_unpack::MemberMeta,
+              content: Option<exav_unpack::Member<'_>>,
+              _: &mut Budget| {
+            let data = match content {
+                None => Vec::new(),
+                Some(exav_unpack::Member::Bytes(d)) => d,
+                Some(exav_unpack::Member::Stream(r)) => {
+                    let mut d = Vec::new();
+                    std::io::Read::read_to_end(r, &mut d).expect("read member");
+                    d
+                }
+            };
             out.push((m.name.clone(), sha256_hex(&data), m.unsupported));
             None::<()>
         },

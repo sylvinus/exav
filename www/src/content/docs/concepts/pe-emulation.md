@@ -9,10 +9,9 @@ memory at start-up. On disk there is nothing for a signature to match: the
 original code is there, but not in a form anything can read.
 
 The usual answer is a decoder per packer. exav has those for the common cases
-(UPX, the aPLib family, MPRESS), and they are the fast path. But a decoder per
-packer is a race the scanner cannot win: the packer's author picks the format,
-and the packers that matter vary it per build to break tools that assume a
-layout.
+(UPX, and the aPLib family: Petite, FSG, NsPack), and they are the fast path. But
+a decoder per packer cannot keep up: the packer's author picks the format, and
+the packers that matter vary it per build to break tools that assume a layout.
 
 So exav also does the general thing. Whatever a packer compresses with, its stub
 must rebuild the original image in memory and jump to it. exav runs the stub and
@@ -30,8 +29,9 @@ A bounded x86-32 interpreter, in-process, with:
   Instruction boundaries are where a decoder goes quietly wrong, so the decoder
   lives in a crate that is checked instruction by instruction against an
   independent decoder over the sample corpus.
-* **Enough Windows to be believed.** A TEB and PEB, the loader's three module
-  lists, and synthetic `kernel32`/`ntdll`/`user32` images with real export
+* **The Windows a stub looks for.** A TEB and PEB, the loader's three module
+  lists, and synthetic `kernel32`/`ntdll`/`user32`/`advapi32`/`msvcrt` images
+  with real export
   directories. Both ways a stub resolves imports work: calling
   `GetProcAddress`, and walking `fs:[0x30]` → PEB → loader list → export table
   by hand. The loader's own import binding is emulated too, because a packed
@@ -81,9 +81,9 @@ and nested content in the recovered image are reached too.
 
 ## When the stub wins
 
-Some stubs will not run to completion. The run stops and says why: an
-instruction outside the implemented set, an export with no implementation (both
-named), a fault nothing handled, or a budget.
+Some stubs will not run to completion. The run stops on an instruction outside
+the implemented set, an export with no implementation, a fault nothing handled,
+or a budget; the `exav-pe-emu` triage tool names which.
 
 * **Nothing is fabricated.** A dump is emitted only when it reads back as a
   valid PE; a wrong guess is discarded rather than handed to the matcher.
@@ -95,9 +95,11 @@ named), a fault nothing handled, or a budget.
   identified packer exav could not unpack into a `Heuristics.Packed.*`
   detection.
 * **Running out of budget is a limit.** The emulator has an instruction budget
-  per stub, and `--max-pe-emulation-steps` (1,000,000,000 by default) bounds the
-  total across every packed executable in one file. A scan that reaches it is
-  `LIMITS-EXCEEDED`.
+  of 120 million per stub and a 32 MiB dump cap, and
+  `--max-pe-emulation-steps` (1,000,000,000 by default) bounds the total across
+  every packed executable in one file. A scan that reaches the total is
+  `LIMITS-EXCEEDED`. A stub stopped by its own budget alone is treated like any
+  other stub that would not finish: `UNSCANNABLE` if its packer was identified.
 
 A run that stopped part-way with a substantial part of the image rebuilt is
 reported as a partial reconstruction: worth scanning, but not named as the
@@ -108,13 +110,14 @@ original program.
 Virtualizing protectors (VMProtect, Themida/WinLicense, Enigma) translate the
 protected functions into a private bytecode when the file is built, so the
 original instructions never exist in memory, and no emulator can recover them.
-exav does not spend the budget trying; it reports them as what they are.
+exav does not spend the budget trying: it reports them `UNSCANNABLE`, and with
+`--detect packed` as `Heuristics.Packed.VMProtect` and the like.
 
 ## Measured coverage
 
 Against 276 samples from 23 real packers, 12 each (ordinary Windows utilities,
 packed; fetched by `scripts/fetch-packed-pe.py` and checked by the corpus test in
-`exav-unpack`):
+`exav-unpack`; the names are the corpus's):
 
 | | Packers |
 |---|---|
@@ -123,10 +126,11 @@ packed; fetched by `scripts/fetch-packed-pe.py` and checked by the corpus test i
 | **Payload recovered, image incomplete** | Amber (a .NET packer: the native stub hands the assembly to the runtime, and that assembly comes back, on 11 of 12 samples) |
 | **Nothing recovered**: the stub defended itself | Alienyze, TELock, Yoda-Protector |
 
-Recovery is all-or-nothing per sample: every sample that recovered anything
-recovered an image at least as large as the input. Four of the fully unpacked
-packers are ones ClamAV ships a hand-written unpacker for (ASPack, MEW, NSPack,
-Yoda's Cryptor); most of the rest have no decoder anywhere.
+Apart from Amber, recovery is all-or-nothing per sample: every sample that
+recovered anything recovered an image at least as large as the input. Seven of
+the fully unpacked packers have a hand-written unpacker in ClamAV (ASPack, FSG,
+MEW, NSPack, UPX, WinUpack, Yoda-Crypter), plus PEtite among the partial ones;
+most of the rest have no decoder anywhere.
 
 The measure is the size of what came back, not whether the run reached the
 original entry point. Several packers hand control to the unpacked program in a

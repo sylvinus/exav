@@ -1,10 +1,11 @@
 //! A source that fails part way is reported, never read as a short file.
 //!
-//! The streaming walk reads its container through `Read + Seek`, and for a
-//! network range reader a failed read is an ordinary event. Taking it for end
-//! of file drops every member past that point without a word.
+//! The walk reads its container through a `ByteSource`, and for a network range
+//! reader a failed read is an ordinary event. Taking it for end of file drops
+//! every member past that point without a word.
 
-use exav_unpack::{is_streamable, stream_members, Budget, Format, Limits, MemberMeta};
+use exav_unpack::source::BlockCache;
+use exav_unpack::{walk, Budget, Format, Limits, Member};
 use std::io::{self, Read, Seek, SeekFrom};
 
 /// Seeks anywhere in `len` bytes; every read fails.
@@ -31,7 +32,7 @@ impl Seek for Unreadable {
 }
 
 #[test]
-fn a_failing_source_is_reported_by_every_streamed_format() {
+fn a_failing_source_is_reported_by_every_format() {
     let formats = [
         Format::Gzip,
         Format::Tar,
@@ -54,19 +55,26 @@ fn a_failing_source_is_reported_by_every_streamed_format() {
         Format::OneNote,
         Format::Swf,
         Format::Szdd,
+        Format::Lzw,
+        Format::Lz4,
+        Format::Dmg,
+        Format::Rar,
+        Format::Ole,
     ];
     let mut silent = Vec::new();
-    for fmt in formats.into_iter().filter(|f| is_streamable(*f)) {
+    for fmt in formats {
         let mut budget = Budget::new(Limits::default());
         // A member's bytes are read by the visitor, which sees their errors.
-        let mut visit = |_: &MemberMeta, r: Option<&mut dyn Read>, _: &mut Budget| {
-            io::copy(r?, &mut io::sink()).err().map(|e| e.to_string())
+        let mut visit = |_: &_, content: Option<Member<'_>>, _: &mut Budget| match content? {
+            Member::Stream(r) => io::copy(r, &mut io::sink()).err().map(|e| e.to_string()),
+            Member::Bytes(_) => None,
         };
-        let src = Unreadable {
+        let src = BlockCache::new(Unreadable {
             pos: 0,
             len: 1 << 20,
-        };
-        match stream_members(fmt, src, &mut budget, &mut visit) {
+        })
+        .unwrap();
+        match walk(fmt, &src, &mut budget, &mut visit) {
             Err(hit) if hit.reason.contains("link down") => {}
             Ok(Some(seen)) if seen.contains("link down") => {}
             other => silent.push(format!("{fmt:?}: {other:?}")),

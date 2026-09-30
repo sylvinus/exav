@@ -29,10 +29,11 @@ named `YARA.SomeRuleName.UNOFFICIAL`, as `clamscan` names it.
 YARA support is behind the default-on `yara` feature. Building with
 `--no-default-features` drops it and its whole dependency tree.
 
-## A native engine, not a wrapper
+## The native engine
 
-exav keeps the parser half of the [`yara-x`](https://github.com/VirusTotal/yara-x)
-crate and replaces its WASM back end with a native tree-walking evaluator:
+exav uses YARA-X's parser crate
+([`yara-x-parser`](https://github.com/VirusTotal/yara-x)) and replaces its WASM
+back end with a native tree-walking evaluator:
 
 - No wasmtime, no Cranelift, no `rsa`, and no code generation at scan time.
   Depending on `yara-x` as a library pulls in a large WebAssembly runtime for its
@@ -64,14 +65,14 @@ implemented modules (`pe.rich_signature`, `pe.version_info`, resources,
 
 <Aside type="tip" title="Rejections are visible">
 exav compiles per rule, so one unsupported rule cannot drop a whole feed. Every
-rejection is recorded (name and reason) and logged when the database is built.
+rejection is recorded (name and reason), and a warning with the count and the
+first few is printed when the rules are compiled (at load, or at `--build-db`).
 </Aside>
 
 ## Real-world coverage
 
-Against large public community rulesets and a commercial one, the large majority
-of rules compile, and the rest are rejected as above. Matching is cross-checked
-against the real `yara-x` over varied inputs, comparing the set of matching rules.
+Matching is cross-checked against the real `yara-x` over varied inputs, comparing
+the set of matching rules.
 
 The cross-check runs yara-x as a program (`yr`) rather than linking it, which
 would bring its WebAssembly runtime into exav's build. Install it with

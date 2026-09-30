@@ -120,6 +120,12 @@ fn next_header(data: &[u8], off: usize) -> Option<usize> {
 /// somewhere meaningful: the end-of-archive marker, another header, or the end
 /// of a truncated file. Arbitrary data does not chain.
 pub(crate) fn is_arc(data: &[u8]) -> bool {
+    is_arc_in(&crate::Probe::whole(data))
+}
+
+/// [`is_arc`] for the object `p` looks at.
+pub(crate) fn is_arc_in(p: &crate::Probe) -> bool {
+    let data = p.head;
     if !plausible_header(data, 0) {
         return false;
     }
@@ -128,10 +134,11 @@ pub(crate) fn is_arc(data: &[u8]) -> bool {
     };
     // A member whose data runs past the end is a truncated archive, which is
     // still an archive.
-    if next >= data.len() {
+    if next >= p.len {
         return true;
     }
-    data.get(next..next + 2) == Some(&[MARKER, 0][..]) || plausible_header(data, next)
+    let at_next = p.window(next, HEADER_LEN_V1);
+    at_next.get(..2) == Some(&[MARKER, 0][..]) || plausible_header(&at_next, 0)
 }
 
 /// Undo the run-length coding: `DLE n` repeats the preceding byte, and `DLE 00`

@@ -47,7 +47,7 @@ fn starts_with_exe(data: &[u8]) -> bool {
 /// Does a plausible ARJ main header start here?
 ///
 /// `60 EA` is two bytes, so across a megabyte of executable it turns up by
-/// chance roughly once — and a false hit is not harmless: the carve hands the
+/// chance roughly once, and a false hit is not harmless: the carve hands the
 /// ARJ extractor a fragment of the stub, extraction fails, and an ordinary file
 /// is reported `UNSCANNABLE`. A .NET assembly did exactly that.
 ///
@@ -98,16 +98,70 @@ fn find_archive_from(data: &[u8], from: usize) -> Option<(usize, &'static str)> 
 
 /// True when `data` looks like a self-extracting archive: an executable stub
 /// with an archive magic embedded past [`MIN_SFX_OFFSET`] (used by `detect`).
-pub(crate) fn looks_like_sfx(data: &[u8]) -> bool {
-    if !starts_with_exe(data) {
+pub(crate) fn looks_like_sfx(p: &crate::Probe) -> bool {
+    if !starts_with_exe(p.head) {
         return false;
     }
-    matches!(find_embedded_archive(data), Some((off, _)) if off > MIN_SFX_OFFSET)
+    let off = match p.source() {
+        None => find_embedded_archive(p.head).map(|(off, _)| off),
+        Some(_) => p.sfx_payload(),
+    };
+    matches!(off, Some(off) if off > MIN_SFX_OFFSET)
+}
+
+/// The search [`payload_offset`] makes, fed a window at a time by a pass
+/// that reads the object for other searches too.
+pub(crate) struct PayloadSearch {
+    found: Option<Option<usize>>,
+}
+
+impl PayloadSearch {
+    /// Bytes each window must run into the next: the longest magic and the
+    /// ARJ header check after it, so a match across the seam is seen whole.
+    pub(crate) const OVERLAP: usize = 16;
+
+    pub(crate) fn new() -> Self {
+        PayloadSearch { found: None }
+    }
+
+    /// Search window `w`, at `base` in the object, the object's last or not.
+    pub(crate) fn feed(&mut self, base: usize, w: &[u8], last: bool) {
+        if self.found.is_some() {
+            return;
+        }
+        // Offset 0 is the executable's own magic, never its payload.
+        let from = if base == 0 { 1 } else { 0 };
+        if let Some((off, _)) = find_archive_from(w, from) {
+            // Near the end of a window a match may be cut short, and an ARJ
+            // candidate before it wrongly passed over; the next window sees
+            // both whole.
+            if last || off + Self::OVERLAP <= w.len() {
+                self.found = Some(Some(base + off));
+                return;
+            }
+        }
+        if last {
+            self.found = Some(None);
+        }
+    }
+
+    /// Whether the search has its answer.
+    pub(crate) fn done(&self) -> bool {
+        self.found.is_some()
+    }
+
+    /// Where the first embedded archive starts, if any.
+    pub(crate) fn offset(&self) -> Option<usize> {
+        self.found.flatten()
+    }
 }
 
 /// Offset of the archive [`find_embedded_archive`] finds in the first `limit`
 /// bytes of `source`, read a window at a time rather than held whole.
-fn payload_offset<R: Read + Seek>(source: &mut R, limit: u64) -> Result<Option<u64>, LimitHit> {
+pub(crate) fn payload_offset<R: Read + Seek>(
+    source: &mut R,
+    limit: u64,
+) -> Result<Option<u64>, LimitHit> {
     /// Bytes read per window.
     const WINDOW: usize = 1 << 20;
     /// Kept from one window into the next: the longest magic and the ARJ
@@ -147,28 +201,29 @@ fn payload_offset<R: Read + Seek>(source: &mut R, limit: u64) -> Result<Option<u
     }
 }
 
-/// Whether `source` is an SFX as [`looks_like_sfx`] judges one in memory, with
-/// the archive looked for in its first `limit` bytes.
-pub(crate) fn is_sfx<R: Read + Seek>(source: &mut R, limit: u64) -> Result<bool, LimitHit> {
-    if !starts_with_exe(&crate::read_at(source, 0, 4)?) {
-        return Ok(false);
-    }
-    Ok(payload_offset(source, limit)?.is_some_and(|off| off > MIN_SFX_OFFSET as u64))
+/// Walk a self-extractor: its appended archive, streamed from where it lies.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let mut source = crate::source::Reader::new(src);
+    let members = stream_offsets(&mut source)?;
+    crate::stream::stream_stored(&mut source, budget, visit, members)
 }
 
-/// Reader-based streaming: find the appended archive's offset in a bounded
-/// prefix (the stub is small), then stream the payload `[off, EOF)` via
-/// seek+take — so a self-extracting installer with a multi-gigabyte payload is
-/// scanned without buffering it. Matches [`extract_sfx`]'s single `sfx-payload`
-/// member.
+/// Find the appended archive's offset, searching as far as detection does (a
+/// window at a time), then stream the payload `[off, EOF)` via seek+take, so a
+/// self-extracting installer with a multi-gigabyte payload is scanned without
+/// buffering it. A shorter search than detection's would type a file as an SFX
+/// and then find nothing in it.
 pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
-    max_buffer: u64,
 ) -> Result<Vec<(String, u64, u64)>, LimitHit> {
     let len = source
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
-    let Some(off) = payload_offset(source, max_buffer.min(len))? else {
+    let Some(off) = payload_offset(source, len)? else {
         return Ok(Vec::new());
     };
     if off >= len {
@@ -177,34 +232,13 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     Ok(vec![("sfx-payload".to_string(), off, len - off)])
 }
 
-pub(crate) fn extract_sfx<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    // First embedded archive past the stub, or nothing to carve.
-    let Some((off, _label)) = find_embedded_archive(data) else {
-        return Ok(None);
-    };
-    let start = off.min(data.len());
-    let slice = &data[start..];
-
-    budget.count_entry()?;
-    let cap = budget.reserve()?;
-    if slice.len() as u64 > cap {
-        return Err(LimitHit::new("sfx payload exceeds budget".to_string()));
-    }
-    let bytes = slice.to_vec();
-    budget.commit(bytes.len() as u64);
-    if let Some(r) = visit(Entry::new("sfx-payload".to_string(), bytes), budget) {
-        return Ok(Some(r));
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn looks_like_sfx(data: &[u8]) -> bool {
+        super::looks_like_sfx(&crate::Probe::whole(data))
+    }
 
     /// An `MZ` stub of zero filler up to `payload_at`, then `payload`.
     fn mz_stub(payload: &[u8], payload_at: usize) -> Vec<u8> {
@@ -212,6 +246,23 @@ mod tests {
         out.resize(payload_at, 0);
         out.extend_from_slice(payload);
         out
+    }
+
+    /// The payload is found as far into the file as detection looks, whatever
+    /// the buffer limit: the search holds a window at a time.
+    #[test]
+    fn a_payload_past_the_buffer_limit_is_found() {
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.extend_from_slice(b"local-header::MALWARETEST::body");
+        let blob = mz_stub(&zip, 64 * 1024);
+        assert!(looks_like_sfx(&blob));
+        let limits = Limits {
+            max_buffer_bytes: 16 * 1024,
+            ..Limits::default()
+        };
+        let entries = extract(Format::Sfx, &blob, &mut Budget::new(limits)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].data.starts_with(b"PK\x03\x04"));
     }
 
     #[test]
@@ -299,7 +350,7 @@ mod tests {
     fn truncated_and_garbage_do_not_panic() {
         let mut budget = Budget::new(Limits::default());
         for input in [b"".as_slice(), b"M", b"MZ", &[0x60], b"PK\x03\x04"] {
-            let _ = extract(Format::Sfx, input, &mut budget).unwrap();
+            let _ = extract(Format::Sfx, &input, &mut budget).unwrap();
         }
     }
 }

@@ -10,6 +10,7 @@ mod allmatch_parity;
 mod authenticode;
 #[cfg(feature = "base64scan")]
 mod base64_scan;
+mod broken_executable;
 #[cfg(feature = "unstable-internals")]
 mod bytecode_gating;
 // NB: gate container suites on `all-formats`, never on exav-core's own per-format

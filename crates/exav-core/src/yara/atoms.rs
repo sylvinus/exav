@@ -3,10 +3,10 @@
 //! Scanning every compiled pattern over the whole buffer (one `find_all` per
 //! pattern) is O(patterns × bytes) and dominates scan time on many-rule sets.
 //! This module builds a *required-literal gate*: for each pattern we extract one
-//! or more **atoms** — literal byte substrings that MUST appear in EVERY match of
+//! or more **atoms**: literal byte substrings that MUST appear in EVERY match of
 //! the pattern. A single shared Aho-Corasick automaton (daachorse) is run over
 //! the buffer ONCE; a pattern's `find_all` is then executed ONLY if one of its
-//! atoms was found (or if the pattern is *ungated* — has no provable required
+//! atoms was found (or if the pattern is *ungated*, i.e. has no provable required
 //! literal, e.g. `xor`, `/a+/`, alternations with an atomless branch).
 //!
 //! ## Why this is false-negative-safe
@@ -16,12 +16,12 @@
 //! zero matches, and returning an empty match list for it is IDENTICAL to running
 //! `find_all`. When we cannot prove such a literal exists, the pattern is left
 //! **ungated** and always scanned. We only ever *skip* a pattern whose required
-//! literal is provably absent — never a pattern that might match.
+//! literal is provably absent, never a pattern that might match.
 //!
 //! Required literals for regexp / hex patterns are extracted with
 //! `regex_syntax`'s literal `Extractor` (the same analysis the `regex` crate uses
 //! for its own prefilters): a finite prefix (or suffix) literal `Seq` with no
-//! empty member is a sound set of required literals — every match begins (ends)
+//! empty member is a sound set of required literals: every match begins (ends)
 //! with one of them. When the extractor gives up it returns an infinite `Seq`,
 //! which we treat as "no required literal" → ungated.
 
@@ -31,6 +31,7 @@ use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 use regex_syntax::hir::literal::{ExtractKind, Extractor};
 use serde::{Deserialize, Serialize};
 
+use crate::byte_source::ByteSource;
 use crate::yara::matcher::{parse_hir, widen_hir, Base64Sub, Needle};
 
 /// Maximum atom window length taken from a literal / base64 needle. A longer
@@ -40,7 +41,7 @@ const MAX_ATOM: usize = 16;
 
 /// The gate classification of one compiled pattern.
 pub(crate) enum Gate {
-    /// No provable required literal — the pattern is always scanned.
+    /// No provable required literal, so the pattern is always scanned.
     Ungated,
     /// The pattern matches only if at least ONE of these atoms is present
     /// (a disjunction). `nocase` means the atoms are ASCII-lowercased and are
@@ -203,7 +204,7 @@ pub(crate) fn regex_gate_ex(
 /// for a `wide ascii` regexp: the plain-form gate OR the wide-form gate). The
 /// atom sets are unioned (a required literal of either branch is a candidate);
 /// if either branch is ungated, or the two branches disagree on case-folding, the
-/// combined gate is [`Gate::Ungated`] — never skip a pattern that might match.
+/// combined gate is [`Gate::Ungated`]: never skip a pattern that might match.
 pub(crate) fn combine_gates(a: Gate, b: Gate) -> Gate {
     match (a, b) {
         (Gate::Ungated, _) | (_, Gate::Ungated) => Gate::Ungated,
@@ -303,45 +304,63 @@ impl Pool {
     }
 
     /// Builds the automaton. On a (very unlikely) build failure the pool's
-    /// patterns are force-ungated so they are still scanned — never silently
+    /// patterns are force-ungated so they are still scanned, never silently
     /// dropped.
-    fn finish(
-        self,
-        ungated: &mut [bool],
-    ) -> (Option<DoubleArrayAhoCorasick<u32>>, Vec<Vec<usize>>) {
+    fn finish(self, ungated: &mut [bool]) -> Lane {
         if self.atoms.is_empty() {
-            return (None, Vec::new());
+            return Lane::default();
         }
         match DoubleArrayAhoCorasickBuilder::new()
             .match_kind(daachorse::MatchKind::Standard)
             .build_with_values(self.atoms.iter().zip(0u32..))
         {
-            Ok(ac) => (Some(ac), self.groups),
+            Ok(ac) => Lane {
+                ac: Some(ac),
+                groups: self.groups,
+                runs: crate::engine::longest_runs(&self.atoms),
+            },
             Err(_) => {
                 for g in &self.groups {
                     for &pid in g {
                         ungated[pid] = true;
                     }
                 }
-                (None, Vec::new())
+                Lane::default()
             }
         }
     }
 }
 
+/// One automaton of the gate: over its atoms, the patterns behind each, and
+/// the longest run of each byte value in them (see [`crate::engine::sweep`]).
+struct Lane {
+    ac: Option<DoubleArrayAhoCorasick<u32>>,
+    groups: Vec<Vec<usize>>,
+    runs: [u32; 256],
+}
+
+impl Default for Lane {
+    fn default() -> Self {
+        Lane {
+            ac: None,
+            groups: Vec::new(),
+            runs: [0; 256],
+        }
+    }
+}
+
 /// The prefilter gate for a whole compiled rule set. Case-sensitive atoms are
-/// searched in the raw buffer; `nocase` atoms in an ASCII-lowercased copy.
+/// searched in the raw buffer; `nocase` atoms in its bytes lowercased, both in
+/// the one read of it.
 pub(crate) struct PatternGate {
-    ac_cs: Option<DoubleArrayAhoCorasick<u32>>,
-    groups_cs: Vec<Vec<usize>>,
-    ac_ci: Option<DoubleArrayAhoCorasick<u32>>,
-    groups_ci: Vec<Vec<usize>>,
+    cs: Lane,
+    ci: Lane,
     /// Per pattern id: `true` = always scan (ungated).
     ungated: Vec<bool>,
     /// Number of patterns with a required-literal gate (diagnostics).
     gated: usize,
     /// Kill switch: when set (via `EXAV_YARA_NO_GATE`), the prefilter is bypassed
-    /// and every pattern is scanned. A safety valve — results are identical to a
+    /// and every pattern is scanned. A safety valve: results are identical to a
     /// gated scan by construction, but this lets an operator rule the prefilter
     /// out if a gate bug is ever suspected. Read once at build time (never on the
     /// hot path).
@@ -366,16 +385,14 @@ impl PatternGate {
                 }
             }
         }
-        let (ac_cs, groups_cs) = cs.finish(&mut ungated);
-        let (ac_ci, groups_ci) = ci.finish(&mut ungated);
+        let cs = cs.finish(&mut ungated);
+        let ci = ci.finish(&mut ungated);
         // Whatever remains not-ungated after the (possibly failing) builds is
         // in fact gated.
         let gated = ungated.iter().filter(|&&u| !u).count();
         PatternGate {
-            ac_cs,
-            groups_cs,
-            ac_ci,
-            groups_ci,
+            cs,
+            ci,
             ungated,
             gated,
             bypass: std::env::var_os("EXAV_YARA_NO_GATE").is_some(),
@@ -391,7 +408,7 @@ impl PatternGate {
     /// Returns, per pattern id, whether `find_all` must be run: `true` for every
     /// ungated pattern, plus every gated pattern one of whose atoms occurs in
     /// `data`. A gated pattern whose atoms are all absent provably has no match.
-    pub(crate) fn select(&self, data: &[u8]) -> Vec<bool> {
+    pub(crate) fn select(&self, src: &dyn ByteSource) -> Vec<bool> {
         if self.bypass {
             return vec![true; self.ungated.len()];
         }
@@ -399,41 +416,36 @@ impl PatternGate {
         // Number of gated patterns still to resolve; lets us stop scanning once
         // every pattern is already slated to run (dense buffers).
         let mut pending = run.iter().filter(|&&r| !r).count();
-
-        if pending > 0 {
-            if let Some(ac) = &self.ac_cs {
-                for m in ac.find_overlapping_iter(data) {
-                    for &pid in &self.groups_cs[m.value() as usize] {
-                        if !run[pid] {
-                            run[pid] = true;
-                            pending -= 1;
-                        }
-                    }
-                    if pending == 0 {
-                        break;
-                    }
-                }
+        if pending == 0 {
+            return run;
+        }
+        let (mut lanes, mut groups) = (Vec::new(), Vec::new());
+        for (lane, fold) in [(&self.cs, false), (&self.ci, true)] {
+            if let Some(ac) = &lane.ac {
+                lanes.push(crate::engine::Lane {
+                    ac,
+                    fold,
+                    runs: &lane.runs,
+                });
+                groups.push(&lane.groups);
             }
         }
-
-        if pending > 0 {
-            if let Some(ac) = &self.ac_ci {
-                let lower = data.to_ascii_lowercase();
-                for m in ac.find_overlapping_iter(&lower) {
-                    for &pid in &self.groups_ci[m.value() as usize] {
-                        if !run[pid] {
-                            run[pid] = true;
-                            pending -= 1;
-                        }
-                    }
-                    if pending == 0 {
-                        break;
-                    }
-                }
-            }
-        }
+        crate::engine::sweep(&lanes, src, &mut |k, value, _, _| {
+            mark(groups[k], value, &mut run, &mut pending)
+        });
         run
     }
+}
+
+/// Slates the patterns of atom `value` to run. `false` once none is left.
+fn mark(groups: &[Vec<usize>], value: u32, run: &mut [bool], pending: &mut usize) -> bool {
+    for &pid in &groups[value as usize] {
+        if !run[pid] {
+            run[pid] = true;
+            *pending -= 1;
+        }
+    }
+    *pending > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +457,7 @@ impl PatternGate {
 // daachorse automaton travels as its own byte serialization (`serialize`), and
 // the per-atom pattern-id groups + the ungated bitmap travel as plain data. On
 // load the automaton is reconstructed via daachorse's checked `deserialize` (no
-// rebuild). `bypass` is NOT serialized — it is an operator kill switch read
+// rebuild). `bypass` is NOT serialized: it is an operator kill switch read
 // afresh from the environment on load, exactly as at build time.
 
 /// True when the prefilter kill switch is set. Read once (build or load time),
@@ -456,13 +468,16 @@ fn bypass_env() -> bool {
 
 impl Serialize for PatternGate {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let ac_cs = self.ac_cs.as_ref().map(|ac| ac.serialize());
-        let ac_ci = self.ac_ci.as_ref().map(|ac| ac.serialize());
+        use crate::database::Blob;
+        let ac_cs = self.cs.ac.as_ref().map(|ac| ac.serialize());
+        let ac_ci = self.ci.ac.as_ref().map(|ac| ac.serialize());
         (
-            ac_cs,
-            &self.groups_cs,
-            ac_ci,
-            &self.groups_ci,
+            ac_cs.as_deref().map(Blob),
+            &self.cs.groups,
+            &self.cs.runs[..],
+            ac_ci.as_deref().map(Blob),
+            &self.ci.groups,
+            &self.ci.runs[..],
             &self.ungated,
             self.gated,
         )
@@ -472,43 +487,115 @@ impl Serialize for PatternGate {
 
 impl<'de> Deserialize<'de> for PatternGate {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use crate::database::BlobBuf;
         type Wire = (
-            Option<Vec<u8>>,
+            Option<BlobBuf>,
             Vec<Vec<usize>>,
-            Option<Vec<u8>>,
+            Vec<u32>,
+            Option<BlobBuf>,
             Vec<Vec<usize>>,
+            Vec<u32>,
             Vec<bool>,
             usize,
         );
-        let (ac_cs_bytes, groups_cs, ac_ci_bytes, groups_ci, ungated, gated): Wire =
+        let (ac_cs, groups_cs, runs_cs, ac_ci, groups_ci, runs_ci, ungated, gated): Wire =
             Deserialize::deserialize(d)?;
 
         fn rebuild<E: serde::de::Error>(
-            bytes: Option<Vec<u8>>,
-        ) -> Result<Option<DoubleArrayAhoCorasick<u32>>, E> {
-            match bytes {
-                None => Ok(None),
+            bytes: Option<BlobBuf>,
+            groups: Vec<Vec<usize>>,
+            runs: Vec<u32>,
+        ) -> Result<Lane, E> {
+            let runs = runs
+                .try_into()
+                .map_err(|_| serde::de::Error::custom("bad atom run table"))?;
+            let ac = match bytes {
+                None => None,
                 Some(b) => {
                     // Checked deserialize: rejects data that would cause
                     // out-of-bounds access (the database is a trusted artifact,
                     // but a corrupt/mismatched blob must fail loudly, not misread).
                     let (ac, _rest) =
-                        DoubleArrayAhoCorasick::<u32>::deserialize(&b).map_err(|e| {
+                        DoubleArrayAhoCorasick::<u32>::deserialize(&b.0).map_err(|e| {
                             serde::de::Error::custom(format!("bad atom automaton: {e}"))
                         })?;
-                    Ok(Some(ac))
+                    Some(ac)
                 }
-            }
+            };
+            Ok(Lane { ac, groups, runs })
         }
 
         Ok(PatternGate {
-            ac_cs: rebuild(ac_cs_bytes)?,
-            groups_cs,
-            ac_ci: rebuild(ac_ci_bytes)?,
-            groups_ci,
+            cs: rebuild(ac_cs, groups_cs, runs_cs)?,
+            ci: rebuild(ac_ci, groups_ci, runs_ci)?,
             ungated,
             gated,
             bypass: bypass_env(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::byte_source::BlockCache;
+
+    /// The gate slates a gated pattern to run exactly when one of its atoms
+    /// occurs in the object (lowercased for a `nocase` one), in memory and read
+    /// through a cache, runs of one byte included.
+    #[test]
+    fn the_gate_selects_the_patterns_whose_atoms_occur() {
+        let atoms = |a: &[&[u8]], nocase| Gate::Atoms {
+            atoms: a.iter().map(|x| x.to_vec()).collect(),
+            nocase,
+        };
+        let gates = vec![
+            atoms(&[b"abcd"], false),
+            atoms(&[b"xyz", &[0; 12]], false),
+            atoms(&[b"hello"], true),
+            Gate::Ungated,
+            atoms(&[b"zzzz", b"q\0\0\0\0\0\0q"], true),
+        ];
+        let gate = PatternGate::from_gates(&gates);
+        let mut state = 0x5eed_u64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        for _ in 0..300 {
+            let mut hay = Vec::new();
+            for _ in 0..1 + next(8) {
+                match next(4) {
+                    0 => hay.extend(std::iter::repeat_n(
+                        b"\0zZ"[next(3)],
+                        [3, 11, 12, 70, 3000][next(5)],
+                    )),
+                    1 => hay.extend_from_slice(
+                        [&b"abcd"[..], b"HeLLo", b"xyz", b"Q\0\0\0\0\0\0Q"][next(4)],
+                    ),
+                    _ => hay.extend((0..next(40)).map(|_| b"abcdxyzhelo\0HELOQ"[next(17)])),
+                }
+            }
+            let lower = hay.to_ascii_lowercase();
+            let want: Vec<bool> = gates
+                .iter()
+                .map(|g| match g {
+                    Gate::Ungated => true,
+                    Gate::Atoms { atoms, nocase } => {
+                        let h = if *nocase { &lower } else { &hay };
+                        atoms
+                            .iter()
+                            .any(|a| h.windows(a.len()).any(|w| w == &a[..]))
+                    }
+                })
+                .collect();
+            let slice: &[u8] = &hay;
+            let cache =
+                BlockCache::with_sizes(std::io::Cursor::new(hay.clone()), 64, 1024).unwrap();
+            assert_eq!(gate.select(&slice), want, "{hay:?}");
+            assert_eq!(gate.select(&cache), want, "{hay:?}");
+        }
     }
 }

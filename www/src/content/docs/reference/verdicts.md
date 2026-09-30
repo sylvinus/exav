@@ -11,10 +11,8 @@ the contract behind [never a silent clean](/concepts/design-principles/#never-a-
 
 `3` means a file could not be fully examined: it was encrypted, hit a limit, or
 used a codec with no decoder. It is not a scanner failure; that is `2` (an
-unreadable path, a database that would not load), as in ClamAV. The two are kept
-apart so that failures and objects needing a decision are not mixed up, and a
-file exav could not read is a better hiding place than one it read and cleared,
-so route `3` to a person.
+unreadable path, a database that would not load), as in ClamAV. A file exav
+could not fully read is a good hiding place, so route `3` to a person.
 
 ## The mapping
 
@@ -31,14 +29,19 @@ Every result line ends in its status, and each status is one exit code:
 
 The grammar is `path: [reason ][CATEGORY ]STATUS`, with the status last, where
 `clamscan` puts `OK` and `FOUND`. The three categories sub-classify a `PARTIAL`.
+`ERROR` lines go to stderr, the rest to stdout; all of them are written to
+`--log`, and `--quiet` drops only the `OK` lines and the summary.
 
 ## What each `PARTIAL` category means
 
 - **`LIMITS-EXCEEDED`**: a limit stopped the scan before it completed. Raise it
-  and scan again. The limits are `--max-input-bytes`, `--max-object-bytes` (a
-  file or member too large for the full engine), the extraction and matcher
-  budgets, the ratio, recursion and member caps, `--max-pe-emulation-steps`, and
-  the engine's internal step budgets.
+  and scan again. The limits are `--max-input-bytes`, `--max-object-bytes` (an
+  object too large for the checks that parse it whole, or a member too large to
+  hold with spilling off), the extraction and matcher budgets, the ratio,
+  recursion and member caps, `--max-pe-emulation-steps`, a stream past the spill
+  budgets, a daemon job past `--max-scan-secs`, the YARA step and match budgets,
+  a bytecode signature that ran out of steps, and the engine's internal step
+  budgets.
 - **`UNSCANNABLE`**: something was recognised but could not be decoded (an
   unsupported codec, a RAR member continuing in another volume, a read error).
   Raising a limit changes nothing. The container's own bytes are still scanned;

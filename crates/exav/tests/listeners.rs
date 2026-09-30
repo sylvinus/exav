@@ -459,6 +459,157 @@ fn a_rewritten_signature_directory_is_reloaded() {
     }
 }
 
+/// Rewrite a signature file in place and put its mtime back, so the directory
+/// watch sees no change and only an explicit reload can pick it up.
+fn rewrite_unseen(dir: &Path, name: &str, body: &str) {
+    let p = dir.join(name);
+    let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+    std::fs::write(&p, body).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+}
+
+fn signal(server: &Server, sig: libc::c_int) {
+    // SAFETY: signals the child this test started and has not reaped.
+    assert_eq!(
+        unsafe { libc::kill(server.child.id() as libc::pid_t, sig) },
+        0
+    );
+}
+
+/// Scan `malwareD` until `Exav.Test.Delta` detects it: the reload that brought
+/// it in has taken effect.
+fn until_delta(scan: impl Fn() -> String, server: &Server) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let got = scan();
+        if got.contains("Exav.Test.Delta") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reload never took effect: {got:?}\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+const WITH_DELTA: &str = "Exav.Test.Alpha:0:*:6d616c7761726541\n\
+                          Exav.Test.Beta:0:*:6d616c7761726542\n\
+                          Exav.Test.Delta:0:*:6d616c7761726544\n";
+
+/// As in clamd: `SIGUSR2` reloads the signatures and `SIGHUP` reopens the
+/// `--log` file, whatever serves. Neither stops the daemon.
+#[test]
+fn signals_reload_and_reopen_the_log_like_clamd() {
+    for workers in ["2", "threads"] {
+        let sigs = sig_dir();
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("scans.log");
+        let clamd = free_port();
+        let server = Server::start(
+            dir,
+            &[
+                "--workers",
+                workers,
+                "--log",
+                log.to_str().unwrap(),
+                "--listen",
+                &format!("clamd://127.0.0.1:{clamd}"),
+                "--sig-dir",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        let scan = || until_answered("scan", || try_clamd_instream(clamd, b"malwareD"));
+        assert!(scan().contains(": OK"), "workers={workers}");
+
+        // Rotation: the log moves away, SIGHUP, and the next line lands in a
+        // new file at the configured path.
+        std::fs::rename(&log, log.with_extension("1")).unwrap();
+        signal(&server, libc::SIGHUP);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !std::fs::read_to_string(&log).is_ok_and(|s| s.contains(": OK")) {
+            assert!(
+                Instant::now() < deadline,
+                "workers={workers}: the log was never reopened:\n{}",
+                server.stderr()
+            );
+            scan();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            clamd_ping(clamd),
+            "PONG",
+            "workers={workers}: SIGHUP stopped it"
+        );
+
+        rewrite_unseen(sigs.path(), "test.ndb", WITH_DELTA);
+        signal(&server, libc::SIGUSR2);
+        wait_for_log(&server, "reloading signatures");
+        until_delta(scan, &server);
+    }
+}
+
+/// `RELOAD` reloads in the thread model too; it used to answer `RELOADING`
+/// and do nothing.
+#[test]
+fn reload_works_in_the_thread_model() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "threads",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    let scan = || until_answered("scan", || try_clamd_instream(clamd, b"malwareD"));
+    assert!(scan().contains(": OK"));
+    rewrite_unseen(sigs.path(), "test.ndb", WITH_DELTA);
+    let mut s = dial(clamd, "clamd");
+    s.write_all(b"zRELOAD\0").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert_eq!(
+        String::from_utf8_lossy(&out).trim_end_matches('\0'),
+        "RELOADING"
+    );
+    wait_for_log(&server, "reloading signatures");
+    until_delta(scan, &server);
+}
+
+/// ICAP served alone reloads on `SIGUSR2`, and `SIGHUP` does not stop it.
+#[test]
+fn icap_alone_reloads_on_sigusr2() {
+    let sigs = sig_dir();
+    let icap = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--listen",
+            &format!("icap://127.0.0.1:{icap}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    wait_for_log(&server, "serving ICAP on tcp:");
+    assert!(!icap_respmod(icap, b"malwareD").contains("Exav.Test.Delta"));
+    signal(&server, libc::SIGHUP);
+    rewrite_unseen(sigs.path(), "test.ndb", WITH_DELTA);
+    signal(&server, libc::SIGUSR2);
+    wait_for_log(&server, "reloading signatures");
+    until_delta(|| icap_respmod(icap, b"malwareD"), &server);
+}
+
 /// A reload does not cut short a scan already in progress: the worker holding
 /// it finishes the job on the database it started with, then retires.
 #[test]

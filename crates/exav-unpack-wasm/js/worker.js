@@ -1,7 +1,8 @@
 // The Worker side of the File path.
 //
-// WHY THIS EXISTS: `exav_unpack::Archive` is `Read + Seek`, and the only
-// synchronous way to read a `Blob` is `FileReaderSync`, which browsers expose
+// WHY THIS EXISTS: exav's archive readers read by offset, synchronously, and
+// the only synchronous way to read a `Blob` is `FileReaderSync`, which browsers
+// expose
 // only inside a Worker. Running here is what lets a `File` be read through the
 // same archive code as everything else, a member at a time, without loading it
 // whole. The alternative was a second set of archive readers written against

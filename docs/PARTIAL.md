@@ -1,8 +1,6 @@
 # PARTIAL: the third verdict, and how it reaches every protocol
 
-**Status: implemented.** Supersedes the decided parts of
-[`VERDICT_PROTOCOL_PLAN.md`](VERDICT_PROTOCOL_PLAN.md), which asked the question
-this answers.
+**Status: implemented.**
 
 Every claim about ClamAV was measured against a local **ClamAV 1.4.3**, and every
 claim about exav against the built binary. Commands at the end.
@@ -11,16 +9,16 @@ claim about exav against the built binary. Commands at the end.
 
 ## 1. One vocabulary
 
-**Status** — four words, each naming the exit code it produces:
+**Status**: four words, each naming the exit code it produces:
 
 | Status | Exit | Meaning |
 |---|---|---|
 | `OK` | 0 | fully scanned, nothing matched |
 | `FOUND` | 1 | a signature matched |
-| `ERROR` | 2 | exav could not do its job — unreadable path, database that would not load |
+| `ERROR` | 2 | exav could not do its job: unreadable path, database that would not load |
 | `PARTIAL` | 3 | exav worked, and something could not be fully examined |
 
-**Category** — only under `PARTIAL`:
+**Category**, only under `PARTIAL`:
 
 | Category | Raised when |
 |---|---|
@@ -28,7 +26,7 @@ claim about exav against the built binary. Commands at the end.
 | `UNSCANNABLE` | the container could not be decoded |
 | `PASSWORD-PROTECTED` | the content is encrypted and no configured password opened it |
 
-**Reason** — free text.
+**Reason**: free text.
 
 One line grammar, everywhere: **`path: [reason ][CATEGORY ]STATUS`**, status last.
 
@@ -41,7 +39,7 @@ path: Can't open file ERROR
 
 ### Why `PARTIAL`
 
-Work happened in all three cases and stopped short of the end — a real prefix was
+Work happened in all three cases and stopped short of the end: a real prefix was
 scanned, or the container was parsed and only its contents were out of reach.
 `SKIPPED` was rejected because `--exclude` already skips files at **exit 0**, so
 one word would have had two meanings with opposite codes; and because it claims
@@ -58,7 +56,7 @@ exactly what it means in ClamAV.
 
 ### Precedence
 
-`1` > `2` > `3` > `0`. A detection outranks everything — finding malware is
+`1` > `2` > `3` > `0`. A detection outranks everything: finding malware is
 conclusive, and a limit hit elsewhere does not make the match less true. An error
 outranks a partial, because it casts doubt on the whole run where a partial is a
 fact about one object.
@@ -106,7 +104,7 @@ as every value in that preset does.
 
 **Refused with `--connect`.** The policy belongs to whatever scans. A client only
 sees the reply the daemon already decided, so the flag would have parsed, looked
-in force, and done nothing — and it cannot be made to work, since once the daemon
+in force, and done nothing. It cannot be made to work, since once the daemon
 has reported `OK` for something it folded, the fact is gone from the wire.
 
 ---
@@ -130,10 +128,10 @@ has reported `OK` for something it folded, the fact is gone from the wire.
 {"category":"LIMITS-EXCEEDED","file":"big.bin","reason":"file size 200000 exceeds max-input-bytes 1024…","status":"PARTIAL"}
 ```
 
-`category` is present only under `PARTIAL` — the other statuses have nothing to
+`category` is present only under `PARTIAL`: the other statuses have nothing to
 sub-classify. Key order is not part of the contract; keys serialise sorted.
 
-### clamd wire — `SCAN` / `CONTSCAN` / `MULTISCAN` / `INSTREAM` / `FILDES` / `SCANURL`
+### clamd wire: `SCAN` / `CONTSCAN` / `MULTISCAN` / `INSTREAM` / `FILDES` / `SCANURL`
 
 ```
 path: file size 200000 exceeds max-input-bytes 1024 LIMITS-EXCEEDED ERROR
@@ -148,7 +146,7 @@ Same grammar as stdout; **only the status word differs**, and it has to. See §4
 ```
 
 The same three names the CLI JSON uses. This replaced `verdict`/`tag`/`message`,
-whose `"verdict":"unscannable"` collided with the *category* of that name — a
+whose `"verdict":"unscannable"` collided with the *category* of that name: a
 `{"verdict":"unscannable","tag":"PASSWORD-PROTECTED"}` read as a contradiction.
 
 ### ICAP
@@ -160,7 +158,7 @@ whose `"verdict":"unscannable"` collided with the *category* of that name — a
 | `ok` | `204` (or `200` echoing the message without `Allow: 204`) | the `X-Exav-*` trio, **never** `X-Infection-Found` |
 
 `X-Exav-Status` is `PARTIAL` even under `--partial-as error`. ICAP has no exit
-code — the only thing those two differ in — and answering `ERROR` would tell a
+code (the only thing those two differ in), and answering `ERROR` would tell a
 proxy the *scanner* failed. Squid counts service failures and eventually bypasses
 the service, so relabelling an encrypted archive could take the scanner out of
 rotation and start failing open.
@@ -168,7 +166,7 @@ rotation and start failing open.
 `X-Infection-Found` on a *block* defaults on: a large class of ICAP client greps
 that header alone and reads a `200` without it as a pass.
 `--icap-infection-header detections` restricts it to database hits, at that cost.
-On a *pass* it is always withheld — the object is being delivered, so claiming an
+On a *pass* it is always withheld: the object is being delivered, so claiming an
 infection would be false and would make those clients block it anyway.
 
 ### Library (`exav-core`)
@@ -188,7 +186,7 @@ reply ends in PARTIAL  -> clamdscan exit 0, prints "f.txt: OK"
 ```
 
 **It rewrites an unknown status to `OK`.** No `FOUND`, no `ERROR`, therefore
-clean — it does not even echo the text.
+clean. It does not even echo the text.
 
 So `PARTIAL` on this wire would make every existing clamd client report a file
 exav could not scan as clean: the silent-clean failure exav exists to prevent,
@@ -197,11 +195,18 @@ protocol's vocabulary is `OK` / `FOUND` / `ERROR`, and `ERROR` is the only word 
 it that fails closed. The category is still in the text for anything that reads
 further.
 
+The cost is known. In clamd, `ERROR` means the scanner failed (a vanished file, a
+dead socket), and clients act on that: `clamdscan` exits 2, which wrappers read
+as "the scanner is broken", and a mail gateway typically temp-fails the message,
+so a password-protected ZIP is retried rather than quarantined. A client that
+needs to tell the categories apart uses `EXINSTREAM`, or `--partial-as found`
+for names it already handles.
+
 ---
 
 ## 5. ClamAV compatibility
 
-ClamAV **does** report these — as detections, opt-in:
+ClamAV **does** report these, as detections, opt-in:
 
 | Situation | ClamAV default | With its alert flag |
 |---|---|---|
@@ -227,11 +232,59 @@ That last part was a real gap: the top-level size check produced
 the one limit ClamAV *does* name. It now passes the limit kind as a type into the
 engine's own lookup, as every other budget already did.
 
-ClamAV has **no structured category anywhere** — `--gen-json` emits file metadata
+ClamAV has **no structured category anywhere**: `--gen-json` emits file metadata
 only (`Magic`, `RootFileType`, `FileName`, `FileType`, `FileSize`, `FileMD5`), no
 verdict. Its only categorisation is the dotted signature name. exav keeps its own
 flat categories for `PARTIAL`, and uses ClamAV's dotted namespace under
-`--partial-as found`, where the object genuinely is being reported as a detection.
+`--partial-as found`, where the object is being reported as a detection.
+
+---
+
+## 6. Why a third verdict: what ClamAV's `OK` covers
+
+The question that led here: run with every heuristic and `--allmatch`, does
+ClamAV miss nothing silently? It does, and no flag changes that.
+
+Method: extract each container's members with exav, hash every member into an
+`.hdb`, then scan the **untouched** container with `clamscan` and every alert
+flag it has. If clamscan reports `OK`, it never reached the member.
+
+```
+--allmatch --heuristic-alerts=yes --alert-broken=yes --alert-broken-media=yes
+--alert-encrypted=yes --alert-encrypted-archive=yes --alert-encrypted-doc=yes
+--alert-macros=yes --alert-exceeds-max=yes --alert-phishing-ssl=yes
+--alert-phishing-cloak=yes --alert-partition-intersection=yes
+```
+
+Every row is a plain `OK` from clamscan on a file whose payload exav reads:
+
+| Container | Members exav reaches | ClamAV reaches |
+|---|---|---|
+| LZW `.Z` (10 fixtures, 12- and 16-bit) | 1 each | **0** |
+| WIM: LZX, LZMS, XPRESS, uncompressed (5 images) | 1-3 each | **0** |
+| UDF-only ISO (no ISO 9660 descriptor) | 3 | **0** |
+| VHDX, dynamic | 1 | **0** |
+| QCOW2 with deflate clusters (2 fixtures) | 1 each | **0** |
+| VMDK sparse, and streamOptimized (the shape inside an OVA) | 1 each | **0** |
+| EGG with LZMA members | 2 | **0** |
+| EGG solid archive | 1 | **0** |
+
+ClamAV does reach EGG store/deflate members, ALZ, ISO 9660 (including the ISO
+side of a bridge image), and anything behind gzip.
+
+- **The EGG rows are inside a format ClamAV supports.** Its EGG code is on by
+  default and still returns `OK` when the members are LZMA or solid. Supporting
+  a format is not reaching its members.
+- **No flag changes any of it.** There is no alert for "a container I have no
+  code for". ClamAV's `--help` says as much for its limits: `--max-filesize`,
+  *"Files larger than this will be skipped and assumed clean"*, and the same
+  for `--max-scantime`. `--alert-exceeds-max` covers file size, scan size and
+  recursion; there is no alert for scan time.
+
+With the documented behaviour past 2 GB (read, scanned as zero bytes, `OK`),
+ClamAV's `OK` means "nothing matched in what I examined". exav's `OK` means "I
+examined it". No combination of flags turns the first into the second, which is
+why exav needs a status ClamAV does not have.
 
 ---
 
@@ -255,4 +308,12 @@ printf 'nSCAN %s\n' "$PWD/big.bin" | nc 127.0.0.1 3310
 
 # ICAP codes and headers: crates/exav/tests/icap_server.rs asserts them
 cargo test -p exav --test icap_server
+
+# Section 6: exav extracts, members are hashed into an .hdb, clamscan
+# rescans the untouched container with every alert flag.
+scripts/clamav-reach.sh crates/exav-unpack/tests/fixtures/{lzw,wim,egg,alz}/*
 ```
+
+The `.gz`-wrapped fixtures under `diskimage/` and `udf/` must be gunzipped
+first: otherwise the measurement tests gzip, not the inner format, and reports
+"reached all" for images ClamAV never opens.

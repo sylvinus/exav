@@ -6,7 +6,11 @@ description: How to contribute to exav, with the clean-room rule, the checks to 
 Issues and PRs are welcome. Good first areas: formats from the
 [gap list](/reference/formats/#the-complete-gap-list), bytecode host APIs (see the
 [comparison](/project/comparison-with-clamav/#bytecode-host-apis)), and fuzz
-targets.
+targets. For a vulnerability, do not open a public issue: see
+[Security](/project/security/#reporting-a-vulnerability).
+
+To start: clone the repository, `make test` to run everything CI runs, and
+`scripts/difftest.sh` when you touch detection (it needs Docker and a corpus).
 
 ## The clean-room rule
 
@@ -44,6 +48,40 @@ author is responsible for every line they submit:
   you cannot establish that a suggested snippet is clean-room and permissively
   licensed, do not submit it.
 
+## Writing an extractor: classify every way you decline to scan
+
+A scanner's worst outcome is not a crash, it is reporting a file clean that it
+did not read. So for every path that can decline to scan bytes (each early
+return, `continue`, `break`, `.ok()`, `unwrap_or_default`, `let … else`,
+error-swallowing `match`, truncation and cap), decide which of these it is:
+
+- **Nothing to scan.** An empty or directory entry, an absent optional field.
+  Skipping hides nothing.
+- **Content present, not examined.** It must surface: `Entry::unsupported`
+  (`UNSCANNABLE`), a `LimitHit` (`LIMITS-EXCEEDED`), or an encrypted marker
+  (`PASSWORD-PROTECTED`). Anything here that does not surface is a bug.
+- **Content absent.** The container declares bytes the file does not contain: a
+  truncated archive, an extent past the end. Every byte that exists was scanned,
+  so the missing tail is absent rather than hidden. Reporting this is a bug in
+  the other direction, and produces `UNSCANNABLE` on files that are merely
+  damaged.
+
+Nearly every bug of this class found so far was a bound or a malformed-input
+check that was right to stop and wrong to stop quietly. The fix is never to
+remove the guard, it is to say so on the way out.
+
+When testing this, use `walk`, which is what the scanner uses: `extract` discards
+the members already emitted when it returns an error, so a test using it cannot
+see members reported before a failure part way.
+
+## Where documentation goes
+
+`www/` (this site) is authoritative for anything a user or integrator relies on:
+supported formats, CLI flags, limits, verdicts, the wire protocol. `docs/` in the
+repository is for engineering notes: audits, investigations, design records. If
+the two disagree about something a user relies on, `www/` is right. CI checks the
+CLI flags the site documents against the binary.
+
 ## Before submitting
 
 Run the same checks CI does:
@@ -57,7 +95,7 @@ make lint    # clippy --all-targets -D warnings + cargo fmt --check
 
 | target | what it covers | needs |
 | --- | --- | --- |
-| `make test-native` | the workspace under every feature pass: default, `http`, `checksums`, `--no-default-features`, `unstable-internals` | nothing extra |
+| `make test-native` | the workspace under every feature pass: default, `http`, `exav-unpack` with `checksums`, `--no-default-features`, `unstable-internals`, `testing-faults` | nothing extra |
 | `make test-wasm` | the extractor and core unit tests on 32-bit `wasm32-wasip1` | `wasmtime` |
 | `make test-js` | the WASM bindings' vitest units and Playwright browser tests | node, wasm-pack |
 | `make test-www` | `astro check` and a full docs build (broken links, bad frontmatter) | node |
@@ -91,7 +129,7 @@ you touch a decoder or byte-parsing path, run the extractor and core tests on
 make test-wasm          # or: scripts/test-wasm.sh   (needs `wasmtime` on PATH)
 ```
 
-CI runs this on every push.
+CI runs this on every pull request and push to `main`.
 
 ## Do not commit real malware
 

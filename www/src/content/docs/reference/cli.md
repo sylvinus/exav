@@ -6,29 +6,20 @@ description: Every exav command-line flag, from targets and scanning limits to o
 `exav [OPTIONS] [PATH]...`
 
 Scan `PATH`(s), files or directories, for malware. `-` reads stdin. An
-`http(s)://` target is scanned over range requests (needs an `http-scan` build).
-With no real signatures loaded, exav refuses to run unless `--allow-no-db`.
+`http(s)://` target is scanned over range requests (needs an `http-scan` build
+and `--allow-http-scan`). With no real signatures loaded, exav refuses to run
+unless `--allow-no-db`.
 
 `exav --help` is the authoritative list; this page mirrors it.
 
 ## How a setting is decided
 
-An explicit flag wins, then the environment variable, then the default, for every
-setting. A container image can carry its configuration in the environment while
-any value stays overridable on the command line.
-
-Every flag has an `EXAV_*` variable: the flag uppercased, dashes to underscores,
-`EXAV_` in front (`--max-input-bytes` reads `EXAV_MAX_INPUT_BYTES`). `exav --help`
-prints the `[env: …]` line under each. [Configuration](/reference/configuration/)
-covers the rest.
-
-A boolean variable takes `1`/`yes`/`on`/`true` or `0`/`no`/`off`/`false`; anything
-else stops the run.
-
-Repeatable flags (`--exclude`, `--exclude-dir`, `--include`, `--passwords`) follow
-the same rule without merging: naming the flag on the command line replaces the
-environment value. Repeat the flag for two patterns. (The environment holds one
-pattern, since a comma is legal inside a regex.)
+An explicit flag wins, then its `EXAV_*` variable, then the default
+(`--max-input-bytes` reads `EXAV_MAX_INPUT_BYTES`; `exav --help` prints the
+`[env: …]` line under each). A repeatable flag named on the command line replaces
+its variable rather than merging with it. [Configuration](/reference/configuration/)
+has the details: booleans, which variables split on commas, and the diagnostic
+variables.
 
 ## Targets, filters and logging
 
@@ -61,10 +52,9 @@ daemon must be able to see them; otherwise send the contents (see
 |---|---|---|
 | `-d`, `--database <PATH>` | none | Load signatures from a file or directory (`.ndb`/`.hdb`/`.cvd`/… or a prebuilt `.exavdb`). A directory is loaded recursively. |
 | `--sig-dir <DIR>` | `/var/lib/exav` | The directory signatures live in: the one `--auto-update` writes into and a sidecar populates. |
-| `--sig-sources <FILE>` | none | File of signature source URLs (also reads `freshclam.conf` source directives). |
 | `--allow-no-db` | off | Testing only. Run against the built-in EICAR-only baseline when no real database is present, instead of refusing. |
 | `--build-db <FILE>` | none | Compile the loaded signatures into a prebuilt `.exavdb` and exit. |
-| `--build-shard-bytes <SIZE>` | none | Cap the per-shard automaton-build transient (`--build-db` only). |
+| `--build-shard-bytes <SIZE\|off>` | none | Peak memory for building one matcher shard during `--build-db`; lower it on a small build host. The parsed signatures stay resident on top of it. |
 
 `-d` and `--sig-dir` are different things: `--sig-dir` names a directory that is
 written to, so a deployment can serve a prebuilt `.exavdb` from one path with
@@ -92,8 +82,8 @@ an emptied volume keeps the database already loaded.
 | `--auto-update` | off | Bootstrap, refresh and hot-reload the signature source. Fetching needs an `http-update` build; Unix only. |
 | `--sig-sources <URL\|FILE>` | none | Where to fetch from. Repeatable; the sources merge. |
 | `--db-url <URL>` | none | A prebuilt `.exavdb` to pull and serve instead of signature files. |
-| `--startup-wait-secs <SECS>` | `1800` with `--auto-update`, `0` otherwise | How long to wait for a sidecar to populate an empty signature directory. `0` does not wait. |
-| `--update-interval-secs <SECS>` | `86400`, or `300` with `--db-url` | Seconds between source re-checks. |
+| `--startup-wait-secs <SECS\|off>` | `1800` with `--auto-update`, `0` otherwise | How long to wait for a sidecar to populate an empty signature directory. `0` or `off` does not wait. |
+| `--update-interval-secs <SECS\|off>` | `86400`, or `300` with `--db-url` | Seconds between source re-checks, at least 60; `off` fetches at startup only (refused for an updater with no listener, which would then do nothing). |
 
 `--auto-update` with no `--listen` and no paths is the updater half of a
 two-container deployment: it keeps the signature volume current and loads no
@@ -122,22 +112,26 @@ The `--db-url` re-check defaults to 300 seconds because it is a conditional
 
 ## Scan limits
 
-Sizes accept `K`/`M`/`G`/`T` suffixes (binary: `45M` is 45 MiB). `0` or `off`
-means no limit on every size limit and on `--max-pe-emulation-steps`. A period
-(how often something happens, such as `--update-interval-secs`) refuses `0`,
-which would read as "always"; only `off` disables it. `--workers` takes a count
-or `threads`, and refuses `0`. See [Limits](/reference/limits/) for which one to
-change.
+Sizes accept `K`/`M`/`G`/`T` suffixes (binary: `45M` is 45 MiB). On a limit,
+`0` and `off` both mean no limit. A period (how often something happens, such
+as `--update-interval-secs`) refuses `0`, which would read as "always"; only
+`off` disables it. A few settings have no `off`, or give `0` its own meaning;
+[Limits](/reference/limits/#0-and-off) lists them, and says which limit to
+change. `--workers` takes a count or `threads`, and refuses `0`.
 
 | Flag | exav default | `--clamav-compat` | Description |
 |---|---|---|---|
-| `--max-input-bytes <SIZE>` | unlimited | `100M` | Largest top-level input taken. Past it the first bytes get the whole scan, and without a detection there the input is `LIMITS-EXCEEDED`. The same for a file, stdin and every daemon verb. |
-| `--max-extracted-bytes <SIZE>` | `256M` / `1G` | `400M` | What decompression may produce across one top-level file: sets the deep-analysis size and the summed extracted bytes to one value; unset, they keep their own defaults. |
-| `--max-object-bytes <SIZE>` | `256M` | none | The most memory one materialized object may use; several are live at once across nesting levels, and `--max-extracted-bytes` bounds their sum. Also the largest file the full signature engine scans: a larger one is matched against literal signatures and whole-file hashes only, and is `LIMITS-EXCEEDED` unless one of those matches. |
-| `--max-matcher-bytes <SIZE>` | `10G` | none | Bytes fed to the matcher across one top-level file: a CPU bound, not a memory one. |
-| `--max-pe-emulation-steps <N>` | `1000000000` | none | Instructions the PE unpacking emulator may run across one top-level file, summed over every packed executable in it. Reaching it is `LIMITS-EXCEEDED`. |
-| `--max-unpack-depth <N>` | `16` | `17` | Maximum nesting depth for recursive unpacking. |
-| `--max-members <N>` | `100000` | `10000` | Maximum members visited across the whole recursive walk. Higher than ClamAV's because exav descends into nested archives ClamAV does not, so it counts more objects for the same file. |
+| `--max-input-bytes <SIZE\|off>` | unlimited | `100M` | Largest top-level input taken. Past it the first bytes get the whole scan, and without a detection there the input is `LIMITS-EXCEEDED`. The same for a file, stdin and every daemon verb. |
+| `--max-object-bytes <SIZE\|off>` | `256M` | unchanged, but a top-level file up to 400M is held whole | The most memory one decoded object may take when held whole; several are live at once across nesting levels, and `--max-process-bytes` bounds the whole scan. A larger file gets the same scan through a block cache (a member, through a spill file), except the checks that parse an object whole (a PE's structure, YARA's `pe`/`elf`/`dotnet` modules, containers read whole), and is `LIMITS-EXCEEDED` if one of those applied, unless something is found. |
+| `--max-matcher-bytes <SIZE\|off>` | `10G` | unchanged | Bytes fed to the matcher across one top-level file: a CPU bound, not a memory one. `clamscan`'s `--max-scansize`. |
+| `--max-pe-emulation-steps <N\|off>` | `1000000000` | unchanged | Instructions the PE unpacking emulator may run across one top-level file, summed over every packed executable in it. Reaching it is `LIMITS-EXCEEDED`. |
+| `--max-unpack-depth <N>` | `16` | `17` | Maximum nesting depth for recursive unpacking. At least 1; no `off`, since each level costs stack. |
+| `--max-members <N\|off>` | `100000` | `10000` | Maximum members visited across the whole recursive walk. Higher than ClamAV's because exav descends into nested archives ClamAV does not, so it counts more objects for the same file. |
+
+What a scan holds in total has no flag of its own: it is 1 GiB (400M under
+`--clamav-compat`), and `--max-process-bytes` lowers it to half the memory a
+scan gets. `--max-extracted-bytes`, which set it before 0.0.2, is refused with a
+message saying so.
 
 Each bound has one spelling. `clamscan`'s names (`--max-filesize`,
 `--max-scansize`, `--max-files`) are refused, with an error naming the exav flag.
@@ -147,23 +141,24 @@ The mapping is in the [ClamAV flag matrix](/reference/clamav-flag-matrix/).
 
 Container-aware scanning needs to seek (a ZIP's directory is at its end), so
 every stream (`INSTREAM`/`EXINSTREAM`, stdin, an ICAP body) is held before it is
-scanned: small ones in RAM, larger ones in a temp file. These bound that, on
-every surface.
+scanned: small ones in RAM, larger ones in a temp file. A local scan spills too:
+an archive member that decodes past `--max-object-bytes` goes to a temp file
+under the same budgets. These bound that, on every surface.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--spill-dir <DIR\|off>` | platform temp dir (`$TMPDIR`) | Where the temp files go, or `off` to never write one. Use a filesystem with room, and one you are willing to see fill up. |
-| `--spill-threshold-bytes <SIZE>` | `16M` | Bytes held in RAM before an object spills. This bounds a listener's memory: a connection costs this much whatever the object weighs. |
-| `--max-spill-bytes <SIZE>` | `2G` | The most temp space one object may occupy (clamd's `StreamMaxLength`). |
-| `--max-total-spill-bytes <SIZE>` | `8G` | The most temp space every in-flight object may occupy together within one process. Under the worker pool each worker and the ICAP child counts separately. |
+| `--spill-threshold-bytes <SIZE>` | `16M` | Bytes held in RAM before an object spills; `0` spills every object at once. This bounds a listener's memory: a connection costs this much whatever the object weighs. A size, not a limit, so it has no `off`. |
+| `--max-spill-bytes <SIZE\|off>` | `2G` | The most temp space one object may occupy (clamd's `StreamMaxLength`). |
+| `--max-total-spill-bytes <SIZE\|off>` | `8G` | The most temp space every in-flight object may occupy together within one process. Under the worker pool each worker and the ICAP child counts separately. |
 
 A per-object cap does not bound the total: a hundred connections at `2G` each is
 200 GB, and filling the temp filesystem takes down everything else on it. Size
 `--max-total-spill-bytes` against the free space on `--spill-dir`.
 
 The sizes must nest (RAM inside one object inside the process), and exav refuses
-to start otherwise. An object a budget refuses is `UNSCANNABLE`, answered rather
-than dropped.
+to start otherwise. An object past a budget has what was held scanned, and is
+`LIMITS-EXCEEDED` unless that finds something: answered rather than dropped.
 
 #### Turning it off
 
@@ -171,12 +166,15 @@ than dropped.
 exav --listen icap://0.0.0.0:1344 --spill-dir off --spill-threshold-bytes 64M
 ```
 
-Nothing is written to disk: `--spill-threshold-bytes` becomes the largest object
-exav takes, and anything larger is `UNSCANNABLE`. Use it for a read-only root
+Nothing is written to disk: `--spill-threshold-bytes` becomes the most of an
+object exav holds, and anything larger has that much scanned and is
+`LIMITS-EXCEEDED` unless it finds something. Inside a scan, an archive
+member that decodes past `--max-object-bytes` is then not scanned, and the file
+is `LIMITS-EXCEEDED`. Use it for a read-only root
 filesystem or a container with no writable temp directory, and budget memory as
 threshold times concurrent scans. It is spelled `--spill-dir off` rather than a
 `0`, because `0` on the `--max-` flags means "no ceiling"; combining
-`--spill-dir off` with `--max-spill-bytes` is refused.
+`--spill-dir off` with either `--max-*-spill-bytes` flag is refused.
 
 ## Detection
 
@@ -188,8 +186,8 @@ threshold times concurrent scans. It is spelled `--spill-dir off` rather than a
 | `--no-decode <LIST>` | none | Encodings to leave alone, subtracted from `--decode`. |
 | `--passwords <PW>` | none | Password to try on encrypted archive members. Repeatable (comma-separated in the environment), tried in order, together with any `.pwdb` databases. A password containing a comma goes in `--passwords-from`. |
 | `--passwords-from <FILE>` | none | Read passwords from a file, one per line, after `--passwords`. Lines are kept verbatim apart from the line ending. The contents stay out of process listings, though the path does not; `chmod 0600` it. |
-| `--dlp-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers. Needs the `dlp` feature. |
-| `--dlp-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers. Needs the `dlp` feature. |
+| `--dlp-credit-cards <N>` | off | Alert `Heuristics.Structured.CreditCardNumber` on a textual file holding N or more valid credit-card numbers (N at least 1). Needs the `dlp` feature. |
+| `--dlp-ssns <N>` | off | Alert `Heuristics.Structured.SSN` on N or more valid US Social Security numbers (N at least 1). Needs the `dlp` feature. |
 
 A decoder is not an unpacker: an unpacker opens a container the file declares
 itself to be; a decoder finds a payload the carrier does not announce, such as a
@@ -198,6 +196,10 @@ subtraction. The `--dlp-` flags detect data leaks rather than malware, which is
 why they are not `--detect` values.
 
 ### What an unscannable object becomes
+
+| Flag | Default | Description |
+|---|---|---|
+| `--partial-as <STATUS>` | `partial` (`ok` under `--clamav-compat`) | What an object exav could not fully examine is reported as. |
 
 `--detect` says what to look for; `--partial-as` says what happens to an object
 exav could not fully examine. The value is the status it reports as, and each
@@ -233,13 +235,13 @@ differ only in the exit code of an exav client.
 | Flag | Description |
 |---|---|
 | `-v`, `--verbose` | Print informational findings (type, entropy, imphash, ML score). A daemon reply carries only a verdict, so in client mode it names the daemon that answered and the command sent per target instead. |
-| `--quiet` | Print only errors and detections: no per-file `OK` lines, no summary. |
+| `--quiet` | Print only detections, `PARTIAL` results and errors: no per-file `OK` lines, no summary. |
 | `--json` | Newline-delimited JSON, one object per input, then a summary object. |
 | `--all-matches` | Report every matching signature, not just the first. |
 
 ## Finding where the CPU went
 
-A listener serves objects nobody kept, so it counts for itself:
+A listener keeps no per-file output, so it keeps its own counters:
 
 | Flag | Default | Description |
 |---|---|---|
@@ -275,7 +277,7 @@ Under the worker pool the counters are per process, so a `STATS` reply describes
 the worker that answered it; the log lines cover every process. For one set of
 totals across both listeners, run `--workers threads`.
 
-`--max-scan-secs` is refused under `--workers threads`, since only the pool can
+`--max-scan-secs` is refused for a listener under `--workers threads`, since only the pool can
 stop one job. There a scan is bounded by work: `--max-matcher-bytes`,
 `--max-pe-emulation-steps`, `--max-unpack-depth` and `--max-members`.
 
@@ -330,9 +332,9 @@ concurrency by its worker count. ICAP always reads it and advertises it as
 | `--send-as <WHAT>` | `path` | What a `--connect` client hands the daemon: `path`, `contents` or `fd`. |
 | `--ping` | off | Ask a daemon whether it is answering, and exit `0` or `2`. Probes `--connect` when given, otherwise the listener this configuration would serve (so a container health check needs no address of its own), with `PING` on clamd and `OPTIONS` on ICAP. One probe; retrying is up to the caller. |
 | `--workers <N\|threads>` | CPU cores | Daemon worker model (Unix): a count runs a prefork pool, `threads` runs the listeners in one process. |
-| `--max-scan-secs <SECS>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`): a job past it is answered `LIMITS-EXCEEDED` and its worker replaced. In a one-shot run it bounds the whole run, which exits 3. Refused for a listener under `--workers threads`. |
-| `--max-process-bytes <SIZE>` | `2G` in the pool, unset otherwise | Unix. Address space (`RLIMIT_AS`): per worker in the pool, the whole process in a one-shot run or the thread model. Also lowers the in-core extraction budget to fit inside it. |
-| `--max-jobs-per-worker <N>` | `1000` | Prefork only: recycle a worker after this many jobs. |
+| `--max-scan-secs <SECS\|off>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`): a job past it is answered `LIMITS-EXCEEDED` and its worker replaced. In a one-shot run it bounds the whole run, which exits 3. Refused for a listener under `--workers threads`. |
+| `--max-process-bytes <SIZE\|off>` | `2G` in the pool (lowered to what the host can back), unset otherwise | Unix. The memory a scan may use, as an address-space cap (`RLIMIT_AS`): per worker in the pool, the whole process in a one-shot run or the thread model. What a scan holds is kept to half of it, so a scan reports a limit rather than being killed. See [sizing a server](/guides/sizing/). |
+| `--max-jobs-per-worker <N\|off>` | `1000` | Prefork only: recycle a worker after this many jobs; `0` or `off` never does. |
 | `--allow-shutdown` | off | Honour the clamd `SHUTDOWN` command, letting any client that can reach the daemon stop it. |
 | `--allow-http-scan` | off | Fetch `http(s)://` scan targets (`exav URL` one-shot, the daemon's `SCANURL`). Needs an `http-scan` build. |
 
@@ -411,13 +413,13 @@ container. These tune it; none of them binds anything.
 | Flag | Default | Description |
 |---|---|---|
 | the path of the `--listen` address | `avscan`, `srv_clamav`, `virus_scan` | Service name to answer on (`icap://host:1344/avscan`). Naming one replaces the defaults; `?service=a&service=b` names several. See [address options](#what-belongs-to-one-listener). |
-| `--icap-preview-bytes <N>` | `4096` | Bytes advertised in the `Preview` header. |
+| `--icap-preview-bytes <SIZE\|off>` | `4096` | Bytes advertised in the `Preview` header; `0` previews the headers only, `off` omits the header. |
 | `--icap-transfer-preview <PATTERN\|off>` | `*` | `Transfer-Preview` value; `off` omits the header. |
 | `?max-connections=` on the address | `100` | Concurrent connections, also advertised as `Max-Connections`. |
-| `--icap-options-ttl-secs <SECS>` | `3600` | How long a client may cache the `OPTIONS` answer. |
-| `--icap-max-requests <N>` | `100` | Requests served on one connection before it is closed. |
-| `--icap-idle-secs <SECS>` | `600` | How long an idle connection is held open. |
-| `--icap-max-header-bytes <N>` | `65536` | Largest ICAP head plus encapsulated HTTP headers. |
+| `--icap-options-ttl-secs <SECS\|off>` | `3600` | How long a client may cache the `OPTIONS` answer; `0` means not at all, `off` omits the header, which RFC 3507 reads as never expiring. |
+| `--icap-max-requests <N\|off>` | `100` | Requests served on one connection before it is closed; `off` never closes it for that. |
+| `--icap-idle-secs <SECS>` | `600` | How long a connection may go without sending or taking a byte, between requests or inside one. No `off`. |
+| `--icap-max-header-bytes <SIZE>` | `64K` | Largest ICAP head plus encapsulated HTTP headers, at least `1K`. No `off`. |
 | `--icap-infection-header <WHEN>` | `blocks` | Which blocks carry `X-Infection-Found`: `blocks` (every one; a `PARTIAL` verdict under `Heuristics.Exav.*`) or `detections` (a signature match only). |
 
 There is no ICAP-specific size ceiling: the same `--max-input-bytes` and spill
@@ -428,16 +430,24 @@ port.
 
 | Flag | Description |
 |---|---|
-| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-extracted-bytes 400M --max-unpack-depth 17 --max-members 10000 --decode none --partial-as ok`, plus the extractor set of stock ClamAV and ClamAV's naming where the two engines name the same fact differently. For differential testing only: it reduces detection on purpose. |
+| `--clamav-compat` | Preset: `--max-input-bytes 100M --max-unpack-depth 17 --max-members 10000 --decode none --partial-as ok` and 400M held per file (ClamAV's scan size), plus the extractor set of stock ClamAV and ClamAV's naming where the two engines name the same fact differently. For differential testing only: it reduces detection on purpose. |
 
 Each preset value can be set on its own, and an explicit flag wins over the
-preset. The preset leaves `--max-object-bytes`, `--max-matcher-bytes`,
-`--max-pe-emulation-steps`, the spill settings, `--detect`/`--no-detect`,
-passwords and update, network and worker settings on exav's defaults. The
-narrower extractor set and the `.UNOFFICIAL` naming have no flags of their own.
+preset. The preset leaves `--max-matcher-bytes`, `--max-pe-emulation-steps`, the
+spill settings, `--detect`/`--no-detect`, passwords and update, network and
+worker settings on exav's defaults, and `--max-object-bytes` too, except that a
+top-level file up to 400M is held whole unless that flag is given. The narrower
+extractor set and the `.UNOFFICIAL` naming have no flags of their own.
 
 For the complete `clamscan` / `clamd` / `clamdscan` surface against exav's, see
 the [ClamAV flag matrix](/reference/clamav-flag-matrix/).
+
+## Other
+
+| Flag | Description |
+|---|---|
+| `-h`, `--help` | Print the help (`-h` a summary, `--help` the full text). |
+| `-V`, `--version` | Print the version. |
 
 ## Exit codes
 

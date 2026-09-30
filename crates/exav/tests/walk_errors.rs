@@ -88,6 +88,48 @@ fn an_unreadable_subdirectory_is_reported_and_fails_the_run() {
     );
 }
 
+/// `--quiet` drops the `OK` lines and the summary, never an error, and an error
+/// reaches `--log` as a detection does.
+#[test]
+fn an_error_is_printed_under_quiet_and_logged() {
+    let dir = TempDir::new().expect("temp dir");
+    let log = dir.path().join("scan.log");
+    let missing = dir.path().join("missing.bin");
+    let out = exav()
+        .arg("--quiet")
+        .arg("--log")
+        .arg(&log)
+        .arg(&missing)
+        .output()
+        .expect("run exav");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("missing.bin") && stderr.contains("ERROR"),
+        "{stderr}"
+    );
+    let logged = std::fs::read_to_string(&log).expect("read the log");
+    assert!(
+        logged.contains("missing.bin") && logged.contains("ERROR"),
+        "{logged}"
+    );
+}
+
+/// The summary counts a file not fully examined as partial, not as an error:
+/// the two exit differently, and the summary has to agree with the exit code.
+#[test]
+fn the_summary_counts_a_partial_file_apart_from_errors() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    gz.extend_from_slice(&[0xff; 64]);
+    std::fs::write(dir.path().join("damaged.gz"), gz).expect("write");
+    let out = exav().arg(dir.path()).output().expect("run exav");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("Partial files: 1"), "{stdout}");
+    assert!(!stdout.contains("Total errors"), "{stdout}");
+}
+
 /// The counterweight to the above: a tree with nothing wrong still exits 0.
 /// A test that only checks the failure direction is satisfied by a scanner that
 /// always fails.

@@ -1,23 +1,19 @@
-# Streaming the last three container formats
+# Streaming the last container formats
 
-exav optimises for memory, not bandwidth. A streamable format is walked member by
-member straight off the seekable source, so peak memory is one member's window
-rather than the whole decoded object. Most containers already work that way (see
-`is_streamable`), including tar, zip, 7z and cab. Three do not, for different
-reasons, and only two of them are worth changing.
+exav optimises for memory, not bandwidth. `walk` hands a format's members over
+straight off the seekable source, each decoded as it is read, so peak memory is
+one member's window rather than the whole decoded object. Most containers
+already work that way (every arm of `dispatch` in `stream.rs` but the last),
+including tar, zip, 7z, cab, lz4, `.Z` and DMG; the rest are read whole
+(`read_whole`). Two of those matter, for different reasons, and only one of them
+is worth changing.
 
-**DMG: the tractable one, and the next concrete step.** `decompress_udif`
-materialises the entire virtual disk into one `Vec` because the HFS+/APFS
-readers need random access over it, so a 4 GB image costs 4 GB of resident
-memory (bounded by the peak-buffer limit, which means large images are refused
-rather than scanned). The reader is already the right shape: `DmgReader` is
-position-based, mapping an offset to a BLKX run and decompressing that run. Two
-pieces are missing. First a decompressed-run cache: `read` currently
-re-decompresses the containing run on every call, which is fine for a linear
-pass and unusable under the seek storms a filesystem crate generates. Then
-`impl Seek`, after which the reader can be handed to the filesystem crates
-directly instead of a materialised image. Roughly 150 lines, and it converts a
-whole-image allocation into one cached run.
+**DMG: done.** The HFS+/APFS readers get the disk as a `Read + Seek` over
+`DmgReader`, which decompresses a BLKX run when the filesystem first reaches it
+and keeps the last 32 MiB of decoded runs. The virtual disk is never held
+whole. Each file is still returned whole by the filesystem crates, so a file is
+bounded by the peak-buffer limit. An encrypted image is decrypted whole, under
+the same limit.
 
 **RAR: real work, deliberately not rushed.** `rar3_unpack.rs` and
 `rar5_unpack.rs` are vendored decoders that build the complete output `Vec`.

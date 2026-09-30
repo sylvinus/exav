@@ -41,20 +41,20 @@ const MAX_PLAUSIBLE_HEADER: u64 = 1 << 20;
 /// have *and* claim a size no archiver ever writes. That is the region where
 /// the reader cannot succeed either — it would allocate, read short, and fail —
 /// which keeps this check aligned with the answer the decoder would have given.
-fn header_worth_reading(data: &[u8]) -> bool {
+fn header_worth_reading(head: &[u8], len: u64) -> bool {
     // Too short to carry a level byte. The reader reports that truncation
     // itself, and does so without over-reserving.
-    if data.len() < 21 {
+    if head.len() < 21 {
         return true;
     }
-    let declared = match data[20] {
+    let declared = match head[20] {
         // Levels 0 and 1 size the header with a single byte, so the worst
         // over-declaration is a couple of hundred bytes.
         0 | 1 => return true,
-        2 => u64::from(u16::from_le_bytes([data[0], data[1]])),
+        2 => u64::from(u16::from_le_bytes([head[0], head[1]])),
         // Level 3 is the only one that states its total in 32 bits, and so the
         // only one that can name a size no machine will satisfy.
-        3 => match data.get(24..28) {
+        3 => match head.get(24..28) {
             Some(b) => u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
             None => return true,
         },
@@ -62,37 +62,44 @@ fn header_worth_reading(data: &[u8]) -> bool {
         // judgement to the reader rather than guess against it.
         _ => return true,
     };
-    declared <= data.len() as u64 || declared <= MAX_PLAUSIBLE_HEADER
+    declared <= len || declared <= MAX_PLAUSIBLE_HEADER
 }
 
-/// LHA/LZH: decode each member with the pure-Rust `delharc` reader.
-pub(crate) fn extract_lha<R>(
-    data: &[u8],
+/// Walk an LHA/LZH archive: `delharc`'s per-member decoder is already a
+/// `Read`, so each member is decoded as it is read. A member with an
+/// unsupported compression method is reported, not skipped; directories are
+/// ignored.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    if !header_worth_reading(data) {
-        return Err(LimitHit::corrupt(
-            "lha: header declares a size no archive carries".into(),
-        ));
-    }
-    let mut dec = delharc::LhaDecodeReader::new(Cursor::new(data))
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    use crate::stream::{emit_stream, MemberMeta};
+    check_first_header(src)?;
+    let mut dec = delharc::LhaDecodeReader::new(crate::source::Reader::new(src))
         .map_err(|e| LimitHit::new(format!("lha: {e}")))?;
     loop {
-        let header = dec.header();
-        let is_dir = header.is_directory();
-        let name = header.parse_pathname_to_str();
-        if !is_dir && dec.is_decoder_supported() {
+        if !dec.header().is_directory() {
             budget.count_entry()?;
-            let cap = budget.reserve()?;
-            let (buf, truncated) =
-                bounded_read(&mut dec, cap).map_err(|e| LimitHit::new(format!("lha read: {e}")))?;
-            if truncated {
-                return Err(LimitHit::new(format!("lha member '{name}' exceeds budget")));
-            }
-            budget.commit(buf.len() as u64);
-            if let Some(r) = visit(Entry::new(name, buf), budget) {
-                return Ok(Some(r));
+            let header = dec.header();
+            let meta = MemberMeta {
+                name: header.parse_pathname_to_str(),
+                comp_size: header.compressed_size,
+                size: Some(header.original_size),
+                encrypted: false,
+                unsupported: None,
+            };
+            let visited = if dec.is_decoder_supported() {
+                emit_stream(&meta, &mut dec, budget, visit)?
+            } else {
+                let meta = MemberMeta {
+                    unsupported: Some("unsupported LHA compression method"),
+                    ..meta
+                };
+                visit(&meta, None, budget)
+            };
+            if let Some(t) = visited {
+                return Ok(Some(t));
             }
         }
         match dec.next_file() {
@@ -102,4 +109,15 @@ pub(crate) fn extract_lha<R>(
         }
     }
     Ok(None)
+}
+
+/// Refuse an archive whose first header would make the reader reserve more
+/// than any archive carries (see [`header_worth_reading`]).
+pub(crate) fn check_first_header(src: &dyn crate::source::ByteSource) -> Result<(), LimitHit> {
+    if header_worth_reading(&src.window(0, 28), src.len() as u64) {
+        return Ok(());
+    }
+    Err(LimitHit::corrupt(
+        "lha: header declares a size no archive carries".into(),
+    ))
 }

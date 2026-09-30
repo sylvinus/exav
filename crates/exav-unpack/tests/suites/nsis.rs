@@ -83,7 +83,7 @@ fn truncated_and_garbage_do_not_panic() {
     // the gitignored sample is present locally.
     if let Some(data) = real_nsis() {
         let truncated = &data[..data.len() / 3];
-        let _ = extract(Format::Nsis, truncated, &mut budget);
+        let _ = extract(Format::Nsis, &truncated, &mut budget);
     }
 
     // Signature with no valid firstheader following.

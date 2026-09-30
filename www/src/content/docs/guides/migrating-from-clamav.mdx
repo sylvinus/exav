@@ -50,22 +50,22 @@ Put these earlier on `PATH` than ClamAV's own (`/usr/local/bin` before `/usr/bin
 on most systems):
 
 ```sh
-# /usr/local/bin/clamscan
+sudo tee /usr/local/bin/clamscan >/dev/null <<'EOF'
 #!/bin/sh
 exec exav --sig-dir /var/lib/clamav "$@"
-```
-
-```sh
-# /usr/local/bin/clamdscan
+EOF
+sudo tee /usr/local/bin/clamdscan >/dev/null <<'EOF'
 #!/bin/sh
 exec exav --connect /run/clamav/clamd.ctl "$@"
+EOF
+sudo chmod +x /usr/local/bin/clamscan /usr/local/bin/clamdscan
 ```
 
 Each pins what the caller's command line does not carry:
 
 - `--sig-dir` names the directory `freshclam` populates. exav's own default is
   `/var/lib/exav`, so without it a caller relying on `clamscan`'s default gets
-  `no signature database loaded — refusing to run`. A caller's own `-d`
+  `no signature database loaded, refusing to run`. A caller's own `-d`
   overrides it.
 - `--connect` is the address the daemon listens on; `--connect HOST:PORT` wraps a
   client for a daemon on another host.
@@ -99,9 +99,15 @@ Keep running `freshclam` / `cvd` on your normal schedule. For a faster start on
 large signature sets, [build a database once](/guides/prebuilt-database/):
 
 ```sh
-exav -d /var/lib/clamav --build-db /var/lib/clamav/exav.exavdb   # after each freshclam
+# After each freshclam, as the clamav user: build beside the live file, then
+# swap it in with a rename so nothing ever reads a half-written database.
+sudo -u clamav exav -d /var/lib/clamav --build-db /var/lib/clamav/exav.exavdb.tmp
+sudo -u clamav mv /var/lib/clamav/exav.exavdb.tmp /var/lib/clamav/exav.exavdb
+
 exav -d /var/lib/clamav/exav.exavdb /data                        # fast cold start
 ```
+
+See [updating a running deployment](/guides/prebuilt-database/#updating-a-running-deployment).
 
 ## 2. Replacing `clamscan`
 
@@ -122,14 +128,18 @@ Each exav limit flag is named after the bound it sets:
 | `clamscan` spelling | exav flag | Bounds |
 |---|---|---|
 | `--max-filesize` | `--max-input-bytes` | the largest top-level input scanned |
-| `--max-scansize` | `--max-extracted-bytes` | what decompression may produce across one top-level file |
+| `--max-scansize` | `--max-matcher-bytes` | the most bytes scanned for one top-level file |
 | `--max-recursion` | `--max-unpack-depth` | nesting depth |
 | `--max-files` | `--max-members` | members visited across the whole recursive walk |
 
-Three bounds have no `clamscan` counterpart: `--max-object-bytes` (the most
-memory one object may use, and the largest file the full engine scans),
-`--max-matcher-bytes` (bytes fed to the matcher, a CPU bound) and
-`--max-pe-emulation-steps` (PE unpacking emulator instructions).
+`--max-matcher-bytes` is a CPU bound in exav: a streamed member is scanned
+without being held, so its default is 10G against ClamAV's 400M. Memory is
+bounded separately, and these have no `clamscan` counterpart:
+`--max-process-bytes` (the memory a scan may use; what it holds is kept to half
+of it), `--max-object-bytes` (the most memory one object may use; a larger one
+is read through a bounded cache or a spill file, and the checks that parse an
+object whole skip it) and `--max-pe-emulation-steps` (PE unpacking emulator
+instructions). See [sizing a server](/guides/sizing/).
 
 There is one spelling per bound, and a `clamscan` spelling gets an error naming
 the exav flag:
@@ -176,10 +186,11 @@ working unchanged.
    grep -i localsocket /etc/clamav/clamd.conf   # e.g. /run/clamav/clamd.ctl
    ```
 
-2. Stop clamd so the socket is free:
+2. Stop clamd so the socket is free. On Debian and Ubuntu stop its socket unit
+   too, or the first connection starts clamd again:
 
    ```sh
-   sudo systemctl stop clamav-daemon
+   sudo systemctl stop clamav-daemon.socket clamav-daemon.service
    ```
 
 3. Run exav on that socket, reading the same database directory:
@@ -187,6 +198,10 @@ working unchanged.
    ```sh
    sudo -u clamav exav --listen /run/clamav/clamd.ctl -d /var/lib/clamav
    ```
+
+   Loading the raw database takes over a minute; wait for
+   `exav: prefork daemon: …` in its output (or load the `exav.exavdb` built in
+   [section 1](#1-keep-your-existing-signatures), which takes seconds).
 
    exav creates the socket with mode `0600`, so clients running as another user
    need the mode `clamd.conf` gave them (`LocalSocketMode`, often `660` with a
@@ -210,17 +225,19 @@ working unchanged.
 ### As a managed service
 
 Install the provided unit (shipped in the `.deb`, or copy
-`packaging/exav-clamd.service`):
+`packaging/exav.service`):
 
 ```sh
-sudo systemctl stop clamav-daemon && sudo systemctl disable clamav-daemon
-sudo systemctl enable --now exav-clamd
+sudo systemctl disable --now clamav-daemon.socket clamav-daemon.service
+sudo systemctl enable --now exav
 clamdscan --ping 1
 ```
 
-The unit runs as the existing `clamav` user on the Debian socket path; edit
-`ExecStart` / `RuntimeDirectory` for Fedora/RHEL or to match your `clamd.conf`.
-See the [daemon guide](/guides/daemon/) for protocol coverage.
+The unit runs as the existing `clamav` user on the Debian socket path and reads
+`/var/lib/clamav`, which `freshclam` keeps current; edit `ExecStart` /
+`RuntimeDirectory` for Fedora/RHEL or to match your `clamd.conf`. The signals are
+clamd's: `SIGUSR2` (`systemctl reload exav`) reloads the signatures and `SIGHUP`
+reopens the log. See the [daemon guide](/guides/daemon/) for protocol coverage.
 
 ## 4. Encrypted archives & passwords
 
@@ -249,9 +266,10 @@ detected but not decrypted. See
   with `--build-db` on a machine with room and give every scanner the `.exavdb`,
   which loads quickly and with a fraction of the memory. A daemon pays the load
   once; the one-shot `clamscan` replacement pays it per run.
-- **Large files:** a file over `--max-object-bytes` (256 MiB) is reported
-  `LIMITS-EXCEEDED` unless a literal signature or a hash matches it (see
+- **Large files:** a file over `--max-object-bytes` (256 MiB) gets the full
+  engine through a bounded block cache. The checks that parse an object whole
+  (PE structure, a format read whole such as RAR) skip it, and when one of them
+  applied and nothing was found it is reported `LIMITS-EXCEEDED` (see
   [Streaming & memory](/concepts/streaming-memory/)).
-- exav is beta: treat non-detections with caution and keep ClamAV as a fallback
-  until you have validated coverage on your own corpus (see
+- Validate coverage on your own corpus before retiring ClamAV (see
   [Differential testing](/concepts/differential-testing/)).

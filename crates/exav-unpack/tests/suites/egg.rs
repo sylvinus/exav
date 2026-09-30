@@ -10,7 +10,8 @@
 
 #![cfg(feature = "egg")]
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 fn members(blob: &[u8]) -> Vec<Entry> {
     let mut budget = Budget::new(Limits::default());
@@ -56,7 +57,7 @@ fn corpus() -> Vec<(&'static str, &'static [u8])> {
 fn every_fixture_is_recognised_as_egg() {
     for (name, blob) in corpus() {
         assert_eq!(
-            exav_unpack::detect(blob),
+            exav_unpack::detect(&blob),
             Some(Format::Egg),
             "{name} was not recognised"
         );

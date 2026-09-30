@@ -44,6 +44,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::byte_source::{ByteSource, Bytes, Stepper};
+
 /// Hard ceilings so a hostile script can't blow up time or memory.
 const MAX_OUTPUT: usize = 32 * 1024 * 1024;
 /// `eval` layers unrolled, counted from the script itself. Each layer re-reads
@@ -77,14 +79,22 @@ enum Tok {
 /// Normalise a JavaScript/script buffer to its canonical form for matching.
 /// The flag is true when the output was cut at [`MAX_OUTPUT`].
 pub fn normalize(data: &[u8]) -> (Vec<u8>, bool) {
-    run(data).finish()
+    run(Text::Mem(Cow::Borrowed(data))).finish()
+}
+
+/// [`normalize`] over a script that need not be held in memory.
+pub(crate) fn normalize_source(src: &dyn ByteSource) -> (Vec<u8>, bool) {
+    match src.as_slice() {
+        Some(data) => normalize(data),
+        None => run(Text::Source(Stepper::new(src))).finish(),
+    }
 }
 
 /// Read all of `data` through the normaliser, leaving the end unwritten.
-fn run(data: &[u8]) -> Normalizer {
+fn run(data: Text) -> Normalizer {
     let mut n = Normalizer::default();
     // The script, and above it the text of each `eval` being unrolled.
-    let mut sources = vec![Lexer::new(Cow::Borrowed(data), 0)];
+    let mut sources = vec![Lexer::new(data, 0)];
     while let Some(src) = sources.last_mut() {
         if n.out.cut {
             break;
@@ -124,7 +134,7 @@ fn is_ident_start(b: u8) -> bool {
 /// whitespace. A `/` is a regex when it appears where a value is expected,
 /// otherwise a comment (`//`, `/*`) or the division operator.
 struct Lexer<'a> {
-    data: Cow<'a, [u8]>,
+    data: Text<'a>,
     i: usize,
     /// "Value expected" position: at the start, or right after an operator /
     /// opening bracket / keyword: a `/` here begins a regex, not division.
@@ -133,8 +143,42 @@ struct Lexer<'a> {
     depth: u32,
 }
 
+/// Text a lexer reads: the script, held in memory or read from its source,
+/// or the decoded text of an `eval`.
+enum Text<'a> {
+    Mem(Cow<'a, [u8]>),
+    Source(Stepper<'a>),
+}
+
+impl Bytes for Text<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Text::Mem(d) => d.len(),
+            Text::Source(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    fn at(&mut self, i: usize) -> u8 {
+        match self {
+            Text::Mem(d) => d[i],
+            Text::Source(s) => s.at(i),
+        }
+    }
+
+    fn range(&mut self, from: usize, to: usize) -> Cow<'_, [u8]> {
+        match self {
+            Text::Mem(d) => {
+                let to = to.min(d.len());
+                Cow::Borrowed(&d[from.min(to)..to])
+            }
+            Text::Source(s) => s.range(from, to),
+        }
+    }
+}
+
 impl<'a> Lexer<'a> {
-    fn new(data: Cow<'a, [u8]>, depth: u32) -> Self {
+    fn new(data: Text<'a>, depth: u32) -> Self {
         Lexer {
             data,
             i: 0,
@@ -144,24 +188,24 @@ impl<'a> Lexer<'a> {
     }
 
     fn next(&mut self) -> Option<Tok> {
-        let data: &[u8] = &self.data;
+        let data = &mut self.data;
         let n = data.len();
         let mut i = self.i;
         while i < n {
-            let b = data[i];
+            let b = data.at(i);
             match b {
                 b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b => {
                     i += 1;
                 }
-                b'/' if i + 1 < n && data[i + 1] == b'/' => {
+                b'/' if i + 1 < n && data.at(i + 1) == b'/' => {
                     i += 2;
-                    while i < n && data[i] != b'\n' {
+                    while i < n && data.at(i) != b'\n' {
                         i += 1;
                     }
                 }
-                b'/' if i + 1 < n && data[i + 1] == b'*' => {
+                b'/' if i + 1 < n && data.at(i + 1) == b'*' => {
                     i += 2;
-                    while i + 1 < n && !(data[i] == b'*' && data[i + 1] == b'/') {
+                    while i + 1 < n && !(data.at(i) == b'*' && data.at(i + 1) == b'/') {
                         i += 1;
                     }
                     i = (i + 2).min(n);
@@ -181,41 +225,43 @@ impl<'a> Lexer<'a> {
                 b'0'..=b'9' => {
                     let start = i;
                     i += 1;
-                    while i < n
-                        && (data[i].is_ascii_alphanumeric()
-                            || data[i] == b'.'
-                            || data[i] == b'_'
-                            || ((data[i] == b'+' || data[i] == b'-')
-                                && matches!(data[i - 1], b'e' | b'E')))
-                    {
+                    while i < n && {
+                        let c = data.at(i);
+                        c.is_ascii_alphanumeric()
+                            || c == b'.'
+                            || c == b'_'
+                            || ((c == b'+' || c == b'-') && matches!(data.at(i - 1), b'e' | b'E'))
+                    } {
                         i += 1;
                     }
                     self.i = i;
                     self.value_pos = false;
-                    return Some(Tok::Num(data[start..i].to_vec()));
+                    return Some(Tok::Num(data.range(start, i).into_owned()));
                 }
-                b'.' if i + 1 < n && data[i + 1].is_ascii_digit() => {
+                b'.' if i + 1 < n && data.at(i + 1).is_ascii_digit() => {
                     let start = i;
                     i += 1;
-                    while i < n
-                        && (data[i].is_ascii_digit() || matches!(data[i], b'e' | b'E' | b'+' | b'-'))
-                    {
+                    while i < n && {
+                        let c = data.at(i);
+                        c.is_ascii_digit() || matches!(c, b'e' | b'E' | b'+' | b'-')
+                    } {
                         i += 1;
                     }
                     self.i = i;
                     self.value_pos = false;
-                    return Some(Tok::Num(data[start..i].to_vec()));
+                    return Some(Tok::Num(data.range(start, i).into_owned()));
                 }
                 _ if is_ident_start(b) => {
                     let start = i;
                     i += 1;
-                    while i < n && is_ident(data[i]) {
+                    while i < n && is_ident(data.at(i)) {
                         i += 1;
                     }
                     self.i = i;
+                    let ident = data.range(start, i).into_owned();
                     // After an identifier that is a keyword, a value follows.
-                    self.value_pos = ident_is_keyword(&data[start..i]);
-                    return Some(Tok::Ident(data[start..i].to_vec()));
+                    self.value_pos = ident_is_keyword(&ident);
+                    return Some(Tok::Ident(ident));
                 }
                 _ => {
                     self.i = i + 1;
@@ -233,12 +279,12 @@ impl<'a> Lexer<'a> {
 
 /// Read a string literal starting at the opening quote `data[i] == quote`.
 /// Returns the decoded content (without quotes) and the index past the closer.
-fn read_string(data: &[u8], mut i: usize, quote: u8) -> (Vec<u8>, usize) {
+fn read_string<B: Bytes>(data: &mut B, mut i: usize, quote: u8) -> (Vec<u8>, usize) {
     let n = data.len();
     let mut s = Vec::new();
     i += 1; // skip opening quote
     while i < n {
-        let b = data[i];
+        let b = data.at(i);
         if b == quote {
             i += 1;
             break;
@@ -261,38 +307,38 @@ fn read_string(data: &[u8], mut i: usize, quote: u8) -> (Vec<u8>, usize) {
 
 /// Decode one backslash escape whose body starts at `i` (the char after `\`).
 /// Returns the decoded bytes and the index past the escape.
-fn decode_escape(data: &[u8], i: usize) -> (Vec<u8>, usize) {
+fn decode_escape<B: Bytes>(data: &mut B, i: usize) -> (Vec<u8>, usize) {
     let n = data.len();
     if i >= n {
         return (vec![b'\\'], i);
     }
-    match data[i] {
+    match data.at(i) {
         b'x' if i + 2 < n => {
-            if let Some(v) = hex2(data[i + 1], data[i + 2]) {
+            if let Some(v) = hex2(data.at(i + 1), data.at(i + 2)) {
                 return (vec![v], i + 3);
             }
-            (vec![data[i]], i + 1)
+            (vec![b'x'], i + 1)
         }
         b'u' => {
-            if i + 1 < n && data[i + 1] == b'{' {
+            if i + 1 < n && data.at(i + 1) == b'{' {
                 // \u{HHHHHH}
                 let mut j = i + 2;
                 let mut cp: u32 = 0;
                 let mut any = false;
-                while j < n && data[j] != b'}' {
-                    let Some(d) = (data[j] as char).to_digit(16) else { break };
+                while j < n && data.at(j) != b'}' {
+                    let Some(d) = (data.at(j) as char).to_digit(16) else { break };
                     cp = cp.saturating_mul(16).saturating_add(d);
                     any = true;
                     j += 1;
                 }
-                if any && j < n && data[j] == b'}' {
+                if any && j < n && data.at(j) == b'}' {
                     return (encode_cp(cp), j + 1);
                 }
                 (vec![b'u'], i + 1)
             } else if i + 4 < n {
                 let mut cp: u32 = 0;
                 for k in 1..=4 {
-                    let Some(d) = (data[i + k] as char).to_digit(16) else {
+                    let Some(d) = (data.at(i + k) as char).to_digit(16) else {
                         return (vec![b'u'], i + 1);
                     };
                     cp = cp * 16 + d;
@@ -306,8 +352,8 @@ fn decode_escape(data: &[u8], i: usize) -> (Vec<u8>, usize) {
             // Octal escape, up to 3 digits.
             let mut j = i;
             let mut v: u32 = 0;
-            while j < n && j < i + 3 && (b'0'..=b'7').contains(&data[j]) {
-                v = v * 8 + (data[j] - b'0') as u32;
+            while j < n && j < i + 3 && (b'0'..=b'7').contains(&data.at(j)) {
+                v = v * 8 + (data.at(j) - b'0') as u32;
                 j += 1;
             }
             (vec![(v & 0xFF) as u8], j)
@@ -319,7 +365,7 @@ fn decode_escape(data: &[u8], i: usize) -> (Vec<u8>, usize) {
         b'f' => (vec![0x0c], i + 1),
         b'v' => (vec![0x0b], i + 1),
         b'\n' => (vec![], i + 1),               // line continuation
-        b'\r' if i + 1 < n && data[i + 1] == b'\n' => (vec![], i + 2),
+        b'\r' if i + 1 < n && data.at(i + 1) == b'\n' => (vec![], i + 2),
         b'\r' => (vec![], i + 1),
         other => (vec![other], i + 1),          // \" \\ \/ \' → literal char
     }
@@ -348,13 +394,13 @@ fn hex2(a: u8, b: u8) -> Option<u8> {
 }
 
 /// Read a regex literal `/.../flags` starting at `data[i] == '/'`.
-fn read_regex(data: &[u8], mut i: usize) -> (Vec<u8>, usize) {
+fn read_regex<B: Bytes>(data: &mut B, mut i: usize) -> (Vec<u8>, usize) {
     let n = data.len();
     let start = i;
     i += 1; // opening /
     let mut in_class = false;
     while i < n {
-        match data[i] {
+        match data.at(i) {
             b'\\' if i + 1 < n => i += 2,
             b'[' => {
                 in_class = true;
@@ -372,10 +418,10 @@ fn read_regex(data: &[u8], mut i: usize) -> (Vec<u8>, usize) {
             _ => i += 1,
         }
     }
-    while i < n && data[i].is_ascii_alphabetic() {
+    while i < n && data.at(i).is_ascii_alphabetic() {
         i += 1; // flags
     }
-    (data[start..i].to_vec(), i)
+    (data.range(start, i).into_owned(), i)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +645,7 @@ impl Normalizer {
                 };
                 if matches!(kind, Kind::Eval) {
                     self.held.truncate(call.start);
-                    return Some(Lexer::new(Cow::Owned(text), call.depth + 1));
+                    return Some(Lexer::new(Text::Mem(Cow::Owned(text)), call.depth + 1));
                 }
                 percent_decode(&text)
             }
@@ -989,11 +1035,11 @@ mod tests {
         for k in 0..200_000 {
             script.extend_from_slice(format!("a{k}=b.c(d,e)+\"f\";").as_bytes());
         }
-        let n = run(&script);
+        let n = run(Text::Mem(Cow::Borrowed(&script)));
         assert!(n.peak_held < 2 * FLUSH_BATCH, "held {} tokens", n.peak_held);
         // Calls nested deeper than the cap: the outermost are given up.
         let deep = [b"unescape(".repeat(100_000), b"'%41'".to_vec(), b")".repeat(100_000)].concat();
-        let n = run(&deep);
+        let n = run(Text::Mem(Cow::Borrowed(&deep)));
         assert!(n.peak_held < 4 * MAX_OPEN_CALLS + FLUSH_BATCH, "held {} tokens", n.peak_held);
     }
 
@@ -1114,6 +1160,34 @@ mod tests {
             &[0u8, 1, 2, 3, 0xff, 0xfe][..],
         ] {
             let _ = normalize(bad); // must not panic
+        }
+    }
+
+    #[test]
+    fn a_script_read_in_blocks_normalizes_as_in_memory() {
+        use crate::byte_source::{BlockCache, CHUNK};
+        let pieces: &[&[u8]] = &[
+            b"eval(", b"unescape(", b"'%61%6c'", b")", b";", b" ", b"\n", b"var x=", b"1e+5", b".5e3",
+            b"/*c*/", b"// line\n", b"/re[/]x/g", b"\"a\\x41\\u0042\\u{43}\\101\"", b"String.fromCharCode(",
+            b"72,105", b"`t\\`q`", b"a/b", b"(", b"]", b"\\\r\n", b"abc$_\x80",
+        ];
+        let mut state = 0x6A09_E667_F3BC_C908u64;
+        for round in 0..300 {
+            let count = if round < 290 { 20 } else { 3 * CHUNK / 4 };
+            let mut data = Vec::new();
+            for _ in 0..count {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                data.extend_from_slice(pieces[(state % pieces.len() as u64) as usize]);
+            }
+            let cache = BlockCache::with_sizes(std::io::Cursor::new(data.clone()), 7, 56).unwrap();
+            assert_eq!(
+                normalize_source(&cache),
+                normalize(&data),
+                "{:?}",
+                String::from_utf8_lossy(&data[..data.len().min(80)])
+            );
         }
     }
 }

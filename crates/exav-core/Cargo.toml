@@ -13,7 +13,7 @@ description = "Core engine for the exav malware scanner: signature-database pars
 # The integration fixtures stay out of the published crate, as they do for
 # exav-unpack. Several are archives built around the EICAR test string, and a
 # `.crate` carrying it is quarantined by whatever scanner watches the machine
-# that runs `cargo add` — the tarball would be the thing setting off alarms.
+# that runs `cargo add`, and the tarball would be the thing setting off alarms.
 # They are test inputs read at run time, so nothing in a published build needs
 # them; `src/yara/testdata` stays because `include_bytes!` needs it to compile.
 exclude = ["tests/fixtures/**"]
@@ -25,21 +25,21 @@ thiserror = "2"
 # fast substring search (SIMD memmem) for the bytecode file_find/memstr APIs
 memchr = "2"
 # hashing (RustCrypto)
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
 # executable parsing (PE/ELF/Mach-O)
 goblin = "0.10"
 # x86 instruction decoder for the bytecode disasm_x86 API. Decode-only, in the
 # workspace, and dependency-free: a general-purpose decoder covers the whole ISA
 # at the cost of hundreds of `unsafe` blocks, which is a poor trade for one API.
-exav-x86 = { path = "../exav-x86", version = "0.0.1" }
+exav-x86 = { path = "../exav-x86", version = "0.0.2" }
 # archive/container extraction (its own crate). Formats are selected via this
 # crate's forwarding features (see `[features]`); `default-features = false` so a
 # lean build can pick only the formats it needs.
 # gzip+tar are not optional: a `.cvd` is a gzip'd tar, a `.cld` a raw one, so
 # loading any signature database needs both.
-exav-unpack = { path = "../exav-unpack", version = "0.0.1", default-features = false, features = ["gzip", "tar"] }
+exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["gzip", "tar"] }
 # fuzzy hashing
 tlsh2 = { version = "0.4", features = ["diff"] }
 # image fuzzy hashing (ClamAV `fuzzy_img#` subsigs). The pinned versions are the
@@ -58,6 +58,8 @@ daachorse = "3"
 rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 rmp-serde = "1.3.1"
+# The `.exavdb` binary blobs, written and read directly (see `database::enc_bytes`).
+rmp = "0.8.15"
 regex = "1.12.4"
 # Backtracking-regex fallback for the few PCRE subsigs using lookaround /
 # backreferences (not regular languages, so the linear-time `regex` engine can't
@@ -68,7 +70,7 @@ regex = "1.12.4"
 fancy-regex = "0.18.0"
 # YARA rule support (ClamAV loads .yar/.yara by default, so a drop-in must too),
 # via exav's native YARA engine under `src/yara/`. It compiles rules to a native
-# tree-walking evaluator — no runtime codegen at scan time (W^X preserved) — and
+# tree-walking evaluator (no runtime codegen at scan time, W^X preserved) and
 # does the `pe` module via `goblin`. The engine reuses exav-core's `goblin`,
 # `md-5`/`sha1`/`sha2` and `memchr`; only the parser/regex/base64 primitives
 # below are pulled in behind the `yara` feature. A lean build drops the engine
@@ -77,14 +79,16 @@ fancy-regex = "0.18.0"
 # Parser + AST only. The AST borrows the source, so the compiler lowers it into
 # an owned IR.
 yara-x-parser = { version = "1.18", optional = true }
-# Byte-oriented regex engine with anchored search: regexp patterns, the `matches`
-# operator, and the execution engine for hex patterns (lowered to byte regexes).
-regex-automata = { version = "0.4", optional = true }
-# Regex HIR + required-literal extraction, used to build the atom prefilter that
-# gates which YARA patterns are scanned. Same crate (and analysis) the `regex`
-# crate uses for its own prefilters, so a finite literal `Seq` is a sound
-# required-literal set (no match is ever missed).
-regex-syntax = { version = "0.8", optional = true }
+# Byte-oriented regex engine with anchored search: YARA regexp patterns, the
+# `matches` operator and hex patterns (lowered to byte regexes), and the lazy
+# DFAs that run a regex over an object read through the block cache.
+regex-automata = "0.4"
+# Regex HIR, which the lazy DFAs are built from, and required-literal
+# extraction, used to build the atom prefilter that gates which YARA patterns
+# are scanned. Same crate (and analysis) the `regex` crate uses for its own
+# prefilters, so a finite literal `Seq` is a sound required-literal set (no
+# match is ever missed).
+regex-syntax = "0.8"
 # base64 alphabet handling for the `base64`/`base64wide` string modifiers.
 base64 = { version = "0.22", optional = true }
 # The parser returns byte strings as `bstr` types.
@@ -99,7 +103,7 @@ default = ["yara", "all-formats", "decrypt", "dlp", "phishing"]
 # Full YARA rule matching (the native in-tree engine under `src/yara/`). On by
 # default; disable for a smaller build that stores but never matches `.yar`/
 # `.yara` rules (the `YaraDb` type stays present for the on-disk format).
-yara = ["dep:yara-x-parser", "dep:regex-automata", "dep:regex-syntax", "dep:base64", "dep:bstr", "dep:crc32fast"]
+yara = ["dep:yara-x-parser", "dep:base64", "dep:bstr", "dep:crc32fast"]
 
 # Opt-in DLP structured-data heuristic (credit-card / SSN counting, ClamAV's
 # `--structured-*-count`). Tiny, pure-Rust, no extra deps; on by default. The
@@ -113,7 +117,7 @@ dlp = []
 phishing = []
 
 # Verify archive checksums during extraction (see `ScanOptions::verify_checksums`).
-# Off by default — the scanner scans content regardless of CRC. Forwarded to
+# Off by default: the scanner scans content regardless of CRC. Forwarded to
 # exav-unpack.
 checksums = ["exav-unpack/checksums"]
 # Forwarded to exav-unpack so the CLI's crash-containment tests can reach it.
@@ -195,7 +199,7 @@ screnc = ["exav-unpack/screnc"]
 # build can take static unpacking without executing attacker control flow.
 pe-emu = ["exav-unpack/pe-emu"]
 # Enables the HTTP(S) range-request seekable backend (HttpRangeReader). OFF by
-# default — the only feature that pulls a C/asm TLS stack (ureq → rustls → ring).
+# default: the only feature that pulls a C/asm TLS stack (ureq → rustls → ring).
 http = ["dep:ureq"]
 # Expose the engine's internal modules (signature IR/matcher `engine`, the
 # `bytecode` interpreter, `pe`/`icon`/`hashes`/`patterns`/… primitives) as `pub`
@@ -213,26 +217,30 @@ unstable-internals = []
 #
 #   cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 #
-# YARA is deliberately absent from a WASI build — the engine is pure Rust and
-# would work, but nothing in that deployment supplies rules.
+# It takes the default features with it, YARA included: a `.yar` file in the
+# database directory is used.
 wasi-bin = ["dep:serde_json"]
 
 [dev-dependencies]
-# Temp files for tests are `src/tmpfile.rs`, deliberately not a dependency — see
-# the note there; the ready-made crates bring `rustix` + `linux-raw-sys` and
+# Temp files for tests are `src/tmpfile.rs`, deliberately not a dependency (see
+# the note there): the ready-made crates bring `rustix` + `linux-raw-sys` and
 # their thousands of unsafe blocks along for a page of `std::fs`.
 # only for building test ZIPs in unit tests
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # test fixtures only: build gzip/tar CVD fixtures + gzip scan inputs.
 # `default-features = false` turns off tar's `xattr` support, which is for
-# restoring extended attributes to a real filesystem — these fixtures are built
-# in memory — and which is the only thing that puts `rustix` + `linux-raw-sys`
+# restoring extended attributes to a real filesystem (these fixtures are built
+# in memory) and which is the only thing that puts `rustix` + `linux-raw-sys`
 # into the build at all.
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 cfb = "0.14"
 # only for the base64-embedded-executable end-to-end test
 base64 = "0.22"
+# Small chunks when reading a source, so tests on small inputs cross many
+# chunk seams. Features only: which formats are built stays with the
+# dependency above.
+exav-unpack = { path = "../exav-unpack", default-features = false, features = ["small-chunks"] }
 
 # All examples reach into the (unstable) engine internals (the `engine`/
 # `bytecode`/`pe` modules or `Database::engine()`), so they only build with the
@@ -282,7 +290,7 @@ required-features = ["unstable-internals"]
 
 # The YARA engine lives behind the `yara` feature, so the targets that drive it
 # have to be gated too. Auto-discovered targets are built by every feature pass,
-# including `--no-default-features` — where `exav_core::yara::compile` and
+# including `--no-default-features`, where `exav_core::yara::compile` and
 # friends are configured out and these fail to COMPILE, taking the minimal-build
 # pass down with them. That pass exists to check the `cfg(not(feature = ...))`
 # fallbacks, so it is the one that must not be blocked by an unrelated target.

@@ -61,8 +61,8 @@ impl Partition {
         local < self.total_sectors()
     }
 
-    fn run_for(&self, local_sec: u64) -> Option<&BlkxRun> {
-        self.runs.iter().find(|r| {
+    fn run_for(&self, local_sec: u64) -> Option<(usize, &BlkxRun)> {
+        self.runs.iter().enumerate().find(|(_, r)| {
             r.entry_type != BLK_TERM
                 && r.entry_type != BLK_COMMENT
                 && local_sec >= r.sector_start
@@ -71,12 +71,18 @@ impl Partition {
     }
 }
 
-struct DmgReader<R: Read + Seek> {
+/// Decompressed runs kept, in bytes: a filesystem walk goes back and forth
+/// between its B-tree nodes and the files' data.
+const RUN_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) struct DmgReader<R: Read + Seek> {
     inner: R,
     sector_count: u64,
     file_size: u64,
     partitions: Vec<Partition>,
     position: u64,
+    /// Decompressed runs by (partition, run), the most recently used last.
+    runs: Vec<((usize, usize), Vec<u8>)>,
 }
 
 impl<R: Read + Seek> DmgReader<R> {
@@ -130,7 +136,36 @@ impl<R: Read + Seek> DmgReader<R> {
             file_size,
             partitions,
             position: 0,
+            runs: Vec::new(),
         })
+    }
+
+    /// The decompressed run `key`, decoded on first use.
+    fn run_data(&mut self, key: (usize, usize), run: &BlkxRun, file_pos: u64) -> io::Result<&[u8]> {
+        if let Some(i) = self.runs.iter().position(|(k, _)| *k == key) {
+            let hit = self.runs.remove(i);
+            self.runs.push(hit);
+        } else {
+            let expected = (run.sector_count as usize).saturating_mul(512);
+            // A run's compressed form is not much larger than the run itself.
+            if expected > MAX_RUN_BYTES || run.data_length > 2 * MAX_RUN_BYTES as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block decompressed size exceeds cap",
+                ));
+            }
+            self.inner.seek(SeekFrom::Start(file_pos))?;
+            let mut compressed = vec![0u8; run.data_length as usize];
+            self.inner.read_exact(&mut compressed)?;
+            let decompressed = decompress(run.entry_type, &compressed, expected)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut held: usize = self.runs.iter().map(|(_, d)| d.len()).sum();
+            while held + decompressed.len() > RUN_CACHE_BYTES && !self.runs.is_empty() {
+                held -= self.runs.remove(0).1.len();
+            }
+            self.runs.push((key, decompressed));
+        }
+        Ok(&self.runs.last().expect("just pushed").1)
     }
 
     fn virtual_disk_size(&self) -> u64 {
@@ -151,31 +186,33 @@ impl<R: Read + Seek> Read for DmgReader<R> {
         let vsec = self.position / 512;
         let sec_offset = self.position % 512;
 
-        let part = self
+        let (pi, part) = self
             .partitions
             .iter()
-            .find(|p| p.contains_sector(vsec))
+            .enumerate()
+            .find(|(_, p)| p.contains_sector(vsec))
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no partition"))?;
 
         let local_sec = vsec - part.sector_base;
-        let run = part
+        let (ri, run) = part
             .run_for(local_sec)
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no run"))?;
+        let run = run.clone();
+        let file_data_offset = part.file_data_offset;
 
         let bytes_into_run = (local_sec - run.sector_start)
             .saturating_mul(512)
             .saturating_add(sec_offset);
         let run_total_bytes = run.sector_count.saturating_mul(512);
         let available_in_run = run_total_bytes.saturating_sub(bytes_into_run);
-        let to_read = buf.len().min(available_in_run as usize);
+        let mut to_read = buf.len().min(available_in_run as usize);
 
         match run.entry_type {
             BLK_ZERO | BLK_IGNORE => {
                 buf[..to_read].fill(0);
             }
             BLK_RAW => {
-                let file_pos = part
-                    .file_data_offset
+                let file_pos = file_data_offset
                     .checked_add(run.data_offset)
                     .and_then(|p| p.checked_add(bytes_into_run))
                     .filter(|&p| p.saturating_add(to_read as u64) <= self.file_size)
@@ -186,8 +223,7 @@ impl<R: Read + Seek> Read for DmgReader<R> {
                 self.inner.read_exact(&mut buf[..to_read])?;
             }
             BLK_ADC | BLK_ZLIB | BLK_BZIP2 | BLK_LZFSE | BLK_LZMA => {
-                let file_pos = part
-                    .file_data_offset
+                let file_pos = file_data_offset
                     .checked_add(run.data_offset)
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "block offset overflow")
@@ -201,18 +237,7 @@ impl<R: Read + Seek> Read for DmgReader<R> {
                         "compressed block extends past end of file",
                     ));
                 }
-                let expected = (run.sector_count as usize).saturating_mul(512);
-                if expected > MAX_RUN_BYTES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "block decompressed size exceeds cap",
-                    ));
-                }
-                self.inner.seek(SeekFrom::Start(file_pos))?;
-                let mut compressed = vec![0u8; run.data_length as usize];
-                self.inner.read_exact(&mut compressed)?;
-                let decompressed = decompress(run.entry_type, &compressed, expected)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let decompressed = self.run_data((pi, ri), &run, file_pos)?;
                 let start = bytes_into_run as usize;
                 if start >= decompressed.len() {
                     return Err(io::Error::new(
@@ -222,6 +247,8 @@ impl<R: Read + Seek> Read for DmgReader<R> {
                 }
                 let end = (start + to_read).min(decompressed.len());
                 buf[..end - start].copy_from_slice(&decompressed[start..end]);
+                // A run that decoded short ends here: the next read reports it.
+                to_read = end - start;
             }
             t => {
                 return Err(io::Error::new(
@@ -233,6 +260,59 @@ impl<R: Read + Seek> Read for DmgReader<R> {
 
         self.position += to_read as u64;
         Ok(to_read)
+    }
+}
+
+impl<R: Read + Seek> Seek for DmgReader<R> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let pos = match to {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.virtual_disk_size().checked_add_signed(d),
+            SeekFrom::Current(d) => self.position.checked_add_signed(d),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek outside the disk"))?;
+        self.position = pos;
+        Ok(pos)
+    }
+}
+
+/// The disk a DMG holds, read on demand: a UDIF image's runs are decompressed
+/// as they are reached, and anything else is the disk itself.
+pub(crate) enum Disk<R: Read + Seek> {
+    Udif(DmgReader<R>),
+    Raw(R),
+}
+
+pub(crate) fn disk<R: Read + Seek>(mut src: R) -> Result<Disk<R>, LimitHit> {
+    let len = src
+        .seek(SeekFrom::End(0))
+        .map_err(|e| LimitHit::corrupt(format!("UDIF: seek to end: {e}")))?;
+    let mut sig = [0u8; 4];
+    let koly = len >= KOLY_SIZE
+        && src.seek(SeekFrom::Start(len - KOLY_SIZE)).is_ok()
+        && src.read_exact(&mut sig).is_ok()
+        && u32::from_be_bytes(sig) == KOLY_MAGIC;
+    if koly {
+        return DmgReader::open(src).map(Disk::Udif);
+    }
+    Ok(Disk::Raw(src))
+}
+
+impl<R: Read + Seek> Read for Disk<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Disk::Udif(d) => d.read(buf),
+            Disk::Raw(r) => r.read(buf),
+        }
+    }
+}
+
+impl<R: Read + Seek> Seek for Disk<R> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        match self {
+            Disk::Udif(d) => d.seek(to),
+            Disk::Raw(r) => r.seek(to),
+        }
     }
 }
 
@@ -251,7 +331,7 @@ fn decompress(
                 .map_err(|e| LimitHit::corrupt(format!("UDIF zlib: {e}")))?;
         }
         BLK_BZIP2 => {
-            bzip2_rs::DecoderReader::new(Cursor::new(compressed))
+            super::bzip2_rs::DecoderReader::new(Cursor::new(compressed))
                 .take(cap)
                 .read_to_end(&mut out)
                 .map_err(|e| LimitHit::corrupt(format!("UDIF bzip2: {e}")))?;
@@ -454,31 +534,4 @@ fn parse_mish(data: &[u8]) -> Result<Partition, LimitHit> {
         sector_base: sector_number,
         runs,
     })
-}
-
-/// Decompress a UDIF DMG into a raw disk image.
-///
-/// Handles all UDIF codecs (zlib, bzip2, LZFSE, LZMA/XZ, ADC, raw) in pure
-/// Rust. Vendored from `dmg-core` 0.1.2 (Apache-2.0, Albert Hui / SecurityRonin).
-pub(crate) fn decompress_udif(data: &[u8], max_buffer: u64) -> Result<Vec<u8>, LimitHit> {
-    if data.len() < 512 || &data[data.len() - 512..data.len() - 508] != b"koly" {
-        if data.len() as u64 > max_buffer {
-            return Err(LimitHit::new("UDIF image exceeds max-buffer".to_string()));
-        }
-        return Ok(data.to_vec());
-    }
-
-    let mut reader = DmgReader::open(Cursor::new(data))?;
-
-    // The whole disk image is decompressed into one buffer (the filesystem
-    // crates need random access over it). Bound it by the global peak-buffer
-    // limit — the declared disk size is attacker-controlled, so a plain
-    // `read_to_end` is otherwise unbounded.
-    let (raw, truncated) = crate::bounded_read(&mut reader, max_buffer)
-        .map_err(|e| LimitHit::corrupt(format!("UDIF decompress: {e}")))?;
-    if truncated {
-        return Err(LimitHit::new("UDIF image exceeds max-buffer".to_string()));
-    }
-
-    Ok(raw)
 }

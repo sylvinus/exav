@@ -224,7 +224,7 @@ fn the_thread_model_socket_is_permissioned_too() {
 }
 
 /// A mode is octal, and a mode that is not one is refused rather than applied.
-/// `666` read as decimal is 0o1232 — a setgid socket nobody asked for.
+/// `666` read as decimal is 0o1232, a setgid socket nobody asked for.
 #[test]
 fn a_mode_that_is_not_a_mode_is_refused() {
     // Under the test's own directory rather than a fixed `/tmp` name: the
@@ -304,7 +304,7 @@ fn the_daemon_logs_what_it_answered() {
 }
 
 /// `--send-as contents` sends the file's bytes (`INSTREAM`), so the daemon needs
-/// no access to the path — the case a milter or a container deployment is in.
+/// no access to the path: the case a milter or a container deployment is in.
 ///
 /// The daemon's own log is the proof of which verb ran: it records a streamed
 /// scan as `stream:` and a path scan under the path it was given.
@@ -415,7 +415,7 @@ fn a_split_set_is_rejoined_when_streamed() {
 
 /// `--verbose` in client mode. The daemon's reply is a verdict and nothing
 /// else, so what `-v` has to add here is which daemon answered and what it was
-/// asked — accepting the flag and printing nothing is the defect.
+/// asked. Accepting the flag and printing nothing is the defect.
 #[test]
 fn verbose_names_the_daemon_and_the_command() {
     let d = Daemon::start("077", &[]);
@@ -440,7 +440,7 @@ fn verbose_names_the_daemon_and_the_command() {
     );
 }
 
-/// A stream the daemon could not examine comes back as `PARTIAL`, exit 3 — the
+/// A stream the daemon could not examine comes back as `PARTIAL`, exit 3: the
 /// same answer a local scan of the same object gives.
 ///
 /// The wire grammar is `<path>: <reason> <CATEGORY> ERROR`, because clamd has no
@@ -452,7 +452,7 @@ fn verbose_names_the_daemon_and_the_command() {
 #[test]
 fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
     // Nowhere to spill and almost no room in RAM, so any real object is one the
-    // daemon cannot examine — the condition, reached the quickest way.
+    // daemon cannot examine: the condition, reached the quickest way.
     let d = Daemon::start(
         "077",
         &["--spill-dir", "off", "--spill-threshold-bytes", "1M"],
@@ -490,6 +490,43 @@ fn a_timed_out_job_gets_an_answer() {
         reply.contains("LIMITS-EXCEEDED ERROR"),
         "no verdict for a job the timer stopped: {reply:?}"
     );
+}
+
+/// The CPU limit is per job. `RLIMIT_CPU` counts a process's whole life, so set
+/// once per worker it killed whichever job ran when the jobs before it had used
+/// the budget between them, and that job got no reply.
+#[test]
+fn the_cpu_limit_is_per_job_not_per_worker() {
+    use std::io::{Read, Write};
+    let d = Daemon::start("077", &["--workers", "1", "--max-scan-secs", "1"]);
+    // Random bytes, so the scan is CPU work rather than a cache hit.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let body: Vec<u8> = (0..8 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let f = d.file("noise.bin", &body);
+    let start = Instant::now();
+    let mut jobs = 0;
+    while start.elapsed() < Duration::from_secs(4) || jobs < 5 {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(format!("zSCAN {}\0", f.display()).as_bytes())
+            .unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let reply = String::from_utf8_lossy(&out);
+        assert!(
+            reply.trim_end_matches('\0').ends_with("OK"),
+            "job {jobs} after {:?}: {reply:?}",
+            start.elapsed()
+        );
+        jobs += 1;
+    }
 }
 
 /// `EXINSTREAM` answers a stream it could not hold as `INSTREAM` does: partial,
@@ -663,7 +700,7 @@ fn verbose_stays_out_of_the_json_stream() {
 /// `clamdscan` has no `-r`, so a command line migrated from it hands the client
 /// a bare directory. Answering for one file in it and exiting 0 is a clean
 /// verdict over a tree that holds a detection, which is the one thing a scanner
-/// may never report — so the default has to be the whole tree.
+/// may never report, so the default has to be the whole tree.
 ///
 /// Asking for the top level is a different matter: `--no-recursive` is exav's
 /// own flag and the caller typed it. The client does its own walking, so it is
@@ -725,7 +762,7 @@ fn the_summary_counts_every_file_the_daemon_answered_for() {
 }
 
 /// A directory and a file in one run. Both are answered on the same session, so
-/// a reply left unread by the first command is read as the second's answer —
+/// a reply left unread by the first command is read as the second's answer,
 /// which loses the file's verdict and misattributes the tree's.
 #[test]
 fn a_directory_beside_a_file_keeps_every_answer() {
@@ -767,6 +804,21 @@ fn allmatch_answers_for_every_file_in_a_tree() {
     assert_eq!(code, 1, "{stdout}");
 }
 
+/// `--all-matches` on a file the daemon could not fully examine is partial, as
+/// without the flag; it used to exit 0.
+#[test]
+fn allmatch_reports_a_partial_file() {
+    let d = Daemon::start("077", &[]);
+    let dir = TempDir::new().unwrap();
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    gz.extend_from_slice(&[0xff; 64]);
+    std::fs::write(dir.path().join("damaged.gz"), gz).unwrap();
+
+    let (code, stdout) = d.client(&["--all-matches"], &[dir.path()]);
+    assert!(stdout.contains("UNSCANNABLE"), "{stdout}");
+    assert_eq!(code, 3, "{stdout}");
+}
+
 /// `--all-matches` over a byte-split set. No part decodes on its own, so scanning
 /// the parts as the files they are finds nothing; the set has to be rejoined
 /// whichever flag was passed, or the answer is clean over an archive nobody
@@ -795,7 +847,7 @@ fn allmatch_rejoins_a_split_set() {
 /// A daemon of the test's own answers one `SCAN` with two messages, which is
 /// what a real one does whenever the path it was handed names more than one
 /// file. A client that reads a fixed single line reports the first and drops
-/// the second — and the second is the detection here.
+/// the second, and the second is the detection here.
 #[test]
 fn every_reply_message_of_a_scan_is_reported() {
     use std::io::Write;
@@ -874,7 +926,7 @@ fn every_reply_message_of_a_scan_is_reported() {
 
 /// The premise the client's session framing rests on: one command, any number
 /// of replies. `SCAN` over a directory answers once per file, every message
-/// tagged with the same command id and nothing marking the last — so a client
+/// tagged with the same command id and nothing marking the last, so a client
 /// that reads a fixed line count drops verdicts, and the one it sends behind
 /// the scan (`PING`) is what tells it the scan has finished talking.
 #[test]

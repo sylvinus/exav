@@ -1,6 +1,6 @@
 ---
 title: Roadmap
-description: What's next for exav, from signature-matching performance and a streaming full engine to broader bytecode coverage, PE protectors, decryption, and less dependency unsafe.
+description: What's next for exav, from signature-matching performance and one read pass for large files to broader bytecode coverage, streaming RAR, multi-volume archives and less dependency unsafe.
 ---
 
 exav is beta. The current focus is the known gaps below, none of which lets an
@@ -24,30 +24,32 @@ for how they are looked for.
   `inflate`) come first, with differential validation against `clamscan`.
 - **Extended and continuous fuzzing**, and a large no-silent-skip CI suite.
 
-## A streaming full engine
+## Large files: fewer passes, PE structure
 
-The full signature engine (wildcard, anchored and file-type `.ndb` signatures,
-`.ldb` logical signatures, YARA, bytecode, the normalised text views) scans a
-file held in memory, up to `--max-object-bytes` (256 MiB by default). A larger
-file only gets the streaming matcher, which covers literal signatures and
-whole-file hashes, and is reported `LIMITS-EXCEEDED` unless one of those
-matches.
+A file larger than `--max-object-bytes` gets the full engine, read through a
+block cache (see [Streaming & memory](/concepts/streaming-memory/)). Two things
+remain:
 
-The goal is a full engine that reads a file as a stream: partial matches carried
-across chunk boundaries, per-signature state kept for logical signatures, and
-end-of-file and file-size conditions resolved once the stream ends. A file of any
-size would then be checked against every signature in bounded memory.
+- **One forward pass.** Each part of the scan (the signature automata, YARA's
+  patterns, hashes, normalised views, carving) reads the file on its own, so a
+  large file is read many times. Feeding them from one pass would make a
+  multi-gigabyte scan several times faster, and cheaper over HTTP.
+- **PE structure past the limit.** A PE's layout, imports, icons and
+  Authenticode signature are parsed from the whole file, so a PE over the limit
+  is `LIMITS-EXCEEDED` unless something is found. Reading only the headers and
+  sections would cover the common case of a small executable with a large
+  overlay.
 
-## Streaming the last three container formats
+## Streaming RAR, 7z and OLE
 
-Most containers are walked member by member off the source, so peak memory is
-one member rather than the whole decoded object (see
-[archive extraction](/concepts/archive-extraction/)). DMG and RAR are still
-decoded whole, so a large disk image or RAR archive is refused as
-`LIMITS-EXCEEDED` past `--max-object-bytes` rather than scanned. DMG is the next
-to stream; RAR needs its decoders rewritten and will take longer. PDF is
-buffered too, but already holds only the file plus one bounded object, so there
-is nothing to gain.
+Most containers, DMG disk images included, are walked member by member off the
+source, so peak memory is one member rather than the whole decoded object (see
+[archive extraction](/concepts/archive-extraction/)). RAR, 7z and OLE containers,
+and the virtual disks, are still read whole: past `--max-object-bytes` their own
+bytes get the full scan but their members are not extracted, and the file is
+`LIMITS-EXCEEDED` unless something is found. Streaming them needs their readers
+rewritten. PDF is buffered too, but already holds only the file plus one bounded
+object, so there is nothing to gain.
 
 ## v2
 
@@ -55,15 +57,25 @@ is nothing to gain.
   baseline, not a trained classifier).
 - Broader fuzzy/similarity matching.
 - Widening what the PE stub emulator can follow. The
-  [x86 interpreter](/concepts/pe-emulation/) already runs the packers that need
-  emulation (ASPack, MEW, Upack, wwpack32, PESpin, yC), but a stub can still
-  outrun it: an instruction outside the implemented set, a Windows export with no
-  implementation, an anti-emulation trick. Each is reported and counted, so the
-  list of what to add is measured.
-- The Authenticode signature-verification engine.
-- RAR AES decryption, and joining RAR volume sets. ClamAV does not join them
-  either; exav reports the split member and scans the part in the volume it was
-  given.
+  [x86 interpreter](/concepts/pe-emulation/) already unpacks 15 of the 23
+  packers in the measured corpus on every sample and 4 more on most, but a stub
+  can still outrun it: an instruction outside the implemented set, a Windows
+  export with no implementation, an anti-emulation trick. Each is reported and
+  counted, so the list of what to add is measured.
+- Verifying Authenticode signatures cryptographically. Parsing, digest checks
+  and `.crb` matching exist today.
+- RAR AES decryption.
+- **Joining format-aware volume sets**: RAR `.partN`/`.rNN`, ZIP `.zNN`, and
+  multi-cabinet CAB. Byte-split sets (`x.7z.001`, `x.7z.002`, ...) are already
+  joined when their parts arrive together (see
+  [split archives](/guides/daemon/#split-archives)). A format-aware volume
+  carries its own headers and a member's data resumes past the next volume's
+  header, so the join belongs in the format's decoder. ClamAV does not join
+  them either; exav reports the split member and scans the part in the volume
+  it was given. Sibling volumes will only be looked for next to the scanned
+  file, under names generated from its own, as regular files (no symlinks). A
+  cabinet names its successor inside the file, so that name will be matched
+  against the directory listing and never opened as a path.
 - The unimplemented `Target:` values (graphics, internal, other, and ClamAV's
   reserved slot 8) and the unloaded database extensions (`.cat`, `.ioc`, and the
   legacy `.sdb`/`.zmd`/`.rmd`). None appears in a stock official database; all
@@ -78,8 +90,8 @@ is nothing to gain.
 ## Hardening: less dependency `unsafe`
 
 exav's own scanning and extraction code is safe Rust (`exav-core` and
-`exav-unpack` are `#![forbid(unsafe_code)]`), and it runs no C, no UnRAR and no
-native JIT. The remaining `unsafe` lives in widely used dependency primitives
+`exav-unpack` are `#![forbid(unsafe_code)]`), and the default build runs no C,
+no UnRAR and no native JIT. The remaining `unsafe` lives in widely used dependency primitives
 (compression and crypto SIMD, OS syscalls), not in the code that parses hostile
 input. Reducing it is an ongoing goal:
 

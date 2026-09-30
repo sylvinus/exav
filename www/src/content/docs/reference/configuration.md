@@ -12,8 +12,8 @@ knobs each limit flag maps to.
 An explicit flag wins, then the environment variable, then the default, for
 every setting. A container image can carry its whole configuration in the
 environment while any value stays overridable on the command line:
-`docker run … exav --auto-update --workers 2` overrides `EXAV_WORKERS` and nothing
-else.
+`docker run … exav --auto-update --workers 2` overrides `EXAV_AUTO_UPDATE` and
+`EXAV_WORKERS` and nothing else.
 
 Booleans accept `1`/`yes`/`on`/`true` (and `y`/`t`) for on, `0`/`no`/`off`/`false`
 (and `n`/`f`) for off. Anything else stops the run: `EXAV_AUTO_UPDATE=ture` read
@@ -22,7 +22,8 @@ as false would fetch nothing and say nothing.
 ## Every flag has a variable, spelled the same way
 
 A flag's variable is its own name, uppercased, with dashes turned to underscores
-and `EXAV_` in front. There are no exceptions and no variable without a flag.
+and `EXAV_` in front, with no exceptions. The only variables without a flag are
+the [engine diagnostics](#engine-diagnostics) below.
 
 | Flag | Variable |
 |---|---|
@@ -34,6 +35,13 @@ and `EXAV_` in front. There are no exceptions and no variable without a flag.
 `exav --help` prints the `[env: …]` line under each flag. The
 [CLI reference](/reference/cli/) documents what each one does; this page covers
 what does not live in a flag, and the engine budgets behind the limits.
+
+A repeatable flag named on the command line replaces its variable rather than
+merging with it. `EXAV_LISTEN`, `EXAV_SIG_SOURCES` and `EXAV_PASSWORDS` split on
+commas, as the flags do on the command line (a password containing a comma goes
+in `--passwords-from`). `EXAV_EXCLUDE`, `EXAV_EXCLUDE_DIR` and `EXAV_INCLUDE`
+hold one pattern each, since a comma is legal inside a regex; repeat the flag for
+more.
 
 ## What lives in the address, not in a flag
 
@@ -56,15 +64,23 @@ A flag for any of these would have to say which listener it meant; on the
 address each has exactly one thing to attach to. An unknown option is an error,
 not an ignored word.
 
-### Engine diagnostics are not on this page
+### Engine diagnostics
 
-`exav-core` reads a few more variables that are library diagnostics, not
-deployment settings: switches that bypass the YARA prefilter, select the legacy
-matcher path, warn on a stubbed bytecode API, or cap a verification budget. They
-let two code paths be compared on the same input, which is how the engine is
-tested. They are documented next to what they toggle, in
-[Bytecode sandbox](/concepts/bytecode-sandbox/) and the YARA design notes; treat
-anything not listed here as belonging to the test bench.
+`exav-core` reads a few more variables. They are diagnostics, not settings: they
+let two code paths be compared on the same input, or trace one. Leave them unset
+in production.
+
+| Variable | Effect |
+|---|---|
+| `EXAV_YARA_NO_GATE` | Set: skip the YARA atom prefilter and evaluate every rule. |
+| `EXAV_SPLIT_MATCH=0` | Use the backtracking signature verifier instead of the default non-backtracking one. |
+| `EXAV_VERIFY_BUDGET` | Step budget for that backtracking verifier. |
+| `EXAV_SIM_BUDGET` | Step budget for the default verifier. |
+| `EXAV_MAX_GROUP_STEPS` | Steps one anchor group may draw per scan. |
+| `EXAV_MAX_BUFFERED_HITS` | Anchor hits buffered before the matcher falls back to its direct path. |
+| `EXAV_ANCHOR_STATS=0` | Skip the build-time anchor re-pick (speed only; matching is the same). |
+| `EXAV_BC_WARN` | Set: warn once per stubbed bytecode API a signature calls. See [Bytecode sandbox](/concepts/bytecode-sandbox/). |
+| `EXAV_BC_TRACE`, `EXAV_BC_FN=<n>` | Trace bytecode execution, optionally for one function. |
 
 ### Migrating a ClamAV container
 
@@ -77,43 +93,11 @@ not checks per day). See the [Docker guide](/guides/docker/).
 
 Each CLI limit flag sets an engine-level budget, on a memory axis or a CPU axis:
 
-| CLI flag | Engine field | Bounds | Default |
-|---|---|---|---|
-| `--max-input-bytes` | `max_scan_size` | the largest top-level input taken | unlimited |
-| `--max-extracted-bytes` | `deep_analysis_max` + `max_extracted_bytes` | what decompression may produce | 256M / 1G (the flag sets both to one value) |
-| `--max-object-bytes` | `max_buffer_bytes` (+ `deep_analysis_max`) | memory: the largest single object, and the largest file the full engine scans | 256M |
-| `--max-matcher-bytes` | `max_scanned_bytes` | CPU: bytes fed to the matcher | 10G |
-| `--max-pe-emulation-steps` | `max_pe_emulation_steps` | CPU: emulator instructions across all packed executables in one file | 1000000000 |
-| `--max-unpack-depth` | `max_recursion` | nesting depth | 16 |
-| `--max-members` | `max_members` | members across the whole recursive walk | 100000 |
-
-See [Limits](/reference/limits/) for which one to raise.
-
-Peak memory is not a single knob. `--max-object-bytes` bounds the largest
-individual buffer; `--max-extracted-bytes` bounds how much extracted data can
-be resident at once, since extraction is charged cumulatively and never
-released. Under the daemon the latter is clamped to fit the per-job address
-space, so a scan that runs out reports `LIMITS-EXCEEDED` instead of the worker
-being killed. See [Streaming & memory](/concepts/streaming-memory/).
-
-### Buffering a stream (spill)
-
-These are not engine fields: they decide where a streamed object waits while it
-is scanned, on every surface (`INSTREAM`, stdin, ICAP), since a stream has to be
-held before a container-aware scan can seek in it. See
-[the CLI reference](/reference/cli/#buffering-a-stream-spill).
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--spill-dir <DIR\|off>` | `$TMPDIR` | Where spilled objects are written, or `off` to never write one. |
-| `--spill-threshold-bytes` | `16M` | RAM per in-flight object before it spills: the bound on a listener's memory. |
-| `--max-spill-bytes` | `2G` | Temp space one object may occupy (clamd `StreamMaxLength`). |
-| `--max-total-spill-bytes` | `8G` | Temp space all in-flight objects in one process may occupy together (per worker and per ICAP child under the pool). |
-
-The sizes have to nest (RAM inside one object inside the process), and exav
-refuses to start otherwise. An object past a budget has what was held scanned,
-and is `LIMITS-EXCEEDED` unless that finds something. `--spill-dir off` turns disk buffering off
-entirely; `0` on the two `--max-` flags means "no ceiling", not "none allowed".
+The engine fields behind each limit flag, with defaults and which one to raise,
+are in [Limits](/reference/limits/#the-in-core-budgets). The spill flags are not
+engine fields; see [Buffering a stream](/reference/cli/#buffering-a-stream-spill).
+For peak memory, see [Streaming & memory](/concepts/streaming-memory/) and
+[sizing a server](/guides/sizing/).
 
 ## Capability toggles
 
@@ -123,6 +107,8 @@ entirely; `0` on the two `--max-` flags means "no ceiling", not "none allowed".
 | `--detect exav-heuristics` | `heuristics` | off |
 | `--detect macros` / `phishing` / `broken` / `broken-media` / `packed` / `partition-intersection` | matching `alert_*` fields | off |
 | `--detect pua` | PUA databases loaded, `PUA.*` kept | off |
+| `--dlp-credit-cards` / `--dlp-ssns` | `structured_cc_count` / `structured_ssn_count` | off |
+| `--passwords` / `--passwords-from` | `passwords` | none |
 | `--partial-as …=found` | `alert_encrypted` / `alert_exceeds_max` | partial |
 | `--clamav-compat` | `restrict_extractors` + `unofficial_suffix` + `clamav_compat` | off (full reach) |
 | none (always on) | `clamav_heuristics` (imphash + PDF obfuscation) | on |

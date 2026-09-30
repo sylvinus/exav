@@ -137,7 +137,7 @@ fn main() -> ExitCode {
                 report.ticks
             ),
             None => println!(
-                "{name}: nothing recovered — {} (after {} instructions, {ms} ms)",
+                "{name}: nothing recovered: {} (after {} instructions, {ms} ms)",
                 report.stop, report.ticks
             ),
         }

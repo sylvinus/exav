@@ -1,17 +1,18 @@
 # Contributing to exav
 
-Issues and PRs are welcome. Good first areas: additional archive formats, `.ndb`
-wildcard matching, the S3 source backend, and fuzz targets.
+Issues and PRs are welcome. Good first areas: formats from the gap list
+(<https://exav.org/reference/formats/#the-complete-gap-list>), bytecode host APIs,
+and fuzz targets.
 
-The full guide — including the AI-assisted-contribution policy — lives at
+The full guide, including the AI-assisted-contribution policy, lives at
 **<https://exav.org/project/contributing/>**. The essentials:
 
 ## The clean-room rule (non-negotiable)
 
 exav is **MIT**; ClamAV (`libclamav` / `libclamav_rust`) is **GPLv2**. All code in
-this repository was, and must continue to be, written independently — without
+this repository was, and must continue to be, written independently, without
 reading, porting, translating, or otherwise consulting any ClamAV GPL source.
-Deriving from GPL code (even C→Rust) would make this project a derivative work.
+Deriving from GPL code (even C to Rust) would make this project a derivative work.
 
 - Do **not** port from ClamAV, and do **not** cite any ClamAV source as the
   origin of any code.
@@ -19,7 +20,7 @@ Deriving from GPL code (even C→Rust) would make this project a derivative work
   specification, reverse-engineered format docs, or **permissively-licensed**
   (MIT/BSD/Apache/public-domain) code, with attribution in `NOTICE`.
 - Interoperating with ClamAV's *data* formats (signature databases, `CL_TYPE_*`
-  ids) is fine — that's interoperability, not derivation.
+  ids) is fine: that's interoperability, not derivation.
 
 The rule is GPL-specific. It does not apply to permissively-licensed sources such
 as BSD-3-Clause YARA-X, which exav reuses with attribution.
@@ -31,16 +32,16 @@ provenance of every line they submit.
 ## Writing an extractor: classify every way you decline to scan
 
 A scanner's worst outcome is not a crash, it is reporting a file clean that it
-did not read. So for every path that can decline to scan bytes — each early
+did not read. So for every path that can decline to scan bytes (each early
 return, `continue`, `break`, `.ok()`, `unwrap_or_default`, `let … else`,
-error-swallowing `match`, truncation and cap — decide which of these it is:
+error-swallowing `match`, truncation and cap), decide which of these it is:
 
 - **Nothing to scan.** An empty or directory entry, an absent optional field.
   Skipping hides nothing. Safe.
 - **Content present, not examined.** It MUST surface: `Entry::unsupported`
   (→ `UNSCANNABLE`), a `LimitHit` (→ `LIMITS-EXCEEDED`), or an encrypted marker
   (→ `PASSWORD-PROTECTED`). **Anything here that does not surface is a bug.**
-- **Content absent.** The container declares bytes the file does not contain — a
+- **Content absent.** The container declares bytes the file does not contain: a
   truncated archive, an extent past EOF. Every byte that exists *was* scanned, so
   the missing tail is absent rather than hidden. **Reporting this is a bug in the
   other direction**, and it produces `UNSCANNABLE` on files that are merely
@@ -51,7 +52,7 @@ backwards in either direction is a defect.
 
 Nearly every bug of this class found so far had one signature: a bound or a
 malformed-input check that was **correct to stop at** and **wrong to stop at
-quietly**. The fix is never to remove the guard — it is to say so on the way out.
+quietly**. The fix is never to remove the guard, it is to say so on the way out.
 
 The exception is more instructive: a dispatch table with a missing row. Nothing
 stopped at anything; a lookup simply had no entry, and "no entry" and "nothing to
@@ -60,17 +61,17 @@ row can only be caught by asserting the table is total.
 
 One trap when testing this: `extract()` discards already-emitted entries when it
 returns `Err`, so a test using it cannot see members reported before a mid-way
-failure, and will report a working fix as broken. Use `extract_each`, which is
-what the scanner uses.
+failure, and will report a working fix as broken. Use `walk`, which is what the
+scanner uses.
 
 ## Where documentation goes
 
 There are two trees, and they are not interchangeable.
 
-**`www/` is authoritative for anything a user or integrator relies on** —
+**`www/` is authoritative for anything a user or integrator relies on**:
 supported formats, CLI flags, limits, verdicts, the wire protocol. If `www/` and
 a note under `docs/` disagree about one of those, `www/` is right and the other
-is stale. CI asserts this for format coverage and CLI flags.
+is stale. CI checks the CLI flags the site documents against the binary.
 
 **`docs/` is for engineering notes**: audits, investigations, design records,
 and the reasoning behind a decision that would bury a user-facing page. It is
@@ -81,7 +82,7 @@ A rule of thumb that resolves most cases: if a reader would be *surprised* to
 need it in order to use exav, it belongs in `www/`. If they would be surprised
 to find it in a user manual, it belongs in `docs/`.
 
-Anything with a number in it — a count, a measurement, a percentage — is worth
+Anything with a number in it (a count, a measurement, a percentage) is worth
 resisting in both. Numbers in prose go stale silently and nothing rebuilds them.
 Prefer stating the claim without the digits, or move the number into a test that
 asserts it.
@@ -90,14 +91,14 @@ asserts it.
 
 ```sh
 make test     # everything CI runs, bar diff-testing and fuzzing
-make lint         # cargo clippy --all-targets -D warnings + cargo fmt --check
+make lint     # cargo clippy --all-targets -D warnings + cargo fmt --check
 ```
 
 `make test` is the whole tree, not just `cargo test`. Each part also runs alone:
 
 | target | what it covers | needs |
 | --- | --- | --- |
-| `make test-native` | the workspace under every feature pass: default, `http`, `checksums`, `--no-default-features`, `unstable-internals` | — |
+| `make test-native` | the workspace under every feature pass: default, `http`, `exav-unpack` with `checksums`, `--no-default-features`, `unstable-internals`, `testing-faults` | nothing extra |
 | `make test-wasm` | the extractor + core unit tests on 32-bit `wasm32-wasip1` | `wasmtime` |
 | `make test-js` | the WASM bindings' vitest units and playwright browser e2e | node, wasm-pack |
 | `make test-www` | `astro check` + a full docs build (broken links, bad frontmatter) | node |
@@ -108,8 +109,8 @@ gates: they measure exav against another engine, so they can go red because the
 
 | harness | what it compares |
 | --- | --- |
-| `scripts/difftest.sh` | exav vs clamd over a corpus — compliance diff (needs docker + a corpus) |
-| `make test-yara-diff` | exav's YARA engine vs `yara-x` on identical rules and inputs (pulls `yara-x`: +83 crates, 21 of them cranelift/wasmtime — nothing else in exav builds a JIT) |
+| `scripts/difftest.sh` | exav vs clamd over a corpus, a compliance diff (needs docker and a corpus) |
+| `make test-yara-diff` | exav's YARA engine vs `yara-x` on identical rules and inputs (pulls `yara-x` and its cranelift/wasmtime JIT, which nothing else in exav builds) |
 
 `cargo test` is fine for the inner loop, but it is a **subset** and a misleading
 one: a test file that opens `#![cfg(feature = "x")]` compiles to **zero tests**
@@ -131,4 +132,4 @@ real malware to this repository.
 
 ## Security
 
-Do not open a public issue for a vulnerability — see [`SECURITY.md`](SECURITY.md).
+Do not open a public issue for a vulnerability: see [`SECURITY.md`](SECURITY.md).

@@ -37,26 +37,27 @@ that never hide an incomplete scan (see
 
 Two wire-level differences to know before swapping a socket:
 
-- **`INSTREAM` has no 25 MB default limit.** clamd defaults `StreamMaxLength` to
-  25 MB and refuses a larger stream; exav accepts one up to `--max-spill-bytes`
+- **`INSTREAM` has no 100 MB default limit.** clamd defaults `StreamMaxLength` to
+  100 MB and refuses a larger stream; exav accepts one up to `--max-spill-bytes`
   (2 GiB by default) unless you set `--max-input-bytes`. `--max-spill-bytes` is
   the direct translation of `StreamMaxLength`; `--max-input-bytes` is the scan
   policy that applies to local files too.
-- **An over-limit stream is refused in exav's own words.** clamd replies
-  `INSTREAM size limit exceeded. ERROR` and closes; exav replies
-  `stream: <reason> LIMITS-EXCEEDED ERROR`. A client matching clamd's exact
-  string will not recognise it; the verdict class is the same.
+- **A stream past the budget is scanned as far as it was held.** clamd replies
+  `INSTREAM size limit exceeded. ERROR` and closes; exav scans the bytes it kept
+  and replies `stream: <reason> LIMITS-EXCEEDED ERROR` unless they hold a
+  detection. A client matching clamd's exact string will not recognise it; the
+  verdict class is the same.
 
 ## Memory & large files
 
 ClamAV reads a file over about 2 GB, scans none of it, and reports `OK`.
 
-exav gives a file up to `--max-object-bytes` (256 MiB by default) the full
-engine in memory. A larger file is still read in full by a streaming matcher
-that covers literal signatures and whole-file hashes, and is reported
-`LIMITS-EXCEEDED` unless one of those matches, never `OK`. Raising
-`--max-object-bytes` extends the full engine to larger files at the cost of
-memory. See [Streaming & memory](/concepts/streaming-memory/).
+exav gives every file the full engine. One up to `--max-object-bytes` (256 MiB
+by default) is held in memory; a larger one is read through an 8 MiB block
+cache. The few checks that parse a file whole, such as a PE's structure, do not
+run past that limit, and a file they applied to is reported `LIMITS-EXCEEDED`
+unless something is found, never `OK`. See
+[Streaming & memory](/concepts/streaming-memory/).
 
 Loading a raw database costs more memory in exav than in ClamAV, because
 building the automaton for a large signature set is expensive. The
@@ -83,23 +84,25 @@ instead of reporting `LIMITS-EXCEEDED`.
 
 ## Signature & format support: what's missing, what's added
 
-exav loads every signature type ClamAV does, so the interesting part is the
-difference on each axis. (For the catalogue see
-[Supported formats](/reference/formats/) and [Signatures](/guides/signatures/).)
+exav loads every signature in the official databases and in the third-party
+feeds tracked here; a few rare file extensions are not loaded
+([details](#database-extensions)). The interesting part is the difference on
+each axis. (For the catalogue see [Supported formats](/reference/formats/) and
+[Signatures](/guides/signatures/).)
 
 | Area | Where exav falls short | Where exav goes further |
 |---|---|---|
-| **Signature types** | none | Every line of the official databases and of the third-party feeds tracked here loads ([details](#signature-format-coverage)). A line exav cannot load is counted and reported by cause. |
+| **Signature types** | `.cat`, `.ioc`, `.sdb`, `.zmd` and `.rmd` files are not loaded; none is in the official database ([details](#database-extensions)). | Every line of the official databases and of the third-party feeds tracked here loads ([details](#signature-format-coverage)). A line exav cannot load is counted and reported by cause. |
 | **Bytecode (`.cbc`)** | Part of ClamAV's host API is implemented; the rest are stubs returning fail-safe values, so a program depending on one could diverge from ClamAV. Every shipped program runs to completion, stub use is rare, and each use is recorded. | Runs on an interpreter with no JIT, removing the code-execution class that has affected a C/JIT bytecode VM. Includes ClamAV's own unpackers: MPRESS is unpacked by running ClamAV's `.cbc` program. |
 | **Signature scope (`Target:`, TDB)** | 11 of 15 `Target:` values, and every TDB attribute any engine implements. A constraint exav cannot evaluate is refused and counted ([details](#signature-metadata-tdb-attributes)). | none |
-| **YARA** | none | Rules needing `macho`, `dex` or `cuckoo` are rejected per rule and counted, so one unsupported rule cannot drop a feed. Matching is cross-checked against `yara-x`. No wasmtime or Cranelift behind it. |
-| **Archive codecs** | none | All three CAB codecs (MSZIP, LZX and Quantum, the last validated byte-exact against libmspack). ZIP members compressed with Deflate64, LZMA, bzip2, zstd, XZ or PPMd are decoded. Members whose sizes are deferred to a trailing data descriptor are carved and scanned. |
-| **Container formats** | none | Virtual disks ClamAV does not open: VHD, VHDX, QCOW2 (compressed clusters included) and VMDK (sparse and streamOptimized, as inside an OVA), reconstructed to the guest disk and rescanned. Also UDF, WIM, LZ4 and Unix `compress` (`.Z`). |
+| **YARA** | none | Seven modules work (`pe`, `elf`, `dotnet`, `math`, `hash`, `string`, `time`); rules importing another (such as `macho`, `dex` or `cuckoo`) are rejected per rule and counted, so one unsupported rule cannot drop a feed. Matching is cross-checked against `yara-x`. No wasmtime or Cranelift behind it. |
+| **Archive codecs** | none | ZIP members compressed with LZMA, bzip2, zstd, XZ or PPMd are decoded. Members whose sizes are deferred to a trailing data descriptor are carved and scanned. |
+| **Container formats** | none | Virtual disks ClamAV does not open: VHD, VHDX, QCOW2 (compressed clusters included) and VMDK (sparse and streamOptimized, as inside an OVA), reconstructed to the guest disk and rescanned. Also UDF, WIM, LZ4, ARC and Unix `compress` (`.Z`). |
 | **Decryption** | none | ZIP (ZipCrypto and WinZip AES), 7z AES including encrypted headers, encrypted DMG, PDF, and Office (legacy XLS RC4 and CryptoAPI, XOR obfuscation, OOXML standard and agile AES), trying Excel's default `VelvetSweatshop` and the empty password. RAR3/RAR5 and PKWARE Strong Encryption are reported `PASSWORD-PROTECTED` by default; ClamAV returns `OK` for them unless `--alert-encrypted-archive` is passed. |
 | **PE unpacking** | none | UPX and the aPLib family are unpacked in-process, and the result is rebuilt in ClamAV's layout so ClamAV hash signatures over its rebuilt image match. MPRESS runs ClamAV's own `.cbc` unpacker. Everything else that looks packed has its stub run under a bounded x86 interpreter ([how](/concepts/pe-emulation/)); ClamAV ships a hand-written unpacker per family. |
 | **PE trust** | Authenticode is parsed and matched against a block list; the certificate chain is not verified. | none |
 | **Heuristics** | A few of ClamAV's default-on heuristics are missing, all per-family detection content written as engine code ([details](#heuristic-alerts)). Deep PDF-JavaScript analysis and VBA-stomping detection are partial; the static scorer is a hand-weighted baseline, not a trained classifier. | VBA macro decompression, Excel 4.0 XLM, JS normalisation, perceptual icon hashing and TLSH fuzzy hashing. |
-| **Updating** | No `.cdiff` patching, no DNS `TXT` version probing, no database signature (`dsig`) verification: full reloads only, with `cvd`/`freshclam` as the supported updaters. | A prebuilt [`.exavdb`](/guides/prebuilt-database/) compiles a large set once and loads quickly everywhere, hot-reloading in the daemon. |
+| **Updating** | No `.cdiff` patching, no DNS `TXT` version probing, no database signature (`dsig`) verification: full reloads only, with `freshclam` or `cvdupdate` as the supported updaters. | A prebuilt [`.exavdb`](/guides/prebuilt-database/) compiles a large set once and loads quickly everywhere, hot-reloading in the daemon. |
 | **Signature content** | exav ships no signatures; it runs ClamAV's. | none |
 
 ### Silent false negatives
@@ -163,7 +166,7 @@ therefore appears to be handled, but the disk format itself is never decoded.
   through its trailing directory, is reported `PASSWORD-PROTECTED`.
 
 **Engine and operations**
-- No JIT: bytecode and YARA run on interpreters.
+- No JIT: bytecode runs on an interpreter.
 - Wildcard verification that cannot backtrack.
 - A WASI build for loading untrusted signatures with no host access.
 - A prebuilt database, and `exav-grep`, a grep over the same recursive
@@ -173,8 +176,9 @@ therefore appears to be handled, but the disk format itself is never decoded.
 ## Security posture
 
 - **Memory-safe Rust.** The scanning and extraction crates are
-  `#![forbid(unsafe_code)]`; the remaining `unsafe` is in dependency primitives,
-  not parsing logic. This rules out the classic C parser and integer-overflow
+  `#![forbid(unsafe_code)]`; the remaining `unsafe` is in dependency primitives
+  and the daemon's own libc calls, not parsing logic. This rules out the classic
+  C parser and integer-overflow
   code-execution bugs.
 - **No runtime code generation.** Bytecode and YARA run on interpreters, so there
   is no writable and executable memory at scan time.
@@ -187,9 +191,11 @@ therefore appears to be handled, but the disk format itself is never decoded.
 
 ## How to read the gaps
 
-exav is younger than ClamAV and does not match it everywhere. Every gap below
-shows up as `UNSCANNABLE`, `LIMITS-EXCEEDED` or a counted skip: a gap costs
-coverage, not a false all-clear. Unevaluable signature constraints are refused
+exav is younger than ClamAV and does not match it everywhere. Most gaps below
+show up as `UNSCANNABLE`, `LIMITS-EXCEEDED` or a counted skip: a gap costs
+coverage, not a false all-clear. The exceptions are detections exav does not
+implement (the [heuristics](#heuristic-alerts) and `Target:` values below): there
+a file gets `OK` where ClamAV would alert. Unevaluable signature constraints are refused
 rather than dropped, since dropping one would make a signature fire more broadly
 than the format allows. See the [roadmap](/project/roadmap/) and
 [Verdicts & exit codes](/reference/verdicts/).
@@ -204,9 +210,6 @@ subsets where the shipped database has so far used only the implemented part).
 
 | Gap | ClamAV | exav |
 |---|---|---|
-| **EGG** archive | `EGG` submodule, on by default | Decodes (store/deflate/bzip2/LZMA) |
-| **ALZ** archive | `ALZ` submodule, on by default | Decodes (store/bzip2/deflate) |
-| **HWP3** documents | `HWP` submodule, on by default, with its own recursion limit | Decodes the deflate body |
 | **InstallShield MSI** | `CL_TYPE_ISHIELD_MSI` | Recognised, reported `UNSCANNABLE` |
 | **CRYPTFF** | `CL_TYPE_CRYPTFF` | Recognised, reported `PASSWORD-PROTECTED` |
 
@@ -280,7 +283,7 @@ so the image-hash signatures scoped to those containers can match.
 
 ### Database extensions
 
-exav loads 29 of the roughly 33 file extensions ClamAV recognises in a signature
+exav loads 30 of the roughly 33 file extensions ClamAV recognises in a signature
 directory ("roughly" because ClamAV's list mixes databases with container
 variants and metadata members).
 
@@ -289,7 +292,7 @@ variants and metadata members).
 | `.cat` | Microsoft security catalogs | Not in the official database |
 | `.ioc` | OpenIOC indicator documents | Not in the official database |
 | `.sdb`, `.zmd`, `.rmd` | Legacy signature formats | Not in the official database |
-| `.cud`, `.info`, `.msu` | Container and metadata members | Not signature content |
+| `.cud`, `.info` | Container and metadata members | Not signature content |
 
 None appears in a stock `daily`/`main`/`bytecode` set, but a third-party feed
 shipping `.ioc` or `.cat` would be skipped, unlike in ClamAV.
@@ -326,7 +329,7 @@ Every signature in the official databases and in the `shelter`,
 reproducing constructs whose actual behaviour differs from the documentation,
 each settled by loading the line into clamscan with a crafted input:
 
-| Construct | What it actually means |
+| Construct | What it means |
 |---|---|
 | Alternation with an empty branch, `(2d4120\|)` | "this run, or nothing". Variable width, so the branch propagates the current position unchanged. |
 | Alternation with nibble wildcards, `(5?\|b?)`, `(?4\|?c)`, `(130?\|0?)` | A branch is not a literal. Branches compile to `(value, mask)` pairs; the all-literal case keeps its substring-search fast path. |
@@ -373,8 +376,8 @@ only a handful of signatures are named `Heuristics.*`. ClamAV routes `PUA.`,
 | `Heuristics.Broken.Executable` | same | parity, via `--detect broken` |
 | `Heuristics.Phishing.Email.SSL-Spoof` | same | parity, via `--detect phishing` |
 | `Heuristics.Structured.{CreditCardNumber,SSN}` | same | exact parity |
-| `Heuristics.Encrypted.{Zip,RAR,7Zip,PDF}` | same | parity |
-| `Heuristics.Encrypted.{Doc,Archive}` | ClamAV has `EGG`, no `.Doc`/`.Archive` | exav's own names |
+| `Heuristics.Encrypted.{Zip,RAR,7Zip,PDF,OLE2}` | same | parity |
+| `Heuristics.Encrypted.Archive` | ClamAV has `EGG`, no `.Archive` | exav's own name, for other formats |
 | `Heuristics.OLE2.ContainsMacros.{VBA,XLM}` | same | exact name parity, via `--detect macros` |
 | `Heuristics.Phishing.Email.Cloaked.NumericIP` | same | exact name parity |
 | `Heuristics.Phishing.Email.{Cloaked.Username,SpoofedDomain}` | same | name parity; ClamAV runs these on by default, exav does not |
@@ -458,6 +461,7 @@ Formats ClamAV does not handle either:
 | UDF | Parser present, extracted nothing from 13 test images | Decoded |
 | YARA modules | None work; even `pe` fails to load | 7 modules implemented |
 | CAB Quantum | Decodes | Decodes |
+| EGG (store, deflate, bzip2, LZMA, AZO), ALZ, HWP3 | Decodes | Decodes |
 
 Two behavioural differences change what a clean verdict means:
 
@@ -473,7 +477,7 @@ answering on a socket. Three ClamAV features are deliberately not implemented:
 
 | Not implemented | What to do instead |
 |---|---|
-| **Quarantine actions** (`--move`, `--copy`, `--remove`) | Act on the exit code or the result line. Exit codes follow clamscan (`0` clean, `1` infected, `2` error), and `--files-from` + `--log` give the same batch plumbing. |
+| **Quarantine actions** (`--move`, `--copy`, `--remove`) | Act on the exit code or the result line. Exit codes follow clamscan (`0` clean, `1` infected, `2` error), plus `3` for not fully scanned, and `--files-from` + `--log` give the same batch plumbing. |
 | **`VirusEvent`** (run a command on detection) | Drive it from the daemon's reply or the scan output. |
 | **On-access scanning** (`OnAccess*`, fanotify) | Not supported. Keep ClamAV if you depend on real-time protection. |
 

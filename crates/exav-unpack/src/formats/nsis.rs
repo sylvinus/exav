@@ -28,7 +28,7 @@ use crate::*;
 use std::io::Cursor;
 
 /// 16-byte firstheader signature: LE `0xDEADBEEF` then ASCII `"NullsoftInst"`.
-const NSIS_SIG: [u8; 16] = [
+pub(crate) const NSIS_SIG: [u8; 16] = [
     0xEF, 0xBE, 0xAD, 0xDE, b'N', b'u', b'l', b'l', b's', b'o', b'f', b't', b'I', b'n', b's', b't',
 ];
 
@@ -47,8 +47,9 @@ fn find_firstheader(data: &[u8]) -> Option<usize> {
 }
 
 /// True if `data` is a PE stub carrying the NSIS firstheader signature.
-pub(crate) fn is_nsis(data: &[u8]) -> bool {
-    data.starts_with(b"MZ") && find_firstheader(data).is_some()
+pub(crate) fn is_nsis(p: &crate::Probe) -> bool {
+    // As `find_firstheader` finds it.
+    p.head.starts_with(b"MZ") && p.find(&NSIS_SIG).and_then(|at| at.checked_sub(4)).is_some()
 }
 
 pub(crate) fn extract_nsis<R>(
@@ -129,7 +130,7 @@ pub(crate) fn extract_nsis<R>(
 }
 
 /// Decode one NSIS compressed stream, selecting the codec from the leading byte:
-/// `'1'` ⇒ NSIS bzip2, `0x5d` ⇒ LZMA props, else raw DEFLATE — with a fallback.
+/// `'1'` ⇒ NSIS bzip2, `0x5d` ⇒ LZMA props, else raw DEFLATE, each with a fallback.
 fn decode_stream(block: &[u8], cap: u64) -> Option<Vec<u8>> {
     match block.first().copied()? {
         b'1' => decode_bzip2(block, cap).or_else(|| decode_deflate(block, cap)),
@@ -157,15 +158,15 @@ fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
         return None;
     }
     // The dictionary size comes straight out of the file and the decoder
-    // allocates it UP FRONT, before a byte is decompressed — so an attacker sets
+    // allocates it UP FRONT, before a byte is decompressed, so an attacker sets
     // it to whatever they like and exav allocates that much. Measured: a 766 KB
     // installer declaring a 1.5 GB dictionary, which aborted the process under
     // the daemon's per-job RLIMIT_AS. Under the daemon that abort closes the
     // client connection with no reply at all, which reads as a clean scan.
     //
     // Clamp it to the caller's budget. A dictionary bigger than the output it is
-    // used to produce cannot help — LZMA only ever looks back into bytes it has
-    // already emitted — so capping at `cap` costs nothing on a real stream while
+    // used to produce cannot help (LZMA only ever looks back into bytes it has
+    // already emitted), so capping at `cap` costs nothing on a real stream while
     // making the allocation bounded by the same limit as everything else.
     let dict = crate::bounded_dict(u32le(block, 1), cap);
     let reader = lzma_rust2::LzmaReader::new_with_props(
@@ -183,7 +184,7 @@ fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
 /// in which case the block is reported unsupported.
 fn decode_bzip2(block: &[u8], cap: u64) -> Option<Vec<u8>> {
     nonempty(bounded_read(
-        bzip2_rs::DecoderReader::new(Cursor::new(block)),
+        super::bzip2_rs::DecoderReader::new(Cursor::new(block)),
         cap,
     ))
 }
@@ -191,12 +192,16 @@ fn decode_bzip2(block: &[u8], cap: u64) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_nsis(data: &[u8]) -> bool {
+        super::is_nsis(&crate::Probe::whole(data))
+    }
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
 
     /// A declared dictionary size is attacker input and is allocated UP FRONT.
-    /// Clamping it is what stops a small file committing gigabytes — measured at
-    /// 1.5 GB from a 766 KB installer, which aborted the process.
+    /// Clamping it is what stops a small file committing gigabytes (measured at
+    /// 1.5 GB from a 766 KB installer, which aborted the process).
     #[test]
     fn a_huge_declared_dictionary_is_clamped_to_the_budget() {
         // 4 GiB-1 declared, 1 MiB of budget.

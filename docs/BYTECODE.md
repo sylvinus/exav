@@ -34,8 +34,8 @@ A `.cbc` file is line-oriented:
 The instruction set is an LLVM-IR-like SSA form: arithmetic, bitwise, casts,
 integer comparisons, branches, calls, `GEP` pointer math, `load`/`store`,
 `memcpy`/`memset`/`memcmp`, and intrinsics (`bswap`, …). Programs cannot make
-syscalls; they reach the outside world only through a fixed **API** (~96
-functions): `read`/`seek`/`file_find` to inspect the file, PE/PDF/JSON
+syscalls; they reach the outside world only through a fixed **API** (107
+functions in ClamAV's table): `read`/`seek`/`file_find` to inspect the file, PE/PDF/JSON
 accessors, hashing, `disasm_x86`, and `setvirusname` to report a hit.
 
 ## 2. What's actually in the live database
@@ -63,20 +63,22 @@ routine* that reads bytes (`read`/`seek`/`file_find`), maybe checks PE section
 info, and calls `setvirusname`. The exotic, heavy APIs (`disasm_x86`, PDF/JSON,
 the compression codecs) appear in only a handful of programs.
 
-## 3. Minimal scope
+## 3. Scope
 
-Targeting the file-access + detection + info/debug APIs covers the bulk:
-
-- **In scope (implemented host API surface):** `setvirusname`, `read`, `seek`,
-  `file_byteat`, `file_find`/`file_find_limit`, `engine_functionality_level`,
-  `bytecode_rt_error`, the `debug_*` family, `read_number`, `memstr`.
-- With exav's current parser, **66 of 85 (78%)** of the live programs use *only*
-  APIs in this set — i.e. they're within reach of the minimal interpreter once
-  instruction lowering is complete.
-- **Out of scope for now (safe stubs / not executed):** `disasm_x86` (an x86
-  decoder), the PDF/JSON object APIs, `inflate`/`lzma`/`bzip2`,
-  `jsnorm`, `matchicon`. A program needing these is loaded but not run — it can
-  never false-positive or crash.
+- **Implemented:** the file-access, detection and PE APIs (`setvirusname`,
+  `read`, `seek`, `file_byteat`, `file_find`/`file_find_limit`, `read_number`,
+  `memstr`, `get_pe_section`, `pe_rawaddr`, `malloc`, `write`, `extract_new`),
+  `disasm_x86` (over `exav-x86`), the PDF object accessors, `matchicon`,
+  `engine_functionality_level`, and the math/util helpers. The `debug_*` family
+  and `bytecode_rt_error` are accepted and do nothing.
+- **Stubbed:** every other API in ClamAV's table (buffer pipes, maps,
+  hashsets, the inflate/bzip2/LZMA and `jsnorm` contexts, JSON accessors, trace
+  and environment calls) returns a fail-safe value (0, -1 or a null pointer),
+  so a program that calls one still runs and takes its failure path. See
+  [Host APIs](#host-apis-34-of-107).
+- A program whose body does not decode, or that names an API outside ClamAV's
+  table, is loaded but never run. All 85 programs in the live database run to
+  completion.
 
 ## 4. Why exav's interpreter is safer than ClamAV's
 
@@ -84,8 +86,9 @@ This is the part that matters. ClamAV's bytecode subsystem has a **documented
 RCE history**, because it executes DB-supplied programs in memory-unsafe C and
 historically via an LLVM JIT:
 
-- **CVE-2020-37167** — heap issue in the bytecode interpreter's function-name
-  handling, **CVSS 9.8 (RCE)**.
+- **CVE-2020-37167**: weak validation of bytecode function names in ClamBC
+  before 0.103.0, a code-injection flaw (CWE-94), **CVSS 3.1 8.4**, local
+  vector.
 - **ClamAV < 0.102 `bytecode_vm` code execution** (exploit-db 47687) — the
   bytecode VM/JIT path.
 - The optional **LLVM JIT** generated and ran native code from bytecode: a large
@@ -95,7 +98,7 @@ exav's design removes these failure modes by construction:
 
 | Risk in ClamAV's C VM | exav |
 |---|---|
-| Buffer overflow / UAF in the VM (the CVE-2020-37167 class) | **Pure safe Rust, no `unsafe`** — every memory access is a bounds-checked slice; an out-of-range index panics into isolation, it cannot corrupt memory |
+| Memory corruption or code injection in the VM (the class of the two above) | **Pure safe Rust, no `unsafe`** — every memory access is a bounds-checked slice; an out-of-range index panics into isolation, it cannot corrupt memory |
 | Native code generation from bytecode (JIT spray, W^X issues) | **No JIT, ever** — interpret only |
 | Untrusted program escaping the sandbox (syscalls, host memory) | Program sees only bounded `Vec`s and a fixed read-only file API; no syscalls, no host pointers |
 | Runaway program (CPU/memory exhaustion) | **Instruction budget**, scratch-memory cap, and call-depth limit |
@@ -109,8 +112,8 @@ that trade-off** — a real reason to switch.
 
 ## 5. Dangers identified (and how they're handled)
 
-- **Decompression/alloc bombs via `malloc`/codecs** → scratch-memory cap; codecs
-  out of scope; allocation bounded.
+- **Decompression/alloc bombs via `malloc`/codecs** → scratch-memory cap; the
+  codec APIs are stubs; allocation bounded.
 - **Infinite loops** → instruction budget (programs are not guaranteed to halt).
 - **Pointer math (`GEP`) out of bounds** → modeled as `(region, offset)` with
   checked access; never a raw pointer.
@@ -141,7 +144,7 @@ that trade-off** — a real reason to switch.
   **live in the normal scan path**, trigger-gated per program (`lib.rs` calls
   `db.bytecode.scan(...)`), producing real `Method::Bytecode` detections. The
   gating is per-program (a program runs only when its trigger lsig matches and
-  its host APIs are implemented), not a global off switch.
+  every API it names is in ClamAV's table), not a global off switch.
 - Confirmed: opcode enum + `operand_counts` table; CALL/GEPN read their arg
   count inline; inline-constant operands marked by a `0x4N`/`0x50` lead byte.
 
@@ -155,18 +158,17 @@ that trade-off** — a real reason to switch.
   constant globals (with component counting). **Decodes all 85** (1,257
   globals) with no errors.
 
-**Execution — live, with partial coverage.** `bytecode::exec` is a bounded
-interpreter over the decoded IR: value array, integer
-arithmetic/bitwise/compare/cast/select, `branch`/`jmp`/`ret`, host-API dispatch,
-and the `(region, offset)` pointer addressing model — and it runs in the live
-scan path (`Scanner::bytecode.scan`), trigger-gated per program, emitting
-`Method::Bytecode` detections. The remaining work is **coverage, not gating**:
-programs needing not-yet-implemented host APIs (`disasm_x86`, the PDF/JSON
-object APIs, the inflate/lzma/bzip2 codecs) are skipped rather than executed, and
-the disasm/codec-dependent detections that do run are not yet
-detection-validated against `clamscan` (see `BYTECODE_VALIDATION.md`).
+**Execution: live.** `bytecode::exec` is a bounded interpreter over the decoded
+IR: value array, integer arithmetic/bitwise/compare/cast/select,
+`branch`/`jmp`/`ret`, host-API dispatch, and the `(region, offset)` pointer
+addressing model. It runs in the live scan path (`Scanner::bytecode.scan`),
+trigger-gated per program, emitting `Method::Bytecode` detections. A program
+that calls a stubbed API runs and gets the stub's fail-safe value; a program
+that runs out of its instruction budget makes the scan `LIMITS-EXCEEDED` unless
+something else is found. Detections that depend on `disasm_x86` or a stub are
+not yet validated against `clamscan` (see `BYTECODE_VALIDATION.md`).
 
-Known limitation (0.0.1): functionality-level handling is unenforced for
+Known limitation: functionality-level handling is unenforced for
 bytecode. Programs observe `FLEVEL=167` via `engine_functionality_level`
 (`bytecode/runtime.rs`), while signature loading gates on `EXAV_FLEVEL=213`
 (`engine/parse.rs`); per-program `min/max_flevel` and `format_level` are parsed
@@ -196,43 +198,12 @@ priority. And note the bigger picture — the **detection delta** from 85 mostly
 legacy programs is modest, so exav's headline win here is the **memory-safe,
 non-JIT sandbox** (removing the RCE class), more than the raw extra coverage.
 
-## 7. Roadmap to 100% of the 85 programs
+## 7. How decoding was validated
 
-The decisive tool throughout is a **self-validating oracle**: decoding is correct
-iff every `B` record consumes exactly to its end *and* the per-function
-instruction total equals the header's `numInsts`, across all 85 files. Each
-phase is "done" only when that holds.
-
-- **Phase A — instruction decode (done).** Pin the exact `B`-record framing:
-  the `T` terminator layout, the trailing marker (the observed `@d E` tail), the
-  `GEP1`/`GEPZ` operand reads, and confirm the opcode field encoding. *Gate:
-  100% of B records consume exactly; Σinsts == numInsts for all 85.* (~1–2 wk)
-- **Phase B — types + SSA value model.** Decode the `T` type table
-  (struct/array/pointer/function) and the value-numbering so register sizes,
-  constants, and pointer types are correct. (~1–2 wk)
-- **Phase C — lower to executable IR.** Map all ~50 opcodes to the VM IR with a
-  bounds-checked `(region, offset)` pointer model (covers `load`/`store`/`GEP`/
-  `memcpy`/`select`/casts/branches/calls). (~2–3 wk)
-- **Phase D — host APIs (→78%).** Implement the API ladder over the existing
-  file buffer + `pe.rs`: `read`/`seek`/`file_byteat`/`file_find(_limit)`,
-  `setvirusname`, `engine_functionality_level`, `debug_*`, `read_number`,
-  `memstr`, bounded `malloc`, `get_pe_section`/`pe_rawaddr`. This set already
-  covers **66/85 (78%)** of the live programs. (~1–2 wk)
-- **Phase E — gated execution + differential testing.** Trigger lsig match → run
-  under budget + `catch_unwind` → `setvirusname` → detection; run only when a
-  program fully lowers and all its APIs are implemented (else safe no-op).
-  Differential-test verdicts against `clamscan` on the same inputs. (~1 wk)
-- **Phase F — long tail (→100%).** The remaining ~19 need `disasm_x86` (an x86
-  decoder — the single biggest API, ~4 programs), the PDF/JSON object APIs, the
-  `inflate`/`lzma`/`bzip2` codecs (reuse exav's unpack decoders), `jsnorm`,
-  `matchicon`, `extract_new`. Each is an isolated, on-demand addition. (~3–6 wk)
-
-**Cross-cutting:** fuzz the decoder/VM every phase; keep execution gated so
-partial support can never false-positive or crash; the memory-safe, non-JIT,
-strictly-bounded sandbox is invariant throughout.
-
-Phases A–E (~6–8 weeks) reach ~78% coverage with real, safe detections; the
-`disasm_x86` long tail (Phase F) is the bulk of the remainder.
+The decisive tool was a **self-validating oracle**: decoding is correct iff
+every `B` record consumes exactly to its end *and* the per-function instruction
+total equals the header's `numInsts`, across all 85 files. That holds for the
+whole live database, and the decoder and VM are fuzzed.
 
 ## Host APIs: 34 of 107
 

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use exav_core::{scan_seekable_located, ScanOptions, Scanner};
 
@@ -48,30 +48,10 @@ impl Signatures for FixedDb {
     }
 }
 
-/// A database that can be swapped underneath a running server.
-pub(super) struct ReloadableDb(RwLock<Arc<Scanner>>);
-
-impl ReloadableDb {
-    /// Wrap a database already shared with another server, so one load answers
-    /// on every listener a process binds until the first reload replaces it.
-    pub(super) fn from_arc(db: Arc<Scanner>) -> Self {
-        Self(RwLock::new(db))
-    }
-
-    /// Install a freshly loaded database. Requests already in flight finish
-    /// against the database they started with.
-    pub(super) fn replace(&self, db: Scanner) {
-        // A poisoned lock here means a panic happened while swapping, not that
-        // the database is unusable, so the value is taken either way rather
-        // than turning a past panic into a permanently broken server.
-        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
-        *guard = Arc::new(db);
-    }
-}
-
-impl Signatures for ReloadableDb {
+/// The thread model's database, which the supervisor swaps on a reload.
+impl Signatures for crate::daemon::SharedDb {
     fn scanner(&self) -> Arc<Scanner> {
-        Arc::clone(&self.0.read().unwrap_or_else(|e| e.into_inner()))
+        self.current()
     }
 }
 
@@ -502,7 +482,7 @@ fn modify<W: Write>(
             // now looking at a block they did not expect.
             eprintln!(
                 "exav: icap: cannot pass an object past --max-input-bytes to a client that sent no \
-                 `Allow: 204` — the discarded tail is not available to hand back; blocking instead"
+                 `Allow: 204`: the discarded tail is not available to hand back; blocking instead"
             );
         }
         log_block(req, &decision);
@@ -598,8 +578,10 @@ fn decide(
 ) -> Decision {
     let decision = match scanned {
         Ok(Ok((report, _loc))) => Decision::from_report(&report),
-        Ok(Err(e)) => Decision::Partial("UNSCANNABLE", format!("scan failed: {e}")),
-        Err(_) => Decision::Partial("UNSCANNABLE", "scan failed (internal error)".to_string()),
+        // Not a partial: nothing was examined, and `--partial-as ok` must not
+        // deliver it.
+        Ok(Err(e)) => Decision::Error(format!("scan failed: {e}")),
+        Err(_) => Decision::Error("scan failed (internal error)".to_string()),
     };
     apply_found_policy(decision)
 }
@@ -743,6 +725,17 @@ fn method_name(req: &RequestHead) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A scan that failed is an error, not a partial: `--partial-as ok` passes
+    /// a partial, and must never pass an object nothing examined.
+    #[test]
+    fn a_failed_scan_is_an_error_that_blocks() {
+        let failed = decide(Ok(Err(std::io::Error::other("read failed"))));
+        assert!(matches!(failed, Decision::Error(_)), "{}", failed.summary());
+        assert!(failed.blocks());
+        let panicked = decide(Err(Box::new("boom")));
+        assert!(matches!(panicked, Decision::Error(_)));
+    }
+
     #[test]
     fn extracts_the_request_target() {
         assert_eq!(
@@ -767,7 +760,7 @@ mod tests {
 
     #[test]
     fn a_reloadable_database_changes_its_istag() {
-        let db = ReloadableDb::from_arc(Arc::new(Scanner::builtin()));
+        let db = crate::daemon::SharedDb::new(Arc::new(Scanner::builtin()));
         let before = response::istag(&db.scanner());
 
         let mut b = exav_core::loader::Builder::new();

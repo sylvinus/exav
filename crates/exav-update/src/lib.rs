@@ -243,7 +243,7 @@ fn fetch_into(
     if auth.is_some() && scheme == "http" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "refusing to send credentials over http:// — use https://, or drop \
+            "refusing to send credentials over http://: use https://, or drop \
              the `user:pass@` and authenticate another way",
         ));
     }
@@ -381,13 +381,13 @@ fn verify_exav_db(body: &[u8]) -> Result<(), String> {
         return Err("truncated download (shorter than an empty database header)".into());
     }
     if &body[..EXAV_DB_MAGIC.len()] != EXAV_DB_MAGIC {
-        return Err("not an exav database (.exavdb) — wrong magic".into());
+        return Err("not an exav database (.exavdb): wrong magic".into());
     }
     let (head_payload, trailer) = body.split_at(body.len() - EXAV_DB_DIGEST_LEN);
     let payload = &head_payload[EXAV_DB_HEADER_LEN..];
     if Sha256::digest(payload).as_slice() != trailer {
         return Err(
-            "integrity check failed (SHA-256 mismatch) — download corrupt or interrupted".into(),
+            "integrity check failed (SHA-256 mismatch): download corrupt or interrupted".into(),
         );
     }
     Ok(())
@@ -436,7 +436,8 @@ fn sanitize_component(raw: &str) -> Option<String> {
 }
 
 /// Map a source `url` to the on-disk path exav installs it at:
-/// `<sigdir>/env/<host>/<url-path…>/<filename>`. Namespacing by origin means two
+/// `<sigdir>/env/<host>/<url-path…>/<name>-<digest>.<ext>`, the digest being of
+/// the whole URL (see below). Namespacing by origin means two
 /// feeds that happen to share a filename (e.g. two CVD mirrors both ending in
 /// `daily.cvd`) never clobber each other. Every component is sanitized, and `.`
 /// /`..` are dropped, so a crafted URL can never escape `sigdir`. Errors only if

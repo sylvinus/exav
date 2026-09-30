@@ -13,23 +13,27 @@ The prefork daemon runs each scan in a worker with `RLIMIT_AS`, `RLIMIT_CPU`, a
 wall-clock alarm and replacement on death. A one-shot CLI run sets kernel limits
 when asked. **A library embedding gets none of that.**
 
-What you do get is the in-core budget, and it is the layer that produces a
-verdict rather than a corpse. Set it deliberately:
+What you do get is the in-core budget, and it is the layer that ends a scan with
+a verdict rather than a killed process. Set it deliberately:
 
 ```rust
 use exav_core::ScanOptions;
 
 let mut opts = ScanOptions::default();
-opts.limits.max_extracted_bytes = 256 * 1024 * 1024;
-opts.limits.max_buffer_bytes = 64 * 1024 * 1024;
-opts.deep_analysis_max = 64 * 1024 * 1024;
+opts.limits.max_extracted_bytes = 256 * 1024 * 1024; // held at once, in total
+opts.deep_analysis_max = 64 * 1024 * 1024;           // one object held whole
 opts.limits.max_recursion = 8;
 opts.limits.max_pe_emulation_steps = 200_000_000;
 ```
 
-`Limits` and `ScanOptions` are `#[non_exhaustive]`, so set fields on a default
-value; a struct literal does not compile outside the crate, even with
-`..Default::default()`.
+`deep_analysis_max` also caps `limits.max_buffer_bytes` for a scan. `Limits` and
+`ScanOptions` are `#[non_exhaustive]`, so set fields on a default value; a struct
+literal does not compile outside the crate, even with `..Default::default()`.
+
+An object over `deep_analysis_max` is scanned through a block cache. Its text
+views, and an archive member too large to hold, need somewhere to be written and
+read back: give the scan a [`Spill`](#somewhere-to-spill), or those are reported
+`LimitsExceeded` rather than scanned.
 
 Two failure modes stay outside any in-process budget, and you should decide what
 to do about them before you feed the library hostile input:
@@ -46,9 +50,13 @@ If your process must survive arbitrary input, scan out of process, or run the
 ## A scan
 
 ```rust
-use exav_core::{loader, ScanOptions, Verdict};
+use exav_core::{loader, ScanOptions, Scanner, Verdict};
 
-let scanner = loader::load("/var/lib/exav".as_ref())?;   // .cvd/.cld/.ndb/.yar, or a .exavdb
+// A directory of .cvd/.cld/.ndb/.yar files, or a .exavdb file.
+let scanner = loader::load("/var/lib/exav".as_ref())?;
+if scanner.signature_count() <= Scanner::builtin().signature_count() {
+    return Err("no signatures loaded".into());
+}
 let opts = ScanOptions::default();
 
 let report = exav_core::scan_path(&scanner, "suspicious.bin".as_ref(), &opts)?;
@@ -60,7 +68,47 @@ match report.verdict {
 }
 ```
 
-## The verdict model is the API
+`loader::load` fails on a path that does not exist, but an empty directory loads
+as the built-in baseline, which detects only the EICAR test file. The CLI refuses
+to run against it; a library caller has to check, as above.
+
+### Somewhere to spill
+
+The library writes nothing to disk on its own. To let a scan spill, implement
+`exav_core::spill::Spill`, for instance over temporary files:
+
+```rust
+use std::io::{Seek, SeekFrom, Write};
+use exav_core::spill::{Spill, SpillReader, SpillWriter};
+
+struct TempSpill(std::path::PathBuf);
+
+impl Spill for TempSpill {
+    fn create(&self) -> Result<Box<dyn SpillWriter>, String> {
+        let file = tempfile::tempfile_in(&self.0).map_err(|e| e.to_string())?;
+        Ok(Box::new(SpillFile(file)))
+    }
+}
+
+struct SpillFile(std::fs::File);
+
+impl SpillWriter for SpillFile {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.0.write_all(bytes).map_err(|e| e.to_string())
+    }
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn SpillReader>, String> {
+        self.0.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        Ok(Box::new(self.0))
+    }
+}
+
+opts.spill = Some(std::sync::Arc::new(TempSpill(std::env::temp_dir())));
+```
+
+Bound what it may write yourself: `create` and `write` can refuse, and the scan
+then reports what it could not keep.
+
+## Reading a verdict
 
 `Ok` does not mean clean, and `Err` does not mean infected. The `io::Error` on
 `scan_path` covers only reaching the file; every scan outcome arrives as a
@@ -105,8 +153,30 @@ for e in &entries {
 it". Skipping those entries silently reintroduces exactly the failure the
 verdict model exists to prevent.
 
-`extract` buffers every member. For anything large, use `extract_each`, which
-streams member by member and can stop early.
+`extract` buffers every member. For anything large, use `walk`, which hands the
+members over one at a time, a large one as a reader, and stops early when the
+visitor returns `Some`:
+
+```rust
+use exav_unpack::{detect, walk, Budget, Limits, Member, MemberMeta};
+
+let Some(format) = detect(&bytes) else { return Ok(()) };
+let mut budget = Budget::new(Limits::default());
+let mut visit = |meta: &MemberMeta, content: Option<Member<'_>>, budget: &mut Budget| {
+    match content {
+        None => eprintln!("{}: {}", meta.name, meta.unsupported.unwrap_or("no content")),
+        Some(member) => match member.into_bytes(meta, budget) {
+            Ok((data, _partial)) => println!("{} ({} bytes)", meta.name, data.len()),
+            Err(e) => eprintln!("{}: {e}", meta.name),
+        },
+    }
+    None::<()>
+};
+walk(format, &bytes, &mut budget, &mut visit)?;
+```
+
+`into_bytes` reads a streamed member whole under the buffer limit; read a
+`Member::Stream` directly to keep it out of memory.
 
 ## Which crate
 
@@ -135,6 +205,6 @@ exav is `0.0.x`: any release may break any API. Cargo treats every `0.0.x` as
 incompatible with the last, so a dependency on one is pinned exactly whatever you
 write.
 
-Modules behind the `unstable-internals` feature (`engine`, `bytecode`,
-`patterns`, `pe`) exist so the tests and diagnostic examples can reach inside.
+Modules behind the `unstable-internals` feature (such as `engine`, `bytecode`,
+`patterns` and `pe`) exist so the tests and diagnostic examples can reach inside.
 They are not an API and will change without a note.

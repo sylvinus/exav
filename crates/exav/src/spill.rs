@@ -25,8 +25,9 @@
 //! sharing that filesystem.
 //!
 //! Exceeding a budget is not an I/O failure and must not be reported as one. The
-//! object is simply one exav could not examine, which is a verdict every surface
-//! already knows how to say ([`SpillError::Budget`] → `UNSCANNABLE`). Dropping
+//! object is one exav could examine only as far as it held, which is a verdict
+//! every surface already knows how to say ([`SpillError::Budget`]: what was held
+//! is scanned, and without a detection it is `LIMITS-EXCEEDED`). Dropping
 //! the connection instead would leave the client with no answer at all, and a
 //! client with no answer is a client that decides for itself.
 
@@ -58,8 +59,9 @@ pub(crate) struct SpillConfig {
     ///
     /// Off, nothing is ever written to a temp file and
     /// [`threshold`](Self::threshold) becomes a hard per-object memory ceiling:
-    /// an object that outgrows it is `UNSCANNABLE`, because there is nowhere
-    /// left to put it. That is the shape a read-only root filesystem needs, and
+    /// an object that outgrows it has what was held scanned and is
+    /// `LIMITS-EXCEEDED` unless something is found. That is the shape a
+    /// read-only root filesystem needs, and
     /// the one a deployment picks when it would rather refuse a large object
     /// than let a scanned payload touch a disk at all.
     pub enabled: bool,
@@ -257,6 +259,54 @@ impl SpillFile {
 impl Drop for SpillFile {
     fn drop(&mut self) {
         IN_USE.fetch_sub(self.charged, Ordering::SeqCst);
+    }
+}
+
+/// Spill space for the scan itself: what it makes of an object too large to
+/// hold (normalised text, a member too large to buffer) goes to the same temp
+/// files, under the same budgets, as the objects the listeners spill.
+pub(crate) struct ScanSpill;
+
+impl exav_core::spill::Spill for ScanSpill {
+    fn create(&self) -> Result<Box<dyn exav_core::spill::SpillWriter>, String> {
+        if !config().enabled {
+            return Err("spilling to disk is off (--spill-dir off)".to_string());
+        }
+        let file = SpillFile::create().map_err(|e| e.to_string())?;
+        Ok(Box::new(file))
+    }
+}
+
+impl exav_core::spill::SpillWriter for SpillFile {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.write_all(bytes).map_err(|e| e.to_string())
+    }
+
+    fn finish(self: Box<Self>) -> Result<Box<dyn exav_core::spill::SpillReader>, String> {
+        let file = self.reopen().map_err(|e| format!("temporary file: {e}"))?;
+        Ok(Box::new(ReadBack {
+            file,
+            _spill: *self,
+        }))
+    }
+}
+
+/// A spill file being read back. Its share of the budget is held until this is
+/// dropped.
+struct ReadBack {
+    file: std::fs::File,
+    _spill: SpillFile,
+}
+
+impl io::Read for ReadBack {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl io::Seek for ReadBack {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(to)
     }
 }
 

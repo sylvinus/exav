@@ -838,7 +838,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         }
         body.push_str(" >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF");
         let mut budget = Budget::new(Limits::default());
-        let _ = extract(Format::Pdf, body.as_bytes(), &mut budget).unwrap();
+        let _ = extract(Format::Pdf, &body.as_bytes(), &mut budget).unwrap();
     }
 
     /// A PDF with no active content emits no JS/URI members (no false members).

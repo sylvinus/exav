@@ -1,7 +1,7 @@
 use crate::formats::pdf_parse::types::Primitive;
 use std::collections::HashMap;
 
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use digest::Digest;
 use md5::Md5;
 
@@ -164,7 +164,7 @@ impl Decoder {
         Err(PdfCryptError::UnsupportedRevision(level))
     }
 
-    pub(crate) fn decrypt_stream(&self, obj_id: u32, data: &mut [u8]) {
+    pub(crate) fn decrypt_stream(&self, obj_id: u32, data: &mut Vec<u8>) {
         if data.is_empty() || self.method == CryptMethod::None {
             return;
         }
@@ -174,22 +174,12 @@ impl Decoder {
                 rc4_apply(&key, data);
             }
             CryptMethod::AESV2 => {
-                if data.len() < 16 {
-                    return;
-                }
-                let (iv, ciphertext) = data.split_at_mut(16);
-                let iv = iv.to_vec();
                 let key = self.per_object_key(obj_id, Some(b"sAlT"));
-                aes_128_cbc_decrypt(&key, &iv, ciphertext);
+                aes_cbc_decrypt(&key, data);
             }
             CryptMethod::AESV3 => {
-                if data.len() < 16 {
-                    return;
-                }
-                let (iv, ciphertext) = data.split_at_mut(16);
-                let iv = iv.to_vec();
                 let key = self.key[..32.min(self.key.len())].to_vec();
-                aes_256_cbc_decrypt(&key, &iv, ciphertext);
+                aes_cbc_decrypt(&key, data);
             }
             CryptMethod::None => {}
         }
@@ -233,7 +223,7 @@ fn resolve_crypt_method(dict: &CryptDict) -> Result<(u32, CryptMethod), PdfCrypt
         1 => Ok((40, CryptMethod::V2)),
         // V==3 is the (undocumented) variable-length RC4 variant; in practice its
         // key derivation matches the published V==2 algorithm, so treat it the
-        // same — best effort. If the derived key doesn't verify against /U|/O we
+        // same, best effort. If the derived key doesn't verify against /U|/O we
         // report the PDF encrypted anyway, so a mismatch is never a silent clean.
         2 | 3 => {
             if !dict.bits.is_multiple_of(8) {
@@ -279,7 +269,7 @@ fn resolve_crypt_method(dict: &CryptDict) -> Result<(u32, CryptMethod), PdfCrypt
     }
 }
 
-// ---- RC4 (RFC 6229) — kept as hand-rolled because the `rc4` crate requires
+// ---- RC4 (RFC 6229), kept hand-rolled because the `rc4` crate requires
 // compile-time typenum key sizes, while PDF uses variable-length keys (40-2048
 // bits). This is a well-understood 17-line cipher with no unsafe code.
 
@@ -524,11 +514,9 @@ fn derive_key_v5_v6(
         }
     };
 
-    let zero_iv = [0u8; 16];
     let mut key_data = wrapped_key.clone();
-    aes_256_cbc_decrypt(
+    unwrap_file_key(
         &intermediate_key[..32.min(intermediate_key.len())],
-        &zero_iv,
         &mut key_data,
     );
     key_data.truncate(32);
@@ -595,10 +583,8 @@ fn revision_6_kdf(password: &[u8], salt: &[u8], u: &[u8]) -> [u8; 32] {
             block_data.push(0);
         }
         let padded_len = block_data.len();
-        let _ = encryptor.encrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(
-            &mut block_data,
-            padded_len,
-        );
+        let _ = encryptor
+            .encrypt_padded::<aes::cipher::block_padding::NoPadding>(&mut block_data, padded_len);
         let encrypted = &block_data[..total];
 
         let sum: usize = encrypted[..16].iter().map(|&b| b as usize).sum();
@@ -643,30 +629,93 @@ fn revision_6_kdf(password: &[u8], salt: &[u8], u: &[u8]) -> [u8; 32] {
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
-fn aes_128_cbc_decrypt(key: &[u8], iv: &[u8], data: &mut [u8]) {
-    if key.len() < 16 || iv.len() < 16 || data.is_empty() {
-        return;
-    }
-    let cipher = Aes128CbcDec::new_from_slices(&key[..16], &iv[..16]);
-    if let Ok(cipher) = cipher {
-        let _ = cipher.decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(data);
+/// Decrypt the `UE`/`OE` wrapped file key in place: AES-256, CBC with a zero
+/// IV and no padding (ISO 32000-2).
+fn unwrap_file_key(key: &[u8], data: &mut [u8]) {
+    use aes::cipher::block_padding::NoPadding;
+    let n = data.len() - data.len() % 16;
+    if let Ok(c) = Aes256CbcDec::new_from_slices(key, &[0u8; 16]) {
+        let _ = c.decrypt_padded::<NoPadding>(&mut data[..n]);
     }
 }
 
-fn aes_256_cbc_decrypt(key: &[u8], iv: &[u8], data: &mut [u8]) {
-    if key.len() < 32 || iv.len() < 16 {
+/// Decrypt an AES stream or string in place: the 16-byte IV, then the CBC
+/// ciphertext. `data` is left holding the plaintext alone, the IV removed.
+///
+/// Stream extraction can include an end-of-line after the ciphertext, so only
+/// the block-aligned part is decrypted. PKCS#7 padding is removed only when it
+/// is valid: a crafted stream with bad padding still yields all its content.
+/// Too short to hold an IV, or with a key of the wrong size, `data` is left as
+/// it was.
+fn aes_cbc_decrypt(key: &[u8], data: &mut Vec<u8>) {
+    use aes::cipher::block_padding::NoPadding;
+    if data.len() < 16 {
         return;
     }
-    // CBC needs whole 16-byte blocks, but PDF stream extraction can include a
-    // trailing EOL after the ciphertext — decrypt only the block-aligned prefix.
-    // NoPadding keeps the full plaintext (incl. any PKCS#7 padding bytes) so a
-    // signature near the tail stays visible and a crafted/edited stream with bad
-    // padding still yields its content.
-    let n = data.len() - data.len() % 16;
-    if n == 0 {
+    let (iv, body) = data.split_at_mut(16);
+    let n = body.len() - body.len() % 16;
+    let ok = match key.len() {
+        16 => Aes128CbcDec::new_from_slices(key, iv)
+            .map(|c| c.decrypt_padded::<NoPadding>(&mut body[..n]).is_ok()),
+        32 => Aes256CbcDec::new_from_slices(key, iv)
+            .map(|c| c.decrypt_padded::<NoPadding>(&mut body[..n]).is_ok()),
+        _ => return,
+    };
+    if !matches!(ok, Ok(true)) {
         return;
     }
-    if let Ok(cipher) = Aes256CbcDec::new_from_slices(&key[..32], &iv[..16]) {
-        let _ = cipher.decrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut data[..n]);
+    data.drain(..16);
+    data.truncate(n);
+    let pad = data.last().copied().unwrap_or(0) as usize;
+    if (1..=16).contains(&pad)
+        && pad <= data.len()
+        && data[data.len() - pad..].iter().all(|&b| b as usize == pad)
+    {
+        data.truncate(data.len() - pad);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PLAIN: &[u8] = b"stream plaintext, 33 bytes long!!";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// An AES stream or string is the IV, then the ciphertext of the padded
+    /// plaintext; what comes out is the plaintext alone. With the IV left in
+    /// front, a FlateDecode stream no longer starts with its zlib header and
+    /// is reported undecodable. Vectors from Python's `cryptography`.
+    #[test]
+    fn aes_decryption_yields_the_plaintext_alone() {
+        let v3 = Decoder {
+            key: vec![0x11; 32],
+            key_size: 32,
+            method: CryptMethod::AESV3,
+        };
+        let v2 = Decoder {
+            key: vec![0x33; 16],
+            key_size: 16,
+            method: CryptMethod::AESV2,
+        };
+        let cases = [
+            (&v3, "222222222222222222222222222222221667316af8df34c59a9cfbb282f3f15390b837b680e02362584c9426a765787eba74d5ee5529da8aad289df5c742541b"),
+            (&v2, "22222222222222222222222222222222c0f2686b1de9823bb0b732f174856be9b2bde49ef0768d91635c34a59383f9e6064367ffe1064032238b380d4224a448"),
+        ];
+        for (dec, hex) in cases {
+            // As extracted, and with the end-of-line a stream body can carry.
+            for tail in [&b""[..], b"\r\n"] {
+                let mut data = unhex(hex);
+                data.extend_from_slice(tail);
+                dec.decrypt_stream(7, &mut data);
+                assert_eq!(data, PLAIN, "{:?} with tail {tail:?}", dec.method);
+            }
+        }
     }
 }

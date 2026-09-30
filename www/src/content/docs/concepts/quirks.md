@@ -80,15 +80,14 @@ See [Bytecode sandbox](/concepts/bytecode-sandbox/).
 ## The file extension is a lie, and so is the magic number
 
 File type comes from content only. Signatures are scoped by type (`Target:` and
-`CL_TYPE_*` container constraints), so getting the type wrong does not just skip
-a parser, it deselects a whole class of signatures. And magic bytes are not
-enough either:
+`CL_TYPE_*` container constraints), so getting the type wrong deselects a whole
+class of signatures, not only a parser. And magic bytes are not enough either:
 
 - **`CA FE BA BE` is two formats:** the Mach-O universal ("fat") binary magic and
   the Java `.class` magic. exav claims a fat binary only when the architecture
   count is between 1 and 64, the whole table is present and every slice lies
-  within the file; `.class` detection also requires a plausible major version
-  (45 or more), which a fat header's architecture count never is.
+  within the file; `.class` is tried only after the fat check fails, and also
+  requires a major version of 45 or more.
 - **Short magics collide with ordinary data.** bzip2 is `BZh`, CAB is `MSCF`,
   gzip is two bytes. A false hit inside a PE overlay would be routed to that
   decoder, fail, and report the whole object `UNSCANNABLE`, so each weak magic is
@@ -122,7 +121,8 @@ over about 2 GB is read, scanned as zero bytes, and reported `OK`.
 
 exav's rule is that refusing by size still scans. An input over
 `--max-input-bytes` has its first `--max-input-bytes` bytes scanned first, as
-any smaller input would be, and only then gets a limit verdict:
+any smaller input would be, and only then gets a limit verdict (here with
+`--max-input-bytes 100M`):
 
 ```text
 file size 5368709120 exceeds max-input-bytes 104857600; scanned first 104857600 bytes only
@@ -198,7 +198,8 @@ That is a double-extension detector: it catches
 Two more places encryption is a signal:
 
 - `--partial-as password-protected=found` turns a password-protected member into
-  a detection, `Heuristics.Encrypted.Zip` / `.RAR` / `.7Zip` / `.PDF` / `.Doc`.
+  a detection, `Heuristics.Encrypted.Zip` / `.RAR` / `.7Zip` / `.PDF` / `.OLE2`,
+  or `.Archive` for other formats.
 - exav tries a default password list on ZIPs: `infected`, `virus`, `malware`,
   `password`, `123456`. "infected" is the standard password for sharing samples,
   so a password-protected dropper opens with no configuration, as
@@ -211,8 +212,10 @@ This reads like a bug in every code review: exav extracts archive members withou
 verifying their CRCs, and verification is off by default. A wrong CRC must never
 stop a member's bytes from being scanned, or an attacker could downgrade a
 detection by flipping one checksum byte. (ClamAV also ignores CRCs when scanning.
-Verification needs the `checksums` Cargo feature and an explicit opt-in, for
-extraction where a bad CRC is a real "corrupt file" signal.)
+Verification is for a library embedding extracting files, where a bad CRC is a
+real "corrupt file" signal: it needs the `checksums` feature of `exav-core` or
+`exav-unpack` and `ScanOptions::verify_checksums`. The command line has no
+switch for it.)
 
 The same instinct generalises. A CAB whose total-size field is overwritten with
 `0xFFFFFFFF` defeats a strict parser; exav clamps it and extracts the member. A
@@ -228,7 +231,9 @@ still reported, not treated as clean.
 > When a sequential stream runs out of input, every byte that exists has been
 > scanned: the missing tail is absent, not hidden, so a clean result is a real
 > clean. The incomplete verdicts are for content that is present but unscanned:
-> an encrypted member, an unsupported codec, a member over a limit.
+> an encrypted member, an unsupported codec, a member over a limit. A stream
+> damaged part way is one of those: the compressed data after the damage is
+> present and was not decoded, so a clean result there is `UNSCANNABLE`.
 
 ## Identity that survives the bytes changing
 
@@ -340,7 +345,7 @@ rendering byte for byte: HTML entity decoding, lowercasing and whitespace
 collapsing; quote-aware comment stripping; and, for scripts, a JavaScript
 normaliser that decodes string escapes, folds `"ab"+"cd"`, evaluates
 `String.fromCharCode(<literals>)` and `unescape("…%XX…")`, and re-parses the
-argument of `eval("…")` for one static layer. Nothing is executed. A single
+argument of `eval("…")`, up to 32 nested layers. Nothing is executed. A single
 textual buffer can be scanned up to five times: raw, HTML-normalised,
 text-normalised, and through the light and heavy JavaScript normalisation.
 
@@ -401,8 +406,9 @@ The `clamd` protocol itself has oddities:
 - **One command can answer any number of times, and nothing marks the last one.**
   `SCAN` over a directory, `CONTSCAN` and `ALLMATCHSCAN` reply once per file with
   no count and no terminator. Outside a session the closed connection is the end
-  marker; inside `IDSESSION` there is none, so exav's client sends a `PING` after
-  each scan and reads up to the `PONG`. A client that reads one line per command
+  marker. clamd refuses `CONTSCAN` and `ALLMATCHSCAN` inside `IDSESSION`, but
+  takes `SCAN` on a directory, and there nothing marks the end, so exav's client
+  sends a `PING` after each scan and reads up to the `PONG`. A client that reads one line per command
   loses a detection and attributes the leftovers to the next command.
 - **`INSTREAM` is `<u32 be len><data>` chunks ended by a zero length:** the only
   binary field in a text protocol. When exav has its answer before the stream
@@ -416,8 +422,8 @@ The `clamd` protocol itself has oddities:
 ## Smaller ones
 
 - **`(B)`, `(L)` and `(W)` are not alternations.** In `.ndb` bodies they look
-  exactly like one-option alternations and are boundary markers (word, line,
-  word). A negated alternation `!(aa|bb)` also requires every branch to be the
+  exactly like one-option alternations and are boundary markers (word boundary,
+  line boundary, non-alphanumeric byte). A negated alternation `!(aa|bb)` also requires every branch to be the
   same length, or the signature is rejected.
 - **Archive member names reach your terminal.** A hostile archive can put ANSI
   escapes (or megabytes of text) in a member name that ends up in the scanner's

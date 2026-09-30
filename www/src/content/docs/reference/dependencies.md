@@ -22,9 +22,12 @@ the repository's `docs/DEPENDENCIES.md`.
   adds no dependency: its framing, chunked decoding and `Encapsulated` parsing
   are written against `std`, in a module that is `#![forbid(unsafe_code)]`, so
   the parsers a hostile client reaches first are exav's own.
-- **Contained `unsafe`.** Some dependencies use `unsafe` internally, almost all
-  for SIMD (byte search, hashing) and OS syscalls (the daemon). None of it is in
-  exav's parsing logic, and reducing it is on the [roadmap](/project/roadmap/).
+- **`unsafe` in dependencies.** Many dependencies use `unsafe` internally: SIMD
+  byte search and hashing, OS syscalls (the daemon), and buffer handling in some
+  decoders that read scanned bytes (`lzfse_rust`, `ruzstd`, `zip`, `tar`,
+  `delharc`, `goblin`). exav's own crates contain none outside the daemon's
+  `libc` calls. The tables give a count per crate, and reducing it is on the
+  [roadmap](/project/roadmap/).
 - **Feature-gated capability.** Optional features (`http`, individual formats)
   pull their dependencies only when enabled (see
   [Feature flags](/reference/feature-flags/)). The network stack is opt-in, and
@@ -33,17 +36,19 @@ the repository's `docs/DEPENDENCIES.md`.
 
 ## CLI & runtime (`exav`)
 
-| Crate | Purpose | License | `unsafe` posture |
-|---|---|---|---|
-| [`clap`](https://crates.io/crates/clap) | Command-line argument parsing | MIT OR Apache-2.0 | safe |
-| [`anyhow`](https://crates.io/crates/anyhow) | Error handling in the binary | MIT OR Apache-2.0 | safe |
-| [`serde_json`](https://crates.io/crates/serde_json) | JSON scan-report output | MIT OR Apache-2.0 | safe |
-| [`walkdir`](https://crates.io/crates/walkdir) | Recursive directory traversal | Unlicense OR MIT | safe |
-| [`regex`](https://crates.io/crates/regex) | Linear-time regex (CLI filters) | MIT OR Apache-2.0 | safe (SIMD via `memchr`/`aho-corasick`) |
-| [`libc`](https://crates.io/crates/libc) | Syscall bindings for the prefork daemon (signals, resource limits) | MIT OR Apache-2.0 | `unsafe` FFI declarations |
+The `unsafe` column is counted the same way as in
+[the transitive table](#every-transitive-dependency).
 
-Spilling an oversized stream to a temp file is not a dependency: it is
-`exav/src/tmpfile.rs`, a page of `std::fs` with the properties that matter
+| Crate | Purpose | License | `unsafe` uses |
+|---|---|---|---|
+| [`clap`](https://crates.io/crates/clap) | Command-line argument parsing | MIT OR Apache-2.0 | **none** (`forbid`) |
+| [`anyhow`](https://crates.io/crates/anyhow) | Error handling in the binary | MIT OR Apache-2.0 | 104 |
+| [`serde_json`](https://crates.io/crates/serde_json) | JSON scan-report output | MIT OR Apache-2.0 | 12 |
+| [`walkdir`](https://crates.io/crates/walkdir) | Recursive directory traversal | Unlicense OR MIT | **none** |
+| [`libc`](https://crates.io/crates/libc) | Syscall bindings for the prefork daemon (signals, resource limits) | MIT OR Apache-2.0 | 423 (FFI declarations) |
+
+Spilling an oversized object to a temp file is not a dependency: it is
+`crates/exav/src/tmpfile.rs`, a page of `std::fs` with the properties that matter
 (`O_CREAT|O_EXCL`, so a planted symlink cannot be followed; mode `0600`; delete
 on drop). The ready-made crates reach the filesystem through `rustix` and
 `linux-raw-sys`, which would add more `unsafe` than the rest of the tree.
@@ -53,73 +58,85 @@ on drop). The ready-made crates reach the filesystem through `rustix` and
 The engine crate is `#![forbid(unsafe_code)]`; the `unsafe` noted below lives
 inside these dependencies, not in exav.
 
-| Crate | Purpose | License | `unsafe` posture |
+| Crate | Purpose | License | `unsafe` uses |
 |---|---|---|---|
-| [`daachorse`](https://crates.io/crates/daachorse) | Double-array Aho-Corasick automaton (the main pattern matcher) | MIT OR Apache-2.0 | perf-critical indexing |
-| [`aho-corasick`](https://crates.io/crates/aho-corasick) | Multi-pattern search (YARA atoms, prefilters) | Unlicense OR MIT | SIMD |
-| [`memchr`](https://crates.io/crates/memchr) | Vectorized byte search | Unlicense OR MIT | SIMD |
-| [`regex-automata`](https://crates.io/crates/regex-automata) / [`regex-syntax`](https://crates.io/crates/regex-syntax) | Linear-time (DoS-safe) regex engine + parser | MIT OR Apache-2.0 | via `memchr` |
-| [`fancy-regex`](https://crates.io/crates/fancy-regex) | Backtracking regex for wildcard-signature verification | MIT | safe |
-| [`goblin`](https://crates.io/crates/goblin) | PE / ELF / Mach-O executable parsing | MIT | safe |
-| [`iced-x86`](https://crates.io/crates/iced-x86) | **Not linked by any shipped binary.** A dev-dependency of [`exav-x86`](/subprojects/exav-x86/) only, where it is the oracle its differential tests, table generator and fuzz target check against | MIT | handler dispatch through raw pointers, and integer-to-enum transmutes on table indices |
-| [`md-5`](https://crates.io/crates/md-5) / [`sha1`](https://crates.io/crates/sha1) / [`sha2`](https://crates.io/crates/sha2) | Hash signatures (whole-file / section digests) | MIT OR Apache-2.0 | minimal (CPU-feature detection) |
-| [`crc32fast`](https://crates.io/crates/crc32fast) | CRC32 | MIT OR Apache-2.0 | SIMD |
-| [`base64`](https://crates.io/crates/base64) | Base64 decode (embedded payloads, YARA) | MIT OR Apache-2.0 | safe |
-| [`bstr`](https://crates.io/crates/bstr) | Byte-string utilities (YARA engine) | MIT OR Apache-2.0 | safe |
-| [`yara-x-parser`](https://crates.io/crates/yara-x-parser) | YARA grammar/AST parser (the native engine's front end) | BSD-3-Clause | safe |
-| [`image`](https://crates.io/crates/image) | Icon/image decoding for fuzzy image hashing | MIT OR Apache-2.0 | some, in codec paths |
-| [`rustdct`](https://crates.io/crates/rustdct) / [`transpose`](https://crates.io/crates/transpose) | DCT for perceptual image hashing | MIT OR Apache-2.0 | safe |
-| [`tlsh2`](https://crates.io/crates/tlsh2) | TLSH fuzzy hashing | Apache-2.0 OR BSD-3-Clause | safe |
-| [`rmp-serde`](https://crates.io/crates/rmp-serde) / [`serde`](https://crates.io/crates/serde) | MessagePack (de)serialization of the prebuilt `.exavdb` | MIT / MIT OR Apache-2.0 | safe |
-| [`thiserror`](https://crates.io/crates/thiserror) | Error-type derive | MIT OR Apache-2.0 | safe |
+| [`daachorse`](https://crates.io/crates/daachorse) | Double-array Aho-Corasick automaton (the main pattern matcher) | MIT OR Apache-2.0 | 69 |
+| [`aho-corasick`](https://crates.io/crates/aho-corasick) | Multi-pattern search (YARA atoms, prefilters) | Unlicense OR MIT | 227 (SIMD) |
+| [`memchr`](https://crates.io/crates/memchr) | Vectorized byte search | Unlicense OR MIT | 326 (SIMD) |
+| [`regex`](https://crates.io/crates/regex) | Linear-time regex (`--exclude`/`--include` filters, signature regexes) | MIT OR Apache-2.0 | 1 |
+| [`regex-automata`](https://crates.io/crates/regex-automata) / [`regex-syntax`](https://crates.io/crates/regex-syntax) | Linear-time (DoS-safe) regex engine + parser | MIT OR Apache-2.0 | 55 / **none** (`forbid`) |
+| [`fancy-regex`](https://crates.io/crates/fancy-regex) | Backtracking regex for the PCRE subsignatures with lookaround or backreferences, under a step bound | MIT | **none** |
+| [`goblin`](https://crates.io/crates/goblin) | PE / ELF / Mach-O executable parsing | MIT | 34 |
+| [`md-5`](https://crates.io/crates/md-5) / [`sha1`](https://crates.io/crates/sha1) / [`sha2`](https://crates.io/crates/sha2) | Hash signatures (whole-file / section digests) | MIT OR Apache-2.0 | 2 / 4 / 29 (CPU-feature detection, SIMD) |
+| [`crc32fast`](https://crates.io/crates/crc32fast) | CRC32 | MIT OR Apache-2.0 | 6 (SIMD) |
+| [`base64`](https://crates.io/crates/base64) | Base64 decode (embedded payloads, YARA) | MIT OR Apache-2.0 | **none** (`forbid`) |
+| [`bstr`](https://crates.io/crates/bstr) | Byte-string utilities (YARA engine) | MIT OR Apache-2.0 | 37 |
+| [`yara-x-parser`](https://crates.io/crates/yara-x-parser) | YARA grammar/AST parser (the native engine's front end) | BSD-3-Clause | 5 |
+| [`image`](https://crates.io/crates/image) | Icon/image decoding for fuzzy image hashing | MIT OR Apache-2.0 | 6, plus its codecs below |
+| [`rustdct`](https://crates.io/crates/rustdct) / [`transpose`](https://crates.io/crates/transpose) | DCT for perceptual image hashing | MIT OR Apache-2.0 | 44 / 12 |
+| [`tlsh2`](https://crates.io/crates/tlsh2) | TLSH fuzzy hashing | Apache-2.0 OR BSD-3-Clause | **none** |
+| [`rmp-serde`](https://crates.io/crates/rmp-serde) / [`serde`](https://crates.io/crates/serde) | MessagePack (de)serialization of the prebuilt `.exavdb` | MIT / MIT OR Apache-2.0 | **none** (`forbid`) / 2 |
+| [`rustc-hash`](https://crates.io/crates/rustc-hash) | Fast hashing for internal maps (also in `exav-pe-emu`) | Apache-2.0 OR MIT | **none** |
+| [`thiserror`](https://crates.io/crates/thiserror) | Error-type derive | MIT OR Apache-2.0 | **none** |
+
+`iced-x86` is not linked by any shipped binary. It is a dev-dependency of
+[`exav-x86`](/subprojects/exav-x86/) only, the oracle its differential tests,
+table generator and fuzz target check against.
 
 ## Extraction & decompression (`exav-unpack`)
 
 Also `#![forbid(unsafe_code)]`. The decoders are pure-Rust; there is no C
-compression library in the tree.
+compression library in the tree. Most of these read scanned bytes. The bzip2
+decoder is not a dependency: it is vendored from `bzip2-rs` into
+`formats/bzip2_rs`, with a fix for incompressible blocks, and is as
+`unsafe`-free as the rest of the crate.
 
-| Crate | Purpose | License | `unsafe` posture |
+| Crate | Purpose | License | `unsafe` uses |
 |---|---|---|---|
-| [`flate2`](https://crates.io/crates/flate2) | DEFLATE / gzip / zlib (pure-Rust `miniz_oxide` backend) | MIT OR Apache-2.0 | safe (no C zlib) |
+| [`flate2`](https://crates.io/crates/flate2) | DEFLATE / gzip / zlib (pure-Rust `miniz_oxide` backend) | MIT OR Apache-2.0 | 36 (no C zlib) |
 | [`deflate64`](https://crates.io/crates/deflate64) | Deflate64 (ZIP method 9) | MIT | **none** (`forbid`) |
-| [`bzip2-rs`](https://crates.io/crates/bzip2-rs) | bzip2 (pure Rust) | MIT OR Apache-2.0 | safe |
-| [`xz4rust`](https://crates.io/crates/xz4rust) | XZ / LZMA (pure Rust) | MIT | safe |
-| [`lzma-rust2`](https://crates.io/crates/lzma-rust2) | LZMA / LZMA2 (7z) | Apache-2.0 | safe |
-| [`ruzstd`](https://crates.io/crates/ruzstd) | Zstandard (pure Rust) | MIT | safe |
-| [`lzxd`](https://crates.io/crates/lzxd) | LZX (CAB) | MIT OR Apache-2.0 | safe |
-| [`lzfse_rust`](https://crates.io/crates/lzfse_rust) | LZFSE / LZVN (DMG) | MIT OR Apache-2.0 | safe |
-| [`delharc`](https://crates.io/crates/delharc) | LHA / LZH | MIT OR Apache-2.0 | safe |
-| [`bitstream-io`](https://crates.io/crates/bitstream-io) | Bit-level readers for decoders | MIT OR Apache-2.0 | safe |
-| [`tar`](https://crates.io/crates/tar) | tar archives (`xattr` disabled, which drops its syscall `unsafe`) | MIT OR Apache-2.0 | safe |
-| [`zip`](https://crates.io/crates/zip) | ZIP container parsing | MIT | safe |
-| [`cfb`](https://crates.io/crates/cfb) | OLE2 / Compound File Binary (Office) | MIT | safe |
-| [`quick-xml`](https://crates.io/crates/quick-xml) | OOXML / XML parsing | MIT | safe |
-| [`mail-parser`](https://crates.io/crates/mail-parser) | MIME / email parsing | Apache-2.0 OR MIT | safe |
-| [`apfs`](https://crates.io/crates/apfs) / [`hfsplus`](https://crates.io/crates/hfsplus) | DMG filesystem parsing | MIT | safe |
+| [`xz4rust`](https://crates.io/crates/xz4rust) | XZ / LZMA (pure Rust) | MIT | 3 |
+| [`lzma-rust2`](https://crates.io/crates/lzma-rust2) | LZMA / LZMA2 (7z) | Apache-2.0 | 14 |
+| [`ruzstd`](https://crates.io/crates/ruzstd) | Zstandard (pure Rust) | MIT | 39 |
+| [`lzxd`](https://crates.io/crates/lzxd) | LZX (CAB) | MIT OR Apache-2.0 | **none** |
+| [`lzfse_rust`](https://crates.io/crates/lzfse_rust) | LZFSE / LZVN (DMG) | MIT OR Apache-2.0 | 435 |
+| [`delharc`](https://crates.io/crates/delharc) | LHA / LZH | MIT OR Apache-2.0 | 19 |
+| [`bitstream-io`](https://crates.io/crates/bitstream-io) | Bit-level readers for decoders | MIT OR Apache-2.0 | **none** (`forbid`) |
+| [`tar`](https://crates.io/crates/tar) | tar archives (`xattr` disabled, which drops its syscall crates) | MIT OR Apache-2.0 | 26 |
+| [`zip`](https://crates.io/crates/zip) | ZIP container parsing | MIT | 32 |
+| [`cfb`](https://crates.io/crates/cfb) | OLE2 / Compound File Binary (Office) | MIT | **none** |
+| [`quick-xml`](https://crates.io/crates/quick-xml) | OOXML / XML parsing | MIT | **none** (`forbid`) |
+| [`mail-parser`](https://crates.io/crates/mail-parser) | MIME / email parsing | Apache-2.0 OR MIT | **none** |
+| [`apfs`](https://crates.io/crates/apfs) / [`hfsplus`](https://crates.io/crates/hfsplus) | DMG filesystem parsing | MIT | **none** |
 | [`ext4-view`](https://crates.io/crates/ext4-view) | ext2/3/4 filesystem walking (virtual disks) | MIT OR Apache-2.0 | **none** (`forbid`) |
-| [`fatfs`](https://crates.io/crates/fatfs) | FAT12/16/32 cluster-chain walking | MIT | 13 |
+| [`fatfs`](https://crates.io/crates/fatfs) | FAT12/16/32 cluster-chain walking | MIT | 11 |
 | [`lznt1`](https://crates.io/crates/lznt1) | LZNT1 (NTFS compressed streams) | MIT | **none** (`forbid`) |
 | [`salzweg`](https://crates.io/crates/salzweg) | LZW (ZOO, Unix `compress`) | MIT | **none** |
 | [`unshield`](https://crates.io/crates/unshield) | InstallShield `.z` archives | MIT | **none** |
-| [`byteorder`](https://crates.io/crates/byteorder) / [`bincode`](https://crates.io/crates/bincode) | Byte-order + binary (de)serialization | Unlicense OR MIT / MIT | safe |
+| [`tinyvec`](https://crates.io/crates/tinyvec) | Inline vectors for the vendored bzip2 decoder | Zlib OR Apache-2.0 OR MIT | **none** (`forbid`) |
+| [`byteorder`](https://crates.io/crates/byteorder) / [`bincode`](https://crates.io/crates/bincode) | Byte-order + binary (de)serialization | Unlicense OR MIT / MIT | 40 / 6 |
+
+`bincode` 1.x is unmaintained (RUSTSEC-2025-0141). `deny.toml` records the
+advisory as ignored, with the reason; it only reads the fixed-size header of an
+encrypted DMG.
 
 ### Cryptographic primitives (the `decrypt` feature)
 
 Used only to decrypt encrypted archive members. These are [RustCrypto](https://github.com/RustCrypto)
-crates; their residual `unsafe` is confined to SIMD/CPU-feature detection.
+crates; their residual `unsafe` is SIMD (AES-NI) and CPU-feature detection.
 
-| Crate | Purpose | License | `unsafe` posture |
+| Crate | Purpose | License | `unsafe` uses |
 |---|---|---|---|
-| [`aes`](https://crates.io/crates/aes) / [`cbc`](https://crates.io/crates/cbc) | AES block cipher + CBC (ZIP/7z/DMG) | MIT OR Apache-2.0 | minimal (CPU-feature detection) |
-| [`des`](https://crates.io/crates/des) | DES (legacy archive encryption) | MIT OR Apache-2.0 | safe |
-| [`hmac`](https://crates.io/crates/hmac) / [`pbkdf2`](https://crates.io/crates/pbkdf2) / [`digest`](https://crates.io/crates/digest) | Key derivation + MAC | MIT OR Apache-2.0 | safe |
-| [`constant_time_eq`](https://crates.io/crates/constant_time_eq) | Constant-time comparison | CC0-1.0 OR MIT-0 OR Apache-2.0 | safe |
-| [`stringprep`](https://crates.io/crates/stringprep) | Password normalization | MIT OR Apache-2.0 | safe |
+| [`aes`](https://crates.io/crates/aes) / [`cbc`](https://crates.io/crates/cbc) | AES block cipher + CBC (ZIP/7z/DMG) | MIT OR Apache-2.0 | 110 / **none** (`forbid`) |
+| [`des`](https://crates.io/crates/des) | DES (legacy archive encryption) | MIT OR Apache-2.0 | **none** |
+| [`hmac`](https://crates.io/crates/hmac) / [`pbkdf2`](https://crates.io/crates/pbkdf2) / [`digest`](https://crates.io/crates/digest) | Key derivation + MAC | MIT OR Apache-2.0 | **none** (`forbid`) / **none** / **none** (`forbid`) |
+| [`constant_time_eq`](https://crates.io/crates/constant_time_eq) | Constant-time comparison | CC0-1.0 OR MIT-0 OR Apache-2.0 | 2 |
+| [`stringprep`](https://crates.io/crates/stringprep) | Password normalization | MIT OR Apache-2.0 | **none** |
 
 ## Opt-in dependencies (not in the default binary)
 
-Enabled only by the `http` feature (URL scanning / signature auto-update),
-handled by the separate `exav-update` crate:
+Enabled only by the `http` feature: URL scanning (`exav-core`) and signature
+auto-update (`exav-update`) both use it.
 
 | Crate | Purpose | License | Note |
 |---|---|---|---|
@@ -143,8 +160,9 @@ cargo tree -e no-dev -p exav --prefix none | sed 's/ (\*)$//' \
 Five of those are exav's own workspace crates (`exav`, `exav-core`,
 `exav-unpack`, `exav-pe-emu`, `exav-x86`), and a few crates resolve at two
 versions. None is a C library, a TLS stack or a code generator; `syn`, `quote`
-and `proc-macro2` are build-time proc-macro machinery with no runtime code in the
-binary.
+and `proc-macro2` are build-time proc-macro machinery, and `autocfg`,
+`version_check`, `rustc_version` and `semver` run only in build scripts, so none
+of them has runtime code in the binary.
 
 The `unsafe` column counts occurrences of the `unsafe` keyword in each crate's
 shipped `src/` (comments stripped; tests, benches and examples excluded) at the
@@ -156,7 +174,8 @@ no raw-syscall binding crates: `rustix` and `linux-raw-sys` are kept out by
 without `xattr`. Reproduce the counts with `cargo geiger`, or per crate with:
 
 ```sh
-grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
+find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
+  | xargs -0 sed 's://.*$::' | grep -cw unsafe
 ```
 
 | Crate | License | `unsafe` uses | Pulled in by |
@@ -171,11 +190,12 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`beef`](https://crates.io/crates/beef) | MIT OR Apache-2.0 | 26 | `yara-x-parser` |
 | [`bit-set`](https://crates.io/crates/bit-set) | Apache-2.0 OR MIT | 2 | `fancy-regex` |
 | [`bit-vec`](https://crates.io/crates/bit-vec) | Apache-2.0 OR MIT | 4 | `fancy-regex` |
-| [`bitflags`](https://crates.io/crates/bitflags) | MIT OR Apache-2.0 | 2 | `delharc`, `image`, `yara-x-parser` |
+| [`autocfg`](https://crates.io/crates/autocfg) | Apache-2.0 OR MIT | **none** | build-time: `num-traits` and its users |
+| [`bitflags`](https://crates.io/crates/bitflags) | MIT OR Apache-2.0 | 21 (two versions resolve: 19 + 2) | `delharc`, `ext4-view`, `fatfs`, `image`, `yara-x-parser` |
 | [`block-buffer`](https://crates.io/crates/block-buffer) | MIT OR Apache-2.0 | 4 | `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`block-padding`](https://crates.io/crates/block-padding) | MIT OR Apache-2.0 | 1 | `aes`, `cbc`, `des` |
-| [`bytemuck`](https://crates.io/crates/bytemuck) | Zlib OR Apache-2.0 OR MIT | 318 | `image` |
-| [`cfg-if`](https://crates.io/crates/cfg-if) | MIT OR Apache-2.0 | **none** | `aes`, `bzip2-rs`, `crc32fast`, `flate2`, `image`, `md-5`, `sha1`, `sha2`, `tar`, `zip` |
+| [`bytemuck`](https://crates.io/crates/bytemuck) | Zlib OR Apache-2.0 OR MIT | 309 | `image` |
+| [`cfg-if`](https://crates.io/crates/cfg-if) | MIT OR Apache-2.0 | **none** | `aes`, `crc32fast`, `flate2`, `image`, `md-5`, `sha1`, `sha2`, `tar`, `zip` |
 | [`chrono`](https://crates.io/crates/chrono) | MIT OR Apache-2.0 | 11 | `delharc` |
 | [`cipher`](https://crates.io/crates/cipher) | MIT OR Apache-2.0 | 2 | `aes`, `cbc`, `des` |
 | [`clap_builder`](https://crates.io/crates/clap_builder) | MIT OR Apache-2.0 | **none** (`forbid`) | `clap` |
@@ -190,13 +210,13 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`crypto-common`](https://crates.io/crates/crypto-common) | MIT OR Apache-2.0 | **none** (`forbid`) | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`either`](https://crates.io/crates/either) | MIT OR Apache-2.0 | 2 | `yara-x-parser` |
 | [`equivalent`](https://crates.io/crates/equivalent) | Apache-2.0 OR MIT | **none** | `mail-parser`, `yara-x-parser`, `zip` |
-| [`explode`](https://crates.io/crates/explode) | MIT | 6 | `unshield` |
+| [`explode`](https://crates.io/crates/explode) | MIT | 5 | `unshield` |
 | [`fdeflate`](https://crates.io/crates/fdeflate) | MIT OR Apache-2.0 | **none** (`forbid`) | `image` |
 | [`filetime`](https://crates.io/crates/filetime) | MIT/Apache-2.0 | 9 | `tar` |
 | [`fnv`](https://crates.io/crates/fnv) | Apache-2.0 / MIT | **none** | `cfb`, `yara-x-parser` |
 | [`generic-array`](https://crates.io/crates/generic-array) | MIT | 78 | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`gif`](https://crates.io/crates/gif) | MIT OR Apache-2.0 | **none** (`forbid`) | `image` |
-| [`hashbrown`](https://crates.io/crates/hashbrown) | MIT OR Apache-2.0 | 759 (two versions resolve: 454 + 305) | `mail-parser`, `yara-x-parser`, `zip` |
+| [`hashbrown`](https://crates.io/crates/hashbrown) | MIT OR Apache-2.0 | 751 (two versions resolve: 450 + 301) | `mail-parser`, `yara-x-parser`, `zip` |
 | [`hashify`](https://crates.io/crates/hashify) | Apache-2.0 OR MIT | **none** | `mail-parser` |
 | [`heck`](https://crates.io/crates/heck) | MIT OR Apache-2.0 | **none** (`forbid`) | `clap` |
 | [`iana-time-zone`](https://crates.io/crates/iana-time-zone) | MIT OR Apache-2.0 | 212 | `delharc` |
@@ -206,8 +226,8 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`itertools`](https://crates.io/crates/itertools) | MIT OR Apache-2.0 | 10 | `yara-x-parser` |
 | [`itoa`](https://crates.io/crates/itoa) | MIT OR Apache-2.0 | 13 | `serde_json` |
 | [`jpeg-decoder`](https://crates.io/crates/jpeg-decoder) | MIT OR Apache-2.0 | 16 | `image` |
-| [`lazy_static`](https://crates.io/crates/lazy_static) | MIT OR Apache-2.0 | 2 | `iced-x86`, `yara-x-parser` |
-| [`log`](https://crates.io/crates/log) | MIT OR Apache-2.0 | 6 | `goblin` |
+| [`lazy_static`](https://crates.io/crates/lazy_static) | MIT OR Apache-2.0 | 2 | `yara-x-parser` |
+| [`log`](https://crates.io/crates/log) | MIT OR Apache-2.0 | 6 | `fatfs`, `goblin` |
 | [`logos`](https://crates.io/crates/logos) | MIT OR Apache-2.0 | 18 | `yara-x-parser` |
 | [`logos-codegen`](https://crates.io/crates/logos-codegen) | MIT OR Apache-2.0 | 4 | `yara-x-parser` |
 | [`logos-derive`](https://crates.io/crates/logos-derive) | MIT OR Apache-2.0 | **none** | `yara-x-parser` |
@@ -223,11 +243,13 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`quote`](https://crates.io/crates/quote) | MIT OR Apache-2.0 | **none** | `apfs`, `bincode`, `clap`, `goblin`, `hfsplus`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`rmp`](https://crates.io/crates/rmp) | MIT | 1 | `rmp-serde` |
 | [`rowan`](https://crates.io/crates/rowan) | MIT OR Apache-2.0 | 55 | `yara-x-parser` |
-| [`rustc-hash`](https://crates.io/crates/rustc-hash) | Apache-2.0 OR MIT | **none** | `yara-x-parser` |
+| [`rustc-hash`](https://crates.io/crates/rustc-hash) | Apache-2.0 OR MIT | **none** | a second version (1.x) for `yara-x-parser` |
+| [`rustc_version`](https://crates.io/crates/rustc_version) | MIT OR Apache-2.0 | **none** | build-time: `yara-x-parser` |
 | [`rustfft`](https://crates.io/crates/rustfft) | MIT OR Apache-2.0 | 1419 | `rustdct` |
 | [`same-file`](https://crates.io/crates/same-file) | Unlicense/MIT | 3 | `walkdir` |
 | [`scroll`](https://crates.io/crates/scroll) | MIT | 7 | `goblin` |
 | [`scroll_derive`](https://crates.io/crates/scroll_derive) | MIT | 1 | `goblin` |
+| [`semver`](https://crates.io/crates/semver) | MIT OR Apache-2.0 | 47 | build-time: `yara-x-parser` |
 | [`serde_core`](https://crates.io/crates/serde_core) | MIT OR Apache-2.0 | 2 | `bincode`, `rmp-serde`, `serde`, `serde_json` |
 | [`serde_derive`](https://crates.io/crates/serde_derive) | MIT OR Apache-2.0 | **none** | `bincode`, `rmp-serde`, `serde` |
 | [`simd-adler32`](https://crates.io/crates/simd-adler32) | MIT | 36 | `flate2`, `image`, `zip` |
@@ -238,8 +260,7 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`text-size`](https://crates.io/crates/text-size) | MIT OR Apache-2.0 | **none** (`forbid`) | `yara-x-parser` |
 | [`thiserror-impl`](https://crates.io/crates/thiserror-impl) | MIT OR Apache-2.0 | 1 | `apfs`, `hfsplus`, `thiserror` |
 | [`tiff`](https://crates.io/crates/tiff) | MIT | 2 | `image` |
-| [`tinyvec`](https://crates.io/crates/tinyvec) | Zlib OR Apache-2.0 OR MIT | **none** (`forbid`) | `bzip2-rs`, `stringprep` |
-| [`tinyvec_macros`](https://crates.io/crates/tinyvec_macros) | MIT OR Apache-2.0 OR Zlib | **none** (`forbid`) | `bzip2-rs`, `stringprep` |
+| [`tinyvec_macros`](https://crates.io/crates/tinyvec_macros) | MIT OR Apache-2.0 OR Zlib | **none** (`forbid`) | `tinyvec` |
 | [`twox-hash`](https://crates.io/crates/twox-hash) | MIT | 72 | `ruzstd` |
 | [`typed-path`](https://crates.io/crates/typed-path) | MIT OR Apache-2.0 | 32 | `zip` |
 | [`typenum`](https://crates.io/crates/typenum) | MIT OR Apache-2.0 | **none** (`forbid`) | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
@@ -249,6 +270,7 @@ grep -rc '\bunsafe\b' ~/.cargo/registry/src/*/<crate>-<version>/src/
 | [`unicode-properties`](https://crates.io/crates/unicode-properties) | MIT/Apache-2.0 | **none** | `stringprep` |
 | [`utf8parse`](https://crates.io/crates/utf8parse) | Apache-2.0 OR MIT | 1 | `clap` |
 | [`uuid`](https://crates.io/crates/uuid) | Apache-2.0 OR MIT | 9 | `cfb` |
+| [`version_check`](https://crates.io/crates/version_check) | MIT/Apache-2.0 | **none** | build-time: `generic-array` |
 | [`web-time`](https://crates.io/crates/web-time) | MIT OR Apache-2.0 | **none** | `cfb` |
 | [`weezl`](https://crates.io/crates/weezl) | MIT OR Apache-2.0 | **none** (`forbid`) | `image` |
 | [`zmij`](https://crates.io/crates/zmij) | MIT | 74 | `serde_json` |

@@ -13,45 +13,39 @@ fourth exit code. This guide covers everyday scanning; see the
 exav file.bin                     # scan one file
 exav /var/www                     # scan a directory, recursively
 exav --no-recursive /var/www      # just the directory's own files
-exav --quiet /data                # only print errors and detections
+exav --quiet /data                # only print detections, partial results and errors
 cat file.zip | exav -             # scan stdin
-exav https://host/obj.zip         # scan over HTTP range requests (needs an `http-scan` build + EXAV_ALLOW_HTTP_SCAN=1)
+exav --allow-http-scan https://host/obj.zip   # over HTTP range requests (an `http-scan` build)
 exav -d ./mydb /data              # use a signature database (file or dir)
 ```
 
-All examples assume signatures are loaded, with `-d` / `--sig-dir` or from the
-default `--sig-dir` directory. See [Signatures](/guides/signatures/).
+All examples assume signatures are loaded, with `-d`/`--database`, or from
+`--sig-dir` (default `/var/lib/exav`). See [Signatures](/guides/signatures/).
 
 ### Stdin
 
-Stdin, and a FIFO given as a path, is buffered before it is scanned: in memory
-up to `--spill-threshold-bytes` (16 MiB), then in a temporary file up to
-`--max-spill-bytes` (2 GiB). The buffered stream then gets the same scan as a
-file, with the same options. A stream past `--max-input-bytes` or the spill
-ceiling is treated as a file past `--max-input-bytes`: what was held gets the
-whole scan, and without a detection in it the stream is `LIMITS-EXCEEDED`. See
-[Streaming & memory](/concepts/streaming-memory/).
+Stdin, and a FIFO given as a path, is held before it is scanned (in RAM, then in
+a temporary file past 16 MiB), then gets the same scan as a file. See
+[buffering a stream](/reference/cli/#buffering-a-stream-spill) for the bounds.
 
-### Scanning over HTTP costs bandwidth, not memory
+### Scanning over HTTP
 
-A seekable source may be read more than once. Some checks need a whole object at
-a time (overlapping ZIP records, overlapping partitions, broken media and
-executable headers) while extraction walks members one at a time, so the object
-is read again to run them. Over `http(s)://` a range source is fetched a small,
-constant number of times, and an object under `--max-object-bytes` is likely
-fetched in full.
+An object up to `--max-object-bytes` is read once, in full. A larger one is read
+through range requests as the scan needs it, and some parts of it more than once:
+the checks that look at an object whole (overlapping ZIP records, overlapping
+partitions, broken media and executable headers) read it again after extraction
+has walked the members. A request that continues the previous one fetches twice
+as much, up to 8 MiB, so reading straight through an object takes few requests;
+one elsewhere in it fetches 64 KiB.
 
 To pay in disk instead of transfer (metered egress, a slow link, per-request
 billing), download the object and scan the file:
 
 ```console
-curl -sO https://host/obj.zip && exav obj.zip
+curl -fsSO https://host/obj.zip && exav obj.zip
 ```
 
-Over `--max-object-bytes`, an archive in a streamable format (ZIP, tar, 7z, CAB
-and most others) is still walked member by member, but the checks on its own
-bytes are skipped; one that cannot be streamed (RAR, for instance) is not opened.
-Either way it is reported `LIMITS-EXCEEDED`.
+`-f` matters: without it an error page is saved and scanned as `OK`.
 
 ## Output format
 
@@ -61,41 +55,44 @@ summary:
 ```console
 /path/to/file: Win.Trojan.Agent-1234 FOUND
 /path/to/clean: OK
-/path/to/missing: No such file or directory ERROR
+/path/to/missing: No such file or directory (os error 2) ERROR
 /path/to/huge.bin: file size 9663676416 exceeds max-input-bytes 4294967296; scanned first 4294967296 bytes only LIMITS-EXCEEDED PARTIAL
-/path/to/secret.zip: encrypted archive member PASSWORD-PROTECTED PARTIAL
+/path/to/secret.zip: encrypted ZIP member PASSWORD-PROTECTED PARTIAL
 ```
 
 A file that could not be fully examined ends with the reason, then the
 [category](/reference/verdicts/) of the condition, then the status `PARTIAL`.
 
-`--quiet` suppresses the `OK` lines and the summary; `-v` adds detail.
+`--quiet` suppresses the `OK` lines and the summary, never an error; `-v` adds
+detail.
 
 ### JSON output
 
 `--json` emits newline-delimited JSON: one object per scanned input, then a
-summary object:
+summary object. Keys come out in alphabetical order, and `findings` (the detected
+type, and more with `-v`) is on every result that has any:
 
 ```console
 $ exav --json /data
-{"file":"/data/file","status":"FOUND","signature":"Win.Trojan.Agent-1234","method":"pattern","offset":1234}
-{"file":"/data/clean","status":"OK"}
-{"file":"/data/huge.bin","status":"PARTIAL","category":"LIMITS-EXCEEDED","reason":"file size 9663676416 exceeds max-input-bytes 4294967296; scanned first 4294967296 bytes only"}
-{"summary":{"scanned":3,"infected":1,"partial":1,"errors":0,"data_scanned_bytes":4294972634,"elapsed_secs":0.042}}
+{"file":"/data/file","method":"pattern","offset":1234,"signature":"Win.Trojan.Agent-1234","status":"FOUND"}
+{"file":"/data/clean.txt","findings":[{"detail":"ASCII text","label":"type"}],"status":"OK"}
+{"category":"LIMITS-EXCEEDED","file":"/data/huge.bin","findings":[{"detail":"ASCII text","label":"type"}],"reason":"file size 9663676416 exceeds max-input-bytes 4294967296; scanned first 4294967296 bytes only","status":"PARTIAL"}
+{"summary":{"data_scanned_bytes":4294972634,"elapsed_secs":0.042,"errors":0,"infected":1,"partial":1,"scanned":3}}
 ```
 
 `status` is on every result object and is the word the human line ends with.
 `category` only appears on a `PARTIAL`, so filter on `status`:
 
 ```sh
-exav --json /data | jq 'select(.status=="PARTIAL")'             # not fully examined
-exav --json /data | jq 'select(.status|test("FOUND|PARTIAL"))'  # everything unclean
+exav --json /data | jq 'select(.status=="PARTIAL")'              # not fully examined
+exav --json /data | jq 'select(.status and .status != "OK")'     # everything not clean
 ```
 
 ### Verbose findings
 
-`-v` / `--verbose` prints informational findings (detected file type, entropy,
-imphash, ML score) alongside the verdict.
+`-v` / `--verbose` prints informational findings alongside the verdict: the
+detected file type, and with `--detect exav-heuristics` also the imphash, section
+entropy and the static score.
 
 ## All-match mode
 
@@ -139,16 +136,17 @@ it and scan inside:
 
 ```sh
 exav --passwords secret --passwords hunter2 /data     # tried in order
+exav --passwords-from /etc/exav/passwords /data       # kept out of `ps`
 ```
 
 Passwords also load from a ClamAV `.pwdb` database in the signature directory.
-exav decrypts ZIP (ZipCrypto and WinZip AES), encrypted DMG, 7z AES-256, PDF, and
-Office: legacy XLS (RC4, RC4 CryptoAPI, XOR) and OOXML (AES standard and agile).
-For Office it also tries Excel's default `VelvetSweatshop` and the empty password
-without being asked. RAR AES and PKWARE Strong Encryption are detected but not
-decrypted.
+exav decrypts ZIP (ZipCrypto and WinZip AES), encrypted DMG, 7z AES-256, PDF,
+garbled ARJ, and Office: legacy XLS (RC4, RC4 CryptoAPI, XOR) and OOXML (AES
+standard and agile). For Office it also tries Excel's default `VelvetSweatshop`
+and the empty password without being asked. RAR AES and PKWARE Strong Encryption
+are detected but not decrypted.
 
-An encrypted archive appended to a picture or a document (a polyglot that archive
+An encrypted ZIP appended to a picture or a document (a polyglot that archive
 tools open by its trailing directory) is reported the same way once its structure
 is confirmed.
 
@@ -156,9 +154,9 @@ is confirmed.
 
 A small set of low-false-positive heuristics runs by default, the ones ClamAV
 itself reports (imphash matching and the PDF obfuscated-name check).
-`--detect exav-heuristics` adds exav's own (PE entropy, packer detection, TLSH
-fuzzy matching, a static ML baseline scorer), which carry more false-positive
-risk and are opt-in:
+`--detect exav-heuristics` adds exav's own (TLSH fuzzy matching, a hand-weighted
+static scorer, and a packed-with-injection-imports check), which carry more
+false-positive risk and are opt-in:
 
 ```sh
 exav --detect exav-heuristics -v sample.exe

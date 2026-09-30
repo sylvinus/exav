@@ -155,7 +155,7 @@ For each artifact (`fuzz/artifacts/<target>/{crash,timeout,oom}-*`):
      before slicing, `saturating_*` arithmetic, `.min(len)` clamps on
      attacker-controlled offsets/sizes. A parser must tolerate any byte string.
    - **A third-party decoder** (e.g. `cab`, which panics instead of returning
-     `Err`) → contain it at the **`extract_each` `catch_unwind` boundary**, which
+     `Err`) → contain it at the **`walk` `catch_unwind` boundary**, which
      turns any decoder panic into a clean `LimitHit`. (We can't easily fix the
      dep in place; the boundary makes hostile input a non-event for *every*
      decoder uniformly.)
@@ -179,7 +179,7 @@ Even with every known panic fixed, new ones can hide in deps. The layers:
 | layer | contains | mechanism |
 |-------|----------|-----------|
 | Root-cause fixes in our parsers | our own panics | bounds checks, saturating math |
-| `extract_each` `catch_unwind` | third-party decoder panics | panic → `LimitHit` (never a silent Clean) |
+| `walk` `catch_unwind` | third-party decoder panics | panic → `LimitHit` (never a silent Clean) |
 | Daemon prefork pool | OOM, stack overflow, hangs | per-job `RLIMIT_AS` / `RLIMIT_CPU` / `SIGALRM` → worker `_exit`, recycled |
 | Verdict taxonomy | "couldn't fully scan" | `LimitsExceeded`/`Unscannable` — a not-fully-scanned file is never reported Clean |
 
@@ -194,7 +194,7 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 
 | input            | site                              | root cause                                              | fix |
 |------------------|-----------------------------------|---------------------------------------------------------|-----|
-| `MSCF` cabinet   | `cab-0.6.0` `folder.rs:134`       | dep indexes an empty vector on a crafted cabinet (panics instead of `Err`) | `catch_unwind` boundary in `extract_each` → `Unscannable` |
+| `MSCF` cabinet   | `cab-0.6.0` `folder.rs:134`       | dep indexes an empty vector on a crafted cabinet (panics instead of `Err`) | `catch_unwind` boundary in `walk` → `Unscannable` |
 | `0o070707` cpio  | `formats/cpio.rs` (bin/newc/odc)  | `data_start` from attacker `namesize`, unclamped → `data[start..end]` with start > len | clamp `data_start` to `data.len()` (all 3 variants) |
 | ISO9660          | `formats/iso.rs:54/57`            | dir record's self-declared `rec_len < 33`, then `rec[2..32]` indexed | require `rec_len >= 33` before slicing |
 | UPX (NRV2B/D/E)  | `formats/upx.rs` (4 gamma loops)  | corrupt bitstream doubles the gamma value until `usize` overflow (and downstream `(m-3)*256`) | cap gamma at `NRV_GAMMA_MAX` (`u32::MAX`) → `Unscannable` |

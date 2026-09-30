@@ -18,7 +18,11 @@
 #     container as the sidecar; its NotifyClamd RELOAD is protocol-compatible
 #     with exav's daemon.
 #
-# Run with:  EXAV_SIG_SOURCES=https://database.clamav.net/ docker compose up -d
+# Run with:  EXAV_SIG_SOURCES=https://clamav-mirror.internal/ docker compose up -d
+#
+# The source is a mirror you run (`cvdupdate serve`, or any web server over a
+# `cvdupdate` directory). Cisco's database.clamav.net serves only freshclam and
+# cvdupdate, and blocks other clients.
 
 services:
   exav:
@@ -41,6 +45,9 @@ services:
       EXAV_SIG_SOURCES: "${EXAV_SIG_SOURCES:?set EXAV_SIG_SOURCES to one or more signature sources you trust — a CVD mirror base ends in /}"
     volumes:
       - exav-db:/var/lib/exav
+    # The image's health check pings a listener, and this container has none.
+    healthcheck:
+      disable: true
     restart: unless-stopped
 
 volumes:

@@ -28,6 +28,7 @@
 //! exactly whatever their provenance.
 
 use super::decode::Operand;
+use crate::byte_source::{ByteSource, CHUNK};
 use super::instr::{Body, Function, Inst};
 use super::instr::{OP_GEP1, OP_ICMP_FIRST, OP_ICMP_LAST, OP_SEXT, OP_TRUNC, OP_ZEXT};
 use super::types::{Globals, TypeTable};
@@ -316,6 +317,10 @@ pub struct Outcome {
     /// True if the program used an unimplemented op/API or made an
     /// out-of-bounds access. The result is then unreliable and must be ignored.
     pub hit_unsupported: bool,
+    /// True if the program stopped before it finished (out of steps, or the VM
+    /// panicked): what it would have found is unknown, so the scan is
+    /// incomplete.
+    pub incomplete: bool,
     /// Buffers the program extracted (via `write`+`extract_new`) for the engine
     /// to recursively re-scan (how unpacker programs surface embedded files).
     pub extracted: Vec<Vec<u8>>,
@@ -335,30 +340,22 @@ pub struct PdfCtx {
 
 /// Scan a PDF for `id gen obj` markers, returning a [`PdfCtx`] (objects sorted
 /// by offset). This mirrors what the PDF parser feeds the bytecode.
-pub fn pdf_ctx(data: &[u8]) -> PdfCtx {
+pub fn pdf_ctx(data: &dyn ByteSource) -> PdfCtx {
     let mut objs = Vec::new();
-    for pos in memchr::memmem::find_iter(data, b" obj") {
+    let mut from = 0;
+    // " obj" cannot overlap itself, so one byte on finds every occurrence.
+    while let Some(pos) = data.find(b" obj", from, data.len()) {
+        from = pos + 1;
         // Before " obj": "<id> <gen>". Walk back over gen digits, a space, id.
-        let mut i = pos;
-        let back_digits = |i: &mut usize| {
-            let s = *i;
-            while *i > 0 && data[*i - 1].is_ascii_digit() {
-                *i -= 1;
-            }
-            s != *i
-        };
-        if !back_digits(&mut i) || i == 0 || data[i - 1] != b' ' {
+        let (i, _) = digits_before(data, pos);
+        if i == pos || i == 0 || data.window(i - 1, 1)[..] != *b" " {
             continue;
         }
-        i -= 1; // the space
-        let id_end = i;
-        if !back_digits(&mut i) || id_end == i {
+        let id_end = i - 1; // the space
+        let (i, id) = digits_before(data, id_end);
+        if i == id_end {
             continue;
         }
-        let id: u32 = std::str::from_utf8(&data[i..id_end])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
         objs.push((id, i as u32));
         if objs.len() >= 8192 {
             break;
@@ -371,9 +368,51 @@ pub fn pdf_ctx(data: &[u8]) -> PdfCtx {
     }
 }
 
+/// Where the run of ASCII digits ending at `end` starts, and its value as
+/// `str::parse::<u32>` reads it (0 when it does not fit). Read backwards a
+/// window at a time, so a long run costs no more memory than a short one.
+fn digits_before(data: &dyn ByteSource, end: usize) -> (usize, u32) {
+    let mut start = end;
+    let mut value = 0u64;
+    let mut overflow = false;
+    // 10 to the power of the digits read so far, until it passes `u32::MAX`:
+    // past that, any digit but 0 overflows.
+    let mut scale = Some(1u64);
+    let mut span = 64;
+    loop {
+        let from = start.saturating_sub(span);
+        let w = data.window(from, start - from);
+        if w.len() != start - from {
+            // Unreadable: the run ends where reading did.
+            return (start, if overflow { 0 } else { value as u32 });
+        }
+        for (k, &b) in w.iter().enumerate().rev() {
+            if !b.is_ascii_digit() {
+                return (from + k + 1, if overflow { 0 } else { value as u32 });
+            }
+            let d = (b - b'0') as u64;
+            if d != 0 {
+                match scale {
+                    Some(s) => {
+                        value += d * s;
+                        overflow |= value > u32::MAX as u64;
+                    }
+                    None => overflow = true,
+                }
+            }
+            scale = scale.and_then(|s| s.checked_mul(10)).filter(|&s| s <= 1 << 40);
+        }
+        if from == 0 {
+            return (0, if overflow { 0 } else { value as u32 });
+        }
+        start = from;
+        span = (span * 2).min(CHUNK);
+    }
+}
+
 /// Execution context for one run.
 pub struct Ctx<'a> {
-    pub file: &'a [u8],
+    pub file: &'a dyn ByteSource,
     pub flevel: u32,
     /// The program's decoded type table (`T` record).
     pub types: &'a TypeTable,
@@ -807,13 +846,13 @@ impl<'a> Machine<'a> {
                     .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
                     .max(0) as usize;
                 let avail = self.ctx.file.len().saturating_sub(self.cursor).min(size);
+                let bytes = self.ctx.file.window(self.cursor, avail);
                 if let Some(op) = args.first() {
                     let p = self.ptr(fi, op);
-                    let bytes = self.ctx.file[self.cursor..self.cursor + avail].to_vec();
                     self.write_region(p, &bytes);
                 }
-                self.cursor += avail;
-                avail as i64
+                self.cursor += bytes.len();
+                bytes.len() as i64
             }
             Api::Seek => {
                 let off = self.value_nat(fi, args.first().unwrap_or(&Operand::Const(0)));
@@ -841,10 +880,9 @@ impl<'a> Machine<'a> {
             }
             Api::FileByteAt => {
                 let off = self.value_nat(fi, args.first().unwrap_or(&Operand::Const(0)));
-                if off >= 0 && (off as usize) < self.ctx.file.len() {
-                    self.ctx.file[off as usize] as i64
-                } else {
-                    -1
+                match usize::try_from(off).ok().map(|o| self.ctx.file.window(o, 1)) {
+                    Some(b) if b.len() == 1 => b[0] as i64,
+                    _ => -1,
                 }
             }
             Api::FileFind | Api::FileFindLimit => {
@@ -866,9 +904,8 @@ impl<'a> Machine<'a> {
                     return -1;
                 }
                 let end = limit.min(self.ctx.file.len());
-                let hay = self.ctx.file.get(self.cursor..end).unwrap_or(&[]);
-                match find_sub(hay, &pat) {
-                    Some(i) => (self.cursor + i) as i64,
+                match self.ctx.file.find(&pat, self.cursor, end) {
+                    Some(at) => at as i64,
                     None => -1,
                 }
             }
@@ -914,8 +951,8 @@ impl<'a> Machine<'a> {
                 // disasm_x86(result, len): decode one instruction at the cursor
                 // into the caller's DISASM_RESULT; return the offset just past
                 // it (the cursor is not advanced, matching the ABI).
-                let n = self.ctx.file.len().saturating_sub(self.cursor).min(32);
-                let bytes = self.ctx.file[self.cursor..self.cursor + n].to_vec();
+                let bytes = self.ctx.file.window(self.cursor, 32).into_owned();
+                let n = bytes.len();
                 match super::disasm::disasm_one(&bytes) {
                     Some((res, len)) => {
                         if self.trace {
@@ -1206,19 +1243,31 @@ impl<'a> Machine<'a> {
     fn read_number(&mut self, radix: u32) -> i64 {
         let is_digit = |b: u8| b.is_ascii_digit() || (radix == 16 && b.is_ascii_hexdigit());
         let file = self.ctx.file;
-        let Some(start) = (self.cursor..file.len()).find(|&i| is_digit(file[i])) else {
+        // The value of the first run of digits at or after the cursor, as
+        // `i64::from_str_radix` reads it: 0 once it overflows.
+        let mut value = Some(0i64);
+        let mut started = false;
+        let mut end = None;
+        file.chunks(self.cursor, file.len(), &mut |at, chunk| {
+            for (k, &b) in chunk.iter().enumerate() {
+                if is_digit(b) {
+                    started = true;
+                    let d = (b as char).to_digit(radix).unwrap_or(0) as i64;
+                    value = value
+                        .and_then(|v| v.checked_mul(radix as i64))
+                        .and_then(|v| v.checked_add(d));
+                } else if started {
+                    end = Some(at + k);
+                    return false;
+                }
+            }
+            true
+        });
+        if !started {
             return -1;
-        };
-        let mut end = start;
-        while end < file.len() && is_digit(file[end]) {
-            end += 1;
         }
-        let v = std::str::from_utf8(&file[start..end])
-            .ok()
-            .and_then(|s| i64::from_str_radix(s, radix).ok())
-            .unwrap_or(0);
-        self.cursor = end;
-        v
+        self.cursor = end.unwrap_or(file.len());
+        value.unwrap_or(0)
     }
 
     fn gep(&mut self, fi: usize, opcode: u8, first_ty: u32, base: &Operand, idx: &Operand) -> i64 {
@@ -1709,6 +1758,7 @@ pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
         detection: m.detection,
         steps: m.steps,
         hit_unsupported: m.unsupported,
+        incomplete: m.steps > MAX_STEPS,
         extracted: m.extracted,
         stubbed: m.stubbed.into_iter().collect(),
     }
@@ -1790,7 +1840,7 @@ mod tests {
     }
 
     fn ctx<'a>(
-        file: &'a [u8],
+        file: &'a dyn ByteSource,
         apis: &'a [(u32, String)],
         globals: &'a Globals,
         types: &'a TypeTable,
@@ -1984,6 +2034,7 @@ mod tests {
         let out = run(&funcs, 0, &ctx(b"", &apis, &globals, &types));
         assert!(out.steps <= MAX_STEPS + 1);
         assert!(out.detection.is_none());
+        assert!(out.incomplete, "a program cut short is not one that found nothing");
     }
 
     #[test]
@@ -2014,5 +2065,108 @@ mod tests {
     fn find_sub_works() {
         assert_eq!(find_sub(b"hello world", b"world"), Some(6));
         assert_eq!(find_sub(b"hello", b"xyz"), None);
+    }
+
+    /// The object table as it was computed over a slice, before the file was a
+    /// source.
+    fn slice_pdf_objs(data: &[u8]) -> Vec<(u32, u32)> {
+        let mut objs = Vec::new();
+        for pos in memchr::memmem::find_iter(data, b" obj") {
+            let mut i = pos;
+            let back_digits = |i: &mut usize| {
+                let s = *i;
+                while *i > 0 && data[*i - 1].is_ascii_digit() {
+                    *i -= 1;
+                }
+                s != *i
+            };
+            if !back_digits(&mut i) || i == 0 || data[i - 1] != b' ' {
+                continue;
+            }
+            i -= 1;
+            let id_end = i;
+            if !back_digits(&mut i) || id_end == i {
+                continue;
+            }
+            let id: u32 = std::str::from_utf8(&data[i..id_end])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            objs.push((id, i as u32));
+        }
+        objs.sort_by_key(|&(_, start)| start);
+        objs
+    }
+
+    fn pdf_like() -> Vec<u8> {
+        let mut d = b"%PDF-1.7\n1 0 obj\n".to_vec();
+        d.extend_from_slice(b"x 12 0 obj 4294967295 0 obj 4294967297 3 obj");
+        d.extend_from_slice(b" 00000000000000000000000000000000000000000000000000000000000000000000000000000000007 0 obj");
+        d.extend_from_slice(b" 100000000000000000000000000000000000000000000000000000000000000000000000000000000000 1 obj");
+        d.extend_from_slice(b"nospace0 obj 5  0 obj  obj 0 obj 9 obj");
+        let mut long = vec![b'1'; 3 * CHUNK];
+        long.extend_from_slice(b" 0 obj");
+        d.extend_from_slice(&long);
+        d.extend_from_slice(b" 42 7 obj");
+        d
+    }
+
+    #[test]
+    fn the_pdf_object_table_is_the_same_read_in_blocks() {
+        let d = pdf_like();
+        let want = slice_pdf_objs(&d);
+        assert!(want.len() >= 6, "the table must hold what the input plants: {want:?}");
+        let cache = crate::byte_source::BlockCache::with_sizes(std::io::Cursor::new(d.clone()), 5, 20)
+            .unwrap();
+        assert_eq!(pdf_ctx(&d).objs, want);
+        assert_eq!(pdf_ctx(&cache).objs, want);
+    }
+
+    /// `read_number` as it was over a slice.
+    fn slice_read_number(file: &[u8], cursor: usize, radix: u32) -> (i64, usize) {
+        let is_digit = |b: u8| b.is_ascii_digit() || (radix == 16 && b.is_ascii_hexdigit());
+        let Some(start) = (cursor..file.len()).find(|&i| is_digit(file[i])) else {
+            return (-1, cursor);
+        };
+        let mut end = start;
+        while end < file.len() && is_digit(file[end]) {
+            end += 1;
+        }
+        let v = std::str::from_utf8(&file[start..end])
+            .ok()
+            .and_then(|s| i64::from_str_radix(s, radix).ok())
+            .unwrap_or(0);
+        (v, end)
+    }
+
+    #[test]
+    fn read_number_reads_what_it_read_over_a_slice() {
+        let mut d = b"abc 123 x 0x7fffffffffffffff z 9223372036854775807 9223372036854775808 ".to_vec();
+        d.extend_from_slice(b"FfEe 00000000000000000000000000000000000000000000042 q");
+        d.extend(std::iter::repeat_n(b'5', 3 * CHUNK));
+        d.extend_from_slice(b" 77");
+        let (apis, globals, types) = (Vec::<(u32, String)>::new(), Globals::default(), TypeTable::default());
+        let cache = crate::byte_source::BlockCache::with_sizes(std::io::Cursor::new(d.clone()), 3, 12)
+            .unwrap();
+        for radix in [10, 16] {
+            for src in [&d as &dyn ByteSource, &cache] {
+                let c = Ctx {
+                    file: src,
+                    ..ctx(&d, &apis, &globals, &types)
+                };
+                let mut m = machine(&c);
+                let mut cursor = 0;
+                loop {
+                    let want = slice_read_number(&d, cursor, radix);
+                    m.cursor = cursor;
+                    let got = m.read_number(radix);
+                    assert_eq!((got, m.cursor), want, "radix {radix} from {cursor}");
+                    if want.0 == -1 {
+                        break;
+                    }
+                    cursor = want.1;
+                }
+            }
+        }
     }
 }

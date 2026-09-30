@@ -17,7 +17,8 @@
 //! cat one.lz4 eicar.lz4 > two_frames.lz4
 //! ```
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 /// `sha256sum` of what `lz4 -dc` writes for each fixture.
 const ONE: &str = "30c2abfccdf15a28990bae7bb0efa2444d82af3ce7053ff493956ef9612f775d";

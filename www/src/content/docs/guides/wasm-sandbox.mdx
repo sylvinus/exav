@@ -22,7 +22,8 @@ host.
 
 <Steps>
 
-1. Build the WASM module:
+1. Build the WASM module, or download `exav-wasm-<tag>-wasm32-wasip1.wasm` from
+   a [release](https://github.com/sylvinus/exav/releases):
 
    ```sh
    rustup target add wasm32-wasip1
@@ -36,40 +37,46 @@ host.
    wasm-tools strip -a target/wasm32-wasip1/release/exav-wasm.wasm -o exav.wasm
    ```
 
-3. Scan a file under wasmtime, with the signatures mounted at `/db`:
+3. Scan a file under wasmtime, with the signatures mounted at `/db` and the
+   files to scan at `/files`:
 
    ```sh
    wasmtime \
      --dir /path/to/sigs::/db \
-     --dir .::. \
+     --dir /path/to/files::/files \
      exav.wasm \
-     /db malware.exe
+     /db /files/malware.exe
    ```
 
 </Steps>
 
-`--dir /path/to/sigs::/db` mounts the signature directory at `/db`, and
-`--dir .::.` mounts the working directory so relative paths work.
+The first argument is the database: a directory of signature files, or a
+[prebuilt `.exavdb`](/guides/prebuilt-database/) file. One that loads no real
+signatures is refused, as the native `exav` refuses it. Mount only the
+directories the module needs.
 
 ## Output
 
-Each scanned file produces one JSON `ScanReport` on stdout; progress and errors
-go to stderr:
+Each file gives one JSON object on stdout, in argument order: the `ScanReport`
+plus `"file"`, or `"file"` and `"error"` for a file that could not be read.
+Progress goes to stderr:
 
 ```sh
-wasmtime --dir ./sigs::/db --dir .::. exav.wasm /db *.exe 2>/dev/null | jq '.verdict'
+wasmtime --dir ./sigs::/db --dir ./in::/in exav.wasm /db /in/a.exe /in/b.zip /in/gone \
+  2>/dev/null | jq -c .
 ```
 
 ```json
-{"verdict":"Clean","findings":[{"label":"type","detail":"PE32+ executable"}]}
-{"verdict":{"Infected":{"signature":"Win.Trojan.Agent-1234","offset":4096,"method":"Pattern"}},"findings":[]}
-{"verdict":{"LimitsExceeded":{"reason":"scan-size limit"}},"findings":[]}
+{"file":"/in/a.exe","findings":[{"detail":"PE","label":"type"}],"verdict":"Clean"}
+{"file":"/in/b.zip","findings":[],"verdict":{"Infected":{"method":"Pattern","offset":4096,"signature":"Win.Trojan.Agent-1234"}}}
+{"error":"No such file or directory (os error 44)","file":"/in/gone"}
 ```
 
 `Verdict` variants: `Clean`, `Infected`, `LimitsExceeded`, `Unscannable`,
-`PasswordProtected`.
+`PasswordProtected`. The exit code is the native `exav`'s: `0` clean, `1` a
+detection, `2` an error, `3` a file not fully examined.
 
-## Why this matters
+## What the sandbox changes
 
 Loading third-party signatures makes the signature parser part of your attack
 surface: a malicious `.ndb` could aim for a parser bug, excessive allocation, or
@@ -80,7 +87,7 @@ sandbox:
 |---|---|---|
 | Signature trust | full host access | a memory-limited WASM instance |
 | Runtime | exav itself | wasmtime or another WASI runtime |
-| Blast radius | the host | the module, optionally fuel-limited |
+| What a bug can reach | the host | the module's own memory and mounted directories |
 | Custom host code | n/a | none |
 | Speed | native | slower |
 
@@ -88,7 +95,8 @@ sandbox:
   memory.
 - **No ambient system access:** WASI limits file access to the mounted paths,
   and the module has no network.
-- **Fuel limits:** wasmtime can cap instruction counts and stop a runaway module.
+- **Instruction limits:** wasmtime can give the module a budget of executed
+  instructions ("fuel") and stop it when that runs out.
 - **Panic isolation:** a panic becomes a wasmtime trap; the host is unaffected.
 
 <Aside type="tip" title="No custom host code">
@@ -104,8 +112,8 @@ host is the runtime itself, not code exav wrote. Any runtime supporting
 - **No stdin:** files must be on a mounted filesystem.
 - **No HTTP(S) scanning:** the module cannot make network requests.
 - **Database size:** `wasm32` memory tops out at 4 GiB, and building the full
-  raw ClamAV database needs more. Use a
-  [prebuilt database](/guides/prebuilt-database/) for large signature sets.
+  raw ClamAV database comes close. Give it a
+  [prebuilt database](/guides/prebuilt-database/) built natively.
 
 ## Alternatives
 

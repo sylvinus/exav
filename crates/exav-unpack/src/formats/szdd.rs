@@ -11,6 +11,7 @@
 //! 12 bits, so truncated/hostile streams decode partially without panicking.
 
 use crate::*;
+use std::io::Read;
 
 const SZDD_MAGIC: &[u8; 8] = b"SZDD\x88\xF0\x27\x33";
 const KWAJ_MAGIC: &[u8; 8] = b"KWAJ\x88\xF0\x27\xD1";
@@ -33,63 +34,145 @@ pub(crate) fn extract_szdd<R>(
     }
 }
 
-/// Decode the SZDD LZSS stream starting at `input`, stopping at `declared`
-/// output bytes or input exhaustion. Never panics: the ring index is masked and
-/// every input read is `get`-guarded.
-fn lzss_decompress(input: &[u8], declared: usize, cap: u64) -> Result<Vec<u8>, LimitHit> {
-    const WIN: usize = 4096;
-    let mut window = [0x20u8; WIN];
-    let mut wpos = WIN - 16; // 4080
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < input.len() && out.len() < declared {
-        let flags = input[i];
-        i += 1;
-        for bit in 0..8 {
-            if out.len() >= declared {
+/// Walk an MS-Compress file. SZDD is decoded as it is read; KWAJ is decoded
+/// whole.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    use crate::stream::{emit_stream, whole, MemberMeta};
+    let hdr = src.window(0, 14);
+    if !hdr.starts_with(SZDD_MAGIC) {
+        return whole(Format::Szdd, src, budget, visit);
+    }
+    if hdr.len() < 14 {
+        return Err(LimitHit::corrupt("szdd: truncated header".to_string()));
+    }
+    let declared = u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as u64;
+    budget.count_entry()?;
+    let mut body = crate::source::Reader::range(src, 14, src.len());
+    let mut rdr = SzddReader::new(&mut body, declared);
+    let meta = MemberMeta {
+        name: szdd_name(&hdr),
+        comp_size: (src.len() - 14) as u64,
+        size: Some(declared),
+        encrypted: false,
+        unsupported: None,
+    };
+    emit_stream(&meta, &mut rdr, budget, visit)
+}
+
+/// SZDD's LZSS decoder as a `Read`: a 4 KiB ring preset to spaces, driven by
+/// flag bytes whose bits select a literal (1) or a 12-bit offset and 4-bit
+/// length back-reference (0). Output stops at the declared size or when the
+/// input runs out. The ring index is masked, so hostile input cannot panic.
+struct SzddReader<'a> {
+    src: &'a mut dyn Read,
+    window: [u8; 4096],
+    wpos: usize,
+    declared: u64,
+    produced: u64,
+    out: [u8; 18], // one token emits at most 18 bytes (back-reference length 3..18)
+    out_len: usize,
+    out_pos: usize,
+    flags: u32,
+    bits_left: u8,
+    done: bool,
+}
+
+impl<'a> SzddReader<'a> {
+    fn new(src: &'a mut dyn Read, declared: u64) -> Self {
+        Self {
+            src,
+            window: [0x20u8; 4096],
+            wpos: 4096 - 16,
+            declared,
+            produced: 0,
+            out: [0u8; 18],
+            out_len: 0,
+            out_pos: 0,
+            flags: 0,
+            bits_left: 0,
+            done: false,
+        }
+    }
+    fn next_byte(&mut self) -> std::io::Result<Option<u8>> {
+        let mut b = [0u8; 1];
+        match self.src.read(&mut b)? {
+            0 => Ok(None),
+            _ => Ok(Some(b[0])),
+        }
+    }
+    fn emit(&mut self, b: u8) {
+        self.out[self.out_len] = b;
+        self.out_len += 1;
+        self.window[self.wpos] = b;
+        self.wpos = (self.wpos + 1) & 4095;
+        self.produced += 1;
+    }
+}
+
+impl Read for SzddReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut w = 0;
+        while w < buf.len() {
+            if self.out_pos < self.out_len {
+                buf[w] = self.out[self.out_pos];
+                self.out_pos += 1;
+                w += 1;
+                continue;
+            }
+            if self.done || self.produced >= self.declared {
                 break;
             }
-            if (flags >> bit) & 1 == 1 {
-                // Literal byte.
-                let Some(&b) = input.get(i) else {
-                    return finish(out, cap);
-                };
-                i += 1;
-                out.push(b);
-                window[wpos] = b;
-                wpos = (wpos + 1) & (WIN - 1);
+            self.out_len = 0;
+            self.out_pos = 0;
+            if self.bits_left == 0 {
+                match self.next_byte()? {
+                    Some(f) => {
+                        self.flags = f as u32;
+                        self.bits_left = 8;
+                    }
+                    None => {
+                        self.done = true;
+                        break;
+                    }
+                }
+            }
+            let is_literal = (self.flags & 1) == 1;
+            self.flags >>= 1;
+            self.bits_left -= 1;
+            if is_literal {
+                match self.next_byte()? {
+                    Some(b) => self.emit(b),
+                    None => {
+                        self.done = true;
+                        break;
+                    }
+                }
             } else {
-                // Back-reference: two bytes -> 12-bit offset + 4-bit length.
-                let (Some(&b0), Some(&b1)) = (input.get(i), input.get(i + 1)) else {
-                    return finish(out, cap);
+                let (b0, b1) = match (self.next_byte()?, self.next_byte()?) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => {
+                        self.done = true;
+                        break;
+                    }
                 };
-                i += 2;
                 let mut mpos = (b0 as usize) | (((b1 as usize) & 0xF0) << 4);
                 let len = ((b1 as usize) & 0x0F) + 3;
                 for _ in 0..len {
-                    if out.len() >= declared {
+                    if self.produced >= self.declared {
                         break;
                     }
-                    let b = window[mpos & (WIN - 1)];
-                    out.push(b);
-                    window[wpos] = b;
-                    wpos = (wpos + 1) & (WIN - 1);
+                    let b = self.window[mpos & 4095];
+                    self.emit(b);
                     mpos = mpos.wrapping_add(1);
                 }
             }
-            if out.len() as u64 > cap {
-                return Err(LimitHit::new("szdd member exceeds budget".to_string()));
-            }
         }
+        Ok(w)
     }
-    finish(out, cap)
-}
-
-fn finish(out: Vec<u8>, cap: u64) -> Result<Vec<u8>, LimitHit> {
-    if out.len() as u64 > cap {
-        return Err(LimitHit::new("szdd member exceeds budget".to_string()));
-    }
-    Ok(out)
 }
 
 fn extract_szdd_inner<R>(
@@ -101,15 +184,19 @@ fn extract_szdd_inner<R>(
     if data.len() < 14 {
         return Err(LimitHit::corrupt("szdd: truncated header".to_string()));
     }
-    let declared = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
-    let body = &data[14..];
+    let declared = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as u64;
+    let mut body = &data[14..];
 
     budget.count_entry()?;
     let cap = budget.reserve()?;
-    // Clamp the attacker-declared size so a huge value can't drive a giant
-    // allocation; the ratio/total caps still bound the real output.
-    let want = declared.min((cap as usize).saturating_add(1));
-    let out = lzss_decompress(body, want, cap)?;
+    let mut out = Vec::new();
+    // Reading a slice cannot fail.
+    let _ = SzddReader::new(&mut body, declared)
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut out);
+    if out.len() as u64 > cap {
+        return Err(LimitHit::new("szdd member exceeds budget".to_string()));
+    }
     budget.commit(out.len() as u64);
     if let Some(r) = visit(Entry::new(szdd_name(data), out), budget) {
         return Ok(Some(r));

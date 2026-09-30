@@ -6,7 +6,8 @@
 //! and a short member gets scanned and found clean on content that is not
 //! there. Three cpio header flavours share the bug and the fix.
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 /// A `newc`-format cpio header. All fields are 8-char hex, ASCII.
 fn newc(name: &str, filesize: u32) -> Vec<u8> {

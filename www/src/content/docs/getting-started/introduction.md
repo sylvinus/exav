@@ -38,21 +38,21 @@ $ exav -d ~/.cvdupdate/database suspicious.bin
 suspicious.bin: Win.Trojan.Agent-1234 FOUND
 ```
 
-A stream on stdin is scanned like a file. It is held in memory up to
-`--spill-threshold-bytes` (16 MiB) and in a temporary file past that, up to
-`--max-spill-bytes` (2 GiB):
+A stream on stdin is scanned like a file:
 
 ```console
-$ curl -s https://example.com/download.zip | exav -d /var/lib/exav -
+$ curl -fsS https://example.com/download.zip | exav -d /var/lib/exav -
 stdin: OK
 ```
 
-Load the database once and serve it over either protocol, or both:
+Load the database once and serve it over either protocol, or both (neither
+protocol authenticates its clients, so bind to an interface only trusted clients
+reach):
 
 ```console
-$ exav --listen clamd://0.0.0.0:3310 --listen icap://0.0.0.0:1344 -d /var/lib/exav
+$ exav --listen clamd://127.0.0.1:3310 --listen icap://127.0.0.1:1344 -d /var/lib/exav
 exav: prefork daemon: 4 workers; per-job limits: wall 120s, mem 2048 MiB, cpu 120s; recycle every 1000 jobs
-exav: serving ICAP on tcp:0.0.0.0:1344 (services: avscan, srv_clamav, virus_scan; preview 4096 B)
+exav: serving ICAP on tcp:127.0.0.1:1344 (services: avscan, srv_clamav, virus_scan; preview 4096 B)
 ```
 
 One process and one loaded database replace a `c-icap` + `clamav` container
@@ -63,9 +63,9 @@ coverage:
 
 ```console
 $ exav suspicious.bin
-exav: no signature database loaded — refusing to run (it would report real
-malware as clean). Load signatures with -d/--sig-dir, or pass --allow-no-db
-to use the built-in EICAR-only baseline (testing only).
+exav: no signature database loaded, refusing to run (it would report real
+malware as clean). Load signatures with -d/--database or --sig-dir, or pass
+--allow-no-db to use the built-in EICAR-only baseline (testing only).
 ```
 
 ## Where to next

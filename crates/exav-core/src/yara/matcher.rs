@@ -3,12 +3,14 @@
 //! Each YARA string/pattern is lowered to a [`PatternMatcher`] that, given a
 //! buffer, produces the list of match offsets+lengths. Three kinds:
 //!
-//! * `Literal` — text patterns (with `nocase`/`ascii`/`wide`/`xor`/`base64`/
+//! * `Literal`: text patterns (with `nocase`/`ascii`/`wide`/`xor`/`base64`/
 //!   `base64wide`/`fullword` handled by expanding into concrete needles).
-//! * `Regex` — regexp patterns, run anchored at every start offset so that
+//! * `Regex`: regexp patterns, run anchored at every start offset so that
 //!   overlapping matches are reported the way YARA does.
-//! * `Hex` — hex patterns, lowered to an equivalent byte regexp and run like
+//! * `Hex`: hex patterns, lowered to an equivalent byte regexp and run like
 //!   `Regex` (YARA hex jumps behave like lazy `.{a,b}?` over *any* byte).
+
+use std::ops::Range;
 
 use base64::Engine;
 use regex_automata::{meta, meta::Regex, util::syntax, Input};
@@ -16,6 +18,8 @@ use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::ParserBuilder;
 use serde::{Deserialize, Serialize};
 
+use crate::byte_source::{ByteSource, CHUNK};
+use crate::stream_regex::{GaveUp, StreamRegex};
 use crate::yara::error::{Error, Result};
 
 /// A single match: byte offset and length within the scanned buffer.
@@ -84,8 +88,8 @@ pub(crate) struct Base64Sub {
 // A [`PatternMatcher`] holds a compiled `regex_automata::meta::Regex` (and a
 // `base64` engine), neither of which is serde-serializable and neither of which
 // can hand back the source it was built from. So the on-disk database does NOT
-// store the compiled matcher; it stores a [`PatternDef`] — the pattern's
-// *definition* (regex source + flags, or the literal/base64 needle bytes) — from
+// store the compiled matcher; it stores a [`PatternDef`], the pattern's
+// *definition* (regex source + flags, or the literal/base64 needle bytes), from
 // which [`PatternDef::compile`] rebuilds an identical `PatternMatcher` on load.
 // Rebuilding a single pattern's regex is cheap; the aggregate cost that the
 // serialized database avoids is the daachorse atom-automaton build (see
@@ -221,22 +225,42 @@ fn is_word(b: u8) -> bool {
 /// `verify_full_word` (fullword modifier: neighbours must be non-alphanumeric;
 /// underscore is NOT a word byte here, unlike regex `\b`).
 fn verify_full_word(data: &[u8], start: usize, end: usize, wide: bool, xor_key: u8) -> bool {
+    let before = &data[start.saturating_sub(2)..start];
+    let after = &data[end..(end + 2).min(data.len())];
+    full_word_between(before, after, wide, xor_key)
+}
+
+/// [`verify_full_word`] given the (up to) two bytes before the match and the
+/// (up to) two bytes after it.
+fn full_word_between(before: &[u8], after: &[u8], wide: bool, xor_key: u8) -> bool {
     if wide {
-        if start >= 2 && (data[start - 1] ^ xor_key) == 0 && is_word(data[start - 2] ^ xor_key) {
-            return false;
+        if let [a, b] = before {
+            if (b ^ xor_key) == 0 && is_word(a ^ xor_key) {
+                return false;
+            }
         }
-        if end + 1 < data.len() && (data[end + 1] ^ xor_key) == 0 && is_word(data[end] ^ xor_key) {
-            return false;
+        if let [a, b] = after {
+            if (b ^ xor_key) == 0 && is_word(a ^ xor_key) {
+                return false;
+            }
         }
     } else {
-        if start >= 1 && is_word(data[start - 1] ^ xor_key) {
+        if before.last().is_some_and(|b| is_word(b ^ xor_key)) {
             return false;
         }
-        if end < data.len() && is_word(data[end] ^ xor_key) {
+        if after.first().is_some_and(|b| is_word(b ^ xor_key)) {
             return false;
         }
     }
     true
+}
+
+/// [`verify_full_word`] over a source, reading only the neighbours.
+fn full_word_in(src: &dyn ByteSource, start: usize, end: usize, wide: bool) -> bool {
+    let from = start.saturating_sub(2);
+    let before = src.window(from, start - from);
+    let after = src.window(end, 2);
+    full_word_between(&before, &after, wide, 0)
 }
 
 #[inline]
@@ -262,11 +286,160 @@ fn needle_hit(data: &[u8], pos: usize, n: &Needle, key: u8) -> bool {
     true
 }
 
+/// Matches one pattern keeps. Past it the rest are dropped and the pattern's
+/// search is incomplete. yara-x stops at the same count.
+pub(crate) const MAX_MATCHES: usize = 1_000_000;
+
+/// The matches found for one pattern.
+pub(crate) struct Found {
+    /// Sorted by offset then length, without duplicates.
+    pub matches: Vec<Match>,
+    /// Every match was found: the pattern stayed under [`MAX_MATCHES`] and
+    /// was searched through the whole object.
+    pub complete: bool,
+}
+
+/// Matches as they are found, up to [`MAX_MATCHES`].
+struct Collector {
+    out: Vec<Match>,
+    full: bool,
+}
+
+impl Collector {
+    fn new() -> Self {
+        Collector {
+            out: Vec::new(),
+            full: false,
+        }
+    }
+
+    fn push(&mut self, offset: usize, len: usize) {
+        if self.out.len() < MAX_MATCHES {
+            self.out.push(Match { offset, len });
+        } else {
+            self.full = true;
+        }
+    }
+}
+
+/// A pattern's regexes as a search over a source runs them, each with
+/// whether it is the `wide` form.
+pub(crate) type StreamRegexes = Vec<(StreamRegex, bool)>;
+
+/// Hands out a pattern's [`StreamRegexes`], built on first use.
+pub(crate) type RegexSource<'s> = &'s dyn Fn() -> Option<&'s StreamRegexes>;
+
+/// Cap on the NFA one regexp compiles to.
+const NFA_SIZE_LIMIT: usize = 64 << 20;
+impl PatternDef {
+    /// The regexes of a regexp or hex pattern for a search over a source,
+    /// matching what [`PatternDef::compile`]'s `meta` regexes match. `None`
+    /// for other patterns, or where one cannot be built.
+    pub(crate) fn stream_regexes(&self) -> Option<StreamRegexes> {
+        let build = |src: &str, ci: bool, dotall: bool, wide: bool| {
+            let hir = parse_hir(src, ci, dotall).ok()?;
+            let hir = if wide { widen_hir(hir) } else { hir };
+            Some((StreamRegex::from_hir(&hir, Some(NFA_SIZE_LIMIT))?, wide))
+        };
+        match self {
+            PatternDef::Regex {
+                src,
+                ci,
+                dotall,
+                wide,
+                ..
+            } => Some(vec![build(src, *ci, *dotall, *wide)?]),
+            PatternDef::RegexMulti {
+                src, ci, dotall, ..
+            } => Some(vec![
+                build(src, *ci, *dotall, false)?,
+                build(src, *ci, *dotall, true)?,
+            ]),
+            PatternDef::Hex { re_src } => Some(vec![build(re_src, false, false, false)?]),
+            PatternDef::Literal { .. } | PatternDef::Base64 { .. } => None,
+        }
+    }
+}
+
+/// [`PatternMatcher::find_all`] of several [windowed](PatternMatcher::windowed)
+/// patterns over a source not held in memory, in one read of it rather than a
+/// read each: every window holds what any of their matches needs around it.
+pub(crate) fn find_all_windowed(pats: &[&PatternMatcher], src: &dyn ByteSource) -> Vec<Found> {
+    let (before, after) = pats
+        .iter()
+        .map(|p| p.reach())
+        .fold((0, 0), |(b, a), (pb, pa)| (b.max(pb), a.max(pa)));
+    let len = src.len();
+    let mut outs: Vec<Collector> = pats.iter().map(|_| Collector::new()).collect();
+    let mut complete = true;
+    let mut base = 0;
+    while base < len && outs.iter().any(|o| !o.full) {
+        let end = (base + CHUNK).min(len);
+        let from = base.saturating_sub(before);
+        let to = end.saturating_add(after).min(len);
+        let w = src.window(from, to - from);
+        if w.len() != to - from {
+            complete = false;
+            break;
+        }
+        for (p, out) in pats.iter().zip(&mut outs) {
+            if !out.full {
+                p.search(&w, base - from..end - from, from, out);
+            }
+        }
+        base = end;
+    }
+    outs.into_iter()
+        .map(|out| {
+            let mut matches = out.out;
+            matches.sort_unstable_by(|a, b| a.offset.cmp(&b.offset).then(a.len.cmp(&b.len)));
+            matches.dedup();
+            Found {
+                matches,
+                complete: complete && !out.full,
+            }
+        })
+        .collect()
+}
+
 impl PatternMatcher {
-    /// Returns all matches, sorted by offset then length, de-duplicated by
-    /// (offset, length).
-    pub(crate) fn find_all(&self, data: &[u8]) -> Vec<Match> {
-        let mut out = Vec::new();
+    /// Whether [`find_all_windowed`] searches this pattern: a literal or a
+    /// base64 one, whose matches need a bounded context around them.
+    pub(crate) fn windowed(&self) -> bool {
+        matches!(
+            self,
+            PatternMatcher::Literal { .. } | PatternMatcher::Base64 { .. }
+        )
+    }
+
+    /// Every match in `src`. `stream` supplies the pattern's regexes for a
+    /// source not held in memory; `materialize` is the largest such source
+    /// read whole when they cannot follow it.
+    pub(crate) fn find_all(
+        &self,
+        src: &dyn ByteSource,
+        stream: RegexSource<'_>,
+        materialize: usize,
+    ) -> Found {
+        let mut out = Collector::new();
+        let mut complete = true;
+        match src.as_slice() {
+            Some(data) => self.search(data, 0..data.len(), 0, &mut out),
+            None => complete = self.search_source(src, stream, materialize, &mut out),
+        }
+        let mut matches = out.out;
+        matches.sort_unstable_by(|a, b| a.offset.cmp(&b.offset).then(a.len.cmp(&b.len)));
+        matches.dedup();
+        Found {
+            matches,
+            complete: complete && !out.full,
+        }
+    }
+
+    /// The matches starting at a position in `keep` of `data`, reported at
+    /// `origin` plus their position. `data` holds whatever each match needs
+    /// around it (see [`Self::reach`]) or ends where the object ends.
+    fn search(&self, data: &[u8], keep: Range<usize>, origin: usize, out: &mut Collector) {
         match self {
             PatternMatcher::Literal {
                 needles,
@@ -281,16 +454,13 @@ impl PatternMatcher {
                         if n.bytes.is_empty() || n.bytes.len() > data.len() {
                             continue;
                         }
+                        let last = data.len() - n.bytes.len();
                         if n.nocase {
-                            let last = data.len() - n.bytes.len();
-                            for pos in 0..=last {
+                            for pos in keep.start..keep.end.min(last + 1) {
                                 if needle_hit(data, pos, n, 0) {
                                     let end = pos + n.bytes.len();
                                     if !*fullword || verify_full_word(data, pos, end, n.wide, 0) {
-                                        out.push(Match {
-                                            offset: pos,
-                                            len: n.bytes.len(),
-                                        });
+                                        out.push(origin + pos, n.bytes.len());
                                     }
                                 }
                             }
@@ -299,15 +469,15 @@ impl PatternMatcher {
                             // start offset (e.g. `"aaaa"` in `"aaaaaa"` → 3), so
                             // we advance the search window by one byte, not by the
                             // needle length (which `memmem::find_iter` would do).
-                            let mut base = 0;
+                            let mut base = keep.start;
                             while let Some(off) = memchr::memmem::find(&data[base..], &n.bytes) {
                                 let pos = base + off;
+                                if pos >= keep.end {
+                                    break;
+                                }
                                 let end = pos + n.bytes.len();
                                 if !*fullword || verify_full_word(data, pos, end, n.wide, 0) {
-                                    out.push(Match {
-                                        offset: pos,
-                                        len: n.bytes.len(),
-                                    });
+                                    out.push(origin + pos, n.bytes.len());
                                 }
                                 base = pos + 1;
                             }
@@ -322,15 +492,12 @@ impl PatternMatcher {
                             continue;
                         }
                         let last = data.len() - n.bytes.len();
-                        for pos in 0..=last {
+                        for pos in keep.start..keep.end.min(last + 1) {
                             for &key in &keys {
                                 if needle_hit(data, pos, n, key) {
                                     let end = pos + n.bytes.len();
                                     if !*fullword || verify_full_word(data, pos, end, n.wide, key) {
-                                        out.push(Match {
-                                            offset: pos,
-                                            len: n.bytes.len(),
-                                        });
+                                        out.push(origin + pos, n.bytes.len());
                                     }
                                     // A given position can only be XOR-decoded by
                                     // one key at a time for a fixed plaintext, but
@@ -343,19 +510,20 @@ impl PatternMatcher {
                     }
                 }
             },
+            // Regexes are only searched whole: their matches have no bound.
             PatternMatcher::Regex { re, fullword, wide } => {
-                anchored_matches(re, data, &mut out, *fullword, *wide);
+                anchored_matches(re, data, out, *fullword, *wide);
             }
             PatternMatcher::RegexMulti {
                 ascii,
                 wide,
                 fullword,
             } => {
-                anchored_matches(ascii, data, &mut out, *fullword, false);
-                anchored_matches(wide, data, &mut out, *fullword, true);
+                anchored_matches(ascii, data, out, *fullword, false);
+                anchored_matches(wide, data, out, *fullword, true);
             }
             PatternMatcher::Hex { re } => {
-                anchored_matches(re, data, &mut out, false, false);
+                anchored_matches(re, data, out, false, false);
             }
             PatternMatcher::Base64 { entries } => {
                 for e in entries {
@@ -363,7 +531,7 @@ impl PatternMatcher {
                         continue;
                     }
                     let last = data.len() - e.searched.len();
-                    for pos in 0..=last {
+                    for pos in keep.start..keep.end.min(last + 1) {
                         if data[pos..].starts_with(&e.searched) {
                             if let Some(r) = verify_base64(
                                 &e.pattern,
@@ -373,19 +541,109 @@ impl PatternMatcher {
                                 &e.engine,
                                 e.wide,
                             ) {
-                                out.push(Match {
-                                    offset: r.0,
-                                    len: r.1 - r.0,
-                                });
+                                out.push(origin + r.0, r.1 - r.0);
                             }
                         }
                     }
                 }
             }
         }
-        out.sort_unstable_by(|a, b| a.offset.cmp(&b.offset).then(a.len.cmp(&b.len)));
-        out.dedup();
-        out
+    }
+
+    /// Bytes a literal or base64 match at `pos` is checked against: how many
+    /// before `pos`, and how many from `pos` on.
+    fn reach(&self) -> (usize, usize) {
+        match self {
+            // The needle, and two bytes each side for `fullword`.
+            PatternMatcher::Literal { needles, .. } => {
+                let longest = needles.iter().map(|n| n.bytes.len()).max().unwrap_or(0);
+                (2, longest + 2)
+            }
+            // What `verify_base64` decodes: from up to 3 characters before
+            // the match (twice that when wide) to its decode length after.
+            PatternMatcher::Base64 { entries } => {
+                let after = entries
+                    .iter()
+                    .map(|e| {
+                        let len = base64::encoded_len(e.pattern.len(), false).unwrap_or(0);
+                        e.searched.len().max(2 * (len + 5))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                (6, after)
+            }
+            PatternMatcher::Regex { .. }
+            | PatternMatcher::RegexMulti { .. }
+            | PatternMatcher::Hex { .. } => (0, 0),
+        }
+    }
+
+    /// [`Self::search`] over a source not held in memory. `false` when some
+    /// of it could not be searched.
+    fn search_source(
+        &self,
+        src: &dyn ByteSource,
+        stream: RegexSource<'_>,
+        materialize: usize,
+        out: &mut Collector,
+    ) -> bool {
+        let len = src.len();
+        match self {
+            PatternMatcher::Literal { .. } | PatternMatcher::Base64 { .. } => {
+                // Chunks, each read with the bytes its matches need around them.
+                let (before, after) = self.reach();
+                let mut base = 0;
+                while base < len && !out.full {
+                    let end = (base + CHUNK).min(len);
+                    let from = base.saturating_sub(before);
+                    let to = end.saturating_add(after).min(len);
+                    let w = src.window(from, to - from);
+                    if w.len() != to - from {
+                        return false;
+                    }
+                    self.search(&w, base - from..end - from, from, out);
+                    base = end;
+                }
+                true
+            }
+            PatternMatcher::Regex { fullword, .. }
+            | PatternMatcher::RegexMulti { fullword, .. } => {
+                let fullword = *fullword;
+                self.search_regexes(src, stream, materialize, fullword, out)
+            }
+            PatternMatcher::Hex { .. } => self.search_regexes(src, stream, materialize, false, out),
+        }
+    }
+
+    fn search_regexes(
+        &self,
+        src: &dyn ByteSource,
+        stream: RegexSource<'_>,
+        materialize: usize,
+        fullword: bool,
+        out: &mut Collector,
+    ) -> bool {
+        let found = stream().and_then(|regexes| {
+            let mut found = Collector::new();
+            for (sr, wide) in regexes.iter() {
+                stream_matches(sr, src, &mut found, fullword, *wide).ok()?;
+            }
+            Some(found)
+        });
+        if let Some(found) = found {
+            out.full |= found.full;
+            out.out.extend(found.out);
+            return true;
+        }
+        // The lazy DFAs gave up, or could not be built: the object is searched
+        // whole, as in memory, if it may be read whole.
+        match src.materialize(materialize) {
+            Some(data) => {
+                self.search(&data, 0..data.len(), 0, out);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -400,26 +658,48 @@ impl PatternMatcher {
 /// byte-for-byte the one an anchored search at `s` would produce. No offset in
 /// `[start, s)` can begin a match (else it would be the leftmost), so nothing is
 /// skipped; resuming at `s + 1` then enumerates every match-start in order.
-fn anchored_matches(re: &Regex, data: &[u8], out: &mut Vec<Match>, fullword: bool, wide: bool) {
+fn anchored_matches(re: &Regex, data: &[u8], out: &mut Collector, fullword: bool, wide: bool) {
     let len = data.len();
     let mut start = 0;
-    while start <= len {
+    while start <= len && !out.full {
         let input = Input::new(data).span(start..len);
         match re.find(input) {
             Some(m) => {
                 let s = m.start();
                 let e = m.end();
                 if e > s && (!fullword || verify_full_word(data, s, e, wide, 0)) {
-                    out.push(Match {
-                        offset: s,
-                        len: e - s,
-                    });
+                    out.push(s, e - s);
                 }
                 start = s + 1;
             }
             None => break,
         }
     }
+}
+
+/// [`anchored_matches`] over a source, with the regex stepped through it.
+fn stream_matches(
+    sr: &StreamRegex,
+    src: &dyn ByteSource,
+    out: &mut Collector,
+    fullword: bool,
+    wide: bool,
+) -> std::result::Result<(), GaveUp> {
+    let mut caches = sr.caches();
+    let len = src.len();
+    let mut start = 0;
+    while start <= len && !out.full {
+        match sr.find(&mut caches, src, start)? {
+            Some((s, e)) => {
+                if e > s && (!fullword || full_word_in(src, s, e, wide)) {
+                    out.push(s, e - s);
+                }
+                start = s + 1;
+            }
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 /// Verifies that `pattern` actually matches in base64 form at `match_start`.
@@ -535,7 +815,7 @@ pub(crate) fn build_regex(
     // pattern expands during construction, so a rule can ask for far more
     // memory than its source suggests, and the failure lands at database-load
     // time where it is least expected. These are failsafes over trusted
-    // content — the database is a trusted input — so they are set high enough
+    // content (the database is a trusted input), so they are set high enough
     // that no reasonable rule meets them, and a rule that does is rejected by
     // name rather than taking the process with it.
     //
@@ -543,7 +823,7 @@ pub(crate) fn build_regex(
     // builds finite automata and does not backtrack. The risk here is
     // compile-time memory, not match-time blowup.
     let limits = meta::Config::new()
-        .nfa_size_limit(Some(64 << 20))
+        .nfa_size_limit(Some(NFA_SIZE_LIMIT))
         .dfa_size_limit(Some(16 << 20))
         .onepass_size_limit(Some(8 << 20));
     Regex::builder()
@@ -577,7 +857,7 @@ pub(crate) fn parse_hir(
 
 /// Rewrites an [`Hir`] into its `wide` (UTF-16LE) form: every byte the regexp
 /// would consume is followed by a mandatory `\x00`. This reproduces yara-x's
-/// `wide`-regexp semantics exactly — yara-x matches such a pattern against a
+/// `wide`-regexp semantics exactly: yara-x matches such a pattern against a
 /// stream in which each data byte is interleaved with a zero byte, and reports a
 /// match length of `2 × (bytes consumed)` (the trailing zero of the last byte is
 /// part of the match). Widening a literal interleaves a zero after every byte;

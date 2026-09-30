@@ -6,15 +6,13 @@
 //! (Copyright (c) 2015, Nicholas Waples, BSD-2-Clause). The upstream copyright
 //! and full licence text live in the repo's top-level `NOTICE` file.
 //!
-//! Scope: single-file, non-solid, non-encrypted RAR3 (unpack version 29) file
-//! members compressed with the LZ method (RAR `-m1..-m5`). The RAR3 filter VM
-//! and the standard E8/E8E9/delta/itanium/RGB/audio filters are ported so
-//! x86/audio/image-filtered streams decode correctly. PPMd-mode blocks (the
-//! secondary RAR3 method) are not decoded — a member that switches to PPMd is
-//! reported as undecodable and recorded by the caller as metadata-only. The
-//! older unpack15/20/26 formats are not handled (rardecode does not support
-//! them either). Everything is bounds-checked and never panics on malformed
-//! input.
+//! Scope: non-encrypted RAR3 (unpack version 29) members, solid groups
+//! included, compressed with LZ (RAR `-m1..-m5`) or PPMd blocks (decoded
+//! through the vendored `ppmd7` model; see `read_ppmd_header`). The RAR3 filter
+//! VM and the standard E8/E8E9/delta/itanium/RGB/audio filters are ported so
+//! x86/audio/image-filtered streams decode correctly. The older unpack15/20/26
+//! formats are not handled (rardecode does not support them either).
+//! Everything is bounds-checked and never panics on malformed input.
 
 use super::ppmd7::{
     Ppmd7, RarRangeDecoder, PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE,

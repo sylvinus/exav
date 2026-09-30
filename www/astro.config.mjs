@@ -47,6 +47,7 @@ export default defineConfig({
           items: [
             { label: 'Scanning', slug: 'guides/scanning' },
             { label: 'Daemon mode', slug: 'guides/daemon' },
+            { label: 'Sizing a server', slug: 'guides/sizing' },
             { label: 'ICAP server', slug: 'guides/icap' },
             { label: 'Docker', slug: 'guides/docker' },
             { label: 'Signatures', slug: 'guides/signatures' },

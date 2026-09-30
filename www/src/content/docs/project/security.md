@@ -3,14 +3,22 @@ title: Security
 description: exav's threat model and hardening, from memory safety, bounded extraction and panic isolation to the position on residual unsafe and database trust.
 ---
 
-exav parses hostile input for a living, and the engine is built to contain it.
-See the repository's `SECURITY.md` for the full threat model and how to report
-vulnerabilities.
+A scanner reads files an attacker chose, and the engine is built to contain
+them. The repository's
+[`SECURITY.md`](https://github.com/sylvinus/exav/blob/main/SECURITY.md) has the
+full threat model.
+
+## Reporting a vulnerability
+
+Report security issues privately through
+[GitHub Security Advisories](https://github.com/sylvinus/exav/security/advisories/new),
+not in a public issue. A crash on a crafted file counts: it may be a denial of
+service.
 
 :::note[Status: beta]
-exav is young, and a scanner earns trust from use. If you find something wrong
-(a miss, a false positive, a crash), please
-[report it](https://github.com/sylvinus/exav/issues).
+exav is young, and a scanner earns trust from use. For something wrong that is
+not a security issue (a miss, a false positive), please
+[open an issue](https://github.com/sylvinus/exav/issues).
 :::
 
 ## Hardening
@@ -20,12 +28,17 @@ exav is young, and a scanner earns trust from use. If you find something wrong
 - **Bounded extraction:** every materialization is reserved against a budget
   before it is allocated (output bytes, ratio, file count, recursion depth,
   matcher bytes, emulation steps). A decompression bomb is `LIMITS-EXCEEDED`.
-- **In-memory unpacking:** the extractor never writes to disk.
-- **Per-file panic isolation:** a parser panic is caught (`catch_unwind`) and
-  reported for that file, never as a clean result, and never aborts the run.
+- **In-memory unpacking:** members are decoded in memory. Only an object too
+  large to hold is written to a temporary file under `--spill-dir` (`off` to
+  never write one).
+- **Panic isolation:** a parser panic is caught (`catch_unwind`) and reported for
+  that container, never as a clean result. An allocation too large to serve and
+  stack exhaustion still end the process; the prefork daemon contains them in one
+  worker.
 - **`overflow-checks` in release:** arithmetic overflow traps rather than wraps.
-- **Fuzzing:** `cargo-fuzz` targets for the parsers, run in CI; `cargo audit` /
-  `cargo deny` in CI. Continuous fuzzing (OSS-Fuzz) is on the roadmap.
+- **Fuzzing:** `cargo-fuzz` targets for the parsers, with a short smoke run per
+  target in CI; `cargo audit` / `cargo deny` in CI. Continuous fuzzing (OSS-Fuzz)
+  is on the roadmap.
 - **Prefork worker pool:** the daemon runs each job in a worker under
   kernel-enforced limits and replaces a worker that exceeds them (see the
   [daemon guide](/guides/daemon/)).
@@ -33,9 +46,9 @@ exav is young, and a scanner earns trust from use. If you find something wrong
 ## On `unsafe`
 
 exav's own scanning and extraction code is safe Rust (`exav-core` and
-`exav-unpack` are `#![forbid(unsafe_code)]`), and it runs no C, no UnRAR and no
-native JIT, which rules out whole classes of remote-code-execution bug by
-construction. The [bytecode interpreter](/concepts/bytecode-sandbox/), for one,
+`exav-unpack` are `#![forbid(unsafe_code)]`), and the default build runs no C,
+no UnRAR and no native JIT, so the memory-corruption bugs behind most scanner
+CVEs cannot occur in it. The [bytecode interpreter](/concepts/bytecode-sandbox/), for one,
 has no counterpart to the bugs that have repeatedly affected ClamAV's C/JIT
 bytecode VM.
 
@@ -101,8 +114,8 @@ Incremental `.cdiff` updates are not applied; exav expects whole containers.
 ## Daemon exposure
 
 - exav refuses the clamd `SHUTDOWN` command by default, so a client that can
-  reach the socket or port cannot stop the daemon (`EXAV_ALLOW_SHUTDOWN=1`
-  allows it).
+  reach the socket or port cannot stop the daemon (`--allow-shutdown` allows
+  it).
 - A client that can reach the daemon can request scans, so restrict access
   regardless: bind to localhost, a private network, or a Unix socket.
 - The daemon refuses to serve with no real signature database, so a

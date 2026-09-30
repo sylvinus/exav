@@ -1,16 +1,16 @@
 //! Heuristic alert names must match ClamAV's **exactly**.
 //!
 //! A heuristic reaches a client as an ordinary `FOUND` whose *name* carries all
-//! the information — there is no separate channel. Gateways that treat
+//! the information; there is no separate channel. Gateways that treat
 //! heuristics differently (tag rather than block, lower score) do it by matching
 //! the string. So a name that is one suffix off is not cosmetic: it is a policy
 //! rule that silently stops firing after a migration.
 //!
 //! Two names were wrong and are pinned here:
 //!
-//! * `Heuristics.OLE2.ContainsMacros` — ClamAV suffixes the macro dialect,
+//! * `Heuristics.OLE2.ContainsMacros`: ClamAV suffixes the macro dialect,
 //!   `.VBA` or `.XLM`. exav emitted the bare name, matching neither.
-//! * `Heuristics.Phishing.Email.Cloaked.IP` — ClamAV calls it
+//! * `Heuristics.Phishing.Email.Cloaked.IP`: ClamAV calls it
 //!   `Cloaked.NumericIP`.
 //!
 //! Both were found by enumerating ClamAV's emitted names rather than by reading
@@ -33,7 +33,7 @@ fn detection(db: &Scanner, blob: &[u8], opts: &ScanOptions) -> Option<String> {
     }
 }
 
-/// A minimal valid OLE2 document carrying a VBA project — the same construction
+/// A minimal valid OLE2 document carrying a VBA project, the same construction
 /// `heuristic_alerts.rs` uses, so the fixture is known to reach the extractor.
 /// A hand-rolled OLE2 with a plain-text module stream does NOT: exav's extractor
 /// needs a real MS-OVBA compressed container, and a fixture that silently fails
@@ -72,7 +72,7 @@ fn macro_alert_carries_the_dialect_suffix() {
 
     let mut opts = ScanOptions::default();
     opts.alert_macros = true;
-    // The fixture MUST fire, or the assertions below are vacuous — which is the
+    // The fixture MUST fire, or the assertions below are vacuous, which is the
     // failure mode this whole file exists to prevent.
     let name = detection(&db, &doc, &opts)
         .expect("fixture did not trigger the macro heuristic; the test would prove nothing");
@@ -120,14 +120,14 @@ fn cloaked_ip_uses_clamavs_numericip_name() {
 }
 
 /// The names exav emits that ClamAV does not. These are *additions*, not
-/// mismatches — they cannot cause a missed detection, only an extra one — but
+/// mismatches (they cannot cause a missed detection, only an extra one), but
 /// they must stay deliberate rather than drift in unnoticed.
 #[test]
 fn exav_only_names_are_the_ones_we_expect() {
     // `Heuristics.Encrypted.Doc` was on this list and did not belong: it is a
     // MISMATCH, not an addition. For an encrypted OLE2 document ClamAV emits
-    // `Heuristics.Encrypted.OLE2` — observed 468 times against 0 for `.Doc`
-    // across a corpus run — so exav's name matched no gateway filter while
+    // `Heuristics.Encrypted.OLE2` (observed 468 times against 0 for `.Doc`
+    // across a corpus run), so exav's name matched no gateway filter while
     // looking, on this list, like a deliberate extra. The trap is that ClamAV's
     // config option IS called `AlertEncryptedDoc`; the option name and the
     // signature name differ, and only the signature name is on the wire.
@@ -154,7 +154,7 @@ fn exav_only_names_are_the_ones_we_expect() {
 /// member, and `--alert-encrypted` turns that into a detection.
 ///
 /// The name has to be exact: a gateway filtering on ClamAV's string matches on
-/// that string and nothing else. Verified against the oracle — over one corpus
+/// that string and nothing else. Verified against the oracle: over one corpus
 /// run clamd emitted `Heuristics.Encrypted.OLE2` 468 times and
 /// `Heuristics.Encrypted.Doc` never.
 #[test]
@@ -162,7 +162,7 @@ fn an_encrypted_office_document_uses_clamavs_signature_name() {
     let cursor = std::io::Cursor::new(Vec::<u8>::new());
     let mut cf = cfb::CompoundFile::create(cursor).expect("create OLE2");
     {
-        // Version 4 agile header, then bytes that are not a valid descriptor —
+        // Version 4 agile header, then bytes that are not a valid descriptor:
         // enough to be recognised as MS-OFFCRYPTO, not enough to decrypt.
         let mut s = cf.create_stream("/EncryptionInfo").expect("EncryptionInfo");
         s.write_all(&[0x04, 0x00, 0x04, 0x00]).unwrap();
@@ -191,7 +191,7 @@ fn an_encrypted_office_document_uses_clamavs_signature_name() {
     assert_eq!(
         name, "Heuristics.Encrypted.OLE2",
         "ClamAV emits `Heuristics.Encrypted.OLE2` for an encrypted OLE2 document. \
-         Note its CONFIG OPTION is `AlertEncryptedDoc` — the option name and the \
+         Note its CONFIG OPTION is `AlertEncryptedDoc`; the option name and the \
          signature name differ, and only the signature name reaches a gateway."
     );
 }
@@ -237,7 +237,7 @@ fn matching_schemes_are_not_a_spoof() {
 // ------------------------------------------------------- Broken.Executable
 
 /// A file carrying an executable magic whose headers do not hold together. The
-/// signal is the *contradiction* — which is why an arbitrary binary blob must
+/// signal is the *contradiction*, which is why an arbitrary binary blob must
 /// never qualify.
 #[test]
 fn broken_executable_needs_a_broken_executable() {
@@ -285,6 +285,83 @@ fn ordinary_files_are_not_broken_executables() {
             None,
             "{what} must not be reported as a broken executable"
         );
+    }
+}
+
+/// A PE header claiming 40 sections it does not have, which passes the
+/// embedded-PE carving gate.
+fn broken_pe() -> Vec<u8> {
+    let mut out = b"MZ".to_vec();
+    out.resize(0x3c, 0);
+    out.extend(64u32.to_le_bytes()); // e_lfanew
+    out.extend(b"PE\0\0");
+    out.extend(0x014cu16.to_le_bytes()); // machine
+    out.extend(40u16.to_le_bytes()); // sections, none of which follow
+    out.extend([0u8; 12]);
+    out.extend(224u16.to_le_bytes()); // optional header size
+    out.extend(0x0102u16.to_le_bytes()); // characteristics
+    out.extend([0x0b, 0x01]); // PE32 magic
+    out.extend([0u8; 222]);
+    out
+}
+
+/// Minimal 64-bit little-endian ELF header with e_shentsize (offset 58) zeroed.
+fn stripped_elf() -> Vec<u8> {
+    let mut elf = vec![0u8; 64];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2; // 64-bit
+    elf[5] = 1; // little-endian
+    elf[6] = 1; // version
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = EXEC
+    elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // x86-64
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    elf[58..60].copy_from_slice(&0u16.to_le_bytes()); // e_shentsize: STRIPPED
+    elf
+}
+
+/// An executable carved out of another object at an offset is a candidate found
+/// by its magic, not a claim the object makes about itself. One that does not
+/// parse (a fragment, a truncated tail, a coincidental header) does not make
+/// its host a broken executable.
+///
+/// Measured against clamscan 1.5.4 `--alert-broken`: each fixture below is
+/// reported on its own and passes when it follows 1 KiB of text or of zeros, or
+/// is appended to a valid PE. Before this, exav flagged a clean 40 KB PE whose
+/// last 1.5 KB held the start of a second, truncated one.
+#[test]
+fn an_embedded_executable_does_not_make_its_host_broken() {
+    let db = empty_db();
+    let mut opts = ScanOptions::default();
+    opts.alert_broken = true;
+    let mut compat = opts.clone();
+    compat.clamav_compat = true;
+    let mut truncated_elf = stripped_elf();
+    truncated_elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+    truncated_elf[40..48].copy_from_slice(&0x1000u64.to_le_bytes()); // e_shoff past EOF
+    truncated_elf[60..62].copy_from_slice(&4u16.to_le_bytes()); // e_shnum
+    for (what, exe) in [
+        ("a broken PE", broken_pe()),
+        ("a stripped ELF", stripped_elf()),
+        ("a truncated ELF", truncated_elf),
+    ] {
+        assert_eq!(
+            detection(&db, &exe, &compat).as_deref(),
+            Some("Heuristics.Broken.Executable"),
+            "{what} alone must be reported, or this test proves nothing"
+        );
+        for (host, lead) in [("text", b'A'), ("zeros", 0u8)] {
+            let mut blob = vec![lead; 1024];
+            blob.extend_from_slice(&exe);
+            for o in [&opts, &compat] {
+                assert_eq!(
+                    detection(&db, &blob, o),
+                    None,
+                    "{what} after 1 KiB of {host} must not be reported (compat: {})",
+                    o.clamav_compat
+                );
+            }
+        }
     }
 }
 
@@ -370,8 +447,8 @@ fn a_fullword_subsignature_does_not_match_inside_a_longer_word() {
 /// A stripped ELF section-header table is reported in BOTH modes; only the name
 /// changes.
 ///
-/// exav does not consider these broken — section headers are optional for
-/// execution and the binaries run — but no toolchain zeroes the entry size, so
+/// exav does not consider these broken (section headers are optional for
+/// execution and the binaries run), but no toolchain zeroes the entry size, so
 /// the fact is worth reporting under a name that says what it is. ClamAV files it
 /// under `Heuristics.Broken.Executable`, and a gateway filtering on that exact
 /// string has to keep matching under `--clamav-compat`.
@@ -379,17 +456,7 @@ fn a_fullword_subsignature_does_not_match_inside_a_longer_word() {
 /// The point of the pair below: compat changes VOCABULARY, never coverage.
 #[test]
 fn a_stripped_elf_section_table_is_reported_in_both_modes() {
-    // Minimal 64-bit little-endian ELF header with e_shentsize (offset 58) zeroed.
-    let mut elf = vec![0u8; 64];
-    elf[..4].copy_from_slice(b"\x7fELF");
-    elf[4] = 2; // 64-bit
-    elf[5] = 1; // little-endian
-    elf[6] = 1; // version
-    elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = EXEC
-    elf[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // x86-64
-    elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
-    elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-    elf[58..60].copy_from_slice(&0u16.to_le_bytes()); // e_shentsize: STRIPPED
+    let elf = stripped_elf();
 
     let mut base = ScanOptions::default();
     base.alert_broken = true;

@@ -59,7 +59,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 fn only_member(blob: &[u8]) -> exav_unpack::Entry {
     let mut budget = Budget::new(Limits::default());
-    let mut entries = extract(Format::Zip, blob, &mut budget).expect("extract");
+    let mut entries = extract(Format::Zip, &blob, &mut budget).expect("extract");
     assert_eq!(entries.len(), 1, "expected exactly one member");
     let e = entries.remove(0);
     assert!(

@@ -22,10 +22,9 @@ ARG BIN_SOURCE=build
 # docker-compose.yml), or setting EXAV_SIG_SOURCES to auto-download from a mirror
 # you trust. See https://exav.org/guides/docker/ for the env vars.
 #
-# One-shot scan. `EXAV_LISTEN` below is set for the daemon this image defaults
-# to; clear it to scan paths instead, or exav refuses rather than guessing which
-# of the two jobs was meant:
-#   docker run --rm -e EXAV_LISTEN= -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+# One-shot scan. Paths on the command line win over the `EXAV_LISTEN` set below
+# for the default daemon; the scan needs the signature volume too:
+#   docker run --rm -v exav-db:/var/lib/exav -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
 
 # ---- binary: compile in-image, or copy a runner-built one --------------------
 # Selected by BIN_SOURCE. Only the selected branch is built; the other is

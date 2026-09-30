@@ -1,0 +1,76 @@
+# exav serving the clamd protocol, in place of clamav-daemon.
+#
+# It serves the Unix socket clamd uses, so `clamdscan`, mail milters and clamd
+# client libraries talk to exav unchanged, and it reads the signatures freshclam
+# keeps in /var/lib/clamav. Enable it *instead of* clamav-daemon: both cannot
+# hold the socket. On Debian/Ubuntu the socket unit has to go too, or socket
+# activation starts clamd again on the first connection:
+#
+#   sudo systemctl disable --now clamav-daemon.socket clamav-daemon.service
+#   sudo systemctl enable --now exav
+#   clamdscan --ping 1                         # verify it answers
+#
+# The socket path below is the Debian/Ubuntu default. On Fedora/RHEL clamd uses
+# /run/clamd.scan/clamd.sock: edit ExecStart and RuntimeDirectory to match, or
+# copy your existing clamd.conf's LocalSocket value.
+[Unit]
+Description=exav malware scanning daemon (clamd protocol)
+Documentation=https://exav.org/guides/daemon/
+After=network.target
+
+[Service]
+Type=simple
+# --workers defaults to one prefork process per CPU core (kernel-enforced per-job
+# limits, and a job that will not stop is killed without touching the others).
+ExecStart=/usr/bin/exav --listen /run/clamav/clamd.ctl -d /var/lib/clamav
+#
+# The socket is created 0600, reachable only by the clamav user this runs as.
+# A client under another UID (Amavis, Rspamd, a web server) needs it widened,
+# which is what clamd.conf spells LocalSocketMode. The mode rides on the address,
+# since it is a property of that socket:
+#   ExecStart=... --listen 'clamd:///run/clamav/clamd.ctl?mode=660'
+# with the client's user in the clamav group. Every user the mode admits can
+# submit scans and read the verdicts, so grant the narrowest set that works
+# rather than 666.
+#
+# --- Pulling a prebuilt database over HTTP (build once, serve many) ----------
+# To fetch an `.exavdb` built by another server instead, point -d at a writable
+# file and give the URL. Needs a build with the `http-update` feature. Replace
+# ExecStart above, and the `ReadOnlyPaths` line below with the two lines after
+# it:
+#   ExecStart=/usr/bin/exav --listen /run/clamav/clamd.ctl --auto-update \
+#       --db-url https://build.internal/exav/live.exavdb \
+#       -d /var/lib/exav/live.exavdb
+#   StateDirectory=exav                  # creates /var/lib/exav for the clamav user
+#   ReadWritePaths=/var/lib/exav         # the pulled database and its temp file
+# (Basic auth: --db-url https://user:pass@build.internal/... is kept out of logs.)
+# See https://exav.org/guides/prebuilt-database/
+# -----------------------------------------------------------------------------
+#
+# As with clamd: `systemctl reload exav` (SIGUSR2) re-reads the signatures
+# without dropping the socket, and SIGHUP reopens the --log file, for logrotate:
+#   postrotate  systemctl kill -s HUP exav.service
+# freshclam's NotifyClamd reloads it through the socket, as it does clamd.
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# Run as the existing clamav user (present from a ClamAV install).
+User=clamav
+Group=clamav
+RuntimeDirectory=clamav
+RuntimeDirectoryMode=0755
+
+# Hardening: the daemon only needs to read the files it scans and the
+# signatures.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadOnlyPaths=/var/lib/clamav
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

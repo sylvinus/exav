@@ -333,7 +333,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "exav-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aho-corasick",
  "daachorse",
@@ -345,7 +345,10 @@ dependencies = [
  "md-5",
  "memchr",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "rmp-serde",
+ "rustc-hash",
  "rustdct",
  "serde",
  "sha1",
@@ -369,14 +372,15 @@ dependencies = [
 
 [[package]]
 name = "exav-pe-emu"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "exav-x86",
+ "rustc-hash",
 ]
 
 [[package]]
 name = "exav-unpack"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "apfs",
@@ -423,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "exav-x86"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "explode"
@@ -963,6 +967,12 @@ dependencies = [
  "rmp",
  "serde",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustdct"

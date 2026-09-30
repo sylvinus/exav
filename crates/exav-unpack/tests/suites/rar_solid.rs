@@ -29,7 +29,8 @@
 //! rar a -ma4 -v4k -m3 -ep vol_rar4.rar one.txt eicar.com
 //! ```
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the files that went into the archives.
 const ONE: &str = "30c2abfccdf15a28990bae7bb0efa2444d82af3ce7053ff493956ef9612f775d";

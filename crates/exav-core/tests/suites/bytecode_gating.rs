@@ -1,10 +1,11 @@
 //! End-to-end test of bytecode trigger-gating: a synthetic `.cbc` whose
 //! logical trigger fires on a byte pattern and whose program calls
 //! `setvirusname`, exercised through [`BytecodeRuntime`]. No ClamAV data is
-//! vendored — the program is assembled with the format's own nibble encoders.
+//! vendored: the program is assembled with the format's own nibble encoders.
 
 use exav_core::bytecode::runtime::BytecodeRuntime;
 use exav_core::filetype::FileType;
+use exav_core::{analyze, analyze_all, ScanOptions, Verdict};
 
 const HEADER_MAGIC: u64 = 0x53e5_493e_9f3d_1c30;
 
@@ -97,25 +98,62 @@ fn synth_cbc(name: &str, marker: &[u8]) -> String {
 #[test]
 fn trigger_gated_detection() {
     let cbc = synth_cbc("Synth.BC.Detect", b"MALWARE");
-    let rt = BytecodeRuntime::from_sources(vec![cbc]);
+    let (rt, triggers) = BytecodeRuntime::standalone(vec![cbc]);
     assert_eq!(rt.len(), 1, "program should load");
 
     // Input containing the trigger marker -> the program runs and names it.
     let hit = b"....prefix....MALWARE....suffix....";
     assert_eq!(
-        rt.scan(hit, FileType::Unknown, None).0,
+        rt.scan(&triggers, hit, FileType::Unknown, None).0,
         Some(("Synth.BC.Detect".to_string(), 0))
     );
 
     // Input without the marker -> trigger doesn't fire -> no detection.
     let clean = b"nothing to see here, totally benign bytes";
-    assert_eq!(rt.scan(clean, FileType::Unknown, None).0, None);
+    assert_eq!(rt.scan(&triggers, clean, FileType::Unknown, None).0, None);
+}
+
+/// In a real scan the trigger is matched by the scanner's own engine, in the
+/// sweep that looks for every other signature: the program runs, its
+/// detection is reported, and the trigger itself neither alerts nor counts
+/// as a signature. Through a built database too.
+#[test]
+fn trigger_gated_detection_in_a_scan() {
+    let mut loader = exav_core::loader::Builder::new();
+    loader.add_named_bytes(
+        "t.cbc",
+        synth_cbc("Synth.BC.Detect", b"MALWARE").as_bytes(),
+        true,
+    );
+    loader.add_named_bytes("t.ndb", b"Other.Sig:0:*:4f54484552\n", true);
+    let built = loader.build().unwrap();
+    let mut file = Vec::new();
+    exav_core::database::write(&built, &mut file).unwrap();
+    let stored = exav_core::database::read(&file[..]).unwrap();
+    for db in [&built, &stored] {
+        // EICAR, the one `.ndb` line, and not the trigger.
+        assert_eq!(db.signature_count(), 2);
+        let found = |data: &[u8]| match analyze(db, data, &ScanOptions::default()).verdict {
+            Verdict::Infected { signature, .. } => Some(signature),
+            _ => None,
+        };
+        assert_eq!(
+            found(b"..prefix..MALWARE..suffix.."),
+            Some("Synth.BC.Detect".to_string())
+        );
+        assert_eq!(found(b"..OTHER.."), Some("Other.Sig".to_string()));
+        assert_eq!(found(b"nothing to see here"), None);
+        let all = analyze_all(db, b"..MALWARE..OTHER..", &ScanOptions::default());
+        let mut names: Vec<_> = all.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Other.Sig", "Synth.BC.Detect"]);
+    }
 }
 
 #[test]
 fn forced_mode_runs_regardless_of_trigger() {
     let cbc = synth_cbc("Synth.BC.Detect", b"MALWARE");
-    let rt = BytecodeRuntime::from_sources(vec![cbc]);
+    let (rt, _) = BytecodeRuntime::standalone(vec![cbc]);
     // Forced execution ignores the trigger: even clean input runs the program,
     // which unconditionally names the detection.
     let out = rt.run_forced(0, b"clean input").expect("program exists");

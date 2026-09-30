@@ -23,9 +23,8 @@ jobs:
       # examples and the `bytecode_gating` integration test) is excluded from the
       # default build, so lint it in a dedicated pass.
       - run: cargo clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
-      # The full native test matrix (default + http + checksums + no-decrypt +
-      # unstable-internals feature passes). Defined once in the Makefile so this
-      # and a local `make test` can't drift.
+      # The full native test matrix, every feature pass. Defined once in the
+      # Makefile so this and a local `make test` can't drift.
       - run: make test-native
 
   # The promised floor is `rust-version` in Cargo.toml (1.91, imposed by

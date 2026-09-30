@@ -22,7 +22,8 @@
 //! wimcapture hardsrc/ hard_LZX.wim --compress=LZX
 //! ```
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the files that went into the images.
 const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";

@@ -1,8 +1,9 @@
-//! RAR extractor for the **stored** (uncompressed) method, RAR4 and RAR5,
-//! implemented from the public RAR file-format field layout. RAR's compressed
-//! methods (its LZ + PPMd) are not implemented, so a compressed or encrypted
-//! member is reported as a member we could not extract (the caller still scans
-//! the raw archive in place).
+//! RAR extractor, RAR4 and RAR5, implemented from the public RAR file-format
+//! field layout. Stored members are copied; RAR3 (unpack 29, LZ + PPMd) members
+//! go to `rar3_unpack` and RAR5 members to `rar5_unpack`, solid groups
+//! included. RAR 1.5/2.x compression, encrypted members and members split
+//! across volumes are reported as members we could not extract (the caller
+//! still scans the raw archive in place).
 //!
 //! Layouts used (magic-byte / header-field level only):
 //! - RAR4 marker `52 61 72 21 1A 07 00`; blocks = `HEAD_CRC u16, HEAD_TYPE u8,

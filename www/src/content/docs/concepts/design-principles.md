@@ -1,11 +1,11 @@
 ---
 title: Design principles
-description: The principles exav is built around, from never a silent clean and memory safety to no runtime code generation, bounded work, drop-in compatibility and clean-room licensing.
+description: The principles exav is built around, from never a silent clean and memory safety to no runtime code generation, bounded work, work done at database build time, drop-in compatibility and clean-room licensing.
 ---
 
 exav is built around a handful of principles. Some protect the host, some protect
-the verdict, and some make exav practical to adopt. One ties them together: every
-bound the engine hits is reported.
+the verdict, and some make exav practical to adopt. One ties them together: a
+scan that stopped short is reported as such.
 
 ## Never a silent clean
 
@@ -18,9 +18,10 @@ that makes the scanner stop early, for any reason, is reported instead of being
 folded into `OK`.
 
 ClamAV, for example, reads a file over about 2 GB, scans none of it, and reports
-`OK`. exav closes that gap and every other way a scan can stop early. The rule
-holds in every mode, including `--clamav-compat`, which changes the names exav
-reports and what it opens, but not whether an incomplete scan is reported.
+`OK`. exav closes that gap and every other way a scan can stop early. The one
+exception is asked for by name: `--clamav-compat`, a preset for differential
+testing, answers an incomplete scan `OK` as ClamAV does, and logs every such
+object on stderr so the pass stays visible.
 
 Three rules follow:
 
@@ -32,8 +33,9 @@ Three rules follow:
    `LIMITS-EXCEEDED`. Otherwise `cat malware huge.pad > evil` would be a bypass.
    A file, stdin and every daemon verb go through that one scan.
 3. **Not fully scanned is never clean, whatever the cause.** That covers external
-   limits and exav's own work bounds: a verification-step budget that stops a
-   pathological wildcard search, an emulator that runs out of steps.
+   limits and exav's own work bounds: the budget that stops a pathological
+   wildcard search, a PE emulation that runs out of instructions
+   (`--max-pe-emulation-steps`), a bytecode program that runs out of steps.
 
 A scan that did not complete resolves to `LIMITS-EXCEEDED`, `UNSCANNABLE` or
 `PASSWORD-PROTECTED`. See [Verdicts & exit codes](/reference/verdicts/) for what
@@ -42,11 +44,11 @@ each means and how it is reported.
 ### Stricter than ClamAV
 
 `clamscan` returns `OK` after bounding its own work (its `alert-exceeds-max` and
-`alert-encrypted` heuristics are off by default); exav does not. It is the one
-behavioral difference a migrating user has to plan for (see
-[Migrating from ClamAV](/guides/migrating-from-clamav/)). `--clamav-compat`
-matches ClamAV's limit values for differential testing, and still reports the
-outcome.
+`alert-encrypted` heuristics are off by default); exav does not. It is the main
+behavioral difference a migrating user has to plan for, along with the flags
+(see [Migrating from ClamAV](/guides/migrating-from-clamav/)). `--clamav-compat`
+matches ClamAV's limit values and its `OK` for incomplete scans, for
+differential testing, and logs each such object.
 
 ### The verdict is not the policy
 
@@ -57,9 +59,9 @@ rather than reject an upload.
 
 Where a deployment chooses that, with
 [`--partial-as ok`](/reference/cli/#what-an-unscannable-object-becomes), the
-choice is named per verdict, announced at startup, logged per object, and still
-reported in the response. The rule does not forbid accepting a risk; it forbids
-hiding one.
+choice is named per verdict and logged per object on stderr; the ICAP service
+also announces it at startup and keeps `X-Exav-Status: PARTIAL` in its response.
+The rule does not forbid accepting a risk; it forbids hiding one.
 
 ### Refusing empty coverage
 
@@ -92,10 +94,21 @@ implemented from public specifications and permissively licensed
 
 Every decode and match is bounded by size or by a step count, so hostile input
 cannot turn a scan into an unbounded computation or allocation; the prefork
-daemon adds a per-job wall-clock and CPU limit on top. Archives are walked member
-by member, and every bound is a flag. Reaching one is reported, never a silent
-truncation. See [Streaming & memory](/concepts/streaming-memory/) and
-[Limits](/reference/limits/).
+daemon adds a per-job wall-clock and CPU limit on top. Most archives are walked
+member by member, and the main bounds are flags. Reaching a bound on the scan is
+reported, never a silent truncation. See
+[Streaming & memory](/concepts/streaming-memory/) and [Limits](/reference/limits/).
+
+## Work at build time
+
+> Whatever can be computed once from the signatures is computed when the
+> database is built, not when it is loaded or when a file is scanned.
+
+A [prebuilt `.exavdb`](/guides/prebuilt-database/) is built once and loaded by
+every CLI run, daemon start, reload and worker. So the build does the expensive
+work (automatons, indexes, tables derived from the signatures) and stores the
+result in a form that loads with little more than a copy. Load time and scan
+speed come first; a larger file is an acceptable price.
 
 ## Minimal dependencies
 
@@ -108,14 +121,8 @@ listed on the [Dependencies](/reference/dependencies/) page.
 ## Drop-in compatibility
 
 exav loads the signature databases you already have, speaks the `clamd` wire
-protocol, and prints `clamscan`'s output format and exit codes, so it fits into
+protocol, and prints `clamscan`'s output format and exit codes (plus exit code 3
+for `PARTIAL`), so it fits into
 an existing deployment without rewriting tooling. Its flags are its own. See
 [Comparison with ClamAV](/project/comparison-with-clamav/) and
 [Migrating from ClamAV](/guides/migrating-from-clamav/).
-
-## How they fit together
-
-Memory safety and no runtime code generation protect the host running exav.
-Never a silent clean and bounded work protect the verdict. Minimal dependencies
-and drop-in compatibility make exav practical to run and adopt. Clean-room
-licensing keeps it permissively licensed and independently built.
