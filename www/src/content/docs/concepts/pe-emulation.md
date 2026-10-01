@@ -83,7 +83,8 @@ and nested content in the recovered image are reached too.
 
 Some stubs will not run to completion. The run stops on an instruction outside
 the implemented set, an export with no implementation, a fault nothing handled,
-or a budget; the `exav-pe-emu` triage tool names which.
+or a budget; the [`exav-pe-emu`](/subprojects/exav-pe-emu/) triage tool names
+which.
 
 * **Nothing is fabricated.** A dump is emitted only when it reads back as a
   valid PE; a wrong guess is discarded rather than handed to the matcher.

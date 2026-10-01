@@ -2,8 +2,8 @@
 //!
 //! An unreadable directory is the quietest way to lose files: the walk yields an
 //! error instead of entries, and an error that is dropped leaves a run that
-//! reports on what it reached and exits 0. To an operator — and to a pipeline
-//! reading the exit code — that is indistinguishable from a tree with nothing
+//! reports on what it reached and exits 0. To an operator, and to a pipeline
+//! reading the exit code, that is indistinguishable from a tree with nothing
 //! wrong in it, even when the part nobody could open holds the malware.
 //!
 //! Every surface that walks a tree goes through one walker, so this pins the
@@ -28,7 +28,7 @@ fn eicar() -> &'static [u8] {
 }
 
 /// Returns `None` when the platform or the test environment cannot make a
-/// directory unreadable — running as root defeats mode 0, and non-Unix has no
+/// directory unreadable: running as root defeats mode 0, and non-Unix has no
 /// equivalent. Skipping beats asserting something the environment cannot show.
 #[cfg(unix)]
 fn unreadable_tree() -> Option<TempDir> {
@@ -113,6 +113,36 @@ fn an_error_is_printed_under_quiet_and_logged() {
         logged.contains("missing.bin") && logged.contains("ERROR"),
         "{logged}"
     );
+}
+
+/// A URL this run will not scan (no `--allow-http-scan`, or a build without
+/// `http-scan`) is an error like any other: logged, and a JSON record.
+#[test]
+fn a_refused_url_is_logged_and_reported_in_json() {
+    let dir = TempDir::new().expect("temp dir");
+    let log = dir.path().join("scan.log");
+    let url = "https://example.invalid/sample.bin";
+    let out = exav()
+        .args(["--json", "--log"])
+        .arg(&log)
+        .arg(url)
+        .output()
+        .expect("run exav");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
+    assert!(
+        stdout.contains(url) && stdout.contains(r#""status":"ERROR""#),
+        "{stdout}"
+    );
+    let out = exav()
+        .arg("--log")
+        .arg(&log)
+        .arg(url)
+        .output()
+        .expect("run exav");
+    assert_eq!(out.status.code(), Some(2));
+    let logged = std::fs::read_to_string(&log).expect("read the log");
+    assert!(logged.contains(url) && logged.contains("ERROR"), "{logged}");
 }
 
 /// The summary counts a file not fully examined as partial, not as an error:

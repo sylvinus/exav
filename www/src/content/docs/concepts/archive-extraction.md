@@ -26,9 +26,8 @@ and codec those extractors open, exav's status against each, and
 [the gap list](/reference/formats/#the-complete-gap-list) of what is still
 missing.
 
-Every input is extracted through a seekable source: a file, an HTTP range reader
-(for a format with an index, such as a ZIP's central directory, the walk fetches
-only the index and the members it reads), or a stream buffered first (see
+Every input is extracted through a seekable source: a file, an HTTP range
+reader, or a stream buffered first (see
 [Streaming & memory](/concepts/streaming-memory/)).
 
 ## The shape of the unpacker
@@ -91,7 +90,8 @@ of it. `walk()` then hands the members to a visitor one at a time. A format whos
 decoder reads forward (ZIP, tar, CAB, ISO, the single-stream compressors, …)
 produces each member as a reader that decodes as it is read, so neither the
 container nor the member is resident. A format whose decoder needs random access
-over the whole container (7z, RAR, OLE, PDF, CHM, the disk images, …) is read
+over the whole container (7z, RAR, OLE, PDF, CHM, the virtual disks and
+filesystem images, …) is read
 whole, bounded before it is allocated, up to `--max-object-bytes`; past it the
 container is `LIMITS-EXCEEDED`. 7z's members still stream once the container is
 in memory. Which it is is a property of the decoder, not of how exav was
@@ -108,24 +108,20 @@ unread costs nothing for it: a ZIP is listed from its central directory, and a
 tar's headers are read in turn with the data between them skipped, so listing
 decodes nothing.
 
-**A ZIP has more members than its directory admits to.** The walk also scans the
-bytes the central directory does not claim (see below), after the directory's
-own members.
-
 ## Bounded, budget before allocation
 
 Every extraction runs under one `Budget`, reserved before a member is read rather
 than checked after:
 
-| Limit | Bounds |
-|---|---|
-| output bytes | what formats decoded whole produce across the tree |
-| per-member size | a member decoded whole (a streamed member is bounded by the ratio and matcher budgets) |
-| compression ratio | output ÷ input, the decompression-bomb guard |
-| file count | members across the archive and everything nested |
-| recursion depth | archives inside archives |
-| matcher bytes | bytes fed to the matcher across the tree, a CPU bound |
-| emulation steps | instructions the PE unpacking emulator runs across the tree |
+| Limit | Bounds | Default |
+|---|---|---|
+| output bytes | what formats decoded whole produce across the tree | 1 GiB, within half of `--max-process-bytes` |
+| per-member size | a member decoded whole (a streamed member is bounded by the ratio and matcher budgets) | `--max-object-bytes` 256M |
+| compression ratio | output ÷ input, the decompression-bomb guard | 1000 |
+| file count | members across the archive and everything nested | `--max-members` 100000 |
+| recursion depth | archives inside archives | `--max-unpack-depth` 16 |
+| matcher bytes | bytes fed to the matcher across the tree, a CPU bound | `--max-matcher-bytes` 10G |
+| emulation steps | instructions the PE unpacking emulator runs across the tree | `--max-pe-emulation-steps` 1,000,000,000 |
 
 Reserving first keeps the peak bounded: a "1 GB from 4 KB" member never
 allocates 1 GB and then gets rejected.
@@ -148,11 +144,17 @@ local header and data in the file. Plenty of extractors still write it out.
 exav does dual indexing: after the central-directory pass it scans the raw bytes
 for local headers the directory did not cover, and extracts those too. The same
 path is the salvage route when the central directory is corrupt, forged or
-truncated.
+truncated. On a ZIP read from its source rather than held in memory, the search
+covers at most 16 MiB of unclaimed bytes, and a search cut short there is
+reported, not taken as complete.
 
 `PK\x03\x04` is four bytes and occurs by chance in ordinary binaries, so a
-credibility check (version, reserved flag bits, a real compression method, a
-NUL-free path within the length limit) decides what counts as a member.
+credibility check decides what counts as a member: version at most 6.3, no
+reserved flag bits, a non-empty path within the length limit and free of NULs,
+and a known compression method or, failing that, a readable UTF-8 name. A
+header with an unknown method and a clean name is still a member, reported
+unscannable, because a packer can stamp a nonsense method on a member to hide
+it from readers that check the method.
 
 ISO images have the same shape: a CD image carries several volume descriptors,
 each with its own directory tree over the same sectors. A malicious ISO lists its
@@ -200,16 +202,12 @@ is caught by name even when its content is unreadable.
 
 ## Encryption
 
-exav decrypts what it can: ZIP (ZipCrypto and WinZip AES), 7z AES-256 including
-encrypted headers, encrypted DMG, PDF, and Office (legacy XLS RC4 and XOR
-obfuscation, OOXML standard and agile AES).
-
-Two defaults need no configuration. Office documents are tried with
-`VelvetSweatshop`, Excel's built-in default password, which opens without a
-prompt for the victim but looks opaque to a scanner that stops at "encrypted".
-ZIPs are tried against a short built-in list of passwords malware distribution
-uses (`infected`, `virus`, …). `--passwords` and ClamAV `.pwdb` databases add
-your own.
+exav decrypts ZIP, 7z, DMG, PDF, Office and garbled ARJ members; the schemes
+are listed in [Supported formats](/reference/formats/#encryption-support).
+Office documents are tried with `VelvetSweatshop`, Excel's built-in default
+password, and ZIPs with a short list of passwords malware distribution uses
+(`infected`, `virus`, …), so neither needs configuration.
+`--passwords` and ClamAV `.pwdb` databases add your own.
 
 An archive that stays encrypted is still a signal: "this member is encrypted" can
 be matched by `.cdb` signatures, and `--partial-as password-protected=found`

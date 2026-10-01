@@ -5,20 +5,25 @@ description: Compile ClamAV signatures into a .exavdb once for a fast, low-memor
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-Loading raw ClamAV signatures means building a large in-memory automaton, which
-takes time and gigabytes of transient RAM. `--build-db` does that work once and
-writes a self-contained `.exavdb`; pointing `-d` at that file restores the
-automaton instead of rebuilding it.
+Loading raw ClamAV signatures means parsing millions of them and building the
+signature index, which takes time and transient RAM. `--build-db` does that work
+once and writes a self-contained `.exavdb`; pointing `-d` at that file reads the
+index back instead of rebuilding it.
 
-## Why it matters
+## What it costs
 
-For the full official database (`main.cvd` + `daily.cvd`), a raw load takes over
-a minute and several GiB of RAM; loading the prebuilt database takes seconds and
-about a GiB. Absolute figures depend on hardware and on the engine version.
+Measured with the 0.0.2 engine on a small arm64 VM, as the peak RSS of the
+process. Figures depend on hardware and on the engine version.
 
-The build is where exav spends effort so that loading and scanning don't have
-to: whatever can be computed once from the signatures is computed there and
-stored, even when that makes the file larger. See
+| Signatures | Parse and build (`--build-db`, or `-d` on the raw files) | Load the `.exavdb` | `.exavdb` size |
+|---|---|---|---|
+| `daily.cvd` alone | ~14 s, 1.3 GB | ~0.7 s, 0.55 GB | 140 MB |
+| `main` + `daily` + `bytecode` | ~23 s, 1.6 GB | ~1.3 s, 0.92 GB | 352 MB |
+
+A raw load pays the build column on every start and every reload. The build is
+where exav spends effort so that loading and scanning don't have to: whatever
+can be computed once from the signatures is computed there and stored, even when
+that makes the file larger. See
 [Design principles](/concepts/design-principles/#work-at-build-time).
 
 <Aside type="note">
@@ -31,11 +36,16 @@ See [Signatures](/guides/signatures/) for the former.
 
 <Steps>
 
-1. Build the database on a host with enough RAM (the full build wants 6 to 8 GiB):
+1. Build the database on a host with enough RAM (the full set wants about 2 GB,
+   see [What it costs](#what-it-costs)):
 
    ```sh
    exav -d ~/.cvdupdate/database --build-db exav.exavdb
    ```
+
+   PUA detection is decided here: add `--detect pua` to the build if any
+   scanner should detect PUA. `--detect pua` on a scan that loads a `.exavdb`
+   changes nothing.
 
 2. Distribute `exav.exavdb`, then load it everywhere:
 
@@ -57,38 +67,32 @@ and a database with another version is rejected rather than loaded
 half-understood:
 
 ```text
-exav: loading database old.exavdb: unsupported database version 3 (this build expects 5)
+exav: loading database old.exavdb: unsupported database version 3 (this build expects 4)
 ```
 
-exav 0.0.2 reads format 5, so rebuild every `.exavdb` made by 0.0.1. Nothing is
-lost: the sources are the `.cvd`/`.cld` files `freshclam` or `cvdupdate` already
-fetched. If you ship a prebuilt database to other hosts, upgrade the builder and
+Rebuild after an upgrade whose changelog mentions a new format version. Nothing
+is lost: the sources are the `.cvd`/`.cld` files `freshclam` or `cvdupdate`
+already fetched. If you ship a prebuilt database to other hosts, upgrade the builder and
 the scanners together: a download is checked for integrity, not for its format
 version, so a scanner offered a newer format keeps the database it has on a
 reload, and fails to start from scratch.
 
-## Building on a small host
-
-Where RAM is tight, `--build-shard-bytes <SIZE>` splits each large partition so
-no single automaton construction exceeds that size, at a small cost in scan
-speed:
-
-```sh
-exav -d ~/.cvdupdate/database --build-db exav.exavdb --build-shard-bytes 1G
-```
-
-It bounds each shard's transient, not the total peak: the parsed signature set
-stays resident underneath, so the peak is roughly the shard size plus that.
-
 <Aside type="caution">
 The database is a trusted artifact: build and fetch it over a channel you trust.
-It is framed `MAGIC | VERSION | payload | SHA-256`, so a torn or wrong-version
+It is framed `MAGIC | VERSION | payload | CRC-32`, so a torn or wrong-version
 file is rejected on load, but it is not meant to be parsed from untrusted input.
 </Aside>
 
 ## Updating a running deployment
 
-The daemon polls the database file's mtime (like clamd's `SelfCheck`), in every
+Point the daemon at the database file itself with `-d`. A `.exavdb` inside a
+directory given to `--sig-dir` is not loaded.
+
+```sh
+exav --listen /run/exav/exav.sock -d /srv/exav/live.exavdb
+```
+
+The daemon polls that file's mtime (like clamd's `SelfCheck`), in every
 listener mode, so an update is a rebuild and an atomic swap:
 
 ```sh
@@ -106,13 +110,18 @@ mv /srv/exav/live.exavdb.tmp /srv/exav/live.exavdb
 ```
 
 The rename means a poll only ever sees a complete file, and the integrity frame
-lets the daemon reject a bad one and keep serving the current database.
+lets the daemon reject a bad one and keep serving the current database. To
+reload at once, send `RELOAD` or `SIGUSR2` (see
+[Hot-reloading signatures](/guides/daemon/#hot-reloading-signatures)). A reload
+holds the new database next to the old one until the swap, so leave room for
+both (see [Sizing a server](/guides/sizing/)).
 
 ## Pulling the database over HTTP
 
 When the `.exavdb` is built on one server and the scanners run elsewhere, the
 daemon can pull it over HTTP instead of sharing a volume: give it `--db-url` and
-`--auto-update` (needs an `http-update` build):
+`--auto-update`. This needs an `http-update` build, such as the Docker image;
+the release binaries lack it (see [Installation](/getting-started/installation/)).
 
 ```sh
 exav --listen /run/exav/exav.sock --auto-update --workers 4 \
@@ -127,7 +136,15 @@ destination is `<--sig-dir>/remote.exavdb`.
 here rather than a day, because the check is a conditional `HEAD` comparing the
 `ETag` / `Last-Modified` and transfers nothing when the file has not changed.
 Only a changed validator triggers a download, which is installed only after its
-`Content-Length` and trailing SHA-256 verify; a corrupt or interrupted download
-is rejected and the current database kept. Basic-auth credentials in the URL
-(percent-encoded as URLs require) are sent as a header and redacted from logs.
-See the [Docker guide](/guides/docker/) for the container equivalent.
+`Content-Length` and trailing CRC-32 verify; a corrupt or interrupted download
+is rejected and the current database kept. The download is held in memory until
+it verifies, so budget its size on top of the loaded database. Basic-auth
+credentials in the URL (percent-encoded as URLs require) are sent as a header
+and redacted from logs. See the [Docker guide](/guides/docker/) for the
+container equivalent.
+
+## Next
+
+- [Daemon mode](/guides/daemon/): serve the database over the clamd protocol.
+- [Sizing a server](/guides/sizing/): memory for the database and the scans.
+- [Docker](/guides/docker/): the same setup in a container.

@@ -3,7 +3,7 @@ title: WASM sandbox
 description: Run the whole exav engine inside a WebAssembly sandbox, for untrusted signatures, untrusted files, or to avoid trusting exav itself.
 ---
 
-import { Aside, Steps } from '@astrojs/starlight/components';
+import { Steps } from '@astrojs/starlight/components';
 
 Two reasons to run the scanner inside a WASM sandbox:
 
@@ -14,27 +14,29 @@ Two reasons to run the scanner inside a WASM sandbox:
   The sandbox needs no assumption that exav's own code is correct.
 
 The same `exav-core` engine compiles to `wasm32-wasip1` and runs under any WASI
-runtime (wasmtime, wasmer, wazero) with no custom host code: you bring your own
-runtime, and a bug inside exav costs a crashed sandbox rather than a compromised
-host.
+runtime (wasmtime, wasmer, wazero): you bring your own runtime, and a bug inside
+exav costs a crashed sandbox rather than a compromised host.
 
 ## Quick start
 
 <Steps>
 
-1. Build the WASM module, or download `exav-wasm-<tag>-wasm32-wasip1.wasm` from
-   a [release](https://github.com/sylvinus/exav/releases):
+1. Download `exav-wasm-<tag>-wasm32-wasip1.wasm` from a
+   [release](https://github.com/sylvinus/exav/releases) and rename it
+   `exav.wasm`, or build it from a clone of the repository (Rust 1.91 or newer):
 
    ```sh
+   git clone https://github.com/sylvinus/exav && cd exav
    rustup target add wasm32-wasip1
    cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
+   cp target/wasm32-wasip1/release/exav-wasm.wasm exav.wasm
    ```
 
 2. Optionally strip debug names to make it smaller:
 
    ```sh
    cargo install wasm-tools   # if not installed
-   wasm-tools strip -a target/wasm32-wasip1/release/exav-wasm.wasm -o exav.wasm
+   wasm-tools strip -a exav.wasm -o exav.min.wasm && mv exav.min.wasm exav.wasm
    ```
 
 3. Scan a file under wasmtime, with the signatures mounted at `/db` and the
@@ -52,8 +54,8 @@ host.
 
 The first argument is the database: a directory of signature files, or a
 [prebuilt `.exavdb`](/guides/prebuilt-database/) file. One that loads no real
-signatures is refused, as the native `exav` refuses it. Mount only the
-directories the module needs.
+signatures is refused, as the native `exav` refuses it. The other arguments are
+files; a directory is not walked. Mount only the directories the module needs.
 
 ## Output
 
@@ -68,13 +70,14 @@ wasmtime --dir ./sigs::/db --dir ./in::/in exav.wasm /db /in/a.exe /in/b.zip /in
 
 ```json
 {"file":"/in/a.exe","findings":[{"detail":"PE","label":"type"}],"verdict":"Clean"}
-{"file":"/in/b.zip","findings":[],"verdict":{"Infected":{"method":"Pattern","offset":4096,"signature":"Win.Trojan.Agent-1234"}}}
+{"file":"/in/b.zip","findings":[{"detail":"ZIP","label":"type"}],"verdict":{"Infected":{"method":"Pattern","offset":4096,"signature":"Win.Trojan.Agent-1234"}}}
 {"error":"No such file or directory (os error 44)","file":"/in/gone"}
 ```
 
-`Verdict` variants: `Clean`, `Infected`, `LimitsExceeded`, `Unscannable`,
-`PasswordProtected`. The exit code is the native `exav`'s: `0` clean, `1` a
-detection, `2` an error, `3` a file not fully examined.
+`verdict` is `"Clean"` or an object named after the variant: `Infected` as
+above, or `LimitsExceeded`, `Unscannable` or `PasswordProtected` with a
+`reason`, such as `{"Unscannable":{"reason":"..."}}`. The exit code follows the
+native `exav`'s [precedence](/reference/verdicts/#process-exit-code).
 
 ## What the sandbox changes
 
@@ -88,7 +91,6 @@ sandbox:
 | Signature trust | full host access | a memory-limited WASM instance |
 | Runtime | exav itself | wasmtime or another WASI runtime |
 | What a bug can reach | the host | the module's own memory and mounted directories |
-| Custom host code | n/a | none |
 | Speed | native | slower |
 
 - **Memory is bounded:** the module cannot reach memory outside its own linear
@@ -98,12 +100,16 @@ sandbox:
 - **Instruction limits:** wasmtime can give the module a budget of executed
   instructions ("fuel") and stop it when that runs out.
 - **Panic isolation:** a panic becomes a wasmtime trap; the host is unaffected.
+- **No custom ABI:** the module is a standard WASI command, so the host is the
+  runtime itself, not code exav wrote.
 
-<Aside type="tip" title="No custom host code">
-The module is a standard WASI command, with no custom ABI or wire protocol. The
-host is the runtime itself, not code exav wrote. Any runtime supporting
-`wasm32-wasip1` works.
-</Aside>
+A `wasm32` module may grow to 4 GiB unless the runtime caps it. With wasmtime,
+set both limits on the command line (`wasmtime run -W help` lists them):
+
+```sh
+wasmtime run -W max-memory-size=3221225472 -W fuel=100000000000 \
+  --dir ./sigs::/db --dir ./in::/in exav.wasm /db /in/a.exe
+```
 
 ## Limitations
 
@@ -111,9 +117,14 @@ host is the runtime itself, not code exav wrote. Any runtime supporting
   high-throughput scanning use a native `exav --listen`.
 - **No stdin:** files must be on a mounted filesystem.
 - **No HTTP(S) scanning:** the module cannot make network requests.
-- **Database size:** `wasm32` memory tops out at 4 GiB, and building the full
-  raw ClamAV database comes close. Give it a
-  [prebuilt database](/guides/prebuilt-database/) built natively.
+- **No flags:** every scan uses the defaults. There is no `--detect` (PUA only
+  from a `.exavdb` built with it), `--all-matches`, `--passwords` (only `.pwdb`
+  passwords are tried) or `--partial-as`, and YARA's filename variables are
+  undefined.
+- **Memory:** the database and each scanned file, read whole, share the 4 GiB
+  `wasm32` address space. Loading raw signatures costs far more than a
+  [prebuilt database](/guides/prebuilt-database/#what-it-costs) built natively,
+  so give it one.
 
 ## Alternatives
 

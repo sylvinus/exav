@@ -315,6 +315,7 @@ fn stream_sevenz<T>(
                     size: None,
                     encrypted: true,
                     unsupported: Some("7z: encrypted header, unsupported codec"),
+                    ..MemberMeta::default()
                 };
                 return Ok(visit(&meta, None, budget));
             }
@@ -347,6 +348,7 @@ fn stream_sevenz<T>(
                 size: Some(file.size),
                 encrypted: true,
                 unsupported: Some(reason),
+                ..MemberMeta::default()
             };
             if let Some(r) = visit(&meta, None, budget) {
                 return Ok(Some(r));
@@ -445,7 +447,7 @@ fn stream_sevenz<T>(
                         comp_size: file.size,
                         size: Some(file.size),
                         encrypted: true,
-                        unsupported: None,
+                        ..MemberMeta::default()
                     };
                     emit_bytes(&meta, Some(fd), budget, visit)?
                 }
@@ -456,6 +458,7 @@ fn stream_sevenz<T>(
                         size: Some(file.size),
                         encrypted: true,
                         unsupported: Some("7z: wrong or missing password"),
+                        ..MemberMeta::default()
                     };
                     visit(&meta, None, budget)
                 }
@@ -475,8 +478,8 @@ fn stream_sevenz<T>(
                 name,
                 comp_size: file.size,
                 size: Some(file.size),
-                encrypted: false,
                 unsupported: Some("7z: member starts past the peak-buffer limit"),
+                ..MemberMeta::default()
             };
             if let Some(t) = visit(&meta, None, budget) {
                 return Ok(Some(t));
@@ -509,12 +512,12 @@ fn stream_sevenz<T>(
                 name,
                 comp_size: file.size,
                 size: Some(file.size),
-                encrypted: false,
                 unsupported: Some(if failed {
                     "7z: solid block failed to decode before this member"
                 } else {
                     "7z: solid block ended before this member"
                 }),
+                ..MemberMeta::default()
             };
             if let Some(t) = visit(&meta, None, budget) {
                 return Ok(Some(t));
@@ -526,8 +529,7 @@ fn stream_sevenz<T>(
             name,
             comp_size: file.size,
             size: Some(file.size),
-            encrypted: false,
-            unsupported: None,
+            ..MemberMeta::default()
         };
         if let Some(t) = emit_stream(&meta, &mut window, budget, visit)? {
             return Ok(Some(t));

@@ -1,11 +1,10 @@
 //! On-disk serialization of a built [`Scanner`] (the compiled `.exavdb`
-//! database), so cold starts skip the expensive automaton construction and
-//! signature parsing.
+//! database), so cold starts skip signature parsing and the index build.
 //!
 //! The database is built once, typically on a capable host such as a daily CI
 //! job, and the resulting file is distributed to and loaded directly by CLI
-//! instances. Loading it reconstructs the double-array automatons from
-//! daachorse's own byte format (no rebuild).
+//! instances. Loading it reads the signature index back as the build laid it
+//! out (no rebuild).
 //!
 //! The file starts with a magic tag and a format version; a mismatch is
 //! rejected rather than misread. The database is a trusted artifact (you build
@@ -15,7 +14,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
+use crc32fast::Hasher as Crc32;
 
 use crate::engine::SigEngine;
 use crate::fuzzy::FuzzyDb;
@@ -34,22 +33,312 @@ const MAGIC: &[u8; 8] = b"EXAVDB\x00\x01";
 ///
 /// The current layout includes the serialized COMPILED YARA rule set in `YaraDb`
 /// (the compiled-blob + blob-version fields), so a prebuilt database loads the
-/// YARA engine without recompiling. Version 4 dropped the streaming literal set;
-/// version 5 added each automaton's longest anchor runs.
-const VERSION: u32 = 5;
+/// YARA engine without recompiling. Version 3 is exav 0.0.1's; version 4
+/// replaced the signature automatons with the anchor index and the pinned
+/// bodies, and the trailing SHA-256 with a CRC-32. Bumped once per release
+/// at most.
+///
+/// Enum variants are stored by index ([`to_vec_indexed`]), so reordering the
+/// variants of a stored enum, or inserting one before others, changes the
+/// format as much as a new field does: bump this then, and exav-update's
+/// `EXAV_DB_VERSION` with it.
+const VERSION: u32 = 4;
 /// Fixed header: 8-byte magic + 4-byte little-endian version.
 const HEADER_LEN: u64 = 12;
-/// Trailing SHA-256 of the payload (integrity stamp).
-const DIGEST_LEN: u64 = 32;
+/// Trailing CRC-32 of the payload, little-endian. The file is trusted (see the
+/// module docs), so this guards against a torn download or a damaged disk, not
+/// against tampering: what a checksum is for, at a fraction of a hash's cost.
+const DIGEST_LEN: u64 = 4;
 
-/// Serialize one value to `w` (MessagePack via the maintained rmp-serde).
+/// Serialize one value to `w`, as [`to_vec_indexed`] encodes it.
 pub(crate) fn enc<T: serde::Serialize, W: Write>(val: &T, w: &mut W) -> io::Result<()> {
-    rmp_serde::encode::write(w, val).map_err(io::Error::other)
+    w.write_all(&to_vec_indexed(val)?)
 }
 
 /// Deserialize one value from `r`.
 pub(crate) fn dec<T: serde::de::DeserializeOwned, R: Read>(r: &mut R) -> io::Result<T> {
     rmp_serde::decode::from_read(r).map_err(io::Error::other)
+}
+
+/// Encode `val` as MessagePack the way rmp-serde lays it out (structs as
+/// arrays), except that an enum variant is written as its index rather than
+/// its name: rmp-serde reads either, and an index is decoded without a string
+/// compared per variant, which was a tenth of a load's time. Unlike rmp-serde,
+/// it refuses a sequence or map of unknown length and 128-bit integers; no
+/// stored type has either.
+pub(crate) fn to_vec_indexed<T: serde::Serialize + ?Sized>(val: &T) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    val.serialize(Indexed(&mut out)).map_err(io::Error::other)?;
+    Ok(out)
+}
+
+/// The serializer behind [`to_vec_indexed`].
+struct Indexed<'a>(&'a mut Vec<u8>);
+
+/// An error of [`Indexed`]: a length MessagePack cannot hold, or one serde
+/// did not give.
+#[derive(Debug)]
+struct IndexedError(String);
+
+impl std::fmt::Display for IndexedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IndexedError {}
+
+impl serde::ser::Error for IndexedError {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        IndexedError(msg.to_string())
+    }
+}
+
+impl From<rmp::encode::ValueWriteError> for IndexedError {
+    fn from(e: rmp::encode::ValueWriteError) -> Self {
+        IndexedError(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for IndexedError {
+    fn from(e: std::io::Error) -> Self {
+        IndexedError(e.to_string())
+    }
+}
+
+fn len32(len: Option<usize>) -> Result<u32, IndexedError> {
+    len.and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| IndexedError("a length unknown or past 2^32".into()))
+}
+
+impl<'a> serde::Serializer for Indexed<'a> {
+    type Ok = ();
+    type Error = IndexedError;
+    type SerializeSeq = Self;
+    type SerializeTuple = Self;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
+    type SerializeStructVariant = Self;
+
+    fn serialize_bool(self, v: bool) -> Result<(), IndexedError> {
+        Ok(rmp::encode::write_bool(self.0, v)?)
+    }
+    fn serialize_i8(self, v: i8) -> Result<(), IndexedError> {
+        self.serialize_i64(v as i64)
+    }
+    fn serialize_i16(self, v: i16) -> Result<(), IndexedError> {
+        self.serialize_i64(v as i64)
+    }
+    fn serialize_i32(self, v: i32) -> Result<(), IndexedError> {
+        self.serialize_i64(v as i64)
+    }
+    fn serialize_i64(self, v: i64) -> Result<(), IndexedError> {
+        rmp::encode::write_sint(self.0, v)?;
+        Ok(())
+    }
+    fn serialize_u8(self, v: u8) -> Result<(), IndexedError> {
+        self.serialize_u64(v as u64)
+    }
+    fn serialize_u16(self, v: u16) -> Result<(), IndexedError> {
+        self.serialize_u64(v as u64)
+    }
+    fn serialize_u32(self, v: u32) -> Result<(), IndexedError> {
+        self.serialize_u64(v as u64)
+    }
+    fn serialize_u64(self, v: u64) -> Result<(), IndexedError> {
+        rmp::encode::write_uint(self.0, v)?;
+        Ok(())
+    }
+    fn serialize_f32(self, v: f32) -> Result<(), IndexedError> {
+        Ok(rmp::encode::write_f32(self.0, v)?)
+    }
+    fn serialize_f64(self, v: f64) -> Result<(), IndexedError> {
+        Ok(rmp::encode::write_f64(self.0, v)?)
+    }
+    fn serialize_char(self, v: char) -> Result<(), IndexedError> {
+        self.serialize_str(v.encode_utf8(&mut [0; 4]))
+    }
+    fn serialize_str(self, v: &str) -> Result<(), IndexedError> {
+        Ok(rmp::encode::write_str(self.0, v)?)
+    }
+    fn serialize_bytes(self, v: &[u8]) -> Result<(), IndexedError> {
+        Ok(rmp::encode::write_bin(self.0, v)?)
+    }
+    fn serialize_none(self) -> Result<(), IndexedError> {
+        self.serialize_unit()
+    }
+    fn serialize_some<T: serde::Serialize + ?Sized>(self, v: &T) -> Result<(), IndexedError> {
+        v.serialize(self)
+    }
+    fn serialize_unit(self) -> Result<(), IndexedError> {
+        Ok(rmp::encode::write_nil(self.0)?)
+    }
+    fn serialize_unit_struct(self, _: &'static str) -> Result<(), IndexedError> {
+        rmp::encode::write_array_len(self.0, 0)?;
+        Ok(())
+    }
+    fn serialize_unit_variant(
+        self,
+        _: &'static str,
+        index: u32,
+        _: &'static str,
+    ) -> Result<(), IndexedError> {
+        self.serialize_u32(index)
+    }
+    fn serialize_newtype_struct<T: serde::Serialize + ?Sized>(
+        self,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), IndexedError> {
+        v.serialize(self)
+    }
+    fn serialize_newtype_variant<T: serde::Serialize + ?Sized>(
+        self,
+        _: &'static str,
+        index: u32,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), IndexedError> {
+        rmp::encode::write_map_len(self.0, 1)?;
+        rmp::encode::write_uint(self.0, index as u64)?;
+        v.serialize(self)
+    }
+    fn serialize_seq(self, len: Option<usize>) -> Result<Self, IndexedError> {
+        rmp::encode::write_array_len(self.0, len32(len)?)?;
+        Ok(self)
+    }
+    fn serialize_tuple(self, len: usize) -> Result<Self, IndexedError> {
+        self.serialize_seq(Some(len))
+    }
+    fn serialize_tuple_struct(self, _: &'static str, len: usize) -> Result<Self, IndexedError> {
+        self.serialize_seq(Some(len))
+    }
+    fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        index: u32,
+        _: &'static str,
+        len: usize,
+    ) -> Result<Self, IndexedError> {
+        rmp::encode::write_map_len(self.0, 1)?;
+        rmp::encode::write_uint(self.0, index as u64)?;
+        self.serialize_seq(Some(len))
+    }
+    fn serialize_map(self, len: Option<usize>) -> Result<Self, IndexedError> {
+        rmp::encode::write_map_len(self.0, len32(len)?)?;
+        Ok(self)
+    }
+    fn serialize_struct(self, _: &'static str, len: usize) -> Result<Self, IndexedError> {
+        self.serialize_seq(Some(len))
+    }
+    fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        index: u32,
+        _: &'static str,
+        len: usize,
+    ) -> Result<Self, IndexedError> {
+        self.serialize_tuple_variant("", index, "", len)
+    }
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+}
+
+impl serde::ser::SerializeSeq for Indexed<'_> {
+    type Ok = ();
+    type Error = IndexedError;
+    fn serialize_element<T: serde::Serialize + ?Sized>(
+        &mut self,
+        v: &T,
+    ) -> Result<(), IndexedError> {
+        v.serialize(Indexed(self.0))
+    }
+    fn end(self) -> Result<(), IndexedError> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTuple for Indexed<'_> {
+    type Ok = ();
+    type Error = IndexedError;
+    fn serialize_element<T: serde::Serialize + ?Sized>(
+        &mut self,
+        v: &T,
+    ) -> Result<(), IndexedError> {
+        v.serialize(Indexed(self.0))
+    }
+    fn end(self) -> Result<(), IndexedError> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTupleStruct for Indexed<'_> {
+    type Ok = ();
+    type Error = IndexedError;
+    fn serialize_field<T: serde::Serialize + ?Sized>(&mut self, v: &T) -> Result<(), IndexedError> {
+        v.serialize(Indexed(self.0))
+    }
+    fn end(self) -> Result<(), IndexedError> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTupleVariant for Indexed<'_> {
+    type Ok = ();
+    type Error = IndexedError;
+    fn serialize_field<T: serde::Serialize + ?Sized>(&mut self, v: &T) -> Result<(), IndexedError> {
+        v.serialize(Indexed(self.0))
+    }
+    fn end(self) -> Result<(), IndexedError> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeMap for Indexed<'_> {
+    type Ok = ();
+    type Error = IndexedError;
+    fn serialize_key<T: serde::Serialize + ?Sized>(&mut self, k: &T) -> Result<(), IndexedError> {
+        k.serialize(Indexed(self.0))
+    }
+    fn serialize_value<T: serde::Serialize + ?Sized>(&mut self, v: &T) -> Result<(), IndexedError> {
+        v.serialize(Indexed(self.0))
+    }
+    fn end(self) -> Result<(), IndexedError> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStruct for Indexed<'_> {
+    type Ok = ();
+    type Error = IndexedError;
+    fn serialize_field<T: serde::Serialize + ?Sized>(
+        &mut self,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), IndexedError> {
+        v.serialize(Indexed(self.0))
+    }
+    fn end(self) -> Result<(), IndexedError> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStructVariant for Indexed<'_> {
+    type Ok = ();
+    type Error = IndexedError;
+    fn serialize_field<T: serde::Serialize + ?Sized>(
+        &mut self,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), IndexedError> {
+        v.serialize(Indexed(self.0))
+    }
+    fn end(self) -> Result<(), IndexedError> {
+        Ok(())
+    }
 }
 
 /// Run `f` on a thread of its own while `g` runs on this one, and return both:
@@ -151,12 +440,12 @@ impl<T: PayloadRead + ?Sized> PayloadRead for &mut T {
     }
 }
 
-/// The payload of a database file, read once and hashed as it goes, so the
-/// integrity check does not cost a second read of the file.
+/// The payload of a database file, read once and checksummed as it goes, so
+/// the integrity check does not cost a second read of the file.
 struct HashedPayload<R> {
     inner: R,
     left: u64,
-    hasher: Sha256,
+    hasher: Crc32,
 }
 
 impl<R: Read> Read for HashedPayload<R> {
@@ -169,8 +458,8 @@ impl<R: Read> Read for HashedPayload<R> {
     }
 }
 
-/// Buffered above the hashing, so the digest is fed large pieces rather
-/// than every few bytes a decoder asks for.
+/// Buffered above the checksum, so it is fed large pieces rather than every
+/// few bytes a decoder asks for.
 impl<R: Read> PayloadRead for io::BufReader<HashedPayload<R>> {
     fn left(&self) -> u64 {
         self.get_ref().left + self.buffer().len() as u64
@@ -193,10 +482,10 @@ pub(crate) fn dec_u32s<R: PayloadRead>(r: &mut R) -> io::Result<Vec<u32>> {
     Ok(words.iter().map(|&w| u32::from_le_bytes(w)).collect())
 }
 
-/// A writer that SHA-256s everything passing through it (the payload digest).
+/// A writer that checksums everything passing through it (the payload).
 struct HashWriter<W> {
     inner: W,
-    hasher: Sha256,
+    hasher: Crc32,
 }
 
 impl<W: Write> Write for HashWriter<W> {
@@ -214,18 +503,20 @@ fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// Serialize a built database, framed as `MAGIC | VERSION | payload | sha256`.
+/// Serialize a built database, framed as `MAGIC | VERSION | payload | crc32`.
 pub fn write<W: Write>(db: &Scanner, mut w: W) -> io::Result<()> {
     w.write_all(MAGIC)?;
     w.write_all(&VERSION.to_le_bytes())?;
     let mut hw = HashWriter {
         inner: w,
-        hasher: Sha256::new(),
+        hasher: Crc32::new(),
     };
     write_payload(db, &mut hw)?;
     let digest = hw.hasher.finalize();
-    hw.inner.write_all(&digest)?;
-    Ok(())
+    hw.inner.write_all(&digest.to_le_bytes())?;
+    // A buffered writer's last bytes go out here, where an error is seen,
+    // not when it is dropped, where it is lost.
+    hw.inner.flush()
 }
 
 fn write_payload<W: Write>(db: &Scanner, w: &mut W) -> io::Result<()> {
@@ -334,12 +625,10 @@ pub fn read<R: Read>(mut r: R) -> io::Result<Scanner> {
     read_payload(payload)
 }
 
-/// SHA-256 the payload and compare to the stored trailer.
+/// Checksum the payload and compare to the stored trailer.
 fn verify_digest(payload: &[u8], trailer: &[u8]) -> io::Result<()> {
-    let mut h = Sha256::new();
-    h.update(payload);
-    if h.finalize().as_slice() != trailer {
-        return Err(bad("database integrity check failed (digest mismatch)"));
+    if crc32fast::hash(payload).to_le_bytes() != trailer {
+        return Err(bad("database integrity check failed (checksum mismatch)"));
     }
     Ok(())
 }
@@ -359,21 +648,20 @@ pub fn save(db: &Scanner, path: &Path) -> io::Result<()> {
     write(db, io::BufWriter::new(f))
 }
 
-/// Load a database file from `path`. Two passes over the file (hash, then
-/// deserialize) so the integrity check happens before deserialization without
-/// buffering the whole payload in memory.
+/// Load a database file from `path`, in one pass: the payload is checksummed
+/// as it is decoded, and the checksum checked before the result is used,
+/// without holding the file in memory.
 pub fn load(path: &Path) -> io::Result<Scanner> {
     let mut f = std::fs::File::open(path)?;
     let total = f.metadata()?.len();
     let payload_len = read_header(&mut f, total)?;
-    // One pass: the payload is hashed as it is decoded, and the digest checked
-    // before the result is used. A torn or corrupt file is rejected all the
-    // same; what decoding it can do first is bounded, since no length in it
-    // is trusted past the end of the payload.
+    // A torn or corrupt file is rejected all the same; what decoding it can
+    // do first is bounded, since no length in it is trusted past the end of
+    // the payload.
     let hashed = HashedPayload {
         inner: f,
         left: payload_len,
-        hasher: Sha256::new(),
+        hasher: Crc32::new(),
     };
     let mut payload = io::BufReader::with_capacity(1 << 20, hashed);
     let decoded = read_payload(&mut payload);
@@ -381,8 +669,8 @@ pub fn load(path: &Path) -> io::Result<Scanner> {
     let mut hashed = payload.into_inner();
     let mut trailer = [0u8; DIGEST_LEN as usize];
     hashed.inner.read_exact(&mut trailer)?;
-    if hashed.hasher.finalize().as_slice() != trailer {
-        return Err(bad("database integrity check failed (digest mismatch)"));
+    if hashed.hasher.finalize().to_le_bytes() != trailer {
+        return Err(bad("database integrity check failed (checksum mismatch)"));
     }
     decoded
 }
@@ -391,6 +679,61 @@ pub fn load(path: &Path) -> io::Result<Scanner> {
 mod tests {
     use crate::{analyze, ScanOptions, Verdict};
 
+    /// What the indexed encoder writes, rmp-serde reads back as the same
+    /// value, every shape serde has; and no variant goes by its name.
+    #[test]
+    fn indexed_variants_read_back_as_written() {
+        // The shared suffix is what the check below looks for in the bytes.
+        #[allow(clippy::enum_variant_names)]
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        enum Shape {
+            UnitVariantName,
+            NewtypeVariantName(u32),
+            TupleVariantName(i8, String),
+            StructVariantName { a: Option<u64>, b: Vec<Shape> },
+        }
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Unit;
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct All {
+            shapes: Vec<Shape>,
+            map: std::collections::BTreeMap<u16, (bool, char)>,
+            none: Option<Shape>,
+            unit: Unit,
+            float: f64,
+            neg: i64,
+            #[serde(with = "super::opt_blob")]
+            blob: Option<Vec<u8>>,
+        }
+        let v = All {
+            shapes: vec![
+                Shape::UnitVariantName,
+                Shape::NewtypeVariantName(u32::MAX),
+                Shape::TupleVariantName(-3, "é".into()),
+                Shape::StructVariantName {
+                    a: Some(1 << 40),
+                    b: vec![
+                        Shape::UnitVariantName,
+                        Shape::StructVariantName { a: None, b: vec![] },
+                    ],
+                },
+            ],
+            map: [(7, (true, 'x')), (300, (false, '€'))].into(),
+            none: None,
+            unit: Unit,
+            float: -2.5,
+            neg: i64::MIN,
+            blob: Some(vec![0, 255, 7]),
+        };
+        let bytes = super::to_vec_indexed(&v).unwrap();
+        assert_eq!(rmp_serde::from_slice::<All>(&bytes).unwrap(), v);
+        assert!(
+            !bytes.windows(7).any(|w| w == b"Variant"),
+            "a variant written by its name"
+        );
+        assert!(bytes.len() < rmp_serde::to_vec(&v).unwrap().len());
+    }
+
     #[test]
     #[cfg_attr(
         target_family = "wasm",
@@ -398,19 +741,26 @@ mod tests {
     )]
     fn database_round_trip_matches_fresh_build() {
         let dir = crate::tmpfile::TempDir::new().unwrap();
-        // A literal ndb sig, a wildcard ndb sig, a logical sig, and a hash sig.
+        // A literal ndb sig, a wildcard ndb sig, a logical sig, and a hash sig;
+        // and signatures their offset pins, checked where it puts them.
         std::fs::write(
             dir.path().join("a.ndb"),
-            "Sig.Lit:0:*:6d616c6963696f7573\nSig.Wild:0:*:6d61*696f7573\n",
+            "Sig.Lit:0:*:6d616c6963696f7573\nSig.Wild:0:*:6d61*696f7573\n\
+             Sig.Pin:0:0:4d5a9000ff\nSig.Wide:0:4,100:70696e6e6564\n",
         )
         .unwrap();
         std::fs::write(
             dir.path().join("b.ldb"),
-            "Sig.Logic;Engine:0-255;0&1;6d616c;696f7573\n",
+            "Sig.Logic;Engine:0-255;0&1;6d616c;696f7573\n\
+             Sig.PinCI;Engine:51-255,Target:0;0;EOF-6:7a6f6d626965::i\n",
         )
         .unwrap();
         let d = crate::hashes::digests_of(b"hashme");
-        std::fs::write(dir.path().join("c.hdb"), format!("{}:*:Sig.Hash\n", d.md5)).unwrap();
+        std::fs::write(
+            dir.path().join("c.hdb"),
+            format!("{}:*:Sig.Hash\n", d.md5_hex()),
+        )
+        .unwrap();
 
         let fresh = crate::loader::load(dir.path()).unwrap();
 
@@ -435,6 +785,25 @@ mod tests {
                 matches!(b.verdict, Verdict::Infected { .. }),
                 "verdict mismatch for {sample:?}"
             );
+        }
+        for (sample, want) in [
+            (&b"MZ\x90\x00\xff then the rest"[..], Some("Sig.Pin")),
+            (&b"abcdefpinned"[..], Some("Sig.Wide")),
+            (&b"pinned too early"[..], None),
+            (&b"its last word: ZoMbIe"[..], Some("Sig.PinCI")),
+            (&b"zombie, but not last"[..], None),
+        ] {
+            for db in [&fresh, &loaded] {
+                let v = analyze(db, sample, &opts).verdict;
+                assert_eq!(
+                    matches!(v, Verdict::Infected { .. }),
+                    want.is_some(),
+                    "{sample:?}: {v:?}"
+                );
+                if want.is_some() {
+                    assert_eq!(v.detail(), want, "{sample:?}");
+                }
+            }
         }
     }
 
@@ -463,7 +832,7 @@ mod tests {
         let path = dir.path().join("db.exavdb");
         super::save(&db, &path).unwrap();
 
-        // Flip a byte in the middle of the payload; the digest must reject it.
+        // Flip a byte in the middle of the payload; the checksum must reject it.
         let mut bytes = std::fs::read(&path).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;
@@ -480,7 +849,7 @@ mod tests {
         assert!(super::read(std::io::Cursor::new(&bytes)).is_err());
     }
 
-    /// `load` decodes as it reads and checks the digest at the end, so what it
+    /// `load` decodes as it reads and checks the checksum at the end, so what it
     /// decodes first may be corrupt: any one byte flipped, and any truncation,
     /// has to come out an error, never a panic, a huge allocation or a load.
     #[test]
@@ -496,7 +865,20 @@ mod tests {
             "Sig.L;Engine:51-255,Target:0;0&1;6d616c;6963696f::i\n",
         )
         .unwrap();
+        let d = crate::hashes::digests_of(b"hashme");
+        std::fs::write(
+            dir.path().join("c.hdb"),
+            format!("{}:6:Sig.Md5\n", d.md5_hex()),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("d.hsb"),
+            format!("{}:*:Sig.Sha\n", d.sha256_hex()),
+        )
+        .unwrap();
         let db = crate::loader::load(dir.path()).unwrap();
+        let v = analyze(&db, b"hashme", &ScanOptions::default()).verdict;
+        assert!(matches!(v, Verdict::Infected { .. }), "{v:?}");
         let mut good = Vec::new();
         super::write(&db, &mut good).unwrap();
         let path = dir.path().join("db.exavdb");

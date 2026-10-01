@@ -181,9 +181,8 @@ fn read_entry(
         let (data, partial) = content.into_bytes(meta, budget)?;
         entry.data = data;
         if partial && entry.unsupported.is_none() {
-            entry.unsupported = Some(
-                "member failed to decode part way; the bytes before the failure are kept",
-            );
+            entry.unsupported =
+                Some("member failed to decode part way; the bytes before the failure are kept");
         }
     }
     Ok(entry)
@@ -382,21 +381,26 @@ impl Archive {
         let out = Array::new();
         let mut index = 0;
         let mut failed = None;
-        let walked = walk(self.fmt, self.bytes.source(), &mut budget, &mut |meta, content, _| {
-            let size = match &content {
-                Some(Member::Bytes(data)) => Some(data.len() as u64),
-                _ => meta.size,
-            };
-            match member_to_js(meta, index, size) {
-                Ok(m) => out.push(&m),
-                Err(e) => {
-                    failed = Some(e);
-                    return Some(());
-                }
-            };
-            index += 1;
-            None
-        });
+        let walked = walk(
+            self.fmt,
+            self.bytes.source(),
+            &mut budget,
+            &mut |meta, content, _| {
+                let size = match &content {
+                    Some(Member::Bytes(data)) => Some(data.len() as u64),
+                    _ => meta.size,
+                };
+                match member_to_js(meta, index, size) {
+                    Ok(m) => out.push(&m),
+                    Err(e) => {
+                        failed = Some(e);
+                        return Some(());
+                    }
+                };
+                index += 1;
+                None
+            },
+        );
         if let Some(e) = failed {
             return Err(e);
         }
@@ -416,13 +420,18 @@ impl Archive {
     ) -> Result<JsValue, JsValue> {
         let mut budget = self.budget(passwords);
         let mut at = 0;
-        let found = walk(self.fmt, self.bytes.source(), &mut budget, &mut |meta, content, b| {
-            if at < index {
-                at += 1;
-                return None;
-            }
-            Some(read_entry(meta, content, b))
-        });
+        let found = walk(
+            self.fmt,
+            self.bytes.source(),
+            &mut budget,
+            &mut |meta, content, b| {
+                if at < index {
+                    at += 1;
+                    return None;
+                }
+                Some(read_entry(meta, content, b))
+            },
+        );
         match found {
             Ok(Some(Ok(entry))) => {
                 self.extracted += entry.data.len() as u64;
@@ -445,23 +454,28 @@ impl Archive {
         let out = Array::new();
         let mut taken = 0;
         let mut failed = None;
-        let walked = walk(self.fmt, self.bytes.source(), &mut budget, &mut |meta, content, b| {
-            let entry = match read_entry(meta, content, b) {
-                Ok(entry) => entry,
-                Err(hit) => return Some(Err(hit)),
-            };
-            taken += entry.data.len() as u64;
-            match unpack_entry_to_js(&entry) {
-                Ok(e) => {
-                    out.push(&e);
-                    None
+        let walked = walk(
+            self.fmt,
+            self.bytes.source(),
+            &mut budget,
+            &mut |meta, content, b| {
+                let entry = match read_entry(meta, content, b) {
+                    Ok(entry) => entry,
+                    Err(hit) => return Some(Err(hit)),
+                };
+                taken += entry.data.len() as u64;
+                match unpack_entry_to_js(&entry) {
+                    Ok(e) => {
+                        out.push(&e);
+                        None
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        Some(Ok(()))
+                    }
                 }
-                Err(e) => {
-                    failed = Some(e);
-                    Some(Ok(()))
-                }
-            }
-        });
+            },
+        );
         self.extracted += taken;
         if let Some(e) = failed {
             return Err(e);

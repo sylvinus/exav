@@ -24,7 +24,7 @@ fn both(blob: &[u8], opts: &ScanOptions) -> [(&'static str, Verdict); 2] {
 
 fn zip_with(member: &[u8], comment: &str) -> Vec<u8> {
     let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    z.set_comment(comment);
+    z.set_comment(comment).unwrap();
     z.start_file(
         "member.bin",
         zip::write::SimpleFileOptions::default()

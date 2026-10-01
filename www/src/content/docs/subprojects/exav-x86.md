@@ -21,7 +21,8 @@ assert_eq!(insn.mn, Mn::Mov);
 assert_eq!(insn.len, 3);
 ```
 
-`#![forbid(unsafe_code)]`, no build script, no code generated at build time.
+`#![forbid(unsafe_code)]` and `#![no_std]` (no allocation, no I/O), no build
+script, no code generated at build time.
 
 ## What `None` means
 
@@ -77,7 +78,7 @@ operand, over:
 * truncation: no proper prefix of an instruction may decode,
 * self-consistency: an instruction re-decoded from exactly its own reported
   length must give the same answer,
-* and, behind `--ignored`, every byte offset of 276 real packed samples.
+* and, behind `--ignored`, every byte offset of a corpus of real packed samples.
 
 That last sweep is the gate: at every site where the independent decoder decodes
 something, the test requires agreement and requires that nothing is declined.

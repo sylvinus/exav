@@ -84,7 +84,10 @@ impl Read for BudgetReader<'_> {
 }
 
 /// Metadata for a member handed to a [`walk`] visitor.
-#[derive(Debug, Clone)]
+///
+/// New fields may appear in any release: build one with
+/// `..MemberMeta::default()` for the fields you do not set.
+#[derive(Debug, Clone, Default)]
 pub struct MemberMeta {
     pub name: String,
     /// Compressed size within the container (for `.cdb` matching), or the
@@ -100,6 +103,36 @@ pub struct MemberMeta {
     /// matching password, damage part way). What was decoded, if anything,
     /// still comes with it.
     pub unsupported: Option<&'static str>,
+    /// When the member was last modified, as its container records it.
+    /// Recorded, not checked.
+    pub mtime: Option<Mtime>,
+    /// Its Unix mode (`st_mode`: file type and permission bits), as its
+    /// container records it.
+    pub mode: Option<u32>,
+    /// For a symbolic link whose container records the target apart from the
+    /// content (tar), that target. A ZIP link's target is its content.
+    pub link: Option<String>,
+    /// For a ZIP member, its compression method number (0 stored, 8
+    /// deflate, ...).
+    pub zip_method: Option<u16>,
+}
+
+/// When a member was last modified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mtime {
+    /// Seconds since the Unix epoch.
+    Unix(i64),
+    /// A wall-clock time with no zone, as a DOS timestamp records it: the
+    /// local time where the archive was written. Turning it into an instant
+    /// takes a time zone, which is the reader's to choose.
+    Local {
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
 }
 
 /// A member's content.
@@ -182,6 +215,7 @@ pub fn walk<T>(
             size: None,
             encrypted: false,
             unsupported: Some("format excluded by the caller's allowed_formats"),
+            ..MemberMeta::default()
         };
         return Ok(visit(&meta, None, budget));
     }
@@ -290,9 +324,8 @@ pub(crate) fn single_meta(
     MemberMeta {
         name: name.to_string(),
         comp_size: src.len() as u64,
-        size: None,
-        encrypted: false,
         unsupported,
+        ..MemberMeta::default()
     }
 }
 
@@ -352,6 +385,9 @@ pub(crate) fn emit_entry<T>(
         size: e.unsupported.is_none().then_some(e.data.len() as u64),
         encrypted: e.encrypted,
         unsupported: e.unsupported,
+        mtime: e.mtime,
+        mode: e.mode,
+        ..MemberMeta::default()
     };
     // An unsupported member may still carry what was decoded of it.
     let content = (e.unsupported.is_none() || !e.data.is_empty()).then_some(e.data);
@@ -393,9 +429,7 @@ pub(crate) fn stream_single<R: Read + Seek, T>(
     let meta = MemberMeta {
         name: name.to_string(),
         comp_size,
-        size: None,
-        encrypted: false,
-        unsupported: None,
+        ..MemberMeta::default()
     };
     emit_stream(&meta, &mut *dec, budget, visit)
 }
@@ -491,10 +525,8 @@ pub(crate) fn stream_stored<R: Read + Seek, T>(
             Region::Unwalked(name, reason) => {
                 let meta = MemberMeta {
                     name,
-                    comp_size: 0,
-                    size: None,
-                    encrypted: false,
                     unsupported: Some(reason),
+                    ..MemberMeta::default()
                 };
                 if let Some(t) = visit(&meta, None, budget) {
                     return Ok(Some(t));
@@ -510,8 +542,7 @@ pub(crate) fn stream_stored<R: Read + Seek, T>(
             name,
             comp_size: size,
             size: Some(size),
-            encrypted: false,
-            unsupported: None,
+            ..MemberMeta::default()
         };
         if let Some(t) = emit_stream(&meta, &mut window, budget, visit)? {
             return Ok(Some(t));

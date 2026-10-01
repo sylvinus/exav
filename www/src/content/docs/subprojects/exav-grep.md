@@ -6,6 +6,9 @@ description: grep for the inside of archives, searching recursively through zip,
 **grep, but it looks inside archives.** The flags you already know, with every
 member of every container, recursively, as the haystack.
 
+It is in each [release](/getting-started/installation/#prebuilt-binaries), as
+`exav-grep-<tag>-<target>`, or:
+
 ```bash
 cargo install exav-grep
 ```
@@ -63,20 +66,24 @@ turns those reports off.
 
 ## Flags
 
-The familiar set (`-i`, `-v`, `-c`, `-l`, `-r`, `-F`, `-A`/`-B`/`-C`, `-m`), plus
-the ones extraction needs:
+The familiar set (`-i`, `-v`, `-l`, `-r`, `-F`, `-A`/`-B`/`-C`), counted per
+member rather than per file: `-m N` stops after N matches in each member, and
+`-c` prints one total, the number of matching members. Plus the ones extraction
+needs:
 
 | Flag | Purpose |
 |---|---|
-| `--passwords <PASSWORD>` | Try on encrypted members (repeatable) |
-| `--max-object-bytes <BYTES>` | Cap on what any single member may decompress to |
+| `--passwords <PASSWORD>` | Try on encrypted members (repeatable), before the [built-in passwords](/reference/formats/#encryption-support) |
+| `--max-object-bytes <BYTES>` | Cap on what any single member may decompress to, and on the size of an input file (default 256 MiB) |
 | `--max-members <N>` | Cap on members visited inside each input file |
 | `--max-unpack-depth <N>` | Cap on archive-within-archive nesting |
 | `--quiet-unreadable` | Suppress unreadable-member reports |
 
 The limits are the scanner's decompression-bomb budget, spelled as
 [`exav`](/reference/cli/#scan-limits) spells them, so pointing it at a hostile
-archive is safe.
+archive is safe. Each input file is read whole into memory, so one larger than
+`--max-object-bytes` is reported unreadable (exit `3`) rather than read; raise
+the flag to search it.
 
 ## What it searches
 

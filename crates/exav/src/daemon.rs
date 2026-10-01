@@ -1196,8 +1196,9 @@ fn current_address_space() -> Option<u64> {
 #[cfg(unix)]
 pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) {
     /// Of the memory a job is granted, the share extraction buffers may claim.
-    /// The rest covers the matcher's own working set (chiefly the lowercase
-    /// copy it makes of each buffer it scans) plus allocator slack.
+    /// The rest covers the matcher's own working set (such as the lowercase
+    /// copy of a buffer a case-insensitive signature is checked in) plus
+    /// allocator slack.
     const EXTRACTION_SHARE_NUM: u64 = 1;
     const EXTRACTION_SHARE_DEN: u64 = 2;
 
@@ -2700,9 +2701,9 @@ fn scan_tree_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<Strin
 }
 
 /// All-match scan of a single file: report every matching signature, at any
-/// size. A file over `--max-input-bytes` falls back to a normal single-match
-/// scan, which enforces that ceiling, so it is never silently skipped. This
-/// mirrors the CLI's `--all-matches` so the two surfaces agree.
+/// size; past `--max-input-bytes`, what its first bytes hold. With no
+/// detection, an incomplete scan is reported as such. Unlike the CLI's
+/// `--all-matches`, a reply with detections carries no line for the limit.
 fn scan_one_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
     if path.is_empty() {
         return vec!["ALLMATCHSCAN: missing path ERROR".to_string()];
@@ -2712,9 +2713,6 @@ fn scan_one_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String
         Ok(o) => o,
         Err(e) => return vec![format!("{path}: {e} ERROR")],
     };
-    if opts.max_scan_size.is_some_and(|max| size > max) {
-        return vec![scan_one_path(db, opts, path)];
-    }
     // Isolate a panic on a crafted file into an ERROR for this target.
     let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         analyze_all_seekable(db, file, size, opts)
@@ -2813,18 +2811,20 @@ impl StreamPayload {
     }
 
     /// Every detection in the payload, at any size (see
-    /// [`exav_core::analyze_all_seekable`]).
+    /// [`exav_core::analyze_all_seekable`]), for a stream of `size` bytes:
+    /// past `--max-input-bytes`, more than the payload holds.
     pub(crate) fn all_matches(
         &self,
         db: &Scanner,
         opts: &ScanOptions,
+        size: u64,
     ) -> io::Result<(Vec<(String, exav_core::Method)>, AllMatchOutcome)> {
         match self {
             StreamPayload::Mem(v) => {
-                exav_core::analyze_all_seekable(db, std::io::Cursor::new(&v[..]), self.len(), opts)
+                exav_core::analyze_all_seekable(db, std::io::Cursor::new(&v[..]), size, opts)
             }
-            StreamPayload::Disk(tmp, n) => {
-                exav_core::analyze_all_seekable(db, tmp.reopen()?, *n, opts)
+            StreamPayload::Disk(tmp, _) => {
+                exav_core::analyze_all_seekable(db, tmp.reopen()?, size, opts)
             }
         }
     }

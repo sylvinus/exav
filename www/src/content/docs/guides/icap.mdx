@@ -66,17 +66,17 @@ and idle proxy connections would otherwise occupy every worker. On a signature
 reload the child is replaced along with the workers: the old one finishes the
 requests in progress and closes its idle connections, and proxies reconnect to
 the new one. The ICAP child's own scans run in threads, one per connection, and
-the kernel's per-job limits do not apply to them; what each scan holds is still
-kept to half the per-job memory, as in a worker.
+the kernel's per-job limits do not apply to them (see
+[Limits](/reference/limits/)); what each scan holds is still kept to half the
+per-job memory, as in a worker.
 
 ICAP served alone runs without the pool: one process, scans in threads,
 `--max-scan-secs` refused. Signatures reload on `SIGUSR2` or when the source
-changes on disk, and the new database is swapped in for the next request.
+changes on disk, and the new database is swapped in for the next request. With
+no clamd listener there is no `STATS` command; the scan totals are written to
+stderr every `--metrics-secs` (300 by default).
 
-In the container, list both in `EXAV_LISTEN`
-(`clamd://0.0.0.0:3310,icap://0.0.0.0:1344`) to keep the clamd listener: setting
-the variable replaces the default (see
-[Docker](/guides/docker/#replacing-a-c-icap-container)).
+For the container, see [Docker](/guides/docker/#replacing-a-c-icap-container).
 
 ## Point Squid at it
 
@@ -220,9 +220,9 @@ the same as for every other input: `--max-input-bytes` (unset by default, the
 `--max-object-bytes`, past which the checks that parse an object whole (PE
 structure, RAR, OLE) do not run (see
 [Streaming & memory](/concepts/streaming-memory/)). Past `--max-input-bytes` or
-a spill ceiling the object is `PARTIAL`; past `--max-object-bytes` it is
-`LIMITS-EXCEEDED` when one of those checks applied and nothing was found. Never
-quietly clean.
+a spill ceiling the object is `LIMITS-EXCEEDED`, and past `--max-object-bytes`
+too when one of those checks applied, unless something was found. Never quietly
+clean.
 
 Translating `virus_scan.MaxObjectSize 5M` usually means nothing at all: exav scans
 the objects c-icap skipped. To keep the limit, `--max-input-bytes 5M` sets it on
@@ -261,18 +261,21 @@ reads `EXAV_ICAP_MAX_REQUESTS`); a flag beats the variable. `Pipelining on` need
 no setting: several requests per connection always work.
 
 The service names and the connection cap go on the address, since they belong to
-that listener:
+that listener (see [what belongs to one listener](/reference/cli/#what-belongs-to-one-listener)):
 
 ```sh
 exav --listen 'icap://0.0.0.0:1344/avscan?max-connections=200' -d /var/lib/exav
 ```
 
 <Aside type="note" title="What a connection costs">
-A connection holds at most `--spill-threshold-bytes` in RAM, whatever the object
-weighs, so the listener's worst case is that times `?max-connections=` (1.6 GB at
-the defaults). Past the threshold the cost moves to disk, bounded per object by
+Buffering a body costs a connection at most `--spill-threshold-bytes` in RAM
+(16 MiB by default), and past that disk, bounded per object by
 `--max-spill-bytes` and across the ICAP process by `--max-total-spill-bytes`.
-Under the worker pool each clamd worker has a budget of its own on top.
+The scan itself holds more: up to 1 GiB per connection by default, or half the
+per-job memory under the worker pool, where no kernel limit applies to ICAP
+scans. See
+[Sizing a server](/guides/sizing/#adding-icap) before raising
+`?max-connections=`.
 </Aside>
 
 ### Draining an over-limit body
@@ -284,8 +287,9 @@ before answering. Closing a socket with unread input makes the kernel send an
 verdict. Draining keeps the verdict and leaves the connection at the next request.
 
 A client that never stops sending would hold a thread forever, so draining stops
-at 64 MB; past that exav answers and closes, and that client may lose the
-response. The clamd listener does the same for `INSTREAM`, at the same bound.
+at 64 MiB; past that exav answers and closes, and that client may lose the
+response. The clamd listener drains `INSTREAM` the same way (see
+[size over the wire](/guides/daemon/#size-over-the-wire)).
 
 ## Caching and the `ISTag`
 
@@ -303,8 +307,8 @@ ISTag: "exav-ae0b21d4572e711f"
 Methods: REQMOD, RESPMOD
 Service: exav/0.0.2 ICAP service
 Allow: 204
-Preview: 4096
 Max-Connections: 100
+Preview: 4096
 Options-TTL: 3600
 Transfer-Preview: *
 Connection: keep-alive

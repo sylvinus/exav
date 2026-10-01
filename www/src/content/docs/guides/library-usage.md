@@ -6,6 +6,17 @@ description: Embedding exav-core or exav-unpack in your own Rust program, with t
 Everything else in this documentation addresses someone running the `exav`
 command. This page is for embedding the engine.
 
+```sh
+cargo add exav-core      # scanning
+cargo add exav-unpack    # extraction only
+```
+
+Both default to every format (and `exav-core` to YARA). For a smaller build,
+turn default features off and pick what you need; see
+[Feature flags](/reference/feature-flags/). The crate pages,
+[exav-core](/subprojects/exav-core/) and
+[exav-unpack](/subprojects/exav-unpack/), list what each one contains.
+
 ## Read this first: you supply the bounds
 
 The CLI and the daemon wrap the engine in protections the library does not have.
@@ -57,7 +68,7 @@ let scanner = loader::load("/var/lib/exav".as_ref())?;
 if scanner.signature_count() <= Scanner::builtin().signature_count() {
     return Err("no signatures loaded".into());
 }
-let opts = ScanOptions::default();
+let mut opts = ScanOptions::default(); // set `opts.spill` here, see below
 
 let report = exav_core::scan_path(&scanner, "suspicious.bin".as_ref(), &opts)?;
 
@@ -70,12 +81,28 @@ match report.verdict {
 
 `loader::load` fails on a path that does not exist, but an empty directory loads
 as the built-in baseline, which detects only the EICAR test file. The CLI refuses
-to run against it; a library caller has to check, as above.
+to run against it; a library caller has to check, as above. `loader::load` skips
+the PUA databases and `loader::load_with_pua` loads them; a `.exavdb` keeps the
+choice it was built with.
+
+Other entry points:
+
+| Function | Scans |
+|---|---|
+| `scan_path` | a file, with its path as YARA's `filepath`/`filename`/`extension` |
+| `scan_seekable` | any `Read + Seek` of known length (`scan_seekable_located` also returns the member path of a hit) |
+| `analyze` | bytes already in memory |
+| `analyze_all_with_outcome`, `analyze_all_seekable` | every match, not just the first, with whether the scan finished (`analyze_all` drops that, so avoid it) |
+| `warm_up` | nothing: builds the lazily-initialised structures, to call before forking workers |
+
+Only `scan_path` knows a file name. Set `opts.filename` when calling the others
+if your YARA rules test it.
 
 ### Somewhere to spill
 
 The library writes nothing to disk on its own. To let a scan spill, implement
-`exav_core::spill::Spill`, for instance over temporary files:
+`exav_core::spill::Spill`, for instance over temporary files (with the
+`tempfile` crate):
 
 ```rust
 use std::io::{Seek, SeekFrom, Write};
@@ -120,13 +147,14 @@ then reports what it could not keep.
 | `Infected` | A signature matched |
 | `LimitsExceeded` | A budget stopped the scan; raise a limit and retry |
 | `Unscannable` | The content could not be decoded; raising a limit changes nothing |
-| `PasswordProtected` | Encrypted, and a password would fix it |
+| `PasswordProtected` | Encrypted; set `opts.passwords` and retry |
 
 **The last three are not errors and must not be treated as clean.** A file exav
 could not read is a better hiding place than one it read and cleared. If you
 collapse them into a boolean, collapse them toward "suspicious", not away.
 
-`Verdict` is `#[non_exhaustive]`, so match with a wildcard arm.
+`Verdict` is `#[non_exhaustive]`, so match with a wildcard arm. See
+[Verdicts & exit codes](/reference/verdicts/) for how the CLI reports each one.
 
 ## Extraction without the scanner
 
@@ -188,6 +216,7 @@ walk(format, &bytes, &mut budget, &mut visit)?;
 | `exav-x86` | An x86-32 decoder with no dependencies |
 | `exav-pe-emu` | Running a packer stub in a sandbox |
 | `exav-update` | Fetching signature databases |
+| `exav-unpack-wasm` | Extraction from JavaScript: an npm package, not a Rust dependency |
 | `exav` | Nothing: it is the binary, not a library |
 
 `exav` is the package `cargo install exav` installs, and it publishes no `[lib]`

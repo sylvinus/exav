@@ -29,7 +29,7 @@ jobs:
 
   # The promised floor is `rust-version` in Cargo.toml (1.91, imposed by
   # yara-x-parser). `make msrv` reads it there and installs that toolchain on
-  # demand, so a bump flows through with no edit here — and a contributor on
+  # demand, so a bump flows through with no edit here, and a contributor on
   # stable can't land a newer feature without this going red.
   msrv:
     runs-on: ubuntu-latest
@@ -40,11 +40,11 @@ jobs:
       - run: make msrv
 
   # The yara-x A/B differential harness. Deliberately NOT part of `make test`
-  # (see the Makefile) — a differential test can go red because the other engine
+  # (see the Makefile): a differential test can go red because the other engine
   # changed, so it is not a merge gate. It runs here anyway, unlike the clamav
   # harness, only because it is self-contained: no signature database, no second
-  # engine to install. Its own job so the optional `yara-x` dependency — 83 extra
-  # crates, 21 of them cranelift/wasmtime — never lands in the `test` job, and so
+  # engine to install. Its own job so the optional `yara-x` dependency (83 extra
+  # crates, 21 of them cranelift/wasmtime) never lands in the `test` job, and so
   # it costs no wall clock.
   yara-diff:
     runs-on: ubuntu-latest
@@ -65,7 +65,7 @@ jobs:
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
       # The scanning core compiled to WASI, and the archive-extractor WASM
-      # bindings (excluded from the workspace, built on their own target) — both
+      # bindings (excluded from the workspace, built on their own target), both
       # the default (all-formats + decrypt) build and a minimal single-format,
       # no-decrypt build, so the feature-gated paths can't silently rot.
       - run: cargo build -p exav-core --features wasi-bin --target wasm32-wasip1
@@ -146,6 +146,6 @@ jobs:
       - name: cargo-fuzz smoke run
         run: |
           cargo install cargo-fuzz --locked
-          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd; do
+          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion; do
             cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
           done

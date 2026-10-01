@@ -1,12 +1,12 @@
 //! Coarse correctness spot-check over a real corpus.
 //!
-//! For every rule file in `$EXAV_YARA_CORPUS` that exav compiles with ZERO
+//! For every rule file in `$EXAV_DEBUG_YARA_CORPUS` that exav compiles with ZERO
 //! rejections *and* that yara-x also accepts, both engines are asked to scan
 //! the same handful of byte inputs; the set of matching rule identifiers must be
 //! identical. This confirms the coverage numbers aren't hiding silent
 //! mis-compiles (a rule that "compiles" but matches differently).
 //!
-//! No-op unless `EXAV_YARA_CORPUS` points at a directory of `.yar`/`.yara`
+//! No-op unless `EXAV_DEBUG_YARA_CORPUS` points at a directory of `.yar`/`.yara`
 //! files, so it never runs in the default `cargo test`, and skipped when the
 //! `yr` binary is absent. See `yara_difftest.rs` for why yara-x is a program
 //! here rather than a dependency.
@@ -53,10 +53,10 @@ fn exav_set(rules: &exav_core::yara::Rules, data: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
-/// The oracle, invoked as a program rather than linked as a library — see
-/// `yara_difftest.rs` for why.
+/// The oracle, invoked as a program rather than linked as a library (see
+/// `yara_difftest.rs` for why).
 fn yr_bin() -> String {
-    std::env::var("EXAV_YR_BIN").unwrap_or_else(|_| "yr".to_string())
+    std::env::var("EXAV_DEBUG_YR_BIN").unwrap_or_else(|_| "yr".to_string())
 }
 
 fn have_yr() -> bool {
@@ -67,8 +67,8 @@ fn have_yr() -> bool {
 }
 
 /// Matching rule names from `yr scan`, or `None` when the oracle refused the
-/// rule file. Refusal is expected on a real corpus — unknown external
-/// variables and modules exav does not implement make it bail — and those
+/// rule file. Refusal is expected on a real corpus (unknown external
+/// variables and modules exav does not implement make it bail), and those
 /// files are skipped rather than counted as disagreements.
 fn yr_set(rules: &str, data: &[u8]) -> Option<BTreeSet<String>> {
     let dir = std::env::temp_dir().join(format!("exav-yr-cov-{}", std::process::id()));
@@ -99,8 +99,8 @@ fn yr_set(rules: &str, data: &[u8]) -> Option<BTreeSet<String>> {
 
 #[test]
 fn spot_check_real_corpus() {
-    let Ok(dir) = std::env::var("EXAV_YARA_CORPUS") else {
-        eprintln!("EXAV_YARA_CORPUS not set; skipping corpus spot-check");
+    let Ok(dir) = std::env::var("EXAV_DEBUG_YARA_CORPUS") else {
+        eprintln!("EXAV_DEBUG_YARA_CORPUS not set; skipping corpus spot-check");
         return;
     };
     if !have_yr() {

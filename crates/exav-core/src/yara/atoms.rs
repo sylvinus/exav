@@ -1,11 +1,12 @@
-//! Atom-based Aho-Corasick prefilter for the YARA string matcher.
+//! Atom prefilter for the YARA string matcher.
 //!
 //! Scanning every compiled pattern over the whole buffer (one `find_all` per
 //! pattern) is O(patterns × bytes) and dominates scan time on many-rule sets.
 //! This module builds a *required-literal gate*: for each pattern we extract one
 //! or more **atoms**: literal byte substrings that MUST appear in EVERY match of
-//! the pattern. A single shared Aho-Corasick automaton (daachorse) is run over
-//! the buffer ONCE; a pattern's `find_all` is then executed ONLY if one of its
+//! the pattern. One anchor index over every atom ([`crate::grams`], the one the
+//! signature engine uses) is swept over the buffer ONCE; a pattern's `find_all`
+//! is then executed ONLY if one of its
 //! atoms was found (or if the pattern is *ungated*, i.e. has no provable required
 //! literal, e.g. `xor`, `/a+/`, alternations with an atomless branch).
 //!
@@ -27,16 +28,16 @@
 
 use std::collections::HashMap;
 
-use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 use regex_syntax::hir::literal::{ExtractKind, Extractor};
 use serde::{Deserialize, Serialize};
 
 use crate::byte_source::ByteSource;
+use crate::grams::{structural, sweep, GramStats, Grams, IndexAnchor};
 use crate::yara::matcher::{parse_hir, widen_hir, Base64Sub, Needle};
 
 /// Maximum atom window length taken from a literal / base64 needle. A longer
-/// window is a strictly more selective (rarer) gate; the cap bounds the shared
-/// automaton's size for pathologically long literals.
+/// window is a strictly more selective (rarer) gate; the cap bounds what the
+/// index holds for pathologically long literals.
 const MAX_ATOM: usize = 16;
 
 /// The gate classification of one compiled pattern.
@@ -53,31 +54,10 @@ pub(crate) enum Gate {
 // Per-pattern atom extraction (compile time)
 // ---------------------------------------------------------------------------
 
-/// Selectivity score of a candidate atom window, reused verbatim from the
-/// AV-engine heuristic (`engine::parse::anchor_score`): a low-entropy run (a
-/// constant byte, or a 2-symbol repeat) matches repetitive content millions of
-/// times and is a terrible prefilter even when long, so it is down-ranked; a
-/// varied run scores its length (longer = rarer = better). Kept byte-identical
-/// here because `engine::parse` is a private module unreachable from `yara`.
-fn anchor_score(b: &[u8]) -> usize {
-    let mut seen = [false; 256];
-    let mut distinct = 0usize;
-    for &x in b {
-        if !seen[x as usize] {
-            seen[x as usize] = true;
-            distinct += 1;
-        }
-    }
-    match distinct {
-        0 | 1 => 1,
-        2 => 3.min(b.len()),
-        _ => b.len(),
-    }
-}
-
 /// Picks the most selective window of length `min(bytes.len(), MAX_ATOM)` from a
-/// required literal. Any contiguous substring of a required literal is itself
-/// required, so this preserves soundness while choosing a rarer anchor.
+/// required literal, by its bytes alone ([`structural`]). Any contiguous
+/// substring of a required literal is itself required, so this preserves
+/// soundness while choosing a rarer anchor.
 fn best_window(bytes: &[u8]) -> &[u8] {
     let len = bytes.len().min(MAX_ATOM);
     if bytes.len() <= MAX_ATOM {
@@ -86,7 +66,7 @@ fn best_window(bytes: &[u8]) -> &[u8] {
     let mut best_start = 0;
     let mut best_score = 0;
     for start in 0..=(bytes.len() - len) {
-        let score = anchor_score(&bytes[start..start + len]);
+        let score = structural(&bytes[start..start + len]);
         if score > best_score {
             best_score = score;
             best_start = start;
@@ -98,7 +78,7 @@ fn best_window(bytes: &[u8]) -> &[u8] {
 /// Gate for a `Literal` pattern (plain/`nocase`/`wide`, no `xor`). Each non-empty
 /// needle contributes one required-literal window; the pattern matches iff SOME
 /// needle matches, so the atom set is the disjunction over needles. An `xor`
-/// pattern transforms the bytes and cannot be gated by a plain automaton, so its
+/// pattern transforms the bytes and cannot be gated by a plain literal, so its
 /// caller passes `xor_present = true` → ungated.
 pub(crate) fn literal_gate(needles: &[Needle], xor_present: bool) -> Gate {
     if xor_present {
@@ -257,9 +237,9 @@ fn required_literals(hir: &regex_syntax::hir::Hir, kind: ExtractKind) -> Option<
 
 /// Picks the more selective of two candidate required-literal sets. A set is only
 /// as strong as its weakest (lowest-scoring) atom, since ANY atom hit triggers a
-/// scan, so we rank by the minimum [`anchor_score`] across the set.
+/// scan, so we rank by the minimum [`structural`] score across the set.
 fn pick_more_selective(a: Option<Vec<Vec<u8>>>, b: Option<Vec<Vec<u8>>>) -> Option<Vec<Vec<u8>>> {
-    let score = |s: &[Vec<u8>]| s.iter().map(|a| anchor_score(a)).min().unwrap_or(0);
+    let score = |s: &[Vec<u8>]| s.iter().map(|a| structural(a)).min().unwrap_or(0);
     match (a, b) {
         (None, x) | (x, None) => x,
         (Some(x), Some(y)) => {
@@ -273,12 +253,12 @@ fn pick_more_selective(a: Option<Vec<Vec<u8>>>, b: Option<Vec<Vec<u8>>>) -> Opti
 }
 
 // ---------------------------------------------------------------------------
-// The compiled gate (one automaton over all atoms)
+// The compiled gate (one index over all atoms)
 // ---------------------------------------------------------------------------
 
-/// De-duplicating pool of atoms feeding one Aho-Corasick automaton. Distinct
-/// atoms map to automaton values; each value carries the list of pattern ids that
-/// share that atom (`groups`).
+/// De-duplicating pool of the atoms of one case. Distinct atoms are values of
+/// the index; each value carries the list of pattern ids that share that atom
+/// (`groups`).
 #[derive(Default)]
 struct Pool {
     index: HashMap<Vec<u8>, usize>,
@@ -302,116 +282,83 @@ impl Pool {
             self.groups[idx].push(pid);
         }
     }
-
-    /// Builds the automaton. On a (very unlikely) build failure the pool's
-    /// patterns are force-ungated so they are still scanned, never silently
-    /// dropped.
-    fn finish(self, ungated: &mut [bool]) -> Lane {
-        if self.atoms.is_empty() {
-            return Lane::default();
-        }
-        match DoubleArrayAhoCorasickBuilder::new()
-            .match_kind(daachorse::MatchKind::Standard)
-            .build_with_values(self.atoms.iter().zip(0u32..))
-        {
-            Ok(ac) => Lane {
-                ac: Some(ac),
-                groups: self.groups,
-                runs: crate::engine::longest_runs(&self.atoms),
-            },
-            Err(_) => {
-                for g in &self.groups {
-                    for &pid in g {
-                        ungated[pid] = true;
-                    }
-                }
-                Lane::default()
-            }
-        }
-    }
 }
 
-/// One automaton of the gate: over its atoms, the patterns behind each, and
-/// the longest run of each byte value in them (see [`crate::engine::sweep`]).
-struct Lane {
-    ac: Option<DoubleArrayAhoCorasick<u32>>,
-    groups: Vec<Vec<usize>>,
-    runs: [u32; 256],
-}
-
-impl Default for Lane {
-    fn default() -> Self {
-        Lane {
-            ac: None,
-            groups: Vec::new(),
-            runs: [0; 256],
-        }
-    }
-}
-
-/// The prefilter gate for a whole compiled rule set. Case-sensitive atoms are
-/// searched in the raw buffer; `nocase` atoms in its bytes lowercased, both in
-/// the one read of it.
+/// The prefilter gate for a whole compiled rule set: one index over every
+/// atom, the case-sensitive ones in partition 0 and the `nocase` ones,
+/// lowercased, in partition 1, found in the one read of the object.
 pub(crate) struct PatternGate {
-    cs: Lane,
-    ci: Lane,
+    grams: Grams,
+    /// Per partition, per atom, the patterns behind it.
+    groups: [Vec<Vec<usize>>; 2],
     /// Per pattern id: `true` = always scan (ungated).
     ungated: Vec<bool>,
-    /// Number of patterns with a required-literal gate (diagnostics).
-    gated: usize,
-    /// Kill switch: when set (via `EXAV_YARA_NO_GATE`), the prefilter is bypassed
-    /// and every pattern is scanned. A safety valve: results are identical to a
-    /// gated scan by construction, but this lets an operator rule the prefilter
-    /// out if a gate bug is ever suspected. Read once at build time (never on the
-    /// hot path).
-    bypass: bool,
 }
 
 impl PatternGate {
     /// Builds the gate from one [`Gate`] per pattern (index == pattern id).
     pub(crate) fn from_gates(gates: &[Gate]) -> PatternGate {
-        let n = gates.len();
-        let mut ungated = vec![false; n];
-        let mut cs = Pool::default();
-        let mut ci = Pool::default();
+        let mut ungated = vec![false; gates.len()];
+        let mut pools: [Pool; 2] = Default::default();
         for (pid, g) in gates.iter().enumerate() {
             match g {
-                Gate::Ungated => ungated[pid] = true,
-                Gate::Atoms { atoms, nocase } => {
-                    let pool = if *nocase { &mut ci } else { &mut cs };
+                // A pattern with no atom at all would never be slated to run.
+                Gate::Atoms { atoms, nocase }
+                    if !atoms.is_empty() && atoms.iter().all(|a| !a.is_empty()) =>
+                {
                     for a in atoms {
-                        pool.add(a.clone(), pid);
+                        pools[*nocase as usize].add(a.clone(), pid);
                     }
                 }
+                _ => ungated[pid] = true,
             }
         }
-        let cs = cs.finish(&mut ungated);
-        let ci = ci.finish(&mut ungated);
-        // Whatever remains not-ungated after the (possibly failing) builds is
-        // in fact gated.
-        let gated = ungated.iter().filter(|&&u| !u).count();
+        let atoms = || pools.iter().flat_map(|p| &p.atoms);
+        let stats = GramStats::build(atoms().count(), |f| atoms().for_each(|a| f(a)));
+        let anchors: Vec<IndexAnchor> = pools
+            .iter()
+            .enumerate()
+            .flat_map(|(part, p)| {
+                p.atoms
+                    .iter()
+                    .zip(0u32..)
+                    .map(move |(bytes, value)| IndexAnchor {
+                        part: part as u32,
+                        nocase: part == 1,
+                        value,
+                        bytes,
+                    })
+            })
+            .collect();
+        let grams = Grams::build(&anchors, &stats);
+        let [cs, ci] = pools;
         PatternGate {
-            cs,
-            ci,
+            grams,
+            groups: [cs.groups, ci.groups],
             ungated,
-            gated,
-            bypass: std::env::var_os("EXAV_YARA_NO_GATE").is_some(),
         }
+    }
+
+    /// Whether the gate is one for `patterns` patterns: one entry each, and
+    /// every gated one behind some atom, so it can be slated to run.
+    pub(crate) fn fits(&self, patterns: usize) -> bool {
+        let mut reached = self.ungated.clone();
+        for &pid in self.groups.iter().flatten().flatten() {
+            reached[pid] = true;
+        }
+        self.ungated.len() == patterns && reached.iter().all(|&r| r)
     }
 
     /// Number of patterns that carry a required-literal gate.
     #[allow(dead_code)]
     pub(crate) fn gated_count(&self) -> usize {
-        self.gated
+        self.ungated.iter().filter(|&&u| !u).count()
     }
 
     /// Returns, per pattern id, whether `find_all` must be run: `true` for every
     /// ungated pattern, plus every gated pattern one of whose atoms occurs in
     /// `data`. A gated pattern whose atoms are all absent provably has no match.
     pub(crate) fn select(&self, src: &dyn ByteSource) -> Vec<bool> {
-        if self.bypass {
-            return vec![true; self.ungated.len()];
-        }
         let mut run = self.ungated.clone();
         // Number of gated patterns still to resolve; lets us stop scanning once
         // every pattern is already slated to run (dense buffers).
@@ -419,20 +366,12 @@ impl PatternGate {
         if pending == 0 {
             return run;
         }
-        let (mut lanes, mut groups) = (Vec::new(), Vec::new());
-        for (lane, fold) in [(&self.cs, false), (&self.ci, true)] {
-            if let Some(ac) = &lane.ac {
-                lanes.push(crate::engine::Lane {
-                    ac,
-                    fold,
-                    runs: &lane.runs,
-                });
-                groups.push(&lane.groups);
-            }
-        }
-        crate::engine::sweep(&lanes, src, &mut |k, value, _, _| {
-            mark(groups[k], value, &mut run, &mut pending)
-        });
+        sweep(
+            &self.grams,
+            &[true, true],
+            src,
+            &mut |part, value, _, _, _| mark(&self.groups[part], value, &mut run, &mut pending),
+        );
         run
     }
 }
@@ -452,85 +391,44 @@ fn mark(groups: &[Vec<usize>], value: u32, run: &mut [bool], pending: &mut usize
 // Serialization of the compiled gate
 // ---------------------------------------------------------------------------
 //
-// The atom automaton is the expensive artifact this whole module exists to
-// avoid rebuilding on load, so the gate is serialized in its COMPILED form: each
-// daachorse automaton travels as its own byte serialization (`serialize`), and
-// the per-atom pattern-id groups + the ungated bitmap travel as plain data. On
-// load the automaton is reconstructed via daachorse's checked `deserialize` (no
-// rebuild). `bypass` is NOT serialized: it is an operator kill switch read
-// afresh from the environment on load, exactly as at build time.
-
-/// True when the prefilter kill switch is set. Read once (build or load time),
-/// never on the hot path.
-fn bypass_env() -> bool {
-    std::env::var_os("EXAV_YARA_NO_GATE").is_some()
-}
+// The index travels as its own binary form ([`Grams::write`]), the per-atom
+// pattern-id groups and the ungated bitmap as plain data. A load checks every
+// id against what it indexes, so a corrupt blob fails loudly, never misreads.
 
 impl Serialize for PatternGate {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use crate::database::Blob;
-        let ac_cs = self.cs.ac.as_ref().map(|ac| ac.serialize());
-        let ac_ci = self.ci.ac.as_ref().map(|ac| ac.serialize());
-        (
-            ac_cs.as_deref().map(Blob),
-            &self.cs.groups,
-            &self.cs.runs[..],
-            ac_ci.as_deref().map(Blob),
-            &self.ci.groups,
-            &self.ci.runs[..],
-            &self.ungated,
-            self.gated,
-        )
-            .serialize(s)
+        let mut index = Vec::new();
+        self.grams
+            .write(&mut index)
+            .map_err(serde::ser::Error::custom)?;
+        (Blob(&index), &self.groups, &self.ungated).serialize(s)
     }
 }
 
 impl<'de> Deserialize<'de> for PatternGate {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use crate::database::BlobBuf;
-        type Wire = (
-            Option<BlobBuf>,
-            Vec<Vec<usize>>,
-            Vec<u32>,
-            Option<BlobBuf>,
-            Vec<Vec<usize>>,
-            Vec<u32>,
-            Vec<bool>,
-            usize,
-        );
-        let (ac_cs, groups_cs, runs_cs, ac_ci, groups_ci, runs_ci, ungated, gated): Wire =
+        let (index, groups, ungated): (BlobBuf, [Vec<Vec<usize>>; 2], Vec<bool>) =
             Deserialize::deserialize(d)?;
-
-        fn rebuild<E: serde::de::Error>(
-            bytes: Option<BlobBuf>,
-            groups: Vec<Vec<usize>>,
-            runs: Vec<u32>,
-        ) -> Result<Lane, E> {
-            let runs = runs
-                .try_into()
-                .map_err(|_| serde::de::Error::custom("bad atom run table"))?;
-            let ac = match bytes {
-                None => None,
-                Some(b) => {
-                    // Checked deserialize: rejects data that would cause
-                    // out-of-bounds access (the database is a trusted artifact,
-                    // but a corrupt/mismatched blob must fail loudly, not misread).
-                    let (ac, _rest) =
-                        DoubleArrayAhoCorasick::<u32>::deserialize(&b.0).map_err(|e| {
-                            serde::de::Error::custom(format!("bad atom automaton: {e}"))
-                        })?;
-                    Some(ac)
-                }
-            };
-            Ok(Lane { ac, groups, runs })
+        if groups
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|&pid| pid >= ungated.len())
+        {
+            return Err(serde::de::Error::custom("bad atom pattern id"));
         }
-
+        let mut index = &index.0[..];
+        let grams = Grams::read(&mut index, &[groups[0].len(), groups[1].len()])
+            .map_err(|e| serde::de::Error::custom(format!("bad atom index: {e}")))?;
+        if !index.is_empty() {
+            return Err(serde::de::Error::custom("bad atom index: trailing bytes"));
+        }
         Ok(PatternGate {
-            cs: rebuild(ac_cs, groups_cs, runs_cs)?,
-            ci: rebuild(ac_ci, groups_ci, runs_ci)?,
+            grams,
+            groups,
             ungated,
-            gated,
-            bypass: bypass_env(),
         })
     }
 }
@@ -597,5 +495,39 @@ mod tests {
             assert_eq!(gate.select(&slice), want, "{hay:?}");
             assert_eq!(gate.select(&cache), want, "{hay:?}");
         }
+    }
+
+    /// A pattern with no atom runs always. A gate read back is refused unless
+    /// it has an entry per pattern, a way to slate each to run, and nothing
+    /// after its index.
+    #[test]
+    fn a_gate_that_cannot_run_a_pattern_is_refused() {
+        let gates = [
+            Gate::Atoms {
+                atoms: vec![b"abcd".to_vec()],
+                nocase: false,
+            },
+            Gate::Atoms {
+                atoms: vec![],
+                nocase: false,
+            },
+        ];
+        let gate = PatternGate::from_gates(&gates);
+        assert_eq!(gate.select(&&b"nothing"[..]), [false, true]);
+        assert!(gate.fits(2) && !gate.fits(3));
+        let bytes = rmp_serde::to_vec(&gate).unwrap();
+        let mut orphan: PatternGate = rmp_serde::from_slice(&bytes).unwrap();
+        orphan.groups[0].clear();
+        assert!(!orphan.fits(2), "a gated pattern behind no atom");
+        let (index, groups, ungated): (crate::database::BlobBuf, [Vec<Vec<usize>>; 2], Vec<bool>) =
+            rmp_serde::from_slice(&bytes).unwrap();
+        let mut longer = index.0.clone();
+        longer.push(0);
+        let tampered =
+            rmp_serde::to_vec(&(crate::database::Blob(&longer), groups, ungated)).unwrap();
+        assert!(
+            rmp_serde::from_slice::<PatternGate>(&tampered).is_err(),
+            "trailing bytes"
+        );
     }
 }

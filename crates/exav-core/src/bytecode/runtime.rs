@@ -8,8 +8,8 @@
 //! per-subsig match offsets it reads. Only a program with no logical signature
 //! (a bare hook name) runs unconditionally, on every file of its hook's type
 //! (`kind` selects PE unpacker / PDF / any). A program's detection is whatever
-//! it passes to `setvirusname`; if it hits an unsupported op the result is
-//! discarded (never trusted).
+//! it passes to `setvirusname`; if its run fails the detection is discarded
+//! (never trusted), but what it wrote is still scanned, as in ClamAV.
 //!
 //! A forced mode (`run_forced` / `run_all_forced`) runs programs regardless of
 //! their gate, for testing and differential validation against clamscan.
@@ -129,19 +129,21 @@ impl BytecodeRuntime {
         layout: Option<&pe::PeLayout>,
     ) -> (Option<(String, usize)>, Vec<Vec<u8>>) {
         let fired = triggers.bytecode_triggers(data, ft, layout);
-        self.scan_source(&data, ft, usize::MAX, &fired)
+        self.scan_source(&data, ft, usize::MAX, &fired, exec::WriteLimits::NONE)
     }
 
     /// Run the programs whose triggers `fired` on `data`, then the hook
     /// programs of its type; returns as [`Self::scan`]. A PE is read whole
     /// for its header data when it is at most `materialize` bytes; a larger
     /// one runs its programs without it, and the scan is marked incomplete.
+    /// `limits.total` is shared by every program run here.
     pub(crate) fn scan_source(
         &self,
         data: &dyn ByteSource,
         ft: FileType,
         materialize: usize,
         fired: &[Fired],
+        limits: exec::WriteLimits,
     ) -> (Option<(String, usize)>, Vec<Vec<u8>>) {
         let mut detection = None;
         let mut extracted = Vec::new();
@@ -165,31 +167,25 @@ impl BytecodeRuntime {
         } else {
             None
         };
+        let pe_missing = ft == FileType::Pe && pe.is_none();
         let pdf = if ft == FileType::Pdf {
             Some(exec::pdf_ctx(data))
         } else {
             None
         };
-        let run_one = |idx: usize,
-                       det: &mut Option<(String, usize)>,
-                       ex: &mut Vec<Vec<u8>>,
-                       match_offs: &[u32]| {
+        let mut left = limits.total;
+        let mut run_one = |idx: usize,
+                           det: &mut Option<(String, usize)>,
+                           ex: &mut Vec<Vec<u8>>,
+                           match_offs: &[u32]| {
             let Some(bc) = self.programs.get(idx) else {
                 return;
             };
-            let o = run_program(bc, data, pe.as_ref(), pdf.as_ref(), match_offs);
-            if o.incomplete {
-                crate::engine::mark_scan_truncated();
-            }
-            if o.hit_unsupported {
-                return;
-            }
-            ex.extend(o.extracted);
-            if det.is_none() {
-                if let Some(d) = o.detection {
-                    *det = Some((d, idx));
-                }
-            }
+            let limits = exec::WriteLimits { total: left, ..limits };
+            let o = run_program(bc, data, pe.as_ref(), pe_missing, pdf.as_ref(), match_offs, limits);
+            let written: u64 = o.extracted.iter().map(|b| b.len() as u64).sum();
+            left = left.saturating_sub(written);
+            take_outcome(o, idx, det, ex);
         };
         // Logical programs, gated by their trigger signature; pass the match
         // offset so `__clambc_match_offsets` reflects where the pattern matched.
@@ -215,19 +211,19 @@ impl BytecodeRuntime {
     /// Run program `idx` regardless of its gate (forced mode, for testing).
     pub fn run_forced(&self, idx: usize, data: &[u8]) -> Option<exec::Outcome> {
         let bc = self.programs.get(idx)?;
-        let pe = pe::bytecode_pe(data);
+        let (pe, pe_missing) = forced_pe(data);
         let pdf = exec::pdf_ctx(&data);
-        Some(run_program(bc, &data, pe.as_ref(), Some(&pdf), &[]))
+        Some(run_program(bc, &data, pe.as_ref(), pe_missing, Some(&pdf), &[], exec::WriteLimits::NONE))
     }
 
     /// Run every program regardless of its gate; returns `(name, idx)` for each
     /// that reports a detection with no unsupported op (differential testing).
     pub fn run_all_forced(&self, data: &[u8]) -> Vec<(String, usize)> {
-        let pe = pe::bytecode_pe(data);
+        let (pe, pe_missing) = forced_pe(data);
         let pdf = exec::pdf_ctx(&data);
         let mut out = Vec::new();
         for (idx, bc) in self.programs.iter().enumerate() {
-            let o = run_program(bc, &data, pe.as_ref(), Some(&pdf), &[]);
+            let o = run_program(bc, &data, pe.as_ref(), pe_missing, Some(&pdf), &[], exec::WriteLimits::NONE);
             if !o.hit_unsupported {
                 if let Some(d) = o.detection {
                     out.push((d, idx));
@@ -238,13 +234,46 @@ impl BytecodeRuntime {
     }
 }
 
+/// PE header data for a forced run, and whether `data` is a PE exav has none
+/// for.
+fn forced_pe(data: &[u8]) -> (Option<pe::BcPe>, bool) {
+    let pe = pe::bytecode_pe(data);
+    let missing = pe.is_none() && crate::filetype::identify(data) == FileType::Pe;
+    (pe, missing)
+}
+
+/// Fold one run into the scan's detection and extracted buffers. What the
+/// program wrote is kept even when the run failed: ClamAV scans it too.
+fn take_outcome(
+    o: exec::Outcome,
+    idx: usize,
+    det: &mut Option<(String, usize)>,
+    ex: &mut Vec<Vec<u8>>,
+) {
+    if o.incomplete {
+        crate::engine::mark_scan_truncated();
+    }
+    ex.extend(o.extracted);
+    if o.hit_unsupported {
+        return;
+    }
+    if det.is_none() {
+        if let Some(d) = o.detection {
+            *det = Some((d, idx));
+        }
+    }
+}
+
 /// Run one program's entry function (0) under a bounded, panic-isolated VM.
+/// `pe_missing`: the file is a PE whose header data `pe` lacks.
 fn run_program(
     bc: &Bytecode,
     data: &dyn ByteSource,
     pe: Option<&pe::BcPe>,
+    pe_missing: bool,
     pdf: Option<&exec::PdfCtx>,
     match_offsets: &[u32],
+    write_limits: exec::WriteLimits,
 ) -> exec::Outcome {
     let ctx = exec::Ctx {
         file: data,
@@ -256,9 +285,14 @@ fn run_program(
         match_offsets,
         apis: &bc.apis,
         default_name: &bc.name,
+        write_limits,
     };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        exec::run(&bc.functions, 0, &ctx)
+        if pe_missing {
+            exec::run_without_pe_data(&bc.functions, 0, &ctx)
+        } else {
+            exec::run(&bc.functions, 0, &ctx)
+        }
     }))
     .unwrap_or_else(|_| exec::Outcome {
         incomplete: true,
@@ -292,6 +326,116 @@ mod tests {
             Some("__bc__7;Engine:56-255,Target:0;0;dead")
         );
         assert_eq!(retrigger("BareHookName", 3), None);
+    }
+
+    /// A failed run loses its detection, not what it wrote.
+    #[test]
+    fn a_failed_run_keeps_its_output() {
+        let (mut det, mut ex) = (None, Vec::new());
+        let failed = exec::Outcome {
+            detection: Some("Dropped".into()),
+            hit_unsupported: true,
+            extracted: vec![b"written".to_vec()],
+            ..Default::default()
+        };
+        take_outcome(failed, 0, &mut det, &mut ex);
+        assert_eq!(det, None);
+        assert_eq!(ex, vec![b"written".to_vec()]);
+    }
+
+    fn num(mut n: u64) -> String {
+        let mut nibs = Vec::new();
+        while n > 0 {
+            nibs.push((n & 0xf) as u8);
+            n >>= 4;
+        }
+        let mut s = String::from((0x60 + nibs.len() as u8) as char);
+        s.extend(nibs.iter().map(|&x| (0x60 + x) as char));
+        s
+    }
+    fn data(bytes: &[u8]) -> String {
+        let mut s = String::from("|");
+        s.push_str(&num(bytes.len() as u64));
+        for &b in bytes {
+            s.push((0x60 + (b & 0xf)) as char);
+            s.push((0x60 + (b >> 4)) as char);
+        }
+        s
+    }
+    fn nib(n: u8) -> char {
+        (0x60 + n) as char
+    }
+
+    /// A program that loads `__clambc_pedata` at offset 4, then calls
+    /// `setvirusname`. Its trigger is the bytes `PEDATA`.
+    fn pedata_reader() -> String {
+        let mut h = String::from("ClamBC");
+        for n in [6, 0x5b4f9546] {
+            h.push_str(&num(n));
+        }
+        h.push_str(&data(b""));
+        for n in [0, 256, 1, 255, 0] {
+            h.push_str(&num(n));
+        }
+        h.push_str(&data(b"test"));
+        for n in [5, 1, 0x53e5_493e_9f3d_1c30] {
+            h.push_str(&num(n));
+        }
+        // No declared types: id 67 is the predefined `i32*`.
+        let t = format!("T{}{}", nib(5), nib(4));
+        let mut e = String::from("E");
+        for n in [96, 1, 5, 79] {
+            e.push_str(&num(n));
+        }
+        e.push_str(&data(b"setvirusname"));
+        // One global: an `i32*` to offset 4 of `__clambc_pedata` (0x8003).
+        // A constant component is its nibble count + 0x40, then the nibbles.
+        let g = format!("G{}{}{}Ad{}`", num(1), num(1), num(67), "Dc``h");
+        // Values 0 and 1, both i32; 3 instructions in 1 block.
+        let mut a = format!("A{}{}L{}", nib(0), num(32), num(2));
+        for _ in 0..2 {
+            a.push_str(&num(32));
+            a.push(nib(0));
+        }
+        a.push_str(&format!("F{}{}", num(3), num(1)));
+        // r0 = load global 0 (opcode 39); r1 = call API 5 with no arguments
+        // (opcode 33); ret void (opcode 20).
+        let b = format!(
+            "B{}{}{}{}@`{}{}{}{}{}{}T{}{}E",
+            num(32),
+            num(0),
+            nib(7),
+            nib(2),
+            num(32),
+            num(1),
+            nib(1),
+            nib(2),
+            nib(0),
+            num(5),
+            nib(4),
+            nib(1)
+        );
+        let trigger: String = b"PEDATA".iter().map(|x| format!("{x:02x}")).collect();
+        format!("{h}\nTest.BC.Pedata;Engine:1-255,Target:0;0;{trigger}\n{t}\n{e}\n{g}\n{a}\n{b}\n")
+    }
+
+    /// `__clambc_pedata` reads as zeros on a file that is not a PE, whatever
+    /// its first bytes, and stops the run as incomplete on a PE exav has no
+    /// header data for.
+    #[test]
+    fn pedata_is_a_gap_only_for_a_pe_without_header_data() {
+        let (rt, triggers) = BytecodeRuntime::standalone(vec![pedata_reader()]);
+        assert_eq!(rt.len(), 1);
+        for (data, ft, found) in [
+            (&b"..PEDATA.."[..], FileType::Unknown, true),
+            (b"MZ..PEDATA..", FileType::Unknown, true),
+            (b"..PEDATA..", FileType::Pe, false),
+        ] {
+            crate::engine::reset_scan_truncated();
+            let (det, _) = rt.scan(&triggers, data, ft, None);
+            assert_eq!(det.is_some(), found, "{ft:?}");
+            assert_eq!(crate::engine::scan_was_truncated(), !found, "{ft:?}");
+        }
     }
 
     #[test]

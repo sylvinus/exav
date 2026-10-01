@@ -53,11 +53,11 @@ Grouped in the order `clamscan --help` prints them.
 |---|---|---|---|---|
 | `--help`, `-h` | Show help | same spelling | same | |
 | `--version`, `-V` | Print version | same spelling | differs | Prints `exav <version>`, naming what is actually running. The `ClamAV <version>` string tooling looks for is what the **daemon** answers to the wire `VERSION` command, so `clamdtop` and clamd client libraries see the engine they expect; a script grepping `clamscan --version` for `ClamAV` does not. |
-| `--verbose`, `-v` | Be verbose | same spelling | differs | exav prints per-file informational findings (type, entropy, imphash, ML score) rather than progress chatter. |
+| `--verbose`, `-v` | Be verbose | same spelling | differs | exav prints per-file informational findings (the detected type, and with `--detect exav-heuristics` the imphash, entropy and static score) rather than progress chatter. |
 | `--archive-verbose`, `-a` | Show filenames inside archives | none | absent | Member paths appear in the match location on a detection. |
 | `--debug` | libclamav debug messages | none | absent | |
 | `--quiet` | Only output error messages | `--quiet` | differs | exav still prints detection lines under `--quiet`; `clamscan` suppresses them too. exav's `--quiet` is the whole output dial: it drops the per-file `OK` lines *and* the summary. |
-| `--stdout` | Write to stdout instead of stderr | none | absent | exav already writes every result line to stdout and reserves stderr for errors, which is what the flag asks for. |
+| `--stdout` | Write to stdout instead of stderr | none | absent | exav already writes `OK`, `FOUND` and `PARTIAL` lines to stdout, and only `ERROR` lines and diagnostics to stderr. |
 | `--no-summary` | No summary at end | `--quiet` | renamed | `--quiet` suppresses the `OK` lines and the summary together. |
 | `--infected`, `-i` | Only print infected files | `--quiet` | renamed | Same setting. |
 | `--suppress-ok-results`, `-o` | Skip printing OK files | `--quiet` | renamed | Same setting. |
@@ -76,10 +76,10 @@ Grouped in the order `clamscan --help` prints them.
 
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
-| `--database=FILE/DIR`, `-d` | Load database from FILE or DIR | same spelling | same | Also loads a prebuilt `.exavdb`. Distinct from `--sig-dir`, which names the directory signatures *live in* and is written to. |
+| `--database=FILE/DIR`, `-d` | Load database from FILE or DIR | same spelling | same | Also loads a prebuilt `.exavdb`, named as a file. Replaces `--sig-dir`, the default directory, and is what `--auto-update` writes to when given. |
 | `--official-db-only[=yes/no]` | Only load official signatures | none | absent | |
 | `--fail-if-cvd-older-than=days` | Nonzero exit if database is stale | none | absent | |
-| `--log=FILE`, `-l` | Save scan report to FILE | `--log` | same | The long spelling matches; **`-l` is absent**. |
+| `--log=FILE`, `-l` | Save scan report to FILE | `--log` | differs | The long spelling matches; **`-l` is absent**. `clamscan` logs detections, warnings and the summary; exav logs every result line, `OK` included, and every error, but not the summary. |
 
 ### Targets, recursion and filters
 
@@ -180,9 +180,9 @@ examine.
 
 | `clamscan` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
-| `--max-scantime=#n` | Skip a scan longer than this (ms) | `--max-scan-secs` | renamed | Seconds, Unix only, and a kernel-enforced wall-clock plus CPU budget per job rather than an in-engine check. In a one-shot run it bounds the whole run, not each file. |
-| `--max-filesize=#n` | Skip files larger than this | `--max-input-bytes` | renamed | exav's default is **no limit**; ClamAV's is 100M. `--clamav-compat` sets 100M. Over the limit exav reports `LIMITS-EXCEEDED`, never a clean `OK`. |
-| `--max-scansize=#n` | Max data scanned per container | `--max-matcher-bytes` | renamed | exav's default is 10G, ClamAV's 400M. exav scans a streamed member without holding it, so this bounds CPU time rather than memory; what a scan holds is bounded by `--max-process-bytes`. `--clamav-compat` holds 400M per file. |
+| `--max-scantime=#n` | Skip a scan longer than this (ms) | `--max-scan-secs` | renamed | Seconds, Unix only, and a kernel-enforced wall-clock plus CPU budget per job rather than an in-engine check. In a one-shot run it bounds the whole run, not each file. Refused on a listener outside the clamd worker pool (`--workers threads`, ICAP alone). |
+| `--max-filesize=#n` | Skip files larger than this | `--max-input-bytes` | renamed | exav's default is **no limit**; ClamAV's is 100M. `--clamav-compat` sets 100M. Over the limit exav reports `LIMITS-EXCEEDED`, not a clean `OK`, unless `--partial-as ok` (which `--clamav-compat` sets). |
+| `--max-scansize=#n` | Max data scanned per container | `--max-matcher-bytes` | renamed | exav's default is 10G, ClamAV's 400M. exav scans a streamed member without holding it, so this bounds CPU time rather than memory. What a scan holds is a fixed 1 GiB, lowered by `--max-process-bytes`; `--clamav-compat` makes it 400M. |
 | `--max-files=#n` | Max files scanned per container | `--max-members` | renamed | exav's default is 100000 against ClamAV's 10000, because exav descends into nested archives ClamAV does not and so counts more members for the same file. `--clamav-compat` sets 10000. |
 | `--max-recursion=#n` | Max archive recursion depth | `--max-unpack-depth` | renamed | Different default too: exav 16, ClamAV 17. `--clamav-compat` sets 17. `0` is refused. |
 | `--max-dir-recursion=#n` | Max directory recursion depth | none | absent | exav's directory walk has no depth cap. |
@@ -214,7 +214,7 @@ The wire protocol is compatible
 | `clamd` | What it does | exav | Status | Notes |
 |---|---|---|---|---|
 | `--help`, `-h` | Show help | same spelling | same | |
-| `--version`, `-V` | Print version | same spelling | same | |
+| `--version`, `-V` | Print version | same spelling | differs | Prints `exav <version>`; the wire `VERSION` command answers the `ClamAV <version>` string clients expect. |
 | `--foreground`, `-F` | Do not daemonize | none | absent | exav's daemon always runs in the foreground; run it under systemd, a supervisor or `&`. |
 | `--debug` | Enable debug mode | none | absent | |
 | `--config-file=FILE`, `-c` | Read configuration from FILE | none | absent | exav reads no configuration file. |
@@ -237,7 +237,7 @@ gives the flag or environment variable that does the same job, or "none".
 | `FixStaleSocket` | Remove a leftover socket at startup | default | exav removes a stale socket before binding. |
 | `TCPSocket` | TCP port to listen on | `--listen ADDR` | One value carries protocol, host and port. |
 | `TCPAddr` | Address to bind | `--listen ADDR` | |
-| `MaxConnectionQueueLength` | Listen backlog | `?max-connections=` on the address | Concurrent connections rather than a backlog. Default 128 (100 on ICAP). Read only under `--workers threads`: the prefork pool bounds concurrency by its worker count. |
+| `MaxConnectionQueueLength` | Listen backlog | `?max-connections=` on the address | Concurrent connections rather than a backlog. Default 128 (100 on ICAP). On the clamd listener it is read only under `--workers threads`: the prefork pool bounds concurrency by its worker count. ICAP always reads it. |
 | `MaxThreads` | Worker thread count | `--workers N` | exav's default is one prefork **process** per CPU core; `--workers threads` selects the in-process thread model. |
 | `MaxQueue` | Max queued scan jobs | none | |
 | `IdleTimeout` | Idle thread timeout | none | |
@@ -255,10 +255,10 @@ gives the flag or environment variable that does the same job, or "none".
 
 | Directive | What it does | exav equivalent | Notes |
 |---|---|---|---|
-| `LogFile` | Scan/status log path | `--log FILE` | Scan results only, one line per scan the daemon answers, under the daemon's own view of the target (`stream:` for `INSTREAM`, `fd:` for `FILDES`). clamd's log also carries startup, connection and reload lines; exav writes those to stderr for the supervisor to route. |
+| `LogFile` | Scan/status log path | `--log FILE` | Scan results only, one line per scan the daemon answers, under the daemon's own view of the target (`stream:` for `INSTREAM`, `fd:` for `FILDES`). clamd's log also carries startup, connection and reload lines; exav writes those to stderr for the supervisor to route. Reopened on `SIGHUP`, as clamd does. |
 | `LogFileMaxSize` | Rotate at this size | none | |
 | `LogFileUnlock` | Do not lock the log | none | |
-| `LogRotate` | Rotate the log | none | |
+| `LogRotate` | Rotate the log | none | Rotate with logrotate: exav reopens `--log` on `SIGHUP`. |
 | `LogTime` | Timestamp log lines | none | |
 | `LogClean` | Log clean files too | none | |
 | `LogSyslog` | Log to syslog | none | exav writes to stdout/stderr; the supervisor routes it. |
@@ -285,7 +285,7 @@ gives the flag or environment variable that does the same job, or "none".
 | `MaxFileSize` | Max file size scanned | `--max-input-bytes` | |
 | `MaxRecursion` | Max archive recursion | `--max-unpack-depth` | |
 | `MaxFiles` | Max files per container | `--max-members` | |
-| `MaxScanTime` | Max scan time | `--max-scan-secs`, `--max-pe-emulation-steps` | `--max-scan-secs` is kernel-enforced per job (seconds, Unix), not an in-engine check. The in-engine CPU bounds are `--max-matcher-bytes` and `--max-pe-emulation-steps`; the latter reports as `Heuristics.Limits.Exceeded.MaxScanTime`. |
+| `MaxScanTime` | Max scan time | `--max-scan-secs`, `--max-pe-emulation-steps` | `--max-scan-secs` is kernel-enforced per job (seconds, Unix), not an in-engine check, and only in the clamd worker pool: ICAP scans have no time bound. The in-engine CPU bounds are `--max-matcher-bytes` and `--max-pe-emulation-steps`; the latter reports as `Heuristics.Limits.Exceeded.MaxScanTime`. |
 | `MaxDirectoryRecursion` | Max directory depth | none | |
 | `MaxEmbeddedPE`, `MaxHTMLNormalize`, `MaxHTMLNoTags`, `MaxScriptNormalize`, `MaxZipTypeRcg`, `MaxPartitions`, `MaxIconsPE`, `MaxRecHWP3` | Per-subsystem caps | none | exav applies its global budgets instead. |
 | `PCREMatchLimit`, `PCRERecMatchLimit`, `PCREMaxFileSize` | PCRE bounds | none | Bounded internally, not tunable. |
@@ -376,11 +376,10 @@ Two client-mode behaviours have no flag:
 
 | exav flag | What it does |
 |---|---|
-| `--sig-dir <DIR>` | The directory signatures live in and `--auto-update` writes to (default `/var/lib/exav`). |
+| `--sig-dir <DIR>` | The directory signatures live in, loaded and (by `--auto-update`) written to unless `-d` is given (default `/var/lib/exav`). |
 | `--sig-sources <URL\|FILE>` | Where `--auto-update` fetches from: exact URLs, mirror bases (trailing `/`), or a file of either, which may be a `freshclam.conf`. |
 | `--db-url <URL>` | A prebuilt `.exavdb` to pull and serve instead of signature files. |
 | `--build-db <FILE>` | Compile the loaded signatures into a prebuilt `.exavdb` and exit. |
-| `--build-shard-bytes <SIZE\|off>` | Peak memory for building one matcher shard during `--build-db`. |
 | `--listen <ADDR>` | Serve on this address. `clamd://` and `icap://`; naming both serves both from one process over one database. |
 | `--connect <ADDR>` | Scan by handing each file to a daemon already running here. |
 | `--send-as <WHAT>` | What that client hands over: `path`, `contents` or `fd`. |
@@ -390,13 +389,13 @@ Two client-mode behaviours have no flag:
 | `--allow-no-db` | Run against the built-in EICAR-only baseline instead of refusing. Testing only. |
 | `--workers <N\|threads>` | Prefork worker processes, or the in-process thread model. |
 | `--max-jobs-per-worker <N\|off>` | Recycle a worker process after this many jobs. |
-| `--max-process-bytes <SIZE\|off>` | Per-worker address-space cap (`RLIMIT_AS`). |
+| `--max-process-bytes <SIZE\|off>` | Address-space cap (`RLIMIT_AS`): per worker in the clamd pool, the whole process otherwise. |
 | `--allow-shutdown` | Honour the clamd `SHUTDOWN` command. Off by default. |
 | `--allow-http-scan` | Fetch `http(s)://` scan targets, one-shot or through `SCANURL`. Off by default. |
 | `--max-object-bytes <SIZE\|off>` | The most memory a single decoded object may use. |
 | `--max-matcher-bytes <SIZE\|off>` | Cumulative bytes fed to the matcher: a CPU bound, not a memory one. |
 | `--max-pe-emulation-steps <N\|off>` | Instructions the PE unpacking emulator may run across one top-level file. |
-| `--spill-dir`, `--spill-threshold-bytes`, `--max-spill-bytes`, `--max-total-spill-bytes` | Where a streamed object waits while it is scanned, and how much RAM and temp space it may take. |
+| `--spill-dir`, `--spill-threshold-bytes`, `--max-spill-bytes`, `--max-total-spill-bytes` | Where a streamed object, or an archive member past `--max-object-bytes`, waits while it is scanned, and how much RAM and temp space it may take. |
 | `--partial-as <POLICY>` | What becomes of an object exav could not fully examine: `partial` (default), `ok`, `found` or `error`, whole or per condition (`limits-exceeded=`, `unscannable=`, `password-protected=`). |
 | `--clamav-compat` | Preset reproducing a stock ClamAV build's limits and extractor set, for differential testing. Reduces detection on purpose. |
 | `--decode <LIST>` / `--no-decode <LIST>` | Encodings to recover a payload from before scanning it: `base64` today, meaning both a run long enough to hold an executable and the base64 assets a markup document embeds. On by default, unlike `--detect`. |

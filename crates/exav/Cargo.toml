@@ -134,7 +134,6 @@ exav-core = { path = "../exav-core", version = "0.0.2", default-features = false
 # feature so the default pure-Rust build never links it.
 exav-update = { path = "../exav-update", version = "0.0.2", optional = true }
 clap.workspace = true
-anyhow.workspace = true
 walkdir.workspace = true
 libc = "0.2.186"
 regex = "1.12.4"

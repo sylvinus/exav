@@ -17,7 +17,7 @@ export default defineConfig({
     starlight({
       title: 'exav',
       tagline: 'A fast, memory-safe malware scanner written in Rust.',
-      // Mark only — the "exav" wordmark next to it is rendered as real text by
+      // Mark only: the "exav" wordmark next to it is rendered as real text by
       // Starlight, so it uses the site font rather than whatever the viewer's
       // OS happens to substitute inside an <img>-loaded SVG.
       logo: {
@@ -45,15 +45,15 @@ export default defineConfig({
         {
           label: 'Usage guides',
           items: [
+            { label: 'Migrating from ClamAV', slug: 'guides/migrating-from-clamav' },
+            { label: 'Signatures', slug: 'guides/signatures' },
             { label: 'Scanning', slug: 'guides/scanning' },
+            { label: 'Prebuilt database', slug: 'guides/prebuilt-database' },
             { label: 'Daemon mode', slug: 'guides/daemon' },
-            { label: 'Sizing a server', slug: 'guides/sizing' },
             { label: 'ICAP server', slug: 'guides/icap' },
             { label: 'Docker', slug: 'guides/docker' },
-            { label: 'Signatures', slug: 'guides/signatures' },
-            { label: 'Prebuilt database', slug: 'guides/prebuilt-database' },
+            { label: 'Sizing a server', slug: 'guides/sizing' },
             { label: 'YARA rules', slug: 'guides/yara' },
-            { label: 'Migrating from ClamAV', slug: 'guides/migrating-from-clamav' },
             { label: 'WASM sandbox', slug: 'guides/wasm-sandbox' },
             { label: 'Rust library usage', slug: 'guides/library-usage' },
             { label: 'Troubleshooting & FAQ', slug: 'guides/troubleshooting' },

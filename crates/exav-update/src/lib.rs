@@ -2,7 +2,7 @@
 //!
 //! exav bundles **no URLs**. The caller supplies them (`--sig-sources` and
 //! `--db-url`, or the variables behind them), so nothing here points at any
-//! vendor by default — exav treats Cisco's "official" CVDs as **just three more
+//! vendor by default: exav treats Cisco's "official" CVDs as **just three more
 //! URLs**, no different from any other feed.
 //!
 //! This crate is isolated on purpose: it is the single place a TLS stack
@@ -14,7 +14,7 @@
 //! validator (or, failing that, a byte-compare against the on-disk copy) decides
 //! whether anything changed; the body is validated before it can overwrite a good
 //! file; and it is installed atomically (temp + rename). There is **no**
-//! digital-signature verification and **no** rsync — for GPG-signed or rsync-only
+//! digital-signature verification and **no** rsync. For GPG-signed or rsync-only
 //! feeds (e.g. Sanesecurity), run `clamav-unofficial-sigs` into the signature
 //! directory and let exav read it.
 #![forbid(unsafe_code)]
@@ -32,18 +32,20 @@ use sha2::{Digest, Sha256};
 /// `.exavdb`). Rejects a server streaming an unbounded/oversized body.
 const MAX_FETCH: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Framing of an exav prebuilt database: `MAGIC(8) | VERSION(4) | payload | SHA-256(32)`.
+/// Framing of an exav prebuilt database: `MAGIC(8) | VERSION(4) | payload | CRC-32(4)`.
 /// Mirrored from `exav-core::database` so this crate needs no `exav-core` dependency.
 const EXAV_DB_MAGIC: &[u8; 8] = b"EXAVDB\x00\x01";
+/// The format version `exav-core` reads and writes (its `database::VERSION`).
+const EXAV_DB_VERSION: u32 = 4;
 const EXAV_DB_HEADER_LEN: usize = 12; // 8-byte magic + 4-byte LE version
-const EXAV_DB_DIGEST_LEN: usize = 32; // trailing SHA-256 of the payload
+const EXAV_DB_DIGEST_LEN: usize = 4; // trailing CRC-32 of the payload, LE
 
 /// Outcome of a conditional fetch. Both variants carry the current validator so
 /// the caller can persist it and short-circuit the next poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Fetch {
-    /// Nothing was written — the remote matched what we already have.
+    /// Nothing was written: the remote matched what we already have.
     Unchanged {
         /// The remote's current validator (`ETag`/`Last-Modified`), if it sent
         /// one. Persist it and pass it back to short-circuit the next poll.
@@ -70,7 +72,7 @@ impl Fetch {
     }
 }
 
-/// Standard base64 (with padding) — just enough to encode Basic-auth credentials
+/// Standard base64 (with padding), just enough to encode Basic-auth credentials
 /// without pulling a base64 crate into this thin updater.
 fn base64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -160,19 +162,20 @@ fn split_basic_auth(url: &str) -> (String, Option<String>) {
 /// A cache validator and the request header that may send it back.
 ///
 /// The two are not interchangeable. A `Last-Modified` date returned in
-/// `If-None-Match` is not a well-formed entity-tag — unquoted, with spaces and
-/// commas — so it can never match, and some CDNs answer a malformed
+/// `If-None-Match` is not a well-formed entity-tag (unquoted, with spaces and
+/// commas), so it can never match, and some CDNs answer a malformed
 /// `If-None-Match` with `400`. The effect is a full re-download on every poll
 /// against any origin that sends no `ETag`, or a hard failure.
-fn validator_of(resp: &ureq::Response) -> Option<String> {
-    resp.header("ETag")
-        .or_else(|| resp.header("Last-Modified"))
+fn validator_of(resp: &ureq::http::Response<ureq::Body>) -> Option<String> {
+    let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
+    header("ETag")
+        .or_else(|| header("Last-Modified"))
         .map(|s| s.to_string())
 }
 
 /// The conditional-request header a stored validator belongs in.
 ///
-/// An entity-tag is quoted — `"abc"` or `W/"abc"` — and an HTTP-date is not, so
+/// An entity-tag is quoted (`"abc"` or `W/"abc"`) and an HTTP-date is not, so
 /// the value says which it is and the stored form stays what the caller already
 /// persists. Sending a date in `If-None-Match` is the failure this avoids: it is
 /// not a well-formed entity-tag, so it can never match, and the poll re-downloads
@@ -221,23 +224,24 @@ fn fetch_into(
     // `.exavdb` by a digest the same response supplied. The operator would see
     // "updated" and nothing else.
     //
-    // A source configured as plain `http://` still works — `https_only` refuses
-    // the DOWNGRADE, not the scheme — so an air-gapped mirror is unaffected.
+    // A source configured as plain `http://` still works: `https_only` refuses
+    // the DOWNGRADE, not the scheme, so an air-gapped mirror is unaffected.
     // `redirects` is pinned rather than inherited so a dependency's default
     // cannot quietly change how far this follows.
     let scheme = scheme_of(url);
-    let agent = ureq::AgentBuilder::new()
+    let agent: ureq::Agent = ureq::Agent::config_builder()
         .user_agent(concat!("exav-update/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout_global(Some(std::time::Duration::from_secs(300)))
         .https_only(scheme == "https")
-        .redirects(5)
-        .build();
+        .max_redirects(5)
+        .build()
+        .into();
 
     let (url, auth) = split_basic_auth(url);
     // Credentials over cleartext are refused rather than sent. `https_only`
     // above covers the downgrade an attacker causes; this covers the one the
     // operator wrote, which is the easier mistake to make and the one nothing
-    // else here would catch — a `Basic` header is the password in base64, and a
+    // else here would catch: a `Basic` header is the password in base64, and a
     // fetch that succeeded looks identical either way. A plain `http://` source
     // with no userinfo still works, so an air-gapped mirror is unaffected.
     if auth.is_some() && scheme == "http" {
@@ -248,9 +252,10 @@ fn fetch_into(
         ));
     }
     let url = url.as_str();
-    let with_auth = |mut r: ureq::Request| -> ureq::Request {
+    type Request = ureq::RequestBuilder<ureq::typestate::WithoutBody>;
+    let with_auth = |mut r: Request| -> Request {
         if let Some(a) = &auth {
-            r = r.set("Authorization", a);
+            r = r.header("Authorization", a);
         }
         r
     };
@@ -258,7 +263,7 @@ fn fetch_into(
     // Only trust the "unchanged" fast-paths (the HEAD/ETag shortcut and the
     // conditional-GET `304`) while we still have the file they'd let us skip
     // re-downloading. If `dest` was deleted or truncated out from under us, a
-    // matching validator must NOT report Unchanged — otherwise the on-disk copy
+    // matching validator must NOT report Unchanged, or the on-disk copy
     // stays missing until the process restarts (which is what resets `prev`). So
     // gate both shortcuts on the destination actually existing.
     let have_dest = dest.exists();
@@ -279,18 +284,10 @@ fn fetch_into(
     let mut req = with_auth(agent.get(url));
     if have_dest {
         if let Some(p) = prev {
-            req = req.set(validator_header(p), p);
+            req = req.header(validator_header(p), p);
         }
     }
-    let resp = match req.call() {
-        Ok(r) => r,
-        Err(ureq::Error::Status(304, _)) => {
-            return Ok(Fetch::Unchanged {
-                validator: prev.map(String::from),
-            })
-        }
-        Err(e) => return Err(io::Error::other(e.to_string())),
-    };
+    let resp = req.call().map_err(|e| io::Error::other(e.to_string()))?;
     // ureq surfaces a 304 as `Ok`; treat it as unchanged.
     if resp.status() == 304 {
         return Ok(Fetch::Unchanged {
@@ -299,7 +296,9 @@ fn fetch_into(
     }
     let validator = validator_of(&resp);
     let expected: Option<u64> = resp
-        .header("Content-Length")
+        .headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse().ok());
 
     // Refuse before allocating, not after. `Content-Length` was already parsed
@@ -313,7 +312,8 @@ fn fetch_into(
         }
     }
     let mut body = Vec::new();
-    resp.into_reader()
+    resp.into_body()
+        .into_reader()
         .take(MAX_FETCH + 1)
         .read_to_end(&mut body)?;
     if body.len() as u64 > MAX_FETCH {
@@ -343,9 +343,9 @@ fn fetch_into(
         .and_then(|n| n.to_str())
         .unwrap_or("download");
     // The temp name carries this process's pid. A fixed name collides when two
-    // updaters share a data directory — a daemon plus a cron `exav --update`, or
-    // two daemons on one volume, both of which the README describes as supported
-    // — and `fs::write` truncates, so the loser's `rename` publishes whatever
+    // updaters share a data directory (a daemon plus a cron `exav --update`, or
+    // two daemons on one volume, both of which the README describes as
+    // supported), and `fs::write` truncates, so the loser's `rename` publishes whatever
     // mixture of the two bodies was on disk at that moment. Each body passed
     // validation on its own; the blend did not.
     let tmp = match dest.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -357,7 +357,7 @@ fn fetch_into(
     };
     // Written, flushed to the device, and only then renamed. `rename` is atomic
     // for the directory entry, but without the sync a crash can leave the entry
-    // pointing at blocks that were never written — a zero-length or partly-zero
+    // pointing at blocks that were never written: a zero-length or partly-zero
     // database where the README promises the previous one intact. Any failure
     // takes the temp file with it rather than leaving it for the next run to
     // trip over.
@@ -373,9 +373,10 @@ fn fetch_into(
     Ok(Fetch::Updated { validator })
 }
 
-/// Verify a body is a complete, uncorrupted exav database: correct magic and a
-/// trailing SHA-256 matching its payload (the stamp `exav-core` writes and checks
-/// at load). Catches an interrupted/corrupt download before it is installed.
+/// Verify a body is a complete, uncorrupted exav database this build can load:
+/// correct magic and version, and a trailing CRC-32 matching its payload (the
+/// stamp `exav-core` writes and checks at load). Catches an interrupted/corrupt
+/// download, or one built by another version, before it replaces a good one.
 fn verify_exav_db(body: &[u8]) -> Result<(), String> {
     if body.len() < EXAV_DB_HEADER_LEN + EXAV_DB_DIGEST_LEN {
         return Err("truncated download (shorter than an empty database header)".into());
@@ -383,11 +384,22 @@ fn verify_exav_db(body: &[u8]) -> Result<(), String> {
     if &body[..EXAV_DB_MAGIC.len()] != EXAV_DB_MAGIC {
         return Err("not an exav database (.exavdb): wrong magic".into());
     }
+    let version = u32::from_le_bytes(
+        body[EXAV_DB_MAGIC.len()..EXAV_DB_HEADER_LEN]
+            .try_into()
+            .unwrap(),
+    );
+    if version != EXAV_DB_VERSION {
+        return Err(format!(
+            "unsupported database version {version} (this build expects {EXAV_DB_VERSION}): \
+             rebuild it with a matching exav"
+        ));
+    }
     let (head_payload, trailer) = body.split_at(body.len() - EXAV_DB_DIGEST_LEN);
     let payload = &head_payload[EXAV_DB_HEADER_LEN..];
-    if Sha256::digest(payload).as_slice() != trailer {
+    if crc32fast::hash(payload).to_le_bytes() != trailer {
         return Err(
-            "integrity check failed (SHA-256 mismatch): download corrupt or interrupted".into(),
+            "integrity check failed (checksum mismatch): download corrupt or interrupted".into(),
         );
     }
     Ok(())
@@ -395,8 +407,8 @@ fn verify_exav_db(body: &[u8]) -> Result<(), String> {
 
 /// Pull a prebuilt exav database (`.exavdb`) from `url` and install it at `dest`
 /// only when it has changed. The body must carry the exav database magic and a
-/// matching embedded SHA-256, so a corrupt/interrupted download is rejected and
-/// the good on-disk database is kept. No signature verification — trust the
+/// matching CRC-32 trailer, so a corrupt/interrupted download is rejected and
+/// the good on-disk database is kept. No signature verification: trust the
 /// builder, over HTTPS.
 pub fn fetch_db_if_changed(url: &str, dest: &Path, prev: Option<&str>) -> io::Result<Fetch> {
     fetch_into(url, dest, prev, verify_exav_db)
@@ -465,14 +477,14 @@ pub fn sig_dest(sigdir: &Path, url: &str) -> io::Result<PathBuf> {
     // Sanitising is lossy and the query is dropped entirely, so two different
     // sources on one host can land on one file: `get.php?db=daily` and
     // `get.php?db=main` both reduce to `get.php`, and `a+b/` and `a%20b/` both
-    // to `a_b`. Sharing a destination is worse than a name collision — each poll
+    // to `a_b`. Sharing a destination is worse than a name collision: each poll
     // finds content that does not match its own stored validator, re-downloads,
     // and overwrites the other, so the two feeds flip-flop forever and the
     // loaded signature set depends on which finished last.
     //
     // A short digest of the WHOLE url, query included, separates them. It goes
     // into the final component so the directory layout still reads as the origin
-    // it came from — and it goes in front of the extension, never after it. The
+    // it came from, and it goes in front of the extension, never after it. The
     // loader dispatches on extension alone: `daily.cvd-473e5c` parses as an
     // extension of `cvd-473e5c`, matches no arm, and is skipped in silence, so a
     // digest appended at the end would fetch every source successfully and load
@@ -497,10 +509,10 @@ pub fn sig_dest(sigdir: &Path, url: &str) -> io::Result<PathBuf> {
 
 /// Pull one **signature source** from `url` into the signature directory `sigdir`
 /// (at [`sig_dest`], i.e. `<sigdir>/env/<host>/…`) only when it has changed. This
-/// is how exav treats every source — a ClamAV `.cvd` and a third-party `.ndb` go
+/// is how exav treats every source: a ClamAV `.cvd` and a third-party `.ndb` go
 /// through the exact same path. Validation before install: a `.cvd`/`.cld` must
 /// carry the `ClamAV-VDB:` header; any other file must be non-empty and not look
-/// like an HTML error page. (No signature/GPG verification — trust the source,
+/// like an HTML error page. (No signature/GPG verification: trust the source,
 /// over HTTPS.)
 pub fn fetch_signature_if_changed(
     url: &str,
@@ -520,7 +532,7 @@ pub fn fetch_signature_if_changed(
             }
         } else {
             // Leading whitespace is ordinary in a templated error page, so the
-            // check has to look past it — otherwise "\n<!DOCTYPE html>" installs
+            // check has to look past it, or "\n<!DOCTYPE html>" installs
             // itself as a signature file and the loader gets to cope with the
             // markup. A JSON error body is the same class of answer.
             let head = b
@@ -538,7 +550,7 @@ pub fn fetch_signature_if_changed(
 /// Garbage-collect exav's `env/` subtree: delete every file under `<sigdir>/env/`
 /// that no longer maps to one of `active_urls` (a source dropped from
 /// `--sig-sources`), then remove the directories left empty.
-/// exav owns only this subtree — files elsewhere in `sigdir` (freshclam- or
+/// exav owns only this subtree: files elsewhere in `sigdir` (freshclam- or
 /// hand-managed) are never touched. Returns the paths removed. Best-effort: an
 /// unreadable entry is skipped rather than fatal.
 pub fn prune_env_sources(sigdir: &Path, active_urls: &[&str]) -> io::Result<Vec<PathBuf>> {
@@ -553,7 +565,7 @@ pub fn prune_env_sources(sigdir: &Path, active_urls: &[&str]) -> io::Result<Vec<
     let mut removed = Vec::new();
     // A file that will not delete is still being LOADED, and the operator who
     // deconfigured its feed has no way to know unless it is said. Being
-    // best-effort is right; being invisible is not — the recursive loader picks
+    // best-effort is right; being invisible is not. The recursive loader picks
     // up whatever is left here, so a stale or withdrawn feed keeps matching.
     let mut failed = Vec::new();
     for file in walk_files(&env_root, 0) {
@@ -684,7 +696,7 @@ mod tests {
     }
 
     /// An uppercase scheme is the same cleartext as a lowercase one, and `ureq`
-    /// normalises it before dialling — so the refusal has to fire for `HTTP://`
+    /// normalises it before dialling, so the refusal has to fire for `HTTP://`
     /// too, or the password goes out in base64 over the wire.
     ///
     /// The port is closed on purpose: reaching the network at all would fail as
@@ -736,12 +748,16 @@ mod tests {
     fn verify_exav_db_accepts_valid_and_rejects_corrupt() {
         let framed = |payload: &[u8]| -> Vec<u8> {
             let mut v = EXAV_DB_MAGIC.to_vec();
-            v.extend_from_slice(&1u32.to_le_bytes());
+            v.extend_from_slice(&EXAV_DB_VERSION.to_le_bytes());
             v.extend_from_slice(payload);
-            v.extend_from_slice(Sha256::digest(payload).as_slice());
+            v.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
             v
         };
         assert!(verify_exav_db(&framed(b"the database payload")).is_ok());
+        let mut older = framed(b"the database payload");
+        older[EXAV_DB_MAGIC.len()] = 3;
+        let err = verify_exav_db(&older).unwrap_err();
+        assert!(err.contains("version 3"), "{err}");
         assert!(verify_exav_db(&framed(b"")).is_ok());
         assert!(verify_exav_db(b"<html>404</html>").is_err());
         assert!(verify_exav_db(b"EXAVDB\x00\x01short").is_err());

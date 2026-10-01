@@ -56,13 +56,14 @@ use formats::*;
 mod inflate;
 pub mod profile;
 pub mod source;
+pub mod span;
 mod stream;
 pub mod volume;
 #[cfg(feature = "pdf")]
 pub use formats::has_obfuscated_name_object;
 #[allow(unused_imports)]
 pub(crate) use stream::Region;
-pub use stream::{is_budget_overflow, walk, Member, MemberMeta, Visit};
+pub use stream::{is_budget_overflow, walk, Member, MemberMeta, Mtime, Visit};
 
 /// Count of overlapping ZIP local file records, the signal behind ClamAV's
 /// `Heuristics.Zip.OverlappingFiles`. Zero for any well-formed archive.
@@ -281,6 +282,10 @@ pub struct Budget {
     /// Only has effect with the `checksums` Cargo feature compiled in; without
     /// it, checksums are never verified regardless of this flag.
     pub(crate) verify_checksums: bool,
+    /// Hand the visitor the directory entries of a container that has them as
+    /// members of their own (ZIP), with no content. Off by default: a scan
+    /// has nothing to read in them. See [`Budget::set_visit_directories`].
+    pub(crate) visit_directories: bool,
 }
 
 impl Budget {
@@ -298,6 +303,7 @@ impl Budget {
             pe_emulation_steps: 0,
             passwords: Vec::new(),
             verify_checksums: false,
+            visit_directories: false,
         }
     }
 
@@ -314,6 +320,13 @@ impl Budget {
     /// scans decompressed content even if a CRC fails (the scanner default).
     pub fn set_verify_checksums(&mut self, verify: bool) -> &mut Self {
         self.verify_checksums = verify;
+        self
+    }
+
+    /// Also visit directory entries (default off), for a caller that recreates
+    /// the tree, empty directories included.
+    pub fn set_visit_directories(&mut self, visit: bool) -> &mut Self {
+        self.visit_directories = visit;
         self
     }
 
@@ -516,7 +529,10 @@ pub(crate) fn read_at<R: Read + std::io::Seek + ?Sized>(
 }
 
 /// One extracted member.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// New fields may appear in any release: build one with [`Entry::new`] or
+/// [`Entry::unsupported`] and assign the others.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Entry {
     pub name: String,
     pub data: Vec<u8>,
@@ -531,6 +547,10 @@ pub struct Entry {
     /// The scanner surfaces this as a distinct `Unscannable` verdict rather than
     /// silently treating the member as clean.
     pub unsupported: Option<&'static str>,
+    /// When the member was last modified (see [`MemberMeta::mtime`]).
+    pub mtime: Option<Mtime>,
+    /// Its Unix mode (see [`MemberMeta::mode`]).
+    pub mode: Option<u32>,
 }
 
 impl Entry {
@@ -539,10 +559,9 @@ impl Entry {
     pub fn new(name: String, data: Vec<u8>) -> Self {
         Entry {
             comp_size: data.len() as u64,
-            encrypted: false,
-            unsupported: None,
             name,
             data,
+            ..Entry::default()
         }
     }
 
@@ -557,10 +576,10 @@ impl Entry {
     ) -> Self {
         Entry {
             name,
-            data: Vec::new(),
             comp_size,
             encrypted,
             unsupported: Some(reason),
+            ..Entry::default()
         }
     }
 }
@@ -1409,6 +1428,13 @@ fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> O
     if let Some(data) = src.as_slice() {
         return detect_probe(&Probe::whole(data));
     }
+    // The first checks need a few bytes, so an archive typed by them is not
+    // read `DETECT_HEAD` deep: over a network or browser reader that is most
+    // of a small archive. Only those `detect_probe` makes first: a later one,
+    // such as RAR's, could be overruled by an earlier check that needs more.
+    if let Some(fmt) = archive_magic(&src.window(0, 16)) {
+        return Some(fmt);
+    }
     let head = src.window(0, DETECT_HEAD);
     if head.len() == src.len() {
         return detect_probe(&Probe::whole(&head));
@@ -2153,6 +2179,8 @@ pub fn extract(
             comp_size: meta.comp_size,
             encrypted: meta.encrypted,
             unsupported: meta.unsupported,
+            mtime: meta.mtime,
+            mode: meta.mode,
         };
         if let Some(content) = content {
             match content.into_bytes(meta, budget) {
@@ -2175,6 +2203,16 @@ pub fn extract(
         Some(hit) => Err(hit),
         None => Ok(out),
     }
+}
+
+/// The volumes of a RAR set (`x.part1.rar`, `x.part2.rar`, ..., or `x.rar`,
+/// `x.r00`, ...), in order, as one single-volume RAR archive: what [`walk`]
+/// reads as [`Format::Rar`]. A member split across volumes is decoded whole
+/// that way, where read one volume at a time it is reported unreadable.
+/// `Err` names a part that does not fit the set.
+#[cfg(feature = "rar")]
+pub fn join_rar_volumes(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
+    formats::join_rar_volumes(volumes)
 }
 
 /// True if `data` looks like a UPX-packed executable (a valid `PackHeader` is

@@ -38,7 +38,20 @@ if let Some(fmt) = detect(&data) {
 
 `extract` holds every member; `walk` hands them over one at a time, a large one
 as a reader, and reads its source through a `ByteSource` (a slice, or a
-`source::BlockCache` over a file).
+`source::BlockCache` over a file). A member's metadata (`MemberMeta`) carries
+its modification time, Unix mode and link target where the format records
+them. A split archive reads as one: `span::ZipSpan` for a `zip -s` set, and
+`join_rar_volumes` for a RAR set.
+
+The crate also ships the `exav-unpack` command (the `cli` feature, on by
+default): an extractor for every format above, whose command line is a subset
+of `unzip`'s.
+
+```sh
+cargo install exav-unpack
+exav-unpack archive.7z -d out/
+exav-unpack -l set.part1.rar
+```
 
 Licensed under MIT. Full documentation:
 [exav.org](https://exav.org/subprojects/exav-unpack/). See [`NOTICE`](https://github.com/sylvinus/exav/blob/main/NOTICE)

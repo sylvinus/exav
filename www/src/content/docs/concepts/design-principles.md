@@ -18,10 +18,7 @@ that makes the scanner stop early, for any reason, is reported instead of being
 folded into `OK`.
 
 ClamAV, for example, reads a file over about 2 GB, scans none of it, and reports
-`OK`. exav closes that gap and every other way a scan can stop early. The one
-exception is asked for by name: `--clamav-compat`, a preset for differential
-testing, answers an incomplete scan `OK` as ClamAV does, and logs every such
-object on stderr so the pass stays visible.
+`OK`. exav closes that gap and every other way a scan can stop early.
 
 Three rules follow:
 
@@ -35,7 +32,9 @@ Three rules follow:
 3. **Not fully scanned is never clean, whatever the cause.** That covers external
    limits and exav's own work bounds: the budget that stops a pathological
    wildcard search, a PE emulation that runs out of instructions
-   (`--max-pe-emulation-steps`), a bytecode program that runs out of steps.
+   (`--max-pe-emulation-steps`), a bytecode program that runs out of steps or
+   reaches an opcode or API exav does not model. A bytecode program that fails
+   on its own (an out-of-bounds access) is discarded, as ClamAV discards it.
 
 A scan that did not complete resolves to `LIMITS-EXCEEDED`, `UNSCANNABLE` or
 `PASSWORD-PROTECTED`. See [Verdicts & exit codes](/reference/verdicts/) for what
@@ -46,9 +45,11 @@ each means and how it is reported.
 `clamscan` returns `OK` after bounding its own work (its `alert-exceeds-max` and
 `alert-encrypted` heuristics are off by default); exav does not. It is the main
 behavioral difference a migrating user has to plan for, along with the flags
-(see [Migrating from ClamAV](/guides/migrating-from-clamav/)). `--clamav-compat`
-matches ClamAV's limit values and its `OK` for incomplete scans, for
-differential testing, and logs each such object.
+(see [Migrating from ClamAV](/guides/migrating-from-clamav/)). The one exception
+is asked for by name:
+[`--clamav-compat`](/reference/cli/#clamav-compatibility), a preset for
+differential testing, answers an incomplete scan `OK` as ClamAV does and logs
+each such object on stderr.
 
 ### The verdict is not the policy
 
@@ -105,8 +106,9 @@ reported, never a silent truncation. See
 > database is built, not when it is loaded or when a file is scanned.
 
 A [prebuilt `.exavdb`](/guides/prebuilt-database/) is built once and loaded by
-every CLI run, daemon start, reload and worker. So the build does the expensive
-work (automatons, indexes, tables derived from the signatures) and stores the
+every CLI run, daemon start and reload, then shared by every worker. So the
+build does the expensive
+work (the anchor index, tables derived from the signatures) and stores the
 result in a form that loads with little more than a copy. Load time and scan
 speed come first; a larger file is an acceptable price.
 

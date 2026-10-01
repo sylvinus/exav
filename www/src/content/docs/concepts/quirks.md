@@ -52,30 +52,17 @@ case needs no configuration. A file with a non-default password stays
 Most people assume a signature is a pattern. ClamAV's most expressive signature
 type is a program: a `.cbc` file in `bytecode.cvd` is C compiled to a custom VM
 bytecode, which runs against a candidate file and decides whether it is
-malicious. A compatible scanner therefore has to embed an interpreter, with an
-instruction budget, a scratch-memory cap, a call-depth limit, a bounds-checked
-pointer model and a panic boundary per program.
+malicious. Part of ClamAV's unpacking is written this way, so a compatible
+scanner has to embed an interpreter, and the signature database becomes code
+your process runs. Even the integers are odd: the `ClamBC` header encodes them
+a nibble per byte (a byte `0x6N` carries nibble `N`).
 
-The format is line-oriented: a `ClamBC` header with a nibble-encoded integer
-scheme (a byte `0x6N` carries nibble `N`), a trigger line that is itself a `.ldb`
-logical signature (the program runs only when it matches), then records for
-types, API declarations, globals, functions, basic blocks and strings. Programs
-reach the outside world only through a fixed API of 107 functions
-(`read`/`seek`/`file_find`, PE/PDF/JSON accessors, hashing, `disasm_x86`, and
-`setvirusname` to report a hit). The most valuable programs are unpackers: part
-of ClamAV's unpacking is implemented as bytecode, so a missing one weakens
-detection across every sample of that packer.
+One design choice is not obvious: exav's budget for a program is a step count,
+not wall-clock time. A deadline would make detection depend on machine load,
+letting an attacker (or a busy server) push a program past it.
 
-The second surprise: the signature database is code your process runs. ClamAV's
-bytecode subsystem has a code-execution history
-([CVE-2020-37167](https://www.cve.org/CVERecord?id=CVE-2020-37167), CVSS 8.4, the
-`bytecode_vm` sandbox escape; and the optional LLVM JIT that generated native
-code from database content). exav's interpreter is safe Rust with no JIT and a
-panic boundary per program, and its budget is a step count, not wall-clock time:
-a deadline would make detection depend on machine load, letting an attacker (or
-a busy server) push a program past it.
-
-See [Bytecode sandbox](/concepts/bytecode-sandbox/).
+The format, the sandbox and ClamAV's history with it are in
+[Bytecode sandbox](/concepts/bytecode-sandbox/).
 
 ## The file extension is a lie, and so is the magic number
 
@@ -116,20 +103,15 @@ the standard `Name="Project"` stream of benign macro documents.
 
 Every scanner has a maximum file size. The naive implementation ("over the limit,
 skip it, report OK") hands the attacker a bypass: append padding until the file
-crosses the threshold. ClamAV's large-file behaviour is the known example: a file
-over about 2 GB is read, scanned as zero bytes, and reported `OK`.
-
-exav's rule is that refusing by size still scans. An input over
-`--max-input-bytes` has its first `--max-input-bytes` bytes scanned first, as
-any smaller input would be, and only then gets a limit verdict (here with
-`--max-input-bytes 100M`):
+crosses the threshold. exav scans the first `--max-input-bytes` bytes before it
+gives a limit verdict (here with `--max-input-bytes 100M`):
 
 ```text
 file size 5368709120 exceeds max-input-bytes 104857600; scanned first 104857600 bytes only
 ```
 
-A detection always beats a limit, and an incomplete scan is never `OK`. See
-[Design principles](/concepts/design-principles/#never-a-silent-clean).
+The rule, and ClamAV's large-file behaviour that motivates it, are in
+[Never a silent clean](/concepts/design-principles/#never-a-silent-clean).
 
 ## Containers have two indexes, and malware uses the one you don't read
 
@@ -137,28 +119,17 @@ A ZIP lists its members twice: a local file header before each member's data,
 and the central directory at the end. Every normal reader trusts the central
 directory, because APPNOTE says it is authoritative. So a member can be hidden:
 leave it out of the central directory and keep its local header and data. Many
-extractors still write it out.
+extractors still write it out, so exav reads both
+([dual indexing](/concepts/archive-extraction/#containers-have-two-indexes)).
 
-exav does dual indexing: after the central-directory pass it scans the raw bytes
-for local headers the directory did not claim and extracts those too, and the
-same path is the salvage route when the directory is corrupt or missing. An
-orphan it cannot read (encrypted, an unsupported codec, a size deferred to a
-data descriptor, an extent past the end of the file) is reported rather than
-skipped: its header is credible, so it is a member the target will extract.
-
-`PK\x03\x04` is four bytes and appears by chance in ordinary binaries, so a
-local header only counts if the fields a real writer fills in are consistent
-(version at most 6.3, no reserved flag bits, a defined method, a non-empty name
-within the path limit and free of NULs). Orphans are charged to the archive-wide
+Members found only by their local header are charged to the archive-wide
 member budget rather than to a separate cap: a real JAR whose end-of-directory
-record was gone had over 400 members reachable only as local headers.
+record was gone had over 400 members reachable only that way.
 
-**ISO images have the same shape**, and the trick is used more openly. A CD image
-carries several volume descriptors, each with its own directory tree over the
-same sectors: the primary ISO9660 tree and the Joliet tree with long Unicode
-names. A malicious ISO lists its payload in only one of them, leaving the other
-empty, so a reader that parses the other sees an empty disc. exav walks every
-tree, Joliet first so the long names win.
+**ISO images have the same shape**, and the trick is used more openly: a
+malicious ISO lists its payload in only one of its directory trees (the primary
+ISO9660 tree or the Joliet tree), so a reader that parses the other sees an
+empty disc. exav walks every tree, Joliet first so the long names win.
 
 **gzip has the problem in miniature.** RFC 1952 allows a `.gz` to be several
 concatenated members, and `gzip`/`zcat` decompress all of them, while Rust's
@@ -200,22 +171,24 @@ Two more places encryption is a signal:
 - `--partial-as password-protected=found` turns a password-protected member into
   a detection, `Heuristics.Encrypted.Zip` / `.RAR` / `.7Zip` / `.PDF` / `.OLE2`,
   or `.Archive` for other formats.
-- exav tries a default password list on ZIPs: `infected`, `virus`, `malware`,
-  `password`, `123456`. "infected" is the standard password for sharing samples,
-  so a password-protected dropper opens with no configuration, as
-  `VelvetSweatshop` does for Office. `.pwdb` databases and `--passwords` extend
-  the pool.
+- "infected" is the standard password for sharing samples, so exav tries it,
+  and a few others, on every encrypted ZIP: a password-protected dropper opens
+  with no configuration, as `VelvetSweatshop` does for Office (see
+  [Encryption support](/reference/formats/#encryption-support)).
 
 ## A wrong checksum must never stop the scan
 
-This reads like a bug in every code review: exav extracts archive members without
-verifying their CRCs, and verification is off by default. A wrong CRC must never
-stop a member's bytes from being scanned, or an attacker could downgrade a
-detection by flipping one checksum byte. (ClamAV also ignores CRCs when scanning.
+This reads like a bug in every code review: for most formats exav scans a
+member's bytes whether or not its CRC matches. A wrong CRC must not stop a
+member from being scanned, or an attacker could downgrade a detection by
+flipping one checksum byte. (ClamAV also ignores CRCs when scanning.
 Verification is for a library embedding extracting files, where a bad CRC is a
 real "corrupt file" signal: it needs the `checksums` feature of `exav-core` or
 `exav-unpack` and `ScanOptions::verify_checksums`. The command line has no
-switch for it.)
+switch for it.) The exceptions are formats where the checksum is the only check
+on a complex decoder (RAR, WIM, ARC, EGG): there a mismatch means the decoder
+produced garbage, and the member is reported `UNSCANNABLE` rather than scanned
+as if it were right.
 
 The same instinct generalises. A CAB whose total-size field is overwritten with
 `0xFFFFFFFF` defeats a strict parser; exav clamps it and extracts the member. A
@@ -226,14 +199,9 @@ recovered prefix, and `zcat` recovers it too.
 Leniency stops at structure. An OLE file a strict reader rejects (a broken
 red-black-tree ordering, common in real Office documents and malware) is walked
 as a flat directory instead, but a member that is present and unreadable is
-still reported, not treated as clean.
-
-> When a sequential stream runs out of input, every byte that exists has been
-> scanned: the missing tail is absent, not hidden, so a clean result is a real
-> clean. The incomplete verdicts are for content that is present but unscanned:
-> an encrypted member, an unsupported codec, a member over a limit. A stream
-> damaged part way is one of those: the compressed data after the damage is
-> present and was not decoded, so a clean result there is `UNSCANNABLE`.
+still reported, not treated as clean. Where a truncated stream is a clean result
+and a damaged one is not is explained in
+[Archive extraction](/concepts/archive-extraction/#recovering-what-a-naive-reader-would-skip).
 
 ## Identity that survives the bytes changing
 
@@ -429,26 +397,27 @@ The `clamd` protocol itself has oddities:
   escapes (or megabytes of text) in a member name that ends up in the scanner's
   output, so names are stripped of control characters and capped at 200 bytes.
 - **Decoder panics have to be a non-event.** Third-party decoders panic on crafted
-  input instead of returning an error. One `catch_unwind` boundary turns any
-  decoder panic into `UNSCANNABLE`, for every decoder, without patching each
-  dependency. The daemon adds a second layer for what `catch_unwind` cannot catch
-  (OOM, stack overflow): a prefork pool with per-job `RLIMIT_AS`, `RLIMIT_CPU`
-  and an alarm, after which the worker answers its client and is replaced.
+  input instead of returning an error, so one `catch_unwind` boundary covers them
+  all without patching each dependency
+  ([Hostile input](/concepts/archive-extraction/#hostile-input)). What it cannot
+  catch (OOM, stack overflow) is left to the daemon's prefork pool, whose
+  per-job limits replace the worker after it answers its client.
 - **A container type exav cannot model refuses the signature.** Leaving a
   `Container:` constraint unenforced to avoid a false negative would let a
   signature scoped to one container fire everywhere. Every type the official
   database uses is determined, so none is currently refused.
 - **PUA signatures are a separate alphabet.** The `.ndu`/`.ldu`/`.hdu`/`.hsu`/
-  `.mdu` databases are ClamAV's potentially-unwanted-application sets, loaded
+  `.mdu`/`.msu` databases are ClamAV's potentially-unwanted-application sets, loaded
   only with PUA detection on. Hash-based PUA has no `PUA.` name gate, so loading
   them by default would flag adware.
 - **The signature ABI is 32-bit where the engine is not.** `.ldb` subsignature
   match offsets are handed to bytecode programs as `u32` values in which
   `u32::MAX` means "no match", so a real match at exactly 4 GiB is clamped to
   `0xFFFFFFFE` rather than read as a miss.
-- **An unpacker that is not sure must emit nothing.** Every unpacked PE must
-  reconstruct a valid `MZ`/`PE\0\0` image, and a packer exav can only detect gets
-  no synthesised output. A wrong guess is discarded, never fed to the matcher.
+- **An unpacker that is not sure must emit nothing.** A wrong guess fed to the
+  matcher is worse than none, so an unpacked PE that does not read back as a
+  valid image is discarded
+  ([PE stub emulation](/concepts/pe-emulation/#when-the-stub-wins)).
 - **Read one byte past the limit.** `take(cap)` returns end-of-file at the cap, so
   "exactly at the cap" and "over it" look the same; exav reads
   `take(cap + 1)` at every size gate to tell them apart, and reports the second.

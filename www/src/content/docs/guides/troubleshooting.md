@@ -17,8 +17,21 @@ EICAR-only baseline is available for testing with `--allow-no-db`
 
 ## "unsupported database version N (this build expects M)"
 
-A prebuilt `.exavdb` is tied to the exav version that built it. After upgrading,
-rebuild it with `--build-db` from the raw signatures.
+A prebuilt `.exavdb` carries a format version, and this exav reads another one.
+Rebuild it with `--build-db` from the raw signatures (see
+[Prebuilt database](/guides/prebuilt-database/#rebuild-after-an-exav-upgrade)).
+
+## "a prebuilt database loads by its own path, not from the directory holding it"
+
+A directory given to `-d` or `--sig-dir` held only a `.exavdb`. Load the file
+itself: `-d /path/to/file.exavdb`.
+
+## "signature source URLs are set but this build has no updater"
+
+`--auto-update` fetches only in a build with HTTP support; the release binaries
+and a plain `cargo install exav` have none. Build with `--features http` (see
+[Installation](/getting-started/installation/)), use the container image, or fill
+the signature directory with `cvd` or `freshclam`.
 
 ## exav exits `3` on files ClamAV called clean
 
@@ -29,11 +42,23 @@ an incompletely scanned file as clean (see
 
 In CI, treat `3` as "not a pass". A scanner failure is still `2`, as in ClamAV.
 `--partial-as ok|found|error` maps `3` to another status if your pipeline wants
-three codes rather than four.
+three codes rather than four. See
+[Verdicts & exit codes](/reference/verdicts/#process-exit-code).
 
-For a differential run against `clamscan`, `--clamav-compat` matches its limits
-and its answer here: it implies `--partial-as ok`. An explicit `--partial-as`
-wins.
+## `clamdscan` or a milter says `ERROR` for an encrypted or oversized file
+
+The clamd protocol has no `PARTIAL`, so over it a file exav could not fully
+examine is answered `<CATEGORY> ERROR` (see
+[on the clamd wire](/reference/verdicts/#on-the-clamd-wire)). Clients act on it
+as on any scanner error. Supply passwords or raise the limit, or choose the
+answer with `--partial-as` on the daemon.
+
+## A client gets "permission denied" on the daemon's socket
+
+exav creates a Unix socket with mode `0600`, so only its own user can connect.
+Widen it on the address, for example
+`--listen 'clamd:///run/clamav/clamd.ctl?mode=660'`, with the client's user in
+the daemon's group (see [Socket permissions](/reference/cli/#socket-permissions)).
 
 ## A file comes back `LIMITS-EXCEEDED`
 
@@ -44,8 +69,7 @@ different things, and raising the wrong one changes nothing (see
 The common case is a large file. One over `--max-object-bytes` (256 MiB by
 default) gets the full engine, but the checks that parse a file whole (a PE's
 structure, YARA's `pe` module, a RAR, 7z or OLE container) do not run on it.
-With `--spill-dir off` leaving nowhere to write them, neither do the text views
-of a large text file (the HTML and script forms signatures are written against),
+With `--spill-dir off`, a large text file also skips its HTML and script views,
 and an archive member that decodes past the limit is not scanned. Raise
 `--max-object-bytes` to have those checks run, at the cost of memory. See
 [Streaming & memory](/concepts/streaming-memory/).
@@ -55,17 +79,17 @@ and an archive member that decodes past the limit is not scanned. Raise
 - **`PASSWORD-PROTECTED`**: an encrypted member. Supply passwords with
   `--passwords` (repeatable), `--passwords-from FILE` or a `.pwdb` database in
   the signature directory, then scan again. See
-  [Migrating from ClamAV](/guides/migrating-from-clamav/#4-encrypted-archives--passwords).
+  [Encryption support](/reference/formats/#encryption-support).
 - **`UNSCANNABLE`**: the container was recognised but could not be decoded (an
   unsupported codec, a RAR member split across volumes, a compressed stream
   damaged part way). Inspect it manually.
 
 ## exav uses a lot of memory when loading signatures
 
-Building the in-memory automaton from a large raw signature set takes several GB
-for a short time. Do it once: build a [prebuilt `.exavdb`](/guides/prebuilt-database/)
-on a capable host and load that everywhere, with a fraction of the RAM and a fast
-start. Memory during a scan is a separate matter, bounded by `--max-object-bytes`
+Parsing a large raw signature set and building its index takes more memory than
+the loaded database, for a short time. Do it once: build a prebuilt `.exavdb` on a
+capable host and load that everywhere (see
+[what it costs](/guides/prebuilt-database/#what-it-costs)). Memory during a scan is a separate matter, bounded by `--max-object-bytes`
 and `--max-process-bytes` (see [sizing a server](/guides/sizing/)).
 
 ## Handling false positives
@@ -77,12 +101,16 @@ directory:
 - `.fp` / `.sfp`: an allowlist by file hash (this file is trusted).
 - `.ign` / `.ign2`: an ignore list by signature name (this signature is off).
 
-For example, to trust one file:
+For example, to trust one file (GNU `md5sum` and `stat`; use your own signature
+directory):
 
 ```sh
 f=trusted.bin
 echo "$(md5sum "$f" | cut -d' ' -f1):$(stat -c%s "$f"):trusted-bin" >> /var/lib/exav/local.fp
 ```
+
+A `.exavdb` loaded with `-d` is not affected until you rebuild it from that
+directory.
 
 Report a suspected false positive to the author of the signature (the feed it
 came from); exav runs signatures, it does not write them.

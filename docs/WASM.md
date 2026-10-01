@@ -2,7 +2,7 @@
 
 exav can run its entire scanning engine inside a WebAssembly sandbox, letting
 you load **untrusted signature databases** without giving them access to your
-host. The scanner compiles to `wasm32-wasip1` — a standard WASI command — and
+host. The scanner compiles to `wasm32-wasip1`, a standard WASI command, and
 runs under any compatible runtime (wasmtime, wasmer, wazero, etc.) with **zero
 custom host code**.
 
@@ -31,23 +31,28 @@ wasmtime \
 
 The `--dir` flags mount directories into the WASM sandbox:
 
-- `--dir /path/to/sigs::/db` — signature DB mounted at `/db` inside the module
-- `--dir .::.` — current working directory mounted at `/` (so relative paths work)
+- `--dir /path/to/sigs::/db`: signature DB mounted at `/db` inside the module
+- `--dir .::.`: current working directory mounted as `.` inside the module (so
+  relative paths work)
 
 ## How it works
 
-The WASM module is a plain WASI command — same as any CLI tool, but sandboxed:
+The WASM module is a plain WASI command, the same as any CLI tool, but sandboxed
+(`crates/exav-core/src/bin/exav-wasm.rs`):
 
 1. **Startup**: reads CLI args via WASI
-2. **Load signatures**: walks the mounted signature directory recursively,
-   loading `.ndb`/`.ldb`/`.hdb`/`.cvd`/`.cld`/`.yar`/etc. files (including
-   CVD/CLD container extraction — handled inside the module)
-3. **Build database**: compiles the signature matcher (Aho-Corasick automaton)
-4. **Scan files**: for each file argument, reads it from the mounted filesystem,
-   runs the full scan (patterns, hashes, YARA, bytecode, structural analysis),
-   and writes a JSON `ScanReport` to stdout
+2. **Load signatures**: the first argument is a prebuilt `.exavdb`, or a
+   directory walked recursively for `.ndb`/`.ldb`/`.hdb`/`.cvd`/`.cld`/`.yar`/etc.
+   files (CVD/CLD extraction happens inside the module), then compiled into the
+   signature index. A database with no real signatures is refused (exit 2).
+3. **Scan files**: each further argument is a file (directories are not
+   walked), read whole from the mounted filesystem and scanned with
+   `ScanOptions::default()`: patterns, hashes, YARA, bytecode, structural
+   analysis. No CLI flags apply.
+4. **Report**: one JSON object per file on stdout; exit `1` if anything was
+   found, else `2` on an error, else `3` if a file was not fully scanned, else `0`.
 
-Progress and errors go to stderr. Results go to stdout — pipe to `jq`:
+Progress and errors go to stderr. Results go to stdout; pipe them to `jq`:
 
 ```sh
 wasmtime --dir ./sigs::/db --dir .::. exav-wasm.wasm /db *.exe 2>/dev/null | jq '.verdict'
@@ -55,14 +60,14 @@ wasmtime --dir ./sigs::/db --dir .::. exav-wasm.wasm /db *.exe 2>/dev/null | jq 
 
 ## Output format
 
-Each scanned file produces one JSON object on stdout:
+Each scanned file produces one JSON object on stdout, the `ScanReport` plus
+`file` (keys sorted), or `file` and `error` for a file that could not be read:
 
 ```json
-{"verdict":"Clean","findings":[{"label":"type","detail":"PE32+ executable"}]}
-
-{"verdict":{"Infected":{"signature":"Win.Trojan.Agent-1234","offset":4096,"method":"Pattern"}},"findings":[]}
-
-{"verdict":{"LimitsExceeded":{"reason":"scan-size limit"}},"findings":[]}
+{"file":"a.exe","findings":[{"detail":"PE","label":"type"}],"verdict":"Clean"}
+{"file":"b.exe","findings":[{"detail":"PE","label":"type"}],"verdict":{"Infected":{"method":"Pattern","offset":4096,"signature":"Win.Trojan.Agent-1234"}}}
+{"file":"big.iso","findings":[{"detail":"ISO","label":"type"}],"verdict":{"LimitsExceeded":{"reason":"..."}}}
+{"error":"No such file or directory (os error 44)","file":"gone.exe"}
 ```
 
 `Verdict` variants: `Clean`, `Infected`, `LimitsExceeded`, `Unscannable`,
@@ -82,12 +87,12 @@ your attack surface. A malicious `.ndb` file could:
 
 Running in native code, any of these compromise the host. In a WASM sandbox:
 
-- **Memory is bounded** — the module can't access memory outside its linear
+- **Memory is bounded**: the module can't access memory outside its linear
   memory instance
-- **No system calls** — WASI restricts file/network access to explicitly mounted
+- **No system calls**: WASI restricts file/network access to explicitly mounted
   paths
-- **Fuel limits** — wasmtime can cap instruction counts, killing runaway modules
-- **No `unsafe` escape** — even if the Rust code has bugs, WASM type-checking
+- **Fuel limits**: wasmtime can cap instruction counts, killing runaway modules
+- **No `unsafe` escape**: even if the Rust code has bugs, WASM type-checking
   prevents memory corruption from escaping the sandbox
 
 ### Why not a custom host?
@@ -96,14 +101,14 @@ An earlier design used a custom host binary (`exav-host`) that embedded the
 `wasmi` WASM interpreter and called exported functions via a raw pointer ABI.
 This had two problems:
 
-1. **Trust shifts to the host** — users now had to trust both the WASM module AND the
+1. **Trust shifts to the host**: users now had to trust both the WASM module AND the
    host binary. The host contained wasmi (less audited than wasmtime) plus
    custom pointer-manipulation code.
 
-2. **No auditability** — the custom ABI (alloc/dealloc/load_file/scan) was
+2. **No auditability**: the custom ABI (alloc/dealloc/load_file/scan) was
    opaque to users and hard to verify.
 
-The new design uses a standard WASI command. Users bring their own wasmtime —
+The new design uses a standard WASI command. Users bring their own wasmtime,
 a ByteCode Alliance project, audited, used in production by Fastly, Cloudflare,
 and others. The host code is wasmtime itself, not ours.
 
@@ -122,7 +127,7 @@ and others. The host code is wasmtime itself, not ours.
 
 ### Memory safety
 
-- The WASM module runs in a linear memory sandbox — no pointer escapes
+- The WASM module runs in a linear memory sandbox: no pointer escapes
 - `exav-unpack` (the extraction engine) has `#![forbid(unsafe_code)]`
 - `exav-core` scanning code is safe Rust
 - Residual `unsafe` is in audited compression/crypto dependencies, not
@@ -130,23 +135,24 @@ and others. The host code is wasmtime itself, not ours.
 
 ### Resource limits
 
-- **WASM linear memory**: bounded by the runtime (default 4 GiB max, typically
-  much less)
-- **Fuel/instructions**: wasmtime can limit total instructions per scan
-- **Filesystem**: only mounted directories are accessible — the module can't
+- **WASM linear memory**: up to 4 GiB for `wasm32` unless the runtime caps it
+  (wasmtime: `-W max-memory-size=<bytes>`)
+- **Fuel/instructions**: wasmtime can limit total instructions per run
+  (`-W fuel=<n>`)
+- **Filesystem**: only mounted directories are accessible; the module can't
   read `/etc/passwd` or write to disk
 - **Network**: no network access in WASI (unless explicitly enabled)
 
 ### Panic isolation
 
 If the WASM module panics (e.g., on corrupt input), wasmtime catches it as a
-trap — the host process is unaffected. This is the same isolation as the native
-`catch_unwind` boundary, but at the WASM level.
+trap, and the host process is unaffected. This is the same isolation as the
+native `catch_unwind` boundary, but at the WASM level.
 
 ## Building
 
 ```sh
-# Requires Rust 1.85+ and the wasm32-wasip1 target
+# Requires Rust 1.91+ and the wasm32-wasip1 target
 rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 ```
@@ -155,17 +161,25 @@ The output is `target/wasm32-wasip1/release/exav-wasm.wasm` (~5-6 MB).
 
 ## Limitations
 
-- **No daemon mode** — each `wasmtime run` invocation loads the DB from scratch.
+- **No daemon mode**: each `wasmtime run` invocation loads the DB from scratch.
   For high-throughput scanning, use a native `exav --listen` instead.
-- **No stdin streaming** — files must be on a mounted filesystem (WASI doesn't
+- **No stdin streaming**: files must be on a mounted filesystem (WASI doesn't
   support the pipe-from-stdin pattern that native `exav` uses for streaming).
-- **No HTTP(S) scanning** — the WASM module can't make network requests, so
-  `exav://` URL targets aren't available.
-- **~10-20% overhead** vs native — wasmtime JIT is fast, but the WASM
+- **No HTTP(S) scanning**: the WASM module can't make network requests, so
+  `http(s)://` targets aren't available.
+- **No flags**: every file is scanned with `ScanOptions::default()`: no
+  `--detect`, `--all-matches`, `--passwords` (only `.pwdb` passwords) or
+  `--partial-as`, no spill, and YARA's filename externals are undefined.
+  PUA signatures load only from a `.exavdb` built with `--detect pua`.
+- **Memory**: the database and each scanned file (read whole) share the 4 GiB
+  `wasm32` address space.
+- **~10-20% overhead** vs native: wasmtime JIT is fast, but the WASM
   sandboxing layer adds some cost.
-- **DB loading is slower** — the full ClamAV DB build wants ~6 GiB transient
-  RAM; in a WASM sandbox this is bounded by the runtime's memory limit. Use a
-  prebuilt database for large signature sets.
+- **DB loading is slower**: building the full ClamAV set from raw signatures
+  takes more memory than loading it, and in a WASM sandbox that is bounded by
+  the runtime's memory limit. Use a prebuilt database for large signature sets
+  (build and load costs are in the site's prebuilt-database guide,
+  <https://exav.org/guides/prebuilt-database/#what-it-costs>).
 
 ## Two WASM surfaces, and how a third gets added
 
@@ -177,18 +191,18 @@ bindings go:
 | target | `wasm32-wasip1` | `wasm32-unknown-unknown` |
 | artifact | a WASI **command** (`[[bin]]`) | a **`cdylib`** + JS glue |
 | runs in | wasmtime / wasmer / wazero | a browser, or Node |
-| talks over | argv, stdio, mounted dirs | `wasm-bindgen`, 848 lines of it |
-| in the workspace | yes | no — it needs its own `[profile.release]` and `wasm-pack` metadata |
+| talks over | argv, stdio, mounted dirs | `wasm-bindgen` |
+| in the workspace | yes | no: it needs its own `[profile.release]` and `wasm-pack` metadata |
 
 The WASI side needs no bindings at all: a `main()` and the standard library. The
 browser side is the one with a cost, and the cost is the binding layer, not the
-port — `exav-unpack`, `exav-core`, `exav-grep` and `exav-pe-emu` all already
+port: `exav-unpack`, `exav-core`, `exav-grep` and `exav-pe-emu` all already
 compile clean for `wasm32-unknown-unknown` with no changes.
 
 **Bindings live in one crate, not one crate per library.** Cargo's `crate-type`
 is a property of the `[lib]` target and cannot be turned on by a feature, so
 `#[wasm_bindgen]` cannot live inside `exav-unpack` itself and produce a `cdylib`
-only for WASM builds — every native build would link a `.so` too. That leaves two
+only for WASM builds: every native build would link a `.so` too. That leaves two
 shapes, and the second is the one to grow into:
 
 - *One `-wasm` sibling per library.* Each is a crate, a `package.json`, a
@@ -197,9 +211,9 @@ shapes, and the second is the one to grow into:
 - *One bindings crate, one surface per feature.* `unpack`, `scan`, `grep` and
   `pe-emu` become Cargo features of a single `cdylib`; the JS glue for byte
   marshalling, `ReadableStream` and error mapping is written once. Separate npm
-  packages still come out of it — the same source built N times with different
+  packages still come out of it (the same source built N times with different
   `--no-default-features --features …` and `--out-dir`, each rewritten to its own
-  package name — so a consumer who only wants the extractor still downloads only
+  package name), so a consumer who only wants the extractor still downloads only
   the extractor's bytes.
 
 Module size is the reason to keep the feature gates honest rather than ship one
@@ -211,7 +225,7 @@ after `wasm-opt`.
 
 - **Native `exav`**: best performance, full features, but requires trusting the
   scanner with host access.
-- **Docker container**: similar isolation to WASM but heavier — a full OS image
+- **Docker container**: similar isolation to WASM but heavier: a full OS image
   vs a single `.wasm` file.
 - **Browser (exav-unpack-wasm)**: the archive *extractor* (not the full scanner)
   runs in-browser via wasm-bindgen. Useful for client-side archive preview, but

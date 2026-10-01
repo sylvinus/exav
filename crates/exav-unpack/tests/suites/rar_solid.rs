@@ -179,3 +179,77 @@ fn a_member_that_decodes_to_the_wrong_bytes_is_not_passed_off_as_content() {
         "corrupting the stream must leave something reported unreadable"
     );
 }
+
+/// `sha256sum` of the inputs of the `rar_volumes` sets.
+const TEXT: &str = "306e49d40e25318b97ad7628011238f0ed6af09880396518cd5a8e1cbe7efe19";
+const NOISE: &str = "6987decf3255b53b0f8cf0da45aafacce4294578716058e11cd018a18e57035e";
+
+/// Sets written by official RAR, each with `noise.bin` split across all three
+/// of its volumes, joined and decoded. The inputs are made with:
+/// ```python
+/// r = random.Random(20261001)
+/// open("text.txt", "w").write("".join(f"line {i}: the quick brown fox {r.randrange(10**6)}\n" for i in range(400)))
+/// open("noise.bin", "wb").write(bytes(r.randrange(256) for _ in range(20000)))
+/// ```
+/// and the sets with RAR 7.23 (RAR5, which ends every volume with a
+/// quick-open record) and RAR 6.12 (RAR4, old-style names):
+/// ```sh
+/// rar a -ma5 -m3 -v8k -ep set5.rar text.txt noise.bin
+/// rar a -ma4 -m3 -vn -v8k -ep set4.rar text.txt noise.bin
+/// ```
+#[test]
+fn a_real_volume_set_joins_into_its_archive() {
+    for parts in [
+        ["set5.part1.rar", "set5.part2.rar", "set5.part3.rar"],
+        ["set4.rar", "set4.r00", "set4.r01"],
+    ] {
+        let vols: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|p| fixture(&format!("../rar_volumes/{p}")))
+            .collect();
+        let refs: Vec<&[u8]> = vols.iter().map(Vec::as_slice).collect();
+        let joined =
+            exav_unpack::join_rar_volumes(&refs).unwrap_or_else(|e| panic!("{}: {e}", parts[0]));
+        // Each RAR5 volume's quick-open record (a service header named `QO`,
+        // its name length before it) indexes that volume alone, and is left
+        // out of the join.
+        let qo = |b: &[u8]| b.windows(3).filter(|w| w == b"\x02QO").count();
+        if parts[0].starts_with("set5") {
+            assert!(vols.iter().all(|v| qo(v) == 1));
+            assert_eq!(qo(&joined), 0);
+        }
+        let mut got: Vec<(String, String)> = members(&joined)
+            .iter()
+            .map(|x| {
+                assert!(
+                    x.unsupported.is_none(),
+                    "{}: {} {:?}",
+                    parts[0],
+                    x.name,
+                    x.unsupported
+                );
+                (x.name.clone(), sha256_hex(&x.data))
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("noise.bin".to_string(), NOISE.to_string()),
+                ("text.txt".to_string(), TEXT.to_string())
+            ],
+            "{}",
+            parts[0]
+        );
+        // Each volume alone reports the split member, never passes it over.
+        for v in &vols {
+            assert!(
+                members(v)
+                    .iter()
+                    .any(|x| x.name == "noise.bin" && x.unsupported.is_some()),
+                "{}: a lone volume",
+                parts[0]
+            );
+        }
+    }
+}

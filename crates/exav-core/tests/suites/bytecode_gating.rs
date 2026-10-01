@@ -150,6 +150,51 @@ fn trigger_gated_detection_in_a_scan() {
     }
 }
 
+/// A program gated on `EXAVTESTMARKER` that `malloc`s 32 bytes and `write`s
+/// them, then names what `write` returned: `BC.Test.Write.AllOk` for 32,
+/// `BC.Test.Write.Fail1` for anything else (`BC.Test.Write.MallocNull` if
+/// `malloc` fails). Assembled with the format's encoders.
+const WRITE_32: &str = "\
+ClamBCaghfdeiodke|aa```c``abhc``|ancflfafmfbfcfmb`cnbicicnbbc``ajaap`clamcoincidencejb:4096
+BC.Test.Write;Engine:56-255,Target:0;0;45584156544553544d41524b4552
+Tedaacb`bbadb`baabbadb`bdbiaahdbdaahdbdaah
+Ebbaacaebed|amcgefdgfgifbgegcgnfafmfef``bbabfd|agmfaflflfofcf``acbed|afggbgifdgef``
+Gagag`@`bgdBbdBcdBnbBdeBefBcgBdgBnbBgeBbgBifBdgBefBnbBmdBafBlfBlfBofBcfBndBegBlfBlf@`bad@Aa`bhdBbdBcdBnbBdeBefBcgBdgBnbBgeBbgBifBdgBefBnbBadBlfBlfBodBkf@`bad@Ac`bidBbdBcdBnbBdeBefBcgBdgBnbBgeBbgBifBdgBefBnbBfdBafBifBlfBac@`bad@Ae`
+A`b`bLagbad`aa`b`b`b`b`aa`b`b`b`b`Falae
+Bbad`ababbaB`bdaaaaeabad`@`Taaaaaaab
+Bb`bababbaeAb`BhadTcab`b@d
+Bb`bacabbac`B`bdaaadfab`bacB`bdTaaadadac
+Bb`baeabbaeAd`BcadTcab`b@d
+Bb`bafabbaeAf`BcadTcab`b@dE
+";
+
+/// A scan's limits reach the programs it runs: a `write` past the largest
+/// buffer the scan may hold, or past the bytes it has left to scan, fails,
+/// and the program goes on to see it.
+#[test]
+fn a_write_past_the_scan_limits_fails() {
+    let mut loader = exav_core::loader::Builder::new();
+    loader.add_named_bytes("w.cbc", WRITE_32.as_bytes(), true);
+    let db = loader.build().unwrap();
+    let input = b"..EXAVTESTMARKER..";
+    let found = |opts: &ScanOptions| match analyze(&db, input, opts).verdict {
+        Verdict::Infected { signature, .. } => Some(signature),
+        v => panic!("{v:?}"),
+    };
+    let ok = Some("BC.Test.Write.AllOk".to_string());
+    let failed = Some("BC.Test.Write.Fail1".to_string());
+    assert_eq!(found(&ScanOptions::default()), ok);
+    let mut opts = ScanOptions::default();
+    opts.limits.max_buffer_bytes = 31;
+    assert_eq!(found(&opts), failed);
+    // What is extracted counts against it, not the input.
+    let mut opts = ScanOptions::default();
+    opts.limits.max_scanned_bytes = 31;
+    assert_eq!(found(&opts), failed);
+    opts.limits.max_scanned_bytes = 32;
+    assert_eq!(found(&opts), ok);
+}
+
 #[test]
 fn forced_mode_runs_regardless_of_trigger() {
     let cbc = synth_cbc("Synth.BC.Detect", b"MALWARE");

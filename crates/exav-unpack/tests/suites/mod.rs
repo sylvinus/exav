@@ -142,6 +142,8 @@ pub(crate) fn extract_each<R>(
             comp_size: meta.comp_size,
             encrypted: meta.encrypted,
             unsupported: meta.unsupported,
+            mtime: meta.mtime,
+            mode: meta.mode,
         };
         visit(entry, budget)
     })

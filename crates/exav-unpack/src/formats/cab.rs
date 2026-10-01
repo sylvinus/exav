@@ -54,8 +54,8 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
                     name: f.name().to_string(),
                     comp_size: f.uncompressed_size as u64,
                     size: Some(f.uncompressed_size as u64),
-                    encrypted: false,
                     unsupported: Some("CAB folder could not be read up to this member"),
+                    ..MemberMeta::default()
                 };
                 if let Some(t) = visit(&m, None, budget) {
                     return Ok(Some(t));
@@ -91,12 +91,12 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
                     name: f.name().to_string(),
                     comp_size: f.uncompressed_size as u64,
                     size: Some(f.uncompressed_size as u64),
-                    encrypted: false,
                     unsupported: Some(if failed {
                         "CAB folder could not be read up to this member"
                     } else {
                         "CAB folder ended before this member's offset"
                     }),
+                    ..MemberMeta::default()
                 };
                 if let Some(t) = visit(&m, None, budget) {
                     return Ok(Some(t));
@@ -108,8 +108,7 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
                 name: f.name().to_string(),
                 comp_size: f.uncompressed_size as u64,
                 size: Some(f.uncompressed_size as u64),
-                encrypted: false,
-                unsupported: None,
+                ..MemberMeta::default()
             };
             let r = {
                 let mut window = (&mut reader).take(f.uncompressed_size as u64);

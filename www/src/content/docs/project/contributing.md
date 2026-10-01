@@ -7,10 +7,13 @@ Issues and PRs are welcome. Good first areas: formats from the
 [gap list](/reference/formats/#the-complete-gap-list), bytecode host APIs (see the
 [comparison](/project/comparison-with-clamav/#bytecode-host-apis)), and fuzz
 targets. For a vulnerability, do not open a public issue: see
-[Security](/project/security/#reporting-a-vulnerability).
+[Security](/project/security/#reporting-a-vulnerability). Contributors follow the
+[code of conduct](https://github.com/sylvinus/exav/blob/main/CODE_OF_CONDUCT.md).
 
-To start: clone the repository, `make test` to run everything CI runs, and
-`scripts/difftest.sh` when you touch detection (it needs Docker and a corpus).
+To start, install Rust 1.91 or newer and a C compiler (the `http` build links
+`ring`), clone the repository and run `make test-native`. The rest of
+`make test` also needs `wasmtime`, Node.js and `wasm-pack`
+([below](#before-submitting)).
 
 ## The clean-room rule
 
@@ -29,6 +32,9 @@ and is a license violation.
   licensed (MIT/BSD/Apache/public-domain) code with attribution in `NOTICE`.
 - Interoperating with ClamAV's data formats (signature databases, `CL_TYPE_*`
   ids) is fine: that is interoperability, not derivation.
+- ClamAV's public documentation, and black-box testing of the `clamscan` and
+  `clamd` binaries (crafted inputs, single-signature databases, `--debug`
+  output), are fine sources of behaviour.
 
 The rule is GPL-specific. It does not apply to permissively licensed sources such
 as BSD-3-Clause YARA-X, which exav reuses with attribution.
@@ -84,39 +90,55 @@ CLI flags the site documents against the binary.
 
 ## Before submitting
 
-Run the same checks CI does:
-
 ```sh
-make test    # everything CI runs, except differential testing and fuzzing
-make lint    # clippy --all-targets -D warnings + cargo fmt --check
+make test    # every test exav owns
+make lint    # CI's clippy passes (-D warnings) and cargo fmt --check
 ```
 
 `make test` covers the whole tree; each part also runs alone:
 
 | target | what it covers | needs |
 | --- | --- | --- |
-| `make test-native` | the workspace under every feature pass: default, `http`, `exav-unpack` with `checksums`, `--no-default-features`, `unstable-internals`, `testing-faults` | nothing extra |
+| `make test-native` | the workspace under every feature pass: default, `http`, `exav-unpack` with `checksums`, `--no-default-features`, `unstable-internals`, `testing-faults` | a C compiler |
 | `make test-wasm` | the extractor and core unit tests on 32-bit `wasm32-wasip1` | `wasmtime` |
-| `make test-js` | the WASM bindings' vitest units and Playwright browser tests | node, wasm-pack |
-| `make test-www` | `astro check` and a full docs build (broken links, bad frontmatter) | node |
+| `make test-js` | the WASM bindings' vitest units and Playwright browser tests | Node.js, `wasm-pack`, python3; downloads Chromium |
+| `make test-www` | `astro check`, a docs build (frontmatter, sidebar entries, rendering) and a check that every internal link and anchor resolves | Node.js |
 
 Not in `make test`:
 
 | target | what it does | needs |
 | --- | --- | --- |
-| `scripts/difftest.sh` | exav against clamd over a corpus, a compliance diff | docker and a corpus |
-| `make test-yara-diff` | exav's YARA engine against `yara-x` on identical rules and inputs | `yara-x-cli` |
+| `scripts/difftest.sh` | exav against clamd over a corpus, a compliance diff (see [differential testing](/concepts/differential-testing/)) | Docker, a corpus and a signature database (`make db`) |
+| `make test-yara-diff` | exav's YARA engine against `yara-x` on identical rules and inputs; without `yr` the tests skip and pass | `yara-x-cli` |
 | `make miri` | selected library tests under Miri, which checks the `unsafe` in dependencies along real code paths; slow | a nightly toolchain with the `miri` component |
 
-The differential harnesses are not merge gates: they measure exav against another
-engine, so they can go red because the other engine changed. Run them when you
-touch the matching subsystem.
+`scripts/difftest.sh` is not a merge gate: it measures exav against clamd, so it
+can go red because clamd or the database changed. Run it when you touch
+detection. `make test-yara-diff` runs in CI on every pull request, and a failure
+fails the run.
 
 `cargo test` is fine for the inner loop, but it is a subset: a test file that
 opens with `#![cfg(feature = "x")]` compiles to zero tests without `x`, and the run
 reports green having checked nothing. Run `make test` before you push.
 
-CI also runs `cargo audit`, `cargo deny check` and a `cargo-fuzz` smoke pass.
+CI runs, on every pull request and push to `main`: the `make lint` checks,
+`make test-native`, the MSRV check (`make msrv`), `make test-yara-diff`, the WASM
+builds with `make test-wasm` and `make test-js`, `make test-www`, `cargo audit`,
+`cargo deny check`, and a `cargo-fuzz` smoke run of every target.
+
+Add a line to the `[Unreleased]` section of `CHANGELOG.md` for any change a user
+or integrator would notice.
+
+## Fuzzing
+
+Targets live in `fuzz/` and need a nightly toolchain and `cargo-fuzz`:
+
+```sh
+cargo +nightly fuzz run <target>
+```
+
+`make fuzz` only builds them. See `docs/FUZZING.md` in the repository for the
+targets and what each covers.
 
 ## 32-bit / WASM tests
 
@@ -135,3 +157,9 @@ CI runs this on every pull request and push to `main`.
 
 Tests use the harmless EICAR string and synthetic inputs only. Never commit real
 malware to this repository.
+
+A fixture that other scanners would detect (EICAR included) is committed
+XOR-masked under a `.xor` suffix, so cloning the repository does not trip
+antivirus; `crates/exav-unpack/tests/fixtures/README.md` explains how to mask one.
+When fixtures change, `make av-audit` scans the tracked tree with `clamscan` to
+catch one that slipped through.

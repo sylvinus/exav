@@ -1,483 +1,471 @@
-exav — THIRD-PARTY NOTICES
-==========================
+exav-unpack-wasm: third-party notices
+=====================================
 
-exav itself is licensed under the MIT License (see the LICENSE file).
-
-The exav binary statically links a number of third-party Rust crates. Those
-crates retain their own licenses; the binary distribution must carry their
-notices. This file enumerates the major components and reproduces the notice
-texts that the BSD-3-Clause and Apache-2.0-WITH-LLVM-exception licenses require.
-
-This is a hand-maintained summary of the principal components, not a byte-exact
-dump of every transitive crate's license. To regenerate a complete, per-crate
-attribution list from the resolved dependency graph, install one of:
-
-    cargo install cargo-about        # then: cargo about generate about.hbs
-    cargo install cargo-bundle-licenses
-
-and run it against this workspace. `cargo deny check licenses` (run in CI)
-confirms every dependency resolves to a permissive license on the allowlist in
-deny.toml.
-
-Versions below reflect Cargo.lock at the time of writing (last verified
-2026-09-09).
+exav-unpack-wasm and the @exav/unpack-wasm npm package are licensed under the
+MIT License (see LICENSE). The package's WebAssembly module is a build of
+exav-unpack, its "standard" preset, so it contains the third-party code in
+exav-unpack's source and the crates it links. This file gives their notices.
+The MIT License and the Apache License 2.0 texts the entries refer to are at
+the end of this file; they apply to those components only.
 
 
--------------------------------------------------------------------------------
-1. yara-x — BSD-3-Clause (source derivative, and a development dependency)
--------------------------------------------------------------------------------
+Part 1: code in exav-unpack's source
+====================================
 
-exav's YARA engine is native, in `crates/exav-core/src/yara/`. Parts of it are
-derived from yara-x's source: the module implementations (`pe`, `elf`, `dotnet`,
-`math`, `hash`, `string`) and the compiler's base64 handling, including field
-semantics and the RVA-to-offset and import-hash routines. Each such file carries
-a per-file attribution header, and the license text is reproduced below and in
-`crates/exav-core/LICENSE-YARA-X`.
+libarchive RAR5 reader, BSD-2-Clause (source derivative)
+--------------------------------------------------------
 
-`yara-x-parser` is a regular OPTIONAL DEPENDENCY, enabled by the default-on
-`yara` feature of `crates/exav-core`, so a default build does link it. No other
-yara-x crate is a dependency of any kind.
-
-The differential test that compares exav's engine against yara-x
-(`crates/exav-core/tests/yara_difftest.rs`) invokes yara-x as a PROGRAM — the
-`yr` binary from `PATH` — rather than linking it, and skips when that binary is
-absent.
-
-Components: yara-x-parser 1.18.
-Upstream: https://github.com/VirusTotal/yara-x
-Copyright (c) VirusTotal and contributors.
-
-  Redistribution and use in source and binary forms, with or without
-  modification, are permitted provided that the following conditions are met:
-
-  1. Redistributions of source code must retain the above copyright notice,
-     this list of conditions and the following disclaimer.
-
-  2. Redistributions in binary form must reproduce the above copyright notice,
-     this list of conditions and the following disclaimer in the documentation
-     and/or other materials provided with the distribution.
-
-  3. Neither the name of the copyright holder nor the names of its contributors
-     may be used to endorse or promote products derived from this software
-     without specific prior written permission.
-
-  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-Other BSD-3-Clause components linked by exav (same 3-clause terms above, with
-their respective copyright holders): subtle, tlsh2.
-
-
--------------------------------------------------------------------------------
-1b. libarchive RAR5 reader — BSD-2-Clause (source derivative)
--------------------------------------------------------------------------------
-
-The RAR5 (unpack50) decompressor in
-crates/exav-unpack/src/formats/rar5_unpack.rs is a Rust port of the
-decompression core of libarchive's archive_read_support_format_rar5.c. As a
-source derivative, BSD-2-Clause requires retaining the upstream copyright and
-licence text reproduced below.
+exav-unpack's RAR5 decompressor is a Rust port of the decompression core of
+libarchive's archive_read_support_format_rar5.c, and the RAR framing of its
+PPMd decoder follows libarchive's archive_read_support_format_rar.c and
+archive_ppmd7.c, under the same terms.
 
 Upstream: https://github.com/libarchive/libarchive
+
 Copyright (c) 2018 Grzegorz Antoniak (http://antoniak.org)
 All rights reserved.
 
-  Redistribution and use in source and binary forms, with or without
-  modification, are permitted provided that the following conditions
-  are met:
-  1. Redistributions of source code must retain the above copyright
-     notice, this list of conditions and the following disclaimer.
-  2. Redistributions in binary form must reproduce the above copyright
-     notice, this list of conditions and the following disclaimer in the
-     documentation and/or other materials provided with the distribution.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
 
-  THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
-  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
-  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
-  IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
-  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
-  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
-  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
--------------------------------------------------------------------------------
-1c. nwaples/rardecode RAR3 reader — BSD-2-Clause (source derivative)
--------------------------------------------------------------------------------
+nwaples/rardecode RAR3 reader, BSD-2-Clause (source derivative)
+---------------------------------------------------------------
 
-The RAR3/RAR4 (unpack29) decompressor in
-crates/exav-unpack/src/formats/rar3_unpack.rs is a Rust port of the
-decompression core of the Go package nwaples/rardecode. As a source
-derivative, BSD-2-Clause requires retaining the upstream copyright and licence
-text reproduced below.
+exav-unpack's RAR3 decompressor is a Rust port of the decompression core of
+the Go package nwaples/rardecode.
 
 Upstream: https://github.com/nwaples/rardecode
+
 Copyright (c) 2015, Nicholas Waples
 All rights reserved.
 
-  Redistribution and use in source and binary forms, with or without
-  modification, are permitted provided that the following conditions
-  are met:
-  1. Redistributions of source code must retain the above copyright
-     notice, this list of conditions and the following disclaimer.
-  2. Redistributions in binary form must reproduce the above copyright
-     notice, this list of conditions and the following disclaimer in the
-     documentation and/or other materials provided with the distribution.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
 
-  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-  POSSIBILITY OF SUCH DAMAGE.
-
-
--------------------------------------------------------------------------------
-1d. ppmd-rust PPMd7 (var.H) model — CC0-1.0 OR MIT-0 (source derivative)
--------------------------------------------------------------------------------
-
-The PPMd variant H decoder in crates/exav-unpack/src/formats/ppmd7/ is vendored
-and adapted from the `ppmd-rust` crate (version 1.4.0), generalised over a range
-decoder trait so it can be driven by either the 7-Zip or the RAR range coder.
-`ppmd-rust` is dual-licensed CC0-1.0 OR MIT-0 (public-domain-equivalent) and is
-itself a Rust port of Igor Pavlov's 7-Zip PPMd7, which implements
-Dmitry Shkarin's public-domain PPMd var.H (2001). It does NOT derive from
-UnRAR/RARLAB.
-
-Upstream: https://crates.io/crates/ppmd-rust
-License: CC0-1.0 OR MIT-0 (https://spdx.org/licenses/CC0-1.0,
-         https://spdx.org/licenses/MIT-0). Both place the work in (or treat it
-         as) the public domain; no attribution is legally required, and this
-         entry is recorded for completeness.
-
-The RAR-specific framing wired into crates/exav-unpack/src/formats/rar3_unpack.rs
-(the PPMd block header: order/sub-allocator-memory/escape bits; the RAR
-Subbotin carry-less range decoder in ppmd7/rangedec.rs; and the escape-symbol
-handling for the PPMd↔LZSS conversion) is reproduced from the public format
-description in libarchive's BSD-2-Clause archive_read_support_format_rar.c /
-archive_ppmd7.c (already attributed in section 1b above), NOT from UnRAR.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
 
 
--------------------------------------------------------------------------------
-1e. dmg-core UDIF reader — Apache-2.0 (source derivative)
--------------------------------------------------------------------------------
+dmg-core UDIF reader, Apache-2.0 (source derivative)
+----------------------------------------------------
 
-The UDIF/DMG block reader in crates/exav-unpack/src/formats/udif.rs is vendored
-and adapted from the `dmg-core` crate (version 0.1.2), changed to use
-`lzma-rust2` instead of `lzma-rs` for XZ decompression. `dmg-core` is licensed
-Apache-2.0; the Apache License requires retaining the attribution notices and
-reproducing any upstream NOTICE text.
+exav-unpack's UDIF (DMG) reader is vendored from dmg-core 0.1.2 and changed to
+decode XZ with lzma-rust2 instead of lzma-rs. Licensed under the Apache
+License, Version 2.0 (text below). Upstream ships no NOTICE file.
 
 Upstream: https://crates.io/crates/dmg-core
 Copyright (c) Albert Hui / SecurityRonin.
-Licensed under the Apache License, Version 2.0. You may obtain a copy at
-http://www.apache.org/licenses/LICENSE-2.0 (see also the Apache-2.0 terms
-referenced in section 2 below). Upstream ships no separate NOTICE file.
 
 
--------------------------------------------------------------------------------
-1f. rust-cab CAB reader — MIT (source derivative)
--------------------------------------------------------------------------------
+MIT-licensed sources
+--------------------
 
-The CAB (Microsoft Cabinet) reader in crates/exav-unpack/src/formats/cab_parse/
-is vendored and adapted from the `rust-cab` crate — write support, the datetime
-module, unused public types, and tests removed; bounds checks added for
-folder data-block and short-read cases. Licensed MIT; the MIT License requires
-retaining the copyright and permission notice (reproduced in the exav LICENSE
-file) in distributions.
+Each under the MIT License (MIT OR Apache-2.0 ones used under MIT):
 
-Upstream: https://github.com/mdsteele/rust-cab
-Copyright (c) Matthew D. Steele <mdsteele@alum.mit.edu>.
-
-
--------------------------------------------------------------------------------
-1g. unarc-rs ARJ reader — MIT OR Apache-2.0 (source derivative)
--------------------------------------------------------------------------------
-
-The ARJ reader in crates/exav-unpack/src/formats/arj_parse/ is vendored and
-adapted from the `unarc-rs` crate — multi-volume support, volume providers, and
-external error types removed; wired to `delharc` for LH6 decompression.
-Dual-licensed MIT OR Apache-2.0; the MIT or Apache terms apply at the
-distributor's choice (both reproduced/referenced elsewhere in this file).
-
-The ZOO structures in crates/exav-unpack/src/formats/zoo_parse.rs are vendored
-and adapted from the same crate, for the same reason the ARJ reader was: linking
-it brings in a second `zip` with default features, and Cargo's feature
-unification then enables the `zip` crate's own LZMA/bzip2/deflate64 decoders
-inside exav, bypassing exav's per-member budget. Adapted to exav's error
-handling, with the variable-length part of a directory entry (long filename,
-directory name) actually read.
-
-The ZOO test archives in crates/exav-unpack/tests/fixtures/zoo/ (`store.zoo`,
-`default.zoo`, `high_per.zoo`) are that project's own test corpus, redistributed
-under the same terms. They hold one identical member under the three
-compression methods, which is what lets the codecs be checked against stored
-bytes rather than against themselves.
-
-Upstream: https://github.com/mkrueger/unarc-rs
-Copyright (c) Mike Krüger.
+- rust-cab (CAB reader, vendored): Copyright (c) Matthew D. Steele
+  <mdsteele@alum.mit.edu>. https://github.com/mdsteele/rust-cab
+- unarc-rs (ARJ and ZOO readers, vendored): Copyright (c) Mike Krüger.
+  https://github.com/mkrueger/unarc-rs
+- bzip2-rs (bzip2 decoder, vendored): Copyright (c) 2021 Paolo Barbolini.
+  https://github.com/paolobarbolini/bzip2-rs
+- EggDotNet (AZO decoder, ported): Copyright (c) Andrew Kolman.
+  https://github.com/akolman/EggDotNet
+- AutoIt-Ripper (compiled AutoIt3 layout and tables): Copyright (c) nazywam
+  and contributors. https://github.com/nazywam/AutoIt-Ripper
 
 
--------------------------------------------------------------------------------
-1h1. unshield / explode — MIT (linked dependency + test fixtures)
--------------------------------------------------------------------------------
+NSIS format headers, zlib
+-------------------------
 
-crates/exav-unpack/src/formats/ishield_z.rs reads InstallShield `.z` archives
-through the `unshield` crate, whose only real dependency is `explode` — a leaf
-decoder for the PKWARE Data Compression Library "implode" codec those archives
-use. Both MIT.
-
-The fixtures in crates/exav-unpack/tests/fixtures/ishieldz/ are that project's
-own examples, redistributed under the same terms. `undhr.z` is shipped alongside
-`undhr.md`, the uncompressed original, which is what lets the decoder be checked
-against the real file rather than against itself.
-
-This is a DIFFERENT format from the InstallShield `ISc(` InstallScript cabinet,
-whose only implementation is the LGPL `unshield` C project — never read, and the
-reason that format stays recognised-but-unopened.
-
-Upstream: https://github.com/agrif/unshield , https://github.com/agrif/explode
-Copyright (c) Aaron Griffith.
-
-
--------------------------------------------------------------------------------
-1h2. iced-x86 — MIT (generated opcode tables)
--------------------------------------------------------------------------------
-
-crates/exav-x86/src/generated.rs holds the SIMD, system and VEX regions of the
-x86 opcode maps. It is not hand-written and not transcribed from a manual: it is
-emitted by crates/exav-x86/tools/gen-tables, which decodes a probe for every
-(prefix, opcode, /digit, mod) combination with `iced-x86` and records what came
-back. The tables are therefore derived from `iced-x86`'s data, and the MIT
-License requires retaining its copyright and permission notice (the MIT text is
-in the exav LICENSE file).
-
-`iced-x86` is also the oracle that exav-x86's differential tests and the
-`x86_decode` fuzz target compare against — including the decoding that
-exav-pe-emu drives. It is a dev-dependency only: the decoder exav-pe-emu uses at
-run time is exav-x86, and no iced code reaches a shipped artifact.
-
-Upstream: https://github.com/icedland/iced
-Copyright (C) 2018-present iced project and contributors.
-
-
--------------------------------------------------------------------------------
-1h. oletools test sample — BSD-2-Clause (test fixture)
--------------------------------------------------------------------------------
-
-The Excel 4.0 macro test fixture
-crates/exav-unpack/tests/fixtures/xlm_excel4_sample.xls is a benign sample
-redistributed from the `oletools` project's test corpus, used to verify the XLM
-macro-sheet surfacing in formats/xlm.rs. Licensed BSD-2-Clause.
-
-Upstream: https://github.com/decalage2/oletools
-Copyright (c) Philippe Lagadec.
-
-
--------------------------------------------------------------------------------
-1i. aPLib reference (depack) — public domain (freeware)
--------------------------------------------------------------------------------
-
-The aPLib depacker in crates/exav-unpack/src/formats/aplib.rs is a clean-room
-implementation of the published aPLib on-disk format. The bit/gamma reader
-follows the algorithm published in the freely-distributable aPLib package's
-reference `depack.c` by Jørgen Ibsen, which the author released for unrestricted
-use ("free to use"). No attribution is legally required; this entry is recorded
-for completeness. It does not derive from any GPL source.
-
-Upstream: https://ibsensoftware.com/products_aPLib.html
-
-
--------------------------------------------------------------------------------
-1j. Microsoft Script Encoder decode tables — public domain
--------------------------------------------------------------------------------
-
-The substitution/decode tables in crates/exav-unpack/src/formats/screnc.rs are
-the published Microsoft Script Encoder (`#@~^`) constants, as documented in
-Didier Stevens' public-domain `decode-vbe.py`. Recorded here for completeness;
-no attribution is legally required and it does not derive from any GPL source.
-
-Upstream: https://blog.didierstevens.com/programs/
-
-
--------------------------------------------------------------------------------
-1k. AutoIt-Ripper — MIT (reference implementation)
--------------------------------------------------------------------------------
-
-crates/exav-unpack/src/formats/autoit.rs implements the compiled-AutoIt3 script
-layout — the EA05 record structure, the Mersenne-Twister keystream and its seeds
-— from the MIT-licensed AutoIt-Ripper reference together with the public format
-description.
-
-Upstream: https://github.com/nazywam/AutoIt-Ripper
-Copyright (c) nazywam and contributors.
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in all
-  copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
-
-
--------------------------------------------------------------------------------
-1l. NSIS format headers — zlib
--------------------------------------------------------------------------------
-
-crates/exav-unpack/src/formats/nsis.rs implements the installer layout — the
-firstheader and block-table structures — from NSIS's own zlib-licensed format
-header `Source/exehead/fileform.h`, together with public reverse-engineering.
+exav-unpack's NSIS reader implements the installer layout from NSIS's format
+header Source/exehead/fileform.h.
 
 Upstream: https://github.com/kichik/nsis
-Copyright (c) Nullsoft and contributors.
+Copyright (c) Nullsoft and contributors
 
-  This software is provided 'as-is', without any express or implied warranty.
-  In no event will the authors be held liable for any damages arising from the
-  use of this software.
+This software is provided 'as-is', without any express or implied warranty.
+In no event will the authors be held liable for any damages arising from the
+use of this software.
 
-  Permission is granted to anyone to use this software for any purpose,
-  including commercial applications, and to alter it and redistribute it freely,
-  subject to the following restrictions:
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it freely,
+subject to the following restrictions:
 
-  1. The origin of this software must not be misrepresented; you must not claim
-     that you wrote the original software. If you use this software in a
-     product, an acknowledgment in the product documentation would be
-     appreciated but is not required.
+1. The origin of this software must not be misrepresented; you must not claim
+   that you wrote the original software. If you use this software in a
+   product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
 
-  2. Altered source versions must be plainly marked as such, and must not be
-     misrepresented as being the original software.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
 
-  3. This notice may not be removed or altered from any source distribution.
-
-
--------------------------------------------------------------------------------
-1m. sevenz-rust2 — Apache-2.0 (design reference)
--------------------------------------------------------------------------------
-
-crates/exav-unpack/src/formats/sevenz/ takes its reader structure from
-sevenz-rust2, re-implemented natively so the crate can keep
-`#![forbid(unsafe_code)]` and use exav's own PPMd7 model.
-
-Upstream: https://github.com/hasenbanck/sevenz-rust2
-Copyright (c) the sevenz-rust2 authors.
-
-Licensed under the Apache License, Version 2.0. A copy is available at
-http://www.apache.org/licenses/LICENSE-2.0. The license requires retaining the
-copyright, patent, trademark and attribution notices from the source, and
-reproducing any NOTICE text the upstream distributes.
+3. This notice may not be removed or altered from any source distribution.
 
 
--------------------------------------------------------------------------------
-2. ISC-licensed components
--------------------------------------------------------------------------------
+Apache-2.0 references
+---------------------
 
-ring 0.17.14 (Apache-2.0 AND ISC), rustls 0.23.41, rustls-webpki, untrusted.
-These carry ISC permission-notice terms; reproduce the copyright notice and the
-permission/disclaimer notice in distributions.
-
-
--------------------------------------------------------------------------------
-3. MIT / Apache-2.0 dual-licensed components (the bulk of the graph)
--------------------------------------------------------------------------------
-
-The majority of exav's dependencies are dual-licensed "MIT OR Apache-2.0" (or a
-superset including Unlicense / 0BSD / Zlib), so the MIT or Apache terms apply at
-the distributor's choice. Notable examples:
-
-  aho-corasick, memchr, daachorse        pattern matching / Aho-Corasick
-  serde, rmp-serde                       serialization
-  clap                                   CLI parsing
-  sha1, sha2, md-5, digest (RustCrypto)  hashing
-  flate2, miniz_oxide, bzip2, zip        decompression (sevenz-rust2 is dev-only:
-                                        it builds 7z test fixtures; the shipped
-                                        7z reader is native, §1m)
-  lzfse_rust, delharc, lzxd,             DMG/LHA/CAB codecs
-    bitstream-io, stringprep
-  cfb                                    OLE/CFB compound-file reader
-  fatfs, ext4-view                       FAT and ext2/3/4 filesystem readers
-  walkdir                                directory traversal
-  regex                                  path-filter regexes, and the search
-                                           engine behind exav-grep
-  libc                                   syscall bindings (daemon)
-  ureq, rustls, webpki-roots             HTTPS for the signature updater
-  wasm-bindgen, js-sys, web-sys,         WebAssembly/JS bindings — these reach
-    wasm-bindgen-futures                   the published npm artifact
-
-MIT-only components (the MIT copyright and permission notice must be retained;
-the MIT text is in the exav LICENSE file): cfb, hfsplus, apfs (the two latter
-via DMG/HFS+/APFS support).
-
-RustCrypto crates are MIT OR Apache-2.0. Zlib-licensed components present:
-miniz_oxide, tinyvec. Unicode-3.0: the ICU / unicode-ident
-crates. Other permissive licenses in the graph: CC0-1.0 and MIT-0 (ppmd-rust via
-sevenz-rust2), CDLA-Permissive-2.0 (webpki-roots, TLS root store), bzip2-1.0.6
-(libbz2-rs-sys).
-
-Format documentation consulted
------------------------------
-
-Some decoders were written from format descriptions rather than from any code.
-Recorded here because a decoder's provenance is part of what makes it auditable:
-
-  EGG        ESTsoft Corp., "EGG Format Specification, Version 1.0" — the
-             vendor's own published document. No ESTsoft code was used.
-
-  AZO        ESTsoft's own compression algorithm, absent from the EGG spec.
-             `crates/exav-unpack/src/formats/azo.rs` and `azo_tables.rs` are a
-             Rust port of the AZO decoder in `EggDotNet`
-             (https://github.com/akolman/EggDotNet), MIT, Copyright (c) Andrew
-             Kolman. ESTsoft's own UnEgg library was NOT used: its licence
-             forbids commercial use without approval and forbids using it to
-             develop a compression algorithm.
-
-  HWP3       Preamble offsets taken from `java-hwp`
-             (https://github.com/ddoleye/java-hwp), Apache-2.0.
-             Copyright the java-hwp authors. Validated against
-             `testHWP_3.0.hwp` from the Apache Tika test corpus
-             (https://github.com/apache/tika), Apache-2.0, Copyright the
-             Apache Software Foundation — vendored as
-             `crates/exav-unpack/tests/fixtures/hwp3/tika_testHWP_3.0.hwp`.
-
-  ALZ        Structure cross-checked against `unalz` (zlib license) and
-             `unar`, used as external oracles rather than as sources.
-
-Full MIT and Apache-2.0 license texts are widely available and are reproduced in
-each crate's source distribution; the exav LICENSE file contains the MIT text.
+- java-hwp (HWP 3.0 preamble offsets): Copyright the java-hwp authors.
+  https://github.com/ddoleye/java-hwp
+- sevenz-rust2 (7z reader structure, written anew): Copyright the sevenz-rust2
+  authors. https://github.com/hasenbanck/sevenz-rust2
 
 
--------------------------------------------------------------------------------
-Build-only tooling
--------------------------------------------------------------------------------
+Public-domain sources, recorded for completeness
+------------------------------------------------
 
-Everything above concerns code that reaches a shipped artifact. The
-documentation site under `www/` builds with an npm toolchain whose lockfile
-includes packages under stronger terms, LGPL-3.0-or-later among them. None of it
-is linked into, bundled with, or distributed alongside any exav binary, crate or
-WASM module: it runs at build time to produce static HTML and is listed here so
-that a licence scan of the repository has an answer rather than a finding.
+- ppmd-rust 1.4.0 (PPMd7 model, vendored), CC0-1.0 OR MIT-0.
+- aPLib's reference depack.c by Jørgen Ibsen (bit and gamma readers), released
+  free to use.
+- Didier Stevens' decode-vbe.py (Microsoft Script Encoder tables), public
+  domain.
+
+
+Part 2: crates linked into the module
+=====================================
+
+Build-time crates (proc-macro2, quote, syn, unicode-ident, thiserror-impl,
+wasm-bindgen-macro, wasm-bindgen-macro-support) generate code but do not
+reach the module and are not listed.
+
+Under the MIT License, each offering it (alone, or among MIT OR Apache-2.0,
+Unlicense OR MIT, 0BSD OR MIT OR Apache-2.0, Zlib OR Apache-2.0 OR MIT), with
+the copyright its license file states, or its authors where it states none:
+
+  adler2                 Jonas Schievink
+  aes                    2018 Artyom Pavlov; 2018-2024 The RustCrypto Project Developers
+  apfs                   2026 Dil4rd
+  arraydeque             2018 Andy Lok
+  base64                 2015 Alice Maz
+  bitflags               2014 The Rust Project Developers
+  bitstream-io           2017 Brian Langenberger
+  block-buffer           2018-2025 The RustCrypto Project Developers
+  block-padding          2018-2025 The RustCrypto Project Developers
+  bumpalo                2019 Nick Fitzgerald
+  byteorder              2015 Andrew Gallant
+  cbc                    2018 Artyom Pavlov; 2018-2022 RustCrypto Developers
+  cfb                    2017 Matthew D. Steele
+  cfg-if                 2014 Alex Crichton
+  chrono                 2014 Kang Seonghoon
+  cipher                 2016-2025 RustCrypto Developers
+  cmov                   2022-2026 The RustCrypto Project Developers
+  const-oid              2020-2026 The RustCrypto Project Developers
+  cpubits                2023-2026 The RustCrypto Project Developers
+  crc                    2017 crc-rs Developers
+  crc-catalog            2019 Akhil Velagapudi
+  crc32fast              2018 Sam Rijs, Alex Crichton and contributors
+  crypto-common          2021-2026 RustCrypto Developers
+  ctutils                2025-2026 The RustCrypto Project Developers
+  deflate64              .NET Foundation and Contributors; 2023 anatawa12
+  delharc                2023 Rafal Michalski
+  des                    2017 Gulshan Singh, Antoni Boucher, Artyom Pavlov;
+                         2017-2024 The RustCrypto Project Developers
+  digest                 2017 Artyom Pavlov; 2017-2025 RustCrypto Developers
+  equivalent             2016-2023 the equivalent authors
+  explode                2020 Aaron Griffith
+  ext4-view              2023 Google LLC
+  fatfs                  2017 Rafał Harabień
+  filetime               2014 Alex Crichton
+  flate2                 2014-2026 Alex Crichton
+  fnv                    2017 Contributors
+  futures-core           2016 Alex Crichton; 2017 The Tokio Authors
+  futures-task           2016 Alex Crichton; 2017 The Tokio Authors
+  futures-util           2016 Alex Crichton; 2017 The Tokio Authors
+  hashbrown              2016 Amanieu d'Antras
+  hfsplus                2026 Dil4rd
+  hmac                   2017 Artyom Pavlov
+  hybrid-array           2022-2026 The RustCrypto Project Developers
+  indexmap               2016-2017 the indexmap authors
+  inout                  2022 Artyom Pavlov; 2022-2025 The RustCrypto Project Developers
+  js-sys                 2014 Alex Crichton
+  log                    2014 The Rust Project Developers
+  lzfse_rust             2020 Vin Singh Ghataore
+  lznt1                  Cody Wyatt Neiman
+  lzxd                   2020 Lonami
+  mail-parser            Stalwart Labs
+  md-5                   2006-2009 Graydon Hoare; 2009-2013 Mozilla Foundation;
+                         2016 Artyom Pavlov; 2016-2026 The RustCrypto Project Developers
+  memchr                 2015 Andrew Gallant
+  miniz_oxide            2017 Frommi; 2017-2024 oyvindln; 2010-2014 Rich Geldreich
+                         and Tenacious Software LLC; 2013-2014 RAD Game Tools and
+                         Valve Software
+  no_std_io2             2020-2021 Brendan Molloy
+  num-traits             2014 The Rust Project Developers
+  once_cell              Aleksey Kladov
+  pbkdf2                 2017 Artyom Pavlov; 2018-2023 The RustCrypto Project Developers
+  pin-project-lite       the pin-project-lite authors
+  quick-xml              2016 Johann Tuffe
+  ruzstd                 2019 Moritz Borcherding
+  salzweg                Redwarp
+  sha1                   2006-2009 Graydon Hoare; 2009-2013 Mozilla Foundation;
+                         2016 Artyom Pavlov; 2016-2026 The RustCrypto Project Developers
+  sha2                   2006-2009 Graydon Hoare; 2009-2013 Mozilla Foundation;
+                         2016 Artyom Pavlov; 2016-2026 The RustCrypto Project Developers
+  simd-adler32           2021 Marvin Countryman
+  slab                   2019 Carl Lerche
+  stringprep             2017 The rust-stringprep Developers
+  tar                    The tar-rs Project Contributors
+  thiserror              David Tolnay
+  tinyvec                2019 Daniel "Lokathor" Gee
+  twox-hash              2015 Jake Goulding
+  typed-path             Chip Senkbeil
+  typenum                2014 Paho Lurie-Gregg
+  unicode-bidi           2015 The Rust Project Developers
+  unicode-normalization  2015 The Rust Project Developers
+  unicode-properties     2015 The Rust Project Developers
+  unshield               2020 Aaron Griffith
+  uuid                   2014 The Rust Project Developers; 2018 Ashley Mannix,
+                         Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
+  wasm-bindgen           2014 Alex Crichton
+  wasm-bindgen-futures   2014 Alex Crichton
+  wasm-bindgen-shared    2014 Alex Crichton
+  web-sys                2014 Alex Crichton
+  web-time               2023 dAxpeDDa
+  xz4rust                2025 Alexander Schütz; 2018 Sam Rijs, Alex Crichton and
+                         contributors
+  zip                    2014 Mathijs van de Nes
+
+Under the Apache License, Version 2.0 (text below), its only license; it ships
+no NOTICE file:
+
+  lzma-rust2             the lzma-rust2 authors
+
+Under CC0-1.0 (public domain; no notice required, recorded for completeness):
+
+  constant_time_eq       Cesar Eduardo Barros
+
+
+MIT License
+-----------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Apache License, Version 2.0
+---------------------------
+
+                              Apache License
+                        Version 2.0, January 2004
+                     http://www.apache.org/licenses/
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
+
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
+
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
+
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
+
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
+
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
+
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
+
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
+
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
+
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
+
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
+
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
+
+END OF TERMS AND CONDITIONS

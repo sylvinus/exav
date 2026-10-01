@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 # Global build args (must be declared before the first FROM to be usable in
-# FROM lines): BIN_SOURCE selects how the runtime stage gets its binary —
+# FROM lines): BIN_SOURCE selects how the runtime stage gets its binary:
 # `build` compiles it in-image (default; local builds, CI smoke test),
 # `prebuilt` copies bins/exav-$TARGETARCH (release publishing; see below).
 ARG BIN_SOURCE=build
 # Distroless, rootless, ClamAV-Docker-compatible image for exav.
 #
-# The runtime is `distroless/static` (built for static binaries — no OS, no
+# The runtime is `distroless/static` (built for static binaries: no OS, no
 # shell, no package manager, minimal attack surface) running as the `nonroot`
 # user (uid 65532). The `exav` binary is a static musl build that does all work
 # in memory, so nothing else is needed at runtime.
@@ -83,24 +83,25 @@ ENV EXAV_LISTEN=clamd://0.0.0.0:3310
 EXPOSE 3310
 # ICAP (RFC 3507) service port, for replacing a c-icap container at a proxy's
 # adaptation hook. Nothing binds it unless an `icap://` address is listed, and
-# listing one ADDS the listener — both protocols are then served from the one
+# listing one ADDS the listener: both protocols are then served from the one
 # process, over the one loaded database:
 #
 #   docker run -d -p 3310:3310 -p 1344:1344 \
 #     -e EXAV_LISTEN=clamd://0.0.0.0:3310,icap://0.0.0.0:1344 \
 #     -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
 #
-# For ICAP and nothing else, name the listener instead of the default command:
+# For ICAP and nothing else, name it in EXAV_LISTEN rather than with --listen,
+# so the HEALTHCHECK below, which reads only the environment, probes it:
 #
 #   docker run -d -p 1344:1344 -v exav-db:/var/lib/exav \
-#     ghcr.io/sylvinus/exav --listen icap://0.0.0.0:1344 --auto-update
+#     -e EXAV_LISTEN=icap://0.0.0.0:1344 ghcr.io/sylvinus/exav
 #
-# EXPOSE is documentation, not a listener — see the ICAP guide for the env vars.
+# EXPOSE is documentation, not a listener: see the ICAP guide for the env vars.
 EXPOSE 1344
 
-# `--ping` reads the same `EXAV_LISTEN` the daemon did — the health check
-# inherits the container's environment — so it follows the configuration instead
-# of assuming it. A check pinned to `clamd://…:3310` calls a healthy daemon dead
+# `--ping` reads the same `EXAV_LISTEN` the daemon did (the health check
+# inherits the container's environment, not its command line), so it follows the
+# configuration instead of assuming it. A check pinned to `clamd://…:3310` calls a healthy daemon dead
 # the moment that variable moves the port or asks for ICAP instead, and an
 # orchestrator restarts the container for it.
 #
@@ -108,14 +109,14 @@ EXPOSE 1344
 # `OPTIONS` on ICAP), not a bare TCP connect: a daemon that accepts and then
 # answers nothing is exactly what this is for.
 #
-# `/exav` is the probe because the image is distroless — no shell, no curl.
+# `/exav` is the probe because the image is distroless: no shell, no curl.
 #
 # Unhealthy while the daemon is still waiting for signatures, deliberately: it
 # is not serving then, and saying otherwise sends traffic somewhere that cannot
 # answer. Raise --start-period when signatures come from a slow sidecar.
 #
 # It answers for the daemon this image defaults to, so a container given a
-# different job — `--build-db`, a `--connect` client, a one-shot scan — reports
+# different job (`--build-db`, a `--connect` client, a one-shot scan) reports
 # unhealthy for its lifetime while working perfectly: nothing is listening, and
 # the check cannot tell that from a daemon that died. Those runs are short and
 # exit on their own, so this is cosmetic under `docker run`; pass

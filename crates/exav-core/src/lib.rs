@@ -92,6 +92,7 @@ engine_internals!(
 );
 
 mod byte_source;
+mod grams;
 mod stream_regex;
 
 // YARA rule support. The native engine (compiler/scanner/modules) lives in-tree
@@ -1355,8 +1356,8 @@ fn allowlisted(db: &Scanner, facts: &Facts) -> bool {
             .is_some()
 }
 
-/// Build every structure a scan initialises lazily (engine automata, compiled
-/// YARA rules), so a process that forks workers after loading shares them
+/// Build every structure a scan initialises lazily (compiled YARA rules and
+/// their automata), so a process that forks workers after loading shares them
 /// copy-on-write instead of each worker building its own.
 pub fn warm_up(db: &Scanner) {
     const PROBE: &[u8] = b"MZ\x90\x00\x00\x00\x00\x00";
@@ -1611,16 +1612,24 @@ fn limits_alert_name(kind: unpack::LimitKind) -> Option<&'static str> {
 /// ceiling come through here, so the two cannot name one condition two ways,
 /// and the kind is passed as a type so the name is looked up and never guessed.
 fn max_file_size_report(size: u64, max: u64, opts: &ScanOptions) -> ScanReport {
+    match max_file_size(size, max, opts) {
+        Ok(name) => ScanReport::infected(name.to_string(), 0, Method::Heuristic, Vec::new()),
+        Err(reason) => ScanReport::limits(reason, Vec::new()),
+    }
+}
+
+/// The alert a top-level file larger than `max_scan_size` is reported as
+/// under `--alert-exceeds-max`, or else the reason it is over the limit.
+fn max_file_size(size: u64, max: u64, opts: &ScanOptions) -> Result<&'static str, String> {
     if opts.alert_exceeds_max {
         if let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize) {
             match_loc_record();
-            return ScanReport::infected(name.to_string(), 0, Method::Heuristic, Vec::new());
+            return Ok(name);
         }
     }
-    ScanReport::limits(
-        format!("file size {size} exceeds max-input-bytes {max}; scanned first {max} bytes only"),
-        Vec::new(),
-    )
+    Err(format!(
+        "file size {size} exceeds max-input-bytes {max}; scanned first {max} bytes only"
+    ))
 }
 
 /// Turn a budget stop into an outcome, honouring `--alert-exceeds-max`.
@@ -2150,7 +2159,33 @@ pub fn analyze_all_with_outcome(
 /// As [`analyze_all_with_outcome`], over a seekable input of `size` bytes.
 /// One too large to hold is read through a block cache of bounded size, so
 /// every detection is listed whatever the input's size.
+///
+/// Past `--max-input-bytes`, what the first `max_scan_size` bytes hold is
+/// listed and the input is reported over the limit, as [`scan_seekable`]
+/// reports it.
 pub fn analyze_all_seekable<R: Read + Seek>(
+    db: &Scanner,
+    mut reader: R,
+    size: u64,
+    opts: &ScanOptions,
+) -> io::Result<(Vec<(String, Method)>, AllMatchOutcome)> {
+    if let Some(max) = opts.max_scan_size {
+        if size > max {
+            let (mut names, outcome) = all_within(db, Window::new(&mut reader, max)?, max, opts)?;
+            return Ok(match max_file_size(size, max, opts) {
+                Ok(name) => {
+                    names.push((name.to_string(), Method::Heuristic));
+                    (names, outcome)
+                }
+                Err(reason) => (names, AllMatchOutcome::LimitsExceeded(reason)),
+            });
+        }
+    }
+    all_within(db, reader, size, opts)
+}
+
+/// [`analyze_all_seekable`] for an input within `--max-input-bytes`.
+fn all_within<R: Read + Seek>(
     db: &Scanner,
     mut reader: R,
     size: u64,
@@ -2854,7 +2889,16 @@ fn scan_archive(
         return members;
     }
     let mut outcome = members;
-    let rest = match core(db, facts, obj.core_type.unwrap_or(ft), obj, opts, sink) {
+    let writes = write_limits(budget);
+    let rest = match core(
+        db,
+        facts,
+        obj.core_type.unwrap_or(ft),
+        obj,
+        opts,
+        writes,
+        sink,
+    ) {
         Ok(rest) => rest,
         Err(stop) => return stop,
     };
@@ -3044,7 +3088,16 @@ fn scan_file(
     let (depth, container) = (obj.depth, obj.container);
     let mut unpacked = Vec::new();
     let (ft, fmt) = if obj.core {
-        let rest = match core(db, facts, obj.core_type.unwrap_or(ft), obj, opts, sink) {
+        let mut writes = write_limits(budget);
+        let rest = match core(
+            db,
+            facts,
+            obj.core_type.unwrap_or(ft),
+            obj,
+            opts,
+            writes,
+            sink,
+        ) {
             Ok(rest) => rest,
             Err(stop) => return stop,
         };
@@ -3059,7 +3112,9 @@ fn scan_file(
             Some(retyped) => {
                 // Worth something only if the object is matched AS the new
                 // type, and unpacked as it.
-                match core(db, facts, retyped, obj, opts, sink) {
+                let written: u64 = unpacked.iter().map(|b| b.len() as u64).sum();
+                writes.total = writes.total.saturating_sub(written);
+                match core(db, facts, retyped, obj, opts, writes, sink) {
                     Ok(rest) => unpacked.extend(rest.unpacked),
                     Err(stop) => return stop,
                 }
@@ -3274,7 +3329,7 @@ fn scan_file(
         if let Some(info) = pe::analyze(data) {
             // imphash (`.imp`) matching is a ClamAV default (matched whenever the
             // loaded DB carries `.imp` sigs), so it runs under `clamav_heuristics`
-            // (i.e. under `--clamav-compat` too). The exav-exclusive ML scorer,
+            // (i.e. under `--clamav-compat` too). The exav-exclusive static scorer,
             // packed-injection heuristic, and the `-v` diagnostic findings below
             // stay behind the full `--detect exav-heuristics` flag.
             if let Some(hit) = db
@@ -3674,6 +3729,16 @@ struct CoreRest {
     retype: Option<FileType>,
 }
 
+/// What bytecode programs may write for one object: no output larger than a
+/// buffer the scan may hold, and all of it within the bytes the scan has left.
+/// The output is charged to the budget when it is scanned.
+fn write_limits(budget: &Budget) -> bytecode::exec::WriteLimits {
+    bytecode::exec::WriteLimits {
+        file: budget.limits().max_buffer_bytes,
+        total: budget.remaining_scan(),
+    }
+}
+
 /// The matching core over an object's own bytes, `ft` being the type it is
 /// matched as. Every detection goes to `sink`; `Err` means the walk must stop.
 fn core(
@@ -3682,10 +3747,11 @@ fn core(
     ft: FileType,
     obj: Obj<'_>,
     opts: &ScanOptions,
+    writes: bytecode::exec::WriteLimits,
     sink: &mut Sink,
 ) -> Result<CoreRest, DeepOutcome> {
     let data = facts.data;
-    let unpacked = core_matches(db, facts, ft, obj, opts, sink);
+    let unpacked = core_matches(db, facts, ft, obj, opts, writes, sink);
     // Taken whatever the outcome, so it cannot outlive this object and retype
     // a later one at the same address.
     let retype = engine::take_retype_source(data);
@@ -3704,6 +3770,7 @@ fn core_matches(
     ft: FileType,
     obj: Obj<'_>,
     opts: &ScanOptions,
+    writes: bytecode::exec::WriteLimits,
     sink: &mut Sink,
 ) -> Result<Vec<Vec<u8>>, DeepOutcome> {
     let data = facts.data;
@@ -3804,7 +3871,8 @@ fn core_matches(
     let mut unpacked = Vec::new();
     if !db.bytecode.is_empty() {
         let (det, extracted) = profile::timed("bytecode", data.len() as u64, || {
-            db.bytecode.scan_source(data, ft, materialize, &fired)
+            db.bytecode
+                .scan_source(data, ft, materialize, &fired, writes)
         });
         if let Some((name, _)) = det {
             hit(&name, false, 0, Method::Bytecode)?;
@@ -3813,13 +3881,12 @@ fn core_matches(
     }
     if !db.sections.is_empty() {
         if let Some(image) = &image {
-            let want_sha = db.sections.wants_sha();
             let found: Vec<_> = profile::timed("sections", data.len() as u64, || {
                 pe::section_slices(image)
                     .into_iter()
                     .filter_map(|(size, slice)| {
                         db.sections
-                            .lookup(size, &hashes::section_digests(slice, want_sha))
+                            .lookup(size, &hashes::section_digests(&db.sections, size, slice))
                     })
                     .collect()
             });
@@ -3999,7 +4066,7 @@ mod tests {
         #[cfg(feature = "all-formats")]
         assert_eq!(want_fmt, Some(unpack::Format::Autoit));
         assert!(!want_embedded.pe.is_empty() && !want_embedded.archives.is_empty());
-        assert!(!want_digests.md5.is_empty() && !want_digests.sha256.is_empty());
+        assert!(want_digests.md5.is_some() && want_digests.sha256.is_some());
         for first in 0..3 {
             let cache =
                 byte_source::BlockCache::with_sizes(Cursor::new(data.clone()), 4093, 16 * 4093)
@@ -4350,11 +4417,18 @@ mod tests {
     /// it does when nested in another archive. The wildcard signature matches
     /// only a member NAME, i.e. the raw container; the hash is the container's.
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
     fn a_top_level_container_gets_the_full_engine_over_its_own_bytes() {
         let zip = build_zip(&[("payload_marker.txt", b"nothing to see here")]);
         let wild = db_from(&[("w.ndb", "Test.ZipName:0:*:7061796c6f6164??6d61726b6572\n")]);
         let d = digests_of(&zip);
-        let hash = db_from(&[("h.hdb", &format!("{}:{}:Test.ZipHash\n", d.md5, zip.len()))]);
+        let hash = db_from(&[(
+            "h.hdb",
+            &format!("{}:{}:Test.ZipHash\n", d.md5_hex(), zip.len()),
+        )]);
         let opts = ScanOptions::default();
 
         assert_eq!(
@@ -4448,6 +4522,10 @@ mod tests {
     /// text file is clean only when its normalised views could be made, which
     /// takes a spill.
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
     fn a_file_over_the_deep_analysis_limit_gets_the_full_engine() {
         let db = db_from(&[
             ("w.ndb", "Test.Wild:0:*:6576696c??7061796c6f6164\n"),
@@ -4504,12 +4582,66 @@ mod tests {
         }
     }
 
+    /// Past `--max-input-bytes` an all-match scan lists what the first bytes
+    /// hold and reports the rest unscanned, as a single-match scan does: it
+    /// neither reads past the limit nor calls the input complete.
+    #[test]
+    fn an_all_match_scan_keeps_to_the_input_limit() {
+        let db = db_from(&[(
+            "t.ndb",
+            "Test.Head:0:*:4558415654455354\nTest.Tail:0:*:5441494c5441494c\n",
+        )]);
+        let mut data = b"EXAVTEST".to_vec();
+        data.extend(std::iter::repeat_n(b'.', 10_000));
+        data.extend_from_slice(b"TAILTAIL");
+        let opts = ScanOptions {
+            max_scan_size: Some(4096),
+            ..ScanOptions::default()
+        };
+        let all = |data: &[u8], opts: &ScanOptions| {
+            analyze_all_seekable(&db, Cursor::new(data), data.len() as u64, opts).unwrap()
+        };
+        let (names, outcome) = all(&data, &opts);
+        let names: Vec<_> = names.into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["Test.Head"]);
+        match outcome {
+            AllMatchOutcome::LimitsExceeded(reason) => {
+                assert!(reason.contains("max-input-bytes"), "{reason}")
+            }
+            other => panic!("expected a limit, got {other:?}"),
+        }
+        // Nothing in the first bytes: the limit alone, as a single-match scan
+        // reports it.
+        let (names, outcome) = all(&data[8..], &opts);
+        assert!(names.is_empty(), "{names:?}");
+        assert!(
+            matches!(outcome, AllMatchOutcome::LimitsExceeded(_)),
+            "{outcome:?}"
+        );
+        // Under ClamAV's alert, by ClamAV's name for it.
+        let alerting = ScanOptions {
+            alert_exceeds_max: true,
+            ..opts.clone()
+        };
+        let want = seekable(&db, &data[8..], &alerting);
+        let (names, _) = all(&data[8..], &alerting);
+        let names: Vec<_> = names.into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            Some(names.as_slice()),
+            infected_as(&want).map(|n| vec![n.to_string()]).as_deref()
+        );
+        // Within the limit, the whole input.
+        let (names, outcome) = all(&data, &ScanOptions::default());
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(matches!(outcome, AllMatchOutcome::Complete), "{outcome:?}");
+    }
+
     /// The `.fp` allowlist covers a top-level archive, not only its members.
     #[test]
     fn an_allowlisted_top_level_archive_is_clean() {
         let zip = build_zip(&[("b.txt", eicar())]);
         let d = digests_of(&zip);
-        let db = db_from(&[("x.fp", &format!("{}:{}:Allowed\n", d.md5, zip.len()))]);
+        let db = db_from(&[("x.fp", &format!("{}:{}:Allowed\n", d.md5_hex(), zip.len()))]);
         assert_eq!(seekable(&db, &zip, &ScanOptions::default()), Verdict::Clean);
     }
 
@@ -4713,7 +4845,7 @@ mod tests {
         let mut db = Scanner::builtin();
         let d = digests_of(b"some clean-looking content");
         db.hashes
-            .extend_from_text(&format!("{}:*:Test.ByHash\n", d.sha256));
+            .extend_from_text(&format!("{}:*:Test.ByHash\n", d.sha256_hex()));
         db.hashes.finalize();
         let r = analyze(&db, b"some clean-looking content", &ScanOptions::default());
         match r.verdict {
@@ -4739,7 +4871,7 @@ mod tests {
             let mut db = Scanner::builtin();
             let d = digests_of(&data);
             db.hashes
-                .extend_from_text(&format!("{}:{}:Test.Tiny{}\n", d.md5, n, n));
+                .extend_from_text(&format!("{}:{}:Test.Tiny{}\n", d.md5_hex(), n, n));
             db.hashes.finalize();
             let hit = matches!(
                 analyze(&db, &data, &ScanOptions::default()).verdict,
@@ -4772,7 +4904,7 @@ mod tests {
         );
         let d = digests_of(b"abcd");
         db.allow
-            .extend_from_text(&format!("{}:4:Test.Allow\n", d.md5));
+            .extend_from_text(&format!("{}:4:Test.Allow\n", d.md5_hex()));
         db.allow.finalize();
         let r = analyze(&db, b"abcd", &ScanOptions::default());
         assert!(
@@ -4809,7 +4941,11 @@ mod tests {
 
         // `.fp` allowlisting this file's hash clears the detection.
         let d = digests_of(&data);
-        std::fs::write(dir.path().join("b.fp"), format!("{}:*:Allowed\n", d.md5)).unwrap();
+        std::fs::write(
+            dir.path().join("b.fp"),
+            format!("{}:*:Allowed\n", d.md5_hex()),
+        )
+        .unwrap();
         assert_eq!(
             analyze(&loader::load(dir.path()).unwrap(), &data, &opts).verdict,
             Verdict::Clean
@@ -5054,7 +5190,7 @@ mod tests {
         let mut db = Scanner::builtin();
         let d = digests_of(&blob);
         db.hashes
-            .extend_from_text(&format!("{}:*:Test.TarWholeHash\n", d.sha256));
+            .extend_from_text(&format!("{}:*:Test.TarWholeHash\n", d.sha256_hex()));
         db.hashes.finalize();
         let f = write_temp(&blob);
         let r = scan_path(&db, f.path(), &ScanOptions::default()).unwrap();
@@ -5477,20 +5613,21 @@ mod parity {
     }
 
     /// The same, over a real database and a directory of samples:
-    /// `EXAV_PARITY_DB=<.exavdb> EXAV_PARITY_CORPUS=<dir> cargo test -p exav-core
-    /// --release --lib parity::corpus -- --ignored --nocapture`.
+    /// `EXAV_DEBUG_PARITY_DB=<.exavdb> EXAV_DEBUG_PARITY_CORPUS=<dir> cargo test
+    /// -p exav-core --release --lib parity::corpus -- --ignored --nocapture`,
+    /// and `EXAV_DEBUG_PARITY_LIMIT=<n>` for the first `n` samples.
     #[test]
     #[ignore = "needs a database and a corpus"]
     fn corpus() {
         let (Ok(db), Ok(dir)) = (
-            std::env::var("EXAV_PARITY_DB"),
-            std::env::var("EXAV_PARITY_CORPUS"),
+            std::env::var("EXAV_DEBUG_PARITY_DB"),
+            std::env::var("EXAV_DEBUG_PARITY_CORPUS"),
         ) else {
-            eprintln!("skip: EXAV_PARITY_DB / EXAV_PARITY_CORPUS unset");
+            eprintln!("skip: EXAV_DEBUG_PARITY_DB / EXAV_DEBUG_PARITY_CORPUS unset");
             return;
         };
         let db = database::load(std::path::Path::new(&db)).expect("load the database");
-        let limit: usize = std::env::var("EXAV_PARITY_LIMIT")
+        let limit: usize = std::env::var("EXAV_DEBUG_PARITY_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(usize::MAX);

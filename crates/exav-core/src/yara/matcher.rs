@@ -92,7 +92,7 @@ pub(crate) struct Base64Sub {
 // *definition* (regex source + flags, or the literal/base64 needle bytes), from
 // which [`PatternDef::compile`] rebuilds an identical `PatternMatcher` on load.
 // Rebuilding a single pattern's regex is cheap; the aggregate cost that the
-// serialized database avoids is the daachorse atom-automaton build (see
+// serialized database avoids is the atom index build (see
 // [`crate::yara::atoms`]), which is serialized separately.
 
 /// The serializable definition of one `base64`/`base64wide` sub-pattern. Mirrors

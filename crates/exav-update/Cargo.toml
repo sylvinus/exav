@@ -15,13 +15,15 @@ description = "Standalone signature-database updater for exav: fetch ClamAV-form
 
 # Deliberately isolated: this is the ONE place a TLS stack (ureq → rustls → ring)
 # enters the tree, kept out of exav-core so the scanning engine stays pure-Rust.
-# ureq 2.12 bundles webpki-roots, so HTTPS works on a scratch/distroless image
-# with no OS certificate store.
+# ureq bundles webpki-roots, so HTTPS works on a scratch/distroless image with
+# no OS certificate store.
 [dependencies]
-ureq = "2"
-# Verify a downloaded `.exavdb`'s embedded SHA-256 before installing it, so an
+ureq = "3"
+# Verify a downloaded `.exavdb`'s embedded CRC-32 before installing it, so an
 # interrupted/corrupt download is rejected rather than clobbering a good cache.
-# Same hash exav-core stamps into the cache; RustCrypto, no C/asm.
+# Same checksum exav-core stamps into the cache.
+crc32fast = "1"
+# The tag that keeps two sources' same-named files apart.
 sha2 = "0.11"
 
 # docs.rs builds with every feature on, so the parts gated behind a feature

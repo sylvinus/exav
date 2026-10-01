@@ -1,9 +1,9 @@
-# exav — build, test, and the daily prebuilt-database pipeline.
+# exav: build, test, and the daily prebuilt-database pipeline.
 #
 # `make exavdb` is the intended production flow: fetch the ClamAV signatures with
 # Cisco's own updater, then compile a prebuilt `.exavdb` that CLI instances load
-# directly (a near-instant, low-memory cold start). Run it on a host with enough
-# RAM — building the full main+daily set needs ~8 GB.
+# directly (a near-instant, low-memory cold start). Building the full main+daily
+# set needs about 2 GB of RAM.
 
 CARGO   ?= cargo
 EXAV    ?= ./target/release/exav
@@ -17,7 +17,7 @@ EXAVDB  ?= exav.exavdb
 build release:
 	$(CARGO) build --release
 
-## test: EVERY test exav owns — native feature matrix, wasm32, the WASM bindings'
+## test: EVERY test exav owns: native feature matrix, wasm32, the WASM bindings'
 ##       JS suites and the docs build. The one command to run before pushing.
 ##       Needs `wasmtime` (test-wasm) and node (test-js, test-www); the
 ##       sub-targets below run each part alone.
@@ -26,7 +26,7 @@ build release:
 ##       against another engine rather than against its own contract:
 ##       `scripts/difftest.sh` and `make test-yara-diff`.
 ##
-##       For the fast inner loop use `cargo test` directly — but note it is a
+##       For the fast inner loop use `cargo test` directly, but note it is a
 ##       SUBSET: feature-gated test files compile to zero tests without their
 ##       feature and report green having checked nothing.
 test:
@@ -36,7 +36,7 @@ test:
 	$(MAKE) test-www
 
 ## test-native: the full native test matrix (every feature pass CI runs, no wasm).
-##              Mirrors the `test` job in .github/workflows/ci.yml — keep in sync.
+##              Mirrors the `test` job in .github/workflows/ci.yml; keep in sync.
 test-native:
 	$(CARGO) test --workspace
 	# The CLI as shipped: a `--workspace` build unifies features across crates,
@@ -57,7 +57,7 @@ test-native:
 	$(CARGO) test -p exav-unpack --features testing-faults panic_containment
 	$(CARGO) test -p exav --features testing-faults --test decoder_crash
 
-## test-yara-diff: the yara-x A/B differential harness — compiles the SAME rules
+## test-yara-diff: the yara-x A/B differential harness. Compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT
 ##                 part of `make test`, for the same reason the clamav harness
 ##                 (scripts/difftest.sh) isn't: a differential test
@@ -68,18 +68,18 @@ test-native:
 ##
 ##                 yara-x is invoked as the `yr` BINARY, not linked as a crate.
 ##                 As a dependency it drags in ~83 extra crates, 21 of them
-##                 cranelift/wasmtime — exav's own build contains no JIT backend
+##                 cranelift/wasmtime; exav's own build contains no JIT backend
 ##                 at all, and a crate in the graph can reach a shipped artifact
 ##                 in a way a program on PATH cannot.
 ##
 ##                 Install the oracle with `cargo install yara-x-cli`, or point
-##                 EXAV_YR_BIN at a build. WITHOUT it the tests SKIP and report
-##                 green having checked nothing — so read the output, not just
+##                 EXAV_DEBUG_YR_BIN at a build. WITHOUT it the tests SKIP and report
+##                 green having checked nothing, so read the output, not just
 ##                 the exit code. Run it when you touch the YARA engine.
 test-yara-diff:
 	$(CARGO) test -p exav-core --test yara_difftest --test yara_coverage_difftest -- --nocapture
 
-## test-js: the exav-unpack-wasm JavaScript suites — vitest units plus the
+## test-js: the exav-unpack-wasm JavaScript suites: vitest units plus the
 ##          playwright browser e2e against a freshly built pkg/. This is the
 ##          published npm package's public API; no cargo test reaches it.
 test-js:
@@ -100,10 +100,11 @@ test-wasm:
 wasm-sizes:
 	./scripts/wasm-format-sizes.sh
 
-## lint: clippy + rustfmt check
+## lint: the clippy passes and rustfmt check CI runs (.github/workflows/ci.yml)
 lint:
-	$(CARGO) clippy --all-targets -- -D warnings
-	$(CARGO) fmt --check
+	$(CARGO) fmt --all --check
+	$(CARGO) clippy --all-targets --features exav-core/http -- -D warnings
+	$(CARGO) clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
 
 ## fmt: format the code
 fmt:
@@ -111,7 +112,7 @@ fmt:
 
 ## msrv: build the workspace on the `rust-version` floor declared in Cargo.toml.
 ##       CI runs this, so a version nobody verifies drifts upward the
-##       first time someone uses a newer feature — silently breaking anyone who
+##       first time someone uses a newer feature, silently breaking anyone who
 ##       pinned the toolchain we promised.
 ##       `rustup run` rather than `cargo +VERSION`: the `+toolchain` prefix is a
 ##       rustup *shim* feature, so it fails with "no such command" whenever
@@ -125,7 +126,7 @@ msrv:
 ##           a committed fixture that other people's scanners will detect. Run it
 ##           when fixtures change, not on every release: it needs `clamscan` and
 ##           a signature directory ($(DBDIR), via `make db`), neither of which is
-##           present on most machines — so as a release gate it would skip
+##           present on most machines, so as a release gate it would skip
 ##           exactly where it mattered. An independent engine on purpose: asking
 ##           exav whether exav's own tree is clean answers the wrong question.
 av-audit:
@@ -169,7 +170,7 @@ exavdb: build db
 ## cache: deprecated alias for `make exavdb`
 cache: exavdb
 
-## daily: alias for `make exavdb` — run from cron to refresh the distributed database
+## daily: alias for `make exavdb`; run from cron to refresh the distributed database
 daily: exavdb
 
 ## clean: remove build artifacts (keeps $(DBDIR) and $(EXAVDB))
@@ -188,7 +189,7 @@ www-build:
 # pre-publish gate. One list, in one place: the order is the crate graph and a
 # crate cannot go up before the crates it depends on exist on the registry, so a
 # list that drifts fails partway and leaves some crates at the new version and
-# some not — and a published version can be yanked but never replaced or reused,
+# some not, and a published version can be yanked but never replaced or reused,
 # so a botched run burns that version number permanently.
 
 ## publish-check: run the pre-publish gate and dry-run every crate, publishing nothing
@@ -201,7 +202,7 @@ publish:
 
 # The npm package is published from the CRATE directory, never from `pkg/`.
 # `wasm-pack` writes its own `package.json` into `pkg/`, so running `npm publish`
-# in there ships that one instead — different `files`, different `main`, and none
+# in there ships that one instead: different `files`, different `main`, and none
 # of the metadata. Only the tracked manifest describes what should go out, and
 # this target is what pins the choice.
 ## npm-publish-check: pack the npm bindings without publishing, and list contents

@@ -7,8 +7,9 @@ import { Steps } from '@astrojs/starlight/components';
 
 exav runs on Linux, macOS and Windows and ships as a single binary. The Linux
 release builds are static (musl); the macOS and Windows builds link the system
-libraries. On Windows there is no prefork worker pool and no `--auto-update`,
-which are Unix only.
+libraries. On Windows there is no prefork worker pool, no per-job limits
+(`--max-scan-secs`, `--max-process-bytes`) and no `--auto-update`, which are
+Unix only.
 
 ## Prebuilt binaries
 
@@ -16,9 +17,27 @@ Each release on [GitHub](https://github.com/sylvinus/exav/releases) carries
 binaries for `{x86_64,aarch64}-unknown-linux-musl` (static, any distro),
 `{x86_64,aarch64}-apple-darwin` and `x86_64-pc-windows-msvc`, and the WASI
 module `exav-wasm-<tag>-wasm32-wasip1.wasm` (see the
-[WASM sandbox guide](/guides/wasm-sandbox/)). They are the default build,
-without HTTP support: to fetch signatures with `--auto-update` or scan URLs,
-build with `--features http` below.
+[WASM sandbox guide](/guides/wasm-sandbox/)). Each archive has a `.sha256`
+checksum beside it. For example, on 64-bit Linux:
+
+```sh
+tag=v0.0.2 target=x86_64-unknown-linux-musl
+curl -fsSLO https://github.com/sylvinus/exav/releases/download/$tag/exav-$tag-$target.tar.gz
+tar xzf exav-$tag-$target.tar.gz
+sudo install -m755 exav /usr/local/bin/exav
+exav --version
+```
+
+They are the default build, without HTTP support: to fetch signatures with
+`--auto-update` or scan URLs, build with `--features http` below.
+
+The standalone tools come as archives of their own, `exav-unpack-<tag>-<target>`
+(an extractor with `unzip`'s command line, see
+[exav-unpack](/subprojects/exav-unpack/#cli)), `exav-grep-<tag>-<target>`
+(see [exav-grep](/subprojects/exav-grep/)) and `exav-pe-emu-<tag>-<target>` (a
+PE unpacker that runs a packer's own stub in an emulator, see
+[exav-pe-emu](/subprojects/exav-pe-emu/#cli)). Every archive carries the
+`LICENSE` and the `NOTICE` of what the binary links.
 
 ## From crates.io
 
@@ -87,6 +106,7 @@ Build a `.deb` locally with `cargo-deb`:
 cargo install cargo-deb
 cargo build --release -p exav
 cargo deb -p exav --no-build      # the binary, and the systemd unit exav.service
+sudo apt install ./target/debian/exav_*.deb
 ```
 
 The unit runs as the `clamav` user and reads `/var/lib/clamav`, as

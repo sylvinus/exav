@@ -15,7 +15,9 @@ against a cold page cache and are not performance numbers.
 The harness lives in the repository's `scripts/`; this page is the concept. The
 runbook is
 [`docs/DIFF_TESTING.md`](https://github.com/sylvinus/exav/blob/main/docs/DIFF_TESTING.md),
-and the smallest run is `LIMIT=500 scripts/difftest.sh`.
+and a quick run is `LIMIT=500 scripts/difftest.sh`. Bytecode programs and YARA
+rules have their own comparisons (`scripts/bc-difftest.sh`, and the YARA
+differential tests in `exav-core`).
 
 ## The setup
 
@@ -63,13 +65,9 @@ sample. Agreement is what matters.
 ## `--clamav-compat`: matching boundaries, not quirks
 
 By default exav runs at full capability, and the harness runs it with
-`--clamav-compat` (`COMPAT=0` measures what exav adds). For a like-for-like run,
-`--clamav-compat` sets a stock ClamAV build's documented defaults: the limit
-values (`--max-input-bytes 100M`, 400M held per file, `--max-unpack-depth 17`,
-`--max-members 10000`, `--decode none`), the extractor
-set, `.UNOFFICIAL` naming for unofficial-database signatures, and
-`--partial-as ok`, so a file ClamAV would call clean is answered `OK` here too.
-Each limit is also its own flag, and an explicit flag wins over the preset.
+[`--clamav-compat`](/reference/cli/#clamav-compatibility) (`COMPAT=0` measures
+what exav adds), which sets a stock ClamAV build's documented limits, extractor
+set and naming, and answers a file ClamAV would call clean `OK`.
 
 It matches ClamAV's documented boundaries, not its implementation quirks: it does
 not reproduce each parser's internal caps and bail-outs (an RTF parser that stops

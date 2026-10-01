@@ -1,4 +1,4 @@
-# Bytecode signatures (`.cbc`) — design, scope, and security
+# Bytecode signatures (`.cbc`): design, scope, and security
 
 ClamAV's most expressive signature type is **bytecode**: a small program (written
 in C, compiled to a custom VM bytecode, shipped as a `.cbc` file in
@@ -7,7 +7,7 @@ malicious. It expresses detection logic that pattern/logical signatures can't.
 
 exav implements a reader and a **memory-safe, sandboxed interpreter** for this
 format. This document records what the format is, what's actually in the live
-database, the scope we target, and — the main point — **why exav's approach is
+database, the scope we target, and (the main point) **why exav's approach is
 structurally safer than ClamAV's**, which has a documented history of remote
 code execution in exactly this subsystem.
 
@@ -19,16 +19,16 @@ code execution in exactly this subsystem.
 
 A `.cbc` file is line-oriented:
 
-- **`ClamBC` header line** — format level, timestamp, compiler, type/function
+- **`ClamBC` header line**: format level, timestamp, compiler, type/function
   counts, functionality-level range, and a validation magic
   (`0x53e5493e9f3d1c30`). Integers use a nibble encoding: a byte `0x6N` carries
   nibble `N` (so `` ` ``=0 … `o`=15); a number is a count byte followed by that
   many little-endian nibbles.
-- **Trigger line** — a logical signature in `.ldb` form
+- **Trigger line**: a logical signature in `.ldb` form
   (`Name;TDB;expr;subsigs…`). The program runs **only** when this signature
   matches a file. exav already has a full `.ldb` engine, so the trigger side is
   free.
-- **Records** — `T` types, `E` API declarations, `G` globals, `A` function
+- **Records**: `T` types, `E` API declarations, `G` globals, `A` function
   headers, `B` basic-block instruction streams, `S` strings.
 
 The instruction set is an LLVM-IR-like SSA form: arithmetic, bitwise, casts,
@@ -40,7 +40,7 @@ accessors, hashing, `disasm_x86`, and `setvirusname` to report a hit.
 
 ## 2. What's actually in the live database
 
-Analysis of `bytecode.cvd` (v339, Sep 2025) — all **85** programs:
+Analysis of `bytecode.cvd` (v339, Sep 2025), all **85** programs:
 
 | Property | Finding |
 |---|---|
@@ -89,7 +89,7 @@ historically via an LLVM JIT:
 - **CVE-2020-37167**: weak validation of bytecode function names in ClamBC
   before 0.103.0, a code-injection flaw (CWE-94), **CVSS 3.1 8.4**, local
   vector.
-- **ClamAV < 0.102 `bytecode_vm` code execution** (exploit-db 47687) — the
+- **ClamAV < 0.102 `bytecode_vm` code execution** (exploit-db 47687), in the
   bytecode VM/JIT path.
 - The optional **LLVM JIT** generated and ran native code from bytecode: a large
   attack surface (and dependency) that Cisco has been moving away from.
@@ -98,47 +98,68 @@ exav's design removes these failure modes by construction:
 
 | Risk in ClamAV's C VM | exav |
 |---|---|
-| Memory corruption or code injection in the VM (the class of the two above) | **Pure safe Rust, no `unsafe`** — every memory access is a bounds-checked slice; an out-of-range index panics into isolation, it cannot corrupt memory |
-| Native code generation from bytecode (JIT spray, W^X issues) | **No JIT, ever** — interpret only |
+| Memory corruption or code injection in the VM (the class of the two above) | **Pure safe Rust, no `unsafe`**: every memory access is a bounds-checked slice; an out-of-range index panics into isolation, it cannot corrupt memory |
+| Native code generation from bytecode (JIT spray, W^X issues) | **No JIT, ever**: interpret only |
 | Untrusted program escaping the sandbox (syscalls, host memory) | Program sees only bounded `Vec`s and a fixed read-only file API; no syscalls, no host pointers |
 | Runaway program (CPU/memory exhaustion) | **Instruction budget**, scratch-memory cap, and call-depth limit |
-| A parser/VM bug taking down the scan | **`catch_unwind` per program** (and per file) — one bad program is skipped, the scan continues |
+| A parser/VM bug taking down the scan | **`catch_unwind` per program** (and per file): one bad program is skipped, the scan continues |
 | Malformed/hostile `.cbc` | Fallible parser (no panics); 100% of the live DB parses cleanly; a program that isn't fully understood is **never executed** |
 
 The net: the worst a hostile or buggy `.cbc` can do to exav is *be skipped or
 time out*. In ClamAV the worst case has been *remote code execution*. For anyone
 who disables ClamAV bytecode for safety, exav offers the capability **without
-that trade-off** — a real reason to switch.
+that trade-off**, a real reason to switch.
 
 ## 5. Dangers identified (and how they're handled)
 
-- **Decompression/alloc bombs via `malloc`/codecs** → scratch-memory cap; the
-  codec APIs are stubs; allocation bounded.
+- **Decompression/alloc bombs via `malloc`/codecs** → the codec APIs are
+  stubs; one `malloc` of 128 MiB less 8 bytes or more returns NULL, as in
+  ClamAV 1.4.3. `write` fails with -1, as ClamAV's does at its file and scan
+  size limits, once one extracted file would pass `--max-object-bytes` or
+  everything written would pass what is left of `--max-matcher-bytes`; the
+  program carries on, and the scan is `LIMITS-EXCEEDED` unless something else
+  is found. Past those, one extracted file holds at most 256 MiB, and a
+  program that writes more is stopped. The number of allocations is bounded
+  only by the instruction budget.
 - **Infinite loops** → instruction budget (programs are not guaranteed to halt).
 - **Pointer math (`GEP`) out of bounds** → modeled as `(region, offset)` with
   checked access; never a raw pointer.
 - **Reading beyond the file** → the file is a read-only slice; all API reads are
   clamped.
 - **Trigger-only false positives** → a program is the *confirmation* step; if it
-  can't run, exav reports nothing (never fires on the trigger alone).
+  can't run, exav never fires on the trigger alone. When exav stopped it (steps,
+  call depth, an unmodeled op or API, output past 256 MiB, PE header data exav
+  lacks), the scan is `LIMITS-EXCEEDED` unless something else is found; a
+  program's own fault (out of bounds, division by zero, an abort) is
+  discarded, as in ClamAV.
+- **`__clambc_pedata` without a PE** → as in ClamAV 1.4.3, its 648 bytes read
+  as zeros on a file that is not a PE, and a read past them is out of bounds.
+  A file exav types as a PE but has no PE header data for (too large to load,
+  or rejected by exav's parser) may be one ClamAV has data for, so reading it
+  stops the program as above.
+- **Output of a failed run** → what a program wrote before its run failed or
+  was stopped is scanned (except after a VM panic), as ClamAV scans the output
+  of a failed run; only its detection is discarded. A
+  `disasm_x86` call on bytes the decoder does not know ends the run, so no
+  output depends on a guess about them.
 - **`deserialize_unchecked`-style trust** → N/A *for the bytecode subsystem*:
   no `.cbc` content is loaded unchecked, and the DB itself is signature-verified
-  by `freshclam`/`cvdupdate`. (The one `deserialize_unchecked` in the project is
-  the prebuilt-database loader in `engine.rs`, which is a SHA-256-verified trusted
-  artifact — a separate trust model, see SECURITY.md.)
+  by `freshclam`/`cvdupdate`. (The prebuilt `.exavdb` is a separate trust
+  model: a trusted artifact whose CRC-32 catches damage, not tampering; see
+  SECURITY.md.)
 
 ## 6. Status
 
 **Done and verified against the real corpus:**
-- Exact nibble number/data/**operand** decoder (`bytecode::decode`) — fuzzed.
-- Header + trigger + API declarations (`bytecode::parse`) — **parses 100% of the
+- Exact nibble number/data/**operand** decoder (`bytecode::decode`), fuzzed.
+- Header + trigger + API declarations (`bytecode::parse`): **parses 100% of the
   85 programs**.
 - **Function headers** (`A` records: args, return type, locals+flags, inst/block
-  counts) — **all 134 headers across the 85 files decode cleanly** (27,290
+  counts): **all 134 headers across the 85 files decode cleanly** (27,290
   instructions framed).
 - Bounded, memory-safe interpreter (`bytecode::exec`, public surface in
   `bytecode::runtime`) with the core opcode set, checked memory,
-  instruction/memory/depth budgets, host API surface — proven end-to-end on
+  instruction/memory/depth budgets, host API surface, proven end-to-end on
   constructed programs.
 - Loader integration ("Bytecode programs loaded: N"); fuzz target. Execution is
   **live in the normal scan path**, trigger-gated per program (`lib.rs` calls
@@ -148,13 +169,13 @@ that trade-off** — a real reason to switch.
 - Confirmed: opcode enum + `operand_counts` table; CALL/GEPN read their arg
   count inline; inline-constant operands marked by a `0x4N`/`0x50` lead byte.
 
-**Static decode — done (Phases A + B).**
-- **A — instructions** (`bytecode::instr`): the exact per-instruction framing
+**Static decode: done (Phases A + B).**
+- **A, instructions** (`bytecode::instr`): the exact per-instruction framing
   (terminator marker, `'E'` end-of-function marker, per-opcode operand shapes
   incl. `CALL`/`GEP`/`BRANCH`/`RET`/`ICMP`, `0x4N`/`0x50` inline constants).
-  **Decodes every instruction of all 85 programs** — 134 functions, 27,290
+  **Decodes every instruction of all 85 programs**: 134 functions, 27,290
   instructions; each block consumes exactly to its terminator.
-- **B — types + globals** (`bytecode::types`): the `T` type table and `G`
+- **B, types + globals** (`bytecode::types`): the `T` type table and `G`
   constant globals (with component counting). **Decodes all 85** (1,257
   globals) with no errors.
 
@@ -178,14 +199,14 @@ reported inside bytecode execution.
 
 ## Real-world importance of the 85 programs
 
-Numerically tiny — 85 of ~3.7M signatures (0.002%) — but uneven in value:
+Numerically tiny (85 of ~3.7M signatures, 0.002%), but uneven in value:
 
 - **Unpackers (~6, `BC.Win.Packer`/`Packed`) matter most.** Some
   of ClamAV's unpacking is *implemented as bytecode*; an unpacker deobfuscates a
   packed PE so the other ~3.7M signatures can match the payload. Missing one
-  silently weakens detection across *many* packed samples — far beyond one sig.
+  silently weakens detection across *many* packed samples, far beyond one sig.
 - **Polymorphic / entry-point-obfuscated families** (`BC.Win.Virus` Xpaj,
-  `Ransom`) — per-sample algorithmic checks static sigs can't express; each
+  `Ransom`): per-sample algorithmic checks static sigs can't express; each
   catches a whole family.
 - **The long tail is legacy.** 36/85 are literally `BC.Legacy.Exploit` for
   2010–2012 CVEs (one notable still-in-the-wild exception: CVE-2012-0158, the
@@ -194,7 +215,7 @@ Numerically tiny — 85 of ~3.7M signatures (0.002%) — but uneven in value:
 
 Implication for the roadmap: prioritize the **unpacker and polymorphic-family**
 bytecodes (broad, current impact); the 36 single-CVE legacy checks are low
-priority. And note the bigger picture — the **detection delta** from 85 mostly-
+priority. And note the bigger picture: the **detection delta** from 85 mostly-
 legacy programs is modest, so exav's headline win here is the **memory-safe,
 non-JIT sandbox** (removing the RCE class), more than the raw extra coverage.
 

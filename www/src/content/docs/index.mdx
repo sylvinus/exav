@@ -18,11 +18,9 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-exav is a malware scanner written in memory-safe Rust: one MIT-licensed binary
-with a native YARA engine. It reads ClamAV's signature databases, answers the
-`clamd` and ICAP protocols and prints `clamscan`'s output format, so it drops into
-an existing ClamAV setup. Its flags are its own: a `clamscan` flag exav lacks
-stops the run rather than being ignored (see the
+exav reads ClamAV's signature databases, answers the `clamd` and ICAP protocols
+and prints `clamscan`'s output format. Its flags are its own: a `clamscan` flag
+exav lacks stops the run rather than being ignored (see the
 [flag matrix](/reference/clamav-flag-matrix/)).
 
 <CardGrid>
@@ -44,8 +42,8 @@ stops the run rather than being ignored (see the
   </Card>
   <Card title="Drop-in compatible" icon="random">
     Loads existing `.cvd`/`.ndb`/`.ldb`/`.hdb`/YARA signature databases and
-    answers the `clamd` protocol, so `clamdscan`, milters and existing tooling
-    talk to exav unchanged.
+    answers the `clamd` and ICAP protocols, so `clamdscan`, milters, proxies and
+    existing tooling talk to exav unchanged.
   </Card>
   <Card title="Prebuilt `.exavdb`" icon="download">
     Compile a large signature set once, then load it quickly and with far less
@@ -75,7 +73,7 @@ fuzzed, but a scanner earns trust from use, and it has not had much yet. Please
 
 <CardGrid>
   <LinkCard title="Why exav exists" href="/getting-started/introduction/" description="What exav is, and the rule it is built around." />
-  <LinkCard title="Install" href="/getting-started/installation/" description="Build from source, packages, containers, and the WASM module." />
+  <LinkCard title="Install" href="/getting-started/installation/" description="Prebuilt binaries, cargo, source builds, packages, containers, and the WASM module." />
   <LinkCard title="Quick start" href="/getting-started/quick-start/" description="Get signatures, run a first scan, read the output." />
   <LinkCard title="Design principles" href="/concepts/design-principles/" description="Memory safety, no runtime code generation, bounded work, never a silent clean." />
 </CardGrid>

@@ -19,7 +19,6 @@ description = "Core engine for the exav malware scanner: signature-database pars
 exclude = ["tests/fixtures/**"]
 
 [dependencies]
-aho-corasick.workspace = true
 # typed error type
 thiserror = "2"
 # fast substring search (SIMD memmem) for the bytecode file_find/memstr APIs
@@ -41,7 +40,7 @@ exav-x86 = { path = "../exav-x86", version = "0.0.2" }
 # loading any signature database needs both.
 exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["gzip", "tar"] }
 # fuzzy hashing
-tlsh2 = { version = "0.4", features = ["diff"] }
+tlsh2 = { version = "1", features = ["diff"] }
 # image fuzzy hashing (ClamAV `fuzzy_img#` subsigs). The pinned versions are the
 # ones named in ClamAV's published dependency manifest, so the decode + Lanczos3
 # resize + DCT-II produce byte-identical hashes. `image` is held at 0.24.x for
@@ -51,8 +50,7 @@ image = { version = "0.24", default-features = false, features = ["png", "jpeg",
 rustdct = "0.7"
 transpose = "0.2"
 # HTTP(S) range-request backend (optional)
-ureq = { version = "2", optional = true }
-daachorse = "3"
+ureq = { version = "3", optional = true }
 # Anchor-frequency counting at database build: tens of millions of u64 gram
 # keys, where the hash is the whole cost of the lookup.
 rustc-hash = "2"
@@ -91,10 +89,8 @@ regex-automata = "0.4"
 regex-syntax = "0.8"
 # base64 alphabet handling for the `base64`/`base64wide` string modifiers.
 base64 = { version = "0.22", optional = true }
-# The parser returns byte strings as `bstr` types.
-bstr = { version = "1", optional = true }
-# crc32/checksum32 for the `hash` module.
-crc32fast = { version = "1", optional = true }
+# The database file's checksum, and crc32/checksum32 for YARA's `hash` module.
+crc32fast = "1"
 # JSON output for the WASI binary (`wasi-bin`), nothing else.
 serde_json = { version = "1.0.140", optional = true }
 
@@ -103,7 +99,7 @@ default = ["yara", "all-formats", "decrypt", "dlp", "phishing"]
 # Full YARA rule matching (the native in-tree engine under `src/yara/`). On by
 # default; disable for a smaller build that stores but never matches `.yar`/
 # `.yara` rules (the `YaraDb` type stays present for the on-disk format).
-yara = ["dep:yara-x-parser", "dep:base64", "dep:bstr", "dep:crc32fast"]
+yara = ["dep:yara-x-parser", "dep:base64"]
 
 # Opt-in DLP structured-data heuristic (credit-card / SSN counting, ClamAV's
 # `--structured-*-count`). Tiny, pure-Rust, no extra deps; on by default. The
@@ -226,7 +222,7 @@ wasi-bin = ["dep:serde_json"]
 # the note there): the ready-made crates bring `rustix` + `linux-raw-sys` and
 # their thousands of unsafe blocks along for a page of `std::fs`.
 # only for building test ZIPs in unit tests
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # test fixtures only: build gzip/tar CVD fixtures + gzip scan inputs.
 # `default-features = false` turns off tar's `xattr` support, which is for
 # restoring extended attributes to a real filesystem (these fixtures are built
@@ -286,6 +282,10 @@ required-features = ["unstable-internals"]
 
 [[example]]
 name = "triage_bc"
+required-features = ["unstable-internals"]
+
+[[example]]
+name = "sweepbench"
 required-features = ["unstable-internals"]
 
 # The YARA engine lives behind the `yara` feature, so the targets that drive it

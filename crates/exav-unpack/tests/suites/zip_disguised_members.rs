@@ -123,7 +123,7 @@ const PAYLOAD: &[u8] = b"payload-that-must-be-scanned";
 ///
 /// From a live JAR: `kingDavid/9.class/` held a real compressed Java class. The
 /// JVM loads it by name; `unzip`, python's `extractall` and the `zip` crate all
-/// call it a directory and discard it — so the malware inside was never scanned.
+/// call it a directory and discard it, so the malware inside was never scanned.
 #[test]
 fn slash_named_member_with_content_is_extracted() {
     let blob = zip_stored(&[("pkg/9.class/", PAYLOAD, 0, crc32(PAYLOAD))]);
@@ -170,12 +170,12 @@ fn genuine_directory_entry_is_still_skipped() {
     );
 }
 
-/// A member flagged encrypted whose bytes are in fact cleartext — proven by the
-/// CRC-32 in its own header — must be scanned, not reported password-protected.
+/// A member flagged encrypted whose bytes are in fact cleartext (proven by the
+/// CRC-32 in its own header) must be scanned, not reported password-protected.
 ///
 /// From live APKs: the packer sets bit 0 on *every* member (Android's ZIP reader
 /// ignores it), so scanners decline an archive the platform installs happily.
-/// Reporting it is not good enough here — the report is exactly what the packer
+/// Reporting it is not good enough here: the report is exactly what the packer
 /// is buying.
 #[test]
 fn lying_encryption_flag_is_seen_through() {
@@ -197,13 +197,65 @@ fn lying_encryption_flag_is_seen_through() {
     );
 }
 
+/// Typing a ZIP that is not held in memory, then walking it without reading its
+/// members, reads its start, directory and headers, not the members' bytes: a
+/// listing over a network or browser reader must not fetch the whole archive.
+#[test]
+fn listing_a_zip_through_a_reader_skips_its_members() {
+    use exav_unpack::source::BlockCache;
+    use std::cell::Cell;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::rc::Rc;
+
+    struct Counting(Cursor<Vec<u8>>, Rc<Cell<usize>>);
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.set(self.1.get() + n);
+            Ok(n)
+        }
+    }
+    impl Seek for Counting {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(to)
+        }
+    }
+
+    let (one, two) = (vec![1u8; 1 << 20], vec![2u8; 1 << 20]);
+    let blob = zip_stored(&[
+        ("one.bin", &one, 0, crc32(&one)),
+        ("two.bin", &two, 0, crc32(&two)),
+    ]);
+    let read = Rc::new(Cell::new(0));
+    let cache = BlockCache::new(Counting(Cursor::new(blob.clone()), read.clone())).unwrap();
+    assert_eq!(exav_unpack::detect(&cache), Some(Format::Zip));
+    let mut names = Vec::new();
+    let walked = walk(
+        Format::Zip,
+        &cache,
+        &mut Budget::new(Limits::default()),
+        &mut |meta, _, _| {
+            names.push(meta.name.clone());
+            None::<()>
+        },
+    );
+    assert!(walked.is_ok(), "{walked:?}");
+    assert_eq!(names, ["one.bin", "two.bin"]);
+    assert!(
+        read.get() < blob.len() / 2,
+        "listing read {} of the archive's {} bytes",
+        read.get(),
+        blob.len()
+    );
+}
+
 /// The guard must not swing the other way: a member whose contents do NOT match
 /// the declared CRC is truly encrypted (or corrupt), and is still reported
 /// rather than handed over as though it were cleartext.
 #[test]
 fn real_encryption_is_still_reported() {
     // Plausible ciphertext: bytes that are not the payload, with the CRC of the
-    // plaintext — exactly what a real encrypted member looks like from outside.
+    // plaintext: exactly what a real encrypted member looks like from outside.
     let cipher = b"\x9f\x2a\x71\xc3\x04\xde\x88\x10\x55\xab\xcd\xef\x01\x23\x45\x67";
     let blob = zip_stored(&[("secret.bin", cipher, 0x0001, crc32(PAYLOAD))]);
 

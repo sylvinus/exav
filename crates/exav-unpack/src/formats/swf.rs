@@ -38,8 +38,7 @@ pub(crate) fn walk<T>(
         name: "movie.swf".to_string(),
         comp_size: (src.len() as u64).saturating_sub(8),
         size: Some(u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64),
-        encrypted: false,
-        unsupported: None,
+        ..MemberMeta::default()
     };
     if &hdr[0..3] == b"CWS" {
         let body = flate2::read::ZlibDecoder::new(Reader::range(src, 8, src.len()));

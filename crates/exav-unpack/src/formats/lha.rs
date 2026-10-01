@@ -86,8 +86,7 @@ pub(crate) fn walk<T>(
                 name: header.parse_pathname_to_str(),
                 comp_size: header.compressed_size,
                 size: Some(header.original_size),
-                encrypted: false,
-                unsupported: None,
+                ..MemberMeta::default()
             };
             let visited = if dec.is_decoder_supported() {
                 emit_stream(&meta, &mut dec, budget, visit)?

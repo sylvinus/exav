@@ -1,4 +1,4 @@
-//! Authenticode (PE code-signing) inspection — **triage without RSA**.
+//! Authenticode (PE code-signing) inspection: **triage without RSA**.
 //!
 //! A signed PE carries a PKCS#7 `SignedData` blob (in the certificate table)
 //! whose `SpcIndirectDataContent` embeds a digest of the file. We extract that
@@ -7,14 +7,14 @@
 //!   * `goblin` (already a dependency) for the certificate table + the byte
 //!     ranges to hash ([`goblin::pe::PE::authenticode_ranges`]);
 //!   * `sha1`/`sha2` (already dependencies) for the hash + thumbprint;
-//!   * a small **vendored** DER reader (the `der` module) — so no `rsa`/`der`/`x509`/`nom`
+//!   * a small **vendored** DER reader (the `der` module), so no `rsa`/`der`/`x509`/`nom`
 //!     crate enters the tree and everything stays `#![forbid(unsafe_code)]`.
 //!
 //! What this gives, with no signature-verification crypto:
 //!   * **digest-covers-file**: recomputed hash vs the embedded digest. A mismatch
-//!     means the file was modified/appended-to after signing — a strong signal.
+//!     means the file was modified/appended-to after signing, a strong signal.
 //!   * signer identity (subject/issuer CN, serial, SHA-1 thumbprint) and whether
-//!     the leaf is **self-signed** — for reporting and `.crb` cert matching.
+//!     the leaf is **self-signed**, for reporting and `.crb` cert matching.
 //!
 //! What it does not do yet: verify that the digest was actually signed by the
 //! certificate's private key. That needs RSA/ECDSA (see `docs/DEPENDENCIES.md`),
@@ -47,7 +47,7 @@ pub struct CertInfo {
     pub self_signed: bool,
     /// SHA-1 of the whole certificate DER (the "thumbprint").
     pub sha1_thumbprint: [u8; 20],
-    /// SHA-1 of the subject `Name` DER (tag+length+value) — the key a ClamAV
+    /// SHA-1 of the subject `Name` DER (tag+length+value): the key a ClamAV
     /// `.crb` entry matches its `Subject` field against.
     pub subject_sha1: [u8; 20],
 }
@@ -56,7 +56,7 @@ pub struct CertInfo {
 #[derive(Clone, Debug)]
 pub struct PeSignature {
     /// The recomputed Authenticode hash equals the digest embedded in the
-    /// signature — i.e. the signature covers the current file bytes.
+    /// signature, i.e. the signature covers the current file bytes.
     pub digest_matches: bool,
     /// The signer (leaf) certificate.
     pub signer: CertInfo,
@@ -79,7 +79,7 @@ struct CrbEntry {
 /// A ClamAV `.crb` certificate database. We honour **block** entries
 /// (`Trusted == 0`) only: a signed PE carrying a matching certificate is
 /// reported. Trust/whitelist entries (`Trusted == 1`) are ignored, since honoring
-/// them safely would require verifying the RSA signature chain (out of scope —
+/// them safely would require verifying the RSA signature chain (out of scope;
 /// see the module docs).
 #[derive(Default, Debug)]
 pub struct CrbDb {
@@ -110,7 +110,7 @@ impl CrbDb {
 
     /// Parse `.crb` text into this database. Format (`;`-separated):
     /// `Name;Trusted;Subject;Serial;PublicKey;Exp;CodeSign;TimeSign;CertSign;NotBefore;Comment`.
-    /// Malformed lines are skipped (best effort — a bad line never aborts a load).
+    /// Malformed lines are skipped (best effort: a bad line never aborts a load).
     pub fn parse_into(&mut self, text: &str) {
         self.sources.push(text.to_string());
         for line in text.lines() {
@@ -574,8 +574,8 @@ mod tests {
     }
 
     /// End-to-end: a PE whose embedded Authenticode digest is of *other* bytes
-    /// (not this file) is detected as a signature that does NOT cover the file —
-    /// the append-after-signing / tampering signal — while the signer identity is
+    /// (not this file) is detected as a signature that does NOT cover the file
+    /// (the append-after-signing / tampering signal), while the signer identity is
     /// still recovered. Exercises goblin cert discovery + the vendored parser +
     /// the hash recompute + mismatch detection.
     #[test]
@@ -594,6 +594,10 @@ mod tests {
     /// image whose section runs past the end of the file, on which goblin
     /// panics, is a signature that does not cover it.
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "a panic aborts under WASI, so goblin's cannot be caught"
+    )]
     fn hashed_ranges_follow_goblin_and_refuse_what_does_not_fit() {
         let pe = fixture("signed_mismatch.exe");
         let parsed = goblin::pe::PE::parse(&pe).unwrap();

@@ -100,7 +100,7 @@ use crate::Scanner;
 pub struct Builder {
     /// The full in-memory engine, fed signature text file-by-file so the raw
     /// text is dropped as it's compiled (rather than concatenated and held
-    /// alive through the memory-heavy automaton build).
+    /// alive through the index build).
     engine: EngineBuilder,
     hashes: HashDb,
     sections: SectionHashDb,
@@ -134,11 +134,6 @@ pub struct Builder {
     /// Passwords parsed from `.pwdb` files, used to decrypt encrypted archive
     /// members. User-supplied (the official CVDs ship no `.pwdb`).
     passwords: Vec<String>,
-    /// Optional per-shard memory budget for the signature-automaton build
-    /// (`--build-shard-bytes`). `None` = build each partition as a single
-    /// automaton (fastest). A budget shards large partitions so a huge set
-    /// (`main+daily`) can build on a small host. Affects `--build-db` builds.
-    max_build_mem: Option<u64>,
     /// Version + build-time of the newest loaded `.cvd`/`.cld` container, for the
     /// clamd-compatible daemon `VERSION` reply. See [`Scanner::db_version`].
     db_version: Option<(u32, String)>,
@@ -163,12 +158,6 @@ impl Builder {
     pub fn set_detect_pua(&mut self, on: bool) {
         self.detect_pua = on;
         self.engine.set_detect_pua(on);
-    }
-
-    /// Set the per-shard automaton-build memory budget (`--build-shard-bytes`).
-    /// `None` (default) builds each partition as one automaton.
-    pub fn set_max_build_mem(&mut self, bytes: Option<u64>) {
-        self.max_build_mem = bytes;
     }
 
     /// Retained for API/CLI compatibility (`--clamav-compat`). The unofficial
@@ -300,13 +289,14 @@ impl Builder {
             "ndb" | "ndu" => self.engine.add_ndb(text, unofficial),
             // Literal `Name=HEX` signatures.
             "db" => {
-                if let Ok(pats) = crate::patterns::parse_simple(text) {
-                    for (name, bytes) in pats {
-                        if name.starts_with("PUA.") && !self.detect_pua {
-                            continue;
-                        }
-                        self.engine.add_literal_prov(&name, &bytes, unofficial);
+                let (pats, skipped) = crate::patterns::parse_simple(text);
+                self.engine
+                    .skip_unloadable("db line not Name=plain hex", skipped);
+                for (name, bytes) in pats {
+                    if name.starts_with("PUA.") && !self.detect_pua {
+                        continue;
                     }
+                    self.engine.add_literal_prov(&name, &bytes, unofficial);
                 }
             }
             "hdb" | "hsb" | "hdu" | "hsu" => self.hashes.extend_from_text_prov(text, unofficial),
@@ -359,11 +349,14 @@ impl Builder {
             // signature-name / target-description scoping is not yet applied
             // (every loaded password is tried against every encrypted member).
             "pwdb" => parse_pwdb_into(text, &mut self.passwords),
-            // Bytecode programs: keep the raw text; parsing + gating happens at
-            // build() (the runtime drops any that fail to parse).
+            // Bytecode programs: keep the raw text of those that parse, for
+            // build(); one that does not is counted unsupported.
             "cbc" if crate::bytecode::parse(text).is_ok() => {
                 self.bytecode_sources.push(text.to_string());
             }
+            "cbc" => self
+                .engine
+                .skip_unloadable("bytecode program does not parse", 1),
             _ => {}
         }
     }
@@ -373,9 +366,9 @@ impl Builder {
     pub fn build(mut self) -> Result<Scanner, LoadError> {
         self.engine.add_literal("Eicar-Test-Signature", eicar());
 
-        // Sort + intern the hash tables BEFORE building the (memory-heavy)
-        // automaton: finalize collapses millions of per-entry strings into one
-        // buffer, so that transient doesn't coexist with the build's peak.
+        // Sort + intern the hash tables BEFORE building the signature index:
+        // finalize collapses millions of per-entry strings into one buffer, so
+        // that transient doesn't coexist with the build's peak.
         let mut hashes = self.hashes;
         let mut sections = self.sections;
         let mut allow = self.allow;
@@ -391,7 +384,7 @@ impl Builder {
             self.bytecode_sources,
             &mut self.engine,
         );
-        let engine = self.engine.build_with_budget(self.max_build_mem);
+        let engine = self.engine.build();
 
         Ok(Scanner {
             engine,
@@ -478,7 +471,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Load a database from a file/dir path (convenience). A prebuilt exav database
 /// file (see [`crate::database`]) is detected by its magic tag and loaded
-/// directly, skipping signature parsing and automaton construction.
+/// directly, skipping signature parsing and the index build.
 pub fn load(path: &Path) -> Result<Scanner, LoadError> {
     load_with_pua(path, false)
 }
@@ -500,17 +493,6 @@ pub fn load_with_options(
     detect_pua: bool,
     unofficial_suffix: bool,
 ) -> Result<Scanner, LoadError> {
-    load_with_options_mem(path, detect_pua, unofficial_suffix, None)
-}
-
-/// As [`load_with_options`], with a per-shard automaton-build memory budget
-/// (`--build-shard-bytes`). Ignored when `path` is a prebuilt database file.
-pub fn load_with_options_mem(
-    path: &Path,
-    detect_pua: bool,
-    unofficial_suffix: bool,
-    max_build_mem: Option<u64>,
-) -> Result<Scanner, LoadError> {
     if path.is_file() && crate::database::is_database_file(path) {
         return crate::database::load(path).map_err(|e| LoadError::Database {
             path: path.display().to_string(),
@@ -528,7 +510,6 @@ pub fn load_with_options_mem(
     let mut builder = Builder::new();
     builder.set_detect_pua(detect_pua);
     builder.set_unofficial_suffix(unofficial_suffix);
-    builder.set_max_build_mem(max_build_mem);
     builder.add_path(path)?;
     let prebuilt = builder.prebuilt_skipped.take();
     let scanner = builder.build()?;
@@ -593,6 +574,10 @@ mod tests {
     /// typo, or a directory whose only database is a prebuilt one (which loads
     /// by its own path).
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
     fn a_path_that_loads_nothing_is_an_error() {
         let dir = std::env::temp_dir().join(format!("exav-loader-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -658,6 +643,28 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         assert_eq!(db.passwords, vec!["hunter2".to_string()]);
     }
 
+    /// A `.db` line that does not parse is skipped and counted on its own, and
+    /// the file's other signatures still load. A `.cbc` program that does not
+    /// parse is counted too.
+    #[test]
+    fn an_unloadable_db_line_or_cbc_program_is_counted() {
+        let mut b = Builder::new();
+        b.add_named_bytes(
+            "x.db",
+            b"Test.Good=6d616c776172652d676f6f64\nTest.Wild=6d61??6c\nno separator\n",
+            false,
+        );
+        b.add_named_bytes("y.cbc", b"not a bytecode program\n", false);
+        let db = b.build().unwrap();
+        assert_eq!(db.unsupported_count(), 3);
+        let report = crate::analyze(&db, b"xx malware-good xx", &crate::ScanOptions::default());
+        assert!(
+            matches!(&report.verdict, crate::Verdict::Infected { signature, .. } if signature == "Test.Good"),
+            "{:?}",
+            report.verdict
+        );
+    }
+
     #[test]
     #[cfg_attr(
         target_family = "wasm",
@@ -671,7 +678,11 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         )
         .unwrap();
         let d = crate::hashes::digests_of(b"x");
-        std::fs::write(dir.path().join("b.hdb"), format!("{}:*:Sig.H\n", d.md5)).unwrap();
+        std::fs::write(
+            dir.path().join("b.hdb"),
+            format!("{}:*:Sig.H\n", d.md5_hex()),
+        )
+        .unwrap();
         let mut f = std::fs::File::create(dir.path().join("c.fdb")).unwrap();
         writeln!(f, "imphash:abcd:Sig.F").unwrap();
 

@@ -946,8 +946,8 @@ pub(crate) fn stream_udf<R: Read + Seek, T>(
                     name: path,
                     comp_size: size,
                     size: Some(size),
-                    encrypted: false,
                     unsupported: Some(reason),
+                    ..MemberMeta::default()
                 };
                 Ok(visit(&meta, None, budget))
             }
@@ -956,8 +956,7 @@ pub(crate) fn stream_udf<R: Read + Seek, T>(
                     name: path,
                     comp_size: size,
                     size: Some(size),
-                    encrypted: false,
-                    unsupported: None,
+                    ..MemberMeta::default()
                 };
                 let mut reader = RunReader {
                     img,

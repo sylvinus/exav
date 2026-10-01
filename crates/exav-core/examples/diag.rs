@@ -38,7 +38,7 @@ fn main() {
     }
     eprintln!("  REAL scan (min of 5): {real_ms:.1} ms");
 
-    // Automaton pass alone (no verification), min of 3.
+    // Anchor search alone (no verification), min of 3.
     let mut ac_ms = f64::MAX;
     let mut ac_hits = 0;
     for _ in 0..3 {
@@ -46,7 +46,7 @@ fn main() {
         ac_hits = db.engine().scan_diag_hits(&data, ft);
         ac_ms = ac_ms.min(t.elapsed().as_secs_f64() * 1000.0);
     }
-    eprintln!("  AC pass only (min of 3): {ac_ms:.1} ms for {ac_hits} hits");
+    eprintln!("  anchor search only (min of 3): {ac_ms:.1} ms for {ac_hits} hits");
 
     let t = Instant::now();
     let d = db.engine().scan_diag(&data, ft, layout.as_ref());

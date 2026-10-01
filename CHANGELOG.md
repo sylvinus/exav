@@ -29,7 +29,33 @@ follow [semantic versioning](https://semver.org/).
   `compress` (`.Z`) are decoded as they are read, as gzip is, instead of
   whole.
 - `--all-matches` and `ALLMATCHSCAN` list every detection at any size; past
-  `--max-object-bytes` they fell back to a single match.
+  `--max-object-bytes` they fell back to a single match. Past
+  `--max-input-bytes` they list what the first bytes hold and report the rest
+  unscanned, as a single-match scan does; they fell back to a single match
+  there too, without saying the search stopped short.
+- Every environment variable without a flag is named `EXAV_DEBUG_*`:
+  `EXAV_BC_WARN`, `EXAV_BC_TRACE`, `EXAV_BC_FN` and `EXAV_FORCED` are
+  `EXAV_DEBUG_BC_WARN`, `EXAV_DEBUG_BC_TRACE`, `EXAV_DEBUG_BC_FN` and
+  `EXAV_DEBUG_BC_FORCED`; `EXAV_YR_BIN`, `EXAV_YARA_CORPUS` and
+  `EXAV_YARA_BENCH_RULES` (tests and examples) are `EXAV_DEBUG_YR_BIN`,
+  `EXAV_DEBUG_YARA_CORPUS` and `EXAV_DEBUG_YARA_BENCH_RULES`.
+  `EXAV_SPLIT_MATCH`, `EXAV_VERIFY_BUDGET`, `EXAV_SIM_BUDGET` and
+  `EXAV_YARA_NO_GATE` are gone, along with the backtracking signature verifier
+  `EXAV_SPLIT_MATCH=0` selected.
+- The `exav-unpack` command has `unzip`'s command line, as a subset: every
+  option it takes means what it means to Info-ZIP `unzip` 6.00 (`-l`, `-t`,
+  `-p`, `-c`, `-Z1`, `-d`, `-x`, `-o`, `-n`, `-P`, `-j`, `-C`, `-q`, `-D`), an
+  `unzip` option it does not take is an error, and its exit statuses are
+  `unzip`'s. `exav-unpack ARCHIVE` extracts; the `list` and `extract`
+  subcommands are gone (`-l`; `-d DIR`). It extracts every format the library
+  reads, writes each member as it is decoded rather than holding the archive
+  and its members in memory, restores ZIP and tar times, permission bits and
+  symbolic links, never writes through a link, and asks before replacing a
+  file. A ZIP split by `zip -s` (`.z01`, ..., `.zip`) and a RAR volume set
+  (`.part1.rar`, ... or `.rar`, `.r00`, ...) are read from any part, and
+  `--volume` names parts that are elsewhere.
+- Releases carry `exav-unpack`, `exav-grep` and `exav-pe-emu` archives beside
+  `exav`'s, and every archive carries `LICENSE` and `NOTICE`.
 - A YARA pattern keeps at most a million matches, as yara-x does; one with more
   makes the scan `LIMITS-EXCEEDED` unless a rule matches.
 - exav-core: `ScanOptions::spill` gives a scan somewhere to write what it makes
@@ -50,7 +76,7 @@ follow [semantic versioning](https://semver.org/).
   - YARA's filename externals are set for a top-level archive and under
     `--all-matches`, as for any other top-level file.
   - The signature engine is the only matcher: the separate literal automaton
-    for large inputs is gone. The `.exavdb` format is at version 5; rebuild
+    for large inputs is gone. The `.exavdb` format is at version 4; rebuild
     with `--build-db`.
 - exav-unpack: `walk(fmt, source, budget, visit)` is the one walk. A member
   comes as `Member::Bytes` or, decoded as it is read, `Member::Stream`;
@@ -130,7 +156,34 @@ follow [semantic versioning](https://semver.org/).
 - A scan that fails behind the ICAP listener is a block, with
   `X-Exav-Status: ERROR` and `Heuristics.Exav.ScanError`.
 - A bytecode program that runs out of instructions makes the scan
-  `LIMITS-EXCEEDED` unless something else is found.
+  `LIMITS-EXCEEDED` unless something else is found. So does one stopped by an
+  opcode or host API exav does not model, or by the interpreter's call-depth or
+  frame-size cap; its result was discarded as though it had found nothing. A
+  program's own fault (an out-of-bounds access, a division by zero) is still
+  discarded, as ClamAV discards it.
+- Bytecode follows ClamAV 1.4.3 in four more places:
+  - A program that aborts has its detection discarded; it was reported.
+  - `malloc` returns NULL from 128 MiB less 8 bytes; it allocated up to
+    256 MiB.
+  - `__clambc_pedata` reads as zeros on a file that is not a PE; reading it
+    discarded the program's result. On a PE that exav has no header data for
+    (too large to load, or not parsed), it makes the scan `LIMITS-EXCEEDED`
+    unless something else is found.
+  - What a program wrote before its run failed is scanned; it was dropped
+    with the program's detection. A program that asks `disasm_x86` about bytes
+    the decoder does not know now stops there, so nothing it writes after that
+    point is scanned.
+- A bytecode program that writes more than 256 MiB into one extracted file
+  makes the scan `LIMITS-EXCEEDED` unless something else is found; the rest
+  of its output was dropped silently.
+- A bytecode `write` fails with -1 once one extracted file would pass
+  `--max-object-bytes`, or the run's output would pass what is left of
+  `--max-matcher-bytes`, as ClamAV's does at its file and scan size limits.
+  The program carries on and the scan is `LIMITS-EXCEEDED` unless something
+  else is found; the write used to succeed.
+- The `docker-compose.yml` example publishes the clamd port on localhost only.
+- `make lint` runs the clippy passes CI runs, and `make test-www` checks that
+  every internal link and anchor of the documentation site resolves.
 - A signature path that loads nothing is an error: one that does not exist, or a
   directory holding only a prebuilt `.exavdb` (load that with `-d`).
 - `clamscan`'s `--alert-encrypted`, `--alert-encrypted-archive`,
@@ -144,16 +197,26 @@ follow [semantic versioning](https://semver.org/).
 - A build without the `yara` feature warns when rule files are loaded; they
   never match.
 - A long run of one byte value costs the signature engine about what its first
-  few hundred bytes do. Once more of the byte has been read than any anchor
-  holds, the automaton skips the rest of the run, and a signature anchored
-  inside it is checked once for the whole interior and one position at a time
-  only near its edges. Where several matches lie inside one run, a first-match
-  scan may report a different one of them.
+  few hundred bytes do. The search skips the run's interior, and a signature
+  anchored inside it is checked once for the whole interior and one position at
+  a time only near its edges. Where several matches lie inside one run, a
+  first-match scan may report a different one of them.
 - Scanning is faster on ordinary files too:
-  - The automatons a file type runs (four for a PE) advance together, byte
-    by byte, in one read of the object, so the processor waits on their
-    memory at once; case-insensitive ones read the bytes lowercased as they
-    go, with no lowercased copy of the object.
+  - The signature engine finds its signatures through one index of their
+    literal anchors, looked up at each position of the object, instead of
+    running automatons (four for a PE) over it. An anchor longer than five
+    bytes is indexed by the seven of its bytes the signatures share least,
+    looked up at every other position.
+    Case-insensitive anchors are looked up on the bytes
+    lowercased as they are read; the object is copied lowercased only when a
+    case-insensitive signature has to be checked.
+  - A signature whose offset window is at most 4096 bytes wide, counted from
+    the start, the end, the entry point or a section, is checked where it can
+    start, not searched for through the object.
+  - A PE section's MD5 is computed only when a section-hash signature names
+    its size.
+  - The bytecode interpreter lays out a function's values once per run rather
+    than at every call, and reads and writes them whole.
   - Bytecode triggers are matched in the same sweep as every other
     signature, not in a second sweep of their own.
   - A literal a signature searches for after a gap is looked up in the
@@ -167,26 +230,38 @@ follow [semantic versioning](https://semver.org/).
 - An object read through the block cache, such as a large file or one fetched
   over HTTP, is read far fewer times over: format detection's search, carving
   and the digests share one read of it, the signature sweep is a second,
-  carving confirms an archive by its first bytes, and YARA's prefilter runs
-  its automatons in one read and its
-  literal and base64 patterns share another. Over HTTP, a request that
+  carving confirms an archive by its first bytes, and YARA's prefilter looks
+  up its atoms in one read and its literal and base64 patterns share another. Over HTTP, a request that
   continues the previous one fetches twice as much, up to 8 MiB.
-- A prebuilt database loads faster: automatons, anchor groups and the indexes
-  derived from the signatures are stored as the build made them and read back
-  with a copy, the file is read once rather than once to check its digest and
-  again to decode it, and the bodies and logical signatures decode on threads
-  of their own while the automatons are read. The file is smaller.
+- A prebuilt database loads faster: the signature index, anchor groups, hash
+  tables and the indexes derived from the signatures are stored as the build
+  made them and read back with a copy, the file is read once rather than once
+  to check its digest and again to decode it, and the bodies and logical
+  signatures decode on threads of their own while the index is read. The file
+  is smaller, and building it takes less memory. Its trailer is a CRC-32 of the
+  contents instead of a SHA-256: it is there to catch a torn or damaged file,
+  which is all the digest was checked for.
+- `--build-shard-bytes` is removed: the signature index has no automaton to
+  split, and builds in far less memory. The flag, or `EXAV_BUILD_SHARD_BYTES`,
+  stops the run with a message naming the change. exav-core:
+  `loader::load_with_options_mem` and `Builder::set_max_build_mem` are removed.
 - Bytecode triggers are evaluated with the object's container, as every other
   logical signature is, so a trigger with a `Container:` condition can fire.
   exav-core (`unstable-internals`): `BytecodeRuntime::from_sources` adds the
   triggers to the `EngineBuilder` it is given, and `BytecodeRuntime::standalone`
   builds a runtime with an engine of its own, for tools.
-- A first-match scan meets signatures in the order the object's bytes hit
-  them, rather than one file-type automaton after another, so when several
-  match it may report a different one of them. Carving keeps the first
+- A first-match scan meets first the signatures their offsets pin, then the
+  others in the order the object's bytes hit them, rather than one file-type
+  automaton after another, so when several match it may report a different
+  one of them. Carving keeps the first
   candidates of each kind by position when more than its cap are found.
 - The RustCrypto crates move to their current generation (`digest` 0.11,
   `cipher` 0.5: `sha2`, `sha1`, `md-5`, `aes`, `cbc`, `des`, `hmac`, `pbkdf2`).
+- Dependencies: `bincode` (unmaintained, RUSTSEC-2025-0141) and `serde` are
+  gone from `exav-unpack`, the encrypted-DMG header being read field by field;
+  `tlsh2` 1.x; `ureq` 3 for the `http` features, which drops `url` and the ICU
+  crates from that build and, as ureq 3 does by default, follows the
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment.
 
 ### Added
 
@@ -209,9 +284,36 @@ follow [semantic versioning](https://semver.org/).
   it, so that one read serves detection and the caller's searches.
   `exav_unpack::detect_archive_start`: the archive an object starts with, from
   its first bytes alone, for an archive carved out of another object.
+- `exav_unpack::MemberMeta` and `Entry` carry a member's modification time
+  (`Mtime`), Unix mode and link target where ZIP or tar records them, and
+  `MemberMeta::zip_method`; both implement `Default`.
+  `Budget::set_visit_directories` has a walk visit directory entries.
+  `exav_unpack::span::ZipSpan` reads a `zip -s` split set as one archive, and
+  `exav_unpack::join_rar_volumes` joins a RAR volume set into one archive. The
+  `cli` feature (default) builds the `exav-unpack` command and is the only one
+  that pulls in `chrono`.
 
 ### Fixed
 
+- Scanning a URL took a server that answered a range request with the whole
+  object (`200` instead of `206`) as the range, and scanned bytes from the
+  start of the object as though they were from the offset asked for. It is
+  an error now.
+- An encrypted DMG whose header declares a salt longer than 32 bytes or a key
+  blob longer than 64 panicked in its decoder; it is reported corrupt.
+- Typing an archive not held in memory read its first 4 MiB even when its
+  first bytes named it, so exav-unpack-wasm's `Archive.open` over a `File` or a
+  `{ read, size }` reader fetched a small archive whole before listing it.
+- A `.db` file with one line exav cannot read loaded none of its signatures.
+  The line is skipped on its own, and counted with every other signature exav
+  could not load (`Unsupported sigs skipped` in the `-v` summary), as is a
+  `.cbc` program that does not parse.
+- A URL target exav will not scan (no `--allow-http-scan`, or a build without
+  `http-scan`) is written to `--log` and reported as a JSON record, as any other
+  error is.
+- The scan summary's `Data scanned` (`data_scanned_bytes` in JSON) counts the
+  first `--max-input-bytes` of a larger input, the bytes actually scanned,
+  rather than its whole size.
 - A top-level archive now gets the full engine over its own bytes (wildcard and
   logical signatures, YARA, bytecode, whole-file hashes), as a nested one did, on
   every entry point including stdin, `INSTREAM` and ICAP.
@@ -286,8 +388,6 @@ follow [semantic versioning](https://semver.org/).
 - A ZIP member compressed with bzip2, LZMA, zstd, XZ, Deflate64 or PPMd and
   larger than `--max-object-bytes` stopped the walk, so the members after it
   were never scanned. It streams, and spills like any other member.
-- `--build-shard-bytes off` (or `0`) built one automaton per anchor instead of
-  no cap.
 - The daemon's CPU limit (`--max-scan-secs`) applied to a worker's whole life
   rather than to each job: once the jobs a worker had served used it between
   them, the kernel killed the worker in the middle of the next job, however

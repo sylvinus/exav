@@ -106,14 +106,16 @@ fn spawn(state: Arc<Mutex<State>>) -> String {
     format!("http://{addr}")
 }
 
-/// A valid `.exavdb`: magic + version + payload + trailing SHA-256.
+/// The `.exavdb` format version this build loads.
+const EXAVDB_VERSION: u32 = 4;
+
+/// A valid `.exavdb`: magic + version + payload + trailing CRC-32.
 fn exavdb_body() -> Vec<u8> {
-    use sha2::{Digest, Sha256};
     let payload = b"exav test database payload";
     let mut v = b"EXAVDB\x00\x01".to_vec();
-    v.extend_from_slice(&1u32.to_le_bytes());
+    v.extend_from_slice(&EXAVDB_VERSION.to_le_bytes());
     v.extend_from_slice(payload);
-    v.extend_from_slice(Sha256::digest(payload).as_slice());
+    v.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
     v
 }
 
@@ -169,7 +171,7 @@ fn an_oversized_declaration_is_refused_before_the_body_is_read() {
 /// Redirects were untested entirely, which matters because the scheme they may
 /// redirect TO is a security property: an HTTPS source must never be downgraded
 /// to cleartext. That half needs a TLS server to exercise; this pins the part
-/// that can be tested here — that following works at all, and that a completed
+/// that can be tested here: that following works at all, and that a completed
 /// fetch leaves no `.tmp` behind for the next run to trip over.
 #[test]
 fn a_redirect_is_followed_and_leaves_no_temp_file() {
@@ -251,12 +253,11 @@ fn head_etag_short_circuits_and_downloads_on_change() {
 
     // New ETag AND different bytes -> installed.
     {
-        use sha2::{Digest, Sha256};
         let payload = b"a different database payload";
         let mut b = b"EXAVDB\x00\x01".to_vec();
-        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&EXAVDB_VERSION.to_le_bytes());
         b.extend_from_slice(payload);
-        b.extend_from_slice(Sha256::digest(payload).as_slice());
+        b.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
         let mut st = state.lock().unwrap();
         st.etag = "\"v3\"".into();
         st.body = b;
@@ -344,7 +345,7 @@ fn fetch_signature_installs_under_env_namespaced_by_origin() {
     let dest = sig_dest(&dir, &url).unwrap();
     assert!(dest.starts_with(dir.join("env")), "must live under env/");
     // Named for the source, plus a digest of the full URL so two sources that
-    // sanitise to the same name stay apart — the digest sitting in front of the
+    // sanitise to the same name stay apart, the digest sitting in front of the
     // extension, which the loader needs intact to classify the file at all.
     let name = dest.file_name().unwrap().to_string_lossy().into_owned();
     assert!(
@@ -401,7 +402,7 @@ fn sig_dest_namespaces_by_origin_and_resists_traversal() {
 
     // The extension survives the digest, for every source and every suffix. The
     // loader routes a database file by extension and nothing else, so a name it
-    // cannot classify is skipped without a word — a fetch that reports success
+    // cannot classify is skipped without a word: a fetch that reports success
     // and a database that never loads. Whatever the digest does to the name, it
     // must not touch the part the loader reads.
     for (url, want) in [
@@ -508,7 +509,7 @@ fn prune_env_sources_drops_deconfigured_and_keeps_the_rest() {
 #[test]
 fn redownloads_when_dest_deleted_despite_matching_validator() {
     // The validator ("v1") is unchanged, but the on-disk file was deleted out from
-    // under us. The HEAD/ETag shortcut must NOT report Unchanged — it must notice
+    // under us. The HEAD/ETag shortcut must NOT report Unchanged: it must notice
     // the file is gone and re-download, so a deleted DB self-heals without a restart.
     let state = Arc::new(Mutex::new(State {
         etag: "\"v1\"".into(),

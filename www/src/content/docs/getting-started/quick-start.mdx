@@ -18,81 +18,87 @@ signatures loaded it refuses to run. Fetching signatures is the first step below
 1. **Get ClamAV signatures** with Cisco's own updater:
 
    ```sh
-   pipx install cvdupdate      # or `pip install --user cvdupdate`
+   pipx install cvdupdate
    cvd update
    ```
 
    This populates `~/.cvdupdate/database` with `main.cvd`, `daily.cvd` and
-   `bytecode.cvd`. If `freshclam` already keeps a database current, use its
-   directory instead (usually `/var/lib/clamav`) in the commands below. See
-   [Signatures](/guides/signatures/) for the licensing background and
-   third-party feeds.
+   `bytecode.cvd`. See [Signatures](/guides/signatures/) for the licensing
+   background and third-party feeds.
 
-2. **Check that detection works** with the EICAR test file, which every scanner
-   detects and which is harmless:
+2. **Tell exav where they are.** exav loads `--sig-dir` (default
+   `/var/lib/exav`) when `-d` is not given; point it at the new directory once
+   for this shell:
+
+   ```sh
+   export EXAV_SIG_DIR=~/.cvdupdate/database
+   ```
+
+   If `freshclam` already keeps a database current, use its directory instead
+   (usually `/var/lib/clamav`).
+
+3. **Check that detection works** with the EICAR test file, which is harmless:
 
    ```sh
    printf '%s%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-' \
      'TEST-FILE!$H+H*' > eicar.com
-   exav -d ~/.cvdupdate/database eicar.com
+   exav eicar.com
    ```
 
    ```console
    eicar.com: Eicar-Test-Signature FOUND
    ```
 
-3. **Scan a file.** The output follows `clamscan`'s format:
+   A `SCAN SUMMARY` block follows the result lines. This first run parses the raw signatures, which takes a while and needs
+   memory to spare (see [what it costs](/guides/prebuilt-database/#what-it-costs)).
+   If the process dies with no message, it ran out of memory. exav always knows
+   EICAR, so the check that the ClamAV signatures loaded is `Known viruses` in
+   the summary: it should be in the millions.
+
+4. **Scan a file.** The output follows `clamscan`'s format:
 
    ```sh
-   exav -d ~/.cvdupdate/database suspicious.bin
+   exav suspicious.bin
    ```
 
    ```console
    suspicious.bin: OK
    ```
 
-4. **Scan a directory.** It is recursive by default; `--quiet` prints only
+5. **Scan a directory.** It is recursive by default; `--quiet` prints only
    detections, partial results and errors:
 
    ```sh
-   exav -d ~/.cvdupdate/database --quiet /var/www
+   exav --quiet /var/www
    ```
 
-5. **Scan stdin** with `-`:
+6. **Scan stdin** with `-`:
 
    ```sh
-   cat backup.tar.gz | exav -d ~/.cvdupdate/database -
+   cat backup.tar.gz | exav -
    ```
 
 </Steps>
 
 ## Exit codes
 
-The status is the last word on each result line, and each status has an exit
-code: `0` for `OK`, `1` for `FOUND`, `2` for `ERROR` (exav could not do its job),
-and `3` for `PARTIAL` (something could not be fully examined).
-
-<Aside type="note">
-`clamscan` reports `OK` and exits `0` for a file it could not fully scan; exav
-exits `3`, so a CI job should not treat `3` as a pass. See
-[Verdicts & exit codes](/reference/verdicts/), and
-[`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes) to map `3` to
-another status.
-</Aside>
+The status is the last word on each result line: `0` `OK`, `1` `FOUND`, `2`
+`ERROR` (exav could not do its job), `3` `PARTIAL` (something could not be fully
+examined, where `clamscan` would say `OK`). A CI job should not treat `3` as a
+pass. See [which code a run exits with](/reference/verdicts/#process-exit-code).
 
 ## Faster startup: build a database once
 
-Loading Cisco's raw database (`main.cvd` + `daily.cvd`) builds a large in-memory
-automaton, which takes time and several GB of transient RAM. Do it once and reuse
-the result:
+Loading the raw signatures parses millions of them on every start. Do it once
+and reuse the result:
 
 ```sh
-exav -d ~/.cvdupdate/database --build-db exav.exavdb   # heavy, run daily in CI
-exav -d exav.exavdb /data                              # fast cold start
+exav --build-db exav.exavdb     # run daily, e.g. in CI
+exav -d exav.exavdb /data       # fast cold start
 ```
 
-A `.exavdb` is tied to the exav version that built it: after upgrading exav,
-rebuild it. See the [prebuilt database guide](/guides/prebuilt-database/).
+Rebuild the `.exavdb` after upgrading exav if its format changed (the load says
+so). See the [prebuilt database guide](/guides/prebuilt-database/).
 
 ## Run it as a daemon
 
@@ -101,8 +107,8 @@ load cost. The daemon stays in the foreground, so run the client from a second
 terminal:
 
 ```sh
-exav --listen "$XDG_RUNTIME_DIR/exav.sock" -d exav.exavdb   # load once, serve
-exav --connect "$XDG_RUNTIME_DIR/exav.sock" /data           # client
+exav --listen /tmp/exav.sock -d exav.exavdb    # load once, serve
+exav --connect /tmp/exav.sock /data            # client
 ```
 
 A daemon can also keep its signatures current itself, fetching from a mirror

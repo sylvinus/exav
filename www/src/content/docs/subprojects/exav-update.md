@@ -5,7 +5,10 @@ description: The signature-fetching library behind exav's --auto-update, for a R
 
 **A signature-fetching library**, for a build pipeline or image-bake step written
 in Rust. It is what `exav --auto-update` fetches with, and it ships no binary of
-its own: from the command line, use `exav --auto-update --sig-sources <URL>`.
+its own: from the command line, use `exav --auto-update --sig-sources <URL>`,
+which needs an `exav` built with `http-update` (or `http`), as the container
+image is; the release binaries and a default `cargo install exav` are not (see
+[Feature flags](/reference/feature-flags/#adding-http-support)).
 
 ```bash
 cargo add exav-update
@@ -15,14 +18,20 @@ cargo add exav-update
 
 - `fetch_signature_if_changed(url, sigdir, prev)` fetches one signature source
   (a `.cvd`/`.cld` container or a loose signature file) into
-  `<sigdir>/env/<host>/…`, with a conditional GET that transfers nothing when the
-  file has not changed. A `.cvd` must carry its `ClamAV-VDB:` header, and
-  anything that looks like an HTML or JSON error page is refused.
+  `<sigdir>/env/<host>/…/<name>-<hash>.<ext>`, the short hash of the whole URL
+  keeping two sources with the same file name apart. A `HEAD` and a conditional
+  GET transfer nothing when the file has not changed. A `.cvd`/`.cld` must carry
+  its `ClamAV-VDB:` header; any other file that looks like an HTML or JSON error
+  page is refused.
 - `fetch_db_if_changed(url, dest, prev)` pulls a
-  [prebuilt `.exavdb`](/guides/prebuilt-database/), checks its length and
-  trailing SHA-256, and installs it with an atomic rename.
+  [prebuilt `.exavdb`](/guides/prebuilt-database/), checks its magic, length and
+  trailing CRC-32, and installs it with an atomic rename.
 - `prune_env_sources` removes files for sources no longer configured, and
   `sig_dest` / `url_basename` say where a URL will land.
+
+Credentials in the URL (`https://user:pass@host/…`, percent-encoded as needed)
+are sent as HTTP Basic auth. A redirect from HTTPS to HTTP is refused, and a
+body over 4 GiB is rejected.
 
 ```rust
 use exav_update::fetch_signature_if_changed;

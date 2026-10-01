@@ -23,6 +23,27 @@ match report.unpacked {
 }
 ```
 
+## CLI
+
+The crate also ships an `exav-pe-emu` command. It is in each
+[release](/getting-started/installation/#prebuilt-binaries), as
+`exav-pe-emu-<tag>-<target>`, or:
+
+```bash
+cargo install exav-pe-emu
+
+exav-pe-emu packed.exe                 # report, and write packed.exe.unpacked
+exav-pe-emu -o out.exe packed.exe      # choose the output path (one input only)
+exav-pe-emu -d out/ a.exe b.exe        # write each image into out/
+exav-pe-emu --report-only packed.exe   # write nothing
+exav-pe-emu --trace packed.exe         # also print the Windows calls and the last instructions
+exav-pe-emu --ticks 500000000 big.exe  # instruction budget per file (default 120 million)
+```
+
+It prints what the stub did for each input, and also writes any other PE image
+found in memory the stub allocated (`<input>.allocation-N`). Exit status: `0` if
+every input gave back an image, `1` if any did not, `2` on a usage or I/O error.
+
 ## Why run the stub
 
 A packed executable is not the program that runs. A decoder per packer is a race

@@ -10,6 +10,10 @@ socket, so callers pay no per-scan load cost. The wire protocol is a subset of
 ClamAV's `clamd` protocol, so existing tooling (`clamdscan`, milters, `clamd`
 client libraries) talks to exav unchanged.
 
+The daemon refuses to start without signatures, so fetch them first (see
+[Signatures](/guides/signatures/)). A prebuilt `.exavdb` starts much faster than
+raw `.cvd` files: see [what it costs](/guides/prebuilt-database/#what-it-costs).
+
 ## Start a daemon
 
 ```sh
@@ -20,7 +24,8 @@ exav --listen clamd://0.0.0.0:3310 -d /var/lib/exav       # the same, spelled ou
 
 The protocol travels in the address, and with no scheme it is `clamd`. A leading
 `/` is a socket path; anything else is `host:port`. Nothing listens without
-`--listen`.
+`--listen`. Creating a socket under `/run/clamav` needs root or the `clamav`
+user; as yourself, use a path such as `$XDG_RUNTIME_DIR/exav.sock`.
 
 Then scan through it:
 
@@ -32,7 +37,8 @@ clamdscan --stream file.bin                        # the official ClamAV client
 clamdscan --fdpass file.bin                        # fd-passing also works
 ```
 
-`--listen` accepts connections and `--connect` makes one.
+`--listen` accepts connections and `--connect` makes one. `clamdscan` takes the
+address from its `clamd.conf` (`LocalSocket`, or `TCPSocket` and `TCPAddr`).
 
 By default the client sends paths, which the daemon opens itself, so the daemon
 has to be able to see them. `--send-as contents` sends the bytes (`INSTREAM`) and
@@ -42,10 +48,12 @@ or a daemon running as another user. `-` (stdin) is always sent as contents.
 
 A directory names its whole tree in all three modes, as it does for `clamdscan`.
 The client walks it and sends one request per file, so `--exclude` / `--include`
-apply to the tree and each request has one reply. A directory holding the parts
-of a byte-split archive (`x.001`, `x.002`, ...) is sent whole instead, as one
-`CONTSCAN` by path, so the daemon can rejoin them; the client's filters and
-`--no-recursive` do not apply to that directory.
+apply to the tree and each request has one reply. The parts of a byte-split
+archive (`x.001`, `x.002`, ...) are sent together so the daemon can rejoin them
+(see [split archives](#split-archives)). By path, a directory holding such parts
+goes as one `CONTSCAN`, and the client's filters and `--no-recursive` do not
+apply to it; with `contents` or `fd`, the parts of each directory go in one
+`EXINSTREAM MULTI` request.
 
 ## Who may connect
 
@@ -64,6 +72,8 @@ inherited, and a value that is not a workable mode is refused.
 The mode belongs to the address because it is a property of that socket. A
 `host:port` has no file to set permissions on, so asking for one there is refused;
 bind a TCP listener to the interface that should reach it and firewall the rest.
+The other address options are listed in
+[what belongs to one listener](/reference/cli/#what-belongs-to-one-listener).
 
 <Aside type="note" title="Put the socket somewhere only its owner can write">
 The path is a name another process can replace between `bind` and `chmod`.
@@ -76,7 +86,8 @@ there first.
 
 Supported commands: `PING`, `VERSION`, `VERSIONCOMMANDS`, `STATS`, `RELOAD`,
 `SCAN` / `CONTSCAN` / `MULTISCAN` / `ALLMATCHSCAN <path>`, `INSTREAM`, `FILDES`
-(fd passing), `IDSESSION` / `SESSION` / `END`, and the exav extensions
+(fd passing), `IDSESSION` / `SESSION` / `END`, `SHUTDOWN` / `QUIT` (below), and
+the exav extensions
 `EXINSTREAM`, `EXINSTREAM MULTI` (below) and `SCANURL <url>`. `SCANURL` scans an
 `http(s)://` object through range requests (see
 [scanning over HTTP](/guides/scanning/#scanning-over-http)) and is honoured, and
@@ -93,14 +104,15 @@ listed in `VERSIONCOMMANDS`, only in a build with `http-scan`
 this process scanned, how long it took, and (with `--profile`) which matcher the
 time went to. See [finding where the CPU went](/reference/cli/#finding-where-the-cpu-went).
 
-A file that could not be fully scanned comes back as `… ERROR` carrying
-`LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. `ERROR` is the only
-failing word in clamd's vocabulary; an unknown word would be read as `OK` by
-existing clients.
+By default a file that could not be fully scanned comes back as `… ERROR`
+carrying `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`, because an
+unknown word would be read as `OK` by existing clients; `--partial-as` changes
+that (see [on the clamd wire](/reference/verdicts/#on-the-clamd-wire)).
 
 The deprecated `STREAM` (separate port) command is not implemented; `INSTREAM`
-replaces it. `SHUTDOWN` is refused by default so a client cannot stop the daemon;
-send the process a signal instead, or pass `--allow-shutdown` to honour it.
+replaces it. `SHUTDOWN` (and its alias `QUIT`) is refused by default so a client
+cannot stop the daemon; send the process a signal instead, or pass
+`--allow-shutdown` to honour it.
 
 Validated against `clamdscan` (`--fdpass`, `--stream`, `--multiscan`), the Python
 `clamd` library, and raw `socat`.
@@ -136,10 +148,13 @@ EXINSTREAM MULTI
 Names are labels; nothing opens or resolves them as paths. The reply is one line
 of JSON, `{"v":1,"files":[…]}`, with one entry per file carrying the same verdict
 fields as a single `EXINSTREAM`, plus `"set"` when the verdict came from a
-rejoined archive. A file the daemon could not hold in full has what it held
-scanned and is answered `LIMITS-EXCEEDED` unless something is found; the rest of
-the request is still scanned. The reply carries `"truncated": true` when the
-request ended before its terminator, so some files never arrived.
+rejoined archive. One request carries at most 1024 files with names up to 4096
+bytes, and holds at most 256 MiB in RAM and 8 GiB in temporary files across
+them; past any of these the request is answered with a JSON error. A file the
+daemon could not hold in full has what it held scanned and is answered
+`LIMITS-EXCEEDED` unless something is found; the rest of the request is still
+scanned. The reply carries `"truncated": true` when the request ended
+before its terminator, so some files never arrived.
 
 RAR `.partN` and ZIP `.zNN` volumes are not rejoined this way: each carries its
 own headers, so concatenating them produces garbage that still looks like an
@@ -154,6 +169,11 @@ An `INSTREAM` body is buffered before it is scanned: in memory up to
 process holds at once. A stream past those is scanned as far as it was held and
 answered `LIMITS-EXCEEDED`. See
 [buffering a stream](/reference/cli/#buffering-a-stream-spill).
+
+When the daemon has its answer before the stream ends, it reads and discards up
+to 64 MiB of the rest before replying, so the reply is not lost to a reset
+connection; the [ICAP guide](/guides/icap/#draining-an-over-limit-body) explains
+why. ICAP bodies are buffered the same way.
 
 ## Worker pool and per-job limits
 
@@ -180,7 +200,8 @@ recursion, emulation steps) fire first.
 Per-job limits need the pool, which only a clamd listener has.
 `--max-jobs-per-worker` is refused without it, and `--max-scan-secs` is refused
 for a listener under `--workers threads` or for ICAP served alone, because
-neither can stop one job without stopping the daemon.
+neither can stop one job without stopping the daemon. ICAP scans get neither
+limit even under the pool: see [Limits](/reference/limits/).
 
 `--max-scan-secs` and `--max-process-bytes` still apply to a one-shot scan, where
 they bound the whole process: the run ends instead of a worker being replaced.
@@ -192,8 +213,14 @@ they bound the whole process: the run ends instead of a worker being replaced.
 it goes:
 
 ```sh
-exav --listen /run/exav.sock --log /var/log/exav.log -d /var/lib/exav
+exav --listen /run/clamav/clamd.ctl --log /var/log/exav/exav.log -d /var/lib/exav
 ```
+
+The daemon refuses to start if it cannot open the file for appending, so its
+directory must exist and be writable by the daemon.
+The packaged unit makes `/var/log` read-only, so with `systemctl edit exav` add
+`LogsDirectory=exav` (which creates `/var/log/exav` for the unit's user) along
+with the `--log` flag on `ExecStart`.
 
 The daemon's results otherwise go only to the client that asked, so this is the
 operator's record. A path scan is logged under its path, a streamed scan as
@@ -204,7 +231,7 @@ call, so lines from different workers never interleave.
 `SIGHUP` reopens the file, as it does for clamd, so logrotate can move it:
 
 ```text
-/var/log/exav.log {
+/var/log/exav/exav.log {
     weekly
     postrotate
         systemctl kill -s HUP exav.service
@@ -234,8 +261,8 @@ the new database is swapped in instead: a connection already open keeps the one
 it started with. If the new source is empty or corrupt, the swap is refused and
 the daemon keeps serving the current database.
 
-`SIGHUP` does not reload: it reopens the `--log` file, as for clamd. `SIGTERM`
-and `SIGINT` stop the daemon.
+`SIGHUP` does not reload ([it reopens the log](#logging-what-was-answered)).
+`SIGTERM` and `SIGINT` stop the daemon.
 
 ### The watch polls mtimes
 
@@ -244,8 +271,9 @@ newest modification time changes, as clamd's `SelfCheck` does. Any change
 counts, not only a later time, so a database replaced by one with an older mtime
 is still picked up. It watches whichever form `-d` names:
 
-- a directory of raw `.cvd`/`.cld`: the newest mtime across the directory and its
-  entries, so a rename, a new file or an in-place overwrite all count;
+- a directory of signature files: the newest mtime across the whole tree,
+  subdirectories included, so a rename, a new file or an in-place overwrite all
+  count;
 - a single database file (`-d db.exavdb`): that file's own mtime, which an atomic
   swap changes.
 
@@ -259,8 +287,9 @@ deployment reloads on swap too, with no explicit `RELOAD`.
 ## As a managed service
 
 A systemd unit (`packaging/exav.service`, also shipped in the `.deb`) runs exav
-in place of `clamav-daemon` on the same socket, reading the signatures
-`freshclam` keeps in `/var/lib/clamav`:
+in place of `clamav-daemon` on the same socket, reading the raw signatures
+`freshclam` keeps in `/var/lib/clamav`. It runs as the `clamav` user, which the
+package does not create, so install it where ClamAV is installed:
 
 ```sh
 sudo systemctl disable --now clamav-daemon.socket clamav-daemon.service

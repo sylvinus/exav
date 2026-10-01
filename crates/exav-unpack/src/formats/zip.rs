@@ -936,10 +936,10 @@ fn parse_local_member(
     budget.commit(out.len() as u64);
     Ok(Some(Entry {
         comp_size: comp as u64,
-        encrypted: false,
         unsupported: part_way.then_some(PART_WAY),
         name,
         data: out,
+        ..Entry::default()
     }))
 }
 
@@ -1161,9 +1161,9 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
                         let entry = Entry {
                             comp_size: comp,
                             encrypted: true,
-                            unsupported: None,
                             name,
                             data: plain,
+                            ..Entry::default()
                         };
                         if let Some(r) = visit(entry, budget) {
                             return Ok(Some(r));
@@ -1258,10 +1258,10 @@ pub fn extract_zip_from<Rd: Read + Seek, R>(
         // Compressed size is meaningful for `.cdb` `FileSizeInContainer`.
         let entry = Entry {
             comp_size: comp,
-            encrypted: false,
             unsupported: part_way.then_some(PART_WAY),
             name,
             data: buf,
+            ..Entry::default()
         };
         if let Some(r) = visit(entry, budget) {
             return Ok(Some(r));
@@ -1438,6 +1438,35 @@ fn read_spans<R: Read + Seek>(
 /// gigabytes unclaimed would otherwise turn opening it into a full read.
 const MAX_ORPHAN_SCAN: u64 = 16 * 1024 * 1024;
 
+/// When a member was last modified: the Unix time of its extended-timestamp
+/// or NTFS extra field, as `unzip` prefers, else its DOS wall-clock time.
+fn zip_mtime<'a>(
+    extra: impl Iterator<Item = &'a ::zip::ExtraField>,
+    dos: Option<::zip::DateTime>,
+) -> Option<crate::Mtime> {
+    // FILETIME counts 100 ns ticks from 1601; the Unix epoch is this many
+    // seconds later.
+    const FILETIME_EPOCH: i64 = 11_644_473_600;
+    let unix = extra
+        .filter_map(|x| match x {
+            ::zip::ExtraField::ExtendedTimestamp(t) => t.mod_time().map(i64::from),
+            ::zip::ExtraField::Ntfs(n) => i64::try_from(n.mtime() / 10_000_000)
+                .ok()
+                .map(|s| s - FILETIME_EPOCH),
+        })
+        .next();
+    unix.map(crate::Mtime::Unix).or_else(|| {
+        dos.map(|d| crate::Mtime::Local {
+            year: d.year(),
+            month: d.month(),
+            day: d.day(),
+            hour: d.hour(),
+            minute: d.minute(),
+            second: d.second(),
+        })
+    })
+}
+
 /// Walk a ZIP off its source. Only the central directory and the members
 /// actually read are fetched. A cleartext member is handed over as the
 /// crate's decompressing reader, so a member decompressing to any size is
@@ -1476,41 +1505,57 @@ pub(crate) fn walk<T>(
             }
             let meta = MemberMeta {
                 name: format!("zip entry {i}"),
-                comp_size: 0,
-                size: None,
-                encrypted: false,
                 unsupported: Some("ZIP member header will not parse"),
+                ..MemberMeta::default()
             };
             if let Some(t) = visit(&meta, None, budget) {
                 return Ok(Some(t));
             }
             continue;
         }
-        let (name, is_file, encrypted, comp, size, method) = {
+        let (name, is_dir, encrypted, comp, size, method, mtime, mode) = {
             let f = zip.by_index_raw(i).map_err(|e| zip_entry_error(i, &e))?;
             (
                 f.name().to_string(),
-                f.is_file(),
+                f.is_dir(),
                 f.encrypted(),
                 f.compressed_size(),
                 f.size(),
                 zip_method_code(&f.compression()),
+                zip_mtime(f.extra_data_fields(), f.last_modified()),
+                f.unix_mode(),
             )
         };
-        // `is_file()` is false purely because the name ends in '/'. A JAR packer
+        // `is_dir()` is true purely because the name ends in '/'. A JAR packer
         // buys exactly that: `kingDavid/9.class/` holds a real deflate-compressed
         // class that the JVM loads by name, while every ZIP tool discards it as a
         // folder. Skip only what carries nothing at all: a "directory" with
         // content is content. (The same guard lives in `extract_zip_from`.)
-        if !is_file && comp == 0 {
-            continue; // directory: counted toward the file budget above, skipped
+        if is_dir && comp == 0 {
+            // Counted toward the file budget above, and handed over only to
+            // a caller that makes directories.
+            if budget.visit_directories {
+                let meta = MemberMeta {
+                    name,
+                    mtime,
+                    mode: Some(mode.map_or(0o040755, |m| 0o040000 | (m & 0o7777))),
+                    ..MemberMeta::default()
+                };
+                if let Some(t) = visit(&meta, None, budget) {
+                    return Ok(Some(t));
+                }
+            }
+            continue;
         }
         let meta = MemberMeta {
             name,
             comp_size: comp,
             size: Some(size),
             encrypted,
-            unsupported: None,
+            mtime,
+            mode,
+            zip_method: Some(method),
+            ..MemberMeta::default()
         };
         if encrypted {
             if let Some(t) = walk_encrypted(&mut zip, i, meta, budget, visit)? {

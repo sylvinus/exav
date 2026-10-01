@@ -1,9 +1,10 @@
 //! RAR extractor, RAR4 and RAR5, implemented from the public RAR file-format
 //! field layout. Stored members are copied; RAR3 (unpack 29, LZ + PPMd) members
 //! go to `rar3_unpack` and RAR5 members to `rar5_unpack`, solid groups
-//! included. RAR 1.5/2.x compression, encrypted members and members split
-//! across volumes are reported as members we could not extract (the caller
-//! still scans the raw archive in place).
+//! included. RAR 1.5/2.x compression and encrypted members are reported as
+//! members we could not extract (the caller still scans the raw archive in
+//! place), and so are members split across volumes, unless the volumes are
+//! joined first ([`join_volumes`]).
 //!
 //! Layouts used (magic-byte / header-field level only):
 //! - RAR4 marker `52 61 72 21 1A 07 00`; blocks = `HEAD_CRC u16, HEAD_TYPE u8,
@@ -94,10 +95,9 @@ fn push_stored(
     budget.commit(bytes.len() as u64);
     out.push(Entry {
         comp_size: pack,
-        encrypted: false,
-        unsupported: None,
         name,
         data: bytes,
+        ..Entry::default()
     });
     Ok(())
 }
@@ -249,10 +249,9 @@ fn extract_rar4(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                     Some(bytes) if crc32_ieee(&bytes) == crc => {
                         out.push(Entry {
                             comp_size: pack,
-                            encrypted: false,
-                            unsupported: None,
                             name,
                             data: bytes,
+                            ..Entry::default()
                         });
                     }
                     Some(_) => {
@@ -444,10 +443,9 @@ fn extract_rar5(data: &[u8], start: usize, budget: &mut Budget) -> Result<Vec<En
                         Some(bytes) if crc_ok(&bytes) => {
                             out.push(Entry {
                                 comp_size: data_size,
-                                encrypted: false,
-                                unsupported: None,
                                 name: f.name,
                                 data: bytes,
+                                ..Entry::default()
                             });
                         }
                         Some(_) => {
@@ -596,6 +594,385 @@ fn rar5_extra_has_crypt(data: &[u8], end: usize, extra_size: u64) -> bool {
         p += advance;
     }
     false
+}
+
+// ---- Volumes ----------------------------------------------------------------
+//
+// A member split across volumes has a file header in each, flagged as
+// continuing from the previous volume and/or in the next, with that volume's
+// share of the packed data after it. Every part's header carries the CRC-32 of
+// that part's packed data, except the last, whose CRC is the whole unpacked
+// file's (RARLAB's technote). Joined, the shares are the member's whole packed
+// stream, which the single-volume reader then decodes as it decodes any other.
+
+/// The volumes of a RAR set, in order, as one single-volume archive: each
+/// split member's packed data joined behind its first header, which takes the
+/// total size and the last part's CRC. `Err` names what does not fit together.
+pub(crate) fn join_volumes(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
+    match volumes.first() {
+        Some(v) if v.starts_with(RAR5_MAGIC) => join_rar5(volumes),
+        Some(v) if v.starts_with(RAR4_MAGIC) => join_rar4(volumes),
+        _ => Err("the first part is not a RAR archive".to_string()),
+    }
+}
+
+/// A member whose parts are still being gathered: its first header and the
+/// packed data so far.
+struct Pending {
+    header: Vec<u8>,
+    data: Vec<u8>,
+}
+
+fn join_rar4(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
+    let mut out = RAR4_MAGIC.to_vec();
+    let mut pending: Option<Pending> = None;
+    for (k, v) in volumes.iter().enumerate() {
+        if !v.starts_with(RAR4_MAGIC) {
+            return Err(format!("part {} is not a RAR4 volume", k + 1));
+        }
+        let mut pos = RAR4_MAGIC.len();
+        while pos + 7 <= v.len() {
+            let (Some(flags), Some(head_size)) = (u16le(v, pos + 3), u16le(v, pos + 5)) else {
+                break;
+            };
+            let (htype, head_size) = (v[pos + 2], head_size as usize);
+            if head_size < 7 || pos + head_size > v.len() {
+                break;
+            }
+            let mut add = if flags & 0x8000 != 0 {
+                u32le(v, pos + 7).unwrap_or(0) as u64
+            } else {
+                0
+            };
+            if htype == 0x74 && flags & 0x100 != 0 {
+                add |= (u32le(v, pos + 32).unwrap_or(0) as u64) << 32;
+            }
+            let end = pos
+                .checked_add(head_size)
+                .and_then(|e| e.checked_add(usize::try_from(add).ok()?))
+                .filter(|&e| e <= v.len())
+                .ok_or_else(|| format!("part {} ends inside a block", k + 1))?;
+            match htype {
+                // The archive header once; each volume's end marker never.
+                0x73 if k == 0 => out.extend_from_slice(&v[pos..end]),
+                0x73 | 0x7B => {}
+                0x74 => {
+                    let (before, after) = (flags & 0x01 != 0, flags & 0x02 != 0);
+                    let (header, data) = (&v[pos..pos + head_size], &v[pos + head_size..end]);
+                    match (before, &mut pending) {
+                        (false, None) if after => {
+                            pending = Some(Pending {
+                                header: header.to_vec(),
+                                data: data.to_vec(),
+                            })
+                        }
+                        (false, None) => out.extend_from_slice(&v[pos..end]),
+                        (true, Some(p)) => p.data.extend_from_slice(data),
+                        (false, Some(_)) => {
+                            return Err(format!("part {} drops a member mid-way", k + 1))
+                        }
+                        (true, None) => {
+                            return Err(format!(
+                                "part {} goes on with a member whose start is missing",
+                                k + 1
+                            ))
+                        }
+                    }
+                    if before && !after {
+                        let p = pending.take().expect("a split member was pending");
+                        out.extend(rar4_whole(p, u32le(v, pos + 16).unwrap_or(0))?);
+                    }
+                }
+                _ => out.extend_from_slice(&v[pos..end]),
+            }
+            if end <= pos {
+                break;
+            }
+            pos = end;
+        }
+    }
+    if pending.is_some() {
+        return Err("the last part ends inside a member".to_string());
+    }
+    // ENDARC: CRC, type 0x7B, flags, size 7.
+    out.extend_from_slice(&[0x3d, 0x7b, 0x7b, 0x00, 0x40, 0x07, 0x00]);
+    Ok(out)
+}
+
+/// A RAR4 member's whole header and data, from its parts.
+fn rar4_whole(mut p: Pending, crc: u32) -> Result<Vec<u8>, String> {
+    let h = &mut p.header;
+    // A stored member's data is its content, so a part missing from between
+    // the ones given shows as a size the header does not record. (A compressed
+    // one fails its CRC once decoded.)
+    let large = u16::from_le_bytes([h[3], h[4]]) & 0x100 != 0;
+    let unp = u64::from(u32le(h, 11).unwrap_or(0))
+        | if large {
+            u64::from(u32le(h, 36).unwrap_or(0)) << 32
+        } else {
+            0
+        };
+    if h.get(25) == Some(&0x30) && unp != p.data.len() as u64 {
+        return Err(format!(
+            "a stored member of {unp} bytes has {} in the parts given",
+            p.data.len()
+        ));
+    }
+    let flags = u16::from_le_bytes([h[3], h[4]]) & !0x03;
+    h[3..5].copy_from_slice(&flags.to_le_bytes());
+    let total = p.data.len() as u64;
+    h[7..11].copy_from_slice(&(total as u32).to_le_bytes());
+    match (flags & 0x100 != 0, h.len() >= 40) {
+        (true, true) => h[32..36].copy_from_slice(&((total >> 32) as u32).to_le_bytes()),
+        _ if total > u64::from(u32::MAX) => {
+            return Err("a member past 4 GiB with no 64-bit size".to_string())
+        }
+        _ => {}
+    }
+    if h.len() < 20 {
+        return Err("a short file header".to_string());
+    }
+    h[16..20].copy_from_slice(&crc.to_le_bytes());
+    let mut out = p.header;
+    out.extend_from_slice(&p.data);
+    Ok(out)
+}
+
+fn vint_bytes(mut x: u64) -> Vec<u8> {
+    let mut o = Vec::new();
+    loop {
+        let b = (x & 0x7f) as u8;
+        x >>= 7;
+        if x == 0 {
+            o.push(b);
+            return o;
+        }
+        o.push(b | 0x80);
+    }
+}
+
+/// One RAR5 block: where its header content starts and ends, its type and
+/// flags, and where its data ends.
+struct Rar5Block {
+    hdr: usize,
+    data_off: usize,
+    htype: u64,
+    hflags: u64,
+    end: usize,
+}
+
+fn rar5_block(v: &[u8], pos: usize) -> Option<Rar5Block> {
+    let (hsize, n) = vint(v, pos + 4)?;
+    let hdr = pos + 4 + n;
+    let data_off = hdr.checked_add(usize::try_from(hsize).ok()?)?;
+    if hsize == 0 || data_off > v.len() {
+        return None;
+    }
+    let (htype, t1) = vint(v, hdr)?;
+    let (hflags, t2) = vint(v, hdr + t1)?;
+    let mut q = hdr + t1 + t2;
+    if hflags & 0x01 != 0 {
+        q += vint(v, q)?.1;
+    }
+    let data_size = if hflags & 0x02 != 0 { vint(v, q)?.0 } else { 0 };
+    let end = data_off.checked_add(usize::try_from(data_size).ok()?)?;
+    (end <= v.len()).then_some(Rar5Block {
+        hdr,
+        data_off,
+        htype,
+        hflags,
+        end,
+    })
+}
+
+fn join_rar5(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
+    let mut out = RAR5_MAGIC.to_vec();
+    // The pending member, with the header content of its first part.
+    let mut pending: Option<Pending> = None;
+    // Service blocks met while a member is pending, which go after it.
+    let mut deferred = Vec::new();
+    for (k, v) in volumes.iter().enumerate() {
+        if !v.starts_with(RAR5_MAGIC) {
+            return Err(format!("part {} is not a RAR5 volume", k + 1));
+        }
+        let mut pos = RAR5_MAGIC.len();
+        while pos + 4 < v.len() {
+            let Some(b) = rar5_block(v, pos) else { break };
+            // A volume past the first records its number: it must be where
+            // it is given.
+            if b.htype == 1 && k > 0 {
+                if let Some(n) = rar5_volume_number(&v[b.hdr..b.data_off]) {
+                    if n != k as u64 {
+                        return Err(format!("part {} is volume {} of its set", k + 1, n + 1));
+                    }
+                }
+            }
+            match b.htype {
+                1 if k == 0 => out.extend_from_slice(&v[pos..b.end]),
+                1 | 5 => {}
+                // The quick-open record each volume ends with caches that
+                // volume's headers at offsets in it: it has no place in the
+                // joined archive.
+                3 if b.hflags & 0x18 == 0 && rar5_name(&v[b.hdr..b.data_off]) == Some(b"QO") => {}
+                2 | 3 => {
+                    let (before, after) = (b.hflags & 0x08 != 0, b.hflags & 0x10 != 0);
+                    let data = &v[b.data_off..b.end];
+                    match (before, &mut pending) {
+                        (false, None) if after => {
+                            pending = Some(Pending {
+                                header: v[b.hdr..b.data_off].to_vec(),
+                                data: data.to_vec(),
+                            })
+                        }
+                        (false, None) => out.extend_from_slice(&v[pos..b.end]),
+                        (true, Some(p)) => p.data.extend_from_slice(data),
+                        (false, Some(_)) if b.htype == 3 && !after => {
+                            deferred.extend_from_slice(&v[pos..b.end])
+                        }
+                        (false, Some(_)) => {
+                            return Err(format!("part {} drops a member mid-way", k + 1))
+                        }
+                        (true, None) => {
+                            return Err(format!(
+                                "part {} goes on with a member whose start is missing",
+                                k + 1
+                            ))
+                        }
+                    }
+                    if before && !after {
+                        let p = pending.take().expect("a split member was pending");
+                        out.extend(rar5_whole(p, rar5_crc(v, &b))?);
+                        out.append(&mut deferred);
+                    }
+                }
+                _ => out.extend_from_slice(&v[pos..b.end]),
+            }
+            if b.end <= pos {
+                break;
+            }
+            pos = b.end;
+        }
+    }
+    if pending.is_some() {
+        return Err("the last part ends inside a member".to_string());
+    }
+    // End of archive: type 5, no flags, no end-of-archive flags.
+    let content = [vint_bytes(5), vint_bytes(0), vint_bytes(0)].concat();
+    out.extend_from_slice(&crc32_ieee(&content).to_le_bytes());
+    out.extend(vint_bytes(content.len() as u64));
+    out.extend(content);
+    Ok(out)
+}
+
+/// The volume number a RAR5 main header records (1 for the second volume),
+/// when it records one.
+fn rar5_volume_number(c: &[u8]) -> Option<u64> {
+    let (_, t1) = vint(c, 0)?;
+    let (hflags, t2) = vint(c, t1)?;
+    let mut q = t1 + t2;
+    if hflags & 0x01 != 0 {
+        q += vint(c, q)?.1;
+    }
+    if hflags & 0x02 != 0 {
+        q += vint(c, q)?.1;
+    }
+    let (archive_flags, n) = vint(c, q)?;
+    (archive_flags & 0x02 != 0)
+        .then(|| vint(c, q + n).map(|v| v.0))
+        .flatten()
+}
+
+/// The name in a RAR5 file or service header's content.
+fn rar5_name(c: &[u8]) -> Option<&[u8]> {
+    let f = rar5_fields_at(c)?;
+    let (file_flags, n) = vint(c, f.after_sizes)?;
+    let mut q = f.after_sizes + n;
+    q += vint(c, q)?.1; // unpacked size
+    q += vint(c, q)?.1; // attributes
+    q += if file_flags & 0x02 != 0 { 4 } else { 0 } + if file_flags & 0x04 != 0 { 4 } else { 0 };
+    q += vint(c, q)?.1; // compression information
+    q += vint(c, q)?.1; // host OS
+    let (len, n) = vint(c, q)?;
+    c.get(q + n..q + n + usize::try_from(len).ok()?)
+}
+
+/// The data CRC a RAR5 file block records, when it records one.
+fn rar5_crc(v: &[u8], b: &Rar5Block) -> Option<u32> {
+    let f = rar5_fields_at(&v[b.hdr..b.data_off])?;
+    f.crc_at.map(|at| u32le(&v[b.hdr..], at).unwrap_or(0))
+}
+
+/// Where the parts of a RAR5 file header content are: the end of its
+/// data-size field, the start of the file fields, and the CRC's offset.
+struct Rar5Layout {
+    after_sizes: usize,
+    crc_at: Option<usize>,
+}
+
+fn rar5_fields_at(c: &[u8]) -> Option<Rar5Layout> {
+    let (_, t1) = vint(c, 0)?;
+    let (hflags, t2) = vint(c, t1)?;
+    let mut q = t1 + t2;
+    if hflags & 0x01 != 0 {
+        q += vint(c, q)?.1;
+    }
+    if hflags & 0x02 != 0 {
+        q += vint(c, q)?.1;
+    }
+    let after_sizes = q;
+    let (file_flags, n) = vint(c, q)?;
+    q += n;
+    q += vint(c, q)?.1; // unpacked size
+    q += vint(c, q)?.1; // attributes
+    if file_flags & 0x02 != 0 {
+        q += 4; // mtime
+    }
+    let crc_at = (file_flags & 0x04 != 0).then_some(q);
+    Some(Rar5Layout {
+        after_sizes,
+        crc_at,
+    })
+}
+
+/// A RAR5 member's whole block, from its parts: the first header with the
+/// split flags off, the total data size, and the last part's CRC.
+fn rar5_whole(p: Pending, crc: Option<u32>) -> Result<Vec<u8>, String> {
+    let c = &p.header;
+    let bad = || "a short file header".to_string();
+    let layout = rar5_fields_at(c).ok_or_else(bad)?;
+    // As for RAR4: a stored member's size shows a missing part.
+    let (file_flags, n) = vint(c, layout.after_sizes).ok_or_else(bad)?;
+    let (unp, n2) = vint(c, layout.after_sizes + n).ok_or_else(bad)?;
+    let mut q = layout.after_sizes + n + n2;
+    q += vint(c, q).ok_or_else(bad)?.1;
+    q += if file_flags & 0x02 != 0 { 4 } else { 0 } + if file_flags & 0x04 != 0 { 4 } else { 0 };
+    let (comp_info, _) = vint(c, q).ok_or_else(bad)?;
+    if (comp_info >> 7) & 0x7 == 0 && file_flags & 0x08 == 0 && unp != p.data.len() as u64 {
+        return Err(format!(
+            "a stored member of {unp} bytes has {} in the parts given",
+            p.data.len()
+        ));
+    }
+    let (htype, t1) = vint(c, 0).ok_or_else(bad)?;
+    let (hflags, t2) = vint(c, t1).ok_or_else(bad)?;
+    let mut content = vint_bytes(htype);
+    content.extend(vint_bytes((hflags & !0x18) | 0x02));
+    if hflags & 0x01 != 0 {
+        let (extra, _) = vint(c, t1 + t2).ok_or_else(bad)?;
+        content.extend(vint_bytes(extra));
+    }
+    content.extend(vint_bytes(p.data.len() as u64));
+    let shift = content.len() as isize - layout.after_sizes as isize;
+    content.extend_from_slice(&c[layout.after_sizes..]);
+    if let (Some(at), Some(crc)) = (layout.crc_at, crc) {
+        let at = (at as isize + shift) as usize;
+        content[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+    let mut out = crc32_ieee(&content).to_le_bytes().to_vec();
+    out.extend(vint_bytes(content.len() as u64));
+    out.extend(content);
+    out.extend_from_slice(&p.data);
+    Ok(out)
 }
 
 /// CRC-32 (IEEE, poly 0xEDB88320) over `data`. Every decoded RAR member is
@@ -752,6 +1129,178 @@ mod tests {
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].name, "a/b.bin");
         assert_eq!(e[0].data, b"EXAV_RAR5_MARKER_payload");
+    }
+
+    /// `arc`'s members cut into `chunk`-byte parts, a new volume at each cut,
+    /// as RARLAB's technote describes a set: the split flags, each part's
+    /// share of the data and size, and the CRC of its share but in the last.
+    fn split(arc: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+        let rar5 = arc.starts_with(RAR5_MAGIC);
+        let magic = if rar5 { RAR5_MAGIC } else { RAR4_MAGIC };
+        let mut vols: Vec<Vec<u8>> = vec![magic.to_vec()];
+        let mut main = Vec::new();
+        let mut pos = magic.len();
+        while pos + 7 < arc.len() {
+            // (block bytes, file header?, header end, data end)
+            let (end, file, data_off) = if rar5 {
+                let Some(b) = rar5_block(arc, pos) else { break };
+                (b.end, b.htype == 2, b.data_off)
+            } else {
+                let (flags, size) = (
+                    u16le(arc, pos + 3).unwrap(),
+                    u16le(arc, pos + 5).unwrap() as usize,
+                );
+                let add = if flags & 0x8000 != 0 {
+                    u32le(arc, pos + 7).unwrap() as usize
+                } else {
+                    0
+                };
+                (pos + size + add, arc[pos + 2] == 0x74, pos + size)
+            };
+            if !file {
+                if main.is_empty() {
+                    main = arc[pos..end].to_vec();
+                    vols[0].extend_from_slice(&main);
+                }
+                pos = end;
+                continue;
+            }
+            let data = &arc[data_off..end];
+            let parts: Vec<&[u8]> = data.chunks(chunk.max(1)).collect();
+            let parts = if parts.is_empty() {
+                vec![&data[..0]]
+            } else {
+                parts
+            };
+            for (j, part) in parts.iter().enumerate() {
+                let (before, after) = (j > 0, j + 1 < parts.len());
+                if before {
+                    let mut v = magic.to_vec();
+                    v.extend_from_slice(&main);
+                    vols.push(v);
+                }
+                let v = vols.last_mut().unwrap();
+                if rar5 {
+                    let c = &arc[rar5_block(arc, pos).unwrap().hdr..data_off];
+                    let mut p = Pending {
+                        header: c.to_vec(),
+                        data: part.to_vec(),
+                    };
+                    // Built as a whole member, then flagged as a part.
+                    let crc = (!after)
+                        .then(|| rar5_crc(arc, &rar5_block(arc, pos).unwrap()))
+                        .flatten();
+                    let crc = crc.or_else(|| after.then(|| crc32_ieee(part)));
+                    let flags_at = vint(&p.header, 0).unwrap().1;
+                    let (fl, n) = vint(&p.header, flags_at).unwrap();
+                    let fl = fl | if before { 0x08 } else { 0 } | if after { 0x10 } else { 0 };
+                    let mut h = p.header[..flags_at].to_vec();
+                    h.extend(vint_bytes(fl));
+                    h.extend_from_slice(&p.header[flags_at + n..]);
+                    p.header = h;
+                    let whole = rar5_part(p, crc);
+                    v.extend(whole);
+                } else {
+                    let mut h = arc[pos..data_off].to_vec();
+                    let fl = u16::from_le_bytes([h[3], h[4]])
+                        | if before { 1 } else { 0 }
+                        | if after { 2 } else { 0 };
+                    h[3..5].copy_from_slice(&fl.to_le_bytes());
+                    h[7..11].copy_from_slice(&(part.len() as u32).to_le_bytes());
+                    if after {
+                        h[16..20].copy_from_slice(&crc32_ieee(part).to_le_bytes());
+                    }
+                    v.extend(h);
+                    v.extend_from_slice(part);
+                }
+            }
+            pos = end;
+        }
+        vols
+    }
+
+    /// A RAR5 block from header content whose flags are already set, with
+    /// `p.data` as its data and `crc` in its CRC field.
+    fn rar5_part(p: Pending, crc: Option<u32>) -> Vec<u8> {
+        let c = &p.header;
+        let layout = rar5_fields_at(c).unwrap();
+        let (htype, t1) = vint(c, 0).unwrap();
+        let (hflags, t2) = vint(c, t1).unwrap();
+        let mut content = vint_bytes(htype);
+        content.extend(vint_bytes(hflags | 0x02));
+        if hflags & 0x01 != 0 {
+            content.extend(vint_bytes(vint(c, t1 + t2).unwrap().0));
+        }
+        content.extend(vint_bytes(p.data.len() as u64));
+        let shift = content.len() as isize - layout.after_sizes as isize;
+        content.extend_from_slice(&c[layout.after_sizes..]);
+        if let (Some(at), Some(crc)) = (layout.crc_at, crc) {
+            let at = (at as isize + shift) as usize;
+            content[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+        }
+        let mut out = crc32_ieee(&content).to_le_bytes().to_vec();
+        out.extend(vint_bytes(content.len() as u64));
+        out.extend(content);
+        out.extend_from_slice(&p.data);
+        out
+    }
+
+    /// A set split from an archive, joined again, extracts as the archive
+    /// does: stored members, and the compressed members of a solid archive,
+    /// RAR4 and RAR5, cut at many sizes. A set missing a part is refused.
+    #[test]
+    fn a_volume_set_joins_into_its_archive() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar_solid");
+        let arcs = [
+            rar4_stored(b"hi.txt", &[b'z'; 1000]),
+            rar5_stored(b"a/b.bin", &[b'y'; 1000]),
+            std::fs::read(format!("{dir}/solid_rar4.rar")).unwrap(),
+            std::fs::read(format!("{dir}/solid_rar5.rar")).unwrap(),
+        ];
+        let names = |e: &[Entry]| {
+            e.iter()
+                .map(|e| (e.name.clone(), e.data.clone(), e.unsupported))
+                .collect::<Vec<_>>()
+        };
+        for (i, arc) in arcs.iter().enumerate() {
+            let want = names(&extract_rar(arc, &mut budget()).unwrap());
+            assert!(
+                want.iter().all(|w| w.2.is_none() && !w.1.is_empty()),
+                "archive {i}: {want:?}"
+            );
+            for chunk in [1, 7, 100, 333, 1 << 20] {
+                let vols = split(arc, chunk);
+                let refs: Vec<&[u8]> = vols.iter().map(Vec::as_slice).collect();
+                let joined = join_volumes(&refs)
+                    .unwrap_or_else(|e| panic!("archive {i} chunk {chunk}: {e}"));
+                assert_eq!(
+                    names(&extract_rar(&joined, &mut budget()).unwrap()),
+                    want,
+                    "archive {i} chunk {chunk}"
+                );
+                if refs.len() > 2 {
+                    // A part gone from the middle: refused, or the member it
+                    // held reported unreadable, never passed off as whole.
+                    let missing: Vec<&[u8]> = refs
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, _)| *k != 1)
+                        .map(|(_, v)| *v)
+                        .collect();
+                    if let Ok(joined) = join_volumes(&missing) {
+                        let got = names(&extract_rar(&joined, &mut budget()).unwrap());
+                        assert!(
+                            got.iter().any(|g| g.2.is_some()),
+                            "archive {i} chunk {chunk}: a missing part"
+                        );
+                    }
+                    assert!(
+                        join_volumes(&refs[1..]).is_err(),
+                        "archive {i} chunk {chunk}: no first part"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

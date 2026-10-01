@@ -41,14 +41,14 @@ pub struct Rules {
     pub(crate) imported: Vec<ModuleKind>,
     /// Whether any rule uses the `entrypoint` keyword.
     pub(crate) uses_entrypoint: bool,
-    /// Required-literal Aho-Corasick prefilter: which patterns even need to be
+    /// Required-literal prefilter: which patterns even need to be
     /// scanned for a given buffer (see [`crate::yara::atoms`]).
     pub(crate) gate: PatternGate,
 }
 
 /// The serialized form of a compiled [`Rules`] set. Everything here is cheap to
-/// (de)serialize; the expensive-to-rebuild atom automaton is inside `gate`
-/// (serialized as daachorse's own byte form), and the per-pattern regexes are
+/// (de)serialize; the atom index is inside `gate` (in its own binary form), and
+/// the per-pattern regexes are
 /// recompiled from `defs` on load. Serialized with borrowed fields, deserialized
 /// into the owned twin [`RulesBlobOwned`].
 #[derive(Serialize)]
@@ -73,8 +73,8 @@ struct RulesBlobOwned {
 
 impl Rules {
     /// Serializes the compiled rule set to MessagePack bytes for embedding in the
-    /// on-disk database. The atom automaton travels in its compiled (daachorse)
-    /// form; only the per-pattern regex SOURCES travel, not the compiled regex
+    /// on-disk database. The atom index travels in its built form; only the
+    /// per-pattern regex SOURCES travel, not the compiled regex
     /// automata. See [`Rules::deserialize`] for the reverse.
     pub(crate) fn serialize(&self) -> Vec<u8> {
         let blob = RulesBlobRef {
@@ -85,20 +85,25 @@ impl Rules {
             uses_entrypoint: self.uses_entrypoint,
             gate: &self.gate,
         };
-        // Infallible for this data (no maps with non-string keys, no unsupported
-        // types); `rmp_serde` only errors on serializer I/O, and Vec never fails.
-        rmp_serde::to_vec(&blob).expect("serialize compiled YARA rules")
+        // Infallible for this data: every length is known and fits, and
+        // writing to a Vec never fails.
+        crate::database::to_vec_indexed(&blob).expect("serialize compiled YARA rules")
     }
 
     /// Reconstructs a compiled rule set from [`Rules::serialize`] bytes. The
-    /// daachorse atom automaton is deserialized (NOT rebuilt); the IR and rule
+    /// atom index is read back (NOT rebuilt from the atoms); the IR and rule
     /// structs are deserialized; and each pattern's `PatternMatcher` is
     /// recompiled from its stored [`PatternDef`]. This skips the aggregate build
-    /// cost (source parse, AST->IR lowering, atom extraction, and the daachorse
-    /// automaton build), paying only per-pattern regex compilation.
+    /// cost (source parse, AST->IR lowering, atom extraction, and the atom
+    /// index build), paying only per-pattern regex compilation.
     pub(crate) fn deserialize(bytes: &[u8]) -> Result<Rules> {
         let blob: RulesBlobOwned = rmp_serde::from_slice(bytes)
             .map_err(|e| Error::new(format!("invalid serialized YARA rules: {e}")))?;
+        if !blob.gate.fits(blob.defs.len()) {
+            return Err(Error::new(
+                "invalid serialized YARA rules: the prefilter does not fit the patterns",
+            ));
+        }
         let mut patterns = Vec::with_capacity(blob.defs.len());
         for def in &blob.defs {
             patterns.push(def.compile()?);
@@ -946,15 +951,15 @@ mod serialize_tests {
     }
 
     /// Load-time measurement (not a correctness gate): compiles a large real
-    /// ruleset from source (which includes the expensive daachorse atom-automaton
-    /// build) vs. deserializing the serialized compiled form (which skips it), and
+    /// ruleset from source (which includes the atom index build) vs.
+    /// deserializing the serialized compiled form (which skips it), and
     /// prints the timings + blob size. Ignored by default; run with:
     ///
     /// ```text
     /// cargo test -p exav-core --features yara --lib -- --ignored --nocapture load_time
     /// ```
     ///
-    /// The source ruleset path can be overridden with `EXAV_YARA_BENCH_RULES`
+    /// The source ruleset path can be overridden with `EXAV_DEBUG_YARA_BENCH_RULES`
     /// (e.g. a concatenated signature-base tree); it defaults to the in-repo
     /// `corpus/securiteinfo/securiteinfo.yara`.
     #[test]
@@ -963,7 +968,7 @@ mod serialize_tests {
         use crate::yara::compiler::Compiler;
         use std::time::Instant;
 
-        let path = std::env::var("EXAV_YARA_BENCH_RULES").unwrap_or_else(|_| {
+        let path = std::env::var("EXAV_DEBUG_YARA_BENCH_RULES").unwrap_or_else(|_| {
             format!(
                 "{}/../../corpus/securiteinfo/securiteinfo.yara",
                 env!("CARGO_MANIFEST_DIR")
@@ -989,8 +994,8 @@ mod serialize_tests {
         let bytes = fresh.serialize();
         let serialize = t1.elapsed();
 
-        // Deserialize (the load path): reconstruct the atom automaton + IR, and
-        // recompile only the per-pattern regexes, skipping the automaton BUILD.
+        // Deserialize (the load path): read back the atom index + IR, and
+        // recompile only the per-pattern regexes, skipping the index BUILD.
         let t2 = Instant::now();
         let loaded = Rules::deserialize(&bytes).expect("deserialize");
         let deserialize = t2.elapsed();
@@ -1003,9 +1008,9 @@ mod serialize_tests {
             "rules: {n_rules}, patterns: {n_patterns}, blob: {} bytes",
             bytes.len()
         );
-        eprintln!("compile from source (incl. atom-automaton build): {compile_from_source:?}");
-        eprintln!("serialize compiled form:                          {serialize:?}");
-        eprintln!("deserialize (load, skips automaton build):        {deserialize:?}");
+        eprintln!("compile from source (incl. atom index build): {compile_from_source:?}");
+        eprintln!("serialize compiled form:                      {serialize:?}");
+        eprintln!("deserialize (load, skips index build):        {deserialize:?}");
         if deserialize.as_nanos() > 0 {
             eprintln!(
                 "speedup (compile / deserialize):                  {:.1}x",

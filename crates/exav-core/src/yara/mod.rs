@@ -10,7 +10,7 @@
 //! database-build time ([`YaraDb::finalize`]) the rules are compiled and the
 //! compiled rule set is serialized into `YaraDb::compiled_blob`, so a prebuilt
 //! `.exavdb` loads the YARA engine WITHOUT recompiling, in particular without
-//! rebuilding the expensive daachorse atom automaton. The daachorse automaton +
+//! extracting the atoms and building their index again. The atom index +
 //! owned IR + per-pattern definitions travel in the blob; only the per-pattern
 //! regexes (whose compiled automata are not serializable) are recompiled from
 //! their stored source on load. The rule *sources* are also retained, so a build
@@ -88,13 +88,14 @@ pub fn compile(src: &str) -> Result<Rules> {
 use serde::{Deserialize, Serialize};
 
 /// Format version of [`YaraDb::compiled_blob`]. Bumped whenever the serialized
-/// compiled-rules layout (the `Rules` blob: IR, pattern defs, atom automaton)
+/// compiled-rules layout (the `Rules` blob: IR, pattern defs, atom index)
 /// changes in an incompatible way. A loaded blob whose version does not match
 /// this build is ignored and the rules are recompiled from source, so a stale
 /// blob is never misread: the coverage is preserved, just without the load-time
 /// shortcut. (This is independent of the outer `.exavdb` format serial in
-/// `crate::database`, which guards the whole file.) Version 2 stores the atom
-/// automatons as binary blobs, with their run tables.
+/// `crate::database`, which guards the whole file.) Version 1 is exav 0.0.1's;
+/// version 2 replaced the atom automaton with the anchor index the signature
+/// engine uses. Bumped once per release at most.
 #[cfg(feature = "yara")]
 const YARA_BLOB_VERSION: u32 = 2;
 
@@ -122,7 +123,7 @@ pub struct YaraDb {
     /// The serialized COMPILED rule set, produced by [`Self::finalize`] at
     /// database-build time (only when built with the `yara` feature). When
     /// present and version-compatible, [`Self::rules`] deserializes it (skipping
-    /// the expensive daachorse atom-automaton build) instead of recompiling from
+    /// the atom extraction and index build) instead of recompiling from
     /// `sources`. This is what makes a prebuilt `.exavdb` load its YARA engine
     /// without recompiling, consistent with the rest of the database (which also
     /// serializes its compiled form). Absent when the database was built without
@@ -177,7 +178,7 @@ impl YaraDb {
     /// validate them and record which rules were rejected (so the coverage gap is
     /// captured in the built database) and (b) SERIALIZE the compiled rule set
     /// into `Self::compiled_blob`, so a prebuilt `.exavdb` loads the YARA engine
-    /// without recompiling (skipping the expensive atom-automaton build), exactly
+    /// without recompiling (skipping the atom extraction and index build), exactly
     /// as the rest of the database serializes its compiled form. Idempotent.
     pub fn finalize(&mut self) {
         #[cfg(not(feature = "yara"))]
@@ -218,7 +219,7 @@ impl YaraDb {
                     return None;
                 }
                 // Fast path: a version-compatible prebuilt compiled blob loads
-                // the rule set (incl. the atom automaton) without recompiling.
+                // the rule set (incl. the atom index) without recompiling.
                 if let Some(blob) = &self.compiled_blob {
                     if self.blob_version == YARA_BLOB_VERSION {
                         match Rules::deserialize(blob) {
@@ -397,7 +398,7 @@ fn preview(rejected: &[String]) -> String {
 // differential (~17k rules, 0 disagreements). The reasons are structural:
 //
 //   * The AV pattern matcher is non-exhaustive by design (it reports the first
-//     hit and stops, and prunes on Aho-Corasick prefilter economics). YARA
+//     hit and stops, and prunes on anchor prefilter economics). YARA
 //     conditions need *exhaustive* per-pattern match sets: counts (`#a`), the
 //     i-th offset/length (`@a[i]`/`!a[i]`), `$a at N`, `$a in (a..b)`, and
 //     `N of`/`P% of` quantifiers all require every match, not just existence.

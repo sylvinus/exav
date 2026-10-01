@@ -4,11 +4,14 @@ exav parses untrusted, attacker-controlled files. The parsing and scanning
 engine is written in safe Rust, which removes the memory-corruption bug class
 that dominates C scanners' CVE history.
 
-**No `unsafe` exists anywhere near hostile file content.** `exav-core` (file
-typing, signature/CVD parsing, PE parsing, the bytecode interpreter, the YARA
-engine), `exav-unpack` (every archive/document decoder), `exav-x86` (the
-instruction decoder), `exav-pe-emu` (the packer emulator) and `exav-update` all
-carry `#![forbid(unsafe_code)]`, which the compiler enforces.
+**exav's own code that reads hostile file content has no `unsafe`.** `exav-core`
+(file typing, signature/CVD parsing, PE parsing, the bytecode interpreter, the
+YARA engine), `exav-unpack` (every archive/document decoder), `exav-x86` (the
+instruction decoder), `exav-pe-emu` (the packer emulator), `exav-grep` and
+`exav-update` all carry `#![forbid(unsafe_code)]`, which the compiler enforces.
+Some third-party decoders they call do use `unsafe` internally; the
+[dependencies page](https://exav.org/reference/dependencies/) counts it per
+crate.
 
 One crate does not: `crates/exav-unpack-wasm`, the WebAssembly bindings
 published to npm. `#[wasm_bindgen]` expands to `unsafe`, and `forbid` cannot be

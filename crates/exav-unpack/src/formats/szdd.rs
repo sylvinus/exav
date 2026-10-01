@@ -57,8 +57,7 @@ pub(crate) fn walk<T>(
         name: szdd_name(&hdr),
         comp_size: (src.len() - 14) as u64,
         size: Some(declared),
-        encrypted: false,
-        unsupported: None,
+        ..MemberMeta::default()
     };
     emit_stream(&meta, &mut rdr, budget, visit)
 }

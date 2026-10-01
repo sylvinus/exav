@@ -52,7 +52,7 @@ fn json_output_is_valid_jsonl_with_expected_fields() {
         .collect();
 
     // First: the EICAR detection. `status` is the same word the human line ends
-    // with, and `category` is absent — it sub-classifies a PARTIAL and there is
+    // with, and `category` is absent: it sub-classifies a PARTIAL and there is
     // nothing to sub-classify here.
     assert_eq!(objs[0]["status"], "FOUND");
     assert!(objs[0]["category"].is_null());
@@ -104,14 +104,10 @@ fn json_infected_only_suppresses_clean() {
 }
 
 /// `--all-matches` must not answer `OK` for a file `--max-input-bytes` says was
-/// never fully examined.
-///
-/// The all-match engine entry takes bytes rather than a file, so it cannot see
-/// the ceiling; the CLI has to route an over-limit file to the single-match path,
-/// which enforces it. Without that, adding a flag about *how many signatures to
-/// report* silently turns a `PARTIAL` into a clean pass — the exact failure the
-/// never-a-silent-clean invariant exists to prevent, and one no signature change
-/// would ever reveal.
+/// never fully examined. Otherwise a flag about *how many signatures to report*
+/// silently turns a `PARTIAL` into a clean pass: the exact failure the
+/// never-a-silent-clean invariant exists to prevent, and one no signature
+/// change would ever reveal.
 #[test]
 fn all_matches_still_reports_a_file_past_the_size_ceiling() {
     let db = TempDir::new().unwrap();
@@ -134,6 +130,14 @@ fn all_matches_still_reports_a_file_past_the_size_ceiling() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let first = stdout.lines().next().unwrap_or_default().to_string();
         let v: serde_json::Value = serde_json::from_str(&first).expect(&first);
+        // The summary counts the bytes scanned: the first 1 MiB, not the 3.
+        let last = stdout.lines().last().unwrap_or_default();
+        let summary: serde_json::Value = serde_json::from_str(last).expect(last);
+        assert_eq!(
+            summary["summary"]["data_scanned_bytes"],
+            1 << 20,
+            "{extra:?}"
+        );
         seen.push((
             out.status.code(),
             v["status"].clone(),
@@ -149,12 +153,50 @@ fn all_matches_still_reports_a_file_past_the_size_ceiling() {
     assert_eq!(seen[0].0, Some(3));
 }
 
+/// The same over stdin, where only the first bytes are held: `--all-matches`
+/// reports the stream's size, as a single-match scan does, not what it held.
+#[test]
+fn all_matches_on_stdin_past_the_size_ceiling_reports_its_size() {
+    use std::io::Write;
+    let db = TempDir::new().unwrap();
+    let mut seen = Vec::new();
+    for extra in [&[][..], &["--all-matches"][..]] {
+        let mut child = exav()
+            .arg("-d")
+            .arg(db.path())
+            .args(["--json", "--max-input-bytes", "4096"])
+            .args(extra)
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("run exav");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&[b'a'; 10_000])
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first = stdout.lines().next().unwrap_or_default().to_string();
+        let v: serde_json::Value = serde_json::from_str(&first).expect(&first);
+        seen.push((out.status.code(), v["status"].clone(), v["reason"].clone()));
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "--all-matches must give the same answer as a single-match scan"
+    );
+    let reason = seen[0].2.as_str().unwrap_or_default();
+    assert!(reason.contains("file size 10000 exceeds"), "{reason}");
+}
+
 /// `--profile` must not change the answer, only add timings beside it.
 ///
 /// It prints a CSV row and returns before the reporting path where every other
 /// mode applies `--partial-as`, so the policy has to be applied there too.
 /// Without that, asking for over-limit files to pass still exits 3 under
-/// `--profile` — a flag about *where the time went* silently overriding a flag
+/// `--profile`: a flag about *where the time went* silently overriding a flag
 /// about *what the verdict is*, in the direction a CI gate would notice only by
 /// failing.
 #[test]
@@ -211,7 +253,7 @@ fn profile_reports_the_same_verdict_as_a_plain_scan() {
 
 /// A detection does not mean the search finished. In `--all-matches` the status
 /// word is `FOUND`, which cannot also say `PARTIAL`, so an incomplete search has
-/// to be reported alongside the detections instead of replacing them — on its
+/// to be reported alongside the detections instead of replacing them: on its
 /// own line in the normal grammar, and as `partial`/`partial_reasons` in JSON.
 ///
 /// Before this, the all-match path discarded the outcome whenever it had
@@ -219,30 +261,23 @@ fn profile_reports_the_same_verdict_as_a_plain_scan() {
 #[test]
 fn all_matches_reports_an_incomplete_search_alongside_detections() {
     let db = TempDir::new().unwrap();
-    // `Test.Hit` is the detection. `Test.Wild` exists to burn the per-group
-    // step budget: its anchor repeats tens of thousands of times and the tail it
-    // searches for is never present, so every hit scans to the end of the file.
-    std::fs::write(
-        db.path().join("t.ndb"),
-        "Test.Hit:0:*:4558415654455354\nTest.Wild:0:*:51574552*5a584356\n",
-    )
-    .unwrap();
+    // `Test.Hit` is the detection, in the first bytes of the sample.
+    std::fs::write(db.path().join("t.ndb"), "Test.Hit:0:*:4558415654455354\n").unwrap();
     let files = TempDir::new().unwrap();
     let sample = files.path().join("sample.bin");
     let mut data = b"EXAVTEST".to_vec();
     data.extend(std::iter::repeat_n(*b"QWER", 50_000).flatten());
     std::fs::write(&sample, &data).unwrap();
 
-    let run = |cap: Option<&str>, json: bool| {
+    let run = |limit: Option<&str>, json: bool| {
         let mut c = exav();
         c.arg("-d").arg(db.path()).arg("--all-matches");
         if json {
             c.arg("--json");
         }
-        if let Some(cap) = cap {
-            // Forces the repeated-anchor cap to refuse the group after its first
-            // charged verify, which is what flags the search truncated.
-            c.env("EXAV_MAX_GROUP_STEPS", cap);
+        if let Some(limit) = limit {
+            // Only the first bytes are scanned, so the search stops short.
+            c.arg("--max-input-bytes").arg(limit);
         }
         c.arg(&sample).output().expect("run exav")
     };
@@ -259,7 +294,7 @@ fn all_matches_reports_an_incomplete_search_alongside_detections() {
 
     // Search truncated: the detection still stands, and the incompleteness is
     // reported next to it in the `[reason ][CATEGORY ]STATUS` grammar.
-    let out = run(Some("1"), false);
+    let out = run(Some("4K"), false);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Test.Hit FOUND"), "{text}");
     let partial = text
@@ -277,7 +312,7 @@ fn all_matches_reports_an_incomplete_search_alongside_detections() {
     );
 
     // Same thing in JSON, as fields rather than a second record.
-    let out = run(Some("1"), true);
+    let out = run(Some("4K"), true);
     let text = String::from_utf8_lossy(&out.stdout);
     let row: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
     assert_eq!(row["status"], "FOUND");

@@ -21,19 +21,9 @@ MIT-licensed, so it does not bundle or redistribute it.
   probing, no `.cdiff` patching, no verification of the CVD's digital signature
   (`dsig`). [`cvdupdate`](https://github.com/Cisco-Talos/cvdupdate)
   (Apache-2.0) and `freshclam` are the supported way to fetch the official
-  database, and they spare Cisco's CDN.
-
-### Then what is `--auto-update`?
-
-`--auto-update` does a plain conditional HTTPS `GET` of the URLs you supply
-(`--sig-sources`, or a prebuilt database at `--db-url`) on a schedule, and
-hot-reloads the result. It is the `exav-update` crate, behind the `http-update`
-[feature](/reference/feature-flags/).
-
-It is not a `freshclam` replacement: it does not discover the current version
-over DNS or apply `.cdiff` patches. Point it at a mirror you run (a `cvdupdate`
-directory served over HTTPS), or at a [`.exavdb`](/guides/prebuilt-database/)
-you built. Cisco's CDN serves only `freshclam` and `cvdupdate`.
+  database, and they spare Cisco's CDN. exav's own
+  [`--auto-update`](#built-in-updater---auto-update) only fetches from a mirror
+  you run.
 
 ## Get the official signatures
 
@@ -60,11 +50,12 @@ From `.cvd`/`.cld` containers or loose files in the directory:
 
 | Extension | Signature type |
 |---|---|
-| `.ndb`, `.db` | body signatures: hex with wildcards (`.db` is the legacy `name=hex` form) |
+| `.ndb` | body signatures: hex with wildcards |
+| `.db` | legacy `Name=HEX` literal signatures (no wildcards) |
 | `.ldb` | logical signatures (boolean expressions over subsignatures) |
 | `.hdb` / `.hsb` | whole-file MD5 / SHA hashes |
 | `.mdb` / `.msb` | PE section hashes |
-| `.fdb` | fuzzy hashes |
+| `.fdb` | exav's own fuzzy hashes, [see below](#exavs-fdb-format) |
 | `.cdb` | container-metadata signatures |
 | `.imp` | PE import hashes (imphash) |
 | `.idb` | PE icon signatures |
@@ -76,13 +67,26 @@ From `.cvd`/`.cld` containers or loose files in the directory:
 | `.pdb` / `.wdb` / `.gdb` | phishing databases |
 | `.pwdb` | passwords for encrypted archives |
 | `.yar` / `.yara` | [YARA rules](/guides/yara/) |
-| `.ndu`, `.ldu`, `.hdu`, `.hsu`, `.mdu` | PUA variants of the above, loaded with `--detect pua` |
+| `.ndu`, `.ldu`, `.hdu`, `.hsu`, `.mdu`, `.msu` | PUA variants of the above, loaded with `--detect pua` |
 | `.cvd` / `.cld` | ClamAV containers of the above: a `.cvd` is a signed, gzip-compressed tar; a `.cld` is the uncompressed form `freshclam` keeps after applying `.cdiff` patches |
 
 See [Supported formats](/reference/formats/) for the archive and container formats
 exav unpacks, and [the comparison](/project/comparison-with-clamav/#signature-format-coverage)
 for how completely each signature format is covered. A signature exav cannot
-load is counted and reported by cause, never dropped silently.
+load is skipped and counted: `-v` prints the total as `Unsupported sigs skipped`
+in the scan summary.
+
+### exav's `.fdb` format
+
+`.fdb` is not a ClamAV format. Each line is one of:
+
+```text
+imphash:<md5 of the PE import table>:<name>
+tlsh:<TLSH digest>:<name>[:<max distance>]
+```
+
+The distance defaults to 100. `imphash` lines match PE files by default; `tlsh`
+lines match only with `--detect exav-heuristics`.
 
 ## Unofficial and third-party feeds
 
@@ -100,25 +104,43 @@ directory.
 
 ## Built-in updater (`--auto-update`)
 
-Add `--auto-update` and point `--sig-sources` / `EXAV_SIG_SOURCES` at source
-URLs, a file of them, or a `freshclam.conf` (exav reads its source directives and
-warns about the rest). A stock `freshclam.conf` names `database.clamav.net`,
-which exav's updater may not use; this is for a `freshclam.conf` that points at
-a private mirror. It works with any `--listen` address, and
-alone for a one-shot scan that should fetch first; with no `--listen` and no
-paths it is only an updater. See the [Docker guide](/guides/docker/), the
+`--auto-update` fetches the URLs you supply on a schedule, with a conditional
+request that transfers nothing when a file has not changed, and hot-reloads the
+result. It is not a `freshclam` replacement: no DNS version probing, no `.cdiff`
+patches. Point it at a mirror you run, or at a
+[`.exavdb`](/guides/prebuilt-database/#pulling-the-database-over-http) you built.
+
+```sh
+# A cvdupdate directory served over HTTPS. The trailing slash makes the URL a
+# mirror base, fetched as main.cvd, daily.cvd and bytecode.cvd.
+exav --auto-update --sig-sources https://mirror.internal/clamav/ \
+  --listen /run/exav/exav.sock
+```
+
+`--sig-sources` (or `EXAV_SIG_SOURCES`) also takes exact file URLs, a file
+listing sources, or a `freshclam.conf`: exav reads its source directives and
+warns about the rest. exav does not refuse a stock `freshclam.conf`, which names
+Cisco's `database.clamav.net`; use it only with one that names your own mirror.
+`--auto-update` works with any `--listen` address, and alone for a one-shot scan
+that should fetch first; with no `--listen` and no paths it is only an updater.
+See the [Docker guide](/guides/docker/), the
 [CLI reference](/reference/cli/#signature-lifecycle) and
 [Configuration](/reference/configuration/).
 
-Each source is saved as `<sig-dir>/env/<host>/<url path>/<name>-<hash>.<ext>`,
-keeping the extension its URL ends in, so the URL has to name the file it
-serves: `https://mirror/daily.cvd` works, while `https://feeds/get.php?db=daily`
-ends in `.php`, which the loader does not route. exav warns about such a source
-at startup.
+The updater needs the `http-update` [feature](/reference/feature-flags/). The
+Docker image has it; the release binaries and a plain `cargo install exav` do
+not (see [Installation](/getting-started/installation/)). It runs on Unix only.
+
+Each source is saved under the signature directory (`-d` when given, else
+`--sig-dir`) as `env/<host>/<url path>/<name>-<hash>.<ext>`, keeping the
+extension its URL ends in, so the URL has to name the file it serves:
+`https://mirror/daily.cvd` works, while `https://feeds/get.php?db=daily` ends in
+`.php`, which the loader does not route. exav warns about such a source at
+startup.
 
 <Aside type="caution">
-The built-in updater does a plain HTTPS fetch with no signature verification, so
-point it only at a mirror you trust. For verified updates, use `freshclam` or
+The built-in updater does no signature verification, so point it only at a
+mirror you trust, over HTTPS. For verified updates, use `freshclam` or
 `cvdupdate` and let exav hot-reload the directory.
 </Aside>
 

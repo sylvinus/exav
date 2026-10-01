@@ -14,13 +14,15 @@ exav file.bin                     # scan one file
 exav /var/www                     # scan a directory, recursively
 exav --no-recursive /var/www      # just the directory's own files
 exav --quiet /data                # only print detections, partial results and errors
+exav --files-from list.txt        # paths from a file, one per line
 cat file.zip | exav -             # scan stdin
 exav --allow-http-scan https://host/obj.zip   # over HTTP range requests (an `http-scan` build)
 exav -d ./mydb /data              # use a signature database (file or dir)
 ```
 
-All examples assume signatures are loaded, with `-d`/`--database`, or from
-`--sig-dir` (default `/var/lib/exav`). See [Signatures](/guides/signatures/).
+Examples without `-d` load `--sig-dir`: `/var/lib/exav` by default, or
+`EXAV_SIG_DIR` as set in the [quick start](/getting-started/quick-start/). See
+[Signatures](/guides/signatures/).
 
 ### Stdin
 
@@ -30,13 +32,10 @@ a temporary file past 16 MiB), then gets the same scan as a file. See
 
 ### Scanning over HTTP
 
-An object up to `--max-object-bytes` is read once, in full. A larger one is read
-through range requests as the scan needs it, and some parts of it more than once:
-the checks that look at an object whole (overlapping ZIP records, overlapping
-partitions, broken media and executable headers) read it again after extraction
-has walked the members. A request that continues the previous one fetches twice
-as much, up to 8 MiB, so reading straight through an object takes few requests;
-one elsewhere in it fetches 64 KiB.
+The server must answer range requests. An object up to `--max-object-bytes` is
+read once, in full; a larger one is read in ranges as the scan needs them, some
+parts more than once (see
+[the block cache](/concepts/streaming-memory/#past-it-through-a-block-cache)).
 
 To pay in disk instead of transfer (metered egress, a slow link, per-request
 billing), download the object and scan the file:
@@ -62,6 +61,8 @@ summary:
 
 A file that could not be fully examined ends with the reason, then the
 [category](/reference/verdicts/) of the condition, then the status `PARTIAL`.
+(The `huge.bin` line comes from a run with `--max-input-bytes 4G`; by default
+there is no input size limit.)
 
 `--quiet` suppresses the `OK` lines and the summary, never an error; `-v` adds
 detail.
@@ -69,8 +70,9 @@ detail.
 ### JSON output
 
 `--json` emits newline-delimited JSON: one object per scanned input, then a
-summary object. Keys come out in alphabetical order, and `findings` (the detected
-type, and more with `-v`) is on every result that has any:
+summary object (left out under `--quiet`). Keys come out in alphabetical order,
+and `findings` (the detected type, and more with `--detect exav-heuristics`) is
+on every result that has any, with or without `-v`:
 
 ```console
 $ exav --json /data
@@ -84,9 +86,13 @@ $ exav --json /data
 `category` only appears on a `PARTIAL`, so filter on `status`:
 
 ```sh
-exav --json /data | jq 'select(.status=="PARTIAL")'              # not fully examined
+exav --json /data | jq 'select(.status=="PARTIAL" or .partial)'  # not fully examined
 exav --json /data | jq 'select(.status and .status != "OK")'     # everything not clean
 ```
+
+`.partial` covers `--all-matches`, where a result lists its detections in
+`signatures` and carries `"partial":true` and `partial_reasons` when the search
+stopped short.
 
 ### Verbose findings
 
@@ -118,16 +124,11 @@ nested below it and lets files directly inside through. To anchor it, write
 
 ## Exit codes
 
-| Code | Status | Meaning |
-|---|---|---|
-| `0` | `OK` | Everything fully scanned, no matches. |
-| `1` | `FOUND` | At least one detection. |
-| `2` | `ERROR` | exav could not do its job: an unreadable path, a database that would not load. |
-| `3` | `PARTIAL` | A file could not be fully examined: `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. |
-
-`3` is kept apart from `2` so that "the scanner broke" and "this file needs a
-decision" are different signals. [`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes)
-maps `3` to another status. See [Verdicts & exit codes](/reference/verdicts/).
+`0` `OK`, `1` `FOUND`, `2` `ERROR` (exav could not do its job), `3` `PARTIAL` (a
+file could not be fully examined). `3` is kept apart from `2` so that "the
+scanner broke" and "this file needs a decision" are different signals;
+[`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes) maps it to
+another status. See [which code a run exits with](/reference/verdicts/#process-exit-code).
 
 ## Encrypted archives
 
@@ -139,12 +140,10 @@ exav --passwords secret --passwords hunter2 /data     # tried in order
 exav --passwords-from /etc/exav/passwords /data       # kept out of `ps`
 ```
 
-Passwords also load from a ClamAV `.pwdb` database in the signature directory.
-exav decrypts ZIP (ZipCrypto and WinZip AES), encrypted DMG, 7z AES-256, PDF,
-garbled ARJ, and Office: legacy XLS (RC4, RC4 CryptoAPI, XOR) and OOXML (AES
-standard and agile). For Office it also tries Excel's default `VelvetSweatshop`
-and the empty password without being asked. RAR AES and PKWARE Strong Encryption
-are detected but not decrypted.
+Passwords also load from a ClamAV `.pwdb` database in the signature directory,
+and a few common ones are tried without being asked. See
+[Encryption support](/reference/formats/#encryption-support) for the formats
+exav decrypts and the passwords it tries by default.
 
 An encrypted ZIP appended to a picture or a document (a polyglot that archive
 tools open by its trailing directory) is reported the same way once its structure
@@ -153,7 +152,8 @@ is confirmed.
 ## Heuristics
 
 A small set of low-false-positive heuristics runs by default, the ones ClamAV
-itself reports (imphash matching and the PDF obfuscated-name check).
+itself reports: imphash matching, the PDF obfuscated-name check, overlapping ZIP
+records and the XZ dictionary-size check.
 `--detect exav-heuristics` adds exav's own (TLSH fuzzy matching, a hand-weighted
 static scorer, and a packed-with-injection-imports check), which carry more
 false-positive risk and are opt-in:

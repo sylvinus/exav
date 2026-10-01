@@ -18,21 +18,24 @@ readme = "README.md"
 # would otherwise download it. Clone the repository to run the suites.
 exclude = ["tests/fixtures/**", "test_data/**"]
 
-# The extractor CLI ships with the library rather than as a separate package.
-# It is a thin shell over the public API and needs nothing the library does not
-# already have (no argument parser, no error crate), so a library consumer pays
-# nothing for it (Cargo builds only the lib target for a dependency), and
-# `cargo install exav-unpack` gives the command, which is where people look for
-# it.
+# The extractor CLI ships with the library rather than as a separate package,
+# so `cargo install exav-unpack` gives the command, which is where people look
+# for it. Its one dependency of its own (`chrono`, for local times) is behind
+# the `cli` feature, which a library consumer turning default features off
+# never builds.
 [[bin]]
 name = "exav-unpack"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 # Always-on (format-agnostic) deps.
 thiserror = "2"
 # fast substring search (locating the UPX PackHeader magic, etc.)
 memchr = "2"
+# The CLI's local times: a DOS timestamp is a local time, and `-l` lists in
+# local time, as unzip does. Already in the tree through `delharc`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 
 # The x86 emulator that runs a packer's stub (`exav-pe-emu`). Its own crate because
 # it is useful on its own and because it is the only thing that needs a CPU
@@ -93,8 +96,6 @@ base64 = { version = "0.22", optional = true }
 quick-xml = { version = "0.41", optional = true }
 des = { version = "0.9", default-features = false, optional = true }
 cbc = { version = "0.2", optional = true }
-bincode = { version = "1", optional = true }
-serde = { version = "1.0.228", features = ["derive"], optional = true }
 flate2 = { version = "1.1.9", optional = true }
 # ZIP method 9 (Deflate64 / "enhanced deflate"). A leaf dep: zero runtime
 # dependencies, MIT, and `#![forbid(unsafe_code)]` like this crate. It is the
@@ -113,7 +114,9 @@ ruzstd = { version = "0.8", optional = true }
 crc32fast = { version = "1.5.0", optional = true }
 
 [features]
-default = ["all-formats", "decrypt"]
+default = ["all-formats", "decrypt", "cli"]
+# The `exav-unpack` command.
+cli = ["dep:chrono"]
 # Makes a reserved byte prefix panic from inside the format dispatch, so the
 # `catch_unwind` boundary in `walk` can be tested for what it is: the
 # thing that turns an arbitrary decoder panic into a reported limit instead of a
@@ -239,7 +242,7 @@ email = ["dep:mail-parser", "dep:base64"]
 # the `decrypt` feature, not here.
 dmg = [
     "dep:hfsplus", "dep:apfs", "dep:lzfse_rust", "dep:xz4rust", "bzip2-decoder",
-    "dep:flate2", "dep:base64", "dep:quick-xml", "dep:bincode", "dep:serde",
+    "dep:flate2", "dep:base64", "dep:quick-xml",
 ]
 
 # Decryption of encrypted members (ZIP ZipCrypto/WinZip-AES, PDF standard
@@ -291,7 +294,7 @@ required-features = ["pe-emu"]
 # independent, but they run in every other feature pass.
 [[test]]
 name = "cli"
-required-features = ["zip"]
+required-features = ["zip", "cli"]
 
 [dev-dependencies]
 # Used only in tests to compare decoder output against external-oracle digests.

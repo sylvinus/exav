@@ -91,7 +91,7 @@ asserts it.
 
 ```sh
 make test     # everything CI runs, bar diff-testing and fuzzing
-make lint     # cargo clippy --all-targets -D warnings + cargo fmt --check
+make lint     # the clippy passes and cargo fmt --check CI runs
 ```
 
 `make test` is the whole tree, not just `cargo test`. Each part also runs alone:
@@ -100,12 +100,13 @@ make lint     # cargo clippy --all-targets -D warnings + cargo fmt --check
 | --- | --- | --- |
 | `make test-native` | the workspace under every feature pass: default, `http`, `exav-unpack` with `checksums`, `--no-default-features`, `unstable-internals`, `testing-faults` | nothing extra |
 | `make test-wasm` | the extractor + core unit tests on 32-bit `wasm32-wasip1` | `wasmtime` |
-| `make test-js` | the WASM bindings' vitest units and playwright browser e2e | node, wasm-pack |
-| `make test-www` | `astro check` + a full docs build (broken links, bad frontmatter) | node |
+| `make test-js` | the WASM bindings' vitest units and playwright browser e2e | node, wasm-pack, python3 |
+| `make test-www` | `astro check`, a full docs build, and a check that every internal link and anchor resolves | node |
 
-The two **differential** harnesses are not in `make test` and are not merge
-gates: they measure exav against another engine, so they can go red because the
-*other* engine changed. Run them when you touch the matching subsystem.
+The two **differential** harnesses are not in `make test`: they measure exav
+against another engine, so they can go red because the *other* engine changed.
+Run them when you touch the matching subsystem. CI runs the YARA one on every
+pull request; the clamd one needs a corpus and runs by hand.
 
 | harness | what it compares |
 | --- | --- |
@@ -117,8 +118,8 @@ one: a test file that opens `#![cfg(feature = "x")]` compiles to **zero tests**
 without `x`, and the run reports green having checked nothing. Run `make test`
 before you push.
 
-CI additionally runs `cargo audit`, `cargo deny check`, and a `cargo-fuzz` smoke
-pass.
+CI additionally runs `cargo audit`, `cargo deny check`, the MSRV build, the WASM
+builds, and a `cargo-fuzz` smoke pass over every fuzz target.
 
 **Run the wasm32 tests if you touch a decoder or byte-parsing path.** `usize` is
 32-bit on the `wasm32` build exav ships, so integer- and capacity-overflow bugs on

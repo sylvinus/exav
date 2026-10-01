@@ -3,20 +3,25 @@ title: License
 description: exav is MIT-licensed, statically links permissively licensed dependencies, and never bundles the GPL ClamAV signature database.
 ---
 
-exav is licensed under the MIT License (see `LICENSE` in the repository).
+exav is licensed under the MIT License (see
+[`LICENSE`](https://github.com/sylvinus/exav/blob/main/LICENSE)).
 
 ## Third-party notices
 
 The exav binary statically links third-party crates under permissive licenses,
-whose required notices are reproduced in `NOTICE`. Among them:
+whose required notices are reproduced in
+[`NOTICE`](https://github.com/sylvinus/exav/blob/main/NOTICE). A build with the
+`http` feature, such as the published image, also links the `ring` TLS
+primitives and the `webpki-roots` certificate store. Among the rest:
 
 - exav's [native YARA engine](/guides/yara/) reuses and adapts the YARA-X parser,
   source and test vectors under BSD-3-Clause, with attribution retained
-  (`LICENSE-YARA-X`). It compiles rules to a native tree-walking evaluator, with
-  no WASM runtime or JIT behind it.
-- exav also contains code ported from permissively licensed projects (RAR, AZO,
-  CAB, DMG, HWP, PPMd and bzip2 decoders among them, and `iced-x86`'s generated decoder
-  tables), each attributed in `NOTICE`.
+  ([`crates/exav-core/LICENSE-YARA-X`](https://github.com/sylvinus/exav/blob/main/crates/exav-core/LICENSE-YARA-X)).
+  It compiles rules to a native tree-walking evaluator, with no WASM runtime or
+  JIT behind it.
+- exav also contains code ported or derived from permissively licensed projects
+  (RAR, AZO, CAB, DMG, PPMd and bzip2 decoders among them, the HWP3 layout, and
+  `iced-x86`'s generated decoder tables), each attributed in `NOTICE`.
 - The WASM sandbox runs exav under a WASI runtime you provide, under its own
   license; exav does not bundle it. See the [WASM sandbox guide](/guides/wasm-sandbox/).
 

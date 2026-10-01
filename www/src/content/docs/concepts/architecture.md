@@ -4,7 +4,8 @@ description: How exav is organized, the crate layout, and how each ClamAV signat
 ---
 
 exav is a small set of focused crates around one scanning engine. This is the
-high-level picture; implementation detail lives in the repository's `docs/`.
+high-level picture; implementation detail lives in the repository's
+[`docs/`](https://github.com/sylvinus/exav/tree/main/docs).
 
 ## Input
 
@@ -78,15 +79,9 @@ about the file: a path it cannot open, a database that will not load, or a
 source that fails part way through a scan, whose unread bytes are not taken for
 the end of the file (see [Verdicts & exit codes](/reference/verdicts/)).
 
-### Content-based typing
-
-File type is decided by magic bytes, not by extension: an executable renamed
-`.jpg` is still typed and scanned as an executable.
-
-### Recursive unpacking, bounded
-
-See [Archive extraction](/concepts/archive-extraction/) for the budgets every
-extraction runs under and what a member exav cannot read becomes.
+File type comes from the content, not the extension: an executable renamed
+`.jpg` is still scanned as an executable. The budgets every extraction runs
+under are in [Archive extraction](/concepts/archive-extraction/).
 
 ## How the crates compose
 
@@ -94,7 +89,8 @@ exav is a small Cargo workspace, not one binary. Two front ends drive the
 engine, `exav-core`: the CLI (which is also the daemon) and the WASI build. Two
 more use only the extractor, `exav-unpack`: the archive grep, and the
 WebAssembly bindings published to npm (built outside the workspace, with their
-own profile). `exav-update`, enabled by the `http` feature, sits to the side,
+own profile). `exav-update`, enabled by the `http-update` feature (part of
+`http`), sits to the side,
 feeding fresh signatures out of band.
 
 Every arrow points down. Nothing below calls anything above it, which is what
@@ -107,7 +103,7 @@ lets the extraction crates be taken on their own.
   depend on exav-core; exav-core, exav-grep and exav-unpack-wasm all depend on
   exav-unpack, which depends on exav-pe-emu, which depends on exav-x86.
   exav-core also depends on exav-x86 directly, for the bytecode disassembly
-  API. exav-update, optional behind the http feature, hangs off exav alone and
+  API. exav-update, optional behind the http-update feature, hangs off exav alone and
   feeds signature files out of band.</desc>
   <defs>
     <marker id="crate-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
@@ -152,7 +148,7 @@ lets the extraction crates be taken on their own.
     <text x="395" y="396">#![forbid(unsafe_code)]</text>
     <text x="395" y="494">x86-32 sandbox</text>
     <text x="395" y="594">decoder</text>
-    <text x="96" y="594">optional: http feature</text>
+    <text x="96" y="594">optional: http-update feature</text>
     <text x="126" y="292" text-anchor="start">bytecode disasm</text>
     <text x="510" y="468" text-anchor="start">runs a packer's own stub to</text>
     <text x="510" y="484" text-anchor="start">recover the image it rebuilds</text>
@@ -193,27 +189,35 @@ than one matcher:
 
 | Source | Runtime structure | Matching |
 |---|---|---|
-| `.ndb` bodies + `.ldb` literal subsignatures | a set of **Aho-Corasick automata**, one per (target type, case) pair, keyed on a literal anchor per body | an automaton hit fans out to every body sharing that anchor; each candidate is then verified (wildcards / gaps / nibbles / alternation / offset / nocase) |
-| `.ldb` PCRE subsignatures | regexes compiled lazily, gated by the trigger expression | linear-time `regex`; patterns with backreferences use a backtracking engine under a step bound |
+| `.ndb` / `.db` bodies + `.ldb` body subsignatures | an **index of literal anchors**, one per body, each tagged with its (target type, case) partition; a body pinned near a fixed offset is kept out of it | the index is looked up at each position of the object, and a hit fans out to every body sharing that anchor; each candidate is then verified (wildcards / gaps / nibbles / alternation / offset / nocase). A pinned body is checked where it can start |
+| `.ldb` PCRE subsignatures | regexes compiled lazily, gated by the trigger expression | linear-time `regex`; patterns with lookaround or backreferences use a backtracking engine under a step bound |
 | `.hsb` / `.hdb` | a size-keyed hash table | whole-file digest lookup |
 | `.mdb` / `.msb` | a section-hash table | per-PE-section digest lookup |
 | `.cdb` | container-metadata matchers | matched on archive members (name/size/encryption/position) |
 | `.imp` | a size-constrained import-hash map | PE imphash lookup |
-| `.cbc` | a [sandboxed bytecode interpreter](/concepts/bytecode-sandbox/) (no JIT) | trigger-gated programs run on extracted buffers |
+| `.fdb` | an imphash map and a list of TLSH digests | imphash lookup; TLSH distance to each digest, under the signature's threshold |
+| `.cbc` | a [sandboxed bytecode interpreter](/concepts/bytecode-sandbox/) (no JIT) | a program runs on an object when its trigger matches; a hook program on every file of its type |
 | `.yar` / `.yara` | a [native YARA engine](/guides/yara/) | near-full YARA, no runtime codegen |
 
-So the engine is a set of Aho-Corasick automata (fed by `.ndb` and `.ldb` literal
-subsignatures), several cheap hash tables, lazy regexes and interpreters. Almost
-all of the memory cost is the automata; see the
-[prebuilt database](/guides/prebuilt-database/).
+The other formats (icons, certificates, file-type magic, allowlists, ignore
+lists, phishing and passwords) are listed in
+[Signatures](/guides/signatures/#formats-exav-loads). So the engine is an
+anchor index, hash tables, lazy regexes and interpreters. Most of the memory is
+the compiled bodies, the index and the hash tables; see the
+[prebuilt database](/guides/prebuilt-database/#what-it-costs).
 
 ## How a body signature is matched
 
+A body is hex with wildcards (`??`, nibbles such as `a?`), gaps (`{10-}`) and
+alternations, optionally tied to an offset: `0:` (the start), `EOF-n`, `EP+n`
+(the entry point) or `Sn+n` (section `n`). A `::f` modifier asks for a match
+on word boundaries.
+
 <svg viewBox="0 0 790 556" role="img" aria-labelledby="matn matd" style="width:100%;height:auto;max-width:790px">
   <title id="matn">From anchor hit to detection</title>
-  <desc id="matd">An object's bytes, and a lowercased view of them for
-  case-insensitive anchors, go through the partitions whose target fits the
-  file type. One Aho-Corasick sweep reports every anchor hit as a group and an
+  <desc id="matd">An object's bytes go through the partitions whose target
+  fits the file type. One sweep looks up the anchor index at each position, on
+  the bytes folded to lowercase, and reports every anchor hit as a group and an
   offset. Each hit fans out to every body sharing the anchor, and each is
   verified around the hit. A verified .ndb body is a detection. A verified .ldb
   subsignature is counted, and the logical expressions of the .ldb signatures
@@ -236,14 +240,14 @@ all of the memory cost is the automata; see the
   <g fill="currentColor" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" text-anchor="middle">
     <text x="128" y="48">object</text>
     <text x="541" y="48">partitions, by (target, case)</text>
-    <text x="541" y="144">one Aho-Corasick sweep</text>
+    <text x="541" y="144">one sweep over the anchor index</text>
     <text x="541" y="240">fan out, then verify each body</text>
     <text x="193" y="364">.ndb body verified</text>
     <text x="597" y="364">.ldb subsignature verified</text>
     <text x="597" y="484">logical expression</text>
   </g>
   <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11.5" opacity="0.72" text-anchor="middle">
-    <text x="128" y="66">its bytes, and a lowercased view</text>
+    <text x="128" y="66">its bytes, read once</text>
     <text x="541" y="66">only those whose target fits the file type run</text>
     <text x="541" y="162">every anchor at once: hits as (group, offset)</text>
     <text x="541" y="260">every body sharing the anchor: prefix back, suffix</text>
@@ -267,27 +271,39 @@ all of the memory cost is the automata; see the
 
 An anchor is a literal run each body must contain; everything else in the body
 (wildcards, nibbles, alternations, gaps, the offset) is checked only where an
-anchor hit. Anchors are split by target type and case, so a scan runs only the
-automata that can matter for the object's type, and a PE never walks the
-HTML-only anchors. The automata that apply advance together over one read of
-the object, whatever the number of signatures in them, so the processor waits on
-their memory at the same time; case-insensitive ones read each byte lowercased.
+anchor hit. Every anchor is in one index, tagged with its target type and case,
+and a lookup reports only the partitions that can matter for the object's type,
+so a PE never verifies an HTML-only body. An anchor is indexed by the bytes of
+it the signature set shares least: the whole anchor at one to three bytes, four
+of them at four or five, and past that two overlapping six-byte windows, of
+which only the one at an even position is looked up. Filters small enough to
+stay in cache turn away most positions before the tables are read. Every anchor is looked up on the bytes
+folded to lowercase, and a case-sensitive one is then compared exactly; the
+object is copied lowercased only when a case-insensitive body has to be
+verified. The object is read once, whatever the number of signatures.
+
+A body whose offset pins it to a window of starts at most 4096 bytes wide,
+counted from the start, the end, the entry point or a section (`0:`, `EP+0:`,
+`100,50:`), is not
+indexed: it is checked at the places it can start, and costs nothing elsewhere
+in the object.
 
 Verification never backtracks: a body is a sequence of elements, and the
 positions it can have reached after each one are kept as a set of intervals, so
 a `{10-}` gap widens an interval instead of multiplying attempts. Backtracking
 is left to PCRE subsignatures with lookaround or backreferences, which are not
 regular and so cannot run on the linear engine: they run on a backtracking
-engine under a step bound, after a linear prefilter (the pattern with its
-lookarounds removed, which matches at least as much) has ruled most objects out.
+engine under a step bound. For lookaround, a linear prefilter (the pattern with
+its lookarounds removed, which matches at least as much) rules most objects out
+first.
 
 ### How far a check reads around a hit
 
 <svg viewBox="0 0 790 310" role="img" aria-labelledby="lkn lkd" style="width:100%;height:auto;max-width:790px">
   <title id="lkn">How far a check reads around an anchor hit</title>
   <desc id="lkd">An object drawn as a strip of 64 KiB blocks. The sweep reads
-  it in order, a chunk at a time, carrying the automaton's state across chunk
-  seams. At an anchor hit, verification reads the body's prefix backward from
+  it in order, a chunk at a time, looking up the anchors that straddle a chunk
+  seam from the bytes on each side. At an anchor hit, verification reads the body's prefix backward from
   the anchor and its suffix forward, as far as the body needs; a gap with no
   upper bound can reach the end of the object. A block no longer in the cache
   is read again. The cache bounds what is held, not how far a check reaches.</desc>
@@ -322,7 +338,7 @@ lookarounds removed, which matches at least as much) has ruled most objects out.
     <path d="M296 54 V66"/><path d="M584 54 V66"/>
   </g>
   <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11.5" opacity="0.72">
-    <text x="8" y="46">sweep: in order, a chunk at a time; the automaton's state carries across seams, so nothing is read twice</text>
+    <text x="8" y="46">sweep: in order, a chunk at a time; an anchor across a seam is looked up there, so nothing is read twice</text>
     <text x="130" y="180">prefix: read backward from the anchor</text>
     <text x="490" y="180">suffix: read forward</text>
     <text x="490" y="214">a {n-} gap can reach the end of the object</text>
@@ -333,9 +349,10 @@ lookarounds removed, which matches at least as much) has ruled most objects out.
   </g>
 </svg>
 
-Neither the sweep nor a check has a window to fall out of. The automata read
-the object once, in order, and their state carries from one chunk to the next,
-so an anchor split across a seam is found without re-reading anything. A check
+Neither the sweep nor a check has a window to fall out of. The sweep reads the
+object once, in order, and looks up the few positions before a seam from the
+bytes on both sides of it, so an anchor split across a seam is found without
+re-reading the chunk. A check
 asks for the bytes it needs at their offset, before or after the hit, from
 memory or, past `--max-object-bytes`, from the
 [block cache](/concepts/streaming-memory/#past-it-through-a-block-cache).
@@ -345,154 +362,14 @@ YARA strings) run as lazy DFAs stepped through it, forward to find where a match
 ends and backward from there to find where it starts. A PCRE with lookaround
 runs its lookaround-free superset that way: when that finds nothing, the PCRE
 cannot match either; when it finds something, the scan is `LIMITS-EXCEEDED`
-unless something else is found, as it is when a lazy DFA meets a construct it
-cannot follow (a Unicode word boundary next to a non-ASCII byte).
+unless something else is found. The same holds for a PCRE with a backreference
+whose trigger holds, and when a lazy DFA meets a construct it cannot follow (a
+Unicode word boundary next to a non-ASCII byte).
 
-## Reading an object not held in memory
+## Memory and spill files
 
-<svg viewBox="0 0 790 392" role="img" aria-labelledby="bcn bcd" style="width:100%;height:auto;max-width:790px">
-  <title id="bcn">One source, read through a block cache</title>
-  <desc id="bcd">A file, an HTTP range reader or a spill file is read through a
-  block cache of 64 KiB blocks holding 8 MiB. Every check asks it for bytes at
-  an offset: the signature sweep a chunk at a time in order, verification and
-  the container walk at any offset, the regexes stepped through, the hashes,
-  typing's search and carving in one shared pass. The checks that parse an object whole run only when it fits within
-  --max-object-bytes.</desc>
-  <defs>
-    <marker id="bc-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 0 L8 4 L0 8 z" fill="currentColor"/>
-    </marker>
-  </defs>
-  <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11" font-weight="600" letter-spacing=".08em" opacity="0.6">
-    <text x="8" y="16">SOURCES</text>
-    <text x="520" y="16">WHAT READS IT</text>
-  </g>
-  <g fill="none" stroke="currentColor" stroke-width="1.5">
-    <rect x="8" y="28" width="170" height="48" rx="6"/>
-    <rect x="8" y="96" width="170" height="48" rx="6"/>
-    <rect x="8" y="164" width="170" height="48" rx="6"/>
-    <rect x="230" y="84" width="230" height="136" rx="6"/>
-    <rect x="520" y="28" width="262" height="44" rx="6"/>
-    <rect x="520" y="84" width="262" height="44" rx="6"/>
-    <rect x="520" y="140" width="262" height="44" rx="6"/>
-    <rect x="520" y="196" width="262" height="44" rx="6"/>
-    <rect x="520" y="252" width="262" height="44" rx="6"/>
-    <rect x="520" y="324" width="262" height="56" rx="6" stroke-dasharray="4 4"/>
-  </g>
-  <g fill="currentColor" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600">
-    <text x="93" y="50" text-anchor="middle">file</text>
-    <text x="93" y="118" text-anchor="middle">HTTP range</text>
-    <text x="93" y="186" text-anchor="middle">spill file</text>
-    <text x="345" y="112" text-anchor="middle">BlockCache</text>
-    <text x="532" y="48">signature sweep</text>
-    <text x="532" y="104">verification</text>
-    <text x="532" y="160">regexes</text>
-    <text x="532" y="216">hashes · typing · carving</text>
-    <text x="532" y="272">container walk</text>
-    <text x="532" y="346">whole-object checks</text>
-  </g>
-  <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11.5" opacity="0.72">
-    <text x="93" y="66" text-anchor="middle">past --max-object-bytes</text>
-    <text x="93" y="134" text-anchor="middle">a request per block</text>
-    <text x="93" y="202" text-anchor="middle">a large member or view</text>
-    <text x="345" y="136" text-anchor="middle">64 KiB blocks, 8 MiB held,</text>
-    <text x="345" y="154" text-anchor="middle">least recently used dropped;</text>
-    <text x="345" y="172" text-anchor="middle">bytes at any offset, or in</text>
-    <text x="345" y="190" text-anchor="middle">1 MiB chunks in order</text>
-    <text x="532" y="64">chunks in order, one pass</text>
-    <text x="532" y="120">windows at any offset</text>
-    <text x="532" y="176">lazy DFAs stepped through</text>
-    <text x="532" y="232">one shared pass; start and end</text>
-    <text x="532" y="288">headers and members, by offset</text>
-    <text x="532" y="366">held whole only: PE, RAR, OLE</text>
-  </g>
-  <g fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#bc-arrow)">
-    <path d="M178 52 H200 V120 H226"/>
-    <path d="M178 120 H226"/>
-    <path d="M178 188 H200 V150 H226"/>
-    <path d="M460 120 H490 V50 H516"/>
-    <path d="M490 106 H516"/>
-    <path d="M490 120 V162 H516"/>
-    <path d="M490 162 V218 H516"/>
-    <path d="M490 218 V274 H516"/>
-  </g>
-</svg>
-
-What the cache holds, and which checks parse an object whole and so do not run
-past `--max-object-bytes`, is in
-[Streaming & memory](/concepts/streaming-memory/#past-it-through-a-block-cache).
-
-## Where the spill fits
-
-<svg viewBox="0 0 790 330" role="img" aria-labelledby="spn spd" style="width:100%;height:auto;max-width:790px">
-  <title id="spn">The two uses of spill files</title>
-  <desc id="spd">Before a scan, a stream (stdin, INSTREAM, ICAP) is held in
-  memory up to --spill-threshold-bytes and then in a temporary file up to
-  --max-spill-bytes, and becomes a seekable source for the scan. Inside a scan,
-  a streamed archive member that decodes past --max-object-bytes, and the normalised
-  text views of a large text file, are written to spill files and read back
-  through a block cache. A stream past its budget, or past the threshold with
-  --spill-dir off, has what was held scanned; with --spill-dir off, such a
-  member or view is not scanned. Either way a scan that finds nothing is
-  LIMITS-EXCEEDED.</desc>
-  <defs>
-    <marker id="sp-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 0 L8 4 L0 8 z" fill="currentColor"/>
-    </marker>
-  </defs>
-  <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11" font-weight="600" letter-spacing=".08em" opacity="0.6">
-    <text x="8" y="16">BEFORE THE SCAN: A STREAM</text>
-    <text x="8" y="176">INSIDE THE SCAN: WHAT IT MAKES</text>
-  </g>
-  <g fill="none" stroke="currentColor" stroke-width="1.5">
-    <rect x="8" y="28" width="170" height="60" rx="6"/>
-    <rect x="214" y="28" width="170" height="60" rx="6"/>
-    <rect x="420" y="28" width="170" height="60" rx="6"/>
-    <rect x="626" y="28" width="156" height="60" rx="6"/>
-    <rect x="8" y="188" width="250" height="60" rx="6"/>
-    <rect x="8" y="258" width="250" height="60" rx="6"/>
-    <rect x="310" y="222" width="190" height="60" rx="6"/>
-    <rect x="552" y="222" width="230" height="60" rx="6"/>
-  </g>
-  <g fill="currentColor" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" text-anchor="middle">
-    <text x="93" y="52">stdin · INSTREAM</text>
-    <text x="299" y="52">RAM</text>
-    <text x="505" y="52">temp file</text>
-    <text x="704" y="52">the scan</text>
-    <text x="133" y="212">member past the limit</text>
-    <text x="133" y="282">text views, large file</text>
-    <text x="405" y="246">spill file</text>
-    <text x="667" y="246">scanned from there</text>
-  </g>
-  <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11.5" opacity="0.72" text-anchor="middle">
-    <text x="93" y="72">ICAP bodies</text>
-    <text x="299" y="72">--spill-threshold-bytes</text>
-    <text x="505" y="72">--max-spill-bytes</text>
-    <text x="704" y="72">a seekable source</text>
-    <text x="133" y="232">decoded past --max-object-bytes</text>
-    <text x="133" y="302">HTML, text, JS normalised</text>
-    <text x="405" y="266">written as it is made</text>
-    <text x="667" y="266">through a block cache</text>
-  </g>
-  <g fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#sp-arrow)">
-    <path d="M178 58 H210"/>
-    <path d="M384 58 H416"/>
-    <path d="M590 58 H622"/>
-    <path d="M258 218 H284 V248 H306"/>
-    <path d="M258 288 H284 V256 H306"/>
-    <path d="M500 252 H548"/>
-  </g>
-  <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11.5" opacity="0.72">
-    <text x="8" y="116">Past --max-spill-bytes, or past the threshold with --spill-dir off, what was held is</text>
-    <text x="8" y="134">scanned and the stream is LIMITS-EXCEEDED unless that finds something.</text>
-    <text x="8" y="152">--max-total-spill-bytes bounds every spill file of a process together.</text>
-  </g>
-</svg>
-
-The library never writes to disk itself: the host hands a scan somewhere to
-spill (the `exav` binary passes its `--spill-dir` files and budgets). Only a
-member decoded as it is read can spill; one decoded whole is bounded by
-`--max-object-bytes` (see [Archive members](/concepts/streaming-memory/#archive-members)).
-Without a spill, a member that decodes past `--max-object-bytes` is not scanned,
-the normalised views of a text file that large are skipped, and a scan that
-found nothing is `LIMITS-EXCEEDED` rather than `OK`.
+An object larger than `--max-object-bytes` is read through a block cache rather
+than held, and a member or text view too large to hold is written to a spill
+file the host provides. The library never writes to disk itself.
+[Streaming & memory](/concepts/streaming-memory/) shows what reads through the
+cache, which checks need an object whole, and where spill files fit.

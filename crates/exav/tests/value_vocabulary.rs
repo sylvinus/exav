@@ -56,7 +56,6 @@ fn every_byte_flag_takes_the_same_sizes() {
         "--max-process-bytes",
         "--max-spill-bytes",
         "--max-total-spill-bytes",
-        "--build-shard-bytes",
         "--icap-preview-bytes",
     ];
     const SIZES: &[&str] = &["--spill-threshold-bytes", "--icap-max-header-bytes"];

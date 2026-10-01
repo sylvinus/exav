@@ -99,72 +99,59 @@ fn find_apfs_offset(data: &[u8]) -> Option<usize> {
 
 // ─── Encrypted DMG header parsing ────────────────────────────────────────────
 
-/// Apple encrypted DMG header, matching dmgwiz's `EncryptedDmgHeader`.
-/// Deserialized via bincode (big-endian, fixint encoding).
-#[derive(serde::Deserialize)]
+/// The fields exav uses of an Apple encrypted DMG (`encrcdsa`, version 2)
+/// header: 264 bytes, big-endian, laid out as dmgwiz's `EncryptedDmgHeader`.
 #[cfg(feature = "decrypt")]
 struct EncryptedDmgHeader {
-    #[allow(dead_code)]
-    signature: [char; 8],
-    #[allow(dead_code)]
     version: u32,
-    #[allow(dead_code)]
-    enc_iv_size: u32,
-    #[allow(dead_code)]
-    unk1: u32,
-    #[allow(dead_code)]
-    unk2: u32,
     data_enc_key_bits: u32,
-    #[allow(dead_code)]
-    unk4: u32,
     hmac_key_bits: u32,
-    #[allow(dead_code)]
-    uuid: [u8; 16],
     blocksize: u32,
     datasize: u64,
     dataoffset: u64,
-    #[allow(dead_code)]
-    unk6: [u8; 24],
-    #[allow(dead_code)]
-    kdf_algorithm: u32,
-    #[allow(dead_code)]
-    kdf_prng_algorithm: u32,
     kdf_iteration_count: u32,
     kdf_salt_len: u32,
     kdf_salt: [u8; 32],
-    #[allow(dead_code)]
     blob_enc_iv_size: u32,
     blob_enc_iv: [u8; 32],
-    #[allow(dead_code)]
-    blob_enc_key_bits: u32,
-    #[allow(dead_code)]
-    blob_enc_algorithm: u32,
-    #[allow(dead_code)]
-    blob_enc_padding: u32,
-    #[allow(dead_code)]
-    blob_enc_mode: u32,
     encrypted_keyblob_size: u32,
     encrypted_keyblob1: [u8; 32],
     encrypted_keyblob2: [u8; 32],
 }
 
-/// Parse the encrcdsa header from raw bytes using bincode (matching dmgwiz).
 #[cfg(feature = "decrypt")]
 fn parse_encrypted_header(data: &[u8]) -> Result<EncryptedDmgHeader, LimitHit> {
-    use bincode::Options;
-
-    let mut cursor = Cursor::new(data);
-    let header: EncryptedDmgHeader = bincode::DefaultOptions::new()
-        .with_big_endian()
-        .with_fixint_encoding()
-        .deserialize_from(&mut cursor)
-        .map_err(|e| LimitHit::corrupt(format!("encrypted DMG header parse: {e}")))?;
-
-    let sig: String = header.signature.iter().collect();
-    if sig != "encrcdsa" {
+    let h = data
+        .get(..264)
+        .ok_or_else(|| LimitHit::corrupt("encrypted DMG header truncated".into()))?;
+    if &h[..8] != b"encrcdsa" {
         return Err(LimitHit::corrupt("missing encrcdsa signature".into()));
     }
-
+    let u32_at = |o: usize| u32::from_be_bytes(h[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_be_bytes(h[o..o + 8].try_into().unwrap());
+    let bytes_at = |o: usize| -> [u8; 32] { h[o..o + 32].try_into().unwrap() };
+    let header = EncryptedDmgHeader {
+        version: u32_at(8),
+        data_enc_key_bits: u32_at(24),
+        hmac_key_bits: u32_at(32),
+        blocksize: u32_at(52),
+        datasize: u64_at(56),
+        dataoffset: u64_at(64),
+        kdf_iteration_count: u32_at(104),
+        kdf_salt_len: u32_at(108),
+        kdf_salt: bytes_at(112),
+        blob_enc_iv_size: u32_at(144),
+        blob_enc_iv: bytes_at(148),
+        encrypted_keyblob_size: u32_at(196),
+        encrypted_keyblob1: bytes_at(200),
+        encrypted_keyblob2: bytes_at(232),
+    };
+    // Both index fixed-size arrays further on.
+    if header.kdf_salt_len > 32 || header.encrypted_keyblob_size > 64 {
+        return Err(LimitHit::corrupt(
+            "encrypted DMG header sizes out of range".into(),
+        ));
+    }
     Ok(header)
 }
 
@@ -576,6 +563,60 @@ mod tests {
         let mut buf = vec![0u8; 1024];
         buf[0..8].copy_from_slice(b"encrcdsa");
         assert!(is_dmg(&buf));
+    }
+
+    /// Every field of an `encrcdsa` header is read from its big-endian place.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn encrypted_header_fields() {
+        let mut h = b"encrcdsa".to_vec();
+        // version .. hmac_key_bits: seven u32s, each its own index.
+        for i in 0..7u32 {
+            h.extend_from_slice(&(0x0101_0000 + i).to_be_bytes());
+        }
+        h.extend_from_slice(&[0xaa; 16]); // uuid
+        h.extend_from_slice(&4096u32.to_be_bytes()); // blocksize
+        h.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes()); // datasize
+        h.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes()); // dataoffset
+        h.extend_from_slice(&[0xbb; 24]);
+        h.extend_from_slice(&1u32.to_be_bytes()); // kdf_algorithm
+        h.extend_from_slice(&2u32.to_be_bytes()); // kdf_prng_algorithm
+        h.extend_from_slice(&1000u32.to_be_bytes()); // kdf_iteration_count
+        h.extend_from_slice(&20u32.to_be_bytes()); // kdf_salt_len
+        h.extend((0..32).map(|i| i as u8)); // kdf_salt
+        h.extend_from_slice(&8u32.to_be_bytes()); // blob_enc_iv_size
+        h.extend((0..32).map(|i| 0x40 + i as u8)); // blob_enc_iv
+        for v in [192u32, 17, 7, 6] {
+            h.extend_from_slice(&v.to_be_bytes());
+        }
+        h.extend_from_slice(&48u32.to_be_bytes()); // encrypted_keyblob_size
+        h.extend((0..64).map(|i| 0x80 + i as u8)); // encrypted_keyblob1, 2
+        assert_eq!(h.len(), 264);
+        h.extend_from_slice(b"trailing data");
+        let p = parse_encrypted_header(&h).unwrap();
+        assert_eq!(p.version, 0x0101_0000);
+        assert_eq!(p.data_enc_key_bits, 0x0101_0004);
+        assert_eq!(p.hmac_key_bits, 0x0101_0006);
+        assert_eq!(p.blocksize, 4096);
+        assert_eq!(p.datasize, 0x0102_0304_0506_0708);
+        assert_eq!(p.dataoffset, 0x1112_1314_1516_1718);
+        assert_eq!(p.kdf_iteration_count, 1000);
+        assert_eq!(p.kdf_salt_len, 20);
+        assert_eq!(p.kdf_salt[31], 31);
+        assert_eq!(p.blob_enc_iv_size, 8);
+        assert_eq!(p.blob_enc_iv[0], 0x40);
+        assert_eq!(p.encrypted_keyblob_size, 48);
+        assert_eq!(p.encrypted_keyblob1[0], 0x80);
+        assert_eq!(p.encrypted_keyblob2[31], 0xbf);
+        assert!(parse_encrypted_header(&h[..263]).is_err(), "short");
+        let mut bad = h.clone();
+        bad[..8].copy_from_slice(b"encrcdsb");
+        assert!(parse_encrypted_header(&bad).is_err(), "signature");
+        for (at, v) in [(108, 33u32), (196, 65)] {
+            let mut bad = h.clone();
+            bad[at..at + 4].copy_from_slice(&v.to_be_bytes());
+            assert!(parse_encrypted_header(&bad).is_err(), "size at {at}");
+        }
     }
 
     /// Write a well-formed HFS+ volume header at `off`.

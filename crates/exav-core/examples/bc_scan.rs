@@ -42,7 +42,7 @@ fn main() {
         let gated = det.map(|(n, _)| n).unwrap_or_else(|| "-".into());
         // The forced pass (every program, ignoring triggers) is expensive on
         // real binaries; only run it when explicitly requested.
-        let forced = if std::env::var("EXAV_FORCED").is_ok() {
+        let forced = if std::env::var("EXAV_DEBUG_BC_FORCED").is_ok() {
             let f: Vec<String> = rt
                 .run_all_forced(&data)
                 .into_iter()

@@ -6,9 +6,10 @@ description: Bounded, memory-safe archive and container extraction in pure Rust 
 **Bounded, memory-safe, pure-Rust archive and container extraction.** The
 scanner's extraction layer, usable on its own.
 
-The crate is `#![forbid(unsafe_code)]`. It extracts to memory under a shared
-decompression-bomb budget (output bytes, expansion ratio, file count, recursion
-depth, cumulative scanned bytes, emulation steps), with panic containment per
+The crate is `#![forbid(unsafe_code)]`. It extracts under a shared
+decompression-bomb budget (total output bytes, the largest object held at once,
+expansion ratio, member count, recursion depth, cumulative scanned bytes,
+emulation steps, and optionally which formats may be opened), with panic containment per
 container walk, so a decoder panic becomes an error for that container instead
 of a crash. An allocation too large to serve and stack exhaustion are outside
 that boundary.
@@ -30,7 +31,7 @@ it is why extraction can be trusted as a coverage claim.
 
 **It opens containers most extractors decline.** Virtual disks (VHD, VHDX, QCOW2,
 VMDK) are reconstructed to the guest disk, and the filesystems inside them (NTFS
-through an MFT walk, FAT through the cluster chain) are walked for files with
+through an MFT walk, FAT through the cluster chain, ext2/3/4) are walked for files with
 their paths; UDF, WIM and Unix `compress` are handled natively. See
 [Supported formats](/reference/formats/).
 
@@ -101,13 +102,72 @@ no directory entry are visited too, after the directory's own.
 
 ## CLI
 
-The crate ships a standalone `exav-unpack` binary, a general extractor with the
-same budgets (`cargo install exav-unpack`):
+The crate ships a standalone `exav-unpack` command, a general extractor with
+the same budgets. It is in the release downloads, or `cargo install
+exav-unpack`.
+
+Its command line is a subset of Info-ZIP `unzip`'s: every option it takes means
+what it means to `unzip`, and an `unzip` option it does not take is refused
+(exit 10) rather than ignored. It reads every format the library reads, not only
+ZIP.
 
 ```bash
-exav-unpack list archive.7z            # what's inside
-exav-unpack extract archive.7z out/    # to disk
+exav-unpack archive.7z                    # extract here
+exav-unpack archive.rar -d out/           # into out/
+exav-unpack archive.zip 'docs/*' -x '*.tmp'  # some members only
+exav-unpack -l archive.tar.gz             # list
+exav-unpack -t archive.zip                # test: decode everything, write nothing
+exav-unpack -p archive.zip notes.txt      # to stdout
+exav-unpack '*.zip' -d out/               # several archives: a quoted wildcard
+exav-unpack set.part1.rar                 # a volume set, from its first part
+exav-unpack set.zip --volume /mnt/b/set.z01  # parts elsewhere, given one by one
 ```
+
+| `unzip` option | |
+|---|---|
+| `-l`, `-t`, `-p`, `-c`, `-Z1` | list, test, to stdout, to stdout with names, names only |
+| `-d DIR` | extract into `DIR` |
+| `-x PATTERN...` | leave out the members that match |
+| `-o`, `-n` | overwrite, never overwrite (default: ask, as `unzip` does) |
+| `-P PASS` | a password; repeat for several |
+| `-j`, `-C`, `-q`, `-qq` | no directories, case-insensitive patterns, quiet, quieter |
+| `-D`, `-DD` | leave directory times, all times, unrestored |
+
+Arguments follow `unzip`'s rules: options before the archive; after it, member
+patterns, `-x` and `-d`; `unzip a.zip b.zip` means member `b.zip` of `a.zip`, so
+several archives are named with a quoted wildcard. Exit statuses are `unzip`'s
+(1 a warning, 2 a damaged member, 9 no archive, 10 a bad option, 11 a pattern
+nothing matched, 81 an unsupported method, 82 a wrong password for every
+member, 1 when others came out).
+
+What `exav-unpack` adds, as long options `unzip` does not have:
+
+- `--volume FILE`: another part of a split archive, for parts not next to the
+  archive or not named as a set. A set named as one is found on its own: `.001`,
+  `.002` parts; `.z01`, ..., `.zip`; `.part1.rar`, `.part2.rar`; `.rar`, `.r00`.
+  `unzip` reads none of these.
+- `--max-size`, `--max-memory`, `--max-members`: the bounds of the extraction
+  (64 GiB decoded, 1 GiB held in memory at once, a million members by default).
+
+Where it differs from `unzip` on purpose:
+
+- It does not ask for a password yet. An encrypted member with no `-P` is
+  skipped as `unzip` skips one with no terminal, after the
+  [built-in passwords](/reference/formats/#encryption-support) are tried, and
+  the exit status is 5. With `-P`, a password that opens none of the encrypted
+  members exits 82; when other members came out, the run exits 1 and each
+  member left behind is reported `skipping: NAME  incorrect password`. `-t`
+  checks without writing anything.
+- A symbolic link whose target leaves the extraction directory is not made, and
+  nothing is written through a link already there. A member name's `..` and
+  root are dropped, so every file lands under the extraction directory.
+- It restores what the archive records: modification times, the permission bits
+  (without setuid, setgid or sticky, as `unzip` without `-K`) and symbolic links,
+  for ZIP and tar. Other formats record less.
+
+Members are written as they are decoded and the archive is read from disk as
+needed, so neither is held in memory whole, except where a format's decoder
+needs it (a 7z solid block, a RAR archive, a CAB folder).
 
 ## In the browser
 
@@ -176,9 +236,13 @@ maxMembers, maxRecursion, maxCompressionRatio, allowedFormats }`; absent keys ke
 defaults, which set the byte budgets below the Rust library's (128 MiB total,
 32 MiB per member), since wasm32 caps the address space at 4 GiB, a tab often
 gets far less, and outgrowing it aborts the module. `allowedFormats` narrows what
-one call may open; an excluded format is reported as `unsupported`. The npm
-package is built without the PE packer emulator, which the Rust library's
-default includes.
+one call may open; an excluded format is reported as `unsupported`.
+
+The npm package is the `standard` build: every format except the PE packer
+emulator, which the Rust library's default includes. Building the package
+yourself, `npm run build:full` adds the emulator and `npm run build:minimal`
+keeps only ZIP, gzip and tar (see
+[Feature flags](/reference/feature-flags/#library-crate-features)).
 
 ## Features
 
@@ -189,7 +253,11 @@ Every format is a Cargo feature, so you build only what you use:
 exav-unpack = { version = "0.0.2", default-features = false, features = ["zip"] }
 ```
 
-`decrypt` (on by default) enables password handling. `checksums` lets a caller
+`decrypt` (on by default) enables decryption; pass passwords with
+`Budget::with_passwords(limits, passwords)` (see
+[Encryption support](/reference/formats/#encryption-support)). A ZIP member
+compressed with bzip2, LZMA, zstd, XZ or PPMd also needs that codec's feature
+(`bzip2`, `lzip`, `zstd`, `xz`, `sevenz`). `checksums` lets a caller
 make a checksum mismatch an error (`Budget::set_verify_checksums`); by default
 the bytes are scanned regardless, and the RAR, WIM and UPX checks above always
 run. See [Feature flags](/reference/feature-flags/).

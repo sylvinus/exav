@@ -41,7 +41,7 @@ suspicious.bin: Win.Trojan.Agent-1234 FOUND
 A stream on stdin is scanned like a file:
 
 ```console
-$ curl -fsS https://example.com/download.zip | exav -d /var/lib/exav -
+$ curl -fsS https://example.com/download.zip | exav -d ~/.cvdupdate/database -
 stdin: OK
 ```
 
@@ -50,7 +50,7 @@ protocol authenticates its clients, so bind to an interface only trusted clients
 reach):
 
 ```console
-$ exav --listen clamd://127.0.0.1:3310 --listen icap://127.0.0.1:1344 -d /var/lib/exav
+$ exav --listen clamd://127.0.0.1:3310 --listen icap://127.0.0.1:1344 -d /var/lib/clamav
 exav: prefork daemon: 4 workers; per-job limits: wall 120s, mem 2048 MiB, cpu 120s; recycle every 1000 jobs
 exav: serving ICAP on tcp:127.0.0.1:1344 (services: avscan, srv_clamav, virus_scan; preview 4096 B)
 ```
@@ -74,6 +74,7 @@ malware as clean). Load signatures with -d/--database or --sig-dir, or pass
   container.
 - [Quick start](/getting-started/quick-start/): signatures, a first scan, the
   output.
+- [Scanning](/guides/scanning/) and [Daemon mode](/guides/daemon/): everyday use.
 - [Comparison with ClamAV](/project/comparison-with-clamav/): compatibility,
   performance, and where the two differ.
 - [Migrating from ClamAV](/guides/migrating-from-clamav/): replace `clamscan` and

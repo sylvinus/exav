@@ -216,7 +216,7 @@ pub(crate) use pepack::emulate_pe;
 #[cfg(feature = "pepack")]
 pub(crate) use pepack::{extract_pepack, is_pepack};
 #[cfg(feature = "rar")]
-pub(crate) use rar::extract_rar;
+pub(crate) use rar::{extract_rar, join_volumes as join_rar_volumes};
 #[cfg(feature = "rtf")]
 pub(crate) use rtf::extract_rtf;
 #[cfg(feature = "screnc")]

@@ -311,27 +311,14 @@ HEUR
 # ── Phase 2: exav ────────────────────────────────────────────────────────────
 phase_exav() {
   [ -x "$EXAV" ] || { echo "FATAL: $EXAV not built (cargo build --release -p exav)"; exit 1; }
-  # A rebuilt exav can bump the database format, making a stale database
-  # unloadable, but `--build-db` needs several GB of RAM, so do NOT rebuild
-  # merely because the binary is newer. Rebuild when it is missing or fails to
-  # LOAD, which is the failure that actually matters.
-  local need=0
-  if [ ! -f "$DB" ]; then need=1
-  elif [ "$EXAV" -nt "$DB" ]; then
-    mkdir -p "$SOCK_DIR"; : > "$SOCK_DIR/.probe"
-    "$EXAV" -d "$DB" "$SOCK_DIR/.probe" >/dev/null 2>&1 \
-      && { say "phase 2: database older than the binary but loads, reusing"; touch "$DB"; } \
-      || need=1
-  fi
-  if [ "$need" = 1 ]; then
+  # A database older than the binary is rebuilt: one that still loads may
+  # still hold what an older build made of the signatures, and the run would
+  # measure that instead of this binary.
+  if [ ! -f "$DB" ] || [ "$EXAV" -nt "$DB" ]; then
     need_signatures
     say "phase 2: building the exav database from $DBDIR"
-    local avail shard=""
-    avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    [ "$avail" -gt 0 ] && [ "$avail" -lt 8000000 ] && shard="--build-shard-bytes ${BUILD_SHARD_BYTES:-1G}"
-    # shellcheck disable=SC2086
-    "$EXAV" -d "$DBDIR" --build-db "$DB" $shard || {
-      echo "FATAL: exav database build failed (it needs several GB of FREE RAM)"; exit 1; }
+    "$EXAV" -d "$DBDIR" --build-db "$DB" || {
+      echo "FATAL: exav database build failed"; exit 1; }
   fi
 
   # exav's results are NOT cached across binaries (that is the entire reason for
