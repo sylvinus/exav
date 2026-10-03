@@ -449,7 +449,7 @@ stderr at startup. Do not run it in production. It changes:
 | Largest top-level file held whole | 256M | 400M | `--max-object-bytes` (a value given replaces it) |
 | Largest object PCRE subsignatures run on | no limit | 100M (ClamAV's `PCREMaxFileSize`) | `--max-pcre-bytes` |
 | Unpacking reach | every format exav handles | only the formats stock ClamAV unpacks | none |
-| Images hashed for `fuzzy_img#` | PNG, GIF, JPEG, TIFF, BMP, WebP, ICO, PNM, QOI, DDS, farbfeld, HDR | PNG, GIF, JPEG, TIFF, BMP, as `clamscan` | none |
+| Images that are graphics (`Target:5`) and hashed for `fuzzy_img#` | PNG, GIF, JPEG, TIFF, BMP, WebP, ICO, PNM, QOI, DDS, farbfeld, HDR | PNG, GIF, JPEG, TIFF, BMP, as `clamscan` | none |
 | Name of a signature from an unofficial database | no suffix (`YARA.<rule>`) | `.UNOFFICIAL` suffix (`YARA.<rule>.UNOFFICIAL`), as `clamscan` does | none |
 | Names for facts the two engines name differently | exav's (e.g. `Heuristics.ELF.StrippedSectionHeaders`) | ClamAV's (e.g. `Heuristics.Broken.Executable`) | none |
 

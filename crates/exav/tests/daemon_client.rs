@@ -512,7 +512,22 @@ fn the_cpu_limit_is_per_job_not_per_worker() {
     let f = d.file("noise.bin", &body);
     let start = Instant::now();
     let mut jobs = 0;
-    while start.elapsed() < Duration::from_secs(4) || jobs < 5 {
+    // Until the jobs have used three times the limit between them, so the
+    // whole-life limit this replaced is certain to have been crossed.
+    #[cfg(target_os = "linux")]
+    let worker = {
+        // Up and forked.
+        assert_eq!(ping(&d), "PONG");
+        let pids = children_of(d.child.id());
+        assert_eq!(pids.len(), 1, "{pids:?}");
+        pids[0]
+    };
+    #[cfg(target_os = "linux")]
+    let more = || cpu_secs(worker) < 3.0;
+    #[cfg(not(target_os = "linux"))]
+    let more = || start.elapsed() < Duration::from_secs(4);
+    while more() || jobs < 5 {
+        assert!(start.elapsed() < Duration::from_secs(300), "{jobs} jobs");
         let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
         s.write_all(format!("zSCAN {}\0", f.display()).as_bytes())
             .unwrap();
@@ -527,6 +542,65 @@ fn the_cpu_limit_is_per_job_not_per_worker() {
         );
         jobs += 1;
     }
+    #[cfg(target_os = "linux")]
+    assert_eq!(children_of(d.child.id()), [worker], "the worker was replaced");
+}
+
+/// User plus system CPU seconds `pid` has used, from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn cpu_secs(pid: u32) -> f64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // Fields 14 and 15, counted after the `(comm)` that may hold spaces.
+    let rest: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
+    let ticks: u64 = rest[11].parse::<u64>().unwrap() + rest[12].parse::<u64>().unwrap();
+    // SAFETY: sysconf reads a constant.
+    ticks as f64 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64
+}
+
+/// The processes whose parent is `pid`.
+#[cfg(target_os = "linux")]
+fn children_of(pid: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            // `pid (comm) state ppid ...`; comm may hold spaces, so split after it.
+            let ppid: u32 = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+            (ppid == pid).then(|| e.file_name().to_str()?.parse().ok())?
+        })
+        .collect()
+}
+
+/// One `zPING` over a fresh connection: a job, as far as the job count goes.
+#[cfg(target_os = "linux")]
+fn ping(d: &Daemon) -> String {
+    use std::io::Write;
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(b"zPING\0").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).trim_end_matches('\0').to_string()
+}
+
+/// `--max-jobs-per-worker off` never recycles the worker, where a count does.
+#[cfg(target_os = "linux")]
+#[test]
+fn max_jobs_per_worker_off_keeps_the_worker() {
+    // Every worker seen across six jobs.
+    let seen = |limit: &str| {
+        let d = Daemon::start("077", &["--workers", "1", "--max-jobs-per-worker", limit]);
+        let mut all = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            assert_eq!(ping(&d), "PONG", "{limit}");
+            std::thread::sleep(Duration::from_millis(200));
+            all.extend(children_of(d.child.id()));
+        }
+        all
+    };
+    // The control: a recycle is something this can see.
+    assert!(seen("2").len() >= 2);
+    assert_eq!(seen("off").len(), 1);
 }
 
 /// `EXINSTREAM` answers a stream it could not hold as `INSTREAM` does: partial,

@@ -1,6 +1,6 @@
 ---
 title: exav-imagehash
-description: Perceptual image hashes in safe Rust, with every step a parameter, reproducing ClamAV's fuzzy_img hash (sigtool --fuzzy-img) and Python imagehash's phash bit for bit.
+description: Perceptual image hashes, with every step a parameter, reproducing ClamAV's fuzzy_img hash (sigtool --fuzzy-img) and Python imagehash's phash bit for bit.
 ---
 
 **Perceptual image hashes, with the steps that tell one tool's hash from
@@ -82,15 +82,34 @@ leaves out: its decoder brings `rayon-core` and `smallvec`, crates with
 `unsafe`.
 
 clamscan, scanning, takes only the first five for graphics (`Target:5`), and
-hashes nothing else. exav does the same under `--clamav-compat`; otherwise a
-`fuzzy_img#` signature is also matched against the other formats.
+hashes nothing else. exav does the same under `--clamav-compat`; otherwise
+every format here is graphics, and a `fuzzy_img#` signature is matched
+against all of them.
 
 ## Safety
 
-The crate is `#![forbid(unsafe_code)]`, and so are its decoders. zune-jpeg's
-only `unsafe` is its SIMD code, which `image` and `tiff` turn on with no way
-to turn it off from outside, so the crate vendors `image`'s JPEG and TIFF
-decoders and `tiff`'s, over zune-jpeg built without it. Decoding is bounded by
+The crate is `#![forbid(unsafe_code)]`, and its decoders have no `unsafe`:
+png, gif, image-webp and qoi forbid it, `image`'s own (BMP, ICO, PNM, DDS,
+farbfeld, HDR) use none, and zune-jpeg's only `unsafe` is its SIMD code, which
+`image` and `tiff` turn on with no way to turn it off from outside, so the
+crate vendors `image`'s JPEG and TIFF decoders and `tiff`'s, over zune-jpeg
+built without it.
+
+The DCT is vendored too: rustdct 0.7.1's algorithm for a power of two, with
+bounds checks where rustdct skips them with `unsafe`, so its coefficients,
+and the presets' hashes, are rustdct's to the bit. rustdct hands other
+lengths to rustfft and its SIMD code; here they go through a Bluestein FFT
+of the crate's own, which rounds differently, so a hash with such a `hash_size
+× highfreq_factor` can differ from rustdct's in a bit whose coefficient sits
+at the median.
+
+The rest of the dependency tree is not free of `unsafe`. On the way to a hash:
+the checksums and inflate under PNG and TIFF (`crc32fast`, `simd-adler32`,
+`flate2`), and pixel and byte casts (`image`, `bytemuck`, `half`,
+`zerocopy`). `moxcms`, `image`'s colour management, is compiled in but not
+reached.
+
+Decoding is bounded by
 `max_decode_bytes` (`Error::TooLarge` past it), and a decoder panicking on a
 crafted file is caught and reported as `Error::Undecodable`. The decoders are
 pinned to the versions libclamav links, for the hashes as much as for

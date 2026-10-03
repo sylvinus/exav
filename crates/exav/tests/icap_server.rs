@@ -503,6 +503,26 @@ fn options_advertises_everything_a_client_needs() {
     assert!(istag.len() <= 32, "{istag}");
 }
 
+/// `off` leaves the header out of `OPTIONS`, which RFC 3507 reads as "do not
+/// preview" and "never expires", while `0` is a value a client acts on: a
+/// headers-only preview, and asking again every time.
+#[test]
+fn off_leaves_preview_and_options_ttl_out_where_0_sends_them() {
+    let options = |extra: &[&str]| {
+        let s = Server::start(TempDir::new().unwrap(), extra);
+        let mut c = s.connect();
+        c.send(b"OPTIONS icap://127.0.0.1/avscan ICAP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+        c.recv()
+    };
+    let r = options(&["--icap-preview-bytes", "off", "--icap-options-ttl-secs", "off"]);
+    assert_eq!(r.code, 200, "{r:?}");
+    assert!(!r.has_header("Preview"), "{r:?}");
+    assert!(!r.has_header("Options-TTL"), "{r:?}");
+    let r = options(&["--icap-preview-bytes", "0", "--icap-options-ttl-secs", "0"]);
+    assert_eq!(r.header("Preview"), Some("0"), "{r:?}");
+    assert_eq!(r.header("Options-TTL"), Some("0"), "{r:?}");
+}
+
 #[test]
 fn the_istag_encodes_the_signature_set() {
     // Two servers with different databases must not share an ISTag, or a proxy

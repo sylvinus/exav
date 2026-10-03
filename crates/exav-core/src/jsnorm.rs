@@ -1142,6 +1142,28 @@ mod tests {
         assert!(!out.contains("eval("), "eval not unrolled: {out}");
     }
 
+    /// Code wrapped in `layers` of `eval(unescape("..."))`, each layer escaping
+    /// the one inside it (`"` and `%` only, so it grows by a few bytes a layer).
+    fn evals(layers: usize) -> Vec<u8> {
+        let mut code = "'powershell'".to_string();
+        for _ in 0..layers {
+            let inner = code.replace('%', "%25").replace('"', "%22");
+            code = format!("eval(unescape(\"{inner}\"))");
+        }
+        code.into_bytes()
+    }
+
+    /// `eval` layers unroll twenty deep, past the eight they stopped at, down
+    /// to the code at the bottom; past the bound of 32 they are left as read.
+    #[test]
+    fn eval_layers_unroll_twenty_deep_and_stop_past_the_bound() {
+        let out = norm(&evals(20));
+        assert!(out.contains("powershell"), "{out}");
+        assert!(!out.contains("eval"), "a layer was left: {out}");
+        let deep = norm(&evals(40));
+        assert!(deep.contains("eval"), "unrolled past the bound");
+    }
+
     #[test]
     fn strings_keep_comment_markers_and_regex_survives() {
         let out = norm(br#"var u = "/*keep*/"; var re = /ab\/cd/g;"#);

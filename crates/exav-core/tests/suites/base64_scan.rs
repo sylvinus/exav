@@ -47,6 +47,29 @@ fn base64_embedded_pe_detected_by_default() {
     }
 }
 
+/// The `.sfp` allowlist applies to every object, a payload decoded out of
+/// another included: the PE whose SHA-256 is on it is not reported, and the
+/// carrier is then clean.
+#[test]
+fn an_allowlisted_decoded_payload_is_not_reported() {
+    use sha2::{Digest, Sha256};
+    // A multiple of 3 bytes, so its base64 ends on a whole group.
+    let mut pe = eicar_pe();
+    pe.resize(2049, 0);
+    let sha: String = Sha256::digest(&pe).iter().map(|b| format!("{b:02x}")).collect();
+    let mut b = exav_core::loader::Builder::new();
+    b.add_named_bytes("x.sfp", format!("{sha}:{}:Allowed.Pe\n", pe.len()).as_bytes(), false);
+    let db = b.build().unwrap();
+    let blob = script_with_base64(&pe);
+    let v = analyze(&db, &blob, &ScanOptions::default()).verdict;
+    assert!(matches!(v, Verdict::Clean), "{v:?}");
+    // The entry is what clears it.
+    assert!(matches!(
+        analyze(&Scanner::builtin(), &blob, &ScanOptions::default()).verdict,
+        Verdict::Infected { .. }
+    ));
+}
+
 #[test]
 fn base64_scan_off_leaves_it_clean() {
     // With decoding disabled (as under --clamav-compat / --no-base64) the base64

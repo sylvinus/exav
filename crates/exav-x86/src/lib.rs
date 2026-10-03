@@ -362,6 +362,18 @@ mnemonics![
     Outsb,
     Outsw,
     Outsd,
+    // Generated-map encodings with an operand rule the tables cannot carry:
+    // UMONITOR's register is sized by the address size, and a gather faults
+    // when its registers overlap.
+    Umonitor,
+    Vgatherdps,
+    Vgatherdpd,
+    Vgatherqps,
+    Vgatherqpd,
+    Vpgatherdd,
+    Vpgatherdq,
+    Vpgatherqd,
+    Vpgatherqq,
     // x87. `Fnstenv`/`Fnstcw` are the GetPC-trick companions: a stub reads its
     // own address back out of the saved FPU environment.
     Fadd,
@@ -1426,6 +1438,12 @@ fn vex_tail(
         if cell & VEX_VSIB != 0 && r.peek().is_some_and(|b| b & 7 != 4) {
             return None;
         }
+        // 16-bit addressing has no SIB byte, so no vector index. Every VEX
+        // VSIB encoding is a gather, which faults when two of its registers
+        // are the same.
+        if cell & VEX_VSIB != 0 && (asz16 || gather_regs_overlap(r, Some(!vvvv & 7))) {
+            return None;
+        }
         let (_, rm) = modrm(r, Size::B4, seg, asz16)?;
         // A vector index is consumed but not reported: naming it as a
         // general-purpose register would be a plausible-looking lie, and
@@ -1630,6 +1648,31 @@ impl Reader<'_> {
     }
 }
 
+fn is_gather(mn: Mn) -> bool {
+    matches!(
+        mn,
+        Mn::Vgatherdps
+            | Mn::Vgatherdpd
+            | Mn::Vgatherqps
+            | Mn::Vgatherqpd
+            | Mn::Vpgatherdd
+            | Mn::Vpgatherdq
+            | Mn::Vpgatherqd
+            | Mn::Vpgatherqq
+    )
+}
+
+/// Whether the gather whose ModRM byte is next names one register twice: its
+/// destination (ModRM `reg`), its index (the SIB byte's) and, when it has a
+/// vector one, its mask. Any such pair is #UD.
+fn gather_regs_overlap(r: &Reader, mask: Option<u8>) -> bool {
+    let (Some(&m), Some(&sib)) = (r.b.get(r.i), r.b.get(r.i + 1)) else {
+        return false;
+    };
+    let (dest, index) = ((m >> 3) & 7, (sib >> 3) & 7);
+    dest == index || mask.is_some_and(|k| k == dest || k == index)
+}
+
 /// Decode one instruction from the start of `bytes`, as if it were at `ip`.
 ///
 /// Returns `None` when the bytes are not an encoding this decoder claims. See
@@ -1732,6 +1775,12 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         // a shorter form of it, and putting a length on it would step a linear
         // decode into the middle of whatever follows.
         if cell & EVEX_VSIB != 0 && r.peek().is_some_and(|m| m & 7 != 4) {
+            return None;
+        }
+        // As in `vex_tail`: no vector index without a SIB byte, and a gather
+        // faults when its destination is its index. Its mask is a `k`
+        // register, which cannot be either.
+        if cell & EVEX_VSIB != 0 && (asz16 || is_gather(mn) && gather_regs_overlap(&r, None)) {
             return None;
         }
         let (dest, rm) = modrm(&mut r, Size::B4, seg, asz16)?;
@@ -2175,6 +2224,16 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         if asz16 && mn == Mn::Montmul {
             return None;
         }
+        // UMONITOR's register holds an address, so it is as wide as the
+        // address size, not the operand size: `67` makes it 16 bits.
+        let ops = if asz16 && mn == Mn::Umonitor {
+            ops.map(|o| match o {
+                Op::Reg(n, Size::B4) => Op::Reg(n, Size::B2),
+                o => o,
+            })
+        } else {
+            ops
+        };
         if r.i > MAX_INSN_LEN {
             return None;
         }

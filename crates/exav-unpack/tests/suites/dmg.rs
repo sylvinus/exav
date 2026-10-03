@@ -42,6 +42,27 @@ fn a_file_with_a_resource_fork_is_reported() {
     assert_eq!(test.unsupported, Some("HFS+ resource fork not read"));
 }
 
+/// A file whose data the image says is somewhere it cannot be read from is
+/// reported, not left out: its first extent is moved far past the image.
+#[test]
+fn a_file_that_cannot_be_read_out_of_the_image_is_reported() {
+    let mut blob = fixture("hfs_plus_udrw.dmg");
+    let bsd = [0, 0, 1, 0xf5, 0, 0, 0, 0x14, 0, 0, 0x81, 0xa4];
+    let at = blob
+        .windows(bsd.len())
+        .position(|w| w == bsd)
+        .expect("the file's record");
+    // The data fork's first extent: its start block, 104 bytes in.
+    let start = at - 32 + 104;
+    blob[start..start + 4].copy_from_slice(&0x00ff_ff00u32.to_be_bytes());
+    let entries = extract(Format::Dmg, &blob, &mut Budget::new(Limits::default())).unwrap();
+    let test = entries
+        .iter()
+        .find(|e| e.name.ends_with("test.txt"))
+        .unwrap_or_else(|| panic!("left out: {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>()));
+    assert!(test.unsupported.is_some(), "read as {} bytes", test.data.len());
+}
+
 // ---------------------------------------------------------------------------
 // Detection
 // ---------------------------------------------------------------------------

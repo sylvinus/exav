@@ -51,6 +51,12 @@ test-native:
 	$(CARGO) test -p exav-core --no-default-features
 	$(CARGO) test -p exav-unpack --no-default-features
 	$(CARGO) test -p exav-imagehash --no-default-features
+	# Each format feature on its own: a whole feature set can hide a format
+	# that only compiles because another one brought its dependency in.
+	scripts/check-features.sh
+	# ALZ and EGG carry their own bzip2 and LZMA decoders, which must work
+	# without the `bzip2` and `lzip` features.
+	$(CARGO) test -p exav-unpack --no-default-features --features alz,egg --test all -- alz egg
 	# Crash containment, which only runs when a decoder can be asked to fail.
 	# Without this pass the tests that check it skip themselves and the whole
 	# question goes unasked. A scanner that dies on crafted input and exits 0

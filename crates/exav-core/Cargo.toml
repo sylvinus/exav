@@ -234,6 +234,8 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 cfb = "0.14"
+# Writes the MSZIP cabinets the damaged-member tests break.
+cab = "0.6.0"
 # only for the base64-embedded-executable end-to-end test
 base64 = "0.22"
 # Encodes the images the `fuzzy_img#` tests scan.

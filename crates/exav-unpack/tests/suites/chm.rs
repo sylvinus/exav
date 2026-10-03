@@ -74,6 +74,46 @@ fn every_frame_of_a_reset_interval_decodes() {
     }
 }
 
+/// The same file with its second frame out of reach: its reset-table entry
+/// points past the compressed stream. `a.html` lies in the first frame alone
+/// and still comes out whole; `b.html` and `c.html` cross the lost frame, so
+/// each comes out as its source or is reported, never as a page with a hole.
+#[test]
+fn a_page_over_a_frame_that_fails_is_reported() {
+    let mut data =
+        read_fixture("multi-frame-lzx.chm").expect("multi-frame-lzx.chm must be committed");
+    // The reset table: version 2, then the entry count, entry size and header
+    // length, and the frame offsets from byte 0x28.
+    let rt = data
+        .windows(16)
+        .position(|w| w[..4] == 2u32.to_le_bytes() && w[8..] == [8, 0, 0, 0, 0x28, 0, 0, 0])
+        .expect("reset table");
+    data[rt + 0x28 + 8..rt + 0x28 + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Chm, &data, &mut budget).expect("extract");
+    let mut reported = 0;
+    for name in ["a", "b", "c"] {
+        let mut page = String::from("<html><body>\n");
+        for i in 0..2000u32 {
+            page += &format!("<p>{name} {}</p>\n", i * 7919 % 10007);
+        }
+        page += "</body></html>\n";
+        let path = format!("/{name}.html");
+        let e = entries
+            .iter()
+            .find(|e| e.name == path)
+            .unwrap_or_else(|| panic!("{path} missing"));
+        if e.unsupported.is_some() {
+            reported += 1;
+        } else {
+            assert!(e.data == page.as_bytes(), "{path} differs from its source unreported");
+        }
+    }
+    let a = entries.iter().find(|e| e.name == "/a.html").unwrap();
+    assert!(a.unsupported.is_none(), "a.html needs only the first frame");
+    assert!(reported > 0, "the lost frame went unreported");
+}
+
 /// The benign CHM, and any locally-present real samples, extract into at least
 /// one member and never panic. (Real samples add real-world-input robustness.)
 #[test]

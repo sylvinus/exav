@@ -97,15 +97,29 @@ fn the_lenient_fallback_keeps_stream_paths() {
 #[test]
 #[cfg(feature = "ole")]
 fn an_encrypted_workbook_leaves_its_other_streams_readable() {
-    use std::io::Write;
     // BOF, then FilePass with an encryption type nothing implements.
     let mut workbook = vec![0x09, 0x08, 16, 0];
     workbook.extend_from_slice(&[0; 16]);
     workbook.extend_from_slice(&[0x2f, 0x00, 2, 0, 0x09, 0x00]);
+    the_other_streams_stay_readable("/Workbook", &workbook);
+}
+
+/// The same for a Word document, which nothing decrypts: its FIB has
+/// `fEncrypted` (bit 8 of the flags word at offset 10) set.
+#[test]
+#[cfg(feature = "ole")]
+fn an_encrypted_word_document_leaves_its_other_streams_readable() {
+    let fib = [0xec, 0xa5, 0xc1, 0x00, 0, 0, 0, 0, 0, 0, 0x00, 0x01];
+    the_other_streams_stay_readable("/WordDocument", &fib);
+}
+
+#[cfg(feature = "ole")]
+fn the_other_streams_stay_readable(stream: &str, encrypted: &[u8]) {
+    use std::io::Write;
     let mut cf = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
-    cf.create_stream("/Workbook")
+    cf.create_stream(stream)
         .unwrap()
-        .write_all(&workbook)
+        .write_all(encrypted)
         .unwrap();
     for path in ["/aaaa", "/bbbb"] {
         cf.create_stream(path).unwrap().write_all(b"x").unwrap();
@@ -135,7 +149,7 @@ fn an_encrypted_workbook_leaves_its_other_streams_readable() {
         assert!(
             entries
                 .iter()
-                .any(|e| e.name == "/Workbook" && e.encrypted && e.unsupported.is_some()),
+                .any(|e| e.name == stream && e.encrypted && e.unsupported.is_some()),
             "{:?}",
             names()
         );

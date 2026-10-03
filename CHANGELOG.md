@@ -291,7 +291,8 @@ follow [semantic versioning](https://semver.org/).
 - `exav-imagehash`, a crate and a command of its own: perceptual image hashes
   with every step a parameter, and presets equal to `sigtool --fuzzy-img`
   (ClamAV's `fuzzy_img` hash, which the scanner now computes through it) and
-  to Python `imagehash.phash`. Safe Rust down to its decoders.
+  to Python `imagehash.phash`. No `unsafe` in it, its image decoders or its
+  DCT (rustdct's, vendored); its checksum and cast dependencies do use some.
 - The `image-hash` build feature (on by default): without it, `fuzzy_img#`
   signatures load as unsupported and no image is decoded.
 - `--max-pcre-bytes`: the largest object PCRE subsignatures run on, as
@@ -338,6 +339,20 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- A crafted ARC member (69 bytes is enough) made the scan allocate until it
+  ran out of memory: its LZW decoder accepted a code past the next free one,
+  which could make a code its own prefix. Such a member is now reported
+  undecodable.
+- A ZOO member compressed with LZD was decoded to whatever size its stream
+  expanded to, not the size it declares, which is what the budget checks: a
+  megabyte member could take gigabytes. Decoding stops at the declared size,
+  and the member is reported.
+- The PE emulator panicked on a packed file whose import directory, or an
+  output structure it passes to an emulated Windows call, runs past 4 GiB.
+- The x86 decoder sized UMONITOR's register by the operand size rather than
+  the address size, and accepted gathers and scatters under an address-size
+  prefix, and gathers whose registers overlap, all of which a processor
+  refuses.
 - A RAR5 archive whose headers are encrypted (`rar -hp`) was read as having
   no members, so it scanned clean. Without a password that opens it, it is
   `PASSWORD-PROTECTED`.
@@ -429,7 +444,7 @@ follow [semantic versioning](https://semver.org/).
   renderings, as before.
 - `--detect broken-media` checks a JPEG as ClamAV does, which crafted inputs
   showed differs from the format's rules: a file is checked only from 6 bytes
-  and `FF D8 FF`; up to 15 bytes of junk before a marker are skipped; every
+  and `FF D8 FF`; up to 14 bytes of junk before a marker are skipped; every
   marker up to the start of scan carries a length, checked against the file,
   the start of scan's own included; and JFIF and SPIFF headers have
   their position checked, after nothing but comments and APP1 segments. Only
@@ -443,11 +458,11 @@ follow [semantic versioning](https://semver.org/).
   them, and on TIFFs of 31 encodings. The JPEG decoders, the one TIFF uses
   included, are built without their SIMD code, their only `unsafe`; they
   decode the same pixels.
-- A WebP image matched `Target:5` (graphics) signatures, which clamscan's do
-  not: its graphics are PNG, GIF, JPEG, TIFF and BMP. Under `--clamav-compat`
-  those five are also the only images hashed for `fuzzy_img#`, as clamscan
-  hashes; otherwise a WebP, ICO, PNM, QOI, DDS, farbfeld or HDR image is too,
-  as `sigtool --fuzzy-img` hashes them.
+- Under `--clamav-compat`, a WebP image matched `Target:5` (graphics)
+  signatures, which clamscan's do not: its graphics are PNG, GIF, JPEG, TIFF
+  and BMP, and those five are also the only images it hashes for `fuzzy_img#`.
+  Otherwise a WebP, ICO, PNM, QOI, DDS, farbfeld or HDR image is graphics too,
+  and hashed as `sigtool --fuzzy-img` hashes it.
 - PCRE subsignatures matched differently from ClamAV's PCRE2 on bytes above
   0x7F and on PCRE syntax the Rust regex engines read otherwise: `\xe9` matched
   é's UTF-8 encoding instead of the byte, `.`, `[^a]` and `\W` missed high

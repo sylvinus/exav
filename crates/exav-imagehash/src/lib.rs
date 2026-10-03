@@ -35,8 +35,11 @@ use std::str::FromStr;
 
 use image::{imageops::FilterType, DynamicImage, GrayImage, ImageFormat};
 
+mod dct;
 mod image_codecs;
 mod pillow;
+
+use dct::dct2d;
 
 pub use pillow::PillowFilter;
 
@@ -600,28 +603,6 @@ fn median<
         (s[mid - 1] + s[mid]) / T::from(2)
     } else {
         s[mid]
-    }
-}
-
-/// In-place 2-D DCT-II of an `n × n` row-major buffer: the columns, then the
-/// rows, each pass scaled by 2 (`scipy.fftpack.dct`'s unnormalised scale).
-fn dct2d<T: rustdct::DctNum>(buf: &mut [T], n: usize) {
-    let dct = rustdct::DctPlanner::new().plan_dct2(n);
-    let two = T::from_f64(2.0).expect("2 is representable");
-    let mut scratch = vec![T::zero(); n * n];
-    transpose::transpose(buf, &mut scratch, n, n);
-    for row in scratch.chunks_mut(n) {
-        dct.process_dct2(row);
-        for v in row {
-            *v = *v * two;
-        }
-    }
-    transpose::transpose(&scratch, buf, n, n);
-    for row in buf.chunks_mut(n) {
-        dct.process_dct2(row);
-        for v in row {
-            *v = *v * two;
-        }
     }
 }
 

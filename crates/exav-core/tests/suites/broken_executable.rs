@@ -178,6 +178,37 @@ fn pe(f: impl FnOnce(&mut Pe)) -> Vec<u8> {
     p.build()
 }
 
+/// The check reads only the headers, so a PE too large to hold gets the same
+/// answer as one in memory: here padded to 64 KiB and read from a reader
+/// past a 4 KiB object limit.
+#[test]
+fn an_executable_too_large_to_hold_is_judged_the_same() {
+    let db = empty_db();
+    for (what, mut blob, want) in [
+        ("PE32", pe(|_| {}), false),
+        ("no sections", pe(|p| p.nsec = Some(0)), true),
+        ("SectionAlignment 0x800", pe(|p| p.salign = 0x800), true),
+    ] {
+        blob.resize(64 * 1024, 0);
+        let mut opts = ScanOptions::default();
+        opts.alert_broken = true;
+        opts.clamav_compat = true;
+        let held = analyze(&db, &blob, &opts).verdict;
+        opts.deep_analysis_max = 4096;
+        let len = blob.len() as u64;
+        let streamed = exav_core::scan_seekable(&db, std::io::Cursor::new(&blob), len, &opts)
+            .unwrap()
+            .verdict;
+        // Past the limit other checks that need the whole object may not run
+        // (a clean PE is then a limit), but this one does.
+        let flagged = |v: &Verdict| {
+            matches!(v, Verdict::Infected { signature, .. } if signature == "Heuristics.Broken.Executable")
+        };
+        assert_eq!(flagged(&held), want, "{what} held: {held:?}");
+        assert_eq!(flagged(&streamed), want, "{what} past the object limit: {streamed:?}");
+    }
+}
+
 #[test]
 fn pe_rules() {
     let many: Vec<Sec> = std::iter::once(sec(0x200, 0x2000, 0x200, 0x2000))

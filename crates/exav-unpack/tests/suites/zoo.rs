@@ -98,6 +98,39 @@ fn the_compressed_archives_decode_to_exactly_what_the_stored_one_holds() {
 }
 
 #[test]
+fn an_lzd_member_does_not_decode_past_its_declared_size() {
+    // The declared size is what the budget is checked against, so LZD output
+    // past it was held whatever it came to: LZW expands a few thousand times,
+    // a megabyte member to gigabytes. Here `license` (LZD, 11357 bytes)
+    // declares 64.
+    let mut img = fixture("default.zoo");
+    let start = u32::from_le_bytes(img[24..28].try_into().unwrap()) as usize;
+    assert_eq!(img[start + 5], 1, "the first member is LZD");
+    img[start + 20..start + 24].copy_from_slice(&64u32.to_le_bytes());
+    let e = members(&img);
+    assert!(!e.is_empty());
+    for x in &e {
+        assert!(x.data.len() <= 64, "{} held {} bytes", x.name, x.data.len());
+        assert!(x.unsupported.is_some(), "{}", x.name);
+    }
+}
+
+/// The chain ends at an entry whose next and data offsets are zero, which
+/// `zoo` writes short, without the name fields after them: the archives it
+/// writes report nothing, not a directory running past their end.
+#[test]
+fn an_archive_zoo_wrote_reports_nothing() {
+    for name in ["store.zoo", "default.zoo", "high_per.zoo"] {
+        let e = members(&fixture(name));
+        assert!(
+            e.iter().all(|x| x.unsupported.is_none()),
+            "{name}: {:?}",
+            e.iter().map(|x| (&x.name, x.unsupported)).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn every_member_carries_its_name() {
     let c = contents("store.zoo");
     assert!(

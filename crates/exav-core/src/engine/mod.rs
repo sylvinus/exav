@@ -47,19 +47,28 @@ fn byte_at<B: ByteSource + ?Sized>(b: &B, i: usize) -> u8 {
     b.window(i, 1).first().copied().unwrap_or(0)
 }
 
-/// Whether the object starts like an image clamscan treats as graphics
-/// (`Target:5`): PNG, GIF, JPEG, TIFF or BMP. Not WebP, PNM or ICO, which
-/// clamscan 1.5.4 neither matches as `Target:5` nor hashes while scanning.
-fn looks_like_image<B: ByteSource + ?Sized>(b: &B) -> bool {
-    let d = b.window(0, 12);
-    d.len() >= 12
-        && (d.starts_with(b"\x89PNG\r\n\x1a\n")
-            || d.starts_with(b"GIF87a")
-            || d.starts_with(b"GIF89a")
-            || d.starts_with(&[0xFF, 0xD8, 0xFF])
-            || d.starts_with(b"II*\x00")
-            || d.starts_with(b"MM\x00*")
-            || d.starts_with(b"BM"))
+/// Whether the object starts like an image `Target:5` (graphics) signatures
+/// run on. Those clamscan 1.5.4 treats as graphics are PNG, GIF, JPEG, TIFF
+/// and BMP; with `all_formats`, every format exav-imagehash detects (WebP,
+/// ICO, PNM, ...) is too.
+fn looks_like_image<B: ByteSource + ?Sized>(b: &B, all_formats: bool) -> bool {
+    let d = b.window(0, 16);
+    if d.len() < 12 {
+        return false;
+    }
+    #[cfg(feature = "image-hash")]
+    if all_formats {
+        return exav_imagehash::Format::detect(&d).is_some();
+    }
+    #[cfg(not(feature = "image-hash"))]
+    let _ = all_formats;
+    d.starts_with(b"\x89PNG\r\n\x1a\n")
+        || d.starts_with(b"GIF87a")
+        || d.starts_with(b"GIF89a")
+        || d.starts_with(&[0xFF, 0xD8, 0xFF])
+        || d.starts_with(b"II*\x00")
+        || d.starts_with(b"MM\x00*")
+        || d.starts_with(b"BM")
 }
 
 /// The object's `fuzzy_img` hash, as ClamAV computes it, when it is an image
@@ -1090,8 +1099,9 @@ pub(crate) struct WholeLimits {
     /// Largest object PCRE subsignatures run on (`--max-pcre-bytes`); past it
     /// they do not match, as ClamAV's `PCREMaxFileSize` has it.
     pub(crate) pcre: usize,
-    /// `fuzzy_img#` hashes every image format exav-imagehash decodes, not only
-    /// the five clamscan treats as graphics. Off under `--clamav-compat`.
+    /// `Target:5` and `fuzzy_img#` take every image format exav-imagehash
+    /// decodes, not only the five clamscan treats as graphics. Off under
+    /// `--clamav-compat`.
     pub(crate) all_image_formats: bool,
 }
 
@@ -2575,7 +2585,7 @@ impl SigEngine {
     /// Every anchor hit a scan of `buf` as file type `ft` finds, handed to `f`
     /// as [`sweep`] does, the partition as the id.
     fn each_hit(&self, buf: &[u8], ft: FileType, f: &mut impl FnMut(usize, u32, usize, usize, usize) -> bool) {
-        let active = self.active(ft, looks_like_image(buf));
+        let active = self.active(ft, looks_like_image(buf, WholeLimits::NONE.all_image_formats));
         sweep(&self.grams, &active, &buf, f);
     }
 
@@ -2828,7 +2838,7 @@ impl SigEngine {
     /// split. `(cs_hits, ci_hits, fanout, target_reject, literal, token, ok)`.
     pub fn scan_diag(&self, buf: &[u8], ft: FileType, layout: Option<&PeLayout>) -> [u64; 7] {
         DIAG_SLOW.with(|c| c.set((0, 0)));
-        let lower = if self.needs_lower(ft, looks_like_image(buf)) {
+        let lower = if self.needs_lower(ft, looks_like_image(buf, WholeLimits::NONE.all_image_formats)) {
             buf.to_ascii_lowercase()
         } else {
             Vec::new()
@@ -3358,7 +3368,7 @@ impl SigEngine {
         } else {
             self.bodies.len()
         });
-        let is_image = looks_like_image(buf);
+        let is_image = looks_like_image(buf, limits.all_image_formats);
 
         // An anchor hit fans out to every body sharing that anchor (the group).
         // A verified NDB body is an immediate detection; an LDB subsignature
@@ -3506,7 +3516,7 @@ impl SigEngine {
             self.bodies.len()
         });
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let is_image = looks_like_image(buf);
+        let is_image = looks_like_image(buf, limits.all_image_formats);
         // Partition membership implies the target match.
         self.walk(buf, ft, is_image, layout, |bid, start, n| {
             match &self.bodies[bid].owner {
@@ -3616,7 +3626,7 @@ impl SigEngine {
             return;
         }
         let mut sc = Scratch::acquire(self.bodies.len());
-        let is_image = looks_like_image(buf);
+        let is_image = looks_like_image(buf, limits.all_image_formats);
         // Partition membership implies the target match.
         self.walk(buf, ft, is_image, layout, |bid, start, n| {
             if let Owner::LdbSub = &self.bodies[bid].owner {
@@ -5897,6 +5907,34 @@ mod tests {
         }
     }
 
+    /// Each PCRE flag letter, read from the signature itself, changes the
+    /// match as PCRE2 has it: `i` caseless, `m` multiline, `s` dot-all, `x`
+    /// extended (pattern whitespace ignored), `E` dollar-end-only (`$` no
+    /// longer matches before a final newline).
+    #[test]
+    fn pcre_flag_letters_mean_what_pcre2_says() {
+        let fires = |sub: &str, hay: &[u8]| {
+            let mut b = EngineBuilder::new();
+            let line = format!("T.Pcre;Engine:81-255,Target:0;0&1;4d41524b;{sub}");
+            assert!(b.add_ldb_line(&line, false).is_ok(), "{line}");
+            b.build().scan(hay, FileType::Unknown).is_some()
+        };
+        for (sub, hay, want) in [
+            ("0/ABC/", &b"MARKabc"[..], false),
+            ("0/ABC/i", b"MARKabc", true),
+            ("0/^abc/", b"MARK\nabc", false),
+            ("0/^abc/m", b"MARK\nabc", true),
+            ("0/K.abc/", b"MARK\nabc", false),
+            ("0/K.abc/s", b"MARK\nabc", true),
+            ("0/a b c/", b"MARKabc", false),
+            ("0/a b c/x", b"MARKabc", true),
+            ("0/abc$/", b"MARKabc\n", true),
+            ("0/abc$/E", b"MARKabc\n", false),
+        ] {
+            assert_eq!(fires(sub, hay), want, "{sub} on {hay:?}");
+        }
+    }
+
     /// Offsets, their shift, `r`, `e`, `A` and `g`, each answer clamscan
     /// 1.5.4's for the same signature and bytes: the part past the offset is
     /// the subject (`^`, `\A` and lookbehinds start there), a match starts at
@@ -6112,6 +6150,37 @@ mod tests {
         };
         assert!(scan(true).is_some());
         assert!(scan(false).is_none());
+    }
+
+    /// Native, a WebP is graphics for `Target:5`, perceptual hash and byte
+    /// subsignature alike; under `--clamav-compat`, as clamscan has it, not.
+    #[cfg(feature = "image-hash")]
+    #[test]
+    fn a_webp_is_graphics_except_under_compat() {
+        let img = image::RgbImage::from_pixel(48, 48, image::Rgb([200, 30, 30]));
+        let mut webp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut webp, image::ImageFormat::WebP)
+            .unwrap();
+        let webp = webp.into_inner();
+        for sig in [
+            "Demo.FuzzyImg;Engine:150-255,Target:5;0;fuzzy_img#8000000000000000",
+            "Demo.Riff;Engine:150-255,Target:5;0;52494646",
+        ] {
+            let mut b = EngineBuilder::new();
+            b.add_ldb(sig, false);
+            let e = b.build();
+            let scan = |all_image_formats: bool| {
+                let limits = WholeLimits {
+                    all_image_formats,
+                    ..WholeLimits::NONE
+                };
+                let buf: &[u8] = &webp;
+                e.scan_first_source(&buf, FileType::Unknown, None, None, None, &|_, _| false, limits, None)
+            };
+            assert!(scan(true).is_some(), "{sig}");
+            assert!(scan(false).is_none(), "{sig}");
+        }
     }
 
     /// Built without `image-hash`, a `fuzzy_img#` signature is counted with

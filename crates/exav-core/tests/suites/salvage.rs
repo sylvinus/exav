@@ -287,6 +287,11 @@ mod damaged {
 
     /// A ZIP whose deflated member breaks part way.
     fn zip_broken() -> Vec<u8> {
+        zip_broken_after(&clean_prefix())
+    }
+
+    /// A ZIP whose deflated member breaks right after `prefix`.
+    fn zip_broken_after(prefix: &[u8]) -> Vec<u8> {
         let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         z.start_file(
             "m.bin",
@@ -294,7 +299,7 @@ mod damaged {
                 .compression_method(zip::CompressionMethod::Stored),
         )
         .unwrap();
-        z.write_all(&deflate_broken_after(&clean_prefix(), UNREACHED))
+        z.write_all(&deflate_broken_after(prefix, UNREACHED))
             .unwrap();
         let mut blob = z.finish().unwrap().into_inner();
         // Relabel the stored member as deflated, in its local header and its
@@ -358,6 +363,83 @@ mod damaged {
         analyze(&Scanner::builtin(), blob, &ScanOptions::default()).verdict
     }
 
+    /// An MSZIP cabinet holding one member, `body`, whose third 32 KiB block
+    /// is replaced by a deflate block of the reserved type: the first two
+    /// decode, nothing after them does.
+    fn cab_broken_in_block_three(body: &[u8]) -> Vec<u8> {
+        let mut builder = cab::CabinetBuilder::new();
+        builder
+            .add_folder(cab::CompressionType::MsZip)
+            .add_file("m.bin");
+        let mut blob = Vec::new();
+        let mut w = builder.build(std::io::Cursor::new(&mut blob)).unwrap();
+        while let Some(mut f) = w.next_file().unwrap() {
+            f.write_all(body).unwrap();
+        }
+        w.finish().unwrap();
+        // CFFOLDER follows the 36-byte CFHEADER: the first CFDATA's offset.
+        let mut at = u32::from_le_bytes(blob[36..40].try_into().unwrap()) as usize;
+        for _ in 0..2 {
+            let cb = u16::from_le_bytes([blob[at + 4], blob[at + 5]]) as usize;
+            at += 8 + cb;
+        }
+        // Past the block's checksum, size fields and `CK`: BFINAL 1, BTYPE 11.
+        assert_eq!(&blob[at + 8..at + 10], b"CK");
+        blob[at + 10] = 0x07;
+        blob
+    }
+
+    /// Filler that does not compress, so the member spans several blocks.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u32 = 0x9e37_79b9;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// The bytes a damaged CAB member decoded before the damage are scanned,
+    /// and with nothing found the damage keeps the file from passing as clean.
+    #[test]
+    fn a_damaged_cab_member_is_scanned_up_to_the_damage() {
+        let mut infected = eicar().to_vec();
+        infected.extend(noise(160 * 1024));
+        match verdict(&cab_broken_in_block_three(&infected)) {
+            Verdict::Infected { .. } => {}
+            other => panic!("EICAR before the damage: expected Infected, got {other:?}"),
+        }
+        match verdict(&cab_broken_in_block_three(&noise(160 * 1024))) {
+            Verdict::Unscannable { .. } => {}
+            other => panic!("nothing before the damage: expected Unscannable, got {other:?}"),
+        }
+    }
+
+    /// A ZOO member that fails its CRC still has every byte it holds scanned.
+    /// `store.zoo` holds one stored member; putting EICAR at its start is what
+    /// breaks the CRC.
+    #[test]
+    fn a_zoo_member_failing_its_crc_is_scanned() {
+        let mut zoo = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../exav-unpack/tests/fixtures/zoo/store.zoo"
+        ))
+        .unwrap();
+        // The archive header's first directory entry, whose `offset` field
+        // locates the member's data.
+        let entry = u32::from_le_bytes(zoo[24..28].try_into().unwrap()) as usize;
+        let data = u32::from_le_bytes(zoo[entry + 10..entry + 14].try_into().unwrap()) as usize;
+        assert!(matches!(verdict(&zoo), Verdict::Clean), "the fixture itself: {:?}", verdict(&zoo));
+        zoo[data..data + eicar().len()].copy_from_slice(eicar());
+        match verdict(&zoo) {
+            Verdict::Infected { .. } => {}
+            other => panic!("expected Infected, got {other:?}"),
+        }
+    }
+
     /// Corruption part way through a compressed stream leaves content in the
     /// file that was never decoded, so a clean prefix is not a clean file. The
     /// same answer whether the stream is the file or sits inside another one.
@@ -415,10 +497,13 @@ mod damaged {
         gz.extend(deflate_broken_after(&prefix, UNREACHED));
         let mut pdf = vec![0x78, 0x9c];
         pdf.extend(deflate_broken_after(&prefix, UNREACHED));
+        let zip = zip_broken_after(&prefix);
         for (what, blob) in [
             ("gzip", gz.clone()),
             ("gzip in tar", in_tar("x.gz", &gz)),
             ("gzip in zip", in_zip("x.gz", &gz)),
+            ("zip", zip.clone()),
+            ("zip in tar", in_tar("x.zip", &zip)),
             ("pdf", pdf_with_stream(&pdf)),
         ] {
             match verdict(&blob) {

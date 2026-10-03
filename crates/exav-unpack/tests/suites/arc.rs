@@ -129,6 +129,47 @@ fn detection_needs_more_than_the_two_byte_marker() {
     assert_ne!(detect(&fake), Some(Format::Arc));
 }
 
+/// One method-9 (squashed) member around `codes`, 9-bit LSB-first.
+fn squashed(codes: &[u16], orig_size: u32) -> Vec<u8> {
+    let mut body = vec![0u8; (codes.len() * 9).div_ceil(8)];
+    for (i, &c) in codes.iter().enumerate() {
+        for b in 0..9 {
+            if c >> b & 1 == 1 {
+                let at = i * 9 + b;
+                body[at / 8] |= 1 << (at % 8);
+            }
+        }
+    }
+    let mut a = vec![0x1A, 9];
+    let mut name = [0u8; 13];
+    name[..8].copy_from_slice(b"loop.bin");
+    a.extend_from_slice(&name);
+    a.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    a.extend_from_slice(&[0; 6]); // date, time, crc
+    a.extend_from_slice(&orig_size.to_le_bytes());
+    a.extend_from_slice(&body);
+    a.extend_from_slice(&[0x1A, 0]);
+    a
+}
+
+#[test]
+fn a_code_past_the_next_free_one_is_refused() {
+    // Found by fuzzing (`full_pipeline`). 258 arrives while 257 is the next
+    // code to define: no encoder writes that. Taken for the KwKwK case, it
+    // became the previous code, the next literal defined 258 as its own
+    // prefix, and expanding 258 then never reached a literal, growing the
+    // stack until the process ran out of memory.
+    let arc = squashed(&[65, 258, 65, 258], 64);
+    let e = members(&arc);
+    assert_eq!(
+        e.len(),
+        1,
+        "{:?}",
+        e.iter().map(|x| &x.name).collect::<Vec<_>>()
+    );
+    assert!(e[0].unsupported.is_some());
+}
+
 #[test]
 fn a_truncated_archive_yields_what_it_can_without_panicking() {
     let full = fixture("sample.arc");

@@ -881,6 +881,69 @@ mod tests {
         assert_eq!(entries[0].data, SOURCE.as_bytes());
     }
 
+    /// An EA06 file of `(subtype, compressed content)` records, as
+    /// [`ea06_script_is_extracted_as_source`] lays one out.
+    fn ea06_blob(records: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let lame = |b: &[u8], seed: u32| {
+            let mut v = b.to_vec();
+            xor(&mut v, seed, Cipher::Lame);
+            v
+        };
+        let mut d = MARKER_EA06.to_vec();
+        d.extend_from_slice(&[0x5a; 16]);
+        for (subtype, comp) in records {
+            d.extend_from_slice(&lame(b"FILE", EA06.file_tag));
+            for (s, keys) in [(*subtype, EA06.subtype), ("src.bin", EA06.name)] {
+                let utf16: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                let n = s.encode_utf16().count() as u32;
+                d.extend_from_slice(&(n ^ keys.0).to_le_bytes());
+                d.extend_from_slice(&lame(&utf16, n.wrapping_add(keys.1)));
+            }
+            d.push(1);
+            d.extend_from_slice(&(comp.len() as u32 ^ EA06.size).to_le_bytes());
+            d.extend_from_slice(&[0; 8 + 16]);
+            d.extend_from_slice(&lame(comp, EA06.content));
+        }
+        d
+    }
+
+    /// A file the script installs (`FileInstall`) is a member of its own, the
+    /// bytes exactly as stored.
+    #[test]
+    fn an_ea06_installed_file_is_extracted_whole() {
+        let payload: Vec<u8> = b"MZ installed payload "
+            .iter()
+            .copied()
+            .cycle()
+            .take(3000)
+            .collect();
+        let blob = ea06_blob(&[
+            (">>>AUTOIT SCRIPT<<<", ea06_all_literal(&unhex(TOKENS))),
+            ("C:\\Users\\Public\\payload.exe", ea06_all_literal(&payload)),
+        ]);
+        let entries = extract(Format::Autoit, &blob, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(entries.len(), 2, "{:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(entries[0].data, SOURCE.as_bytes());
+        assert_eq!(entries[1].unsupported, None);
+        assert!(entries[1].data == payload, "the installed file differs");
+    }
+
+    /// A member whose compressed stream stops half way is scanned as far as it
+    /// decoded, and reported: what comes out is a prefix of what went in.
+    #[test]
+    fn an_ea06_member_cut_short_is_kept_and_reported() {
+        let payload: Vec<u8> = (0..4000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut comp = ea06_all_literal(&payload);
+        comp.truncate(comp.len() / 2);
+        let blob = ea06_blob(&[("C:\\x.bin", comp)]);
+        let entries = extract(Format::Autoit, &blob, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert!(e.unsupported.is_some(), "the cut was not reported");
+        assert!(e.data.len() > 1000, "{} bytes kept", e.data.len());
+        assert!(payload.starts_with(&e.data), "what was kept is not the start of the member");
+    }
+
     /// [`ea05_all_literal`] with EA06's literal flag (1) and magic.
     fn ea06_all_literal(plain: &[u8]) -> Vec<u8> {
         let mut bits: Vec<u8> = Vec::new();

@@ -261,6 +261,160 @@ fn a_large_raw_decoded_member_streams_and_the_walk_goes_on() {
     );
 }
 
+/// `1-big.bin` in the `*_large_then_small` archives below: 40000 bytes of
+/// numbered lines, ending in the EICAR string, so a decoder that stops early
+/// loses the marker.
+fn large_member() -> Vec<u8> {
+    let lines: Vec<u8> = (0..700u32)
+        .flat_map(|i| {
+            format!(
+                "{i:05} the quick brown fox jumps over the lazy dog {}\n",
+                i * 7919 % 10007
+            )
+            .into_bytes()
+        })
+        .collect();
+    let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+    let mut big = lines.repeat(2);
+    big.truncate(40000 - eicar.len());
+    big.extend_from_slice(eicar);
+    big
+}
+
+const SMALL_MEMBER: &[u8] = b"the member after the large one, which the walk must still reach\n";
+
+/// A ZIP of `1-big.bin` as `big` (already compressed with `method`) and
+/// `2-after.txt` stored, central directory included.
+fn zip_large_then_small(method: u16, big: &[u8]) -> Vec<u8> {
+    let crc = |d: &[u8]| {
+        let mut c = flate2::Crc::new();
+        c.update(d);
+        c.sum()
+    };
+    let members: [(&str, u16, Vec<u8>, u32, u32); 2] = [
+        ("1-big.bin", method, big.to_vec(), crc(&large_member()), 40000),
+        (
+            "2-after.txt",
+            0,
+            SMALL_MEMBER.to_vec(),
+            crc(SMALL_MEMBER),
+            SMALL_MEMBER.len() as u32,
+        ),
+    ];
+    let mut z = Vec::new();
+    let mut cd = Vec::new();
+    for (name, m, data, crc, usize) in &members {
+        let at = z.len() as u32;
+        let fields = |v: &mut Vec<u8>| {
+            v.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            v.extend_from_slice(&0u16.to_le_bytes()); // flags
+            v.extend_from_slice(&m.to_le_bytes());
+            v.extend_from_slice(&[0; 4]); // time, date
+            v.extend_from_slice(&crc.to_le_bytes());
+            v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            v.extend_from_slice(&usize.to_le_bytes());
+            v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            v.extend_from_slice(&0u16.to_le_bytes()); // extra
+        };
+        z.extend_from_slice(b"PK\x03\x04");
+        fields(&mut z);
+        z.extend_from_slice(name.as_bytes());
+        z.extend_from_slice(data);
+        cd.extend_from_slice(b"PK\x01\x02");
+        cd.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        fields(&mut cd);
+        cd.extend_from_slice(&[0; 6]); // comment length, disk, internal attrs
+        cd.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        cd.extend_from_slice(&at.to_le_bytes());
+        cd.extend_from_slice(name.as_bytes());
+    }
+    let cd_at = z.len() as u32;
+    z.extend_from_slice(&cd);
+    z.extend_from_slice(b"PK\x05\x06");
+    z.extend_from_slice(&[0; 4]); // disk numbers
+    z.extend_from_slice(&2u16.to_le_bytes());
+    z.extend_from_slice(&2u16.to_le_bytes());
+    z.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+    z.extend_from_slice(&cd_at.to_le_bytes());
+    z.extend_from_slice(&0u16.to_le_bytes());
+    z
+}
+
+/// The streamed walk over `blob` with a buffer far smaller than the large
+/// member: each member once, as `(name, unsupported, bytes)`.
+fn walk_small_buffer(blob: &[u8]) -> Vec<(String, Option<&'static str>, Vec<u8>)> {
+    use exav_unpack::{walk, Member, MemberMeta};
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 8192;
+    let mut seen = Vec::new();
+    let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+        let mut d = Vec::new();
+        match content {
+            Some(Member::Stream(r)) => {
+                r.read_to_end(&mut d).unwrap();
+            }
+            Some(Member::Bytes(b)) => d = b,
+            None => {}
+        }
+        seen.push((m.name.clone(), m.unsupported, d));
+        None::<()>
+    };
+    walk(Format::Zip, &blob, &mut Budget::new(limits), &mut visit).unwrap();
+    seen
+}
+
+fn assert_both_members_whole(what: &str, blob: &[u8]) {
+    let seen = walk_small_buffer(blob);
+    let summary: Vec<_> = seen.iter().map(|s| (&s.0, s.1, s.2.len())).collect();
+    assert_eq!(seen.len(), 2, "{what}: each member once: {summary:?}");
+    assert_eq!(seen[0].0, "1-big.bin", "{what}: {summary:?}");
+    assert_eq!(seen[0].1, None, "{what}: {summary:?}");
+    assert!(seen[0].2 == large_member(), "{what}: the large member differs");
+    assert_eq!(seen[1].0, "2-after.txt", "{what}: {summary:?}");
+    assert_eq!(seen[1].2, SMALL_MEMBER, "{what}: {summary:?}");
+}
+
+/// A member larger than the buffer limit, in each codec the `zip` crate lacks,
+/// is decoded as it is read, whole and once, and the member after it is
+/// still reached. The Deflate64, BZip2 and LZMA archives were written by
+/// 7-Zip 25.01 (`7z a -tzip -mm=<method> -mx=9 x.zip 1-big.bin 2-after.txt`,
+/// LZMA with `-md=4k`), so the codecs are read as a real writer emits them.
+/// LZMA's window is allocated whole, so a dictionary over the limit is a
+/// limit instead (`zip_lzma_member_is_decoded_once_when_streamed`).
+#[test]
+#[cfg(all(feature = "bzip2", feature = "lzip"))]
+fn a_large_member_in_any_codec_streams_and_the_walk_goes_on() {
+    for name in [
+        "7z_deflate64_large_then_small.zip",
+        "7z_bzip2_large_then_small.zip",
+        "7z_lzma_large_then_small.zip",
+    ] {
+        assert_both_members_whole(name, &fixture(name));
+    }
+}
+
+/// The same for zstd (method 93), written by ruzstd's encoder.
+#[test]
+#[cfg(feature = "zstd")]
+fn a_large_zstd_member_streams_and_the_walk_goes_on() {
+    let big = ruzstd::encoding::compress_to_vec(
+        &large_member()[..],
+        ruzstd::encoding::CompressionLevel::Fastest,
+    );
+    assert_both_members_whole("zstd", &zip_large_then_small(93, &big));
+}
+
+/// The same for XZ (method 95), written by lzma-rust2's XZ writer.
+#[test]
+#[cfg(feature = "xz")]
+fn a_large_xz_member_streams_and_the_walk_goes_on() {
+    use std::io::Write;
+    let mut w = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6)).unwrap();
+    w.write_all(&large_member()).unwrap();
+    let big = w.finish().unwrap();
+    assert_both_members_whole("xz", &zip_large_then_small(95, &big));
+}
+
 // --- Orphan local headers must never be silently dropped --------------------
 //
 // A credible local file header the central directory doesn't cover *is* a member

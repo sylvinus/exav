@@ -61,6 +61,11 @@ fn module_stream_name(name: &str) -> Vec<u8> {
 /// A compound file carrying one complete VBA module: the `dir` stream describing
 /// it and the module stream holding the code.
 fn ole_with_a_real_module(source: &str, text_offset: usize) -> Vec<u8> {
+    ole_with_a_real_module_beside(source, text_offset, &[])
+}
+
+/// The same, with one-byte `siblings` streams at the root.
+fn ole_with_a_real_module_beside(source: &str, text_offset: usize, siblings: &[&str]) -> Vec<u8> {
     let mut dir = Vec::new();
     dir.extend_from_slice(&record(0x0004, b"VBAProject")); // PROJECTNAME
     dir.extend_from_slice(&record(0x0019, b"Module1")); // MODULENAME
@@ -77,6 +82,9 @@ fn ole_with_a_real_module(source: &str, text_offset: usize) -> Vec<u8> {
 
     let cursor = std::io::Cursor::new(Vec::<u8>::new());
     let mut cf = cfb::CompoundFile::create(cursor).expect("create cfb");
+    for path in siblings {
+        cf.create_stream(path).unwrap().write_all(b"x").unwrap();
+    }
     cf.create_storage("/VBA").expect("create /VBA");
     {
         let mut s = cf.create_stream("/VBA/dir").expect("create dir");
@@ -132,6 +140,28 @@ fn the_macro_source_reaches_the_vba_project_artifact() {
         dump.to_ascii_lowercase().contains("calc.exe"),
         "the REM dump must carry the module source, got:\n{dump}"
     );
+}
+
+/// A compound file the strict reader refuses, two siblings' names swapped so
+/// the directory is out of order, is read by the lenient one, and its VBA
+/// project is still assembled from the `VBA` storage it finds there.
+#[test]
+fn the_macro_source_is_assembled_through_the_lenient_reader() {
+    const SOURCE: &str = "Attribute VB_Name = \"Module1\"\r\nSub AutoOpen()\r\n  Shell \"calc.exe\"\r\nEnd Sub\r\n";
+    let mut blob = ole_with_a_real_module_beside(SOURCE, 0x10, &["/aaaa", "/bbbb"]);
+    let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+    let (a, b) = (utf16("aaaa"), utf16("bbbb"));
+    let at = |n: &[u8], blob: &[u8]| blob.windows(n.len()).position(|w| w == n).unwrap();
+    let (pa, pb) = (at(&a, &blob), at(&b, &blob));
+    blob[pa..pa + 8].copy_from_slice(&b);
+    blob[pb..pb + 8].copy_from_slice(&a);
+    assert!(
+        cfb::CompoundFile::open(std::io::Cursor::new(blob.clone())).is_err(),
+        "the strict reader still opens it"
+    );
+    let entries = extract(Format::Ole, &blob, &mut Budget::new(Limits::default())).unwrap();
+    let raw = String::from_utf8_lossy(&artifact(&entries, "vba_project_raw").data).into_owned();
+    assert!(raw.contains("calc.exe"), "got:\n{raw}");
 }
 
 #[test]

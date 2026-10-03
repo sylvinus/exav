@@ -574,6 +574,40 @@ mod tests {
         }
     }
 
+    /// A failed scan is blocked as the ICAP guide's `ERROR` row says: on the
+    /// wire, `X-Exav-Status: ERROR` with a reason and no category, and the
+    /// c-icap header under `Heuristics.Exav.ScanError` under `blocks` only.
+    #[test]
+    fn a_failed_scan_is_blocked_in_the_error_vocabulary() {
+        let d = Decision::Error("scan failed: read failed".to_string());
+        for (policy, threat) in [
+            (InfectionHeader::Blocks, true),
+            (InfectionHeader::Detections, false),
+        ] {
+            let mut out = Vec::new();
+            block(&d, policy).write_to(&mut out, "\"t\"").unwrap();
+            let text = String::from_utf8(out).unwrap();
+            let icap_head = text.split("\r\n\r\n").next().unwrap();
+            let lines: Vec<&str> = icap_head.lines().collect();
+            assert_eq!(lines[0], "ICAP/1.0 200 OK", "{policy:?}");
+            assert!(lines.contains(&"X-Exav-Status: ERROR"), "{policy:?}: {text}");
+            assert!(
+                lines.contains(&"X-Exav-Reason: scan failed: read failed"),
+                "{policy:?}: {text}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.starts_with("X-Exav-Category:")),
+                "{policy:?}: {text}"
+            );
+            assert_eq!(
+                lines.contains(&"X-Infection-Found: Type=0; Resolution=2; Threat=Heuristics.Exav.ScanError;"),
+                threat,
+                "{policy:?}: {text}"
+            );
+            assert!(text.contains("HTTP/1.1 403 Forbidden"), "{policy:?}: {text}");
+        }
+    }
+
     #[test]
     fn a_not_scanned_threat_name_reads_as_the_condition_that_blocked() {
         assert_eq!(

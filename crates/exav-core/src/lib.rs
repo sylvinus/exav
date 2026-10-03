@@ -4534,6 +4534,26 @@ mod tests {
         std::fs::write(&path, &zip).unwrap();
         let on_disk = scan_path(&wild, &path, &opts).unwrap().verdict;
         assert_eq!(infected_as(&on_disk), Some("Test.ZipName"));
+
+        // A logical signature and a YARA rule over the same name: in the
+        // container's bytes only, never in its member's.
+        let ldb = db_from(&[(
+            "l.ldb",
+            "Test.ZipLdb;Engine:51-255,Target:0;0&1;7061796c6f6164;6d61726b6572\n",
+        )]);
+        assert_eq!(infected_as(&seekable(&ldb, &zip, &opts)), Some("Test.ZipLdb"));
+        assert_eq!(
+            infected_as(&scan_path(&ldb, &path, &opts).unwrap().verdict),
+            Some("Test.ZipLdb")
+        );
+        #[cfg(feature = "yara")]
+        {
+            let yara = db_from(&[(
+                "r.yar",
+                "rule zip_name { strings: $a = \"payload_marker\" condition: $a }\n",
+            )]);
+            assert_eq!(infected_as(&seekable(&yara, &zip, &opts)), Some("YARA.zip_name"));
+        }
     }
 
     /// A detection in a member stored in an archive is the member's, at any
@@ -4604,6 +4624,209 @@ mod tests {
         ] {
             assert_eq!(infected_as(&v), Some("Eicar-Test-Signature"), "{v:?}");
         }
+
+        // `.ign`'s `db:line:name` form, and the scan of a path.
+        let db = db_from(&[
+            ("a.ndb", "Test.Noisy:0:*:6e6f697379626974\n"),
+            ("a.ign", "a.ndb:1:Test.Noisy\n"),
+        ]);
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.zip");
+        std::fs::write(&path, &zip).unwrap();
+        for v in [
+            analyze(&db, &zip, &opts).verdict,
+            seekable(&db, &zip, &opts),
+            scan_path(&db, &path, &opts).unwrap().verdict,
+        ] {
+            assert_eq!(infected_as(&v), Some("Eicar-Test-Signature"), "{v:?}");
+        }
+    }
+
+    /// An all-match scan lists every detection in an object too large to
+    /// hold, as in one held whole.
+    #[test]
+    fn all_matches_lists_every_detection_past_the_object_limit() {
+        let db = db_from(&[
+            ("a.ndb", "Test.One:0:*:6f6e656d61726b6572\n"),
+            ("b.ndb", "Test.Two:0:*:74776f6d61726b6572\n"),
+        ]);
+        let mut data = b"xx onemarker xx".to_vec();
+        data.resize(512 * 1024, b' ');
+        data.extend_from_slice(b"xx twomarker xx");
+        let opts = ScanOptions {
+            deep_analysis_max: 4096,
+            ..ScanOptions::default()
+        };
+        let (all, _) =
+            analyze_all_seekable(&db, Cursor::new(&data), data.len() as u64, &opts).unwrap();
+        let mut names: Vec<_> = all.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Test.One", "Test.Two"]);
+    }
+
+    /// YARA's filename externals are set for a top-level archive, under a
+    /// first-match scan and under `--all-matches` alike.
+    #[test]
+    #[cfg(all(feature = "yara", any(feature = "zip", feature = "all-formats")))]
+    fn yara_sees_a_top_level_archives_name() {
+        let db = db_from(&[("r.yar", "rule by_ext { condition: extension == \".zip\" }\n")]);
+        let zip = build_zip(&[("a.txt", b"nothing")]);
+        let opts = ScanOptions {
+            filename: Some("/srv/in/t.zip".to_string()),
+            ..ScanOptions::default()
+        };
+        assert_eq!(infected_as(&seekable(&db, &zip, &opts)), Some("YARA.by_ext"));
+        let (all, _) = analyze_all_seekable(&db, Cursor::new(&zip), zip.len() as u64, &opts).unwrap();
+        assert!(all.iter().any(|(n, _)| n == "YARA.by_ext"), "{all:?}");
+        assert_eq!(seekable(&db, &zip, &ScanOptions::default()), Verdict::Clean);
+    }
+
+    /// An image whose pixels would take more than `--max-object-bytes` is not
+    /// decoded, and a loaded `fuzzy_img#` signature is then undecided: the
+    /// scan is `LIMITS-EXCEEDED`, not clean. A 2000x2000 PNG, 12 MB of pixels
+    /// from a few KB, under a 1 MiB limit.
+    #[test]
+    #[cfg(feature = "image-hash")]
+    fn an_image_too_large_to_decode_leaves_a_fuzzy_signature_undecided() {
+        let img = image::RgbImage::from_pixel(2000, 2000, image::Rgb([90, 90, 90]));
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let db = db_from(&[(
+            "f.ldb",
+            "Test.Fuzzy;Engine:150-255,Target:0;0;fuzzy_img#0123456789abcdef\n",
+        )]);
+        let opts = ScanOptions {
+            deep_analysis_max: 1 << 20,
+            ..ScanOptions::default()
+        };
+        assert!((png.len() as u64) < opts.deep_analysis_max);
+        assert!(
+            matches!(analyze(&db, &png, &opts).verdict, Verdict::LimitsExceeded { .. }),
+            "{:?}",
+            analyze(&db, &png, &opts).verdict
+        );
+        assert_eq!(analyze(&db, &png, &ScanOptions::default()).verdict, Verdict::Clean);
+    }
+
+    /// No object is held in memory past `--max-object-bytes`, a container its
+    /// format reads whole included, whatever `Limits::max_buffer_bytes` says:
+    /// a 40 KB compound file is scanned under the default limit, and is a
+    /// limit under a 4 KiB one, through a reader and in memory alike.
+    #[test]
+    #[cfg(any(feature = "ole", feature = "all-formats"))]
+    fn the_object_limit_also_bounds_a_container_read_whole() {
+        use std::io::Write;
+        let mut cf = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+        cf.create_stream("/pad").unwrap().write_all(&[b'.'; 20000]).unwrap();
+        cf.create_stream("/payload").unwrap().write_all(b"harmless").unwrap();
+        let ole = cf.into_inner().into_inner();
+        let db = Scanner::builtin();
+        let opts = ScanOptions::default();
+        assert_eq!(seekable(&db, &ole, &opts), Verdict::Clean);
+        let opts = ScanOptions {
+            deep_analysis_max: 4096,
+            ..opts
+        };
+        assert!(opts.limits.max_buffer_bytes > ole.len() as u64);
+        for v in [seekable(&db, &ole, &opts), analyze(&db, &ole, &opts).verdict] {
+            assert!(matches!(v, Verdict::LimitsExceeded { .. }), "{v:?}");
+        }
+    }
+
+    /// An LHA member in a method there is no decoder for (`-lh9-`) leaves the
+    /// archive `UNSCANNABLE`; a detection in another member still wins.
+    #[test]
+    #[cfg(any(feature = "lha", feature = "all-formats"))]
+    fn an_lha_member_nothing_decodes_is_unscannable() {
+        // A level-0 member: header size and checksum, then method, sizes,
+        // time, attribute, level, name and the content's CRC-16.
+        fn member(method: &[u8; 5], name: &[u8], body: &[u8]) -> Vec<u8> {
+            let crc = body.iter().fold(0u16, |mut crc, &b| {
+                crc ^= b as u16;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+                }
+                crc
+            });
+            let mut h = method.to_vec();
+            h.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            h.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            h.extend_from_slice(&[0, 0, 0x21, 0x5a, 0x20, 0]);
+            h.push(name.len() as u8);
+            h.extend_from_slice(name);
+            h.extend_from_slice(&crc.to_le_bytes());
+            let sum = h.iter().fold(0u8, |s, &b| s.wrapping_add(b));
+            [&[h.len() as u8, sum][..], &h, body].concat()
+        }
+        let lha = |first: &[u8]| {
+            [
+                member(b"-lh0-", b"a.txt", first),
+                member(b"-lh9-", b"b.txt", b"12345678"),
+                vec![0],
+            ]
+            .concat()
+        };
+        let db = Scanner::builtin();
+        let opts = ScanOptions::default();
+        let clean = lha(b"hello there");
+        assert!(
+            matches!(analyze(&db, &clean, &opts).verdict, Verdict::Unscannable { .. }),
+            "{:?}",
+            analyze(&db, &clean, &opts).verdict
+        );
+        assert!(matches!(seekable(&db, &clean, &opts), Verdict::Unscannable { .. }));
+        let infected = lha(eicar());
+        assert!(infected_as(&analyze(&db, &infected, &opts).verdict).is_some());
+    }
+
+    /// A WebP is graphics to a `Target:5` signature by default, and not under
+    /// `--clamav-compat`, as clamscan has it: the option reaches the engine.
+    #[test]
+    #[cfg(feature = "image-hash")]
+    fn clamav_compat_keeps_target_5_to_clamscans_graphics() {
+        let img = image::RgbImage::from_pixel(32, 32, image::Rgb([10, 200, 30]));
+        let mut webp = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut webp, image::ImageFormat::WebP)
+            .unwrap();
+        let webp = webp.into_inner();
+        let db = db_from(&[("w.ldb", "Test.Graphics;Engine:51-255,Target:5;0;52494646\n")]);
+        assert_eq!(
+            infected_as(&analyze(&db, &webp, &ScanOptions::default()).verdict),
+            Some("Test.Graphics")
+        );
+        assert_eq!(
+            analyze(&db, &webp, &ScanOptions::clamav_compat()).verdict,
+            Verdict::Clean
+        );
+    }
+
+    /// A whole-file allowlist entry clears the file whichever way it is
+    /// scanned: in memory, through a reader and from a path, by MD5 (`.fp`)
+    /// or by SHA-256 (`.sfp`).
+    #[test]
+    #[cfg(any(feature = "zip", feature = "all-formats"))]
+    fn an_allowlisted_file_is_clean_on_every_scan_path() {
+        let zip = build_zip(&[("b.txt", eicar())]);
+        let d = digests_of(&zip);
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.zip");
+        std::fs::write(&path, &zip).unwrap();
+        let opts = ScanOptions::default();
+        for (file, line) in [
+            ("x.fp", format!("{}:{}:Allowed\n", d.md5_hex(), zip.len())),
+            ("x.sfp", format!("{}:{}:Allowed\n", d.sha256_hex(), zip.len())),
+        ] {
+            let db = db_from(&[(file, &line)]);
+            assert_eq!(analyze(&db, &zip, &opts).verdict, Verdict::Clean, "{file}");
+            assert_eq!(seekable(&db, &zip, &opts), Verdict::Clean, "{file}");
+            assert_eq!(scan_path(&db, &path, &opts).unwrap().verdict, Verdict::Clean, "{file}");
+        }
+        // The entry is what clears it.
+        assert!(infected_as(&seekable(&Scanner::builtin(), &zip, &opts)).is_some());
     }
 
     /// A file too large to hold gets the full engine, read through a block
@@ -4638,6 +4861,32 @@ mod tests {
             for v in [
                 seekable(&db, data, &opts),
                 scan_path(&db, &path, &opts).unwrap().verdict,
+            ] {
+                assert_eq!(infected_as(&v), Some(want), "{v:?}");
+            }
+        }
+        // A PCRE subsignature and a YARA rule past the limit too.
+        let mut rules = vec![(
+            "p.ldb",
+            "Test.Pcre;Engine:81-255,Target:0;0&1;6f6e6c79;0/only[0-9]+pcre/\n",
+        )];
+        if cfg!(feature = "yara") {
+            rules.push(("r.yar", "rule big_y { strings: $a = \"yara-only-marker\" condition: $a }\n"));
+        }
+        let more = db_from(&rules);
+        let mut pcre = b"xx only42pcre xx".to_vec();
+        pcre.resize(1024, b' ');
+        let mut yara = b"xx yara-only-marker xx".to_vec();
+        yara.resize(1024, b' ');
+        let mut cases = vec![(&pcre, "Test.Pcre")];
+        if cfg!(feature = "yara") {
+            cases.push((&yara, "YARA.big_y"));
+        }
+        for (data, want) in cases {
+            std::fs::write(&path, data).unwrap();
+            for v in [
+                seekable(&more, data, &opts),
+                scan_path(&more, &path, &opts).unwrap().verdict,
             ] {
                 assert_eq!(infected_as(&v), Some(want), "{v:?}");
             }

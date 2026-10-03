@@ -893,6 +893,64 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         assert!(matches!(scan(&pua, data).verdict, Verdict::Infected { .. }));
     }
 
+    /// PUA signatures, `.ndb` and `.db` alike, stay off by default however
+    /// the file is scanned, its bytes in memory, through a reader or from a
+    /// path, and as a stored zip member; on with `--detect pua`.
+    #[test]
+    #[cfg(any(feature = "zip", feature = "all-formats"))]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
+    fn pua_signatures_stay_off_on_every_scan_path() {
+        use crate::{analyze, scan_path, scan_seekable, ScanOptions, Verdict};
+        use std::io::Write;
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("p.ndb"), "PUA.Test.Ndb:0:*:70756170756170756170\n").unwrap();
+        std::fs::write(dir.path().join("p.db"), "PUA.Test.Db=6d79706f74656e7469616c\n").unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("m.txt", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored))
+            .unwrap();
+        zip.write_all(b"xx puapuapuap and mypotential xx").unwrap();
+        let zip = zip.finish().unwrap().into_inner();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        let mut inputs = Vec::new();
+        for (name, data) in [
+            ("ndb.txt", b"xx puapuapuap xx".to_vec()),
+            ("db.txt", b"xx mypotential xx".to_vec()),
+            ("m.zip", zip),
+        ] {
+            std::fs::write(files.join(name), &data).unwrap();
+            inputs.push((files.join(name), data));
+        }
+        let verdicts = |db: &Scanner| -> Vec<(String, Verdict)> {
+            let opts = ScanOptions::default();
+            let mut v = Vec::new();
+            for (path, data) in &inputs {
+                let n = path.display().to_string();
+                v.push((format!("{n} in memory"), analyze(db, data, &opts).verdict));
+                let r = scan_seekable(db, std::io::Cursor::new(data), data.len() as u64, &opts);
+                v.push((format!("{n} read"), r.unwrap().verdict));
+                v.push((format!("{n} path"), scan_path(db, path, &opts).unwrap().verdict));
+            }
+            v
+        };
+        let sigs = |pua: bool| {
+            let mut b = Builder::new();
+            b.set_detect_pua(pua);
+            b.add_path(&dir.path().join("p.ndb")).unwrap();
+            b.add_path(&dir.path().join("p.db")).unwrap();
+            b.build().unwrap()
+        };
+        for (what, v) in verdicts(&sigs(false)) {
+            assert_eq!(v, Verdict::Clean, "{what}");
+        }
+        for (what, v) in verdicts(&sigs(true)) {
+            assert!(matches!(v, Verdict::Infected { .. }), "{what}: {v:?}");
+        }
+    }
+
     /// A literal `.ndb` signature is counted once.
     #[test]
     #[cfg_attr(

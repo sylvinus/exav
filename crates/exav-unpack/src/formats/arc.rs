@@ -215,7 +215,13 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
 
         stack.clear();
         let mut c = code;
-        if code >= next {
+        // A code past the next free one is in no encoder's output. Taken for
+        // the KwKwK case it would become the prefix of the next code defined,
+        // which can then be its own prefix: the expansion below never ends.
+        if code > next {
+            return None;
+        }
+        if code == next {
             // KwKwK: the code is the one about to be defined, so it expands to
             // the previous string followed by its own first byte.
             let p = prev?;

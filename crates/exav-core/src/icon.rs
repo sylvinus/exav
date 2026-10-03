@@ -1400,6 +1400,25 @@ fn metric_matches(a: &IconMetric, b: &IconMetric) -> bool {
 mod tests {
     use super::*;
 
+    /// A PE the full parse refuses over its certificate table, sized past the
+    /// end of the file, still gives up its icon, the same one. The fixture is
+    /// a PE32 with one 32x32 icon, from `tests/fixtures/pe/make_icon_pe.py`,
+    /// its resources checked with `pefile`.
+    #[test]
+    fn an_icon_is_read_past_a_malformed_certificate_table() {
+        let pe = include_bytes!("../tests/fixtures/pe/icon32.exe").to_vec();
+        let want = pe_icon_metrics(&pe);
+        assert_eq!(want.len(), 1, "the fixture's icon");
+        let mut bad = pe.clone();
+        // PE32: the optional header is 24 bytes past `PE\0\0` at 0x40, its
+        // data directories 96 bytes in, the certificate table the fifth.
+        let at = 0x40 + 24 + 96 + 4 * 8;
+        bad[at..at + 4].copy_from_slice(&0x200u32.to_le_bytes());
+        bad[at + 4..at + 8].copy_from_slice(&2_409_852_894u32.to_le_bytes());
+        assert!(goblin::pe::PE::parse(&bad).is_err(), "the full parse refuses it");
+        assert_eq!(pe_icon_metrics(&bad), want);
+    }
+
     fn put_u16(v: &mut Vec<u8>, x: u16) {
         v.extend_from_slice(&x.to_le_bytes());
     }

@@ -27,7 +27,8 @@ deterministic, safe `panic_bounds_check` here (at worst a DoS). Fuzzing finds
 those panics/aborts/hangs so we can eliminate or contain them.
 
 We still run under **AddressSanitizer** because our *dependencies* (`cab`,
-`sevenz`, `pdf`, `delharc`, `lzxd`, compression shims) carry their own `unsafe`;
+`sevenz`, `pdf`, `delharc`, `lzxd`, compression shims, and under the image
+hash `crc32fast` and `simd-adler32`) carry their own `unsafe`;
 ASan catches genuine UB in them, distinct from the safe panics that surface on
 their own.
 
@@ -51,6 +52,7 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | `bytecode`      | `.cbc` bytecode loader            | bytecode verification                    |
 | `rar3_ppmd`     | RAR3 PPMd decompression          | PPMd/LZSS conversion path               |
 | `pe_emulator`   | `exav_pe_emu::unpack()`               | the x86 emulator that runs packer stubs: instruction decode + semantics, the emulated Windows environment, SEH, and the dump path. **The only target where the input supplies control flow rather than data** — and the only path from a scanned file to a dependency containing `unsafe` (the instruction decoder), so it is fuzzed through the entry point the scanner uses. Asserts the invariant the scanner relies on: anything emitted parses as a PE. |
+| `imagehash`     | `exav_imagehash::Hasher::hash()`  | every image decoder behind `fuzzy_img#` (PNG, GIF, JPEG, TIFF, BMP, WebP, ICO, PNM, QOI, DDS, farbfeld, HDR), then the grey conversion, resize and DCT of both presets, with a 64 MiB decode budget. The scan reaches these only when a database has a `fuzzy_img#` signature, so `analyze` rarely does. |
 | `parser_recursion` | nesting depth, constructed        | Builds deep nesting from a couple of input bytes rather than waiting for the mutator to find it — every extra level needs another well-formed delimiter pair, so byte mutation stalls at two or three while this reaches thousands. Targets the failure the panic boundary cannot contain: `catch_unwind` catches a bounds check, not a stack overflow, and `max_recursion` bounds containers-inside-containers rather than a grammar that nests into itself. A finding looks like a crash with **no panic message**. |
 | `x86_decode`    | `exav_x86::decode()`                  | **differential against `iced-x86`**, which is compiled in as the oracle. Asserts six properties per input: never claim an encoding iced rejects; agree on length; agree on mnemonic; agree on the memory operand's base/index/scale/displacement and on every register operand's file, number and position; re-decoding from exactly the reported length gives the same answer; and no proper prefix of an instruction decodes. Declining is not a failure — `None` means "not an encoding this decoder claims", which the caller reports as unsupported. |
 
@@ -85,6 +87,10 @@ fuzzer never reaches the deep parsers. We seed aggressively:
 2. **Real corpus samples** — small (≤ 64 KB) files sampled from the live
    MalwareBazaar corpus. These carry valid PE/archive/document structure, so the
    mutator starts *inside* the parsers instead of rediscovering magic.
+3. **Images**, for `imagehash`: exav-imagehash's committed test images
+   (`crates/exav-imagehash/tests/fixtures/img`) and, for the three formats
+   they lack, one tiny DDS, farbfeld and HDR file in `fuzz/seeds/imagehash`.
+   Both are passed as extra, read-only corpus directories, in CI too.
 
 Seeds and fuzzer-discovered inputs live in a **gitignored** work dir
 (`tmp/data/fuzzwork_analyze`), never the committed corpus, so a run never bloats
@@ -202,6 +208,11 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 | NDB anchor sig   | `engine.rs` `pick_anchor`         | `fixed += w` overflowed on crafted input | `fixed = fixed.saturating_add(w)` |
 | truncated CAB (LZX) | `cab` → `lzxd` `bitstream.rs:37` | dep reads `buffer[1]` when buffer has 1 byte | `catch_unwind` boundary → `Unscannable` |
 | LHA level 3      | `delharc` `header/parser.rs:265`  | dep adds `parser.len + first_header_len` which overflows u32 | `catch_unwind` boundary → `Unscannable` |
+| ARC, 69 bytes (`full_pipeline`, OOM) | `formats/arc.rs` `lzw` | a code past the next free one was taken for KwKwK; it then became a code's own prefix, and expanding it never ended | refuse `code > next` |
+| ZOO LZD (review of the above) | `formats/zoo.rs` `decode` | output was not capped at the declared size the budget checked, and LZW expands a few thousand times | a writer that stops at `org_size` |
+| PE import directory at 4 GiB (`pe_emulator`) | `exav-pe-emu` `win.rs` `bind_imports` | `is_mapped` saturated, so a descriptor past the top passed, and reading its fields overflowed; API output pointers had the same `p + off` | `is_mapped` refuses a range past 4 GiB; guest pointer offsets wrap |
+| `67 F3 0F AE /6` (`x86_decode`) | `exav-x86` | UMONITOR's register was sized by the operand size, not the address size | 16 bits under `67` |
+| VSIB gathers and scatters (`x86_decode`) | `exav-x86` | claimed under `67` (no SIB in 16-bit addressing), and gathers whose destination, index and mask registers overlap, which are #UD | refused |
 
 Verdict note: decoder panics and corrupt-stream errors map to **`Unscannable`**
 (recognised format, undecodable bytes), distinguished from genuine resource

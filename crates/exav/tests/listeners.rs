@@ -415,48 +415,201 @@ fn serving_no_signatures_is_refused() {
 
 /// A signature change on disk reaches the running daemon: the supervisor's
 /// mtime watch is what a sidecar deployment relies on, and it has to keep
-/// working now that the signature lifecycle is a flag rather than a mode.
+/// working now that the signature lifecycle is a flag rather than a mode, and
+/// whatever serves: the pool, the thread model, or ICAP alone.
 #[test]
 fn a_rewritten_signature_directory_is_reloaded() {
+    for model in ["pool", "threads", "icap"] {
+        let sigs = sig_dir();
+        let port = free_port();
+        let listen = match model {
+            "icap" => format!("icap://127.0.0.1:{port}"),
+            _ => format!("clamd://127.0.0.1:{port}"),
+        };
+        let mut args = vec!["--listen", &listen, "--sig-dir", sigs.path().to_str().unwrap()];
+        if model == "threads" {
+            args.extend(["--workers", "threads"]);
+        }
+        let server = Server::start(TempDir::new().unwrap(), &args);
+        // A worker of the old generation may still take a connection, so an
+        // answer without the new signature means "not yet".
+        let scan = || match model {
+            "icap" => icap_respmod(port, b"malwareD"),
+            _ => try_clamd_instream(port, b"malwareD").unwrap_or_default(),
+        };
+        if model == "icap" {
+            wait_for_log(&server, "serving ICAP on tcp:");
+        }
+        let before = match model {
+            "icap" => icap_respmod(port, b"malwareD"),
+            _ => clamd_instream(port, b"malwareD"),
+        };
+        assert!(
+            !before.contains("Exav.Test.Delta"),
+            "{model}: nothing detects this yet, got {before:?}"
+        );
+
+        std::fs::write(
+            sigs.path().join("more.ndb"),
+            "Exav.Test.Delta:0:*:6d616c7761726544\n",
+        )
+        .unwrap();
+        wait_for_log(&server, "reloading signatures");
+        until_delta(scan, &server);
+    }
+}
+
+/// Bytes `pid` has read so far, from `/proc/<pid>/io`.
+#[cfg(target_os = "linux")]
+fn bytes_read(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("rchar:"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// A file a sidecar writes while the first load is still running is a change:
+/// the watch's baseline is what the load started from, not what the directory
+/// held once it finished.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_written_during_the_first_load_is_reloaded() {
+    use std::fmt::Write as _;
     let sigs = sig_dir();
+    // Enough that building the database takes seconds after the files are read.
+    let mut big = String::new();
+    for i in 0..1_000_000u64 {
+        writeln!(big, "Exav.Big.{i}:0:*:{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).unwrap();
+    }
+    std::fs::write(sigs.path().join("big.ndb"), &big).unwrap();
     let clamd = free_port();
     let server = Server::start(
         TempDir::new().unwrap(),
         &[
+            "--workers",
+            "threads",
             "--listen",
             &format!("clamd://127.0.0.1:{clamd}"),
             "--sig-dir",
             sigs.path().to_str().unwrap(),
         ],
     );
-
-    let before = clamd_instream(clamd, b"malwareD");
-    assert!(
-        before.contains(": OK"),
-        "nothing detects this yet, got {before:?}"
-    );
-
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while bytes_read(server.child.id()) < big.len() as u64 {
+        assert!(Instant::now() < deadline, "the signatures were never read");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     std::fs::write(
         sigs.path().join("more.ndb"),
         "Exav.Test.Delta:0:*:6d616c7761726544\n",
     )
     .unwrap();
-    wait_for_log(&server, "reloading signatures");
+    // Otherwise the write missed the window this is about.
+    assert!(
+        !server.stderr().contains("listening on"),
+        "the load had already finished:\n{}",
+        server.stderr()
+    );
+    let first = clamd_instream(clamd, b"malwareD");
+    assert!(first.contains(": OK"), "loaded before the write: {first}");
+    until_delta(|| clamd_instream(clamd, b"malwareD"), &server);
+}
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        // A worker of the old generation may still take this connection, so
-        // an answer without the new signature means "not yet".
-        let after = try_clamd_instream(clamd, b"malwareD");
-        if after.as_deref().unwrap_or("").contains("Exav.Test.Delta") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the new signature never took effect: {after:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+/// A reload or a shutdown signal that lands while the supervisor is busy is
+/// acted on as soon as it is free, not at the end of its next idle poll.
+///
+/// Busy means reloading a database big enough to take seconds, started by a
+/// `SIGUSR2`; the poll is ten seconds, well past what either answer may take.
+/// The worker a reload retires is kept in a job, so its exit is not what wakes
+/// the supervisor.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
+    use std::fmt::Write as _;
+    let sigs = sig_dir();
+    let mut big = String::new();
+    for i in 0..1_000_000u64 {
+        writeln!(big, "Exav.Big.{i}:0:*:{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).unwrap();
     }
+    std::fs::write(sigs.path().join("big.ndb"), &big).unwrap();
+    let clamd = free_port();
+    let mut server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let pid = server.child.id();
+    let reloads = |s: &Server| s.stderr().matches("reloading signatures").count();
+    // A reload under way: it has read the signatures and is building from them.
+    let start_a_reload = |s: &Server| {
+        let before = bytes_read(pid);
+        signal(s, libc::SIGUSR2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while bytes_read(pid) < before + big.len() as u64 {
+            assert!(Instant::now() < deadline, "no reload started:\n{}", s.stderr());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // When `done` first holds.
+    let when = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let since = Instant::now();
+        while !done() {
+            assert!(since.elapsed() < Duration::from_secs(60), "{what} never happened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Instant::now()
+    };
+
+    // A job the worker is in until the test ends.
+    let hold = || {
+        let mut s = dial(clamd, "clamd");
+        s.write_all(b"zINSTREAM\0").unwrap();
+        s.write_all(&4u32.to_be_bytes()).unwrap();
+        s.write_all(b"ab").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        s
+    };
+
+    let _job = hold();
+    start_a_reload(&server);
+    signal(&server, libc::SIGUSR2);
+    assert_eq!(reloads(&server), 0, "the first reload ended before the second request");
+    let first = when("the first reload", &mut || reloads(&server) >= 1);
+    let second = when("the second reload", &mut || reloads(&server) >= 2);
+    assert!(
+        second - first < Duration::from_secs(8),
+        "the second reload waited {:?} after the first:\n{}",
+        second - first,
+        server.stderr()
+    );
+
+    // The idle worker of the first reload, retired by the second, is gone.
+    when("the idle worker's exit", &mut || {
+        server.stderr().contains("retired after a reload")
+    });
+    let _job = hold();
+    start_a_reload(&server);
+    signal(&server, libc::SIGTERM);
+    assert_eq!(reloads(&server), 2, "the third reload ended before SIGTERM");
+    let third = when("the third reload", &mut || reloads(&server) >= 3);
+    let exit = when("the exit", &mut || {
+        matches!(server.child.try_wait(), Ok(Some(_)))
+    });
+    assert!(
+        exit - third < Duration::from_secs(5),
+        "SIGTERM waited {:?} after the reload:\n{}",
+        exit - third,
+        server.stderr()
+    );
 }
 
 /// Rewrite a signature file in place and put its mtime back, so the directory
@@ -711,16 +864,21 @@ fn a_reload_lets_an_icap_request_in_progress_finish() {
 /// Processes whose parent is `pid`.
 #[cfg(target_os = "linux")]
 fn children_of(pid: u32) -> usize {
+    child_pids(pid).len()
+}
+
+#[cfg(target_os = "linux")]
+fn child_pids(pid: u32) -> Vec<u32> {
     std::fs::read_dir("/proc")
         .unwrap()
-        .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("stat")).ok())
-        .filter(|stat| {
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
             // `pid (comm) state ppid ...`; comm may hold spaces, so split after it.
-            stat.rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
-                == Some(pid)
+            let ppid: u32 = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+            (ppid == pid).then(|| e.file_name().to_str()?.parse().ok())?
         })
-        .count()
+        .collect()
 }
 
 /// A reload replaces the pool, it does not add to it: the retired generation's
@@ -856,6 +1014,50 @@ fn a_worker_stopped_mid_job_answers() {
     let _ = s.read_to_end(&mut out);
     let reply = String::from_utf8_lossy(&out);
     assert!(reply.contains("ERROR"), "no answer: {reply:?}");
+}
+
+/// So does one whose supervisor is killed outright, and it does not outlive it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_whose_supervisor_dies_mid_job_answers() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let workers = child_pids(server.child.id());
+    assert_eq!(workers.len(), 1, "{workers:?}");
+    let mut s = dial(clamd, "clamd");
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&4u32.to_be_bytes()).unwrap();
+    s.write_all(b"ab").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    signal(&server, libc::SIGKILL);
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out).into_owned();
+    let proc = format!("/proc/{}", workers[0]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&proc).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let gone = !Path::new(&proc).exists();
+    // SAFETY: the worker this test started, if it is still there.
+    unsafe {
+        libc::kill(workers[0] as libc::pid_t, libc::SIGKILL);
+    }
+    assert!(reply.contains("stopped before it finished ERROR"), "{reply:?}");
+    assert!(gone, "the worker outlived its supervisor");
 }
 
 /// An updater-only run with nothing to fetch from is refused. A container told

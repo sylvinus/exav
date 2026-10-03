@@ -1,15 +1,18 @@
 # exav-imagehash
 
-**Perceptual image hashes in safe Rust**, with every step of the hash a
+**Perceptual image hashes**, with every step of the hash a
 parameter and two settings that reproduce existing tools bit for bit:
 
 - **ClamAV**: the hash ClamAV matches `fuzzy_img#` signatures against, equal
   to `sigtool --fuzzy-img` (ClamAV 1.4.6 and 1.5.4);
 - **imagehash**: Python `imagehash.phash(Image.open(f))` with its defaults.
 
-The crate is `#![forbid(unsafe_code)]`, and so are its decoders: zune-jpeg is
-built without its SIMD code, the only `unsafe` it has, with `image`'s JPEG and
-TIFF decoders vendored to make that possible. Decoding is bounded by a byte
+The crate is `#![forbid(unsafe_code)]`, and its image decoders have no
+`unsafe`: zune-jpeg is built without its SIMD code, the only `unsafe` it has,
+with `image`'s JPEG and TIFF decoders vendored to make that possible. The DCT
+is rustdct's, vendored with bounds checks where it skips them with `unsafe`.
+Other dependencies do use `unsafe`: the PNG and TIFF checksums and inflate,
+and pixel casts. Decoding is bounded by a byte
 budget, and a decoder panicking on a crafted file is caught and reported as an
 undecodable image.
 

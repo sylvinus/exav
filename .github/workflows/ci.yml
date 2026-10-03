@@ -154,3 +154,8 @@ jobs:
           for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion; do
             cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
           done
+          # Seeded: random bytes rarely get past an image header.
+          mkdir -p fuzz/corpus/imagehash
+          cargo +nightly fuzz run imagehash fuzz/corpus/imagehash \
+            crates/exav-imagehash/tests/fixtures/img fuzz/seeds/imagehash \
+            -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10

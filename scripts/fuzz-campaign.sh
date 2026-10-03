@@ -32,7 +32,7 @@ WORK="${WORK:-$ROOT/tmp/data}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 CODEGEN_UNITS="${CODEGEN_UNITS:-16}"
 # Order matters when a campaign is cut short: the broadest targets run first.
-TARGETS="${TARGETS:-analyze full_pipeline unpack x86_decode pe_emulator bytecode sigs ndb_compile cvd pe filetype rar3_ppmd parser_recursion}"
+TARGETS="${TARGETS:-analyze full_pipeline unpack x86_decode pe_emulator imagehash bytecode sigs ndb_compile cvd pe filetype rar3_ppmd parser_recursion}"
 
 n=$(printf '%s\n' $TARGETS | wc -l)
 slice=$((TOTAL / n))
@@ -63,10 +63,14 @@ fail=0
 for t in $TARGETS; do
   corpus="$WORK/fuzzwork_$t"
   mkdir -p "$corpus"
+  # Read-only seed dirs; new inputs go to the first corpus dir only.
+  seeds=""
+  [ "$t" = imagehash ] && seeds="crates/exav-imagehash/tests/fixtures/img fuzz/seeds/imagehash"
   echo "=== $t (${slice}s, corpus $(find "$corpus" -type f | wc -l) inputs) ==="
   # -timeout is the DoS threshold; -rss_limit_mb catches runaway allocation.
   # The ignore_* flags are what make this a batch run rather than a bisect.
-  if ! cargo +nightly fuzz run --codegen-units "$CODEGEN_UNITS" "$t" "$corpus" -- \
+  # shellcheck disable=SC2086
+  if ! cargo +nightly fuzz run --codegen-units "$CODEGEN_UNITS" "$t" "$corpus" $seeds -- \
     -fork=1 -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1 \
     -timeout=60 -rss_limit_mb=4096 -max_total_time="$slice" 2>&1 |
     tail -20; then

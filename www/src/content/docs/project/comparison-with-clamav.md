@@ -315,11 +315,12 @@ positives (observed: a Java CVE signature firing on APK members).
 | 13 | Internal engine-generated data | Not implemented |
 | 14 | Other | Not implemented |
 
-Graphics are what clamscan takes them for: PNG, GIF, JPEG, TIFF and BMP. A
-`fuzzy_img#` subsignature is matched against those, under `--clamav-compat`
-as clamscan does; otherwise also against a WebP, ICO, PNM, QOI, DDS, farbfeld
-or HDR image, which `sigtool --fuzzy-img` hashes but clamscan does not while
-scanning. The hash is ClamAV's to the bit
+Under `--clamav-compat`, graphics are what clamscan takes them for: PNG, GIF,
+JPEG, TIFF and BMP. Otherwise a WebP, ICO, PNM, QOI, DDS, farbfeld or HDR
+image is graphics too, which `sigtool --fuzzy-img` hashes but clamscan does
+not while scanning; a build without the `image-hash` feature keeps to the
+five. `Target:5` signatures run on graphics, and a `fuzzy_img#` subsignature
+is matched against them whatever its target. The hash is ClamAV's to the bit
 ([exav-imagehash](/subprojects/exav-imagehash/)).
 
 ### Signature-format coverage

@@ -80,7 +80,6 @@ code, not a dependency.
 | [`zune-jpeg`](https://crates.io/crates/zune-jpeg) / [`zune-core`](https://crates.io/crates/zune-core) | JPEG decoding for fuzzy image hashing (0.5.8, and 0.4.21 for JPEG-compressed TIFF), built without its SIMD features, which hold all of its `unsafe` | MIT OR Apache-2.0 OR Zlib | **none** (`forbid`) / **none** (two versions of each resolve) |
 | [`png`](https://crates.io/crates/png) / [`gif`](https://crates.io/crates/gif) | `image`'s PNG and GIF decoders, required at the versions libclamav links (as are the JPEG and TIFF ones), which `cargo install` would not otherwise hold | MIT OR Apache-2.0 | **none** (`forbid`) / **none** (`forbid`) |
 | [`fax`](https://crates.io/crates/fax) / [`weezl`](https://crates.io/crates/weezl) / [`half`](https://crates.io/crates/half) / [`quick-error`](https://crates.io/crates/quick-error) / [`bytemuck`](https://crates.io/crates/bytemuck) | The vendored TIFF decoder's: CCITT fax, LZW, 16-bit floats, error types, byte casts | MIT / MIT OR Apache-2.0 / MIT OR Apache-2.0 / MIT OR Apache-2.0 / Zlib OR Apache-2.0 OR MIT | **none** / **none** (`forbid`) / 84 / **none** / 323 |
-| [`rustdct`](https://crates.io/crates/rustdct) / [`transpose`](https://crates.io/crates/transpose) | DCT for perceptual image hashing | MIT OR Apache-2.0 | 44 / 12 |
 | [`tlsh2`](https://crates.io/crates/tlsh2) | TLSH fuzzy hashing | Apache-2.0 OR BSD-3-Clause | **none** |
 | [`rmp-serde`](https://crates.io/crates/rmp-serde) / [`rmp`](https://crates.io/crates/rmp) / [`serde`](https://crates.io/crates/serde) | MessagePack encoding of the prebuilt `.exavdb` | MIT / MIT / MIT OR Apache-2.0 | **none** (`forbid`) / 1 / 2 |
 | [`rustc-hash`](https://crates.io/crates/rustc-hash) | Fast hashing for internal maps (also in `exav-pe-emu`) | Apache-2.0 OR MIT | **none** |
@@ -99,6 +98,10 @@ Some of exav is vendored source instead of dependencies, under its crates'
   without its SIMD code, which `image` and `tiff` cannot turn off.
 - exav-imagehash's `src/pillow.rs`: Pillow 12.3.0's resampler and grey
   conversions (MIT-CMU), ported for its imagehash preset.
+- exav-imagehash's `src/dct.rs`: rustdct 0.7.1's DCT-II for power-of-two
+  lengths (MIT), with bounds checks where upstream skips them with `unsafe`.
+  Other lengths, which rustdct hands to rustfft and its SIMD code, go through
+  a Bluestein FFT written there.
 
 `iced-x86` is not linked by any shipped binary. It is a dev-dependency of
 [`exav-x86`](/subprojects/exav-x86/) only, the oracle its differential tests,
@@ -189,10 +192,9 @@ runtime code in the binary.
 The `unsafe` column counts occurrences of the `unsafe` keyword in each crate's
 shipped `src/` (comments stripped; tests, benches and examples excluded) at the
 version resolved when the table was written. Read it as surface to review, not as
-risk. Most of it is in `rustfft` (SIMD, reached only through the perceptual image
-hash), `hashbrown` and `bytemuck`, none of which parses scanned bytes, and in
-`zerocopy` (with its derive macro), which `half` pulls in, and `moxcms`, which
-`image` does. There are
+risk. Most of it is in `hashbrown` and `bytemuck`, neither of which parses
+scanned bytes, and in `zerocopy` (with its derive macro), which `half` pulls
+in, and `moxcms`, which `image` does. There are
 no raw-syscall binding crates: `rustix` and `linux-raw-sys` are kept out by
 [writing the spill file in-tree](#cli--runtime-exav) and by building `tar`
 without `xattr`. Reproduce the counts with `cargo geiger`, or per crate with:
@@ -263,11 +265,8 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`miniz_oxide`](https://crates.io/crates/miniz_oxide) | MIT OR Zlib OR Apache-2.0 | **none** (`forbid`; two versions resolve) | `flate2`, `image`, `png`, `zip` |
 | [`moxcms`](https://crates.io/crates/moxcms) | BSD-3-Clause OR Apache-2.0 | 344 | `image` |
 | [`no_std_io2`](https://crates.io/crates/no_std_io2) | Apache-2.0 OR MIT | 11 | `bitstream-io`, `zip` |
-| [`num-complex`](https://crates.io/crates/num-complex) | MIT OR Apache-2.0 | 2 | `rustdct` |
-| [`num-integer`](https://crates.io/crates/num-integer) | MIT OR Apache-2.0 | **none** | `rustdct`, `transpose` |
-| [`num-traits`](https://crates.io/crates/num-traits) | MIT OR Apache-2.0 | 1 | `delharc`, `image`, `rmp`, `rmp-serde`, `rustdct`, `transpose`, `yara-x-parser` |
+| [`num-traits`](https://crates.io/crates/num-traits) | MIT OR Apache-2.0 | 1 | `delharc`, `image`, `rmp`, `rmp-serde`, `yara-x-parser` |
 | [`plain`](https://crates.io/crates/plain) | MIT/Apache-2.0 | 23 | `goblin` |
-| [`primal-check`](https://crates.io/crates/primal-check) | MIT OR Apache-2.0 | **none** | `rustdct` |
 | [`proc-macro2`](https://crates.io/crates/proc-macro2) | MIT OR Apache-2.0 | 6 | `apfs`, `clap`, `fax`, `goblin`, `half`, `hfsplus`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`pxfm`](https://crates.io/crates/pxfm) | BSD-3-Clause OR Apache-2.0 | 224 | `image` |
 | [`qoi`](https://crates.io/crates/qoi) | MIT/Apache-2.0 | **none** (`forbid`) | `image` |
@@ -275,7 +274,6 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`rowan`](https://crates.io/crates/rowan) | MIT OR Apache-2.0 | 55 | `yara-x-parser` |
 | [`rustc-hash`](https://crates.io/crates/rustc-hash) | Apache-2.0 OR MIT | **none** | a second version (1.x) for `yara-x-parser` |
 | [`rustc_version`](https://crates.io/crates/rustc_version) | MIT OR Apache-2.0 | **none** | build-time: `yara-x-parser` |
-| [`rustfft`](https://crates.io/crates/rustfft) | MIT OR Apache-2.0 | 1419 | `rustdct` |
 | [`same-file`](https://crates.io/crates/same-file) | Unlicense/MIT | 3 | `walkdir` |
 | [`scroll`](https://crates.io/crates/scroll) | MIT | 7 | `goblin` |
 | [`scroll_derive`](https://crates.io/crates/scroll_derive) | MIT | 1 | `goblin` |
@@ -283,7 +281,6 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`serde_core`](https://crates.io/crates/serde_core) | MIT OR Apache-2.0 | 2 | `rmp-serde`, `serde`, `serde_json` |
 | [`serde_derive`](https://crates.io/crates/serde_derive) | MIT OR Apache-2.0 | **none** | `rmp-serde`, `serde` |
 | [`simd-adler32`](https://crates.io/crates/simd-adler32) | MIT | 36 | `flate2`, `image`, `png`, `zip` |
-| [`strength_reduce`](https://crates.io/crates/strength_reduce) | MIT OR Apache-2.0 | **none** | `rustdct`, `transpose` |
 | [`strsim`](https://crates.io/crates/strsim) | MIT | **none** (`forbid`) | `clap` |
 | [`syn`](https://crates.io/crates/syn) | MIT OR Apache-2.0 | 152 (two versions resolve: 71 + 81) | `apfs`, `clap`, `fax`, `goblin`, `half`, `hfsplus`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`text-size`](https://crates.io/crates/text-size) | MIT OR Apache-2.0 | **none** (`forbid`) | `yara-x-parser` |

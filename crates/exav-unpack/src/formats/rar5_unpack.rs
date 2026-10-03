@@ -987,6 +987,43 @@ mod tests {
         assert_eq!(window_size_from_comp_info((5 << 10) | (8 << 15)), 4 << 20);
     }
 
+    /// The ARM filter converts branch targets relative to the start of the
+    /// member, so a block 64 bytes into a member converts the same whether
+    /// the member starts the stream or follows 5000 bytes of another one in
+    /// a solid group. A `BL` whose stored target is its own word index,
+    /// 64 / 4, decodes to offset 0.
+    #[test]
+    fn the_arm_filter_counts_from_the_start_of_its_member() {
+        let mut block = Vec::new();
+        for i in 0..64u32 {
+            let word = if i % 3 == 0 { 0xeb00_0000 | (i * 4099) } else { i * 0x0101_0101 };
+            block.extend_from_slice(&word.to_le_bytes());
+        }
+        block[..4].copy_from_slice(&(0xeb00_0000u32 | 16).to_le_bytes());
+        let run = |member_start: u64| -> Vec<u8> {
+            let mut d = Unpacker50::new(1 << 17).unwrap();
+            let u = &mut d.u;
+            let at = member_start + 64;
+            for (i, &b) in block.iter().enumerate() {
+                let w = ((at + i as u64) as usize) & u.window_mask;
+                u.window_buf[w] = b;
+            }
+            u.file_start = member_start;
+            u.cap = u64::MAX;
+            let f = FilterInfo {
+                kind: FilterType::Arm,
+                channels: 0,
+                block_start: at,
+                block_length: block.len() as u64,
+            };
+            run_filter(u, &f).unwrap();
+            u.out.clone()
+        };
+        let alone = run(0);
+        assert_eq!(&alone[..4], &0xeb00_0000u32.to_le_bytes());
+        assert_eq!(run(5000), alone, "converted relative to the solid stream");
+    }
+
     #[test]
     fn the_rar7_algorithm_is_version_1_without_bit_20() {
         assert!(rar7_algorithm(1));

@@ -1211,15 +1211,18 @@ impl<'a> Env<'a> {
                 let mbi = arg(cpu, mem, 1)?;
                 let page = addr & !(PAGE_SIZE as u32 - 1);
                 let committed = mem.is_mapped(page, 1);
+                // The guest's pointer: its fields can lie past 4 GiB, where
+                // the wrapped address faults.
+                let f = |off: u32| mbi.wrapping_add(off);
                 mem.write_u32(mbi, page).map_err(Stop::Fault)?; // BaseAddress
-                mem.write_u32(mbi + 4, page).map_err(Stop::Fault)?; // AllocationBase
-                mem.write_u32(mbi + 8, 0x40).map_err(Stop::Fault)?; // AllocationProtect
-                mem.write_u32(mbi + 12, PAGE_SIZE as u32)
+                mem.write_u32(f(4), page).map_err(Stop::Fault)?; // AllocationBase
+                mem.write_u32(f(8), 0x40).map_err(Stop::Fault)?; // AllocationProtect
+                mem.write_u32(f(12), PAGE_SIZE as u32)
                     .map_err(Stop::Fault)?; // RegionSize
-                mem.write_u32(mbi + 16, if committed { 0x1000 } else { 0x10000 })
+                mem.write_u32(f(16), if committed { 0x1000 } else { 0x10000 })
                     .map_err(Stop::Fault)?; // State
-                mem.write_u32(mbi + 20, 0x40).map_err(Stop::Fault)?; // Protect
-                mem.write_u32(mbi + 24, 0x20000).map_err(Stop::Fault)?; // Type
+                mem.write_u32(f(20), 0x40).map_err(Stop::Fault)?; // Protect
+                mem.write_u32(f(24), 0x20000).map_err(Stop::Fault)?; // Type
                 28
             }
             Api::HeapCreate => PROCESS_HEAP,
@@ -1304,10 +1307,11 @@ impl<'a> Env<'a> {
             Api::GetVersion => 0x0a28_0105, // Windows XP, as a stub expects
             Api::GetVersionEx => {
                 let p = arg(cpu, mem, 0)?;
-                mem.write_u32(p + 4, 5).map_err(Stop::Fault)?; // major
-                mem.write_u32(p + 8, 1).map_err(Stop::Fault)?; // minor
-                mem.write_u32(p + 12, 2600).map_err(Stop::Fault)?; // build
-                mem.write_u32(p + 16, 2).map_err(Stop::Fault)?; // platform
+                let f = |off: u32| p.wrapping_add(off);
+                mem.write_u32(f(4), 5).map_err(Stop::Fault)?; // major
+                mem.write_u32(f(8), 1).map_err(Stop::Fault)?; // minor
+                mem.write_u32(f(12), 2600).map_err(Stop::Fault)?; // build
+                mem.write_u32(f(16), 2).map_err(Stop::Fault)?; // platform
                 1
             }
             Api::GetTickCount => {
@@ -1318,7 +1322,7 @@ impl<'a> Env<'a> {
                 let p = arg(cpu, mem, 0)?;
                 self.perf = self.perf.wrapping_add(0x1000);
                 mem.write_u32(p, self.perf as u32).map_err(Stop::Fault)?;
-                mem.write_u32(p + 4, (self.perf >> 32) as u32)
+                mem.write_u32(p.wrapping_add(4), (self.perf >> 32) as u32)
                     .map_err(Stop::Fault)?;
                 1
             }
@@ -1351,19 +1355,20 @@ impl<'a> Env<'a> {
                 let p = arg(cpu, mem, 0)?;
                 let zero = [0u8; 36];
                 mem.write_bytes(p, &zero).map_err(Stop::Fault)?;
-                mem.write_u32(p + 4, PAGE_SIZE as u32)
-                    .map_err(Stop::Fault)?; // dwPageSize
-                mem.write_u32(p + 8, 0x0001_0000).map_err(Stop::Fault)?; // lpMinimumApplicationAddress
-                mem.write_u32(p + 12, 0x7ffe_0000).map_err(Stop::Fault)?; // lpMaximumApplicationAddress
-                mem.write_u32(p + 20, 1).map_err(Stop::Fault)?; // dwNumberOfProcessors
-                mem.write_u32(p + 32, 0x1000).map_err(Stop::Fault)?; // dwAllocationGranularity
+                let f = |off: u32| p.wrapping_add(off);
+                mem.write_u32(f(4), PAGE_SIZE as u32).map_err(Stop::Fault)?; // dwPageSize
+                mem.write_u32(f(8), 0x0001_0000).map_err(Stop::Fault)?; // lpMinimumApplicationAddress
+                mem.write_u32(f(12), 0x7ffe_0000).map_err(Stop::Fault)?; // lpMaximumApplicationAddress
+                mem.write_u32(f(20), 1).map_err(Stop::Fault)?; // dwNumberOfProcessors
+                mem.write_u32(f(32), 0x1000).map_err(Stop::Fault)?; // dwAllocationGranularity
                 0
             }
             Api::GetSystemTimeAsFileTime => {
                 let p = arg(cpu, mem, 0)?;
                 self.perf = self.perf.wrapping_add(0x1000);
                 mem.write_u32(p, self.perf as u32).map_err(Stop::Fault)?;
-                mem.write_u32(p + 4, 0x01c9_0000).map_err(Stop::Fault)?;
+                mem.write_u32(p.wrapping_add(4), 0x01c9_0000)
+                    .map_err(Stop::Fault)?;
                 0
             }
             Api::TlsAlloc => match self.tls_used.iter().position(|&u| !u) {
@@ -2101,6 +2106,31 @@ mod tests {
             0,
             "and reset, so the next call is not charged for this one"
         );
+    }
+
+    /// Found by fuzzing (`pe_emulator`): an import directory whose first
+    /// descriptor starts 16 bytes below 4 GiB, in a mapped top page. Its
+    /// `FirstThunk` field lies past the top, and reading it overflowed.
+    #[test]
+    fn an_import_descriptor_past_the_top_of_memory_is_not_read() {
+        let (mut mem, mut env) = env();
+        mem.map(0xffff_f000, 0x1000).unwrap();
+        let dir_rva = 0xffff_fff0u32.wrapping_sub(0x0040_0000);
+        assert_eq!(env.bind_imports(&mut mem, 0x0040_0000, dir_rva, 20), Ok(0));
+    }
+
+    /// An API's output pointer is the guest's, so its fields can lie past
+    /// 4 GiB: writing them faults, it does not overflow.
+    #[test]
+    fn an_output_struct_past_the_top_of_memory_faults() {
+        let (mut mem, mut env) = env();
+        mem.map(0xffff_f000, 0x1000).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.regs[ESP] = INITIAL_ESP;
+        cpu.push32(&mut mem, 0xffff_fff8).unwrap(); // lpVersionInformation
+        cpu.push32(&mut mem, 0xdead_0000).unwrap();
+        cpu.eip = trap_for(&env, "kernel32.dll", "GetVersionExA");
+        assert!(matches!(env.call(&mut cpu, &mut mem), Err(Stop::Fault(_))));
     }
 
     #[test]

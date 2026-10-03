@@ -30,21 +30,53 @@ pub(crate) fn is_zoo(data: &[u8]) -> bool {
     super::sniff::is(data, crate::Format::Zoo)
 }
 
-/// Decode one member's bytes, or `None` with the reason.
+/// A writer that takes at most `left` bytes and fails past them.
+struct Bounded {
+    out: Vec<u8>,
+    left: usize,
+    over: bool,
+}
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if b.len() > self.left {
+            self.over = true;
+            return Err(std::io::Error::other("past the declared size"));
+        }
+        self.left -= b.len();
+        self.out.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Decode one member's bytes, or why they could not be.
 fn decode(method: Method, raw: &[u8], org_size: u32, cap: u64) -> Result<Vec<u8>, &'static str> {
     match method {
         Method::Stored => Ok(raw.to_vec()),
         Method::Lzw => {
-            let mut out = Vec::new();
-            salzweg::decoder::VariableDecoder::decode(
+            // `org_size` is what the budget was checked against, and LZW
+            // expands a few thousand times, so the output stops there.
+            let mut out = Bounded {
+                out: Vec::new(),
+                left: org_size as usize,
+                over: false,
+            };
+            let r = salzweg::decoder::VariableDecoder::decode(
                 raw,
                 &mut out,
                 8,
                 salzweg::Endianness::LittleEndian,
                 salzweg::CodeSizeStrategy::Default,
-            )
-            .map_err(|_| "ZOO member could not be LZW-decoded")?;
-            Ok(out)
+            );
+            match r {
+                Ok(()) => Ok(out.out),
+                Err(_) if out.over => Err("ZOO member decodes past its declared size"),
+                Err(_) => Err("ZOO member could not be LZW-decoded"),
+            }
         }
         Method::Lh5 => {
             use delharc::decode::Decoder;
@@ -104,6 +136,18 @@ pub(crate) fn extract_zoo<R>(
                 ),
                 budget,
             ));
+        }
+        // The chain ends at an entry whose next and data offsets are zero,
+        // which `zoo` writes short of the fixed header: its tag, type and
+        // method, then the two offsets.
+        let rest = data.get(at..).unwrap_or(&[]);
+        let le32 = |o: usize| rest.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        if rest.len() < DIRENT_HEADER_SIZE
+            && le32(0) == Some(super::zoo_parse::ZOO_TAG)
+            && le32(6) == Some(0)
+            && le32(10) == Some(0)
+        {
+            break;
         }
         let Some(fixed) = data.get(at..).and_then(|b| b.get(..DIRENT_HEADER_SIZE)) else {
             budget.count_entry()?;

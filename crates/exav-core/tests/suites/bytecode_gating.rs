@@ -38,6 +38,11 @@ fn nib(n: u8) -> char {
 /// A logical (kind 256) program: trigger matches the hex of `marker`; the
 /// program calls `setvirusname()` (no args → reports its own name) and returns.
 fn synth_cbc(name: &str, marker: &[u8]) -> String {
+    synth_cbc_when(name, marker, "Engine:1-255,Target:0")
+}
+
+/// As [`synth_cbc`], the trigger's attributes `attrs`.
+fn synth_cbc_when(name: &str, marker: &[u8], attrs: &str) -> String {
     let mut h = String::from("ClamBC");
     h.push_str(&num(6)); // format level
     h.push_str(&num(0x5b4f9546)); // timestamp
@@ -53,7 +58,7 @@ fn synth_cbc(name: &str, marker: &[u8]) -> String {
     h.push_str(&num(HEADER_MAGIC));
 
     let hex: String = marker.iter().map(|b| format!("{b:02x}")).collect();
-    let trigger = format!("{name};Engine:1-255,Target:0;0;{hex}");
+    let trigger = format!("{name};{attrs};0;{hex}");
 
     // E: maxapi, count=1, (id=5, type=79, "setvirusname").
     let mut e = String::from("E");
@@ -148,6 +153,33 @@ fn trigger_gated_detection_in_a_scan() {
         names.sort_unstable();
         assert_eq!(names, ["Other.Sig", "Synth.BC.Detect"]);
     }
+}
+
+/// A trigger with a `Container:` condition is evaluated with the object's
+/// container, as every logical signature is: it fires on a zip's member and
+/// not on the same bytes as a file of their own.
+#[test]
+fn a_trigger_with_a_container_condition_fires_in_that_container() {
+    use std::io::Write;
+    let mut loader = exav_core::loader::Builder::new();
+    let cbc = synth_cbc_when(
+        "Synth.BC.InZip",
+        b"MALWARE",
+        "Engine:1-255,Target:0,Container:CL_TYPE_ZIP",
+    );
+    loader.add_named_bytes("t.cbc", cbc.as_bytes(), true);
+    let db = loader.build().unwrap();
+    let member = b"..prefix..MALWARE..suffix..";
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("m.txt", zip::write::SimpleFileOptions::default()).unwrap();
+    zip.write_all(member).unwrap();
+    let zip = zip.finish().unwrap().into_inner();
+    let found = |data: &[u8]| match analyze(&db, data, &ScanOptions::default()).verdict {
+        Verdict::Infected { signature, .. } => Some(signature),
+        _ => None,
+    };
+    assert_eq!(found(&zip), Some("Synth.BC.InZip".to_string()));
+    assert_eq!(found(member), None);
 }
 
 /// A program gated on `EXAVTESTMARKER` that `malloc`s 32 bytes and `write`s

@@ -1,6 +1,6 @@
 [package]
 name = "exav-imagehash"
-description = "Perceptual image hashes in safe Rust: ClamAV's fuzzy_img hash, equal to `sigtool --fuzzy-img`, and Python imagehash's phash, with every step a parameter."
+description = "Perceptual image hashes: ClamAV's fuzzy_img hash, equal to `sigtool --fuzzy-img`, and Python imagehash's phash, with every step a parameter."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -48,9 +48,6 @@ quick-error = "2.0.1"
 # Also `gif`'s LZW.
 weezl = "=0.1.10"
 bytemuck = "1"
-# The DCT.
-rustdct = "=0.7.1"
-transpose = "=0.2.3"
 
 [features]
 default = ["cli", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr"]
@@ -72,6 +69,9 @@ hdr = ["image/hdr"]
 
 [dev-dependencies]
 crc32fast = "1"
+# What `src/dct.rs` is checked against: it ships rustdct's algorithm without
+# rustdct, its `unsafe` and rustfft's SIMD code.
+rustdct = "=0.7.1"
 
 [package.metadata.docs.rs]
 all-features = true

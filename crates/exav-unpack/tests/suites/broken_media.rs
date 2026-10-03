@@ -229,6 +229,17 @@ fn a_jpeg_segment_running_past_eof_is_flagged() {
     );
 }
 
+/// clamscan takes a file for a JPEG only from `FF D8 FF`: the same damaged
+/// segment one junk byte after the SOI is not judged at all.
+#[test]
+fn a_jpeg_needs_ff_d8_ff_to_be_judged() {
+    let mut j = valid_jpeg();
+    j[4] = 0xF0;
+    assert!(broken_media_alert(&j).is_some(), "the control is not broken");
+    j.insert(2, 0x00);
+    assert_eq!(broken_media_alert(&j), None);
+}
+
 #[test]
 fn a_jpeg_segment_length_below_two_is_impossible() {
     let mut j = valid_jpeg();

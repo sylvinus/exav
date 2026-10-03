@@ -116,6 +116,28 @@ fn the_x86_filter_counts_from_its_own_member() {
     );
 }
 
+/// The same in a solid group, where the decoder carries over from the first
+/// member: RAR 6.24, `rar a -ma4 -s -ds -m3 -mce+ -ep solid_x86.rar first.txt
+/// x86s.bin`. `x86s.bin`, synthetic E8 calls between passages of the
+/// 1720-byte `first.txt`, comes second, so it only decodes through the
+/// window the first left.
+#[test]
+fn the_x86_filter_counts_from_its_own_member_in_a_solid_group() {
+    assert_eq!(
+        read("solid_x86.rar", &[]),
+        want(&[
+            (
+                "first.txt",
+                "abba26a8e3b0de25cbf1bc08ba84f55f5ed5739026b8e9271bc1f0f06e5623ac"
+            ),
+            (
+                "x86s.bin",
+                "2681cd6bc6ac34356bf14d40e153343ddba86a0f76e7cd172ff1fb066b6fb25e"
+            ),
+        ])
+    );
+}
+
 /// A member that is not solid is decoded on its own window: `g_far.bin`
 /// repeats 64 KiB of random bytes after 200 KiB of zeros, under a 512 KiB
 /// window, after a first member's 64 KiB (which the decoder rounds up to its

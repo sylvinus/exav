@@ -3625,6 +3625,19 @@ mod tests {
 
         file("more.ndb", "b", t - Duration::from_secs(60));
         assert!(watch.changed(), "an older mtime");
+        assert!(!watch.changed());
+
+        // Swapped in by a rename: the same name, size and timestamps, another
+        // file. In a directory, and as a single database file.
+        file("swap.tmp", "c", t - Duration::from_secs(60));
+        std::fs::rename(dir.path().join("swap.tmp"), dir.path().join("more.ndb")).unwrap();
+        pin_dir();
+        assert!(watch.changed(), "a file swapped in by a rename");
+        let db = dir.path().join("more.ndb");
+        let mut watch = Watch::new(db.clone());
+        file("swap.tmp", "d", t - Duration::from_secs(60));
+        std::fs::rename(dir.path().join("swap.tmp"), &db).unwrap();
+        assert!(watch.changed(), "a database file swapped in by a rename");
     }
 
     /// Clamping only ever lowers: a generous grant must leave the operator's
