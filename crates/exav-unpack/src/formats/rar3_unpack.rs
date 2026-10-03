@@ -698,6 +698,9 @@ struct Decoder29 {
     /// Sub-allocator memory size in bytes, carried across PPMd blocks (only
     /// re-allocated when the 0x20 "reset" flag is set).
     ppmd_mem: u32,
+    /// The PPMd escape symbol: 2 until a block header sets another, then kept
+    /// by the blocks after it that set none.
+    ppmd_escape: u8,
     #[allow(dead_code)] // tracked during decode; not consumed by the caller
     eof: bool,
     fnum: usize,
@@ -712,6 +715,7 @@ impl Decoder29 {
             decode_is_ppm: false,
             ppmd: None,
             ppmd_mem: 0,
+            ppmd_escape: 2,
             eof: false,
             fnum: 0,
             flen: Vec::new(),
@@ -842,11 +846,11 @@ impl Decoder29 {
             self.ppmd_mem = mem;
         }
 
-        let escape = if flags & 0x40 != 0 {
-            br.read_bits(8).ok_or_else(|| err("eof ppmd escape"))? as u8
-        } else {
-            2
-        };
+        // The escape is kept from block to block until a header sets another.
+        if flags & 0x40 != 0 {
+            self.ppmd_escape = br.read_bits(8).ok_or_else(|| err("eof ppmd escape"))? as u8;
+        }
+        let escape = self.ppmd_escape;
 
         // The remaining member bytes feed the RAR range decoder (byte-aligned).
         br.align_byte();
@@ -1093,6 +1097,11 @@ impl DecodeReader {
                 }
                 Ok(DecodeStep::EndOfFile) => {
                     self.eof = true;
+                    // PPMd's end of data ends its block as well as the file:
+                    // the next member of a solid group starts with a header.
+                    if self.dec.decode_is_ppm {
+                        self.tables_read = false;
+                    }
                     break;
                 }
                 Ok(DecodeStep::EndOfBlockAndFile) => {
@@ -1271,12 +1280,16 @@ impl Unpacker29 {
         // require reading a bit or two past the packed data. Output is bounded
         // by `unpacked_size`, so the trailing zeros are never actually emitted.
         // Mirrors the RAR5 unpacker's input padding.
-        let mut padded = Vec::with_capacity(packed.len() + 16);
+        let mut padded = Vec::with_capacity(packed.len() + MEMBER_PADDING);
         padded.extend_from_slice(packed);
-        padded.extend_from_slice(&[0u8; 16]);
+        padded.extend_from_slice(&[0u8; MEMBER_PADDING]);
         self.dr.br = BitReader::new(padded);
         self.dr.eof = false;
         self.dr.err = None;
+        // The x86 and Itanium filters convert addresses relative to the start
+        // of the member, solid or not; counting from an earlier member's start
+        // corrupted every executable after the first decoded member.
+        self.dr.tot = 0;
         if !solid {
             // Filters never span the members of a solid group, so they are reset
             // either way.
@@ -1308,6 +1321,12 @@ impl Unpacker29 {
         if (out.len() as u64) < unpacked_size {
             return Err(err("decoded fewer bytes than declared"));
         }
+        // Read on to the member's end-of-file code, which the next member of
+        // a solid group starts after. A member with nothing to output, an
+        // empty file, never reached it, and the next one began mid-stream.
+        if !self.dr.eof && self.dr.err.is_none() && self.dr.win.buffered() == 0 {
+            self.dr.fill();
+        }
         out.truncate(unpacked_size as usize);
         budget.commit(out.len() as u64);
         Ok(out)
@@ -1327,6 +1346,10 @@ pub fn unpack29(
 // ---- RAR3 filters (filters.go) --------------------------------------------
 
 const FILE_SIZE: i64 = 0x1000000;
+
+/// Zero bytes after a member's packed data: the encoders do not pad the
+/// bitstream, so its last symbols can read a little past it.
+const MEMBER_PADDING: usize = 16;
 const VM_GLOBAL_ADDR: usize = 0x3C000;
 const VM_SIZE: usize = 0x40000;
 const VM_MASK: u32 = (VM_SIZE - 1) as u32;

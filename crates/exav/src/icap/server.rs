@@ -31,9 +31,11 @@ pub(super) trait Signatures: Send + Sync {
     fn scanner(&self) -> Arc<Scanner>;
 }
 
-/// A database that never changes.
+/// A database that never changes: the forked ICAP child's (Unix only).
+#[cfg(unix)]
 pub(super) struct FixedDb(Arc<Scanner>);
 
+#[cfg(unix)]
 impl FixedDb {
     /// Wrap a database already shared with another server, so one load answers
     /// on every listener a process binds.
@@ -42,6 +44,7 @@ impl FixedDb {
     }
 }
 
+#[cfg(unix)]
 impl Signatures for FixedDb {
     fn scanner(&self) -> Arc<Scanner> {
         Arc::clone(&self.0)

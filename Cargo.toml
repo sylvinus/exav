@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update"]
+members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update", "crates/exav-imagehash"]
 exclude = ["fuzz", "crates/exav-unpack-wasm"]
 
 [workspace.package]

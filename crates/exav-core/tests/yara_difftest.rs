@@ -151,8 +151,10 @@ fn yr_matches(rules: &str, data: &[u8], defines: &[(&str, &str)]) -> BTreeSet<St
 
     let mut cmd = std::process::Command::new(yr_bin());
     cmd.arg("scan");
+    // Every define here is a string, which `yr` takes only quoted.
     for (k, v) in defines {
-        cmd.arg("--define").arg(format!("{k}={v}"));
+        let v = v.replace('\\', "\\\\").replace('"', "\\\"");
+        cmd.arg("--define").arg(format!("{k}=\"{v}\""));
     }
     let out = cmd
         .arg(&rule_path)

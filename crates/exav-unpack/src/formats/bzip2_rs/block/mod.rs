@@ -18,9 +18,14 @@ mod error;
 
 const BLOCK_MAGIC: u64 = 0x314159265359;
 const FINAL_MAGIC: u64 = 0x177245385090;
+/// NSIS's bzip2 marks a block, and the end of the stream, with one byte each,
+/// and carries no checksum and no randomised bit.
+const NSIS_BLOCK: u64 = 0x31;
+const NSIS_FINAL: u64 = 0x17;
 
 pub(crate) struct Block {
     header: Header,
+    nsis: bool,
 
     tt: Vec<u32>,
     pre_rle_used: u32,
@@ -42,11 +47,12 @@ enum State {
 }
 
 impl Block {
-    pub fn new(header: Header) -> Self {
+    pub fn new(header: Header, nsis: bool) -> Self {
         let max_blocksize = header.max_blocksize();
 
         Self {
             header,
+            nsis,
 
             tt: Vec::with_capacity(max_blocksize as usize),
             pre_rle_used: 0,
@@ -95,16 +101,26 @@ impl Block {
         match &self.state {
             State::ReadyForRead => {
                 let magic = reader
-                    .read_u64(48)
+                    .read_u64(if self.nsis { 8 } else { 48 })
                     .ok_or_else(|| BlockError::new("next magic truncated"))?;
                 match magic {
-                    BLOCK_MAGIC => {
+                    NSIS_BLOCK if self.nsis => {
                         self.read_block(reader)?;
                         self.state = State::Reading;
 
                         self.read(reader, out)
                     }
-                    FINAL_MAGIC => {
+                    NSIS_FINAL if self.nsis => {
+                        self.state = State::NotReady;
+                        Ok(0)
+                    }
+                    BLOCK_MAGIC if !self.nsis => {
+                        self.read_block(reader)?;
+                        self.state = State::Reading;
+
+                        self.read(reader, out)
+                    }
+                    FINAL_MAGIC if !self.nsis => {
                         let _crc = reader
                             .read_u32(32)
                             .ok_or_else(|| BlockError::new("whole stream crc truncated"))?;
@@ -173,7 +189,7 @@ impl Block {
             self.state = State::NotReady;
 
             let crc = self.hasher.finalyze();
-            return if self.expected_crc == crc {
+            return if self.nsis || self.expected_crc == crc {
                 Ok(0)
             } else {
                 Err(BlockError::new("bad crc"))
@@ -188,15 +204,17 @@ impl Block {
         self.hasher = Hasher::new();
         self.tt.clear();
 
-        self.expected_crc = reader
-            .read_u32(32)
-            .ok_or_else(|| BlockError::new("crc truncated"))?;
+        if !self.nsis {
+            self.expected_crc = reader
+                .read_u32(32)
+                .ok_or_else(|| BlockError::new("crc truncated"))?;
 
-        let randomised = reader
-            .read_bool()
-            .ok_or_else(|| BlockError::new("randomised truncated"))?;
-        if randomised {
-            return Err(BlockError::new("randomised expected to be 'normal'"));
+            let randomised = reader
+                .read_bool()
+                .ok_or_else(|| BlockError::new("randomised truncated"))?;
+            if randomised {
+                return Err(BlockError::new("randomised expected to be 'normal'"));
+            }
         }
 
         let orig_ptr = reader

@@ -67,7 +67,7 @@ reload the child is replaced along with the workers: the old one finishes the
 requests in progress and closes its idle connections, and proxies reconnect to
 the new one. The ICAP child's own scans run in threads, one per connection, and
 the kernel's per-job limits do not apply to them (see
-[Limits](/reference/limits/)); what each scan holds is still kept to half the
+[Limits](/reference/limits/)); what each scan holds is still kept inside the
 per-job memory, as in a worker.
 
 ICAP served alone runs without the pool: one process, scans in threads,
@@ -271,9 +271,9 @@ exav --listen 'icap://0.0.0.0:1344/avscan?max-connections=200' -d /var/lib/exav
 Buffering a body costs a connection at most `--spill-threshold-bytes` in RAM
 (16 MiB by default), and past that disk, bounded per object by
 `--max-spill-bytes` and across the ICAP process by `--max-total-spill-bytes`.
-The scan itself holds more: up to 1 GiB per connection by default, or half the
-per-job memory under the worker pool, where no kernel limit applies to ICAP
-scans. See
+The scan itself holds more: up to 1 GiB per connection by default, or what a
+worker's scan may hold under the worker pool, where no kernel limit applies to
+ICAP scans. See
 [Sizing a server](/guides/sizing/#adding-icap) before raising
 `?max-connections=`.
 </Aside>

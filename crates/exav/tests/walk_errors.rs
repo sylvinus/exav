@@ -23,6 +23,7 @@ fn exav() -> Command {
     c
 }
 
+#[cfg(unix)]
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
 }

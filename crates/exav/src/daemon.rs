@@ -440,7 +440,7 @@ impl SharedDb {
 /// returns.
 pub fn supervise(
     db: &SharedDb,
-    watch: Option<std::path::PathBuf>,
+    mut watch: Option<Watch>,
     reload_db: &dyn Fn() -> Result<Scanner, String>,
 ) -> ! {
     #[cfg(unix)]
@@ -456,19 +456,12 @@ pub fn supervise(
         install_restarting_handler(libc::SIGHUP, on_sighup);
         install_restarting_handler(libc::SIGUSR2, on_sigusr2);
     }
-    let mut last = watch.as_deref().and_then(datadir_mtime);
     loop {
         #[cfg(unix)]
         nap(SUPERVISOR_TICK);
         #[cfg(not(unix))]
         std::thread::sleep(SUPERVISOR_TICK);
-        let disk_changed = match watch.as_deref().and_then(datadir_mtime) {
-            Some(t) if source_changed(last, t) => {
-                last = Some(t);
-                true
-            }
-            _ => false,
-        };
+        let disk_changed = watch.as_mut().is_some_and(Watch::changed);
         if RELOAD_REQUESTED.swap(false, Ordering::Relaxed) || disk_changed {
             match reload_db() {
                 Ok(new_db) => {
@@ -862,7 +855,7 @@ pub fn request_reload() {
 /// The supervisor's **idle** poll cadence: the upper bound on how long a
 /// *signal-less* database change (a sidecar that writes the volume without
 /// `RELOAD`) can go unnoticed. Everything urgent is signal-driven and interrupts
-/// the sleep immediately, so this timer's only job is the mtime poll: a worker
+/// the sleep immediately, so this timer's only job is the source poll: a worker
 /// exit (SIGCHLD) triggers instant reap+respawn, `RELOAD`/the updater/`SIGUSR2`
 /// trigger an instant reload, and SIGTERM/SIGINT an instant shutdown. It is
 /// therefore a few seconds, not sub-second: polling the filesystem twice a
@@ -907,39 +900,64 @@ fn retire_grace(max_scan_time: std::time::Duration) -> std::time::Duration {
     }
 }
 
-/// Newest mtime of the watched source, the reload trigger for a sidecar that
-/// writes the volume without sending `RELOAD` (clamd's `SelfCheck`). For a
-/// **directory** this is the newest mtime **across the whole tree**: the loader
-/// reads the directory recursively (including the updater's `env/<host>/…`
-/// subtree), so the watch must too: an in-place overwrite deep in the tree bumps
-/// only its own directory's mtime, which a top-level-only scan would miss. For a
-/// single **file** (a prebuilt database) it is just that file's mtime; an atomic
-/// swap replaces its inode, and so its mtime, so the poll fires. `None` if the
-/// path can't be stat'd. Symlinks are not followed (no cycles).
-pub(crate) fn datadir_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
-    let mut newest = std::fs::metadata(dir).and_then(|m| m.modified()).ok()?;
-    // WalkDir over a file yields just that file, so this also covers the
-    // single-`.exavdb` case (leaving `newest` at the file's own mtime).
-    for entry in WalkDir::new(dir).follow_links(false).into_iter().flatten() {
-        if let Some(t) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            if t > newest {
-                newest = t;
-            }
-        }
-    }
-    Some(newest)
+/// A signature source the supervisor polls for changes, with its
+/// [`source_state`] from before the serving database was read from it.
+///
+/// Taken before the load rather than when the supervisor starts polling: a
+/// sidecar writing the source between the two (the load can take minutes)
+/// would otherwise be in the baseline, and its signatures never loaded.
+pub struct Watch {
+    pub path: std::path::PathBuf,
+    seen: Option<u64>,
 }
 
-/// Whether the watched source changed since the last poll.
+impl Watch {
+    /// Call before loading the database from `path`.
+    pub fn new(path: std::path::PathBuf) -> Self {
+        let seen = source_state(&path);
+        Watch { path, seen }
+    }
+
+    /// Whether the source changed since it was last seen, noting it as seen.
+    /// Any difference counts: a database swapped for one with an older mtime
+    /// (copied with `cp -p`, unpacked from an archive) is still a new one.
+    fn changed(&mut self) -> bool {
+        match source_state(&self.path) {
+            Some(s) if self.seen != Some(s) => {
+                self.seen = Some(s);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A digest of the watched source, the reload trigger for a sidecar that writes
+/// the volume without sending `RELOAD` (clamd's `SelfCheck`): the path, size,
+/// mtime and inode of every entry. For a **directory** that is the whole tree,
+/// since the loader reads it recursively (including the updater's
+/// `env/<host>/…` subtree). For a single **file** (a prebuilt database) it is
+/// that file; an atomic swap replaces its inode. `None` if the path can't be
+/// stat'd. Symlinks are not followed (no cycles).
 ///
-/// Any difference counts, not only a newer time: swapping a database file for
-/// one that carries an older mtime (copied with `cp -p`, unpacked from an
-/// archive, built on a host with a slower clock) is still a new database.
-pub(crate) fn source_changed(
-    last: Option<std::time::SystemTime>,
-    now: std::time::SystemTime,
-) -> bool {
-    last != Some(now)
+/// Not the newest mtime alone: some filesystems stamp from a coarse clock, and
+/// a file written within one tick of the baseline (a sidecar finishing just
+/// after a load started) carries the same mtime as everything before it.
+pub(crate) fn source_state(dir: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::fs::metadata(dir).ok()?.modified().ok().hash(&mut h);
+    let entries = WalkDir::new(dir).follow_links(false).sort_by_file_name();
+    for entry in entries.into_iter().flatten() {
+        entry.path().hash(&mut h);
+        if let Ok(m) = entry.metadata() {
+            m.len().hash(&mut h);
+            m.modified().ok().hash(&mut h);
+            #[cfg(unix)]
+            std::os::unix::fs::MetadataExt::ino(&m).hash(&mut h);
+        }
+    }
+    Some(h.finish())
 }
 
 /// Sleep for `d`, or less if a supervisor signal arrived since the last nap.
@@ -1195,36 +1213,32 @@ fn current_address_space() -> Option<u64> {
 /// so it cannot make a scan look at more than the operator asked for.
 #[cfg(unix)]
 pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) {
-    /// Of the memory a job is granted, the share extraction buffers may claim.
-    /// The rest covers the matcher's own working set (such as the lowercase
-    /// copy of a buffer a case-insensitive signature is checked in) plus
-    /// allocator slack.
-    const EXTRACTION_SHARE_NUM: u64 = 1;
-    const EXTRACTION_SHARE_DEN: u64 = 2;
-
-    let budget = (job_memory / EXTRACTION_SHARE_DEN) * EXTRACTION_SHARE_NUM;
-    if budget == 0 {
-        return;
-    }
-    // The total a scan holds, and what one object may take of it, whether in
-    // an extractor's buffer or read whole by the engine.
-    let lowered = [
+    // Beside an object held whole, matching it may take an image decoded from
+    // it and that image's grey copy, each up to an object's size, and a
+    // lowercase copy of at most `LOWERCASE_COPY_MAX`. So one object may take a
+    // quarter of the job's memory, and the total held, which includes that
+    // object, leaves room for those plus a tenth for everything else.
+    let mut lowered = false;
+    let mut cap = |v: &mut u64, max: u64| {
+        lowered |= *v > max;
+        *v = (*v).min(max);
+    };
+    cap(&mut opts.limits.max_buffer_bytes, job_memory / 4);
+    cap(&mut opts.deep_analysis_max, job_memory / 4);
+    let object = opts.limits.max_buffer_bytes.max(opts.deep_analysis_max);
+    cap(
         &mut opts.limits.max_extracted_bytes,
-        &mut opts.limits.max_buffer_bytes,
-        &mut opts.deep_analysis_max,
-    ]
-    .into_iter()
-    .fold(false, |lowered, v| {
-        let over = *v > budget;
-        *v = (*v).min(budget);
-        lowered | over
-    });
+        job_memory.saturating_sub(2 * object + exav_core::LOWERCASE_COPY_MAX + job_memory / 10),
+    );
+    let total = opts.limits.max_extracted_bytes;
     if lowered {
         eprintln!(
-            "exav: a scan may hold at most {} MiB (half the {} MiB of memory it gets), so \
-             a size limit is reported rather than the scan being killed for hitting one",
-            budget >> 20,
+            "exav: of the {} MiB of memory a scan gets, it may hold {} MiB at once and \
+             {} MiB in one object, so a size limit is reported rather than the scan being \
+             killed for hitting one",
             job_memory >> 20,
+            total >> 20,
+            object >> 20,
         );
     }
 }
@@ -1542,7 +1556,7 @@ pub fn run_prefork(
     addr: ListenAddr,
     opts: Arc<ScanOptions>,
     mut cfg: PoolConfig,
-    datadir: Option<std::path::PathBuf>,
+    mut datadir: Option<Watch>,
     reload_db: &dyn Fn() -> Result<Scanner, String>,
     side: Option<&SideListener>,
 ) -> io::Result<()> {
@@ -1640,8 +1654,6 @@ pub fn run_prefork(
         std::collections::HashMap::new();
     let grace = retire_grace(cfg.max_scan_time);
 
-    let mut last_mtime = datadir.as_deref().and_then(datadir_mtime);
-
     // Supervisor: reap exited workers and respawn to keep the count constant,
     // reload signatures on request, until a shutdown signal arrives.
     loop {
@@ -1707,16 +1719,7 @@ pub fn run_prefork(
 
         // Reload trigger: an explicit RELOAD/SIGUSR2, or the data dir changed on
         // disk (a sidecar wrote it). Coalesce both into one reload per tick.
-        let disk_changed = match datadir.as_deref().and_then(datadir_mtime) {
-            Some(t) => {
-                let changed = source_changed(last_mtime, t);
-                if changed {
-                    last_mtime = Some(t);
-                }
-                changed
-            }
-            None => false,
-        };
+        let disk_changed = datadir.as_mut().is_some_and(Watch::changed);
         if RELOAD_REQUESTED.swap(false, Ordering::Relaxed) || disk_changed {
             match reload_db() {
                 Ok(new_db) => {
@@ -3486,16 +3489,50 @@ mod tests {
         opts.limits.max_extracted_bytes = 1024 << 20;
         opts.deep_analysis_max = 256 << 20;
         fit_limits_to_job_memory(&mut opts, 300 << 20);
-        assert_eq!(opts.deep_analysis_max, 150 << 20);
+        assert_eq!(opts.deep_analysis_max, 75 << 20);
+        assert_eq!(opts.limits.max_extracted_bytes, 104 << 20);
 
         let mut opts = ScanOptions::default();
         opts.limits.max_extracted_bytes = 100 << 20;
         opts.limits.max_buffer_bytes = u64::MAX;
         opts.deep_analysis_max = u64::MAX;
-        fit_limits_to_job_memory(&mut opts, 1024 << 20);
+        fit_limits_to_job_memory(&mut opts, 1000 << 20);
         assert_eq!(opts.limits.max_extracted_bytes, 100 << 20);
-        assert_eq!(opts.limits.max_buffer_bytes, 512 << 20);
-        assert_eq!(opts.deep_analysis_max, 512 << 20);
+        assert_eq!(opts.limits.max_buffer_bytes, 250 << 20);
+        assert_eq!(opts.deep_analysis_max, 250 << 20);
+    }
+
+    /// From live archives scanned with objects allowed up to 2000M in 2 GiB
+    /// workers: a ~420 MB member read whole was matched through copies of it
+    /// (since removed) and the worker died on the allocation. What matching
+    /// still takes beside an object, an image decoded from it and its grey
+    /// copy plus a bounded lowercase copy, must fit what the job gets.
+    #[test]
+    fn an_object_and_what_matching_it_takes_fit_the_grant() {
+        let job = 2048u64 << 20;
+        let mut opts = ScanOptions::default();
+        opts.limits.max_extracted_bytes = 2000 << 20;
+        opts.limits.max_buffer_bytes = 2000 << 20;
+        opts.deep_analysis_max = 2000 << 20;
+        fit_limits_to_job_memory(&mut opts, job);
+        let object = opts.deep_analysis_max.max(opts.limits.max_buffer_bytes);
+        assert!(opts.limits.max_extracted_bytes + 2 * object + exav_core::LOWERCASE_COPY_MAX < job);
+    }
+
+    /// The default 2 GiB job leaves the default and `--clamav-compat` limits
+    /// as they are.
+    #[test]
+    fn the_default_grant_keeps_the_default_limits() {
+        for opts in [ScanOptions::default(), ScanOptions::clamav_compat()] {
+            let mut fitted = opts.clone();
+            fit_limits_to_job_memory(&mut fitted, 2048 << 20);
+            assert_eq!(
+                fitted.limits.max_extracted_bytes,
+                opts.limits.max_extracted_bytes
+            );
+            assert_eq!(fitted.limits.max_buffer_bytes, opts.limits.max_buffer_bytes);
+            assert_eq!(fitted.deep_analysis_max, opts.deep_analysis_max);
+        }
     }
 
     /// A signal that lands while the supervisor is awake (reaping, reloading)
@@ -3556,15 +3593,38 @@ mod tests {
         assert_eq!(cgroup_limit_from(v1, read), None);
     }
 
-    /// A database swapped for one with an older mtime is still a change.
+    /// A file added with the very timestamps already there, as a coarse clock
+    /// stamps one written within a tick of the baseline, is a change; so is a
+    /// file put back with an older mtime. Nothing changed is no change.
     #[test]
-    fn an_older_mtime_is_still_a_change() {
+    fn a_source_is_watched_by_more_than_its_newest_mtime() {
         use std::time::{Duration, SystemTime};
+        let dir = crate::tmpfile::TempDir::new().unwrap();
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        assert!(source_changed(None, t));
-        assert!(!source_changed(Some(t), t));
-        assert!(source_changed(Some(t), t + Duration::from_secs(1)));
-        assert!(source_changed(Some(t), t - Duration::from_secs(1)));
+        let file = |name: &str, body: &str, mtime: SystemTime| {
+            std::fs::write(dir.path().join(name), body).unwrap();
+            let f = std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap();
+            f.set_modified(mtime).unwrap();
+        };
+        let pin_dir = || {
+            let d = std::fs::File::open(dir.path()).unwrap();
+            d.set_modified(t).unwrap();
+        };
+        file("test.ndb", "a", t);
+        pin_dir();
+        let mut watch = Watch::new(dir.path().to_path_buf());
+        assert!(!watch.changed());
+
+        file("more.ndb", "b", t);
+        pin_dir();
+        assert!(watch.changed(), "a file added with the same timestamps");
+        assert!(!watch.changed());
+
+        file("more.ndb", "b", t - Duration::from_secs(60));
+        assert!(watch.changed(), "an older mtime");
     }
 
     /// Clamping only ever lowers: a generous grant must leave the operator's

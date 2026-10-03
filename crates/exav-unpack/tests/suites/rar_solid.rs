@@ -116,6 +116,50 @@ fn a_solid_rar5_group_decodes_every_member() {
     assert_eq!(decoded("solid_rar5.rar"), expected());
 }
 
+/// Two members, not solid, made with RAR 7.23: `a.txt` with a 128 KiB
+/// dictionary, then `b.bin` with 512 KiB, a random 132 KiB block repeated
+/// after a marker. Every member was decoded on the first one's window, so the
+/// second member's distances wrapped and it failed its CRC.
+#[test]
+fn each_member_is_decoded_on_its_own_window() {
+    let mut got: Vec<(String, String)> = members(&fixture("two_windows.rar"))
+        .iter()
+        .map(|e| {
+            assert!(e.unsupported.is_none(), "{}: {:?}", e.name, e.unsupported);
+            (e.name.clone(), sha256_hex(&e.data))
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            (
+                "a.txt".to_string(),
+                "3e608b23bf8d9706b2fdc9fd13ba3c874f13856ea95c5b6ae6b4be2f7761f1cc".to_string()
+            ),
+            (
+                "b.bin".to_string(),
+                "4f75c24fffa92da699feca067ac9883a0084205742283037dfc6dd7f4eb59bd8".to_string()
+            ),
+        ]
+    );
+}
+
+/// A solid group made with RAR 7.23, `-mce+`: `a.txt`, then `code.zzz`,
+/// synthetic x86 calls under the x86 filter. The filter converts addresses
+/// relative to the member, and they were taken relative to the solid stream,
+/// so every executable after the first member of a solid group failed its CRC.
+#[test]
+fn the_x86_filter_counts_from_the_start_of_its_member() {
+    let e = members(&fixture("solid_x86.rar"));
+    let code = e.iter().find(|e| e.name == "code.zzz").expect("code.zzz");
+    assert!(code.unsupported.is_none(), "{:?}", code.unsupported);
+    assert_eq!(
+        sha256_hex(&code.data),
+        "491d628a407e383cc1d068fc52372141c20153371449edaba359628caa00b502"
+    );
+}
+
 #[test]
 fn a_member_split_across_volumes_is_reported() {
     // Only part of `one.txt`'s compressed data is in this volume; the rest is in

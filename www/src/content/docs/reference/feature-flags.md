@@ -12,7 +12,7 @@ for auditability, `unsafe` surface and binary or WASM size. These are Cargo
 ## Default features
 
 ```toml
-default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap"]
+default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap", "image-hash"]
 ```
 
 The default build is pure Rust and links no TLS stack; HTTP is opt-in.
@@ -26,6 +26,7 @@ The default build is pure Rust and links no TLS stack; HTTP is opt-in.
 | `decrypt` | yes | Decryption of encrypted ZIP, 7z, PDF, DMG and Office content (see [Encryption support](/reference/formats/#encryption-support)). Without it that content is reported `PASSWORD-PROTECTED`. |
 | `dlp` | yes | The structured-data leak heuristics (`--dlp-credit-cards` / `--dlp-ssns`). |
 | `phishing` | yes | The phishing heuristic `--detect phishing` runs, and the `.pdb`/`.gdb`/`.wdb` URL lists it reads. |
+| `image-hash` | yes | `fuzzy_img#` subsignatures, through [exav-imagehash](/subprojects/exav-imagehash/) and its image decoders. Without it those signatures load as unsupported (counted, with the reason), and no image is ever decoded. |
 | `icap` | yes | The [ICAP (RFC 3507) server](/guides/icap/) and its `--icap-*` flags. Pure Rust, no extra dependencies; binds nothing unless an `icap://` address is given. |
 | `http` | **no** | HTTP(S) support: both halves below, and the only thing that links a TLS stack (`ureq` → `rustls` → `ring`). In `exav-core`, `http` is only the range-request backend (`dep:ureq`); in `exav` it is `http = ["http-scan", "http-update"]`. |
 | `http-scan` | no | Scanning an `http(s)://` argument, and the daemon's `SCANURL` command. Both also need `--allow-http-scan` at run time. |
@@ -126,7 +127,7 @@ and report it `UNSCANNABLE`. Every name is forwarded from `exav-unpack` through
 
 | Crate | Feature | What it does |
 |---|---|---|
-| `exav-core` | default | `yara`, `all-formats`, `decrypt`, `dlp`, `phishing` (no `icap`, which is the binary's) |
+| `exav-core` | default | `yara`, `all-formats`, `decrypt`, `dlp`, `phishing`, `image-hash` (no `icap`, which is the binary's) |
 | `exav-core` | `http` | The HTTP range-request reader (`dep:ureq`) |
 | `exav-core` | `checksums` | Lets `ScanOptions::verify_checksums` make a container checksum mismatch an error |
 | `exav-core` | `unstable-internals` | Makes the engine internals (`engine`, `bytecode`, `pe`, …) public, for tools; no stability promise |
@@ -134,6 +135,7 @@ and report it `UNSCANNABLE`. Every name is forwarded from `exav-unpack` through
 | `exav-unpack` | default | `all-formats`, `decrypt` |
 | `exav-unpack` | `all-formats-no-emu` | Every format except `pe-emu`. Not forwarded to `exav-core` or `exav` |
 | `exav-unpack` | `checksums` | Lets `Budget::set_verify_checksums` make a checksum mismatch an error |
+| `exav-imagehash` | default | `cli`, and the formats past the five clamscan treats as graphics: `webp`, `ico`, `pnm`, `qoi`, `dds`, `ff`, `hdr` |
 | `exav-unpack-wasm` | `standard` (default) | Every format except `pe-emu`, plus `decrypt`: what the npm package ships |
 | `exav-unpack-wasm` | `full` | Every format, emulator included |
 | `exav-unpack-wasm` | `minimal` | ZIP, gzip and tar only |

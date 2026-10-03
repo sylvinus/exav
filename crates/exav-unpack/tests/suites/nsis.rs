@@ -2,10 +2,8 @@
 use exav_unpack::{detect, extract, Budget, Format, Limits};
 
 /// A real NSIS installer (PE stub + NSIS firstheader + compressed data block).
-/// Its blocks use NSIS's modified bzip2, which we don't fully decode — the point
-/// of the test is that detection classifies it and extraction is panic-free and
-/// yields at least one member (decoded or unsupported), never a crash or a
-/// whole-scan failure. It is real malware, so it is **gitignored (not
+/// Its blocks use NSIS's modified bzip2, and every one of them decodes. It is
+/// real malware, so it is **gitignored (not
 /// committed)** and read at runtime; the tests skip when it's absent (fresh
 /// clone / CI). sha256 provenance is in `fixtures/nsis/README.md`.
 fn real_nsis() -> Option<Vec<u8>> {
@@ -23,18 +21,19 @@ fn real_sample_is_detected_as_nsis() {
 }
 
 #[test]
-fn real_sample_extracts_without_panic_and_yields_members() {
+fn real_sample_decodes_every_block() {
     let Some(data) = real_nsis() else { return };
     let mut budget = Budget::new(Limits::default());
     let entries = extract(Format::Nsis, &data, &mut budget).expect("must not fail the scan");
+    assert!(!entries.is_empty(), "expected members");
     assert!(
-        !entries.is_empty(),
-        "expected >=1 member (decoded or unsupported)"
+        entries.iter().all(|e| e.unsupported.is_none()),
+        "every block decodes: {:?}",
+        entries
+            .iter()
+            .map(|e| (&e.name, e.unsupported))
+            .collect::<Vec<_>>()
     );
-    // Every member is either real decoded content or a marked-unsupported block.
-    assert!(entries
-        .iter()
-        .all(|e| e.unsupported.is_some() || !e.data.is_empty()));
 }
 
 #[test]
@@ -59,10 +58,13 @@ fn synthetic_deflate_block_recovers_marker() {
     blob.extend_from_slice(&0u32.to_le_bytes()); // firstheader flags
     blob.extend_from_slice(&sig); // siginfo
     blob.extend_from_slice(&0u32.to_le_bytes()); // header_size
-    blob.extend_from_slice(&((4 + deflate.len()) as u32).to_le_bytes()); // archive_size
+
+    // archive_size: from the firstheader through the CRC-32 after the data.
+    blob.extend_from_slice(&((0x1c + 4 + deflate.len() + 4) as u32).to_le_bytes());
     let size_word = (deflate.len() as u32) | 0x8000_0000; // compressed block
     blob.extend_from_slice(&size_word.to_le_bytes());
     blob.extend_from_slice(&deflate);
+    blob.extend_from_slice(&0u32.to_le_bytes()); // CRC-32
 
     assert_eq!(detect(&blob), Some(Format::Nsis));
     let mut budget = Budget::new(Limits::default());

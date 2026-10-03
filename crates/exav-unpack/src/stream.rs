@@ -115,6 +115,9 @@ pub struct MemberMeta {
     /// For a ZIP member, its compression method number (0 stored, 8
     /// deflate, ...).
     pub zip_method: Option<u16>,
+    /// For a ZIP member, the general-purpose flags of its local header, which
+    /// can disagree with the central directory's that set `encrypted`.
+    pub zip_local_flags: Option<u16>,
 }
 
 /// When a member was last modified.

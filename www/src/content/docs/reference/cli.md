@@ -130,13 +130,16 @@ change. `--workers` takes a count or `threads`, and refuses `0`.
 | `--max-input-bytes <SIZE\|off>` | unlimited | `100M` | Largest top-level input taken. Past it the first bytes get the whole scan, and without a detection there the input is `LIMITS-EXCEEDED`. The same for a file, stdin and every daemon verb. |
 | `--max-object-bytes <SIZE\|off>` | `256M` | unchanged, but a top-level file up to 400M is held whole | The most memory one object may take when held whole. A larger one gets the same scan through a block cache or spill file, except the checks that need it whole (PE structure, YARA's `pe`/`elf`/`dotnet`, containers read whole); if one of those applied, it is `LIMITS-EXCEEDED` unless something is found. |
 | `--max-matcher-bytes <SIZE\|off>` | `10G` | unchanged | Bytes fed to the matcher across one top-level file: a CPU bound, not a memory one. `clamscan`'s `--max-scansize`. |
+| `--max-pcre-bytes <SIZE\|off>` | unlimited | `100M` | The largest object PCRE subsignatures run on; on a larger one they do not match. Per object, so a small member of a large archive is still matched. A CPU bound: an object is matched without being copied. `clamscan`'s `--pcre-max-filesize`. |
+| `--min-scan-bytes <SIZE>` | `6` | unchanged | The smallest object scanned. A smaller file or member, at any depth, is neither matched nor unpacked and counts as clean, as ClamAV scans no object under 6 bytes. `0` scans every object. |
 | `--max-pe-emulation-steps <N\|off>` | `1000000000` | unchanged | Instructions the PE unpacking emulator may run across one top-level file, summed over every packed executable in it. Reaching it is `LIMITS-EXCEEDED`. |
 | `--max-unpack-depth <N>` | `16` | `17` | Maximum nesting depth for recursive unpacking. At least 1; no `off`, since each level costs stack. |
 | `--max-members <N\|off>` | `100000` | `10000` | Maximum members visited across the whole recursive walk. Higher than ClamAV's because exav descends into nested archives ClamAV does not, so it counts more objects for the same file. |
 
 What a scan holds in total has no flag of its own and cannot be raised: it is
 1 GiB (400M under `--clamav-compat`), and `--max-process-bytes` can only lower
-it, to half the memory a scan gets. `--max-extracted-bytes`, which set it before
+it, to what fits the memory a scan gets (see [Limits](/reference/limits/)).
+`--max-extracted-bytes`, which set it before
 0.0.2, is refused with a message saying so. [Limits](/reference/limits/) has
 the details.
 
@@ -221,6 +224,14 @@ status has one exit code:
 It also takes a per-category list, such as
 `--partial-as password-protected=ok,limits-exceeded=found`, over
 `limits-exceeded`, `unscannable` and `password-protected`.
+
+`password-protected=found` is ClamAV's `--alert-encrypted`, and like it reports
+encryption itself: any encrypted member is `Heuristics.Encrypted.Zip` (`.RAR`,
+`.7Zip`, `.PDF`, `.OLE2`, or `.Archive` for other formats), including one exav
+decrypted and one whose encryption flag is set over plain content. A detection
+in decrypted content wins over it, and `--all-matches` reports both. The
+`PASSWORD-PROTECTED` category itself is narrower: only content exav could not
+decrypt makes a file `PARTIAL`.
 
 `ok` is what ClamAV does for an encrypted archive and what `c-icap` does past
 `MaxObjectSize`. exav does it only when asked: every such object is logged, and
@@ -334,7 +345,7 @@ always reads it and advertises it as `Max-Connections`.
 | `--ping` | off | Ask a daemon whether it is answering, and exit `0` or `2`. Probes `--connect` when given, otherwise the listener this configuration would serve (so a container health check needs no address of its own), with `PING` on clamd and `OPTIONS` on ICAP. One probe; retrying is up to the caller. |
 | `--workers <N\|threads>` | CPU cores | Worker model of the clamd listener (Unix), refused without one: a count runs a prefork pool, `threads` runs the listeners in one process. `0` is refused. |
 | `--max-scan-secs <SECS\|off>` | `120` in the pool, unset otherwise | Unix. Per job in the pool (wall clock, plus CPU time via `RLIMIT_CPU`): a job past it is answered `LIMITS-EXCEEDED` and its worker replaced. In a one-shot run it bounds the whole run, which exits 3. Refused on any other listener (`--workers threads`, ICAP alone), which can only stop the whole daemon; ICAP scans have no time bound. |
-| `--max-process-bytes <SIZE\|off>` | `2G` in the pool (lowered to what the host can back), unset otherwise | Unix. The memory a scan may use, as an address-space cap (`RLIMIT_AS`): per clamd worker in the pool, the whole process in a one-shot run or any other listener. The pool's ICAP child gets no cap, only the in-core budgets fitted to it. What a scan holds is kept to half of it, so a scan reports a limit rather than being killed. See [Limits](/reference/limits/#the-kernel-backstops) and [sizing a server](/guides/sizing/). |
+| `--max-process-bytes <SIZE\|off>` | `2G` in the pool (lowered to what the host can back), unset otherwise | Unix. The memory a scan may use, as an address-space cap (`RLIMIT_AS`): per clamd worker in the pool, the whole process in a one-shot run or any other listener. The pool's ICAP child gets no cap, only the in-core budgets fitted to it. What a scan holds is kept inside it, with room for matching copies, so a scan reports a limit rather than being killed. See [Limits](/reference/limits/#the-kernel-backstops) and [sizing a server](/guides/sizing/). |
 | `--max-jobs-per-worker <N\|off>` | `1000` | Prefork only: recycle a worker after this many jobs; `0` or `off` never does. |
 | `--allow-shutdown` | off | Honour the clamd `SHUTDOWN` command, letting any client that can reach the daemon stop it. Refused without a `clamd://` listener. |
 | `--allow-http-scan` | off | Fetch `http(s)://` scan targets (`exav URL` one-shot, the daemon's `SCANURL`). Needs an `http-scan` build. |
@@ -436,7 +447,9 @@ stderr at startup. Do not run it in production. It changes:
 | What a partial object becomes | `partial` (exit 3) | `ok` (exit 0) | `--partial-as` |
 | Total a scan holds | 1 GiB | 400M (ClamAV's scan size) | none |
 | Largest top-level file held whole | 256M | 400M | `--max-object-bytes` (a value given replaces it) |
+| Largest object PCRE subsignatures run on | no limit | 100M (ClamAV's `PCREMaxFileSize`) | `--max-pcre-bytes` |
 | Unpacking reach | every format exav handles | only the formats stock ClamAV unpacks | none |
+| Images hashed for `fuzzy_img#` | PNG, GIF, JPEG, TIFF, BMP, WebP, ICO, PNM, QOI, DDS, farbfeld, HDR | PNG, GIF, JPEG, TIFF, BMP, as `clamscan` | none |
 | Name of a signature from an unofficial database | no suffix (`YARA.<rule>`) | `.UNOFFICIAL` suffix (`YARA.<rule>.UNOFFICIAL`), as `clamscan` does | none |
 | Names for facts the two engines name differently | exav's (e.g. `Heuristics.ELF.StrippedSectionHeaders`) | ClamAV's (e.g. `Heuristics.Broken.Executable`) | none |
 

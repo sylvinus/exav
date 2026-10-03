@@ -65,6 +65,10 @@ MAXSZ="${MAXSZ:-20971520}"            # skip files > 20 MB
 # faster; it converts slow files into ERROR rows, which is worse than waiting
 # because they then look like a compliance difference.
 TMO="${TMO:-120}"
+# The largest object either engine examines whole: clamd's MaxFileSize and
+# MaxScanSize, exav's --max-object-bytes. Different values make the side with
+# the smaller one report a limit the other never reaches.
+SIZE_LIMIT="${SIZE_LIMIT:-2000M}"
 CLAMD_START_TMO="${CLAMD_START_TMO:-900}"  # clamd DB load can take minutes
 PHASE="${PHASE:-all}"                 # all | clam | exav | compare
 FRESH_CLAM="${FRESH_CLAM:-0}"
@@ -237,8 +241,8 @@ LocalSocket /tmp/clamd.sock
 LocalSocketMode 666
 Foreground yes
 MaxThreads $JOBS
-MaxScanSize 2000M
-MaxFileSize 2000M
+MaxScanSize $SIZE_LIMIT
+MaxFileSize $SIZE_LIMIT
 CONF
   # Without this clamd REFUSES ALLMATCHSCAN, and the refusal looks like a clean
   # file: every reply would read OK and the whole run would be silently void.
@@ -346,6 +350,8 @@ phase_exav() {
   max_scan_secs=$(awk -v t="$TMO" 'BEGIN { printf "%d", (t == int(t) ? t : int(t) + 1) }')
   local flags="--workers $JOBS --max-scan-secs $max_scan_secs"
   [ "$COMPAT" = 1 ] && flags="$flags --clamav-compat"
+  # Overrides the preset's 400M, stock ClamAV's scan size.
+  flags="$flags --max-object-bytes $SIZE_LIMIT"
   # Cover every alert class clamd was configured with. Anything clamd is asked
   # to alert on and exav is not becomes a fake FN: the file is bucketed as
   # "clam detected, exav did not" when exav was never asked to look. Measured

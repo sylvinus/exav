@@ -43,10 +43,12 @@ pub(crate) struct StreamRegex {
 
 impl StreamRegex {
     /// The regex `regex::bytes::RegexBuilder::new(pattern)` builds, with
-    /// `size_limit(nfa_limit)`. `None` where that would fail, or where the lazy
-    /// DFAs cannot be built.
+    /// `unicode(false)` and `size_limit(nfa_limit)`: bytes matched as PCRE does
+    /// without UTF. `None` where that would fail, or where the lazy DFAs cannot
+    /// be built.
     pub(crate) fn bytes_regex(pattern: &str, nfa_limit: usize) -> Option<Self> {
-        let hir = syntax::parse_with(pattern, &syntax::Config::new().utf8(false)).ok()?;
+        let config = syntax::Config::new().utf8(false).unicode(false);
+        let hir = syntax::parse_with(pattern, &config).ok()?;
         Self::from_hir(&hir, Some(nfa_limit))
     }
 
@@ -118,6 +120,7 @@ impl StreamRegex {
 
     /// The matches `meta::Regex::find_iter` yields over `src`, until `f`
     /// returns `false`.
+    #[cfg(test)]
     pub(crate) fn for_each(
         &self,
         src: &dyn ByteSource,
@@ -331,7 +334,10 @@ mod tests {
     #[test]
     fn matches_what_the_in_memory_regex_matches() {
         for p in PATTERNS {
-            let re = regex::bytes::Regex::new(p).unwrap();
+            let re = regex::bytes::RegexBuilder::new(p)
+                .unicode(false)
+                .build()
+                .unwrap();
             let sr = StreamRegex::bytes_regex(p, 16 << 20).unwrap();
             for h in haystacks() {
                 // Blocks of 3 bytes: every read crosses a seam somewhere.

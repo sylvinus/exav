@@ -37,8 +37,10 @@ their paths; UDF, WIM and Unix `compress` are handled natively. See
 
 **It survives adversarial archives.** ZIP members hidden from the central
 directory, entries named with a trailing slash so tools discard them as folders,
-members flagged encrypted that are not: each is handled because a live sample
-used it. See [Archive extraction](/concepts/archive-extraction/).
+members flagged encrypted that are not, an Android manifest given a compression
+method that does not exist (Android reads it as stored): each is handled
+because a live sample used it. See
+[Archive extraction](/concepts/archive-extraction/).
 
 **Decoders are validated against external implementations**, never against
 themselves, and integrity-checked where the format carries a checksum (RAR

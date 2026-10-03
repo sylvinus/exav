@@ -121,83 +121,31 @@ fn collect_ole_entries<R: Read + Seek>(
         };
     }
 
-    // Legacy `.doc`/`.xls`: the encryption bit lives in the stream's header.
-    // Word's FIB sets `fEncrypted` (0x0100) in the 16-bit flags word at offset
-    // 0x0A of the `WordDocument` stream; Excel marks it with a `FilePass` (0x2F)
-    // record near the start of the `Workbook`/`Book` stream. Detect either — and
-    // for Excel additionally try to DECRYPT (RC4-basic, incl. the default
-    // `VelvetSweatshop` password) so the real content is scanned instead of being
-    // reported password-protected. When decryption succeeds the plaintext stream
-    // is substituted into the loop below; when it fails (wrong scheme / password)
-    // we surface an encrypted member — never a silent clean.
-    let mut decrypted_workbook: Option<(std::path::PathBuf, Vec<u8>)> = None;
-    if let Some(p) = paths.iter().find(|p| {
-        let n = p
-            .file_name()
-            .map(|s| s.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        n == "worddocument" || n == "workbook" || n == "book"
-    }) {
-        let is_word = p
-            .file_name()
-            .map(|s| s.to_string_lossy().eq_ignore_ascii_case("worddocument"))
-            .unwrap_or(false);
-        if let Ok(s) = comp.open_stream(p) {
-            // Read the whole stream (Excel decryption needs it all); bounded by
-            // the peak-buffer cap.
-            let (wb, truncated) = bounded_read(s, budget.limits.max_buffer_bytes)
-                .map_err(|e| LimitHit::new(format!("ole read: {e}")))?;
-            let encrypted = if is_word {
-                wb.len() >= 12 && (u16::from_le_bytes([wb[10], wb[11]]) & 0x0100) != 0
-            } else {
-                xls_has_filepass(&wb)
-            };
-            if encrypted {
-                let decrypted = if !is_word && !truncated {
-                    #[cfg(feature = "decrypt")]
-                    {
-                        super::ole_crypto::try_decrypt_workbook(&wb, &budget.passwords)
-                    }
-                    #[cfg(not(feature = "decrypt"))]
-                    {
-                        None
-                    }
-                } else {
-                    None
-                };
-                match decrypted {
-                    Some(dec) => decrypted_workbook = Some((p.clone(), dec)),
-                    None => {
-                        budget.count_entry()?;
-                        return Ok(vec![Entry::unsupported(
-                            p.to_string_lossy().into_owned(),
-                            total_len,
-                            true,
-                            "encrypted Office document",
-                        )]);
-                    }
-                }
-            }
-        }
-    }
-
     let mut entries = Vec::new();
     for p in &paths {
         budget.count_entry()?;
         let cap = budget.reserve()?;
-        // Use the decrypted plaintext for the Workbook/Book stream if we cracked it.
-        let (buf, truncated) = match &decrypted_workbook {
-            Some((wp, dec)) if wp == p => (dec.clone(), dec.len() as u64 > cap),
-            _ => {
-                let stream = comp
-                    .open_stream(p)
-                    .map_err(|e| LimitHit::new(format!("ole stream: {e}")))?;
-                bounded_read(stream, cap).map_err(|e| LimitHit::new(format!("ole read: {e}")))?
-            }
-        };
+        let stream = comp
+            .open_stream(p)
+            .map_err(|e| LimitHit::new(format!("ole stream: {e}")))?;
+        let (buf, truncated) =
+            bounded_read(stream, cap).map_err(|e| LimitHit::new(format!("ole read: {e}")))?;
         if truncated {
             return Err(LimitHit::new("ole stream exceeds budget".to_string()));
         }
+        let (buf, was_decrypted) = match legacy_encryption(&p.to_string_lossy(), buf, budget) {
+            Legacy::Plain(b) => (b, false),
+            Legacy::Decrypted(b) => (b, true),
+            Legacy::Locked => {
+                entries.push(Entry::unsupported(
+                    p.to_string_lossy().into_owned(),
+                    total_len,
+                    true,
+                    "encrypted Office document",
+                ));
+                continue;
+            }
+        };
         budget.commit(buf.len() as u64);
 
         // MSI compresses OLE2 stream names to fit longer names into the
@@ -213,7 +161,6 @@ fn collect_ole_entries<R: Read + Seek>(
         // was protected. Reporting only the content is what let a document exav
         // opened with the `VelvetSweatshop` default password come back with no
         // mention of encryption at all — 552 files, 6.3% of a corpus.
-        let was_decrypted = matches!(&decrypted_workbook, Some((wp, _)) if wp == p);
         let mut entry = Entry::new(name, buf);
         entry.encrypted = was_decrypted;
         entries.push(entry);
@@ -403,24 +350,34 @@ fn ppt_storage_payload(
 /// The payload bytes inside an `Ole10Native` stream, or `None` when the header
 /// does not hold together.
 ///
-/// Layout ([MS-OLEDS] 2.3.6): `NativeDataSize` u32, `Flags` u16, then `Label`,
-/// `FileName` and `Reserved`/temp path as NUL-terminated byte strings, then
-/// `NativeDataSize2` u32 and the data. The strings are attacker-controlled, so
-/// every step is bounds-checked and the declared size is clamped to what is
-/// actually present rather than trusted.
+/// Layout: `NativeDataSize` u32, `Flags` u16, then `Label` and `FileName` as
+/// NUL-terminated byte strings. Office then writes a reserved u32, the temp
+/// path as a u32 length and that many bytes, and the data's u32 size; some
+/// writers give the temp path as a bare NUL-terminated string instead. The
+/// strings are attacker-controlled, so every step is bounds-checked and the
+/// declared size is clamped to what is actually present rather than trusted.
 fn ole10native_payload(data: &[u8]) -> Option<&[u8]> {
-    let mut p = 4usize + 2; // total size + flags
-    for _ in 0..3 {
-        let rel = data.get(p..)?.iter().position(|&b| b == 0)?;
-        p += rel + 1;
-    }
-    let size_bytes = data.get(p..p + 4)?;
-    let size =
-        u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]) as usize;
-    p += 4;
-    let avail = data.len().checked_sub(p)?;
-    let take = size.min(avail);
-    (take > 0).then(|| &data[p..p + take])
+    let le32 = |p: usize| {
+        data.get(p..p + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let past_string = |p: usize| Some(p + data.get(p..)?.iter().position(|&b| b == 0)? + 1);
+    let names = past_string(past_string(4 + 2)?)?;
+    // A reserved word then a counted, NUL-terminated temp path, all of the
+    // data after it; read so only when every part of that holds.
+    let counted = le32(names + 4)
+        .filter(|&len| len > 0)
+        .and_then(|len| (names + 8).checked_add(len))
+        .filter(|&at| data.get(at - 1) == Some(&0))
+        .filter(|&at| le32(at).is_some_and(|size| size > 0 && size <= data.len() - at - 4));
+    let at = match counted {
+        Some(at) => at,
+        None => past_string(names)?,
+    };
+    let size = le32(at)?;
+    let start = at + 4;
+    let take = size.min(data.len().checked_sub(start)?);
+    (take > 0).then(|| &data[start..start + take])
 }
 
 /// Synthesize VBA/XLM macro text artifacts from the extracted OLE streams and
@@ -652,11 +609,13 @@ fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>, bo
     }
 
     // Root entry (object type 5) anchors the mini stream.
+    let mut root = None;
     let mut root_start = 0u32;
     let mut root_size = 0u64;
     for i in 0..n_entries {
         let e = &dir[i * 128..i * 128 + 128];
         if e[66] == 5 {
+            root = Some(i);
             root_start = le32(e, 116);
             root_size = if v4 {
                 le64(e, 120)
@@ -664,6 +623,39 @@ fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>, bo
                 le32(e, 120) as u64
             };
             break;
+        }
+    }
+
+    // Each entry's path, from the tree: a storage's child and that child's
+    // siblings are its members. The sibling order the strict reader refuses
+    // does not matter here, and the VBA project is found by its `VBA` storage.
+    // An entry the walk does not reach keeps its bare name.
+    let entry_name = |i: usize| {
+        let e = &dir[i * 128..i * 128 + 128];
+        cfb_entry_name(&e[..64], le16(e, 64) as usize)
+    };
+    let mut paths: Vec<Option<String>> = vec![None; n_entries];
+    let mut seen = vec![false; n_entries];
+    let mut storages = Vec::new();
+    if let Some(r) = root {
+        seen[r] = true;
+        storages.push((r, String::new()));
+    }
+    while let Some((storage, base)) = storages.pop() {
+        let mut members = vec![le32(&dir[storage * 128..storage * 128 + 128], 76)];
+        while let Some(m) = members.pop() {
+            let m = m as usize;
+            if m >= n_entries || seen[m] {
+                continue;
+            }
+            seen[m] = true;
+            let e = &dir[m * 128..m * 128 + 128];
+            members.extend([le32(e, 68), le32(e, 72)]);
+            let path = format!("{base}/{}", entry_name(m));
+            if e[66] == 1 {
+                storages.push((m, path.clone()));
+            }
+            paths[m] = Some(path);
         }
     }
     let mini_stream = read_fat_stream(root_start, root_size);
@@ -729,13 +721,14 @@ fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>, bo
         } else {
             read_fat_stream(start, size)
         };
-        // Both readers stop at `cap`. Compare what came back with what the
-        // directory entry declared: short means the budget cut the stream, and
-        // the caller has to be told, because a prefix handed over as a whole
-        // stream is a payload past the cap that nothing ever scanned and
-        // nothing ever reported.
-        let truncated = (bytes.len() as u64) < size;
-        streams.push((name, bytes, truncated));
+        // Both readers stop at `cap`. A stream the directory declares larger
+        // than that was cut by the budget, and the caller has to be told,
+        // because a prefix handed over as a whole stream is a payload past the
+        // cap that nothing ever scanned and nothing ever reported. One that
+        // comes back short of a size within the cap has a sector chain that
+        // ends early: there is nothing more of it in the file to read.
+        let truncated = size > cap && (bytes.len() as u64) < size;
+        streams.push((paths[i].take().unwrap_or(name), bytes, truncated));
         if streams.len() >= 4096 {
             break;
         }
@@ -808,54 +801,23 @@ fn assemble_ole_entries(
         };
     }
 
-    // Legacy `.doc`/`.xls` encryption.
-    let mut decrypted_workbook: Option<(String, Vec<u8>)> = None;
-    if let Some((wname, wb, _)) = streams.iter().find(|(n, _, _)| {
-        let l = leaf(n).to_ascii_lowercase();
-        l == "worddocument" || l == "workbook" || l == "book"
-    }) {
-        let is_word = leaf(wname).eq_ignore_ascii_case("worddocument");
-        let encrypted = if is_word {
-            wb.len() >= 12 && (u16::from_le_bytes([wb[10], wb[11]]) & 0x0100) != 0
-        } else {
-            xls_has_filepass(wb)
-        };
-        if encrypted {
-            let decrypted = if !is_word {
-                #[cfg(feature = "decrypt")]
-                {
-                    super::ole_crypto::try_decrypt_workbook(wb, &budget.passwords)
-                }
-                #[cfg(not(feature = "decrypt"))]
-                {
-                    None
-                }
-            } else {
-                None
-            };
-            match decrypted {
-                Some(dec) => decrypted_workbook = Some((wname.clone(), dec)),
-                None => {
-                    budget.count_entry()?;
-                    return Ok(vec![Entry::unsupported(
-                        leaf(wname),
-                        total_len,
-                        true,
-                        "encrypted Office document",
-                    )]);
-                }
-            }
-        }
-    }
-
     let mut entries = Vec::new();
     for (name, data, truncated) in streams {
         budget.count_entry()?;
-        let cap = budget.reserve()?;
-        let buf = match &decrypted_workbook {
-            Some((wn, dec)) if *wn == name => dec.clone(),
-            _ => data,
+        let (buf, was_decrypted) = match legacy_encryption(&name, data, budget) {
+            Legacy::Plain(b) => (b, false),
+            Legacy::Decrypted(b) => (b, true),
+            Legacy::Locked => {
+                entries.push(Entry::unsupported(
+                    name,
+                    total_len,
+                    true,
+                    "encrypted Office document",
+                ));
+                continue;
+            }
         };
+        let cap = budget.reserve()?;
         if buf.len() as u64 > cap {
             return Err(LimitHit::new("ole stream exceeds budget".to_string()));
         }
@@ -863,7 +825,7 @@ fn assemble_ole_entries(
         let out_name = if msi {
             decompress_msi_name(&leaf(&name))
         } else {
-            leaf(&name)
+            name.clone()
         };
         // A stream the reader had to cut short is reported alongside the part
         // that fits, the same way an over-budget safetensors header is. Handing
@@ -880,7 +842,6 @@ fn assemble_ole_entries(
         // Decrypted streams stay marked encrypted — same rule as the strict path
         // above, applied here too because the lenient fallback is the one a
         // malformed compound file actually takes.
-        let was_decrypted = matches!(&decrypted_workbook, Some((wn, _)) if *wn == name);
         let mut entry = Entry::new(out_name, buf);
         entry.encrypted = was_decrypted;
         entries.push(entry);
@@ -892,6 +853,46 @@ fn assemble_ole_entries(
     append_ppt_embedded_storages(&mut entries, budget);
     append_macro_artifacts(&mut entries, budget);
     Ok(entries)
+}
+
+/// A stream after the legacy `.doc`/`.xls` encryption check.
+enum Legacy {
+    Plain(Vec<u8>),
+    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    Decrypted(Vec<u8>),
+    /// Encrypted, and no password or scheme exav has opens it.
+    Locked,
+}
+
+/// Check the stream at `path` for legacy Office encryption, and decrypt an
+/// Excel workbook with the default `VelvetSweatshop` or a pool password.
+///
+/// Word sets `fEncrypted` (0x0100) in the flags word at offset 0x0A of
+/// `WordDocument`; Excel puts a `FilePass` record after the `BOF` of a
+/// `Workbook`/`Book` stream. Every such stream is checked, an embedded
+/// workbook's as well as the document's own. The encryption covers that
+/// stream alone: the VBA project and the other streams are in the clear.
+fn legacy_encryption(path: &str, data: Vec<u8>, budget: &Budget) -> Legacy {
+    let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let is_word = leaf.eq_ignore_ascii_case("worddocument");
+    let is_excel = leaf.eq_ignore_ascii_case("workbook") || leaf.eq_ignore_ascii_case("book");
+    let encrypted = if is_word {
+        data.len() >= 12 && (u16::from_le_bytes([data[10], data[11]]) & 0x0100) != 0
+    } else {
+        is_excel && xls_has_filepass(&data)
+    };
+    if !encrypted {
+        return Legacy::Plain(data);
+    }
+    #[cfg(feature = "decrypt")]
+    if is_excel {
+        if let Some(dec) = super::ole_crypto::try_decrypt_workbook(&data, &budget.passwords) {
+            return Legacy::Decrypted(dec);
+        }
+    }
+    #[cfg(not(feature = "decrypt"))]
+    let _ = budget;
+    Legacy::Locked
 }
 
 /// True if an Excel BIFF8 `Workbook`/`Book` stream is encrypted: a `FilePass`

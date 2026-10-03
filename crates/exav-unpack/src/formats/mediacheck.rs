@@ -13,8 +13,9 @@
 //! tidier spelling of the same condition.
 //!
 //! The formats are all published standards (GIF89a, the PNG specification,
-//! TIFF 6.0, and JPEG/JFIF), so each check below follows from the spec rather
-//! than from any implementation.
+//! TIFF 6.0, and JPEG/JFIF), and each check follows the spec, or, where a name
+//! depends on how the parser goes about it, what clamscan reports on crafted
+//! inputs.
 
 /// The first structural fault found in `data`, as a ClamAV alert name, or `None`
 /// when the file is either well formed or not an image this validates.
@@ -42,7 +43,9 @@ pub fn broken_media_alert(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"II\x2a\x00") || data.starts_with(b"MM\x00\x2a") {
         return check_tiff(data);
     }
-    if data.starts_with(b"\xff\xd8") {
+    // clamscan takes a file for a JPEG, and checks it, only from 6 bytes long
+    // and starting `FF D8 FF`.
+    if data.len() >= 6 && data.starts_with(b"\xff\xd8\xff") {
         return check_jpeg(data);
     }
     None
@@ -85,9 +88,10 @@ fn check_gif(d: &[u8]) -> Option<&'static str> {
                     return Some("Heuristics.Broken.Media.GIF.TruncatedExtension");
                 }
                 p += 1;
-                p = skip_subblocks(d, p)
-                    .ok_or("Heuristics.Broken.Media.GIF.TruncatedExtensionSubBlock")
-                    .ok()?;
+                let Some(np) = skip_subblocks(d, p) else {
+                    return Some("Heuristics.Broken.Media.GIF.TruncatedExtensionSubBlock");
+                };
+                p = np;
             }
             0x2C => {
                 // Image descriptor: 9 bytes, then optional local colour table,
@@ -262,44 +266,37 @@ fn tiff_type_size(ty: u16) -> usize {
 
 // ----------------------------------------------------------------------- JPEG
 
+/// The bytes a marker is looked for in: up to 15 bytes of junk and fill may
+/// precede it.
+const JPEG_MARKER_WINDOW: usize = 16;
+
+/// Checked as clamscan checks it, which is how its names are reached: every
+/// segment before the start of scan carries a length, EOI and the restart
+/// markers included, and a marker is looked for in the next
+/// [`JPEG_MARKER_WINDOW`] bytes, junk before it ignored.
 fn check_jpeg(d: &[u8]) -> Option<&'static str> {
     let mut p = 2usize; // SOI
-    let mut seen_sof = false;
     let (mut jfif, mut exif, mut spiff) = (0u32, 0u32, 0u32);
     let mut segment_index = 0u32;
+    let mut only_com_and_app1 = true;
     loop {
-        // Markers may be preceded by fill bytes (0xFF), but arbitrary data
-        // between segments is not legal.
-        let Some(&b0) = d.get(p) else {
-            return Some(if seen_sof {
-                "Heuristics.Broken.Media.JPEG.NoImages"
-            } else {
-                "Heuristics.Broken.Media.JPEG.CantReadMarker"
-            });
-        };
-        if b0 != 0xFF {
-            return Some("Heuristics.Broken.Media.JPEG.SpuriousBytesBeforeSegment");
-        }
-        let mut q = p;
-        while d.get(q) == Some(&0xFF) {
-            q += 1;
-        }
-        let Some(&marker) = d.get(q) else {
-            return Some("Heuristics.Broken.Media.JPEG.CantReadMarker");
-        };
-        p = q + 1;
-        segment_index += 1;
-        match marker {
-            0xD9 => break,                         // EOI
-            0xD8 | 0x01 | 0xD0..=0xD7 => continue, // standalone markers
-            0xDA => {
-                // Start of scan: entropy-coded data follows, whose extent is not
-                // declared. Structural validation ends here.
-                seen_sof = true;
+        // The first byte that is not 0xFF and follows one.
+        let mut marker_at = None;
+        for at in p..p + JPEG_MARKER_WINDOW {
+            let Some(&b) = d.get(at) else {
+                return Some("Heuristics.Broken.Media.JPEG.CantReadSegmentSize");
+            };
+            if at > p && b != 0xFF && d[at - 1] == 0xFF {
+                marker_at = Some(at);
                 break;
             }
-            _ => {}
         }
+        let Some(at) = marker_at else {
+            return Some("Heuristics.Broken.Media.JPEG.SpuriousBytesBeforeSegment");
+        };
+        let marker = d[at];
+        p = at + 1;
+        segment_index += 1;
         let Some(lb) = d.get(p..p + 2) else {
             return Some("Heuristics.Broken.Media.JPEG.CantReadSegmentSize");
         };
@@ -312,66 +309,57 @@ fn check_jpeg(d: &[u8]) -> Option<&'static str> {
         if p + len > d.len() {
             return Some("Heuristics.Broken.Media.JPEG.SegmentDataOutOfFile");
         }
+        if marker == 0xDA {
+            // Start of scan, its own header checked like any segment's:
+            // entropy-coded data follows, whose extent is not declared.
+            // Structural validation ends here.
+            return None;
+        }
         let body = &d[p + 2..p + len];
+        // A JFIF or SPIFF header has to come first, after nothing but comments
+        // and APP1 segments, within the first two segments or three when an
+        // Exif header came before it. Only segments carrying the identifier
+        // count: a JFXX extension after JFIF, or any other APP0, is not a
+        // second JFIF. Each header needs 16 bytes with its length.
         match marker {
-            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => seen_sof = true,
-            0xE0 => {
-                // APP0 — JFIF. Long enough to hold the identifier plus version
-                // and density fields.
-                //
-                // Its POSITION is deliberately not checked. JPEG permits APPn
-                // markers in any order and mainstream writers use that latitude:
-                // Adobe emits APP1 Exif before APP0 JFIF, which put JFIF at index
-                // 2 and reported ordinary Photoshop and Office output as broken
-                // media. clamd, which has the same machinery, emits this name
-                // zero times over 8,978 samples while emitting other Broken.Media
-                // names 29 times — it declines to make this check, and is right
-                // to. A marker order the format allows is not evidence of
-                // tampering.
+            0xE0 if body.starts_with(b"JFIF\0") => {
                 jfif += 1;
                 if jfif > 1 {
                     return Some("Heuristics.Broken.Media.JPEG.JFIFdupAppMarker");
                 }
-                if body.starts_with(b"JFIF\0") && len < 16 {
+                if !(only_com_and_app1 && segment_index <= 2 + u32::from(exif > 0)) {
+                    return Some("Heuristics.Broken.Media.JPEG.JFIFmarkerBadPosition");
+                }
+                if len < 16 {
                     return Some("Heuristics.Broken.Media.JPEG.JFIFheaderTooShort");
                 }
             }
-            0xE1 => {
-                // APP1 — Exif.
-                if body.starts_with(b"Exif\0") {
-                    exif += 1;
-                    if exif > 1 {
-                        return Some("Heuristics.Broken.Media.JPEG.ExifDupAppMarker");
-                    }
-                    // Position deliberately unchecked — see the APP0 arm above.
-                    // An ICC profile (APP2) or a Photoshop resource block (APP13)
-                    // sitting between JFIF and Exif is ordinary, and requiring
-                    // Exif at index <= 2 reported Office `docProps/thumbnail.jpeg`
-                    // and every Photoshop export as broken.
-                    if len < 16 {
-                        return Some("Heuristics.Broken.Media.JPEG.ExifHeaderTooShort");
-                    }
+            0xE1 if body.starts_with(b"Exif\0\0") => {
+                exif += 1;
+                if exif > 1 || spiff > 0 {
+                    return Some("Heuristics.Broken.Media.JPEG.ExifDupAppMarker");
+                }
+                if len < 16 {
+                    return Some("Heuristics.Broken.Media.JPEG.ExifHeaderTooShort");
                 }
             }
-            0xE8 => {
-                // APP8 — SPIFF.
+            0xE8 if body.starts_with(b"SPIFF\0") => {
                 spiff += 1;
-                if spiff > 1 {
+                if spiff > 1 || jfif > 0 || exif > 0 {
                     return Some("Heuristics.Broken.Media.JPEG.SPIFFdupAppMarker");
                 }
-                if segment_index != 1 {
+                if !(only_com_and_app1 && segment_index <= 2) {
                     return Some("Heuristics.Broken.Media.JPEG.SPIFFmarkerBadPosition");
                 }
-                if len < 32 {
+                if len < 16 {
                     return Some("Heuristics.Broken.Media.JPEG.SPIFFheaderTooShort");
                 }
             }
             _ => {}
         }
+        if !matches!(marker, 0xE1 | 0xFE) {
+            only_com_and_app1 = false;
+        }
         p += len;
     }
-    if !seen_sof {
-        return Some("Heuristics.Broken.Media.JPEG.NoImages");
-    }
-    None
 }

@@ -144,8 +144,8 @@ Each exav limit flag is named after the bound it sets:
 `--max-matcher-bytes` is a CPU bound in exav: a streamed member is scanned
 without being held, so its default is 10G against ClamAV's 400M. Memory is
 bounded separately, and these have no `clamscan` counterpart:
-`--max-process-bytes` (the memory a scan may use; what it holds is kept to half
-of it), `--max-object-bytes` (the most memory one object may use; a larger one
+`--max-process-bytes` (the memory a scan may use; what it holds is kept inside
+it), `--max-object-bytes` (the most memory one object may use; a larger one
 is read through a bounded cache or a spill file, and the checks that parse an
 object whole skip it) and `--max-pe-emulation-steps` (PE unpacking emulator
 instructions). See [sizing a server](/guides/sizing/).

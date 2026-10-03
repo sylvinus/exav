@@ -189,8 +189,10 @@ a time under kernel-enforced limits:
 | `--max-jobs-per-worker` | 1000 | jobs before a worker is recycled (bounds leaks) |
 
 The 2 G is lowered at startup to what the machine can back, and what a scan
-holds is kept to half of it. [Sizing a server](/guides/sizing/) works this
-through for a 4 GB machine.
+holds is kept inside it: one object at most a quarter, since an image decoded
+from it and its grey copy can take as much again twice, and the whole scan
+whatever leaves room for those.
+[Sizing a server](/guides/sizing/) works this through for a 4 GB machine.
 
 A worker past its limit answers its client, exits and is replaced, without
 touching the rest of the pool. The in-engine limits (scan bytes, ratio,
@@ -264,18 +266,22 @@ the daemon keeps serving the current database.
 `SIGHUP` does not reload ([it reopens the log](#logging-what-was-answered)).
 `SIGTERM` and `SIGINT` stop the daemon.
 
-### The watch polls mtimes
+### The watch polls the source
 
-Every ~10 seconds the supervisor checks the `-d` source and reloads when its
-newest modification time changes, as clamd's `SelfCheck` does. Any change
-counts, not only a later time, so a database replaced by one with an older mtime
-is still picked up. It watches whichever form `-d` names:
+Every ~10 seconds the supervisor checks the `-d` source and reloads when it
+changed, as clamd's `SelfCheck` does. It compares the name, size,
+modification time and inode of every entry with what it saw when the serving
+database was read, so a new or renamed file counts even when it carries the
+same timestamp as the rest (some filesystems stamp from a coarse clock), and a
+database replaced by one with an older mtime is still picked up. It watches
+whichever form `-d` names:
 
-- a directory of signature files: the newest mtime across the whole tree,
-  subdirectories included, so a rename, a new file or an in-place overwrite all
-  count;
-- a single database file (`-d db.exavdb`): that file's own mtime, which an atomic
-  swap changes.
+- a directory of signature files: the whole tree, subdirectories included;
+- a single database file (`-d db.exavdb`): that file, which an atomic swap
+  replaces.
+
+A file rewritten in place with the same size within one tick of the
+filesystem's clock looks unchanged; send `RELOAD` after such a write.
 
 Polling rather than kernel events is what makes it work across Docker volumes,
 bind mounts and NFS, where inotify events do not propagate. The

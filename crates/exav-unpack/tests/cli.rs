@@ -77,9 +77,11 @@ fn zip_with(method: u16, members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// One tar entry: `(name, type, mode, mtime, link, body)`.
+#[cfg(unix)]
 type TarEntry<'a> = (&'a str, u8, u32, u64, &'a str, &'a [u8]);
 
 /// A ustar archive of `entries`.
+#[cfg(unix)]
 fn tar_of(entries: &[TarEntry]) -> Vec<u8> {
     let mut v = Vec::new();
     for (name, kind, mode, mtime, link, body) in entries {

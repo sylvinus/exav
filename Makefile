@@ -50,6 +50,7 @@ test-native:
 	# pass hides: the paths that must report unsupported rather than clean.
 	$(CARGO) test -p exav-core --no-default-features
 	$(CARGO) test -p exav-unpack --no-default-features
+	$(CARGO) test -p exav-imagehash --no-default-features
 	# Crash containment, which only runs when a decoder can be asked to fail.
 	# Without this pass the tests that check it skip themselves and the whole
 	# question goes unasked. A scanner that dies on crafted input and exits 0

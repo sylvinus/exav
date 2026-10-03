@@ -103,6 +103,7 @@ export default defineConfig({
             { label: 'exav-grep', slug: 'subprojects/exav-grep' },
             { label: 'exav-core', slug: 'subprojects/exav-core' },
             { label: 'exav-pe-emu', slug: 'subprojects/exav-pe-emu' },
+            { label: 'exav-imagehash', slug: 'subprojects/exav-imagehash' },
             { label: 'exav-x86', slug: 'subprojects/exav-x86' },
             { label: 'exav-update', slug: 'subprojects/exav-update' },
           ],

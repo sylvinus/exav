@@ -162,8 +162,8 @@ pub(crate) fn spawn_reporter(interval: Duration, what: &'static str) {
 }
 
 /// Scans finished by this process, for the tests that check a surface counts
-/// what it scanned.
-#[cfg(test)]
+/// what it scanned (the daemon's, Unix only).
+#[cfg(all(test, unix))]
 pub(crate) fn scans() -> u64 {
     SCANS.load(Ordering::Relaxed)
 }

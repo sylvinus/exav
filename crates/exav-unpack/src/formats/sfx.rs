@@ -68,6 +68,16 @@ fn plausible_arj_header(data: &[u8], off: usize) -> bool {
         && host_os <= 11
 }
 
+/// Does a 7z start header begin here? Its CRC-32 over the 20 bytes after it
+/// must match: 7-Zip checks it, and the six-byte magic also turns up in the
+/// code of tools that handle 7z, where a carve reads a header that is not one.
+fn plausible_7z_header(data: &[u8], off: usize) -> bool {
+    let Some(h) = data.get(off..off + 32) else {
+        return false;
+    };
+    crc32fast::hash(&h[12..32]) == u32::from_le_bytes([h[8], h[9], h[10], h[11]])
+}
+
 fn find_embedded_archive(data: &[u8]) -> Option<(usize, &'static str)> {
     find_archive_from(data, 1)
 }
@@ -77,16 +87,18 @@ fn find_archive_from(data: &[u8], from: usize) -> Option<(usize, &'static str)> 
     let hay = data.get(from..)?;
     let mut best: Option<(usize, &'static str)> = None;
     for &(sig, name) in SIGS {
-        // ARJ's magic is weak enough that the first hit is often noise, so its
-        // matches are walked until one carries a header that checks out. The
-        // other signatures are four bytes or more and are taken as they come.
-        let found = if name == "arj" {
-            memchr::memmem::find_iter(hay, sig)
-                .map(|rel| rel + from)
-                .find(|&off| plausible_arj_header(data, off))
-        } else {
-            memchr::memmem::find(hay, sig).map(|rel| rel + from)
+        // ARJ's and 7z's matches are walked until one carries a header that
+        // checks out: ARJ's magic is weak enough that the first hit is often
+        // noise, and 7z's is in the code of tools that handle the format. The
+        // other signatures are taken as they come.
+        let plausible: fn(&[u8], usize) -> bool = match name {
+            "arj" => plausible_arj_header,
+            "7z" => plausible_7z_header,
+            _ => |_, _| true,
         };
+        let found = memchr::memmem::find_iter(hay, sig)
+            .map(|rel| rel + from)
+            .find(|&off| plausible(data, off));
         if let Some(off) = found {
             if best.is_none_or(|(b, _)| off < b) {
                 best = Some((off, name));
@@ -116,9 +128,10 @@ pub(crate) struct PayloadSearch {
 }
 
 impl PayloadSearch {
-    /// Bytes each window must run into the next: the longest magic and the
-    /// ARJ header check after it, so a match across the seam is seen whole.
-    pub(crate) const OVERLAP: usize = 16;
+    /// Bytes each window must run into the next: the 7z start header, the
+    /// longest a candidate's check reads, so a match across the seam is seen
+    /// whole.
+    pub(crate) const OVERLAP: usize = 32;
 
     pub(crate) fn new() -> Self {
         PayloadSearch { found: None }
@@ -132,8 +145,8 @@ impl PayloadSearch {
         // Offset 0 is the executable's own magic, never its payload.
         let from = if base == 0 { 1 } else { 0 };
         if let Some((off, _)) = find_archive_from(w, from) {
-            // Near the end of a window a match may be cut short, and an ARJ
-            // candidate before it wrongly passed over; the next window sees
+            // Near the end of a window a match may be cut short, and an ARJ or
+            // 7z candidate before it wrongly passed over; the next window sees
             // both whole.
             if last || off + Self::OVERLAP <= w.len() {
                 self.found = Some(Some(base + off));
@@ -164,9 +177,8 @@ pub(crate) fn payload_offset<R: Read + Seek>(
 ) -> Result<Option<u64>, LimitHit> {
     /// Bytes read per window.
     const WINDOW: usize = 1 << 20;
-    /// Kept from one window into the next: the longest magic and the ARJ
-    /// header check after it, so a match across the seam is seen whole.
-    const OVERLAP: usize = 16;
+    /// Kept from one window into the next, as [`PayloadSearch::OVERLAP`].
+    const OVERLAP: usize = PayloadSearch::OVERLAP;
     source
         .seek(std::io::SeekFrom::Start(0))
         .map_err(|e| LimitHit::corrupt(format!("sfx: {e}")))?;
@@ -185,8 +197,8 @@ pub(crate) fn payload_offset<R: Read + Seek>(
         // Offset 0 is the executable's own magic, never its payload.
         let from = if base == 0 { 1 } else { 0 };
         if let Some((off, _)) = find_archive_from(&buf, from) {
-            // Near the end of a window a match may be cut short, and an ARJ
-            // candidate before it wrongly passed over; the next window sees
+            // Near the end of a window a match may be cut short, and an ARJ or
+            // 7z candidate before it wrongly passed over; the next window sees
             // both whole.
             if last || off + OVERLAP <= buf.len() {
                 return Ok(Some(base + off as u64));
@@ -281,9 +293,19 @@ mod tests {
         assert!(entries[0].data.windows(11).any(|w| w == b"MALWARETEST"));
     }
 
+    /// A 7z signature header with a start-header CRC that checks out.
+    fn sevenz_header() -> Vec<u8> {
+        let mut h = b"7z\xBC\xAF\x27\x1C\x00\x04".to_vec();
+        let next = [19u64.to_le_bytes(), 0u64.to_le_bytes()].concat();
+        let start = [&next[..], &0u32.to_le_bytes()].concat();
+        h.extend_from_slice(&crc32fast::hash(&start).to_le_bytes());
+        h.extend_from_slice(&start);
+        h
+    }
+
     #[test]
     fn carves_appended_7z_payload() {
-        let mut seven = b"7z\xBC\xAF\x27\x1C".to_vec();
+        let mut seven = sevenz_header();
         seven.extend_from_slice(b"----MALWARETEST----");
         let blob = mz_stub(&seven, 512);
         assert!(looks_like_sfx(&blob));
@@ -293,6 +315,20 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].data.starts_with(b"7z\xBC\xAF\x27\x1C"));
         assert!(entries[0].data.windows(11).any(|w| w == b"MALWARETEST"));
+    }
+
+    /// From a live installer: a tool that handles 7z holds the six-byte magic
+    /// in its own data. Carved as a payload, it read as a broken 7z archive and
+    /// made the executable `UNSCANNABLE`.
+    #[test]
+    fn a_7z_magic_without_its_start_header_is_passed_over() {
+        let mut junk = b"7z\xBC\xAF\x27\x1C".to_vec();
+        junk.extend_from_slice(&[0x5a; 40]);
+        assert!(!looks_like_sfx(&mz_stub(&junk, 512)));
+
+        let mut blob = mz_stub(&junk, 512);
+        blob.extend_from_slice(&sevenz_header());
+        assert_eq!(find_embedded_archive(&blob), Some((512 + junk.len(), "7z")));
     }
 
     /// The windowed search must answer what the whole-buffer one does, wherever
@@ -311,8 +347,9 @@ mod tests {
         // that answer would miss the earlier archive.
         let mut arj_zip = arj;
         arj_zip[6..10].copy_from_slice(b"PK\x03\x04");
-        for at in (W - 24..W + 24).chain([100, 2 * W - 3]) {
-            for magic in [&b"PK\x03\x04"[..], &arj[..], &arj_zip[..]] {
+        let seven = sevenz_header();
+        for at in (W - 40..W + 24).chain([100, 2 * W - 3]) {
+            for magic in [&b"PK\x03\x04"[..], &arj[..], &arj_zip[..], &seven[..]] {
                 let blob = mz_stub(magic, at);
                 assert_eq!(search(&blob, blob.len() as u64), whole(&blob), "{at}");
             }

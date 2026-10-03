@@ -43,5 +43,6 @@ Licensed under MIT. The library crates it is built from are
 [`exav-core`](https://crates.io/crates/exav-core),
 [`exav-unpack`](https://crates.io/crates/exav-unpack),
 [`exav-pe-emu`](https://crates.io/crates/exav-pe-emu),
+[`exav-imagehash`](https://crates.io/crates/exav-imagehash),
 [`exav-x86`](https://crates.io/crates/exav-x86) and
 [`exav-update`](https://crates.io/crates/exav-update).

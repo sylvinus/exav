@@ -33,6 +33,17 @@ fn empty_password_rc4_r4() {
     );
 }
 
+/// Written by qpdf with its default permissions, `/P -4`. Bit 12 of `/P` was
+/// read as `/EncryptMetadata false`, which changes the key, so the empty
+/// password never matched and the file came out `PASSWORD-PROTECTED`.
+#[test]
+fn empty_password_aesv2_r4() {
+    assert!(
+        recovers_eicar("empty_aesv2_r4.pdf"),
+        "AES-128 R4 empty-password PDF must decrypt"
+    );
+}
+
 #[test]
 fn empty_password_aesv3_r6() {
     assert!(

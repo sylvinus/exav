@@ -262,8 +262,8 @@ fn parse_reset_table(blob: &[u8]) -> Option<ResetTable> {
 }
 
 /// Decompress the section-1 LZX `content` stream into a single buffer (bounded
-/// to `cap` bytes). Returns the decoded buffer plus whether at least one frame
-/// decoded successfully.
+/// to `cap` bytes). Returns the decoded buffer and, per 32 KiB frame, whether
+/// it decoded.
 ///
 /// LZX in CHM is framed: the stream is padded up to a whole number of 32 KiB
 /// frames (padded to the reset interval), so every frame decodes to exactly
@@ -271,20 +271,19 @@ fn parse_reset_table(blob: &[u8]) -> Option<ResetTable> {
 /// the reset table's "honest" (unpadded) length, or the last block ends mid-way
 /// and the decoder reports EOF.
 ///
-/// Best-effort: only frames that start at an LZX reset boundary are decoded
-/// (each with a fresh decoder). This is exact for single-frame streams and for
-/// streams whose reset interval is one frame — the common cases. Frames inside a
-/// multi-frame reset interval can't be started independently with this crate, so
-/// they're left zero-filled rather than decoded to garbage. Never panics.
+/// The decoder is reset at the start of each reset interval and carried
+/// through its frames, each read from the compressed offset the reset table
+/// gives it. A table with fewer entries than frames gives only where each
+/// interval starts, so then only the first frame of each is decoded.
 fn decompress_content(
     content: &[u8],
     params: &LzxParams,
     rt: &ResetTable,
     cap: usize,
-) -> (Vec<u8>, bool) {
+) -> (Vec<u8>, Vec<bool>) {
     let real_len = rt.uncomp_len as usize;
     if real_len == 0 || cap == 0 {
-        return (Vec::new(), false);
+        return (Vec::new(), Vec::new());
     }
     // Frames covering the real (unpadded) length — files never index past it.
     let frames_needed = real_len.div_ceil(LZX_FRAME_SIZE);
@@ -293,47 +292,50 @@ fn decompress_content(
     let max_frames = (cap / LZX_FRAME_SIZE).max(1).min(frames_needed);
     let buf_len = max_frames * LZX_FRAME_SIZE;
     let mut out = vec![0u8; buf_len];
+    let mut decoded = vec![false; max_frames];
 
     let rif = params.reset_interval_frames.max(1);
     let per_frame = rt.offsets.len() >= frames_needed;
-
-    let mut any = false;
-    let mut r = 0usize;
-    loop {
-        let frame = match r.checked_mul(rif) {
-            Some(f) if f < max_frames => f,
-            _ => break,
-        };
-        // Compressed byte offset at which this reset-aligned frame begins.
-        let byte_off = if r == 0 && rt.offsets.is_empty() {
-            0
-        } else if per_frame {
-            match rt.offsets.get(frame) {
-                Some(&o) => o as usize,
-                None => break,
-            }
-        } else {
-            match rt.offsets.get(r) {
-                Some(&o) => o as usize,
-                None => break,
-            }
-        };
-        if byte_off > content.len() {
-            break;
+    // Where frame `f` starts in `content`, and the interval index `r` it opens.
+    let start_of = |f: usize, r: usize| -> Option<usize> {
+        if f == 0 && rt.offsets.is_empty() {
+            return Some(0);
         }
-        let chunk = &content[byte_off..];
-        let out_pos = frame * LZX_FRAME_SIZE;
-        // Fresh decoder per reset point (each reset boundary re-initialises the
-        // LZX state); the crate then handles the E8 header and block structure.
+        let o = if per_frame {
+            rt.offsets.get(f)
+        } else if f.is_multiple_of(rif) {
+            rt.offsets.get(r)
+        } else {
+            None
+        };
+        o.and_then(|&o| usize::try_from(o).ok())
+            .filter(|&o| o <= content.len())
+    };
+
+    let mut r = 0usize;
+    while let Some(first) = r.checked_mul(rif).filter(|&f| f < max_frames) {
         let mut lzxd = Lzxd::new(params.window);
-        if let Ok(bytes) = lzxd.decompress_next(chunk, LZX_FRAME_SIZE) {
-            let n = bytes.len().min(out.len() - out_pos);
+        let frames = &mut decoded[first..(first + rif).min(max_frames)];
+        for (f, ok) in (first..).zip(frames) {
+            let Some(from) = start_of(f, r) else { break };
+            let to = match start_of(f + 1, r + 1) {
+                Some(to) if per_frame && to >= from => to,
+                _ => content.len(),
+            };
+            let Ok(bytes) = lzxd.decompress_next(&content[from..to], LZX_FRAME_SIZE) else {
+                break;
+            };
+            let out_pos = f * LZX_FRAME_SIZE;
+            let n = bytes.len().min(LZX_FRAME_SIZE);
             out[out_pos..out_pos + n].copy_from_slice(&bytes[..n]);
-            any = true;
+            *ok = n == LZX_FRAME_SIZE;
+            if !*ok {
+                break;
+            }
         }
         r += 1;
     }
-    (out, any)
+    (out, decoded)
 }
 
 pub(crate) fn extract_chm<R>(
@@ -364,7 +366,7 @@ pub(crate) fn extract_chm<R>(
     // Decode the compressed content section once (shared by all section-1 files).
     // Bounded to what the budget still allows so a huge declared length can't OOM.
     let mut decompressed: Vec<u8> = Vec::new();
-    let mut lzx_ok = false;
+    let mut frames_ok: Vec<bool> = Vec::new();
     if let Some(content_e) = content {
         if let Some(content_bytes) = read_sec0(data, dir.sec0_offset, content_e) {
             let params = control
@@ -387,9 +389,8 @@ pub(crate) fn extract_chm<R>(
             if let (Some(params), Some(rt)) = (params, rt) {
                 let cap = budget.reserve().unwrap_or(0) as usize;
                 if cap > 0 {
-                    let (buf, ok) = decompress_content(content_bytes, &params, &rt, cap);
-                    decompressed = buf;
-                    lzx_ok = ok;
+                    (decompressed, frames_ok) =
+                        decompress_content(content_bytes, &params, &rt, cap);
                 }
             }
         }
@@ -434,7 +435,15 @@ pub(crate) fn extract_chm<R>(
             // Compressed: slice out of the decompressed LZX stream.
             let start = usize::try_from(e.offset).ok();
             let len = usize::try_from(e.length).ok();
-            match (lzx_ok, start, len) {
+            // Every frame the entry covers decoded.
+            let decoded = start.zip(len).is_some_and(|(s, l)| {
+                let first = s / LZX_FRAME_SIZE;
+                let end = s.saturating_add(l).div_ceil(LZX_FRAME_SIZE);
+                frames_ok
+                    .get(first..end)
+                    .is_some_and(|f| f.iter().all(|&ok| ok))
+            });
+            match (decoded, start, len) {
                 // Same again for the compressed section: report rather than
                 // deliver a prefix dressed up as the whole entry.
                 (true, Some(_), Some(l)) if l as u64 > cap => (

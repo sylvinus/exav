@@ -56,6 +56,16 @@ follow [semantic versioning](https://semver.org/).
   `--volume` names parts that are elsewhere.
 - Releases carry `exav-unpack`, `exav-grep` and `exav-pe-emu` archives beside
   `exav`'s, and every archive carries `LICENSE` and `NOTICE`.
+- `--partial-as password-protected=found` reports any encrypted member as
+  `Heuristics.Encrypted.*`, as ClamAV's `--alert-encrypted` does: one exav
+  decrypted with a password, and one whose encryption flag is set over plain
+  content (APK packers set it on every member), included. A detection in the
+  content still wins. Before, a scan without `--all-matches` reported neither,
+  and a falsely flagged member was not even `.cdb`-matchable as encrypted.
+  `PASSWORD-PROTECTED` is still only content exav could not decrypt. For a ZIP
+  member the alert reads the local header as ClamAV does (bit 0 set, bit 13
+  clear), and a `.cdb` encryption field matches either the local header or the
+  central directory record; both read only the central directory before.
 - A YARA pattern keeps at most a million matches, as yara-x does; one with more
   makes the scan `LIMITS-EXCEEDED` unless a rule matches.
 - exav-core: `ScanOptions::spill` gives a scan somewhere to write what it makes
@@ -137,13 +147,24 @@ follow [semantic versioning](https://semver.org/).
   `/var/lib/clamav`, reloads with `systemctl reload exav` (`SIGUSR2`), and says
   how to stop `clamav-daemon.socket` alongside `clamav-daemon`.
 - `--max-extracted-bytes` is removed. What a scan holds is 1 GiB (400M under
-  `--clamav-compat`), and `--max-process-bytes` lowers it to half the memory a
-  scan gets. The flag, or `EXAV_MAX_EXTRACTED_BYTES`, stops the run with a
+  `--clamav-compat`), and `--max-process-bytes` lowers it to what fits the
+  memory a scan gets. The flag, or `EXAV_MAX_EXTRACTED_BYTES`, stops the run with a
   message naming the change. It also set the largest object held in memory, so
   `--max-extracted-bytes 0` loaded any file whole.
-- `--max-process-bytes` also lowers `--max-object-bytes` to half the memory a
-  scan gets, so a file past it is `LIMITS-EXCEEDED`; it was `out of memory
-  ERROR`.
+- `--max-process-bytes` also lowers `--max-object-bytes` to a quarter of the
+  memory a scan gets, and the total held to what leaves room for an image
+  decoded from the largest object and its grey copy plus a tenth, so a file
+  past them is `LIMITS-EXCEEDED`; it was `out of memory ERROR`. The default 2G
+  changes neither the default limits nor `--clamav-compat`'s.
+- Matching an object no longer copies it whole. PCRE subsignatures ran over a
+  Latin-1 string of the object, up to twice its size, and case-insensitive
+  bodies over a lowercased copy: the first now match the bytes directly, the
+  second lowercase what they read past 16 MiB. A crafted image no longer takes
+  more memory than an object may: its decoded pixels are held to
+  `--max-object-bytes` (past it, and short of the 512 MiB ClamAV decodes, the
+  scan is `LIMITS-EXCEEDED`), and it is turned grey
+  without a full-size RGB copy. A decoder panic leaves the image unhashed
+  rather than stopping its scan.
 - `0` and `off`, flag by flag: `--max-members 0`/`off` and
   `--max-jobs-per-worker 0`/`off` mean no limit; `--max-unpack-depth` and the
   `--dlp-` counts refuse `0` (and depth refuses `off`); `--update-interval-secs
@@ -259,12 +280,27 @@ follow [semantic versioning](https://semver.org/).
   `cipher` 0.5: `sha2`, `sha1`, `md-5`, `aes`, `cbc`, `des`, `hmac`, `pbkdf2`).
 - Dependencies: `bincode` (unmaintained, RUSTSEC-2025-0141) and `serde` are
   gone from `exav-unpack`, the encrypted-DMG header being read field by field;
-  `tlsh2` 1.x; `ureq` 3 for the `http` features, which drops `url` and the ICU
+  `tlsh2` 1.x; `ext4-view` 1.0 (panics and infinite loops on corrupt
+  filesystems fixed upstream); `lzma-rust2` 0.21 (malformed-input fixes
+  upstream); `ureq` 3 for the `http` features, which drops `url` and the ICU
   crates from that build and, as ureq 3 does by default, follows the
   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment.
 
 ### Added
 
+- `exav-imagehash`, a crate and a command of its own: perceptual image hashes
+  with every step a parameter, and presets equal to `sigtool --fuzzy-img`
+  (ClamAV's `fuzzy_img` hash, which the scanner now computes through it) and
+  to Python `imagehash.phash`. Safe Rust down to its decoders.
+- The `image-hash` build feature (on by default): without it, `fuzzy_img#`
+  signatures load as unsupported and no image is decoded.
+- `--max-pcre-bytes`: the largest object PCRE subsignatures run on, as
+  ClamAV's `PCREMaxFileSize` (`clamscan --pcre-max-filesize`), per object. No
+  limit by default; 100M under `--clamav-compat`, ClamAV's default.
+- `--min-scan-bytes` (default 6): an object smaller than this, file or
+  member, is not scanned and counts as clean, as ClamAV scans no object under
+  6 bytes. Such objects were scanned, so a 3-byte signature body could match
+  a 5-byte file ClamAV reports clean. `0` scans every object, as before.
 - `--max-pe-emulation-steps` (default 1,000,000,000): instructions the PE
   unpacking emulator may run across one top-level file, reported as
   `LIMITS-EXCEEDED` / `Heuristics.Limits.Exceeded.MaxScanTime`.
@@ -292,15 +328,172 @@ follow [semantic versioning](https://semver.org/).
   `exav_unpack::join_rar_volumes` joins a RAR volume set into one archive. The
   `cli` feature (default) builds the `exav-unpack` command and is the only one
   that pulls in `chrono`.
+- Encrypted RAR archives are decrypted with the caller's passwords and the
+  defaults tried on ZIP (`infected` and the like): RAR5's AES-256 and RAR
+  2.9-4's AES-128, file data and, under `rar -hp`, the headers too. A member
+  decrypted is still reported encrypted. They were all `PASSWORD-PROTECTED`.
+- A RAR5 hard link or file copy is the member it names; it was empty.
+- RAR5 headers written for the RAR 7 algorithm: 80 distance codes, and
+  dictionary sizes that are not a power of two.
 
 ### Fixed
+
+- A RAR5 archive whose headers are encrypted (`rar -hp`) was read as having
+  no members, so it scanned clean. Without a password that opens it, it is
+  `PASSWORD-PROTECTED`.
+- An encrypted stored RAR5 member was handed over as its ciphertext, as
+  though it were the file, and not reported encrypted.
+- In a RAR archive every member was decoded on the first member's window, so a
+  later member whose dictionary is larger failed its CRC and was not scanned;
+  each member that is not solid now gets its own. A RAR5 header's dictionary
+  size was read from 4 of its 5 bits.
+- The x86 and Itanium (RAR 2.9-4) and x86 and ARM (RAR5) filters converted
+  addresses relative to the start of the first member decoded, not of their
+  own member, so an executable after it in the archive failed its CRC.
+- In a solid RAR 2.9-4 group, an empty member left the next one decoding from
+  the middle of the stream; a PPMd block header that sets no escape symbol had
+  it reset to the default instead of kept; and a member following one that
+  ended in PPMd was read without the block header it starts with. Each failed
+  every member after it.
 
 - Scanning a URL took a server that answered a range request with the whole
   object (`200` instead of `206`) as the range, and scanned bytes from the
   start of the object as though they were from the offset asked for. It is
   an error now.
+- A ZIP member whose compression method is a value no specification defines
+  is read as Android reads it, stored and its uncompressed size long; it was
+  `UNSCANNABLE`. APK packers give `AndroidManifest.xml` such a method, often
+  with a compressed size shorter than the data, so that other tools skip it.
+- NSIS installers compressed with bzip2 are decoded: NSIS's bzip2 has no
+  stream header, marks blocks with one byte and carries no checksums, so every
+  block was `UNSCANNABLE`. And the CRC-32 at the end of an installer was read
+  as one more block, which made every installer built with a CRC (NSIS's
+  default) `UNSCANNABLE` whatever its codec.
+- A file in an HFS+ disk image with a resource fork is reported
+  `UNSCANNABLE`: only data forks are read, and a file macOS compressed keeps
+  its bytes in its resource fork with an empty data fork, which was scanned as
+  an empty file.
+- The daemon's watch of its signature source missed changes. It compared only
+  the newest mtime, which a filesystem stamping from a coarse clock gives a
+  file written within one tick of the last change, and it took its baseline
+  after the database had loaded and the workers had forked, so a file a
+  sidecar wrote in between was part of it. Either way the new signatures were
+  not loaded until the source changed again. The watch now compares every
+  entry's name, size, mtime and inode, against a baseline taken before the
+  load.
+- A ZIP with other bytes before it whose offsets count from its own start (a
+  self-extractor's payload, an archive appended to another) was located from
+  the first central directory found after its declared offset, which, with
+  two archives back to back, is the first one's; every member was read at
+  the wrong place and reported `UNSCANNABLE`. The directory is now located
+  from the end record, as Info-ZIP does.
+- An executable holding the 7z signature in its own data (a tool that handles
+  7z) was carved as a self-extractor with a broken archive and reported
+  `UNSCANNABLE`. A 7z candidate is taken only when its start-header CRC
+  checks out, as 7-Zip requires.
+- A PE whose full parse fails over one malformed directory (a certificate
+  table sized past the end of the file, say) had no section hashes, icon,
+  entry-point layout or bytecode PE data, and each bytecode program reading
+  that data left the scan `LIMITS-EXCEEDED`. Those come from the headers and
+  section table now, read without the directories.
+- A PDF stream that fails to decode from its first byte has its raw bytes
+  scanned, as ClamAV does, and is still reported `UNSCANNABLE`. Nothing of it
+  was scanned, so a ZIP behind a `/FlateDecode` filter went unopened.
+- An object embedded in an Office document as a package (`Ole10Native`) with
+  its temp path counted, as Office writes it, was carved from the middle of
+  its header, so a document or executable inside was never recognised.
+- A VBA project whose compressed chunks have signature bits other than the
+  fixed `0b011` is decoded, as Office runs it; the whole project was dropped,
+  and with it every macro signature and `Heuristics.OLE2.ContainsMacros`.
+  Emotet documents do this.
+- A compound file read by the lenient reader (a malformed directory, which
+  the strict one refuses) keeps each stream's path; its VBA project, found by
+  its `VBA` storage, was never assembled.
+- A stream of a malformed compound file whose sector chain ends before the
+  size its directory entry gives was reported cut short by the size budget,
+  and the file `UNSCANNABLE`; there is nothing more of it to read.
+- An encrypted workbook embedded in a document, as Excel stores an inserted
+  workbook, is decrypted too; only the first workbook stream was looked at.
+- An encrypted workbook or Word document exav cannot decrypt still has its
+  other streams scanned: only the document stream is encrypted, and the VBA
+  project beside it went unscanned.
+- A GIF whose extension sub-block runs past the end of the file was taken for
+  a well-formed image; under `--detect broken-media` it is
+  `Heuristics.Broken.Media.GIF.TruncatedExtensionSubBlock`, as ClamAV names it.
+- HTML (`Target:3`) and text (`Target:7`) signatures matched raw bytes as
+  well as the normalised renderings they are written for, mail (`Target:4`)
+  ones any text-like file, and a text file was also matched through an HTML
+  rendering (entities decoded) and an HTML file through a text one. Each now
+  matches where clamscan's does: 3 the HTML rendering of an HTML file, 7 the
+  text rendering of a text file, 4 a mail's raw bytes. An RTF keeps both
+  renderings, as before.
+- `--detect broken-media` checks a JPEG as ClamAV does, which crafted inputs
+  showed differs from the format's rules: a file is checked only from 6 bytes
+  and `FF D8 FF`; up to 15 bytes of junk before a marker are skipped; every
+  marker up to the start of scan carries a length, checked against the file,
+  the start of scan's own included; and JFIF and SPIFF headers have
+  their position checked, after nothing but comments and APP1 segments. Only
+  an APP0 saying `JFIF` counts as one, so a JFXX thumbnail after it is no
+  longer a duplicate. `JPEG.NoImages` and `JPEG.CantReadMarker`, which ClamAV
+  did not report on any of them, are gone.
+- `fuzzy_img#` hashes are computed with the image decoders ClamAV 1.4.6 and
+  1.5.4 ship (image 0.25.9, zune-jpeg 0.5.8). The older JPEG decoder exav used
+  gave a different hash for 116 of 9,751 photos, so a signature for one of
+  them did not match; the hashes now equal `sigtool --fuzzy-img`'s on all of
+  them, and on TIFFs of 31 encodings. The JPEG decoders, the one TIFF uses
+  included, are built without their SIMD code, their only `unsafe`; they
+  decode the same pixels.
+- A WebP image matched `Target:5` (graphics) signatures, which clamscan's do
+  not: its graphics are PNG, GIF, JPEG, TIFF and BMP. Under `--clamav-compat`
+  those five are also the only images hashed for `fuzzy_img#`, as clamscan
+  hashes; otherwise a WebP, ICO, PNM, QOI, DDS, farbfeld or HDR image is too,
+  as `sigtool --fuzzy-img` hashes them.
+- PCRE subsignatures matched differently from ClamAV's PCRE2 on bytes above
+  0x7F and on PCRE syntax the Rust regex engines read otherwise: `\xe9` matched
+  é's UTF-8 encoding instead of the byte, `.`, `[^a]` and `\W` missed high
+  bytes, `$` did not match before a final newline (a signature ending
+  `</svg>$` missed most SVG files), octal escapes such as `\0` or `[\22]` left
+  the signature unable to compile, `\<` was a word boundary, `\v` a vertical
+  tab and `\h` a hex digit. Each pattern is now parsed with PCRE2's grammar and
+  rewritten in a subset both engines read as PCRE2 does, each construct
+  settled against clamscan; one with no exact equivalent leaves its signature
+  unsupported and counted (none of the 1,220 in the official databases). The
+  `x`, `E`, `U` and `A` flags were ignored and are applied.
+- A PCRE subsignature with an offset was looked for from the start of the
+  file and kept when a match started at the offset, so an earlier match
+  overlapping it hid it. As in ClamAV, the part from the offset on is now the
+  subject (`^`, `\A` and a lookbehind start there), the match starts at the
+  offset unless `r`, a shift bounds where it starts and `e` where it ends.
+- A PCRE subsignature with `g` counted once, so a logical signature
+  requiring it more than once (`1>3`) never fired; it counts every match.
+- A CHM decoded only the first 32 KiB frame of each LZX reset interval and
+  left the others zeroed, so a page or image past it was scanned as zeros or
+  as a cut-off file (a help file's PNG came out `Broken.Media.PNG`). Every
+  frame is decoded, and an entry over a frame that fails is reported rather
+  than zero-filled.
 - An encrypted DMG whose header declares a salt longer than 32 bytes or a key
   blob longer than 64 panicked in its decoder; it is reported corrupt.
+- A revision 4 encrypted PDF (AES-128, or RC4 under a crypt filter) whose
+  permissions allow assembling the document, qpdf's default, was taken to
+  leave its metadata unencrypted, which changes the key: the empty password
+  never matched and the file was `PASSWORD-PROTECTED`, its content unread.
+  A crypt filter's key length written in bits, as the specification gives it,
+  is read as bits; it was read as bytes only.
+- A PDF encrypted with a 40-bit RC4 key had its streams and strings decrypted
+  with a 5-byte object key instead of the 10-byte one the format derives, so
+  what was scanned was garbage, and an object with a generation number other
+  than 0 was decrypted with the wrong key at any key length.
+- A PDF stream whose `stream` keyword is followed by spaces before its line
+  end had the spaces taken as data, so its FlateDecode content was not decoded
+  and the file was reported `PARTIAL`; 0.0.1 decoded from a later 0x78 byte and
+  scanned the garbage.
+- The end of line before a PDF stream's `endstream` was taken as data, so an
+  empty stream (`/Length 0`) was reported undecodable.
+- An executable inside an OLE2 file (Word, Excel, MSI) was carved only from the
+  stream holding it. It is also carved from the file's own bytes now and
+  scanned to the end of the file, as ClamAV does, so a signature that matches
+  what follows it in the file finds it (`Win.Loader.Covenant-10058832-0` on a
+  Word dropper, for one).
 - Typing an archive not held in memory read its first 4 MiB even when its
   first bytes named it, so exav-unpack-wasm's `Archive.open` over a `File` or a
   `{ read, size }` reader fetched a small archive whole before listing it.

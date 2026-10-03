@@ -70,15 +70,14 @@ fn zip_with_an_unreadable_first_member() -> Vec<u8> {
     .unwrap();
     z.write_all(&[b'P'; 2048]).unwrap();
     let mut blob = z.finish().unwrap().into_inner();
-    // Lie about where the central directory starts. A reader reconciles the
-    // claim against where the directory actually is and carries the difference
-    // over to every local-header offset, so the directory still parses and the
-    // members it points at do not. Bytes 16..20 of the EOCD are that offset.
-    let eocd = blob
+    // Point the member's directory entry at a local header that is not there.
+    // The directory still parses and the member it points at does not. Bytes
+    // 42..46 of a central directory header are that offset.
+    let cd = blob
         .windows(4)
-        .rposition(|w| w == b"PK\x05\x06")
-        .expect("end-of-central-directory record");
-    blob[eocd + 16..eocd + 20].copy_from_slice(&0u32.to_le_bytes());
+        .rposition(|w| w == b"PK\x01\x02")
+        .expect("central directory header");
+    blob[cd + 42..cd + 46].copy_from_slice(&7u32.to_le_bytes());
     blob
 }
 

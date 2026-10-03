@@ -47,13 +47,9 @@ impl CryptDict {
             _ => 128,
         };
 
-        let encrypt_metadata = if p & (1 << 11) != 0 {
-            false
-        } else {
-            match dict.get("EncryptMetadata") {
-                Some(Primitive::Boolean(b)) => *b,
-                _ => true,
-            }
+        let encrypt_metadata = match dict.get("EncryptMetadata") {
+            Some(Primitive::Boolean(b)) => *b,
+            _ => true,
         };
 
         let mut crypt_filters = HashMap::new();
@@ -164,17 +160,17 @@ impl Decoder {
         Err(PdfCryptError::UnsupportedRevision(level))
     }
 
-    pub(crate) fn decrypt_stream(&self, obj_id: u32, data: &mut Vec<u8>) {
+    pub(crate) fn decrypt_stream(&self, obj_id: u32, gen: u32, data: &mut Vec<u8>) {
         if data.is_empty() || self.method == CryptMethod::None {
             return;
         }
         match self.method {
             CryptMethod::V2 => {
-                let key = self.per_object_key(obj_id, None);
+                let key = self.per_object_key(obj_id, gen, None);
                 rc4_apply(&key, data);
             }
             CryptMethod::AESV2 => {
-                let key = self.per_object_key(obj_id, Some(b"sAlT"));
+                let key = self.per_object_key(obj_id, gen, Some(b"sAlT"));
                 aes_cbc_decrypt(&key, data);
             }
             CryptMethod::AESV3 => {
@@ -185,17 +181,20 @@ impl Decoder {
         }
     }
 
-    fn per_object_key(&self, obj_id: u32, salt: Option<&[u8]>) -> Vec<u8> {
+    /// ISO 32000-1 7.6.2, algorithm 1: MD5 of the file key, the object
+    /// number's low 3 bytes and the generation's low 2, and for AES the salt;
+    /// the first n + 5 bytes of it, at most 16, are the object's key.
+    fn per_object_key(&self, obj_id: u32, gen: u32, salt: Option<&[u8]>) -> Vec<u8> {
         let n = self.key_size.min(16);
         let mut data = Vec::with_capacity(n + 5 + 4);
         data.extend_from_slice(&self.key[..n]);
         data.extend_from_slice(&obj_id.to_le_bytes()[..3]);
-        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&gen.to_le_bytes()[..2]);
         if let Some(s) = salt {
             data.extend_from_slice(s);
         }
         let hash = md5_compute(&data);
-        hash[..n.min(16)].to_vec()
+        hash[..(n + 5).min(16)].to_vec()
     }
 }
 
@@ -250,13 +249,16 @@ fn resolve_crypt_method(dict: &CryptDict) -> Result<(u32, CryptMethod), PdfCrypt
                 .crypt_filters
                 .get(filter_name)
                 .ok_or_else(|| PdfCryptError::MissingEntry(format!("CF/{filter_name}")))?;
+            // The specification gives a crypt filter's /Length in bits, and
+            // Acrobat and qpdf write it in bytes (16, 32); a key is at most
+            // 32 bytes, so a value up to 32 is bytes.
+            let bits = cf
+                .length
+                .map(|n| if n <= 32 { 8 * n } else { n })
+                .unwrap_or(dict.bits);
             match cf.method {
-                CryptMethod::V2 | CryptMethod::AESV2 => {
-                    Ok((cf.length.map(|n| 8 * n).unwrap_or(dict.bits), cf.method))
-                }
-                CryptMethod::AESV3 if dict.v == 5 => {
-                    Ok((cf.length.map(|n| 8 * n).unwrap_or(dict.bits), cf.method))
-                }
+                CryptMethod::V2 | CryptMethod::AESV2 => Ok((bits, cf.method)),
+                CryptMethod::AESV3 if dict.v == 5 => Ok((bits, cf.method)),
                 CryptMethod::AESV3 if dict.v == 6 => Ok((256, CryptMethod::AESV3)),
                 m => Err(PdfCryptError::InvalidData(format!(
                     "unsupported crypt method {m:?}"
@@ -688,6 +690,37 @@ mod tests {
             .collect()
     }
 
+    /// A crypt filter's /Length in bytes, as Acrobat writes it, or in bits, as
+    /// the specification gives it, is the same 128-bit key.
+    #[test]
+    fn a_crypt_filter_length_reads_in_bytes_or_bits() {
+        for length in [16, 128] {
+            let dict = CryptDict {
+                o: Vec::new(),
+                u: Vec::new(),
+                r: 4,
+                v: 4,
+                bits: 40,
+                p: -4,
+                encrypt_metadata: true,
+                crypt_filters: HashMap::from([(
+                    "StdCF".to_string(),
+                    CryptFilter {
+                        method: CryptMethod::AESV2,
+                        length: Some(length),
+                    },
+                )]),
+                default_stream_filter: Some("StdCF".to_string()),
+                oe: None,
+                ue: None,
+            };
+            assert_eq!(
+                resolve_crypt_method(&dict).unwrap(),
+                (128, CryptMethod::AESV2)
+            );
+        }
+    }
+
     /// An AES stream or string is the IV, then the ciphertext of the padded
     /// plaintext; what comes out is the plaintext alone. With the IV left in
     /// front, a FlateDecode stream no longer starts with its zlib header and
@@ -713,9 +746,24 @@ mod tests {
             for tail in [&b""[..], b"\r\n"] {
                 let mut data = unhex(hex);
                 data.extend_from_slice(tail);
-                dec.decrypt_stream(7, &mut data);
+                dec.decrypt_stream(7, 0, &mut data);
                 assert_eq!(data, PLAIN, "{:?} with tail {tail:?}", dec.method);
             }
         }
+    }
+
+    /// RC4 with a 40-bit file key: the object key is 10 bytes (n + 5), and it
+    /// covers the generation number. Vector from Python's hashlib and a plain
+    /// RC4, object 9, generation 1.
+    #[test]
+    fn rc4_object_key_is_n_plus_5_bytes_and_covers_the_generation() {
+        let dec = Decoder {
+            key: vec![0x11; 5],
+            key_size: 5,
+            method: CryptMethod::V2,
+        };
+        let mut data = unhex("629b5068e6d08d72fc48ae484fcd3a7a9df5cc2a6b934775c7da599b709a1b2939");
+        dec.decrypt_stream(9, 1, &mut data);
+        assert_eq!(data, PLAIN);
     }
 }

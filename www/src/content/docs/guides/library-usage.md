@@ -215,6 +215,7 @@ walk(format, &bytes, &mut budget, &mut visit)?;
 | `exav-grep` | Searching inside archives |
 | `exav-x86` | An x86-32 decoder with no dependencies |
 | `exav-pe-emu` | Running a packer stub in a sandbox |
+| `exav-imagehash` | Perceptual image hashes: ClamAV's `fuzzy_img`, imagehash's `phash`, or your own parameters |
 | `exav-update` | Fetching signature databases |
 | `exav-unpack-wasm` | Extraction from JavaScript: an npm package, not a Rust dependency |
 | `exav` | Nothing: it is the binary, not a library |

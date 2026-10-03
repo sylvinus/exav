@@ -1242,7 +1242,7 @@ impl Prescan {
     /// Bytes each window must run into the next, so that what it looks for is
     /// seen whole across the seam: the longest marker, and a self-extractor's
     /// archive magic with the header check after it.
-    pub const OVERLAP: usize = 16;
+    pub const OVERLAP: usize = 32;
 
     /// Whether [`detect_prescanned`] can ask for the search on an object of
     /// `len` bytes: not when the start it reads anyway is all of it.
@@ -1835,6 +1835,12 @@ mod detect_source_tests {
         }
     }
 
+    #[cfg(all(
+        feature = "screnc",
+        feature = "autoit",
+        feature = "nsis",
+        feature = "sfx"
+    ))]
     fn prescanned(data: &[u8], window: usize) -> Searched {
         let mut pre = Prescan::new(data);
         let mut at = 0;

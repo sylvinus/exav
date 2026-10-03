@@ -7,7 +7,10 @@
 //!   compress (upstream issue #13, unfixed in any release);
 //! * the `rustc_1_37` code paths are taken unconditionally, the `nightly`
 //!   ones dropped, and lints brought up to this crate's settings;
-//! * paths and visibility adapted to a module of this crate.
+//! * paths and visibility adapted to a module of this crate;
+//! * a mode for NSIS's bzip2, which has no stream header, marks a block and
+//!   the end of the stream with one byte each, and has no checksums or
+//!   randomised bit (`DecoderReader::new_nsis`).
 
 pub(crate) use self::decoder::DecoderReader;
 

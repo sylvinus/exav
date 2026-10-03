@@ -20,6 +20,8 @@ column is for [library users](/guides/library-usage/) (`Limits` in exav-unpack,
 | `--max-input-bytes` | `ScanOptions::max_scan_size` | no limit | A top-level input too big to take whole (its first bytes still get the whole scan) |
 | `--max-object-bytes` | `Limits::max_buffer_bytes` and `ScanOptions::deep_analysis_max` | 256 MiB | The largest single object held in memory; a larger file or member is read through a block cache or a temporary file |
 | `--max-matcher-bytes` | `Limits::max_scanned_bytes` | 10 GiB | Cumulative bytes fed to the matcher |
+| `--max-pcre-bytes` | `ScanOptions::max_pcre_bytes` | no limit (100 MiB under `--clamav-compat`) | PCRE subsignatures on an object larger than this, which then do not match |
+| `--min-scan-bytes` | `ScanOptions::min_scan_bytes` | 6 bytes | Every check on an object smaller than this, which then counts as clean; `0` scans every object |
 | `--max-pe-emulation-steps` | `Limits::max_pe_emulation_steps` | 1,000,000,000 | Emulator instructions across all packed executables in one file |
 | `--max-unpack-depth` | `Limits::max_recursion` | 16 | Nesting depth, containers inside containers |
 | `--max-members` | `Limits::max_members` | 100000 | Member-count blowup |
@@ -32,9 +34,14 @@ See [the flag matrix](/reference/clamav-flag-matrix/).
 
 The total a scan may hold has no flag of its own, and no flag raises it. It is
 1 GiB (400M under `--clamav-compat`), and `--max-process-bytes` can only lower
-it, together with `--max-object-bytes`, to half the memory a scan gets (see
-[the kernel backstops](#the-kernel-backstops)). `--max-extracted-bytes`, which
-set it before 0.0.2, is refused.
+it, together with `--max-object-bytes`, to what fits the memory a scan gets (see
+[the kernel backstops](#the-kernel-backstops)): beside an object held whole, an
+image decoded from it and its grey copy can take as much again twice, so one
+object is kept to a quarter of that memory, and the total to what leaves room
+for those plus a tenth. Matching makes no other copy of an object but a
+lowercase one of at most 16 MiB. The
+default 2 G changes neither the default limits nor `--clamav-compat`'s.
+`--max-extracted-bytes`, which set it before 0.0.2, is refused.
 
 `--clamav-compat` sets `--max-input-bytes` to 100M, `--max-unpack-depth` to 17
 and `--max-members` to 10000, and holds 400M per file, both in total and as the
@@ -56,7 +63,8 @@ largest top-level file held whole: ClamAV's scan size.
   `--spill-threshold-bytes 0` spills every stream at once and has no `off`
   (`--spill-dir off` keeps streams in RAM); `--icap-preview-bytes 0` previews
   headers only and `off` leaves the header out; `--icap-options-ttl-secs 0`
-  expires at once and `off` never does.
+  expires at once and `off` never does. `--min-scan-bytes 0` scans every
+  object and has no `off`.
 - A threshold of findings (`--dlp-credit-cards`, `--dlp-ssns`) refuses `0`,
   which would alert on every file; leave the flag out instead.
 - `--workers` refuses `0`; the in-process model is `--workers threads`.
@@ -110,10 +118,10 @@ ICAP scans get no `--max-scan-secs` in any mode. Under the pool the ICAP
 listener runs in a child of its own with no `RLIMIT_AS` either; the in-core
 budgets, fitted to `--max-process-bytes`, are what bound its scans.
 
-Setting `--max-process-bytes` also keeps what a scan holds to half of it: the
-1 GiB extraction total and `--max-object-bytes` are lowered when they are larger.
-The other half is the matcher's working set, such as the lowercase copy of a
-buffer a case-insensitive signature is checked in. The in-core cap then fires first and reports a limit
+Setting `--max-process-bytes` also keeps what a scan holds inside it:
+`--max-object-bytes` is lowered to a quarter of it, and the 1 GiB extraction
+total to what leaves room for an image decoded from the largest object and its
+grey copy (twice its size) plus a tenth. The in-core cap then fires first and reports a limit
 instead of the kernel killing the scan. In the pool, the per-worker figure is
 also lowered to what the host can back: RAM, less a third for the rest of the
 system, less the shared database, divided by `--workers`. A daemon job stopped

@@ -333,12 +333,13 @@ fn orphan_unsupported_codec_is_reported_not_dropped() {
 }
 
 #[test]
-fn orphan_member_with_a_nonsense_method_is_reported_not_dropped() {
+fn orphan_member_with_a_nonsense_method_is_read_as_stored() {
     // Method 47506 is in no version of APPNOTE. Live APK packers stamp exactly
     // this on `AndroidManifest.xml` — together with a corrupt central directory,
     // so the member is reachable only through the orphan scan. Gating that scan on
     // a recognised method drops the one member the packer went to the trouble of
-    // hiding, and the archive then scans clean.
+    // hiding, and the archive then scans clean. Android reads such a member as
+    // stored, and so does exav.
     let e = orphan_entries(&lfh(
         "AndroidManifest.xml",
         47506,
@@ -350,10 +351,8 @@ fn orphan_member_with_a_nonsense_method_is_reported_not_dropped() {
         .iter()
         .find(|x| x.name == "AndroidManifest.xml")
         .expect("a member with an unrecognised method must still be reported");
-    assert!(
-        m.unsupported.is_some(),
-        "an undecodable method must surface, not vanish"
-    );
+    assert_eq!(m.unsupported, None);
+    assert_eq!(m.data, b"\x03\x00\x08\x00payload");
 }
 
 #[test]

@@ -107,10 +107,22 @@ mod ppmd7;
 pub(crate) mod qcow2;
 #[cfg(feature = "rar")]
 mod rar;
+#[cfg(all(feature = "rar", feature = "decrypt"))]
+mod rar3_crypt;
 #[cfg(feature = "rar")]
 mod rar3_unpack;
+#[cfg(all(feature = "rar", feature = "decrypt"))]
+mod rar5_crypt;
 #[cfg(feature = "rar")]
 mod rar5_unpack;
+
+/// Passwords tried on an encrypted archive member after the caller's: the
+/// conventions of malware distribution. A password-protected dropper is a
+/// classic scanner-evasion trick, so opening these with no configuration
+/// matters, as `VelvetSweatshop` does for Office.
+#[cfg(feature = "decrypt")]
+pub(crate) const DEFAULT_ARCHIVE_PASSWORDS: &[&str] =
+    &["infected", "virus", "malware", "password", "123456"];
 // Every container exav recognises but does not open reports through here.
 pub(crate) mod reported;
 #[cfg(feature = "sevenz")]

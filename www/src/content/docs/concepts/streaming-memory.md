@@ -112,7 +112,8 @@ A few things need the file whole and are not done past the limit:
 - the structure of a PE: entry-point and section offsets, section hashes,
   imports, icons, the Authenticode signature, UPX and packer unpacking;
 - YARA's `pe`, `elf` and `dotnet` modules;
-- a PCRE subsignature with a backreference, and the `fuzzy_img` image hash;
+- a PCRE subsignature with a lookaround or a backreference, and the
+  `fuzzy_img` image hash;
 - containers whose format is read whole (7z, RAR, OLE, PDF, the virtual-disk and
   filesystem images and others; see
   [Supported formats](/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)).

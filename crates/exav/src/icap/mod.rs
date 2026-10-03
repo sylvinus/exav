@@ -106,7 +106,9 @@ mod wire;
 pub(crate) use self::config::{IcapConfig, InfectionHeader};
 pub(crate) use self::server::Server;
 
-use self::server::{FixedDb, Signatures};
+#[cfg(unix)]
+use self::server::FixedDb;
+use self::server::Signatures;
 use crate::daemon::SharedDb;
 
 /// Version string reported in the `Service` and `Server` headers.

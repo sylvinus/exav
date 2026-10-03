@@ -85,6 +85,10 @@ mod protectors;
 #[cfg(feature = "rar")]
 mod rar3_ppmd;
 #[cfg(feature = "rar")]
+mod rar4_compat;
+#[cfg(all(feature = "rar", feature = "decrypt"))]
+mod rar5_encryption;
+#[cfg(feature = "rar")]
 mod rar_solid;
 #[cfg(feature = "sevenz")]
 mod sevenz_bcj2;
@@ -103,6 +107,8 @@ mod vhd;
 mod wim;
 #[cfg(feature = "xz")]
 mod xz_dict;
+#[cfg(feature = "zip")]
+mod zip_appended;
 #[cfg(feature = "zip")]
 mod zip_codecs;
 #[cfg(feature = "zip")]

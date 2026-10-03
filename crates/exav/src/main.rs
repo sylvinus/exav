@@ -632,10 +632,12 @@ struct Cli {
 
     /// The memory one scan may use: an address-space cap (RLIMIT_AS) on each
     /// worker in the prefork pool, on the whole process otherwise. Unix only.
-    /// What a scan holds is kept to half of it (the rest is the matcher's
-    /// working set), lowering the default 1G extraction budget and
-    /// --max-object-bytes when they are larger, so a scan reports
-    /// LIMITS-EXCEEDED instead of being killed. K/M/G/T suffixes; `off` or `0`
+    /// One object held whole is kept to a quarter of it (an image decoded
+    /// from it and its grey copy may take as much again twice), and what a
+    /// scan holds in all to what leaves room for those and a tenth to spare,
+    /// lowering --max-object-bytes and the default 1G extraction budget when
+    /// they are larger, so a scan reports LIMITS-EXCEEDED instead of being
+    /// killed. K/M/G/T suffixes; `off` or `0`
     /// means no cap. [default in the pool: 2G, lowered to what the host's RAM
     /// can back; unset otherwise]
     #[arg(
@@ -768,6 +770,30 @@ struct Cli {
         value_parser = parse_size
     )]
     max_scanned_bytes: Option<u64>,
+
+    /// The largest object PCRE subsignatures run on: on a larger one they do
+    /// not match, as with ClamAV's PCREMaxFileSize. A CPU bound: an object
+    /// is matched without being copied. K/M/G/T suffixes; `off` or `0` means
+    /// no limit. [default: off, 100M under --clamav-compat] [clamscan:
+    /// --pcre-max-filesize]
+    #[arg(
+        long = "max-pcre-bytes",
+        env = "EXAV_MAX_PCRE_BYTES",
+        value_name = "SIZE|off",
+        value_parser = parse_size
+    )]
+    max_pcre_bytes: Option<u64>,
+
+    /// The smallest object scanned: a smaller file or member is neither
+    /// matched nor unpacked and counts as clean, as ClamAV scans no object
+    /// under 6 bytes. `0` scans every object. [default: 6]
+    #[arg(
+        long = "min-scan-bytes",
+        env = "EXAV_MIN_SCAN_BYTES",
+        value_name = "SIZE",
+        value_parser = parse_size_not_off
+    )]
+    min_scan_bytes: Option<u64>,
 
     /// Most x86 instructions the PE unpacking emulator may run across one
     /// top-level file, summed over every packed executable it contains. A scan
@@ -946,6 +972,10 @@ struct Cli {
     /// said twice: OK 0, FOUND 1, ERROR 2, PARTIAL 3.
     ///
     /// Categories: limits-exceeded, unscannable, password-protected.
+    ///
+    /// password-protected is content exav could not decrypt. Its `found`
+    /// reports any encryption as Heuristics.Encrypted.*, decrypted or not, as
+    /// ClamAV's --alert-encrypted does; a detection in decrypted content wins.
     ///
     /// On the clamd wire `partial` and `error` are both an `ERROR` reply: that
     /// protocol's vocabulary is closed, and a real client reads a word it does
@@ -1432,6 +1462,9 @@ fn clamscan_flag_hint(args: &[String]) -> Option<String> {
             "--max-scansize" => {
                 "use --max-matcher-bytes, the most bytes scanned for one top-level file"
             }
+            "--pcre-max-filesize" => {
+                "use --max-pcre-bytes, the largest object PCRE subsignatures run on"
+            }
             // Conditions ClamAV reports as detections, which exav reports as
             // PARTIAL unless asked otherwise.
             "--alert-encrypted" | "--alert-encrypted-archive" | "--alert-encrypted-doc" => {
@@ -1801,6 +1834,12 @@ fn main() -> ExitCode {
         }
     }
 
+    // Before the load, so a source rewritten during it still reads as changed.
+    let watch = if serves {
+        reload_watch_dir(&cli).map(daemon::Watch::new)
+    } else {
+        None
+    };
     let db = match load_db(&cli) {
         Ok(db) => db,
         Err(e) => {
@@ -1832,7 +1871,7 @@ fn main() -> ExitCode {
     }
 
     if serves {
-        return run_listeners(&cli, db, pool_workers);
+        return run_listeners(&cli, db, pool_workers, watch);
     }
 
     if let Some(out) = &cli.build_db {
@@ -1854,6 +1893,7 @@ fn main() -> ExitCode {
         };
     }
 
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut opts = build_scan_options(&cli);
     // Keep the three layers in their intended order outside the pool too: the
     // in-core budget decides first and produces a verdict, and the kernel cap
@@ -1980,7 +2020,13 @@ fn reload_watch_dir(cli: &Cli) -> Option<PathBuf> {
 /// binds both listeners, forks the scan workers, and forks one more child for
 /// ICAP. Every child shares the warmed database copy-on-write, and a reload
 /// re-forks all of them from the new one.
-fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
+fn run_listeners(
+    cli: &Cli,
+    db: Scanner,
+    pool_workers: usize,
+    watch: Option<daemon::Watch>,
+) -> ExitCode {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut opts = build_scan_options(cli);
     // The pool does this per worker (`run_prefork`). Everywhere else it happens
     // here: the in-core extraction budget has to fit inside the address space
@@ -1994,15 +2040,14 @@ fn run_listeners(cli: &Cli, db: Scanner, pool_workers: usize) -> ExitCode {
     }
     let opts = opts;
 
-    // Watch the path the database came from so a sidecar rewriting it triggers a
-    // reload without an explicit `RELOAD`. Guard the reload itself: if the
-    // source was emptied or clobbered out from under us, refuse the swap and
+    // `watch` is the path the database came from, so a sidecar rewriting it
+    // triggers a reload without an explicit `RELOAD`. Guard the reload itself: if
+    // the source was emptied or clobbered out from under us, refuse the swap and
     // keep serving the current database rather than silently downgrading to the
     // near-zero-coverage baseline.
-    let watch = reload_watch_dir(cli);
     let reload_source = watch
         .as_ref()
-        .map(|p| format!("reloaded signature source {}", p.display()))
+        .map(|w| format!("reloaded signature source {}", w.path.display()))
         .unwrap_or_else(|| "reloaded signature source".to_string());
     let allow_no_db = cli.allow_no_db;
     let reload = || load_db(cli).and_then(|db| guard_not_empty(db, &reload_source, allow_no_db));
@@ -2226,6 +2271,16 @@ fn build_scan_options(cli: &Cli) -> ScanOptions {
     // --max-object-bytes) at the cost of scan time only.
     if let Some(s) = cli.max_scanned_bytes.map(no_limit_at_zero) {
         opts.limits.max_scanned_bytes = s;
+    }
+    // --max-pcre-bytes: no limit by default; under compat, the 100M of
+    // ClamAV's PCREMaxFileSize.
+    opts.max_pcre_bytes = match cli.max_pcre_bytes {
+        Some(0) => None,
+        Some(v) => Some(v),
+        None => compat.then_some(100 * MIB),
+    };
+    if let Some(n) = cli.min_scan_bytes {
+        opts.min_scan_bytes = n;
     }
     if let Some(n) = cli.max_pe_emulation_steps.map(no_limit_at_zero) {
         opts.limits.max_pe_emulation_steps = n;
@@ -5183,7 +5238,6 @@ mod tests {
             &["--max-rechwp3", "5"],
             &["--pcre-match-limit", "5"],
             &["--pcre-recmatch-limit", "5"],
-            &["--pcre-max-filesize", "1M"],
             &["--disable-cache"],
             // clamdscan's client-side flags.
             &["--config-file", "clamd.conf"],
@@ -5209,6 +5263,7 @@ mod tests {
     /// An address with no `?mode=` gets the documented default, and it is the
     /// one the daemon actually binds with: owner-only, so a socket left
     /// unqualified is never reachable by another local user.
+    #[cfg(unix)]
     #[test]
     fn an_unqualified_socket_is_owner_only() {
         assert_eq!(daemon::DEFAULT_SOCKET_MODE, 0o600);

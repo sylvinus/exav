@@ -64,6 +64,17 @@ impl Decoder {
         }
     }
 
+    /// A [`Decoder`] for NSIS's bzip2: no stream header, the 900 KiB block
+    /// size NSIS always uses, and one-byte block markers with no checksums.
+    pub fn new_nsis() -> Self {
+        let header = Header::from_raw_blocksize(9).expect("blocksize is valid");
+        let block = Block::new(header.clone(), true);
+        Self {
+            header_block: Some((header, block)),
+            ..Self::new()
+        }
+    }
+
     fn space(&self) -> usize {
         match &self.header_block {
             Some((_, block)) if block.is_reading() => 0,
@@ -110,7 +121,7 @@ impl Decoder {
                 }
 
                 let header = Header::parse(self.in_buf[..4].try_into().unwrap())?;
-                let block = Block::new(header.clone());
+                let block = Block::new(header.clone(), false);
                 self.header_block = Some((header, block));
 
                 self.skip_bits = 4 * 8;

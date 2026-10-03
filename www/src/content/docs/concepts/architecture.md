@@ -89,12 +89,13 @@ exav is a small Cargo workspace, not one binary. Two front ends drive the
 engine, `exav-core`: the CLI (which is also the daemon) and the WASI build. Two
 more use only the extractor, `exav-unpack`: the archive grep, and the
 WebAssembly bindings published to npm (built outside the workspace, with their
-own profile). `exav-update`, enabled by the `http-update` feature (part of
-`http`), sits to the side,
-feeding fresh signatures out of band.
+own profile). `exav-core` hashes images through `exav-imagehash`, beside it
+(the `image-hash` feature). `exav-update`, enabled by the `http-update`
+feature (part of `http`), sits to the side, feeding fresh signatures out of
+band.
 
-Every arrow points down. Nothing below calls anything above it, which is what
-lets the extraction crates be taken on their own.
+Every arrow points down or across. Nothing calls anything above it, which is
+what lets the extraction and hashing crates be taken on their own.
 
 <svg viewBox="0 0 790 620" role="img" aria-labelledby="craten crated" style="width:100%;height:auto;max-width:790px">
   <title id="craten">exav crate dependency graph</title>
@@ -103,8 +104,9 @@ lets the extraction crates be taken on their own.
   depend on exav-core; exav-core, exav-grep and exav-unpack-wasm all depend on
   exav-unpack, which depends on exav-pe-emu, which depends on exav-x86.
   exav-core also depends on exav-x86 directly, for the bytecode disassembly
-  API. exav-update, optional behind the http-update feature, hangs off exav alone and
-  feeds signature files out of band.</desc>
+  API, and on exav-imagehash, for the fuzzy_img image hash. exav-update,
+  optional behind the http-update feature, hangs off exav alone and feeds
+  signature files out of band.</desc>
   <defs>
     <marker id="crate-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0 0 L8 4 L0 8 z" fill="currentColor"/>
@@ -121,6 +123,7 @@ lets the extraction crates be taken on their own.
     <rect x="295" y="450" width="200" height="62" rx="6"/>
     <rect x="295" y="550" width="200" height="62" rx="6"/>
     <rect x="4" y="550" width="185" height="62" rx="6"/>
+    <rect x="520" y="170" width="160" height="80" rx="6"/>
   </g>
   <g fill="currentColor" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="600" text-anchor="middle">
     <text x="96" y="48">exav</text>
@@ -132,6 +135,7 @@ lets the extraction crates be taken on their own.
     <text x="395" y="474">exav-pe-emu</text>
     <text x="395" y="574">exav-x86</text>
     <text x="96" y="574">exav-update</text>
+    <text x="600" y="196">exav-imagehash</text>
   </g>
   <g fill="currentColor" font-family="system-ui, sans-serif" font-size="11.5" opacity="0.72" text-anchor="middle">
     <text x="96" y="66">clamscan + clamd</text>
@@ -149,6 +153,8 @@ lets the extraction crates be taken on their own.
     <text x="395" y="494">x86-32 sandbox</text>
     <text x="395" y="594">decoder</text>
     <text x="96" y="594">optional: http-update feature</text>
+    <text x="600" y="216">fuzzy_img hash</text>
+    <text x="600" y="234">image decoders</text>
     <text x="126" y="292" text-anchor="start">bytecode disasm</text>
     <text x="510" y="468" text-anchor="start">runs a packer's own stub to</text>
     <text x="510" y="484" text-anchor="start">recover the image it rebuilds</text>
@@ -165,6 +171,7 @@ lets the extraction crates be taken on their own.
     <path d="M395 512 V546"/>
     <path d="M96 94 V546"/>
     <path d="M200 240 H120 V530 H250 V581 H291"/>
+    <path d="M390 210 H516"/>
   </g>
 </svg>
 
@@ -190,7 +197,7 @@ than one matcher:
 | Source | Runtime structure | Matching |
 |---|---|---|
 | `.ndb` / `.db` bodies + `.ldb` body subsignatures | an **index of literal anchors**, one per body, each tagged with its (target type, case) partition; a body pinned near a fixed offset is kept out of it | the index is looked up at each position of the object, and a hit fans out to every body sharing that anchor; each candidate is then verified (wildcards / gaps / nibbles / alternation / offset / nocase). A pinned body is checked where it can start |
-| `.ldb` PCRE subsignatures | regexes compiled lazily, gated by the trigger expression | linear-time `regex`; patterns with lookaround or backreferences use a backtracking engine under a step bound |
+| `.ldb` PCRE subsignatures | regexes compiled lazily, gated by the trigger expression | linear-time `regex`; patterns with lookaround, backreferences or atomic groups use a backtracking engine under a step bound |
 | `.hsb` / `.hdb` | a size-keyed hash table | whole-file digest lookup |
 | `.mdb` / `.msb` | a section-hash table | per-PE-section digest lookup |
 | `.cdb` | container-metadata matchers | matched on archive members (name/size/encryption/position) |
@@ -291,11 +298,11 @@ in the object.
 Verification never backtracks: a body is a sequence of elements, and the
 positions it can have reached after each one are kept as a set of intervals, so
 a `{10-}` gap widens an interval instead of multiplying attempts. Backtracking
-is left to PCRE subsignatures with lookaround or backreferences, which are not
-regular and so cannot run on the linear engine: they run on a backtracking
-engine under a step bound. For lookaround, a linear prefilter (the pattern with
-its lookarounds removed, which matches at least as much) rules most objects out
-first.
+is left to PCRE subsignatures with lookaround, backreferences or atomic groups
+(`\R` and possessive quantifiers among them), which the linear engine cannot
+run: they run on a backtracking engine under a step bound. For lookaround, a
+linear prefilter (the pattern with its lookarounds removed, which matches at
+least as much) rules most objects out first.
 
 ### How far a check reads around a hit
 
@@ -363,8 +370,7 @@ ends and backward from there to find where it starts. A PCRE with lookaround
 runs its lookaround-free superset that way: when that finds nothing, the PCRE
 cannot match either; when it finds something, the scan is `LIMITS-EXCEEDED`
 unless something else is found. The same holds for a PCRE with a backreference
-whose trigger holds, and when a lazy DFA meets a construct it cannot follow (a
-Unicode word boundary next to a non-ASCII byte).
+or an atomic group whose trigger holds.
 
 ## Memory and spill files
 

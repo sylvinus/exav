@@ -165,7 +165,7 @@ examine.
 |---|---|---|---|---|
 | `--alert-broken[=yes/no]` | Alert on broken PE/ELF | `--detect broken` | renamed | Both cover Mach-O too, although clamscan's help says PE and ELF. |
 | `--alert-broken-media[=yes/no]` | Alert on broken JPEG/TIFF/PNG/GIF | `--detect broken-media` | renamed | |
-| `--alert-encrypted[=yes/no]` | Alert on encrypted archives and documents | `--partial-as password-protected=found` | renamed | exav reports an encrypted member as `PASSWORD-PROTECTED` **by default** (ClamAV returns a clean `OK`). `found` converts that verdict into a `Heuristics.Encrypted.*` detection. |
+| `--alert-encrypted[=yes/no]` | Alert on encrypted archives and documents | `--partial-as password-protected=found` | renamed | exav reports an encrypted member it cannot decrypt as `PASSWORD-PROTECTED` **by default** (ClamAV returns a clean `OK`). `found` reports any encryption as a `Heuristics.Encrypted.*` detection, decrypted or not, as ClamAV does. |
 | `--alert-encrypted-archive[=yes/no]` | Alert on encrypted archives only | `--partial-as password-protected=found` | renamed | The one policy covers archives and documents together. |
 | `--alert-encrypted-doc[=yes/no]` | Alert on encrypted documents only | `--partial-as password-protected=found` | renamed | Same. |
 | `--alert-macros[=yes/no]` | Alert on VBA macros in OLE2 | `--detect macros` | renamed | exav also raises it for XLM and OOXML. |
@@ -196,7 +196,7 @@ examine.
 | `--max-rechwp3=#n` | Max HWP3 parse recursion | none | absent | Same. |
 | `--pcre-match-limit=#n` | Max PCRE match calls | none | absent | exav's PCRE path has a bounded backtrack budget that is not operator-tunable. |
 | `--pcre-recmatch-limit=#n` | Max recursive PCRE match calls | none | absent | Same. |
-| `--pcre-max-filesize=#n` | Max file size for PCRE subsignatures | none | absent | Same. |
+| `--pcre-max-filesize=#n` | Max file size for PCRE subsignatures | `--max-pcre-bytes` | renamed | Per object, as in ClamAV: a member under the limit is matched inside a larger archive. exav's default is no limit, since an object is matched without being copied; `--clamav-compat` makes it ClamAV's 100M. |
 | `--disable-cache` | Disable the clean-file hash cache | none | absent | exav has no scan cache, so there is nothing to disable. |
 
 ## `clamd`
@@ -288,7 +288,8 @@ gives the flag or environment variable that does the same job, or "none".
 | `MaxScanTime` | Max scan time | `--max-scan-secs`, `--max-pe-emulation-steps` | `--max-scan-secs` is kernel-enforced per job (seconds, Unix), not an in-engine check, and only in the clamd worker pool: ICAP scans have no time bound. The in-engine CPU bounds are `--max-matcher-bytes` and `--max-pe-emulation-steps`; the latter reports as `Heuristics.Limits.Exceeded.MaxScanTime`. |
 | `MaxDirectoryRecursion` | Max directory depth | none | |
 | `MaxEmbeddedPE`, `MaxHTMLNormalize`, `MaxHTMLNoTags`, `MaxScriptNormalize`, `MaxZipTypeRcg`, `MaxPartitions`, `MaxIconsPE`, `MaxRecHWP3` | Per-subsystem caps | none | exav applies its global budgets instead. |
-| `PCREMatchLimit`, `PCRERecMatchLimit`, `PCREMaxFileSize` | PCRE bounds | none | Bounded internally, not tunable. |
+| `PCREMaxFileSize` | Max object size for PCRE subsignatures | `--max-pcre-bytes` | |
+| `PCREMatchLimit`, `PCRERecMatchLimit` | PCRE backtracking bounds | none | Bounded internally, not tunable. |
 | `StreamMaxLength` | Max `INSTREAM` upload | `--max-input-bytes`, `--max-spill-bytes` | clamd defaults to 100M and refuses more; exav has **no default scan limit** on a stream. `--max-spill-bytes` (2G) bounds the temp space one streamed object may occupy, which is the closest thing to a per-upload ceiling. Set `--max-input-bytes` if a client relied on the daemon to bound its uploads. |
 | `StreamMinPort` / `StreamMaxPort` | Legacy `STREAM` port range | none | The `STREAM` command is removed from ClamAV too. |
 | `CacheSize` / `DisableCache` | Clean-file hash cache | none | exav has no scan cache. |
@@ -303,7 +304,7 @@ gives the flag or environment variable that does the same job, or "none".
 | `HeuristicAlerts`, `HeuristicScanPrecedence` | Heuristic policy | none | |
 | `AlertBrokenExecutables` | Alert on broken PE/ELF | `--detect broken` | |
 | `AlertBrokenMedia` | Alert on broken graphics | `--detect broken-media` | |
-| `AlertEncrypted` | Alert on encrypted content | `--partial-as password-protected=found` | exav reports encrypted members as `PASSWORD-PROTECTED` without it. |
+| `AlertEncrypted` | Alert on encrypted content | `--partial-as password-protected=found` | Any encryption, decrypted or not. Without it, exav reports members it cannot decrypt as `PASSWORD-PROTECTED`. |
 | `AlertEncryptedArchive` / `AlertEncryptedDoc` | Split encrypted alerts | `--partial-as password-protected=found` | One policy covers both. |
 | `AlertOLE2Macros` | Alert on VBA macros | `--detect macros` | |
 | `AlertExceedsMax` | Alert on a limit stop | `--partial-as limits-exceeded=found` | exav reports `LIMITS-EXCEEDED` without it. |

@@ -9,6 +9,30 @@ use md5::{Digest, Md5};
 use crate::byte_source::ByteSource;
 use crate::hexsig::encode_hex;
 
+/// A PE's headers and section table, read without its data directories.
+///
+/// What signatures, section hashes, icons and bytecode read, and bounded: the
+/// section headers must fit in the file. A full parse also walks imports,
+/// exports, resources and the certificate table, and refuses the whole file
+/// over one malformed entry in any of them (a certificate table sized past
+/// the end of the file, say); its permissive mode instead keeps going through
+/// them, and a malformed import table took it to gigabytes.
+pub(crate) struct Headers<'a> {
+    pub header: goblin::pe::header::Header<'a>,
+    pub sections: Vec<goblin::pe::section_table::SectionTable>,
+}
+
+/// [`Headers`] of `data`, `None` if they do not parse.
+pub(crate) fn headers(data: &[u8]) -> Option<Headers<'_>> {
+    use goblin::pe::header::{Header, SIZEOF_COFF_HEADER, SIZEOF_PE_MAGIC};
+    let header = Header::parse(data).ok()?;
+    let mut at = (header.dos_header.pe_pointer as usize)
+        .checked_add(SIZEOF_PE_MAGIC + SIZEOF_COFF_HEADER)?
+        .checked_add(usize::from(header.coff_header.size_of_optional_header))?;
+    let sections = header.coff_header.sections(data, &mut at).ok()?;
+    Some(Headers { header, sections })
+}
+
 /// Structural facts extracted from a PE file.
 pub struct PeInfo {
     pub is_64: bool,
@@ -488,10 +512,13 @@ fn macho_broken(src: &dyn ByteSource) -> bool {
 
 /// Extract [`PeLayout`] from a PE. `None` if `data` is not a parseable PE.
 pub fn layout(data: &[u8]) -> Option<PeLayout> {
-    let pe = PE::parse(data).ok()?;
+    let pe = headers(data)?;
     let mut section_rawptrs = Vec::with_capacity(pe.sections.len());
     let mut section_rawsizes = Vec::with_capacity(pe.sections.len());
-    let entry_rva = pe.entry as u64;
+    let entry_rva = pe
+        .header
+        .optional_header
+        .map_or(0, |o| u64::from(o.standard_fields.address_of_entry_point));
     let mut entry = None;
     for s in &pe.sections {
         let va = s.virtual_address as u64;
@@ -568,7 +595,7 @@ impl BcPe {
 
 /// Extract [`BcPe`] from a PE image. `None` if `data` is not a parseable PE.
 pub fn bytecode_pe(data: &[u8]) -> Option<BcPe> {
-    let pe = PE::parse(data).ok()?;
+    let pe = headers(data)?;
     let hdr_size = pe
         .header
         .optional_header
@@ -590,13 +617,13 @@ pub fn bytecode_pe(data: &[u8]) -> Option<BcPe> {
         hdr_size,
         pedata: Vec::new(),
     };
-    bc.pedata = build_pedata(&pe, &bc, data.len());
+    bc.pedata = build_pedata(&pe.header, &bc, data.len());
     Some(bc)
 }
 
 /// Build the `cli_pe_hook_data` byte image the way the bytecode compiler lays
 /// it out (offsets verified against the field accesses real programs make).
-fn build_pedata(pe: &PE, bc: &BcPe, file_size: usize) -> Vec<u8> {
+fn build_pedata(header: &goblin::pe::header::Header, bc: &BcPe, file_size: usize) -> Vec<u8> {
     let mut b = vec![0u8; PEDATA_SIZE];
     let put16 =
         |b: &mut [u8], off: usize, v: u16| b[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -605,8 +632,8 @@ fn build_pedata(pe: &PE, bc: &BcPe, file_size: usize) -> Vec<u8> {
     let put64 =
         |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 
-    let coff = &pe.header.coff_header;
-    let e_lfanew = pe.header.dos_header.pe_pointer;
+    let coff = &header.coff_header;
+    let e_lfanew = header.dos_header.pe_pointer;
     put32(&mut b, 0, e_lfanew); // offset
     put16(&mut b, 8, coff.number_of_sections); // nsections
 
@@ -620,7 +647,7 @@ fn build_pedata(pe: &PE, bc: &BcPe, file_size: usize) -> Vec<u8> {
     put16(&mut b, 32, coff.size_of_optional_header);
     put16(&mut b, 34, coff.characteristics);
 
-    if let Some(oh) = pe.header.optional_header {
+    if let Some(oh) = header.optional_header {
         let s = &oh.standard_fields;
         let w = &oh.windows_fields;
         let ep = s.address_of_entry_point;
@@ -994,9 +1021,8 @@ pub(crate) fn embedded_archive_offsets_in(data: &dyn ByteSource) -> Vec<usize> {
 /// SHA can be skipped when no `.msb` signatures are loaded). Empty if `data`
 /// is not a parseable PE.
 pub fn section_slices(data: &[u8]) -> Vec<(u64, &[u8])> {
-    let pe = match PE::parse(data) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
+    let Some(pe) = headers(data) else {
+        return Vec::new();
     };
     let mut out = Vec::with_capacity(pe.sections.len());
     for s in &pe.sections {
@@ -1335,6 +1361,23 @@ mod tests {
             assert_eq!((rd32(base + 64), rd32(base + 68)), (0x1004, 4));
             assert_eq!((rd32(base + 120), rd32(base + 124)), (0x1008, 8));
         }
+    }
+
+    /// From a live DLL in an MSI: a certificate table sized past the end of the
+    /// file fails goblin's full parse. Its bytecode PE data was missing, so
+    /// every bytecode program reading it left the scan `LIMITS-EXCEEDED`, and
+    /// its section hashes were never computed. None of them reads a directory.
+    #[test]
+    fn a_malformed_certificate_table_leaves_the_pe_readable() {
+        let body = b"abcdefgh";
+        let mut pe = minimal_pe(body);
+        let at = 0x58 + 112 + 4 * 8; // the certificate table's directory entry
+        pe[at..at + 4].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[at + 4..at + 8].copy_from_slice(&2_409_852_894u32.to_le_bytes());
+        assert!(PE::parse(&pe).is_err(), "the full parse refuses it");
+        assert_eq!(bytecode_pe(&pe).expect("parses").sections.len(), 1);
+        assert_eq!(section_slices(&pe), vec![(body.len() as u64, &body[..])]);
+        assert_eq!(layout(&pe).expect("parses").entry, Some(0x200));
     }
 
     /// Noise with embedded images and archive magics planted at `spots`, some

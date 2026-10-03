@@ -42,16 +42,21 @@ jobs:
   # The yara-x A/B differential harness. Deliberately NOT part of `make test`
   # (see the Makefile): a differential test can go red because the other engine
   # changed, so it is not a merge gate. It runs here anyway, unlike the clamav
-  # harness, only because it is self-contained: no signature database, no second
-  # engine to install. Its own job so the optional `yara-x` dependency (83 extra
-  # crates, 21 of them cranelift/wasmtime) never lands in the `test` job, and so
-  # it costs no wall clock.
+  # harness, only because it is self-contained: no signature database, just
+  # yara-x's `yr` binary. The tests skip when `yr` is missing, so it is installed
+  # and checked first; without it this job would pass having compared nothing.
   yara-diff:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install yr (yara-x CLI)
+        run: |
+          YR=v1.21.0
+          curl -sSL "https://github.com/VirusTotal/yara-x/releases/download/$YR/yara-x-$YR-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C /tmp
+          echo "/tmp" >> "$GITHUB_PATH"
+      - run: yr --version
       - run: make test-yara-diff
 
   wasm:

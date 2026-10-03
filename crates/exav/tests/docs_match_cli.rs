@@ -329,6 +329,7 @@ fn every_flag_named_in_a_message_exists() {
         "copy",
         "max-filesize",
         "max-scansize",
+        "pcre-max-filesize",
         "max-recursion",
         "max-files",
         "suppress-ok-results",

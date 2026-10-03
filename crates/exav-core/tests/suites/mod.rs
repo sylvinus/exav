@@ -45,6 +45,7 @@ mod salvage;
 mod size_caps;
 mod tar_size_terminator;
 mod target_flash;
+mod target_text;
 #[cfg(feature = "all-formats")]
 mod tdb_attributes;
 mod untyped_container_dispatch;

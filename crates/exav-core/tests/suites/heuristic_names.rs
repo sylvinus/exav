@@ -387,6 +387,8 @@ fn office_and_adobe_jpeg_marker_order_is_not_broken_media() {
     jpg.extend(seg(0xE2, b"ICC_PROFILE\0\x01\x01padding-padding"));
     jpg.extend(seg(0xE1, b"Exif\0\0MM\0\x2a\0\0\0\x08\0\0"));
     jpg.extend(seg(0xC0, &[0x08, 0, 16, 0, 16, 1, 1, 0x11, 0]));
+    jpg.extend(seg(0xDA, &[0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]));
+    jpg.extend_from_slice(&[0x00; 8]);
     jpg.extend_from_slice(&[0xFF, 0xD9]);
 
     let mut opts = ScanOptions::default();

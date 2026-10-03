@@ -31,6 +31,7 @@ usage: exav-pe-emu [options] FILE...
       --trace         print the Windows calls and the last instructions
       --ticks N       instruction budget per file (default 120000000)
   -h, --help          this
+  -V, --version       print the version
 
 Exit status: 0 if every input gave back an image, 1 if any did not, 2 on a
 usage or I/O error.";
@@ -57,6 +58,10 @@ fn parse_args() -> Result<Opts, String> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => return Err(String::new()),
+            "-V" | "--version" => {
+                println!("exav-pe-emu {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-o" | "--output" => o.output = Some(args.next().ok_or("-o needs a path")?.into()),
             "-d" | "--dir" => o.dir = Some(args.next().ok_or("-d needs a path")?.into()),
             "--report-only" => o.report_only = true,

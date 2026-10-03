@@ -23,7 +23,7 @@ name = "exav"
 path = "src/main.rs"
 
 [features]
-default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap"]
+default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap", "image-hash"]
 # ICAP (RFC 3507) server, so exav can stand in for a `c-icap` container at a
 # proxy's adaptation hook. On by default (pure Rust, std-only, no extra crates)
 # because the published image has to be able to serve it. It still binds
@@ -59,6 +59,9 @@ http-update = ["dep:exav-update"]
 dlp = ["exav-core/dlp"]
 # The phishing heuristic `--detect phishing` runs. Tiny, pure-Rust.
 phishing = ["exav-core/phishing"]
+# `fuzzy_img#` subsignatures, through exav-imagehash and its image decoders.
+# Without it they load as unsupported, and no image is ever decoded.
+image-hash = ["exav-core/image-hash"]
 decrypt = ["exav-core/decrypt"]
 
 # Archive/container formats, forwarded to exav-core, then exav-unpack. `all-formats`

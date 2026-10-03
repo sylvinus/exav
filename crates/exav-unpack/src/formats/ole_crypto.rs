@@ -1002,6 +1002,45 @@ mod tests {
         assert!(recovered.windows(eicar().len()).any(|w| w == eicar()));
     }
 
+    /// A workbook embedded in another, as Excel stores an inserted workbook
+    /// object, is decrypted too: only the first workbook stream was checked,
+    /// and a plain one at the top hid an encrypted one below it.
+    #[test]
+    fn an_embedded_encrypted_workbook_is_decrypted() {
+        use std::io::Write;
+        let salt = [0x5au8; 16];
+        let d = KeyDeriver::basic(&salt, "VelvetSweatshop");
+        let enc = verifier_pair(&d, &[0x24u8; 16]);
+        let mut fp = vec![1u8, 0, 1, 0, 1, 0];
+        fp.extend_from_slice(&salt);
+        fp.extend_from_slice(&enc[..32]);
+        let ct = encrypted_workbook(&d, &fp);
+
+        let mut cf = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+        let plain = [0x09, 0x08, 0, 0, 0x0a, 0x00, 0, 0];
+        cf.create_stream("/Workbook")
+            .unwrap()
+            .write_all(&plain)
+            .unwrap();
+        cf.create_storage("/MBD0001").unwrap();
+        cf.create_stream("/MBD0001/Workbook")
+            .unwrap()
+            .write_all(&ct)
+            .unwrap();
+        let blob = cf.into_inner().into_inner();
+        let entries = crate::formats::ole::extract_ole(
+            &blob,
+            &mut crate::Budget::new(crate::Limits::default()),
+        )
+        .unwrap();
+        let inner = entries
+            .iter()
+            .find(|e| e.name == "/MBD0001/Workbook")
+            .unwrap();
+        assert!(inner.encrypted && inner.unsupported.is_none());
+        assert!(inner.data.windows(eicar().len()).any(|w| w == eicar()));
+    }
+
     /// End-to-end (RC4-CryptoAPI, 128-bit): VelvetSweatshop default recovers EICAR.
     #[test]
     fn velvetsweatshop_cryptoapi_recovers_eicar() {

@@ -31,11 +31,11 @@
 mod rarity;
 mod sweep;
 
+#[cfg(feature = "yara")]
+pub(crate) use rarity::structural;
 #[cfg(test)]
 pub(crate) use rarity::FILTER_MIN_BODIES;
 pub(crate) use rarity::{anchor_score, GramStats};
-#[cfg(feature = "yara")]
-pub(crate) use rarity::structural;
 pub(crate) use sweep::sweep;
 #[cfg(test)]
 pub(crate) use sweep::{MIN_SKIP_RUN, NO_RUN_COLLAPSE, SWEEP_WINDOW};

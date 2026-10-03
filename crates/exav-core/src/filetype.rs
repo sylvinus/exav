@@ -191,7 +191,7 @@ pub enum FileType {
     Tnef,        // TNEF (winmail.dat) MS email attachment container
     Swf,         // SWF (Adobe Flash) movie (CWS/ZWS compressed)
     // Raster image. Never produced by content detection: `Target:5` signatures
-    // reach images through `fuzzy_img::looks_like_image` instead. This exists
+    // reach images through the engine's `looks_like_image` instead. This exists
     // only so a `HandlerType:CL_TYPE_GRAPHICS` signature has a type to re-type
     // *to*; giving it one costs nothing precisely because nothing else can
     // produce it.
@@ -209,9 +209,14 @@ pub enum FileType {
     AiModel,   // AI model (Python pickle / safetensors)
     Screnc,    // Microsoft Script Encoder (#@~^)
     Script,    // shell/script with a shebang
-    Html,      // HTML document (content-detected; for `Target:3` HTML signatures)
-    Text,      // ASCII/UTF-8 text (content-detected; for `Target:7` text signatures)
+    Html,      // HTML document (content-detected)
+    Text,      // ASCII/UTF-8 text (content-detected)
     Unknown,
+    // The normalised views of an object, which never type an object itself:
+    // the one HTML (`Target:3`) signatures match, and the one text
+    // (`Target:7`) signatures match.
+    HtmlView,
+    TextView,
 }
 
 impl FileType {
@@ -286,6 +291,8 @@ impl FileType {
             FileType::Html => "HTML",
             FileType::Text => "ASCII text",
             FileType::Unknown => "data",
+            FileType::HtmlView => "normalised HTML",
+            FileType::TextView => "normalised text",
         }
     }
 }

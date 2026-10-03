@@ -66,7 +66,7 @@ fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"]
 # dependency-free; the MFT walk itself is in-tree.
 lznt1 = { version = "0.1", optional = true }
 # ext2/3/4 reader. Read-only by construction, no `unsafe`, no dependencies.
-ext4-view = { version = "0.9", optional = true }
+ext4-view = { version = "1", optional = true }
 # LZW, for ZOO's LZD codec. Dependency-free.
 salzweg = { version = "0.1", optional = true }
 # InstallShield `.z` reader. Its only real dep is `explode` (MIT), a leaf
@@ -103,7 +103,7 @@ flate2 = { version = "1.1.9", optional = true }
 # on it directly so the raw-bytes path (orphan local headers, where we never go
 # through the `zip` crate's reader) decodes method 9 too.
 deflate64 = { version = "0.1.12", optional = true }
-lzma-rust2 = { version = "0.16.4", default-features = false, features = ["std", "lzip"], optional = true }
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "lzip"], optional = true }
 # PDF crypto primitives (replacing hand-rolled implementations)
 md-5 = { version = "0.11", optional = true }
 sha2 = { version = "0.11", optional = true }
@@ -184,7 +184,7 @@ autoit = []
 onenote = []
 rtf = []
 machofat = []
-sfx = []
+sfx = ["dep:crc32fast"]
 # PE runtime packers: detection plus the aPLib-family static unpack
 # (Petite/FSG2/NsPack). Pure Rust, parses only: nothing is executed.
 pepack = []

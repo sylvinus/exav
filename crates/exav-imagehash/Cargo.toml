@@ -1,0 +1,77 @@
+[package]
+name = "exav-imagehash"
+description = "Perceptual image hashes in safe Rust: ClamAV's fuzzy_img hash, equal to `sigtool --fuzzy-img`, and Python imagehash's phash, with every step a parameter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["image", "hash", "perceptual", "phash", "clamav"]
+categories = ["multimedia::images", "algorithms"]
+readme = "README.md"
+exclude = ["tests/fixtures/**"]
+
+# The vendored `tiff` decoder's doc examples are written for it as a crate of
+# its own: here their `use tiff::...` cannot resolve.
+[lib]
+doctest = false
+
+# The CLI ships with the library, as exav-unpack's does, so that
+# `cargo install exav-imagehash` gives the command. It needs nothing the
+# library does not.
+[[bin]]
+name = "exav-imagehash"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+# The decoders are at the versions libclamav 1.5.4 links, so that ClamAV's
+# hash is reproduced bit for bit: the hash is the signature. JPEG and TIFF are
+# not `image` features: they go through `src/image_codecs/`, `image`'s own
+# decoders over zune-jpeg built without its SIMD code (its only `unsafe`),
+# which `image` and `tiff` cannot turn off. Pinned with `=` for
+# `cargo install`, which resolves without Cargo.lock.
+image = { version = "=0.25.9", default-features = false, features = ["png", "gif", "bmp"] }
+png = "=0.18.0"
+gif = "=0.14.1"
+zune-jpeg = { version = "=0.5.8", default-features = false, features = ["std"] }
+zune-core = "=0.5.0"
+zune-core-04 = { package = "zune-core", version = "=0.4.12" }
+# The vendored `tiff` decoder's dependencies, as tiff 0.10.3 has them, and
+# `bytemuck` for its byte casts.
+zune-jpeg-04 = { package = "zune-jpeg", version = "=0.4.21", default-features = false, features = ["std"] }
+fax34 = { package = "fax", version = "=0.2.6" }
+flate2 = "1.0.20"
+half = "2.4.1"
+quick-error = "2.0.1"
+# Also `gif`'s LZW.
+weezl = "=0.1.10"
+bytemuck = "1"
+# The DCT.
+rustdct = "=0.7.1"
+transpose = "=0.2.3"
+
+[features]
+default = ["cli", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr"]
+# The command-line tool.
+cli = []
+# Formats beyond the five clamscan treats as graphics, which `sigtool
+# --fuzzy-img` also hashes (libclamav 1.5.4 links the same `image` codecs and
+# the same image-webp and qoi). Each is a decoder without `unsafe`: image-webp
+# and qoi are `forbid(unsafe_code)`, the others are `image`'s own. OpenEXR,
+# which sigtool also reads, is left out: its crate pulls `rayon-core` and
+# `smallvec`. Off, a file of that format is not an image here.
+webp = ["image/webp"]
+ico = ["image/ico"]
+pnm = ["image/pnm"]
+qoi = ["image/qoi"]
+dds = ["image/dds"]
+ff = ["image/ff"]
+hdr = ["image/hdr"]
+
+[dev-dependencies]
+crc32fast = "1"
+
+[package.metadata.docs.rs]
+all-features = true

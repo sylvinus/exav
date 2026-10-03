@@ -92,7 +92,7 @@ directory given to `--sig-dir` is not loaded.
 exav --listen /run/exav/exav.sock -d /srv/exav/live.exavdb
 ```
 
-The daemon polls that file's mtime (like clamd's `SelfCheck`), in every
+The daemon polls that file (like clamd's `SelfCheck`), in every
 listener mode, so an update is a rebuild and an atomic swap:
 
 ```sh

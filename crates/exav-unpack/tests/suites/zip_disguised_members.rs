@@ -278,3 +278,69 @@ fn real_encryption_is_still_reported() {
         "streaming walker handed over ciphertext as though it had decoded: {s:?}"
     );
 }
+
+/// One stored member as an APK packer writes its manifest: a compression
+/// method no specification defines (a different one in each header) and a
+/// compressed size shorter than the data, which runs for the uncompressed size.
+/// With the central directory, or as a lone local header.
+fn zip_bogus_method(data: &[u8], with_directory: bool) -> Vec<u8> {
+    let name = b"AndroidManifest.xml";
+    let short = (data.len() / 3) as u32;
+    let header = |sig: &[u8], method: u16, central: bool| {
+        let mut h = sig.to_vec();
+        if central {
+            h.extend_from_slice(&20u16.to_le_bytes());
+        }
+        h.extend_from_slice(&20u16.to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes()); // flags
+        h.extend_from_slice(&method.to_le_bytes());
+        h.extend_from_slice(&[0; 4]); // time, date
+        h.extend_from_slice(&crc32(data).to_le_bytes());
+        h.extend_from_slice(&short.to_le_bytes());
+        h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes());
+        if central {
+            h.extend_from_slice(&[0; 6]); // comment length, disk, internal attributes
+            h.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+            h.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        }
+        h.extend_from_slice(name);
+        h
+    };
+    let mut out = header(b"PK\x03\x04", 25411, false);
+    out.extend_from_slice(data);
+    if with_directory {
+        let cd = out.len() as u32;
+        let central = header(b"PK\x01\x02", 21425, true);
+        out.extend_from_slice(&central);
+        out.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    out
+}
+
+/// A member with a made-up compression method is read as Android reads it:
+/// stored, its uncompressed size long.
+#[test]
+fn an_undefined_compression_method_reads_as_android_reads_it() {
+    let manifest: Vec<u8> = (0..900u32).map(|i| (i % 251) as u8).collect();
+    for with_directory in [true, false] {
+        let blob = zip_bogus_method(&manifest, with_directory);
+        let b = buffered(&blob);
+        let m = b
+            .iter()
+            .find(|e| e.name == "AndroidManifest.xml")
+            .unwrap_or_else(|| panic!("{b:?}"));
+        assert_eq!(m.unsupported, None, "directory: {with_directory}");
+        assert_eq!(m.data, manifest, "directory: {with_directory}");
+        let s = streamed(&blob);
+        assert!(
+            s.iter()
+                .any(|(n, d)| n == "AndroidManifest.xml" && *d == manifest),
+            "{with_directory}"
+        );
+    }
+}

@@ -237,7 +237,8 @@ volumes:
 
 Run it with `EXAV_SIG_SOURCES=https://clamav-mirror.internal/ docker compose up -d`.
 
-The scanner notices the updated files on the shared mount (an mtime watch) and
+The scanner notices the updated files on the shared mount ([a poll of the
+source](/guides/daemon/#the-watch-polls-the-source)) and
 re-forks its worker pool with the new signatures, with no restart and no
 cross-container signalling.
 

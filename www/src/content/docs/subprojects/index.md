@@ -18,6 +18,7 @@ flows through them.
 | [exav-unpack](/subprojects/exav-unpack/) | Bounded, memory-safe extraction for the full [supported-format list](/reference/formats/), as a Rust library, a CLI, and a WASM module that runs in a browser |
 | [exav-grep](/subprojects/exav-grep/) | grep for the inside of archives: search recursively through zip/rar/7z/tar/iso/OLE/PDF/email members |
 | [exav-pe-emu](/subprojects/exav-pe-emu/) | A sandboxed x86-32 emulator that unpacks packed Windows executables by running their stub, as a library and a CLI |
+| [exav-imagehash](/subprojects/exav-imagehash/) | Perceptual image hashes with every step a parameter, reproducing ClamAV's `fuzzy_img` hash and Python imagehash's `phash` bit for bit, as a library and a CLI |
 
 ## Libraries
 

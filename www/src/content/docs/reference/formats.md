@@ -46,6 +46,10 @@ encrypted ZIP members, are decoded whole under that limit.
 
 A DMG is walked at any size, but each file in it is held whole, under
 `--max-object-bytes`; an encrypted DMG is decrypted whole under the same limit.
+Only data forks are read. A file macOS compressed (decmpfs) keeps its bytes in
+an attribute or its resource fork instead: on HFS+, a file with a resource fork
+is reported `UNSCANNABLE`; on APFS, and for small HFS+ files compressed into
+the attribute alone, such a file reads as empty.
 
 Every other format is read whole: a container larger than `--max-object-bytes`
 (256 MiB by default) is reported `LIMITS-EXCEEDED` and its members are not
@@ -73,16 +77,14 @@ container with ClamAV 1.4.3 and 1.5.3.
 |---|---|---|
 | ACE | No support: 200 members of a real ACE went unextracted | No encoder exists to validate a decoder against, and the one sample obtainable is rejected as invalid by both `lsar` and `unace` |
 | StuffIt / StuffIt X | No support: real `.sit` and `.sitx` unextracted | Compression methods undocumented; the only implementations are closed-source or GPL |
-| Inno Setup | No support: stops at "Recognized MS-EXE/DLL", 71 members unreached | The layout changes across setup-data versions; `innoextract` works as an oracle but is GPL, so it cannot be a source |
+| Inno Setup | No support: stops at "Recognized MS-EXE/DLL", 71 members unreached | The layout changes across setup-data versions; `innoextract` (zlib license) is the reference |
 | ZIP method 10 (DCL Implode) | No support: enumerates the entry, then `unsupported method (10)` | No tool in print creates one, so a decoder could only be validated against found samples |
 | ZIP methods 94 / 96 / 97 (MP3, JPEG, WavPack) | No support | WinZip-only; no other extractor in the reference set reads them |
 | PKWARE Strong Encryption | No support | Rare, proprietary |
-| RAR AES | No support | Decryptor pending |
 | WIM LZMS resources | No support for WIM at all: no `CL_TYPE_WIM`, all four test images clean | Used by `.esd` images and `wimlib --solid` |
 | RAR5 dictionaries over 64 MiB (including RAR 7's larger ones) | not measured | The decoder's window is capped at 64 MiB |
 | RAR 1.5 / 2.x compression (unpack versions 15, 20, 26) | not measured; ClamAV's RAR support derives from UnRAR, which reads these | No permissively licensed decoder to port or check against; stored members of these archives are scanned |
 | KWAJ LZSS, MSZIP and LZH methods | not measured | Stored and XOR-obfuscated KWAJ members are decoded |
-| NSIS modified-bzip2 blocks | not measured | The stock bzip2 decoder usually rejects them; they are reported |
 | CHM multi-frame LZX intervals | not measured | Reported |
 | 7z BCJ ARMT / PPC / SPARC / IA64 / RISC-V | not measured | Minor architectures |
 | 7z Deflate64 / Zstandard coders | not measured | The Zstandard coder is a 7-Zip ZS fork extension |
@@ -197,7 +199,11 @@ and Zstandard coders.
 
 **RAR:** RAR3 (LZ + PPMd) and RAR5 (LZ), including solid archives (the window,
 Huffman tables and PPMd model carry across the group, and every member is
-CRC-checked). A member split across volumes is reported, since the rest of its
+CRC-checked), the standard filters RAR writes, encrypted members and headers,
+and hard links and
+file copies. Checked against official RAR 6.12 and 7.23 output across methods,
+solid groups, filters, dictionary sizes, volumes, recovery records and
+encryption. A member split across volumes is reported, since the rest of its
 data is in a sibling file; the bytes of a split stored member that are present
 are still scanned. (ClamAV does not join volume sets either.)
 
@@ -295,6 +301,7 @@ where the table names some:
 |---|---|---|
 | ZIP | ZipCrypto, WinZip AES-128/192/256 | `infected`, `virus`, `malware`, `password`, `123456` (the malware-sharing convention) |
 | 7z | AES-256 (SHA-256 KDF), including encrypted headers; the result is CRC-checked | none |
+| RAR | RAR5 AES-256 and RAR 2.9-4 AES-128, including encrypted headers (`rar -hp`); the result is CRC-checked | `infected`, `virus`, `malware`, `password`, `123456` |
 | PDF | standard security handler, RC4 and AES | the empty user password, first |
 | DMG | encrypted UDIF | none |
 | Office | legacy Excel `.xls` (RC4, RC4 CryptoAPI, XOR obfuscation); OOXML `.docx`/`.xlsx`/`.pptx` (AES, standard and agile) | `VelvetSweatshop` (Excel's no-prompt default) and the empty password |
@@ -302,8 +309,8 @@ where the table names some:
 
 Content that is still encrypted after that is reported `PASSWORD-PROTECTED`,
 never scanned as ciphertext and called clean. That covers a wrong or missing
-password, and the schemes exav detects but does not decrypt: RAR encrypted
-members and encrypted RAR headers, PKWARE Strong Encryption, encrypted ALZ and
+password, and the schemes exav detects but does not decrypt: RAR 2.0's own
+cipher, PKWARE Strong Encryption, encrypted ALZ and
 EGG members, ARJ GOST-256, encrypted legacy Word `.doc`, and CryptFF.
 
 The pool is, in order: each `--passwords` (repeatable, or comma-separated in

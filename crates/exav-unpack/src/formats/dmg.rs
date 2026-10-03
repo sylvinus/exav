@@ -439,6 +439,18 @@ fn walk_disk<D: Read + Seek, T>(
             if we.entry.kind != hfsplus::EntryKind::File {
                 continue;
             }
+            // Only the data fork is read. A resource fork is content too, and
+            // where macOS compressed a file (decmpfs) it holds the file's
+            // bytes while the data fork is empty: reported, not scanned as
+            // empty.
+            if vol.stat(&we.path).is_ok_and(|s| s.resource_fork_size > 0) {
+                budget.count_entry()?;
+                let e = Entry::unsupported(we.path, 0, false, "HFS+ resource fork not read");
+                if let Some(t) = emit(e, budget)? {
+                    return Ok(Some(t));
+                }
+                continue;
+            }
             let hit = read_file(we.path, budget, emit, |path, out| {
                 vol.read_file_to(path, out).map(|_| ())
             })?;

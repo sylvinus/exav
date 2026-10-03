@@ -48,8 +48,14 @@ The grammar is `path: [reason ][CATEGORY ]STATUS`, with the status last, where
   unsupported codec, a RAR member continuing in another volume, a read error).
   Raising a limit changes nothing. The container's own bytes are still scanned;
   only what it holds could not be reached.
-- **`PASSWORD-PROTECTED`**: an encrypted member. Scan again with `--passwords`
-  (repeatable) or a `.pwdb` database to decrypt it.
+- **`PASSWORD-PROTECTED`**: an encrypted member exav could not decrypt. Scan
+  again with `--passwords` (repeatable) or a `.pwdb` database to decrypt it. A
+  member exav did decrypt, with one of those or a
+  [built-in password](/reference/formats/#encryption-support), is scanned like
+  any other and does not make the file `PARTIAL`.
+  `--partial-as password-protected=found` is separate: it reports any
+  encryption, decrypted or not (see
+  [`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes)).
 
 ## Process exit code
 

@@ -448,6 +448,7 @@ impl<B: ByteSource + ?Sized> ByteSource for Lower<'_, B> {
 }
 
 /// A `Read + Seek` cursor over a source, for the extractors that take one.
+#[derive(Clone)]
 pub struct Reader<'a> {
     src: &'a dyn ByteSource,
     pos: u64,

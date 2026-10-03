@@ -27,7 +27,7 @@ startup:
 
 ```text
 exav: per-job memory 2048 MiB x 2 workers exceeds what this host can back; using 818 MiB per job (two thirds of RAM, less the 1094 MiB shared database, over the workers). ...
-exav: a scan may hold at most 409 MiB (half the 818 MiB of memory it gets), so a size limit is reported rather than the scan being killed for hitting one
+exav: of the 818 MiB of memory a scan gets, it may hold 311 MiB at once and 204 MiB in one object, so a size limit is reported rather than the scan being killed for hitting one
 exav: prefork daemon: 2 workers; per-job limits: wall 120s, mem 818 MiB, cpu 120s; recycle every 1000 jobs
 ```
 
@@ -70,13 +70,15 @@ total is one database plus what the scans use (the `Pss` line of
 
 3. **`--max-process-bytes`**, the memory one scan may use. Left unset, it is 2 GB
    lowered to the share above, which is the right value. Set it lower to leave
-   room for another service on the same machine. A scan is kept to half of it
-   (the other half is the matcher's working set), so what it holds is at most
-   409 MB here, and an object past that is scanned through a block cache or a
-   spill file instead of being loaded, or reported `LIMITS-EXCEEDED`.
+   room for another service on the same machine. Beside an object held whole,
+   an image decoded from it and its grey copy can take as much again twice,
+   so one object is kept to a quarter of it, 204 MB here, and what a scan
+   holds in all to 311 MB, which leaves room for those and a tenth to spare.
+   A larger object is scanned through a block cache or a spill file instead
+   of being loaded, or reported `LIMITS-EXCEEDED`.
 
 4. **`--max-object-bytes`**, the largest object held whole (default 256 MB).
-   exav lowers it to that half when it is larger, so there is nothing to set.
+   exav lowers it to that quarter when it is larger, so there is nothing to set.
    Raise `--max-process-bytes` rather than this one when a large container is
    reported `LIMITS-EXCEEDED` and the machine has room.
 
@@ -98,7 +100,7 @@ total is one database plus what the scans use (the `Pss` line of
 An `icap://` listener next to the clamd one runs in one more child process,
 sharing the same database. It scans in threads, one per connection (up to 100 by
 default), with no `--max-scan-secs` and no `RLIMIT_AS` (see
-[Limits](/reference/limits/)). Each scan may hold what a worker's scan may (409
+[Limits](/reference/limits/)). Each scan may hold what a worker's scan may (311
 MB here), plus up to `--spill-threshold-bytes` of buffered body. Most scans hold
 far less, but the worst case is that times the number of connections, so on a
 4 GB machine bound them with `?max-connections=` on the address:

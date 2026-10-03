@@ -18,6 +18,30 @@ fn contains_marker(entries: &[exav_unpack::Entry]) -> bool {
         .any(|e| e.data.windows(MARKER.len()).any(|w| w == MARKER))
 }
 
+/// Only the data fork is read, so a file with a resource fork, which is where
+/// macOS keeps a compressed file's bytes, is reported rather than scanned as
+/// though the data fork were all of it. The fixture's one file is given a
+/// resource fork in its catalog record.
+#[test]
+fn a_file_with_a_resource_fork_is_reported() {
+    let mut blob = fixture("hfs_plus_udrw.dmg");
+    // The record's BSD info (owner 501, group 20, flags, mode 0o100644), 32
+    // bytes into the record; the resource fork's logical size is 168 bytes in.
+    let bsd = [0, 0, 1, 0xf5, 0, 0, 0, 0x14, 0, 0, 0x81, 0xa4];
+    let at = blob
+        .windows(bsd.len())
+        .position(|w| w == bsd)
+        .expect("the file's record");
+    let size = at - 32 + 168;
+    blob[size..size + 8].copy_from_slice(&100u64.to_be_bytes());
+    let entries = extract(Format::Dmg, &blob, &mut Budget::new(Limits::default())).unwrap();
+    let test = entries
+        .iter()
+        .find(|e| e.name.ends_with("test.txt"))
+        .expect("the file");
+    assert_eq!(test.unsupported, Some("HFS+ resource fork not read"));
+}
+
 // ---------------------------------------------------------------------------
 // Detection
 // ---------------------------------------------------------------------------

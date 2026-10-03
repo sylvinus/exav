@@ -144,6 +144,13 @@ an encrypted ZIP appended to a picture or a document whose central directory
 checks out: archive tools open such a polyglot through its trailing directory, so
 it is reported `PASSWORD-PROTECTED`.
 
+**Executables in an OLE2 file** (Word, Excel, MSI) are carved twice: from the
+stream that holds one, and from the file's own bytes, scanned from the
+executable's header to the end of the file, which is what ClamAV scans. The
+streams are sectors in any order, so the bytes after an executable in the file
+are not the ones after it in its stream, and signatures exist that match only
+the former.
+
 ## "Encrypted" is itself a detection
 
 Once malware encrypts to blind scanners rather than to protect anything,
@@ -156,7 +163,9 @@ VirusName:ContainerType:ContainerSize:FileNameREGEX:FileSizeInContainer:FileSize
 
 `IsEncrypted` is three-state (`1`, `0`, `*`), so a signature can say "a ZIP
 containing an encrypted member whose name matches `(?i)invoice.*\.exe`" and fire
-without decrypting anything. A real signature from `daily.cvd`:
+without decrypting anything. A ZIP member has two headers, its central
+directory record and its local header, each with its own encryption bit; as in
+ClamAV, the field matches either. A real signature from `daily.cvd`:
 
 ```text
 Archive.Filetype.DualExtJS-6168221-2:CL_TYPE_ZIP:*:^[^/\\]+\.(doc|xls|ppt|pdf|png|gif|jpeg)\.js$:*:*:*:1:*:
@@ -168,9 +177,13 @@ That is a double-extension detector: it catches
 
 Two more places encryption is a signal:
 
-- `--partial-as password-protected=found` turns a password-protected member into
-  a detection, `Heuristics.Encrypted.Zip` / `.RAR` / `.7Zip` / `.PDF` / `.OLE2`,
-  or `.Archive` for other formats.
+- `--partial-as password-protected=found` reports any encrypted member as a
+  detection, `Heuristics.Encrypted.Zip` / `.RAR` / `.7Zip` / `.PDF` / `.OLE2`,
+  or `.Archive` for other formats: decrypted or not, and when the encryption
+  flag is set over plain content, as APK packers set it on every member. Only a
+  member exav could not decrypt is `PASSWORD-PROTECTED`. For a ZIP member the
+  alert reads the local header, as ClamAV's does: bit 0 set and bit 13 (headers
+  masked) clear, whatever the central directory says.
 - "infected" is the standard password for sharing samples, so exav tries it,
   and a few others, on every encrypted ZIP: a password-protected dropper opens
   with no configuration, as `VelvetSweatshop` does for Office (see
@@ -252,13 +265,16 @@ signature can require "these bytes and this icon". exav implements ClamAV's
 - Getting the icon out means walking PE resources: `RT_GROUP_ICON` (type 14), its
   14-byte entries, each `icon_id` under `RT_ICON` (type 3), then the DIB.
 
-The separate `fuzzy_img#<16-hex>` subsignature is a different algorithm: the
-64-bit DCT perceptual hash from Python's `imagehash` (`phash()`, median variant),
-matched by Hamming distance. Reproducing it exactly means pinning details that
-normally do not matter: BT.601 grayscale with round-half-away-from-zero, a
-Lanczos3 resize to exactly 32×32, a ×2 scale after each 1-D DCT pass, the
-top-left 8×8 block including DC, a strict `>` median threshold, MSB-first
-packing. Get one wrong and nothing matches.
+The separate `fuzzy_img#<16-hex>` subsignature is a different algorithm: a
+64-bit DCT perceptual hash built like Python `imagehash`'s `phash()` (median
+variant) but not equal to it, matched by Hamming distance. Reproducing it
+exactly means pinning details that normally do not matter: BT.601 grayscale
+in `f32` with round-half-away-from-zero, the `image` crate's Lanczos3 resize
+to exactly 32×32, a ×2 scale after each 1-D DCT pass, the top-left 8×8 block
+including DC, a strict `>` median threshold, MSB-first packing, and the very
+decoders, at the versions ClamAV links. Get one wrong and nothing matches.
+[exav-imagehash](/subprojects/exav-imagehash/) computes it, and imagehash's
+own with the same code.
 
 ## The string `EXEC` is not in the file
 
@@ -326,16 +342,20 @@ decoding keeps only the low byte of the code point and looks for the closing `;`
 within 12 bytes, and comment markers inside string literals survive, so the
 stripper tracks `'`, `"` and backticks.
 
-Type gating on the normalised views is driven by observed false positives:
-`Target:3` is restricted to HTML and RTF because an HTML-exploit signature fired
-on obfuscated npm JavaScript, Java signatures (`Target:12`) are gated on the
-`cafebabe` magic because one fired on APK members, and the targets exav cannot
-positively identify are skipped (see [Targets](/project/comparison-with-clamav/#targets)).
+Which signatures meet which rendering follows clamscan, probed one signature
+at a time: `Target:3` and `Target:7` signatures match only the HTML and text
+renderings, never raw bytes; an HTML file has the HTML rendering and a text file
+the text one, not the other; `Target:4` (mail) signatures match a mail's raw
+bytes. An HTML signature on plain JavaScript is a match clamscan cannot make,
+and one did fire on obfuscated npm code before. Java signatures (`Target:12`)
+are gated on the `cafebabe` magic because one fired on APK members, and the
+targets exav cannot positively identify are skipped (see
+[Targets](/project/comparison-with-clamav/#targets)).
 
 ### A pure-ASCII RTF is text, and that widens what matches
 
 An RTF with no byte outside printable ASCII counts as text, so exav also scans
-its text-normalised rendering, which ClamAV never produces for a file it types as
+its HTML and text renderings, which ClamAV never produces for a file it types as
 RTF. Because that rendering is lowercased, a case-sensitive signature effectively
 also matches case-insensitively against such a file. Adding a single NUL byte
 makes the file non-text and the two scanners agree again.

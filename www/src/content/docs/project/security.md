@@ -47,8 +47,8 @@ please [open an issue](https://github.com/sylvinus/exav/issues).
 ## On `unsafe`
 
 exav's own scanning, extraction and emulation code is safe Rust: `exav-core`,
-`exav-unpack`, `exav-x86`, `exav-pe-emu`, `exav-update`, `exav-grep` and the
-ICAP listener are `#![forbid(unsafe_code)]`. The default build runs no C, no
+`exav-unpack`, `exav-x86`, `exav-pe-emu`, `exav-imagehash`, `exav-update`,
+`exav-grep` and the ICAP listener are `#![forbid(unsafe_code)]`. The default build runs no C, no
 UnRAR and no native JIT, so the memory-corruption bugs behind most scanner CVEs
 cannot occur in exav's own code. The
 [bytecode interpreter](/concepts/bytecode-sandbox/), for one, has no counterpart

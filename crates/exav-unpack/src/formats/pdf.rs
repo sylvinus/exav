@@ -171,7 +171,13 @@ pub(crate) fn extract_pdf<R>(
         // Strings are decrypted with the object key when the doc is encrypted,
         // so the recovered plaintext matches (same key schedule as streams).
         #[cfg(feature = "decrypt")]
-        harvest_actions(&obj, decoder.as_ref(), obj_id, &mut js_acc, &mut uri_acc);
+        harvest_actions(
+            &obj,
+            decoder.as_ref(),
+            (obj_id, gen),
+            &mut js_acc,
+            &mut uri_acc,
+        );
         #[cfg(not(feature = "decrypt"))]
         harvest_actions(&obj, &mut js_acc, &mut uri_acc);
 
@@ -182,7 +188,7 @@ pub(crate) fn extract_pdf<R>(
         {
             #[cfg(feature = "decrypt")]
             if let Some(ref dec) = decoder {
-                dec.decrypt_stream(obj_id, &mut stream_data);
+                dec.decrypt_stream(obj_id, gen, &mut stream_data);
             }
             let raw_len = stream_data.len() as u64;
             let cap = budget.reserve()?;
@@ -205,13 +211,18 @@ pub(crate) fn extract_pdf<R>(
             // CCITTFaxDecode) pass the raw bytes through, so those streams
             // are scanned as their raw content — the signatures match the
             // bytes either way.
+            //
+            // An undecodable stream's raw bytes are scanned in its place, as
+            // ClamAV scans them: a filter that names Flate over data that is
+            // not (a ZIP, say) hides nothing from that scan.
             let entry = if buf.is_empty() && raw_len > 0 && outcome.decode_error {
-                Entry::unsupported(
-                    format!("pdf-obj-{obj_id}-{gen}"),
-                    raw_len,
-                    false,
-                    "PDF stream could not be decoded",
-                )
+                if raw_len > budget.reserve()? {
+                    return Err(LimitHit::new("pdf stream exceeds budget".to_string()));
+                }
+                budget.commit(raw_len);
+                let mut e = Entry::new(format!("pdf-obj-{obj_id}-{gen}"), stream_data);
+                e.unsupported = Some("PDF stream could not be decoded; its raw bytes were scanned");
+                e
             } else {
                 let mut e = Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf);
                 if outcome.part_way {
@@ -259,7 +270,7 @@ const URI_KEYS: &[&str] = &["URI", "URL", "Launch", "F", "Win", "SubmitForm"];
 fn harvest_actions(
     obj: &Primitive,
     decoder: Option<&Decoder>,
-    obj_id: u32,
+    obj_id: (u32, u32),
     js: &mut Vec<u8>,
     uri: &mut Vec<u8>,
 ) {
@@ -273,7 +284,7 @@ fn harvest_actions(obj: &Primitive, js: &mut Vec<u8>, uri: &mut Vec<u8>) {
 fn harvest_inner(
     obj: &Primitive,
     #[cfg(feature = "decrypt")] decoder: Option<&Decoder>,
-    #[cfg(feature = "decrypt")] obj_id: u32,
+    #[cfg(feature = "decrypt")] obj_id: (u32, u32),
     js: &mut Vec<u8>,
     uri: &mut Vec<u8>,
     depth: u32,
@@ -296,7 +307,7 @@ fn harvest_inner(
                     let mut bytes = s.to_vec();
                     #[cfg(feature = "decrypt")]
                     if let Some(dec) = decoder {
-                        dec.decrypt_stream(obj_id, &mut bytes);
+                        dec.decrypt_stream(obj_id.0, obj_id.1, &mut bytes);
                     }
                     acc.extend_from_slice(&bytes);
                     acc.push(b'\n');
@@ -403,7 +414,7 @@ fn apply_filters(
                         // Empty input decodes vacuously (nothing to fail on);
                         // only non-empty input decoding to nothing is an error.
                         let err = s.data.is_empty() && !buf.is_empty();
-                        part_way |= s.undecoded && !err;
+                        part_way |= s.undecoded && !s.data.is_empty();
                         (s.data, s.over_cap, err)
                     }
                 }
@@ -715,6 +726,23 @@ mod tests {
         );
     }
 
+    /// A `/Length 0` stream holds only the end of line before `endstream`,
+    /// which is not data: an empty stream, not an undecodable one.
+    #[test]
+    fn the_line_end_before_endstream_is_not_data() {
+        let pdf = b"%PDF-1.5\n12 0 obj\r\n<</Filter/FlateDecode/Length 0>>stream\r\n\r\nendstream\r\nendobj\ntrailer\n<< /Root 12 0 R >>\n%%EOF";
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Pdf, pdf, &mut budget).unwrap();
+        assert!(
+            entries.iter().all(|e| e.unsupported.is_none()),
+            "{:?}",
+            entries
+                .iter()
+                .map(|e| (&e.name, e.unsupported))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Garbage behind `/FlateDecode` (no zlib header anywhere for the
     /// leading-junk retry to find) recovers nothing: still `unsupported`, so a
     /// file whose bytes are present but unread never scans as clean.
@@ -743,15 +771,55 @@ mod tests {
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
         assert!(
-            entries
-                .iter()
-                .any(|e| e.unsupported == Some("PDF stream could not be decoded")),
-            "a corrupt stream must stay surfaced: {:?}",
+            entries.iter().any(|e| e.unsupported
+                == Some("PDF stream could not be decoded; its raw bytes were scanned")
+                && e.data == raw),
+            "a corrupt stream must stay surfaced, its raw bytes scanned: {:?}",
             entries
                 .iter()
                 .map(|e| (&e.name, e.unsupported))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A `stream` keyword followed by spaces before its line end, as some
+    /// writers emit: the data starts after the line end, and decodes.
+    #[test]
+    fn spaces_after_the_stream_keyword_are_not_data() {
+        let body = b"BT /F1 12 Tf (hidden payload) Tj ET";
+        // A zlib stream with an 8 KiB window, header 58 09 as the writer
+        // that does this emits: with no 0x78 to restart from, the stream
+        // decodes only if its first byte is found.
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(body).unwrap();
+        let mut z = vec![0x58, 0x09];
+        z.extend(enc.finish().unwrap());
+        let (mut a, mut b) = (1u32, 0u32);
+        for &x in body.iter() {
+            a = (a + u32::from(x)) % 65521;
+            b = (b + a) % 65521;
+        }
+        z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        assert!(
+            !z.contains(&0x78),
+            "the test needs a stream with no 0x78 byte"
+        );
+        let mut pdf = format!(
+            "%PDF-1.3\n5 0 obj\r\n<< /Length {} /Filter /FlateDecode >> stream \r\n",
+            z.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(&z);
+        pdf.extend_from_slice(b"\r\nendstream\r\nendobj\r\ntrailer\n<< /Root 5 0 R >>\n%%EOF");
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Pdf, &pdf, &mut budget).unwrap();
+        let obj = entries
+            .iter()
+            .find(|e| e.name == "pdf-obj-5-0")
+            .expect("the stream object");
+        assert_eq!(obj.unsupported, None);
+        assert_eq!(obj.data, body);
     }
 
     /// A solid-white page image (1 MB of one byte, ratio ~1000:1) is ordinary

@@ -65,6 +65,11 @@ mod tmpfile;
 /// `exav_core::unpack` and the `ScanOptions::limits` type stay stable.
 pub use exav_unpack as unpack;
 
+/// The largest object a scan copies lowercased while matching it; a larger
+/// one is lowercased as it is read. With an image's decoded pixels, the only
+/// memory matching takes beside the object itself.
+pub const LOWERCASE_COPY_MAX: u64 = engine::LOWER_COPY_MAX as u64;
+
 // ---- Engine internals (NOT a stable API) ---------------------------------
 // The signature IR/matcher, bytecode interpreter, and parsing primitives. They
 // are crate-private by default and only exposed as `pub` under the
@@ -87,11 +92,18 @@ macro_rules! engine_internals {
     };
 }
 engine_internals!(
-    bytecode, container, cvd, engine, fuzzy, fuzzy_img, hashes, hexsig, icon, jsnorm, ml,
-    normalize, patterns, pe,
+    bytecode, container, cvd, engine, fuzzy, hashes, hexsig, icon, jsnorm, ml, normalize, patterns,
+    pe,
 );
 
 mod byte_source;
+// For the vendored fancy-regex, written against `alloc`.
+extern crate alloc;
+/// fancy-regex with fixes it has not released yet, vendored as upstream wrote
+/// it: see `fancy_regex/README.md`.
+#[allow(dead_code, unused_imports, private_interfaces, clippy::all)]
+#[rustfmt::skip]
+mod fancy_regex;
 mod grams;
 mod stream_regex;
 
@@ -116,33 +128,25 @@ use hashes::{HashDb, SectionHashDb};
 use ml::Model;
 use unpack::Budget;
 
+/// Default of [`ScanOptions::min_scan_bytes`]: clamscan scans no object
+/// under 6 bytes, top-level file or member, whatever the signature type.
+pub const MIN_SCAN_BYTES: u64 = 6;
+
 /// Smallest object a whole-file hash signature (`.hdb`/`.hsb`) may be matched
-/// against.
+/// against, whatever [`ScanOptions::min_scan_bytes`] is.
 ///
-/// ClamAV refuses to scan any object of 5 bytes or fewer at all (`fmap->len <=
-/// 5` in `cli_magic_scan` and its four sibling entry points (libclamav
-/// `scanners.c`, checked against 1.4.3)), so every hash signature it ships with
-/// a smaller declared size is unreachable in ClamAV, standalone file or nested
-/// layer alike. Six such signatures exist in a current main+daily set.
-///
-/// exav extracts more aggressively and had no such floor, which turned those
-/// six pieces of auto-generated junk into live detections. Measured against
-/// ClamAV 1.4.3 on the same inputs, which reports OK for both:
+/// ClamAV scans no object under 6 bytes, so a hash signature with a smaller
+/// declared size never fires there; a current main+daily set has six. Matched
+/// on a short object they are false positives, measured on inputs ClamAV
+/// reports OK:
 ///
 ///   * a 1-byte file holding `V` matched `Win.Trojan.Agent-1720205`;
 ///   * the 2 bytes `\x00\x00` that a benign PDF's 2x2 image XObject decodes to
 ///     matched `Win.Malware.Agent-7761897-0`.
 ///
-/// Note where this does NOT apply: the allow-list (`.fp`/`.sfp`) is matched
-/// with the same machinery but must stay unfloored, since a suppression that
-/// silently stopped working would cause exactly the false positives this
-/// prevents.
-///
-/// Deliberately a bound on hash *matching*, not on scanning: a short object is
-/// still extracted, still pattern-matched, still counted. Only the claim "this
-/// hash identifies a file" is refused for something too small to be one. No
-/// detection is lost, because every signature below the floor is one ClamAV
-/// itself can never fire, so nothing can depend on it.
+/// The allow-list (`.fp`/`.sfp`) is matched with the same machinery and is
+/// not floored: a suppression that stopped working would cause exactly the
+/// false positives this prevents.
 const MIN_HASH_MATCH_BYTES: u64 = 6;
 
 /// What a scan reports when a per-buffer bound (the step pool, or the
@@ -867,6 +871,14 @@ pub struct ScanOptions {
     /// over this limit with no spill to go to is not scanned, and reported.
     /// A scan also holds `limits.max_buffer_bytes` to it. Default 256 MiB.
     pub deep_analysis_max: u64,
+    /// Largest object PCRE subsignatures run on (`--max-pcre-bytes`); on a
+    /// larger one they do not match, as ClamAV's `PCREMaxFileSize` has it.
+    /// `None` = no limit (default); 100 MiB under `--clamav-compat`.
+    pub max_pcre_bytes: Option<u64>,
+    /// Smallest object scanned (`--min-scan-bytes`): a smaller one, at any
+    /// depth, is neither matched nor unpacked and counts as clean, as ClamAV
+    /// does not scan an object under 6 bytes. `0` scans everything. Default 6.
+    pub min_scan_bytes: u64,
     /// Enable exav's *exclusive* structural heuristics: TLSH fuzzy matching, the
     /// static suspicion scorer (`Heuristics.Static.Suspect.*`), and the packed-with-injection
     /// heuristic. These have no stock-ClamAV analog, so they stay off under
@@ -1022,6 +1034,8 @@ impl Default for ScanOptions {
         Self {
             max_scan_size: None,
             deep_analysis_max: 256 * 1024 * 1024,
+            max_pcre_bytes: None,
+            min_scan_bytes: MIN_SCAN_BYTES,
             heuristics: false,
             // ClamAV-default matchings (PDF obfuscation, imphash) are on out of the
             // box: FP-safe and part of a faithful default scan. The exav-exclusive
@@ -1067,6 +1081,9 @@ impl ScanOptions {
         Self {
             max_scan_size: Some(100 * 1024 * 1024),
             deep_analysis_max: 400 * 1024 * 1024,
+            // ClamAV's PCREMaxFileSize default.
+            max_pcre_bytes: Some(100 * 1024 * 1024),
+            min_scan_bytes: MIN_SCAN_BYTES,
             // exav-exclusive TLSH/ML stay off (they'd be diff-run false positives);
             // the ClamAV-default heuristics are on to match stock clamscan.
             heuristics: false,
@@ -1932,6 +1949,13 @@ fn walk_members(
         let _mpg = MatchPathGuard::enter(&name);
         terminal = member_content_scan(&cx, &mut tally, &buf, budget, findings, sink);
     }
+    if let Some(name) = tally.encrypted.take() {
+        if !matches!(terminal, Some(DeepOutcome::Infected { .. })) {
+            if let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic) {
+                return o;
+            }
+        }
+    }
     terminal.unwrap_or_else(|| tally.verdict())
 }
 
@@ -2570,6 +2594,10 @@ struct MemberTally {
     /// A size limit cut the analysis of something short without stopping the
     /// walk: the rest of the members were still scanned.
     limits: Option<String>,
+    /// The `--alert-encrypted` name for a member stored encrypted whose
+    /// content was read anyway (decrypted, or not encrypted after all): held
+    /// until the walk ends, so a signature in that content wins over it.
+    encrypted: Option<&'static str>,
 }
 
 impl MemberTally {
@@ -2579,6 +2607,7 @@ impl MemberTally {
             unscannable: None,
             password: None,
             limits: None,
+            encrypted: None,
         }
     }
 
@@ -2639,14 +2668,28 @@ fn member_metadata_scan(
     // would otherwise pre-empt the detection it is standing in for.
     //
     // Under `--all-matches` both belong in the output and neither pre-empts
-    // anything, so the decrypted case reports there.
-    if e.encrypted && cx.opts.alert_encrypted && (e.unsupported.is_some() || sink.wants_all()) {
-        if let Some(o) = sink.hit(
-            encrypted_heuristic_name(cx.fmt).to_string(),
-            0,
-            Method::Heuristic,
-        ) {
-            return Some(o);
+    // anything, so the decrypted case reports there. Under first-match it is
+    // held, and reported once the walk ends if nothing else was found.
+    //
+    // A ZIP member alerts as ClamAV's does, on its local header: bit 0 set and
+    // bit 13 (headers masked) clear, whatever the central directory says. APK
+    // packers set the bit in one header only.
+    let alert = e
+        .zip_local_flags
+        .map_or(e.encrypted, |f| f & 0x0001 != 0 && f & 0x2000 == 0);
+    if alert && cx.opts.alert_encrypted {
+        if e.unsupported.is_some() || sink.wants_all() {
+            if let Some(o) = sink.hit(
+                encrypted_heuristic_name(cx.fmt).to_string(),
+                0,
+                Method::Heuristic,
+            ) {
+                return Some(o);
+            }
+        } else {
+            tally
+                .encrypted
+                .get_or_insert(encrypted_heuristic_name(cx.fmt));
         }
     }
     // Opt-in (`--detect packed`): name the packer as well as reporting that its
@@ -2689,16 +2732,27 @@ fn member_metadata_scan(
         }
     }
     if !cx.db.cdb.is_empty() {
-        let member = container::Member {
-            name: &e.name,
-            size_in_container: e.comp_size,
-            size_real,
-            encrypted: e.encrypted,
-            pos: member_pos,
-        };
-        if let Some((sig, unofficial)) = profile::timed("cdb", 0, || {
-            cx.db.cdb.matches(cx.ft, cx.container_size, &member)
-        }) {
+        // ClamAV matches a ZIP member's central-directory record and its local
+        // header each, so the encryption field matches either one's bit 0.
+        let local = e.zip_local_flags.map(|f| f & 0x0001 != 0);
+        let records = std::iter::once(e.encrypted).chain(local.filter(|&l| l != e.encrypted));
+        let mut reported = None;
+        for encrypted in records {
+            let member = container::Member {
+                name: &e.name,
+                size_in_container: e.comp_size,
+                size_real,
+                encrypted,
+                pos: member_pos,
+            };
+            let Some((sig, unofficial)) = profile::timed("cdb", 0, || {
+                cx.db.cdb.matches(cx.ft, cx.container_size, &member)
+            }) else {
+                continue;
+            };
+            if reported.as_ref() == Some(&sig) {
+                continue;
+            }
             if let Some(o) = sink.hit(
                 report_name(&sig, unofficial, cx.opts.unofficial_suffix),
                 0,
@@ -2706,6 +2760,7 @@ fn member_metadata_scan(
             ) {
                 return Some(o);
             }
+            reported = Some(sig);
         }
     }
     None
@@ -2845,6 +2900,9 @@ fn scan_object(
     findings: &mut Vec<Finding>,
     sink: &mut Sink,
 ) -> DeepOutcome {
+    if (data.len() as u64) < opts.min_scan_bytes {
+        return DeepOutcome::Clean;
+    }
     // Content the operator has vouched for (`.fp`/`.sfp`): neither it nor
     // anything inside it is a detection. Keyed on the object's bytes, so an
     // entry means the same thing wherever the object is found.
@@ -2902,7 +2960,7 @@ fn scan_archive(
         Ok(rest) => rest,
         Err(stop) => return stop,
     };
-    scan_unpacked(
+    if let Some(o) = scan_unpacked(
         db,
         rest.unpacked,
         obj,
@@ -2911,8 +2969,30 @@ fn scan_archive(
         findings,
         sink,
         &mut outcome,
-    )
-    .unwrap_or(outcome)
+    ) {
+        return o;
+    }
+    // An OLE2 file's executables are also carved from its own bytes, each
+    // scanned from its header to the end of the file, as ClamAV carves them.
+    // Its streams are sectors laid out in any order, so what follows an
+    // executable in the file is not what follows it in its stream, and a
+    // signature written against ClamAV's carving can match those bytes.
+    if fmt == unpack::Format::Ole && obj.carve && obj.depth < budget.limits().max_recursion {
+        let carved = Obj {
+            carve: false,
+            embedded: true,
+            ..obj.inner(obj.container)
+        };
+        for off in facts.embedded().pe {
+            let sub = &byte_source::Sub::new(data, off, data.len() - off);
+            match scan_found(db, sub, carved, opts, budget, findings, sink) {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
+                o => defer(&mut outcome, o),
+            }
+        }
+    }
+    outcome
 }
 
 /// What an object carries encoded in its own bytes, and the checks that read
@@ -3598,11 +3678,26 @@ fn mostly_text(data: &[u8]) -> bool {
 /// its member and that member's own member are each mid-scan while the walk is
 /// inside them. Making one at a time keeps the peak at one copy without
 /// changing which views are scanned or in what order.
-fn normalizations(ft: FileType, data: &dyn ByteSource) -> Vec<ViewKind> {
-    let mut v = vec![ViewKind::Html, ViewKind::Text];
+///
+/// Each comes with the type it is matched as, which decides the signatures
+/// that apply. As clamscan does, an HTML object has its HTML view and a text
+/// object its text view, each not the other. An RTF has both, which clamscan
+/// does not give it: see "A pure-ASCII RTF is text" in the quirks guide.
+fn normalizations(ft: FileType, data: &dyn ByteSource) -> Vec<(ViewKind, FileType)> {
+    let (kind, as_type) = match ft {
+        FileType::Rtf => {
+            return vec![
+                (ViewKind::Html, FileType::HtmlView),
+                (ViewKind::Text, FileType::TextView),
+            ]
+        }
+        FileType::Html => (ViewKind::Html, FileType::HtmlView),
+        _ => (ViewKind::Text, FileType::TextView),
+    };
+    let mut v = vec![(kind, as_type)];
     if looks_like_script(ft, &data.window(0, 8192)) {
-        v.push(ViewKind::Javascript);
-        v.push(ViewKind::Deobfuscated);
+        v.push((ViewKind::Javascript, as_type));
+        v.push((ViewKind::Deobfuscated, as_type));
     }
     v
 }
@@ -3776,6 +3871,13 @@ fn core_matches(
     let data = facts.data;
     let suffix = opts.unofficial_suffix;
     let materialize = opts.deep_analysis_max as usize;
+    let whole = engine::WholeLimits {
+        materialize,
+        pcre: opts
+            .max_pcre_bytes
+            .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+        all_image_formats: !opts.clamav_compat,
+    };
     let all = sink.wants_all();
     // The engine passes over an ignored (`.ign`/`.ign2`) match to look for the
     // next one; every other matcher's hits are ignored by the sink.
@@ -3805,7 +3907,9 @@ fn core_matches(
     // The bytecode triggers that fire on the raw bytes, found in the same
     // sweep as every other signature.
     let mut fired = Vec::new();
+    // `as_type` is `ft` for the object's own bytes, the view's type for a view.
     let mut engine_pass = |src: &dyn ByteSource,
+                           as_type: FileType,
                            layout: Option<&pe::PeLayout>,
                            icons: Option<&engine::IconCtx>,
                            fired: Option<&mut Vec<engine::Fired>>|
@@ -3814,27 +3918,13 @@ fn core_matches(
         profile::timed("engine", src.len() as u64, || {
             let c = obj.container;
             if all {
-                db.engine.scan_all_source(
-                    src,
-                    ft,
-                    layout,
-                    c,
-                    icons,
-                    &mut found,
-                    materialize,
-                    fired,
-                );
+                db.engine
+                    .scan_all_source(src, as_type, layout, c, icons, &mut found, whole, fired);
             } else {
-                found.extend(db.engine.scan_first_source(
-                    src,
-                    ft,
-                    layout,
-                    c,
-                    icons,
-                    &skip,
-                    materialize,
-                    fired,
-                ));
+                found.extend(
+                    db.engine
+                        .scan_first_source(src, as_type, layout, c, icons, &skip, whole, fired),
+                );
             }
         });
         for (name, off, unofficial) in found {
@@ -3842,14 +3932,13 @@ fn core_matches(
         }
         Ok(())
     };
-    engine_pass(data, layout.as_ref(), Some(&icon_ctx), Some(&mut fired))?;
-    // Normalised-content passes: HTML/text/mail (`Target:3/4/7`) signatures
-    // are written against canonicalised content, not raw bytes. Only worth
-    // making when a signature could match the result: `target_ok` confines
-    // Target:3/4/7 to text-ish types, and a Target:0 pattern has already run
-    // against the raw bytes, so for a positively-typed binary they are pure
-    // cost. `is_textual` alone does not say so: it counts 0x80..=0xff as text,
-    // and most packed binaries carry few NULs.
+    engine_pass(data, ft, layout.as_ref(), Some(&icon_ctx), Some(&mut fired))?;
+    // Normalised-content passes: HTML/text (`Target:3/7`) signatures are
+    // written against canonicalised content, not raw bytes. Only worth making
+    // for a textual object: a Target:0 pattern has already run against the
+    // raw bytes, so for a positively-typed binary they are pure cost.
+    // `is_textual` alone does not say so: it counts 0x80..=0xff as text, and
+    // most packed binaries carry few NULs.
     if !db.engine.is_empty()
         && is_textual_type(ft)
         && normalize::is_textual(&data.window(0, normalize::SAMPLE))
@@ -3857,13 +3946,13 @@ fn core_matches(
         // One at a time: each is a full-size copy of `data`, and nesting
         // stacks them (a container, its member and that member's member are
         // each mid-scan while the walk is inside them).
-        for kind in normalizations(ft, data) {
+        for (kind, as_type) in normalizations(ft, data) {
             let Some(view) = profile::timed("normalize", data.len() as u64, || {
                 make_view(kind, data, opts)
             }) else {
                 continue;
             };
-            engine_pass(view.source(), None, None, None)?;
+            engine_pass(view.source(), as_type, None, None, None)?;
         }
     }
     // Bytecode programs whose trigger/hook fires (gated execution). Their
@@ -4754,23 +4843,28 @@ mod tests {
         // `Html` and `Script` are script-like whatever they contain; `Text`
         // earns the two extra views only from what is in the bytes.
         assert_eq!(
-            normalizations(FileType::Text, plain).len(),
-            2,
-            "a non-script textual file is matched against the html and text views"
+            normalizations(FileType::Text, plain),
+            [(ViewKind::Text, FileType::TextView)],
+            "a non-script textual file is matched against its text view"
         );
         assert_eq!(
             normalizations(FileType::Text, script).len(),
-            4,
+            3,
             "script-shaped content adds the javascript and jsnorm views"
         );
         assert_eq!(
-            normalizations(FileType::Html, plain).len(),
-            4,
+            normalizations(FileType::Html, plain),
+            [
+                (ViewKind::Html, FileType::HtmlView),
+                (ViewKind::Javascript, FileType::HtmlView),
+                (ViewKind::Deobfuscated, FileType::HtmlView)
+            ],
             "an HTML file is script-like by type, whatever it holds"
         );
+        assert_eq!(normalizations(FileType::Rtf, script).len(), 2);
 
         // And each one produces something to scan.
-        for (i, kind) in normalizations(FileType::Text, script)
+        for (i, (kind, _)) in normalizations(FileType::Text, script)
             .into_iter()
             .enumerate()
         {
@@ -4861,11 +4955,15 @@ mod tests {
     }
 
     /// Whole-file hash signatures stop applying at [`MIN_HASH_MATCH_BYTES`],
-    /// and the boundary is exactly where ClamAV puts it: 5 bytes is refused, 6
-    /// matches. Verified against ClamAV 1.4.3 with an equivalent `.hdb`, which
-    /// reports OK up to 5 bytes and FOUND from 6.
+    /// even with every object scanned: 5 bytes is refused, 6 matches. ClamAV
+    /// 1.4.3 with an equivalent `.hdb` reports OK up to 5 bytes and FOUND
+    /// from 6.
     #[test]
     fn hash_signatures_do_not_match_tiny_objects() {
+        let opts = ScanOptions {
+            min_scan_bytes: 0,
+            ..ScanOptions::default()
+        };
         for n in 1..=8usize {
             let data: Vec<u8> = (0..n).map(|i| b'A' + (i % 26) as u8).collect();
             let mut db = Scanner::builtin();
@@ -4873,10 +4971,7 @@ mod tests {
             db.hashes
                 .extend_from_text(&format!("{}:{}:Test.Tiny{}\n", d.md5_hex(), n, n));
             db.hashes.finalize();
-            let hit = matches!(
-                analyze(&db, &data, &ScanOptions::default()).verdict,
-                Verdict::Infected { .. }
-            );
+            let hit = matches!(analyze(&db, &data, &opts).verdict, Verdict::Infected { .. });
             assert_eq!(
                 hit,
                 n >= 6,
@@ -4892,11 +4987,15 @@ mod tests {
     #[test]
     fn allowlist_still_applies_below_the_hash_floor() {
         // A 4-byte body carrying a pattern detection, then allow-listed by hash.
+        let opts = ScanOptions {
+            min_scan_bytes: 0,
+            ..ScanOptions::default()
+        };
         let mut db = Scanner::builtin();
         let mut eb = engine::EngineBuilder::new();
         eb.add_ndb("Test.Tiny.Pattern:0:*:61626364", false); // "abcd"
         db.engine = eb.build();
-        let r = analyze(&db, b"abcd", &ScanOptions::default());
+        let r = analyze(&db, b"abcd", &opts);
         assert!(
             matches!(r.verdict, Verdict::Infected { .. }),
             "pattern must still match a 4-byte object: {:?}",
@@ -4906,12 +5005,50 @@ mod tests {
         db.allow
             .extend_from_text(&format!("{}:4:Test.Allow\n", d.md5_hex()));
         db.allow.finalize();
-        let r = analyze(&db, b"abcd", &ScanOptions::default());
+        let r = analyze(&db, b"abcd", &opts);
         assert!(
             !matches!(r.verdict, Verdict::Infected { .. }),
             "allow-list must suppress below the hash floor: {:?}",
             r.verdict
         );
+    }
+
+    /// An object under `min_scan_bytes` is not scanned, nested or not, as
+    /// clamscan 1.5.4 does not match `ABC` in a top-level or gzipped `ABCDE`
+    /// and does in `ABCDEF`. `0` scans it.
+    #[test]
+    fn objects_under_the_minimum_are_not_scanned() {
+        use std::io::Write;
+        let mut db = Scanner::builtin();
+        let mut eb = engine::EngineBuilder::new();
+        eb.add_ndb("Test.Small:0:*:414243", false); // "ABC"
+        db.engine = eb.build();
+        let gz = |p: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(p).unwrap();
+            e.finish().unwrap()
+        };
+        let all = ScanOptions {
+            min_scan_bytes: 0,
+            ..ScanOptions::default()
+        };
+        for (n, opts, found) in [
+            (5, ScanOptions::default(), false),
+            (6, ScanOptions::default(), true),
+            (5, all, true),
+        ] {
+            let p = &b"ABCDEF"[..n];
+            for (what, data) in [("top-level", p.to_vec()), ("gzipped", gz(p))] {
+                let r = analyze(&db, &data, &opts);
+                assert_eq!(
+                    matches!(r.verdict, Verdict::Infected { .. }),
+                    found,
+                    "{what} {n} bytes, minimum {}: {:?}",
+                    opts.min_scan_bytes,
+                    r.verdict
+                );
+            }
+        }
     }
 
     #[test]

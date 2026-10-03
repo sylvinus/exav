@@ -315,6 +315,13 @@ positives (observed: a Java CVE signature firing on APK members).
 | 13 | Internal engine-generated data | Not implemented |
 | 14 | Other | Not implemented |
 
+Graphics are what clamscan takes them for: PNG, GIF, JPEG, TIFF and BMP. A
+`fuzzy_img#` subsignature is matched against those, under `--clamav-compat`
+as clamscan does; otherwise also against a WebP, ICO, PNM, QOI, DDS, farbfeld
+or HDR image, which `sigtool --fuzzy-img` hashes but clamscan does not while
+scanning. The hash is ClamAV's to the bit
+([exav-imagehash](/subprojects/exav-imagehash/)).
+
 ### Signature-format coverage
 
 Every signature in the official databases and in the `shelter`,
@@ -332,6 +339,19 @@ each settled by loading the line into clamscan with a crafted input:
 | `0:0&(…)` in a logical expression | A `:`-suffix on a subsignature reference, discarded: the reference is the number before the colon. The suffix is not always numeric; two `.lnk` signatures put the header bytes they match there. |
 | `(8==9)` and `0=2,&1&2` | `==` for equality and a trailing comma with no second count. Neither is documented; both load. |
 
+PCRE subsignatures run as ClamAV's PCRE2 runs them: 8-bit, without UTF, with
+LF newlines, so a pattern character is a byte and case, `\w`, `\d`, `\s` and the
+POSIX classes cover ASCII only. exav parses each pattern with PCRE2's grammar and
+rewrites it for its two regex engines, each construct settled against clamscan.
+An offset hands PCRE the part of the file from it on as the whole subject, and
+`r`, `e`, `A` and `g` keep ClamAV's meaning, `g` counting matches for the
+expression. A construct with no exact equivalent leaves its signature
+unsupported and counted: `\X`, `\G`, subroutine calls and recursion, `(*ACCEPT)`
+and the other backtracking verbs but `(*FAIL)`, branch reset `(?|`, callouts,
+`(*UTF)`, `(*UCP)` and newline conventions, `\p` other than a general category,
+and a condition other than on a group or an assertion. No PCRE subsignature in
+the official databases uses one.
+
 Two more are TDB rather than syntax: `HandlerType:CL_TYPE_GRAPHICS` needs a
 graphics type to re-type to, and `Container:CL_TYPE_MHTML` needs MHTML told apart
 from mail, which turns on the mail envelope, not the multipart subtype: a
@@ -342,12 +362,13 @@ without them is MHTML.
 
 ClamAV's engine exposes 37 tunables (`cl_engine_set_num`/`_str`) and 13
 per-parser on/off bits (`CL_SCAN_PARSE_*`). exav implements the four headline
-limits (scan size, file size, recursion depth, file count) and none of the rest.
+limits (scan size, file size, recursion depth, file count) and the PCRE file
+size limit (`--max-pcre-bytes`), and none of the rest.
 
 | Missing | ClamAV default | Why it matters |
 |---|---|---|
 | `MAX_SCANTIME` | 120 s | exav has no in-engine wall-clock limit. Its in-core budgets count bytes, members and steps; wall clock is bounded by the kernel-level `--max-scan-secs` (120 s per job under the prefork daemon, opt-in on a one-shot run). There is none under `--workers threads`, on Windows, or in a library embedding. |
-| `PCRE_MATCH_LIMIT` / `PCRE_RECMATCH_LIMIT` / `PCRE_MAX_FILESIZE` | 100000 / 2000 / 100 MB | Backtracking PCRE subsignatures run under a fixed step limit that is not tunable. |
+| `PCRE_MATCH_LIMIT` / `PCRE_RECMATCH_LIMIT` | 100000 / 2000 | Backtracking PCRE subsignatures run under a fixed step limit that is not tunable. |
 | `CACHE_SIZE` / `DISABLE_CACHE` | 65536 entries | ClamAV caches clean-file hashes; exav does not, which costs time on trees with repeated files. |
 | `MAX_EMBEDDEDPE`, `MAX_HTMLNORMALIZE`, `MAX_HTMLNOTAGS`, `MAX_SCRIPTNORMALIZE`, `MAX_ZIPTYPERCG`, `MAX_PARTITIONS`, `MAX_ICONSPE`, `MAX_RECHWP3` | various | Per-subsystem caps exav applies globally or not at all. |
 | 13 `CL_SCAN_PARSE_*` toggles | all on | An operator can disable a single parser (`--scan-pe=no`, `--scan-ole2=no`, …); a migrated configuration that does so changes meaning under exav. |
@@ -402,11 +423,13 @@ blocklist is a distribution question more than an engine one, and it is out of
 scope for now.
 
 Heuristics are also how ClamAV expresses what exav models as verdicts:
-`Heuristics.Limits.Exceeded.*` is `LIMITS-EXCEEDED`, `Heuristics.Encrypted.*` is
-`PASSWORD-PROTECTED`, and `Heuristics.Broken.*` overlaps `UNSCANNABLE`. ClamAV's
-form is a `FOUND`; exav's needs the `ERROR` line, which most clients read as "the
-scanner broke". `--partial-as password-protected=found` converts the verdict into
-`Heuristics.Encrypted.*`, and `--partial-as limits-exceeded=found` into
+`Heuristics.Limits.Exceeded.*` is `LIMITS-EXCEEDED`, `Heuristics.Encrypted.*`
+covers `PASSWORD-PROTECTED`, and `Heuristics.Broken.*` overlaps `UNSCANNABLE`.
+ClamAV's form is a `FOUND`; exav's needs the `ERROR` line, which most clients
+read as "the scanner broke". `--partial-as password-protected=found` reports
+`Heuristics.Encrypted.*` for any encryption, as ClamAV does even when a `.pwdb`
+password decrypts the member, while `PASSWORD-PROTECTED` is only what exav
+could not decrypt. `--partial-as limits-exceeded=found` turns a limit into
 `Heuristics.Limits.Exceeded.<which limit>`, the name coming from a typed limit
 kind rather than the reason text. `UNSCANNABLE` has no ClamAV-named equivalent;
 under `found` it becomes `Heuristics.Exav.Unscannable`.

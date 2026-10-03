@@ -306,6 +306,33 @@ Copyright (c) the zip2 contributors.
 
 
 -------------------------------------------------------------------------------
+1h5. fancy-regex, image, tiff (MIT) and Pillow (MIT-CMU), source derivatives
+-------------------------------------------------------------------------------
+
+crates/exav-core/src/fancy_regex/ is vendored from fancy-regex 0.19.2 with two
+fixes merged upstream after it. crates/exav-imagehash/src/image_codecs/ holds
+image 0.25.9's JPEG and TIFF decoders (image is MIT OR Apache-2.0, used under
+the MIT License) and the decoder of tiff 0.10.3, and
+crates/exav-imagehash/src/pillow.rs ports Pillow 12.3.0's resampler and its
+conversions to grey. The README.md beside each lists what was changed, and
+crates/exav-imagehash/src/LICENSE-pillow holds Pillow's license.
+
+Upstream: https://github.com/fancy-regex/fancy-regex
+Copyright 2015 The Fancy Regex Authors.
+
+Upstream: https://github.com/image-rs/image
+The image-rs Developers.
+
+Upstream: https://github.com/image-rs/image-tiff
+Copyright (c) 2018 PistonDevelopers
+
+Upstream: https://github.com/python-pillow/Pillow
+Copyright © 1997-2011 by Secret Labs AB
+Copyright © 1995-2011 by Fredrik Lundh and contributors
+Copyright © 2010 by Jeffrey 'Alex' Clark and contributors
+
+
+-------------------------------------------------------------------------------
 1h. oletools test sample, BSD-2-Clause (test fixture)
 -------------------------------------------------------------------------------
 
@@ -464,10 +491,11 @@ shipped 7z reader is native (§1m) and the bzip2 decoder is vendored (§1h3).
 
 MIT-only components (the MIT copyright and permission notice must be retained;
 the MIT text is in the exav LICENSE file): apfs, ascii_tree, cfb, color_quant,
-deflate64, explode, fancy-regex, fatfs, goblin, hfsplus, lznt1, quick-xml,
+deflate64, explode, fatfs, fax, fax_derive, goblin, hfsplus, lznt1, quick-xml,
 rmp, rmp-serde, ruzstd, salzweg, scroll, scroll_derive, simd-adler32, slab,
-strsim, tiff, twox-hash, unshield, xz4rust, zip, zmij, and bytes (`http`
-features only).
+strsim, twox-hash, unshield, xz4rust, zip, zmij, and bytes (`http` features
+only). fancy-regex and tiff are vendored, and Pillow's resampler ported
+(§1h5).
 
 Apache-2.0-only: lzma-rust2 (it ships no NOTICE file of its own; the license
 text is in section 4).

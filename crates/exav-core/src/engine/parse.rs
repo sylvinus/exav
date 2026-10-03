@@ -28,7 +28,11 @@ pub(super) fn classify_failure_reason(s: &str) -> &'static str {
     // mislabelled every *alternation* as byte-compare, i.e. 6 of the 16 skipped
     // signatures in a live daily set were filed under the wrong missing feature.
     if s.starts_with("fuzzy_img#") {
-        return "ldb: malformed fuzzy_img# subsignature";
+        return if cfg!(feature = "image-hash") {
+            "ldb: malformed fuzzy_img# subsignature"
+        } else {
+            "ldb: fuzzy_img# subsignature in a build without image-hash"
+        };
     }
     // Byte-compare has the shape `N(offset#properties#value)`: a subsignature
     // reference, then a parenthesised triple separated by '#'.
@@ -43,7 +47,7 @@ pub(super) fn classify_failure_reason(s: &str) -> &'static str {
         return "ldb: unsupported byte-compare subsignature";
     }
     if s.contains('/') {
-        return "ldb: unsupported PCRE subsignature";
+        return parse_pcre(s).err().unwrap_or("ldb: unsupported PCRE subsignature");
     }
     // `(a|b)` alternations, including the empty-branch form `(abc|)` that makes
     // a run optional, and branches that themselves contain nibble wildcards.
@@ -57,6 +61,9 @@ pub(super) fn classify_failure_reason(s: &str) -> &'static str {
 /// (`Trigger/regex/flags`), or a normal hex/pattern body.
 pub(super) fn classify_subsig(s: &str) -> Option<ParsedSub> {
     if let Some(rest) = s.strip_prefix("fuzzy_img#") {
+        if !cfg!(feature = "image-hash") {
+            return None;
+        }
         return parse_fuzzy_subsig(rest).map(|(h, d)| ParsedSub::Fuzzy(h, d));
     }
     if let Some(b) = parse_bcomp_subsig(s) {
@@ -106,50 +113,67 @@ pub(super) fn parse_num(s: &str) -> Option<i64> {
     }
 }
 
-/// Parse `Trigger/PCRE/[flags]`. The regex is delimited by the first and last
-/// `/`; flags `i`/`s`/`m` map to case-insensitive/dotall/multiline (other
-/// Flags like `g`/`r`/`e` are accepted but don't change a match/no-match
-/// result here).
+/// Parse `[Offset:]Trigger/PCRE/[flags]`. The regex is delimited by the first
+/// and last `/`. `i`, `s`, `m`, `x`, `E` and `U` are PCRE2's options, applied
+/// by `pcre::translate`; `g`, `r`, `e` and `A` are how ClamAV runs it. A
+/// pattern the translation refuses, or another flag, leaves the signature
+/// unsupported.
 pub(super) fn parse_pcre_subsig(s: &str) -> Option<PcreSub> {
-    let first = s.find('/')?;
-    let last = s.rfind('/')?;
+    parse_pcre(s).ok()
+}
+
+/// [`parse_pcre_subsig`], saying why a subsignature is refused.
+pub(super) fn parse_pcre(s: &str) -> Result<PcreSub, &'static str> {
+    const MALFORMED: &str = "ldb: malformed PCRE subsignature";
+    let first = s.find('/').ok_or(MALFORMED)?;
+    let last = s.rfind('/').ok_or(MALFORMED)?;
     if last <= first {
-        return None;
+        return Err(MALFORMED);
     }
     // `[Offset:]Trigger/PCRE/Flags`. An offset prefix constrains where the match
     // may start; on a live `daily.cvd` 368 of the 369 that use one are `EOF-n`
     // (a trailing marker), so leaving it unparsed dropped those signatures.
     let head = &s[..first];
     let (offset, trigger_src) = match head.split_once(':') {
-        Some((o, t)) => (parse_offset(o)?, t),
+        Some((o, t)) => (parse_offset(o).ok_or(MALFORMED)?, t),
         None => (Offset::Any, head),
     };
     // Only offsets resolvable from the file length alone. `EP`/`Sx` need a PE
-    // layout `PcreSub::is_match` does not carry, and matching one without it
+    // layout `PcreSub::count` does not carry, and matching one without it
     // would silently never fire — so it stays counted-unsupported instead.
-    if !matches!(
-        offset,
-        Offset::Any | Offset::Constrained(_)
-    ) || matches!(
+    if matches!(
         &offset,
         Offset::Constrained(k)
             if !matches!(k.as_ref(), OffsetKind::Abs { .. } | OffsetKind::Eof { .. })
     ) {
-        return None;
+        return Err("ldb: PCRE subsignature offset relative to a PE layout");
     }
-    let trigger = parse_expr(trigger_src)?;
+    let trigger = parse_expr(trigger_src).ok_or(MALFORMED)?;
     let pattern = &s[first + 1..last];
     if pattern.is_empty() {
-        return None;
+        return Err(MALFORMED);
     }
     let flags = &s[last + 1..];
-    Some(PcreSub {
-        trigger,
-        offset,
-        pattern: pattern.to_string(),
-        ci: flags.contains('i'),
+    if !flags.chars().all(|c| "greismxAEU".contains(c)) {
+        return Err("ldb: unknown PCRE subsignature flag");
+    }
+    let options = super::pcre::Flags {
+        caseless: flags.contains('i'),
         dotall: flags.contains('s'),
         multiline: flags.contains('m'),
+        extended: flags.contains('x'),
+        dollar_endonly: flags.contains('E'),
+        ungreedy: flags.contains('U'),
+        ..Default::default()
+    };
+    Ok(PcreSub {
+        trigger,
+        offset,
+        pattern: super::pcre::translate(pattern, options)?,
+        global: flags.contains('g'),
+        rolling: flags.contains('r'),
+        encompass: flags.contains('e'),
+        anchored: flags.contains('A'),
         re: std::sync::OnceLock::new(),
         fancy: std::sync::OnceLock::new(),
         prefilter: std::sync::OnceLock::new(),
