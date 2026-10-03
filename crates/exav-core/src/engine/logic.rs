@@ -46,9 +46,10 @@ impl Node {
     }
 
     /// Sound satisfiability over-approximation: can this expression *possibly*
-    /// evaluate true, given that subsigs for which `unknown(i)` is true have a
-    /// not-yet-computed binary count (0 or 1 — PCRE/bcomp/fuzzy subsigs), while
-    /// the rest have the fixed count `count(i)`? Returns false only when NO
+    /// evaluate true, given that subsigs for which `unknown(i)` is `Some(max)`
+    /// have a not-yet-computed count anywhere in `0..=max` (PCRE/bcomp/fuzzy
+    /// subsigs: 1, or unbounded for a PCRE counting every match), while the
+    /// rest have the fixed count `count(i)`? Returns false only when NO
     /// assignment of the unknowns can satisfy the expression, so a caller may
     /// safely skip evaluating those (expensive) subsigs. Unknowns appearing in
     /// multiple leaves are treated independently (an over-approximation), so the
@@ -57,26 +58,34 @@ impl Node {
     pub(super) fn can_be_true(
         &self,
         count: &dyn Fn(usize) -> u32,
-        unknown: &dyn Fn(usize) -> bool,
+        unknown: &dyn Fn(usize) -> Option<u32>,
     ) -> bool {
         match self {
-            Node::Sub(i) => unknown(*i) || count(*i) > 0,
-            Node::SubCmp(i, c, x) => {
-                if unknown(*i) {
-                    cmp_ok(*c, 0, *x) || cmp_ok(*c, 1, *x)
-                } else {
-                    cmp_ok(*c, count(*i), *x)
-                }
-            }
+            Node::Sub(i) => unknown(*i).is_some() || count(*i) > 0,
+            Node::SubCmp(i, c, x) => match unknown(*i) {
+                // Some value in 0..=max satisfies the comparison.
+                Some(max) => match c {
+                    Cmp::Gt => max > *x,
+                    Cmp::Lt => *x > 0,
+                    Cmp::Eq => *x <= max,
+                },
+                None => cmp_ok(*c, count(*i), *x),
+            },
             Node::GroupCmp(ids, c, x, y) => {
-                let known_sum: u32 = ids.iter().filter(|&&i| !unknown(i)).map(|&i| count(i)).sum();
-                let nunk = ids.iter().filter(|&&i| unknown(i)).count() as u32;
-                // Unknown subsigs each contribute 0 or 1, so the group total is
-                // achievable anywhere in [known_sum, known_sum + nunk].
+                let known_sum: u64 = ids
+                    .iter()
+                    .filter(|&&i| unknown(i).is_none())
+                    .map(|&i| u64::from(count(i)))
+                    .sum();
+                let unknown_max: u64 = ids.iter().filter_map(|&i| unknown(i)).map(u64::from).sum();
+                let nunk = ids.iter().filter(|&&i| unknown(i).is_some()).count() as u32;
+                // The group total is achievable anywhere in
+                // [known_sum, known_sum + unknown_max].
+                let x64 = u64::from(*x);
                 let total_ok = match c {
-                    Cmp::Gt => known_sum + nunk > *x,
-                    Cmp::Lt => known_sum < *x,
-                    Cmp::Eq => *x >= known_sum && *x <= known_sum + nunk,
+                    Cmp::Gt => known_sum + unknown_max > x64,
+                    Cmp::Lt => known_sum < x64,
+                    Cmp::Eq => x64 >= known_sum && x64 <= known_sum + unknown_max,
                 };
                 if !total_ok {
                     return false;
@@ -85,7 +94,7 @@ impl Node {
                     Some(y) => {
                         let known_distinct = ids
                             .iter()
-                            .filter(|&&i| !unknown(i) && count(i) > 0)
+                            .filter(|&&i| unknown(i).is_none() && count(i) > 0)
                             .count() as u32;
                         known_distinct + nunk >= *y
                     }
@@ -94,6 +103,46 @@ impl Node {
             }
             Node::And(v) => v.iter().all(|n| n.can_be_true(count, unknown)),
             Node::Or(v) => v.iter().any(|n| n.can_be_true(count, unknown)),
+        }
+    }
+
+    /// Sound satisfiability over-approximation for pruning *before* any body
+    /// subsignature is verified. `absent(i)` marks a subsig whose count is
+    /// certainly 0 because no body of it has an anchor hit anywhere in the
+    /// buffer; every other subsig is free to take any count.
+    ///
+    /// Distinct from [`Self::can_be_true`], whose unknowns are binary: a body
+    /// subsig can match many times, so a 0-or-1 unknown would wrongly prune
+    /// `SubCmp(i, Gt, 5)` and lose the signature. Returns false only when no
+    /// assignment of the free subsigs can satisfy the expression, so pruning
+    /// stays FN-safe; `total` and `distinct` in a group are over-approximated
+    /// independently, which can only yield a false "possible".
+    pub(super) fn can_be_true_absent(&self, absent: &dyn Fn(usize) -> bool) -> bool {
+        // A free count ranges over all of `u32`, so a comparison is satisfiable
+        // unless the bound itself rules every value out.
+        let free_cmp_ok = |c: Cmp, x: u32| match c {
+            Cmp::Eq => true,
+            Cmp::Gt => x < u32::MAX,
+            Cmp::Lt => x > 0,
+        };
+        match self {
+            Node::Sub(i) => !absent(*i),
+            Node::SubCmp(i, c, x) => {
+                if absent(*i) {
+                    cmp_ok(*c, 0, *x)
+                } else {
+                    free_cmp_ok(*c, *x)
+                }
+            }
+            Node::GroupCmp(ids, c, x, y) => {
+                let nfree = ids.iter().filter(|&&i| !absent(i)).count() as u32;
+                if nfree == 0 {
+                    return cmp_ok(*c, 0, *x) && y.is_none_or(|y| y == 0);
+                }
+                free_cmp_ok(*c, *x) && y.is_none_or(|y| nfree >= y)
+            }
+            Node::And(v) => v.iter().all(|n| n.can_be_true_absent(absent)),
+            Node::Or(v) => v.iter().any(|n| n.can_be_true_absent(absent)),
         }
     }
 
@@ -318,7 +367,7 @@ mod tests {
 
     fn check(expr: &str, base: &[u32], unk: &[usize]) {
         let node = parse_expr(expr).unwrap();
-        let is_unknown = |i: usize| unk.contains(&i);
+        let is_unknown = |i: usize| unk.contains(&i).then_some(1);
         let over = node.can_be_true(&|i| base.get(i).copied().unwrap_or(0), &is_unknown);
         let exact = brute_satisfiable(&node, base, unk);
         // Sound: whenever truly satisfiable, the over-approximation must say so.
@@ -332,11 +381,24 @@ mod tests {
     fn gate_never_prunes_satisfiable() {
         // Absent required AND-body → unsatisfiable regardless of the PCRE.
         let node = parse_expr("0&1").unwrap();
-        assert!(!node.can_be_true(&|_| 0, &|i| i == 1)); // subsig0 absent
-        assert!(node.can_be_true(&|i| (i == 0) as u32, &|i| i == 1)); // subsig0 present
+        assert!(!node.can_be_true(&|_| 0, &|i| (i == 1).then_some(1))); // subsig0 absent
+        assert!(node.can_be_true(&|i| (i == 0) as u32, &|i| (i == 1).then_some(1))); // subsig0 present
         // OR keeps it satisfiable through the unknown branch.
         let n2 = parse_expr("(0&1)|2").unwrap();
-        assert!(n2.can_be_true(&|_| 0, &|i| i == 2));
+        assert!(n2.can_be_true(&|_| 0, &|i| (i == 2).then_some(1)));
+    }
+
+    /// A PCRE subsig with `g` counts every match, so a count threshold above 1
+    /// on it is satisfiable before it runs.
+    #[test]
+    fn gate_keeps_a_count_an_unknown_can_reach() {
+        let node = parse_expr("0&1>3").unwrap();
+        let present = |i: usize| (i == 0) as u32;
+        assert!(!node.can_be_true(&present, &|i| (i == 1).then_some(1)));
+        assert!(node.can_be_true(&present, &|i| (i == 1).then_some(u32::MAX)));
+        let group = parse_expr("0&(1|2)>5").unwrap();
+        assert!(!group.can_be_true(&present, &|i| (i > 0).then_some(1)));
+        assert!(group.can_be_true(&present, &|i| (i == 1).then_some(u32::MAX).or((i == 2).then_some(1))));
     }
 
     #[test]

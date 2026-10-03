@@ -774,10 +774,12 @@ fn an_object_past_the_size_limit_blocks_rather_than_passing() {
 
     assert_eq!(r.code, 200, "an unscanned object must not get a 204: {r:?}");
     assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
-    // Word for word what the clamd listener says about a stream this size.
-    // There is one size setting, and it does not answer differently depending
-    // on which port the object arrived at.
-    assert_eq!(r.header("X-Exav-Reason"), Some("size exceeds 1024"));
+    // Word for word what the clamd listener and a file path say about an
+    // object this size: it is one scan, whatever the object arrived through.
+    assert_eq!(
+        r.header("X-Exav-Reason"),
+        Some("file size 65536 exceeds max-input-bytes 1024; scanned first 1024 bytes only")
+    );
     // Blocked in the c-icap vocabulary too, under a name that says which
     // condition blocked it rather than borrowing a database signature's.
     assert_eq!(
@@ -1208,7 +1210,7 @@ fn an_object_with_nowhere_to_spill_gets_a_verdict_rather_than_a_dropped_connecti
     let r = c.recv();
 
     assert_eq!(r.code, 200, "an object nobody buffered is not a 204: {r:?}");
-    assert_eq!(r.header("X-Exav-Category"), Some("UNSCANNABLE"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(
         r.header("X-Exav-Reason")
             .unwrap_or_default()
@@ -1263,7 +1265,7 @@ fn no_spill_keeps_scanned_bytes_off_the_disk() {
     ));
     let r = c.recv();
     assert_eq!(r.code, 200, "{r:?}");
-    assert_eq!(r.header("X-Exav-Category"), Some("UNSCANNABLE"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(
         r.header("X-Exav-Reason")
             .unwrap_or_default()

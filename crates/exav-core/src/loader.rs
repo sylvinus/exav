@@ -22,14 +22,14 @@ pub const CONTAINER_EXTENSIONS: &[&str] = &["cvd", "cld"];
 /// Loose signature-file extensions, loaded as unofficial.
 pub const SIGNATURE_EXTENSIONS: &[&str] = &[
     "ndb", "ndu", "db", "hdb", "hdu", "hsb", "hsu", "fdb", "imp", "ldb", "ldu", "mdb", "mdu",
-    "msb", "cdb", "ftm", "pdb", "gdb", "wdb", "crb", "yar", "yara", "fp", "sfp", "ign", "ign2",
-    "cbc", "idb", "pwdb",
+    "msb", "msu", "cdb", "ftm", "pdb", "gdb", "wdb", "crb", "yar", "yara", "fp", "sfp", "ign",
+    "ign2", "cbc", "idb", "pwdb",
 ];
 
 /// Whether a filename's extension is one the loader routes.
 ///
 /// A file in a signature directory with any other extension is skipped without
-/// being read — the directory legitimately holds `.cdiff`, `.sign`, `.info` and
+/// being read: the directory legitimately holds `.cdiff`, `.sign`, `.info` and
 /// updater state alongside the databases, and reading those as signatures would
 /// be worse than ignoring them. The cost is that a file which *should* have been
 /// a database is skipped just as quietly, so anything that puts a file there is
@@ -61,8 +61,6 @@ pub enum LoadError {
     TooLarge { path: String },
     #[error("parsing signature container: {0}")]
     Container(String),
-    #[error("building pattern set: {0}")]
-    Patterns(String),
     #[error("loading database {path}: {source}")]
     Database {
         path: String,
@@ -94,17 +92,15 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, LoadError> {
 use crate::fuzzy::FuzzyDb;
 use crate::hashes::{HashDb, SectionHashDb};
 use crate::ml::HeuristicModel;
-use crate::patterns::{eicar, Pattern, PatternSet};
+use crate::patterns::eicar;
 use crate::Scanner;
 
 /// Accumulates parsed signatures from multiple files before building.
 #[derive(Default)]
 pub struct Builder {
-    /// Literal patterns for the streaming path (literal `.ndb` + `.db`).
-    patterns: Vec<Pattern>,
     /// The full in-memory engine, fed signature text file-by-file so the raw
     /// text is dropped as it's compiled (rather than concatenated and held
-    /// alive through the memory-heavy automaton build).
+    /// alive through the index build).
     engine: EngineBuilder,
     hashes: HashDb,
     sections: SectionHashDb,
@@ -116,15 +112,15 @@ pub struct Builder {
     /// Raw `.cbc` texts; parsed and gated into a runtime at [`Self::build`].
     bytecode_sources: Vec<String>,
     /// ClamAV `--detect-pua`: when false (default), the PUA-variant databases
-    /// (`.ndu`/`.ldu`/`.hdu`/`.hsu`/`.mdu`) are skipped entirely and `PUA.*`
+    /// (`.ndu`/`.ldu`/`.hdu`/`.hsu`/`.mdu`/`.msu`) are skipped entirely and `PUA.*`
     /// signatures elsewhere are dropped.
     detect_pua: bool,
     /// Retained for API/CLI compatibility (`--clamav-compat` calls
     /// [`Self::set_unofficial_suffix`]); it does not affect what is stored.
     ///
-    /// Provenance — whether a signature came from an unofficial (non-`.cvd`)
-    /// database — is now recorded *per signature*, always, regardless of this
-    /// flag. The `.UNOFFICIAL` name suffix / `YARA.` prefix is applied at REPORT
+    /// Provenance (whether a signature came from an unofficial, non-`.cvd`
+    /// database) is now recorded *per signature*, always, regardless of this
+    /// flag. The `.UNOFFICIAL` name suffix is applied at REPORT
     /// time (gated on `ScanOptions::unofficial_suffix`), so ONE database serves both compat and
     /// non-compat scans. Official `.cvd`/`.cld` sigs carry `unofficial=false` and
     /// are never suffixed. See `crate::report_name`.
@@ -138,11 +134,6 @@ pub struct Builder {
     /// Passwords parsed from `.pwdb` files, used to decrypt encrypted archive
     /// members. User-supplied (the official CVDs ship no `.pwdb`).
     passwords: Vec<String>,
-    /// Optional per-shard memory budget for the signature-automaton build
-    /// (`--max-build-memory`). `None` = build each partition as a single
-    /// automaton (fastest). A budget shards large partitions so a huge set
-    /// (`main+daily`) can build on a small host. Affects `--build-db` builds.
-    max_build_mem: Option<u64>,
     /// Version + build-time of the newest loaded `.cvd`/`.cld` container, for the
     /// clamd-compatible daemon `VERSION` reply. See [`Scanner::db_version`].
     db_version: Option<(u32, String)>,
@@ -150,6 +141,10 @@ pub struct Builder {
     /// phishing heuristic for brand scoping and false-positive suppression.
     #[cfg(feature = "phishing")]
     phishing: crate::phishing::PhishingDb,
+    /// A prebuilt database met in a directory, which loads only by its own
+    /// path. Kept so a directory holding nothing else is an error rather than
+    /// the built-in baseline.
+    prebuilt_skipped: Option<std::path::PathBuf>,
 }
 
 impl Builder {
@@ -165,12 +160,6 @@ impl Builder {
         self.engine.set_detect_pua(on);
     }
 
-    /// Set the per-shard automaton-build memory budget (`--max-build-memory`).
-    /// `None` (default) builds each partition as one automaton.
-    pub fn set_max_build_mem(&mut self, bytes: Option<u64>) {
-        self.max_build_mem = bytes;
-    }
-
     /// Retained for API/CLI compatibility (`--clamav-compat`). The unofficial
     /// suffix is applied at scan/report time (gated on `ScanOptions::unofficial_suffix`),
     /// using per-signature provenance recorded at load regardless of this flag, so
@@ -183,7 +172,7 @@ impl Builder {
     /// Load a path that is either a single db file/container or a directory.
     /// Directories are scanned **recursively**: db files at any depth are loaded
     /// (entries sorted for deterministic order). Hidden (`.`-prefixed)
-    /// sub-directories are skipped — `.git`, caches, editor/backup dirs — so a
+    /// sub-directories are skipped (`.git`, caches, editor/backup dirs), so a
     /// nested feed layout loads fully without slurping unrelated files. Recursion
     /// follows symlinks but is depth-capped so a symlink cycle can't loop forever.
     pub fn add_path(&mut self, path: &Path) -> Result<(), LoadError> {
@@ -259,8 +248,13 @@ impl Builder {
                 Ok(())
             }
             // Skip anything else in a database directory (.cdiff/.sign/.info,
-            // state files, etc.) without reading it.
-            _ => Ok(()),
+            // state files, etc.) without reading it past its magic.
+            _ => {
+                if self.prebuilt_skipped.is_none() && crate::database::is_database_file(path) {
+                    self.prebuilt_skipped = Some(path.to_path_buf());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -275,35 +269,38 @@ impl Builder {
     fn add_named_text(&mut self, name: &str, text: &str, official: bool) {
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
         // Provenance: a signature from any database that is NOT a signed
-        // `.cvd`/`.cld` container is "unofficial" — ClamAV suffixes such
-        // detections with `.UNOFFICIAL` (and YARA rules with a `YARA.` prefix).
+        // `.cvd`/`.cld` container is "unofficial"; ClamAV suffixes such
+        // detections with `.UNOFFICIAL`.
         // We record this bit per signature, ALWAYS (independent of any compat
         // flag), and store the CLEAN name. The suffix is applied at report time
         // (see `crate::report_name`), gated on `ScanOptions::unofficial_suffix`, so a single
         // database serves both compat and non-compat scans.
         let unofficial = !official;
-        // The `.??u` databases (`.ndu`/`.ldu`/`.hdu`/`.hsu`/`.mdu`) are ClamAV's
-        // PUA signature sets, loaded only with `DetectPUA`. Skip them by default
-        // so exav doesn't flag PUA (including hash-based PUA, which has no `PUA.`
-        // name gate) on a default config.
-        if !self.detect_pua && matches!(ext.as_str(), "ndu" | "ldu" | "hdu" | "hsu" | "mdu") {
+        // The `.??u` databases (`.ndu`/`.ldu`/`.hdu`/`.hsu`/`.mdu`/`.msu`) are
+        // ClamAV's PUA signature sets, loaded only with `DetectPUA`. Skip them by
+        // default so exav doesn't flag PUA (including hash-based PUA, which has no
+        // `PUA.` name gate) on a default config.
+        if !self.detect_pua && matches!(ext.as_str(), "ndu" | "ldu" | "hdu" | "hsu" | "mdu" | "msu")
+        {
             return;
         }
         match ext.as_str() {
             // `.ndb`/`.ndu` (unpacked-content variant share the format).
-            "ndb" | "ndu" => {
-                // Literal subset for streaming; full text for the engine.
-                let (mut pats, _unsup) = PatternSet::parse_ndb_prov(text, unofficial);
-                self.patterns.append(&mut pats);
-                self.engine.add_ndb(text, unofficial);
-            }
+            "ndb" | "ndu" => self.engine.add_ndb(text, unofficial),
+            // Literal `Name=HEX` signatures.
             "db" => {
-                if let Ok(mut pats) = PatternSet::parse_simple(text) {
-                    self.patterns.append(&mut pats);
+                let (pats, skipped) = crate::patterns::parse_simple(text);
+                self.engine
+                    .skip_unloadable("db line not Name=plain hex", skipped);
+                for (name, bytes) in pats {
+                    if name.starts_with("PUA.") && !self.detect_pua {
+                        continue;
+                    }
+                    self.engine.add_literal_prov(&name, &bytes, unofficial);
                 }
             }
             "hdb" | "hsb" | "hdu" | "hsu" => self.hashes.extend_from_text_prov(text, unofficial),
-            "mdb" | "mdu" | "msb" => self.sections.extend_from_text_prov(text, unofficial),
+            "mdb" | "mdu" | "msb" | "msu" => self.sections.extend_from_text_prov(text, unofficial),
             "fdb" => self.fuzzy.extend_from_text(text),
             "imp" => self.fuzzy.extend_imp(text),
             "cdb" => self.cdb.extend_from_text_prov(text, unofficial),
@@ -319,9 +316,9 @@ impl Builder {
             #[cfg(not(feature = "phishing"))]
             "pdb" | "gdb" | "wdb" => {}
             // Authenticode-cert database (`.crb`): block-list of signer certs.
-            // We match on the certificate identity (subject-hash + serial) — RSA
+            // We match on the certificate identity (subject-hash + serial). RSA
             // signature *verification* remains out of scope (would reintroduce the
-            // excluded `rsa` crate — see docs/DEPENDENCIES.md).
+            // excluded `rsa` crate, see docs/DEPENDENCIES.md).
             "crb" => self.crb.parse_into(text),
             "yar" | "yara" => self.yara.extend_from_text(text, unofficial),
             // Whole-file hash allowlist (clears a detection).
@@ -352,26 +349,26 @@ impl Builder {
             // signature-name / target-description scoping is not yet applied
             // (every loaded password is tried against every encrypted member).
             "pwdb" => parse_pwdb_into(text, &mut self.passwords),
-            // Bytecode programs: keep the raw text; parsing + gating happens at
-            // build() (the runtime drops any that fail to parse).
+            // Bytecode programs: keep the raw text of those that parse, for
+            // build(); one that does not is counted unsupported.
             "cbc" if crate::bytecode::parse(text).is_ok() => {
                 self.bytecode_sources.push(text.to_string());
             }
+            "cbc" => self
+                .engine
+                .skip_unloadable("bytecode program does not parse", 1),
             _ => {}
         }
     }
 
-    /// Build the final database. If no patterns were loaded, the built-in
-    /// EICAR pattern is retained so the engine always has at least a test
-    /// signature.
+    /// Build the final database. The EICAR test signature is always added, so
+    /// the engine has at least that one.
     pub fn build(mut self) -> Result<Scanner, LoadError> {
-        // Fold EICAR into the engine so in-memory scans detect it without the
-        // streaming automaton; also keep it in the streaming literal set.
         self.engine.add_literal("Eicar-Test-Signature", eicar());
 
-        // Sort + intern the hash tables BEFORE building the (memory-heavy)
-        // automaton: finalize collapses millions of per-entry strings into one
-        // buffer, so that transient doesn't coexist with the build's peak.
+        // Sort + intern the hash tables BEFORE building the signature index:
+        // finalize collapses millions of per-entry strings into one buffer, so
+        // that transient doesn't coexist with the build's peak.
         let mut hashes = self.hashes;
         let mut sections = self.sections;
         let mut allow = self.allow;
@@ -382,14 +379,14 @@ impl Builder {
         // stored in the database and scans don't recompile on first use.
         self.yara.finalize();
 
-        let engine = self.engine.build_with_budget(self.max_build_mem);
-
-        let mut pats = self.patterns;
-        pats.push(Pattern::new("Eicar-Test-Signature", eicar().to_vec()));
-        let patterns = PatternSet::build(&pats, 0).map_err(LoadError::Patterns)?;
+        // Bytecode triggers join the engine, to be matched in the same sweep.
+        let bytecode = crate::bytecode::runtime::BytecodeRuntime::from_sources(
+            self.bytecode_sources,
+            &mut self.engine,
+        );
+        let engine = self.engine.build();
 
         Ok(Scanner {
-            patterns,
             engine,
             hashes,
             sections,
@@ -398,9 +395,7 @@ impl Builder {
             yara: self.yara,
             allow,
             ignored: self.ignored,
-            bytecode: crate::bytecode::runtime::BytecodeRuntime::from_sources(
-                self.bytecode_sources,
-            ),
+            bytecode,
             model: Box::new(HeuristicModel),
             ml_threshold: 0.85,
             ftm: self.ftm,
@@ -476,7 +471,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Load a database from a file/dir path (convenience). A prebuilt exav database
 /// file (see [`crate::database`]) is detected by its magic tag and loaded
-/// directly, skipping signature parsing and automaton construction.
+/// directly, skipping signature parsing and the index build.
 pub fn load(path: &Path) -> Result<Scanner, LoadError> {
     load_with_pua(path, false)
 }
@@ -488,26 +483,15 @@ pub fn load_with_pua(path: &Path, detect_pua: bool) -> Result<Scanner, LoadError
     load_with_options(path, detect_pua, false)
 }
 
-/// As [`load`], with control over PUA detection and the unofficial-name suffix.
-/// `unofficial_suffix` (set under `--clamav-compat`) tags signatures from
-/// unofficial databases with `.UNOFFICIAL`/`YARA.` for exact ClamAV output. A
-/// prebuilt database already reflects the choices made when it was built, so these
-/// only affect loading a raw db file/dir/CVD.
+/// As [`load`], with control over PUA detection. `unofficial_suffix` is kept for
+/// API compatibility and changes nothing loaded: the `.UNOFFICIAL` suffix is
+/// applied at report time from `ScanOptions::unofficial_suffix`. A prebuilt
+/// database already reflects the PUA choice made when it was built, so
+/// `detect_pua` only affects loading a raw db file/dir/CVD.
 pub fn load_with_options(
     path: &Path,
     detect_pua: bool,
     unofficial_suffix: bool,
-) -> Result<Scanner, LoadError> {
-    load_with_options_mem(path, detect_pua, unofficial_suffix, None)
-}
-
-/// As [`load_with_options`], with a per-shard automaton-build memory budget
-/// (`--max-build-memory`). Ignored when `path` is a prebuilt database file.
-pub fn load_with_options_mem(
-    path: &Path,
-    detect_pua: bool,
-    unofficial_suffix: bool,
-    max_build_mem: Option<u64>,
 ) -> Result<Scanner, LoadError> {
     if path.is_file() && crate::database::is_database_file(path) {
         return crate::database::load(path).map_err(|e| LoadError::Database {
@@ -515,12 +499,32 @@ pub fn load_with_options_mem(
             source: e,
         });
     }
+    // A mistyped path would otherwise load nothing and return the built-in
+    // baseline, a scanner that finds nothing but the test string.
+    if !path.exists() {
+        return Err(LoadError::Io {
+            path: path.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory"),
+        });
+    }
     let mut builder = Builder::new();
     builder.set_detect_pua(detect_pua);
     builder.set_unofficial_suffix(unofficial_suffix);
-    builder.set_max_build_mem(max_build_mem);
     builder.add_path(path)?;
-    builder.build()
+    let prebuilt = builder.prebuilt_skipped.take();
+    let scanner = builder.build()?;
+    match prebuilt {
+        Some(db) if scanner.signature_count() <= Scanner::builtin().signature_count() => {
+            Err(LoadError::Io {
+                path: db.display().to_string(),
+                source: std::io::Error::other(
+                    "a prebuilt database loads by its own path, not from the directory \
+                     holding it",
+                ),
+            })
+        }
+        _ => Ok(scanner),
+    }
 }
 
 #[cfg(test)]
@@ -533,8 +537,8 @@ mod tests {
     ///
     /// They have to be, because a file this says yes to and the loader skips is
     /// invisible: it is fetched, reported as updated, and never becomes a
-    /// signature. The directory is also a working area — `.cdiff`, `.sign`,
-    /// `.info` and updater state live beside the databases — so "skip what I do
+    /// signature. The directory is also a working area (`.cdiff`, `.sign`,
+    /// `.info` and updater state live beside the databases), so "skip what I do
     /// not know" is right, and the answer to which is which can only be in one
     /// place.
     #[test]
@@ -564,6 +568,47 @@ mod tests {
         ] {
             assert!(!loads_by_extension(name), "{name} is not a database");
         }
+    }
+
+    /// A path that loads nothing is an error, not the built-in baseline: a
+    /// typo, or a directory whose only database is a prebuilt one (which loads
+    /// by its own path).
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
+    fn a_path_that_loads_nothing_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("exav-loader-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load(&dir.join("no-such-dir")).is_err());
+
+        let mut b = Builder::new();
+        b.add_named_bytes("x.ndb", b"Test.X:0:*:4142434445464748\n", false);
+        let db = dir.join("x.exavdb");
+        crate::database::save(&b.build().unwrap(), &db).unwrap();
+        let err = load(&dir).map(|_| ()).unwrap_err();
+        assert!(err.to_string().contains("x.exavdb"), "{err}");
+        // The file itself loads, and beside real signatures it is only skipped.
+        assert!(load(&db).is_ok());
+        std::fs::write(dir.join("y.ndb"), "Test.Y:0:*:4142434445464749\n").unwrap();
+        assert!(load(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.msu` is ClamAV's PUA section-hash set, loaded like `.msb` and, like
+    /// every `.??u` set, only when PUA detection is on.
+    #[test]
+    fn msu_loads_as_pua_section_hashes() {
+        let line = b"4096:d41d8cd98f00b204e9800998ecf8427e:PUA.Test.Section\n";
+        let count = |pua: bool| {
+            let mut b = Builder::new();
+            b.set_detect_pua(pua);
+            b.add_named_bytes("x.msu", line, false);
+            b.build().unwrap().signature_count()
+        };
+        assert!(loads_by_extension("x.msu"));
+        assert_eq!(count(true), count(false) + 1);
     }
 
     #[test]
@@ -598,6 +643,28 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         assert_eq!(db.passwords, vec!["hunter2".to_string()]);
     }
 
+    /// A `.db` line that does not parse is skipped and counted on its own, and
+    /// the file's other signatures still load. A `.cbc` program that does not
+    /// parse is counted too.
+    #[test]
+    fn an_unloadable_db_line_or_cbc_program_is_counted() {
+        let mut b = Builder::new();
+        b.add_named_bytes(
+            "x.db",
+            b"Test.Good=6d616c776172652d676f6f64\nTest.Wild=6d61??6c\nno separator\n",
+            false,
+        );
+        b.add_named_bytes("y.cbc", b"not a bytecode program\n", false);
+        let db = b.build().unwrap();
+        assert_eq!(db.unsupported_count(), 3);
+        let report = crate::analyze(&db, b"xx malware-good xx", &crate::ScanOptions::default());
+        assert!(
+            matches!(&report.verdict, crate::Verdict::Infected { signature, .. } if signature == "Test.Good"),
+            "{:?}",
+            report.verdict
+        );
+    }
+
     #[test]
     #[cfg_attr(
         target_family = "wasm",
@@ -611,12 +678,16 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         )
         .unwrap();
         let d = crate::hashes::digests_of(b"x");
-        std::fs::write(dir.path().join("b.hdb"), format!("{}:*:Sig.H\n", d.md5)).unwrap();
+        std::fs::write(
+            dir.path().join("b.hdb"),
+            format!("{}:*:Sig.H\n", d.md5_hex()),
+        )
+        .unwrap();
         let mut f = std::fs::File::create(dir.path().join("c.fdb")).unwrap();
         writeln!(f, "imphash:abcd:Sig.F").unwrap();
 
         let db = load(dir.path()).unwrap();
-        assert!(!db.patterns.is_empty());
+        assert!(!db.engine.is_empty());
         // "de*ad" has no >=2-byte literal anchor -> counted unsupported.
         assert_eq!(db.unsupported_count(), 1);
         assert!(!db.hashes.is_empty());
@@ -713,7 +784,7 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
     }
 
     /// (c) an official `.cvd` signature is NEVER suffixed, even in compat, while a
-    /// loose sig loaded alongside it IS — proving per-signature provenance for a
+    /// loose sig loaded alongside it IS. This proves per-signature provenance for a
     /// mixed source.
     #[test]
     fn official_cvd_never_suffixed_mixed_source() {
@@ -771,10 +842,68 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         // In compat the detection name is suffixed and matches the ign entry.
         assert_eq!(analyze(&db, data, &compat).verdict, Verdict::Clean);
         // In non-compat the detection is the clean `Demo.Loose`, which the
-        // suffixed ign entry does NOT name — so it still fires.
+        // suffixed ign entry does NOT name, so it still fires.
         assert!(matches!(
             analyze(&db, data, &ScanOptions::default()).verdict,
             Verdict::Infected { .. }
         ));
+    }
+
+    /// A `.db` signature is matched by an ordinary scan.
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
+    fn a_db_signature_matches_in_memory() {
+        use crate::{analyze, ScanOptions, Verdict};
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("x.db"), "Test.Db=6576696c31706179\n").unwrap();
+        let db = load(dir.path()).unwrap();
+        match analyze(&db, b"aaa evil1pay bbb", &ScanOptions::default()).verdict {
+            Verdict::Infected { signature, .. } => assert_eq!(signature, "Test.Db"),
+            other => panic!("expected the .db signature, got {other:?}"),
+        }
+    }
+
+    /// `PUA.*` stays off unless asked for.
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
+    fn pua_literals_stay_off_by_default() {
+        use crate::{analyze, ScanOptions, Verdict};
+        let scan = |db: &Scanner, data: &[u8]| analyze(db, data, &ScanOptions::default());
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("p.ndb"),
+            "PUA.Test.X:0:*:70756170756170756170\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a.ndb"), "Demo.X:0:*:6e6f7065\n").unwrap();
+        let data = b"xx puapuapuap xx";
+        let db = load(dir.path()).unwrap();
+        assert_eq!(scan(&db, data).verdict, Verdict::Clean);
+
+        let mut b = Builder::new();
+        b.set_detect_pua(true);
+        b.add_path(dir.path()).unwrap();
+        let pua = b.build().unwrap();
+        assert!(matches!(scan(&pua, data).verdict, Verdict::Infected { .. }));
+    }
+
+    /// A literal `.ndb` signature is counted once.
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
+    fn a_literal_signature_is_counted_once() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.ndb"), "Demo.X:0:*:6e6f7065\n").unwrap();
+        let db = load(dir.path()).unwrap();
+        // It and the always-present EICAR test signature.
+        assert_eq!(db.signature_count(), 2);
     }
 }

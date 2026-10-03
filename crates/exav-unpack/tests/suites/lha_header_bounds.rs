@@ -41,7 +41,7 @@ fn the_overflow_reproducers_do_not_reach_the_decoder_unchecked() {
         let mut budget = Budget::new(Limits::default());
         // Either the bounds check refuses it or the decoder reports it; what
         // must never happen is a panic escaping, or a silent empty success.
-        let _ = extract(Format::Lha, data, &mut budget);
+        let _ = extract(Format::Lha, &data, &mut budget);
     }
 }
 

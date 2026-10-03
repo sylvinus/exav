@@ -487,7 +487,7 @@ pub fn version_info_anchors(data: &[u8]) -> Vec<u64> {
 /// Shared setup for the resource-tree walkers: parse the PE, map the resource
 /// directory to a file offset, and build the view over it.
 fn resource_view(data: &[u8]) -> Option<(Resources<'_>, usize)> {
-    let pe = goblin::pe::PE::parse(data).ok()?;
+    let pe = crate::pe::headers(data)?;
     let oh = pe.header.optional_header?;
     let rsrc = oh.data_directories.get_resource_table()?;
     if rsrc.virtual_address == 0 || rsrc.size == 0 {
@@ -515,9 +515,8 @@ fn resource_view(data: &[u8]) -> Option<(Resources<'_>, usize)> {
 
 /// Parse a PE and return the DIB slices of its first icon group.
 fn pe_icon_dibs(data: &[u8]) -> Vec<&[u8]> {
-    let pe = match goblin::pe::PE::parse(data) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
+    let Some(pe) = crate::pe::headers(data) else {
+        return Vec::new();
     };
     let oh = match pe.header.optional_header {
         Some(o) => o,

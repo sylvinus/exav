@@ -46,7 +46,7 @@ fn iso(files: &[(&str, u64, u64)], root_len: u64) -> Vec<u8> {
 
 fn entries(blob: &[u8]) -> Vec<exav_unpack::Entry> {
     let mut b = Budget::new(Limits::default());
-    extract(Format::Iso, blob, &mut b).unwrap_or_default()
+    extract(Format::Iso, &blob, &mut b).unwrap_or_default()
 }
 
 #[test]
@@ -100,6 +100,27 @@ fn a_corrupt_directory_record_is_reported() {
             .map(|x| (&x.name, x.unsupported))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn a_corrupt_directory_record_is_reported_when_streamed() {
+    // The scanner walks every ISO through `walk`, where the same record used
+    // to end the directory without a word.
+    let mut img = iso(&[("A.TXT", 19, 4)], 200);
+    let p = 18 * SECTOR + 33 + "A.TXT".len();
+    img[p] = 5;
+    let mut unsupported = Vec::new();
+    let mut b = Budget::new(Limits::default());
+    let _ = exav_unpack::walk(
+        Format::Iso,
+        &img,
+        &mut b,
+        &mut |m: &exav_unpack::MemberMeta, _: Option<exav_unpack::Member<'_>>, _: &mut Budget| {
+            unsupported.extend(m.unsupported);
+            None::<()>
+        },
+    );
+    assert!(!unsupported.is_empty(), "a corrupt record must be reported");
 }
 
 #[test]

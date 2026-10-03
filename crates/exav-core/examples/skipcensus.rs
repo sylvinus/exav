@@ -1,7 +1,7 @@
 // Diagnostic: why does a signature database contribute signatures exav does not
 // load? Feeds every `.ndb`/`.ldb` line from a `.cvd` (or a loose file) to a
 // fresh `EngineBuilder` and prints the per-reason breakdown, WITHOUT building
-// the automaton — so it is fast and needs no automaton-sized RAM.
+// the engine, so it is fast and needs little memory.
 //
 // "Counted, never silently ignored" is only half a guarantee if the count has
 // no attribution; this is what turns the number into a work list.

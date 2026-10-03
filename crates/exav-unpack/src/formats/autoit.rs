@@ -6,17 +6,20 @@
 //! AutoIt, so carving the embedded script back out lets the engine scan it.
 //!
 //! Implemented from the MIT-licensed **AutoIt-Ripper** reference
-//! (<https://github.com/nazywam/AutoIt-Ripper>, MIT) and the public format:
+//! (<https://github.com/nazywam/AutoIt-Ripper>, MIT) and the public format.
+//! After the marker, 16 bytes, then a run of `FILE` records: a 4-byte tag that
+//! decrypts to `"FILE"`, subtype and name strings, sizes, a checksum, two
+//! timestamps and the content, each field under its own key. A compressed
+//! member is an `EA05`/`EA06` magic, a big-endian output size and an LZSS
+//! bitstream. The two versions differ in:
 //!
-//! * **EA05** (older) — after the marker, a 16-byte region is summed into a
-//!   checksum, then a run of `FILE` records. Each record's 4-byte tag decrypts
-//!   (via AutoIt's Mersenne-Twister keystream, seed `0x16FA`) to `"FILE"`; the
-//!   subtype/name strings, sizes and CRC are keyed likewise, and the content is
-//!   MT-decrypted with `checksum + 0x22AF`. A compressed member is a `EA05`
-//!   magic + big-endian output size + an LZSS bitstream. We decode this in full.
-//! * **EA06** (newer) — keyed by a floating-point PRNG and a tokenised opcode
-//!   stream; recognised and reported [`Entry::unsupported`] (`autoit-ea06`),
-//!   never silently clean.
+//! * **EA05** (older): a Mersenne-Twister keystream, byte strings, and a content
+//!   key that adds the sum of the 16 bytes after the marker;
+//! * **EA06** (newer): a floating-point PRNG keystream and UTF-16 strings.
+//!
+//! A compiled script (`>>>AUTOIT SCRIPT<<<`) is a token stream, turned back into
+//! text in the form ClamAV writes it, so that the signatures written against
+//! that form match (see [`decompile`]).
 //!
 //! Every read is bounds-checked, output grows dynamically (never pre-allocated
 //! from an attacker size), and members are charged against the [`Budget`], so
@@ -24,8 +27,8 @@
 
 use crate::*;
 
-const MARKER_EA05: &[u8; 8] = b"AU3!EA05";
-const MARKER_EA06: &[u8; 8] = b"AU3!EA06";
+pub(crate) const MARKER_EA05: &[u8; 8] = b"AU3!EA05";
+pub(crate) const MARKER_EA06: &[u8; 8] = b"AU3!EA06";
 
 // AutoIt EA05 keystream seeds / XOR keys (format constants).
 const KEY_FILE_TAG: u32 = 0x16FA; // decrypts the 4-byte record tag to "FILE"
@@ -34,11 +37,54 @@ const KEY_SUBTYPE_DATA: u32 = 0xA25E;
 const KEY_NAME_LEN: u32 = 0x29AC;
 const KEY_NAME_DATA: u32 = 0xF25E;
 const KEY_SIZE: u32 = 0x45AA;
+#[cfg(test)]
 const KEY_CRC: u32 = 0xC3D2;
 const KEY_CONTENT: u32 = 0x22AF;
 
-pub(crate) fn is_autoit(data: &[u8]) -> bool {
-    find_marker(data, MARKER_EA05).is_some() || find_marker(data, MARKER_EA06).is_some()
+#[derive(Clone, Copy)]
+enum Cipher {
+    Mt,
+    Lame,
+}
+
+/// What differs between the two versions of the record stream.
+struct Version {
+    cipher: Cipher,
+    /// Strings are UTF-16, their length counted in characters.
+    unicode: bool,
+    /// The content key adds the sum of the 16 bytes after the marker.
+    checksum: bool,
+    file_tag: u32,
+    subtype: (u32, u32),
+    name: (u32, u32),
+    size: u32,
+    content: u32,
+}
+
+const EA05: Version = Version {
+    cipher: Cipher::Mt,
+    unicode: false,
+    checksum: true,
+    file_tag: KEY_FILE_TAG,
+    subtype: (KEY_SUBTYPE_LEN, KEY_SUBTYPE_DATA),
+    name: (KEY_NAME_LEN, KEY_NAME_DATA),
+    size: KEY_SIZE,
+    content: KEY_CONTENT,
+};
+
+const EA06: Version = Version {
+    cipher: Cipher::Lame,
+    unicode: true,
+    checksum: false,
+    file_tag: 0x18EE,
+    subtype: (0xADBC, 0xB33F),
+    name: (0xF820, 0xF479),
+    size: 0x87BC,
+    content: 0x2477,
+};
+
+pub(crate) fn is_autoit(p: &crate::Probe) -> bool {
+    p.find(MARKER_EA05).is_some() || p.find(MARKER_EA06).is_some()
 }
 
 fn find_marker(data: &[u8], needle: &[u8; 8]) -> Option<usize> {
@@ -60,86 +106,99 @@ pub(crate) fn extract_autoit<R>(
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
     if let Some(off) = find_marker(data, MARKER_EA05) {
-        return ea05(&data[off + 8..], budget, visit);
+        return records(&data[off + 8..], &EA05, budget, visit);
     }
     if let Some(off) = find_marker(data, MARKER_EA06) {
-        budget.count_entry()?;
-        let size = (data.len() - (off + 8).min(data.len())) as u64;
-        let e = Entry::unsupported(
-            "autoit-ea06".to_string(),
-            size,
-            false,
-            "AutoIt EA06 unsupported",
-        );
-        return Ok(visit(e, budget));
+        return records(&data[off + 8..], &EA06, budget, visit);
     }
     Ok(None)
 }
 
-/// Decode the EA05 record stream (`body` starts just past the marker).
-fn ea05<R>(body: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
+/// Decode the record stream (`body` starts just past the marker).
+fn records<R>(
+    body: &[u8],
+    v: &Version,
+    budget: &mut Budget,
+    visit: Sink<R>,
+) -> Result<Option<R>, LimitHit> {
     if body.len() < 16 {
         return Ok(None);
     }
-    // The first 16 bytes are summed into the content-decrypt checksum.
-    let checksum: u32 = body[..16]
-        .iter()
-        .fold(0u32, |a, &b| a.wrapping_add(b as u32));
+    let checksum: u32 = if v.checksum {
+        body[..16]
+            .iter()
+            .fold(0u32, |a, &b| a.wrapping_add(b as u32))
+    } else {
+        0
+    };
 
     let mut pos = 16usize;
     let mut emitted = 0u32;
-    // Record tag: 4 bytes that MT-decrypt to "FILE".
     while let Some(tag_enc) = body.get(pos..pos + 4) {
         let mut tag = tag_enc.to_vec();
-        mt_xor(&mut tag, KEY_FILE_TAG);
+        xor(&mut tag, v.file_tag, v.cipher);
         if tag != b"FILE" {
             break;
         }
         pos += 4;
 
-        // Subtype and name strings: u32 length (XOR key) then `len` MT-decrypted
-        // bytes (seed = length + data-key). We only need to advance past them, but
-        // decode the subtype to recognise the script member.
-        let Some(subtype) = read_string(body, &mut pos, KEY_SUBTYPE_LEN, KEY_SUBTYPE_DATA) else {
+        // The subtype says what the member is; the name is only skipped.
+        let Some(subtype) = read_string(body, &mut pos, v, v.subtype) else {
             break;
         };
-        if read_string(body, &mut pos, KEY_NAME_LEN, KEY_NAME_DATA).is_none() {
+        if read_string(body, &mut pos, v, v.name).is_none() {
             break;
         }
 
-        // Data header: compressed flag (u8), compressed size, uncompressed size,
-        // CRC (each XOR-keyed), then two 8-byte timestamps.
+        // Compressed flag (u8), compressed size, uncompressed size and checksum
+        // (each XOR-keyed), then two 8-byte timestamps. The checksum is not
+        // verified: a wrong one must not stop the content being scanned.
         let Some(&comp) = body.get(pos) else { break };
         pos += 1;
-        let (Some(csize_raw), Some(_usize_raw), Some(crc_raw)) =
-            (le32(body, pos), le32(body, pos + 4), le32(body, pos + 8))
-        else {
+        let Some(csize_raw) = le32(body, pos) else {
             break;
         };
-        let csize = (csize_raw ^ KEY_SIZE) as usize;
-        let _crc = crc_raw ^ KEY_CRC; // decoded CRC-32 (not verified)
-        pos += 12; // csize + usize + crc
-        pos += 16; // two u64 timestamps
+        let csize = (csize_raw ^ v.size) as usize;
+        pos += 12 + 16;
         if (csize as i32) < 0 {
             break;
         }
 
-        let Some(enc) = body.get(pos..pos + csize) else {
+        let Some(enc) = pos.checked_add(csize).and_then(|end| body.get(pos..end)) else {
             break;
         };
         pos += csize;
         let mut content = enc.to_vec();
-        mt_xor(&mut content, checksum.wrapping_add(KEY_CONTENT));
+        xor(&mut content, checksum.wrapping_add(v.content), v.cipher);
 
         let cap = budget.reserve()?;
-        let out = if comp == 1 {
-            match decompress_ea05(&content, cap as usize) {
+        let (content, complete) = if comp == 1 {
+            match decompress(&content, cap as usize) {
                 Some(v) => v,
                 None => continue,
             }
         } else {
-            content
+            (content, true)
         };
+        let (out, mut unsupported) = match subtype.as_str() {
+            ">>>AUTOIT SCRIPT<<<" => match decompile(&content, cap as usize) {
+                Ok(text) => (text, None),
+                // Not a token stream at all: the plain script older compilers
+                // stored under this subtype.
+                Err(None) => (content, None),
+                Err(Some(text)) => (
+                    text,
+                    Some(
+                        "AutoIt script token stream is malformed; the lines before it were scanned",
+                    ),
+                ),
+            },
+            ">AUTOIT UNICODE SCRIPT<" => (utf16le(&content).into_bytes(), None),
+            _ => (content, None),
+        };
+        if !complete {
+            unsupported = Some("AutoIt member ends early; the part decoded was scanned");
+        }
         if out.len() < 4 {
             continue;
         }
@@ -155,25 +214,100 @@ fn ea05<R>(body: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>
             format!("autoit-{:03}.au3", emitted + 1)
         };
         emitted += 1;
-        if let Some(r) = visit(Entry::new(name, out), budget) {
+        let mut e = Entry::new(name, out);
+        e.unsupported = unsupported;
+        if let Some(r) = visit(e, budget) {
             return Ok(Some(r));
         }
     }
     Ok(None)
 }
 
-/// Read an XOR-length + MT-encrypted string, advancing `pos`. EA05 strings are
-/// single-byte (non-unicode).
-fn read_string(body: &[u8], pos: &mut usize, key_len: u32, key_data: u32) -> Option<String> {
-    let len = (le32(body, *pos)? ^ key_len) as usize;
+/// Read an XOR-keyed length, then that many encrypted characters (keyed by the
+/// length plus `keys.1`), advancing `pos`.
+fn read_string(body: &[u8], pos: &mut usize, v: &Version, keys: (u32, u32)) -> Option<String> {
+    let chars = le32(body, *pos)? ^ keys.0;
     *pos += 4;
-    if (len as i32) < 0 {
+    if (chars as i32) < 0 {
         return None;
     }
-    let mut bytes = body.get(*pos..*pos + len)?.to_vec();
+    let len = if v.unicode {
+        chars as usize * 2
+    } else {
+        chars as usize
+    };
+    let mut bytes = body.get(*pos..pos.checked_add(len)?)?.to_vec();
     *pos += len;
-    mt_xor(&mut bytes, (len as u32).wrapping_add(key_data));
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    xor(&mut bytes, chars.wrapping_add(keys.1), v.cipher);
+    Some(if v.unicode {
+        utf16le(&bytes)
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+fn utf16le(b: &[u8]) -> String {
+    let units: Vec<u16> = b
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// XOR `buf` in place with the version's keystream seeded by `seed`.
+fn xor(buf: &mut [u8], seed: u32, cipher: Cipher) {
+    match cipher {
+        Cipher::Mt => mt_xor(buf, seed),
+        Cipher::Lame => {
+            let mut prng = Lame::new(seed);
+            for b in buf.iter_mut() {
+                *b ^= prng.next_byte();
+            }
+        }
+    }
+}
+
+// --- AutoIt EA06 keystream (from AutoIt-Ripper lame.py, MIT) -----------------
+
+/// A lagged-Fibonacci generator whose output is read through a double in
+/// [0, 1), then scaled to a byte.
+struct Lame {
+    c0: usize,
+    c1: usize,
+    grp: [u32; 17],
+}
+
+impl Lame {
+    fn new(mut seed: u32) -> Self {
+        let mut grp = [0u32; 17];
+        for g in grp.iter_mut() {
+            seed = 1u32.wrapping_sub(seed.wrapping_mul(0x53A9_B4FB));
+            *g = seed;
+        }
+        let mut l = Lame { c0: 0, c1: 10, grp };
+        for _ in 0..9 {
+            l.step();
+        }
+        l
+    }
+
+    fn step(&mut self) -> f64 {
+        let r = self.grp[self.c0]
+            .rotate_left(9)
+            .wrapping_add(self.grp[self.c1].rotate_left(13));
+        self.grp[self.c0] = r;
+        self.c0 = if self.c0 == 0 { 16 } else { self.c0 - 1 };
+        self.c1 = if self.c1 == 0 { 16 } else { self.c1 - 1 };
+        let bits = (((r >> 12) | 0x3FF0_0000) as u64) << 32 | (r << 20) as u64;
+        f64::from_bits(bits) - 1.0
+    }
+
+    fn next_byte(&mut self) -> u8 {
+        self.step();
+        (self.step() * 256.0) as u8
+    }
 }
 
 // --- AutoIt Mersenne-Twister keystream (from AutoIt-Ripper mt.py, MIT) --------
@@ -240,7 +374,7 @@ impl Mt {
     }
 }
 
-// --- EA05 LZSS decompressor (from AutoIt-Ripper decompress.py, MIT) -----------
+// --- LZSS decompressor (from AutoIt-Ripper decompress.py, MIT) ----------------
 
 /// MSB-first bit reader over a byte slice.
 struct Bits<'a> {
@@ -273,7 +407,7 @@ impl<'a> Bits<'a> {
     }
 }
 
-/// Read an EA05 match length via the variable-length ladder (min 3).
+/// Read a match length via the variable-length ladder (min 3).
 fn read_match_len(bits: &mut Bits) -> usize {
     // (base, bits, sentinel)
     const LADDER: &[(usize, u32, u32)] = &[
@@ -306,11 +440,15 @@ fn read_match_len(bits: &mut Bits) -> usize {
     }
 }
 
-/// Decompress a `EA05`-magic + big-endian-size + LZSS bitstream, bounded by `cap`.
-fn decompress_ea05(content: &[u8], cap: usize) -> Option<Vec<u8>> {
-    if content.len() < 8 || &content[0..4] != b"EA05" {
-        return None;
-    }
+/// Decompress an `EA05`/`EA06` magic + big-endian size + LZSS bitstream,
+/// bounded by `cap`. The magic sets the flag bit that marks a literal. The
+/// flag is false when the stream ended before the size it declares.
+fn decompress(content: &[u8], cap: usize) -> Option<(Vec<u8>, bool)> {
+    let literal = match content.get(0..4)? {
+        b"EA05" => 0,
+        b"EA06" => 1,
+        _ => return None,
+    };
     let mut want = be32(content, 4)? as usize;
     if want == 0 {
         want = content.len();
@@ -320,9 +458,12 @@ fn decompress_ea05(content: &[u8], cap: usize) -> Option<Vec<u8>> {
     let mut bits = Bits::new(&content[8..]);
     let mut out: Vec<u8> = Vec::new();
     while !bits.err && out.len() < want {
-        if bits.get(1) == 0 {
-            // literal
-            out.push(bits.get(8) as u8);
+        if bits.get(1) == literal {
+            let b = bits.get(8) as u8;
+            if bits.err {
+                break;
+            }
+            out.push(b);
         } else {
             let offset = bits.get(15) as usize;
             let len = read_match_len(&mut bits);
@@ -335,12 +476,182 @@ fn decompress_ea05(content: &[u8], cap: usize) -> Option<Vec<u8>> {
             }
         }
     }
-    Some(out)
+    let complete = out.len() >= want;
+    Some((out, complete))
+}
+
+// --- Token stream to script text (token layout from AutoIt-Ripper, MIT) ------
+
+/// Rebuild the text of a compiled script from its token stream, one line per
+/// `0x7F` token, in the form ClamAV writes it, which is the form signatures
+/// are written against. Observed on ClamAV's own output, byte for byte over
+/// 38,000 lines of corpus scripts plus a crafted one for the rarer tokens:
+///
+/// * each token is followed by a space, except a user function's name, which
+///   runs into the `(` after it; lines end with LF, and nothing is indented;
+/// * keywords and built-in functions named by index are upper-cased; names
+///   stored as text are written as stored;
+/// * a 32-bit integer is `0x%08x`; a 64-bit one is its high word shifted up
+///   plus its low word sign-extended, as `0x%016x`; a float is C's `%g`;
+/// * a string is quoted without escaping, and each UTF-16 unit is written as
+///   its low byte.
+///
+/// `Err(None)` when not even one line decodes, which is content that is not a
+/// token stream; `Err(Some(text))` holds the lines before a malformed token.
+/// Stops once past `cap` bytes; the caller reports that as a limit.
+fn decompile(tokens: &[u8], cap: usize) -> Result<Vec<u8>, Option<Vec<u8>>> {
+    use super::autoit_data::{FUNCTIONS, KEYWORDS};
+    let fail = |out: Vec<u8>| Err(Some(out).filter(|o| !o.is_empty()));
+    let mut t = Tokens { d: tokens, pos: 0 };
+    let mut out = Vec::new();
+    let Some(lines) = t.u32() else {
+        return fail(out);
+    };
+    let mut line = 0u32;
+    while line < lines && out.len() <= cap {
+        let Some(op) = t.u8() else {
+            return fail(out);
+        };
+        let ok = match op {
+            0x7F => {
+                line += 1;
+                out.push(b'\n');
+                continue;
+            }
+            0x00 | 0x01 => {
+                let table: &[&str] = if op == 0 { &KEYWORDS } else { &FUNCTIONS };
+                t.i32()
+                    .and_then(|i| table.get(usize::try_from(i).ok()?))
+                    .map(|name| out.extend(name.bytes().map(|b| b.to_ascii_uppercase())))
+            }
+            0x05 => t
+                .u32()
+                .map(|n| out.extend_from_slice(format!("0x{n:08x}").as_bytes())),
+            0x10 => t.u64().map(|n| {
+                let v = (n & !0xFFFF_FFFF).wrapping_add(n as u32 as i32 as i64 as u64);
+                out.extend_from_slice(format!("0x{v:016x}").as_bytes());
+            }),
+            0x20 => t
+                .f64()
+                .map(|f| out.extend_from_slice(c_float_g(f).as_bytes())),
+            0x30..=0x37 => {
+                let prefix: &[u8] = match op {
+                    0x32 => b"@",
+                    0x33 => b"$",
+                    0x35 => b".",
+                    0x36 => b"\"",
+                    _ => b"",
+                };
+                out.extend_from_slice(prefix);
+                let ok = t.string(&mut out);
+                if op == 0x36 {
+                    out.push(b'"');
+                }
+                // A user function's name runs into its `(`.
+                if op == 0x34 {
+                    if ok.is_none() {
+                        return fail(out);
+                    }
+                    continue;
+                }
+                ok
+            }
+            0x40..=0x58 => {
+                out.extend_from_slice(OPERATORS[(op - 0x40) as usize].as_bytes());
+                Some(())
+            }
+            _ => None,
+        };
+        if ok.is_none() {
+            return fail(out);
+        }
+        out.push(b' ');
+    }
+    Ok(out)
+}
+
+const OPERATORS: [&str; 25] = [
+    ",", "=", ">", "<", "<>", ">=", "<=", "(", ")", "+", "-", "/", "*", "&", "[", "]", "==", "^",
+    "+=", "-=", "/=", "*=", "&=", "?", ":",
+];
+
+/// `f` as C's `printf("%g")` writes it: six significant digits, trailing zeros
+/// dropped, exponent form below 1e-4 and from 1e6 with a signed exponent of at
+/// least two digits.
+fn c_float_g(f: f64) -> String {
+    if !f.is_finite() {
+        return match (f.is_nan(), f.is_sign_negative()) {
+            (true, _) => "nan",
+            (false, true) => "-inf",
+            (false, false) => "inf",
+        }
+        .to_string();
+    }
+    let trim = |s: String| {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    };
+    // The exponent after rounding to six digits decides the form.
+    let sci = format!("{f:.5e}");
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    if (-4..6).contains(&exp) {
+        trim(format!("{f:.*}", (5 - exp) as usize))
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa.to_string()), exp.abs())
+    }
+}
+
+struct Tokens<'a> {
+    d: &'a [u8],
+    pos: usize,
+}
+
+impl Tokens<'_> {
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let b = self.d.get(self.pos..self.pos.checked_add(N)?)?;
+        self.pos += N;
+        b.try_into().ok()
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take::<1>().map(|b| b[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        self.take().map(u32::from_le_bytes)
+    }
+    fn i32(&mut self) -> Option<i32> {
+        self.take().map(i32::from_le_bytes)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        self.take().map(u64::from_le_bytes)
+    }
+    fn f64(&mut self) -> Option<f64> {
+        self.take().map(f64::from_le_bytes)
+    }
+
+    /// A length in characters, then that many UTF-16 units XOR-keyed by it;
+    /// the low byte of each is appended to `out`.
+    fn string(&mut self, out: &mut Vec<u8>) -> Option<()> {
+        let key = self.u32()?;
+        let len = (key as usize).checked_mul(2)?;
+        let raw = self.d.get(self.pos..self.pos.checked_add(len)?)?;
+        self.pos += len;
+        out.extend(raw.as_chunks::<2>().0.iter().map(|c| c[0] ^ key as u8));
+        Some(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_autoit(data: &[u8]) -> bool {
+        super::is_autoit(&crate::Probe::whole(data))
+    }
 
     /// MT is symmetric, so encrypting == decrypting.
     fn mt_apply(plain: &[u8], seed: u32) -> Vec<u8> {
@@ -434,8 +745,11 @@ mod tests {
     fn lzss_literal_roundtrip() {
         let plain = b"MALWARETEST-lzss-literal-stream";
         let stream = ea05_all_literal(plain);
-        let out = decompress_ea05(&stream, 1 << 20).unwrap();
+        let (out, complete) = decompress(&stream, 1 << 20).unwrap();
         assert_eq!(out, plain);
+        assert!(complete);
+        let (_, complete) = decompress(&stream[..stream.len() - 6], 1 << 20).unwrap();
+        assert!(!complete, "a cut stream says so");
     }
 
     #[test]
@@ -461,14 +775,125 @@ mod tests {
         assert_eq!(entries[0].data, script);
     }
 
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The EA06 keystream, against AutoIt-Ripper's `LAME` seeded with the tag key.
     #[test]
-    fn ea06_marker_unsupported() {
-        let mut blob = MARKER_EA06.to_vec();
-        blob.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0, 1, 2, 3]);
+    fn ea06_keystream_matches_the_reference() {
+        let mut ks = [0u8; 16];
+        xor(&mut ks, EA06.file_tag, Cipher::Lame);
+        assert_eq!(ks.to_vec(), unhex("2d0a8617b6b371a0071084f7e5bae729"));
+    }
+
+    /// A token stream and its text in ClamAV's form: keywords and a function
+    /// by index, a function by name, quotes inside a string, integers and
+    /// floats.
+    const TOKENS: &str = "04000000001c0000003301000000590041013a00000047360c000000670069007e006200690060003f003e0022006800600060004036030000006a006d0077004036040000004600610061007400487f00040000003301000000590000050000007f31060000004b0055004100440049005e00470500000000403611000000620070006800310033005c0050005d004600500043005400450054004200450033004020000000000000f83f4020408cb5781daf1544487f00080000007f";
+    const SOURCE: &str = "LOCAL $X = DLLCALL ( \"kernel32.dll\" , \"int\" , \"Beep\" ) \nIF $X THEN \nMSGBOX ( 0x00000000 , \"say \"MALWARETEST\"\" , 1.5 , 1e+20 ) \nENDIF \n";
+
+    #[test]
+    fn tokens_decompile_as_clamav_writes_them() {
+        assert_eq!(
+            decompile(&unhex(TOKENS), 1 << 20).unwrap(),
+            SOURCE.as_bytes()
+        );
+        let cut = unhex(TOKENS);
+        match decompile(&cut[..cut.len() - 3], 1 << 20) {
+            Err(Some(text)) => assert!(text.starts_with(b"LOCAL $X")),
+            other => panic!("the lines before the cut are kept: {other:?}"),
+        }
+        assert!(matches!(
+            decompile(b"; plain script text", 1 << 20),
+            Err(None)
+        ));
+    }
+
+    /// The rarer tokens, against what ClamAV wrote for a crafted script: 64-bit
+    /// integers (whose low word it sign-extends), floats as `%g`, a user
+    /// function's name running into its `(`, and a non-ASCII character as the
+    /// low byte of its UTF-16 unit.
+    #[test]
+    fn rare_tokens_render_as_clamav_writes_them() {
+        let mut t = 1u32.to_le_bytes().to_vec();
+        for v in [
+            0xffff_ffffu64,
+            0x1_0000_0002,
+            0x1234_5678_9abc_def0,
+            0x8000_0000,
+            5,
+        ] {
+            t.push(0x10);
+            t.extend_from_slice(&v.to_le_bytes());
+        }
+        for f in [6.0f64, 0.5, 1e20, 123456.789, -2.5, 1e-7, 1.2345678] {
+            t.push(0x20);
+            t.extend_from_slice(&f.to_le_bytes());
+        }
+        let key = 3u32;
+        t.push(0x34);
+        t.extend_from_slice(&key.to_le_bytes());
+        for c in "F\u{2014}N".encode_utf16() {
+            t.extend_from_slice(&(c ^ key as u16).to_le_bytes());
+        }
+        t.extend_from_slice(&[0x47, 0x48, 0x7F]);
+        let want = b"0xffffffffffffffff 0x0000000100000002 0x123456779abcdef0 \
+            0xffffffff80000000 0x0000000000000005 6 0.5 1e+20 123457 -2.5 1e-07 \
+            1.23457 F\x14N( ) \n";
+        assert_eq!(decompile(&t, 1 << 20).unwrap(), want);
+    }
+
+    /// A whole EA06 record: the tag, UTF-16 subtype and name, and a compressed
+    /// token stream, all under the EA06 keystream, come out as source text.
+    #[test]
+    fn ea06_script_is_extracted_as_source() {
+        let lame = |b: &[u8], seed: u32| {
+            let mut v = b.to_vec();
+            xor(&mut v, seed, Cipher::Lame);
+            v
+        };
+        let utf16 = |s: &str| {
+            s.encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<u8>>()
+        };
+        let comp = ea06_all_literal(&unhex(TOKENS));
+        let mut d = MARKER_EA06.to_vec();
+        d.extend_from_slice(&[0x5a; 16]); // not summed into any key for EA06
+        d.extend_from_slice(&lame(b"FILE", EA06.file_tag));
+        for (s, keys) in [(">>>AUTOIT SCRIPT<<<", EA06.subtype), ("s.au3", EA06.name)] {
+            let n = s.encode_utf16().count() as u32;
+            d.extend_from_slice(&(n ^ keys.0).to_le_bytes());
+            d.extend_from_slice(&lame(&utf16(s), n.wrapping_add(keys.1)));
+        }
+        d.push(1);
+        d.extend_from_slice(&(comp.len() as u32 ^ EA06.size).to_le_bytes());
+        d.extend_from_slice(&[0; 8 + 16]);
+        d.extend_from_slice(&lame(&comp, EA06.content));
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Autoit, &blob, &mut budget).unwrap();
+        let entries = extract(Format::Autoit, &d, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].unsupported.is_some());
+        assert_eq!(entries[0].unsupported, None);
+        assert_eq!(entries[0].data, SOURCE.as_bytes());
+    }
+
+    /// [`ea05_all_literal`] with EA06's literal flag (1) and magic.
+    fn ea06_all_literal(plain: &[u8]) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        for &b in plain {
+            bits.push(1);
+            bits.extend((0..8).rev().map(|k| (b >> k) & 1));
+        }
+        bits.resize(bits.len().div_ceil(8) * 8 + 8, 0);
+        let mut out = b"EA06".to_vec();
+        out.extend_from_slice(&(plain.len() as u32).to_be_bytes());
+        let packed = bits.as_slice().chunks(8);
+        out.extend(packed.map(|c| c.iter().fold(0u8, |a, &b| a << 1 | b)));
+        out
     }
 
     #[test]
@@ -476,7 +901,7 @@ mod tests {
         for cut in 0..40usize {
             let full = build_ea05_stored(b"x", b"MALWARETEST short");
             let mut budget = Budget::new(Limits::default());
-            let _ = extract(Format::Autoit, &full[..cut.min(full.len())], &mut budget).unwrap();
+            let _ = extract(Format::Autoit, &&full[..cut.min(full.len())], &mut budget).unwrap();
         }
         let mut budget = Budget::new(Limits::default());
         assert!(extract(Format::Autoit, b"not autoit", &mut budget)

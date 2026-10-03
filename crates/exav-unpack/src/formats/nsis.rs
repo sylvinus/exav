@@ -10,7 +10,7 @@
 //!   0x00 u32     flags
 //!   0x04 u8[16]  signature = LE 0xDEADBEEF + "NullsoftInst"
 //!   0x14 u32     header_size
-//!   0x18 u32     archive_size   // total bytes of the data block that follows
+//!   0x18 u32     archive_size   // bytes from the firstheader through the CRC
 //!   0x1c ...     data block
 //! ```
 //!
@@ -28,11 +28,13 @@ use crate::*;
 use std::io::Cursor;
 
 /// 16-byte firstheader signature: LE `0xDEADBEEF` then ASCII `"NullsoftInst"`.
-const NSIS_SIG: [u8; 16] = [
+pub(crate) const NSIS_SIG: [u8; 16] = [
     0xEF, 0xBE, 0xAD, 0xDE, b'N', b'u', b'l', b'l', b's', b'o', b'f', b't', b'I', b'n', b's', b't',
 ];
 
 const FIRSTHEADER_LEN: usize = 0x1c;
+/// `firstheader.flags`: the installer carries no CRC-32 after its data.
+const FH_FLAGS_NO_CRC: u32 = 4;
 const MAX_BLOCKS: usize = 10_000;
 const SOLID_MIN_OUTPUT: usize = 64;
 
@@ -47,8 +49,9 @@ fn find_firstheader(data: &[u8]) -> Option<usize> {
 }
 
 /// True if `data` is a PE stub carrying the NSIS firstheader signature.
-pub(crate) fn is_nsis(data: &[u8]) -> bool {
-    data.starts_with(b"MZ") && find_firstheader(data).is_some()
+pub(crate) fn is_nsis(p: &crate::Probe) -> bool {
+    // As `find_firstheader` finds it.
+    p.head.starts_with(b"MZ") && p.find(&NSIS_SIG).and_then(|at| at.checked_sub(4)).is_some()
 }
 
 pub(crate) fn extract_nsis<R>(
@@ -63,8 +66,15 @@ pub(crate) fn extract_nsis<R>(
     if data_start > data.len() {
         return Ok(None);
     }
+    // The size counts from the firstheader itself, and takes in the CRC-32
+    // that follows the data unless the installer was built without one.
+    let flags = u32le(data, fh);
     let archive_size = u32le(data, fh + 0x18) as usize;
-    let arch_end = data_start.saturating_add(archive_size).min(data.len());
+    let crc_len = if flags & FH_FLAGS_NO_CRC == 0 { 4 } else { 0 };
+    let arch_end = fh
+        .saturating_add(archive_size)
+        .saturating_sub(crc_len)
+        .min(data.len());
     if arch_end <= data_start {
         return Ok(None);
     }
@@ -129,7 +139,7 @@ pub(crate) fn extract_nsis<R>(
 }
 
 /// Decode one NSIS compressed stream, selecting the codec from the leading byte:
-/// `'1'` ⇒ NSIS bzip2, `0x5d` ⇒ LZMA props, else raw DEFLATE — with a fallback.
+/// `'1'` ⇒ NSIS bzip2, `0x5d` ⇒ LZMA props, else raw DEFLATE, each with a fallback.
 fn decode_stream(block: &[u8], cap: u64) -> Option<Vec<u8>> {
     match block.first().copied()? {
         b'1' => decode_bzip2(block, cap).or_else(|| decode_deflate(block, cap)),
@@ -157,15 +167,15 @@ fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
         return None;
     }
     // The dictionary size comes straight out of the file and the decoder
-    // allocates it UP FRONT, before a byte is decompressed — so an attacker sets
+    // allocates it UP FRONT, before a byte is decompressed, so an attacker sets
     // it to whatever they like and exav allocates that much. Measured: a 766 KB
     // installer declaring a 1.5 GB dictionary, which aborted the process under
     // the daemon's per-job RLIMIT_AS. Under the daemon that abort closes the
     // client connection with no reply at all, which reads as a clean scan.
     //
     // Clamp it to the caller's budget. A dictionary bigger than the output it is
-    // used to produce cannot help — LZMA only ever looks back into bytes it has
-    // already emitted — so capping at `cap` costs nothing on a real stream while
+    // used to produce cannot help (LZMA only ever looks back into bytes it has
+    // already emitted), so capping at `cap` costs nothing on a real stream while
     // making the allocation bounded by the same limit as everything else.
     let dict = crate::bounded_dict(u32le(block, 1), cap);
     let reader = lzma_rust2::LzmaReader::new_with_props(
@@ -179,11 +189,11 @@ fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
     nonempty(bounded_read(reader, cap))
 }
 
-/// NSIS's modified bzip2 (header stripped); the stock decoder usually rejects it,
-/// in which case the block is reported unsupported.
+/// NSIS's modified bzip2: no stream header, one-byte block markers, no
+/// checksums.
 fn decode_bzip2(block: &[u8], cap: u64) -> Option<Vec<u8>> {
     nonempty(bounded_read(
-        bzip2_rs::DecoderReader::new(Cursor::new(block)),
+        super::bzip2_rs::DecoderReader::new_nsis(Cursor::new(block)),
         cap,
     ))
 }
@@ -191,12 +201,16 @@ fn decode_bzip2(block: &[u8], cap: u64) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_nsis(data: &[u8]) -> bool {
+        super::is_nsis(&crate::Probe::whole(data))
+    }
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
 
     /// A declared dictionary size is attacker input and is allocated UP FRONT.
-    /// Clamping it is what stops a small file committing gigabytes — measured at
-    /// 1.5 GB from a 766 KB installer, which aborted the process.
+    /// Clamping it is what stops a small file committing gigabytes (measured at
+    /// 1.5 GB from a 766 KB installer, which aborted the process).
     #[test]
     fn a_huge_declared_dictionary_is_clamped_to_the_budget() {
         // 4 GiB-1 declared, 1 MiB of budget.
@@ -209,7 +223,9 @@ mod tests {
         assert_eq!(crate::bounded_dict(0, 1 << 20), 1 << 12);
     }
 
-    fn synthetic_nsis(deflate_block: &[u8]) -> Vec<u8> {
+    /// A non-solid installer of one compressed block, as NSIS lays it out: the
+    /// size counted from the firstheader, a CRC-32 after the data.
+    fn synthetic_nsis(compressed_block: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"MZ");
         out.extend_from_slice(&[0u8; 62]);
@@ -217,12 +233,68 @@ mod tests {
         out.extend_from_slice(&0u32.to_le_bytes()); // flags
         out.extend_from_slice(&NSIS_SIG);
         out.extend_from_slice(&0u32.to_le_bytes()); // header_size
-        let asz = 4 + deflate_block.len();
+        let asz = FIRSTHEADER_LEN + 4 + compressed_block.len() + 4;
         out.extend_from_slice(&(asz as u32).to_le_bytes()); // archive_size
         debug_assert_eq!(out.len(), fh + FIRSTHEADER_LEN);
-        out.extend_from_slice(&((deflate_block.len() as u32) | 0x8000_0000).to_le_bytes());
-        out.extend_from_slice(deflate_block);
+        out.extend_from_slice(&((compressed_block.len() as u32) | 0x8000_0000).to_le_bytes());
+        out.extend_from_slice(compressed_block);
+        out.extend_from_slice(&0xA1B2_C3D4u32.to_le_bytes()); // CRC-32
         out
+    }
+
+    /// `payload` in NSIS's bzip2, made from a standard bzip2 stream of one
+    /// block: the stream header dropped, the block's 48-bit magic, CRC and
+    /// randomised bit replaced by the byte 0x31, and the end marker and stream
+    /// CRC by the byte 0x17.
+    fn nsis_bzip2(payload: &[u8]) -> Vec<u8> {
+        let mut enc = ::bzip2::write::BzEncoder::new(Vec::new(), ::bzip2::Compression::best());
+        enc.write_all(payload).unwrap();
+        let std = enc.finish().unwrap();
+        let bit = |i: usize| (std[i / 8] >> (7 - i % 8)) & 1;
+        let bits48 = |p: usize| (0..48).fold(0u64, |v, k| (v << 1) | u64::from(bit(p + k)));
+        // "BZh9", block magic, block CRC, randomised bit.
+        let body = 32 + 48 + 32 + 1;
+        let end = (body..std.len() * 8 - 48)
+            .find(|&p| bits48(p) == 0x1772_4538_5090)
+            .unwrap();
+        assert!(
+            (body..end).all(|p| bits48(p) != 0x3141_5926_5359),
+            "one block"
+        );
+        let mut bits: Vec<u8> = (0..8).map(|k| (0x31 >> (7 - k)) & 1).collect();
+        bits.extend((body..end).map(bit));
+        bits.extend((0..8).map(|k| (0x17 >> (7 - k)) & 1));
+        <[u8]>::chunks(&bits, 8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u8, |b, (k, &v)| b | (v << (7 - k)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_block_in_nsis_bzip2_decodes() {
+        let blob = synthetic_nsis(&nsis_bzip2(b"MALWARETEST inside an NSIS bzip2 block"));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
+        assert!(
+            entries.iter().all(|e| e.unsupported.is_none()),
+            "{entries:?}"
+        );
+        assert!(entries
+            .iter()
+            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
+    }
+
+    /// The CRC-32 after the data is not one more block.
+    #[test]
+    fn the_trailing_crc_is_not_a_block() {
+        let blob = synthetic_nsis(&raw_deflate(b"MALWARETEST inside an NSIS deflate block"));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0].unsupported.is_none());
     }
 
     fn raw_deflate(payload: &[u8]) -> Vec<u8> {

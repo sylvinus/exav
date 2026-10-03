@@ -42,7 +42,7 @@
 use std::fmt;
 use std::path::Path;
 
-use exav_unpack::{Budget, Entry, Limits};
+use exav_unpack::{Budget, Limits};
 
 /// Separator between a container and a member in a reported path, mirroring the
 /// convention `7z`/`unzip` tooling uses so the output is greppable in turn.
@@ -279,7 +279,7 @@ impl Searcher {
                 ),
             });
         }
-        let Some(fmt) = exav_unpack::detect(data).or_else(|| packed_executable(data)) else {
+        let Some(fmt) = exav_unpack::detect(&data).or_else(|| packed_executable(data)) else {
             // A leaf: search its bytes.
             return self.search_one(label, data, sink);
         };
@@ -290,37 +290,50 @@ impl Searcher {
         // still gets looked at rather than silently producing no output.
         let mut members = 0usize;
         let mut keep_going = true;
-        let r =
-            exav_unpack::extract_each(fmt, data, budget, &mut |entry: Entry, b: &mut Budget| {
-                let child = format!("{label}{NESTING_SEP}{}", entry.name);
-                // A member exav could not decode is content this search did not see.
-                // Saying nothing here would report "no matches" for bytes nobody
-                // looked at.
-                if let Some(reason) = entry.unsupported {
-                    // Counted as a member even though it yielded nothing. The
-                    // fallback below exists for a buffer the walker found no
-                    // members in at all; a container whose members all failed to
-                    // decode HAS members, and line-searching its own compressed
-                    // bytes would emit a stream of garbage matches contradicting
-                    // the `Unreadable` events just reported for the same file.
-                    members += 1;
-                    self.unreadable += 1;
-                    if !sink(Event::Unreadable {
-                        path: child,
-                        reason: reason.to_string(),
-                    }) {
-                        keep_going = false;
-                        return Some(());
+        let r = exav_unpack::walk(fmt, &data, budget, &mut |meta, content, b| {
+            let child = format!("{label}{NESTING_SEP}{}", meta.name);
+            // Counted as a member whether or not it yields anything. The
+            // fallback below exists for a buffer the walker found no members in
+            // at all; a container whose members all failed to decode HAS
+            // members, and line-searching its own compressed bytes would emit a
+            // stream of garbage matches contradicting the `Unreadable` events
+            // reported for the same file.
+            members += 1;
+            // A member exav could not decode is content this search did not
+            // see. Saying nothing here would report "no matches" for bytes
+            // nobody looked at.
+            let (data, unread) = match meta.unsupported {
+                Some(reason) => (Vec::new(), Some(reason)),
+                None => match content.map(|c| c.into_bytes(meta, b)).transpose() {
+                    Err(hit) => return Some(Err(hit)),
+                    Ok(None) => (Vec::new(), None),
+                    Ok(Some((data, partial))) => {
+                        (data, partial.then_some("member failed to decode part way"))
                     }
-                    return None;
-                }
-                members += 1;
-                if !self.walk(&child, &entry.data, b, depth + 1, sink) {
-                    keep_going = false;
-                    return Some(());
-                }
+                },
+            };
+            let mut go = true;
+            if unread.is_none() || !data.is_empty() {
+                go = self.walk(&child, &data, b, depth + 1, sink);
+            }
+            if let Some(reason) = unread.filter(|_| go) {
+                self.unreadable += 1;
+                go = sink(Event::Unreadable {
+                    path: child,
+                    reason: reason.to_string(),
+                });
+            }
+            if go {
                 None
-            });
+            } else {
+                keep_going = false;
+                Some(Ok(()))
+            }
+        });
+        let r = match r {
+            Ok(Some(Err(hit))) | Err(hit) => Err(hit),
+            Ok(_) => Ok(()),
+        };
         // A budget stop or a decoder failure means members went unexamined.
         if let Err(e) = r {
             self.unreadable += 1;

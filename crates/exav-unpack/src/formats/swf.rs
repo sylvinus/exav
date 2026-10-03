@@ -9,110 +9,78 @@
 //! decompressed body.
 //!
 //! `FWS` is already uncompressed, so there is nothing to unpack; only `CWS` and
-//! `ZWS` are decoded. All sizing is bounded by the [`Budget`]: an attacker-
-//! controlled `FileLength` can never drive an allocation — the LZMA decode target
-//! and the zlib inflate are both clamped to the remaining budget, and a body that
-//! would exceed it is rejected.
-use crate::*;
-use std::io::Cursor;
+//! `ZWS` are decoded, as they are read. An attacker-controlled `FileLength`
+//! never drives an allocation: the LZMA dictionary is clamped to the buffer
+//! limit, and the output is bounded by the scan budget as it flows.
+use std::io::{Cursor, Read};
 
-pub(crate) fn extract_swf<R>(
-    data: &[u8],
+use crate::source::{ByteSource, Reader};
+use crate::stream::{emit_stream, MemberMeta, Visit};
+use crate::{Budget, LimitHit};
+
+/// Walk an SWF movie: the rebuilt `FWS` header, then the body decoded as it is
+/// read. A non-SWF input or an `FWS` movie yields no member: its bytes are the
+/// container's own, scanned as they are.
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    // Need the full 8-byte header to know the encoding and FileLength.
-    if data.len() < 8 {
+    visit: Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let hdr = src.window(0, 17);
+    if hdr.len() < 8 || (&hdr[0..3] != b"CWS" && &hdr[0..3] != b"ZWS") {
         return Ok(None);
     }
-    let sig = &data[0..3];
-    // FWS is already uncompressed — nothing to unpack. Non-SWF magic: ignore.
-    if sig != b"CWS" && sig != b"ZWS" {
-        return Ok(None);
-    }
-
     budget.count_entry()?;
-    let cap = budget.reserve()?;
-
-    // Decompress the body (bytes 8..) per the signature.
-    let body = if sig == b"CWS" {
-        use flate2::read::ZlibDecoder;
-        let (out, truncated) = bounded_read(ZlibDecoder::new(&data[8..]), cap)
-            .map_err(|e| LimitHit::corrupt(format!("swf zlib: {e}")))?;
-        if truncated {
-            return Err(LimitHit::new(
-                "swf: decompressed size exceeds budget".into(),
-            ));
-        }
-        out
-    } else {
-        // ZWS / LZMA. If the stream doesn't decode cleanly, report the member as
-        // unsupported rather than failing the whole scan or panicking.
-        match decode_zws_lzma(data, cap) {
-            Ok((out, truncated)) => {
-                if truncated {
-                    return Err(LimitHit::new(
-                        "swf: decompressed size exceeds budget".into(),
-                    ));
-                }
-                out
-            }
-            Err(()) => {
-                let comp = (data.len() as u64).saturating_sub(8);
-                return Ok(visit(
-                    Entry::unsupported(
-                        "movie.swf".into(),
-                        comp,
-                        false,
-                        "SWF LZMA decode unsupported",
-                    ),
-                    budget,
-                ));
-            }
-        }
-    };
-
-    // Rebuild an FWS movie: the original 8-byte header with the signature forced
-    // to `FWS` (version + FileLength kept verbatim), then the decompressed body.
-    let mut fws = Vec::with_capacity(8 + body.len());
+    let mut fws = Vec::with_capacity(8);
     fws.extend_from_slice(b"FWS");
-    fws.extend_from_slice(&data[3..8]);
-    fws.extend_from_slice(&body);
-    budget.commit(fws.len() as u64);
-    Ok(visit(Entry::new("movie.swf".into(), fws), budget))
+    fws.extend_from_slice(&hdr[3..8]);
+    let meta = MemberMeta {
+        name: "movie.swf".to_string(),
+        comp_size: (src.len() as u64).saturating_sub(8),
+        size: Some(u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64),
+        ..MemberMeta::default()
+    };
+    if &hdr[0..3] == b"CWS" {
+        let body = flate2::read::ZlibDecoder::new(Reader::range(src, 8, src.len()));
+        return emit_stream(&meta, &mut Cursor::new(fws).chain(body), budget, visit);
+    }
+    // ZWS / LZMA: 8 header + 4 comp-length + 5 LZMA props before the stream.
+    let unsupported = MemberMeta {
+        unsupported: Some("SWF LZMA decode unsupported"),
+        ..meta.clone()
+    };
+    if hdr.len() < 17 {
+        return Ok(visit(&unsupported, None, budget));
+    }
+    let file_length = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
+    let want = file_length.saturating_sub(8);
+    let dict = dict_size(
+        u32::from_le_bytes([hdr[13], hdr[14], hdr[15], hdr[16]]),
+        want,
+        budget.limits().max_buffer_bytes,
+    );
+    let stream = Reader::range(src, 17, src.len());
+    match lzma_rust2::LzmaReader::new_with_props(stream, want, hdr[12], dict, None) {
+        Ok(body) => emit_stream(&meta, &mut Cursor::new(fws).chain(body), budget, visit),
+        Err(_) => Ok(visit(&unsupported, None, budget)),
+    }
 }
 
-/// Decode a `ZWS` (LZMA) SWF body. After the 8-byte movie header the layout is a
-/// 4-byte compressed-length u32 LE, then a 5-byte LZMA properties header (1 props
-/// byte + u32 LE dictionary size), then the range-coded stream. The uncompressed
-/// body size is `FileLength - 8`. Returns `(bytes, truncated)` — `truncated` true
-/// if the output hit the budget cap — or `Err(())` if the stream can't be decoded
-/// (short/malformed input, unsupported variant), so the caller can fall back to
-/// an `unsupported` member instead of aborting.
-fn decode_zws_lzma(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), ()> {
-    // 8 header + 4 comp-length + 5 LZMA props = 17 bytes before the stream.
-    if data.len() < 17 {
-        return Err(());
-    }
-    let file_length = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
-    // Declared uncompressed body size. Untrusted: used only as the decode target,
-    // and memory is bounded by `bounded_read(cap)` regardless of how large it is.
-    let want = file_length.saturating_sub(8);
-    let props = data[12];
-    let dict_size = crate::bounded_dict(
-        u32::from_le_bytes([data[13], data[14], data[15], data[16]]),
-        cap,
-    );
-    let stream = &data[17..];
-    let reader =
-        lzma_rust2::LzmaReader::new_with_props(Cursor::new(stream), want, props, dict_size, None)
-            .map_err(|_| ())?;
-    bounded_read(reader, cap).map_err(|_| ())
+/// Pick the LZMA dictionary size for a `ZWS` movie. Both `declared` (the props
+/// header's dictionary field) and `want` (the movie header's own `FileLength`,
+/// less the 8-byte header) are attacker-controlled, and the dictionary is
+/// allocated up front — so `want` is no ceiling on its own: a movie declaring
+/// 4 GiB would buy itself a 4 GiB dictionary. `max_buffer` is the real bound;
+/// `want` only ever tightens it, since a dictionary larger than the bytes it
+/// will be used to look back into cannot be consulted.
+fn dict_size(declared: u32, want: u64, max_buffer: u64) -> u32 {
+    crate::bounded_dict(declared, want.min(max_buffer))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{extract, Format, Limits};
     use flate2::{write::ZlibEncoder, Compression};
     use std::io::Write;
 
@@ -186,7 +154,7 @@ mod tests {
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Swf, &zws, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].unsupported, Some("SWF LZMA decode unsupported"));
+        assert!(entries[0].unsupported.is_some());
     }
 
     #[test]
@@ -196,5 +164,31 @@ mod tests {
         assert!(extract(Format::Swf, b"NOTASWF!", &mut budget)
             .unwrap()
             .is_empty());
+    }
+
+    // A `ZWS` header carries two attacker-chosen sizes, and the LZMA dictionary
+    // is allocated before a single byte is decoded. Neither may set that size.
+    #[test]
+    fn dictionary_is_bounded_by_the_buffer_limit() {
+        let max_buffer = Limits::default().max_buffer_bytes;
+        // The sizes from a movie that asked for a 2.7 GiB dictionary by declaring
+        // a ~4 GiB FileLength: neither number may be believed.
+        assert_eq!(
+            dict_size(0xA1A1_C32B, 0xF04A_0957 - 8, max_buffer),
+            max_buffer as u32,
+            "a huge declared dictionary is clamped to the buffer limit"
+        );
+        // A movie small enough to be honest keeps its own (smaller) dictionary.
+        assert_eq!(
+            dict_size(1 << 16, 1 << 20, max_buffer),
+            1 << 16,
+            "a dictionary under both bounds is used as-is"
+        );
+        // `want` still tightens: no point holding more history than output.
+        assert_eq!(
+            dict_size(u32::MAX, 1 << 20, max_buffer),
+            1 << 20,
+            "the declared output bounds the dictionary when it is the smaller"
+        );
     }
 }

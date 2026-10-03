@@ -3,34 +3,63 @@ title: Installation
 description: Install exav with cargo, from a prebuilt binary, as a package, as a container, or build it from source.
 ---
 
-import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
+import { Steps } from '@astrojs/starlight/components';
 
-exav is cross-platform (Linux, macOS, Windows) and ships as a single static
-binary with no runtime dependencies.
+exav runs on Linux, macOS and Windows and ships as a single binary. The Linux
+release builds are static (musl); the macOS and Windows builds link the system
+libraries. On Windows there is no prefork worker pool, no per-job limits
+(`--max-scan-secs`, `--max-process-bytes`) and no `--auto-update`, which are
+Unix only.
+
+## Prebuilt binaries
+
+Each release on [GitHub](https://github.com/sylvinus/exav/releases) carries
+binaries for `{x86_64,aarch64}-unknown-linux-musl` (static, any distro),
+`{x86_64,aarch64}-apple-darwin` and `x86_64-pc-windows-msvc`, and the WASI
+module `exav-wasm-<tag>-wasm32-wasip1.wasm` (see the
+[WASM sandbox guide](/guides/wasm-sandbox/)). Each archive has a `.sha256`
+checksum beside it. For example, on 64-bit Linux:
+
+```sh
+tag=v0.0.2 target=x86_64-unknown-linux-musl
+curl -fsSLO https://github.com/sylvinus/exav/releases/download/$tag/exav-$tag-$target.tar.gz
+tar xzf exav-$tag-$target.tar.gz
+sudo install -m755 exav /usr/local/bin/exav
+exav --version
+```
+
+They are the default build, without HTTP support: to fetch signatures with
+`--auto-update` or scan URLs, build with `--features http` below.
+
+The standalone tools come as archives of their own, `exav-unpack-<tag>-<target>`
+(an extractor with `unzip`'s command line, see
+[exav-unpack](/subprojects/exav-unpack/#cli)), `exav-grep-<tag>-<target>`
+(see [exav-grep](/subprojects/exav-grep/)), `exav-pe-emu-<tag>-<target>` (a
+PE unpacker that runs a packer's own stub in an emulator, see
+[exav-pe-emu](/subprojects/exav-pe-emu/#cli)) and
+`exav-imagehash-<tag>-<target>` (perceptual image hashes, ClamAV's and
+imagehash's, see [exav-imagehash](/subprojects/exav-imagehash/)). Every archive carries the
+`LICENSE` and the `NOTICE` of what the binary links.
 
 ## From crates.io
+
+Building needs Rust 1.91 or newer (`rustc --version`; `rustup update` to
+upgrade).
 
 ```sh
 cargo install exav
 ```
 
-That installs the `exav` binary with the default pure-Rust build, which handles every
-supported archive format. The package is `exav`; the library
-crates it is built from are the `exav-*` ones, and are not needed to install it.
-
-For a build with [HTTP support](/reference/feature-flags/#adding-http-support) —
-URL scanning and signature updates over HTTP(S):
+That installs the `exav` binary with the default pure-Rust build, which handles
+every supported archive format. For a build with
+[HTTP support](/reference/feature-flags/#adding-http-support) (URL scanning and
+signature updates over HTTP(S)):
 
 ```sh
 cargo install exav --features http
 ```
 
 See [Feature flags](/reference/feature-flags/) for all build options.
-
-<Aside type="caution" title="Rust 1.91 or newer">
-If the build fails on syntax rather than on your code, check `rustc --version`
-first — the workspace `rust-version` in `Cargo.toml` is authoritative.
-</Aside>
 
 ## Build from source
 
@@ -55,15 +84,14 @@ first — the workspace `rust-version` in `Cargo.toml` is authoritative.
 
 </Steps>
 
-The default build handles every supported archive format and is already a
-pure-Rust binary with no TLS stack. To add [HTTP(S) support](/reference/feature-flags/#adding-http-support)
-(URL scanning and signature auto-update):
+To add [HTTP(S) support](/reference/feature-flags/#adding-http-support) (URL
+scanning and signature auto-update):
 
 ```sh
 cargo build --release -p exav --features http
 ```
 
-For an even smaller binary with fewer capabilities:
+For a smaller binary without YARA, DLP, the phishing heuristic or ICAP:
 
 ```sh
 cargo build --release -p exav --no-default-features --features all-formats,decrypt
@@ -72,52 +100,50 @@ cargo build --release -p exav --no-default-features --features all-formats,decry
 See [Feature flags](/reference/feature-flags/) for the full list of build-time
 options.
 
-## Packages & release artifacts
+## Debian / Ubuntu package
 
-CI produces these on each `v*` tag:
+Build a `.deb` locally with `cargo-deb`:
 
-<Tabs>
-  <TabItem label="Prebuilt binaries">
-    Static-musl Linux binaries run on any distro. Targets:
-    `{x86_64,aarch64}-linux-musl`, `{x86_64,aarch64}-apple-darwin`,
-    `x86_64-windows` — attached to the GitHub Release.
-  </TabItem>
-  <TabItem label="Debian / Ubuntu">
-    ```sh
-    cargo install cargo-deb
-    cargo build --release -p exav
-    cargo deb -p exav --no-build      # binary + optional systemd unit
-    ```
-  </TabItem>
-</Tabs>
+```sh
+cargo install cargo-deb
+cargo build --release -p exav
+cargo deb -p exav --no-build      # the binary, and the systemd unit exav.service
+sudo apt install ./target/debian/exav_*.deb
+```
+
+The unit runs as the `clamav` user and reads `/var/lib/clamav`, as
+`clamav-daemon` does; the package creates neither, so install it on a machine
+that has ClamAV's (see [Migrating from ClamAV](/guides/migrating-from-clamav/#as-a-managed-service)).
 
 ## Container
 
-The published image is a wire-level drop-in for the ClamAV Docker image — same
-clamd port 3310, same protocol:
+The published image is a wire-level replacement for the ClamAV Docker image: the
+same clamd port 3310 and protocol. It fetches signatures itself from a source you
+name, such as a `cvdupdate` mirror of Cisco's database:
 
 ```sh
-docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+docker run -d -p 3310:3310 -v exav-db:/var/lib/exav \
+  -e EXAV_SIG_SOURCES=https://clamav-mirror.internal/ ghcr.io/sylvinus/exav
 ```
 
-See the [Docker guide](/guides/docker/) for signature population, environment
-variables, and the dual-container updater pattern.
+Without a source it waits for another container to fill the volume. See the
+[Docker guide](/guides/docker/) for signature population, environment variables,
+and the dual-container updater pattern.
 
 ## WASM sandbox module
 
-To run the scanner sandboxed (for untrusted signatures), build the
-`wasm32-wasip1` module:
+To run the scanner sandboxed (for untrusted signatures), take the release's
+`.wasm` or build the `wasm32-wasip1` module:
 
 ```sh
 rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 ```
 
-The output is `target/wasm32-wasip1/release/exav-wasm.wasm` (~5–6 MB). See the
+The output is `target/wasm32-wasip1/release/exav-wasm.wasm`. See the
 [WASM sandbox guide](/guides/wasm-sandbox/) for how to run it under wasmtime.
 
 ## Next
 
-You have the binary — now [get signatures and run your first scan](/getting-started/quick-start/).
-exav ships with **no** real signature database of its own, so this step is
-required.
+exav ships no signature database of its own, so the next step is to
+[get signatures and run a first scan](/getting-started/quick-start/).

@@ -15,7 +15,8 @@
 //! done
 //! ```
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/lzw/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -136,22 +137,13 @@ fn a_truncated_stream_keeps_what_decoded() {
 
 #[test]
 fn an_oversized_stream_is_reported_not_truncated_silently() {
-    // Decoding past the per-member budget must surface rather than hand back a
-    // silently shortened member.
+    // Holding a member larger than the buffer limit must fail as a limit rather
+    // than hand back a silently shortened member.
     let z = fixture("bigreset.b16.Z");
     let mut limits = Limits::default();
     limits.max_buffer_bytes = 4096;
     let mut b = Budget::new(limits);
-    let mut out = Vec::new();
-    let _ = extract_each(Format::Lzw, &z, &mut b, &mut |e: Entry, _: &mut Budget| {
-        out.push(e);
-        None::<()>
-    });
-    assert!(
-        out.iter().any(|x| x.unsupported.is_some()),
-        "an over-budget .Z must be reported, got {:?}",
-        out.iter()
-            .map(|x| (&x.name, x.unsupported, x.data.len()))
-            .collect::<Vec<_>>()
-    );
+    let err = exav_unpack::extract(Format::Lzw, &z.as_slice(), &mut b)
+        .expect_err("an over-budget .Z must be reported");
+    assert!(!err.is_corrupt(), "a limit, not corruption: {err:?}");
 }

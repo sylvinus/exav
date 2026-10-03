@@ -59,42 +59,19 @@ fn be_u32(d: &[u8], off: usize) -> u32 {
 /// conservatively-validated MBR). Used by `detect()` — placed last there so the
 /// weak MBR boot signature never shadows a more specific format.
 #[cfg(feature = "partition")]
-pub(crate) fn is_partition(data: &[u8]) -> bool {
-    is_gpt(data) || is_apm(data) || is_mbr(data)
-}
-
-/// Read `len` bytes at `off` from a seekable source (tolerant of short reads).
-fn read_at<R: std::io::Read + std::io::Seek>(source: &mut R, off: u64, len: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; len];
-    if source.seek(std::io::SeekFrom::Start(off)).is_err() {
-        return Vec::new();
-    }
-    let mut n = 0;
-    while n < len {
-        match source.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
-    buf.truncate(n);
-    buf
+pub(crate) fn is_partition(p: &crate::Probe) -> bool {
+    is_gpt(p.head) || is_apm(p.head) || is_mbr_in(p.head, p.len as u64)
 }
 
 /// One partition as a byte range `[first_lba*512, end_sector*512)` clamped to
 /// `total_len`; `None` for a degenerate/out-of-range slice.
-fn lba_range(
-    name: String,
-    first_lba: u64,
-    end_sector: u64,
-    total_len: u64,
-) -> Option<(String, u64, u64)> {
+fn lba_range(name: String, first_lba: u64, end_sector: u64, total_len: u64) -> Option<Region> {
     let start = first_lba.saturating_mul(SECTOR as u64).min(total_len);
     let end = end_sector.saturating_mul(SECTOR as u64).min(total_len);
     if end <= start {
         return None;
     }
-    Some((name, start, end - start))
+    Some(Region::Member(name, start, end - start))
 }
 
 /// The ClamAV alert name for an overlapping partition table in `data`, or
@@ -108,15 +85,15 @@ fn lba_range(
 /// The three names are ClamAV's exactly, **including the doubled `n` in
 /// `MBRPartitionnIntersect`**. That is a typo upstream, but the name is the API:
 /// a gateway filtering on it would not match a corrected spelling.
-pub fn intersection_alert(data: &[u8]) -> Option<&'static str> {
-    let mut cur = std::io::Cursor::new(data);
-    let regions = stream_offsets(&mut cur).ok()?;
-    // Only real partitions count; `stream_offsets` also emits zero-length marker
-    // regions for truncated tables, which are not partitions and cannot overlap.
+pub fn intersection_alert(data: &dyn crate::source::ByteSource) -> Option<&'static str> {
+    let regions = stream_offsets(&mut crate::source::Reader::new(data)).ok()?;
+    // Only real partitions count, not the parts of a table left unwalked.
     let mut ranges: Vec<(u64, u64)> = regions
         .iter()
-        .filter(|(_, _start, len)| *len > 0)
-        .map(|(_, start, len)| (*start, start.saturating_add(*len)))
+        .filter_map(|r| match r {
+            Region::Member(_, start, len) if *len > 0 => Some((*start, start.saturating_add(*len))),
+            _ => None,
+        })
         .collect();
     if ranges.len() < 2 {
         return None;
@@ -134,7 +111,8 @@ pub fn intersection_alert(data: &[u8]) -> Option<&'static str> {
     if !intersects {
         return None;
     }
-    let head = &data[..data.len().min(2 * SECTOR)];
+    let head = data.window(0, 2 * SECTOR);
+    let head = &head[..];
     if is_gpt(head) {
         Some("Heuristics.GPTPartitionIntersection")
     } else if is_apm(head) {
@@ -144,47 +122,77 @@ pub fn intersection_alert(data: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Reader-based streaming: parse the GPT/APM/MBR table (tiny, near the start) via
-/// targeted reads and return each partition as `(name, offset, size)`. The
-/// partition data itself — which is the bulk of a disk image — streams via
-/// seek+take. Mirrors `extract_partition`'s ranges, validated against the true
-/// file length rather than an in-memory buffer.
+/// Walk a disk image, each partition streamed from where it lies.
+#[cfg(feature = "partition")]
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let mut source = crate::source::Reader::new(src);
+    let members = stream_offsets(&mut source)?;
+    crate::stream::stream_stored(&mut source, budget, visit, members)
+}
+
+/// Parse the GPT/APM/MBR table (tiny, near the start) via targeted reads and
+/// return each partition as a region; the partition data, the bulk of a disk
+/// image, is streamed by the caller. Ranges are validated against the file
+/// length. A part of the table that was not walked is a region of its own,
+/// which the caller reports.
 pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
     source: &mut R,
-) -> Result<Vec<(String, u64, u64)>, LimitHit> {
+) -> Result<Vec<Region>, LimitHit> {
+    const TOO_MANY_GPT: &str = "too many GPT partitions to walk them all";
     let total_len = source
         .seek(std::io::SeekFrom::End(0))
         .map_err(|e| LimitHit::corrupt(format!("partition: {e}")))?;
-    let head = read_at(source, 0, 2 * SECTOR); // covers GPT sig, APM ER/PM, MBR table
+    let head = crate::read_at(source, 0, 2 * SECTOR)?; // covers GPT sig, APM ER/PM, MBR table
     let mut out = Vec::new();
     if is_gpt(&head) {
         let entries_lba = le_u64(&head, SECTOR + 72);
-        // Same truncation as the buffered path: clamping a parsed count silently
-        // discards the entries past the cap. `stream_offsets` has no reporting
-        // channel, so it emits a zero-length marker region that the caller
-        // surfaces rather than dropping the fact on the floor.
+        // Clamping a parsed count discards the entries past the cap, so the
+        // cap is reported.
         let declared = le_u32(&head, SECTOR + 80);
         let num_entries = declared.min(GPT_MAX_ENTRIES);
         if declared > GPT_MAX_ENTRIES {
-            out.push((format!("<gpt-partitions-beyond-{GPT_MAX_ENTRIES}>"), 0, 0));
+            out.push(Region::Unwalked(
+                format!("<gpt-partitions-beyond-{GPT_MAX_ENTRIES}>"),
+                TOO_MANY_GPT,
+            ));
         }
+        // An implausible stride is not walked, but the partitions are still
+        // there.
         let entry_size = le_u32(&head, SECTOR + 84);
         if !(GPT_MIN_ENTRY_SIZE..=GPT_MAX_ENTRY_SIZE).contains(&entry_size) {
+            out.push(Region::Unwalked(
+                "<gpt>".to_string(),
+                "implausible GPT entry size; partition table not walked",
+            ));
             return Ok(out);
         }
         let base = entries_lba.saturating_mul(SECTOR as u64);
-        let table = read_at(
+        let table = crate::read_at(
             source,
             base,
             (num_entries as usize).saturating_mul(entry_size as usize),
-        );
+        )?;
         let mut emitted = 0usize;
         for i in 0..num_entries as usize {
             if emitted >= MAX_PARTS {
+                out.push(Region::Unwalked(
+                    format!("<gpt-partitions-beyond-{MAX_PARTS}>"),
+                    TOO_MANY_GPT,
+                ));
                 break;
             }
             let e = i.saturating_mul(entry_size as usize);
+            // An entry table running past the end: the partitions it describes
+            // exist in the layout but cannot be read here.
             let Some(entry) = table.get(e..e.saturating_add(56)) else {
+                out.push(Region::Unwalked(
+                    "<gpt-entry-table-truncated>".to_string(),
+                    "GPT partition entry table extends past the end of the image",
+                ));
                 break;
             };
             if entry[..16].iter().all(|&b| b == 0) {
@@ -206,14 +214,17 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
         let declared_map = be_u32(&head, SECTOR + 4);
         let map_entries = declared_map.min(MAX_PARTS as u32);
         if declared_map > MAX_PARTS as u32 {
-            out.push((format!("<apm-partitions-beyond-{MAX_PARTS}>"), 0, 0));
+            out.push(Region::Unwalked(
+                format!("<apm-partitions-beyond-{MAX_PARTS}>"),
+                "too many APM partitions to walk them all",
+            ));
         }
         let mut emitted = 0usize;
         for i in 0..map_entries as usize {
             if emitted >= MAX_PARTS {
                 break;
             }
-            let sector = read_at(source, ((i + 1) * SECTOR) as u64, SECTOR);
+            let sector = crate::read_at(source, ((i + 1) * SECTOR) as u64, SECTOR)?;
             if sector.get(0..2) != Some(b"PM".as_slice()) {
                 break;
             }
@@ -232,26 +243,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
                 out.push(m);
             }
         }
-    } else if head.get(510..512) == Some(&[0x55, 0xAA][..])
-        && !is_volume_boot_record(&head)
-        && (0..4).any(|i| {
-            // is_mbr, but ranges validated against the true file length rather
-            // than the 1 KiB head, so a real (large) MBR image still qualifies.
-            // The guards must match `is_mbr` exactly: a check that lives in only
-            // one of the two paths leaves the other one wrong.
-            let e = 0x1BE + i * 16;
-            let status = head.get(e).copied().unwrap_or(0xFF);
-            let ptype = head.get(e + 4).copied().unwrap_or(0);
-            let lba_first = le_u32(&head, e + 8) as u64;
-            let sectors = le_u32(&head, e + 12);
-            (status == 0x00 || status == 0x80)
-                && ptype != 0x00
-                && ptype != 0xEE
-                && sectors > 0
-                && lba_first > 0
-                && lba_first.saturating_mul(SECTOR as u64) < total_len
-        })
-    {
+    } else if is_mbr_in(&head, total_len) {
         let mut emitted = 0usize;
         for i in 0..4 {
             let e = 0x1BE + i * 16;
@@ -322,8 +314,9 @@ fn is_volume_boot_record(data: &[u8]) -> bool {
         && sectors_per_cluster.is_power_of_two()
 }
 
-#[cfg(feature = "partition")]
-fn is_mbr(data: &[u8]) -> bool {
+/// Whether an image `len` bytes long, whose first sector is in `data`, opens
+/// with a plausible MBR partition table.
+fn is_mbr_in(data: &[u8], len: u64) -> bool {
     if data.get(510..512) != Some(&[0x55, 0xAA][..]) {
         return false;
     }
@@ -347,240 +340,8 @@ fn is_mbr(data: &[u8]) -> bool {
             && ptype != 0xEE
             && sectors > 0
             && lba_first > 0
-            && (lba_first as usize).saturating_mul(SECTOR) < data.len()
+            && (lba_first as u64).saturating_mul(SECTOR as u64) < len
     })
-}
-
-/// Carve `[start_sector*512 .. end_sector*512]` (both clamped to the image),
-/// charge it against the budget, and hand it to the visitor. Returns
-/// `Ok(Some(r))` if the visitor stopped early. Empty/degenerate ranges are
-/// skipped without consuming a file-count slot.
-#[cfg(feature = "partition")]
-fn emit_region<R>(
-    data: &[u8],
-    name: String,
-    start_sector: u64,
-    end_sector: u64,
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    let start = (start_sector as usize)
-        .saturating_mul(SECTOR)
-        .min(data.len());
-    let end = (end_sector as usize).saturating_mul(SECTOR).min(data.len());
-    let slice = data.get(start..end).unwrap_or(&[]);
-    if slice.is_empty() {
-        return Ok(None);
-    }
-    budget.count_entry()?;
-    let cap = budget.reserve()?;
-    if slice.len() as u64 > cap {
-        return Err(LimitHit::new(format!("partition '{name}' exceeds budget")));
-    }
-    budget.commit(slice.len() as u64);
-    Ok(visit(Entry::new(name, slice.to_vec()), budget))
-}
-
-#[cfg(feature = "partition")]
-pub(crate) fn extract_partition<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    // Prefer GPT/APM (self-describing, strong magic); fall back to the
-    // conservatively-validated MBR table (which also covers the hybrid case
-    // where a real MBR precedes a GPT but the GPT magic is absent/damaged).
-    if is_gpt(data) {
-        extract_gpt(data, budget, visit)
-    } else if is_apm(data) {
-        extract_apm(data, budget, visit)
-    } else if is_mbr(data) {
-        extract_mbr(data, budget, visit)
-    } else {
-        Ok(None)
-    }
-}
-
-/// GPT: header at offset 512 gives the partition-entry array location, count,
-/// and stride. Each used entry (non-zero type GUID) carves its LBA range.
-#[cfg(feature = "partition")]
-fn extract_gpt<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
-    let hdr = SECTOR; // GPT header lives in LBA1.
-                      // Real GPT header field offsets (relative to the header start):
-                      //   +72 partition_entries_lba (u64)
-                      //   +80 num_entries (u32)
-                      //   +84 entry_size (u32)
-    let entries_lba = le_u64(data, hdr + 72);
-    let declared_entries = le_u32(data, hdr + 80);
-    // Clamping here is the guard, but it is also a truncation: entries past the
-    // cap describe real regions of the image that will not be walked. Report it
-    // rather than let `.min()` quietly discard them. (The `emitted >= MAX_PARTS`
-    // check further down can then never fire — this clamp is what bounds the
-    // loop — but it is kept as a belt-and-braces bound.)
-    let num_entries = declared_entries.min(GPT_MAX_ENTRIES);
-    if declared_entries > GPT_MAX_ENTRIES {
-        budget.count_entry()?;
-        if let Some(r) = visit(
-            Entry::unsupported(
-                format!("<gpt-partitions-beyond-{GPT_MAX_ENTRIES}>"),
-                0,
-                false,
-                "too many GPT partitions to walk them all",
-            ),
-            budget,
-        ) {
-            return Ok(Some(r));
-        }
-    }
-    let entry_size = le_u32(data, hdr + 84);
-    if !(GPT_MIN_ENTRY_SIZE..=GPT_MAX_ENTRY_SIZE).contains(&entry_size) {
-        // Refusing to walk an implausible stride is right, but the partitions
-        // are still there — say so instead of returning "nothing found".
-        budget.count_entry()?;
-        if let Some(r) = visit(
-            Entry::unsupported(
-                "<gpt>".to_string(),
-                0,
-                false,
-                "implausible GPT entry size; partition table not walked",
-            ),
-            budget,
-        ) {
-            return Ok(Some(r));
-        }
-        return Ok(None);
-    }
-    let base = (entries_lba as usize).saturating_mul(SECTOR);
-    let mut emitted = 0usize;
-    for i in 0..num_entries as usize {
-        if emitted >= MAX_PARTS {
-            // Report the cap. Breaking quietly leaves the remaining partitions
-            // unscanned while the image could still be called clean.
-            budget.count_entry()?;
-            if let Some(r) = visit(
-                Entry::unsupported(
-                    format!("<gpt-partitions-beyond-{MAX_PARTS}>"),
-                    0,
-                    false,
-                    "too many GPT partitions to walk them all",
-                ),
-                budget,
-            ) {
-                return Ok(Some(r));
-            }
-            break;
-        }
-        let e = base.saturating_add(i.saturating_mul(entry_size as usize));
-        // An entry table running past EOF: the partitions it describes exist in
-        // the layout but cannot be read here.
-        let Some(entry) = data.get(e..e.saturating_add(56)) else {
-            budget.count_entry()?;
-            if let Some(r) = visit(
-                Entry::unsupported(
-                    "<gpt-entry-table-truncated>".to_string(),
-                    0,
-                    false,
-                    "GPT partition entry table extends past the end of the image",
-                ),
-                budget,
-            ) {
-                return Ok(Some(r));
-            }
-            break;
-        };
-        // All-zero type GUID marks an unused slot.
-        if entry[..16].iter().all(|&b| b == 0) {
-            continue;
-        }
-        let first_lba = le_u64(entry, 32);
-        let last_lba = le_u64(entry, 40);
-        // Range is inclusive of last_lba: [first_lba*512 .. (last_lba+1)*512].
-        let end_sector = last_lba.saturating_add(1);
-        emitted += 1;
-        let name = format!("gpt-part-{emitted}");
-        if let Some(r) = emit_region(data, name, first_lba, end_sector, budget, visit)? {
-            return Ok(Some(r));
-        }
-    }
-    Ok(None)
-}
-
-/// APM (big-endian): sector 0 is Block0 (`ER`); sectors 1.. each hold one
-/// partition-map entry (`PM`). The first entry's `mapEntries` bounds the count.
-#[cfg(feature = "partition")]
-fn extract_apm<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
-    // mapEntries from the first entry (sector 1), capped. The cap is a real
-    // truncation — entries past it describe regions of the image that will not
-    // be walked — so report it rather than let `.min()` discard them quietly.
-    let declared = be_u32(data, SECTOR + 4);
-    let map_entries = declared.min(MAX_PARTS as u32);
-    if declared > MAX_PARTS as u32 {
-        budget.count_entry()?;
-        if let Some(r) = visit(
-            Entry::unsupported(
-                format!("<apm-partitions-beyond-{MAX_PARTS}>"),
-                0,
-                false,
-                "too many APM partitions to walk them all",
-            ),
-            budget,
-        ) {
-            return Ok(Some(r));
-        }
-    }
-    let mut emitted = 0usize;
-    for i in 0..map_entries as usize {
-        if emitted >= MAX_PARTS {
-            break;
-        }
-        let base = (i + 1).saturating_mul(SECTOR); // entries start at sector 1
-                                                   // Each entry must begin with the `PM` signature; stop at the first miss.
-        if data.get(base..base + 2) != Some(b"PM".as_slice()) {
-            break;
-        }
-        let pblock_start = be_u32(data, base + 8) as u64;
-        let pblock_count = be_u32(data, base + 12) as u64;
-        if pblock_count == 0 {
-            continue;
-        }
-        let end_sector = pblock_start.saturating_add(pblock_count);
-        emitted += 1;
-        let name = format!("apm-part-{emitted}");
-        if let Some(r) = emit_region(data, name, pblock_start, end_sector, budget, visit)? {
-            return Ok(Some(r));
-        }
-    }
-    Ok(None)
-}
-
-/// MBR: four 16-byte entries at offset 0x1BE. Empty (`type==0`) and protective
-/// (`type==0xEE`, which defers to GPT) entries are skipped.
-#[cfg(feature = "partition")]
-fn extract_mbr<R>(data: &[u8], budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
-    let mut emitted = 0usize;
-    for i in 0..4 {
-        let e = 0x1BE + i * 16;
-        let ptype = data.get(e + 4).copied().unwrap_or(0);
-        if ptype == 0x00 || ptype == 0xEE {
-            continue; // empty slot, or protective MBR (defer to GPT)
-        }
-        let lba_first = le_u32(data, e + 8) as u64;
-        let sectors = le_u32(data, e + 12) as u64;
-        if sectors == 0 {
-            continue;
-        }
-        // Only carve entries whose start actually lands inside the image.
-        if (lba_first as usize).saturating_mul(SECTOR) >= data.len() {
-            continue;
-        }
-        let end_sector = lba_first.saturating_add(sectors);
-        emitted += 1;
-        let name = format!("mbr-part-{emitted}");
-        if let Some(r) = emit_region(data, name, lba_first, end_sector, budget, visit)? {
-            return Ok(Some(r));
-        }
-    }
-    Ok(None)
 }
 
 // The module compiles unconditionally (for the intersection heuristic), but
@@ -616,7 +377,7 @@ mod tests {
         // contents never get reached: a FAT image holding a zipped payload came
         // back LIMITS-EXCEEDED instead of infected.
         assert!(
-            !is_partition(&fat_boot_sector()),
+            !is_partition(&crate::Probe::whole(&fat_boot_sector())),
             "a FAT boot sector must not be taken for a partition table"
         );
     }
@@ -632,11 +393,11 @@ mod tests {
         b[446 + 4] = 0x0C;
         b[446 + 8..446 + 12].copy_from_slice(&0u32.to_le_bytes());
         b[446 + 12..446 + 16].copy_from_slice(&2u32.to_le_bytes());
-        assert!(!is_mbr(&b));
+        assert!(!is_mbr_in(&b, b.len() as u64));
 
         // The same entry one sector in is a normal partition.
         b[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
-        assert!(is_mbr(&b));
+        assert!(is_mbr_in(&b, b.len() as u64));
     }
 
     use super::*;
@@ -751,12 +512,10 @@ mod tests {
 
     #[test]
     fn garbage_and_truncated_do_not_panic() {
-        // Call the extractor directly (no catch_unwind) so a genuine panic would
+        // Call the table walk directly (no catch_unwind) so a genuine panic would
         // fail the test rather than being swallowed by the containment boundary.
         let run = |bytes: &[u8]| {
-            let mut budget = Budget::new(Limits::default());
-            let _ =
-                extract_partition::<std::convert::Infallible>(bytes, &mut budget, &mut |_, _| None);
+            let _ = stream_offsets(&mut std::io::Cursor::new(bytes));
         };
         // Random-ish bytes with the boot signature at 510.
         let mut g = vec![0u8; 1024];

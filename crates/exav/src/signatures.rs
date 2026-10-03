@@ -16,8 +16,7 @@
 //!   * pull a prebuilt `.exavdb` over HTTP (`--db-url`) as an alternative to
 //!     fetching signature files, with the same change detection and reload.
 //!
-//! Unix only: the reload it drives belongs to the prefork supervisor, and the
-//! fetching half needs a build with `--features http-update`.
+//! Unix only; the fetching half needs a build with `--features http-update`.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -274,15 +273,14 @@ fn redact_url(url: &str) -> String {
     url
 }
 
-/// Whether a reload has anything to act on: only the prefork supervisor re-forks
-/// its pool on request. Elsewhere the change is picked up by the mtime watch on
-/// the same path, and raising `SIGHUP` in a process with no handler for it would
-/// kill the server instead of reloading it.
+/// Whether a reload has anything to act on in this process.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reload {
-    /// Signal the prefork supervisor as soon as an update lands.
+    /// A listener's supervisor runs here: ask it to reload as soon as an
+    /// update lands.
     Signal,
-    /// Leave it to the mtime watch on the signature path.
+    /// Nothing is served here (`--auto-update` alone); whoever serves the
+    /// directory picks the change up from its mtime watch.
     Watch,
 }
 
@@ -314,8 +312,8 @@ pub(crate) struct AutoUpdate {
     /// The directory the sources are fetched into. `None` in prebuilt-database
     /// mode, where [`start`] already owns the polling.
     dir: Option<PathBuf>,
-    /// Time between source re-checks.
-    interval: Duration,
+    /// Time between source re-checks; `None` when they are off.
+    interval: Option<Duration>,
     /// How an installed update reaches the running server.
     reload: Reload,
     /// Per-source HTTP validators learned by the initial fetch.
@@ -323,26 +321,35 @@ pub(crate) struct AutoUpdate {
     validators: std::collections::HashMap<String, Option<String>>,
 }
 
-/// How often the sources are re-checked, from `--update-interval-secs`.
-fn interval(cli: &Cli) -> Duration {
-    Duration::from_secs(
+/// How often the sources are re-checked, from `--update-interval-secs`;
+/// `None` for `off`, which fetches at startup only.
+fn interval(cli: &Cli) -> Option<Duration> {
+    every(
         cli.update_interval_secs
-            .unwrap_or(DEFAULT_UPDATE_INTERVAL_SECS)
-            .max(MIN_UPDATE_INTERVAL_SECS),
+            .unwrap_or(DEFAULT_UPDATE_INTERVAL_SECS),
     )
 }
 
 /// How often a `--db-url` prebuilt database is re-checked, from the same flag.
 /// A conditional `HEAD`, so the default cadence is minutes rather than the day
-/// a full source fetch gets — but the same 60-second floor applies: a short
-/// poll aimed at someone else's server is the same loop whatever it checks.
+/// a full source fetch gets. The same 60-second floor applies: a short poll
+/// aimed at someone else's server is the same loop whatever it checks.
 #[cfg(feature = "http-update")]
-fn db_poll_interval(cli: &Cli) -> Duration {
-    Duration::from_secs(
-        cli.update_interval_secs
-            .unwrap_or(DEFAULT_DB_URL_POLL_SECS)
-            .max(MIN_UPDATE_INTERVAL_SECS),
-    )
+fn db_poll_interval(cli: &Cli) -> Option<Duration> {
+    every(cli.update_interval_secs.unwrap_or(DEFAULT_DB_URL_POLL_SECS))
+}
+
+/// `secs` as a polling period, floored; `None` for `0`, which `off` parses to.
+fn every(secs: u64) -> Option<Duration> {
+    (secs != 0).then(|| Duration::from_secs(secs.max(MIN_UPDATE_INTERVAL_SECS)))
+}
+
+/// How a polling period reads in a log line.
+fn describe(every: Option<Duration>) -> String {
+    match every {
+        Some(d) => format!("every {}s", d.as_secs()),
+        None => "at startup only (--update-interval-secs off)".to_string(),
+    }
 }
 
 /// Seconds to wait for a sidecar to fill an empty signature dir. `--auto-update`
@@ -398,9 +405,9 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
 
     let interval = interval(cli);
     eprintln!(
-        "exav: {} signature source(s), refreshed every {}s",
+        "exav: {} signature source(s), fetched {}",
         sources.len(),
-        interval.as_secs()
+        describe(interval)
     );
 
     // A source is saved under the filename its URL ends in, and the loader routes
@@ -416,7 +423,7 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
         if !exav_core::loader::loads_by_extension(&name) {
             eprintln!(
                 "exav: {url} saves as `{name}`, which the loader does not recognise as a \
-                 database — it will be fetched and not loaded. Signatures are routed by \
+                 database: it will be fetched and not loaded. Signatures are routed by \
                  extension: name the URL after the file it serves (.cvd, .cld, .ndb, .hdb, \
                  .ldb, .yar, …)."
             );
@@ -426,7 +433,7 @@ pub(crate) fn start(cli: &mut Cli, reload: Reload) -> Result<Option<AutoUpdate>,
     #[cfg(not(feature = "http-update"))]
     {
         eprintln!(
-            "exav: signature source URLs are set but this build has no updater — rebuild \
+            "exav: signature source URLs are set but this build has no updater: rebuild \
              with `--features http-update`, or populate {} from a sidecar. Continuing.",
             dir.display()
         );
@@ -465,7 +472,7 @@ fn start_prebuilt_db(
 ) -> Result<(), String> {
     if !sources.is_empty() {
         eprintln!(
-            "exav: --db-url is set — ignoring --sig-sources \
+            "exav: --db-url is set, ignoring --sig-sources \
              (serving a prebuilt database, not signature files)"
         );
     }
@@ -505,10 +512,11 @@ fn start_prebuilt_db(
         }
     };
 
-    eprintln!(
-        "exav: polling {shown} for database changes every {}s",
-        poll.as_secs()
-    );
+    eprintln!("exav: database from {shown} fetched {}", describe(poll));
+    let Some(poll) = poll else {
+        cli.database = Some(dest);
+        return Ok(());
+    };
     let url = url.to_string();
     let watched = dest.clone();
     std::thread::spawn(move || loop {
@@ -517,7 +525,7 @@ fn start_prebuilt_db(
             Ok(f) => {
                 validator = f.validator().map(String::from);
                 if f.is_updated() {
-                    eprintln!("exav: database updated from {shown} — reloading");
+                    eprintln!("exav: database updated from {shown}, reloading");
                     reload.request();
                 }
             }
@@ -536,7 +544,7 @@ fn start_prebuilt_db(
     _sources: &[String],
     _reload: Reload,
 ) -> Result<(), String> {
-    Err("--db-url needs the updater — build with `--features http-update`".to_string())
+    Err("--db-url needs the updater: build with `--features http-update`".to_string())
 }
 
 impl AutoUpdate {
@@ -553,7 +561,9 @@ impl AutoUpdate {
                 reload,
                 mut validators,
             } = self;
-            let Some(dir) = dir else { return };
+            let (Some(dir), Some(interval)) = (dir, interval) else {
+                return;
+            };
             std::thread::spawn(move || loop {
                 std::thread::sleep(interval);
                 if update_signatures(&sources, &dir, &mut validators) {
@@ -580,6 +590,8 @@ impl AutoUpdate {
                 mut validators,
             } = self;
             let dir = dir.expect("a prebuilt database poller is never an updater-only run");
+            let interval =
+                interval.expect("`updater_only_error` refuses an updater that never polls");
             eprintln!(
                 "exav: updater-only: refreshing {} every {}s",
                 dir.display(),
@@ -629,8 +641,15 @@ pub(crate) fn updater_only_error(cli: &Cli) -> Option<String> {
     if cli.db_url.is_some() {
         return Some(
             "an updater fetches signature files; --db-url pulls a prebuilt \
-             database, which is served rather than written for another process — \
+             database, which is served rather than written for another process: \
              add --listen"
+                .to_string(),
+        );
+    }
+    if interval(cli).is_none() {
+        return Some(
+            "--auto-update with no listener is an updater, and with \
+             --update-interval-secs off it would fetch once and then do nothing"
                 .to_string(),
         );
     }
@@ -741,23 +760,23 @@ mod tests {
         let cli =
             |args: &[&str]| Cli::parse_from(std::iter::once("exav").chain(args.iter().copied()));
 
+        let secs = |args: &[&str]| interval(&cli(args)).map(|d| d.as_secs());
+        assert_eq!(secs(&[]), Some(24 * 3600), "once a day is the default");
         assert_eq!(
-            interval(&cli(&[])).as_secs(),
-            24 * 3600,
-            "once a day is the default"
-        );
-        assert_eq!(
-            interval(&cli(&["--update-interval-secs", "3600"])).as_secs(),
-            3600,
+            secs(&["--update-interval-secs", "3600"]),
+            Some(3600),
             "an interval in seconds is used as given"
         );
-        for too_short in ["0", "1", "59"] {
+        for too_short in ["1", "59"] {
             assert_eq!(
-                interval(&cli(&["--update-interval-secs", too_short])).as_secs(),
-                MIN_UPDATE_INTERVAL_SECS,
+                secs(&["--update-interval-secs", too_short]),
+                Some(MIN_UPDATE_INTERVAL_SECS),
                 "--update-interval-secs {too_short} must not become a delay-free loop"
             );
         }
+        // `off` stops the re-checks; it used to poll every minute.
+        assert_eq!(secs(&["--update-interval-secs", "off"]), None);
+        assert!(Cli::try_parse_from(["exav", "--update-interval-secs", "0"]).is_err());
     }
 
     #[cfg(feature = "http-update")]
@@ -767,18 +786,20 @@ mod tests {
         let cli =
             |args: &[&str]| Cli::parse_from(std::iter::once("exav").chain(args.iter().copied()));
 
+        let secs = |args: &[&str]| db_poll_interval(&cli(args)).map(|d| d.as_secs());
         assert_eq!(
-            db_poll_interval(&cli(&[])).as_secs(),
-            300,
+            secs(&[]),
+            Some(300),
             "a pulled database re-checks every five minutes by default"
         );
-        for too_short in ["0", "1", "59"] {
+        for too_short in ["1", "59"] {
             assert_eq!(
-                db_poll_interval(&cli(&["--update-interval-secs", too_short])).as_secs(),
-                MIN_UPDATE_INTERVAL_SECS,
+                secs(&["--update-interval-secs", too_short]),
+                Some(MIN_UPDATE_INTERVAL_SECS),
                 "--update-interval-secs {too_short} must not hammer the database host"
             );
         }
+        assert_eq!(secs(&["--update-interval-secs", "off"]), None);
     }
 
     /// Waiting for a sidecar is what `--auto-update` brings with it. Without the

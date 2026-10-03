@@ -2,7 +2,7 @@
 //! Fuzz the NDB/LDB signature compiler: parse arbitrary signature text through
 //! `EngineBuilder::add_ndb()` / `add_ldb()`, then build the engine.  Catches
 //! panics in `parse_elems`, `compile_body`, `pick_anchor`, `parse_gap`,
-//! `parse_alt`, AC automaton construction, and all the hex-wildcard parsing
+//! `parse_alt`, the anchor index build, and all the hex-wildcard parsing
 //! codepaths that no other fuzz target reaches.
 use libfuzzer_sys::fuzz_target;
 use exav_core::engine::EngineBuilder;

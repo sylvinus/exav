@@ -13,8 +13,9 @@
 //! The archive is a chain of self-describing records. Each extension field is
 //! `magic(4) | flags(1) | size(2 or 4) | data`, and a run of them ends at a stop
 //! marker — so an unknown field is skipped by length rather than guessed at, and
-//! a future EGG version stays readable. AZO is ESTsoft's own algorithm and is
-//! not documented; blocks using it are reported.
+//! a future EGG version stays readable. AZO is ESTsoft's own undocumented
+//! algorithm, decoded by a port of the one permissively licensed implementation
+//! (`formats::azo`).
 
 use crate::{Budget, Entry, Format, LimitHit, Sink};
 
@@ -222,9 +223,9 @@ fn decode_block(algo: u8, raw: &[u8], uncomp: u64, cap: u64) -> Option<(Vec<u8>,
         DEFLATE => {
             crate::bounded_read(flate2::read::DeflateDecoder::new(Cursor::new(raw)), cap).ok()
         }
-        #[cfg(feature = "bzip2")]
-        BZIP2 => crate::bounded_read(bzip2_rs::DecoderReader::new(Cursor::new(raw)), cap).ok(),
-        #[cfg(feature = "lzip")]
+        BZIP2 => {
+            crate::bounded_read(super::bzip2_rs::DecoderReader::new(Cursor::new(raw)), cap).ok()
+        }
         LZMA => {
             // An LZMA block is not a bare stream. It opens with a 4-byte codec
             // record — algorithm, flags, then a u16 property length — followed by

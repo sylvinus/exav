@@ -138,11 +138,13 @@ const archive = await Archive.open(file, undefined, {
 });
 ```
 
-Where an archive carries an index — a ZIP's central directory, a tar's headers —
-`list()` reads it and decompresses nothing, and `extract(i)` seeks straight to
-the member. A single compressed stream such as gzip or xz has no index by
-construction: there `list()` walks the archive, costing what `extractAll()`
-costs, and the result is reused rather than walked twice.
+`list()` decodes nothing it can avoid: where an archive carries an index (a
+ZIP's central directory, a tar's headers) it decompresses nothing, and
+`uncompressedSize` is what the archive declares, or -1 where it declares none
+(a gzip or xz stream). `extract(i)` walks the archive up to member `i`, skipping
+the members before it undecoded where the format allows; a format read whole
+(7z, RAR) is decoded to be listed or extracted from, so for those,
+`extractAll()` is one pass where `extract(i)` over every `i` is many.
 
 ### Limits
 

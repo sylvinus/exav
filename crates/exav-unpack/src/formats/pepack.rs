@@ -58,7 +58,7 @@ pub(crate) fn emulate_pe(
         trace,
         ..Default::default()
     };
-    let r = x86::run::unpack(data, &limits);
+    let r = crate::profile::timed("emu", data.len() as u64, || x86::run::unpack(data, &limits));
     let mut line = format!(
         "ticks={} dirty={}KiB stop={}",
         r.ticks,
@@ -825,8 +825,8 @@ pub(crate) enum Recovered<R> {
 /// Instruction budget for one stub. Runtime packers spend on the order of a
 /// hundred instructions per byte they produce, so this is what bounds the size
 /// of image the emulator can follow to completion — and what bounds the CPU a
-/// hostile file can demand. At roughly 20M ticks a second it is a few seconds
-/// in the worst case, and only for files that already look packed.
+/// hostile file can demand. At tens of millions of ticks a second it is a few
+/// seconds in the worst case, and only for files that already look packed.
 #[cfg(feature = "pe-emu")]
 const MAX_EMU_TICKS: u64 = 120_000_000;
 
@@ -864,13 +864,29 @@ pub(crate) fn emulated_unpack<R>(
 ) -> Result<Recovered<R>, LimitHit> {
     budget.count_entry()?;
     let cap = budget.reserve()?.min(MAX_INNER as u64) as usize;
+    let room = budget.pe_emulation_room();
+    if room == 0 {
+        return Err(budget.pe_emulation_exhausted());
+    }
     let limits = x86::run::EmuLimits {
-        max_ticks: MAX_EMU_TICKS,
+        max_ticks: MAX_EMU_TICKS.min(room),
         max_dump: cap.min(MAX_EMU_DUMP),
         max_pages: cap.min(MAX_EMU_MEMORY) / exav_pe_emu::PAGE_SIZE,
         ..Default::default()
     };
-    let report = x86::run::unpack(data, &limits);
+    let report =
+        crate::profile::timed("emu", data.len() as u64, || x86::run::unpack(data, &limits));
+    budget.charge_pe_emulation(report.ticks);
+    // The per-stub cap ending a run is the emulator's normal behavior; the
+    // scan-wide one ending it means this stub was not given its full share.
+    let cut_short = limits.max_ticks < MAX_EMU_TICKS && report.ticks >= limits.max_ticks;
+    let ended = |budget: &Budget, done: Recovered<R>| {
+        if cut_short {
+            Err(budget.pe_emulation_exhausted())
+        } else {
+            Ok(done)
+        }
+    };
 
     // Payloads the stub built in memory it allocated. Emitted whether or not it
     // also rebuilt its own image: a loader that unfolds the original program
@@ -890,12 +906,13 @@ pub(crate) fn emulated_unpack<R>(
         }
     }
 
+    let fallback = if emitted {
+        Recovered::Emitted
+    } else {
+        Recovered::Nothing
+    };
     let Some(unpacked) = report.unpacked else {
-        return Ok(if emitted {
-            Recovered::Emitted
-        } else {
-            Recovered::Nothing
-        });
+        return ended(budget, fallback);
     };
     // The same output gate the static path uses: only a buffer that reads back
     // as a PE image is emitted. A run that ended mid-decompression leaves the
@@ -903,11 +920,7 @@ pub(crate) fn emulated_unpack<R>(
     // rejects is a dump whose headers the stub overwrote with something else,
     // where there is no way to tell code from rubble.
     if !looks_like_pe(&unpacked.data) {
-        return Ok(if emitted {
-            Recovered::Emitted
-        } else {
-            Recovered::Nothing
-        });
+        return ended(budget, fallback);
     }
     let name = if unpacked.reached_oep {
         format!("{label}-emulated")
@@ -918,13 +931,13 @@ pub(crate) fn emulated_unpack<R>(
     if let Some(r) = visit(Entry::new(name, unpacked.data), budget) {
         return Ok(Recovered::Halt(r));
     }
-    Ok(Recovered::Emitted)
+    ended(budget, Recovered::Emitted)
 }
 
 fn packer_name(p: Packer) -> &'static str {
     // The vendor's own capitalisation, and the single source of truth for it.
     // These strings reach the user twice — in the member name and, with
-    // `--alert-packed`, inside `Heuristics.Packed.<name>` — and a gateway
+    // `--detect packed`, inside `Heuristics.Packed.<name>` — and a gateway
     // filtering on an exact string needs the name the vendor uses. Spelling them
     // once here means the scanner never has to re-derive a display name, so the
     // two can't drift apart and a packer added below is reportable immediately.
@@ -1264,7 +1277,7 @@ mod tests {
         for junk in [&b"MZ"[..], b"MZ\x00\x00", b"MZ\xff\xff\xff\xff garbage"] {
             let _ = is_pepack(junk);
             let mut b = Budget::new(Limits::default());
-            let _ = extract(Format::PePacked, junk, &mut b);
+            let _ = extract(Format::PePacked, &junk, &mut b);
         }
     }
 

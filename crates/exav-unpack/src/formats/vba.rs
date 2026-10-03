@@ -12,9 +12,9 @@
 
 /// Decompress an MS-OVBA "CompressedContainer" ([MS-OVBA] §2.4.1.1).
 ///
-/// Returns `None` if the signature byte or a chunk header is invalid. On
-/// truncated/corrupt input it returns whatever was decoded so far (malware
-/// often ships deliberately damaged containers).
+/// Returns `None` if the signature byte is not 0x01. On truncated/corrupt
+/// input it returns whatever was decoded so far (malware often ships
+/// deliberately damaged containers).
 pub(crate) fn decompress(data: &[u8], cap: u64) -> Option<Vec<u8>> {
     if data.first() != Some(&0x01) {
         return None;
@@ -30,13 +30,12 @@ pub(crate) fn decompress(data: &[u8], cap: u64) -> Option<Vec<u8>> {
         }
         let header = u16::from_le_bytes([data[pos], data[pos + 1]]);
         pos += 2;
-        let size = (header & 0x0FFF) as usize; // CompressedChunkSize
-        let signature = (header >> 12) & 0x07;
+        // CompressedChunkSize, then the signature bits (0b011), which are fixed
+        // and which nothing reads: Emotet documents set them otherwise to stop
+        // analysis tools, Office runs the macros all the same, so they are not
+        // checked.
+        let size = (header & 0x0FFF) as usize;
         let compressed = (header >> 15) & 0x01;
-        if signature != 0b011 {
-            // Not a valid chunk header; stop rather than misinterpret.
-            return if out.is_empty() { None } else { Some(out) };
-        }
         let chunk_data_len = size + 1; // bytes of chunk data following the header
         let chunk_end = (pos + chunk_data_len).min(data.len());
         let chunk_start = out.len();
@@ -577,6 +576,19 @@ mod tests {
         let mut buf = vec![0x01u8];
         buf.extend_from_slice(&header.to_le_bytes());
         buf.push(0x00); // flag byte: all literals
+        buf.extend_from_slice(b"abcd");
+        assert_eq!(decompress(&buf, u64::MAX).unwrap(), b"abcd");
+    }
+
+    /// From live Emotet documents: a chunk header whose signature bits are
+    /// 0b100, not 0b011. Office runs the macros all the same, and the whole
+    /// VBA project was dropped.
+    #[test]
+    fn a_chunk_signature_other_than_0b011_still_decodes() {
+        let header: u16 = 0b1100_0000_0000_0000 | 4;
+        let mut buf = vec![0x01u8];
+        buf.extend_from_slice(&header.to_le_bytes());
+        buf.push(0x00);
         buf.extend_from_slice(b"abcd");
         assert_eq!(decompress(&buf, u64::MAX).unwrap(), b"abcd");
     }

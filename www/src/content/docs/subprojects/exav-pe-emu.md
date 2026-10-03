@@ -3,76 +3,94 @@ title: exav-pe-emu
 description: A sandboxed x86-32 emulator that unpacks runtime-packed Windows executables by running their stub and capturing the image it rebuilds.
 ---
 
-**An x86-32 emulator that unpacks packed executables by running them.** Not a
-decoder per packer — a machine the packer's own stub runs on, so whatever it
-compresses or encrypts with, the original image is captured at the moment the
-stub jumps to it.
+**An x86-32 emulator that unpacks packed executables by running them.** It runs
+the packer's own stub and captures the original image when the stub jumps to it,
+whatever the packer compresses or encrypts with.
+
+```bash
+cargo add exav-pe-emu
+```
 
 ```rust
 let file = std::fs::read("packed.exe")?;
 let report = exav_pe_emu::unpack(&file, &exav_pe_emu::EmuLimits::default());
 match report.unpacked {
-    Some(u) => std::fs::write("unpacked.exe", &u.data)?,
-    // Nothing is ever invented — this says why the stub was not followed.
+    // `u.data` is the rebuilt image in memory layout, for scanning rather than
+    // running; `u.reached_oep` says whether the stub jumped to it.
+    Some(u) => std::fs::write("unpacked.bin", &u.data)?,
+    // Nothing is invented: this says why the stub was not followed.
     None => eprintln!("{}", report.stop),
 }
 ```
 
+## CLI
+
+The crate also ships an `exav-pe-emu` command. It is in each
+[release](/getting-started/installation/#prebuilt-binaries), as
+`exav-pe-emu-<tag>-<target>`, or:
+
+```bash
+cargo install exav-pe-emu
+
+exav-pe-emu packed.exe                 # report, and write packed.exe.unpacked
+exav-pe-emu -o out.exe packed.exe      # choose the output path (one input only)
+exav-pe-emu -d out/ a.exe b.exe        # write each image into out/
+exav-pe-emu --report-only packed.exe   # write nothing
+exav-pe-emu --trace packed.exe         # also print the Windows calls and the last instructions
+exav-pe-emu --ticks 500000000 big.exe  # instruction budget per file (default 120 million)
+```
+
+It prints what the stub did for each input, and also writes any other PE image
+found in memory the stub allocated (`<input>.allocation-N`). Exit status: `0` if
+every input gave back an image, `1` if any did not, `2` on a usage or I/O error.
+
 ## Why run the stub
 
-A packed executable is not the program that runs. Writing a decoder per packer
-is a race against people who change their format every build, and it only ever
-covers packers someone has already reverse-engineered. But every packer, without
-exception, has to rebuild the original program in memory and transfer control to
-it — otherwise it would not run. That moment is packer-independent, and it is
-what this captures.
-
-Measured against 276 samples from 23 real packers: 218 (79%) give back a complete
-image, and 15 packers do so on every sample they were given. Four more unpack
-most of theirs. Three defeat it (and are reported as unpacked-nothing, never as
-clean), and one is a .NET packer whose payload comes back as the managed assembly
-it loads. Five are packers ClamAV ships a hand-written unpacker for; most of the
-rest have no decoder anywhere. See
-[PE stub emulation](/concepts/pe-emulation/) for the mechanism and the full
-table.
+A packed executable is not the program that runs. A decoder per packer is a race
+against authors who change their format every build, and only covers packers
+someone has already reverse-engineered. But every packer has to rebuild the
+original program in memory and transfer control to it, or it would not run. That
+moment is packer-independent, and it is what this captures. Coverage measured on
+real packers is on the [PE stub emulation](/concepts/pe-emulation/#measured-coverage)
+page.
 
 ## What is emulated
 
 Enough Windows that a stub cannot tell, and nothing more:
 
-* **Sparse 32-bit address space** — pages appear when touched, so a hostile
+* **A sparse 32-bit address space:** pages appear when touched, so a hostile
   `SizeOfImage` is not a memory bomb; unmapped access faults; every page
   remembers whether it was written and whether it has executed.
-* **The instruction set stubs use** — integers, flags, shifts, string
-  primitives, the x87 subset (including the `fnstenv` program-counter trick),
-  MMX/SSE data movement and shuffles, BCD, `crc32`, and the **trap flag**, so a
-  stub that single-steps itself through its own exception handler runs as it
-  would on hardware.
-* **The loader's work** — TEB/PEB, the three module lists, synthetic
+* **The instructions stubs use:** integers, flags, shifts, string primitives, the
+  x87 subset (including the `fnstenv` program-counter trick), MMX/SSE data
+  movement and shuffles, BCD, `crc32`, and the trap flag, so a stub that
+  single-steps itself through its own exception handler runs as on hardware.
+* **The loader's work:** TEB/PEB, the three module lists, synthetic
   `kernel32`/`ntdll`/`user32` with walkable export directories, and import
-  binding, because a stub calls `LoadLibraryA` through the slot the loader
-  filled in.
+  binding, because a stub calls `LoadLibraryA` through the slot the loader filled
+  in.
 * **Structured exception handling** with `CONTEXT` resume, on-demand stack
-  growth, and a read-only view of *the file being emulated*, so a
-  self-extracting stub can read its own overlay.
+  growth, and a read-only view of the file being emulated, so a self-extracting
+  stub can read its own overlay.
 
 ## What is not
 
-* **No host access of any kind.** No syscalls, no filesystem, no network, no
-  processes. The only file that resolves is the one passed in, read-only.
-  Malware here is *interpreted*, never executed.
-* **No virtualizing protectors** (VMProtect, Themida, Enigma): they translate
-  the protected code to a private bytecode at build time, so no original code
-  exists in memory at any point. Nothing to capture, and the emulator does not
-  pretend otherwise.
-* **No `unsafe`.** `#![forbid(unsafe_code)]` — every access is bounds-checked
-  and every stop is a value, never a panic. Decoding is
-  [`exav-x86`](/subprojects/exav-x86/), which is itself dependency-free and
-  `#![forbid(unsafe_code)]`: no assembler, no code generation, and nothing in
-  the emulator's dependency tree that is not memory-safe Rust.
+* **No host access.** No syscalls, filesystem, network or processes; the only
+  file that resolves is the one passed in, read-only. Malware here is
+  interpreted, never executed.
+* **No virtualizing protectors** (VMProtect, Themida, Enigma): they translate the
+  protected code to a private bytecode at build time, so no original code exists
+  in memory to capture.
+* **No `unsafe`.** `#![forbid(unsafe_code)]`: every access is bounds-checked and
+  every stop is a value, never a panic. Decoding is
+  [`exav-x86`](/subprojects/exav-x86/), itself dependency-free and
+  `#![forbid(unsafe_code)]`.
 
 ## Bounds
 
-Instruction budget, resident-page cap, dump-size cap, and a progress check that
-ends a stub spinning in an anti-emulation delay loop. All configurable through
-`EmuLimits`; the defaults are what the scanner uses.
+An instruction budget, a resident-page cap, a dump-size cap, and a progress check
+that ends a stub spinning in an anti-emulation delay loop, all set through
+`EmuLimits`. The defaults (200 million instructions, 192 MiB of pages, a 64 MiB
+dump) suit one sample on its own; the scanner uses tighter per-stub budgets
+(120 million, 64 MiB, 32 MiB) and also caps the total across every packed
+executable in one file (`--max-pe-emulation-steps`).

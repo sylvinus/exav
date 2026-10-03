@@ -50,6 +50,30 @@ fn benign_lzx_detects_and_decodes() {
     );
 }
 
+/// `multi-frame-lzx.chm` resets its LZX stream every two 32 KiB frames, and
+/// `b.html` runs from the first frame into the second, which only decodes
+/// with the state the first left. Each page comes out as `chmcmd` was given it.
+#[test]
+fn every_frame_of_a_reset_interval_decodes() {
+    let data = read_fixture("multi-frame-lzx.chm").expect("multi-frame-lzx.chm must be committed");
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Chm, &data, &mut budget).expect("extract");
+    for name in ["a", "b", "c"] {
+        let mut page = String::from("<html><body>\n");
+        for i in 0..2000u32 {
+            page += &format!("<p>{name} {}</p>\n", i * 7919 % 10007);
+        }
+        page += "</body></html>\n";
+        let path = format!("/{name}.html");
+        let e = entries
+            .iter()
+            .find(|e| e.name == path)
+            .unwrap_or_else(|| panic!("{path} missing"));
+        assert!(e.unsupported.is_none(), "{path}: {:?}", e.unsupported);
+        assert!(e.data == page.as_bytes(), "{path} differs from its source");
+    }
+}
+
 /// The benign CHM, and any locally-present real samples, extract into at least
 /// one member and never panic. (Real samples add real-world-input robustness.)
 #[test]
@@ -85,7 +109,7 @@ fn truncated_head_does_not_panic() {
         };
         let head = &data[..64.min(data.len())];
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Chm, head, &mut budget).unwrap();
+        let entries = extract(Format::Chm, &head, &mut budget).unwrap();
         assert!(entries.is_empty(), "{name}: truncated head yielded members");
     }
 }

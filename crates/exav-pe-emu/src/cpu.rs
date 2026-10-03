@@ -762,7 +762,11 @@ impl Cpu {
         // meant to save. A self-modifying stub turns the cache into pure
         // overhead, by orders of magnitude, unless invalidation is this cheap.
         let gen = mem.code_generation();
-        let slot = (self.eip as usize >> 1) & (CACHE_SLOTS - 1);
+        // Indexed by the full address, not `eip >> 1`: consecutive
+        // instructions often differ by one byte (`inc ecx; dec ecx`), and
+        // folding that bit away maps neighbours onto the same slot, so
+        // straight-line code evicts itself every step and never hits.
+        let slot = self.eip as usize & (CACHE_SLOTS - 1);
         let insn = match &self.cache[slot] {
             Some((g, ip, insn)) if *g == gen && *ip == self.eip => insn.clone(),
             _ => {

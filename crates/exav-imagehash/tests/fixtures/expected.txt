@@ -1,0 +1,34 @@
+# file, then the hash of `sigtool --fuzzy-img` (ClamAV 1.5.4), then of
+# Python `imagehash.phash` (imagehash 4.3.2, Pillow 12.3.0).
+bilevel.bmp b2bcc3328dca2dca b2bcc3328dca2dca
+bilevel.pbm b2bcc3328dca2dca b2bcc3328dca2dca
+bilevel.png b2bcc3328dca2dca b2bcc3328dca2dca
+bmp.ico b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+cmyk.tif b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+deflate.tif b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+i16.png f23c8b31cdc32c8d b2fcc3328dcb2dc0
+l.jpg b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+l.pgm b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+l.png b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+l.tif b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+la.png b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+lossless.webp b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+lossy.webp b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+lzw.tif b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+p.bmp f2f8c3728dca2dc0 f2f8c3728dca2dc0
+p.png f2fcc3328dc32dc0 f2fcc3328dc30dc2
+p_trns.png d27cc3328fca2dc8 d27cc3328fca2dc8
+rgb.bmp b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgb.gif f2f8c3728dca2dc0 f2f8c3728dca2dc0
+rgb.jpg b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgb.png b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgb.ppm b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgb.qoi b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgb.tif b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgb16.ppm b2bcc332cdca2d8a b2bcc332cdca2d8a
+rgba.bmp b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgba.ico b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgba.png b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgba.qoi b2fcc3328dcb2dc0 b2fcc3328dcb2dc0
+rgba.webp 92b8c3338dcb2dc3 92b8c3738dcb2dc2
+trns.gif d27cc3328fca2dc8 d27cc3328fca2dc8

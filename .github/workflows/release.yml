@@ -1,6 +1,9 @@
 # Tag-driven binary releases. Push a tag like `v0.1.0` and this cross-compiles
-# the `exav` CLI for each target, archives it, and attaches it to the GitHub
-# Release for that tag. Static musl Linux builds run on any distro (no glibc).
+# the `exav` CLI and the standalone `exav-unpack`, `exav-grep`, `exav-pe-emu`
+# and `exav-imagehash` for each target, archives each with LICENSE and NOTICE, and
+# attaches them to the
+# GitHub Release for that tag. Static musl Linux builds run on any distro (no
+# glibc).
 # The `wasm` job adds the two WebAssembly artifacts: the unpacker npm tarball
 # (`@exav/unpack-wasm`, standard preset — exactly what `npm publish` ships via
 # `prepublishOnly`) and the engine as a WASI module (`exav-core --features
@@ -58,6 +61,42 @@ jobs:
           archive: exav-$tag-$target
           # YARA rule support is on by default; keep it for full parity.
           # For a smaller binary, add: features: "" / no-default-features.
+          # The licenses of everything linked go with every binary (NOTICE).
+          include: LICENSE,NOTICE
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checksum: sha256
+      # The standalone tools, each in an archive of its own: most people
+      # want one of them, not the scanner.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-unpack
+          target: ${{ matrix.target }}
+          archive: exav-unpack-$tag-$target
+          include: LICENSE,NOTICE
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checksum: sha256
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-grep
+          target: ${{ matrix.target }}
+          archive: exav-grep-$tag-$target
+          include: LICENSE,NOTICE
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checksum: sha256
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-pe-emu
+          target: ${{ matrix.target }}
+          archive: exav-pe-emu-$tag-$target
+          include: LICENSE,NOTICE
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checksum: sha256
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: exav-imagehash
+          target: ${{ matrix.target }}
+          archive: exav-imagehash-$tag-$target
+          include: LICENSE,NOTICE
           token: ${{ secrets.GITHUB_TOKEN }}
           checksum: sha256
 

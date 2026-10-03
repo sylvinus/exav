@@ -61,18 +61,12 @@ fn be_u64(data: &[u8], p: usize) -> Option<u64> {
     ]))
 }
 
-/// Parse and fully validate the fat header. Returns the arch slices only when
-/// the input is a *plausible* universal binary (see the module docs for the
-/// strictness rationale); returns `None` for anything else, including a Java
-/// `.class` file that merely shares the `0xCAFEBABE` magic.
-fn parse_archs(data: &[u8]) -> Option<Vec<Arch>> {
-    parse_archs_len(data, data.len() as u64)
-}
-
-/// As [`parse_archs`], but validating slice ranges against an explicit
-/// `total_len` rather than `data.len()`. The reader-based path passes only the
-/// header region as `data` (which must still contain the whole arch table) and
-/// the true file length as `total_len`.
+/// Parse and fully validate the fat header of a file of `total_len` bytes,
+/// whose start is `data` (which must contain the whole arch table). Returns
+/// the arch slices only when the input is a *plausible* universal binary (see
+/// the module docs for the strictness rationale); returns `None` for anything
+/// else, including a Java `.class` file that merely shares the `0xCAFEBABE`
+/// magic.
 fn parse_archs_len(data: &[u8], total_len: u64) -> Option<Vec<Arch>> {
     let magic = be_u32(data, 0)?;
     let is64 = match magic {
@@ -119,13 +113,25 @@ fn parse_archs_len(data: &[u8], total_len: u64) -> Option<Vec<Arch>> {
 }
 
 /// True when `data` is a plausible Mach-O universal binary (used by `detect`).
-pub(crate) fn looks_like_machofat(data: &[u8]) -> bool {
-    parse_archs(data).is_some()
+pub(crate) fn looks_like_machofat(p: &crate::Probe) -> bool {
+    parse_archs_len(p.head, p.len as u64).is_some()
 }
 
-/// Parse arch slice offsets from a seekable source (reader-based streaming). The
-/// arch table is a bounded header at the start; each arch image streams via
-/// seek+take. Returns `(name, offset, size)` per arch, matching [`extract_machofat`].
+/// Walk a universal binary, each arch image streamed from where it lies.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let mut source = crate::source::Reader::new(src);
+    let members = stream_offsets(&mut source)?;
+    crate::stream::stream_stored(&mut source, budget, visit, members)
+}
+
+/// Parse arch slice offsets from a seekable source. The arch table is a bounded
+/// header at the start; each arch image streams via seek+take. Returns
+/// `(name, offset, size)` per arch, and none for an implausible fat binary
+/// (a Java `.class` sharing the magic), which is then scanned as itself.
 pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
 ) -> Result<Vec<(String, u64, u64)>, LimitHit> {
@@ -137,14 +143,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         .map_err(|e| LimitHit::corrupt(format!("machofat: {e}")))?;
     // The largest possible arch table: 8-byte header + MAX_ARCH * 32-byte records.
     let mut header = vec![0u8; 8 + MAX_ARCH as usize * 32];
-    let mut n = 0;
-    while n < header.len() {
-        match source.read(&mut header[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(_) => break,
-        }
-    }
+    let n = crate::read_full(source, &mut header)?;
     header.truncate(n);
     let Some(archs) = parse_archs_len(&header, total_len) else {
         return Ok(Vec::new());
@@ -154,38 +153,6 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         .enumerate()
         .map(|(i, a)| (format!("macho-arch-{i}"), a.offset as u64, a.size as u64))
         .collect())
-}
-
-pub(crate) fn extract_machofat<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    // Not a plausible fat binary (e.g. a Java `.class` sharing the magic): emit
-    // nothing so the engine falls back to normal handling.
-    let Some(archs) = parse_archs(data) else {
-        return Ok(None);
-    };
-
-    for (i, a) in archs.iter().enumerate() {
-        // `parse_archs` already validated the range; clamp again defensively so a
-        // future change can never produce `start > end` (which would panic).
-        let start = a.offset.min(data.len());
-        let end = a.offset.saturating_add(a.size).min(data.len());
-        let slice = &data[start..end];
-
-        budget.count_entry()?;
-        let cap = budget.reserve()?;
-        if slice.len() as u64 > cap {
-            return Err(LimitHit::new(format!("macho fat arch {i} exceeds budget")));
-        }
-        let bytes = slice.to_vec();
-        budget.commit(bytes.len() as u64);
-        if let Some(r) = visit(Entry::new(format!("macho-arch-{i}"), bytes), budget) {
-            return Ok(Some(r));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -240,7 +207,7 @@ mod tests {
         // arch-table / offset-within-file checks must still reject it.
         let mut blob = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34];
         blob.extend_from_slice(&[0xABu8; 200]); // constant pool: not valid arch records
-        assert!(!looks_like_machofat(&blob));
+        assert!(!looks_like_machofat(&crate::Probe::whole(&blob)));
         let mut budget = Budget::new(Limits::default());
         assert!(extract(Format::Machofat, &blob, &mut budget)
             .unwrap()

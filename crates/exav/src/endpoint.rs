@@ -163,7 +163,7 @@ impl Endpoint {
             if opts.mode.is_some() {
                 return Err(format!(
                     "`{s}`: `mode` sets the permissions of a socket file, and a host:port \
-                     listener has none — restrict it with the bind address and a firewall"
+                     listener has none: restrict it with the bind address and a firewall"
                 ));
             }
             let (hostport, path) = match rest.split_once('/') {
@@ -206,8 +206,8 @@ fn check_host_port(hostport: &str, whole: &str) -> Result<String, String> {
     }
     Err(format!(
         "`{whole}`: `{hostport}` has no port, so nothing can be bound to it. If you \
-         meant several ICAP services, a comma separates addresses rather than names \
-         — repeat the key instead: `?service=…&service=…`"
+         meant several ICAP services, a comma separates addresses rather than names: \
+         repeat the key instead, `?service=…&service=…`"
     ))
 }
 
@@ -237,7 +237,7 @@ fn resolve_services(
         };
         return Err(format!(
             "`{whole}`: the clamd protocol has no services, so {given} means nothing here \
-             — an `icap://` address is the one that takes `/<service>`"
+             (an `icap://` address is the one that takes `/<service>`)"
         ));
     }
     match (path, query) {
@@ -333,7 +333,7 @@ fn parse_service(v: &str, whole: &str) -> Result<String, String> {
     if name.contains(',') {
         return Err(format!(
             "`{whole}`: a comma separates addresses, not service names; repeat the key \
-             instead — `?service=…&service=…`"
+             instead: `?service=…&service=…`"
         ));
     }
     if name.contains('/') {

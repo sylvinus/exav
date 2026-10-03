@@ -29,6 +29,9 @@ exav-pe-emu = { path = "../crates/exav-pe-emu" }
 # desynchronises everything after it — so the oracle is compiled in here, and
 # only here.
 exav-x86 = { path = "../crates/exav-x86" }
+# The image decoders behind `fuzzy_img#`, every format, fuzzed directly: the
+# scan reaches them only when a database has such a signature.
+exav-imagehash = { path = "../crates/exav-imagehash", default-features = false, features = ["webp", "ico", "pnm", "qoi", "dds", "ff", "hdr"] }
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
 
 [[bin]]
@@ -76,6 +79,13 @@ bench = false
 [[bin]]
 name = "filetype"
 path = "fuzz_targets/filetype.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "imagehash"
+path = "fuzz_targets/imagehash.rs"
 test = false
 doc = false
 bench = false

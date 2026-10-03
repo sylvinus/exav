@@ -1,12 +1,12 @@
 ---
 title: Supported formats
-description: The archive, container, document, and executable-packer formats exav unpacks — and what's detected but not yet decoded.
+description: The archive, container, document, and executable-packer formats exav unpacks, and what is detected but not yet decoded.
 ---
 
-exav recursively unpacks a wide set of archives, structured documents, and packed
-executables — all pure-Rust, all under the decompression-bomb budget. Anything it
-can't fully decode is reported `UNSCANNABLE` or `PASSWORD-PROTECTED`, never
-silently dropped (the [never-silent invariant](/concepts/design-principles/#never-a-silent-clean)).
+exav recursively unpacks archives, structured documents and packed executables,
+in pure Rust and under the decompression-bomb budget. Anything it cannot fully
+decode is reported `UNSCANNABLE` or `PASSWORD-PROTECTED` (see
+[never a silent clean](/concepts/design-principles/#never-a-silent-clean)).
 
 Each format is a Cargo feature; see [Feature flags](/reference/feature-flags/) to
 build a subset.
@@ -15,204 +15,160 @@ build a subset.
 
 | Format | Notes |
 |---|---|
-| ZIP | **Deflate64 (method 9)**, Store, Deflate, bzip2, LZMA, zstd, XZ and PPMd members; WinZip AES-128/192/256 & ZipCrypto decryption; orphan local headers and deferred-size streaming members are carved too |
-| gzip · bzip2 · xz · zstd · lzip · `.Z` (LZW) · LZ4 | streaming decompressors: content is scanned to its end without being held, so a payload past the per-member cap is still reached — no matter which of them a file happens to be wrapped in. Concatenated streams are followed rather than stopping at the first, for LZ4 frames and for multi-stream bzip2/xz alike |
+| ZIP | Every common method (see [codecs](#codec-level-coverage)) and [decryption](#encryption-support); orphan local headers and deferred-size members are carved too |
+| gzip · bzip2 · xz · zstd · lzip · `.Z` (LZW) · LZ4 | Streaming decompressors: a member is decoded as it is read. Past `--max-object-bytes` it is written to a spill file and scanned from there like any object that large; with spilling off it is reported `LIMITS-EXCEEDED`. Concatenated streams and frames are followed for all of them |
+| ARC (SEA ARC / PKARC / PAK) | the pre-ZIP archiver; each member is checked against its CRC-16 |
 | tar | POSIX/GNU |
-| 7z | LZMA/LZMA2/PPMd/BZip2/Deflate/Delta, BCJ x86/ARM/ARM64 and **BCJ2**; AES-256 decryption (SHA-256 KDF, CRC-verified) |
+| 7z | Every common coder (see [codecs](#codec-level-coverage)) and AES-256 [decryption](#encryption-support) |
 | CAB · CHM | Microsoft cabinet / help (ITSF + LZX) |
-| RAR | RAR3 (LZ + PPMd) and RAR5 (LZ), including **solid** archives — the whole group shares one compressed stream, so each member is decoded against the window the previous one left. Every member is checked against the CRC the archive records, so a mis-decode is reported rather than passed off as the file |
+| RAR | RAR3 and RAR5, including solid archives; every member is checked against its recorded CRC (see [codecs](#codec-level-coverage)) |
 | ARJ · LHA | classic archivers |
-| ISO · UDF | CD/DVD/Blu-ray images: the ISO 9660 tree (with Joliet) and the UDF tree, including UDF-only images that carry no ISO 9660 descriptor at all. A bridge image carrying both is walked once per file, not twice |
-| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix/package archives |
-| DMG | Apple UDIF, incl. encrypted, with HFS+/APFS extraction |
-| FAT12/16/32 | files inside a disk image, with their paths, reassembled from the cluster chain — so a fragmented file comes back whole rather than as the fragments a raw carve would find |
-| ext2/3/4 | files inside a Linux disk image, with their paths, reassembled from the inode's extent tree or block map — same argument as FAT, and ext4 fragments freely. Symlinks and device nodes are skipped rather than invented as files: neither holds bytes in the image |
-| ZOO | Rahul Dhesi's 1986 archiver, both codecs (LZD, a 13-bit LZW; and LZH, his own). Every member is checked against the CRC-16 the archive records, and a mismatch is reported rather than passed off as the file. **Deleted members are extracted too** — ZOO flags them in the directory and leaves the bytes in place |
-| NTFS | files inside a disk image, walked through the MFT: reassembled from their data runs (including across `$ATTRIBUTE_LIST` when a file is fragmented past what one record can describe), read in place when resident, and LZNT1-decompressed when compressed. Data runs that fall short of the declared size are reported rather than handed back as a complete file. An MFT walk also surfaces **deleted-but-resident** records, which a directory walk cannot |
-| WIM (`.wim`/`.esd`) | Windows imaging format: file resources with their directory paths, uncompressed, XPRESS- or LZX-compressed. Each resource is checked against the SHA-1 the image records, so a mis-decode is reported rather than scanned as the file; LZMS resources are reported |
-| VHD · VHDX · QCOW2 · VMDK | virtual-disk images, reconstructed to the guest disk and rescanned: VHD fixed + dynamic, VHDX via its block allocation table, QCOW2 including deflate-compressed clusters, VMDK sparse and streamOptimized (the shape inside an OVA). Images that are a delta against a parent file (differencing VHD/VHDX, QCOW2 backing file) are reported, not skipped |
+| ALZ · EGG | ESTsoft's Korean archivers: ALZ stored, deflate and bzip2 members; EGG stored, deflate, bzip2, LZMA and AZO members, each block CRC-checked |
+| InstallShield `.z` | the older installer archive (PKWARE DCL implode) |
+| ISO · UDF | CD/DVD/Blu-ray images: the ISO 9660 tree (with Joliet) and the UDF tree, including UDF-only images with no ISO 9660 descriptor. A bridge image carrying both is walked once per file |
+| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix and package archives |
+| DMG | Apple UDIF, including [encrypted](#encryption-support), with HFS+/APFS extraction |
+| FAT12/16/32 | files inside a disk image, with their paths, reassembled from the cluster chain, so a fragmented file comes back whole |
+| ext2/3/4 | files inside a Linux disk image, with their paths, reassembled from the inode's extent tree or block map. Symlinks and device nodes hold no bytes and are skipped |
+| ZOO | Rahul Dhesi's 1986 archiver, both codecs (LZD, a 13-bit LZW, and LZH). Each member is checked against its recorded CRC-16, and a mismatch is reported. Deleted members are extracted too: ZOO flags them and leaves the bytes in place |
+| NTFS | files inside a disk image, walked through the MFT: reassembled from their data runs (including across `$ATTRIBUTE_LIST`), read in place when resident, LZNT1-decompressed when compressed. Data runs short of the declared size are reported. The MFT walk also surfaces deleted-but-resident records a directory walk cannot see |
+| WIM (`.wim`/`.esd`) | Windows imaging format: file resources with their paths, uncompressed, XPRESS or LZX. Each resource is checked against its recorded SHA-1; LZMS resources are reported |
+| VHD · VHDX · QCOW2 · VMDK | virtual disks, reconstructed to the guest disk and rescanned: VHD fixed and dynamic, VHDX through its block allocation table, QCOW2 including deflate-compressed clusters, VMDK sparse and streamOptimized (the shape inside an OVA). Delta images against a parent (differencing VHD/VHDX, QCOW2 with a backing file) are reported, not skipped |
+
+## Size: what is read as it goes, and what is read whole
+
+These are decoded as they are read, at any size: ZIP, tar, CAB, ISO/UDF, LHA,
+`ar`, cpio, TNEF, OneNote, SWF, SZDD, partition maps, self-extracting
+executables, universal Mach-O, `.pyc`, and the single-stream compressors above.
+A member that decodes past `--max-object-bytes` goes to a spill file and is
+scanned from there. The exceptions: ZIP Shrink, Reduce and Implode members, and
+encrypted ZIP members, are decoded whole under that limit.
+
+A DMG is walked at any size, but each file in it is held whole, under
+`--max-object-bytes`; an encrypted DMG is decrypted whole under the same limit.
+Only data forks are read. A file macOS compressed (decmpfs) keeps its bytes in
+an attribute or its resource fork instead: on HFS+, a file with a resource fork
+is reported `UNSCANNABLE`; on APFS, and for small HFS+ files compressed into
+the attribute alone, such a file reads as empty.
+
+Every other format is read whole: a container larger than `--max-object-bytes`
+(256 MiB by default) is reported `LIMITS-EXCEEDED` and its members are not
+scanned. That includes RAR, OLE, PDF, CHM, ARJ, xar, email, WIM, and the virtual
+disks and filesystems (VHD, VHDX, QCOW2, VMDK, FAT, NTFS, ext), which are often
+larger than that: raise `--max-object-bytes` where such images are expected. 7z
+is read whole too, but its members stream out of it.
 
 ## The complete gap list
 
-Every container or codec exav does not decode, in one place. This list is
-authoritative — if something is not here, exav opens it.
+Every container or codec exav does not decode. If something is not here, exav
+opens it.
 
-It splits in two, and the split is the part that matters.
-
-### Recognised, reported — never a silent clean
+### Recognised and reported
 
 exav opens these far enough to know what they are, then reports `UNSCANNABLE` or
-`PASSWORD-PROTECTED`. It knows the file is a container and says its members went
-unexamined, rather than scanning the compressed bytes, matching nothing, and
-calling it clean.
+`PASSWORD-PROTECTED`: it says the members went unexamined rather than scanning
+the compressed bytes, matching nothing, and calling the file clean.
 
 The ClamAV column was measured by extracting each container with a third-party
-tool, hashing the members into a signature database, and scanning the untouched
-container with ClamAV 1.4.3 and 1.5.3 to see whether it reached them.
+tool, hashing its members into a signature database, and scanning the untouched
+container with ClamAV 1.4.3 and 1.5.3.
 
 | Format / codec | ClamAV | Why it is open |
 |---|---|---|
-| ACE | No support — 200 members of a real ACE went unextracted | No encoder exists to validate a decoder against, and the one obtainable sample is rejected as invalid by both `lsar` and `unace` |
-| StuffIt / StuffIt X | No support — genuine `.sit` and `.sitx` unextracted | Compression methods undocumented; the only reference implementations are closed-source or GPL |
-| Inno Setup | No support — stops at "Recognized MS-EXE/DLL"; 71 members unreached | The layout changes across setup-data versions; `innoextract` works as an oracle but is GPL, so it cannot be a source |
-| ZIP method 10 (DCL Implode) | No support — enumerates the entry, then `unsupported method (10)` | No tool in print creates one, so a decoder could only be validated against found samples |
-| ZIP methods 94 / 96 / 97 (MP3, JPEG, WavPack) | No support | WinZip-only; no other extractor in the reference set reads them either |
+| ACE | No support: 200 members of a real ACE went unextracted | No encoder exists to validate a decoder against, and the one sample obtainable is rejected as invalid by both `lsar` and `unace` |
+| StuffIt / StuffIt X | No support: real `.sit` and `.sitx` unextracted | Compression methods undocumented; the only implementations are closed-source or GPL |
+| Inno Setup | No support: stops at "Recognized MS-EXE/DLL", 71 members unreached | The layout changes across setup-data versions; `innoextract` (zlib license) is the reference |
+| ZIP method 10 (DCL Implode) | No support: enumerates the entry, then `unsupported method (10)` | No tool in print creates one, so a decoder could only be validated against found samples |
+| ZIP methods 94 / 96 / 97 (MP3, JPEG, WavPack) | No support | WinZip-only; no other extractor in the reference set reads them |
 | PKWARE Strong Encryption | No support | Rare, proprietary |
-| RAR AES | No support | Decryptor pending |
-| WIM LZMS resources | No support for WIM at all — no `CL_TYPE_WIM`, all four test images clean | Used by `.esd` images and `wimlib --solid` |
-| RAR7 big dictionary | — | |
-| NSIS modified-bzip2 blocks | — | |
-| CHM multi-frame LZX intervals | — | |
-| AutoIt EA06 | — | |
-| 7z BCJ ARMT / PPC / SPARC / IA64 / RISC-V | — | Minor architectures |
-| 7z Deflate64 / Zstandard coders | — | The Zstandard coder is a 7-Zip ZS fork extension |
-| ASPack, MEW, Upack, WWPack, PESpin, yC | Ships a hand-written unpacker per family | Runs the stub under an x86 interpreter instead — see [PE packers](#pe-packers) |
+| WIM LZMS resources | No support for WIM at all: no `CL_TYPE_WIM`, all four test images clean | Used by `.esd` images and `wimlib --solid` |
+| RAR5 dictionaries over 64 MiB (including RAR 7's larger ones) | not measured | The decoder's window is capped at 64 MiB |
+| RAR 1.5 / 2.x compression (unpack versions 15, 20, 26) | not measured; ClamAV's RAR support derives from UnRAR, which reads these | No permissively licensed decoder to port or check against; stored members of these archives are scanned |
+| KWAJ LZSS, MSZIP and LZH methods | not measured | Stored and XOR-obfuscated KWAJ members are decoded |
+| CHM multi-frame LZX intervals | not measured | Reported |
+| 7z BCJ ARMT / PPC / SPARC / IA64 / RISC-V | not measured | Minor architectures |
+| 7z Deflate64 / Zstandard coders | not measured | The Zstandard coder is a 7-Zip ZS fork extension |
 
-**Nothing in this table is a capability gap against ClamAV** — the last
-row is a different route to the same result. Everything above it is
-a format neither engine opens, listed because
-[an attacker picks a format by what the victim can open](/concepts/archive-extraction/#the-parity-principle),
-not by what a scanner supports — these are gaps against 7-Zip, WinRAR and The
-Unarchiver. For ACE, StuffIt and Inno the blocker is
-[validation](/concepts/archive-extraction/#validating-a-decoder) rather than
-effort: with no trustworthy implementation to check against, a decoder that is
-subtly wrong emits plausible bytes rather than errors.
+None of the measured rows is a capability gap against ClamAV: they are formats
+neither engine opens. RAR 1.5/2.x compression, not measured, is likely one. They
+are listed because [an attacker picks a format by what the victim can open](/concepts/archive-extraction/#the-parity-principle),
+so they are gaps against 7-Zip, WinRAR and The Unarchiver. For ACE, StuffIt and
+Inno the blocker is [validation](/concepts/archive-extraction/#validating-a-decoder):
+with no trustworthy implementation to check against, a subtly wrong decoder emits
+plausible bytes rather than errors.
 
 ### Checked against ClamAV's own type list
 
-The formats here come from checking exav against ClamAV's own `CL_TYPE_*`
-enumeration rather than a hand-assembled format list — a hand-assembled list can
-only confirm itself.
+These come from checking exav against ClamAV's own `CL_TYPE_*` enumeration rather
+than a hand-assembled list. `clamscan --debug` reports dedicated submodules for
+EGG, ALZ and HWP, all on by default, and its shipped magic database types all
+five formats below.
 
-`clamscan --debug` reports **dedicated submodules for EGG, ALZ and HWP, all
-enabled by default**, listed alongside its unpackers; its shipped magic database
-types all five formats below.
-
-| Format | ClamAV | exav | Evidence it is really decoded, not just typed |
+| Format | ClamAV | exav | Evidence of decoding in ClamAV |
 |---|---|---|---|
-| **EGG** (ESTsoft, Korean) | Decodes | **Decodes** (store/deflate/bzip2/LZMA, CRC-verified) | `EGG` submodule on by default; `Heuristics.Encrypted.EGG` exists, so members are parsed deeply enough to detect encryption |
+| **EGG** (ESTsoft, Korean) | Decodes | **Decodes** (store/deflate/bzip2/LZMA/AZO, CRC-verified) | `EGG` submodule on by default; `Heuristics.Encrypted.EGG` exists, so members are parsed deeply enough to detect encryption |
 | **ALZ** (ESTsoft, Korean) | Decodes | **Decodes** (store/bzip2/deflate) | `ALZ` submodule on by default; magic added at flevel 210 |
-| **HWP3** (Hangul Word Processor) | Decodes | **Decodes** (deflate body) | `HWP` submodule on by default, plus its own scan-option bit, its own engine option `MAX_RECHWP3`, and its own `--max-rechwp3` flag |
+| **HWP3** (Hangul Word Processor) | Decodes | **Decodes** (deflate body) | `HWP` submodule on by default, with its own scan-option bit, engine option `MAX_RECHWP3` and `--max-rechwp3` flag |
 | **ISHIELD_MSI** (InstallShield MSI) | Types and handles | Recognised, reported `UNSCANNABLE` | dedicated `CL_TYPE_ISHIELD_MSI` |
 | **CRYPTFF** | Types and handles | Recognised, reported `PASSWORD-PROTECTED` | dedicated `CL_TYPE_CRYPTFF` |
 
-EGG and ALZ matter for Korean-language targets, where ALZip is common; HWP3 is
-the Korean government's standard document format and a recurring spear-phishing
-carrier. All three are decoded, not merely recognised:
+EGG and ALZ matter for Korean-language targets, where ALZip is common; HWP3 is the
+Korean government's standard document format and a recurring spear-phishing
+carrier.
 
-- **ALZ** — stored, bzip2 and deflate members. Structure cross-checked field by
-  field against `unalz` (zlib-licensed) and `unar` as external oracles.
-- **EGG** — stored, deflate, bzip2, LZMA **and AZO** members, written from
-  ESTsoft's own published *EGG Format Specification v1.0*. Every EGG block
-  records a CRC-32 of its decompressed bytes, so the **format validates the
-  decoder**: a member is only ever handed on as content when it reproduces the
-  checksum ESTsoft's compressor wrote. Encrypted members report as
-  password-protected.
+- **ALZ** is cross-checked field by field against `unalz` (zlib-licensed) and
+  `unar`.
+- **EGG** is written from ESTsoft's published *EGG Format Specification v1.0*;
+  every block's CRC-32 validates the decoder. AZO, ESTsoft's own codec, is not in
+  the specification: exav's decoder is a port of `EggDotNet` (MIT, credited in
+  `NOTICE`), the one permissively licensed implementation.
+- **HWP3** preamble offsets come from `java-hwp` (Apache-2.0, credited in
+  `NOTICE`), validated against a document Hangul Word Processor wrote.
 
-  AZO is ESTsoft's own algorithm and is **not in the specification** — a range
-  coder driving LZ77, with two competing probability models per context and a
-  running score picking which to decode from. exav's decoder is a Rust port of
-  the one permissively licensed implementation, `EggDotNet` (MIT, credited in
-  `NOTICE`); ESTsoft's own UnEgg library could not be used, because its licence
-  forbids both commercial use without approval and using it to build a
-  compression algorithm. ClamAV reached the same conclusion and wrote from the
-  spec. The port is validated the same way as the rest: against the writer's
-  CRC-32, not against itself.
-- **HWP3** — the deflate-compressed body is decompressed and scanned, which is
-  where a spear-phishing payload lives. Preamble offsets come from `java-hwp`
-  (Apache-2.0, credited in `NOTICE`) and are validated against
-  `testHWP_3.0.hwp` from the **Apache Tika** corpus — a document Hangul Word
-  Processor wrote, not one exav wrote. Its 9 KiB container inflates to ~45 KiB
-  of body, and a test samples the inflated bytes to confirm they are absent
-  from the raw file, so the fixture cannot quietly stop testing
-  compression.
-
-InstallShield MSI and CryptFF are recognised but not opened: both are named, so
-their payloads report as unexamined instead of scanning clean. CryptFF reports
-as encrypted rather than merely undecodable, because that is what it is.
+InstallShield MSI (sniffed by `"InstallShield\0"` plus a fixed record 292 bytes
+on) and CryptFF are recognised but not opened, so their payloads report as
+unexamined. CryptFF reports as encrypted, because that is what it is.
 
 ### Where recognition itself is the question
 
-A format with **no detection** is the weaker failure mode: the file is scanned
-as whatever it does type as, the members inside are never reached, and **the
-scan can come back clean** — unlike the tables above, where exav at least names
-what it could not open. Recognition is far cheaper than decoding and removes
-that clean-verdict hole on its own. Where each format that raises this risk
-stands:
+A format with no detection is the weaker failure: the file is scanned as whatever
+it types as, its members are never reached, and the scan can come back clean.
+Recognition is much cheaper than decoding and removes that hole on its own:
 
 | Format | ClamAV | exav | Sniff |
 |---|---|---|---|
-| InstallShield MSI | No support | Recognised, reported | `"InstallShield\0"` + a fixed record 292 bytes on |
 | InstallShield InstallScript cabinet | No support | Recognised, reported | `ISc(` at 0 |
-| InstallShield `.z` archive | No support | **Decoded** | `13 5D 65 8C` at 0, confirmed against the header's own arithmetic (declared archive size, table-of-contents offset inside it) rather than a version constant |
-| ext2/3/4 | No support | **Decoded** | `0xEF53` at **1080** — nothing at offset 0 identifies the image |
-| ZOO | No support | **Decoded** | tag `0xFDC4A7DC` at **20** plus a non-zero version byte at 32; the leading `ZOO ?.?? Archive.` text is conventional and may be anything |
+| InstallShield `.z` archive | No support | **Decoded** | `13 5D 65 8C` at 0, confirmed against the header's own arithmetic (declared archive size, table-of-contents offset) |
+| ext2/3/4 | No support | **Decoded** | `0xEF53` at offset 1080; nothing at offset 0 identifies the image |
+| ZOO | No support | **Decoded** | tag `0xFDC4A7DC` at 20 plus a non-zero version byte at 32; the leading `ZOO ?.?? Archive.` text may be anything |
 | AppleSingle / AppleDouble | No support | Recognised, reported | `0x00051600` / `0x00051607` |
 | lrzip | No support | Recognised, reported | `LRZI` at 0 |
 
-**ext2/3/4 and ZOO are decoded in full**, not merely recognised:
+ext is walked as a filesystem rather than carved, for the same reason as FAT: a
+file written into a hole lands in several extents. InstallShield `.z` is read
+through the MIT `unshield` crate; the header check keeps four magic bytes alone
+from reporting ordinary files as archives exav then could not open.
 
-- **ext** is walked as a filesystem, not carved, for the same reason as FAT: a
-  file written into a hole left by a deleted one lands in several extents, and
-  the first fragment on its own will not decompress. The regression fixture is
-  built with `mke2fs` + `debugfs` and its payload inode really does span two
-  non-adjacent extents (`(0-62):371-433, (63-96):498-531`), with the EICAR
-  string deflated so it appears nowhere in the raw image. Reading is delegated
-  to `ext4-view` (MIT/Apache, read-only by construction, no dependencies).
-- **ZOO** carries two codecs of its own: LZD (a 13-bit LZW) and LZH (Dhesi's
-  own, which is `lh5` on the wire). The oracle is the format itself — the
-  fixtures hold one identical member stored, LZD-compressed and LZH-compressed,
-  and the test asserts the compressed ones reproduce the stored bytes exactly.
-  A subtly wrong codec emits plausible bytes rather than an error, which is the
-  failure that check exists to catch. Each member's recorded CRC-16 is verified
-  too; a mismatch is *reported*, not dropped, since a tampered member is the
-  interesting one.
-
-- **InstallShield `.z`** — the *older* installer archive. Members use
-  PKWARE's DCL "implode", read
-  through the MIT `unshield` crate. The oracle is the plaintext: the upstream
-  project ships `undhr.z` next to `undhr.md`, the original, and the test asserts
-  a byte-for-byte match. Recognition is confirmed against the header's own
-  arithmetic rather than a guessed version word — four magic bytes alone would
-  report ordinary files as archives exav then could not open, a lie in the other
-  direction.
-
-**lrzip and the `ISc(` cabinet stay at recognition, and the blocker is
-licensing rather than effort.** Neither has a published specification. lrzip's
-rzip long-range match stream is defined only by its own GPL source, and the only
-`ISc(` implementation is the LGPL `unshield` — both of which exav must not read
-under its clean-room rule, and neither has a permissively-licensed
-implementation in any language. Running such a tool as an *oracle* is fine;
-inferring an exact bitstream from black-box behaviour is not something to
-attempt and then claim. `UNSCANNABLE` tells an operator there is a gap, where a
+lrzip and the `ISc(` cabinet stay at recognition for licensing reasons. Neither
+has a published specification: lrzip's long-range match stream is defined only
+by its GPL source, and the only `ISc(` implementation is the LGPL `unshield` C
+project (not the MIT crate of the same name). exav's clean-room rule forbids
+reading either, and inferring an exact bitstream from black-box behaviour is not
+something to claim. `UNSCANNABLE` tells the operator there is a gap, where a
 guessed decoder would produce plausible bytes and a confident `OK`.
 
-(The MIT `unshield` *crate* on crates.io covers the `.z` archive above — a
-different format from the `ISc(` cabinet, whose only implementation is the LGPL
-`unshield` **C project**. Same name, same author lineage, different code and
-different licence.)
-
-Still unrecognised, each for a stated reason rather than by omission:
+Still unrecognised, each for a stated reason:
 
 | Format | Why not |
 |---|---|
-| Compact Pro, DiskDoubler | No magic that could be sourced authoritatively. `file`'s magic database does not carry them, and guessing a signature buys a false positive — an ordinary file reported `UNSCANNABLE` — which is its own kind of lie |
-| MacBinary | No magic at all: it is identified by a *heuristic* over header fields (a zero at 0, a length byte at 1, a CRC at 124). Recognising it means accepting a false-positive rate on arbitrary binaries |
-| Wise installer | A PE carrying a marker string; the outer file is a PE and is scanned as one either way |
-| Brotli as a bare stream | Deliberate. A raw Brotli stream has **no magic number** — nothing in the bytes distinguishes it from arbitrary data. `.br` is served with a `Content-Encoding` header, metadata a scanner never sees. Detection, not decoding, is the blocker |
-
-The pattern in the "why not" column is the same one throughout this page:
-**where the choice is between a silent miss and a false positive, exav takes
-neither on a guess.** A format is recognised when the bytes say so, and listed
-here when they do not.
+| Compact Pro, DiskDoubler | No authoritative magic: `file`'s database does not carry them, and a guessed signature would report ordinary files `UNSCANNABLE` |
+| MacBinary | No magic at all, only a heuristic over header fields (a zero at 0, a length byte at 1, a CRC at 124), with a false-positive rate on arbitrary binaries |
+| Wise installer | A PE carrying a marker string; the outer PE is scanned either way |
+| Brotli as a bare stream | A raw Brotli stream has no magic number; `.br` is identified by a `Content-Encoding` header a scanner never sees |
 
 ### Codec-level coverage
 
-What the entries above look like in detail, for the formats where "supported" is
-a per-codec question rather than a yes.
-
-**ZIP** — reachable by every extractor in the reference set and both OS shells,
-so the highest-value format to be complete on.
+**ZIP**, reachable by every extractor in the reference set and both OS shells:
 
 | Method | Name | exav |
 |---|---|---|
@@ -232,133 +188,137 @@ so the highest-value format to be complete on.
 | 97 | WavPack | **no** |
 | 98 | PPMd | yes |
 
-ZIP64, orphan local headers (dual indexing), deferred-size members, ZipCrypto and
-WinZip AES-128/192/256 are all handled; PKWARE Strong Encryption is not.
+ZIP64, orphan local headers (dual indexing) and deferred-size members are
+handled. Encryption is under [Encryption support](#encryption-support).
 
-**7z** — Copy, LZMA, LZMA2, PPMd, BZip2, Deflate, AES-256 (including encrypted
-headers), Delta and BCJ x86/ARM/ARM64 all decode, as does **BCJ2**. BCJ2 needed
-more than a decoder: it is the only 7z coder with several input streams, so the
-folder's bind-pair graph has to be resolved rather than walked as a linear chain.
-Missing: the minor-architecture BCJ filters, and the Deflate64 and Zstandard
-coders.
+**7z:** Copy, LZMA, LZMA2, PPMd, BZip2, Deflate, AES-256 (including encrypted
+headers), Delta, BCJ x86/ARM/ARM64 and BCJ2. BCJ2 is the only 7z coder with
+several input streams, so the folder's bind-pair graph is resolved rather than
+walked as a chain. Missing: the minor-architecture BCJ filters, and the Deflate64
+and Zstandard coders.
 
-**RAR** — RAR3 (LZ + PPMd) and RAR5 (LZ) decode, including **solid** archives:
-the window, Huffman tables and PPMd model carry across the group, and every
-member is CRC-checked so a mis-decoded solid member is reported rather than
-handed over. A member split across volumes is reported, since the rest of its
-data is in a sibling file; a split *stored* member's present bytes are still
-emitted. (ClamAV does not join volume sets either.)
+**RAR:** RAR3 (LZ + PPMd) and RAR5 (LZ), including solid archives (the window,
+Huffman tables and PPMd model carry across the group, and every member is
+CRC-checked), the standard filters RAR writes, encrypted members and headers,
+and hard links and
+file copies. Checked against official RAR 6.12 and 7.23 output across methods,
+solid groups, filters, dictionary sizes, volumes, recovery records and
+encryption. A member split across volumes is reported, since the rest of its
+data is in a sibling file; the bytes of a split stored member that are present
+are still scanned. (ClamAV does not join volume sets either.)
 
-**CAB / CHM** — MSZIP, LZX and **Quantum** all decode; CHM is ITSF + LZX, with
-multi-frame LZX intervals still missing.
+**CAB / CHM:** MSZIP, LZX and Quantum; CHM is ITSF + LZX, with multi-frame LZX
+intervals missing.
 
-**Disk images** — ISO 9660 + Joliet, UDF, DMG (HFS+/APFS, LZFSE/LZVN,
-encrypted), VHD, VHDX, QCOW2, VMDK, FAT12/16/32, NTFS and ext2/3/4 are all
-walked. Images whose payload lives in a *parent* file — differencing VHD/VHDX,
-QCOW2 with a backing file — are reported rather than partially reconstructed.
+**Disk images:** ISO 9660 + Joliet, UDF, DMG (HFS+/APFS, LZFSE/LZVN, encrypted),
+VHD, VHDX, QCOW2, VMDK, FAT12/16/32, NTFS and ext2/3/4. Images whose payload
+lives in a parent file (differencing VHD/VHDX, QCOW2 with a backing file) are
+reported rather than partially reconstructed.
 
 ### CAB Quantum
 
-Implemented. Quantum is an arithmetic coder over adaptive frequency models,
-shipped with Office-97-era cabinets — and still reachable, because **7-Zip
-decompresses Quantum cabinets byte-exactly today**. A victim opens the archive;
-a scanner that skips the codec sees nothing. That a format is old, or absent
-from a corpus, is an argument for an attacker reaching for it.
-
-Microsoft published the cabinet *container* but never the Quantum *compressor*,
-so exav's decoder was written from a functional specification of the format and
-validated against `cabextract`/libmspack as an oracle — the same relationship the
-project has with `clamscan` and `innoextract`, never a source.
-
-Validation: byte-exact on the reference cabinet, plus **107 generated streams
-across every window size (10–21) with outputs up to 11 KB, decoded by both
-engines with zero disagreements** — enough to exercise hundreds of frequency
-rescales, the periodic model reordering, and repeated window wrapping, none of
-which the tiny reference vector reaches. exav additionally rejects matches that
-overshoot a frame or reach behind the start of a folder; neither can occur in
-data an encoder produced, and refusing them stops a corrupt stream from turning
-into plausible output.
+Quantum is an arithmetic coder over adaptive frequency models, shipped with
+Office-97-era cabinets, and still reachable: 7-Zip decompresses Quantum cabinets
+today. Microsoft published the cabinet container but never the Quantum
+compressor, so exav's decoder was written from a functional specification and
+validated against `cabextract`/libmspack as an oracle, never a source: byte-exact
+on the reference cabinet, and on 107 generated streams across every window size
+(10 to 21) with outputs up to 11 KB, with no disagreement. exav also rejects
+matches that overshoot a frame or reach behind the start of a folder, which an
+encoder cannot produce, so a corrupt stream does not turn into plausible output.
 
 ## PE packers
 
 | State | Packers |
 |---|---|
-| **Unpacked, per format** | UPX (including the bare-`PackHeader` layout, verified against the header's Adler-32, then rebuilt as a PE); the aPLib family (Petite, FSG, NsPack); **MPRESS**, by running ClamAV's own `.cbc` unpacker on exav's bytecode interpreter |
-| **Unpacked, by running the stub** | Anything else that looks packed, under a bounded x86 interpreter that captures the image the stub rebuilds. Measured against 276 samples from 23 real packers, 218 (79%) give back a complete image, and 15 packers do so on every sample (ASPack, BeRoEXEPacker, EXpressor, FSG, MEW, MPRESS, Molebox, NSPack, Neolite, PECompact, Packman, RLPack, UPX, WinUpack, Yoda-Crypter); Exe32pack, PEtite, JDPack and Eronana unpack most but not all of theirs; Alienyze, TELock and Yoda-Protector defeat it entirely and are reported rather than passed over |
-| **Reported `UNSCANNABLE`** | A packed file whose stub defended itself successfully, so no verified image came out |
-| **Reported, never unpacked** | VMProtect, Themida/WinLicense, Enigma — virtualizers, where no original code exists in memory at any point to recover |
+| **Unpacked, per format** | UPX, all methods: NRV2B/2D/2E (UCL), LZMA and DEFLATE, including the bare-`PackHeader` layout, verified against the header's Adler-32, then rebuilt as a PE (a stripped or patched `PackHeader` falls back to running the stub); the aPLib family (Petite 2.x, FSG 2.0, NsPack), round-trip byte-exact; MPRESS, by running ClamAV's own `.cbc` unpacker on exav's bytecode interpreter, so only with `bytecode.cvd` loaded |
+| **Unpacked by running the stub** | ASPack, MEW, Upack, WWPack, PESpin, Yoda's Cryptor, and anything else that looks packed, under a bounded x86 interpreter that captures the image the stub rebuilds. Measured coverage is on the [PE stub emulation](/concepts/pe-emulation/#measured-coverage) page |
+| **Reported `UNSCANNABLE`** | A file whose packer exav identified but could not unpack. A file sent to the emulator only because of its shape is scanned as it is if nothing comes out |
+| **Reported, never unpacked** | VMProtect, Themida/WinLicense, Enigma: virtualizers, where no original code exists in memory to recover |
 
-The second row is the general case. A per-packer decoder has to be written,
-version by version, against a format the packer's author is free to change; the
-one thing no packer can avoid is that its stub must rebuild the original image
-in memory and jump to it. exav runs the stub — in a sandbox with no syscalls, no
-host memory and no way out — and takes the image at that jump. Nothing is
-emitted unless it reads back as a valid PE, so a stub that outruns the emulator
-costs a report, never a fabricated one. See
-[PE stub emulation](/concepts/pe-emulation/).
+A per-packer decoder has to be written against a format the packer's author is
+free to change; what no packer can avoid is that its stub rebuilds the original
+image in memory and jumps to it. exav runs the stub in a sandbox with no syscalls
+and no host memory, and takes the image at that jump. Nothing is emitted unless
+it reads back as a valid PE. See [PE stub emulation](/concepts/pe-emulation/).
 
-Measured against ClamAV: ClamAV natively unpacks **10 packer families**, each
-with a hand-written submodule. exav unpacks 4 of them with dedicated decoders,
-**MPRESS** (which ClamAV does not unpack at all) through ClamAV's own bytecode
-program, and the rest through the emulator, which is not limited to a list.
+ClamAV natively unpacks 10 packer families, each with a hand-written submodule.
+exav unpacks four of them with dedicated decoders and the rest through the
+emulator. SUE and Yoda's Protector (not Yoda's Cryptor) are detection-only in
+ClamAV, covered by PUA packer signatures in the optional `.?du` databases, and
+so is MPRESS outside its bytecode signature.
 
-MPRESS, SUE and Yoda's *Protector* (a different product from Yoda's Cryptor) are
-detection-only for ClamAV, covered by 964 PUA packer signatures in the optional
-`.?du` databases rather than by an unpacker.
-
-This runs under `--clamav-compat` too: compat matches ClamAV's alert *names* and
-rough feature scope, and does not switch unpackers off.
+`--clamav-compat` keeps the PE unpackers on: it narrows archive extractors and
+names, not unpacking of executables.
 
 ## Documents & email
 
 | Format | What's extracted |
 |---|---|
-| OLE2 (legacy Office, MSI) | streams, VBA-macro decompression, Excel 4.0 (XLM) macro surfacing |
+| OLE2 (legacy Office, MSI) | streams, VBA-macro decompression, Excel 4.0 (XLM) macros |
 | OOXML | the modern Office ZIP container |
-| PDF | object streams (FlateDecode + LZW/ASCII85/ASCIIHex/RunLength + filter chains), plus JavaScript / URI / launch-action harvesting; RC4/AES decryption |
+| PDF | object streams (FlateDecode, LZW, ASCII85, ASCIIHex, RunLength and filter chains), JavaScript, URI and launch-action harvesting; [decryption](#encryption-support) |
+| HWP3 (Hangul Word Processor 3) | the deflate-compressed body |
 | RTF | embedded hex objects |
 | MIME email | decoded attachments and parts |
 | TNEF (`winmail.dat`) · OneNote · Adobe XDP | embedded-file carriers |
 
-## Executables & packers
+## Executables
+
+Packed executables are under [PE packers](#pe-packers).
 
 | Format | Handling |
 |---|---|
-| UPX | walked with all UCL methods + LZMA + DEFLATE (NRV2B/D/E). A stripped or patched `PackHeader` defeats the static reader — it needs the header to find the compressed blocks — so those images fall back to running the stub, which has to decompress them regardless |
-| aPLib families (Petite 2.x / FSG 2.0 / NsPack) | **decompressed** back to the original PE (round-trip byte-exact) |
-| Aspack · MEW · Upack · wwpack32 · PeSpin · Yoda's Cryptor, and unnamed packers | **stub run under a bounded x86 interpreter**; the rebuilt image is dumped when it reads back as a PE, and the file is reported `UNSCANNABLE` when it does not |
-| VMProtect · Themida/WinLicense · Enigma | **reported** — a virtualizer destroys the original code at build time, so there is nothing to recover |
-| Embedded PE / ELF / Mach-O | carved at non-zero offsets and re-scanned in their own type context |
-| Mach-O universal ("fat") | split per-architecture |
+| Embedded PE / ELF / Mach-O | carved at non-zero offsets and rescanned in their own type context |
+| Mach-O universal ("fat") | split per architecture |
 
 ## Other carriers
 
-Formats that aren't archives but still carry a payload exav has to reach:
+Formats that are not archives but still carry a payload:
 
 | Carrier | What exav extracts |
 |---|---|
-| NSIS, SFX installers | The installer's packaged files |
-| AutoIt (EA05) | The compiled script body |
-| MS-SZDD / KWAJ | The original file from the legacy compression wrappers |
-| BinHex, uuencode | The decoded binary from the text encoding |
-| LNK | Embedded command-line strings and target paths |
-| Python `.pyc` | Bytecode strings and constants |
-| GPT / APM / MBR partition maps | The partitions, then each filesystem inside |
-| Java `.class` | Constant-pool strings |
-| SWF (FWS / CWS / ZWS) | The decompressed Flash tag stream; all three variants are typed so `Target:11` signatures apply |
-| HTML, Word/Excel 2003 flat XML | Inline base64 assets — a `data:` URI image, a base64 element body — extracted with the document as their container |
-| AI models | Python pickle opcodes (surfaced, never executed) + safetensors header |
-| Microsoft Script Encoder | The plaintext of `#@~^`-encoded VBScript/JScript |
+| NSIS, SFX installers | the installer's packaged files |
+| AutoIt (EA05, EA06) | the script, a compiled one as text in the form ClamAV writes it, and the files it installs |
+| MS-SZDD / KWAJ | the original file from SZDD, and from KWAJ stored or XOR members (other KWAJ methods are reported) |
+| BinHex, uuencode | the decoded binary |
+| LNK | embedded command-line strings and target paths |
+| Python `.pyc` | bytecode strings and constants |
+| GPT / APM / MBR partition maps | the partitions, then each filesystem inside |
+| Java `.class` | constant-pool strings |
+| SWF (FWS / CWS / ZWS) | the decompressed Flash tag stream; all three variants are typed so `Target:11` signatures apply |
+| HTML, Word/Excel 2003 flat XML | inline base64 assets (a `data:` URI image, a base64 element body), with the document as their container |
+| AI models | Python pickle opcodes (surfaced, never executed) and the safetensors header |
+| Microsoft Script Encoder | the plaintext of `#@~^`-encoded VBScript/JScript |
+| An archive appended to another file | carved and extracted; an encrypted ZIP appended to a picture or document is reported `PASSWORD-PROTECTED` once its directory checks out |
 
 ## Encryption support
 
-| Container | Status |
-|---|---|
-| ZIP (ZipCrypto, WinZip AES-128/192/256) | decrypted with a password |
-| 7z (AES-256) | decrypted with a password (CRC-verified) |
-| PDF (RC4 / AES standard security handler) | decrypted with a password |
-| DMG | decrypted with a password |
-| Office: legacy XLS (RC4-basic, RC4-CryptoAPI, XOR) and OOXML (AES standard + agile) | decrypted; `VelvetSweatshop` and the empty password are tried automatically |
-| RAR AES, PKWARE Strong Encryption | detected only — decryptors pending |
+exav decrypts these with the password pool, then with the built-in passwords
+where the table names some:
 
-Passwords come from `--passwords` (repeatable) or a ClamAV `.pwdb` database.
+| Container | Schemes decrypted | Tried besides the pool |
+|---|---|---|
+| ZIP | ZipCrypto, WinZip AES-128/192/256 | `infected`, `virus`, `malware`, `password`, `123456` (the malware-sharing convention) |
+| 7z | AES-256 (SHA-256 KDF), including encrypted headers; the result is CRC-checked | none |
+| RAR | RAR5 AES-256 and RAR 2.9-4 AES-128, including encrypted headers (`rar -hp`); the result is CRC-checked | `infected`, `virus`, `malware`, `password`, `123456` |
+| PDF | standard security handler, RC4 and AES | the empty user password, first |
+| DMG | encrypted UDIF | none |
+| Office | legacy Excel `.xls` (RC4, RC4 CryptoAPI, XOR obfuscation); OOXML `.docx`/`.xlsx`/`.pptx` (AES, standard and agile) | `VelvetSweatshop` (Excel's no-prompt default) and the empty password |
+| ARJ | garbled (`arj -g`) and GOST-40 members, checked against the member's CRC-32 | none |
+
+Content that is still encrypted after that is reported `PASSWORD-PROTECTED`,
+never scanned as ciphertext and called clean. That covers a wrong or missing
+password, and the schemes exav detects but does not decrypt: RAR 2.0's own
+cipher, PKWARE Strong Encryption, encrypted ALZ and
+EGG members, ARJ GOST-256, encrypted legacy Word `.doc`, and CryptFF.
+
+The pool is, in order: each `--passwords` (repeatable, or comma-separated in
+`EXAV_PASSWORDS`), then the lines of the `--passwords-from` file (kept verbatim,
+so a password may hold commas or spaces, and stays out of process listings),
+then the passwords of any ClamAV `.pwdb` database in the signature directory
+(cleartext or hex-encoded entries). Duplicates are dropped.
+
+ARJ decryption comes with the `arj` feature; the rest needs the `decrypt`
+feature, on by default (see [Feature flags](/reference/feature-flags/)). Without
+it, that content is reported `PASSWORD-PROTECTED`.

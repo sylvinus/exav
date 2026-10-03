@@ -8,14 +8,13 @@
 //! extraction with no native/C dependencies.
 //!
 //! This module is SYNCHRONOUS throughout, and that is the design rather than an
-//! omission. `exav_unpack::Archive` is `Read + Seek`; meeting it on its own
-//! terms is what lets a browser build share exav's archive readers instead of
-//! carrying a second set, and a second set is a second set of answers about the
-//! same bytes. Reading a `File` synchronously needs `FileReaderSync`, which
-//! exists only inside a Worker — so the `File` path runs in a Worker, and
-//! `js/index.js` presents the async API a caller on the main thread uses.
-//! Bytes already in memory need no Worker and take the same code through a
-//! `Cursor`.
+//! omission. `exav_unpack::walk` reads its source by offset, synchronously;
+//! meeting it on its own terms is what lets a browser build share exav's
+//! archive readers instead of carrying a second set, and a second set is a
+//! second set of answers about the same bytes. Reading a `File` synchronously
+//! needs `FileReaderSync`, which exists only inside a Worker, so the `File`
+//! path runs in a Worker, and `js/index.js` presents the async API a caller on
+//! the main thread uses. Bytes already in memory need no Worker.
 //!
 //! From JavaScript, through the facade:
 //!
@@ -32,7 +31,10 @@
 
 mod source;
 
-use exav_unpack::{Budget, Entry as UnpackEntry, Format, Limits};
+use exav_unpack::source::BlockCache;
+use exav_unpack::{
+    walk, Budget, ByteSource, Entry as UnpackEntry, Format, LimitHit, Limits, Member, MemberMeta,
+};
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use source::Src;
 use wasm_bindgen::prelude::*;
@@ -144,22 +146,46 @@ fn limit_marker_to_js(why: &str) -> Result<JsValue, JsValue> {
     entry_to_js(&format!("<{why}>"), &[], false, why)
 }
 
-fn member_to_js(m: &exav_unpack::MemberInfo) -> Result<JsValue, JsValue> {
+/// One member's metadata, as JS receives it. `size` is its decoded size where
+/// that is known without decoding it, else -1.
+fn member_to_js(m: &MemberMeta, index: usize, size: Option<u64>) -> Result<JsValue, JsValue> {
     let obj = Object::new();
     Reflect::set(&obj, &"name".into(), &JsValue::from_str(&m.name))?;
-    Reflect::set(&obj, &"index".into(), &JsValue::from_f64(m.index as f64))?;
+    Reflect::set(&obj, &"index".into(), &JsValue::from_f64(index as f64))?;
     Reflect::set(
         &obj,
         &"compressedSize".into(),
-        &JsValue::from_f64(m.compressed_size as f64),
+        &JsValue::from_f64(m.comp_size as f64),
     )?;
     Reflect::set(
         &obj,
         &"uncompressedSize".into(),
-        &JsValue::from_f64(m.uncompressed_size as f64),
+        &JsValue::from_f64(size.map_or(-1.0, |n| n as f64)),
     )?;
     Reflect::set(&obj, &"encrypted".into(), &JsValue::from_bool(m.encrypted))?;
     Ok(obj.into())
+}
+
+/// A member a walk handed over, as an entry: a streamed one is read whole
+/// under the budget, and a limit is an error that stops the walk.
+fn read_entry(
+    meta: &MemberMeta,
+    content: Option<Member<'_>>,
+    budget: &mut Budget,
+) -> Result<UnpackEntry, LimitHit> {
+    let mut entry = UnpackEntry::new(meta.name.clone(), Vec::new());
+    entry.comp_size = meta.comp_size;
+    entry.encrypted = meta.encrypted;
+    entry.unsupported = meta.unsupported;
+    if let Some(content) = content {
+        let (data, partial) = content.into_bytes(meta, budget)?;
+        entry.data = data;
+        if partial && entry.unsupported.is_none() {
+            entry.unsupported =
+                Some("member failed to decode part way; the bytes before the failure are kept");
+        }
+    }
+    Ok(entry)
 }
 
 fn parse_passwords(passwords: &JsValue) -> Vec<String> {
@@ -260,32 +286,39 @@ fn format_by_name(name: &str) -> Option<Format> {
 /// `js/index.js` is what a page talks to.
 #[wasm_bindgen]
 pub struct Archive {
-    inner: exav_unpack::Archive<Src>,
-    /// One budget for the whole archive lifetime, so `maxMembers`,
-    /// `maxExtractedBytes` and the scan budget bound the ARCHIVE rather than
-    /// each member. A fresh budget per `extract` call would reset the counters
-    /// and let sequential extracts exceed every cumulative limit.
-    budget: Budget,
-    /// The members of an archive that carries no index, once walked.
-    ///
-    /// `exav_unpack::Archive::list` reports an index where the format has one.
-    /// Where it does not, it reports an empty slice — and passing that straight
-    /// out would tell a page the archive holds NOTHING, which is the one answer
-    /// this crate must never give. So an archive without an index is walked
-    /// once and held: its members are not knowable any other way, since finding
-    /// them and extracting them are the same operation.
-    ///
-    /// Nothing here is decided per format. Whatever `exav_unpack` can index, it
-    /// indexes, and this never runs for it.
-    walked: Option<Walk>,
+    bytes: Bytes,
+    fmt: Format,
+    limits: Limits,
+    /// Bytes extracted so far, across calls: `maxExtractedBytes` bounds the
+    /// ARCHIVE rather than each call, so sequential extracts cannot exceed it.
+    extracted: u64,
 }
 
-/// What one walk of a directory-less archive found, and why it stopped.
-struct Walk {
-    entries: Vec<UnpackEntry>,
-    /// Set when a limit ended the walk early, so the caller is told the list is
-    /// short rather than left to read it as complete.
-    stopped: Option<String>,
+/// Where an archive's bytes are.
+enum Bytes {
+    Memory(Vec<u8>),
+    /// Read by offset as a walk needs them, through a cache of bounded size.
+    Reader(BlockCache<Src>),
+}
+
+impl Bytes {
+    fn source(&self) -> &dyn ByteSource {
+        match self {
+            Bytes::Memory(v) => v,
+            Bytes::Reader(c) => c,
+        }
+    }
+}
+
+impl Archive {
+    /// The budget for one walk. Each call walks the archive afresh, so member
+    /// counts are per walk; extracted bytes are counted across calls.
+    fn budget(&self, passwords: Option<JsValue>) -> Budget {
+        let mut limits = self.limits.clone();
+        limits.max_extracted_bytes = limits.max_extracted_bytes.saturating_sub(self.extracted);
+        let passwords = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
+        Budget::with_passwords(limits, passwords)
+    }
 }
 
 #[wasm_bindgen]
@@ -294,8 +327,8 @@ impl Archive {
     /// caller-supplied `{ read(offset, length): Uint8Array, size: number }`.
     ///
     /// A supplied `read` is SYNCHRONOUS and returns bytes rather than a promise
-    /// of them: the archive readers are `Read + Seek`, and there is nowhere in
-    /// a `read` that returns bytes to await anything.
+    /// of them: the archive readers read by offset, synchronously, and there is
+    /// nowhere in a `read` that returns bytes to await anything.
     ///
     /// `limits` is optional and bounds every extraction from this archive:
     /// `{ maxExtractedBytes, maxBufferBytes, maxScannedBytes, maxMembers,
@@ -306,151 +339,149 @@ impl Archive {
     #[wasm_bindgen(js_name = "open")]
     pub fn open(source: JsValue, limits: Option<JsValue>) -> Result<Archive, JsValue> {
         let limits = limits_from_js(&limits.unwrap_or(JsValue::UNDEFINED));
-        let src = if let Some(bytes) = source.dyn_ref::<Uint8Array>() {
-            Src::Memory(std::io::Cursor::new(bytes.to_vec()))
+        let reader = |src: Src| BlockCache::new(src).map(Bytes::Reader).map_err(err);
+        let bytes = if let Some(bytes) = source.dyn_ref::<Uint8Array>() {
+            Bytes::Memory(bytes.to_vec())
         } else if let Some(blob) = source.dyn_ref::<web_sys::Blob>() {
             // `File` is a `Blob`, so one branch covers both.
-            Src::from_blob(blob.clone())?
+            reader(Src::from_blob(blob.clone())?)?
         } else if let Some(obj) = source.dyn_ref::<Object>() {
-            Src::from_js_reader(obj)?
+            reader(Src::from_js_reader(obj)?)?
         } else {
             return Err(JsValue::from_str(
                 "expected a Uint8Array, a File/Blob inside a Worker, \
                  or a { read(offset, length), size } object",
             ));
         };
-
-        let inner = exav_unpack::Archive::open(src).map_err(err)?;
-        check_allowed(inner.format(), &limits)?;
-        let budget = Budget::new(limits);
+        let fmt = exav_unpack::detect(bytes.source())
+            .ok_or_else(|| JsValue::from_str("unrecognised archive format"))?;
+        check_allowed(fmt, &limits)?;
         Ok(Archive {
-            inner,
-            budget,
-            walked: None,
+            bytes,
+            fmt,
+            limits,
+            extracted: 0,
         })
-    }
-
-    /// Whether this archive carries an index that can be read without
-    /// extracting anything.
-    ///
-    /// A capability, asked of the archive, rather than a list of formats kept
-    /// here — as `exav_unpack` learns to index another format, this starts
-    /// reporting it with no change on this side.
-    fn is_indexed(&self) -> bool {
-        !self.inner.list().is_empty()
-    }
-
-    /// Walk a directory-less archive once, and keep what it found.
-    ///
-    /// The walk is what extraction does, so doing it twice would decompress
-    /// everything twice — and for a source that only reads forward, the second
-    /// walk would find nothing at all.
-    fn walk(&mut self, passwords: Vec<String>) -> &Walk {
-        if self.walked.is_none() {
-            self.budget.passwords = passwords;
-            let mut entries = Vec::new();
-            let mut stopped = None;
-            loop {
-                match self.inner.extract_next(&mut self.budget) {
-                    Ok(Some(e)) => entries.push(e),
-                    Ok(None) => break,
-                    Err(hit) => {
-                        stopped = Some(hit.to_string());
-                        break;
-                    }
-                }
-            }
-            self.walked = Some(Walk { entries, stopped });
-        }
-        self.walked.as_ref().expect("just populated")
     }
 
     /// The detected format's name.
     pub fn format(&self) -> String {
-        format_name(self.inner.format())
+        format_name(self.fmt)
     }
 
     /// The members, as metadata.
     ///
-    /// Where the archive carries an index — a ZIP's central directory, a tar's
-    /// headers — this reads what `open` already parsed: no further I/O, and no
-    /// member decompressed. Where it does not, the members are only knowable by
-    /// walking, so the walk happens here and is kept.
+    /// A listing decodes nothing it can avoid: a member decoded as it is read
+    /// is left unread, and its size is what the archive declares for it. Where
+    /// the archive carries an index (a ZIP's central directory, a tar's
+    /// headers) that is all there is to it; a format read whole is decoded to
+    /// be listed.
     pub fn list(&mut self, passwords: Option<JsValue>) -> Result<Array, JsValue> {
+        let mut budget = self.budget(passwords);
         let out = Array::new();
-        if self.is_indexed() {
-            for m in self.inner.list() {
-                out.push(&member_to_js(m)?);
-            }
-            return Ok(out);
+        let mut index = 0;
+        let mut failed = None;
+        let walked = walk(
+            self.fmt,
+            self.bytes.source(),
+            &mut budget,
+            &mut |meta, content, _| {
+                let size = match &content {
+                    Some(Member::Bytes(data)) => Some(data.len() as u64),
+                    _ => meta.size,
+                };
+                match member_to_js(meta, index, size) {
+                    Ok(m) => out.push(&m),
+                    Err(e) => {
+                        failed = Some(e);
+                        return Some(());
+                    }
+                };
+                index += 1;
+                None
+            },
+        );
+        if let Some(e) = failed {
+            return Err(e);
         }
-        let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
-        let walk = self.walk(pw);
-        for (index, e) in walk.entries.iter().enumerate() {
-            out.push(&member_to_js(&exav_unpack::MemberInfo {
-                name: e.name.clone(),
-                index,
-                compressed_size: e.comp_size,
-                uncompressed_size: e.data.len() as u64,
-                encrypted: e.encrypted,
-            })?);
-        }
-        if let Some(why) = walk.stopped.clone() {
-            out.push(&limit_marker_to_js(&why)?);
+        // A list cut short by a limit says so, rather than reading as the
+        // whole archive.
+        if let Err(hit) = walked {
+            out.push(&limit_marker_to_js(&hit.to_string())?);
         }
         Ok(out)
     }
 
-    /// Extract one member by index.
+    /// Extract one member by index: the archive is walked up to it.
     pub fn extract(
         &mut self,
         index: usize,
         passwords: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
-        if self.is_indexed() {
-            self.budget.passwords = pw;
-            let entry = self.inner.extract(index, &mut self.budget).map_err(err)?;
-            return unpack_entry_to_js(&entry);
-        }
-        let walk = self.walk(pw);
-        match walk.entries.get(index) {
-            Some(e) => unpack_entry_to_js(e),
-            None => Err(JsValue::from_str(&format!("index {index} out of bounds"))),
+        let mut budget = self.budget(passwords);
+        let mut at = 0;
+        let found = walk(
+            self.fmt,
+            self.bytes.source(),
+            &mut budget,
+            &mut |meta, content, b| {
+                if at < index {
+                    at += 1;
+                    return None;
+                }
+                Some(read_entry(meta, content, b))
+            },
+        );
+        match found {
+            Ok(Some(Ok(entry))) => {
+                self.extracted += entry.data.len() as u64;
+                unpack_entry_to_js(&entry)
+            }
+            Ok(Some(Err(hit))) | Err(hit) => Err(err(hit)),
+            Ok(None) => Err(JsValue::from_str(&format!("index {index} out of bounds"))),
         }
     }
 
     /// Extract every member.
     ///
-    /// One budget across the whole archive, so `maxMembers`,
-    /// `maxExtractedBytes` and the compression-ratio guard bound the ARCHIVE
-    /// rather than each member of it. A limit reached part-way is reported as a
-    /// final member saying so, because a list that simply ends reads as an
-    /// archive that simply ended.
+    /// One budget across the walk, so `maxMembers`, `maxExtractedBytes` and the
+    /// compression-ratio guard bound the ARCHIVE rather than each member of it.
+    /// A limit reached part-way is reported as a final member saying so,
+    /// because a list that simply ends reads as an archive that simply ended.
     #[wasm_bindgen(js_name = "extractAll")]
     pub fn extract_all(&mut self, passwords: Option<JsValue>) -> Result<Array, JsValue> {
-        let pw = passwords.map(|p| parse_passwords(&p)).unwrap_or_default();
+        let mut budget = self.budget(passwords);
         let out = Array::new();
-        if !self.is_indexed() {
-            let walk = self.walk(pw);
-            for e in &walk.entries {
-                out.push(&unpack_entry_to_js(e)?);
-            }
-            if let Some(why) = walk.stopped.clone() {
-                out.push(&limit_marker_to_js(&why)?);
-            }
-            return Ok(out);
-        }
-        self.budget.passwords = pw;
-        loop {
-            match self.inner.extract_next(&mut self.budget) {
-                Ok(Some(e)) => out.push(&unpack_entry_to_js(&e)?),
-                Ok(None) => break,
-                Err(hit) => {
-                    out.push(&limit_marker_to_js(&hit.to_string())?);
-                    break;
+        let mut taken = 0;
+        let mut failed = None;
+        let walked = walk(
+            self.fmt,
+            self.bytes.source(),
+            &mut budget,
+            &mut |meta, content, b| {
+                let entry = match read_entry(meta, content, b) {
+                    Ok(entry) => entry,
+                    Err(hit) => return Some(Err(hit)),
+                };
+                taken += entry.data.len() as u64;
+                match unpack_entry_to_js(&entry) {
+                    Ok(e) => {
+                        out.push(&e);
+                        None
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        Some(Ok(()))
+                    }
                 }
-            };
+            },
+        );
+        self.extracted += taken;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        if let Ok(Some(Err(hit))) | Err(hit) = walked {
+            out.push(&limit_marker_to_js(&hit.to_string())?);
         }
         Ok(out)
     }
@@ -463,7 +494,7 @@ impl Archive {
 /// Detect the archive/container format from magic bytes.
 #[wasm_bindgen(js_name = "detectFormat")]
 pub fn detect_format(data: &[u8]) -> Option<String> {
-    exav_unpack::detect(data).map(format_name)
+    exav_unpack::detect(&data).map(format_name)
 }
 
 /// Extract every member from bytes already in memory.

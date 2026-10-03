@@ -3,7 +3,7 @@
 //! Security model: pure safe Rust, no `unsafe`, no native codegen, no syscalls.
 //! The program sees the file only through a fixed read-only API; all memory is
 //! bounds-checked Rust `Vec`s; every run is capped by instruction and call-depth
-//! budgets. A program can at worst be abandoned or return nothing — never
+//! budgets. A program can at worst be abandoned or return nothing; it can never
 //! corrupt memory.
 //!
 //! # Memory model
@@ -18,20 +18,22 @@
 //!
 //! # Where the API shapes come from
 //!
-//! Several structures named here — `cli_exe_section`, `cli_pe_hook_data`,
-//! `cli_environment` — are the ABI a `.cbc` program was compiled against, so an
+//! Several structures named here (`cli_exe_section`, `cli_pe_hook_data`,
+//! `cli_environment`) are the ABI a `.cbc` program was compiled against, so an
 //! interpreter has to reproduce them field for field or the program reads
 //! garbage. Their layouts are established from the accesses real programs make:
 //! run a program, watch which offsets it loads and what it does with them. That
 //! is the same method used for the signature formats, and it is the only one
-//! available — the shapes are an interface, and interfaces have to be matched
+//! available: the shapes are an interface, and interfaces have to be matched
 //! exactly whatever their provenance.
 
 use super::decode::Operand;
+use crate::byte_source::{ByteSource, CHUNK};
 use super::instr::{Body, Function, Inst};
 use super::instr::{OP_GEP1, OP_ICMP_FIRST, OP_ICMP_LAST, OP_SEXT, OP_TRUNC, OP_ZEXT};
 use super::types::{Globals, TypeTable};
-/// Deterministic instruction cap per program run — a *failsafe* against a
+use std::rc::Rc;
+/// Deterministic instruction cap per program run: a *failsafe* against a
 /// runaway loop in this interpreter, NOT a budget on the trusted bytecode.
 ///
 /// Bounded by step count, not wall clock: a wall-clock budget would make
@@ -82,7 +84,7 @@ const R_FILESIZE: i64 = 1;
 /// The parsed PE header struct region (`__clambc_pedata`).
 const R_PEDATA: i64 = 2;
 /// A read-only all-zero region for predefined globals we don't model yet
-/// (`__clambc_kind`, `match_counts`) — reads return 0 so a program runs
+/// (`__clambc_kind`, `match_counts`). Reads return 0 so a program runs
 /// rather than hitting "unsupported".
 const R_ZERO: i64 = 3;
 /// The `__clambc_match_offsets` region: per-subsignature trigger-match offsets.
@@ -95,10 +97,14 @@ const R_STACK: i64 = 0x1000;
 const R_HEAP: i64 = 0x8000;
 /// Base for global regions; region `R_GLOBAL + g` is global id `g`.
 const R_GLOBAL: i64 = 0x10_0000;
-/// Cap on a single `malloc` / extraction output. The format allows up to 1 GiB;
-/// 256 MiB is a safer ceiling that still admits legitimate unpack buffers
-/// (16 MiB was too low and made large-buffer unpackers fail with a null).
+/// Cap on one extraction buffer. It is exav's own: a `write` past it stops
+/// the run as incomplete.
 const MAX_ALLOC: usize = 256 << 20;
+/// The largest `malloc` ClamAV 1.4.3 grants: it returns NULL from
+/// `(128 << 20) - 8` bytes up, and so does exav.
+const MAX_MALLOC: usize = (128 << 20) - 9;
+/// Size of `__clambc_pedata`.
+const PEDATA_LEN: usize = 648;
 
 fn compose(region: i64, off: u32) -> i64 {
     (region << 32) | i64::from(off)
@@ -148,7 +154,7 @@ pub enum Api {
     Memstr,
     EngineFunctionalityLevel,
     EngineDconfLevel,
-    // Context-dependent APIs not yet fed real data — best-effort "nothing"
+    // Context-dependent APIs not yet fed real data: best-effort "nothing"
     // stubs so the program runs without hitting an unsupported call.
     GetEnvironment,
     MatchIcon,
@@ -223,7 +229,7 @@ pub fn api_of(name: &str) -> Api {
         | "debug_print_str_nonl"
         | "debug_print_uint"
         | "bytecode_rt_error" => Api::Debug,
-        // Deterministic math/util — fully implemented.
+        // Deterministic math/util, fully implemented.
         "isin" => Api::Isin,
         "icos" => Api::Icos,
         "iexp" => Api::Iexp,
@@ -313,9 +319,19 @@ pub fn api_of(name: &str) -> Api {
 pub struct Outcome {
     pub detection: Option<String>,
     pub steps: u64,
-    /// True if the program used an unimplemented op/API or made an
-    /// out-of-bounds access. The result is then unreliable and must be ignored.
+    /// True if the program used an unimplemented op/API, made an out-of-bounds
+    /// access, divided by zero or aborted. The result is then unreliable and
+    /// must be ignored.
     pub hit_unsupported: bool,
+    /// True if exav, not the program, stopped the run before it finished (out
+    /// of steps or call depth, a frame too large, an op or API exav does not
+    /// model, output past exav's extraction cap, PE header data exav lacks, or
+    /// a VM panic): what it would have found is unknown, so the scan is
+    /// incomplete. A program's own failure (an out-of-bounds access, a
+    /// division by zero, an abort) ends it as it would in ClamAV, and is not.
+    /// Also true when a `write` was refused at the scan's limits: the run
+    /// went on, but what it would have written was not scanned.
+    pub incomplete: bool,
     /// Buffers the program extracted (via `write`+`extract_new`) for the engine
     /// to recursively re-scan (how unpacker programs surface embedded files).
     pub extracted: Vec<Vec<u8>>,
@@ -335,30 +351,22 @@ pub struct PdfCtx {
 
 /// Scan a PDF for `id gen obj` markers, returning a [`PdfCtx`] (objects sorted
 /// by offset). This mirrors what the PDF parser feeds the bytecode.
-pub fn pdf_ctx(data: &[u8]) -> PdfCtx {
+pub fn pdf_ctx(data: &dyn ByteSource) -> PdfCtx {
     let mut objs = Vec::new();
-    for pos in memchr::memmem::find_iter(data, b" obj") {
+    let mut from = 0;
+    // " obj" cannot overlap itself, so one byte on finds every occurrence.
+    while let Some(pos) = data.find(b" obj", from, data.len()) {
+        from = pos + 1;
         // Before " obj": "<id> <gen>". Walk back over gen digits, a space, id.
-        let mut i = pos;
-        let back_digits = |i: &mut usize| {
-            let s = *i;
-            while *i > 0 && data[*i - 1].is_ascii_digit() {
-                *i -= 1;
-            }
-            s != *i
-        };
-        if !back_digits(&mut i) || i == 0 || data[i - 1] != b' ' {
+        let (i, _) = digits_before(data, pos);
+        if i == pos || i == 0 || data.window(i - 1, 1)[..] != *b" " {
             continue;
         }
-        i -= 1; // the space
-        let id_end = i;
-        if !back_digits(&mut i) || id_end == i {
+        let id_end = i - 1; // the space
+        let (i, id) = digits_before(data, id_end);
+        if i == id_end {
             continue;
         }
-        let id: u32 = std::str::from_utf8(&data[i..id_end])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
         objs.push((id, i as u32));
         if objs.len() >= 8192 {
             break;
@@ -371,9 +379,51 @@ pub fn pdf_ctx(data: &[u8]) -> PdfCtx {
     }
 }
 
+/// Where the run of ASCII digits ending at `end` starts, and its value as
+/// `str::parse::<u32>` reads it (0 when it does not fit). Read backwards a
+/// window at a time, so a long run costs no more memory than a short one.
+fn digits_before(data: &dyn ByteSource, end: usize) -> (usize, u32) {
+    let mut start = end;
+    let mut value = 0u64;
+    let mut overflow = false;
+    // 10 to the power of the digits read so far, until it passes `u32::MAX`:
+    // past that, any digit but 0 overflows.
+    let mut scale = Some(1u64);
+    let mut span = 64;
+    loop {
+        let from = start.saturating_sub(span);
+        let w = data.window(from, start - from);
+        if w.len() != start - from {
+            // Unreadable: the run ends where reading did.
+            return (start, if overflow { 0 } else { value as u32 });
+        }
+        for (k, &b) in w.iter().enumerate().rev() {
+            if !b.is_ascii_digit() {
+                return (from + k + 1, if overflow { 0 } else { value as u32 });
+            }
+            let d = (b - b'0') as u64;
+            if d != 0 {
+                match scale {
+                    Some(s) => {
+                        value += d * s;
+                        overflow |= value > u32::MAX as u64;
+                    }
+                    None => overflow = true,
+                }
+            }
+            scale = scale.and_then(|s| s.checked_mul(10)).filter(|&s| s <= 1 << 40);
+        }
+        if from == 0 {
+            return (0, if overflow { 0 } else { value as u32 });
+        }
+        start = from;
+        span = (span * 2).min(CHUNK);
+    }
+}
+
 /// Execution context for one run.
 pub struct Ctx<'a> {
-    pub file: &'a [u8],
+    pub file: &'a dyn ByteSource,
     pub flevel: u32,
     /// The program's decoded type table (`T` record).
     pub types: &'a TypeTable,
@@ -392,13 +442,38 @@ pub struct Ctx<'a> {
     pub apis: &'a [(u32, String)],
     /// Detection name reported when `setvirusname` can't resolve a name.
     pub default_name: &'a str,
+    pub write_limits: WriteLimits,
+}
+
+/// The scan's limits on what `write` makes: the size of one output file, and
+/// the bytes a run may write in all. A `write` past either returns -1, as one
+/// past ClamAV's file and scan size limits does.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteLimits {
+    pub file: u64,
+    pub total: u64,
+}
+
+impl WriteLimits {
+    pub const NONE: Self = WriteLimits {
+        file: u64::MAX,
+        total: u64::MAX,
+    };
 }
 
 /// One function activation.
 struct Frame<'a> {
     vtypes: &'a [u32],
-    map: Vec<u32>,
+    /// Where each value sits in `stack`.
+    slots: Rc<[Slot]>,
     stack: Vec<u8>,
+}
+
+/// A value's byte offset in its frame, and its width in bytes (at least 1).
+#[derive(Clone, Copy)]
+struct Slot {
+    off: u32,
+    w: u32,
 }
 
 /// Control-flow result of executing one instruction.
@@ -411,6 +486,11 @@ enum Flow {
 struct Machine<'a> {
     ctx: &'a Ctx<'a>,
     frames: Vec<Frame<'a>>,
+    /// Per function, where each of its values sits in a frame and the
+    /// frame's size: worked out at its first call, not at every one.
+    layouts: Vec<Option<(Rc<[Slot]>, usize)>>,
+    /// The program's declared APIs, by `CALL_API` id, resolved once per run.
+    apis: Vec<(u32, Api)>,
     /// Globals rendered to bytes once (a global read happens in hot loops, so
     /// this must not reallocate per access).
     gcache: Vec<Vec<u8>>,
@@ -420,78 +500,111 @@ struct Machine<'a> {
     extract_cur: Vec<u8>,
     /// Finalized extracted buffers (`extract_new` flushes `extract_cur` here).
     extracted: Vec<Vec<u8>>,
+    /// Bytes `write` took this run, and whether it refused some at the scan's
+    /// limits.
+    written: u64,
+    limited: bool,
     cursor: usize,
     detection: Option<String>,
     steps: u64,
     unsupported: bool,
+    /// Something the interpreter does not model, or one of its own bounds,
+    /// stopped the run: what the program would have found is unknown.
+    gap: bool,
     halt: bool,
+    /// The file is a PE whose header data `ctx.pe` lacks.
+    pe_missing: bool,
     /// Names of *data-fabricating* stub APIs the run actually invoked (lookup /
     /// allocation / decompression APIs we answer with a fixed fail-safe value
     /// instead of real behavior). A detection that depended on one of these ran
-    /// partly on fiction — surfaced in [`Outcome::stubbed`] so it is never
+    /// partly on fiction, so it is surfaced in [`Outcome::stubbed`] and never
     /// silently trusted. Benign no-ops (debug/trace/platform) are not recorded.
     stubbed: std::collections::BTreeSet<String>,
-    /// Opt-in (`EXAV_BC_TRACE`) execution trace of the data-access APIs, for
+    /// Opt-in (`EXAV_DEBUG_BC_TRACE`) execution trace of the data-access APIs, for
     /// debugging why a gated program does or doesn't detect. Read once at
     /// construction, so it costs nothing in the hot path when off.
     trace: bool,
-    /// Opt-in (`EXAV_BC_FN=<idx>`) per-instruction value trace of one function,
+    /// Opt-in (`EXAV_DEBUG_BC_FN=<idx>`) per-instruction value trace of one function,
     /// for debugging a divergent computation. `None` when off.
     trace_fn: Option<usize>,
 }
 
 impl<'a> Machine<'a> {
+    /// The program failed: the run ends here and its result is discarded.
+    /// Carried on, it would compute on the zeros a failed read returns.
     fn flag(&mut self) {
         self.unsupported = true;
+        self.halt = true;
+    }
+
+    /// [`Self::flag`] for a stop that is exav's, not the program's: the run is
+    /// then incomplete rather than a program failure ClamAV would also have.
+    fn gap(&mut self) {
+        self.flag();
+        self.gap = true;
+    }
+
+    /// `__clambc_pedata`. A file that is not a PE reads as zeros, as in
+    /// ClamAV. A PE whose header data exav lacks may be one ClamAV has data
+    /// for, so that is a gap.
+    fn pedata(&mut self) -> Option<&'a [u8]> {
+        if let Some(pe) = self.ctx.pe {
+            return Some(&pe.pedata);
+        }
+        if self.pe_missing {
+            self.gap();
+            return None;
+        }
+        Some(&[0; PEDATA_LEN])
     }
 
     /// Record that a fail-safe stub fabricated a result, and (under
-    /// `EXAV_BC_WARN`) warn once so a missing implementation is never silent.
+    /// `EXAV_DEBUG_BC_WARN`) warn once so a missing implementation is never silent.
     fn note_stub(&mut self, name: &str) {
-        if self.stubbed.insert(name.to_string()) && std::env::var_os("EXAV_BC_WARN").is_some() {
+        if self.stubbed.insert(name.to_string()) && std::env::var_os("EXAV_DEBUG_BC_WARN").is_some() {
             eprintln!("[exav bytecode] WARN: stubbed API `{name}` returned a fail-safe value; result may diverge from ClamAV");
         }
     }
 
     // --- per-frame raw memory (bounds-checked) ---
+    #[inline(always)]
     fn rd_mem(&mut self, frame: usize, off: u32, w: usize) -> i64 {
         let o = off as usize;
-        let ok = self
-            .frames
-            .get(frame)
-            .map(|fr| w != 0 && o + w <= fr.stack.len())
-            .unwrap_or(false);
-        if !ok {
+        let Some(b) = self.frames.get(frame).and_then(|fr| fr.stack.get(o..o.checked_add(w)?)).filter(|_| w != 0) else {
             self.flag();
             return 0;
-        }
-        let fr = &self.frames[frame];
-        let mut v = 0u64;
-        for i in 0..w {
-            v |= u64::from(fr.stack[o + i]) << (8 * i);
-        }
+        };
+        // The widths values come in, read whole; any other a byte at a time.
+        let v = match w {
+            1 => u64::from(b[0]),
+            2 => u64::from(u16::from_le_bytes([b[0], b[1]])),
+            4 => u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            8 => u64::from_le_bytes(b.try_into().expect("eight bytes")),
+            _ => b.iter().enumerate().fold(0u64, |v, (i, &x)| v | u64::from(x) << (8 * i)),
+        };
         v as i64
     }
+    #[inline(always)]
     fn wr_mem(&mut self, frame: usize, off: u32, w: usize, val: i64) {
         let o = off as usize;
-        let ok = self
-            .frames
-            .get(frame)
-            .map(|fr| w != 0 && o + w <= fr.stack.len())
-            .unwrap_or(false);
-        if !ok {
+        let Some(b) = self.frames.get_mut(frame).and_then(|fr| fr.stack.get_mut(o..o.checked_add(w)?)).filter(|_| w != 0) else {
             self.flag();
             return;
-        }
-        let v = val as u64;
-        let fr = &mut self.frames[frame];
-        for i in 0..w {
-            fr.stack[o + i] = (v >> (8 * i)) as u8;
+        };
+        let v = (val as u64).to_le_bytes();
+        match w {
+            1 | 2 | 4 | 8 => b.copy_from_slice(&v[..w]),
+            _ => {
+                for (i, x) in b.iter_mut().enumerate() {
+                    *x = ((val as u64) >> (8 * i)) as u8;
+                }
+            }
         }
     }
 
-    fn map_of(&self, fi: usize, id: u32) -> Option<u32> {
-        self.frames.get(fi)?.map.get(id as usize).copied()
+    #[inline(always)]
+    fn slot(&self, fi: usize, id: u32) -> Option<Slot> {
+        self.frames.get(fi)?.slots.get(id as usize).copied()
     }
     fn type_of(&self, fi: usize, id: u32) -> u32 {
         self.frames
@@ -501,20 +614,21 @@ impl<'a> Machine<'a> {
     }
 
     /// Store an instruction result into value `id`'s slot at its type width.
+    #[inline(always)]
     fn set(&mut self, fi: usize, id: u32, v: i64) {
-        let Some(off) = self.map_of(fi, id) else {
+        let Some(s) = self.slot(fi, id) else {
             self.flag();
             return;
         };
-        let w = type_bytes(self.type_of(fi, id)).max(1);
-        self.wr_mem(fi, off, w, v);
+        self.wr_mem(fi, s.off, s.w as usize, v);
     }
 
     // --- operand evaluation ---
+    #[inline(always)]
     fn value(&mut self, fi: usize, op: &Operand, w: usize) -> i64 {
         match *op {
-            Operand::Reg(i) => match self.map_of(fi, i) {
-                Some(off) => self.rd_mem(fi, off, w),
+            Operand::Reg(i) => match self.slot(fi, i) {
+                Some(s) => self.rd_mem(fi, s.off, w),
                 None => {
                     self.flag();
                     0
@@ -523,7 +637,7 @@ impl<'a> Machine<'a> {
             Operand::Const(c) => mask(c as i64, (w * 8) as u32),
             // A global used as a value reads its stored content: the composed
             // pointer for a pointer global, or the scalar for a scalar global
-            // (it is NOT dereferenced — LOAD does that separately).
+            // (it is NOT dereferenced; LOAD does that separately).
             Operand::Global(g) => self.global_value(g),
         }
     }
@@ -541,12 +655,14 @@ impl<'a> Machine<'a> {
             }
         }
     }
+    #[inline(always)]
     fn op_width(&self, fi: usize, op: &Operand) -> usize {
         match *op {
-            Operand::Reg(i) => type_bytes(self.type_of(fi, i)).max(1),
+            Operand::Reg(i) => self.slot(fi, i).map_or(1, |s| s.w as usize),
             _ => 8,
         }
     }
+    #[inline(always)]
     fn value_nat(&mut self, fi: usize, op: &Operand) -> i64 {
         let w = self.op_width(fi, op);
         self.value(fi, op, w)
@@ -566,7 +682,7 @@ impl<'a> Machine<'a> {
         match *op {
             Operand::Reg(i) => {
                 let ty = self.type_of(fi, i);
-                let Some(off) = self.map_of(fi, i) else {
+                let Some(Slot { off, .. }) = self.slot(fi, i) else {
                     self.flag();
                     return R_NULL;
                 };
@@ -625,7 +741,9 @@ impl<'a> Machine<'a> {
             });
         }
         if region == R_PEDATA {
-            let pd = self.ctx.pe.map(|p| p.pedata.as_slice()).unwrap_or(&[]);
+            let Some(pd) = self.pedata() else {
+                return 0;
+            };
             return read_le(pd, off as usize, w).unwrap_or_else(|| {
                 self.flag();
                 0
@@ -710,13 +828,21 @@ impl<'a> Machine<'a> {
                 .to_vec()
         };
         if region == R_PEDATA {
-            return self.ctx.pe.map(|p| slice(&p.pedata)).unwrap_or_default();
+            return self.pedata().map(slice).unwrap_or_default();
         }
         if region == R_ZERO {
             // Cap the zero-fill: `len` is attacker-controlled (memcpy/memmem/
             // memstr feed it), and an uncapped `vec![0; len]` would abort the
             // process on a huge length. Short reads are already normal here.
             return vec![0u8; len.min(MAX_BYTES)];
+        }
+        // The two regions [`Self::deref_int`] reads as values, read as bytes.
+        if region == R_FILESIZE {
+            return slice(&(self.ctx.file.len().min(u32::MAX as usize) as u32).to_le_bytes());
+        }
+        if region == R_MATCHOFF {
+            let offs: Vec<u8> = self.ctx.match_offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+            return slice(&offs);
         }
         if region >= R_GLOBAL {
             return slice(self.global_bytes((region - R_GLOBAL) as usize));
@@ -777,12 +903,10 @@ impl<'a> Machine<'a> {
     }
 
     fn api_for(&self, func: u32) -> Api {
-        self.ctx
-            .apis
+        self.apis
             .iter()
             .find(|(id, _)| *id == func + 1)
-            .map(|(_, n)| api_of(n))
-            .unwrap_or(Api::Unsupported)
+            .map_or(Api::Unsupported, |&(_, a)| a)
     }
 
     fn call_api(&mut self, fi: usize, api: Api, args: &[Operand]) -> i64 {
@@ -807,13 +931,13 @@ impl<'a> Machine<'a> {
                     .value_nat(fi, args.get(1).unwrap_or(&Operand::Const(0)))
                     .max(0) as usize;
                 let avail = self.ctx.file.len().saturating_sub(self.cursor).min(size);
+                let bytes = self.ctx.file.window(self.cursor, avail);
                 if let Some(op) = args.first() {
                     let p = self.ptr(fi, op);
-                    let bytes = self.ctx.file[self.cursor..self.cursor + avail].to_vec();
                     self.write_region(p, &bytes);
                 }
-                self.cursor += avail;
-                avail as i64
+                self.cursor += bytes.len();
+                bytes.len() as i64
             }
             Api::Seek => {
                 let off = self.value_nat(fi, args.first().unwrap_or(&Operand::Const(0)));
@@ -841,10 +965,9 @@ impl<'a> Machine<'a> {
             }
             Api::FileByteAt => {
                 let off = self.value_nat(fi, args.first().unwrap_or(&Operand::Const(0)));
-                if off >= 0 && (off as usize) < self.ctx.file.len() {
-                    self.ctx.file[off as usize] as i64
-                } else {
-                    -1
+                match usize::try_from(off).ok().map(|o| self.ctx.file.window(o, 1)) {
+                    Some(b) if b.len() == 1 => b[0] as i64,
+                    _ => -1,
                 }
             }
             Api::FileFind | Api::FileFindLimit => {
@@ -866,9 +989,8 @@ impl<'a> Machine<'a> {
                     return -1;
                 }
                 let end = limit.min(self.ctx.file.len());
-                let hay = self.ctx.file.get(self.cursor..end).unwrap_or(&[]);
-                match find_sub(hay, &pat) {
-                    Some(i) => (self.cursor + i) as i64,
+                match self.ctx.file.find(&pat, self.cursor, end) {
+                    Some(at) => at as i64,
                     None => -1,
                 }
             }
@@ -914,8 +1036,8 @@ impl<'a> Machine<'a> {
                 // disasm_x86(result, len): decode one instruction at the cursor
                 // into the caller's DISASM_RESULT; return the offset just past
                 // it (the cursor is not advanced, matching the ABI).
-                let n = self.ctx.file.len().saturating_sub(self.cursor).min(32);
-                let bytes = self.ctx.file[self.cursor..self.cursor + n].to_vec();
+                let bytes = self.ctx.file.window(self.cursor, 32).into_owned();
+                let n = bytes.len();
                 match super::disasm::disasm_one(&bytes) {
                     Some((res, len)) => {
                         if self.trace {
@@ -936,10 +1058,10 @@ impl<'a> Machine<'a> {
                         // from "an instruction outside my scope", so neither can
                         // this. Returning the ABI's -1 would let the program
                         // carry on down a branch it would not have taken with a
-                        // full decoder, and report a verdict built on it. Mark
-                        // the run unsupported instead: the result is discarded
-                        // rather than quietly changed.
-                        self.unsupported = true;
+                        // full decoder, and report a verdict built on it. End
+                        // the run as unsupported instead: the detection is
+                        // discarded, and nothing is written past this point.
+                        self.flag();
                         -1
                     }
                 }
@@ -948,9 +1070,9 @@ impl<'a> Machine<'a> {
                 // malloc(size): a fresh zeroed heap allocation; returns a
                 // pointer to it (region R_HEAP + index).
                 let size = self.value_nat(fi, args.first().unwrap_or(&Operand::Const(0)));
-                if size <= 0 || size as usize > MAX_ALLOC {
+                if size <= 0 || size as usize > MAX_MALLOC {
                     if self.trace {
-                        eprintln!("[trace] malloc({size}) -> NULL (over MAX_ALLOC {MAX_ALLOC})");
+                        eprintln!("[trace] malloc({size}) -> NULL (over MAX_MALLOC {MAX_MALLOC})");
                         for (hi, h) in self.heaps.iter().enumerate() {
                             let n = h.len().min(32);
                             eprintln!(
@@ -977,9 +1099,20 @@ impl<'a> Machine<'a> {
                 let p = self.ptr(fi, args.first().unwrap_or(&Operand::Const(0)));
                 let bytes = self.read_region(p, len);
                 let n = bytes.len();
-                if self.extract_cur.len() + n <= MAX_ALLOC {
-                    self.extract_cur.extend_from_slice(&bytes);
+                let file = (self.extract_cur.len() + n) as u64;
+                let limits = self.ctx.write_limits;
+                if file > limits.file || self.written.saturating_add(n as u64) > limits.total {
+                    // The program sees the failure and carries on; what it
+                    // would have written goes unscanned.
+                    self.limited = true;
+                    return -1;
                 }
+                if self.extract_cur.len() + n > MAX_ALLOC {
+                    self.gap();
+                    return -1;
+                }
+                self.extract_cur.extend_from_slice(&bytes);
+                self.written += n as u64;
                 if self.trace {
                     eprintln!(
                         "[trace] write(len={len}) -> {n} bytes (extract_cur={})",
@@ -1025,7 +1158,7 @@ impl<'a> Machine<'a> {
             }
             Api::EngineFunctionalityLevel => self.ctx.flevel as i64,
             // The dconf level is documented as "usually identical to the
-            // functionality level" — a small integer, NOT a bitmask. Returning
+            // functionality level": a small integer, NOT a bitmask. Returning
             // 0xFFFFFFFF made every `dconf & bit` test and flevel comparison
             // pass, which can push a program onto a detection path it should
             // skip (false positive). Mirror the functionality level instead.
@@ -1197,7 +1330,7 @@ impl<'a> Machine<'a> {
             Api::StubNeg => -1,
             Api::StubNull => 0,
             Api::Unsupported => {
-                self.flag();
+                self.gap();
                 0
             }
         }
@@ -1206,19 +1339,31 @@ impl<'a> Machine<'a> {
     fn read_number(&mut self, radix: u32) -> i64 {
         let is_digit = |b: u8| b.is_ascii_digit() || (radix == 16 && b.is_ascii_hexdigit());
         let file = self.ctx.file;
-        let Some(start) = (self.cursor..file.len()).find(|&i| is_digit(file[i])) else {
+        // The value of the first run of digits at or after the cursor, as
+        // `i64::from_str_radix` reads it: 0 once it overflows.
+        let mut value = Some(0i64);
+        let mut started = false;
+        let mut end = None;
+        file.chunks(self.cursor, file.len(), &mut |at, chunk| {
+            for (k, &b) in chunk.iter().enumerate() {
+                if is_digit(b) {
+                    started = true;
+                    let d = (b as char).to_digit(radix).unwrap_or(0) as i64;
+                    value = value
+                        .and_then(|v| v.checked_mul(radix as i64))
+                        .and_then(|v| v.checked_add(d));
+                } else if started {
+                    end = Some(at + k);
+                    return false;
+                }
+            }
+            true
+        });
+        if !started {
             return -1;
-        };
-        let mut end = start;
-        while end < file.len() && is_digit(file[end]) {
-            end += 1;
         }
-        let v = std::str::from_utf8(&file[start..end])
-            .ok()
-            .and_then(|s| i64::from_str_radix(s, radix).ok())
-            .unwrap_or(0);
-        self.cursor = end;
-        v
+        self.cursor = end.unwrap_or(file.len());
+        value.unwrap_or(0)
     }
 
     fn gep(&mut self, fi: usize, opcode: u8, first_ty: u32, base: &Operand, idx: &Operand) -> i64 {
@@ -1249,22 +1394,31 @@ impl<'a> Machine<'a> {
 
     /// Execute one function activation, returning its result value.
     fn exec_fn(&mut self, funcs: &'a [Function], idx: usize, args: &[i64], depth: usize) -> i64 {
-        if depth > MAX_DEPTH || self.halt {
+        if self.halt {
             self.flag();
+            return 0;
+        }
+        if depth > MAX_DEPTH {
+            self.gap();
             return 0;
         }
         let Some(f) = funcs.get(idx) else {
             self.flag();
             return 0;
         };
-        let (map, nbytes) = layout(f, self.ctx.types);
+        if self.layouts.len() < funcs.len() {
+            self.layouts.resize(funcs.len(), None);
+        }
+        let types = self.ctx.types;
+        let (slots, nbytes) = self.layouts[idx].get_or_insert_with(|| layout(f, types));
+        let (slots, nbytes) = (Rc::clone(slots), *nbytes);
         if nbytes > MAX_BYTES {
-            self.flag();
+            self.gap();
             return 0;
         }
         self.frames.push(Frame {
             vtypes: &f.types,
-            map,
+            slots,
             stack: vec![0u8; nbytes],
         });
         let fi = self.frames.len() - 1;
@@ -1287,7 +1441,12 @@ impl<'a> Machine<'a> {
                 }
                 let flow = self.step(funcs, fi, inst, depth);
                 if self.trace_fn == Some(idx) {
-                    let v = self.value(fi, &Operand::Reg(inst.dest), 8);
+                    // Read at the value's own width, without the checks that
+                    // would end the run: tracing must not change the result.
+                    let v = self
+                        .slot(fi, inst.dest)
+                        .and_then(|s| self.frames[fi].stack.get(s.off as usize..(s.off + s.w) as usize))
+                        .map_or(0, |b| b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)) as i64);
                     eprintln!(
                         "[fn{idx} bb{bb}] op={:<2} dest={:<3} ty={:<3} => {v} (0x{:x})",
                         inst.opcode, inst.dest, inst.ty, v as u64
@@ -1356,7 +1515,7 @@ impl<'a> Machine<'a> {
                     let argvals: Vec<i64> = args.iter().map(|o| self.arg_value(fi, o)).collect();
                     self.exec_fn(funcs, *func as usize, &argvals, depth + 1)
                 };
-                // A void call (result type 0) has no destination — its `dest`
+                // A void call (result type 0) has no destination: its `dest`
                 // field is a placeholder (0). Storing into it would clobber
                 // value id 0, which for a callee with arguments is its first
                 // argument (SSA result ids are always >= numArgs). Only write
@@ -1521,11 +1680,12 @@ impl<'a> Machine<'a> {
                 };
                 self.set(fi, inst.dest, d);
             }
+            // ClamAV fails the run here and drops its virus name.
             OP_ABORT => {
-                self.halt = true;
+                self.flag();
                 return Flow::Return(0);
             }
-            _ => self.flag(), // any remaining op needs more modeling
+            _ => self.gap(), // any remaining op needs more modeling
         }
         Flow::Next
     }
@@ -1652,22 +1812,40 @@ fn arith(op: u8, a: i64, b: i64) -> i64 {
 }
 
 /// Lay out a function's value buffer: assign each value an aligned byte offset.
-fn layout(f: &Function, types: &TypeTable) -> (Vec<u32>, usize) {
-    let mut map = Vec::with_capacity(f.types.len());
+fn layout(f: &Function, types: &TypeTable) -> (Rc<[Slot]>, usize) {
+    let mut slots = Vec::with_capacity(f.types.len());
     let mut bytes = 0usize;
     for &ty in &f.types {
         let align = types.align(ty).max(1);
         let size = types.size(ty).max(1);
         bytes = (bytes + align - 1) & !(align - 1);
-        map.push(bytes as u32);
+        slots.push(Slot {
+            off: bytes as u32,
+            w: type_bytes(ty).max(1) as u32,
+        });
         bytes += size;
     }
     bytes = (bytes + 7) & !7;
-    (map, bytes)
+    (slots.into(), bytes)
+}
+
+/// `ctx`'s declared APIs, resolved by name.
+fn resolve_apis(ctx: &Ctx) -> Vec<(u32, Api)> {
+    ctx.apis.iter().map(|(id, n)| (*id, api_of(n))).collect()
 }
 
 /// Run `entry` over `ctx`. Bounded; call inside `catch_unwind` for isolation.
 pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
+    run_inner(funcs, entry, ctx, false)
+}
+
+/// [`run`] over a PE whose header data `ctx.pe` lacks (too large to load, or
+/// rejected by exav's parser): reading `__clambc_pedata` is then a gap.
+pub fn run_without_pe_data(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
+    run_inner(funcs, entry, ctx, true)
+}
+
+fn run_inner(funcs: &[Function], entry: usize, ctx: &Ctx, pe_missing: bool) -> Outcome {
     let gcache: Vec<Vec<u8>> = ctx
         .globals
         .values
@@ -1677,18 +1855,24 @@ pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
     let mut m = Machine {
         ctx,
         frames: Vec::new(),
+        layouts: Vec::new(),
+        apis: resolve_apis(ctx),
         gcache,
         heaps: Vec::new(),
         extract_cur: Vec::new(),
         extracted: Vec::new(),
+        written: 0,
+        limited: false,
         cursor: 0,
         detection: None,
         steps: 0,
         unsupported: false,
+        gap: false,
         halt: false,
+        pe_missing,
         stubbed: std::collections::BTreeSet::new(),
-        trace: std::env::var_os("EXAV_BC_TRACE").is_some(),
-        trace_fn: std::env::var("EXAV_BC_FN")
+        trace: std::env::var_os("EXAV_DEBUG_BC_TRACE").is_some(),
+        trace_fn: std::env::var("EXAV_DEBUG_BC_FN")
             .ok()
             .and_then(|s| s.parse().ok()),
     };
@@ -1700,7 +1884,7 @@ pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
     // scanned when the program ends, so an unpacker that writes its output and
     // returns is complete and correct. Requiring the explicit call meant exav
     // ran ClamAV's MPRESS unpacker to completion, received the full 994 KB
-    // decompressed image through `write`, and then discarded it — the payload
+    // decompressed image through `write`, and then discarded it. The payload
     // was recovered and thrown away, and the file scanned clean.
     if !m.extract_cur.is_empty() {
         m.extracted.push(std::mem::take(&mut m.extract_cur));
@@ -1709,6 +1893,7 @@ pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
         detection: m.detection,
         steps: m.steps,
         hit_unsupported: m.unsupported,
+        incomplete: m.steps > MAX_STEPS || m.gap || m.limited,
         extracted: m.extracted,
         stubbed: m.stubbed.into_iter().collect(),
     }
@@ -1717,7 +1902,9 @@ pub fn run(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::instr::{Body, Function, Inst, OP_BRANCH, OP_JMP, OP_RET_VOID};
+    use crate::bytecode::instr::{
+        Body, Function, Inst, OP_BRANCH, OP_CALL_API, OP_JMP, OP_RET, OP_RET_VOID,
+    };
     use crate::bytecode::types::{Globals, TypeTable};
 
     fn detector() -> Vec<Function> {
@@ -1790,7 +1977,7 @@ mod tests {
     }
 
     fn ctx<'a>(
-        file: &'a [u8],
+        file: &'a dyn ByteSource,
         apis: &'a [(u32, String)],
         globals: &'a Globals,
         types: &'a TypeTable,
@@ -1805,6 +1992,7 @@ mod tests {
             match_offsets: &[],
             apis,
             default_name: "Test.BC.Found",
+            write_limits: WriteLimits::NONE,
         }
     }
 
@@ -1813,9 +2001,11 @@ mod tests {
             ctx: c,
             frames: vec![Frame {
                 vtypes: &[],
-                map: vec![],
+                slots: Rc::from([]),
                 stack: vec![],
             }],
+            layouts: Vec::new(),
+            apis: resolve_apis(c),
             gcache: c
                 .globals
                 .values
@@ -1825,14 +2015,37 @@ mod tests {
             heaps: Vec::new(),
             extract_cur: Vec::new(),
             extracted: Vec::new(),
+            written: 0,
+            limited: false,
             cursor: 0,
             detection: None,
             steps: 0,
             unsupported: false,
+            gap: false,
             halt: false,
+            pe_missing: false,
             stubbed: std::collections::BTreeSet::new(),
             trace: false,
             trace_fn: None,
+        }
+    }
+
+    #[test]
+    fn frame_memory_reads_back_every_width() {
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        for w in 1..=8usize {
+            m.frames[0].stack = vec![0xAA; 16];
+            m.wr_mem(0, 3, w, 0x0807_0605_0403_0201);
+            let want = (0x0807_0605_0403_0201u64 & (u64::MAX >> (64 - 8 * w))) as i64;
+            assert_eq!(m.rd_mem(0, 3, w), want, "width {w}");
+            assert_eq!(m.frames[0].stack[2], 0xAA, "width {w}");
+            assert_eq!(m.frames[0].stack[3 + w], 0xAA, "width {w}");
+            assert!(!m.unsupported);
+            assert_eq!(m.rd_mem(0, 17 - w as u32, w), 0, "width {w} past the end");
+            assert!(m.unsupported);
+            m.unsupported = false;
         }
     }
 
@@ -1964,6 +2177,229 @@ mod tests {
         assert_eq!(out.detection.as_deref(), Some("Test.BC.Found"));
     }
 
+    /// What the interpreter cannot model leaves the program's answer unknown,
+    /// so the run is incomplete. A program's own failure (a division by zero)
+    /// ends it as it would in ClamAV: discarded, not incomplete.
+    #[test]
+    fn an_unmodeled_step_is_incomplete_a_program_fault_is_not() {
+        let one = |inst: Inst| {
+            vec![Function {
+                num_args: 0,
+                return_type: 0,
+                types: vec![32],
+                num_insts: 2,
+                num_bb: 1,
+                blocks: vec![vec![
+                    inst,
+                    Inst {
+                        opcode: OP_RET,
+                        dest: 0,
+                        ty: 0,
+                        body: Body::Ret(None),
+                    },
+                ]],
+            }]
+        };
+        let (apis, globals, types) = (Vec::new(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let unmodeled = one(Inst {
+            opcode: 250,
+            dest: 0,
+            ty: 32,
+            body: Body::Ops(vec![]),
+        });
+        let unknown_api = one(Inst {
+            opcode: OP_CALL_API,
+            dest: 0,
+            ty: 32,
+            body: Body::Call {
+                api: true,
+                func: 7,
+                args: vec![],
+            },
+        });
+        let div_zero = one(Inst {
+            opcode: 4,
+            dest: 0,
+            ty: 32,
+            body: Body::Ops(vec![Operand::Const(1), Operand::Const(0)]),
+        });
+        for (name, funcs, incomplete) in [
+            ("unmodeled op", unmodeled, true),
+            ("unknown API", unknown_api, true),
+            ("division by zero", div_zero, false),
+        ] {
+            let out = run(&funcs, 0, &c);
+            assert!(out.hit_unsupported, "{name}");
+            assert_eq!(out.incomplete, incomplete, "{name}");
+        }
+    }
+
+    /// A program's own fault ends its run there: it cannot carry on into a
+    /// step exav does not model and make the scan incomplete after all.
+    #[test]
+    fn a_program_fault_ends_the_run() {
+        let inst = |opcode, body| Inst {
+            opcode,
+            dest: 0,
+            ty: 32,
+            body,
+        };
+        let funcs = vec![Function {
+            num_args: 0,
+            return_type: 0,
+            types: vec![32],
+            num_insts: 3,
+            num_bb: 1,
+            blocks: vec![vec![
+                // A value the function does not have: out of bounds.
+                inst(1, Body::Ops(vec![Operand::Reg(99), Operand::Const(1)])),
+                inst(250, Body::Ops(vec![])),
+                inst(OP_RET, Body::Ret(None)),
+            ]],
+        }];
+        let (apis, globals, types) = (Vec::new(), Globals::default(), TypeTable::default());
+        let out = run(&funcs, 0, &ctx(b"", &apis, &globals, &types));
+        assert!(out.hit_unsupported);
+        assert!(!out.incomplete, "the fault ended the run before the unmodeled op");
+    }
+
+    /// An abort after `setvirusname` fails the run in ClamAV: the name is
+    /// dropped, and the run is not incomplete.
+    #[test]
+    fn an_abort_discards_the_detection() {
+        let inst = |opcode, body| Inst {
+            opcode,
+            dest: 0,
+            ty: 32,
+            body,
+        };
+        let funcs = vec![Function {
+            num_args: 0,
+            return_type: 0,
+            types: vec![32],
+            num_insts: 3,
+            num_bb: 1,
+            blocks: vec![vec![
+                inst(
+                    OP_CALL_API,
+                    Body::Call {
+                        api: true,
+                        func: 0,
+                        args: vec![],
+                    },
+                ),
+                inst(OP_ABORT, Body::Ops(vec![])),
+                inst(OP_RET, Body::Ret(None)),
+            ]],
+        }];
+        let apis = vec![(1, "setvirusname".to_string())];
+        let (globals, types) = (Globals::default(), TypeTable::default());
+        let out = run(&funcs, 0, &ctx(b"", &apis, &globals, &types));
+        assert_eq!(out.detection.as_deref(), Some("Test.BC.Found"));
+        assert!(out.hit_unsupported);
+        assert!(!out.incomplete);
+    }
+
+    /// Bytes `disasm_x86` cannot decode end the run there, so nothing the
+    /// program writes after it is kept as output.
+    #[test]
+    fn an_undecoded_instruction_ends_the_run() {
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        assert_eq!(m.call_api(0, Api::DisasmX86, &[]), -1);
+        assert!(m.unsupported && m.halt && !m.gap);
+    }
+
+    /// `malloc` returns NULL where ClamAV's does, and the program sees it.
+    #[test]
+    fn malloc_past_clamav_limit_is_null() {
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        assert_ne!(m.call_api(0, Api::Malloc, &[Operand::Const(MAX_MALLOC as u64)]), 0);
+        assert_eq!(m.call_api(0, Api::Malloc, &[Operand::Const(MAX_MALLOC as u64 + 1)]), 0);
+        assert!(!m.unsupported && !m.gap);
+    }
+
+    /// Output past exav's own cap is not dropped silently: the run stops
+    /// as incomplete.
+    #[test]
+    fn write_past_the_extraction_cap_is_a_gap() {
+        let globals = Globals {
+            values: vec![vec![0, 1], vec![0x41, 0x42]],
+        };
+        let (apis, types) = (apis(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        let args = [Operand::Global(0), Operand::Const(2)];
+        m.extract_cur = vec![0; MAX_ALLOC - 2];
+        assert_eq!(m.call_api(0, Api::Write, &args), 2);
+        assert!(!m.gap);
+        assert_eq!(m.call_api(0, Api::Write, &args), -1);
+        assert_eq!(m.extract_cur.len(), MAX_ALLOC);
+        assert!(m.gap && m.halt);
+    }
+
+    /// A `write` past the scan's limits, on one output file or on all of a
+    /// run's, fails and the run goes on, as in ClamAV; the scan is then
+    /// incomplete.
+    #[test]
+    fn write_past_the_scan_limits_fails_and_the_run_goes_on() {
+        let globals = Globals {
+            values: vec![vec![0, 1], vec![0x41, 0x42, 0x43]],
+        };
+        let (apis, types) = (apis(), TypeTable::default());
+        let args = [Operand::Global(0), Operand::Const(3)];
+        // Three bytes to one file, seven in all.
+        let c = Ctx {
+            write_limits: WriteLimits { file: 3, total: 7 },
+            ..ctx(b"", &apis, &globals, &types)
+        };
+        let mut m = machine(&c);
+        assert_eq!(m.call_api(0, Api::Write, &args), 3);
+        assert_eq!(m.call_api(0, Api::Write, &args), -1, "past one file's limit");
+        assert!(m.limited && !m.halt && !m.gap && !m.unsupported);
+        m.call_api(0, Api::ExtractNew, &[]);
+        assert_eq!(m.call_api(0, Api::Write, &args), 3);
+        m.call_api(0, Api::ExtractNew, &[]);
+        assert_eq!(m.call_api(0, Api::Write, &args), -1, "past the run's limit");
+        assert_eq!(m.call_api(0, Api::Write, &[Operand::Global(0), Operand::Const(1)]), 1);
+        assert_eq!(m.extracted, vec![b"ABC".to_vec(), b"ABC".to_vec()]);
+        assert_eq!(m.extract_cur, b"A");
+        assert!(!m.halt);
+    }
+
+    /// On a file that is not a PE, `__clambc_pedata` reads as zeros up to its
+    /// size, as in ClamAV; past it is out of bounds. On a PE whose header data
+    /// exav lacks, reading it is a gap.
+    #[test]
+    fn pedata_without_a_pe() {
+        let pe = crate::pe::bytecode_pe(include_bytes!("../../tests/testdata/tiny_pe32.exe"));
+        assert_eq!(pe.expect("tiny PE parses").pedata.len(), PEDATA_LEN);
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let c = ctx(b"not a PE", &apis, &globals, &types);
+        let mut m = machine(&c);
+        assert_eq!(m.deref_int(compose(R_PEDATA, 4), 4), 0);
+        assert_eq!(m.deref_int(compose(R_PEDATA, PEDATA_LEN as u32 - 4), 4), 0);
+        assert_eq!(m.read_region(compose(R_PEDATA, 0), 8), vec![0; 8]);
+        assert!(!m.unsupported);
+        m.deref_int(compose(R_PEDATA, PEDATA_LEN as u32 - 3), 4);
+        assert!(m.unsupported && !m.gap);
+
+        // An `MZ` file exav does not take for a PE reads zeros too.
+        let c = ctx(b"MZ\x90\x00", &apis, &globals, &types);
+        let mut m = machine(&c);
+        assert_eq!(m.deref_int(compose(R_PEDATA, 4), 4), 0);
+        assert!(!m.unsupported);
+
+        let mut m = machine(&c);
+        m.pe_missing = true;
+        assert_eq!(m.deref_int(compose(R_PEDATA, 4), 4), 0);
+        assert!(m.gap);
+    }
+
     #[test]
     fn infinite_loop_is_bounded() {
         let blocks = vec![vec![Inst {
@@ -1984,6 +2420,7 @@ mod tests {
         let out = run(&funcs, 0, &ctx(b"", &apis, &globals, &types));
         assert!(out.steps <= MAX_STEPS + 1);
         assert!(out.detection.is_none());
+        assert!(out.incomplete, "a program cut short is not one that found nothing");
     }
 
     #[test]
@@ -2014,5 +2451,108 @@ mod tests {
     fn find_sub_works() {
         assert_eq!(find_sub(b"hello world", b"world"), Some(6));
         assert_eq!(find_sub(b"hello", b"xyz"), None);
+    }
+
+    /// The object table as it was computed over a slice, before the file was a
+    /// source.
+    fn slice_pdf_objs(data: &[u8]) -> Vec<(u32, u32)> {
+        let mut objs = Vec::new();
+        for pos in memchr::memmem::find_iter(data, b" obj") {
+            let mut i = pos;
+            let back_digits = |i: &mut usize| {
+                let s = *i;
+                while *i > 0 && data[*i - 1].is_ascii_digit() {
+                    *i -= 1;
+                }
+                s != *i
+            };
+            if !back_digits(&mut i) || i == 0 || data[i - 1] != b' ' {
+                continue;
+            }
+            i -= 1;
+            let id_end = i;
+            if !back_digits(&mut i) || id_end == i {
+                continue;
+            }
+            let id: u32 = std::str::from_utf8(&data[i..id_end])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            objs.push((id, i as u32));
+        }
+        objs.sort_by_key(|&(_, start)| start);
+        objs
+    }
+
+    fn pdf_like() -> Vec<u8> {
+        let mut d = b"%PDF-1.7\n1 0 obj\n".to_vec();
+        d.extend_from_slice(b"x 12 0 obj 4294967295 0 obj 4294967297 3 obj");
+        d.extend_from_slice(b" 00000000000000000000000000000000000000000000000000000000000000000000000000000000007 0 obj");
+        d.extend_from_slice(b" 100000000000000000000000000000000000000000000000000000000000000000000000000000000000 1 obj");
+        d.extend_from_slice(b"nospace0 obj 5  0 obj  obj 0 obj 9 obj");
+        let mut long = vec![b'1'; 3 * CHUNK];
+        long.extend_from_slice(b" 0 obj");
+        d.extend_from_slice(&long);
+        d.extend_from_slice(b" 42 7 obj");
+        d
+    }
+
+    #[test]
+    fn the_pdf_object_table_is_the_same_read_in_blocks() {
+        let d = pdf_like();
+        let want = slice_pdf_objs(&d);
+        assert!(want.len() >= 6, "the table must hold what the input plants: {want:?}");
+        let cache = crate::byte_source::BlockCache::with_sizes(std::io::Cursor::new(d.clone()), 5, 20)
+            .unwrap();
+        assert_eq!(pdf_ctx(&d).objs, want);
+        assert_eq!(pdf_ctx(&cache).objs, want);
+    }
+
+    /// `read_number` as it was over a slice.
+    fn slice_read_number(file: &[u8], cursor: usize, radix: u32) -> (i64, usize) {
+        let is_digit = |b: u8| b.is_ascii_digit() || (radix == 16 && b.is_ascii_hexdigit());
+        let Some(start) = (cursor..file.len()).find(|&i| is_digit(file[i])) else {
+            return (-1, cursor);
+        };
+        let mut end = start;
+        while end < file.len() && is_digit(file[end]) {
+            end += 1;
+        }
+        let v = std::str::from_utf8(&file[start..end])
+            .ok()
+            .and_then(|s| i64::from_str_radix(s, radix).ok())
+            .unwrap_or(0);
+        (v, end)
+    }
+
+    #[test]
+    fn read_number_reads_what_it_read_over_a_slice() {
+        let mut d = b"abc 123 x 0x7fffffffffffffff z 9223372036854775807 9223372036854775808 ".to_vec();
+        d.extend_from_slice(b"FfEe 00000000000000000000000000000000000000000000042 q");
+        d.extend(std::iter::repeat_n(b'5', 3 * CHUNK));
+        d.extend_from_slice(b" 77");
+        let (apis, globals, types) = (Vec::<(u32, String)>::new(), Globals::default(), TypeTable::default());
+        let cache = crate::byte_source::BlockCache::with_sizes(std::io::Cursor::new(d.clone()), 3, 12)
+            .unwrap();
+        for radix in [10, 16] {
+            for src in [&d as &dyn ByteSource, &cache] {
+                let c = Ctx {
+                    file: src,
+                    ..ctx(&d, &apis, &globals, &types)
+                };
+                let mut m = machine(&c);
+                let mut cursor = 0;
+                loop {
+                    let want = slice_read_number(&d, cursor, radix);
+                    m.cursor = cursor;
+                    let got = m.read_number(radix);
+                    assert_eq!((got, m.cursor), want, "radix {radix} from {cursor}");
+                    if want.0 == -1 {
+                        break;
+                    }
+                    cursor = want.1;
+                }
+            }
+        }
     }
 }

@@ -11,7 +11,8 @@
 //! Fixtures are the `unarc-rs` project's own test archives (MIT OR Apache-2.0),
 //! written by real `zoo`; see `NOTICE`.
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/zoo/{name}", env!("CARGO_MANIFEST_DIR"));

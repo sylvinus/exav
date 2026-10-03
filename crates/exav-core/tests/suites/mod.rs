@@ -10,6 +10,7 @@ mod allmatch_parity;
 mod authenticode;
 #[cfg(feature = "base64scan")]
 mod base64_scan;
+mod broken_executable;
 #[cfg(feature = "unstable-internals")]
 mod bytecode_gating;
 // NB: gate container suites on `all-formats`, never on exav-core's own per-format
@@ -35,12 +36,16 @@ mod matryoshka;
 #[cfg(feature = "all-formats")]
 mod multi_volume;
 #[cfg(feature = "all-formats")]
+mod one_scan;
+#[cfg(feature = "all-formats")]
 mod ooxml_container;
 #[cfg(feature = "all-formats")]
 mod oversize_container;
 mod salvage;
+mod size_caps;
 mod tar_size_terminator;
 mod target_flash;
+mod target_text;
 #[cfg(feature = "all-formats")]
 mod tdb_attributes;
 mod untyped_container_dispatch;

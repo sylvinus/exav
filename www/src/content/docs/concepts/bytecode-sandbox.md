@@ -1,93 +1,102 @@
 ---
 title: Bytecode sandbox
-description: What ClamAV .cbc bytecode signatures are, and why exav's memory-safe, non-JIT interpreter removes the code-execution class that has affected ClamAV.
+description: What ClamAV .cbc bytecode signatures are, and why exav's memory-safe interpreter with no JIT removes the code-execution class that has affected ClamAV.
 ---
 
-ClamAV's most expressive signature type is **bytecode**: a small program (written
-in C, compiled to a custom VM bytecode, shipped as a `.cbc` file in
-`bytecode.cvd`) that runs against a candidate file and decides whether it's
-malicious. It expresses detection logic that pattern and logical signatures
-can't — most valuably, a handful of **unpackers** that deobfuscate packed PEs so
-the other millions of signatures can match the payload.
+ClamAV's most expressive signature type is bytecode: a small program (written in
+C, compiled to a custom VM bytecode, shipped as a `.cbc` file in `bytecode.cvd`)
+that runs against a candidate file and decides whether it is malicious. It
+expresses logic that pattern and logical signatures cannot, most usefully a
+handful of unpackers that deobfuscate packed PEs so the other signatures can
+match the payload. What an unpacker produces is scanned like an archive member:
+through the whole pipeline, under the same depth and scan budgets.
 
-exav implements a reader and a **memory-safe, sandboxed interpreter** for this
-format. The headline is not extra coverage (the live DB is only 85 programs) —
-it's that exav runs them **without the code-execution class** that has
-affected ClamAV's bytecode subsystem.
+exav implements a reader and a memory-safe, sandboxed interpreter for this
+format. The live database holds few programs, so the point is less extra
+coverage than running them without the code-execution class that has affected
+ClamAV's bytecode subsystem.
 
 ## The format, in brief
 
-A `.cbc` file is line-oriented: a `ClamBC` header, a **trigger line** (a `.ldb`
-logical signature — the program runs *only* when this matches a file), and
-records for types, API declarations, globals, function headers, basic-block
-instruction streams, and strings. The instruction set is an LLVM-IR-like SSA
-form. Programs cannot make syscalls; they reach the outside world only through a
-fixed **host API** — a table of **107 functions**, identical in ClamAV 1.4.3 and
-1.5.3: `read`/`seek`/`file_find` to inspect the file, PE/PDF/JSON accessors,
-hashing, and `setvirusname` to report a hit.
+A `.cbc` file is line-oriented: a `ClamBC` header, a trigger line (a `.ldb`
+logical signature; the program runs only when it matches, or on every file of
+one type for a program that hooks it instead), and records for types,
+API declarations, globals, function headers, basic-block instruction streams
+and strings. The instruction set is an SSA form close to LLVM IR. Programs cannot
+make syscalls; they reach the outside world only through a fixed host API of 107
+functions (the same in ClamAV 1.4.3 and 1.5.3): `read`/`seek`/`file_find` to
+inspect the file, PE/PDF/JSON accessors, hashing, and `setvirusname` to report a
+hit. The trigger side comes for free with exav's `.ldb` engine.
 
-The trigger side is free for exav because it already has a full `.ldb` engine.
+## Why the attack surface is smaller
 
-## Why exav's interpreter has a smaller attack surface
+ClamAV's bytecode subsystem has a documented code-execution history, because it
+runs database-supplied programs in memory-unsafe C and, historically, through an
+LLVM JIT. An attacker needs to get a `.cbc` file loaded, from a third-party feed
+for instance:
 
-ClamAV's bytecode subsystem has a **documented code-execution history**, because
-it executes DB-supplied programs in memory-unsafe C and historically via an LLVM
-JIT:
-
-- **[CVE-2020-37167](https://www.cve.org/CVERecord?id=CVE-2020-37167)** — weak
-  validation in the bytecode interpreter's function-name processing (CWE-94 code
-  injection) lets a crafted `.cbc` corrupt the VM's memory and chain to
-  arbitrary code execution in the scanner process, with a
-  [public ROP exploit](https://www.exploit-db.com/exploits/47687) (exploit-db
-  47687, the `bytecode_vm` sandbox escape). **CVSS 8.4**; ClamAV before
-  0.103.0. Also tracked by
+- **[CVE-2020-37167](https://www.cve.org/CVERecord?id=CVE-2020-37167):** weak
+  validation of function names in the ClamBC bytecode interpreter lets a
+  crafted `.cbc` manipulate the interpreter; the advisory rates it CVSS 8.4 and
+  lists ClamAV before 0.103.0. A
+  [public exploit](https://www.exploit-db.com/exploits/47687) (exploit-db 47687,
+  `bytecode_vm`) reaches code execution through the bytecode VM, demonstrated
+  with the `clambc` tool. Also tracked by
   [Ubuntu](https://ubuntu.com/security/CVE-2020-37167).
-- The optional **LLVM JIT** generated and ran native code from bytecode — a large
+- The optional LLVM JIT generated and ran native code from bytecode, a large
   attack surface Cisco has been moving away from.
 
 exav removes these failure modes by construction:
 
 | Risk in ClamAV's C VM | exav |
 |---|---|
-| Memory corruption in the VM (the CVE-2020-37167 class) | **Pure safe Rust, no `unsafe`** — every memory access is a bounds-checked slice; an out-of-range index panics into isolation, it cannot corrupt memory |
-| Native code generation from bytecode (JIT spray, W^X issues) | **No JIT, ever** — interpret only |
-| A program escaping the sandbox (syscalls, host memory) | The program sees only bounded `Vec`s and a fixed read-only file API — no syscalls, no host pointers |
-| Runaway program (CPU/memory exhaustion) | **Instruction budget**, scratch-memory cap, and call-depth limit |
-| A parser/VM bug taking down the scan | **`catch_unwind` per program** (and per file) — one bad program is skipped, the scan continues |
-| Malformed/hostile `.cbc` | Fallible parser (no panics); 100% of the live DB parses cleanly; a program not fully understood is **never executed** |
+| Memory corruption in the VM (the CVE-2020-37167 class) | Safe Rust with no `unsafe`: every access to program memory is bounds-checked, so a bad index cannot reach memory outside it |
+| Native code generation from bytecode | No JIT: interpretation only |
+| A program escaping the sandbox (syscalls, host memory) | The program sees only bounded buffers and a fixed read-only file API: no syscalls, no host pointers |
+| A runaway program | An instruction budget, a scratch-memory cap and a call-depth limit |
+| A VM bug taking down the scan | `catch_unwind` per program: a bad program is stopped and the scan continues |
+| A malformed or hostile `.cbc` | A fallible parser with no panics; a program not fully understood is never executed |
 
-The net: the worst a hostile or buggy `.cbc` can do to exav is *be skipped or
-time out*. In ClamAV the worst case has been *arbitrary code execution*. For anyone
-who disables ClamAV bytecode for safety, exav offers the capability **without
-that trade-off**.
+The worst a hostile or buggy `.cbc` can do to exav is be skipped or be stopped.
+A program exav stops before it finished (out of instructions or call depth, an
+opcode or API exav does not model, more than 256 MiB written to one extracted
+file, a read of the PE header data `__clambc_pedata` on a PE that exav has no
+header data for, or a VM panic) makes the scan `LIMITS-EXCEEDED` unless
+something is found, since what it would have found is unknown. A program that
+fails on its own (an out-of-bounds access, a division by zero, an abort) ends
+there as it would in ClamAV, and its detection is discarded; so is that of one
+that asks `disasm_x86` about bytes the decoder does not know, since exav cannot
+tell an invalid instruction from one outside its decoder. Except after a VM
+panic, what the program wrote before it stopped is still scanned, as ClamAV
+scans the output of a run that failed. A `write` that would take one extracted
+file past `--max-object-bytes`, or the output past what is left of
+`--max-matcher-bytes`, fails with -1 as ClamAV's does at its own limits: the
+program carries on, and the scan is `LIMITS-EXCEEDED` unless something is
+found. On a file
+that is not a PE, `__clambc_pedata` reads as zeros, as in ClamAV. exav can run
+these programs with the code-execution risk removed, for anyone who disables
+ClamAV bytecode for safety.
 
 ## Trigger-gated execution, and the API subset
 
-Execution is **live in the normal scan path**, trigger-gated per program: a
-program runs only when its logical-signature trigger matches. The gating is
-per-program, not a global off switch.
+Execution is live in the normal scan path and gated per program: a program runs
+only when its logical-signature trigger matches. The few programs with no
+trigger (two PDF hooks in the current `bytecode.cvd`) run on every file of the
+type they hook.
 
-exav implements **34 of the 107 host APIs**. The other 73 are present as
-**fail-safe stubs** rather than as a reason to skip the program: a call to one
-returns a conservative value and is recorded, so the program still runs to the
-end. Every stub that actually fabricates a result is surfaced in the run's
-outcome (and warned under `EXAV_BC_WARN`), because a verdict that rests partly
-on fiction must never look like one that does not.
-
-What that buys, measured on a live `bytecode.cvd`: exav parses **100% of the 85
-programs** and **all 85 execute to completion** with no unsupported opcode.
-Across 400 real malware samples, exactly **one** stub was ever reached
-(`get_environment`). A `.cbc` header declares a `maxapi` *ceiling*, not a call
-list — which is why a third of the table has been enough for all of the shipped
-programs so far. The
-[full per-group breakdown of the 56 unimplemented reachable APIs](/project/comparison-with-clamav/#bytecode-host-apis--34-of-107)
-is in the ClamAV gap list.
+exav implements 34 of the 107 host API functions. The rest are fail-safe
+stubs rather than a reason to skip a program: a call returns a conservative value
+and is recorded, so the program still runs to the end. A stub that fabricates a
+result is recorded in the run's outcome and, with the `EXAV_DEBUG_BC_WARN`
+environment variable set, printed to stderr. On a live
+`bytecode.cvd`, every program parses and runs to completion with no unsupported
+opcode, and in practice programs rarely reach a stub: a `.cbc` header declares a
+`maxapi` ceiling, not a call list. The per-API breakdown is in the repository's
+[`docs/BYTECODE.md`](https://github.com/sylvinus/exav/blob/main/docs/BYTECODE.md).
 
 ## Real-world weight
 
-Numerically the 85 programs are 0.002% of ~3.7M signatures, but uneven in value:
-the ~6 **unpackers** matter most (missing one silently weakens detection
-across many packed samples), the polymorphic-family checks each catch a whole
-family, and a long tail of ~36 are legacy single-CVE checks. The detection delta
-is modest — which is why exav's win here is the memory-safe, non-JIT sandbox,
-more than the raw extra coverage.
+Bytecode programs are a tiny fraction of the signatures, and uneven in value: the
+few unpackers matter most (missing one weakens detection across many packed
+samples), the polymorphic-family checks each cover a whole family, and a long
+tail are legacy single-CVE checks.

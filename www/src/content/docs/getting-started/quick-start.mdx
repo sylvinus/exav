@@ -5,133 +5,126 @@ description: Fetch ClamAV signatures, run your first exav scan, and understand t
 
 import { Steps, Aside } from '@astrojs/starlight/components';
 
-This walks you from a freshly-built binary to a working scan. You'll need
+This walks you from a freshly built binary to a working scan. You need
 [exav installed](/getting-started/installation/) first.
 
 <Aside type="caution" title="exav ships no signatures">
-exav never bundles the GPL-licensed ClamAV signature database. With no real
-signatures loaded, **exav refuses to run** rather than report clean on near-zero
-coverage. You fetch signatures yourself — that's the first step below.
+exav does not bundle the GPL-licensed ClamAV signature database, and with no real
+signatures loaded it refuses to run. Fetching signatures is the first step below.
 </Aside>
 
 <Steps>
 
-1. **Get ClamAV signatures** with Cisco's own updater, onto your own machine:
+1. **Get ClamAV signatures** with Cisco's own updater:
 
    ```sh
-   pip install cvdupdate
-   cvd update                  # or `freshclam`
+   pipx install cvdupdate
+   cvd update
    ```
 
-   This populates `~/.cvdupdate/database` with `main.cvd` / `daily.cvd` /
+   This populates `~/.cvdupdate/database` with `main.cvd`, `daily.cvd` and
    `bytecode.cvd`. See [Signatures](/guides/signatures/) for the licensing
    background and third-party feeds.
 
-2. **Scan a file**, pointing `-d` at that directory:
+2. **Tell exav where they are.** exav loads `--sig-dir` (default
+   `/var/lib/exav`) when `-d` is not given; point it at the new directory once
+   for this shell:
 
    ```sh
-   exav -d ~/.cvdupdate/database suspicious.bin
+   export EXAV_SIG_DIR=~/.cvdupdate/database
    ```
 
-   Output is `clamscan`-compatible:
+   If `freshclam` already keeps a database current, use its directory instead
+   (usually `/var/lib/clamav`).
+
+3. **Check that detection works** with the EICAR test file, which is harmless:
+
+   ```sh
+   printf '%s%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-' \
+     'TEST-FILE!$H+H*' > eicar.com
+   exav eicar.com
+   ```
 
    ```console
-   suspicious.bin: Win.Trojan.Agent-1234 FOUND
+   eicar.com: Eicar-Test-Signature FOUND
    ```
 
-   or, for a clean file:
+   A `SCAN SUMMARY` block follows the result lines. This first run parses the raw signatures, which takes a while and needs
+   memory to spare (see [what it costs](/guides/prebuilt-database/#what-it-costs)).
+   If the process dies with no message, it ran out of memory. exav always knows
+   EICAR, so the check that the ClamAV signatures loaded is `Known viruses` in
+   the summary: it should be in the millions.
+
+4. **Scan a file.** The output follows `clamscan`'s format:
+
+   ```sh
+   exav suspicious.bin
+   ```
 
    ```console
    suspicious.bin: OK
    ```
 
-3. **Scan a directory** — recursive by default, printing only errors and
-   detections:
+5. **Scan a directory.** It is recursive by default; `--quiet` prints only
+   detections, partial results and errors:
 
    ```sh
-   exav -d ~/.cvdupdate/database --quiet /var/www
+   exav --quiet /var/www
    ```
 
-4. **Stream from stdin** — constant memory, any size, no temp file:
+6. **Scan stdin** with `-`:
 
    ```sh
-   cat backup.tar.gz | exav -d ~/.cvdupdate/database -
-   aws s3 cp s3://bucket/backup-50gb.tar.gz - | exav -d ~/.cvdupdate/database -
+   cat backup.tar.gz | exav -
    ```
 
 </Steps>
 
-## Alternate: let exav fetch the signatures itself
+## Exit codes
 
-If your build has [HTTP support](/reference/feature-flags/#adding-http-support),
-exav can pull Cisco's CVDs directly —
-replacing step 1 above, with no `cvdupdate` or `freshclam` involved:
-
-```sh
-export EXAV_SIG_SOURCES=https://database.clamav.net/
-exav -d ~/.exav-db --auto-update suspicious.bin
-```
-
-The trailing slash makes the value a mirror base, expanding to
-`main`/`daily`/`bytecode.cvd`; an exact `…/daily.cvd` URL is fetched verbatim
-instead. Sources land validated in `-d`, which is then loaded for the scan,
-and `--auto-update` keeps them current for as long as the process runs. This
-needs a `--features http` build — see [Installation](/getting-started/installation/).
-
-## Understand the exit code
-
-Each code is a status word, and the status is the last word on the result line:
-
-| Exit | Status | Meaning |
-|---|---|---|
-| `0` | `OK` | Clean — every file was fully scanned and nothing matched. |
-| `1` | `FOUND` | At least one detection. |
-| `2` | `ERROR` | exav could not do its job: an unreadable path, a database that would not load. |
-| `3` | `PARTIAL` | exav worked, and something could not be fully examined — `LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`. |
-
-<Aside type="note">
-`3` is the deliberate difference from `clamscan`, which reports `OK` and exits
-`0` for a file it could not fully scan. This is the
-[never-silent-clean invariant](/concepts/design-principles/#never-a-silent-clean)
-in action: a CI job should treat `3` as "not a pass", and `2` still means what it
-means in ClamAV — the scanner itself failed. To fold `3` into another status, see
-[`--partial-as`](/reference/cli/#what-an-unscannable-object-becomes).
-</Aside>
+The status is the last word on each result line: `0` `OK`, `1` `FOUND`, `2`
+`ERROR` (exav could not do its job), `3` `PARTIAL` (something could not be fully
+examined, where `clamscan` would say `OK`). A CI job should not treat `3` as a
+pass. See [which code a run exits with](/reference/verdicts/#process-exit-code).
 
 ## Faster startup: build a database once
 
-Loading Cisco's raw ClamAV database (`main.cvd`+`daily.cvd`) builds a large
-in-memory automaton (tens
-of seconds, several GB of transient RAM). Do that work once and reuse it:
+Loading the raw signatures parses millions of them on every start. Do it once
+and reuse the result:
 
 ```sh
-exav -d ~/.cvdupdate/database --build-db exav.exavdb   # heavy, run daily in CI
-exav -d exav.exavdb /data                              # ~sub-second cold start
+exav --build-db exav.exavdb     # run daily, e.g. in CI
+exav -d exav.exavdb /data       # fast cold start
 ```
 
-See the [prebuilt database guide](/guides/prebuilt-database/).
+Rebuild the `.exavdb` after upgrading exav if its format changed (the load says
+so). See the [prebuilt database guide](/guides/prebuilt-database/).
 
 ## Run it as a daemon
 
-Load the database once and serve scans over a socket, so callers pay no
-per-scan cold-start cost:
+Load the database once and serve scans over a socket, so callers pay no per-scan
+load cost. The daemon stays in the foreground, so run the client from a second
+terminal:
 
 ```sh
-exav --listen /run/user/1000/exav.sock -d exav.exavdb   # load once, serve
-exav --connect /run/user/1000/exav.sock /data           # client: no load cost
-clamdscan --stream file.bin                    # the official ClamAV client works too
+exav --listen /tmp/exav.sock -d exav.exavdb    # load once, serve
+exav --connect /tmp/exav.sock /data            # client
 ```
 
-The direction is the flag: `--listen` accepts connections, `--connect` makes
-one. The protocol travels in the address, so `--listen icap://0.0.0.0:1344`
-serves ICAP from the same binary — and naming both serves both from one process
-over one loaded database.
+A daemon can also keep its signatures current itself, fetching from a mirror
+with `--auto-update` (a `--features http` build); see
+[Signatures](/guides/signatures/#built-in-updater---auto-update).
+
+`--listen` accepts connections and `--connect` makes one. The protocol travels in
+the address: `--listen icap://0.0.0.0:1344` serves ICAP, and naming both serves
+both from one process. ClamAV's own `clamdscan` works too, given a `clamd.conf`
+whose `LocalSocket` or `TCPSocket` points at the daemon.
 
 See the [daemon guide](/guides/daemon/).
 
 ## Next
 
-- [Scanning](/guides/scanning/) — files, directories, output formats, exit codes.
-- [Migrating from ClamAV](/guides/migrating-from-clamav/) — replace `clamscan` /
+- [Scanning](/guides/scanning/): files, directories, output formats.
+- [Migrating from ClamAV](/guides/migrating-from-clamav/): replace `clamscan` and
   `clamd` in place.
-- [CLI reference](/reference/cli/) — every flag.
+- [CLI reference](/reference/cli/): every flag.

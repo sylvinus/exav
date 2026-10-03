@@ -65,7 +65,7 @@ fn ppt_with(records: &[u8]) -> Vec<u8> {
 
 fn members(blob: &[u8]) -> Vec<exav_unpack::Entry> {
     let mut budget = Budget::new(Limits::default());
-    extract(Format::Ole, blob, &mut budget).expect("ppt extracts")
+    extract(Format::Ole, &blob, &mut budget).expect("ppt extracts")
 }
 
 fn has_marker(entries: &[exav_unpack::Entry]) -> bool {

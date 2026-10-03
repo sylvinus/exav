@@ -20,6 +20,9 @@ pub(super) enum Decision {
     /// tag (`LIMITS-EXCEEDED`, `UNSCANNABLE`, `PASSWORD-PROTECTED`) and the
     /// detail behind it.
     Partial(&'static str, String),
+    /// The scan itself failed. Blocked whatever `--partial-as` says: the
+    /// object was not examined at all.
+    Error(String),
 }
 
 impl Decision {
@@ -52,7 +55,7 @@ impl Decision {
         match self {
             Self::Clean => crate::metrics::Category::Clean,
             Self::Infected(_) => crate::metrics::Category::Infected,
-            Self::Partial(_, _) => crate::metrics::Category::Partial,
+            Self::Partial(_, _) | Self::Error(_) => crate::metrics::Category::Partial,
         }
     }
 
@@ -78,6 +81,15 @@ impl Decision {
                 headers.extend(partial_headers(tag, reason));
                 headers
             }
+            Self::Error(reason) => {
+                let mut headers = Vec::with_capacity(3);
+                if policy == InfectionHeader::Blocks {
+                    headers.push(infection_found("Heuristics.Exav.ScanError"));
+                }
+                headers.push(("X-Exav-Status", "ERROR".to_string()));
+                headers.push(("X-Exav-Reason", header_safe(reason)));
+                headers
+            }
         }
     }
 
@@ -91,7 +103,7 @@ impl Decision {
     /// block, which is the opposite of what the operator asked for.
     fn pass_headers(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::Clean | Self::Infected(_) => Vec::new(),
+            Self::Clean | Self::Infected(_) | Self::Error(_) => Vec::new(),
             Self::Partial(tag, reason) => partial_headers(tag, reason),
         }
     }
@@ -102,6 +114,7 @@ impl Decision {
             Self::Clean => "clean".to_string(),
             Self::Infected(name) => format!("infected: {}", header_safe(name)),
             Self::Partial(tag, reason) => format!("{tag}: {}", header_safe(reason)),
+            Self::Error(reason) => format!("ERROR: {}", header_safe(reason)),
         }
     }
 }
@@ -343,9 +356,13 @@ pub(super) fn options(cfg: &IcapConfig) -> Response {
         .header("Methods", "REQMOD, RESPMOD")
         .header("Service", cfg.service_label.clone())
         .header("Allow", "204")
-        .header("Preview", cfg.preview_size.to_string())
-        .header("Max-Connections", cfg.max_connections.to_string())
-        .header("Options-TTL", cfg.options_ttl.to_string());
+        .header("Max-Connections", cfg.max_connections.to_string());
+    if let Some(n) = cfg.preview_size {
+        r = r.header("Preview", n.to_string());
+    }
+    if let Some(ttl) = cfg.options_ttl {
+        r = r.header("Options-TTL", ttl.to_string());
+    }
     if !cfg.transfer_preview.is_empty() {
         r = r.header("Transfer-Preview", cfg.transfer_preview.clone());
     }
@@ -419,6 +436,13 @@ fn block_page(decision: &Decision) -> String {
                 "exav could not fully examine this object ({}): {}. \
                  An object that could not be examined is not known to be safe, so it is blocked.",
                 html_escape(tag),
+                html_escape(reason)
+            ),
+        ),
+        Decision::Error(reason) => (
+            "Scan failed",
+            format!(
+                "exav could not scan this object: {}. It is blocked.",
                 html_escape(reason)
             ),
         ),

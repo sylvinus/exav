@@ -23,44 +23,48 @@ name = "exav"
 path = "src/main.rs"
 
 [features]
-default = ["yara", "all-formats", "decrypt", "dlp", "icap"]
+default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap", "image-hash"]
 # ICAP (RFC 3507) server, so exav can stand in for a `c-icap` container at a
-# proxy's adaptation hook. ON by default — pure-Rust, std-only, no extra crates
-# — because the published image has to be able to serve it. It still binds
-# nothing unless `--icap` asks it to.
+# proxy's adaptation hook. On by default (pure Rust, std-only, no extra crates)
+# because the published image has to be able to serve it. It still binds
+# nothing unless `--listen icap://...` asks it to.
 icap = []
-# Full YARA rule matching via the native engine in exav-core. ON by default —
-# pure-Rust, no runtime codegen. Disable with `--no-default-features` for a
-# smaller build (~13 fewer crates: drops the YARA parser + regex-automata).
+# YARA rule matching via the native engine in exav-core. On by default; pure
+# Rust, no runtime codegen. Without it, rule files load but never match.
 yara = ["exav-core/yara"]
 # Lets a scanned file ask a decoder to panic, abort or exhaust the stack, so the
 # tests can check what the CLI reports when one does. A crash that a caller
 # cannot tell from a clean scan is the worst outcome exav has, and that is only
 # observable from outside the process. Never enabled by a shipped build.
 testing-faults = ["exav-core/testing-faults"]
-# HTTP(S) support. OFF by default so the standard build is 100% pure-Rust and
-# links no TLS stack — `ureq → rustls → ring` is the only C/asm in the tree.
-# Split into two independently-selectable halves so a deployment can take the
-# signature updater WITHOUT exposing the network-facing scan verb (or vice versa):
+# HTTP(S) support. Off by default so the standard build is pure Rust and links
+# no TLS stack (`ureq -> rustls -> ring` is the only C/asm in the tree).
+# Split into two halves so a deployment can take the signature updater without
+# the network-facing scan verb, or the reverse:
 #
-#   * `http-scan`   — scan an `http(s)://` argument + the daemon `SCANURL` command.
-#                     This lets a daemon *client* make the daemon fetch a URL, so
-#                     leave it off on an updater-only or untrusted-client daemon.
-#   * `http-update` — what `--auto-update` fetches with: `--sig-sources` (exact
-#                     URLs, CVD mirror bases, or a file of either) and `--db-url`
-#                     (pull a prebuilt `.exavdb`). Pulls the `exav-update` crate.
+#   * `http-scan`:   scan an `http(s)://` argument, and the daemon `SCANURL`
+#                    command. This lets a daemon client make the daemon fetch a
+#                    URL, so leave it off on an updater-only or untrusted-client
+#                    daemon.
+#   * `http-update`: what `--auto-update` fetches with: `--sig-sources` (exact
+#                    URLs, CVD mirror bases, or a file of either) and `--db-url`
+#                    (a prebuilt `.exavdb`). Pulls the `exav-update` crate.
 #
-# `http` enables both (unchanged meaning; the published image builds with it).
+# `http` enables both; the published image builds with it.
 http = ["http-scan", "http-update"]
 http-scan = ["exav-core/http"]
 http-update = ["dep:exav-update"]
-checksums = ["exav-core/checksums"]
-# DLP structured-data heuristic (credit-card / SSN counting). Enables the
-# `--structured-cc-count` / `--structured-ssn-count` flags. Tiny, pure-Rust.
+# DLP structured-data heuristic (credit-card / SSN counting): what
+# `--dlp-credit-cards` / `--dlp-ssns` run. Tiny, pure-Rust.
 dlp = ["exav-core/dlp"]
+# The phishing heuristic `--detect phishing` runs. Tiny, pure-Rust.
+phishing = ["exav-core/phishing"]
+# `fuzzy_img#` subsignatures, through exav-imagehash and its image decoders.
+# Without it they load as unsupported, and no image is ever decoded.
+image-hash = ["exav-core/image-hash"]
 decrypt = ["exav-core/decrypt"]
 
-# Archive/container formats, forwarded to exav-core → exav-unpack. `all-formats`
+# Archive/container formats, forwarded to exav-core, then exav-unpack. `all-formats`
 # (in `default`) is every extractor; pick individual formats for a smaller
 # binary (e.g. `--no-default-features --features yara,zip`).
 all-formats = ["exav-core/all-formats"]
@@ -128,12 +132,11 @@ screnc = ["exav-core/screnc"]
 pe-emu = ["exav-core/pe-emu"]
 
 [dependencies]
-exav-core = { path = "../exav-core", version = "0.0.1", default-features = false }
+exav-core = { path = "../exav-core", version = "0.0.2", default-features = false }
 # Standalone signature updater (its own TLS stack), enabled by the `http`
 # feature so the default pure-Rust build never links it.
-exav-update = { path = "../exav-update", version = "0.0.1", optional = true }
+exav-update = { path = "../exav-update", version = "0.0.2", optional = true }
 clap.workspace = true
-anyhow.workspace = true
 walkdir.workspace = true
 libc = "0.2.186"
 regex = "1.12.4"
@@ -168,7 +171,7 @@ assets = [
     ["target/release/exav", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/exav/README.md", "644"],
     ["../../NOTICE", "usr/share/doc/exav/NOTICE", "644"],
-    ["../../packaging/exav-clamd.service", "lib/systemd/system/exav-clamd.service", "644"],
+    ["../../packaging/exav.service", "lib/systemd/system/exav.service", "644"],
 ]
 
 

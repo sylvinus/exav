@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update"]
+members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update", "crates/exav-imagehash"]
 exclude = ["fuzz", "crates/exav-unpack-wasm"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
 homepage = "https://exav.org"
-# Checked by `make msrv` rather than asserted — a floor nothing verifies drifts.
+# Checked by `make msrv` rather than asserted: a floor nothing verifies drifts.
 #
 # The number is set by a dependency, not by this code: `yara-x-parser` declares
 # 1.91, so the resolver refuses anything older for a default build. exav's own
@@ -24,12 +24,10 @@ keywords = ["antivirus", "clamav", "malware", "scanner", "security"]
 categories = ["command-line-utilities", "filesystem"]
 
 [workspace.dependencies]
-aho-corasick = "1.1"
 # `env` lets every flag name the environment variable it falls back to, so the
 # precedence (flag, then environment, then default) is one rule the parser
 # applies and `--help` prints, rather than per-flag code.
 clap = { version = "4.5", features = ["derive", "env"] }
-anyhow = "1"
 walkdir = "2.5"
 
 # Catch integer overflow in release too: on hostile input a silent wraparound
@@ -41,7 +39,7 @@ overflow-checks = true
 # Tests keep full debug info and debug assertions; only codegen changes.
 #
 # Rationale: much of the suite decompresses megabytes (RAR, 7z, CAB, XZ, disk
-# images), and at opt-level 0 that decompression — not the assertions — is what
+# images), and at opt-level 0 that decompression, not the assertions, is what
 # the wall clock measures. `opt-level = 1` is the cheap tier: it captures most of
 # the run-time win without the compile time, and without the rustc memory that
 # level 2/3 demand on the big crates.
@@ -49,7 +47,7 @@ overflow-checks = true
 # Set in BOTH places on purpose. `[profile.test]` covers the workspace's own
 # crates; `package."*"` covers everything that is not a workspace member. Drop
 # the second stanza and the ~400 third-party crates fall back to the `dev`
-# profile's opt-level 0 — which is where the slow test runs came from, since the
+# profile's opt-level 0, which is where the slow test runs came from, since the
 # codecs doing the actual decompression all live in those crates.
 [profile.test]
 opt-level = 1

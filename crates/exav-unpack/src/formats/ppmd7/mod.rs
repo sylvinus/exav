@@ -26,7 +26,9 @@ mod rangedec;
 mod tagged_offset;
 
 pub(crate) use model::Ppmd7;
+#[cfg(feature = "rar")]
 pub(crate) use rangedec::RarRangeDecoder;
+#[cfg(any(feature = "sevenz", test))]
 pub(crate) use rangedec::SevenZRangeDecoder;
 
 /// A range decoder symbol decode returned this end-of-stream marker.
@@ -34,9 +36,13 @@ pub(crate) const SYM_END: i32 = -1;
 /// A range decoder symbol decode hit a model/range inconsistency.
 pub(crate) const SYM_ERROR: i32 = -2;
 
+#[cfg_attr(not(feature = "rar"), allow(dead_code))]
 pub(crate) const PPMD7_MIN_ORDER: u32 = 2;
+#[cfg_attr(not(feature = "rar"), allow(dead_code))]
 pub(crate) const PPMD7_MAX_ORDER: u32 = 64;
+#[cfg_attr(not(feature = "rar"), allow(dead_code))]
 pub(crate) const PPMD7_MIN_MEM_SIZE: u32 = 2048;
+#[cfg_attr(not(feature = "rar"), allow(dead_code))]
 pub(crate) const PPMD7_MAX_MEM_SIZE: u32 = u32::MAX - 12 * 3;
 
 /// Decode a complete 7z-framed PPMd7 stream of exactly `out_len` bytes. Used by
@@ -78,6 +84,7 @@ pub(crate) trait RangeDec {
     fn out_of_data(&self) -> bool;
     /// Number of input bytes consumed so far (for resuming a shared cursor after
     /// a RAR3 PPMd→LZSS conversion).
+    #[cfg_attr(not(feature = "rar"), allow(dead_code))]
     fn bytes_consumed(&self) -> usize;
 }
 

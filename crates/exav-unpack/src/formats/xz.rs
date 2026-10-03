@@ -1,24 +1,25 @@
 use crate::*;
 
-pub(crate) fn extract_xz<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    budget.count_entry()?;
-    let cap = budget.reserve()?;
-    let (out, truncated) = decode_xz(data, cap)?;
-    if truncated {
-        return Err(LimitHit::new("xz member exceeds budget".to_string()));
-    }
-    ratio_guard(data.len() as u64, out.len() as u64, budget)?;
-    budget.commit(out.len() as u64);
-    Ok(visit(Entry::new("xz-content".to_string(), out), budget))
-}
-
 /// The dictionary size exav is willing to allocate for an XZ stream. Matches the
 /// decoder's own allocation cap below — one number, not two that can drift.
 pub const XZ_MAX_DICT: u64 = 64 * 1024 * 1024;
+
+/// Walk an `.xz` file: one member, every stream decoded in turn as it is read.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    use crate::stream::{emit_stream, single_meta};
+    budget.count_entry()?;
+    let mut dec = content_reader(src);
+    emit_stream(
+        &single_meta("xz-content", src, None),
+        &mut dec,
+        budget,
+        visit,
+    )
+}
 
 /// The dictionary size an XZ stream *declares*, if it can be read from the first
 /// block's LZMA2 filter properties.
@@ -101,25 +102,21 @@ fn skip_varint(d: &[u8], p: usize) -> Option<usize> {
 /// decompressing to gigabytes be scanned without ever being held: the file on
 /// disk is bounded, its output is not.
 ///
-/// Concatenated streams need no special handling here — the decoder resets at
+/// Concatenated streams need no special handling here: the decoder resets at
 /// each end-of-stream and carries on, so multi-stream files stream like any
-/// other. (bzip2 cannot do this: recovering from a spurious stream magic needs
-/// re-reading the whole input, which a reader that has already emitted bytes
-/// cannot do.)
-pub(crate) fn content_reader(data: &[u8]) -> XzReader<'_> {
-    XzReader {
-        data,
-        input_pos: 0,
-        decoder: xz4rust::XzDecoder::with_alloc_dict_size(8192, XZ_MAX_DICT as usize),
-        staged: Vec::new(),
-        taken: 0,
-        done: false,
-    }
+/// other.
+pub(crate) fn content_reader(
+    data: &dyn crate::source::ByteSource,
+) -> XzReader<crate::source::Reader<'_>> {
+    XzReader::new(crate::source::Reader::new(data))
 }
 
-pub(crate) struct XzReader<'a> {
-    data: &'a [u8],
-    input_pos: usize,
+/// Every stream of an `.xz` input read from `input`, decoded as it is read.
+pub(crate) struct XzReader<R> {
+    input: R,
+    inbuf: Vec<u8>,
+    in_pos: usize,
+    in_len: usize,
     /// The decoder owns its dictionary allocation, so its lifetime is
     /// independent of the input; `'static` keeps it out of the caller's way.
     decoder: xz4rust::XzDecoder<'static>,
@@ -131,7 +128,37 @@ pub(crate) struct XzReader<'a> {
     done: bool,
 }
 
-impl std::io::Read for XzReader<'_> {
+impl<R: std::io::Read> XzReader<R> {
+    pub(crate) fn new(input: R) -> Self {
+        XzReader {
+            input,
+            inbuf: vec![0; 8192],
+            in_pos: 0,
+            in_len: 0,
+            decoder: xz4rust::XzDecoder::with_alloc_dict_size(8192, XZ_MAX_DICT as usize),
+            staged: Vec::new(),
+            taken: 0,
+            done: false,
+        }
+    }
+
+    /// Refill the input buffer once it is used up. `false` at the end of the
+    /// input.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        if self.in_pos == self.in_len {
+            self.in_pos = 0;
+            self.in_len = loop {
+                match self.input.read(&mut self.inbuf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    r => break r?,
+                }
+            };
+        }
+        Ok(self.in_pos < self.in_len)
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for XzReader<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if self.taken < self.staged.len() {
@@ -145,33 +172,36 @@ impl std::io::Read for XzReader<'_> {
             }
             self.staged.clear();
             self.taken = 0;
-            let mut buf = [0u8; 8192];
-            let feed = self.data[self.input_pos..].len().min(buf.len());
-            if feed == 0 {
+            if !self.fill()? {
                 self.done = true;
                 return Ok(0);
             }
+            let mut buf = [0u8; 8192];
             match self
                 .decoder
-                .decode(&self.data[self.input_pos..self.input_pos + feed], &mut buf)
+                .decode(&self.inbuf[self.in_pos..self.in_len], &mut buf)
             {
                 Ok(result) => {
                     self.staged
                         .extend_from_slice(&buf[..result.output_produced()]);
-                    self.input_pos += result.input_consumed();
+                    self.in_pos += result.input_consumed();
                     if let xz4rust::XzNextBlockResult::EndOfStream(_, _) = result {
                         self.decoder.reset();
                         // Concatenated streams may be separated by zero padding.
-                        while self.input_pos < self.data.len() && self.data[self.input_pos] == 0 {
-                            self.input_pos += 1;
-                        }
-                        if self.input_pos >= self.data.len() {
-                            self.done = true;
+                        loop {
+                            if !self.fill()? {
+                                self.done = true;
+                                break;
+                            }
+                            if self.inbuf[self.in_pos] != 0 {
+                                break;
+                            }
+                            self.in_pos += 1;
                         }
                     }
                 }
                 Err(xz4rust::XzError::NeedsLargerInputBuffer) => {
-                    self.input_pos += feed;
+                    self.in_pos = self.in_len;
                 }
                 // A malformed stream is corruption, not a limit. Surfacing it as
                 // an io error lets the caller report Unscannable without killing
@@ -180,62 +210,4 @@ impl std::io::Read for XzReader<'_> {
             }
         }
     }
-}
-
-/// Decode all concatenated XZ streams using xz4rust's block-based API
-/// (pure Rust, no unsafe, zero runtime deps with no_unsafe + no sha256). Shared
-/// with the ZIP path (method 95 = XZ) via [`super::zip`].
-pub(crate) fn decode_xz(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitHit> {
-    let mut decoder = xz4rust::XzDecoder::with_alloc_dict_size(8192, XZ_MAX_DICT as usize);
-    let mut out = Vec::new();
-    let mut input_pos = 0;
-    let mut out_buf = [0u8; 8192];
-
-    loop {
-        let remaining = cap.saturating_sub(out.len() as u64);
-        if remaining == 0 {
-            return Ok((out, true));
-        }
-
-        let feed = data[input_pos..].len().min(out_buf.len());
-        if feed == 0 {
-            break;
-        }
-
-        match decoder.decode(&data[input_pos..input_pos + feed], &mut out_buf) {
-            Ok(result) => {
-                let produced = result.output_produced();
-                if produced > 0 {
-                    out.extend_from_slice(&out_buf[..produced]);
-                    // Check budget after each output chunk (catches bombs).
-                    if out.len() as u64 > cap {
-                        return Ok((out, true));
-                    }
-                }
-                input_pos += result.input_consumed();
-                if let xz4rust::XzNextBlockResult::EndOfStream(_, _) = result {
-                    decoder.reset();
-                    // Skip padding zeros between concatenated streams
-                    while input_pos < data.len() && data[input_pos] == 0 {
-                        input_pos += 1;
-                    }
-                    if input_pos >= data.len() {
-                        break;
-                    }
-                }
-            }
-            Err(xz4rust::XzError::NeedsLargerInputBuffer) => {
-                input_pos += feed;
-            }
-            Err(e) => {
-                // A malformed/undecodable xz stream is a *corruption*, not a
-                // resource limit. Marking it `corrupt` makes it an Unscannable
-                // signal that does NOT abort the enclosing container: a bad `.xz`
-                // member inside a tar must not stop the sibling members (which may
-                // carry the actual detection) from being scanned.
-                return Err(LimitHit::corrupt(format!("xz: {e}")));
-            }
-        }
-    }
-    Ok((out, false))
 }

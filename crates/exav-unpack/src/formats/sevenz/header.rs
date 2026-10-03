@@ -991,7 +991,7 @@ mod tests {
         // is what actually regresses the fix).
         let _ = parse_archive(data, &[]);
         let mut budget = crate::Budget::new(crate::Limits::default());
-        let _ = crate::extract(crate::Format::SevenZip, data, &mut budget);
+        let _ = crate::extract(crate::Format::SevenZip, &data, &mut budget);
     }
 
     /// SubStreamsInfo with an absurd `NID_NUM_UNPACK_STREAM` count: the running

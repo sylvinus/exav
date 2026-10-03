@@ -1,10 +1,9 @@
 //! `--all-matches` must be a **superset** of a normal scan, never a subset.
 //!
-//! It is easy to assume this holds by construction and it does not. The two
-//! paths are separate walks — `deep_analyze` stops at the first detection,
-//! `collect_all` visits everything — and any capability added to one and not the
-//! other silently changes *which signatures run*, not just how many names come
-//! back.
+//! It holds by construction now (one walk, driven by a sink that stops or
+//! collects), and it did not when the two paths were separate walks: any
+//! capability added to one and not the other silently changed *which
+//! signatures run*, not just how many names come back.
 //!
 //! That happened: `collect_all` typed every extracted member with plain content
 //! detection, while the first-match path forces textual OLE2 streams to type as
@@ -79,8 +78,8 @@ fn allmatch_is_a_superset_of_a_normal_scan() {
     assert!(
         all.iter().any(|n| n == "Test.OleMacro"),
         "--all-matches dropped a detection a normal scan makes: {all:?}. \
-         `collect_all` must apply the same forced member type as `deep_analyze` — \
-         a textual OLE2 stream is scanned AS `Ole` so `Target:2` signatures run."
+         A textual OLE2 stream is scanned AS `Ole` so `Target:2` signatures run, \
+         in both modes."
     );
 }
 

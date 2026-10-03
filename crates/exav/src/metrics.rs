@@ -45,6 +45,9 @@ pub(crate) const MATCHERS: &[&str] = &[
     "bytecode",
     "static",
     "normalize",
+    "unpack",
+    "emu",
+    "filetype",
 ];
 
 /// Counters for one matcher.
@@ -76,6 +79,9 @@ const OTHER: usize = MATCHERS.len();
 // `MATCHERS`, so adding a matcher name without adding a cell fails to compile
 // rather than silently dropping that matcher's numbers.
 static MATCHER_CELLS: [MatcherCell; CELLS] = [
+    MatcherCell::new(),
+    MatcherCell::new(),
+    MatcherCell::new(),
     MatcherCell::new(),
     MatcherCell::new(),
     MatcherCell::new(),
@@ -156,8 +162,8 @@ pub(crate) fn spawn_reporter(interval: Duration, what: &'static str) {
 }
 
 /// Scans finished by this process, for the tests that check a surface counts
-/// what it scanned.
-#[cfg(test)]
+/// what it scanned (the daemon's, Unix only).
+#[cfg(all(test, unix))]
 pub(crate) fn scans() -> u64 {
     SCANS.load(Ordering::Relaxed)
 }

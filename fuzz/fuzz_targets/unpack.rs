@@ -84,6 +84,6 @@ fuzz_target!(|data: &[u8]| {
             tight_limits(),
             vec!["infected".to_string(), "hunter2".to_string()],
         );
-        let _ = extract(fmt, data, &mut budget);
+        let _ = extract(fmt, &data, &mut budget);
     }
 });

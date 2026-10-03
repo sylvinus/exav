@@ -10,10 +10,11 @@
 //!   `PING`                 -> `PONG`
 //!   `VERSION`              -> `exav <version>`
 //!   `STATS`                -> a short status block ending with `END`
-//!   `RELOAD`               -> `RELOADING`; in the prefork pool this signals the
-//!                             supervisor to re-read the data dir and re-fork the
-//!                             workers with the new signatures (the mechanism a
-//!                             stock `freshclam`'s `NotifyClamd` drives)
+//!   `RELOAD`               -> `RELOADING`; the supervisor re-reads the
+//!                             signatures (in the prefork pool, re-forking the
+//!                             workers with them), as `SIGUSR2` does. The
+//!                             mechanism a stock `freshclam`'s `NotifyClamd`
+//!                             drives
 //!   `SCAN <path>`          -> `<path>: OK` / `<path>: <sig> FOUND` / `… ERROR`
 //!   `CONTSCAN <path>`      -> recurse a directory, one reply line per file
 //!   `MULTISCAN <path>`     -> alias of CONTSCAN
@@ -21,7 +22,7 @@
 //!                             The payload is materialized to a seekable source
 //!                             (kept in RAM when small, spilled to an auto-deleted
 //!                             temp file when large) and given the FULL
-//!                             container-aware scan — so malware inside an archive
+//!                             container-aware scan, so malware inside an archive
 //!                             is detected, matching clamd. Bounded by
 //!                             `--max-input-bytes` (disk is the ceiling). Reply
 //!                             `stream: …`
@@ -35,14 +36,16 @@
 //!                                 [,"location":"outer.zip/…/inside.txt"]}
 //!                                 (location present only for a NESTED hit; it is
 //!                                 the `/`-joined container member-name path from
-//!                                 the stream to the matched leaf — control bytes
+//!                                 the stream to the matched leaf; control bytes
 //!                                 sanitised, capped ~512 chars)
 //!                               {"v":1,"status":"PARTIAL","category":C[,"reason":R]}
 //!                                 (C ∈ LIMITS-EXCEEDED / UNSCANNABLE /
-//!                                 PASSWORD-PROTECTED / TRUNCATED — a stream that
-//!                                 was not fully scanned is PARTIAL, NEVER OK)
+//!                                 PASSWORD-PROTECTED; a stream that was not
+//!                                 fully scanned is PARTIAL unless `--partial-as`
+//!                                 says otherwise)
 //!                               {"v":1,"status":"ERROR","reason":R}
 //!                                 (transient/infra failure the client may retry,
+//!                                 a stream that ended before its terminator,
 //!                                 or a PARTIAL under `--partial-as error`)
 //!                             `status` is the same four-word vocabulary the CLI
 //!                             prints and `--json` emits, and each word names the
@@ -54,7 +57,7 @@
 //!   `EXINSTREAM MULTI`     -> exav extension: several files in ONE request, so a
 //!                             multi-volume archive split across them (`x.7z.001`,
 //!                             `.002`, …) is rejoined and scanned as the one
-//!                             archive it is — sent one at a time, no part decodes
+//!                             archive it is. Sent one at a time, no part decodes
 //!                             and every one of them replies `clean`. Framing,
 //!                             repeated per file:
 //!                               `<u32 name_len><name>` then the INSTREAM chunk
@@ -83,8 +86,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use exav_core::{
-    analyze_all_with_outcome, scan_path, scan_seekable_located, scan_stream, AllMatchOutcome,
-    ScanOptions, ScanReport, Scanner, VerdictCategory,
+    analyze_all_seekable, scan_path, scan_seekable_located, AllMatchOutcome, ScanOptions,
+    ScanReport, Scanner, Verdict, VerdictCategory,
 };
 use walkdir::WalkDir;
 
@@ -215,8 +218,9 @@ impl<'a> AncillaryReader<'a> {
     /// One `recvmsg` into `buf`, draining any passed fds into `self.fds`.
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use std::os::fd::{AsRawFd, RawFd};
-        // Control buffer sized for a handful of fds.
-        let mut cmsg = [0u8; 256];
+        // Control buffer sized for a handful of fds. `u64` rather than `u8` for
+        // the alignment `cmsghdr` needs, as in `send_fd_command`.
+        let mut cmsg = [0u64; 32];
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
@@ -228,7 +232,7 @@ impl<'a> AncillaryReader<'a> {
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cmsg.len() as _;
+            msg.msg_controllen = std::mem::size_of_val(&cmsg) as _;
             let n = libc::recvmsg(self.stream.as_raw_fd(), &mut msg, 0);
             if n < 0 {
                 return Err(io::Error::last_os_error());
@@ -282,7 +286,7 @@ impl FdSource for AncillaryReader<'_> {
     }
 }
 
-/// Send `cmd` on `stream` with `fd` attached as `SCM_RIGHTS` ancillary data —
+/// Send `cmd` on `stream` with `fd` attached as `SCM_RIGHTS` ancillary data:
 /// the client half of `FILDES`, and the one thing a plain `write` cannot do.
 ///
 /// The descriptor the daemon receives is its own, pointing at the same open
@@ -382,7 +386,7 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
 /// Per-read socket timeout. Bounds how long a connection may block the daemon
 /// waiting for the client to send data (a command, or the next INSTREAM chunk),
-/// so a slow/idle client — the classic slow-loris — can't pin a connection slot
+/// so a slow/idle client (the classic slow-loris) can't pin a connection slot
 /// (or, in the thread model where there is no per-job kill, a worker) forever.
 /// Applied to every accepted stream; a stall past this closes the connection.
 const SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -409,17 +413,82 @@ impl Drop for ConnGuard {
     }
 }
 
+/// The database the thread-model listeners share, swapped whole on a reload.
+/// A connection or request already in progress keeps the one it started with.
+pub struct SharedDb(std::sync::RwLock<Arc<Scanner>>);
+
+impl SharedDb {
+    pub fn new(db: Arc<Scanner>) -> Self {
+        Self(std::sync::RwLock::new(db))
+    }
+
+    /// The database to serve the next connection or request with.
+    pub fn current(&self) -> Arc<Scanner> {
+        // A poisoned lock means a panic happened while swapping, not that the
+        // database is unusable.
+        Arc::clone(&self.0.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub(crate) fn replace(&self, db: Scanner) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(db);
+    }
+}
+
+/// The thread model's supervisor: reload `db` on `RELOAD`, `SIGUSR2`, or a
+/// change to the watched signature source, and reopen the `--log` file on
+/// `SIGHUP`, as clamd does. A failed reload keeps the database in use. Never
+/// returns.
+pub fn supervise(
+    db: &SharedDb,
+    mut watch: Option<Watch>,
+    reload_db: &dyn Fn() -> Result<Scanner, String>,
+) -> ! {
+    #[cfg(unix)]
+    {
+        if let Err(e) = arm_wakeup() {
+            eprintln!(
+                "exav: reload signals will wait for the next {}s poll: {e}",
+                SUPERVISOR_TICK.as_secs()
+            );
+        }
+        // Restarting: the listeners' threads must not see their reads and
+        // accepts interrupted by a signal meant for this one.
+        install_restarting_handler(libc::SIGHUP, on_sighup);
+        install_restarting_handler(libc::SIGUSR2, on_sigusr2);
+    }
+    loop {
+        #[cfg(unix)]
+        nap(SUPERVISOR_TICK);
+        #[cfg(not(unix))]
+        std::thread::sleep(SUPERVISOR_TICK);
+        let disk_changed = watch.as_mut().is_some_and(Watch::changed);
+        if RELOAD_REQUESTED.swap(false, Ordering::Relaxed) || disk_changed {
+            match reload_db() {
+                Ok(new_db) => {
+                    eprintln!(
+                        "exav: reloading signatures ({} known)",
+                        new_db.signature_count()
+                    );
+                    exav_core::warm_up(&new_db);
+                    db.replace(new_db);
+                }
+                Err(e) => eprintln!("exav: signature reload failed, keeping current DB: {e}"),
+            }
+        }
+    }
+}
+
 /// Run the daemon until the listener errors (e.g. the process is killed).
 /// `allow_shutdown` controls whether the `SHUTDOWN` command stops the daemon
 /// (here it exits the process; the thread model has no supervisor to unwind).
-/// `allow_http_scan` controls whether the exav-only `SCANURL` command fetches —
+/// `allow_http_scan` controls whether the exav-only `SCANURL` command fetches,
 /// off by default, since it lets any client that can reach the socket make the
 /// daemon fetch a URL.
 ///
-/// The database arrives already shared so one load can answer on more than one
-/// listener in the same process.
+/// Each connection is served with the database current when it opened; a
+/// reload ([`supervise`]) swaps it for the connections after.
 pub fn run(
-    db: Arc<Scanner>,
+    db: Arc<SharedDb>,
     addr: ListenAddr,
     opts: Arc<ScanOptions>,
     allow_shutdown: bool,
@@ -429,8 +498,8 @@ pub fn run(
     use std::sync::atomic::{AtomicUsize, Ordering};
     let conns = Arc::new(AtomicUsize::new(0));
     // A client that disconnects right after reading a reply delivers SIGPIPE on
-    // the next write. `main` set the default disposition — which kills the
-    // process — so that a one-shot scan piped into `head` ends quietly; a
+    // the next write. `main` set the default disposition, which kills the
+    // process, so that a one-shot scan piped into `head` ends quietly; a
     // listener wants the opposite. Ignoring it makes the write fail with EPIPE
     // and cost one connection instead of the daemon.
     #[cfg(unix)]
@@ -450,9 +519,9 @@ pub fn run(
                 let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
                 if conns.fetch_add(1, Ordering::Relaxed) >= max_connections {
                     conns.fetch_sub(1, Ordering::Relaxed);
-                    continue; // at capacity — drop the connection
+                    continue; // at capacity: drop the connection
                 }
-                let (db, opts, c) = (Arc::clone(&db), Arc::clone(&opts), Arc::clone(&conns));
+                let (db, opts, c) = (db.current(), Arc::clone(&opts), Arc::clone(&conns));
                 std::thread::spawn(move || {
                     let _guard = ConnGuard(c);
                     // The fd-capturing reader handles FILDES; the writer is a
@@ -474,7 +543,7 @@ pub fn run(
                         &opts,
                         &|| {},
                         &|| {},
-                        &|| {},
+                        &request_reload,
                         &shutdown,
                         allow_http_scan,
                     ) {
@@ -495,9 +564,9 @@ pub fn run(
                 let stream = TcpListenerStream(tcp);
                 if conns.fetch_add(1, Ordering::Relaxed) >= max_connections {
                     conns.fetch_sub(1, Ordering::Relaxed);
-                    continue; // at capacity — drop the connection
+                    continue; // at capacity: drop the connection
                 }
-                let (db, opts, c) = (Arc::clone(&db), Arc::clone(&opts), Arc::clone(&conns));
+                let (db, opts, c) = (db.current(), Arc::clone(&opts), Arc::clone(&conns));
                 std::thread::spawn(move || {
                     let _guard = ConnGuard(c);
                     let shutdown = || {
@@ -514,7 +583,7 @@ pub fn run(
                         &opts,
                         &|| {},
                         &|| {},
-                        &|| {},
+                        &request_reload,
                         &shutdown,
                         allow_http_scan,
                     ) {
@@ -534,26 +603,27 @@ pub fn run(
 // `--workers N` switches the daemon from the in-process thread model above to a
 // pool of N persistent worker *processes*. Each worker handles one scan at a
 // time (sequentially), so a single job can be bounded and, if it goes rogue,
-// killed without touching any other in-flight work — the one thing the thread
+// killed without touching any other in-flight work, the one thing the thread
 // model cannot do safely at all (no safe thread-kill in Rust/C).
 //
 // Why processes / why Unix-only here:
 //   * Workers `fork()` from the parent *after* the DB is loaded and warmed, so
-//     the (large, read-only) signature DB is shared via copy-on-write — no
+//     the (large, read-only) signature DB is shared via copy-on-write: no
 //     re-load, low memory.
 //   * They inherit the listening socket and `accept()` on it directly, so the
 //     full clamd protocol (incl. `FILDES` fd-passing via `SCM_RIGHTS`) is
 //     handled in the worker with zero parent relay.
 //   * Limits are enforced by the kernel, the only layer that can stop a stuck
-//     call inside a dependency: `RLIMIT_AS` (memory) / `RLIMIT_CPU` (CPU time)
-//     trigger a kernel kill, and a per-job `setitimer(SIGALRM)` whose handler
-//     `_exit()`s gives a hard wall-clock bound even on a non-yielding CPU loop.
+//     call inside a dependency: `RLIMIT_AS` fails the allocation past the
+//     memory cap, a per-job soft `RLIMIT_CPU` raises `SIGXCPU`, and a per-job
+//     `setitimer(SIGALRM)` gives a wall-clock bound even on a non-yielding CPU
+//     loop. Both signal handlers answer the client and `_exit()`.
 //   * Workers recycle after `max_jobs` to bound slow leaks/fragmentation; the
 //     supervisor respawns them by forking from the clean parent (pristine COW).
 //
 // This is the deterministic-caps backstop (Layer 3): the in-core
 // `max_scanned_bytes`/ratio/recursion caps still fire first and identically in
-// both models — the pool only adds the hard kill for the residual tail.
+// both models; the pool only adds the hard kill for the residual tail.
 
 /// Exit code a worker uses when its per-job wall-clock alarm fires.
 #[cfg(unix)]
@@ -568,16 +638,16 @@ pub struct PoolConfig {
     pub max_scan_time: std::time::Duration,
     /// Per-worker address-space cap in bytes (`RLIMIT_AS`).
     pub max_memory_bytes: u64,
-    /// Per-worker CPU-seconds cap (`RLIMIT_CPU`; kernel `SIGXCPU`/`SIGKILL`).
+    /// Per-job CPU-seconds cap (soft `RLIMIT_CPU`, re-armed per job; `SIGXCPU`).
     pub max_cpu_secs: u64,
     /// Recycle a worker after this many jobs (bounds slow leaks).
     pub max_jobs: u64,
     /// Whether the `SHUTDOWN` command is honoured (clamd default: yes). When
-    /// false, `SHUTDOWN` replies with an error instead of stopping the daemon —
+    /// false, `SHUTDOWN` replies with an error instead of stopping the daemon,
     /// useful when the socket/port is reachable by untrusted clients.
     pub allow_shutdown: bool,
     /// Whether the exav-only `SCANURL` command fetches (default: no). When
-    /// false, `SCANURL` replies with an error instead of fetching — useful for
+    /// false, `SCANURL` replies with an error instead of fetching, useful for
     /// the same reason: it lets any client that can reach the socket make the
     /// daemon fetch a URL.
     pub allow_http_scan: bool,
@@ -588,6 +658,24 @@ pub struct PoolConfig {
 enum BoundListener {
     Unix(std::os::unix::net::UnixListener),
     Tcp(TcpListener),
+}
+
+#[cfg(unix)]
+impl BoundListener {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            BoundListener::Unix(l) => l.as_raw_fd(),
+            BoundListener::Tcp(l) => l.as_raw_fd(),
+        }
+    }
+
+    fn set_nonblocking(&self) -> io::Result<()> {
+        match self {
+            BoundListener::Unix(l) => l.set_nonblocking(true),
+            BoundListener::Tcp(l) => l.set_nonblocking(true),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -604,12 +692,12 @@ fn bind_listener(addr: &ListenAddr) -> io::Result<BoundListener> {
 /// listening before any `chmod` runs and, under a permissive umask, listening
 /// at 0777 while it does. Binding under a umask of 0777 instead creates it with
 /// no permissions at all: the only mode a client can ever find on the path is
-/// the one asked for. A failed `chmod` is fatal for the same reason — the
+/// the one asked for. A failed `chmod` is fatal for the same reason: the
 /// socket would otherwise stay at mode 000 and refuse everyone silently.
 ///
 /// The path itself is still a name another process can replace between the two
 /// calls if it can write the directory, so a socket belongs somewhere only its
-/// owner can write — `$XDG_RUNTIME_DIR` or `/var/run`, not world-writable
+/// owner can write (`$XDG_RUNTIME_DIR` or `/var/run`), not world-writable
 /// `/tmp`, where another local user can pre-create the path.
 #[cfg(unix)]
 fn bind_unix_socket(
@@ -643,104 +731,308 @@ fn bind_unix_socket(
 #[cfg(unix)]
 static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Set to true when a DB reload is requested: by SIGHUP (which a worker raises on
-/// a `RELOAD` command, and which the CLI's background updater raises after a
-/// successful download) or by the supervisor noticing the data dir changed on
-/// disk. The supervisor drains it each tick and re-forks the pool.
-#[cfg(unix)]
+/// Set to true when a DB reload is requested: by SIGUSR2 (which a worker raises
+/// on a `RELOAD` command, and which the CLI's background updater raises after a
+/// successful download), as clamd does. The supervisor drains it each tick.
 static RELOAD_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by SIGHUP in the supervisor, for it to pass the signal on to its
+/// children: each reopens its own `--log` handle.
+#[cfg(unix)]
+static HUP_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(unix)]
 extern "C" fn on_shutdown(_sig: libc::c_int) {
     SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    wake();
 }
 
+/// SIGUSR2: reload the signatures.
+#[cfg(unix)]
+extern "C" fn on_sigusr2(_sig: libc::c_int) {
+    RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    wake();
+}
+
+/// SIGHUP: reopen the `--log` file.
 #[cfg(unix)]
 extern "C" fn on_sighup(_sig: libc::c_int) {
-    RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::LOG_REOPEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    HUP_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    wake();
 }
 
-/// Empty handler whose only job is to interrupt the supervisor's `nanosleep`
-/// (handlers are installed without `SA_RESTART`) so a worker exit is reaped
-/// promptly rather than after the full poll interval.
+/// SIGHUP in a worker or the side listener's child: reopen its own handle.
 #[cfg(unix)]
-extern "C" fn on_sigchld(_sig: libc::c_int) {}
+extern "C" fn on_sighup_child(_sig: libc::c_int) {
+    crate::LOG_REOPEN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
-/// Public so the CLI's updater thread can raise a reload after writing new
-/// signatures to the data dir (equivalent to sending `RELOAD` over the socket).
-/// Only called from the `http-update`-gated updater, so it's dead otherwise.
+/// The dispositions every child of the pool starts from: the supervisor's
+/// flag-setting handlers must not fire in it, its SIGTERM is the default until
+/// the child installs its own, and a SIGUSR2 sent to the whole process group is
+/// the supervisor's to act on.
 #[cfg(unix)]
-#[cfg_attr(not(feature = "http-update"), allow(dead_code))]
-pub fn request_reload() {
-    RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Also poke the process so a sleeping supervisor wakes immediately.
+fn child_signals() {
+    // SAFETY: sets this process's own dispositions, right after `fork`.
     unsafe {
-        libc::kill(libc::getpid(), libc::SIGHUP);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        libc::signal(libc::SIGUSR2, libc::SIG_IGN);
+    }
+    install_restarting_handler(libc::SIGHUP, on_sighup_child);
+}
+
+/// Wakes the supervisor so a worker exit is reaped at once.
+#[cfg(unix)]
+extern "C" fn on_sigchld(_sig: libc::c_int) {
+    wake();
+}
+
+/// The supervisor's self-pipe: the signal handlers write to it and [`nap`]
+/// polls it. Interrupting a sleep is not enough, because a signal that lands
+/// while the supervisor is awake would then wait out the next full nap.
+#[cfg(unix)]
+static WAKE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static WAKE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// A byte is in the pipe. Keeps it to one, so the handler's `write` never
+/// fails and never changes `errno` under the code it interrupted.
+#[cfg(unix)]
+static WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Create the self-pipe. Idempotent; call before installing the handlers.
+#[cfg(unix)]
+fn arm_wakeup() -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if WAKE_WRITE.load(Ordering::Relaxed) >= 0 {
+        return Ok(());
+    }
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe` writes two descriptors into `fds`.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        // SAFETY: sets flags on descriptors this process just created.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+    }
+    WAKE_READ.store(fds[0], Ordering::Relaxed);
+    WAKE_WRITE.store(fds[1], Ordering::Relaxed);
+    Ok(())
+}
+
+/// Make the next [`nap`] return at once. Async-signal-safe: atomics and one
+/// `write`.
+#[cfg(unix)]
+fn wake() {
+    use std::sync::atomic::Ordering;
+    if WAKE_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let fd = WAKE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // SAFETY: writes one byte from a static to a descriptor this process
+        // owns. The pipe is empty here, so this neither blocks nor fails.
+        unsafe {
+            libc::write(fd, b"!".as_ptr() as *const libc::c_void, 1);
+        }
     }
 }
 
-/// The supervisor's **idle** poll cadence — the upper bound on how long a
+/// Ask the supervisor for a reload: what `RELOAD` does in the thread model, and
+/// what the CLI's updater thread does after writing new signatures.
+pub fn request_reload() {
+    RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(unix)]
+    wake();
+}
+
+/// The supervisor's **idle** poll cadence: the upper bound on how long a
 /// *signal-less* database change (a sidecar that writes the volume without
 /// `RELOAD`) can go unnoticed. Everything urgent is signal-driven and interrupts
-/// the sleep immediately, so this timer's only job is the mtime poll: a worker
-/// exit (SIGCHLD) triggers instant reap+respawn, `RELOAD`/the updater/`SIGHUP`
+/// the sleep immediately, so this timer's only job is the source poll: a worker
+/// exit (SIGCHLD) triggers instant reap+respawn, `RELOAD`/the updater/`SIGUSR2`
 /// trigger an instant reload, and SIGTERM/SIGINT an instant shutdown. It is
-/// therefore a few seconds, not sub-second — polling the filesystem twice a
+/// therefore a few seconds, not sub-second: polling the filesystem twice a
 /// second for a database that changes a few times a day would wake the process
 /// (and, on an NFS-mounted DB directory, generate GETATTR/READDIR traffic) for
 /// nothing. Still ~60× more responsive than clamd's 600 s `SelfCheck`; use
-/// `RELOAD`/`NotifyClamd`/`SIGHUP` when you want a change picked up instantly.
-#[cfg(unix)]
-const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+/// `RELOAD`/`NotifyClamd`/`SIGUSR2` when you want a change picked up instantly.
+pub(crate) const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Newest mtime of the watched source — the reload trigger for a sidecar that
-/// writes the volume without sending `RELOAD` (clamd's `SelfCheck`). For a
-/// **directory** this is the newest mtime **across the whole tree**: the loader
-/// reads the directory recursively (including the updater's `env/<host>/…`
-/// subtree), so the watch must too — an in-place overwrite deep in the tree bumps
-/// only its own directory's mtime, which a top-level-only scan would miss. For a
-/// single **file** (a prebuilt database) it is just that file's mtime — an atomic
-/// swap replaces it with a newer-mtime inode, so the poll fires. `None` if the
-/// path can't be stat'd. Symlinks are not followed (no cycles).
-///
-/// Also the ICAP server's reload trigger, which is why it is not Unix-gated:
-/// that server runs on every platform.
-#[cfg(any(unix, feature = "icap"))]
-pub(crate) fn datadir_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
-    let mut newest = std::fs::metadata(dir).and_then(|m| m.modified()).ok()?;
-    // WalkDir over a file yields just that file, so this also covers the
-    // single-`.exavdb` case (leaving `newest` at the file's own mtime).
-    for entry in WalkDir::new(dir).follow_links(false).into_iter().flatten() {
-        if let Some(t) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-            if t > newest {
-                newest = t;
-            }
-        }
-    }
-    Some(newest)
+/// A child of a retired generation, finishing the job it had when a reload
+/// replaced it.
+#[cfg(unix)]
+struct Retiring {
+    /// The side listener's child rather than a worker.
+    side: bool,
+    since: std::time::Instant,
+    /// Sent SIGTERM for outliving its grace.
+    stopped: bool,
 }
 
-/// Sleep, but return early if a signal arrives (no `SA_RESTART`).
+#[cfg(unix)]
+impl Retiring {
+    fn new(side: bool, since: std::time::Instant) -> Self {
+        Self {
+            side,
+            since,
+            stopped: false,
+        }
+    }
+}
+
+/// How long a retired child may take to finish: one job's time limit, plus a
+/// margin to write its answer. With no time limit, a fixed ceiling.
+#[cfg(unix)]
+fn retire_grace(max_scan_time: std::time::Duration) -> std::time::Duration {
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+    const NO_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+    if max_scan_time.is_zero() {
+        NO_LIMIT
+    } else {
+        max_scan_time + MARGIN
+    }
+}
+
+/// A signature source the supervisor polls for changes, with its
+/// [`source_state`] from before the serving database was read from it.
+///
+/// Taken before the load rather than when the supervisor starts polling: a
+/// sidecar writing the source between the two (the load can take minutes)
+/// would otherwise be in the baseline, and its signatures never loaded.
+pub struct Watch {
+    pub path: std::path::PathBuf,
+    seen: Option<u64>,
+}
+
+impl Watch {
+    /// Call before loading the database from `path`.
+    pub fn new(path: std::path::PathBuf) -> Self {
+        let seen = source_state(&path);
+        Watch { path, seen }
+    }
+
+    /// Whether the source changed since it was last seen, noting it as seen.
+    /// Any difference counts: a database swapped for one with an older mtime
+    /// (copied with `cp -p`, unpacked from an archive) is still a new one.
+    fn changed(&mut self) -> bool {
+        match source_state(&self.path) {
+            Some(s) if self.seen != Some(s) => {
+                self.seen = Some(s);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A digest of the watched source, the reload trigger for a sidecar that writes
+/// the volume without sending `RELOAD` (clamd's `SelfCheck`): the path, size,
+/// mtime and inode of every entry. For a **directory** that is the whole tree,
+/// since the loader reads it recursively (including the updater's
+/// `env/<host>/…` subtree). For a single **file** (a prebuilt database) it is
+/// that file; an atomic swap replaces its inode. `None` if the path can't be
+/// stat'd. Symlinks are not followed (no cycles).
+///
+/// Not the newest mtime alone: some filesystems stamp from a coarse clock, and
+/// a file written within one tick of the baseline (a sidecar finishing just
+/// after a load started) carries the same mtime as everything before it.
+pub(crate) fn source_state(dir: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::fs::metadata(dir).ok()?.modified().ok().hash(&mut h);
+    let entries = WalkDir::new(dir).follow_links(false).sort_by_file_name();
+    for entry in entries.into_iter().flatten() {
+        entry.path().hash(&mut h);
+        if let Ok(m) = entry.metadata() {
+            m.len().hash(&mut h);
+            m.modified().ok().hash(&mut h);
+            #[cfg(unix)]
+            std::os::unix::fs::MetadataExt::ino(&m).hash(&mut h);
+        }
+    }
+    Some(h.finish())
+}
+
+/// Sleep for `d`, or less if a supervisor signal arrived since the last nap.
 #[cfg(unix)]
 fn nap(d: std::time::Duration) {
-    let ts = libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_nsec: d.subsec_nanos() as _,
-    };
+    use std::sync::atomic::Ordering;
+    let mut fds = [libc::pollfd {
+        // A negative fd (not armed) is ignored by `poll`: a plain sleep.
+        fd: WAKE_READ.load(Ordering::Relaxed),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let ms = d.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: `fds` is one valid `pollfd` for the duration of the call.
     unsafe {
-        libc::nanosleep(&ts, std::ptr::null_mut());
+        libc::poll(fds.as_mut_ptr(), 1, ms);
     }
+    if fds[0].fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 16];
+    // SAFETY: reads into a local buffer from a nonblocking descriptor this
+    // process owns; stops at EAGAIN.
+    while unsafe { libc::read(fds[0].fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
+    // Cleared after draining: a signal before this point is handled by the
+    // loop the caller is about to run, one after it writes a fresh byte.
+    WAKE_PENDING.store(false, Ordering::SeqCst);
 }
 
 /// The worker's per-job wall-clock alarm. Terminating immediately is the whole
 /// point: the scan blew its time budget (possibly stuck inside a dependency
 /// that never returns to a cooperative checkpoint), and there is no safe way to
-/// unwind in-process — so we `_exit` (async-signal-safe) and let the supervisor
-/// respawn a replacement.
+/// unwind in-process, so we `_exit` (async-signal-safe) and let the supervisor
+/// respawn a replacement. The client gets a verdict first, as in
+/// [`on_sigabrt`]: a connection closed with no reply reads as clean to some
+/// clients.
 #[cfg(unix)]
 extern "C" fn on_sigalrm(_sig: libc::c_int) {
+    let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            libc::write(
+                fd,
+                TIMEOUT_REPLY.as_ptr() as *const libc::c_void,
+                TIMEOUT_REPLY.len(),
+            );
+        }
+    }
     unsafe { libc::_exit(EXIT_TIMEOUT) }
 }
+
+/// The job used its CPU budget (see [`arm_cpu_limit`]): answered as
+/// [`on_sigalrm`] answers, since the budget is `--max-scan-secs` too.
+#[cfg(unix)]
+extern "C" fn on_sigxcpu(_sig: libc::c_int) {
+    let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            libc::write(
+                fd,
+                TIMEOUT_REPLY.as_ptr() as *const libc::c_void,
+                TIMEOUT_REPLY.len(),
+            );
+        }
+    }
+    unsafe { libc::_exit(EXIT_CPU) }
+}
+
+/// Exit code a worker uses when a job runs out of CPU time.
+#[cfg(unix)]
+const EXIT_CPU: i32 = 18;
+
+/// Reply [`on_sigalrm`] emits, framed like [`ABORT_REPLY`].
+#[cfg(unix)]
+const TIMEOUT_REPLY: &[u8] = b": scan exceeded --max-scan-secs LIMITS-EXCEEDED ERROR\n\0";
 
 /// The fd of the connection this worker is currently serving, for the abort
 /// handler below. `-1` when idle. A raw atomic because a signal handler may read
@@ -757,14 +1049,14 @@ const ABORT_REPLY: &[u8] = b": scan aborted (out of memory) ERROR\n\0";
 /// Say something before dying.
 ///
 /// A worker killed mid-scan closes its connection with no reply at all, and a
-/// clean close is indistinguishable from "scanned, found nothing" — so a crash
+/// clean close is indistinguishable from "scanned, found nothing", so a crash
 /// reads as a clean verdict, which is the one answer a scanner must never give
 /// by accident. Measured: 55 worker deaths in an 8,978-file run, every one
 /// recorded as clean by the client.
 ///
 /// `SIGABRT` (Rust's allocation-failure path) is catchable, so those can be
 /// reported. A `SIGKILL` from the OOM killer cannot be, which is why the client
-/// must ALSO treat a silent close as an error — the two fixes are complementary,
+/// must ALSO treat a silent close as an error. The two fixes are complementary,
 /// not alternatives.
 ///
 /// Async-signal-safe: only `write` and `_exit`, no allocation, no locks.
@@ -783,6 +1075,37 @@ extern "C" fn on_sigabrt(_sig: libc::c_int) {
     unsafe { libc::_exit(EXIT_ABORTED) }
 }
 
+/// Whether the worker is inside a job: between `arm` and `disarm`.
+#[cfg(unix)]
+static IN_JOB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reply [`on_sigterm`] emits, framed like [`ABORT_REPLY`].
+#[cfg(unix)]
+const STOPPED_REPLY: &[u8] = b": scan stopped before it finished ERROR\n\0";
+
+/// A worker told to stop (a shutdown, its supervisor gone, or a retired
+/// generation past its grace) answers the job it is in, as [`on_sigalrm`]
+/// does. Between jobs it just exits: a line written then would be read as the
+/// answer to the client's next command.
+#[cfg(unix)]
+extern "C" fn on_sigterm(_sig: libc::c_int) {
+    let fd = CURRENT_CONN_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 && IN_JOB.load(std::sync::atomic::Ordering::Relaxed) {
+        unsafe {
+            libc::write(
+                fd,
+                STOPPED_REPLY.as_ptr() as *const libc::c_void,
+                STOPPED_REPLY.len(),
+            );
+        }
+    }
+    unsafe { libc::_exit(EXIT_STOPPED) }
+}
+
+/// Exit code for a worker stopped by [`on_sigterm`].
+#[cfg(unix)]
+const EXIT_STOPPED: libc::c_int = 92;
+
 /// Exit code for a worker that aborted mid-scan and managed to say so.
 #[cfg(unix)]
 const EXIT_ABORTED: libc::c_int = 91;
@@ -796,6 +1119,20 @@ fn install_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
         // No SA_RESTART: a signal interrupts blocking syscalls (accept/waitpid)
         // with EINTR so the loops can observe shutdown / fire the alarm.
         sa.sa_flags = 0;
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+    }
+}
+
+/// [`install_handler`] with `SA_RESTART`, for a signal that only sets a flag in
+/// a process whose blocking calls (a client read, `accept`) must carry on.
+#[cfg(unix)]
+fn install_restarting_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    // SAFETY: as in `install_handler`.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
         libc::sigaction(sig, &sa, std::ptr::null_mut());
     }
 }
@@ -814,8 +1151,33 @@ fn set_rlimit(resource: libc::c_int, limit: u64) {
     }
 }
 
+/// Give the next job `secs` of CPU on top of what this worker has already used.
+///
+/// `RLIMIT_CPU` counts the whole life of the process, so it is re-armed per job.
+/// Only the soft limit moves: an unprivileged process cannot raise a hard limit
+/// it has lowered. Its `SIGXCPU` is caught by [`on_sigxcpu`].
+#[cfg(unix)]
+fn arm_cpu_limit(secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0
+            || libc::getrlimit(libc::RLIMIT_CPU, &mut rl) != 0
+        {
+            return;
+        }
+        let us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+        let used = (us(ru.ru_utime) + us(ru.ru_stime)).div_ceil(1_000_000);
+        rl.rlim_cur = (used.saturating_add(secs) as libc::rlim_t).min(rl.rlim_max);
+        libc::setrlimit(libc::RLIMIT_CPU, &rl);
+    }
+}
+
 /// Bytes of address space this process already occupies, from `/proc/self/statm`
-/// (page count in field 0). `None` when it cannot be read — the caller then
+/// (page count in field 0). `None` when it cannot be read; the caller then
 /// applies the configured cap alone.
 ///
 /// Needed because `RLIMIT_AS` is a whole-process ceiling while the per-job
@@ -829,23 +1191,13 @@ fn current_address_space() -> Option<u64> {
     (page > 0).then(|| pages.saturating_mul(page as u64))
 }
 
-/// How much address space one job may use so the whole pool fits in RAM.
-///
-/// `None` when the host's memory cannot be read, in which case the configured
-/// value stands unmodified.
-///
-/// The signature database is shared copy-on-write by every worker, so it is
-/// subtracted ONCE rather than per worker. A slice of RAM is held back for the
-/// kernel and everything else on the box — running the machine to exactly zero
-/// free just moves the kill from one process to another.
-#[cfg(unix)]
 /// Bring the in-core extraction budget inside the memory a job is actually
 /// granted, so the deterministic cap fires before the kernel one.
 ///
 /// The pool's design puts three layers in a fixed order: the in-core
 /// size/ratio/recursion caps decide first and produce a *verdict*
 /// (`LIMITS-EXCEEDED`), and `RLIMIT_AS` is only a backstop for the residual
-/// tail. That order is not automatic — it holds only while the in-core budget
+/// tail. That order is not automatic: it holds only while the in-core budget
 /// is smaller than the address space the worker gets, and nothing enforced it.
 ///
 /// It did not hold, and the inversion is easy to reach: on a modest host the
@@ -853,72 +1205,127 @@ fn current_address_space() -> Option<u64> {
 /// Extraction buffers are charged cumulatively and never released, so a scan
 /// can hold most of that budget live at once and meet the kernel limit first.
 /// A campaign run turned up dozens of aborts from exactly that. Every one was
-/// reported as an error rather than a clean, so nothing was missed — but a scan
+/// reported as an error rather than a clean, so nothing was missed, but a scan
 /// that should have said "I hit a limit" instead said "I died", which is a
 /// worse answer and a noisier one.
 ///
 /// Clamping here restores the intended order. It only ever *lowers* a budget,
 /// so it cannot make a scan look at more than the operator asked for.
+#[cfg(unix)]
 pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) {
-    /// Of the memory a job is granted, the share extraction buffers may claim.
-    /// The rest covers the matcher's own working set — chiefly the lowercase
-    /// copy it makes of each buffer it scans — plus allocator slack.
-    const EXTRACTION_SHARE_NUM: u64 = 1;
-    const EXTRACTION_SHARE_DEN: u64 = 2;
-
-    let budget = (job_memory / EXTRACTION_SHARE_DEN) * EXTRACTION_SHARE_NUM;
-    if budget == 0 || opts.limits.max_extracted_bytes <= budget {
-        return;
-    }
-    let was = opts.limits.max_extracted_bytes;
-    opts.limits.max_extracted_bytes = budget;
-    // A single member may not exceed the whole extraction budget either.
-    opts.limits.max_buffer_bytes = opts.limits.max_buffer_bytes.min(budget);
-    eprintln!(
-        "exav: extraction budget {} MiB exceeds the {} MiB of address space available; using {} \
-         MiB so a size limit is reported rather than the scan being killed for hitting one",
-        was >> 20,
-        job_memory >> 20,
-        budget >> 20,
+    // Beside an object held whole, matching it may take an image decoded from
+    // it and that image's grey copy, each up to an object's size, and a
+    // lowercase copy of at most `LOWERCASE_COPY_MAX`. So one object may take a
+    // quarter of the job's memory, and the total held, which includes that
+    // object, leaves room for those plus a tenth for everything else.
+    let mut lowered = false;
+    let mut cap = |v: &mut u64, max: u64| {
+        lowered |= *v > max;
+        *v = (*v).min(max);
+    };
+    cap(&mut opts.limits.max_buffer_bytes, job_memory / 4);
+    cap(&mut opts.deep_analysis_max, job_memory / 4);
+    let object = opts.limits.max_buffer_bytes.max(opts.deep_analysis_max);
+    cap(
+        &mut opts.limits.max_extracted_bytes,
+        job_memory.saturating_sub(2 * object + exav_core::LOWERCASE_COPY_MAX + job_memory / 10),
     );
+    let total = opts.limits.max_extracted_bytes;
+    if lowered {
+        eprintln!(
+            "exav: of the {} MiB of memory a scan gets, it may hold {} MiB at once and \
+             {} MiB in one object, so a size limit is reported rather than the scan being \
+             killed for hitting one",
+            job_memory >> 20,
+            total >> 20,
+            object >> 20,
+        );
+    }
 }
 
 /// This process's cgroup memory ceiling, if it has one.
-///
-/// v2 first (`memory.max`, the unified hierarchy every current runtime uses),
-/// then the v1 path. Both spell "no limit" as a sentinel — literal `max` on v2,
-/// a number near `u64::MAX` on v1 — which reads as *unlimited*, not as a cap of
-/// that size. Absent or unreadable means no cgroup ceiling to apply.
+#[cfg(unix)]
 fn cgroup_memory_limit() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",                   // cgroup v2
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1
-    ] {
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let raw = raw.trim();
-        if raw == "max" {
-            return None;
-        }
-        if let Ok(v) = raw.parse::<u64>() {
-            // v1 reports "unlimited" as a huge page-aligned number rather than a
-            // word; anything past the host's own RAM is not a real ceiling.
-            if v > 0 && v < (u64::MAX >> 10) {
-                return Some(v);
-            }
-            return None;
-        }
-    }
-    None
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    cgroup_limit_from(&own, |p| std::fs::read_to_string(p).ok())
 }
 
+/// The smallest memory limit on the cgroup `proc_self_cgroup` names and its
+/// ancestors, reading files through `read`.
+///
+/// v2 first (`memory.max`, the unified hierarchy every current runtime uses),
+/// then v1 (`memory.limit_in_bytes`). Both spell "no limit" as a sentinel
+/// (literal `max` on v2, a number near `u64::MAX` on v1), which reads as
+/// *unlimited*, not as a cap of that size. A path the mount does not show (a
+/// v1 container sees its own cgroup at the mount root) ends up at the root,
+/// which is then the process's own.
+#[cfg(unix)]
+fn cgroup_limit_from(proc_self_cgroup: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+    let mut v2 = None;
+    let mut v1 = None;
+    for line in proc_self_cgroup.lines() {
+        let mut f = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if controllers.is_empty() {
+            v2 = Some(path);
+        } else if controllers.split(',').any(|c| c == "memory") {
+            v1 = Some(path);
+        }
+    }
+    let lowest = |mount: &str, file: &str, own: &str| -> Option<Option<u64>> {
+        let mut dir = own.trim_end_matches('/').to_string();
+        let mut found = None;
+        let mut limit: Option<u64> = None;
+        loop {
+            if let Some(raw) = read(&format!("{mount}{dir}/{file}")) {
+                found = Some(());
+                let raw = raw.trim();
+                // v1 reports "unlimited" as a huge page-aligned number rather
+                // than a word; anything past the host's own RAM is no ceiling.
+                if let Ok(v) = raw.parse::<u64>() {
+                    if v > 0 && v < (u64::MAX >> 10) {
+                        limit = Some(limit.map_or(v, |l| l.min(v)));
+                    }
+                }
+            }
+            match dir.rfind('/') {
+                Some(i) => dir.truncate(i),
+                None => break,
+            }
+        }
+        found.map(|()| limit)
+    };
+    [
+        v2.and_then(|p| lowest("/sys/fs/cgroup", "memory.max", p)),
+        v1.and_then(|p| lowest("/sys/fs/cgroup/memory", "memory.limit_in_bytes", p)),
+        // No `/proc/self/cgroup` to go by: the mount roots, as seen from here.
+        lowest("/sys/fs/cgroup", "memory.max", "/"),
+        lowest("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "/"),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    .flatten()
+}
+
+/// How much address space one job may use so the whole pool fits in RAM.
+///
+/// `None` when the host's memory cannot be read, in which case the configured
+/// value stands unmodified.
+///
+/// The signature database is shared copy-on-write by every worker, so it is
+/// subtracted ONCE rather than per worker. A slice of RAM is held back for the
+/// kernel and everything else on the box: running the machine to exactly zero
+/// free just moves the kill from one process to another.
+#[cfg(unix)]
 fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
     /// Leave this fraction of total RAM to the rest of the system.
     ///
     /// A third, not a token slice. A single scan's peak is NOT one buffer: the
     /// matcher allocates a full-size lowercase copy of every buffer it scans for
-    /// case-insensitive partitions, and nesting stacks those — a container, its
+    /// case-insensitive partitions, and nesting stacks those: a container, its
     /// member and that member's own member each hold a buffer AND a copy while
     /// the walk is inside them. So the per-job figure below is a floor on what a
     /// scan can want, not a ceiling, and the pool has to be sized with room for
@@ -928,7 +1335,7 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
     /// the per-worker grants plus the shared database left too little for the
     /// kernel and page cache, and dozens of workers were killed over a single
     /// run. An OOM kill cannot be caught, so it costs a scan its answer
-    /// entirely — strictly worse than the scan reporting that it hit a limit,
+    /// entirely, strictly worse than the scan reporting that it hit a limit,
     /// which is why the headroom is this generous.
     const HEADROOM_NUM: u64 = 1;
     const HEADROOM_DEN: u64 = 3;
@@ -946,7 +1353,7 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
         .ok()?;
     // `/proc/meminfo` is the HOST's memory even inside a container, so on its
     // own it hands a memory-capped container per-job grants its cgroup will
-    // never honour — and the cgroup's OOM killer then arrives before this
+    // never honour, and the cgroup's OOM killer then arrives before this
     // process's own `RLIMIT_AS` ever would, costing the scan its answer for
     // exactly the reason the headroom above exists to avoid. Containers are how
     // this daemon is mostly run, and every Kubernetes pod carries a limit.
@@ -963,7 +1370,7 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
 ///
 /// Separate from [`on_sigalrm`], which serves a pool worker that a parent will
 /// reap and report on. Here nobody is watching, so the handler has to say what
-/// happened itself — through `write(2)`, the only output an async-signal-safe
+/// happened itself, through `write(2)`, the only output an async-signal-safe
 /// handler may use.
 #[cfg(unix)]
 extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
@@ -973,8 +1380,8 @@ extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
         // Exit 3, the `PARTIAL` code, rather than the pool's dedicated timeout
         // code: a scan that ran out of time is one more object exav declined to
         // call clean, and it should sort with the others. The handler cannot
-        // consult `--partial-as` — reading it here would not be
-        // async-signal-safe — so a run that folds partials elsewhere still gets
+        // consult `--partial-as` (reading it here would not be
+        // async-signal-safe), so a run that folds partials elsewhere still gets
         // 3 from this path alone.
         libc::_exit(3)
     }
@@ -989,7 +1396,7 @@ extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
 /// never returns.
 ///
 /// Both are kernel-enforced backstops, not the primary bound. The in-core
-/// budgets decide first and produce a verdict; these catch what escapes them —
+/// budgets decide first and produce a verdict; these catch what escapes them:
 /// an allocation the budget cannot see, or a decoder that loops without
 /// producing output.
 #[cfg(unix)]
@@ -1012,8 +1419,8 @@ fn set_timer(d: std::time::Duration) {
             tv_usec: 0,
         },
         it_value: libc::timeval {
-            tv_sec: d.as_secs() as libc::time_t,
-            tv_usec: d.subsec_micros() as libc::suseconds_t,
+            tv_sec: d.as_secs() as _,
+            tv_usec: d.subsec_micros() as _,
         },
     };
     unsafe {
@@ -1033,18 +1440,113 @@ fn set_timer(d: std::time::Duration) {
 pub struct SideListener {
     /// Named in the supervisor's log when the child exits.
     pub name: &'static str,
-    /// Serves the listener it captured, in the forked child. Runs until the
-    /// process is stopped; returning at all means the listener is gone.
+    /// Serves the listener it captured, in the forked child. The descriptor is
+    /// the child's generation (see [`await_connection`]): once it is retired,
+    /// the child finishes what it is serving and exits 0.
     #[allow(clippy::type_complexity)]
-    pub serve: Box<dyn Fn(Arc<Scanner>, Arc<ScanOptions>) + Send + Sync>,
+    pub serve: Box<dyn Fn(Arc<Scanner>, Arc<ScanOptions>, std::os::fd::RawFd) + Send + Sync>,
+}
+
+/// One generation of the pool: a pipe whose write end only the supervisor
+/// holds. Its children wait on the read end alongside the listener, and
+/// dropping the generation closes the write end, which they see as end of
+/// file: an idle child leaves at once, a busy one after its current job. A
+/// reload retires the old children this way rather than by signal, so no scan
+/// in progress is cut short.
+#[cfg(unix)]
+struct Generation {
+    retire: std::os::fd::OwnedFd,
+    notice: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl Generation {
+    fn new() -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` writes two descriptors into `fds`.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both descriptors were just created and nothing else owns them.
+        let (retire, notice) = unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        };
+        for fd in fds {
+            // SAFETY: sets a flag on a descriptor this process owns.
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        Ok(Self { retire, notice })
+    }
+
+    /// In a child just forked: drop its copy of the write end, so only the
+    /// supervisor's keeps the generation alive. Returns the end to wait on.
+    fn enter(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        // SAFETY: closes this process's inherited copy. The `OwnedFd` is the
+        // parent's value and is never dropped here: a child does not return.
+        unsafe {
+            libc::close(self.notice.as_raw_fd());
+        }
+        self.retire.as_raw_fd()
+    }
+}
+
+/// An accept error that only means there is nothing to accept right now.
+#[cfg(unix)]
+pub(crate) fn lost_accept_race(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+/// Block until `listener` has a connection to accept (`true`) or the
+/// generation `retire` belongs to has been retired (`false`).
+#[cfg(unix)]
+pub(crate) fn await_connection(listener: std::os::fd::RawFd, retire: std::os::fd::RawFd) -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: retire,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: listener,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: `fds` is two valid `pollfd` for the duration of the call.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Let the accept that follows report the failure.
+            return true;
+        }
+        if fds[0].revents != 0 {
+            return false;
+        }
+        if fds[1].revents != 0 {
+            return true;
+        }
+    }
 }
 
 /// Run the daemon as a prefork pool of `cfg.workers` worker processes.
 ///
 /// `datadir` (when `Some`) is polled for on-disk changes so a sidecar that writes
 /// the volume triggers a reload without sending `RELOAD`. `reload_db` re-reads the
-/// signatures; on a `RELOAD`/SIGHUP/data-dir change the supervisor calls it,
-/// warms the result, and re-forks the pool with the new DB — a failed reload is
+/// signatures; on a `RELOAD`/SIGUSR2/data-dir change the supervisor calls it,
+/// warms the result, and re-forks the pool with the new DB. A failed reload is
 /// logged and the running DB is kept. `side` is an additional listener served by
 /// one more child, forked, reaped and reloaded exactly as the workers are.
 #[cfg(unix)]
@@ -1054,7 +1556,7 @@ pub fn run_prefork(
     addr: ListenAddr,
     opts: Arc<ScanOptions>,
     mut cfg: PoolConfig,
-    datadir: Option<std::path::PathBuf>,
+    mut datadir: Option<Watch>,
     reload_db: &dyn Fn() -> Result<Scanner, String>,
     side: Option<&SideListener>,
 ) -> io::Result<()> {
@@ -1065,11 +1567,14 @@ pub fn run_prefork(
     }
 
     let listener = bind_listener(&addr)?;
+    // Workers wait in `await_connection`, not in `accept`: several may wake for
+    // one connection, and the ones that lose the race must not block in accept.
+    listener.set_nonblocking()?;
 
-    // Warm every lazily-initialised structure (engine automaton, compiled YARA
-    // rules) BEFORE forking, so all workers share them read-only via COW rather
-    // than each compiling its own private copy on first scan.
-    let _ = scan_stream(&db, &b"MZ\x90\x00\x00\x00\x00\x00"[..]);
+    // Warm every lazily-initialised structure BEFORE forking, so all workers
+    // share them read-only via COW rather than each building its own copy on
+    // first scan.
+    exav_core::warm_up(&db);
 
     // Sized here, before the options are shared: the address space is measured
     // once the database is loaded and warmed, and both the per-job ceiling and
@@ -1079,8 +1584,9 @@ pub fn run_prefork(
         if cfg.max_memory_bytes > afford {
             eprintln!(
                 "exav: per-job memory {} MiB x {} workers exceeds what this host can back; \
-                 using {} MiB per job (RAM minus the {} MiB shared database). Raise RAM, \
-                 lower --workers, or set a smaller --max-process-bytes to silence this.",
+                 using {} MiB per job (two thirds of RAM, less the {} MiB shared database, \
+                 over the workers). Raise RAM, lower --workers, or set a smaller \
+                 --max-process-bytes to silence this.",
                 cfg.max_memory_bytes >> 20,
                 cfg.workers,
                 afford >> 20,
@@ -1100,7 +1606,7 @@ pub fn run_prefork(
     // Bound the POOL, not just each worker.
     //
     // `RLIMIT_AS` is per process, so N workers at a B-byte budget permit N*B in
-    // total — and nothing checked that against the machine. On a 5.9 GB host, 4
+    // total, and nothing checked that against the machine. On a 5.9 GB host, 4
     // workers at 2 GiB each permits 8 GiB, so the per-process backstop never
     // fires and the SYSTEM OOM killer picks workers off instead. That is strictly
     // worse: a `SIGKILL` cannot be caught, so the worker dies without answering
@@ -1126,21 +1632,27 @@ pub fn run_prefork(
     // worker inherits it via copy-on-write.
     DAEMON_MAX_WORKERS.store(cfg.workers.max(1), Ordering::Relaxed);
 
+    arm_wakeup()?;
     install_handler(libc::SIGTERM, on_shutdown);
     install_handler(libc::SIGINT, on_shutdown);
     install_handler(libc::SIGHUP, on_sighup);
+    install_handler(libc::SIGUSR2, on_sigusr2);
     install_handler(libc::SIGCHLD, on_sigchld);
 
+    let mut gen = Generation::new()?;
     let mut children = std::collections::HashSet::new();
     for _ in 0..cfg.workers {
-        children.insert(spawn_worker(&listener, &db, &opts, &cfg)?);
+        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
     }
     let mut side_pid = match side {
-        Some(s) => Some(spawn_side(s, &db, &opts)?),
+        Some(s) => Some(spawn_side(s, &db, &opts, &gen)?),
         None => None,
     };
-
-    let mut last_mtime = datadir.as_deref().and_then(datadir_mtime);
+    // Children of retired generations, still finishing their last job. They
+    // are reaped but not replaced, and stopped once their grace has passed.
+    let mut retiring: std::collections::HashMap<libc::pid_t, Retiring> =
+        std::collections::HashMap::new();
+    let grace = retire_grace(cfg.max_scan_time);
 
     // Supervisor: reap exited workers and respawn to keep the count constant,
     // reload signatures on request, until a shutdown signal arrives.
@@ -1157,13 +1669,23 @@ pub fn run_prefork(
             if pid <= 0 {
                 break; // 0 = none exited yet; <0 = no children / error
             }
+            let side_name = side.map_or("worker", |s| s.name);
+            if let Some(r) = retiring.remove(&pid) {
+                log_child_exit(pid, status, if r.side { side_name } else { "worker" }, true);
+                continue;
+            }
             let is_side = side_pid == Some(pid);
             if is_side {
                 side_pid = None;
             } else {
                 children.remove(&pid);
             }
-            log_child_exit(pid, status, side.map_or("worker", |s| s.name), is_side);
+            log_child_exit(
+                pid,
+                status,
+                if is_side { side_name } else { "worker" },
+                false,
+            );
             if !SHUTDOWN.load(Ordering::Relaxed) {
                 if is_side {
                     // Unwrapping is sound: `is_side` is only ever true when a
@@ -1172,25 +1694,32 @@ pub fn run_prefork(
                         side.expect("a side listener exited, so there is one"),
                         &db,
                         &opts,
+                        &gen,
                     )?);
                 } else {
-                    children.insert(spawn_worker(&listener, &db, &opts, &cfg)?);
+                    children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
                 }
             }
         }
 
-        // Reload trigger: an explicit RELOAD/SIGHUP, or the data dir changed on
-        // disk (a sidecar wrote it). Coalesce both into one reload per tick.
-        let disk_changed = match datadir.as_deref().and_then(datadir_mtime) {
-            Some(t) => {
-                let changed = last_mtime.map(|prev| t > prev).unwrap_or(true);
-                if changed {
-                    last_mtime = Some(t);
+        // Log rotation: every child holds its own handle.
+        if HUP_RECEIVED.swap(false, Ordering::Relaxed) {
+            for &pid in children
+                .iter()
+                .chain(side_pid.iter())
+                .chain(retiring.keys())
+            {
+                // SAFETY: signals a child of this process that has not been
+                // reaped, so the pid cannot have been reused.
+                unsafe {
+                    libc::kill(pid, libc::SIGHUP);
                 }
-                changed
             }
-            None => false,
-        };
+        }
+
+        // Reload trigger: an explicit RELOAD/SIGUSR2, or the data dir changed on
+        // disk (a sidecar wrote it). Coalesce both into one reload per tick.
+        let disk_changed = datadir.as_mut().is_some_and(Watch::changed);
         if RELOAD_REQUESTED.swap(false, Ordering::Relaxed) || disk_changed {
             match reload_db() {
                 Ok(new_db) => {
@@ -1199,24 +1728,27 @@ pub fn run_prefork(
                         new_db.signature_count()
                     );
                     // Warm before forking so new workers share it COW.
-                    let _ = scan_stream(&new_db, &b"MZ\x90\x00\x00\x00\x00\x00"[..]);
+                    exav_core::warm_up(&new_db);
                     db = Arc::new(new_db);
-                    // Graceful re-fork: bring up a fresh generation from the new
-                    // DB, then retire the old children (reaped on the next tick).
-                    // The side listener goes with them, which is the whole of its
-                    // signature swap — it comes back forked from the new database.
-                    let mut old: Vec<libc::pid_t> = children.drain().collect();
-                    old.extend(side_pid.take());
+                    // Replacing the generation drops the old one, which is the
+                    // old children's notice to leave once idle. It happens
+                    // before the fork so the new children never hold the old
+                    // write end. The side listener goes with them, which is the
+                    // whole of its signature swap: it comes back forked from
+                    // the new database.
+                    gen = Generation::new()?;
+                    let since = std::time::Instant::now();
+                    retiring.extend(
+                        children
+                            .drain()
+                            .map(|pid| (pid, Retiring::new(false, since))),
+                    );
+                    retiring.extend(side_pid.take().map(|pid| (pid, Retiring::new(true, since))));
                     for _ in 0..cfg.workers {
-                        children.insert(spawn_worker(&listener, &db, &opts, &cfg)?);
+                        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
                     }
                     if let Some(s) = side {
-                        side_pid = Some(spawn_side(s, &db, &opts)?);
-                    }
-                    for pid in old {
-                        unsafe {
-                            libc::kill(pid, libc::SIGTERM);
-                        }
+                        side_pid = Some(spawn_side(s, &db, &opts, &gen)?);
                     }
                 }
                 Err(e) => {
@@ -1225,11 +1757,43 @@ pub fn run_prefork(
             }
         }
 
-        nap(SUPERVISOR_TICK);
+        // A retired child past its grace is stopped: an idle session or a
+        // client that never finishes its request would otherwise keep it, and
+        // the old signatures it serves, alive indefinitely.
+        let now = std::time::Instant::now();
+        let mut tick = SUPERVISOR_TICK;
+        for (&pid, r) in retiring.iter_mut().filter(|(_, r)| !r.stopped) {
+            let due = r.since + grace;
+            if now >= due {
+                let what = if r.side {
+                    side.map_or("worker", |s| s.name)
+                } else {
+                    "worker"
+                };
+                eprintln!(
+                    "exav: {what} {pid} of a retired generation is still busy after {}s; stopping it",
+                    grace.as_secs()
+                );
+                // SAFETY: signals a child of this process that has not been
+                // reaped, so the pid cannot have been reused.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                r.stopped = true;
+            } else {
+                tick = tick.min(due - now);
+            }
+        }
+        nap(tick);
     }
 
     // Graceful teardown: signal every child, then reap them.
-    let all: Vec<libc::pid_t> = children.iter().copied().chain(side_pid).collect();
+    let all: Vec<libc::pid_t> = children
+        .iter()
+        .copied()
+        .chain(side_pid)
+        .chain(retiring.keys().copied())
+        .collect();
     for &pid in &all {
         unsafe {
             libc::kill(pid, libc::SIGTERM);
@@ -1247,7 +1811,7 @@ pub fn run_prefork(
 /// Ask the kernel to kill this process when its parent goes.
 ///
 /// A worker spends its life blocked in `accept()`, so it cannot notice that the
-/// supervisor has died — and when the supervisor is killed outright rather than
+/// supervisor has died, and when the supervisor is killed outright rather than
 /// asked to stop (the OOM killer, `kill -9`, a container stop, a test harness
 /// dropping the child) it never gets to take its pool down with it. The workers
 /// are reparented to init and block forever on a socket nobody will connect to
@@ -1255,7 +1819,7 @@ pub fn run_prefork(
 /// per run of this crate's daemon tests, accumulating across runs until the
 /// process table or the descriptor ceiling gives out.
 ///
-/// `PR_SET_PDEATHSIG` is Linux-only and there is no portable equivalent — the
+/// `PR_SET_PDEATHSIG` is Linux-only and there is no portable equivalent: the
 /// alternatives all need the worker to be watching a descriptor it is not
 /// watching. On other Unixes a supervisor killed outright still leaves its
 /// workers behind; one asked to stop takes them with it as it always did.
@@ -1276,7 +1840,7 @@ fn die_with_parent(supervisor: libc::pid_t) {
         }
         // The parent can die between `fork` and the `prctl`, in which case the
         // signal it would have raised was already missed and this worker would
-        // block forever — the same leak through a narrower window. Comparing
+        // block forever: the same leak through a narrower window. Comparing
         // against the pid the supervisor recorded of itself is what makes that
         // check sound: a parent that is no longer *that* process is gone,
         // whatever pid took its place.
@@ -1296,6 +1860,7 @@ fn spawn_side(
     side: &SideListener,
     db: &Arc<Scanner>,
     opts: &Arc<ScanOptions>,
+    gen: &Generation,
 ) -> io::Result<libc::pid_t> {
     use std::io::Write as _;
     let _ = io::stderr().flush();
@@ -1306,17 +1871,13 @@ fn spawn_side(
     match pid {
         -1 => Err(io::Error::last_os_error()),
         0 => {
-            unsafe {
-                libc::signal(libc::SIGTERM, libc::SIG_DFL);
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::signal(libc::SIGHUP, libc::SIG_DFL);
-                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-            }
+            let retire = gen.enter();
+            child_signals();
             // After the resets above, so the SIGTERM it arranges is the default
-            // disposition — a handler inherited from the supervisor would
+            // disposition; a handler inherited from the supervisor would
             // otherwise decide what parent death means here.
             die_with_parent(supervisor);
-            (side.serve)(Arc::clone(db), Arc::clone(opts));
+            (side.serve)(Arc::clone(db), Arc::clone(opts), retire);
             // The listener was the child's whole job, so there is nothing left
             // for it to do but let the supervisor respawn it.
             unsafe { libc::_exit(2) }
@@ -1331,6 +1892,7 @@ fn spawn_worker(
     db: &Arc<Scanner>,
     opts: &Arc<ScanOptions>,
     cfg: &PoolConfig,
+    gen: &Generation,
 ) -> io::Result<libc::pid_t> {
     // Flush so buffered parent output isn't duplicated into the child.
     use std::io::Write as _;
@@ -1340,14 +1902,15 @@ fn spawn_worker(
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
-        0 => worker_main(listener, db, opts, cfg, supervisor), // never returns
+        0 => worker_main(listener, db, opts, cfg, supervisor, gen.enter()), // never returns
         n => Ok(n),
     }
 }
 
 /// A worker process: bound by the kernel limits, it accepts and serves
-/// connections one at a time until it hits its job limit (then exits cleanly so
-/// the supervisor recycles it). Never returns.
+/// connections one at a time until it hits its job limit or its generation
+/// `retire` is retired (then exits cleanly, and the supervisor replaces it in
+/// the first case only). Never returns.
 #[cfg(unix)]
 fn worker_main(
     listener: &BoundListener,
@@ -1355,6 +1918,7 @@ fn worker_main(
     opts: &ScanOptions,
     cfg: &PoolConfig,
     supervisor: libc::pid_t,
+    retire: std::os::fd::RawFd,
 ) -> ! {
     // Apply the kernel-enforced resource caps to *this* process.
     //
@@ -1363,7 +1927,7 @@ fn worker_main(
     // configured value would give a scan only what is left over rather than the
     // budget the setting names, and jobs would be killed for exceeding a ceiling
     // nobody asked for. Adding what the process already uses makes the number
-    // mean what it says — memory available TO A SCAN.
+    // mean what it says: memory available TO A SCAN.
     //
     // Zero means "no limit", so it must not be added to: `already` is non-zero,
     // and the sum would pin the address space at the worker's current footprint,
@@ -1375,29 +1939,32 @@ fn worker_main(
             cfg.max_memory_bytes.saturating_add(already),
         );
     }
-    set_rlimit(libc::RLIMIT_CPU as libc::c_int, cfg.max_cpu_secs);
     install_handler(libc::SIGALRM, on_sigalrm);
+    install_handler(libc::SIGXCPU, on_sigxcpu);
     // Report an allocation failure to the client instead of dying silently.
     install_handler(libc::SIGABRT, on_sigabrt);
-    // Restore default disposition for the signals the parent handles, so the
-    // supervisor's kill terminates us and inherited handlers don't fire here.
-    unsafe {
-        libc::signal(libc::SIGTERM, libc::SIG_DFL);
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::signal(libc::SIGHUP, libc::SIG_DFL);
-        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-    }
-    // Only now, with SIGTERM back to its default disposition: arranged before
-    // the reset, parent death would run the handler this worker inherited from
-    // the supervisor, which only sets a flag — and the worker would go on to
-    // block in `accept()` exactly as if nothing had been arranged at all.
+    // Replace the handlers inherited from the supervisor, so its flag-setting
+    // handlers don't fire here.
+    child_signals();
+    install_handler(libc::SIGTERM, on_sigterm);
+    // Only now, with SIGTERM handled here: arranged before, parent death would
+    // run the handler this worker inherited from the supervisor, which only
+    // sets a flag, and the worker would go on to block in `accept()` exactly
+    // as if nothing had been arranged at all.
     die_with_parent(supervisor);
-    let arm = || set_timer(cfg.max_scan_time);
-    let disarm = || set_timer(std::time::Duration::ZERO);
+    let arm = || {
+        IN_JOB.store(true, std::sync::atomic::Ordering::Relaxed);
+        arm_cpu_limit(cfg.max_cpu_secs);
+        set_timer(cfg.max_scan_time)
+    };
+    let disarm = || {
+        set_timer(std::time::Duration::ZERO);
+        IN_JOB.store(false, std::sync::atomic::Ordering::Relaxed);
+    };
     // A `RELOAD` command reaches a worker, not the supervisor; forward it by
     // signalling the parent, which owns the pool and does the re-fork.
     let reload = || unsafe {
-        libc::kill(libc::getppid(), libc::SIGHUP);
+        libc::kill(libc::getppid(), libc::SIGUSR2);
     };
     // `SHUTDOWN` likewise forwards to the supervisor (SIGTERM → graceful
     // teardown of the whole pool). Disabled → report it wasn't honoured.
@@ -1416,9 +1983,15 @@ fn worker_main(
 
     let mut jobs = 0u64;
     loop {
+        if !await_connection(listener.as_raw_fd(), retire) {
+            unsafe { libc::_exit(0) }
+        }
+        // The listener is non-blocking, and on some systems an accepted socket
+        // inherits that; a job's reads are written for a blocking one.
         let outcome: io::Result<()> = match listener {
             BoundListener::Unix(l) => match l.accept() {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
                     // Record the fd so `on_sigabrt` can answer on this connection
                     // if the scan aborts, instead of closing without a word.
@@ -1442,7 +2015,8 @@ fn worker_main(
                     disarm(); // ensure the timer is off between connections
                     r
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // Another worker took the connection this one woke for.
+                Err(e) if lost_accept_race(&e) => continue,
                 Err(e) => unsafe {
                     eprintln!("exav: worker accept error: {e}");
                     libc::_exit(1);
@@ -1450,6 +2024,7 @@ fn worker_main(
             },
             BoundListener::Tcp(l) => match l.accept() {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT));
                     // As on the Unix path: without the fd, `on_sigabrt` has
                     // nowhere to send its last word and an aborted scan closes
@@ -1476,7 +2051,7 @@ fn worker_main(
                     disarm();
                     r
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if lost_accept_race(&e) => continue,
                 Err(e) => unsafe {
                     eprintln!("exav: worker accept error: {e}");
                     libc::_exit(1);
@@ -1496,20 +2071,25 @@ fn worker_main(
 }
 
 /// Decode a reaped child's wait-status into a human-readable cause, so the
-/// operator can see *why* it died (timeout / OOM / CPU / recycle). `side_name`
-/// names the extra listener's child when `is_side`; everything else is a worker.
+/// operator can see *why* it died (timeout / OOM / CPU / recycle). `what` names
+/// the child; `retired` says it belonged to a generation a reload replaced.
 #[cfg(unix)]
-fn log_child_exit(pid: libc::pid_t, status: libc::c_int, side_name: &str, is_side: bool) {
+fn log_child_exit(pid: libc::pid_t, status: libc::c_int, what: &str, retired: bool) {
     let cause = if libc::WIFEXITED(status) {
         match libc::WEXITSTATUS(status) {
             EXIT_TIMEOUT => "scan wall-clock timeout".to_string(),
+            EXIT_CPU => "scan CPU-time limit".to_string(),
             EXIT_ABORTED => "aborted mid-scan (reported to the client)".to_string(),
+            EXIT_STOPPED => "stopped".to_string(),
+            0 if retired => "retired after a reload".to_string(),
             0 => "recycled (job limit / clean exit)".to_string(),
             code => format!("exit code {code}"),
         }
     } else if libc::WIFSIGNALED(status) {
         match libc::WTERMSIG(status) {
-            libc::SIGKILL => "killed (OOM / RLIMIT_AS)".to_string(),
+            // RLIMIT_AS fails an allocation (SIGABRT below); SIGKILL comes from
+            // the system OOM killer, a hard RLIMIT_CPU or an operator.
+            libc::SIGKILL => "killed by SIGKILL (system OOM killer or operator)".to_string(),
             libc::SIGXCPU => "CPU-time limit (RLIMIT_CPU)".to_string(),
             libc::SIGABRT => "aborted (allocation failure under RLIMIT_AS)".to_string(),
             sig => format!("signal {sig}"),
@@ -1517,7 +2097,6 @@ fn log_child_exit(pid: libc::pid_t, status: libc::c_int, side_name: &str, is_sid
     } else {
         "unknown".to_string()
     };
-    let what = if is_side { side_name } else { "worker" };
     eprintln!("exav: {what} {pid} exited: {cause}");
 }
 
@@ -1560,7 +2139,7 @@ fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(String, Del
         buf.pop();
     }
     // A path on Unix is bytes, not text, and a filename that is not valid UTF-8
-    // is perfectly legal — so `from_utf8_lossy` can replace bytes and produce a
+    // is perfectly legal, so `from_utf8_lossy` can replace bytes and produce a
     // path that names a different file, or none. The command pipeline is `str`
     // throughout, so the lossy conversion stands for now; what must not stand is
     // the misleading answer. Without this the client is told "No such file or
@@ -1651,7 +2230,7 @@ where
     // IDSESSION/SESSION keep the connection open for many commands until END.
     // IDSESSION tags each reply with a sequence id (the modern, client-preferred
     // form); the legacy SESSION does not. Every other command is handled once and
-    // the connection is then closed — clamd's single-command-per-connection
+    // the connection is then closed: clamd's single-command-per-connection
     // semantics, which clients rely on to know the reply is complete.
     let idsession = word.eq_ignore_ascii_case("IDSESSION");
     if idsession || word.eq_ignore_ascii_case("SESSION") {
@@ -1834,7 +2413,7 @@ fn dispatch<R: Read>(
         // commands the daemon speaks. Format matches clamd: `<version>| COMMANDS:
         // <space-separated list>`.
         // The list is what a client uses to decide what it may send, so a verb
-        // that works and is missing here is a capability nobody discovers — and
+        // that works and is missing here is a capability nobody discovers, and
         // a verb that is listed but refused is a capability nobody can use.
         // `SCANURL` is therefore listed only when this daemon would honour it:
         // built with `http-scan` and started with `--allow-http-scan`.
@@ -1856,7 +2435,7 @@ fn dispatch<R: Read>(
         //
         // The clamd fields keep their positions and their names, because
         // `clamdtop` finds its columns by both. What exav knows and clamd does
-        // not — where this process spent its scan time — follows them as
+        // not (where this process spent its scan time) follows them as
         // `SCANSTATS`/`MATCHERSTATS` lines, which a clamd client ignores and a
         // human or a scraper can read. `QUEUE` reports the scans actually in
         // flight rather than the constant `0 items` a stub would give, since a
@@ -1882,7 +2461,7 @@ fn dispatch<R: Read>(
         "SCAN" => vec![scan_one_path(db, opts, arg)],
         "CONTSCAN" | "MULTISCAN" => scan_tree(db, opts, arg),
         // All-match: report every matching signature per file (not just the
-        // first), one reply line each — clamd's ALLMATCHSCAN semantics.
+        // first), one reply line each: clamd's ALLMATCHSCAN semantics.
         "ALLMATCHSCAN" => scan_tree_allmatch(db, opts, arg),
         "INSTREAM" => vec![instream(db, opts, reader)?],
         // Extended INSTREAM: same chunk framing, structured JSON reply with the
@@ -1919,7 +2498,7 @@ fn write_reply<W: Write>(w: &mut W, id: Option<u64>, reply: &str, delim: Delim) 
     // breaks clamd-session clients like clamdtop, which then see
     // `2: STATE:`/`2: THREADS:` instead of the bare field lines and can't parse
     // the body. Each CONTSCAN file result is a separate reply message (its own
-    // call here), so it still gets its own id — only intra-message lines change.
+    // call here), so it still gets its own id; only intra-message lines change.
     if let Some(n) = id {
         write!(w, "{n}: ")?;
     }
@@ -1932,7 +2511,7 @@ fn write_reply<W: Write>(w: &mut W, id: Option<u64>, reply: &str, delim: Delim) 
 /// [`exav_core::Verdict`] classification. A partial verdict is surfaced as
 /// `<TAG> (<reason>) ERROR` (never `OK`) so the never-silent-skip invariant
 /// holds on the wire, and the tag/detail come from the same source the one-shot
-/// CLI uses — the two surfaces cannot drift apart.
+/// CLI uses, so the two surfaces cannot drift apart.
 fn verdict_line(target: &str, report: &ScanReport) -> String {
     let mut owned;
     let report = if report.verdict.category() == VerdictCategory::Partial {
@@ -1946,12 +2525,12 @@ fn verdict_line(target: &str, report: &ScanReport) -> String {
     match v.category() {
         VerdictCategory::Infected => format!("{target}: {} FOUND", v.detail().unwrap_or_default()),
         VerdictCategory::Clean => format!("{target}: OK"),
-        // The same grammar the one-shot CLI prints — `reason CATEGORY STATUS` —
+        // The same grammar the one-shot CLI prints (`reason CATEGORY STATUS`),
         // so the two surfaces do not describe one verdict two ways. Only the
         // status word differs, and it has to: clamd's vocabulary is `OK`,
         // `FOUND` and `ERROR`, and a real client reads a word outside it as
         // `OK`. Measured against clamdscan 1.4.3, which rewrites an unknown
-        // status to `OK` and exits 0 — so `PARTIAL` on this wire would turn
+        // status to `OK` and exits 0, so `PARTIAL` on this wire would turn
         // exav's fail-closed answer into a fail-open one at every existing
         // client. `ERROR` is the only word here that fails closed.
         //
@@ -2002,7 +2581,7 @@ fn scan_one_path(db: &Scanner, opts: &ScanOptions, path: &str) -> String {
 /// Scanning a directory one file at a time misses one whole class of archive: a
 /// set split across `big.7z.001`, `.002`, `.003` has no piece that decodes on
 /// its own, so every part reports `OK` and the archive is never opened. Sets are
-/// therefore rejoined per directory and scanned as the archives they are — see
+/// therefore rejoined per directory and scanned as the archives they are. See
 /// [`volume_set_lines`] for how the result is attributed back to files.
 fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
     if path.is_empty() {
@@ -2042,7 +2621,7 @@ fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
 /// Rejoin the multi-volume sets among `files` and scan each as one archive.
 ///
 /// Returns the status text to report for each part of a set that resolved to
-/// something other than clean — keyed by the part's own path, so the caller
+/// something other than clean, keyed by the part's own path, so the caller
 /// still emits exactly one reply line per file. A piece of an infected archive
 /// is not a clean file, and it is the piece the operator has to act on.
 ///
@@ -2082,7 +2661,7 @@ fn volume_set_lines(
             // operator what was actually found, which `big.7z.002` does not.
             //
             // Built by `verdict_line` so a part's reply and a whole file's reply
-            // share one grammar — including `--partial-as`, which `verdict_line`
+            // share one grammar, including `--partial-as`, which `verdict_line`
             // applies. The empty target leaves a bare `": "` in front for the
             // caller to fill in with the part's path.
             let line = verdict_line("", &v.report);
@@ -2124,32 +2703,28 @@ fn scan_tree_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<Strin
     out
 }
 
-/// All-match scan of a single file: report every matching signature. Works on a
-/// buffered copy (bounded by `deep_analysis_max`); a larger file falls back to a
-/// normal single-match scan so it is never silently skipped — mirroring the CLI's
-/// `--all-matches` so the two surfaces agree.
+/// All-match scan of a single file: report every matching signature, at any
+/// size; past `--max-input-bytes`, what its first bytes hold. With no
+/// detection, an incomplete scan is reported as such. Unlike the CLI's
+/// `--all-matches`, a reply with detections carries no line for the limit.
 fn scan_one_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
     if path.is_empty() {
         return vec!["ALLMATCHSCAN: missing path ERROR".to_string()];
     }
-    let cap = opts.deep_analysis_max;
-    let mut data = Vec::new();
-    let read = File::open(Path::new(path)).and_then(|f| {
-        f.take(cap.saturating_add(1))
-            .read_to_end(&mut data)
-            .map(|_| ())
-    });
-    if let Err(e) = read {
-        return vec![format!("{path}: {e} ERROR")];
-    }
-    if data.len() as u64 > cap {
-        // Too big to buffer for all-match; single-match scan (never skip).
-        return vec![scan_one_path(db, opts, path)];
-    }
+    let opened = File::open(Path::new(path)).and_then(|f| f.metadata().map(|m| (f, m.len())));
+    let (file, size) = match opened {
+        Ok(o) => o,
+        Err(e) => return vec![format!("{path}: {e} ERROR")],
+    };
     // Isolate a panic on a crafted file into an ERROR for this target.
     let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        analyze_all_with_outcome(db, &data, opts)
+        analyze_all_seekable(db, file, size, opts)
     }));
+    let found = match found {
+        Ok(Ok(found)) => Ok(found),
+        Ok(Err(e)) => return vec![format!("{path}: {e} ERROR")],
+        Err(panic) => Err(panic),
+    };
     match found {
         Ok((dets, _)) if !dets.is_empty() => dets
             .into_iter()
@@ -2157,16 +2732,18 @@ fn scan_one_allmatch(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String
             .collect(),
         // No detections, but the walk may not have covered the file. Reporting OK
         // here regardless is a silent clean, and it lands in the mode a
-        // differential harness drives every file through — so the measurements
+        // differential harness drives every file through, so the measurements
         // steering development inherited it too.
-        Ok((_, outcome)) => vec![match outcome {
-            AllMatchOutcome::Complete => format!("{path}: OK"),
-            AllMatchOutcome::LimitsExceeded(r) => format!("{path}: {r} LIMITS-EXCEEDED"),
-            AllMatchOutcome::Unscannable(r) => format!("{path}: {r} UNSCANNABLE"),
-            AllMatchOutcome::PasswordProtected(r) => {
-                format!("{path}: {r} PASSWORD-PROTECTED")
-            }
-        }],
+        // The same line a single-match scan gives, `--partial-as` included.
+        Ok((_, outcome)) => {
+            let verdict = match outcome {
+                AllMatchOutcome::Complete => Verdict::Clean,
+                AllMatchOutcome::LimitsExceeded(reason) => Verdict::LimitsExceeded { reason },
+                AllMatchOutcome::Unscannable(reason) => Verdict::Unscannable { reason },
+                AllMatchOutcome::PasswordProtected(reason) => Verdict::PasswordProtected { reason },
+            };
+            vec![verdict_line(path, &ScanReport::new(verdict, Vec::new()))]
+        }
         Err(_) => vec![format!("{path}: scan failed (internal error) ERROR")],
     }
 }
@@ -2201,7 +2778,7 @@ fn scan_url(db: &Scanner, opts: &ScanOptions, url: &str) -> String {
 /// timeout and so never trips it.
 pub(crate) const MAX_DRAIN_BYTES: u64 = 64 * 1024 * 1024;
 
-/// A stream payload materialized into a **seekable** source — in RAM when small,
+/// A stream payload materialized into a **seekable** source: in RAM when small,
 /// else spilled to an auto-deleting temp file. A seekable view is what lets a
 /// streamed input (INSTREAM/EXINSTREAM, and the CLI's stdin) get full
 /// container-aware scanning (a ZIP's central directory is at the end) at ANY size
@@ -2219,10 +2796,10 @@ impl StreamPayload {
         }
     }
 
-    /// The payload's bytes, or `None` when it is larger than `cap`. Used to feed
-    /// a payload back for multi-volume rejoining, which is the one thing that
-    /// needs a second look at the same bytes.
-    fn bytes_capped(&self, cap: u64) -> io::Result<Option<Vec<u8>>> {
+    /// The payload's bytes, or `None` when it is larger than `cap`. For the
+    /// second looks at the same bytes: multi-volume rejoining, and
+    /// `--all-matches`.
+    pub(crate) fn bytes_capped(&self, cap: u64) -> io::Result<Option<Vec<u8>>> {
         if self.len() > cap {
             return Ok(None);
         }
@@ -2235,85 +2812,175 @@ impl StreamPayload {
             }
         }
     }
+
+    /// Every detection in the payload, at any size (see
+    /// [`exav_core::analyze_all_seekable`]), for a stream of `size` bytes:
+    /// past `--max-input-bytes`, more than the payload holds.
+    pub(crate) fn all_matches(
+        &self,
+        db: &Scanner,
+        opts: &ScanOptions,
+        size: u64,
+    ) -> io::Result<(Vec<(String, exav_core::Method)>, AllMatchOutcome)> {
+        match self {
+            StreamPayload::Mem(v) => {
+                exav_core::analyze_all_seekable(db, std::io::Cursor::new(&v[..]), size, opts)
+            }
+            StreamPayload::Disk(tmp, _) => {
+                exav_core::analyze_all_seekable(db, tmp.reopen()?, size, opts)
+            }
+        }
+    }
+}
+
+/// A stream read into a seekable payload, as far as it could be held.
+pub(crate) struct Held {
+    pub(crate) payload: StreamPayload,
+    /// Why the payload stops before the stream's end, when it does: there was
+    /// nowhere left to put the rest. The reader is left at that point.
+    pub(crate) short: Option<String>,
 }
 
 /// Buffer an (already de-chunked / pre-capped) reader into a [`StreamPayload`]:
 /// up to the configured threshold in RAM, then spill the rest to a temp file.
-/// Shared by the daemon stream verbs and the CLI stdin path so both get the same
-/// seekable, container-aware scan under the same budgets.
-pub(crate) fn buffer_to_seekable<R: Read>(
-    reader: &mut R,
-) -> Result<StreamPayload, crate::spill::SpillError> {
+/// Shared by the daemon stream verbs and the CLI's stdin so all get the same
+/// seekable, container-aware scan under the same budgets. A stream larger than
+/// the budgets allow is held as far as they allow.
+pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<Held> {
+    use crate::spill::SpillError;
     let threshold = crate::spill::config().threshold;
     let mut buf = Vec::new();
     reader.by_ref().take(threshold).read_to_end(&mut buf)?;
-    if (buf.len() as u64) < threshold {
-        return Ok(StreamPayload::Mem(buf));
+    let mut block = vec![0u8; 64 * 1024];
+    let got = match (buf.len() as u64) < threshold {
+        true => 0,
+        false => read_full(reader, &mut block)?,
+    };
+    if got == 0 {
+        return Ok(Held {
+            payload: StreamPayload::Mem(buf),
+            short: None,
+        });
     }
-    // More data remains — spill the RAM head, then stream the rest to disk. The
+    // More data remains: spill the RAM head, then stream the rest to disk. The
     // budgets live in `SpillFile`: `RLIMIT_AS` caps address space and does not
     // cap a file, so without them a client that never stops sending fills the
-    // temp filesystem — a denial of service against the host rather than the
+    // temp filesystem, a denial of service against the host rather than the
     // scan, and one that outlives the connection.
-    let mut tmp = crate::spill::SpillFile::create()?;
-    tmp.write_all(&buf)?;
-    let mut block = vec![0u8; 64 * 1024];
-    loop {
-        let got = reader.read(&mut block)?;
-        if got == 0 {
+    let mut tmp = match crate::spill::SpillFile::create() {
+        Ok(t) => t,
+        Err(SpillError::Budget(why)) => {
+            return Ok(Held {
+                payload: StreamPayload::Mem(buf),
+                short: Some(why),
+            })
+        }
+        Err(SpillError::Io(e)) => return Err(e),
+    };
+    let mut short = None;
+    for chunk in [&buf[..], &block[..got]] {
+        match tmp.write_all(chunk) {
+            Ok(()) => {}
+            Err(SpillError::Budget(why)) => {
+                short = Some(why);
+                break;
+            }
+            Err(SpillError::Io(e)) => return Err(e),
+        }
+    }
+    while short.is_none() {
+        let n = reader.read(&mut block)?;
+        if n == 0 {
             break;
         }
-        tmp.write_all(&block[..got])?;
+        match tmp.write_all(&block[..n]) {
+            Ok(()) => {}
+            Err(SpillError::Budget(why)) => short = Some(why),
+            Err(SpillError::Io(e)) => return Err(e),
+        }
     }
     let len = tmp.len()?;
-    Ok(StreamPayload::Disk(tmp, len))
+    Ok(Held {
+        payload: StreamPayload::Disk(tmp, len),
+        short,
+    })
+}
+
+/// Scan what was held of a stream of `size` bytes. A payload that stops short
+/// for want of room is treated as `--max-input-bytes` treats an input past it:
+/// the held bytes get the whole scan, and with no detection in them the limit
+/// is reported.
+pub(crate) fn scan_held(
+    db: &Scanner,
+    opts: &ScanOptions,
+    held: &Held,
+    size: u64,
+) -> io::Result<(ScanReport, Option<String>)> {
+    let Some(why) = &held.short else {
+        return scan_payload(db, opts, &held.payload, size);
+    };
+    let kept = held.payload.len();
+    let (report, loc) = scan_payload(db, opts, &held.payload, kept)?;
+    if report.verdict.category() == VerdictCategory::Infected {
+        return Ok((report, loc));
+    }
+    let reason = format!("{why}; scanned the first {kept} bytes only");
+    Ok((
+        ScanReport::new(Verdict::LimitsExceeded { reason }, Vec::new()),
+        None,
+    ))
 }
 
 /// Scan a materialized payload via the seekable (container-aware) path, returning
 /// the report and the nested match location (`None` for a top-level hit).
+///
+/// `size` is the input's full size. It is larger than the payload when the
+/// input went past `--max-input-bytes` and only its start was kept.
 pub(crate) fn scan_payload(
     db: &Scanner,
     opts: &ScanOptions,
     payload: &StreamPayload,
+    size: u64,
 ) -> io::Result<(ScanReport, Option<String>)> {
     match payload {
         StreamPayload::Mem(v) => {
-            scan_seekable_located(db, std::io::Cursor::new(&v[..]), v.len() as u64, opts)
+            scan_seekable_located(db, std::io::Cursor::new(&v[..]), size, opts)
         }
-        StreamPayload::Disk(tmp, len) => {
+        StreamPayload::Disk(tmp, _) => {
             // A fresh handle positioned at 0; the `TempFile` stays alive (and
             // thus the file) for as long as the payload does.
             let file = tmp.reopen()?;
-            scan_seekable_located(db, file, *len, opts)
+            scan_seekable_located(db, file, size, opts)
         }
     }
 }
 
-/// [`scan_payload`], timed into the process counters.
+/// [`scan_held`], timed into the process counters.
 ///
 /// The ICAP listener times its own scans (it names the object from the request
-/// target, which this cannot see), so this is the daemon's stream verbs only —
+/// target, which this cannot see), so this is the daemon's stream verbs only:
 /// double-counting a scan would make the throughput figure a fiction.
 fn scan_payload_timed(
     db: &Scanner,
     opts: &ScanOptions,
-    payload: &StreamPayload,
+    held: &Held,
+    size: u64,
     target: &str,
 ) -> io::Result<(ScanReport, Option<String>)> {
     let timer = crate::metrics::ScanTimer::start();
-    let result = scan_payload(db, opts, payload);
+    let result = scan_held(db, opts, held, size);
     let category = match &result {
         Ok((report, _)) => report.verdict.category().into(),
         // A scan that failed is a scan that did not finish, which is the
         // partial column wherever else exav counts it.
         Err(_) => crate::metrics::Category::Partial,
     };
-    timer.finish(target, payload.len(), category);
+    timer.finish(target, held.payload.len(), category);
     result
 }
 
 /// Scan an INSTREAM chunk stream. The payload is materialized to a seekable
-/// source (RAM or a temp file) and given the full container-aware scan — so
+/// source (RAM or a temp file) and given the full container-aware scan, so
 /// malware inside an archive sent over INSTREAM is detected, matching clamd (the
 /// old flat-only path missed it). Any unread chunks are drained so the connection
 /// stays in sync for the next command.
@@ -2322,83 +2989,52 @@ fn instream<R: Read>(
     opts: &ScanOptions,
     reader: &mut BufReader<R>,
 ) -> io::Result<String> {
-    let max = opts.max_scan_size;
-    let mut stream = Instream::new(reader, max);
-    let payload = match buffer_to_seekable(&mut stream) {
-        Ok(p) => p,
-        // A budget with no room is a stream nobody could examine, which is a
-        // verdict the client is owed. Letting it out as an I/O error would drop
-        // the connection instead, and a client with no answer decides for
-        // itself — the one outcome an over-full temp filesystem must not buy.
-        Err(crate::spill::SpillError::Budget(reason)) => {
-            let _ = stream.drain();
-            return Ok(format!("stream: {reason} UNSCANNABLE ERROR"));
-        }
-        Err(crate::spill::SpillError::Io(e)) => return Err(e),
-    };
-    let over = stream.over_limit;
-    let truncated = stream.truncated();
-    // The reply is already decided; a drain that stops at its cap only means the
-    // connection will not be reusable.
+    let mut stream = Instream::new(reader, opts.max_scan_size);
+    let held = buffer_to_seekable(&mut stream)?;
+    // Counts what was not held, so the size is the stream's. A drain that
+    // stops at its cap only means the connection will not be reusable.
     let _reached_terminator = stream.drain()?;
-    if over {
-        let max = max.unwrap_or(0);
-        return Ok(format!("stream: size exceeds {max} LIMITS-EXCEEDED ERROR"));
-    }
     // Answering a prefix would answer a question the client never finished
     // asking, and `OK` on the benign head of a file is a bypass anyone can drive.
-    if truncated {
-        return Ok("stream: stream ended before its terminator UNSCANNABLE ERROR".to_string());
+    // Not a partial either: `--partial-as ok` would turn it back into that `OK`.
+    if stream.truncated() {
+        return Ok(format!("stream: {STREAM_CUT} ERROR"));
     }
-    let (report, _loc) = scan_payload_timed(db, opts, &payload, "stream")?;
+    let (report, _loc) = scan_payload_timed(db, opts, &held, stream.total(), "stream")?;
     Ok(verdict_line("stream", &report))
 }
 
 /// `EXINSTREAM`: scan a file sent over the exact INSTREAM chunk framing and reply
-/// with one line of compact JSON — `{"v":1,"verdict":...}`. Unlike INSTREAM's
-/// flat scan, the payload is buffered (bounded by `--max-input-bytes`) and run
-/// through the full container-aware analysis, so a detection carries its nested
-/// `location` (the `/`-joined member path). The verdict *classification* matches
-/// INSTREAM: a detection beats a limit; a not-fully-scanned stream is
-/// `unscannable`, never `clean`. An over-limit stream is `unscannable` (never
-/// clean). One detection per scan (first / most relevant).
+/// with one line of compact JSON, `{"v":1,"status":...}` (module docs). The
+/// payload is buffered and scanned as INSTREAM's is, and a detection also
+/// carries its nested `location` (the `/`-joined member path). A detection beats
+/// a limit, a stream not fully examined is `PARTIAL` with its category, never
+/// `OK`, and one cut before its terminator is `ERROR`. One detection per scan.
 fn exinstream<R: Read>(
     db: &Scanner,
     opts: &ScanOptions,
     reader: &mut BufReader<R>,
 ) -> io::Result<String> {
-    // Materialize to a seekable source (RAM small / temp file large) — same path
-    // as INSTREAM — bounded by `--max-input-bytes` (disk is the ceiling). That is
+    // Materialize to a seekable source (RAM small / temp file large), the same
+    // path as INSTREAM, bounded by `--max-input-bytes` (disk is the ceiling). That is
     // the flag this cap actually reads: `opts.max_scan_size` is exav-core's
     // per-top-level-file bound, which `--max-input-bytes` sets. Naming the other
     // flag here would send an operator to raise a setting that changes nothing.
     let mut stream = Instream::new(reader, opts.max_scan_size);
-    let payload = match buffer_to_seekable(&mut stream) {
-        Ok(p) => p,
+    let held = match buffer_to_seekable(&mut stream) {
+        Ok(h) => h,
         Err(e) => {
             let _ = stream.drain();
             return Ok(json_error(&format!("stream read error: {e}")));
         }
     };
-    let over = stream.over_limit;
-    let truncated = stream.truncated();
-    // The reply is already decided; a drain that stops at its cap only means the
-    // connection will not be reusable.
+    // As in INSTREAM: counts what was not held.
     let _reached_terminator = stream.drain()?;
-    if over {
-        return Ok(json_partial(
-            "LIMITS-EXCEEDED",
-            Some("stream exceeds max-filesize; not fully scanned"),
-        ));
-    }
     // As in INSTREAM: a prefix is not the file, so it gets no verdict.
-    if truncated {
-        return Ok(json_partial(
-            "TRUNCATED",
-            Some("stream ended before its terminator; not fully received"),
-        ));
+    if stream.truncated() {
+        return Ok(json_error(STREAM_CUT));
     }
-    match scan_payload_timed(db, opts, &payload, "stream") {
+    match scan_payload_timed(db, opts, &held, stream.total(), "stream") {
         Ok((report, loc)) => Ok(verdict_json(&report, loc)),
         Err(e) => Ok(json_error(&format!("scan error: {e}"))),
     }
@@ -2460,10 +3096,11 @@ fn exinstream_multi<R: Read>(
 ) -> io::Result<String> {
     use serde_json::json;
     let mut names: Vec<String> = Vec::new();
-    let mut payloads: Vec<StreamPayload> = Vec::new();
+    // `None` for a file the daemon could not hold.
+    let mut payloads: Vec<Option<StreamPayload>> = Vec::new();
     let mut entries: Vec<serde_json::Value> = Vec::new();
     // Set when the request stops before its terminator. Every file already read
-    // still gets its verdict — those streams were complete — but the request as
+    // still gets its verdict (those streams were complete), but the request as
     // a whole is answered as incomplete, because the files that never arrived
     // are indistinguishable from files the client chose not to send.
     let mut request_truncated = false;
@@ -2496,44 +3133,37 @@ fn exinstream_multi<R: Read>(
         let name = String::from_utf8_lossy(&raw).into_owned();
 
         let mut stream = Instream::new(reader, opts.max_scan_size);
-        let payload = match buffer_to_seekable(&mut stream) {
-            Ok(p) => p,
+        let held = match buffer_to_seekable(&mut stream) {
+            Ok(h) => h,
             Err(e) => {
                 let _ = stream.drain();
                 return Ok(json_error(&format!("stream read error: {e}")));
             }
         };
-        let over = stream.over_limit;
-        let truncated = stream.truncated();
-        stream.drain()?;
-        if truncated {
-            request_truncated = true;
-        }
-        let fields = if over {
-            json!({
-                "status": "PARTIAL",
-                "category": "LIMITS-EXCEEDED",
-                "reason": "stream exceeds max-filesize; not fully scanned",
-            })
-        } else if truncated {
-            json!({
-                "status": "PARTIAL",
-                "category": "TRUNCATED",
-                "reason": "stream ended before its terminator; not fully received",
-            })
+        // Past a drain that stopped at its cap, or at end of input, the next
+        // file's framing is not where the loop would look for it.
+        let cut = !stream.drain()? || stream.truncated();
+        let fields = if stream.truncated() {
+            json!({"status": "ERROR", "reason": STREAM_CUT})
         } else {
-            match scan_payload_timed(db, opts, &payload, &name) {
+            match scan_payload_timed(db, opts, &held, stream.total(), &name) {
                 Ok((report, loc)) => verdict_fields(&report, loc),
                 Err(e) => json!({"status": "ERROR", "reason": format!("scan error: {e}")}),
             }
         };
-        match &payload {
+        match &held.payload {
             StreamPayload::Mem(v) => held_ram += v.len() as u64,
             StreamPayload::Disk(_, n) => held_spill += *n,
         }
         entries.push(named_entry(&name, fields, None));
         names.push(name);
-        payloads.push(payload);
+        // Only a whole file can be a part of a rejoined set.
+        let whole = held.short.is_none() && held.payload.len() == stream.total();
+        payloads.push(whole.then_some(held.payload));
+        if cut {
+            request_truncated = true;
+            break;
+        }
 
         // Stop before accepting the file that would cross the line, so the
         // reply describes a request the daemon actually held rather than one it
@@ -2557,6 +3187,8 @@ fn exinstream_multi<R: Read>(
             .position(|n| n == name)
             .ok_or_else(|| io::Error::other("no such stream"))?;
         payloads[i]
+            .as_ref()
+            .ok_or_else(|| io::Error::other("stream was not held"))?
             .bytes_capped(opts.deep_analysis_max)?
             .ok_or_else(|| io::Error::other("stream too large to rejoin"))
     });
@@ -2574,7 +3206,7 @@ fn exinstream_multi<R: Read>(
     }
     let mut out = json!({"v": 1, "files": entries});
     if request_truncated {
-        // The per-file verdicts above stand — those streams arrived whole. This
+        // The per-file verdicts above stand: those streams arrived whole. This
         // says the LIST is short: files the client meant to send never got here,
         // and a caller treating "every file came back clean" as "the batch is
         // clean" would be wrong about a batch it never fully sent.
@@ -2611,7 +3243,7 @@ fn verdict_fields(report: &ScanReport, location: Option<String>) -> serde_json::
         report
     };
     let v = &report.verdict;
-    // `status` / `category` / `reason` — the same three names the one-shot
+    // `status` / `category` / `reason`: the same three names the one-shot
     // `--json` uses, so one schema describes both. The old `verdict`/`tag`/
     // `message` trio named the same things differently here, and its
     // `"unscannable"` collided with the *category* of that name: a
@@ -2650,8 +3282,8 @@ fn verdict_fields(report: &ScanReport, location: Option<String>) -> serde_json::
 /// Render a scan verdict as one line of compact JSON for `EXINSTREAM`.
 fn verdict_json(report: &ScanReport, location: Option<String>) -> String {
     // `"v"` is the schema version every reply carries. Key *order* is not part
-    // of the contract — the object is serialised with sorted keys, and a JSON
-    // consumer reads by name — so nothing here depends on where it lands.
+    // of the contract: the object is serialised with sorted keys, and a JSON
+    // consumer reads by name, so nothing here depends on where it lands.
     let mut o = serde_json::json!({"v": 1});
     if let Some(fields) = verdict_fields(report, location).as_object() {
         for (k, val) in fields {
@@ -2665,13 +3297,8 @@ fn json_error(message: &str) -> String {
     serde_json::json!({"v": 1, "status": "ERROR", "reason": message}).to_string()
 }
 
-fn json_partial(tag: &str, message: Option<&str>) -> String {
-    let mut o = serde_json::json!({"v": 1, "status": "PARTIAL", "category": tag});
-    if let Some(m) = message {
-        o["reason"] = serde_json::json!(m);
-    }
-    o.to_string()
-}
+/// The reason for a stream that ended before its terminator.
+const STREAM_CUT: &str = "stream ended before its terminator";
 
 /// A `Read` over a clamd INSTREAM chunk sequence: `<u32 be len><data>` repeated,
 /// ended by a zero length. Presents the de-chunked payload as one stream.
@@ -2684,7 +3311,7 @@ struct Instream<'a, R: Read> {
     /// The stream ended WITHOUT its zero-length terminator: the client closed or
     /// was cut off part-way through. The bytes received are a prefix of the file
     /// the client meant to send, so a verdict on them is a verdict on something
-    /// nobody chose to scan — and `OK` on a prefix is the shape of a bypass:
+    /// nobody chose to scan, and `OK` on a prefix is the shape of a bypass:
     /// send the benign head of a file, hang up, collect a clean answer. The
     /// caller must reply with an error instead.
     truncated: bool,
@@ -2715,7 +3342,7 @@ impl<'a, R: Read> Instream<'a, R> {
     fn next_chunk(&mut self) -> io::Result<()> {
         let mut len = [0u8; 4];
         if read_full(self.inner, &mut len)? < 4 {
-            // The client stopped before the terminator — either at a chunk
+            // The client stopped before the terminator, either at a chunk
             // boundary or part-way through a length. A well-formed INSTREAM ends
             // with a zero-length chunk, so either way this is not the file the
             // client set out to send.
@@ -2733,16 +3360,16 @@ impl<'a, R: Read> Instream<'a, R> {
     /// Consume any remaining chunks up to the terminator (used when the scan
     /// stopped early on a detection), up to [`MAX_DRAIN_BYTES`].
     ///
-    /// Draining is a courtesy — it lets the connection carry another command
-    /// instead of being reset — and a courtesy with no bound is a way to hold a
+    /// Draining is a courtesy (it lets the connection carry another command
+    /// instead of being reset), and a courtesy with no bound is a way to hold a
     /// worker. Every read completes inside the socket timeout, so the timeout
     /// never fires while a client keeps sending; without a cap one connection
     /// can occupy a slot for as long as it likes, and in the thread model there
     /// is no per-command timer behind it.
     ///
     /// Past the cap the reply still goes out and the rest of the client's bytes
-    /// are left in the socket. The session is then desynchronised — the leftover
-    /// payload parses as garbage commands — which is the client's own doing and
+    /// are left in the socket. The session is then desynchronised (the leftover
+    /// payload parses as garbage commands), which is the client's own doing and
     /// costs it a byte for every byte the daemon reads. What it no longer buys
     /// is a worker held for free.
     ///
@@ -2767,8 +3394,16 @@ impl<'a, R: Read> Instream<'a, R> {
             }
             self.remaining -= n as u32;
             drained += n as u64;
+            self.total += n as u64;
         }
         Ok(true)
+    }
+
+    /// The stream's size: every byte received, including those past the
+    /// limit that were only counted. A lower bound when `drain` stopped at
+    /// its cap.
+    fn total(&self) -> u64 {
+        self.total
     }
 }
 
@@ -2792,12 +3427,15 @@ impl<R: Read> Read for Instream<'_, R> {
                 return Ok(0);
             }
             self.remaining -= n as u32;
+            let before = self.total;
             self.total += n as u64;
             if let Some(max) = self.max {
                 if self.total > max {
-                    // Stop feeding the scanner; the caller reports the limit.
+                    // Hand over up to one byte past the limit, so the payload
+                    // holds everything the scan looks at and shows it is over;
+                    // the rest is only counted, by `drain`.
                     self.over_limit = true;
-                    return Ok(0);
+                    return Ok((max + 1 - before) as usize);
                 }
             }
             return Ok(n);
@@ -2840,6 +3478,153 @@ mod tests {
             opts.limits.max_buffer_bytes <= opts.limits.max_extracted_bytes,
             "one member may not exceed the whole extraction budget"
         );
+    }
+
+    /// Every cap on what a scan holds fits the grant, not only the total: the
+    /// engine reads an object whole up to `deep_analysis_max`, and a total
+    /// already under the grant says nothing about one object's cap.
+    #[test]
+    fn every_holding_cap_fits_the_grant() {
+        let mut opts = ScanOptions::default();
+        opts.limits.max_extracted_bytes = 1024 << 20;
+        opts.deep_analysis_max = 256 << 20;
+        fit_limits_to_job_memory(&mut opts, 300 << 20);
+        assert_eq!(opts.deep_analysis_max, 75 << 20);
+        assert_eq!(opts.limits.max_extracted_bytes, 104 << 20);
+
+        let mut opts = ScanOptions::default();
+        opts.limits.max_extracted_bytes = 100 << 20;
+        opts.limits.max_buffer_bytes = u64::MAX;
+        opts.deep_analysis_max = u64::MAX;
+        fit_limits_to_job_memory(&mut opts, 1000 << 20);
+        assert_eq!(opts.limits.max_extracted_bytes, 100 << 20);
+        assert_eq!(opts.limits.max_buffer_bytes, 250 << 20);
+        assert_eq!(opts.deep_analysis_max, 250 << 20);
+    }
+
+    /// From live archives scanned with objects allowed up to 2000M in 2 GiB
+    /// workers: a ~420 MB member read whole was matched through copies of it
+    /// (since removed) and the worker died on the allocation. What matching
+    /// still takes beside an object, an image decoded from it and its grey
+    /// copy plus a bounded lowercase copy, must fit what the job gets.
+    #[test]
+    fn an_object_and_what_matching_it_takes_fit_the_grant() {
+        let job = 2048u64 << 20;
+        let mut opts = ScanOptions::default();
+        opts.limits.max_extracted_bytes = 2000 << 20;
+        opts.limits.max_buffer_bytes = 2000 << 20;
+        opts.deep_analysis_max = 2000 << 20;
+        fit_limits_to_job_memory(&mut opts, job);
+        let object = opts.deep_analysis_max.max(opts.limits.max_buffer_bytes);
+        assert!(opts.limits.max_extracted_bytes + 2 * object + exav_core::LOWERCASE_COPY_MAX < job);
+    }
+
+    /// The default 2 GiB job leaves the default and `--clamav-compat` limits
+    /// as they are.
+    #[test]
+    fn the_default_grant_keeps_the_default_limits() {
+        for opts in [ScanOptions::default(), ScanOptions::clamav_compat()] {
+            let mut fitted = opts.clone();
+            fit_limits_to_job_memory(&mut fitted, 2048 << 20);
+            assert_eq!(
+                fitted.limits.max_extracted_bytes,
+                opts.limits.max_extracted_bytes
+            );
+            assert_eq!(fitted.limits.max_buffer_bytes, opts.limits.max_buffer_bytes);
+            assert_eq!(fitted.deep_analysis_max, opts.deep_analysis_max);
+        }
+    }
+
+    /// A signal that lands while the supervisor is awake (reaping, reloading)
+    /// still cuts its next nap short, so a crashed worker is replaced and a
+    /// `RELOAD` served at once rather than a tick later. SIGUSR2 stands in for
+    /// SIGCHLD so the children other tests spawn do not reach the handler.
+    #[test]
+    fn a_signal_before_the_nap_ends_it() {
+        arm_wakeup().unwrap();
+        install_handler(libc::SIGUSR2, on_sigchld);
+        // SAFETY: raises a signal on this thread; its handler only wakes.
+        unsafe {
+            libc::raise(libc::SIGUSR2);
+        }
+        let start = std::time::Instant::now();
+        nap(SUPERVISOR_TICK);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "slept {:?} after the signal",
+            start.elapsed()
+        );
+    }
+
+    /// The ceiling is the one on this process's own cgroup and its ancestors,
+    /// not whatever sits at the mount root.
+    #[test]
+    fn the_cgroup_limit_is_read_where_the_process_lives() {
+        let files: std::collections::HashMap<&str, &str> = [
+            ("/sys/fs/cgroup/memory.max", "max\n"),
+            ("/sys/fs/cgroup/system.slice/memory.max", "8589934592\n"),
+            (
+                "/sys/fs/cgroup/system.slice/exav.service/memory.max",
+                "max\n",
+            ),
+            (
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "9223372036854771712\n",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                "1073741824\n",
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let read = |p: &str| files.get(p).map(|s| s.to_string());
+
+        // A service under a slice with a limit: the slice's limit applies.
+        let v2 = "0::/system.slice/exav.service\n";
+        assert_eq!(cgroup_limit_from(v2, read), Some(8 << 30));
+        // A container with its own namespace sees itself at the root.
+        assert_eq!(cgroup_limit_from("0::/\n", read), None);
+        // v1, memory controller listed with others.
+        let v1 = "5:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n";
+        assert_eq!(cgroup_limit_from(v1, read), Some(1 << 30));
+        // A v1 path this mount does not show falls back to the mount root.
+        let v1 = "4:memory:/elsewhere\n";
+        assert_eq!(cgroup_limit_from(v1, read), None);
+    }
+
+    /// A file added with the very timestamps already there, as a coarse clock
+    /// stamps one written within a tick of the baseline, is a change; so is a
+    /// file put back with an older mtime. Nothing changed is no change.
+    #[test]
+    fn a_source_is_watched_by_more_than_its_newest_mtime() {
+        use std::time::{Duration, SystemTime};
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let file = |name: &str, body: &str, mtime: SystemTime| {
+            std::fs::write(dir.path().join(name), body).unwrap();
+            let f = std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap();
+            f.set_modified(mtime).unwrap();
+        };
+        let pin_dir = || {
+            let d = std::fs::File::open(dir.path()).unwrap();
+            d.set_modified(t).unwrap();
+        };
+        file("test.ndb", "a", t);
+        pin_dir();
+        let mut watch = Watch::new(dir.path().to_path_buf());
+        assert!(!watch.changed());
+
+        file("more.ndb", "b", t);
+        pin_dir();
+        assert!(watch.changed(), "a file added with the same timestamps");
+        assert!(!watch.changed());
+
+        file("more.ndb", "b", t - Duration::from_secs(60));
+        assert!(watch.changed(), "an older mtime");
     }
 
     /// Clamping only ever lowers: a generous grant must leave the operator's
@@ -3007,7 +3792,7 @@ mod tests {
 
     // Real DEFLATE ZIPs (generated by Python's zipfile). Compressed so the EICAR
     // is NOT visible to a flat scan of the container, forcing real extraction of
-    // each level — which is what exercises the nested-location chain.
+    // each level, which is what exercises the nested-location chain.
     // `ZIP_EICAR_INSIDE`: a `.zip` with member `inside.txt` = EICAR.
     const ZIP_EICAR_INSIDE: &[u8] = &[
         80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 230, 190, 244, 92, 60, 207, 81, 104, 70, 0, 0, 0, 68, 0,
@@ -3039,9 +3824,9 @@ mod tests {
 
     #[test]
     fn instream_extracts_archives() {
-        // INSTREAM must detect malware INSIDE an archive, as clamd does — a
+        // INSTREAM must detect malware INSIDE an archive, as clamd does; a
         // flat-only scan of the stream is not enough. EICAR is DEFLATE-compressed inside
-        // the zip, so a flat scan of the raw stream can't see it — extraction is
+        // the zip, so a flat scan of the raw stream can't see it: extraction is
         // required.
         let r = one(&instream_msg(ZIP_EICAR_INSIDE), 0);
         assert!(
@@ -3124,15 +3909,15 @@ mod tests {
 
     #[test]
     fn exinstream_multi_rejoins_a_split_archive() {
-        // The reason the verb exists. Each part on its own decodes to nothing —
-        // asserted below — so three separate EXINSTREAM calls would all reply
-        // `clean` and the archive would never be opened.
+        // The reason the verb exists. Each part on its own decodes to nothing
+        // (asserted below), so three separate EXINSTREAM calls would all reply
+        // `OK` and the archive would never be opened.
         let parts = split_set("payload", ZIP_EICAR_INSIDE, 3);
         for (name, part) in &parts {
             let solo = one(&exinstream_msg(part), 0);
             assert!(
                 solo.contains(r#""status":"OK""#),
-                "{name} is detectable alone — the fixture proves nothing: {solo}"
+                "{name} is detectable alone, so the fixture proves nothing: {solo}"
             );
         }
         let msg = exinstream_multi_msg(
@@ -3316,7 +4101,9 @@ mod tests {
         payload.extend_from_slice(eicar());
         let expected = payload.len() as u64;
 
-        let materialized = buffer_to_seekable(&mut &payload[..]).unwrap();
+        let held = buffer_to_seekable(&mut &payload[..]).unwrap();
+        assert!(held.short.is_none());
+        let materialized = held.payload;
         assert!(
             matches!(materialized, StreamPayload::Disk(_, _)),
             "past the threshold the payload belongs on disk, not in RAM"
@@ -3334,7 +4121,8 @@ mod tests {
         );
 
         let db = Scanner::builtin();
-        let (report, _) = scan_payload(&db, &ScanOptions::default(), &materialized).unwrap();
+        let (report, _) =
+            scan_payload(&db, &ScanOptions::default(), &materialized, expected).unwrap();
         assert!(
             matches!(report.verdict.category(), VerdictCategory::Infected),
             "the spilled bytes are what gets scanned"
@@ -3357,7 +4145,7 @@ mod tests {
     #[test]
     fn contscan_rejoins_a_split_archive_in_a_directory() {
         // A directory holding `payload.zip.001..003` is one archive, not three
-        // files. Scanned one at a time — which is all CONTSCAN did — no part
+        // files. Scanned one at a time (which is all CONTSCAN did), no part
         // decodes and every line reads `OK`.
         let dir = crate::tmpfile::TempDir::new().unwrap();
         for (name, part) in split_set("payload", ZIP_EICAR_INSIDE, 3) {
@@ -3634,7 +4422,7 @@ mod tests {
     #[test]
     fn scanurl_allowed_attempts_fetch() {
         // Allowed: the daemon tries to fetch rather than refusing. A closed
-        // loopback port fails fast with a fetch ERROR — the point is the
+        // loopback port fails fast with a fetch ERROR; the point is the
         // request got past the gate, not that it downloaded anything.
         let r = one_allow_http_scan(b"zSCANURL http://127.0.0.1:9/x\0", 0, true);
         assert!(r.contains("ERROR") && !r.contains("disabled"), "got {r}");
@@ -3676,10 +4464,31 @@ mod tests {
         assert!(rg.trim_end_matches('\0').ends_with("OK"), "got {rg}");
     }
 
+    /// A file ALLMATCHSCAN could not fully examine is answered in the same
+    /// words as SCAN, ending in `ERROR`: a bare category is a word clamd
+    /// clients read as `OK`.
+    #[test]
+    fn allmatchscan_ends_a_partial_in_error() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        let damaged = dir.path().join("damaged.gz");
+        let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        gz.extend_from_slice(&[0xff; 64]);
+        std::fs::write(&damaged, gz).unwrap();
+        let path = damaged.to_string_lossy();
+        let db = Scanner::builtin();
+        let lines = scan_one_allmatch(&db, &ScanOptions::default(), &path);
+        assert_eq!(
+            lines,
+            [scan_one_path(&db, &ScanOptions::default(), &path)],
+            "ALLMATCHSCAN and SCAN disagree"
+        );
+        assert!(lines[0].ends_with(" UNSCANNABLE ERROR"), "{lines:?}");
+    }
+
     #[test]
     fn shutdown_disabled_reports_error_and_does_not_exit() {
         // With the hook returning false (disabled), SHUTDOWN must reply an ERROR
-        // rather than silently succeeding — and obviously not kill the test.
+        // rather than silently succeeding, and obviously not kill the test.
         let (mut client, server) = UnixStream::pair().unwrap();
         let db = Scanner::builtin();
         let opts = ScanOptions::default();

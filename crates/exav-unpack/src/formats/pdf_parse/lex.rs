@@ -130,11 +130,22 @@ impl<'a> Lexer<'a> {
                 }
                 b's' if self.starts_with(b"stream") => {
                     self.pos += 6;
-                    if self.pos < self.data.len() && self.data[self.pos] == b'\r' {
-                        self.pos += 1;
+                    // The data starts after the keyword's end of line, which
+                    // some writers put after trailing spaces. Without a line
+                    // end, nothing more is skipped.
+                    let mut p = self.pos;
+                    while p < self.data.len() && matches!(self.data[p], b' ' | b'\t') {
+                        p += 1;
                     }
-                    if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
-                        self.pos += 1;
+                    let eol = p;
+                    if p < self.data.len() && self.data[p] == b'\r' {
+                        p += 1;
+                    }
+                    if p < self.data.len() && self.data[p] == b'\n' {
+                        p += 1;
+                    }
+                    if p > eol {
+                        self.pos = p;
                     }
                     return Token::Stream;
                 }

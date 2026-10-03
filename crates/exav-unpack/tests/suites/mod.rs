@@ -19,6 +19,8 @@ mod arc;
 #[cfg(feature = "arj")]
 mod arj_never_silent;
 mod broken_media;
+#[cfg(feature = "bzip2")]
+mod bzip2_blocks;
 #[cfg(feature = "cab")]
 mod cab_quantum;
 #[cfg(feature = "chm")]
@@ -83,10 +85,16 @@ mod protectors;
 #[cfg(feature = "rar")]
 mod rar3_ppmd;
 #[cfg(feature = "rar")]
+mod rar4_compat;
+#[cfg(all(feature = "rar", feature = "decrypt"))]
+mod rar5_encryption;
+#[cfg(feature = "rar")]
 mod rar_solid;
 #[cfg(feature = "sevenz")]
 mod sevenz_bcj2;
 mod silent_skips;
+#[cfg(feature = "all-formats")]
+mod stream_read_errors;
 #[cfg(feature = "iso")]
 mod udf;
 #[cfg(feature = "upx")]
@@ -100,6 +108,8 @@ mod wim;
 #[cfg(feature = "xz")]
 mod xz_dict;
 #[cfg(feature = "zip")]
+mod zip_appended;
+#[cfg(feature = "zip")]
 mod zip_codecs;
 #[cfg(feature = "zip")]
 mod zip_deflate64;
@@ -109,3 +119,38 @@ mod zip_disguised_members;
 mod zip_overlap;
 #[cfg(feature = "zoo")]
 mod zoo;
+
+use exav_unpack::{walk, Budget, Entry, Format, LimitHit, Member};
+
+/// Every member of `data` as an [`Entry`], a streamed one read into memory,
+/// handed to `visit` until it returns `Some`. Unlike `exav_unpack::extract`,
+/// the members visited before an error are seen, for the suites that check
+/// what a damaged container still yields.
+pub(crate) fn extract_each<R>(
+    fmt: Format,
+    data: &[u8],
+    budget: &mut Budget,
+    visit: &mut dyn FnMut(Entry, &mut Budget) -> Option<R>,
+) -> Result<Option<R>, LimitHit> {
+    walk(fmt, &data, budget, &mut |meta, content, budget| {
+        let data = match content {
+            None => Vec::new(),
+            Some(Member::Bytes(bytes)) => bytes,
+            Some(Member::Stream(reader)) => {
+                let mut bytes = Vec::new();
+                let _ = reader.read_to_end(&mut bytes);
+                bytes
+            }
+        };
+        let entry = Entry {
+            name: meta.name.clone(),
+            data,
+            comp_size: meta.comp_size,
+            encrypted: meta.encrypted,
+            unsupported: meta.unsupported,
+            mtime: meta.mtime,
+            mode: meta.mode,
+        };
+        visit(entry, budget)
+    })
+}

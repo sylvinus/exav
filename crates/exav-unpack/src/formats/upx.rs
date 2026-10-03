@@ -14,7 +14,7 @@
 //! Stored, NRV2B, NRV2D, NRV2E, LZMA and DEFLATE are all decompressed. The NRV
 //! decoders here are written independently from the **published NRV2B/D/E
 //! bitstream description** (a bit-flag literal/match scheme) and verified purely
-//! by **black-box round-trip against the `upx` CLI's own output** — they are NOT
+//! by **black-box round-trip against the `upx` CLI's own output**. They are NOT
 //! ported, translated, or otherwise derived from the source of UCL (Oberhumer,
 //! GPL) or ClamAV (GPL); the code expression (bit reader, variable naming,
 //! control flow) is exav's own. The LZMA 2-byte property framing is likewise
@@ -70,7 +70,7 @@ pub(crate) fn find_packheader(data: &[u8]) -> Option<usize> {
 
 /// Strong evidence the image really is UPX-packed: the `UPX!` PackHeader magic
 /// or the conventional `UPX0`/`UPX1` section names. Used to decide whether a
-/// failed unpack is worth REPORTING — speculative calls on unrelated bytes must
+/// failed unpack is worth REPORTING: speculative calls on unrelated bytes must
 /// stay silent, but a file that advertises itself as UPX and whose payload we
 /// could not recover is content present-and-unexamined.
 fn looks_upx(data: &[u8]) -> bool {
@@ -89,7 +89,7 @@ fn looks_upx(data: &[u8]) -> bool {
 ///
 /// Before reporting, the stub is *run*: a patched header defeats the static
 /// reader, which needs the header to find the compressed blocks, but it does not
-/// defeat the stub — the stub still has to decompress the image to run it. Only
+/// defeat the stub, which still has to decompress the image to run it. Only
 /// when that comes back empty too is the file reported unopened.
 fn report_packed<R>(
     data: &[u8],
@@ -132,8 +132,8 @@ fn adler32(data: &[u8]) -> u32 {
 /// `find_packheader` does not model.
 ///
 /// That function understands the `l_info`/`p_info`/`b_info` chain. A PE can
-/// instead carry a 32-byte PackHeader — `UPX!`, version, format, method, level,
-/// the two Adler-32 sums, then `u_len`/`c_len`/`u_file_size` — with the
+/// instead carry a 32-byte PackHeader (`UPX!`, version, format, method, level,
+/// the two Adler-32 sums, then `u_len`/`c_len`/`u_file_size`) with the
 /// compressed stream following immediately. Read as an `l_info`, that header's
 /// `c_len`/`u_file_size` fields land where a `b_info` block's sizes are expected
 /// and fail validation, so the file matched no unpacker at all and scanned
@@ -227,7 +227,7 @@ const CLAMAV_DOS_STUB_B64: &str = concat!(
 const STUB_LEN: usize = 208;
 
 /// Decode [`CLAMAV_DOS_STUB_B64`]. The input is a constant this crate controls,
-/// so a failure here is a build-time mistake, not bad input — the unit test
+/// so a failure here is a build-time mistake, not bad input. The unit test
 /// below pins both the length and an Adler-32 of the result.
 fn clamav_dos_stub() -> Option<[u8; STUB_LEN]> {
     use base64::Engine;
@@ -250,13 +250,13 @@ fn clamav_dos_stub() -> Option<[u8; STUB_LEN]> {
 /// section's RVA). The original PE header block survives in the tail of that
 /// run, which is what makes the rebuild possible at all.
 ///
-/// The transformations are ClamAV's, recovered by diffing against its output —
-/// black-box, not from its source:
+/// The transformations are ClamAV's, recovered by diffing against its output
+/// (black-box, not from its source):
 ///
 /// * `TimeDateStamp` := `"CLAM"`,
 /// * `FileAlignment` := `SectionAlignment`,
 /// * every section: `VirtualSize` = `SizeOfRawData` = `VirtualSize` rounded up
-///   to `SectionAlignment`, and `PointerToRawData` := `VirtualAddress` — i.e.
+///   to `SectionAlignment`, and `PointerToRawData` := `VirtualAddress`, so
 ///   the file is flattened so a file offset equals its RVA.
 fn rebuild_clamav_pe(image: &[u8], first_rva: u32) -> Option<Vec<u8>> {
     // The original header block sits near the end of the decompressed run; take
@@ -349,14 +349,14 @@ pub(crate) fn extract_upx<R>(
     let Some(li) = find_packheader(data) else {
         // No `l_info` chain. Try the PackHeader layout before giving up; if that
         // fails too and the image still advertises UPX, the payload is there and
-        // unexamined — say so rather than returning clean.
+        // unexamined: say so rather than returning clean.
         budget.count_entry()?;
         let cap = budget.reserve()?;
         if let Some(image) = packheader_image(data, cap) {
             // Hand over the rebuilt PE rather than the raw run: it carries the
             // same bytes plus the headers, so ordinary pattern signatures still
-            // match, and ClamAV's hash signatures over packed malware — computed
-            // across its own rebuilt artifact — match too. Fall back to the raw
+            // match, and ClamAV's hash signatures over packed malware, computed
+            // across its own rebuilt artifact, match too. Fall back to the raw
             // image if the headers could not be recovered, since scanning the
             // content still beats reporting nothing.
             let out = first_section_rva(data)
@@ -390,7 +390,7 @@ pub(crate) fn extract_upx<R>(
         }
         let dstart = pos + 12;
         if sz_cpr == 0 || dstart.saturating_add(sz_cpr) > data.len() {
-            break; // malformed chain — stop, keep what we have
+            break; // malformed chain: stop, keep what we have
         }
         if out.len() as u64 + sz_unc as u64 > cap {
             return Err(LimitHit::new(
@@ -409,7 +409,7 @@ pub(crate) fn extract_upx<R>(
         } else if method == M_LZMA {
             match lzma_block_decompress(cdata, sz_unc) {
                 Ok(b) => b,
-                Err(_) => break, // unfilter/variant we can't handle — keep what we have
+                Err(_) => break, // unfilter/variant we can't handle: keep what we have
             }
         } else if method == M_DEFLATE {
             match deflate_block_decompress(cdata, sz_unc) {
@@ -417,7 +417,7 @@ pub(crate) fn extract_upx<R>(
                 Err(_) => break,
             }
         } else {
-            break; // unknown method — stop the walk, keep what we have
+            break; // unknown method: stop the walk, keep what we have
         };
         if block.len() != sz_unc {
             break;
@@ -427,7 +427,7 @@ pub(crate) fn extract_upx<R>(
     }
     // NOTE: `b_ftid` (x86 call/jmp filter) is intentionally not reversed. Modern
     // `upx` does not filter ELF (the id is 0), and the filter only rewrites the
-    // 4-byte operands of CALL/JMP — strings and data, which signatures mostly key
+    // 4-byte operands of CALL/JMP; strings and data, which signatures mostly key
     // on, are recovered exactly regardless. Reversing it for PE needs a nonzero
     // `addvalue` derived from the unpacked PE layout, and no filtered-ELF test
     // vector exists to validate against, so it is deferred rather than shipped
@@ -572,12 +572,11 @@ fn copy_match(
     Ok(false)
 }
 
-/// Upper bound for any NRV gamma (offset/length) value. UPX match offsets and
-/// lengths are bounded by the output size (≤ `max_buffer_bytes`, ~256 MiB), far
-/// below this; a larger value means a corrupt stream and would only ever be a
-/// rejected match. Capping keeps the doubling loops and the downstream
-/// `(m-3)*256` arithmetic from overflowing on hostile input.
-const NRV_GAMMA_MAX: usize = u32::MAX as usize;
+/// Upper bound for any NRV gamma (offset/length) value: the end-of-stream
+/// marker's, the largest for which `(m-3)*256 + byte` fits in a `u32`. Real
+/// offsets and lengths are far below it. The cap keeps the doubling loops and
+/// that arithmetic from overflowing, on 32-bit targets too.
+const NRV_GAMMA_MAX: usize = 0xff_ffff + 3;
 
 /// NRV2B offset-gamma: `m=1; do { m=2m+bit } while(!bit)`.
 #[inline]
@@ -721,7 +720,7 @@ fn nrv2d_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
     Ok(out)
 }
 
-/// NRV2E (UCL) decompressor — UPX's *default* method. Same offset code as NRV2D,
+/// NRV2E (UCL) decompressor, UPX's *default* method. Same offset code as NRV2D,
 /// but a distinct match-length prefix tree: seeded bit 1 ⇒ len 1+bit (1..2);
 /// else next bit 1 ⇒ len 3+bit (3..4); else a gamma length with a `+3` bias.
 /// Long-match threshold `0x500`.
@@ -775,7 +774,7 @@ mod rebuild_tests {
     /// The stub is a compatibility constant: a large family of ClamAV hash
     /// signatures is computed over a rebuilt PE that begins with exactly these
     /// bytes. If it is ever "tidied up", those signatures stop matching and the
-    /// failure is silent — detections just stop happening — so pin it by
+    /// failure is silent (detections just stop happening), so pin it by
     /// checksum rather than by quoting the text back.
     #[test]
     fn clamav_dos_stub_is_byte_stable() {
@@ -831,6 +830,39 @@ mod rebuild_tests {
 mod tests {
     use super::*;
 
+    /// An NRV2B gamma stream for `m`: the bits after its leading 1, each
+    /// followed by a stop bit (1 on the last), packed as `Br` reads them.
+    fn nrv_gamma_bits(m: u64) -> Vec<u8> {
+        let width = 64 - m.leading_zeros();
+        let mut bits = Vec::new();
+        for i in (0..width - 1).rev() {
+            bits.push((m >> i) & 1 == 1);
+            bits.push(i == 0);
+        }
+        bits.resize(bits.len().div_ceil(32) * 32, false);
+        bits.chunks(32)
+            .flat_map(|w| {
+                let v = w.iter().fold(0u32, |acc, &b| acc << 1 | b as u32);
+                v.to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// The cap is the end-of-stream marker's gamma, so `(m - 3) * 256 + byte`
+    /// fits in a `u32`, and a value past it is refused alike on 32- and 64-bit.
+    #[test]
+    fn nrv_gamma_is_capped_at_the_end_marker() {
+        let end = 0xff_ffff + 3;
+        for (m, ok) in [(2, true), (end, true), (end + 1, false), (1 << 31, false)] {
+            let src = nrv_gamma_bits(m);
+            let got = nrv_gamma(&mut Br::new(&src));
+            assert_eq!(got.is_ok(), ok, "m = {m:#x}");
+            if ok {
+                assert_eq!(got.unwrap() as u64, m);
+            }
+        }
+    }
+
     #[test]
     fn deflate_block_roundtrips() {
         // UPX method 15 is a raw DEFLATE stream; verify the decoder recovers the
@@ -860,8 +892,8 @@ mod tests {
     }
 
     /// NRV2D, NRV2E and LZMA each pack the SAME marker ELF, so all must
-    /// decompress to byte-identical output containing the marker — validating the
-    /// decoders against real `upx` output.
+    /// decompress to byte-identical output containing the marker. This checks
+    /// the decoders against real `upx` output.
     #[test]
     fn nrv2d_nrv2e_lzma_decode_byte_exact() {
         let nrv2b = include_bytes!("../../tests/fixtures/upx_nrv2b_min.bin");
@@ -876,7 +908,7 @@ mod tests {
                 max_compression_ratio: u64::MAX,
                 ..Default::default()
             });
-            extract(Format::Upx, data, &mut b)
+            extract(Format::Upx, &data, &mut b)
                 .unwrap()
                 .into_iter()
                 .next()
@@ -910,6 +942,6 @@ mod tests {
         let data = include_bytes!("../../tests/fixtures/upx_nrv2b_min.bin");
         let mut budget = Budget::new(Limits::default());
         // Chop the compressed data mid-block; must not panic.
-        let _ = extract(Format::Upx, &data[..data.len() - 80], &mut budget);
+        let _ = extract(Format::Upx, &&data[..data.len() - 80], &mut budget);
     }
 }

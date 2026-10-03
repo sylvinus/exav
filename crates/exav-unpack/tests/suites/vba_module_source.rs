@@ -210,3 +210,39 @@ fn an_ole10native_payload_is_carved_past_its_header() {
         "the carve must start after the header, not at the stream start"
     );
 }
+
+/// The header as Office writes it, from a live Word dropper: after the file
+/// name, a reserved word and the temp path counted rather than NUL-delimited.
+/// Read as a third string, the reserved word's leading zero ended it at once,
+/// the payload started in the middle of the header, and the encrypted
+/// document inside was never recognised as one.
+#[test]
+fn an_ole10native_payload_with_a_counted_temp_path_is_carved() {
+    const PAYLOAD: &[u8] = b"MALWARETEST-embedded-package-payload";
+    let temp = b"C:\\Users\\x\\AppData\\Local\\Temp\\zoro.kl\0";
+
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&0u32.to_le_bytes()); // total size (unused)
+    stream.extend_from_slice(&2u16.to_le_bytes()); // flags
+    stream.extend_from_slice(b"zoro.kl\0"); // label
+    stream.extend_from_slice(b"C:\\Users\\x\\Desktop\\zoro.kl\0"); // original path
+    stream.extend_from_slice(&0x0003_0000u32.to_le_bytes()); // reserved
+    stream.extend_from_slice(&(temp.len() as u32).to_le_bytes());
+    stream.extend_from_slice(temp);
+    stream.extend_from_slice(&(PAYLOAD.len() as u32).to_le_bytes());
+    stream.extend_from_slice(PAYLOAD);
+
+    let mut cf = cfb::CompoundFile::create(std::io::Cursor::new(Vec::<u8>::new())).unwrap();
+    cf.create_stream("/\u{1}Ole10Native")
+        .unwrap()
+        .write_all(&stream)
+        .unwrap();
+    let blob = cf.into_inner().into_inner();
+
+    let entries = extract(Format::Ole, &blob, &mut Budget::new(Limits::default())).unwrap();
+    let carved = entries
+        .iter()
+        .find(|e| e.name.contains("Ole10Native-payload"))
+        .expect("the payload");
+    assert_eq!(carved.data, PAYLOAD);
+}

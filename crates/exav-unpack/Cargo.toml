@@ -13,53 +13,60 @@ homepage.workspace = true
 keywords = ["archive", "extract", "unzip", "decompression", "zip"]
 categories = ["filesystem", "compression", "parser-implementations"]
 readme = "README.md"
-# The test corpus is 9.4 MB of crafted archives — the bulk of this crate on
+# The test corpus is 9.4 MB of crafted archives: the bulk of this crate on
 # disk, and of no use to anything that depends on it. Every `cargo install exav`
 # would otherwise download it. Clone the repository to run the suites.
 exclude = ["tests/fixtures/**", "test_data/**"]
 
-# The extractor CLI ships with the library rather than as a separate package.
-# It is a thin shell over the public API and needs nothing the library does not
-# already have — no argument parser, no error crate — so a library consumer pays
-# nothing for it (Cargo builds only the lib target for a dependency), and
-# `cargo install exav-unpack` gives the command, which is where people look for
-# it.
+# The extractor CLI ships with the library rather than as a separate package,
+# so `cargo install exav-unpack` gives the command, which is where people look
+# for it. Its one dependency of its own (`chrono`, for local times) is behind
+# the `cli` feature, which a library consumer turning default features off
+# never builds.
 [[bin]]
 name = "exav-unpack"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 # Always-on (format-agnostic) deps.
 thiserror = "2"
 # fast substring search (locating the UPX PackHeader magic, etc.)
 memchr = "2"
+# The CLI's local times: a DOS timestamp is a local time, and `-l` lists in
+# local time, as unzip does. Already in the tree through `delharc`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 
 # The x86 emulator that runs a packer's stub (`exav-pe-emu`). Its own crate because
 # it is useful on its own and because it is the only thing that needs a CPU
 # decoder: keeping it out of here means a build without `pepack` never compiles
-# `iced-x86` at all.
-exav-pe-emu = { version = "0.0.1", path = "../exav-pe-emu", optional = true }
+# `exav-x86` at all.
+exav-pe-emu = { version = "0.0.2", path = "../exav-pe-emu", optional = true }
 
 # --- Per-format optional deps. Each is pulled in only by the feature(s) below
 # that need it; a dep shared by several formats (e.g. `flate2`) is compiled if
 # ANY enabling feature is active. See `[features]`. ---
-zip = { version = "8", default-features = false, features = ["deflate-flate2"], optional = true }
+# `legacy-zip`: PKZIP 1.x Shrink, Reduce and Implode (methods 1-6), no
+# `unsafe`. These decode a member whole; `formats/zip.rs` checks its sizes
+# against the buffer limit first.
+zip = { version = "8", default-features = false, features = ["deflate-flate2", "legacy-zip"], optional = true }
 # `default-features = false` drops `tar`'s `xattr` feature (extended-attribute
-# *restore* on disk extraction) — we extract to memory and never restore xattrs,
+# *restore* on disk extraction): we extract to memory and never restore xattrs,
 # so it's unused. This removes the `rustix` + `linux-raw-sys` syscall crates
 # entirely (~8,600 `unsafe` ops, the single largest source in the dep tree).
 tar = { version = "0.4", default-features = false, optional = true }
-bzip2-rs = { version = "0.1.2", optional = true }
+# For the bzip2 decoder vendored from `bzip2-rs` in `formats/bzip2_rs`.
+tinyvec = { version = "1.11", optional = true }
 byteorder = { version = "1", optional = true }
 lzxd = { version = "0.2", optional = true }
-# FAT filesystem reader. Zero `unsafe`; `chrono` (timestamps) is left off, so the
-# only transitive deps are `bitflags` and `log`.
+# FAT filesystem reader (a few `unsafe` uses of its own); `chrono` (timestamps)
+# is left off, so the only transitive deps are `bitflags` and `log`.
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"], optional = true }
 # LZNT1, the compression NTFS applies per compression unit. Single-purpose and
 # dependency-free; the MFT walk itself is in-tree.
 lznt1 = { version = "0.1", optional = true }
 # ext2/3/4 reader. Read-only by construction, no `unsafe`, no dependencies.
-ext4-view = { version = "0.9", optional = true }
+ext4-view = { version = "1", optional = true }
 # LZW, for ZOO's LZD codec. Dependency-free.
 salzweg = { version = "0.1", optional = true }
 # InstallShield `.z` reader. Its only real dep is `explode` (MIT), a leaf
@@ -73,13 +80,13 @@ delharc = { version = "0.6.2", optional = true }
 bitstream-io = { version = "4.10.0", optional = true }
 # Pure-Rust crypto for decrypting password-known encrypted archive members
 # (ZIP ZipCrypto + WinZip AES). DECRYPTION needs only a cipher + a KDF, no RNG,
-# so none of these pull `getrandom` (verified) — the hard no-getrandom default
+# so none of these pull `getrandom` (verified) and the hard no-getrandom default
 # build is preserved. We do NOT enable the `zip` crate's `aes-crypto`/encryption
 # features, which would pull `getrandom` for salt/IV generation we never do.
-aes = { version = "0.8", optional = true }
-hmac = { version = "0.12", optional = true }
-sha1 = { version = "0.10", optional = true }
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+aes = { version = "0.9", optional = true }
+hmac = { version = "0.13", optional = true }
+sha1 = { version = "0.11", optional = true }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 constant_time_eq = { version = "0.3", optional = true }
 # DMG support
 hfsplus = { version = "0.2", optional = true }
@@ -87,10 +94,8 @@ apfs = { version = "0.2", optional = true }
 lzfse_rust = { version = "0.2.1", optional = true }
 base64 = { version = "0.22", optional = true }
 quick-xml = { version = "0.41", optional = true }
-des = { version = "0.8", default-features = false, optional = true }
-cbc = { version = "0.1", optional = true }
-bincode = { version = "1", optional = true }
-serde = { version = "1.0.228", features = ["derive"], optional = true }
+des = { version = "0.9", default-features = false, optional = true }
+cbc = { version = "0.2", optional = true }
 flate2 = { version = "1.1.9", optional = true }
 # ZIP method 9 (Deflate64 / "enhanced deflate"). A leaf dep: zero runtime
 # dependencies, MIT, and `#![forbid(unsafe_code)]` like this crate. It is the
@@ -98,26 +103,32 @@ flate2 = { version = "1.1.9", optional = true }
 # on it directly so the raw-bytes path (orphan local headers, where we never go
 # through the `zip` crate's reader) decodes method 9 too.
 deflate64 = { version = "0.1.12", optional = true }
-lzma-rust2 = { version = "0.16.4", default-features = false, features = ["std", "lzip"], optional = true }
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "lzip"], optional = true }
 # PDF crypto primitives (replacing hand-rolled implementations)
-md-5 = { version = "0.10", optional = true }
-sha2 = { version = "0.10", optional = true }
-digest = { version = "0.10", optional = true }
+md-5 = { version = "0.11", optional = true }
+sha2 = { version = "0.11", optional = true }
+digest = { version = "0.11", optional = true }
 stringprep = { version = "0.1", optional = true }
 xz4rust = { version = "0.2.1", default-features = false, features = ["std", "bcj", "crc64", "delta", "no_unsafe"], optional = true }
 ruzstd = { version = "0.8", optional = true }
 crc32fast = { version = "1.5.0", optional = true }
 
 [features]
-default = ["all-formats", "decrypt"]
+default = ["all-formats", "decrypt", "cli"]
+# The `exav-unpack` command.
+cli = ["dep:chrono"]
 # Makes a reserved byte prefix panic from inside the format dispatch, so the
-# `catch_unwind` boundary in `extract_each` can be tested for what it is: the
+# `catch_unwind` boundary in `walk` can be tested for what it is: the
 # thing that turns an arbitrary decoder panic into a reported limit instead of a
 # dead process. Never enabled by a shipped build; the test suite turns it on.
 testing-faults = []
+# `source::CHUNK` at 4 KiB instead of 1 MiB, so a test's small input crosses
+# many chunk seams. Never enabled by a shipped build; exav-core's tests turn it
+# on.
+small-chunks = []
 # Every container/format exav can extract. Disable this (with
 # `default-features = false`) and enable only the formats you need for a smaller
-# build — e.g. `features = ["zip"]` for a ZIP-only extractor. A format exav
+# build, e.g. `features = ["zip"]` for a ZIP-only extractor. A format exav
 # recognises but wasn't compiled to unpack is reported as unsupported (never
 # silently treated as clean), same as any undecodable member.
 all-formats = ["all-formats-no-emu", "pe-emu"]
@@ -139,13 +150,16 @@ all-formats-no-emu = [
 zip = ["dep:zip", "dep:flate2", "dep:deflate64"]
 gzip = ["dep:flate2"]
 tar = ["dep:tar"]
-bzip2 = ["dep:bzip2-rs"]
+bzip2 = ["bzip2-decoder"]
+# Internal: the vendored bzip2 decoder, shared by every format that carries
+# bzip2. Not a format of its own; select `bzip2` instead.
+bzip2-decoder = ["dep:tinyvec", "dep:crc32fast"]
 xz = ["dep:xz4rust"]
 zstd = ["dep:ruzstd"]
 lzip = ["dep:lzma-rust2"]
 cab = ["dep:lzxd", "dep:flate2", "dep:byteorder"]
 chm = ["dep:lzxd"]
-sevenz = ["dep:lzma-rust2", "dep:bzip2-rs", "dep:flate2", "dep:crc32fast"]
+sevenz = ["dep:lzma-rust2", "bzip2-decoder", "dep:flate2", "dep:crc32fast"]
 rar = []
 arj = ["dep:delharc", "dep:bitstream-io", "dep:crc32fast"]
 lha = ["dep:delharc"]
@@ -165,14 +179,14 @@ binhex = []
 lnk = []
 partition = []
 pyc = []
-nsis = ["dep:flate2", "dep:lzma-rust2", "dep:bzip2-rs"]
+nsis = ["dep:flate2", "dep:lzma-rust2", "bzip2-decoder"]
 autoit = []
 onenote = []
 rtf = []
 machofat = []
-sfx = []
+sfx = ["dep:crc32fast"]
 # PE runtime packers: detection plus the aPLib-family static unpack
-# (Petite/FSG2/NsPack). Pure Rust, parses only — nothing is executed.
+# (Petite/FSG2/NsPack). Pure Rust, parses only: nothing is executed.
 pepack = []
 # Emulation-based unpacking: run the packer's own stub under `exav-pe-emu` and
 # capture the image it rebuilds. Its own switch, because it is the one thing in
@@ -199,16 +213,15 @@ arc = []
 ace = []
 stuffit = []
 # ESTsoft/Hancom Korean formats, all decoded.
-alz = ["dep:flate2", "dep:bzip2-rs"]
-egg = ["dep:flate2", "dep:bzip2-rs", "dep:lzma-rust2"]
+alz = ["dep:flate2", "bzip2-decoder"]
+egg = ["dep:flate2", "bzip2-decoder", "dep:lzma-rust2"]
 hwp3 = ["dep:flate2"]
-# FAT filesystem reader. Zero `unsafe`; `chrono` (timestamps) is left off, so the
-# only transitive deps are `bitflags` and `log`.
-fat = ["dep:fatfs"]
+# FAT filesystem reader.
+fat =["dep:fatfs"]
 # ext2/3/4, walked as a filesystem for the same reason as FAT: a fragmented file
 # comes back whole from the inode's block map and in pieces from a carve.
 ext = ["dep:ext4-view"]
-# ZOO carries LZD (LZW) and LZH — the latter is `lh5` on the wire, so `delharc`
+# ZOO carries LZD (LZW) and LZH. The latter is `lh5` on the wire, so `delharc`
 # already covers it.
 zoo = ["dep:salzweg", "dep:delharc"]
 # InstallShield `.z`. NOT the `ISc(` InstallScript cabinet, whose only
@@ -221,22 +234,22 @@ ntfs = ["dep:lznt1"]
 upx = ["dep:flate2", "dep:lzma-rust2", "dep:base64"]
 
 # Structured documents.
-ole = ["dep:cfb"]
+ole = ["dep:cfb", "dep:flate2"]
 pdf = ["dep:flate2"]
 email = ["dep:mail-parser", "dep:base64"]
 
 # Apple disk images (UDIF + HFS+/APFS). The encrypted-DMG cipher stack is under
 # the `decrypt` feature, not here.
 dmg = [
-    "dep:hfsplus", "dep:apfs", "dep:lzfse_rust", "dep:xz4rust", "dep:bzip2-rs",
-    "dep:flate2", "dep:base64", "dep:quick-xml", "dep:bincode", "dep:serde",
+    "dep:hfsplus", "dep:apfs", "dep:lzfse_rust", "dep:xz4rust", "bzip2-decoder",
+    "dep:flate2", "dep:base64", "dep:quick-xml",
 ]
 
 # Decryption of encrypted members (ZIP ZipCrypto/WinZip-AES, PDF standard
 # security handler, encrypted DMG). ON by default. This is the ONLY thing that
 # pulls the cipher/KDF crates (all decryption-only: no RNG, no getrandom). Drop
 # it (with the format features you want, e.g. `--no-default-features --features
-# zip`) for a build with no crypto stack — encrypted members are then reported
+# zip`) for a build with no crypto stack; encrypted members are then reported
 # `PASSWORD-PROTECTED`/unsupported (never decrypted, never silently clean), the
 # same as when no password is supplied. Effective only combined with a format
 # that has encryptable members (zip/pdf/dmg).
@@ -251,7 +264,7 @@ rar5-crc-check = []
 
 # Enforce container checksums (CRCs) during extraction. OFF by default: a malware
 # scanner scans decompressed content regardless of integrity metadata (a wrong
-# CRC must never stop a member's bytes from being scanned — that would let an
+# CRC must never stop a member's bytes from being scanned, as that would let an
 # attacker downgrade a detection by corrupting a checksum; this matches ClamAV).
 # With this feature compiled in, `Budget::set_verify_checksums(true)` re-enables
 # strict verification (e.g. for the extract-for-real CLI, where a bad CRC is a
@@ -281,11 +294,15 @@ required-features = ["pe-emu"]
 # independent, but they run in every other feature pass.
 [[test]]
 name = "cli"
-required-features = ["zip"]
+required-features = ["zip", "cli"]
 
 [dev-dependencies]
 # Used only in tests to compare decoder output against external-oracle digests.
-sha2 = "0.10"
+sha2 = "0.11"
+# Test helpers build ZIP fixtures and gunzip stored disk images; as optional
+# normal dependencies they would be missing from a single-format test build.
+flate2 = "1.1.9"
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # Reference PPMd7 (var.H) encoder, used only to validate the vendored PPMd7
 # model in `formats/ppmd7` against a known-good 7z-coder stream (CC0-1.0/MIT-0).
 ppmd-rust = "1"
@@ -293,6 +310,9 @@ ppmd-rust = "1"
 sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
 # Used only in tests to build CAB fixtures for roundtrip testing.
 cab = "0.6.0"
+# Reference bzip2 encoder (a port of libbzip2), used only in tests to build
+# streams the vendored decoder must read.
+bzip2 = "0.6"
 # Used only in tests to prove the strict CFB reader rejects a malformed
 # compound file that exav's lenient OLE fallback still recovers.
 cfb = "0.14.0"

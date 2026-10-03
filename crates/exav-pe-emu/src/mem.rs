@@ -18,7 +18,7 @@
 //!   into a page the stub wrote is the classic tail transfer to the original
 //!   entry point.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Page size of the emulated machine. x86 pages are 4 KiB, and packers align
 /// their `VirtualAlloc` requests to it.
@@ -54,7 +54,7 @@ struct Page {
 pub struct Mem {
     pages: Vec<Page>,
     /// Page number (`addr >> 12`) to slot in `pages`.
-    index: HashMap<u32, u32>,
+    index: FxHashMap<u32, u32>,
     /// Hard cap on resident pages; hitting it is a budget stop, not a fault.
     max_pages: usize,
     /// Single-entry lookup cache. Emulated code has extreme page locality (a
@@ -91,7 +91,7 @@ impl Mem {
     pub fn new(max_pages: usize) -> Self {
         Self {
             pages: Vec::new(),
-            index: HashMap::new(),
+            index: FxHashMap::default(),
             max_pages,
             cache_page: 0,
             cache_slot: 0,

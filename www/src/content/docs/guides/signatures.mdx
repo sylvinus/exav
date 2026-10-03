@@ -1,54 +1,37 @@
 ---
 title: Signatures
-description: How to get ClamAV signatures for exav with cvd or freshclam, add unofficial feeds, and why exav never bundles the GPL database.
+description: How to get ClamAV signatures for exav with cvd or freshclam, add unofficial feeds, and why exav does not bundle the GPL database.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-exav re-uses ClamAV's signature *formats* so the whole ecosystem's signatures
-work — but it ships with **no** real database of its own (only a tiny built-in
-EICAR test signature). You supply the signatures.
+exav reads ClamAV's signature formats, so the ecosystem's signatures work, but it
+ships no real database of its own (only a built-in EICAR test signature). You
+supply the signatures.
 
 ## Why exav doesn't ship signatures
 
-The ClamAV signature database (`main.cvd` / `daily.cvd`) is **GPL-licensed**;
-using it inside another engine is considered a derivative work. exav ships under
-**MIT** and therefore **never bundles or redistributes it**.
+The ClamAV signature database (`main.cvd`, `daily.cvd`) is GPL-licensed. exav is
+MIT-licensed, so it does not bundle or redistribute it.
 
-- exav can *read* the CVD format — reading a format is interoperability, not
-  redistribution.
-- To get the signatures, **you** run Cisco's own updater onto your own machine,
-  then point exav at the directory. GPL governs distribution, not use.
-- exav deliberately does *not* re-implement `freshclam`'s update protocol — no
-  DNS `TXT` version probing, no `.cdiff` incremental patching, no GPG signature
-  verification. [`cvdupdate`](https://github.com/Cisco-Talos/cvdupdate)
-  (Apache-2.0) and `freshclam` are the supported path for the official database,
-  and they avoid hammering Cisco's CDN.
-
-### Then what is `--auto-update`?
-
-A much smaller thing, and the distinction matters when you are deciding which to
-run. `--auto-update` does a plain conditional HTTPS `GET` of the URLs **you**
-supply (`--sig-sources`, or a prebuilt database at `--db-url`), on a schedule,
-and hot-reloads the result. That is the whole of it — the `exav-update` crate,
-behind the off-by-default `http-update` [feature](/reference/feature-flags/).
-
-What it is *not* is a `freshclam` replacement: it will not discover the current
-version over DNS, will not apply `.cdiff` patches, and does not check the CVD's
-GPG signature. So point it at a mirror you control or trust, or at a prebuilt
-[`.exavdb`](/guides/prebuilt-database/) you built yourself — and use `freshclam`
-or `cvdupdate` against Cisco's CDN.
+- Reading the CVD format is interoperability, not redistribution.
+- You run Cisco's own updater on your machine and point exav at the directory.
+  The GPL governs distribution, not use.
+- exav does not re-implement `freshclam`'s update protocol: no DNS `TXT` version
+  probing, no `.cdiff` patching, no verification of the CVD's digital signature
+  (`dsig`). [`cvdupdate`](https://github.com/Cisco-Talos/cvdupdate)
+  (Apache-2.0) and `freshclam` are the supported way to fetch the official
+  database, and they spare Cisco's CDN. exav's own
+  [`--auto-update`](#built-in-updater---auto-update) only fetches from a mirror
+  you run.
 
 ## Get the official signatures
 
-<Aside type="tip">
-Either updater works — use whichever you already run. Keep your existing update
-schedule when migrating; nothing about updating changes.
-</Aside>
+Either updater works; keep whichever you already run, on the same schedule.
 
 ```sh
 # Option A: cvdupdate (Cisco's Python updater; the command it installs is `cvd`)
-pip install cvdupdate
+pipx install cvdupdate
 cvd update
 exav -d ~/.cvdupdate/database /data
 
@@ -57,84 +40,112 @@ freshclam
 exav -d /var/lib/clamav /data
 ```
 
-`-d` / `--sig-dir` **loads a directory recursively** (hidden `.`-prefixed
-sub-directories are skipped), so a nested layout is picked up in full.
+`-d` (`--database`) or `--sig-dir` loads a directory recursively (hidden
+`.`-prefixed sub-directories are skipped), so a nested layout is picked up in
+full.
 
 ## Formats exav loads
 
-From a `.cvd`/`.cld` container (a signed, gzip'd tar of typed files) or loose
-files in the directory:
+From `.cvd`/`.cld` containers or loose files in the directory:
 
 | Extension | Signature type |
 |---|---|
-| `.ndb` | literal/hex body signatures (incl. wildcards) |
+| `.ndb` | body signatures: hex with wildcards |
+| `.db` | legacy `Name=HEX` literal signatures (no wildcards) |
 | `.ldb` | logical signatures (boolean expressions over subsignatures) |
 | `.hdb` / `.hsb` | whole-file MD5 / SHA hashes |
 | `.mdb` / `.msb` | PE section hashes |
+| `.fdb` | exav's own fuzzy hashes, [see below](#exavs-fdb-format) |
 | `.cdb` | container-metadata signatures |
-| `.imp` | PE import-hash (imphash) |
-| `.cbc` | bytecode programs (run in a [sandboxed interpreter](/concepts/bytecode-sandbox/)) |
-| `.fp` / `.sfp` / `.ign` / `.ign2` | allowlists |
+| `.imp` | PE import hashes (imphash) |
+| `.idb` | PE icon signatures |
+| `.ftm` | file-type magic, used when content typing is inconclusive |
+| `.crb` | Authenticode certificate block list |
+| `.cbc` | bytecode programs, run in a [sandboxed interpreter](/concepts/bytecode-sandbox/) |
+| `.fp` / `.sfp` | allowlists by file hash |
+| `.ign` / `.ign2` | ignore lists by signature name |
 | `.pdb` / `.wdb` / `.gdb` | phishing databases |
-| `.pwdb` | password database (for encrypted archives) |
+| `.pwdb` | passwords for encrypted archives |
 | `.yar` / `.yara` | [YARA rules](/guides/yara/) |
-| `.cvd` / `.cld` | signed containers of the above |
+| `.ndu`, `.ldu`, `.hdu`, `.hsu`, `.mdu`, `.msu` | PUA variants of the above, loaded with `--detect pua` |
+| `.cvd` / `.cld` | ClamAV containers of the above: a `.cvd` is a signed, gzip-compressed tar; a `.cld` is the uncompressed form `freshclam` keeps after applying `.cdiff` patches |
 
-See [Supported formats](/reference/formats/) for the archive/container formats
-exav can unpack.
+See [Supported formats](/reference/formats/) for the archive and container formats
+exav unpacks, and [the comparison](/project/comparison-with-clamav/#signature-format-coverage)
+for how completely each signature format is covered. A signature exav cannot
+load is skipped and counted: `-v` prints the total as `Unsupported sigs skipped`
+in the scan summary.
 
-<Aside type="note">
-Measured on a live ClamAV `daily.cvd` (273,587 signature lines): exav loads
-**all of them**, and all of `main` and of the third-party feeds tracked here.
-Anything it could not load would be **counted and attributable by cause**, never
-silently ignored — see
-[how that was closed](/project/comparison-with-clamav/#signature-format-coverage).
-</Aside>
+### exav's `.fdb` format
 
-## Unofficial & third-party feeds
+`.fdb` is not a ClamAV format. Each line is one of:
 
-Beyond the official database, a range of **third-party and unofficial signature
-feeds** exist — community YARA rulesets, commercial vendor feeds, and add-on
-signature sets. exav loads any of them the same way: drop the files (or a nested
-directory of them) into your signature directory and `-d`/`--sig-dir` picks them up
-recursively.
+```text
+imphash:<md5 of the PE import table>:<name>
+tlsh:<TLSH digest>:<name>[:<max distance>]
+```
 
-- Prefer **permissively-licensed** sets where you intend to redistribute them.
-- Several third-party/commercial feeds are distributed through updater tools that
-  lay signatures out in a nested directory — exav's recursive load handles that
-  layout unchanged.
-- **A database is recognised by its extension**, not its contents: `.cvd`,
-  `.cld`, `.ndb`, `.hdb`, `.hsb`, `.ldb`, `.yar`, `.ign2`, `.pwdb` and the rest of
-  the ClamAV set. Anything else in the directory is passed over without being
-  read, which is what lets `.cdiff`, `.sign`, `.info` and updater state files live
-  there safely. A signature file saved under some other name is skipped just as
-  quietly, so rename it rather than wondering why it never matched.
+The distance defaults to 100. `imphash` lines match PE files by default; `tlsh`
+lines match only with `--detect exav-heuristics`.
+
+## Unofficial and third-party feeds
+
+Community YARA rulesets, commercial vendor feeds and add-on signature sets load
+the same way: put the files, or a nested directory of them, in the signature
+directory.
+
+- Prefer permissively licensed sets if you intend to redistribute them.
+- Feeds distributed through updater tools that lay signatures out in nested
+  directories load unchanged.
+- A database is recognised by its extension, not its contents. Anything else in
+  the directory is passed over without being read, which lets `.cdiff`, `.sign`,
+  `.info` and updater state live there safely; a signature file saved under
+  another name is skipped the same way, so rename it.
 
 ## Built-in updater (`--auto-update`)
 
-exav can fetch signatures itself — add `--auto-update` and point
-`--sig-sources` / `EXAV_SIG_SOURCES` at a file of source URLs, or even at
-your existing `freshclam.conf` (exav reads its source directives and warns about
-+ ignores the rest). It works alongside any `--listen` address, and on its own for
-a one-shot scan that should fetch before it scans; with **no** `--listen` and no
-paths it is an updater and nothing else. See the [Docker guide](/guides/docker/), the
+`--auto-update` fetches the URLs you supply on a schedule, with a conditional
+request that transfers nothing when a file has not changed, and hot-reloads the
+result. It is not a `freshclam` replacement: no DNS version probing, no `.cdiff`
+patches. Point it at a mirror you run, or at a
+[`.exavdb`](/guides/prebuilt-database/#pulling-the-database-over-http) you built.
+
+```sh
+# A cvdupdate directory served over HTTPS. The trailing slash makes the URL a
+# mirror base, fetched as main.cvd, daily.cvd and bytecode.cvd.
+exav --auto-update --sig-sources https://mirror.internal/clamav/ \
+  --listen /run/exav/exav.sock
+```
+
+`--sig-sources` (or `EXAV_SIG_SOURCES`) also takes exact file URLs, a file
+listing sources, or a `freshclam.conf`: exav reads its source directives and
+warns about the rest. exav does not refuse a stock `freshclam.conf`, which names
+Cisco's `database.clamav.net`; use it only with one that names your own mirror.
+`--auto-update` works with any `--listen` address, and alone for a one-shot scan
+that should fetch first; with no `--listen` and no paths it is only an updater.
+See the [Docker guide](/guides/docker/), the
 [CLI reference](/reference/cli/#signature-lifecycle) and
 [Configuration](/reference/configuration/).
 
-Each source is saved under the filename its **URL ends in**, so the URL has to
-name the file it serves: `https://mirror/daily.cvd` works, while a CGI-style
-endpoint like `https://feeds/get.php?db=daily` saves as `get.php` — not an
-extension the loader routes. exav says so at startup rather than fetching it
-every interval and loading nothing.
+The updater needs the `http-update` [feature](/reference/feature-flags/). The
+Docker image has it; the release binaries and a plain `cargo install exav` do
+not (see [Installation](/getting-started/installation/)). It runs on Unix only.
+
+Each source is saved under the signature directory (`-d` when given, else
+`--sig-dir`) as `env/<host>/<url path>/<name>-<hash>.<ext>`, keeping the
+extension its URL ends in, so the URL has to name the file it serves:
+`https://mirror/daily.cvd` works, while `https://feeds/get.php?db=daily` ends in
+`.php`, which the loader does not route. exav warns about such a source at
+startup.
 
 <Aside type="caution">
-The built-in updater does a plain HTTPS fetch with **no signature verification** —
-point it only at a mirror you trust. For cryptographically verified updates, use
-`freshclam` / `cvdupdate` and let exav hot-reload the volume.
+The built-in updater does no signature verification, so point it only at a
+mirror you trust, over HTTPS. For verified updates, use `freshclam` or
+`cvdupdate` and let exav hot-reload the directory.
 </Aside>
 
 ## Next
 
-- [Prebuilt database](/guides/prebuilt-database/) — compile signatures once for
-  near-instant startup.
-- [YARA rules](/guides/yara/) — the native YARA engine.
+- [Prebuilt database](/guides/prebuilt-database/): compile signatures once for a
+  fast start.
+- [YARA rules](/guides/yara/): the native YARA engine.

@@ -26,7 +26,7 @@
 //! that would are present so a stub gets a plausible answer, and they fail the
 //! way they would on a machine where the operation is not permitted.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::cpu::{Cpu, Stop, EAX, ESP};
 use crate::mem::{Mem, PAGE_SIZE};
@@ -79,6 +79,12 @@ const MAPPING_HANDLE_BASE: u32 = 0x0000_0800;
 /// The path the emulator reports for the program, and the only one that opens.
 const SAMPLE_PATH: &str = "C:\\sample.exe";
 const PROCESS_HEAP: u32 = 0x0052_0000;
+
+/// TLS indices a process has: `TLS_MINIMUM_AVAILABLE` (64) plus the 1024
+/// expansion slots. `TlsSetValue`/`TlsGetValue` reject anything past it.
+const TLS_SLOTS: usize = 1088;
+const TLS_OUT_OF_INDEXES: u32 = 0xffff_ffff;
+const ERROR_INVALID_PARAMETER: u32 = 87;
 
 /// A synthetic loaded module.
 #[derive(Debug, Clone)]
@@ -136,6 +142,7 @@ enum Api {
     TlsAlloc,
     TlsSetValue,
     TlsGetValue,
+    TlsFree,
     Sleep,
     CloseHandle,
     CreateFile {
@@ -264,7 +271,7 @@ const APIS: &[ApiSpec] = &[
     k("TlsAlloc", 0, Api::TlsAlloc),
     k("TlsSetValue", 2, Api::TlsSetValue),
     k("TlsGetValue", 1, Api::TlsGetValue),
-    k("TlsFree", 1, Api::Const(1)),
+    k("TlsFree", 1, Api::TlsFree),
     k("Sleep", 1, Api::Sleep),
     k("CloseHandle", 1, Api::CloseHandle),
     k("CreateFileA", 7, Api::CreateFile { wide: false }),
@@ -707,11 +714,11 @@ pub struct Env<'a> {
     /// touches no host file: the only path that resolves is the program's own.
     file: &'a [u8],
     /// Open handles onto that file, with their read positions.
-    open_files: HashMap<u32, u32>,
+    open_files: FxHashMap<u32, u32>,
     next_handle: u32,
     /// Scratch cell handed back by the CRT's `__p__*` accessors.
     crt_cell: u32,
-    traps: HashMap<u32, Trap>,
+    traps: FxHashMap<u32, Trap>,
     /// Base address of the emulated program image (what `GetModuleHandle(NULL)`
     /// returns).
     pub image_base: u32,
@@ -723,8 +730,10 @@ pub struct Env<'a> {
     last_error: u32,
     tick: u32,
     perf: u64,
-    tls: HashMap<u32, u32>,
-    tls_next: u32,
+    /// Per-index TLS values and which indices `TlsAlloc` handed out, both
+    /// `TLS_SLOTS` long so a guest cannot grow them.
+    tls: Vec<u32>,
+    tls_used: Vec<bool>,
     /// Exports that were called but not implemented, for diagnostics.
     pub missing_apis: Vec<String>,
     /// Record every serviced call. Off on the scan path; the triage tool turns
@@ -754,23 +763,25 @@ impl<'a> Env<'a> {
         let mut env = Env {
             modules: Vec::new(),
             file,
-            open_files: HashMap::new(),
+            open_files: FxHashMap::default(),
             next_handle: FILE_HANDLE_BASE,
             crt_cell: ENV_BASE + 0x100,
-            traps: HashMap::new(),
+            traps: FxHashMap::default(),
             image_base,
             heap_next: HEAP_BASE,
             allocations: Vec::new(),
             last_error: 0,
             tick: 0x0001_0000,
             perf: 0x0010_0000,
-            tls: HashMap::new(),
-            tls_next: 1,
+            tls: vec![0; TLS_SLOTS],
+            tls_used: vec![false; TLS_SLOTS],
             missing_apis: Vec::new(),
             trace: false,
             api_log: Vec::new(),
             bulk_bytes: 0,
         };
+        // Slot 0 starts taken: the first `TlsAlloc` returns 1.
+        env.tls_used[0] = true;
         map(mem, STACK_BASE, STACK_SIZE)?;
         map(mem, ENV_BASE, PAGE_SIZE as u32)?;
         map(mem, LDR_BASE, 0x4000)?;
@@ -1355,20 +1366,50 @@ impl<'a> Env<'a> {
                 mem.write_u32(p + 4, 0x01c9_0000).map_err(Stop::Fault)?;
                 0
             }
-            Api::TlsAlloc => {
-                let i = self.tls_next;
-                self.tls_next += 1;
-                i
-            }
+            Api::TlsAlloc => match self.tls_used.iter().position(|&u| !u) {
+                Some(i) => {
+                    self.tls_used[i] = true;
+                    self.tls[i] = 0;
+                    i as u32
+                }
+                None => TLS_OUT_OF_INDEXES,
+            },
+            // Like Windows, Set/Get only range-check the index; whether it was
+            // allocated is checked by `TlsFree` alone.
             Api::TlsSetValue => {
                 let i = arg(cpu, mem, 0)?;
                 let v = arg(cpu, mem, 1)?;
-                self.tls.insert(i, v);
-                1
+                match self.tls.get_mut(i as usize) {
+                    Some(slot) => {
+                        *slot = v;
+                        1
+                    }
+                    None => {
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        0
+                    }
+                }
             }
             Api::TlsGetValue => {
                 let i = arg(cpu, mem, 0)?;
-                self.tls.get(&i).copied().unwrap_or(0)
+                match self.tls.get(i as usize) {
+                    Some(&v) => v,
+                    None => {
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        0
+                    }
+                }
+            }
+            Api::TlsFree => {
+                let i = arg(cpu, mem, 0)? as usize;
+                if self.tls_used.get(i).copied().unwrap_or(false) {
+                    self.tls_used[i] = false;
+                    self.tls[i] = 0;
+                    1
+                } else {
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    0
+                }
             }
             Api::Sleep => 0,
             Api::CloseHandle => 1,
@@ -2181,6 +2222,65 @@ mod tests {
         assert_eq!(
             env.find_module(h).map(|m| m.name.as_str()),
             Some("wininet.dll")
+        );
+    }
+
+    /// Call a stdcall kernel32 export with `args` and return EAX.
+    fn call_k32(env: &mut Env, mem: &mut Mem, name: &str, args: &[u32]) -> u32 {
+        let mut cpu = Cpu::new();
+        cpu.regs[ESP] = INITIAL_ESP;
+        for &a in args.iter().rev() {
+            cpu.push32(mem, a).unwrap();
+        }
+        cpu.push32(mem, 0xdead_0000).unwrap(); // return address
+        cpu.eip = trap_for(env, "kernel32.dll", name);
+        assert_eq!(env.call(&mut cpu, mem).unwrap(), ApiEffect::Continue);
+        cpu.regs[EAX]
+    }
+
+    /// TLS state is bounded by the index range, whatever indices a guest
+    /// passes, and `TlsFree` only releases what `TlsAlloc` handed out.
+    #[test]
+    fn tls_indices_are_bounded_and_freed() {
+        let (mut mem, mut env) = env();
+
+        let i = call_k32(&mut env, &mut mem, "TlsAlloc", &[]);
+        assert_eq!(i, 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsSetValue", &[i, 0x1234]), 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsGetValue", &[i]), 0x1234);
+
+        for bad in [TLS_SLOTS as u32, 0x7fff_ffff, u32::MAX] {
+            assert_eq!(call_k32(&mut env, &mut mem, "TlsSetValue", &[bad, 1]), 0);
+            assert_eq!(env.last_error, ERROR_INVALID_PARAMETER);
+            assert_eq!(call_k32(&mut env, &mut mem, "TlsGetValue", &[bad]), 0);
+        }
+        assert_eq!(env.tls.len(), TLS_SLOTS);
+
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsFree", &[i]), 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsGetValue", &[i]), 0);
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "TlsFree", &[i]),
+            0,
+            "double free"
+        );
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "TlsFree", &[5]),
+            0,
+            "never allocated"
+        );
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsFree", &[u32::MAX]), 0);
+
+        // The freed index is reused, then the pool runs out.
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsAlloc", &[]), 1);
+        for _ in 2..TLS_SLOTS {
+            assert_ne!(
+                call_k32(&mut env, &mut mem, "TlsAlloc", &[]),
+                TLS_OUT_OF_INDEXES
+            );
+        }
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "TlsAlloc", &[]),
+            TLS_OUT_OF_INDEXES
         );
     }
 

@@ -2,8 +2,8 @@
 //!
 //! An unreadable directory is the quietest way to lose files: the walk yields an
 //! error instead of entries, and an error that is dropped leaves a run that
-//! reports on what it reached and exits 0. To an operator — and to a pipeline
-//! reading the exit code — that is indistinguishable from a tree with nothing
+//! reports on what it reached and exits 0. To an operator, and to a pipeline
+//! reading the exit code, that is indistinguishable from a tree with nothing
 //! wrong in it, even when the part nobody could open holds the malware.
 //!
 //! Every surface that walks a tree goes through one walker, so this pins the
@@ -23,12 +23,13 @@ fn exav() -> Command {
     c
 }
 
+#[cfg(unix)]
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
 }
 
 /// Returns `None` when the platform or the test environment cannot make a
-/// directory unreadable — running as root defeats mode 0, and non-Unix has no
+/// directory unreadable: running as root defeats mode 0, and non-Unix has no
 /// equivalent. Skipping beats asserting something the environment cannot show.
 #[cfg(unix)]
 fn unreadable_tree() -> Option<TempDir> {
@@ -86,6 +87,78 @@ fn an_unreadable_subdirectory_is_reported_and_fails_the_run() {
         stdout.contains("ordinary.txt"),
         "the readable file must still be scanned\n--- stdout ---\n{stdout}"
     );
+}
+
+/// `--quiet` drops the `OK` lines and the summary, never an error, and an error
+/// reaches `--log` as a detection does.
+#[test]
+fn an_error_is_printed_under_quiet_and_logged() {
+    let dir = TempDir::new().expect("temp dir");
+    let log = dir.path().join("scan.log");
+    let missing = dir.path().join("missing.bin");
+    let out = exav()
+        .arg("--quiet")
+        .arg("--log")
+        .arg(&log)
+        .arg(&missing)
+        .output()
+        .expect("run exav");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("missing.bin") && stderr.contains("ERROR"),
+        "{stderr}"
+    );
+    let logged = std::fs::read_to_string(&log).expect("read the log");
+    assert!(
+        logged.contains("missing.bin") && logged.contains("ERROR"),
+        "{logged}"
+    );
+}
+
+/// A URL this run will not scan (no `--allow-http-scan`, or a build without
+/// `http-scan`) is an error like any other: logged, and a JSON record.
+#[test]
+fn a_refused_url_is_logged_and_reported_in_json() {
+    let dir = TempDir::new().expect("temp dir");
+    let log = dir.path().join("scan.log");
+    let url = "https://example.invalid/sample.bin";
+    let out = exav()
+        .args(["--json", "--log"])
+        .arg(&log)
+        .arg(url)
+        .output()
+        .expect("run exav");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
+    assert!(
+        stdout.contains(url) && stdout.contains(r#""status":"ERROR""#),
+        "{stdout}"
+    );
+    let out = exav()
+        .arg("--log")
+        .arg(&log)
+        .arg(url)
+        .output()
+        .expect("run exav");
+    assert_eq!(out.status.code(), Some(2));
+    let logged = std::fs::read_to_string(&log).expect("read the log");
+    assert!(logged.contains(url) && logged.contains("ERROR"), "{logged}");
+}
+
+/// The summary counts a file not fully examined as partial, not as an error:
+/// the two exit differently, and the summary has to agree with the exit code.
+#[test]
+fn the_summary_counts_a_partial_file_apart_from_errors() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    gz.extend_from_slice(&[0xff; 64]);
+    std::fs::write(dir.path().join("damaged.gz"), gz).expect("write");
+    let out = exav().arg(dir.path()).output().expect("run exav");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("Partial files: 1"), "{stdout}");
+    assert!(!stdout.contains("Total errors"), "{stdout}");
 }
 
 /// The counterweight to the above: a tree with nothing wrong still exits 0.

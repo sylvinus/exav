@@ -42,8 +42,8 @@ const SAFETENSORS_SNIFF: usize = 4096;
 /// proto-0/1 pickles are intentionally *not* sniffed here (their leading byte
 /// carries no reliable magic), though `extract_aimodel` will still disassemble
 /// them if routing sends them our way.
-pub(crate) fn is_aimodel(data: &[u8]) -> bool {
-    is_pickle(data) || is_safetensors(data)
+pub(crate) fn is_aimodel(p: &crate::Probe) -> bool {
+    is_pickle(p.head) || is_safetensors_in(p.head, p.len)
 }
 
 /// Pickle protocol 2..5: `0x80` PROTO opcode followed by the protocol number.
@@ -55,7 +55,12 @@ fn is_pickle(data: &[u8]) -> bool {
 /// bounds, the header opening with `{`, and a `"` within the first
 /// `min(n, 4096)` header bytes.
 fn is_safetensors(data: &[u8]) -> bool {
-    if data.len() < 9 {
+    is_safetensors_in(data, data.len())
+}
+
+/// [`is_safetensors`] for an object `len` bytes long whose start is `data`.
+fn is_safetensors_in(data: &[u8], len: usize) -> bool {
+    if len < 9 {
         return false;
     }
     let n = u64::from_le_bytes([
@@ -69,7 +74,7 @@ fn is_safetensors(data: &[u8]) -> bool {
         Some(e) => e,
         None => return false,
     };
-    if end > data.len() as u64 {
+    if end > len as u64 {
         return false;
     }
     if data.get(8) != Some(&b'{') {
@@ -476,6 +481,10 @@ fn strip_quotes(raw: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_aimodel(data: &[u8]) -> bool {
+        super::is_aimodel(&crate::Probe::whole(data))
+    }
 
     fn short_binunicode(s: &str) -> Vec<u8> {
         let bytes = s.as_bytes();
