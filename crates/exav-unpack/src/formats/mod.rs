@@ -30,6 +30,13 @@ mod chm;
 pub(crate) mod cpio;
 #[cfg(feature = "dmg")]
 pub(crate) mod dmg;
+// Code pages of AutoCAD drawings, which DXF and DWG strings are in.
+#[cfg(any(feature = "dxf", feature = "dwg"))]
+mod codepage;
+#[cfg(feature = "dwg")]
+pub mod dwg;
+#[cfg(feature = "dxf")]
+pub mod dxf;
 #[cfg(feature = "egg")]
 pub(crate) mod egg;
 #[cfg(feature = "email")]
@@ -42,6 +49,16 @@ pub(crate) mod iso;
 pub(crate) mod lha;
 #[cfg(feature = "lzip")]
 pub(crate) mod lzip;
+// Every feature that enables `lzma-rust2`.
+#[cfg(any(
+    feature = "lzip",
+    feature = "sevenz",
+    feature = "swf",
+    feature = "nsis",
+    feature = "egg",
+    feature = "upx"
+))]
+pub(crate) mod lzma;
 #[cfg(feature = "ole")]
 mod ole;
 #[cfg(all(feature = "ole", feature = "decrypt"))]
@@ -101,8 +118,10 @@ pub(crate) mod ntfs;
 pub(crate) mod onenote;
 #[doc(hidden)]
 pub mod partition;
-#[cfg(any(feature = "rar", feature = "sevenz"))]
+#[cfg(any(feature = "rar", feature = "sevenz", feature = "zip"))]
 mod ppmd7;
+#[cfg(feature = "zip")]
+pub(crate) mod ppmd8;
 #[cfg(feature = "diskimage")]
 pub(crate) mod qcow2;
 #[cfg(feature = "rar")]
@@ -150,7 +169,9 @@ pub(crate) mod vmdk;
 pub(crate) mod wim;
 #[cfg(feature = "xar")]
 mod xar;
-#[cfg(feature = "xz")]
+// DMG's xz runs use its `XzReader` only.
+#[cfg(any(feature = "xz", feature = "dmg"))]
+#[cfg_attr(not(feature = "xz"), allow(dead_code))]
 #[doc(hidden)]
 pub mod xz;
 #[cfg(feature = "zip")]

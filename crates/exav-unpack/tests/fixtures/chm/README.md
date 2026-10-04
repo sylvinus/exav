@@ -19,8 +19,9 @@ domain (CC0).
 ## Gitignored (real malware — never committed)
 
 Real in-the-wild malware `.chm` samples (single-frame LZX). They are
-**gitignored** (`tests/fixtures/**/real-malware-*`); the tests read them at
-runtime and skip when absent, so they only add extra robustness coverage for
+**gitignored** (`tests/fixtures/**/real-malware-*`) and kept locally as
+`<name>.zip` (AES-256, password `infected`, see `../README.md`); the tests
+read them at runtime and skip when absent, so they only add extra robustness coverage for
 developers who have them locally. Provenance for re-download / VT lookup:
 
 | file | sha256 |

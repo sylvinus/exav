@@ -139,10 +139,9 @@ fn adler32(data: &[u8]) -> u32 {
 /// and fail validation, so the file matched no unpacker at all and scanned
 /// clean. A live GandCrab sample was packed exactly this way.
 ///
-/// The header carries `u_adler`, so acceptance is decided by checksum rather
-/// than by plausibility: a decode that does not reproduce the recorded Adler-32
-/// over exactly `u_len` bytes is discarded. That makes a wrong guess
-/// unrepresentable rather than merely unlikely.
+/// A decode is accepted only when it yields exactly `u_len` bytes, and one
+/// that also reproduces the recorded Adler-32 (`u_adler`) wins over one that
+/// does not ([`packheader_image`]).
 pub(crate) fn has_packheader_layout(data: &[u8]) -> bool {
     let mut search = 0usize;
     while let Some(rel) = memchr::memmem::find(&data[search..], b"UPX!") {
@@ -165,7 +164,11 @@ pub(crate) fn has_packheader_layout(data: &[u8]) -> bool {
     false
 }
 
-fn packheader_image(data: &[u8], cap: u64) -> Option<Vec<u8>> {
+/// The run a `UPX!` PackHeader describes, decoded: the first whose Adler-32
+/// matches, else (unless `verify`) the first that decodes in full to its
+/// size, as a checksum mismatch after a full decode hides nothing.
+fn packheader_image(data: &[u8], cap: u64, verify: bool) -> Option<Vec<u8>> {
+    let mut unverified = None;
     let mut search = 0usize;
     while let Some(rel) = memchr::memmem::find(&data[search..], b"UPX!") {
         let m = search + rel;
@@ -182,18 +185,24 @@ fn packheader_image(data: &[u8], cap: u64) -> Option<Vec<u8>> {
             continue;
         }
         let cdata = &data[start..start + c_len];
-        let out = match method {
-            M_NRV2B => nrv2b_decompress(cdata, u_len),
-            M_NRV2D => nrv2d_decompress(cdata, u_len),
-            M_NRV2E => nrv2e_decompress(cdata, u_len),
+        let mut out = Vec::with_capacity(u_len.min(1 << 20));
+        let decoded = match method {
+            M_NRV2B => nrv2b_decompress(cdata, u_len, &mut out),
+            M_NRV2D => nrv2d_decompress(cdata, u_len, &mut out),
+            M_NRV2E => nrv2e_decompress(cdata, u_len, &mut out),
             _ => continue,
         };
-        let Ok(out) = out else { continue };
-        if out.len() == u_len && adler32(&out) == u_adler {
+        if decoded.is_err() || out.len() != u_len {
+            continue;
+        }
+        if adler32(&out) == u_adler {
             return Some(out);
         }
+        if !verify && unverified.is_none() {
+            unverified = Some(out);
+        }
     }
-    None
+    unverified
 }
 
 /// Ceiling on a rebuilt image, mirroring the packed-PE path.
@@ -352,7 +361,7 @@ pub(crate) fn extract_upx<R>(
         // unexamined: say so rather than returning clean.
         budget.count_entry()?;
         let cap = budget.reserve()?;
-        if let Some(image) = packheader_image(data, cap) {
+        if let Some(image) = packheader_image(data, cap, budget.should_verify_checksums()) {
             // Hand over the rebuilt PE rather than the raw run: it carries the
             // same bytes plus the headers, so ordinary pattern signatures still
             // match, and ClamAV's hash signatures over packed malware, computed
@@ -378,6 +387,7 @@ pub(crate) fn extract_upx<R>(
 
     let mut out: Vec<u8> = Vec::new();
     let mut pos = li + 24; // first b_info
+    let mut part_way = false;
     loop {
         if pos + 12 > data.len() {
             break;
@@ -389,41 +399,55 @@ pub(crate) fn extract_upx<R>(
             break; // terminator
         }
         let dstart = pos + 12;
-        if sz_cpr == 0 || dstart.saturating_add(sz_cpr) > data.len() {
+        // A block is smaller packed than unpacked, or stored at the same size.
+        if sz_cpr == 0 || sz_cpr > sz_unc {
             break; // malformed chain: stop, keep what we have
+        }
+        // A block cut by the end of the file is decoded as far as it goes:
+        // the rest of it is absent.
+        let end = dstart.saturating_add(sz_cpr);
+        let rest_absent = end > data.len();
+        if dstart > data.len() {
+            break;
         }
         if out.len() as u64 + sz_unc as u64 > cap {
             return Err(LimitHit::new(
                 "upx: decompressed size exceeds budget".into(),
             ));
         }
-        let cdata = &data[dstart..dstart + sz_cpr];
+        let cdata = &data[dstart..end.min(data.len())];
         let block = if sz_cpr == sz_unc {
-            cdata.to_vec() // stored
+            Salvaged {
+                data: cdata.to_vec(), // stored
+                over_cap: false,
+                undecoded: false,
+                cut_short: rest_absent,
+            }
         } else if method == M_NRV2B {
-            nrv2b_decompress(cdata, sz_unc)?
+            nrv_block(nrv2b_decompress, cdata, sz_unc)
         } else if method == M_NRV2D {
-            nrv2d_decompress(cdata, sz_unc)?
+            nrv_block(nrv2d_decompress, cdata, sz_unc)
         } else if method == M_NRV2E {
-            nrv2e_decompress(cdata, sz_unc)?
+            nrv_block(nrv2e_decompress, cdata, sz_unc)
         } else if method == M_LZMA {
             match lzma_block_decompress(cdata, sz_unc) {
-                Ok(b) => b,
-                Err(_) => break, // unfilter/variant we can't handle: keep what we have
+                Some(b) => b,
+                None => break, // unfilter/variant we can't handle: keep what we have
             }
         } else if method == M_DEFLATE {
-            match deflate_block_decompress(cdata, sz_unc) {
-                Ok(b) => b,
-                Err(_) => break,
-            }
+            deflate_block_decompress(cdata, sz_unc)
         } else {
             break; // unknown method: stop the walk, keep what we have
         };
-        if block.len() != sz_unc {
+        // What decoded is kept whatever stopped it. A block that did not
+        // decode to its size, with no cut to explain it, left bytes unread.
+        let short = block.data.len() != sz_unc && !(block.cut_short && rest_absent);
+        part_way |= block.undecoded || short;
+        out.extend_from_slice(&block.data);
+        if part_way || rest_absent {
             break;
         }
-        out.extend_from_slice(&block);
-        pos = dstart + sz_cpr;
+        pos = end;
     }
     // NOTE: `b_ftid` (x86 call/jmp filter) is intentionally not reversed. Modern
     // `upx` does not filter ELF (the id is 0), and the filter only rewrites the
@@ -442,22 +466,25 @@ pub(crate) fn extract_upx<R>(
         };
     }
     budget.commit(out.len() as u64);
+    let why = part_way.then_some(
+        "UPX block failed to decompress part way; the bytes before the failure were scanned",
+    );
     Ok(visit(
-        Entry::new("upx-decompressed".to_string(), out),
+        Entry {
+            unsupported: why,
+            ..Entry::new("upx-decompressed".to_string(), out)
+        },
         budget,
     ))
 }
 
 /// Decompress a UPX DEFLATE (method 15) block: a raw DEFLATE stream (no zlib
 /// header/footer); the uncompressed size comes from `b_info.sz_unc`.
-fn deflate_block_decompress(cdata: &[u8], sz_unc: usize) -> Result<Vec<u8>, LimitHit> {
-    use flate2::read::DeflateDecoder;
-    let mut out = Vec::with_capacity(sz_unc.min(1 << 20));
-    DeflateDecoder::new(cdata)
-        .take(sz_unc as u64)
-        .read_to_end(&mut out)
-        .map_err(|e| LimitHit::new(format!("upx deflate: {e}")))?;
-    Ok(out)
+fn deflate_block_decompress(cdata: &[u8], sz_unc: usize) -> Salvaged {
+    salvage(
+        crate::inflate::Inflate::new(cdata).take(sz_unc as u64),
+        sz_unc as u64,
+    )
 }
 
 #[inline]
@@ -468,11 +495,10 @@ fn u32_le(d: &[u8], off: usize) -> u32 {
 /// Decompress a UPX LZMA (method 14) block. UPX stores the LZMA lc/lp/pb
 /// properties in a 2-byte header at the start of the compressed payload (NOT the
 /// standard 5-byte header), and the uncompressed size comes from `b_info.sz_unc`
-/// (not embedded). Reconstruct the `.lzma` (alone) framing and decode with
-/// `lzma_rust2`.
-fn lzma_block_decompress(cdata: &[u8], sz_unc: usize) -> Result<Vec<u8>, LimitHit> {
+/// (not embedded). `None` when the properties are not LZMA's.
+fn lzma_block_decompress(cdata: &[u8], sz_unc: usize) -> Option<Salvaged> {
     if cdata.len() < 2 {
-        return Err(LimitHit::new("upx lzma: short block".into()));
+        return None;
     }
     let (b0, b1) = (cdata[0], cdata[1]);
     let pb = (b0 & 7) as u32;
@@ -481,23 +507,36 @@ fn lzma_block_decompress(cdata: &[u8], sz_unc: usize) -> Result<Vec<u8>, LimitHi
     // The top 5 bits of byte 0 redundantly encode lc+lp; reject if inconsistent
     // or out of the LZMA-legal ranges.
     if pb >= 5 || lp >= 5 || lc >= 9 || (b0 >> 3) as u32 != lc + lp {
-        return Err(LimitHit::new("upx lzma: bad props".into()));
+        return None;
     }
-    // Standard single LZMA properties byte, then a `.lzma`-alone header
-    // (props + dict_size LE32 + uncompressed_size LE64) + the range-coded stream.
+    // The standard single LZMA properties byte; the dictionary is never
+    // larger than the output it looks back into.
     let props = ((pb * 5 + lp) * 9 + lc) as u8;
     let dict = (sz_unc as u32).max(1 << 12);
-    let mut framed = Vec::with_capacity(13 + cdata.len() - 2);
-    framed.push(props);
-    framed.extend_from_slice(&dict.to_le_bytes());
-    framed.extend_from_slice(&(sz_unc as u64).to_le_bytes());
-    framed.extend_from_slice(&cdata[2..]);
-    let mut reader = lzma_rust2::LzmaReader::new_mem_limit(Cursor::new(framed), u32::MAX, None)
-        .map_err(|e| LimitHit::new(format!("upx lzma: {e}")))?;
-    let mut out = Vec::with_capacity(sz_unc.min(1 << 20));
-    std::io::Read::read_to_end(&mut reader, &mut out)
-        .map_err(|e| LimitHit::new(format!("upx lzma: {e}")))?;
-    Ok(out)
+    let lzma = lzma_rust2::LzmaStream::new_with_props(sz_unc as u64, props, dict, None).ok()?;
+    Some(salvage(
+        super::lzma::SansIo::new(&cdata[2..], lzma),
+        sz_unc as u64,
+    ))
+}
+
+/// The NRV decoders' error when their input runs out.
+const NRV_UNDERRUN: &str = "upx nrv: input underrun";
+
+/// An NRV decoder: input, output size, output.
+type Nrv = fn(&[u8], usize, &mut Vec<u8>) -> Result<(), LimitHit>;
+
+/// A block decoded by one of the NRV decoders, as far as it goes.
+fn nrv_block(decode: Nrv, cdata: &[u8], sz_unc: usize) -> Salvaged {
+    let mut data = Vec::with_capacity(sz_unc.min(1 << 20));
+    let failed = decode(cdata, sz_unc, &mut data).err();
+    let cut_short = failed.as_ref().is_some_and(|e| e.reason == NRV_UNDERRUN);
+    Salvaged {
+        data,
+        over_cap: false,
+        undecoded: failed.is_some() && !cut_short,
+        cut_short,
+    }
 }
 
 /// Shared UCL/NRV bit reader (LE32): refill a 32-bit little-endian word from the
@@ -524,7 +563,7 @@ impl<'a> Br<'a> {
     fn bit(&mut self) -> Result<u32, LimitHit> {
         if self.bc == 0 {
             if self.ip + 4 > self.src.len() {
-                return Err(LimitHit::new("upx nrv: input underrun".into()));
+                return Err(LimitHit::new(NRV_UNDERRUN.into()));
             }
             self.bb = u32::from_le_bytes([
                 self.src[self.ip],
@@ -543,7 +582,7 @@ impl<'a> Br<'a> {
         let b = *self
             .src
             .get(self.ip)
-            .ok_or_else(|| LimitHit::new("upx nrv: byte underrun".into()))?;
+            .ok_or_else(|| LimitHit::new(NRV_UNDERRUN.into()))?;
         self.ip += 1;
         Ok(b as usize)
     }
@@ -616,15 +655,14 @@ fn nrv_len_tail(r: &mut Br, mut ml: usize) -> Result<usize, LimitHit> {
 }
 
 /// NRV2B (UCL) decompressor, LE32 variant.
-fn nrv2b_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
+fn nrv2b_decompress(src: &[u8], dst_len: usize, out: &mut Vec<u8>) -> Result<(), LimitHit> {
     let mut r = Br::new(src);
-    let mut out: Vec<u8> = Vec::with_capacity(dst_len.min(1 << 20));
     let mut last: usize = 1;
     while out.len() < dst_len {
         while r.bit()? == 1 {
             out.push(r.byte()? as u8);
             if out.len() >= dst_len {
-                return Ok(out);
+                return Ok(());
             }
         }
         let m = nrv_gamma(&mut r)?;
@@ -643,11 +681,11 @@ fn nrv2b_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
         if off > 0xd00 {
             ml += 1;
         }
-        if copy_match(&mut out, off, ml + 1, dst_len)? {
-            return Ok(out);
+        if copy_match(out, off, ml + 1, dst_len)? {
+            return Ok(());
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// NRV2D/NRV2E offset-gamma loop: like NRV2B but folds an extra data bit on each
@@ -695,15 +733,14 @@ fn nrv_de_offset(r: &mut Br, last: &mut usize) -> Result<Option<(usize, usize)>,
 
 /// NRV2D (UCL) decompressor. Offset uses [`nrv_gamma_de`] + the LSB/shift; length
 /// is NRV2B-style (2 bits then gamma+2); long-match threshold `0x500`.
-fn nrv2d_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
+fn nrv2d_decompress(src: &[u8], dst_len: usize, out: &mut Vec<u8>) -> Result<(), LimitHit> {
     let mut r = Br::new(src);
-    let mut out: Vec<u8> = Vec::with_capacity(dst_len.min(1 << 20));
     let mut last: usize = 1;
     while out.len() < dst_len {
         while r.bit()? == 1 {
             out.push(r.byte()? as u8);
             if out.len() >= dst_len {
-                return Ok(out);
+                return Ok(());
             }
         }
         let Some((off, seed)) = nrv_de_offset(&mut r, &mut last)? else {
@@ -713,26 +750,25 @@ fn nrv2d_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
         if off > 0x500 {
             ml += 1;
         }
-        if copy_match(&mut out, off, ml + 1, dst_len)? {
-            return Ok(out);
+        if copy_match(out, off, ml + 1, dst_len)? {
+            return Ok(());
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// NRV2E (UCL) decompressor, UPX's *default* method. Same offset code as NRV2D,
 /// but a distinct match-length prefix tree: seeded bit 1 ⇒ len 1+bit (1..2);
 /// else next bit 1 ⇒ len 3+bit (3..4); else a gamma length with a `+3` bias.
 /// Long-match threshold `0x500`.
-fn nrv2e_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
+fn nrv2e_decompress(src: &[u8], dst_len: usize, out: &mut Vec<u8>) -> Result<(), LimitHit> {
     let mut r = Br::new(src);
-    let mut out: Vec<u8> = Vec::with_capacity(dst_len.min(1 << 20));
     let mut last: usize = 1;
     while out.len() < dst_len {
         while r.bit()? == 1 {
             out.push(r.byte()? as u8);
             if out.len() >= dst_len {
-                return Ok(out);
+                return Ok(());
             }
         }
         let Some((off, seed)) = nrv_de_offset(&mut r, &mut last)? else {
@@ -760,11 +796,11 @@ fn nrv2e_decompress(src: &[u8], dst_len: usize) -> Result<Vec<u8>, LimitHit> {
         if off > 0x500 {
             ml += 1;
         }
-        if copy_match(&mut out, off, ml + 1, dst_len)? {
-            return Ok(out);
+        if copy_match(out, off, ml + 1, dst_len)? {
+            return Ok(());
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -873,8 +909,9 @@ mod tests {
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
         enc.write_all(&orig).unwrap();
         let packed = enc.finish().unwrap();
-        let out = deflate_block_decompress(&packed, orig.len()).expect("inflate");
-        assert_eq!(out, orig);
+        let out = deflate_block_decompress(&packed, orig.len());
+        assert!(!out.undecoded && !out.cut_short);
+        assert_eq!(out.data, orig);
     }
 
     #[test]
@@ -928,6 +965,53 @@ mod tests {
             d.windows(MARKER.len()).any(|w| w == MARKER),
             "marker recovered"
         );
+    }
+
+    /// A PackHeader (no `l_info` chain) over the first NRV2B block of
+    /// `upx_nrv2b_min.bin`, recording `adler` for the decoded bytes; and
+    /// those bytes.
+    fn packheader_blob(adler: impl Fn(u32) -> u32) -> (Vec<u8>, Vec<u8>) {
+        let data = include_bytes!("../../tests/fixtures/upx_nrv2b_min.bin");
+        let b = find_packheader(data).unwrap() + 24;
+        let (sz_unc, sz_cpr) = (u32_le(data, b) as usize, u32_le(data, b + 4) as usize);
+        assert_eq!(data[b + 8], M_NRV2B);
+        let cdata = &data[b + 12..b + 12 + sz_cpr];
+        let mut want = Vec::new();
+        nrv2b_decompress(cdata, sz_unc, &mut want).unwrap();
+        let mut h = b"UPX!".to_vec();
+        h.extend_from_slice(&[13, 9, M_NRV2B, 8]); // version, format, method, level
+        h.extend_from_slice(&adler(adler32(&want)).to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes()); // c_adler
+        h.extend_from_slice(&(sz_unc as u32).to_le_bytes());
+        h.extend_from_slice(&(sz_cpr as u32).to_le_bytes());
+        h.extend_from_slice(&[0u8; 8]);
+        h.extend_from_slice(cdata);
+        (h, want)
+    }
+
+    /// The run decodes in full to its size, and only the Adler-32 recorded
+    /// for it disagrees: it is handed over, as with a right one.
+    #[test]
+    fn a_packheader_run_failing_only_its_adler32_is_handed_over() {
+        let adlers: [fn(u32) -> u32; 2] = [|a| a, |a| a ^ 1];
+        for adler in adlers {
+            let (blob, want) = packheader_blob(adler);
+            let entries = extract(Format::Upx, &blob, &mut Budget::new(Limits::default())).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].unsupported.is_none());
+            assert_eq!(entries[0].data, want);
+        }
+    }
+
+    #[cfg(feature = "checksums")]
+    #[test]
+    fn a_packheader_run_failing_its_adler32_is_reported_when_checksums_are_verified() {
+        let (blob, _) = packheader_blob(|a| a ^ 1);
+        let mut budget = Budget::new(Limits::default());
+        budget.set_verify_checksums(true);
+        let entries = extract(Format::Upx, &blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].unsupported.is_some());
     }
 
     #[test]

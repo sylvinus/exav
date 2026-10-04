@@ -590,7 +590,10 @@ mod tests {
             let icap_head = text.split("\r\n\r\n").next().unwrap();
             let lines: Vec<&str> = icap_head.lines().collect();
             assert_eq!(lines[0], "ICAP/1.0 200 OK", "{policy:?}");
-            assert!(lines.contains(&"X-Exav-Status: ERROR"), "{policy:?}: {text}");
+            assert!(
+                lines.contains(&"X-Exav-Status: ERROR"),
+                "{policy:?}: {text}"
+            );
             assert!(
                 lines.contains(&"X-Exav-Reason: scan failed: read failed"),
                 "{policy:?}: {text}"
@@ -600,11 +603,16 @@ mod tests {
                 "{policy:?}: {text}"
             );
             assert_eq!(
-                lines.contains(&"X-Infection-Found: Type=0; Resolution=2; Threat=Heuristics.Exav.ScanError;"),
+                lines.contains(
+                    &"X-Infection-Found: Type=0; Resolution=2; Threat=Heuristics.Exav.ScanError;"
+                ),
                 threat,
                 "{policy:?}: {text}"
             );
-            assert!(text.contains("HTTP/1.1 403 Forbidden"), "{policy:?}: {text}");
+            assert!(
+                text.contains("HTTP/1.1 403 Forbidden"),
+                "{policy:?}: {text}"
+            );
         }
     }
 

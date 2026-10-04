@@ -78,14 +78,24 @@ pub(crate) fn extract_nsis<R>(
     if arch_end <= data_start {
         return Ok(None);
     }
+    // The file ends before the data does: what is missing is absent.
+    let cut_by_eof = fh.saturating_add(archive_size).saturating_sub(crc_len) > data.len();
 
-    // Solid attempt: the whole region as one compressed stream.
+    // Solid attempt: the whole region as one compressed stream. Taken when it
+    // decodes whole, or, decoded part way, when it opens as a solid stream
+    // does: with the header block, `header_size` bytes long. A non-solid
+    // region read as one stream decodes, if at all, to bytes that do not.
+    let header_size = u32le(data, fh + 0x14);
     let cap = budget.reserve()?;
-    if let Some(bytes) = decode_stream(&data[data_start..arch_end], cap) {
-        if bytes.len() >= SOLID_MIN_OUTPUT {
+    if let Some(s) = decode_stream(&data[data_start..arch_end], cap) {
+        let whole = !s.undecoded && !s.cut_short && s.data.len() >= SOLID_MIN_OUTPUT;
+        let opens_solid =
+            header_size != 0 && s.data.len() >= 4 && u32le(&s.data, 0) & 0x7fff_ffff == header_size;
+        if whole || opens_solid {
             budget.count_entry()?;
-            budget.commit(bytes.len() as u64);
-            return Ok(visit(Entry::new("nsis-solid".to_string(), bytes), budget));
+            budget.commit(s.data.len() as u64);
+            let entry = decoded_entry("nsis-solid".to_string(), s, cut_by_eof);
+            return Ok(visit(entry, budget));
         }
     }
 
@@ -103,6 +113,7 @@ pub(crate) fn extract_nsis<R>(
         }
         let clamped = size.min(arch_end - pos);
         let block = &data[pos..pos + clamped];
+        let rest_absent = pos.saturating_add(size) > data.len();
         pos += clamped;
         n += 1;
 
@@ -111,12 +122,17 @@ pub(crate) fn extract_nsis<R>(
         let decoded = if compressed {
             decode_stream(block, cap)
         } else {
-            Some(block[..clamped.min(cap as usize)].to_vec())
+            Some(Salvaged {
+                data: block[..clamped.min(cap as usize)].to_vec(),
+                over_cap: clamped as u64 > cap,
+                undecoded: false,
+                cut_short: false,
+            })
         };
         let stop = match decoded {
-            Some(bytes) => {
-                budget.commit(bytes.len() as u64);
-                visit(Entry::new(format!("nsis-{n}"), bytes), budget)
+            Some(s) => {
+                budget.commit(s.data.len() as u64);
+                visit(decoded_entry(format!("nsis-{n}"), s, rest_absent), budget)
             }
             None => visit(
                 Entry::unsupported(
@@ -138,31 +154,54 @@ pub(crate) fn extract_nsis<R>(
     Ok(None)
 }
 
-/// Decode one NSIS compressed stream, selecting the codec from the leading byte:
-/// `'1'` ⇒ NSIS bzip2, `0x5d` ⇒ LZMA props, else raw DEFLATE, each with a fallback.
-fn decode_stream(block: &[u8], cap: u64) -> Option<Vec<u8>> {
-    match block.first().copied()? {
-        b'1' => decode_bzip2(block, cap).or_else(|| decode_deflate(block, cap)),
-        0x5d => decode_lzma(block, cap).or_else(|| decode_deflate(block, cap)),
-        _ => decode_deflate(block, cap).or_else(|| decode_lzma(block, cap)),
+/// A member of what `s` decoded, reported when it is not the whole stream.
+/// `rest_absent`: the stream was cut by the end of the file.
+fn decoded_entry(name: String, s: Salvaged, rest_absent: bool) -> Entry {
+    let unsupported = if s.over_cap {
+        Some("NSIS stream exceeds the per-member decompression budget")
+    } else {
+        s.part_way(rest_absent).then_some(
+            "NSIS stream failed to decode part way; the bytes before the failure were scanned",
+        )
+    };
+    Entry {
+        unsupported,
+        ..Entry::new(name, s.data)
     }
 }
 
-fn nonempty(r: Result<(Vec<u8>, bool), std::io::Error>) -> Option<Vec<u8>> {
-    match r {
-        Ok((out, _)) if !out.is_empty() => Some(out),
-        _ => None,
+/// Decode one NSIS compressed stream, selecting the codec from the leading byte:
+/// `'1'` ⇒ NSIS bzip2, `0x5d` ⇒ LZMA props, else raw DEFLATE, each with a fallback.
+/// A codec that decodes the stream whole wins; failing that, the first that
+/// decoded anything, with what it decoded before it stopped.
+fn decode_stream(block: &[u8], cap: u64) -> Option<Salvaged> {
+    type Codec = fn(&[u8], u64) -> Option<Salvaged>;
+    let order: [Codec; 2] = match block.first().copied()? {
+        b'1' => [decode_bzip2, decode_deflate],
+        0x5d => [decode_lzma, decode_deflate],
+        _ => [decode_deflate, decode_lzma],
+    };
+    let mut part = None;
+    for s in order.iter().filter_map(|codec| codec(block, cap)) {
+        if s.data.is_empty() {
+            continue;
+        }
+        if !s.undecoded && !s.cut_short {
+            return Some(s);
+        }
+        part.get_or_insert(s);
     }
+    part
 }
 
 /// Raw DEFLATE (NSIS "zlib", no zlib wrapper).
-fn decode_deflate(block: &[u8], cap: u64) -> Option<Vec<u8>> {
-    nonempty(bounded_read(flate2::read::DeflateDecoder::new(block), cap))
+fn decode_deflate(block: &[u8], cap: u64) -> Option<Salvaged> {
+    Some(salvage(crate::inflate::Inflate::new(block), cap))
 }
 
 /// NSIS LZMA: 1 props byte + u32 dictionary size, then the stream (size unknown,
 /// decoded to the end marker).
-fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
+fn decode_lzma(block: &[u8], cap: u64) -> Option<Salvaged> {
     if block.len() < 5 {
         return None;
     }
@@ -178,21 +217,14 @@ fn decode_lzma(block: &[u8], cap: u64) -> Option<Vec<u8>> {
     // already emitted), so capping at `cap` costs nothing on a real stream while
     // making the allocation bounded by the same limit as everything else.
     let dict = crate::bounded_dict(u32le(block, 1), cap);
-    let reader = lzma_rust2::LzmaReader::new_with_props(
-        Cursor::new(&block[5..]),
-        u64::MAX,
-        block[0],
-        dict,
-        None,
-    )
-    .ok()?;
-    nonempty(bounded_read(reader, cap))
+    let lzma = lzma_rust2::LzmaStream::new_with_props(u64::MAX, block[0], dict, None).ok()?;
+    Some(salvage(super::lzma::SansIo::new(&block[5..], lzma), cap))
 }
 
 /// NSIS's modified bzip2: no stream header, one-byte block markers, no
 /// checksums.
-fn decode_bzip2(block: &[u8], cap: u64) -> Option<Vec<u8>> {
-    nonempty(bounded_read(
+fn decode_bzip2(block: &[u8], cap: u64) -> Option<Salvaged> {
+    Some(salvage(
         super::bzip2_rs::DecoderReader::new_nsis(Cursor::new(block)),
         cap,
     ))

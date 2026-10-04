@@ -1,0 +1,60 @@
+---
+// The site's sections (starlight-sidebar-topics topics) as header tabs.
+// `isCurrent` is false on pages without a sidebar (the landing page).
+const { topics } = Astro.locals.starlightSidebarTopics;
+---
+
+<nav aria-label="Sections">
+  <ul>
+    {
+      topics.map((topic) => (
+        <li>
+          <a href={topic.link} aria-current={topic.isCurrent ? 'true' : undefined}>
+            {topic.label}
+          </a>
+        </li>
+      ))
+    }
+  </ul>
+</nav>
+
+<style>
+  nav,
+  ul,
+  li {
+    height: 100%;
+  }
+
+  ul {
+    display: flex;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  a {
+    display: flex;
+    align-items: center;
+    height: 100%;
+    padding-inline: 0.625rem;
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+    font-weight: 500;
+    white-space: nowrap;
+    text-decoration: none;
+  }
+
+  a:hover {
+    color: var(--sl-color-white);
+  }
+
+  a[aria-current] {
+    color: var(--sl-color-white);
+    box-shadow: inset 0 -2px 0 var(--sl-color-text-accent);
+  }
+
+  a:focus-visible {
+    outline: 2px solid var(--sl-color-text-accent);
+    outline-offset: -4px;
+  }
+</style>

@@ -1,65 +1,63 @@
 ---
 title: exav
-description: A fast, memory-safe malware scanner written in Rust, compatible with ClamAV signature databases and tooling.
+description: Memory-safe tools for untrusted files, written in Rust. A malware scanner compatible with ClamAV's signatures and protocols, an archive extractor, and a file viewer for the browser.
+template: splash
 hero:
-  tagline: A fast, memory-safe malware scanner written in Rust.
+  tagline: Memory-safe tools for untrusted files. Scan them for malware, unpack them, and view them in the browser.
   image:
     file: ../../assets/logo.svg
   actions:
-    - text: Get started
-      link: /getting-started/introduction/
+    - text: Malware scanning
+      link: /scanner/getting-started/introduction/
       icon: right-arrow
       variant: primary
-    - text: View on GitHub
-      link: https://github.com/sylvinus/exav
-      icon: external
-      variant: minimal
+    - text: Archive extraction
+      link: /unpack/
+      variant: secondary
+    - text: File viewer
+      link: /viewer/
+      variant: secondary
 ---
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-exav reads ClamAV's signature databases, answers the `clamd` and ICAP protocols
-and prints `clamscan`'s output format. Its flags are its own: a `clamscan` flag
-exav lacks stops the run rather than being ignored (see the
-[flag matrix](/reference/clamav-flag-matrix/)).
+exav is a set of tools for files you did not write and should not trust: an
+attachment, an upload, a download. They are built on the same parsers,
+written in safe Rust, and each bounds the work a hostile file can cause.
+Each tool is usable on its own.
 
 <CardGrid>
-  <Card title="Memory-safe Rust engine" icon="rocket">
-    The scanning and extraction code is safe Rust (`#![forbid(unsafe_code)]` in
-    the core crates). The default build links no C and generates no code at run
-    time, so the memory-corruption bugs behind most scanner CVEs cannot occur in
-    the code that parses hostile input.
+  <Card title="Malware scanning" icon="magnifier">
+    A ClamAV-compatible scanner, daemon and ICAP server that never reports a
+    file clean unless it fully scanned it.
+
+    ```sh
+    cargo install exav
+    ```
+
+    [Start here](/scanner/getting-started/introduction/) or read the
+    [comparison with ClamAV](/scanner/reference/comparison-with-clamav/)
   </Card>
-  <Card title="Bounded memory" icon="bars">
-    Most archives are walked member by member instead of being extracted whole,
-    and a stream waits in a temp file under
-    [budgets you set](/reference/cli/#buffering-a-stream-spill). A file over a
-    bound is reported, not called clean.
+  <Card title="Archive extraction" icon="download">
+    Bounded, memory-safe extraction of archives, disk images and documents, as
+    a command, a Rust crate, and `@exav/unpack-wasm` for browsers and Node.
+
+    ```sh
+    cargo install exav-unpack
+    ```
+
+    [Start here](/unpack/)
   </Card>
-  <Card title="Native YARA engine" icon="puzzle">
-    Near-full YARA support through a native tree-walking evaluator: no code
-    generation at scan time, a pure-Rust dependency tree, on by default.
-  </Card>
-  <Card title="Drop-in compatible" icon="random">
-    Loads existing `.cvd`/`.ndb`/`.ldb`/`.hdb`/YARA signature databases and
-    answers the `clamd` and ICAP protocols, so `clamdscan`, milters, proxies and
-    existing tooling talk to exav unchanged.
-  </Card>
-  <Card title="Prebuilt `.exavdb`" icon="download">
-    Compile a large signature set once, then load it quickly and with far less
-    memory everywhere.
-  </Card>
-  <Card title="WASM sandbox" icon="seti:wasm">
-    The whole engine compiles to a WASI module, so **untrusted** signatures can
-    be loaded without host access, with no custom host code.
-  </Card>
-  <Card title="Never a silent clean" icon="approve-check">
-    A file is reported clean only if it was fully scanned. Anything that stops a
-    scan early gets a verdict of its own, which a deployment may choose to
-    deliver anyway, but only by saying so.
-  </Card>
-  <Card title="MIT licensed" icon="open-book">
-    A permissive license, with nothing derived from GPL sources.
+  <Card title="File viewer" icon="document">
+    `@exav/viewer` shows PDF, images, DWG and DXF, Office documents, IFC and
+    STL models, media and archives in the browser, and can open each file in
+    a sandboxed frame of its own.
+
+    ```sh
+    npm install @exav/viewer
+    ```
+
+    [Start here](/viewer/) or [try the demo](/viewer/demo/)
   </Card>
 </CardGrid>
 
@@ -69,11 +67,11 @@ fuzzed, but a scanner earns trust from use, and it has not had much yet. Please
 [report anything that looks wrong](https://github.com/sylvinus/exav/issues).
 :::
 
-## Start here
+## Subprojects and About
 
 <CardGrid>
-  <LinkCard title="Why exav exists" href="/getting-started/introduction/" description="What exav is, and the rule it is built around." />
-  <LinkCard title="Install" href="/getting-started/installation/" description="Prebuilt binaries, cargo, source builds, packages, containers, and the WASM module." />
-  <LinkCard title="Quick start" href="/getting-started/quick-start/" description="Get signatures, run a first scan, read the output." />
-  <LinkCard title="Design principles" href="/concepts/design-principles/" description="Memory safety, no runtime code generation, bounded work, never a silent clean." />
+  <LinkCard title="Subprojects" href="/subprojects/" description="exav-grep, exav-imagehash, exav-pe-emu, exav-core as a library, exav-render, exav-x86 and exav-update." />
+  <LinkCard title="Technical architecture" href="/project/architecture/" description="How the crates and the WebAssembly packages depend on each other." />
+  <LinkCard title="Security" href="/project/security/" description="Reporting a vulnerability, the threat model, and where each tool's safety model is documented." />
+  <LinkCard title="Contributing" href="/project/contributing/" description="The clean-room rule, the checks to run, and the 32-bit/WASM tests." />
 </CardGrid>

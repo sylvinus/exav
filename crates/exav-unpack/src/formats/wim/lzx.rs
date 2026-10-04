@@ -13,9 +13,9 @@
 //! format documents) plus the two WIM deltas above. Bits come from 16-bit
 //! **little-endian** words, most significant bit first.
 //!
-//! Every decoded resource is checked against the SHA-1 the image records, so a
-//! mistake here surfaces as a reported resource rather than as plausible bytes
-//! that are not the file.
+//! A mistake here gives plausible bytes that are not the file. With checksums
+//! verified, a resource failing the SHA-1 the image records is reported; the
+//! tests compare decoded resources with the files that went in.
 
 /// Symbols 0..255 are literals; the rest encode (length, offset-slot) pairs.
 const NUM_CHARS: usize = 256;

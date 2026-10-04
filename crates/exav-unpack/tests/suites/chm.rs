@@ -20,6 +20,9 @@ const BENIGN_LZX: &str = "benign-lzx.chm";
 const REAL_SAMPLES: &[&str] = &["real-malware-lzx-1.chm", "real-malware-lzx-2.chm"];
 
 fn read_fixture(name: &str) -> Option<Vec<u8>> {
+    if REAL_SAMPLES.contains(&name) {
+        return super::real_sample(&format!("chm/{name}"));
+    }
     let p = format!("{}/tests/fixtures/chm/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&p).ok()
 }
@@ -106,7 +109,10 @@ fn a_page_over_a_frame_that_fails_is_reported() {
         if e.unsupported.is_some() {
             reported += 1;
         } else {
-            assert!(e.data == page.as_bytes(), "{path} differs from its source unreported");
+            assert!(
+                e.data == page.as_bytes(),
+                "{path} differs from its source unreported"
+            );
         }
     }
     let a = entries.iter().find(|e| e.name == "/a.html").unwrap();

@@ -70,11 +70,17 @@ function assetExists(pathname) {
   return existsSync(p) && statSync(p).isFile();
 }
 
+// Served from the same site by another build: the viewer demo
+// (crates/exav-viewer, `npm run demo:build`), which www.yml copies in and
+// checks for itself.
+const ELSEWHERE = ['/viewer/demo/'];
+
 const broken = [];
 for (const [from, { hrefs }] of pages) {
   for (const href of hrefs) {
     if (!href || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) continue;
     const url = new URL(href, 'https://site.invalid' + from);
+    if (ELSEWHERE.some((p) => url.pathname.startsWith(p))) continue;
     const page = target(url.pathname);
     if (!page) {
       if (!assetExists(url.pathname)) broken.push(`${from}: ${href} (no such page)`);

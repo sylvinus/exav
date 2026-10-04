@@ -174,7 +174,7 @@ const AFTER_HELP: &str = "\
 Coming from ClamAV:
   exav loads the same signature databases and answers the same clamd protocol,
   but the flags are its own. The per-flag mapping is at
-  https://exav.org/reference/clamav-flag-matrix/
+  https://exav.org/scanner/reference/clamav-flag-matrix/
 
   A clamscan flag exav does not have is REFUSED, never ignored: the run stops
   rather than scanning under settings you did not ask for.";
@@ -1531,7 +1531,9 @@ fn main() -> ExitCode {
     }
     if let Some(hint) = clamscan_flag_hint(&argv) {
         eprintln!("exav: {hint}");
-        eprintln!("exav: the full mapping is at https://exav.org/reference/clamav-flag-matrix/");
+        eprintln!(
+            "exav: the full mapping is at https://exav.org/scanner/reference/clamav-flag-matrix/"
+        );
         return ExitCode::from(2);
     }
     let mut cli = Cli::parse();
@@ -2206,7 +2208,7 @@ fn run_listeners(
 ///
 /// Each exav flag is spelled like the field it feeds, so the mapping reads off
 /// the name. The flag↔field table lives in
-/// `www/src/content/docs/reference/limits.md`, and the
+/// `www/src/content/docs/scanner/reference/limits.md`, and the
 /// `limit_flags_land_on_their_fields` test pins every pair; keep both in step
 /// with any change here.
 #[allow(clippy::field_reassign_with_default)] // conditional per-field overrides read cleaner than a struct literal
@@ -5120,7 +5122,7 @@ mod tests {
     }
 
     /// Pins the ClamAV-compatibility surface documented by the flag matrix
-    /// (`www/src/content/docs/reference/clamav-flag-matrix.md`).
+    /// (`www/src/content/docs/scanner/reference/clamav-flag-matrix.md`).
     ///
     /// Both halves matter, and the second one more. A spelling that stops
     /// parsing breaks a migrated command line, which the operator finds out

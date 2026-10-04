@@ -1,0 +1,904 @@
+/* @exav/viewer default UI. Every colour, radius and size is a custom property
+   (TOKENS in @exav/viewer/react); set them on an ancestor to restyle. */
+
+:where(.exv-body, .exv-dialog) {
+  --exv-surface: #f1f5f9;
+  --exv-panel: #ffffff;
+  --exv-border: #e2e8f0;
+  --exv-text: #334155;
+  --exv-text-strong: #0f172a;
+  --exv-muted: #64748b;
+  --exv-faint: #94a3b8;
+  --exv-hover: #f8fafc;
+  --exv-active: #f1f5f9;
+  --exv-accent: #0f172a;
+  --exv-on-accent: #ffffff;
+  --exv-error: #b91c1c;
+  --exv-warning: #b45309;
+  --exv-media-bg: #0f172a;
+  --exv-model-bg: radial-gradient(circle at 50% 30%, #ffffff 0%, #e2e8f0 55%, #cbd5e1 100%);
+  --exv-radius: 0.375rem;
+  --exv-rail-width: 15rem;
+  --exv-tap: 2.75rem;
+  --exv-font: inherit;
+  font-family: var(--exv-font);
+  color: var(--exv-text);
+}
+
+.exv-body,
+.exv-body * {
+  box-sizing: border-box;
+}
+
+/* ── body ── */
+.exv-body {
+  position: relative;
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  background: var(--exv-surface);
+}
+.exv-main {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.exv-bars {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+}
+.exv-stage {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+.exv-surface {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+/* The sandboxed frame (`@exav/viewer/frame`), filling the surface. */
+.exv-sandbox {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+.exv-stack {
+  flex: none;
+}
+.exv-rails {
+  display: flex;
+  flex: none;
+}
+.exv-rails:empty {
+  display: none;
+}
+
+/* ── status ── */
+.exv-status {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 1.5rem;
+  background: var(--exv-surface);
+  text-align: center;
+  font-size: 0.875rem;
+  color: var(--exv-muted);
+}
+.exv-status p {
+  margin: 0;
+  max-width: 34rem;
+}
+.exv-status-error {
+  color: var(--exv-error);
+}
+.exv-spinner {
+  display: inline-flex;
+  animation: exv-spin 1s linear infinite;
+}
+@keyframes exv-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .exv-spinner {
+    animation-duration: 3s;
+  }
+}
+
+/* ── buttons ── */
+.exv-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--exv-tap);
+  height: var(--exv-tap);
+  border: 0;
+  border-radius: var(--exv-radius);
+  background: transparent;
+  color: var(--exv-text);
+  cursor: pointer;
+}
+.exv-icon-button:hover {
+  background: var(--exv-active);
+}
+.exv-icon-button-small {
+  width: 2rem;
+  height: 2rem;
+  color: var(--exv-muted);
+}
+.exv-icon-button-round {
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 999px;
+}
+.exv-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: var(--exv-tap);
+  padding: 0 1rem;
+  border: 1px solid var(--exv-accent);
+  border-radius: var(--exv-radius);
+  background: var(--exv-accent);
+  color: var(--exv-on-accent);
+  font: inherit;
+  font-size: 0.875rem;
+  text-decoration: none;
+  cursor: pointer;
+}
+.exv-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.exv-button-outline {
+  background: var(--exv-panel);
+  border-color: var(--exv-border);
+  color: var(--exv-text);
+}
+
+/* ── rails ── */
+.exv-rail {
+  display: flex;
+  flex-direction: column;
+  width: var(--exv-rail-width);
+  flex: none;
+  border-left: 1px solid var(--exv-border);
+  background: var(--exv-panel);
+  min-height: 0;
+}
+.exv-rail-unfold {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--exv-tap);
+  height: var(--exv-tap);
+  border: 0;
+  border-left: 1px solid var(--exv-border);
+  border-bottom: 1px solid var(--exv-border);
+  border-bottom-left-radius: var(--exv-radius);
+  background: var(--exv-panel);
+  color: var(--exv-text);
+  cursor: pointer;
+}
+.exv-rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.375rem 0.5rem;
+  border-bottom: 1px solid var(--exv-border);
+}
+.exv-rail-title,
+.exv-rail-label {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--exv-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.exv-rail-section {
+  flex: none;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--exv-border);
+  font-size: 0.875rem;
+}
+.exv-rail-section p {
+  margin: 0;
+}
+.exv-rail-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.exv-rail-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.25rem 0;
+}
+.exv-layouts {
+  max-height: 33vh;
+  overflow-y: auto;
+  margin-top: 0.25rem;
+}
+.exv-row {
+  display: flex;
+  width: 100%;
+  min-height: 2.25rem;
+  align-items: center;
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  border-radius: var(--exv-radius);
+  background: transparent;
+  color: var(--exv-text);
+  font: inherit;
+  font-size: 0.875rem;
+  text-align: left;
+  cursor: pointer;
+}
+.exv-row:hover {
+  background: var(--exv-hover);
+}
+.exv-row-current {
+  background: var(--exv-active);
+  color: var(--exv-text-strong);
+  font-weight: 500;
+}
+.exv-outline {
+  padding: 0.5rem;
+}
+.exv-outline-entry {
+  display: block;
+  width: 100%;
+  padding: 0.375rem 0.5rem;
+  border: 0;
+  border-radius: var(--exv-radius);
+  background: transparent;
+  color: var(--exv-muted);
+  font: inherit;
+  font-size: 0.875rem;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.exv-outline-entry:hover {
+  background: var(--exv-active);
+}
+.exv-outline-top {
+  color: var(--exv-text-strong);
+  font-weight: 500;
+}
+.exv-segmented {
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--exv-border);
+  border-radius: var(--exv-radius);
+}
+.exv-segmented button {
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  background: var(--exv-panel);
+  color: var(--exv-muted);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.exv-segmented button[aria-pressed="true"] {
+  background: var(--exv-accent);
+  color: var(--exv-on-accent);
+}
+.exv-layer-all button {
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  border-radius: var(--exv-radius);
+  background: transparent;
+  color: var(--exv-muted);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.exv-layer-all button:hover {
+  background: var(--exv-active);
+}
+.exv-layer {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.25rem;
+  padding: 0.25rem 0.75rem;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+.exv-layer:hover {
+  background: var(--exv-hover);
+}
+.exv-layer input {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--exv-accent);
+}
+.exv-swatch {
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 1px solid var(--exv-faint);
+  border-radius: 2px;
+}
+.exv-truncate {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.exv-strong {
+  color: var(--exv-text-strong);
+}
+.exv-muted {
+  color: var(--exv-muted);
+}
+.exv-faint {
+  color: var(--exv-faint);
+}
+
+/* ── floating ── */
+.exv-pager {
+  position: absolute;
+  bottom: 0.75rem;
+  left: 50%;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  transform: translateX(-50%);
+  border: 1px solid var(--exv-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--exv-panel) 95%, transparent);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+.exv-badge {
+  position: absolute;
+  bottom: 0.5rem;
+  left: 50%;
+  z-index: 2;
+  margin: 0;
+  padding: 0.25rem 0.75rem;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--exv-panel) 90%, transparent);
+  font-size: 0.75rem;
+  color: var(--exv-muted);
+  pointer-events: none;
+}
+.exv-warnings {
+  position: absolute;
+  bottom: 0.5rem;
+  left: 0.5rem;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: calc(100% - 1rem);
+  padding: 0.25rem 0.25rem 0.25rem 0.75rem;
+  border: 1px solid var(--exv-border);
+  border-radius: var(--exv-radius);
+  background: var(--exv-panel);
+  font-size: 0.75rem;
+  color: var(--exv-warning);
+}
+.exv-warnings p {
+  margin: 0;
+}
+
+/* The zoom buttons and the drag toggle: for a mouse. A touch screen pinches
+   and scrolls, and its buttons would only cover the page. */
+.exv-tools {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0.75rem;
+  z-index: 3;
+  display: none;
+  gap: 0.375rem;
+}
+@media (any-pointer: fine) {
+  .exv-tools {
+    display: flex;
+  }
+}
+.exv-tool-group {
+  display: flex;
+  padding: 0.125rem;
+  border: 1px solid var(--exv-border);
+  border-radius: var(--exv-radius);
+  background: var(--exv-panel);
+  box-shadow: 0 1px 3px rgb(15 23 42 / 0.12);
+}
+.exv-tool-group .exv-icon-button[aria-pressed="true"] {
+  background: var(--exv-active);
+  color: var(--exv-text-strong);
+}
+.exv-tool-group .exv-icon-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── archive ── */
+.exv-archive {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  background: var(--exv-panel);
+}
+.exv-archive-head {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--exv-border);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--exv-muted);
+}
+.exv-archive-refused {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  color: var(--exv-warning);
+}
+.exv-archive-list {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+}
+.exv-archive-list li + li {
+  border-top: 1px solid var(--exv-hover);
+}
+.exv-member {
+  display: flex;
+  width: 100%;
+  min-height: var(--exv-tap);
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  border: 0;
+  background: transparent;
+  color: var(--exv-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.exv-member:hover:not(:disabled) {
+  background: var(--exv-hover);
+}
+.exv-member:disabled {
+  cursor: default;
+}
+.exv-member-locked {
+  opacity: 0.5;
+}
+.exv-member > svg,
+.exv-member > .exv-spinner {
+  flex: none;
+  color: var(--exv-faint);
+}
+.exv-member-name {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  font-size: 0.875rem;
+}
+.exv-member-folder {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--exv-faint);
+}
+.exv-member-size {
+  flex: none;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--exv-faint);
+}
+.exv-archive-back {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.5rem;
+  border-bottom: 1px solid var(--exv-border);
+  background: var(--exv-panel);
+  font-size: 0.875rem;
+  color: var(--exv-muted);
+}
+.exv-archive-back button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 2.25rem;
+  padding: 0 0.5rem;
+  border: 0;
+  border-radius: var(--exv-radius);
+  background: transparent;
+  color: var(--exv-text);
+  font: inherit;
+  cursor: pointer;
+}
+.exv-archive-back button:hover {
+  background: var(--exv-active);
+}
+.exv-archive-member {
+  position: absolute;
+  inset: 0;
+}
+
+/* ── engines' surfaces ── */
+.exv-pdf {
+  position: absolute;
+  inset: 0;
+  display: flex;
+}
+.exv-pdf-scroller {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 12px;
+}
+.exv-pdf-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  width: max-content;
+  min-width: 100%;
+  margin: 0 auto;
+}
+.exv-pdf-page {
+  position: relative;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.12);
+}
+.exv-pdf-bitmap {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.exv-pdf-detail {
+  position: absolute;
+  display: none;
+  pointer-events: none;
+}
+/* pdf.js's text layer, as its pdf_viewer.css lays it out: each run of text
+   transparent, at its place and size on the page. pdf.js sets the layer's
+   size, `--min-font-size`, and each run's `--font-height`, `--scale-x` and
+   `--rotate`. */
+.exv-pdf-text {
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-align: initial;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+}
+.exv-pdf-text :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* A drag that pans: the hand, over the text and the links too. */
+.exv-pdf[data-drag="pan"] .exv-pdf-scroller,
+.exv-pdf[data-drag="pan"] .exv-pdf-text :is(span, br),
+.exv-pdf[data-drag="pan"] .exv-pdf-link {
+  cursor: grab;
+}
+.exv-pdf-panning .exv-pdf-scroller,
+.exv-pdf-panning .exv-pdf-text :is(span, br),
+.exv-pdf-panning .exv-pdf-link {
+  cursor: grabbing !important;
+}
+.exv-pdf-text > span {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.exv-pdf-text ::selection {
+  background: rgb(0 0 255 / 0.25);
+  background: color-mix(in srgb, AccentColor, transparent 50%);
+  color: transparent;
+}
+.exv-pdf-text br::selection {
+  background: transparent;
+}
+.exv-pdf-text[data-main-rotation="90"] {
+  transform: rotate(90deg) translateY(-100%);
+}
+.exv-pdf-text[data-main-rotation="180"] {
+  transform: rotate(180deg) translate(-100%, -100%);
+}
+.exv-pdf-text[data-main-rotation="270"] {
+  transform: rotate(270deg) translateX(-100%);
+}
+/* Below the text, out of the way; over the whole layer while a selection
+   is dragged, so that the space between runs moves nothing (reader.ts). */
+.exv-pdf-text-end {
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.exv-pdf-selecting .exv-pdf-text-end {
+  top: 0;
+}
+.exv-pdf-links {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.exv-pdf-link {
+  position: absolute;
+  pointer-events: auto;
+}
+.exv-pdf-link:hover {
+  background: rgb(250 204 21 / 0.2);
+}
+.exv-pdf-link:focus-visible {
+  outline: 2px solid var(--exv-accent);
+}
+.exv-image {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.exv-image-stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+.exv-image-picture {
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.exv-image-detail {
+  position: absolute;
+  display: none;
+  pointer-events: none;
+}
+.exv-image-page-layer,
+.exv-image-screen-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.exv-image-page-layer > *,
+.exv-image-screen-layer > * {
+  pointer-events: auto;
+}
+.exv-cad,
+.exv-ifc,
+.exv-model,
+.exv-office {
+  position: absolute;
+  inset: 0;
+}
+.exv-cad-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  outline: none;
+}
+/* The drawing's thumbnail, over the canvas while the drawing parses. */
+.exv-cad-preview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+.exv-model {
+  background: var(--exv-model-bg);
+}
+.exv-model-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.exv-office {
+  background: #ffffff;
+  overflow: hidden;
+}
+.exv-office-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+/* A slide on the surface, as a PDF's pages are, centred in the stage it is
+   fitted to: clear of the slide pager below it. */
+.exv-office-pptx {
+  background: var(--exv-surface);
+}
+.exv-office-stage {
+  position: absolute;
+  inset: 1rem 1rem 4.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.exv-office-stage .exv-office-canvas {
+  box-shadow: 0 1px 3px rgb(15 23 42 / 0.18);
+}
+/* Under a Word page's or a slide's text runs while a selection is dragged
+   (office/selection.ts). */
+.exv-office-text-end {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.exv-media {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+}
+.exv-media-video {
+  background: var(--exv-media-bg);
+}
+.exv-media video {
+  max-width: 100%;
+  max-height: 100%;
+}
+.exv-media audio {
+  width: 100%;
+  max-width: 36rem;
+}
+
+/* ── dialog ── */
+.exv-dialog {
+  height: calc(100dvh - 4rem);
+  width: calc(100vw - 4rem);
+  max-width: none;
+  max-height: none;
+  margin: auto;
+  padding: 1rem;
+  border: 0;
+  border-radius: calc(var(--exv-radius) * 2);
+  background: var(--exv-panel);
+  box-shadow: 0 10px 40px rgb(15 23 42 / 0.25);
+  box-sizing: border-box;
+}
+.exv-dialog::backdrop {
+  background: rgb(15 23 42 / 0.6);
+}
+@media (min-width: 640px) {
+  .exv-dialog-page {
+    max-width: 72rem;
+  }
+}
+.exv-dialog-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  height: 100%;
+}
+.exv-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.exv-dialog-title {
+  min-width: 0;
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--exv-text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.exv-hint {
+  margin-left: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--exv-muted);
+}
+.exv-frame {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--exv-border);
+  border-radius: var(--exv-radius);
+  background: var(--exv-surface);
+}
+.exv-dialog-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.exv-foot-left,
+.exv-foot-right {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+}
+.exv-foot-right {
+  gap: 0.5rem;
+}
+.exv-counter {
+  margin-left: 0.25rem;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+.exv-separated {
+  margin-left: 0.75rem;
+  padding-left: 0.75rem;
+  border-left: 1px solid var(--exv-border);
+}

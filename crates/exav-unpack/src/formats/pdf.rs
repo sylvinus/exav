@@ -352,6 +352,7 @@ fn salvage_zlib(data: &[u8], cap: u64) -> Salvaged {
         data: Vec::new(),
         over_cap: false,
         undecoded: true,
+        cut_short: false,
     };
     match crate::inflate::zlib_body(data) {
         Some(body) => bounded_read_salvage(body, cap, true).unwrap_or(failed),

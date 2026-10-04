@@ -80,7 +80,11 @@ fn aes_encrypted_script_and_uri_strings_come_out_exact() {
                 .map(|e| String::from_utf8_lossy(&e.data).into_owned())
                 .unwrap_or_else(|| panic!("{f}: no {name}"))
         };
-        assert_eq!(get("pdf-javascript"), "app.alert('exav-js-marker');\n", "{f}");
+        assert_eq!(
+            get("pdf-javascript"),
+            "app.alert('exav-js-marker');\n",
+            "{f}"
+        );
         assert_eq!(get("pdf-uris"), "http://exav.invalid/landing\n", "{f}");
     }
 }

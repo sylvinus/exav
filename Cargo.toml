@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update", "crates/exav-imagehash"]
-exclude = ["fuzz", "crates/exav-unpack-wasm"]
+members = ["crates/exav", "crates/exav-core", "crates/exav-grep", "crates/exav-unpack", "crates/exav-pe-emu", "crates/exav-x86", "crates/exav-update", "crates/exav-imagehash", "crates/exav-render"]
+exclude = ["fuzz", "crates/exav-unpack-wasm", "crates/exav-viewer"]
 
 [workspace.package]
 version = "0.0.2"
@@ -11,13 +11,14 @@ repository = "https://github.com/sylvinus/exav"
 homepage = "https://exav.org"
 # Checked by `make msrv` rather than asserted: a floor nothing verifies drifts.
 #
-# The number is set by a dependency, not by this code: `yara-x-parser` declares
-# 1.91, so the resolver refuses anything older for a default build. exav's own
-# source needs only 1.88 (`slice::as_chunks`, `is_multiple_of`, and the
-# let-chains the `zip` dependency uses), which is where this would sit if the
-# YARA parser relaxed. Worth rechecking when that dependency moves; lowering it
-# means confirming with `make msrv`, not editing this line.
-rust-version = "1.91"
+# The number is set by dependencies, not by this code: exav-render's image
+# decoders hayro-jpeg2000 0.4, hayro-jbig2 0.3.1 and hayro-ccitt 0.4 declare
+# 1.92 (and `yara-x-parser` 1.91), so cargo refuses to build them on anything
+# older. exav's own source needs only 1.88 (`slice::as_chunks`,
+# `is_multiple_of`, and the let-chains the `zip` dependency uses). Worth
+# rechecking when those dependencies move; lowering it means confirming with
+# `make msrv`, not editing this line.
+rust-version = "1.92"
 # crates.io discovery. keywords: max 5, <=20 chars each. categories must be from
 # https://crates.io/category_slugs (an invalid one fails `cargo publish`).
 keywords = ["antivirus", "clamav", "malware", "scanner", "security"]

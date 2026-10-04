@@ -9,6 +9,15 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 /// "koly": the UDIF trailer signature (last 512 bytes of the file).
 const KOLY_SIG: &[u8; 4] = b"koly";
 
+/// Whether `trailer`, the first 12 bytes of an object's last 512, is a UDIF
+/// `koly` trailer: its signature, version 4, and its own size, 512.
+pub(crate) fn is_koly(trailer: &[u8]) -> bool {
+    trailer.len() >= 12
+        && trailer[..4] == KOLY_SIG[..]
+        && trailer[4..8] == 4u32.to_be_bytes()
+        && trailer[8..12] == 512u32.to_be_bytes()
+}
+
 /// "encrcdsa": encrypted DMG header signature.
 const ENCRCDSA_SIG: &[u8; 8] = b"encrcdsa";
 
@@ -394,13 +403,40 @@ fn decrypt_image(
     }
 }
 
-/// Walk the filesystem on a (possibly UDIF-compressed) disk image.
+/// Walk the filesystem on a (possibly UDIF-compressed) disk image. A run
+/// that failed to decode part way leaves the walk reading what decoded
+/// before the failure, and bytes past it that may not be the disk's
+/// (decoders can run on past damage before they notice it), so it is
+/// reported once the walk is done.
 fn walk_disk<D: Read + Seek, T>(
     disk: D,
     budget: &mut Budget,
     emit: Emit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    let mut disk = super::udif::disk(disk)?;
+    let disk = super::udif::disk(disk)?;
+    let damaged = disk.damage();
+    let found = walk_fs(disk, budget, emit)?;
+    if found.is_some() || !damaged.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(found);
+    }
+    budget.count_entry()?;
+    emit(
+        Entry::unsupported(
+            "dmg-disk".to_string(),
+            0,
+            false,
+            "DMG run failed to decode part way; the bytes before the failure were scanned",
+        ),
+        budget,
+    )
+}
+
+/// Walk the HFS+ or APFS filesystem on `disk`.
+fn walk_fs<D: Read + Seek, T>(
+    mut disk: super::udif::Disk<D>,
+    budget: &mut Budget,
+    emit: Emit<T>,
+) -> Result<Option<T>, LimitHit> {
     // Both filesystems are looked for in the first 64 KiB, as `is_dmg` does.
     let mut head = Vec::new();
     disk.seek(SeekFrom::Start(0))
@@ -485,9 +521,14 @@ fn read_file<T, E>(
         return Err(LimitHit::new(format!("DMG file '{path}' exceeds budget")));
     }
     if read.is_err() {
-        // Its bytes are in the image and were not read: reported, not dropped.
+        // Its bytes are in the image and were not all read: reported, not
+        // dropped, and those read before the failure scanned.
+        budget.commit(out.data.len() as u64);
         return emit(
-            Entry::unsupported(path, 0, false, "DMG file could not be read"),
+            Entry {
+                unsupported: Some("DMG file could not be read"),
+                ..Entry::new(path, out.data)
+            },
             budget,
         );
     }

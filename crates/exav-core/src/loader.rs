@@ -906,11 +906,23 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         use crate::{analyze, scan_path, scan_seekable, ScanOptions, Verdict};
         use std::io::Write;
         let dir = crate::tmpfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("p.ndb"), "PUA.Test.Ndb:0:*:70756170756170756170\n").unwrap();
-        std::fs::write(dir.path().join("p.db"), "PUA.Test.Db=6d79706f74656e7469616c\n").unwrap();
+        std::fs::write(
+            dir.path().join("p.ndb"),
+            "PUA.Test.Ndb:0:*:70756170756170756170\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p.db"),
+            "PUA.Test.Db=6d79706f74656e7469616c\n",
+        )
+        .unwrap();
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        zip.start_file("m.txt", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored))
-            .unwrap();
+        zip.start_file(
+            "m.txt",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
         zip.write_all(b"xx puapuapuap and mypotential xx").unwrap();
         let zip = zip.finish().unwrap().into_inner();
         let files = dir.path().join("files");
@@ -932,7 +944,10 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
                 v.push((format!("{n} in memory"), analyze(db, data, &opts).verdict));
                 let r = scan_seekable(db, std::io::Cursor::new(data), data.len() as u64, &opts);
                 v.push((format!("{n} read"), r.unwrap().verdict));
-                v.push((format!("{n} path"), scan_path(db, path, &opts).unwrap().verdict));
+                v.push((
+                    format!("{n} path"),
+                    scan_path(db, path, &opts).unwrap().verdict,
+                ));
             }
             v
         };

@@ -147,9 +147,14 @@ fn the_macro_source_reaches_the_vba_project_artifact() {
 /// project is still assembled from the `VBA` storage it finds there.
 #[test]
 fn the_macro_source_is_assembled_through_the_lenient_reader() {
-    const SOURCE: &str = "Attribute VB_Name = \"Module1\"\r\nSub AutoOpen()\r\n  Shell \"calc.exe\"\r\nEnd Sub\r\n";
+    const SOURCE: &str =
+        "Attribute VB_Name = \"Module1\"\r\nSub AutoOpen()\r\n  Shell \"calc.exe\"\r\nEnd Sub\r\n";
     let mut blob = ole_with_a_real_module_beside(SOURCE, 0x10, &["/aaaa", "/bbbb"]);
-    let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+    let utf16 = |s: &str| {
+        s.encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>()
+    };
     let (a, b) = (utf16("aaaa"), utf16("bbbb"));
     let at = |n: &[u8], blob: &[u8]| blob.windows(n.len()).position(|w| w == n).unwrap();
     let (pa, pb) = (at(&a, &blob), at(&b, &blob));

@@ -8,7 +8,7 @@ in Rust. It is what `exav --auto-update` fetches with, and it ships no binary of
 its own: from the command line, use `exav --auto-update --sig-sources <URL>`,
 which needs an `exav` built with `http-update` (or `http`), as the container
 image is; the release binaries and a default `cargo install exav` are not (see
-[Feature flags](/reference/feature-flags/#adding-http-support)).
+[Feature flags](/scanner/reference/feature-flags/#adding-http-support)).
 
 ```bash
 cargo add exav-update
@@ -24,7 +24,7 @@ cargo add exav-update
   its `ClamAV-VDB:` header; any other file that looks like an HTML or JSON error
   page is refused.
 - `fetch_db_if_changed(url, dest, prev)` pulls a
-  [prebuilt `.exavdb`](/guides/prebuilt-database/), checks its magic, length and
+  [prebuilt `.exavdb`](/scanner/guides/prebuilt-database/), checks its magic, length and
   trailing CRC-32, and installs it with an atomic rename.
 - `prune_env_sources` removes files for sources no longer configured, and
   `sig_dest` / `url_basename` say where a URL will land.

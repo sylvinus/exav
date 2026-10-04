@@ -36,6 +36,9 @@ pub(crate) struct Block {
 
     hasher: Hasher,
     expected_crc: u32,
+    /// A block decoded in full and failed its CRC. The blocks after it are
+    /// still decoded; the mismatch is reported at the end of the stream.
+    crc_failed: bool,
 
     state: State,
 }
@@ -63,6 +66,7 @@ impl Block {
 
             hasher: Hasher::new(),
             expected_crc: 0,
+            crc_failed: false,
 
             state: State::NotReady,
         }
@@ -102,7 +106,7 @@ impl Block {
             State::ReadyForRead => {
                 let magic = reader
                     .read_u64(if self.nsis { 8 } else { 48 })
-                    .ok_or_else(|| BlockError::new("next magic truncated"))?;
+                    .ok_or_else(|| BlockError::truncated("next magic truncated"))?;
                 match magic {
                     NSIS_BLOCK if self.nsis => {
                         self.read_block(reader)?;
@@ -123,11 +127,15 @@ impl Block {
                     FINAL_MAGIC if !self.nsis => {
                         let _crc = reader
                             .read_u32(32)
-                            .ok_or_else(|| BlockError::new("whole stream crc truncated"))?;
+                            .ok_or_else(|| BlockError::truncated("whole stream crc truncated"))?;
 
                         // TODO: check whole stream crc
 
                         self.state = State::NotReady;
+                        // Reported once, so a read after it ends the stream.
+                        if std::mem::take(&mut self.crc_failed) {
+                            return Err(BlockError::checksum("bad crc"));
+                        }
                         Ok(0)
                     }
                     _ => {
@@ -189,11 +197,8 @@ impl Block {
             self.state = State::NotReady;
 
             let crc = self.hasher.finalyze();
-            return if self.nsis || self.expected_crc == crc {
-                Ok(0)
-            } else {
-                Err(BlockError::new("bad crc"))
-            };
+            self.crc_failed |= !self.nsis && self.expected_crc != crc;
+            return Ok(0);
         }
 
         self.hasher.update(&out[..read]);
@@ -207,11 +212,11 @@ impl Block {
         if !self.nsis {
             self.expected_crc = reader
                 .read_u32(32)
-                .ok_or_else(|| BlockError::new("crc truncated"))?;
+                .ok_or_else(|| BlockError::truncated("crc truncated"))?;
 
             let randomised = reader
                 .read_bool()
-                .ok_or_else(|| BlockError::new("randomised truncated"))?;
+                .ok_or_else(|| BlockError::truncated("randomised truncated"))?;
             if randomised {
                 return Err(BlockError::new("randomised expected to be 'normal'"));
             }
@@ -219,7 +224,7 @@ impl Block {
 
         let orig_ptr = reader
             .read_u32(24)
-            .ok_or_else(|| BlockError::new("orig ptr truncated"))?;
+            .ok_or_else(|| BlockError::truncated("orig ptr truncated"))?;
 
         let mut huffman_used_symbols = ArrayVec::<[u8; 16]>::new();
         let mut huffman_used_bitmaps = ArrayVec::<[u8; 256]>::new();
@@ -227,7 +232,7 @@ impl Block {
         for i in 0..16 {
             if reader
                 .read_bool()
-                .ok_or_else(|| BlockError::new("symbol range truncated"))?
+                .ok_or_else(|| BlockError::truncated("symbol range truncated"))?
             {
                 huffman_used_symbols.push(i);
             }
@@ -237,7 +242,7 @@ impl Block {
             for symbol in 0..16 {
                 if reader
                     .read_bool()
-                    .ok_or_else(|| BlockError::new("symbol range truncated"))?
+                    .ok_or_else(|| BlockError::truncated("symbol range truncated"))?
                 {
                     huffman_used_bitmaps.push(symbol_range * 16 + symbol);
                 }
@@ -250,14 +255,14 @@ impl Block {
 
         let huffman_groups = reader
             .read_u8(3)
-            .ok_or_else(|| BlockError::new("huffmann groups truncated"))?;
+            .ok_or_else(|| BlockError::truncated("huffmann groups truncated"))?;
         if !(2..=6).contains(&huffman_groups) {
             return Err(BlockError::new("invalid number of huffman trees"));
         }
 
         let selectors_used = reader
             .read_u16(15)
-            .ok_or_else(|| BlockError::new("selectors used truncated"))?;
+            .ok_or_else(|| BlockError::truncated("selectors used truncated"))?;
 
         let mut selectors_list = vec![0u8; usize::from(selectors_used)];
 
@@ -267,7 +272,7 @@ impl Block {
 
             while reader
                 .read_bool()
-                .ok_or_else(|| BlockError::new("selector truncated"))?
+                .ok_or_else(|| BlockError::truncated("selector truncated"))?
             {
                 trees += 1;
 
@@ -292,7 +297,7 @@ impl Block {
         for _ in 0..huffman_groups {
             let mut length = reader
                 .read_u8(5)
-                .ok_or_else(|| BlockError::new("huffman group length truncated"))?;
+                .ok_or_else(|| BlockError::truncated("huffman group length truncated"))?;
 
             for length_item in &mut *lengths {
                 loop {
@@ -302,14 +307,14 @@ impl Block {
 
                     if !reader
                         .read_bool()
-                        .ok_or_else(|| BlockError::new("length bit1 truncated"))?
+                        .ok_or_else(|| BlockError::truncated("length bit1 truncated"))?
                     {
                         break;
                     }
 
                     if reader
                         .read_bool()
-                        .ok_or_else(|| BlockError::new("length bit2 truncated"))?
+                        .ok_or_else(|| BlockError::truncated("length bit2 truncated"))?
                     {
                         length -= 1;
                     } else {
@@ -338,7 +343,7 @@ impl Block {
         let mut decoded = 0;
         #[cfg(target_pointer_width = "64")]
         let mut r = CachedBitReader::new(reader)
-            .ok_or_else(|| BlockError::new("huffman bitstream truncated"))?;
+            .ok_or_else(|| BlockError::truncated("huffman bitstream truncated"))?;
         loop {
             if decoded == 50 {
                 let selector = selectors_list.pop().ok_or_else(|| {
@@ -359,7 +364,7 @@ impl Block {
                 if r.overflowed() {
                     r.restore(reader, read);
                     r.refresh(reader)
-                        .ok_or_else(|| BlockError::new("huffman bitstream truncated"))?;
+                        .ok_or_else(|| BlockError::truncated("huffman bitstream truncated"))?;
 
                     current_huffman_tree.decode(&mut r)
                 } else {
@@ -369,7 +374,7 @@ impl Block {
             #[cfg(not(target_pointer_width = "64"))]
             let v = current_huffman_tree.decode(reader);
 
-            let v = v.ok_or_else(|| BlockError::new("huffman bitstream truncated"))?;
+            let v = v.ok_or_else(|| BlockError::truncated("huffman bitstream truncated"))?;
             decoded += 1;
 
             if v < 2 {

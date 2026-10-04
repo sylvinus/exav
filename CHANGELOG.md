@@ -31,8 +31,9 @@ follow [semantic versioning](https://semver.org/).
 - `--all-matches` and `ALLMATCHSCAN` list every detection at any size; past
   `--max-object-bytes` they fell back to a single match. Past
   `--max-input-bytes` they list what the first bytes hold and report the rest
-  unscanned, as a single-match scan does; they fell back to a single match
-  there too, without saying the search stopped short.
+  unscanned, as a single-match scan does; `--all-matches` fell back to a single
+  match there, without saying the search stopped short, and `ALLMATCHSCAN`
+  ignored the limit.
 - Every environment variable without a flag is named `EXAV_DEBUG_*`:
   `EXAV_BC_WARN`, `EXAV_BC_TRACE`, `EXAV_BC_FN` and `EXAV_FORCED` are
   `EXAV_DEBUG_BC_WARN`, `EXAV_DEBUG_BC_TRACE`, `EXAV_DEBUG_BC_FN` and
@@ -54,8 +55,8 @@ follow [semantic versioning](https://semver.org/).
   file. A ZIP split by `zip -s` (`.z01`, ..., `.zip`) and a RAR volume set
   (`.part1.rar`, ... or `.rar`, `.r00`, ...) are read from any part, and
   `--volume` names parts that are elsewhere.
-- Releases carry `exav-unpack`, `exav-grep` and `exav-pe-emu` archives beside
-  `exav`'s, and every archive carries `LICENSE` and `NOTICE`.
+- Releases carry `exav-unpack`, `exav-grep`, `exav-pe-emu` and `exav-imagehash`
+  archives beside `exav`'s, and every archive carries `LICENSE` and `NOTICE`.
 - `--partial-as password-protected=found` reports any encrypted member as
   `Heuristics.Encrypted.*`, as ClamAV's `--alert-encrypted` does: one exav
   decrypted with a password, and one whose encryption flag is set over plain
@@ -102,7 +103,8 @@ follow [semantic versioning](https://semver.org/).
 - `ScanOptions::deep_analysis_max` also holds `Limits::max_buffer_bytes` for a
   scan, so no object is held in memory past it.
 - exav-unpack-wasm: `list()` decodes nothing it can avoid, and reports
-  `uncompressedSize` as the archive declares it, -1 where it declares none;
+  `uncompressedSize` as the archive declares it, -1 where it declares none
+  (it was the decoded size there);
   `extract(i)` walks the archive up to member `i`.
 - YARA detections are named `YARA.<rule>` outside `--clamav-compat`; the
   `.UNOFFICIAL` suffix is compat-only, as for every other signature.
@@ -137,10 +139,14 @@ follow [semantic versioning](https://semver.org/).
   storages) is `UNSCANNABLE` when the part before the damage holds no
   detection, wherever it sits; a checksum mismatch after a full decode is not.
   Nested in another container it used to be `OK`, and a gzip with only a bad
-  CRC was `UNSCANNABLE` at the top level.
+  CRC was `UNSCANNABLE` at the top level. A deflated ZIP member declaring 0
+  bytes compressed and uncompressed (Civil 3D writes them) is empty, not
+  damaged.
 - The daemon's signals match clamd's: `SIGUSR2` reloads the signatures and
   `SIGHUP` reopens the `--log` file (for logrotate), under the worker pool, the
-  thread model and ICAP alone. Both used to kill the process.
+  thread model and ICAP alone. `SIGUSR2` used to kill the process in every
+  mode, as `SIGHUP` did under the thread model and ICAP alone; under the pool
+  `SIGHUP` reloaded the signatures.
 - `--workers threads` and an ICAP-only listener reload on `SIGUSR2`, `RELOAD` and
   a change in the signature directory, as the pool does.
 - The systemd unit is `exav.service` (it was `exav-clamd.service`). It reads
@@ -205,6 +211,11 @@ follow [semantic versioning](https://semver.org/).
 - The `docker-compose.yml` example publishes the clamd port on localhost only.
 - `make lint` runs the clippy passes CI runs, and `make test-www` checks that
   every internal link and anchor of the documentation site resolves.
+- exav.org is organised by product: malware scanning, archive extraction
+  (with new pages for the `exav-unpack` command and `@exav/unpack-wasm`), the
+  file viewer, subprojects, and about the project, each listed in the header
+  of every page and with its own sidebar. The old page URLs redirect to the
+  new ones. The site is dark only.
 - A signature path that loads nothing is an error: one that does not exist, or a
   directory holding only a prebuilt `.exavdb` (load that with `-d`).
 - `clamscan`'s `--alert-encrypted`, `--alert-encrypted-archive`,
@@ -288,11 +299,50 @@ follow [semantic versioning](https://semver.org/).
 
 ### Added
 
+- AutoCAD DXF drawings, ASCII and binary, R12 to 2018 (feature `dxf`, in
+  `all-formats`): the object an OLE2FRAME embeds, which the file holds as
+  hexadecimal, is extracted and scanned (the compound file, then its streams),
+  as is any other binary chunk that is a whole file of a known kind. An ASCII
+  DXF keeps its text type; nothing changes under `--clamav-compat`.
+  `exav_unpack::dxf` exposes the pairs, records and code pages of the format.
+- AutoCAD DWG drawings, R13 to 2018 (feature `dwg`, in
+  `all-formats`): the preview images are extracted and scanned, the bitmap
+  as a BMP file, and so is the object each OLE2FRAME embeds
+  (`ole2frame-<handle>.ole`, the compound file); a drawing whose objects
+  cannot be read is reported as not fully examined, and so is a drawing of
+  a release before R13 (R12, AC1009, and older). Nothing changes under
+  `--clamav-compat`. `exav_unpack::dwg`
+  reads the format's bit codes, the sections the file header locates (from
+  2004: the encrypted file header, the page and section maps, checksummed
+  and compressed pages, with what they expand to bounded; 2007's own
+  Reed-Solomon coded pages, compression and CRCs, a damaged header or map
+  read from the copies the file keeps), the classes, the
+  object map and each object's common data and strings, from the ODA
+  specification. The DXF reader now reads MTEXT columns from the extended data (before 2018)
+  and the embedded object (2018).
 - `exav-imagehash`, a crate and a command of its own: perceptual image hashes
   with every step a parameter, and presets equal to `sigtool --fuzzy-img`
   (ClamAV's `fuzzy_img` hash, which the scanner now computes through it) and
   to Python `imagehash.phash`. No `unsafe` in it, its image decoders or its
   DCT (rustdct's, vendored); its checksum and cast dependencies do use some.
+- `exav-render`, a new crate of memory-safe decoders that turn a file into
+  something to draw: raster images into pixels (exav-imagehash now hashes
+  what it decodes; over 9,751 photos the hashes are unchanged), JPEG 2000,
+  JBIG2 and fax images (`jp2`, `jbig2`; hayro-jpeg2000 and hayro-jbig2,
+  `forbid(unsafe_code)`, without their SIMD code) including those of PDFs
+  (`pdf_image`), DWG (R13 to 2018) and DXF drawings into GPU-ready buffers
+  (feature `dwg`), and IFC (2X3, 4 and 4X3) and STL models into meshes
+  (features `ifc`, `stl`).
+- `@exav/viewer`, a new npm package: a file viewer for the browser, for PDF,
+  images (TIFF, BMP and the formats browsers do not draw, through exav-render
+  in WebAssembly), DWG and DXF, Word, Excel, PowerPoint and CSV, IFC and STL
+  models, video, audio, and the files inside an archive. Each format's engine
+  loads on its first file; every asset is served by the host, so it runs under
+  a strict Content-Security-Policy and offline. A framework-free core, a React
+  UI, a Vite plugin, a command that copies the engines' assets, and a
+  sandboxed mode that opens each file in an `<iframe sandbox="allow-scripts">`
+  of its own. Documented under File viewer on exav.org, with a demo at
+  exav.org/viewer/demo/.
 - The `image-hash` build feature (on by default): without it, `fuzzy_img#`
   signatures load as unsupported and no image is decoded.
 - `--max-pcre-bytes`: the largest object PCRE subsignatures run on, as
@@ -315,7 +365,11 @@ follow [semantic versioning](https://semver.org/).
 - The WASI binary (`exav-core --features wasi-bin`) loads a signature directory
   as the CLI does, reports each result as JSON with the file name, and exits
   0/1/2/3 like `exav`.
-- A guide to sizing a server, with the flags for a 4 GB host.
+- A guide to sizing a server, with the flags for a 4 GB host, and how the
+  daemon divides the RAM it is given between the database and its workers.
+- The image's health check, repeated where an image kept as OCI loses it
+  (`HEALTHCHECK` is part of Docker's image format): in `docker-compose.yml`,
+  and as a Compose and a Kubernetes snippet in the Docker guide.
 - `exav_unpack::Prescan` and `exav_unpack::detect_prescanned`: detection's
   search through an object not held in memory, fed by the caller's own read of
   it, so that one read serves detection and the caller's searches.
@@ -339,6 +393,122 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- An object holding more embedded files than carving scans (16 PE, ELF or
+  Mach-O images of each kind, 32 archives) scanned the first ones and
+  dropped the rest silently, so decoys in front of a payload hid it from the
+  signatures that need it carved. Such an object is now `LIMITS-EXCEEDED`
+  unless something is found; the other members of its container are still
+  scanned. An archive candidate now counts only when its header checks out,
+  gzip's `XFL` and `OS` fields included, so chance byte runs in large files
+  cannot reach the cap.
+- A ZIP member compressed with PPMd (method 98), as 7-Zip and WinZip write
+  it, was `UNSCANNABLE` and its content unscanned: it was decoded as PPMd
+  variant H, the 7z one, where ZIP uses variant I revision 1. It is decoded,
+  and needs only the `zip` feature; it needed `sevenz`.
+- A ZIP member found only by its local header (left out of the central
+  directory, or in an archive whose directory is missing) and written by a
+  streaming writer, with its sizes in a data descriptor after the data, was
+  decoded to nothing when compressed with PPMd or LZMA, and scanned as an
+  empty file: its size was taken from the local header, where it is zero. It
+  now comes from the data descriptor, and a member with no size anywhere is
+  decoded to its codec's end marker. With a descriptor written without its
+  optional signature, such a member was `UNSCANNABLE` in every codec but
+  Deflate. One damaged part way now has the bytes before the damage scanned,
+  as a Deflate one did.
+- A ZIP member found only by its local header and in ZIP64 form, its sizes in
+  a ZIP64 extra field, was dropped without being reported.
+- A 7z member whose packed data the header placed past the end of the file,
+  or in a packed stream the header does not list, was left out without a
+  word, so the archive could scan clean. It is reported, and the scan is
+  `UNSCANNABLE` unless something is found.
+- A ZIP member found only by its local header whose data ran past the end of
+  the file (an archive cut short, or one claiming a size it does not hold)
+  was dropped: the compressed bytes that were there were never decoded, so a
+  payload in them was missed and the file could scan clean. They are decoded
+  and scanned, whatever the codec. Cut off by the end of the file, the member
+  is not reported, as nothing present went unread: a ZIP cut short, the first
+  part of a split ZIP scanned on its own among them, stays `OK` unless
+  something is found. One left out of the central directory whose data runs
+  into the next listed member is reported as not whole. When a rejoined split
+  archive is `FOUND`, `CONTSCAN` and `EXINSTREAM MULTI` report that on every
+  part, a part `UNSCANNABLE` on its own included.
+- Such a member cut short before the next header was reported as complete
+  when compressed with Deflate, Deflate64, LZMA or XZ, and as not whole with
+  PPMd or bzip2. It is reported as not whole whatever its codec. So is one
+  that decodes to more than its declared size, as a Deflate stream damaged part
+  way can without an error.
+- A ZIP member compressed with LZMA or Zstandard and cut short had little or
+  nothing of what decoded before the cut scanned: the LZMA decoder dropped
+  what it decoded since its last read, the Zstandard one the last window of
+  the frame. So did an lzip or Zstandard file cut short. Each is scanned as far
+  as it decodes.
+- A bzip2 or Zstandard file cut short was `UNSCANNABLE`, and so was any
+  compressed stream cut off before its first decoded byte (inside its header,
+  or its first bzip2 or Zstandard block). Each is `OK` unless something is
+  found, as a gzip, xz or lzip file cut short is: nothing present went unread.
+  bzip2 and Zstandard decode by block, so the block the cut falls in gives
+  nothing.
+- A member damaged part way, or cut short, lost what its decoder had decoded
+  before the damage or the cut, so a payload sitting just before it was
+  missed: 7z (LZMA, LZMA2, Deflate), SWF (both compressed forms), NSIS, UPX
+  (every method), EGG, ALZ, HWP 3.0, XAR, and the grains and clusters of
+  streamOptimized VMDK and compressed qcow2 images. A damaged 7z folder using
+  BCJ2 made the whole archive `UNSCANNABLE` with no member scanned. What
+  decoded is now scanned in each. Damage with bytes after it is still
+  reported, as are bytes an LZMA decoder had decoded but not handed over
+  when it met the damage (at most what 1 KiB of the stream decodes to).
+- An xz stream damaged part way (an `.xz` file, a ZIP member of method 95, a
+  DMG run) lost up to 8 KiB of what decoded before the damage, so a payload
+  just before it could be missed. At most 1 KiB is lost now.
+- A compressed DMG run (zlib, bzip2, xz, LZFSE) that failed to decode part way
+  was dropped whole: no file with bytes in it was scanned, and a run holding
+  the filesystem's catalog left nothing of the image scanned. The
+  part that decoded is now read, its files scanned, and the image reported
+  `UNSCANNABLE` unless something is found, since a decoder can run on past
+  damage before noticing it. A zlib run damaged where the decoder ran on
+  without an error to the run's size was scanned `OK` from bytes that were
+  not the disk's; it, and a run decoding to more than its size, are reported.
+  A DMG file that could not be read in full has its bytes read before the
+  failure scanned.
+- An EGG block that decoded in full and then failed its CRC-32 was
+  `UNSCANNABLE` and its bytes unscanned. Every byte present was read, so they
+  are scanned and the result is `OK` unless something is found, as for a ZIP
+  member; the mismatch is reported only with checksum verification on.
+- The same now holds for a RAR member failing its CRC-32, a WIM resource
+  failing its SHA-1, and an ARC or ZOO member failing its CRC-16: each was
+  `UNSCANNABLE` (RAR, WIM, ARC with its bytes unscanned). A bzip2 block failing
+  its CRC stopped the stream, and an lzip member failing its trailer stopped
+  the file, so the blocks or members after it were never decoded and a payload
+  in them was missed; they are decoded and scanned, in every container that
+  carries bzip2. A UPX `PackHeader` run that decoded in full but disagreed
+  with its Adler-32 was left unpacked. Two cases still report a mismatch: an
+  encrypted member, whose CRC is how a password is confirmed, and a solid RAR
+  member decoded after a member of its group that could not be, whose bytes
+  are then not its own.
+- A DMG whose data opens with a bzip2 or xz run, as hdiutil writes compressed
+  images, was scanned as a bare bzip2 or xz stream from its first bytes, not
+  walked as a disk image, so a file in a later run of another kind was never
+  reached. Its `koly` trailer is now checked before those two magics.
+- A RAR4 volume set missing a volume from its middle was joined by the
+  `exav-unpack` command, only the CRC of the member it cut telling. When its
+  volumes record their numbers, as RAR 3 and later write them, it is refused,
+  as a RAR5 one was.
+- A member cut off by the end of the file was `UNSCANNABLE` (NSIS, HWP 3.0,
+  XAR, VMDK, qcow2, and the first member of an EGG or ALZ archive), though
+  nothing present went unread, or dropped without its present bytes decoded
+  (a later EGG or ALZ member, a UPX block). Each is decoded as far as the file
+  goes and is `OK` unless something is found, as a ZIP cut short is.
+- A UPX block that failed to decode (LZMA or Deflate), or decoded short, was
+  dropped without a word with every block after it, so a packed executable
+  could scan clean; an NRV block that failed made the scan `UNSCANNABLE` with
+  nothing of the image scanned. What decoded is scanned and the image is
+  reported not decoded whole.
+- An NSIS stream decoded to more than `--max-object-bytes` was cut there and
+  scanned as complete. It is reported.
+- A 7z member compressed with PPMd whose stream ran out before the member's
+  declared size was handed over as complete, so the archive could scan clean.
+  The part decoded is scanned and the member is reported not decoded whole.
+  The member is now decoded as it is read, where it was decoded whole first.
 - A crafted ARC member (69 bytes is enough) made the scan allocate until it
   ran out of memory: its LZW decoder accepted a code past the next free one,
   which could make a code its own prefix. Such a member is now reported
@@ -347,6 +517,12 @@ follow [semantic versioning](https://semver.org/).
   expanded to, not the size it declares, which is what the budget checks: a
   megabyte member could take gigabytes. Decoding stops at the declared size,
   and the member is reported.
+- Every ZOO archive `zoo` writes was `UNSCANNABLE`: the directory entry that
+  ends it is shorter than a full one, and was read as an entry cut short.
+- An executable decoded out of a base64 string lost its last one or two bytes
+  when the encoding ended in padding, as it does for two sizes in three, so a
+  hash signature or `.sfp` entry for it never matched. The same for a `data:`
+  URI written without its padding.
 - The PE emulator panicked on a packed file whose import directory, or an
   output structure it passes to an emulated Windows call, runs past 4 GiB.
 - The x86 decoder sized UMONITOR's register by the operand size rather than
@@ -461,8 +637,10 @@ follow [semantic versioning](https://semver.org/).
 - Under `--clamav-compat`, a WebP image matched `Target:5` (graphics)
   signatures, which clamscan's do not: its graphics are PNG, GIF, JPEG, TIFF
   and BMP, and those five are also the only images it hashes for `fuzzy_img#`.
-  Otherwise a WebP, ICO, PNM, QOI, DDS, farbfeld or HDR image is graphics too,
-  and hashed as `sigtool --fuzzy-img` hashes it.
+  Otherwise a WebP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000 or JBIG2
+  image is graphics too, and hashed as `sigtool --fuzzy-img` hashes it (a
+  JPEG 2000 or JBIG2 image, which sigtool does not read, as it hashes the
+  same pixels in a PNG).
 - PCRE subsignatures matched differently from ClamAV's PCRE2 on bytes above
   0x7F and on PCRE syntax the Rust regex engines read otherwise: `\xe9` matched
   é's UTF-8 encoding instead of the byte, `.`, `[^a]` and `\W` missed high
@@ -509,9 +687,6 @@ follow [semantic versioning](https://semver.org/).
   scanned to the end of the file, as ClamAV does, so a signature that matches
   what follows it in the file finds it (`Win.Loader.Covenant-10058832-0` on a
   Word dropper, for one).
-- Typing an archive not held in memory read its first 4 MiB even when its
-  first bytes named it, so exav-unpack-wasm's `Archive.open` over a `File` or a
-  `{ read, size }` reader fetched a small archive whole before listing it.
 - A `.db` file with one line exav cannot read loaded none of its signatures.
   The line is skipped on its own, and counted with every other signature exav
   could not load (`Unsupported sigs skipped` in the `-v` summary), as is a
@@ -531,8 +706,10 @@ follow [semantic versioning](https://semver.org/).
   the top-level scan takes.
 - Clean ZIP members compressed with LZMA, bzip2, XZ, zstd or Deflate64 were also
   reported as an unsupported codec on the streamed path.
-- `.db` signatures were never matched; PUA literal signatures matched without
-  `--detect pua`.
+- `.db` signatures matched only on the streamed paths (the start of an input
+  past `--max-input-bytes`, the own bytes of a top-level ZIP, tar or gzip, and
+  stdin), never in a file or a member; on those paths PUA literal signatures
+  matched without `--detect pua`.
 - A read error from the source is reported instead of being taken for the end of
   a container, for every format.
 - A self-extracting executable whose archive starts past `--max-object-bytes`
@@ -595,7 +772,9 @@ follow [semantic versioning](https://semver.org/).
   input than such a block takes.
 - A ZIP member compressed with bzip2, LZMA, zstd, XZ, Deflate64 or PPMd and
   larger than `--max-object-bytes` stopped the walk, so the members after it
-  were never scanned. It streams, and spills like any other member.
+  were never scanned. It streams, and spills like any other member. One whose
+  LZMA dictionary or PPMd model would take more than `--max-object-bytes` is
+  still not decoded: it is `LIMITS-EXCEEDED`, and the walk goes on past it.
 - The daemon's CPU limit (`--max-scan-secs`) applied to a worker's whole life
   rather than to each job: once the jobs a worker had served used it between
   them, the kernel killed the worker in the middle of the next job, however
@@ -609,9 +788,9 @@ follow [semantic versioning](https://semver.org/).
   as the same text ClamAV extracts, and the files it installs. They were `UNSCANNABLE`. A member cut short is
   scanned as far as it goes and reported.
 - In an AES-encrypted PDF (AES-128 or AES-256, the default of current tools)
-  the decrypted streams and strings kept the 16-byte IV in front. Every
-  compressed stream then failed to inflate, went unscanned and made the scan
-  `UNSCANNABLE`, and extracted URIs and JavaScript carried 16 bytes of noise.
+  the decrypted streams and strings kept the 16-byte IV in front. A compressed
+  stream decoded only when the search for a zlib header past those bytes found
+  the right one, and extracted URIs and JavaScript carried 16 bytes of noise.
 - A CAB member that shares its bytes with the one before it (MSI cabinets list
   a file installed under two names twice at one offset, as ScreenConnect
   installers do) made the scan `UNSCANNABLE`: the streamed walk reads forward

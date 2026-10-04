@@ -7,7 +7,8 @@
 //! on the page can be typed), so this does.
 //!
 //! Skipped, not failed, when `www/` is absent: the published crate ships without
-//! it, and a test that cannot see the docs has nothing to say about them.
+//! it, and a test that cannot see the docs has nothing to say about them. In a
+//! checkout, a page these tests read that has moved fails them.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,22 @@ fn repo_root() -> PathBuf {
         .nth(2)
         .expect("repo root above crates/exav")
         .to_path_buf()
+}
+
+/// `rel` under the repository root, `None` when `www/` is absent (the
+/// published crate). With `www/` there, `rel` must exist.
+fn docs_path(rel: &str) -> Option<PathBuf> {
+    let root = repo_root();
+    if !root.join("www").is_dir() {
+        eprintln!("skipping: {} is absent", root.join("www").display());
+        return None;
+    }
+    let p = root.join(rel);
+    assert!(
+        p.exists(),
+        "{rel} is missing: the docs moved, update the path here"
+    );
+    Some(p)
 }
 
 /// Long flags the binary really has, from `--help`.
@@ -93,12 +110,9 @@ fn flags_in(path: &Path) -> BTreeSet<String> {
 /// Every flag exav really has is written down somewhere a reader can find it.
 #[test]
 fn every_flag_is_documented() {
-    let root = repo_root();
-    let cli = root.join("www/src/content/docs/reference/cli.md");
-    if !cli.exists() {
-        eprintln!("skipping: {} is absent", cli.display());
+    let Some(cli) = docs_path("www/src/content/docs/scanner/reference/cli.md") else {
         return;
-    }
+    };
     let documented = flags_in(&cli);
     let undocumented: Vec<_> = flags_in_help()
         .into_iter()
@@ -109,7 +123,7 @@ fn every_flag_is_documented() {
         undocumented.is_empty(),
         "these flags exist but are in no table on the CLI reference page:\n  {}\n\n\
          A flag nobody can find is a flag nobody uses: add it to \
-         www/src/content/docs/reference/cli.md.",
+         www/src/content/docs/scanner/reference/cli.md.",
         undocumented.join("\n  ")
     );
 }
@@ -124,11 +138,9 @@ fn every_flag_is_documented() {
 #[test]
 fn every_documented_exav_command_uses_real_flags() {
     let root = repo_root();
-    let docs = root.join("www/src/content/docs");
-    if !docs.exists() {
-        eprintln!("skipping: {} is absent", docs.display());
+    let Some(docs) = docs_path("www/src/content/docs") else {
         return;
-    }
+    };
     let real = flags_in_help();
 
     let mut bad: Vec<String> = Vec::new();
@@ -462,11 +474,10 @@ fn every_flag_named_in_a_message_exists() {
 /// that true for the whole column rather than the few flags someone got to.
 #[test]
 fn docs_name_the_exav_flag_for_every_renamed_clamscan_flag() {
-    let matrix = repo_root().join("www/src/content/docs/reference/clamav-flag-matrix.md");
-    if !matrix.exists() {
-        eprintln!("skipping: {} is absent", matrix.display());
+    let Some(matrix) = docs_path("www/src/content/docs/scanner/reference/clamav-flag-matrix.md")
+    else {
         return;
-    }
+    };
     let text = std::fs::read_to_string(&matrix).expect("read the flag matrix");
 
     let mut renamed: BTreeSet<String> = BTreeSet::new();

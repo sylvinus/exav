@@ -45,13 +45,17 @@ fn decode_block_reader(
     let mut current: Box<dyn Read> = Box::new(Cursor::new(pack_data.to_vec()));
     for coder_idx in ordered_coder_iter(block) {
         let coder = &block.coders[coder_idx];
-        current = super::decode::wrap_coder(
-            current,
-            coder,
-            expected_total as usize,
-            password,
-            max_buffer,
-        )?;
+        // Each coder decodes to its own declared size, the one for its first
+        // output stream; the folder's total is the last coder's.
+        let first_out: u64 = block.coders[..coder_idx]
+            .iter()
+            .fold(0u64, |n, c| n.saturating_add(c.num_out_streams));
+        let size = usize::try_from(first_out)
+            .ok()
+            .and_then(|i| block.unpack_sizes.get(i).copied())
+            .unwrap_or(expected_total);
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        current = super::decode::wrap_coder(current, coder, size, password, max_buffer)?;
     }
     Ok(current)
 }
@@ -69,7 +73,7 @@ fn decode_block_graph(
     pack_streams: &[&[u8]],
     password: Option<&str>,
     max_buffer: u64,
-) -> Result<Vec<u8>, LimitHit> {
+) -> Result<Decoded, LimitHit> {
     // Exclusive prefix sums: the global index of each coder's first in/out stream.
     let mut in_base = Vec::with_capacity(block.coders.len());
     let mut out_base = Vec::with_capacity(block.coders.len());
@@ -105,7 +109,7 @@ fn decode_block_graph(
         g: &Graph<'_>,
         coder_idx: usize,
         seen: &mut Vec<usize>,
-    ) -> Result<Vec<u8>, LimitHit> {
+    ) -> Result<Decoded, LimitHit> {
         let block = g.block;
         let pack_streams = g.pack_streams;
         let in_base = g.in_base;
@@ -124,12 +128,15 @@ fn decode_block_graph(
 
         // Resolve each input of this coder to a concrete buffer.
         let mut inputs: Vec<Vec<u8>> = Vec::new();
+        let mut failed = None;
         for k in 0..coder.num_in_streams {
             let gi = in_base[coder_idx] + k;
             if let Some(bp) = block.bind_pairs.iter().find(|b| b.in_index == gi) {
                 let src = producer(bp.out_index)
                     .ok_or_else(|| LimitHit::corrupt("7z: bind pair names no coder".to_string()))?;
-                inputs.push(materialise(g, src, seen)?);
+                let (input, f) = materialise(g, src, seen)?;
+                failed = failed.or(f);
+                inputs.push(input);
             } else {
                 // Fed directly by one of the block's packed streams; their order
                 // in `packed_streams` is the order of the packed data.
@@ -172,7 +179,8 @@ fn decode_block_graph(
             if out_size as u64 > max_buffer {
                 return Err(LimitHit::new("7z BCJ2 output exceeds max-buffer".into()));
             }
-            return super::bcj2::decode(&inputs[0], &inputs[1], &inputs[2], &inputs[3], out_size);
+            return super::bcj2::decode(&inputs[0], &inputs[1], &inputs[2], &inputs[3], out_size)
+                .map(|out| (out, failed));
         }
         let single = inputs
             .into_iter()
@@ -185,12 +193,8 @@ fn decode_block_graph(
             password,
             max_buffer,
         )?;
-        let (buf, truncated) = crate::bounded_read(&mut r, max_buffer)
-            .map_err(|e| LimitHit::corrupt(format!("7z: coder read: {e}")))?;
-        if truncated {
-            return Err(LimitHit::new("7z block exceeds max-buffer".into()));
-        }
-        Ok(buf)
+        let (buf, f) = read_salvaged(&mut r, max_buffer)?;
+        Ok((buf, failed.or(f)))
     }
 
     // The block's result is the output nothing else consumes.
@@ -223,7 +227,7 @@ fn decode_block(
     expected_total: u64,
     password: Option<&str>,
     max_buffer: u64,
-) -> Result<Vec<u8>, LimitHit> {
+) -> Result<Decoded, LimitHit> {
     // A folder whose coders take more inputs than there are coders cannot be a
     // simple chain (BCJ2 is the case in practice), so resolve the bind-pair
     // graph instead. `pack_data` covers the block's packed streams laid end to
@@ -246,13 +250,41 @@ fn decode_block(
     let mut current = decode_block_reader(block, pack_data, expected_total, password, max_buffer)?;
     // A 7z block is a *solid* unit that may hold many members; its decompressed
     // size can amplify far beyond the packed input. Bound it by the global
-    // peak-buffer limit (read cap+1, then reject if it overran).
-    let (out, truncated) = crate::bounded_read(&mut current, max_buffer)
-        .map_err(|e| LimitHit::corrupt(format!("7z: decompress: {e}")))?;
-    if truncated {
+    // peak-buffer limit.
+    read_salvaged(&mut current, max_buffer)
+}
+
+/// A block's output decoded whole, and the error that stopped it early, if
+/// one did. What was decoded before the error is kept: members in it are
+/// still scanned.
+type Decoded = (Vec<u8>, Option<std::io::Error>);
+
+/// Read `r` whole, up to `max_buffer` bytes, keeping what was decoded
+/// before an error.
+fn read_salvaged(r: &mut dyn Read, max_buffer: u64) -> Result<Decoded, LimitHit> {
+    let s = crate::salvage(r, max_buffer);
+    if s.over_cap {
         return Err(LimitHit::new("7z block exceeds max-buffer".to_string()));
     }
-    Ok(out)
+    // Every packed stream of a listed folder is in the file, so a decoder
+    // that ran out of input was damaged as surely as one that failed.
+    let failed = (s.undecoded || s.cut_short).then(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "7z: block failed to decode part way",
+        )
+    });
+    Ok((s.data, failed))
+}
+
+/// The end of a block decoded whole: the error that stopped its decoder, or
+/// the end of the block.
+struct Failed(Option<std::io::Error>);
+
+impl Read for Failed {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        self.0.take().map_or(Ok(0), Err)
+    }
 }
 
 /// Read and discard up to `n` decompressed bytes from `r`. Returns how many
@@ -272,6 +304,47 @@ fn skip_reader(r: &mut dyn Read, n: u64) -> (u64, bool) {
         }
     }
     (skipped, false)
+}
+
+/// The packed bytes of folder `block_idx`, and the size of each of its packed
+/// streams. A folder can have several (BCJ2 folders have four), laid end to
+/// end; the sizes let the graph decoder split them apart again. `Err` says
+/// why the header puts them out of reach.
+fn block_pack_data<'a>(
+    archive: &super::header::Archive,
+    block_idx: usize,
+    data: &'a [u8],
+) -> Result<(&'a [u8], Vec<u64>), &'static str> {
+    const MISSING: &str = "7z: folder names a packed stream the header does not list";
+    const PAST_END: &str = "7z: packed data runs past the end of the archive";
+    let block = &archive.blocks[block_idx];
+    let first = archive
+        .stream_map
+        .block_first_pack_stream
+        .get(block_idx)
+        .copied()
+        .ok_or(MISSING)?;
+    let n_pack = block.packed_streams.len().max(1);
+    let sizes = first
+        .checked_add(n_pack)
+        .and_then(|end| archive.pack_sizes.get(first..end))
+        .ok_or(MISSING)?
+        .to_vec();
+    let start = SIGNATURE_HEADER_SIZE
+        .checked_add(archive.pack_pos)
+        .and_then(|v| v.checked_add(archive.stream_map.pack_stream_offsets[first]))
+        .ok_or(PAST_END)?;
+    let end = sizes
+        .iter()
+        .try_fold(start, |acc, &s| acc.checked_add(s))
+        .ok_or(PAST_END)?;
+    let range = usize::try_from(start)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .ok_or(PAST_END)?;
+    data.get(range.0..range.1)
+        .map(|packed| (packed, sizes))
+        .ok_or(PAST_END)
 }
 
 /// Walk a 7z archive. Its header is at the end, so the container is read whole;
@@ -335,9 +408,27 @@ fn stream_sevenz<T>(
         } else {
             file.name.clone()
         };
-        let block_idx = match archive.stream_map.file_block.get(file_idx).copied() {
-            Some(Some(b)) => b,
-            _ => continue, // no stream (empty file / directory)
+        // From here on the header names a member with content, so whatever
+        // keeps its bytes out of reach is reported, never skipped.
+        let out_of_reach = |name: String, reason: &'static str| MemberMeta {
+            name,
+            comp_size: file.size,
+            size: Some(file.size),
+            unsupported: Some(reason),
+            ..MemberMeta::default()
+        };
+        let Some(block_idx) = archive
+            .stream_map
+            .file_block
+            .get(file_idx)
+            .copied()
+            .flatten()
+        else {
+            let meta = out_of_reach(name, "7z: member has no folder in the header");
+            if let Some(r) = visit(&meta, None, budget) {
+                return Ok(Some(r));
+            }
+            continue;
         };
         let block = &archive.blocks[block_idx];
         let aes = block_has_aes(block);
@@ -356,37 +447,16 @@ fn stream_sevenz<T>(
             continue;
         }
 
-        // Locate the packed data for the block (same derivation as extract_sevenz).
-        let pack_stream_idx = archive
-            .stream_map
-            .block_first_pack_stream
-            .get(block_idx)
-            .copied()
-            .unwrap_or(0);
-        if pack_stream_idx >= archive.pack_sizes.len() {
-            continue;
-        }
-        let pack_offset = match SIGNATURE_HEADER_SIZE
-            .checked_add(archive.pack_pos)
-            .and_then(|v| v.checked_add(archive.stream_map.pack_stream_offsets[pack_stream_idx]))
-            .and_then(|v| usize::try_from(v).ok())
-        {
-            Some(v) => v,
-            None => continue,
+        let (pack_data, block_pack_sizes) = match block_pack_data(&archive, block_idx, data) {
+            Ok(v) => v,
+            Err(reason) => {
+                let meta = out_of_reach(name, reason);
+                if let Some(r) = visit(&meta, None, budget) {
+                    return Ok(Some(r));
+                }
+                continue;
+            }
         };
-        // A folder can have several packed streams (BCJ2 folders have four),
-        // laid end to end. Cover all of them, and keep the individual sizes so
-        // the graph decoder can split them apart again.
-        let n_pack = block.packed_streams.len().max(1);
-        let block_pack_sizes: Vec<u64> = (0..n_pack)
-            .filter_map(|k| archive.pack_sizes.get(pack_stream_idx + k).copied())
-            .collect();
-        let pack_size: usize = block_pack_sizes.iter().sum::<u64>() as usize;
-        let pack_end = match pack_offset.checked_add(pack_size) {
-            Some(e) if e <= data.len() => e,
-            _ => continue,
-        };
-        let pack_data = &data[pack_offset..pack_end];
 
         // Byte offset of this file within the (solid) block.
         let block_first_file = archive
@@ -418,7 +488,9 @@ fn stream_sevenz<T>(
                     pw,
                     max_buffer,
                 ) {
-                    Ok(dec) => {
+                    // A decode that fails is a wrong password as likely as
+                    // damage: try the next one.
+                    Ok((dec, None)) => {
                         let start = bytes_to_skip as usize;
                         if start >= dec.len() {
                             continue;
@@ -435,7 +507,7 @@ fn stream_sevenz<T>(
                         file_data = Some(fd);
                         break;
                     }
-                    Err(_) => continue,
+                    Ok((_, Some(_))) | Err(_) => continue,
                 }
             }
             let r = match file_data {
@@ -490,7 +562,7 @@ fn stream_sevenz<T>(
         // filter needs all four streams present at once. Decode the block
         // buffered instead, bounded by the same peak-buffer limit.
         let mut reader: Box<dyn Read> = if block.coders.iter().any(|c| c.num_in_streams > 1) {
-            let decoded = decode_block(
+            let (decoded, failed) = decode_block(
                 block,
                 pack_data,
                 &block_pack_sizes,
@@ -498,7 +570,7 @@ fn stream_sevenz<T>(
                 None,
                 max_buffer,
             )?;
-            Box::new(Cursor::new(decoded))
+            Box::new(Cursor::new(decoded).chain(Failed(failed)))
         } else {
             decode_block_reader(block, pack_data, block_total, None, max_buffer)?
         };

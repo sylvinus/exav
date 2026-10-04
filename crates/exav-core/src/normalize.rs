@@ -1,7 +1,8 @@
 //! Textual content canonicalisation for normalised signature matching.
 //!
-//! `Target:3` (HTML), `Target:4` (ASCII/text) and `Target:7` (mail) signatures
-//! are authored against *canonicalised* content rather than raw bytes, so that a
+//! `Target:3` (HTML) and `Target:7` (text) signatures are authored against
+//! *canonicalised* content rather than raw bytes (`Target:4`, mail, matches the
+//! raw bytes; see `target_ok` in `engine`), so that a
 //! single pattern matches regardless of letter case, HTML entity encoding,
 //! comment insertion or whitespace padding used to evade it. This module is a
 //! clean-room implementation driven by that interoperability requirement:

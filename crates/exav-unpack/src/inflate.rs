@@ -128,13 +128,19 @@ impl<R: BufRead> Read for Inflate<R> {
 /// not one. The trailing Adler-32 is not checked: a mismatch after a full
 /// decode hides nothing.
 pub(crate) fn zlib_body(data: &[u8]) -> Option<Inflate<&[u8]>> {
-    let [cmf, flg, ..] = *data else {
-        return None;
-    };
+    zlib_reader(data).ok().flatten()
+}
+
+/// [`zlib_body`] over a reader: the error is the reader's, `UnexpectedEof`
+/// when the input ends inside the 2-byte header.
+pub(crate) fn zlib_reader<R: BufRead>(mut src: R) -> io::Result<Option<Inflate<R>>> {
+    let mut h = [0u8; 2];
+    src.read_exact(&mut h)?;
+    let [cmf, flg] = h;
     let deflate = cmf & 0x0f == 8 && cmf >> 4 <= 7;
     let preset_dictionary = flg & 0x20 != 0;
     let check = (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0;
-    (deflate && check && !preset_dictionary).then(|| Inflate::new(&data[2..]))
+    Ok((deflate && check && !preset_dictionary).then(|| Inflate::new(src)))
 }
 
 /// A gzip file (RFC 1952), every member in turn, with each trailer checked

@@ -76,13 +76,15 @@ pub(crate) fn extract_alz<R>(
         if encrypted {
             p += 12; // verification block
         }
-        let Ok(comp_usize) = usize::try_from(comp) else {
+        let comp_usize = usize::try_from(comp).unwrap_or(usize::MAX);
+        let end = p.saturating_add(comp_usize);
+        // A member cut by the end of the file: what is there is decoded, the
+        // rest is absent.
+        let rest_absent = end > data.len();
+        let Some(body) = data.get(p..end.min(data.len())) else {
             break;
         };
-        let Some(body) = data.get(p..p.saturating_add(comp_usize)) else {
-            break;
-        };
-        p += comp_usize;
+        p = end.min(data.len());
         emitted += 1;
 
         budget.count_entry()?;
@@ -94,16 +96,23 @@ pub(crate) fn extract_alz<R>(
                 // Truncated at the per-member cap: the bytes we have are real,
                 // but the member was not seen in full, so it must not read as
                 // fully scanned.
-                Some((_, true)) => Entry::unsupported(
+                Some(s) if s.over_cap => Entry::unsupported(
                     name,
                     uncomp,
                     false,
                     "ALZ member exceeds the per-member decompression budget",
                 ),
-                Some((out, false)) => {
-                    crate::ratio_guard(body.len() as u64, out.len() as u64, budget)?;
-                    budget.commit(out.len() as u64);
-                    Entry::new(name, out)
+                Some(s) => {
+                    crate::ratio_guard(body.len() as u64, s.data.len() as u64, budget)?;
+                    budget.commit(s.data.len() as u64);
+                    let why = s.part_way(rest_absent).then_some(
+                        "ALZ member failed to decode part way; the bytes before the failure \
+                         were scanned",
+                    );
+                    Entry {
+                        unsupported: why,
+                        ..Entry::new(name, s.data)
+                    }
                 }
                 None => Entry::unsupported(
                     name,
@@ -143,14 +152,24 @@ fn le_uint(b: &[u8]) -> u64 {
     v
 }
 
-/// Decompress one ALZ member. `None` for a method exav cannot decode, which the
-/// caller turns into an `unsupported` entry rather than a silent skip.
-fn decode_alz_member(method: u8, body: &[u8], cap: u64) -> Option<(Vec<u8>, bool)> {
+/// Decompress one ALZ member, keeping what decoded before an error. `None` for
+/// a method exav cannot decode, which the caller turns into an `unsupported`
+/// entry rather than a silent skip.
+fn decode_alz_member(method: u8, body: &[u8], cap: u64) -> Option<crate::Salvaged> {
+    use crate::salvage;
     use std::io::Cursor;
     match method {
-        0 => Some((body.to_vec(), body.len() as u64 > cap)),
-        1 => crate::bounded_read(super::bzip2_rs::DecoderReader::new(Cursor::new(body)), cap).ok(),
-        2 => crate::bounded_read(flate2::read::DeflateDecoder::new(Cursor::new(body)), cap).ok(),
+        0 => Some(crate::Salvaged {
+            data: body[..body.len().min(cap as usize)].to_vec(),
+            over_cap: body.len() as u64 > cap,
+            undecoded: false,
+            cut_short: false,
+        }),
+        1 => Some(salvage(
+            super::bzip2_rs::DecoderReader::new(Cursor::new(body)),
+            cap,
+        )),
+        2 => Some(salvage(crate::inflate::Inflate::new(body), cap)),
         _ => None,
     }
 }

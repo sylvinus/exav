@@ -16,12 +16,11 @@
 //!   file resources    -> chunk-compressed data
 //! ```
 //!
-//! **Every resource is checked against the SHA-1 the image records for it.** A
-//! chunk decoder that is subtly wrong does not fail — it produces plausible
-//! bytes that are not the file, and a signature that fails to match those reads
-//! exactly like a clean file. The hash is what separates "decoded" from
-//! "decoded correctly", so a resource that fails it is reported rather than
-//! handed over.
+//! The image records the SHA-1 of every resource. A resource that decodes in
+//! full and fails it is scanned all the same, as a ZIP member failing its
+//! CRC-32 is: the bytes are there, and an attacker sets the hash as easily as
+//! the data. With checksums verified (`Budget::set_verify_checksums`) it is
+//! reported instead.
 
 use std::collections::HashMap;
 
@@ -120,7 +119,7 @@ fn sha1_of(data: &[u8]) -> [u8; HASH_LEN] {
 }
 
 /// Decompress one resource. `Err` names a reason worth reporting; `Ok` bytes are
-/// still unverified until checked against the recorded hash.
+/// not checked against the recorded hash here.
 fn read_resource(
     data: &[u8],
     res: &Resource,
@@ -307,10 +306,10 @@ pub(crate) fn extract_wim<R>(
         budget.count_entry()?;
         let decoded = read_resource(data, res, codec, chunk_size, budget);
         let bytes = match decoded {
-            // The image records a SHA-1 per resource. A chunk codec that is
-            // subtly wrong yields plausible bytes rather than an error, so this
-            // is the only thing distinguishing content from garbage.
-            Ok(b) if sha1_of(&b) == res.hash => b,
+            // Decoded in full. A SHA-1 mismatch after that hides nothing: the
+            // bytes are scanned, as a ZIP member's are, and reported only when
+            // checksums are verified.
+            Ok(b) if !budget.should_verify_checksums() || sha1_of(&b) == res.hash => b,
             Ok(_) => {
                 if let Some(r) = visit(
                     Entry::unsupported(

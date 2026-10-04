@@ -3,15 +3,11 @@ use exav_unpack::{detect, extract, Budget, Format, Limits};
 
 /// A real NSIS installer (PE stub + NSIS firstheader + compressed data block).
 /// Its blocks use NSIS's modified bzip2, and every one of them decodes. It is
-/// real malware, so it is **gitignored (not
-/// committed)** and read at runtime; the tests skip when it's absent (fresh
-/// clone / CI). sha256 provenance is in `fixtures/nsis/README.md`.
+/// real malware, so it is **gitignored (not committed)**, kept locally in an
+/// AES ZIP (`../README.md`); the tests skip when it's absent (fresh clone /
+/// CI). sha256 provenance is in `fixtures/nsis/README.md`.
 fn real_nsis() -> Option<Vec<u8>> {
-    let p = format!(
-        "{}/tests/fixtures/nsis/real-malware-modbzip2.exe",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    std::fs::read(&p).ok()
+    super::real_sample("nsis/real-malware-modbzip2.exe")
 }
 
 #[test]

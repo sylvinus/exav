@@ -47,9 +47,9 @@ exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = f
 # fuzzy hashing
 tlsh2 = { version = "1", features = ["diff"] }
 # The `fuzzy_img#` image hash, ClamAV's to the bit (`image-hash` feature). Its
-# formats past the five clamscan treats as graphics are hashed except under
-# `--clamav-compat`.
-exav-imagehash = { path = "../exav-imagehash", version = "0.0.2", default-features = false, features = ["webp", "ico", "pnm", "qoi", "dds", "ff", "hdr"], optional = true }
+# formats past the five clamscan treats as graphics, JPEG 2000 and JBIG2
+# included, are hashed except under `--clamav-compat`.
+exav-imagehash = { path = "../exav-imagehash", version = "0.0.2", default-features = false, features = ["webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2"], optional = true }
 # HTTP(S) range-request backend (optional)
 ureq = { version = "3", optional = true }
 # Anchor-frequency counting at database build: tens of millions of u64 gram
@@ -123,7 +123,7 @@ checksums = ["exav-unpack/checksums"]
 # Never enabled by a shipped build.
 testing-faults = ["exav-unpack/testing-faults"]
 
-# Decryption of encrypted archive members (ZIP/PDF/DMG). ON by default; the only
+# Decryption of encrypted members (ZIP/7z/RAR/PDF/DMG/Office). ON by default; the only
 # thing that pulls the cipher/KDF crates. Drop it for a build with no crypto
 # stack (encrypted members are then reported password-protected). Forwarded to
 # exav-unpack.
@@ -194,6 +194,8 @@ pepack = ["exav-unpack/pepack"]
 javaclass = ["exav-unpack/javaclass"]
 aimodel = ["exav-unpack/aimodel"]
 screnc = ["exav-unpack/screnc"]
+dxf = ["exav-unpack/dxf"]
+dwg = ["exav-unpack/dwg"]
 # Emulation-based unpacking (see exav-unpack's `pe-emu`): its own switch, so a
 # build can take static unpacking without executing attacker control flow.
 pe-emu = ["exav-unpack/pe-emu"]
@@ -238,6 +240,8 @@ cfb = "0.14"
 cab = "0.6.0"
 # only for the base64-embedded-executable end-to-end test
 base64 = "0.22"
+# The reference PPMd8 encoder, for the ZIP method-98 end-to-end test.
+ppmd-rust = "1"
 # Encodes the images the `fuzzy_img#` tests scan.
 image = { version = "=0.25.9", default-features = false, features = ["png", "webp"] }
 # The unit tests of the vendored `src/fancy_regex/`, as upstream wrote them.

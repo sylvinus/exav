@@ -33,144 +33,23 @@
 use std::fmt;
 use std::str::FromStr;
 
-use image::{imageops::FilterType, DynamicImage, GrayImage, ImageFormat};
+use exav_render::image::{Channels, Pixels, Samples};
+use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer};
 
 mod dct;
-mod image_codecs;
 mod pillow;
 
 use dct::dct2d;
 
+pub use exav_render::image::{Format, DECODE_MAX};
 pub use pillow::PillowFilter;
 
-/// An image format this build decodes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Format {
-    Png,
-    Gif,
-    Jpeg,
-    Tiff,
-    Bmp,
-    #[cfg(feature = "webp")]
-    Webp,
-    #[cfg(feature = "ico")]
-    Ico,
-    #[cfg(feature = "pnm")]
-    Pnm,
-    #[cfg(feature = "qoi")]
-    Qoi,
-    #[cfg(feature = "dds")]
-    Dds,
-    #[cfg(feature = "ff")]
-    Farbfeld,
-    #[cfg(feature = "hdr")]
-    Hdr,
-}
-
-impl Format {
-    /// Every format this build decodes.
-    pub const ALL: &'static [Format] = &[
-        Format::Png,
-        Format::Gif,
-        Format::Jpeg,
-        Format::Tiff,
-        Format::Bmp,
-        #[cfg(feature = "webp")]
-        Format::Webp,
-        #[cfg(feature = "ico")]
-        Format::Ico,
-        #[cfg(feature = "pnm")]
-        Format::Pnm,
-        #[cfg(feature = "qoi")]
-        Format::Qoi,
-        #[cfg(feature = "dds")]
-        Format::Dds,
-        #[cfg(feature = "ff")]
-        Format::Farbfeld,
-        #[cfg(feature = "hdr")]
-        Format::Hdr,
-    ];
-
-    /// The format `data` starts as, by its magic bytes.
-    pub fn detect(data: &[u8]) -> Option<Format> {
-        let s = |m: &[u8]| data.starts_with(m);
-        Some(if s(b"\x89PNG\r\n\x1a\n") {
-            Format::Png
-        } else if s(b"GIF87a") || s(b"GIF89a") {
-            Format::Gif
-        } else if s(&[0xFF, 0xD8, 0xFF]) {
-            Format::Jpeg
-        } else if s(b"II*\x00") || s(b"MM\x00*") {
-            Format::Tiff
-        } else if s(b"BM") {
-            Format::Bmp
-        } else {
-            return Self::detect_extra(data);
-        })
-    }
-
-    #[allow(unused_variables)]
-    fn detect_extra(data: &[u8]) -> Option<Format> {
-        #[cfg(feature = "webp")]
-        if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-            return Some(Format::Webp);
-        }
-        #[cfg(feature = "ico")]
-        if data.starts_with(&[0, 0, 1, 0]) {
-            return Some(Format::Ico);
-        }
-        #[cfg(feature = "pnm")]
-        if data.len() >= 2 && data[0] == b'P' && (b'1'..=b'7').contains(&data[1]) {
-            return Some(Format::Pnm);
-        }
-        #[cfg(feature = "qoi")]
-        if data.starts_with(b"qoif") {
-            return Some(Format::Qoi);
-        }
-        #[cfg(feature = "dds")]
-        if data.starts_with(b"DDS ") {
-            return Some(Format::Dds);
-        }
-        #[cfg(feature = "ff")]
-        if data.starts_with(b"farbfeld") {
-            return Some(Format::Farbfeld);
-        }
-        #[cfg(feature = "hdr")]
-        if data.starts_with(b"#?RADIANCE") {
-            return Some(Format::Hdr);
-        }
-        None
-    }
-
-    /// Lower-case name, as the CLI takes it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Format::Png => "png",
-            Format::Gif => "gif",
-            Format::Jpeg => "jpeg",
-            Format::Tiff => "tiff",
-            Format::Bmp => "bmp",
-            #[cfg(feature = "webp")]
-            Format::Webp => "webp",
-            #[cfg(feature = "ico")]
-            Format::Ico => "ico",
-            #[cfg(feature = "pnm")]
-            Format::Pnm => "pnm",
-            #[cfg(feature = "qoi")]
-            Format::Qoi => "qoi",
-            #[cfg(feature = "dds")]
-            Format::Dds => "dds",
-            #[cfg(feature = "ff")]
-            Format::Farbfeld => "farbfeld",
-            #[cfg(feature = "hdr")]
-            Format::Hdr => "hdr",
-        }
-    }
-
-    fn bit(self) -> u16 {
-        1 << Format::ALL.iter().position(|f| *f == self).unwrap_or(0)
-    }
+/// The format's bit in a [`Formats`]: its place in [`Format::ALL`].
+fn bit(f: Format) -> u16 {
+    Format::ALL
+        .iter()
+        .position(|x| *x == f)
+        .map_or(0, |at| 1 << at)
 }
 
 /// A set of formats.
@@ -185,7 +64,8 @@ impl Formats {
     /// --fuzzy-img` decodes more.
     pub const CLAMAV_GRAPHICS: Formats = Formats(0b1_1111);
 
-    /// Every format this build decodes.
+    /// Every format this build decodes, JPEG 2000 and JBIG2 included,
+    /// which libclamav does not decode.
     pub const ALL: Formats = Formats(u16::MAX);
 
     /// Every format this build decodes.
@@ -194,11 +74,11 @@ impl Formats {
     }
 
     pub fn contains(self, f: Format) -> bool {
-        self.0 & f.bit() != 0
+        self.0 & bit(f) != 0
     }
 
     pub fn with(self, f: Format) -> Formats {
-        Formats(self.0 | f.bit())
+        Formats(self.0 | bit(f))
     }
 
     pub fn iter(self) -> impl Iterator<Item = Format> {
@@ -284,9 +164,6 @@ pub struct Params {
     /// crate's default, which ClamAV decodes with).
     pub max_decode_bytes: u64,
 }
-
-/// Most bytes a decoded image may take.
-pub const DECODE_MAX: u64 = 512 * 1024 * 1024;
 
 /// Largest DCT side the parameters may ask for.
 const MAX_SIDE: u32 = 4096;
@@ -629,55 +506,63 @@ fn resize(gray: GrayImage, side: u32, how: Resize) -> Vec<u8> {
         .into_raw()
 }
 
-/// Decode, within `max_alloc` bytes of pixels (at most [`DECODE_MAX`]).
+/// Decode with exav-render, within `max_alloc` bytes of pixels (at most
+/// [`DECODE_MAX`]).
 fn decode(data: &[u8], format: Format, max_alloc: u64) -> Result<DynamicImage, Error> {
-    let limit = max_alloc.min(DECODE_MAX);
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(limit);
-    // JPEG and TIFF go through `image`'s own decoders, built without SIMD
-    // (`image_codecs`); the rest through `image`.
-    let decoded = match format {
-        Format::Jpeg => {
-            image_codecs::jpeg::JpegDecoder::new(data).and_then(|d| image_codecs::decode(d, limits))
-        }
-        Format::Tiff => image_codecs::tiff_image::TiffDecoder::new(std::io::Cursor::new(data))
-            .and_then(|d| image_codecs::decode(d, limits)),
-        other => {
-            let mut reader = image::ImageReader::with_format(
-                std::io::Cursor::new(data),
-                image_format(other).ok_or(Error::Unsupported)?,
-            );
-            reader.limits(limits);
-            reader.decode()
-        }
-    };
-    decoded.map_err(|e| match e {
-        image::ImageError::Limits(_) if limit < DECODE_MAX => Error::TooLarge,
-        _ => Error::Undecodable,
-    })
+    use exav_render::image::Error as E;
+    exav_render::image::decode(data, format, max_alloc)
+        .map(dynamic)
+        .map_err(|e| match e {
+            E::TooLarge => Error::TooLarge,
+            E::Unsupported => Error::Unsupported,
+            _ => Error::Undecodable,
+        })
 }
 
-fn image_format(f: Format) -> Option<ImageFormat> {
-    Some(match f {
-        Format::Png => ImageFormat::Png,
-        Format::Gif => ImageFormat::Gif,
-        Format::Bmp => ImageFormat::Bmp,
-        #[cfg(feature = "webp")]
-        Format::Webp => ImageFormat::WebP,
-        #[cfg(feature = "ico")]
-        Format::Ico => ImageFormat::Ico,
-        #[cfg(feature = "pnm")]
-        Format::Pnm => ImageFormat::Pnm,
-        #[cfg(feature = "qoi")]
-        Format::Qoi => ImageFormat::Qoi,
-        #[cfg(feature = "dds")]
-        Format::Dds => ImageFormat::Dds,
-        #[cfg(feature = "ff")]
-        Format::Farbfeld => ImageFormat::Farbfeld,
-        #[cfg(feature = "hdr")]
-        Format::Hdr => ImageFormat::Hdr,
-        Format::Jpeg | Format::Tiff => return None,
-    })
+/// The decoded samples as the `image` buffer of the same layout, moved, not
+/// copied: the conversions below are the `image` crate's, which is what
+/// ClamAV's hash is made of.
+fn dynamic(p: Pixels) -> DynamicImage {
+    let (w, h) = (p.width, p.height);
+    let sized = "exav-render gives a buffer of its own size";
+    match (p.channels, p.samples) {
+        (Channels::Luma, Samples::U8(v)) => {
+            DynamicImage::ImageLuma8(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::LumaAlpha, Samples::U8(v)) => {
+            DynamicImage::ImageLumaA8(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::Rgb, Samples::U8(v)) => {
+            DynamicImage::ImageRgb8(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::Rgba, Samples::U8(v)) => {
+            DynamicImage::ImageRgba8(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::Luma, Samples::U16(v)) => {
+            DynamicImage::ImageLuma16(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::LumaAlpha, Samples::U16(v)) => {
+            DynamicImage::ImageLumaA16(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::Rgb, Samples::U16(v)) => {
+            DynamicImage::ImageRgb16(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::Rgba, Samples::U16(v)) => {
+            DynamicImage::ImageRgba16(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::Rgb, Samples::F32(v)) => {
+            DynamicImage::ImageRgb32F(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        (Channels::Rgba, Samples::F32(v)) => {
+            DynamicImage::ImageRgba32F(ImageBuffer::from_raw(w, h, v).expect(sized))
+        }
+        // No decoder gives grey floats; `image` has no buffer for them.
+        (Channels::Luma | Channels::LumaAlpha, Samples::F32(v)) => {
+            let n = if p.channels == Channels::Luma { 1 } else { 2 };
+            let rgb = v.chunks_exact(n).flat_map(|s| [s[0]; 3]).collect();
+            DynamicImage::ImageRgb32F(ImageBuffer::from_raw(w, h, rgb).expect(sized))
+        }
+    }
 }
 
 /// BT.601 luma, rounded half away from zero: not the `image` crate's

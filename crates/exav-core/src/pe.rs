@@ -698,22 +698,27 @@ fn put_dirs(b: &mut [u8], base: usize, oh: &goblin::pe::optional_header::Optiona
     }
 }
 
-/// Maximum embedded PE images to carve from one buffer (bounds work on inputs
-/// crafted with many `MZ` markers).
-const MAX_EMBEDDED_PE: usize = 16;
+/// Maximum embedded PE images to carve from one buffer, and as many ELF and
+/// Mach-O images (bounds work on inputs crafted with many `MZ` markers).
+pub(crate) const MAX_EMBEDDED_PE: usize = 16;
 
 /// Most archive candidates carved from one buffer.
-const MAX_EMBEDDED_ARCHIVES: usize = 32;
+pub(crate) const MAX_EMBEDDED_ARCHIVES: usize = 32;
 
 /// What carving finds embedded at a non-zero offset in an object: validated
-/// PE, ELF and Mach-O images, and archive candidates found by their magic, each
-/// in ascending order and within its cap.
+/// PE, ELF and Mach-O images, and archive candidates whose header checks out,
+/// each in ascending order and within its cap.
 #[derive(Default)]
 pub(crate) struct Embedded {
     pub(crate) pe: Vec<usize>,
     pub(crate) elf: Vec<usize>,
     pub(crate) macho: Vec<usize>,
     pub(crate) archives: Vec<usize>,
+    /// A PE image that validated was left out at its cap, so the object is
+    /// not fully scanned.
+    pub(crate) pe_capped: bool,
+    /// The same for an ELF or Mach-O image or an archive.
+    pub(crate) others_capped: bool,
 }
 
 /// The magics carving looks for, and what each marks.
@@ -746,7 +751,8 @@ const CARVE_MAGICS: [(&[u8], Magic); 14] = [
 
 /// Everything carving looks for in `data`, found in one read of it, a window
 /// at a time: the image at offset 0 is the object's own, and each candidate
-/// is validated as it is met. A kind stops being looked for at its cap.
+/// is validated as it is met. The search stops once every kind is at its cap
+/// and one more candidate has been seen past a cap.
 pub(crate) fn embedded_in(data: &dyn ByteSource) -> Embedded {
     let mut carving = Carving::new();
     let len = data.len();
@@ -798,11 +804,13 @@ impl Carving {
         }
     }
 
-    /// Whether every kind is at its cap, so the rest of the object has
-    /// nothing more to add.
+    /// Whether the rest of the object has nothing more to add: every kind is
+    /// at its cap, and candidates past the caps were already seen.
     pub(crate) fn full(&self) -> bool {
         let f = &self.found;
-        f.pe.len() >= MAX_EMBEDDED_PE
+        f.pe_capped
+            && f.others_capped
+            && f.pe.len() >= MAX_EMBEDDED_PE
             && f.elf.len() >= MAX_EMBEDDED_PE
             && f.macho.len() >= MAX_EMBEDDED_PE
             && f.archives.len() >= MAX_EMBEDDED_ARCHIVES
@@ -828,12 +836,35 @@ impl Carving {
                 Magic::Elf => (&mut found.elf, MAX_EMBEDDED_PE, elf_at(data, off)),
                 Magic::MachoThin(be) => (&mut found.macho, MAX_EMBEDDED_PE, macho_thin_at(data, off, be)),
                 Magic::MachoFat => (&mut found.macho, MAX_EMBEDDED_PE, macho_fat_at(data, off)),
-                Magic::Archive => (&mut found.archives, MAX_EMBEDDED_ARCHIVES, true),
+                Magic::Archive => (&mut found.archives, MAX_EMBEDDED_ARCHIVES, archive_at(data, off)),
             };
-            if ok && list.len() < cap {
-                list.push(off);
+            if ok {
+                if list.len() < cap {
+                    list.push(off);
+                } else if matches!(kind, Magic::Pe) {
+                    found.pe_capped = true;
+                } else {
+                    found.others_capped = true;
+                }
             }
         }
+    }
+}
+
+/// An archive header at `off` that holds up, as [`crate::unpack::detect_archive_start`]
+/// checks one, gzip's more strictly. A candidate past a cap makes the object
+/// `LIMITS-EXCEEDED`, so chance matches must not fill the caps: gzip's 27 fixed
+/// bits occur about 32 times in 4 GiB of random data, so its `XFL` (0, 2 or 4)
+/// and `OS` (0 to 13, or 255, per RFC 1952) are checked too.
+fn archive_at(data: &dyn ByteSource, off: usize) -> bool {
+    let sub = crate::byte_source::Sub::new(data, off, data.len() - off);
+    match crate::unpack::detect_archive_start(&sub) {
+        Some(crate::unpack::Format::Gzip) => {
+            let head = data.window(off, 10);
+            head.len() == 10 && matches!(head[8], 0 | 2 | 4) && matches!(head[9], 0..=13 | 255)
+        }
+        Some(_) => true,
+        None => false,
     }
 }
 
@@ -1003,10 +1034,10 @@ pub(crate) fn embedded_macho_offsets_in(data: &dyn ByteSource) -> Vec<usize> {
 /// appended to or embedded in another file: SFX stubs, PE overlays (data after
 /// the last section), and droppers that staple a ZIP/CAB/7z/RAR/GZIP/XZ onto a
 /// carrier. The normal scan only types the buffer at offset 0, so these embedded
-/// containers are invisible without carving. Candidates are validated by the
-/// caller (via the extractor's `detect`) before extraction, so a coincidental
-/// magic byte-run isn't treated as a real archive. Bounded to keep a buffer full
-/// of magic-like bytes from blowing up the work.
+/// containers are invisible without carving. A candidate counts only if its
+/// header checks out (see `archive_at`), so a coincidental magic byte-run isn't
+/// treated as a real archive. Bounded to keep a buffer full of archive headers
+/// from blowing up the work.
 pub fn embedded_archive_offsets(data: &[u8]) -> Vec<usize> {
     embedded_archive_offsets_in(&data)
 }
@@ -1141,15 +1172,20 @@ mod tests {
                     Magic::Elf => (&mut want.elf, MAX_EMBEDDED_PE, elf_at(d, off)),
                     Magic::MachoThin(be) => (&mut want.macho, MAX_EMBEDDED_PE, macho_thin_at(d, off, be)),
                     Magic::MachoFat => (&mut want.macho, MAX_EMBEDDED_PE, macho_fat_at(d, off)),
-                    Magic::Archive => (&mut want.archives, MAX_EMBEDDED_ARCHIVES, true),
+                    Magic::Archive => (&mut want.archives, MAX_EMBEDDED_ARCHIVES, archive_at(d, off)),
                 };
                 if ok && list.len() < cap {
                     list.push(off);
+                } else if ok && matches!(kind, Magic::Pe) {
+                    want.pe_capped = true;
+                } else if ok {
+                    want.others_capped = true;
                 }
             }
         }
         assert_eq!((want.pe.len(), want.elf.len(), want.macho.len()), (2, 2, 2));
         assert_eq!(want.archives.len(), MAX_EMBEDDED_ARCHIVES);
+        assert!(want.others_capped && !want.pe_capped);
         let src = BlockCache::with_sizes(std::io::Cursor::new(data.clone()), 512, 4096).unwrap();
         let slice: &[u8] = &data;
         for hay in [&slice as &dyn ByteSource, &src] {
@@ -1158,7 +1194,32 @@ mod tests {
             assert_eq!(got.elf, want.elf);
             assert_eq!(got.macho, want.macho);
             assert_eq!(got.archives, want.archives);
+            assert_eq!((got.pe_capped, got.others_capped), (want.pe_capped, want.others_capped));
         }
+    }
+
+    /// A chance `1f 8b 08` run is not a gzip candidate unless the header's
+    /// `XFL` and `OS` hold up, so random data cannot fill the archive cap and
+    /// make an object `LIMITS-EXCEEDED`.
+    #[test]
+    fn gzip_candidates_need_a_plausible_header() {
+        let mut data = vec![b'x'; 64 * 40];
+        for k in 1..40 {
+            let at = k * 64;
+            // Flags 0 and an MTIME, then XFL 0x77 and OS 0x80: no gzip writer's.
+            data[at..at + 10].copy_from_slice(&[0x1f, 0x8b, 0x08, 0, 1, 2, 3, 4, 0x77, 0x80]);
+        }
+        let found = embedded_in(&&data[..]);
+        assert!(found.archives.is_empty() && !found.others_capped);
+        // The same headers with XFL 2 and OS 3 (Unix) are candidates.
+        for k in 1..40 {
+            let at = k * 64;
+            data[at + 8] = 2;
+            data[at + 9] = 3;
+        }
+        let found = embedded_in(&&data[..]);
+        assert_eq!(found.archives.len(), MAX_EMBEDDED_ARCHIVES);
+        assert!(found.others_capped);
     }
 
     #[test]

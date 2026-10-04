@@ -40,10 +40,11 @@ arithmetic (`Precision`: `f32` or `f64`), the threshold (median or mean), and
 whether the DC term is kept.
 
 **Formats:** PNG, GIF, JPEG, TIFF and BMP, and, each a Cargo feature on by
-default, WebP, ICO, PNM, QOI, DDS, farbfeld and Radiance HDR, recognised from
-their first bytes. `Formats::CLAMAV_GRAPHICS` is the five clamscan hashes while
-scanning; `sigtool --fuzzy-img` hashes them all (and OpenEXR, which this crate
-does not read).
+default, WebP, ICO, PNM, QOI, DDS, farbfeld, Radiance HDR, JPEG 2000 and
+JBIG2, recognised from their first bytes. `Formats::CLAMAV_GRAPHICS` is the
+five clamscan hashes while scanning; `sigtool --fuzzy-img` hashes all but JPEG
+2000 and JBIG2 (and OpenEXR, which this crate does not read). A JPEG 2000 or
+JBIG2 image hashes as the same pixels do in a PNG.
 
 **How exact.** Checked against the tools themselves:
 

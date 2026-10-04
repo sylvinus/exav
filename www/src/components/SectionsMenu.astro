@@ -1,0 +1,68 @@
+---
+// The sections menu of pages without a sidebar (the landing page), on screens
+// too narrow for the header tabs. Looks like Starlight's mobile menu; the
+// popover gives Escape, click-outside and focus order without script.
+import { Icon } from '@astrojs/starlight/components';
+import MobileMenuFooter from '@astrojs/starlight/components/MobileMenuFooter.astro';
+import TopicList from './TopicList.astro';
+---
+
+<div class="sections-menu print:hidden">
+  <button type="button" popovertarget="exav-sections-menu" aria-label="Sections">
+    <Icon name="bars" class="open-menu" />
+    <Icon name="close" class="close-menu" />
+  </button>
+  <div id="exav-sections-menu" popover>
+    <TopicList />
+    <MobileMenuFooter />
+  </div>
+</div>
+
+<style>
+  button {
+    display: flex;
+    border: 0;
+    border-radius: 50%;
+    width: var(--sl-menu-button-size);
+    height: var(--sl-menu-button-size);
+    padding: 0.5rem;
+    background-color: var(--sl-color-white);
+    color: var(--sl-color-black);
+    box-shadow: var(--sl-shadow-md);
+    cursor: pointer;
+  }
+
+  .sections-menu:has(:popover-open) button {
+    background-color: var(--sl-color-gray-2);
+    box-shadow: none;
+  }
+
+  .sections-menu:has(:popover-open) .open-menu,
+  .sections-menu:not(:has(:popover-open)) .close-menu {
+    display: none;
+  }
+
+  [popover] {
+    inset: var(--sl-nav-height) 0 0 0;
+    width: 100%;
+    max-width: none;
+    height: auto;
+    margin: 0;
+    padding: 1rem var(--sl-sidebar-pad-x);
+    border: 0;
+    background-color: var(--sl-color-black);
+    color: var(--sl-color-text);
+    overflow-y: auto;
+  }
+
+  [popover]:popover-open {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  /* No scrolling of the page under the menu, as with Starlight's. */
+  :global(html:has(#exav-sections-menu:popover-open)) {
+    overflow: hidden;
+  }
+</style>

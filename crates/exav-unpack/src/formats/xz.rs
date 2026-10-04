@@ -95,6 +95,11 @@ fn skip_varint(d: &[u8], p: usize) -> Option<usize> {
     read_varint(d, p).map(|(_, np)| np)
 }
 
+/// Output bytes per decoder call. `xz4rust` reports nothing of a call that
+/// fails, so what that call decoded before the error is lost: at most this
+/// much.
+const OUT_STEP: usize = 1024;
+
 /// A `Read` over the decompressed content of `data`, for the streaming path.
 ///
 /// `xz4rust` exposes a block-based decoder rather than a `Read`, so this pulls
@@ -126,6 +131,8 @@ pub(crate) struct XzReader<R> {
     staged: Vec<u8>,
     taken: usize,
     done: bool,
+    /// Input was fed to the decoder since the last end of stream.
+    mid_stream: bool,
 }
 
 impl<R: std::io::Read> XzReader<R> {
@@ -139,6 +146,7 @@ impl<R: std::io::Read> XzReader<R> {
             staged: Vec::new(),
             taken: 0,
             done: false,
+            mid_stream: false,
         }
     }
 
@@ -174,9 +182,17 @@ impl<R: std::io::Read> std::io::Read for XzReader<R> {
             self.taken = 0;
             if !self.fill()? {
                 self.done = true;
+                // The input ended inside a stream: the rest of it is not here.
+                if self.mid_stream {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "xz: stream cut short",
+                    ));
+                }
                 return Ok(0);
             }
-            let mut buf = [0u8; 8192];
+            self.mid_stream = true;
+            let mut buf = [0u8; OUT_STEP];
             match self
                 .decoder
                 .decode(&self.inbuf[self.in_pos..self.in_len], &mut buf)
@@ -187,6 +203,7 @@ impl<R: std::io::Read> std::io::Read for XzReader<R> {
                     self.in_pos += result.input_consumed();
                     if let xz4rust::XzNextBlockResult::EndOfStream(_, _) = result {
                         self.decoder.reset();
+                        self.mid_stream = false;
                         // Concatenated streams may be separated by zero padding.
                         loop {
                             if !self.fill()? {

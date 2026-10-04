@@ -14,11 +14,11 @@
 //! NTFS MFT records `formats/ntfs.rs` walks. A scanner wants those bytes: they
 //! are still in the file the victim has.
 //!
-//! **A CRC mismatch is reported, not thrown away.** ZOO records a CRC-16 per
-//! member. Bytes that fail it are still emitted — a tampered member is the
-//! interesting case, and dropping it would be a silent skip — but the entry
-//! carries the mismatch so a caller can tell decoded-and-verified from
-//! decoded-and-doubtful.
+//! **A CRC mismatch does not stop a scan.** ZOO records a CRC-16 per member.
+//! Bytes that fail it are still emitted, as a ZIP member's are: a tampered
+//! member is the interesting case, and dropping it would be a silent skip.
+//! With checksums verified (`Budget::set_verify_checksums`) the entry also
+//! carries the mismatch.
 
 use super::zoo_parse::{crc16_arc, DirEntry, Header, Method, DIRENT_HEADER_SIZE, ZOO_HEADER_SIZE};
 use crate::{Budget, Entry, LimitHit, Sink};
@@ -141,7 +141,10 @@ pub(crate) fn extract_zoo<R>(
         // which `zoo` writes short of the fixed header: its tag, type and
         // method, then the two offsets.
         let rest = data.get(at..).unwrap_or(&[]);
-        let le32 = |o: usize| rest.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let le32 = |o: usize| {
+            rest.get(o..o + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
         if rest.len() < DIRENT_HEADER_SIZE
             && le32(0) == Some(super::zoo_parse::ZOO_TAG)
             && le32(6) == Some(0)
@@ -227,10 +230,10 @@ pub(crate) fn extract_zoo<R>(
             };
             match decoded {
                 Ok(bytes) => {
-                    // The CRC is what separates a correct decode from a merely
-                    // plausible one — a subtly wrong codec emits bytes, not an
-                    // error. The bytes are still emitted; the entry says so.
-                    let ok = crc16_arc(&bytes) == entry.crc16;
+                    // A CRC-16 mismatch after a full decode hides nothing: the
+                    // bytes are scanned, as a ZIP member's are, and the entry
+                    // says so only when checksums are verified.
+                    let ok = !budget.should_verify_checksums() || crc16_arc(&bytes) == entry.crc16;
                     budget.commit(bytes.len() as u64);
                     let mut e = Entry::new(name, bytes);
                     e.comp_size = entry.size_now as u64;

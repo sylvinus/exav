@@ -171,7 +171,8 @@ fn a_trigger_with_a_container_condition_fires_in_that_container() {
     let db = loader.build().unwrap();
     let member = b"..prefix..MALWARE..suffix..";
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    zip.start_file("m.txt", zip::write::SimpleFileOptions::default()).unwrap();
+    zip.start_file("m.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
     zip.write_all(member).unwrap();
     let zip = zip.finish().unwrap().into_inner();
     let found = |data: &[u8]| match analyze(&db, data, &ScanOptions::default()).verdict {

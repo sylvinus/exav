@@ -9,9 +9,8 @@
 //! from Microsoft's RecursiveExtractor test corpus (MIT). Listings were
 //! cross-checked against **`nomarch`**, an independent decoder.
 //!
-//! The archive stores a CRC-16 of each member's uncompressed bytes, which exav
-//! checks on every decode — so a fixture that decoded wrongly would be reported
-//! unreadable and never reach the digest comparisons here.
+//! The digest comparisons here are against the files that went in, so a
+//! member that decoded wrongly fails them whatever its CRC-16 says.
 //!
 //! Regenerate with:
 //! ```sh

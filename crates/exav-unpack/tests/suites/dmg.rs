@@ -59,8 +59,17 @@ fn a_file_that_cannot_be_read_out_of_the_image_is_reported() {
     let test = entries
         .iter()
         .find(|e| e.name.ends_with("test.txt"))
-        .unwrap_or_else(|| panic!("left out: {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>()));
-    assert!(test.unsupported.is_some(), "read as {} bytes", test.data.len());
+        .unwrap_or_else(|| {
+            panic!(
+                "left out: {:?}",
+                entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        test.unsupported.is_some(),
+        "read as {} bytes",
+        test.data.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +209,43 @@ fn extract_apfs_encrypted_no_password_reports_unsupported() {
     assert_eq!(entries.len(), 1);
     assert!(entries[0].unsupported.is_some());
     assert!(entries[0].encrypted);
+}
+
+/// UDIF images whose data fork opens with a bzip2 or an xz run, as hdiutil
+/// writes UDBZ and ULMO images, the rest of the disk in a zlib run
+/// (`../fixtures/cut_short/make_udif.py`). The file starts with that run's
+/// magic and ends with the `koly` trailer: it is a disk image, and its file
+/// comes out whole, which no decode of the first run as a bare stream gives.
+#[test]
+fn a_udif_opening_with_a_bzip2_or_xz_run_is_a_dmg() {
+    use std::io::Read;
+    let eicar = exav_unpack::eicar();
+    for (name, magic) in [
+        ("udif_bzip2_first.dmg", &b"BZh"[..]),
+        ("udif_xz_first.dmg", &b"\xFD7zXZ\0"[..]),
+    ] {
+        let p = format!(
+            "{}/tests/fixtures/cut_short/{name}.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let gz = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut data = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_end(&mut data)
+            .unwrap();
+        assert!(data.starts_with(magic), "{name}");
+        assert_eq!(detect(&data), Some(Format::Dmg), "{name}");
+        let entries = extract(Format::Dmg, &data, &mut Budget::new(Limits::default())).unwrap();
+        let test = entries
+            .iter()
+            .find(|e| e.name.ends_with("test.txt"))
+            .unwrap_or_else(|| panic!("{name}: no test.txt"));
+        assert!(test.unsupported.is_none(), "{name}: {:?}", test.unsupported);
+        assert!(
+            test.data.windows(eicar.len()).any(|w| w == eicar),
+            "{name}: EICAR not in test.txt"
+        );
+    }
 }
 
 #[cfg(feature = "decrypt")]

@@ -10,7 +10,7 @@ YARA engine), `exav-unpack` (every archive/document decoder), `exav-x86` (the
 instruction decoder), `exav-pe-emu` (the packer emulator), `exav-grep` and
 `exav-update` all carry `#![forbid(unsafe_code)]`, which the compiler enforces.
 Some third-party decoders they call do use `unsafe` internally; the
-[dependencies page](https://exav.org/reference/dependencies/) counts it per
+[dependencies page](https://exav.org/project/dependencies/) counts it per
 crate.
 
 One crate does not: `crates/exav-unpack-wasm`, the WebAssembly bindings
@@ -38,7 +38,7 @@ exav's own `unsafe` lives in the `exav` binary, almost all of it in
 The ICAP listener, whose parsers read straight off the network, carries
 `#![forbid(unsafe_code)]` of its own. The residual `unsafe` in third-party
 dependencies (compression/crypto SIMD, syscall shims) is inventoried at
-<https://exav.org/reference/dependencies/>.
+<https://exav.org/project/dependencies/>.
 
 The residual risks for a memory-safe scanner are denial of service (panics,
 unbounded memory, infinite loops) and detection evasion, which is where the

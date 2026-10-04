@@ -10,7 +10,12 @@
 //! * paths and visibility adapted to a module of this crate;
 //! * a mode for NSIS's bzip2, which has no stream header, marks a block and
 //!   the end of the stream with one byte each, and has no checksums or
-//!   randomised bit (`DecoderReader::new_nsis`).
+//!   randomised bit (`DecoderReader::new_nsis`);
+//! * a block whose bits run out at the end of the input is an `UnexpectedEof`
+//!   error, told apart from damage;
+//! * a block failing its CRC does not stop the stream: the blocks after it
+//!   are decoded, and the mismatch is a checksum-mismatch error
+//!   (`crate::checksum_mismatch`) at the end of the stream.
 
 pub(crate) use self::decoder::DecoderReader;
 

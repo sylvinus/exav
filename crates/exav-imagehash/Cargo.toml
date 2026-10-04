@@ -26,48 +26,37 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-# The decoders are at the versions libclamav 1.5.4 links, so that ClamAV's
-# hash is reproduced bit for bit: the hash is the signature. JPEG and TIFF are
-# not `image` features: they go through `src/image_codecs/`, `image`'s own
-# decoders over zune-jpeg built without its SIMD code (its only `unsafe`),
-# which `image` and `tiff` cannot turn off. Pinned with `=` for
-# `cargo install`, which resolves without Cargo.lock.
-image = { version = "=0.25.9", default-features = false, features = ["png", "gif", "bmp"] }
-png = "=0.18.0"
-gif = "=0.14.1"
-zune-jpeg = { version = "=0.5.8", default-features = false, features = ["std"] }
-zune-core = "=0.5.0"
-zune-core-04 = { package = "zune-core", version = "=0.4.12" }
-# The vendored `tiff` decoder's dependencies, as tiff 0.10.3 has them, and
-# `bytemuck` for its byte casts.
-zune-jpeg-04 = { package = "zune-jpeg", version = "=0.4.21", default-features = false, features = ["std"] }
-fax34 = { package = "fax", version = "=0.2.6" }
-flate2 = "1.0.20"
-half = "2.4.1"
-quick-error = "2.0.1"
-# Also `gif`'s LZW.
-weezl = "=0.1.10"
-bytemuck = "1"
+# The decoders, at the versions libclamav 1.5.4 links, so that ClamAV's hash is
+# reproduced bit for bit: the hash is the signature. This crate only hashes the
+# pixels they give.
+exav-render = { path = "../exav-render", version = "0.0.2", default-features = false, features = ["image"] }
+# The resize and the conversions to RGB, as ClamAV runs them; the same `=` pin
+# as exav-render's, since its pixels arrive in this crate's buffers.
+image = { version = "=0.25.9", default-features = false }
 
 [features]
-default = ["cli", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr"]
+default = ["cli", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2"]
 # The command-line tool.
 cli = []
 # Formats beyond the five clamscan treats as graphics, which `sigtool
 # --fuzzy-img` also hashes (libclamav 1.5.4 links the same `image` codecs and
-# the same image-webp and qoi). Each is a decoder without `unsafe`: image-webp
-# and qoi are `forbid(unsafe_code)`, the others are `image`'s own. OpenEXR,
-# which sigtool also reads, is left out: its crate pulls `rayon-core` and
-# `smallvec`. Off, a file of that format is not an image here.
-webp = ["image/webp"]
-ico = ["image/ico"]
-pnm = ["image/pnm"]
-qoi = ["image/qoi"]
-dds = ["image/dds"]
-ff = ["image/ff"]
-hdr = ["image/hdr"]
+# the same image-webp and qoi). Off, a file of that format is not an image
+# here. See exav-render.
+webp = ["exav-render/webp"]
+ico = ["exav-render/ico"]
+pnm = ["exav-render/pnm"]
+qoi = ["exav-render/qoi"]
+dds = ["exav-render/dds"]
+ff = ["exav-render/ff"]
+hdr = ["exav-render/hdr"]
+# JPEG 2000 and JBIG2, which sigtool does not read: hashed as the same pixels
+# are in any other format.
+jp2 = ["exav-render/jp2"]
+jbig2 = ["exav-render/jbig2"]
 
 [dev-dependencies]
+# The tests encode their inputs.
+image = { version = "=0.25.9", default-features = false, features = ["png", "webp"] }
 crc32fast = "1"
 # What `src/dct.rs` is checked against: it ships rustdct's algorithm without
 # rustdct, its `unsafe` and rustfft's SIMD code.

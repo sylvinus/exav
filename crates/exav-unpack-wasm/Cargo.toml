@@ -5,7 +5,7 @@ version = "0.0.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
-rust-version = "1.91"
+rust-version = "1.92"
 description = "WebAssembly bindings for exav-unpack: in-browser, memory-safe universal archive extraction. Build with `wasm-pack build`."
 
 [lib]

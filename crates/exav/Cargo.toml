@@ -127,6 +127,8 @@ pepack = ["exav-core/pepack"]
 javaclass = ["exav-core/javaclass"]
 aimodel = ["exav-core/aimodel"]
 screnc = ["exav-core/screnc"]
+dxf = ["exav-core/dxf"]
+dwg = ["exav-core/dwg"]
 # Emulation-based unpacking: its own switch, so a build can take the static
 # unpackers without executing attacker-supplied control flow.
 pe-emu = ["exav-core/pe-emu"]

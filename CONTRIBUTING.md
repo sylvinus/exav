@@ -1,7 +1,7 @@
 # Contributing to exav
 
 Issues and PRs are welcome. Good first areas: formats from the gap list
-(<https://exav.org/reference/formats/#the-complete-gap-list>), bytecode host APIs,
+(<https://exav.org/unpack/formats/#the-complete-gap-list>), bytecode host APIs,
 and fuzz targets.
 
 The full guide, including the AI-assisted-contribution policy, lives at

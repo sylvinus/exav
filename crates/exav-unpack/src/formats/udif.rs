@@ -1,10 +1,12 @@
 // Vendored from `dmg-core` 0.1.2 (Apache-2.0, Albert Hui / SecurityRonin).
-// Adapted to use `lzma-rust2` instead of `lzma-rs` for XZ decompression.
+// Adapted to decode XZ runs with exav's `formats::xz` reader (`xz4rust`)
+// instead of `lzma-rs`, and to keep what a run decodes before an error.
 
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use base64::Engine;
-use flate2::read::ZlibDecoder;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -81,8 +83,20 @@ pub(crate) struct DmgReader<R: Read + Seek> {
     file_size: u64,
     partitions: Vec<Partition>,
     position: u64,
-    /// Decompressed runs by (partition, run), the most recently used last.
-    runs: Vec<((usize, usize), Vec<u8>)>,
+    /// Decompressed runs by (partition, run), the most recently used last,
+    /// each with whether it failed to decode part way.
+    runs: Vec<((usize, usize), Run)>,
+    /// Set once a run decoded so far fails part way.
+    damaged: Arc<AtomicBool>,
+}
+
+/// A run's decoded bytes, all of them or those before a failure.
+struct Run {
+    data: Vec<u8>,
+    /// Decoding failed with compressed bytes of the run left unread, or
+    /// produced more than the run declares: `data` is not the run's whole
+    /// content, and whatever was read from it may not be.
+    damaged: bool,
 }
 
 impl<R: Read + Seek> DmgReader<R> {
@@ -137,11 +151,12 @@ impl<R: Read + Seek> DmgReader<R> {
             partitions,
             position: 0,
             runs: Vec::new(),
+            damaged: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// The decompressed run `key`, decoded on first use.
-    fn run_data(&mut self, key: (usize, usize), run: &BlkxRun, file_pos: u64) -> io::Result<&[u8]> {
+    fn run_data(&mut self, key: (usize, usize), run: &BlkxRun, file_pos: u64) -> io::Result<&Run> {
         if let Some(i) = self.runs.iter().position(|(k, _)| *k == key) {
             let hit = self.runs.remove(i);
             self.runs.push(hit);
@@ -159,9 +174,12 @@ impl<R: Read + Seek> DmgReader<R> {
             self.inner.read_exact(&mut compressed)?;
             let decompressed = decompress(run.entry_type, &compressed, expected)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let mut held: usize = self.runs.iter().map(|(_, d)| d.len()).sum();
-            while held + decompressed.len() > RUN_CACHE_BYTES && !self.runs.is_empty() {
-                held -= self.runs.remove(0).1.len();
+            if decompressed.damaged {
+                self.damaged.store(true, Ordering::Relaxed);
+            }
+            let mut held: usize = self.runs.iter().map(|(_, r)| r.data.len()).sum();
+            while held + decompressed.data.len() > RUN_CACHE_BYTES && !self.runs.is_empty() {
+                held -= self.runs.remove(0).1.data.len();
             }
             self.runs.push((key, decompressed));
         }
@@ -239,12 +257,16 @@ impl<R: Read + Seek> Read for DmgReader<R> {
                 }
                 let decompressed = self.run_data((pi, ri), &run, file_pos)?;
                 let start = bytes_into_run as usize;
-                if start >= decompressed.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "decompressed run underrun",
-                    ));
+                if start >= decompressed.data.len() {
+                    // Short of a damaged run: content left undecoded. Short
+                    // of a whole one: the stream ended there.
+                    return Err(if decompressed.damaged {
+                        io::Error::new(io::ErrorKind::InvalidData, "run failed to decode part way")
+                    } else {
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "decompressed run underrun")
+                    });
                 }
+                let decompressed = &decompressed.data;
                 let end = (start + to_read).min(decompressed.len());
                 buf[..end - start].copy_from_slice(&decompressed[start..end]);
                 // A run that decoded short ends here: the next read reports it.
@@ -298,6 +320,17 @@ pub(crate) fn disk<R: Read + Seek>(mut src: R) -> Result<Disk<R>, LimitHit> {
     Ok(Disk::Raw(src))
 }
 
+impl<R: Read + Seek> Disk<R> {
+    /// Set once a run read so far failed to decode part way: what was read
+    /// from it may not be the disk's content, read on or not.
+    pub(crate) fn damage(&self) -> Arc<AtomicBool> {
+        match self {
+            Disk::Udif(d) => d.damaged.clone(),
+            Disk::Raw(_) => Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 impl<R: Read + Seek> Read for Disk<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -316,76 +349,51 @@ impl<R: Read + Seek> Seek for Disk<R> {
     }
 }
 
-fn decompress(
-    entry_type: u32,
-    compressed: &[u8],
-    expected_len: usize,
-) -> Result<Vec<u8>, LimitHit> {
-    let mut out = Vec::with_capacity(crate::cap_prealloc(expected_len));
+/// Decode a run of `expected_len` bytes, keeping what decoded before an
+/// error.
+fn decompress(entry_type: u32, compressed: &[u8], expected_len: usize) -> Result<Run, LimitHit> {
     let cap = expected_len as u64;
-    match entry_type {
-        BLK_ZLIB => {
-            ZlibDecoder::new(Cursor::new(compressed))
-                .take(cap)
-                .read_to_end(&mut out)
-                .map_err(|e| LimitHit::corrupt(format!("UDIF zlib: {e}")))?;
-        }
-        BLK_BZIP2 => {
-            super::bzip2_rs::DecoderReader::new(Cursor::new(compressed))
-                .take(cap)
-                .read_to_end(&mut out)
-                .map_err(|e| LimitHit::corrupt(format!("UDIF bzip2: {e}")))?;
-        }
-        BLK_LZMA => {
-            // ULMO blocks are XZ-framed (stream magic FD 37 7A 58 5A 00).
-            // xz4rust: pure Rust, no unsafe, zero runtime deps (no sha2).
-            let mut decoder = xz4rust::XzDecoder::with_alloc_dict_size(8192, 64 * 1024 * 1024);
-            let mut out_buf = [0u8; 8192];
-            let mut pos = 0;
-            loop {
-                let feed = compressed[pos..].len().min(out_buf.len());
-                if feed == 0 {
-                    break;
-                }
-                match decoder.decode(&compressed[pos..pos + feed], &mut out_buf) {
-                    Ok(result) => {
-                        let produced = result.output_produced();
-                        if produced > 0 {
-                            out.extend_from_slice(&out_buf[..produced]);
-                        }
-                        pos += result.input_consumed();
-                        if let xz4rust::XzNextBlockResult::EndOfStream(_, _) = result {
-                            break;
-                        }
-                    }
-                    Err(xz4rust::XzError::NeedsLargerInputBuffer) => {
-                        pos += feed;
-                    }
-                    Err(e) => {
-                        return Err(LimitHit::corrupt(format!("UDIF xz: {e}")));
-                    }
-                }
-                if out.len() as u64 > cap {
-                    return Err(LimitHit::corrupt("UDIF xz exceeds budget".to_string()));
-                }
+    let s = match entry_type {
+        // Not flate2's `ZlibDecoder`, which drops the output of the read
+        // that fails.
+        BLK_ZLIB => match crate::inflate::zlib_body(compressed) {
+            Some(body) => crate::salvage(body, cap),
+            None => {
+                return Ok(Run {
+                    data: Vec::new(),
+                    damaged: true,
+                })
             }
-        }
+        },
+        BLK_BZIP2 => crate::salvage(
+            super::bzip2_rs::DecoderReader::new(Cursor::new(compressed)),
+            cap,
+        ),
+        // ULMO blocks are XZ-framed (stream magic FD 37 7A 58 5A 00).
+        BLK_LZMA => crate::salvage(super::xz::XzReader::new(Cursor::new(compressed)), cap),
         BLK_LZFSE => {
             let mut decoder = lzfse_rust::LzfseRingDecoder::default();
-            decoder
-                .reader_bytes(compressed)
-                .take(cap)
-                .read_to_end(&mut out)
-                .map_err(|e| LimitHit::corrupt(format!("UDIF lzfse: {e}")))?;
+            crate::salvage(decoder.reader_bytes(compressed), cap)
         }
-        BLK_ADC => out = adc_decompress(compressed, expected_len),
+        BLK_ADC => {
+            return Ok(Run {
+                data: adc_decompress(compressed, expected_len),
+                damaged: false,
+            })
+        }
         other => {
             return Err(LimitHit::corrupt(format!(
                 "UDIF unsupported block type {other:#010x}"
             )))
         }
-    }
-    Ok(out)
+    };
+    // The run's compressed bytes are all here, so a stream that runs out of
+    // them hides nothing; one that decodes past the run's size is not the
+    // run.
+    Ok(Run {
+        damaged: s.part_way(true) || s.over_cap,
+        data: s.data,
+    })
 }
 
 fn adc_decompress(input: &[u8], expected_len: usize) -> Vec<u8> {
@@ -534,4 +542,106 @@ fn parse_mish(data: &[u8]) -> Result<Partition, LimitHit> {
         sector_base: sector_number,
         runs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A UDIF image of `sectors` sectors in one run of `kind`, its bytes `run`.
+    fn udif(kind: u32, sectors: u64, run: &[u8]) -> Vec<u8> {
+        let mut mish = b"mish".to_vec();
+        mish.extend_from_slice(&1u32.to_be_bytes());
+        mish.extend_from_slice(&0u64.to_be_bytes()); // first sector
+        mish.extend_from_slice(&sectors.to_be_bytes());
+        mish.extend_from_slice(&0u64.to_be_bytes()); // data offset
+        mish.resize(200, 0);
+        mish.extend_from_slice(&2u32.to_be_bytes());
+        let len = run.len() as u64;
+        for (t, start, count, off, n) in
+            [(kind, 0, sectors, 0, len), (BLK_TERM, sectors, 0, len, 0)]
+        {
+            mish.extend_from_slice(&t.to_be_bytes());
+            mish.extend_from_slice(&0u32.to_be_bytes());
+            for v in [start, count, off, n] {
+                mish.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        let xml = format!(
+            "<plist><dict><key>resource-fork</key><dict><key>blkx</key><array><dict>\
+             <key>Data</key><data>{}</data></dict></array></dict></dict></plist>",
+            base64::engine::general_purpose::STANDARD.encode(&mish)
+        );
+        let mut f = run.to_vec();
+        let mut koly = [0u8; 512];
+        koly[..4].copy_from_slice(b"koly");
+        koly[216..224].copy_from_slice(&len.to_be_bytes());
+        koly[224..232].copy_from_slice(&(xml.len() as u64).to_be_bytes());
+        koly[492..500].copy_from_slice(&sectors.to_be_bytes());
+        f.extend_from_slice(xml.as_bytes());
+        f.extend_from_slice(&koly);
+        f
+    }
+
+    /// zlib of `data`; with `break_at`, a stored block whose length check
+    /// fails written there, the rest of the stream after it.
+    fn zlib(data: &[u8], break_at: Option<usize>) -> Vec<u8> {
+        let at = break_at.unwrap_or(data.len());
+        let mut w = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        w.write_all(&data[..at]).unwrap();
+        w.flush().unwrap();
+        if break_at.is_some() {
+            w.get_mut()
+                .extend_from_slice(&[0x00, 0x05, 0x00, 0x00, 0x00]);
+        }
+        w.write_all(&data[at..]).unwrap();
+        w.finish().unwrap()
+    }
+
+    fn text(n: usize) -> Vec<u8> {
+        (0..n).map(|i| b'a' + (i * 7 % 26) as u8).collect()
+    }
+
+    fn open(image: Vec<u8>) -> Disk<Cursor<Vec<u8>>> {
+        let d = disk(Cursor::new(image)).unwrap();
+        assert!(matches!(d, Disk::Udif(_)));
+        d
+    }
+
+    fn read_at(d: &mut Disk<Cursor<Vec<u8>>>, at: u64, n: usize) -> io::Result<Vec<u8>> {
+        d.seek(SeekFrom::Start(at))?;
+        let mut b = vec![0; n];
+        d.read_exact(&mut b)?;
+        Ok(b)
+    }
+
+    #[test]
+    fn a_run_damaged_part_way_keeps_its_decoded_bytes_and_is_flagged() {
+        let t = text(4096);
+        let mut d = open(udif(BLK_ZLIB, 8, &zlib(&t, Some(1024))));
+        assert_eq!(read_at(&mut d, 0, 1024).unwrap(), t[..1024]);
+        assert!(d.damage().load(Ordering::Relaxed));
+        let past = read_at(&mut d, 2048, 16).unwrap_err();
+        assert_eq!(past.kind(), io::ErrorKind::InvalidData, "{past}");
+    }
+
+    /// The stream ended whole before the run's size: nothing is left unread.
+    #[test]
+    fn a_run_shorter_than_it_declares_is_not_flagged() {
+        let t = text(1024);
+        let mut d = open(udif(BLK_ZLIB, 4, &zlib(&t, None)));
+        assert_eq!(read_at(&mut d, 0, 1024).unwrap(), t);
+        let past = read_at(&mut d, 1024, 16).unwrap_err();
+        assert_eq!(past.kind(), io::ErrorKind::UnexpectedEof, "{past}");
+        assert!(!d.damage().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_run_decoding_past_its_size_is_flagged() {
+        let t = text(4096);
+        let mut d = open(udif(BLK_ZLIB, 4, &zlib(&t, None)));
+        assert_eq!(read_at(&mut d, 0, 2048).unwrap(), t[..2048]);
+        assert!(d.damage().load(Ordering::Relaxed));
+    }
 }

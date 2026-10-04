@@ -6,7 +6,10 @@ description: exav's threat model and hardening, from memory safety, bounded extr
 A scanner reads files an attacker chose, and the engine is built to contain
 them. The repository's
 [`SECURITY.md`](https://github.com/sylvinus/exav/blob/main/SECURITY.md) has the
-full threat model.
+full threat model. This page covers the scanner; the extractor's bounds are its
+[safety model](/unpack/#the-safety-model), and what a hostile file can
+reach in the browser is the file viewer's [Security](/viewer/security/)
+page.
 
 ## Reporting a vulnerability
 
@@ -25,7 +28,7 @@ please [open an issue](https://github.com/sylvinus/exav/issues).
 ## Hardening
 
 - **Never a silent clean:** a file is reported clean only if it was fully
-  scanned (see [design principles](/concepts/design-principles/#never-a-silent-clean)).
+  scanned (see [design principles](/scanner/concepts/design-principles/#never-a-silent-clean)).
 - **Bounded extraction:** every materialization is reserved against a budget
   before it is allocated (output bytes, ratio, file count, recursion depth,
   matcher bytes, emulation steps). A decompression bomb is `LIMITS-EXCEEDED`.
@@ -42,7 +45,7 @@ please [open an issue](https://github.com/sylvinus/exav/issues).
   Continuous fuzzing is on the [roadmap](/project/roadmap/).
 - **Prefork worker pool:** the daemon runs each job in a worker under
   kernel-enforced limits and replaces a worker that exceeds them (see the
-  [daemon guide](/guides/daemon/)).
+  [daemon guide](/scanner/guides/daemon/)).
 
 ## On `unsafe`
 
@@ -51,12 +54,12 @@ exav's own scanning, extraction and emulation code is safe Rust: `exav-core`,
 `exav-grep` and the ICAP listener are `#![forbid(unsafe_code)]`. The default build runs no C, no
 UnRAR and no native JIT, so the memory-corruption bugs behind most scanner CVEs
 cannot occur in exav's own code. The
-[bytecode interpreter](/concepts/bytecode-sandbox/), for one, has no counterpart
+[bytecode interpreter](/scanner/concepts/bytecode-sandbox/), for one, has no counterpart
 to the bugs that have repeatedly affected ClamAV's C/JIT bytecode VM.
 
 The remaining `unsafe` is the daemon's libc calls and code inside dependencies:
 SIMD, syscalls, and buffer handling in some decoders that read scanned bytes
-(see [Dependencies](/reference/dependencies/) for counts per crate). The
+(see [Dependencies](/project/dependencies/) for counts per crate). The
 approach is to minimise it (drop dependencies exav does not need), contain it
 (panic isolation, the prefork process boundary, the WASM build), and look for
 bugs in it (fuzzing, and Miri through `make miri`). Reducing it further is on the
@@ -66,7 +69,7 @@ bugs in it (fuzzing, and Miri through `make miri`). Reducing it further is on th
 
 The native engine treats signatures as trusted input. To load signatures you do
 not fully trust (third-party `.ndb` sets, community YARA rules), use the
-[WASM sandbox](/guides/wasm-sandbox/), which bounds memory, has no ambient
+[WASM sandbox](/scanner/guides/wasm-sandbox/), which bounds memory, has no ambient
 system access, and turns a parser panic into a contained trap.
 
 ## Database authenticity is not verified
@@ -102,7 +105,7 @@ asset:
 - exav refuses the clamd `SHUTDOWN` command by default, so a client that can
   reach the socket or port cannot stop the daemon (`--allow-shutdown` allows
   it).
-- A client that can reach the daemon or the [ICAP listener](/guides/icap/) can
+- A client that can reach the daemon or the [ICAP listener](/scanner/guides/icap/) can
   request scans, so restrict access regardless: bind to localhost, a private
   network, or a Unix socket.
 - `--allow-http-scan` (in an `http-scan` build) lets any such client make the

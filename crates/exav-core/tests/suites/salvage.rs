@@ -56,6 +56,58 @@ fn truncated_gzip_without_malware_is_clean_not_flagged() {
     }
 }
 
+/// A bzip2, Zstandard, xz or lzip file cut short, as a download that stopped:
+/// what decodes before the cut is scanned, EICAR in it is found, and a prefix
+/// without it is clean, not partial. The streams are the members of exav-unpack's
+/// `cut_<codec>.zip` fixtures (written by 7-Zip 25.01; zstd 1.5.7 for Zstandard)
+/// and `cut_lzip.lz` (lzip 1.25, `lzip -9`), each text with EICAR in the middle.
+/// Python 3.13's `bz2` and `lzma`, `zstd -dc` and `lzip -dc` give a prefix
+/// without EICAR from each cut 25% in, and one with it from each cut 90% in.
+#[cfg(feature = "all-formats")]
+#[test]
+fn a_compressed_file_cut_short_is_scanned_as_far_as_it_goes() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../exav-unpack/tests/fixtures");
+    let read = |p: &str| {
+        exav_core::unpack::read_fixture(&format!("{fixtures}/{p}"))
+            .unwrap_or_else(|e| panic!("{p}: {e}"))
+    };
+    let member = |zip: Vec<u8>| {
+        let u16_at = |o: usize| usize::from(u16::from_le_bytes([zip[o], zip[o + 1]]));
+        let comp = u32::from_le_bytes(zip[18..22].try_into().unwrap()) as usize;
+        let start = 30 + u16_at(26) + u16_at(28);
+        zip[start..start + comp].to_vec()
+    };
+    let files = [
+        ("bzip2", member(read("zip/cut_bzip2.zip"))),
+        ("zstd", member(read("zip/cut_zstd.zip"))),
+        ("xz", member(read("zip/cut_xz.zip"))),
+        ("lzip", read("cut_lzip.lz")),
+    ];
+    let db = Scanner::builtin();
+    let mut wrong = Vec::new();
+    for (codec, file) in &files {
+        for (pct, found) in [(25, false), (90, true)] {
+            let v = analyze(
+                &db,
+                &file[..file.len() * pct / 100],
+                &ScanOptions::default(),
+            )
+            .verdict;
+            let ok = match &v {
+                Verdict::Infected { signature, .. } => {
+                    found && signature.to_ascii_uppercase().contains("EICAR")
+                }
+                Verdict::Clean => !found,
+                _ => false,
+            };
+            if !ok {
+                wrong.push(format!("{codec}, cut at {pct}%: {v:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A ZIP that OPENS but whose first member cannot be read: the central directory
 /// is intact, so the archive parses, and the failure only arrives when the member
 /// itself is reached. Word documents carrying an embedded ZIP land here routinely
@@ -432,7 +484,11 @@ mod damaged {
         // locates the member's data.
         let entry = u32::from_le_bytes(zoo[24..28].try_into().unwrap()) as usize;
         let data = u32::from_le_bytes(zoo[entry + 10..entry + 14].try_into().unwrap()) as usize;
-        assert!(matches!(verdict(&zoo), Verdict::Clean), "the fixture itself: {:?}", verdict(&zoo));
+        assert!(
+            matches!(verdict(&zoo), Verdict::Clean),
+            "the fixture itself: {:?}",
+            verdict(&zoo)
+        );
         zoo[data..data + eicar().len()].copy_from_slice(eicar());
         match verdict(&zoo) {
             Verdict::Infected { .. } => {}

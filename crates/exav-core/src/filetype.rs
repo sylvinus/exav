@@ -168,9 +168,9 @@ pub enum FileType {
     Lz4,         // LZ4 frame
     Arc,         // ARC / PKARC / PAK archive
     Ace,         // ACE archive (recognised, not decoded)
-    Alz,         // ALZ archive (recognised, not decoded)
-    Egg,         // EGG archive (recognised, not decoded)
-    Hwp3,        // Hangul HWP v3 document (recognised, not decoded)
+    Alz,         // ALZ archive
+    Egg,         // EGG archive
+    Hwp3,        // Hangul HWP v3 document
     IshieldMsi,  // InstallShield MSI installer (recognised, not unpacked)
     IshieldCab,  // InstallShield InstallScript cabinet (recognised, not unpacked)
     IshieldZ,    // InstallShield `.z` archive (decoded)
@@ -365,8 +365,12 @@ fn identify_with(buf: &[u8], detect: impl FnOnce() -> Option<crate::unpack::Form
     // Archive/container formats: the magic detection is owned solely by
     // `exav-unpack::detect` (single source of truth); map its `Format` to the
     // broader `FileType`.
-    if let Some(fmt) = detect() {
-        return filetype_of_format(fmt);
+    // A DXF drawing has no ClamAV type: an ASCII one is text to ClamAV and
+    // stays so here, for `Target:7`; what it embeds is extracted from the
+    // magic (`MAGIC_DISPATCH_ONLY`).
+    match detect() {
+        Some(crate::unpack::Format::Dxf) | None => {}
+        Some(fmt) => return filetype_of_format(fmt),
     }
     // Content-sniffed text-ish types (core-specific).
     if buf.starts_with(b"#!") {
@@ -628,6 +632,8 @@ pub(crate) const MAGIC_DISPATCH_ONLY: &[crate::unpack::Format] = &[
     crate::unpack::Format::Qcow2,
     crate::unpack::Format::Vmdk,
     crate::unpack::Format::Vhdx,
+    crate::unpack::Format::Dxf,
+    crate::unpack::Format::Dwg,
 ];
 
 #[cfg(test)]
@@ -670,17 +676,32 @@ mod tests {
         // Real daily.ftm-style lines: literal magic, wildcarded magic (skipped),
         // unmodelled CL_TYPE (skipped), and a non-zero magictype (skipped).
         ftm.extend_from_text(
-            "0:0:49545346:MS CHM:CL_TYPE_ANY:CL_TYPE_MSCHM\n\
+            "0:0:550d0d0a:Python:CL_TYPE_ANY:CL_TYPE_PYTHON_COMPILED\n\
              0:0:46726f6d20:MBox:CL_TYPE_ANY:CL_TYPE_MAIL\n\
              0:0:255044462d:PDF:CL_TYPE_ANY:CL_TYPE_PDF\n\
              0:0:6125{4}62:wild:CL_TYPE_ANY:CL_TYPE_MAIL\n\
              1:0:cafe:pe:CL_TYPE_ANY:CL_TYPE_MSEXE",
         );
-        // CHM has no exav FileType (CL_TYPE_MSCHM unmodelled) -> not stored;
+        // Compiled Python has no exav FileType here -> not stored;
         // MAIL + PDF map and are stored.
+        assert_eq!(ftm.identify(b"\x55\x0d\x0d\x0a rest"), None);
         assert_eq!(ftm.identify(b"From the start"), Some(FileType::Email));
         assert_eq!(ftm.identify(b"%PDF-1.7 ..."), Some(FileType::Pdf));
         assert_eq!(ftm.identify(b"no magic here"), None);
+    }
+
+    /// ClamAV has no DXF type: an ASCII drawing is text to it, so `Target:7`
+    /// signatures apply, and a binary one is data.
+    #[test]
+    fn a_dxf_keeps_the_type_its_bytes_give() {
+        assert_eq!(
+            identify(b"  0\r\nSECTION\r\n  2\r\nHEADER\r\n"),
+            FileType::Text
+        );
+        assert_eq!(
+            identify(b"AutoCAD Binary DXF\r\n\x1a\0\0\0SECTION\0"),
+            FileType::Unknown
+        );
     }
 
     #[test]

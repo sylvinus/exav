@@ -1,0 +1,171 @@
+/**
+ * The built-in strings, English and French. A host with its own i18n passes
+ * `translate` instead. Plural keys are written without their `_one`/`_other`
+ * suffix and receive `count`.
+ */
+export const MESSAGES = {
+  en: {
+    archive_back: "Back to the archive",
+    archive_failed_member: "This file could not be extracted.",
+    archive_member_encrypted: "This file is encrypted.",
+    archive_member_unsupported: "This file could not be read out of the archive.",
+    archive_members_one: "{{count}} file",
+    archive_members_other: "{{count}} files",
+    archive_no_reader: "This file cannot be shown here.",
+    background: "Background",
+    background_dark: "Dark",
+    background_light: "Light",
+    categories: "Categories",
+    close: "Close",
+    converting_model: "Preparing the model… {{percent}}%",
+    counter: "{{current}} / {{total}}",
+    download: "Download",
+    drag_pan: "Move the page",
+    drag_select: "Select text",
+    drawing: "Preparing the image…",
+    drawing_panel: "Drawing",
+    empty_model: "This model has nothing to show.",
+    error: "The preview could not be shown.",
+    error_archive: "This archive could not be opened.",
+    error_drawing: "The drawing could not be shown.",
+    error_drawing_version: "This drawing is saved in a format older than AutoCAD R13, which cannot be shown here.",
+    error_file: "This file could not be shown.",
+    error_image: "The image could not be shown.",
+    error_media: "This device cannot play this file.",
+    error_model: "This model could not be shown.",
+    error_office: "This document could not be shown.",
+    layers: "Layers",
+    layers_all: "All",
+    layers_none: "None",
+    layouts: "Layouts",
+    link_confirm: "The document links to {{url}}. Open it in a new tab?",
+    loading: "Loading the document…",
+    loading_model: "Loading the model…",
+    model_panel: "Model",
+    model_space: "Model space",
+    next: "Next",
+    open_in_tab: "Open in a new tab",
+    page_of: "Page {{current}} / {{total}}",
+    page_short: "Page {{page}}",
+    panel_hide: "Hide the panel",
+    prev: "Previous",
+    sections: "Sections",
+    sections_hide: "Hide the sections",
+    selection: "Element",
+    selection_none: "Tap an element to identify it.",
+    selection_unnamed: "Unnamed",
+    slide_of: "Slide {{current}} / {{total}}",
+    stl_triangles_one: "{{count}} triangle",
+    stl_triangles_other: "{{count}} triangles",
+    unavailable_offline: "Not available offline",
+    warning_external_references_one: "{{count}} external reference is not drawn.",
+    warning_external_references_other: "{{count}} external references are not drawn.",
+    warning_model_damaged: "The file is damaged: what could be read is shown.",
+    warning_model_partial: "The model is too large to show whole: part of it is left out.",
+    warning_model_truncated_one: "The model is too large to show whole: {{count}} element is left out.",
+    warning_model_truncated_other: "The model is too large to show whole: {{count}} elements are left out.",
+    warning_model_unsupported_one: "{{count}} piece of geometry is of a kind not drawn here.",
+    warning_model_unsupported_other: "{{count}} pieces of geometry are of a kind not drawn here.",
+    warning_proxy_without_graphics_one:
+      "{{count}} custom object was saved without its graphics: only the application that made it can show it.",
+    warning_proxy_without_graphics_other:
+      "{{count}} custom objects were saved without their graphics: only the application that made them can show them.",
+    warning_scene_truncated: "The drawing is too large to show whole: part of it is left out.",
+    warning_source_read_whole: "The server does not send parts of the file: all of it was downloaded.",
+    zoom_fit: "Fit to the window",
+    zoom_in: "Zoom in",
+    zoom_out: "Zoom out",
+  },
+  fr: {
+    archive_back: "Retour à l'archive",
+    archive_failed_member: "Ce fichier n'a pas pu être extrait.",
+    archive_member_encrypted: "Ce fichier est chiffré.",
+    archive_member_unsupported: "Ce fichier n'a pas pu être lu dans l'archive.",
+    archive_members_one: "{{count}} fichier",
+    archive_members_other: "{{count}} fichiers",
+    archive_no_reader: "Ce fichier ne peut pas être affiché ici.",
+    background: "Fond",
+    background_dark: "Sombre",
+    background_light: "Clair",
+    categories: "Catégories",
+    close: "Fermer",
+    converting_model: "Préparation de la maquette… {{percent}} %",
+    counter: "{{current}} / {{total}}",
+    download: "Télécharger",
+    drag_pan: "Déplacer la page",
+    drag_select: "Sélectionner le texte",
+    drawing: "Préparation de l'image…",
+    drawing_panel: "Dessin",
+    empty_model: "Cette maquette ne contient aucun élément à afficher.",
+    error: "L'aperçu n'a pas pu s'afficher.",
+    error_archive: "Cette archive n'a pas pu être ouverte.",
+    error_drawing: "Le dessin n'a pas pu s'afficher.",
+    error_drawing_version: "Ce dessin est enregistré dans un format antérieur à AutoCAD R13, qui ne peut pas être affiché ici.",
+    error_file: "Ce fichier n'a pas pu s'afficher.",
+    error_image: "L'image n'a pas pu s'afficher.",
+    error_media: "Cet appareil ne sait pas lire ce fichier.",
+    error_model: "Cette maquette n'a pas pu s'afficher.",
+    error_office: "Ce document n'a pas pu s'afficher.",
+    layers: "Calques",
+    layers_all: "Tous",
+    layers_none: "Aucun",
+    layouts: "Présentations",
+    link_confirm: "Le document renvoie vers {{url}}. L'ouvrir dans un nouvel onglet ?",
+    loading: "Chargement du document…",
+    loading_model: "Chargement de la maquette…",
+    model_panel: "Maquette",
+    model_space: "Espace objet",
+    next: "Suivant",
+    open_in_tab: "Ouvrir dans un nouvel onglet",
+    page_of: "Page {{current}} / {{total}}",
+    page_short: "Page {{page}}",
+    panel_hide: "Masquer le panneau",
+    prev: "Précédent",
+    sections: "Sections",
+    sections_hide: "Masquer les sections",
+    selection: "Élément",
+    selection_none: "Touchez un élément pour l'identifier.",
+    selection_unnamed: "Sans nom",
+    slide_of: "Diapositive {{current}} / {{total}}",
+    stl_triangles_one: "{{count}} triangle",
+    stl_triangles_other: "{{count}} triangles",
+    unavailable_offline: "Non disponible hors ligne",
+    warning_external_references_one: "{{count}} référence externe n'est pas dessinée.",
+    warning_external_references_other: "{{count}} références externes ne sont pas dessinées.",
+    warning_model_damaged: "Le fichier est endommagé : ce qui a pu être lu est affiché.",
+    warning_model_partial: "La maquette est trop grande pour être affichée en entier : une partie en est omise.",
+    warning_model_truncated_one: "La maquette est trop grande pour être affichée en entier : {{count}} élément est omis.",
+    warning_model_truncated_other: "La maquette est trop grande pour être affichée en entier : {{count}} éléments sont omis.",
+    warning_model_unsupported_one: "{{count}} géométrie d'un type non pris en charge n'est pas dessinée.",
+    warning_model_unsupported_other: "{{count}} géométries d'un type non pris en charge ne sont pas dessinées.",
+    warning_proxy_without_graphics_one:
+      "{{count}} objet personnalisé a été enregistré sans son graphisme : seule l'application qui l'a créé peut l'afficher.",
+    warning_proxy_without_graphics_other:
+      "{{count}} objets personnalisés ont été enregistrés sans leur graphisme : seule l'application qui les a créés peut les afficher.",
+    warning_scene_truncated: "Le dessin est trop grand pour être affiché en entier : une partie en est omise.",
+    warning_source_read_whole: "Le serveur n'envoie pas le fichier par parties : il a été téléchargé en entier.",
+    zoom_fit: "Ajuster à la fenêtre",
+    zoom_in: "Agrandir",
+    zoom_out: "Réduire",
+  },
+} as const;
+
+type Strings = (typeof MESSAGES)["en"];
+type Base<K> = K extends `${infer B}_one` | `${infer B}_other` ? B : K;
+
+/** Every message key, plural keys without their suffix. */
+export type MessageKey = Base<keyof Strings>;
+
+export type Translate = (key: MessageKey, vars?: Record<string, string | number>) => string;
+
+/** The built-in strings for `locale` ("fr", "fr-CA"...; English otherwise). */
+export function builtinTranslate(locale = "en"): Translate {
+  const lang = locale.toLowerCase().startsWith("fr") ? "fr" : "en";
+  const table = MESSAGES[lang] as Record<string, string>;
+  const plural = new Intl.PluralRules(lang);
+  return (key, vars = {}) => {
+    const count = typeof vars.count === "number" ? vars.count : undefined;
+    const template = (count !== undefined && table[`${key}_${plural.select(count) === "one" ? "one" : "other"}`]) || table[key] || key;
+    return template.replace(/\{\{(\w+)\}\}/g, (_, name: string) => String(vars[name] ?? ""));
+  };
+}

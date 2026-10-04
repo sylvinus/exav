@@ -1,21 +1,27 @@
 //! OneNote (`.one`) extraction tests against real malware samples.
 //!
-//! Fixtures are real-malware `.one` droppers (defanged as inert data here — we
-//! only carve their embedded FileDataStoreObject payloads and assert the
-//! extractor is panic-safe). Living in `tests/fixtures/onenote/`; see that dir's
-//! `README.md` for sha256 provenance.
+//! Fixtures are real-malware `.one` droppers, gitignored and kept locally in
+//! password-protected ZIPs (`tests/fixtures/README.md`). The tests only carve
+//! their embedded FileDataStoreObject payloads and assert the extractor is
+//! panic-safe. See `tests/fixtures/onenote/README.md` for sha256 provenance.
 
 use exav_unpack::{detect, extract, Budget, Format, Limits};
 
-fn fixtures() -> Vec<std::path::PathBuf> {
+/// The `.one` samples present locally, as `(name, bytes)`, each kept in its
+/// AES ZIP (`../README.md`).
+fn fixtures() -> Vec<(String, Vec<u8>)> {
     let dir = format!("{}/tests/fixtures/onenote", env!("CARGO_MANIFEST_DIR"));
-    let mut out: Vec<_> = std::fs::read_dir(&dir)
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read_dir {dir}: {e}"))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "one").unwrap_or(false))
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| Some(n.strip_suffix(".zip")?.to_string()))
+        .filter(|n| n.ends_with(".one"))
         .collect();
-    out.sort();
-    out
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|n| Some((n.clone(), super::real_sample(&format!("onenote/{n}"))?)))
+        .collect()
 }
 
 #[test]
@@ -28,19 +34,17 @@ fn real_samples_detect_extract_and_never_panic() {
         return;
     }
     let mut total_members = 0usize;
-    for path in &files {
-        let data = std::fs::read(path).unwrap();
+    for (name, data) in &files {
         // All samples are genuine OneNote sections → must be detected.
         assert_eq!(
-            detect(&data),
+            detect(data),
             Some(Format::OneNote),
-            "not detected as OneNote: {}",
-            path.display()
+            "not detected as OneNote: {name}"
         );
         // Extraction must complete without panicking on real (hostile) input.
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::OneNote, &data, &mut budget)
-            .unwrap_or_else(|e| panic!("extract {}: {}", path.display(), e.reason));
+        let entries = extract(Format::OneNote, data, &mut budget)
+            .unwrap_or_else(|e| panic!("extract {name}: {}", e.reason));
         total_members += entries.len();
     }
     // At least one real sample must yield an embedded member (these droppers

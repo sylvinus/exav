@@ -20,16 +20,25 @@
 //! offsets (see `model.rs`) — no raw pointers and no `unsafe`, unlike the C
 //! original — so an out-of-range access sets an error flag instead of being UB,
 //! and decode errors are surfaced as `SYM_ERROR`/`SYM_END` rather than panicking.
+//!
+//! The PPMd8 model of ZIP method 98 (`formats/ppmd8`) reuses the definitions in
+//! `common.rs`, `TaggedOffset`, the [`RangeDec`] trait and `RarRangeDecoder`,
+//! whose arithmetic is PPMd8's range decoder.
 
+pub(crate) mod common;
+#[cfg(any(feature = "rar", feature = "sevenz", test))]
 mod model;
 mod rangedec;
 mod tagged_offset;
 
+#[cfg(any(feature = "rar", feature = "sevenz", test))]
 pub(crate) use model::Ppmd7;
-#[cfg(feature = "rar")]
+#[cfg(any(feature = "rar", feature = "zip"))]
 pub(crate) use rangedec::RarRangeDecoder;
 #[cfg(any(feature = "sevenz", test))]
 pub(crate) use rangedec::SevenZRangeDecoder;
+#[cfg(feature = "zip")]
+pub(crate) use tagged_offset::TaggedOffset;
 
 /// A range decoder symbol decode returned this end-of-stream marker.
 pub(crate) const SYM_END: i32 = -1;
@@ -51,7 +60,7 @@ pub(crate) const PPMD7_MAX_MEM_SIZE: u32 = u32::MAX - 12 * 3;
 /// `out_len` bytes.
 #[cfg(test)]
 pub(crate) fn decode_7z(data: &[u8], order: u32, mem_size: u32, out_len: usize) -> Option<Vec<u8>> {
-    let rc = SevenZRangeDecoder::new(data);
+    let rc = SevenZRangeDecoder::new(data.to_vec());
     if !rc.init_ok() {
         return None;
     }
@@ -82,6 +91,10 @@ pub(crate) trait RangeDec {
     fn decode_bit(&mut self, size0: u32) -> u32;
     /// True once the underlying byte source has been exhausted (truncation).
     fn out_of_data(&self) -> bool;
+    /// The current range. PPMd8 caps a frequency total at it before
+    /// `get_threshold`.
+    #[cfg_attr(not(feature = "zip"), allow(dead_code))]
+    fn range(&self) -> u32;
     /// Number of input bytes consumed so far (for resuming a shared cursor after
     /// a RAR3 PPMd→LZSS conversion).
     #[cfg_attr(not(feature = "rar"), allow(dead_code))]
@@ -139,5 +152,57 @@ mod tests {
         roundtrip(b"a", 2, 2048);
         roundtrip(b"abcabcabcabc", 3, 4096);
         roundtrip(&[0u8; 1000], 6, 1 << 16);
+    }
+
+    fn lcg_bytes(n: usize, seed: u32, alphabet: u32) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                ((x >> 16) % alphabet) as u8
+            })
+            .collect()
+    }
+
+    /// Small models fill up long before the input ends, so the sub-allocator
+    /// glues its free blocks, takes units from the text area, and the model
+    /// restarts.
+    #[test]
+    fn model_matches_reference_when_memory_runs_out() {
+        let text: Vec<u8> = (0..20_000u32)
+            .flat_map(|i| format!("{} {} ", i % 97, i * 7919 % 1013).into_bytes())
+            .collect();
+        for data in [
+            text,
+            lcg_bytes(100_000, 42, 256),
+            lcg_bytes(100_000, 43, 20),
+        ] {
+            for (order, mem) in [(2, 2048), (6, 4096), (16, 16 * 1024), (64, 64 * 1024)] {
+                roundtrip(&data, order, mem);
+            }
+        }
+    }
+
+    /// Junk decodes to junk until something gives, through either range
+    /// decoder: the model never panics or loops.
+    #[test]
+    fn junk_input_terminates() {
+        fn run<RC: RangeDec>(mut model: Ppmd7<RC>) {
+            for _ in 0..64 * 1024 {
+                if model.decode_symbol() < 0 {
+                    return;
+                }
+            }
+        }
+        for seed in 0..32 {
+            let mut junk = lcg_bytes(4096, seed, 256);
+            for (order, mem) in [(2, 2048), (64, 2048), (6, 1 << 16)] {
+                let rar = rangedec::RarRangeDecoder::new(junk.clone());
+                run(Ppmd7::new(rar, order, mem).unwrap());
+                junk[0] = 0;
+                let sevenz = SevenZRangeDecoder::new(junk.clone());
+                run(Ppmd7::new(sevenz, order, mem).unwrap());
+            }
+        }
     }
 }

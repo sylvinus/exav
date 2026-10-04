@@ -29,12 +29,6 @@
   }
 }
 
-:root[data-theme='light'] {
-  --sl-color-accent-low: #c5efe8;
-  --sl-color-accent: #0c8375;
-  --sl-color-accent-high: #063d37;
-}
-
 /* Homepage hero. The mark is a square, so left unconstrained it fills half the
    hero; cap it and keep the tagline measure short. */
 .hero > .stack .tagline {
@@ -52,4 +46,13 @@
   font-size: 0.85em;
   font-weight: 600;
   white-space: nowrap;
+}
+
+/* Diagrams are drawn 790 units wide; on a phone, scaling one to the screen
+   makes its text unreadable, so it keeps a minimum width and scrolls. */
+.diagram {
+  overflow-x: auto;
+}
+.diagram > svg {
+  min-width: 640px;
 }

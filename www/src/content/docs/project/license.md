@@ -4,7 +4,10 @@ description: exav is MIT-licensed, statically links permissively licensed depend
 ---
 
 exav is licensed under the MIT License (see
-[`LICENSE`](https://github.com/sylvinus/exav/blob/main/LICENSE)).
+[`LICENSE`](https://github.com/sylvinus/exav/blob/main/LICENSE)): every crate,
+and the `@exav/unpack-wasm` and `@exav/viewer` npm packages. What the viewer
+bundles, and the engines installed beside it, keep their own licenses (see
+[File viewer](/viewer/#license)).
 
 ## Third-party notices
 
@@ -14,7 +17,7 @@ whose required notices are reproduced in
 `http` feature, such as the published image, also links the `ring` TLS
 primitives and the `webpki-roots` certificate store. Among the rest:
 
-- exav's [native YARA engine](/guides/yara/) reuses and adapts the YARA-X parser,
+- exav's [native YARA engine](/scanner/guides/yara/) reuses and adapts the YARA-X parser,
   source and test vectors under BSD-3-Clause, with attribution retained
   ([`crates/exav-core/LICENSE-YARA-X`](https://github.com/sylvinus/exav/blob/main/crates/exav-core/LICENSE-YARA-X)).
   It compiles rules to a native tree-walking evaluator, with no WASM runtime or
@@ -23,7 +26,7 @@ primitives and the `webpki-roots` certificate store. Among the rest:
   (RAR, AZO, CAB, DMG, PPMd and bzip2 decoders among them, the HWP3 layout, and
   `iced-x86`'s generated decoder tables), each attributed in `NOTICE`.
 - The WASM sandbox runs exav under a WASI runtime you provide, under its own
-  license; exav does not bundle it. See the [WASM sandbox guide](/guides/wasm-sandbox/).
+  license; exav does not bundle it. See the [WASM sandbox guide](/scanner/guides/wasm-sandbox/).
 
 ## The GPL signature database
 
@@ -31,7 +34,7 @@ exav does not bundle or redistribute the GPL-licensed ClamAV signature database.
 It can read the CVD format (reading a format is interoperability, not
 redistribution), but the signatures are fetched by you, with `freshclam` or
 `cvdupdate`, or with exav's `--auto-update` from a URL you supply.
-See [Signatures](/guides/signatures/).
+See [Signatures](/scanner/guides/signatures/).
 
 exav ships no signature database of its own, only a built-in EICAR test
 signature; real detection comes from databases you supply.

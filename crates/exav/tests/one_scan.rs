@@ -184,6 +184,111 @@ fn every_entry_point_scans_the_start_of_an_oversize_input_the_same_way() {
     assert!(line.ends_with("LIMITS-EXCEEDED ERROR"), "{line}");
 }
 
+/// Stdin and a FIFO are counted, profiled and bounded by `--max-process-bytes`
+/// as the same bytes in a file are.
+#[test]
+fn stdin_is_counted_profiled_and_bounded_as_a_file_is() {
+    let sigs = sig_dir();
+    let mut blob = PAYLOAD.to_vec();
+    blob.extend(vec![b'.'; 1 << 20]);
+
+    // The summary, less the time it took.
+    let summary = |out: &str| -> Vec<String> {
+        out.lines()
+            .skip_while(|l| !l.contains("SCAN SUMMARY"))
+            .filter(|l| !l.starts_with("Time:"))
+            .map(str::to_string)
+            .collect()
+    };
+    let runs = cli_verdicts(sigs.path(), &blob, &[]);
+    let file = summary(&runs[0].2);
+    assert!(
+        file.iter().any(|l| l == "Data scanned: 1.00 MB"),
+        "{file:?}"
+    );
+    for (how, _, out) in &runs[1..] {
+        assert_eq!(summary(out), file, "{how}");
+    }
+
+    // The CSV row, less its name and its timings.
+    let row = |out: &str| -> Vec<String> {
+        let mut lines = out.lines();
+        let (head, row) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+        head.split(',')
+            .zip(row.split(','))
+            .filter(|(h, _)| *h != "file" && !h.ends_with("_us"))
+            .map(|(h, v)| format!("{h}={v}"))
+            .collect()
+    };
+    let runs = cli_verdicts(sigs.path(), &blob, &["--profile"]);
+    let file = row(&runs[0].2);
+    assert!(file.iter().any(|c| c == "verdict=infected"), "{file:?}");
+    for (how, _, out) in &runs[1..] {
+        assert_eq!(row(out), file, "{how}: {out}");
+    }
+
+    // A PE larger than the quarter of 128M a scan may hold in one object.
+    let mut pe = vec![0u8; 40 << 20];
+    pe[..2].copy_from_slice(b"MZ");
+    pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+    pe[0x44..0x46].copy_from_slice(&0x14cu16.to_le_bytes());
+    for (how, code, out) in cli_verdicts(sigs.path(), &pe, &["--max-process-bytes", "128M"]) {
+        assert!(out.contains("deep-analysis limit"), "{how}: {out}");
+        assert_eq!(code, 3, "{how}: {out}");
+    }
+    // The cap is what made it a limit.
+    for (how, code, out) in cli_verdicts(sigs.path(), &pe, &[]) {
+        assert_eq!(code, 0, "{how}: {out}");
+    }
+}
+
+/// All-match over an object past `--max-object-bytes` still lists every
+/// detection, from the CLI on every entry point and from `ALLMATCHSCAN`.
+#[test]
+fn all_matches_lists_every_detection_past_the_object_limit() {
+    let sigs = sig_dir();
+    let mut blob = PAYLOAD.to_vec();
+    blob.extend(vec![b'.'; 512 * 1024]);
+    blob.extend_from_slice(PAYLOAD2);
+    let limit = ["--max-object-bytes", "64K"];
+    let found = |out: &str| -> Vec<String> {
+        let mut v: Vec<String> = out
+            .lines()
+            .filter_map(|l| {
+                l.strip_suffix(" FOUND")?
+                    .rsplit_once(": ")
+                    .map(|(_, s)| s.to_string())
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for (how, code, out) in cli_verdicts(
+        sigs.path(),
+        &blob,
+        &[&limit[..], &["--all-matches"]].concat(),
+    ) {
+        assert_eq!(
+            found(&out),
+            ["Exav.Test.Wild", "Exav.Test.Wild2"],
+            "{how}: {out}"
+        );
+        assert_eq!(code, 1, "{how}: {out}");
+    }
+
+    let d = Daemon::start(sigs.path(), &limit);
+    let f = d._dir.path().join("two.bin");
+    std::fs::write(&f, &blob).unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(format!("zALLMATCHSCAN {}\0", f.display()).as_bytes())
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let out = String::from_utf8_lossy(&out).replace('\0', "\n");
+    assert_eq!(found(&out), ["Exav.Test.Wild", "Exav.Test.Wild2"], "{out}");
+}
+
 /// Options that only the file path used to honour reach stdin too.
 #[test]
 fn stdin_gets_the_options_a_file_gets() {

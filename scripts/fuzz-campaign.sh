@@ -32,7 +32,10 @@ WORK="${WORK:-$ROOT/tmp/data}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 CODEGEN_UNITS="${CODEGEN_UNITS:-16}"
 # Order matters when a campaign is cut short: the broadest targets run first.
-TARGETS="${TARGETS:-analyze full_pipeline unpack x86_decode pe_emulator imagehash bytecode sigs ndb_compile cvd pe filetype rar3_ppmd parser_recursion}"
+TARGETS="${TARGETS:-analyze full_pipeline unpack x86_decode pe_emulator imagehash drawing cad_dxf cad_dwg ifc bytecode sigs ndb_compile cvd pe filetype rar3_ppmd parser_recursion}"
+# Seeds from the test fixtures (scripts/fuzz-seeds.sh), unmasked, so outside
+# the repository.
+SEEDS="${SEEDS:-${XDG_CACHE_HOME:-$HOME/.cache}/exav-fuzz-seeds}"
 
 n=$(printf '%s\n' $TARGETS | wc -l)
 slice=$((TOTAL / n))
@@ -40,6 +43,7 @@ slice=$((TOTAL / n))
 
 echo "campaign: $n targets x ${slice}s"
 mkdir -p "$WORK"
+scripts/fuzz-seeds.sh "$SEEDS" || exit 1
 
 # Build every target up front, and refuse to start if any fails. A campaign
 # that runs `cargo fuzz run` per target and pipes the output away turns a
@@ -65,7 +69,7 @@ for t in $TARGETS; do
   mkdir -p "$corpus"
   # Read-only seed dirs; new inputs go to the first corpus dir only.
   seeds=""
-  [ "$t" = imagehash ] && seeds="crates/exav-imagehash/tests/fixtures/img fuzz/seeds/imagehash"
+  [ -d "$SEEDS/$t" ] && seeds="$SEEDS/$t"
   echo "=== $t (${slice}s, corpus $(find "$corpus" -type f | wc -l) inputs) ==="
   # -timeout is the DoS threshold; -rss_limit_mb catches runaway allocation.
   # The ignore_* flags are what make this a batch run rather than a bisect.

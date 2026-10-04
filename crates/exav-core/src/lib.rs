@@ -410,10 +410,12 @@ fn unpack_target(
         }
         return Some(fmt);
     }
-    // Formats with no ClamAV `CL_TYPE_*` of their own (disk images and Unix
-    // `compress`) are typed `Unknown`, so `unpack_format` cannot reach them.
-    // They still hold real content (a compressed QCOW2 cluster or a `.Z` stream
-    // shows none of its payload in the file's bytes), so dispatch them straight
+    // Formats with no ClamAV `CL_TYPE_*` of their own (disk images, Unix
+    // `compress`, DXF and DWG drawings) are typed `Unknown` (or text, for an
+    // ASCII DXF), so `unpack_format` cannot reach them. They still hold real
+    // content (a compressed QCOW2 cluster, a `.Z` stream or a DXF's
+    // hex-encoded OLE object shows none of its payload in the file's bytes,
+    // a DWG's preview is a bitmap without its file header), so dispatch them straight
     // from the magic. Compat mode leaves them off: stock ClamAV opens none of
     // them, and extracting more there would be counted as a disagreement.
     let detected = || facts.format();
@@ -1278,8 +1280,11 @@ impl Scanner {
         // extractor's stronger magic check (block magic for bzip2, zero
         // `reserved1` for CAB, deflate CM + flag bits for gzip, the header CRC
         // for ARJ) before trusting the typing; a false hit is scanned as raw bytes.
+        // A bzip2 or xz magic is also how a UDIF disk image whose data fork
+        // opens with its first run starts, which `detect` types by its trailer.
         let false_archive = match ft {
             FileType::Bzip2 => facts.format() != Some(unpack::Format::Bzip2),
+            FileType::Xz => facts.format() != Some(unpack::Format::Xz),
             FileType::Cab => facts.format() != Some(unpack::Format::Cab),
             FileType::Gzip => facts.format() != Some(unpack::Format::Gzip),
             FileType::Arj => facts.format() != Some(unpack::Format::Arj),
@@ -1711,7 +1716,11 @@ fn read_member(
     let mut head = rdr.take(cap.saturating_add(1));
     match head.read_to_end(&mut buf) {
         Err(e) if unpack::is_budget_overflow(&e) => return Err(over_budget()),
-        Err(e) if verify_checksums || buf.is_empty() => {
+        // Nothing decoded before an error that hides nothing (the input ran
+        // out inside the first block, say) is an empty prefix, not a failure.
+        Err(e)
+            if verify_checksums || (buf.is_empty() && unpack::decode_error_hides_content(&e)) =>
+        {
             tally
                 .unscannable
                 .get_or_insert_with(|| format!("member decode error: {e}"));
@@ -2151,6 +2160,9 @@ fn report_of_outcome(
 fn unfinished(opts: &ScanOptions) -> Option<DeepOutcome> {
     if let Some(reason) = engine::scan_over_size() {
         return Some(limits_outcome(opts, unpack::LimitKind::MaxFileSize, reason));
+    }
+    if let Some(reason) = engine::scan_capped() {
+        return Some(limits_outcome(opts, unpack::LimitKind::MaxFiles, reason));
     }
     engine::scan_was_truncated().then(|| DeepOutcome::Limits(SEARCH_INCOMPLETE.into()))
 }
@@ -2983,13 +2995,18 @@ fn scan_archive(
             embedded: true,
             ..obj.inner(obj.container)
         };
-        for off in facts.embedded().pe {
+        let embedded = facts.embedded();
+        for off in embedded.pe {
             let sub = &byte_source::Sub::new(data, off, data.len() - off);
             match scan_found(db, sub, carved, opts, budget, findings, sink) {
                 DeepOutcome::Clean => {}
                 o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
                 o => defer(&mut outcome, o),
             }
+        }
+        // Only PE images are carved here, so only their cap counts.
+        if embedded.pe_capped {
+            engine::mark_capped(carving_capped);
         }
     }
     outcome
@@ -3266,6 +3283,7 @@ fn scan_file(
         };
         // Every candidate of every kind, found in one read of the object.
         let embedded = facts.embedded();
+        let capped = embedded.pe_capped || embedded.others_capped;
         let images = embedded
             .pe
             .into_iter()
@@ -3325,6 +3343,12 @@ fn scan_file(
                 // against `clamscan`, which reports such carriers clean. Move on.
                 _ => {}
             }
+        }
+
+        // Past a cap, an embedded image or archive was not scanned: without
+        // this, padding a dropper with decoys would hide the real payload.
+        if capped {
+            engine::mark_capped(carving_capped);
         }
     }
 
@@ -3616,6 +3640,16 @@ fn whole<'a>(
         engine::mark_over_size(|| over_size(data.len(), opts, &format!("{what} did not run")));
     }
     whole
+}
+
+/// Why an object carving reached its cap on is not fully scanned.
+fn carving_capped() -> String {
+    format!(
+        "more embedded files than carving scans in one object ({} executables of \
+         each kind, {} archives): the rest were not scanned",
+        pe::MAX_EMBEDDED_PE,
+        pe::MAX_EMBEDDED_ARCHIVES,
+    )
 }
 
 /// Why something was skipped on an object of `len` bytes: it is over the
@@ -4541,7 +4575,10 @@ mod tests {
             "l.ldb",
             "Test.ZipLdb;Engine:51-255,Target:0;0&1;7061796c6f6164;6d61726b6572\n",
         )]);
-        assert_eq!(infected_as(&seekable(&ldb, &zip, &opts)), Some("Test.ZipLdb"));
+        assert_eq!(
+            infected_as(&seekable(&ldb, &zip, &opts)),
+            Some("Test.ZipLdb")
+        );
         assert_eq!(
             infected_as(&scan_path(&ldb, &path, &opts).unwrap().verdict),
             Some("Test.ZipLdb")
@@ -4552,7 +4589,10 @@ mod tests {
                 "r.yar",
                 "rule zip_name { strings: $a = \"payload_marker\" condition: $a }\n",
             )]);
-            assert_eq!(infected_as(&seekable(&yara, &zip, &opts)), Some("YARA.zip_name"));
+            assert_eq!(
+                infected_as(&seekable(&yara, &zip, &opts)),
+                Some("YARA.zip_name")
+            );
         }
     }
 
@@ -4630,14 +4670,19 @@ mod tests {
             ("a.ndb", "Test.Noisy:0:*:6e6f697379626974\n"),
             ("a.ign", "a.ndb:1:Test.Noisy\n"),
         ]);
-        let dir = crate::tmpfile::TempDir::new().unwrap();
-        let path = dir.path().join("t.zip");
-        std::fs::write(&path, &zip).unwrap();
         for v in [
             analyze(&db, &zip, &opts).verdict,
             seekable(&db, &zip, &opts),
-            scan_path(&db, &path, &opts).unwrap().verdict,
         ] {
+            assert_eq!(infected_as(&v), Some("Eicar-Test-Signature"), "{v:?}");
+        }
+        // No temp directory under WASI.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let dir = crate::tmpfile::TempDir::new().unwrap();
+            let path = dir.path().join("t.zip");
+            std::fs::write(&path, &zip).unwrap();
+            let v = scan_path(&db, &path, &opts).unwrap().verdict;
             assert_eq!(infected_as(&v), Some("Eicar-Test-Signature"), "{v:?}");
         }
     }
@@ -4669,14 +4714,21 @@ mod tests {
     #[test]
     #[cfg(all(feature = "yara", any(feature = "zip", feature = "all-formats")))]
     fn yara_sees_a_top_level_archives_name() {
-        let db = db_from(&[("r.yar", "rule by_ext { condition: extension == \".zip\" }\n")]);
+        let db = db_from(&[(
+            "r.yar",
+            "rule by_ext { condition: extension == \".zip\" }\n",
+        )]);
         let zip = build_zip(&[("a.txt", b"nothing")]);
         let opts = ScanOptions {
             filename: Some("/srv/in/t.zip".to_string()),
             ..ScanOptions::default()
         };
-        assert_eq!(infected_as(&seekable(&db, &zip, &opts)), Some("YARA.by_ext"));
-        let (all, _) = analyze_all_seekable(&db, Cursor::new(&zip), zip.len() as u64, &opts).unwrap();
+        assert_eq!(
+            infected_as(&seekable(&db, &zip, &opts)),
+            Some("YARA.by_ext")
+        );
+        let (all, _) =
+            analyze_all_seekable(&db, Cursor::new(&zip), zip.len() as u64, &opts).unwrap();
         assert!(all.iter().any(|(n, _)| n == "YARA.by_ext"), "{all:?}");
         assert_eq!(seekable(&db, &zip, &ScanOptions::default()), Verdict::Clean);
     }
@@ -4704,11 +4756,17 @@ mod tests {
         };
         assert!((png.len() as u64) < opts.deep_analysis_max);
         assert!(
-            matches!(analyze(&db, &png, &opts).verdict, Verdict::LimitsExceeded { .. }),
+            matches!(
+                analyze(&db, &png, &opts).verdict,
+                Verdict::LimitsExceeded { .. }
+            ),
             "{:?}",
             analyze(&db, &png, &opts).verdict
         );
-        assert_eq!(analyze(&db, &png, &ScanOptions::default()).verdict, Verdict::Clean);
+        assert_eq!(
+            analyze(&db, &png, &ScanOptions::default()).verdict,
+            Verdict::Clean
+        );
     }
 
     /// No object is held in memory past `--max-object-bytes`, a container its
@@ -4720,8 +4778,14 @@ mod tests {
     fn the_object_limit_also_bounds_a_container_read_whole() {
         use std::io::Write;
         let mut cf = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
-        cf.create_stream("/pad").unwrap().write_all(&[b'.'; 20000]).unwrap();
-        cf.create_stream("/payload").unwrap().write_all(b"harmless").unwrap();
+        cf.create_stream("/pad")
+            .unwrap()
+            .write_all(&[b'.'; 20000])
+            .unwrap();
+        cf.create_stream("/payload")
+            .unwrap()
+            .write_all(b"harmless")
+            .unwrap();
         let ole = cf.into_inner().into_inner();
         let db = Scanner::builtin();
         let opts = ScanOptions::default();
@@ -4731,7 +4795,10 @@ mod tests {
             ..opts
         };
         assert!(opts.limits.max_buffer_bytes > ole.len() as u64);
-        for v in [seekable(&db, &ole, &opts), analyze(&db, &ole, &opts).verdict] {
+        for v in [
+            seekable(&db, &ole, &opts),
+            analyze(&db, &ole, &opts).verdict,
+        ] {
             assert!(matches!(v, Verdict::LimitsExceeded { .. }), "{v:?}");
         }
     }
@@ -4747,7 +4814,11 @@ mod tests {
             let crc = body.iter().fold(0u16, |mut crc, &b| {
                 crc ^= b as u16;
                 for _ in 0..8 {
-                    crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xA001
+                    } else {
+                        crc >> 1
+                    };
                 }
                 crc
             });
@@ -4773,11 +4844,17 @@ mod tests {
         let opts = ScanOptions::default();
         let clean = lha(b"hello there");
         assert!(
-            matches!(analyze(&db, &clean, &opts).verdict, Verdict::Unscannable { .. }),
+            matches!(
+                analyze(&db, &clean, &opts).verdict,
+                Verdict::Unscannable { .. }
+            ),
             "{:?}",
             analyze(&db, &clean, &opts).verdict
         );
-        assert!(matches!(seekable(&db, &clean, &opts), Verdict::Unscannable { .. }));
+        assert!(matches!(
+            seekable(&db, &clean, &opts),
+            Verdict::Unscannable { .. }
+        ));
         let infected = lha(eicar());
         assert!(infected_as(&analyze(&db, &infected, &opts).verdict).is_some());
     }
@@ -4812,18 +4889,30 @@ mod tests {
     fn an_allowlisted_file_is_clean_on_every_scan_path() {
         let zip = build_zip(&[("b.txt", eicar())]);
         let d = digests_of(&zip);
+        // No temp directory under WASI: the scan of a path is native only.
+        #[cfg(not(target_family = "wasm"))]
         let dir = crate::tmpfile::TempDir::new().unwrap();
+        #[cfg(not(target_family = "wasm"))]
         let path = dir.path().join("t.zip");
+        #[cfg(not(target_family = "wasm"))]
         std::fs::write(&path, &zip).unwrap();
         let opts = ScanOptions::default();
         for (file, line) in [
             ("x.fp", format!("{}:{}:Allowed\n", d.md5_hex(), zip.len())),
-            ("x.sfp", format!("{}:{}:Allowed\n", d.sha256_hex(), zip.len())),
+            (
+                "x.sfp",
+                format!("{}:{}:Allowed\n", d.sha256_hex(), zip.len()),
+            ),
         ] {
             let db = db_from(&[(file, &line)]);
             assert_eq!(analyze(&db, &zip, &opts).verdict, Verdict::Clean, "{file}");
             assert_eq!(seekable(&db, &zip, &opts), Verdict::Clean, "{file}");
-            assert_eq!(scan_path(&db, &path, &opts).unwrap().verdict, Verdict::Clean, "{file}");
+            #[cfg(not(target_family = "wasm"))]
+            assert_eq!(
+                scan_path(&db, &path, &opts).unwrap().verdict,
+                Verdict::Clean,
+                "{file}"
+            );
         }
         // The entry is what clears it.
         assert!(infected_as(&seekable(&Scanner::builtin(), &zip, &opts)).is_some());
@@ -4871,7 +4960,10 @@ mod tests {
             "Test.Pcre;Engine:81-255,Target:0;0&1;6f6e6c79;0/only[0-9]+pcre/\n",
         )];
         if cfg!(feature = "yara") {
-            rules.push(("r.yar", "rule big_y { strings: $a = \"yara-only-marker\" condition: $a }\n"));
+            rules.push((
+                "r.yar",
+                "rule big_y { strings: $a = \"yara-only-marker\" condition: $a }\n",
+            ));
         }
         let more = db_from(&rules);
         let mut pcre = b"xx only42pcre xx".to_vec();

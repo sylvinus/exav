@@ -39,7 +39,11 @@ fn crb_blocklist_flags_signed_pe() {
 fn a_signed_pe_whose_section_runs_past_the_file_is_still_checked() {
     let subj = "2c190fb742c4be7399e7706dd24610807dc9860c";
     let mut loader = exav_core::loader::Builder::new();
-    loader.add_named_bytes("block.crb", format!("Malware.StolenCert;0;{subj};\n").as_bytes(), true);
+    loader.add_named_bytes(
+        "block.crb",
+        format!("Malware.StolenCert;0;{subj};\n").as_bytes(),
+        true,
+    );
     let db = loader.build().expect("build db");
 
     let mut pe = fixture("signed_mismatch.exe");

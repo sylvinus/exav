@@ -23,12 +23,14 @@ jobs:
       # examples and the `bytecode_gating` integration test) is excluded from the
       # default build, so lint it in a dedicated pass.
       - run: cargo clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --features dwg -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings
       # The full native test matrix, every feature pass. Defined once in the
       # Makefile so this and a local `make test` can't drift.
       - run: make test-native
 
-  # The promised floor is `rust-version` in Cargo.toml (1.91, imposed by
-  # yara-x-parser). `make msrv` reads it there and installs that toolchain on
+  # The promised floor is `rust-version` in Cargo.toml (1.92, imposed by the
+  # hayro image decoders). `make msrv` reads it there and installs that toolchain on
   # demand, so a bump flows through with no edit here, and a contributor on
   # stable can't land a newer feature without this going red.
   msrv:
@@ -101,6 +103,15 @@ jobs:
         with:
           node-version: 22
       - run: make test-js
+      # @exav/viewer: its wasm modules and its archive plugin's peer
+      # (exav-unpack-wasm's pkg/, which test-js built with test-only features)
+      # are rebuilt from source, with the wasm-bindgen-cli its Cargo.toml pins,
+      # and its demo is driven in Chromium, its sandboxed frame in Chromium,
+      # Firefox and WebKit. See scripts/test-viewer.sh.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+      - run: make test-viewer
 
   docs:
     runs-on: ubuntu-latest
@@ -141,6 +152,12 @@ jobs:
         run: |
           cargo deny --manifest-path crates/exav-unpack-wasm/Cargo.toml \
             --config deny.toml check advisories bans sources licenses
+      # The viewer's wasm modules, also its own workspace. Every feature: the
+      # DWG module is not a default.
+      - name: cargo-deny (viewer)
+        run: |
+          cargo deny --manifest-path crates/exav-viewer/Cargo.toml --all-features \
+            --config deny.toml check advisories bans sources licenses
 
   fuzz-smoke:
     runs-on: ubuntu-latest
@@ -151,11 +168,15 @@ jobs:
       - name: cargo-fuzz smoke run
         run: |
           cargo install cargo-fuzz --locked
-          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion; do
-            cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+          # Seeded from the test fixtures where they match a target's input:
+          # random bytes rarely get past a header. Outside the checkout, as
+          # the masked fixtures are unmasked.
+          seeds="$RUNNER_TEMP/fuzz-seeds"
+          scripts/fuzz-seeds.sh "$seeds"
+          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion imagehash drawing cad_dxf cad_dwg ifc; do
+            mkdir -p "fuzz/corpus/$t"
+            extra=""
+            [ -d "$seeds/$t" ] && extra="$seeds/$t"
+            cargo +nightly fuzz run "$t" "fuzz/corpus/$t" $extra \
+              -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
           done
-          # Seeded: random bytes rarely get past an image header.
-          mkdir -p fuzz/corpus/imagehash
-          cargo +nightly fuzz run imagehash fuzz/corpus/imagehash \
-            crates/exav-imagehash/tests/fixtures/img fuzz/seeds/imagehash \
-            -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10

@@ -93,7 +93,7 @@ unrecognised one is a startup error, not a policy that silently never fires.
 
 **`ok` is never silent.** The listener says so at startup, and every such object
 is logged with its category and reason. That is what keeps [never a silent
-clean](https://exav.org/concepts/design-principles/#never-a-silent-clean) intact
+clean](https://exav.org/scanner/concepts/design-principles/#never-a-silent-clean) intact
 rather than switched off.
 
 **A detection is never folded.** This governs only the three categories above.

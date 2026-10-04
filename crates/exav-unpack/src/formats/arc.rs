@@ -18,10 +18,11 @@
 //! original 1985 layout, which has no `orig_size` field, so its header is four
 //! bytes shorter.
 //!
-//! Every member carries a **CRC-16 of its uncompressed bytes**, and exav checks
-//! it on each one. That is what makes the less-common methods safe to attempt: a
-//! decoder that is subtly wrong produces plausible bytes rather than an error,
-//! and without the check those bytes would be scanned as if they were the file.
+//! Every member carries a **CRC-16 of its uncompressed bytes**. A member that
+//! decodes in full and fails it is scanned all the same, as a ZIP member
+//! failing its CRC-32 is; with checksums verified
+//! (`Budget::set_verify_checksums`) it is reported instead. The tests compare
+//! decoded members with the files that went in.
 
 use crate::{Budget, Entry, LimitHit, Sink};
 
@@ -389,13 +390,27 @@ pub(crate) fn extract_arc<R>(
             }
         } else {
             let decoded = decode(method, body, orig_size);
-            // The archive records a CRC-16 per member. A decoder that is subtly
-            // wrong yields plausible bytes rather than an error, so this is what
-            // separates content from garbage.
+            // `Some` is the whole body decoded. A CRC-16 or size mismatch after
+            // that hides nothing: the bytes are scanned, as a ZIP member's are,
+            // and reported only when checksums are verified.
             let entry = match decoded {
-                Some(b) if b.len() == orig_size && crc16(&b) == crc => {
-                    budget.commit(b.len() as u64);
-                    Entry::new(name, b)
+                Some(b)
+                    if !budget.should_verify_checksums()
+                        || (b.len() == orig_size && crc16(&b) == crc) =>
+                {
+                    // A stored body is as long as the member's packed size,
+                    // whatever its original size says.
+                    if b.len() > cap {
+                        Entry::unsupported(
+                            name,
+                            comp_size as u64,
+                            false,
+                            "ARC member exceeds the per-member size budget",
+                        )
+                    } else {
+                        budget.commit(b.len() as u64);
+                        Entry::new(name, b)
+                    }
                 }
                 Some(_) => Entry::unsupported(
                     name,

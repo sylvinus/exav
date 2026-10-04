@@ -26,6 +26,13 @@ impl Display for DecoderError {
     }
 }
 
+impl DecoderError {
+    /// A block's bits ran out before it was whole.
+    pub(crate) fn is_truncated(&self) -> bool {
+        matches!(self, DecoderError::Block(e) if e.is_truncated())
+    }
+}
+
 impl From<HeaderError> for DecoderError {
     fn from(err: HeaderError) -> Self {
         DecoderError::Header(err)

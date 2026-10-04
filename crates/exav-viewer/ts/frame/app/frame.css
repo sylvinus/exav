@@ -1,0 +1,13 @@
+/* The frame's page: one surface, filling the iframe. */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+.exv-frame-root {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}

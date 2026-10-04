@@ -11,7 +11,7 @@ tools:
   to `sigtool --fuzzy-img` from ClamAV 1.4.6 and 1.5.4. exav's scanner uses it.
 - **imagehash**: Python `imagehash.phash(Image.open(f))` with its defaults.
 
-It is in each [release](/getting-started/installation/#prebuilt-binaries), as
+It is in each [release](/scanner/getting-started/installation/#prebuilt-binaries), as
 `exav-imagehash-<tag>-<target>`, or:
 
 ```bash
@@ -75,11 +75,13 @@ Checked against the tools themselves:
 
 ## Formats
 
-PNG, GIF, JPEG, TIFF and BMP, and WebP, ICO, PNM, QOI, DDS, farbfeld and
-Radiance HDR, each a Cargo feature on by default, recognised from their first
-bytes. `sigtool --fuzzy-img` hashes all of them, and OpenEXR, which this crate
-leaves out: its decoder brings `rayon-core` and `smallvec`, crates with
-`unsafe`.
+PNG, GIF, JPEG, TIFF and BMP, and WebP, ICO, PNM, QOI, DDS, farbfeld,
+Radiance HDR, JPEG 2000 and JBIG2, each a Cargo feature on by default,
+recognised from their first bytes. `sigtool --fuzzy-img` hashes all of them
+but JPEG 2000 and JBIG2, and OpenEXR, which this crate leaves out: its decoder
+brings `rayon-core` and `smallvec`, crates with `unsafe`. The hash is one of
+pixels, so a JPEG 2000 or JBIG2 image hashes as the same pixels do in a PNG,
+and a signature `sigtool --fuzzy-img` made from that PNG matches it.
 
 clamscan, scanning, takes only the first five for graphics (`Target:5`), and
 hashes nothing else. exav does the same under `--clamav-compat`; otherwise
@@ -89,7 +91,8 @@ against all of them.
 ## Safety
 
 The crate is `#![forbid(unsafe_code)]`, and its decoders have no `unsafe`:
-png, gif, image-webp and qoi forbid it, `image`'s own (BMP, ICO, PNM, DDS,
+png, gif, image-webp, qoi, hayro-jpeg2000 and hayro-jbig2 (built without
+their `simd` feature) forbid it, `image`'s own (BMP, ICO, PNM, DDS,
 farbfeld, HDR) use none, and zune-jpeg's only `unsafe` is its SIMD code, which
 `image` and `tiff` turn on with no way to turn it off from outside, so the
 crate vendors `image`'s JPEG and TIFF decoders and `tiff`'s, over zune-jpeg
@@ -137,6 +140,11 @@ let d = h.distance(&other);                          // None between sizes
 `hash_rgb8`, `hash_rgba8` and `hash_gray` take decoded pixels, for a caller
 with a decoder of its own; only the grey conversion, the resize and the DCT
 then apply.
+
+The command is the `cli` feature, on by default with every format past the
+first five (`webp`, `ico`, `pnm`, `qoi`, `dds`, `ff`, `hdr`, `jp2`, `jbig2`);
+a library consumer can turn default features off and pick the formats it
+needs.
 
 Building exav without its `image-hash` feature leaves this crate out, and
 loads `fuzzy_img#` signatures as unsupported.

@@ -3,7 +3,9 @@
 //! Every EGG block records a CRC-32 of its *decompressed* bytes, written by
 //! ESTsoft's compressor. A decoder that produces plausible-but-wrong output —
 //! the failure mode this project cares about, because it is silent — cannot
-//! match it. So `Entry::new` here means "these bytes reproduce the checksum the
+//! match it. The extractor scans a block that fails its CRC all the same, so
+//! `members` checks every decoded member against the CRC-32s the blocks
+//! record: a decoded member here means "these bytes reproduce the checksum the
 //! writer recorded", not "our decoder is happy with itself".
 //!
 //! Fixtures are from the MIT-licensed `EggDotNet` test corpus.
@@ -13,6 +15,8 @@
 use super::extract_each;
 use exav_unpack::{Budget, Entry, Format, Limits};
 
+/// The members, each one decoded (not reported unsupported) checked to
+/// match a CRC-32 some block header of `blob` records.
 fn members(blob: &[u8]) -> Vec<Entry> {
     let mut budget = Budget::new(Limits::default());
     let mut out = Vec::new();
@@ -25,7 +29,27 @@ fn members(blob: &[u8]) -> Vec<Entry> {
             None
         },
     );
+    let recorded = recorded_crcs(blob);
+    for e in out.iter().filter(|e| e.unsupported.is_none()) {
+        let mut crc = flate2::Crc::new();
+        crc.update(&e.data);
+        assert!(
+            recorded.contains(&crc.sum()),
+            "'{}' decoded to bytes no block's CRC-32 matches",
+            e.name
+        );
+    }
     out
+}
+
+/// The CRC-32 of every block header (magic `0x02B50C13`, then algorithm,
+/// hint, the two sizes, the CRC: EGG Format Specification 1.0).
+fn recorded_crcs(blob: &[u8]) -> Vec<u32> {
+    let magic = 0x02B5_0C13u32.to_le_bytes();
+    blob.windows(18)
+        .filter(|w| w[..4] == magic)
+        .map(|w| u32::from_le_bytes(w[14..18].try_into().unwrap()))
+        .collect()
 }
 
 macro_rules! fixture {
@@ -83,8 +107,9 @@ fn no_fixture_scans_clean() {
 
 #[test]
 fn a_deflate_member_decodes_to_its_recorded_checksum() {
-    // `Entry::new` is only produced on a CRC match, so reaching one at all is
-    // the assertion — the decode agreed with ESTsoft's compressor.
+    // `members` checks each decoded member against the recorded CRCs, so
+    // reaching one at all is the assertion: the decode agreed with ESTsoft's
+    // compressor.
     let m = members(fixture!("posix_small.egg"));
     let decoded: Vec<&Entry> = m.iter().filter(|e| e.unsupported.is_none()).collect();
     assert!(
@@ -127,7 +152,7 @@ fn lzma_members_decode_to_their_recorded_checksums() {
 
 #[test]
 fn every_decoded_member_is_non_empty() {
-    // A zero-length `Entry::new` would mean the CRC matched an empty decode —
+    // A zero-length decoded member would mean the CRC matched an empty decode,
     // which is how a decoder that quietly produces nothing still looks green.
     for (name, blob) in corpus() {
         for e in members(blob) {

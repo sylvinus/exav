@@ -1,6 +1,6 @@
 //! RAR3 (unpack29) decompression CRC validation harness.
 //!
-//! For every RAR4-signature sample under `corpus/samples/_bulk/rar/*.bin` this
+//! For every RAR4-signature sample in `$EXAV_DEBUG_RAR_CORPUS/*.bin` this
 //! parses the RAR4 file blocks, decompresses each unpack29 LZ member through the
 //! crate's `extract_rar`, and compares the output's CRC-32 against the
 //! FILE_CRC stored in the file header.
@@ -123,7 +123,11 @@ fn check_archive(data: &[u8]) -> (u32, u32, u32, u32, u32) {
 }
 
 fn main() {
-    let dir = Path::new("corpus/samples/_bulk/rar");
+    let Some(dir) = std::env::var_os("EXAV_DEBUG_RAR_CORPUS") else {
+        eprintln!("set EXAV_DEBUG_RAR_CORPUS to the directory of the *.bin samples");
+        return;
+    };
+    let dir = Path::new(&dir);
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {

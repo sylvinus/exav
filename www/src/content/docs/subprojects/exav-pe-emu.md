@@ -26,7 +26,7 @@ match report.unpacked {
 ## CLI
 
 The crate also ships an `exav-pe-emu` command. It is in each
-[release](/getting-started/installation/#prebuilt-binaries), as
+[release](/scanner/getting-started/installation/#prebuilt-binaries), as
 `exav-pe-emu-<tag>-<target>`, or:
 
 ```bash
@@ -51,7 +51,7 @@ against authors who change their format every build, and only covers packers
 someone has already reverse-engineered. But every packer has to rebuild the
 original program in memory and transfer control to it, or it would not run. That
 moment is packer-independent, and it is what this captures. Coverage measured on
-real packers is on the [PE stub emulation](/concepts/pe-emulation/#measured-coverage)
+real packers is on the [PE stub emulation](/scanner/concepts/pe-emulation/#measured-coverage)
 page.
 
 ## What is emulated

@@ -1,4 +1,5 @@
 use super::*;
+use image::ImageFormat;
 
 fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
     let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
@@ -47,6 +48,57 @@ fn solid_black_is_all_zero() {
 fn a_jpeg_hashes_as_clamav_decodes_it() {
     let jpeg = include_bytes!("../tests/fixtures/decoder_sensitive.jpg");
     assert_eq!(clamav(jpeg).unwrap(), "fed581d5812a853b");
+}
+
+/// `sigtool --fuzzy-img` reads neither JPEG 2000 nor JBIG2, but the hash is
+/// one of pixels: these files hash as the PNGs they were losslessly encoded
+/// from do (exav-render's fixtures, see make.py there). The hashes are what
+/// sigtool (ClamAV 1.4.3) prints for those PNGs. They are not among
+/// clamscan's graphics.
+#[test]
+#[cfg(all(feature = "jp2", feature = "jbig2"))]
+fn jpeg_2000_and_jbig2_hash_as_the_same_pixels_in_a_png() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../exav-render/tests/fixtures/images"
+    );
+    let read = |name: &str| std::fs::read(format!("{dir}/{name}")).unwrap();
+    for (file, f, png, sigtool) in [
+        ("rgb.jp2", Format::Jpeg2000, "rgb.png", "f0a50fd80dda4b1e"),
+        ("rgb.j2k", Format::Jpeg2000, "rgb.png", "f0a50fd80dda4b1e"),
+        (
+            "generic.jb2",
+            Format::Jbig2,
+            "bilevel.png",
+            "d656ab50a9e9c82d",
+        ),
+        (
+            "generic-random.jb2",
+            Format::Jbig2,
+            "bilevel.png",
+            "d656ab50a9e9c82d",
+        ),
+    ] {
+        let data = read(file);
+        assert_eq!(Format::detect(&data), Some(f), "{file}");
+        assert_eq!(clamav(&read(png)).unwrap(), sigtool, "{png}");
+        assert_eq!(clamav(&data).unwrap(), sigtool, "{file}");
+        assert!(
+            Formats::ALL.contains(f) && Formats::NONE.with(f).contains(f),
+            "{file}"
+        );
+        assert!(!Formats::CLAMAV_GRAPHICS.contains(f), "{file}");
+        let graphics = Hasher::with_params(Params {
+            formats: Formats::CLAMAV_GRAPHICS,
+            ..Params::CLAMAV
+        })
+        .unwrap();
+        assert_eq!(
+            graphics.hash(&data).map(|h| h.to_string()),
+            Err(Error::Unsupported),
+            "{file}"
+        );
+    }
 }
 
 #[test]

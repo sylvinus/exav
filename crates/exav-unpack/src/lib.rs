@@ -35,7 +35,8 @@
 //! # Safety
 //!
 //! This crate contains **no `unsafe` code**: the entire extraction layer,
-//! including the vendored PPMd7 sub-allocator (`formats/ppmd7/`), is 100% safe
+//! including the vendored PPMd sub-allocators (`formats/ppmd7/`,
+//! `formats/ppmd8/`), is 100% safe
 //! Rust over a bounds-checked byte arena. The forbid below is enforced
 //! crate-wide.
 #![forbid(unsafe_code)]
@@ -52,13 +53,36 @@ pub(crate) mod formats;
 #[allow(unused_imports)]
 use formats::*;
 
-#[cfg(any(feature = "gzip", feature = "zip", feature = "pdf", feature = "ole"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "zip",
+    feature = "pdf",
+    feature = "ole",
+    feature = "sevenz",
+    feature = "swf",
+    feature = "nsis",
+    feature = "alz",
+    feature = "egg",
+    feature = "hwp3",
+    feature = "xar",
+    feature = "diskimage",
+    feature = "upx",
+    feature = "dmg"
+))]
 mod inflate;
 pub mod profile;
 pub mod source;
 pub mod span;
 mod stream;
 pub mod volume;
+/// AutoCAD DWG's bit codes, sections and object records, for drawing
+/// readers. Feature `dwg`.
+#[cfg(feature = "dwg")]
+pub use formats::dwg;
+/// AutoCAD DXF's pairs, records and strings, for drawing readers. Feature
+/// `dxf`.
+#[cfg(feature = "dxf")]
+pub use formats::dxf;
 #[cfg(feature = "pdf")]
 pub use formats::has_obfuscated_name_object;
 #[allow(unused_imports)]
@@ -268,10 +292,12 @@ pub struct Budget {
     pub(crate) scanned: u64,
     /// Emulator instructions spent so far (see [`Limits::max_pe_emulation_steps`]).
     pub(crate) pe_emulation_steps: u64,
-    /// Candidate passwords tried (in order) when decrypting an encrypted member
-    /// (ZIP ZipCrypto/AES today). Empty by default: an encrypted member with no
-    /// password yields an `Entry::unsupported(encrypted=true, …)` so the scanner
-    /// reports `PasswordProtected`. The pool is the union of any `.pwdb` file and
+    /// Candidate passwords tried, in order, when decrypting an encrypted ZIP,
+    /// 7z, RAR, ARJ, PDF, DMG or Office member, before the built-in ones a
+    /// format has (a PDF's empty user password goes first). Empty by default:
+    /// a member no password opens yields an
+    /// `Entry::unsupported(encrypted=true, …)` so the scanner reports
+    /// `PasswordProtected`. The pool is the union of any `.pwdb` file and
     /// the runtime `ScanOptions::passwords`, threaded down by exav-core.
     pub passwords: Vec<String>,
     /// Verify container checksums (CRCs) during extraction. **Off by default**:
@@ -714,6 +740,13 @@ pub enum Format {
     AiModel,
     /// Microsoft Script Encoder (`#@~^` VBScript/JScript.Encode): decode.
     Screnc,
+    /// AutoCAD DXF drawing, ASCII or binary: the files it embeds in binary
+    /// chunks (an OLE2FRAME's object). See [`dxf`] (feature `dxf`).
+    Dxf,
+    /// AutoCAD DWG drawing, R13 to R2018: its preview images and
+    /// the objects its OLE2FRAMEs embed. A drawing of an older release is
+    /// one unsupported entry. See [`dwg`] (feature `dwg`).
+    Dwg,
 }
 
 impl Format {
@@ -785,6 +818,8 @@ impl Format {
         Format::JavaClass,
         Format::AiModel,
         Format::Screnc,
+        Format::Dxf,
+        Format::Dwg,
     ];
 }
 
@@ -866,6 +901,8 @@ mod format_all_tests {
                 Format::JavaClass => 42,
                 Format::AiModel => 43,
                 Format::Screnc => 44,
+                Format::Dxf => 66,
+                Format::Dwg => 67,
             }
         }
         let mut seen: Vec<u8> = Format::ALL.iter().map(|f| tag(*f)).collect();
@@ -873,7 +910,7 @@ mod format_all_tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            65,
+            67,
             "Format::ALL is missing a variant (or lists one twice)"
         );
     }
@@ -1037,9 +1074,12 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
             continue;
         }
         let run = data.range(start, end);
+        // Unpadded or damaged: the characters before any `=`, less a single
+        // leftover one, which encodes no whole byte.
+        let bare = j - start;
         let decoded = engine
             .decode(&run)
-            .or_else(|_| plain.decode(&run[..(j - start) / 4 * 4]));
+            .or_else(|_| plain.decode(&run[..bare - usize::from(bare % 4 == 1)]));
         if let Ok(dec) = decoded {
             if !dec.is_empty() && dec.len() as u64 <= cap {
                 out.push(dec);
@@ -1144,7 +1184,9 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
             continue;
         }
         // Executable-looking: now materialize the run (whitespace stripped) and
-        // decode the whole 4-char groups (dropping any partial tail / padding).
+        // decode it. The run stops before any `=`, so a padded payload ends in
+        // a partial group of 2 or 3 characters holding its last 1 or 2 bytes;
+        // a single leftover character encodes no whole byte and is dropped.
         let mut run: Vec<u8> = Vec::with_capacity(nb64);
         let mut at = start;
         while at < j {
@@ -1157,7 +1199,9 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
             );
             at = piece_end;
         }
-        run.truncate(run.len() / 4 * 4);
+        if run.len() % 4 == 1 {
+            run.pop();
+        }
         if let Ok(dec) = engine.decode(&run) {
             if dec.len() as u64 <= cap && is_executable_payload(&dec) {
                 out.push(dec);
@@ -1433,7 +1477,9 @@ fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> O
     // of a small archive. Only those `detect_probe` makes first: a later one,
     // such as RAR's, could be overruled by an earlier check that needs more.
     if let Some(fmt) = archive_magic(&src.window(0, 16)) {
-        return Some(fmt);
+        return Some(udif_or(fmt, src.len(), |off| {
+            src.window(off, 12).into_owned()
+        }));
     }
     let head = src.window(0, DETECT_HEAD);
     if head.len() == src.len() {
@@ -1480,6 +1526,24 @@ fn archive_magic(data: &[u8]) -> Option<Format> {
     None
 }
 
+/// `fmt`, the magic an object `len` bytes long starts with, or a DMG when that
+/// magic is bzip2's or xz's and the object ends in a UDIF `koly` trailer:
+/// hdiutil writes UDBZ and ULMO images with the data fork, so the file,
+/// opening on its first bzip2 or xz run. `read(off)` reads 12 bytes at `off`,
+/// and only for those two magics.
+fn udif_or(fmt: Format, len: usize, read: impl FnOnce(usize) -> Vec<u8>) -> Format {
+    #[cfg(feature = "dmg")]
+    if matches!(fmt, Format::Bzip2 | Format::Xz)
+        && len >= 512
+        && formats::dmg::is_koly(&read(len - 512))
+    {
+        return Format::Dmg;
+    }
+    #[cfg(not(feature = "dmg"))]
+    let _ = (len, read);
+    fmt
+}
+
 fn is_rar_magic(data: &[u8]) -> bool {
     data.starts_with(b"Rar!\x1a\x07\x00") || data.starts_with(b"Rar!\x1a\x07\x01\x00")
 }
@@ -1489,7 +1553,7 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     // well within `DETECT_HEAD`, so the start answers as the whole would.
     let data = p.head;
     if let Some(fmt) = archive_magic(data) {
-        return Some(fmt);
+        return Some(udif_or(fmt, p.len, |off| p.window(off, 12).into_owned()));
     }
     // CHM (ITSS): "ITSF" header magic at offset 0.
     #[cfg(feature = "chm")]
@@ -1688,6 +1752,19 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     #[cfg(feature = "rtf")]
     if data.starts_with(b"{\\rtf") {
         return Some(Format::Rtf);
+    }
+    // DXF: the binary sentinel, or a `0`/`SECTION` pair after comments.
+    #[cfg(feature = "dxf")]
+    if dxf::looks_like_dxf(data) {
+        return Some(Format::Dxf);
+    }
+    // DWG: a version ID, then section locators ending with their sentinel
+    // (R13 to R2000), an encrypted file header that decrypts (R2004 on) or
+    // a Reed-Solomon coded one that decodes (R2007). A release before R13
+    // too, which extraction reports as unsupported.
+    #[cfg(feature = "dwg")]
+    if dwg::looks_like_dwg(data) || dwg::pre_r13_version(data).is_some() {
+        return Some(Format::Dwg);
     }
     // Windows Shell Link (.lnk): fixed 20-byte prefix (HeaderSize 0x4C + CLSID).
     #[cfg(feature = "lnk")]
@@ -1890,6 +1967,8 @@ mod detect_source_tests {
             0xEF, 0xBE, 0xAD, 0xDE, b'N', b'u', b'l', b'l', b's', b'o', b'f', b't', b'I', b'n',
             b's', b't',
         ];
+        // A UDIF trailer's signature, version and size.
+        let koly = [b"koly".as_slice(), &[0, 0, 0, 4, 0, 0, 2, 0]].concat();
         // Each case needs its format's detection compiled in.
         let cases: Vec<(Vec<u8>, Option<Format>, bool)> = vec![
             (
@@ -1923,6 +2002,23 @@ mod detect_source_tests {
                 far(b"", b"koly", &[0; 508]),
                 Some(Format::Dmg),
                 cfg!(feature = "dmg"),
+            ),
+            // A UDIF image opening with its first bzip2 or xz run: the
+            // trailer outranks the magic, which alone stays a bare stream.
+            (
+                far(b"BZh91AY&SY", &koly, &[0; 500]),
+                Some(Format::Dmg),
+                cfg!(feature = "dmg"),
+            ),
+            (
+                far(b"\xFD7zXZ\0", &koly, &[0; 500]),
+                Some(Format::Dmg),
+                cfg!(feature = "dmg"),
+            ),
+            (
+                far(b"BZh91AY&SY", b"koly", &[0; 508]),
+                Some(Format::Bzip2),
+                true,
             ),
         ];
         for (i, (data, want, on)) in cases.iter().enumerate() {
@@ -2101,6 +2197,10 @@ pub(crate) fn dispatch_extract<R>(
         Format::AiModel => extract_aimodel(data, budget, visit),
         #[cfg(feature = "screnc")]
         Format::Screnc => extract_screnc(data, budget, visit),
+        #[cfg(feature = "dxf")]
+        Format::Dxf => formats::dxf::extract_dxf(data, budget, visit),
+        #[cfg(feature = "dwg")]
+        Format::Dwg => formats::dwg::extract_dwg(data, budget, visit),
         // A format whose extractor this build left out. (A format decoded as it
         // is read never reaches here when its extractor is compiled in.)
         _ => not_compiled_in(fmt, data, budget, visit),
@@ -2372,7 +2472,8 @@ pub const FIXTURE_MASK: u8 = 0x5A;
 /// samples: these fixtures are the corpus for an archive extractor, so wrapping
 /// them in archives would make the ZIP and 7z tests depend on working ZIP and
 /// decryption support to load their own inputs, and the `--no-default-features`
-/// build has neither compiled in.
+/// build has neither compiled in. Real-malware samples, which are never
+/// committed, are the exception (see [`read_fixture`]).
 ///
 /// Test support, not part of the stable API: may change in any release.
 #[doc(hidden)]
@@ -2387,6 +2488,12 @@ pub fn unmask_fixture(masked: &[u8]) -> Vec<u8> {
 /// ordinary tools. Missing-file errors name the plain path, which is the one a
 /// reader is looking for.
 ///
+/// When neither exists, `<path>.zip` is read as a real-malware sample: never
+/// committed, kept locally as a ZIP with its one member AES-encrypted under
+/// the password `infected` (MalwareBazaar's convention), and decrypted here in
+/// memory. A build without the `zip` and `decrypt` features cannot open it and
+/// returns an `Unsupported` error.
+///
 /// Test support, not part of the stable API: may change in any release.
 #[doc(hidden)]
 pub fn read_fixture(path: &str) -> std::io::Result<Vec<u8>> {
@@ -2394,7 +2501,41 @@ pub fn read_fixture(path: &str) -> std::io::Result<Vec<u8>> {
     if std::fs::exists(&masked)? {
         return Ok(unmask_fixture(&std::fs::read(&masked)?));
     }
+    let sealed = format!("{path}.zip");
+    if !std::fs::exists(path)? && std::fs::exists(&sealed)? {
+        return open_sample(&std::fs::read(&sealed)?);
+    }
     std::fs::read(path)
+}
+
+/// The password real-malware samples are kept under (see [`read_fixture`]).
+#[doc(hidden)]
+pub const SAMPLE_PASSWORD: &str = "infected";
+
+/// The one member of a sample ZIP, decrypted with [`SAMPLE_PASSWORD`].
+fn open_sample(zip: &[u8]) -> std::io::Result<Vec<u8>> {
+    #[cfg(all(feature = "zip", feature = "decrypt"))]
+    {
+        use std::io::{Error, ErrorKind};
+        let mut budget = Budget::with_passwords(Limits::default(), vec![SAMPLE_PASSWORD.into()]);
+        let mut entries = extract(Format::Zip, &zip, &mut budget)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e.reason))?;
+        match entries.as_slice() {
+            [e] if e.unsupported.is_none() => Ok(entries.remove(0).data),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "sample ZIP does not decrypt to one member",
+            )),
+        }
+    }
+    #[cfg(not(all(feature = "zip", feature = "decrypt")))]
+    {
+        let _ = zip;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a sample ZIP needs the zip and decrypt features",
+        ))
+    }
 }
 
 /// Read up to `cap` bytes; the returned flag is true if the source had more
@@ -2433,10 +2574,14 @@ pub(crate) fn checksum_mismatch(what: &'static str) -> std::io::Error {
 /// decoded. A stream that ends early (the rest is absent) or that decoded in
 /// full and failed its checksum hides nothing; damage part way does.
 pub fn decode_error_hides_content(e: &std::io::Error) -> bool {
-    e.kind() != std::io::ErrorKind::UnexpectedEof
-        && !e
-            .get_ref()
-            .is_some_and(|inner| inner.is::<ChecksumMismatch>())
+    e.kind() != std::io::ErrorKind::UnexpectedEof && !is_checksum_mismatch(e)
+}
+
+/// Whether `e` is a [`checksum_mismatch`]: raised after a full decode.
+#[allow(dead_code)] // see `bounded_read_salvage`
+pub(crate) fn is_checksum_mismatch(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ChecksumMismatch>())
 }
 
 /// What [`bounded_read_salvage`] recovered.
@@ -2448,6 +2593,35 @@ pub(crate) struct Salvaged {
     /// A decode error stopped the read with content left undecoded
     /// ([`decode_error_hides_content`]).
     pub(crate) undecoded: bool,
+    /// The decoder ran out of input before its stream ended
+    /// (`UnexpectedEof`).
+    pub(crate) cut_short: bool,
+}
+
+#[allow(dead_code)] // see `bounded_read_salvage`
+impl Salvaged {
+    /// Whether bytes present in the input were left undecoded: damage, or
+    /// a stream that ran out of input with more of the input after it.
+    /// `rest_absent`: the member's data was cut by the end of the input, so
+    /// running out of it hides nothing.
+    pub(crate) fn part_way(&self, rest_absent: bool) -> bool {
+        self.undecoded || (self.cut_short && !rest_absent)
+    }
+}
+
+/// [`bounded_read_salvage`] of `r`, salvaging.
+#[allow(dead_code)] // see `bounded_read_salvage`
+pub(crate) fn salvage<R: Read>(r: R, cap: u64) -> Salvaged {
+    match bounded_read_salvage(r, cap, true) {
+        Ok(s) => s,
+        // Unreachable: with `salvage` set, errors end the read instead.
+        Err(_) => Salvaged {
+            data: Vec::new(),
+            over_cap: false,
+            undecoded: true,
+            cut_short: false,
+        },
+    }
 }
 
 /// Like [`bounded_read`], but when `salvage` is set, a read error does not
@@ -2470,12 +2644,14 @@ pub(crate) fn bounded_read_salvage<R: Read>(
             data,
             over_cap,
             undecoded: false,
+            cut_short: false,
         });
     }
     let limit = cap.saturating_add(1);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut undecoded = false;
+    let mut cut_short = false;
     while (buf.len() as u64) < limit {
         match r.read(&mut chunk) {
             Ok(0) => break,
@@ -2483,6 +2659,7 @@ pub(crate) fn bounded_read_salvage<R: Read>(
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 undecoded = decode_error_hides_content(&e);
+                cut_short = e.kind() == std::io::ErrorKind::UnexpectedEof;
                 break;
             }
         }
@@ -2495,6 +2672,7 @@ pub(crate) fn bounded_read_salvage<R: Read>(
         data: buf,
         over_cap,
         undecoded,
+        cut_short,
     })
 }
 
@@ -2584,6 +2762,21 @@ mod markup_payload_tests {
         let page = format!("<img src=\"data:image/png;base64,{}\">", b64(&want));
         let got = markup_embedded_payloads(&page.as_bytes(), 1 << 20);
         assert_eq!(got, vec![want], "padding must not be dropped from the tail");
+    }
+
+    /// Some writers leave the `=` off. The partial last group still holds the
+    /// asset's last one or two bytes.
+    #[test]
+    fn an_unpadded_data_uri_keeps_its_last_bytes() {
+        for marker in [&b"m"[..], b"mmm"] {
+            let want = png(marker);
+            assert_ne!(want.len() % 3, 0);
+            let bare = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&want);
+            let page = format!("<img src=\"data:image/png;base64,{bare}\">");
+            let got = markup_embedded_payloads(&page.as_bytes(), 1 << 20);
+            let tail = want.len() % 3;
+            assert_eq!(got, vec![want], "{tail} byte(s) past the last group");
+        }
     }
 
     #[test]
@@ -2959,6 +3152,34 @@ mod tests {
         assert!(base64_payloads(&format!("x=\"{txt}\"").as_bytes(), u64::MAX).is_empty());
         // Too-short a run is never trial-decoded.
         assert!(base64_payloads(b"var x = \"aGVsbG8gd29ybGQ=\"", u64::MAX).is_empty());
+    }
+
+    /// A payload whose length is not a multiple of three ends in a partial
+    /// group (`xx==` or `xxx=`): its last one or two bytes must come back,
+    /// wrapped or not, or a hash of the payload never matches.
+    #[cfg(feature = "base64scan")]
+    #[test]
+    fn base64_payloads_keep_the_bytes_of_a_padded_tail() {
+        use base64::Engine;
+        for extra in [1usize, 2] {
+            let mut pe = vec![0u8; 3 * 700 + extra];
+            pe[..2].copy_from_slice(b"MZ");
+            pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+            pe[0x40..0x44].copy_from_slice(b"PE\x00\x00");
+            let n = pe.len();
+            pe[n - extra..].fill(0xAB);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&pe);
+            assert!(b64.ends_with('='));
+            let wrapped: Vec<&str> = b64
+                .as_bytes()
+                .chunks(76)
+                .map(|l| std::str::from_utf8(l).unwrap())
+                .collect();
+            for carrier in [format!("x = \"{b64}\";"), wrapped.join("\r\n")] {
+                let got = base64_payloads(&carrier.as_bytes(), u64::MAX);
+                assert_eq!(got, vec![pe.clone()], "{extra} trailing byte(s)");
+            }
+        }
     }
 
     #[cfg(feature = "base64scan")]

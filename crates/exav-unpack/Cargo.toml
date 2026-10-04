@@ -74,6 +74,11 @@ salzweg = { version = "0.1", optional = true }
 unshield = { version = "0.2", default-features = false, optional = true }
 # structured documents that contain embedded files
 cfb = { version = "0.14.0", optional = true }
+# AutoCAD drawings before 2007 are in the code page `$DWGCODEPAGE` names,
+# among them the double-byte Asian ones, which `\M+` escapes use too.
+# encoding_rs is the WHATWG decoder set Firefox ships; built without
+# `simd-accel`.
+encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc"], optional = true }
 mail-parser = { version = "0.11.4", optional = true }
 delharc = { version = "0.6.2", optional = true }
 # ARJ decompression: bitstream-io for the "fastest" LZ77 codec
@@ -103,7 +108,7 @@ flate2 = { version = "1.1.9", optional = true }
 # on it directly so the raw-bytes path (orphan local headers, where we never go
 # through the `zip` crate's reader) decodes method 9 too.
 deflate64 = { version = "0.1.12", optional = true }
-lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "lzip"], optional = true }
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std"], optional = true }
 # PDF crypto primitives (replacing hand-rolled implementations)
 md-5 = { version = "0.11", optional = true }
 sha2 = { version = "0.11", optional = true }
@@ -143,7 +148,7 @@ all-formats-no-emu = [
     "diskimage", "wim", "lz4", "arc", "ace", "stuffit", "alz", "egg", "hwp3",
     "fat", "ext", "zoo", "ishieldz", "inno", "ntfs", "pyc",
     "nsis", "machofat", "sfx", "autoit", "onenote", "rtf", "pepack",
-    "javaclass", "aimodel", "screnc", "base64scan",
+    "javaclass", "aimodel", "screnc", "base64scan", "dxf", "dwg",
 ]
 
 # Archives / compressors.
@@ -156,7 +161,7 @@ bzip2 = ["bzip2-decoder"]
 bzip2-decoder = ["dep:tinyvec", "dep:crc32fast"]
 xz = ["dep:xz4rust"]
 zstd = ["dep:ruzstd"]
-lzip = ["dep:lzma-rust2"]
+lzip = ["dep:lzma-rust2", "dep:crc32fast"]
 cab = ["dep:lzxd", "dep:flate2", "dep:byteorder"]
 chm = ["dep:lzxd"]
 sevenz = ["dep:lzma-rust2", "bzip2-decoder", "dep:flate2", "dep:crc32fast"]
@@ -237,6 +242,13 @@ upx = ["dep:flate2", "dep:lzma-rust2", "dep:base64"]
 ole = ["dep:cfb", "dep:flate2"]
 pdf = ["dep:flate2"]
 email = ["dep:mail-parser", "dep:base64"]
+# AutoCAD DXF: the files a drawing embeds (an OLE2FRAME's object), and the
+# public `dxf` module that drawing readers (exav-render's) build on.
+dxf = ["dep:encoding_rs"]
+# AutoCAD DWG, R13 to R2018: the preview images a drawing carries
+# and the objects its OLE2FRAMEs embed, and the public `dwg` module that
+# drawing readers (exav-render's) build on.
+dwg = ["dep:encoding_rs"]
 
 # Apple disk images (UDIF + HFS+/APFS). The encrypted-DMG cipher stack is under
 # the `decrypt` feature, not here.
@@ -245,14 +257,14 @@ dmg = [
     "dep:flate2", "dep:base64", "dep:quick-xml",
 ]
 
-# Decryption of encrypted members (ZIP ZipCrypto/WinZip-AES, PDF standard
-# security handler, encrypted DMG). ON by default. This is the ONLY thing that
+# Decryption of encrypted members (ZIP ZipCrypto/WinZip-AES, 7z AES, RAR3/RAR5
+# AES, PDF standard security handler, encrypted DMG, Office). ON by default. This is the ONLY thing that
 # pulls the cipher/KDF crates (all decryption-only: no RNG, no getrandom). Drop
 # it (with the format features you want, e.g. `--no-default-features --features
 # zip`) for a build with no crypto stack; encrypted members are then reported
 # `PASSWORD-PROTECTED`/unsupported (never decrypted, never silently clean), the
 # same as when no password is supplied. Effective only combined with a format
-# that has encryptable members (zip/pdf/dmg).
+# that has encryptable members. ARJ's ciphers come with `arj`, not this.
 decrypt = [
     "dep:aes", "dep:hmac", "dep:pbkdf2", "dep:sha1", "dep:constant_time_eq",
     "dep:des", "dep:cbc", "dep:md-5", "dep:sha2", "dep:digest", "dep:stringprep",
@@ -303,8 +315,8 @@ sha2 = "0.11"
 # normal dependencies they would be missing from a single-format test build.
 flate2 = "1.1.9"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
-# Reference PPMd7 (var.H) encoder, used only to validate the vendored PPMd7
-# model in `formats/ppmd7` against a known-good 7z-coder stream (CC0-1.0/MIT-0).
+# Reference PPMd7 (var.H) and PPMd8 (var.I) encoders, used only to validate the
+# models in `formats/ppmd7` and `formats/ppmd8` (CC0-1.0/MIT-0).
 ppmd-rust = "1"
 # Used only in tests to create 7z archives for roundtrip testing.
 sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }

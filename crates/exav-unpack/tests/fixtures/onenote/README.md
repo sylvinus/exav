@@ -1,7 +1,9 @@
 # OneNote test fixtures
 
 Real in-the-wild malicious OneNote `.one` droppers (payload carried as a
-FileDataStoreObject). Renamed from their sha256 for readability.
+FileDataStoreObject). Renamed from their sha256 for readability. They are
+gitignored, never committed, and kept locally as `<name>.zip` (AES-256,
+password `infected`, see `../README.md`); the sha256 is of the file inside.
 
 | file | sha256 |
 |---|---|

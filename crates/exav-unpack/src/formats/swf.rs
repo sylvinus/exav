@@ -12,8 +12,9 @@
 //! `ZWS` are decoded, as they are read. An attacker-controlled `FileLength`
 //! never drives an allocation: the LZMA dictionary is clamped to the buffer
 //! limit, and the output is bounded by the scan budget as it flows.
-use std::io::{Cursor, Read};
+use std::io::{BufReader, Cursor, Read};
 
+use super::lzma::SansIo;
 use crate::source::{ByteSource, Reader};
 use crate::stream::{emit_stream, MemberMeta, Visit};
 use crate::{Budget, LimitHit};
@@ -41,8 +42,21 @@ pub(crate) fn walk<T>(
         ..MemberMeta::default()
     };
     if &hdr[0..3] == b"CWS" {
-        let body = flate2::read::ZlibDecoder::new(Reader::range(src, 8, src.len()));
-        return emit_stream(&meta, &mut Cursor::new(fws).chain(body), budget, visit);
+        let body = BufReader::new(Reader::range(src, 8, src.len()));
+        return match crate::inflate::zlib_reader(body) {
+            Ok(Some(body)) => emit_stream(&meta, &mut Cursor::new(fws).chain(body), budget, visit),
+            // Cut inside the zlib header: no byte of the body is here.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                emit_stream(&meta, &mut Cursor::new(fws), budget, visit)
+            }
+            _ => {
+                let unsupported = MemberMeta {
+                    unsupported: Some("SWF body is not a zlib stream"),
+                    ..meta
+                };
+                Ok(visit(&unsupported, None, budget))
+            }
+        };
     }
     // ZWS / LZMA: 8 header + 4 comp-length + 5 LZMA props before the stream.
     let unsupported = MemberMeta {
@@ -60,8 +74,11 @@ pub(crate) fn walk<T>(
         budget.limits().max_buffer_bytes,
     );
     let stream = Reader::range(src, 17, src.len());
-    match lzma_rust2::LzmaReader::new_with_props(stream, want, hdr[12], dict, None) {
-        Ok(body) => emit_stream(&meta, &mut Cursor::new(fws).chain(body), budget, visit),
+    match lzma_rust2::LzmaStream::new_with_props(want, hdr[12], dict, None) {
+        Ok(lzma) => {
+            let mut body = Cursor::new(fws).chain(SansIo::new(stream, lzma));
+            emit_stream(&meta, &mut body, budget, visit)
+        }
         Err(_) => Ok(visit(&unsupported, None, budget)),
     }
 }

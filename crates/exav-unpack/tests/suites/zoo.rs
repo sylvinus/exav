@@ -125,7 +125,9 @@ fn an_archive_zoo_wrote_reports_nothing() {
         assert!(
             e.iter().all(|x| x.unsupported.is_none()),
             "{name}: {:?}",
-            e.iter().map(|x| (&x.name, x.unsupported)).collect::<Vec<_>>()
+            e.iter()
+                .map(|x| (&x.name, x.unsupported))
+                .collect::<Vec<_>>()
         );
     }
 }

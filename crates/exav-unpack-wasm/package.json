@@ -60,7 +60,7 @@
   "bugs": {
     "url": "https://github.com/sylvinus/exav/issues"
   },
-  "homepage": "https://github.com/sylvinus/exav#readme",
+  "homepage": "https://exav.org/unpack/wasm/",
   "devDependencies": {
     "@playwright/test": "^1.61.1",
     "serve": "^14.2.6",

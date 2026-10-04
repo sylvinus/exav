@@ -32,6 +32,11 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 const RAR4_MAGIC: &[u8] = &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 const RAR5_MAGIC: &[u8] = &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
 
+/// A solid member decoded on a window missing a member before it, and failing
+/// its CRC: its bytes are not its own.
+const RAR_STALE: &str =
+    "RAR solid member follows one that was not decoded, so it cannot be decoded either";
+
 pub(crate) fn extract_rar(data: &[u8], budget: &mut Budget) -> Result<Vec<Entry>, LimitHit> {
     if data.starts_with(RAR5_MAGIC) {
         extract_rar5(data, RAR5_MAGIC.len(), budget)
@@ -283,6 +288,9 @@ fn extract_rar4_keyed(
     // stream, so a member flagged solid needs the window and tables its
     // predecessor left behind.
     let mut solid_dec: Option<rar3_unpack::Unpacker29> = None;
+    // Whether the window holds every member before this one. A solid member
+    // decoded without them decodes to bytes that are not its own.
+    let mut in_step = true;
     while pos + 7 <= data.len() {
         let flags = match u16le(data, pos + 3) {
             Some(f) => f,
@@ -374,6 +382,11 @@ fn extract_rar4_keyed(
             // real reason keeps a volume set from looking like a corrupt
             // archive, and the member is still surfaced rather than skipped.
             let split = flags & 0x03 != 0;
+            // Only the LZ branch below feeds the window.
+            let lz = !encrypted && unp_ver == 29 && (0x31..=0x35).contains(&method);
+            if !is_dir && (split || !lz) {
+                in_step = false;
+            }
             if is_dir {
                 // skip directories
             } else if encrypted && !split {
@@ -448,25 +461,33 @@ fn extract_rar4_keyed(
                 if !solid || solid_dec.is_none() {
                     solid_dec = rar3_unpack::Unpacker29::new(win_bits, budget).ok();
                 }
+                let stale = solid && !in_step;
                 let decoded = match solid_dec.as_mut() {
                     Some(dec) => dec.member(packed, unp, solid, budget).ok(),
                     None => None,
                 };
                 // A member that failed mid-group leaves the shared window out of
                 // step with the stream, so every later member would decode to
-                // garbage. Dropping the decoder makes them fail their CRC and be
-                // reported rather than quietly mis-scanned.
+                // garbage: those are reported (`stale`), not scanned as theirs.
                 if decoded.is_none() {
                     solid_dec = None;
                 }
+                let crc_ok = decoded.as_ref().is_some_and(|b| crc32_ieee(b) == crc);
+                in_step = decoded.is_some() && (!stale || crc_ok);
                 match decoded {
-                    Some(bytes) if crc32_ieee(&bytes) == crc => {
+                    // A CRC mismatch after a full decode hides nothing: the
+                    // bytes are scanned, as a ZIP member's are, and reported
+                    // only when checksums are verified.
+                    Some(bytes) if crc_ok || !(stale || budget.should_verify_checksums()) => {
                         out.push(Entry {
                             comp_size: pack,
                             name,
                             data: bytes,
                             ..Entry::default()
                         });
+                    }
+                    Some(_) if stale => {
+                        out.push(Entry::unsupported(name, pack, false, RAR_STALE));
                     }
                     Some(_) => {
                         out.push(Entry::unsupported(
@@ -486,8 +507,8 @@ fn extract_rar4_keyed(
                     }
                 }
             } else {
-                // Compressed (unsupported method / PPMd / older version) or
-                // encrypted member we can't decode — record metadata, flagged
+                // Compressed with an older version or an unknown method, or
+                // encrypted, and not decoded: record metadata, flagged
                 // Unscannable so it isn't reported as clean.
                 let _ = crc;
                 budget.count_entry()?;
@@ -544,6 +565,8 @@ fn extract_rar5_keyed(
     // Kept across members: a solid RAR5 group's files share one window, and a
     // solid member's first block may declare no tables of its own.
     let mut solid_dec: Option<rar5_unpack::Unpacker50> = None;
+    // Whether the window holds every member before this one.
+    let mut in_step = true;
     let mut out = Vec::new();
     let mut pos = start;
     while pos + 4 < data.len() {
@@ -627,6 +650,7 @@ fn extract_rar5_keyed(
                 if is_dir {
                     // skip
                 } else if split && f.method != 0 {
+                    in_step = false;
                     budget.count_entry()?;
                     out.push(Entry::unsupported(
                         f.name,
@@ -678,6 +702,7 @@ fn extract_rar5_keyed(
                         // A solid group cannot go on past a member it could
                         // not read.
                         solid_dec = None;
+                        in_step = false;
                         budget.count_entry()?;
                         out.push(Entry::unsupported(
                             f.name,
@@ -690,6 +715,7 @@ fn extract_rar5_keyed(
                         // file, the rest in a sibling volume, so it is reported
                         // as well as scanned: the partial bytes alone read as a
                         // complete member, and a multi-volume archive as clean.
+                        in_step = false;
                         if split {
                             budget.count_entry()?;
                             out.push(Entry::unsupported(
@@ -738,7 +764,7 @@ fn extract_rar5_keyed(
                         self::decode_rar5_member(
                             &mut out,
                             budget,
-                            &mut solid_dec,
+                            (&mut solid_dec, &mut in_step),
                             &f,
                             plain.as_deref().unwrap_or(raw),
                             data_size,
@@ -760,12 +786,12 @@ fn extract_rar5_keyed(
 }
 
 /// Decode one compressed RAR5 member from `packed` and add it to `out`, or
-/// say why it could not be read.
-#[allow(clippy::too_many_arguments)]
+/// say why it could not be read. The pair after `budget` is the solid group's
+/// decoder and whether its window holds every member before this one.
 fn decode_rar5_member(
     out: &mut Vec<Entry>,
     budget: &mut Budget,
-    solid_dec: &mut Option<rar5_unpack::Unpacker50>,
+    (solid_dec, in_step): (&mut Option<rar5_unpack::Unpacker50>, &mut bool),
     f: &Rar5File,
     packed: &[u8],
     data_size: u64,
@@ -778,33 +804,42 @@ fn decode_rar5_member(
     if !f.solid || solid_dec.is_none() {
         *solid_dec = rar5_unpack::Unpacker50::for_member(f.comp_info).ok();
     }
+    let stale = f.solid && !*in_step;
     let decoded = match solid_dec.as_mut() {
         Some(dec) => dec.member(packed, f.unp_size, f.solid, budget).ok(),
         None => None,
     };
     // A member that failed mid-group leaves the shared window out of step with
-    // the stream, so every later member would decode to garbage. Dropping the
-    // decoder makes them fail their CRC and be reported rather than quietly
-    // mis-scanned.
+    // the stream, so every later member would decode to garbage: those are
+    // reported (`stale`), not scanned as theirs.
     if decoded.is_none() {
         *solid_dec = None;
     }
+    let matches = decoded.as_deref().is_some_and(&crc_ok);
+    *in_step = decoded.is_some() && (!stale || matches);
+    // For an encrypted member the CRC is what confirms the password (RAR5's
+    // own check value is optional), so a mismatch there is always reported.
+    let checked = stale || f.encrypted || budget.should_verify_checksums();
     let name = f.name.clone();
     out.push(match decoded {
-        Some(bytes) if crc_ok(&bytes) => Entry {
+        // A CRC mismatch after a full decode hides nothing: the bytes are
+        // scanned, as a ZIP member's are, and reported only when checksums
+        // are verified.
+        Some(bytes) if matches || !checked => Entry {
             comp_size: data_size,
             name,
             data: bytes,
             encrypted: f.encrypted,
             ..Entry::default()
         },
+        Some(_) if stale => Entry::unsupported(name, data_size, f.encrypted, RAR_STALE),
         Some(_) => Entry::unsupported(
             name,
             data_size,
             f.encrypted,
             "RAR member did not match its recorded CRC after decoding",
         ),
-        // Couldn't decode (unsupported method/filter/PPMd or malformed):
+        // Couldn't decode (unsupported method or filter, or malformed):
         // metadata only, flagged Unscannable so it isn't reported clean.
         None => Entry::unsupported(name, data_size, f.encrypted, "unsupported RAR compression"),
     });
@@ -927,8 +962,7 @@ struct Rar5File {
     /// `comp_info` bit 6: the member continues the previous member's compressed
     /// stream and cannot be decoded without its window.
     solid: bool,
-    /// Stored unpacked-data CRC-32, only meaningful when `has_crc`. Every
-    /// decoded member is checked against it.
+    /// Stored unpacked-data CRC-32, only meaningful when `has_crc`.
     crc: u32,
     has_crc: bool,
     encrypted: bool,
@@ -1109,6 +1143,17 @@ fn join_rar4(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
                 .and_then(|e| e.checked_add(usize::try_from(add).ok()?))
                 .filter(|&e| e <= v.len())
                 .ok_or_else(|| format!("part {} ends inside a block", k + 1))?;
+            // A volume's end block may record its number (EARC_VOLNUMBER,
+            // after the data CRC when EARC_DATACRC is set): it must be where
+            // it is given.
+            if htype == 0x7B && flags & 0x0008 != 0 {
+                let at = pos + 7 + if flags & 0x0002 != 0 { 4 } else { 0 };
+                if let Some(n) = u16le(v, at).filter(|_| at + 2 <= pos + head_size) {
+                    if usize::from(n) != k {
+                        return Err(format!("part {} is volume {} of its set", k + 1, n + 1));
+                    }
+                }
+            }
             match htype {
                 // The archive header once; each volume's end marker never.
                 0x73 if k == 0 => out.extend_from_slice(&v[pos..end]),
@@ -1160,8 +1205,10 @@ fn join_rar4(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
 fn rar4_whole(mut p: Pending, crc: u32) -> Result<Vec<u8>, String> {
     let h = &mut p.header;
     // A stored member's data is its content, so a part missing from between
-    // the ones given shows as a size the header does not record. (A compressed
-    // one fails its CRC once decoded.)
+    // the ones given shows as a size the header does not record. (A volume
+    // missing from a set that records volume numbers is refused by the join;
+    // without them, a compressed member fails its CRC once decoded, which is
+    // reported only when checksums are verified.)
     let large = u16::from_le_bytes([h[3], h[4]]) & 0x100 != 0;
     let unp = u64::from(u32le(h, 11).unwrap_or(0))
         | if large {
@@ -1432,12 +1479,11 @@ fn rar5_whole(p: Pending, crc: Option<u32>) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// CRC-32 (IEEE, poly 0xEDB88320) over `data`. Every decoded RAR member is
-/// checked against the CRC the archive records, in every build: a decoder that
-/// produces plausible-looking wrong bytes — which is exactly what happens when
-/// a solid member is decoded without the preceding member's window — would
-/// otherwise hand the scanner content that is not the file, and a pattern that
-/// does not match garbage reads as clean.
+/// CRC-32 (IEEE, poly 0xEDB88320) over `data`. A decoded RAR member failing
+/// the CRC the archive records is reported when it is a solid member decoded
+/// without a member before it (its bytes are not its own), when it is
+/// encrypted (the CRC is what confirms the password), or when checksums are
+/// verified; otherwise it is scanned, as a ZIP member failing its CRC is.
 pub(crate) fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
@@ -1633,7 +1679,16 @@ mod tests {
                 let (before, after) = (j > 0, j + 1 < parts.len());
                 if before {
                     let mut v = magic.to_vec();
-                    v.extend_from_slice(&main);
+                    if rar5 {
+                        // A volume past the first records its number, as RAR
+                        // writes it.
+                        let c = [1, 0, 0x03, vols.len() as u64].map(vint_bytes).concat();
+                        let body = [vint_bytes(c.len() as u64), c].concat();
+                        v.extend(crc32_ieee(&body).to_le_bytes());
+                        v.extend(body);
+                    } else {
+                        v.extend_from_slice(&main);
+                    }
                     vols.push(v);
                 }
                 let v = vols.last_mut().unwrap();
@@ -1773,28 +1828,16 @@ mod tests {
     }
 
     /// End-to-end RAR5 LZ decompression against real samples, validating each
-    /// decompressed member against the CRC-32 stored in its file header. Runs
-    /// only when the malware corpus is present (skipped otherwise).
+    /// decompressed member against the CRC-32 stored in its file header. Reads
+    /// the `*.bin` files of the directory `EXAV_DEBUG_RAR_CORPUS` names; skipped when
+    /// it is not set.
     #[test]
     #[ignore = "extracts 114 RAR5 samples (310 MB); run with --ignored"]
     fn rar5_real_samples_crc() {
         use std::path::Path;
-        // Walk up to find the repo's corpus dir from the crate dir.
-        let mut dir = std::env::current_dir().unwrap();
-        let mut corpus = None;
-        for _ in 0..6 {
-            let c = dir.join("corpus/samples/_bulk/rar");
-            if c.is_dir() {
-                corpus = Some(c);
-                break;
-            }
-            if !dir.pop() {
-                break;
-            }
-        }
-        let corpus = match corpus {
-            Some(c) => c,
-            None => return, // corpus not present; skip
+        let corpus = match std::env::var_os("EXAV_DEBUG_RAR_CORPUS") {
+            Some(c) => std::path::PathBuf::from(c),
+            None => return,
         };
 
         let mut checked = 0u32;

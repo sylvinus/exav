@@ -49,8 +49,8 @@ fn byte_at<B: ByteSource + ?Sized>(b: &B, i: usize) -> u8 {
 
 /// Whether the object starts like an image `Target:5` (graphics) signatures
 /// run on. Those clamscan 1.5.4 treats as graphics are PNG, GIF, JPEG, TIFF
-/// and BMP; with `all_formats`, every format exav-imagehash detects (WebP,
-/// ICO, PNM, ...) is too.
+/// and BMP; with `all_formats`, every format exav-imagehash hashes (WebP,
+/// ICO, PNM, ..., JPEG 2000 and JBIG2) is too.
 fn looks_like_image<B: ByteSource + ?Sized>(b: &B, all_formats: bool) -> bool {
     let d = b.window(0, 16);
     if d.len() < 12 {
@@ -58,7 +58,8 @@ fn looks_like_image<B: ByteSource + ?Sized>(b: &B, all_formats: bool) -> bool {
     }
     #[cfg(feature = "image-hash")]
     if all_formats {
-        return exav_imagehash::Format::detect(&d).is_some();
+        use exav_imagehash::{Format, Formats};
+        return Format::detect(&d).is_some_and(|f| Formats::ALL.contains(f));
     }
     #[cfg(not(feature = "image-hash"))]
     let _ = all_formats;
@@ -417,12 +418,35 @@ thread_local! {
     /// Why a check did not run on an object too large to hold in memory, the
     /// first such reason this scan. Setting it also sets [`SCAN_TRUNCATED`].
     static SCAN_OVER_SIZE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+
+    /// Why carving left an embedded image or archive unscanned, the first such
+    /// reason this scan. Setting it also sets [`SCAN_TRUNCATED`].
+    static SCAN_CAPPED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Clear the per-scan verify-truncation flag. Call at the start of a top-level scan.
 pub fn reset_scan_truncated() {
     SCAN_TRUNCATED.with(|c| c.set(false));
     SCAN_OVER_SIZE.with(|r| r.borrow_mut().take());
+    SCAN_CAPPED.with(|r| r.borrow_mut().take());
+}
+
+/// Record that carving reached its cap with more to carve, and why. Unlike a
+/// `Limits` outcome it does not stop the walk: the container's other members
+/// are still scanned, and a detection in any of them wins.
+pub(crate) fn mark_capped(reason: impl FnOnce() -> String) {
+    SCAN_TRUNCATED.with(|c| c.set(true));
+    SCAN_CAPPED.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.is_none() {
+            *r = Some(reason());
+        }
+    });
+}
+
+/// The reason recorded by [`mark_capped`] this scan, if any.
+pub(crate) fn scan_capped() -> Option<String> {
+    SCAN_CAPPED.with(|r| r.borrow().clone())
 }
 
 /// Record that a check did not run because the object is too large to hold
@@ -6180,6 +6204,45 @@ mod tests {
             };
             assert!(scan(true).is_some(), "{sig}");
             assert!(scan(false).is_none(), "{sig}");
+        }
+    }
+
+    /// Natively, a JPEG 2000 or JBIG2 file is graphics for `Target:5` and
+    /// hashed for `fuzzy_img#`, as every format exav-imagehash decodes;
+    /// under `--clamav-compat` it is neither, as for clamscan.
+    #[cfg(feature = "image-hash")]
+    #[test]
+    fn jpeg_2000_and_jbig2_are_graphics_natively() {
+        for (file, magic, hash) in [
+            (
+                &include_bytes!("../../../exav-render/tests/fixtures/images/rgb.jp2")[..],
+                "0000000c6a502020",
+                "f0a50fd80dda4b1e",
+            ),
+            (
+                &include_bytes!("../../../exav-render/tests/fixtures/images/generic.jb2")[..],
+                "974a42320d0a1a0a",
+                "d656ab50a9e9c82d",
+            ),
+        ] {
+            for (sig, graphics) in [
+                (format!("Demo.Img;Engine:150-255,Target:5;0;{magic}"), true),
+                (format!("Demo.FuzzyImg;Engine:150-255,Target:0;0;fuzzy_img#{hash}"), true),
+                (format!("Demo.Any;Engine:150-255,Target:0;0;{magic}"), false),
+            ] {
+                let mut b = EngineBuilder::new();
+                b.add_ldb(&sig, false);
+                let e = b.build();
+                for all_image_formats in [true, false] {
+                    let limits = WholeLimits {
+                        all_image_formats,
+                        ..WholeLimits::NONE
+                    };
+                    let found = e.scan_first_source(&file, FileType::Unknown, None, None, None, &|_, _| false, limits, None);
+                    // The control, a signature for any file, finds it in both.
+                    assert_eq!(found.is_some(), all_image_formats || !graphics, "{sig} all formats {all_image_formats}");
+                }
+            }
         }
     }
 

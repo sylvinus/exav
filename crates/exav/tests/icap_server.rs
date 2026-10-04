@@ -171,13 +171,19 @@ impl Server {
 
 /// Wait for the server to announce its listener, and return the address it
 /// named.
+///
+/// Only a whole line counts: stderr is unbuffered, so the line reaches the log
+/// in several writes and a read can land between them.
 fn announced_addr(log: &std::path::Path) -> String {
     const MARKER: &str = "serving ICAP on tcp:";
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let text = std::fs::read_to_string(log).unwrap_or_default();
-        if let Some(rest) = text.split_once(MARKER).map(|(_, r)| r) {
-            let addr = rest
+        if let Some((line, _)) = text
+            .split_once(MARKER)
+            .and_then(|(_, rest)| rest.split_once('\n'))
+        {
+            let addr = line
                 .split_whitespace()
                 .next()
                 .expect("the announcement names an address");
@@ -189,6 +195,27 @@ fn announced_addr(log: &std::path::Path) -> String {
         "the server never announced its listener:\n{}",
         std::fs::read_to_string(log).unwrap_or_default()
     );
+}
+
+/// The helper above, on a log read between two writes of the announcement.
+#[test]
+fn a_half_written_announcement_is_waited_for() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("stderr.log");
+    std::fs::write(&log, "exav: serving ICAP on tcp:").unwrap();
+    let writer = {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(
+                &log,
+                "exav: serving ICAP on tcp:127.0.0.1:1344 (services: avscan; preview off)\n",
+            )
+            .unwrap();
+        })
+    };
+    assert_eq!(announced_addr(&log), "127.0.0.1:1344");
+    writer.join().unwrap();
 }
 
 /// A server over the built-in baseline and the default configuration.
@@ -514,7 +541,12 @@ fn off_leaves_preview_and_options_ttl_out_where_0_sends_them() {
         c.send(b"OPTIONS icap://127.0.0.1/avscan ICAP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
         c.recv()
     };
-    let r = options(&["--icap-preview-bytes", "off", "--icap-options-ttl-secs", "off"]);
+    let r = options(&[
+        "--icap-preview-bytes",
+        "off",
+        "--icap-options-ttl-secs",
+        "off",
+    ]);
     assert_eq!(r.code, 200, "{r:?}");
     assert!(!r.has_header("Preview"), "{r:?}");
     assert!(!r.has_header("Options-TTL"), "{r:?}");
@@ -1294,6 +1326,26 @@ fn no_spill_keeps_scanned_bytes_off_the_disk() {
     );
     // Still delivered on a connection that survives, like any other verdict.
     assert_eq!(r.header("Connection"), Some("keep-alive"), "{r:?}");
+
+    // What was held of it is still scanned: a detection there is found.
+    let mut held = eicar().to_vec();
+    held.resize(256 * 1024, b'A');
+    let mut c = s.connect();
+    c.send(&request(
+        "RESPMOD",
+        "avscan",
+        Some(REQ_HDR),
+        Some(RES_HDR),
+        Some(&held),
+        &["Allow: 204"],
+    ));
+    let r = c.recv();
+    assert!(
+        r.header("X-Infection-Found")
+            .is_some_and(|v| v.contains("Threat=Eicar-Test-Signature;")),
+        "{r:?}"
+    );
+    assert!(!r.has_header("X-Exav-Category"), "{r:?}");
 
     // That verdict is itself the evidence no file was written: had one been,
     // the object would have been buffered, scanned, and answered `204`. There is

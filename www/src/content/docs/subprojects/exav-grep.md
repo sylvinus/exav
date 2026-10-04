@@ -6,7 +6,7 @@ description: grep for the inside of archives, searching recursively through zip,
 **grep, but it looks inside archives.** The flags you already know, with every
 member of every container, recursively, as the haystack.
 
-It is in each [release](/getting-started/installation/#prebuilt-binaries), as
+It is in each [release](/scanner/getting-started/installation/#prebuilt-binaries), as
 `exav-grep-<tag>-<target>`, or:
 
 ```bash
@@ -73,21 +73,21 @@ needs:
 
 | Flag | Purpose |
 |---|---|
-| `--passwords <PASSWORD>` | Try on encrypted members (repeatable), before the [built-in passwords](/reference/formats/#encryption-support) |
+| `--passwords <PASSWORD>` | Try on encrypted members (repeatable), before the [built-in passwords](/unpack/formats/#encryption-support) |
 | `--max-object-bytes <BYTES>` | Cap on what any single member may decompress to, and on the size of an input file (default 256 MiB) |
 | `--max-members <N>` | Cap on members visited inside each input file |
 | `--max-unpack-depth <N>` | Cap on archive-within-archive nesting |
 | `--quiet-unreadable` | Suppress unreadable-member reports |
 
 The limits are the scanner's decompression-bomb budget, spelled as
-[`exav`](/reference/cli/#scan-limits) spells them, so pointing it at a hostile
+[`exav`](/scanner/reference/cli/#scan-limits) spells them, so pointing it at a hostile
 archive is safe. Each input file is read whole into memory, so one larger than
 `--max-object-bytes` is reported unreadable (exit `3`) rather than read; raise
 the flag to search it.
 
 ## What it searches
 
-Everything [exav-unpack](/subprojects/exav-unpack/) opens: zip, rar, 7z, tar,
+Everything [exav-unpack](/unpack/) opens: zip, rar, 7z, tar,
 gzip/xz/bzip2/zstd, iso, cab, OLE2 documents, PDF, MIME email, disk images and the
 filesystems inside them. Derived views are searched too, so a Java class is
 searchable as its string constants rather than as opaque bytecode.

@@ -152,7 +152,7 @@ native `catch_unwind` boundary, but at the WASM level.
 ## Building
 
 ```sh
-# Requires Rust 1.91+ and the wasm32-wasip1 target
+# Requires Rust 1.92+ and the wasm32-wasip1 target
 rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 ```
@@ -179,7 +179,7 @@ The output is `target/wasm32-wasip1/release/exav-wasm.wasm` (~5-6 MB).
   takes more memory than loading it, and in a WASM sandbox that is bounded by
   the runtime's memory limit. Use a prebuilt database for large signature sets
   (build and load costs are in the site's prebuilt-database guide,
-  <https://exav.org/guides/prebuilt-database/#what-it-costs>).
+  <https://exav.org/scanner/guides/prebuilt-database/#what-it-costs>).
 
 ## Two WASM surfaces, and how a third gets added
 

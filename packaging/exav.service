@@ -15,7 +15,7 @@
 # copy your existing clamd.conf's LocalSocket value.
 [Unit]
 Description=exav malware scanning daemon (clamd protocol)
-Documentation=https://exav.org/guides/daemon/
+Documentation=https://exav.org/scanner/guides/daemon/
 After=network.target
 
 [Service]
@@ -44,7 +44,7 @@ ExecStart=/usr/bin/exav --listen /run/clamav/clamd.ctl -d /var/lib/clamav
 #   StateDirectory=exav                  # creates /var/lib/exav for the clamav user
 #   ReadWritePaths=/var/lib/exav         # the pulled database and its temp file
 # (Basic auth: --db-url https://user:pass@build.internal/... is kept out of logs.)
-# See https://exav.org/guides/prebuilt-database/
+# See https://exav.org/scanner/guides/prebuilt-database/
 # -----------------------------------------------------------------------------
 #
 # As with clamd: `systemctl reload exav` (SIGUSR2) re-reads the signatures

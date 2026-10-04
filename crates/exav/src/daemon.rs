@@ -2605,10 +2605,16 @@ fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
         let name = f.to_string_lossy();
         let line = scan_one_path(db, opts, &name);
         // The archive's verdict replaces a part's own `OK`: on its own the part
-        // decoded to nothing, so that `OK` says only "this fragment is not
-        // itself malware". A verdict the part earned by itself stands.
+        // is a fragment, so that `OK` says only "this fragment is not itself
+        // malware". A detection in the archive also replaces a part's own
+        // `PARTIAL`, which says only that the fragment could not be read
+        // whole. Any other verdict the part earned by itself stands.
         match sets.get(f) {
-            Some(status) if line.ends_with(": OK") => out.push(format!("{name}: {status}")),
+            Some((found, status))
+                if line.ends_with(": OK") || (*found && !line.ends_with(" FOUND")) =>
+            {
+                out.push(format!("{name}: {status}"))
+            }
             _ => out.push(line),
         }
     }
@@ -2620,10 +2626,11 @@ fn scan_tree(db: &Scanner, opts: &ScanOptions, path: &str) -> Vec<String> {
 
 /// Rejoin the multi-volume sets among `files` and scan each as one archive.
 ///
-/// Returns the status text to report for each part of a set that resolved to
-/// something other than clean, keyed by the part's own path, so the caller
-/// still emits exactly one reply line per file. A piece of an infected archive
-/// is not a clean file, and it is the piece the operator has to act on.
+/// Returns whether the set was found infected and the status text to report,
+/// for each part of a set that resolved to something other than clean, keyed
+/// by the part's own path, so the caller still emits exactly one reply line
+/// per file. A piece of an infected archive is not a clean file, and it is the
+/// piece the operator has to act on.
 ///
 /// Grouped per directory: `a/big.7z.001` and `b/big.7z.002` are two unrelated
 /// files that happen to share a name, and splicing them would concatenate bytes
@@ -2632,7 +2639,7 @@ fn volume_set_lines(
     db: &Scanner,
     opts: &ScanOptions,
     files: &[std::path::PathBuf],
-) -> std::collections::HashMap<std::path::PathBuf, String> {
+) -> std::collections::HashMap<std::path::PathBuf, (bool, String)> {
     use std::collections::HashMap;
     let mut by_dir: HashMap<&Path, Vec<&std::path::PathBuf>> = HashMap::new();
     for f in files {
@@ -2672,7 +2679,11 @@ fn volume_set_lines(
             if status == "OK" {
                 continue;
             }
-            out.insert(dir.join(&v.name), format!("{status} (in {})", v.set));
+            let found = v.report.verdict.category() == VerdictCategory::Infected;
+            out.insert(
+                dir.join(&v.name),
+                (found, format!("{status} (in {})", v.set)),
+            );
         }
     }
     out
@@ -3197,9 +3208,13 @@ fn exinstream_multi<R: Read>(
             continue;
         };
         // The archive's verdict replaces the part's own `clean`: on its own the
-        // part decoded to nothing, so that `clean` says only "this fragment is
-        // not itself malware". A verdict the part earned by itself stands.
-        if entries[i]["status"] != "OK" {
+        // part is a fragment, so that `clean` says only "this fragment is not
+        // itself malware". A detection in the archive also replaces the part's
+        // own `PARTIAL`, which says only that the fragment could not be read
+        // whole. Any other verdict the part earned by itself stands.
+        let found = v.report.verdict.category() == VerdictCategory::Infected;
+        let own = &entries[i]["status"];
+        if own != "OK" && !(found && own != "FOUND") {
             continue;
         }
         entries[i] = named_entry(&v.name, verdict_fields(&v.report, None), Some(&v.set));
@@ -3905,6 +3920,71 @@ mod tests {
             .collect()
     }
 
+    /// A ZIP of `(name, method, bytes)` members, each holding its bytes as
+    /// given, central directory included.
+    fn zip_members(members: &[(&str, u16, &[u8])]) -> Vec<u8> {
+        let crc = |data: &[u8]| {
+            let mut c = !0u32;
+            for &b in data {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        (c >> 1) ^ 0xEDB8_8320
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        };
+        let (mut out, mut cd) = (Vec::new(), Vec::new());
+        for (name, method, data) in members {
+            let fields = |v: &mut Vec<u8>| {
+                v.extend_from_slice(&[20, 0, 0, 0]); // version needed, flags
+                v.extend_from_slice(&method.to_le_bytes());
+                v.extend_from_slice(&[0; 4]); // time, date
+                v.extend_from_slice(&crc(data).to_le_bytes());
+                v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                v.extend_from_slice(&[0, 0]); // extra length
+            };
+            cd.extend_from_slice(b"PK\x01\x02\x14\x00");
+            fields(&mut cd);
+            cd.extend_from_slice(&[0; 10]); // comment length, disk, attributes
+            cd.extend_from_slice(&(out.len() as u32).to_le_bytes());
+            cd.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b"PK\x03\x04");
+            fields(&mut out);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+        }
+        let n = (members.len() as u16).to_le_bytes();
+        let cd_at = (out.len() as u32).to_le_bytes();
+        let cd_len = (cd.len() as u32).to_le_bytes();
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+        out.extend_from_slice(&[n[0], n[1], n[0], n[1]]);
+        out.extend_from_slice(&cd_len);
+        out.extend_from_slice(&cd_at);
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    /// A split ZIP whose first part alone is `PARTIAL`: it holds a member in
+    /// WavPack (method 97), which exav does not decode. The second member is
+    /// EICAR, stored, cut through by the split, so no part alone is found.
+    fn split_set_partial_alone() -> Vec<(String, Vec<u8>)> {
+        let blob = zip_members(&[("a.bin", 97, &[0x5a; 64]), ("e.txt", 0, eicar())]);
+        let parts = split_set("mixed", &blob, 2);
+        let at = blob
+            .windows(eicar().len())
+            .position(|w| w == eicar())
+            .unwrap();
+        assert!(at < parts[0].1.len() && at + eicar().len() > parts[0].1.len());
+        parts
+    }
+
     #[test]
     fn exinstream_multi_reports_one_entry_per_file() {
         let r = one(
@@ -3922,15 +4002,15 @@ mod tests {
 
     #[test]
     fn exinstream_multi_rejoins_a_split_archive() {
-        // The reason the verb exists. Each part on its own decodes to nothing
-        // (asserted below), so three separate EXINSTREAM calls would all reply
-        // `OK` and the archive would never be opened.
+        // The reason the verb exists. Each part on its own is clean (asserted
+        // below), so three separate EXINSTREAM calls would all reply `OK` and
+        // the archive's content would never be reported.
         let parts = split_set("payload", ZIP_EICAR_INSIDE, 3);
         for (name, part) in &parts {
             let solo = one(&exinstream_msg(part), 0);
             assert!(
                 solo.contains(r#""status":"OK""#),
-                "{name} is detectable alone, so the fixture proves nothing: {solo}"
+                "{name} is not clean alone, so the fixture proves nothing: {solo}"
             );
         }
         let msg = exinstream_multi_msg(
@@ -3946,6 +4026,40 @@ mod tests {
         for f in files {
             assert_eq!(f["status"], "FOUND", "every part is a piece of it: {r}");
             assert_eq!(f["set"], "payload.zip", "named for the archive: {r}");
+        }
+    }
+
+    #[test]
+    fn exinstream_multi_reports_a_found_set_on_a_part_partial_alone() {
+        // A part's own `PARTIAL` is about the part; the archive it belongs to
+        // is infected, and that is what the part has to report.
+        let parts = split_set_partial_alone();
+        let solo: Vec<_> = parts
+            .iter()
+            .map(|(_, p)| one(&exinstream_msg(p), 0))
+            .collect();
+        assert!(
+            solo[0].contains(r#""status":"PARTIAL""#),
+            "the first part alone: {}",
+            solo[0]
+        );
+        assert!(
+            solo.iter().all(|s| !s.contains(r#""status":"FOUND""#)),
+            "{solo:?}"
+        );
+        let msg = exinstream_multi_msg(
+            &parts
+                .iter()
+                .map(|(n, d)| (n.as_str(), d.as_slice()))
+                .collect::<Vec<_>>(),
+        );
+        let r = one(&msg, 0);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap_or_else(|e| panic!("{e}: {r}"));
+        let files = v["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 2, "got {r}");
+        for f in files {
+            assert_eq!(f["status"], "FOUND", "every part is a piece of it: {r}");
+            assert_eq!(f["set"], "mixed.zip", "named for the archive: {r}");
         }
     }
 
@@ -4158,8 +4272,8 @@ mod tests {
     #[test]
     fn contscan_rejoins_a_split_archive_in_a_directory() {
         // A directory holding `payload.zip.001..003` is one archive, not three
-        // files. Scanned one at a time (which is all CONTSCAN did), no part
-        // decodes and every line reads `OK`.
+        // files. Scanned one at a time (which is all CONTSCAN did), every line
+        // reads `OK`.
         let dir = crate::tmpfile::TempDir::new().unwrap();
         for (name, part) in split_set("payload", ZIP_EICAR_INSIDE, 3) {
             std::fs::write(dir.path().join(&name), &part).unwrap();
@@ -4178,6 +4292,33 @@ mod tests {
             assert!(
                 l.contains("(in payload.zip)"),
                 "the line must name the archive, not just the fragment: {l}"
+            );
+        }
+    }
+
+    #[test]
+    fn contscan_reports_a_found_set_on_a_part_partial_alone() {
+        let dir = crate::tmpfile::TempDir::new().unwrap();
+        for (name, part) in split_set_partial_alone() {
+            std::fs::write(dir.path().join(&name), &part).unwrap();
+        }
+        let first = dir.path().join("mixed.zip.001");
+        let solo = scan_one_path(
+            &Scanner::builtin(),
+            &ScanOptions::default(),
+            &first.to_string_lossy(),
+        );
+        assert!(solo.ends_with(" ERROR"), "the first part alone: {solo}");
+        let lines = scan_tree(
+            &Scanner::builtin(),
+            &ScanOptions::default(),
+            &dir.path().to_string_lossy(),
+        );
+        assert_eq!(lines.len(), 2, "one line per file: {lines:?}");
+        for l in &lines {
+            assert!(
+                l.contains("FOUND") && l.contains("(in mixed.zip)"),
+                "every part carries the archive's verdict: {lines:?}"
             );
         }
     }

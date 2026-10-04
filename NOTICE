@@ -175,6 +175,27 @@ archive_ppmd7.c (already attributed in section 1b above), NOT from UnRAR.
 
 
 -------------------------------------------------------------------------------
+1d1. ppmd-rust PPMd8 (var.I rev.1) model, CC0-1.0 OR MIT-0 (source derivative)
+-------------------------------------------------------------------------------
+
+The PPMd variant I revision 1 decoder for ZIP method 98 in
+crates/exav-unpack/src/formats/ppmd8/ is ported from the `ppmd-rust` crate
+(version 1.5.0), with its sub-allocator rewritten over a bounds-checked byte
+arena and its symbol decoder generalised over the same range decoder trait as
+section 1d. `ppmd-rust` is dual-licensed CC0-1.0 OR MIT-0
+(public-domain-equivalent) and is itself a Rust port of Igor Pavlov's 7-Zip
+PPMd8, which implements Dmitry Shkarin's public-domain PPMd var.I (2002) and
+Dmitry Subbotin's public-domain carry-less range coder. It does NOT derive from
+UnRAR/RARLAB.
+
+Upstream: https://crates.io/crates/ppmd-rust
+License: CC0-1.0 OR MIT-0 (https://spdx.org/licenses/CC0-1.0,
+         https://spdx.org/licenses/MIT-0). Both place the work in (or treat it
+         as) the public domain; no attribution is legally required, and this
+         entry is recorded for completeness.
+
+
+-------------------------------------------------------------------------------
 1e. dmg-core UDIF reader, Apache-2.0 (source derivative)
 -------------------------------------------------------------------------------
 
@@ -311,7 +332,7 @@ Copyright (c) the zip2 contributors.
 -------------------------------------------------------------------------------
 
 crates/exav-core/src/fancy_regex/ is vendored from fancy-regex 0.19.2 with two
-fixes merged upstream after it. crates/exav-imagehash/src/image_codecs/ holds
+fixes merged upstream after it. crates/exav-render/src/image_codecs/ holds
 image 0.25.9's JPEG and TIFF decoders (image is MIT OR Apache-2.0, used under
 the MIT License) and the decoder of tiff 0.10.3, and
 crates/exav-imagehash/src/pillow.rs ports Pillow 12.3.0's resampler and its
@@ -456,6 +477,24 @@ Licensed under the Apache License, Version 2.0 (text in section 4).
 
 
 -------------------------------------------------------------------------------
+1n. NewStroke (CC0-1.0) and the viewer's fonts (OFL-1.1)
+-------------------------------------------------------------------------------
+
+These reach only exav-render's `dwg` feature and the @exav/viewer npm package;
+the exav binary contains none of them.
+
+crates/exav-render/fonts/newstroke.bene is the NewStroke stroke font, in the
+FontoBene text format, dedicated to the public domain under CC0-1.0
+(crates/exav-render/fonts/LICENSE-CC0-1.0.txt).
+
+Upstream: http://vovanium.ru/sledy/newstroke/en
+
+crates/exav-viewer/assets/fonts/ holds Arimo, Cousine and Tinos, under the SIL
+Open Font License 1.1. NOTICE.md beside them gives each face's copyright and
+version, and OFL-1.1.txt the licence.
+
+
+-------------------------------------------------------------------------------
 2. ISC-licensed components
 -------------------------------------------------------------------------------
 
@@ -486,6 +525,10 @@ the distributor's choice. Notable examples:
   stringprep                             PDF password normalization
   ext4-view                              ext2/3/4 filesystem reader
   image                                  image decoding (image hashing)
+  hayro-jpeg2000, hayro-jbig2,           JPEG 2000, JBIG2 and CCITT fax in
+    hayro-ccitt                            exav-render (image hashing) and
+                                           @exav/viewer; hayro-jpeg2000's
+                                           two ICC profiles are CC0-1.0
   walkdir                                directory traversal
   libc                                   syscall bindings (daemon)
   ureq, ureq-proto, http, rustls,        HTTPS (`http` features only)
@@ -506,6 +549,8 @@ only). fancy-regex and tiff are vendored, and Pillow's resampler ported
 
 Apache-2.0-only: lzma-rust2 (it ships no NOTICE file of its own; the license
 text is in section 4).
+(Apache-2.0 OR MIT) AND BSD-3-Clause: encoding_rs, whose index data is the
+WHATWG Encoding Standard's (BSD-3-Clause).
 BSD-3-Clause: yara-x-parser (§1), and subtle (`http` features only). tlsh2 is
 Apache-2.0 OR BSD-3-Clause.
 

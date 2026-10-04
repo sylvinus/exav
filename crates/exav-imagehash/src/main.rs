@@ -222,11 +222,27 @@ fn formats(v: &str) -> Result<Formats, String> {
     }
     let mut set = Formats::NONE;
     for name in v.split(',') {
-        let f = Format::ALL
+        let f = Formats::ALL
             .iter()
             .find(|f| f.name() == name)
             .ok_or(format!("unknown or not built format `{name}`"))?;
-        set = set.with(*f);
+        set = set.with(f);
     }
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(all(feature = "jp2", feature = "jbig2"))]
+    fn formats_takes_jpeg_2000_and_jbig2() {
+        let set = formats("jpeg2000,jbig2").unwrap();
+        let names: Vec<&str> = set.iter().map(Format::name).collect();
+        assert_eq!(names, ["jpeg2000", "jbig2"]);
+        assert!(formats("all").unwrap().contains(Format::Jpeg2000));
+        assert!(!formats("clamav-graphics").unwrap().contains(Format::Jbig2));
+        assert!(formats("png,nope").is_err());
+    }
 }

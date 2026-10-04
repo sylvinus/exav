@@ -292,6 +292,25 @@ mod tests {
         assert_eq!(entries[0].data, payload);
     }
 
+    /// A filter in front of LZMA, which decodes to the size its coder
+    /// declares. Written by 7-Zip 25.01 from the 2149-byte `known.txt` of the
+    /// ZIP data-descriptor fixtures: `7z a -t7z -m0=BCJ -m1=LZMA` and
+    /// `-m0=Delta:4 -m1=LZMA`.
+    #[test]
+    fn filter_and_lzma_chains_from_7zip_decode() {
+        let mut known = b"exav data descriptor fixture\n".to_vec();
+        for i in 1..=40 {
+            known.extend_from_slice(
+                format!("line {i:02}: the quick brown fox jumps over the lazy dog\n").as_bytes(),
+            );
+        }
+        for name in ["bcj_lzma.7z", "delta_lzma.7z"] {
+            let files = extract_entries(&fixture(name));
+            assert_eq!(files.len(), 1, "{name}");
+            assert!(files.get("known.txt") == Some(&known), "{name}");
+        }
+    }
+
     /// Code-like bytes: noise with x86 `call rel32` (high byte 0x00 or 0xFF,
     /// the ones the filter converts), ARM `BL` and ARM64 `BL`/`ADRP` words
     /// every few dozen bytes.

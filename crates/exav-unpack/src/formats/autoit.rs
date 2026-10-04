@@ -922,7 +922,12 @@ mod tests {
             ("C:\\Users\\Public\\payload.exe", ea06_all_literal(&payload)),
         ]);
         let entries = extract(Format::Autoit, &blob, &mut Budget::new(Limits::default())).unwrap();
-        assert_eq!(entries.len(), 2, "{:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(
+            entries.len(),
+            2,
+            "{:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
         assert_eq!(entries[0].data, SOURCE.as_bytes());
         assert_eq!(entries[1].unsupported, None);
         assert!(entries[1].data == payload, "the installed file differs");
@@ -941,7 +946,10 @@ mod tests {
         let e = &entries[0];
         assert!(e.unsupported.is_some(), "the cut was not reported");
         assert!(e.data.len() > 1000, "{} bytes kept", e.data.len());
-        assert!(payload.starts_with(&e.data), "what was kept is not the start of the member");
+        assert!(
+            payload.starts_with(&e.data),
+            "what was kept is not the start of the member"
+        );
     }
 
     /// [`ea05_all_literal`] with EA06's literal flag (1) and magic.

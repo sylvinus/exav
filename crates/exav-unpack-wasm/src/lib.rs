@@ -1,8 +1,4 @@
-// `wasm_bindgen`'s expansion contains `unsafe`, so this crate cannot `forbid` it
-// outright the way the rest of the workspace does. Denying it covers the code
-// exav writes, which is where the guarantee is available to give: nothing
-// hand-written here is unsafe, and the generated glue is the only exception.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 //! WebAssembly bindings for `exav-unpack` — memory-safe, in-browser archive
 //! extraction with no native/C dependencies.

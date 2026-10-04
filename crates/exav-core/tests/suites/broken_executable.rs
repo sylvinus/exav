@@ -201,11 +201,13 @@ fn an_executable_too_large_to_hold_is_judged_the_same() {
             .verdict;
         // Past the limit other checks that need the whole object may not run
         // (a clean PE is then a limit), but this one does.
-        let flagged = |v: &Verdict| {
-            matches!(v, Verdict::Infected { signature, .. } if signature == "Heuristics.Broken.Executable")
-        };
+        let flagged = |v: &Verdict| matches!(v, Verdict::Infected { signature, .. } if signature == "Heuristics.Broken.Executable");
         assert_eq!(flagged(&held), want, "{what} held: {held:?}");
-        assert_eq!(flagged(&streamed), want, "{what} past the object limit: {streamed:?}");
+        assert_eq!(
+            flagged(&streamed),
+            want,
+            "{what} past the object limit: {streamed:?}"
+        );
     }
 }
 

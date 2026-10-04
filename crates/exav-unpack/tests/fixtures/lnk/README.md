@@ -2,7 +2,9 @@
 
 `eicar.lnk` is a synthetic EICAR-in-a-shortcut. The `real-malware-*.lnk` files
 are real in-the-wild malicious shortcuts (Unicode, TargetIDList + LinkInfo),
-renamed from their sha256 for readability.
+renamed from their sha256 for readability. They are gitignored, never
+committed, and kept locally as `<name>.zip` (AES-256, password `infected`, see
+`../README.md`); the sha256 is of the file inside.
 
 | file | sha256 |
 |---|---|

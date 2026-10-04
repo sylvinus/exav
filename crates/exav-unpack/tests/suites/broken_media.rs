@@ -235,7 +235,10 @@ fn a_jpeg_segment_running_past_eof_is_flagged() {
 fn a_jpeg_needs_ff_d8_ff_to_be_judged() {
     let mut j = valid_jpeg();
     j[4] = 0xF0;
-    assert!(broken_media_alert(&j).is_some(), "the control is not broken");
+    assert!(
+        broken_media_alert(&j).is_some(),
+        "the control is not broken"
+    );
     j.insert(2, 0x00);
     assert_eq!(broken_media_alert(&j), None);
 }

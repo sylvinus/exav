@@ -130,7 +130,10 @@ fn a_source_failing_part_way_is_reported_or_harmless() {
         let Some(fmt) = exav_unpack::detect(&data) else {
             continue;
         };
-        let intact = outcome(fmt, &BlockCache::new(io::Cursor::new(data.clone())).unwrap());
+        let intact = outcome(
+            fmt,
+            &BlockCache::new(io::Cursor::new(data.clone())).unwrap(),
+        );
         if intact.error.is_some() || intact.members.is_empty() {
             continue;
         }
@@ -151,10 +154,9 @@ fn a_source_failing_part_way_is_reported_or_harmless() {
             .unwrap();
             let failing = outcome(fmt, &src);
             let reported = failing.error.is_some()
-                || failing
-                    .members
-                    .iter()
-                    .any(|m| m.1.is_some() && !intact.members.iter().any(|i| i.0 == m.0 && i.1 == m.1));
+                || failing.members.iter().any(|m| {
+                    m.1.is_some() && !intact.members.iter().any(|i| i.0 == m.0 && i.1 == m.1)
+                });
             if failing != intact && !reported {
                 silent.push(format!(
                     "{} ({fmt:?}), failing from {fail_at}: {} members, intact {}",

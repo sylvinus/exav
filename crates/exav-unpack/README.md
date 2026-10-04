@@ -17,7 +17,7 @@ Unix `compress`, CAB, 7z, RAR (RAR3 LZ+PPMd, RAR5 LZ), ARJ, LHA, ZOO, ARC, EGG,
 ALZ, ISO 9660 and UDF, ar, cpio, xar, WIM, OLE2, PDF, MIME email and TNEF, Apple
 DMG (UDIF + HFS+/APFS), virtual disks (VHD, VHDX, QCOW2, VMDK) with the NTFS and
 FAT filesystems inside them, UPX and other PE packers, and more. The full list
-is at [exav.org](https://exav.org/reference/formats/).
+is at [exav.org](https://exav.org/unpack/formats/).
 
 Every format is a **Cargo feature**, so you can build only what you need
 (`--no-default-features --features zip` for a ZIP-only extractor). Decryption
@@ -54,5 +54,5 @@ exav-unpack -l set.part1.rar
 ```
 
 Licensed under MIT. Full documentation:
-[exav.org](https://exav.org/subprojects/exav-unpack/). See [`NOTICE`](https://github.com/sylvinus/exav/blob/main/NOTICE)
+[exav.org](https://exav.org/unpack/). See [`NOTICE`](https://github.com/sylvinus/exav/blob/main/NOTICE)
 for third-party attributions.

@@ -13,8 +13,6 @@
 //! The reconstructed guest disk is emitted as a single member for the partition
 //! and filesystem handlers to pick up.
 
-use std::io::Cursor;
-
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// `KDMV` — the sparse-extent header magic, little-endian on disk.
@@ -211,26 +209,43 @@ fn read_markers(data: &[u8], disk: &mut [u8], grain_size: usize) -> (usize, usiz
         // A data marker: 12 bytes of header then `size` bytes of deflate,
         // padded out to a sector boundary.
         let start = pos + 12;
-        let Some(raw) = data.get(start..start + size) else {
-            break; // truncated stream: what precedes it has been read
+        // A grain cut by the end of the file: what is there is decoded, the
+        // rest is absent.
+        let rest_absent = start.saturating_add(size) > data.len();
+        let Some(raw) = data.get(start..start.saturating_add(size).min(data.len())) else {
+            break;
         };
         let guest = (lba as usize).saturating_mul(SECTOR as usize);
         if guest < disk.len() {
-            match crate::bounded_read(
-                flate2::read::ZlibDecoder::new(Cursor::new(raw)),
-                grain_size as u64,
-            ) {
-                Ok((out, _)) => {
-                    let n = out.len().min(disk.len() - guest);
-                    disk[guest..guest + n].copy_from_slice(&out[..n]);
-                    if n > 0 {
-                        wrote += 1;
-                    }
-                }
-                // The grain's bytes are in this file; exav just could not read
-                // them. That is content left unexamined, not content absent.
-                Err(_) => undecodable += 1,
+            let s = match crate::inflate::zlib_reader(raw) {
+                Ok(Some(z)) => crate::salvage(z, grain_size as u64),
+                // Cut inside the zlib header, or not a zlib stream.
+                Err(_) => crate::Salvaged {
+                    data: Vec::new(),
+                    over_cap: false,
+                    undecoded: false,
+                    cut_short: true,
+                },
+                Ok(None) => crate::Salvaged {
+                    data: Vec::new(),
+                    over_cap: false,
+                    undecoded: true,
+                    cut_short: false,
+                },
+            };
+            let n = s.data.len().min(disk.len() - guest);
+            disk[guest..guest + n].copy_from_slice(&s.data[..n]);
+            if n > 0 {
+                wrote += 1;
             }
+            // The grain's bytes are in this file; exav just could not read
+            // them. That is content left unexamined, not content absent.
+            if s.part_way(rest_absent) {
+                undecodable += 1;
+            }
+        }
+        if rest_absent {
+            break;
         }
         let consumed = (12 + size).div_ceil(512) * 512;
         pos = pos.saturating_add(consumed);

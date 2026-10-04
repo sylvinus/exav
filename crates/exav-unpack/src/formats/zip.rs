@@ -142,10 +142,56 @@ fn decoded_whole_too_big(method: u16, comp: u64, size: u64, max_buffer: u64) -> 
     (1..=6).contains(&method) && comp.max(size) > max_buffer
 }
 
+/// Deflate64 decoded as it is read. The crate's own reader ends with `Ok(0)`
+/// when its input runs out mid-stream, the same as at the end of the stream;
+/// this one returns `UnexpectedEof`, as [`crate::inflate::Inflate`] does.
+struct Deflate64<R> {
+    inner: BufReader<R>,
+    inflater: Box<deflate64::InflaterManaged>,
+}
+
+impl<R: Read> Deflate64<R> {
+    fn new(inner: R) -> Self {
+        Deflate64 {
+            inner: BufReader::new(inner),
+            inflater: Box::new(deflate64::InflaterManaged::new()),
+        }
+    }
+}
+
+impl<R: Read> Read for Deflate64<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let input = self.inner.fill_buf()?;
+            let eof = input.is_empty();
+            let result = self.inflater.inflate(input, buf);
+            self.inner.consume(result.bytes_consumed);
+            if result.data_error {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid deflate64",
+                ));
+            }
+            if result.bytes_written > 0 || self.inflater.finished() {
+                return Ok(result.bytes_written);
+            }
+            if eof {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+    }
+}
+
 /// Why [`raw_decoder`] gave no decoder for a member.
 pub(crate) enum RawRefusal {
     /// No decoder for this method in this build, or its header is malformed.
     Unsupported(&'static str),
+    /// The input ends inside the codec's own header, before its stream.
+    Truncated,
     /// Decoding needs more memory than `--max-object-bytes` allows.
     TooBig,
 }
@@ -153,16 +199,22 @@ pub(crate) enum RawRefusal {
 /// A decoder, over a member's RAW compressed bytes, for a method the `zip`
 /// crate itself can't decode, using exav's own decoders, so a payload behind
 /// a codec the crate lacks is still scanned. The member is decoded as it is
-/// read. `usz` is the declared uncompressed size (LZMA's decode target).
+/// read. `usz` is the declared uncompressed size (LZMA's and PPMd's decode
+/// target), `None` when unknown: those two then decode to their end marker.
 /// `max_buffer` bounds what a decoder allocates up front.
 #[allow(unused_variables, unused_mut)]
 pub(crate) fn raw_decoder<'a, R: Read + 'a>(
     method: u16,
     mut raw: R,
-    usz: u64,
+    usz: Option<u64>,
     max_buffer: u64,
 ) -> Result<Box<dyn Read + 'a>, RawRefusal> {
     const MALFORMED: RawRefusal = RawRefusal::Unsupported("malformed zip member header");
+    // The codec header did not read whole: cut short, or unreadable.
+    let short_header = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => RawRefusal::Truncated,
+        _ => MALFORMED,
+    };
     match method {
         // Method 9 = Deflate64 ("enhanced deflate"): deflate with a 64 KiB
         // window, length code 285 redefined to take 16 extra bits (lengths up to
@@ -170,44 +222,48 @@ pub(crate) fn raw_decoder<'a, R: Read + 'a>(
         // up to 64 KiB). Produced by 7-Zip (`-mm=Deflate64`) and by Windows'
         // own compressed-folder writer, and decoded by ClamAV. The member bytes
         // are a raw stream (no wrapper), exactly like method 8.
-        9 => Ok(Box::new(deflate64::Deflate64Decoder::new(raw))),
+        9 => Ok(Box::new(Deflate64::new(raw))),
         // APPNOTE 5.8.8: 2-byte version, 2-byte props-size (=5), then the 5-byte
         // LZMA properties (1 lc/lp/pb byte + 4-byte dict size), then the stream.
         #[cfg(feature = "lzip")]
         14 => {
             let mut hdr = [0u8; 9];
-            raw.read_exact(&mut hdr).map_err(|_| MALFORMED)?;
+            raw.read_exact(&mut hdr).map_err(short_header)?;
             let declared = u32::from_le_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]);
+            // `u64::MAX` is the decoder's unknown size, which ends at the end
+            // marker (flag bit 1 says the stream has one).
+            let size = usz.unwrap_or(u64::MAX);
             // The dictionary is allocated up front. One larger than the output
             // is never consulted, so the output size bounds it for free; past
             // that, it is memory this scan may not claim.
-            if u64::from(declared).min(usz) > max_buffer {
+            if u64::from(declared).min(size) > max_buffer {
                 return Err(RawRefusal::TooBig);
             }
-            let dict = crate::bounded_dict(declared, usz);
-            lzma_rust2::LzmaReader::new_with_props(raw, usz, hdr[4], dict, None)
-                .map(|r| Box::new(r) as Box<dyn Read + 'a>)
+            let dict = crate::bounded_dict(declared, size);
+            // Decoded with `SansIo`, which hands over the bytes decoded before
+            // a stream runs out (`LzmaReader` drops them).
+            lzma_rust2::LzmaStream::new_with_props(size, hdr[4], dict, None)
+                .map(|s| Box::new(super::lzma::SansIo::new(raw, s)) as Box<dyn Read + 'a>)
                 .map_err(|_| MALFORMED)
         }
         #[cfg(feature = "bzip2")]
         12 => Ok(Box::new(super::bzip2_rs::DecoderReader::new(raw))),
         #[cfg(feature = "zstd")]
-        93 => ruzstd::decoding::StreamingDecoder::new(raw)
-            .map(|r| Box::new(r) as Box<dyn Read + 'a>)
-            .map_err(|_| MALFORMED),
+        93 => Ok(Box::new(super::zstd::ZstdReader::new(raw))),
         // Method 95 = XZ: the raw member bytes are a complete .xz stream.
         #[cfg(feature = "xz")]
         95 => Ok(Box::new(super::xz::XzReader::new(raw))),
-        // Method 98 = PPMd var.H, the variant 7z uses, so it reuses the in-tree
-        // PPMd7 decoder. ZIP packs the model parameters into a 2-byte
-        // little-endian header at the front of the member data (APPNOTE 5.9)
-        // instead of carrying them in coder properties as 7z does.
-        #[cfg(feature = "sevenz")]
+        // Method 98 = PPMd variant I revision 1 (PPMd8), not the var.H of 7z:
+        // its own model and the Subbotin range coder. The model parameters are
+        // a 2-byte little-endian header at the front of the member data
+        // (APPNOTE 5.10). The stream may or may not end in an end marker, so
+        // decoding stops at the declared size when there is one.
         98 => {
             let mut hdr = [0u8; 2];
-            raw.read_exact(&mut hdr).map_err(|_| MALFORMED)?;
-            let (order, mem_size) = zip_ppmd_params(hdr).ok_or(MALFORMED)?;
-            match super::sevenz::decode::Ppmd7ZReader::new(raw, order, mem_size, max_buffer) {
+            raw.read_exact(&mut hdr).map_err(short_header)?;
+            let (order, mem_size, restore) = zip_ppmd_params(hdr).ok_or(MALFORMED)?;
+            match super::ppmd8::Ppmd8ZipReader::new(raw, order, mem_size, restore, usz, max_buffer)
+            {
                 Ok(r) => Ok(Box::new(r)),
                 Err(e) if e.is_corrupt() => Err(MALFORMED),
                 Err(_) => Err(RawRefusal::TooBig),
@@ -225,33 +281,36 @@ pub(crate) fn raw_decoder<'a, R: Read + 'a>(
 pub(crate) fn decode_zip_raw(
     method: u16,
     raw: &[u8],
-    usz: u64,
+    usz: Option<u64>,
     cap: u64,
 ) -> Option<(Vec<u8>, bool)> {
     match raw_decoder(method, raw, usz, cap) {
         Ok(r) => bounded_read(r, cap).ok(),
         Err(RawRefusal::TooBig) => Some((Vec::new(), true)),
-        Err(RawRefusal::Unsupported(_)) => None,
+        Err(RawRefusal::Unsupported(_) | RawRefusal::Truncated) => None,
     }
 }
 
-/// A ZIP method-98 (PPMd) member's model parameters, from its 2-byte header.
+/// A ZIP method-98 (PPMd8) member's model parameters, from its 2-byte header:
+/// `(order, memory in bytes, restore method)`.
 ///
-/// APPNOTE 5.9: a little-endian word precedes the data: order in bits 0-3
-/// (biased by 1), model memory in MB in bits 4-11 (biased by 1), and the
-/// restoration method in bits 12-15. Only the parameters matter here; the
-/// restoration method is a property of the encoder's model resets, which the
-/// decoder follows from the stream itself.
-fn zip_ppmd_params(hdr: [u8; 2]) -> Option<(u32, u32)> {
+/// APPNOTE 5.10: a little-endian word precedes the data: order in bits 0-3
+/// (biased by 1), model memory in MB in bits 4-11 (biased by 1), and the model
+/// restoration method in bits 12-15 (0 restart, 1 cut off, 2 freeze). The
+/// decoder must restore the model as the encoder did when memory runs out, so
+/// the method matters. `None` for order 1 (the range is 2 to 16) or a method
+/// other than 0 or 1: 7-Zip 25.01 reports freeze as an unsupported method.
+fn zip_ppmd_params(hdr: [u8; 2]) -> Option<(u32, u32, super::ppmd8::RestoreMethod)> {
+    use super::ppmd8::RestoreMethod;
     let w = u16::from_le_bytes(hdr);
     let order = (w & 0x0f) as u32 + 1;
     let mem_mb = ((w >> 4) & 0xff) as u32 + 1;
-    // Guard the shift as well as the decoder's own range check: 256 MB is the
-    // format's maximum and already far past anything legitimate.
-    if !(2..=64).contains(&order) || mem_mb > 256 {
-        return None;
-    }
-    Some((order, mem_mb << 20))
+    let restore = match w >> 12 {
+        0 => RestoreMethod::Restart,
+        1 => RestoreMethod::CutOff,
+        _ => return None,
+    };
+    (order >= super::ppmd8::PPMD8_MIN_ORDER).then_some((order, mem_mb << 20, restore))
 }
 
 /// Parse the WinZip-AES 0x9901 extra field: `len(2)=7, ver(2), "AE"(2),
@@ -268,6 +327,20 @@ pub(crate) fn parse_aes_extra(extra: Option<&[u8]>) -> Option<(u8, u16)> {
             return Some((strength, method));
         }
         data = &data[4 + len..];
+    }
+    None
+}
+
+/// The body of the first extra field `id` in `extra`, a run of `id(2),
+/// len(2), body(len)` records (APPNOTE 4.5.1).
+fn extra_field(mut extra: &[u8], id: u16) -> Option<&[u8]> {
+    while extra.len() >= 4 {
+        let len = usize::from(u16::from_le_bytes([extra[2], extra[3]]));
+        let body = extra.get(4..4 + len)?;
+        if u16::from_le_bytes([extra[0], extra[1]]) == id {
+            return Some(body);
+        }
+        extra = &extra[4 + len..];
     }
     None
 }
@@ -609,7 +682,7 @@ fn scan_orphan_locals<R>(
         if !plausible_local_header(data, off) {
             continue;
         }
-        if let Some(entry) = parse_local_member(data, off, budget)? {
+        if let Some(entry) = parse_local_member(data, off, true, budget)? {
             if let Some(r) = visit(entry, budget) {
                 return Ok(Some(r));
             }
@@ -965,9 +1038,13 @@ pub(crate) fn cleartext_despite_flag(enc: &EncryptedMember, crc: u32) -> Option<
 /// *are* a member the target will extract, and omitting it would let the file be
 /// reported clean on a scan that never looked inside it. `Ok(None)` is returned
 /// only for a directory entry, which carries no content by definition.
+///
+/// `at_input_end` says the end of `data` is the end of the input, not of a
+/// span with more of the file after it.
 fn parse_local_member(
     data: &[u8],
     off: usize,
+    at_input_end: bool,
     budget: &mut Budget,
 ) -> Result<Option<Entry>, LimitHit> {
     let h = match data.get(off..off + LFH_LEN) {
@@ -976,8 +1053,6 @@ fn parse_local_member(
     };
     let flags = u16::from_le_bytes([h[6], h[7]]);
     let method = u16::from_le_bytes([h[8], h[9]]);
-    let comp = u32::from_le_bytes([h[18], h[19], h[20], h[21]]) as usize;
-    let usz = u32::from_le_bytes([h[22], h[23], h[24], h[25]]) as u64;
     let name_len = u16::from_le_bytes([h[26], h[27]]) as usize;
     let extra_len = u16::from_le_bytes([h[28], h[29]]) as usize;
     let name = String::from_utf8_lossy(
@@ -985,6 +1060,11 @@ fn parse_local_member(
             .unwrap_or(&[]),
     )
     .into_owned();
+    let data_start = off + LFH_LEN + name_len + extra_len;
+    let extra = data
+        .get(off + LFH_LEN + name_len..data_start)
+        .unwrap_or(&[]);
+    let (comp, usz, zip64) = local_sizes(h, extra);
 
     // A trailing '/' with no content is a directory entry: nothing at all to
     // scan, so skipping it hides nothing.
@@ -996,13 +1076,12 @@ fn parse_local_member(
         budget.count_entry()?;
         Ok(Some(Entry::unsupported(
             name.clone(),
-            comp as u64,
+            comp,
             encrypted,
             reason,
         )))
     };
 
-    let data_start = off + LFH_LEN + name_len + extra_len;
     // Bit 0: the member is encrypted. The orphan path has no central-directory
     // CRC to drive the ZipCrypto password check, so report it rather than guess.
     //
@@ -1015,53 +1094,85 @@ fn parse_local_member(
     // result proves the bytes were never encrypted, whatever the header claims.
     if flags & 0x01 != 0 {
         let crc = u32::from_le_bytes([h[14], h[15], h[16], h[17]]);
-        if !encryption_flag_is_a_lie(data, data_start, comp, method, flags, crc) {
+        let probe = usize::try_from(comp).unwrap_or(usize::MAX);
+        if !encryption_flag_is_a_lie(data, data_start, probe, method, flags, crc) {
             return report("encrypted zip member (orphan local header)", true, budget);
         }
     }
-    // Bit 3: the sizes live in a data descriptor AFTER the member data, so the
-    // local header alone doesn't say where the member ends. Recover the extent
-    // rather than declining to scan — on a live corpus this was the single
-    // largest source of `UNSCANNABLE`, i.e. the most content exav was choosing
-    // not to look at.
-    let comp = if flags & 0x08 != 0 && comp == 0 {
-        match deferred_member_size(data, data_start, method) {
-            Some(c) => c,
-            None => {
-                return report(
-                    "streaming zip member with unrecoverable size (orphan local header)",
-                    false,
-                    budget,
-                )
-            }
+    // Bit 3: the sizes follow the member data, in a data descriptor, and the
+    // local header's are zero (APPNOTE 4.4.4). Recover them rather than
+    // declining to scan: on a live corpus this was the single largest source
+    // of `UNSCANNABLE`, the most content exav was choosing not to look at. An
+    // uncompressed size still unknown is `None`, and the codec is decoded to
+    // its own end: taking the header's zero would decode nothing, an empty
+    // member that looks complete.
+    let (comp, usz) = if flags & 0x08 != 0 && (comp == 0 || usz == 0) {
+        let tail = data.get(data_start..).unwrap_or(&[]);
+        match data_descriptor(tail, zip64) {
+            // Nor is a zero in the descriptor trusted: an 8-byte descriptor
+            // behind a header without the ZIP64 field, which APPNOTE requires
+            // but a writer can omit, has the compressed size's high half where
+            // the 4-byte layout reads the uncompressed size.
+            Some((c, u)) => (c, (u != 0).then_some(u)),
+            None if comp != 0 => (comp, None),
+            None => match self_delimited_extent(tail, method) {
+                Some(c) => (c, None),
+                None => {
+                    return report(
+                        "streaming zip member with unrecoverable size (orphan local header)",
+                        false,
+                        budget,
+                    )
+                }
+            },
         }
     } else {
-        comp
+        (comp, Some(usz))
     };
-    let raw = match data.get(data_start..data_start + comp) {
-        Some(r) => r,
-        // The declared extent runs past EOF: the archive is truncated, so those
-        // bytes are ABSENT from the file rather than hidden in it. Whatever does
-        // exist is still covered by the outer raw scan, so this is not a coverage
-        // gap and must not be reported as one — exav scans for malware, it is not
-        // a file-integrity validator. See docs/QUIRKS.md.
-        None => return Ok(None),
-    };
+    // The declared extent can run past the end of `data`: the file is cut
+    // short, or the member overlaps what follows it. The bytes present are
+    // decoded and scanned. Leaving the member out would leave a compressed
+    // prefix nobody decoded.
+    let data_start = data_start.min(data.len());
+    let end = usize::try_from(comp)
+        .ok()
+        .and_then(|c| data_start.checked_add(c))
+        .filter(|&end| end <= data.len());
+    let past_end = end.is_none();
+    let raw = &data[data_start..end.unwrap_or(data.len())];
+    // The member's data runs to the end of the input: whatever of it a
+    // decoder still wanted is absent, and no byte after it went unread.
+    let rest_absent = at_input_end && end.is_none_or(|e| e == data.len());
     budget.count_entry()?;
     let cap = budget.reserve()?;
-    let (out, part_way) = match method {
+    let over_budget = |name| {
+        Ok(Some(Entry::unsupported(
+            name,
+            comp,
+            false,
+            "orphan zip member exceeds size budget",
+        )))
+    };
+    // Whether a decoder left the member part way: damage, which leaves bytes
+    // present undecoded; running out of input with more of the file after
+    // the extent, which may be the member's rest; or a decoded size that is
+    // not the declared one, past it (no cut does that: a deflate stream
+    // damaged part way can decode on to its end without an error) or short
+    // of it at the stream's own end.
+    let part_way = |s: &crate::Salvaged| {
+        let n = s.data.len() as u64;
+        s.undecoded
+            || (s.cut_short && !rest_absent)
+            || usz.is_some_and(|u| n > u || (n < u && !s.cut_short))
+    };
+    let (out, why) = match method {
         // Stored. The deflate arm below already refuses to hand back a prefix;
         // this one clamped to the cap and returned it as a complete member, so
         // an oversized stored orphan was silently truncated. Same treatment.
-        0 if comp as u64 > cap => {
-            return Ok(Some(Entry::unsupported(
-                name,
-                comp as u64,
-                false,
-                "orphan zip member exceeds size budget",
-            )))
-        }
-        0 => (raw.get(..comp).unwrap_or(raw).to_vec(), false),
+        0 if raw.len() as u64 > cap => return over_budget(name),
+        0 => (raw.to_vec(), None),
+        // Declared empty both ways: empty, as in `member_reader`.
+        8 if comp == 0 && usz == Some(0) => (Vec::new(), None),
         8 => {
             // Salvage the bytes decoded before any corruption rather than
             // dropping the whole member: this is a best-effort recovery of a
@@ -1074,40 +1185,56 @@ fn parse_local_member(
             // aborting, so the remaining orphans are still scanned — the same
             // shape the central-directory path uses for an oversized member.
             if s.over_cap {
-                return Ok(Some(Entry::unsupported(
-                    name,
-                    comp as u64,
-                    false,
-                    "orphan zip member exceeds size budget",
-                )));
+                return over_budget(name);
             }
-            (s.data, s.undecoded)
+            let why = part_way(&s).then_some(PART_WAY);
+            (s.data, why)
         }
         // A method no specification defines: read as Android reads it, stored
         // and its uncompressed size long (see `walk_raw_decode`).
-        m if !defined_method(m) && usz <= cap => {
-            let end = data_start.saturating_add(usz as usize).min(data.len());
-            (data[data_start..end].to_vec(), false)
+        m if !defined_method(m) && usz.unwrap_or(comp) <= cap => {
+            let len = usize::try_from(usz.unwrap_or(comp)).unwrap_or(usize::MAX);
+            let end = data_start.saturating_add(len);
+            let present = &data[data_start..end.min(data.len())];
+            let why = (end > data.len() && !at_input_end).then_some(PAST_END);
+            (present.to_vec(), why)
         }
-        _ => match decode_zip_raw(method, raw, usz, cap) {
-            Some((o, false)) => (o, false),
-            // Either a codec exav has no decoder for, or one whose stream was
-            // truncated. Both leave content unexamined.
-            _ => {
+        // Exav's own decoders, salvaging as the deflate arm does.
+        _ => match raw_decoder(method, raw, usz, cap) {
+            Ok(r) => {
+                let s = bounded_read_salvage(r, cap, true)
+                    .map_err(|e| LimitHit::corrupt(format!("orphan zip decode: {e}")))?;
+                if s.over_cap {
+                    return over_budget(name);
+                }
+                let why = part_way(&s).then_some(PART_WAY);
+                (s.data, why)
+            }
+            Err(RawRefusal::TooBig) => return over_budget(name),
+            // Cut inside the codec's header: no byte of the stream is here.
+            Err(RawRefusal::Truncated) if rest_absent => (Vec::new(), None),
+            Err(RawRefusal::Unsupported(_) | RawRefusal::Truncated) => {
                 return Ok(Some(Entry::unsupported(
                     name,
-                    comp as u64,
+                    comp,
                     false,
                     "unsupported zip compression method (orphan local header)",
                 )))
             }
         },
     };
-    ratio_guard(comp as u64, out.len() as u64, budget)?;
+    ratio_guard(comp, out.len() as u64, budget)?;
     budget.commit(out.len() as u64);
+    // Past the end of a span, the bytes after it are the file's, unread as
+    // this member's. Past the end of the input they are absent.
+    let unsupported = if past_end && !at_input_end {
+        Some(PAST_END)
+    } else {
+        why
+    };
     Ok(Some(Entry {
-        comp_size: comp as u64,
-        unsupported: part_way.then_some(PART_WAY),
+        comp_size: comp,
+        unsupported,
         name,
         data: out,
         ..Entry::default()
@@ -1118,10 +1245,18 @@ fn parse_local_member(
 const PART_WAY: &str =
     "zip member failed to decode part way; the bytes before the failure were scanned";
 
+/// Why an orphan member's entry holds only the bytes of the span it was found
+/// in, with more of the file after it.
+const PAST_END: &str =
+    "zip member runs past the end of the data it was found in; the bytes present were scanned";
+
 /// A cleartext member's content. Stored and deflated members are decoded here
 /// rather than by the crate: its deflate reader drops what it decoded in the
 /// call that meets damage, and its CRC-32 failure is not told apart from
-/// damage. Other codecs go through the crate as before.
+/// damage. Other codecs go through the crate as before. A deflated member
+/// declaring 0 bytes compressed and uncompressed is empty (Civil 3D writes
+/// them; Python's zipfile reads them so), not a stream cut before its first
+/// block.
 pub(crate) fn member_reader<'a, R: Read + Seek>(
     zip: &'a mut ::zip::ZipArchive<R>,
     i: usize,
@@ -1134,51 +1269,83 @@ pub(crate) fn member_reader<'a, R: Read + Seek>(
     }
     let raw = zip.by_index_raw(i)?;
     let crc = raw.crc32();
-    Ok(if method == C::Stored {
+    let empty = raw.compressed_size() == 0 && raw.size() == 0;
+    Ok(if method == C::Stored || empty {
         Box::new(CrcCheck::new(raw, crc))
     } else {
         Box::new(CrcCheck::new(Inflate::new(BufReader::new(raw)), crc))
     })
 }
 
-/// Recover the compressed length of a member whose local header deferred its
-/// sizes to a trailing data descriptor (general-purpose flag bit 3).
-///
-/// Two independent routes, in order of reliability:
-///
-///  1. **The data descriptor's own signature.** APPNOTE 4.3.9.3 makes the
-///     `PK\x07\x08` marker optional but near-universal in practice; the
-///     compressed size is the second `u32` after it. Accepted only when that
-///     size actually points back at this member's data, which rejects a marker
-///     that belongs to some later member.
-///  2. **The next header.** Failing that, the member data runs up to the next
-///     local file header or the start of the central directory.
-///
-/// `None` when neither route lands, in which case the caller reports the member
-/// rather than dropping it.
-fn deferred_member_size(data: &[u8], data_start: usize, method: u16) -> Option<usize> {
-    let tail = data.get(data_start..)?;
-    // Route 1: a data descriptor whose declared size is self-consistent.
-    let mut from = 0usize;
-    while let Some(rel) = memfind(&tail[from..], b"PK\x07\x08") {
-        let sig = from + rel;
-        // signature(4) + crc(4) + compressed(4) + uncompressed(4)
-        if let Some(f) = tail.get(sig + 8..sig + 12) {
-            let declared = u32::from_le_bytes([f[0], f[1], f[2], f[3]]) as usize;
-            if declared == sig {
-                return Some(declared);
-            }
-        }
-        from = sig + 4;
-        if from >= tail.len() {
-            break;
+/// A local header's `(compressed, uncompressed)` sizes, and whether it has a
+/// ZIP64 extended information extra field. A size the header gives as
+/// `0xFFFFFFFF` is in that field, uncompressed first (APPNOTE 4.5.3), and the
+/// field makes the data descriptor's sizes 8 bytes each (4.3.9.2).
+fn local_sizes(h: &[u8], extra: &[u8]) -> (u64, u64, bool) {
+    let field = |o: usize| u64::from(u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]));
+    let mut sizes = [field(22), field(18)];
+    let Some(body) = extra_field(extra, 0x0001) else {
+        return (sizes[1], sizes[0], false);
+    };
+    let mut values = body.as_chunks::<8>().0.iter();
+    for size in sizes.iter_mut().filter(|s| **s == 0xFFFF_FFFF) {
+        if let Some(v) = values.next() {
+            *size = u64::from_le_bytes(*v);
         }
     }
-    // Route 2: run to whatever header comes next. Only safe for a codec that
-    // tolerates trailing bytes — deflate stops at its own end-of-stream marker,
-    // whereas a stored member would silently absorb the descriptor and the next
-    // header into its content.
-    if method != 8 {
+    (sizes[1], sizes[0], true)
+}
+
+/// The `(compressed, uncompressed)` sizes from the data descriptor that ends
+/// the member whose data starts `tail` (APPNOTE 4.3.9): `crc(4)`, then the two
+/// sizes, 8 bytes each when `zip64`, else 4, after an optional `PK\x07\x08`.
+///
+/// A descriptor is taken only when its compressed size is the distance from
+/// the data's start to it, which a chance match or a later member's
+/// descriptor does not satisfy. Signed, it can sit anywhere; unsigned, it must
+/// end where the next record starts, or at the end of `tail`.
+fn data_descriptor(tail: &[u8], zip64: bool) -> Option<(u64, u64)> {
+    let width = if zip64 { 8 } else { 4 };
+    let size_at = |at: usize| {
+        let b = tail.get(at..at.checked_add(width)?)?;
+        let mut v = [0u8; 8];
+        v[..width].copy_from_slice(b);
+        Some(u64::from_le_bytes(v))
+    };
+    // The sizes of a descriptor whose CRC-32 is at `crc`, if the member's data
+    // ends at `end`.
+    let sizes_if_data_ends_at = |crc: usize, end: usize| {
+        let comp = size_at(crc + 4)?;
+        if comp != end as u64 {
+            return None;
+        }
+        Some((comp, size_at(crc + 4 + width)?))
+    };
+    let mut signed = memchr::memmem::find_iter(tail, b"PK\x07\x08");
+    if let Some(sizes) = signed.find_map(|sig| sizes_if_data_ends_at(sig + 4, sig)) {
+        return Some(sizes);
+    }
+    // Records that can follow a member: a local header, the central directory,
+    // its digital signature, the end record, the ZIP64 end record.
+    let next_record = |p: &usize| {
+        matches!(
+            tail.get(p + 2..p + 4),
+            Some([3, 4] | [1, 2] | [5, 5] | [5, 6] | [6, 6])
+        )
+    };
+    memchr::memmem::find_iter(tail, b"PK")
+        .filter(next_record)
+        .chain([tail.len()])
+        .filter_map(|next| next.checked_sub(4 + 2 * width))
+        .find_map(|crc| sizes_if_data_ends_at(crc, crc))
+}
+
+/// Where the data of a member with no size and no descriptor ends, for a codec
+/// that marks its own end: at the next header, or the end of `tail`. `None` for
+/// a stored member, or a method no specification defines, which is read as
+/// stored: either would take the next header as content.
+fn self_delimited_extent(tail: &[u8], method: u16) -> Option<u64> {
+    if method == 0 || !defined_method(method) {
         return None;
     }
     let next = [&b"PK\x03\x04"[..], &b"PK\x01\x02"[..], &b"PK\x05\x06"[..]]
@@ -1186,7 +1353,7 @@ fn deferred_member_size(data: &[u8], data_start: usize, method: u16) -> Option<u
         .filter_map(|sig| memfind(tail, sig))
         .min()
         .unwrap_or(tail.len());
-    (next > 0).then_some(next)
+    (next > 0).then_some(next as u64)
 }
 
 /// Stream a ZIP from any seekable reader, invoking `visit` per file member. With
@@ -1390,7 +1557,7 @@ pub fn extract_zip_from<Rd: Read + Seek + Clone, R>(
             let (raw, _) = bounded_read(&mut file, budget.limits.max_buffer_bytes)
                 .map_err(|e| LimitHit::new(format!("zip raw read: {e}")))?;
             drop(file);
-            match decode_zip_raw(method, &raw, usz, cap) {
+            match decode_zip_raw(method, &raw, Some(usz), cap) {
                 Some((out, truncated)) => (out, truncated, false),
                 None => {
                     if let Some(r) = oversized(budget, "archive member: unsupported ZIP codec") {
@@ -1494,40 +1661,22 @@ fn unclaimed_spans<R: Read + Seek>(
     (gaps, known)
 }
 
-/// Name, sizes and encryption flag from a local file header, WITHOUT
-/// decompressing anything.
-///
-/// Finding a hidden member and reading it are separate jobs, and only the first
-/// is needed to say the member is there. Keeping them separate is what lets a
-/// listing account for the whole archive at the cost of a header parse.
-///
-/// `None` for a directory entry, which has nothing to scan.
-fn local_header_info(data: &[u8], off: usize) -> Option<(String, u64, u64, bool)> {
-    let h = data.get(off..off + LFH_LEN)?;
-    let flags = u16::from_le_bytes([h[6], h[7]]);
-    let method = u16::from_le_bytes([h[8], h[9]]);
-    let crc = u32::from_le_bytes([h[14], h[15], h[16], h[17]]);
-    let comp = u64::from(u32::from_le_bytes([h[18], h[19], h[20], h[21]]));
-    let usz = u64::from(u32::from_le_bytes([h[22], h[23], h[24], h[25]]));
+/// Whether the local header at `off` names a member with something to scan:
+/// not a directory entry (no data, a name ending in '/'), and readable.
+/// Parses the header only; [`parse_local_member`] reads the member.
+fn local_header_has_content(data: &[u8], off: usize) -> bool {
+    let Some(h) = data.get(off..off + LFH_LEN) else {
+        return false;
+    };
     let name_len = usize::from(u16::from_le_bytes([h[26], h[27]]));
     let extra_len = usize::from(u16::from_le_bytes([h[28], h[29]]));
-    let name =
-        String::from_utf8_lossy(data.get(off + LFH_LEN..off + LFH_LEN + name_len)?).into_owned();
-    if comp == 0 && name.ends_with('/') {
-        return None;
-    }
-
-    // The encryption bit is checkable, not merely trustworthy, and extraction
-    // checks it: APK packers set it on every member to make analysis tools
-    // refuse an archive Android installs happily. Reporting the bit at face
-    // value here would have a listing say PASSWORD-PROTECTED where extraction
-    // finds cleartext — the same archive described two ways depending on which
-    // call was made. The check runs over bytes already in hand.
-    let encrypted = flags & 0x01 != 0 && {
-        let data_start = off + LFH_LEN + name_len + extra_len;
-        !encryption_flag_is_a_lie(data, data_start, comp as usize, method, flags, crc)
+    let name_end = off + LFH_LEN + name_len;
+    let Some(name) = data.get(off + LFH_LEN..name_end) else {
+        return false;
     };
-    Some((name, comp, usz, encrypted))
+    let extra = data.get(name_end..name_end + extra_len).unwrap_or(&[]);
+    let (comp, _, _) = local_sizes(h, extra);
+    !(comp == 0 && name.ends_with(b"/"))
 }
 
 /// Where in the unclaimed runs each hidden member's header sits.
@@ -1555,7 +1704,7 @@ fn find_orphans(
             if !plausible_local_header(buf, off) {
                 continue;
             }
-            if local_header_info(buf, off).is_some() {
+            if local_header_has_content(buf, off) {
                 out.push((span, off));
             }
         }
@@ -1808,7 +1957,7 @@ fn walk_raw_decode<R: Read + Seek, T>(
     let method = zip_method_code(&f.compression());
     let usz = f.size();
     let data_start = f.data_start();
-    match raw_decoder(method, f, usz, cap) {
+    match raw_decoder(method, f, Some(usz), cap) {
         Ok(mut r) => crate::stream::emit_stream(&meta, &mut r, budget, visit),
         Err(RawRefusal::Unsupported(_)) if !defined_method(method) && data_start.is_some() => {
             // A method no ZIP specification defines is no codec at all.
@@ -1828,6 +1977,11 @@ fn walk_raw_decode<R: Read + Seek, T>(
         }
         Err(RawRefusal::Unsupported(reason)) => {
             meta.unsupported = Some(reason);
+            Ok(visit(&meta, None, budget))
+        }
+        // The directory gives the member fewer bytes than its codec header.
+        Err(RawRefusal::Truncated) => {
+            meta.unsupported = Some("malformed zip member header");
             Ok(visit(&meta, None, budget))
         }
         Err(RawRefusal::TooBig) => {
@@ -1919,7 +2073,8 @@ pub(crate) fn hidden_members<Rd: Read + Seek>(
     let (unclaimed, truncated) = read_spans(&mut reader, &gaps, MAX_ORPHAN_SCAN)?;
     let mut out = Vec::new();
     for (span, off) in find_orphans(&unclaimed, &known) {
-        if let Some(entry) = parse_local_member(&unclaimed[span].1, off, budget)? {
+        // A span ends where a listed member or the directory starts.
+        if let Some(entry) = parse_local_member(&unclaimed[span].1, off, false, budget)? {
             out.push(entry);
         }
     }
@@ -2039,32 +2194,56 @@ mod directory_tests {
 mod zip_ppmd_tests {
     use super::*;
 
-    /// APPNOTE 5.9 packs the PPMd model parameters into the two bytes that
-    /// precede the stream. Getting the bias or the bit split wrong silently
-    /// builds the wrong model and decodes garbage, so pin the arithmetic.
+    use super::super::ppmd8::RestoreMethod;
+
+    /// APPNOTE 5.10.4: `wPPMd = (order - 1) + ((MB - 1) << 4) + (restore << 12)`,
+    /// little-endian. The 7-Zip fixture's member starts with `05 00`.
     #[test]
-    fn ppmd_params_follow_appnote_biases() {
-        // order in bits 0-3 (+1), memory MB in bits 4-11 (+1).
-        // w = 0x0107 -> order 8, mem 17 MB.
-        let (order, mem) = zip_ppmd_params([0x07, 0x01]).expect("valid params");
-        assert_eq!(order, 8);
-        assert_eq!(mem, 17 << 20);
+    fn ppmd_params_follow_appnote() {
+        assert_eq!(
+            zip_ppmd_params([0x05, 0x00]),
+            Some((6, 1 << 20, RestoreMethod::Restart))
+        );
+        assert_eq!(
+            zip_ppmd_params([0x07, 0x11]),
+            Some((8, 17 << 20, RestoreMethod::CutOff))
+        );
+        assert_eq!(
+            zip_ppmd_params([0xff, 0x0f]),
+            Some((16, 256 << 20, RestoreMethod::Restart))
+        );
     }
 
     #[test]
-    fn ppmd_params_reject_out_of_range_models() {
-        // order field 0 -> order 1, below PPMd7's minimum of 2.
+    fn ppmd_params_reject_what_ppmd8_does_not_define() {
+        // Order 1.
         assert!(zip_ppmd_params([0x00, 0x00]).is_none());
+        // Restore method 2 (freeze) and the undefined 3-15.
+        assert!(zip_ppmd_params([0x07, 0x20]).is_none());
+        assert!(zip_ppmd_params([0x07, 0xf0]).is_none());
         // Too short to carry the header at all.
         for raw in [&[0x07u8][..], &[]] {
-            assert!(decode_zip_raw(98, raw, 64, 1 << 20).is_none());
+            assert!(decode_zip_raw(98, raw, Some(64), 1 << 20).is_none());
         }
     }
 
-    /// The wiring must be *reached* for method 98, and a payload it cannot
-    /// decode must fail visibly rather than be dropped. (A real PPMd-compressed
-    /// fixture would need a PPMd encoder, which isn't available here; the
-    /// decoder itself is covered by the 7z tests that share it.)
+    /// A model larger than the buffer limit is refused before it is
+    /// allocated, as a limit rather than as damage.
+    #[test]
+    fn ppmd_model_over_the_buffer_limit_is_too_big() {
+        // order 6, 256 MB.
+        let raw = [0xf5u8, 0x0f, 0xde, 0xad, 0xbe, 0xef];
+        assert_eq!(
+            decode_zip_raw(98, &raw, Some(64), 1 << 20),
+            Some((Vec::new(), true))
+        );
+        assert!(matches!(
+            raw_decoder(98, &raw[..], Some(64), 1 << 20),
+            Err(RawRefusal::TooBig)
+        ));
+    }
+
+    /// A payload that does not decode fails visibly rather than being dropped.
     #[test]
     fn ppmd_member_with_undecodable_payload_does_not_silently_vanish() {
         let mut budget = Budget::new(Limits::default());
@@ -2072,8 +2251,45 @@ mod zip_ppmd_tests {
         // Valid parameter header, garbage stream.
         let raw = [0x07u8, 0x01, 0xde, 0xad, 0xbe, 0xef];
         assert!(
-            decode_zip_raw(98, &raw, 64, cap).is_none(),
+            decode_zip_raw(98, &raw, Some(64), cap).is_none(),
             "a corrupt PPMd stream must decode to nothing, so the caller reports it"
         );
+    }
+
+    /// The first member of a 7-Zip archive (order 12, 1 MB, cut-off), with bits
+    /// flipped and cut short: no panic, and never past the declared size.
+    #[test]
+    fn damaged_7zip_ppmd_member_never_panics_or_overruns() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/zip/7z_ppmd_large_then_small.zip"
+        );
+        let zip = std::fs::read(path).unwrap();
+        let u32_at = |o: usize| u32::from_le_bytes(zip[o..o + 4].try_into().unwrap());
+        let u16_at = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]) as usize;
+        let (comp, usz) = (u32_at(18) as usize, Some(u32_at(22) as u64));
+        let start = LFH_LEN + u16_at(26) + u16_at(28);
+        let member = &zip[start..start + comp];
+        assert_eq!(member[..2], [0x0b, 0x10]);
+        let cap = 1 << 20;
+        let (whole, over) = decode_zip_raw(98, member, usz, cap).expect("intact member decodes");
+        assert_eq!((Some(whole.len() as u64), over), (usz, false));
+
+        let flips = (2..18)
+            .flat_map(|p| (0..8).map(move |b| (p, b)))
+            .chain((18..member.len()).step_by(23).map(|p| (p, p % 8)));
+        for (pos, bit) in flips {
+            let mut bad = member.to_vec();
+            bad[pos] ^= 1 << bit;
+            if let Some((out, _)) = decode_zip_raw(98, &bad, usz, cap) {
+                assert!(Some(out.len() as u64) <= usz);
+            }
+        }
+        for cut in (0..member.len()).step_by(97) {
+            assert!(
+                decode_zip_raw(98, &member[..cut], usz, cap).is_none(),
+                "cut at {cut}: a truncated member is not a decoded one"
+            );
+        }
     }
 }

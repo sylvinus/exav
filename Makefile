@@ -11,15 +11,16 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www wasm-sizes lint fmt msrv av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
 	$(CARGO) build --release
 
 ## test: EVERY test exav owns: native feature matrix, wasm32, the WASM bindings'
-##       JS suites and the docs build. The one command to run before pushing.
-##       Needs `wasmtime` (test-wasm) and node (test-js, test-www); the
+##       JS suites, the viewer's and the docs build. The one command to run
+##       before pushing. Needs `wasmtime` (test-wasm), wasm-bindgen-cli
+##       (test-viewer) and node (test-js, test-viewer, test-www); the
 ##       sub-targets below run each part alone.
 ##
 ##       Excludes fuzzing and the two DIFFERENTIAL harnesses, which check exav
@@ -33,6 +34,7 @@ test:
 	$(MAKE) test-native
 	$(MAKE) test-wasm
 	$(MAKE) test-js
+	$(MAKE) test-viewer
 	$(MAKE) test-www
 
 ## test-native: the full native test matrix (every feature pass CI runs, no wasm).
@@ -63,6 +65,13 @@ test-native:
 	# is indistinguishable, to a pipeline reading `$$?`, from a clean scan.
 	$(CARGO) test -p exav-unpack --features testing-faults panic_containment
 	$(CARGO) test -p exav --features testing-faults --test decoder_crash
+	# DWG and DXF, behind exav-render's `dwg` feature, which no other crate of
+	# the workspace turns on; and alone, as @exav/viewer's DWG module builds it.
+	$(CARGO) test -p exav-render --features dwg
+	$(CARGO) test -p exav-render --no-default-features --features dwg
+	# IFC and STL, behind `ifc` and `stl`, as @exav/viewer's model module
+	# builds them.
+	$(CARGO) test -p exav-render --no-default-features --features ifc,stl
 
 ## test-yara-diff: the yara-x A/B differential harness. Compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT
@@ -92,6 +101,19 @@ test-yara-diff:
 test-js:
 	./scripts/test-js.sh
 
+## test-viewer: @exav/viewer: its wasm modules built from the current source,
+##              vitest units (pdf.js's image decoders against the package's
+##              among them), then the package built and checked as `npm publish`
+##              would upload it, the sink and wasm-import gates, and the demo
+##              built for production and driven in headless Chromium under its
+##              Content-Security-Policy, its sandboxed frame in Chromium,
+##              Firefox and WebKit. The
+##              archive plugin's peer, exav-unpack-wasm's pkg/, is rebuilt from
+##              the current source too. Needs wasm-bindgen-cli at the version
+##              crates/exav-viewer pins.
+test-viewer:
+	./scripts/test-viewer.sh
+
 ## test-www: type-check and build the exav.org docs site (broken links, bad
 ##           frontmatter, sidebar entries pointing at deleted pages).
 test-www:
@@ -112,6 +134,8 @@ lint:
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets --features exav-core/http -- -D warnings
 	$(CARGO) clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --features dwg -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings
 
 ## fmt: format the code
 fmt:

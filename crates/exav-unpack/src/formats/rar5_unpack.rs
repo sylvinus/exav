@@ -6,11 +6,11 @@
 //! ARM filters). It is BSD-2-Clause-derived; the upstream copyright and full
 //! licence text live in the repo's top-level `NOTICE` file.
 //!
-//! Scope: single-volume, non-solid, non-encrypted RAR5 members compressed with
-//! the LZ methods (compression versions 0..). Multi-volume block merging,
-//! solid-stream cross-file window reuse and PPMd are intentionally not handled
-//! here (the caller records those members as metadata-only). Everything is
-//! bounds-checked and never panics on malformed input.
+//! Scope: RAR5 members, which are all LZ: RAR 5.0 dropped PPMd. Solid groups
+//! share one decoder ([`Unpacker50`]). A member split across volumes reaches
+//! this module only once the volumes are joined (`rar::join_volumes`), and an
+//! encrypted one only once decrypted. Everything is bounds-checked and never
+//! panics on malformed input.
 
 use crate::{Budget, LimitHit};
 
@@ -996,7 +996,11 @@ mod tests {
     fn the_arm_filter_counts_from_the_start_of_its_member() {
         let mut block = Vec::new();
         for i in 0..64u32 {
-            let word = if i % 3 == 0 { 0xeb00_0000 | (i * 4099) } else { i * 0x0101_0101 };
+            let word = if i % 3 == 0 {
+                0xeb00_0000 | (i * 4099)
+            } else {
+                i * 0x0101_0101
+            };
             block.extend_from_slice(&word.to_le_bytes());
         }
         block[..4].copy_from_slice(&(0xeb00_0000u32 | 16).to_le_bytes());

@@ -19,6 +19,10 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WASMTIME="${WASMTIME:-wasmtime}"
+# Its installer puts it here and adds it to PATH only in new login shells.
+if ! command -v "$WASMTIME" >/dev/null 2>&1 && [ -x "$HOME/.wasmtime/bin/wasmtime" ]; then
+  WASMTIME="$HOME/.wasmtime/bin/wasmtime"
+fi
 
 if ! command -v "$WASMTIME" >/dev/null 2>&1; then
   echo "error: '$WASMTIME' not found. Install wasmtime (https://wasmtime.dev) or set \$WASMTIME." >&2

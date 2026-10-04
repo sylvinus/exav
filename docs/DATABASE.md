@@ -87,7 +87,7 @@ swapping it in hot-reloads within a poll tick, with no explicit `RELOAD`. The
 framing `MAGIC | VERSION | payload | CRC-32` lets the daemon reject a
 torn/wrong-version database on reload and keep serving the current one. The
 database is a trusted artifact: the CRC-32 catches damage, not tampering. See
-[Updating a running deployment](https://exav.org/guides/prebuilt-database/#updating-a-running-deployment).
+[Updating a running deployment](https://exav.org/scanner/guides/prebuilt-database/#updating-a-running-deployment).
 
 ## Future ideas
 

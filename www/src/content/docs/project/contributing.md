@@ -4,13 +4,13 @@ description: How to contribute to exav, with the clean-room rule, the checks to 
 ---
 
 Issues and PRs are welcome. Good first areas: formats from the
-[gap list](/reference/formats/#the-complete-gap-list), bytecode host APIs (see the
-[comparison](/project/comparison-with-clamav/#bytecode-host-apis)), and fuzz
+[gap list](/unpack/formats/#the-complete-gap-list), bytecode host APIs (see the
+[comparison](/scanner/reference/comparison-with-clamav/#bytecode-host-apis)), and fuzz
 targets. For a vulnerability, do not open a public issue: see
 [Security](/project/security/#reporting-a-vulnerability). Contributors follow the
 [code of conduct](https://github.com/sylvinus/exav/blob/main/CODE_OF_CONDUCT.md).
 
-To start, install Rust 1.91 or newer and a C compiler (the `http` build links
+To start, install Rust 1.92 or newer and a C compiler (the `http` build links
 `ring`), clone the repository and run `make test-native`. The rest of
 `make test` also needs `wasmtime`, Node.js and `wasm-pack`
 ([below](#before-submitting)).
@@ -108,7 +108,7 @@ Not in `make test`:
 
 | target | what it does | needs |
 | --- | --- | --- |
-| `scripts/difftest.sh` | exav against clamd over a corpus, a compliance diff (see [differential testing](/concepts/differential-testing/)) | Docker, a corpus and a signature database (`make db`) |
+| `scripts/difftest.sh` | exav against clamd over a corpus, a compliance diff (see [differential testing](/scanner/concepts/differential-testing/)) | Docker, a corpus and a signature database (`make db`) |
 | `make test-yara-diff` | exav's YARA engine against `yara-x` on identical rules and inputs; without `yr` the tests skip and pass | `yara-x-cli` |
 | `make miri` | selected library tests under Miri, which checks the `unsafe` in dependencies along real code paths; slow | a nightly toolchain with the `miri` component |
 

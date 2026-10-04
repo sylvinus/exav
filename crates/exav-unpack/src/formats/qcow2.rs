@@ -17,8 +17,6 @@
 //! Reconstruction emits the guest disk as a single member, which the partition
 //! and filesystem handlers then pick up in the normal way.
 
-use std::io::Cursor;
-
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// L2 entry bit 62: the cluster is deflate-compressed.
@@ -154,16 +152,15 @@ pub(crate) fn extract_qcow2<R>(
                 else {
                     continue; // past the end: truncated image, not a hidden cluster
                 };
+                // Cut by the end of the file: what is there is decoded, the
+                // rest is absent.
+                let rest_absent = coffset.saturating_add(csize) > data.len();
                 // Clusters are raw DEFLATE, with no zlib wrapper.
-                match crate::bounded_read(
-                    flate2::read::DeflateDecoder::new(Cursor::new(raw)),
-                    cluster_size as u64,
-                ) {
-                    Ok((out, _)) => {
-                        let k = n.min(out.len());
-                        disk[guest..guest + k].copy_from_slice(&out[..k]);
-                    }
-                    Err(_) => undecodable_clusters += 1,
+                let s = crate::salvage(crate::inflate::Inflate::new(raw), cluster_size as u64);
+                let k = n.min(s.data.len());
+                disk[guest..guest + k].copy_from_slice(&s.data[..k]);
+                if s.part_way(rest_absent) {
+                    undecodable_clusters += 1;
                 }
                 continue;
             }

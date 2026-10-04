@@ -20,9 +20,15 @@ mod bytecode_gating;
 #[cfg(feature = "all-formats")]
 mod cdb_stream;
 #[cfg(feature = "all-formats")]
+mod checksum_mismatch;
+#[cfg(feature = "all-formats")]
+mod cut_short_members;
+#[cfg(feature = "all-formats")]
 mod embedded_carve;
 #[cfg(feature = "all-formats")]
 mod encrypted_archives;
+#[cfg(feature = "image-hash")]
+mod fuzzy_img_formats;
 #[cfg(feature = "all-formats")]
 mod heuristic_alerts;
 #[cfg(feature = "all-formats")]
@@ -42,6 +48,8 @@ mod ooxml_container;
 #[cfg(feature = "all-formats")]
 mod oversize_container;
 mod salvage;
+#[cfg(feature = "all-formats")]
+mod sevenz_ppmd;
 mod size_caps;
 mod tar_size_terminator;
 mod target_flash;
@@ -53,3 +61,5 @@ mod untyped_container_dispatch;
 mod yara_dotnet;
 #[cfg(feature = "all-formats")]
 mod zip_dual_index;
+#[cfg(feature = "all-formats")]
+mod zip_ppmd;

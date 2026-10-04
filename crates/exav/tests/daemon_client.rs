@@ -471,6 +471,53 @@ fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
     assert_eq!(code, 3, "which is exit 3, not 2: {out}");
 }
 
+/// What was held of a stream too large to hold is scanned: a detection in it is
+/// found, as in the start of a file past `--max-input-bytes`.
+#[test]
+fn a_detection_in_what_was_held_of_a_stream_is_found() {
+    use std::io::Write;
+    let d = Daemon::start(
+        "077",
+        &["--spill-dir", "off", "--spill-threshold-bytes", "1M"],
+    );
+    let mut body = eicar().to_vec();
+    body.resize(4 << 20, b'A');
+    let ask = |verb: &str| {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(format!("z{verb}\0").as_bytes()).unwrap();
+        for c in body.chunks(1 << 20) {
+            s.write_all(&(c.len() as u32).to_be_bytes()).unwrap();
+            s.write_all(c).unwrap();
+        }
+        s.write_all(&0u32.to_be_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string()
+    };
+    // The oracle: the same bytes as a file, scanned as far as the same size.
+    let f = d.file("held.bin", &body);
+    let out = exav()
+        .arg("-d")
+        .arg(d._db.path())
+        .args(["--quiet", "--max-input-bytes", "1M"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    let local = String::from_utf8_lossy(&out.stdout);
+    let name = local
+        .trim()
+        .strip_prefix(&format!("{}: ", f.display()))
+        .and_then(|l| l.strip_suffix(" FOUND"))
+        .unwrap_or_else(|| panic!("{local}"))
+        .to_string();
+    assert_eq!(ask("INSTREAM"), format!("stream: {name} FOUND"));
+    let json = ask("EXINSTREAM");
+    assert!(json.contains("\"status\":\"FOUND\""), "{json}");
+    assert!(json.contains(&format!("\"{name}\"")), "{json}");
+}
+
 /// A job cut off by `--max-scan-secs` is answered, not closed in silence: a
 /// connection that ends with no reply reads as a clean scan to some clients.
 #[test]
@@ -489,6 +536,28 @@ fn a_timed_out_job_gets_an_answer() {
     assert!(
         reply.contains("LIMITS-EXCEEDED ERROR"),
         "no verdict for a job the timer stopped: {reply:?}"
+    );
+}
+
+/// The same for a job still scanning when its time runs out, rather than one
+/// waiting on its client.
+#[test]
+fn a_job_still_scanning_when_its_time_runs_out_gets_an_answer() {
+    use std::io::{Read, Write};
+    let d = Daemon::start("077", &["--max-scan-secs", "1"]);
+    // Sparse: seconds of scanning, and no disk.
+    let f = d.dir.path().join("zeros.bin");
+    std::fs::File::create(&f).unwrap().set_len(2 << 30).unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(format!("zSCAN {}\0", f.display()).as_bytes())
+        .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out);
+    assert!(
+        reply.contains("exceeded --max-scan-secs LIMITS-EXCEEDED ERROR"),
+        "{reply:?}"
     );
 }
 
@@ -543,7 +612,11 @@ fn the_cpu_limit_is_per_job_not_per_worker() {
         jobs += 1;
     }
     #[cfg(target_os = "linux")]
-    assert_eq!(children_of(d.child.id()), [worker], "the worker was replaced");
+    assert_eq!(
+        children_of(d.child.id()),
+        [worker],
+        "the worker was replaced"
+    );
 }
 
 /// User plus system CPU seconds `pid` has used, from `/proc/<pid>/stat`.
@@ -551,7 +624,12 @@ fn the_cpu_limit_is_per_job_not_per_worker() {
 fn cpu_secs(pid: u32) -> f64 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     // Fields 14 and 15, counted after the `(comm)` that may hold spaces.
-    let rest: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
+    let rest: Vec<&str> = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
     let ticks: u64 = rest[11].parse::<u64>().unwrap() + rest[12].parse::<u64>().unwrap();
     // SAFETY: sysconf reads a constant.
     ticks as f64 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64
@@ -566,7 +644,13 @@ fn children_of(pid: u32) -> Vec<u32> {
             let e = e.ok()?;
             let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
             // `pid (comm) state ppid ...`; comm may hold spaces, so split after it.
-            let ppid: u32 = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+            let ppid: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
             (ppid == pid).then(|| e.file_name().to_str()?.parse().ok())?
         })
         .collect()
@@ -580,7 +664,9 @@ fn ping(d: &Daemon) -> String {
     s.write_all(b"zPING\0").unwrap();
     let mut out = Vec::new();
     let _ = s.read_to_end(&mut out);
-    String::from_utf8_lossy(&out).trim_end_matches('\0').to_string()
+    String::from_utf8_lossy(&out)
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 /// `--max-jobs-per-worker off` never recycles the worker, where a count does.

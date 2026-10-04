@@ -20,7 +20,7 @@ ARG BIN_SOURCE=build
 # Signatures are NOT bundled (exav ships no GPL DB and no CDN URL). Provide them
 # by mounting a populated volume, running a sidecar that writes it (see
 # docker-compose.yml), or setting EXAV_SIG_SOURCES to auto-download from a mirror
-# you trust. See https://exav.org/guides/docker/ for the env vars.
+# you trust. See https://exav.org/scanner/guides/docker/ for the env vars.
 #
 # One-shot scan. Paths on the command line win over the `EXAV_LISTEN` set below
 # for the default daemon; the scan needs the signature volume too:
@@ -38,10 +38,9 @@ ARG BIN_SOURCE=build
 #     of magnitude slower than cross-compiling it.
 # rust:alpine targets *-unknown-linux-musl and links statically. `build-base`
 # provides the C toolchain the TLS stack (ring, via the `http` feature's ureq →
-# rustls) needs to compile under musl. Pinned to 1.91, the current MSRV floor
-# imposed by the yara-x/wasmtime/cranelift tree (see the workspace `rust-version`);
-# bump both together when that stack raises its MSRV again.
-FROM rust:1.91-alpine AS build
+# rustls) needs to compile under musl. Pinned to 1.92, the MSRV floor (see the
+# workspace `rust-version`, which says what sets it); bump both together.
+FROM rust:1.92-alpine AS build
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /src
 COPY . .
@@ -121,6 +120,11 @@ EXPOSE 1344
 # the check cannot tell that from a daemon that died. Those runs are short and
 # exit on their own, so this is cosmetic under `docker run`; pass
 # `--no-healthcheck` if a supervisor would act on it.
+#
+# HEALTHCHECK belongs to Docker's image format: an image stored or pulled with
+# only the OCI configuration (which has no such field) loses it. An
+# orchestrator that matters should say it itself, with the same command
+# (docker-compose.yml, and the Health section of the Docker guide).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD ["/exav", "--ping"]
 

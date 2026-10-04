@@ -274,7 +274,12 @@ fn large_member() -> Vec<u8> {
             .into_bytes()
         })
         .collect();
-    let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+    // In two pieces, so that no scanner flags this file.
+    let eicar = concat!(
+        "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-",
+        "STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+    )
+    .as_bytes();
     let mut big = lines.repeat(2);
     big.truncate(40000 - eicar.len());
     big.extend_from_slice(eicar);
@@ -286,24 +291,30 @@ const SMALL_MEMBER: &[u8] = b"the member after the large one, which the walk mus
 /// A ZIP of `1-big.bin` as `big` (already compressed with `method`) and
 /// `2-after.txt` stored, central directory included.
 fn zip_large_then_small(method: u16, big: &[u8]) -> Vec<u8> {
-    let crc = |d: &[u8]| {
-        let mut c = flate2::Crc::new();
-        c.update(d);
-        c.sum()
-    };
-    let members: [(&str, u16, Vec<u8>, u32, u32); 2] = [
-        ("1-big.bin", method, big.to_vec(), crc(&large_member()), 40000),
+    zip_of(&[
+        ("1-big.bin", method, big, crc(&large_member()), 40000),
         (
             "2-after.txt",
             0,
-            SMALL_MEMBER.to_vec(),
+            SMALL_MEMBER,
             crc(SMALL_MEMBER),
             SMALL_MEMBER.len() as u32,
         ),
-    ];
+    ])
+}
+
+fn crc(d: &[u8]) -> u32 {
+    let mut c = flate2::Crc::new();
+    c.update(d);
+    c.sum()
+}
+
+/// A ZIP of `(name, method, raw data, crc, uncompressed size)` members, central
+/// directory included.
+fn zip_of(members: &[(&str, u16, &[u8], u32, u32)]) -> Vec<u8> {
     let mut z = Vec::new();
     let mut cd = Vec::new();
-    for (name, m, data, crc, usize) in &members {
+    for (name, m, data, crc, usize) in members {
         let at = z.len() as u32;
         let fields = |v: &mut Vec<u8>| {
             v.extend_from_slice(&20u16.to_le_bytes()); // version needed
@@ -332,20 +343,30 @@ fn zip_large_then_small(method: u16, big: &[u8]) -> Vec<u8> {
     z.extend_from_slice(&cd);
     z.extend_from_slice(b"PK\x05\x06");
     z.extend_from_slice(&[0; 4]); // disk numbers
-    z.extend_from_slice(&2u16.to_le_bytes());
-    z.extend_from_slice(&2u16.to_le_bytes());
+    z.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    z.extend_from_slice(&(members.len() as u16).to_le_bytes());
     z.extend_from_slice(&(cd.len() as u32).to_le_bytes());
     z.extend_from_slice(&cd_at.to_le_bytes());
     z.extend_from_slice(&0u16.to_le_bytes());
     z
 }
 
+/// Each member the streamed walk over `blob` visits, once, as
+/// `(name, unsupported, bytes)`, and how the walk ended.
+type Seen = Vec<(String, Option<&'static str>, Vec<u8>)>;
+
 /// The streamed walk over `blob` with a buffer far smaller than the large
-/// member: each member once, as `(name, unsupported, bytes)`.
-fn walk_small_buffer(blob: &[u8]) -> Vec<(String, Option<&'static str>, Vec<u8>)> {
+/// member.
+fn walk_small_buffer(blob: &[u8]) -> Seen {
+    let (seen, end) = walk_with_buffer(blob, 8192);
+    end.unwrap();
+    seen
+}
+
+fn walk_with_buffer(blob: &[u8], max_buffer: u64) -> (Seen, Result<(), exav_unpack::LimitHit>) {
     use exav_unpack::{walk, Member, MemberMeta};
     let mut limits = Limits::default();
-    limits.max_buffer_bytes = 8192;
+    limits.max_buffer_bytes = max_buffer;
     let mut seen = Vec::new();
     let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
         let mut d = Vec::new();
@@ -359,8 +380,8 @@ fn walk_small_buffer(blob: &[u8]) -> Vec<(String, Option<&'static str>, Vec<u8>)
         seen.push((m.name.clone(), m.unsupported, d));
         None::<()>
     };
-    walk(Format::Zip, &blob, &mut Budget::new(limits), &mut visit).unwrap();
-    seen
+    let end = walk(Format::Zip, &blob, &mut Budget::new(limits), &mut visit).map(|_| ());
+    (seen, end)
 }
 
 fn assert_both_members_whole(what: &str, blob: &[u8]) {
@@ -369,7 +390,10 @@ fn assert_both_members_whole(what: &str, blob: &[u8]) {
     assert_eq!(seen.len(), 2, "{what}: each member once: {summary:?}");
     assert_eq!(seen[0].0, "1-big.bin", "{what}: {summary:?}");
     assert_eq!(seen[0].1, None, "{what}: {summary:?}");
-    assert!(seen[0].2 == large_member(), "{what}: the large member differs");
+    assert!(
+        seen[0].2 == large_member(),
+        "{what}: the large member differs"
+    );
     assert_eq!(seen[1].0, "2-after.txt", "{what}: {summary:?}");
     assert_eq!(seen[1].2, SMALL_MEMBER, "{what}: {summary:?}");
 }
@@ -393,6 +417,62 @@ fn a_large_member_in_any_codec_streams_and_the_walk_goes_on() {
     }
 }
 
+/// `7z_ppmd_large_then_small.zip` was written by 7-Zip 25.01 at `-mx=9`, which
+/// for PPMd means order 12, a 1 MB model and the cut-off restore method
+/// (members start `0b 10`). The model is allocated whole, so it takes a buffer
+/// limit of 1 MB; below that each member is a limit, not damage.
+#[test]
+fn a_ppmd_member_written_by_7zip_is_decoded_whole() {
+    let blob = fixture("7z_ppmd_large_then_small.zip");
+    let (seen, end) = walk_with_buffer(&blob, 1 << 20);
+    end.unwrap();
+    let summary: Vec<_> = seen.iter().map(|s| (&s.0, s.1, s.2.len())).collect();
+    assert_eq!(seen.len(), 2, "{summary:?}");
+    assert_eq!((seen[0].0.as_str(), seen[0].1), ("1-big.bin", None));
+    assert!(seen[0].2 == large_member(), "the large member differs");
+    assert_eq!(
+        (seen[1].0.as_str(), seen[1].1, &seen[1].2[..]),
+        ("2-after.txt", None, SMALL_MEMBER)
+    );
+
+    let (seen, end) = walk_with_buffer(&blob, (1 << 20) - 1);
+    assert!(seen.is_empty(), "{seen:?}");
+    let limit = end.unwrap_err();
+    assert!(!limit.is_corrupt(), "{limit:?}");
+}
+
+/// `ppmd_7zip.zip`, written by 7-Zip 25.01:
+/// `7z a -tzip -mm=PPMd -mo=6 ppmd_7zip.zip known.txt`, then the same with
+/// `-mo=16` for `order16.txt`, which is `known.txt` three times. Both are 1 MB
+/// models with the restart method.
+fn ppmd_7zip_known() -> Vec<u8> {
+    let mut t = b"exav PPMd ZIP fixture\n".to_vec();
+    for i in 1..=40 {
+        t.extend_from_slice(
+            format!("line {i:02}: the quick brown fox jumps over the lazy dog\n").as_bytes(),
+        );
+    }
+    t
+}
+
+#[test]
+fn zip_ppmd_members_written_by_7zip_are_decoded() {
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Zip, &fixture("ppmd_7zip.zip"), &mut budget).unwrap();
+    let got: Vec<_> = entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.unsupported, e.data.clone()))
+        .collect();
+    let known = ppmd_7zip_known();
+    assert_eq!(
+        got,
+        [
+            ("known.txt", None, known.clone()),
+            ("order16.txt", None, known.repeat(3))
+        ]
+    );
+}
+
 /// The same for zstd (method 93), written by ruzstd's encoder.
 #[test]
 #[cfg(feature = "zstd")]
@@ -409,7 +489,8 @@ fn a_large_zstd_member_streams_and_the_walk_goes_on() {
 #[cfg(feature = "xz")]
 fn a_large_xz_member_streams_and_the_walk_goes_on() {
     use std::io::Write;
-    let mut w = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6)).unwrap();
+    let mut w =
+        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6)).unwrap();
     w.write_all(&large_member()).unwrap();
     let big = w.finish().unwrap();
     assert_both_members_whole("xz", &zip_large_then_small(95, &big));
@@ -438,6 +519,14 @@ fn lfh(name: &str, method: u16, flags: u16, payload: &[u8], declared_comp: Optio
     v.extend_from_slice(&0u16.to_le_bytes()); // extra len
     v.extend_from_slice(name.as_bytes());
     v.extend_from_slice(payload);
+    v
+}
+
+/// [`lfh`] declaring `usize` as the uncompressed size, for a codec that
+/// decodes to the declared size.
+fn lfh_sized(name: &str, method: u16, payload: &[u8], usize: u32) -> Vec<u8> {
+    let mut v = lfh(name, method, 0, payload, None);
+    v[22..26].copy_from_slice(&usize.to_le_bytes());
     v
 }
 
@@ -525,22 +614,6 @@ fn a_chance_signature_with_a_nonsense_method_is_still_rejected() {
 }
 
 #[test]
-fn orphan_truncated_member_is_not_flagged_the_bytes_are_absent() {
-    // Declare far more compressed bytes than the file contains. The archive is
-    // truncated, so the declared bytes are ABSENT rather than hidden — what does
-    // exist is still covered by the outer raw scan. Reporting here would make
-    // every damaged archive noisy for no security gain (docs/QUIRKS.md).
-    let e = orphan_entries(&lfh("cut.bin", 0, 0, b"only-a-few", Some(50_000)));
-    assert!(
-        e.iter().all(|x| x.unsupported.is_none()),
-        "truncation must not be reported as unreadable, got {:?}",
-        e.iter()
-            .map(|x| (&x.name, x.unsupported))
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
 fn orphan_streaming_member_without_sizes_is_reported() {
     // Data-descriptor flag with no in-line compressed size: nothing to carve,
     // but the member exists.
@@ -561,6 +634,56 @@ fn orphan_directory_entry_is_not_reported() {
         !e.iter().any(|x| x.name == "adir/"),
         "a directory entry should not be reported as unscannable"
     );
+}
+
+/// A deflated member declaring 0 compressed and 0 uncompressed bytes is an
+/// empty member: Python's zipfile reads it as `b''`. Civil 3D writes such
+/// members in the ZIPs it keeps in DXF XRECORDs. Checked through the central
+/// directory (streamed walk and buffered extraction) and as an orphan.
+#[test]
+fn a_deflated_member_of_zero_bytes_is_empty() {
+    use exav_unpack::{walk, Member, MemberMeta};
+    let blob = zip_of(&[
+        ("empty.txt", 8, b"", 0, 0),
+        ("after.txt", 0, EICAR, crc(EICAR), EICAR.len() as u32),
+    ]);
+    let want = vec![
+        ("empty.txt".to_string(), None, Ok(()), Vec::new()),
+        ("after.txt".to_string(), None, Ok(()), EICAR.to_vec()),
+    ];
+
+    let mut seen = Vec::new();
+    let mut visit = |m: &MemberMeta, content: Option<Member<'_>>, _: &mut Budget| {
+        let mut d = Vec::new();
+        let read = match content {
+            Some(Member::Stream(r)) => r.read_to_end(&mut d).map(drop).map_err(|e| e.to_string()),
+            Some(Member::Bytes(b)) => {
+                d = b;
+                Ok(())
+            }
+            None => Ok(()),
+        };
+        seen.push((m.name.clone(), m.unsupported, read, d));
+        None::<()>
+    };
+    walk(
+        Format::Zip,
+        &blob,
+        &mut Budget::new(Limits::default()),
+        &mut visit,
+    )
+    .unwrap();
+    assert_eq!(seen, want, "streamed");
+
+    let got: Vec<_> = orphan_entries(&blob)
+        .into_iter()
+        .map(|e| (e.name, e.unsupported, Ok::<(), String>(()), e.data))
+        .collect();
+    assert_eq!(got, want, "buffered");
+
+    let got = orphan_entries(&lfh("empty.txt", 8, 0, b"", None));
+    let got: Vec<_> = got.iter().map(|e| (&e.name, e.unsupported)).collect();
+    assert!(got.iter().all(|e| e.1.is_none()), "orphan: {got:?}");
 }
 
 #[test]
@@ -651,14 +774,461 @@ fn orphan_stored_member_with_deferred_size_is_reported_not_guessed() {
     }
 }
 
-/// ZIP method 98 (PPMd var.H) end-to-end, against a stream produced by an
-/// independent reference encoder (`ppmd-rust`) rather than by exav's own code.
-///
-/// The stream format is shared with 7z, but ZIP carries the model parameters in
-/// a 2-byte APPNOTE 5.9 header at the front of the member instead of in coder
-/// properties — so this is the part 7z's tests do NOT cover.
+// --- Sizes after the data (general-purpose bit 3) ----------------------------
+//
+// A writer that cannot seek back, such as one writing to a pipe, sets bit 3,
+// leaves the sizes in the local header zero, and puts them in a data
+// descriptor after the member data. Without the central directory, the
+// descriptor is the only place the sizes are.
+
+/// `known.txt`, the one member of each `dd_*.zip`.
+fn dd_known() -> Vec<u8> {
+    let mut t = b"exav data descriptor fixture\n".to_vec();
+    for i in 1..=40 {
+        t.extend_from_slice(
+            format!("line {i:02}: the quick brown fox jumps over the lazy dog\n").as_bytes(),
+        );
+    }
+    t
+}
+
+/// Each written as a stream: bit 3 set, sizes zero in the local header, a
+/// signed data descriptor after the data. `dd_7zip_<method>.zip`: 7-Zip 25.01,
+/// `7z a -tzip -mm=<method> -so x.zip known.txt > out` (LZMA with its end
+/// marker, flag bit 1). `dd_python_*.zip`: Python 3.13 `zipfile` over an
+/// unseekable stream; the `zip64` ones with `force_zip64=True`, which puts a
+/// ZIP64 extra field in the local header and 8-byte sizes in the descriptor.
+/// Paired with whether this build has the codec.
+const DATA_DESCRIPTOR_FIXTURES: [(&str, bool); 9] = [
+    ("dd_7zip_deflate.zip", true),
+    ("dd_7zip_deflate64.zip", true),
+    ("dd_7zip_bzip2.zip", cfg!(feature = "bzip2")),
+    ("dd_7zip_lzma.zip", cfg!(feature = "lzip")),
+    ("dd_7zip_ppmd.zip", true),
+    ("dd_7zip_xz.zip", cfg!(feature = "xz")),
+    ("dd_python_stored.zip", true),
+    ("dd_python_stored_zip64.zip", true),
+    ("dd_python_lzma_zip64.zip", cfg!(feature = "lzip")),
+];
+
+/// The archive cut where its central directory starts: the member, found only
+/// by the local-header scan.
+fn orphaned(zip: &[u8]) -> Vec<u8> {
+    let cd = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    zip[..cd].to_vec()
+}
+
+/// `member` with its data descriptor's signature removed, which APPNOTE
+/// 4.3.9.3 makes optional.
+fn unsigned_descriptor(member: &[u8]) -> Vec<u8> {
+    let sig = member.windows(4).rposition(|w| w == b"PK\x07\x08").unwrap();
+    [&member[..sig], &member[sig + 4..]].concat()
+}
+
+/// `member` in front of a valid one-member ZIP, whose central directory does
+/// not list it.
+fn hidden_before_a_zip(member: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    z.start_file("carrier.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    z.write_all(SMALL_MEMBER).unwrap();
+    [member, &z.finish().unwrap().into_inner()].concat()
+}
+
 #[test]
-#[cfg(feature = "sevenz")]
+fn orphan_members_with_a_data_descriptor_are_decoded_whole() {
+    let known = dd_known();
+    let mut wrong = Vec::new();
+    for (name, built) in DATA_DESCRIPTOR_FIXTURES {
+        if !built {
+            continue;
+        }
+        let zip = fixture(name);
+        let member = orphaned(&zip);
+        let unsigned = unsigned_descriptor(&member);
+        for (what, blob) in [
+            ("listed", &zip),
+            ("orphan", &member),
+            ("orphan, unsigned descriptor", &unsigned),
+        ] {
+            let got: Vec<_> = orphan_entries(blob)
+                .into_iter()
+                .map(|e| (e.name, e.unsupported, e.data))
+                .collect();
+            if got != [("known.txt".to_string(), None, known.clone())] {
+                let summary: Vec<_> = got.iter().map(|g| (&g.0, g.1, g.2.len())).collect();
+                wrong.push(format!("{name}, {what}: {summary:?}"));
+            }
+        }
+        // The streamed walk reads only the space the central directory leaves
+        // unclaimed, which here ends where the member's descriptor does.
+        for (what, m) in [("hidden", &member), ("hidden, unsigned", &unsigned)] {
+            let (seen, end) = walk_with_buffer(&hidden_before_a_zip(m), 16 << 20);
+            end.unwrap();
+            let want = [
+                ("carrier.txt".to_string(), None, SMALL_MEMBER.to_vec()),
+                ("known.txt".to_string(), None, known.clone()),
+            ];
+            if seen != want {
+                let summary: Vec<_> = seen.iter().map(|s| (&s.0, s.1, s.2.len())).collect();
+                wrong.push(format!("{name}, {what}: {summary:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The same for zstd (method 93), which no writer at hand puts in a ZIP: the
+/// member from ruzstd's encoder, behind a header and a descriptor laid out as
+/// in `dd_7zip_*.zip`.
+#[test]
+#[cfg(feature = "zstd")]
+fn orphan_zstd_member_with_a_data_descriptor_is_decoded() {
+    let known = dd_known();
+    let packed =
+        ruzstd::encoding::compress_to_vec(&known[..], ruzstd::encoding::CompressionLevel::Fastest);
+    let mut member = lfh("known.txt", 93, 0x0008, &[], Some(0));
+    member.extend_from_slice(&packed);
+    member.extend_from_slice(b"PK\x07\x08");
+    member.extend_from_slice(&0u32.to_le_bytes()); // CRC-32, not checked here
+    member.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+    member.extend_from_slice(&(known.len() as u32).to_le_bytes());
+    for blob in [member.clone(), unsigned_descriptor(&member)] {
+        let got: Vec<_> = orphan_entries(&blob)
+            .into_iter()
+            .map(|e| (e.name, e.unsupported, e.data))
+            .collect();
+        assert!(got == [("known.txt".to_string(), None, known.clone())]);
+    }
+}
+
+/// `zip64_python_lzma.zip`: Python 3.13 `zipfile`, `force_zip64=True`, to a
+/// file: both sizes `0xFFFFFFFF` in the local header and given in its ZIP64
+/// extra field. Read from the header alone, the member ran past the end of the
+/// file and was dropped as truncated.
+#[test]
+#[cfg(feature = "lzip")]
+fn orphan_zip64_member_is_decoded() {
+    let zip = fixture("zip64_python_lzma.zip");
+    for blob in [&zip[..], &orphaned(&zip)] {
+        let got: Vec<_> = orphan_entries(blob)
+            .into_iter()
+            .map(|e| (e.name, e.unsupported, e.data))
+            .collect();
+        assert!(
+            got == [("known.txt".to_string(), None, dd_known())],
+            "{:?}",
+            got.iter()
+                .map(|g| (&g.0, g.1, g.2.len()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A descriptor with 8-byte sizes behind a header without the ZIP64 field,
+/// against APPNOTE 4.3.9.2. Read with 4-byte sizes, its uncompressed size is
+/// the compressed size's high half, zero, which would decode nothing; the
+/// member is decoded to its end marker instead.
+#[test]
+fn a_zero_size_in_a_descriptor_is_not_taken_at_its_word() {
+    let member = orphaned(&fixture("dd_7zip_ppmd.zip"));
+    let sig = member.windows(4).rposition(|w| w == b"PK\x07\x08").unwrap();
+    let field = |o: usize| u64::from(u32::from_le_bytes(member[o..o + 4].try_into().unwrap()));
+    let (comp, usz) = (field(sig + 8), field(sig + 12));
+    let mut blob = member[..sig + 8].to_vec();
+    blob.extend_from_slice(&comp.to_le_bytes());
+    blob.extend_from_slice(&usz.to_le_bytes());
+    let got: Vec<_> = orphan_entries(&blob)
+        .into_iter()
+        .map(|e| (e.name, e.unsupported, e.data))
+        .collect();
+    assert!(
+        got == [("known.txt".to_string(), None, dd_known())],
+        "{:?}",
+        got.iter()
+            .map(|g| (&g.0, g.1, g.2.len()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// With no descriptor at all, a codec that marks its own end is decoded up to
+/// it, as far as the next header.
+#[test]
+fn orphan_member_without_its_descriptor_is_decoded_to_its_end_marker() {
+    let known = dd_known();
+    for (name, built) in [
+        ("dd_7zip_lzma.zip", cfg!(feature = "lzip")),
+        ("dd_7zip_ppmd.zip", true),
+    ] {
+        if !built {
+            continue;
+        }
+        let member = orphaned(&fixture(name));
+        let sig = member.windows(4).rposition(|w| w == b"PK\x07\x08").unwrap();
+        let mut blob = member[..sig].to_vec();
+        blob.extend_from_slice(&lfh("second.txt", 0, 0, b"harmless", None));
+        let entries = orphan_entries(&blob);
+        let got: Vec<_> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.unsupported, e.data.len()))
+            .collect();
+        assert_eq!(
+            got,
+            [("known.txt", None, known.len()), ("second.txt", None, 8)],
+            "{name}"
+        );
+        assert!(entries[0].data == known, "{name}: content differs");
+    }
+}
+
+/// Cut short with no descriptor and another header right after the cut, a
+/// member is decoded as far as it goes: those bytes are scanned, and the
+/// member says it was not decoded whole, whichever codec 7-Zip wrote it with.
+/// Bytes follow the cut, so nothing says the rest of the member is absent.
+#[test]
+fn orphan_member_cut_short_yields_its_prefix_marked_part_way() {
+    let known = dd_known();
+    let data_start = 30 + "known.txt".len();
+    let mut wrong = Vec::new();
+    for (name, built) in DATA_DESCRIPTOR_FIXTURES {
+        if !built || !name.starts_with("dd_7zip_") {
+            continue;
+        }
+        let member = orphaned(&fixture(name));
+        let sig = member.windows(4).rposition(|w| w == b"PK\x07\x08").unwrap();
+        let mut blob = member[..(data_start + sig) / 2].to_vec();
+        blob.extend_from_slice(&lfh("second.txt", 0, 0, b"harmless", None));
+        let entries = orphan_entries(&blob);
+        let first = entries.iter().find(|e| e.name == "known.txt").unwrap();
+        // Every decoder but bzip2's hands out what it decoded before the input
+        // ran out; bzip2 decodes by block, and this member is one block.
+        let streams = !name.contains("bzip2");
+        if first.unsupported.is_none()
+            || !known.starts_with(&first.data)
+            || (streams && first.data.is_empty())
+        {
+            wrong.push(format!(
+                "{name}: {:?}, {} bytes",
+                first.unsupported,
+                first.data.len()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The same cut with nothing after it: the member is cut off by the end of the
+/// file. What decodes of it is scanned and the member is not reported: every
+/// byte present was decoded, and the rest is absent.
+#[test]
+fn orphan_member_cut_at_the_end_of_the_file_yields_its_prefix_unreported() {
+    let known = dd_known();
+    let data_start = 30 + "known.txt".len();
+    let mut wrong = Vec::new();
+    for (name, built) in DATA_DESCRIPTOR_FIXTURES {
+        if !built || !name.starts_with("dd_7zip_") {
+            continue;
+        }
+        let member = orphaned(&fixture(name));
+        let sig = member.windows(4).rposition(|w| w == b"PK\x07\x08").unwrap();
+        let entries = orphan_entries(&member[..(data_start + sig) / 2]);
+        let streams = !name.contains("bzip2");
+        let ok = match &entries[..] {
+            [e] => {
+                e.name == "known.txt"
+                    && e.unsupported.is_none()
+                    && known.starts_with(&e.data)
+                    && !(streams && e.data.is_empty())
+            }
+            _ => false,
+        };
+        if !ok {
+            wrong.push(format!("{name}: {:?}", entry_summary(&entries)));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// --- Members cut off by the end of the file, every codec ---------------------
+//
+// `cut_<codec>.zip` holds one member, `member.txt` ([`cut_content`]). Written by
+// 7-Zip 25.01, `7z a -tzip -mm=<method> cut_<codec>.zip member.txt`, method
+// Copy, Deflate, Deflate64, BZip2 (with `-md=100k`, so the content spans two
+// blocks), LZMA, PPMd or XZ; `cut_zstd.zip` by Python 3.13 around the frame of
+// `zstd -1 --no-check` (zstd 1.5.7), which 7-Zip extracts. Masked: the content
+// holds EICAR. Cut [`CUT_CLEAN`] percent into its compressed data, each
+// archive gives a prefix without EICAR under `7z x`; cut [`CUT_FOUND`] percent
+// in, a prefix with it. With [`DAMAGE_LEN`] bytes of 0xFF written
+// [`DAMAGE_AT`] percent in, `7z x` reports a data error for each.
+
+const CUT_CLEAN: usize = 25;
+const CUT_FOUND: usize = 90;
+const DAMAGE_AT: usize = 10;
+const DAMAGE_LEN: usize = 256;
+
+/// `(codec, built in this build, content is the large one)`.
+const CUT_FIXTURES: [(&str, bool, bool); 8] = [
+    ("stored", true, false),
+    ("deflate", true, false),
+    ("deflate64", true, false),
+    ("bzip2", cfg!(feature = "bzip2"), true),
+    ("lzma", cfg!(feature = "lzip"), false),
+    ("ppmd", true, false),
+    ("xz", cfg!(feature = "xz"), false),
+    ("zstd", cfg!(feature = "zstd"), true),
+];
+
+/// How many bytes `7z x` gives from each fixture cut [`CUT_CLEAN`] and
+/// [`CUT_FOUND`] percent into its compressed data, in [`CUT_FIXTURES`] order.
+const CUT_7ZIP: [(usize, usize); 8] = [
+    (8209, 29552),
+    (7084, 29363),
+    (7084, 29363),
+    (0, 99996),
+    (7058, 29310),
+    (7343, 29341),
+    (7012, 29401),
+    (0, 131072),
+];
+
+/// How far short of 7-Zip a prefix may fall: decoders stop at different
+/// points of the last bytes they hold.
+const CUT_SLACK: usize = 512;
+
+/// `n` bytes of words, as the script that wrote the fixtures drew them.
+fn cut_text(n: usize, seed: u32) -> Vec<u8> {
+    let words: Vec<&str> = "the quick brown fox jumps over lazy dog exav scans every member \
+         of an archive cut short at the end of the file and keeps what it decoded\n"
+        .split(' ')
+        .collect();
+    let mut x = seed;
+    let mut out = Vec::with_capacity(n + 16);
+    while out.len() < n {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        out.extend_from_slice(words[(x >> 16) as usize % words.len()].as_bytes());
+        out.push(b' ');
+        if (x >> 8).is_multiple_of(13) {
+            out.extend_from_slice(format!("{} ", x % 100_000).as_bytes());
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// `member.txt`: text, EICAR, text. The large one, for the codecs that decode
+/// by block (bzip2, zstd), has EICAR in its first block.
+fn cut_content(large: bool) -> Vec<u8> {
+    let (before, after) = if large {
+        (60_000, 90_000)
+    } else {
+        (16_384, 16_384)
+    };
+    [
+        cut_text(before, 7),
+        exav_unpack::eicar().to_vec(),
+        cut_text(after, 8),
+    ]
+    .concat()
+}
+
+/// Where the first member's data starts, and its compressed size, from its
+/// local header.
+fn first_member(zip: &[u8]) -> (usize, usize) {
+    let u16_at = |o: usize| usize::from(u16::from_le_bytes([zip[o], zip[o + 1]]));
+    let comp = u32::from_le_bytes(zip[18..22].try_into().unwrap()) as usize;
+    (30 + u16_at(26) + u16_at(28), comp)
+}
+
+fn entry_summary(entries: &[exav_unpack::Entry]) -> Vec<(&str, Option<&str>, usize)> {
+    entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.unsupported, e.data.len()))
+        .collect()
+}
+
+/// A member cut off by the end of the file has what decodes of it scanned, and
+/// is not reported, whatever its codec and wherever the cut: every byte
+/// present was decoded, and the rest is absent.
+#[test]
+fn orphan_member_cut_off_by_the_end_of_the_file_is_decoded_not_reported() {
+    let mut wrong = Vec::new();
+    for ((codec, built, large), (clean, found)) in CUT_FIXTURES.into_iter().zip(CUT_7ZIP) {
+        if !built {
+            continue;
+        }
+        let zip = fixture(&format!("cut_{codec}.zip"));
+        let content = cut_content(large);
+        let (start, comp) = first_member(&zip);
+        let whole = orphan_entries(&zip[..start + comp]);
+        if !matches!(&whole[..], [e] if e.unsupported.is_none() && e.data == content) {
+            wrong.push(format!("{codec}, whole: {:?}", entry_summary(&whole)));
+        }
+        // One byte in, the cut is inside the codec's own header, if it has one.
+        let cuts = [
+            (1, false, 0),
+            (comp * CUT_CLEAN / 100, false, clean),
+            (comp * CUT_FOUND / 100, true, found),
+        ];
+        for (cut, eicar, oracle) in cuts {
+            let got = orphan_entries(&zip[..start + cut]);
+            let ok = matches!(&got[..], [e] if e.name == "member.txt"
+                && e.unsupported.is_none()
+                && content.starts_with(&e.data)
+                && e.data.len() + CUT_SLACK >= oracle)
+                && any_has_eicar(&got) == eicar;
+            if !ok {
+                wrong.push(format!("{codec}, cut at {cut}: {:?}", entry_summary(&got)));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Damage part way through a member, with the rest of it after the damage, is
+/// reported: those bytes are present and were not decoded. Stored data has no
+/// structure to damage. The deflate decoders do not see this damage and
+/// decode on to the stream's end, past the declared size, which is what says
+/// so there.
+#[test]
+fn orphan_member_damaged_part_way_is_reported() {
+    let mut wrong = Vec::new();
+    for (codec, built, _) in CUT_FIXTURES {
+        if !built || codec == "stored" {
+            continue;
+        }
+        let mut zip = fixture(&format!("cut_{codec}.zip"));
+        let (start, comp) = first_member(&zip);
+        let at = start + comp * DAMAGE_AT / 100;
+        zip[at..at + DAMAGE_LEN].fill(0xff);
+        let got = orphan_entries(&zip[..start + comp]);
+        if !matches!(&got[..], [e] if e.unsupported.is_some()) {
+            wrong.push(format!("{codec}: {:?}", entry_summary(&got)));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A member left out of the central directory whose extent runs into the
+/// member after it is reported: the bytes past its span are present, as that
+/// member's.
+#[test]
+fn hidden_member_running_into_the_next_one_is_reported() {
+    let zip = fixture("cut_deflate.zip");
+    let (start, comp) = first_member(&zip);
+    let blob = hidden_before_a_zip(&zip[..start + comp / 2]);
+    let (seen, end) = walk_with_buffer(&blob, 16 << 20);
+    end.unwrap();
+    let summary: Vec<_> = seen.iter().map(|s| (&s.0, s.1, s.2.len())).collect();
+    assert!(
+        seen.iter().any(|s| s.0 == "member.txt" && s.1.is_some()),
+        "{summary:?}"
+    );
+}
+
+/// ZIP method 98 (PPMd variant I rev. 1) on the orphan-header path, against a
+/// stream from the reference `ppmd-rust` PPMd8 encoder.
+#[test]
 fn zip_ppmd_member_is_decoded() {
     use std::io::Write;
 
@@ -667,19 +1237,23 @@ fn zip_ppmd_member_is_decoded() {
 
     let mut stream = Vec::new();
     {
-        let mut enc = ppmd_rust::Ppmd7Encoder::new(&mut stream, ORDER, MEM_MB << 20)
-            .expect("build reference PPMd7 encoder");
+        let mut enc = ppmd_rust::Ppmd8Encoder::new(
+            &mut stream,
+            ORDER,
+            MEM_MB << 20,
+            ppmd_rust::RestoreMethod::Restart,
+        )
+        .expect("build reference PPMd8 encoder");
         enc.write_all(EICAR).expect("encode");
-        enc.finish(true).expect("finish");
+        enc.finish(false).expect("finish");
     }
 
-    // APPNOTE 5.9: order in bits 0-3 (biased by 1), memory MB in bits 4-11
-    // (biased by 1).
+    // APPNOTE 5.10.4: (order - 1) + ((MB - 1) << 4) + (restore << 12).
     let w: u16 = ((ORDER - 1) as u16) | (((MEM_MB - 1) as u16) << 4);
     let mut member = w.to_le_bytes().to_vec();
     member.extend_from_slice(&stream);
 
-    let blob = lfh("ppmd.txt", 98, 0, &member, None);
+    let blob = lfh_sized("ppmd.txt", 98, &member, EICAR.len() as u32);
     let entries = orphan_entries(&blob);
     assert!(
         any_has_eicar(&entries),

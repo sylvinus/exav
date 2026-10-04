@@ -426,7 +426,12 @@ fn a_rewritten_signature_directory_is_reloaded() {
             "icap" => format!("icap://127.0.0.1:{port}"),
             _ => format!("clamd://127.0.0.1:{port}"),
         };
-        let mut args = vec!["--listen", &listen, "--sig-dir", sigs.path().to_str().unwrap()];
+        let mut args = vec![
+            "--listen",
+            &listen,
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ];
         if model == "threads" {
             args.extend(["--workers", "threads"]);
         }
@@ -481,7 +486,12 @@ fn a_file_written_during_the_first_load_is_reloaded() {
     // Enough that building the database takes seconds after the files are read.
     let mut big = String::new();
     for i in 0..1_000_000u64 {
-        writeln!(big, "Exav.Big.{i}:0:*:{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).unwrap();
+        writeln!(
+            big,
+            "Exav.Big.{i}:0:*:{:016x}",
+            i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        )
+        .unwrap();
     }
     std::fs::write(sigs.path().join("big.ndb"), &big).unwrap();
     let clamd = free_port();
@@ -531,7 +541,12 @@ fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
     let sigs = sig_dir();
     let mut big = String::new();
     for i in 0..1_000_000u64 {
-        writeln!(big, "Exav.Big.{i}:0:*:{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).unwrap();
+        writeln!(
+            big,
+            "Exav.Big.{i}:0:*:{:016x}",
+            i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        )
+        .unwrap();
     }
     std::fs::write(sigs.path().join("big.ndb"), &big).unwrap();
     let clamd = free_port();
@@ -555,7 +570,11 @@ fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
         signal(s, libc::SIGUSR2);
         let deadline = Instant::now() + Duration::from_secs(60);
         while bytes_read(pid) < before + big.len() as u64 {
-            assert!(Instant::now() < deadline, "no reload started:\n{}", s.stderr());
+            assert!(
+                Instant::now() < deadline,
+                "no reload started:\n{}",
+                s.stderr()
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     };
@@ -563,7 +582,10 @@ fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
     let when = |what: &str, done: &mut dyn FnMut() -> bool| {
         let since = Instant::now();
         while !done() {
-            assert!(since.elapsed() < Duration::from_secs(60), "{what} never happened");
+            assert!(
+                since.elapsed() < Duration::from_secs(60),
+                "{what} never happened"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         Instant::now()
@@ -582,7 +604,11 @@ fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
     let _job = hold();
     start_a_reload(&server);
     signal(&server, libc::SIGUSR2);
-    assert_eq!(reloads(&server), 0, "the first reload ended before the second request");
+    assert_eq!(
+        reloads(&server),
+        0,
+        "the first reload ended before the second request"
+    );
     let first = when("the first reload", &mut || reloads(&server) >= 1);
     let second = when("the second reload", &mut || reloads(&server) >= 2);
     assert!(
@@ -875,7 +901,13 @@ fn child_pids(pid: u32) -> Vec<u32> {
             let e = e.ok()?;
             let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
             // `pid (comm) state ppid ...`; comm may hold spaces, so split after it.
-            let ppid: u32 = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()?;
+            let ppid: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
             (ppid == pid).then(|| e.file_name().to_str()?.parse().ok())?
         })
         .collect()
@@ -1056,7 +1088,10 @@ fn a_worker_whose_supervisor_dies_mid_job_answers() {
     unsafe {
         libc::kill(workers[0] as libc::pid_t, libc::SIGKILL);
     }
-    assert!(reply.contains("stopped before it finished ERROR"), "{reply:?}");
+    assert!(
+        reply.contains("stopped before it finished ERROR"),
+        "{reply:?}"
+    );
     assert!(gone, "the worker outlived its supervisor");
 }
 

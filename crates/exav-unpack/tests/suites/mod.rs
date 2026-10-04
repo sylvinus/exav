@@ -34,6 +34,10 @@ mod disabled_formats;
 mod diskimage;
 #[cfg(feature = "dmg")]
 mod dmg;
+#[cfg(feature = "dwg")]
+mod dwg;
+#[cfg(feature = "dxf")]
+mod dxf;
 mod egg;
 #[cfg(feature = "decrypt")]
 mod encrypted_zip;
@@ -92,6 +96,8 @@ mod rar5_encryption;
 mod rar_solid;
 #[cfg(feature = "sevenz")]
 mod sevenz_bcj2;
+#[cfg(feature = "sevenz")]
+mod sevenz_ppmd;
 mod silent_skips;
 #[cfg(feature = "all-formats")]
 mod stream_read_errors;
@@ -121,6 +127,26 @@ mod zip_overlap;
 mod zoo;
 
 use exav_unpack::{walk, Budget, Entry, Format, LimitHit, Member};
+
+/// A real-malware sample under `tests/fixtures/`, kept locally only (see
+/// `read_fixture`), or `None` when it is absent or this build cannot open its
+/// ZIP. Any other failure to read it fails the test.
+pub(crate) fn real_sample(rel: &str) -> Option<Vec<u8>> {
+    let path = format!("{}/tests/fixtures/{rel}", env!("CARGO_MANIFEST_DIR"));
+    match exav_unpack::read_fixture(&path) {
+        Ok(data) => Some(data),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            eprintln!("skipping {rel}: {e}");
+            None
+        }
+        Err(e) => panic!("{rel}: {e}"),
+    }
+}
 
 /// Every member of `data` as an [`Entry`], a streamed one read into memory,
 /// handed to `visit` until it returns `Some`. Unlike `exav_unpack::extract`,
