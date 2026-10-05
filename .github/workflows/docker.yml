@@ -6,6 +6,8 @@
 # binaries natively on amd64 (via `cross`, NOT under QEMU) and `publish`
 # assembles the multi-arch image around them with `COPY` — compiling the
 # Rust+ring tree emulated for arm64 is what used to make publishing slow.
+# `publish` then re-checks the pushed tag, because the image must carry Docker
+# (not OCI) mediatypes for podman to honour its HEALTHCHECK; see that step.
 # Pull with:
 #   docker run -d -p 3310:3310 -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
 name: docker
@@ -125,9 +127,112 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
           # Take bins/exav-$TARGETARCH from the `binaries` job instead of
           # compiling in-image (Dockerfile documents both branches).
           build-args: BIN_SOURCE=prebuilt
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Publish Docker manifest-list/schema2 mediatypes rather than OCI
+          # ones, so that podman honours the image's HEALTHCHECK.
+          #
+          # `Healthcheck` is a Docker config extension with no equivalent in
+          # the OCI image spec. Nothing strips it: flipping this exporter
+          # option leaves the config blob byte-identical (same sha256), and
+          # only the declared mediatype changes. But podman reads the field
+          # back solely from a schema2 config — containers/common fills
+          # `HealthCheck` in the `DockerV2Schema2MediaType` branch of
+          # libimage/inspect.go and in no other branch — so under OCI
+          # mediatypes it reports "has no defined healthcheck" however healthy
+          # the daemon actually is. That leaves a rootless podman deployment
+          # with no readiness signal at all: the image is distroless, so a
+          # compose-level `test:` has no shell to run in either. Docker reads
+          # the field from both configs, so this is a no-op for `docker run`.
+          #
+          # `provenance: false` is load-bearing, not tidying: attestations can
+          # only be referenced from an OCI index, so buildx's default
+          # provenance attestation would force OCI mediatypes straight back.
+          # Attaching SLSA provenance as a separate referrer instead (e.g.
+          # actions/attest-build-provenance with push-to-registry) leaves the
+          # image's own mediatype alone.
+          #
+          # `push` moves into `outputs` so there is a single image exporter
+          # making a single mediatype decision.
+          provenance: false
+          outputs: type=image,oci-mediatypes=false,push=true
+
+      # The `build-test` job above smoke-tests a locally `load`ed image, which
+      # cannot catch a *push-time* mediatype change — the exporter is what
+      # differs. These two steps therefore run against the pushed tag.
+      - name: Assert the published manifest is a Docker manifest list
+        env:
+          # Via env: rather than inlined into `run:`, so a tag reaches bash as
+          # data and not as code.
+          TAGS: ${{ steps.meta.outputs.tags }}
+          EXPECTED: application/vnd.docker.distribution.manifest.list.v2+json
+        run: |
+          set -euo pipefail
+          # Every tag in the set points at the same index, so one is enough.
+          TAG=$(printf '%s\n' "$TAGS" | head -1)
+          docker buildx imagetools inspect "$TAG" --raw > "$RUNNER_TEMP/manifest.json"
+          GOT=$(jq -r '.mediaType' "$RUNNER_TEMP/manifest.json")
+          echo "$TAG -> $GOT"
+          if [ "$GOT" != "$EXPECTED" ]; then
+            echo "::error::published $GOT, expected $EXPECTED -- podman will ignore the image HEALTHCHECK"
+            exit 1
+          fi
+
+      # The assertion above pins the wire format; this one tests the consumer
+      # that the format exists for. podman is preinstalled on ubuntu-latest.
+      - name: Verify podman sees the HEALTHCHECK on the published image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(printf '%s\n' "$TAGS" | head -1)
+          podman --version
+          # Log in rather than relying on an anonymous pull: a GHCR package
+          # starts out private, so the very first publish of a fork would
+          # otherwise fail here for the wrong reason.
+          podman login ghcr.io -u "$REGISTRY_USER" --password-stdin <<<"$REGISTRY_PASSWORD"
+          podman pull -q "$TAG"
+
+          # This coming back empty *is* the regression being guarded against:
+          # podman populates it only from a Docker schema2 config.
+          IMAGE_HC=$(podman image inspect \
+            --format '{{if .HealthCheck}}{{.HealthCheck.Test}}{{end}}' "$TAG")
+          echo "image healthcheck: ${IMAGE_HC:-<absent>}"
+          if [ -z "$IMAGE_HC" ]; then
+            echo "::error::podman reports no healthcheck on $TAG"
+            exit 1
+          fi
+
+          # Same env as the `build-test` smoke test: no mirror configured, so
+          # opt into the built-in EICAR-only baseline and skip the wait for a
+          # sidecar that is not coming.
+          podman run -d --name exav-podman \
+            -e EXAV_STARTUP_WAIT_SECS=0 -e EXAV_ALLOW_NO_DB=1 "$TAG"
+          CONTAINER_HC=$(podman inspect \
+            --format '{{if .Config.Healthcheck}}{{.Config.Healthcheck.Test}}{{end}}' exav-podman)
+          echo "container healthcheck: ${CONTAINER_HC:-<absent>}"
+          if [ -z "$CONTAINER_HC" ]; then
+            echo "::error::healthcheck did not reach the container config"
+            podman rm -f exav-podman
+            exit 1
+          fi
+
+          # `/exav --ping` answers only once the database is loaded, so poll
+          # instead of asserting on the first probe.
+          for _ in $(seq 60); do
+            if podman healthcheck run exav-podman; then
+              echo "podman reports: $(podman inspect --format '{{.State.Health.Status}}' exav-podman)"
+              podman rm -f exav-podman
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::podman healthcheck never passed"
+          podman logs exav-podman
+          podman rm -f exav-podman
+          exit 1
