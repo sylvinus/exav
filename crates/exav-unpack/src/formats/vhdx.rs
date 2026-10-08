@@ -62,19 +62,19 @@ const PAYLOAD_BLOCK_PARTIALLY_PRESENT: u64 = 7;
 const HAS_PARENT: u32 = 1 << 1;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
 
 fn le_u64(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    crate::bytes::at(d, off, 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         .unwrap_or(0)
 }
@@ -100,7 +100,7 @@ fn regions(data: &[u8]) -> Option<(Region, Region)> {
             };
             // Entry: GUID(16), FileOffset u64, Length u32, Required u32.
             let r = Region {
-                offset: le_u64(data, e + 16) as usize,
+                offset: crate::bytes::to_usize(le_u64(data, e + 16)),
                 length: le_u32(data, e + 24) as usize,
             };
             if guid == BAT_REGION {
@@ -126,7 +126,7 @@ struct Geometry {
 
 fn geometry(data: &[u8], meta: &Region) -> Option<Geometry> {
     let base = meta.offset;
-    if data.get(base..base + 8) != Some(METADATA_SIGNATURE.as_slice()) {
+    if crate::bytes::at(data, base, 8) != Some(METADATA_SIGNATURE.as_slice()) {
         return None;
     }
     let count = le_u16(data, base + 10).min(MAX_METADATA_ENTRIES);
@@ -139,15 +139,17 @@ fn geometry(data: &[u8], meta: &Region) -> Option<Geometry> {
         has_parent: false,
     };
     for i in 0..count as usize {
-        let e = base + 32 + i * 32;
-        let Some(guid) = data.get(e..e + 16) else {
+        let Some(e) = base.checked_add(32 + i * 32) else {
+            break;
+        };
+        let Some(guid) = crate::bytes::at(data, e, 16) else {
             break;
         };
         // Item offsets are relative to the start of the metadata region.
-        let item = base + le_u32(data, e + 16) as usize;
+        let item = base.saturating_add(le_u32(data, e.saturating_add(16)) as usize);
         if guid == FILE_PARAMETERS {
             g.block_size = le_u32(data, item);
-            g.has_parent = le_u32(data, item + 4) & HAS_PARENT != 0;
+            g.has_parent = le_u32(data, item.saturating_add(4)) & HAS_PARENT != 0;
         } else if guid == VIRTUAL_DISK_SIZE {
             g.virtual_size = le_u64(data, item);
         } else if guid == LOGICAL_SECTOR_SIZE {
@@ -235,13 +237,13 @@ pub(crate) fn extract_vhdx<R>(
             unlocatable_blocks += (total_blocks - i) as usize;
             break;
         }
-        let entry = le_u64(data, bat.offset + (bat_index as usize) * 8);
+        let entry = le_u64(data, bat.offset.saturating_add((bat_index as usize) * 8));
         let state = entry & 7;
         if state != PAYLOAD_BLOCK_FULLY_PRESENT && state != PAYLOAD_BLOCK_PARTIALLY_PRESENT {
             continue; // unallocated or explicitly zero
         }
         // Bits 20..63 hold the file offset in megabytes.
-        let host = ((entry >> 20) * (1 << 20)) as usize;
+        let host = crate::bytes::to_usize((entry >> 20) << 20);
         let guest = (i as usize).saturating_mul(block_size);
         if guest >= disk.len() {
             continue;
@@ -249,7 +251,7 @@ pub(crate) fn extract_vhdx<R>(
         // An entry pointing past the end of the file names bytes that are
         // absent rather than hidden, so the block stays zero and stays quiet.
         let n = block_size.min(disk.len() - guest);
-        if let Some(src) = data.get(host..host + n) {
+        if let Some(src) = crate::bytes::at(data, host, n) {
             disk[guest..guest + n].copy_from_slice(src);
         }
     }

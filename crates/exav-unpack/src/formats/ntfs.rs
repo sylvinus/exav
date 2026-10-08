@@ -80,19 +80,19 @@ const MAX_RECORDS: usize = 200_000;
 const MAX_RUNS: usize = 65_536;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
 
 fn le_u64(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    crate::bytes::at(d, off, 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         .unwrap_or(0)
 }
@@ -118,7 +118,7 @@ fn geometry(data: &[u8]) -> Option<Geometry> {
     let record_size = if raw > 0 {
         (raw as usize).checked_mul(cluster)?
     } else {
-        1usize.checked_shl((-raw) as u32)?
+        1usize.checked_shl(raw.unsigned_abs().into())?
     };
     if !(256..=1 << 20).contains(&record_size) {
         return None;
@@ -221,7 +221,10 @@ fn data_runs(d: &[u8]) -> Vec<Run> {
         if bits < 64 && delta & (1i64 << (bits - 1)) != 0 {
             delta -= 1i64 << bits;
         }
-        lcn += delta;
+        let Some(next) = lcn.checked_add(delta) else {
+            break;
+        };
+        lcn = next;
         runs.push(Run {
             lcn: Some(lcn),
             clusters,
@@ -237,15 +240,15 @@ fn read_runs(volume: &[u8], runs: &[Run], cluster: usize, real_size: usize) -> V
         if out.len() >= real_size {
             break;
         }
-        let want = (r.clusters as usize).saturating_mul(cluster);
+        let want = crate::bytes::to_usize(r.clusters).saturating_mul(cluster);
         let take = want.min(real_size - out.len());
         match r.lcn {
             // Sparse: allocated but never written, so it reads as zeroes on the
             // victim's machine too.
             None => out.resize(out.len() + take, 0),
             Some(lcn) if lcn >= 0 => {
-                let start = (lcn as usize).saturating_mul(cluster);
-                match volume.get(start..start + take) {
+                let start = crate::bytes::to_usize(lcn as u64).saturating_mul(cluster);
+                match crate::bytes::at(volume, start, take) {
                     Some(s) => out.extend_from_slice(s),
                     // Past the end of the image: those bytes are absent rather
                     // than hidden, so what exists still stands.
@@ -302,8 +305,8 @@ fn data_extents(
     let mut runs: Vec<Run> = Vec::new();
     let mut real_size = 0usize;
     for (vcn, record) in refs {
-        let at = (record as usize).checked_mul(geo.record_size)?;
-        let Some(slice) = mft.get(at..at + geo.record_size) else {
+        let at = crate::bytes::to_usize(record).checked_mul(geo.record_size)?;
+        let Some(slice) = crate::bytes::at(mft, at, geo.record_size) else {
             continue;
         };
         let mut r = slice.to_vec();
@@ -317,7 +320,7 @@ fn data_extents(
                 break;
             }
             let alen = le_u32(&r, off + 4) as usize;
-            if alen < 16 || off + alen > r.len() {
+            if alen < 16 || alen > r.len() - off {
                 break;
             }
             let non_resident = r.get(off + 8).copied().unwrap_or(0) != 0;
@@ -328,7 +331,7 @@ fn data_extents(
             {
                 // Only the extent starting at VCN 0 carries the true size.
                 if vcn == 0 {
-                    real_size = le_u64(&r, off + 0x30) as usize;
+                    real_size = crate::bytes::to_usize(le_u64(&r, off + 0x30));
                 }
                 let runs_off = off + le_u16(&r, off + 0x20) as usize;
                 runs.extend(data_runs(r.get(runs_off..off + alen).unwrap_or(&[])));
@@ -358,7 +361,7 @@ fn find_attribute_list(rec: &[u8], volume: &[u8], geo: &Geometry) -> Option<Vec<
             break;
         }
         let alen = le_u32(rec, off + 4) as usize;
-        if alen < 16 || off + alen > rec.len() {
+        if alen < 16 || alen > rec.len() - off {
             break;
         }
         if atype == ATTR_ATTRIBUTE_LIST {
@@ -366,12 +369,14 @@ fn find_attribute_list(rec: &[u8], volume: &[u8], geo: &Geometry) -> Option<Vec<
             if !non_resident {
                 let vlen = le_u32(rec, off + 16) as usize;
                 let voff = off + le_u16(rec, off + 20) as usize;
-                return rec.get(voff..voff + vlen).map(<[u8]>::to_vec);
+                return crate::bytes::at(rec, voff, vlen).map(<[u8]>::to_vec);
             }
-            let real_size = le_u64(rec, off + 0x30) as usize;
+            let real_size = crate::bytes::to_usize(le_u64(rec, off + 0x30));
             let runs_off = off + le_u16(rec, off + 0x20) as usize;
             let runs = data_runs(rec.get(runs_off..off + alen).unwrap_or(&[]));
-            let bytes = read_runs(volume, &runs, geo.cluster, real_size);
+            // No table of this kind is larger than the volume, and a sparse run
+            // costs memory for every zero it reads.
+            let bytes = read_runs(volume, &runs, geo.cluster, real_size.min(volume.len()));
             // A list read short would silently drop the extents it names, so it
             // is treated as unusable rather than half-used.
             return (bytes.len() == real_size && real_size > 0).then_some(bytes);
@@ -418,7 +423,7 @@ fn parse_record(
             break;
         }
         let alen = le_u32(rec, off + 4) as usize;
-        if alen < 16 || off + alen > rec.len() {
+        if alen < 16 || alen > rec.len() - off {
             break;
         }
         let non_resident = rec.get(off + 8).copied().unwrap_or(0) != 0;
@@ -462,7 +467,7 @@ fn parse_record(
             } else if !non_resident {
                 let vlen = le_u32(rec, off + 16) as usize;
                 let voff = off + le_u16(rec, off + 20) as usize;
-                let bytes = rec.get(voff..voff + vlen).unwrap_or(&[]).to_vec();
+                let bytes = crate::bytes::at(rec, voff, vlen).unwrap_or(&[]).to_vec();
                 file = Some(File {
                     name: String::new(),
                     data: Some(bytes),
@@ -478,10 +483,15 @@ fn parse_record(
                 if le_u64(rec, off + 16) != 0 && spread.is_none() {
                     // Only this extent is reachable. Report the shortfall, but
                     // still scan the part that is here.
-                    let real_size = le_u64(rec, off + 0x30) as usize;
+                    let real_size = crate::bytes::to_usize(le_u64(rec, off + 0x30));
                     let runs_off = off + le_u16(rec, off + 0x20) as usize;
                     let runs = data_runs(rec.get(runs_off..off + alen).unwrap_or(&[]));
-                    let part = read_runs(volume, &runs, geo.cluster, real_size.max(1));
+                    let part = read_runs(
+                        volume,
+                        &runs,
+                        geo.cluster,
+                        real_size.clamp(1, volume.len().max(1)),
+                    );
                     file = Some(File {
                         name: String::new(),
                         data: Some(part),
@@ -495,7 +505,7 @@ fn parse_record(
                     let (runs, real_size) = match spread {
                         Some(v) => v,
                         None => {
-                            let real_size = le_u64(rec, off + 0x30) as usize;
+                            let real_size = crate::bytes::to_usize(le_u64(rec, off + 0x30));
                             let runs_off = off + le_u16(rec, off + 0x20) as usize;
                             (
                                 data_runs(rec.get(runs_off..off + alen).unwrap_or(&[])),
@@ -511,9 +521,19 @@ fn parse_record(
                             deleted,
                         });
                     } else if attr_flags & ATTR_COMPRESSED != 0 {
-                        let unit = 1usize << le_u16(rec, off + 0x22);
-                        let raw = read_runs(volume, &runs, geo.cluster, usize::MAX);
-                        file = Some(match decompress(&raw, unit * geo.cluster, real_size) {
+                        // A compression unit is 2^4 clusters in practice.
+                        let unit = Some(le_u16(rec, off + 0x22))
+                            .filter(|&s| s <= 16)
+                            .and_then(|s| (1usize << s).checked_mul(geo.cluster));
+                        // Stored compressed, so never more than the file's size
+                        // plus a unit; a sparse run is not read past that.
+                        let raw = match unit {
+                            Some(u) => {
+                                read_runs(volume, &runs, geo.cluster, real_size.saturating_add(u))
+                            }
+                            None => Vec::new(),
+                        };
+                        file = Some(match unit.and_then(|u| decompress(&raw, u, real_size)) {
                             Some(d) => File {
                                 name: String::new(),
                                 data: Some(d),
@@ -616,8 +636,8 @@ pub(crate) fn extract_ntfs<R>(
     // Record 0 is `$MFT` itself, and its `$DATA` gives the runs of the whole
     // table — which can be fragmented, so the MFT cannot simply be read
     // linearly from its first cluster.
-    let mft_start = (geo.mft_lcn as usize).saturating_mul(geo.cluster);
-    let Some(first) = data.get(mft_start..mft_start + geo.record_size) else {
+    let mft_start = crate::bytes::to_usize(geo.mft_lcn).saturating_mul(geo.cluster);
+    let Some(first) = crate::bytes::at(data, mft_start, geo.record_size) else {
         budget.count_entry()?;
         return Ok(visit(
             Entry::unsupported(
@@ -674,8 +694,10 @@ pub(crate) fn extract_ntfs<R>(
     }
 
     for i in FIRST_USER_RECORD..n {
-        let at = i * geo.record_size;
-        let Some(slice) = mft.get(at..at + geo.record_size) else {
+        let Some(slice) = i
+            .checked_mul(geo.record_size)
+            .and_then(|at| crate::bytes::at(&mft, at, geo.record_size))
+        else {
             break;
         };
         if slice.get(0..4) != Some(RECORD_MAGIC.as_slice()) {
@@ -749,14 +771,15 @@ fn mft_bytes(rec0: &[u8], volume: &[u8], geo: &Geometry) -> Vec<u8> {
             break;
         }
         let alen = le_u32(rec0, off + 4) as usize;
-        if alen < 16 || off + alen > rec0.len() {
+        if alen < 16 || alen > rec0.len() - off {
             break;
         }
         if atype == ATTR_DATA && rec0.get(off + 8).copied().unwrap_or(0) != 0 {
-            let real_size = le_u64(rec0, off + 0x30) as usize;
+            let real_size = crate::bytes::to_usize(le_u64(rec0, off + 0x30));
             let runs_off = off + le_u16(rec0, off + 0x20) as usize;
             let runs = data_runs(rec0.get(runs_off..off + alen).unwrap_or(&[]));
-            return read_runs(volume, &runs, geo.cluster, real_size);
+            // The table cannot be larger than the volume it is in.
+            return read_runs(volume, &runs, geo.cluster, real_size.min(volume.len()));
         }
         off += alen;
     }

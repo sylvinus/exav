@@ -39,7 +39,7 @@ fn eicar() -> &'static [u8] {
     exav_unpack::eicar()
 }
 
-fn fixture(name: &str) -> Vec<u8> {
+pub(super) fn fixture(name: &str) -> Vec<u8> {
     let p = format!(
         "{}/tests/fixtures/diskimage/{name}",
         env!("CARGO_MANIFEST_DIR")
@@ -194,6 +194,27 @@ fn a_streamoptimized_grain_that_will_not_inflate_says_so() {
     assert!(
         e.iter().any(|x| x.unsupported.is_some()),
         "a grain that could not be decompressed must be reported, got {:?}",
+        e.iter()
+            .map(|x| (&x.name, x.unsupported))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_metadata_marker_that_skips_past_the_end_of_the_file_ends_the_walk() {
+    // A grain-table marker counts the sectors that follow it. Declaring 2^64 - 1
+    // of them sends the walk's position to the top of `usize`, and the next
+    // bounds check on it must not overflow (it did, found by `analyze`).
+    let mut raw = fixture("streamoptimized.vmdk");
+    let at = u64::from_le_bytes(raw[64..72].try_into().unwrap()) as usize * 512;
+    raw[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    raw[at + 8..at + 12].copy_from_slice(&0u32.to_le_bytes());
+    raw[at + 12..at + 16].copy_from_slice(&1u32.to_le_bytes());
+
+    let e = members(Format::Vmdk, &raw);
+    assert!(
+        e.iter().any(|x| x.unsupported.is_some()),
+        "no grain is reachable, which must be said, got {:?}",
         e.iter()
             .map(|x| (&x.name, x.unsupported))
             .collect::<Vec<_>>()

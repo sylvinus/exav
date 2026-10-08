@@ -20,6 +20,7 @@ export default defineConfig({
     baseURL: external ?? "http://127.0.0.1:4317/",
     headless: true,
     viewport: { width: 1280, height: 800 },
+    screenshot: "only-on-failure",
   },
   ...(!external && {
     webServer: {

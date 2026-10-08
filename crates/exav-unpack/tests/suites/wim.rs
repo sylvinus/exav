@@ -29,7 +29,7 @@ const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf65
 const NOTES: &str = "3b38534b3df987c96e0d6185b9e59289ad54806698c9ac1248afc85cad276af2";
 const DEEP: &str = "0035fe0884edb216726d771c5bb354fd2150160459cacc18feb0c1f30bcc81a3";
 
-fn fixture(name: &str) -> Vec<u8> {
+pub(super) fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/wim/{name}", env!("CARGO_MANIFEST_DIR"));
     exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
@@ -157,9 +157,9 @@ fn resources_in_a_codec_exav_lacks_are_reported_not_passed_over() {
 /// size, the flags, the offset).
 fn with_wrong_hashes(blob: &[u8]) -> Vec<u8> {
     let mut d = blob.to_vec();
-    let le = |d: &[u8], at: usize| u64::from_le_bytes(d[at..at + 8].try_into().unwrap()) as usize;
-    let size = le(&d, 48) & 0x00FF_FFFF_FFFF_FFFF;
-    let at = le(&d, 56);
+    let le = |d: &[u8], at: usize| u64::from_le_bytes(d[at..at + 8].try_into().unwrap());
+    let size = (le(&d, 48) & 0x00FF_FFFF_FFFF_FFFF) as usize;
+    let at = le(&d, 56) as usize;
     for e in (at..at + size).step_by(50) {
         if d[e + 7] & 0x02 == 0 && le(&d, e + 16) > 0 {
             d[e + 30] ^= 1;

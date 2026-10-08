@@ -53,6 +53,7 @@ pub(crate) mod formats;
 #[allow(unused_imports)]
 use formats::*;
 
+mod bytes;
 #[cfg(any(
     feature = "gzip",
     feature = "zip",

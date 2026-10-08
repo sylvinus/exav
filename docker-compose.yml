@@ -33,8 +33,9 @@ services:
       - "127.0.0.1:3310:3310"
     volumes:
       - exav-db:/var/lib/exav
-    # The image's HEALTHCHECK, said here too: it is a Docker image setting,
-    # which a registry or a pull that keeps only the OCI configuration drops.
+    # The image's HEALTHCHECK, said here too: podman ignores it on an image
+    # that does not carry Docker mediatypes (older tags, or a registry that
+    # re-exports as OCI).
     healthcheck:
       test: ["CMD", "/exav", "--ping"]
       interval: 30s

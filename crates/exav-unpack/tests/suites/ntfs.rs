@@ -33,7 +33,7 @@ const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf65
 /// further on. Unique in the image.
 const RUNLIST: [u8; 8] = [0x21, 0x04, 0x00, 0x0c, 0x11, 0x04, 0x04, 0x00];
 
-fn fixture() -> Vec<u8> {
+pub(super) fn fixture() -> Vec<u8> {
     let p = format!(
         "{}/tests/fixtures/ntfs/fragmented.img.gz",
         env!("CARGO_MANIFEST_DIR")

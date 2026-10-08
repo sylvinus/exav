@@ -112,6 +112,14 @@ jobs:
         with:
           tool: wasm-bindgen@0.2.129
       - run: make test-viewer
+      # What the browser saw, for the failures that do not happen on a
+      # developer's machine (the PDF text and pinch tests do not).
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: viewer-e2e-results
+          path: crates/exav-viewer/test-results
+          if-no-files-found: ignore
 
   docs:
     runs-on: ubuntu-latest

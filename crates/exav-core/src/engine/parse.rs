@@ -206,7 +206,7 @@ pub(super) fn parse_bcomp_subsig(s: &str) -> Option<BcompSub> {
         (true, n)
     };
     let mag = parse_num(num)?;
-    let offset = if neg { -mag } else { mag };
+    let offset = if neg { mag.checked_neg()? } else { mag };
     // byte_options: [h|d|a|i][l|b]?[e]? num_bytes
     let mut ch = opts_s.chars().peekable();
     let kind = match ch.next()? {

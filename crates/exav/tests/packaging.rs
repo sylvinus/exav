@@ -93,9 +93,10 @@ fn the_compose_file_publishes_no_port_beyond_localhost() {
     assert!(published > 0, "no port found to check");
 }
 
-/// The image's HEALTHCHECK is Docker-format only: an image kept as OCI loses
-/// it. The compose file says it again for the scanner, and must not drift
-/// from the image's command and timings.
+/// The image's HEALTHCHECK is not honoured everywhere (podman ignores it on an
+/// image without Docker mediatypes; Kubernetes always). The compose file says
+/// it again for the scanner, and must not drift from the image's command and
+/// timings.
 #[test]
 fn the_compose_file_repeats_the_images_health_check() {
     let docker = repo_file("Dockerfile");
@@ -140,4 +141,35 @@ fn the_compose_file_repeats_the_images_health_check() {
         let want = format!("{key}: {}", option(flag));
         assert!(scanner.contains(&want), "compose lacks `{want}`");
     }
+}
+
+/// podman reads the image's HEALTHCHECK only from Docker mediatypes, and
+/// buildx's default provenance attestation forces an OCI index back. Dropping
+/// either setting from the publish step looks like tidying and silently
+/// removes the health check for podman.
+#[test]
+fn the_publish_step_pushes_docker_mediatypes() {
+    let workflow = repo_file(".github/workflows/docker.yml");
+    let publish = workflow
+        .split("\n  publish:")
+        .nth(1)
+        .expect("the publish job");
+    let live: Vec<&str> = publish
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert!(live.contains(&"provenance: false"), "provenance is on");
+    let outputs = live
+        .iter()
+        .find_map(|l| l.strip_prefix("outputs:"))
+        .expect("an outputs: line on the build-push step")
+        .trim();
+    for want in ["type=image", "oci-mediatypes=false", "push=true"] {
+        assert!(
+            outputs.split(',').any(|o| o == want),
+            "outputs lacks {want}: {outputs}"
+        );
+    }
+    assert!(!live.contains(&"push: true"), "push: true beside outputs");
 }

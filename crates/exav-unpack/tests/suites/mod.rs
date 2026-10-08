@@ -45,6 +45,7 @@ mod encrypted_zip;
 mod entry_accounting;
 #[cfg(feature = "ext")]
 mod ext;
+mod extreme;
 #[cfg(feature = "fat")]
 mod fat;
 mod hwp3;

@@ -43,6 +43,11 @@ export CARGO_TARGET_WASM32_WASIP1_RUNNER="$WASMTIME run --dir $REPO::$REPO"
 # 1) The extractor (pure Rust, the main parsing attack surface).
 cargo test --lib -p exav-unpack --target wasm32-wasip1 "$@"
 
+# 1b) Container header fields at their extremes (tests/suites/extreme.rs), the
+#     one integration suite that runs here: a wasm32 build has no unwinding, so
+#     a sum that overflows 32 bits aborts it, and that is what fails the run.
+cargo test -p exav-unpack --test all --target wasm32-wasip1 -- extreme
+
 # 2) The scanning core, minus `yara` (yara-x pulls wasmtime/cranelift, which
 #    can't target wasm) — so the engine/pe/patterns/phishing/dlp byte-processing
 #    logic is checked on a 32-bit `usize` too. Host-filesystem tests (DB/database

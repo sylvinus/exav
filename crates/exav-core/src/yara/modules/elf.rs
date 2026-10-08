@@ -148,7 +148,10 @@ fn entry_point_offset_from(elf: &goblin::elf::Elf) -> Option<i64> {
             && entry >= ph.p_vaddr
             && entry < ph.p_vaddr.saturating_add(ph.p_memsz)
         {
-            return Some((ph.p_offset + (entry - ph.p_vaddr)) as i64);
+            return ph
+                .p_offset
+                .checked_add(entry - ph.p_vaddr)
+                .map(|o| o as i64);
         }
     }
     // ET_REL has no segments: fall back to the section that covers the entry.
@@ -157,7 +160,10 @@ fn entry_point_offset_from(elf: &goblin::elf::Elf) -> Option<i64> {
             && entry >= sh.sh_addr
             && entry < sh.sh_addr.saturating_add(sh.sh_size)
         {
-            return Some((sh.sh_offset + (entry - sh.sh_addr)) as i64);
+            return sh
+                .sh_offset
+                .checked_add(entry - sh.sh_addr)
+                .map(|o| o as i64);
         }
     }
     None

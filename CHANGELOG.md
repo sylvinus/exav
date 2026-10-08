@@ -367,9 +367,16 @@ follow [semantic versioning](https://semver.org/).
   0/1/2/3 like `exav`.
 - A guide to sizing a server, with the flags for a 4 GB host, and how the
   daemon divides the RAM it is given between the database and its workers.
-- The image's health check, repeated where an image kept as OCI loses it
-  (`HEALTHCHECK` is part of Docker's image format): in `docker-compose.yml`,
-  and as a Compose and a Kubernetes snippet in the Docker guide.
+- The image's health check, repeated where the image's own is not honoured
+  (podman on an image without Docker mediatypes; Kubernetes always): in
+  `docker-compose.yml`, and as a Compose and a Kubernetes snippet in the Docker
+  guide.
+- The published image uses Docker mediatypes instead of OCI ones, so podman
+  honours its `HEALTHCHECK` (the 0.0.1 tags are OCI, and podman shows no health
+  check on them). This drops the buildx provenance attestation, which needs an
+  OCI index. The publish workflow now fails if a tag is not a Docker manifest
+  list or podman cannot see the health check, and the image build checks the
+  health check in `build-test`.
 - `exav_unpack::Prescan` and `exav_unpack::detect_prescanned`: detection's
   search through an object not held in memory, fed by the caller's own read of
   it, so that one read serves detection and the caller's searches.
@@ -393,6 +400,18 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- A streamOptimized VMDK whose metadata marker declared more sectors than the
+  file holds overflowed the marker walk (a panic in builds with overflow
+  checks, a wrapped position otherwise); the walk now ends there.
+- Header fields at the top of their range no longer overflow the readers of
+  VMDK, QCOW2, VHD, VHDX, NTFS and WIM images (a "decoder panicked" error on a
+  64-bit build, an abort or a wrapped offset in the WebAssembly ones), and a
+  sparse NTFS run can no longer ask for the memory of its whole declared size.
+  A signature database with a gap of `{N-}` as wide as `usize`, an `EP-` offset
+  or a byte-comparison offset of `i64::MIN` is refused or matches nothing
+  instead of panicking the scan or the load. The dotnet and elf YARA modules
+  and the bytecode `pe_rawaddr` no longer panic on a section address, raw
+  pointer or entry that overflows.
 - An object holding more embedded files than carving scans (16 PE, ELF or
   Mach-O images of each kind, 32 archives) scanned the first ones and
   dropped the rest silently, so decoys in front of a payload hid it from the

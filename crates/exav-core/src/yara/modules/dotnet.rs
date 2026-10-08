@@ -150,7 +150,7 @@ impl<'a> Meta<'a> {
         // Root: signature, major, minor, reserved, then a length-prefixed
         // version string padded to a four-byte boundary.
         let vlen = le_u32(data, root + 12) as usize;
-        let vbytes = data.get(root + 16..root + 16 + vlen)?;
+        let vbytes = data.get(root + 16..)?.get(..vlen)?;
         let version = String::from_utf8_lossy(
             &vbytes[..vbytes.iter().position(|&b| b == 0).unwrap_or(vbytes.len())],
         )
@@ -164,7 +164,7 @@ impl<'a> Meta<'a> {
             let offset = le_u32(data, p);
             let size = le_u32(data, p + 4);
             let name_start = p + 8;
-            let end = data[name_start..].iter().position(|&b| b == 0)? + name_start;
+            let end = data.get(name_start..)?.iter().position(|&b| b == 0)? + name_start;
             let name = String::from_utf8_lossy(data.get(name_start..end)?).into_owned();
             streams.push(Stream { name, offset, size });
             // Names are NUL-terminated and padded to four bytes.
@@ -689,9 +689,11 @@ fn format_guid(g: &[u8]) -> String {
 fn rva_to_offset(pe: &goblin::pe::PE, rva: u32) -> Option<usize> {
     for s in &pe.sections {
         let start = s.virtual_address;
-        let end = start + s.virtual_size.max(s.size_of_raw_data);
+        let end = start.saturating_add(s.virtual_size.max(s.size_of_raw_data));
         if rva >= start && rva < end {
-            return Some((rva - start + s.pointer_to_raw_data) as usize);
+            return (rva - start)
+                .checked_add(s.pointer_to_raw_data)
+                .map(|o| o as usize);
         }
     }
     None

@@ -267,6 +267,17 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 | JPX decoded at a reduced size (`imagehash`, 7 panics) | hayro-jpeg2000 0.4.1 `j2c/decode.rs` `store`, through exav-render's `pdf_image::decode_jpx` | a reduced decode places its samples with full-resolution coordinates: an image area offset or a subsampled component in a second tile underflows a subtraction or slices past a row (or, offset, draws nothing), and a column of tiles empty at that size is a zero chunk size | `decode_jpx` refuses a reduced decode of those layouts (`Siz::reducible`), as pdf.js's decoder failing; full-size decodes unchanged (`a_reduced_jpx_decode_the_decoder_cannot_place_fails_cleanly`, files written by OpenJPEG in `tests/fixtures/images/make.py`) |
 | JBIG2 stream of 418 bytes declaring a 16,504 by 65,359 region on a 120 by 64 page (`imagehash`, timeout) | exav-render `pdf_image/jbig2.rs` and `image/jbig2.rs`, through hayro-jbig2 0.3.1 `decode/generic.rs` | the budget counted the page bitmap only; hayro-jbig2 decodes each region at its declared size (up to 65,535 by 65,535) wherever it lies, so a region far off the page took 135 MB and minutes | the bitmaps the region segments declare count against the budget too, in both organisations of a file (`region_pixels`; `a_jbig2_region_larger_than_the_budget_is_refused`, segments written in the test). Symbol dictionaries, whose symbol sizes are coded in the data, are still bounded by hayro-jbig2's own limits only |
 | TIFF LZW strip without a clear code (`imagehash`, panic in debug builds) | `weezl` 0.1.10 `decode.rs` (the vendored TIFF decoder's LZW) | a `debug_assert!` held that a TIFF table never reaches 4,095 codes; release builds decode the strip | weezl 0.1.12, whose only change is that assertion, corrected upstream (`a_tiff_lzw_strip_filling_its_table_without_a_clear_code_decodes`, a strip written in the test) |
+| streamOptimized VMDK, grain-table marker counting 2^64 - 1 sectors (`analyze`, CI smoke run, overflow panic) | `formats/vmdk.rs` `read_markers` | the marker's skip saturated the walk position to `usize::MAX`, and the loop condition then added 512 to it | `pos.saturating_add(512)` (`a_metadata_marker_that_skips_past_the_end_of_the_file_ends_the_walk`) |
+
+Header numbers at the top of their range are what unchecked sums overflow on,
+and libFuzzer's stock mutations seldom put one in a chosen field. Two things
+cover that. The `unpack` and `analyze` targets share a custom mutator
+(`fuzz/extreme.rs`) that sets one 2-, 4- or 8-byte field to such a value a
+quarter of the time. And `crates/exav-unpack/tests/suites/extreme.rs` does it
+exhaustively and deterministically for the disk-image formats: every field of a
+valid container, one at a time, must not panic the decoder. `make test-wasm`
+runs it on wasm32 too, where the production build wraps silently and a test
+build aborts.
 
 exav-render's `tests/fixtures/fuzz/` also holds damaged drawings from early
 `drawing` runs (an over-long run of modular-number continuation words, an

@@ -27,6 +27,10 @@
 //! The reconstructed disk is emitted as a single member, which the partition and
 //! filesystem handlers then pick up in the normal way.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::{Budget, Entry, LimitHit, Sink};
 
 const FOOTER_LEN: usize = 512;
@@ -42,13 +46,13 @@ const DISK_TYPE_DYNAMIC: u32 = 3;
 const DISK_TYPE_DIFFERENCING: u32 = 4;
 
 fn be_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
 
 fn be_u64(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    crate::bytes::at(d, off, 8)
         .map(|b| u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         .unwrap_or(0)
 }
@@ -130,8 +134,8 @@ fn extract_dynamic<R>(
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    let dyn_off = be_u64(f, 16) as usize;
-    let Some(hdr) = data.get(dyn_off..dyn_off + 1024) else {
+    let dyn_off = crate::bytes::to_usize(be_u64(f, 16));
+    let Some(hdr) = crate::bytes::at(data, dyn_off, 1024) else {
         return unreadable(
             "dynamic VHD header lies outside the image",
             current_size,
@@ -149,7 +153,7 @@ fn extract_dynamic<R>(
     }
     // Dynamic header: +16 BAT offset (u64), +28 max table entries (u32),
     // +32 block size (u32).
-    let bat_off = be_u64(hdr, 16) as usize;
+    let bat_off = crate::bytes::to_usize(be_u64(hdr, 16));
     let max_entries = be_u32(hdr, 28) as usize;
     let block_size = be_u32(hdr, 32) as usize;
     // A block size that is not a sane power-of-two multiple of the sector size
@@ -169,7 +173,7 @@ fn extract_dynamic<R>(
     // Each block is preceded by a sector bitmap, padded up to a sector boundary.
     let bitmap_len = ((block_size / SECTOR).div_ceil(8)).next_multiple_of(SECTOR);
 
-    let Some(bat) = data.get(bat_off..bat_off + max_entries.saturating_mul(4)) else {
+    let Some(bat) = crate::bytes::at(data, bat_off, max_entries.saturating_mul(4)) else {
         return unreadable(
             "dynamic VHD block allocation table lies outside the image",
             current_size,
@@ -199,7 +203,7 @@ fn extract_dynamic<R>(
     let mut disk = vec![0u8; want as usize];
     let mut missing = 0usize;
     for i in 0..max_entries {
-        let ent = be_u32(bat, i * 4);
+        let ent = be_u32(bat, i.saturating_mul(4));
         if ent == BAT_UNUSED {
             continue; // never written: reads as zeroes when mounted, as here
         }
@@ -210,20 +214,20 @@ fn extract_dynamic<R>(
         if dst >= disk.len() {
             break;
         }
-        let n = block_size.min(disk.len() - dst);
-        match data.get(src..src + n) {
-            Some(block) => disk[dst..dst + n].copy_from_slice(block),
+        let n = block_size.min(disk.len().saturating_sub(dst));
+        match crate::bytes::at(data, src, n) {
+            Some(block) => disk[dst..dst.saturating_add(n)].copy_from_slice(block),
             // The BAT points at a block outside the file: the image is truncated,
             // so those bytes are absent rather than hidden (they stay zero).
             // Counted so a wholly bogus table can be told apart from a healthy
             // one below.
-            None => missing += 1,
+            None => missing = missing.saturating_add(1),
         }
     }
     // A BAT whose every allocated entry points outside the file is not a
     // truncated image, it is one exav failed to read at all.
     let allocated = (0..max_entries)
-        .filter(|&i| be_u32(bat, i * 4) != BAT_UNUSED)
+        .filter(|&i| be_u32(bat, i.saturating_mul(4)) != BAT_UNUSED)
         .count();
     if allocated > 0 && missing == allocated {
         return Ok(visit(

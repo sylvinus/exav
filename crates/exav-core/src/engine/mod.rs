@@ -1532,11 +1532,15 @@ enum BcompKind {
 impl BcompSub {
     /// Extract the value at `trigger_off + offset` and test the comparisons.
     fn matches(&self, buf: &dyn ByteSource, trigger_off: u64) -> bool {
-        let pos = trigger_off as i64 + self.offset;
-        if pos < 0 || pos as usize > buf.len() {
+        let Some(pos) = i64::try_from(trigger_off)
+            .ok()
+            .and_then(|t| t.checked_add(self.offset))
+            .and_then(|p| usize::try_from(p).ok())
+            .filter(|&p| p <= buf.len())
+        else {
             return false;
-        }
-        let rest = buf.window(pos as usize, self.num_bytes);
+        };
+        let rest = buf.window(pos, self.num_bytes);
         let rest: &[u8] = &rest;
         let val: i64 = match self.kind {
             BcompKind::Raw => {
@@ -4143,7 +4147,7 @@ fn add_delta(base: u64, delta: i64) -> Option<u64> {
     if delta >= 0 {
         base.checked_add(delta as u64)
     } else {
-        base.checked_sub((-delta) as u64)
+        base.checked_sub(delta.unsigned_abs())
     }
 }
 
@@ -4989,12 +4993,11 @@ fn advance_neg_alt<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
 fn advance_gap(cur: &[(usize, usize)], min: usize, max: Option<usize>, n: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(cur.len());
     for &(lo, hi) in cur {
-        let newlo = lo + min;
-        if newlo > n {
+        let Some(newlo) = lo.checked_add(min).filter(|&l| l <= n) else {
             continue;
-        }
+        };
         let newhi = match max {
-            Some(m) => (hi + m).min(n),
+            Some(m) => hi.saturating_add(m).min(n),
             None => n,
         };
         if newlo <= newhi {
@@ -5596,6 +5599,44 @@ mod tests {
         let mut b = EngineBuilder::new();
         b.add_ndb(line, false);
         b.build()
+    }
+
+    /// A signature file is not trusted: numbers in it at the top of their range
+    /// must be refused or clamped, never added to something.
+    #[test]
+    fn a_gap_as_wide_as_usize_matches_nothing_and_does_not_overflow() {
+        let e = ndb("T.Gap:0:*:4142{18446744073709551615-}4344");
+        assert!(e.scan(b"zzABzzCDzz", FileType::Unknown).is_none());
+        let e = ndb("T.Gap2:0:*:4142{0-18446744073709551615}4344");
+        assert!(e.scan(b"zzABzzCDzz", FileType::Unknown).is_some());
+    }
+
+    #[test]
+    fn an_offset_from_the_entry_point_of_i64_min_matches_nothing() {
+        let e = ndb("T.Ep:0:EP-9223372036854775808:4142");
+        let layout = PeLayout {
+            entry: Some(4),
+            section_rawptrs: vec![0],
+            section_rawsizes: vec![16],
+            version_info: Vec::new(),
+        };
+        assert!(e.scan_with_layout(b"zzzzABzzzzzzzzzz", FileType::Unknown, Some(&layout), None).is_none());
+    }
+
+    #[test]
+    fn a_byte_comparison_with_an_offset_of_i64_max_matches_nothing() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb("L.Cmp2;Engine:51-255,Target:0;0&1;41414141;0(>>9223372036854775807#ib4#=1)", false);
+        let e = b.build();
+        assert!(e.scan(b"zzAAAAzzzzzz", FileType::Unknown).is_none());
+    }
+
+    #[test]
+    fn a_byte_comparison_with_an_offset_of_i64_min_loads_and_matches_nothing() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb("L.Cmp;Engine:51-255,Target:0;0&1;41414141;0(<<-9223372036854775808#ib4#=1)", false);
+        let e = b.build();
+        assert!(e.scan(b"zzAAAAzzzzzz", FileType::Unknown).is_none());
     }
 
     /// Past [`MAX_BUFFERED_HITS`] the sweep stops buffering its hits and

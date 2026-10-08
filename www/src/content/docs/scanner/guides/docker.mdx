@@ -79,10 +79,13 @@ docker exec exav /exav --ping                       # what this container serves
 exav --ping --connect clamd://scanner.internal:3310 # from anywhere
 ```
 
-`HEALTHCHECK` is part of Docker's image format, and the OCI image
-configuration has no such field: an image kept or pulled as OCI loses it, and
-`docker inspect` then shows no health check. Where that matters, say it in the
-orchestrator's own configuration, with the same command:
+`HEALTHCHECK` is a Docker extension of the image configuration, not part of the
+OCI spec. Docker honours it either way. Podman reads it only from an image
+published with Docker mediatypes, which the publish workflow checks from
+release 0.0.2 on; on older tags, or an image a registry re-exports as OCI,
+`podman image inspect` shows no health check. Kubernetes ignores it entirely.
+Where it matters, say it in the orchestrator's own configuration, with the same
+command:
 
 ```yaml
 # Compose
@@ -111,7 +114,8 @@ A container is unhealthy while it waits for signatures, since it is not serving
 then. The image's start period is 60 seconds. If signatures come from a slow
 sidecar, or the container loads raw `.cvd` files (as the built-in updater does;
 see [what it costs](/scanner/guides/prebuilt-database/#what-it-costs)), raise it
-(`--health-start-period`) so the orchestrator does not kill it mid-load.
+(`--health-start-period` on `docker run`, `start_period` in Compose) so the
+orchestrator does not kill it mid-load.
 
 The check is for the daemon. A container given another job (building a
 database, a `--connect` client, a one-shot scan) reports unhealthy the whole time

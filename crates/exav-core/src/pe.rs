@@ -586,7 +586,7 @@ impl BcPe {
         }
         for s in self.sections.iter().rev() {
             if s.rsz != 0 && s.rva <= rva && s.rsz > rva - s.rva {
-                return Some((rva - s.rva) + s.raw);
+                return (rva - s.rva).checked_add(s.raw);
             }
         }
         None
@@ -1112,6 +1112,19 @@ pub(crate) fn elf_section_headers_stripped_in(src: &dyn ByteSource) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A section's raw pointer is the file's: an address inside it whose raw
+    /// offset does not fit in 32 bits has no raw address, rather than a panic.
+    #[test]
+    fn rawaddr_past_the_top_of_u32_is_absent_not_a_panic() {
+        let pe = BcPe {
+            sections: vec![BcPeSection { rva: 0x1000, vsz: 0x1000, raw: 0xFFFF_FF00, rsz: 0x1000, chr: 0 }],
+            hdr_size: 0x200,
+            pedata: Vec::new(),
+        };
+        assert_eq!(pe.rawaddr(0x1010, 0x10000), Some(0xFFFF_FF10));
+        assert_eq!(pe.rawaddr(0x1200, 0x10000), None);
+    }
 
     /// One read finds what looking for each magic at every offset finds:
     /// every validated image and archive candidate, in order and within its

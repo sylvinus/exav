@@ -65,19 +65,19 @@ enum Codec {
 }
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
 
 fn le_u64(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    crate::bytes::at(d, off, 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         .unwrap_or(0)
 }
@@ -352,7 +352,9 @@ pub(crate) fn extract_wim<R>(
 fn collect_names(meta: &[u8], out: &mut HashMap<[u8; HASH_LEN], String>) {
     // The security table comes first: its own length, rounded up to 8.
     let sec_len = le_u32(meta, 0) as usize;
-    let root = sec_len.next_multiple_of(8);
+    let Some(root) = sec_len.checked_next_multiple_of(8) else {
+        return;
+    };
     let mut stack = vec![(root, String::new())];
     let mut walked = 0usize;
 
@@ -362,16 +364,17 @@ fn collect_names(meta: &[u8], out: &mut HashMap<[u8; HASH_LEN], String>) {
             if walked > MAX_DENTRIES {
                 return;
             }
-            let len = le_u64(meta, off) as usize;
-            if len < DENTRY_NAME_OFF || off + len > meta.len() {
+            let len = crate::bytes::to_usize(le_u64(meta, off));
+            if len < DENTRY_NAME_OFF || len > meta.len().saturating_sub(off) {
                 break; // an end-of-directory marker is a zero length
             }
             let attributes = le_u32(meta, off + 8);
-            let subdir = le_u64(meta, off + 16) as usize;
+            let subdir = crate::bytes::to_usize(le_u64(meta, off + 16));
             let name_len = le_u16(meta, off + DENTRY_NAME_LEN_OFF) as usize;
             let name_at = off + DENTRY_NAME_OFF;
             let name = meta
-                .get(name_at..name_at + name_len)
+                .get(name_at..)
+                .and_then(|rest| rest.get(..name_len))
                 .map(|raw| {
                     let units: Vec<u16> = raw
                         .as_chunks::<2>()

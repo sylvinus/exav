@@ -89,6 +89,33 @@ is on exav.org.
   arrow keys, download and "open in a tab" are written again by a host that
   keeps its own dialog around `ViewerBody`.
 
+## Robustness
+
+The arithmetic audit (`tmp/ARITHMETIC_AUDIT.md`, not committed; its row names
+are used below) found about a hundred sites where a header's number is added to or multiplied by something
+unchecked. The disk-image formats, the signature engine's gaps, offsets and
+byte comparisons, and the dotnet, elf and bytecode-PE readers are fixed and
+tested. Open:
+
+- **The rest of the audit**: its sections A (rows C9 to C15, D1, T1 to T9, E1
+  to E14), B (R1, R3 to R17: uncatchable allocations, unbounded loops) and C
+  (the wasm32-only wraps in arc, lz4, arj, egg, upx, ole, vba, rar, udif,
+  ccitt). Section C matters most: the wasm builds have no overflow checks.
+- **`crate::bytes::at` everywhere**: `d.get(off..off + n)` is spelled about
+  150 times in `exav-unpack` and as many in `exav-core`. Only the disk-image
+  formats use the checked form. A mechanical replacement, by a script, wants
+  the owner's go-ahead.
+- **`clippy::arithmetic_side_effects`**: denied in `formats/vhd.rs` only. The
+  other disk formats are close (vmdk 12 sites, qcow2 11, vhdx 15), then ntfs
+  (75) and wim (45); the lint is far too noisy for the decoders (2,700 in
+  `exav-unpack`). Extend it file by file as each is cleaned.
+- **The wasm32 run covers the disk images only**: `make test-wasm` runs the
+  `extreme` suite and the `--lib` tests. The same sweep for the other
+  container formats (a valid sample of each, `extreme.rs::sweep`) would
+  extend it.
+- **A dmg with `decrypt`** (audit row D1) and the second half of the NTFS
+  attribute-list walk have no test of their own.
+
 ## Dependencies
 
 - **TLS without C or assembly**: `ring` (via rustls) is the only C/assembly in

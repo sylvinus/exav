@@ -100,9 +100,9 @@ EXPOSE 1344
 
 # `--ping` reads the same `EXAV_LISTEN` the daemon did (the health check
 # inherits the container's environment, not its command line), so it follows the
-# configuration instead of assuming it. A check pinned to `clamd://…:3310` calls a healthy daemon dead
-# the moment that variable moves the port or asks for ICAP instead, and an
-# orchestrator restarts the container for it.
+# configuration instead of assuming it. A check pinned to `clamd://…:3310` calls
+# a healthy daemon dead the moment that variable moves the port or asks for ICAP
+# instead, and an orchestrator restarts the container for it.
 #
 # It is one exchange in whatever protocol the listener speaks (`PING` on clamd,
 # `OPTIONS` on ICAP), not a bare TCP connect: a daemon that accepts and then
@@ -121,8 +121,10 @@ EXPOSE 1344
 # exit on their own, so this is cosmetic under `docker run`; pass
 # `--no-healthcheck` if a supervisor would act on it.
 #
-# HEALTHCHECK belongs to Docker's image format: an image stored or pulled with
-# only the OCI configuration (which has no such field) loses it. An
+# HEALTHCHECK is a Docker extension of the image config, not part of the OCI
+# spec. The field survives in an OCI image, and Docker reads it, but podman
+# reads it only from an image published with Docker mediatypes, which the
+# publish workflow asserts. Kubernetes ignores it whatever the format. An
 # orchestrator that matters should say it itself, with the same command
 # (docker-compose.yml, and the Health section of the Docker guide).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
