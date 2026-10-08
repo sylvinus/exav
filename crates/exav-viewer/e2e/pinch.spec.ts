@@ -22,10 +22,25 @@ async function open(page: Page, name: string) {
   await page.waitForTimeout(500);
 }
 
-/** The feature's box, in page coordinates. */
+/**
+ * The feature's box, in page coordinates. Waited for: a PDF is `ready` before
+ * its first page is drawn, and a slow machine takes its time.
+ */
 async function locate(frame: Locator, test: Test) {
   const at = (await frame.boundingBox())!;
-  const box = find(decodePng(await frame.screenshot()), test).box;
+  // Without the zoom buttons, which sit over a corner of it.
+  const tools = frame.page().locator(".exv-tools");
+  const hide = (v: string) => tools.evaluateAll((els, value) => els.forEach((e) => ((e as HTMLElement).style.visibility = value)), v);
+  const until = Date.now() + 15_000;
+  let box: ReturnType<typeof find>["box"] = null;
+  for (;;) {
+    await hide("hidden");
+    const shot = await frame.screenshot();
+    await hide("");
+    box = find(decodePng(shot), test).box;
+    if (box || Date.now() > until) break;
+    await frame.page().waitForTimeout(250);
+  }
   if (!box) throw new Error("feature not on screen");
   const x = at.x + box.minX;
   const y = at.y + box.minY;

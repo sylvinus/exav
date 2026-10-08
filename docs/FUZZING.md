@@ -69,6 +69,12 @@ reaches those combinations; enumeration does not. A wrong length is the failure
 to watch, because it desynchronises every instruction after it rather than
 staying local.
 
+Run it with `ASAN_OPTIONS=detect_leaks=0`, as CI's `fuzz-smoke` does: iced-x86
+builds its decoder tables in a `lazy_static` it never frees, and the newest
+nightly's LeakSanitizer reports them at exit (552 bytes in 12 allocations,
+whatever the input). It is the oracle's, not exav's, and every other target
+keeps the check.
+
 The fuzz crate builds `exav-core` with **`default-features = false`** (YARA off):
 the YARA path isn't exercised by the builtin-DB harness, and dropping it keeps
 ASan compile times down on a constrained host. Everything we touch — archive

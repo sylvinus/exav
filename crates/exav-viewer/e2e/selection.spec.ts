@@ -69,8 +69,11 @@ for (const mode of ["sandbox", "page"] as const) {
     await page.mouse.down();
     await page.mouse.move(s.x + 300, s.y + 80, { steps: 8 });
     await page.mouse.up();
-    // The key goes to the sheet, which the press has taken the focus to.
+    // The key goes to the sheet, which the press has taken the focus to, and
+    // after the frames that draw the selection (under load a copy pressed
+    // before them finds nothing selected).
     await expect.poll(() => page.evaluate(() => document.activeElement?.id)).not.toBe("paste");
+    for (const frame of page.frames()) await frame.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
     await page.keyboard.press("ControlOrMeta+c");
     // Pasted into the page around the viewer, as a person would.
     await paste.fill("");

@@ -420,7 +420,13 @@
 }
 
 /* The zoom buttons and the drag toggle: for a mouse. A touch screen pinches
-   and scrolls, and its buttons would only cover the page. */
+   and scrolls, and its buttons would only cover the page. The warnings keep
+   clear of them, whose width this allows for. */
+@media (any-pointer: fine) {
+  .exv-warnings {
+    max-width: calc(100% - 1rem - 12rem);
+  }
+}
 .exv-tools {
   position: absolute;
   right: 0.75rem;

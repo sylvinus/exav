@@ -142,7 +142,14 @@ fn have_yr() -> bool {
 /// oracle, the same relationship exav already has with `clamscan`, and one that
 /// cannot end up in a shipped artifact by accident.
 fn yr_matches(rules: &str, data: &[u8], defines: &[(&str, &str)]) -> BTreeSet<String> {
-    let dir = std::env::temp_dir().join(format!("exav-yr-{}", std::process::id()));
+    // A directory of its own: tests run in parallel, and one that shared it
+    // would read another's rules (and fail on identifiers the other defines).
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "exav-yr-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::create_dir_all(&dir);
     let rule_path = dir.join("rules.yar");
     let data_path = dir.join("target.bin");

@@ -25,8 +25,24 @@ function recordRequests(page: Page): string[] {
   return urls;
 }
 
+/**
+ * Runs `read` with the zoom buttons hidden: they sit over a corner of the
+ * surface, which is not what the pixels are read for. Hidden through the
+ * element's style, which the frame's policy has no say over (a `style` given to
+ * the screenshot is an inline sheet it refuses).
+ */
+async function withoutTools<T>(page: Page, read: () => Promise<T>): Promise<T> {
+  const set = (value: string) => page.locator(".exv-tools").evaluateAll((els, v) => els.forEach((e) => ((e as HTMLElement).style.visibility = v)), value);
+  await set("hidden");
+  try {
+    return await read();
+  } finally {
+    await set("");
+  }
+}
+
 async function shot(target: Locator): Promise<Pixels> {
-  return decodePng(await target.screenshot({ animations: "disabled" }));
+  return withoutTools(target.page(), async () => decodePng(await target.screenshot({ animations: "disabled" })));
 }
 
 /** Waits for two screenshots in a row to agree: a canvas drawn over several frames has settled. */
@@ -192,7 +208,7 @@ for (const mode of ["sandbox", "page"] as const) {
           // Inside the canvas's edge, which the frame's border reaches.
           await settled(canvas);
           const b = (await canvas.boundingBox())!;
-          const p = decodePng(await page.screenshot({ clip: { x: b.x + 3, y: b.y + 3, width: b.width - 6, height: b.height - 6 } }));
+          const p = await withoutTools(page, async () => decodePng(await page.screenshot({ clip: { x: b.x + 3, y: b.y + 3, width: b.width - 6, height: b.height - 6 } })));
           // The ground is the most common colour.
           const counts = new Map<number, number>();
           for (let i = 0; i < p.data.length; i += 4 * 97) {
@@ -339,6 +355,8 @@ for (const mode of ["sandbox", "page"] as const) {
         const position = () => scroller.evaluate((el) => [el.scrollLeft, el.scrollTop]);
         await expect(pages).toHaveCount(3);
         for (let i = 0; i < 3; i++) await tools.getByRole("button", { name: "Zoom in" }).click();
+        // The three zooms have all been laid out (in the frame they are commands still on their way): about 1.95 times as wide as the viewer.
+        await expect.poll(() => scroller.evaluate((el) => el.scrollWidth / el.clientWidth)).toBeGreaterThan(1.85);
         await scroller.evaluate((el) => {
           el.scrollLeft = 60;
           el.scrollTop = 200;
@@ -378,13 +396,18 @@ for (const mode of ["sandbox", "page"] as const) {
         const run = engine(page).locator(".exv-pdf-text span", { hasText: sentence });
         /** The drawn ink beside the run, in the run's band: it starts and ends where the run does. */
         const lined = async () => {
-          const r = (await run.boundingBox())!;
-          const margin = 40;
-          const strip = decodePng(await page.screenshot({ clip: { x: r.x - margin, y: r.y, width: r.width + 2 * margin, height: r.height } }));
-          const ink = find(strip, dark).box!;
-          expect(Math.abs(ink.minX - margin), "the run starts where the ink does").toBeLessThan(4);
-          expect(Math.abs(ink.maxX + 1 - (margin + r.width)), "the run ends where the ink does").toBeLessThan(6);
-          return r.width;
+          let width = 0;
+          // Until the page is drawn: a slow machine is still at it when the PDF is `ready`.
+          await expect(async () => {
+            const r = (await run.boundingBox())!;
+            const margin = 40;
+            const strip = await withoutTools(page, async () => decodePng(await page.screenshot({ clip: { x: r.x - margin, y: r.y, width: r.width + 2 * margin, height: r.height } })));
+            const ink = find(strip, dark).box!;
+            expect(Math.abs(ink.minX - margin), "the run starts where the ink does").toBeLessThan(4);
+            expect(Math.abs(ink.maxX + 1 - (margin + r.width)), "the run ends where the ink does").toBeLessThan(6);
+            width = r.width;
+          }).toPass({ timeout: 15_000 });
+          return width;
         };
         await expect(run).toHaveCount(1);
         await page.waitForTimeout(500);

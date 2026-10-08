@@ -177,6 +177,13 @@ jobs:
             mkdir -p "fuzz/corpus/$t"
             extra=""
             [ -d "$seeds/$t" ] && extra="$seeds/$t"
-            cargo +nightly fuzz run "$t" "fuzz/corpus/$t" $extra \
+            # iced-x86, the oracle x86_decode compares against, builds its
+            # decoder tables in a `lazy_static` it never frees: the newest
+            # nightly's LeakSanitizer reports them at exit (552 bytes, whatever
+            # the input), which is not a leak of exav's. The other targets keep
+            # the check.
+            asan=""
+            [ "$t" = x86_decode ] && asan="detect_leaks=0"
+            ASAN_OPTIONS="$asan" cargo +nightly fuzz run "$t" "fuzz/corpus/$t" $extra \
               -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
           done

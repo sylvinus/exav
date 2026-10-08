@@ -227,6 +227,10 @@ impl SpillFile {
         // connections spilling at once would both read a total under the
         // ceiling and both add to it, and the budget that exists to bound
         // concurrent use would be the one thing concurrency defeats.
+        //
+        // `fetch_update` is deprecated in the newest toolchains for `try_update`,
+        // which the MSRV does not have.
+        #[allow(deprecated)]
         IN_USE
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 let total = used.saturating_add(n);

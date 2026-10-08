@@ -71,7 +71,13 @@ fn have_yr() -> bool {
 /// variables and modules exav does not implement make it bail), and those
 /// files are skipped rather than counted as disagreements.
 fn yr_set(rules: &str, data: &[u8]) -> Option<BTreeSet<String>> {
-    let dir = std::env::temp_dir().join(format!("exav-yr-cov-{}", std::process::id()));
+    // A directory of its own, as in `yara_difftest`: calls may run in parallel.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "exav-yr-cov-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::create_dir_all(&dir);
     let rule_path = dir.join("rules.yar");
     let data_path = dir.join("target.bin");
