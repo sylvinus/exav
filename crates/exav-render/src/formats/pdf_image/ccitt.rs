@@ -54,7 +54,7 @@ pub fn decode_ccitt(data: &[u8], p: CcittParams, max_alloc: u64) -> Result<Vec<u
         out: &mut out,
         stride,
         // Whole bytes: pdf.js's decoder copies each row's first bytes.
-        width: stride * 8,
+        width: stride.saturating_mul(8),
         height: p.height as usize,
         black_is_1: p.black_is_1,
         x: 0,

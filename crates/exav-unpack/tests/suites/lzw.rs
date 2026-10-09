@@ -135,6 +135,34 @@ fn a_truncated_stream_keeps_what_decoded() {
     );
 }
 
+/// `compress -b16` of 90,000 incompressible bytes (ncompress 5.0): the table
+/// fills to 65,536 entries before the stream ends, which a 16-bit counter of
+/// the next free code cannot hold. The original is not committed; its SHA-256
+/// is (seeded `random.Random(20261009)`, 90,000 `getrandbits(8)`).
+#[test]
+fn a_full_sixteen_bit_table_decodes() {
+    use sha2::{Digest, Sha256};
+    let p = format!(
+        "{}/tests/fixtures/lzw_full/fulltable.b16.Z",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let z = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let e = emitted(&z);
+    let got = e
+        .iter()
+        .find(|x| x.unsupported.is_none())
+        .unwrap_or_else(|| panic!("no decoded member, got {e:?}"));
+    assert_eq!(got.data.len(), 90_000);
+    let digest: String = Sha256::digest(&got.data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        digest,
+        "e1b58c1fe19f7edeed1d4acd9eeddbd77c9f0b50494b82061b009d9b9fd3a4ce"
+    );
+}
+
 #[test]
 fn an_oversized_stream_is_reported_not_truncated_silently() {
     // Holding a member larger than the buffer limit must fail as a limit rather

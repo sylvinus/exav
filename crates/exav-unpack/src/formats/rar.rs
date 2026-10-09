@@ -291,7 +291,7 @@ fn extract_rar4_keyed(
     // Whether the window holds every member before this one. A solid member
     // decoded without them decodes to bytes that are not its own.
     let mut in_step = true;
-    while pos + 7 <= data.len() {
+    while pos.saturating_add(7) <= data.len() {
         let flags = match u16le(data, pos + 3) {
             Some(f) => f,
             None => break,
@@ -519,9 +519,11 @@ fn extract_rar4_keyed(
                     "unsupported RAR compression",
                 ));
             }
-            pos = data_off + add_size as usize;
+            pos = data_off.saturating_add(crate::bytes::to_usize(add_size));
         } else {
-            pos += head_size + add_size as usize;
+            pos = pos
+                .saturating_add(head_size)
+                .saturating_add(crate::bytes::to_usize(add_size));
         }
         if add_size == 0 && head_size == 0 {
             break;

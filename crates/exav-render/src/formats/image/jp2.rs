@@ -12,7 +12,10 @@ pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     // The decoder holds every component as `f32` at full size, then packs
     // them into bytes.
     within(
-        u64::from(width) * u64::from(height) * channels * 5,
+        u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(channels)
+            .saturating_mul(5),
         max_alloc,
     )?;
     let data = image

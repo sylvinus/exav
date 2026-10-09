@@ -81,8 +81,8 @@ exav --ping --connect clamd://scanner.internal:3310 # from anywhere
 
 `HEALTHCHECK` is a Docker extension of the image configuration, not part of the
 OCI spec. Docker honours it either way. Podman reads it only from an image
-published with Docker mediatypes, which the publish workflow checks from
-release 0.0.2 on; on older tags, or an image a registry re-exports as OCI,
+published with Docker mediatypes, which the publish workflow checks for images
+published after 0.0.1; on older tags, or an image a registry re-exports as OCI,
 `podman image inspect` shows no health check. Kubernetes ignores it entirely.
 Where it matters, say it in the orchestrator's own configuration, with the same
 command:

@@ -141,6 +141,11 @@ fn ctime_from_btime(btime: &str) -> String {
         let day: u32 = it.next()?.parse().ok()?;
         let mon_name = it.next()?;
         let year: i64 = it.next()?.parse().ok()?;
+        // The weekday sum below is for real calendar years; a build time is
+        // text from a database file.
+        if !(1..=9999).contains(&year) {
+            return None;
+        }
         let (hh, mm) = it.next()?.split_once(['-', ':'])?;
         let mon = MON.iter().position(|m| m.eq_ignore_ascii_case(mon_name))? + 1;
         // Sakamoto's algorithm: day-of-week (0 = Sunday) for a Gregorian date.
@@ -896,7 +901,7 @@ fn retire_grace(max_scan_time: std::time::Duration) -> std::time::Duration {
     if max_scan_time.is_zero() {
         NO_LIMIT
     } else {
-        max_scan_time + MARGIN
+        max_scan_time.saturating_add(MARGIN)
     }
 }
 
@@ -1763,7 +1768,10 @@ pub fn run_prefork(
         let now = std::time::Instant::now();
         let mut tick = SUPERVISOR_TICK;
         for (&pid, r) in retiring.iter_mut().filter(|(_, r)| !r.stopped) {
-            let due = r.since + grace;
+            // A grace too long to add to the clock is one that never ends.
+            let Some(due) = r.since.checked_add(grace) else {
+                continue;
+            };
             if now >= due {
                 let what = if r.side {
                     side.map_or("worker", |s| s.name)
@@ -3460,6 +3468,20 @@ impl<R: Read> Read for Instream<'_, R> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// `--max-scan-secs` is an operator's number, and a database's build time is
+    /// text from a file: neither may panic the supervisor or a connection.
+    #[test]
+    fn a_scan_time_limit_as_wide_as_a_duration_gets_a_grace_not_a_panic() {
+        let g = super::retire_grace(std::time::Duration::MAX);
+        assert!(g >= std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_build_time_with_a_huge_year_is_returned_unchanged() {
+        let t = "17 Jul 9223372036854775807 06-24 +0000";
+        assert_eq!(super::ctime_from_btime(t), t);
+    }
+
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;

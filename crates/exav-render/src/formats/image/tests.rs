@@ -207,3 +207,95 @@ fn a_tiff_lzw_strip_filling_its_table_without_a_clear_code_decodes() {
     assert_eq!((p.width, p.height, p.channels), (64, 61, Channels::Luma));
     assert_eq!(p.samples, Samples::U8(pixels));
 }
+
+thread_local!(static PANICKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// Records a panic on this thread, which `decode` would otherwise turn into
+/// `Undecodable` without a trace.
+fn watch_panics() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            PANICKED.with(|p| p.set(true));
+            previous(info);
+        }));
+    });
+    PANICKED.with(|p| p.set(false));
+}
+
+fn panicked() -> bool {
+    PANICKED.with(|p| p.get())
+}
+
+/// A little-endian TIFF with one directory of `(tag, type, count, value)`
+/// entries (values inline) and 8 bytes of strip data.
+fn tiff_with(entries: &[(u16, u16, u32, u32)]) -> Vec<u8> {
+    let mut tiff = b"II*\0".to_vec();
+    tiff.extend_from_slice(&16u32.to_le_bytes());
+    tiff.extend_from_slice(&[0; 8]);
+    tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for &(tag, kind, count, value) in entries {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&kind.to_le_bytes());
+        tiff.extend_from_slice(&count.to_le_bytes());
+        tiff.extend_from_slice(&value.to_le_bytes());
+    }
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    tiff
+}
+
+/// A TIFF's own numbers decide its sizes: counts and products of them that do
+/// not fit are errors, not panics (each of these panicked a build with
+/// overflow checks, or wrapped to a size that passed the consistency check).
+#[test]
+fn tiff_tags_at_the_ends_of_their_ranges_are_errors_not_panics() {
+    let base = |extra: &[(u16, u16, u32, u32)]| {
+        let mut e = vec![
+            (256, 3, 1, 1),
+            (257, 4, 1, 70_000),
+            (258, 3, 1, 8),
+            (259, 3, 1, 1),
+            (262, 3, 1, 1),
+            (273, 4, 1, 8),
+            (277, 3, 1, 1),
+            (278, 3, 1, 1),
+            (279, 4, 1, 1),
+        ];
+        for x in extra {
+            e.retain(|y| y.0 != x.0);
+            e.push(*x);
+        }
+        e.sort_by_key(|x| x.0);
+        tiff_with(&e)
+    };
+    // The same file at one row decodes: the builder is sound.
+    assert!(decode(&base(&[(257, 4, 1, 1)]), Format::Tiff, DECODE_MAX).is_ok());
+    // SampleFormat with no values.
+    let empty_format = base(&[(339, 3, 0, 0)]);
+    // 70,000 one-row strips of 65,535 planes.
+    let many_planes = base(&[(277, 3, 1, 65_535), (284, 3, 1, 2)]);
+    // 1x1 tiles over a 4,294,967,295 square image, planar.
+    let many_tiles = tiff_with(&[
+        (256, 4, 1, u32::MAX),
+        (257, 4, 1, u32::MAX),
+        (258, 3, 1, 8),
+        (259, 3, 1, 1),
+        (262, 3, 1, 1),
+        (277, 3, 1, 65_535),
+        (284, 3, 1, 2),
+        (322, 4, 1, 1),
+        (323, 4, 1, 1),
+        (324, 4, 1, 8),
+        (325, 4, 1, 1),
+    ]);
+    for (what, file) in [
+        ("an empty SampleFormat", empty_format),
+        ("planes times strips", many_planes),
+        ("tiles across times down", many_tiles),
+    ] {
+        watch_panics();
+        let _ = decode(&file, Format::Tiff, DECODE_MAX);
+        assert!(!panicked(), "{what} panicked the decoder");
+    }
+}

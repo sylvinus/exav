@@ -89,18 +89,37 @@ is on exav.org.
   arrow keys, download and "open in a tab" are written again by a host that
   keeps its own dialog around `ViewerBody`.
 
+## CI
+
+- **Delete the viewer e2e diagnostics** (`screenshot: "only-on-failure"` in
+  `crates/exav-viewer/playwright.config.ts` and the `viewer-e2e-results`
+  upload step in `.github/workflows/ci.yml`) once the three PDF tests that
+  fail only on the GitHub runner are understood.
+
 ## Robustness
 
 The arithmetic audit (`tmp/ARITHMETIC_AUDIT.md`, not committed; its row names
-are used below) found about a hundred sites where a header's number is added to or multiplied by something
-unchecked. The disk-image formats, the signature engine's gaps, offsets and
-byte comparisons, and the dotnet, elf and bytecode-PE readers are fixed and
-tested. Open:
+are used below) found about a hundred sites where a header's number is added
+to or multiplied by something unchecked. Fixed and tested: the disk-image
+formats, the signature engine's gaps, offsets, byte comparisons, PCRE group
+references and logic sums, the dotnet, elf and bytecode-PE readers, the
+fancy-regex size analysis, the `.Z` and ARC table counters (a `.Z` whose table
+filled was lost), LZ4 skippable frames, the ARC, UPX and RAR4 position walks
+(32-bit), the delta and audio RAR filters, OLE crypto lengths and spin count,
+PDF key sizes, the 7z LZMA2 dictionary, split-ZIP offsets, the TIFF strip,
+tile and format counts, DXF group codes, the daemon's scan-time limit and
+build-time year, `-A` in exav-grep, exav-imagehash dimensions. Fixed without a
+test of their own (the input is not practical to build): C14 (HTTP range end),
+C15 (`ml.rs` histogram, needs 4 GiB), E1 (x87 infinity store), T5 to T8
+(JPEG 2000 palette and size sums), R13 (zero-column proxy mesh), R7 (IFC trim
+parameter), `ccitt.rs` stride. Open:
 
-- **The rest of the audit**: its sections A (rows C9 to C15, D1, T1 to T9, E1
-  to E14), B (R1, R3 to R17: uncatchable allocations, unbounded loops) and C
-  (the wasm32-only wraps in arc, lz4, arj, egg, upx, ole, vba, rar, udif,
-  ccitt). Section C matters most: the wasm builds have no overflow checks.
+- **The rest of the audit**: the rows not named above. In section A, C12
+  (bytecode VM sums, contained), D1, E10 (rar join), E14 (bcj2, 7z substream
+  order), T9; in section B, R3 for LZMA, R4, R5, R8 to R12, R14, R16 for the
+  RAR VM, R17; in section C, the 32-bit wraps in arj, egg, vba, udif, ole
+  (other than the two fixed), the rest of rar and upx, dotnet and the bytecode
+  VM. Section C matters most: the wasm builds have no overflow checks.
 - **`crate::bytes::at` everywhere**: `d.get(off..off + n)` is spelled about
   150 times in `exav-unpack` and as many in `exav-core`. Only the disk-image
   formats use the checked form. A mechanical replacement, by a script, wants
@@ -109,10 +128,11 @@ tested. Open:
   other disk formats are close (vmdk 12 sites, qcow2 11, vhdx 15), then ntfs
   (75) and wim (45); the lint is far too noisy for the decoders (2,700 in
   `exav-unpack`). Extend it file by file as each is cleaned.
-- **The wasm32 run covers the disk images only**: `make test-wasm` runs the
-  `extreme` suite and the `--lib` tests. The same sweep for the other
-  container formats (a valid sample of each, `extreme.rs::sweep`) would
-  extend it.
+- **The wasm32 sweep's samples**: `make test-wasm` runs the `extreme` suite,
+  which covers the disk images and one small sample of 25 other containers
+  (`extreme.rs`). It finds what a single field set to an extreme reaches in
+  those samples; a bug behind a field the sample does not use (a split-volume
+  RAR, a spanned ZIP, an encrypted container) needs a sample that uses it.
 - **A dmg with `decrypt`** (audit row D1) and the second half of the NTFS
   attribute-list walk have no test of their own.
 

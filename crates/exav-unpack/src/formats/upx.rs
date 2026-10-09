@@ -181,7 +181,7 @@ fn packheader_image(data: &[u8], cap: u64, verify: bool) -> Option<Vec<u8>> {
         let u_len = u32_le(data, m + 16) as usize;
         let c_len = u32_le(data, m + 20) as usize;
         let start = m + 32;
-        if u_len == 0 || c_len == 0 || u_len as u64 > cap || start + c_len > data.len() {
+        if u_len == 0 || c_len == 0 || u_len as u64 > cap || c_len > data.len() - start {
             continue;
         }
         let cdata = &data[start..start + c_len];
@@ -489,7 +489,9 @@ fn deflate_block_decompress(cdata: &[u8], sz_unc: usize) -> Salvaged {
 
 #[inline]
 fn u32_le(d: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+    crate::bytes::at(d, off, 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(0)
 }
 
 /// Decompress a UPX LZMA (method 14) block. UPX stores the LZMA lc/lp/pb

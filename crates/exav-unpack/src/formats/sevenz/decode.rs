@@ -95,6 +95,9 @@ pub(super) fn wrap_coder(
             } else {
                 (2 | (dict_size_bits & 1)) << (dict_size_bits / 2 + 11)
             };
+            // As for LZMA: a dictionary larger than what the stream can fill
+            // is allocated for nothing, and 4 GiB is declared by one byte.
+            let dict_size = crate::bounded_dict(dict_size, (expected_size as u64).min(max_buffer));
             let lzma2 = lzma_rust2::Lzma2Stream::new(dict_size);
             Ok(Box::new(SansIo::new(inner, lzma2)))
         }

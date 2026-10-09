@@ -256,7 +256,9 @@ impl<'a> Reader<'a> {
                     }
                 };
                 let (s, mut e) = (param(&t1[i1]), param(&t2[i2]));
-                if !(s.is_finite() && e.is_finite()) {
+                // A parameter this far from the start is no arc, and adding a
+                // turn to a float that large changes nothing, forever.
+                if !(s.is_finite() && e.is_finite()) || (e - s).abs() > 1.0e6 {
                     return None;
                 }
                 if sense {

@@ -12,7 +12,7 @@ use super::Ctx;
 use crate::formats::cad::model::*;
 
 pub(super) fn p3(p: &mut Vec3, t: &Tag<'_>, base: i32) -> bool {
-    match t.code - base {
+    match t.code.wrapping_sub(base) {
         0 => p.x = t.f64(),
         10 => p.y = t.f64(),
         20 => p.z = t.f64(),
@@ -22,7 +22,7 @@ pub(super) fn p3(p: &mut Vec3, t: &Tag<'_>, base: i32) -> bool {
 }
 
 pub(super) fn p2(p: &mut Vec2, t: &Tag<'_>, base: i32) -> bool {
-    match t.code - base {
+    match t.code.wrapping_sub(base) {
         0 => p.x = t.f64(),
         10 => p.y = t.f64(),
         _ => return false,
@@ -40,7 +40,7 @@ fn handle(t: &Tag<'_>) -> Handle {
 
 /// A repeated 3D point: `base` starts one, `base + 10` and `+ 20` fill it.
 pub(super) fn push3(v: &mut Vec<Vec3>, t: &Tag<'_>, base: i32, ctx: &mut Ctx<'_>) -> bool {
-    match t.code - base {
+    match t.code.wrapping_sub(base) {
         0 => {
             if ctx.room(v.len()) {
                 v.push(Vec3::new(t.f64(), 0.0, 0.0));
@@ -62,7 +62,7 @@ pub(super) fn push3(v: &mut Vec<Vec3>, t: &Tag<'_>, base: i32, ctx: &mut Ctx<'_>
 }
 
 pub(super) fn push2(v: &mut Vec<Vec2>, t: &Tag<'_>, base: i32, ctx: &mut Ctx<'_>) -> bool {
-    match t.code - base {
+    match t.code.wrapping_sub(base) {
         0 => {
             if ctx.room(v.len()) {
                 v.push(Vec2::new(t.f64(), 0.0));

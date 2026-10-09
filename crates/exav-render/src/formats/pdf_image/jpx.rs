@@ -84,7 +84,10 @@ pub fn decode_jpx(
     let n = siz.components.len();
     // Every component as `f32` in the decoder, then as bytes, then the
     // components wanted.
-    let needed = pixels * n as u64 * 5 + pixels * 4;
+    let needed = pixels
+        .saturating_mul(n as u64)
+        .saturating_mul(5)
+        .saturating_add(pixels.saturating_mul(4));
     if needed > max_alloc {
         return Err(Error::new("Image too large"));
     }
@@ -111,7 +114,9 @@ pub fn decode_jpx(
                 (true, false) => samples.map(|v| unscale(v, info.precision)).collect(),
                 (true, true) => {
                     let half = 1i32 << (info.precision.min(31) - 1);
-                    samples.map(|v| unscale(v, info.precision) - half).collect()
+                    samples
+                        .map(|v| unscale(v, info.precision).wrapping_sub(half))
+                        .collect()
                 }
                 (false, false) => samples.map(i32::from).collect(),
                 (false, true) => samples.map(|v| i32::from(v) - 128).collect(),
@@ -154,7 +159,7 @@ pub fn decode_jpx(
             let grey = space == Colour::Grey || count < 3;
             if grey && count == 1 {
                 Some(grey_rgba(&planes[0].values, None))
-            } else if grey && params.smask_in_data {
+            } else if grey && params.smask_in_data && count >= 2 {
                 Some(grey_rgba(&planes[0].values, Some(&planes[1].values)))
             } else if grey {
                 None
@@ -241,11 +246,13 @@ fn convert(planes: &mut Vec<Plane>, space: Colour) {
                 let cb = planes[1].values[i] as f32 - offset;
                 let cr = planes[2].values[i] as f32 - offset;
                 let rgb = if space == Colour::Sycc {
+                    // Palette entries can be any `i32`.
                     [
-                        planes[0].values[i] + (1.402f64 * f64::from(cr)) as i32,
-                        planes[0].values[i]
-                            - (0.344f64 * f64::from(cb) + 0.714f64 * f64::from(cr)) as i32,
-                        planes[0].values[i] + (1.772f64 * f64::from(cb)) as i32,
+                        planes[0].values[i].saturating_add((1.402f64 * f64::from(cr)) as i32),
+                        planes[0].values[i].saturating_sub(
+                            (0.344f64 * f64::from(cb) + 0.714f64 * f64::from(cr)) as i32,
+                        ),
+                        planes[0].values[i].saturating_add((1.772f64 * f64::from(cb)) as i32),
                     ]
                 } else {
                     [

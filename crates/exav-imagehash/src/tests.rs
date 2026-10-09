@@ -257,6 +257,15 @@ fn pixels_hash_as_the_file_does() {
         .is_err());
 }
 
+/// Dimensions are the caller's: ones whose pixel count does not fit a `usize`
+/// are a mismatch with the buffer, not an overflow.
+#[test]
+fn dimensions_whose_pixel_count_overflows_are_refused() {
+    let h = Hasher::new(Preset::ClamAv);
+    assert!(h.hash_rgb8(u32::MAX, u32::MAX, &[0; 12]).is_err());
+    assert!(h.hash_rgba8(u32::MAX, u32::MAX, &[0; 12]).is_err());
+}
+
 #[test]
 fn sizes_and_hex() {
     let png = {

@@ -419,10 +419,11 @@
   margin: 0;
 }
 
-/* The zoom buttons and the drag toggle: for a mouse. A touch screen pinches
-   and scrolls, and its buttons would only cover the page. The warnings keep
-   clear of them, whose width this allows for. */
-@media (any-pointer: fine) {
+/* The zoom buttons and the drag toggle: for a mouse, or for a browser that
+   reports no pointer at all (a desktop without one detected, headless test
+   browsers). A touch screen pinches and scrolls, and its buttons would only
+   cover the page. The warnings keep clear of them, whose width this allows for. */
+@media (any-pointer: fine), (any-pointer: none) {
   .exv-warnings {
     max-width: calc(100% - 1rem - 12rem);
   }
@@ -435,7 +436,7 @@
   display: none;
   gap: 0.375rem;
 }
-@media (any-pointer: fine) {
+@media (any-pointer: fine), (any-pointer: none) {
   .exv-tools {
     display: flex;
   }

@@ -395,7 +395,9 @@ impl Searcher {
                 counted = true;
             }
             let from = i.saturating_sub(self.opts.before_context);
-            let to = (i + self.opts.after_context).min(lines.len().saturating_sub(1));
+            let to = i
+                .saturating_add(self.opts.after_context)
+                .min(lines.len().saturating_sub(1));
             for (j, l) in lines.iter().enumerate().take(to + 1).skip(from) {
                 // Don't reprint a line already emitted as context for an earlier
                 // match, and never downgrade a match line to a context line.
@@ -491,6 +493,30 @@ mod tests {
             v.extend_from_slice(body);
         }
         v
+    }
+
+    /// `-A` is a number off the command line: as wide as `usize` it means "to
+    /// the end of the file", and the match line is still printed.
+    #[test]
+    fn an_after_context_as_wide_as_usize_reaches_the_end() {
+        let opts = Options {
+            after_context: usize::MAX,
+            ..Options::default()
+        };
+        let ev = collect(
+            Matcher::fixed("two", false).unwrap(),
+            opts,
+            "f",
+            b"one\ntwo\nthree\nfour\n",
+        );
+        let lines: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                Event::Match { line_no, .. } => Some(*line_no),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec![2]);
     }
 
     #[test]

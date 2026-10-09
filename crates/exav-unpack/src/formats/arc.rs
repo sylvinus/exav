@@ -50,13 +50,13 @@ const MIN_WIDTH: u32 = 9;
 const MAX_MEMBERS: usize = 4096;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
@@ -90,7 +90,7 @@ fn crc16(data: &[u8]) -> u16 {
 /// NUL padding rejects most genuine archives while happening to accept the
 /// tidier ones, which is the worst of both.
 fn plausible_header(data: &[u8], off: usize) -> bool {
-    let Some(h) = data.get(off..off + HEADER_LEN_V1) else {
+    let Some(h) = crate::bytes::at(data, off, HEADER_LEN_V1) else {
         return false;
     };
     if h[0] != MARKER || h[1] == 0 || h[1] > MAX_METHOD {
@@ -185,7 +185,8 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
     let table_cap = 1usize << max_width;
     let mut prefix = vec![0u16; table_cap];
     let mut suffix = vec![0u8; table_cap];
-    let mut next = FIRST_FREE;
+    // 65,536 once the table is full, which a `u16` cannot hold.
+    let mut next = u32::from(FIRST_FREE);
     let mut width = MIN_WIDTH;
     let mut prev: Option<u16> = None;
     let mut out: Vec<u8> = Vec::new();
@@ -208,7 +209,7 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
         let code = code as u16;
 
         if code == CLEAR {
-            next = FIRST_FREE;
+            next = u32::from(FIRST_FREE);
             width = MIN_WIDTH;
             prev = None;
             continue;
@@ -219,10 +220,10 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
         // A code past the next free one is in no encoder's output. Taken for
         // the KwKwK case it would become the prefix of the next code defined,
         // which can then be its own prefix: the expansion below never ends.
-        if code > next {
+        if u32::from(code) > next {
             return None;
         }
-        if code == next {
+        if u32::from(code) == next {
             // KwKwK: the code is the one about to be defined, so it expands to
             // the previous string followed by its own first byte.
             let p = prev?;
@@ -309,7 +310,7 @@ pub(crate) fn extract_arc<R>(
     let mut pos = 0usize;
     let mut members = 0usize;
 
-    while pos + HEADER_LEN_V1 <= data.len() {
+    while pos.saturating_add(HEADER_LEN_V1) <= data.len() {
         if data[pos] != MARKER {
             break;
         }

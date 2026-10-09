@@ -30,6 +30,18 @@ fn quick<T>(what: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// A group code is the file's number: the smallest and largest `i32` among the
+/// codes of an entity are not offsets to subtract from.
+#[test]
+fn group_codes_at_the_ends_of_i32_are_read_not_subtracted() {
+    for code in ["-2147483648", "2147483647", "-2147483647"] {
+        for entity in ["LINE", "CIRCLE", "TEXT", "LWPOLYLINE", "INSERT", "LAYER"] {
+            let body = format!("0\n{entity}\n8\n0\n10\n1.0\n{code}\n5\n20\n2.0\n11\n3.0\n");
+            let _ = quick("group code", || read_dxf(&dxf(&body)));
+        }
+    }
+}
+
 #[test]
 fn every_truncation_reads_or_fails_cleanly() {
     for data in samples() {

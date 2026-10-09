@@ -101,7 +101,7 @@ mod http {
             if start >= self.len {
                 return Ok(());
             }
-            let last = (start + size).min(self.len) - 1;
+            let last = start.saturating_add(size).min(self.len) - 1;
             let resp = self
                 .agent
                 .get(&self.url)

@@ -121,7 +121,7 @@ impl KeyDeriver {
                     k[..5].copy_from_slice(&hf[..5]);
                     k
                 } else {
-                    hf[..*key_bytes].to_vec()
+                    hf[..(*key_bytes).min(hf.len())].to_vec()
                 }
             }
         }
@@ -424,8 +424,9 @@ fn xor_create_array(pw: &str) -> Option<[u8; 16]> {
         index -= 1;
         pad_index -= 1;
         obf[index] = xor_ror(XOR_PAD[pad_index], lo);
-        index -= 1;
-        pad_index -= 1;
+        // An odd count of pad bytes ends here, one step short of two.
+        index = index.saturating_sub(1);
+        pad_index = pad_index.saturating_sub(1);
     }
     Some(obf)
 }
@@ -563,9 +564,9 @@ fn parse_ooxml_standard(info: &[u8]) -> Option<OoxmlStandard> {
     if minor != 2 {
         return None; // not standard encryption
     }
-    let header_size = u32::from_le_bytes([info[8], info[9], info[10], info[11]]) as usize;
+    let header_size = u32::from_le_bytes(info.get(8..12)?.try_into().ok()?) as usize;
     // EncryptionHeader starts at offset 12; KeySize is its 5th u32 (offset +16).
-    let hdr = info.get(12..12 + header_size)?;
+    let hdr = crate::bytes::at(info, 12, header_size)?;
     let key_bits = u32::from_le_bytes(hdr.get(16..20)?.try_into().ok()?);
     let key_bytes = if key_bits == 0 {
         16
@@ -820,11 +821,16 @@ fn parse_ooxml_agile(info: &[u8]) -> Option<OoxmlAgile> {
     })
 }
 
+/// The most hash rounds taken from an `EncryptionInfo`'s `spinCount`.
+const MAX_AGILE_SPIN: u32 = 1_000_000;
+
 /// Agile password hash ([MS-OFFCRYPTO] §2.3.4.11): `H0 = Hash(salt ‖ UTF16LE(pw))`,
 /// then `spin` iterations of `Hi = Hash(LE32(i) ‖ H(i-1))`. Excludes the block key.
 fn agile_iterated_hash(salt: &[u8], pw: &str, alg: HashAlg, spin: u32) -> Vec<u8> {
     let mut h = alg.digest(&[salt, &utf16le(pw)].concat());
-    for i in 0..spin {
+    // Office writes 100,000. The count is the file's, and each password tried
+    // costs this many hashes: 4 billion would be an hour of one.
+    for i in 0..spin.min(MAX_AGILE_SPIN) {
         let mut m = i.to_le_bytes().to_vec();
         m.extend_from_slice(&h);
         h = alg.digest(&m);
@@ -906,6 +912,54 @@ fn decrypt_agile_package(package: &[u8], secret: &[u8], a: &OoxmlAgile) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The password and the EncryptionInfo come from the user and the file: no
+    /// length of either may panic the derivation.
+    #[test]
+    fn a_spin_count_of_billions_is_cut_to_a_million_rounds() {
+        let start = std::time::Instant::now();
+        let h = agile_iterated_hash(&[0u8; 16], "pw", HashAlg::Sha1, u32::MAX);
+        assert_eq!(h.len(), 20);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        // The same as asking for the cut itself.
+        assert_eq!(
+            h,
+            agile_iterated_hash(&[0u8; 16], "pw", HashAlg::Sha1, MAX_AGILE_SPIN)
+        );
+    }
+
+    #[test]
+    fn xor_arrays_for_every_password_length_are_built() {
+        for n in 0..=16 {
+            let pw = "a".repeat(n);
+            assert_eq!(
+                xor_create_array(&pw).is_some(),
+                (1..=15).contains(&n),
+                "length {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cryptoapi_key_size_past_the_hash_is_cut_to_the_hash() {
+        let k = KeyDeriver::cryptoapi(&[0u8; 16], "pw", 2048);
+        assert!(k.block_key(0).len() <= 20);
+    }
+
+    #[test]
+    fn a_short_standard_encryption_info_is_not_parsed_not_a_panic() {
+        for len in 0..=11 {
+            let mut info = vec![0u8; len];
+            if len > 3 {
+                info[2] = 2; // minor
+            }
+            assert!(parse_ooxml_standard(&info).is_none(), "length {len}");
+        }
+        let mut huge = vec![0u8; 16];
+        huge[2] = 2;
+        huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_ooxml_standard(&huge).is_none());
+    }
 
     fn eicar() -> &'static [u8] {
         crate::eicar()

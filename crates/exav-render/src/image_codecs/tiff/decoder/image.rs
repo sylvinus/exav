@@ -150,7 +150,11 @@ impl Image {
                     return Err(TiffUnsupportedError::UnsupportedSampleFormat(sample_format).into());
                 }
 
-                sample_format[0]
+                // A tag with no values has no format to read.
+                sample_format
+                    .first()
+                    .copied()
+                    .ok_or(TiffFormatError::InconsistentSizesEncountered)?
             }
             None => SampleFormat::Uint,
         };
@@ -233,8 +237,9 @@ impl Image {
 
                 if chunk_offsets.len() != chunk_bytes.len()
                     || rows_per_strip == 0
-                    || u32::try_from(chunk_offsets.len())?
-                        != (height.saturating_sub(1) / rows_per_strip + 1) * planes as u32
+                    || chunk_offsets.len() as u64
+                        != u64::from(height.saturating_sub(1) / rows_per_strip + 1)
+                            * planes as u64
                 {
                     return Err(TiffError::FormatError(
                         TiffFormatError::InconsistentSizesEncountered,
@@ -273,8 +278,11 @@ impl Image {
 
                 let tile = tile_attributes.as_ref().unwrap();
                 if chunk_offsets.len() != chunk_bytes.len()
-                    || chunk_offsets.len()
-                        != tile.tiles_down() * tile.tiles_across() * planes as usize
+                    || tile
+                        .tiles_down()
+                        .checked_mul(tile.tiles_across())
+                        .and_then(|t| t.checked_mul(planes as usize))
+                        != Some(chunk_offsets.len())
                 {
                     return Err(TiffError::FormatError(
                         TiffFormatError::InconsistentSizesEncountered,

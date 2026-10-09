@@ -346,7 +346,7 @@ impl<'a> Analyzer<'a> {
                     child_inside_zero_rep,
                     enclosing_group,
                 )?;
-                min_size = child_info.min_size * lo;
+                min_size = child_info.min_size.saturating_mul(lo);
                 max_size = if hi == usize::MAX || child_info.max_size == usize::MAX {
                     usize::MAX
                 } else {
@@ -441,7 +441,7 @@ impl<'a> Analyzer<'a> {
                 )?;
                 let child_info_truth = self.visit(
                     true_branch,
-                    min_pos_in_group + child_info_condition.min_size,
+                    min_pos_in_group.saturating_add(child_info_condition.min_size),
                     inside_zero_rep,
                     enclosing_group,
                 )?;
@@ -452,14 +452,16 @@ impl<'a> Analyzer<'a> {
                     enclosing_group,
                 )?;
 
-                min_size = child_info_condition.min_size
-                    + min(child_info_truth.min_size, child_info_false.min_size);
+                min_size = child_info_condition
+                    .min_size
+                    .saturating_add(min(child_info_truth.min_size, child_info_false.min_size));
                 max_size = max(child_info_truth.max_size, child_info_false.max_size);
                 const_size = child_info_condition.const_size
                     && child_info_truth.const_size
                     && child_info_false.const_size
                     // if the condition's size plus the truth branch's size is equal to the false branch's size then it's const size
-                    && child_info_condition.min_size + child_info_truth.min_size == child_info_false.min_size;
+                    && child_info_condition.min_size.saturating_add(child_info_truth.min_size)
+                        == child_info_false.min_size;
 
                 children.push(child_info_condition);
                 children.push(child_info_truth);

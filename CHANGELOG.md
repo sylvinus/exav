@@ -400,6 +400,9 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- A `.Z` (`compress -b16`) or ARC file whose code table filled to 65,536
+  entries was lost to a panic in its decoder: a 16-bit counter of the next free
+  code overflowed. It decodes now.
 - A streamOptimized VMDK whose metadata marker declared more sectors than the
   file holds overflowed the marker walk (a panic in builds with overflow
   checks, a wrapped position otherwise); the walk now ends there.

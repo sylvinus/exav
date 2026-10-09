@@ -787,7 +787,11 @@ impl Parser {
             if n == 0 {
                 return Err("PCRE: reference to a non-existent group");
             }
-            Ok(Ref::Number(self.groups + n))
+            Ok(Ref::Number(
+                self.groups
+                    .checked_add(n)
+                    .ok_or("PCRE: reference to a non-existent group")?,
+            ))
         } else if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
             Ok(Ref::Number(id.parse().map_err(|_| "PCRE: malformed group reference")?))
         } else if !id.is_empty() {
@@ -1483,6 +1487,30 @@ fn emit_set(s: &Set, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A relative group reference is the database's number added to the count
+    /// so far: one that overflows is a reference to no group, not a panic.
+    #[test]
+    fn a_relative_group_reference_at_the_top_of_u32_is_refused() {
+        assert!(translate(r"(a)\g{+4294967295}", flags("")).is_err());
+        assert!(translate(r"(a)\g{+1}(b)", flags("")).is_ok());
+    }
+
+    /// Nested repeat counts multiply the size analysis: the product is capped,
+    /// and a pattern the engine cannot size is refused or compiled, not a panic.
+    #[test]
+    fn nested_repeat_counts_do_not_overflow_the_size_analysis() {
+        for p in [
+            r"((((a{65535}){65535}){65535}){65535}){65535}\1",
+            r"(?=(((a{65535}){65535}){65535}){65535})\1",
+            r"(?(1)((a{65535}){65535}){65535}|((b{65535}){65535}){65535})(x)",
+            r"((((a{65535}){65535}){65535}){65535}){65535}(?<=a)",
+        ] {
+            let _ = crate::fancy_regex::RegexBuilder::new(p)
+                .bytes_mode(crate::fancy_regex::BytesMode::Ascii)
+                .build();
+        }
+    }
 
     fn flags(s: &str) -> Flags {
         Flags {

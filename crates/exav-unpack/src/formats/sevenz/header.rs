@@ -638,15 +638,15 @@ fn parse_files_info(
             if non_empty_counter < total_unpack_sub_streams {
                 file.size = sub_streams_info
                     .as_ref()
-                    .map(|ssi| ssi.unpack_sizes[non_empty_counter])
+                    .and_then(|ssi| ssi.unpack_sizes.get(non_empty_counter).copied())
                     .unwrap_or(0);
                 file.has_crc = sub_streams_info
                     .as_ref()
-                    .map(|ssi| ssi.has_crc[non_empty_counter])
+                    .and_then(|ssi| ssi.has_crc.get(non_empty_counter).copied())
                     .unwrap_or(false);
                 file.crc = sub_streams_info
                     .as_ref()
-                    .map(|ssi| ssi.crcs[non_empty_counter])
+                    .and_then(|ssi| ssi.crcs.get(non_empty_counter).copied())
                     .unwrap_or(0);
             }
             non_empty_counter += 1;

@@ -1498,14 +1498,16 @@ fn filter_delta(n: usize, buf: &[u8]) -> Vec<u8> {
         return res;
     }
     let mut i = 0usize;
-    for j in 0..n {
+    // A channel past the data has no byte, and `n` is the archive's 32-bit
+    // register.
+    for j in 0..n.min(l) {
         let mut c = 0u8;
         let mut k = j;
         while k < l {
             c = c.wrapping_sub(buf[i]);
             i += 1;
             res[k] = c;
-            k += n;
+            k = k.saturating_add(n);
         }
     }
     res
@@ -1565,7 +1567,9 @@ fn abs_i(n: i32) -> i32 {
 }
 
 fn filter_rgb(r0: u32, r1: u32, buf: &[u8]) -> Vec<u8> {
-    let width = r0 as i32 - 3;
+    let Some(width) = (r0 as i32).checked_sub(3) else {
+        return buf.to_vec();
+    };
     let pos_r = r1 as i32;
     let l = buf.len();
     let mut res = vec![0u8; l];
@@ -1621,7 +1625,7 @@ fn filter_audio(chans: usize, buf: &[u8]) -> Vec<u8> {
         return res;
     }
     let mut src = 0usize;
-    for c in 0..chans {
+    for c in 0..chans.min(l) {
         let mut prev_byte = 0i32;
         let mut byte_count = 0i32;
         let mut diff = [0i32; 7];
@@ -1676,7 +1680,7 @@ fn filter_audio(chans: usize, buf: &[u8]) -> Vec<u8> {
                 }
             }
             byte_count += 1;
-            i += chans;
+            i = i.saturating_add(chans);
         }
     }
     res
@@ -1850,6 +1854,27 @@ const VM_MASK_USE: u32 = VM_MASK;
 mod tests {
     use super::*;
     use crate::Limits;
+
+    /// The filter's registers come from the archive: one that is `i32::MIN`
+    /// after the subtraction of 3 leaves the data as it was, not a panic.
+    /// The channel count is a 32-bit register of the archive's: one far past
+    /// the data is not four billion passes over it.
+    #[test]
+    fn delta_and_audio_filters_with_a_register_of_billions_finish_at_once() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let start = std::time::Instant::now();
+        assert_eq!(filter_delta(u32::MAX as usize, &data).len(), data.len());
+        assert_eq!(filter_audio(u32::MAX as usize, &data).len(), data.len());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_rgb_filter_with_a_register_at_the_bottom_of_i32_changes_nothing() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9];
+        for r0 in [0x8000_0000u32, 0x8000_0001, 0x8000_0002] {
+            assert_eq!(filter_rgb(r0, 0, &data), data, "r0 {r0:#x}");
+        }
+    }
 
     #[test]
     fn truncated_no_panic() {

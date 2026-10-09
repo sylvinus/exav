@@ -73,7 +73,12 @@ impl ZipSpan {
                     self.parts.len()
                 )
             })?;
-        Ok(base + off)
+        base.checked_add(off).ok_or_else(|| {
+            format!(
+                "the directory's offset in part {} is out of range",
+                disk + 1
+            )
+        })
     }
 
     /// The end-of-directory records and the directory, rewritten.
@@ -226,7 +231,8 @@ impl ZipSpan {
 
     /// `len` bytes of the parts as they are, from `off` of the joined stream.
     fn read(&self, off: u64, len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len);
+        // `len` is a size the archive declared.
+        let mut out = Vec::with_capacity(crate::cap_prealloc(len));
         let end = off.saturating_add(len as u64).min(self.len);
         let mut at = off;
         while at < end {

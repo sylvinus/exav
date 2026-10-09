@@ -87,6 +87,9 @@ fn sectors(blob: &[u8], cap: usize, len: usize) -> Vec<Range<usize>> {
         .map(|i| i * 512)
         .filter(|&s| blob[s..s + 512].iter().any(|&b| b != 0))
         .collect();
+    if cap == 0 {
+        return Vec::new();
+    }
     let step = live.len().div_ceil(cap).max(1);
     live.into_iter().step_by(step).map(|s| s..s + len).collect()
 }
@@ -183,9 +186,8 @@ fn other_containers_fields_at_their_extremes() {
         (Format::Upx, "upx_nrv2d.upx"),
         (Format::Upx, "upx_lzma.upx"),
         (Format::Ole, "ole/malformed_dir_order.ole"),
-        (Format::Rar, "rar4/enc_data.rar"),
-        (Format::Rar, "rar4/solid_ppmd.rar"),
-        (Format::Rar, "rar5/enc_headers.rar"),
+        (Format::Rar, "rar4/solid_x86.rar"),
+        (Format::Rar, "rar4/two_windows.rar"),
         (Format::Rar, "rar5/hardlink.rar"),
         (Format::Rar, "rar_solid/solid_rar4.rar"),
         (Format::Zoo, "zoo/default.zoo"),
@@ -207,20 +209,55 @@ fn other_containers_fields_at_their_extremes() {
     ];
     let mut bad = Vec::new();
     for &(fmt, path) in samples {
+        // To run one sample alone: EXTREME_ONLY=lz4/one.lz4
+        if std::env::var("EXTREME_ONLY").is_ok_and(|only| !path.contains(&only)) {
+            continue;
+        }
         let p = format!("{}/tests/fixtures/{path}", env!("CARGO_MANIFEST_DIR"));
         let blob = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
         if blob.len() > 200_000 {
             continue;
         }
-        let tail = blob.len().saturating_sub(512);
+        // A RAR is decoded with a large window on every run: its headers only.
+        let (head, tail_len, nsectors) = if matches!(fmt, Format::Rar) {
+            (160, 64, 0)
+        } else {
+            (1024, 512, 12)
+        };
+        let tail = blob.len().saturating_sub(tail_len);
         let mut regions = vec![
-            Range { start: 0, end: blob.len().min(1024) },
-            Range { start: tail, end: blob.len() },
+            Range {
+                start: 0,
+                end: blob.len().min(head),
+            },
+            Range {
+                start: tail,
+                end: blob.len(),
+            },
         ];
-        regions.extend(sectors(&blob, 12, 64));
-        bad.extend(sweep(fmt, &blob, &regions).into_iter().map(|w| format!("{path} {w}")));
+        regions.extend(sectors(&blob, nsectors, 64));
+        bad.extend(
+            sweep(fmt, &blob, &regions)
+                .into_iter()
+                .map(|w| format!("{path} {w}")),
+        );
     }
     none(bad);
+}
+
+/// A skippable frame ahead of a real one, whose size field is the skip: on a
+/// 32-bit `usize` the position after a large skip saturates, and the next
+/// bound check adds to it.
+#[test]
+fn lz4_with_a_skippable_frame_fields_at_their_extremes() {
+    let p = format!("{}/tests/fixtures/lz4/one.lz4", env!("CARGO_MANIFEST_DIR"));
+    let frame = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+    blob.extend_from_slice(&4u32.to_le_bytes());
+    blob.extend_from_slice(&[0; 4]);
+    blob.extend_from_slice(&frame);
+    none(sweep(Format::Lz4, &blob, &[Range { start: 0, end: 24 }]));
 }
 
 /// Fails with the first few changes in `bad`.

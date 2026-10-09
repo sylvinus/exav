@@ -49,7 +49,9 @@ struct Lzw<B> {
     /// entry `prefix[c]` by the byte `suffix[c]`.
     prefix: Vec<u16>,
     suffix: Vec<u8>,
-    next: u16,
+    /// The next free code. 65,536 once a 16-bit table is full, which a `u16`
+    /// cannot hold.
+    next: u32,
     width: u32,
     prev: Option<u16>,
     stack: Vec<u8>,
@@ -84,7 +86,7 @@ impl<B: Bytes> Lzw<B> {
             block_mode,
             prefix: vec![0u16; table_cap],
             suffix: vec![0u8; table_cap],
-            next: if block_mode { FIRST_FREE } else { CLEAR },
+            next: u32::from(if block_mode { FIRST_FREE } else { CLEAR }),
             width: INIT_WIDTH,
             prev: None,
             stack: Vec::new(),
@@ -125,7 +127,7 @@ impl<B: Bytes> Lzw<B> {
             // width as soon as the table reaches `(1 << width) - 1` entries,
             // and pads to the next group boundary at the old width as it does
             // so.
-            if self.width < self.max_width && self.next as u32 >= (1u32 << self.width) {
+            if self.width < self.max_width && self.next >= (1u32 << self.width) {
                 self.align_to_group();
                 self.width += 1;
             }
@@ -137,7 +139,7 @@ impl<B: Bytes> Lzw<B> {
                 // A reset is also a width change: pad at the width in force,
                 // then start over at the initial width.
                 self.align_to_group();
-                self.next = FIRST_FREE;
+                self.next = u32::from(FIRST_FREE);
                 self.width = INIT_WIDTH;
                 self.prev = None;
                 continue;
@@ -146,7 +148,7 @@ impl<B: Bytes> Lzw<B> {
             // Rebuild the string for `code` by walking the prefix chain.
             self.stack.clear();
             let mut cur = code;
-            if cur >= self.next {
+            if u32::from(cur) >= self.next {
                 // KwKwK: the code refers to the entry being defined right now.
                 let p = self.prev?;
                 self.stack.push(first_byte(&self.prefix, &self.suffix, p));

@@ -7,7 +7,7 @@ use super::{Ctx, Raw};
 use crate::formats::cad::model::*;
 
 fn set_point(p: &mut Vec3, t: &Tag<'_>, base: i32) -> bool {
-    match t.code - base {
+    match t.code.wrapping_sub(base) {
         0 => p.x = t.f64(),
         10 => p.y = t.f64(),
         20 => p.z = t.f64(),
@@ -17,7 +17,7 @@ fn set_point(p: &mut Vec3, t: &Tag<'_>, base: i32) -> bool {
 }
 
 fn set_point2(p: &mut Vec2, t: &Tag<'_>, base: i32) -> bool {
-    match t.code - base {
+    match t.code.wrapping_sub(base) {
         0 => p.x = t.f64(),
         10 => p.y = t.f64(),
         _ => return false,

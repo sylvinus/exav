@@ -129,7 +129,7 @@ const components = {
 | `ArchiveBack` | `archive`, `name` | the bar back out of a member |
 | `InfoBadge` | `format`, `info` | an STL's triangle count |
 | `Warnings` | `warnings` | what a drawing or model lacks, or that the file was downloaded whole (with a button to dismiss it) |
-| `ZoomControls` | `zoom` | zoom out, zoom in (a quarter each) and fit, over the surface; for a mouse only (`any-pointer: fine`), as a touch screen pinches |
+| `ZoomControls` | `zoom` | zoom out, zoom in (a quarter each) and fit, over the surface; shown for a mouse (`any-pointer: fine`) or when the browser reports no pointer (`none`), not on a touch screen, which pinches |
 | `DragToggle` | `drag` | a PDF zoomed past the viewer: a hand to move the page by dragging (the default), a text cursor to select text |
 
 The two last ones sit together at the bottom right of the surface. Replace one

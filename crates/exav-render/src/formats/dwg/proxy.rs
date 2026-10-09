@@ -443,7 +443,9 @@ fn arc(
 
 fn mesh(out: &mut Vec<Piece>, t: &Traits, m: &ProxyMesh, at: &dyn Fn(Vec3) -> Vec3) {
     let (rows, cols) = (m.rows as usize, m.columns as usize);
-    if rows.checked_mul(cols) != Some(m.vertices.len()) {
+    // Zero columns of 4 billion rows hold no vertices and pass the product, and
+    // the loops below walk the rows.
+    if rows == 0 || cols == 0 || rows.checked_mul(cols) != Some(m.vertices.len()) {
         return;
     }
     let v = |r: usize, c: usize| at(m.vertices[r * cols + c]);

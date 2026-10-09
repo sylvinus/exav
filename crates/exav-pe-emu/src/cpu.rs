@@ -2183,7 +2183,10 @@ impl Cpu {
                 let (signif, exp, sign) = extended_parts(v);
                 let mut b = [0u8; 10];
                 b[..8].copy_from_slice(&signif.to_le_bytes());
-                let se = ((exp + 16383) as u16 & 0x7fff) | if sign { 0x8000 } else { 0 };
+                // Infinity and NaN come back with the largest exponent, which
+                // saturates here to the field's all-ones value.
+                let se =
+                    ((exp.saturating_add(16383)) as u16 & 0x7fff) | if sign { 0x8000 } else { 0 };
                 b[8..10].copy_from_slice(&se.to_le_bytes());
                 mem.write_bytes(addr, &b).map_err(Stop::Fault)
             }

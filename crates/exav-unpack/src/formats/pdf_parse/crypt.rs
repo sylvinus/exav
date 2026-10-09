@@ -185,7 +185,7 @@ impl Decoder {
     /// number's low 3 bytes and the generation's low 2, and for AES the salt;
     /// the first n + 5 bytes of it, at most 16, are the object's key.
     fn per_object_key(&self, obj_id: u32, gen: u32, salt: Option<&[u8]>) -> Vec<u8> {
-        let n = self.key_size.min(16);
+        let n = self.key_size.min(16).min(self.key.len());
         let mut data = Vec::with_capacity(n + 5 + 4);
         data.extend_from_slice(&self.key[..n]);
         data.extend_from_slice(&obj_id.to_le_bytes()[..3]);
@@ -420,7 +420,7 @@ fn key_derivation_owner_password_rc4(
         }
     }
     let digest = ctx.finalize();
-    Ok(digest[..key_size].to_vec())
+    Ok(digest[..key_size.min(digest.len())].to_vec())
 }
 
 fn check_password_rc4(revision: u32, document_u: &[u8], id: &[u8], key: &[u8]) -> bool {
@@ -680,6 +680,23 @@ fn aes_cbc_decrypt(key: &[u8], data: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/Length` is the file's: a key size past the 16 bytes of an MD5 digest
+    /// (or past the key the file gave) is cut, not indexed.
+    #[test]
+    fn a_key_size_past_the_digest_is_cut() {
+        for revision in [2, 3] {
+            let k = key_derivation_owner_password_rc4(revision, 32, b"pw").unwrap();
+            assert_eq!(k.len(), 16, "revision {revision}");
+        }
+        let d = Decoder {
+            key: vec![7; 5],
+            key_size: 32,
+            method: CryptMethod::None,
+        };
+        // The file's 5-byte key, plus 5 bytes of the object's number and generation.
+        assert_eq!(d.per_object_key(1, 0, None).len(), 10);
+    }
 
     const PLAIN: &[u8] = b"stream plaintext, 33 bytes long!!";
 

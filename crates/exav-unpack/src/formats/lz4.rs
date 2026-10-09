@@ -250,7 +250,7 @@ impl<'a> Lz4Reader<'a> {
                 // Frames concatenate: `lz4 -dc` on a file holding several emits
                 // all of them, one after another.
                 let pos = self.pos;
-                if pos + 8 > len {
+                if pos.saturating_add(8) > len {
                     return Ok(false);
                 }
                 let head = self.window(pos, 32)?;

@@ -291,7 +291,7 @@ fn ppt_embedded_storages(
             continue;
         }
         if rec_type == EXT_OLE_OBJ_STG {
-            if let Some(body) = stream.get(off + 8..off + 8 + len) {
+            if let Some(body) = crate::bytes::at(stream, off + 8, len) {
                 if let Some(blob) = ppt_storage_payload(ver_instance >> 4, body, budget) {
                     out.push(blob);
                 }
@@ -555,7 +555,9 @@ fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>, bo
     }
 
     // --- Build the FAT -------------------------------------------------------
-    let mut fat: Vec<u32> = Vec::with_capacity(fat_sectors.len() * entries_per_sector);
+    let mut fat: Vec<u32> = Vec::with_capacity(crate::cap_prealloc(
+        fat_sectors.len().saturating_mul(entries_per_sector),
+    ));
     for &fs in &fat_sectors {
         match read_sector(fs) {
             Some(sec) => {

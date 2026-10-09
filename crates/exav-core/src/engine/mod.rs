@@ -1685,7 +1685,7 @@ impl Ldb {
         // Pass 1: normal subsigs from AC body counts.
         for (i, s) in self.subs.iter().enumerate() {
             if let SubSig::Bodies(ids) = s {
-                c[i] = ids.iter().map(|&b| body_count(b)).sum();
+                c[i] = ids.iter().fold(0u32, |a, &b| a.saturating_add(body_count(b)));
             }
         }
         // Satisfiability gate: PCRE/bcomp/fuzzy subsigs are expensive to evaluate,

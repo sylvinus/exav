@@ -729,7 +729,7 @@ impl<'a> Compiler<'a> {
                                     )?;
                                     delegate_nodes.clear();
 
-                                    go_back += child.min_size;
+                                    go_back = go_back.saturating_add(child.min_size);
                                     if go_back > 0 {
                                         self.b.add(Insn::GoBack(go_back));
                                     }
@@ -1375,7 +1375,7 @@ impl DelegateBuilder {
         // TODO: might want to detect case of a group with no captures
         //  inside, so we can run find() instead of captures()
 
-        self.min_size += info.min_size;
+        self.min_size = self.min_size.saturating_add(info.min_size);
         self.const_size &= info.const_size;
         if self.capture_groups.is_none() {
             self.capture_groups = Some(info.capture_groups);

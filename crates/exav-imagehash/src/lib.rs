@@ -406,7 +406,10 @@ impl Hasher {
     }
 
     fn hash_pixels(&self, w: u32, h: u32, px: &[u8], n: usize) -> Result<ImageHash, Error> {
-        if w == 0 || h == 0 || px.len() != w as usize * h as usize * n {
+        let want = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|p| p.checked_mul(n));
+        if w == 0 || h == 0 || want != Some(px.len()) {
             return Err(Error::InvalidParams(
                 "pixel count does not match the dimensions",
             ));

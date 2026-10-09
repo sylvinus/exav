@@ -268,10 +268,10 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 'v' => verbose = true,
                 'o' => o.overwrite = Some(true),
                 'n' => o.overwrite = Some(false),
-                'q' => o.quiet += 1,
+                'q' => o.quiet = o.quiet.saturating_add(1),
                 'j' => o.junk = true,
                 'C' => o.nocase = true,
-                'D' => o.no_times += 1,
+                'D' => o.no_times = o.no_times.saturating_add(1),
                 'h' => return Ok(Parsed::Usage(status::OK)),
                 'd' => o.dir = Some(PathBuf::from(operand(&mut i)?)),
                 'P' => o.passwords.push(operand(&mut i)?),
@@ -753,7 +753,7 @@ impl<'a> Archive<'a> {
                     None => meta.size.unwrap_or(0),
                 };
                 self.files += 1;
-                self.bytes += size;
+                self.bytes = self.bytes.saturating_add(size);
                 println!("{size:>9}  {}   {name}", when(meta.mtime));
                 return Ok(());
             }

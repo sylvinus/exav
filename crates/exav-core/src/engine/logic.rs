@@ -31,7 +31,7 @@ impl Node {
             Node::Sub(i) => count(*i) > 0,
             Node::SubCmp(i, c, x) => cmp_ok(*c, count(*i), *x),
             Node::GroupCmp(ids, c, x, y) => {
-                let total: u32 = ids.iter().map(|&i| count(i)).sum();
+                let total = ids.iter().fold(0u32, |a, &i| a.saturating_add(count(i)));
                 if !cmp_ok(*c, total, *x) {
                     return false;
                 }
@@ -318,6 +318,16 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Body counts are saturated by the scan, so two of them can sum past
+    /// `u32`: the group's total is capped, not wrapped or a panic.
+    #[test]
+    fn a_group_of_saturated_counts_compares_as_a_large_total() {
+        let n = Node::GroupCmp(vec![0, 1], Cmp::Gt, 5, None);
+        assert!(n.eval(&|_| u32::MAX));
+        let n = Node::GroupCmp(vec![0, 1], Cmp::Lt, 5, None);
+        assert!(!n.eval(&|_| u32::MAX));
+    }
 
     /// A `:`-suffixed subsignature reference means the number before the colon,
     /// and the reference stays live. Established against clamscan, not guessed —
