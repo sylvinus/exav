@@ -1447,7 +1447,7 @@ impl<'a> Machine<'a> {
                     // would end the run: tracing must not change the result.
                     let v = self
                         .slot(fi, inst.dest)
-                        .and_then(|s| self.frames[fi].stack.get(s.off as usize..s.off as usize + s.w as usize))
+                        .and_then(|s| crate::bytes::at(&self.frames[fi].stack, s.off as usize, s.w as usize))
                         .map_or(0, |b| b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)) as i64);
                     eprintln!(
                         "[fn{idx} bb{bb}] op={:<2} dest={:<3} ty={:<3} => {v} (0x{:x})",

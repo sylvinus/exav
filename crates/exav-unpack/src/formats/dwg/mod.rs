@@ -147,7 +147,7 @@ pub fn pre_r13_version(head: &[u8]) -> Option<&str> {
         _ => false,
     };
     let le32 = |at: usize| -> Option<u32> {
-        let b = head.get(at..at + 4)?;
+        let b = crate::bytes::at(head, at, 4)?;
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
     let shaped = head.get(6..12)? == [0; 6]

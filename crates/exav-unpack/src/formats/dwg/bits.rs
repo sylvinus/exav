@@ -301,7 +301,9 @@ impl<'a> Bits<'a> {
         }
         if self.pos & 7 == 0 {
             let at = (self.pos >> 3) as usize;
-            let out = self.data.get(at..at + n).ok_or(BitError::End)?.to_vec();
+            let out = crate::bytes::at(self.data, at, n)
+                .ok_or(BitError::End)?
+                .to_vec();
             self.pos += n as u64 * 8;
             return Ok(out);
         }

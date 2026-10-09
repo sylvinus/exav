@@ -149,10 +149,10 @@ Open:
   extension walk) is not seen; that one has a unit test at the helper level.
   A time limit on each run, which the wasm build cannot have without threads,
   would find the next one.
-- **`crate::bytes::at` everywhere**: `d.get(off..off + n)` is spelled about
-  150 times in `exav-unpack` and as many in `exav-core`. Only the disk-image
-  formats use the checked form. A mechanical replacement, by a script, wants
-  the owner's go-ahead.
+- **`d.get(off..off + n)` in other spellings**: the 90 sites written as
+  `x.get(a..a + b)` now use `crate::bytes::at` (exav-core has its own copy).
+  Slices written `d[a..a + b]`, and `get` on a `&str` or a `Vec` of another
+  type, were not touched.
 - **`clippy::arithmetic_side_effects`**: denied in the disk-image formats
   (vhd, vmdk, qcow2, vhdx, ntfs, wim without its two codecs, ext, fat,
   partition, iso, dmg, udif, udf); the codecs `wim/lzx.rs` and `wim::xpress`
@@ -163,7 +163,6 @@ Open:
   (`extreme.rs`). It finds what a single field set to an extreme reaches in
   those samples; a bug behind a field the sample does not use (a split-volume
   RAR, a spanned ZIP, an encrypted container) needs a sample that uses it.
-- **The second half of the NTFS attribute-list walk** has no test of its own.
 
 ## Dependencies
 

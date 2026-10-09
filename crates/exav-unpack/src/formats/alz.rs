@@ -46,7 +46,9 @@ pub(crate) fn extract_alz<R>(
             break; // central directory (`CLZ\x01`) or trailing data
         }
         p += 4;
-        let Some(h) = data.get(p..p + 9) else { break };
+        let Some(h) = crate::bytes::at(data, p, 9) else {
+            break;
+        };
         let name_len = u16::from_le_bytes([h[0], h[1]]) as usize;
         let descriptor = h[7];
         p += 9;
@@ -58,16 +60,18 @@ pub(crate) fn extract_alz<R>(
             p += name_len;
             continue;
         }
-        let Some(m) = data.get(p..p + 6) else { break };
+        let Some(m) = crate::bytes::at(data, p, 6) else {
+            break;
+        };
         let method = m[0];
         p += 6; // method, unknown, crc32
-        let Some(sizes) = data.get(p..p + width * 2) else {
+        let Some(sizes) = crate::bytes::at(data, p, width * 2) else {
             break;
         };
         let comp = le_uint(&sizes[..width]);
         let uncomp = le_uint(&sizes[width..]);
         p += width * 2;
-        let Some(name) = data.get(p..p + name_len) else {
+        let Some(name) = crate::bytes::at(data, p, name_len) else {
             break;
         };
         let name = String::from_utf8_lossy(name).into_owned();

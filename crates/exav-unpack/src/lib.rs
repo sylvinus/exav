@@ -996,7 +996,7 @@ fn is_executable_payload(d: &[u8]) -> bool {
     }
     if d.starts_with(b"MZ") {
         let e = u32::from_le_bytes([d[0x3c], d[0x3d], d[0x3e], d[0x3f]]) as usize;
-        return d.get(e..e + 4) == Some(b"PE\x00\x00");
+        return crate::bytes::at(d, e, 4) == Some(b"PE\x00\x00");
     }
     true
 }

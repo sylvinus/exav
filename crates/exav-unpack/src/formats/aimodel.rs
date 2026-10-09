@@ -230,7 +230,7 @@ fn disassemble(data: &[u8], cap: u64) -> Vec<u8> {
     macro_rules! read_le {
         ($n:expr) => {{
             let n: usize = $n;
-            match data.get(i + 1..i + 1 + n) {
+            match crate::bytes::at(data, i + 1, n) {
                 Some(s) => {
                     let mut val: u64 = 0;
                     for (k, &b) in s.iter().enumerate() {

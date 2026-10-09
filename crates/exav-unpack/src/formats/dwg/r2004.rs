@@ -233,7 +233,7 @@ struct FileHeader {
 }
 
 fn file_header(data: &[u8]) -> Option<FileHeader> {
-    let raw = data.get(0x80..0x80 + 0x6C)?;
+    let raw = crate::bytes::at(data, 0x80, 0x6C)?;
     let mut h = [0u8; 0x6C];
     for (o, (a, b)) in h.iter_mut().zip(raw.iter().zip(MAGIC.iter())) {
         *o = a ^ b;

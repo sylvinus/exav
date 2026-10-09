@@ -56,7 +56,7 @@ fn starts_with_exe(data: &[u8]) -> bool {
 /// fixed fields and cannot exceed the header holding it, and the host OS is one
 /// of a dozen defined values.
 fn plausible_arj_header(data: &[u8], off: usize) -> bool {
-    let Some(h) = data.get(off..off + 11) else {
+    let Some(h) = crate::bytes::at(data, off, 11) else {
         return false;
     };
     let basic_size = u16::from_le_bytes([h[2], h[3]]) as usize;
@@ -72,7 +72,7 @@ fn plausible_arj_header(data: &[u8], off: usize) -> bool {
 /// must match: 7-Zip checks it, and the six-byte magic also turns up in the
 /// code of tools that handle 7z, where a carve reads a header that is not one.
 fn plausible_7z_header(data: &[u8], off: usize) -> bool {
-    let Some(h) = data.get(off..off + 32) else {
+    let Some(h) = crate::bytes::at(data, off, 32) else {
         return false;
     };
     crc32fast::hash(&h[12..32]) == u32::from_le_bytes([h[8], h[9], h[10], h[11]])

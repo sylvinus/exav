@@ -641,7 +641,7 @@ pub(crate) fn decompress(data: &[u8], cap: u64) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
 
     loop {
-        let Some(h) = data.get(p..p + 12) else {
+        let Some(h) = crate::bytes::at(data, p, 12) else {
             // No further block header: a well-formed stream ends on the
             // zero-size block below, so running out here is truncation.
             return None;

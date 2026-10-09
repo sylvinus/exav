@@ -278,13 +278,13 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
 }
 
 fn is_gpt(data: &[u8]) -> bool {
-    data.get(SECTOR..SECTOR + 8) == Some(GPT_SIG.as_slice())
+    crate::bytes::at(data, SECTOR, 8) == Some(GPT_SIG.as_slice())
 }
 
 fn is_apm(data: &[u8]) -> bool {
     // Block0 signature `ER` at sector 0, and a partition-map entry `PM` at
     // sector 1 — both required so a stray "ER..." prefix isn't mistaken for APM.
-    data.starts_with(b"ER") && data.get(SECTOR..SECTOR + 2) == Some(b"PM".as_slice())
+    data.starts_with(b"ER") && crate::bytes::at(data, SECTOR, 2) == Some(b"PM".as_slice())
 }
 
 /// Conservative MBR test: the `55 AA` boot signature at offset 510 plus at least

@@ -184,7 +184,7 @@ fn parse_filepass(stream: &[u8]) -> Option<FilePass> {
         return None;
     }
     let size = u16::from_le_bytes([stream[fp + 2], stream[fp + 3]]) as usize;
-    let rec = stream.get(body..body + size)?;
+    let rec = crate::bytes::at(stream, body, size)?;
     if rec.len() < 6 || u16::from_le_bytes([rec[0], rec[1]]) != 1 {
         return None; // XOR obfuscation or none
     }
@@ -445,7 +445,7 @@ fn parse_filepass_xor(stream: &[u8]) -> Option<u16> {
         return None;
     }
     let size = u16::from_le_bytes([stream[fp + 2], stream[fp + 3]]) as usize;
-    let rec = stream.get(body..body + size)?;
+    let rec = crate::bytes::at(stream, body, size)?;
     // XORObfuscation: wEncryptionType(2)=0, Key(2), VerificationBytes(2).
     if rec.len() < 6 || u16::from_le_bytes([rec[0], rec[1]]) != 0 {
         return None;

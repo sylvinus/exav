@@ -177,7 +177,7 @@ impl<'a> Pe<'a> {
         let mut sections = Vec::with_capacity(num_sections);
         for i in 0..num_sections {
             let s = sec_table + i * 40;
-            let hdr = data.get(s..s + 40)?;
+            let hdr = crate::bytes::at(data, s, 40)?;
             let mut name = [0u8; 8];
             name.copy_from_slice(&hdr[..8]);
             sections.push(Section {
@@ -345,7 +345,7 @@ fn identify(pe: &Pe) -> Option<Packer> {
     // begin the decompressor with a distinctive load of the packed-source and
     // destination pointers. Match at the entry-point file offset only.
     if let Some(off) = pe.rva_to_off(pe.entry_rva) {
-        if let Some(win) = pe.data.get(off..off + 2) {
+        if let Some(win) = crate::bytes::at(pe.data, off, 2) {
             // `BE xx xx xx xx` (mov esi, imm32) is the canonical FSG 2.0 stub
             // opener; require it to sit right at the entry point.
             if win[0] == 0xBE && fsg_stub_plausible(pe, off) {
@@ -636,7 +636,7 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
     let mut total = 0u32;
     for i in 0..32usize {
         let d = dir_off + i * 20;
-        let Some(desc) = data.get(d..d + 20) else {
+        let Some(desc) = crate::bytes::at(data, d, 20) else {
             break;
         };
         let orig = u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]);
@@ -648,7 +648,7 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
         let Some(mut off) = rva_to_file_offset(pe, thunks) else {
             continue;
         };
-        while let Some(v) = data.get(off..off + 4) {
+        while let Some(v) = crate::bytes::at(data, off, 4) {
             if u32::from_le_bytes([v[0], v[1], v[2], v[3]]) == 0 {
                 break;
             }

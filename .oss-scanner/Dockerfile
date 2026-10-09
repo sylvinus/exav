@@ -6,8 +6,11 @@
 #   docker build -f .oss-scanner/Dockerfile -t exav-oss-scanner .
 FROM rust:1.92-bookworm
 
+# Frame pointers and line tables for a debugger, without the full debug info
+# that makes the build several times larger.
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_TERM_COLOR=never \
+    CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     RUSTFLAGS="-C force-frame-pointers=yes"
 
 # gdb and valgrind are for the agent that reproduces a finding; clang is what a
@@ -19,18 +22,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . /src
 WORKDIR /src
 
-# Every crate of the workspace, with the debug info and the overflow checks of
-# the dev profile (the release profile keeps overflow checks too). `--locked`
-# builds exactly the dependencies of Cargo.lock.
-RUN cargo build --workspace --locked
+# Every dependency of every crate, test-only ones included, so that nothing
+# is fetched after this step. `--locked` uses exactly Cargo.lock.
+RUN cargo fetch --locked
 
-# The optional network-facing half of the CLI (`SCANURL`, `--sig-sources`),
-# which pulls the TLS stack: built so that its dependencies are fetched too.
-RUN cargo build -p exav --locked --features http
-
-# The test binaries and their dependencies, built and not run: a test run takes
-# a long time and a failing test must not fail the image.
-RUN cargo test --workspace --locked --no-run
+# Every crate of the workspace, in the dev profile (overflow checks on, as in
+# the release profile). `exav` is built with the optional network-facing half
+# (`SCANURL`, `--sig-sources`), which pulls the TLS stack.
+RUN cargo build --workspace --locked \
+    && cargo build -p exav --locked --features http
 
 # The tools, on PATH. They read a file given on the command line; `exav` needs
 # a signature database to scan, which `threat_model.md` says how to make.
@@ -38,6 +38,7 @@ RUN for t in exav exav-unpack exav-grep exav-imagehash; do \
         ln -s "/src/target/debug/$t" "/usr/local/bin/$t"; \
     done
 
-# A cheap check that the image works, whose failure is only reported.
+# A cheap check that the image works: the unit tests of the extractor. A
+# failure is reported and does not fail the image.
 RUN (cargo test -p exav-unpack --lib --locked 2>&1 | tail -n 5) \
     || echo "WARNING: the exav-unpack unit tests reported failures"

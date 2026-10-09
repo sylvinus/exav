@@ -126,7 +126,7 @@ impl CachedBitReader {
 
     pub fn refresh(&mut self, reader: &BitReader<'_>) -> Option<()> {
         let pos = reader.position / 8;
-        let data = reader.bytes.get(pos..pos + 8)?;
+        let data = crate::bytes::at(reader.bytes, pos, 8)?;
 
         self.cache = u64::from_be_bytes(data.try_into().unwrap());
         self.cache <<= reader.position % 8;

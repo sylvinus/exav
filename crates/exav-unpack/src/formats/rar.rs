@@ -233,7 +233,7 @@ fn rar4_open_headers(
         let mut q = main_end;
         let mut blocks = 0;
         while q < data.len() {
-            let salt: [u8; 8] = data.get(q..q + 8)?.try_into().ok()?;
+            let salt: [u8; 8] = crate::bytes::at(data, q, 8)?.try_into().ok()?;
             let keys = crypt.keys.get(&pw, &salt)?;
             let mut first = data.get(q + 8..q + 24)?.to_vec();
             rar3_crypt::decrypt(&keys, &mut first);
@@ -917,7 +917,7 @@ fn rar5_open_headers(
     let mut plain = data.get(..start)?.to_vec();
     let mut headers = 0;
     while p < data.len() {
-        let iv: [u8; 16] = data.get(p..p + 16)?.try_into().ok()?;
+        let iv: [u8; 16] = crate::bytes::at(data, p, 16)?.try_into().ok()?;
         let mut first = data.get(p + 16..p + 32)?.to_vec();
         rar5_crypt::decrypt(&k.key, &iv, &mut first);
         let (hsize, n) = vint(&first, 4)?;

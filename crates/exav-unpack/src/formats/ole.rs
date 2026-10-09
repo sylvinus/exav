@@ -279,7 +279,7 @@ fn ppt_embedded_storages(
     let mut out = Vec::new();
     let mut off = 0usize;
     for _ in 0..MAX_RECORDS {
-        let Some(hdr) = stream.get(off..off + 8) else {
+        let Some(hdr) = crate::bytes::at(stream, off, 8) else {
             break;
         };
         let ver_instance = u16::from_le_bytes([hdr[0], hdr[1]]);
@@ -358,8 +358,7 @@ fn ppt_storage_payload(
 /// declared size is clamped to what is actually present rather than trusted.
 fn ole10native_payload(data: &[u8]) -> Option<&[u8]> {
     let le32 = |p: usize| {
-        data.get(p..p + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        crate::bytes::at(data, p, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
     let past_string = |p: usize| Some(p + data.get(p..)?.iter().position(|&b| b == 0)? + 1);
     let names = past_string(past_string(4 + 2)?)?;
@@ -685,7 +684,7 @@ fn lenient_cfb_streams(data: &[u8], cap: u64) -> Option<Vec<(String, Vec<u8>, bo
                 break; // cycle guard
             }
             let off = (cur as usize) * mini_sector_size;
-            if let Some(chunk) = mini_stream.get(off..off + mini_sector_size) {
+            if let Some(chunk) = crate::bytes::at(&mini_stream, off, mini_sector_size) {
                 let take = chunk.len().min(need - out.len());
                 out.extend_from_slice(&chunk[..take]);
             }

@@ -289,7 +289,7 @@ fn rebuild_clamav_pe(image: &[u8], first_rva: u32) -> Option<Vec<u8>> {
     let nsec = u16_le(image, hdr + 6) as usize;
     let optsz = u16_le(image, hdr + 20) as usize;
     let hdrlen = 24 + optsz + nsec * 40;
-    let mut blk = image.get(hdr..hdr + hdrlen)?.to_vec();
+    let mut blk = crate::bytes::at(image, hdr, hdrlen)?.to_vec();
     blk[8..12].copy_from_slice(b"CLAM");
 
     let sa = u32_le(&blk, 24 + 32);
@@ -337,7 +337,7 @@ fn rebuild_clamav_pe(image: &[u8], first_rva: u32) -> Option<Vec<u8>> {
 /// RVA of the first section of a PE, which is where the decompressed run starts.
 fn first_section_rva(data: &[u8]) -> Option<u32> {
     let e = u32_le(data, 0x3c) as usize;
-    if data.get(e..e + 4)? != b"PE\0\0" {
+    if crate::bytes::at(data, e, 4)? != b"PE\0\0" {
         return None;
     }
     let nsec = u16_le(data, e + 6) as usize;
@@ -346,7 +346,7 @@ fn first_section_rva(data: &[u8]) -> Option<u32> {
         return None;
     }
     let st = e + 24 + optsz;
-    data.get(st..st + 40)?;
+    crate::bytes::at(data, st, 40)?;
     Some(u32_le(data, st + 12))
 }
 

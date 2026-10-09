@@ -142,8 +142,7 @@ pub(crate) fn extract_zoo<R>(
         // method, then the two offsets.
         let rest = data.get(at..).unwrap_or(&[]);
         let le32 = |o: usize| {
-            rest.get(o..o + 4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            crate::bytes::at(rest, o, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
         if rest.len() < DIRENT_HEADER_SIZE
             && le32(0) == Some(super::zoo_parse::ZOO_TAG)

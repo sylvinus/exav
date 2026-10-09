@@ -118,7 +118,7 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
     let mut sec0_offset = crate::bytes::to_usize(u64at(d, 0x38 + 0x20).unwrap_or(0));
 
     // ITSP directory header.
-    if d.get(off_hs1..off_hs1 + 4)? != b"ITSP" {
+    if crate::bytes::at(d, off_hs1, 4)? != b"ITSP" {
         return None;
     }
     let chunk_size = u32at(d, off_hs1 + 0x10)? as usize;

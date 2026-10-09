@@ -49,13 +49,13 @@ struct Arch {
 
 /// Read a big-endian `u32` at `p`, `None` if out of bounds.
 fn be_u32(data: &[u8], p: usize) -> Option<u32> {
-    let b = data.get(p..p + 4)?;
+    let b = crate::bytes::at(data, p, 4)?;
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Read a big-endian `u64` at `p`, `None` if out of bounds.
 fn be_u64(data: &[u8], p: usize) -> Option<u64> {
-    let b = data.get(p..p + 8)?;
+    let b = crate::bytes::at(data, p, 8)?;
     Some(u64::from_be_bytes([
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
     ]))

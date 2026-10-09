@@ -320,7 +320,7 @@ pub(crate) fn parse_aes_extra(extra: Option<&[u8]>) -> Option<(u8, u16)> {
     while data.len() >= 4 {
         let id = u16::from_le_bytes([data[0], data[1]]);
         let len = u16::from_le_bytes([data[2], data[3]]) as usize;
-        let body = data.get(4..4 + len)?;
+        let body = crate::bytes::at(data, 4, len)?;
         if id == 0x9901 && body.len() >= 7 {
             let strength = body[4];
             let method = u16::from_le_bytes([body[5], body[6]]);
@@ -336,7 +336,7 @@ pub(crate) fn parse_aes_extra(extra: Option<&[u8]>) -> Option<(u8, u16)> {
 fn extra_field(mut extra: &[u8], id: u16) -> Option<&[u8]> {
     while extra.len() >= 4 {
         let len = usize::from(u16::from_le_bytes([extra[2], extra[3]]));
-        let body = extra.get(4..4 + len)?;
+        let body = crate::bytes::at(extra, 4, len)?;
         if u16::from_le_bytes([extra[0], extra[1]]) == id {
             return Some(body);
         }
@@ -810,12 +810,10 @@ pub fn directory_is_consistent(data: &[u8]) -> bool {
     const EOCD_LEN: usize = 22;
     const CDH_LEN: usize = 46;
     let u16_at = |p: usize| {
-        data.get(p..p + 2)
-            .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+        crate::bytes::at(data, p, 2).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
     };
     let u32_at = |p: usize| {
-        data.get(p..p + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        crate::bytes::at(data, p, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
     let tail = data.len().saturating_sub(EOCD_LEN + usize::from(u16::MAX));
     let Some(eocd) = data[tail..]
@@ -840,7 +838,7 @@ pub fn directory_is_consistent(data: &[u8]) -> bool {
     let base = cd_start as i64 - cd_off as i64;
     let mut p = cd_start;
     for _ in 0..entries {
-        if data.get(p..p + 4) != Some(b"PK\x01\x02") {
+        if crate::bytes::at(data, p, 4) != Some(b"PK\x01\x02") {
             return false;
         }
         let (Some(n), Some(e), Some(c), Some(local)) = (
@@ -851,15 +849,15 @@ pub fn directory_is_consistent(data: &[u8]) -> bool {
         ) else {
             return false;
         };
-        let Some(name) = data.get(p + CDH_LEN..p + CDH_LEN + n) else {
+        let Some(name) = crate::bytes::at(data, p + CDH_LEN, n) else {
             return false;
         };
         let Ok(lo) = usize::try_from(base + local as i64) else {
             return false;
         };
-        if data.get(lo..lo + 4) != Some(b"PK\x03\x04")
+        if crate::bytes::at(data, lo, 4) != Some(b"PK\x03\x04")
             || u16_at(lo + 26) != Some(n)
-            || data.get(lo + LFH_LEN..lo + LFH_LEN + n) != Some(name)
+            || crate::bytes::at(data, lo + LFH_LEN, n) != Some(name)
         {
             return false;
         }
@@ -904,7 +902,7 @@ fn plausible_header_at(rest: &[u8], left: usize) -> bool {
     if name_len == 0 || name_len > MAX_NAME {
         return false;
     }
-    let Some(name) = rest.get(LFH_LEN..LFH_LEN + name_len) else {
+    let Some(name) = crate::bytes::at(rest, LFH_LEN, name_len) else {
         return false;
     };
     if name.contains(&0) {
@@ -984,7 +982,7 @@ fn encryption_flag_is_a_lie(
     if comp > PROBE_MAX {
         return false;
     }
-    let Some(raw) = data.get(data_start..data_start + comp) else {
+    let Some(raw) = crate::bytes::at(data, data_start, comp) else {
         return false;
     };
     let plain = match method {
@@ -1047,7 +1045,7 @@ fn parse_local_member(
     at_input_end: bool,
     budget: &mut Budget,
 ) -> Result<Option<Entry>, LimitHit> {
-    let h = match data.get(off..off + LFH_LEN) {
+    let h = match crate::bytes::at(data, off, LFH_LEN) {
         Some(h) => h,
         None => return Ok(None),
     };
@@ -1055,11 +1053,9 @@ fn parse_local_member(
     let method = u16::from_le_bytes([h[8], h[9]]);
     let name_len = u16::from_le_bytes([h[26], h[27]]) as usize;
     let extra_len = u16::from_le_bytes([h[28], h[29]]) as usize;
-    let name = String::from_utf8_lossy(
-        data.get(off + LFH_LEN..off + LFH_LEN + name_len)
-            .unwrap_or(&[]),
-    )
-    .into_owned();
+    let name =
+        String::from_utf8_lossy(crate::bytes::at(data, off + LFH_LEN, name_len).unwrap_or(&[]))
+            .into_owned();
     let data_start = off + LFH_LEN + name_len + extra_len;
     let extra = data
         .get(off + LFH_LEN + name_len..data_start)
@@ -1665,7 +1661,7 @@ fn unclaimed_spans<R: Read + Seek>(
 /// not a directory entry (no data, a name ending in '/'), and readable.
 /// Parses the header only; [`parse_local_member`] reads the member.
 fn local_header_has_content(data: &[u8], off: usize) -> bool {
-    let Some(h) = data.get(off..off + LFH_LEN) else {
+    let Some(h) = crate::bytes::at(data, off, LFH_LEN) else {
         return false;
     };
     let name_len = usize::from(u16::from_le_bytes([h[26], h[27]]));
@@ -1674,7 +1670,7 @@ fn local_header_has_content(data: &[u8], off: usize) -> bool {
     let Some(name) = data.get(off + LFH_LEN..name_end) else {
         return false;
     };
-    let extra = data.get(name_end..name_end + extra_len).unwrap_or(&[]);
+    let extra = crate::bytes::at(data, name_end, extra_len).unwrap_or(&[]);
     let (comp, _, _) = local_sizes(h, extra);
     !(comp == 0 && name.ends_with(b"/"))
 }

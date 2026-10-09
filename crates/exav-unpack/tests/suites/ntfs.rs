@@ -34,10 +34,11 @@ const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf65
 const RUNLIST: [u8; 8] = [0x21, 0x04, 0x00, 0x0c, 0x11, 0x04, 0x04, 0x00];
 
 pub(super) fn fixture() -> Vec<u8> {
-    let p = format!(
-        "{}/tests/fixtures/ntfs/fragmented.img.gz",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    gunzipped("fragmented.img.gz")
+}
+
+fn gunzipped(name: &str) -> Vec<u8> {
+    let p = format!("{}/tests/fixtures/ntfs/{name}", env!("CARGO_MANIFEST_DIR"));
     let raw = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
     let mut out = Vec::new();
     std::io::Read::read_to_end(
@@ -157,6 +158,108 @@ fn runs_that_do_not_cover_the_declared_size_are_reported_not_truncated() {
     assert!(
         p.data.is_empty(),
         "and no partial content should be passed off as the file"
+    );
+}
+
+// A file fragmented past what its MFT record holds: the runs continue in
+// extension records, and the `$ATTRIBUTE_LIST` that names them is itself outside
+// the record (non-resident). `attribute_list.img.gz` is a 14 MiB volume made by
+// `ntfs-3g`, not edited afterwards:
+//
+//   mkntfs -F -q -c 1024 -L exavtest vol.img
+//   ntfs-3g vol.img /mnt                          # then, as root, in /mnt:
+//   write 3000 files of 2000 bytes, delete every other one, then write
+//   payload.txt: lines "line %07d fragmented across the holes\n" until the
+//   volume is full
+//
+// The file is the first 5,280,759 bytes of those lines, in the holes and the
+// tail of the volume. `ntfscat` returns the same digest; `ntfsinfo -v` shows
+// the list non-resident and the data runs in extension records.
+const ATTRIBUTE_LIST_PAYLOAD: &str =
+    "8b315ad3f77c9f3ce1dc711c99eb3e2c8240bf7881ee373cfe92d4a5eec21702";
+
+#[test]
+fn a_file_whose_runs_are_named_by_an_attribute_list_is_read_whole() {
+    let e = members(&gunzipped("attribute_list.img.gz"));
+    assert!(
+        e.iter().all(|x| x.unsupported.is_none()),
+        "got {:?}",
+        e.iter()
+            .map(|x| (&x.name, x.unsupported))
+            .collect::<Vec<_>>()
+    );
+    let p = e
+        .iter()
+        .find(|x| x.name == "payload.txt")
+        .expect("the fragmented file must be found");
+    assert_eq!(p.data.len(), 5_280_759);
+    assert_eq!(sha256_hex(&p.data), ATTRIBUTE_LIST_PAYLOAD);
+}
+
+/// The byte offset in `img` of the size fields of the non-resident
+/// `$ATTRIBUTE_LIST` (`real_size` at +0x30) of the one file that has one.
+fn attribute_list_size_at(img: &[u8]) -> usize {
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([img[at], img[at + 1]]));
+    let cluster = u16_at(11) * usize::from(img[13]);
+    let mft = u64::from_le_bytes(img[0x30..0x38].try_into().unwrap()) as usize * cluster;
+    let mut found = Vec::new();
+    for rec in (mft + 16 * 1024..mft + 200 * 1024).step_by(1024) {
+        // Files only: the root directory of this volume has a list as well.
+        if &img[rec..rec + 4] != b"FILE" || u16_at(rec + 22) & 2 != 0 {
+            continue;
+        }
+        let mut off = rec + u16_at(rec + 20);
+        while off + 8 <= rec + 1024 {
+            let ty = u32::from_le_bytes(img[off..off + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(img[off + 4..off + 8].try_into().unwrap()) as usize;
+            if ty == 0xFFFF_FFFF || len < 16 {
+                break;
+            }
+            if ty == 0x20 && img[off + 8] != 0 {
+                found.push(off + 0x30);
+            }
+            off += len;
+        }
+    }
+    assert_eq!(found.len(), 1, "one non-resident attribute list expected");
+    found[0]
+}
+
+#[test]
+fn an_attribute_list_that_reads_short_is_reported_not_half_used() {
+    // The list claims 2048 bytes and its one cluster holds 1024: a list read
+    // short would drop the extents it names, and the file would be emitted as
+    // its first extent alone. The size is part of the record, outside the
+    // update-sequence positions (the last two bytes of each 512-byte sector).
+    let mut img = gunzipped("attribute_list.img.gz");
+    let at = attribute_list_size_at(&img);
+    assert!(at % 512 < 500, "the size field must not sit on a fix-up");
+    assert_eq!(
+        u64::from_le_bytes(img[at..at + 8].try_into().unwrap()),
+        224,
+        "the list as written"
+    );
+    img[at..at + 8].copy_from_slice(&2048u64.to_le_bytes());
+
+    let e = members(&img);
+    // The list also names the extension record that holds the file's name, so
+    // without it the file is found by its record, not by "payload.txt".
+    let payload: Vec<_> = e
+        .iter()
+        .filter(|x| x.name == "payload.txt" || x.name.starts_with("<mft-record-"))
+        .collect();
+    assert!(
+        payload.iter().any(|x| x.unsupported.is_some()),
+        "a short list must be reported, got {:?}",
+        e.iter()
+            .map(|x| (&x.name, x.unsupported))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !payload
+            .iter()
+            .any(|x| x.unsupported.is_none() && sha256_hex(&x.data) == ATTRIBUTE_LIST_PAYLOAD),
+        "and the whole file must not be passed off from a half-read list"
     );
 }
 

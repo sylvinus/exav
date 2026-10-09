@@ -47,8 +47,7 @@ const BLOCK_UNCOMPRESSED: u32 = 0x8000_0000;
 const LEGACY_BLOCK: usize = 8 * 1024 * 1024;
 
 fn le_u32(d: &[u8], off: usize) -> Option<u32> {
-    d.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    crate::bytes::at(d, off, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Decompress one LZ4 block, appending to `out`. Matches may reach back before

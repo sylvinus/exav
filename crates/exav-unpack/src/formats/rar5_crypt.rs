@@ -51,15 +51,15 @@ impl CryptRecord {
         let mut p = n + m;
         let kdf_count = *b.get(p)?;
         p += 1;
-        let salt: [u8; 16] = b.get(p..p + 16)?.try_into().ok()?;
+        let salt: [u8; 16] = crate::bytes::at(b, p, 16)?.try_into().ok()?;
         p += 16;
         let mut iv = [0u8; 16];
         if with_iv {
-            iv = b.get(p..p + 16)?.try_into().ok()?;
+            iv = crate::bytes::at(b, p, 16)?.try_into().ok()?;
             p += 16;
         }
         let check = if flags & 0x01 != 0 {
-            Some(b.get(p..p + 12)?.try_into().ok()?)
+            Some(crate::bytes::at(b, p, 12)?.try_into().ok()?)
         } else {
             None
         };

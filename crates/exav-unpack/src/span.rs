@@ -27,15 +27,21 @@ const LOCATOR64: &[u8; 4] = b"PK\x06\x07";
 const CDFH: &[u8; 4] = b"PK\x01\x02";
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        crate::bytes::at(b, at, 2)?.try_into().ok()?,
+    ))
 }
 
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        crate::bytes::at(b, at, 4)?.try_into().ok()?,
+    ))
 }
 
 fn u64_at(b: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        crate::bytes::at(b, at, 8)?.try_into().ok()?,
+    ))
 }
 
 fn put(b: &mut [u8], at: usize, v: &[u8]) {
@@ -137,7 +143,7 @@ impl ZipSpan {
         }
         let mut i = 0;
         for _ in 0..entries {
-            if !cd.get(i..i + 4).is_some_and(|s| s == CDFH) {
+            if !crate::bytes::at(&cd, i, 4).is_some_and(|s| s == CDFH) {
                 return Err("a central directory record is not where the last one ends".to_string());
             }
             let field = |at: usize| {

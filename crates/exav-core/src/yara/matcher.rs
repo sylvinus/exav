@@ -786,7 +786,7 @@ fn verify_base64(
     let decoded_len = engine.decode_slice(&encoded, &mut decoded).ok()?;
     decoded.truncate(decoded_len);
 
-    let decoded_pattern = decoded.get(padding..padding + pattern.len())?;
+    let decoded_pattern = crate::bytes::at(&decoded, padding, pattern.len())?;
     if pattern == decoded_pattern {
         Some((match_start, match_start + match_len))
     } else {

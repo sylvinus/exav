@@ -549,7 +549,8 @@ impl<'a> Dwg<'a> {
     fn check_locator_crc(&mut self) {
         let n = self.locators.len();
         let at = 0x19 + 9 * n;
-        let (Some(head), Some(stored)) = (self.data.get(..at), self.data.get(at..at + 2)) else {
+        let (Some(head), Some(stored)) = (self.data.get(..at), crate::bytes::at(self.data, at, 2))
+        else {
             return;
         };
         let magic = match n {
@@ -771,7 +772,7 @@ fn locators(data: &[u8]) -> Option<Vec<Locator>> {
         });
     }
     let sentinel = 0x19 + 9 * n + 2;
-    (data.get(sentinel..sentinel + 16)? == LOCATORS_END).then_some(out)
+    (crate::bytes::at(data, sentinel, 16)? == LOCATORS_END).then_some(out)
 }
 
 /// The preview images (spec 14.2) at the address at 0x0D: entries of a

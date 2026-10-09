@@ -70,6 +70,9 @@ const ATTR_SPARSE: u16 = 0x8000;
 /// `$FILE_NAME` namespaces. The DOS 8.3 alias duplicates a name we already have.
 const NAMESPACE_DOS: u8 = 2;
 
+/// The low 48 bits of a file reference are the record number.
+const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
 /// Records 0..15 are the filesystem's own metadata — `$MFT`, `$LogFile`,
 /// `$UpCase` and friends. They are skipped, and skipping them loses nothing: the
 /// volume's raw bytes are pattern-scanned before this walk runs, so anything
@@ -296,7 +299,7 @@ fn data_extents(
         if atype == ATTR_DATA && name_len == 0 {
             let vcn = le_u64(&list, i.saturating_add(8));
             // The low 48 bits of the file reference are the record number.
-            let record = le_u64(&list, i.saturating_add(16)) & 0x0000_FFFF_FFFF_FFFF;
+            let record = le_u64(&list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
             refs.push((vcn, record));
         }
         i = i.saturating_add(entry_len);
@@ -419,7 +422,14 @@ fn parse_record(
     }
     let deleted = flags & FLAG_IN_USE == 0;
 
-    let mut name: Option<String> = None;
+    // An extension record belongs to the file its base reference names, which
+    // lists it: it is not a file of its own.
+    if le_u64(rec, 32) & RECORD_NUMBER_MASK != 0 {
+        return None;
+    }
+    // The name is in this record, or, for a file fragmented hard enough to
+    // have an attribute list, in an extension record the list names.
+    let name = record_name(rec).or_else(|| name_from_extensions(rec, volume, mft, geo, sector));
     let mut file: Option<File> = None;
     let mut off = le_u16(rec, 20) as usize;
 
@@ -435,32 +445,6 @@ fn parse_record(
         let non_resident = rec.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
         let attr_flags = le_u16(rec, off.saturating_add(12));
         let name_len = rec.get(off.saturating_add(9)).copied().unwrap_or(0) as usize;
-
-        if atype == ATTR_FILE_NAME && !non_resident {
-            let voff = off.saturating_add(le_u16(rec, off.saturating_add(20)) as usize);
-            let nlen = rec.get(voff.saturating_add(0x40)).copied().unwrap_or(0) as usize;
-            let namespace = rec.get(voff.saturating_add(0x41)).copied().unwrap_or(0);
-            // The DOS 8.3 alias names a file we already have under its real name.
-            if namespace != NAMESPACE_DOS {
-                if let Some(raw) =
-                    crate::bytes::at(rec, voff.saturating_add(0x42), nlen.saturating_mul(2))
-                {
-                    let units: Vec<u16> = raw
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .copied()
-                        .map(u16::from_le_bytes)
-                        .collect();
-                    let n = String::from_utf16_lossy(&units);
-                    // Prefer the longest, which is the Win32 name over a POSIX
-                    // alias of the same file.
-                    if name.as_ref().is_none_or(|old| n.len() > old.len()) {
-                        name = Some(n);
-                    }
-                }
-            }
-        }
 
         // Only the unnamed `$DATA` attribute is the file's own content; a named
         // one is an alternate data stream.
@@ -597,9 +581,95 @@ fn parse_record(
         off = off.saturating_add(alen);
     }
 
+    // A file with content and no name anywhere is still a file: the caller
+    // names it by its record.
     let mut f = file?;
-    f.name = name?;
+    f.name = name.unwrap_or_default();
     Some(f)
+}
+
+/// The name a resident `$FILE_NAME` attribute at `off` gives, unless it is the
+/// DOS 8.3 alias, which names a file we already have under its real name.
+fn file_name_attr(rec: &[u8], off: usize) -> Option<String> {
+    let voff = off.saturating_add(le_u16(rec, off.saturating_add(20)) as usize);
+    let nlen = rec.get(voff.saturating_add(0x40)).copied().unwrap_or(0) as usize;
+    let namespace = rec.get(voff.saturating_add(0x41)).copied().unwrap_or(0);
+    if namespace == NAMESPACE_DOS {
+        return None;
+    }
+    let raw = crate::bytes::at(rec, voff.saturating_add(0x42), nlen.saturating_mul(2))?;
+    let units: Vec<u16> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// The longest name of the `$FILE_NAME` attributes in `rec`, which is the Win32
+/// name over a POSIX alias of the same file.
+fn record_name(rec: &[u8]) -> Option<String> {
+    let mut name: Option<String> = None;
+    let mut off = le_u16(rec, 20) as usize;
+    while off.saturating_add(8) <= rec.len() {
+        let atype = le_u32(rec, off);
+        if atype == ATTR_END {
+            break;
+        }
+        let alen = le_u32(rec, off.saturating_add(4)) as usize;
+        if alen < 16 || alen > rec.len().saturating_sub(off) {
+            break;
+        }
+        let non_resident = rec.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
+        if atype == ATTR_FILE_NAME && !non_resident {
+            if let Some(n) = file_name_attr(rec, off) {
+                if name.as_ref().is_none_or(|old| n.len() > old.len()) {
+                    name = Some(n);
+                }
+            }
+        }
+        off = off.saturating_add(alen);
+    }
+    name
+}
+
+/// The name of a file whose record has none because its `$FILE_NAME` is in an
+/// extension record, which the `$ATTRIBUTE_LIST` names.
+fn name_from_extensions(
+    rec: &[u8],
+    volume: &[u8],
+    mft: &[u8],
+    geo: &Geometry,
+    sector: usize,
+) -> Option<String> {
+    let list = find_attribute_list(rec, volume, geo)?;
+    let mut name: Option<String> = None;
+    let mut i = 0usize;
+    // Bounded by the list, which is bounded by the volume.
+    while i.saturating_add(26) <= list.len() {
+        let entry_len = le_u16(&list, i.saturating_add(4)) as usize;
+        if entry_len < 26 {
+            break;
+        }
+        if le_u32(&list, i) == ATTR_FILE_NAME {
+            let record = le_u64(&list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
+            let at = crate::bytes::to_usize(record).checked_mul(geo.record_size)?;
+            if let Some(slice) = crate::bytes::at(mft, at, geo.record_size) {
+                let mut r = slice.to_vec();
+                if r.get(0..4) == Some(RECORD_MAGIC.as_slice()) && apply_fixups(&mut r, sector) {
+                    if let Some(n) = record_name(&r) {
+                        if name.as_ref().is_none_or(|old| n.len() > old.len()) {
+                            name = Some(n);
+                        }
+                    }
+                }
+            }
+        }
+        i = i.saturating_add(entry_len);
+    }
+    name
 }
 
 /// LZNT1 over a compressed attribute: the runs hold a sequence of compression
@@ -748,10 +818,15 @@ pub(crate) fn extract_ntfs<R>(
         };
         // A deleted record's runs may since have been reused by another file, so
         // its bytes are marked rather than presented as that file's content.
-        let name = if f.deleted {
-            format!("<deleted>/{}", f.name)
+        let base = if f.name.is_empty() {
+            format!("<mft-record-{i}>")
         } else {
             f.name
+        };
+        let name = if f.deleted {
+            format!("<deleted>/{base}")
+        } else {
+            base
         };
         // A file can be both partly readable and short: the report says what is
         // missing, and the bytes that exist are still scanned. Emitting only one

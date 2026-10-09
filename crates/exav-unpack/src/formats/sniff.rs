@@ -124,7 +124,7 @@ pub(crate) fn is_in(p: &Probe, fmt: Format) -> bool {
             w.windows(TAG.len()).enumerate().any(|(i, x)| {
                 x == TAG && {
                     let at = i + TAG.len() + 292;
-                    d.get(at..at + 8) == Some(&[0x06, 0, 0, 0, 0, 0, 0, 0][..])
+                    crate::bytes::at(d, at, 8) == Some(&[0x06, 0, 0, 0, 0, 0, 0, 0][..])
                         // eight bytes of anything, then the trailing marker
                         && d.get(at + 16..at + 21) == Some(&[0, 0, 0, 0, 1][..])
                 }
@@ -145,10 +145,12 @@ pub(crate) fn is_in(p: &Probe, fmt: Format) -> bool {
         // of which a coincidental byte-run will not satisfy.
         Format::IshieldZ => {
             let u16at = |o: usize| -> Option<u32> {
-                Some(u16::from_le_bytes(d.get(o..o + 2)?.try_into().ok()?) as u32)
+                Some(u16::from_le_bytes(crate::bytes::at(d, o, 2)?.try_into().ok()?) as u32)
             };
             let u32at = |o: usize| -> Option<u32> {
-                Some(u32::from_le_bytes(d.get(o..o + 4)?.try_into().ok()?))
+                Some(u32::from_le_bytes(
+                    crate::bytes::at(d, o, 4)?.try_into().ok()?,
+                ))
             };
             d.starts_with(&[0x13, 0x5D, 0x65, 0x8C])
                 && (|| {

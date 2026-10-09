@@ -349,7 +349,7 @@ impl<'a> Tags<'a> {
                 c => (i32::from(c), pos + 1),
             },
             _ => {
-                let b = self.data.get(pos..pos + 2)?;
+                let b = crate::bytes::at(self.data, pos, 2)?;
                 (
                     i32::from(i16::from_le_bytes([*b.first()?, *b.get(1)?])),
                     pos + 2,

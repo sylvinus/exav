@@ -225,7 +225,7 @@ fn unshuffle(run: &[u8], out: &mut Vec<u8>) {
         return;
     }
     for &(len, at) in SHUFFLE.get(run.len()).copied().unwrap_or(&[]) {
-        if let Some(block) = run.get(at..at + len) {
+        if let Some(block) = crate::bytes::at(run, at, len) {
             unshuffle(block, out);
         }
     }

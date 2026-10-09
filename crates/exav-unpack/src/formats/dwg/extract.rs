@@ -26,7 +26,7 @@ const BLOCK_HEADER: u16 = 0x31;
 /// bitmap. `None` when the bitmap's own header does not fit it.
 pub fn bmp_file(dib: &[u8]) -> Option<Vec<u8>> {
     let le32 = |at: usize| -> Option<u32> {
-        let b = dib.get(at..at + 4)?;
+        let b = crate::bytes::at(dib, at, 4)?;
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
     let header = le32(0)?;

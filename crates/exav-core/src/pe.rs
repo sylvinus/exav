@@ -1106,7 +1106,7 @@ pub(crate) fn elf_section_headers_stripped_in(src: &dyn ByteSource) -> bool {
         Some(2) => 58,
         _ => return false,
     };
-    h.get(off..off + 2) == Some(&[0, 0][..])
+    crate::bytes::at(&h, off, 2) == Some(&[0, 0][..])
 }
 
 #[cfg(test)]

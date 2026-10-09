@@ -93,11 +93,15 @@ fn find_marker(data: &[u8], needle: &[u8; 8]) -> Option<usize> {
 
 #[inline]
 fn le32(d: &[u8], p: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(d.get(p..p + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        crate::bytes::at(d, p, 4)?.try_into().ok()?,
+    ))
 }
 #[inline]
 fn be32(d: &[u8], p: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(d.get(p..p + 4)?.try_into().ok()?))
+    Some(u32::from_be_bytes(
+        crate::bytes::at(d, p, 4)?.try_into().ok()?,
+    ))
 }
 
 pub(crate) fn extract_autoit<R>(
@@ -134,7 +138,7 @@ fn records<R>(
 
     let mut pos = 16usize;
     let mut emitted = 0u32;
-    while let Some(tag_enc) = body.get(pos..pos + 4) {
+    while let Some(tag_enc) = crate::bytes::at(body, pos, 4) {
         let mut tag = tag_enc.to_vec();
         xor(&mut tag, v.file_tag, v.cipher);
         if tag != b"FILE" {

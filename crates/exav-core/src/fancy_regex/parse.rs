@@ -806,7 +806,7 @@ impl<'a> Parser<'a> {
         let bytes = self.re.as_bytes();
 
         // Verify that we have '\b' or '\B'
-        if !matches!(bytes.get(ix..ix + 2), Some([b'\\', b'b' | b'B'])) {
+        if !matches!(crate::bytes::at(bytes, ix, 2), Some([b'\\', b'b' | b'B'])) {
             return Err(Error::ParseError(
                 ix,
                 ParseError::InvalidEscape("\\b{...}".to_string()),

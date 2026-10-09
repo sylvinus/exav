@@ -96,7 +96,7 @@ fn check_gif(d: &[u8]) -> Option<&'static str> {
             0x2C => {
                 // Image descriptor: 9 bytes, then optional local colour table,
                 // then an LZW code-size byte and sub-blocks.
-                let Some(desc) = d.get(p..p + 9) else {
+                let Some(desc) = crate::bytes::at(d, p, 9) else {
                     return Some("Heuristics.Broken.Media.GIF.TruncatedImageDescriptor");
                 };
                 let lflags = desc[8];
@@ -151,7 +151,7 @@ fn check_png(d: &[u8]) -> Option<&'static str> {
             // Ran out exactly at a chunk boundary without IEND.
             return Some("Heuristics.Broken.Media.PNG.EOFReadingChunk");
         }
-        let Some(lb) = d.get(p..p + 4) else {
+        let Some(lb) = crate::bytes::at(d, p, 4) else {
             return Some("Heuristics.Broken.Media.PNG.EOFReadingChunk");
         };
         let len = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
@@ -185,7 +185,7 @@ fn check_png(d: &[u8]) -> Option<&'static str> {
 fn check_tiff(d: &[u8]) -> Option<&'static str> {
     let le = d.starts_with(b"II");
     let u16at = |o: usize| -> Option<u16> {
-        let b = d.get(o..o + 2)?;
+        let b = crate::bytes::at(d, o, 2)?;
         Some(if le {
             u16::from_le_bytes([b[0], b[1]])
         } else {
@@ -193,7 +193,7 @@ fn check_tiff(d: &[u8]) -> Option<&'static str> {
         })
     };
     let u32at = |o: usize| -> Option<u32> {
-        let b = d.get(o..o + 4)?;
+        let b = crate::bytes::at(d, o, 4)?;
         Some(if le {
             u32::from_le_bytes([b[0], b[1], b[2], b[3]])
         } else {
@@ -297,7 +297,7 @@ fn check_jpeg(d: &[u8]) -> Option<&'static str> {
         let marker = d[at];
         p = at + 1;
         segment_index += 1;
-        let Some(lb) = d.get(p..p + 2) else {
+        let Some(lb) = crate::bytes::at(d, p, 2) else {
             return Some("Heuristics.Broken.Media.JPEG.CantReadSegmentSize");
         };
         let len = u16::from_be_bytes([lb[0], lb[1]]) as usize;

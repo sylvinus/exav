@@ -462,6 +462,11 @@ follow [semantic versioning](https://semver.org/).
   one turn at a time, the members of an encrypted 7z block each decrypting it
   again, and a PE stub opening itself without end or searching tables it had
   grown. A library loaded where the stub had mapped memory failed for good.
+- An NTFS file fragmented hard enough to have an attribute list, with its
+  `$FILE_NAME` in an extension record, was not emitted at all: the walk found
+  no name and skipped it. Its name is now read from the extension record, and a
+  file with content and no name anywhere is emitted as `<mft-record-N>`.
+  Extension records are no longer taken for files of their own.
 - The disk-image readers (VMDK, QCOW2, VHDX, NTFS, WIM, ext, FAT, partition
   tables, ISO, DMG, UDIF, UDF) check or saturate every sum on a header's
   number, and clippy fails on one that does not.

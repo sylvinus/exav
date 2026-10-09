@@ -97,6 +97,7 @@ engine_internals!(
 );
 
 mod byte_source;
+mod bytes;
 // For the vendored fancy-regex, written against `alloc`.
 extern crate alloc;
 /// fancy-regex with fixes it has not released yet, vendored as upstream wrote

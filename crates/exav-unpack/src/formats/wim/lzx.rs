@@ -69,7 +69,7 @@ impl<'a> Bits<'a> {
         while self.n < want {
             // Reading past the end is how a truncated chunk ends; the caller
             // notices because the output comes up short.
-            let w = self.data.get(self.pos..self.pos + 2)?;
+            let w = crate::bytes::at(self.data, self.pos, 2)?;
             self.pos += 2;
             self.buf = (self.buf << 16) | u16::from_le_bytes([w[0], w[1]]) as u32;
             self.n += 16;
@@ -336,11 +336,11 @@ pub(super) fn decompress(data: &[u8], out_len: usize) -> Option<Vec<u8>> {
                 // bytes follow.
                 let mut p = bits.pos;
                 for slot in r.iter_mut() {
-                    let v = data.get(p..p + 4)?;
+                    let v = crate::bytes::at(data, p, 4)?;
                     *slot = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
                     p += 4;
                 }
-                let body = data.get(p..p + want)?;
+                let body = crate::bytes::at(data, p, want)?;
                 out.extend_from_slice(body);
                 p += want;
                 // Blocks are padded to an even length.
