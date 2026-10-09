@@ -415,6 +415,56 @@ follow [semantic versioning](https://semver.org/).
   instead of panicking the scan or the load. The dotnet and elf YARA modules
   and the bytecode `pe_rawaddr` no longer panic on a section address, raw
   pointer or entry that overflows.
+- More header numbers that were added or multiplied unchecked, now refused
+  or clamped: the ARJ, EGG, UDIF (DMG) and VBA readers and the RAR, UPX, OLE
+  and 7z (BCJ2) ones on a 32-bit build, where a wrapped sum defeated the
+  bounds check beside it; the volume join of a split RAR (a seven-byte block
+  head, a service block with a name length of `u64::MAX`); the offset of an
+  encrypted DMG's data; the bytecode machine's seek, pointer and layout sums;
+  the .NET reader; a RAR3 filter left in the queue after its definition was
+  cleared; and the warning counters of the drawing and IFC readers.
+- Work a crafted file could multiply, now bounded: a 7z folder of more than 64
+  chained coders (one recursion level each), an ISO directory that lists
+  itself (walked until the directory limit, with the whole listing queued each
+  time), a PE resource directory node whose entries point back at it, an IFC
+  profile or item that lists the next level twice, a DWG or DXF `MINSERT` of
+  65,535 by 65,535 empty blocks, a PDF with a megabyte of digits, a TIFF tile
+  as wide as 4,294,967,295 pixels (a 51 GB allocation, which aborted), and a
+  `rep` string instruction of the PE emulator that faulted part way and was
+  charged one tick for the stores it had made. Also: the members of a solid 7z
+  folder are read in one pass instead of one pass each, an InstallShield Z
+  member is expanded up to the per-member budget rather than whole, the key
+  derivations of one RAR archive are limited (a salt per member times a
+  password list), a RAR3 PPMd block cannot ask for more memory than the buffer
+  limit, `.ldb` logical expressions nest at most 64 deep (they overflowed the
+  stack), and a very wide, one-pixel-high image hashes in memory of the order
+  of its own size instead of 70 times it.
+- A CHM whose listing has an unreadable entry came back with no files and no
+  word. The files before the damage are extracted and the damage reported.
+- A `.ftm` rule with an offset as large as `usize` ended the file-type search
+  for the rules after it. `--max-scan-secs` past what `time_t` holds armed no
+  timer at all (it wrapped negative and the kernel refused it, unreported).
+  `--hash-size` and `--highfreq-factor` of `exav-imagehash` past `u32` were cut
+  to their low bits; they are refused.
+- Numbers in a signature file or a database past `u32` were cut to their low
+  bits: a fixed gap of 2^32 bytes put an anchor at distance 2, and a count of
+  `4294967296` read as 0. A stored YARA pattern with a bad base64 alphabet
+  panicked at load, and one with no bytes matched everywhere. A database of
+  more than 4 GiB of signature text is refused, as the offsets into its name,
+  anchor and hash tables are 32 bits. An x86 table cell naming no mnemonic is
+  no instruction, not an out-of-range index.
+- Work a small file could ask for, now bounded: a DWG polyline of a million
+  vertices dashed by scanning them for every dash, a hatch over a boundary of
+  100,000 edges for every scan line (and over a thousand pattern lines), a
+  fill band testing every edge, an MTEXT paragraph looking up each line's
+  start from the start of the text, mesh normals at a vertex of 100,000 faces,
+  a JPEG 2000 component mapping with one plane per entry, an IFC angle unrolled
+  one turn at a time, the members of an encrypted 7z block each decrypting it
+  again, and a PE stub opening itself without end or searching tables it had
+  grown. A library loaded where the stub had mapped memory failed for good.
+- The disk-image readers (VMDK, QCOW2, VHDX, NTFS, WIM, ext, FAT, partition
+  tables, ISO, DMG, UDIF, UDF) check or saturate every sum on a header's
+  number, and clippy fails on one that does not.
 - An object holding more embedded files than carving scans (16 PE, ELF or
   Mach-O images of each kind, 32 archives) scanned the first ones and
   dropped the rest silently, so decoys in front of a payload hid it from the

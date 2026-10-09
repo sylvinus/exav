@@ -102,7 +102,7 @@ impl<'a> Reader<'a> {
             for item in ids(rp.get(3)) {
                 match self.item(item, 0, None) {
                     Some(mut v) => out.append(&mut v),
-                    None => self.warnings.invalid += 1,
+                    None => self.warnings.invalid = self.warnings.invalid.saturating_add(1),
                 }
             }
         }
@@ -182,6 +182,7 @@ impl<'a> Reader<'a> {
         if depth > MAX_DEPTH {
             return None;
         }
+        self.visit()?;
         let (ty, p) = self.get(id)?;
         let color = self.item_color(id).or(inherited);
         let solid = |mesh: Mesh| {
@@ -299,7 +300,7 @@ impl<'a> Reader<'a> {
                 for item in ids(rp.get(3)) {
                     match self.item(item, depth + 1, None) {
                         Some(mut v) => pieces.append(&mut v),
-                        None => self.warnings.invalid += 1,
+                        None => self.warnings.invalid = self.warnings.invalid.saturating_add(1),
                     }
                 }
                 for piece in &mut pieces {
@@ -346,7 +347,7 @@ impl<'a> Reader<'a> {
                     solid: true,
                 }],
                 None => {
-                    self.warnings.invalid += 1;
+                    self.warnings.invalid = self.warnings.invalid.saturating_add(1);
                     return Some(a);
                 }
             }
@@ -369,7 +370,7 @@ impl<'a> Reader<'a> {
         let size: usize = a.iter().chain(&b).map(|p| p.mesh.t.len()).sum();
         let closed = b.iter().all(|p| p.solid) && a.iter().any(|p| p.solid);
         if !closed || size > csg::MAX_TRIANGLES {
-            self.warnings.booleans_skipped += 1;
+            self.warnings.booleans_skipped = self.warnings.booleans_skipped.saturating_add(1);
             return if op == Op::Union {
                 a.into_iter().chain(b).collect()
             } else {
@@ -400,7 +401,7 @@ impl<'a> Reader<'a> {
         let pa = polys(&solids, 0);
         let pb = polys(&b, solids.len() as u32);
         let Some(result) = csg::combine(op, pa, pb) else {
-            self.warnings.booleans_skipped += 1;
+            self.warnings.booleans_skipped = self.warnings.booleans_skipped.saturating_add(1);
             let mut out = solids;
             if op == Op::Union {
                 out.extend(b);

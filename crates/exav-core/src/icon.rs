@@ -290,9 +290,32 @@ struct Resources<'a> {
     /// File offset of the resource root (the resource-directory base).
     rbase: usize,
     map: SectionMap,
+    /// Directory entries still to be looked at. A node can list thousands of
+    /// entries that point back at itself, which the depth limit alone leaves
+    /// as an exponential walk.
+    entries_left: std::cell::Cell<u32>,
 }
 
+/// The directory entries one icon lookup may visit.
+const MAX_RESOURCE_ENTRIES: u32 = 4096;
+
 impl<'a> Resources<'a> {
+    fn new(data: &'a [u8], rbase: usize, map: SectionMap) -> Self {
+        Resources {
+            data,
+            rbase,
+            map,
+            entries_left: std::cell::Cell::new(MAX_RESOURCE_ENTRIES),
+        }
+    }
+
+    /// Spend one entry of the budget; false once it is gone.
+    fn spend(&self) -> bool {
+        let left = self.entries_left.get();
+        self.entries_left.set(left.saturating_sub(1));
+        left > 0
+    }
+
     /// First ID-named subdirectory under `dir_abs` whose id equals `want`.
     fn find_id_subdir(&self, dir_abs: usize, want: u16) -> Option<usize> {
         let named = rd_u16(self.data, dir_abs.checked_add(12)?)? as usize;
@@ -319,6 +342,9 @@ impl<'a> Resources<'a> {
         let ids = rd_u16(self.data, dir_abs.checked_add(14)?)? as usize;
         let total = named.checked_add(ids)?;
         for i in 0..total {
+            if !self.spend() {
+                return None;
+            }
             let e = dir_abs.checked_add(16)?.checked_add(i.checked_mul(8)?)?;
             let off_field = rd_u32(self.data, e.checked_add(4)?)?;
             if off_field & 0x8000_0000 != 0 {
@@ -341,6 +367,9 @@ impl<'a> Resources<'a> {
         let ids = rd_u16(self.data, dir_abs.checked_add(14)?)? as usize;
         let total = named.checked_add(ids)?;
         for i in 0..total {
+            if !self.spend() {
+                return None;
+            }
             let e = dir_abs.checked_add(16)?.checked_add(i.checked_mul(8)?)?;
             let off_field = rd_u32(self.data, e.checked_add(4)?)?;
             if off_field & 0x8000_0000 != 0 {
@@ -510,7 +539,7 @@ fn resource_view(data: &[u8]) -> Option<(Resources<'_>, usize)> {
     if rbase >= data.len() {
         return None;
     }
-    Some((Resources { data, rbase, map }, rbase))
+    Some((Resources::new(data, rbase, map), rbase))
 }
 
 /// Parse a PE and return the DIB slices of its first icon group.
@@ -549,7 +578,7 @@ fn pe_icon_dibs(data: &[u8]) -> Vec<&[u8]> {
     if rbase >= data.len() {
         return Vec::new();
     }
-    Resources { data, rbase, map }.collect_dibs()
+    Resources::new(data, rbase, map).collect_dibs()
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1446,31 @@ mod tests {
         bad[at + 4..at + 8].copy_from_slice(&2_409_852_894u32.to_le_bytes());
         assert!(goblin::pe::PE::parse(&bad).is_err(), "the full parse refuses it");
         assert_eq!(pe_icon_metrics(&bad), want);
+    }
+
+    /// A group node of a few entries that all point back at the node itself
+    /// has no icon, and takes no longer to say so than any other.
+    #[test]
+    fn a_resource_node_listing_itself_is_not_walked_exponentially() {
+        let entries = 8u16;
+        let mut d = vec![0u8; 16];
+        d[14..16].copy_from_slice(&1u16.to_le_bytes()); // the root: one id entry
+        d.extend_from_slice(&14u32.to_le_bytes()); // type 14
+        d.extend_from_slice(&(0x8000_0000u32 | 24).to_le_bytes()); // its node
+        let mut node = vec![0u8; 16];
+        node[14..16].copy_from_slice(&entries.to_le_bytes());
+        d.extend_from_slice(&node);
+        for i in 0..entries {
+            d.extend_from_slice(&u32::from(i).to_le_bytes());
+            d.extend_from_slice(&(0x8000_0000u32 | 24).to_le_bytes());
+        }
+        let map = SectionMap {
+            size_of_headers: 0,
+            sections: Vec::new(),
+        };
+        let start = std::time::Instant::now();
+        assert!(Resources::new(&d, 0, map).collect_dibs().is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     fn put_u16(v: &mut Vec<u8>, x: u16) {

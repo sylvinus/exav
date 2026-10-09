@@ -431,11 +431,11 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
             Err(Stop::Fault(f)) if env.grow_stack(&mut mem, f.addr) => {
                 // The stack grew into its guard region, which on Windows just
                 // commits another page. Retry the instruction.
-                ticks += 1;
+                ticks += 1 + cpu.take_partial_ticks();
                 continue;
             }
             Err(stop) => {
-                ticks += 1;
+                ticks += 1 + cpu.take_partial_ticks();
                 // Deliver the fault to the stub's own handler chain; only if
                 // nothing accepts it does the run end.
                 let code = exception_code(&stop);
@@ -1059,6 +1059,53 @@ mod tests {
             "the handler resumed execution and the stub reached its target: {}",
             r.stop
         );
+    }
+
+    #[test]
+    fn a_rep_that_faults_part_way_is_charged_for_what_it_did() {
+        // `rep stosb` of 0x1000 bytes from 0x100 bytes before the end of the
+        // image faults on the next page; a handler resumes past it. The
+        // stores before the fault used to cost one tick in all, so a stub
+        // looping through this had a budget that never ran out.
+        //
+        //   68 <handler>, 64 ff 35 .., 64 89 25 ..   install the handler
+        //   31 c0                 xor eax, eax
+        //   bf 00 2f 40 00        mov edi, 0x402f00
+        //   b9 00 10 00 00        mov ecx, 0x1000
+        //   f3 aa                 rep stosb          <- faults after 0x100 stores
+        //   a3 00 10 40 00        mov [0x401000], eax   <- resumed here
+        //   e9 ..                 jmp .text
+        let base = 0x0040_2000u32;
+        let mut stub: Vec<u8> = Vec::new();
+        let handler_at_placeholder = stub.len() + 1;
+        stub.extend_from_slice(&[0x68, 0, 0, 0, 0]);
+        stub.extend_from_slice(&[0x64, 0xff, 0x35, 0, 0, 0, 0]);
+        stub.extend_from_slice(&[0x64, 0x89, 0x25, 0, 0, 0, 0]);
+        stub.extend_from_slice(&[0x31, 0xc0]);
+        stub.extend_from_slice(&[0xbf, 0x00, 0x2f, 0x40, 0x00]);
+        stub.extend_from_slice(&[0xb9, 0x00, 0x10, 0x00, 0x00]);
+        stub.extend_from_slice(&[0xf3, 0xaa]);
+        let resume_off = stub.len();
+        stub.extend_from_slice(&[0xa3, 0x00, 0x10, 0x40, 0x00]);
+        stub.extend_from_slice(&[0xe9, 0, 0, 0, 0]);
+        let jmp_at = base + stub.len() as u32 - 5;
+        let rel = 0x0040_1000u32.wrapping_sub(jmp_at + 5) as i32;
+        let n = stub.len();
+        stub[n - 4..].copy_from_slice(&rel.to_le_bytes());
+
+        let handler_off = stub.len();
+        stub.extend_from_slice(&[0x8b, 0x44, 0x24, 0x0c]); // mov eax, [esp+0xc]
+        stub.extend_from_slice(&[0xc7, 0x80, 0xb8, 0x00, 0x00, 0x00]); // mov [eax+0xb8], imm32
+        stub.extend_from_slice(&(base + resume_off as u32).to_le_bytes());
+        stub.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+
+        let handler_va = base + handler_off as u32;
+        stub[handler_at_placeholder..handler_at_placeholder + 4]
+            .copy_from_slice(&handler_va.to_le_bytes());
+
+        let file = packed_pe(&stub, 0x1000);
+        let r = unpack(&file, &tiny_limits());
+        assert!(r.ticks >= 0x100, "ticks {}: {}", r.ticks, r.stop);
     }
 
     #[test]

@@ -19,6 +19,10 @@
 //! The reconstructed disk is emitted as a single member for the partition and
 //! filesystem handlers to pick up.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// The two region tables, at 192 KiB and 256 KiB. The second is a mirror, read
@@ -88,20 +92,20 @@ struct Region {
 /// Find the BAT and metadata regions in whichever region table parses.
 fn regions(data: &[u8]) -> Option<(Region, Region)> {
     for base in [REGION_TABLE_1, REGION_TABLE_2] {
-        if data.get(base..base + 4) != Some(REGION_SIGNATURE.as_slice()) {
+        if crate::bytes::at(data, base, 4) != Some(REGION_SIGNATURE.as_slice()) {
             continue;
         }
-        let count = le_u32(data, base + 8).min(MAX_REGION_ENTRIES);
+        let count = le_u32(data, base.saturating_add(8)).min(MAX_REGION_ENTRIES);
         let (mut bat, mut meta) = (None, None);
         for i in 0..count as usize {
-            let e = base + 16 + i * 32;
-            let Some(guid) = data.get(e..e + 16) else {
+            let e = base.saturating_add(16).saturating_add(i.saturating_mul(32));
+            let Some(guid) = crate::bytes::at(data, e, 16) else {
                 break;
             };
             // Entry: GUID(16), FileOffset u64, Length u32, Required u32.
             let r = Region {
-                offset: crate::bytes::to_usize(le_u64(data, e + 16)),
-                length: le_u32(data, e + 24) as usize,
+                offset: crate::bytes::to_usize(le_u64(data, e.saturating_add(16))),
+                length: le_u32(data, e.saturating_add(24)) as usize,
             };
             if guid == BAT_REGION {
                 bat = Some(r);
@@ -129,7 +133,7 @@ fn geometry(data: &[u8], meta: &Region) -> Option<Geometry> {
     if crate::bytes::at(data, base, 8) != Some(METADATA_SIGNATURE.as_slice()) {
         return None;
     }
-    let count = le_u16(data, base + 10).min(MAX_METADATA_ENTRIES);
+    let count = le_u16(data, base.saturating_add(10)).min(MAX_METADATA_ENTRIES);
     let mut g = Geometry {
         block_size: 0,
         virtual_size: 0,
@@ -139,7 +143,7 @@ fn geometry(data: &[u8], meta: &Region) -> Option<Geometry> {
         has_parent: false,
     };
     for i in 0..count as usize {
-        let Some(e) = base.checked_add(32 + i * 32) else {
+        let Some(e) = base.checked_add(i.saturating_mul(32).saturating_add(32)) else {
             break;
         };
         let Some(guid) = crate::bytes::at(data, e, 16) else {
@@ -219,40 +223,45 @@ pub(crate) fn extract_vhdx<R>(
     // The BAT interleaves one sector-bitmap entry after every `chunk_ratio`
     // payload entries, so a block's index in the table is not its index on the
     // disk.
-    let chunk_ratio = ((1u64 << 23) * g.logical_sector_size as u64) / g.block_size as u64;
+    let chunk_ratio = (1u64 << 23)
+        .saturating_mul(u64::from(g.logical_sector_size))
+        .checked_div(u64::from(g.block_size))
+        .unwrap_or(0);
     let block_size = g.block_size as usize;
-    let total_blocks = g.virtual_size.div_ceil(g.block_size as u64);
+    let total_blocks = g.virtual_size.div_ceil(u64::from(g.block_size).max(1));
 
-    let mut disk = vec![0u8; g.virtual_size as usize];
+    let mut disk = vec![0u8; crate::bytes::to_usize(g.virtual_size)];
     // Blocks the BAT says are here but that could not be located. Zero-filling
     // one and saying nothing would hand the scanner a clean-looking hole where
     // real content should be.
     let mut unlocatable_blocks = 0usize;
 
     for i in 0..total_blocks {
-        let bat_index = i + i.checked_div(chunk_ratio).unwrap_or(0);
+        let bat_index = i.saturating_add(i.checked_div(chunk_ratio).unwrap_or(0));
+        let bat_at = crate::bytes::to_usize(bat_index).saturating_mul(8);
         // Past the end of the declared BAT region: the table is short, so this
         // block and every one after it has no entry to read.
-        if (bat_index as usize + 1) * 8 > bat.length {
-            unlocatable_blocks += (total_blocks - i) as usize;
+        if bat_at.saturating_add(8) > bat.length {
+            unlocatable_blocks = unlocatable_blocks
+                .saturating_add(crate::bytes::to_usize(total_blocks.saturating_sub(i)));
             break;
         }
-        let entry = le_u64(data, bat.offset.saturating_add((bat_index as usize) * 8));
+        let entry = le_u64(data, bat.offset.saturating_add(bat_at));
         let state = entry & 7;
         if state != PAYLOAD_BLOCK_FULLY_PRESENT && state != PAYLOAD_BLOCK_PARTIALLY_PRESENT {
             continue; // unallocated or explicitly zero
         }
         // Bits 20..63 hold the file offset in megabytes.
         let host = crate::bytes::to_usize((entry >> 20) << 20);
-        let guest = (i as usize).saturating_mul(block_size);
+        let guest = crate::bytes::to_usize(i).saturating_mul(block_size);
         if guest >= disk.len() {
             continue;
         }
         // An entry pointing past the end of the file names bytes that are
         // absent rather than hidden, so the block stays zero and stays quiet.
-        let n = block_size.min(disk.len() - guest);
+        let n = block_size.min(disk.len().saturating_sub(guest));
         if let Some(src) = crate::bytes::at(data, host, n) {
-            disk[guest..guest + n].copy_from_slice(src);
+            disk[guest..guest.saturating_add(n)].copy_from_slice(src);
         }
     }
 

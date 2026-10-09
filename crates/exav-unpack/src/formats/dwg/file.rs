@@ -708,6 +708,8 @@ fn read_class(
 fn read_object_map(data: &[u8], limit: usize, problems: &mut Vec<String>) -> Vec<(u64, usize)> {
     let mut at = 0usize;
     let mut map = Vec::new();
+    // Counted and said once: a note a piece would be the size of the map again.
+    let mut outside = 0usize;
     loop {
         let Some(s) = slice(data, at, 2) else {
             problems.push("the object map is cut short".into());
@@ -732,7 +734,7 @@ fn read_object_map(data: &[u8], limit: usize, problems: &mut Vec<String>) -> Vec
             offset = offset.wrapping_add(dl);
             match usize::try_from(offset) {
                 Ok(o) if o < limit => map.push((handle, o)),
-                _ => problems.push(format!("object {handle:X} is outside the objects")),
+                _ => outside += 1,
             }
         }
         // The size covers itself and the entries; the CRC follows.
@@ -740,6 +742,9 @@ fn read_object_map(data: &[u8], limit: usize, problems: &mut Vec<String>) -> Vec
         if at >= data.len() {
             break;
         }
+    }
+    if outside > 0 {
+        problems.push(format!("{outside} objects are outside the objects"));
     }
     // Later entries of a handle replace earlier ones.
     map.reverse();
@@ -831,6 +836,25 @@ pub(super) fn has_file_header(head: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thousand entries pointing outside the objects are one note, not a
+    /// thousand strings.
+    #[test]
+    fn objects_outside_the_objects_are_one_problem() {
+        let entries = 1000usize;
+        let body_len = entries * 2;
+        let mut data = ((body_len + 2) as u16).to_be_bytes().to_vec();
+        for _ in 0..entries {
+            data.extend_from_slice(&[0x01, 0x01]); // handle +1, offset +1
+        }
+        data.extend_from_slice(&[0, 0]); // the CRC
+        data.extend_from_slice(&[0, 2]); // a section of nothing ends the map
+        let mut problems = Vec::new();
+        let map = read_object_map(&data, 0, &mut problems);
+        assert!(map.is_empty());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("1000 "), "{problems:?}");
+    }
 
     #[test]
     fn the_crc_table_is_the_specifications() {

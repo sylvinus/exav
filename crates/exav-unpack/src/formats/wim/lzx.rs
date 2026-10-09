@@ -17,6 +17,12 @@
 //! verified, a resource failing the SHA-1 the image records is reported; the
 //! tests compare decoded resources with the files that went in.
 
+// The parent module denies unchecked arithmetic on a header's numbers. This
+// is the codec: its sums are on bit counts, code lengths and slots that the
+// format limits itself (16-bit words, codes of 16 bits or less, 17 extra
+// bits, a 65535-byte block), and on positions inside the chunk it was handed.
+#![allow(clippy::arithmetic_side_effects)]
+
 /// Symbols 0..255 are literals; the rest encode (length, offset-slot) pairs.
 const NUM_CHARS: usize = 256;
 /// A main symbol's low three bits are the length; 7 means "read the length tree".

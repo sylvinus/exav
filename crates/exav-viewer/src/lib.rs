@@ -63,7 +63,7 @@ mod image {
         })?;
         // Checked before converting: a grey image takes four times its
         // decoded size as RGBA8.
-        if u64::from(p.width) * u64::from(p.height) * 4 > max {
+        if (u64::from(p.width) * u64::from(p.height)).saturating_mul(4) > max {
             return Err(JsError::new("too-large"));
         }
         Ok(DecodedImage {

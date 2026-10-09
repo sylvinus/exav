@@ -698,6 +698,9 @@ struct Decoder29 {
     /// Sub-allocator memory size in bytes, carried across PPMd blocks (only
     /// re-allocated when the 0x20 "reset" flag is set).
     ppmd_mem: u32,
+    /// The most memory a PPMd block header may ask the model for: the
+    /// archive's number, up to 256 MB, otherwise.
+    ppmd_mem_limit: u64,
     /// The PPMd escape symbol: 2 until a block header sets another, then kept
     /// by the blocks after it that set none.
     ppmd_escape: u8,
@@ -715,6 +718,7 @@ impl Decoder29 {
             decode_is_ppm: false,
             ppmd: None,
             ppmd_mem: 0,
+            ppmd_mem_limit: u64::MAX,
             ppmd_escape: 2,
             eof: false,
             fnum: 0,
@@ -872,6 +876,9 @@ impl Decoder29 {
                 || !(PPMD7_MIN_MEM_SIZE..=PPMD7_MAX_MEM_SIZE).contains(&mem)
             {
                 return Err(err("invalid ppmd params"));
+            }
+            if u64::from(mem) > self.ppmd_mem_limit {
+                return Err(err("PPMd memory exceeds max-buffer"));
             }
             let model = Ppmd7::new(rc, maxorder, mem).ok_or_else(|| err("ppmd alloc"))?;
             self.ppmd = Some(PpmdState {
@@ -1144,13 +1151,12 @@ impl DecodeReader {
 
         let mut cur = f;
         loop {
-            outbuf = run_filter(
-                &self.dec.filters[cur.filter_index],
-                &cur.regs,
-                &cur.global,
-                outbuf,
-                self.tot,
-            )?;
+            // A new block's header clears the filter definitions, so a queued
+            // filter can name one that is gone.
+            let Some(filter) = self.dec.filters.get(cur.filter_index) else {
+                return Err(err("filter no longer defined"));
+            };
+            outbuf = run_filter(filter, &cur.regs, &cur.global, outbuf, self.tot)?;
             match self.filters.front() {
                 None => break,
                 Some(nf) => {
@@ -1244,6 +1250,7 @@ impl Unpacker29 {
             return Err(err("RAR window exceeds max-buffer"));
         }
         let mut dec = Decoder29::new();
+        dec.ppmd_mem_limit = budget.limits.max_buffer_bytes;
         dec.init_filters();
         dec.lz.reset();
         Ok(Unpacker29 {
@@ -1866,6 +1873,49 @@ mod tests {
         assert_eq!(filter_delta(u32::MAX as usize, &data).len(), data.len());
         assert_eq!(filter_audio(u32::MAX as usize, &data).len(), data.len());
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// A PPMd block header asks for the model's memory (up to 256 MB, the
+    /// archive's number): over the budget's buffer limit it is refused before
+    /// the allocation.
+    #[test]
+    fn a_ppmd_header_asking_for_more_than_the_buffer_limit_is_refused() {
+        // 7 bits of flags (reset, order 6), 8 bits of size (16 MB), then bytes
+        // for the range decoder.
+        let mut bytes = vec![0b0100_1010, 0b0001_1110];
+        bytes.extend_from_slice(&[0u8; 64]);
+        let mut dec = Decoder29::new();
+        dec.ppmd_mem_limit = 1 << 20;
+        let e = dec
+            .read_ppmd_header(&mut BitReader::new(bytes.clone()))
+            .unwrap_err();
+        assert!(e.reason.contains("exceeds max-buffer"), "{}", e.reason);
+        // Within the limit it gets as far as the model.
+        dec.ppmd_mem_limit = 64 << 20;
+        let r = dec.read_ppmd_header(&mut BitReader::new(bytes));
+        assert!(
+            r.as_ref()
+                .err()
+                .is_none_or(|e| !e.reason.contains("exceeds max-buffer")),
+            "{:?}",
+            r.err().map(|e| e.reason)
+        );
+    }
+
+    /// A queued filter whose definition a later block header cleared is an
+    /// error, not an index past the list.
+    #[test]
+    fn a_queued_filter_without_a_definition_is_an_error() {
+        let mut b = Budget::new(Limits::default());
+        let mut u = Unpacker29::new(16, &mut b).unwrap();
+        u.dr.filters.push_back(QueuedFilter {
+            length: 0,
+            offset: 0,
+            filter_index: 3,
+            regs: [None; VM_REGS - 1],
+            global: Vec::new(),
+        });
+        assert!(u.dr.process_filters().is_err());
     }
 
     #[test]

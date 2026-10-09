@@ -198,7 +198,10 @@ impl<'a> EntropyCode<'a> {
             return 0;
         }
         let v = (self.tag.wrapping_sub(self.low)) / t;
-        self.up = self.low.wrapping_add(t.wrapping_mul(v + 1)).wrapping_sub(1);
+        self.up = self
+            .low
+            .wrapping_add(t.wrapping_mul(v.wrapping_add(1)))
+            .wrapping_sub(1);
         self.low = self.low.wrapping_add(t.wrapping_mul(v));
         self.rescale();
         v
@@ -529,7 +532,7 @@ impl DistanceCode {
         let idx = self.prob.code(e) as usize;
         let mut dist = tbl::MATCH_DIST_CODE[idx.min(tbl::MATCH_DIST_CODE.len() - 1)];
         if idx < tbl::MATCH_DIST_EXTRABIT.len() {
-            dist += e.code_raw(tbl::MATCH_DIST_EXTRABIT[idx]);
+            dist = dist.saturating_add(e.code_raw(tbl::MATCH_DIST_EXTRABIT[idx]));
         }
         self.history.add(dist);
         dist
@@ -555,7 +558,7 @@ impl LengthCode {
         let idx = self.prob.code(e, dist_code) as usize;
         let mut len = tbl::MATCH_LENGTH_CODE[idx.min(tbl::MATCH_LENGTH_CODE.len() - 1)];
         if idx < tbl::MATCH_LENGTH_EXTRABIT.len() {
-            len += e.code_raw(tbl::MATCH_LENGTH_EXTRABIT[idx]);
+            len = len.saturating_add(e.code_raw(tbl::MATCH_LENGTH_EXTRABIT[idx]));
         }
         len
     }
@@ -602,7 +605,7 @@ fn decode_block(inbuf: &[u8], out: &mut [u8]) -> Result<(), ()> {
             // the stream is not what it claims.
             let d = dist as usize;
             let l = length as usize;
-            if d == 0 || d > i || i + l > out.len() {
+            if d == 0 || d > i || l > out.len().saturating_sub(i) {
                 return Err(());
             }
             for k in 0..l {

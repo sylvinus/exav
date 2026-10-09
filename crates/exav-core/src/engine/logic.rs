@@ -166,7 +166,11 @@ impl Node {
 
 pub(super) fn parse_expr(expr: &str) -> Option<Node> {
     let tokens: Vec<u8> = expr.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let mut p = Parser { s: &tokens, i: 0 };
+    let mut p = Parser {
+        s: &tokens,
+        i: 0,
+        depth: 0,
+    };
     let node = p.or()?;
     if p.i == p.s.len() {
         Some(node)
@@ -175,9 +179,15 @@ pub(super) fn parse_expr(expr: &str) -> Option<Node> {
     }
 }
 
+/// Parentheses a logical expression may nest. Each is a level of recursion in
+/// the parser and in everything that walks the tree after it; real signatures
+/// nest a handful.
+const MAX_NESTING: u32 = 64;
+
 pub(super) struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: u32,
 }
 
 impl Parser<'_> {
@@ -210,8 +220,14 @@ impl Parser<'_> {
     fn atom(&mut self) -> Option<Node> {
         match self.peek()? {
             b'(' => {
+                if self.depth >= MAX_NESTING {
+                    return None;
+                }
                 self.i += 1;
-                let inner = self.or()?;
+                self.depth += 1;
+                let inner = self.or();
+                self.depth -= 1;
+                let inner = inner?;
                 if self.peek() != Some(b')') {
                     return None;
                 }
@@ -228,7 +244,8 @@ impl Parser<'_> {
                 }
             }
             b'0'..=b'9' => {
-                let sub = self.number()?;
+                // A subsignature past `usize` is none that exists.
+                let sub = usize::try_from(self.number()?).unwrap_or(usize::MAX);
                 if let Some(cmp) = self.cmp() {
                     let (x, _y) = self.count_args()?; // single subsig: y is ignored
                     Some(Node::SubCmp(sub, cmp, x))
@@ -285,18 +302,24 @@ impl Parser<'_> {
 
     /// Parse `x` or `x,y` after a comparison operator.
     fn count_args(&mut self) -> Option<(u32, Option<u32>)> {
-        let x = self.number()? as u32;
+        let x = self.count()?;
         if self.peek() == Some(b',') {
             self.i += 1;
             // A trailing comma with no second count — `0=2,&1&2` in
             // `Unix.Trojan.Elknot-2` — is tolerated and means the same as no
             // comma at all.
-            return Some((x, self.number().map(|y| y as u32)));
+            return Some((x, self.count()));
         }
         Some((x, None))
     }
 
-    fn number(&mut self) -> Option<usize> {
+    /// A count: past `u32` no count of matches is ever reached, so it is
+    /// clamped, not cut to its low bits.
+    fn count(&mut self) -> Option<u32> {
+        self.number().map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
+    fn number(&mut self) -> Option<u64> {
         let start = self.i;
         while matches!(self.peek(), Some(b'0'..=b'9')) {
             self.i += 1;
@@ -318,6 +341,15 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parentheses nest as deep as the parser's own recursion allows: a
+    /// hundred thousand of them are refused, a few dozen parse.
+    #[test]
+    fn a_deeply_nested_expression_is_refused_not_a_stack_overflow() {
+        let nest = |n: usize| format!("{}0{}", "(".repeat(n), ")".repeat(n));
+        assert!(parse_expr(&nest(40)).is_some());
+        assert!(parse_expr(&nest(100_000)).is_none());
+    }
 
     /// Body counts are saturated by the scan, so two of them can sum past
     /// `u32`: the group's total is capped, not wrapped or a panic.
@@ -409,6 +441,16 @@ mod tests {
         let group = parse_expr("0&(1|2)>5").unwrap();
         assert!(!group.can_be_true(&present, &|i| (i > 0).then_some(1)));
         assert!(group.can_be_true(&present, &|i| (i == 1).then_some(u32::MAX).or((i == 2).then_some(1))));
+    }
+
+    /// A count past `u32` is one no object reaches; cut to its low bits,
+    /// `4294967296` was `0` and `>` it held for any present subsignature.
+    #[test]
+    fn a_count_past_u32_is_not_cut_to_its_low_bits() {
+        let one = |_: usize| 1u32;
+        assert!(!parse_expr("0>4294967296").unwrap().eval(&one));
+        assert!(parse_expr("0<4294967296").unwrap().eval(&one));
+        assert!(!parse_expr("(0|1)>4294967297,2").unwrap().eval(&one));
     }
 
     #[test]

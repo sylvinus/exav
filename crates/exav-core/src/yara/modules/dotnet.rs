@@ -76,13 +76,15 @@ const ELEMENT_TYPE_STRING: u8 = 0x0E;
 const MAX_TABLES: usize = 64;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    off.checked_add(2)
+        .and_then(|end| d.get(off..end))
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    off.checked_add(4)
+        .and_then(|end| d.get(off..end))
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
@@ -149,8 +151,8 @@ impl<'a> Meta<'a> {
 
         // Root: signature, major, minor, reserved, then a length-prefixed
         // version string padded to a four-byte boundary.
-        let vlen = le_u32(data, root + 12) as usize;
-        let vbytes = data.get(root + 16..)?.get(..vlen)?;
+        let vlen = le_u32(data, root.saturating_add(12)) as usize;
+        let vbytes = data.get(root.checked_add(16)?..)?.get(..vlen)?;
         let version = String::from_utf8_lossy(
             &vbytes[..vbytes.iter().position(|&b| b == 0).unwrap_or(vbytes.len())],
         )
@@ -411,8 +413,8 @@ impl<'a> Meta<'a> {
             return None;
         }
         let sz = self.row_size(t);
-        let at = self.table_at[t] + (i as usize) * sz;
-        self.tables.get(at..at + sz)
+        let at = self.table_at[t].saturating_add((i as usize).saturating_mul(sz));
+        self.tables.get(at..at.checked_add(sz)?)
     }
 
     /// Read an index of `w` bytes at `off`.
@@ -446,7 +448,8 @@ impl<'a> Meta<'a> {
             Some(v) => v,
             None => return Vec::new(),
         };
-        s.get(hdr..hdr + len as usize)
+        hdr.checked_add(len as usize)
+            .and_then(|end| s.get(hdr..end))
             .map(<[u8]>::to_vec)
             .unwrap_or_default()
     }
@@ -503,14 +506,16 @@ impl<'a> Meta<'a> {
             // The last byte of an entry is a flag rather than character data, so
             // a one-byte entry carries no characters at all. YARA counts neither
             // those nor zero-length ones.
+            let start = p.saturating_add(hdr);
+            let next = start.saturating_add(len);
             if len <= 1 {
-                p += hdr + len;
+                p = next;
                 continue;
             }
-            let end = (p + hdr + len).min(self.us.len());
-            let body = &self.us[p + hdr..end.saturating_sub(1).max(p + hdr)];
+            let end = next.min(self.us.len());
+            let body = &self.us[start..end.saturating_sub(1).max(start)];
             user_strings.push(Value::Str(body.to_vec()));
-            p += hdr + len;
+            p = next;
         }
         f.insert(
             "number_of_user_strings".into(),

@@ -700,6 +700,11 @@ impl Image {
         } else if chunk_row_bytes > data_row_bytes && self.predictor == Predictor::FloatingPoint {
             // The floating point predictor shuffles the padding bytes into the encoded output, so
             // this case is handled specially when needed.
+            // The tile's width is the file's own: one row of it is a buffer
+            // the size of that, and a failed allocation aborts.
+            if chunk_row_bytes > limits.decoding_buffer_size {
+                return Err(TiffError::LimitsExceeded);
+            }
             let mut encoded = vec![0u8; chunk_row_bytes];
             for row in buf.chunks_mut(output_row_stride).take(data_dims.1 as usize) {
                 reader.read_exact(&mut encoded)?;

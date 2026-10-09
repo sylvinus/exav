@@ -497,25 +497,33 @@ pub(super) fn parse_elems(hex: &str) -> Option<Vec<Elem>> {
     }
 }
 
+/// A gap bound, as wide as the file can be: a number that does not fit a
+/// 32-bit `usize` is the largest one, so a signature behaves the same there
+/// and on a 64-bit build instead of failing to load.
+fn gap_bound(s: &str) -> Option<usize> {
+    let n: u64 = s.trim().parse().ok()?;
+    Some(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 pub(super) fn parse_gap(spec: &str) -> Option<Elem> {
     let spec = spec.trim();
     if let Some(rest) = spec.strip_prefix('-') {
         Some(Elem::Gap {
             min: 0,
-            max: Some(rest.trim().parse().ok()?),
+            max: Some(gap_bound(rest)?),
         })
     } else if let Some(pre) = spec.strip_suffix('-') {
         Some(Elem::Gap {
-            min: pre.trim().parse().ok()?,
+            min: gap_bound(pre)?,
             max: None,
         })
     } else if let Some((a, b)) = spec.split_once('-') {
         Some(Elem::Gap {
-            min: a.trim().parse().ok()?,
-            max: Some(b.trim().parse().ok()?),
+            min: gap_bound(a)?,
+            max: Some(gap_bound(b)?),
         })
     } else {
-        let n = spec.parse().ok()?;
+        let n = gap_bound(spec)?;
         Some(Elem::Gap {
             min: n,
             max: Some(n),
@@ -613,15 +621,14 @@ pub(super) fn pick_anchor(
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
                     None => true,
                 };
-                if in_fixed_prefix && better(&best_fixed) {
-                    best_fixed = Some((
-                        score,
-                        b.len(),
-                        Prefix::Fixed {
-                            anchor_idx: i as u32,
-                            len: fixed as u32,
-                        },
-                    ));
+                // A distance past `u32` cannot be stored: the anchor is then
+                // no fixed-prefix one, instead of one at a wrapped distance.
+                if let (true, Ok(len), Ok(anchor_idx)) =
+                    (in_fixed_prefix, u32::try_from(fixed), u32::try_from(i))
+                {
+                    if better(&best_fixed) {
+                        best_fixed = Some((score, b.len(), Prefix::Fixed { anchor_idx, len }));
+                    }
                 }
                 let any_better = match &best_any {
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
@@ -651,8 +658,8 @@ pub(super) fn pick_anchor(
                 if idx == 1 && matches!(elems.first(), Some(Elem::Gap { .. })) {
                     return Some(Prefix::Floating { anchor_idx: 1 });
                 }
-                if idx > 0 {
-                    return Some(Prefix::Internal { anchor_idx: idx as u32 });
+                if let (true, Ok(anchor_idx)) = (idx > 0, u32::try_from(idx)) {
+                    return Some(Prefix::Internal { anchor_idx });
                 }
             }
         }

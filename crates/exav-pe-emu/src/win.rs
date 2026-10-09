@@ -85,6 +85,16 @@ const PROCESS_HEAP: u32 = 0x0052_0000;
 const TLS_SLOTS: usize = 1088;
 const TLS_OUT_OF_INDEXES: u32 = 0xffff_ffff;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_TOO_MANY_OPEN_FILES: u32 = 4;
+
+/// Handles to the sample open at once. A stub that opens itself without
+/// closing grew the table by an entry a call, as far as the tick budget let it.
+const MAX_OPEN_FILES: usize = 256;
+
+/// What a search of one entry of a table is charged, in bulk bytes (a tick per
+/// page of them): the driver bounds work, not calls, and these searches walk
+/// tables a stub grows.
+const SCAN_CHARGE: u64 = 256;
 
 /// A synthetic loaded module.
 #[derive(Debug, Clone)]
@@ -1145,7 +1155,7 @@ impl<'a> Env<'a> {
                 match self.find_module_by_name(&name).map(|m| m.base) {
                     Some(b) => b,
                     None => {
-                        let base = self.next_module_base();
+                        let base = self.next_module_base(mem);
                         match self.create_module(mem, &name, base) {
                             Ok(()) => base,
                             Err(_) => 0,
@@ -1175,7 +1185,7 @@ impl<'a> Env<'a> {
                         // unknown DLL is how a stub probes for a sandbox, and
                         // the honest answer there is that it is not there.
                         None if is_system_dll(&name) => {
-                            let base = self.next_module_base();
+                            let base = self.next_module_base(mem);
                             match self.create_module(mem, &name, base) {
                                 Ok(()) => base,
                                 Err(_) => 0,
@@ -1236,6 +1246,7 @@ impl<'a> Env<'a> {
                 let size = arg(cpu, mem, 3)?;
                 let new = self.alloc(mem, 0, size);
                 if new != 0 && old != 0 {
+                    self.bulk_bytes += (self.allocations.len() as u64).saturating_mul(SCAN_CHARGE);
                     let keep = self
                         .allocations
                         .iter()
@@ -1417,15 +1428,24 @@ impl<'a> Env<'a> {
                 }
             }
             Api::Sleep => 0,
-            Api::CloseHandle => 1,
+            Api::CloseHandle => {
+                let h = arg(cpu, mem, 0)?;
+                self.open_files.remove(&h);
+                1
+            }
             Api::CreateFile { wide } => {
                 let p = arg(cpu, mem, 0)?;
                 let path = read_str(mem, p, wide)?;
                 if self.is_own_path(&path) {
-                    let h = self.next_handle;
-                    self.next_handle += 4;
-                    self.open_files.insert(h, 0);
-                    h
+                    if self.open_files.len() >= MAX_OPEN_FILES {
+                        self.last_error = ERROR_TOO_MANY_OPEN_FILES;
+                        INVALID_HANDLE
+                    } else {
+                        let h = self.next_handle;
+                        self.next_handle = self.next_handle.wrapping_add(4);
+                        self.open_files.insert(h, 0);
+                        h
+                    }
                 } else {
                     // Every other path does not exist here at all: there is
                     // no host filesystem behind this environment.
@@ -1690,7 +1710,7 @@ impl<'a> Env<'a> {
             let module_base = match self.find_module_by_name(&dll).map(|m| m.base) {
                 Some(b) => b,
                 None => {
-                    let b = self.next_module_base();
+                    let b = self.next_module_base(mem);
                     if self.create_module(mem, &dll, b).is_err() {
                         continue;
                     }
@@ -1753,6 +1773,7 @@ impl<'a> Env<'a> {
         let Some(module_name) = self.find_module(hmod).map(|m| m.name.clone()) else {
             return 0;
         };
+        self.bulk_bytes += (self.traps.len() as u64).saturating_mul(SCAN_CHARGE);
         // The lowest matching trap, not the first one iteration happens to
         // reach. More than one can match — a module created twice under two
         // spellings of its name, or an alias resolved after the export table
@@ -1821,15 +1842,22 @@ impl<'a> Env<'a> {
         p == SAMPLE_PATH.to_ascii_lowercase() || base == "sample.exe"
     }
 
-    fn next_module_base(&self) -> u32 {
+    fn next_module_base(&self, mem: &Mem) -> u32 {
         // Below the preloaded system DLLs, growing down, so a newly "loaded"
-        // module never lands on one that is already mapped.
-        self.modules
+        // module never lands on one that is already mapped. Memory the stub
+        // mapped there itself is stepped over: laying a module on it fails,
+        // and would fail again at the same address for every later load.
+        let mut at = self
+            .modules
             .iter()
             .map(|m| m.base)
             .min()
             .unwrap_or(0x7000_0000)
-            .saturating_sub(MODULE_SIZE)
+            .saturating_sub(MODULE_SIZE);
+        while at > 0 && mem.any_mapped(at, MODULE_SIZE) {
+            at = at.saturating_sub(MODULE_SIZE);
+        }
+        at
     }
 }
 
@@ -2266,6 +2294,65 @@ mod tests {
         cpu.eip = trap_for(env, "kernel32.dll", name);
         assert_eq!(env.call(&mut cpu, mem).unwrap(), ApiEffect::Continue);
         cpu.regs[EAX]
+    }
+
+    /// A module is placed below the others; memory the stub mapped on that
+    /// spot is stepped over. Laid on it, the load failed, and failed again at
+    /// the same address for every library the stub asked for after.
+    #[test]
+    fn a_library_is_loaded_past_memory_the_stub_mapped_where_it_would_go() {
+        let (mut mem, mut env) = env();
+        let blocked = env.next_module_base(&mem);
+        mem.map(blocked, 0x1000).unwrap();
+        let name = 0x0050_0000u32;
+        mem.map(name, 0x1000).unwrap();
+        mem.write_bytes(name, b"some-library.dll\0").unwrap();
+        let base = call_k32(&mut env, &mut mem, "LoadLibraryA", &[name]);
+        assert_ne!(base, 0, "the load failed on the stub's memory");
+        assert!(base < blocked);
+    }
+
+    /// A stub that opens the sample again and again, closing none, gets
+    /// handles up to a limit and then an error; a handle closed is room for one
+    /// more. The table was one entry a call.
+    #[test]
+    fn handles_to_the_sample_are_limited_and_closing_one_makes_room() {
+        let (mut mem, mut env) = env();
+        let path = 0x0050_0000u32;
+        mem.map(path, 0x1000).unwrap();
+        mem.write_bytes(path, b"C:\\sample.exe\0").unwrap();
+        let open = |env: &mut Env, mem: &mut Mem| {
+            call_k32(env, mem, "CreateFileA", &[path, 0x8000_0000, 1, 0, 3, 0, 0])
+        };
+        let first = open(&mut env, &mut mem);
+        assert_ne!(first, INVALID_HANDLE);
+        for _ in 1..MAX_OPEN_FILES {
+            assert_ne!(open(&mut env, &mut mem), INVALID_HANDLE);
+        }
+        assert_eq!(open(&mut env, &mut mem), INVALID_HANDLE);
+        assert_eq!(env.last_error, ERROR_TOO_MANY_OPEN_FILES);
+        assert_eq!(env.open_files.len(), MAX_OPEN_FILES);
+        assert_eq!(call_k32(&mut env, &mut mem, "CloseHandle", &[first]), 1);
+        assert_ne!(open(&mut env, &mut mem), INVALID_HANDLE);
+    }
+
+    /// `GetProcAddress` searches every trap, so with many of them a call is
+    /// charged for the search; one tick each let a stub spend the budget on
+    /// searches of a table it had grown.
+    #[test]
+    fn resolving_an_export_is_charged_for_the_search() {
+        let (mut mem, mut env) = env();
+        let name = 0x0050_0000u32;
+        mem.map(name, 0x1000).unwrap();
+        mem.write_bytes(name, b"VirtualAlloc\0").unwrap();
+        let k32 = env.find_module_by_name("kernel32.dll").unwrap().base;
+        assert_eq!(env.take_bulk_bytes(), 0);
+        let addr = call_k32(&mut env, &mut mem, "GetProcAddress", &[k32, name]);
+        assert_ne!(addr, 0);
+        let charged = env.take_bulk_bytes();
+        // Hundreds of traps: a tick or more, where a lookup is one.
+        assert!(env.traps.len() > 100);
+        assert!(charged >= PAGE_SIZE as u64, "charged {charged}");
     }
 
     /// TLS state is bounded by the index range, whatever indices a guest

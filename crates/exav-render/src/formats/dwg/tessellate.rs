@@ -206,6 +206,9 @@ pub fn viewport_transform(
 /// Guards against block reference cycles in damaged files.
 const MAX_BLOCK_DEPTH: u32 = 32;
 
+/// The placements one MINSERT may make, whatever its block draws.
+const MAX_MINSERT_CELLS: usize = 1 << 20;
+
 /// One of the drawing's tabs: model space, or a paper-space sheet.
 pub struct LayoutInfo {
     pub name: String,
@@ -1719,7 +1722,8 @@ impl<'a> Tessellator<'a> {
             // that can be drawn is the frame, which is what AutoCAD shows for
             // an image it cannot load, and the count so the host can say so.
             EntityKind::Image(img) => {
-                self.warnings.external_references += 1;
+                self.warnings.external_references =
+                    self.warnings.external_references.saturating_add(1);
                 let u = [img.u_vector.x, img.u_vector.y];
                 let v = [img.v_vector.x, img.v_vector.y];
                 let o = [img.insertion.x, img.insertion.y];
@@ -1740,7 +1744,8 @@ impl<'a> Tessellator<'a> {
             }
 
             EntityKind::Underlay(u) => {
-                self.warnings.external_references += 1;
+                self.warnings.external_references =
+                    self.warnings.external_references.saturating_add(1);
                 if u.clip_vertices.len() >= 2 {
                     let pts: Vec<[f64; 2]> = u.clip_vertices.iter().map(|p| [p.x, p.y]).collect();
                     // Two points are the corners of a rectangle, more are a path.
@@ -1766,7 +1771,8 @@ impl<'a> Tessellator<'a> {
             }
 
             EntityKind::Ole2Frame(o) => {
-                self.warnings.external_references += 1;
+                self.warnings.external_references =
+                    self.warnings.external_references.saturating_add(1);
                 let (a, b) = (o.upper_left, o.lower_right);
                 let frame = [[a.x, a.y], [b.x, a.y], [b.x, b.y], [a.x, b.y]];
                 self.push_transformed(&frame, true, xf, rgba, attr, pattern);
@@ -1786,13 +1792,14 @@ impl<'a> Tessellator<'a> {
                 }
             }
             EntityKind::Unknown(u) if u.is_custom() => {
-                self.warnings.proxy_without_graphics += 1;
+                self.warnings.proxy_without_graphics =
+                    self.warnings.proxy_without_graphics.saturating_add(1);
             }
 
             // Meshes, SHAPE (a glyph of an SHX file, which cannot be shipped)
             // and every other type the model does not hold.
             EntityKind::Polyline(_) | EntityKind::Shape(_) | EntityKind::Unknown(_) => {
-                self.warnings.unknown_entities += 1;
+                self.warnings.unknown_entities = self.warnings.unknown_entities.saturating_add(1);
             }
         }
     }
@@ -1943,7 +1950,7 @@ impl<'a> Tessellator<'a> {
         // Blocks rotate and scale their contents, so the text follows.
         let block_rotation = ctx.xf.b.atan2(ctx.xf.a);
         let scale = ctx.xf.scale_magnitude();
-        self.warnings.text_runs += 1;
+        self.warnings.text_runs = self.warnings.text_runs.saturating_add(1);
         let run = text::TextRun {
             x: p[0],
             y: p[1],
@@ -2014,7 +2021,10 @@ impl<'a> Tessellator<'a> {
 
         let mut pen = dx;
         let mut points: Vec<[f64; 2]> = Vec::new();
-        self.warnings.stroke_glyphs += run.text.chars().count() as u32;
+        self.warnings.stroke_glyphs = self
+            .warnings
+            .stroke_glyphs
+            .saturating_add(u32::try_from(run.text.chars().count()).unwrap_or(u32::MAX));
         for c in run.text.chars() {
             // A character the font lacks draws its "?" rather than a hole.
             if let Some(glyph) = stroke.glyph(c).or_else(|| stroke.glyph('?')) {
@@ -2108,7 +2118,7 @@ impl<'a> Tessellator<'a> {
                 face: label.face,
                 order: self.scene.order,
             };
-            self.warnings.text_runs += 1;
+            self.warnings.text_runs = self.warnings.text_runs.saturating_add(1);
             match label.face {
                 font::Face::Stroke => self.push_stroke_text(&run),
                 font::Face::TrueType(_) => self.scene.push_text(run),
@@ -2136,8 +2146,16 @@ impl<'a> Tessellator<'a> {
         let (sin_r, cos_r) = ins.rotation.sin_cos();
         let columns = ins.columns;
         let grid = (0..ins.rows).flat_map(|row| (0..columns).map(move |col| (row, col)));
-        for (row, col) in grid {
-            if self.scene_full() {
+        // A block with nothing in it adds nothing to the scene, so the scene
+        // never fills: one placement says all there is to say about it.
+        let empty = self
+            .block(&ins.block_name)
+            .is_none_or(|b| b.entities.is_empty());
+        for (visited, (row, col)) in grid.enumerate() {
+            if empty && visited > 0 {
+                break;
+            }
+            if visited >= MAX_MINSERT_CELLS || self.scene_full() {
                 self.warnings.scene_truncated = self.warnings.scene_truncated.saturating_add(1);
                 break;
             }
@@ -2202,18 +2220,18 @@ impl<'a> Tessellator<'a> {
             return;
         }
         if depth >= MAX_BLOCK_DEPTH {
-            self.warnings.depth_exceeded += 1;
+            self.warnings.depth_exceeded = self.warnings.depth_exceeded.saturating_add(1);
             return;
         }
         let key = normalize(block_name);
         if self.stack.contains(&key) {
             // Cyclic block reference in a damaged file.
-            self.warnings.depth_exceeded += 1;
+            self.warnings.depth_exceeded = self.warnings.depth_exceeded.saturating_add(1);
             return;
         }
 
         let Some(block) = self.block(block_name) else {
-            self.warnings.missing_blocks += 1;
+            self.warnings.missing_blocks = self.warnings.missing_blocks.saturating_add(1);
             return;
         };
 
@@ -2436,13 +2454,15 @@ impl<'a> Tessellator<'a> {
             .collect();
 
         if lines.is_empty() {
-            self.warnings.hatch_patterns_missing += 1;
+            self.warnings.hatch_patterns_missing =
+                self.warnings.hatch_patterns_missing.saturating_add(1);
             return;
         }
 
         let (segments, truncated) = hatch::pattern_segments(&loops, &lines, island_style(h));
         if truncated {
-            self.warnings.hatch_patterns_truncated += 1;
+            self.warnings.hatch_patterns_truncated =
+                self.warnings.hatch_patterns_truncated.saturating_add(1);
         }
 
         // Record the pattern's spacing so the renderer can fade these lines
@@ -2657,6 +2677,30 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("did not return within 20 s");
         assert!(truncated > 0 && n < SCENE_BUDGET + MAX_SEGMENTS_PER_CIRCLE);
+    }
+
+    /// The grid of an empty (or missing) block never fills the scene, which
+    /// is what stopped the walk of the grid above.
+    #[test]
+    fn a_minsert_of_an_empty_block_is_cut_short_at_once() {
+        for empty in [true, false] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut doc = minsert(u16::MAX, u16::MAX);
+                if empty {
+                    doc.blocks[1].entities.clear();
+                } else {
+                    doc.blocks.truncate(1); // the block is not there at all
+                }
+                let mut t = Tessellator::new(&doc);
+                t.run();
+                let _ = tx.send(t.scene.strokes.len());
+            });
+            let n = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("did not return within 20 s");
+            assert_eq!(n, 0);
+        }
     }
 
     const MAX_SEGMENTS_PER_CIRCLE: usize = 513;

@@ -510,7 +510,14 @@ impl Seek for Reader<'_> {
                 "seek before the start",
             ));
         }
-        self.pos = pos as u64;
+        // A position past `u64` is not one: wrapped, it would land at the start.
+        // A position past `u64` is not one: wrapped, it would land at the start.
+        self.pos = u64::try_from(pos).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek past the largest offset",
+            )
+        })?;
         Ok(self.pos)
     }
 }
@@ -649,6 +656,18 @@ mod tests {
 
     fn data(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    /// A seek past the largest offset is an error; it used to wrap to a small
+    /// one, which passes any check made against the end of the object.
+    #[test]
+    fn a_seek_past_u64_is_an_error_not_a_wrap() {
+        let d = data(100);
+        let slice = d.as_slice();
+        let mut r = Reader::new(&slice);
+        assert_eq!(r.seek(SeekFrom::Start(u64::MAX)).unwrap(), u64::MAX);
+        assert!(r.seek(SeekFrom::Current(2)).is_err());
+        assert_eq!(r.seek(SeekFrom::Start(5)).unwrap(), 5);
     }
 
     #[test]

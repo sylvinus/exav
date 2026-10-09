@@ -13,6 +13,10 @@
 //! The reconstructed guest disk is emitted as a single member for the partition
 //! and filesystem handlers to pick up.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// `KDMV` — the sparse-extent header magic, little-endian on disk.
@@ -160,14 +164,17 @@ pub(crate) fn extract_vmdk<R>(
             if gte == 0 {
                 continue;
             }
-            let guest = (i * 512 + j).saturating_mul(grain_size);
+            let guest = i
+                .saturating_mul(512)
+                .saturating_add(j)
+                .saturating_mul(grain_size);
             if guest >= disk.len() {
                 continue;
             }
-            let n = grain_size.min(disk.len() - guest);
+            let n = grain_size.min(disk.len().saturating_sub(guest));
             let host = crate::bytes::to_usize((gte as u64).saturating_mul(SECTOR));
             if let Some(src) = crate::bytes::at(data, host, n) {
-                disk[guest..guest + n].copy_from_slice(src);
+                disk[guest..guest.saturating_add(n)].copy_from_slice(src);
             }
         }
     }
@@ -192,9 +199,9 @@ fn read_markers(data: &[u8], disk: &mut [u8], grain_size: usize) -> (usize, usiz
     while pos.saturating_add(512) <= data.len() {
         // Marker: u64 LBA, u32 size, u32 type (the last only when size == 0).
         let lba = le_u64(data, pos);
-        let size = le_u32(data, pos + 8) as usize;
+        let size = le_u32(data, pos.saturating_add(8)) as usize;
         if size == 0 {
-            let kind = le_u32(data, pos + 12);
+            let kind = le_u32(data, pos.saturating_add(12));
             match kind {
                 MARKER_EOS => break,
                 // Metadata regions: `lba` counts the sectors that follow.
@@ -204,14 +211,14 @@ fn read_markers(data: &[u8], disk: &mut [u8], grain_size: usize) -> (usize, usiz
                     continue;
                 }
                 _ => {
-                    pos += 512;
+                    pos = pos.saturating_add(512);
                     continue;
                 }
             }
         }
         // A data marker: 12 bytes of header then `size` bytes of deflate,
         // padded out to a sector boundary.
-        let start = pos + 12;
+        let start = pos.saturating_add(12);
         // A grain cut by the end of the file: what is there is decoded, the
         // rest is absent.
         let rest_absent = start.saturating_add(size) > data.len();
@@ -236,21 +243,21 @@ fn read_markers(data: &[u8], disk: &mut [u8], grain_size: usize) -> (usize, usiz
                     cut_short: false,
                 },
             };
-            let n = s.data.len().min(disk.len() - guest);
-            disk[guest..guest + n].copy_from_slice(&s.data[..n]);
+            let n = s.data.len().min(disk.len().saturating_sub(guest));
+            disk[guest..guest.saturating_add(n)].copy_from_slice(&s.data[..n]);
             if n > 0 {
-                wrote += 1;
+                wrote = wrote.saturating_add(1);
             }
             // The grain's bytes are in this file; exav just could not read
             // them. That is content left unexamined, not content absent.
             if s.part_way(rest_absent) {
-                undecodable += 1;
+                undecodable = undecodable.saturating_add(1);
             }
         }
         if rest_absent {
             break;
         }
-        let consumed = (12 + size).div_ceil(512) * 512;
+        let consumed = size.saturating_add(12).div_ceil(512).saturating_mul(512);
         pos = pos.saturating_add(consumed);
     }
     (wrote, undecodable)

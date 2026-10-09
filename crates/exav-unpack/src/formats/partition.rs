@@ -18,6 +18,10 @@
 //! truncated input. The number of emitted partitions is capped, and each carved
 //! region is charged against the [`Budget`] before it is materialised.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::*;
 
 const SECTOR: usize = 512;
@@ -30,27 +34,30 @@ const GPT_MAX_ENTRY_SIZE: u32 = 4096;
 
 const GPT_SIG: &[u8; 8] = b"EFI PART";
 
+/// Where the four entries of an MBR's partition table start.
+const MBR_ENTRIES: [usize; 4] = [0x1BE, 0x1CE, 0x1DE, 0x1EE];
+
 /// Read a little-endian `u64` at `off`, or `0` if out of bounds.
 fn le_u64(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    crate::bytes::at(d, off, 8)
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
         .unwrap_or(0)
 }
 /// Read a little-endian `u32` at `off`, or `0` if out of bounds.
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
         .unwrap_or(0)
 }
 /// Read a little-endian `u16` at `off`, or `0` if out of bounds.
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
         .unwrap_or(0)
 }
 /// Read a big-endian `u32` at `off`, or `0` if out of bounds (APM is big-endian).
 fn be_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|s| u32::from_be_bytes(s.try_into().unwrap()))
         .unwrap_or(0)
 }
@@ -71,7 +78,7 @@ fn lba_range(name: String, first_lba: u64, end_sector: u64, total_len: u64) -> O
     if end <= start {
         return None;
     }
-    Some(Region::Member(name, start, end - start))
+    Some(Region::Member(name, start, end.saturating_sub(start)))
 }
 
 /// The ClamAV alert name for an overlapping partition table in `data`, or
@@ -200,7 +207,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             }
             let first_lba = le_u64(entry, 32);
             let end_sector = le_u64(entry, 40).saturating_add(1);
-            emitted += 1;
+            emitted = emitted.saturating_add(1);
             if let Some(m) = lba_range(
                 format!("gpt-part-{emitted}"),
                 first_lba,
@@ -224,7 +231,8 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             if emitted >= MAX_PARTS {
                 break;
             }
-            let sector = crate::read_at(source, ((i + 1) * SECTOR) as u64, SECTOR)?;
+            let at = (i as u64).saturating_add(1).saturating_mul(SECTOR as u64);
+            let sector = crate::read_at(source, at, SECTOR)?;
             if sector.get(0..2) != Some(b"PM".as_slice()) {
                 break;
             }
@@ -233,7 +241,7 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
             if pblock_count == 0 {
                 continue;
             }
-            emitted += 1;
+            emitted = emitted.saturating_add(1);
             if let Some(m) = lba_range(
                 format!("apm-part-{emitted}"),
                 pblock_start,
@@ -245,18 +253,17 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
         }
     } else if is_mbr_in(&head, total_len) {
         let mut emitted = 0usize;
-        for i in 0..4 {
-            let e = 0x1BE + i * 16;
-            let ptype = head.get(e + 4).copied().unwrap_or(0);
+        for e in MBR_ENTRIES {
+            let ptype = head.get(e.saturating_add(4)).copied().unwrap_or(0);
             if ptype == 0x00 || ptype == 0xEE {
                 continue;
             }
-            let lba_first = le_u32(&head, e + 8) as u64;
-            let sectors = le_u32(&head, e + 12) as u64;
+            let lba_first = le_u32(&head, e.saturating_add(8)) as u64;
+            let sectors = le_u32(&head, e.saturating_add(12)) as u64;
             if sectors == 0 || lba_first.saturating_mul(SECTOR as u64) >= total_len {
                 continue;
             }
-            emitted += 1;
+            emitted = emitted.saturating_add(1);
             if let Some(m) = lba_range(
                 format!("mbr-part-{emitted}"),
                 lba_first,
@@ -323,12 +330,11 @@ fn is_mbr_in(data: &[u8], len: u64) -> bool {
     if is_volume_boot_record(data) {
         return false;
     }
-    (0..4).any(|i| {
-        let e = 0x1BE + i * 16;
+    MBR_ENTRIES.into_iter().any(|e| {
         let status = data.get(e).copied().unwrap_or(0xFF);
-        let ptype = data.get(e + 4).copied().unwrap_or(0);
-        let lba_first = le_u32(data, e + 8);
-        let sectors = le_u32(data, e + 12);
+        let ptype = data.get(e.saturating_add(4)).copied().unwrap_or(0);
+        let lba_first = le_u32(data, e.saturating_add(8));
+        let sectors = le_u32(data, e.saturating_add(12));
         // status must be 0x00 (inactive) or 0x80 (bootable); a non-empty,
         // non-protective type; a non-zero size; a start that lands inside the
         // image (so random bytes with 55 AA at 510 don't qualify); and a start
@@ -346,7 +352,9 @@ fn is_mbr_in(data: &[u8], len: u64) -> bool {
 
 // The module compiles unconditionally (for the intersection heuristic), but
 // these drive `extract(Format::Partition, …)`, which needs the walker.
+// The tests lay out their inputs by index arithmetic on small constants.
 #[cfg(all(test, feature = "partition"))]
+#[allow(clippy::arithmetic_side_effects)]
 mod tests {
     /// A FAT boot sector: a jump instruction, an OEM name, a BIOS Parameter
     /// Block — and, at 446, ordinary boot code that happens to read as a

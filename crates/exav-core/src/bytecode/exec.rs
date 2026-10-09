@@ -802,7 +802,7 @@ impl<'a> Machine<'a> {
         let ok = self
             .heaps
             .get(h)
-            .map(|buf| w != 0 && o + w <= buf.len())
+            .map(|buf| w != 0 && o.checked_add(w).is_some_and(|end| end <= buf.len()))
             .unwrap_or(false);
         if !ok {
             self.flag();
@@ -823,7 +823,7 @@ impl<'a> Machine<'a> {
     fn read_region(&mut self, p: i64, len: usize) -> Vec<u8> {
         let (region, off) = (ptr_region(p), ptr_off(p) as usize);
         let slice = |buf: &[u8]| {
-            buf.get(off..(off + len).min(buf.len()))
+            buf.get(off..off.saturating_add(len).min(buf.len()))
                 .unwrap_or(&[])
                 .to_vec()
         };
@@ -905,7 +905,7 @@ impl<'a> Machine<'a> {
     fn api_for(&self, func: u32) -> Api {
         self.apis
             .iter()
-            .find(|(id, _)| *id == func + 1)
+            .find(|(id, _)| *id == func.saturating_add(1))
             .map_or(Api::Unsupported, |&(_, a)| a)
     }
 
@@ -947,13 +947,14 @@ impl<'a> Machine<'a> {
                     2 => self.ctx.file.len() as i64,
                     _ => 0,
                 };
-                let pos = base + off;
-                if pos < 0 || pos > self.ctx.file.len() as i64 {
+                let pos = base.checked_add(off);
+                let Some(pos) = pos.filter(|&p| (0..=self.ctx.file.len() as i64).contains(&p))
+                else {
                     if self.trace {
                         eprintln!("[trace] seek(off={off}, whence={whence}) -> OOB(-1)");
                     }
                     return -1;
-                }
+                };
                 self.cursor = pos as usize;
                 if self.trace {
                     eprintln!(
@@ -1201,7 +1202,7 @@ impl<'a> Machine<'a> {
                     Some(p) if idx >= 0 && (idx as usize) < p.objs.len() => {
                         let i = idx as usize;
                         if i + 1 == p.objs.len() {
-                            (p.size - p.objs[i].1) as i64
+                            p.size.saturating_sub(p.objs[i].1) as i64
                         } else {
                             (p.objs[i + 1]
                                 .1
@@ -1373,7 +1374,8 @@ impl<'a> Machine<'a> {
         let delta = if opcode == OP_GEP1 {
             // GEP1: index scaled by the pointee's size (resolved at prepare time).
             let esz = pointee.map(|p| self.ctx.types.size(p)).unwrap_or(1).max(1);
-            index * esz as i64
+            // The program's own number, wrapped as the address is.
+            index.wrapping_mul(esz as i64)
         } else if index == 0 {
             0
         } else if let Some(p) = pointee {
@@ -1445,7 +1447,7 @@ impl<'a> Machine<'a> {
                     // would end the run: tracing must not change the result.
                     let v = self
                         .slot(fi, inst.dest)
-                        .and_then(|s| self.frames[fi].stack.get(s.off as usize..(s.off + s.w) as usize))
+                        .and_then(|s| self.frames[fi].stack.get(s.off as usize..s.off as usize + s.w as usize))
                         .map_or(0, |b| b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)) as i64);
                     eprintln!(
                         "[fn{idx} bb{bb}] op={:<2} dest={:<3} ty={:<3} => {v} (0x{:x})",
@@ -1505,7 +1507,7 @@ impl<'a> Machine<'a> {
                             .ctx
                             .apis
                             .iter()
-                            .find(|(id, _)| *id == *func + 1)
+                            .find(|(id, _)| *id == func.saturating_add(1))
                             .map(|(_, n)| n.clone())
                             .unwrap_or_default();
                         self.note_stub(&name);
@@ -1540,8 +1542,11 @@ impl<'a> Machine<'a> {
                             .unwrap_or(1)
                             .max(1) as i64;
                         let base = self.ptr(fi, base);
-                        let delta: i64 =
-                            idxs.iter().map(|o| self.value_nat(fi, o)).sum::<i64>() * esz;
+                        let delta: i64 = idxs
+                            .iter()
+                            .map(|o| self.value_nat(fi, o))
+                            .fold(0i64, i64::wrapping_add)
+                            .wrapping_mul(esz);
                         compose(ptr_region(base), ptr_off(base).wrapping_add(delta as u32))
                     }
                     None => {
@@ -1727,11 +1732,11 @@ fn version_compare(l: &[u8], r: &[u8]) -> i64 {
         }
         let (mut li, mut ri) = (0u64, 0u64);
         while i < l.len() && l[i].is_ascii_digit() {
-            li = 10 * li + (l[i] - b'0') as u64;
+            li = li.saturating_mul(10).saturating_add((l[i] - b'0') as u64);
             i += 1;
         }
         while j < r.len() && r[j].is_ascii_digit() {
-            ri = 10 * ri + (r[j] - b'0') as u64;
+            ri = ri.saturating_mul(10).saturating_add((r[j] - b'0') as u64);
             j += 1;
         }
         if li != ri {
@@ -1741,7 +1746,7 @@ fn version_compare(l: &[u8], r: &[u8]) -> i64 {
 }
 
 fn read_le(buf: &[u8], off: usize, w: usize) -> Option<i64> {
-    let slice = buf.get(off..off + w)?;
+    let slice = buf.get(off..off.checked_add(w)?)?;
     let mut v = 0u64;
     for (i, &b) in slice.iter().enumerate() {
         v |= u64::from(b) << (8 * i);
@@ -1818,14 +1823,14 @@ fn layout(f: &Function, types: &TypeTable) -> (Rc<[Slot]>, usize) {
     for &ty in &f.types {
         let align = types.align(ty).max(1);
         let size = types.size(ty).max(1);
-        bytes = (bytes + align - 1) & !(align - 1);
+        bytes = bytes.saturating_add(align - 1) & !(align - 1);
         slots.push(Slot {
             off: bytes as u32,
             w: type_bytes(ty).max(1) as u32,
         });
-        bytes += size;
+        bytes = bytes.saturating_add(size);
     }
-    bytes = (bytes + 7) & !7;
+    bytes = bytes.saturating_add(7) & !7;
     (slots.into(), bytes)
 }
 
@@ -2047,6 +2052,25 @@ mod tests {
             assert!(m.unsupported);
             m.unsupported = false;
         }
+    }
+
+    /// An index is the program's own number: scaled past `i64`, it wraps as
+    /// the address does, and does not stop the program.
+    #[test]
+    fn a_pointer_index_scaled_past_i64_wraps() {
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        // `i64*`: eight bytes an element.
+        let p = m.gep(
+            0,
+            OP_GEP1,
+            0x8000 | 64,
+            &Operand::Const(0),
+            &Operand::Const(i64::MAX as u64),
+        );
+        assert_eq!(ptr_off(p), (i64::MAX.wrapping_mul(8)) as u32);
+        assert!(!m.unsupported);
     }
 
     #[test]

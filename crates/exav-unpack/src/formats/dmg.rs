@@ -2,6 +2,9 @@
     not(feature = "decrypt"),
     allow(dead_code, unused_mut, unused_imports, unreachable_code)
 )]
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
 use crate::source::{ByteSource, Reader};
 use crate::*;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -34,7 +37,7 @@ pub(crate) fn is_dmg(p: &Probe) -> bool {
     if p.len == 0 {
         return false;
     }
-    if p.len >= 512 && p.window(p.len - 512, 4)[..] == KOLY_SIG[..] {
+    if p.len >= 512 && p.window(p.len.saturating_sub(512), 4)[..] == KOLY_SIG[..] {
         return true;
     }
     if data.len() >= 8 && &data[0..8] == ENCRCDSA_SIG {
@@ -61,7 +64,7 @@ const HFSX_SIG: [u8; 2] = [0x48, 0x58];
 /// a power of two of at least 512. Together they take the false-positive rate to
 /// somewhere around one in a billion.
 fn plausible_hfs_header(data: &[u8], off: usize) -> bool {
-    let Some(h) = data.get(off..off + 44) else {
+    let Some(h) = crate::bytes::at(data, off, 44) else {
         return false;
     };
     let sig = [h[0], h[1]];
@@ -89,7 +92,7 @@ fn find_hfs_offset(data: &[u8]) -> Option<usize> {
 /// the object header (checksum, oid, xid, type, subtype) comes first.
 /// `nx_block_size` is the field immediately after the magic.
 fn plausible_apfs_header(data: &[u8], off: usize) -> bool {
-    let Some(h) = data.get(off..off + 8) else {
+    let Some(h) = crate::bytes::at(data, off, 8) else {
         return false;
     };
     if &h[0..4] != APFS_SIG {
@@ -136,9 +139,9 @@ fn parse_encrypted_header(data: &[u8]) -> Result<EncryptedDmgHeader, LimitHit> {
     if &h[..8] != b"encrcdsa" {
         return Err(LimitHit::corrupt("missing encrcdsa signature".into()));
     }
-    let u32_at = |o: usize| u32::from_be_bytes(h[o..o + 4].try_into().unwrap());
-    let u64_at = |o: usize| u64::from_be_bytes(h[o..o + 8].try_into().unwrap());
-    let bytes_at = |o: usize| -> [u8; 32] { h[o..o + 32].try_into().unwrap() };
+    let u32_at = |o: usize| u32::from_be_bytes(h[o..o.saturating_add(4)].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_be_bytes(h[o..o.saturating_add(8)].try_into().unwrap());
+    let bytes_at = |o: usize| -> [u8; 32] { h[o..o.saturating_add(32)].try_into().unwrap() };
     let header = EncryptedDmgHeader {
         version: u32_at(8),
         data_enc_key_bits: u32_at(24),
@@ -261,13 +264,14 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
 
     // Decrypt keyblob to get AES key + HMAC key.
     let keyblob = decrypt_keyblob(&header, &derived_key)?;
-    if keyblob.len() < aes_key_bytes + hmac_key_bytes {
+    let keys_end = aes_key_bytes.saturating_add(hmac_key_bytes);
+    if keyblob.len() < keys_end {
         return Err(LimitHit::corrupt(
             "keyblob too short after decryption".into(),
         ));
     }
     let aes_key = &keyblob[..aes_key_bytes];
-    let hmac_key = &keyblob[aes_key_bytes..aes_key_bytes + hmac_key_bytes];
+    let hmac_key = &keyblob[aes_key_bytes..keys_end];
 
     // Decrypt all chunks. `blocksize` is an attacker-controlled u32; bound the
     // single chunk allocation by the (default) global peak-buffer limit and
@@ -278,20 +282,23 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
             "DMG block size invalid or exceeds max-buffer".into(),
         ));
     }
-    let data_size = header.datasize as usize;
-    let data_start = header.dataoffset as usize;
+    let data_size = crate::bytes::to_usize(header.datasize);
+    let data_start = crate::bytes::to_usize(header.dataoffset);
     let num_chunks = data_size.div_ceil(chunk_size);
 
     let mut plaintext = Vec::with_capacity(crate::cap_prealloc(data_size));
     let mut chunk_buf = vec![0u8; chunk_size];
 
     for chunk_no in 0..num_chunks {
-        let src_start = data_start + chunk_no * chunk_size;
-        let src_end = (src_start + chunk_size).min(data.len());
-        if src_start >= data.len() {
+        let src_start = chunk_no
+            .checked_mul(chunk_size)
+            .and_then(|n| n.checked_add(data_start))
+            .filter(|&s| s < data.len());
+        let Some(src_start) = src_start else {
             break;
-        }
-        let src_len = src_end - src_start;
+        };
+        let src_end = src_start.saturating_add(chunk_size).min(data.len());
+        let src_len = src_end.saturating_sub(src_start);
         chunk_buf[..src_len].copy_from_slice(&data[src_start..src_end]);
         if src_len < chunk_size {
             // Last chunk may be short; pad with zeros for decryption.
@@ -305,7 +312,7 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
         type Aes128Cbc = cbc::Decryptor<aes::Aes128>;
         type Aes256Cbc = cbc::Decryptor<aes::Aes256>;
 
-        let remain = data_size - plaintext.len();
+        let remain = data_size.saturating_sub(plaintext.len());
         let to_write = remain.min(chunk_size);
 
         if aes_key_bytes == 16 {
@@ -387,7 +394,8 @@ fn decrypt_image(
             };
             // A right password gives a koly trailer or a filesystem.
             let has_koly = decrypted.len() >= 512
-                && &decrypted[decrypted.len() - 512..decrypted.len() - 508] == KOLY_SIG;
+                && crate::bytes::at(&decrypted, decrypted.len().saturating_sub(512), 4)
+                    == Some(KOLY_SIG.as_slice());
             let has_fs =
                 find_hfs_offset(&decrypted).is_some() || find_apfs_offset(&decrypted).is_some();
             if has_koly || has_fs {
@@ -545,7 +553,7 @@ struct Capped {
 
 impl std::io::Write for Capped {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        if (self.data.len() + b.len()) as u64 > self.cap {
+        if (self.data.len() as u64).saturating_add(b.len() as u64) > self.cap {
             self.over = true;
             return Err(std::io::Error::other("over the buffer limit"));
         }
@@ -596,7 +604,9 @@ impl<D: Seek> Seek for Part<D> {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
+// The tests lay out their inputs by index arithmetic on small constants.
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
 
@@ -670,6 +680,29 @@ mod tests {
             bad[at..at + 4].copy_from_slice(&v.to_be_bytes());
             assert!(parse_encrypted_header(&bad).is_err(), "size at {at}");
         }
+    }
+
+    /// A data offset at the top of the range ends the chunk loop; it used to
+    /// overflow the chunk position, whatever the password (the keyblob is
+    /// decrypted without padding, so a wrong one still reaches the loop).
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn a_data_offset_at_the_top_of_the_range_ends_the_decryption() {
+        let mut h = vec![0u8; 264];
+        h[..8].copy_from_slice(b"encrcdsa");
+        let put32 =
+            |h: &mut Vec<u8>, at: usize, v: u32| h[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        put32(&mut h, 8, 2); // version
+        put32(&mut h, 24, 128); // AES key bits
+        put32(&mut h, 32, 160); // HMAC key bits
+        put32(&mut h, 52, 4096); // blocksize
+        h[56..64].copy_from_slice(&8192u64.to_be_bytes()); // datasize
+        h[64..72].copy_from_slice(&0xFFFF_FFFF_FFFF_F000u64.to_be_bytes()); // dataoffset
+        put32(&mut h, 104, 1); // kdf iterations
+        put32(&mut h, 196, 64); // keyblob size
+        h.resize(8192, 0);
+        let out = try_decrypt_dmg(&h, "any").expect("the walk ends with nothing decrypted");
+        assert!(out.is_empty());
     }
 
     /// Write a well-formed HFS+ volume header at `off`.

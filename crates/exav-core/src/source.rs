@@ -178,7 +178,9 @@ mod http {
                     "seek before start",
                 ));
             }
-            self.pos = target as u64;
+            self.pos = u64::try_from(target).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek past the largest offset")
+            })?;
             Ok(self.pos)
         }
     }
@@ -251,6 +253,16 @@ mod tests {
         r.seek(SeekFrom::Start(0)).unwrap();
         r.read_to_end(&mut all).unwrap();
         assert_eq!(all, body);
+    }
+
+    /// A seek past the largest offset is refused, not wrapped to a small one.
+    #[test]
+    fn a_seek_past_u64_is_an_error_not_a_wrap() {
+        let body: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let mut r = HttpRangeReader::open(&serve(body, false)).unwrap();
+        assert_eq!(r.seek(SeekFrom::Start(u64::MAX)).unwrap(), u64::MAX);
+        assert!(r.seek(SeekFrom::Current(2)).is_err());
+        assert_eq!(r.seek(SeekFrom::Start(5)).unwrap(), 5);
     }
 
     /// A server that answers a range with the whole object is not read as

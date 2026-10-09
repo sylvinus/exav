@@ -919,7 +919,9 @@ impl<R: Read + Seek> Decoder<R> {
 
         let strips = match self.image().planar_config {
             PlanarConfiguration::Chunky => height / rows_per_strip,
-            PlanarConfiguration::Planar => height / rows_per_strip * self.image().samples as u32,
+            PlanarConfiguration::Planar => (height / rows_per_strip)
+                .checked_mul(u32::from(self.image().samples))
+                .ok_or(TiffError::IntSizeError)?,
         };
 
         Ok(strips)

@@ -77,9 +77,9 @@ impl<F: Fetch> Read for Windowed<F> {
 impl<F: Fetch> Seek for Windowed<F> {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let at = match to {
-            SeekFrom::Start(n) => n as i64,
-            SeekFrom::End(n) => self.src.len() as i64 + n,
-            SeekFrom::Current(n) => self.pos as i64 + n,
+            SeekFrom::Start(n) => i128::from(n),
+            SeekFrom::End(n) => i128::from(self.src.len()) + i128::from(n),
+            SeekFrom::Current(n) => i128::from(self.pos) + i128::from(n),
         };
         if at < 0 {
             return Err(io::Error::other("seek before the start of the archive"));
@@ -87,7 +87,7 @@ impl<F: Fetch> Seek for Windowed<F> {
         // Seeking PAST the end is legal and reads nothing; the next `read`
         // returns zero bytes. Refusing here would reject a reader that seeks to
         // a computed offset before checking it.
-        self.pos = at as u64;
+        self.pos = u64::try_from(at).map_err(|_| io::Error::other("seek past the largest offset"))?;
         Ok(self.pos)
     }
 }

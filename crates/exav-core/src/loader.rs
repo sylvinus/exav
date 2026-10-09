@@ -145,9 +145,27 @@ pub struct Builder {
     /// path. Kept so a directory holding nothing else is an error rather than
     /// the built-in baseline.
     prebuilt_skipped: Option<std::path::PathBuf>,
+    /// Bytes of signature text taken by [`Self::add_path`] so far.
+    loaded: u64,
 }
 
+/// The signature text one builder takes from files. The engine's name, anchor
+/// and hash tables address their text with `u32` offsets, which they cannot
+/// outgrow while the text they are made from fits in one.
+const MAX_TOTAL_TEXT: u64 = u32::MAX as u64;
+
 impl Builder {
+    /// Count `n` more bytes of signature text from `path`.
+    fn take_text(&mut self, path: &Path, n: u64) -> Result<(), LoadError> {
+        self.loaded = self.loaded.saturating_add(n);
+        if self.loaded > MAX_TOTAL_TEXT {
+            return Err(LoadError::TooLarge {
+                path: path.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -226,6 +244,7 @@ impl Builder {
                 // keep their names verbatim (no `.UNOFFICIAL`).
                 let data = read_capped(path)?;
                 let (hdr, files) = cvd::read(&data).map_err(LoadError::Container)?;
+                self.take_text(path, files.iter().map(|f| f.data.len() as u64).sum())?;
                 // Track the newest container (highest version) so the daemon's
                 // clamd-compatible VERSION reply can report the daily set's
                 // version/build-time (what `clamdtop` displays as DBVER/DBTIME).
@@ -244,6 +263,7 @@ impl Builder {
             e if SIGNATURE_EXTENSIONS.contains(&e) => {
                 // A loose signature file is unofficial (not a signed container).
                 let data = read_capped(path)?;
+                self.take_text(path, data.len() as u64)?;
                 self.add_named_text(name, &String::from_utf8_lossy(&data), false);
                 Ok(())
             }
@@ -598,6 +618,26 @@ mod tests {
 
     /// `.msu` is ClamAV's PUA section-hash set, loaded like `.msb` and, like
     /// every `.??u` set, only when PUA detection is on.
+    /// The tables address their text with `u32`: files past that much text in
+    /// all are refused, not loaded into tables whose offsets would wrap.
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "host filesystem/tempdir unavailable under WASI"
+    )]
+    fn signature_text_past_u32_in_all_is_refused() {
+        let dir = std::env::temp_dir().join(format!("exav-loader-total-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.ndb");
+        std::fs::write(&file, b"Test.X:0:*:4142434445464748\n").unwrap();
+        let mut b = Builder::new();
+        b.loaded = MAX_TOTAL_TEXT - 100;
+        assert!(b.add_path(&file).is_ok());
+        b.loaded = MAX_TOTAL_TEXT - 10;
+        assert!(matches!(b.add_path(&file), Err(LoadError::TooLarge { .. })));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn msu_loads_as_pua_section_hashes() {
         let line = b"4096:d41d8cd98f00b204e9800998ecf8427e:PUA.Test.Section\n";

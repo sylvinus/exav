@@ -13,6 +13,15 @@ use super::fill::IslandStyle;
 /// over a huge region cannot lock up the tessellator.
 const MAX_PATTERN_SEGMENTS: usize = 40_000;
 
+/// Pattern line families taken from one hatch; the real patterns have a few
+/// dozen. Each is compared with the ones before it, and walks the region.
+const MAX_PATTERN_LINES: usize = 1024;
+
+/// Boundary edges visited in all by one hatch's scan lines. Each scan line
+/// visits every edge of the region, so the segment cap alone leaves it at
+/// 40,000 scan lines times the edges of a boundary of millions of them.
+const MAX_PATTERN_EDGE_VISITS: u64 = 100_000_000;
+
 /// One closed boundary loop, already flattened to points.
 pub type Loop = Vec<[f64; 2]>;
 
@@ -247,6 +256,14 @@ pub fn pattern_segments(
     };
     let mut out: Vec<[[f64; 2]; 2]> = Vec::new();
     let mut inside_loops: Vec<bool> = Vec::new();
+    let too_many_lines = lines.len() > MAX_PATTERN_LINES;
+    let lines = &lines[..lines.len().min(MAX_PATTERN_LINES)];
+    let edges: u64 = loops
+        .iter()
+        .filter(|l| l.len() >= 3)
+        .map(|l| l.len() as u64)
+        .sum();
+    let mut visits = 0u64;
 
     // ANSI32 and friends declare two families that differ only in base point.
     // Where a file repeats a family outright, drawing it twice doubles the ink
@@ -300,6 +317,10 @@ pub fn pattern_segments(
         }
 
         for k in k0..=k1 {
+            visits = visits.saturating_add(edges);
+            if visits > MAX_PATTERN_EDGE_VISITS {
+                return (out, true);
+            }
             let origin = [
                 line.base[0] + k as f64 * line.offset[0],
                 line.base[1] + k as f64 * line.offset[1],
@@ -341,7 +362,7 @@ pub fn pattern_segments(
         }
     }
 
-    (out, false)
+    (out, too_many_lines)
 }
 
 #[cfg(test)]
@@ -437,6 +458,55 @@ mod tests {
                 "should end at the right edge"
             );
         }
+    }
+
+    /// Every scan line visits every edge of the boundary: 20,000 lines over
+    /// 100,000 edges was two billion visits, for a hatch the segment cap
+    /// alone does not stop.
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "timing")]
+    fn a_boundary_of_many_edges_is_cut_short_not_walked_for_every_scan_line() {
+        let ring: Loop = (0..100_000)
+            .map(|i| {
+                let a = f64::from(i) / 100_000.0 * std::f64::consts::TAU;
+                [500.0 * a.cos(), 500.0 * a.sin()]
+            })
+            .collect();
+        let line = PatternLine {
+            angle: 0.0,
+            base: [0.0, 0.0],
+            offset: [0.0, 0.05],
+            dashes: vec![],
+        };
+        let t = std::time::Instant::now();
+        let (segs, truncated) = pattern_segments(&[ring], &[line], IslandStyle::Normal);
+        assert!(truncated);
+        assert!(!segs.is_empty());
+        assert!(t.elapsed().as_secs() < 3, "took {:?}", t.elapsed());
+    }
+
+    /// A hatch has a few dozen pattern lines; each is compared with the ones
+    /// before it and walks the region, so those past the cap are dropped and
+    /// the pattern reported as incomplete.
+    #[test]
+    fn pattern_lines_past_the_cap_are_reported_as_incomplete() {
+        let sq = square(0.0, 0.0, 1.0);
+        let lines: Vec<PatternLine> = (0..MAX_PATTERN_LINES + 10)
+            .map(|i| PatternLine {
+                angle: 0.0,
+                base: [0.0, i as f64 * 1e-3],
+                offset: [0.0, 10.0],
+                dashes: vec![],
+            })
+            .collect();
+        let (_, truncated) = pattern_segments(
+            &[sq.clone()],
+            &lines[..MAX_PATTERN_LINES],
+            IslandStyle::Normal,
+        );
+        assert!(!truncated, "at the cap");
+        let (_, truncated) = pattern_segments(&[sq], &lines, IslandStyle::Normal);
+        assert!(truncated, "past it");
     }
 
     #[test]

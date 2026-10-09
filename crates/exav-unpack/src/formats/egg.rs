@@ -35,12 +35,11 @@ const AZO: u8 = 3;
 const LZMA: u8 = 4;
 
 fn le_u32(d: &[u8], at: usize) -> Option<u32> {
-    d.get(at..at + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    crate::bytes::at(d, at, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn le_u16(d: &[u8], at: usize) -> Option<u16> {
-    d.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    crate::bytes::at(d, at, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
 /// One extension field, already located by its magic.
@@ -60,15 +59,16 @@ fn field(d: &[u8], at: usize) -> Option<Field> {
     if magic == END {
         return None;
     }
-    let flags = *d.get(at + 4)?;
+    let flags = *d.get(at.checked_add(4)?)?;
     // Bit 0 selects a 4-byte length; everything else in the flag byte is the
     // field's own business and must not change how far to skip.
+    let len_at = at.checked_add(5)?;
     let (len, hdr) = if flags & 0x01 != 0 {
-        (le_u32(d, at + 5)? as usize, 9)
+        (le_u32(d, len_at)? as usize, 9)
     } else {
-        (le_u16(d, at + 5)? as usize, 7)
+        (le_u16(d, len_at)? as usize, 7)
     };
-    let body = at + hdr;
+    let body = at.checked_add(hdr)?;
     Some(Field {
         magic,
         body,
@@ -99,7 +99,7 @@ fn extension_run(d: &[u8], mut at: usize) -> (usize, Option<String>, bool) {
         at = f.next;
     }
     // Past the stop marker, when there is one.
-    (at + 4, name, encrypted)
+    (at.saturating_add(4), name, encrypted)
 }
 
 pub(crate) fn extract_egg<R>(
@@ -121,20 +121,20 @@ pub(crate) fn extract_egg<R>(
     let mut encrypted = global_encrypted;
     let mut index = 0usize;
 
-    while p + 4 <= data.len() {
+    while p.saturating_add(4) <= data.len() {
         let Some(magic) = le_u32(data, p) else { break };
         match magic {
             END => break,
             FILE_HEADER => {
                 // magic(4) file-id(4) file-length(8), then this file's fields.
-                let after = p + 16;
+                let after = p.saturating_add(16);
                 let (next, n, enc) = extension_run(data, after);
                 name = n;
                 encrypted = global_encrypted || enc;
                 p = next;
             }
             BLOCK_HEADER => {
-                let Some(hdr) = data.get(p + 4..p + 18) else {
+                let Some(hdr) = crate::bytes::at(data, p.saturating_add(4), 14) else {
                     break;
                 };
                 let algo = hdr[0];
@@ -142,7 +142,7 @@ pub(crate) fn extract_egg<R>(
                 let comp = u32::from_le_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]) as usize;
                 let crc = u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]);
                 // The block's own extension fields, then its payload.
-                let (body, _, _) = extension_run(data, p + 18);
+                let (body, _, _) = extension_run(data, p.saturating_add(18));
                 let Some(end) = body.checked_add(comp) else {
                     break;
                 };
@@ -310,6 +310,19 @@ mod tests {
     use crate::Limits;
 
     // The magic itself is tested in `formats::sniff`, which owns it.
+
+    /// A field at the top of the address space is past the end of the data,
+    /// whichever way its offsets are added; the run ends there.
+    #[test]
+    fn a_field_at_the_top_of_the_address_space_ends_the_run() {
+        let d = [0u8; 64];
+        for at in [usize::MAX, usize::MAX - 3, usize::MAX - 8] {
+            assert_eq!(le_u32(&d, at), None);
+            assert_eq!(le_u16(&d, at), None);
+            assert!(field(&d, at).is_none());
+            assert_eq!(extension_run(&d, at), (at.saturating_add(4), None, false));
+        }
+    }
 
     fn members(blob: &[u8]) -> Vec<Entry> {
         let mut b = Budget::new(Limits::default());

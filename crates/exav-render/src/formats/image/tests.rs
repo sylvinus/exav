@@ -245,6 +245,32 @@ fn tiff_with(entries: &[(u16, u16, u32, u32)]) -> Vec<u8> {
     tiff
 }
 
+/// A tile 4,294,967,295 wide on an image one pixel wide, floating point, with
+/// the floating point predictor: the decoder sets a buffer aside for one row of
+/// the tile, 51 GB, before it reads anything. It is over the limit asked for,
+/// and said so, not an allocation.
+#[test]
+fn a_tile_row_over_the_limit_is_too_large_before_it_is_allocated() {
+    let file = tiff_with(&[
+        (256, 4, 1, 1),
+        (257, 4, 1, 1),
+        (258, 3, 1, 32),
+        (259, 3, 1, 1),
+        (262, 3, 1, 2),
+        (277, 3, 1, 3),
+        (317, 3, 1, 3),
+        (322, 4, 1, u32::MAX),
+        (323, 4, 1, 1),
+        (324, 4, 1, 8),
+        (325, 4, 1, 1),
+        (339, 3, 1, 3),
+    ]);
+    assert_eq!(
+        decode(&file, Format::Tiff, 16 << 20).err(),
+        Some(Error::TooLarge)
+    );
+}
+
 /// A TIFF's own numbers decide its sizes: counts and products of them that do
 /// not fit are errors, not panics (each of these panicked a build with
 /// overflow checks, or wrapped to a size that passed the consistency check).

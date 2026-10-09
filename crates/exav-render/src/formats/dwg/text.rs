@@ -158,10 +158,13 @@ pub fn wrap_spans(line: &Line, max_cap: f64, f: &Metrics) -> Vec<Line> {
 
     let mut out: Vec<Vec<Span>> = Vec::new();
     let mut at = 0usize;
+    // Indexed by position: `chars().nth` from the start for every line is
+    // quadratic in a long text.
+    let flat_chars: Vec<char> = flat.chars().collect();
     for wrapped in wrap_line(&flat, max_cap, f) {
         let count = wrapped.chars().count();
         // wrap_line only ever drops spaces at a break, so walk past them.
-        while at < owner.len() && flat.chars().nth(at) == Some(' ') && !wrapped.starts_with(' ') {
+        while at < owner.len() && flat_chars.get(at) == Some(&' ') && !wrapped.starts_with(' ') {
             at += 1;
         }
         let mut runs: Vec<Span> = Vec::new();
@@ -747,6 +750,24 @@ mod wrapping {
             bold: false,
             italic: false,
         }))
+    }
+
+    /// Each wrapped line looked up the character at its start by counting from
+    /// the start of the text: a long paragraph in several runs was quadratic.
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "timing")]
+    fn a_long_paragraph_of_several_runs_is_wrapped_in_linear_time() {
+        let f = fixed();
+        let raw = format!("{{\\C7;{}}}{}", "ab ".repeat(40_000), "cd ".repeat(40_000));
+        let lines = mtext_spans(&raw);
+        let t = std::time::Instant::now();
+        let wrapped = wrap_spans(&lines[0], box_for(5), &f);
+        assert!(t.elapsed().as_millis() < 500, "took {:?}", t.elapsed());
+        // Five characters to a line holds "ab ab" and "cd cd": one word is
+        // always left over to the next line's start.
+        assert!(wrapped.len() > 30_000, "{} lines", wrapped.len());
+        let first: String = wrapped[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(first, "ab ab");
     }
 
     /// A box, in cap heights, that admits exactly `chars` monospaced characters

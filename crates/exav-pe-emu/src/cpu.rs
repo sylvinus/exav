@@ -331,6 +331,8 @@ pub struct Cpu {
     /// Set when an x87 computation was approximated rather than emulated. The
     /// unpacker treats a dump produced under approximation as lower confidence.
     pub fpu_approximated: bool,
+    /// Iterations a `rep` string operation completed before it faulted.
+    partial_ticks: u64,
     /// Direct-mapped decode cache, tagged with the memory generation.
     /// Decompression stubs are tight loops, so the same few dozen instructions
     /// are decoded millions of times and caching them removes the decode from
@@ -378,6 +380,7 @@ impl Cpu {
             fpu_cw: 0x037f,
             fpu_last_ip: 0,
             fpu_approximated: false,
+            partial_ticks: 0,
             cache: vec![None; CACHE_SLOTS],
             xmm: [[0u8; 16]; 8],
             mmx: [0u64; 8],
@@ -754,7 +757,11 @@ impl Cpu {
     /// "ticks" it cost — 1 for ordinary instructions, the iteration count for a
     /// `rep`-prefixed string operation, so that a single `rep movsd` moving a
     /// megabyte is charged what it actually costs.
+    ///
+    /// When it returns a fault, `take_partial_ticks` gives what the failed
+    /// instruction had done before it.
     pub fn step(&mut self, mem: &mut Mem) -> Result<u64, Stop> {
+        self.partial_ticks = 0;
         // Invalidation is a *tag* comparison, not a sweep. Self-modifying code
         // is normal here — a packer that decompresses into the pages it is
         // executing from bumps the generation on nearly every write — and
@@ -1595,6 +1602,11 @@ impl Cpu {
         self.write_op(mem, insn, 0, res)
     }
 
+    /// The iterations a faulting `rep` string operation completed, once.
+    pub fn take_partial_ticks(&mut self) -> u64 {
+        std::mem::take(&mut self.partial_ticks)
+    }
+
     // ---- string primitives ---------------------------------------------
 
     /// Execute a `movs`/`stos`/`lods`/`scas`/`cmps`, honouring `rep`. Returns
@@ -1636,37 +1648,46 @@ impl Cpu {
             if repeat && self.regs[ECX] == 0 {
                 break;
             }
-            match kind {
-                StrOp::Movs => {
-                    let v = self.read_mem(mem, self.regs[ESI], size)?;
-                    self.write_mem(mem, self.regs[EDI], size, v)?;
-                    self.regs[ESI] = self.regs[ESI].wrapping_add(delta);
-                    self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
+            let one = (|| -> Result<(), Stop> {
+                match kind {
+                    StrOp::Movs => {
+                        let v = self.read_mem(mem, self.regs[ESI], size)?;
+                        self.write_mem(mem, self.regs[EDI], size, v)?;
+                        self.regs[ESI] = self.regs[ESI].wrapping_add(delta);
+                        self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
+                    }
+                    StrOp::Stos => {
+                        let v = self.regs[EAX] & mask(size);
+                        self.write_mem(mem, self.regs[EDI], size, v)?;
+                        self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
+                    }
+                    StrOp::Lods => {
+                        let v = self.read_mem(mem, self.regs[ESI], size)?;
+                        let keep = self.regs[EAX] & !mask(size);
+                        self.regs[EAX] = keep | v;
+                        self.regs[ESI] = self.regs[ESI].wrapping_add(delta);
+                    }
+                    StrOp::Scas => {
+                        let a = self.regs[EAX] & mask(size);
+                        let b = self.read_mem(mem, self.regs[EDI], size)?;
+                        self.flags_sub(a, b, 0, size);
+                        self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
+                    }
+                    StrOp::Cmps => {
+                        let a = self.read_mem(mem, self.regs[ESI], size)?;
+                        let b = self.read_mem(mem, self.regs[EDI], size)?;
+                        self.flags_sub(a, b, 0, size);
+                        self.regs[ESI] = self.regs[ESI].wrapping_add(delta);
+                        self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
+                    }
                 }
-                StrOp::Stos => {
-                    let v = self.regs[EAX] & mask(size);
-                    self.write_mem(mem, self.regs[EDI], size, v)?;
-                    self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
-                }
-                StrOp::Lods => {
-                    let v = self.read_mem(mem, self.regs[ESI], size)?;
-                    let keep = self.regs[EAX] & !mask(size);
-                    self.regs[EAX] = keep | v;
-                    self.regs[ESI] = self.regs[ESI].wrapping_add(delta);
-                }
-                StrOp::Scas => {
-                    let a = self.regs[EAX] & mask(size);
-                    let b = self.read_mem(mem, self.regs[EDI], size)?;
-                    self.flags_sub(a, b, 0, size);
-                    self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
-                }
-                StrOp::Cmps => {
-                    let a = self.read_mem(mem, self.regs[ESI], size)?;
-                    let b = self.read_mem(mem, self.regs[EDI], size)?;
-                    self.flags_sub(a, b, 0, size);
-                    self.regs[ESI] = self.regs[ESI].wrapping_add(delta);
-                    self.regs[EDI] = self.regs[EDI].wrapping_add(delta);
-                }
+                Ok(())
+            })();
+            if let Err(stop) = one {
+                // A handler may resume the instruction where it faulted, so
+                // the iterations already done are still work done.
+                self.partial_ticks = self.partial_ticks.saturating_add(ticks);
+                return Err(stop);
             }
             ticks += 1;
             if !repeat {

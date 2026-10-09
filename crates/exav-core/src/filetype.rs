@@ -70,7 +70,11 @@ impl FtmMagics {
     /// As [`Self::identify`], over an object that need not be held in memory.
     pub(crate) fn identify_source(&self, data: &dyn ByteSource) -> Option<FileType> {
         for r in &self.rules {
-            let end = r.offset.checked_add(r.magic.len())?;
+            // One rule with an offset past the address space says nothing
+            // about the ones after it.
+            let Some(end) = r.offset.checked_add(r.magic.len()) else {
+                continue;
+            };
             if end <= data.len() && data.window(r.offset, r.magic.len())[..] == r.magic[..] {
                 return Some(r.ft);
             }
@@ -688,6 +692,20 @@ mod tests {
         assert_eq!(ftm.identify(b"From the start"), Some(FileType::Email));
         assert_eq!(ftm.identify(b"%PDF-1.7 ..."), Some(FileType::Pdf));
         assert_eq!(ftm.identify(b"no magic here"), None);
+    }
+
+    /// A rule whose offset is the largest `usize` has no end to compare with;
+    /// the rules after it still apply.
+    #[test]
+    fn a_rule_at_the_top_of_the_address_space_does_not_end_the_search() {
+        let mut ftm = FtmMagics::default();
+        ftm.extend_from_text(&format!(
+            "0:{}:cafe:far:CL_TYPE_ANY:CL_TYPE_MSEXE\n\
+             0:0:255044462d:PDF:CL_TYPE_ANY:CL_TYPE_PDF",
+            usize::MAX
+        ));
+        assert_eq!(ftm.len(), 2);
+        assert_eq!(ftm.identify(b"%PDF-1.7 ..."), Some(FileType::Pdf));
     }
 
     /// ClamAV has no DXF type: an ASCII drawing is text to it, so `Target:7`

@@ -241,6 +241,31 @@ mod tests {
         assert!(joined.windows(15).any(|w| w == b"SECOND-FILE-MAR"));
     }
 
+    /// 150 members of one encrypted solid block (`7z a -ppw -ms=on`). The key
+    /// is derived with 2^19 SHA-256 rounds, and each member derived it again
+    /// for every password up to the right one, with the block decrypted each
+    /// time: 7 seconds for these 150 members, and it grows with their number
+    /// and with the cycles power the archive asks for. Done once per block, it
+    /// is a fraction of a second.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "timing")]
+    fn the_members_of_an_encrypted_solid_block_are_decrypted_once() {
+        let data = fixture("aes_solid_many.7z");
+        let t = std::time::Instant::now();
+        let files = extract_entries_pw(&data, &["a", "b", "c", "d", "pw"]);
+        assert!(t.elapsed().as_secs() < 3, "took {:?}", t.elapsed());
+        assert_eq!(files.len(), 150);
+        for (name, body) in &files {
+            let n = name.trim_start_matches('m').trim_end_matches(".txt");
+            assert_eq!(
+                body,
+                format!("member {n} of the solid block\n").as_bytes(),
+                "{name}"
+            );
+        }
+    }
+
     /// Without a password an AES archive is still reported encrypted/unsupported.
     #[test]
     fn aes_without_password_unsupported() {

@@ -112,6 +112,13 @@ pub const DEFAULT_MAX_TRIANGLES: usize = 6_000_000;
 /// Faces meeting at a smaller angle are shaded smooth and not outlined.
 pub(crate) const CREASE_DEGREES: f64 = 30.0;
 
+/// Faces around a vertex averaged for its smooth normal. Each corner is
+/// compared with every face at its vertex, so the work for a fan of `n` faces
+/// around one vertex is `n` squared; real meshes have a few to a few dozen
+/// there. Past the window the face's own normal is added and the rest
+/// left out.
+const MAX_SHADED_FACES: usize = 256;
+
 /// One coloured mesh of an element, in model coordinates relative to the
 /// scene origin.
 pub(crate) struct Part {
@@ -160,7 +167,7 @@ impl SceneBuilder {
     pub fn add(&mut self, mut element: Element, parts: Vec<Part>) -> bool {
         let total: usize = parts.iter().map(|p| p.triangles.len()).sum();
         if total > self.budget {
-            self.scene.warnings.truncated += 1;
+            self.scene.warnings.truncated = self.scene.warnings.truncated.saturating_add(1);
             return false;
         }
         for part in parts {
@@ -330,11 +337,16 @@ fn finish(part: &Part) -> Finished {
         let n = face_n[i];
         for &v in &corner_w[i] {
             let mut s = [0.0f64; 3];
-            for &j in &around[start[v as usize] as usize..start[v as usize + 1] as usize] {
+            let faces = &around[start[v as usize] as usize..start[v as usize + 1] as usize];
+            let window = &faces[..faces.len().min(MAX_SHADED_FACES)];
+            for &j in window {
                 let m = face_n[j as usize];
                 if dot(n, m) >= cos_crease {
                     s = [s[0] + m[0], s[1] + m[1], s[2] + m[2]];
                 }
+            }
+            if window.len() < faces.len() && !window.contains(&(i as u32)) {
+                s = [s[0] + n[0], s[1] + n[1], s[2] + n[2]];
             }
             let len = dot(s, s).sqrt();
             let sn = if len > 1e-12 {
@@ -446,6 +458,35 @@ mod tests {
         // Four corners per face, each with the face's own normal.
         assert_eq!(f.positions.len() / 3, 24);
         assert_eq!(f.edges.len() / 6, 12);
+    }
+
+    /// A fan of 100,000 faces around one vertex compared each corner with
+    /// every face at the vertex, ten billion dot products.
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "timing")]
+    fn a_fan_of_many_faces_around_one_vertex_is_shaded_in_bounded_time() {
+        let n = 100_000u32;
+        let mut positions = vec![[0.0, 0.0, 0.0]];
+        for k in 0..n {
+            let a = f64::from(k) / f64::from(n) * std::f64::consts::TAU;
+            positions.push([a.cos(), a.sin(), 0.0]);
+        }
+        let triangles = (0..n).map(|k| [0, 1 + k, 1 + (k + 1) % n]).collect();
+        let part = Part {
+            color: None,
+            positions,
+            triangles,
+            solid: false,
+            edges: false,
+        };
+        let t = std::time::Instant::now();
+        let f = finish(&part);
+        assert!(t.elapsed().as_secs() < 2, "took {:?}", t.elapsed());
+        assert_eq!(f.indices.len(), 3 * n as usize);
+        // A flat fan: every normal is the plane's.
+        for nrm in f.normals.chunks(3) {
+            assert!((nrm[2] - 1.0).abs() < 1e-5, "normal {nrm:?}");
+        }
     }
 
     #[test]

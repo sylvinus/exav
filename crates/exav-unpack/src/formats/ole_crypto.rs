@@ -203,15 +203,16 @@ fn parse_filepass(stream: &[u8]) -> Option<FilePass> {
         // then EncryptionVerifier{SaltSize(4) Salt EncVerifier(16) HashSize(4) Hash}.
         let hdr_meta = rec.get(6..14)?;
         let header_size = u32::from_le_bytes(hdr_meta[4..8].try_into().ok()?) as usize;
-        let header = rec.get(14..14 + header_size)?;
+        let header = crate::bytes::at(rec, 14, header_size)?;
         let key_bits = u32::from_le_bytes(header.get(16..20)?.try_into().ok()?);
-        let v = rec.get(14 + header_size..)?;
+        let v = rec.get(14usize.checked_add(header_size)?..)?;
         let salt_size = u32::from_le_bytes(v.get(0..4)?.try_into().ok()?) as usize;
-        let salt = v.get(4..4 + salt_size)?.to_vec();
-        let enc_verifier = v.get(4 + salt_size..4 + salt_size + 16)?.to_vec();
-        let vh = 4 + salt_size + 16;
-        let vhash_size = u32::from_le_bytes(v.get(vh..vh + 4)?.try_into().ok()?) as usize;
-        let enc_vhash = v.get(vh + 4..vh + 4 + vhash_size)?.to_vec();
+        let salt = crate::bytes::at(v, 4, salt_size)?.to_vec();
+        let ev_off = 4usize.checked_add(salt_size)?;
+        let enc_verifier = crate::bytes::at(v, ev_off, 16)?.to_vec();
+        let vh = ev_off.checked_add(16)?;
+        let vhash_size = u32::from_le_bytes(crate::bytes::at(v, vh, 4)?.try_into().ok()?) as usize;
+        let enc_vhash = crate::bytes::at(v, vh.checked_add(4)?, vhash_size)?.to_vec();
         Some(FilePass {
             salt,
             enc_verifier,
@@ -574,15 +575,16 @@ fn parse_ooxml_standard(info: &[u8]) -> Option<OoxmlStandard> {
         (key_bits / 8) as usize
     };
     // EncryptionVerifier follows the header.
-    let v = info.get(12 + header_size..)?;
+    let v = info.get(12usize.checked_add(header_size)?..)?;
     let salt_size = u32::from_le_bytes(v.get(0..4)?.try_into().ok()?) as usize;
-    let salt = v.get(4..4 + salt_size)?.to_vec();
-    let enc_verifier = v.get(4 + salt_size..4 + salt_size + 16)?.to_vec();
-    let vh_off = 4 + salt_size + 16;
-    let vhash_size = u32::from_le_bytes(v.get(vh_off..vh_off + 4)?.try_into().ok()?) as usize;
+    let salt = crate::bytes::at(v, 4, salt_size)?.to_vec();
+    let ev_off = 4usize.checked_add(salt_size)?;
+    let enc_verifier = crate::bytes::at(v, ev_off, 16)?.to_vec();
+    let vh_off = ev_off.checked_add(16)?;
+    let vhash_size = u32::from_le_bytes(crate::bytes::at(v, vh_off, 4)?.try_into().ok()?) as usize;
     // The stored hash is padded up to the cipher block; read the padded field.
-    let padded = vhash_size.div_ceil(16) * 16;
-    let enc_verifier_hash = v.get(vh_off + 4..vh_off + 4 + padded)?.to_vec();
+    let padded = vhash_size.checked_next_multiple_of(16)?;
+    let enc_verifier_hash = crate::bytes::at(v, vh_off.checked_add(4)?, padded)?.to_vec();
     Some(OoxmlStandard {
         key_bytes,
         salt,

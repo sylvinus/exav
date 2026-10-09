@@ -155,7 +155,7 @@ pub(crate) fn has_packheader_layout(data: &[u8]) -> bool {
         let c_len = u32_le(data, m + 20) as usize;
         if u_len != 0
             && c_len != 0
-            && m + 32 + c_len <= data.len()
+            && c_len <= data.len() - (m + 32)
             && matches!(method, M_NRV2B | M_NRV2D | M_NRV2E)
         {
             return true;

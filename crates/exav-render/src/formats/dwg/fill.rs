@@ -239,6 +239,19 @@ pub fn fill_region(loops: &[Vec<[f64; 2]>], style: IslandStyle) -> Vec<[f64; 2]>
     let mut crossings: Vec<(f64, usize)> = Vec::new();
     let mut inside_loops: Vec<bool> = Vec::new();
 
+    // The edges a band crosses, kept as the bands go up: testing every edge in
+    // every band is quadratic in the boundary. In edge order, as the crossings
+    // of equal height are then ordered as they were by the scan of all edges.
+    let mut by_start: Vec<usize> = (0..edges.len()).collect();
+    by_start.sort_by(|&a, &b| {
+        edges[a]
+            .y0
+            .partial_cmp(&edges[b].y0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut next = 0;
+    let mut active: Vec<usize> = Vec::new();
+
     for w in ys.windows(2) {
         let (ya, yb) = (w[0], w[1]);
         if yb - ya < 1e-12 {
@@ -246,12 +259,20 @@ pub fn fill_region(loops: &[Vec<[f64; 2]>], style: IslandStyle) -> Vec<[f64; 2]>
         }
         let mid = (ya + yb) * 0.5;
 
+        let before = active.len();
+        while next < by_start.len() && edges[by_start[next]].y0 <= mid {
+            active.push(by_start[next]);
+            next += 1;
+        }
+        let started = active.len() > before;
+        // Half-open in y, so a vertex shared by two edges is counted once.
+        active.retain(|&i| edges[i].y1 > mid);
+        if started {
+            active.sort_unstable();
+        }
         crossings.clear();
-        for (i, e) in edges.iter().enumerate() {
-            // Half-open in y, so a vertex shared by two edges is counted once.
-            if e.y0 <= mid && e.y1 > mid {
-                crossings.push((e.x_at(mid), i));
-            }
+        for &i in &active {
+            crossings.push((edges[i].x_at(mid), i));
         }
         if crossings.len() < 2 {
             continue;
@@ -445,6 +466,30 @@ mod tests {
         // Two squares sharing an edge fill their union once, not twice.
         let t = fill_even_odd(&[square(0.0, 0.0, 10.0), square(10.0, 0.0, 10.0)]);
         assert!((area(&t) - 200.0).abs() < 1e-6, "area {}", area(&t));
+    }
+}
+
+#[cfg(test)]
+mod scan_cost {
+    use super::tests_shapes::{area, circle};
+    use super::*;
+
+    /// Each band tested every edge of the boundary for whether it crosses it:
+    /// 60,000 bands over 60,000 edges, though a handful cross any one. The
+    /// area is the polygon's, so the sweep keeps what the scan found.
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "timing")]
+    fn the_bands_of_a_large_boundary_do_not_each_test_all_its_edges() {
+        let n = 60_000;
+        let t = std::time::Instant::now();
+        let tris = fill_even_odd(&[circle(0.0, 0.0, 100.0, n)]);
+        assert!(t.elapsed().as_millis() < 300, "took {:?}", t.elapsed());
+        let polygon = 0.5 * n as f64 * 100.0 * 100.0 * (std::f64::consts::TAU / n as f64).sin();
+        let got = area(&tris);
+        assert!(
+            (got - polygon).abs() < polygon * 1e-6,
+            "area {got}, polygon {polygon}"
+        );
     }
 }
 

@@ -72,6 +72,9 @@ salzweg = { version = "0.1", optional = true }
 # InstallShield `.z` reader. Its only real dep is `explode` (MIT), a leaf
 # decoder for the PKWARE DCL "implode" codec those archives use.
 unshield = { version = "0.2", default-features = false, optional = true }
+# The same decoder, read through a cap of our own: `unshield` only gives a
+# member whole, whatever it expands to.
+explode = { version = "0.1", optional = true }
 # structured documents that contain embedded files
 cfb = { version = "0.14.0", optional = true }
 # AutoCAD drawings before 2007 are in the code page `$DWGCODEPAGE` names,
@@ -231,7 +234,7 @@ ext = ["dep:ext4-view"]
 zoo = ["dep:salzweg", "dep:delharc"]
 # InstallShield `.z`. NOT the `ISc(` InstallScript cabinet, whose only
 # implementation is LGPL and which stays recognised-but-unopened.
-ishieldz = ["dep:unshield"]
+ishieldz = ["dep:unshield", "dep:explode"]
 inno = []
 # NTFS is walked through the MFT rather than as a filesystem tree: a scanner
 # wants every file's bytes, and the MFT also still holds deleted records.

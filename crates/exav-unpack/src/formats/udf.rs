@@ -35,6 +35,10 @@
 //! file over as the runs of bytes it occupies, which the two drivers either
 //! copy out or stream.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -98,19 +102,19 @@ const LVD_READ: usize = 440 + 64 * 256;
 const FE_READ: usize = 216;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
 
 fn le_u64(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    crate::bytes::at(d, off, 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         .unwrap_or(0)
 }
@@ -119,9 +123,12 @@ fn le_u64(d: &[u8], off: usize) -> u64 {
 /// starts at sector 16 and each entry is a 2048-byte descriptor whose identifier
 /// sits at offset 1.
 pub(crate) fn has_udf(data: &[u8]) -> bool {
-    (16..32).any(|s| {
-        let o = (s * SECTOR + 1) as usize;
-        matches!(data.get(o..o + 5), Some(b"NSR02") | Some(b"NSR03"))
+    (16..32u64).any(|s| {
+        let o = crate::bytes::to_usize(s.saturating_mul(SECTOR).saturating_add(1));
+        matches!(
+            crate::bytes::at(data, o, 5),
+            Some(b"NSR02") | Some(b"NSR03")
+        )
     })
 }
 
@@ -233,27 +240,30 @@ impl Volume {
     /// The runs of the image holding `len` bytes from `addr`. `None` when its
     /// partition cannot be followed, or the range runs past the metadata file.
     fn locate(&self, addr: Addr, len: u64) -> Option<Vec<Run>> {
-        let off = (addr.lbn as u64) * self.block_size;
+        let off = (addr.lbn as u64).checked_mul(self.block_size)?;
         match self.maps.get(addr.part as usize)? {
             Map::Physical { start, .. } => Some(vec![Run {
-                at: Some(start + off),
+                at: Some(start.checked_add(off)?),
                 len,
             }]),
             Map::Metadata(runs) => {
-                let end = off + len;
+                let end = off.checked_add(len)?;
                 let mut pos = off;
-                let mut i = runs.partition_point(|(s, r)| s + r.len <= pos);
+                let mut i = runs.partition_point(|(s, r)| s.saturating_add(r.len) <= pos);
                 let mut out = Vec::new();
                 while pos < end {
                     let (s, r) = runs.get(i)?;
-                    let skip = pos - s;
-                    let take = (r.len - skip).min(end - pos);
+                    let skip = pos.checked_sub(*s)?;
+                    let take = r.len.checked_sub(skip)?.min(end.saturating_sub(pos));
                     out.push(Run {
-                        at: r.at.map(|a| a + skip),
+                        at: match r.at {
+                            Some(a) => Some(a.checked_add(skip)?),
+                            None => None,
+                        },
                         len: take,
                     });
-                    pos += take;
-                    i += 1;
+                    pos = pos.saturating_add(take);
+                    i = i.saturating_add(1);
                 }
                 Some(out)
             }
@@ -282,7 +292,7 @@ fn volume(img: &mut dyn Image) -> Result<Volume, Stop> {
         sectors.saturating_sub(1),
         sectors.saturating_sub(257),
     ] {
-        let d = img.read(s * SECTOR, 24)?;
+        let d = img.read(s.saturating_mul(SECTOR), 24)?;
         if le_u16(&d, 0) == TAG_ANCHOR {
             // The anchor's first field is the extent holding the descriptor
             // sequence.
@@ -341,20 +351,23 @@ fn volume(img: &mut dyn Image) -> Result<Volume, Stop> {
     let mut at = 440;
     for _ in 0..map_count.min(64) {
         let kind = d.get(at).copied().unwrap_or(0);
-        let len = d.get(at + 1).copied().unwrap_or(0) as usize;
+        let len = d.get(at.saturating_add(1)).copied().unwrap_or(0) as usize;
         if len == 0 {
             break;
         }
-        let m = d.get(at..at + len).unwrap_or(&[]);
+        let m = crate::bytes::at(&d, at, len).unwrap_or(&[]);
         let ident = m.get(5..28).unwrap_or(&[]);
-        let ident = &ident[..ident.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1)];
+        let ident = &ident[..ident
+            .iter()
+            .rposition(|&b| b != 0)
+            .map_or(0, |p| p.saturating_add(1))];
         maps.push(match (kind, ident) {
             (1, _) => {
                 let number = le_u16(m, 4);
                 match partitions.iter().find(|(n, _)| *n == number) {
                     Some(&(_, start)) => Map::Physical {
                         number,
-                        start: start * SECTOR,
+                        start: start.saturating_mul(SECTOR),
                     },
                     None => {
                         Map::Unreadable("UDF partition map names a partition not in this volume")
@@ -373,7 +386,7 @@ fn volume(img: &mut dyn Image) -> Result<Volume, Stop> {
             }
             _ => Map::Unreadable("UDF partition map of a kind exav does not know"),
         });
-        at += len;
+        at = at.saturating_add(len);
     }
 
     let mut vol = Volume {
@@ -420,13 +433,13 @@ fn metadata_map(
         let Some(layout) = layout(img, vol, fe, physical, &fe_head, file_type)? else {
             continue;
         };
-        let mut start = 0;
+        let mut start = 0u64;
         let runs = layout
             .runs
             .into_iter()
             .map(|r| {
                 let s = start;
-                start += r.len;
+                start = start.saturating_add(r.len);
                 (s, r)
             })
             .collect();
@@ -469,23 +482,23 @@ fn extents(
     // Bounded because a malformed continuation can point back at itself.
     for _ in 0..MAX_EXTENTS {
         let span = len.min(ad_bytes);
-        ad_bytes -= span;
-        let ads = img.read(area, span as usize)?;
+        ad_bytes = ad_bytes.saturating_sub(span);
+        let ads = img.read(area, crate::bytes::to_usize(span))?;
         let mut consumed = 0u64;
         let mut next: Option<(Addr, u64)> = None;
-        while consumed + size <= span {
+        while consumed.saturating_add(size) <= span {
             if out.len() == MAX_EXTENTS {
                 return Ok(Some((out, false)));
             }
-            let o = consumed as usize;
-            consumed += size;
+            let o = crate::bytes::to_usize(consumed);
+            consumed = consumed.saturating_add(size);
             let raw_len = le_u32(&ads, o);
             let kind = raw_len >> 30;
             let length = raw_len & 0x3FFF_FFFF;
             let addr = Addr {
-                lbn: le_u32(&ads, o + 4),
+                lbn: le_u32(&ads, o.saturating_add(4)),
                 part: if ad_kind == AD_LONG {
-                    le_u16(&ads, o + 8)
+                    le_u16(&ads, o.saturating_add(8))
                 } else {
                     part
                 },
@@ -536,8 +549,13 @@ fn ad_area(fe_head: &[u8], fe: u64) -> (u64, u64) {
     let extended = le_u16(fe_head, 0) == TAG_EXTENDED_FILE_ENTRY;
     let base = if extended { 208 } else { 168 };
     let ea_len = le_u32(fe_head, base) as u64;
-    let ad_len = le_u32(fe_head, base + 4) as u64;
-    (fe + base as u64 + 8 + ea_len, ad_len)
+    let ad_len = le_u32(fe_head, base.saturating_add(4)) as u64;
+    (
+        fe.saturating_add(base as u64)
+            .saturating_add(8)
+            .saturating_add(ea_len),
+        ad_len,
+    )
 }
 
 /// The **absolute sector** of a file's first recorded extent, used to recognise a
@@ -615,7 +633,7 @@ fn layout(
         if size >= info_len {
             break;
         }
-        let want = (e.length as u64).min(info_len - size);
+        let want = (e.length as u64).min(info_len.saturating_sub(size));
         if e.kind != EXTENT_RECORDED {
             // Allocated but never written: it reads as zeroes on the victim's
             // machine too, so there is nothing hidden here.
@@ -623,7 +641,7 @@ fn layout(
                 at: None,
                 len: want,
             });
-            size += want;
+            size = size.saturating_add(want);
             continue;
         }
         // Several pieces when the extent is in a metadata partition whose file
@@ -641,7 +659,7 @@ fn layout(
             {
                 break 'extents;
             }
-            size += piece.len;
+            size = size.saturating_add(piece.len);
             runs.push(piece);
         }
     }
@@ -657,8 +675,8 @@ fn read_runs(img: &mut dyn Image, runs: &[Run]) -> Result<Vec<u8>, LimitHit> {
     let mut out = Vec::new();
     for r in runs {
         match r.at {
-            None => out.resize(out.len() + r.len as usize, 0),
-            Some(at) => out.extend_from_slice(&img.read(at, r.len as usize)?),
+            None => out.resize(out.len().saturating_add(crate::bytes::to_usize(r.len)), 0),
+            Some(at) => out.extend_from_slice(&img.read(at, crate::bytes::to_usize(r.len))?),
         }
     }
     Ok(out)
@@ -691,7 +709,7 @@ impl Read for RunReader<'_> {
                                 .read(at, want)
                                 .map_err(|e| io::Error::other(e.reason))?;
                             buf[..got.len()].copy_from_slice(&got);
-                            run.at = Some(at + got.len() as u64);
+                            run.at = Some(at.saturating_add(got.len() as u64));
                             got.len()
                         }
                     };
@@ -699,7 +717,7 @@ impl Read for RunReader<'_> {
                     if n == 0 {
                         return Ok(0);
                     }
-                    run.len -= n as u64;
+                    run.len = run.len.saturating_sub(n as u64);
                     return Ok(n);
                 }
                 _ => match self.runs.next() {
@@ -791,7 +809,7 @@ fn walk<T>(
     let mut visited_icbs: HashSet<Addr> = HashSet::new();
 
     while let Some(dir) = queue.pop() {
-        walked += 1;
+        walked = walked.saturating_add(1);
         if walked > MAX_DIRS {
             emit!(unreadable(
                 format!("<udf-directories-beyond-{MAX_DIRS}>"),
@@ -979,24 +997,24 @@ struct Fid {
 fn read_fids(dir: &[u8], parent: &str) -> Vec<Fid> {
     let mut out = Vec::new();
     let mut p = 0usize;
-    while p + 38 <= dir.len() {
+    while p.saturating_add(38) <= dir.len() {
         if le_u16(dir, p) != TAG_FILE_IDENTIFIER {
             break;
         }
-        let characteristics = dir.get(p + 18).copied().unwrap_or(0);
-        let name_len = dir.get(p + 19).copied().unwrap_or(0) as usize;
+        let characteristics = dir.get(p.saturating_add(18)).copied().unwrap_or(0);
+        let name_len = dir.get(p.saturating_add(19)).copied().unwrap_or(0) as usize;
         // The ICB field is a long_ad: extent length, then block and partition.
         let icb = Addr {
-            lbn: le_u32(dir, p + 24),
-            part: le_u16(dir, p + 28),
+            lbn: le_u32(dir, p.saturating_add(24)),
+            part: le_u16(dir, p.saturating_add(28)),
         };
-        let impl_len = le_u16(dir, p + 36) as usize;
-        let name_at = p + 38 + impl_len;
-        let total = 38 + impl_len + name_len;
+        let impl_len = le_u16(dir, p.saturating_add(36)) as usize;
+        let name_at = p.saturating_add(38).saturating_add(impl_len);
+        let total = impl_len.saturating_add(38).saturating_add(name_len);
 
         // `..` carries no name and points back up the tree.
         if characteristics & FID_PARENT == 0 && name_len > 0 {
-            if let Some(raw) = dir.get(name_at..name_at + name_len) {
+            if let Some(raw) = crate::bytes::at(dir, name_at, name_len) {
                 let name = decode_name(raw);
                 let path = if parent.is_empty() {
                     name
@@ -1011,11 +1029,11 @@ fn read_fids(dir: &[u8], parent: &str) -> Vec<Fid> {
             }
         }
         // Descriptors are padded to a four-byte boundary.
-        let step = total.div_ceil(4) * 4;
+        let step = total.div_ceil(4).saturating_mul(4);
         if step == 0 {
             break;
         }
-        p += step;
+        p = p.saturating_add(step);
     }
     out
 }

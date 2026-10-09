@@ -21,6 +21,12 @@ const U64S: [u64; 7] = [
     (1 << 44) - 1,
 ];
 const U32S: [u32; 3] = [u32::MAX, 1 << 31, i32::MAX as u32];
+/// How far past a field a sum with its position is made to wrap: the field
+/// itself, and the offsets the formats read the next thing at.
+const POSITION_OFFSETS: [usize; 4] = [0, 4, 8, 16];
+
+/// What makes a changed input pass its own checks again.
+type Fixup = dyn Fn(&mut [u8]);
 
 /// Whether the walk of `blob` ended in a panic inside the decoder.
 fn panicked(fmt: Format, blob: &[u8]) -> bool {
@@ -40,10 +46,37 @@ fn panicked(fmt: Format, blob: &[u8]) -> bool {
 /// the values above, one at a time, and returns the changes that panicked the
 /// decoder as `"offset width value"`.
 pub fn sweep(fmt: Format, blob: &[u8], regions: &[Range<usize>]) -> Vec<String> {
+    sweep_fixing(fmt, blob, regions, None)
+}
+
+/// [`sweep`] for a format that checks a CRC over its headers: `fix` is run on
+/// the input after each change and makes the checks pass again, or the walk
+/// ends at the first header changed and reaches nothing after it.
+///
+/// Besides the fixed values, each field is set to what makes a sum with its own
+/// position wrap, `2^32` or `2^64` minus the position and a few small offsets
+/// from it: a bound check `position + length` is passed by a length near the
+/// top of the range only for the one place the field sits.
+pub fn sweep_fixing(
+    fmt: Format,
+    blob: &[u8],
+    regions: &[Range<usize>],
+    fix: Option<&Fixup>,
+) -> Vec<String> {
     assert!(!panicked(fmt, blob), "the unmodified input already panics");
     let mut work = blob.to_vec();
     let mut bad = Vec::new();
     let mut try_set = |work: &mut Vec<u8>, at: usize, bytes: &[u8], what: String| {
+        if let Some(fix) = fix {
+            // The fix touches bytes beyond the field: it works on a copy.
+            let mut trial = work.clone();
+            trial[at..at + bytes.len()].copy_from_slice(bytes);
+            fix(&mut trial);
+            if panicked(fmt, &trial) {
+                bad.push(what);
+            }
+            return;
+        }
         let saved = work[at..at + bytes.len()].to_vec();
         work[at..at + bytes.len()].copy_from_slice(bytes);
         if panicked(fmt, work) {
@@ -60,6 +93,12 @@ pub fn sweep(fmt: Format, blob: &[u8], regions: &[Range<usize>]) -> Vec<String> 
                         try_set(&mut work, at, &bytes, format!("{at:#x} u32 {v:#x}"));
                     }
                 }
+                for d in POSITION_OFFSETS {
+                    let v = 0u32.wrapping_sub((at + d) as u32);
+                    for bytes in [v.to_le_bytes(), v.to_be_bytes()] {
+                        try_set(&mut work, at, &bytes, format!("{at:#x} u32 -{:#x}", at + d));
+                    }
+                }
             }
             // Every 4 bytes, not 8: a record inside a resource need not sit on
             // an 8-byte boundary of the file.
@@ -67,6 +106,12 @@ pub fn sweep(fmt: Format, blob: &[u8], regions: &[Range<usize>]) -> Vec<String> 
                 for v in U64S {
                     for bytes in [v.to_le_bytes(), v.to_be_bytes()] {
                         try_set(&mut work, at, &bytes, format!("{at:#x} u64 {v:#x}"));
+                    }
+                }
+                for d in POSITION_OFFSETS {
+                    let v = 0u64.wrapping_sub((at + d) as u64);
+                    for bytes in [v.to_le_bytes(), v.to_be_bytes()] {
+                        try_set(&mut work, at, &bytes, format!("{at:#x} u64 -{:#x}", at + d));
                     }
                 }
             }
@@ -186,6 +231,9 @@ fn other_containers_fields_at_their_extremes() {
         (Format::Upx, "upx_nrv2d.upx"),
         (Format::Upx, "upx_lzma.upx"),
         (Format::Ole, "ole/malformed_dir_order.ole"),
+        (Format::Ole, "xlm_excel4_sample.xls"),
+        (Format::Dmg, "dmg/hfs_plus_udzo.dmg"),
+        (Format::Dmg, "dmg/encrypted.dmg"),
         (Format::Rar, "rar4/solid_x86.rar"),
         (Format::Rar, "rar4/two_windows.rar"),
         (Format::Rar, "rar5/hardlink.rar"),
@@ -243,6 +291,62 @@ fn other_containers_fields_at_their_extremes() {
         );
     }
     none(bad);
+}
+
+/// The header ranges of an ARJ archive and where each one's CRC-32 sits: the
+/// main header, then each member's, with their extended headers.
+fn arj_header_crcs(blob: &[u8]) -> Vec<(Range<usize>, usize)> {
+    let u16_at = |at: usize| u16::from_le_bytes([blob[at], blob[at + 1]]) as usize;
+    let u32_at = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap()) as usize;
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= blob.len() && blob[pos..pos + 2] == [0x60, 0xEA] {
+        let size = u16_at(pos + 2);
+        if size == 0 || pos + 4 + size + 4 > blob.len() {
+            break;
+        }
+        let header = pos + 4..pos + 4 + size;
+        out.push((header.clone(), header.end));
+        pos = header.end + 4;
+        loop {
+            let ext = u16_at(pos);
+            pos += 2;
+            if ext == 0 {
+                break;
+            }
+            out.push((pos..pos + ext, pos + ext));
+            pos += ext + 4;
+        }
+        // The first is the main header; a member's header says how much
+        // packed data follows it.
+        if out.len() > 1 && size >= 16 {
+            pos += u32_at(header.start + 12);
+        }
+    }
+    out
+}
+
+/// ARJ checks a CRC over each header, so a changed field ends the walk at the
+/// first header unless the CRC is made right again.
+#[test]
+fn arj_fields_with_their_crc_made_right_at_their_extremes() {
+    let p = format!("{}/tests/fixtures/sample.arj", env!("CARGO_MANIFEST_DIR"));
+    let blob = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+    let crcs = arj_header_crcs(&blob);
+    assert!(crcs.len() >= 2, "a main header and a member's: {crcs:?}");
+    let fix = move |work: &mut [u8]| {
+        for (range, at) in &crcs {
+            if at + 4 <= work.len() {
+                let crc = crc32fast::hash(&work[range.clone()]);
+                work[*at..*at + 4].copy_from_slice(&crc.to_le_bytes());
+            }
+        }
+    };
+    let whole = Range {
+        start: 0,
+        end: blob.len(),
+    };
+    none(sweep_fixing(Format::Arj, &blob, &[whole], Some(&fix)));
 }
 
 /// A skippable frame ahead of a real one, whose size field is the skip: on a

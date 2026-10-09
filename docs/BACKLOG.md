@@ -108,33 +108,62 @@ filled was lost), LZ4 skippable frames, the ARC, UPX and RAR4 position walks
 (32-bit), the delta and audio RAR filters, OLE crypto lengths and spin count,
 PDF key sizes, the 7z LZMA2 dictionary, split-ZIP offsets, the TIFF strip,
 tile and format counts, DXF group codes, the daemon's scan-time limit and
-build-time year, `-A` in exav-grep, exav-imagehash dimensions. Fixed without a
-test of their own (the input is not practical to build): C14 (HTTP range end),
-C15 (`ml.rs` histogram, needs 4 GiB), E1 (x87 infinity store), T5 to T8
-(JPEG 2000 palette and size sums), R13 (zero-column proxy mesh), R7 (IFC trim
-parameter), `ccitt.rs` stride. Open:
+build-time year, `-A` in exav-grep, exav-imagehash dimensions, the RAR volume
+join, the encrypted DMG chunk loop, the 7z coder chain length, the ISO
+directory loop, the PE resource node loop, the IFC visit budget, the
+`MINSERT` of an empty block, the PDF `find_next_obj` scan, the TIFF tile row
+buffer, the PE emulator's `rep` ticks, the bytecode machine's pointer
+arithmetic and the 32-bit sums of the ARJ, EGG, UDIF and VBA readers. Fixed
+without a test of their own (the input is not practical to build): C14 (HTTP
+range end), C15 (`ml.rs` histogram, needs 4 GiB), E1 (x87 infinity store), T5
+to T8 (JPEG 2000 palette and size sums), T9 (`strip_count`, which nothing
+calls), R13 (zero-column proxy mesh), R7 (IFC trim parameter), `ccitt.rs`
+stride, the BCJ2 position (4 GiB of output), the bytecode layout and version
+sums, the warning counters (R17, 4 billion of them), the `azo.rs` range-coder
+sums and the pin offsets of `engine/pins.rs`. Section 2 of the audit, done
+with tests: a truncated CHM listing entry (the CHM came back clean and
+silent; the files before it are kept and the damage reported), `.ldb`
+expressions nested without limit (a stack overflow), a seek past `u64`, the
+`setitimer` seconds, the `.ftm` rule that ended the search, the pillow
+resampling weights held for the whole image, the memory amplifications (DWG
+object map notes, the InstallShield Z member read through the budget, the
+total of RAR5 and RAR4 key derivations, RAR3 PPMd's memory against the buffer
+limit, the 7z solid block read once instead of once per member). The rest of
+section 2 is done too, with tests: the `as` truncations of the signature
+parser (a fixed gap past `u32`, a count past `u32`), the exav-x86 name tables
+(a cell that names no mnemonic is no instruction, and every cell of the
+generated tables is checked to name one), a stored YARA pattern with a bad
+base64 alphabet or no bytes, the `u32` name, anchor and hash tables (a
+database of more than 4 GiB of text is refused), the JPEG 2000 palette
+planes, the quadratic scans of the DWG linetype, hatch, fill and text code and
+of the mesh normals (a window of 256 faces around a vertex) and the IFC
+cylinder unrolling, the 7z encrypted block decrypted once per block, and the
+PE emulator's open handles, its searches and its module placement.
 
-- **The rest of the audit**: the rows not named above. In section A, C12
-  (bytecode VM sums, contained), D1, E10 (rar join), E14 (bcj2, 7z substream
-  order), T9; in section B, R3 for LZMA, R4, R5, R8 to R12, R14, R16 for the
-  RAR VM, R17; in section C, the 32-bit wraps in arj, egg, vba, udif, ole
-  (other than the two fixed), the rest of rar and upx, dotnet and the bytecode
-  VM. Section C matters most: the wasm builds have no overflow checks.
+Open:
+
+- **A sweep that finds hangs**: the `extreme` suite sets fields to fixed
+  large values and to `2^32` or `2^64` minus the field's own position, and
+  ARJ's CRCs are made right again after each change. It only sees a panic or
+  an abort. A sum that wraps to a smaller position and so loops (the EGG
+  extension walk) is not seen; that one has a unit test at the helper level.
+  A time limit on each run, which the wasm build cannot have without threads,
+  would find the next one.
 - **`crate::bytes::at` everywhere**: `d.get(off..off + n)` is spelled about
   150 times in `exav-unpack` and as many in `exav-core`. Only the disk-image
   formats use the checked form. A mechanical replacement, by a script, wants
   the owner's go-ahead.
-- **`clippy::arithmetic_side_effects`**: denied in `formats/vhd.rs` only. The
-  other disk formats are close (vmdk 12 sites, qcow2 11, vhdx 15), then ntfs
-  (75) and wim (45); the lint is far too noisy for the decoders (2,700 in
-  `exav-unpack`). Extend it file by file as each is cleaned.
+- **`clippy::arithmetic_side_effects`**: denied in the disk-image formats
+  (vhd, vmdk, qcow2, vhdx, ntfs, wim without its two codecs, ext, fat,
+  partition, iso, dmg, udif, udf); the codecs `wim/lzx.rs` and `wim::xpress`
+  allow it. The lint is far too noisy for the other decoders (about 2,500
+  sites in `exav-unpack`). Extend it file by file as each is cleaned.
 - **The wasm32 sweep's samples**: `make test-wasm` runs the `extreme` suite,
-  which covers the disk images and one small sample of 25 other containers
+  which covers the disk images and one small sample of 28 other containers
   (`extreme.rs`). It finds what a single field set to an extreme reaches in
   those samples; a bug behind a field the sample does not use (a split-volume
   RAR, a spanned ZIP, an encrypted container) needs a sample that uses it.
-- **A dmg with `decrypt`** (audit row D1) and the second half of the NTFS
-  attribute-list walk have no test of their own.
+- **The second half of the NTFS attribute-list walk** has no test of its own.
 
 ## Dependencies
 

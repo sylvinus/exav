@@ -17,6 +17,10 @@
 //! Reconstruction emits the guest disk as a single member, which the partition
 //! and filesystem handlers then pick up in the normal way.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// L2 entry bit 62: the cluster is deflate-compressed.
@@ -37,6 +41,12 @@ fn be_u64(d: &[u8], off: usize) -> u64 {
     crate::bytes::at(d, off, 8)
         .map(|b| u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         .unwrap_or(0)
+}
+
+/// The low `bits` bits set.
+fn low_mask(bits: u32) -> u64 {
+    1u64.checked_shl(bits)
+        .map_or(u64::MAX, |m| m.saturating_sub(1))
 }
 
 pub(crate) fn is_qcow2(data: &[u8]) -> bool {
@@ -110,8 +120,8 @@ pub(crate) fn extract_qcow2<R>(
     // Compressed-cluster descriptor split, per the specification: the low
     // `csize_shift` bits are the host offset, the next ones the length in
     // 512-byte sectors minus one.
-    let csize_shift = 62 - (cluster_bits - 8);
-    let csize_mask = (1u64 << (cluster_bits - 8)) - 1;
+    let csize_shift = 62u32.saturating_sub(cluster_bits.saturating_sub(8));
+    let csize_mask = low_mask(cluster_bits.saturating_sub(8));
 
     let mut disk = vec![0u8; want as usize];
     // A cluster whose compressed bytes are *present* but will not inflate is
@@ -126,7 +136,7 @@ pub(crate) fn extract_qcow2<R>(
         if l2_off == 0 {
             continue; // no L2 table: this whole range is unallocated (zeroes)
         }
-        let Some(l2) = crate::bytes::at(data, l2_off, l2_entries * 8) else {
+        let Some(l2) = crate::bytes::at(data, l2_off, l2_entries.saturating_mul(8)) else {
             continue; // L2 table past the end: truncated image
         };
         for (j, l2_chunk) in l2.as_chunks::<8>().0.iter().enumerate() {
@@ -140,18 +150,25 @@ pub(crate) fn extract_qcow2<R>(
             if e == 0 || (!compressed && e & L2_ZERO != 0) {
                 continue; // unallocated or explicitly zero
             }
-            let guest = (i * l2_entries + j).saturating_mul(cluster_size);
+            let guest = i
+                .saturating_mul(l2_entries)
+                .saturating_add(j)
+                .saturating_mul(cluster_size);
             if guest >= disk.len() {
                 continue;
             }
-            let n = cluster_size.min(disk.len() - guest);
+            let n = cluster_size.min(disk.len().saturating_sub(guest));
 
             if compressed {
-                let coffset = (e & ((1u64 << csize_shift) - 1)) as usize;
-                let nb_csectors = ((e >> csize_shift) & csize_mask) as usize + 1;
+                let coffset = crate::bytes::to_usize(e & low_mask(csize_shift));
+                let nb_csectors =
+                    crate::bytes::to_usize(e.checked_shr(csize_shift).unwrap_or(0) & csize_mask)
+                        .saturating_add(1);
                 // The run starts mid-sector, so the first partial sector counts
                 // against the total length.
-                let csize = nb_csectors * 512 - (coffset & 511);
+                let csize = nb_csectors
+                    .saturating_mul(512)
+                    .saturating_sub(coffset & 511);
                 let Some(raw) = data.get(coffset..coffset.saturating_add(csize).min(data.len()))
                 else {
                     continue; // past the end: truncated image, not a hidden cluster
@@ -162,9 +179,9 @@ pub(crate) fn extract_qcow2<R>(
                 // Clusters are raw DEFLATE, with no zlib wrapper.
                 let s = crate::salvage(crate::inflate::Inflate::new(raw), cluster_size as u64);
                 let k = n.min(s.data.len());
-                disk[guest..guest + k].copy_from_slice(&s.data[..k]);
+                disk[guest..guest.saturating_add(k)].copy_from_slice(&s.data[..k]);
                 if s.part_way(rest_absent) {
-                    undecodable_clusters += 1;
+                    undecodable_clusters = undecodable_clusters.saturating_add(1);
                 }
                 continue;
             }
@@ -174,7 +191,7 @@ pub(crate) fn extract_qcow2<R>(
             // cluster stays zero.
             let host = crate::bytes::to_usize(e & OFFSET_MASK);
             if let Some(src) = crate::bytes::at(data, host, n) {
-                disk[guest..guest + n].copy_from_slice(src);
+                disk[guest..guest.saturating_add(n)].copy_from_slice(src);
             }
         }
     }

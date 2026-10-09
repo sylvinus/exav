@@ -327,13 +327,13 @@ fn expand_bits(bit_depth: u8, row_size: u32, buf: &[u8]) -> Vec<u8> {
     // Note: this conversion assumes that the scanlines begin on byte boundaries
     let mask = (1u8 << bit_depth as usize) - 1;
     let scaling_factor = 255 / ((1 << bit_depth as usize) - 1);
-    let bit_width = row_size * u32::from(bit_depth);
+    let bit_width = row_size.saturating_mul(u32::from(bit_depth));
     let skip = if bit_width % 8 == 0 {
         0
     } else {
         (8 - bit_width % 8) / u32::from(bit_depth)
     };
-    let row_len = row_size + skip;
+    let row_len = row_size.saturating_add(skip);
     let mut p = Vec::new();
     let mut i = 0;
     for v in buf {

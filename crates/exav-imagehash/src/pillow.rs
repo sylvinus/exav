@@ -91,51 +91,82 @@ fn clip8(v: i32) -> u8 {
 }
 
 /// The weights of one dimension: per output pixel, the first input pixel and
-/// how many follow, and `ksize` fixed-point coefficients.
-struct Coeffs {
+/// how many follow, and `ksize` fixed-point coefficients. They are made one
+/// output pixel at a time: all of them together are `ksize` per output pixel,
+/// which for a very wide, very short image is many times the image.
+struct Axis {
+    in_size: i32,
+    in0: f32,
+    out_size: i32,
+    scale: f64,
+    support: f64,
+    inv_filterscale: f64,
     ksize: usize,
-    bounds: Vec<(i32, i32)>,
-    k: Vec<i32>,
+    f: PillowFilter,
 }
 
-fn precompute_coeffs(in_size: i32, in0: f32, in1: f32, out_size: i32, f: PillowFilter) -> Coeffs {
-    let scale = f64::from(in1 - in0) / f64::from(out_size);
-    let filterscale = scale.max(1.0);
-    let support = f.support() * filterscale;
-    let ksize = (support.ceil() as usize) * 2 + 1;
-    let inv_filterscale = 1.0 / filterscale;
-    let mut bounds = Vec::with_capacity(out_size as usize);
-    let mut kk = vec![0f64; out_size as usize * ksize];
-    for xx in 0..out_size {
-        let center = f64::from(in0) + (f64::from(xx) + 0.5) * scale;
-        let xmin = ((center - support + 0.5) as i32).max(0);
-        let xmax = ((center + support + 0.5) as i32).min(in_size) - xmin;
-        let k = &mut kk[xx as usize * ksize..][..ksize];
+impl Axis {
+    fn new(in_size: i32, in0: f32, in1: f32, out_size: i32, f: PillowFilter) -> Axis {
+        let scale = f64::from(in1 - in0) / f64::from(out_size);
+        let filterscale = scale.max(1.0);
+        let support = f.support() * filterscale;
+        Axis {
+            in_size,
+            in0,
+            out_size,
+            scale,
+            support,
+            inv_filterscale: 1.0 / filterscale,
+            ksize: (support.ceil() as usize)
+                .saturating_mul(2)
+                .saturating_add(1),
+            f,
+        }
+    }
+
+    /// Output pixel `xx`: the centre of its window, the first input pixel and
+    /// how many follow.
+    fn span(&self, xx: i32) -> (f64, i32, i32) {
+        let center = f64::from(self.in0) + (f64::from(xx) + 0.5) * self.scale;
+        let xmin = ((center - self.support + 0.5) as i32).max(0);
+        let xmax = ((center + self.support + 0.5) as i32).min(self.in_size) - xmin;
+        (center, xmin, xmax)
+    }
+
+    fn bounds(&self, xx: i32) -> (i32, i32) {
+        let (_, xmin, xmax) = self.span(xx);
+        (xmin, xmax)
+    }
+
+    /// The `ksize` fixed-point coefficients of output pixel `xx`, in `k`;
+    /// `kk` is scratch.
+    fn weights(&self, xx: i32, kk: &mut Vec<f64>, k: &mut Vec<i32>) {
+        let (center, xmin, xmax) = self.span(xx);
+        kk.clear();
+        kk.resize(self.ksize, 0.0);
         let mut ww = 0.0;
         for x in 0..xmax.max(0) {
-            let w = f.weight((f64::from(x + xmin) - center + 0.5) * inv_filterscale);
-            k[x as usize] = w;
+            let w = self
+                .f
+                .weight((f64::from(x + xmin) - center + 0.5) * self.inv_filterscale);
+            kk[x as usize] = w;
             ww += w;
         }
         if ww != 0.0 {
-            for v in k.iter_mut().take(xmax.max(0) as usize) {
+            for v in kk.iter_mut().take(xmax.max(0) as usize) {
                 *v /= ww;
             }
         }
-        bounds.push((xmin, xmax));
-    }
-    let k = kk
-        .iter()
-        .map(|&v| {
+        k.clear();
+        k.extend(kk.iter().map(|&v| {
             let s = v * f64::from(1u32 << PRECISION_BITS);
             if v < 0.0 {
                 (-0.5 + s) as i32
             } else {
                 (0.5 + s) as i32
             }
-        })
-        .collect();
-    Coeffs { ksize, bounds, k }
+        }));
+    }
 }
 
 /// A grey image, row-major.
@@ -146,18 +177,20 @@ pub(crate) struct Gray {
     pub(crate) pixels: Vec<u8>,
 }
 
-fn horizontal(input: &Gray, offset: usize, rows: usize, c: &Coeffs) -> Gray {
-    let width = c.bounds.len();
+fn horizontal(input: &Gray, offset: usize, rows: usize, axis: &Axis) -> Gray {
+    let width = axis.out_size as usize;
     let mut pixels = vec![0u8; width * rows];
-    for yy in 0..rows {
-        let line = &input.pixels[(yy + offset) * input.width..][..input.width];
-        for (xx, &(xmin, xmax)) in c.bounds.iter().enumerate() {
-            let k = &c.k[xx * c.ksize..];
+    let (mut kk, mut k) = (Vec::new(), Vec::new());
+    for xx in 0..axis.out_size {
+        let (xmin, xmax) = axis.bounds(xx);
+        axis.weights(xx, &mut kk, &mut k);
+        for yy in 0..rows {
+            let line = &input.pixels[(yy + offset) * input.width..][..input.width];
             let mut ss: i32 = 1 << (PRECISION_BITS - 1);
             for x in 0..xmax.max(0) as usize {
                 ss = ss.wrapping_add(i32::from(line[x + xmin as usize]).wrapping_mul(k[x]));
             }
-            pixels[yy * width + xx] = clip8(ss);
+            pixels[yy * width + xx as usize] = clip8(ss);
         }
     }
     Gray {
@@ -167,13 +200,16 @@ fn horizontal(input: &Gray, offset: usize, rows: usize, c: &Coeffs) -> Gray {
     }
 }
 
-fn vertical(input: &Gray, c: &Coeffs, shift: i32) -> Gray {
-    let height = c.bounds.len();
+fn vertical(input: &Gray, axis: &Axis, shift: i32) -> Gray {
+    let height = axis.out_size as usize;
     let width = input.width;
     let mut pixels = vec![0u8; width * height];
-    for (yy, &(ymin, ymax)) in c.bounds.iter().enumerate() {
+    let (mut kk, mut k) = (Vec::new(), Vec::new());
+    for yy in 0..axis.out_size {
+        let (ymin, ymax) = axis.bounds(yy);
         let ymin = (ymin - shift) as usize;
-        let k = &c.k[yy * c.ksize..];
+        axis.weights(yy, &mut kk, &mut k);
+        let yy = yy as usize;
         for xx in 0..width {
             let mut ss: i32 = 1 << (PRECISION_BITS - 1);
             for (y, &ky) in k.iter().enumerate().take(ymax.max(0) as usize) {
@@ -194,14 +230,14 @@ fn vertical(input: &Gray, c: &Coeffs, shift: i32) -> Gray {
 fn resample(input: &Gray, xsize: usize, ysize: usize, f: PillowFilter, b: [f32; 4]) -> Gray {
     let need_horizontal = xsize != input.width || b[0] != 0.0 || b[2] != xsize as f32;
     let need_vertical = ysize != input.height || b[1] != 0.0 || b[3] != ysize as f32;
-    let vert = precompute_coeffs(input.height as i32, b[1], b[3], ysize as i32, f);
-    let ybox_first = vert.bounds[0].0;
-    let (last_min, last_len) = vert.bounds[ysize - 1];
+    let vert = Axis::new(input.height as i32, b[1], b[3], ysize as i32, f);
+    let ybox_first = vert.bounds(0).0;
+    let (last_min, last_len) = vert.bounds(ysize as i32 - 1);
     let ybox_last = last_min + last_len;
     let mut shift = 0;
     let mut current = None;
     if need_horizontal {
-        let horiz = precompute_coeffs(input.width as i32, b[0], b[2], xsize as i32, f);
+        let horiz = Axis::new(input.width as i32, b[0], b[2], xsize as i32, f);
         shift = ybox_first;
         current = Some(horizontal(
             input,
@@ -226,7 +262,7 @@ pub(crate) fn resize(input: &Gray, xsize: usize, ysize: usize, f: PillowFilter) 
         return input.clone();
     }
     let b = [0.0, 0.0, w as f32, h as f32];
-    if h > w * 100 && ysize < h {
+    if h > w.saturating_mul(100) && ysize < h {
         let im = resample(input, w, ysize, f, [0.0, b[1], w as f32, b[3]]);
         return resample(&im, xsize, ysize, f, [b[0], 0.0, b[2], ysize as f32]);
     }

@@ -6693,6 +6693,23 @@ mod tests {
         let _ = b.build(); // must not panic
     }
 
+    /// A literal behind a fixed gap of 2^32 bytes is 2^32 past the start; the
+    /// distance does not fit the prefix, so it must not be stored cut to its
+    /// low bits (`2`, which put the start two bytes before the anchor).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn an_anchor_past_u32_of_fixed_prefix_is_not_a_fixed_one() {
+        use super::parse::pick_anchor;
+        let elems = [
+            Elem::Bytes(vec![0, 0]),
+            Elem::Gap { min: 1 << 32, max: Some(1 << 32) },
+            Elem::Bytes(b"rare literal".to_vec()),
+        ];
+        if let Some(Prefix::Fixed { anchor_idx: 2, len }) = pick_anchor(&elems, true, None) {
+            panic!("stored a distance of {len}");
+        }
+    }
+
     /// A shorter but rare literal must outrank a longer ubiquitous one, and
     /// `pick_anchor` must actually anchor on it.
     ///

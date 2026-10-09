@@ -153,6 +153,10 @@ pub(crate) struct Reader<'a> {
     pub warnings: Warnings,
     /// Triangles still allowed to be made, intermediate ones included.
     pub work: usize,
+    /// Items and profiles still allowed to be read. An instance that lists
+    /// the next one twice, thirty levels down, is four billion visits of
+    /// thirty instances; the depth limit alone does not stop it.
+    visits: usize,
     placements: HashMap<u32, Xf>,
     maps: HashMap<u32, Rc<Vec<Piece>>>,
     /// Item -> style, from `IfcStyledItem`.
@@ -174,6 +178,7 @@ impl<'a> Reader<'a> {
             angle: 1.0,
             warnings: Warnings::default(),
             work,
+            visits: f.len().saturating_add(64).saturating_mul(64),
             placements: HashMap::new(),
             maps: HashMap::new(),
             styled: HashMap::new(),
@@ -198,6 +203,12 @@ impl<'a> Reader<'a> {
             .unsupported
             .entry(String::from_utf8_lossy(ty).into_owned())
             .or_insert(0) += 1;
+    }
+
+    /// Takes one read of an item or profile from the visit budget.
+    pub fn visit(&mut self) -> Option<()> {
+        self.visits = self.visits.checked_sub(1)?;
+        Some(())
     }
 
     /// Takes `n` triangles from the work budget.
@@ -792,7 +803,7 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
             continue;
         };
         let Some(world) = p[5].id().map_or(Some(Xf::IDENTITY), |pl| r.placement(pl)) else {
-            r.warnings.invalid += 1;
+            r.warnings.invalid = r.warnings.invalid.saturating_add(1);
             continue;
         };
         let class = String::from_utf8_lossy(ty).into_owned();
@@ -864,7 +875,9 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
     }
     out.scene.origin = origin.unwrap_or([0.0; 3]);
     let mut warnings = r.warnings;
-    warnings.truncated += out.scene.warnings.truncated;
+    warnings.truncated = warnings
+        .truncated
+        .saturating_add(out.scene.warnings.truncated);
     warnings.damaged |= out.scene.warnings.damaged;
     out.scene.warnings = warnings;
     Ok(out.scene)

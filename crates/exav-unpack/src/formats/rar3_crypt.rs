@@ -56,17 +56,43 @@ pub(crate) fn decrypt(keys: &Keys, data: &mut Vec<u8>) {
 
 /// What each password derived over each salt, kept for the whole archive:
 /// every derivation is 2^18 SHA-1 rounds.
-#[derive(Default)]
-pub(crate) struct KeyCache(Vec<([u8; 8], String, Keys)>);
+///
+/// Every encrypted member and every encrypted header block may carry a salt of
+/// its own, so the derivations are limited: past the limit a key is not made.
+pub(crate) struct KeyCache {
+    keys: Vec<([u8; 8], String, Keys)>,
+    limit: usize,
+}
+
+/// The derivations one archive may make: about half a minute of SHA-1.
+const MAX_DERIVATIONS: usize = 256;
+
+impl Default for KeyCache {
+    fn default() -> Self {
+        KeyCache {
+            keys: Vec::new(),
+            limit: MAX_DERIVATIONS,
+        }
+    }
+}
 
 impl KeyCache {
-    pub(crate) fn get(&mut self, password: &str, salt: &[u8; 8]) -> Keys {
-        if let Some((.., k)) = self.0.iter().find(|(s, p, _)| s == salt && p == password) {
-            return k.clone();
+    /// The keys of `password` over `salt`; `None` when they are not cached and
+    /// the limit of derivations is reached.
+    pub(crate) fn get(&mut self, password: &str, salt: &[u8; 8]) -> Option<Keys> {
+        if let Some((.., k)) = self
+            .keys
+            .iter()
+            .find(|(s, p, _)| s == salt && p == password)
+        {
+            return Some(k.clone());
+        }
+        if self.keys.len() >= self.limit {
+            return None;
         }
         let k = derive(password, salt);
-        self.0.push((*salt, password.to_string(), k.clone()));
-        k
+        self.keys.push((*salt, password.to_string(), k.clone()));
+        Some(k)
     }
 }
 
@@ -81,4 +107,25 @@ pub(crate) fn candidates(passwords: &[String]) -> Vec<String> {
                 .map(|p| p.to_string()),
         )
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A salt per member and a password list: the derivations stop at the
+    /// limit, the ones made are still served, and no further one is made.
+    #[test]
+    fn derivations_over_many_salts_stop_at_the_limit() {
+        let mut cache = KeyCache {
+            keys: Vec::new(),
+            limit: 3,
+        };
+        for salt in 0..10u8 {
+            let got = cache.get("pw", &[salt; 8]);
+            assert_eq!(got.is_some(), salt < 3, "salt {salt}");
+        }
+        assert!(cache.get("pw", &[1; 8]).is_some(), "a cached one is served");
+        assert_eq!(cache.keys.len(), 3);
+    }
 }

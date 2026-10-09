@@ -25,6 +25,13 @@ fn rotate(p: V3, a: V3, d: V3, t: f64) -> V3 {
     add(a, r)
 }
 
+/// The angle `a`, a whole number of turns off, within half a turn of `prev`.
+/// In one step: turns added one at a time take as many steps as the polyline
+/// has wound, which a long spiral makes quadratic.
+fn continuous(a: f64, prev: f64) -> f64 {
+    a - TAU * ((a - prev) / TAU).round()
+}
+
 /// Loops of an area in order: the outer one, then the holes.
 fn loops(area: &(Vec<V2>, Vec<Vec<V2>>)) -> impl Iterator<Item = &Vec<V2>> {
     std::iter::once(&area.0).chain(area.1.iter())
@@ -182,7 +189,7 @@ impl<'a> Reader<'a> {
             .map(Vec::len)
             .sum::<usize>()
             + profile.open.iter().map(Vec::len).sum::<usize>();
-        self.budget(points * 4)?;
+        self.budget(points.saturating_mul(4))?;
         let mut m = extrude(&profile, scale(dir, d), end.as_ref());
         m.transform(&pos);
         let closed = profile.open.is_empty();
@@ -222,7 +229,7 @@ impl<'a> Reader<'a> {
             .map(Vec::len)
             .sum::<usize>()
             + profile.open.iter().map(Vec::len).sum::<usize>();
-        self.budget(points * 2 * (n + 1))?;
+        self.budget(points.saturating_mul(2).saturating_mul(n.saturating_add(1)))?;
         let mut m = Mesh::default();
         let ring_at = |shape: &[V2], far: &[V2], k: usize| -> Vec<V3> {
             let f = k as f64 / n as f64;
@@ -498,7 +505,7 @@ impl<'a> Reader<'a> {
         let mut points: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for f in p.first()?.list()?.iter().filter_map(Value::id) {
             let Some((fty, fp)) = self.get(f) else {
-                self.warnings.invalid += 1;
+                self.warnings.invalid = self.warnings.invalid.saturating_add(1);
                 continue;
             };
             if fty == b"IFCADVANCEDFACE" || fty == b"IFCFACESURFACE" {
@@ -660,12 +667,7 @@ impl<'a> Reader<'a> {
                         let lq = inv.point(q);
                         let mut a = lq[1].atan2(lq[0]);
                         if let Some(pa) = prev {
-                            while a - pa > std::f64::consts::PI {
-                                a -= TAU;
-                            }
-                            while pa - a > std::f64::consts::PI {
-                                a += TAU;
-                            }
+                            a = continuous(a, pa);
                         }
                         prev = Some(a);
                         flat.push([a, lq[2]]);
@@ -1008,6 +1010,25 @@ fn between(c: &[V3], a: V3, b: V3, same: bool) -> Vec<V3> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The angle is brought next to the previous one by whole turns, however
+    /// far apart they are: adding a turn at a time took a billion steps for
+    /// a polyline wound a billion times.
+    #[test]
+    fn an_angle_is_unrolled_in_one_step_however_far_the_previous_one_is() {
+        use std::f64::consts::PI;
+        assert!((continuous(0.5, 0.5) - 0.5).abs() < 1e-12);
+        assert!((continuous(3.0, -3.0) - (3.0 - TAU)).abs() < 1e-12);
+        assert!((continuous(-3.0, 3.0) - (-3.0 + TAU)).abs() < 1e-12);
+        for prev in [0.0, 7.0, -40.0, 1.0e6, -1.0e12] {
+            for a in [-PI, -1.0, 0.0, 2.5, PI] {
+                let c = continuous(a, prev);
+                assert!((c - prev).abs() <= PI + 1e-6, "{a} next to {prev} gave {c}");
+                let turns = (c - a) / TAU;
+                assert!((turns - turns.round()).abs() < 1e-3, "{a} became {c}");
+            }
+        }
+    }
 
     #[test]
     fn an_extruded_square_with_a_hole() {

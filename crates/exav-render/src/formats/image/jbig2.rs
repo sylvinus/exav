@@ -60,7 +60,7 @@ impl Decoder for Grey {
     }
 
     fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
-        let n = chunk_count as usize * 8;
+        let n = (chunk_count as usize).saturating_mul(8);
         self.samples
             .resize(self.samples.len() + n, if black { 0 } else { 255 });
     }

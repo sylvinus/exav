@@ -96,7 +96,7 @@ fn push_stored(
         return Ok(());
     }
     let cap = budget.reserve()?;
-    let end = off.saturating_add(pack as usize);
+    let end = off.saturating_add(crate::bytes::to_usize(pack));
     if pack > cap || end > data.len() {
         return Err(LimitHit::new("rar: stored member exceeds budget".into()));
     }
@@ -164,7 +164,9 @@ fn rar4_decrypt_member(
         None => rar3_crypt::candidates(&budget.passwords),
     };
     for pw in tries {
-        let keys = crypt.keys.get(&pw, &salt);
+        let Some(keys) = crypt.keys.get(&pw, &salt) else {
+            break; // no more derivations: the member stays encrypted
+        };
         let mut buf = raw.to_vec();
         rar3_crypt::decrypt(&keys, &mut buf);
         let plain = if lz {
@@ -232,7 +234,7 @@ fn rar4_open_headers(
         let mut blocks = 0;
         while q < data.len() {
             let salt: [u8; 8] = data.get(q..q + 8)?.try_into().ok()?;
-            let keys = crypt.keys.get(&pw, &salt);
+            let keys = crypt.keys.get(&pw, &salt)?;
             let mut first = data.get(q + 8..q + 24)?.to_vec();
             rar3_crypt::decrypt(&keys, &mut first);
             let head_size = usize::from(u16::from_le_bytes([first[5], first[6]]));
@@ -390,7 +392,9 @@ fn extract_rar4_keyed(
             if is_dir {
                 // skip directories
             } else if encrypted && !split {
-                let dend = data_off.saturating_add(pack as usize).min(data.len());
+                let dend = data_off
+                    .saturating_add(crate::bytes::to_usize(pack))
+                    .min(data.len());
                 let raw = &data[data_off.min(data.len())..dend];
                 let member = Rar4Member {
                     method,
@@ -450,7 +454,9 @@ fn extract_rar4_keyed(
             } else if !encrypted && unp_ver == 29 && (0x31..=0x35).contains(&method) {
                 // RAR3 (unpack29) compressed LZ member: attempt decompression.
                 budget.count_entry()?;
-                let dend = data_off.saturating_add(pack as usize).min(data.len());
+                let dend = data_off
+                    .saturating_add(crate::bytes::to_usize(pack))
+                    .min(data.len());
                 let packed = &data[data_off.min(data.len())..dend];
                 // LHD_SOLID. The window is sized once, from the first member of
                 // the group; a solid member's own dictionary flags describe the
@@ -579,7 +585,7 @@ fn extract_rar5_keyed(
             None => break,
         };
         let hdr = hs_off + hs_len; // header content start
-        let Some(data_off) = hdr.checked_add(hsize as usize) else {
+        let Some(data_off) = hdr.checked_add(crate::bytes::to_usize(hsize)) else {
             break;
         }; // packed data start
         if hsize == 0 || data_off > data.len() {
@@ -683,7 +689,7 @@ fn extract_rar5_keyed(
                         ..Entry::default()
                     });
                 } else {
-                    let dataend = data_off.saturating_add(data_size as usize);
+                    let dataend = data_off.saturating_add(crate::bytes::to_usize(data_size));
                     let raw = if data_off <= data.len() && dataend <= data.len() {
                         &data[data_off..dataend]
                     } else {
@@ -776,7 +782,7 @@ fn extract_rar5_keyed(
                 }
             }
         }
-        let Some(next) = data_off.checked_add(data_size as usize) else {
+        let Some(next) = data_off.checked_add(crate::bytes::to_usize(data_size)) else {
             break;
         };
         if next <= pos {
@@ -985,7 +991,7 @@ fn rar5_file_fields(
     hsize: u64,
     extra_size: u64,
 ) -> Option<Rar5File> {
-    let end = hdr.checked_add(hsize as usize)?;
+    let end = hdr.checked_add(crate::bytes::to_usize(hsize))?;
     let (file_flags, n) = vint(data, q)?;
     q += n;
     let (unp_size, n) = vint(data, q)?; // unpacked size
@@ -1007,7 +1013,10 @@ fn rar5_file_fields(
     q += n;
     let (name_len, n) = vint(data, q)?;
     q += n;
-    let nend = q.saturating_add(name_len as usize).min(end).min(data.len());
+    let nend = q
+        .saturating_add(crate::bytes::to_usize(name_len))
+        .min(end)
+        .min(data.len());
     let name = if q < nend {
         String::from_utf8_lossy(&data[q..nend]).into_owned()
     } else {
@@ -1044,10 +1053,10 @@ struct Rar5Extra {
 /// Scan the trailing extra area `[end-extra_size, end)`.
 fn rar5_extra(data: &[u8], end: usize, extra_size: u64) -> Rar5Extra {
     let mut found = Rar5Extra::default();
-    if extra_size == 0 || extra_size as usize > end {
+    if extra_size == 0 || crate::bytes::to_usize(extra_size) > end {
         return found;
     }
-    let mut p = end - extra_size as usize;
+    let mut p = end - crate::bytes::to_usize(extra_size);
     let mut guard = 0;
     while p < end && guard < 64 {
         guard += 1;
@@ -1058,7 +1067,7 @@ fn rar5_extra(data: &[u8], end: usize, extra_size: u64) -> Rar5Extra {
             break;
         };
         // `rec_size` counts the bytes after its own vint: the type and body.
-        let Some(rec_end) = rec_start.checked_add(rec_size as usize) else {
+        let Some(rec_end) = rec_start.checked_add(crate::bytes::to_usize(rec_size)) else {
             break;
         };
         let Some((rec_type, n2)) = vint(data, rec_start) else {
@@ -1074,7 +1083,7 @@ fn rar5_extra(data: &[u8], end: usize, extra_size: u64) -> Rar5Extra {
                     let (_flags, c) = vint(b, a)?;
                     let (len, d) = vint(b, a + c)?;
                     let at = a + c + d;
-                    let name = b.get(at..at.checked_add(len as usize)?)?;
+                    let name = crate::bytes::at(b, at, crate::bytes::to_usize(len))?;
                     Some((kind, String::from_utf8_lossy(name).into_owned()))
                 })();
                 found.redirect = target;
@@ -1206,6 +1215,10 @@ fn join_rar4(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
 /// A RAR4 member's whole header and data, from its parts.
 fn rar4_whole(mut p: Pending, crc: u32) -> Result<Vec<u8>, String> {
     let h = &mut p.header;
+    // The smallest block head is 7 bytes, and a split member's has fields up to byte 20.
+    if h.len() < 20 {
+        return Err("a short file header".to_string());
+    }
     // A stored member's data is its content, so a part missing from between
     // the ones given shows as a size the header does not record. (A volume
     // missing from a set that records volume numbers is refused by the join;
@@ -1234,9 +1247,6 @@ fn rar4_whole(mut p: Pending, crc: u32) -> Result<Vec<u8>, String> {
             return Err("a member past 4 GiB with no 64-bit size".to_string())
         }
         _ => {}
-    }
-    if h.len() < 20 {
-        return Err("a short file header".to_string());
     }
     h[16..20].copy_from_slice(&crc.to_le_bytes());
     let mut out = p.header;
@@ -1399,7 +1409,7 @@ fn rar5_name(c: &[u8]) -> Option<&[u8]> {
     q += vint(c, q)?.1; // compression information
     q += vint(c, q)?.1; // host OS
     let (len, n) = vint(c, q)?;
-    c.get(q + n..q + n + usize::try_from(len).ok()?)
+    crate::bytes::at(c, q.checked_add(n)?, usize::try_from(len).ok()?)
 }
 
 /// The data CRC a RAR5 file block records, when it records one.
@@ -1815,6 +1825,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Volumes whose split member has a seven-byte header (the smallest block
+    /// head) are refused, not indexed past their end.
+    #[test]
+    fn joining_a_split_member_with_a_seven_byte_header_is_an_error() {
+        let vol = |flags: u16| {
+            let mut v = RAR4_MAGIC.to_vec();
+            v.extend_from_slice(&[0, 0, 0x74]);
+            v.extend_from_slice(&flags.to_le_bytes());
+            v.extend_from_slice(&7u16.to_le_bytes());
+            v
+        };
+        let (first, last) = (vol(0x02), vol(0x01));
+        assert!(join_volumes(&[&first, &last]).is_err());
+    }
+
+    /// A service block whose name length is the largest vint cannot place its
+    /// name: the sum overflowed.
+    #[test]
+    fn a_service_block_name_of_every_bit_set_has_no_name() {
+        // type 3, flags 0, then flags, unpacked size, attributes, compression
+        // information and host OS (one byte each), then the name length.
+        let mut content = vec![3, 0, 0, 0, 0, 0, 0];
+        content.extend_from_slice(&[0xFF; 9]);
+        content.push(0x01);
+        assert_eq!(rar5_name(&content), None);
     }
 
     #[test]

@@ -185,15 +185,22 @@ impl Pins {
             };
             for s in lo..=hi.min(len) {
                 for &d in &g.dists {
-                    let at = s + d as u64;
-                    let w = buf.window(at as usize, 2);
+                    // Past what a `usize` holds there is nothing to read; cast,
+                    // it would wrap to a place that is.
+                    let Some(at) = s
+                        .checked_add(d as u64)
+                        .and_then(|at| usize::try_from(at).ok())
+                    else {
+                        continue;
+                    };
+                    let w = buf.window(at, 2);
                     if w.len() < 2 {
                         continue;
                     }
                     let k = key(&w);
                     let from = g.entries.partition_point(|e| (e.0, e.1) < (d, k));
                     for &(_, _, b) in g.entries[from..].iter().take_while(|e| (e.0, e.1) == (d, k)) {
-                        if wanted(&bodies[b as usize]) && !f(b as usize, at as usize) {
+                        if wanted(&bodies[b as usize]) && !f(b as usize, at) {
                             return false;
                         }
                     }

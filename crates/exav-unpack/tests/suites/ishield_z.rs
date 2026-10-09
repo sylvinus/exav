@@ -121,6 +121,41 @@ fn every_member_carries_its_name() {
     );
 }
 
+/// A member whose compressed form fits the budget and whose expansion does not
+/// is reported as expanding past it, and is read only up to the budget.
+#[test]
+fn a_member_that_expands_past_the_budget_is_reported() {
+    let blob = fixture("undhr.z");
+    let whole = members(&blob);
+    let (comp, size) = whole
+        .iter()
+        .map(|e| (e.comp_size, e.data.len() as u64))
+        .find(|&(c, d)| c > 0 && d > c + 2)
+        .expect("a member that expands");
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = comp + (size - comp) / 2;
+    let mut b = Budget::new(limits);
+    let mut out = Vec::new();
+    let _ = extract_each(
+        Format::IshieldZ,
+        &blob,
+        &mut b,
+        &mut |e: Entry, _: &mut Budget| {
+            out.push(e);
+            None::<()>
+        },
+    );
+    assert!(
+        out.iter().any(|x| x
+            .unsupported
+            .is_some_and(|r| r.contains("decompressed past the per-member"))),
+        "got {:?}",
+        out.iter()
+            .map(|x| (&x.name, x.unsupported))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn a_member_past_the_budget_is_reported_not_skipped() {
     let mut limits = Limits::default();

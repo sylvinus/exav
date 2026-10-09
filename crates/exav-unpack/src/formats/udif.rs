@@ -2,6 +2,10 @@
 // Adapted to decode XZ runs with exav's `formats::xz` reader (`xz4rust`)
 // instead of `lzma-rs`, and to keep what a run decodes before an error.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -59,7 +63,7 @@ impl Partition {
         if vsec < self.sector_base {
             return false;
         }
-        let local = vsec - self.sector_base;
+        let local = vsec.saturating_sub(self.sector_base);
         local < self.total_sectors()
     }
 
@@ -109,7 +113,7 @@ impl<R: Read + Seek> DmgReader<R> {
         }
 
         reader
-            .seek(SeekFrom::Start(file_size - KOLY_SIZE))
+            .seek(SeekFrom::Start(file_size.saturating_sub(KOLY_SIZE)))
             .map_err(|e| LimitHit::corrupt(format!("UDIF: seek to koly: {e}")))?;
         let mut koly = [0u8; 512];
         reader
@@ -135,7 +139,7 @@ impl<R: Read + Seek> DmgReader<R> {
         reader
             .seek(SeekFrom::Start(xml_offset))
             .map_err(|e| LimitHit::corrupt(format!("UDIF: seek to xml: {e}")))?;
-        let mut xml_bytes = vec![0u8; xml_length as usize];
+        let mut xml_bytes = vec![0u8; crate::bytes::to_usize(xml_length)];
         reader
             .read_exact(&mut xml_bytes)
             .map_err(|e| LimitHit::corrupt(format!("UDIF: read xml: {e}")))?;
@@ -161,16 +165,18 @@ impl<R: Read + Seek> DmgReader<R> {
             let hit = self.runs.remove(i);
             self.runs.push(hit);
         } else {
-            let expected = (run.sector_count as usize).saturating_mul(512);
+            let expected = crate::bytes::to_usize(run.sector_count).saturating_mul(512);
             // A run's compressed form is not much larger than the run itself.
-            if expected > MAX_RUN_BYTES || run.data_length > 2 * MAX_RUN_BYTES as u64 {
+            if expected > MAX_RUN_BYTES
+                || run.data_length > (MAX_RUN_BYTES as u64).saturating_mul(2)
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "block decompressed size exceeds cap",
                 ));
             }
             self.inner.seek(SeekFrom::Start(file_pos))?;
-            let mut compressed = vec![0u8; run.data_length as usize];
+            let mut compressed = vec![0u8; crate::bytes::to_usize(run.data_length)];
             self.inner.read_exact(&mut compressed)?;
             let decompressed = decompress(run.entry_type, &compressed, expected)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -178,8 +184,10 @@ impl<R: Read + Seek> DmgReader<R> {
                 self.damaged.store(true, Ordering::Relaxed);
             }
             let mut held: usize = self.runs.iter().map(|(_, r)| r.data.len()).sum();
-            while held + decompressed.data.len() > RUN_CACHE_BYTES && !self.runs.is_empty() {
-                held -= self.runs.remove(0).1.data.len();
+            while held.saturating_add(decompressed.data.len()) > RUN_CACHE_BYTES
+                && !self.runs.is_empty()
+            {
+                held = held.saturating_sub(self.runs.remove(0).1.data.len());
             }
             self.runs.push((key, decompressed));
         }
@@ -211,19 +219,20 @@ impl<R: Read + Seek> Read for DmgReader<R> {
             .find(|(_, p)| p.contains_sector(vsec))
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no partition"))?;
 
-        let local_sec = vsec - part.sector_base;
+        let local_sec = vsec.saturating_sub(part.sector_base);
         let (ri, run) = part
             .run_for(local_sec)
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no run"))?;
         let run = run.clone();
         let file_data_offset = part.file_data_offset;
 
-        let bytes_into_run = (local_sec - run.sector_start)
+        let bytes_into_run = local_sec
+            .saturating_sub(run.sector_start)
             .saturating_mul(512)
             .saturating_add(sec_offset);
         let run_total_bytes = run.sector_count.saturating_mul(512);
         let available_in_run = run_total_bytes.saturating_sub(bytes_into_run);
-        let mut to_read = buf.len().min(available_in_run as usize);
+        let mut to_read = buf.len().min(crate::bytes::to_usize(available_in_run));
 
         match run.entry_type {
             BLK_ZERO | BLK_IGNORE => {
@@ -256,7 +265,7 @@ impl<R: Read + Seek> Read for DmgReader<R> {
                     ));
                 }
                 let decompressed = self.run_data((pi, ri), &run, file_pos)?;
-                let start = bytes_into_run as usize;
+                let start = crate::bytes::to_usize(bytes_into_run);
                 if start >= decompressed.data.len() {
                     // Short of a damaged run: content left undecoded. Short
                     // of a whole one: the stream ended there.
@@ -267,10 +276,11 @@ impl<R: Read + Seek> Read for DmgReader<R> {
                     });
                 }
                 let decompressed = &decompressed.data;
-                let end = (start + to_read).min(decompressed.len());
-                buf[..end - start].copy_from_slice(&decompressed[start..end]);
+                let end = start.saturating_add(to_read).min(decompressed.len());
+                let got = end.saturating_sub(start);
+                buf[..got].copy_from_slice(&decompressed[start..end]);
                 // A run that decoded short ends here: the next read reports it.
-                to_read = end - start;
+                to_read = got;
             }
             t => {
                 return Err(io::Error::new(
@@ -280,7 +290,7 @@ impl<R: Read + Seek> Read for DmgReader<R> {
             }
         }
 
-        self.position += to_read as u64;
+        self.position = self.position.saturating_add(to_read as u64);
         Ok(to_read)
     }
 }
@@ -311,7 +321,9 @@ pub(crate) fn disk<R: Read + Seek>(mut src: R) -> Result<Disk<R>, LimitHit> {
         .map_err(|e| LimitHit::corrupt(format!("UDIF: seek to end: {e}")))?;
     let mut sig = [0u8; 4];
     let koly = len >= KOLY_SIZE
-        && src.seek(SeekFrom::Start(len - KOLY_SIZE)).is_ok()
+        && src
+            .seek(SeekFrom::Start(len.saturating_sub(KOLY_SIZE)))
+            .is_ok()
         && src.read_exact(&mut sig).is_ok()
         && u32::from_be_bytes(sig) == KOLY_MAGIC;
     if koly {
@@ -401,27 +413,27 @@ fn adc_decompress(input: &[u8], expected_len: usize) -> Vec<u8> {
     let mut i = 0;
     while i < input.len() && out.len() < expected_len {
         let b = input[i];
-        i += 1;
+        i = i.saturating_add(1);
         if b & 0x80 != 0 {
-            let n = (b & 0x7F) as usize + 1;
-            let end = (i + n).min(input.len());
+            let n = usize::from(b & 0x7F).saturating_add(1);
+            let end = i.saturating_add(n).min(input.len());
             out.extend_from_slice(&input[i..end]);
             i = end;
         } else if b & 0x40 != 0 {
-            if i + 1 >= input.len() {
+            if i.saturating_add(1) >= input.len() {
                 break;
             }
-            let len = (b & 0x3F) as usize + 4;
-            let offset = ((input[i] as usize) << 8) | input[i + 1] as usize;
-            i += 2;
+            let len = usize::from(b & 0x3F).saturating_add(4);
+            let offset = (usize::from(input[i]) << 8) | usize::from(input[i.saturating_add(1)]);
+            i = i.saturating_add(2);
             copy_back(&mut out, offset, len);
         } else {
             if i >= input.len() {
                 break;
             }
-            let len = ((b >> 2) & 0x0F) as usize + 3;
-            let offset = (((b & 0x03) as usize) << 8) | input[i] as usize;
-            i += 1;
+            let len = usize::from((b >> 2) & 0x0F).saturating_add(3);
+            let offset = (usize::from(b & 0x03) << 8) | usize::from(input[i]);
+            i = i.saturating_add(1);
             copy_back(&mut out, offset, len);
         }
     }
@@ -433,7 +445,7 @@ fn copy_back(out: &mut Vec<u8>, offset: usize, len: usize) {
         if out.len() <= offset {
             break;
         }
-        let byte = out[out.len() - 1 - offset];
+        let byte = out[out.len().saturating_sub(1).saturating_sub(offset)];
         out.push(byte);
     }
 }
@@ -513,18 +525,21 @@ fn parse_mish(data: &[u8]) -> Result<Partition, LimitHit> {
 
     let runs_start = 204;
     let run_size = 40;
-    if data.len() < runs_start + block_descriptors * run_size {
+    let runs_len = block_descriptors.checked_mul(run_size);
+    if runs_len.is_none_or(|n| data.len().saturating_sub(runs_start) < n) {
         return Err(LimitHit::corrupt("UDIF mish: truncated run list".into()));
     }
 
     let mut runs = Vec::with_capacity(block_descriptors);
     for i in 0..block_descriptors {
-        let o = runs_start + i * run_size;
-        let entry_type = u32::from_be_bytes(data[o..o + 4].try_into().unwrap());
-        let sector_start = u64::from_be_bytes(data[o + 8..o + 16].try_into().unwrap());
-        let sector_count = u64::from_be_bytes(data[o + 16..o + 24].try_into().unwrap());
-        let data_offset = u64::from_be_bytes(data[o + 24..o + 32].try_into().unwrap());
-        let data_length = u64::from_be_bytes(data[o + 32..o + 40].try_into().unwrap());
+        // Inside the list, which was checked to be all there.
+        let o = i.saturating_mul(run_size).saturating_add(runs_start);
+        let run = &data[o..o.saturating_add(run_size)];
+        let entry_type = u32::from_be_bytes(run[0..4].try_into().unwrap());
+        let sector_start = u64::from_be_bytes(run[8..16].try_into().unwrap());
+        let sector_count = u64::from_be_bytes(run[16..24].try_into().unwrap());
+        let data_offset = u64::from_be_bytes(run[24..32].try_into().unwrap());
+        let data_length = u64::from_be_bytes(run[32..40].try_into().unwrap());
         runs.push(BlkxRun {
             entry_type,
             sector_start,
@@ -544,10 +559,23 @@ fn parse_mish(data: &[u8]) -> Result<Partition, LimitHit> {
     })
 }
 
+// The tests lay out their inputs by index arithmetic on small constants.
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A run count whose product with the 40-byte run size wraps a 32-bit
+    /// `usize` to a small number: the list is longer than the data, not short.
+    #[test]
+    fn a_run_count_that_wraps_the_list_size_is_a_truncated_list() {
+        let mut mish = vec![0u8; 244];
+        mish[..4].copy_from_slice(&MISH_MAGIC.to_be_bytes());
+        // 0x0666_6667 * 40 = 0x1_0000_0018
+        mish[200..204].copy_from_slice(&0x0666_6667u32.to_be_bytes());
+        assert!(parse_mish(&mish).is_err());
+    }
 
     /// A UDIF image of `sectors` sectors in one run of `kind`, its bytes `run`.
     fn udif(kind: u32, sectors: u64, run: &[u8]) -> Vec<u8> {

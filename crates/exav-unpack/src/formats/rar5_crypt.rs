@@ -135,10 +135,26 @@ pub(crate) fn find_keys(
     passwords: &[String],
     cache: &mut Vec<([u8; 16], u8, Vec<u8>, Keys)>,
 ) -> Option<Keys> {
+    find_keys_within(record, passwords, cache, MAX_KDF_ROUNDS)
+}
+
+/// The PBKDF2 iterations all the derivations of one archive may add up to:
+/// every member may carry a salt of its own, and every password is tried over
+/// each. About half a minute of HMACs.
+const MAX_KDF_ROUNDS: u64 = 1 << 25;
+
+fn find_keys_within(
+    record: &CryptRecord,
+    passwords: &[String],
+    cache: &mut Vec<([u8; 16], u8, Vec<u8>, Keys)>,
+    max_rounds: u64,
+) -> Option<Keys> {
     let candidates = passwords
         .iter()
         .map(String::as_str)
         .chain(super::DEFAULT_ARCHIVE_PASSWORDS.iter().copied());
+    let rounds_of = |count: u8| 1u64 << count.min(MAX_KDF_COUNT);
+    let mut spent: u64 = cache.iter().map(|(_, c, ..)| rounds_of(*c)).sum();
     for pw in candidates {
         let pw = pw.as_bytes();
         let cached = cache
@@ -148,6 +164,10 @@ pub(crate) fn find_keys(
         let keys = match cached {
             Some(k) => k,
             None => {
+                spent = spent.saturating_add(rounds_of(record.kdf_count));
+                if spent > max_rounds {
+                    return None;
+                }
                 let k = derive(pw, &record.salt, record.kdf_count)?;
                 cache.push((record.salt, record.kdf_count, pw.to_vec(), k.clone()));
                 k
@@ -187,4 +207,37 @@ pub(crate) fn tweak_crc(hash_key: &[u8; 32], crc: u32) -> u32 {
         .iter()
         .enumerate()
         .fold(0u32, |r, (i, &b)| r ^ (u32::from(b) << ((i & 3) * 8)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record whose password check no candidate passes.
+    fn record(salt: u8, kdf_count: u8) -> CryptRecord {
+        let value = [7u8; 8];
+        let mut check = [0u8; 12];
+        check[..8].copy_from_slice(&value);
+        check[8..].copy_from_slice(&Sha256::digest(value)[..4]);
+        CryptRecord {
+            kdf_count,
+            salt: [salt; 16],
+            iv: [0; 16],
+            check: Some(check),
+            tweaked: false,
+        }
+    }
+
+    /// Salts of a member each, and a password list: the derivations stop at
+    /// the archive's total, not at the end of the members.
+    #[test]
+    fn key_derivations_over_many_salts_stop_at_the_total() {
+        let passwords: Vec<String> = (0..50).map(|i| format!("password {i}")).collect();
+        let mut cache = Vec::new();
+        // 2^10 iterations a derivation, 2^13 allowed in all: eight of them.
+        for salt in 0..40 {
+            assert!(find_keys_within(&record(salt, 10), &passwords, &mut cache, 1 << 13).is_none());
+        }
+        assert_eq!(cache.len(), 8);
+    }
 }

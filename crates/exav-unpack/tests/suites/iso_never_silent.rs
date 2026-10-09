@@ -124,6 +124,24 @@ fn a_corrupt_directory_record_is_reported_when_streamed() {
 }
 
 #[test]
+fn a_directory_that_lists_itself_is_walked_once() {
+    // A subdirectory record pointing back at its own extent used to be queued
+    // again and again until the directory limit, then reported as too many.
+    let mut img = iso(&[("SUB", 18, 200), ("A.TXT", 19, 5)], 200);
+    img[18 * SECTOR + 25] = 0x02; // the first record is a directory
+    img[19 * SECTOR..19 * SECTOR + 5].copy_from_slice(b"hello");
+    let e = entries(&img);
+    assert!(
+        e.iter().all(|x| x.unsupported.is_none()),
+        "a loop is walked once, got {:?}",
+        e.iter()
+            .map(|x| (&x.name, x.unsupported))
+            .collect::<Vec<_>>()
+    );
+    assert!(e.iter().any(|x| x.data == b"hello"));
+}
+
+#[test]
 fn a_well_formed_member_is_still_extracted_normally() {
     // The counterweight: none of the above may make ordinary images noisy.
     let mut img = iso(&[("A.TXT", 19, 5)], 200);
@@ -143,30 +161,34 @@ fn a_well_formed_member_is_still_extracted_normally() {
 fn hitting_the_directory_walk_cap_is_reported() {
     // More directories than the walk guard allows. Stopping quietly would leave
     // the rest of the image unenumerated while it could still be called clean.
-    // Each directory record points at another directory, so the walk queues
-    // more than MAX_DIRS of them.
-    let mut img = vec![0u8; SECTOR * 40];
+    // Each directory record points at a directory of its own, so the walk
+    // queues more than MAX_DIRS of them.
+    let mut img = vec![0u8; SECTOR * 60];
     let pvd = 16 * SECTOR;
     img[pvd] = 1;
     img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
     let rd = pvd + 156;
     img[rd] = 34;
     img[rd + 2..rd + 6].copy_from_slice(&18u32.to_le_bytes());
-    img[rd + 10..rd + 14].copy_from_slice(&2048u32.to_le_bytes());
+    img[rd + 10..rd + 14].copy_from_slice(&(40 * 2048u32).to_le_bytes());
     img[rd + 25] = 0x02;
     img[rd + 32] = 1;
     let term = 17 * SECTOR;
     img[term] = 0xff;
     img[term + 1..term + 6].copy_from_slice(b"CD001");
 
-    // Root directory packed with subdirectory records, each pointing back at
-    // sector 18 — a cycle, so the walk is bounded only by the count guard.
+    // Root directory packed with subdirectory records, each naming a distinct
+    // extent past the end of the image: none has anything in it, and each
+    // still counts as a directory to walk.
     let mut p = 18 * SECTOR;
-    for i in 0..40 {
+    for i in 0..1100u32 {
         let name = format!("D{i}");
         let rec_len = 33 + name.len();
+        if (p % SECTOR) + rec_len > SECTOR {
+            p = (p / SECTOR + 1) * SECTOR; // a record does not cross a sector
+        }
         img[p] = rec_len as u8;
-        img[p + 2..p + 6].copy_from_slice(&18u32.to_le_bytes());
+        img[p + 2..p + 6].copy_from_slice(&(1000 + i).to_le_bytes());
         img[p + 10..p + 14].copy_from_slice(&2048u32.to_le_bytes());
         img[p + 25] = 0x02; // directory
         img[p + 32] = name.len() as u8;

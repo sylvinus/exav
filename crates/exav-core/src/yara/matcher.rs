@@ -191,14 +191,16 @@ impl PatternDef {
             PatternDef::Base64 { entries } => {
                 let entries = entries
                     .iter()
-                    .map(|e| Base64Sub {
-                        searched: e.searched.clone(),
-                        pattern: e.pattern.clone(),
-                        padding: e.padding,
-                        wide: e.wide,
-                        engine: b64_engine(e.alphabet.as_deref()),
+                    .map(|e| {
+                        Ok(Base64Sub {
+                            searched: e.searched.clone(),
+                            pattern: e.pattern.clone(),
+                            padding: e.padding,
+                            wide: e.wide,
+                            engine: b64_engine(e.alphabet.as_deref())?,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 PatternMatcher::Base64 { entries }
             }
         })
@@ -207,13 +209,18 @@ impl PatternDef {
 
 /// Builds a NO_PAD base64 engine for the given alphabet (standard if `None`).
 /// Shared by the compiler (fresh lowering) and [`PatternDef::compile`] (load).
-/// A stored alphabet was validated at compile time, so `Alphabet::new` cannot
-/// fail here for a def rebuilt from a database.
-pub(crate) fn b64_engine(alphabet: Option<&str>) -> base64::engine::GeneralPurpose {
-    let alph = alphabet.map_or(base64::alphabet::STANDARD, |a| {
-        base64::alphabet::Alphabet::new(a).unwrap()
-    });
-    base64::engine::GeneralPurpose::new(&alph, base64::engine::general_purpose::NO_PAD)
+/// An alphabet read from a database is not trusted: one that is not 64 distinct
+/// printable characters is an error.
+pub(crate) fn b64_engine(alphabet: Option<&str>) -> Result<base64::engine::GeneralPurpose> {
+    let alph = match alphabet {
+        None => base64::alphabet::STANDARD,
+        Some(a) => base64::alphabet::Alphabet::new(a)
+            .map_err(|e| Error::new(format!("invalid base64 alphabet: {e}")))?,
+    };
+    Ok(base64::engine::GeneralPurpose::new(
+        &alph,
+        base64::engine::general_purpose::NO_PAD,
+    ))
 }
 
 #[inline]
@@ -713,6 +720,9 @@ fn verify_base64(
     engine: &base64::engine::GeneralPurpose,
     wide: bool,
 ) -> Option<(usize, usize)> {
+    if pattern.is_empty() {
+        return None;
+    }
     let len = base64::encoded_len(pattern.len(), false)?;
 
     let (mut decode_start_delta, mut decode_len, mut match_len) = match padding {
@@ -977,4 +987,48 @@ pub(crate) fn normalize_yara_regex(src: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base64_def(searched: &[u8], pattern: &[u8], alphabet: Option<&str>) -> PatternDef {
+        PatternDef::Base64 {
+            entries: vec![Base64SubDef {
+                searched: searched.to_vec(),
+                pattern: pattern.to_vec(),
+                padding: 0,
+                wide: false,
+                alphabet: alphabet.map(String::from),
+            }],
+        }
+    }
+
+    fn found(def: &PatternDef, data: &[u8]) -> Vec<Match> {
+        let mut out = Collector::new();
+        def.compile()
+            .unwrap()
+            .search(data, 0..data.len(), 0, &mut out);
+        out.out
+    }
+
+    /// The rules of a database are not trusted: an alphabet that is not 64
+    /// distinct characters is an error, not a panic.
+    #[test]
+    fn a_stored_base64_alphabet_of_the_wrong_length_is_refused() {
+        assert!(base64_def(b"YWJj", b"abc", Some("abc")).compile().is_err());
+        assert!(base64_def(b"YWJj", b"abc", None).compile().is_ok());
+    }
+
+    /// A stored pattern with nothing to decode to has no match to report: it
+    /// matched with a length of zero at every place its needle was.
+    #[test]
+    fn a_stored_base64_pattern_that_is_empty_matches_nothing() {
+        assert_eq!(
+            found(&base64_def(b"YWJj", b"abc", None), b"..YWJj..").len(),
+            1
+        );
+        assert!(found(&base64_def(b"YWJj", b"", None), b"..YWJj..").is_empty());
+    }
 }

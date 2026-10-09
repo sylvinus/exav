@@ -105,10 +105,17 @@ impl Mn {
         }
     }
 
-    /// The mnemonic a generated map's name index names.
-    fn from_generated(i: usize) -> Mn {
-        debug_assert!(i < generated::OF_NAMES.len(), "name index {i} out of range");
-        Mn(i as u16)
+    /// The mnemonic a generated map's name index names; `None` for an index
+    /// the names do not reach.
+    fn from_generated(i: usize) -> Option<Mn> {
+        generated::OF_NAMES.get(i)?;
+        u16::try_from(i).ok().map(Mn)
+    }
+
+    /// The mnemonic of a cell's name field, which holds the index plus one:
+    /// `0` is an empty cell.
+    fn from_field(field: u32) -> Option<Mn> {
+        Mn::from_generated(usize::try_from(field.checked_sub(1)?).ok()?)
     }
 
     /// The index for a name, resolved at compile time.
@@ -1413,7 +1420,7 @@ fn vex_tail(
     if cell & VEX_SUB_BIT != 0 {
         let m = r.peek().unwrap_or(0);
         let block = (cell >> VEX_NAME_SHIFT) as usize;
-        cell = sub[block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0)];
+        cell = *sub.get(block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0))?;
     }
     if cell == 0 {
         return None;
@@ -1424,7 +1431,7 @@ fn vex_tail(
     if cell & VEX_STRICT_VVVV != 0 && vvvv != 0xf {
         return None;
     }
-    let mn = Mn::from_generated(((cell >> VEX_NAME_SHIFT) - 1) as usize);
+    let mn = Mn::from_field(cell >> VEX_NAME_SHIFT)?;
     // Nearly every such encoding reads a ModRM byte; `vzeroupper` and
     // `vzeroall` are the exceptions, and consuming a byte they do not read
     // would report them two to six bytes too long.
@@ -1752,8 +1759,8 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         if cell & EVEX_SUB_BIT != 0 {
             let m = r.peek().unwrap_or(0);
             let block = (cell >> EVEX_NAME_SHIFT) as usize;
-            cell = generated::EVEX_SUB
-                [block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0)];
+            cell = *generated::EVEX_SUB
+                .get(block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0))?;
         }
         if cell == 0
             || (cell & EVEX_STRICT_VVVV != 0 && vvvv != 0xf)
@@ -1763,7 +1770,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         {
             return None;
         }
-        let mn = Mn::from_generated(((cell >> EVEX_NAME_SHIFT) - 1) as usize);
+        let mn = Mn::from_field(cell >> EVEX_NAME_SHIFT)?;
         // Every EVEX encoding reads a ModRM byte, and an eight-bit
         // displacement in one is *compressed*: it counts elements, not bytes,
         // so it has to be scaled by a factor the encoding chooses. Nothing in
@@ -2015,7 +2022,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             }
             return Some(Insn {
                 len: r.i,
-                mn: Mn::from_generated(((cell >> 2) - 1) as usize),
+                mn: Mn::from_field(u32::from(cell >> 2))?,
                 ops: [rm, Op::None, Op::None],
                 rep,
                 repne,
@@ -2042,7 +2049,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             if cell == 0 {
                 return None;
             }
-            let mn = Mn::from_generated(((cell >> 2) - 1) as usize);
+            let mn = Mn::from_field(u32::from(cell >> 2))?;
             let imm = match cell & 3 {
                 0 => 0usize,
                 1 => 1,
@@ -2127,7 +2134,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         let (mn, imm) = match exact.flatten() {
             Some((_, _, _, name, imm)) => {
                 modrm_is_opcode = true;
-                (Mn::from_generated(name as usize), imm as usize)
+                (Mn::from_generated(usize::from(name))?, usize::from(imm))
             }
             None if keyed_on_modrm => return None,
             None => {
@@ -2141,7 +2148,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
                     2 => 2,
                     _ => 4,
                 };
-                (Mn::from_generated(((cell >> 2) - 1) as usize), imm)
+                (Mn::from_field(u32::from(cell >> 2))?, imm)
             }
         };
         // `0F 20`–`23` move to and from the control and debug registers. They
@@ -2819,6 +2826,84 @@ mod tests {
                 assert!(seen.insert(n), "{n} appears twice in HAND_NAMES");
             }
         }
+    }
+
+    /// The decoder takes a name from a table cell as `field - 1` and an index
+    /// into `OF_NAMES`; every non-empty cell must name one that exists, and
+    /// every block a cell points to must lie in its table.
+    #[test]
+    fn every_table_cell_names_a_mnemonic() {
+        let short = |maps: &[&[u16]]| {
+            for m in maps {
+                for &c in *m {
+                    assert!(
+                        c == 0 || Mn::from_field(u32::from(c >> 2)).is_some(),
+                        "cell {c:#x}"
+                    );
+                }
+            }
+        };
+        short(&[
+            &generated::OF_MAP,
+            &generated::OF38_MAP,
+            &generated::OF3A_MAP,
+            &generated::NOW3D_MAP,
+        ]);
+        for &(_, _, _, name, _) in &generated::OF_MOD3 {
+            assert!(
+                Mn::from_generated(usize::from(name)).is_some(),
+                "OF_MOD3 name {name}"
+            );
+        }
+        let long = |what: &str, cells: &[u32], sub: &[u32], sub_bit: u32, shift: u32| {
+            let named = |c: u32| c == 0 || Mn::from_field(c >> shift).is_some();
+            for &c in cells {
+                if c & sub_bit == 0 {
+                    assert!(named(c), "{what} cell {c:#x}");
+                    continue;
+                }
+                let block = (c >> shift) as usize;
+                let cells = sub
+                    .get(block * 16..block * 16 + 16)
+                    .unwrap_or_else(|| panic!("{what} block {block}"));
+                for &s in cells {
+                    assert!(s & sub_bit == 0 && named(s), "{what} sub cell {s:#x}");
+                }
+            }
+        };
+        long(
+            "VEX",
+            &generated::VEX_MAP,
+            &generated::VEX_SUB,
+            VEX_SUB_BIT,
+            VEX_NAME_SHIFT,
+        );
+        long(
+            "XOP",
+            &generated::XOP_MAP,
+            &generated::XOP_SUB,
+            VEX_SUB_BIT,
+            VEX_NAME_SHIFT,
+        );
+        long(
+            "EVEX",
+            &generated::EVEX_CELLS,
+            &generated::EVEX_SUB,
+            EVEX_SUB_BIT,
+            EVEX_NAME_SHIFT,
+        );
+    }
+
+    /// An index or field the names do not reach is no mnemonic, not a wrong one.
+    #[test]
+    fn a_name_index_past_the_names_is_none() {
+        let n = generated::OF_NAMES.len();
+        assert!(Mn::from_generated(n - 1).is_some());
+        assert!(Mn::from_generated(n).is_none());
+        assert!(Mn::from_field(0).is_none());
+        assert!(Mn::from_field(n as u32).is_some());
+        assert!(Mn::from_field(n as u32 + 1).is_none());
+        assert!(Mn::from_field(u32::MAX).is_none());
     }
 
     /// Interning must round-trip: the index a constant holds must name it back.

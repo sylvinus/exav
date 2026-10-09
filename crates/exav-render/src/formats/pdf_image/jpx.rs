@@ -132,7 +132,7 @@ pub fn decode_jpx(
     let mut space = boxes.colour;
     if !params.indexed {
         if let (Some(palette), Some(mapping)) = (&boxes.palette, &boxes.mapping) {
-            planes = apply_palette(&planes, palette, mapping, &siz)?;
+            planes = apply_palette(&planes, palette, mapping, &siz, max_alloc)?;
         }
         if let Some(definitions) = &boxes.definitions {
             apply_channel_definitions(&mut planes, definitions);
@@ -403,7 +403,15 @@ fn apply_palette(
     palette: &Palette,
     mapping: &[Mapping],
     siz: &Siz,
+    max_alloc: u64,
 ) -> Result<Vec<Plane>, Error> {
+    // A mapping entry makes a plane of its own, however small the file: the
+    // planes held, the components and the mapped ones, are counted.
+    let samples = planes.first().map_or(0, |p| p.values.len() as u64);
+    let held = (planes.len() as u64).saturating_add(mapping.len() as u64);
+    if held.saturating_mul(samples).saturating_mul(4) > max_alloc {
+        return Err(Error::new("Image too large"));
+    }
     let mut out = Vec::with_capacity(mapping.len());
     for m in mapping {
         let source = planes
@@ -650,5 +658,58 @@ impl<'a> Iterator for BoxIter<'a> {
         let body = &d[header as usize..len as usize];
         self.0 = &d[len as usize..];
         Some((kind, body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each entry of the component mapping box is a plane of its own, so a
+    /// few kilobytes of boxes asked for planes without end.
+    #[test]
+    fn a_mapping_of_many_entries_is_counted_against_the_budget() {
+        let samples = 4096;
+        let planes = [Plane {
+            values: vec![0; samples],
+            precision: 8,
+            dx: 1,
+        }];
+        let palette = Palette {
+            entries: vec![vec![0, 0, 0]; 4],
+            columns: 3,
+        };
+        let siz = Siz {
+            width: 64,
+            height: 64,
+            components: vec![Component {
+                precision: 8,
+                signed: false,
+                dx: 1,
+                dy: 1,
+            }],
+            grid: Grid {
+                x: 64,
+                y: 64,
+                offset: (0, 0),
+                tile: (64, 64),
+                tile_offset: (0, 0),
+            },
+        };
+        let mapping = |n: usize| {
+            vec![
+                Mapping {
+                    component: 0,
+                    palette_column: Some(1)
+                };
+                n
+            ]
+        };
+        let run = |n: usize| apply_palette(&planes, &palette, &mapping(n), &siz, 1 << 20);
+        assert_eq!(run(3).map(|p| p.len()), Ok(3));
+        assert!(
+            run(4096).is_err(),
+            "4096 planes of 16 KiB in a 1 MiB budget"
+        );
     }
 }

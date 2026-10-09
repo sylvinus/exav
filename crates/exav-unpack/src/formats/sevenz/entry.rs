@@ -158,12 +158,13 @@ fn decode_block_graph(
         // Each coder declares its OWN output size; handing a sub-coder the
         // whole folder's size makes it decode far past its stream (LZMA reports
         // a distance overflow), so look up this coder's entry.
-        let out_size = block
-            .unpack_sizes
-            .get(out_base[coder_idx] as usize)
-            .copied()
-            .unwrap_or_else(|| super::header::folder_out_size(block))
-            as usize;
+        let out_size = crate::bytes::to_usize(
+            usize::try_from(out_base[coder_idx])
+                .ok()
+                .and_then(|i| block.unpack_sizes.get(i))
+                .copied()
+                .unwrap_or_else(|| super::header::folder_out_size(block)),
+        );
         if coder.method_id.as_slice() == super::parse::ID_BCJ2 {
             if inputs.len() != 4 {
                 return Err(LimitHit::corrupt(
@@ -236,7 +237,7 @@ fn decode_block(
         let mut slices: Vec<&[u8]> = Vec::with_capacity(pack_sizes.len());
         let mut off = 0usize;
         for s in pack_sizes {
-            let end = off.saturating_add(*s as usize);
+            let end = off.saturating_add(crate::bytes::to_usize(*s));
             if end > pack_data.len() {
                 return Err(LimitHit::corrupt(
                     "7z: packed stream extends past the archive".to_string(),
@@ -284,6 +285,39 @@ struct Failed(Option<std::io::Error>);
 impl Read for Failed {
     fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
         self.0.take().map_or(Ok(0), Err)
+    }
+}
+
+/// The decoder of the solid block being walked, and how many of its decoded
+/// bytes have been read. The members of a block follow each other in it, so
+/// the next one starts where this one left off: starting the decoder over for
+/// each is a pass over the block per member.
+struct Solid {
+    block: usize,
+    reader: Box<dyn Read>,
+    pos: u64,
+}
+
+/// What is known of the passwords for the encrypted block being walked: the
+/// one that decrypted a member, with the block it decrypted, and those that
+/// are not it.
+struct AesBlock {
+    block: usize,
+    good: Option<Vec<u8>>,
+    wrong: Vec<bool>,
+}
+
+/// A reader that counts what is read through it.
+struct Counted<'a> {
+    inner: &'a mut dyn Read,
+    read: u64,
+}
+
+impl Read for Counted<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(out)?;
+        self.read += n as u64;
+        Ok(n)
     }
 }
 
@@ -397,6 +431,14 @@ fn stream_sevenz<T>(
     };
     let passwords: Vec<String> = budget.passwords.clone();
     let max_buffer = budget.limits.max_buffer_bytes;
+    let mut solid: Option<Solid> = None;
+    let mut aes_state: Option<AesBlock> = None;
+    // Sizes added up once, not for each member over the members before it.
+    let mut before: Vec<u64> = Vec::with_capacity(archive.files.len() + 1);
+    before.push(0);
+    for f in &archive.files {
+        before.push(before[before.len() - 1].saturating_add(f.size));
+    }
 
     for (file_idx, file) in archive.files.iter().enumerate() {
         if !file.has_stream || file.size == 0 {
@@ -465,49 +507,78 @@ fn stream_sevenz<T>(
             .get(block_idx)
             .copied()
             .unwrap_or(0);
-        let sub_index = file_idx.saturating_sub(block_first_file);
-        let mut bytes_to_skip: u64 = 0;
-        for si in 0..sub_index {
-            let sub_file_idx = block_first_file + si;
-            if sub_file_idx < archive.files.len() {
-                bytes_to_skip = bytes_to_skip.saturating_add(archive.files[sub_file_idx].size);
-            }
-        }
+        let bytes_to_skip: u64 = if file_idx > block_first_file {
+            before[file_idx.min(archive.files.len())]
+                .saturating_sub(before[block_first_file.min(archive.files.len())])
+        } else {
+            0
+        };
         let block_total = super::header::folder_out_size(block);
 
         if aes {
             // Encrypted: decode the whole block (bounded), CRC-verify, try each
             // password — the buffered path, since streaming can't retry/verify.
+            // The block is decrypted once, not once per member: each decryption
+            // derives the key again (2^19 SHA-256 rounds or more) and decodes
+            // the block. A password is dropped for the block when its decode
+            // fails or its first member does not check out: a wrong key gives
+            // garbage for every member, and a right one is told by the CRC.
+            if aes_state.as_ref().is_none_or(|s| s.block != block_idx) {
+                aes_state = Some(AesBlock {
+                    block: block_idx,
+                    good: None,
+                    wrong: vec![false; passwords.len()],
+                });
+            }
+            let Some(state) = aes_state.as_mut() else {
+                continue;
+            };
+            let member = |dec: &[u8]| -> Option<Vec<u8>> {
+                let start = crate::bytes::to_usize(bytes_to_skip);
+                if start >= dec.len() {
+                    return None;
+                }
+                let end = start
+                    .saturating_add(crate::bytes::to_usize(file.size))
+                    .min(dec.len());
+                let fd = dec[start..end].to_vec();
+                if file.has_crc {
+                    let mut h = crc32fast::Hasher::new();
+                    h.update(&fd);
+                    if h.finalize() != file.crc {
+                        return None;
+                    }
+                }
+                Some(fd)
+            };
             let mut file_data: Option<Vec<u8>> = None;
-            for pw in passwords.iter().map(|p| Some(p.as_str())) {
-                match decode_block(
-                    block,
-                    pack_data,
-                    &block_pack_sizes,
-                    block_total,
-                    pw,
-                    max_buffer,
-                ) {
+            if let Some(dec) = &state.good {
+                file_data = member(dec);
+            } else {
+                for (i, pw) in passwords.iter().enumerate() {
+                    if state.wrong[i] {
+                        continue;
+                    }
                     // A decode that fails is a wrong password as likely as
                     // damage: try the next one.
-                    Ok((dec, None)) => {
-                        let start = bytes_to_skip as usize;
-                        if start >= dec.len() {
-                            continue;
-                        }
-                        let end = start.saturating_add(file.size as usize).min(dec.len());
-                        let fd = dec[start..end].to_vec();
-                        if file.has_crc {
-                            let mut h = crc32fast::Hasher::new();
-                            h.update(&fd);
-                            if h.finalize() != file.crc {
-                                continue;
+                    match decode_block(
+                        block,
+                        pack_data,
+                        &block_pack_sizes,
+                        block_total,
+                        Some(pw.as_str()),
+                        max_buffer,
+                    ) {
+                        Ok((dec, None)) => match member(&dec) {
+                            Some(fd) => {
+                                file_data = Some(fd);
+                                state.good = Some(dec);
+                                break;
                             }
-                        }
-                        file_data = Some(fd);
-                        break;
+                            None => state.wrong[i] = true,
+                        },
+                        Ok((_, Some(_))) | Err(_) => state.wrong[i] = true,
                     }
-                    Ok((_, Some(_))) | Err(_) => continue,
                 }
             }
             let r = match file_data {
@@ -561,21 +632,35 @@ fn stream_sevenz<T>(
         // A multi-input folder (BCJ2) cannot be streamed as a linear chain: its
         // filter needs all four streams present at once. Decode the block
         // buffered instead, bounded by the same peak-buffer limit.
-        let mut reader: Box<dyn Read> = if block.coders.iter().any(|c| c.num_in_streams > 1) {
-            let (decoded, failed) = decode_block(
-                block,
-                pack_data,
-                &block_pack_sizes,
-                block_total,
-                None,
-                max_buffer,
-            )?;
-            Box::new(Cursor::new(decoded).chain(Failed(failed)))
-        } else {
-            decode_block_reader(block, pack_data, block_total, None, max_buffer)?
+        if !solid
+            .as_ref()
+            .is_some_and(|s| s.block == block_idx && s.pos <= bytes_to_skip)
+        {
+            let reader: Box<dyn Read> = if block.coders.iter().any(|c| c.num_in_streams > 1) {
+                let (decoded, failed) = decode_block(
+                    block,
+                    pack_data,
+                    &block_pack_sizes,
+                    block_total,
+                    None,
+                    max_buffer,
+                )?;
+                Box::new(Cursor::new(decoded).chain(Failed(failed)))
+            } else {
+                decode_block_reader(block, pack_data, block_total, None, max_buffer)?
+            };
+            solid = Some(Solid {
+                block: block_idx,
+                reader,
+                pos: 0,
+            });
+        }
+        let Some(s) = solid.as_mut() else {
+            continue;
         };
-        let (skipped, failed) = skip_reader(reader.as_mut(), bytes_to_skip);
-        if skipped < bytes_to_skip {
+        let (skipped, failed) = skip_reader(s.reader.as_mut(), bytes_to_skip - s.pos);
+        s.pos += skipped;
+        if s.pos < bytes_to_skip {
             // The block ended before this file's offset: the sub-stream table
             // claims more content than the block decodes to. Every later member
             // of a solid block is in the same position, so leaving these out
@@ -596,14 +681,22 @@ fn stream_sevenz<T>(
             }
             continue;
         }
-        let mut window = reader.take(file.size);
+        let mut window = Counted {
+            inner: s.reader.as_mut(),
+            read: 0,
+        }
+        .take(file.size);
         let meta = MemberMeta {
             name,
             comp_size: file.size,
             size: Some(file.size),
             ..MemberMeta::default()
         };
-        if let Some(t) = emit_stream(&meta, &mut window, budget, visit)? {
+        let emitted = emit_stream(&meta, &mut window, budget, visit);
+        // Where the next member of the block starts from: what was read,
+        // which may be less than the member's size.
+        s.pos += window.get_ref().read;
+        if let Some(t) = emitted? {
             return Ok(Some(t));
         }
     }

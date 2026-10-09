@@ -52,14 +52,13 @@ const RTABLE_NAME: &str = "::DataSpace/Storage/MSCompressed/Transform/\
 // ---- little-endian readers, all bounds-checked (return None past EOF) --------
 
 fn u16at(d: &[u8], p: usize) -> Option<u16> {
-    d.get(p..p + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    crate::bytes::at(d, p, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 fn u32at(d: &[u8], p: usize) -> Option<u32> {
-    d.get(p..p + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    crate::bytes::at(d, p, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 fn u64at(d: &[u8], p: usize) -> Option<u64> {
-    d.get(p..p + 8)
+    crate::bytes::at(d, p, 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
@@ -94,6 +93,8 @@ struct DirEntry {
 struct ChmDir {
     sec0_offset: usize,
     entries: Vec<DirEntry>,
+    /// An entry of the listing could not be read: files after it are unknown.
+    listing_damaged: bool,
 }
 
 /// Parse the ITSF header + ITSP directory. Returns `None` if this isn't a
@@ -103,18 +104,18 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
         return None;
     }
     // Header-section table follows the 0x38-byte ITSF header.
-    let off_hs1 = u64at(d, 0x38 + 0x10)? as usize; // ITSP directory
-                                                   // The directory offset must land inside the file. Bounding it here also keeps
-                                                   // every `off_hs1 + <small const>` read below from overflowing `usize` on a
-                                                   // crafted 64-bit offset (a `d.len() <= isize::MAX` invariant makes the adds
-                                                   // safe once `off_hs1 < d.len()`).
+    let off_hs1 = crate::bytes::to_usize(u64at(d, 0x38 + 0x10)?); // ITSP directory
+                                                                  // The directory offset must land inside the file. Bounding it here also keeps
+                                                                  // every `off_hs1 + <small const>` read below from overflowing `usize` on a
+                                                                  // crafted 64-bit offset (a `d.len() <= isize::MAX` invariant makes the adds
+                                                                  // safe once `off_hs1 < d.len()`).
     if off_hs1 >= d.len() {
         return None;
     }
     // OffsetCS0 (content section 0 base). Present in v3; for v1/2 we recompute
     // it below from the directory geometry.
     let version = u32at(d, 0x04)?;
-    let mut sec0_offset = u64at(d, 0x38 + 0x20).unwrap_or(0) as usize;
+    let mut sec0_offset = crate::bytes::to_usize(u64at(d, 0x38 + 0x20).unwrap_or(0));
 
     // ITSP directory header.
     if d.get(off_hs1..off_hs1 + 4)? != b"ITSP" {
@@ -140,6 +141,7 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
     }
 
     let mut entries = Vec::new();
+    let mut listing_damaged = false;
     for cn in 0..num_chunks {
         let cs = dir_start + cn * chunk_size;
         let chunk = &d[cs..cs + chunk_size];
@@ -150,18 +152,32 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
         // The entry region runs from +0x14 up to the quickref area; the very last
         // u16 of the chunk is the entry count. Read encints bounded by `end`.
         let end = chunk_size - 2;
-        let num_entries = u16at(chunk, end)? as usize;
+        let Some(num_entries) = u16at(chunk, end).map(usize::from) else {
+            listing_damaged = true;
+            continue;
+        };
         let mut p = 0x14usize;
         for _ in 0..num_entries {
-            let name_len = read_encint(chunk, &mut p, end)? as usize;
+            // An entry that cannot be read ends this chunk's listing, and the
+            // listing is reported as damaged: what follows is not in the list.
+            let Some(name_len) = read_encint(chunk, &mut p, end).map(crate::bytes::to_usize) else {
+                listing_damaged = true;
+                break;
+            };
             if name_len > end.saturating_sub(p) {
+                listing_damaged = true;
                 break; // truncated / hostile name length
             }
             let name = String::from_utf8_lossy(&chunk[p..p + name_len]).into_owned();
             p += name_len;
-            let section = read_encint(chunk, &mut p, end)?;
-            let offset = read_encint(chunk, &mut p, end)?;
-            let length = read_encint(chunk, &mut p, end)?;
+            let (Some(section), Some(offset), Some(length)) = (
+                read_encint(chunk, &mut p, end),
+                read_encint(chunk, &mut p, end),
+                read_encint(chunk, &mut p, end),
+            ) else {
+                listing_damaged = true;
+                break;
+            };
             entries.push(DirEntry {
                 name,
                 section,
@@ -174,6 +190,7 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
     Some(ChmDir {
         sec0_offset,
         entries,
+        listing_damaged,
     })
 }
 
@@ -281,7 +298,7 @@ fn decompress_content(
     rt: &ResetTable,
     cap: usize,
 ) -> (Vec<u8>, Vec<bool>) {
-    let real_len = rt.uncomp_len as usize;
+    let real_len = crate::bytes::to_usize(rt.uncomp_len);
     if real_len == 0 || cap == 0 {
         return (Vec::new(), Vec::new());
     }
@@ -482,6 +499,20 @@ pub(crate) fn extract_chm<R>(
         }
     }
 
+    if dir.listing_damaged {
+        // Files the listing would have named are in the container, unseen.
+        budget.count_entry()?;
+        return Ok(visit(
+            Entry::unsupported(
+                "chm-directory".to_string(),
+                data.len() as u64,
+                false,
+                "CHM directory damaged; the files after the damage are not listed",
+            ),
+            budget,
+        ));
+    }
+
     Ok(None)
 }
 
@@ -593,6 +624,52 @@ mod tests {
         d[dir_start + 0x14] = 0x81;
         d[dir_start + 0x15] = 0x00;
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Chm, &d, &mut budget).unwrap().is_empty());
+        // The listing is damaged, which is reported: no file is named.
+        let entries = extract(Format::Chm, &d, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].unsupported.is_some());
+    }
+
+    /// An entry count past the entries a listing chunk holds runs the reader
+    /// off the end of its entries. The files before that point are still
+    /// extracted, and the damage is reported; the whole CHM used to come back
+    /// as nothing at all.
+    #[test]
+    fn a_listing_chunk_with_too_many_entries_keeps_the_files_before_it() {
+        let path = format!(
+            "{}/tests/fixtures/chm/benign-lzx.chm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let blob = std::fs::read(path).unwrap();
+        let mut budget = Budget::new(Limits::default());
+        let want = extract(Format::Chm, &blob, &mut budget).unwrap();
+        assert!(!want.is_empty());
+        assert!(want.iter().all(|e| e.unsupported.is_none()));
+
+        let hs1 = u64at(&blob, 0x48).unwrap() as usize;
+        let chunk_size = u32at(&blob, hs1 + 0x10).unwrap() as usize;
+        let num_chunks = u32at(&blob, hs1 + 0x2c).unwrap() as usize;
+        let dir_start = hs1 + 0x54;
+        let mut bad = blob.clone();
+        let mut hit = false;
+        for cn in 0..num_chunks {
+            let cs = dir_start + cn * chunk_size;
+            if &bad[cs..cs + 4] == b"PMGL" {
+                let end = cs + chunk_size - 2;
+                bad[end..end + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+                hit = true;
+            }
+        }
+        assert!(hit, "the sample has a listing chunk");
+        let mut budget = Budget::new(Limits::default());
+        let got = extract(Format::Chm, &bad, &mut budget).unwrap();
+        for w in &want {
+            assert!(
+                got.iter().any(|g| g.name == w.name && g.data == w.data),
+                "{} kept",
+                w.name
+            );
+        }
+        assert!(got.iter().any(|g| g.unsupported.is_some()));
     }
 }

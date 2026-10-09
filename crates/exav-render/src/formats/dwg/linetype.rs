@@ -199,10 +199,10 @@ pub fn dash_polyline(
         // Emit each drawn interval following the polyline's own vertices, so a
         // dash spanning a corner bends with it instead of cutting across.
         let mut prev = point_at(&path, &cum, s0);
-        for i in 0..path.len() {
-            if cum[i] <= s0 {
-                continue;
-            }
+        // The vertices past `s0`: found by search, as a scan from the start
+        // for every dash is quadratic in a long polyline.
+        let first = cum.partition_point(|&c| c <= s0);
+        for i in first..path.len() {
             if cum[i] >= s1 {
                 break;
             }
@@ -427,6 +427,26 @@ mod tests {
         };
         let labelled = Pattern::with_labels(&[1.0, -1.0], &[label], 1.0).unwrap();
         assert!(dash_labels(&pts, false, &labelled).is_empty());
+    }
+
+    /// Each dash looked for its vertices from the start of the polyline, so
+    /// the dashes of a polyline of a million vertices took minutes. The
+    /// bound is wide: the pass is a few milliseconds.
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "timing")]
+    fn the_dashes_of_a_long_polyline_do_not_each_scan_all_its_vertices() {
+        let pts: Vec<[f64; 2]> = (0..=1_000_000).map(|i| [f64::from(i), 0.0]).collect();
+        let p = Pattern::new(&[50.0, -50.0], 1.0).unwrap();
+        let t = std::time::Instant::now();
+        let dashes = dash_polyline(&pts, false, &p).unwrap();
+        assert!(t.elapsed().as_millis() < 400, "took {:?}", t.elapsed());
+        // 10,000 dashes of 50 unit segments each.
+        assert_eq!(dashes.len(), 10_000 * 50);
+        assert_eq!(dashes[0], [[0.0, 0.0], [1.0, 0.0]]);
+        assert_eq!(
+            dashes[dashes.len() - 1],
+            [[999_949.0, 0.0], [999_950.0, 0.0]]
+        );
     }
 
     #[test]

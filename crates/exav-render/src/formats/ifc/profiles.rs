@@ -173,6 +173,7 @@ impl<'a> Reader<'a> {
         if depth > MAX_DEPTH {
             return None;
         }
+        self.visit()?;
         let (ty, p) = self.get(id)?;
         let num = |i: usize| p.get(i).and_then(Value::num).filter(|v| v.is_finite());
         let opt = |i: usize| num(i).unwrap_or(0.0).max(0.0);
@@ -520,6 +521,30 @@ fn thicken(c: &[V2], t: f64) -> Option<Vec<V2>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ifc::StepFile;
+
+    /// A composite profile listing the next level twice, thirty levels deep:
+    /// the visits are budgeted by the size of the file, not walked in full.
+    #[test]
+    fn a_composite_profile_chain_that_doubles_each_level_is_cut_short() {
+        let levels = 30;
+        let mut step = String::from(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+             #1=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,1.,1.);\n",
+        );
+        for k in 2..=levels + 1 {
+            step.push_str(&format!(
+                "#{k}=IFCCOMPOSITEPROFILEDEF(.AREA.,$,(#{p},#{p}),$);\n",
+                p = k - 1
+            ));
+        }
+        step.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+        let f = StepFile::parse(step.as_bytes()).unwrap();
+        let mut r = Reader::new(&f, 1_000_000);
+        let start = std::time::Instant::now();
+        let _ = r.profile(levels + 1, 0);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn a_fillet_takes_the_corner_area_off() {

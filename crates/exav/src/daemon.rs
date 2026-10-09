@@ -1424,12 +1424,18 @@ fn set_timer(d: std::time::Duration) {
             tv_usec: 0,
         },
         it_value: libc::timeval {
-            tv_sec: d.as_secs() as _,
+            // A limit past what the clock holds is the longest one: cast, it
+            // would wrap negative, and the kernel refuses a negative time.
+            tv_sec: libc::time_t::try_from(d.as_secs()).unwrap_or(libc::time_t::MAX),
             tv_usec: d.subsec_micros() as _,
         },
     };
-    unsafe {
-        libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut());
+    let armed = unsafe { libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) };
+    if armed != 0 {
+        eprintln!(
+            "exav: the scan time limit could not be set: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -3474,6 +3480,23 @@ mod tests {
     fn a_scan_time_limit_as_wide_as_a_duration_gets_a_grace_not_a_panic() {
         let g = super::retire_grace(std::time::Duration::MAX);
         assert!(g >= std::time::Duration::from_secs(5));
+    }
+
+    /// A limit of `u64::MAX` seconds wrapped to -1 as a `time_t`, which the
+    /// kernel refuses, and the run went on with no limit at all.
+    #[test]
+    fn a_scan_time_limit_past_time_t_still_arms_the_timer() {
+        let armed = |it: &libc::itimerval| it.it_value.tv_sec > 0;
+        let read = || {
+            let mut it: libc::itimerval = unsafe { std::mem::zeroed() };
+            unsafe { libc::getitimer(libc::ITIMER_REAL, &mut it) };
+            it
+        };
+        super::set_timer(std::time::Duration::from_secs(u64::MAX));
+        let set = armed(&read());
+        super::set_timer(std::time::Duration::ZERO);
+        assert!(set, "the timer was armed");
+        assert!(!armed(&read()), "and disarmed again");
     }
 
     #[test]

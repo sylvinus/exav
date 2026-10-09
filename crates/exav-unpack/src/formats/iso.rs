@@ -1,4 +1,7 @@
 #![allow(unused_imports)]
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
 use crate::*;
 use std::collections::HashSet;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
@@ -40,7 +43,7 @@ fn vd_roots(read: &mut dyn FnMut(u64, usize) -> Vec<u8>) -> Vec<(bool, u64, u64)
     let mut primary = Vec::new();
     let mut joliet = Vec::new();
     for i in 0..32u64 {
-        let vd = read((16 + i) * SECTOR, 190);
+        let vd = read(i.saturating_add(16).saturating_mul(SECTOR), 190);
         if vd.len() < 190 || vd.get(1..6) != Some(b"CD001") {
             break;
         }
@@ -51,7 +54,11 @@ fn vd_roots(read: &mut dyn FnMut(u64, usize) -> Vec<u8>) -> Vec<(bool, u64, u64)
         if ty != 1 && ty != 2 {
             continue; // boot record or something we don't walk
         }
-        let le32 = |o: usize| u32::from_le_bytes([vd[o], vd[o + 1], vd[o + 2], vd[o + 3]]) as u64;
+        let le32 = |o: usize| {
+            crate::bytes::at(&vd, o, 4).map_or(0, |s| {
+                u64::from(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+            })
+        };
         let root = (le32(156 + 2), le32(156 + 10));
         // A Joliet SVD carries a UCS-2 escape sequence (`%/@`, `%/C`, `%/E`) at
         // offset 88; that flags UTF-16 names. A type-2 without it is treated as a
@@ -107,7 +114,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         })
     };
     let le32 = |b: &[u8], o: usize| -> u64 {
-        b.get(o..o + 4)
+        crate::bytes::at(b, o, 4)
             .map(|s| u32::from_le_bytes(s.try_into().unwrap()) as u64)
             .unwrap_or(0)
     };
@@ -122,9 +129,12 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     }
     let mut visited = 0usize;
     // Each queued dir carries the Joliet flag of the tree it belongs to.
+    // A directory is walked once per tree, however many records name it: a
+    // record can point back at its own extent.
+    let mut queued: HashSet<(bool, u64)> = roots.iter().map(|&(j, lba, _)| (j, lba)).collect();
     let mut dirs: Vec<(bool, u64, u64)> = roots;
     while let Some((joliet, lba, len)) = dirs.pop() {
-        visited += 1;
+        visited = visited.saturating_add(1);
         if visited > MAX_DIRS {
             // Breaking out silently would leave every remaining directory
             // unenumerated while the image could still be reported clean.
@@ -145,14 +155,18 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         while p < dir.len() {
             let rec_len = dir[p] as usize;
             if rec_len == 0 {
-                let next = (p / SECTOR as usize + 1) * SECTOR as usize;
+                let next = p
+                    .checked_div(SECTOR as usize)
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .saturating_mul(SECTOR as usize);
                 if next <= p {
                     break;
                 }
                 p = next;
                 continue;
             }
-            if rec_len < 33 || p + rec_len > dir.len() {
+            if rec_len < 33 || p.saturating_add(rec_len) > dir.len() {
                 // Everything after a corrupt record is unreachable.
                 out.push(Region::Unwalked(
                     format!("<iso-directory@lba{lba}-truncated>"),
@@ -160,28 +174,32 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
                 ));
                 break;
             }
-            let rec = &dir[p..p + rec_len];
+            let rec = &dir[p..p.saturating_add(rec_len)];
             let child_lba = le32(rec, 2);
             let child_len = le32(rec, 10);
             let name_len = rec[32] as usize;
             let flags = rec[25];
             let is_self_or_parent = name_len == 1 && matches!(rec.get(33), Some(0) | Some(1));
             if is_self_or_parent {
-                p += rec_len;
+                p = p.saturating_add(rec_len);
                 continue;
             }
             if flags & 0x02 != 0 {
-                dirs.push((joliet, child_lba, child_len));
+                if queued.insert((joliet, child_lba)) {
+                    dirs.push((joliet, child_lba, child_len));
+                }
             } else if seen_files.insert(child_lba) {
-                let raw = rec.get(33..33 + name_len.min(rec_len - 33)).unwrap_or(&[]);
+                let raw = rec
+                    .get(33..33usize.saturating_add(name_len.min(rec_len.saturating_sub(33))))
+                    .unwrap_or(&[]);
                 let name = decode_name(raw, joliet);
                 let fstart = child_lba.saturating_mul(SECTOR);
                 let fend = fstart.saturating_add(child_len).min(total_len);
                 if fend > fstart {
-                    out.push(Region::Member(name, fstart, fend - fstart));
+                    out.push(Region::Member(name, fstart, fend.saturating_sub(fstart)));
                 }
             }
-            p += rec_len;
+            p = p.saturating_add(rec_len);
         }
     }
     Ok((out, seen_files))

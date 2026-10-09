@@ -77,9 +77,9 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             _ => {
                 if value(a, "--preset", &mut it)?.is_some() {
                 } else if let Some(v) = value(a, "--hash-size", &mut it)? {
-                    params.hash_size = number(&v)? as u32;
+                    params.hash_size = number32(&v)?;
                 } else if let Some(v) = value(a, "--highfreq-factor", &mut it)? {
-                    params.highfreq_factor = number(&v)? as u32;
+                    params.highfreq_factor = number32(&v)?;
                 } else if let Some(v) = value(a, "--grey", &mut it)? {
                     params.grey = match v.as_str() {
                         "bt601-float" => Grey::Bt601Float,
@@ -198,6 +198,12 @@ fn number(v: &str) -> Result<u64, String> {
     v.parse().map_err(|_| format!("`{v}` is not a number"))
 }
 
+/// A number that fits `u32`: one past it would otherwise be cut to its low
+/// bits, a different hash size with no word about it.
+fn number32(v: &str) -> Result<u32, String> {
+    u32::try_from(number(v)?).map_err(|_| format!("`{v}` is too large"))
+}
+
 fn resize(v: &str) -> Result<Resize, String> {
     Ok(match v {
         "lanczos3" => Resize::Lanczos3,
@@ -234,6 +240,15 @@ fn formats(v: &str) -> Result<Formats, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hash_size_past_u32_is_refused_not_cut() {
+        // 2^32 + 8 would be a hash size of 8.
+        for opt in ["--hash-size", "--highfreq-factor"] {
+            let err = run(vec![opt.into(), "4294967304".into()]).unwrap_err();
+            assert!(err.contains("too large"), "{opt}: {err}");
+        }
+    }
 
     #[test]
     #[cfg(all(feature = "jp2", feature = "jbig2"))]

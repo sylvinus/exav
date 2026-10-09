@@ -653,6 +653,7 @@ dependencies = [
  "digest",
  "encoding_rs",
  "exav-pe-emu",
+ "explode",
  "ext4-view",
  "fatfs",
  "flate2",
