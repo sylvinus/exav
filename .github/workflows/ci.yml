@@ -111,6 +111,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@0.2.129
+      # The report sample names Helvetica without embedding it, so the PDF text
+      # and pinch tests measure whatever font the system gives that name. The
+      # URW base 35 set is Nimbus Sans, the metric match the tests were written
+      # against; the runner's image does not guarantee it.
+      - name: Fonts for the PDF samples
+        run: |
+          sudo apt-get update && sudo apt-get install -y fonts-urw-base35
+          fc-match Helvetica
+          fc-match Arial
       - run: make test-viewer
       # What the browser saw, for the failures that do not happen on a
       # developer's machine (the PDF text and pinch tests do not).
