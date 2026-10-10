@@ -500,7 +500,7 @@ mod tests {
             })
             .collect();
         let (_, truncated) = pattern_segments(
-            &[sq.clone()],
+            std::slice::from_ref(&sq),
             &lines[..MAX_PATTERN_LINES],
             IslandStyle::Normal,
         );

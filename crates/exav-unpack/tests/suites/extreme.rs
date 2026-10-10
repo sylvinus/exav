@@ -295,6 +295,7 @@ fn other_containers_fields_at_their_extremes() {
 
 /// The header ranges of an ARJ archive and where each one's CRC-32 sits: the
 /// main header, then each member's, with their extended headers.
+#[cfg(feature = "arj")]
 fn arj_header_crcs(blob: &[u8]) -> Vec<(Range<usize>, usize)> {
     let u16_at = |at: usize| u16::from_le_bytes([blob[at], blob[at + 1]]) as usize;
     let u32_at = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap()) as usize;
@@ -328,6 +329,7 @@ fn arj_header_crcs(blob: &[u8]) -> Vec<(Range<usize>, usize)> {
 
 /// ARJ checks a CRC over each header, so a changed field ends the walk at the
 /// first header unless the CRC is made right again.
+#[cfg(feature = "arj")]
 #[test]
 fn arj_fields_with_their_crc_made_right_at_their_extremes() {
     let p = format!("{}/tests/fixtures/sample.arj", env!("CARGO_MANIFEST_DIR"));

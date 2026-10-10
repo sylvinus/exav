@@ -211,8 +211,8 @@ fn zip_with_oversized_member(payload_tail: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     {
         let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
-        let o: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         z.start_file("big.bin", o).unwrap();
         std::io::Write::write_all(&mut z, &body).unwrap();
         z.finish().unwrap();
