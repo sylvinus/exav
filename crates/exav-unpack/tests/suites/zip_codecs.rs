@@ -207,6 +207,58 @@ fn legacy_methods_are_decoded() {
     }
 }
 
+/// A one-member ZIP holding `data` as method 6 (Implode) with the given flags.
+fn implode_zip(flags: u16, data: &[u8]) -> Vec<u8> {
+    let name = b"a";
+    let mut z = Vec::new();
+    z.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    for v in [20u16, flags, 6, 0, 0] {
+        z.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [0u32, data.len() as u32, 16] {
+        z.extend_from_slice(&v.to_le_bytes());
+    }
+    z.extend_from_slice(&[1, 0, 0, 0]);
+    z.extend_from_slice(name);
+    z.extend_from_slice(data);
+    let cd = z.len() as u32;
+    z.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+    for v in [20u16, 20, flags, 6, 0, 0] {
+        z.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [0u32, data.len() as u32, 16] {
+        z.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [1u16, 0, 0, 0, 0] {
+        z.extend_from_slice(&v.to_le_bytes());
+    }
+    z.extend_from_slice(&[0; 4]);
+    z.extend_from_slice(&0u32.to_le_bytes());
+    z.extend_from_slice(name);
+    let cd_len = z.len() as u32 - cd;
+    z.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    for v in [0u16, 0, 1, 1] {
+        z.extend_from_slice(&v.to_le_bytes());
+    }
+    z.extend_from_slice(&cd_len.to_le_bytes());
+    z.extend_from_slice(&cd.to_le_bytes());
+    z.extend_from_slice(&0u16.to_le_bytes());
+    z
+}
+
+/// Fuzz finding (2026-10-10, `unpack`): an Implode tree whose size byte is 255
+/// overflowed `byte + 1` in `zip` 8.6.0 (`legacy/implode.rs:29`). Containment
+/// turned the panic into "decoder panicked", but the member was lost and the
+/// archive reported as corrupt; the bad tree must be an ordinary decode error.
+#[test]
+fn implode_tree_size_255_is_not_a_panic() {
+    // flags 0b110: 8K window and a literal tree, so the first byte is a tree size.
+    let blob = implode_zip(0b110, &[0xff; 40]);
+    let mut budget = Budget::new(Limits::default());
+    let outcome = format!("{:?}", extract(Format::Zip, &blob, &mut budget));
+    assert!(!outcome.contains("panicked"), "{outcome}");
+}
+
 /// The `zip` crate decodes these methods whole, into a buffer it reserves from
 /// the member's declared size. Over the buffer limit, the member is not
 /// decoded and the limit is reported.

@@ -317,6 +317,39 @@ fn a_huge_declared_size_is_refused_before_decoding() {
     );
 }
 
+/// Fuzz finding (2026-10-10, `imagehash`: a timeout): 227 bytes of segments
+/// whose generic region declares hundreds of millions of pixels. The memory
+/// check charged a region at one bit a pixel, so a 64 MiB budget let through
+/// a decode of ~5 s in a release build (the viewer's 1 GiB budget allows 16 times as much). A
+/// region's pixels are work, charged at a byte each like the page's.
+#[test]
+fn a_region_declaring_more_pixels_than_the_budget_is_refused() {
+    let segments = fixture("jbig2_region_bomb.seg");
+    let started = std::time::Instant::now();
+    let embedded = decode_jbig2(&segments, 97, 61, None, 64 << 20);
+    assert_eq!(embedded.unwrap_err().message(), "Image too large");
+    // A file whose region is 2048 by 2048 (512 KiB as bits): over a 1 MiB
+    // budget as work, though not as memory.
+    let embedded: Vec<u8> = page_with_a_region(2048)
+        .iter()
+        .flat_map(|(h, d)| [&h[..], &d[..]].concat())
+        .collect();
+    let mut file = b"\x97JB2\r\n\x1a\n".to_vec();
+    file.extend_from_slice(&[1, 0, 0, 0, 1]);
+    file.extend_from_slice(&embedded);
+    assert_eq!(
+        decode(&file, Format::Jbig2, 1 << 20).unwrap_err(),
+        Error::TooLarge
+    );
+    assert_eq!(
+        decode_jbig2(&embedded, 120, 64, None, 1 << 20)
+            .unwrap_err()
+            .message(),
+        "Image too large"
+    );
+    assert!(started.elapsed().as_secs() < 2, "refused from the headers");
+}
+
 // pdf.js's layouts (exav-render's `pdf_image`), against the same sources.
 
 fn interleave_with(p: &Pixels, alpha: Option<u8>) -> Vec<u8> {

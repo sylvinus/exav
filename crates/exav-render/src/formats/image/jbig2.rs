@@ -27,6 +27,9 @@ pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
         .get(if flags & 2 != 0 { 9 } else { 13 }..)
         .unwrap_or_default();
     let regions = region_pixels(segments, flags & 1 == 0);
+    // Decoding a region costs time per pixel, whatever the memory its bitmap
+    // takes, so the declared pixels are charged at a byte each as well.
+    within(regions, max_alloc)?;
     // The page and region bitmaps, one bit a pixel, and the bytes the page
     // is unpacked into.
     within(

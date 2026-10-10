@@ -227,7 +227,7 @@ wasi-bin = ["dep:serde_json"]
 # the note there): the ready-made crates bring `rustix` + `linux-raw-sys` and
 # their thousands of unsafe blocks along for a page of `std::fs`.
 # only for building test ZIPs in unit tests
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # test fixtures only: build gzip/tar CVD fixtures + gzip scan inputs.
 # `default-features = false` turns off tar's `xattr` support, which is for
 # restoring extended attributes to a real filesystem (these fixtures are built

@@ -57,7 +57,7 @@ pub fn read_encrypted_member(
 ) -> Result<EncryptedMember, std::io::Error> {
     // The `zip` crate models a WinZip-AES member's `compression()` as a special
     // `Aes` method and stores the real method in the 0x9901 extra field.
-    let (aes_strength, method) = parse_aes_extra(file.extra_data())
+    let (aes_strength, method) = parse_aes_extra(file.extra_data().as_deref())
         .map(|(s, m)| (Some(s), m))
         .unwrap_or((None, compression_to_u16(file.compression())));
     // High byte of the 16-bit DOS mod-time — the ZipCrypto check byte for
@@ -81,6 +81,15 @@ pub fn read_encrypted_member(
         method,
         dos_time_hi,
     })
+}
+
+/// A member's name for reporting: the decoded name, or the raw bytes read as
+/// lossy UTF-8 when the archive's name does not decode.
+fn member_name<R: Read>(file: &::zip::read::ZipFile<'_, R>) -> String {
+    match file.name() {
+        Ok(n) => n.into_owned(),
+        Err(_) => String::from_utf8_lossy(file.name_raw()).into_owned(),
+    }
 }
 
 /// Map the crate's `CompressionMethod` to the ZIP numeric method code we need
@@ -1413,7 +1422,7 @@ pub fn extract_zip_from<Rd: Read + Seek + Clone, R>(
         if !file.is_file() && file.compressed_size() == 0 {
             continue;
         }
-        let name = file.name().to_string();
+        let name = member_name(&file);
         let comp = file.compressed_size();
         // Codec + declared uncompressed size, captured from the raw header so we
         // can decode methods the `zip` crate lacks (LZMA/BZIP2/ZSTD) ourselves.
@@ -1776,6 +1785,7 @@ fn zip_mtime<'a>(
             ::zip::ExtraField::Ntfs(n) => i64::try_from(n.mtime() / 10_000_000)
                 .ok()
                 .map(|s| s - FILETIME_EPOCH),
+            _ => None,
         })
         .next();
     unix.map(crate::Mtime::Unix).or_else(|| {
@@ -1839,7 +1849,7 @@ pub(crate) fn walk<T>(
         let (name, is_dir, encrypted, comp, size, method, mtime, mode, local) = {
             let f = zip.by_index_raw(i).map_err(|e| zip_entry_error(i, &e))?;
             (
-                f.name().to_string(),
+                member_name(&f),
                 f.is_dir(),
                 f.encrypted(),
                 f.compressed_size(),

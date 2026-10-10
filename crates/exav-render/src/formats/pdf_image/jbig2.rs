@@ -43,6 +43,11 @@ pub fn decode_jbig2(
     let page = u64::from(image.width()) * u64::from(image.height());
     let regions =
         region_pixels(data, false).saturating_add(globals.map_or(0, |g| region_pixels(g, false)));
+    // Decoding a region costs time per pixel, whatever the memory its bitmap
+    // takes, so the declared pixels are charged at a byte each as well.
+    if regions > max_alloc {
+        return Err(Error::new("Image too large"));
+    }
     // The page and region bitmaps, the page's rows as the decoder emits
     // them, and the output.
     if (page / 8)
