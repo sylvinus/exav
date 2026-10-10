@@ -17,6 +17,8 @@
 //!
 //! Single forward byte-wise passes, no allocation, no panics on binary input.
 
+use crate::byte_source::{Bytes, Indexed};
+
 /// Which SSN textual format(s) to count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsnMode {
@@ -243,12 +245,21 @@ fn card_at(buf: &[u8], credit_only: bool) -> bool {
 
 /// Count payment-card numbers in `data` (credit networks only).
 pub fn count_credit_cards(data: &[u8]) -> usize {
+    count_credit_cards_in(&mut Indexed(data))
+}
+
+/// Bytes [`card_at`] reads: every digit and separator it may take, and the
+/// byte after them.
+const CARD_REACH: usize = 19 + MAX_SEPARATORS as usize + 1;
+
+/// [`count_credit_cards`] over any object.
+pub(crate) fn count_credit_cards_in<B: Bytes>(data: &mut B) -> usize {
     let mut count = 0usize;
     let mut i = 0usize;
     while i < data.len() {
-        if data[i].is_ascii_digit()
-            && (i == 0 || !data[i - 1].is_ascii_digit())
-            && card_at(&data[i..], true)
+        if data.at(i).is_ascii_digit()
+            && (i == 0 || !data.at(i - 1).is_ascii_digit())
+            && card_at(&data.range(i, i + CARD_REACH), true)
         {
             count += 1;
             // Skip ahead past a plausible card so one number isn't recounted.
@@ -305,14 +316,15 @@ fn ssn_at(buf: &[u8], hyphens: bool) -> bool {
         && (1..=9999).contains(&serial)
 }
 
-fn count_ssn_fmt(data: &[u8], hyphens: bool) -> usize {
+fn count_ssn_fmt<B: Bytes>(data: &mut B, hyphens: bool) -> usize {
     let width = if hyphens { 11 } else { 9 };
     let mut count = 0usize;
     let mut i = 0usize;
     while i < data.len() {
-        if data[i].is_ascii_digit()
-            && (i == 0 || !data[i - 1].is_ascii_digit())
-            && ssn_at(&data[i..], hyphens)
+        if data.at(i).is_ascii_digit()
+            && (i == 0 || !data.at(i - 1).is_ascii_digit())
+            // `ssn_at` reads the number and the byte after it.
+            && ssn_at(&data.range(i, i + width + 1), hyphens)
         {
             count += 1;
             i += width;
@@ -324,6 +336,11 @@ fn count_ssn_fmt(data: &[u8], hyphens: bool) -> usize {
 
 /// Count US Social Security numbers in `data` in the requested format(s).
 pub fn count_ssns(data: &[u8], mode: SsnMode) -> usize {
+    count_ssns_in(&mut Indexed(data), mode)
+}
+
+/// [`count_ssns`] over any object.
+pub(crate) fn count_ssns_in<B: Bytes>(data: &mut B, mode: SsnMode) -> usize {
     match mode {
         SsnMode::Normal => count_ssn_fmt(data, true),
         SsnMode::Stripped => count_ssn_fmt(data, false),
@@ -448,5 +465,42 @@ mod tests {
             ..ScanOptions::default()
         };
         assert!(matches!(analyze(&db, &buf, &high).verdict, Verdict::Clean));
+    }
+
+    #[test]
+    fn counts_read_in_blocks_are_the_counts_from_memory() {
+        use crate::byte_source::{BlockCache, Stepper, CHUNK};
+        let plants: &[&[u8]] = &[
+            VISA,
+            MC,
+            AMEX,
+            DISCOVER,
+            b"4111 1111 1111 1111",
+            b"078-05-1120",
+            b"123-45-6789",
+            b"123456789",
+        ];
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut data = Vec::new();
+        while data.len() < 4 * CHUNK {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if state.is_multiple_of(7) {
+                data.extend_from_slice(plants[(state / 7 % plants.len() as u64) as usize]);
+            } else {
+                data.push(b"0123456789 -x\n"[(state % 14) as usize]);
+            }
+        }
+        let cache = BlockCache::with_sizes(std::io::Cursor::new(data.clone()), 61, 4 * 61).unwrap();
+        let cards = count_credit_cards(&data);
+        assert!(cards > 10);
+        assert_eq!(count_credit_cards_in(&mut Stepper::new(&cache)), cards);
+        for mode in [SsnMode::Normal, SsnMode::Stripped, SsnMode::Both] {
+            assert_eq!(
+                count_ssns_in(&mut Stepper::new(&cache), mode),
+                count_ssns(&data, mode)
+            );
+        }
     }
 }

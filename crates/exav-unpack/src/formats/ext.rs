@@ -17,6 +17,10 @@
 //! other such site, and an image past that budget is reported rather than
 //! quietly skipped.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// Bounds on the tree walk; hitting either is reported, never a quiet stop.
@@ -133,7 +137,7 @@ pub(crate) fn extract_ext<R>(
                 continue;
             }
             let path = format!("{}{}", dir.trim_end_matches('/'), format_args!("/{name}"));
-            seen += 1;
+            seen = seen.saturating_add(1);
             if seen > MAX_ENTRIES {
                 budget.count_entry()?;
                 if let Some(r) = visit(
@@ -168,7 +172,7 @@ pub(crate) fn extract_ext<R>(
                 continue;
             };
             if meta.is_dir() {
-                stack.push((path, depth + 1));
+                stack.push((path, depth.saturating_add(1)));
                 continue;
             }
             // Only regular files hold content. A symlink is a path, and a

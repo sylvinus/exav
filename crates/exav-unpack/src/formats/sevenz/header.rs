@@ -3,6 +3,9 @@
 use super::parse::*;
 use crate::LimitHit;
 
+/// The most coders a folder may chain.
+const MAX_CODERS: usize = 64;
+
 // ─── Data structures ───────────────────────────────────────────────────────
 
 pub(super) struct Coder {
@@ -291,6 +294,11 @@ fn parse_unpack_info(r: &mut SevenZReader) -> Result<Vec<Block>, LimitHit> {
 
 fn read_block(r: &mut SevenZReader) -> Result<Block, LimitHit> {
     let num_coders = read_var_usize(r)?;
+    // Decoding a folder recurses once per coder along its chain, and a real
+    // folder has a handful (a filter, a compressor, perhaps a cipher).
+    if num_coders > MAX_CODERS {
+        return Err(LimitHit::corrupt("7z: too many coders in a folder".into()));
+    }
     let mut coders = Vec::with_capacity(num_coders.min(r.remaining()));
     let mut total_in_streams: u64 = 0;
     let mut total_out_streams: u64 = 0;
@@ -638,15 +646,15 @@ fn parse_files_info(
             if non_empty_counter < total_unpack_sub_streams {
                 file.size = sub_streams_info
                     .as_ref()
-                    .map(|ssi| ssi.unpack_sizes[non_empty_counter])
+                    .and_then(|ssi| ssi.unpack_sizes.get(non_empty_counter).copied())
                     .unwrap_or(0);
                 file.has_crc = sub_streams_info
                     .as_ref()
-                    .map(|ssi| ssi.has_crc[non_empty_counter])
+                    .and_then(|ssi| ssi.has_crc.get(non_empty_counter).copied())
                     .unwrap_or(false);
                 file.crc = sub_streams_info
                     .as_ref()
-                    .map(|ssi| ssi.crcs[non_empty_counter])
+                    .and_then(|ssi| ssi.crcs.get(non_empty_counter).copied())
                     .unwrap_or(0);
             }
             non_empty_counter += 1;
@@ -991,7 +999,117 @@ mod tests {
         // is what actually regresses the fix).
         let _ = parse_archive(data, &[]);
         let mut budget = crate::Budget::new(crate::Limits::default());
-        let _ = crate::extract(crate::Format::SevenZip, data, &mut budget);
+        let _ = crate::extract(crate::Format::SevenZip, &data, &mut budget);
+    }
+
+    /// A 7z number of up to 29 bits.
+    fn num(v: u64) -> Vec<u8> {
+        match v {
+            0..=0x7F => vec![v as u8],
+            0x80..=0x3FFF => vec![0x80 | (v >> 8) as u8, v as u8],
+            0x4000..=0x1F_FFFF => vec![0xC0 | (v >> 16) as u8, v as u8, (v >> 8) as u8],
+            _ => vec![
+                0xE0 | (v >> 24) as u8,
+                v as u8,
+                (v >> 8) as u8,
+                (v >> 16) as u8,
+            ],
+        }
+    }
+
+    /// Ninety-nine thousand four-byte members of one stored folder: each is read
+    /// from where the one before it ended, not by decoding the folder again
+    /// up to it (a pass over the folder per member, and a copy of its packed
+    /// bytes per member).
+    #[test]
+    fn the_members_of_a_solid_folder_are_read_in_one_pass() {
+        let n: u64 = 99_000;
+        let packed: Vec<u8> = (0..n as u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut body = vec![0x01, 0x04, 0x06, 0x00, 0x01, 0x09];
+        body.extend(num(packed.len() as u64));
+        body.extend_from_slice(&[0x00, 0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C]);
+        body.extend(num(packed.len() as u64));
+        body.extend_from_slice(&[0x00, 0x08, 0x0D]);
+        body.extend(num(n));
+        body.push(0x09);
+        body.extend(std::iter::repeat_n(0x04u8, n as usize - 1));
+        body.extend_from_slice(&[0x00, 0x00, 0x05]);
+        body.extend(num(n));
+        body.push(0x11);
+        body.extend(num(1 + 4 * n));
+        body.push(0x00);
+        for _ in 0..n {
+            body.extend_from_slice(&[b'a', 0x00, 0x00, 0x00]);
+        }
+        body.extend_from_slice(&[0x00, 0x00]);
+        let mut data = vec![0u8; 32];
+        data[0..6].copy_from_slice(&SIGNATURE);
+        data[7] = 4;
+        data[12..20].copy_from_slice(&(packed.len() as u64).to_le_bytes());
+        data[20..28].copy_from_slice(&(body.len() as u64).to_le_bytes());
+        data.extend_from_slice(&packed);
+        data.extend_from_slice(&body);
+
+        let mut budget = crate::Budget::new(crate::Limits::default());
+        let start = std::time::Instant::now();
+        let got = crate::extract(crate::Format::SevenZip, &data.as_slice(), &mut budget).unwrap();
+        let took = start.elapsed();
+        assert_eq!(got.len(), n as usize);
+        assert!(got.iter().all(|e| e.unsupported.is_none()));
+        assert_eq!(got[12_345].data, 12_345u32.to_le_bytes());
+        assert_eq!(got[98_999].data, 98_999u32.to_le_bytes());
+        // About 70 ms; the pass per member took several seconds.
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// A folder of a hundred thousand Copy coders chained end to end is refused
+    /// by the header, not decoded by a recursion as deep.
+    #[test]
+    fn a_folder_of_a_hundred_thousand_chained_coders_is_refused() {
+        let n: u32 = 100_000;
+        // 7z number of three bytes: 110xxxxx, then the low 16 bits.
+        let num = [0xC0 | (n >> 16) as u8, n as u8, (n >> 8) as u8];
+        let mut body = vec![
+            0x01, // NID_HEADER
+            0x04, // NID_MAIN_STREAMS_INFO
+            0x06, // NID_PACK_INFO
+            0x00, // pack_pos
+            0x01, // num_pack_streams
+            0x09, // NID_SIZE
+            0x00, // pack size[0]
+            0x00, // NID_END (pack info)
+            0x07, // NID_UNPACK_INFO
+            0x0B, // NID_FOLDER
+            0x01, // num_blocks
+            0x00, // external
+        ];
+        body.extend_from_slice(&num); // num_coders
+        for _ in 0..n {
+            body.extend_from_slice(&[0x01, 0x00]); // Copy
+        }
+        // Coder i takes the output of coder i + 1; the last takes the pack stream.
+        for i in 0..n - 1 {
+            for v in [i, i + 1] {
+                body.extend_from_slice(&[0xC0 | (v >> 16) as u8, v as u8, (v >> 8) as u8]);
+            }
+        }
+        body.push(0x0C); // NID_CODERS_UNPACK_SIZE
+        body.extend(std::iter::repeat_n(0u8, n as usize));
+        body.extend_from_slice(&[
+            0x00, // NID_END (unpack info)
+            0x00, // NID_END (streams info)
+            0x05, // NID_FILES_INFO
+            0x01, // num_files
+            0x11, // NID_NAMES
+            0x05, // size
+            0x00, // external
+            b'a', 0x00, 0x00, 0x00, // "a", terminated
+            0x00, // NID_END (files info)
+            0x00, // NID_END (header)
+        ]);
+        let data = wrap_archive(&body);
+        assert!(parse_archive(&data, &[]).is_err());
+        extract_no_panic(&data);
     }
 
     /// SubStreamsInfo with an absurd `NID_NUM_UNPACK_STREAM` count: the running

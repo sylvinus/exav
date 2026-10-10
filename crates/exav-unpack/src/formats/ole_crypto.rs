@@ -13,7 +13,7 @@
 //! project) are not.
 //!
 //! This module also implements the legacy **XOR obfuscation** scheme
-//! (`wEncryptionType == 0`, [MS-OFFCRYPTO] §2.3.7) and both OOXML schemes —
+//! (`wEncryptionType == 0`, [MS-OFFCRYPTO] §2.3.7) and both OOXML schemes:
 //! **standard** (AES-ECB, SHA-1 spun 50000×) and **agile** (AES-CBC with a
 //! per-blob KDF), §2.3.4. `ole.rs` routes an `EncryptionInfo` +
 //! `EncryptedPackage` compound file here and scans the recovered `.zip`; a
@@ -24,7 +24,7 @@ use sha1::Sha1;
 
 /// Passwords exav tries automatically on an encrypted Office document before
 /// giving up and reporting it password-protected: the Excel default (opens with
-/// no prompt — the common malware trick) and the empty password.
+/// no prompt, the common malware trick) and the empty password.
 pub(crate) const DEFAULT_OFFICE_PASSWORDS: &[&str] = &["VelvetSweatshop", ""];
 
 fn md5(data: &[u8]) -> [u8; 16] {
@@ -121,7 +121,7 @@ impl KeyDeriver {
                     k[..5].copy_from_slice(&hf[..5]);
                     k
                 } else {
-                    hf[..*key_bytes].to_vec()
+                    hf[..(*key_bytes).min(hf.len())].to_vec()
                 }
             }
         }
@@ -184,7 +184,7 @@ fn parse_filepass(stream: &[u8]) -> Option<FilePass> {
         return None;
     }
     let size = u16::from_le_bytes([stream[fp + 2], stream[fp + 3]]) as usize;
-    let rec = stream.get(body..body + size)?;
+    let rec = crate::bytes::at(stream, body, size)?;
     if rec.len() < 6 || u16::from_le_bytes([rec[0], rec[1]]) != 1 {
         return None; // XOR obfuscation or none
     }
@@ -203,15 +203,16 @@ fn parse_filepass(stream: &[u8]) -> Option<FilePass> {
         // then EncryptionVerifier{SaltSize(4) Salt EncVerifier(16) HashSize(4) Hash}.
         let hdr_meta = rec.get(6..14)?;
         let header_size = u32::from_le_bytes(hdr_meta[4..8].try_into().ok()?) as usize;
-        let header = rec.get(14..14 + header_size)?;
+        let header = crate::bytes::at(rec, 14, header_size)?;
         let key_bits = u32::from_le_bytes(header.get(16..20)?.try_into().ok()?);
-        let v = rec.get(14 + header_size..)?;
+        let v = rec.get(14usize.checked_add(header_size)?..)?;
         let salt_size = u32::from_le_bytes(v.get(0..4)?.try_into().ok()?) as usize;
-        let salt = v.get(4..4 + salt_size)?.to_vec();
-        let enc_verifier = v.get(4 + salt_size..4 + salt_size + 16)?.to_vec();
-        let vh = 4 + salt_size + 16;
-        let vhash_size = u32::from_le_bytes(v.get(vh..vh + 4)?.try_into().ok()?) as usize;
-        let enc_vhash = v.get(vh + 4..vh + 4 + vhash_size)?.to_vec();
+        let salt = crate::bytes::at(v, 4, salt_size)?.to_vec();
+        let ev_off = 4usize.checked_add(salt_size)?;
+        let enc_verifier = crate::bytes::at(v, ev_off, 16)?.to_vec();
+        let vh = ev_off.checked_add(16)?;
+        let vhash_size = u32::from_le_bytes(crate::bytes::at(v, vh, 4)?.try_into().ok()?) as usize;
+        let enc_vhash = crate::bytes::at(v, vh.checked_add(4)?, vhash_size)?.to_vec();
         Some(FilePass {
             salt,
             enc_verifier,
@@ -230,7 +231,7 @@ const BLOCK: usize = 1024;
 
 /// Decrypt a whole `Workbook`/`Book` stream in place following the BIFF record
 /// structure: record headers stay cleartext, exempt records' data stays
-/// cleartext, and every other record's data is RC4-decrypted — while the cipher
+/// cleartext, and every other record's data is RC4-decrypted, while the cipher
 /// position advances continuously over the cleartext regions (re-keyed each
 /// 1024-byte block). See [MS-OFFCRYPTO] §2.3.6.1.
 fn decrypt_workbook(stream: &[u8], deriver: &KeyDeriver) -> Vec<u8> {
@@ -290,7 +291,7 @@ fn decrypt_workbook(stream: &[u8], deriver: &KeyDeriver) -> Vec<u8> {
 /// (basic / CryptoAPI) and the legacy XOR obfuscation (`wEncryptionType == 0`).
 /// Returns the decrypted stream on the first password that verifies, or `None`
 /// if the scheme is unhandled or no password matched (the caller then reports
-/// password-protected — never a silent clean).
+/// password-protected, never a silent clean).
 pub(crate) fn try_decrypt_workbook(stream: &[u8], passwords: &[String]) -> Option<Vec<u8>> {
     let candidates: Vec<&str> = passwords
         .iter()
@@ -350,7 +351,7 @@ const XOR_MATRIX: [u16; 105] = [
     0x4084, 0x8108, 0x1231, 0x2462, 0x48C4,
 ];
 
-/// `ROR(b1 ^ b2, 1)` over 8 bits — the per-element mixing of the XOR array.
+/// `ROR(b1 ^ b2, 1)` over 8 bits: the per-element mixing of the XOR array.
 fn xor_ror(b1: u8, b2: u8) -> u8 {
     (b1 ^ b2).rotate_right(1)
 }
@@ -424,8 +425,9 @@ fn xor_create_array(pw: &str) -> Option<[u8; 16]> {
         index -= 1;
         pad_index -= 1;
         obf[index] = xor_ror(XOR_PAD[pad_index], lo);
-        index -= 1;
-        pad_index -= 1;
+        // An odd count of pad bytes ends here, one step short of two.
+        index = index.saturating_sub(1);
+        pad_index = pad_index.saturating_sub(1);
     }
     Some(obf)
 }
@@ -443,7 +445,7 @@ fn parse_filepass_xor(stream: &[u8]) -> Option<u16> {
         return None;
     }
     let size = u16::from_le_bytes([stream[fp + 2], stream[fp + 3]]) as usize;
-    let rec = stream.get(body..body + size)?;
+    let rec = crate::bytes::at(stream, body, size)?;
     // XORObfuscation: wEncryptionType(2)=0, Key(2), VerificationBytes(2).
     if rec.len() < 6 || u16::from_le_bytes([rec[0], rec[1]]) != 0 {
         return None;
@@ -492,7 +494,7 @@ fn decrypt_workbook_xor(stream: &[u8], password: &str) -> Vec<u8> {
 
 // ─────────────────────────── OOXML (.docx/.xlsx) AES ───────────────────────────
 
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 
 /// AES-ECB decrypt `data` in place-copy (used by OOXML STANDARD encryption, which
 /// is ECB with no IV). Trailing partial block is left as-is.
@@ -503,8 +505,7 @@ fn aes_ecb_decrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
             if let Ok(c) = <$ty>::new_from_slice(key) {
                 for chunk in out.chunks_mut(16) {
                     if chunk.len() == 16 {
-                        let mut b =
-                            aes::cipher::generic_array::GenericArray::clone_from_slice(chunk);
+                        let mut b = aes::Block::try_from(&*chunk).expect("a whole block");
                         c.decrypt_block(&mut b);
                         chunk.copy_from_slice(&b);
                     }
@@ -564,9 +565,9 @@ fn parse_ooxml_standard(info: &[u8]) -> Option<OoxmlStandard> {
     if minor != 2 {
         return None; // not standard encryption
     }
-    let header_size = u32::from_le_bytes([info[8], info[9], info[10], info[11]]) as usize;
+    let header_size = u32::from_le_bytes(info.get(8..12)?.try_into().ok()?) as usize;
     // EncryptionHeader starts at offset 12; KeySize is its 5th u32 (offset +16).
-    let hdr = info.get(12..12 + header_size)?;
+    let hdr = crate::bytes::at(info, 12, header_size)?;
     let key_bits = u32::from_le_bytes(hdr.get(16..20)?.try_into().ok()?);
     let key_bytes = if key_bits == 0 {
         16
@@ -574,15 +575,16 @@ fn parse_ooxml_standard(info: &[u8]) -> Option<OoxmlStandard> {
         (key_bits / 8) as usize
     };
     // EncryptionVerifier follows the header.
-    let v = info.get(12 + header_size..)?;
+    let v = info.get(12usize.checked_add(header_size)?..)?;
     let salt_size = u32::from_le_bytes(v.get(0..4)?.try_into().ok()?) as usize;
-    let salt = v.get(4..4 + salt_size)?.to_vec();
-    let enc_verifier = v.get(4 + salt_size..4 + salt_size + 16)?.to_vec();
-    let vh_off = 4 + salt_size + 16;
-    let vhash_size = u32::from_le_bytes(v.get(vh_off..vh_off + 4)?.try_into().ok()?) as usize;
+    let salt = crate::bytes::at(v, 4, salt_size)?.to_vec();
+    let ev_off = 4usize.checked_add(salt_size)?;
+    let enc_verifier = crate::bytes::at(v, ev_off, 16)?.to_vec();
+    let vh_off = ev_off.checked_add(16)?;
+    let vhash_size = u32::from_le_bytes(crate::bytes::at(v, vh_off, 4)?.try_into().ok()?) as usize;
     // The stored hash is padded up to the cipher block; read the padded field.
-    let padded = vhash_size.div_ceil(16) * 16;
-    let enc_verifier_hash = v.get(vh_off + 4..vh_off + 4 + padded)?.to_vec();
+    let padded = vhash_size.checked_next_multiple_of(16)?;
+    let enc_verifier_hash = crate::bytes::at(v, vh_off.checked_add(4)?, padded)?.to_vec();
     Some(OoxmlStandard {
         key_bytes,
         salt,
@@ -702,7 +704,7 @@ impl HashAlg {
 /// trailing partial block untouched. All AES key lengths (128/192/256) supported.
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     use aes::cipher::block_padding::NoPadding;
-    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    use aes::cipher::{BlockModeDecrypt, KeyIvInit};
     let mut out = data.to_vec();
     let n = out.len() - out.len() % 16;
     if iv.len() < 16 || n == 0 {
@@ -711,7 +713,7 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     macro_rules! run {
         ($ty:ty) => {{
             if let Ok(c) = <cbc::Decryptor<$ty>>::new_from_slices(key, &iv[..16]) {
-                let _ = c.decrypt_padded_mut::<NoPadding>(&mut out[..n]);
+                let _ = c.decrypt_padded::<NoPadding>(&mut out[..n]);
             }
         }};
     }
@@ -821,11 +823,16 @@ fn parse_ooxml_agile(info: &[u8]) -> Option<OoxmlAgile> {
     })
 }
 
+/// The most hash rounds taken from an `EncryptionInfo`'s `spinCount`.
+const MAX_AGILE_SPIN: u32 = 1_000_000;
+
 /// Agile password hash ([MS-OFFCRYPTO] §2.3.4.11): `H0 = Hash(salt ‖ UTF16LE(pw))`,
 /// then `spin` iterations of `Hi = Hash(LE32(i) ‖ H(i-1))`. Excludes the block key.
 fn agile_iterated_hash(salt: &[u8], pw: &str, alg: HashAlg, spin: u32) -> Vec<u8> {
     let mut h = alg.digest(&[salt, &utf16le(pw)].concat());
-    for i in 0..spin {
+    // Office writes 100,000. The count is the file's, and each password tried
+    // costs this many hashes: 4 billion would be an hour of one.
+    for i in 0..spin.min(MAX_AGILE_SPIN) {
         let mut m = i.to_le_bytes().to_vec();
         m.extend_from_slice(&h);
         h = alg.digest(&m);
@@ -907,6 +914,54 @@ fn decrypt_agile_package(package: &[u8], secret: &[u8], a: &OoxmlAgile) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The password and the EncryptionInfo come from the user and the file: no
+    /// length of either may panic the derivation.
+    #[test]
+    fn a_spin_count_of_billions_is_cut_to_a_million_rounds() {
+        let start = std::time::Instant::now();
+        let h = agile_iterated_hash(&[0u8; 16], "pw", HashAlg::Sha1, u32::MAX);
+        assert_eq!(h.len(), 20);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        // The same as asking for the cut itself.
+        assert_eq!(
+            h,
+            agile_iterated_hash(&[0u8; 16], "pw", HashAlg::Sha1, MAX_AGILE_SPIN)
+        );
+    }
+
+    #[test]
+    fn xor_arrays_for_every_password_length_are_built() {
+        for n in 0..=16 {
+            let pw = "a".repeat(n);
+            assert_eq!(
+                xor_create_array(&pw).is_some(),
+                (1..=15).contains(&n),
+                "length {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cryptoapi_key_size_past_the_hash_is_cut_to_the_hash() {
+        let k = KeyDeriver::cryptoapi(&[0u8; 16], "pw", 2048);
+        assert!(k.block_key(0).len() <= 20);
+    }
+
+    #[test]
+    fn a_short_standard_encryption_info_is_not_parsed_not_a_panic() {
+        for len in 0..=11 {
+            let mut info = vec![0u8; len];
+            if len > 3 {
+                info[2] = 2; // minor
+            }
+            assert!(parse_ooxml_standard(&info).is_none(), "length {len}");
+        }
+        let mut huge = vec![0u8; 16];
+        huge[2] = 2;
+        huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_ooxml_standard(&huge).is_none());
+    }
 
     fn eicar() -> &'static [u8] {
         crate::eicar()
@@ -1003,6 +1058,50 @@ mod tests {
         assert!(recovered.windows(eicar().len()).any(|w| w == eicar()));
     }
 
+    /// A workbook embedded in another, as Excel stores an inserted workbook
+    /// object, is decrypted too: only the first workbook stream was checked,
+    /// and a plain one at the top hid an encrypted one below it. Excel names
+    /// the storage `MBD` and eight hex digits, which the walk visits after
+    /// `/Workbook`; a shorter name is visited before it.
+    #[test]
+    fn an_embedded_encrypted_workbook_is_decrypted() {
+        use std::io::Write;
+        let salt = [0x5au8; 16];
+        let d = KeyDeriver::basic(&salt, "VelvetSweatshop");
+        let enc = verifier_pair(&d, &[0x24u8; 16]);
+        let mut fp = vec![1u8, 0, 1, 0, 1, 0];
+        fp.extend_from_slice(&salt);
+        fp.extend_from_slice(&enc[..32]);
+        let ct = encrypted_workbook(&d, &fp);
+
+        for storage in ["/MBD0001", "/MBD0012AB34"] {
+            let mut cf = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+            let plain = [0x09, 0x08, 0, 0, 0x0a, 0x00, 0, 0];
+            cf.create_stream("/Workbook")
+                .unwrap()
+                .write_all(&plain)
+                .unwrap();
+            cf.create_storage(storage).unwrap();
+            let inner_path = format!("{storage}/Workbook");
+            cf.create_stream(&inner_path)
+                .unwrap()
+                .write_all(&ct)
+                .unwrap();
+            let blob = cf.into_inner().into_inner();
+            let entries = crate::formats::ole::extract_ole(
+                &blob,
+                &mut crate::Budget::new(crate::Limits::default()),
+            )
+            .unwrap();
+            let inner = entries.iter().find(|e| e.name == inner_path).unwrap();
+            assert!(inner.encrypted && inner.unsupported.is_none(), "{storage}");
+            assert!(
+                inner.data.windows(eicar().len()).any(|w| w == eicar()),
+                "{storage}"
+            );
+        }
+    }
+
     /// End-to-end (RC4-CryptoAPI, 128-bit): VelvetSweatshop default recovers EICAR.
     #[test]
     fn velvetsweatshop_cryptoapi_recovers_eicar() {
@@ -1032,11 +1131,11 @@ mod tests {
     }
 
     fn aes_ecb_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
-        use aes::cipher::{BlockEncrypt, KeyInit};
+        use aes::cipher::{BlockCipherEncrypt, KeyInit};
         let cipher = aes::Aes128::new_from_slice(key).unwrap();
         let mut out = data.to_vec();
         for chunk in out.chunks_mut(16) {
-            let mut b = aes::cipher::generic_array::GenericArray::clone_from_slice(chunk);
+            let mut b = aes::Block::try_from(&*chunk).unwrap();
             cipher.encrypt_block(&mut b);
             chunk.copy_from_slice(&b);
         }
@@ -1159,11 +1258,11 @@ mod tests {
     }
 
     fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
-        use aes::cipher::{block_padding::NoPadding, BlockEncryptMut, KeyIvInit};
+        use aes::cipher::{block_padding::NoPadding, BlockModeEncrypt, KeyIvInit};
         let mut out = data.to_vec();
         let n = out.len();
         let enc = <cbc::Encryptor<aes::Aes256>>::new_from_slices(key, &iv[..16]).unwrap();
-        enc.encrypt_padded_mut::<NoPadding>(&mut out, n)
+        enc.encrypt_padded::<NoPadding>(&mut out, n)
             .unwrap()
             .to_vec()
     }
@@ -1305,7 +1404,7 @@ encryptedVerifierHashInput=\"{}\" encryptedVerifierHashValue=\"{}\" encryptedKey
 
     /// End-to-end: obfuscate a BIFF `Workbook` (BOF, XOR `FilePass`, an EICAR
     /// record, EOF) with the XOR scheme, then confirm the default-password path
-    /// recovers the cleartext EICAR — exercising the per-record index math.
+    /// recovers the cleartext EICAR, exercising the per-record index math.
     #[test]
     fn xor_obfuscation_recovers_eicar() {
         let pw = "VelvetSweatshop";

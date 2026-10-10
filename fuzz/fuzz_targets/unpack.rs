@@ -8,11 +8,24 @@
 //! (ZipCrypto/WinZip-AES, 7z AES, PDF/DMG crypto) are reachable when the mutator
 //! produces a plausible encrypted container.
 //!
-//! Seed corpus: `fuzz/corpus/unpack/` — real format headers (zip, rar, pdf,
-//! ole2, 7z, cab, and the newer decoders) that let the mutator start inside each
-//! parser instead of rediscovering magic bytes.
+//! Seeds: `scripts/fuzz-seeds.sh` (the `containers` directory, every test
+//! fixture of at most 64 KiB), so the mutator starts inside each parser instead
+//! of rediscovering magic bytes.
 use libfuzzer_sys::fuzz_target;
 use exav_unpack::{extract, Budget, Format, Limits};
+
+#[path = "../extreme.rs"]
+mod extreme;
+
+// A quarter of the mutations set one header field to the top of its range, where
+// unchecked sums overflow (see `extreme.rs`).
+libfuzzer_sys::fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
+    if extreme::set_extreme_field(data, size, seed) {
+        size
+    } else {
+        libfuzzer_sys::fuzzer_mutate(data, size, max_size)
+    }
+});
 
 fn tight_limits() -> Limits {
     let mut l = Limits::default();
@@ -29,61 +42,17 @@ fn tight_limits() -> Limits {
     l
 }
 
-/// Every extractable format. Kept exhaustive on purpose: a new `Format` variant
-/// should be added here so its parser's error paths are fuzzed directly, without
-/// the mutator having to synthesise valid magic bytes.
-const ALL_FORMATS: &[Format] = &[
-    Format::Zip,
-    Format::Gzip,
-    Format::Tar,
-    Format::Bzip2,
-    Format::Xz,
-    Format::Cab,
-    Format::Chm,
-    Format::Ole,
-    Format::Pdf,
-    Format::Email,
-    Format::SevenZip,
-    Format::Iso,
-    Format::Lha,
-    Format::Arj,
-    Format::Rar,
-    Format::Upx,
-    Format::Ar,
-    Format::Cpio,
-    Format::Xar,
-    Format::Dmg,
-    Format::Zstd,
-    Format::Lzip,
-    Format::Uuencode,
-    Format::Xdp,
-    Format::Szdd,
-    Format::Tnef,
-    Format::Swf,
-    Format::Binhex,
-    Format::Lnk,
-    Format::Partition,
-    Format::Pyc,
-    Format::Nsis,
-    Format::Machofat,
-    Format::Sfx,
-    Format::Autoit,
-    Format::OneNote,
-    Format::Rtf,
-    Format::PePacked,
-    Format::JavaClass,
-    Format::AiModel,
-    Format::Screnc,
-];
-
 fuzz_target!(|data: &[u8]| {
-    for &fmt in ALL_FORMATS {
+    // `Format::ALL`, not a list of our own: a hand-kept copy here fell behind
+    // the enum and left 26 formats unfuzzed. Each parser's error paths are
+    // reached directly, without the mutator synthesising valid magic bytes.
+    for &fmt in Format::ALL {
         // Candidate passwords exercise the decryption paths (7z AES, ZipCrypto,
         // WinZip-AES, PDF/DMG); harmless for every other format.
         let mut budget = Budget::with_passwords(
             tight_limits(),
             vec!["infected".to_string(), "hunter2".to_string()],
         );
-        let _ = extract(fmt, data, &mut budget);
+        let _ = extract(fmt, &data, &mut budget);
     }
 });

@@ -129,6 +129,44 @@ fn unknown_fields_are_compile_errors_not_silent_undefined() {
     assert!(e.contains("elf"), "got: {e}");
 }
 
+/// The ELF's own numbers (entry, segment and section offsets and addresses)
+/// are the file's; none of them may panic the module.
+#[test]
+fn fields_at_their_extremes_do_not_panic_the_module() {
+    let rules = exav_core::yara::compile(
+        r#"import "elf" rule t { condition: elf.entry_point == 1 or elf.number_of_sections == 99
+           or for any s in elf.sections : (s.offset == 1 or s.name == "x")
+           or for any g in elf.segments : (g.offset == 1) }"#,
+    )
+    .expect("compile");
+    let mut bad = Vec::new();
+    let mut data = TINY_ELF.to_vec();
+    for at in (0..TINY_ELF.len() - 8).step_by(4) {
+        for v in [
+            u64::MAX,
+            u64::MAX - 15,
+            1 << 63,
+            i64::MAX as u64,
+            0xFFFF_FFFF_FFFF_F000,
+        ] {
+            data[at..at + 8].copy_from_slice(&v.to_le_bytes());
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rules.scan(&data).matching_rules().len()
+            }));
+            if r.is_err() {
+                bad.push(format!("{at:#x} {v:#x}"));
+            }
+        }
+        data[at..at + 8].copy_from_slice(&TINY_ELF[at..at + 8]);
+    }
+    assert!(
+        bad.is_empty(),
+        "{} panics, first: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(12)]
+    );
+}
+
 #[test]
 fn elf_import_compiles() {
     // A rejected `import "elf"` drops every rule in a Linux-focused feed, so the

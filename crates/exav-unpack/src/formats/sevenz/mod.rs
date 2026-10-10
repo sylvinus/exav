@@ -16,7 +16,7 @@ mod entry;
 mod header;
 mod parse;
 
-pub(crate) use entry::{extract_sevenz, stream_sevenz};
+pub(crate) use entry::walk;
 
 #[cfg(test)]
 mod tests {
@@ -34,7 +34,7 @@ mod tests {
     fn extract_entries(blob: &[u8]) -> HashMap<String, Vec<u8>> {
         let mut budget = Budget::new(Limits::default());
         let entries =
-            extract(Format::SevenZip, blob, &mut budget).expect("extract should not fail");
+            extract(Format::SevenZip, &blob, &mut budget).expect("extract should not fail");
         entries.into_iter().map(|e| (e.name, e.data)).collect()
     }
 
@@ -152,12 +152,12 @@ mod tests {
         let pws = passwords.iter().map(|s| s.to_string()).collect();
         let mut budget = Budget::with_passwords(Limits::default(), pws);
         let entries =
-            extract(Format::SevenZip, blob, &mut budget).expect("extract should not fail");
+            extract(Format::SevenZip, &blob, &mut budget).expect("extract should not fail");
         entries.into_iter().map(|e| (e.name, e.data)).collect()
     }
 
     /// A real 7-Zip archive with an AES-encrypted *header* (`7z a -psecret
-    /// -mhe=on`) decrypts with the password — the encoded header itself is
+    /// -mhe=on`) decrypts with the password: the encoded header itself is
     /// decrypted so the file listing and content are recovered.
     #[cfg(feature = "decrypt")]
     #[test]
@@ -187,7 +187,7 @@ mod tests {
     }
 
     /// Real 7-Zip-produced AES-256 archives (password `hunter2`) decrypt back to
-    /// the original bytes — end-to-end proof the SHA-256 KDF matches 7-Zip. The
+    /// the original bytes: end-to-end proof the SHA-256 KDF matches 7-Zip. The
     /// fixtures were made with `7z a -phunter2 -mhe=off`.
     #[cfg(feature = "decrypt")]
     #[test]
@@ -241,6 +241,31 @@ mod tests {
         assert!(joined.windows(15).any(|w| w == b"SECOND-FILE-MAR"));
     }
 
+    /// 150 members of one encrypted solid block (`7z a -ppw -ms=on`). The key
+    /// is derived with 2^19 SHA-256 rounds, and each member derived it again
+    /// for every password up to the right one, with the block decrypted each
+    /// time: 7 seconds for these 150 members, and it grows with their number
+    /// and with the cycles power the archive asks for. Done once per block, it
+    /// is a fraction of a second.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "timing")]
+    fn the_members_of_an_encrypted_solid_block_are_decrypted_once() {
+        let data = fixture("aes_solid_many.7z");
+        let t = std::time::Instant::now();
+        let files = extract_entries_pw(&data, &["a", "b", "c", "d", "pw"]);
+        assert!(t.elapsed().as_secs() < 3, "took {:?}", t.elapsed());
+        assert_eq!(files.len(), 150);
+        for (name, body) in &files {
+            let n = name.trim_start_matches('m').trim_end_matches(".txt");
+            assert_eq!(
+                body,
+                format!("member {n} of the solid block\n").as_bytes(),
+                "{name}"
+            );
+        }
+    }
+
     /// Without a password an AES archive is still reported encrypted/unsupported.
     #[test]
     fn aes_without_password_unsupported() {
@@ -290,5 +315,76 @@ mod tests {
         let entries = extract(Format::SevenZip, &blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, payload);
+    }
+
+    /// A filter in front of LZMA, which decodes to the size its coder
+    /// declares. Written by 7-Zip 25.01 from the 2149-byte `known.txt` of the
+    /// ZIP data-descriptor fixtures: `7z a -t7z -m0=BCJ -m1=LZMA` and
+    /// `-m0=Delta:4 -m1=LZMA`.
+    #[test]
+    fn filter_and_lzma_chains_from_7zip_decode() {
+        let mut known = b"exav data descriptor fixture\n".to_vec();
+        for i in 1..=40 {
+            known.extend_from_slice(
+                format!("line {i:02}: the quick brown fox jumps over the lazy dog\n").as_bytes(),
+            );
+        }
+        for name in ["bcj_lzma.7z", "delta_lzma.7z"] {
+            let files = extract_entries(&fixture(name));
+            assert_eq!(files.len(), 1, "{name}");
+            assert!(files.get("known.txt") == Some(&known), "{name}");
+        }
+    }
+
+    /// Code-like bytes: noise with x86 `call rel32` (high byte 0x00 or 0xFF,
+    /// the ones the filter converts), ARM `BL` and ARM64 `BL`/`ADRP` words
+    /// every few dozen bytes.
+    fn branchy_payload() -> Vec<u8> {
+        let mut seed = 0x2545_f491_u32;
+        let mut out = Vec::with_capacity(256 * 1024);
+        while out.len() < 256 * 1024 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let r = seed.to_le_bytes();
+            match seed % 5 {
+                0 => out.extend([0xE8, r[0], r[1], 0x00, 0x00]),
+                1 => out.extend([0xE9, r[0], r[1], 0xFF, 0xFF]),
+                2 => out.extend([r[0], r[1], r[2], 0xEB]),
+                3 => out.extend([r[0], r[1], r[2], 0x94]),
+                _ => out.extend([r[0] | 0x80, r[1], r[2], 0x90 | (r[3] & 0x0F)]),
+            }
+            out.extend(&r[..seed as usize % 4]);
+        }
+        out
+    }
+
+    /// Each branch filter undoes what 7-Zip's encoder did: the member comes out
+    /// byte for byte as it went in.
+    #[test]
+    fn branch_filters_round_trip() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderMethod};
+        use std::io::Cursor;
+
+        let payload = branchy_payload();
+        for filter in [
+            EncoderMethod::BCJ_X86_FILTER,
+            EncoderMethod::BCJ_ARM_FILTER,
+            EncoderMethod::BCJ_ARM64_FILTER,
+        ] {
+            let mut sink = Cursor::new(Vec::new());
+            {
+                let mut w = ArchiveWriter::new(&mut sink).unwrap();
+                w.set_content_methods(vec![EncoderMethod::LZMA2.into(), filter.into()]);
+                w.push_archive_entry(
+                    ArchiveEntry::new_file("code.bin"),
+                    Some(Cursor::new(payload.clone())),
+                )
+                .unwrap();
+                w.finish().unwrap();
+            }
+            let mut budget = Budget::new(Limits::default());
+            let entries = extract(Format::SevenZip, &sink.into_inner(), &mut budget).unwrap();
+            assert_eq!(entries.len(), 1, "{filter:?}");
+            assert!(entries[0].data == payload, "{filter:?} altered the member");
+        }
     }
 }

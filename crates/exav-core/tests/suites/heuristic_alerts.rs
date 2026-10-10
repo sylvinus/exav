@@ -60,6 +60,137 @@ fn alert_encrypted_upgrades_to_heuristic_detection() {
     }
 }
 
+/// One stored ZIP member with the encryption bit set over cleartext, as APK
+/// packers write every member (Android ignores the bit).
+fn falsely_encrypted_zip(body: &[u8]) -> Vec<u8> {
+    flagged_zip(body, 1, 1)
+}
+
+/// One stored cleartext member, its central and local headers carrying the
+/// general-purpose flags given.
+fn flagged_zip(body: &[u8], central_flags: u16, local_flags: u16) -> Vec<u8> {
+    let name = b"classes.dex";
+    let crc = crc32fast::hash(body);
+    let mut z = Vec::new();
+    let header = |sig: &[u8], central: bool| {
+        let mut h = sig.to_vec();
+        if central {
+            h.extend_from_slice(&20u16.to_le_bytes()); // made by
+        }
+        h.extend_from_slice(&20u16.to_le_bytes()); // needed
+        let flags = if central { central_flags } else { local_flags };
+        h.extend_from_slice(&flags.to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes()); // stored
+        h.extend_from_slice(&[0; 4]); // time, date
+        h.extend_from_slice(&crc.to_le_bytes());
+        h.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        h.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes()); // extra
+        if central {
+            h.extend_from_slice(&[0; 6]); // comment length, disk, internal attributes
+            h.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+            h.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        }
+        h.extend_from_slice(name);
+        h
+    };
+    z.extend(header(b"PK\x03\x04", false));
+    z.extend_from_slice(body);
+    let cd = z.len();
+    z.extend(header(b"PK\x01\x02", true));
+    let cd_len = z.len() - cd;
+    z.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+    z.extend_from_slice(&(cd_len as u32).to_le_bytes());
+    z.extend_from_slice(&(cd as u32).to_le_bytes());
+    z.extend_from_slice(&0u16.to_le_bytes());
+    z
+}
+
+/// A member whose encryption bit lies is read anyway, and still reported as
+/// encrypted when the alert is on, as ClamAV reports it: after the walk, so a
+/// signature in its content wins.
+#[test]
+fn a_falsely_encrypted_member_is_read_and_still_alerted() {
+    let db = builtin_db();
+    let mut opts = ScanOptions::default();
+    let benign = falsely_encrypted_zip(b"dex\n035\0 nothing to see here");
+    assert!(matches!(
+        analyze(&db, &benign, &opts).verdict,
+        Verdict::Clean
+    ));
+    opts.alert_encrypted = true;
+    match analyze(&db, &benign, &opts).verdict {
+        Verdict::Infected { signature, .. } => assert_eq!(signature, "Heuristics.Encrypted.Zip"),
+        other => panic!("expected Heuristics.Encrypted.Zip, got {other:?}"),
+    }
+    let infected = falsely_encrypted_zip(exav_core::unpack::eicar());
+    match analyze(&db, &infected, &opts).verdict {
+        Verdict::Infected { signature, .. } => assert!(
+            signature.to_ascii_uppercase().contains("EICAR"),
+            "{signature}"
+        ),
+        other => panic!("expected EICAR, got {other:?}"),
+    }
+}
+
+/// ClamAV alerts on a ZIP member's local header, bit 0 set and bit 13 (headers
+/// masked) clear, whatever the central directory says. APKs from the corpus
+/// set the bit in the central directory only, or with bit 13, and ClamAV said
+/// nothing of them.
+#[test]
+fn the_encryption_alert_follows_the_local_header() {
+    let db = builtin_db();
+    let mut opts = ScanOptions::default();
+    opts.alert_encrypted = true;
+    for (central, local, alerts) in [
+        (0x0001, 0x0000, false),
+        (0x0000, 0x0001, true),
+        (0x0001, 0x0001, true),
+        (0x0001, 0x2001, false),
+        (0x2001, 0x0001, true),
+        (0xff49, 0xff49, false),
+    ] {
+        let zip = flagged_zip(b"dex\n035\0 nothing to see here", central, local);
+        let verdict = analyze(&db, &zip, &opts).verdict;
+        let alerted = matches!(&verdict, Verdict::Infected { signature, .. }
+            if signature == "Heuristics.Encrypted.Zip");
+        assert_eq!(
+            alerted, alerts,
+            "central {central:#06x}, local {local:#06x}: {verdict:?}"
+        );
+    }
+}
+
+/// A `.cdb` signature's encryption field matches either of a ZIP member's
+/// headers, as ClamAV matches each.
+#[test]
+fn a_cdb_encryption_field_matches_either_header() {
+    let mut l = exav_core::loader::Builder::new();
+    l.add_named_bytes(
+        "t.cdb",
+        b"Test.Cdb.Enc:CL_TYPE_ZIP:*:classes\\.dex:*:*:1:*:*:*\n\
+          Test.Cdb.Plain:CL_TYPE_ZIP:*:classes\\.dex:*:*:0:*:*:*\n",
+        true,
+    );
+    let db = l.build().unwrap();
+    let opts = ScanOptions::default();
+    for (central, local, want) in [
+        (0x0000, 0x0000, &["Test.Cdb.Plain"][..]),
+        (0x0001, 0x0001, &["Test.Cdb.Enc"]),
+        (0x0001, 0x0000, &["Test.Cdb.Enc", "Test.Cdb.Plain"]),
+        (0x0000, 0x0001, &["Test.Cdb.Enc", "Test.Cdb.Plain"]),
+    ] {
+        let zip = flagged_zip(b"dex\n035\0 nothing to see here", central, local);
+        let mut got: Vec<String> = exav_core::analyze_all(&db, &zip, &opts)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        got.sort();
+        assert_eq!(got, want, "central {central:#06x}, local {local:#06x}");
+    }
+}
+
 #[test]
 fn alert_encrypted_with_password_still_finds_payload() {
     // A real detection beats the heuristic: with the correct password the inner
@@ -76,6 +207,32 @@ fn alert_encrypted_with_password_still_finds_payload() {
         ),
         other => panic!("expected EICAR Infected, got {other:?}"),
     }
+}
+
+#[test]
+fn a_decrypted_7z_member_is_still_reported_as_encrypted() {
+    // Decrypting with a pool password must not erase the fact that the member
+    // was encrypted: under all-match both the payload and the heuristic are
+    // reported, as they are for ZIP.
+    let db = builtin_db();
+    let blob = fixture("aes256_hdr.7z");
+    let mut opts = ScanOptions::default();
+    opts.alert_encrypted = true;
+    opts.passwords = vec!["password".to_string()];
+    let names: Vec<String> = exav_core::analyze_all(&db, &blob, &opts)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_uppercase().contains("EICAR")),
+        "{names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "Heuristics.Encrypted.7Zip"),
+        "{names:?}"
+    );
 }
 
 // --- alert-macros ----------------------------------------------------------

@@ -12,9 +12,9 @@
 
 /// Decompress an MS-OVBA "CompressedContainer" ([MS-OVBA] §2.4.1.1).
 ///
-/// Returns `None` if the signature byte or a chunk header is invalid. On
-/// truncated/corrupt input it returns whatever was decoded so far (malware
-/// often ships deliberately damaged containers).
+/// Returns `None` if the signature byte is not 0x01. On truncated/corrupt
+/// input it returns whatever was decoded so far (malware often ships
+/// deliberately damaged containers).
 pub(crate) fn decompress(data: &[u8], cap: u64) -> Option<Vec<u8>> {
     if data.first() != Some(&0x01) {
         return None;
@@ -30,13 +30,12 @@ pub(crate) fn decompress(data: &[u8], cap: u64) -> Option<Vec<u8>> {
         }
         let header = u16::from_le_bytes([data[pos], data[pos + 1]]);
         pos += 2;
-        let size = (header & 0x0FFF) as usize; // CompressedChunkSize
-        let signature = (header >> 12) & 0x07;
+        // CompressedChunkSize, then the signature bits (0b011), which are fixed
+        // and which nothing reads: Emotet documents set them otherwise to stop
+        // analysis tools, Office runs the macros all the same, so they are not
+        // checked.
+        let size = (header & 0x0FFF) as usize;
         let compressed = (header >> 15) & 0x01;
-        if signature != 0b011 {
-            // Not a valid chunk header; stop rather than misinterpret.
-            return if out.is_empty() { None } else { Some(out) };
-        }
         let chunk_data_len = size + 1; // bytes of chunk data following the header
         let chunk_end = (pos + chunk_data_len).min(data.len());
         let chunk_start = out.len();
@@ -113,14 +112,13 @@ struct DirInfo {
 }
 
 fn read_u16(d: &[u8], p: usize) -> Option<u16> {
-    d.get(p..p + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    crate::bytes::at(d, p, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 fn read_u32(d: &[u8], p: usize) -> Option<u32> {
-    d.get(p..p + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    crate::bytes::at(d, p, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 fn read_str(d: &[u8], p: usize, n: usize) -> String {
-    String::from_utf8_lossy(d.get(p..p + n).unwrap_or(&[])).into_owned()
+    String::from_utf8_lossy(crate::bytes::at(d, p, n).unwrap_or(&[])).into_owned()
 }
 
 /// Parse the decompressed `dir` stream ([MS-OVBA] §2.3.4.2). Best-effort: an
@@ -131,7 +129,8 @@ fn parse_dir(d: &[u8]) -> DirInfo {
     let mut modules: Vec<Module> = Vec::new();
     let mut cur: Option<Module> = None;
     let mut p = 0usize;
-    while p + 6 <= d.len() {
+    while p.saturating_add(6) <= d.len() {
+        let record = p;
         let id = read_u16(d, p).unwrap();
         let size = read_u32(d, p + 2).unwrap() as usize;
         let body = p + 6;
@@ -326,6 +325,11 @@ fn parse_dir(d: &[u8]) -> DirInfo {
                 p = body + size;
             }
         }
+        // Sums of 32-bit sizes wrap on a 32-bit build and can land behind the
+        // record; every record is at least six bytes long.
+        if p <= record {
+            break;
+        }
     }
     if let Some(m) = cur.take() {
         modules.push(m);
@@ -334,7 +338,7 @@ fn parse_dir(d: &[u8]) -> DirInfo {
 }
 
 fn decode_utf16(d: &[u8], p: usize, n: usize) -> String {
-    let bytes = d.get(p..p + n).unwrap_or(&[]);
+    let bytes = crate::bytes::at(d, p, n).unwrap_or(&[]);
     let units: Vec<u16> = bytes
         .as_chunks::<2>()
         .0
@@ -521,6 +525,20 @@ mod tests {
         String::from_utf8(normalize_vba_code(s.as_bytes())).unwrap()
     }
 
+    /// Records are read at offsets the project's own sizes add up to: past the
+    /// top of the address space there is nothing, not a wrapped read.
+    #[test]
+    fn a_record_at_the_top_of_the_address_space_reads_as_absent() {
+        let d = [0u8; 64];
+        for p in [usize::MAX, usize::MAX - 1, usize::MAX - 3] {
+            assert_eq!(read_u16(&d, p), None);
+            assert_eq!(read_u32(&d, p), None);
+            assert_eq!(read_str(&d, p, 4), "");
+            assert_eq!(decode_utf16(&d, p, 4), "");
+        }
+        assert_eq!(read_str(&d, 8, usize::MAX), "");
+    }
+
     #[test]
     fn vba_normalize_lowercases_and_collapses_whitespace() {
         // Case-fold code + collapse runs of spaces/tabs to one space, so a subsig
@@ -577,6 +595,19 @@ mod tests {
         let mut buf = vec![0x01u8];
         buf.extend_from_slice(&header.to_le_bytes());
         buf.push(0x00); // flag byte: all literals
+        buf.extend_from_slice(b"abcd");
+        assert_eq!(decompress(&buf, u64::MAX).unwrap(), b"abcd");
+    }
+
+    /// From live Emotet documents: a chunk header whose signature bits are
+    /// 0b100, not 0b011. Office runs the macros all the same, and the whole
+    /// VBA project was dropped.
+    #[test]
+    fn a_chunk_signature_other_than_0b011_still_decodes() {
+        let header: u16 = 0b1100_0000_0000_0000 | 4;
+        let mut buf = vec![0x01u8];
+        buf.extend_from_slice(&header.to_le_bytes());
+        buf.push(0x00);
         buf.extend_from_slice(b"abcd");
         assert_eq!(decompress(&buf, u64::MAX).unwrap(), b"abcd");
     }

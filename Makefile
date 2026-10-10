@@ -1,9 +1,9 @@
-# exav — build, test, and the daily prebuilt-database pipeline.
+# exav: build, test, and the daily prebuilt-database pipeline.
 #
 # `make exavdb` is the intended production flow: fetch the ClamAV signatures with
 # Cisco's own updater, then compile a prebuilt `.exavdb` that CLI instances load
-# directly (a near-instant, low-memory cold start). Run it on a host with enough
-# RAM — building the full main+daily set needs ~8 GB.
+# directly (a near-instant, low-memory cold start). Building the full main+daily
+# set needs about 2 GB of RAM.
 
 CARGO   ?= cargo
 EXAV    ?= ./target/release/exav
@@ -11,50 +11,69 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-www wasm-sizes lint fmt msrv av-audit publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www wasm-sizes lint fmt msrv av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
 	$(CARGO) build --release
 
-## test: EVERY test exav owns — native feature matrix, wasm32, the WASM bindings'
-##       JS suites and the docs build. The one command to run before pushing.
-##       Needs `wasmtime` (test-wasm) and node (test-js, test-www); the
+## test: EVERY test exav owns: native feature matrix, wasm32, the WASM bindings'
+##       JS suites, the viewer's and the docs build. The one command to run
+##       before pushing. Needs `wasmtime` (test-wasm), wasm-bindgen-cli
+##       (test-viewer) and node (test-js, test-viewer, test-www); the
 ##       sub-targets below run each part alone.
 ##
 ##       Excludes fuzzing and the two DIFFERENTIAL harnesses, which check exav
 ##       against another engine rather than against its own contract:
 ##       `scripts/difftest.sh` and `make test-yara-diff`.
 ##
-##       For the fast inner loop use `cargo test` directly — but note it is a
+##       For the fast inner loop use `cargo test` directly, but note it is a
 ##       SUBSET: feature-gated test files compile to zero tests without their
 ##       feature and report green having checked nothing.
 test:
 	$(MAKE) test-native
 	$(MAKE) test-wasm
 	$(MAKE) test-js
+	$(MAKE) test-viewer
 	$(MAKE) test-www
 
 ## test-native: the full native test matrix (every feature pass CI runs, no wasm).
-##              Mirrors the `test` job in .github/workflows/ci.yml — keep in sync.
+##              Mirrors the `test` job in .github/workflows/ci.yml; keep in sync.
 test-native:
 	$(CARGO) test --workspace
+	# The CLI as shipped: a `--workspace` build unifies features across crates,
+	# so it can hide an exav-core feature that `exav` itself does not forward.
+	$(CARGO) test -p exav --features http
 	$(CARGO) test -p exav-core --features http
 	$(CARGO) test -p exav-unpack --features checksums
 	$(CARGO) test -p exav-unpack --no-default-features --features all-formats
 	$(CARGO) test -p exav-core --features unstable-internals
 	# Minimal build: compiles the `cfg(not(feature = ...))` fallbacks every other
-	# pass hides — the paths that must report unsupported rather than clean.
+	# pass hides: the paths that must report unsupported rather than clean.
 	$(CARGO) test -p exav-core --no-default-features
 	$(CARGO) test -p exav-unpack --no-default-features
+	$(CARGO) test -p exav-imagehash --no-default-features
+	# Each format feature on its own: a whole feature set can hide a format
+	# that only compiles because another one brought its dependency in.
+	scripts/check-features.sh
+	# ALZ and EGG carry their own bzip2 and LZMA decoders, which must work
+	# without the `bzip2` and `lzip` features.
+	$(CARGO) test -p exav-unpack --no-default-features --features alz,egg --test all -- alz egg
 	# Crash containment, which only runs when a decoder can be asked to fail.
 	# Without this pass the tests that check it skip themselves and the whole
-	# question goes unasked — a scanner that dies on crafted input and exits 0
+	# question goes unasked. A scanner that dies on crafted input and exits 0
 	# is indistinguishable, to a pipeline reading `$$?`, from a clean scan.
 	$(CARGO) test -p exav-unpack --features testing-faults panic_containment
 	$(CARGO) test -p exav --features testing-faults --test decoder_crash
+	# DWG and DXF, behind exav-render's `dwg` feature, which no other crate of
+	# the workspace turns on; and alone, as @exav/viewer's DWG module builds it.
+	$(CARGO) test -p exav-render --features dwg
+	$(CARGO) test -p exav-render --no-default-features --features dwg
+	# IFC and STL, behind `ifc` and `stl`, as @exav/viewer's model module
+	# builds them.
+	$(CARGO) test -p exav-render --no-default-features --features ifc,stl
 
-## test-yara-diff: the yara-x A/B differential harness — compiles the SAME rules
+## test-yara-diff: the yara-x A/B differential harness. Compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT
 ##                 part of `make test`, for the same reason the clamav harness
 ##                 (scripts/difftest.sh) isn't: a differential test
@@ -65,22 +84,35 @@ test-native:
 ##
 ##                 yara-x is invoked as the `yr` BINARY, not linked as a crate.
 ##                 As a dependency it drags in ~83 extra crates, 21 of them
-##                 cranelift/wasmtime — exav's own build contains no JIT backend
+##                 cranelift/wasmtime; exav's own build contains no JIT backend
 ##                 at all, and a crate in the graph can reach a shipped artifact
 ##                 in a way a program on PATH cannot.
 ##
 ##                 Install the oracle with `cargo install yara-x-cli`, or point
-##                 EXAV_YR_BIN at a build. WITHOUT it the tests SKIP and report
-##                 green having checked nothing — so read the output, not just
+##                 EXAV_DEBUG_YR_BIN at a build. WITHOUT it the tests SKIP and report
+##                 green having checked nothing, so read the output, not just
 ##                 the exit code. Run it when you touch the YARA engine.
 test-yara-diff:
 	$(CARGO) test -p exav-core --test yara_difftest --test yara_coverage_difftest -- --nocapture
 
-## test-js: the exav-unpack-wasm JavaScript suites — vitest units plus the
+## test-js: the exav-unpack-wasm JavaScript suites: vitest units plus the
 ##          playwright browser e2e against a freshly built pkg/. This is the
 ##          published npm package's public API; no cargo test reaches it.
 test-js:
 	./scripts/test-js.sh
+
+## test-viewer: @exav/viewer: its wasm modules built from the current source,
+##              vitest units (pdf.js's image decoders against the package's
+##              among them), then the package built and checked as `npm publish`
+##              would upload it, the sink and wasm-import gates, and the demo
+##              built for production and driven in headless Chromium under its
+##              Content-Security-Policy, its sandboxed frame in Chromium,
+##              Firefox and WebKit. The
+##              archive plugin's peer, exav-unpack-wasm's pkg/, is rebuilt from
+##              the current source too. Needs wasm-bindgen-cli at the version
+##              crates/exav-viewer pins.
+test-viewer:
+	./scripts/test-viewer.sh
 
 ## test-www: type-check and build the exav.org docs site (broken links, bad
 ##           frontmatter, sidebar entries pointing at deleted pages).
@@ -97,10 +129,13 @@ test-wasm:
 wasm-sizes:
 	./scripts/wasm-format-sizes.sh
 
-## lint: clippy + rustfmt check
+## lint: the clippy passes and rustfmt check CI runs (.github/workflows/ci.yml)
 lint:
-	$(CARGO) clippy --all-targets -- -D warnings
-	$(CARGO) fmt --check
+	$(CARGO) fmt --all --check
+	$(CARGO) clippy --all-targets --features exav-core/http -- -D warnings
+	$(CARGO) clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --features dwg -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings
 
 ## fmt: format the code
 fmt:
@@ -108,7 +143,7 @@ fmt:
 
 ## msrv: build the workspace on the `rust-version` floor declared in Cargo.toml.
 ##       CI runs this, so a version nobody verifies drifts upward the
-##       first time someone uses a newer feature — silently breaking anyone who
+##       first time someone uses a newer feature, silently breaking anyone who
 ##       pinned the toolchain we promised.
 ##       `rustup run` rather than `cargo +VERSION`: the `+toolchain` prefix is a
 ##       rustup *shim* feature, so it fails with "no such command" whenever
@@ -122,7 +157,7 @@ msrv:
 ##           a committed fixture that other people's scanners will detect. Run it
 ##           when fixtures change, not on every release: it needs `clamscan` and
 ##           a signature directory ($(DBDIR), via `make db`), neither of which is
-##           present on most machines — so as a release gate it would skip
+##           present on most machines, so as a release gate it would skip
 ##           exactly where it mattered. An independent engine on purpose: asking
 ##           exav whether exav's own tree is clean answers the wrong question.
 av-audit:
@@ -136,6 +171,17 @@ av-audit:
 	    echo "-> mask these (see crates/exav-unpack/tests/fixtures/README.md)"; exit 1; \
 	  fi; \
 	  echo "no detections"
+
+## miri: run the container-walking tests of exav-unpack under Miri, which checks
+##       the `unsafe` inside dependencies (memchr, the compression and crypto
+##       crates) along real code paths. Needs a nightly toolchain with the
+##       component: `rustup toolchain install nightly --component miri`.
+##       A subset, chosen by test-name filter in MIRI_TESTS: Miri runs code
+##       orders of magnitude slower, and the decoder round-trip tests alone take
+##       hours. Its own target dir, so it never invalidates the normal build.
+MIRI_TESTS ?= formats::zip formats::cpio formats::tar formats::iso formats::partition formats::cab
+miri:
+	CARGO_TARGET_DIR=target/miri rustup run nightly cargo miri test -p exav-unpack --lib -- $(MIRI_TESTS)
 
 ## fuzz: smoke-build the fuzz targets
 fuzz:
@@ -155,7 +201,7 @@ exavdb: build db
 ## cache: deprecated alias for `make exavdb`
 cache: exavdb
 
-## daily: alias for `make exavdb` — run from cron to refresh the distributed database
+## daily: alias for `make exavdb`; run from cron to refresh the distributed database
 daily: exavdb
 
 ## clean: remove build artifacts (keeps $(DBDIR) and $(EXAVDB))
@@ -174,7 +220,7 @@ www-build:
 # pre-publish gate. One list, in one place: the order is the crate graph and a
 # crate cannot go up before the crates it depends on exist on the registry, so a
 # list that drifts fails partway and leaves some crates at the new version and
-# some not — and a published version can be yanked but never replaced or reused,
+# some not, and a published version can be yanked but never replaced or reused,
 # so a botched run burns that version number permanently.
 
 ## publish-check: run the pre-publish gate and dry-run every crate, publishing nothing
@@ -187,7 +233,7 @@ publish:
 
 # The npm package is published from the CRATE directory, never from `pkg/`.
 # `wasm-pack` writes its own `package.json` into `pkg/`, so running `npm publish`
-# in there ships that one instead — different `files`, different `main`, and none
+# in there ships that one instead: different `files`, different `main`, and none
 # of the metadata. Only the tracked manifest describes what should go out, and
 # this target is what pins the choice.
 ## npm-publish-check: pack the npm bindings without publishing, and list contents

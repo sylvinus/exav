@@ -4,9 +4,10 @@
 //! `{n}`/`{n-m}`/`{-m}`/`{n-}` and the `[n-m]`/`[n]` byte-range form,
 //! `(aa|bb)` alternates, `!(...)` negation).
 //! Pure-literal matching can't express those, so this engine compiles each
-//! body to a token program, pre-filters with one Aho-Corasick automaton over
-//! a literal *anchor* per signature, and verifies the full program at each
-//! candidate position.
+//! body to a token program, pre-filters with an index of one literal *anchor*
+//! per signature ([`crate::grams`]), and verifies the full program at each candidate
+//! position. A body whose offset pins it near a known place is checked there
+//! instead ([`pins`]).
 //!
 //! Verification does not backtrack. A token program is run as a Thompson-style
 //! simulation over a set of reachable position *intervals*
@@ -14,30 +15,108 @@
 //! `Prefix::Internal` body), so an unbounded gap costs one interval expansion
 //! instead of a per-length loop and hostile, highly repetitive input cannot make
 //! verification blow up combinatorially. The old recursive walk
-//! (`match_forward` / `match_backward`) is retained behind
-//! `EXAV_SPLIT_MATCH=0` so a scan can be run both ways and the results compared.
+//! (`match_forward` / `match_backward`) is kept in the tests, as the reference
+//! the simulator is checked against.
 //!
 //! `.ldb` logical signatures compose subsignatures (each an `.ndb` body) with
-//! a boolean expression. Verification runs only on a bounded in-memory buffer
-//! (the streaming path stays literal-only).
+//! a boolean expression.
 //!
-//! Supported subsignature features: `EP`- and section-relative offsets, and
-//! PCRE (via `fancy-regex` for lookaround/backreferences). Not supported
-//! (counted, never silently dropped): `VI`/`SEx` offset kinds, bytecode
-//! subsignatures, and patterns whose only literal run is shorter than
-//! `MIN_ANCHOR` or sits behind a non-leading variable gap.
+//! The scan runs over any [`ByteSource`]: a buffer held in memory, or an object
+//! read through a block cache, with the same results. A check that needs the
+//! object whole (a backreferencing PCRE, an image hash) reads it into memory
+//! when it is small enough and otherwise marks the scan incomplete.
+//!
+//! Supported subsignature features: `EP`-, section- and version-info-relative
+//! offsets (`EP`, `Sn`, `SL`, `SEn`, `VI`), and PCRE (via `fancy-regex` for
+//! lookaround/backreferences). Not supported (counted, never silently
+//! dropped): bytecode subsignatures, and patterns whose only literal run is
+//! shorter than `MIN_ANCHOR` or sits behind a non-leading variable gap.
 
-use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
+use crate::byte_source::{self, ByteSource, Lower};
 use crate::filetype::FileType;
+use crate::grams::{sweep, GramStats, Grams, IndexAnchor, FOLD};
 use crate::pe::PeLayout;
+use crate::stream_regex::StreamRegex;
+
+/// The byte at `i`, which the caller has checked is inside `b`.
+#[inline]
+fn byte_at<B: ByteSource + ?Sized>(b: &B, i: usize) -> u8 {
+    b.window(i, 1).first().copied().unwrap_or(0)
+}
+
+/// Whether the object starts like an image `Target:5` (graphics) signatures
+/// run on. Those clamscan 1.5.4 treats as graphics are PNG, GIF, JPEG, TIFF
+/// and BMP; with `all_formats`, every format exav-imagehash hashes (WebP,
+/// ICO, PNM, ..., JPEG 2000 and JBIG2) is too.
+fn looks_like_image<B: ByteSource + ?Sized>(b: &B, all_formats: bool) -> bool {
+    let d = b.window(0, 16);
+    if d.len() < 12 {
+        return false;
+    }
+    #[cfg(feature = "image-hash")]
+    if all_formats {
+        use exav_imagehash::{Format, Formats};
+        return Format::detect(&d).is_some_and(|f| Formats::ALL.contains(f));
+    }
+    #[cfg(not(feature = "image-hash"))]
+    let _ = all_formats;
+    d.starts_with(b"\x89PNG\r\n\x1a\n")
+        || d.starts_with(b"GIF87a")
+        || d.starts_with(b"GIF89a")
+        || d.starts_with(&[0xFF, 0xD8, 0xFF])
+        || d.starts_with(b"II*\x00")
+        || d.starts_with(b"MM\x00*")
+        || d.starts_with(b"BM")
+}
+
+/// The object's `fuzzy_img` hash, as ClamAV computes it, when it is an image
+/// of the formats `limits` allows. Decoding needs the whole image, and its
+/// pixels take no more than an object held whole may; past either, its
+/// `fuzzy_img#` signatures are undecided.
+#[cfg(feature = "image-hash")]
+fn image_hash(buf: &dyn ByteSource, limits: WholeLimits) -> Option<[u8; 8]> {
+    use exav_imagehash::{Error, Format, Formats, Hasher, Params};
+    let formats = if limits.all_image_formats {
+        Formats::ALL
+    } else {
+        Formats::CLAMAV_GRAPHICS
+    };
+    // Recognised from the first bytes before the object is read whole.
+    if !Format::detect(&buf.window(0, 16)).is_some_and(|f| formats.contains(f)) {
+        return None;
+    }
+    let hasher = Hasher::with_params(Params {
+        formats,
+        max_decode_bytes: limits.materialize as u64,
+        ..Params::CLAMAV
+    })
+    .ok()?;
+    match buf.materialize(limits.materialize).map(|bytes| hasher.hash(&bytes)) {
+        Some(Ok(h)) => h.to_bytes().try_into().ok(),
+        None | Some(Err(Error::TooLarge)) => {
+            SCAN_TRUNCATED.with(|c| c.set(true));
+            None
+        }
+        Some(Err(_)) => None,
+    }
+}
+
+/// Built without `image-hash`, `fuzzy_img#` subsignatures do not load.
+#[cfg(not(feature = "image-hash"))]
+fn image_hash(_: &dyn ByteSource, _: WholeLimits) -> Option<[u8; 8]> {
+    None
+}
 
 // Signature-text parsing and the `.ldb` logical-expression evaluator live in
 // sibling submodules; their items are `pub(super)` (internal to `engine`).
 mod logic;
 mod parse;
+mod pcre;
+mod pins;
+use pins::Pins;
 use logic::*;
 use parse::*;
 // Re-exported so crate-root matchers (e.g. `.cdb`) can gate signatures on the
@@ -49,7 +128,7 @@ pub(crate) use parse::flevel_ok;
 /// `Container:` constraint fires only when its *immediate* container is of this
 /// type. Named after the `CL_TYPE_*` tokens of the signature format.
 ///
-/// A type exav cannot determine is NOT silently left unenforced — that drops the
+/// A type exav cannot determine is NOT silently left unenforced: that drops the
 /// constraint and lets the signature fire on content it was never scoped to, the
 /// same false-positive shape the unimplemented TDB attributes had. Such a
 /// signature is refused at load and counted instead.
@@ -74,28 +153,28 @@ pub enum ClType {
     Cpio,
     Ar,
     Zstd,
-    /// `CL_TYPE_MSCHM` — a compiled HTML Help file.
+    /// `CL_TYPE_MSCHM`: a compiled HTML Help file.
     Mschm,
-    /// `CL_TYPE_DMG` — an Apple disk image.
+    /// `CL_TYPE_DMG`: an Apple disk image.
     Dmg,
-    /// `CL_TYPE_NULSFT` — an NSIS (Nullsoft) installer.
+    /// `CL_TYPE_NULSFT`: an NSIS (Nullsoft) installer.
     Nulsft,
-    /// `CL_TYPE_AUTOIT` — a compiled AutoIt3 script.
+    /// `CL_TYPE_AUTOIT`: a compiled AutoIt3 script.
     Autoit,
-    /// `CL_TYPE_MSEXE` — a Windows executable acting as a container: an SFX
+    /// `CL_TYPE_MSEXE`: a Windows executable acting as a container: an SFX
     /// stub, a runtime-packed image, or an installer with an appended archive.
     MsExe,
-    /// `CL_TYPE_RTF` — an RTF document (its `\objdata` embedded objects).
+    /// `CL_TYPE_RTF`: an RTF document (its `\objdata` embedded objects).
     Rtf,
-    /// `CL_TYPE_HTML` — an HTML page, for content carried inside it (a `data:`
+    /// `CL_TYPE_HTML`: an HTML page, for content carried inside it (a `data:`
     /// URI image, an embedded object).
     Html,
-    /// `CL_TYPE_XML_WORD` — a Word 2003 flat-XML document (not the zipped
+    /// `CL_TYPE_XML_WORD`: a Word 2003 flat-XML document (not the zipped
     /// `.docx`, which is `OoxmlWord`).
     XmlWord,
-    /// `CL_TYPE_XML_XL` — an Excel 2003 flat-XML workbook.
+    /// `CL_TYPE_XML_XL`: an Excel 2003 flat-XML workbook.
     XmlXl,
-    /// `CL_TYPE_MHTML` — a saved web page (`.mht`): MIME with no mail envelope.
+    /// `CL_TYPE_MHTML`: a saved web page (`.mht`): MIME with no mail envelope.
     Mhtml,
 }
 
@@ -103,7 +182,7 @@ pub enum ClType {
 enum ClTypeToken {
     /// A type exav tracks.
     Known(ClType),
-    /// `CL_TYPE_ANY` — a wildcard, verified rather than assumed: probed with a
+    /// `CL_TYPE_ANY`: a wildcard, verified rather than assumed. Probed with a
     /// `Container:CL_TYPE_ANY` signature, clamscan fires it on a bare file, on a
     /// ZIP member, and on a member two archives deep alike. (Reading the layer
     /// logic suggests it should mean "top level only", since a missing parent
@@ -160,7 +239,7 @@ impl ClType {
 /// The `Container:` constraint a signature carries.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
 pub enum ContainerReq {
-    /// No `Container:` attribute, or `CL_TYPE_ANY` — fires anywhere.
+    /// No `Container:` attribute, or `CL_TYPE_ANY`: fires anywhere.
     #[default]
     Unconstrained,
     /// Fires only directly inside a container of this type.
@@ -191,7 +270,7 @@ fn parse_tdb_handler_type(tdb: &str) -> Option<&str> {
 }
 
 /// Parse an `Intermediates:CL_TYPE_A>CL_TYPE_B` TDB attribute into the ancestry
-/// chain it requires, outermost first — the written order.
+/// chain it requires, outermost first, in the written order.
 ///
 /// The format caps a chain at 16 links; a link naming a type exav cannot
 /// determine refuses the signature, for the same reason `Container:` does.
@@ -244,16 +323,15 @@ fn parse_tdb_icongroups(tdb: &str) -> (Option<String>, Option<String>) {
     (g1, g2)
 }
 
-/// Minimum literal length usable as an Aho-Corasick anchor.
+/// Minimum literal length usable as an anchor.
 const MIN_ANCHOR: usize = 2;
 
 thread_local! {
     /// Per-thread reusable LDB-subsig scratch (`counts` + first-match `offs`),
     /// grown to the largest engine seen and always stored in a clean state
-    /// (all `0` / `u32::MAX`). Reused across scans so a scan pays only for the
-    /// bodies it actually touches, not a full re-zero of every body each call
-    /// (~10 MiB for a full database).
-    static LDB_SCRATCH: RefCell<(Vec<u32>, Vec<u32>)> =
+    /// (all `0` / `u64::MAX`). Reused across scans so a scan pays only for the
+    /// bodies it actually touches, not a full re-zero of every body each call.
+    static LDB_SCRATCH: RefCell<(Vec<u32>, Vec<u64>)> =
         const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
@@ -262,7 +340,7 @@ thread_local! {
 /// clean-when-stored invariant across the scan functions' early returns.
 struct Scratch {
     counts: Vec<u32>,
-    offs: Vec<u32>,
+    offs: Vec<u64>,
     /// Body ids whose `counts`/`offs` were modified this scan (the reset set).
     touched: Vec<usize>,
 }
@@ -283,13 +361,32 @@ impl Scratch {
         let (mut counts, mut offs) = LDB_SCRATCH.with(|s| s.replace((Vec::new(), Vec::new())));
         if counts.len() < n {
             counts.resize(n, 0);
-            offs.resize(n, u32::MAX);
+            offs.resize(n, u64::MAX);
         }
         Scratch {
             counts,
             offs,
             touched: Vec::new(),
         }
+    }
+
+    /// Count `n` matches of body `bid`, the first starting at `start`, keeping
+    /// its first offset.
+    fn record(&mut self, bid: usize, start: u64, n: u64) {
+        if self.counts[bid] == 0 {
+            self.touched.push(bid);
+        }
+        self.counts[bid] = self.counts[bid].saturating_add(n.min(u32::MAX as u64) as u32);
+        // Below the sentinel, so a real offset never reads as "no match".
+        let s = start.min(u64::MAX - 1);
+        if s < self.offs[bid] {
+            self.offs[bid] = s;
+        }
+    }
+
+    /// Where body `bid` first matched this scan.
+    fn first_offset(&self, bid: usize) -> Option<u64> {
+        (self.offs[bid] != u64::MAX).then_some(self.offs[bid])
     }
 }
 
@@ -300,55 +397,275 @@ impl Drop for Scratch {
         }
         for &b in &self.touched {
             self.counts[b] = 0;
-            self.offs[b] = u32::MAX;
+            self.offs[b] = u64::MAX;
         }
         let counts = std::mem::take(&mut self.counts);
         let offs = std::mem::take(&mut self.offs);
         LDB_SCRATCH.with(|s| *s.borrow_mut() = (counts, offs));
     }
 }
-/// Per-candidate verification step cap for the LEGACY backtracking path only
-/// (`EXAV_SPLIT_MATCH=0`): bounds backtracking on a *single* pattern
-/// (gaps/alternations) so one pathological body can't loop unboundedly, the same
-/// idea as a regex step limit. Each `verify` call gets a fresh budget. The
-/// default path never reaches it — every wildcard body is decided by the
-/// non-backtracking simulator (`gap_split_match` forward,
-/// `gap_split_match_backward` for a [`Prefix::Internal`] start).
-const VERIFY_BUDGET: u64 = 200_000;
-
-/// Per-buffer pool for the LEGACY backtracking path (`EXAV_SPLIT_MATCH=0`).
-/// Bounds total backtracking work per buffer so a pathological fan-out (hundreds
-/// of thousands of expensive verifies) can't turn one file into tens of seconds.
-/// Sized far above any legitimate file's need: a normal 2 MB script spends a few
-/// million steps; this caps the worst case to well under a second. On the
-/// default path this pool is never drawn from.
-const SCAN_VERIFY_BUDGET: u64 = 64_000_000;
 
 thread_local! {
     /// Set true when a wildcard `verify` is skipped because the per-buffer
-    /// [`SCAN_VERIFY_BUDGET`] pool was exhausted — i.e. the search did NOT fully
+    /// [`SIM_BUDGET`] pool was exhausted, or when another check marks
+    /// itself short through [`mark_scan_truncated`]: the search did NOT fully
     /// complete. Per exav's cardinal rule (never a silent `Clean` on an
     /// incomplete scan), the top-level scan converts a would-be `Clean` into
     /// `LimitsExceeded` when this is set. Reset at the start of each top-level
     /// scan via [`reset_scan_truncated`].
     static SCAN_TRUNCATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Why a check did not run on an object too large to hold in memory, the
+    /// first such reason this scan. Setting it also sets [`SCAN_TRUNCATED`].
+    static SCAN_OVER_SIZE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+
+    /// Why carving left an embedded image or archive unscanned, the first such
+    /// reason this scan. Setting it also sets [`SCAN_TRUNCATED`].
+    static SCAN_CAPPED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Clear the per-scan verify-truncation flag. Call at the start of a top-level scan.
 pub fn reset_scan_truncated() {
     SCAN_TRUNCATED.with(|c| c.set(false));
+    SCAN_OVER_SIZE.with(|r| r.borrow_mut().take());
+    SCAN_CAPPED.with(|r| r.borrow_mut().take());
 }
 
-/// Did any wildcard verification get skipped this scan because its per-buffer
-/// verify budget was exhausted? If so the scan was INCOMPLETE and must not be
-/// reported `Clean`.
+/// Record that carving reached its cap with more to carve, and why. Unlike a
+/// `Limits` outcome it does not stop the walk: the container's other members
+/// are still scanned, and a detection in any of them wins.
+pub(crate) fn mark_capped(reason: impl FnOnce() -> String) {
+    SCAN_TRUNCATED.with(|c| c.set(true));
+    SCAN_CAPPED.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.is_none() {
+            *r = Some(reason());
+        }
+    });
+}
+
+/// The reason recorded by [`mark_capped`] this scan, if any.
+pub(crate) fn scan_capped() -> Option<String> {
+    SCAN_CAPPED.with(|r| r.borrow().clone())
+}
+
+/// Record that a check did not run because the object is too large to hold
+/// in memory, and why.
+pub(crate) fn mark_over_size(reason: impl FnOnce() -> String) {
+    SCAN_TRUNCATED.with(|c| c.set(true));
+    SCAN_OVER_SIZE.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.is_none() {
+            *r = Some(reason());
+        }
+    });
+}
+
+/// The reason recorded by [`mark_over_size`] this scan, if any.
+pub(crate) fn scan_over_size() -> Option<String> {
+    SCAN_OVER_SIZE.with(|r| r.borrow().clone())
+}
+
+/// Record that a check outside this module (YARA's condition step budget, the
+/// JavaScript view's output cap, the phishing allow-list budget) stopped short,
+/// so the scan is reported as incomplete.
+pub(crate) fn mark_scan_truncated() {
+    SCAN_TRUNCATED.with(|c| c.set(true));
+}
+
+/// Did any check stop short this scan (see [`SCAN_TRUNCATED`])? If so the scan
+/// was INCOMPLETE and must not be reported `Clean`.
 pub fn scan_was_truncated() -> bool {
     SCAN_TRUNCATED.with(|c| c.get())
 }
 
+/// Cap on simulator steps drawn by one anchor group per scan (see [`GroupCost`]).
+const MAX_GROUP_STEPS: u64 = 16_000_000;
+
+/// Per-scan account of simulator steps drawn per anchor group: the bound on
+/// concentrated repeated-boilerplate work.
+///
+/// One anchor shared by many bodies (a mailing-list footer, an XML boilerplate
+/// tag) can hit thousands of times per buffer, and every hit re-verifies every
+/// body in the group over overlapping suffixes. The group whose cumulative
+/// simulator draw passes the cap is skipped from then on, and the scan is
+/// flagged truncated through the same [`SCAN_TRUNCATED`] channel as pool
+/// exhaustion. A would-be `Clean` is then downgraded to `LimitsExceeded`, so
+/// the cap is never a silent clean. Note the limit of that: only the `Clean`
+/// arms consult [`scan_was_truncated`], so in `--all-matches` mode a capped
+/// group leaves no trace once some other signature has matched.
+///
+/// Keyed on cost, not hit count, deliberately: a hit count cannot tell a benign
+/// repetition from a pathological one, because the same shape produces both.
+/// Measured against a live ClamAV set, one 12 MB spreadsheet relationships part
+/// (112,084 hyperlinks) hits a single group 112,084 times, and the dearest
+/// single verify behind those anchors ran 25-35 ms: it is this cap, not the
+/// step pool, that ends that scan. The neighbouring 31 MB sheet part, with
+/// comparable hit counts but cheap bodies, finishes clean and untouched. So the
+/// discriminator has to be accumulated cost: hit counts alone rank these two
+/// the same way round.
+struct GroupCost {
+    steps: rustc_hash::FxHashMap<u64, u64>,
+    cap: u64,
+    /// How many groups have passed the cap. While none has, every group is
+    /// admitted without a lookup, which is nearly every scan: `admit` runs for
+    /// every anchor hit.
+    over: usize,
+}
+
+impl GroupCost {
+    fn new(cap: u64) -> Self {
+        Self {
+            steps: rustc_hash::FxHashMap::default(),
+            cap,
+            over: 0,
+        }
+    }
+
+    /// Whether partition `pidx`'s group `value` may still verify: false once
+    /// its cumulative simulator draw passed the cap (the scan is then flagged
+    /// truncated: the search did not complete).
+    fn admit(&mut self, pidx: usize, value: u32) -> bool {
+        if self.over == 0 {
+            return true;
+        }
+        let key = ((pidx as u64) << 32) | value as u64;
+        if self.steps.get(&key).is_some_and(|&s| s > self.cap) {
+            SCAN_TRUNCATED.with(|c| c.set(true));
+            return false;
+        }
+        true
+    }
+
+    /// Charge simulator steps drawn to partition `pidx`'s group `value`.
+    fn charge(&mut self, pidx: usize, value: u32, drawn: u64) {
+        if drawn == 0 {
+            return;
+        }
+        let key = ((pidx as u64) << 32) | value as u64;
+        let steps = self.steps.entry(key).or_insert(0);
+        let was_over = *steps > self.cap;
+        *steps += drawn;
+        if !was_over && *steps > self.cap {
+            self.over += 1;
+        }
+    }
+}
+
+/// `count` hits of one anchor, at `start`, `start + 1`, and so on: one hit, or
+/// part of a run of one repeated byte (see [`sweep`]).
+#[derive(Clone, Copy)]
+struct SweepHit {
+    pidx: u32,
+    value: u32,
+    /// `start << 16 | (count - 1)`, keeping the entry at 16 bytes.
+    packed: u64,
+}
+
+impl SweepHit {
+    /// Most hits one entry stands for; a longer run takes several.
+    const MAX_COUNT: usize = 1 << 16;
+
+    fn new(pidx: u32, value: u32, start: usize, count: usize) -> Self {
+        debug_assert!((1..=Self::MAX_COUNT).contains(&count));
+        SweepHit {
+            pidx,
+            value,
+            packed: (start as u64) << 16 | (count - 1) as u64,
+        }
+    }
+
+    /// Push `count` hits at `start`, split into as many entries as that
+    /// takes; consecutive ones are joined again when they are verified.
+    fn push(hits: &mut Vec<SweepHit>, pidx: usize, value: u32, start: usize, count: usize) {
+        let (mut at, mut left) = (start, count);
+        while left > 0 {
+            let n = left.min(Self::MAX_COUNT);
+            hits.push(SweepHit::new(pidx as u32, value, at, n));
+            at += n;
+            left -= n;
+        }
+    }
+
+    fn start(&self) -> usize {
+        (self.packed >> 16) as usize
+    }
+
+    fn count(&self) -> usize {
+        (self.packed & 0xffff) as usize + 1
+    }
+}
+
+/// The largest object a case-insensitive verification copies lowercased; a
+/// larger one is lowercased as it is read. In tests, small enough that the
+/// suites cover both.
+pub(crate) const LOWER_COPY_MAX: usize = if cfg!(test) { 64 } else { 16 << 20 };
+
+/// An object held in memory, lowercased the first time it is read.
+struct LazyLower<'a> {
+    src: &'a [u8],
+    low: std::cell::OnceCell<Vec<u8>>,
+}
+
+impl<'a> LazyLower<'a> {
+    fn new(src: &'a [u8]) -> Self {
+        LazyLower {
+            src,
+            low: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn get(&self) -> &[u8] {
+        self.low.get_or_init(|| self.src.to_ascii_lowercase())
+    }
+}
+
+impl ByteSource for LazyLower<'_> {
+    fn len(&self) -> usize {
+        self.src.len()
+    }
+
+    fn window(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+        ByteSource::window(self.get(), off, len)
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        Some(self.get())
+    }
+
+    fn identity(&self) -> (usize, usize) {
+        ByteSource::identity(self.src)
+    }
+}
+
+/// Cap on buffered sweep entries (16 bytes each, so ~64 MiB). Past it the scan
+/// drops the buffer and runs the direct inline path instead: no gate, no
+/// speedup, no growing memory. A hostile hit-dense file costs what it costs
+/// without any of this, plus the abandoned partial sweep.
+const MAX_BUFFERED_HITS: usize = 4_000_000;
+
+/// Hit count from which the gate is worth its own setup (a bitmap over every
+/// body). Below it the sweep is replayed ungated: what gating would save could
+/// not pay for zeroing the bitmap.
+const GATE_MIN_HITS: usize = 50_000;
+
+#[cfg(test)]
+thread_local! {
+    /// [`MAX_BUFFERED_HITS`] for the tests on this thread, so they can reach
+    /// the path past it.
+    static BUFFERED_HITS_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_BUFFERED_HITS) };
+}
+
+fn max_buffered_hits() -> usize {
+    #[cfg(test)]
+    return BUFFERED_HITS_CAP.get();
+    #[cfg(not(test))]
+    MAX_BUFFERED_HITS
+}
+
 thread_local! {
     /// Container types of every ancestor of the buffer being scanned, outermost
-    /// first — what `Intermediates:` is evaluated against. `None` marks an
+    /// first: what `Intermediates:` is evaluated against. `None` marks an
     /// ancestor whose type exav cannot name, which no chain can match through.
     ///
     /// Ambient rather than a parameter because it is pushed at the handful of
@@ -387,7 +704,7 @@ impl Drop for AncestryGuard {
 }
 
 /// Whether `want` (outermost first) is the innermost run of the current
-/// ancestry — i.e. it ends at the immediate parent.
+/// ancestry, that is, it ends at the immediate parent.
 fn ancestry_ends_with(want: &[ClType]) -> bool {
     ANCESTRY.with(|a| {
         let a = a.borrow();
@@ -402,66 +719,42 @@ fn ancestry_ends_with(want: &[ClType]) -> bool {
 /// Take the pending re-type for `buf`, if a `HandlerType:` signature decided one
 /// for exactly this buffer. Clears it either way, so a decision is used once.
 pub fn take_retype(buf: &[u8]) -> Option<FileType> {
+    take_retype_of(ByteSource::identity(buf))
+}
+
+/// [`take_retype`] for any object.
+pub(crate) fn take_retype_source(src: &dyn ByteSource) -> Option<FileType> {
+    take_retype_of(src.identity())
+}
+
+fn take_retype_of((addr, len): (usize, usize)) -> Option<FileType> {
     RETYPE.with(|c| match c.take() {
-        Some((addr, len, ft)) if addr == buf.as_ptr() as usize && len == buf.len() => Some(ft),
+        Some((a, l, ft)) if a == addr && l == len => Some(ft),
         _ => None,
     })
 }
 
-/// The per-buffer legacy backtracking pool, overridable via
-/// `EXAV_VERIFY_BUDGET` (steps). Read once. Only consulted when the simulator is
-/// disabled with `EXAV_SPLIT_MATCH=0`.
-fn scan_verify_budget() -> u64 {
-    use std::sync::OnceLock;
-    static B: OnceLock<u64> = OnceLock::new();
-    *B.get_or_init(|| {
-        std::env::var("EXAV_VERIFY_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(SCAN_VERIFY_BUDGET)
-    })
+/// Record a re-type decided for `src`.
+fn set_retype(src: &dyn ByteSource, ft: FileType) {
+    let (addr, len) = src.identity();
+    RETYPE.with(|c| c.set(Some((addr, len, ft))));
 }
 
-/// Per-buffer pool for the gap-split simulator. The simulator is polynomial and
-/// FP-safe (a positive answer is always a real match), so its backstop sits far
-/// above the backtracking pool — it exists only to bound a deliberately
-/// adversarial input, and on real content is essentially never spent. Kept
-/// separate from the backtracking pool so the (safe, cheap) simulator's generous
-/// headroom can never let the (dangerous, exponential) backtracker run longer.
-/// At the simulator's throughput this bounds a worst-case buffer to a few
-/// seconds before it (correctly, never silently) reports `LimitsExceeded`.
-/// Overridable via `EXAV_SIM_BUDGET`.
+/// Per-buffer pool of verification steps, drawn by the gap-split simulator.
+/// The simulator is polynomial and FP-safe (a positive answer is always a real
+/// match).
+///
+/// It is NOT only reached by adversarial input, despite what its size suggests:
+/// against a live ClamAV set an ordinary 6.7 MB spreadsheet spends it, because
+/// the 52 MB of XML it unpacks to repeats one shape often enough that short
+/// URL/email anchors hit over a hundred thousand times each. That scan reports
+/// `LimitsExceeded` rather than `Clean`: honestly, since the search really did
+/// not finish, but on a benign file. Raising this pool does not fix such a
+/// scan; it just buys more of the same work (measured: 16x the pool changed
+/// nothing, because the per-group cap ends it first). At the simulator's
+/// throughput this bounds a worst-case buffer to a few seconds before it
+/// (correctly, never silently) reports `LimitsExceeded`.
 const SIM_BUDGET: u64 = 500_000_000;
-
-fn sim_verify_budget() -> u64 {
-    use std::sync::OnceLock;
-    static B: OnceLock<u64> = OnceLock::new();
-    *B.get_or_init(|| {
-        std::env::var("EXAV_SIM_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(SIM_BUDGET)
-    })
-}
-
-/// The two per-buffer work pools a scan draws from: `sim` bounds the polynomial
-/// gap-split simulator — the only one the default path uses — and `legacy` bounds
-/// the exponential backtracking walk (`match_forward`/`match_backward`), reached
-/// only with `EXAV_SPLIT_MATCH=0`. Kept separate so the simulator's large safe
-/// headroom can never relax the backtracker's tight cap.
-struct Budgets {
-    legacy: u64,
-    sim: u64,
-}
-
-impl Budgets {
-    fn new() -> Self {
-        Budgets {
-            legacy: scan_verify_budget(),
-            sim: sim_verify_budget(),
-        }
-    }
-}
 
 thread_local! {
     /// Diagnostic: (slowest token-verify microseconds, its body id).
@@ -477,7 +770,7 @@ enum Elem {
     LoNibble(u8),
     Gap { min: usize, max: Option<usize> },
     Alt { opts: Vec<Vec<u8>>, neg: bool },
-    /// `(5?|b?)`, `(?4|?c)`, `(130?|0?)` — an alternation whose branches carry
+    /// `(5?|b?)`, `(?4|?c)`, `(130?|0?)`: an alternation whose branches carry
     /// nibble wildcards, so a branch is a `(value, mask)` per byte rather than a
     /// literal. Kept separate from [`Elem::Alt`] so the all-literal case keeps
     /// its substring-search fast path, which a masked branch cannot use.
@@ -538,17 +831,29 @@ enum Prefix {
     /// (`elems[..anchor_idx]` contains a `Gap`/`Alt`). Verification matches both
     /// forward from the anchor and *backward* across the preceding gaps. Chosen
     /// only when a literal after a gap is markedly more selective than anything
-    /// in the fixed prefix (e.g. a constant zero-run is the only pre-gap literal)
-    /// — and only for `Offset::Any` patterns, so the floating pattern start never
+    /// in the fixed prefix (e.g. a constant zero-run is the only pre-gap literal),
+    /// and only for `Offset::Any` patterns, so the floating pattern start never
     /// needs to satisfy a fixed offset.
     Internal { anchor_idx: u32 },
+}
+
+impl Prefix {
+    /// Index into `elems` of the literal serving as the anchor. The three
+    /// variants differ in what precedes it, not in having one.
+    fn anchor_idx(&self) -> u32 {
+        match *self {
+            Prefix::Fixed { anchor_idx, .. }
+            | Prefix::Floating { anchor_idx }
+            | Prefix::Internal { anchor_idx } => anchor_idx,
+        }
+    }
 }
 
 /// Offset constraint on where the pattern start may sit. The overwhelmingly
 /// common case is [`Offset::Any`] (no constraint); the rare constrained kinds
 /// are boxed so this enum stays one word, keeping `Body` small across the
 /// millions of loaded signatures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum Offset {
     Any,
     Constrained(Box<OffsetKind>),
@@ -556,7 +861,7 @@ enum Offset {
 
 /// A concrete offset constraint (boxed inside [`Offset::Constrained`]). `shift`
 /// is the optional `,maxshift` window width.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum OffsetKind {
     /// start in [n, n+shift]
     Abs {
@@ -593,13 +898,13 @@ enum OffsetKind {
 }
 
 /// A compiled body plus where it came from. The literal anchor used to build
-/// the Aho-Corasick automaton is kept separately (in `EngineBuilder`'s
-/// concatenated `anchor_buf`) and dropped after the build — it is never needed
-/// during scanning.
+/// the index is kept separately (in `EngineBuilder`'s concatenated
+/// `anchor_buf`) and dropped after the build: it is never needed during
+/// scanning.
 #[derive(Serialize, Deserialize)]
 struct Body {
     /// The token program to verify at each anchor hit. `None` for a pure
-    /// literal whose anchor IS the whole pattern — then an Aho-Corasick hit is
+    /// literal whose anchor IS the whole pattern: then an anchor hit is
     /// already a full match (subject only to the offset), so no per-body token
     /// allocation is kept. This is the common case and the main memory saver.
     elems: Option<Vec<Elem>>,
@@ -613,7 +918,7 @@ struct Body {
     /// reaches from its start so the trailing boundary can be found.
     ///
     /// Carrying the LENGTH rather than a flag is what makes the check possible
-    /// at all — the verifier reports where a match began, never where it ended.
+    /// at all: the verifier reports where a match began, never where it ended.
     /// Only patterns of fixed width can supply it, which is why a fullword body
     /// that is not fixed-width is refused at load time (and counted) rather than
     /// matched with the modifier quietly dropped.
@@ -654,8 +959,8 @@ fn fixed_width(elems: &[Elem]) -> Option<usize> {
     Some(total)
 }
 
-/// True if a pure literal whose anchor equals the whole pattern (an AC hit is
-/// already a full match, so no stored token program is needed).
+/// True if a pure literal whose anchor equals the whole pattern (an anchor hit
+/// is already a full match, so no stored token program is needed).
 fn is_literal_only(elems: &[Elem], prefix: &Prefix) -> bool {
     matches!(
         prefix,
@@ -689,7 +994,7 @@ struct Ldb {
     /// false (a real sig needs a subsig to match), so when no subsig matched a
     /// file the whole logical-sig pass can be skipped for all but these.
     fires_on_empty: bool,
-    /// One entry per subsignature number (positional — referenced by index in
+    /// One entry per subsignature number (positional: referenced by index in
     /// the logical expression and in trigger fields).
     subs: Vec<SubSig>,
     /// Optional `FileSize:min-max` TDB constraint (inclusive); the scanned
@@ -727,7 +1032,17 @@ struct Ldb {
     /// only at report time (compat mode), never baked into `name`.
     #[serde(default)]
     unofficial: bool,
+    /// The bytecode program this signature gates, when it is one's trigger:
+    /// it then never alerts, and a match runs the program instead (see
+    /// [`Fired`]).
+    #[serde(default)]
+    bytecode: Option<u32>,
 }
+
+/// A bytecode trigger that fired: the program it gates, and where each of
+/// its subsignatures first matched (`u32::MAX` for none), which the program
+/// reads as `__clambc_match_offsets`.
+pub type Fired = (u32, Vec<u32>);
 
 /// A logical-signature subsignature: a normal hex/pattern body group, a PCRE
 /// regex, or a byte-compare. PCRE and byte-compare are evaluated *after* the
@@ -737,7 +1052,7 @@ enum SubSig {
     /// Normal subsig: AC-anchored body ids (an `aw` modifier yields several);
     /// matched if any body matched. Count = sum of body match counts.
     Bodies(Vec<usize>),
-    Pcre(PcreSub),
+    Pcre(Box<PcreSub>),
     Bcomp(BcompSub),
     /// `fuzzy_img#<hash>[#<dist>]`: matched if the scanned object is an image
     /// whose 64-bit perceptual hash is within Hamming distance `dist` of this one
@@ -746,160 +1061,342 @@ enum SubSig {
     Fuzzy([u8; 8], u32),
 }
 
-/// A `Trigger/PCRE/[flags]` subsignature. The compiled regex is built lazily
-/// and not serialized (a database stores only the pattern/flags).
+/// A `[Offset:]Trigger/PCRE/[flags]` subsignature. The compiled regexes are
+/// built lazily and not serialized.
 #[derive(Serialize, Deserialize)]
 struct PcreSub {
     /// Logical expression over preceding subsigs that gates the regex.
     trigger: Node,
-    /// Where in the file the match may start. `Offset::Any` (the common case)
-    /// puts no constraint on it. Only [`Offset::Abs`] and [`Offset::Eof`] are
-    /// accepted at parse time — those need nothing but the file length, whereas
-    /// the `EP`/`Sx` kinds need a PE layout this path does not carry, and
-    /// evaluating one without it would silently never match.
+    /// Where in the file the match is looked for. `Offset::Any` (the common
+    /// case) puts no constraint on it. Only [`Offset::Abs`] and [`Offset::Eof`]
+    /// are accepted at parse time: those need nothing but the file length,
+    /// whereas the `EP`/`Sx` kinds need a PE layout this path does not carry,
+    /// and evaluating one without it would silently never match.
     offset: Offset,
+    /// The pattern as [`pcre::translate`] writes it for the Rust engines, its
+    /// `i`, `s`, `m`, `x`, `E` and `U` flags applied.
     pattern: String,
-    ci: bool,
-    dotall: bool,
-    multiline: bool,
+    /// `g`: every match is counted, not just the first.
+    global: bool,
+    /// `r`: with an offset and no shift, the match may start anywhere after
+    /// the offset rather than at it.
+    rolling: bool,
+    /// `e`: with a shift, the match also ends within it.
+    encompass: bool,
+    /// `A`: the match starts where the searched part does.
+    anchored: bool,
     #[serde(skip)]
     re: std::sync::OnceLock<Option<regex::bytes::Regex>>,
     /// Fast linear-engine *superset* prefilter for the backtracking path: the
     /// pattern with its zero-width lookarounds stripped, compiled in the DoS-safe
     /// `regex` engine. Since dropping a `(?=…)`/`(?!…)`/`(?<=…)`/`(?<!…)` assertion
     /// only *relaxes* the pattern, if this prefilter can't match neither can the
-    /// real one — so a non-match lets us skip the expensive backtracking scan (and
-    /// the per-call latin-1 buffer copy). `None` when the pattern can't be reduced
-    /// to a linear superset (e.g. it uses backreferences). Built lazily.
+    /// real one, so a non-match lets us skip the expensive backtracking scan.
+    /// `None` when the pattern can't be reduced to a linear superset (e.g. it
+    /// uses backreferences). Built lazily.
     #[serde(skip)]
     prefilter: std::sync::OnceLock<Option<regex::bytes::Regex>>,
     /// Backtracking fallback (`fancy-regex`) for lookaround/backreference patterns
-    /// the linear `regex` engine can't compile. Run over a latin-1 mapping of the
-    /// bytes, with a bounded backtrack budget so a crafted pattern can't hang.
+    /// the linear `regex` engine can't compile. Run over the bytes, with a
+    /// bounded backtrack budget so a crafted pattern can't hang.
     #[serde(skip)]
-    fancy: std::sync::OnceLock<Option<fancy_regex::Regex>>,
+    fancy: std::sync::OnceLock<Option<crate::fancy_regex::Regex>>,
+    /// The linear regex as lazy DFAs, for an object read through the block
+    /// cache. Built lazily.
+    #[serde(skip)]
+    stream_re: std::sync::OnceLock<Option<Box<StreamRegex>>>,
+    /// `prefilter` as lazy DFAs. Built lazily.
+    #[serde(skip)]
+    stream_prefilter: std::sync::OnceLock<Option<Box<StreamRegex>>>,
 }
 
-/// A buffer plus its lossless latin-1 (`u8 → char`) rendering, built **at most
-/// once** and shared across every PCRE subsig evaluated over that buffer. The
-/// backtracking `fancy-regex` engine matches on `&str`; building this once avoids
-/// rebuilding a full multi-MB `String` copy of the *same* buffer on every PCRE
-/// call. Without it, a feed with hundreds of lookaround PCREs (e.g.
-/// `twinclams.ldb`) turns a single large file into tens of seconds of pure
-/// allocation churn.
-pub(super) struct Latin1<'a> {
-    buf: &'a [u8],
-    mapped: std::cell::OnceCell<String>,
+/// NFA size a PCRE subsignature may compile to.
+const PCRE_NFA_LIMIT: usize = 16 * 1024 * 1024;
+
+/// What the checks that need an object whole may do with it.
+#[derive(Clone, Copy)]
+pub(crate) struct WholeLimits {
+    /// Largest object such a check (an image hash, a backtracking regex) may
+    /// read into memory when it is not held there, and the most an image's
+    /// decoded pixels may take.
+    pub(crate) materialize: usize,
+    /// Largest object PCRE subsignatures run on (`--max-pcre-bytes`); past it
+    /// they do not match, as ClamAV's `PCREMaxFileSize` has it.
+    pub(crate) pcre: usize,
+    /// `Target:5` and `fuzzy_img#` take every image format exav-imagehash
+    /// decodes, not only the five clamscan treats as graphics. Off under
+    /// `--clamav-compat`.
+    pub(crate) all_image_formats: bool,
 }
 
-impl<'a> Latin1<'a> {
+impl WholeLimits {
+    pub(crate) const NONE: WholeLimits = WholeLimits {
+        materialize: usize::MAX,
+        pcre: usize::MAX,
+        all_image_formats: true,
+    };
+}
+
+/// The object the PCRE subsignatures of one scan run over, shared by all of
+/// them so that one read whole is read once.
+pub(super) struct Hay<'a> {
+    src: &'a dyn ByteSource,
+    limits: WholeLimits,
+    /// The object read whole, done at most once.
+    held: std::cell::OnceCell<Option<Vec<u8>>>,
+}
+
+impl<'a> Hay<'a> {
     #[inline]
-    pub(super) fn new(buf: &'a [u8]) -> Self {
-        Self { buf, mapped: std::cell::OnceCell::new() }
+    pub(super) fn new(src: &'a dyn ByteSource, limits: WholeLimits) -> Self {
+        Self {
+            src,
+            limits,
+            held: std::cell::OnceCell::new(),
+        }
     }
-    #[inline]
-    fn bytes(&self) -> &[u8] {
-        self.buf
-    }
-    /// The latin-1 `&str` view, built on first use and cached for the buffer.
-    fn as_str(&self) -> &str {
-        self.mapped
-            .get_or_init(|| self.buf.iter().map(|&b| b as char).collect())
+
+    /// The object in memory: as it is held, or read whole when it is at most
+    /// `limits.materialize` bytes.
+    fn bytes(&self) -> Option<&[u8]> {
+        if let Some(s) = self.src.as_slice() {
+            return Some(s);
+        }
+        self.held
+            .get_or_init(|| self.src.materialize(self.limits.materialize).map(|c| c.into_owned()))
+            .as_deref()
     }
 }
+
+/// Where in an object a PCRE subsignature is matched, as ClamAV hands PCRE2
+/// the part past the offset as the whole subject (so `^`, `\A` and a
+/// lookbehind see it start there).
+struct Window {
+    /// The part searched, `[lo, hi)`.
+    lo: usize,
+    hi: usize,
+    /// A match starts at the beginning of the part (or, for later matches
+    /// under `g`, where the previous one ended).
+    anchored: bool,
+    /// The furthest into the part a match may start.
+    max_start: Option<usize>,
+}
+
+/// The most matches counted for one subsignature under `g`.
+const MAX_PCRE_COUNT: u32 = 1 << 20;
 
 impl PcreSub {
-    /// Inline-flag prefix (`(?ism)`) applied to this subsig's pattern.
-    fn flagged_pattern(&self) -> String {
-        let mut flags = String::new();
-        if self.ci {
-            flags.push('i');
+    /// The part of an object of `len` bytes this subsignature is matched in,
+    /// or `None` when the offset lies past it.
+    ///
+    /// Without an offset, the whole object. With one and no shift, the part
+    /// from the offset, the match starting at it unless `r`. With a shift, the
+    /// match starts at most that far in (`r` has no effect), and under `e`
+    /// the part ends there too.
+    fn window(&self, len: usize) -> Option<Window> {
+        let (base, shift) = match &self.offset {
+            Offset::Any => {
+                return Some(Window {
+                    lo: 0,
+                    hi: len,
+                    anchored: self.anchored,
+                    max_start: None,
+                })
+            }
+            Offset::Constrained(k) => match k.as_ref() {
+                OffsetKind::Abs { n, shift } => (usize::try_from(*n).ok()?, *shift),
+                OffsetKind::Eof { n, shift } => (len.checked_sub(usize::try_from(*n).ok()?)?, *shift),
+                _ => return None,
+            },
+        };
+        if base > len {
+            return None;
         }
-        if self.dotall {
-            flags.push('s');
-        }
-        if self.multiline {
-            flags.push('m');
-        }
-        if flags.is_empty() {
-            self.pattern.clone()
+        let shift = usize::try_from(shift).unwrap_or(usize::MAX);
+        Some(if shift > 0 {
+            Window {
+                lo: base,
+                hi: if self.encompass { base.saturating_add(shift).min(len) } else { len },
+                anchored: self.anchored,
+                max_start: Some(shift),
+            }
         } else {
-            format!("(?{flags}){}", self.pattern)
+            Window {
+                lo: base,
+                hi: len,
+                anchored: self.anchored || !self.rolling,
+                max_start: None,
+            }
+        })
+    }
+
+    /// The matches `find` reports in a part of `len` bytes, counted as ClamAV
+    /// does: the first only without `g`, and with it each next one searched
+    /// for from where the last ended. `find(pos)` is the leftmost match
+    /// starting at or after `pos`, or `None` when the search gave up.
+    fn count_matches(
+        &self,
+        w: &Window,
+        len: usize,
+        mut find: impl FnMut(usize) -> Option<Option<(usize, usize)>>,
+    ) -> Option<u32> {
+        let mut n = 0;
+        let mut pos = 0;
+        while let Some((s, e)) = find(pos)? {
+            if (w.anchored && s != pos) || w.max_start.is_some_and(|m| s > m) {
+                break;
+            }
+            n += 1;
+            if !self.global || n == MAX_PCRE_COUNT {
+                break;
+            }
+            pos = if e > s { e } else { e + 1 };
+            if pos > len {
+                break;
+            }
+        }
+        Some(n)
+    }
+
+    /// How many times this subsignature matches `hay`, for its logical
+    /// expression: 0 or 1, or with `g` the number of matches.
+    ///
+    /// The linear-time `regex` engine runs most patterns. The few using
+    /// lookaround or backreferences fall back to the backtracking
+    /// `fancy-regex`, behind a linear superset prefilter and with a bounded
+    /// backtrack budget. Both read the pattern [`pcre::translate`] wrote.
+    fn count(&self, hay: &Hay) -> u32 {
+        if hay.src.len() > hay.limits.pcre {
+            return 0;
+        }
+        let Some(w) = self.window(hay.src.len()) else {
+            return 0;
+        };
+        match hay.src.as_slice() {
+            Some(buf) => self.count_in(&buf[w.lo..w.hi], &w),
+            None => self.count_streamed(hay, &w),
         }
     }
 
-    /// Lazily compile and run the regex over `buf`. The linear-time, DoS-safe
-    /// `regex` engine handles the vast majority of patterns. The few using
-    /// lookaround / backreferences (not regular languages) can't compile there;
-    /// they fall back to the backtracking `fancy-regex`, run over a LOSSLESS
-    /// latin-1 mapping of the bytes (each byte `0x00..=0xff` → `U+0000..=U+00FF`)
-    /// so it works on binary content, not just text. ClamAV writes high bytes as
-    /// `\xNN`, which map to the same codepoints, so matching is byte-equivalent.
-    /// A bounded backtrack budget plus trigger-gating keep it DoS- and FP-safe, and
-    /// a superset literal prefilter skips it entirely when the pattern can't match.
-    fn is_match(&self, buf: &Latin1) -> bool {
-        let re = self.re.get_or_init(|| {
-            regex::bytes::RegexBuilder::new(&self.flagged_pattern())
-                .size_limit(16 * 1024 * 1024)
-                .dfa_size_limit(16 * 1024 * 1024)
-                .build()
-                .ok()
-        });
-        if let Some(r) = re {
-            let hay = buf.bytes();
-            return match self.offset {
-                // Unconstrained: the existential answer is all we need.
-                Offset::Any => r.is_match(hay),
-                // Constrained: a match only counts if it STARTS inside the
-                // window, so walk the matches rather than asking is_match.
-                _ => {
-                    let len = hay.len() as u64;
-                    r.find_iter(hay)
-                        .any(|m| offset_ok(&self.offset, m.start() as u64, len, None))
+    /// `count` over an object read through the block cache: the linear
+    /// regexes by lazy DFAs stepped through it, the backtracking ones in memory
+    /// when the object is small enough to hold. Anything else is reported as
+    /// an incomplete scan.
+    fn count_streamed(&self, hay: &Hay, w: &Window) -> u32 {
+        let part = Part {
+            src: hay.src,
+            lo: w.lo,
+            len: w.hi - w.lo,
+        };
+        if self.compiled_re().is_some() {
+            let sr = self
+                .stream_re
+                .get_or_init(|| StreamRegex::bytes_regex(&self.pattern, PCRE_NFA_LIMIT).map(Box::new));
+            if let Some(sr) = sr.as_deref() {
+                let mut caches = sr.caches();
+                if let Some(n) = self.count_matches(w, part.len, |pos| sr.find(&mut caches, &part, pos).ok()) {
+                    return n;
                 }
-            };
+            }
+        } else {
+            let sr = self.stream_prefilter.get_or_init(|| {
+                strip_lookaround(&self.pattern)
+                    .filter(|s| *s != self.pattern)
+                    .and_then(|p| StreamRegex::bytes_regex(&p, PCRE_NFA_LIMIT))
+                    .map(Box::new)
+            });
+            // The superset can only rule a match out.
+            if sr.as_deref().is_some_and(|sr| sr.is_match(&part).is_ok_and(|m| !m)) {
+                return 0;
+            }
+        }
+        match hay.bytes() {
+            Some(buf) => self.count_in(&buf[w.lo..w.hi], w),
+            None => {
+                SCAN_TRUNCATED.with(|c| c.set(true));
+                0
+            }
+        }
+    }
+
+    fn compiled_re(&self) -> Option<&regex::bytes::Regex> {
+        self.re
+            .get_or_init(|| {
+                regex::bytes::RegexBuilder::new(&self.pattern)
+                    .unicode(false)
+                    .size_limit(PCRE_NFA_LIMIT)
+                    .dfa_size_limit(16 * 1024 * 1024)
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// `count` over the part searched, held in memory.
+    fn count_in(&self, part: &[u8], w: &Window) -> u32 {
+        if let Some(r) = self.compiled_re() {
+            return self
+                .count_matches(w, part.len(), |pos| Some(r.find_at(part, pos).map(|m| (m.start(), m.end()))))
+                .unwrap_or(0);
         }
         // Backtracking path (lookaround / backreferences). First the fast
         // linear-engine superset prefilter: if the lookaround-stripped pattern
         // can't match, the real one can't either, so skip the backtracking scan.
-        let prefilter = self
-            .prefilter
-            .get_or_init(|| build_prefilter(&self.flagged_pattern()));
-        if let Some(pf) = prefilter {
-            if !pf.is_match(buf.bytes()) {
-                return false;
-            }
+        let prefilter = self.prefilter.get_or_init(|| build_prefilter(&self.pattern));
+        if prefilter.as_ref().is_some_and(|pf| !pf.is_match(part)) {
+            return 0;
         }
         let fre = self.fancy.get_or_init(|| {
-            fancy_regex::RegexBuilder::new(&self.flagged_pattern())
+            crate::fancy_regex::RegexBuilder::new(&self.pattern)
+                .bytes_mode(crate::fancy_regex::BytesMode::Ascii)
                 .backtrack_limit(1_000_000)
                 .build()
                 .ok()
         });
         let Some(r) = fre.as_ref() else {
-            return false;
+            return 0;
         };
-        // Lossless latin-1 view, built once per buffer and shared across all PCRE
-        // subsigs (see `Latin1`), so a large file with many lookaround PCREs
-        // doesn't reallocate the whole buffer per call. The latin-1 mapping is
-        // 1 byte -> 1 char, so a char index here IS the byte offset.
-        let s = buf.as_str();
-        match self.offset {
-            Offset::Any => r.is_match(s).unwrap_or(false),
-            _ => {
-                let len = buf.bytes().len() as u64;
-                r.find_iter(s)
-                    .filter_map(|m| m.ok())
-                    .any(|m| offset_ok(&self.offset, m.start() as u64, len, None))
-            }
+        self.count_matches(w, part.len(), |pos| {
+            r.find_from_pos(part, pos).ok().map(|m| m.map(|m| (m.start(), m.end())))
+        })
+        .unwrap_or(0)
+    }
+}
+
+/// Bytes `lo..lo+len` of an object, read as an object of their own.
+struct Part<'a> {
+    src: &'a dyn ByteSource,
+    lo: usize,
+    len: usize,
+}
+
+impl ByteSource for Part<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn window(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+        let len = len.min(self.len.saturating_sub(off));
+        if len == 0 {
+            return std::borrow::Cow::Borrowed(&[]);
         }
+        self.src.window(self.lo + off, len)
+    }
+
+    fn read_error(&self) -> Option<String> {
+        self.src.read_error()
+    }
+
+    fn identity(&self) -> (usize, usize) {
+        let (id, _) = self.src.identity();
+        (id.wrapping_add(self.lo), self.len)
     }
 }
 
 /// Build a fast linear-engine *superset* of `pattern` for prefiltering the backtracking
 /// path: strip zero-width lookaround assertions and compile the result in the
 /// DoS-safe `regex` engine. Dropping a lookaround only relaxes the language, so
-/// the result matches a superset of the original — a non-match is a sound reason
+/// the result matches a superset of the original: a non-match is a sound reason
 /// to skip the backtracking scan. Returns `None` when no superset can be formed
 /// (no lookaround to strip, a backreference is present, or the reduced pattern
 /// still won't compile), in which case the caller runs the full engine
@@ -910,18 +1407,19 @@ fn build_prefilter(pattern: &str) -> Option<regex::bytes::Regex> {
         return None; // nothing was stripped → no cheaper superset to gain
     }
     regex::bytes::RegexBuilder::new(&stripped)
+        .unicode(false)
         .size_limit(16 * 1024 * 1024)
         .dfa_size_limit(16 * 1024 * 1024)
         .build()
         .ok()
 }
 
-/// Remove top-of-token lookaround groups — `(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)` —
+/// Remove top-of-token lookaround groups (`(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)`)
 /// from a regex, returning the relaxed pattern. Only these four exact forms are
-/// removed (with their balanced parenthesis span); every other construct —
-/// `(?:…)`, capturing/named groups, char classes, inline flags — is preserved
+/// removed (with their balanced parenthesis span); every other construct
+/// (`(?:…)`, capturing/named groups, char classes, inline flags) is preserved
 /// verbatim, so the result can only match *more* inputs than the original.
-/// Returns `None` if a backreference (`\1`–`\9`) is present (can't soundly reduce)
+/// Returns `None` if a backreference (`\k<N>`, `\1`–`\9`) is present (can't soundly reduce)
 /// or the parentheses are unbalanced.
 fn strip_lookaround(pat: &str) -> Option<String> {
     let b = pat.as_bytes();
@@ -931,8 +1429,8 @@ fn strip_lookaround(pat: &str) -> Option<String> {
     while i < b.len() {
         let c = b[i];
         if c == b'\\' {
-            // Escape: a `\1`–`\9` backreference makes reduction unsound.
-            if i + 1 < b.len() && b[i + 1].is_ascii_digit() && b[i + 1] != b'0' {
+            // Escape: a backreference (`\k<N>`, `\1`–`\9`) makes reduction unsound.
+            if i + 1 < b.len() && (b[i + 1] == b'k' || (b[i + 1].is_ascii_digit() && b[i + 1] != b'0')) {
                 return None;
             }
             out.push(c);
@@ -1033,12 +1531,17 @@ enum BcompKind {
 
 impl BcompSub {
     /// Extract the value at `trigger_off + offset` and test the comparisons.
-    fn matches(&self, buf: &[u8], trigger_off: u32) -> bool {
-        let pos = trigger_off as i64 + self.offset;
-        if pos < 0 || pos as usize > buf.len() {
+    fn matches(&self, buf: &dyn ByteSource, trigger_off: u64) -> bool {
+        let Some(pos) = i64::try_from(trigger_off)
+            .ok()
+            .and_then(|t| t.checked_add(self.offset))
+            .and_then(|p| usize::try_from(p).ok())
+            .filter(|&p| p <= buf.len())
+        else {
             return false;
-        }
-        let rest = &buf[pos as usize..];
+        };
+        let rest = buf.window(pos, self.num_bytes);
+        let rest: &[u8] = &rest;
         let val: i64 = match self.kind {
             BcompKind::Raw => {
                 if rest.len() < self.num_bytes {
@@ -1140,7 +1643,7 @@ impl Ldb {
 
     /// Whether the current container context satisfies the `Container:` TDB
     /// constraint. An unconstrained sig always passes. A type-constrained sig
-    /// fires only when the immediate container matches — in particular never at
+    /// fires only when the immediate container matches, in particular never at
     /// the top level, since the format scopes such sigs to content extracted
     /// from a container of that type.
     fn container_ok(&self, cur: Option<ClType>) -> bool {
@@ -1153,7 +1656,7 @@ impl Ldb {
     /// Whether the ancestry satisfies the `Intermediates:` TDB constraint.
     ///
     /// `ancestry` is the chain of container types above this object, outermost
-    /// first — the same order the attribute is written in. The requirement is a
+    /// first, the same order the attribute is written in. The requirement is a
     /// contiguous run anchored at the *immediate* parent, so the chain's last
     /// link must be the innermost container and the run need not reach the top:
     /// `A>B` holds for `…>A>B>here` but not for `A>B>…>here`.
@@ -1171,9 +1674,9 @@ impl Ldb {
     /// reference earlier subsigs).
     fn eval(
         &self,
-        buf: &Latin1,
+        buf: &Hay,
         body_count: &dyn Fn(usize) -> u32,
-        body_off: &dyn Fn(usize) -> Option<u32>,
+        body_off: &dyn Fn(usize) -> Option<u64>,
         img_hash: Option<[u8; 8]>,
         icon_ctx: Option<&IconCtx>,
     ) -> bool {
@@ -1182,21 +1685,20 @@ impl Ldb {
         // Pass 1: normal subsigs from AC body counts.
         for (i, s) in self.subs.iter().enumerate() {
             if let SubSig::Bodies(ids) = s {
-                c[i] = ids.iter().map(|&b| body_count(b)).sum();
+                c[i] = ids.iter().fold(0u32, |a, &b| a.saturating_add(body_count(b)));
             }
         }
         // Satisfiability gate: PCRE/bcomp/fuzzy subsigs are expensive to evaluate,
         // yet a candidate lsig often can't fire regardless of their outcome because
         // a *body* subsig the boolean expression also requires is absent (common
-        // with feeds whose PCREs anchor on ubiquitous literals). Skip Pass 2 —
-        // and the whole lsig — when no assignment of the not-yet-evaluated
+        // with feeds whose PCREs anchor on ubiquitous literals). Skip Pass 2,
+        // and the whole lsig, when no assignment of the not-yet-evaluated
         // (binary) expensive subsigs can satisfy `expr`. Over-approximate and
         // FN-safe: never prunes a satisfiable expression.
-        let unknown = |i: usize| {
-            matches!(
-                self.subs.get(i),
-                Some(SubSig::Pcre(_) | SubSig::Bcomp(_) | SubSig::Fuzzy(..))
-            )
+        let unknown = |i: usize| match self.subs.get(i) {
+            Some(SubSig::Pcre(p)) => Some(if p.global { u32::MAX } else { 1 }),
+            Some(SubSig::Bcomp(_) | SubSig::Fuzzy(..)) => Some(1),
+            _ => None,
         };
         if !self.expr.can_be_true(&|i| c[i], &unknown) {
             return false;
@@ -1205,8 +1707,8 @@ impl Ldb {
         for (i, s) in self.subs.iter().enumerate() {
             match s {
                 SubSig::Pcre(p) => {
-                    if p.trigger.eval(&|j| c.get(j).copied().unwrap_or(0)) && p.is_match(buf) {
-                        c[i] = 1;
+                    if p.trigger.eval(&|j| c.get(j).copied().unwrap_or(0)) {
+                        c[i] = p.count(buf);
                     }
                 }
                 SubSig::Bcomp(b) => {
@@ -1214,7 +1716,7 @@ impl Ldb {
                         // Offset anchored at the trigger subsig's first match.
                         if let SubSig::Bodies(ids) = &self.subs[b.trigger] {
                             if let Some(off) = ids.iter().filter_map(|&id| body_off(id)).min() {
-                                if b.matches(buf.bytes(), off) {
+                                if b.matches(buf.src, off) {
                                     c[i] = 1;
                                 }
                             }
@@ -1306,10 +1808,14 @@ impl EngineBuilder {
         self.anchor_ranges.push((start, a.len() as u32));
     }
 
-    /// Add a plain literal signature (no wildcards/offset). Used to fold the
-    /// built-in EICAR test pattern into the engine so in-memory scans don't
-    /// also need the streaming literal automaton.
+    /// Add a plain literal signature (no wildcards/offset): the built-in
+    /// EICAR test pattern, and `.db` signatures.
     pub fn add_literal(&mut self, name: &str, bytes: &[u8]) {
+        self.add_literal_prov(name, bytes, false);
+    }
+
+    /// As [`Self::add_literal`], with `unofficial` provenance (a loose `.db`).
+    pub fn add_literal_prov(&mut self, name: &str, bytes: &[u8], unofficial: bool) {
         if bytes.len() < MIN_ANCHOR {
             return;
         }
@@ -1327,7 +1833,7 @@ impl EngineBuilder {
             fullword_len: None,
             owner: Owner::Ndb {
                 name: name.to_string(),
-                unofficial: false,
+                unofficial,
             },
         });
     }
@@ -1375,7 +1881,7 @@ impl EngineBuilder {
                 None => (None, true),
             };
             if !flevel_ok_here {
-                continue; // sig is for a different engine flevel — skip like ClamAV
+                continue; // sig is for a different engine flevel: skip like ClamAV
             }
             match (offset, body) {
                 (Some(offset), Some(hex)) => match compile_body(hex, matches!(offset, Offset::Any))
@@ -1426,9 +1932,9 @@ impl EngineBuilder {
     /// together any PCRE subsignature that contains a literal `;`.
     ///
     /// The format says a semicolon inside a regex must be written `\x3B`. Live
-    /// signatures do not always comply — `Js.Trojan.Gootloader-10027796-0`
+    /// signatures do not always comply: `Js.Trojan.Gootloader-10027796-0`
     /// matches `…{4,10};\s+…` and `Win.Phishing.VbsAgent-10036542-0` lists `;;`
-    /// as one branch of an alternation of symbol pairs — and clamscan loads both,
+    /// as one branch of an alternation of symbol pairs, and clamscan loads both,
     /// so a plain split drops two real detections over a punctuation rule the
     /// database itself does not keep.
     ///
@@ -1438,7 +1944,7 @@ impl EngineBuilder {
     /// odd count is therefore a regex cut in half, and the pieces are glued back
     /// with the `;` that split them until the count is even again.
     fn split_ldb_fields(line: &str) -> Vec<String> {
-        /// Unescaped `/` in a field — `\/` inside a regex does not delimit.
+        /// Unescaped `/` in a field: `\/` inside a regex does not delimit.
         fn slashes(s: &str) -> usize {
             let b = s.as_bytes();
             (0..b.len())
@@ -1449,8 +1955,8 @@ impl EngineBuilder {
         let mut pending: Option<String> = None;
         for field in line.split(';') {
             // Only subsignature fields can hold a regex. The name and the TDB
-            // routinely contain `/` — third-party feeds ship names like
-            // `TwinWave.EvilDoc.DOCXRSTRGOOD.CMDSPCE/.200402` — and counting
+            // routinely contain `/` (third-party feeds ship names like
+            // `TwinWave.EvilDoc.DOCXRSTRGOOD.CMDSPCE/.200402`), and counting
             // those slashes made the parity rule swallow the whole line into one
             // field, turning eight loadable signatures into "malformed line".
             if out.len() < 3 && pending.is_none() {
@@ -1500,7 +2006,7 @@ impl EngineBuilder {
         // PE-icon perceptual match (see [`crate::icon`]). We load the sig and
         // store the group-name constraint; at match time the structural part
         // must hold AND the PE's icon must match an `.idb` entry in the
-        // requested group(s) — otherwise the sig does not fire.
+        // requested group(s); otherwise the sig does not fire.
         let icon_group = {
             let (g1, g2) = parse_tdb_icongroups(parts[1]);
             if g1.is_some() || g2.is_some() {
@@ -1528,7 +2034,7 @@ impl EngineBuilder {
             });
         }
         // Range attributes. `Malformed` means the attribute is there but
-        // unreadable — refuse rather than run with the bound dropped.
+        // unreadable: refuse rather than run with the bound dropped.
         use parse::TdbRange;
         let range = |r| match r {
             TdbRange::Absent => Ok(None),
@@ -1642,8 +2148,23 @@ impl EngineBuilder {
             handler_type,
             icon_group,
             unofficial,
+            bytecode: None,
         });
         Ok(())
+    }
+
+    /// Add bytecode program `program`'s trigger, the logical signature
+    /// `line`. It is matched in the same sweep as every other signature, and
+    /// never alerts: a scan hands its matches to the bytecode runtime.
+    /// Returns whether it loaded; one that does not is not counted as a
+    /// skipped signature, its program simply never runs.
+    pub(crate) fn add_bytecode_trigger(&mut self, line: &str, program: u32) -> bool {
+        let before = self.ldbs.len();
+        if self.add_ldb_line(line, false).is_err() || self.ldbs.len() == before {
+            return false;
+        }
+        self.ldbs[before].bytecode = Some(program);
+        true
     }
 
     pub fn unsupported(&self) -> usize {
@@ -1653,7 +2174,7 @@ impl EngineBuilder {
     /// Why each skipped signature was skipped, most frequent first.
     ///
     /// `unsupported()` alone says *how many* signatures a database contributed
-    /// that exav did not load — which satisfies "counted, never silently
+    /// that exav did not load, which satisfies "counted, never silently
     /// ignored", but is not actionable. This breaks the same total down by
     /// cause so a coverage gap can be attributed to a concrete missing feature
     /// rather than guessed at.
@@ -1665,6 +2186,13 @@ impl EngineBuilder {
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         v
+    }
+
+    /// Record `n` signatures another loader could not load, under `reason`.
+    pub(crate) fn skip_unloadable(&mut self, reason: &'static str, n: usize) {
+        for _ in 0..n {
+            self.skip(reason);
+        }
     }
 
     /// Record one skipped signature under `reason`.
@@ -1679,67 +2207,165 @@ impl EngineBuilder {
             .iter()
             .filter(|b| matches!(b.owner, Owner::Ndb { .. }))
             .count()
-            + self.ldbs.len()
+            + self.ldbs.iter().filter(|l| l.bytecode.is_none()).count()
     }
 
-    pub fn build(self) -> SigEngine {
-        self.build_with_budget(None)
+    /// Every candidate anchor literal in the database, handed to `f` once per
+    /// body that contains it. Bodies whose `elems` were dropped (a pure literal
+    /// whose anchor IS the whole pattern) still contribute: their literal is in
+    /// `anchor_buf`, and they are a large share of the set, so leaving them out
+    /// would understate how common the commonest literals are.
+    fn for_each_candidate_literal(
+        bodies: &[Body],
+        anchor_buf: &[u8],
+        anchor_ranges: &[(u32, u32)],
+        f: &mut dyn FnMut(&[u8]),
+    ) {
+        for (id, body) in bodies.iter().enumerate() {
+            match &body.elems {
+                Some(elems) => {
+                    for e in elems {
+                        if let Elem::Bytes(b) = e {
+                            if b.len() >= MIN_ANCHOR {
+                                f(b);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let (s, l) = anchor_ranges[id];
+                    f(&anchor_buf[s as usize..(s + l) as usize]);
+                }
+            }
+        }
     }
 
-    /// As [`EngineBuilder::build`], but bounds the per-shard automaton-build
-    /// transient to roughly `max_build_mem` bytes by sharding each large
-    /// `(target, case)` partition into multiple automatons. `None` builds one
-    /// automaton per partition (fastest, largest transient). Only the build-time
-    /// peak is affected — scan results are identical.
+    /// Re-choose every anchor now that the whole database is known.
     ///
-    /// Anchors are partitioned by `(target, case)`: a scan then runs only the
-    /// partitions whose `target` matches the file type (a PE file never
-    /// traverses the ELF/HTML/text automatons), so the per-body target check is
-    /// implied by which partition a body lives in. Within a partition, identical
-    /// anchors de-duplicate into one automaton pattern that fans out to every
-    /// body sharing it.
-    pub fn build_with_budget(mut self, max_build_mem: Option<u64>) -> SigEngine {
-        // The double-array construction transient scales ~linearly with the
-        // anchor count, at a rough `BUILD_BYTES_PER_ANCHOR`; capping anchors per
-        // shard bounds that peak so a huge set (main+daily) builds on a small
-        // host. Omit the budget for the fastest build (one automaton per class).
-        const BUILD_BYTES_PER_ANCHOR: u64 = 3072;
-        let max_anchors = match max_build_mem {
-            Some(m) => (m / BUILD_BYTES_PER_ANCHOR).max(1) as usize,
-            None => usize::MAX,
-        };
+    /// A body's anchor is picked while it is parsed, when the only thing
+    /// available is the pattern itself, so the choice can only be structural
+    /// (longest, most varied run). How *selective* a literal is depends on the
+    /// rest of the set, which does not exist yet. This pass revisits the choice
+    /// with that knowledge: see [`GramStats`].
+    ///
+    /// Cannot change what the engine matches. The anchor is a prefilter and
+    /// verification re-checks the entire pattern whatever triggered it, so a
+    /// different anchor changes only how often the check runs. Returns the
+    /// statistics, which choose the windows the anchors are indexed by too.
+    fn repick_anchors(&mut self) -> GramStats {
+        let old_buf = std::mem::take(&mut self.anchor_buf);
+        let old_ranges = std::mem::take(&mut self.anchor_ranges);
+        let bodies = &mut self.bodies;
+        let stats = GramStats::build(bodies.len(), |f| {
+            Self::for_each_candidate_literal(bodies, &old_buf, &old_ranges, f)
+        });
+        let mut buf = Vec::with_capacity(old_buf.len());
+        let mut ranges = Vec::with_capacity(old_ranges.len());
+        for (id, body) in bodies.iter_mut().enumerate() {
+            let (s, l) = old_ranges[id];
+            let old_anchor = &old_buf[s as usize..(s + l) as usize];
+            // A pure literal has one candidate and it is already the anchor.
+            let anchor: &[u8] = match &body.elems {
+                None => old_anchor,
+                Some(elems) => {
+                    match parse::pick_anchor(
+                        elems,
+                        matches!(body.offset, Offset::Any),
+                        Some(&stats),
+                    ) {
+                        // `pick_anchor` succeeded once with no statistics, so a
+                        // `None` here would mean the scores changed which
+                        // candidates are admissible at all. They cannot (the
+                        // `MIN_ANCHOR` gate is on length), but keep the working
+                        // anchor rather than drop a signature if it ever did.
+                        Some(p) => match &elems[p.anchor_idx() as usize] {
+                            Elem::Bytes(b) => {
+                                body.prefix = p;
+                                b
+                            }
+                            _ => old_anchor,
+                        },
+                        None => old_anchor,
+                    }
+                }
+            };
+            ranges.push((buf.len() as u32, anchor.len() as u32));
+            buf.extend_from_slice(anchor);
+        }
+        self.anchor_buf = buf;
+        self.anchor_ranges = ranges;
+        stats
+    }
+
+    /// Build the engine.
+    ///
+    /// Anchors are partitioned by `(target, case)`: a scan then looks only for
+    /// those of the partitions whose `target` matches the file type, so the
+    /// per-body target check is implied by which partition a body lives in.
+    /// Within a partition, identical anchors de-duplicate into one value that
+    /// fans out to every body sharing it, and every partition's values are
+    /// indexed together ([`Grams`]). A body its offset pins to a few places is
+    /// in no partition ([`Pins`]).
+    pub fn build(mut self) -> SigEngine {
+        let (partitions, anchors, pins, stats) = self.partition();
+        let index: Vec<IndexAnchor> = anchors
+            .iter()
+            .map(|(part, nocase, value, bytes)| IndexAnchor {
+                part: *part,
+                nocase: *nocase,
+                value: *value,
+                bytes,
+            })
+            .collect();
+        let grams = Grams::build(&index, &stats);
+        drop(stats);
+        drop(index);
+        drop(anchors);
+        let (body_ldb, fires_empty) = ldb_indexes(self.bodies.len(), &self.ldbs);
+        let fuzzy_ldbs = fuzzy_ldb_indices(&self.ldbs);
+        let has_fuzzy = !fuzzy_ldbs.is_empty();
+        let has_ooxml_container = any_ooxml_container(&self.ldbs);
+        SigEngine {
+            partitions,
+            grams,
+            pins,
+            bodies: self.bodies,
+            ldbs: self.ldbs,
+            unsupported: self.unsupported,
+            body_ldb,
+            fires_empty,
+            has_fuzzy,
+            fuzzy_ldbs,
+            has_ooxml_container,
+        }
+    }
+
+    /// Choose the anchors, pin the bodies that can be, and partition the rest:
+    /// the partitions, every value's anchor as `(partition, nocase, value,
+    /// bytes)`, lowercased when case-insensitive, the pins, and the statistics
+    /// the anchors were chosen by.
+    #[allow(clippy::type_complexity)]
+    fn partition(&mut self) -> (Vec<Partition>, Vec<(u32, bool, u32, Vec<u8>)>, Pins, GramStats) {
+        let stats = self.repick_anchors();
         let anchor_buf = std::mem::take(&mut self.anchor_buf);
         let anchor_ranges = std::mem::take(&mut self.anchor_ranges);
+        let anchor_of = |id: usize| {
+            let (s, l) = anchor_ranges[id];
+            &anchor_buf[s as usize..(s + l) as usize]
+        };
+        let (pins, pinned) = Pins::take(&mut self.bodies, |id| anchor_of(id).to_vec());
         // Case-sensitive anchors (the bulk) stay borrowed slices into
-        // `anchor_buf`; case-insensitive anchors match a lowercased haystack so
-        // they are stored lowercased (owned).
+        // `anchor_buf`; case-insensitive anchors are stored lowercased (owned).
         let mut cs: std::collections::BTreeMap<u8, AnchorGroups<&[u8]>> =
             std::collections::BTreeMap::new();
         let mut ci: std::collections::BTreeMap<u8, AnchorGroups<Vec<u8>>> =
             std::collections::BTreeMap::new();
         for (id, b) in self.bodies.iter().enumerate() {
-            let (s, l) = anchor_ranges[id];
-            let anchor = &anchor_buf[s as usize..(s + l) as usize];
-            // Targets 4 (mail) and 7 (text) gate identically in `target_ok`, so
-            // keeping them in separate automata buys nothing and costs a whole
-            // extra pass over the haystack on exactly the file types where both
-            // are active. Fold them together; `target_ok(4, ft)` covers both.
-            //
-            // Before chasing walk-count reductions further, know that they do not
-            // pay. Partitions hold DISJOINT pattern sets, so four walks are not
-            // four times the work of one — they match four different pattern sets
-            // over the same bytes. Removing a walk only relocates its patterns.
-            //
-            // Measured, and it went the other way: folding target 0 (the "any
-            // file type" set) into every type-specific partition removes a walk
-            // from every scan, yet was slower on engine time and cost both
-            // database size and resident memory. Fewer, larger automata trade
-            // state transitions for cache misses, and the cache side won.
-            //
-            // This 4/7 fold is kept only because it is free: the two targets gate
-            // identically in `target_ok`, so they merge without duplicating a
-            // single pattern.
-            let b_target = if b.target == 7 { 4 } else { b.target };
+            if pinned[id] {
+                continue;
+            }
+            let anchor = anchor_of(id);
+            let b_target = b.target;
             if b.nocase {
                 ci.entry(b_target)
                     .or_insert_with(AnchorGroups::new)
@@ -1751,50 +2377,28 @@ impl EngineBuilder {
             }
         }
         let mut partitions = Vec::new();
-        for (target, g) in cs {
-            for (ac, groups) in g.finish_sharded(max_anchors) {
-                partitions.push(Partition {
-                    target,
-                    nocase: false,
-                    ac,
-                    groups,
-                });
-            }
+        let mut anchors = Vec::new();
+        let classes = cs
+            .into_iter()
+            .map(|(t, g)| (t, false, g.finish()))
+            .chain(ci.into_iter().map(|(t, g)| (t, true, g.finish())));
+        for (target, nocase, (groups, values)) in classes {
+            let part = partitions.len() as u32;
+            anchors.extend(values.into_iter().map(|(v, a)| (part, nocase, v, a)));
+            partitions.push(Partition { target, nocase, groups });
         }
-        for (target, g) in ci {
-            for (ac, groups) in g.finish_sharded(max_anchors) {
-                partitions.push(Partition {
-                    target,
-                    nocase: true,
-                    ac,
-                    groups,
-                });
-            }
-        }
-        drop(anchor_buf);
-        drop(anchor_ranges);
-        let (body_ldb, fires_empty) = ldb_indexes(self.bodies.len(), &self.ldbs);
-        let fuzzy_ldbs = fuzzy_ldb_indices(&self.ldbs);
-        let has_fuzzy = !fuzzy_ldbs.is_empty();
-        let has_ooxml_container = any_ooxml_container(&self.ldbs);
-        SigEngine {
-            partitions,
-            bodies: self.bodies,
-            ldbs: self.ldbs,
-            unsupported: self.unsupported,
-            body_ldb,
-            fires_empty,
-            has_fuzzy,
-            fuzzy_ldbs,
-            has_ooxml_container,
-        }
+        (partitions, anchors, pins, stats)
     }
 }
 
-/// Accumulates distinct anchors and the bodies that share each, then builds a
-/// double-array Aho-Corasick whose stored value is the group index. The key
-/// type `K` is a borrowed slice for the (large) case-sensitive set and an owned
-/// `Vec<u8>` for the lowercased case-insensitive set.
+/// What [`AnchorGroups`] builds for one partition: the bodies behind every
+/// value, and each value's anchor, for the [`Grams`] index.
+type Built = (Groups, Vec<(u32, Vec<u8>)>);
+
+/// Accumulates distinct anchors and the bodies that share each: each distinct
+/// anchor is a value, whose group is those bodies. The key type `K` is a
+/// borrowed slice for the (large) case-sensitive set and an owned `Vec<u8>` for
+/// the lowercased case-insensitive set.
 struct AnchorGroups<K> {
     index: std::collections::HashMap<K, u32>,
     patterns: Vec<K>,
@@ -1824,70 +2428,74 @@ impl<K: Eq + std::hash::Hash + Clone + AsRef<[u8]>> AnchorGroups<K> {
         self.groups[g].push(body);
     }
 
-    /// Build one or more automatons over the accumulated anchors. When
-    /// `max_anchors == usize::MAX` (no budget) a single automaton is built over
-    /// the whole set; otherwise the anchors (and their parallel `groups`) are
-    /// split into shards of at most `max_anchors` patterns each, so no single
-    /// double-array construction exceeds the memory budget. Each returned
-    /// automaton stores values `0..chunk_len`, indexing that shard's `groups`.
-    fn finish_sharded(mut self, max_anchors: usize) -> Vec<(DoubleArrayAhoCorasick<u32>, Vec<Vec<usize>>)> {
-        // The de-dup map isn't needed for the build; free it first so it
-        // doesn't coexist with the automaton's construction peak.
-        self.index = std::collections::HashMap::new();
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
-        let build = |pats: &[K], groups: Vec<Vec<usize>>| -> Option<(DoubleArrayAhoCorasick<u32>, Vec<Vec<usize>>)> {
-            DoubleArrayAhoCorasickBuilder::new()
-                .match_kind(daachorse::MatchKind::Standard)
-                .build_with_values(pats.iter().zip(0u32..))
-                .ok()
-                .map(|ac| (ac, groups))
-        };
-        if max_anchors == usize::MAX || self.patterns.len() <= max_anchors {
-            return build(&self.patterns, self.groups).into_iter().collect();
-        }
-        let mut out = Vec::new();
-        let mut p_iter = self.patterns.into_iter();
-        let mut g_iter = self.groups.into_iter();
-        loop {
-            let chunk_pat: Vec<K> = p_iter.by_ref().take(max_anchors).collect();
-            if chunk_pat.is_empty() {
-                break;
-            }
-            let chunk_grp: Vec<Vec<usize>> = g_iter.by_ref().take(max_anchors).collect();
-            if let Some(part) = build(&chunk_pat, chunk_grp) {
-                out.push(part);
-            }
-        }
-        out
+    /// The groups, and each value's anchor.
+    fn finish(self) -> Built {
+        let anchors = self
+            .patterns
+            .iter()
+            .zip(0u32..)
+            .map(|(p, v)| (v, p.as_ref().to_vec()))
+            .collect();
+        (Groups::from_lists(self.groups), anchors)
     }
 }
 
-/// A compiled signature set: a double-array Aho-Corasick over distinct anchors
-/// (case-sensitive and case-insensitive) + per-body verifiers + logical-sig
-/// expressions. Each automaton's stored value indexes a group of body ids that
-/// share that anchor.
-/// One Aho-Corasick automaton over the anchors of the bodies sharing a single
-/// `(target, case)` class. `groups[value]` is the list of body ids that share
-/// the anchor the automaton stored under `value`. A case-insensitive partition
-/// (`nocase`) matches against the lowercased haystack. A class larger than the
-/// build budget is split across several `Partition`s (shards) with the same
-/// `(target, nocase)`.
+/// The anchors of the bodies sharing one `(target, case)` class, each a value
+/// in the engine's [`Grams`]. `groups.get(value)` are the body ids that share
+/// the anchor of `value`. A case-insensitive partition (`nocase`) matches the
+/// object lowercased.
 struct Partition {
     target: u8,
     nocase: bool,
-    ac: DoubleArrayAhoCorasick<u32>,
-    groups: Vec<Vec<usize>>,
+    groups: Groups,
 }
 
+/// The body ids behind each value of an anchor, flat rather than one list
+/// per value: one allocation, stored and loaded as a copy.
+struct Groups {
+    /// Value `v`'s bodies are `bodies[start[v]..start[v + 1]]`.
+    start: Vec<u32>,
+    bodies: Vec<u32>,
+}
+
+impl Groups {
+    fn from_lists(lists: Vec<Vec<usize>>) -> Self {
+        let mut start = Vec::with_capacity(lists.len() + 1);
+        let mut bodies = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+        start.push(0);
+        for list in lists {
+            bodies.extend(list.into_iter().map(|b| b as u32));
+            start.push(bodies.len() as u32);
+        }
+        Groups { start, bodies }
+    }
+
+    /// The bodies behind value `v`.
+    fn get(&self, v: u32) -> &[u32] {
+        let v = v as usize;
+        &self.bodies[self.start[v] as usize..self.start[v + 1] as usize]
+    }
+
+    /// Whether `start` delimits `bodies`, and every body is below `n`.
+    fn valid(&self, n: usize) -> bool {
+        self.start.first() == Some(&0)
+            && self.start.last().is_some_and(|&e| e as usize == self.bodies.len())
+            && self.start.windows(2).all(|w| w[0] <= w[1])
+            && self.bodies.iter().all(|&b| (b as usize) < n)
+    }
+}
+
+/// A compiled signature set: the anchors of every body, per `(target, case)`
+/// partition, per-body verifiers, and logical-signature expressions.
 pub struct SigEngine {
-    /// One (or, when sharded, several) Aho-Corasick automaton per `(target,
-    /// case)` class. A scan runs only the partitions whose `target` matches the
-    /// file type (`target_ok`) — a PE file never traverses the ELF/HTML/text
-    /// automatons — so the per-body target check is implied by which partition a
-    /// body lives in.
+    /// One per `(target, case)` class. A scan looks only for the anchors of
+    /// the partitions whose `target` matches the file type (`target_ok`), so
+    /// the per-body target check is implied by which partition a body lives in.
     partitions: Vec<Partition>,
+    /// The long anchors of every partition.
+    grams: Grams,
+    /// The bodies checked where their offset puts them, in no partition.
+    pins: Pins,
     bodies: Vec<Body>,
     ldbs: Vec<Ldb>,
     pub unsupported: usize,
@@ -1910,7 +2518,7 @@ pub struct SigEngine {
     fuzzy_ldbs: Vec<u32>,
     /// Whether any loaded logical sig carries a `Container:CL_TYPE_OOXML_*`
     /// constraint. When false, container scans can skip the OOXML sub-type probe
-    /// (a leading-prefix read) entirely — nothing depends on the distinction.
+    /// (a leading-prefix read) entirely: nothing depends on the distinction.
     /// Derived from `ldbs` (recomputed after a database load).
     has_ooxml_container: bool,
 }
@@ -1969,96 +2577,131 @@ impl SigEngine {
         self.bodies.is_empty()
     }
 
-    /// The partitions to run for file type `ft`: those whose `target` matches
-    /// (`target_ok`), each yielded as `(automaton, groups, haystack)` where the
-    /// haystack is the lowercased copy for a `nocase` partition and `buf`
-    /// otherwise. `lower` must be the lowercased `buf` when [`needs_lower`]
-    /// returns true (else it is never read).
-    fn active<'a>(
-        &'a self,
-        ft: FileType,
-        buf: &'a [u8],
-        lower: &'a [u8],
-    ) -> impl Iterator<Item = (&'a DoubleArrayAhoCorasick<u32>, &'a [Vec<usize>], &'a [u8])> {
-        // A `Target:5` (graphics) partition is normally skipped — exav doesn't
-        // model graphics as a `FileType`. But when the buffer IS an image, its
-        // Target:5 signatures legitimately apply, so run those partitions too
-        // (their subsignature anchors must match for an image-scoped LDB — e.g. a
-        // `Win.Phishing.*` raw-image sig — to become a candidate).
-        let is_image = crate::fuzzy_img::looks_like_image(buf);
+    /// Per partition, whether a scan of file type `ft` looks for its anchors:
+    /// those whose `target` matches (`target_ok`). A `Target:5` (graphics)
+    /// partition is normally skipped, since exav doesn't model graphics as a
+    /// `FileType`; but when the object IS an image its signatures apply (an
+    /// image-scoped logical signature, e.g. a `Win.Phishing.*` raw-image sig,
+    /// needs its subsignature anchors to match to become a candidate).
+    fn active(&self, ft: FileType, is_image: bool) -> Vec<bool> {
         self.partitions
             .iter()
-            .filter(move |p| target_ok(p.target, ft) || (p.target == 5 && is_image))
-            .map(move |p| {
-                let hay: &[u8] = if p.nocase { lower } else { buf };
-                (&p.ac, p.groups.as_slice(), hay)
-            })
+            .map(|p| target_ok(p.target, ft) || (p.target == 5 && is_image))
+            .collect()
     }
 
-    /// Whether any active partition for `ft` is case-insensitive — i.e. whether
-    /// a lowercased copy of the haystack must be allocated for this scan.
-    fn needs_lower(&self, ft: FileType, buf: &[u8]) -> bool {
-        let is_image = crate::fuzzy_img::looks_like_image(buf);
-        self.partitions
-            .iter()
-            .any(|p| p.nocase && (target_ok(p.target, ft) || (p.target == 5 && is_image)))
+    /// The bodies behind value `value` of partition `pidx`; past the last
+    /// partition, where the pinned bodies' candidates are, body `value`.
+    fn group<'a>(&'a self, pidx: usize, value: &'a u32) -> &'a [u32] {
+        match self.partitions.get(pidx) {
+            Some(p) => p.groups.get(*value),
+            None => std::slice::from_ref(value),
+        }
     }
 
-    /// Serialize to the on-disk database: each double-array automaton via
-    /// daachorse's own format, the rest via bincode (by reference, no clone).
+    /// Whether any active partition for `ft` is case-insensitive, that is,
+    /// whether verification may read the object lowercased.
+    fn needs_lower(&self, ft: FileType, is_image: bool) -> bool {
+        self.pins.any_nocase()
+            || self
+                .partitions
+                .iter()
+                .zip(self.active(ft, is_image))
+                .any(|(p, on)| on && p.nocase)
+    }
+
+    /// Every anchor hit a scan of `buf` as file type `ft` finds, handed to `f`
+    /// as [`sweep`] does, the partition as the id.
+    fn each_hit(&self, buf: &[u8], ft: FileType, f: &mut impl FnMut(usize, u32, usize, usize, usize) -> bool) {
+        let active = self.active(ft, looks_like_image(buf, WholeLimits::NONE.all_image_formats));
+        sweep(&self.grams, &active, &buf, f);
+    }
+
+    /// Serialize to the on-disk database: the index and the tables as binary
+    /// blobs, the bodies and logical signatures as MessagePack.
     pub(crate) fn write_cache<W: std::io::Write>(&self, mut w: W) -> std::io::Result<()> {
-        use crate::database::enc;
-        // Each partition: (target, nocase, serialized automaton bytes, groups).
+        use crate::database::{enc, enc_bytes, enc_u32s, to_vec_indexed};
+        // The bodies and logical signatures first, each encoded whole into a
+        // blob: a load decodes them on threads of their own while it reads the
+        // index behind them.
+        enc_bytes(&to_vec_indexed(&self.bodies)?, &mut w)?;
+        enc_bytes(&to_vec_indexed(&self.ldbs)?, &mut w)?;
+        // Each partition: target, nocase, then its groups as binary blobs.
         enc(&(self.partitions.len() as u32), &mut w)?;
         for p in &self.partitions {
             enc(&p.target, &mut w)?;
             enc(&p.nocase, &mut w)?;
-            enc(&p.ac.serialize(), &mut w)?;
-            enc(&p.groups, &mut w)?;
+            enc_u32s(&p.groups.start, &mut w)?;
+            enc_u32s(&p.groups.bodies, &mut w)?;
         }
-        enc(&self.bodies, &mut w)?;
-        enc(&self.ldbs, &mut w)?;
+        self.grams.write(&mut w)?;
+        enc_bytes(&to_vec_indexed(&self.pins)?, &mut w)?;
         enc(&self.unsupported, &mut w)?;
+        // What the build derived from those, stored so a load does not redo it.
+        enc_u32s(&self.body_ldb, &mut w)?;
+        enc_u32s(&self.fires_empty, &mut w)?;
+        enc_u32s(&self.fuzzy_ldbs, &mut w)?;
+        enc(&self.has_ooxml_container, &mut w)?;
         Ok(())
     }
 
-    /// Reverse of [`write_cache`]. The daachorse bytes come from a database file
-    /// this build wrote and validated (magic + version).
-    pub(crate) fn read_cache<R: std::io::Read>(mut r: R) -> std::io::Result<Self> {
-        use crate::database::dec;
-        let deser = |b: Vec<u8>| -> std::io::Result<DoubleArrayAhoCorasick<u32>> {
-            DoubleArrayAhoCorasick::deserialize(&b)
-                .map(|(dfa, _)| dfa)
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("corrupt signature database (aho-corasick deserialize): {e:?}"),
-                    )
-                })
+    /// Reverse of [`write_cache`]. The bytes come from a database file this
+    /// build wrote and validated (magic + version); the index checks its own
+    /// tables as it reads them.
+    pub(crate) fn read_cache<R: crate::database::PayloadRead>(mut r: R) -> std::io::Result<Self> {
+        use crate::database::{alongside, dec, dec_bytes, dec_u32s};
+        let corrupt = |what: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("corrupt signature database ({what})"),
+            )
         };
-        let n_parts: u32 = dec(&mut r)?;
-        let mut partitions = Vec::with_capacity(n_parts as usize);
-        for _ in 0..n_parts {
-            let target: u8 = dec(&mut r)?;
-            let nocase: bool = dec(&mut r)?;
-            let ac_bytes: Vec<u8> = dec(&mut r)?;
-            let groups: Vec<Vec<usize>> = dec(&mut r)?;
-            partitions.push(Partition {
-                target,
-                nocase,
-                ac: deser(ac_bytes)?,
-                groups,
-            });
-        }
-        let bodies: Vec<Body> = dec(&mut r)?;
-        let ldbs: Vec<Ldb> = dec(&mut r)?;
+        let (bodies, ldbs) = (dec_bytes(&mut r)?, dec_bytes(&mut r)?);
+        let decode_bodies = || rmp_serde::from_slice::<Vec<Body>>(&bodies).map_err(std::io::Error::other);
+        let decode_ldbs = || rmp_serde::from_slice::<Vec<Ldb>>(&ldbs).map_err(std::io::Error::other);
+        let read_parts = || -> std::io::Result<(Vec<Partition>, Grams)> {
+            let n_parts: u32 = dec(&mut r)?;
+            // Not sized from `n_parts`: the checksum is checked after this
+            // is read, and a damaged count would ask for gigabytes.
+            let mut parts = Vec::new();
+            for _ in 0..n_parts {
+                let target: u8 = dec(&mut r)?;
+                let nocase: bool = dec(&mut r)?;
+                let groups = Groups {
+                    start: dec_u32s(&mut r)?,
+                    bodies: dec_u32s(&mut r)?,
+                };
+                parts.push(Partition { target, nocase, groups });
+            }
+            let values: Vec<usize> = parts.iter().map(|p| p.groups.start.len().saturating_sub(1)).collect();
+            let grams = Grams::read(&mut r, &values)?;
+            Ok((parts, grams))
+        };
+        // Three threads where there are: the bodies and the logical signatures
+        // decode while this one reads the anchors.
+        let ((bodies, ldbs), parts) = alongside(|| alongside(decode_bodies, decode_ldbs), read_parts);
+        let (bodies, ldbs, (parts, grams)) = (bodies?, ldbs?, parts?);
+        let pins: Pins = rmp_serde::from_slice(&dec_bytes(&mut r)?).map_err(std::io::Error::other)?;
+        let pins = pins.load(&bodies).ok_or_else(|| corrupt("pinned bodies"))?;
         let unsupported = dec(&mut r)?;
-        let (body_ldb, fires_empty) = ldb_indexes(bodies.len(), &ldbs);
-        let fuzzy_ldbs = fuzzy_ldb_indices(&ldbs);
+        let body_ldb = dec_u32s(&mut r)?;
+        let fires_empty = dec_u32s(&mut r)?;
+        let fuzzy_ldbs = dec_u32s(&mut r)?;
+        let has_ooxml_container = dec(&mut r)?;
+        let n_ldbs = ldbs.len();
+        if parts.iter().any(|p| !p.groups.valid(bodies.len()))
+            || body_ldb.len() != bodies.len()
+            || body_ldb.iter().any(|&l| l != u32::MAX && l as usize >= n_ldbs)
+            || fires_empty.iter().chain(&fuzzy_ldbs).any(|&l| l as usize >= n_ldbs)
+        {
+            return Err(corrupt("indexes"));
+        }
+        let partitions = parts;
         let has_fuzzy = !fuzzy_ldbs.is_empty();
-        let has_ooxml_container = any_ooxml_container(&ldbs);
         Ok(SigEngine {
             partitions,
+            grams,
+            pins,
             bodies,
             ldbs,
             unsupported,
@@ -2076,7 +2719,7 @@ impl SigEngine {
             .iter()
             .filter(|b| matches!(b.owner, Owner::Ndb { .. }))
             .count()
-            + self.ldbs.len()
+            + self.ldbs.iter().filter(|l| l.bytecode.is_none()).count()
     }
 
     /// Whether any loaded logical sig is scoped to an OOXML container sub-type
@@ -2097,6 +2740,30 @@ impl SigEngine {
     /// `.UNOFFICIAL` in compat mode).
     pub fn scan(&self, buf: &[u8], ft: FileType) -> Option<(String, u64, bool)> {
         self.scan_with_layout(buf, ft, None, None)
+    }
+
+    /// Describe a body's compiled pattern with its literal bytes spelled out
+    /// (diagnostic). [`describe_body`] reports literal *lengths*, which cannot
+    /// answer "is a rarer literal available to anchor on instead?"; this can.
+    pub fn describe_body_literals(&self, bid: usize) -> String {
+        let b = &self.bodies[bid];
+        let Some(elems) = &b.elems else {
+            return "<literal-only: the anchor IS the whole body>".to_string();
+        };
+        elems
+            .iter()
+            .map(|x| match x {
+                Elem::Bytes(v) => format!("{:?}", String::from_utf8_lossy(v)),
+                Elem::AnyByte => "?".to_string(),
+                Elem::HiNibble(_) | Elem::LoNibble(_) => "n".to_string(),
+                Elem::Gap { min, max } => format!("G{{{min},{max:?}}}"),
+                Elem::Alt { opts, neg } => {
+                    format!("A{}{}", if *neg { "!" } else { "" }, opts.len())
+                }
+                Elem::AltMasked { opts } => format!("Am{}", opts.len()),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Describe a body's compiled pattern (diagnostic).
@@ -2131,9 +2798,9 @@ impl SigEngine {
         DIAG_SLOW.with(|c| c.get())
     }
 
-    /// Diagnostic census of the loaded bodies' prefix kinds, and — for the
+    /// Diagnostic census of the loaded bodies' prefix kinds, and (for the
     /// `Prefix::Internal` bodies, the only ones that still reach the
-    /// backtracking `match_backward` — the shape of the pre-anchor context that
+    /// backtracking `match_backward`) the shape of the pre-anchor context that
     /// walk has to cross. Used to size the remaining backtracking surface.
     ///
     /// Returns `(literal_only, fixed, floating, internal, internal_with_var_gap,
@@ -2199,7 +2866,7 @@ impl SigEngine {
     /// split. `(cs_hits, ci_hits, fanout, target_reject, literal, token, ok)`.
     pub fn scan_diag(&self, buf: &[u8], ft: FileType, layout: Option<&PeLayout>) -> [u64; 7] {
         DIAG_SLOW.with(|c| c.set((0, 0)));
-        let lower = if self.needs_lower(ft, buf) {
+        let lower = if self.needs_lower(ft, looks_like_image(buf, WholeLimits::NONE.all_image_formats)) {
             buf.to_ascii_lowercase()
         } else {
             Vec::new()
@@ -2210,35 +2877,37 @@ impl SigEngine {
         // tuple shape).
         let treject = 0u64;
         let (mut lit, mut tok, mut ok) = (0u64, 0u64, 0u64);
-        let mut budgets = Budgets::new();
-        for p in self.partitions.iter().filter(|p| target_ok(p.target, ft)) {
-            let hay: &[u8] = if p.nocase { &lower } else { buf };
-            for m in p.ac.find_overlapping_iter(hay) {
+        let mut budget = SIM_BUDGET;
+        let mut occ = OccCache::new();
+        self.each_hit(buf, ft, &mut |pidx, value, start, _, count| {
+            let p = &self.partitions[pidx];
+            for s in start..start + count {
                 if p.nocase {
                     ci_hits += 1;
                 } else {
                     cs_hits += 1;
                 }
-                let group = &p.groups[m.value() as usize];
+                let group = p.groups.get(value);
                 fanout += group.len() as u64;
                 for &bid in group {
-                    let body = &self.bodies[bid];
+                    let body = &self.bodies[bid as usize];
                     if body.elems.is_none() {
                         lit += 1;
                     } else {
                         tok += 1;
                     }
                     let t = std::time::Instant::now();
-                    if verify(body, buf, m.start(), layout, &lower, &mut budgets).is_some() {
+                    if verify(body, buf, s, layout, &lower[..], &mut budget, &mut occ).is_some() {
                         ok += 1;
                     }
                     let us = t.elapsed().as_micros() as u64;
                     if us > DIAG_SLOW.with(|c| c.get().0) {
-                        DIAG_SLOW.with(|c| c.set((us, bid)));
+                        DIAG_SLOW.with(|c| c.set((us, bid as usize)));
                     }
                 }
             }
-        }
+            true
+        });
         [cs_hits, ci_hits, fanout, treject, lit, tok, ok]
     }
 
@@ -2246,18 +2915,14 @@ impl SigEngine {
     /// indexed by anchor byte length (0..=15, last bucket = >=15), a tuple of
     /// (anchor_hits, total_fanout). Lets us see which anchor lengths drive the
     /// verify explosion on dense content.
-    pub fn scan_diag_hist(&self, buf: &[u8], _ft: FileType) -> Vec<(u64, u64)> {
+    pub fn scan_diag_hist(&self, buf: &[u8], ft: FileType) -> Vec<(u64, u64)> {
         let mut hist = vec![(0u64, 0u64); 16];
-        let lower = buf.to_ascii_lowercase();
-        for p in &self.partitions {
-            let hay: &[u8] = if p.nocase { &lower } else { buf };
-            for m in p.ac.find_overlapping_iter(hay) {
-                let len = (m.end() - m.start()).min(15);
-                let g = p.groups[m.value() as usize].len() as u64;
-                hist[len].0 += 1;
-                hist[len].1 += g;
-            }
-        }
+        self.each_hit(buf, ft, &mut |pidx, value, _, len, count| {
+            let g = self.partitions[pidx].groups.get(value).len() as u64;
+            hist[len.min(15)].0 += count as u64;
+            hist[len.min(15)].1 += g * count as u64;
+            true
+        });
         hist
     }
 
@@ -2291,32 +2956,28 @@ impl SigEngine {
     }
 
     /// Diagnostic: for one scan, the groups that contribute the most fan-out,
-    /// each with its discriminability — the best single secondary byte offset and
+    /// each with its discriminability: the best single secondary byte offset and
     /// the fraction of bodies it constrains. Prints nothing; returns rows of
     /// `(anchor_len, group_size, hits, fanout_contrib, best_off, coverage_pct)`.
     pub fn scan_diag_groups(
         &self,
         buf: &[u8],
-        _ft: FileType,
+        ft: FileType,
     ) -> Vec<(usize, usize, u64, u64, i32, u32)> {
-        // Count hits per group value (case-sensitive partitions only — they
-        // dominate). Keyed by `(partition index, value)` since sharded
-        // partitions reuse the same local value space.
+        // Count hits per group value (case-sensitive partitions only: they
+        // dominate), keyed by `(partition index, value)`.
         let mut hits: std::collections::HashMap<(usize, u32), (u64, usize)> =
             std::collections::HashMap::new();
-        for (pidx, p) in self.partitions.iter().enumerate() {
-            if p.nocase {
-                continue;
+        self.each_hit(buf, ft, &mut |pidx, value, _, len, count| {
+            if !self.partitions[pidx].nocase {
+                hits.entry((pidx, value)).or_insert((0, len)).0 += count as u64;
             }
-            for m in p.ac.find_overlapping_iter(buf) {
-                let len = m.end() - m.start();
-                hits.entry((pidx, m.value())).or_insert((0, len)).0 += 1;
-            }
-        }
+            true
+        });
         let mut rows: Vec<(usize, usize, u64, u64, i32, u32)> = Vec::new();
         let mut cons = Vec::new();
         for ((pidx, val), (h, anchor_len)) in hits {
-            let group = &self.partitions[pidx].groups[val as usize];
+            let group = self.partitions[pidx].groups.get(val);
             let gsize = group.len();
             let fanout = h * gsize as u64;
             if fanout < 50_000 {
@@ -2332,7 +2993,7 @@ impl SigEngine {
             let mut constrained: std::collections::HashMap<i32, u32> =
                 std::collections::HashMap::new();
             for &bid in group {
-                self.body_constraints(bid, &mut cons);
+                self.body_constraints(bid as usize, &mut cons);
                 let mut seen_off: std::collections::HashSet<i32> = std::collections::HashSet::new();
                 for &(o, b) in &cons {
                     if o >= 0 && (o as usize) < anchor_len {
@@ -2363,25 +3024,125 @@ impl SigEngine {
         rows
     }
 
+    /// Diagnostic: what an anchor-presence gate on logical signatures could
+    /// prune. Returns `(fanout, prunable_fanout, ldbs_touched, ldbs_prunable)`.
+    ///
+    /// A body subsignature is only worth verifying if its logical signature can
+    /// still fire; when a sibling subsig the expression requires has no anchor
+    /// hit anywhere in the buffer, its count is certainly 0 and the whole lsig
+    /// is dead. `prunable_fanout` is how many of the `(hit, body)` verifies that
+    /// would remove: the ceiling on what such a gate can save, before paying
+    /// for whatever pass computes it.
+    pub fn scan_diag_gate(&self, buf: &[u8], ft: FileType) -> (u64, u64, usize, usize) {
+        // Pass 1: which bodies have an anchor hit anywhere, and the hits.
+        let mut hit = vec![false; self.bodies.len()];
+        let mut hits = Vec::new();
+        self.each_hit(buf, ft, &mut |pidx, value, _, _, count| {
+            for &bid in self.partitions[pidx].groups.get(value) {
+                hit[bid as usize] = true;
+            }
+            hits.push((pidx, value, count));
+            true
+        });
+        // Which logical sigs are still satisfiable given that.
+        let mut alive: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+        for (bid, &h) in hit.iter().enumerate() {
+            if !h {
+                continue;
+            }
+            let li = self.body_ldb[bid];
+            if li == u32::MAX {
+                continue;
+            }
+            alive.entry(li).or_insert_with(|| {
+                let ldb = &self.ldbs[li as usize];
+                let absent = |i: usize| match ldb.subs.get(i) {
+                    // Only body subsigs are decided by anchor presence; a
+                    // PCRE/bcomp/fuzzy subsig has no anchor, so it is never
+                    // "certainly absent" and must stay free.
+                    Some(SubSig::Bodies(ids)) => !ids.iter().any(|&b| hit[b]),
+                    _ => false,
+                };
+                ldb.expr.can_be_true_absent(&absent)
+            });
+        }
+        // Pass 2: count the fan-out a gate would skip.
+        let (mut fanout, mut prunable) = (0u64, 0u64);
+        for (pidx, value, count) in hits {
+            for &bid in self.partitions[pidx].groups.get(value) {
+                fanout += count as u64;
+                let li = self.body_ldb[bid as usize];
+                if li != u32::MAX && !alive.get(&li).copied().unwrap_or(true) {
+                    prunable += count as u64;
+                }
+            }
+        }
+        let dead = alive.values().filter(|&&a| !a).count();
+        (fanout, prunable, alive.len(), dead)
+    }
+
+    /// Diagnostic: total anchor hits, running the anchor search and nothing
+    /// else. Isolates that pass from the verification that follows it, which is
+    /// what says whether a scheme that trades an extra pass for fewer verifies
+    /// can pay for itself.
+    pub fn scan_diag_hits(&self, buf: &[u8], ft: FileType) -> u64 {
+        let mut n = 0u64;
+        self.each_hit(buf, ft, &mut |_, _, _, _, count| {
+            n += count as u64;
+            true
+        });
+        n
+    }
+
+    /// Diagnostic: the anchors that hit most in one scan, as `(anchor bytes,
+    /// hits, group size)`, most fan-out first. `scan_diag_groups` reports an
+    /// anchor's *length*; this reports its *bytes*, which is what shows whether
+    /// a bad prefilter is bad because it is short or because it is ubiquitous in
+    /// real content (`http`, `www.`) despite scoring well on byte variety.
+    pub fn scan_diag_anchors(
+        &self,
+        buf: &[u8],
+        ft: FileType,
+    ) -> Vec<(Vec<u8>, u64, usize, Vec<usize>)> {
+        let mut hits: std::collections::HashMap<(usize, u32), (u64, Vec<u8>)> =
+            std::collections::HashMap::new();
+        self.each_hit(buf, ft, &mut |pidx, value, start, len, count| {
+            let e = hits
+                .entry((pidx, value))
+                .or_insert_with(|| (0, buf[start..start + len].to_vec()));
+            e.0 += count as u64;
+            true
+        });
+        let mut rows: Vec<(Vec<u8>, u64, usize, Vec<usize>)> = hits
+            .into_iter()
+            .map(|((pidx, val), (h, bytes))| {
+                let g = self.partitions[pidx].groups.get(val);
+                (bytes, h, g.len(), g.iter().take(4).map(|&b| b as usize).collect())
+            })
+            .collect();
+        rows.sort_by_key(|(_, h, g, _)| std::cmp::Reverse(h * *g as u64));
+        rows.truncate(25);
+        rows
+    }
+
     /// As [`scan`], with PE layout for resolving `EP`/section-relative offsets.
     /// Logical-sig indices to evaluate for a scan: those owning a matched subsig
     /// body (`touched`) plus the always-check `fires_empty` set. Sorted+deduped,
     /// so iterating the result preserves the first-match-by-index semantics of
-    /// scanning every ldb in order — while skipping the ~all that can't fire.
+    /// scanning every ldb in order, while skipping the ~all that can't fire.
     /// The scanned object's 64-bit image perceptual hash, computed once per scan
     /// and only when a `fuzzy_img#` subsig is loaded and the bytes look like an
     /// image (so non-image scans pay nothing). Used by `SubSig::Fuzzy`.
-    fn maybe_img_hash(&self, buf: &[u8]) -> Option<[u8; 8]> {
-        if self.has_fuzzy && crate::fuzzy_img::looks_like_image(buf) {
-            crate::fuzzy_img::phash(buf)
-        } else {
-            None
+    fn maybe_img_hash(&self, buf: &dyn ByteSource, limits: WholeLimits) -> Option<[u8; 8]> {
+        if !self.has_fuzzy {
+            return None;
         }
+        image_hash(buf, limits)
     }
 
     /// Logical sigs worth evaluating for this scan: those whose subsig bodies
-    /// matched, plus the always-on `fires_empty` set, plus — when the object is
-    /// an image (`include_fuzzy`) — the `fuzzy_img#` sigs (which have no body to
+    /// matched, plus the always-on `fires_empty` set, plus (when the object is
+    /// an image, `include_fuzzy`) the `fuzzy_img#` sigs (which have no body to
     /// touch them).
     fn candidate_ldbs(&self, touched: &[usize], include_fuzzy: bool) -> Vec<u32> {
         let mut cand: Vec<u32> =
@@ -2400,6 +3161,126 @@ impl SigEngine {
         cand.dedup();
         cand
     }
+
+        /// Which logical signatures can still fire, indexed by ldb id, given the
+        /// anchor `hits` of a whole sweep, which stand for `total` hits. `None`
+        /// when gating is not worth setting up.
+        ///
+        /// A body subsignature is only worth verifying while its logical
+        /// signature is still satisfiable. When a subsig the expression requires
+        /// has no anchor hit anywhere in the buffer its count is certainly zero,
+        /// which can kill the whole signature, and with it every verify its
+        /// other subsigs would have drawn. On a spreadsheet relationships part
+        /// that is 86% of the fan-out; on the sheet itself, all of it.
+        ///
+        /// FN-safe: [`Node::can_be_true_absent`] only reports "impossible" when
+        /// no assignment of the free subsigs satisfies the expression, and a
+        /// subsig with no anchor (PCRE/bcomp/fuzzy) is never treated as absent.
+        fn ldb_alive(&self, hits: &[SweepHit], total: u64) -> Option<Vec<bool>> {
+            if self.ldbs.is_empty() || total < GATE_MIN_HITS as u64 {
+                return None;
+            }
+            let mut hit_body = vec![false; self.bodies.len()];
+            for h in hits {
+                for &bid in self.group(h.pidx as usize, &h.value) {
+                    hit_body[bid as usize] = true;
+                }
+            }
+            let mut alive = vec![true; self.ldbs.len()];
+            let mut seen = vec![false; self.ldbs.len()];
+            for (bid, &h) in hit_body.iter().enumerate() {
+                if !h {
+                    continue;
+                }
+                let li = self.body_ldb[bid];
+                if li == u32::MAX || seen[li as usize] {
+                    continue;
+                }
+                seen[li as usize] = true;
+                let ldb = &self.ldbs[li as usize];
+                let absent = |i: usize| match ldb.subs.get(i) {
+                    // Only body subsigs are decided by anchor presence; one
+                    // without an anchor must stay free, never "absent".
+                    Some(SubSig::Bodies(ids)) => !ids.iter().any(|&b| hit_body[b]),
+                    _ => false,
+                };
+                alive[li as usize] = ldb.expr.can_be_true_absent(&absent);
+            }
+            Some(alive)
+        }
+
+        /// Verify every body reachable from this scan's anchor hits, calling
+        /// `on_match` for each one that matches. Stops as soon as `on_match`
+        /// returns `Break`.
+        ///
+        /// The one place the anchor sweep, the repeated-anchor cap, the step
+        /// pools and the logical-signature gate are applied, so the first-match,
+        /// all-match and logical-offset scans cannot drift apart.
+        ///
+        /// Hits are buffered rather than verified as they come, so the
+        /// logical-signature gate ([`Self::ldb_alive`]) can run between the
+        /// sweep and verification: it needs to know which anchors hit anywhere
+        /// in the object, which only the whole sweep settles, and sweeping
+        /// twice costs more than the verification it saves. Past
+        /// [`max_buffered_hits`] entries, the buffered hits are verified
+        /// ungated and the rest as they come: memory stays bounded, and the
+        /// object is still swept once.
+        #[allow(clippy::too_many_arguments)]
+        fn walk_candidates<B, L, F>(
+            &self,
+            buf: &B,
+            ft: FileType,
+            is_image: bool,
+            layout: Option<&PeLayout>,
+            lower: &L,
+            on_match: F,
+        ) where
+            B: ByteSource + ?Sized,
+            L: ByteSource + ?Sized,
+            F: FnMut(usize, u64, u64) -> std::ops::ControlFlow<()>,
+        {
+            let mut v = Verifier {
+                eng: self,
+                buf,
+                layout,
+                lower,
+                budget: SIM_BUDGET,
+                occ: OccCache::new(),
+                group_cost: GroupCost::new(MAX_GROUP_STEPS),
+                on_match,
+            };
+            let cap = max_buffered_hits();
+            // Nothing to gate without logical signatures.
+            let mut buffered = (!self.ldbs.is_empty()).then(Vec::new);
+            let mut total = 0u64;
+            let mut take = |pidx: usize, value: u32, start: usize, count: usize| {
+                if let Some(hits) = buffered.as_mut().filter(|h| h.len() + count.div_ceil(SweepHit::MAX_COUNT) <= cap) {
+                    SweepHit::push(hits, pidx, value, start, count);
+                    total += count as u64;
+                    return true;
+                }
+                if let Some(hits) = buffered.take() {
+                    if v.replay(&hits, None) {
+                        return false;
+                    }
+                }
+                !v.hit(pidx, value, start, count, None)
+            };
+            // The pinned bodies first, each a group of its own in the
+            // partition past the last: a few checks where their offsets put
+            // them.
+            let wanted = |b: &Body| target_ok(b.target, ft) || (b.target == 5 && is_image);
+            let pinned = self.partitions.len();
+            let whole = self.pins.visit(&self.bodies, buf, lower, layout, &wanted, &mut |bid, at| {
+                take(pinned, bid as u32, at, 1)
+            });
+            let active = self.active(ft, is_image);
+            let whole = whole && sweep(&self.grams, &active, buf, &mut |pidx, value, start, _, count| take(pidx, value, start, count));
+            if let (true, Some(hits)) = (whole, buffered) {
+                let alive = self.ldb_alive(&hits, total);
+                v.replay(&hits, alive.as_deref());
+            }
+        }
 
     /// Scan `buf`, returning the first matching signature as
     /// `(clean_name, offset, unofficial)`.
@@ -2423,6 +3304,91 @@ impl SigEngine {
         container: Option<ClType>,
         icon_ctx: Option<&IconCtx>,
     ) -> Option<(String, u64, bool)> {
+        self.scan_first(buf, ft, layout, container, icon_ctx, &|_, _| false)
+    }
+
+    /// As [`Self::scan_with_icons`], passing over every signature for which
+    /// `skip(clean_name, unofficial)` holds and carrying on to the next match.
+    ///
+    /// This is how an ignore list (`.ign`/`.ign2`) takes effect. Filtering the
+    /// result afterwards is not enough: a first-match scan stops at the ignored
+    /// signature, so a real one matching later in the same buffer is never
+    /// looked for.
+    pub(crate) fn scan_first(
+        &self,
+        buf: &[u8],
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        icon_ctx: Option<&IconCtx>,
+        skip: &dyn Fn(&str, bool) -> bool,
+    ) -> Option<(String, u64, bool)> {
+        self.scan_first_in(buf, &buf, ft, layout, container, icon_ctx, skip, WholeLimits::NONE, None)
+    }
+
+    /// As [`Self::scan_first`], over any object, within `limits`. The bytecode triggers
+    /// that fire go to `fired`, when given, up to the detection that ends the
+    /// scan.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_first_source(
+        &self,
+        src: &dyn ByteSource,
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        icon_ctx: Option<&IconCtx>,
+        skip: &dyn Fn(&str, bool) -> bool,
+        limits: WholeLimits,
+        fired: Option<&mut Vec<Fired>>,
+    ) -> Option<(String, u64, bool)> {
+        match src.as_slice() {
+            Some(buf) => self.scan_first_in(buf, &buf, ft, layout, container, icon_ctx, skip, limits, fired),
+            None => self.scan_first_in(src, src, ft, layout, container, icon_ctx, skip, limits, fired),
+        }
+    }
+
+    /// Verify every candidate body.
+    /// `on_match(bid, start, n)` gets `n` matches of body `bid`, at `start`,
+    /// `start + 1`, and so on.
+    fn walk<B, F>(&self, buf: &B, ft: FileType, is_image: bool, layout: Option<&PeLayout>, on_match: F)
+    where
+        B: ByteSource + ?Sized,
+        F: FnMut(usize, u64, u64) -> std::ops::ControlFlow<()>,
+    {
+        // Verifying a case-insensitive body reads the object lowercased, at
+        // the same positions (ASCII lowercasing preserves length). Held in
+        // memory and small, the object is lowercased whole the first time one
+        // is verified, which most scans never do; larger, or read through the
+        // cache, it is a view that lowercases what is read, so no second copy
+        // of a large object is held.
+        if !self.needs_lower(ft, is_image) {
+            let none: &[u8] = &[];
+            return self.walk_candidates(buf, ft, is_image, layout, none, on_match);
+        }
+        match buf.as_slice() {
+            Some(s) if s.len() <= LOWER_COPY_MAX => {
+                self.walk_candidates(buf, ft, is_image, layout, &LazyLower::new(s), on_match)
+            }
+            _ => self.walk_candidates(buf, ft, is_image, layout, &Lower(buf), on_match),
+        }
+    }
+
+    /// The body of [`Self::scan_first`]. `buf` and `src` are the same object:
+    /// `buf` typed for the matchers' inner loops, `src` for the checks that
+    /// take any object.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_first_in<B: ByteSource + ?Sized>(
+        &self,
+        buf: &B,
+        src: &dyn ByteSource,
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        icon_ctx: Option<&IconCtx>,
+        skip: &dyn Fn(&str, bool) -> bool,
+        limits: WholeLimits,
+        mut fired: Option<&mut Vec<Fired>>,
+    ) -> Option<(String, u64, bool)> {
         // Per-LDB-subsig match counts; only allocated when there are logical
         // signatures (otherwise no LdbSub body exists and counts is unused).
         let mut sc = Scratch::acquire(if self.ldbs.is_empty() {
@@ -2430,75 +3396,47 @@ impl SigEngine {
         } else {
             self.bodies.len()
         });
-        let counts = &mut sc.counts;
-        let offs = &mut sc.offs;
-        let touched = &mut sc.touched;
+        let is_image = looks_like_image(buf, limits.all_image_formats);
 
         // An anchor hit fans out to every body sharing that anchor (the group).
         // A verified NDB body is an immediate detection; an LDB subsignature
         // accumulates a per-body count and first-match offset (the latter
-        // anchors byte-compare subsigs). The case-insensitive automaton matches
-        // against a lowercased copy of the haystack; positions line up with the
-        // original (ASCII lowercasing preserves length), so verification still
-        // runs against `buf`.
-        // Only allocate the lowercased copy if a case-insensitive partition runs.
-        let lower = if self.needs_lower(ft, buf) {
-            buf.to_ascii_lowercase()
-        } else {
-            Vec::new()
-        };
-        let mut budgets = Budgets::new();
-        for (ac, groups, hay) in self.active(ft, buf, &lower) {
-            for m in ac.find_overlapping_iter(hay) {
-                let group = &groups[m.value() as usize];
-                for &bid in group {
-                    // The partition already guarantees this body's target matches
-                    // `ft`, so no per-body target check is needed here.
-                    let body = &self.bodies[bid];
-                    if let Some(start) = verify(body, buf, m.start(), layout, &lower, &mut budgets) {
-                        match &body.owner {
-                            Owner::Ndb { name, unofficial } => {
-                                return Some((name.clone(), start, *unofficial))
-                            }
-                            // counts is non-empty whenever LdbSub bodies exist.
-                            Owner::LdbSub => {
-                                if counts[bid] == 0 {
-                                    touched.push(bid);
-                                }
-                                counts[bid] = counts[bid].saturating_add(1);
-                                let s = start.min(u32::MAX as u64 - 1) as u32;
-                                if offs[bid] == u32::MAX || s < offs[bid] {
-                                    offs[bid] = s;
-                                }
-                            }
-                        }
+        // anchors byte-compare subsigs). The partition already guarantees each
+        // body's target matches `ft`, so no per-body target check is needed.
+        let mut ndb_hit: Option<(String, u64, bool)> = None;
+        self.walk(buf, ft, is_image, layout, |bid, start, n| {
+            match &self.bodies[bid].owner {
+                Owner::Ndb { name, unofficial } => {
+                    if skip(name, *unofficial) {
+                        return std::ops::ControlFlow::Continue(());
                     }
+                    ndb_hit = Some((name.clone(), start, *unofficial));
+                    return std::ops::ControlFlow::Break(());
                 }
+                // counts is non-empty whenever LdbSub bodies exist.
+                Owner::LdbSub => sc.record(bid, start, n),
             }
+            std::ops::ControlFlow::Continue(())
+        });
+        if let Some(hit) = ndb_hit {
+            return Some(hit);
         }
 
         // If no subsignature matched, only logical sigs that fire on an empty
-        // count vector (vanishingly rare) can hit — skip the rest entirely.
-        let body_off = |b: usize| -> Option<u32> {
-            match offs[b] {
-                u32::MAX => None,
-                o => Some(o),
-            }
-        };
-        let img_hash = self.maybe_img_hash(buf);
-        let latin1 = Latin1::new(buf);
-        for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
+        // count vector (vanishingly rare) can hit: skip the rest entirely.
+        let img_hash = self.maybe_img_hash(src, limits);
+        let hay = Hay::new(src, limits);
+        for li in self.candidate_ldbs(&sc.touched, img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            // `Target:5` (graphics) signatures — perceptual `fuzzy_img#` hashes
-            // and raw-byte image matches alike — are dropped by `target_ok(5)`,
+            // `Target:5` (graphics) signatures, perceptual `fuzzy_img#` hashes
+            // and raw-byte image matches alike, are dropped by `target_ok(5)`,
             // since exav does not model graphics as a `FileType`. But when the
             // scanned object IS an image, Target:5 is in fact satisfied, so let
             // such a signature through the target gate; its actual fire is still
             // gated by the subsignature match and the size/container constraints
             // (a benign image only trips a sig whose exact bytes/hash it carries).
             // Matches clamd, which runs Target:5 signatures on graphics.
-            if !(target_ok(ldb.target, ft)
-                || ldb.target == 5 && crate::fuzzy_img::looks_like_image(buf))
+            if !(target_ok(ldb.target, ft) || ldb.target == 5 && is_image)
                 || !ldb.size_ok(buf.len())
                 || !ldb.pe_shape_ok(layout)
                 || !ldb.container_ok(container)
@@ -2506,13 +3444,25 @@ impl SigEngine {
             {
                 continue;
             }
-            if ldb.eval(&latin1, &|b| counts[b], &body_off, img_hash, icon_ctx) {
+            let body_off = |b: usize| sc.first_offset(b);
+            if let Some(program) = ldb.bytecode {
+                if let Some(fired) = fired.as_deref_mut() {
+                    if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
+                        fired.push((program, sub_offsets(ldb, &sc)));
+                    }
+                }
+                continue;
+            }
+            if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
                 // `HandlerType:` is an action, not an alert: the object is
                 // re-typed and rescanned as that type, and this signature stays
                 // silent. Record the decision for the caller (tagged with this
                 // buffer) and keep looking for a real detection.
                 if let Some(ft) = ldb.handler_type {
-                    RETYPE.with(|c| c.set(Some((buf.as_ptr() as usize, buf.len(), ft))));
+                    set_retype(src, ft);
+                    continue;
+                }
+                if skip(&ldb.name, ldb.unofficial) {
                     continue;
                 }
                 return Some((ldb.name.clone(), 0, ldb.unofficial));
@@ -2522,7 +3472,7 @@ impl SigEngine {
     }
 
     /// Collect *every* matching signature (NDB bodies + logical sigs), not just
-    /// the first — used by `--all-matches`. Names are de-duplicated.
+    /// the first, for `--all-matches`. Names are de-duplicated.
     pub fn scan_all_with_layout(
         &self,
         buf: &[u8],
@@ -2544,68 +3494,83 @@ impl SigEngine {
         icon_ctx: Option<&IconCtx>,
         out: &mut Vec<(String, u64, bool)>,
     ) {
+        self.scan_all_in(buf, &buf, ft, layout, container, icon_ctx, out, WholeLimits::NONE, None)
+    }
+
+    /// As [`Self::scan_all_with_icons`], over any object; `limits` and
+    /// `fired` as for [`Self::scan_first_source`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_all_source(
+        &self,
+        src: &dyn ByteSource,
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        icon_ctx: Option<&IconCtx>,
+        out: &mut Vec<(String, u64, bool)>,
+        limits: WholeLimits,
+        fired: Option<&mut Vec<Fired>>,
+    ) {
+        match src.as_slice() {
+            Some(buf) => self.scan_all_in(buf, &buf, ft, layout, container, icon_ctx, out, limits, fired),
+            None => self.scan_all_in(src, src, ft, layout, container, icon_ctx, out, limits, fired),
+        }
+    }
+
+    /// The bytecode triggers that fire on `buf`, for driving the bytecode
+    /// runtime outside a scan (tests, tools).
+    pub fn bytecode_triggers(&self, buf: &[u8], ft: FileType, layout: Option<&PeLayout>) -> Vec<Fired> {
+        let mut fired = Vec::new();
+        self.scan_all_in(buf, &buf, ft, layout, None, None, &mut Vec::new(), WholeLimits::NONE, Some(&mut fired));
+        fired
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_all_in<B: ByteSource + ?Sized>(
+        &self,
+        buf: &B,
+        src: &dyn ByteSource,
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        icon_ctx: Option<&IconCtx>,
+        out: &mut Vec<(String, u64, bool)>,
+        limits: WholeLimits,
+        mut fired: Option<&mut Vec<Fired>>,
+    ) {
         let mut sc = Scratch::acquire(if self.ldbs.is_empty() {
             0
         } else {
             self.bodies.len()
         });
-        let counts = &mut sc.counts;
-        let offs = &mut sc.offs;
-        let touched = &mut sc.touched;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let lower = if self.needs_lower(ft, buf) {
-            buf.to_ascii_lowercase()
-        } else {
-            Vec::new()
-        };
-        let mut budgets = Budgets::new();
-        for (ac, groups, hay) in self.active(ft, buf, &lower) {
-            for m in ac.find_overlapping_iter(hay) {
-                for &bid in &groups[m.value() as usize] {
-                    // Partition membership implies the target match.
-                    let body = &self.bodies[bid];
-                    if let Some(start) = verify(body, buf, m.start(), layout, &lower, &mut budgets) {
-                        match &body.owner {
-                            Owner::Ndb { name, unofficial } => {
-                                if seen.insert(name.clone()) {
-                                    out.push((name.clone(), start, *unofficial));
-                                }
-                            }
-                            Owner::LdbSub => {
-                                if counts[bid] == 0 {
-                                    touched.push(bid);
-                                }
-                                counts[bid] = counts[bid].saturating_add(1);
-                                let s = start.min(u32::MAX as u64 - 1) as u32;
-                                if offs[bid] == u32::MAX || s < offs[bid] {
-                                    offs[bid] = s;
-                                }
-                            }
-                        }
+        let is_image = looks_like_image(buf, limits.all_image_formats);
+        // Partition membership implies the target match.
+        self.walk(buf, ft, is_image, layout, |bid, start, n| {
+            match &self.bodies[bid].owner {
+                Owner::Ndb { name, unofficial } => {
+                    if seen.insert(name.clone()) {
+                        out.push((name.clone(), start, *unofficial));
                     }
                 }
+                Owner::LdbSub => sc.record(bid, start, n),
             }
-        }
-        let body_off = |b: usize| -> Option<u32> {
-            match offs[b] {
-                u32::MAX => None,
-                o => Some(o),
-            }
-        };
-        let img_hash = self.maybe_img_hash(buf);
-        let latin1 = Latin1::new(buf);
-        for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
+            std::ops::ControlFlow::Continue(())
+        });
+        let body_off = |b: usize| sc.first_offset(b);
+        let img_hash = self.maybe_img_hash(src, limits);
+        let hay = Hay::new(src, limits);
+        for li in self.candidate_ldbs(&sc.touched, img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            // `Target:5` (graphics) signatures — perceptual `fuzzy_img#` hashes
-            // and raw-byte image matches alike — are dropped by `target_ok(5)`,
+            // `Target:5` (graphics) signatures, perceptual `fuzzy_img#` hashes
+            // and raw-byte image matches alike, are dropped by `target_ok(5)`,
             // since exav does not model graphics as a `FileType`. But when the
             // scanned object IS an image, Target:5 is in fact satisfied, so let
             // such a signature through the target gate; its actual fire is still
             // gated by the subsignature match and the size/container constraints
             // (a benign image only trips a sig whose exact bytes/hash it carries).
             // Matches clamd, which runs Target:5 signatures on graphics.
-            if !(target_ok(ldb.target, ft)
-                || ldb.target == 5 && crate::fuzzy_img::looks_like_image(buf))
+            if !(target_ok(ldb.target, ft) || ldb.target == 5 && is_image)
                 || !ldb.size_ok(buf.len())
                 || !ldb.pe_shape_ok(layout)
                 || !ldb.container_ok(container)
@@ -2613,18 +3578,26 @@ impl SigEngine {
             {
                 continue;
             }
-            // A `HandlerType:` signature re-types rather than alerts, so it has
-            // no name to collect — but the re-type itself must still be recorded,
-            // or `--all-matches` runs a different signature set than a normal scan.
-            if ldb.handler_type.is_some() {
-                if let Some(ft) = ldb.handler_type {
-                    if ldb.eval(&latin1, &|b| counts[b], &body_off, img_hash, icon_ctx) {
-                        RETYPE.with(|c| c.set(Some((buf.as_ptr() as usize, buf.len(), ft))));
+            if let Some(program) = ldb.bytecode {
+                if let Some(fired) = fired.as_deref_mut() {
+                    if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
+                        fired.push((program, sub_offsets(ldb, &sc)));
                     }
                 }
                 continue;
             }
-            if ldb.eval(&latin1, &|b| counts[b], &body_off, img_hash, icon_ctx)
+            // A `HandlerType:` signature re-types rather than alerts, so it has
+            // no name to collect, but the re-type itself must still be recorded,
+            // or `--all-matches` runs a different signature set than a normal scan.
+            if ldb.handler_type.is_some() {
+                if let Some(ft) = ldb.handler_type {
+                    if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
+                        set_retype(src, ft);
+                    }
+                }
+                continue;
+            }
+            if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx)
                 && seen.insert(ldb.name.clone())
             {
                 out.push((ldb.name.clone(), 0, ldb.unofficial));
@@ -2634,10 +3607,9 @@ impl SigEngine {
 
     /// For each matching logical signature, return its name and the per-subsig
     /// match offsets: `offsets[i]` is the file offset where subsignature `i`
-    /// first matched, or `u32::MAX` (`CLI_OFF_NONE`) if it didn't. Drives
-    /// bytecode triggers, whose programs read `__clambc_match_offsets[i]` to
-    /// locate the pattern they were gated on (a plain match count loses the
-    /// position, which most trigger programs need to seek/verify).
+    /// first matched, or `u32::MAX` (`CLI_OFF_NONE`) if it didn't. What a
+    /// bytecode trigger hands its program (see [`Fired`]), for any logical
+    /// signature.
     pub fn scan_logical_offsets(
         &self,
         buf: &[u8],
@@ -2646,64 +3618,64 @@ impl SigEngine {
         container: Option<ClType>,
         out: &mut Vec<(String, Vec<u32>)>,
     ) {
+        self.scan_logical_offsets_in(buf, &buf, ft, layout, container, out, WholeLimits::NONE)
+    }
+
+    /// As [`Self::scan_logical_offsets`], over any object; `limits` as for
+    /// [`Self::scan_first_source`].
+    #[cfg(test)]
+    pub(crate) fn scan_logical_offsets_source(
+        &self,
+        src: &dyn ByteSource,
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        out: &mut Vec<(String, Vec<u32>)>,
+        limits: WholeLimits,
+    ) {
+        match src.as_slice() {
+            Some(buf) => self.scan_logical_offsets_in(buf, &buf, ft, layout, container, out, limits),
+            None => self.scan_logical_offsets_in(src, src, ft, layout, container, out, limits),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_logical_offsets_in<B: ByteSource + ?Sized>(
+        &self,
+        buf: &B,
+        src: &dyn ByteSource,
+        ft: FileType,
+        layout: Option<&PeLayout>,
+        container: Option<ClType>,
+        out: &mut Vec<(String, Vec<u32>)>,
+        limits: WholeLimits,
+    ) {
         if self.ldbs.is_empty() {
             return;
         }
         let mut sc = Scratch::acquire(self.bodies.len());
-        let counts = &mut sc.counts;
-        let offs = &mut sc.offs;
-        let touched = &mut sc.touched;
-        let lower = if self.needs_lower(ft, buf) {
-            buf.to_ascii_lowercase()
-        } else {
-            Vec::new()
-        };
-        let mut budgets = Budgets::new();
-        for (ac, groups, hay) in self.active(ft, buf, &lower) {
-            for m in ac.find_overlapping_iter(hay) {
-                for &bid in &groups[m.value() as usize] {
-                    // Partition membership implies the target match.
-                    let body = &self.bodies[bid];
-                    if let Some(start) = verify(body, buf, m.start(), layout, &lower, &mut budgets) {
-                        if let Owner::LdbSub = &body.owner {
-                            if counts[bid] == 0 {
-                                touched.push(bid);
-                            }
-                            counts[bid] = counts[bid].saturating_add(1);
-                            // Clamp below `u32::MAX` so a real offset can never
-                            // collide with the `CLI_OFF_NONE` (`u32::MAX`)
-                            // "no match" sentinel used in `offs` (only matters
-                            // for the 4 GiB boundary, where a u32 offset is
-                            // already lossy).
-                            let s = start.min(u32::MAX as u64 - 1) as u32;
-                            if offs[bid] == u32::MAX || s < offs[bid] {
-                                offs[bid] = s;
-                            }
-                        }
-                    }
-                }
+        let is_image = looks_like_image(buf, limits.all_image_formats);
+        // Partition membership implies the target match.
+        self.walk(buf, ft, is_image, layout, |bid, start, n| {
+            if let Owner::LdbSub = &self.bodies[bid].owner {
+                sc.record(bid, start, n);
             }
-        }
-        let body_off = |b: usize| -> Option<u32> {
-            match offs[b] {
-                u32::MAX => None,
-                o => Some(o),
-            }
-        };
-        let img_hash = self.maybe_img_hash(buf);
-        let latin1 = Latin1::new(buf);
-        for li in self.candidate_ldbs(&touched[..], img_hash.is_some()) {
+            std::ops::ControlFlow::Continue(())
+        });
+        let body_off = |b: usize| sc.first_offset(b);
+        let img_hash = self.maybe_img_hash(src, limits);
+        let hay = Hay::new(src, limits);
+        for li in self.candidate_ldbs(&sc.touched, img_hash.is_some()) {
             let ldb = &self.ldbs[li as usize];
-            // `Target:5` (graphics) signatures — perceptual `fuzzy_img#` hashes
-            // and raw-byte image matches alike — are dropped by `target_ok(5)`,
+            // `Target:5` (graphics) signatures, perceptual `fuzzy_img#` hashes
+            // and raw-byte image matches alike, are dropped by `target_ok(5)`,
             // since exav does not model graphics as a `FileType`. But when the
             // scanned object IS an image, Target:5 is in fact satisfied, so let
             // such a signature through the target gate; its actual fire is still
             // gated by the subsignature match and the size/container constraints
             // (a benign image only trips a sig whose exact bytes/hash it carries).
             // Matches clamd, which runs Target:5 signatures on graphics.
-            if !(target_ok(ldb.target, ft)
-                || ldb.target == 5 && crate::fuzzy_img::looks_like_image(buf))
+            if !(target_ok(ldb.target, ft) || ldb.target == 5 && is_image)
                 || !ldb.size_ok(buf.len())
                 || !ldb.pe_shape_ok(layout)
                 || !ldb.container_ok(container)
@@ -2712,24 +3684,31 @@ impl SigEngine {
             {
                 continue;
             }
-            if ldb.eval(&latin1, &|b| counts[b], &body_off, img_hash, None) {
-                // Per-subsig offset = the earliest match among a normal subsig's
-                // bodies (its `aw`-style variants); `CLI_OFF_NONE` for a subsig
-                // that didn't match or is a PCRE/byte-compare (no anchor point).
-                let so = ldb
-                    .subs
-                    .iter()
-                    .map(|s| match s {
-                        SubSig::Bodies(ids) => {
-                            ids.iter().map(|&b| offs[b]).min().unwrap_or(u32::MAX)
-                        }
-                        _ => u32::MAX,
-                    })
-                    .collect();
-                out.push((ldb.name.clone(), so));
+            if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, None) {
+                out.push((ldb.name.clone(), sub_offsets(ldb, &sc)));
             }
         }
     }
+}
+
+/// Where each of `ldb`'s subsignatures first matched this scan: the earliest
+/// match among a normal subsig's bodies (its `aw`-style variants), and
+/// `CLI_OFF_NONE` (`u32::MAX`) for one that did not match or is a
+/// PCRE/byte-compare (no anchor point). The bytecode ABI carries 32 bits: an
+/// offset past 4 GiB is clamped below the sentinel rather than read as "no
+/// match".
+fn sub_offsets(ldb: &Ldb, sc: &Scratch) -> Vec<u32> {
+    ldb.subs
+        .iter()
+        .map(|s| match s {
+            SubSig::Bodies(ids) => ids
+                .iter()
+                .filter_map(|&b| sc.first_offset(b))
+                .min()
+                .map_or(u32::MAX, |o| o.min(u32::MAX as u64 - 1) as u32),
+            _ => u32::MAX,
+        })
+        .collect()
 }
 
 fn target_ok(target: u8, ft: FileType) -> bool {
@@ -2740,21 +3719,17 @@ fn target_ok(target: u8, ft: FileType) -> bool {
         6 => ft == FileType::Elf,
         9 => ft == FileType::MachO,
         10 => ft == FileType::Pdf,
-        // HTML(3): apply only to content typed as HTML (or RTF, which can carry
-        // HTML-ish exploit markup) — NOT every text-ish/unknown buffer, or an
-        // HTML-exploit sig false-positives on plain JavaScript (observed:
-        // `Html.Exploit.CVE_2017_11861` firing on obfuscated npm JS that contains
-        // `Uint32Array(0x..)`).
-        3 => matches!(ft, FileType::Html | FileType::Rtf),
-        // mail(4)/text(7): apply to text-ish types (incl. the content-detected
-        // `Text`), NOT binary `Unknown` — ClamAV types text vs binary and runs
-        // text sigs only on text. `Target:0` still covers everything.
-        4 | 7 => matches!(
-            ft,
-            FileType::Text | FileType::Rtf | FileType::Script | FileType::Email | FileType::Html
-        ),
+        // HTML(3) and text(7) signatures match the normalised view of an HTML
+        // or a text object, never raw bytes; mail(4) ones match a mail's raw
+        // bytes. As clamscan does, probed with each target over text, HTML,
+        // RTF, mail, script, XML and CSV files, in their own case and
+        // lowercased: an HTML signature on an RTF or on plain JavaScript, or a
+        // text one on raw bytes, is a match clamscan cannot make.
+        3 => ft == FileType::HtmlView,
+        4 => ft == FileType::Email,
+        7 => ft == FileType::TextView,
         // Java(12): gate on a positively-typed `.class` (the `cafebabe` magic,
-        // with Mach-O fat binaries — same first four bytes — already rejected by
+        // with Mach-O fat binaries (same first four bytes) already rejected by
         // `identify`). The earlier blanket skip predated `FileType::JavaClass`
         // and cost real detections: a log4shell logical signature
         // (`FileSize:500-5000,Target:12`) never ran, so a JAR whose payload
@@ -2762,8 +3737,8 @@ fn target_ok(target: u8, ft: FileType) -> bool {
         // false positives that motivated the skip came from running Java sigs on
         // *untyped* apk/zip members, which typing on the magic prevents.
         12 => ft == FileType::JavaClass,
-        // Flash(11): every SWF variant is positively typed — `CWS`/`ZWS` by
-        // `unpack::detect`, `FWS` by `identify` — so the gate is exact. Both the
+        // Flash(11): every SWF variant is positively typed (`CWS`/`ZWS` by
+        // `unpack::detect`, `FWS` by `identify`), so the gate is exact. Both the
         // compressed container and the `FWS` body exav rebuilds from it are
         // typed `Swf`, which matches clamscan: probed with a `Target:11`
         // signature, it fires on an uncompressed movie, on a compressed one, and
@@ -2794,43 +3769,236 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
 }
 
-fn verify(
+/// What verifying the candidates of one scan carries from one anchor hit to
+/// the next: the step pool, the occurrence memo and the group costs.
+struct Verifier<'s, B: ?Sized, L: ?Sized, F> {
+    eng: &'s SigEngine,
+    buf: &'s B,
+    layout: Option<&'s PeLayout>,
+    lower: &'s L,
+    budget: u64,
+    occ: OccCache,
+    group_cost: GroupCost,
+    on_match: F,
+}
+
+impl<B, L, F> Verifier<'_, B, L, F>
+where
+    B: ByteSource + ?Sized,
+    L: ByteSource + ?Sized,
+    F: FnMut(usize, u64, u64) -> std::ops::ControlFlow<()>,
+{
+    /// Verify the bodies behind `count` hits of partition `pidx`'s anchor
+    /// group `value`, from `start`, but those of logical signatures `alive`
+    /// rules out; `true` when `on_match` asks to stop.
+    fn hit(&mut self, pidx: usize, value: u32, start: usize, count: usize, alive: Option<&[bool]>) -> bool {
+        if !self.group_cost.admit(pidx, value) {
+            return false;
+        }
+        let eng = self.eng;
+        for &bid in eng.group(pidx, &value) {
+            let bid = bid as usize;
+            if let Some(alive) = alive {
+                let li = eng.body_ldb[bid];
+                if li != u32::MAX && !alive[li as usize] {
+                    continue;
+                }
+            }
+            if self.body(bid, start, count, (pidx, value)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Verify body `bid` at `count` anchor hits from `start`, charging the
+    /// steps to `group`; `true` when `on_match` asks to stop.
+    fn body(&mut self, bid: usize, start: usize, count: usize, group: (usize, u32)) -> bool {
+        let body = &self.eng.bodies[bid];
+        let pool_before = self.budget;
+        let on_match = &mut self.on_match;
+        let (budget, occ) = (&mut self.budget, &mut self.occ);
+        let stop = if count == 1 {
+            verify(body, self.buf, start, self.layout, self.lower, budget, occ)
+                .is_some_and(|s| on_match(bid, s, 1).is_break())
+        } else {
+            let mut report = |s, n| on_match(bid, s, n).is_break();
+            verify_run(body, self.buf, start, count, self.layout, self.lower, budget, occ, &mut report)
+        };
+        let drawn = pool_before - self.budget;
+        self.group_cost.charge(group.0, group.1, drawn);
+        stop
+    }
+
+    /// [`Self::hit`] for each of the buffered `hits`, in order; `true` when
+    /// `on_match` asks to stop.
+    fn replay(&mut self, hits: &[SweepHit], alive: Option<&[bool]>) -> bool {
+        let mut next = 0;
+        while let Some(h) = hits.get(next) {
+            let (value, start) = (h.value, h.start());
+            // A run longer than one entry holds was pushed as consecutive
+            // entries: verified as one, its interior is not cut into pieces
+            // with edges of their own. A pinned body's candidates are no run.
+            let mut count = h.count();
+            next += 1;
+            let pinned = h.pidx as usize == self.eng.partitions.len();
+            while let Some(g) = hits.get(next).filter(|_| !pinned) {
+                if (g.pidx, g.value, g.start()) != (h.pidx, value, start + count) {
+                    break;
+                }
+                count += g.count();
+                next += 1;
+            }
+            if self.hit(h.pidx as usize, value, start, count, alive) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn verify<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
     body: &Body,
-    buf: &[u8],
+    buf: &B,
     anchor_start: usize,
     layout: Option<&PeLayout>,
-    lower: &[u8],
-    budgets: &mut Budgets,
+    lower: &L,
+    budget: &mut u64,
+    occ: &mut OccCache,
 ) -> Option<u64> {
-    let start = verify_inner(body, buf, anchor_start, layout, lower, budgets)?;
+    let start = verify_inner(body, buf, anchor_start, layout, lower, budget, occ)?;
     let Some(len) = body.fullword_len else {
         return Some(start);
     };
-    // `::f` — the match must not be glued to a longer word on either side.
+    // `::f`: the match must not be glued to a longer word on either side.
     //
     // Dropping this modifier silently is not a smaller version of implementing
     // it: it makes every `::f` subsignature match as a plain substring, so the
     // signature fires on strictly more than its author asked for. Measured on
     // one live sample, `Win.Trojan.APT_Trojan_Win_REDFLARE_1` matched a 25 MB Go
     // binary where `VirtualAllocEx` occurs only ever as `FuncVirtualAllocEx` and
-    // `fini` only ever inside longer identifiers — under the real semantics its
+    // `fini` only ever inside longer identifiers. Under the real semantics its
     // `0&1&2&3&4&5` expression is false, and ClamAV agrees.
     let s = start as usize;
-    let before_ok = s == 0 || !buf.get(s - 1).copied().is_some_and(is_word_byte);
-    let after_ok = !buf.get(s + len).copied().is_some_and(is_word_byte);
+    let word_at = |i: usize| i < buf.len() && is_word_byte(byte_at(buf, i));
+    let before_ok = s == 0 || !word_at(s - 1);
+    let after_ok = !word_at(s + len);
     (before_ok && after_ok).then_some(start)
 }
 
-fn verify_inner(
+/// How far around an anchor hit [`verify`] can read: `(back, fwd)` with every
+/// byte it reads in `anchor - back .. anchor + fwd`. `None` when a gap is
+/// unbounded.
+fn reach(body: &Body) -> Option<(usize, usize)> {
+    let (mut back, mut fwd) = match &body.elems {
+        None => (0, 0),
+        Some(elems) => match body.prefix {
+            Prefix::Fixed { len, .. } => {
+                let len = len as usize;
+                (len, max_total_width(elems)?.saturating_sub(len))
+            }
+            Prefix::Floating { anchor_idx } => (0, max_total_width(&elems[anchor_idx as usize..])?),
+            Prefix::Internal { anchor_idx } => (
+                max_total_width(&elems[..anchor_idx as usize])?,
+                max_total_width(&elems[anchor_idx as usize..])?,
+            ),
+        },
+    };
+    // `::f` reads one byte before the match and the one after its end.
+    if let Some(len) = body.fullword_len {
+        back += 1;
+        fwd = fwd.max(len + 1);
+    }
+    Some((back, fwd))
+}
+
+/// [`verify`] at every anchor hit `start..start + count` of one run of hits,
+/// which [`sweep`] reports only inside a run of one byte value.
+/// `on_match(first, n)` gets the matches at `first..first + n`, in order, and
+/// stops the walk by returning `true`; so does a `true` return.
+///
+/// A hit whose whole [`reach`] lies inside the run reads the same bytes as
+/// every other such hit, and passes the same offset check when the offset
+/// allows it at all, so one verify answers for all of them. The hits near the
+/// run's edges, and every hit of a body whose reach is unbounded, are verified
+/// one by one; a body pinned to an offset only where the offset allows.
+#[allow(clippy::too_many_arguments)]
+fn verify_run<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
     body: &Body,
-    buf: &[u8],
+    buf: &B,
+    start: usize,
+    count: usize,
+    layout: Option<&PeLayout>,
+    lower: &L,
+    budget: &mut u64,
+    occ: &mut OccCache,
+    on_match: &mut dyn FnMut(u64, u64) -> bool,
+) -> bool {
+    let end = start + count;
+    // Verify the hit at `s`, and report a match as `n` of them.
+    let mut one = |s: usize, n: usize| {
+        verify(body, buf, s, layout, lower, budget, occ).is_some_and(|m| on_match(m, n as u64))
+    };
+    // The hits the offset allows, as ranges of anchor positions.
+    let mut allowed: Vec<(usize, usize)> = Vec::new();
+    match &body.offset {
+        Offset::Any => allowed.push((start, end)),
+        Offset::Constrained(_) => {
+            // The pattern start sits `len` bytes before a fixed-prefix anchor
+            // and at a floating one. An internal anchor has no fixed distance
+            // to it (and is only chosen for unpinned bodies anyway).
+            let len = match body.prefix {
+                Prefix::Fixed { len, .. } => len as u64,
+                Prefix::Floating { .. } => 0,
+                Prefix::Internal { .. } => return (start..end).any(|s| one(s, 1)),
+            };
+            let clip = |lo: u64, hi: u64| {
+                let lo = lo.saturating_add(len).max(start as u64);
+                let hi = hi.saturating_add(len).saturating_add(1).min(end as u64);
+                (lo < hi).then_some((lo as usize, hi as usize))
+            };
+            match start_set(&body.offset, buf.len() as u64, layout) {
+                None => return false,
+                Some(StartSet::Anywhere) => allowed.push((start, end)),
+                Some(StartSet::Range(lo, hi)) => allowed.extend(clip(lo, hi)),
+                Some(StartSet::Points(points)) => {
+                    let mut points = points.to_vec();
+                    points.sort_unstable();
+                    points.dedup();
+                    allowed.extend(points.into_iter().filter_map(|p| clip(p, p)));
+                }
+            }
+        }
+    }
+    let interior = reach(body).and_then(|(back, fwd)| {
+        let lo = start.checked_add(back)?;
+        let hi = (end + 1).checked_sub(fwd)?;
+        (lo < hi).then_some((lo, hi))
+    });
+    for (lo, hi) in allowed {
+        // The interior hits within this range, or none at all.
+        let (ilo, ihi) = match interior {
+            Some((a, b)) if a.clamp(lo, hi) < b.clamp(lo, hi) => (a.clamp(lo, hi), b.clamp(lo, hi)),
+            _ => (hi, hi),
+        };
+        if (lo..ilo).any(|s| one(s, 1)) || (ilo < ihi && one(ilo, ihi - ilo)) || (ihi..hi).any(|s| one(s, 1)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn verify_inner<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
+    body: &Body,
+    buf: &B,
     anchor_start: usize,
     layout: Option<&PeLayout>,
-    lower: &[u8],
-    budgets: &mut Budgets,
+    lower: &L,
+    budget: &mut u64,
+    occ: &mut OccCache,
 ) -> Option<u64> {
-    // Pure literal: the Aho-Corasick hit is already the full match; only the
-    // offset constraint remains (no backtracking, so no budget is drawn).
+    // Pure literal: the anchor hit is already the full match; only the
+    // offset constraint remains, so no budget is drawn.
     let elems = match &body.elems {
         None => {
             return offset_ok(&body.offset, anchor_start as u64, buf.len() as u64, layout)
@@ -2854,129 +4022,59 @@ fn verify_inner(
     //    `gap_split_match_backward`, which reconstructs the byte-for-byte same
     //    start the backtracking walk returned.
     //
-    // Everything draws from the `sim` pool; the `legacy` pool stays untouched.
-    if split_match_enabled() {
-        macro_rules! sim {
-            ($toks:expr, $at:expr) => {{
-                if budgets.sim == 0 {
-                    SCAN_TRUNCATED.with(|c| c.set(true));
-                    return None;
-                }
-                gap_split_match($toks, buf, $at, body.nocase, lower, &mut budgets.sim)
-            }};
-        }
-        return match body.prefix {
-            Prefix::Fixed { len, .. } => {
-                if anchor_start < len as usize {
-                    return None;
-                }
-                let start = anchor_start - len as usize;
-                if !off_at(start) {
-                    return None;
-                }
-                sim!(elems, start).then_some(start as u64)
+    // The offset constraint is checked before the simulator wherever the start
+    // is known up front: an offset-pinned body whose only anchor is a common
+    // run hits thousands of times per file, and all but the pinned hit are
+    // rejected without running it.
+    macro_rules! sim {
+        ($toks:expr, $at:expr) => {{
+            if *budget == 0 {
+                SCAN_TRUNCATED.with(|c| c.set(true));
+                return None;
             }
-            Prefix::Floating { anchor_idx } => {
-                if !off_at(anchor_start) {
-                    return None;
-                }
-                sim!(&elems[anchor_idx as usize..], anchor_start).then_some(anchor_start as u64)
-            }
-            Prefix::Internal { anchor_idx } => {
-                if !sim!(&elems[anchor_idx as usize..], anchor_start) {
-                    return None;
-                }
-                if budgets.sim == 0 {
-                    SCAN_TRUNCATED.with(|c| c.set(true));
-                    return None;
-                }
-                // The start comes from the backward simulator, which returns the
-                // same start the legacy walk did but without backtracking — so
-                // this path draws from the polynomial `sim` pool too, and the
-                // exponential `legacy` pool is never touched.
-                gap_split_match_backward(
-                    &elems[..anchor_idx as usize],
-                    buf,
-                    anchor_start,
-                    body.nocase,
-                    lower,
-                    &mut budgets.sim,
-                )
-                .filter(|&start| off_at(start))
-                .map(|start| start as u64)
-            }
-        };
+            gap_split_match($toks, buf, $at, body.nocase, lower, budget, occ)
+        }};
     }
-
-    // Legacy backtracking path (split matcher disabled).
-    if budgets.legacy == 0 {
-        SCAN_TRUNCATED.with(|c| c.set(true));
-        return None;
-    }
-    let call_cap = VERIFY_BUDGET.min(budgets.legacy);
-    let mut budget = call_cap;
-    let result = match body.prefix {
+    match body.prefix {
         Prefix::Fixed { len, .. } => {
             if anchor_start < len as usize {
-                None
-            } else {
-                let start = anchor_start - len as usize;
-                // The pattern start is known up front, so apply the (cheap)
-                // offset constraint BEFORE the expensive backtracking match.
-                // Offset-pinned sigs (EP+0/Abs/Sec) whose only viable anchor is a
-                // common run (e.g. a zero triple) hit thousands of times per file;
-                // this rejects all but the ~one hit at the pinned position without
-                // ever running `match_forward`. For `Offset::Any` the gate is a
-                // constant `true`, so nothing is lost on the common case.
-                if !off_at(start) {
-                    None
-                } else {
-                    match_forward(elems, buf, start, body.nocase, &mut budget).then_some(start)
-                }
+                return None;
             }
+            let start = anchor_start - len as usize;
+            if !off_at(start) {
+                return None;
+            }
+            sim!(elems, start).then_some(start as u64)
         }
         Prefix::Floating { anchor_idx } => {
             if !off_at(anchor_start) {
-                None
-            } else {
-                match_forward(
-                    &elems[anchor_idx as usize..],
-                    buf,
-                    anchor_start,
-                    body.nocase,
-                    &mut budget,
-                )
-                .then_some(anchor_start)
+                return None;
             }
+            sim!(&elems[anchor_idx as usize..], anchor_start).then_some(anchor_start as u64)
         }
-        // Anchor sits past variable gaps: confirm the suffix forward from the
-        // anchor, then the prefix backward across the gaps to the pattern start.
-        // The start is only known after backward matching, so the offset gate
-        // runs last (these are `Offset::Any`-only, so it is a no-op anyway).
+        // The start is only known once the backward simulator has found it,
+        // so the offset check runs last.
         Prefix::Internal { anchor_idx } => {
-            if match_forward(
-                &elems[anchor_idx as usize..],
+            if !sim!(&elems[anchor_idx as usize..], anchor_start) {
+                return None;
+            }
+            if *budget == 0 {
+                SCAN_TRUNCATED.with(|c| c.set(true));
+                return None;
+            }
+            gap_split_match_backward(
+                &elems[..anchor_idx as usize],
                 buf,
                 anchor_start,
                 body.nocase,
-                &mut budget,
-            ) {
-                match_backward(
-                    &elems[..anchor_idx as usize],
-                    buf,
-                    anchor_start,
-                    body.nocase,
-                    &mut budget,
-                )
-                .filter(|&start| off_at(start))
-            } else {
-                None
-            }
+                lower,
+                budget,
+                occ,
+            )
+            .filter(|&start| off_at(start))
+            .map(|start| start as u64)
         }
-    };
-    // Charge the steps this verify actually spent back to the legacy pool.
-    budgets.legacy = budgets.legacy.saturating_sub(call_cap - budget);
-    result.map(|start| start as u64)
+    }
 }
 
 fn bytes_eq(a: &[u8], b: &[u8], nocase: bool) -> bool {
@@ -2988,57 +4086,60 @@ fn bytes_eq(a: &[u8], b: &[u8], nocase: bool) -> bool {
 }
 
 fn offset_ok(off: &Offset, start: u64, filelen: u64, layout: Option<&PeLayout>) -> bool {
-    let window = |base: u64, shift: u64| start >= base && start <= base.saturating_add(shift);
+    match start_set(off, filelen, layout) {
+        None => false,
+        Some(StartSet::Anywhere) => true,
+        Some(StartSet::Range(lo, hi)) => start >= lo && start <= hi,
+        Some(StartSet::Points(points)) => points.contains(&start),
+    }
+}
+
+/// Where an offset constraint lets a pattern start.
+enum StartSet<'a> {
+    Anywhere,
+    /// `lo..=hi`.
+    Range(u64, u64),
+    /// Exactly these offsets.
+    Points(&'a [u64]),
+}
+
+/// The pattern starts `off` allows in a file of `filelen` bytes; `None` when
+/// it allows none.
+fn start_set<'a>(off: &Offset, filelen: u64, layout: Option<&'a PeLayout>) -> Option<StartSet<'a>> {
+    let window = |base: u64, shift: u64| Some(StartSet::Range(base, base.saturating_add(shift)));
     let kind = match off {
-        Offset::Any => return true,
+        Offset::Any => return Some(StartSet::Anywhere),
         Offset::Constrained(k) => k.as_ref(),
     };
     match *kind {
         OffsetKind::Abs { n, shift } => window(n, shift),
         // `EOF-n` anchors `n` bytes before end of file. If `n` exceeds the
-        // file length the anchor is before offset 0 — treated as no
-        // match; without this guard `saturating_sub` collapses it to offset 0
-        // and a pattern at the start of a short file would falsely match.
-        OffsetKind::Eof { n, shift } => n <= filelen && window(filelen - n, shift),
-        OffsetKind::Ep { delta, shift } => match layout.and_then(|l| l.entry) {
-            Some(ep) => add_delta(ep, delta)
-                .map(|t| window(t, shift))
-                .unwrap_or(false),
-            None => false,
-        },
+        // file length the anchor is before offset 0, which is no match;
+        // without this guard `saturating_sub` collapses it to offset 0 and a
+        // pattern at the start of a short file would falsely match.
+        OffsetKind::Eof { n, shift } => (n <= filelen).then(|| window(filelen - n, shift))?,
+        OffsetKind::Ep { delta, shift } => window(add_delta(layout?.entry?, delta)?, shift),
         OffsetKind::Sec { idx, delta, shift } => {
-            match layout.and_then(|l| l.section_rawptrs.get(idx).copied()) {
-                Some(p) => add_delta(p, delta)
-                    .map(|t| window(t, shift))
-                    .unwrap_or(false),
-                None => false,
-            }
+            window(add_delta(*layout?.section_rawptrs.get(idx)?, delta)?, shift)
         }
         OffsetKind::SecLast { delta, shift } => {
-            match layout.and_then(|l| l.section_rawptrs.last().copied()) {
-                Some(p) => add_delta(p, delta)
-                    .map(|t| window(t, shift))
-                    .unwrap_or(false),
-                None => false,
-            }
+            window(add_delta(*layout?.section_rawptrs.last()?, delta)?, shift)
         }
         // `SEn` constrains where the match STARTS, not where it ends: probed
         // with a two-section PE, a signature anchored `SE0:` fires on a pattern
         // that begins at the last byte of section 0 and runs on into section 1.
-        // The upper bound is inclusive for the same reason — a match starting at
+        // The upper bound is inclusive for the same reason: a match starting at
         // exactly `ptr + size`, i.e. the first byte of the next section, is
         // accepted. That looks like an off-by-one and reproducing it is
         // deliberate: being stricter here would drop a detection ClamAV makes.
         // `VI` is an anchor set, not a window: the match must begin exactly at
         // a version-info key. See `icon::version_info_anchors`.
-        OffsetKind::VersionInfo => layout.is_some_and(|l| l.version_info.contains(&start)),
-        OffsetKind::SecIn { idx } => match layout {
-            Some(l) => match (l.section_rawptrs.get(idx), l.section_rawsizes.get(idx)) {
-                (Some(&p), Some(&n)) => start >= p && start <= p.saturating_add(n),
-                _ => false,
-            },
-            None => false,
-        },
+        OffsetKind::VersionInfo => Some(StartSet::Points(&layout?.version_info)),
+        OffsetKind::SecIn { idx } => {
+            let l = layout?;
+            let (p, n) = (*l.section_rawptrs.get(idx)?, *l.section_rawsizes.get(idx)?);
+            Some(StartSet::Range(p, p.saturating_add(n)))
+        }
     }
 }
 
@@ -3046,14 +4147,22 @@ fn add_delta(base: u64, delta: i64) -> Option<u64> {
     if delta >= 0 {
         base.checked_add(delta as u64)
     } else {
-        base.checked_sub((-delta) as u64)
+        base.checked_sub(delta.unsigned_abs())
     }
 }
 
 /// Match the token program against `buf` at `pos`. Backtracks over gaps and
 /// alternations; `budget` bounds total work. `nocase` folds ASCII case on
-/// literal comparisons (the `i` subsig modifier).
-fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &mut u64) -> bool {
+/// literal comparisons (the `i` subsig modifier). The reference the tests hold
+/// [`gap_split_match`] to.
+#[cfg(test)]
+fn match_forward<B: ByteSource + ?Sized>(
+    toks: &[Elem],
+    buf: &B,
+    pos: usize,
+    nocase: bool,
+    budget: &mut u64,
+) -> bool {
     if *budget == 0 {
         return false;
     }
@@ -3065,23 +4174,23 @@ fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &m
     match head {
         Elem::Bytes(b) => {
             buf.len() >= pos + b.len()
-                && bytes_eq(&buf[pos..pos + b.len()], b, nocase)
+                && bytes_eq(&buf.window(pos, b.len()), b, nocase)
                 && match_forward(rest, buf, pos + b.len(), nocase, budget)
         }
         Elem::AnyByte => pos < buf.len() && match_forward(rest, buf, pos + 1, nocase, budget),
         Elem::AltMasked { opts } => opts.iter().any(|o| {
             pos + o.len() <= buf.len()
-                && masked_eq(o, &buf[pos..pos + o.len()], nocase)
+                && masked_eq(o, &buf.window(pos, o.len()), nocase)
                 && match_forward(rest, buf, pos + o.len(), nocase, budget)
         }),
         Elem::HiNibble(h) => {
             pos < buf.len()
-                && buf[pos] >> 4 == *h
+                && byte_at(buf, pos) >> 4 == *h
                 && match_forward(rest, buf, pos + 1, nocase, budget)
         }
         Elem::LoNibble(l) => {
             pos < buf.len()
-                && buf[pos] & 0x0f == *l
+                && byte_at(buf, pos) & 0x0f == *l
                 && match_forward(rest, buf, pos + 1, nocase, budget)
         }
         Elem::Gap { min, max } => {
@@ -3092,7 +4201,7 @@ fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &m
             }
             // Fast path: a gap followed by a literal. Instead of testing every
             // gap length byte-by-byte (O(gap), and budget-burning when the
-            // literal is absent — the dominant cost on type-matched fan-out),
+            // literal is absent: the dominant cost on type-matched fan-out),
             // SIMD-search for each occurrence of that literal within the gap
             // window and recurse only there. Case-sensitive only (memmem can't
             // fold case); the `nocase` path keeps the scalar fallback.
@@ -3111,28 +4220,32 @@ fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &m
                         // backtracking over occurrences is needed. This collapses
                         // the combinatorial blow-up of `lit*lit*lit…` chains
                         // (polymorphic-malware sigs) from exponential to linear,
-                        // with identical results — if the tail can't match after
+                        // with identical results: if the tail can't match after
                         // the first occurrence, a later occurrence (further right,
                         // less room) can't either.
                         let greedy = max.is_none()
                             && matches!(tail.first(), None | Some(Elem::Gap { max: None, .. }));
                         if greedy {
-                            return match memchr::memmem::find(&buf[lo..end], lit) {
-                                Some(off) => {
+                            return match buf.find(lit, lo, end) {
+                                Some(q) => {
                                     *budget = budget.saturating_sub(1);
-                                    match_forward(tail, buf, lo + off + lit.len(), nocase, budget)
+                                    match_forward(tail, buf, q + lit.len(), nocase, budget)
                                 }
                                 None => false,
                             };
                         }
-                        for off in memchr::memmem::find_iter(&buf[lo..end], lit) {
+                        // Non-overlapping occurrences, as `memmem::find_iter`
+                        // yields them.
+                        let mut from = lo;
+                        while let Some(q) = buf.find(lit, from, end) {
                             if *budget == 0 {
                                 return false;
                             }
                             *budget -= 1;
-                            if match_forward(tail, buf, lo + off + lit.len(), nocase, budget) {
+                            if match_forward(tail, buf, q + lit.len(), nocase, budget) {
                                 return true;
                             }
+                            from = q + lit.len();
                         }
                         return false;
                     }
@@ -3154,13 +4267,13 @@ fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &m
                 if l == 0 || pos + l > buf.len() {
                     return false;
                 }
-                let cur = &buf[pos..pos + l];
-                !opts.iter().any(|o| bytes_eq(o, cur, nocase))
+                let cur = buf.window(pos, l);
+                !opts.iter().any(|o| bytes_eq(o, &cur, nocase))
                     && match_forward(rest, buf, pos + l, nocase, budget)
             } else {
                 opts.iter().any(|o| {
                     buf.len() >= pos + o.len()
-                        && bytes_eq(&buf[pos..pos + o.len()], o, nocase)
+                        && bytes_eq(&buf.window(pos, o.len()), o, nocase)
                         && match_forward(rest, buf, pos + o.len(), nocase, budget)
                 })
             }
@@ -3171,12 +4284,12 @@ fn match_forward(toks: &[Elem], buf: &[u8], pos: usize, nocase: bool, budget: &m
 /// Match a token program *backward* so it ends exactly at `end`, returning the
 /// start position (where the first token begins). The mirror of [`match_forward`]
 /// for verifying an [`Prefix::Internal`] anchor's preceding context across
-/// variable gaps. `budget` bounds backtracking work. Only reached on the rare,
-/// selective internal anchors, so it keeps the simple scalar gap loop (no SIMD
-/// fast path) — clarity over a micro-optimization that never runs hot.
-fn match_backward(
+/// variable gaps. `budget` bounds backtracking work. The reference the tests
+/// hold [`gap_split_match_backward`] to.
+#[cfg(test)]
+fn match_backward<B: ByteSource + ?Sized>(
     toks: &[Elem],
-    buf: &[u8],
+    buf: &B,
     end: usize,
     nocase: bool,
     budget: &mut u64,
@@ -3191,7 +4304,7 @@ fn match_backward(
     };
     match last {
         Elem::Bytes(b) => {
-            if end < b.len() || !bytes_eq(&buf[end - b.len()..end], b, nocase) {
+            if end < b.len() || !bytes_eq(&buf.window(end - b.len(), b.len()), b, nocase) {
                 return None;
             }
             match_backward(rest, buf, end - b.len(), nocase, budget)
@@ -3203,13 +4316,13 @@ fn match_backward(
             match_backward(rest, buf, end - 1, nocase, budget)
         }
         Elem::HiNibble(h) => {
-            if end == 0 || buf[end - 1] >> 4 != *h {
+            if end == 0 || byte_at(buf, end - 1) >> 4 != *h {
                 return None;
             }
             match_backward(rest, buf, end - 1, nocase, budget)
         }
         Elem::LoNibble(l) => {
-            if end == 0 || buf[end - 1] & 0x0f != *l {
+            if end == 0 || byte_at(buf, end - 1) & 0x0f != *l {
                 return None;
             }
             match_backward(rest, buf, end - 1, nocase, budget)
@@ -3231,7 +4344,7 @@ fn match_backward(
         }
         Elem::AltMasked { opts } => {
             for o in opts {
-                if end >= o.len() && masked_eq(o, &buf[end - o.len()..end], nocase) {
+                if end >= o.len() && masked_eq(o, &buf.window(end - o.len(), o.len()), nocase) {
                     if let Some(s) = match_backward(rest, buf, end - o.len(), nocase, budget) {
                         return Some(s);
                     }
@@ -3250,14 +4363,14 @@ fn match_backward(
                 if l == 0 || end < l {
                     return None;
                 }
-                let cur = &buf[end - l..end];
-                if opts.iter().any(|o| bytes_eq(o, cur, nocase)) {
+                let cur = buf.window(end - l, l);
+                if opts.iter().any(|o| bytes_eq(o, &cur, nocase)) {
                     return None;
                 }
                 match_backward(rest, buf, end - l, nocase, budget)
             } else {
                 for o in opts {
-                    if end >= o.len() && bytes_eq(&buf[end - o.len()..end], o, nocase) {
+                    if end >= o.len() && bytes_eq(&buf.window(end - o.len(), o.len()), o, nocase) {
                         if let Some(s) = match_backward(rest, buf, end - o.len(), nocase, budget) {
                             return Some(s);
                         }
@@ -3274,7 +4387,7 @@ fn match_backward(
 
 // --- Gap-split anchored matching -------------------------------------------
 //
-// The legacy `match_forward` walks a wildcard body by recursive backtracking:
+// The backtracking `match_forward` walks a wildcard body recursively:
 // at every variable gap it tries each gap length (or every occurrence of the
 // following literal) and recurses. On dense content a body with several large
 // or unbounded gaps fans out multiplicatively, so a per-buffer step budget has
@@ -3289,23 +4402,9 @@ fn match_backward(
 // unbounded gap is a single interval expansion instead of a per-length loop,
 // and "the literal that follows a gap" is found once across the whole window
 // instead of once per surviving backtracking branch. The body is present iff
-// the reachable set is non-empty after the last element — the *identical*
+// the reachable set is non-empty after the last element: the *identical*
 // present/absent decision the backtracking walk computes, but without the
 // combinatorial blow-up, so the verify budget is (essentially) never spent.
-
-/// Whether the non-backtracking gap-split matcher is used. `EXAV_SPLIT_MATCH=0`
-/// (also `false`/`no`/`off`) forces the legacy backtracking `verify` path, so a
-/// scan can be run both ways and the detections compared. Read once.
-fn split_match_enabled() -> bool {
-    use std::sync::OnceLock;
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        !matches!(
-            std::env::var("EXAV_SPLIT_MATCH").ok().as_deref(),
-            Some("0") | Some("false") | Some("no") | Some("off")
-        )
-    })
-}
 
 /// Coalesce a position-interval set into sorted, disjoint form. Two intervals
 /// are merged when they touch or overlap (`next.lo <= cur.hi + 1`), since the
@@ -3331,6 +4430,281 @@ fn coalesce(ivs: &mut Vec<(usize, usize)>) {
     ivs.truncate(w + 1);
 }
 
+/// Per-scan memo of literal-token occurrences: the fix for redundant suffix
+/// rescanning.
+///
+/// Every anchor hit re-verifies its bodies over suffixes that overlap the
+/// previous hit's almost entirely: searched afresh each time, a repeated footer
+/// anchor rescans the same megabytes tens of thousands of times per buffer.
+/// The occurrences of a token do not depend on the hit, so they are memoised,
+/// a block of [`OCC_BLOCK`] start positions at a time: a verify reads the
+/// blocks its window covers, and searches only those no verify reached
+/// before. A check around one anchor reads a block, not the whole object; a
+/// gap that runs to the end of it has every block searched once, however many
+/// verifies cross them. Same reachable sets as the direct search
+/// (overlapping, ascending), so verdicts are unchanged.
+///
+/// Budget honesty is preserved: cached reads charge one unit per source
+/// interval plus one per occurrence emitted, exactly as the direct path does,
+/// so the per-buffer pool trips at the same verify in the same order. The
+/// block searches themselves are uncharged (each is made once).
+///
+/// Memory is bounded: past [`MAX_OCC_TOTAL`] units (a cached run each, and a
+/// few per block) a token falls back to the direct per-verify search,
+/// remembered so later verifies go straight to it. Correctness is identical
+/// either way (only speed differs), so no truncation flag is involved.
+struct OccCache {
+    /// Split by case-folding rather than keyed on `(needle, nocase)`: a tuple
+    /// key has to be *built* to be looked up, so every call (cache hits
+    /// included, which is nearly all of them) allocated a `Vec` for the
+    /// needle. `Box<[u8]>` borrows as `[u8]`, so with one map per folding a hit
+    /// is a plain `get(needle)` and only a first insert allocates.
+    cs: std::collections::HashMap<Box<[u8]>, OccEntry>,
+    ci: std::collections::HashMap<Box<[u8]>, OccEntry>,
+    total: usize,
+    /// Runs allowed before memoising is refused. A field rather than
+    /// the bare constant so tests can force the direct path.
+    cap: usize,
+}
+
+/// What the memo knows about one token.
+enum OccEntry {
+    /// The occurrences starting in each block searched so far, keyed by
+    /// block number, ascending, as [`OccRun`]s.
+    Blocks(rustc_hash::FxHashMap<usize, Vec<OccRun>>),
+    /// Refused (would exceed the memory cap): direct search, immediately.
+    Failed,
+}
+
+/// Start positions per block of [`OccCache`]: as many as one [`OccRun`]
+/// holds, so a run found in a block is one word.
+const OCC_BLOCK: usize = OccRun::MAX_LEN;
+
+/// What a block of [`OccCache`] costs against its cap, in runs: a map entry
+/// is about as large as four.
+const OCC_BLOCK_COST: usize = 4;
+
+/// Consecutive occurrence starts `first..=last` in a word, `first << 16 |
+/// (last - first)`: the size one start took before starts were grouped. A
+/// longer run takes several.
+#[derive(Clone, Copy)]
+struct OccRun(u64);
+
+impl OccRun {
+    const MAX_LEN: usize = 1 << 16;
+
+    /// Push `first..=last` onto `v` as runs; `false`, having pushed none of
+    /// them, when that would make `v` longer than `room`.
+    fn push(v: &mut Vec<OccRun>, room: usize, first: usize, last: usize) -> bool {
+        let n = (last - first) / Self::MAX_LEN + 1;
+        if v.len() + n > room {
+            return false;
+        }
+        let mut at = first;
+        while at <= last {
+            let end = last.min(at + Self::MAX_LEN - 1);
+            v.push(OccRun((at as u64) << 16 | (end - at) as u64));
+            at = end + 1;
+        }
+        true
+    }
+
+    fn first(self) -> usize {
+        (self.0 >> 16) as usize
+    }
+
+    fn last(self) -> usize {
+        self.first() + (self.0 & 0xffff) as usize
+    }
+}
+
+/// Cap on cached occurrence runs per scan (~32 MB of them).
+const MAX_OCC_TOTAL: usize = 4_000_000;
+
+/// Most intervals one reachable set holds (16 bytes each, so 16 MiB). Only
+/// content that repeats a short pattern for megabytes comes near it: positions
+/// that touch merge, so a run of one byte is a single interval however long.
+/// Past it the set stops growing and the scan is flagged incomplete.
+const MAX_REACH: usize = 1 << 20;
+
+/// Add the reachable positions `lo..=hi` to `out`, extending its last
+/// interval when they touch it. `false`, with the scan flagged incomplete,
+/// when the set is full.
+fn reach_push(out: &mut Vec<(usize, usize)>, lo: usize, hi: usize) -> bool {
+    if let Some(last) = out.last_mut() {
+        if lo >= last.0 && lo <= last.1.saturating_add(1) {
+            last.1 = last.1.max(hi);
+            return true;
+        }
+    }
+    if out.len() >= MAX_REACH {
+        SCAN_TRUNCATED.with(|c| c.set(true));
+        return false;
+    }
+    out.push((lo, hi));
+    true
+}
+
+/// The needle starts `qa..=qb` make `qa + l..=qb + l` reachable, for one budget
+/// unit each, the way one start at a time charged them: a start is kept, then
+/// the search stops once the pool is empty.
+fn reach_starts(out: &mut Vec<(usize, usize)>, budget: &mut u64, l: usize, qa: usize, qb: usize) -> bool {
+    let count = (qb - qa + 1) as u64;
+    if count <= *budget {
+        *budget -= count;
+        return reach_push(out, qa + l, qb + l);
+    }
+    let kept = (*budget as usize).saturating_add(1);
+    *budget = 0;
+    SCAN_TRUNCATED.with(|c| c.set(true));
+    reach_push(out, qa + l, qa + kept - 1 + l);
+    false
+}
+
+/// Every start of `pat` in `hay` from `lo` to `qmax` (a start the whole needle
+/// fits after), overlapping and ascending, as intervals of consecutive starts:
+/// `f(first, last)`, which stops the search by returning `false`, as does a
+/// `false` return.
+///
+/// One searcher serves every search after the first rather than one per
+/// occurrence. Inside a run of the byte a needle made of one byte repeats,
+/// every start follows the one before, so the whole run is one interval found
+/// by one search.
+fn for_each_occurrence<H: ByteSource + ?Sized>(
+    hay: &H,
+    pat: &[u8],
+    lo: usize,
+    qmax: usize,
+    mut f: impl FnMut(usize, usize) -> bool,
+) -> bool {
+    let l = pat.len();
+    let end = qmax + l;
+    let uniform = pat.iter().all(|&b| b == pat[0]);
+    // The last start of the run of occurrences from `q`.
+    let last_of = |q: usize| {
+        let mut last = q;
+        // Most occurrences are not followed by another: one byte says so.
+        if uniform && q + l < end && byte_at(hay, q + l) == pat[0] {
+            hay.chunks(q + l, end, &mut |_, chunk| {
+                let same = chunk.iter().take_while(|&&b| b == pat[0]).count();
+                last += same;
+                same == chunk.len()
+            });
+        }
+        last
+    };
+    // Built once a second search is needed: a window with one occurrence or
+    // none, which is most of what verifies search, keeps the plain search and
+    // its cheaper path for short haystacks.
+    let mut finder = None;
+    let mut from = lo;
+    while from <= qmax {
+        let found = match hay.as_slice() {
+            Some(s) if from > lo => finder
+                .get_or_insert_with(|| memchr::memmem::Finder::new(pat))
+                .find(&s[from..end])
+                .map(|r| from + r),
+            _ => hay.find(pat, from, end),
+        };
+        let Some(q) = found else {
+            return true;
+        };
+        let last = last_of(q);
+        if !f(q, last) {
+            return false;
+        }
+        from = last + 1;
+    }
+    true
+}
+
+impl OccCache {
+    fn new() -> Self {
+        Self::with_cap(MAX_OCC_TOTAL)
+    }
+
+    /// A memo allowed `cap` cached runs. `0` refuses every token, forcing
+    /// the direct search, which is how the differential tests reach that path
+    /// on the small buffers they generate.
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            cs: std::collections::HashMap::new(),
+            ci: std::collections::HashMap::new(),
+            total: 0,
+            cap,
+        }
+    }
+
+    /// Hand `f` the occurrences of `needle` (in `lower` when `nocase`: same
+    /// length, so positions line up with `buf`) whose start lies in
+    /// `lo..=qmax`, as runs of starts clipped to it, ascending. `None` when the
+    /// token is not memoised, and nothing was handed over: the caller searches
+    /// directly. Otherwise whether `f` let the walk reach the end.
+    ///
+    /// Every block the range covers is searched before anything is handed
+    /// over, so a token refused midway has reported nothing twice.
+    #[allow(clippy::too_many_arguments)]
+    fn visit<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
+        &mut self,
+        buf: &B,
+        lower: &L,
+        needle: &[u8],
+        nocase: bool,
+        lo: usize,
+        qmax: usize,
+        mut f: impl FnMut(usize, usize) -> bool,
+    ) -> Option<bool> {
+        if self.cap == 0 {
+            return None;
+        }
+        let map = if nocase { &mut self.ci } else { &mut self.cs };
+        // Looked up by borrowed slice, so a hit allocates nothing.
+        if !map.contains_key(needle) {
+            map.insert(needle.into(), OccEntry::Blocks(Default::default()));
+        }
+        let entry = map.get_mut(needle)?;
+        let OccEntry::Blocks(blocks) = entry else {
+            return None;
+        };
+        let last_start = buf.len() - needle.len();
+        let range = lo / OCC_BLOCK..=qmax / OCC_BLOCK;
+        let mut folded = None;
+        for b in range.clone() {
+            if blocks.contains_key(&b) {
+                continue;
+            }
+            // Bounded by what is left of the cap, so what the cap exists to
+            // bound cannot be built oversized first and measured after.
+            let room = self.cap - self.total.min(self.cap);
+            let (s0, s1) = (b * OCC_BLOCK, ((b + 1) * OCC_BLOCK - 1).min(last_start));
+            let mut runs = Vec::new();
+            let mut push = |q: usize, last: usize| OccRun::push(&mut runs, room, q, last);
+            let whole = if nocase {
+                let pat = folded.get_or_insert_with(|| needle.to_ascii_lowercase());
+                for_each_occurrence(lower, pat, s0, s1, &mut push)
+            } else {
+                for_each_occurrence(buf, needle, s0, s1, &mut push)
+            };
+            if !whole || runs.len() + OCC_BLOCK_COST > room {
+                *entry = OccEntry::Failed;
+                return None;
+            }
+            self.total += runs.len() + OCC_BLOCK_COST;
+            blocks.insert(b, runs);
+        }
+        for b in range {
+            let runs = &blocks[&b];
+            let first = runs.partition_point(|r| r.last() < lo);
+            for r in runs[first..].iter().take_while(|r| r.first() <= qmax) {
+                if !f(r.first().max(lo), r.last().min(qmax)) {
+                    return Some(false);
+                }
+            }
+        }
+        Some(true)
+    }
+}
+
 /// Advance a reachable set across a literal `needle` (length ≥ 1): for every
 /// start position `q` in the set with `buf[q..q+L] == needle` (ASCII-folded when
 /// `nocase`), the position `q+L` is reachable next. `nocase` searches the
@@ -3338,14 +4712,21 @@ fn coalesce(ivs: &mut Vec<(usize, usize)>) {
 /// budget unit per source interval plus one per occurrence found; on exhaustion
 /// it flags truncation and returns whatever was found so the scan is never a
 /// silent clean.
-fn advance_literal(
+///
+/// Occurrences come from the per-scan [`OccCache`] (each block of the object
+/// searched once per token per scan) rather than a fresh `memmem` per
+/// interval, which is what made repeated-anchor verifies rescan the same
+/// suffixes thousands of times.
+#[allow(clippy::too_many_arguments)]
+fn advance_literal<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
     cur: &[(usize, usize)],
-    buf: &[u8],
-    lower: &[u8],
+    buf: &B,
+    lower: &L,
     needle: &[u8],
     nocase: bool,
     out: &mut Vec<(usize, usize)>,
     budget: &mut u64,
+    occ: &mut OccCache,
 ) {
     let n = buf.len();
     let l = needle.len();
@@ -3353,14 +4734,53 @@ fn advance_literal(
         return;
     }
     let last_start = n - l; // greatest position a length-l needle can start at
-    let (hay, folded);
-    if nocase {
-        folded = needle.to_ascii_lowercase();
-        hay = (lower, folded.as_slice());
-    } else {
-        hay = (buf, needle);
+    for (k, &(lo, hi)) in cur.iter().enumerate() {
+        if lo > last_start {
+            continue;
+        }
+        if *budget == 0 {
+            SCAN_TRUNCATED.with(|c| c.set(true));
+            return;
+        }
+        *budget -= 1;
+        let qmax = hi.min(last_start);
+        // Ascending, so `out` keeps the order the direct search produces
+        // (matters only for determinism of downstream first-match offsets,
+        // which read minima).
+        let visit = |a, b| reach_starts(out, budget, l, a, b);
+        match occ.visit(buf, lower, needle, nocase, lo, qmax, visit) {
+            Some(true) => continue,
+            Some(false) => return,
+            None => {}
+        }
+        // Not memoised: this interval and the rest are searched directly,
+        // this one's unit already charged.
+        *budget += 1;
+        advance_literal_direct(&cur[k..], buf, lower, needle, nocase, out, budget);
+        return;
     }
-    let (haystack, pat) = hay;
+}
+
+/// [`advance_literal`] with a `memmem` search per interval.
+#[allow(clippy::too_many_arguments)]
+fn advance_literal_direct<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
+    cur: &[(usize, usize)],
+    buf: &B,
+    lower: &L,
+    needle: &[u8],
+    nocase: bool,
+    out: &mut Vec<(usize, usize)>,
+    budget: &mut u64,
+) {
+    let l = needle.len();
+    let last_start = buf.len() - l;
+    let folded;
+    let pat: &[u8] = if nocase {
+        folded = needle.to_ascii_lowercase();
+        &folded
+    } else {
+        needle
+    };
     for &(lo, hi) in cur {
         if lo > last_start {
             continue;
@@ -3373,26 +4793,16 @@ fn advance_literal(
         let qmax = hi.min(last_start);
         // Every start position `q` in `[lo, qmax]` with a needle occurrence
         // becomes the reachable position `q+L`. Occurrences are enumerated
-        // *overlapping* (advance the search cursor by 1, not by `L`) so a
-        // self-overlapping needle like `aa` in `aaa` yields every start — the
-        // reachable set is the exact union the token program admits, never a
-        // non-overlapping subset.
-        let end = qmax + l; // slice bound past the last admissible start
-        let mut s = lo;
-        while s <= qmax {
-            match memchr::memmem::find(&haystack[s..end], pat) {
-                Some(off) => {
-                    let q = s + off; // q <= qmax by construction of `end`
-                    out.push((q + l, q + l));
-                    if *budget == 0 {
-                        SCAN_TRUNCATED.with(|c| c.set(true));
-                        return;
-                    }
-                    *budget -= 1;
-                    s = q + 1;
-                }
-                None => break,
-            }
+        // *overlapping*, so a self-overlapping needle like `aa` in `aaa` yields
+        // every start: the reachable set is the exact union the token program
+        // admits, never a non-overlapping subset.
+        let whole = if nocase {
+            for_each_occurrence(lower, pat, lo, qmax, |qa, qb| reach_starts(out, budget, l, qa, qb))
+        } else {
+            for_each_occurrence(buf, pat, lo, qmax, |qa, qb| reach_starts(out, budget, l, qa, qb))
+        };
+        if !whole {
+            return;
         }
     }
 }
@@ -3403,11 +4813,11 @@ fn advance_literal(
 /// per position scanned for the nibble classes.
 /// Advance over an alternation whose branches carry nibble wildcards. Unlike a
 /// literal branch there is no substring search to lean on, so every start
-/// position in the reachable set is tested against every branch — charged to the
+/// position in the reachable set is tested against every branch, charged to the
 /// step budget the same way a nibble class is.
-fn advance_masked_alt(
+fn advance_masked_alt<B: ByteSource + ?Sized>(
     cur: &[(usize, usize)],
-    buf: &[u8],
+    buf: &B,
     opts: &[Vec<(u8, u8)>],
     nocase: bool,
     out: &mut Vec<(usize, usize)>,
@@ -3423,7 +4833,9 @@ fn advance_masked_alt(
             // An empty branch consumes nothing: every reachable position stays
             // reachable. This is the `(abc|)` "optional run" form.
             if w == 0 {
-                out.push((lo, hi.min(n)));
+                if !reach_push(out, lo, hi.min(n)) {
+                    return;
+                }
                 continue;
             }
             if w > n {
@@ -3437,19 +4849,27 @@ fn advance_masked_alt(
                 SCAN_TRUNCATED.with(|c| c.set(true));
                 return;
             }
-            for q in lo..=qmax {
-                if masked_eq(branch, &buf[q..q + w], nocase) {
-                    out.push((q + w, q + w));
+            // A window at a time, each running `w - 1` bytes into the next so
+            // every start in it has its whole branch to compare.
+            let mut q0 = lo;
+            while q0 <= qmax {
+                let starts = (qmax - q0 + 1).min(byte_source::CHUNK);
+                let win = buf.window(q0, starts + w - 1);
+                for k in 0..starts {
+                    if masked_eq(branch, &win[k..k + w], nocase) && !reach_push(out, q0 + k + w, q0 + k + w) {
+                        return;
+                    }
                 }
+                q0 += starts;
             }
             *budget = budget.saturating_sub((qmax - lo + 1) as u64);
         }
     }
 }
 
-fn advance_class(
+fn advance_class<B: ByteSource + ?Sized>(
     cur: &[(usize, usize)],
-    buf: &[u8],
+    buf: &B,
     elem: &Elem,
     out: &mut Vec<(usize, usize)>,
     budget: &mut u64,
@@ -3465,38 +4885,43 @@ fn advance_class(
         }
         *budget -= 1;
         let qmax = hi.min(n - 1);
-        match elem {
-            Elem::AnyByte => out.push((lo + 1, qmax + 1)),
-            Elem::HiNibble(h) => {
-                for (q, &b) in (lo..=qmax).zip(&buf[lo..=qmax]) {
-                    if b >> 4 == *h {
-                        out.push((q + 1, q + 1));
-                    }
+        let (mask, want) = match *elem {
+            Elem::AnyByte => {
+                if !reach_push(out, lo + 1, qmax + 1) {
+                    return;
                 }
-                *budget = budget.saturating_sub((qmax - lo + 1) as u64);
+                continue;
             }
-            Elem::LoNibble(l) => {
-                for (q, &b) in (lo..=qmax).zip(&buf[lo..=qmax]) {
-                    if b & 0x0f == *l {
-                        out.push((q + 1, q + 1));
-                    }
-                }
-                *budget = budget.saturating_sub((qmax - lo + 1) as u64);
-            }
+            Elem::HiNibble(h) => (0xf0, h << 4),
+            Elem::LoNibble(l) => (0x0f, l),
             _ => unreachable!("advance_class only handles single-byte classes"),
+        };
+        let mut full = false;
+        buf.chunks(lo, qmax + 1, &mut |at, chunk| {
+            for (k, &b) in chunk.iter().enumerate() {
+                if b & mask == want && !reach_push(out, at + k + 1, at + k + 1) {
+                    full = true;
+                    return false;
+                }
+            }
+            true
+        });
+        if full {
+            return;
         }
+        *budget = budget.saturating_sub((qmax - lo + 1) as u64);
     }
 }
 
 /// Advance a reachable set across a negated alternation `!(o0|o1|…)`: all
 /// options share one length `l`, and a position `q` advances to `q+l` iff the
 /// `l`-byte window at `q` equals *none* of them. Each source interval shifts by
-/// `l` and then has the (few) excluded end-positions — where a window did match
-/// an option — carved out, so the result stays a compact interval set.
-fn advance_neg_alt(
+/// `l` and then has the (few) excluded end-positions, where a window did match
+/// an option, carved out, so the result stays a compact interval set.
+fn advance_neg_alt<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
     cur: &[(usize, usize)],
-    buf: &[u8],
-    lower: &[u8],
+    buf: &B,
+    lower: &L,
     opts: &[Vec<u8>],
     nocase: bool,
     out: &mut Vec<(usize, usize)>,
@@ -3511,14 +4936,13 @@ fn advance_neg_alt(
         return;
     }
     let last_start = n - l;
-    let haystack: &[u8] = if nocase { lower } else { buf };
     let folded: Vec<Vec<u8>> = if nocase {
         opts.iter().map(|o| o.to_ascii_lowercase()).collect()
     } else {
         Vec::new()
     };
     let pats: &[Vec<u8>] = if nocase { &folded } else { opts };
-    let mut excluded: Vec<usize> = Vec::new();
+    let mut excluded: Vec<(usize, usize)> = Vec::new();
     for &(lo, hi) in cur {
         if lo > last_start {
             continue;
@@ -3530,53 +4954,50 @@ fn advance_neg_alt(
         *budget -= 1;
         let qmax = hi.min(last_start);
         // End-positions of windows in [lo,qmax] that DO match an option: these
-        // are the holes punched out of the shifted interval.
+        // are the holes punched out of the shifted interval. Held as intervals,
+        // so a run of matching windows is one hole.
         excluded.clear();
-        let end = qmax + l;
         for pat in pats {
-            let mut s = lo;
-            while s <= qmax {
-                match memchr::memmem::find(&haystack[s..end], pat) {
-                    Some(off) => {
-                        let q = s + off;
-                        excluded.push(q + l);
-                        s = q + 1;
-                    }
-                    None => break,
-                }
+            let hole = |qa: usize, qb: usize| reach_push(&mut excluded, qa + l, qb + l);
+            let whole = if nocase {
+                for_each_occurrence(lower, pat, lo, qmax, hole)
+            } else {
+                for_each_occurrence(buf, pat, lo, qmax, hole)
+            };
+            if !whole {
+                return;
             }
         }
-        excluded.sort_unstable();
-        excluded.dedup();
-        *budget = budget.saturating_sub(excluded.len() as u64);
+        coalesce(&mut excluded);
+        let holes: usize = excluded.iter().map(|&(a, b)| b - a + 1).sum();
+        *budget = budget.saturating_sub(holes as u64);
         // The shifted interval [lo+l, qmax+l] minus the excluded points.
         let (a, b) = (lo + l, qmax + l);
         let mut cursor = a;
-        for &e in &excluded {
-            if e > cursor {
-                out.push((cursor, e - 1));
+        for &(e0, e1) in &excluded {
+            if e0 > cursor && !reach_push(out, cursor, e0 - 1) {
+                return;
             }
-            cursor = e + 1;
+            cursor = e1 + 1;
         }
-        if cursor <= b {
-            out.push((cursor, b));
+        if cursor <= b && !reach_push(out, cursor, b) {
+            return;
         }
     }
 }
 
 /// Advance a reachable set across a variable gap `{min,max}` (unbounded when
 /// `max` is `None`). Each interval `[lo,hi]` expands to `[lo+min,
-/// min(hi+max, n)]` — the union over every start position of its reachable gap
-/// window — clamped to the buffer length `n`.
+/// min(hi+max, n)]` (the union over every start position of its reachable gap
+/// window), clamped to the buffer length `n`.
 fn advance_gap(cur: &[(usize, usize)], min: usize, max: Option<usize>, n: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(cur.len());
     for &(lo, hi) in cur {
-        let newlo = lo + min;
-        if newlo > n {
+        let Some(newlo) = lo.checked_add(min).filter(|&l| l <= n) else {
             continue;
-        }
+        };
         let newhi = match max {
-            Some(m) => (hi + m).min(n),
+            Some(m) => hi.saturating_add(m).min(n),
             None => n,
         };
         if newlo <= newhi {
@@ -3589,18 +5010,19 @@ fn advance_gap(cur: &[(usize, usize)], min: usize, max: Option<usize>, n: usize)
 
 /// Decide whether `toks` matches `buf` starting at `pos`, by advancing a set of
 /// reachable positions element by element (see the module note above). Returns
-/// `true` iff some position remains reachable after the final element — the same
+/// `true` iff some position remains reachable after the final element: the same
 /// answer [`match_forward`] computes, without its backtracking. `budget` (the
 /// per-buffer pool) is charged the exact search work; if it is exhausted the
 /// scan is flagged truncated and a conservative `false` is returned, so an
 /// incomplete search can never be reported a silent clean.
-fn gap_split_match(
+fn gap_split_match<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
     toks: &[Elem],
-    buf: &[u8],
+    buf: &B,
     pos: usize,
     nocase: bool,
-    lower: &[u8],
+    lower: &L,
     budget: &mut u64,
+    occ: &mut OccCache,
 ) -> bool {
     let mut cur: Vec<(usize, usize)> = vec![(pos, pos)];
     let mut next: Vec<(usize, usize)> = Vec::new();
@@ -3615,7 +5037,7 @@ fn gap_split_match(
         match tok {
             Elem::Bytes(b) => {
                 next.clear();
-                advance_literal(&cur, buf, lower, b, nocase, &mut next, budget);
+                advance_literal(&cur, buf, lower, b, nocase, &mut next, budget, occ);
                 coalesce(&mut next);
                 std::mem::swap(&mut cur, &mut next);
             }
@@ -3624,12 +5046,12 @@ fn gap_split_match(
                 for o in opts {
                     // An empty branch is the `(abc|)` optional-run form: it
                     // consumes nothing, so every reachable position stays
-                    // reachable. `advance_literal` cannot express that — it
+                    // reachable. `advance_literal` cannot express that: it
                     // searches for a needle, and there is none.
                     if o.is_empty() {
                         next.extend_from_slice(&cur);
                     } else {
-                        advance_literal(&cur, buf, lower, o, nocase, &mut next, budget);
+                        advance_literal(&cur, buf, lower, o, nocase, &mut next, budget, occ);
                     }
                 }
                 coalesce(&mut next);
@@ -3707,26 +5129,27 @@ fn set_contains(ivs: &[(usize, usize)], p: usize) -> bool {
 ///  1. **Reachability (forward).** `reach[i]` is the set of positions at which
 ///     `toks[..i]` can finish, seeded with every position the pattern start could
 ///     possibly occupy. `reach[i]` is therefore exactly "the positions from which
-///     the remaining leftward tokens can still complete" — the fact the
+///     the remaining leftward tokens can still complete": the fact the
 ///     backtracking walk rediscovers by trial and error at every gap. Computed
 ///     with the same interval-set machinery as [`gap_split_match`], so an
 ///     unbounded gap is one interval expansion rather than a per-length loop.
 ///  2. **Reconstruction (backward).** Walk the tokens last-to-first, at each step
-///     taking the *first* choice the backtracking walk would have taken — for a
-///     gap the shortest length, for an alternation the earliest option — but
+///     taking the *first* choice the backtracking walk would have taken (for a
+///     gap the shortest length, for an alternation the earliest option), but
 ///     accepting it only if it lands in `reach[i]`. Same exploration order plus
 ///     perfect lookahead, so the first solution found is the same one, reached
 ///     without ever exploring a dead branch.
 ///
 /// Polynomial in the buffer and token count, so it draws from the simulator pool
 /// rather than the tight backtracking pool.
-fn gap_split_match_backward(
+fn gap_split_match_backward<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
     toks: &[Elem],
-    buf: &[u8],
+    buf: &B,
     end: usize,
     nocase: bool,
-    lower: &[u8],
+    lower: &L,
     budget: &mut u64,
+    occ: &mut OccCache,
 ) -> Option<usize> {
     if toks.is_empty() {
         return Some(end); // no preceding context: the pattern starts at `end`
@@ -3752,7 +5175,7 @@ fn gap_split_match_backward(
         let mut next = Vec::new();
         match tok {
             Elem::Bytes(b) => {
-                advance_literal(cur, buf, lower, b, nocase, &mut next, budget);
+                advance_literal(cur, buf, lower, b, nocase, &mut next, budget, occ);
                 coalesce(&mut next);
             }
             Elem::Alt { opts, neg: false } => {
@@ -3760,7 +5183,7 @@ fn gap_split_match_backward(
                     if o.is_empty() {
                         next.extend_from_slice(cur);
                     } else {
-                        advance_literal(cur, buf, lower, o, nocase, &mut next, budget);
+                        advance_literal(cur, buf, lower, o, nocase, &mut next, budget, occ);
                     }
                 }
                 coalesce(&mut next);
@@ -3792,10 +5215,10 @@ fn gap_split_match_backward(
         let need = reach[i].as_slice();
         let q = match &toks[i] {
             // Fixed-width tokens have a single predecessor. It is necessarily in
-            // `reach[i]` — the forward pass only produced `cur` from it — so the
+            // `reach[i]` (the forward pass only produced `cur` from it), so the
             // membership check is a debug-only assertion.
             Elem::Bytes(b) => {
-                if cur < b.len() || !bytes_eq(&buf[cur - b.len()..cur], b, nocase) {
+                if cur < b.len() || !bytes_eq(&buf.window(cur - b.len(), b.len()), b, nocase) {
                     return None;
                 }
                 cur - b.len()
@@ -3807,13 +5230,13 @@ fn gap_split_match_backward(
                 cur - 1
             }
             Elem::HiNibble(h) => {
-                if cur == 0 || buf[cur - 1] >> 4 != *h {
+                if cur == 0 || byte_at(buf, cur - 1) >> 4 != *h {
                     return None;
                 }
                 cur - 1
             }
             Elem::LoNibble(l) => {
-                if cur == 0 || buf[cur - 1] & 0x0f != *l {
+                if cur == 0 || byte_at(buf, cur - 1) & 0x0f != *l {
                     return None;
                 }
                 cur - 1
@@ -3823,14 +5246,14 @@ fn gap_split_match_backward(
                 if l == 0 || cur < l {
                     return None;
                 }
-                let w = &buf[cur - l..cur];
-                if opts.iter().any(|o| bytes_eq(o, w, nocase)) {
+                let w = buf.window(cur - l, l);
+                if opts.iter().any(|o| bytes_eq(o, &w, nocase)) {
                     return None;
                 }
                 cur - l
             }
             // The backtracking walk tries gap lengths ascending from `min`, so it
-            // takes the shortest gap that still admits a full match — i.e. the
+            // takes the shortest gap that still admits a full match, i.e. the
             // *greatest* reachable position in `[cur - hi, cur - min]`. One
             // binary search replaces that loop.
             Elem::Gap { min, max } => {
@@ -3846,7 +5269,7 @@ fn gap_split_match_backward(
                 let mut found = None;
                 for o in opts {
                     if cur >= o.len()
-                        && bytes_eq(&buf[cur - o.len()..cur], o, nocase)
+                        && bytes_eq(&buf.window(cur - o.len(), o.len()), o, nocase)
                         && set_contains(need, cur - o.len())
                     {
                         found = Some(cur - o.len());
@@ -3859,7 +5282,7 @@ fn gap_split_match_backward(
                 let mut found = None;
                 for o in opts {
                     if cur >= o.len()
-                        && masked_eq(o, &buf[cur - o.len()..cur], nocase)
+                        && masked_eq(o, &buf.window(cur - o.len(), o.len()), nocase)
                         && set_contains(need, cur - o.len())
                     {
                         found = Some(cur - o.len());
@@ -3890,12 +5313,226 @@ enum Cmp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grams::{anchor_score, MIN_SKIP_RUN, NO_RUN_COLLAPSE, SWEEP_WINDOW};
 
+    thread_local! {
+        /// Builds on this thread pin no body: the reference the pinned
+        /// bodies' checks are held to.
+        pub(super) static NO_PINS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A body its offset pins is found where it matches, and only there, as
+    /// the sweep found it: at a fixed offset, in a window stepped through or
+    /// searched, from the end, the entry point or a section, in either case,
+    /// and as a logical signature's subsignature.
+    #[test]
+    fn pinned_bodies_match_as_swept_ones_did() {
+        let mut rng = Rng(0x5EED_0F0F_F5E7);
+        let layout = PeLayout {
+            entry: Some(700),
+            section_rawptrs: vec![512, 1500],
+            section_rawsizes: vec![988, 2000],
+            version_info: Vec::new(),
+        };
+        let lits: [&[u8]; 6] = [b"\x00\x00\x00", b"\x00\x00", b"MZ\x90\x00", b"abc", b"\xff\xfe\x00\x00\x00\x00\x00\x01", b"Ab"];
+        let mut ndb = String::new();
+        let mut ldb = String::new();
+        for i in 0..300 {
+            let lit = lits[rng.below(lits.len())];
+            let hex: String = lit.iter().map(|b| format!("{b:02x}")).collect();
+            let off = match rng.below(9) {
+                0 => "0".to_string(),
+                1 => format!("{}", rng.below(3000)),
+                2 => format!("{},{}", rng.below(3000), 1 + rng.below(60)),
+                3 => format!("{},{}", rng.below(3000), 100 + rng.below(3000)),
+                4 => format!("EOF-{}", 1 + rng.below(3000)),
+                5 => format!("EP+{}", rng.below(40)),
+                6 => format!("EP-{},{}", rng.below(40), rng.below(80)),
+                7 => format!("S{}+{}", rng.below(2), rng.below(100)),
+                _ => format!("SL+{},{}", rng.below(100), rng.below(200)),
+            };
+            let body = match rng.below(3) {
+                0 => hex.clone(),
+                1 => format!("{hex}??{hex}"),
+                _ => format!("{hex}{{1-4}}{hex}"),
+            };
+            match rng.below(3) {
+                0 => {
+                    let nocase = if rng.below(2) == 0 { "::i" } else { "" };
+                    ldb.push_str(&format!("L.{i};Engine:51-255,Target:1;0&1;{off}:{body}{nocase};6d61726b\n"));
+                }
+                _ => ndb.push_str(&format!("N.{i}:1:{off}:{body}\n")),
+            }
+        }
+        let build = |no_pins: bool| {
+            NO_PINS.set(no_pins);
+            let mut b = EngineBuilder::new();
+            b.add_ndb(&ndb, false);
+            b.add_ldb(&ldb, false);
+            let e = b.build();
+            NO_PINS.set(false);
+            e
+        };
+        let (with, without) = (build(false), build(true));
+        assert!(with.pins.bodies().count() > 150 && without.pins.bodies().count() == 0);
+        let mut matched = 0;
+        for round in 0..40 {
+            let mut hay = vec![b'.'; 3500];
+            for _ in 0..60 {
+                let lit = lits[rng.below(lits.len())];
+                let at = rng.below(hay.len() - 2 * lit.len() - 4);
+                hay[at..at + lit.len()].copy_from_slice(lit);
+                if rng.below(2) == 0 {
+                    hay[at + lit.len() + 1..at + 2 * lit.len() + 1].copy_from_slice(lit);
+                }
+            }
+            hay.extend_from_slice(b"mark");
+            for ly in [Some(&layout), None] {
+                let all = |e: &SigEngine| {
+                    let mut out = Vec::new();
+                    e.scan_all_with_layout(&hay, FileType::Pe, ly, None, &mut out);
+                    out.sort();
+                    out
+                };
+                let want = all(&without);
+                matched += want.len();
+                assert_eq!(all(&with), want, "round {round}, layout {}", ly.is_some());
+            }
+        }
+        assert!(matched > 500, "{matched}");
+    }
+
+    /// Every `(body, start)` a scan's sweep of `hay` as `ft` hands on, and in
+    /// how many reports.
+    fn body_hits<H: ByteSource + ?Sized>(e: &SigEngine, hay: &H, ft: FileType) -> (Vec<(u32, usize)>, usize) {
+        let active = e.active(ft, false);
+        let (mut out, mut reports) = (Vec::new(), 0);
+        sweep(&e.grams, &active, hay, &mut |pidx, value, start, _, count| {
+            reports += 1;
+            for &b in e.partitions[pidx].groups.get(value) {
+                out.extend((start..start + count).map(|s| (b, s)));
+            }
+            true
+        });
+        out.sort_unstable();
+        (out, reports)
+    }
+
+    /// Every `(body, start)` of the anchors `partition` chose, searched for
+    /// one by one: what the index has to find.
+    fn searched_hits(e: &SigEngine, anchors: &[(u32, bool, u32, Vec<u8>)], hay: &[u8], ft: FileType) -> Vec<(u32, usize)> {
+        let active = e.active(ft, false);
+        let mut out = Vec::new();
+        for (part, nocase, value, a) in anchors {
+            if !active[*part as usize] || a.len() > hay.len() {
+                continue;
+            }
+            for s in 0..=hay.len() - a.len() {
+                let w = &hay[s..s + a.len()];
+                if (*nocase && w.eq_ignore_ascii_case(a)) || (!*nocase && w == &a[..]) {
+                    out.extend(e.partitions[*part as usize].groups.get(*value).iter().map(|&b| (b, s)));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The anchor index finds every anchor at every place it occurs, in its
+    /// case and for its file types, and nowhere else: in memory or read
+    /// through a cache, across windows, at the edges and inside runs, where
+    /// an anchor of the run's byte comes as a few reports.
+    #[test]
+    fn indexed_anchors_are_found_wherever_they_occur() {
+        let mut rng = Rng(0x0DDB_A11C_AFE0_1234);
+        let alpha = b"ab\x00Zz";
+        let mut ndb = String::new();
+        let mut ldb = String::new();
+        let mut anchors = Vec::new();
+        let mut any_type = Vec::new();
+        for i in 0..400 {
+            let len = 2 + rng.below(14);
+            let lit: Vec<u8> = (0..len).map(|_| alpha[rng.below(alpha.len())]).collect();
+            let hex: String = lit.iter().map(|b| format!("{b:02x}")).collect();
+            let target = [0, 1, 3, 7][rng.below(4)];
+            match rng.below(4) {
+                0 => ldb.push_str(&format!("L.{i};Engine:51-255,Target:{target};0;{hex}::i\n")),
+                1 => ndb.push_str(&format!("W.{i}:{target}:*:{hex}??{hex}\n")),
+                _ => ndb.push_str(&format!("N.{i}:{target}:*:{hex}\n")),
+            }
+            if target == 0 && lit.len() >= 6 && lit.iter().any(|&c| c != lit[0]) {
+                any_type.push(lit.clone());
+            }
+            anchors.push(lit);
+        }
+        // Anchors that start inside a run of zeros, found at its last
+        // positions, and anchors of one repeated byte, of every width.
+        ndb.push_str("E.1:0:*:0000000000ab\nE.2:0:*:00000000abcd\nE.3:0:*:000000abcdef\n");
+        ndb.push_str("U.1:0:*:0000\nU.2:0:*:000000\nU.3:0:*:00000000\nU.4:0:*:0000000000000000000000\n");
+        ldb.push_str("U.5;Engine:51-255,Target:0;0;6161::i\nU.6;Engine:51-255,Target:0;0;4141414141414141\n");
+        let builder = || {
+            let mut b = EngineBuilder::new();
+            b.add_ndb(&ndb, false);
+            b.add_ldb(&ldb, false);
+            b
+        };
+        let e = builder().build();
+        let (_, chosen, _, _) = builder().partition();
+        // Anchors placed at every offset around window seams, and runs that
+        // end in anchors, one of them past a seam.
+        let longs: Vec<&Vec<u8>> = any_type.iter().take(20).collect();
+        let mut seams = vec![b'.'; 40 * SWEEP_WINDOW];
+        for (k, d) in (1..40).map(|k| (k, k % 20)) {
+            let a = longs[k % longs.len()];
+            let at = k * SWEEP_WINDOW - d;
+            seams[at..at + a.len()].copy_from_slice(a);
+        }
+        seams.extend(std::iter::repeat_n(0u8, 2 * SWEEP_WINDOW));
+        seams.extend_from_slice(longs[0]);
+        for run in [300, 2 * SWEEP_WINDOW + 7] {
+            seams.extend(std::iter::repeat_n(0u8, run));
+            seams.extend_from_slice(b"\xab\xcd\xef.");
+        }
+        seams.extend(std::iter::repeat_n(b'A', 3 * SWEEP_WINDOW + 5));
+        seams.extend(std::iter::repeat_n(b'a', 200));
+        let cache = byte_source::BlockCache::with_sizes(std::io::Cursor::new(seams.clone()), 97, 8 * 97).unwrap();
+        for ft in [FileType::Unknown, FileType::Pe] {
+            let want = searched_hits(&e, &chosen, &seams, ft);
+            assert!(want.len() > 20, "{}", want.len());
+            let (got, reports) = body_hits(&e, &seams[..], ft);
+            assert_eq!(got, want, "seams {ft:?}");
+            assert!(reports < want.len() / 50, "{reports} reports for {} hits", want.len());
+            assert_eq!(body_hits(&e, &cache, ft).0, want, "seams {ft:?}, read through a cache");
+        }
+        for round in 0..6 {
+            let mut hay = Vec::new();
+            while hay.len() < 5000 {
+                match rng.below(8) {
+                    0 => hay.extend(std::iter::repeat_n(0u8, 50 + rng.below(3000))),
+                    1 => {
+                        let a = &anchors[rng.below(anchors.len())];
+                        hay.extend(a.iter().map(|&c| if rng.below(2) == 0 { c.to_ascii_uppercase() } else { c }));
+                    }
+                    2 => hay.extend_from_slice(&anchors[rng.below(anchors.len())]),
+                    _ => hay.push(alpha[rng.below(alpha.len())]),
+                }
+            }
+            let cache = byte_source::BlockCache::with_sizes(std::io::Cursor::new(hay.clone()), 511, 8 * 511).unwrap();
+            for ft in [FileType::Unknown, FileType::Pe, FileType::Html, FileType::Text] {
+                let want = searched_hits(&e, &chosen, &hay, ft);
+                assert!(!want.is_empty());
+                assert_eq!(body_hits(&e, &hay[..], ft).0, want, "round {round} {ft:?}");
+                assert_eq!(body_hits(&e, &cache, ft).0, want, "round {round} {ft:?}, read through a cache");
+            }
+        }
+    }
+
+    #[cfg(feature = "image-hash")]
     #[test]
     fn fuzzy_img_ldb_fires_despite_target5_gate() {
         // Regression: a `fuzzy_img#` signature is written `Target:5` (graphics),
         // a type exav doesn't model, so `target_ok(5)` is false and the sig used
-        // to be dropped — even though the perceptual hash matched exactly. Now a
+        // to be dropped, even though the perceptual hash matched exactly. Now a
         // fuzzy sig fires on an image regardless of the Target:5 gate.
         let mut img = image::RgbImage::new(64, 64);
         for (x, y, p) in img.enumerate_pixels_mut() {
@@ -3905,11 +5542,14 @@ mod tests {
         {
             use image::ImageEncoder;
             image::codecs::png::PngEncoder::new(&mut png)
-                .write_image(img.as_raw(), 64, 64, image::ColorType::Rgb8)
+                .write_image(img.as_raw(), 64, 64, image::ExtendedColorType::Rgb8)
                 .unwrap();
         }
-        let hash = crate::fuzzy_img::phash(&png).expect("image hashes");
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let h = exav_imagehash::Hasher::new(exav_imagehash::Preset::ClamAv)
+            .hash(&png)
+            .expect("image hashes");
+        let hex = h.to_string();
+        let hash: [u8; 8] = h.to_bytes().try_into().expect("64 bits");
 
         let mut b = EngineBuilder::new();
         b.add_ldb(
@@ -3959,6 +5599,79 @@ mod tests {
         let mut b = EngineBuilder::new();
         b.add_ndb(line, false);
         b.build()
+    }
+
+    /// A signature file is not trusted: numbers in it at the top of their range
+    /// must be refused or clamped, never added to something.
+    #[test]
+    fn a_gap_as_wide_as_usize_matches_nothing_and_does_not_overflow() {
+        let e = ndb("T.Gap:0:*:4142{18446744073709551615-}4344");
+        assert!(e.scan(b"zzABzzCDzz", FileType::Unknown).is_none());
+        let e = ndb("T.Gap2:0:*:4142{0-18446744073709551615}4344");
+        assert!(e.scan(b"zzABzzCDzz", FileType::Unknown).is_some());
+    }
+
+    #[test]
+    fn an_offset_from_the_entry_point_of_i64_min_matches_nothing() {
+        let e = ndb("T.Ep:0:EP-9223372036854775808:4142");
+        let layout = PeLayout {
+            entry: Some(4),
+            section_rawptrs: vec![0],
+            section_rawsizes: vec![16],
+            version_info: Vec::new(),
+        };
+        assert!(e.scan_with_layout(b"zzzzABzzzzzzzzzz", FileType::Unknown, Some(&layout), None).is_none());
+    }
+
+    #[test]
+    fn a_byte_comparison_with_an_offset_of_i64_max_matches_nothing() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb("L.Cmp2;Engine:51-255,Target:0;0&1;41414141;0(>>9223372036854775807#ib4#=1)", false);
+        let e = b.build();
+        assert!(e.scan(b"zzAAAAzzzzzz", FileType::Unknown).is_none());
+    }
+
+    #[test]
+    fn a_byte_comparison_with_an_offset_of_i64_min_loads_and_matches_nothing() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb("L.Cmp;Engine:51-255,Target:0;0&1;41414141;0(<<-9223372036854775808#ib4#=1)", false);
+        let e = b.build();
+        assert!(e.scan(b"zzAAAAzzzzzz", FileType::Unknown).is_none());
+    }
+
+    /// Past [`MAX_BUFFERED_HITS`] the sweep stops buffering its hits and
+    /// verifies them as they come, ungated: the same signatures match, first
+    /// or all, wherever the buffer overflows.
+    #[test]
+    fn a_full_hit_buffer_changes_no_answer() {
+        let mut b = EngineBuilder::new();
+        b.add_ndb("N.Run:0:*:41414141??41", false);
+        b.add_ndb("N.Tail:0:*:5a5a5a5a", false);
+        b.add_ldb("L.Two;Engine:51-255,Target:0;0&1;42424242;43434343", false);
+        b.add_ldb("L.None;Engine:51-255,Target:0;0&1;42424242;44444444", false);
+        let e = b.build();
+        let mut buf = Vec::new();
+        for k in 0..500 {
+            buf.extend_from_slice(b"AAAA");
+            buf.push(b'0' + (k % 10) as u8);
+            buf.extend_from_slice(b"A..");
+        }
+        buf.extend_from_slice(b"..BBBB..CCCC..ZZZZ");
+        let answers = |cap: usize| {
+            BUFFERED_HITS_CAP.set(cap);
+            let first = e.scan(&buf, FileType::Unknown).map(|(n, o, _)| (n, o));
+            let mut all = Vec::new();
+            e.scan_all_with_layout(&buf, FileType::Unknown, None, None, &mut all);
+            all.sort();
+            BUFFERED_HITS_CAP.set(MAX_BUFFERED_HITS);
+            (first, all)
+        };
+        let want = answers(MAX_BUFFERED_HITS);
+        let names: Vec<_> = want.1.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, ["L.Two", "N.Run", "N.Tail"]);
+        for cap in [0, 1, 7, 250] {
+            assert_eq!(answers(cap), want, "cap {cap}");
+        }
     }
 
     /// Decode hex (whitespace ignored) so test buffers hold the real bytes a
@@ -4038,13 +5751,24 @@ mod tests {
     }
 
     #[test]
-    fn text_target_scoped_to_text_not_binary() {
-        // A text-target (7) signature runs on `Text` content but NOT on a PE
-        // (false positive) nor on binary `Unknown` — ClamAV types text vs binary.
+    fn text_target_scoped_to_the_text_view() {
+        // A text-target (7) signature matches the normalised text view, not
+        // raw bytes of any type: not a PE, not binary `Unknown`, and not the
+        // text itself, whose raw case is not the view's.
         let e = ndb("X:7:*:68656c6c6f"); // "hello"
-        assert!(e.scan(b"hello", FileType::Text).is_some());
+        assert!(e.scan(b"hello", FileType::TextView).is_some());
+        assert!(e.scan(b"hello", FileType::Text).is_none());
         assert!(e.scan(b"hello", FileType::Pe).is_none());
         assert!(e.scan(b"hello", FileType::Unknown).is_none());
+        // HTML (3) matches the HTML view alone, mail (4) a mail's raw bytes.
+        let h = ndb("X:3:*:68656c6c6f");
+        assert!(h.scan(b"hello", FileType::HtmlView).is_some());
+        assert!(h.scan(b"hello", FileType::Html).is_none());
+        assert!(h.scan(b"hello", FileType::Rtf).is_none());
+        let m = ndb("X:4:*:68656c6c6f");
+        assert!(m.scan(b"hello", FileType::Email).is_some());
+        assert!(m.scan(b"hello", FileType::Text).is_none());
+        assert!(m.scan(b"hello", FileType::TextView).is_none());
         // A PE-target (1) signature still works on a PE.
         let pe = ndb("X:1:*:cafebabe");
         assert!(pe.scan(&hx("cafebabe"), FileType::Pe).is_some());
@@ -4090,7 +5814,7 @@ mod tests {
     #[test]
     fn gap_then_literal_backtracks_to_later_occurrence() {
         // aabb{0-20}ccdd??ff: anchor is "aabb"; after the gap the literal "ccdd"
-        // appears twice — the first is NOT followed by `..ff`, the second is.
+        // appears twice: the first is NOT followed by `..ff`, the second is.
         // The memmem fast path must try BOTH occurrences (not just the first).
         let mut b = EngineBuilder::new();
         b.add_ndb("S.Multi:0:*:aabb{0-20}ccdd??ff", false);
@@ -4174,13 +5898,13 @@ mod tests {
     #[test]
     fn pcre_backreference_via_fancy_regex() {
         // A PCRE subsig using a backreference: the linear `regex` engine can't
-        // compile it, so the trigger-gated fancy-regex fallback (latin-1 byte
-        // mapping) handles it — over BINARY content, not just text.
+        // compile it, so the trigger-gated fancy-regex fallback handles it,
+        // over BINARY content, not just text.
         let mut b = EngineBuilder::new();
         assert!(b.add_ldb_line("Test.Backref;Target:0;0&1;4141;0/(.)\\1\\1/", false).is_ok());
         let e = b.build();
         // Binary buffer (has a NUL + high bytes) containing "AAA": both the
-        // anchor "AA" and the triple-backref `(.)\1\1` match via the byte mapping.
+        // anchor "AA" and the triple-backref `(.)\1\1` match.
         assert!(e.scan(b"\x00\xffAAA\x80", FileType::Unknown).is_some());
         // "AAB": anchor matches but the triple-backref does not.
         assert!(e.scan(b"\x00\xffAAB\x80", FileType::Unknown).is_none());
@@ -4204,6 +5928,190 @@ mod tests {
             elapsed.as_secs() < 3,
             "backtracking must be bounded, took {elapsed:?}"
         );
+    }
+
+    /// Whether a logical signature whose PCRE subsig is `/pcre/flags` fires
+    /// on `MARK ` followed by `payload`.
+    fn pcre_fires(pcre: &str, flags: &str, payload: &[u8]) -> bool {
+        let mut b = EngineBuilder::new();
+        let line = format!("T.Pcre;Engine:81-255,Target:0;0&1;4d41524b;0/{pcre}/{flags}");
+        assert!(b.add_ldb_line(&line, false).is_ok(), "{line}");
+        let buf = [b"MARK ".as_slice(), payload].concat();
+        b.build().scan(&buf, FileType::Unknown).is_some()
+    }
+
+    /// Each answer is clamscan 1.5.4's on the same signature and bytes: PCRE
+    /// without UTF, a byte per character, classes and case over ASCII.
+    #[test]
+    fn pcre_matches_bytes_as_clamav_does() {
+        let cases: &[(&str, &str, &[u8], bool)] = &[
+            (r"\xe9t\xe9", "", b"\xe9t\xe9", true),
+            (r"\xe9t\xe9", "", b"\xc3\xa9t\xc3\xa9", false),
+            (r"\x{e9}t", "", b"\xe9t", true),
+            (r"a.b", "", b"a\xffb", true),
+            (r"a.b", "", b"a\xc3\xa9b", false),
+            (r"\xc9t", "i", b"\xe9t", false),
+            (r"\xc9t", "i", b"\xc9t", true),
+            (r"a\Wb", "", b"a\xe9b", true),
+            (r"x[^a]y", "", b"x\xffy", true),
+            (r"x[\x80-\xff]y", "", b"x\xc3\xa9y", false),
+            (r"x[\22]y", "", b"x\x12y", true),
+            (r"x\0y", "", b"x\x00y", true),
+            (r"\<rel", "", b" rel", false),
+            (r"svg>$", "", b"</svg>\n", true),
+            (r"svg>$", "", b"</svg>\n\n", false),
+            // The backtracking engine, for lookaround and back references.
+            (r"(?<=\xe9)t", "", b"\xe9t", true),
+            (r"t(?=\xe9)", "", b"t\xe9", true),
+            (r"(\xe9)x\1", "", b"\xe9x\xe9", true),
+            (r"(?=a)a.b", "", b"a\xffb", true),
+            (r"(?=s)svg>$", "", b"</svg>\n", true),
+        ];
+        for &(pcre, flags, payload, want) in cases {
+            assert_eq!(pcre_fires(pcre, flags, payload), want, "/{pcre}/{flags} on {payload:?}");
+        }
+    }
+
+    /// Each PCRE flag letter, read from the signature itself, changes the
+    /// match as PCRE2 has it: `i` caseless, `m` multiline, `s` dot-all, `x`
+    /// extended (pattern whitespace ignored), `E` dollar-end-only (`$` no
+    /// longer matches before a final newline).
+    #[test]
+    fn pcre_flag_letters_mean_what_pcre2_says() {
+        let fires = |sub: &str, hay: &[u8]| {
+            let mut b = EngineBuilder::new();
+            let line = format!("T.Pcre;Engine:81-255,Target:0;0&1;4d41524b;{sub}");
+            assert!(b.add_ldb_line(&line, false).is_ok(), "{line}");
+            b.build().scan(hay, FileType::Unknown).is_some()
+        };
+        for (sub, hay, want) in [
+            ("0/ABC/", &b"MARKabc"[..], false),
+            ("0/ABC/i", b"MARKabc", true),
+            ("0/^abc/", b"MARK\nabc", false),
+            ("0/^abc/m", b"MARK\nabc", true),
+            ("0/K.abc/", b"MARK\nabc", false),
+            ("0/K.abc/s", b"MARK\nabc", true),
+            ("0/a b c/", b"MARKabc", false),
+            ("0/a b c/x", b"MARKabc", true),
+            ("0/abc$/", b"MARKabc\n", true),
+            ("0/abc$/E", b"MARKabc\n", false),
+        ] {
+            assert_eq!(fires(sub, hay), want, "{sub} on {hay:?}");
+        }
+    }
+
+    /// Offsets, their shift, `r`, `e`, `A` and `g`, each answer clamscan
+    /// 1.5.4's for the same signature and bytes: the part past the offset is
+    /// the subject (`^`, `\A` and lookbehinds start there), a match starts at
+    /// the offset unless `r`, a shift bounds where it starts, `e` where it
+    /// ends, and `g` counts consecutive matches for the expression.
+    #[test]
+    fn pcre_offsets_and_counts_as_clamav() {
+        // Held in memory and read through a block cache, the same answer.
+        let fires = |expr: &str, sub: &str, hay: &[u8]| {
+            let mut b = EngineBuilder::new();
+            let line = format!("T.Pcre;Engine:81-255,Target:0;{expr};4d41524b;{sub}");
+            assert!(b.add_ldb_line(&line, false).is_ok(), "{line}");
+            let e = b.build();
+            let held = e.scan(hay, FileType::Unknown).is_some();
+            let cache = byte_source::BlockCache::with_sizes(std::io::Cursor::new(hay.to_vec()), 3, 12).unwrap();
+            let read = e.scan_first_source(&cache, FileType::Unknown, None, None, None, &|_, _| false, WholeLimits::NONE, None);
+            assert_eq!(read.is_some(), held, "{line}: through a block cache");
+            held
+        };
+        let hay = b"MARKaaaaxyz\n";
+        let cases: &[(&str, &str, bool)] = &[
+            (r"4:0/aaaa/", "0&1", true),
+            (r"5:0/aaa/", "0&1", true),
+            (r"6:0/a+x/", "0&1", true),
+            (r"2:0/aaaa/r", "0&1", true),
+            (r"2:0/aaaa/", "0&1", false),
+            (r"2,3:0/aaaa/", "0&1", true),
+            (r"2,1:0/aaaa/", "0&1", false),
+            (r"4,4:0/aaaa/e", "0&1", true),
+            (r"4,3:0/aaaaxyz/e", "0&1", false),
+            (r"4,7:0/aaaaxyz/e", "0&1", true),
+            (r"4,6:0/aaaaxyz/e", "0&1", false),
+            (r"4,3:0/aaaaxyz/", "0&1", true),
+            (r"4:0/^aaaa/", "0&1", true),
+            (r"4:0/\Aaaaa/", "0&1", true),
+            (r"4:0/(?<=MARK)aaaa/", "0&1", false),
+            (r"0/aaaa/A", "0&1", false),
+            (r"0/MARK/A", "0&1", true),
+            (r"EOF-4:0/xyz/", "0&1", true),
+            (r"EOF-8:0/xyz/r", "0&1", true),
+            (r"4,4:0/aaaa$/e", "0&1", true),
+            (r"4,4:0/aaaa$/", "0&1", false),
+            (r"4:0/aaaa/e", "0&1", true),
+            (r"2,3:0/^aaaa/", "0&1", false),
+            (r"2,3:0/^RKaa/", "0&1", true),
+            (r"2:0/^aaaa/r", "0&1", false),
+            (r"2:0/(?<=K)aaaa/r", "0&1", true),
+            (r"2,3:0/(?<=K)aaaa/", "0&1", true),
+            (r"2:0/xyz$/r", "0&1", true),
+            (r"2,1:0/aaaa/r", "0&1", false),
+            (r"EOF-11:0/aaaa/r", "0&1", true),
+            (r"0/a/", "0&1>3", false),
+            (r"0/a/g", "0&1>3", true),
+            (r"0/a/g", "0&1=4", true),
+            (r"0/aa/g", "0&1>1", true),
+            (r"0/aa/g", "0&1>2", false),
+        ];
+        for &(sub, expr, want) in cases {
+            assert_eq!(fires(expr, sub, hay), want, "{expr};{sub}");
+        }
+        let hay = b"########MARKaaaa";
+        assert!(fires("0&1>1", r"13:0/a/g", hay));
+        assert!(!fires("0&1>2", r"13,1:0/a/g", hay));
+        assert!(fires("0&1>2", r"13:0/a/gr", hay));
+        assert!(fires("0&1>1", r"0/a+/gU", b"########MARKaa"));
+        assert!(!fires("0&1>1", r"0/a+/g", b"########MARKaa"));
+    }
+
+    /// A case-insensitive body matches the same in an object small enough to
+    /// be lowercased whole as in one lowercased as it is read.
+    #[test]
+    fn nocase_bodies_match_in_large_objects_without_a_copy() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb("T.NoCase;Target:0;0;6d61??776172{2-4}65::i", false);
+        let e = b.build();
+        for len in [LOWER_COPY_MAX / 2, LOWER_COPY_MAX * 4] {
+            let mut hay = vec![b'.'; len];
+            hay.extend_from_slice(b"MaLwAR..E");
+            assert!(e.scan(&hay, FileType::Unknown).is_some(), "{len}");
+            hay.truncate(len);
+            hay.extend_from_slice(b"MaLwAR.....E");
+            assert!(e.scan(&hay, FileType::Unknown).is_none(), "{len}");
+        }
+    }
+
+    /// A PCRE construct with no exact equivalent leaves its signature
+    /// unsupported, under the construct's name, rather than matched otherwise.
+    #[test]
+    fn a_refused_pcre_is_counted_with_its_reason() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb("T.Sub;Engine:81-255,Target:0;0&1;4d41524b;0/(a)(?1)/", false);
+        assert_eq!(b.unsupported(), 1);
+        assert_eq!(b.unsupported_reasons(), vec![("PCRE: a subroutine call", 1)]);
+    }
+
+    /// An object larger than `--max-pcre-bytes` gets no PCRE matching, as an
+    /// object past ClamAV's PCREMaxFileSize.
+    #[test]
+    fn pcre_skips_an_object_past_its_limit() {
+        let mut b = EngineBuilder::new();
+        assert!(b.add_ldb_line("T.Pcre;Engine:81-255,Target:0;0&1;4d41524b;0/hel+o/", false).is_ok());
+        let e = b.build();
+        let buf: &[u8] = b"MARK hello";
+        let scan = |pcre: usize| {
+            let limits = WholeLimits {
+                pcre,
+                ..WholeLimits::NONE
+            };
+            e.scan_first_source(&buf, FileType::Unknown, None, None, None, &|_, _| false, limits, None)
+        };
+        assert!(scan(buf.len()).is_some());
+        assert!(scan(buf.len() - 1).is_none());
     }
 
     #[test]
@@ -4241,7 +6149,7 @@ mod tests {
                 FileType::Unknown
             )
             .is_none());
-        // A buffer full of zero triples — the shape a naive anchor explodes on — but no
+        // A buffer full of zero triples (the shape a naive anchor explodes on), but no
         // `8606` → the selective internal anchor never fires → no match, no work.
         assert!(e
             .scan(&hx("000000 000000 000000 000000 000000"), FileType::Unknown)
@@ -4251,7 +6159,7 @@ mod tests {
     #[test]
     fn internal_anchor_offset_constrained_falls_back() {
         // With a non-`*` offset the floating start must satisfy the offset, so
-        // Internal anchoring is disallowed — the engine must still detect using
+        // Internal anchoring is disallowed: the engine must still detect using
         // the fixed-prefix (zero-run) anchor, just without the selectivity win.
         let mut b = EngineBuilder::new();
         b.add_ndb("VO:0:0:e8??000000{0-8}8606", false);
@@ -4280,6 +6188,122 @@ mod tests {
             .is_none());
     }
 
+    /// Native, a WebP is hashed for `fuzzy_img#` as `sigtool --fuzzy-img`
+    /// hashes it; under `--clamav-compat`, as clamscan does, it is not.
+    #[cfg(feature = "image-hash")]
+    #[test]
+    fn a_webp_is_hashed_except_under_compat() {
+        let img = image::RgbImage::from_pixel(48, 48, image::Rgb([200, 30, 30]));
+        let mut webp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut webp, image::ImageFormat::WebP)
+            .unwrap();
+        let webp = webp.into_inner();
+        let mut b = EngineBuilder::new();
+        b.add_ldb(
+            "Demo.FuzzyImg;Engine:150-255,Target:0;0;fuzzy_img#8000000000000000",
+            false,
+        );
+        let e = b.build();
+        let scan = |all_image_formats: bool| {
+            let limits = WholeLimits {
+                all_image_formats,
+                ..WholeLimits::NONE
+            };
+            let buf: &[u8] = &webp;
+            e.scan_first_source(&buf, FileType::Unknown, None, None, None, &|_, _| false, limits, None)
+        };
+        assert!(scan(true).is_some());
+        assert!(scan(false).is_none());
+    }
+
+    /// Native, a WebP is graphics for `Target:5`, perceptual hash and byte
+    /// subsignature alike; under `--clamav-compat`, as clamscan has it, not.
+    #[cfg(feature = "image-hash")]
+    #[test]
+    fn a_webp_is_graphics_except_under_compat() {
+        let img = image::RgbImage::from_pixel(48, 48, image::Rgb([200, 30, 30]));
+        let mut webp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut webp, image::ImageFormat::WebP)
+            .unwrap();
+        let webp = webp.into_inner();
+        for sig in [
+            "Demo.FuzzyImg;Engine:150-255,Target:5;0;fuzzy_img#8000000000000000",
+            "Demo.Riff;Engine:150-255,Target:5;0;52494646",
+        ] {
+            let mut b = EngineBuilder::new();
+            b.add_ldb(sig, false);
+            let e = b.build();
+            let scan = |all_image_formats: bool| {
+                let limits = WholeLimits {
+                    all_image_formats,
+                    ..WholeLimits::NONE
+                };
+                let buf: &[u8] = &webp;
+                e.scan_first_source(&buf, FileType::Unknown, None, None, None, &|_, _| false, limits, None)
+            };
+            assert!(scan(true).is_some(), "{sig}");
+            assert!(scan(false).is_none(), "{sig}");
+        }
+    }
+
+    /// Natively, a JPEG 2000 or JBIG2 file is graphics for `Target:5` and
+    /// hashed for `fuzzy_img#`, as every format exav-imagehash decodes;
+    /// under `--clamav-compat` it is neither, as for clamscan.
+    #[cfg(feature = "image-hash")]
+    #[test]
+    fn jpeg_2000_and_jbig2_are_graphics_natively() {
+        for (file, magic, hash) in [
+            (
+                &include_bytes!("../../../exav-render/tests/fixtures/images/rgb.jp2")[..],
+                "0000000c6a502020",
+                "f0a50fd80dda4b1e",
+            ),
+            (
+                &include_bytes!("../../../exav-render/tests/fixtures/images/generic.jb2")[..],
+                "974a42320d0a1a0a",
+                "d656ab50a9e9c82d",
+            ),
+        ] {
+            for (sig, graphics) in [
+                (format!("Demo.Img;Engine:150-255,Target:5;0;{magic}"), true),
+                (format!("Demo.FuzzyImg;Engine:150-255,Target:0;0;fuzzy_img#{hash}"), true),
+                (format!("Demo.Any;Engine:150-255,Target:0;0;{magic}"), false),
+            ] {
+                let mut b = EngineBuilder::new();
+                b.add_ldb(&sig, false);
+                let e = b.build();
+                for all_image_formats in [true, false] {
+                    let limits = WholeLimits {
+                        all_image_formats,
+                        ..WholeLimits::NONE
+                    };
+                    let found = e.scan_first_source(&file, FileType::Unknown, None, None, None, &|_, _| false, limits, None);
+                    // The control, a signature for any file, finds it in both.
+                    assert_eq!(found.is_some(), all_image_formats || !graphics, "{sig} all formats {all_image_formats}");
+                }
+            }
+        }
+    }
+
+    /// Built without `image-hash`, a `fuzzy_img#` signature is counted with
+    /// what it lacks rather than loaded to never match.
+    #[cfg(not(feature = "image-hash"))]
+    #[test]
+    fn fuzzy_img_needs_image_hash() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb(
+            "Demo.FuzzyImg;Engine:150-255,Target:0;0;fuzzy_img#8000000000000000",
+            false,
+        );
+        assert_eq!(
+            b.unsupported_reasons(),
+            vec![("ldb: fuzzy_img# subsignature in a build without image-hash", 1)]
+        );
+    }
+
+    #[cfg(feature = "image-hash")]
     #[test]
     fn ldb_fuzzy_img_subsig() {
         // A solid (non-black) image hashes to 8000000000000000 (spec anchor).
@@ -4313,7 +6337,7 @@ mod tests {
             .is_none());
         // A `#<distance>` tolerance now loads and matches within the hamming
         // distance (this image hashes exactly to 8000000000000000, so it is
-        // distance 0 — trivially within any tolerance).
+        // distance 0, trivially within any tolerance).
         let mut b3 = EngineBuilder::new();
         b3.add_ldb(
             "Demo.FuzzyDist;Engine:150-255,Target:0;0;fuzzy_img#8000000000000000#5",
@@ -4439,6 +6463,7 @@ mod tests {
         assert_eq!(strip_lookaround(r"a\(?=b").unwrap(), r"a\(?=b"); // escaped paren
         // A backreference can't be soundly reduced.
         assert!(strip_lookaround(r"(a)\1").is_none());
+        assert!(strip_lookaround(r"(?=(a))\k<1>").is_none());
         // build_prefilter yields None when nothing was stripped.
         assert!(build_prefilter("(?:abc)def").is_none());
         // ...and a compilable superset when lookaround is present.
@@ -4668,6 +6693,147 @@ mod tests {
         let _ = b.build(); // must not panic
     }
 
+    /// A literal behind a fixed gap of 2^32 bytes is 2^32 past the start; the
+    /// distance does not fit the prefix, so it must not be stored cut to its
+    /// low bits (`2`, which put the start two bytes before the anchor).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn an_anchor_past_u32_of_fixed_prefix_is_not_a_fixed_one() {
+        use super::parse::pick_anchor;
+        let elems = [
+            Elem::Bytes(vec![0, 0]),
+            Elem::Gap { min: 1 << 32, max: Some(1 << 32) },
+            Elem::Bytes(b"rare literal".to_vec()),
+        ];
+        if let Some(Prefix::Fixed { anchor_idx: 2, len }) = pick_anchor(&elems, true, None) {
+            panic!("stored a distance of {len}");
+        }
+    }
+
+    /// A shorter but rare literal must outrank a longer ubiquitous one, and
+    /// `pick_anchor` must actually anchor on it.
+    ///
+    /// The pair is real. `"http://" {7-15} ":7878"` is a live signature, and a
+    /// 12 MB spreadsheet relationships part drove its `"http://"` anchor to
+    /// 61,489 hits while `":7878"` occurs in it zero times. Length-only ranking
+    /// picks `"http://"`; a live main+daily set has it in 9,225 bodies against
+    /// 1 for `":7878"`, which is what makes the right choice visible without
+    /// any reference corpus.
+    #[test]
+    fn a_rare_literal_outranks_a_popular_one() {
+        use super::parse::pick_anchor;
+        // Each call is one body. The proportions are what the real set looks
+        // like: a literal hundreds of signatures are built around, against one
+        // that appears in a single signature.
+        let stats = GramStats::build(500, |f| {
+            for _ in 0..500 {
+                f(b"http://");
+            }
+            f(b":7878");
+        });
+        let (rare, popular) = (
+            anchor_score(b":7878", Some(&stats)),
+            anchor_score(b"http://", Some(&stats)),
+        );
+        assert!(rare > popular, "\":7878\" ({rare}) must beat \"http://\" ({popular})");
+
+        // With no statistics (the state while a body is first parsed), the
+        // ranking is the original length order, so the build-time re-pick
+        // is doing real work rather than confirming a choice already made.
+        assert!(anchor_score(b":7878", None) < anchor_score(b"http://", None));
+
+        // A literal no signature shares keeps scoring its length, so ordinary
+        // binary patterns are untouched.
+        assert_eq!(anchor_score(b"\x9a\x3f\xe1\x07\xb2", Some(&stats)), 5);
+
+        // End to end: the anchor moves past the gap onto the rare literal.
+        let elems = vec![
+            Elem::Bytes(b"http://".to_vec()),
+            Elem::Gap {
+                min: 7,
+                max: Some(15),
+            },
+            Elem::Bytes(b":7878".to_vec()),
+        ];
+        assert!(
+            matches!(
+                pick_anchor(&elems, true, Some(&stats)),
+                Some(Prefix::Internal { anchor_idx: 2 })
+            ),
+            "must anchor past the gap on the rare literal, got {:?}",
+            pick_anchor(&elems, true, Some(&stats))
+        );
+    }
+
+    /// Grams in a single body are dropped to keep the counting map small; that
+    /// must not change any score, since `log2(1)` is already zero.
+    #[test]
+    fn single_body_grams_cost_nothing() {
+        let stats = GramStats::build(2, |f| {
+            f(b"ONLYONCE");
+            f(b"ALSOONCE");
+        });
+        assert_eq!(anchor_score(b"ONLYONCE", Some(&stats)), 8);
+        assert_eq!(anchor_score(b"ONLYONCE", None), 8);
+    }
+
+    /// A short literal must be charged for every body that CONTAINS it, not
+    /// only for bodies that are exactly it.
+    ///
+    /// Regression. Counting credited each literal only at the window width its
+    /// own lookup would use, so the 2-gram `"//"` was counted from two-byte
+    /// literals alone (a handful), while the tens of thousands of longer
+    /// literals containing it credited nothing. `"//"` then scored as rare,
+    /// beat the correctly-penalised `"http://"`, and anchors migrated onto the
+    /// most common fragments in the set: measured, +84% token verifies on one
+    /// spreadsheet part, with `"://"` and `"htt"` becoming hot anchors.
+    #[test]
+    fn a_short_literal_is_charged_for_every_body_containing_it() {
+        // No body IS "//" or "://": they only ever appear inside a longer one.
+        let stats = GramStats::build(500, |f| {
+            for _ in 0..500 {
+                f(b"http://example");
+            }
+        });
+        for frag in [&b"//"[..], b"://", b"htt"] {
+            assert!(
+                anchor_score(frag, Some(&stats)) < anchor_score(b"http://", Some(&stats)),
+                "{:?} must not outrank the literal it is a fragment of ({} vs {})",
+                String::from_utf8_lossy(frag),
+                anchor_score(frag, Some(&stats)),
+                anchor_score(b"http://", Some(&stats))
+            );
+        }
+    }
+
+    /// The repeat filter is an optimisation, so it must not change an answer.
+    /// Same literals through both paths (the exact single pass a small build
+    /// takes, and the filtered two-pass a full database takes) must score
+    /// identically.
+    #[test]
+    fn the_repeat_filter_changes_no_score() {
+        use crate::grams::FILTER_MIN_BODIES;
+        let feed = |f: &mut dyn FnMut(&[u8])| {
+            for _ in 0..300 {
+                f(b"POPULAR!");
+            }
+            for _ in 0..7 {
+                f(b"UNCOMMON");
+            }
+            f(b"SINGLETON");
+        };
+        let exact = GramStats::build(1, feed);
+        let filtered = GramStats::build(FILTER_MIN_BODIES, feed);
+        for lit in [&b"POPULAR!"[..], b"UNCOMMON", b"SINGLETON", b"ABSENT!!"] {
+            assert_eq!(
+                anchor_score(lit, Some(&exact)),
+                anchor_score(lit, Some(&filtered)),
+                "paths disagree on {:?}",
+                String::from_utf8_lossy(lit)
+            );
+        }
+    }
+
     // --- gap-split matcher equivalence -------------------------------------
 
     /// Reference present/absent oracle: a straightforward recursive matcher that
@@ -4734,7 +6900,7 @@ mod tests {
     }
 
     /// Build a random token program (Bytes / AnyByte / nibble / gap / alternation,
-    /// negated or not) over a 3-symbol alphabet — the full element set the
+    /// negated or not) over a 3-symbol alphabet: the full element set the
     /// simulator handles.
     fn rand_toks(rng: &mut Rng, alpha: &[u8]) -> Vec<Elem> {
         let n = 1 + rng.below(5);
@@ -4814,12 +6980,11 @@ mod tests {
     }
 
     /// The gap-split simulator must return the exact present/absent answer for
-    /// every token program, buffer, start, and case-fold flag — this correctness
+    /// every token program, buffer, start, and case-fold flag. This correctness
     /// is what makes the split path a detection-preserving drop-in. Checked
     /// against the exhaustive `bt_match` oracle over a large random sample.
-    /// Additionally asserts the split path never *misses* what the legacy
-    /// `match_forward` finds (`match_forward ⟹ gap_split`): the switch can only
-    /// ever preserve or add a true detection, never drop one.
+    /// Additionally asserts the split path never *misses* what the backtracking
+    /// `match_forward` finds (`match_forward ⟹ gap_split`).
     #[test]
     fn gap_split_matches_backtracker() {
         let alpha = b"AaB"; // includes an upper/lower pair so nocase matters
@@ -4833,25 +6998,36 @@ mod tests {
             let lower = buf.to_ascii_lowercase();
 
             let want = bt_match(&toks, &buf, pos, nocase);
+            // Both occurrence paths, every case. These buffers are far too
+            // small to ever exhaust the real memo budget, so with only
+            // `OccCache::new()` the direct search (the path a large buffer
+            // takes once a token blows the position cap) went unexercised
+            // here, and a divergence in it would have passed silently.
+            for cap in [MAX_OCC_TOTAL, 0] {
+                let mut b2 = u64::MAX;
+                let mut occ = OccCache::with_cap(cap);
+                let got = gap_split_match(&toks, &buf, pos, nocase, &lower, &mut b2, &mut occ);
+                assert_eq!(
+                    want, got,
+                    "gap-split wrong (occ cap {cap}): toks={toks:?} buf={buf:?} pos={pos} nocase={nocase}"
+                );
+            }
             let mut b2 = u64::MAX;
-            let got = gap_split_match(&toks, &buf, pos, nocase, &lower, &mut b2);
-            assert_eq!(
-                want, got,
-                "gap-split wrong: toks={toks:?} buf={buf:?} pos={pos} nocase={nocase}"
-            );
-            // The legacy walk must never find a match the split path misses.
+            let mut occ = OccCache::new();
+            let got = gap_split_match(&toks, &buf, pos, nocase, &lower, &mut b2, &mut occ);
+            // The backtracking walk must never find a match the split path misses.
             let mut b1 = u64::MAX;
             if match_forward(&toks, &buf, pos, nocase, &mut b1) {
                 assert!(
                     got,
-                    "gap-split dropped a legacy match: toks={toks:?} buf={buf:?} pos={pos} nocase={nocase}"
+                    "gap-split dropped a backtracking match: toks={toks:?} buf={buf:?} pos={pos} nocase={nocase}"
                 );
             }
         }
     }
 
     /// The backward simulator must return the *identical start* the backtracking
-    /// `match_backward` returns — not merely some valid one — or a body's
+    /// `match_backward` returns, not merely some valid one, or a body's
     /// reported offset would shift. Same randomized corpus as the forward test.
     #[test]
     fn gap_split_backward_matches_backtracker() {
@@ -4868,8 +7044,21 @@ mod tests {
 
             let mut b1 = u64::MAX;
             let want = match_backward(&toks, &buf, end, nocase, &mut b1);
+            // Memoised and direct occurrence paths alike: see the forward test.
+            for cap in [MAX_OCC_TOTAL, 0] {
+                let mut b2 = u64::MAX;
+                let mut occ = OccCache::with_cap(cap);
+                let got =
+                    gap_split_match_backward(&toks, &buf, end, nocase, &lower, &mut b2, &mut occ);
+                assert_eq!(
+                    want, got,
+                    "backward split wrong (occ cap {cap}): toks={toks:?} buf={buf:?} end={end} nocase={nocase}"
+                );
+            }
             let mut b2 = u64::MAX;
-            let got = gap_split_match_backward(&toks, &buf, end, nocase, &lower, &mut b2);
+            let mut occ = OccCache::new();
+            let got =
+                gap_split_match_backward(&toks, &buf, end, nocase, &lower, &mut b2, &mut occ);
             assert_eq!(
                 want, got,
                 "backward split wrong: toks={toks:?} buf={buf:?} end={end} nocase={nocase}"
@@ -4899,8 +7088,9 @@ mod tests {
         ];
         let lower = buf.to_ascii_lowercase();
         let mut b = u64::MAX;
+        let mut occ = OccCache::new();
         assert_eq!(
-            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut b),
+            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut b, &mut occ),
             Some(4),
             "must return the start the backtracker returns (shortest gap first)"
         );
@@ -4927,28 +7117,24 @@ mod tests {
             Elem::Bytes(b"a".to_vec()),
         ];
         let lower = buf.to_ascii_lowercase();
+        // The per-call cap the backtracking walk ran under.
+        const CAP: u64 = 200_000;
 
-        // Legacy walk: cut off by its per-call cap, having decided nothing.
-        let mut legacy = VERIFY_BUDGET;
-        assert_eq!(
-            match_backward(&toks, &buf, buf.len(), false, &mut legacy),
-            None
-        );
-        assert_eq!(legacy, 0, "the backtracker should have drained its budget");
+        // Backtracking walk: cut off by its cap, having decided nothing.
+        let mut steps = CAP;
+        assert_eq!(match_backward(&toks, &buf, buf.len(), false, &mut steps), None);
+        assert_eq!(steps, 0, "the backtracker should have drained its budget");
 
         // Simulator: a real "no match", with the budget barely touched.
         reset_scan_truncated();
-        let mut sim = VERIFY_BUDGET;
+        let mut sim = CAP;
+        let mut occ = OccCache::new();
         assert_eq!(
-            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut sim),
+            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut sim, &mut occ),
             None
         );
         assert!(!scan_was_truncated(), "must not report an incomplete search");
-        assert!(
-            sim > VERIFY_BUDGET / 2,
-            "should finish well inside the budget, spent {}",
-            VERIFY_BUDGET - sim
-        );
+        assert!(sim > CAP / 2, "should finish well inside the budget, spent {}", CAP - sim);
     }
 
     #[test]
@@ -4964,7 +7150,9 @@ mod tests {
         ];
         let lower = buf.to_ascii_lowercase();
         let mut budget = 5_000_000u64;
-        let got = gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut budget);
+        let mut occ = OccCache::new();
+        let got =
+            gap_split_match_backward(&toks, &buf, buf.len(), false, &lower, &mut budget, &mut occ);
         assert!(got.is_some(), "must find the match");
         assert!(!scan_was_truncated(), "must not report truncation");
     }
@@ -4976,7 +7164,8 @@ mod tests {
         let check = |toks: &[Elem], buf: &[u8], pos: usize, nocase: bool| -> bool {
             let lower = buf.to_ascii_lowercase();
             let mut b = u64::MAX;
-            gap_split_match(toks, buf, pos, nocase, &lower, &mut b)
+            let mut occ = OccCache::new();
+            gap_split_match(toks, buf, pos, nocase, &lower, &mut b, &mut occ)
         };
         // Unbounded gap between two literals.
         let t = vec![
@@ -5020,11 +7209,11 @@ mod tests {
         assert!(!check(&t, b"AB", 0, false));
     }
 
-    /// The trickier anchor/element classes — negated alternation and an Internal
-    /// anchor (whose start comes from the backward walk) — must detect correctly
-    /// under BOTH the split path and the legacy path, and agree with each other.
+    /// The trickier anchor/element classes (negated alternation and an Internal
+    /// anchor whose start comes from the backward walk) detect correctly, at
+    /// the right start.
     #[test]
-    fn split_and_legacy_agree_on_tricky_constructs() {
+    fn tricky_constructs_are_detected_at_their_start() {
         let run = |line: &str, buf: &[u8]| -> bool {
             let e = ndb(line);
             e.scan(buf, FileType::Unknown).is_some()
@@ -5038,16 +7227,480 @@ mod tests {
         assert!(run("Intern:0:*:00000000*cafebabe", &hx("00000000 99 cafebabe")));
         assert!(!run("Intern:0:*:00000000*cafebabe", &hx("00000000 99 deadbeef")));
 
-        // The Internal-anchor detection must report the SAME start offset whether
-        // the forward suffix is decided by the simulator or the legacy walk (the
-        // start always comes from the backward walk, so it must not drift).
+        // The Internal-anchor detection reports the start the backward walk
+        // finds.
         let internal = ndb("IOff:0:*:00000000*cafebabe");
         let buf = hx("77 00000000 99 cafebabe");
-        // (env is process-global; this test documents the invariant that the
-        // backward-derived start is path-independent — start = 1 here.)
         assert_eq!(
             internal.scan(&buf, FileType::Unknown).map(|(_, o, _)| o),
             Some(1)
         );
+    }
+
+    #[test]
+    fn group_cost_caps_concentrated_draw_and_flags_truncation() {
+        // The flag is thread-local and test threads are reused: leave it as
+        // found so no other test observes a truncation it did not cause.
+        reset_scan_truncated();
+        let mut g = GroupCost::new(100);
+        // Cheap verifies never trip the cap, however many run.
+        for _ in 0..10_000 {
+            assert!(g.admit(0, 7));
+            g.charge(0, 7, 0);
+        }
+        assert!(!scan_was_truncated(), "zero-draw groups must not interact");
+        // One group drawing past the cap is refused from then on.
+        g.charge(0, 7, 60);
+        assert!(g.admit(0, 7));
+        g.charge(0, 7, 50);
+        assert!(!g.admit(0, 7), "110 drawn past a cap of 100 trips it");
+        assert!(scan_was_truncated(), "tripping the cap is an incomplete search");
+        // A different group, or the same value in another partition, is
+        // unaffected: the cap bounds concentrated cost, not total work.
+        reset_scan_truncated();
+        let mut g = GroupCost::new(10);
+        g.charge(0, 7, 11);
+        assert!(g.admit(0, 8));
+        assert!(g.admit(1, 7));
+        assert!(!scan_was_truncated(), "distinct groups must not interact");
+        reset_scan_truncated();
+    }
+
+    /// A random body over bytes that also make up the haystacks, drawing on
+    /// every element the parser accepts.
+    fn rand_hex(rng: &mut Rng) -> String {
+        const LIT: [&str; 6] = ["61", "62", "63", "41", "00", "ff"];
+        let lit = |rng: &mut Rng, n: usize| -> String {
+            (0..n).map(|_| LIT[rng.below(LIT.len())]).collect()
+        };
+        let n = 2 + rng.below(2);
+        let mut s = lit(rng, n);
+        for _ in 0..rng.below(4) {
+            s += match rng.below(9) {
+                0 => "??".to_string(),
+                1 => "*".to_string(),
+                2 => format!("{{{}-{}}}", rng.below(3), 3 + rng.below(4)),
+                3 => format!("{{{}}}", rng.below(4)),
+                4 => "(6162|63)".to_string(),
+                5 => "!(61|62)".to_string(),
+                6 => "6?".to_string(),
+                7 => "?1".to_string(),
+                _ => format!("{{{}-}}", rng.below(3)),
+            }
+            .as_str();
+            let n = 2 + rng.below(2);
+            s += &lit(rng, n);
+        }
+        s
+    }
+
+    /// A random signature line: plain `.ndb` bodies at various offsets, and
+    /// logical signatures with modifiers, PCRE (linear and lookaround) and
+    /// byte-compare subsignatures.
+    fn rand_sig(rng: &mut Rng, i: usize) -> (bool, String) {
+        if rng.below(2) == 0 {
+            let off = ["*", "0", "3", "EOF-12", "2,4", "EOF-20,8"][rng.below(6)];
+            return (false, format!("N{i}:0:{off}:{}", rand_hex(rng)));
+        }
+        let modifier = ["", "::i", "::f", "::a", "::wa"][rng.below(5)];
+        let mut subs = vec![format!("{}{modifier}", rand_hex(rng)), rand_hex(rng)];
+        let expr = match rng.below(5) {
+            0 => {
+                let p = ["a+b", "c[ab]{2}", "(?i)ab+", "b(?=c)"][rng.below(4)];
+                subs.push(format!("0/{p}/"));
+                "0&2"
+            }
+            1 => {
+                let p = ["EOF-30:0/a[bc]/", "5:0/ab/", "0,9:0/ab/"][rng.below(3)];
+                subs.push(p.to_string());
+                "(0|1)&2"
+            }
+            2 => {
+                let (at, kind, cmp) = (
+                    rng.below(3),
+                    ["d2", "h2", "il2"][rng.below(3)],
+                    ["=", ">", "<"][rng.below(3)],
+                );
+                subs.push(format!("0(>>{at}#{kind}#{cmp}10)"));
+                "0&2"
+            }
+            3 => "0|1",
+            _ => "0&1",
+        };
+        (
+            true,
+            format!("L{i};Engine:81-255,Target:0;{expr};{}", subs.join(";")),
+        )
+    }
+
+    fn rand_haystack(rng: &mut Rng) -> Vec<u8> {
+        const BYTES: &[u8] = b"abcAB\x00\xff";
+        (0..rng.below(400))
+            .map(|_| BYTES[rng.below(BYTES.len())])
+            .collect()
+    }
+
+    /// The engine answers the same over an object read through the block cache
+    /// as over the same bytes in memory: first match, every match, and the
+    /// logical offsets bytecode triggers read.
+    #[test]
+    fn a_streamed_object_matches_as_in_memory() {
+        use crate::byte_source::BlockCache;
+        let mut rng = Rng(0x5eed);
+        let mut matched = 0;
+        let mut loaded_special = 0;
+        for round in 0..400 {
+            let mut b = EngineBuilder::new();
+            let mut sigs = Vec::new();
+            for i in 0..6 {
+                let (logical, line) = rand_sig(&mut rng, i);
+                let before = b.unsupported();
+                if logical {
+                    b.add_ldb(&line, false);
+                } else {
+                    b.add_ndb(&line, false);
+                }
+                if b.unsupported() == before && (line.contains('/') || line.contains("(>>")) {
+                    loaded_special += 1;
+                }
+                sigs.push(line);
+            }
+            let e = b.build();
+            for _ in 0..8 {
+                let buf = rand_haystack(&mut rng);
+                // Blocks of 5 bytes, 4 of them held: every read crosses seams
+                // and most go back to the source.
+                let src = BlockCache::with_sizes(std::io::Cursor::new(buf.clone()), 5, 20).unwrap();
+                let ctx = || format!("round {round}: {sigs:?} on {buf:?}");
+
+                reset_scan_truncated();
+                let want = e.scan(&buf, FileType::Unknown);
+                let want_trunc = scan_was_truncated();
+                reset_scan_truncated();
+                let got = e.scan_first_source(
+                    &src,
+                    FileType::Unknown,
+                    None,
+                    None,
+                    None,
+                    &|_, _| false,
+                    WholeLimits::NONE,
+                    None,
+                );
+                assert_eq!(got, want, "{}", ctx());
+                assert_eq!(scan_was_truncated(), want_trunc, "{}", ctx());
+                matched += want.is_some() as usize;
+
+                let (mut w, mut g) = (Vec::new(), Vec::new());
+                e.scan_all_with_layout(&buf, FileType::Unknown, None, None, &mut w);
+                e.scan_all_source(&src, FileType::Unknown, None, None, None, &mut g, WholeLimits::NONE, None);
+                assert_eq!(g, w, "{}", ctx());
+
+                let (mut w, mut g) = (Vec::new(), Vec::new());
+                e.scan_logical_offsets(&buf, FileType::Unknown, None, None, &mut w);
+                e.scan_logical_offsets_source(&src, FileType::Unknown, None, None, &mut g, WholeLimits::NONE);
+                assert_eq!(g, w, "{}", ctx());
+            }
+        }
+        reset_scan_truncated();
+        assert!(matched > 100, "too few matches ({matched}) to exercise anything");
+        assert!(loaded_special > 300, "PCRE/byte-compare subsigs rarely loaded ({loaded_special})");
+    }
+
+    /// Mostly long runs of one byte with short noise between them: runs shorter
+    /// and longer than any anchor, at both ends of the buffer, and one that is
+    /// uniform only once lowercased.
+    fn runny_haystack(rng: &mut Rng) -> Vec<u8> {
+        const NOISE: &[u8] = b"abcAB\x00\xff";
+        let mut out = Vec::new();
+        for _ in 0..1 + rng.below(6) {
+            for _ in 0..rng.below(12) {
+                out.push(NOISE[rng.below(NOISE.len())]);
+            }
+            let len = [1, 3, 8, 40, 300, 2500][rng.below(6)] + rng.below(8);
+            match rng.below(5) {
+                4 => out.extend((0..len).map(|i| if i % 3 == 0 { b'A' } else { b'a' })),
+                k => out.extend(std::iter::repeat_n([0x00, 0xff, b'a', b'A'][k], len)),
+            }
+        }
+        out
+    }
+
+    /// [`rand_sig`], plus bodies made of runs, at offsets that land inside
+    /// runs, and logical signatures that count their matches.
+    fn runny_sig(rng: &mut Rng, i: usize) -> (bool, String) {
+        match rng.below(3) {
+            0 => rand_sig(rng, i),
+            1 => {
+                let body = ["00000000", "ffffffffffff", "0000{3-9}0000", "0000*ff", "00??00", "6161616161"]
+                    [rng.below(6)];
+                let off = ["*", "0", "EOF-40", "300,5", "EOF-3000,100"][rng.below(5)];
+                (false, format!("R{i}:0:{off}:{body}"))
+            }
+            _ => {
+                // `6?` reads the raw byte even in a case-insensitive body, so
+                // it tells `a` from `A` inside a run that is uniform lowercased.
+                let sub = [
+                    "00000000",
+                    "ffffffff",
+                    "61616161::i",
+                    "61616?6161::i",
+                    "0000{2-5}00ff",
+                    "00??0000::f",
+                    "0000*6162",
+                ][rng.below(7)];
+                let expr = ["0>5", "0=7", "0>200", "(0|1)>40,2", "0<3&1", "0&1"][rng.below(6)];
+                (
+                    true,
+                    format!("C{i};Engine:81-255,Target:0;{expr};{sub};{}", rand_hex(rng)),
+                )
+            }
+        }
+    }
+
+    /// Collapsing runs of one repeated byte changes no answer: every match,
+    /// logical offsets and the truncation flag come out as they do hit by hit,
+    /// in memory and streamed alike. A first match is one of the matches: which
+    /// one a scan meets first inside a run may differ.
+    #[test]
+    fn run_collapsing_changes_no_answer() {
+        use crate::byte_source::BlockCache;
+        let mut rng = Rng(0xc011_a95e);
+        let (mut matched, mut collapsed) = (0, 0);
+        for round in 0..300 {
+            let mut b = EngineBuilder::new();
+            let mut sigs = Vec::new();
+            for i in 0..6 {
+                let (logical, line) = runny_sig(&mut rng, i);
+                if logical {
+                    b.add_ldb(&line, false);
+                } else {
+                    b.add_ndb(&line, false);
+                }
+                sigs.push(line);
+            }
+            let e = b.build();
+            for _ in 0..6 {
+                let buf = runny_haystack(&mut rng);
+                let src = BlockCache::with_sizes(std::io::Cursor::new(buf.clone()), 64, 256).unwrap();
+                let ctx = || format!("round {round}: {sigs:?} on {buf:?}");
+                let ft = FileType::Unknown;
+                let answers = |collapse: bool| {
+                    NO_RUN_COLLAPSE.with(|c| c.set(!collapse));
+                    reset_scan_truncated();
+                    let first = e.scan(&buf, ft);
+                    let trunc = scan_was_truncated();
+                    let (mut all, mut offs) = (Vec::new(), Vec::new());
+                    e.scan_all_with_layout(&buf, ft, None, None, &mut all);
+                    e.scan_logical_offsets(&buf, ft, None, None, &mut offs);
+                    all.sort();
+                    offs.sort();
+                    let s_first = e.scan_first_source(&src, ft, None, None, None, &|_, _| false, WholeLimits::NONE, None);
+                    let (mut s_all, mut s_offs) = (Vec::new(), Vec::new());
+                    e.scan_all_source(&src, ft, None, None, None, &mut s_all, WholeLimits::NONE, None);
+                    e.scan_logical_offsets_source(&src, ft, None, None, &mut s_offs, WholeLimits::NONE);
+                    s_all.sort();
+                    s_offs.sort();
+                    NO_RUN_COLLAPSE.with(|c| c.set(false));
+                    (first, trunc, all, offs, s_first, s_all, s_offs)
+                };
+                let slow = answers(false);
+                let fast = answers(true);
+                assert_eq!(fast.2, slow.2, "every match, {}", ctx());
+                assert_eq!(fast.3, slow.3, "logical offsets, {}", ctx());
+                assert_eq!(fast.1, slow.1, "truncation, {}", ctx());
+                assert_eq!(fast.0.is_some(), slow.0.is_some(), "first match, {}", ctx());
+                if let Some(hit) = &fast.0 {
+                    assert!(fast.2.contains(hit), "first match {hit:?} not among every match, {}", ctx());
+                }
+                assert_eq!(fast.4, fast.0, "streamed first match, {}", ctx());
+                assert_eq!(fast.5, fast.2, "streamed every match, {}", ctx());
+                assert_eq!(fast.6, fast.3, "streamed logical offsets, {}", ctx());
+                matched += slow.0.is_some() as usize;
+                collapsed += buf.chunk_by(|a, b| a == b).any(|r| r.len() >= MIN_SKIP_RUN) as usize;
+            }
+        }
+        reset_scan_truncated();
+        assert!(matched > 200, "too few matches ({matched}) to exercise anything");
+        assert!(collapsed > 1000, "too few haystacks collapsed ({collapsed})");
+    }
+
+    /// Verifying a body at every hit inside a long run gives the matches a hit
+    /// by hit verify gives, and draws work only near the run's edges and at
+    /// the positions an offset allows.
+    #[test]
+    fn a_long_run_is_verified_at_its_edges() {
+        let buf = vec![0u8; 1 << 20];
+        let (start, count) = (0usize, 1usize << 19);
+        for line in [
+            "V:0:*:0000??0000",
+            "V:0:*:0000{2-5}00ff",
+            "V:0:*:000000",
+            "V:0:EOF-600000,20:0000??0000",
+            "V:0:300,5:0000{1-2}00",
+        ] {
+            let e = ndb(line);
+            let body = &e.bodies[0];
+            let (mut slow, mut fast) = (Vec::new(), Vec::new());
+            let (mut b1, mut b2) = (SIM_BUDGET, SIM_BUDGET);
+            let (mut o1, mut o2) = (OccCache::new(), OccCache::new());
+            for s in start..start + count {
+                if let Some(m) = verify(body, &buf[..], s, None, &buf[..], &mut b1, &mut o1) {
+                    slow.push(m);
+                }
+            }
+            let stopped = verify_run(body, &buf[..], start, count, None, &buf[..], &mut b2, &mut o2, &mut |m, n| {
+                fast.extend(m..m + n);
+                false
+            });
+            assert!(!stopped);
+            assert_eq!(fast, slow, "{line}");
+            let (d1, d2) = (SIM_BUDGET - b1, SIM_BUDGET - b2);
+            assert!(d2 <= 10_000, "{line}: drew {d2} (hit by hit: {d1})");
+        }
+    }
+
+    /// The positions a literal reaches inside a run of its own byte are
+    /// consecutive, and the reachable set keeps them as one interval, found by
+    /// the memoised search or the direct one alike. Held one by one, a verify
+    /// after a gap over 120 MB of zeros asked for a gigabyte and the scan
+    /// aborted on the allocation.
+    #[test]
+    fn a_run_of_reachable_positions_stays_one_interval() {
+        let buf = vec![0u8; 1 << 20];
+        let n = buf.len();
+        let cur = [(0, n)];
+        for cap in [0, MAX_OCC_TOTAL] {
+            let (mut out, mut budget) = (Vec::new(), u64::MAX);
+            let mut occ = OccCache::with_cap(cap);
+            advance_literal(&cur, &buf[..], &buf[..], b"\0\0\0\0", false, &mut out, &mut budget, &mut occ);
+            assert_eq!(out, [(4, n)], "literal, occurrence cache cap {cap}");
+        }
+        let (mut out, mut budget) = (Vec::new(), u64::MAX);
+        advance_class(&cur, &buf[..], &Elem::HiNibble(0), &mut out, &mut budget);
+        assert_eq!(out, [(1, n)], "nibble");
+        let (mut out, mut budget) = (Vec::new(), u64::MAX);
+        advance_masked_alt(&cur, &buf[..], &[vec![(0, 0xf0), (0, 0)]], false, &mut out, &mut budget);
+        assert_eq!(out, [(2, n)], "masked alternation");
+
+        reset_scan_truncated();
+        let e = ndb("G:0:*:0102030405060708*00000000??ff");
+        let mut hay = hx("0102030405060708");
+        hay.extend(&buf);
+        assert_eq!(e.scan(&hay, FileType::Unknown), None);
+        assert!(!scan_was_truncated(), "the search completes");
+    }
+
+    /// The block memo gives what a direct search gives, for the same budget,
+    /// across block seams (a literal straddling one, a run crossing several),
+    /// for windows around one point and gaps to the end alike; and a check
+    /// around one point searches the one block it lies in, not the object.
+    #[test]
+    fn occurrences_memoised_by_block_match_a_direct_search() {
+        let mut rng = Rng(0x0cc_b10c);
+        let n = 5 * OCC_BLOCK + 123;
+        let mut buf: Vec<u8> = (0..n).map(|_| b"xyzab"[rng.below(5)]).collect();
+        for seam in 1..5 {
+            let at = seam * OCC_BLOCK;
+            buf[at - 2..at + 2].copy_from_slice(b"abab");
+        }
+        buf[2 * OCC_BLOCK - 700..3 * OCC_BLOCK + 900].fill(b'a');
+        let lower = buf.to_ascii_lowercase();
+        for needle in [&b"ab"[..], b"aa", b"a", b"zab", b"AB"] {
+            for _ in 0..40 {
+                let mut cur: Vec<(usize, usize)> = Vec::new();
+                let mut at = rng.below(n / 2);
+                for _ in 0..1 + rng.below(4) {
+                    let len = [0, 1, 30, 70_000, n][rng.below(5)];
+                    let hi = (at + len).min(n);
+                    cur.push((at, hi));
+                    at = hi + 1 + rng.below(90_000);
+                    if at >= n {
+                        break;
+                    }
+                }
+                let nocase = needle == b"AB";
+                let run = |cap: usize, budget: u64| {
+                    let (mut out, mut budget) = (Vec::new(), budget);
+                    let mut occ = OccCache::with_cap(cap);
+                    advance_literal(&cur, &buf[..], &lower[..], needle, nocase, &mut out, &mut budget, &mut occ);
+                    (out, budget)
+                };
+                for budget in [u64::MAX, 50, 3] {
+                    reset_scan_truncated();
+                    let want = run(0, budget);
+                    let want_trunc = scan_was_truncated();
+                    reset_scan_truncated();
+                    assert_eq!(run(MAX_OCC_TOTAL, budget), want, "{needle:?} over {cur:?}, budget {budget}");
+                    assert_eq!(scan_was_truncated(), want_trunc);
+                }
+            }
+        }
+        reset_scan_truncated();
+        let mut occ = OccCache::with_cap(MAX_OCC_TOTAL);
+        let (mut out, mut budget) = (Vec::new(), u64::MAX);
+        let point = 3 * OCC_BLOCK + 17;
+        advance_literal(&[(point, point)], &buf[..], &lower[..], b"zab", false, &mut out, &mut budget, &mut occ);
+        match occ.cs.get(&b"zab"[..]) {
+            Some(OccEntry::Blocks(blocks)) => assert_eq!(blocks.len(), 1),
+            _ => panic!("the token was not memoised"),
+        }
+    }
+
+    /// A run of occurrence starts longer than one word holds is cached as
+    /// consecutive words giving back exactly its starts, and a run that does
+    /// not fit the room left is not cached in part.
+    #[test]
+    fn occurrence_runs_split_exactly() {
+        let m = OccRun::MAX_LEN;
+        let mut v = Vec::new();
+        assert!(OccRun::push(&mut v, 10, 5, 5));
+        assert!(OccRun::push(&mut v, 10, 7, 7 + 3 * m));
+        let got: Vec<(usize, usize)> = v.iter().map(|r| (r.first(), r.last())).collect();
+        assert_eq!(got, [(5, 5), (7, 6 + m), (7 + m, 6 + 2 * m), (7 + 2 * m, 6 + 3 * m), (7 + 3 * m, 7 + 3 * m)]);
+        assert!(!OccRun::push(&mut v, 6, 1 << 30, (1 << 30) + m));
+        assert_eq!(v.len(), 5);
+    }
+
+    /// A reachable set that cannot be merged, a two-byte pattern repeated for
+    /// megabytes, stops at [`MAX_REACH`] intervals with the scan flagged
+    /// incomplete: `LIMITS-EXCEEDED`, never an allocation failure.
+    #[test]
+    fn a_reachable_set_is_capped() {
+        reset_scan_truncated();
+        let buf: Vec<u8> = std::iter::repeat_n([0u8, 1], MAX_REACH + 10).flatten().collect();
+        let (mut out, mut budget) = (Vec::new(), u64::MAX);
+        let mut occ = OccCache::with_cap(0);
+        advance_literal(&[(0, buf.len())], &buf[..], &buf[..], b"\0", false, &mut out, &mut budget, &mut occ);
+        assert_eq!(out.len(), MAX_REACH);
+        assert!(scan_was_truncated());
+        reset_scan_truncated();
+    }
+
+    /// `::f` reads the byte before a match and the one after it, so a run of
+    /// hits hemmed in by word bytes is verified one by one at both edges.
+    #[test]
+    fn a_fullword_run_reads_past_its_edges() {
+        let mut b = EngineBuilder::new();
+        b.add_ldb("W;Engine:81-255,Target:0;0;00000000::f", false);
+        let e = b.build();
+        let body = &e.bodies[0];
+        let mut buf = b"a".to_vec();
+        buf.extend(std::iter::repeat_n(0u8, 1000));
+        buf.push(b'a');
+        // Every position the four-byte anchor fits at, and nothing more.
+        let (start, count) = (1, 997);
+        let (mut slow, mut fast) = (Vec::new(), Vec::new());
+        let (mut b1, mut b2) = (SIM_BUDGET, SIM_BUDGET);
+        let (mut o1, mut o2) = (OccCache::new(), OccCache::new());
+        for s in start..start + count {
+            slow.extend(verify(body, &buf[..], s, None, &buf[..], &mut b1, &mut o1));
+        }
+        verify_run(body, &buf[..], start, count, None, &buf[..], &mut b2, &mut o2, &mut |m, n| {
+            fast.extend(m..m + n);
+            false
+        });
+        assert_eq!(fast, slow);
+        assert_eq!(slow.first(), Some(&2), "the fixture must hit both edges");
     }
 }

@@ -1,7 +1,7 @@
 //! ALZ extraction, validated **byte-for-byte against an external oracle**.
 //!
 //! ClamAV ships an ALZ submodule enabled by default; exav had nothing, so an
-//! `.alz` scanned clean — its members are compressed, a raw pattern scan matches
+//! `.alz` scanned clean: its members are compressed, a raw pattern scan matches
 //! nothing, and the file passes. That is the failure mode this crate exists to
 //! prevent.
 //!
@@ -10,7 +10,7 @@
 //! produced by **`unalz` 0.65** (zlib-licensed), and the member list was
 //! independently cross-checked with **`unar`/`lsar`** (The Unarchiver). Two
 //! independent implementations agreeing is what makes this a validation rather
-//! than a round-trip against ourselves — a decoder checked only against its own
+//! than a round-trip against ourselves. A decoder checked only against its own
 //! output emits plausible bytes rather than errors when it is subtly wrong.
 //!
 //! The header layout was derived from this archive by observation, then
@@ -20,7 +20,7 @@
 use exav_unpack::{extract, Budget, Format, Limits};
 use sha2::{Digest, Sha256};
 
-/// `(name, uncompressed size, sha256 prefix)` — every member of the fixture, as
+/// `(name, uncompressed size, sha256 prefix)` for every member of the fixture, as
 /// reported and extracted by `unalz`.
 const EXPECTED: &[(&str, usize, &str)] = &[
     ("lorem_ipsum_long.tif", 1_195_080, "162d8b99fd7e695b"),
@@ -46,7 +46,7 @@ fn extract_all(data: &[u8]) -> Vec<exav_unpack::Entry> {
     // rather than silently truncating and reporting `unsupported`.
     limits.max_buffer_bytes = limits.max_buffer_bytes.max(4 * 1024 * 1024);
     let mut b = Budget::new(limits);
-    extract(Format::Alz, data, &mut b).expect("ALZ extraction must not error")
+    extract(Format::Alz, &data, &mut b).expect("ALZ extraction must not error")
 }
 
 #[test]
@@ -69,7 +69,10 @@ fn every_member_matches_the_oracle_byte_for_byte() {
             e.unsupported
         );
         assert_eq!(e.data.len(), *size, "{name}: wrong decompressed length");
-        let got = format!("{:x}", Sha256::digest(&e.data));
+        let got: String = Sha256::digest(&e.data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert!(
             got.starts_with(digest),
             "{name}: content differs from `unalz` output (sha256 {got}, expected {digest}…). \

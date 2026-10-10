@@ -65,7 +65,7 @@ fn ppt_with(records: &[u8]) -> Vec<u8> {
 
 fn members(blob: &[u8]) -> Vec<exav_unpack::Entry> {
     let mut budget = Budget::new(Limits::default());
-    extract(Format::Ole, blob, &mut budget).expect("ppt extracts")
+    extract(Format::Ole, &blob, &mut budget).expect("ppt extracts")
 }
 
 fn has_marker(entries: &[exav_unpack::Entry]) -> bool {
@@ -132,6 +132,39 @@ fn a_malformed_record_length_terminates_the_walk() {
 
     // Truncated header.
     let _ = members(&ppt_with(b"\x10\x00\x11"));
+}
+
+/// Deflate that turns invalid part way, the marker the last thing before the
+/// damage: what the failing read had already decoded is handed over, with the
+/// damage reported. A decoder that drops the read meeting the damage loses
+/// tens of KiB, the marker among them.
+#[test]
+#[cfg(feature = "ole")]
+fn an_object_damaged_part_way_keeps_what_decoded_before_the_damage() {
+    let mut payload: Vec<u8> = (0..4000u32)
+        .flat_map(|i| format!("slide text line {i}\n").into_bytes())
+        .collect();
+    payload.extend_from_slice(MARKER);
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(&payload).unwrap();
+    // A sync flush ends on a byte boundary with no final block; then a block
+    // of the reserved type, which no decoder gets past.
+    e.flush().unwrap();
+    let mut zlib = vec![0x78, 0x9c];
+    zlib.extend_from_slice(e.get_ref());
+    zlib.push(0x06);
+    zlib.extend_from_slice(&[0x5a; 4096]);
+    let mut body = (payload.len() as u32).to_le_bytes().to_vec();
+    body.extend_from_slice(&zlib);
+    let entries = members(&ppt_with(&container(
+        0x03fa,
+        &record(0x0010, EXT_OLE_OBJ_STG, &body),
+    )));
+    let object = entries
+        .iter()
+        .find(|e| e.data.windows(MARKER.len()).any(|w| w == MARKER))
+        .expect("what decoded before the damage was dropped");
+    assert!(object.unsupported.is_some(), "the damage was not reported");
 }
 
 /// Deflate that stops early: the object is damaged, not absent, so whatever

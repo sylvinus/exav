@@ -9,11 +9,6 @@ yanked = "deny"
 # release available; none is reachable in exav's usage. Revisit on every
 # dependency bump (a fixed release should drop the ignore, not keep it).
 ignore = [
-    # bincode is flagged unmaintained (informational, not a vulnerability). Used
-    # only for fixed-layout, big-endian header parsing of DMG/encrcdsa headers
-    # (crates/exav-unpack/src/formats/dmg.rs). No decode of untrusted
-    # length-prefixed collections; no known defect.
-    "RUSTSEC-2025-0141",
     # NOTE: RUSTSEC-2023-0071 (`rsa` "Marvin") is intentionally NOT listed. `rsa`
     # is not in the tree: the native YARA engine does `pe` via `goblin`
     # and needs no Authenticode RSA, so the advisory has nothing to apply to.

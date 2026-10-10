@@ -71,15 +71,23 @@ pub(crate) fn extract_xar<R>(
 
         budget.count_entry()?;
         let cap = budget.reserve()?;
+        let mut why = None;
         let member = if blk.gzip {
             // Heap data is zlib-wrapped; inflate bounded by the declared size.
-            let want = blk.size.min(cap as usize);
-            let mut out = Vec::new();
-            if ZlibDecoder::new(raw)
-                .take(want as u64 + 1)
-                .read_to_end(&mut out)
-                .is_err()
-            {
+            let want = blk.size.min(cap as usize) as u64;
+            let rest_absent = off.saturating_add(blk.length) > data.len();
+            let s = match crate::inflate::zlib_reader(raw) {
+                Ok(Some(z)) => Some(crate::salvage(z.take(want + 1), cap)),
+                // Cut inside the zlib header: no byte of the stream is here.
+                Err(_) if rest_absent => Some(crate::Salvaged {
+                    data: Vec::new(),
+                    over_cap: false,
+                    undecoded: false,
+                    cut_short: true,
+                }),
+                _ => None,
+            };
+            let Some(s) = s.filter(|s| !(s.undecoded && s.data.is_empty())) else {
                 // The TOC names this member and its bytes are in the heap; the
                 // stream just would not inflate. Dropping it would leave a file
                 // the archive contains with no trace in the result.
@@ -95,11 +103,14 @@ pub(crate) fn extract_xar<R>(
                     return Ok(Some(r));
                 }
                 continue;
-            }
-            if out.len() as u64 > cap {
+            };
+            if s.over_cap {
                 return Err(LimitHit::new(format!("xar member '{name}' exceeds budget")));
             }
-            out
+            why = s.part_way(rest_absent).then_some(
+                "XAR member failed to inflate part way; the bytes before the failure were scanned",
+            );
+            s.data
         } else {
             if raw.len() as u64 > cap {
                 return Err(LimitHit::new(format!("xar member '{name}' exceeds budget")));
@@ -107,7 +118,11 @@ pub(crate) fn extract_xar<R>(
             raw.to_vec()
         };
         budget.commit(member.len() as u64);
-        if let Some(r) = visit(Entry::new(name, member), budget) {
+        let entry = Entry {
+            unsupported: why,
+            ..Entry::new(name, member)
+        };
+        if let Some(r) = visit(entry, budget) {
             return Ok(Some(r));
         }
     }

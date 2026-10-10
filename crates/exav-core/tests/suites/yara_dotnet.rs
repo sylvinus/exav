@@ -100,6 +100,47 @@ fn arrays_and_nested_structs_match_yara_x() {
     }
 }
 
+/// Header fields are the file's; none of them may panic the module, whatever the
+/// value (a sum of a section's address and size, a raw pointer plus an offset,
+/// a stream name running to the end of the file).
+#[test]
+fn fields_at_their_extremes_do_not_panic_the_module() {
+    let db = scanner_for(
+        r#"dotnet.number_of_streams == 99 or dotnet.number_of_resources == 99 or dotnet.number_of_classes == 99 or dotnet.version == "x""#,
+    )
+    .expect("compile");
+    let base = fixture();
+    let mut bad = Vec::new();
+    let mut data = base.clone();
+    for at in (0..base.len() - 4).step_by(4) {
+        for v in [u32::MAX, 1 << 31, 0xFFFF_F000u32, 0xFFFF_FF00u32] {
+            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                analyze(&db, &data, &ScanOptions::default())
+            }));
+            if r.is_err() {
+                bad.push(format!("{at:#x} {v:#x}"));
+            }
+        }
+        data[at..at + 4].copy_from_slice(&base[at..at + 4]);
+    }
+    // The stream table at the end of the metadata root, cut short.
+    for cut in (base.len() - 64..base.len()).step_by(1) {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            analyze(&db, &base[..cut], &ScanOptions::default())
+        }));
+        if r.is_err() {
+            bad.push(format!("cut at {cut:#x}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} panics, first: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(12)]
+    );
+}
+
 #[test]
 fn a_file_that_is_not_dotnet_reads_as_such() {
     // Every other field is left undefined rather than given a wrong value, which

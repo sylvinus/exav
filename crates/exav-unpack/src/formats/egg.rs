@@ -4,17 +4,19 @@
 //! vendor code was consulted: the spec documents the layout completely, which is
 //! the only thing needed here.
 //!
-//! **Every block carries a CRC-32 of its decompressed bytes**, so the format
-//! checks the decoder rather than the decoder checking itself — a member that
-//! decodes to the wrong thing is reported, not handed onward as content. That is
-//! the external oracle this project requires before shipping a decoder, supplied
-//! by the format itself.
+//! **Every block carries a CRC-32 of its decompressed bytes**, which the tests
+//! check the decoders against: the external oracle this project requires
+//! before shipping a decoder, supplied by the format itself. A block that
+//! decodes in full and fails it is scanned all the same, as a ZIP member is,
+//! and reported only when checksums are verified
+//! ([`crate::Budget::set_verify_checksums`]).
 //!
 //! The archive is a chain of self-describing records. Each extension field is
 //! `magic(4) | flags(1) | size(2 or 4) | data`, and a run of them ends at a stop
 //! marker — so an unknown field is skipped by length rather than guessed at, and
-//! a future EGG version stays readable. AZO is ESTsoft's own algorithm and is
-//! not documented; blocks using it are reported.
+//! a future EGG version stays readable. AZO is ESTsoft's own undocumented
+//! algorithm, decoded by a port of the one permissively licensed implementation
+//! (`formats::azo`).
 
 use crate::{Budget, Entry, Format, LimitHit, Sink};
 
@@ -33,12 +35,11 @@ const AZO: u8 = 3;
 const LZMA: u8 = 4;
 
 fn le_u32(d: &[u8], at: usize) -> Option<u32> {
-    d.get(at..at + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    crate::bytes::at(d, at, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn le_u16(d: &[u8], at: usize) -> Option<u16> {
-    d.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    crate::bytes::at(d, at, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
 /// One extension field, already located by its magic.
@@ -58,15 +59,16 @@ fn field(d: &[u8], at: usize) -> Option<Field> {
     if magic == END {
         return None;
     }
-    let flags = *d.get(at + 4)?;
+    let flags = *d.get(at.checked_add(4)?)?;
     // Bit 0 selects a 4-byte length; everything else in the flag byte is the
     // field's own business and must not change how far to skip.
+    let len_at = at.checked_add(5)?;
     let (len, hdr) = if flags & 0x01 != 0 {
-        (le_u32(d, at + 5)? as usize, 9)
+        (le_u32(d, len_at)? as usize, 9)
     } else {
-        (le_u16(d, at + 5)? as usize, 7)
+        (le_u16(d, len_at)? as usize, 7)
     };
-    let body = at + hdr;
+    let body = at.checked_add(hdr)?;
     Some(Field {
         magic,
         body,
@@ -97,7 +99,7 @@ fn extension_run(d: &[u8], mut at: usize) -> (usize, Option<String>, bool) {
         at = f.next;
     }
     // Past the stop marker, when there is one.
-    (at + 4, name, encrypted)
+    (at.saturating_add(4), name, encrypted)
 }
 
 pub(crate) fn extract_egg<R>(
@@ -119,20 +121,20 @@ pub(crate) fn extract_egg<R>(
     let mut encrypted = global_encrypted;
     let mut index = 0usize;
 
-    while p + 4 <= data.len() {
+    while p.saturating_add(4) <= data.len() {
         let Some(magic) = le_u32(data, p) else { break };
         match magic {
             END => break,
             FILE_HEADER => {
                 // magic(4) file-id(4) file-length(8), then this file's fields.
-                let after = p + 16;
+                let after = p.saturating_add(16);
                 let (next, n, enc) = extension_run(data, after);
                 name = n;
                 encrypted = global_encrypted || enc;
                 p = next;
             }
             BLOCK_HEADER => {
-                let Some(hdr) = data.get(p + 4..p + 18) else {
+                let Some(hdr) = crate::bytes::at(data, p.saturating_add(4), 14) else {
                     break;
                 };
                 let algo = hdr[0];
@@ -140,14 +142,17 @@ pub(crate) fn extract_egg<R>(
                 let comp = u32::from_le_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]) as usize;
                 let crc = u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]);
                 // The block's own extension fields, then its payload.
-                let (body, _, _) = extension_run(data, p + 18);
+                let (body, _, _) = extension_run(data, p.saturating_add(18));
                 let Some(end) = body.checked_add(comp) else {
                     break;
                 };
-                let Some(raw) = data.get(body..end) else {
+                // A block cut by the end of the file: what is there is
+                // decoded, the rest is absent.
+                let rest_absent = end > data.len();
+                let Some(raw) = data.get(body..end.min(data.len())) else {
                     break;
                 };
-                p = body + comp;
+                p = end.min(data.len());
                 index += 1;
                 emitted += 1;
 
@@ -160,20 +165,41 @@ pub(crate) fn extract_egg<R>(
                     Entry::unsupported(member, uncomp, true, "encrypted EGG member")
                 } else {
                     match decode_block(algo, raw, uncomp, cap) {
-                        Some((out, false)) if crc32(&out) == crc => {
-                            crate::ratio_guard(raw.len() as u64, out.len() as u64, budget)?;
-                            budget.commit(out.len() as u64);
-                            Entry::new(member, out)
+                        Some(s) if !s.over_cap && (s.undecoded || s.cut_short) => {
+                            // Decoded as far as the block goes. Its CRC-32
+                            // covers bytes that did not decode, so it cannot
+                            // be checked; damage, or a stream that ended
+                            // with bytes of the block after it, is reported.
+                            crate::ratio_guard(raw.len() as u64, s.data.len() as u64, budget)?;
+                            budget.commit(s.data.len() as u64);
+                            let why = s.part_way(rest_absent).then_some(
+                                "EGG block failed to decode part way; the bytes before the \
+                                 failure were scanned",
+                            );
+                            Entry {
+                                unsupported: why,
+                                ..Entry::new(member, s.data)
+                            }
                         }
-                        // Decoded, but not to what the writer recorded. Handing
-                        // these bytes on as content would be scanning a guess.
-                        Some((_, false)) => Entry::unsupported(
+                        // Decoded in full. A CRC-32 mismatch after that
+                        // hides nothing: the bytes are scanned, as a ZIP
+                        // member's are, and reported only when checksums
+                        // are verified.
+                        Some(s)
+                            if !s.over_cap
+                                && (!budget.should_verify_checksums() || crc32(&s.data) == crc) =>
+                        {
+                            crate::ratio_guard(raw.len() as u64, s.data.len() as u64, budget)?;
+                            budget.commit(s.data.len() as u64);
+                            Entry::new(member, s.data)
+                        }
+                        Some(s) if !s.over_cap => Entry::unsupported(
                             member,
                             uncomp,
                             false,
                             "EGG block did not match its recorded CRC-32 after decoding",
                         ),
-                        Some((_, true)) => Entry::unsupported(
+                        Some(_) => Entry::unsupported(
                             member,
                             uncomp,
                             false,
@@ -212,19 +238,23 @@ pub(crate) fn extract_egg<R>(
     Ok(None)
 }
 
-/// Decompress one block. `None` for an algorithm exav cannot decode; the second
-/// tuple field is `true` when the output hit the budget cap and is therefore a
-/// prefix rather than the whole block.
-fn decode_block(algo: u8, raw: &[u8], uncomp: u64, cap: u64) -> Option<(Vec<u8>, bool)> {
+/// Decompress one block, keeping what decoded before an error. `None` for an
+/// algorithm exav cannot decode.
+fn decode_block(algo: u8, raw: &[u8], uncomp: u64, cap: u64) -> Option<crate::Salvaged> {
+    use crate::salvage;
     use std::io::Cursor;
     match algo {
-        STORE => Some((raw.to_vec(), raw.len() as u64 > cap)),
-        DEFLATE => {
-            crate::bounded_read(flate2::read::DeflateDecoder::new(Cursor::new(raw)), cap).ok()
-        }
-        #[cfg(feature = "bzip2")]
-        BZIP2 => crate::bounded_read(bzip2_rs::DecoderReader::new(Cursor::new(raw)), cap).ok(),
-        #[cfg(feature = "lzip")]
+        STORE => Some(crate::Salvaged {
+            data: raw[..raw.len().min(cap as usize)].to_vec(),
+            over_cap: raw.len() as u64 > cap,
+            undecoded: false,
+            cut_short: (raw.len() as u64) < uncomp,
+        }),
+        DEFLATE => Some(salvage(crate::inflate::Inflate::new(raw), cap)),
+        BZIP2 => Some(salvage(
+            super::bzip2_rs::DecoderReader::new(Cursor::new(raw)),
+            cap,
+        )),
         LZMA => {
             // An LZMA block is not a bare stream. It opens with a 4-byte codec
             // record — algorithm, flags, then a u16 property length — followed by
@@ -233,8 +263,8 @@ fn decode_block(algo: u8, raw: &[u8], uncomp: u64, cap: u64) -> Option<(Vec<u8>,
             // The spec's block section does not describe this, so it was read off
             // real archives: the length always reads 5, the five bytes are the
             // usual `5d` + 32-bit dictionary size, and the byte after them is the
-            // 0x00 that opens every LZMA range-coded stream. The CRC-32 check on
-            // the result is what settles it.
+            // 0x00 that opens every LZMA range-coded stream. The result matching
+            // the block's CRC-32 (tests/suites/egg.rs) is what settles it.
             let prop_len = le_u16(raw, 2)? as usize;
             let props_at = 4;
             let props = *raw.get(props_at)?;
@@ -242,21 +272,18 @@ fn decode_block(algo: u8, raw: &[u8], uncomp: u64, cap: u64) -> Option<(Vec<u8>,
             let stream = raw.get(props_at + prop_len..)?;
             // LZMA1 carries no end marker here, so the decoder is told how much
             // to produce; `uncomp` comes from the block header the CRC covers.
-            let rd = lzma_rust2::LzmaReader::new_with_props(
-                Cursor::new(stream),
-                uncomp,
-                props,
-                dict,
-                None,
-            )
-            .ok()?;
-            crate::bounded_read(rd, cap).ok()
+            let lzma = lzma_rust2::LzmaStream::new_with_props(uncomp, props, dict, None).ok()?;
+            Some(salvage(super::lzma::SansIo::new(stream, lzma), cap))
         }
         // ESTsoft's own algorithm. The spec does not document it; the decoder is
         // ported from the one permissively licensed implementation (see
-        // `formats::azo`). The block CRC still decides whether the result is
-        // handed on as content.
-        AZO => super::azo::decompress(raw, cap).map(|o| (o, false)),
+        // `formats::azo`), and checked against the block CRC by the tests.
+        AZO => super::azo::decompress(raw, cap).map(|data| crate::Salvaged {
+            data,
+            over_cap: false,
+            undecoded: false,
+            cut_short: false,
+        }),
         _ => None,
     }
 }
@@ -284,6 +311,19 @@ mod tests {
 
     // The magic itself is tested in `formats::sniff`, which owns it.
 
+    /// A field at the top of the address space is past the end of the data,
+    /// whichever way its offsets are added; the run ends there.
+    #[test]
+    fn a_field_at_the_top_of_the_address_space_ends_the_run() {
+        let d = [0u8; 64];
+        for at in [usize::MAX, usize::MAX - 3, usize::MAX - 8] {
+            assert_eq!(le_u32(&d, at), None);
+            assert_eq!(le_u16(&d, at), None);
+            assert!(field(&d, at).is_none());
+            assert_eq!(extension_run(&d, at), (at.saturating_add(4), None, false));
+        }
+    }
+
     fn members(blob: &[u8]) -> Vec<Entry> {
         let mut b = Budget::new(Limits::default());
         let mut seen = Vec::new();
@@ -307,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_member_round_trips_and_its_crc_is_checked() {
+    fn a_stored_member_round_trips() {
         let payload = b"the quick brown fox\n";
         let blob = build_egg("hello.txt", STORE, payload, crc32(payload));
         let seen = members(&blob);
@@ -317,19 +357,32 @@ mod tests {
         assert!(seen[0].unsupported.is_none());
     }
 
+    /// Every byte of the block was read, so the mismatch hides nothing.
     #[test]
-    fn a_block_whose_crc_disagrees_is_reported_not_delivered() {
-        // The CRC is the only thing standing between a wrong decode and bytes
-        // presented as content, so a mismatch must never yield an Entry::new.
+    fn a_block_whose_crc_disagrees_after_a_full_decode_is_delivered() {
         let payload = b"the quick brown fox\n";
-        let blob = build_egg("hello.txt", STORE, payload, 0xDEAD_BEEF);
+        let blob = build_egg("hello.txt", STORE, payload, crc32(payload) ^ 1);
         let seen = members(&blob);
         assert_eq!(seen.len(), 1);
-        assert!(
-            seen[0].unsupported.is_some(),
-            "a CRC mismatch must be reported: {seen:?}"
-        );
-        assert!(seen[0].data.is_empty(), "and must deliver no content");
+        assert_eq!(seen[0].data, payload, "{seen:?}");
+        assert!(seen[0].unsupported.is_none(), "{seen:?}");
+    }
+
+    #[cfg(feature = "checksums")]
+    #[test]
+    fn a_block_whose_crc_disagrees_is_reported_when_checksums_are_verified() {
+        let payload = b"the quick brown fox\n";
+        let blob = build_egg("hello.txt", STORE, payload, crc32(payload) ^ 1);
+        let mut b = Budget::new(Limits::default());
+        b.set_verify_checksums(true);
+        let mut seen = Vec::new();
+        let _ = extract_egg(&blob, &mut b, &mut |e: Entry, _: &mut Budget| {
+            seen.push(e);
+            None::<()>
+        });
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].unsupported.is_some(), "{seen:?}");
+        assert!(seen[0].data.is_empty(), "{seen:?}");
     }
 
     /// AZO decodes now (see `formats::azo`), but a block that is not a valid AZO

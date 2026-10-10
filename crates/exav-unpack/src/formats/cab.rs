@@ -2,21 +2,30 @@
 use crate::*;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 
+/// Walk a cabinet off its source.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    stream_cab(&mut crate::source::Reader::new(src), budget, visit)
+}
+
 /// Streaming cab extraction (pattern A): each CFFOLDER is decoded as a
 /// forward-only [`FolderReader`] and each file is handed the visitor as a
-/// `take(uncompressed_size)` window — the decompressed folder is never buffered.
-/// Files are emitted folder-by-folder in offset order.
+/// `take(uncompressed_size)` window; the decompressed folder is never buffered.
+/// Files are emitted folder-by-folder in offset order, and a file that starts
+/// before the reader restarts the folder.
 pub(crate) fn stream_cab<R: Read + Seek, T>(
     source: &mut R,
     budget: &mut Budget,
-    visit: crate::stream::StreamVisit<T>,
+    visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
     use crate::formats::cab_parse::cabinet::Cabinet;
     use crate::formats::cab_parse::folder::FolderReader;
-    use crate::stream::{visit_member, MemberMeta};
+    use crate::stream::{emit_stream, MemberMeta};
     let (folder_metas, files) =
         Cabinet::layout(source).map_err(|e| LimitHit::new(format!("cab: {e}")))?;
-    let max_buffer = budget.limits.max_buffer_bytes;
     for (folder_idx, meta) in folder_metas.iter().enumerate() {
         let mut folder_files: Vec<&crate::formats::cab_parse::file::FileEntry> = files
             .iter()
@@ -31,40 +40,63 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
             meta.first_data_offset,
             meta.num_data_blocks,
             meta.compression_type,
-            max_buffer,
         )
         .map_err(|e| LimitHit::new(format!("cab folder: {e}")))?;
         let mut pos = 0u64;
+        // Set once the folder stream fails: past that, offsets no longer
+        // match what the reader would return.
+        let mut stalled = false;
         for f in folder_files {
             let want = f.data_offset as u64;
-            // Both of these are members the cabinet's own directory names, so
-            // they exist; this reader just cannot reach them. Reporting is the
-            // whole difference between "no malware here" and "did not look".
-            if want < pos {
+            if stalled {
                 budget.count_entry()?;
                 let m = MemberMeta {
                     name: f.name().to_string(),
                     comp_size: f.uncompressed_size as u64,
-                    encrypted: false,
-                    unsupported: Some(
-                        "CAB member lies before the current position in its folder \
-                         (this walker reads forward only)",
-                    ),
+                    size: Some(f.uncompressed_size as u64),
+                    unsupported: Some("CAB folder could not be read up to this member"),
+                    ..MemberMeta::default()
                 };
                 if let Some(t) = visit(&m, None, budget) {
                     return Ok(Some(t));
                 }
                 continue;
             }
-            let skipped = skip_forward(&mut reader, want - pos);
+            // A member starting before the reader shares bytes with the one
+            // before it: MSI cabinets list a file installed under two names
+            // twice at one offset. Decode the folder again from its start. The
+            // bytes decoded twice are charged to the scan budget, which bounds
+            // a cabinet built to force a restart per member.
+            if want < pos {
+                budget.charge_scan(want)?;
+                drop(reader);
+                reader = FolderReader::new(
+                    &mut *source,
+                    meta.first_data_offset,
+                    meta.num_data_blocks,
+                    meta.compression_type,
+                )
+                .map_err(|e| LimitHit::new(format!("cab folder: {e}")))?;
+                pos = 0;
+            }
+            // A member the cabinet's own directory names exists; when this
+            // reader cannot reach it, reporting is the whole difference between
+            // "no malware here" and "did not look".
+            let (skipped, failed) = skip_forward(&mut reader, want - pos);
             pos += skipped;
+            stalled = failed;
             if pos < want {
                 budget.count_entry()?;
                 let m = MemberMeta {
                     name: f.name().to_string(),
                     comp_size: f.uncompressed_size as u64,
-                    encrypted: false,
-                    unsupported: Some("CAB folder ended before this member's offset"),
+                    size: Some(f.uncompressed_size as u64),
+                    unsupported: Some(if failed {
+                        "CAB folder could not be read up to this member"
+                    } else {
+                        "CAB folder ended before this member's offset"
+                    }),
+                    ..MemberMeta::default()
                 };
                 if let Some(t) = visit(&m, None, budget) {
                     return Ok(Some(t));
@@ -75,15 +107,15 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
             let meta_m = MemberMeta {
                 name: f.name().to_string(),
                 comp_size: f.uncompressed_size as u64,
-                encrypted: false,
-                unsupported: None,
+                size: Some(f.uncompressed_size as u64),
+                ..MemberMeta::default()
             };
             let r = {
                 let mut window = (&mut reader).take(f.uncompressed_size as u64);
-                let out = visit_member(&meta_m, &mut window, budget, visit)?;
+                let out = emit_stream(&meta_m, &mut window, budget, visit)?;
                 // Drain any bytes the visitor left so `pos` advances by the full
                 // size and the next file lands at the right offset.
-                let _ = std::io::copy(&mut window, &mut std::io::sink());
+                stalled = std::io::copy(&mut window, &mut std::io::sink()).is_err();
                 out
             };
             pos = want + f.uncompressed_size as u64;
@@ -95,8 +127,9 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
     Ok(None)
 }
 
-/// Read and discard up to `n` bytes; returns how many were skipped.
-fn skip_forward<R: Read>(r: &mut R, n: u64) -> u64 {
+/// Read and discard up to `n` bytes; returns how many were skipped, and whether
+/// the reader failed rather than ended.
+fn skip_forward<R: Read>(r: &mut R, n: u64) -> (u64, bool) {
     let mut skipped = 0u64;
     let mut buf = [0u8; 8192];
     while skipped < n {
@@ -104,78 +137,9 @@ fn skip_forward<R: Read>(r: &mut R, n: u64) -> u64 {
         match r.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(k) => skipped += k as u64,
-            Err(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (skipped, true),
         }
     }
-    skipped
-}
-
-pub(crate) fn extract_cab<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    let patched = repair_cab_size(data);
-    let src: &[u8] = patched.as_deref().unwrap_or(data);
-    let mut cursor = Cursor::new(src);
-    let cabinet = crate::formats::cab_parse::cabinet::Cabinet::new(
-        &mut cursor,
-        budget.limits.max_buffer_bytes,
-    )
-    .map_err(|e| LimitHit::new(format!("cab: {e}")))?;
-
-    for file_entry in cabinet.file_entries() {
-        budget.count_entry()?;
-        let cap = budget.reserve()?;
-        let name = file_entry.name().to_string();
-        // By entry, not by name: two members can share a name, and a name lookup
-        // would hand back the first one's bytes twice and never the second's.
-        let reader = match cabinet.read_entry(file_entry) {
-            Ok(r) => r,
-            Err(_) => {
-                if let Some(r) = visit(
-                    Entry::unsupported(name, 0, false, "corrupt CAB member"),
-                    budget,
-                ) {
-                    return Ok(Some(r));
-                }
-                continue;
-            }
-        };
-        let buf = tolerant_read(reader, cap);
-        budget.commit(buf.len() as u64);
-        if let Some(r) = visit(Entry::new(name, buf), budget) {
-            return Ok(Some(r));
-        }
-    }
-    Ok(None)
-}
-
-fn tolerant_read<R: Read>(mut r: R, cap: u64) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    while (buf.len() as u64) < cap {
-        match r.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                let room = (cap - buf.len() as u64) as usize;
-                buf.extend_from_slice(&chunk[..n.min(room)]);
-            }
-            Err(_) => break,
-        }
-    }
-    buf
-}
-
-fn repair_cab_size(data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 12 || &data[0..4] != b"MSCF" {
-        return None;
-    }
-    let declared = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as u64;
-    if declared <= data.len() as u64 {
-        return None;
-    }
-    let mut out = data.to_vec();
-    out[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    Some(out)
+    (skipped, false)
 }

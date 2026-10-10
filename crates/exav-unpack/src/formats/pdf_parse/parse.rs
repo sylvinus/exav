@@ -128,7 +128,14 @@ fn read_stream_data(lex: &mut Lexer) -> Vec<u8> {
     let remaining = lex.remaining();
     if let Some(end) = find_endstream(remaining) {
         let stream_end = start + end;
-        let data = lex.remaining()[..end].to_vec();
+        // The end of line before `endstream` is not part of the data.
+        let data = &remaining[..end];
+        let data = data
+            .strip_suffix(b"\r\n")
+            .or_else(|| data.strip_suffix(b"\n"))
+            .or_else(|| data.strip_suffix(b"\r"))
+            .unwrap_or(data)
+            .to_vec();
         lex.set_pos(stream_end);
         // Skip "endstream"
         let _ = lex.next_token();

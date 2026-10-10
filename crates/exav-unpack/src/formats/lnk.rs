@@ -210,9 +210,9 @@ mod tests {
         // Real in-the-wild malware shortcuts (Unicode, with TargetIDList +
         // LinkInfo). We only require that extraction terminates without a panic
         // or out-of-bounds read. The samples are real malware, so they are
-        // gitignored (not committed) and read at runtime — the test skips any
-        // that aren't present locally (fresh clone / CI). sha256 provenance is
-        // in the dir's README.md.
+        // gitignored (not committed), kept locally in AES ZIPs and read at
+        // runtime; the test skips any that aren't present locally (fresh
+        // clone / CI). sha256 provenance is in the dir's README.md.
         let names = [
             "real-malware-1.lnk",
             "real-malware-2.lnk",
@@ -220,8 +220,18 @@ mod tests {
         ];
         for name in names {
             let path = format!("{}/tests/fixtures/lnk/{name}", env!("CARGO_MANIFEST_DIR"));
-            let Ok(blob) = crate::read_fixture(&path) else {
-                continue;
+            let blob = match crate::read_fixture(&path) {
+                Ok(blob) => blob,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    eprintln!("skipping {name}: {e}");
+                    continue;
+                }
+                Err(e) => panic!("{name}: {e}"),
             };
             let mut budget = Budget::new(Limits::default());
             // Must not panic; a well-formed sample yields at least one member.

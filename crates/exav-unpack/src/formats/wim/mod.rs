@@ -16,12 +16,15 @@
 //!   file resources    -> chunk-compressed data
 //! ```
 //!
-//! **Every resource is checked against the SHA-1 the image records for it.** A
-//! chunk decoder that is subtly wrong does not fail — it produces plausible
-//! bytes that are not the file, and a signature that fails to match those reads
-//! exactly like a clean file. The hash is what separates "decoded" from
-//! "decoded correctly", so a resource that fails it is reported rather than
-//! handed over.
+//! The image records the SHA-1 of every resource. A resource that decodes in
+//! full and fails it is scanned all the same, as a ZIP member failing its
+//! CRC-32 is: the bytes are there, and an attacker sets the hash as easily as
+//! the data. With checksums verified (`Budget::set_verify_checksums`) it is
+//! reported instead.
+
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
 
@@ -66,19 +69,19 @@ enum Codec {
 }
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
 
 fn le_u64(d: &[u8], off: usize) -> u64 {
-    d.get(off..off + 8)
+    crate::bytes::at(d, off, 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
         .unwrap_or(0)
 }
@@ -97,14 +100,15 @@ struct Resource {
 /// and the uncompressed size.
 fn resource_header(data: &[u8], off: usize) -> Resource {
     let mut size = 0u64;
-    for i in 0..7 {
-        size |= (data.get(off + i).copied().unwrap_or(0) as u64) << (i * 8);
+    for i in 0..7usize {
+        let b = data.get(off.saturating_add(i)).copied().unwrap_or(0);
+        size |= u64::from(b) << i.saturating_mul(8);
     }
     Resource {
         size_in_wim: size,
-        flags: data.get(off + 7).copied().unwrap_or(0),
-        offset: le_u64(data, off + 8),
-        original_size: le_u64(data, off + 16),
+        flags: data.get(off.saturating_add(7)).copied().unwrap_or(0),
+        offset: le_u64(data, off.saturating_add(8)),
+        original_size: le_u64(data, off.saturating_add(16)),
         hash: [0; HASH_LEN],
     }
 }
@@ -120,7 +124,7 @@ fn sha1_of(data: &[u8]) -> [u8; HASH_LEN] {
 }
 
 /// Decompress one resource. `Err` names a reason worth reporting; `Ok` bytes are
-/// still unverified until checked against the recorded hash.
+/// not checked against the recorded hash here.
 fn read_resource(
     data: &[u8],
     res: &Resource,
@@ -128,10 +132,8 @@ fn read_resource(
     chunk_size: u32,
     budget: &mut Budget,
 ) -> Result<Vec<u8>, &'static str> {
-    let start = res.offset as usize;
-    let end = start.saturating_add(res.size_in_wim as usize);
-    let raw = data
-        .get(start..end)
+    let start = crate::bytes::to_usize(res.offset);
+    let raw = crate::bytes::at(data, start, crate::bytes::to_usize(res.size_in_wim))
         .ok_or("WIM resource lies outside the image")?;
 
     if res.flags & RESOURCE_COMPRESSED == 0 {
@@ -144,40 +146,42 @@ fn read_resource(
     if res.original_size > cap {
         return Err("WIM resource exceeds max-buffer");
     }
+    let original = crate::bytes::to_usize(res.original_size);
     let chunk = chunk_size.max(1) as usize;
-    let n_chunks = (res.original_size as usize).div_ceil(chunk).max(1);
+    let n_chunks = original.div_ceil(chunk).max(1);
 
     // The chunk table gives the start of chunks 1..n-1 relative to the end of
     // the table; chunk 0 always starts there. Entries are u32 unless the
     // uncompressed resource is over 4 GiB.
     let wide = res.original_size > u32::MAX as u64;
     let entry = if wide { 8 } else { 4 };
-    let table_len = (n_chunks - 1) * entry;
+    let table_len = n_chunks.saturating_sub(1).saturating_mul(entry);
     let table = raw.get(..table_len).ok_or("WIM chunk table is truncated")?;
     let body = &raw[table_len..];
 
     let chunk_start = |i: usize| -> usize {
+        let at = i.saturating_sub(1).saturating_mul(entry);
         if i == 0 {
             0
         } else if wide {
-            le_u64(table, (i - 1) * 8) as usize
+            crate::bytes::to_usize(le_u64(table, at))
         } else {
-            le_u32(table, (i - 1) * 4) as usize
+            le_u32(table, at) as usize
         }
     };
 
-    let mut out = Vec::with_capacity(res.original_size as usize);
+    let mut out = Vec::with_capacity(original);
     for i in 0..n_chunks {
         let s = chunk_start(i);
-        let e = if i + 1 < n_chunks {
-            chunk_start(i + 1)
+        let e = if i.saturating_add(1) < n_chunks {
+            chunk_start(i.saturating_add(1))
         } else {
             body.len()
         };
         let Some(cdata) = body.get(s..e.max(s)) else {
             return Err("WIM chunk lies outside its resource");
         };
-        let want = chunk.min(res.original_size as usize - out.len());
+        let want = chunk.min(original.saturating_sub(out.len()));
         // A chunk that did not compress is stored verbatim, and is then exactly
         // as long as what it decodes to.
         if cdata.len() >= want {
@@ -194,7 +198,7 @@ fn read_resource(
         };
         out.extend_from_slice(&decoded);
     }
-    out.truncate(res.original_size as usize);
+    out.truncate(original);
     Ok(out)
 }
 
@@ -225,9 +229,11 @@ pub(crate) fn extract_wim<R>(
 
     // The offset table is itself a resource.
     let table_res = resource_header(data, 48);
-    let ts = table_res.offset as usize;
-    let te = ts.saturating_add(table_res.size_in_wim as usize);
-    let Some(table) = data.get(ts..te) else {
+    let Some(table) = crate::bytes::at(
+        data,
+        crate::bytes::to_usize(table_res.offset),
+        crate::bytes::to_usize(table_res.size_in_wim),
+    ) else {
         budget.count_entry()?;
         return Ok(visit(
             Entry::unsupported(
@@ -241,15 +247,16 @@ pub(crate) fn extract_wim<R>(
     };
 
     let mut resources: Vec<Resource> = Vec::new();
-    for i in 0..(table.len() / TABLE_ENTRY_LEN).min(MAX_RESOURCES) {
-        let o = i * TABLE_ENTRY_LEN;
+    let listed = table.len().checked_div(TABLE_ENTRY_LEN).unwrap_or(0);
+    for i in 0..listed.min(MAX_RESOURCES) {
+        let o = i.saturating_mul(TABLE_ENTRY_LEN);
         let mut r = resource_header(table, o);
-        if let Some(h) = table.get(o + 30..o + 30 + HASH_LEN) {
+        if let Some(h) = crate::bytes::at(table, o.saturating_add(30), HASH_LEN) {
             r.hash.copy_from_slice(h);
         }
         resources.push(r);
     }
-    if table.len() / TABLE_ENTRY_LEN > MAX_RESOURCES {
+    if listed > MAX_RESOURCES {
         budget.count_entry()?;
         if let Some(r) = visit(
             Entry::unsupported(
@@ -307,10 +314,10 @@ pub(crate) fn extract_wim<R>(
         budget.count_entry()?;
         let decoded = read_resource(data, res, codec, chunk_size, budget);
         let bytes = match decoded {
-            // The image records a SHA-1 per resource. A chunk codec that is
-            // subtly wrong yields plausible bytes rather than an error, so this
-            // is the only thing distinguishing content from garbage.
-            Ok(b) if sha1_of(&b) == res.hash => b,
+            // Decoded in full. A SHA-1 mismatch after that hides nothing: the
+            // bytes are scanned, as a ZIP member's are, and reported only when
+            // checksums are verified.
+            Ok(b) if !budget.should_verify_checksums() || sha1_of(&b) == res.hash => b,
             Ok(_) => {
                 if let Some(r) = visit(
                     Entry::unsupported(
@@ -353,26 +360,29 @@ pub(crate) fn extract_wim<R>(
 fn collect_names(meta: &[u8], out: &mut HashMap<[u8; HASH_LEN], String>) {
     // The security table comes first: its own length, rounded up to 8.
     let sec_len = le_u32(meta, 0) as usize;
-    let root = sec_len.next_multiple_of(8);
+    let Some(root) = sec_len.checked_next_multiple_of(8) else {
+        return;
+    };
     let mut stack = vec![(root, String::new())];
     let mut walked = 0usize;
 
     while let Some((mut off, prefix)) = stack.pop() {
         loop {
-            walked += 1;
+            walked = walked.saturating_add(1);
             if walked > MAX_DENTRIES {
                 return;
             }
-            let len = le_u64(meta, off) as usize;
-            if len < DENTRY_NAME_OFF || off + len > meta.len() {
+            let len = crate::bytes::to_usize(le_u64(meta, off));
+            if len < DENTRY_NAME_OFF || len > meta.len().saturating_sub(off) {
                 break; // an end-of-directory marker is a zero length
             }
-            let attributes = le_u32(meta, off + 8);
-            let subdir = le_u64(meta, off + 16) as usize;
-            let name_len = le_u16(meta, off + DENTRY_NAME_LEN_OFF) as usize;
-            let name_at = off + DENTRY_NAME_OFF;
+            let attributes = le_u32(meta, off.saturating_add(8));
+            let subdir = crate::bytes::to_usize(le_u64(meta, off.saturating_add(16)));
+            let name_len = le_u16(meta, off.saturating_add(DENTRY_NAME_LEN_OFF)) as usize;
+            let name_at = off.saturating_add(DENTRY_NAME_OFF);
             let name = meta
-                .get(name_at..name_at + name_len)
+                .get(name_at..)
+                .and_then(|rest| rest.get(..name_len))
                 .map(|raw| {
                     let units: Vec<u16> = raw
                         .as_chunks::<2>()
@@ -397,13 +407,16 @@ fn collect_names(meta: &[u8], out: &mut HashMap<[u8; HASH_LEN], String>) {
                 if subdir != 0 && subdir < meta.len() {
                     stack.push((subdir, path.clone()));
                 }
-            } else if let Some(h) = meta.get(off + 64..off + 64 + HASH_LEN) {
+            } else if let Some(h) = crate::bytes::at(meta, off.saturating_add(64), HASH_LEN) {
                 let mut hash = [0u8; HASH_LEN];
                 hash.copy_from_slice(h);
                 out.entry(hash).or_insert(path);
             }
             // Dentries are padded to an 8-byte boundary.
-            off += len.next_multiple_of(8);
+            let Some(padded) = len.checked_next_multiple_of(8) else {
+                break;
+            };
+            off = off.saturating_add(padded);
         }
     }
 }
@@ -415,6 +428,10 @@ fn collect_names(meta: &[u8], out: &mut HashMap<[u8; HASH_LEN], String>) {
 /// little-endian words into a left-aligned 32-bit window, most significant bit
 /// first — and long match lengths escape into *bytes* taken from the same
 /// position, so the bit reader and the byte reader share one cursor.
+// A codec, as `lzx` is: its sums are on bit counts, code lengths of 15 or
+// less and a 16-bit offset slot, and on positions inside the chunk it was
+// handed.
+#[allow(clippy::arithmetic_side_effects)]
 mod xpress {
     const TABLE_BYTES: usize = 256;
     const SYMBOLS: usize = 512;

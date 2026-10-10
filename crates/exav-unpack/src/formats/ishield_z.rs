@@ -98,15 +98,26 @@ pub(crate) fn extract_ishield_z<R>(
         }
         // Addressed by the raw path the listing gave; nothing constructs a name
         // of its own here.
-        match archive.load(&path) {
-            // `explode` returns a whole `Vec` with no cap of its own, so the
-            // output is checked after the fact rather than while decoding. The
-            // bound that makes this safe is the one above: the input is already
-            // capped, and DCL implode's 4 KiB window cannot turn a bounded input
-            // into an unbounded output. An over-cap result is still reported —
-            // discarded bytes that nobody hears about are the failure mode this
-            // crate exists to avoid.
-            Ok(bytes) if bytes.len() as u64 > cap => {
+        //
+        // `Archive::load` explodes a member whole, with no cap: the codec's
+        // matches run to 518 bytes, so a bounded input can expand a few hundred
+        // times over. The compressed bytes are taken instead and read through
+        // the decoder up to the cap. An over-cap result is still reported:
+        // discarded bytes that nobody hears about are the failure mode this
+        // crate exists to avoid.
+        let loaded = archive
+            .load_compressed(&path)
+            .map_err(|_| ())
+            .and_then(|raw| {
+                let s = crate::salvage(explode::ExplodeReader::new(Cursor::new(raw)), cap);
+                if s.over_cap || !s.undecoded {
+                    Ok(s)
+                } else {
+                    Err(())
+                }
+            });
+        match loaded.map(|s| (s.over_cap, s.data)) {
+            Ok((true, _)) => {
                 if let Some(r) = visit(
                     Entry::unsupported(
                         name,
@@ -120,7 +131,7 @@ pub(crate) fn extract_ishield_z<R>(
                     return Ok(Some(r));
                 }
             }
-            Ok(bytes) => {
+            Ok((false, bytes)) => {
                 budget.commit(bytes.len() as u64);
                 let mut e = Entry::new(name, bytes);
                 e.comp_size = comp_size as u64;
@@ -128,9 +139,8 @@ pub(crate) fn extract_ishield_z<R>(
                     return Ok(Some(r));
                 }
             }
-            Err(e) => {
+            Err(()) => {
                 // One member exav cannot decode must not stop the rest.
-                let _ = e;
                 if let Some(r) = visit(
                     Entry::unsupported(
                         name,

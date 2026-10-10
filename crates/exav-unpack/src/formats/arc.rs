@@ -18,10 +18,11 @@
 //! original 1985 layout, which has no `orig_size` field, so its header is four
 //! bytes shorter.
 //!
-//! Every member carries a **CRC-16 of its uncompressed bytes**, and exav checks
-//! it on each one. That is what makes the less-common methods safe to attempt: a
-//! decoder that is subtly wrong produces plausible bytes rather than an error,
-//! and without the check those bytes would be scanned as if they were the file.
+//! Every member carries a **CRC-16 of its uncompressed bytes**. A member that
+//! decodes in full and fails it is scanned all the same, as a ZIP member
+//! failing its CRC-32 is; with checksums verified
+//! (`Budget::set_verify_checksums`) it is reported instead. The tests compare
+//! decoded members with the files that went in.
 
 use crate::{Budget, Entry, LimitHit, Sink};
 
@@ -49,13 +50,13 @@ const MIN_WIDTH: u32 = 9;
 const MAX_MEMBERS: usize = 4096;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
-    d.get(off..off + 2)
+    crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0)
 }
 
 fn le_u32(d: &[u8], off: usize) -> u32 {
-    d.get(off..off + 4)
+    crate::bytes::at(d, off, 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .unwrap_or(0)
 }
@@ -89,7 +90,7 @@ fn crc16(data: &[u8]) -> u16 {
 /// NUL padding rejects most genuine archives while happening to accept the
 /// tidier ones, which is the worst of both.
 fn plausible_header(data: &[u8], off: usize) -> bool {
-    let Some(h) = data.get(off..off + HEADER_LEN_V1) else {
+    let Some(h) = crate::bytes::at(data, off, HEADER_LEN_V1) else {
         return false;
     };
     if h[0] != MARKER || h[1] == 0 || h[1] > MAX_METHOD {
@@ -120,6 +121,12 @@ fn next_header(data: &[u8], off: usize) -> Option<usize> {
 /// somewhere meaningful: the end-of-archive marker, another header, or the end
 /// of a truncated file. Arbitrary data does not chain.
 pub(crate) fn is_arc(data: &[u8]) -> bool {
+    is_arc_in(&crate::Probe::whole(data))
+}
+
+/// [`is_arc`] for the object `p` looks at.
+pub(crate) fn is_arc_in(p: &crate::Probe) -> bool {
+    let data = p.head;
     if !plausible_header(data, 0) {
         return false;
     }
@@ -128,10 +135,11 @@ pub(crate) fn is_arc(data: &[u8]) -> bool {
     };
     // A member whose data runs past the end is a truncated archive, which is
     // still an archive.
-    if next >= data.len() {
+    if next >= p.len {
         return true;
     }
-    data.get(next..next + 2) == Some(&[MARKER, 0][..]) || plausible_header(data, next)
+    let at_next = p.window(next, HEADER_LEN_V1);
+    at_next.get(..2) == Some(&[MARKER, 0][..]) || plausible_header(&at_next, 0)
 }
 
 /// Undo the run-length coding: `DLE n` repeats the preceding byte, and `DLE 00`
@@ -177,7 +185,8 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
     let table_cap = 1usize << max_width;
     let mut prefix = vec![0u16; table_cap];
     let mut suffix = vec![0u8; table_cap];
-    let mut next = FIRST_FREE;
+    // 65,536 once the table is full, which a `u16` cannot hold.
+    let mut next = u32::from(FIRST_FREE);
     let mut width = MIN_WIDTH;
     let mut prev: Option<u16> = None;
     let mut out: Vec<u8> = Vec::new();
@@ -200,7 +209,7 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
         let code = code as u16;
 
         if code == CLEAR {
-            next = FIRST_FREE;
+            next = u32::from(FIRST_FREE);
             width = MIN_WIDTH;
             prev = None;
             continue;
@@ -208,7 +217,13 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
 
         stack.clear();
         let mut c = code;
-        if code >= next {
+        // A code past the next free one is in no encoder's output. Taken for
+        // the KwKwK case it would become the prefix of the next code defined,
+        // which can then be its own prefix: the expansion below never ends.
+        if u32::from(code) > next {
+            return None;
+        }
+        if u32::from(code) == next {
             // KwKwK: the code is the one about to be defined, so it expands to
             // the previous string followed by its own first byte.
             let p = prev?;
@@ -295,7 +310,7 @@ pub(crate) fn extract_arc<R>(
     let mut pos = 0usize;
     let mut members = 0usize;
 
-    while pos + HEADER_LEN_V1 <= data.len() {
+    while pos.saturating_add(HEADER_LEN_V1) <= data.len() {
         if data[pos] != MARKER {
             break;
         }
@@ -376,13 +391,27 @@ pub(crate) fn extract_arc<R>(
             }
         } else {
             let decoded = decode(method, body, orig_size);
-            // The archive records a CRC-16 per member. A decoder that is subtly
-            // wrong yields plausible bytes rather than an error, so this is what
-            // separates content from garbage.
+            // `Some` is the whole body decoded. A CRC-16 or size mismatch after
+            // that hides nothing: the bytes are scanned, as a ZIP member's are,
+            // and reported only when checksums are verified.
             let entry = match decoded {
-                Some(b) if b.len() == orig_size && crc16(&b) == crc => {
-                    budget.commit(b.len() as u64);
-                    Entry::new(name, b)
+                Some(b)
+                    if !budget.should_verify_checksums()
+                        || (b.len() == orig_size && crc16(&b) == crc) =>
+                {
+                    // A stored body is as long as the member's packed size,
+                    // whatever its original size says.
+                    if b.len() > cap {
+                        Entry::unsupported(
+                            name,
+                            comp_size as u64,
+                            false,
+                            "ARC member exceeds the per-member size budget",
+                        )
+                    } else {
+                        budget.commit(b.len() as u64);
+                        Entry::new(name, b)
+                    }
                 }
                 Some(_) => Entry::unsupported(
                     name,

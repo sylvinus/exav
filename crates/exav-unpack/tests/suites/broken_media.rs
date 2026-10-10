@@ -134,6 +134,21 @@ fn a_truncated_gif_names_where_it_broke() {
     );
 }
 
+/// An extension whose sub-block runs past the end of the file is flagged,
+/// not taken for a well-formed image.
+#[test]
+fn a_gif_extension_sub_block_past_eof_is_flagged() {
+    let mut g = valid_gif();
+    let pos = g.iter().position(|&b| b == 0x2C).expect("descriptor");
+    g.truncate(pos);
+    // A comment extension declaring a 100-byte sub-block, 3 bytes of it there.
+    g.extend_from_slice(&[0x21, 0xFE, 100, b'a', b'b', b'c']);
+    assert_eq!(
+        broken_media_alert(&g),
+        Some("Heuristics.Broken.Media.GIF.TruncatedExtensionSubBlock")
+    );
+}
+
 #[test]
 fn a_gif_with_an_unknown_block_label_is_flagged() {
     let mut g = valid_gif();
@@ -214,6 +229,20 @@ fn a_jpeg_segment_running_past_eof_is_flagged() {
     );
 }
 
+/// clamscan takes a file for a JPEG only from `FF D8 FF`: the same damaged
+/// segment one junk byte after the SOI is not judged at all.
+#[test]
+fn a_jpeg_needs_ff_d8_ff_to_be_judged() {
+    let mut j = valid_jpeg();
+    j[4] = 0xF0;
+    assert!(
+        broken_media_alert(&j).is_some(),
+        "the control is not broken"
+    );
+    j.insert(2, 0x00);
+    assert_eq!(broken_media_alert(&j), None);
+}
+
 #[test]
 fn a_jpeg_segment_length_below_two_is_impossible() {
     let mut j = valid_jpeg();
@@ -243,24 +272,105 @@ fn a_duplicate_jfif_marker_is_flagged() {
     );
 }
 
+/// Junk before a marker is skipped when the marker is within 16 bytes, as
+/// clamscan skips it, and reported when it is not.
 #[test]
-fn stray_bytes_between_jpeg_segments_are_flagged() {
-    let mut j = valid_jpeg();
-    // Splice non-marker bytes where a marker must begin.
-    j.splice(2..2, [0x41, 0x42, 0x43]);
-    assert_eq!(
-        broken_media_alert(&j),
-        Some("Heuristics.Broken.Media.JPEG.SpuriousBytesBeforeSegment")
-    );
+fn stray_bytes_between_jpeg_segments_are_flagged_past_fifteen() {
+    let after_app0 = 2 + 18;
+    for (junk, want) in [
+        (14, None),
+        (
+            15,
+            Some("Heuristics.Broken.Media.JPEG.SpuriousBytesBeforeSegment"),
+        ),
+    ] {
+        let mut j = valid_jpeg();
+        j.splice(after_app0..after_app0, std::iter::repeat_n(0x41, junk));
+        assert_eq!(broken_media_alert(&j), want, "{junk} bytes");
+    }
 }
 
+/// What clamscan names, from crafted inputs: it takes a file for a JPEG only
+/// from 6 bytes and `FF D8 FF`, reads a length after every marker before the
+/// scan (EOI and the restart markers too), and wants JFIF first, after
+/// nothing but comments and APP1 segments.
 #[test]
-fn a_jpeg_with_no_frame_is_flagged() {
-    // SOI then straight to EOI: no frame, so nothing to decode.
-    assert_eq!(
-        broken_media_alert(&[0xFF, 0xD8, 0xFF, 0xD9]),
-        Some("Heuristics.Broken.Media.JPEG.NoImages")
-    );
+fn jpeg_names_follow_clamscan() {
+    let seg = |m: u8, body: &[u8]| {
+        let mut s = vec![0xFF, m];
+        s.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        s.extend_from_slice(body);
+        s
+    };
+    let jfif = seg(0xE0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+    let exif = seg(0xE1, b"Exif\0\0\0\0\0\0\0\0\0\0\0\0");
+    let icc = seg(0xE2, b"ICC_PROFILE\0\0\0\0\0");
+    let spiff = seg(0xE8, b"SPIFF\0\0\0\0\0\0\0\0\0\0\0");
+    let jfxx = seg(0xE0, b"JFXX\0\x10\0\0\0\0\0\0\0\0\0");
+    let scan = valid_jpeg()[2 + 18..].to_vec();
+    let jpeg = |parts: &[&[u8]]| {
+        let mut j = vec![0xFF, 0xD8];
+        for p in parts {
+            j.extend_from_slice(p);
+        }
+        j
+    };
+    for (what, j, want) in [
+        ("junk after SOI", jpeg(&[b"ABC", &jfif, &scan]), None),
+        ("SOI then EOI", jpeg(&[&[0xFF, 0xD9]]), None),
+        (
+            "EOI before the scan",
+            jpeg(&[&jfif, &[0xFF, 0xD9]]),
+            Some("CantReadSegmentSize"),
+        ),
+        (
+            "RST before the scan",
+            jpeg(&[&jfif, &[0xFF, 0xD0], &scan]),
+            Some("SegmentDataOutOfFile"),
+        ),
+        ("Exif then JFIF", jpeg(&[&exif, &jfif, &scan]), None),
+        (
+            "ICC then JFIF",
+            jpeg(&[&icc, &jfif, &scan]),
+            Some("JFIFmarkerBadPosition"),
+        ),
+        ("JFIF then JFXX", jpeg(&[&jfif, &jfxx, &scan]), None),
+        (
+            "JFIF then SPIFF",
+            jpeg(&[&jfif, &spiff, &scan]),
+            Some("SPIFFdupAppMarker"),
+        ),
+        (
+            "SPIFF then Exif",
+            jpeg(&[&spiff, &exif, &scan]),
+            Some("ExifDupAppMarker"),
+        ),
+        (
+            "ICC then SPIFF",
+            jpeg(&[&icc, &spiff, &scan]),
+            Some("SPIFFmarkerBadPosition"),
+        ),
+        // The start of scan's own header is checked too (from go-fuzz's JPEG
+        // corpus): a length past the end, or one short of itself.
+        (
+            "SOS past the end",
+            jpeg(&[&jfif, &[0xFF, 0xDA, 0x00, 0x0E]]),
+            Some("SegmentDataOutOfFile"),
+        ),
+        (
+            "SOS length 1",
+            jpeg(&[&jfif, &[0xFF, 0xDA, 0x00, 0x01, 0, 0]]),
+            Some("InvalidSegmentSize"),
+        ),
+        (
+            "SOS cut in its length",
+            jpeg(&[&jfif, &[0xFF, 0xDA, 0x00]]),
+            Some("CantReadSegmentSize"),
+        ),
+    ] {
+        let want = want.map(|n| format!("Heuristics.Broken.Media.JPEG.{n}"));
+        assert_eq!(broken_media_alert(&j).map(str::to_string), want, "{what}");
+    }
 }
 
 #[test]

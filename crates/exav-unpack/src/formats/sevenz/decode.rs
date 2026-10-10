@@ -3,7 +3,9 @@
 
 use super::header::Coder;
 use super::parse::*;
+use crate::formats::lzma::SansIo;
 use crate::LimitHit;
+use lzma_rust2::filter::bcj::BcjReader;
 use std::io::{self, Read};
 
 /// Return true if `id` is a codec we can decode.
@@ -68,18 +70,17 @@ pub(super) fn wrap_coder(
             // Bound the up-front dictionary allocation. `expected_size` is a
             // header var-int and nothing else bounds it, so it is no ceiling on
             // its own; `max_buffer` is. Keep the declared output as the tighter
-            // of the two — a dictionary larger than the bytes it will be used to
+            // of the two: a dictionary larger than the bytes it will be used to
             // look back into cannot be consulted.
             let dict_size = crate::bounded_dict(dict_size, (expected_size as u64).min(max_buffer));
-            let decoder = lzma_rust2::LzmaReader::new_with_props(
-                inner,
+            let lzma = lzma_rust2::LzmaStream::new_with_props(
                 expected_size as u64,
                 props,
                 dict_size,
                 None,
             )
             .map_err(|e| LimitHit::corrupt(format!("7z: LZMA init: {e}")))?;
-            Ok(Box::new(decoder))
+            Ok(Box::new(SansIo::new(inner, lzma)))
         }
 
         x if x == ID_LZMA2 => {
@@ -94,8 +95,11 @@ pub(super) fn wrap_coder(
             } else {
                 (2 | (dict_size_bits & 1)) << (dict_size_bits / 2 + 11)
             };
-            let decoder = lzma_rust2::Lzma2Reader::new(inner, dict_size, None);
-            Ok(Box::new(decoder))
+            // As for LZMA: a dictionary larger than what the stream can fill
+            // is allocated for nothing, and 4 GiB is declared by one byte.
+            let dict_size = crate::bounded_dict(dict_size, (expected_size as u64).min(max_buffer));
+            let lzma2 = lzma_rust2::Lzma2Stream::new(dict_size);
+            Ok(Box::new(SansIo::new(inner, lzma2)))
         }
 
         x if x == ID_PPMD => {
@@ -110,34 +114,24 @@ pub(super) fn wrap_coder(
                 coder.properties[4],
             ]);
 
-            let ppmd_reader = Ppmd7ZReader::new(inner, order, mem_size, max_buffer)?;
+            let ppmd_reader =
+                Ppmd7ZReader::new(inner, order, mem_size, expected_size as u64, max_buffer)?;
             Ok(Box::new(ppmd_reader))
         }
 
         x if x == ID_BZIP2 => {
-            let decoder = bzip2_rs::DecoderReader::new(inner);
+            let decoder = crate::formats::bzip2_rs::DecoderReader::new(inner);
             Ok(Box::new(decoder))
         }
 
         x if x == ID_DEFLATE => {
-            let decoder = flate2::read::DeflateDecoder::new(std::io::BufReader::new(inner));
+            let decoder = crate::inflate::Inflate::new(std::io::BufReader::new(inner));
             Ok(Box::new(decoder))
         }
 
-        x if x == ID_BCJ_X86 => {
-            let filter = BcjX86Filter::new(inner, max_buffer);
-            Ok(Box::new(filter))
-        }
-
-        x if x == ID_BCJ_ARM => {
-            let filter = BcjArmFilter::new(inner, max_buffer);
-            Ok(Box::new(filter))
-        }
-
-        x if x == ID_BCJ_ARM64 => {
-            let filter = BcjArm64Filter::new(inner, max_buffer);
-            Ok(Box::new(filter))
-        }
+        x if x == ID_BCJ_X86 => Ok(Box::new(BcjReader::new_x86(inner, 0))),
+        x if x == ID_BCJ_ARM => Ok(Box::new(BcjReader::new_arm(inner, 0))),
+        x if x == ID_BCJ_ARM64 => Ok(Box::new(BcjReader::new_arm64(inner, 0))),
 
         x if x == ID_DELTA => {
             let distance = if coder.properties.is_empty() {
@@ -158,15 +152,23 @@ pub(super) fn wrap_coder(
 
 // ─── Our own PPMd7 reader for 7z ───────────────────────────────────────────
 
+/// A 7z PPMd coder's output, `size` bytes, decoded as it is read.
+///
+/// The packed input is read whole on the first `read`, bounded by
+/// `max_buffer`. A stream that runs out, that goes inconsistent, or that meets
+/// an end marker before `size` bytes is an `InvalidData` error after the bytes
+/// decoded before it.
 pub(crate) struct Ppmd7ZReader<R: Read> {
-    inner: R,
-    buffer: Vec<u8>,
-    pos: usize,
+    inner: Option<R>,
     order: u32,
     mem_size: u32,
-    initialized: bool,
-    decoded_data: Vec<u8>,
+    model: Option<crate::formats::ppmd7::Ppmd7<crate::formats::ppmd7::SevenZRangeDecoder>>,
+    remaining: u64,
     max_buffer: u64,
+    /// An error met after some bytes of a `read` were already decoded,
+    /// returned by the next `read`.
+    pending: Option<&'static str>,
+    done: bool,
 }
 
 impl<R: Read> Ppmd7ZReader<R> {
@@ -174,6 +176,7 @@ impl<R: Read> Ppmd7ZReader<R> {
         inner: R,
         order: u32,
         mem_size: u32,
+        size: u64,
         max_buffer: u64,
     ) -> Result<Self, LimitHit> {
         if !(2..=64).contains(&order) {
@@ -188,10 +191,10 @@ impl<R: Read> Ppmd7ZReader<R> {
         }
         // The model arena is `mem_size` bytes and the field is a full u32, so a
         // tiny archive can otherwise ask for ~4 GiB before decoding anything.
-        // The allocation is fallible, so this is not a crash — but the caller's
+        // The allocation is fallible, so this is not a crash, but the caller's
         // buffer cap is what says how much memory this scan may claim, and the
-        // model has to answer to it like everything else. The ZIP method-98 path
-        // clamps for the same reason.
+        // model has to answer to it like everything else. The ZIP method-98
+        // reader refuses the same way.
         if u64::from(mem_size) > max_buffer {
             return Err(LimitHit::new(format!(
                 "7z: PPMD model memory {mem_size} exceeds max-buffer {max_buffer}"
@@ -199,319 +202,97 @@ impl<R: Read> Ppmd7ZReader<R> {
         }
 
         Ok(Self {
-            inner,
-            buffer: Vec::new(),
-            pos: 0,
+            inner: Some(inner),
             order,
             mem_size,
-            initialized: false,
-            decoded_data: Vec::new(),
+            model: None,
+            remaining: size,
             max_buffer,
+            pending: None,
+            done: false,
         })
     }
 
-    fn init_and_decode(&mut self) -> Result<(), LimitHit> {
-        // Bound both the compressed input and the decoded output by the global
-        // peak-buffer limit — PPMd amplifies heavily.
-        let (buf, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
+    fn init(
+        &mut self,
+        inner: R,
+    ) -> Result<crate::formats::ppmd7::Ppmd7<crate::formats::ppmd7::SevenZRangeDecoder>, LimitHit>
+    {
+        use crate::formats::ppmd7::{Ppmd7, SevenZRangeDecoder};
+        let (buf, truncated) = crate::bounded_read(inner, self.max_buffer)
             .map_err(|e| LimitHit::corrupt(format!("7z: PPMD read: {e}")))?;
         if truncated {
             return Err(LimitHit::new("7z PPMD input exceeds max-buffer".into()));
         }
-        self.buffer = buf;
-
-        use crate::formats::ppmd7::{Ppmd7, SevenZRangeDecoder, SYM_END};
-
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        let rc = SevenZRangeDecoder::new(&self.buffer);
+        let rc = SevenZRangeDecoder::new(buf);
         if !rc.init_ok() {
             return Err(LimitHit::corrupt(
                 "7z: PPMD range decoder init failed".into(),
             ));
         }
-
-        let mut model = Ppmd7::new(rc, self.order, self.mem_size)
-            .ok_or_else(|| LimitHit::corrupt("7z: PPMD model init failed".into()))?;
-
-        let mut out = Vec::new();
-        loop {
-            let sym = model.decode_symbol();
-            if sym < 0 {
-                if sym == SYM_END {
-                    break;
-                }
-                return Err(LimitHit::corrupt("7z: PPMD decode error".into()));
-            }
-            out.push(sym as u8);
-            if out.len() as u64 > self.max_buffer {
-                return Err(LimitHit::new("7z PPMD output exceeds max-buffer".into()));
-            }
-        }
-
-        self.decoded_data = out;
-        self.initialized = true;
-        Ok(())
+        Ppmd7::new(rc, self.order, self.mem_size)
+            .ok_or_else(|| LimitHit::corrupt("7z: PPMD model init failed".into()))
     }
 }
 
 impl<R: Read> Read for Ppmd7ZReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.initialized {
-            self.init_and_decode()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        use crate::formats::ppmd7::SYM_END;
+        if let Some(reason) = self.pending.take() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
         }
-
-        if self.pos >= self.decoded_data.len() {
+        if buf.is_empty() || self.remaining == 0 || self.done {
             return Ok(0);
         }
-
-        let available = &self.decoded_data[self.pos..];
-        let to_copy = buf.len().min(available.len());
-        buf[..to_copy].copy_from_slice(&available[..to_copy]);
-        self.pos += to_copy;
-        Ok(to_copy)
-    }
-}
-
-// ─── BCJ x86 filter ────────────────────────────────────────────────────────
-
-struct BcjX86Filter<R: Read> {
-    inner: R,
-    buf: Vec<u8>,
-    pos: usize,
-    max_buffer: u64,
-}
-
-impl<R: Read> BcjX86Filter<R> {
-    fn new(inner: R, max_buffer: u64) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            pos: 0,
-            max_buffer,
-        }
-    }
-}
-
-impl<R: Read> Read for BcjX86Filter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            let (data, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if truncated {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "7z BCJ input exceeds max-buffer",
-                ));
+        if let Some(inner) = self.inner.take() {
+            match self.init(inner) {
+                Ok(model) => self.model = Some(model),
+                Err(e) => {
+                    self.done = true;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
             }
-            self.buf = data;
-            apply_bcj_x86(&mut self.buf);
-            self.pos = 0;
         }
-
-        if self.pos >= self.buf.len() {
+        let Some(model) = self.model.as_mut() else {
             return Ok(0);
-        }
-
-        let available = &self.buf[self.pos..];
-        let to_copy = buf.len().min(available.len());
-        buf[..to_copy].copy_from_slice(&available[..to_copy]);
-        self.pos += to_copy;
-        Ok(to_copy)
-    }
-}
-
-fn apply_bcj_x86(data: &mut [u8]) {
-    let mut i = 0;
-    let mut ip: u32 = 0;
-
-    while i + 4 < data.len() {
-        let b = data[i];
-
-        if b == 0xE8 || b == 0xE9 {
-            let rel = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
-            let addr = ip.wrapping_add(5).wrapping_add(rel as u32);
-            data[i + 1] = addr as u8;
-            data[i + 2] = (addr >> 8) as u8;
-            data[i + 3] = (addr >> 16) as u8;
-            data[i + 4] = (addr >> 24) as u8;
-        }
-
-        let len = match b {
-            0x0F => {
-                if i + 1 < data.len() {
-                    match data[i + 1] {
-                        0x80..=0x8F => 6,
-                        _ => 2,
-                    }
-                } else {
-                    1
-                }
-            }
-            0x80..=0x83 => 6,
-            0x88..=0x8B => 2,
-            0xA1..=0xA3 => 5,
-            0xB8..=0xBF => 5,
-            0xC2..=0xC3 => 1,
-            0xC8 => 4,
-            0xE8 => 5,
-            0xE9 => 5,
-            0xEB => 2,
-            0x68 => 5,
-            0x6A => 2,
-            0xFF => {
-                if i + 1 < data.len() && (data[i + 1] & 0x38) == 0x10 {
-                    6
-                } else {
-                    2
-                }
-            }
-            _ => 1,
         };
 
-        i += len;
-        ip = ip.wrapping_add(len as u32);
-    }
-}
-
-// ─── BCJ ARM filter ────────────────────────────────────────────────────────
-
-struct BcjArmFilter<R: Read> {
-    inner: R,
-    buf: Vec<u8>,
-    pos: usize,
-    max_buffer: u64,
-}
-
-impl<R: Read> BcjArmFilter<R> {
-    fn new(inner: R, max_buffer: u64) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            pos: 0,
-            max_buffer,
-        }
-    }
-}
-
-impl<R: Read> Read for BcjArmFilter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            let (data, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if truncated {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "7z BCJ input exceeds max-buffer",
-                ));
+        let want = usize::try_from(self.remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let mut n = 0;
+        let mut error = None;
+        while n < want {
+            let sym = model.decode_symbol();
+            // A symbol decoded while the input ran out was decoded from
+            // padding, not from the stream.
+            if model.out_of_data() {
+                error = Some("7z: PPMD stream truncated");
+                break;
             }
-            self.buf = data;
-            apply_bcj_arm(&mut self.buf);
-            self.pos = 0;
-        }
-        if self.pos >= self.buf.len() {
-            return Ok(0);
-        }
-        let available = &self.buf[self.pos..];
-        let n = buf.len().min(available.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
-fn apply_bcj_arm(data: &mut [u8]) {
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        let w = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        if (w >> 24) == 0xEB || (w >> 24) == 0xFB {
-            let rel = (w & 0x00FFFFFF) << 2;
-            let sign = if w & 0x00800000 != 0 {
-                0xFF000000u32
-            } else {
-                0
-            };
-            let addr = (i as u32).wrapping_add(8).wrapping_add(sign | rel);
-            let corrected = addr.wrapping_sub(i as u32);
-            let new_rel = corrected >> 2;
-            data[i] = (new_rel & 0xFF) as u8;
-            data[i + 1] = ((new_rel >> 8) & 0xFF) as u8;
-            data[i + 2] = ((new_rel >> 16) & 0xFF) as u8;
-            data[i + 3] = (data[i + 3] & 0xF0) | ((new_rel >> 24) as u8 & 0x0F);
-        }
-        i += 4;
-    }
-}
-
-// ─── BCJ ARM64 filter ──────────────────────────────────────────────────────
-
-struct BcjArm64Filter<R: Read> {
-    inner: R,
-    buf: Vec<u8>,
-    pos: usize,
-    max_buffer: u64,
-}
-
-impl<R: Read> BcjArm64Filter<R> {
-    fn new(inner: R, max_buffer: u64) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            pos: 0,
-            max_buffer,
-        }
-    }
-}
-
-impl<R: Read> Read for BcjArm64Filter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            let (data, truncated) = crate::bounded_read(&mut self.inner, self.max_buffer)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if truncated {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "7z BCJ input exceeds max-buffer",
-                ));
+            if sym == SYM_END {
+                error = Some("7z: PPMD stream ended before its declared size");
+                break;
             }
-            self.buf = data;
-            apply_bcj_arm64(&mut self.buf);
-            self.pos = 0;
+            if sym < 0 {
+                error = Some("7z: PPMD stream is corrupt");
+                break;
+            }
+            buf[n] = sym as u8;
+            n += 1;
         }
-        if self.pos >= self.buf.len() {
-            return Ok(0);
+        self.remaining -= n as u64;
+        if self.remaining == 0 {
+            self.model = None;
         }
-        let available = &self.buf[self.pos..];
-        let n = buf.len().min(available.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        self.pos += n;
+        let Some(reason) = error else {
+            return Ok(n);
+        };
+        self.model = None;
+        self.done = true;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+        }
+        self.pending = Some(reason);
         Ok(n)
-    }
-}
-
-fn apply_bcj_arm64(data: &mut [u8]) {
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        let w = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        if (w >> 26) == 0x05 || (w >> 26) == 0x17 {
-            let imm26 = w & 0x03FFFFFF;
-            let sign = if imm26 & 0x02000000 != 0 {
-                0xFC000000u32
-            } else {
-                0
-            };
-            let addr = (i as u32).wrapping_add(sign | (imm26 << 2));
-            let corrected = addr.wrapping_sub(i as u32);
-            let new_imm = corrected >> 2;
-            data[i] = (new_imm & 0xFF) as u8;
-            data[i + 1] = ((new_imm >> 8) & 0xFF) as u8;
-            data[i + 2] = ((new_imm >> 16) & 0xFF) as u8;
-            data[i + 3] = (data[i + 3] & 0xFC) | ((new_imm >> 24) as u8 & 0x03);
-        }
-        i += 4;
     }
 }
 
@@ -549,14 +330,83 @@ impl<R: Read> Read for DeltaFilter<R> {
 }
 
 #[cfg(test)]
-mod tests {
+mod ppmd_tests {
     use super::*;
+    use std::io::Write;
+
+    /// `data` through the reference `ppmd-rust` PPMd7 (variant H) encoder.
+    fn encode(data: &[u8], order: u32, mem: u32, end_marker: bool) -> Vec<u8> {
+        let mut packed = Vec::new();
+        let mut enc = ppmd_rust::Ppmd7Encoder::new(&mut packed, order, mem).unwrap();
+        enc.write_all(data).unwrap();
+        enc.finish(end_marker).unwrap();
+        packed
+    }
+
+    fn text(n: usize) -> Vec<u8> {
+        (0..n as u32)
+            .flat_map(|i| format!("{i:06} the quick brown fox {}\n", i * 7919 % 101).into_bytes())
+            .take(n)
+            .collect()
+    }
+
+    /// Reads `size` bytes of `packed` in `chunk`-byte reads: what came out,
+    /// and how the read ended.
+    fn read(packed: &[u8], size: u64, chunk: usize) -> (Vec<u8>, io::Result<()>) {
+        let mut r = Ppmd7ZReader::new(packed, 6, 1 << 20, size, 1 << 24).unwrap();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; chunk];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => return (out, Ok(())),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) => return (out, Err(e)),
+            }
+        }
+    }
 
     #[test]
-    fn bcj_x86_basic() {
-        let mut data = vec![0xE8, 0x10, 0x00, 0x00, 0x00];
-        data.resize(1024, 0);
-        apply_bcj_x86(&mut data);
-        assert_eq!(data[0], 0xE8);
+    fn decodes_to_the_declared_size_in_reads_of_any_size() {
+        let data = text(50_000);
+        for end_marker in [false, true] {
+            let packed = encode(&data, 6, 1 << 20, end_marker);
+            for chunk in [1, 7, 4096, 1 << 20] {
+                let (out, end) = read(&packed, data.len() as u64, chunk);
+                assert!(
+                    end.is_ok(),
+                    "chunk {chunk}, end marker {end_marker}: {end:?}"
+                );
+                assert!(out == data, "chunk {chunk}, end marker {end_marker}");
+            }
+            let (out, end) = read(&packed, 1000, 4096);
+            assert!(end.is_ok() && out == data[..1000]);
+        }
+    }
+
+    /// Cut short, the stream yields what it decoded, then an error, read in
+    /// any chunk size.
+    #[test]
+    fn a_stream_cut_short_is_an_error_after_a_correct_prefix() {
+        let data = text(50_000);
+        let packed = encode(&data, 6, 1 << 20, false);
+        for cut in [0, 1, 5, 6, 100, packed.len() / 2, packed.len() - 1] {
+            for chunk in [1, 4096] {
+                let (out, end) = read(&packed[..cut], data.len() as u64, chunk);
+                assert!(end.is_err(), "cut {cut}, chunk {chunk}");
+                assert!(
+                    out.len() < data.len() && data.starts_with(&out),
+                    "cut {cut}, chunk {chunk}: not a prefix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_end_marker_before_the_declared_size_is_an_error() {
+        let data = text(5000);
+        let packed = encode(&data, 6, 1 << 20, true);
+        let (out, end) = read(&packed, data.len() as u64 + 1, 4096);
+        assert!(end.is_err());
+        assert!(out == data, "what came before the end marker is delivered");
     }
 }

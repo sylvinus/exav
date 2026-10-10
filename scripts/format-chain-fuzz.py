@@ -9,7 +9,7 @@ enumerate.
 It has already paid for itself twice:
 
   * a two-byte HFS+ signature scanned across 64 KiB matched compressed data about
-    one time in twenty, and a false hit is not a wasted check — `detect` answers
+    one time in twenty, and a false hit is not a wasted check: `detect` answers
     `Dmg`, so the file's real format is never tried;
   * a FAT boot sector read as a partition table produced a "partition" identical
     to the whole image, which re-detected the same way until the recursion budget
@@ -23,8 +23,9 @@ is the scanner working.
 Usage:  scripts/format-chain-fuzz.py [trials] [chain-length] [seed]
 
 Needs the same tools as scripts/make-matryoshka.sh, on PATH. Set TOOLS_PREFIX if
-they live in a staging root rather than the system paths, and EXAV to point at a
-built binary (default: target/debug/exav).
+they live in a staging root rather than the system paths, EXAV to point at a
+built binary (default: target/debug/exav), and DB at a signature database
+(default: eicar.ndb).
 """
 import os, random, subprocess, sys, shutil, tempfile
 
@@ -38,7 +39,7 @@ if PREFIX:
         f"{PREFIX}/{d}" for d in ("usr/lib", "lib")
     ) + ":" + ENV.get("LD_LIBRARY_PATH", "")
 EXAV = os.environ.get("EXAV", "target/debug/exav")
-DB = os.environ.get("EXAV_DB", "eicar.ndb")
+DB = os.environ.get("DB", "eicar.ndb")
 
 # Reversed, and flipped back at run time, so the 68-byte sequence is not stored
 # anywhere in this tree. See `exav_unpack::eicar` for why that matters: a file
@@ -186,7 +187,7 @@ def main():
             verdict = scan(final, cwd, len(order) + 10)
             # Only a *clean* verdict is a bug. A resource limit is the honest
             # answer for a chain that inflates a 68-byte payload through several
-            # megabytes of disk image and then recompresses it — the ratio guard
+            # megabytes of disk image and then recompresses it: the ratio guard
             # firing there is the scanner working, not failing.
             if "FOUND" in verdict:
                 state = "ok  "

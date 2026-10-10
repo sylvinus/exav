@@ -5,13 +5,14 @@
 //! user with no third-party tool. Anything exav cannot reconstruct must be
 //! reported, not passed over.
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 const SECTOR: usize = 512;
 const FOOTER: usize = 512;
 
 /// A VHD footer. All fields big-endian; only the ones exav reads are filled in.
-fn footer(disk_type: u32, data_offset: u64, current_size: u64) -> Vec<u8> {
+pub(super) fn footer(disk_type: u32, data_offset: u64, current_size: u64) -> Vec<u8> {
     let mut f = vec![0u8; FOOTER];
     f[0..8].copy_from_slice(b"conectix");
     f[16..24].copy_from_slice(&data_offset.to_be_bytes());
@@ -21,7 +22,7 @@ fn footer(disk_type: u32, data_offset: u64, current_size: u64) -> Vec<u8> {
 }
 
 /// A dynamic-disk header. `bat_off` and the geometry are what exav walks.
-fn dyn_header(bat_off: u64, max_entries: u32, block_size: u32) -> Vec<u8> {
+pub(super) fn dyn_header(bat_off: u64, max_entries: u32, block_size: u32) -> Vec<u8> {
     let mut h = vec![0u8; 1024];
     h[0..8].copy_from_slice(b"cxsparse");
     h[16..24].copy_from_slice(&bat_off.to_be_bytes());

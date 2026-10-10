@@ -1,7 +1,8 @@
 //! Textual content canonicalisation for normalised signature matching.
 //!
-//! `Target:3` (HTML), `Target:4` (ASCII/text) and `Target:7` (mail) signatures
-//! are authored against *canonicalised* content rather than raw bytes, so that a
+//! `Target:3` (HTML) and `Target:7` (text) signatures are authored against
+//! *canonicalised* content rather than raw bytes (`Target:4`, mail, matches the
+//! raw bytes; see `target_ok` in `engine`), so that a
 //! single pattern matches regardless of letter case, HTML entity encoding,
 //! comment insertion or whitespace padding used to evade it. This module is a
 //! clean-room implementation driven by that interoperability requirement:
@@ -14,10 +15,13 @@
 //! None of these interpret attacker-controlled sizes; they walk the input once
 //! and can't panic on any byte sequence.
 
+use crate::byte_source::{Bytes, Indexed};
+
 /// Fraction (percent) of sampled bytes that must be "text-like" for a buffer to
 /// be treated as textual, and the NUL-byte ceiling above which it's binary.
 const TEXT_PERCENT: usize = 90;
-const SAMPLE: usize = 8192;
+/// Bytes of an object's start [`is_textual`] looks at.
+pub(crate) const SAMPLE: usize = 8192;
 
 /// Heuristic: does this buffer look like text worth running normalised
 /// signatures over? Empty input is not textual; a buffer with more than ~1% NUL
@@ -51,9 +55,26 @@ fn lower(b: u8) -> u8 {
     b.to_ascii_lowercase()
 }
 
+/// Where a normaliser writes its view: memory, or a spill for an object too
+/// large to hold.
+pub(crate) trait Out {
+    fn push(&mut self, b: u8);
+    fn last(&self) -> Option<u8>;
+}
+
+impl Out for Vec<u8> {
+    #[inline]
+    fn push(&mut self, b: u8) {
+        Vec::push(self, b);
+    }
+    fn last(&self) -> Option<u8> {
+        self.as_slice().last().copied()
+    }
+}
+
 /// Append `b`, collapsing any run of ASCII whitespace to a single space.
 #[inline]
-fn push_collapsed(out: &mut Vec<u8>, b: u8, prev_ws: &mut bool) {
+fn push_collapsed<O: Out>(out: &mut O, b: u8, prev_ws: &mut bool) {
     if b.is_ascii_whitespace() {
         if !*prev_ws {
             out.push(b' ');
@@ -68,28 +89,42 @@ fn push_collapsed(out: &mut Vec<u8>, b: u8, prev_ws: &mut bool) {
 /// Normalise HTML: decode entities, lowercase, collapse whitespace. Tags are
 /// preserved (so `Target:3` signatures written against markup still match).
 pub fn html(data: &[u8]) -> Vec<u8> {
-    let decoded = decode_entities(data);
-    let mut out = Vec::with_capacity(decoded.len());
-    let mut prev_ws = false;
-    for &b in &decoded {
-        push_collapsed(&mut out, lower(b), &mut prev_ws);
-    }
+    let mut out = Vec::with_capacity(data.len());
+    html_into(&mut Indexed(data), &mut out);
     out
+}
+
+/// [`html`] from any object into any [`Out`].
+pub(crate) fn html_into<B: Bytes, O: Out>(data: &mut B, out: &mut O) {
+    let mut prev_ws = false;
+    let mut i = 0usize;
+    let n = data.len();
+    while i < n {
+        let (b, next) = decode_entity_at(data, i);
+        push_collapsed(out, lower(b), &mut prev_ws);
+        i = next;
+    }
 }
 
 /// Normalise plain text: lowercase, drop control bytes, collapse whitespace.
 pub fn text(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
+    text_into(&mut Indexed(data), &mut out);
+    out
+}
+
+/// [`text`] from any object into any [`Out`].
+pub(crate) fn text_into<B: Bytes, O: Out>(data: &mut B, out: &mut O) {
     let mut prev_ws = false;
-    for &b in data {
+    for i in 0..data.len() {
+        let b = data.at(i);
         if b.is_ascii_whitespace() {
-            push_collapsed(&mut out, b, &mut prev_ws);
+            push_collapsed(out, b, &mut prev_ws);
         } else if b >= 0x20 {
             out.push(lower(b));
             prev_ws = false;
         }
     }
-    out
 }
 
 /// A JavaScript identifier byte (letters, digits, `_`, `$`).
@@ -104,59 +139,52 @@ fn is_word(b: u8) -> bool {
 /// comment-and-case obfuscation of `eval(unescape(...))`-style loaders (a comment
 /// between `eval(` and `unescape(` must not leave a separating space).
 pub fn javascript(data: &[u8]) -> Vec<u8> {
-    let stripped = strip_comments(data);
-    let mut out: Vec<u8> = Vec::with_capacity(stripped.len());
+    let mut out = Vec::with_capacity(data.len());
+    javascript_into(&mut Indexed(data), &mut out);
+    out
+}
+
+/// [`javascript`] from any object into any [`Out`].
+pub(crate) fn javascript_into<B: Bytes, O: Out>(data: &mut B, out: &mut O) {
     let mut pending_ws = false;
-    for &b in &stripped {
+    strip_comments(data, &mut |b| {
         if b.is_ascii_whitespace() {
             pending_ws = true;
-            continue;
+            return;
         }
         let c = lower(b);
         if pending_ws {
             pending_ws = false;
-            if let Some(&last) = out.last() {
+            if let Some(last) = out.last() {
                 if is_word(last) && is_word(c) {
                     out.push(b' ');
                 }
             }
         }
         out.push(c);
-    }
-    out
+    });
 }
 
-/// Decode HTML character references: numeric decimal (`&#105;`), numeric hex
-/// (`&#x69;`/`&#X69;`) and the handful of named entities. Only well-formed,
-/// terminated references decode; anything else is copied verbatim.
-fn decode_entities(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut i = 0usize;
-    let n = data.len();
-    while i < n {
-        if data[i] != b'&' {
-            out.push(data[i]);
-            i += 1;
-            continue;
-        }
-        // Find the terminating ';' within a short window (entities are short).
-        let limit = (i + 12).min(n);
-        let semi = data[i + 1..limit].iter().position(|&b| b == b';').map(|p| i + 1 + p);
-        let Some(semi) = semi else {
-            out.push(b'&');
-            i += 1;
-            continue;
-        };
-        let body = &data[i + 1..semi];
-        if let Some(decoded) = decode_reference(body) {
-            out.push(decoded);
-            i = semi + 1;
-        } else {
-            out.push(b'&');
-            i += 1;
-        }
+/// The byte an HTML character reference at `i` decodes to, and where the text
+/// after it starts: numeric decimal (`&#105;`), numeric hex (`&#x69;`/`&#X69;`)
+/// and the handful of named entities. Only well-formed, terminated references
+/// decode; anything else is the byte at `i` itself.
+#[inline]
+fn decode_entity_at<B: Bytes>(data: &mut B, i: usize) -> (u8, usize) {
+    let b = data.at(i);
+    if b != b'&' {
+        return (b, i + 1);
     }
-    out
+    // Find the terminating ';' within a short window (entities are short).
+    let limit = (i + 12).min(data.len());
+    let window = data.range(i + 1, limit);
+    let Some(p) = window.iter().position(|&b| b == b';') else {
+        return (b'&', i + 1);
+    };
+    match decode_reference(&window[..p]) {
+        Some(decoded) => (decoded, i + 1 + p + 1),
+        None => (b'&', i + 1),
+    }
 }
 
 /// Decode the inside of one `&…;` reference to a single byte, if recognised.
@@ -196,17 +224,17 @@ fn decode_reference(body: &[u8]) -> Option<u8> {
 
 /// Remove `/* … */` and `// …` comments, treating them as inert inside string
 /// literals (`'…'`, `"…"`, `` `…` ``) so a comment marker in a string survives.
-fn strip_comments(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
+/// Each byte kept goes to `out`.
+fn strip_comments<B: Bytes, F: FnMut(u8)>(data: &mut B, out: &mut F) {
     let n = data.len();
     let mut i = 0usize;
     let mut quote: Option<u8> = None;
     while i < n {
-        let b = data[i];
+        let b = data.at(i);
         if let Some(q) = quote {
-            out.push(b);
+            out(b);
             if b == b'\\' && i + 1 < n {
-                out.push(data[i + 1]); // keep the escaped char intact
+                out(data.at(i + 1)); // keep the escaped char intact
                 i += 2;
                 continue;
             }
@@ -219,30 +247,29 @@ fn strip_comments(data: &[u8]) -> Vec<u8> {
         match b {
             b'\'' | b'"' | b'`' => {
                 quote = Some(b);
-                out.push(b);
+                out(b);
                 i += 1;
             }
-            b'/' if i + 1 < n && data[i + 1] == b'*' => {
+            b'/' if i + 1 < n && data.at(i + 1) == b'*' => {
                 i += 2;
-                while i + 1 < n && !(data[i] == b'*' && data[i + 1] == b'/') {
+                while i + 1 < n && !(data.at(i) == b'*' && data.at(i + 1) == b'/') {
                     i += 1;
                 }
                 i = (i + 2).min(n);
-                out.push(b' '); // comment becomes a token separator
+                out(b' '); // comment becomes a token separator
             }
-            b'/' if i + 1 < n && data[i + 1] == b'/' => {
+            b'/' if i + 1 < n && data.at(i + 1) == b'/' => {
                 i += 2;
-                while i < n && data[i] != b'\n' {
+                while i < n && data.at(i) != b'\n' {
                     i += 1;
                 }
             }
             _ => {
-                out.push(b);
+                out(b);
                 i += 1;
             }
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -307,5 +334,179 @@ mod tests {
     fn text_drops_controls_and_lowercases() {
         let out = text(b"Hello\x00\x01World\t\tGoodbye");
         assert_eq!(out, b"helloworld goodbye");
+    }
+
+    /// The normalisers as they were, over a slice in two passes.
+    mod before {
+        use super::super::{decode_reference, is_word, lower};
+
+        fn collapse(out: &mut Vec<u8>, b: u8, prev_ws: &mut bool) {
+            if b.is_ascii_whitespace() {
+                if !*prev_ws {
+                    out.push(b' ');
+                    *prev_ws = true;
+                }
+            } else {
+                out.push(b);
+                *prev_ws = false;
+            }
+        }
+
+        pub fn html(data: &[u8]) -> Vec<u8> {
+            let mut decoded = Vec::new();
+            let mut i = 0usize;
+            let n = data.len();
+            while i < n {
+                if data[i] != b'&' {
+                    decoded.push(data[i]);
+                    i += 1;
+                    continue;
+                }
+                let limit = (i + 12).min(n);
+                let semi = data[i + 1..limit].iter().position(|&b| b == b';').map(|p| i + 1 + p);
+                match semi.and_then(|s| decode_reference(&data[i + 1..s]).map(|d| (d, s))) {
+                    Some((d, s)) => {
+                        decoded.push(d);
+                        i = s + 1;
+                    }
+                    None => {
+                        decoded.push(b'&');
+                        i += 1;
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            let mut prev_ws = false;
+            for &b in &decoded {
+                collapse(&mut out, lower(b), &mut prev_ws);
+            }
+            out
+        }
+
+        pub fn text(data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut prev_ws = false;
+            for &b in data {
+                if b.is_ascii_whitespace() {
+                    collapse(&mut out, b, &mut prev_ws);
+                } else if b >= 0x20 {
+                    out.push(lower(b));
+                    prev_ws = false;
+                }
+            }
+            out
+        }
+
+        pub fn javascript(data: &[u8]) -> Vec<u8> {
+            let mut stripped = Vec::new();
+            let n = data.len();
+            let mut i = 0usize;
+            let mut quote: Option<u8> = None;
+            while i < n {
+                let b = data[i];
+                if let Some(q) = quote {
+                    stripped.push(b);
+                    if b == b'\\' && i + 1 < n {
+                        stripped.push(data[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if b == q {
+                        quote = None;
+                    }
+                    i += 1;
+                    continue;
+                }
+                match b {
+                    b'\'' | b'"' | b'`' => {
+                        quote = Some(b);
+                        stripped.push(b);
+                        i += 1;
+                    }
+                    b'/' if i + 1 < n && data[i + 1] == b'*' => {
+                        i += 2;
+                        while i + 1 < n && !(data[i] == b'*' && data[i + 1] == b'/') {
+                            i += 1;
+                        }
+                        i = (i + 2).min(n);
+                        stripped.push(b' ');
+                    }
+                    b'/' if i + 1 < n && data[i + 1] == b'/' => {
+                        i += 2;
+                        while i < n && data[i] != b'\n' {
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        stripped.push(b);
+                        i += 1;
+                    }
+                }
+            }
+            let mut out: Vec<u8> = Vec::new();
+            let mut pending_ws = false;
+            for &b in &stripped {
+                if b.is_ascii_whitespace() {
+                    pending_ws = true;
+                    continue;
+                }
+                let c = lower(b);
+                if pending_ws {
+                    pending_ws = false;
+                    if let Some(&last) = out.last() {
+                        if is_word(last) && is_word(c) {
+                            out.push(b' ');
+                        }
+                    }
+                }
+                out.push(c);
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn references_at_the_edge_of_the_window_decode_as_they_did() {
+        for s in [
+            &b"a&#000000065;b"[..],
+            b"a&#0000000065;b",
+            b"&#x00000041;",
+            b"&#x000000041;",
+            b"&AMP;&amp&#;&#x;&",
+        ] {
+            assert_eq!(html(s), before::html(s), "{:?}", String::from_utf8_lossy(s));
+        }
+        assert_eq!(html(b"a&#000000065;b"), b"aab");
+    }
+
+    #[test]
+    fn the_views_are_what_they_were_from_memory_or_read_in_blocks() {
+        use crate::byte_source::{BlockCache, Stepper, CHUNK};
+        let alphabet = b"&#;x6aA9lgt amp;\t\n/*'\"`\\\x01Zq_$";
+        let mut state = 0x853C_49E6_748F_EA9Bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..400 {
+            let len = if round < 390 { (next() % 64) as usize } else { 3 * CHUNK + (next() % 100) as usize };
+            let data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let what = String::from_utf8_lossy(&data[..data.len().min(64)]).into_owned();
+            assert_eq!(html(&data), before::html(&data), "html {what:?}");
+            assert_eq!(text(&data), before::text(&data), "text {what:?}");
+            assert_eq!(javascript(&data), before::javascript(&data), "javascript {what:?}");
+            let cache = BlockCache::with_sizes(std::io::Cursor::new(data.clone()), 7, 56).unwrap();
+            let mut got = Vec::new();
+            html_into(&mut Stepper::new(&cache), &mut got);
+            assert_eq!(got, html(&data), "html read in blocks, {what:?}");
+            got.clear();
+            text_into(&mut Stepper::new(&cache), &mut got);
+            assert_eq!(got, text(&data), "text read in blocks, {what:?}");
+            got.clear();
+            javascript_into(&mut Stepper::new(&cache), &mut got);
+            assert_eq!(got, javascript(&data), "javascript read in blocks, {what:?}");
+        }
     }
 }

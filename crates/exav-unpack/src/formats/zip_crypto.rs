@@ -2,18 +2,18 @@
 //! PKWARE "ZipCrypto" stream cipher and WinZip AES (AE-1/AE-2).
 //!
 //! DECRYPTION with a *known* password needs only a cipher (AES) + a KDF
-//! (PBKDF2-HMAC-SHA1) and a stream XOR — no RNG. So this links `aes`/`hmac`/
+//! (PBKDF2-HMAC-SHA1) and a stream XOR, no RNG. So this links `aes`/`hmac`/
 //! `sha1`/`pbkdf2`/`ctr`, none of which pull `getrandom`, preserving the
 //! project's no-getrandom default build. We deliberately do NOT enable the
 //! `zip` crate's `aes-crypto`/encryption features (those pull `getrandom` for
 //! the salt/IV generation that only *encryption* needs).
 //!
 //! These routines take the already-read *raw encrypted member bytes* (what
-//! `ZipFile::read` would yield without a decryptor — i.e. the stored/compressed
+//! `ZipFile::read` would yield without a decryptor, i.e. the stored/compressed
 //! payload after the format's own crypto framing) and return the decrypted
 //! ciphertext-stripped bytes ready to be decompressed by the member's method.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
@@ -80,15 +80,14 @@ pub(crate) fn decrypt_aes(body: &[u8], strength: u8, password: &[u8]) -> Option<
 /// crate only offers big-endian / 32-/64-bit LE flavours, none of which is the
 /// 128-bit-LE WinZip needs).
 fn aes_ctr_le(key: &[u8], data: &mut [u8], key_len: usize) -> Option<()> {
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
     let mut counter = [0u8; 16];
     counter[0] = 1; // little-endian "1"
     macro_rules! run {
         ($ty:ty) => {{
             let cipher = <$ty>::new_from_slice(key).ok()?;
             for chunk in data.chunks_mut(16) {
-                let mut block =
-                    aes::cipher::generic_array::GenericArray::clone_from_slice(&counter);
+                let mut block = aes::Block::from(counter);
                 cipher.encrypt_block(&mut block);
                 for (b, k) in chunk.iter_mut().zip(block.iter()) {
                     *b ^= *k;
@@ -121,7 +120,7 @@ fn aes_ctr_le(key: &[u8], data: &mut [u8], key_len: usize) -> Option<()> {
 /// reference byte is the high byte of the CRC-32, EXCEPT when the archive was
 /// written with a streaming data descriptor (general-purpose bit 3), where the
 /// CRC isn't known at encryption time and the high byte of the DOS mod-time is
-/// used instead — the form Info-ZIP's `zip` emits. The caller passes whichever
+/// used instead (the form Info-ZIP's `zip` emits). The caller passes whichever
 /// candidate(s) apply; the full-payload CRC check downstream is the real gate.
 pub(crate) fn decrypt_zipcrypto(
     body: &[u8],
@@ -141,7 +140,7 @@ pub(crate) fn decrypt_zipcrypto(
         *b = c;
     }
     // The classic password check: header[11] == high byte of CRC-32 (or DOS
-    // mod-time for streaming archives — see the doc comment).
+    // mod-time for streaming archives, see the doc comment).
     if !check_bytes.contains(&header[11]) {
         return None;
     }

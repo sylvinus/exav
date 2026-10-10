@@ -161,21 +161,93 @@ pub(crate) fn extract_uuencode<R>(
 /// True if `data` (leading whitespace skipped) opens a uuencode stream: a
 /// `begin `/`begin-base64 ` line with a matching `end`/`====` terminator later.
 /// Conservative — used by [`crate::detect`], which is the single source of truth.
-pub(crate) fn looks_like_uuencode(data: &[u8]) -> bool {
+pub(crate) fn looks_like_uuencode(p: &crate::Probe) -> bool {
+    let data = p.head;
     let head = trim_ascii_start(&data[..data.len().min(4096)]);
     let base64 = head.starts_with(b"begin-base64 ");
     if !base64 && !head.starts_with(b"begin ") {
         return false;
     }
     // Require a terminator so a stray "begin " prose line isn't claimed.
-    lines(data).any(|l| {
-        let t = trim_ascii(l);
-        if base64 {
-            t.starts_with(b"====")
-        } else {
-            t == b"end"
+    let mut scan = Terminator::new(base64);
+    match p.source() {
+        None => {
+            scan.feed(data);
         }
-    })
+        Some(src) => src.chunks(0, src.len(), &mut |_, chunk| !scan.feed(chunk)),
+    }
+    scan.finish()
+}
+
+/// Looks for a line that, trimmed of ASCII whitespace, is `end` (or starts
+/// with `====` for base64), over bytes fed a piece at a time.
+struct Terminator {
+    base64: bool,
+    found: bool,
+    /// Past the line's leading whitespace.
+    in_text: bool,
+    /// Bytes of the line from its first non-whitespace one.
+    pos: usize,
+    /// The first four of those.
+    first: [u8; 4],
+    /// Index of the last non-whitespace byte among them.
+    last_text: usize,
+}
+
+impl Terminator {
+    fn new(base64: bool) -> Self {
+        Terminator {
+            base64,
+            found: false,
+            in_text: false,
+            pos: 0,
+            first: [0; 4],
+            last_text: 0,
+        }
+    }
+
+    /// `true` once a terminator is found.
+    fn feed(&mut self, data: &[u8]) -> bool {
+        for &b in data {
+            if b == b'\n' {
+                self.end_line();
+                if self.found {
+                    return true;
+                }
+            } else if self.in_text {
+                if self.pos < 4 {
+                    self.first[self.pos] = b;
+                }
+                if !b.is_ascii_whitespace() {
+                    self.last_text = self.pos;
+                }
+                self.pos += 1;
+            } else if !b.is_ascii_whitespace() {
+                self.in_text = true;
+                self.first[0] = b;
+                self.last_text = 0;
+                self.pos = 1;
+            }
+        }
+        false
+    }
+
+    fn end_line(&mut self) {
+        if self.in_text {
+            self.found |= if self.base64 {
+                self.pos >= 4 && self.first == *b"===="
+            } else {
+                self.last_text == 2 && self.first[..3] == *b"end"
+            };
+        }
+        self.in_text = false;
+        self.pos = 0;
+    }
+
+    fn finish(mut self) -> bool {
+        self.end_line();
+        self.found
+    }
 }
 
 /// `[u8]::trim_ascii_start` is stable but re-implemented here to also cover the
@@ -206,6 +278,56 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn looks_like_uuencode(data: &[u8]) -> bool {
+        super::looks_like_uuencode(&crate::Probe::whole(data))
+    }
+
+    /// Whether a line of `data` is a terminator, as it was decided by
+    /// splitting it into lines.
+    fn has_terminator_by_lines(data: &[u8], base64: bool) -> bool {
+        lines(data).any(|l| {
+            let t = trim_ascii(l);
+            if base64 {
+                t.starts_with(b"====")
+            } else {
+                t == b"end"
+            }
+        })
+    }
+
+    #[test]
+    fn the_terminator_scan_decides_as_the_line_split_did() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let alphabet = b"end=\n\r \t x";
+        for len in 0..40 {
+            for _ in 0..300 {
+                let data: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        alphabet[(state % alphabet.len() as u64) as usize]
+                    })
+                    .collect();
+                for base64 in [false, true] {
+                    let want = has_terminator_by_lines(&data, base64);
+                    // Whole, then a byte at a time.
+                    let mut whole = Terminator::new(base64);
+                    whole.feed(&data);
+                    assert_eq!(
+                        whole.finish(),
+                        want,
+                        "{:?} base64={base64}",
+                        String::from_utf8_lossy(&data)
+                    );
+                    let mut bytes = Terminator::new(base64);
+                    let found = data.iter().any(|b| bytes.feed(std::slice::from_ref(b)));
+                    assert_eq!(found || bytes.finish(), want);
+                }
+            }
+        }
+    }
 
     /// Reference classic-uuencode encoder for the roundtrip test.
     fn uuencode(name: &str, data: &[u8]) -> Vec<u8> {

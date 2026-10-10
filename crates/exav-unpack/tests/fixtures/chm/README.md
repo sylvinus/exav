@@ -9,11 +9,19 @@ decode path (it contains the marker `EXAV-LZX-OK` inside the compressed content
 section). The HTML content is released into the **public domain (CC0)**. Safe to
 commit, and the always-on LZX decode oracle in `tests/chm.rs`.
 
+`multi-frame-lzx.chm`: three generated pages (`a.html`, `b.html`, `c.html`,
+each `<p>{name} {i * 7919 % 10007}</p>` for i in 0..2000 between
+`<html><body>` and `</body></html>`) compiled with `chmcmd` 3.2.2. Its LZX
+stream spans three 32 KiB frames and resets every two, so a page past the
+first frame of an interval decodes only with the state that frame left. Public
+domain (CC0).
+
 ## Gitignored (real malware — never committed)
 
 Real in-the-wild malware `.chm` samples (single-frame LZX). They are
-**gitignored** (`tests/fixtures/**/real-malware-*`); the tests read them at
-runtime and skip when absent, so they only add extra robustness coverage for
+**gitignored** (`tests/fixtures/**/real-malware-*`) and kept locally as
+`<name>.zip` (AES-256, password `infected`, see `../README.md`); the tests
+read them at runtime and skip when absent, so they only add extra robustness coverage for
 developers who have them locally. Provenance for re-download / VT lookup:
 
 | file | sha256 |

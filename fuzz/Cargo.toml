@@ -29,6 +29,13 @@ exav-pe-emu = { path = "../crates/exav-pe-emu" }
 # desynchronises everything after it — so the oracle is compiled in here, and
 # only here.
 exav-x86 = { path = "../crates/exav-x86" }
+# The image decoders behind `fuzzy_img#`, every format, fuzzed directly: the
+# scan reaches them only when a database has such a signature.
+exav-imagehash = { path = "../crates/exav-imagehash", default-features = false, features = ["webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2"] }
+# DWG and DXF, which @exav/viewer parses in the browser from whatever a user
+# opens; the scanner does not read them. Its PDF image decoders too (the
+# `imagehash` target), which the viewer runs in place of pdf.js's own.
+exav-render = { path = "../crates/exav-render", default-features = false, features = ["dwg", "image", "jp2", "jbig2", "ccitt", "ifc", "stl"] }
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
 
 [[bin]]
@@ -76,6 +83,13 @@ bench = false
 [[bin]]
 name = "filetype"
 path = "fuzz_targets/filetype.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "imagehash"
+path = "fuzz_targets/imagehash.rs"
 test = false
 doc = false
 bench = false
@@ -135,6 +149,34 @@ bench = false
 [[bin]]
 name = "parser_recursion"
 path = "fuzz_targets/parser_recursion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drawing"
+path = "fuzz_targets/drawing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cad_dxf"
+path = "fuzz_targets/cad_dxf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cad_dwg"
+path = "fuzz_targets/cad_dwg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ifc"
+path = "fuzz_targets/ifc.rs"
 test = false
 doc = false
 bench = false

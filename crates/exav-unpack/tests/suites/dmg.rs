@@ -18,6 +18,60 @@ fn contains_marker(entries: &[exav_unpack::Entry]) -> bool {
         .any(|e| e.data.windows(MARKER.len()).any(|w| w == MARKER))
 }
 
+/// Only the data fork is read, so a file with a resource fork, which is where
+/// macOS keeps a compressed file's bytes, is reported rather than scanned as
+/// though the data fork were all of it. The fixture's one file is given a
+/// resource fork in its catalog record.
+#[test]
+fn a_file_with_a_resource_fork_is_reported() {
+    let mut blob = fixture("hfs_plus_udrw.dmg");
+    // The record's BSD info (owner 501, group 20, flags, mode 0o100644), 32
+    // bytes into the record; the resource fork's logical size is 168 bytes in.
+    let bsd = [0, 0, 1, 0xf5, 0, 0, 0, 0x14, 0, 0, 0x81, 0xa4];
+    let at = blob
+        .windows(bsd.len())
+        .position(|w| w == bsd)
+        .expect("the file's record");
+    let size = at - 32 + 168;
+    blob[size..size + 8].copy_from_slice(&100u64.to_be_bytes());
+    let entries = extract(Format::Dmg, &blob, &mut Budget::new(Limits::default())).unwrap();
+    let test = entries
+        .iter()
+        .find(|e| e.name.ends_with("test.txt"))
+        .expect("the file");
+    assert_eq!(test.unsupported, Some("HFS+ resource fork not read"));
+}
+
+/// A file whose data the image says is somewhere it cannot be read from is
+/// reported, not left out: its first extent is moved far past the image.
+#[test]
+fn a_file_that_cannot_be_read_out_of_the_image_is_reported() {
+    let mut blob = fixture("hfs_plus_udrw.dmg");
+    let bsd = [0, 0, 1, 0xf5, 0, 0, 0, 0x14, 0, 0, 0x81, 0xa4];
+    let at = blob
+        .windows(bsd.len())
+        .position(|w| w == bsd)
+        .expect("the file's record");
+    // The data fork's first extent: its start block, 104 bytes in.
+    let start = at - 32 + 104;
+    blob[start..start + 4].copy_from_slice(&0x00ff_ff00u32.to_be_bytes());
+    let entries = extract(Format::Dmg, &blob, &mut Budget::new(Limits::default())).unwrap();
+    let test = entries
+        .iter()
+        .find(|e| e.name.ends_with("test.txt"))
+        .unwrap_or_else(|| {
+            panic!(
+                "left out: {:?}",
+                entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        test.unsupported.is_some(),
+        "read as {} bytes",
+        test.data.len()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Detection
 // ---------------------------------------------------------------------------
@@ -155,6 +209,43 @@ fn extract_apfs_encrypted_no_password_reports_unsupported() {
     assert_eq!(entries.len(), 1);
     assert!(entries[0].unsupported.is_some());
     assert!(entries[0].encrypted);
+}
+
+/// UDIF images whose data fork opens with a bzip2 or an xz run, as hdiutil
+/// writes UDBZ and ULMO images, the rest of the disk in a zlib run
+/// (`../fixtures/cut_short/make_udif.py`). The file starts with that run's
+/// magic and ends with the `koly` trailer: it is a disk image, and its file
+/// comes out whole, which no decode of the first run as a bare stream gives.
+#[test]
+fn a_udif_opening_with_a_bzip2_or_xz_run_is_a_dmg() {
+    use std::io::Read;
+    let eicar = exav_unpack::eicar();
+    for (name, magic) in [
+        ("udif_bzip2_first.dmg", &b"BZh"[..]),
+        ("udif_xz_first.dmg", &b"\xFD7zXZ\0"[..]),
+    ] {
+        let p = format!(
+            "{}/tests/fixtures/cut_short/{name}.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let gz = exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut data = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_end(&mut data)
+            .unwrap();
+        assert!(data.starts_with(magic), "{name}");
+        assert_eq!(detect(&data), Some(Format::Dmg), "{name}");
+        let entries = extract(Format::Dmg, &data, &mut Budget::new(Limits::default())).unwrap();
+        let test = entries
+            .iter()
+            .find(|e| e.name.ends_with("test.txt"))
+            .unwrap_or_else(|| panic!("{name}: no test.txt"));
+        assert!(test.unsupported.is_none(), "{name}: {:?}", test.unsupported);
+        assert!(
+            test.data.windows(eicar.len()).any(|w| w == eicar),
+            "{name}: EICAR not in test.txt"
+        );
+    }
 }
 
 #[cfg(feature = "decrypt")]

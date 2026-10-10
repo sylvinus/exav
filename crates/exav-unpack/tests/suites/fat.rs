@@ -23,7 +23,8 @@
 //! gzip -9 fragmented.img
 //! ```
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the ZIP that was copied in, which is what following the
 /// cluster chain has to reproduce.

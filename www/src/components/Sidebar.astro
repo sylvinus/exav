@@ -1,0 +1,18 @@
+---
+// Starlight's sidebar (the current section's pages), with the list of
+// sections above it in the mobile menu, where the header has no tabs.
+import Default from '@astrojs/starlight/components/Sidebar.astro';
+import TopicList from './TopicList.astro';
+---
+
+<div class="topics md:sl-hidden">
+  <TopicList />
+</div>
+<Default><slot /></Default>
+
+<style>
+  .topics {
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--sl-color-hairline-light);
+  }
+</style>

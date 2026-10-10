@@ -18,9 +18,8 @@
 //! and exav scans one file at a time. Those must be reported, never passed over.
 //!
 //! Fixtures were produced by **official RAR** (6.12 for RAR4, 7.23 for RAR5) and
-//! the expected digests are of the original input files. RAR records a CRC-32
-//! per member, which exav checks on every decode, so a fixture that decoded
-//! wrongly could not reach the digest comparison in the first place.
+//! the expected digests are of the original input files, so a member that
+//! decoded wrongly fails the comparison whatever its CRC-32 says.
 //!
 //! Regenerate with:
 //! ```sh
@@ -29,7 +28,8 @@
 //! rar a -ma4 -v4k -m3 -ep vol_rar4.rar one.txt eicar.com
 //! ```
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the files that went into the archives.
 const ONE: &str = "30c2abfccdf15a28990bae7bb0efa2444d82af3ce7053ff493956ef9612f775d";
@@ -115,6 +115,50 @@ fn a_solid_rar5_group_decodes_every_member() {
     assert_eq!(decoded("solid_rar5.rar"), expected());
 }
 
+/// Two members, not solid, made with RAR 7.23: `a.txt` with a 128 KiB
+/// dictionary, then `b.bin` with 512 KiB, a random 132 KiB block repeated
+/// after a marker. Every member was decoded on the first one's window, so the
+/// second member's distances wrapped and it failed its CRC.
+#[test]
+fn each_member_is_decoded_on_its_own_window() {
+    let mut got: Vec<(String, String)> = members(&fixture("two_windows.rar"))
+        .iter()
+        .map(|e| {
+            assert!(e.unsupported.is_none(), "{}: {:?}", e.name, e.unsupported);
+            (e.name.clone(), sha256_hex(&e.data))
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            (
+                "a.txt".to_string(),
+                "3e608b23bf8d9706b2fdc9fd13ba3c874f13856ea95c5b6ae6b4be2f7761f1cc".to_string()
+            ),
+            (
+                "b.bin".to_string(),
+                "4f75c24fffa92da699feca067ac9883a0084205742283037dfc6dd7f4eb59bd8".to_string()
+            ),
+        ]
+    );
+}
+
+/// A solid group made with RAR 7.23, `-mce+`: `a.txt`, then `code.zzz`,
+/// synthetic x86 calls under the x86 filter. The filter converts addresses
+/// relative to the member, and they were taken relative to the solid stream,
+/// so every executable after the first member of a solid group failed its CRC.
+#[test]
+fn the_x86_filter_counts_from_the_start_of_its_member() {
+    let e = members(&fixture("solid_x86.rar"));
+    let code = e.iter().find(|e| e.name == "code.zzz").expect("code.zzz");
+    assert!(code.unsupported.is_none(), "{:?}", code.unsupported);
+    assert_eq!(
+        sha256_hex(&code.data),
+        "491d628a407e383cc1d068fc52372141c20153371449edaba359628caa00b502"
+    );
+}
+
 #[test]
 fn a_member_split_across_volumes_is_reported() {
     // Only part of `one.txt`'s compressed data is in this volume; the rest is in
@@ -148,12 +192,231 @@ fn a_whole_member_in_a_later_volume_still_decodes() {
     assert_eq!(sha256_hex(&eicar.data), EICAR);
 }
 
+/// A file member of a RAR4 or RAR5 archive: its name, its header, where the
+/// header records the data's CRC-32, and its packed data.
+struct Layout {
+    name: Vec<u8>,
+    head: std::ops::Range<usize>,
+    crc_at: usize,
+    data: std::ops::Range<usize>,
+    rar5: bool,
+}
+
+fn u16_le(d: &[u8], at: usize) -> usize {
+    usize::from(u16::from_le_bytes([d[at], d[at + 1]]))
+}
+
+fn u32_le(d: &[u8], at: usize) -> usize {
+    u32::from_le_bytes(d[at..at + 4].try_into().unwrap()) as usize
+}
+
+/// A RAR5 variable-length integer at `at`: its value and where it ends.
+fn vint(d: &[u8], mut at: usize) -> (usize, usize) {
+    let mut v = 0;
+    for shift in (0..).step_by(7) {
+        let b = d[at];
+        at += 1;
+        v |= usize::from(b & 0x7F) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    (v, at)
+}
+
+/// The file members of `d`, from its headers as the RAR format describes
+/// them (RAR4: `technote.txt`; RAR5: rarlab's archive format page).
+fn layout(d: &[u8]) -> Vec<Layout> {
+    let mut out = Vec::new();
+    if d.starts_with(b"Rar!\x1a\x07\x01\x00") {
+        let mut p = 8;
+        while p + 4 < d.len() {
+            let (hsize, body) = vint(d, p + 4);
+            let end = body + hsize;
+            let (kind, q) = vint(d, body);
+            let (hflags, mut q) = vint(d, q);
+            if hflags & 0x01 != 0 {
+                q = vint(d, q).1;
+            }
+            let mut data_size = 0;
+            if hflags & 0x02 != 0 {
+                (data_size, q) = vint(d, q);
+            }
+            if kind == 2 {
+                let (fflags, q) = vint(d, q);
+                let q = vint(d, q).1; // unpacked size
+                let mut q = vint(d, q).1; // attributes
+                if fflags & 0x02 != 0 {
+                    q += 4; // mtime
+                }
+                assert!(fflags & 0x04 != 0, "a data CRC");
+                let crc_at = q;
+                let q = vint(d, q + 4).1; // compression
+                let q = vint(d, q).1; // host OS
+                let (len, q) = vint(d, q);
+                out.push(Layout {
+                    name: d[q..q + len].to_vec(),
+                    head: p..end,
+                    crc_at,
+                    data: end..end + data_size,
+                    rar5: true,
+                });
+            }
+            p = end + data_size;
+        }
+    } else {
+        let mut p = 0;
+        while p + 7 <= d.len() {
+            let (kind, flags, size) = (d[p + 2], u16_le(d, p + 3), u16_le(d, p + 5));
+            let add = if flags & 0x8000 != 0 {
+                u32_le(d, p + 7)
+            } else {
+                0
+            };
+            if kind == 0x74 {
+                let name_at = p + 32 + if flags & 0x100 != 0 { 8 } else { 0 };
+                out.push(Layout {
+                    name: d[name_at..name_at + u16_le(d, p + 26)].to_vec(),
+                    head: p..p + size,
+                    crc_at: p + 16,
+                    data: p + size..p + size + add,
+                    rar5: false,
+                });
+            }
+            p += size + add;
+        }
+    }
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = flate2::Crc::new();
+    c.update(data);
+    c.sum()
+}
+
+/// `d` with `name`'s recorded CRC-32 wrong and its header's own CRC right.
+fn with_wrong_crc(d: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut d = d.to_vec();
+    let m = layout(&d)
+        .into_iter()
+        .find(|m| m.name == name)
+        .expect("the member");
+    d[m.crc_at] ^= 1;
+    if m.rar5 {
+        let head = crc32(&d[m.head.start + 4..m.head.end]);
+        d[m.head.start..m.head.start + 4].copy_from_slice(&head.to_le_bytes());
+    } else {
+        let head = (crc32(&d[m.head.start + 2..m.head.end]) & 0xFFFF) as u16;
+        d[m.head.start..m.head.start + 2].copy_from_slice(&head.to_le_bytes());
+    }
+    d
+}
+
+/// Only a member's recorded CRC is wrong: it decodes to the file all the
+/// same, and the members after it too, and all are handed over. A wrong
+/// checksum is no reason not to scan bytes that are there.
+#[test]
+fn a_member_failing_only_its_crc_is_handed_over() {
+    for archive in ["solid_rar4.rar", "solid_rar5.rar"] {
+        for name in ["eicar.com", "one.txt"] {
+            let blob = with_wrong_crc(&fixture(archive), name.as_bytes());
+            let e = members(&blob);
+            assert!(
+                e.iter().all(|x| x.unsupported.is_none()),
+                "{archive} {name}: {:?}",
+                e.iter()
+                    .map(|x| (&x.name, x.unsupported))
+                    .collect::<Vec<_>>()
+            );
+            let mut got: Vec<(String, String)> = e
+                .iter()
+                .map(|x| (x.name.clone(), sha256_hex(&x.data)))
+                .collect();
+            got.sort();
+            assert_eq!(got, expected(), "{archive} {name}");
+        }
+    }
+}
+
+/// A member whose packed data does not decode leaves the solid window out of
+/// step with the stream, so the members after it decode against a fresh
+/// window, to bytes that are not theirs. Those are reported, never handed
+/// over as content, whatever their checksums say.
+#[test]
+fn members_decoded_after_one_that_failed_are_reported() {
+    for archive in ["solid_rar4.rar", "solid_rar5.rar"] {
+        let mut blob = fixture(archive);
+        let one = layout(&blob)
+            .into_iter()
+            .find(|m| m.name == b"one.txt")
+            .unwrap();
+        blob[one.data].fill(0xFF);
+        let e = members(&blob);
+        let got: Vec<(&str, bool)> = e
+            .iter()
+            .map(|x| (x.name.as_str(), x.unsupported.is_some()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("eicar.com", false),
+                ("one.txt", true),
+                ("three.txt", true),
+                ("two.txt", true)
+            ],
+            "{archive}"
+        );
+        assert_eq!(sha256_hex(&e[0].data), EICAR, "{archive}");
+    }
+}
+
+/// With checksums verified, a member failing its CRC is reported, and what
+/// is handed over is the file.
+#[cfg(feature = "checksums")]
+#[test]
+fn a_member_failing_its_crc_is_reported_when_checksums_are_verified() {
+    for archive in ["solid_rar4.rar", "solid_rar5.rar"] {
+        let blob = with_wrong_crc(&fixture(archive), b"one.txt");
+        let e = members_verified(&blob);
+        for x in &e {
+            assert_eq!(
+                x.unsupported.is_some(),
+                x.name == "one.txt",
+                "{archive} {}",
+                x.name
+            );
+        }
+    }
+}
+
+#[cfg(feature = "checksums")]
+fn members_verified(blob: &[u8]) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = 8 * 1024 * 1024;
+    limits.max_extracted_bytes = 16 * 1024 * 1024;
+    let mut b = Budget::new(limits);
+    b.set_verify_checksums(true);
+    let _ = extract_each(
+        Format::Rar,
+        blob,
+        &mut b,
+        &mut |e: Entry, _: &mut Budget| {
+            out.push(e);
+            None::<()>
+        },
+    );
+    out
+}
+
+#[cfg(feature = "checksums")]
 #[test]
 fn a_member_that_decodes_to_the_wrong_bytes_is_not_passed_off_as_content() {
     // Corrupting a solid member's packed data makes the decoder produce
-    // *something* rather than fail. The CRC RAR records is what distinguishes
-    // "decoded" from "decoded correctly", and it is checked in every build — a
-    // member that fails it must be reported, not handed over as the file.
+    // *something* rather than fail. With checksums verified, the CRC RAR
+    // records is what distinguishes "decoded" from "decoded correctly": a
+    // member that fails it is reported, not handed over as the file.
     let mut raw = fixture("solid_rar4.rar");
     // Scribble over the middle of the archive body, well past the headers.
     let mid = raw.len() / 2;
@@ -161,7 +424,7 @@ fn a_member_that_decodes_to_the_wrong_bytes_is_not_passed_off_as_content() {
         *b ^= 0xFF;
     }
 
-    let e = members(&raw);
+    let e = members_verified(&raw);
     for m in &e {
         if m.unsupported.is_some() {
             continue;
@@ -177,4 +440,86 @@ fn a_member_that_decodes_to_the_wrong_bytes_is_not_passed_off_as_content() {
         e.iter().any(|x| x.unsupported.is_some()),
         "corrupting the stream must leave something reported unreadable"
     );
+}
+
+/// `sha256sum` of the inputs of the `rar_volumes` sets.
+const TEXT: &str = "306e49d40e25318b97ad7628011238f0ed6af09880396518cd5a8e1cbe7efe19";
+const NOISE: &str = "6987decf3255b53b0f8cf0da45aafacce4294578716058e11cd018a18e57035e";
+
+/// Sets written by official RAR, each with `noise.bin` split across all three
+/// of its volumes, joined and decoded. The inputs are made with:
+/// ```python
+/// r = random.Random(20261001)
+/// open("text.txt", "w").write("".join(f"line {i}: the quick brown fox {r.randrange(10**6)}\n" for i in range(400)))
+/// open("noise.bin", "wb").write(bytes(r.randrange(256) for _ in range(20000)))
+/// ```
+/// and the sets with RAR 7.23 (RAR5, which ends every volume with a
+/// quick-open record) and RAR 6.12 (RAR4, old-style names):
+/// ```sh
+/// rar a -ma5 -m3 -v8k -ep set5.rar text.txt noise.bin
+/// rar a -ma4 -m3 -vn -v8k -ep set4.rar text.txt noise.bin
+/// ```
+#[test]
+fn a_real_volume_set_joins_into_its_archive() {
+    for parts in [
+        ["set5.part1.rar", "set5.part2.rar", "set5.part3.rar"],
+        ["set4.rar", "set4.r00", "set4.r01"],
+    ] {
+        let vols: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|p| fixture(&format!("../rar_volumes/{p}")))
+            .collect();
+        let refs: Vec<&[u8]> = vols.iter().map(Vec::as_slice).collect();
+        let joined =
+            exav_unpack::join_rar_volumes(&refs).unwrap_or_else(|e| panic!("{}: {e}", parts[0]));
+        // Each RAR5 volume's quick-open record (a service header named `QO`,
+        // its name length before it) indexes that volume alone, and is left
+        // out of the join.
+        let qo = |b: &[u8]| b.windows(3).filter(|w| w == b"\x02QO").count();
+        if parts[0].starts_with("set5") {
+            assert!(vols.iter().all(|v| qo(v) == 1));
+            assert_eq!(qo(&joined), 0);
+        }
+        let mut got: Vec<(String, String)> = members(&joined)
+            .iter()
+            .map(|x| {
+                assert!(
+                    x.unsupported.is_none(),
+                    "{}: {} {:?}",
+                    parts[0],
+                    x.name,
+                    x.unsupported
+                );
+                (x.name.clone(), sha256_hex(&x.data))
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("noise.bin".to_string(), NOISE.to_string()),
+                ("text.txt".to_string(), TEXT.to_string())
+            ],
+            "{}",
+            parts[0]
+        );
+        // Each volume alone reports the split member, never passes it over.
+        for v in &vols {
+            assert!(
+                members(v)
+                    .iter()
+                    .any(|x| x.name == "noise.bin" && x.unsupported.is_some()),
+                "{}: a lone volume",
+                parts[0]
+            );
+        }
+        // Each volume records its number, so a set missing its middle one is
+        // refused rather than joined into a member that decodes to garbage.
+        let gap = [refs[0], refs[2]];
+        assert!(
+            exav_unpack::join_rar_volumes(&gap).is_err(),
+            "{}: the middle volume missing",
+            parts[0]
+        );
+    }
 }

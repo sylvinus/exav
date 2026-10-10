@@ -19,6 +19,10 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WASMTIME="${WASMTIME:-wasmtime}"
+# Its installer puts it here and adds it to PATH only in new login shells.
+if ! command -v "$WASMTIME" >/dev/null 2>&1 && [ -x "$HOME/.wasmtime/bin/wasmtime" ]; then
+  WASMTIME="$HOME/.wasmtime/bin/wasmtime"
+fi
 
 if ! command -v "$WASMTIME" >/dev/null 2>&1; then
   echo "error: '$WASMTIME' not found. Install wasmtime (https://wasmtime.dev) or set \$WASMTIME." >&2
@@ -38,6 +42,11 @@ export CARGO_TARGET_WASM32_WASIP1_RUNNER="$WASMTIME run --dir $REPO::$REPO"
 
 # 1) The extractor (pure Rust, the main parsing attack surface).
 cargo test --lib -p exav-unpack --target wasm32-wasip1 "$@"
+
+# 1b) Container header fields at their extremes (tests/suites/extreme.rs), the
+#     one integration suite that runs here: a wasm32 build has no unwinding, so
+#     a sum that overflows 32 bits aborts it, and that is what fails the run.
+cargo test -p exav-unpack --test all --target wasm32-wasip1 -- extreme
 
 # 2) The scanning core, minus `yara` (yara-x pulls wasmtime/cranelift, which
 #    can't target wasm) — so the engine/pe/patterns/phishing/dlp byte-processing

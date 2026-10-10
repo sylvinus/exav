@@ -164,10 +164,6 @@ fn clamd_instream(port: u16, body: &[u8]) -> String {
 }
 
 /// The same, reporting a dropped connection instead of panicking on it.
-///
-/// A reload re-forks the worker pool, and a connection accepted across that
-/// moment is reset — a real transient a client retries, not a failure. A test
-/// polling for a reloaded signature has to be able to tell the two apart.
 fn try_clamd_instream(port: u16, body: &[u8]) -> io::Result<String> {
     let mut s = dial(port, "clamd");
     s.write_all(b"zINSTREAM\0")?;
@@ -419,26 +415,403 @@ fn serving_no_signatures_is_refused() {
 
 /// A signature change on disk reaches the running daemon: the supervisor's
 /// mtime watch is what a sidecar deployment relies on, and it has to keep
-/// working now that the signature lifecycle is a flag rather than a mode.
+/// working now that the signature lifecycle is a flag rather than a mode, and
+/// whatever serves: the pool, the thread model, or ICAP alone.
 #[test]
 fn a_rewritten_signature_directory_is_reloaded() {
+    for model in ["pool", "threads", "icap"] {
+        let sigs = sig_dir();
+        let port = free_port();
+        let listen = match model {
+            "icap" => format!("icap://127.0.0.1:{port}"),
+            _ => format!("clamd://127.0.0.1:{port}"),
+        };
+        let mut args = vec![
+            "--listen",
+            &listen,
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ];
+        if model == "threads" {
+            args.extend(["--workers", "threads"]);
+        }
+        let server = Server::start(TempDir::new().unwrap(), &args);
+        // A worker of the old generation may still take a connection, so an
+        // answer without the new signature means "not yet".
+        let scan = || match model {
+            "icap" => icap_respmod(port, b"malwareD"),
+            _ => try_clamd_instream(port, b"malwareD").unwrap_or_default(),
+        };
+        if model == "icap" {
+            wait_for_log(&server, "serving ICAP on tcp:");
+        }
+        let before = match model {
+            "icap" => icap_respmod(port, b"malwareD"),
+            _ => clamd_instream(port, b"malwareD"),
+        };
+        assert!(
+            !before.contains("Exav.Test.Delta"),
+            "{model}: nothing detects this yet, got {before:?}"
+        );
+
+        std::fs::write(
+            sigs.path().join("more.ndb"),
+            "Exav.Test.Delta:0:*:6d616c7761726544\n",
+        )
+        .unwrap();
+        wait_for_log(&server, "reloading signatures");
+        until_delta(scan, &server);
+    }
+}
+
+/// Bytes `pid` has read so far, from `/proc/<pid>/io`.
+#[cfg(target_os = "linux")]
+fn bytes_read(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("rchar:"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// A file a sidecar writes while the first load is still running is a change:
+/// the watch's baseline is what the load started from, not what the directory
+/// held once it finished.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_written_during_the_first_load_is_reloaded() {
+    use std::fmt::Write as _;
     let sigs = sig_dir();
+    // Enough that building the database takes seconds after the files are read.
+    let mut big = String::new();
+    for i in 0..1_000_000u64 {
+        writeln!(
+            big,
+            "Exav.Big.{i}:0:*:{:016x}",
+            i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        )
+        .unwrap();
+    }
+    std::fs::write(sigs.path().join("big.ndb"), &big).unwrap();
     let clamd = free_port();
     let server = Server::start(
         TempDir::new().unwrap(),
         &[
+            "--workers",
+            "threads",
             "--listen",
             &format!("clamd://127.0.0.1:{clamd}"),
             "--sig-dir",
             sigs.path().to_str().unwrap(),
         ],
     );
-
-    let before = clamd_instream(clamd, b"malwareD");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while bytes_read(server.child.id()) < big.len() as u64 {
+        assert!(Instant::now() < deadline, "the signatures were never read");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::write(
+        sigs.path().join("more.ndb"),
+        "Exav.Test.Delta:0:*:6d616c7761726544\n",
+    )
+    .unwrap();
+    // Otherwise the write missed the window this is about.
     assert!(
-        before.contains(": OK"),
-        "nothing detects this yet, got {before:?}"
+        !server.stderr().contains("listening on"),
+        "the load had already finished:\n{}",
+        server.stderr()
     );
+    let first = clamd_instream(clamd, b"malwareD");
+    assert!(first.contains(": OK"), "loaded before the write: {first}");
+    until_delta(|| clamd_instream(clamd, b"malwareD"), &server);
+}
+
+/// A reload or a shutdown signal that lands while the supervisor is busy is
+/// acted on as soon as it is free, not at the end of its next idle poll.
+///
+/// Busy means reloading a database big enough to take seconds, started by a
+/// `SIGUSR2`; the poll is ten seconds, well past what either answer may take.
+/// The worker a reload retires is kept in a job, so its exit is not what wakes
+/// the supervisor.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_request_while_the_supervisor_is_busy_is_not_left_for_the_next_poll() {
+    use std::fmt::Write as _;
+    let sigs = sig_dir();
+    let mut big = String::new();
+    for i in 0..1_000_000u64 {
+        writeln!(
+            big,
+            "Exav.Big.{i}:0:*:{:016x}",
+            i.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        )
+        .unwrap();
+    }
+    std::fs::write(sigs.path().join("big.ndb"), &big).unwrap();
+    let clamd = free_port();
+    let mut server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let pid = server.child.id();
+    let reloads = |s: &Server| s.stderr().matches("reloading signatures").count();
+    // A reload under way: it has read the signatures and is building from them.
+    let start_a_reload = |s: &Server| {
+        let before = bytes_read(pid);
+        signal(s, libc::SIGUSR2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while bytes_read(pid) < before + big.len() as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "no reload started:\n{}",
+                s.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // When `done` first holds.
+    let when = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let since = Instant::now();
+        while !done() {
+            assert!(
+                since.elapsed() < Duration::from_secs(60),
+                "{what} never happened"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Instant::now()
+    };
+
+    // A job the worker is in until the test ends.
+    let hold = || {
+        let mut s = dial(clamd, "clamd");
+        s.write_all(b"zINSTREAM\0").unwrap();
+        s.write_all(&4u32.to_be_bytes()).unwrap();
+        s.write_all(b"ab").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        s
+    };
+
+    let _job = hold();
+    start_a_reload(&server);
+    signal(&server, libc::SIGUSR2);
+    assert_eq!(
+        reloads(&server),
+        0,
+        "the first reload ended before the second request"
+    );
+    let first = when("the first reload", &mut || reloads(&server) >= 1);
+    let second = when("the second reload", &mut || reloads(&server) >= 2);
+    assert!(
+        second - first < Duration::from_secs(8),
+        "the second reload waited {:?} after the first:\n{}",
+        second - first,
+        server.stderr()
+    );
+
+    // The idle worker of the first reload, retired by the second, is gone.
+    when("the idle worker's exit", &mut || {
+        server.stderr().contains("retired after a reload")
+    });
+    let _job = hold();
+    start_a_reload(&server);
+    signal(&server, libc::SIGTERM);
+    assert_eq!(reloads(&server), 2, "the third reload ended before SIGTERM");
+    let third = when("the third reload", &mut || reloads(&server) >= 3);
+    let exit = when("the exit", &mut || {
+        matches!(server.child.try_wait(), Ok(Some(_)))
+    });
+    assert!(
+        exit - third < Duration::from_secs(5),
+        "SIGTERM waited {:?} after the reload:\n{}",
+        exit - third,
+        server.stderr()
+    );
+}
+
+/// Rewrite a signature file in place and put its mtime back, so the directory
+/// watch sees no change and only an explicit reload can pick it up.
+fn rewrite_unseen(dir: &Path, name: &str, body: &str) {
+    let p = dir.join(name);
+    let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+    std::fs::write(&p, body).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+}
+
+fn signal(server: &Server, sig: libc::c_int) {
+    // SAFETY: signals the child this test started and has not reaped.
+    assert_eq!(
+        unsafe { libc::kill(server.child.id() as libc::pid_t, sig) },
+        0
+    );
+}
+
+/// Scan `malwareD` until `Exav.Test.Delta` detects it: the reload that brought
+/// it in has taken effect.
+fn until_delta(scan: impl Fn() -> String, server: &Server) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let got = scan();
+        if got.contains("Exav.Test.Delta") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reload never took effect: {got:?}\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+const WITH_DELTA: &str = "Exav.Test.Alpha:0:*:6d616c7761726541\n\
+                          Exav.Test.Beta:0:*:6d616c7761726542\n\
+                          Exav.Test.Delta:0:*:6d616c7761726544\n";
+
+/// As in clamd: `SIGUSR2` reloads the signatures and `SIGHUP` reopens the
+/// `--log` file, whatever serves. Neither stops the daemon.
+#[test]
+fn signals_reload_and_reopen_the_log_like_clamd() {
+    for workers in ["2", "threads"] {
+        let sigs = sig_dir();
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("scans.log");
+        let clamd = free_port();
+        let server = Server::start(
+            dir,
+            &[
+                "--workers",
+                workers,
+                "--log",
+                log.to_str().unwrap(),
+                "--listen",
+                &format!("clamd://127.0.0.1:{clamd}"),
+                "--sig-dir",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        let scan = || until_answered("scan", || try_clamd_instream(clamd, b"malwareD"));
+        assert!(scan().contains(": OK"), "workers={workers}");
+
+        // Rotation: the log moves away, SIGHUP, and the next line lands in a
+        // new file at the configured path.
+        std::fs::rename(&log, log.with_extension("1")).unwrap();
+        signal(&server, libc::SIGHUP);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !std::fs::read_to_string(&log).is_ok_and(|s| s.contains(": OK")) {
+            assert!(
+                Instant::now() < deadline,
+                "workers={workers}: the log was never reopened:\n{}",
+                server.stderr()
+            );
+            scan();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            clamd_ping(clamd),
+            "PONG",
+            "workers={workers}: SIGHUP stopped it"
+        );
+
+        rewrite_unseen(sigs.path(), "test.ndb", WITH_DELTA);
+        signal(&server, libc::SIGUSR2);
+        wait_for_log(&server, "reloading signatures");
+        until_delta(scan, &server);
+    }
+}
+
+/// `RELOAD` reloads in the thread model too; it used to answer `RELOADING`
+/// and do nothing.
+#[test]
+fn reload_works_in_the_thread_model() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "threads",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    let scan = || until_answered("scan", || try_clamd_instream(clamd, b"malwareD"));
+    assert!(scan().contains(": OK"));
+    rewrite_unseen(sigs.path(), "test.ndb", WITH_DELTA);
+    let mut s = dial(clamd, "clamd");
+    s.write_all(b"zRELOAD\0").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert_eq!(
+        String::from_utf8_lossy(&out).trim_end_matches('\0'),
+        "RELOADING"
+    );
+    wait_for_log(&server, "reloading signatures");
+    until_delta(scan, &server);
+}
+
+/// ICAP served alone reloads on `SIGUSR2`, and `SIGHUP` does not stop it.
+#[test]
+fn icap_alone_reloads_on_sigusr2() {
+    let sigs = sig_dir();
+    let icap = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--listen",
+            &format!("icap://127.0.0.1:{icap}"),
+            "-d",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    wait_for_log(&server, "serving ICAP on tcp:");
+    assert!(!icap_respmod(icap, b"malwareD").contains("Exav.Test.Delta"));
+    signal(&server, libc::SIGHUP);
+    rewrite_unseen(sigs.path(), "test.ndb", WITH_DELTA);
+    signal(&server, libc::SIGUSR2);
+    wait_for_log(&server, "reloading signatures");
+    until_delta(|| icap_respmod(icap, b"malwareD"), &server);
+}
+
+/// A reload does not cut short a scan already in progress: the worker holding
+/// it finishes the job on the database it started with, then retires.
+#[test]
+fn a_reload_lets_a_scan_in_progress_finish() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "2",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+
+    let mut s = dial(clamd, "clamd");
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&(ALPHA.len() as u32).to_be_bytes()).unwrap();
+    s.write_all(ALPHA).unwrap();
 
     std::fs::write(
         sigs.path().join("more.ndb"),
@@ -446,21 +819,280 @@ fn a_rewritten_signature_directory_is_reloaded() {
     )
     .unwrap();
     wait_for_log(&server, "reloading signatures");
+    // Past the moment the old generation is told to go.
+    std::thread::sleep(Duration::from_secs(2));
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        // A connection accepted while the supervisor re-forks its pool is
-        // reset, so a dropped one here means "not yet", not "wrong answer".
-        let after = try_clamd_instream(clamd, b"malwareD");
-        if after.as_deref().unwrap_or("").contains("Exav.Test.Delta") {
-            break;
+    s.write_all(&0u32.to_be_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out);
+    assert!(
+        reply.contains("Exav.Test.Alpha FOUND"),
+        "the scan in progress was dropped by the reload: {reply:?}\n{}",
+        server.stderr()
+    );
+}
+
+/// The same for an ICAP request, served by a child of its own.
+#[test]
+fn a_reload_lets_an_icap_request_in_progress_finish() {
+    let sigs = sig_dir();
+    let (clamd, icap) = (free_port(), free_port());
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "2",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--listen",
+            &format!("icap://127.0.0.1:{icap}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    wait_for_log(&server, "serving ICAP on tcp:");
+
+    let mut s = dial(icap, "icap");
+    let http = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", ALPHA.len());
+    let head = format!(
+        "RESPMOD icap://127.0.0.1:{icap}/avscan ICAP/1.0\r\n\
+         Host: 127.0.0.1\r\n\
+         Connection: close\r\n\
+         Encapsulated: res-hdr=0, res-body={}\r\n\r\n",
+        http.len()
+    );
+    s.write_all(head.as_bytes()).unwrap();
+    s.write_all(http.as_bytes()).unwrap();
+    s.write_all(format!("{:x}\r\n", ALPHA.len()).as_bytes())
+        .unwrap();
+    s.write_all(ALPHA).unwrap();
+
+    std::fs::write(
+        sigs.path().join("more.ndb"),
+        "Exav.Test.Delta:0:*:6d616c7761726544\n",
+    )
+    .unwrap();
+    wait_for_log(&server, "reloading signatures");
+    std::thread::sleep(Duration::from_secs(2));
+
+    s.write_all(b"\r\n0\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let answer = String::from_utf8_lossy(&out);
+    assert!(
+        answer.contains("Exav.Test.Alpha"),
+        "the ICAP request in progress was dropped by the reload: {answer:?}\n{}",
+        server.stderr()
+    );
+}
+
+/// Processes whose parent is `pid`.
+#[cfg(target_os = "linux")]
+fn children_of(pid: u32) -> usize {
+    child_pids(pid).len()
+}
+
+#[cfg(target_os = "linux")]
+fn child_pids(pid: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            // `pid (comm) state ppid ...`; comm may hold spaces, so split after it.
+            let ppid: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (ppid == pid).then(|| e.file_name().to_str()?.parse().ok())?
+        })
+        .collect()
+}
+
+/// A reload replaces the pool, it does not add to it: the retired generation's
+/// workers are not replaced as they exit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reload_keeps_the_pool_its_size() {
+    let sigs = sig_dir();
+    let (clamd, icap) = (free_port(), free_port());
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "2",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--listen",
+            &format!("icap://127.0.0.1:{icap}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    wait_for_log(&server, "serving ICAP on tcp:");
+    let pid = server.child.id();
+    assert_eq!(children_of(pid), 3, "two workers and the ICAP child");
+    // An idle keep-alive connection does not keep a retired ICAP child alive.
+    let _idle = dial(icap, "icap");
+    for (i, name) in ["d.ndb", "e.ndb"].iter().enumerate() {
+        std::fs::write(
+            sigs.path().join(name),
+            format!("Exav.Test.X{i}:0:*:6d616c776172655{i}\n"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while server.stderr().matches("reloading signatures").count() <= i {
+            assert!(Instant::now() < deadline, "no reload:\n{}", server.stderr());
+            std::thread::sleep(Duration::from_millis(50));
         }
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(
+            children_of(pid),
+            3,
+            "after reload {}:\n{}",
+            i + 1,
+            server.stderr()
+        );
+    }
+}
+
+/// A retired worker does not outlive its grace period: one held by an idle
+/// session would otherwise keep serving it the old signatures until the client
+/// hangs up.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_retired_worker_is_stopped_after_its_grace() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "2",
+            "--max-scan-secs",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let pid = server.child.id();
+
+    let mut session = dial(clamd, "clamd");
+    session.write_all(b"zIDSESSION\0zPING\0").unwrap();
+    let mut reply = [0u8; 8];
+    session.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"1: PONG\0");
+
+    std::fs::write(
+        sigs.path().join("more.ndb"),
+        "Exav.Test.Delta:0:*:6d616c7761726544\n",
+    )
+    .unwrap();
+    wait_for_log(&server, "reloading signatures");
+    let reloaded = Instant::now();
+    // The grace is one job's time limit and a margin: well under the minute an
+    // idle session is otherwise allowed.
+    while children_of(pid) > 2 {
         assert!(
-            Instant::now() < deadline,
-            "the new signature never took effect: {after:?}"
+            reloaded.elapsed() < Duration::from_secs(30),
+            "the retired worker is still up:\n{}",
+            server.stderr()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let mut rest = Vec::new();
+    let _ = session.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "{rest:?}");
+}
+
+/// A worker stopped in the middle of a job answers it, as one stopped by its
+/// time limit does: a connection closed with no reply reads as clean to some
+/// clients.
+#[test]
+fn a_worker_stopped_mid_job_answers() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let mut s = dial(clamd, "clamd");
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&4u32.to_be_bytes()).unwrap();
+    s.write_all(b"ab").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let status = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out);
+    assert!(reply.contains("ERROR"), "no answer: {reply:?}");
+}
+
+/// So does one whose supervisor is killed outright, and it does not outlive it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_whose_supervisor_dies_mid_job_answers() {
+    let sigs = sig_dir();
+    let clamd = free_port();
+    let server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "1",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(clamd_ping(clamd), "PONG");
+    let workers = child_pids(server.child.id());
+    assert_eq!(workers.len(), 1, "{workers:?}");
+    let mut s = dial(clamd, "clamd");
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&4u32.to_be_bytes()).unwrap();
+    s.write_all(b"ab").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    signal(&server, libc::SIGKILL);
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out).into_owned();
+    let proc = format!("/proc/{}", workers[0]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&proc).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let gone = !Path::new(&proc).exists();
+    // SAFETY: the worker this test started, if it is still there.
+    unsafe {
+        libc::kill(workers[0] as libc::pid_t, libc::SIGKILL);
+    }
+    assert!(
+        reply.contains("stopped before it finished ERROR"),
+        "{reply:?}"
+    );
+    assert!(gone, "the worker outlived its supervisor");
 }
 
 /// An updater-only run with nothing to fetch from is refused. A container told

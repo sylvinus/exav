@@ -5,16 +5,11 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use crate::formats::cab_parse::consts;
 use crate::formats::cab_parse::ctype::CompressionType;
 use crate::formats::cab_parse::file::FileEntry;
-use crate::formats::cab_parse::folder::Folder;
 use crate::formats::cab_parse::string::read_null_terminated_string;
 
-pub(crate) struct Cabinet {
-    file_entries: Vec<FileEntry>,
-    decompressed_data: Vec<u8>,
-}
+pub(crate) struct Cabinet;
 
-/// A CFFOLDER's location and codec, parsed without decompressing its data — used
-/// by both the buffered [`Cabinet::new`] and the streaming extractor.
+/// A CFFOLDER's location and codec, parsed without decompressing its data.
 pub(crate) struct FolderMeta {
     pub first_data_offset: u32,
     pub num_data_blocks: u16,
@@ -23,9 +18,8 @@ pub(crate) struct FolderMeta {
 
 impl Cabinet {
     /// Parse the CFHEADER, CFFOLDER table, and CFFILE table **without**
-    /// decompressing any folder data. The streaming extractor uses this to walk
-    /// files and decode each folder lazily (via [`super::folder::FolderReader`]);
-    /// `new` uses it and then decompresses.
+    /// decompressing any folder data. The extractor walks the files and decodes
+    /// each folder lazily (via [`super::folder::FolderReader`]).
     pub(crate) fn layout<R: Read + Seek>(
         reader: &mut R,
     ) -> io::Result<(Vec<FolderMeta>, Vec<FileEntry>)> {
@@ -114,88 +108,5 @@ impl Cabinet {
             ));
         }
         Ok((folder_metas, file_entries))
-    }
-
-    pub(crate) fn new<R: Read + Seek>(reader: &mut R, max_buffer: u64) -> io::Result<Cabinet> {
-        let (folder_metas, mut file_entries) = Self::layout(reader)?;
-
-        // === Decompress each folder ===
-        let mut folders: Vec<Folder> = Vec::with_capacity(folder_metas.len());
-        for m in &folder_metas {
-            folders.push(Folder::new(
-                reader,
-                m.first_data_offset,
-                m.num_data_blocks,
-                m.compression_type,
-                max_buffer,
-            )?);
-        }
-
-        // === Build combined decompressed buffer ===
-        let mut decompressed_data = Vec::new();
-        let mut folder_decomp_offsets: Vec<u32> = Vec::new();
-        for folder in &folders {
-            folder_decomp_offsets.push(decompressed_data.len() as u32);
-            decompressed_data.extend_from_slice(folder.decompressed_data());
-            // The combined buffer across all folders must also stay within the
-            // global peak-buffer limit.
-            if decompressed_data.len() as u64 > max_buffer {
-                invalid_data!("Cabinet decompressed size exceeds max-buffer");
-            }
-        }
-
-        // Map file entries to absolute offsets in the combined buffer
-        for fe in &mut file_entries {
-            let base = folder_decomp_offsets
-                .get(fe.folder_index as usize)
-                .copied()
-                .unwrap_or(0);
-            fe.data_offset += base;
-        }
-
-        Ok(Cabinet {
-            file_entries,
-            decompressed_data,
-        })
-    }
-
-    pub(crate) fn file_entries(&self) -> &[FileEntry] {
-        &self.file_entries
-    }
-
-    /// Read the member at a specific entry.
-    ///
-    /// A cabinet may hold two members under one name. Looking a member up by
-    /// name then yields the first one's bytes twice and never the second's, so a
-    /// walk over [`Self::file_entries`] reads each entry directly.
-    pub(crate) fn read_entry(&self, file_entry: &FileEntry) -> io::Result<FileReader<'_>> {
-        let start = file_entry.data_offset as usize;
-        let end = start + file_entry.uncompressed_size as usize;
-        if end > self.decompressed_data.len() {
-            invalid_data!(
-                "File extends past end of decompressed data (offset {}, size {})",
-                start,
-                file_entry.uncompressed_size
-            );
-        }
-        Ok(FileReader {
-            data: &self.decompressed_data[start..end],
-            pos: 0,
-        })
-    }
-}
-
-pub(crate) struct FileReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Read for FileReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let remaining = &self.data[self.pos..];
-        let n = remaining.len().min(buf.len());
-        buf[..n].copy_from_slice(&remaining[..n]);
-        self.pos += n;
-        Ok(n)
     }
 }

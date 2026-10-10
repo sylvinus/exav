@@ -30,6 +30,17 @@ use crate::*;
 /// 16-byte header (`magic`, `bit_field`, `mtime`, `source_size`).
 const PYC_HEADER_LEN: usize = 16;
 
+/// Walk a `.pyc`: its code object, streamed from where it lies.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let mut source = crate::source::Reader::new(src);
+    let members = stream_offsets(&mut source)?;
+    crate::stream::stream_stored(&mut source, budget, visit, members)
+}
+
 /// Reader-based streaming: the single `pyc-code` member is the whole file past
 /// the fixed header — streamed via seek+take with no buffering.
 pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
@@ -46,35 +57,6 @@ pub(crate) fn stream_offsets<R: std::io::Read + std::io::Seek>(
         PYC_HEADER_LEN as u64,
         len - PYC_HEADER_LEN as u64,
     )])
-}
-
-/// Emit the marshalled code body of a `.pyc` file (the whole file minus the
-/// fixed 16-byte header) as a single `pyc-code` member. Bounds-checked; a file
-/// shorter than the header (or with an empty body) yields no members.
-pub(crate) fn extract_pyc<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    // Too short to hold a header + body: emit nothing (no panic).
-    if data.len() < PYC_HEADER_LEN {
-        return Ok(None);
-    }
-    let body = &data[PYC_HEADER_LEN..];
-    if body.is_empty() {
-        return Ok(None);
-    }
-    budget.count_entry()?;
-    let cap = budget.reserve()?;
-    if body.len() as u64 > cap {
-        return Err(LimitHit::new("pyc body exceeds budget".to_string()));
-    }
-    let member = body.to_vec();
-    budget.commit(member.len() as u64);
-    if let Some(r) = visit(Entry::new("pyc-code".into(), member), budget) {
-        return Ok(Some(r));
-    }
-    Ok(None)
 }
 
 #[cfg(test)]

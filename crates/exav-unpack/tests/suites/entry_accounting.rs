@@ -18,7 +18,7 @@ fn hits_limit(blob: &[u8], fmt: Format, cap: u64) -> bool {
     let mut limits = Limits::default();
     limits.max_members = cap;
     let mut budget = Budget::new(limits);
-    extract(fmt, blob, &mut budget).is_err()
+    extract(fmt, &blob, &mut budget).is_err()
 }
 
 fn tar_of(members: &[(&str, Vec<u8>)]) -> Vec<u8> {

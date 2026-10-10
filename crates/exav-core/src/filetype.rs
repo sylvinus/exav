@@ -1,11 +1,14 @@
 //! Content-based file-type identification (magic bytes), never trusting
-//! the file extension. Only needs the first few KB, so it works in stream
-//! mode. Drives routing to unpackers and structural analyzers.
+//! the file extension. Reads the first few KB, and whatever container
+//! detection (`unpack::detect`) needs: the end of an object, or a search of it.
+//! Drives routing to unpackers and structural analyzers.
+
+use crate::byte_source::ByteSource;
 
 /// File-type magic rules loaded from ClamAV `.ftm` databases. Each is a literal
 /// byte prefix at a fixed offset that assigns a [`FileType`]. Applied ONLY as a
 /// fallback when content-based [`identify`] is inconclusive (`Unknown`), so it
-/// never overrides — and so never regresses — a confidently-typed file.
+/// never overrides (and so never regresses) a confidently-typed file.
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FtmMagics {
     rules: Vec<FtmRule>,
@@ -31,7 +34,7 @@ impl FtmMagics {
     /// only absolute-offset (`magictype 0`) rules whose magic is purely literal
     /// hex and whose `CL_TYPE` maps to a [`FileType`] exav models; wildcarded
     /// magics and unmodelled types are skipped (the engine still type-detects
-    /// natively — these only fill gaps).
+    /// natively; these only fill gaps).
     pub fn extend_from_text(&mut self, text: &str) {
         for line in text.lines() {
             let line = line.trim();
@@ -61,9 +64,18 @@ impl FtmMagics {
     /// First magic that matches `data`, if any. Intended as the `Unknown`
     /// fallback for [`identify`].
     pub fn identify(&self, data: &[u8]) -> Option<FileType> {
+        self.identify_source(&data)
+    }
+
+    /// As [`Self::identify`], over an object that need not be held in memory.
+    pub(crate) fn identify_source(&self, data: &dyn ByteSource) -> Option<FileType> {
         for r in &self.rules {
-            let end = r.offset.checked_add(r.magic.len())?;
-            if end <= data.len() && &data[r.offset..end] == r.magic.as_slice() {
+            // One rule with an offset past the address space says nothing
+            // about the ones after it.
+            let Some(end) = r.offset.checked_add(r.magic.len()) else {
+                continue;
+            };
+            if end <= data.len() && data.window(r.offset, r.magic.len())[..] == r.magic[..] {
                 return Some(r.ft);
             }
         }
@@ -90,7 +102,7 @@ fn parse_literal_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Map a ClamAV `CL_TYPE_*` to the exav [`FileType`] it corresponds to, or
-/// `None` for types exav doesn't model (compiled python, …) — assigning those
+/// `None` for types exav doesn't model (compiled python, …). Assigning those
 /// would gain nothing since no `Target` keys on them.
 pub(crate) fn cl_type_to_filetype(t: &str) -> Option<FileType> {
     Some(match t {
@@ -160,9 +172,9 @@ pub enum FileType {
     Lz4,         // LZ4 frame
     Arc,         // ARC / PKARC / PAK archive
     Ace,         // ACE archive (recognised, not decoded)
-    Alz,         // ALZ archive (recognised, not decoded)
-    Egg,         // EGG archive (recognised, not decoded)
-    Hwp3,        // Hangul HWP v3 document (recognised, not decoded)
+    Alz,         // ALZ archive
+    Egg,         // EGG archive
+    Hwp3,        // Hangul HWP v3 document
     IshieldMsi,  // InstallShield MSI installer (recognised, not unpacked)
     IshieldCab,  // InstallShield InstallScript cabinet (recognised, not unpacked)
     IshieldZ,    // InstallShield `.z` archive (decoded)
@@ -182,8 +194,8 @@ pub enum FileType {
     Szdd,        // MS-Compress SZDD / KWAJ
     Tnef,        // TNEF (winmail.dat) MS email attachment container
     Swf,         // SWF (Adobe Flash) movie (CWS/ZWS compressed)
-    // Raster image. Never produced by content detection — `Target:5` signatures
-    // reach images through `fuzzy_img::looks_like_image` instead. This exists
+    // Raster image. Never produced by content detection: `Target:5` signatures
+    // reach images through the engine's `looks_like_image` instead. This exists
     // only so a `HandlerType:CL_TYPE_GRAPHICS` signature has a type to re-type
     // *to*; giving it one costs nothing precisely because nothing else can
     // produce it.
@@ -201,9 +213,14 @@ pub enum FileType {
     AiModel,   // AI model (Python pickle / safetensors)
     Screnc,    // Microsoft Script Encoder (#@~^)
     Script,    // shell/script with a shebang
-    Html,      // HTML document (content-detected; for `Target:3` HTML signatures)
-    Text,      // ASCII/UTF-8 text (content-detected; for `Target:7` text signatures)
+    Html,      // HTML document (content-detected)
+    Text,      // ASCII/UTF-8 text (content-detected)
     Unknown,
+    // The normalised views of an object, which never type an object itself:
+    // the one HTML (`Target:3`) signatures match, and the one text
+    // (`Target:7`) signatures match.
+    HtmlView,
+    TextView,
 }
 
 impl FileType {
@@ -278,6 +295,8 @@ impl FileType {
             FileType::Html => "HTML",
             FileType::Text => "ASCII text",
             FileType::Unknown => "data",
+            FileType::HtmlView => "normalised HTML",
+            FileType::TextView => "normalised text",
         }
     }
 }
@@ -285,6 +304,34 @@ impl FileType {
 /// Identify a file type from a header prefix (and, for tar, a 512-byte
 /// record if available).
 pub fn identify(buf: &[u8]) -> FileType {
+    identify_with(buf, || crate::unpack::detect(&buf))
+}
+
+/// Bytes of an object's start the content sniffers below read.
+const SNIFF_HEAD: usize = 8192;
+
+/// As [`identify`], over an object that need not be held in memory: its start
+/// is read, and the container detection reads what it needs.
+pub(crate) fn identify_source(src: &dyn ByteSource) -> FileType {
+    identify_source_with(src, || crate::unpack::detect(src))
+}
+
+/// As [`identify_source`], asking `detect` for what [`crate::unpack::detect`]
+/// makes of `src`, if the checks before it fail.
+pub(crate) fn identify_source_with(
+    src: &dyn ByteSource,
+    detect: impl FnOnce() -> Option<crate::unpack::Format>,
+) -> FileType {
+    let head = match src.as_slice() {
+        Some(buf) => std::borrow::Cow::Borrowed(buf),
+        None => src.window(0, SNIFF_HEAD),
+    };
+    identify_with(&head, detect)
+}
+
+/// [`identify`] given the object's start, which holds at least what every
+/// check but `detect` reads, and `detect`, asked only if those checks fail.
+fn identify_with(buf: &[u8], detect: impl FnOnce() -> Option<crate::unpack::Format>) -> FileType {
     // Executables and RTF: types core recognises itself (not extractable
     // containers, so `exav-unpack` doesn't know them).
     if buf.starts_with(b"MZ") {
@@ -310,7 +357,7 @@ pub fn identify(buf: &[u8]) -> FileType {
     }
     // Uncompressed Flash. `CWS`/`ZWS` (the compressed variants) are containers
     // and belong to `unpack::detect`; `FWS` has nothing to decompress, so core
-    // types it directly — without this, `Target:11` signatures would never see
+    // types it directly. Without this, `Target:11` signatures would never see
     // an uncompressed movie, nor the `FWS` body exav rebuilds from a `CWS`/`ZWS`
     // one. The magic is the bare three bytes, matching ClamAV: probing clamscan
     // with a `Target:11` signature shows `FWS` + garbage version + a nonsense
@@ -322,8 +369,12 @@ pub fn identify(buf: &[u8]) -> FileType {
     // Archive/container formats: the magic detection is owned solely by
     // `exav-unpack::detect` (single source of truth); map its `Format` to the
     // broader `FileType`.
-    if let Some(fmt) = crate::unpack::detect(buf) {
-        return filetype_of_format(fmt);
+    // A DXF drawing has no ClamAV type: an ASCII one is text to ClamAV and
+    // stays so here, for `Target:7`; what it embeds is extracted from the
+    // magic (`MAGIC_DISPATCH_ONLY`).
+    match detect() {
+        Some(crate::unpack::Format::Dxf) | None => {}
+        Some(fmt) => return filetype_of_format(fmt),
     }
     // Content-sniffed text-ish types (core-specific).
     if buf.starts_with(b"#!") {
@@ -347,7 +398,7 @@ pub fn identify(buf: &[u8]) -> FileType {
 /// True if the head looks like text (ASCII *or* UTF-8) rather than binary.
 /// Generous on purpose: a NUL byte or a high density of non-whitespace control
 /// bytes marks binary, but high bytes (0x80..=0xff) are accepted so non-ASCII
-/// UTF-8 text still types as text — otherwise non-English text malware would
+/// UTF-8 text still types as text. Otherwise non-English text malware would
 /// type as binary and lose its `Target:7` (ASCII-text) coverage.
 fn looks_textual(buf: &[u8]) -> bool {
     let head = &buf[..buf.len().min(8192)];
@@ -370,7 +421,7 @@ fn looks_textual(buf: &[u8]) -> bool {
 /// HTML and applies `Target:3` signatures only to it; exav mirrors that so an
 /// HTML-exploit sig does not fire on, say, obfuscated JavaScript that merely
 /// contains `Uint32Array(0x..)`. Conservative: requires a real structural tag in
-/// the (text-ish) head — plain JS/text is left `Unknown` and is still covered by
+/// the (text-ish) head. Plain JS/text is left `Unknown` and is still covered by
 /// `Target:7` text signatures.
 fn looks_like_html(buf: &[u8]) -> bool {
     let head = &buf[..buf.len().min(8192)];
@@ -434,7 +485,7 @@ fn looks_like_email(buf: &[u8]) -> bool {
 }
 
 /// Whether a MIME document is an **MHTML web archive** rather than a mail
-/// message — a saved web page (`.mht`), not something that travelled through a
+/// message: a saved web page (`.mht`), not something that travelled through a
 /// mail server.
 ///
 /// The discriminator is the mail envelope, not the multipart subtype: probed
@@ -463,8 +514,8 @@ pub(crate) fn looks_like_mhtml(buf: &[u8]) -> bool {
 
 /// The [`FileType`] a magic-detected [`Format`] corresponds to.
 ///
-/// (`Format::Email` is never returned by magic — email is content-sniffed — but
-/// is mapped for completeness.)
+/// (`Format::Email` is never returned by magic, since email is content-sniffed,
+/// but is mapped for completeness.)
 ///
 /// Several formats have no ClamAV `CL_TYPE_*` of their own and land on
 /// `FileType::Unknown`. Since the scanner reaches an extractor through
@@ -544,7 +595,7 @@ pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
         // `Format` is `#[non_exhaustive]`, so the compiler can no longer prove
         // this mapping is total. `scan_dispatch_covers_every_format` proves it
         // instead, walking `Format::ALL` and failing on any variant that does
-        // not round-trip — which catches a missing arm here for the same reason
+        // not round-trip. That catches a missing arm here for the same reason
         // the compiler used to, and with a better message.
         _ => FileType::Unknown,
     }
@@ -559,8 +610,8 @@ pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
 /// Containers that live *inside* an executable: an installer or self-extractor
 /// whose payload is appended to a PE/ELF stub.
 ///
-/// `identify` answers `Pe`/`Elf` for these — correctly, since they are real
-/// executables and the PE signature scan has to run on them — and
+/// `identify` answers `Pe`/`Elf` for these (correctly, since they are real
+/// executables and the PE signature scan has to run on them), and
 /// `unpack_format` has no mapping from an executable to a container, so the
 /// extractor is never reached. Embedded-archive carving covers the case where
 /// the appended data is a *recognisable* archive (a ZIP glued to a stub), but
@@ -585,6 +636,8 @@ pub(crate) const MAGIC_DISPATCH_ONLY: &[crate::unpack::Format] = &[
     crate::unpack::Format::Qcow2,
     crate::unpack::Format::Vmdk,
     crate::unpack::Format::Vhdx,
+    crate::unpack::Format::Dxf,
+    crate::unpack::Format::Dwg,
 ];
 
 #[cfg(test)]
@@ -597,7 +650,7 @@ mod tests {
     /// members are simply not scanned, and the file is reported clean on the
     /// strength of a raw pattern scan that cannot see compressed content.
     ///
-    /// This is a real regression that shipped — `.Z`, DMG, VHD, QCOW2 and VMDK
+    /// This is a real regression that shipped: `.Z`, DMG, VHD, QCOW2 and VMDK
     /// each had a working extractor that nothing ever called.
     #[test]
     fn scan_dispatch_covers_every_format() {
@@ -614,7 +667,7 @@ mod tests {
             assert_eq!(
                 crate::unpack_format(ft),
                 Some(fmt),
-                "{fmt:?} maps to {ft:?}, which the scanner does not dispatch                  back to {fmt:?} — its contents would go unscanned. Give it a                  FileType, or add it to MAGIC_DISPATCH_ONLY."
+                "{fmt:?} maps to {ft:?}, which the scanner does not dispatch                  back to {fmt:?}, so its contents would go unscanned. Give it a                  FileType, or add it to MAGIC_DISPATCH_ONLY."
             );
         }
     }
@@ -627,17 +680,46 @@ mod tests {
         // Real daily.ftm-style lines: literal magic, wildcarded magic (skipped),
         // unmodelled CL_TYPE (skipped), and a non-zero magictype (skipped).
         ftm.extend_from_text(
-            "0:0:49545346:MS CHM:CL_TYPE_ANY:CL_TYPE_MSCHM\n\
+            "0:0:550d0d0a:Python:CL_TYPE_ANY:CL_TYPE_PYTHON_COMPILED\n\
              0:0:46726f6d20:MBox:CL_TYPE_ANY:CL_TYPE_MAIL\n\
              0:0:255044462d:PDF:CL_TYPE_ANY:CL_TYPE_PDF\n\
              0:0:6125{4}62:wild:CL_TYPE_ANY:CL_TYPE_MAIL\n\
              1:0:cafe:pe:CL_TYPE_ANY:CL_TYPE_MSEXE",
         );
-        // CHM has no exav FileType (CL_TYPE_MSCHM unmodelled) -> not stored;
+        // Compiled Python has no exav FileType here -> not stored;
         // MAIL + PDF map and are stored.
+        assert_eq!(ftm.identify(b"\x55\x0d\x0d\x0a rest"), None);
         assert_eq!(ftm.identify(b"From the start"), Some(FileType::Email));
         assert_eq!(ftm.identify(b"%PDF-1.7 ..."), Some(FileType::Pdf));
         assert_eq!(ftm.identify(b"no magic here"), None);
+    }
+
+    /// A rule whose offset is the largest `usize` has no end to compare with;
+    /// the rules after it still apply.
+    #[test]
+    fn a_rule_at_the_top_of_the_address_space_does_not_end_the_search() {
+        let mut ftm = FtmMagics::default();
+        ftm.extend_from_text(&format!(
+            "0:{}:cafe:far:CL_TYPE_ANY:CL_TYPE_MSEXE\n\
+             0:0:255044462d:PDF:CL_TYPE_ANY:CL_TYPE_PDF",
+            usize::MAX
+        ));
+        assert_eq!(ftm.len(), 2);
+        assert_eq!(ftm.identify(b"%PDF-1.7 ..."), Some(FileType::Pdf));
+    }
+
+    /// ClamAV has no DXF type: an ASCII drawing is text to it, so `Target:7`
+    /// signatures apply, and a binary one is data.
+    #[test]
+    fn a_dxf_keeps_the_type_its_bytes_give() {
+        assert_eq!(
+            identify(b"  0\r\nSECTION\r\n  2\r\nHEADER\r\n"),
+            FileType::Text
+        );
+        assert_eq!(
+            identify(b"AutoCAD Binary DXF\r\n\x1a\0\0\0SECTION\0"),
+            FileType::Unknown
+        );
     }
 
     #[test]
@@ -667,7 +749,7 @@ mod tests {
         );
         assert_eq!(identify(b"<script>alert(1)</script>"), FileType::Html);
         // Obfuscated JS with no HTML tags must NOT be Html (so Target:3 HTML
-        // exploit sigs don't fire on it — the npm-package FP). It is text, so it
+        // exploit sigs don't fire on it, as in the npm-package FP). It is text, so it
         // types as Text (covered by Target:7), never Html.
         assert_eq!(
             identify(b"const _0x12=_0x37;var a=new Uint32Array(0x10000);for(;;){}"),

@@ -11,7 +11,7 @@
 //!
 //! Usage: `cargo run --example dump_members --all-features -- <file> <outdir>`
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Limits};
+use exav_unpack::{detect, Budget, Limits, Member};
 use std::path::PathBuf;
 
 fn main() {
@@ -35,19 +35,28 @@ fn walk(data: &[u8], outdir: &PathBuf, depth: u32, n: &mut usize, prefix: &str) 
     if depth > 8 {
         return;
     }
-    let Some(fmt) = detect(data) else { return };
+    let Some(fmt) = detect(&data) else { return };
     let mut budget = Budget::new(Limits::default());
-    let _ = extract_each::<()>(fmt, data, &mut budget, &mut |e: Entry, _b: &mut Budget| {
-        if e.data.is_empty() {
+    let _ = exav_unpack::walk::<()>(fmt, &data, &mut budget, &mut |meta, content, _| {
+        let bytes = match content {
+            None => return None,
+            Some(Member::Bytes(bytes)) => bytes,
+            Some(Member::Stream(reader)) => {
+                let mut bytes = Vec::new();
+                let _ = reader.read_to_end(&mut bytes);
+                bytes
+            }
+        };
+        if bytes.is_empty() {
             return None;
         }
         // A member byte-identical to its container is the fixed point the
         // scanner also refuses to follow; recursing here would never terminate.
-        if e.data.len() == data.len() && e.data == data {
+        if bytes == data {
             return None;
         }
         *n += 1;
-        let safe: String = e
+        let safe: String = meta
             .name
             .chars()
             .map(|c| {
@@ -60,9 +69,9 @@ fn walk(data: &[u8], outdir: &PathBuf, depth: u32, n: &mut usize, prefix: &str) 
             .collect();
         let safe = &safe[safe.len().saturating_sub(60)..];
         let path = outdir.join(format!("{prefix}{:05}_{safe}", *n));
-        if std::fs::write(&path, &e.data).is_ok() {
+        if std::fs::write(&path, &bytes).is_ok() {
             let child = format!("{prefix}{:05}_", *n);
-            walk(&e.data, outdir, depth + 1, n, &child);
+            walk(&bytes, outdir, depth + 1, n, &child);
         }
         None
     });

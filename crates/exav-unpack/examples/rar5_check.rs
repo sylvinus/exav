@@ -1,6 +1,6 @@
 //! RAR5 decompression CRC validation harness.
 //!
-//! For every RAR5 sample under `corpus/samples/_bulk/rar/*.bin` this lists the
+//! For every RAR5 sample in `$EXAV_DEBUG_RAR_CORPUS/*.bin` this lists the
 //! file members, decompresses the LZ-compressed ones, and compares the output's
 //! CRC-32 (IEEE) against the CRC stored in the RAR5 file header.
 //!
@@ -232,7 +232,11 @@ fn file_fields(
 }
 
 fn main() {
-    let dir = Path::new("corpus/samples/_bulk/rar");
+    let Some(dir) = std::env::var_os("EXAV_DEBUG_RAR_CORPUS") else {
+        eprintln!("set EXAV_DEBUG_RAR_CORPUS to the directory of the *.bin samples");
+        return;
+    };
+    let dir = Path::new(&dir);
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {

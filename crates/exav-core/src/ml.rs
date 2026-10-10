@@ -42,7 +42,7 @@ impl Features {
 
 /// Extract static features from raw bytes plus optional parsed PE info.
 pub fn extract(data: &[u8], pe: Option<&PeInfo>) -> Features {
-    let mut hist = [0u32; 256];
+    let mut hist = [0u64; 256];
     for &b in data {
         hist[b as usize] += 1;
     }

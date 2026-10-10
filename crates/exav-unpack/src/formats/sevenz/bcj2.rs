@@ -140,7 +140,7 @@ pub(super) fn decode(
         } else {
             (jump, &mut jump_pos)
         };
-        let Some(raw) = src_buf.get(*src_pos..*src_pos + 4) else {
+        let Some(raw) = crate::bytes::at(src_buf, *src_pos, 4) else {
             return Err(LimitHit::corrupt(
                 "7z BCJ2: call/jump stream exhausted".to_string(),
             ));
@@ -149,7 +149,7 @@ pub(super) fn decode(
         let absolute = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
         // x86 branch displacements are relative to the END of the instruction,
         // which is four bytes past where the target is about to be written.
-        let relative = absolute.wrapping_sub(out.len() as u32 + 4);
+        let relative = absolute.wrapping_sub((out.len() as u32).wrapping_add(4));
         out.extend_from_slice(&relative.to_le_bytes());
         prev = (relative >> 24) as u8;
     }

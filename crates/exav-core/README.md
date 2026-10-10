@@ -4,7 +4,7 @@ The core scanning engine of [**exav**](https://github.com/sylvinus/exav), a
 memory-safe ClamAV replacement written in Rust.
 
 `exav-core` provides the library API for loading ClamAV signature databases and
-scanning files or streams in constant memory: signature-database parsing
+scanning files or streams in bounded memory: signature-database parsing
 (`.ndb`/`.ldb`/`.hdb`/`.cvd`/…), pattern/hash/fuzzy matching, optional YARA
 (via the native engine in `exav_core::yara`), a sandboxed `.cbc` bytecode interpreter, and PE/ELF/Mach-O
 parsing. Archive/container extraction lives in the companion
@@ -24,5 +24,5 @@ assert!(matches!(report.verdict, Verdict::Clean));
 ```
 
 For the CLI and daemon, see [`exav`](https://crates.io/crates/exav).
-Full documentation: [exav.org](https://exav.org/guides/library-usage/).
+Full documentation: [exav.org](https://exav.org/subprojects/exav-core/).
 Licensed under MIT.

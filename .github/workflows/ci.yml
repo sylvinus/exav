@@ -23,14 +23,15 @@ jobs:
       # examples and the `bytecode_gating` integration test) is excluded from the
       # default build, so lint it in a dedicated pass.
       - run: cargo clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
-      # The full native test matrix (default + http + checksums + no-decrypt +
-      # unstable-internals feature passes). Defined once in the Makefile so this
-      # and a local `make test` can't drift.
+      - run: cargo clippy -p exav-render --all-targets --features dwg -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings
+      # The full native test matrix, every feature pass. Defined once in the
+      # Makefile so this and a local `make test` can't drift.
       - run: make test-native
 
-  # The promised floor is `rust-version` in Cargo.toml (1.91, imposed by
-  # yara-x-parser). `make msrv` reads it there and installs that toolchain on
-  # demand, so a bump flows through with no edit here — and a contributor on
+  # The promised floor is `rust-version` in Cargo.toml (1.92, imposed by the
+  # hayro image decoders). `make msrv` reads it there and installs that toolchain on
+  # demand, so a bump flows through with no edit here, and a contributor on
   # stable can't land a newer feature without this going red.
   msrv:
     runs-on: ubuntu-latest
@@ -41,18 +42,23 @@ jobs:
       - run: make msrv
 
   # The yara-x A/B differential harness. Deliberately NOT part of `make test`
-  # (see the Makefile) — a differential test can go red because the other engine
+  # (see the Makefile): a differential test can go red because the other engine
   # changed, so it is not a merge gate. It runs here anyway, unlike the clamav
-  # harness, only because it is self-contained: no signature database, no second
-  # engine to install. Its own job so the optional `yara-x` dependency — 83 extra
-  # crates, 21 of them cranelift/wasmtime — never lands in the `test` job, and so
-  # it costs no wall clock.
+  # harness, only because it is self-contained: no signature database, just
+  # yara-x's `yr` binary. The tests skip when `yr` is missing, so it is installed
+  # and checked first; without it this job would pass having compared nothing.
   yara-diff:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install yr (yara-x CLI)
+        run: |
+          YR=v1.21.0
+          curl -sSL "https://github.com/VirusTotal/yara-x/releases/download/$YR/yara-x-$YR-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C /tmp
+          echo "/tmp" >> "$GITHUB_PATH"
+      - run: yr --version
       - run: make test-yara-diff
 
   wasm:
@@ -66,7 +72,7 @@ jobs:
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
       # The scanning core compiled to WASI, and the archive-extractor WASM
-      # bindings (excluded from the workspace, built on their own target) — both
+      # bindings (excluded from the workspace, built on their own target), both
       # the default (all-formats + decrypt) build and a minimal single-format,
       # no-decrypt build, so the feature-gated paths can't silently rot.
       - run: cargo build -p exav-core --features wasi-bin --target wasm32-wasip1
@@ -97,6 +103,32 @@ jobs:
         with:
           node-version: 22
       - run: make test-js
+      # @exav/viewer: its wasm modules and its archive plugin's peer
+      # (exav-unpack-wasm's pkg/, which test-js built with test-only features)
+      # are rebuilt from source, with the wasm-bindgen-cli its Cargo.toml pins,
+      # and its demo is driven in Chromium, its sandboxed frame in Chromium,
+      # Firefox and WebKit. See scripts/test-viewer.sh.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+      # The report sample names Helvetica without embedding it, so the PDF text
+      # and pinch tests measure whatever font the system gives that name. The
+      # URW base 35 set is Nimbus Sans, the metric match the tests were written
+      # against; the runner's image does not guarantee it.
+      - name: Fonts for the PDF samples
+        run: |
+          sudo apt-get update && sudo apt-get install -y fonts-urw-base35
+          fc-match Helvetica
+          fc-match Arial
+      - run: make test-viewer
+      # What the browser saw, for the failures that do not happen on a
+      # developer's machine (the PDF text and pinch tests do not).
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: viewer-e2e-results
+          path: crates/exav-viewer/test-results
+          if-no-files-found: ignore
 
   docs:
     runs-on: ubuntu-latest
@@ -137,6 +169,12 @@ jobs:
         run: |
           cargo deny --manifest-path crates/exav-unpack-wasm/Cargo.toml \
             --config deny.toml check advisories bans sources licenses
+      # The viewer's wasm modules, also its own workspace. Every feature: the
+      # DWG module is not a default.
+      - name: cargo-deny (viewer)
+        run: |
+          cargo deny --manifest-path crates/exav-viewer/Cargo.toml --all-features \
+            --config deny.toml check advisories bans sources licenses
 
   fuzz-smoke:
     runs-on: ubuntu-latest
@@ -147,6 +185,22 @@ jobs:
       - name: cargo-fuzz smoke run
         run: |
           cargo install cargo-fuzz --locked
-          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd; do
-            cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+          # Seeded from the test fixtures where they match a target's input:
+          # random bytes rarely get past a header. Outside the checkout, as
+          # the masked fixtures are unmasked.
+          seeds="$RUNNER_TEMP/fuzz-seeds"
+          scripts/fuzz-seeds.sh "$seeds"
+          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion imagehash drawing cad_dxf cad_dwg ifc; do
+            mkdir -p "fuzz/corpus/$t"
+            extra=""
+            [ -d "$seeds/$t" ] && extra="$seeds/$t"
+            # iced-x86, the oracle x86_decode compares against, builds its
+            # decoder tables in a `lazy_static` it never frees: the newest
+            # nightly's LeakSanitizer reports them at exit (552 bytes, whatever
+            # the input), which is not a leak of exav's. The other targets keep
+            # the check.
+            asan=""
+            [ "$t" = x86_decode ] && asan="detect_leaks=0"
+            ASAN_OPTIONS="$asan" cargo +nightly fuzz run "$t" "fuzz/corpus/$t" $extra \
+              -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
           done

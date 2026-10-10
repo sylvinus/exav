@@ -1,0 +1,10 @@
+# Used instead of the repository's .dockerignore for this Dockerfile: the
+# scanner should see the docs, the fuzz targets and the test corpus, which the
+# image of the product leaves out. Only what is built or fetched is left out.
+**/target/
+**/node_modules/
+.git/
+.env*
+*.exavdb
+exav-db/
+tmp/

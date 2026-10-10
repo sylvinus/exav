@@ -18,7 +18,7 @@
 //!   into a page the stub wrote is the classic tail transfer to the original
 //!   entry point.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Page size of the emulated machine. x86 pages are 4 KiB, and packers align
 /// their `VirtualAlloc` requests to it.
@@ -54,7 +54,7 @@ struct Page {
 pub struct Mem {
     pages: Vec<Page>,
     /// Page number (`addr >> 12`) to slot in `pages`.
-    index: HashMap<u32, u32>,
+    index: FxHashMap<u32, u32>,
     /// Hard cap on resident pages; hitting it is a budget stop, not a fault.
     max_pages: usize,
     /// Single-entry lookup cache. Emulated code has extreme page locality (a
@@ -91,7 +91,7 @@ impl Mem {
     pub fn new(max_pages: usize) -> Self {
         Self {
             pages: Vec::new(),
-            index: HashMap::new(),
+            index: FxHashMap::default(),
             max_pages,
             cache_page: 0,
             cache_slot: 0,
@@ -212,13 +212,18 @@ impl Mem {
         (first..=last).any(|p| self.index.contains_key(&p))
     }
 
-    /// Whether every page covering `addr..addr+len` is mapped.
+    /// Whether every page covering `addr..addr+len` is mapped. A range past
+    /// 4 GiB is not, so a field read at `addr + offset` inside it cannot
+    /// overflow.
     pub fn is_mapped(&self, addr: u32, len: u32) -> bool {
         if len == 0 {
             return true;
         }
         let first = addr >> PAGE_SHIFT;
-        let last = addr.saturating_add(len - 1) >> PAGE_SHIFT;
+        let Some(end) = addr.checked_add(len - 1) else {
+            return false;
+        };
+        let last = end >> PAGE_SHIFT;
         (first..=last).all(|p| self.index.contains_key(&p))
     }
 
@@ -405,6 +410,18 @@ mod tests {
         m.map(0x1000, 4).unwrap();
         assert_eq!(m.read_u8(0x1000).unwrap(), 0);
         assert!(m.read_u8(0x2000).is_err());
+    }
+
+    /// A range past 4 GiB is not mapped memory, whatever the top page holds:
+    /// callers check a structure with `is_mapped` and then read its fields at
+    /// `addr + offset`, which must not overflow.
+    #[test]
+    fn a_range_that_wraps_past_4gib_is_not_mapped() {
+        let mut m = Mem::new(16);
+        m.map(0xffff_f000, 0x1000).unwrap();
+        assert!(m.is_mapped(0xffff_fff0, 0x10));
+        assert!(!m.is_mapped(0xffff_fff0, 0x11));
+        assert!(!m.is_mapped(0xffff_fff0, 20));
     }
 
     #[test]

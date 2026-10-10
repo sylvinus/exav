@@ -14,61 +14,17 @@
 //! little-endian `rd_*` / `wr_*` accessors below, which validate the offset
 //! against the arena length; an out-of-range access (only reachable on
 //! malformed input) sets the `corrupt` flag and yields `0`, and the symbol
-//! decoder turns `corrupt` into [`SYM_ERROR`] instead of panicking. The
-//! in-arena byte layout is identical to the previous `#[repr(C, packed)]`
+//! decoder turns `corrupt` into [`SYM_ERROR`] instead of panicking. Offset
+//! arithmetic wraps, walks over a list, a context's states or a suffix chain
+//! are bounded, and table indexes are checked, as in the PPMd8 model, so a
+//! model in a state no stream leads to cannot panic or loop forever either.
+//! The in-arena byte layout is identical to the previous `#[repr(C, packed)]`
 //! structs, so the decode is byte-exact with the pointer version.
 #![allow(clippy::all)]
 
+use super::common::*;
 use super::tagged_offset::TaggedOffset;
 use super::{RangeDec, SYM_END, SYM_ERROR};
-
-// ---- shared PPMd constants (from ppmd-rust internal.rs) -------------------
-
-const PPMD_INT_BITS: u32 = 7;
-const PPMD_PERIOD_BITS: u32 = 7;
-const PPMD_BIN_SCALE: u32 = 1 << (PPMD_INT_BITS + PPMD_PERIOD_BITS);
-
-const fn ppmd_get_mean_spec(summ: u32, shift: u32, round: u32) -> u32 {
-    (summ + (1 << (shift - round))) >> shift
-}
-const fn ppmd_get_mean(summ: u32) -> u32 {
-    ppmd_get_mean_spec(summ, PPMD_PERIOD_BITS, 2)
-}
-const fn ppmd_update_prob_1(prob: u32) -> u32 {
-    prob - ppmd_get_mean(prob)
-}
-
-const PPMD_N1: u32 = 4;
-const PPMD_N2: u32 = 4;
-const PPMD_N3: u32 = 4;
-const PPMD_N4: u32 = (128 + 3 - PPMD_N1 - 2 * PPMD_N2 - 3 * PPMD_N3) / 4;
-const PPMD_NUM_INDEXES: u32 = PPMD_N1 + PPMD_N2 + PPMD_N3 + PPMD_N4;
-
-enum SeeSource {
-    Dummy,
-    Table(usize, usize),
-}
-
-#[derive(Copy, Clone, Default)]
-struct See {
-    summ: u16,
-    shift: u8,
-    count: u8,
-}
-
-impl See {
-    fn update(&mut self) {
-        if (self.shift as i32) < 7 && {
-            self.count = self.count.wrapping_sub(1);
-            self.count as i32 == 0
-        } {
-            self.summ = ((self.summ as i32) << 1) as u16;
-            let fresh = self.shift;
-            self.shift = self.shift.wrapping_add(1);
-            self.count = (3 << fresh as i32) as u8;
-        }
-    }
-}
 
 // ---- arena node byte layout ----------------------------------------------
 //
@@ -76,8 +32,7 @@ impl See {
 // fields are little-endian (the previous code ran on LE targets and stored
 // native-endian; the round-trip and gold-CRC tests pin the exact bytes).
 //
-// State (6 bytes):
-//   symbol:u8 @0  freq:u8 @1  successor_0:u16 @2  successor_1:u16 @4
+// State (6 bytes): see `common.rs`.
 // Context (12 bytes):
 //   num_stats:u16 @0
 //   union2 @2: summ_freq:u16  | state2{ symbol:u8 @2, freq:u8 @3 }
@@ -86,13 +41,6 @@ impl See {
 // Node (12 bytes):
 //   stamp:u16 @0  nu:u16 @2  next:u32 @4  prev:u32 @8
 //   (NodeUnion overlays next_ref:u32 @0, i.e. stamp+nu)
-
-const STATE_SIZE: u32 = 6;
-
-const ST_SYMBOL: u32 = 0;
-const ST_FREQ: u32 = 1;
-const ST_SUCC0: u32 = 2;
-const ST_SUCC1: u32 = 4;
 
 const CTX_NUM_STATS: u32 = 0;
 const CTX_SUMM_FREQ: u32 = 2; // union2 as summ_freq
@@ -116,14 +64,11 @@ const NODE_NEXT_REF: u32 = 0; // NodeUnion.next_ref overlays stamp+nu
 
 // ---- model constants (from ppmd-rust ppmd7.rs) ----------------------------
 
-const MAX_FREQ: u8 = 124;
-const UNIT_SIZE: u32 = 12;
 const EMPTY_NODE: u16 = 0;
 
-static K_EXP_ESCAPE: [u8; 16] = [25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2];
-static K_INIT_BIN_ESC: [u16; 8] = [
-    0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051,
-];
+/// Bound on suffix-chain walks. A valid chain is at most `max_order` (<= 64)
+/// links long.
+const CHAIN_LIMIT: u32 = 2 * super::PPMD7_MAX_ORDER;
 
 /// The PPMd7 (var.H) model, generic over the range decoder.
 ///
@@ -168,9 +113,15 @@ pub(crate) struct Ppmd7<RC: RangeDec> {
 
 impl<RC: RangeDec> Ppmd7<RC> {
     /// Construct the model with `rc` already initialised, `order` in
-    /// [PPMD7_MIN_ORDER, PPMD7_MAX_ORDER] and `mem_size` bytes of arena. Returns
-    /// `None` on allocation failure.
+    /// [PPMD7_MIN_ORDER, PPMD7_MAX_ORDER] and `mem_size` bytes of arena, in
+    /// [PPMD7_MIN_MEM_SIZE, PPMD7_MAX_MEM_SIZE]. Returns `None` for a
+    /// parameter out of range or on allocation failure.
     pub(crate) fn new(rc: RC, order: u32, mem_size: u32) -> Option<Self> {
+        if !(super::PPMD7_MIN_ORDER..=super::PPMD7_MAX_ORDER).contains(&order)
+            || !(super::PPMD7_MIN_MEM_SIZE..=super::PPMD7_MAX_MEM_SIZE).contains(&mem_size)
+        {
+            return None;
+        }
         let mut units2index = [0u8; 128];
         let mut index2units = [0u8; 40];
 
@@ -305,7 +256,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
     #[inline(always)]
     fn wr_u16(&mut self, off: u32, v: u16) {
         let o = off as usize;
-        match self.arena.get_mut(o..o + 2) {
+        match o.checked_add(2).and_then(|end| self.arena.get_mut(o..end)) {
             Some(s) => s.copy_from_slice(&v.to_le_bytes()),
             None => self.corrupt = true,
         }
@@ -314,7 +265,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
     #[inline(always)]
     fn wr_u32(&mut self, off: u32, v: u32) {
         let o = off as usize;
-        match self.arena.get_mut(o..o + 4) {
+        match o.checked_add(4).and_then(|end| self.arena.get_mut(o..end)) {
             Some(s) => s.copy_from_slice(&v.to_le_bytes()),
             None => self.corrupt = true,
         }
@@ -338,31 +289,31 @@ impl<RC: RangeDec> Ppmd7<RC> {
 
     #[inline(always)]
     fn state_symbol(&mut self, s: u32) -> u8 {
-        self.rd_u8(s + ST_SYMBOL)
+        self.rd_u8(s.wrapping_add(ST_SYMBOL))
     }
     #[inline(always)]
     fn set_state_symbol(&mut self, s: u32, v: u8) {
-        self.wr_u8(s + ST_SYMBOL, v)
+        self.wr_u8(s.wrapping_add(ST_SYMBOL), v)
     }
     #[inline(always)]
     fn state_freq(&mut self, s: u32) -> u8 {
-        self.rd_u8(s + ST_FREQ)
+        self.rd_u8(s.wrapping_add(ST_FREQ))
     }
     #[inline(always)]
     fn set_state_freq(&mut self, s: u32, v: u8) {
-        self.wr_u8(s + ST_FREQ, v)
+        self.wr_u8(s.wrapping_add(ST_FREQ), v)
     }
     #[inline(always)]
     fn state_successor(&mut self, s: u32) -> TaggedOffset {
-        let lo = self.rd_u16(s + ST_SUCC0) as u32;
-        let hi = self.rd_u16(s + ST_SUCC1) as u32;
-        TaggedOffset::from_raw(lo + (hi << 16))
+        let lo = self.rd_u16(s.wrapping_add(ST_SUCC0)) as u32;
+        let hi = self.rd_u16(s.wrapping_add(ST_SUCC1)) as u32;
+        TaggedOffset::from_raw(lo | (hi << 16))
     }
     #[inline(always)]
     fn set_state_successor(&mut self, s: u32, v: TaggedOffset) {
         let raw = v.as_raw();
-        self.wr_u16(s + ST_SUCC0, raw as u16);
-        self.wr_u16(s + ST_SUCC1, (raw >> 16) as u16);
+        self.wr_u16(s.wrapping_add(ST_SUCC0), raw as u16);
+        self.wr_u16(s.wrapping_add(ST_SUCC1), (raw >> 16) as u16);
     }
 
     /// Copy a whole 6-byte State node `src` -> `dst`.
@@ -373,78 +324,109 @@ impl<RC: RangeDec> Ppmd7<RC> {
 
     #[inline(always)]
     fn ctx_num_stats(&mut self, c: u32) -> u16 {
-        self.rd_u16(c + CTX_NUM_STATS)
+        self.rd_u16(c.wrapping_add(CTX_NUM_STATS))
     }
     #[inline(always)]
     fn set_ctx_num_stats(&mut self, c: u32, v: u16) {
-        self.wr_u16(c + CTX_NUM_STATS, v)
+        self.wr_u16(c.wrapping_add(CTX_NUM_STATS), v)
     }
     #[inline(always)]
     fn ctx_summ_freq(&mut self, c: u32) -> u16 {
-        self.rd_u16(c + CTX_SUMM_FREQ)
+        self.rd_u16(c.wrapping_add(CTX_SUMM_FREQ))
     }
     #[inline(always)]
     fn set_ctx_summ_freq(&mut self, c: u32, v: u16) {
-        self.wr_u16(c + CTX_SUMM_FREQ, v)
+        self.wr_u16(c.wrapping_add(CTX_SUMM_FREQ), v)
     }
     #[inline(always)]
     fn ctx_state2_symbol(&mut self, c: u32) -> u8 {
-        self.rd_u8(c + CTX_STATE2_SYMBOL)
+        self.rd_u8(c.wrapping_add(CTX_STATE2_SYMBOL))
     }
     #[inline(always)]
     fn ctx_state2_freq(&mut self, c: u32) -> u8 {
-        self.rd_u8(c + CTX_STATE2_FREQ)
+        self.rd_u8(c.wrapping_add(CTX_STATE2_FREQ))
     }
     #[inline(always)]
     fn ctx_stats(&mut self, c: u32) -> TaggedOffset {
-        TaggedOffset::from_raw(self.rd_u32(c + CTX_STATS))
+        TaggedOffset::from_raw(self.rd_u32(c.wrapping_add(CTX_STATS)))
     }
     #[inline(always)]
     fn set_ctx_stats(&mut self, c: u32, v: TaggedOffset) {
-        self.wr_u32(c + CTX_STATS, v.as_raw())
+        self.wr_u32(c.wrapping_add(CTX_STATS), v.as_raw())
     }
     /// `union4.state4.get_successor()` — overlay of the single-state successor.
     #[inline(always)]
     fn ctx_state4_successor(&mut self, c: u32) -> TaggedOffset {
-        let lo = self.rd_u16(c + CTX_STATE4_SUCC0) as u32;
-        let hi = self.rd_u16(c + CTX_STATE4_SUCC1) as u32;
-        TaggedOffset::from_raw(lo + (hi << 16))
+        let lo = self.rd_u16(c.wrapping_add(CTX_STATE4_SUCC0)) as u32;
+        let hi = self.rd_u16(c.wrapping_add(CTX_STATE4_SUCC1)) as u32;
+        TaggedOffset::from_raw(lo | (hi << 16))
     }
     #[inline(always)]
     fn ctx_suffix(&mut self, c: u32) -> TaggedOffset {
-        TaggedOffset::from_raw(self.rd_u32(c + CTX_SUFFIX))
+        TaggedOffset::from_raw(self.rd_u32(c.wrapping_add(CTX_SUFFIX)))
     }
     #[inline(always)]
     fn set_ctx_suffix(&mut self, c: u32, v: TaggedOffset) {
-        self.wr_u32(c + CTX_SUFFIX, v.as_raw())
+        self.wr_u32(c.wrapping_add(CTX_SUFFIX), v.as_raw())
+    }
+
+    /// `units2index[nu - 1]`, for `nu` in 1..=128.
+    fn u2i(&mut self, nu: u32) -> u32 {
+        match nu
+            .checked_sub(1)
+            .and_then(|i| self.units2index.get(i as usize))
+        {
+            Some(&i) => i as u32,
+            None => {
+                self.corrupt = true;
+                0
+            }
+        }
+    }
+
+    fn i2u(&self, index: u32) -> u32 {
+        self.index2units
+            .get(index as usize)
+            .map_or(0, |&u| u as u32)
+    }
+
+    /// Upper bound on the nodes any list can hold.
+    fn max_nodes(&self) -> usize {
+        self.arena.len() / UNIT_SIZE as usize + 1
     }
 
     // ---- sub-allocator ----------------------------------------------------
 
     fn insert_node(&mut self, node: u32, indx: u32) {
+        let Some(&head) = self.free_list.get(indx as usize) else {
+            self.corrupt = true;
+            return;
+        };
         // node viewed as a NodeUnion: write its next_ref (u32 @0) to the
         // current free-list head, then push `node` as the new head.
-        let head = self.free_list[indx as usize];
-        self.wr_u32(node + NODE_NEXT_REF, head.as_raw());
+        self.wr_u32(node.wrapping_add(NODE_NEXT_REF), head.as_raw());
         self.free_list[indx as usize] = TaggedOffset::from_raw(node);
     }
 
+    /// Pops list `indx`, which the caller has checked is not empty.
     fn remove_node(&mut self, indx: u32) -> u32 {
         let node = self.free_list[indx as usize].as_raw();
-        let next = self.rd_u32(node + NODE_NEXT_REF);
+        let next = self.rd_u32(node.wrapping_add(NODE_NEXT_REF));
         self.free_list[indx as usize] = TaggedOffset::from_raw(next);
         node
     }
 
     fn split_block(&mut self, ptr: u32, old_index: u32, new_index: u32) {
-        let nu = (self.index2units[old_index as usize] as u32)
-            - (self.index2units[new_index as usize] as u32);
-        let ptr = ptr + self.index2units[new_index as usize] as u32 * UNIT_SIZE;
-        let mut i = self.units2index[(nu as usize) - 1] as u32;
-        if self.index2units[i as usize] as u32 != nu {
-            i -= 1;
-            let k = self.index2units[i as usize] as u32;
-            self.insert_node(ptr + k * UNIT_SIZE, nu - k - 1);
+        let nu = self.i2u(old_index).wrapping_sub(self.i2u(new_index));
+        let ptr = ptr.wrapping_add(self.i2u(new_index).wrapping_mul(UNIT_SIZE));
+        let mut i = self.u2i(nu);
+        if self.i2u(i) != nu {
+            i = i.wrapping_sub(1);
+            let k = self.i2u(i);
+            self.insert_node(
+                ptr.wrapping_add(k.wrapping_mul(UNIT_SIZE)),
+                nu.wrapping_sub(k).wrapping_sub(1),
+            );
         }
         self.insert_node(ptr, i);
     }
@@ -453,24 +435,28 @@ impl<RC: RangeDec> Ppmd7<RC> {
         let mut n = TaggedOffset::null();
         self.glue_count = 255;
         if self.lo_unit != self.hi_unit {
-            self.wr_u16(self.lo_unit + NODE_STAMP, 1);
+            self.wr_u16(self.lo_unit.wrapping_add(NODE_STAMP), 1);
         }
-        let mut i = 0;
-        while i < PPMD_NUM_INDEXES {
-            let nu = self.index2units[i as usize] as u16;
-            let mut next = self.free_list[i as usize];
-            self.free_list[i as usize] = TaggedOffset::null();
+        let mut budget = self.max_nodes();
+        for i in 0..PPMD_NUM_INDEXES as usize {
+            let nu = self.index2units[i] as u16;
+            let mut next = self.free_list[i];
+            self.free_list[i] = TaggedOffset::null();
             while next.is_not_null() {
+                if budget == 0 {
+                    self.corrupt = true;
+                    return;
+                }
+                budget -= 1;
                 let node = next.as_raw();
                 // un = node as NodeUnion. tmp = next; next = un.next_ref;
                 let tmp = next;
-                next = TaggedOffset::from_raw(self.rd_u32(node + NODE_NEXT_REF));
-                self.wr_u16(node + NODE_STAMP, EMPTY_NODE);
-                self.wr_u16(node + NODE_NU, nu);
-                self.wr_u32(node + NODE_NEXT, n.as_raw());
+                next = TaggedOffset::from_raw(self.rd_u32(node.wrapping_add(NODE_NEXT_REF)));
+                self.wr_u16(node.wrapping_add(NODE_STAMP), EMPTY_NODE);
+                self.wr_u16(node.wrapping_add(NODE_NU), nu);
+                self.wr_u32(node.wrapping_add(NODE_NEXT), n.as_raw());
                 n = tmp;
             }
-            i += 1;
         }
         let mut head = n;
         self.glue_blocks(n, &mut head);
@@ -486,27 +472,38 @@ impl<RC: RangeDec> Ppmd7<RC> {
             NodeNext(u32),
         }
         let mut prev = Prev::Head;
+        let mut budget = self.max_nodes();
         while n.is_not_null() {
+            if budget == 0 || self.corrupt {
+                self.corrupt = true;
+                return;
+            }
+            budget -= 1;
             let node = n.as_raw();
-            let mut nu = self.rd_u16(node + NODE_NU) as u32;
-            n = TaggedOffset::from_raw(self.rd_u32(node + NODE_NEXT));
+            let mut nu = self.rd_u16(node.wrapping_add(NODE_NU)) as u32;
+            n = TaggedOffset::from_raw(self.rd_u32(node.wrapping_add(NODE_NEXT)));
             if nu == 0 {
                 match prev {
                     Prev::Head => *head = n,
                     Prev::NodeNext(off) => self.wr_u32(off, n.as_raw()),
                 }
             } else {
-                prev = Prev::NodeNext(node + NODE_NEXT);
+                prev = Prev::NodeNext(node.wrapping_add(NODE_NEXT));
                 loop {
-                    let node2 = node + nu * UNIT_SIZE;
-                    let node2_nu = self.rd_u16(node2 + NODE_NU) as u32;
+                    let node2 = node.wrapping_add(nu.wrapping_mul(UNIT_SIZE));
+                    let node2_nu = self.rd_u16(node2.wrapping_add(NODE_NU)) as u32;
                     nu += node2_nu;
-                    let node2_stamp = self.rd_u16(node2 + NODE_STAMP);
+                    let node2_stamp = self.rd_u16(node2.wrapping_add(NODE_STAMP));
                     if node2_stamp != EMPTY_NODE || nu >= 0x10000 {
                         break;
                     }
-                    self.wr_u16(node + NODE_NU, nu as u16);
-                    self.wr_u16(node2 + NODE_NU, 0);
+                    if node2_nu == 0 || self.corrupt {
+                        // Would not advance: only a damaged arena has this.
+                        self.corrupt = true;
+                        return;
+                    }
+                    self.wr_u16(node.wrapping_add(NODE_NU), nu as u16);
+                    self.wr_u16(node2.wrapping_add(NODE_NU), 0);
                 }
             }
         }
@@ -514,23 +511,32 @@ impl<RC: RangeDec> Ppmd7<RC> {
 
     fn fill_list(&mut self, head: TaggedOffset) {
         let mut n = head;
+        let mut budget = self.max_nodes();
         while n.is_not_null() {
+            if budget == 0 || self.corrupt {
+                self.corrupt = true;
+                return;
+            }
+            budget -= 1;
             let mut node = n.as_raw();
-            let mut nu = self.rd_u16(node + NODE_NU) as u32;
-            n = TaggedOffset::from_raw(self.rd_u32(node + NODE_NEXT));
+            let mut nu = self.rd_u16(node.wrapping_add(NODE_NU)) as u32;
+            n = TaggedOffset::from_raw(self.rd_u32(node.wrapping_add(NODE_NEXT)));
             if nu == 0 {
                 continue;
             }
             while nu > 128 {
                 self.insert_node(node, PPMD_NUM_INDEXES - 1);
                 nu -= 128;
-                node += 128 * UNIT_SIZE;
+                node = node.wrapping_add(128 * UNIT_SIZE);
             }
-            let mut index = self.units2index[(nu as usize) - 1] as u32;
-            if self.index2units[index as usize] as u32 != nu {
-                index -= 1;
-                let k = self.index2units[index as usize] as u32;
-                self.insert_node(node + k * UNIT_SIZE, nu - k - 1);
+            let mut index = self.u2i(nu);
+            if self.i2u(index) != nu {
+                index = index.wrapping_sub(1);
+                let k = self.i2u(index);
+                self.insert_node(
+                    node.wrapping_add(k.wrapping_mul(UNIT_SIZE)),
+                    nu.wrapping_sub(k).wrapping_sub(1),
+                );
             }
             self.insert_node(node, index);
         }
@@ -538,6 +544,10 @@ impl<RC: RangeDec> Ppmd7<RC> {
 
     #[inline(never)]
     fn alloc_units_rare(&mut self, index: u32) -> Option<u32> {
+        if index >= PPMD_NUM_INDEXES {
+            self.corrupt = true;
+            return None;
+        }
         if self.glue_count == 0 {
             self.glue_free_blocks();
             if self.free_list[index as usize].is_not_null() {
@@ -548,11 +558,11 @@ impl<RC: RangeDec> Ppmd7<RC> {
         loop {
             i += 1;
             if i == PPMD_NUM_INDEXES {
-                let num_bytes = self.index2units[index as usize] as u32 * UNIT_SIZE;
+                let num_bytes = self.i2u(index) * UNIT_SIZE;
                 let us = self.units_start;
-                self.glue_count -= 1;
-                return if us - self.text > num_bytes {
-                    self.units_start = us - num_bytes;
+                self.glue_count = self.glue_count.wrapping_sub(1);
+                return if us.wrapping_sub(self.text) > num_bytes {
+                    self.units_start = us.wrapping_sub(num_bytes);
                     Some(self.units_start)
                 } else {
                     None
@@ -568,13 +578,17 @@ impl<RC: RangeDec> Ppmd7<RC> {
     }
 
     fn alloc_units(&mut self, index: u32) -> Option<u32> {
+        if index >= PPMD_NUM_INDEXES {
+            self.corrupt = true;
+            return None;
+        }
         if self.free_list[index as usize].is_not_null() {
             return Some(self.remove_node(index));
         }
-        let num_bytes = self.index2units[index as usize] as u32 * UNIT_SIZE;
+        let num_bytes = self.i2u(index) * UNIT_SIZE;
         let lo = self.lo_unit;
-        if self.hi_unit - lo >= num_bytes {
-            self.lo_unit = lo + num_bytes;
+        if self.hi_unit.wrapping_sub(lo) >= num_bytes {
+            self.lo_unit = lo.wrapping_add(num_bytes);
             return Some(lo);
         }
         self.alloc_units_rare(index)
@@ -666,7 +680,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
                 let ns = self.ctx_num_stats(c) as usize;
                 let mut steps = 0usize;
                 while self.state_symbol(s) != sym {
-                    s += STATE_SIZE;
+                    s = s.wrapping_add(STATE_SIZE);
                     steps += 1;
                     if steps >= ns {
                         self.corrupt = true;
@@ -696,7 +710,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
         }
 
         let new_sym = self.rd_u8(up_branch.get_offset());
-        let new_offset = up_branch.get_offset() + 1;
+        let new_offset = up_branch.get_offset().wrapping_add(1);
         let up_branch = TaggedOffset::from_bytes_offset(new_offset);
 
         let new_freq = if self.ctx_num_stats(c) == 1 {
@@ -706,7 +720,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
             let ns = self.ctx_num_stats(c) as usize;
             let mut steps = 0usize;
             while self.state_symbol(s) != new_sym {
-                s += STATE_SIZE;
+                s = s.wrapping_add(STATE_SIZE);
                 steps += 1;
                 if steps >= ns {
                     self.corrupt = true;
@@ -718,16 +732,21 @@ impl<RC: RangeDec> Ppmd7<RC> {
             let s0 = (self.ctx_summ_freq(c) as u32)
                 .saturating_sub(self.ctx_num_stats(c) as u32)
                 .saturating_sub(cf);
-            1 + (if 2 * cf <= s0 {
+            let add = if 2 * cf <= s0 {
                 (5 * cf > s0) as u32
             } else {
-                ((2 * cf + s0 - 1) / (2 * s0)) + 1
-            }) as u8
+                let Some(q) = (2 * cf + s0 - 1).checked_div(2 * s0) else {
+                    self.corrupt = true;
+                    return None;
+                };
+                q + 1
+            };
+            (add as u8).wrapping_add(1)
         };
 
         loop {
             let c1: u32 = if self.hi_unit != self.lo_unit {
-                self.hi_unit -= UNIT_SIZE;
+                self.hi_unit = self.hi_unit.wrapping_sub(UNIT_SIZE);
                 self.hi_unit
             } else if self.free_list[0].is_not_null() {
                 self.remove_node(0)
@@ -740,6 +759,10 @@ impl<RC: RangeDec> Ppmd7<RC> {
             self.set_state_freq(state, new_freq);
             self.set_state_successor(state, up_branch);
             self.set_ctx_suffix(c1, TaggedOffset::from_raw(c));
+            if num_ps == 0 {
+                self.corrupt = true;
+                return None;
+            }
             num_ps -= 1;
             let successor = ps[num_ps];
             self.set_state_successor(successor, TaggedOffset::from_raw(c1));
@@ -771,23 +794,23 @@ impl<RC: RangeDec> Ppmd7<RC> {
                     let ns = self.ctx_num_stats(c) as usize;
                     let mut steps = 0usize;
                     while self.state_symbol(s) != sym {
-                        s += STATE_SIZE;
+                        s = s.wrapping_add(STATE_SIZE);
                         steps += 1;
                         if steps >= ns {
                             self.corrupt = true;
                             return;
                         }
                     }
-                    if self.state_freq(s) >= self.state_freq(s - STATE_SIZE) {
+                    if self.state_freq(s) >= self.state_freq(s.wrapping_sub(STATE_SIZE)) {
                         self.swap_states(s);
-                        s -= STATE_SIZE;
+                        s = s.wrapping_sub(STATE_SIZE);
                     }
                 }
                 if self.state_freq(s) < MAX_FREQ - 9 {
                     let f = self.state_freq(s);
                     self.set_state_freq(s, f + 2);
                     let sf = self.ctx_summ_freq(c);
-                    self.set_ctx_summ_freq(c, sf + 2);
+                    self.set_ctx_summ_freq(c, sf.wrapping_add(2));
                 }
             }
         }
@@ -810,7 +833,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
 
         let sym = self.state_symbol(self.found_state);
         self.wr_u8(self.text, sym);
-        self.text += 1;
+        self.text = self.text.wrapping_add(1);
         if self.text >= self.units_start {
             self.restart_model();
             return;
@@ -833,10 +856,12 @@ impl<RC: RangeDec> Ppmd7<RC> {
                     }
                 }
             }
-            self.order_fall -= 1;
+            self.order_fall = self.order_fall.wrapping_sub(1);
             if self.order_fall == 0 {
                 max_successor = min_successor;
-                self.text -= (self.max_context != self.min_context) as u32;
+                self.text = self
+                    .text
+                    .wrapping_sub((self.max_context != self.min_context) as u32);
             }
         }
 
@@ -849,17 +874,28 @@ impl<RC: RangeDec> Ppmd7<RC> {
         }
 
         let ns = self.ctx_num_stats(mc) as u32;
-        let s0 =
-            (self.ctx_summ_freq(mc) as u32) - ns - ((self.state_freq(self.found_state) as u32) - 1);
+        let s0 = (self.ctx_summ_freq(mc) as u32)
+            .wrapping_sub(ns)
+            .wrapping_sub((self.state_freq(self.found_state) as u32).wrapping_sub(1));
 
+        let mut steps = 0;
         while c != mc {
+            steps += 1;
+            if steps > CHAIN_LIMIT || self.corrupt {
+                self.corrupt = true;
+                return;
+            }
             let mut sum;
             let ns1 = self.ctx_num_stats(c) as u32;
             if ns1 != 1 {
                 if ns1 & 1 == 0 {
                     let old_nu = ns1 >> 1;
-                    let i = self.units2index[(old_nu as usize) - 1] as u32;
-                    if i != self.units2index[old_nu as usize] as u32 {
+                    let i = self.u2i(old_nu);
+                    let Some(&next_i) = self.units2index.get(old_nu as usize) else {
+                        self.corrupt = true;
+                        return;
+                    };
+                    if i != next_i as u32 {
                         let Some(ptr) = self.alloc_units(i + 1) else {
                             self.restart_model();
                             return;
@@ -894,22 +930,25 @@ impl<RC: RangeDec> Ppmd7<RC> {
                 sum = freq + self.init_esc + ((ns > 3) as u32);
             }
 
-            let s = self.get_multi_state_stats(c) + ns1 * STATE_SIZE;
-            let mut cf = 2 * (sum + 6) * self.state_freq(self.found_state) as u32;
-            let sf = s0 + sum;
+            let s = self
+                .get_multi_state_stats(c)
+                .wrapping_add(ns1.wrapping_mul(STATE_SIZE));
+            let f_freq = self.state_freq(self.found_state) as u32;
+            let mut cf = 2u32.wrapping_mul(sum.wrapping_add(6)).wrapping_mul(f_freq);
+            let sf = s0.wrapping_add(sum);
             let fsym = self.state_symbol(self.found_state);
             self.set_state_symbol(s, fsym);
             self.set_ctx_num_stats(c, (ns1 + 1) as u16);
             self.set_state_successor(s, max_successor);
-            if cf < 6 * sf {
-                cf = 1 + ((cf > sf) as u32) + ((cf >= 4 * sf) as u32);
-                sum += 3;
+            if cf < sf.wrapping_mul(6) {
+                cf = 1 + ((cf > sf) as u32) + ((cf >= sf.wrapping_mul(4)) as u32);
+                sum = sum.wrapping_add(3);
             } else {
                 cf = 4
-                    + ((cf >= 9 * sf) as u32)
-                    + ((cf >= 12 * sf) as u32)
-                    + ((cf >= 15 * sf) as u32);
-                sum += cf;
+                    + ((cf >= sf.wrapping_mul(9)) as u32)
+                    + ((cf >= sf.wrapping_mul(12)) as u32)
+                    + ((cf >= sf.wrapping_mul(15)) as u32);
+                sum = sum.wrapping_add(cf);
             }
             self.set_ctx_summ_freq(c, sum as u16);
             self.set_state_freq(s, cf as u8);
@@ -920,71 +959,81 @@ impl<RC: RangeDec> Ppmd7<RC> {
     /// Swap State node `s` with the node before it (`s-STATE_SIZE`).
     fn swap_states(&mut self, s: u32) {
         let a = s;
-        let b = s - STATE_SIZE;
+        let b = s.wrapping_sub(STATE_SIZE);
         // Swap two 6-byte State records via a temporary.
-        let mut tmp = [0u8; STATE_SIZE as usize];
+        let tmp = self.read_state(a);
         for j in 0..STATE_SIZE {
-            tmp[j as usize] = self.rd_u8(a + j);
+            let v = self.rd_u8(b.wrapping_add(j));
+            self.wr_u8(a.wrapping_add(j), v);
         }
+        self.write_state(b, tmp);
+    }
+
+    fn read_state(&mut self, s: u32) -> [u8; STATE_SIZE as usize] {
+        let mut t = [0u8; STATE_SIZE as usize];
         for j in 0..STATE_SIZE {
-            let v = self.rd_u8(b + j);
-            self.wr_u8(a + j, v);
+            t[j as usize] = self.rd_u8(s.wrapping_add(j));
         }
+        t
+    }
+
+    fn write_state(&mut self, s: u32, t: [u8; STATE_SIZE as usize]) {
         for j in 0..STATE_SIZE {
-            self.wr_u8(b + j, tmp[j as usize]);
+            self.wr_u8(s.wrapping_add(j), t[j as usize]);
         }
     }
 
     #[inline(never)]
     fn rescale(&mut self) {
         let stats = self.get_multi_state_stats(self.min_context);
+        let num_stats = self.ctx_num_stats(self.min_context) as u32;
+        // A context rescaled has 2 to 256 states, the found one among them.
+        let dist = self.found_state.wrapping_sub(stats);
+        if !(2..=256).contains(&num_stats)
+            || !dist.is_multiple_of(STATE_SIZE)
+            || dist / STATE_SIZE >= num_stats
+        {
+            self.corrupt = true;
+            return;
+        }
         let mut s = self.found_state;
         if s != stats {
             // Shift the found_state record down to the front (insertion move).
-            let mut tmp = [0u8; STATE_SIZE as usize];
-            for j in 0..STATE_SIZE {
-                tmp[j as usize] = self.rd_u8(s + j);
-            }
+            let tmp = self.read_state(s);
             while s != stats {
-                self.copy_state(s, s - STATE_SIZE);
-                s -= STATE_SIZE;
+                self.copy_state(s, s.wrapping_sub(STATE_SIZE));
+                s = s.wrapping_sub(STATE_SIZE);
             }
-            for j in 0..STATE_SIZE {
-                self.wr_u8(s + j, tmp[j as usize]);
-            }
+            self.write_state(s, tmp);
         }
 
         let mut sum_freq = self.state_freq(s) as u32;
-        let mut esc_freq = (self.ctx_summ_freq(self.min_context) as u32) - sum_freq;
+        let mut esc_freq = (self.ctx_summ_freq(self.min_context) as u32).wrapping_sub(sum_freq);
         let adder = (self.order_fall != 0) as u32;
         sum_freq = (sum_freq + 4 + adder) >> 1;
-        let mut i = (self.ctx_num_stats(self.min_context) as u32) - 1;
+        let mut i = num_stats - 1;
         self.set_state_freq(s, sum_freq as u8);
 
         for _ in 0..i {
-            s += STATE_SIZE;
+            s = s.wrapping_add(STATE_SIZE);
             let mut freq = self.state_freq(s) as u32;
-            esc_freq -= freq;
+            esc_freq = esc_freq.wrapping_sub(freq);
             freq = (freq + adder) >> 1;
             sum_freq += freq;
             self.set_state_freq(s, freq as u8);
-            if freq > self.state_freq(s - STATE_SIZE) as u32 {
+            if freq > self.state_freq(s.wrapping_sub(STATE_SIZE)) as u32 {
                 // Bubble the record up while its freq exceeds the predecessor.
-                let mut tmp = [0u8; STATE_SIZE as usize];
-                for j in 0..STATE_SIZE {
-                    tmp[j as usize] = self.rd_u8(s + j);
-                }
+                let tmp = self.read_state(s);
                 let mut s1 = s;
                 loop {
-                    self.copy_state(s1, s1 - STATE_SIZE);
-                    s1 -= STATE_SIZE;
-                    if !(s1 != stats && freq > self.state_freq(s1 - STATE_SIZE) as u32) {
+                    self.copy_state(s1, s1.wrapping_sub(STATE_SIZE));
+                    s1 = s1.wrapping_sub(STATE_SIZE);
+                    if !(s1 != stats && freq > self.state_freq(s1.wrapping_sub(STATE_SIZE)) as u32)
+                    {
                         break;
                     }
                 }
-                for j in 0..STATE_SIZE {
-                    self.wr_u8(s1 + j, tmp[j as usize]);
-                }
+                self.write_state(s1, tmp);
             }
         }
 
@@ -992,12 +1041,15 @@ impl<RC: RangeDec> Ppmd7<RC> {
             i = 0;
             while self.state_freq(s) == 0 {
                 i += 1;
-                s -= STATE_SIZE;
+                s = s.wrapping_sub(STATE_SIZE);
+                if i >= num_stats {
+                    self.corrupt = true;
+                    return;
+                }
             }
-            esc_freq += i;
+            esc_freq = esc_freq.wrapping_add(i);
             let mc = self.min_context;
-            let num_stats = self.ctx_num_stats(mc) as u32;
-            let num_stats_new = num_stats.wrapping_sub(i);
+            let num_stats_new = num_stats - i;
             self.set_ctx_num_stats(mc, num_stats_new as u16);
             let n0 = (num_stats + 1) >> 1;
 
@@ -1014,14 +1066,15 @@ impl<RC: RangeDec> Ppmd7<RC> {
                 self.copy_state(s, stats);
                 self.set_state_freq(s, freq as u8);
                 self.found_state = s;
-                self.insert_node(stats, self.units2index[(n0 as usize) - 1] as u32);
+                let index = self.u2i(n0);
+                self.insert_node(stats, index);
                 return;
             }
 
             let n1 = (num_stats_new + 1) >> 1;
             if n0 != n1 {
-                let i0 = self.units2index[(n0 as usize) - 1] as u32;
-                let i1 = self.units2index[(n1 as usize) - 1] as u32;
+                let i0 = self.u2i(n0);
+                let i1 = self.u2i(n1);
                 if i0 != i1 {
                     if self.free_list[i1 as usize].is_not_null() {
                         let ptr = self.remove_node(i1);
@@ -1035,7 +1088,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
             }
         }
 
-        let new_summ = (sum_freq + esc_freq - (esc_freq >> 1)) as u16;
+        let new_summ = sum_freq.wrapping_add(esc_freq).wrapping_sub(esc_freq >> 1) as u16;
         self.set_ctx_summ_freq(self.min_context, new_summ);
         self.found_state = self.get_multi_state_stats(self.min_context);
     }
@@ -1105,11 +1158,11 @@ impl<RC: RangeDec> Ppmd7<RC> {
         let mut s = self.found_state;
         let freq = self.state_freq(s) as u32 + 4;
         let sf = self.ctx_summ_freq(self.min_context);
-        self.set_ctx_summ_freq(self.min_context, sf + 4);
+        self.set_ctx_summ_freq(self.min_context, sf.wrapping_add(4));
         self.set_state_freq(s, freq as u8);
-        if freq > self.state_freq(s - STATE_SIZE) as u32 {
+        if freq > self.state_freq(s.wrapping_sub(STATE_SIZE)) as u32 {
             self.swap_states(s);
-            s -= STATE_SIZE;
+            s = s.wrapping_sub(STATE_SIZE);
             self.found_state = s;
             if freq > MAX_FREQ as u32 {
                 self.rescale();
@@ -1124,7 +1177,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
         let mut freq = self.state_freq(s) as u32;
         let summ_freq = self.ctx_summ_freq(mc) as u32;
         self.prev_success = ((2 * freq) > summ_freq) as u32;
-        self.run_length += self.prev_success as i32;
+        self.run_length = self.run_length.wrapping_add(self.prev_success as i32);
         self.set_ctx_summ_freq(mc, (summ_freq + 4) as u16);
         freq += 4;
         self.set_state_freq(s, freq as u8);
@@ -1139,7 +1192,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
         let freq = self.state_freq(s) as u32 + 4;
         self.run_length = self.init_rl;
         let sf = self.ctx_summ_freq(self.min_context);
-        self.set_ctx_summ_freq(self.min_context, sf + 4);
+        self.set_ctx_summ_freq(self.min_context, sf.wrapping_add(4));
         self.set_state_freq(s, freq as u8);
         if freq > MAX_FREQ as u32 {
             self.rescale();
@@ -1148,24 +1201,32 @@ impl<RC: RangeDec> Ppmd7<RC> {
     }
 
     fn update_bin(&mut self, s: u32) {
-        let freq = self.state_freq(s) as u32;
+        let freq = self.state_freq(s);
         self.found_state = s;
         self.prev_success = 1;
-        self.run_length += 1;
-        let nf = self.state_freq(s) + ((freq < 128) as u32) as u8;
-        self.set_state_freq(s, nf);
+        self.run_length = self.run_length.wrapping_add(1);
+        self.set_state_freq(s, freq + (freq < 128) as u8);
         self.next_context();
     }
 
+    /// Masks the symbol of `s` and every state from `s2` up to `s`, in pairs
+    /// as upstream does.
     fn mask_symbols(&mut self, char_mask: &mut [u8; 256], s: u32, mut s2: u32) {
         let sym = self.state_symbol(s) as usize;
         char_mask[sym] = 0;
-        while s2 < s {
+        // A context holds at most 256 states, so 128 pairs.
+        for _ in 0..128 {
+            if s2 >= s {
+                return;
+            }
             let sym0 = self.state_symbol(s2) as usize;
-            let sym1 = self.state_symbol(s2 + STATE_SIZE) as usize;
-            s2 += 2 * STATE_SIZE;
+            let sym1 = self.state_symbol(s2.wrapping_add(STATE_SIZE)) as usize;
+            s2 = s2.wrapping_add(2 * STATE_SIZE);
             char_mask[sym0] = 0;
             char_mask[sym1] = 0;
+        }
+        if s2 < s {
+            self.corrupt = true;
         }
     }
 
@@ -1211,7 +1272,17 @@ impl<RC: RangeDec> Ppmd7<RC> {
     /// Offset of a context's single state (the union2/union4 overlay at `+2`).
     #[inline(always)]
     fn get_single_state(&self, context: u32) -> u32 {
-        context + CTX_SINGLE_STATE
+        context.wrapping_add(CTX_SINGLE_STATE)
+    }
+
+    /// `get_threshold(total)`, unless `total` is zero or over the range,
+    /// which would divide by zero.
+    fn threshold(&mut self, total: u32) -> Option<u32> {
+        if total == 0 || total > self.rc.range() {
+            self.corrupt = true;
+            return None;
+        }
+        Some(self.rc.get_threshold(total))
     }
 
     #[inline(always)]
@@ -1224,13 +1295,21 @@ impl<RC: RangeDec> Ppmd7<RC> {
     /// 0x20 reset flag): `PpmdRAR_RangeDec_Init` re-initialises the range coder
     /// over the bytes that follow, but the context tree / SEE / suballocator are
     /// carried over unchanged.
+    #[cfg_attr(not(feature = "rar"), allow(dead_code))]
     pub(crate) fn replace_rc(&mut self, rc: RC) {
         self.rc = rc;
     }
 
     /// Input bytes consumed by the range decoder so far.
+    #[cfg_attr(not(feature = "rar"), allow(dead_code))]
     pub(crate) fn rc_bytes_consumed(&self) -> usize {
         self.rc.bytes_consumed()
+    }
+
+    /// Whether the range decoder has read past the end of its input.
+    #[cfg_attr(not(feature = "sevenz"), allow(dead_code))]
+    pub(crate) fn out_of_data(&self) -> bool {
+        self.rc.out_of_data()
     }
 
     /// Decode the next symbol. Returns a byte in `0..=255`, [`SYM_END`] for the
@@ -1249,7 +1328,9 @@ impl<RC: RangeDec> Ppmd7<RC> {
         if self.ctx_num_stats(self.min_context) != 1 {
             let mut s = self.get_multi_state_stats(self.min_context);
             let summ_freq = self.ctx_summ_freq(self.min_context) as u32;
-            let mut count = self.rc.get_threshold(summ_freq);
+            let Some(mut count) = self.threshold(summ_freq) else {
+                return SYM_ERROR;
+            };
             let hi_cnt = count;
 
             count = count.wrapping_sub(self.state_freq(s) as u32);
@@ -1265,7 +1346,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
             self.prev_success = 0;
             let num_stats = self.ctx_num_stats(self.min_context);
             for _ in 1..num_stats {
-                s += STATE_SIZE;
+                s = s.wrapping_add(STATE_SIZE);
                 count = count.wrapping_sub(self.state_freq(s) as u32);
                 if (count as i32) < 0 {
                     let freq = self.state_freq(s) as u32;
@@ -1304,7 +1385,10 @@ impl<RC: RangeDec> Ppmd7<RC> {
 
             pr = ppmd_update_prob_1(pr);
             self.bin_summ[bi][ci] = pr as u16;
-            self.init_esc = self.exp_escape[(pr >> 10) as usize] as u32;
+            let Some(&esc) = self.exp_escape.get((pr >> 10) as usize) else {
+                return SYM_ERROR;
+            };
+            self.init_esc = esc as u32;
 
             char_mask = [u8::MAX; 256];
             let symbol = self.state_symbol(self.get_single_state(self.min_context)) as usize;
@@ -1331,7 +1415,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
                     self.corrupt = true;
                     return SYM_ERROR;
                 }
-                self.order_fall += 1;
+                self.order_fall = self.order_fall.wrapping_add(1);
                 if self.ctx_suffix(mc).is_null() {
                     return SYM_END;
                 }
@@ -1345,15 +1429,15 @@ impl<RC: RangeDec> Ppmd7<RC> {
             let mut hi_cnt = self.state_freq(s) as u32
                 & char_mask[self.state_symbol(s) as usize] as u32
                 & (0u32.wrapping_sub(num));
-            s += num * STATE_SIZE;
+            s = s.wrapping_add(num * STATE_SIZE);
             self.min_context = mc;
 
             while num2 != 0 {
                 let sym0_0 = self.state_symbol(s) as usize;
-                let sym1_0 = self.state_symbol(s + STATE_SIZE) as usize;
-                s += 2 * STATE_SIZE;
-                hi_cnt += (self.state_freq(s - 2 * STATE_SIZE) & char_mask[sym0_0]) as u32;
-                hi_cnt += (self.state_freq(s - STATE_SIZE) & char_mask[sym1_0]) as u32;
+                let sym1_0 = self.state_symbol(s.wrapping_add(STATE_SIZE)) as usize;
+                hi_cnt += (self.state_freq(s) & char_mask[sym0_0]) as u32;
+                hi_cnt += (self.state_freq(s.wrapping_add(STATE_SIZE)) & char_mask[sym1_0]) as u32;
+                s = s.wrapping_add(2 * STATE_SIZE);
                 num2 -= 1;
             }
 
@@ -1361,7 +1445,9 @@ impl<RC: RangeDec> Ppmd7<RC> {
             let see_source = self.make_esc_freq(num_masked, &mut freq_sum);
             freq_sum += hi_cnt;
 
-            let mut count = self.rc.get_threshold(freq_sum);
+            let Some(mut count) = self.threshold(freq_sum) else {
+                return SYM_ERROR;
+            };
 
             if count < hi_cnt {
                 s = self.get_multi_state_stats(self.min_context);
@@ -1374,17 +1460,17 @@ impl<RC: RangeDec> Ppmd7<RC> {
                     let f = self.state_freq(s) as u32;
                     let m = char_mask[self.state_symbol(s) as usize] as u32;
                     count = count.wrapping_sub(f & m);
-                    s += STATE_SIZE;
+                    s = s.wrapping_add(STATE_SIZE);
                     steps += 1;
                     if (count as i32) < 0 {
                         break;
                     }
                     if steps >= ns {
                         self.corrupt = true;
-                        break;
+                        return SYM_ERROR;
                     }
                 }
-                s -= STATE_SIZE;
+                s = s.wrapping_sub(STATE_SIZE);
                 let freq = self.state_freq(s) as u32;
                 self.rc
                     .decode(hi_cnt.wrapping_sub(count).wrapping_sub(freq), freq);
@@ -1406,11 +1492,10 @@ impl<RC: RangeDec> Ppmd7<RC> {
             see.summ = see.summ.wrapping_add(freq_sum as u16);
 
             s = self.get_multi_state_stats(self.min_context);
-            let s2 = s + self.ctx_num_stats(self.min_context) as u32 * STATE_SIZE;
-            while s < s2 {
+            for _ in 0..self.ctx_num_stats(self.min_context) {
                 let sym = self.state_symbol(s) as usize;
                 char_mask[sym] = 0;
-                s += STATE_SIZE;
+                s = s.wrapping_add(STATE_SIZE);
             }
         }
     }
@@ -1424,5 +1509,127 @@ impl<RC: RangeDec> Ppmd7<RC> {
         } else {
             sym
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::ppmd7::SevenZRangeDecoder;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    type Model = Ppmd7<SevenZRangeDecoder>;
+
+    fn model(input: Vec<u8>) -> Model {
+        Ppmd7::new(SevenZRangeDecoder::new(input), 6, 1 << 16).unwrap()
+    }
+
+    /// Runs `f` on a fresh model, as a damaged one would hold its state:
+    /// whether it panicked.
+    fn panics(f: impl FnOnce(&mut Model)) -> bool {
+        let mut m = model(vec![0; 256]);
+        catch_unwind(AssertUnwindSafe(|| f(&mut m))).is_err()
+    }
+
+    /// States no stream leads to, which a bug elsewhere in the model could:
+    /// offsets at the top of the `u32` range, counts and indexes past their
+    /// tables. Each is an error, not a panic, with `overflow-checks` on as
+    /// the release profile has them.
+    #[test]
+    fn a_damaged_model_is_an_error_not_a_panic() {
+        let decodes_an_error = |m: &mut Model| assert_eq!(m.decode_symbol(), SYM_ERROR);
+        let cases: Vec<(&str, Box<dyn Fn(&mut Model)>)> = vec![
+            (
+                "a context at the end of the offset range",
+                Box::new(move |m| {
+                    m.min_context = u32::MAX - 3;
+                    decodes_an_error(m);
+                }),
+            ),
+            (
+                "states at the end of the offset range",
+                Box::new(move |m| {
+                    let c = m.min_context;
+                    m.set_ctx_stats(c, TaggedOffset::from_raw(u32::MAX - 2));
+                    decodes_an_error(m);
+                }),
+            ),
+            (
+                "a frequency total of zero",
+                Box::new(move |m| {
+                    let c = m.min_context;
+                    m.set_ctx_summ_freq(c, 0);
+                    decodes_an_error(m);
+                }),
+            ),
+            (
+                "a found state before its context's states",
+                Box::new(|m| {
+                    let c = m.min_context;
+                    m.found_state = m.get_multi_state_stats(c) - STATE_SIZE;
+                    m.rescale();
+                    assert!(m.corrupt);
+                }),
+            ),
+            (
+                "a context with more states than there are symbols",
+                Box::new(|m| {
+                    let c = m.min_context;
+                    m.set_ctx_num_stats(c, u16::MAX);
+                    m.found_state = m.get_multi_state_stats(c);
+                    m.rescale();
+                    assert!(m.corrupt);
+                }),
+            ),
+            (
+                "free-list indexes past the table",
+                Box::new(|m| {
+                    let lo = m.lo_unit;
+                    m.insert_node(lo, 40);
+                    assert_eq!(m.alloc_units(PPMD_NUM_INDEXES), None);
+                    m.split_block(lo, 0, 5);
+                    assert!(m.corrupt);
+                }),
+            ),
+            (
+                "fields written at the end of the offset range",
+                Box::new(|m| {
+                    for off in [u32::MAX, u32::MAX - 1, u32::MAX - 3] {
+                        m.wr_u16(off, 1);
+                        m.wr_u32(off, 1);
+                    }
+                    assert!(m.corrupt);
+                }),
+            ),
+        ];
+        let failed: Vec<_> = cases
+            .into_iter()
+            .filter(|(_, case)| panics(case))
+            .map(|(what, _)| what)
+            .collect();
+        assert!(failed.is_empty(), "panicked: {failed:?}");
+    }
+
+    /// The run-length counter grows while the model's most likely symbol
+    /// keeps coming. Near its maximum, the run carries on without a panic.
+    #[test]
+    fn a_long_run_does_not_overflow_its_counter() {
+        use std::io::Write;
+        let data = vec![b'a'; 4096];
+        let mut packed = Vec::new();
+        let mut enc = ppmd_rust::Ppmd7Encoder::new(&mut packed, 6, 1 << 16).unwrap();
+        enc.write_all(&data).unwrap();
+        enc.finish(false).unwrap();
+        let mut m = model(packed);
+        for _ in 0..64 {
+            assert_eq!(m.decode_symbol(), i32::from(b'a'));
+        }
+        m.run_length = i32::MAX - 8;
+        let run = catch_unwind(AssertUnwindSafe(|| {
+            for _ in 64..data.len() {
+                m.decode_symbol();
+            }
+        }));
+        assert!(run.is_ok());
     }
 }

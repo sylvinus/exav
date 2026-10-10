@@ -1,0 +1,206 @@
+[
+ {
+  "pdf": "jpx-rgb.pdf",
+  "stream": "rgb.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-rgb-devicergb.pdf",
+  "stream": "rgb.jp2",
+  "filter": "jpx",
+  "numComponents": 3,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-grey-devicegray.pdf",
+  "stream": "grey.j2k",
+  "filter": "jpx",
+  "numComponents": 1,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-grey.pdf",
+  "stream": "grey.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-grey4.pdf",
+  "stream": "grey4.j2k",
+  "filter": "jpx",
+  "numComponents": 1,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-cmyk-devicecmyk.pdf",
+  "stream": "cmyk.jp2",
+  "filter": "jpx",
+  "numComponents": 4,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-cmyk.pdf",
+  "stream": "cmyk.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-sycc.pdf",
+  "stream": "sycc.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-rgba-smaskindata.pdf",
+  "stream": "rgba.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": true
+ },
+ {
+  "pdf": "jpx-greya-smaskindata.pdf",
+  "stream": "greya.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": true
+ },
+ {
+  "pdf": "jpx-indexed.pdf",
+  "stream": "palette.jp2",
+  "filter": "jpx",
+  "numComponents": 1,
+  "isIndexedColormap": true,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-palette.pdf",
+  "stream": "palette.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jpx-lossy.pdf",
+  "stream": "lossy.jp2",
+  "filter": "jpx",
+  "numComponents": 0,
+  "isIndexedColormap": false,
+  "smaskInData": false
+ },
+ {
+  "pdf": "jbig2-generic.pdf",
+  "stream": "generic.jbig2",
+  "width": 120,
+  "height": 64,
+  "filter": "jbig2"
+ },
+ {
+  "pdf": "jbig2-tpgd.pdf",
+  "stream": "tpgd.jbig2",
+  "width": 120,
+  "height": 64,
+  "filter": "jbig2"
+ },
+ {
+  "pdf": "jbig2-symbol.pdf",
+  "stream": "symbol.jbig2",
+  "width": 120,
+  "height": 64,
+  "filter": "jbig2",
+  "globals": "symbol-globals.jbig2"
+ },
+ {
+  "pdf": "ccitt-g4.pdf",
+  "stream": "g4.ccitt",
+  "width": 120,
+  "height": 64,
+  "filter": "ccitt",
+  "K": -1,
+  "EndOfLine": false,
+  "EncodedByteAlign": false,
+  "BlackIs1": false,
+  "Columns": 120,
+  "Rows": 64
+ },
+ {
+  "pdf": "ccitt-g4-blackis1.pdf",
+  "stream": "g4.ccitt",
+  "width": 120,
+  "height": 64,
+  "filter": "ccitt",
+  "K": -1,
+  "EndOfLine": false,
+  "EncodedByteAlign": false,
+  "BlackIs1": true,
+  "Columns": 120,
+  "Rows": 64
+ },
+ {
+  "pdf": "ccitt-g3-1d.pdf",
+  "stream": "g3-1d.ccitt",
+  "width": 120,
+  "height": 64,
+  "filter": "ccitt",
+  "K": 0,
+  "EndOfLine": true,
+  "EncodedByteAlign": false,
+  "BlackIs1": false,
+  "Columns": 120,
+  "Rows": 64
+ },
+ {
+  "pdf": "ccitt-g3-2d.pdf",
+  "stream": "g3-2d.ccitt",
+  "width": 120,
+  "height": 64,
+  "filter": "ccitt",
+  "K": 1,
+  "EndOfLine": true,
+  "EncodedByteAlign": false,
+  "BlackIs1": false,
+  "Columns": 120,
+  "Rows": 64
+ },
+ {
+  "pdf": "ccitt-g3-fill.pdf",
+  "stream": "g3-fill.ccitt",
+  "width": 120,
+  "height": 64,
+  "filter": "ccitt",
+  "K": 0,
+  "EndOfLine": true,
+  "EncodedByteAlign": true,
+  "BlackIs1": false,
+  "Columns": 120,
+  "Rows": 64
+ },
+ {
+  "pdf": "ccitt-rle.pdf",
+  "stream": "rle.ccitt",
+  "width": 120,
+  "height": 64,
+  "filter": "ccitt",
+  "K": 0,
+  "EndOfLine": false,
+  "EncodedByteAlign": true,
+  "BlackIs1": false,
+  "Columns": 120,
+  "Rows": 64
+ }
+]

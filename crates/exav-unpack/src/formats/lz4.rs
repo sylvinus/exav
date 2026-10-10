@@ -19,11 +19,7 @@
 //! the previous block, so every block decodes into one continuous buffer rather
 //! than being decompressed on its own.
 
-use crate::{Budget, Entry, Format, LimitHit, Sink};
-
-fn is_lz4(d: &[u8]) -> bool {
-    super::sniff::is(d, Format::Lz4)
-}
+use crate::source::ByteSource;
 
 /// Skippable frames are `0x184D2A50`..`0x184D2A5F`: a length and payload a
 /// reader steps over. Needed here to find the next frame when several are
@@ -51,8 +47,7 @@ const BLOCK_UNCOMPRESSED: u32 = 0x8000_0000;
 const LEGACY_BLOCK: usize = 8 * 1024 * 1024;
 
 fn le_u32(d: &[u8], off: usize) -> Option<u32> {
-    d.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    crate::bytes::at(d, off, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Decompress one LZ4 block, appending to `out`. Matches may reach back before
@@ -149,148 +144,246 @@ fn header(data: &[u8]) -> Result<(usize, bool, bool), &'static str> {
     ))
 }
 
-pub(crate) fn extract_lz4<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    if !is_lz4(data) {
-        return Ok(None);
-    }
+/// Output kept for matches to reach back into: an offset is 16 bits.
+const HISTORY: usize = 64 * 1024;
+
+/// The largest block the reader takes in. A frame block is at most 4 MiB and
+/// a legacy one at most 8 MiB compressed plus its worst-case growth.
+const MAX_BLOCK_READ: usize = 16 * 1024 * 1024;
+
+/// Walk an `.lz4` file: one member, decoded as it is read. The decoder holds
+/// one block and the 64 KiB a match can reach back into.
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
+    budget: &mut crate::Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, crate::LimitHit> {
+    use crate::stream::{emit_stream, single_meta};
     budget.count_entry()?;
-    let cap = budget.reserve()? as usize;
-
-    let mut out: Vec<u8> = Vec::new();
-    let mut decoded_any = false;
-    let mut pos = 0usize;
-
-    // Frames concatenate: `lz4 -dc` on a file holding several emits all of them,
-    // one after another. Stopping at the first end mark would leave everything
-    // behind it unscanned, which is a one-command way to hide a payload.
-    while pos + 8 <= data.len() {
-        let legacy = data[pos..].starts_with(&LEGACY_MAGIC);
-        let (mut p, block_checksum, content_checksum) = if legacy {
-            (pos + 4, false, false)
-        } else if data[pos..].starts_with(&MAGIC) {
-            match header(&data[pos..]) {
-                Ok((off, bc, cc)) => (pos + off, bc, cc),
-                Err(reason) => {
-                    return finish(out, decoded_any, reason, data.len() as u64, budget, visit)
-                }
-            }
-        } else if data[pos] & 0xF0 == 0x50 && data[pos + 1..pos + 4] == SKIPPABLE_MASK {
-            // A skippable frame carries no compressed data of its own; step over
-            // it and carry on with whatever follows.
-            let len = le_u32(data, pos + 4).unwrap_or(0) as usize;
-            pos = pos.saturating_add(8).saturating_add(len);
-            continue;
-        } else {
-            // Trailing bytes that are not a frame. If nothing decoded at all the
-            // file was never really LZ4; otherwise this is junk after the data.
-            break;
-        };
-
-        while let Some(size) = le_u32(data, p) {
-            p += 4;
-            if !legacy && size == 0 {
-                // End mark, then the optional whole-frame checksum.
-                if content_checksum {
-                    p += 4;
-                }
-                break;
-            }
-            let stored = !legacy && size & BLOCK_UNCOMPRESSED != 0;
-            let n = (size & !BLOCK_UNCOMPRESSED) as usize;
-            // A block extending past the end means the file is truncated: those
-            // bytes are absent rather than hidden, and what came before is kept.
-            let Some(body) = data.get(p..p + n) else {
-                p = data.len();
-                break;
-            };
-            p += n;
-            let block_cap = if legacy {
-                cap.min(out.len() + LEGACY_BLOCK)
-            } else {
-                cap
-            };
-            if stored {
-                if out.len() + body.len() > block_cap {
-                    return finish(
-                        out,
-                        decoded_any,
-                        "LZ4 frame exceeds the size budget",
-                        data.len() as u64,
-                        budget,
-                        visit,
-                    );
-                }
-                out.extend_from_slice(body);
-            } else if let Err(reason) = block(body, &mut out, block_cap) {
-                return finish(out, decoded_any, reason, data.len() as u64, budget, visit);
-            }
-            decoded_any = true;
-            if block_checksum {
-                p += 4;
-            }
-            if p >= data.len() {
-                break;
-            }
-            // A legacy frame has no end mark: it ends where the next frame's
-            // magic begins, or at the end of the file.
-            if legacy && (data[p..].starts_with(&LEGACY_MAGIC) || data[p..].starts_with(&MAGIC)) {
-                break;
-            }
-        }
-        if p <= pos {
-            break; // no progress — malformed
-        }
-        pos = p;
-    }
-
-    if !decoded_any {
-        return report(
-            "LZ4 frame holds no readable block",
-            data.len() as u64,
+    match content_reader(src) {
+        Ok(mut dec) => emit_stream(
+            &single_meta("lz4-content", src, None),
+            &mut dec,
             budget,
             visit,
+        ),
+        Err(reason) => Ok(visit(
+            &single_meta("lz4-content", src, Some(reason)),
+            None,
+            budget,
+        )),
+    }
+}
+
+/// The content of every frame in `src`, concatenated, as a `Read` decoding a
+/// block at a time. Frames concatenate: `lz4 -dc` on a file holding several
+/// emits all of them, and stopping at the first end mark would leave a payload
+/// behind it unscanned. `Err` when not one block decodes, with the reason.
+pub(crate) fn content_reader(src: &dyn ByteSource) -> Result<Lz4Reader<'_>, &'static str> {
+    let mut r = Lz4Reader {
+        src,
+        pos: 0,
+        blocks: None,
+        history: Vec::new(),
+        handed: 0,
+        done: false,
+        failed: None,
+    };
+    if r.next_block()? {
+        Ok(r)
+    } else {
+        Err("LZ4 frame holds no readable block")
+    }
+}
+
+pub(crate) struct Lz4Reader<'a> {
+    src: &'a dyn ByteSource,
+    /// Where the frame being read starts, or the next one.
+    pos: usize,
+    /// Inside a frame: where its next block is, and how its blocks are laid
+    /// out.
+    blocks: Option<Blocks>,
+    /// Decoded bytes: the last [`HISTORY`] handed out, then those not yet.
+    history: Vec<u8>,
+    handed: usize,
+    done: bool,
+    failed: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct Blocks {
+    p: usize,
+    legacy: bool,
+    block_checksum: bool,
+    content_checksum: bool,
+}
+
+impl<'a> Lz4Reader<'a> {
+    /// Up to `n` bytes at `at`, as many as the input holds there. `Err` when
+    /// the source fails to give them.
+    fn window(&self, at: usize, n: usize) -> Result<std::borrow::Cow<'a, [u8]>, &'static str> {
+        let w = self.src.window(at, n);
+        if w.len() < n.min(self.src.len().saturating_sub(at)) {
+            return Err("LZ4 input could not be read");
+        }
+        Ok(w)
+    }
+
+    /// Leave the frame, the next one starting at `p`. `false` when that makes
+    /// no progress.
+    fn end_frame(&mut self, p: usize) -> bool {
+        self.blocks = None;
+        if p <= self.pos {
+            return false;
+        }
+        self.pos = p;
+        true
+    }
+
+    /// Decode the next block onto `history`. `Ok(false)` when no block is
+    /// left, `Err` with the reason when one fails.
+    fn next_block(&mut self) -> Result<bool, &'static str> {
+        let len = self.src.len();
+        loop {
+            let Some(mut b) = self.blocks else {
+                // Frames concatenate: `lz4 -dc` on a file holding several emits
+                // all of them, one after another.
+                let pos = self.pos;
+                if pos.saturating_add(8) > len {
+                    return Ok(false);
+                }
+                let head = self.window(pos, 32)?;
+                let blocks = if head.starts_with(&LEGACY_MAGIC) {
+                    Blocks {
+                        p: pos + 4,
+                        legacy: true,
+                        block_checksum: false,
+                        content_checksum: false,
+                    }
+                } else if head.starts_with(&MAGIC) {
+                    let (off, block_checksum, content_checksum) = header(&head)?;
+                    Blocks {
+                        p: pos + off,
+                        legacy: false,
+                        block_checksum,
+                        content_checksum,
+                    }
+                } else if head.len() >= 8 && head[0] & 0xF0 == 0x50 && head[1..4] == SKIPPABLE_MASK
+                {
+                    // A skippable frame carries no compressed data of its own.
+                    let skip = le_u32(&head, 4).unwrap_or(0) as usize;
+                    self.pos = pos.saturating_add(8).saturating_add(skip);
+                    continue;
+                } else {
+                    // Trailing bytes that are not a frame.
+                    return Ok(false);
+                };
+                self.blocks = Some(blocks);
+                continue;
+            };
+            let Some(size) = le_u32(&self.window(b.p, 4)?, 0) else {
+                if !self.end_frame(b.p) {
+                    return Ok(false);
+                }
+                continue;
+            };
+            b.p += 4;
+            if !b.legacy && size == 0 {
+                // End mark, then the optional whole-frame checksum.
+                if b.content_checksum {
+                    b.p += 4;
+                }
+                if !self.end_frame(b.p) {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let stored = !b.legacy && size & BLOCK_UNCOMPRESSED != 0;
+            let n = (size & !BLOCK_UNCOMPRESSED) as usize;
+            if b.p.saturating_add(n) > len {
+                // Truncated: those bytes are absent rather than hidden.
+                if !self.end_frame(len) {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if n > MAX_BLOCK_READ {
+                return Err("LZ4 block is larger than the format allows");
+            }
+            let body = self.window(b.p, n)?;
+            b.p += n;
+            // A frame block is held to the legacy size too, which is twice the
+            // largest the format allows, so that one block cannot fill memory.
+            let block_cap = self.history.len() + LEGACY_BLOCK;
+            if stored {
+                if self.history.len() + body.len() > block_cap {
+                    return Err("LZ4 frame exceeds the size budget");
+                }
+                self.history.extend_from_slice(&body);
+            } else {
+                block(&body, &mut self.history, block_cap)?;
+            }
+            if b.block_checksum {
+                b.p += 4;
+            }
+            self.blocks = Some(b);
+            // A legacy frame has no end mark: it ends where the next frame's
+            // magic begins, or at the end of the file.
+            let next = self.window(b.p, 4)?;
+            if b.p >= len
+                || (b.legacy && (next.starts_with(&LEGACY_MAGIC) || next.starts_with(&MAGIC)))
+            {
+                self.end_frame(b.p);
+            }
+            return Ok(true);
+        }
+    }
+}
+
+impl std::io::Read for Lz4Reader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.handed < self.history.len() {
+                let n = (self.history.len() - self.handed).min(out.len());
+                out[..n].copy_from_slice(&self.history[self.handed..self.handed + n]);
+                self.handed += n;
+                return Ok(n);
+            }
+            if let Some(reason) = self.failed.take() {
+                self.done = true;
+                return Err(std::io::Error::other(reason));
+            }
+            if self.done {
+                return Ok(0);
+            }
+            // Keep only what a match can still reach.
+            let drop = self.handed.saturating_sub(HISTORY);
+            self.history.drain(..drop);
+            self.handed -= drop;
+            match self.next_block() {
+                Ok(true) => {}
+                Ok(false) => self.done = true,
+                Err(reason) => self.failed = Some(reason),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Input the source fails to deliver is a read error, not the frame's end.
+    #[test]
+    fn a_source_that_fails_is_not_taken_for_the_end() {
+        let blob = crate::read_fixture(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/lz4/one.lz4"
+        ))
+        .unwrap();
+        assert!(super::content_reader(&blob).is_ok());
+        let src = crate::source::short_source(&blob[..100], blob.len() as u64);
+        assert_eq!(
+            super::content_reader(&src).err(),
+            Some("LZ4 input could not be read")
         );
     }
-    budget.commit(out.len() as u64);
-    Ok(visit(Entry::new("lz4-content".to_string(), out), budget))
-}
-
-/// A frame that failed partway has still produced real bytes. Emitting them and
-/// reporting the failure beats discarding content that was successfully decoded.
-fn finish<R>(
-    out: Vec<u8>,
-    decoded_any: bool,
-    reason: &'static str,
-    size: u64,
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    if !decoded_any {
-        return report(reason, size, budget, visit);
-    }
-    budget.count_entry()?;
-    if let Some(r) = visit(
-        Entry::unsupported("lz4-content".to_string(), size, false, reason),
-        budget,
-    ) {
-        return Ok(Some(r));
-    }
-    budget.commit(out.len() as u64);
-    Ok(visit(Entry::new("lz4-content".to_string(), out), budget))
-}
-
-fn report<R>(
-    reason: &'static str,
-    size: u64,
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    Ok(visit(
-        Entry::unsupported("lz4-content".to_string(), size, false, reason),
-        budget,
-    ))
 }
