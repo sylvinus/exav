@@ -35,6 +35,9 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/create-gh-release-action@v1
         with:
+          # The release notes are this tag's section of the changelog
+          # (`## [0.0.2] - 2026-10-11`); without it the body is empty.
+          changelog: CHANGELOG.md
           token: ${{ secrets.GITHUB_TOKEN }}
   build:
     needs: create-release
