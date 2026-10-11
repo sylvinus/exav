@@ -44,9 +44,11 @@ for f in "$chart"/ci/*-values.yaml; do
     fi
   done
 
-  for forbid in EXAV_ALLOW_SHUTDOWN EXAV_ALLOW_HTTP_SCAN; do
-    if grep -q -- "$forbid" <<< "$rendered"; then
-      echo "rendered manifest must not set: $forbid" >&2
+  # Off, and fixed: an explicit env entry wins over envFrom, which can carry
+  # either name from a ConfigMap or Secret the chart cannot see.
+  for forced in EXAV_ALLOW_SHUTDOWN EXAV_ALLOW_HTTP_SCAN; do
+    if ! grep -A1 -- "name: $forced\$" <<< "$rendered" | grep -q 'value: "false"'; then
+      echo "rendered manifest must set $forced to \"false\"" >&2
       exit 1
     fi
   done

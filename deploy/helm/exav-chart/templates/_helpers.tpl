@@ -126,7 +126,8 @@ Kubernetes API rejection after apply.
 {{- if and .Values.signatures.existingSecret (or .Values.signatures.sources .Values.signatures.dbUrl) -}}
 {{- fail "exav-chart: signatures.existingSecret replaces the chart Secret. Put sig-sources and db-url inside that Secret instead of setting signatures.sources or signatures.dbUrl." -}}
 {{- end -}}
-{{- if and .Values.signatures.persistence.enabled (gt (int .Values.replicaCount) 1) (not (has "ReadWriteMany" .Values.signatures.persistence.accessModes)) -}}
+{{- /* accessModes configures the chart's own PVC: an existing claim has its own. */ -}}
+{{- if and .Values.signatures.persistence.enabled (not .Values.signatures.persistence.existingClaim) (gt (int .Values.replicaCount) 1) (not (has "ReadWriteMany" .Values.signatures.persistence.accessModes)) -}}
 {{- fail "exav-chart: replicaCount > 1 with signatures.persistence.enabled needs signatures.persistence.accessModes to include ReadWriteMany, or replicaCount set to 1, or signatures.persistence.enabled set to false." -}}
 {{- end -}}
 {{- if and .Values.podDisruptionBudget.enabled (include "exav-chart.isSet" .Values.podDisruptionBudget.minAvailable) (include "exav-chart.isSet" .Values.podDisruptionBudget.maxUnavailable) -}}
