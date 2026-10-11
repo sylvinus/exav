@@ -402,6 +402,9 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- On macOS, a scan time limit above 100,000,000 seconds (`--max-scan-secs`,
+  the largest values) was refused by the system and left no limit at all. It is
+  capped at that value on every platform.
 - `--all-matches` with `--alert-exceeds-max`, on a file whose walk a budget
   stopped (a decompression bomb), dropped the `Heuristics.Limits.Exceeded.*`
   alert and reported a complete scan with nothing found, which printed as clean.

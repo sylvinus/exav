@@ -1415,6 +1415,11 @@ pub(crate) fn apply_oneshot_limits(max_scan_time: Option<u64>, max_scan_memory: 
     }
 }
 
+/// The longest the one-shot timer is armed for: what `setitimer` accepts on
+/// macOS, where a larger value is `EINVAL` and would leave no limit at all.
+#[cfg(unix)]
+const MAX_TIMER_SECS: u64 = 100_000_000;
+
 /// Arm (or, with a zero duration, disarm) the one-shot wall-clock timer.
 #[cfg(unix)]
 fn set_timer(d: std::time::Duration) {
@@ -1426,7 +1431,10 @@ fn set_timer(d: std::time::Duration) {
         it_value: libc::timeval {
             // A limit past what the clock holds is the longest one: cast, it
             // would wrap negative, and the kernel refuses a negative time.
-            tv_sec: libc::time_t::try_from(d.as_secs()).unwrap_or(libc::time_t::MAX),
+            // macOS refuses more than 100,000,000 seconds (EINVAL, three
+            // years), so that is the longest, on every platform.
+            tv_sec: libc::time_t::try_from(d.as_secs().min(MAX_TIMER_SECS))
+                .unwrap_or(libc::time_t::MAX),
             tv_usec: d.subsec_micros() as _,
         },
     };
