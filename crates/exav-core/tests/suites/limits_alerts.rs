@@ -91,7 +91,7 @@ fn all_matches_names_the_budget_that_stopped_the_walk() {
     };
     let (names, outcome) = exav_core::analyze_all_with_outcome(&db, &blob, &opts);
     let names: Vec<_> = names.into_iter().map(|(n, _)| n).collect();
-    assert_eq!(names, [signature.clone()], "{outcome:?}");
+    assert_eq!(names, [signature], "{outcome:?}");
 }
 
 #[test]

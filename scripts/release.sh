@@ -223,7 +223,9 @@ if [ "$DRY_RUN" = 1 ]; then
     log="$(mktemp)"
     if $CARGO publish -p "$c" --dry-run --allow-dirty >"$log" 2>&1; then
       echo "  $c: ok"
-    elif grep -q "no matching package named \`exav" "$log"; then
+    elif grep -qE "no matching package named \`exav|failed to select a version for the requirement \`exav-" "$log"; then
+      # The second is the same fact after a first release: the sibling's
+      # earlier version is on crates.io, the one this crate needs is not.
       skipped+=("$c")
       echo "  $c: not verifiable yet (a workspace dependency is not on crates.io)"
     else

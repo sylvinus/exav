@@ -6,6 +6,8 @@ follow [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-10-11
+
 ### Changed
 
 - A file larger than `--max-object-bytes` (256 MiB by default) gets the full
