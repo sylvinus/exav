@@ -139,7 +139,8 @@ done
 python3 - "$OUT/full_pipeline" <<'PY'
 import os, struct, sys
 kinds = ["ndb","ldb","hdb","hsb","mdb","msb","cdb","ftm","yar","pdb","gdb","wdb","fdb","imp","crb","db","fp","sfp","ign","ign2","pwdb","cbc","idb"]
-scan = (b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\n"
+# The antivirus test string, backwards: this tree may not carry it whole.
+scan = ("*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\\4[PA@%P!O5X"[::-1].encode() + b"\n"
         b"hello world MARKER secret ab cd ab payload macro work doc ABCD\n")
 def frame(files):
     out = struct.pack("<HB", 0, len(files))

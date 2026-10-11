@@ -33,7 +33,9 @@ def read(path, limit=65535):
 
 
 DB = sorted(f for f in os.listdir("fuzz/db") if f.startswith("fuzz."))
-EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+# The antivirus test string, written backwards: this tree may not carry it
+# (scripts/release.sh, crates/exav/tests/self_scan.rs).
+EICAR = "*H+H$!ELIF-TSET-SURIVITNA-DRADNATS-RACIE$}7)CC7)^P(45XZP\\4[PA@%P!O5X"[::-1].encode()
 
 # --- sigs, ndb_compile, bytecode: signature text (fuzz_targets/sigs.rs,
 # ndb_compile.rs, bytecode.rs). One file of each kind of fuzz/db/ whole, then
