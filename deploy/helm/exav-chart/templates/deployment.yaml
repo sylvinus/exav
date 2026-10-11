@@ -132,6 +132,14 @@ spec:
                   key: db-url
             {{- end }}
             {{- end }}
+            {{- /* Off, and fixed: an explicit env entry wins over envFrom, which
+                     the chart cannot inspect (a ConfigMap or Secret may carry
+                     either name). Either lets any client that reaches the
+                     daemon stop it, or make it fetch a URL. */}}
+            - name: EXAV_ALLOW_SHUTDOWN
+              value: "false"
+            - name: EXAV_ALLOW_HTTP_SCAN
+              value: "false"
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
