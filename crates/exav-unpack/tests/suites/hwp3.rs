@@ -13,7 +13,8 @@
 
 #![cfg(feature = "hwp3")]
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 const REAL: &[u8] = include_bytes!("../fixtures/hwp3/tika_testHWP_3.0.hwp");
 
@@ -34,7 +35,7 @@ fn members(blob: &[u8]) -> Vec<Entry> {
 
 #[test]
 fn a_real_document_is_recognised() {
-    assert_eq!(exav_unpack::detect(REAL), Some(Format::Hwp3));
+    assert_eq!(exav_unpack::detect(&REAL), Some(Format::Hwp3));
 }
 
 #[test]

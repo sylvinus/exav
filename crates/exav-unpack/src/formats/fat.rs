@@ -19,6 +19,10 @@
 //! `formats/partition.rs`, where mistaking one for the other invents a partition
 //! spanning the whole image.
 
+// Every sum and product on a header's number is checked or saturating here; a
+// plain one fails the build, so the next edit cannot add the unchecked kind.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::io::Cursor;
 
 use crate::{Budget, Entry, LimitHit, Sink};
@@ -164,7 +168,7 @@ pub(crate) fn extract_fat<R>(
             } else {
                 format!("{prefix}/{name}")
             };
-            seen += 1;
+            seen = seen.saturating_add(1);
             if seen > MAX_ENTRIES {
                 budget.count_entry()?;
                 if let Some(r) = visit(
@@ -181,7 +185,7 @@ pub(crate) fn extract_fat<R>(
                 return Ok(None);
             }
             if entry.is_dir() {
-                stack.push((entry.to_dir(), path, depth + 1));
+                stack.push((entry.to_dir(), path, depth.saturating_add(1)));
                 continue;
             }
 

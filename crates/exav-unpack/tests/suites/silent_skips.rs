@@ -1,7 +1,7 @@
 //! Regressions for members that existed but produced nothing.
 //!
 //! Each case here was a `continue` that dropped a member the container's own
-//! directory names. All are the same class — the bytes are in the file, exav
+//! directory names. All are the same class: the bytes are in the file, exav
 //! failed to read them, so the result must say so rather than come back clean.
 //! `CONTRIBUTING.md` sets out the classification these are judged against.
 //!
@@ -9,7 +9,8 @@
 //! declares bytes the file does not contain, must stay quiet. `ordinary_*` tests
 //! elsewhere pin that side.
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 /// Every member `extract_each` produces, as `(name, unsupported-reason)`.
 /// `extract` is not usable here: it discards already-emitted entries when the
@@ -138,4 +139,87 @@ fn a_cab_member_beyond_its_folder_data_is_reported() {
         m.iter().any(|(n, u)| n == "b.txt" && u.is_some()),
         "and it must carry a reason rather than read as empty: {m:?}"
     );
+}
+
+/// A one-folder, uncompressed cabinet holding `payload`, whose directory lists
+/// `files` as `(uoffFolderStart, size, NUL-terminated name)`.
+#[cfg(feature = "cab")]
+fn cab_with_files(payload: &[u8], files: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
+    let files_off = 36 + 8;
+    let data_off = files_off + files.iter().map(|f| 16 + f.2.len()).sum::<usize>();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"MSCF");
+    blob.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+    blob.extend_from_slice(&0u32.to_le_bytes()); // cbCabinet (patched below)
+    blob.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+    blob.extend_from_slice(&(files_off as u32).to_le_bytes()); // coffFiles
+    blob.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+    blob.extend_from_slice(&[3, 1]); // version
+    blob.extend_from_slice(&1u16.to_le_bytes()); // cFolders
+    blob.extend_from_slice(&(files.len() as u16).to_le_bytes()); // cFiles
+    blob.extend_from_slice(&[0; 6]); // flags, setID, iCabinet
+    blob.extend_from_slice(&(data_off as u32).to_le_bytes()); // coffCabStart
+    blob.extend_from_slice(&1u16.to_le_bytes()); // cCFData
+    blob.extend_from_slice(&0u16.to_le_bytes()); // typeCompress = none
+    for (off, size, name) in files {
+        blob.extend_from_slice(&size.to_le_bytes());
+        blob.extend_from_slice(&off.to_le_bytes());
+        blob.extend_from_slice(&[0; 8]); // iFolder, date, time, attribs
+        blob.extend_from_slice(name);
+    }
+    blob.extend_from_slice(&0u32.to_le_bytes()); // csum
+    blob.extend_from_slice(&(payload.len() as u16).to_le_bytes()); // cbData
+    blob.extend_from_slice(&(payload.len() as u16).to_le_bytes()); // cbUncomp
+    blob.extend_from_slice(payload);
+    let total = blob.len() as u32;
+    blob[8..12].copy_from_slice(&total.to_le_bytes());
+    assert_eq!(exav_unpack::detect(&blob), Some(Format::Cab));
+    blob
+}
+
+/// Two CAB members may share their bytes: MSI cabinets list a file twice at one
+/// offset when it is installed under two names, as ScreenConnect installers do.
+/// A member that starts before the end of the previous one is read again from
+/// the folder's start, not reported unreadable.
+#[cfg(feature = "cab")]
+#[test]
+fn cab_members_that_share_bytes_are_all_read() {
+    let files = [
+        (0, 11, b"first\0".to_vec()),
+        (0, 11, b"same_bytes\0".to_vec()),
+        (6, 5, b"overlap\0".to_vec()),
+    ];
+    let blob = cab_with_files(b"hello world", &files);
+    let mut budget = Budget::new(Limits::default());
+    let mut got = Vec::new();
+    let _ = extract_each::<()>(Format::Cab, &blob, &mut budget, &mut |e: Entry, _| {
+        got.push((e.name, e.unsupported, e.data));
+        None
+    });
+    let want: Vec<(String, Option<&str>, Vec<u8>)> = vec![
+        ("first".into(), None, b"hello world".to_vec()),
+        ("same_bytes".into(), None, b"hello world".to_vec()),
+        ("overlap".into(), None, b"world".to_vec()),
+    ];
+    assert_eq!(got, want);
+}
+
+/// Each restart decodes the folder again up to the member, so a directory that
+/// lists the same late member thousands of times is quadratic work unless it is
+/// charged. It is, to the scan budget, and the walk stops as a limit.
+#[cfg(feature = "cab")]
+#[test]
+fn cab_restarts_are_charged_to_the_scan_budget() {
+    let payload = vec![b'x'; 1000];
+    let files: Vec<_> = (0..200)
+        .map(|i| (990, 10, format!("m{i}\0").into_bytes()))
+        .collect();
+    let blob = cab_with_files(&payload, &files);
+    let mut limits = Limits::default();
+    limits.max_scanned_bytes = 50_000;
+    let mut budget = Budget::new(limits);
+    let r = extract_each::<()>(Format::Cab, &blob, &mut budget, &mut |_, _| None);
+    // Uncharged, the walk would read 200 × 10 bytes and succeed.
+    let err = r.expect_err("200 restarts at offset 990 exceed a 50,000-byte budget");
+    assert!(err.reason.contains("scan budget"), "{err:?}");
 }

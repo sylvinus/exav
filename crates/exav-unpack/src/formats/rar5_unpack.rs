@@ -6,20 +6,23 @@
 //! ARM filters). It is BSD-2-Clause-derived; the upstream copyright and full
 //! licence text live in the repo's top-level `NOTICE` file.
 //!
-//! Scope: single-volume, non-solid, non-encrypted RAR5 members compressed with
-//! the LZ methods (compression versions 0..). Multi-volume block merging,
-//! solid-stream cross-file window reuse and PPMd are intentionally not handled
-//! here (the caller records those members as metadata-only). Everything is
-//! bounds-checked and never panics on malformed input.
+//! Scope: RAR5 members, which are all LZ: RAR 5.0 dropped PPMd. Solid groups
+//! share one decoder ([`Unpacker50`]). A member split across volumes reaches
+//! this module only once the volumes are joined (`rar::join_volumes`), and an
+//! encrypted one only once decrypted. Everything is bounds-checked and never
+//! panics on malformed input.
 
 use crate::{Budget, LimitHit};
 
 const HUFF_BC: usize = 20;
 const HUFF_NC: usize = 306;
 const HUFF_DC: usize = 64;
+/// Distance codes of the RAR 7 algorithm (compression version 1), which
+/// reach distances past any window this decoder allocates.
+const HUFF_DCX: usize = 80;
 const HUFF_LDC: usize = 16;
 const HUFF_RC: usize = 44;
-const HUFF_TABLE_SIZE: usize = HUFF_NC + HUFF_DC + HUFF_RC + HUFF_LDC;
+const HUFF_TABLE_SIZE_MAX: usize = HUFF_NC + HUFF_DCX + HUFF_RC + HUFF_LDC;
 
 const G_UNPACK_WINDOW_SIZE: u64 = 0x20000;
 const MAX_WINDOW_SIZE: u64 = 64 * 1024 * 1024;
@@ -237,6 +240,13 @@ struct Unpacker {
     dd: DecodeTable,
     ldd: DecodeTable,
     rd: DecodeTable,
+    /// Distance codes in the tables: [`HUFF_DC`], or [`HUFF_DCX`] for the RAR 7
+    /// algorithm.
+    dist_codes: usize,
+    /// Where in the stream the current member's output starts. The x86 and
+    /// ARM filters convert addresses relative to the member, which in a solid
+    /// group is not the stream.
+    file_start: u64,
     // current block context
     cur_block_size: usize,
     block_parsing_finished: bool,
@@ -381,9 +391,10 @@ fn parse_tables(u: &mut Unpacker, br: &mut BitReader, p: &[u8]) -> Result<(), Li
         return Err(err("bad bit-length table"));
     }
 
-    let mut table = [0u8; HUFF_TABLE_SIZE];
+    let table_size = HUFF_NC + u.dist_codes + HUFF_RC + HUFF_LDC;
+    let mut table = [0u8; HUFF_TABLE_SIZE_MAX];
     let mut i = 0usize;
-    while i < HUFF_TABLE_SIZE {
+    while i < table_size {
         // Guard against a runaway bit reader on malformed input.
         if br.in_addr >= u.cur_block_size + 4 {
             return Err(err("table bit reader overrun"));
@@ -406,7 +417,7 @@ fn parse_tables(u: &mut Unpacker, br: &mut BitReader, p: &[u8]) -> Result<(), Li
             if i == 0 {
                 return Err(err("repeat with no previous code"));
             }
-            while n > 0 && i < HUFF_TABLE_SIZE {
+            while n > 0 && i < table_size {
                 table[i] = table[i - 1];
                 i += 1;
                 n -= 1;
@@ -422,7 +433,7 @@ fn parse_tables(u: &mut Unpacker, br: &mut BitReader, p: &[u8]) -> Result<(), Li
                 n += 11;
                 br.skip(7);
             }
-            while n > 0 && i < HUFF_TABLE_SIZE {
+            while n > 0 && i < table_size {
                 table[i] = 0;
                 i += 1;
                 n -= 1;
@@ -435,10 +446,10 @@ fn parse_tables(u: &mut Unpacker, br: &mut BitReader, p: &[u8]) -> Result<(), Li
         return Err(err("bad literal table"));
     }
     idx += HUFF_NC;
-    if !create_decode_tables(&table[idx..], &mut u.dd, HUFF_DC) {
+    if !create_decode_tables(&table[idx..], &mut u.dd, u.dist_codes) {
         return Err(err("bad distance table"));
     }
-    idx += HUFF_DC;
+    idx += u.dist_codes;
     if !create_decode_tables(&table[idx..], &mut u.ldd, HUFF_LDC) {
         return Err(err("bad low-distance table"));
     }
@@ -537,6 +548,9 @@ fn do_uncompress_block(u: &mut Unpacker, br: &mut BitReader, p: &[u8]) -> Result
         } else if num >= 262 {
             let mut len = decode_code_length(br, p, num - 262);
             let dist_slot = decode_number(br, &u.dd, p);
+            if dist_slot as usize >= HUFF_DC {
+                return Err(err("distance beyond the window"));
+            }
             let dbits: i32;
             let mut dist: i64 = 1;
             if dist_slot < 4 {
@@ -666,7 +680,8 @@ fn run_filter(u: &mut Unpacker, flt: &FilterInfo) -> Result<(), LimitHit> {
                     let b = buf[i];
                     i += 1;
                     if b == 0xE8 || (extended && b == 0xE9) {
-                        let offset = ((i as u64 + flt.block_start) % file_size as u64) as u32;
+                        let at = (i as u64 + flt.block_start).saturating_sub(u.file_start);
+                        let offset = (at % file_size as u64) as u32;
                         let addr = read_u32(&buf, i);
                         if addr & 0x8000_0000 != 0 {
                             if (addr.wrapping_add(offset)) & 0x8000_0000 == 0 {
@@ -693,7 +708,8 @@ fn run_filter(u: &mut Unpacker, flt: &FilterInfo) -> Result<(), LimitHit> {
                 while i + 3 < blen {
                     if buf[i + 3] == 0xEB {
                         let mut offset = read_u32(&buf, i) & 0x00ff_ffff;
-                        offset = offset.wrapping_sub(((i as u64 + flt.block_start) / 4) as u32);
+                        let at = (i as u64 + flt.block_start).saturating_sub(u.file_start);
+                        offset = offset.wrapping_sub((at / 4) as u32);
                         offset = (offset & 0x00ff_ffff) | 0xeb00_0000;
                         out[i..i + 4].copy_from_slice(&offset.to_le_bytes());
                     }
@@ -743,8 +759,18 @@ pub struct Unpacker50 {
 }
 
 impl Unpacker50 {
-    /// All members of a solid group share the window, so it is sized once, from
-    /// the first member.
+    /// A decoder for the member whose file header holds `comp_info`: its window
+    /// and its algorithm version. All members of a solid group share the
+    /// window, so it is sized once, from the first member.
+    pub fn for_member(comp_info: u64) -> Result<Self, LimitHit> {
+        let mut dec = Self::new(window_size_from_comp_info(comp_info))?;
+        if rar7_algorithm(comp_info) {
+            dec.u.dist_codes = HUFF_DCX;
+        }
+        Ok(dec)
+    }
+
+    /// A decoder for the RAR 5.0 algorithm on a `window_size` window.
     pub fn new(window_size: u64) -> Result<Self, LimitHit> {
         if window_size == 0 || window_size > MAX_WINDOW_SIZE || !window_size.is_power_of_two() {
             return Err(err("invalid window size"));
@@ -767,6 +793,8 @@ impl Unpacker50 {
                 dd: DecodeTable::new(),
                 ldd: DecodeTable::new(),
                 rd: DecodeTable::new(),
+                dist_codes: HUFF_DC,
+                file_start: 0,
                 cur_block_size: 0,
                 block_parsing_finished: true,
                 last_block: false,
@@ -803,6 +831,7 @@ impl Unpacker50 {
             self.u.last_block_length = 0;
             self.u.window_buf.fill(0);
         }
+        self.u.file_start = self.u.last_write_ptr;
         self.u.filters.clear();
         self.u.block_parsing_finished = true;
         self.u.last_block = false;
@@ -914,15 +943,27 @@ pub fn unpack50(
     Unpacker50::new(window_size)?.member(packed, unpacked_size, false, budget)
 }
 
-/// Compute the RAR5 window size from the file header's `comp_info` field.
-/// Returns 0 for directories / unsupported sizes.
+/// Whether `comp_info` selects the RAR 7 algorithm: version 1 (bits 0..5),
+/// unless bit 20 says the data is the version 0 algorithm all the same.
+fn rar7_algorithm(comp_info: u64) -> bool {
+    comp_info & 0x3f == 1 && comp_info & 0x10_0000 == 0
+}
+
+/// The window to decode the member whose file header holds `comp_info` in: its
+/// dictionary, 128 KiB << bits 10..14, plus for version 1 that size times bits
+/// 15..19 over 32, rounded up to a power of two. No distance reaches past the
+/// dictionary, so the larger window decodes the same bytes. 0 for a dictionary
+/// over [`MAX_WINDOW_SIZE`].
 pub fn window_size_from_comp_info(comp_info: u64) -> u64 {
-    let shift = (comp_info >> 10) & 15;
-    let ws = G_UNPACK_WINDOW_SIZE << shift;
-    if ws > MAX_WINDOW_SIZE {
+    let base = G_UNPACK_WINDOW_SIZE << ((comp_info >> 10) & 0x1f);
+    let mut dict = base;
+    if comp_info & 0x3f == 1 {
+        dict += base / 32 * ((comp_info >> 15) & 0x1f);
+    }
+    if dict > MAX_WINDOW_SIZE {
         0
     } else {
-        ws
+        dict.next_power_of_two()
     }
 }
 
@@ -935,6 +976,63 @@ mod tests {
     fn window_size_calc() {
         assert_eq!(window_size_from_comp_info(0), 0x20000);
         assert_eq!(window_size_from_comp_info(1 << 10), 0x40000);
+        // The size field is 5 bits: N = 16 is 8 GiB, past the cap, not 128 KiB.
+        assert_eq!(window_size_from_comp_info(16 << 10), 0);
+        // Version 1: 4 MiB plus 8/32 of it, rounded up to the next power of two.
+        assert_eq!(
+            window_size_from_comp_info(1 | (5 << 10) | (8 << 15)),
+            8 << 20
+        );
+        // The fraction bits mean nothing in a version 0 header.
+        assert_eq!(window_size_from_comp_info((5 << 10) | (8 << 15)), 4 << 20);
+    }
+
+    /// The ARM filter converts branch targets relative to the start of the
+    /// member, so a block 64 bytes into a member converts the same whether
+    /// the member starts the stream or follows 5000 bytes of another one in
+    /// a solid group. A `BL` whose stored target is its own word index,
+    /// 64 / 4, decodes to offset 0.
+    #[test]
+    fn the_arm_filter_counts_from_the_start_of_its_member() {
+        let mut block = Vec::new();
+        for i in 0..64u32 {
+            let word = if i % 3 == 0 {
+                0xeb00_0000 | (i * 4099)
+            } else {
+                i * 0x0101_0101
+            };
+            block.extend_from_slice(&word.to_le_bytes());
+        }
+        block[..4].copy_from_slice(&(0xeb00_0000u32 | 16).to_le_bytes());
+        let run = |member_start: u64| -> Vec<u8> {
+            let mut d = Unpacker50::new(1 << 17).unwrap();
+            let u = &mut d.u;
+            let at = member_start + 64;
+            for (i, &b) in block.iter().enumerate() {
+                let w = ((at + i as u64) as usize) & u.window_mask;
+                u.window_buf[w] = b;
+            }
+            u.file_start = member_start;
+            u.cap = u64::MAX;
+            let f = FilterInfo {
+                kind: FilterType::Arm,
+                channels: 0,
+                block_start: at,
+                block_length: block.len() as u64,
+            };
+            run_filter(u, &f).unwrap();
+            u.out.clone()
+        };
+        let alone = run(0);
+        assert_eq!(&alone[..4], &0xeb00_0000u32.to_le_bytes());
+        assert_eq!(run(5000), alone, "converted relative to the solid stream");
+    }
+
+    #[test]
+    fn the_rar7_algorithm_is_version_1_without_bit_20() {
+        assert!(rar7_algorithm(1));
+        assert!(!rar7_algorithm(0));
+        assert!(!rar7_algorithm(1 | 0x10_0000));
     }
 
     #[test]

@@ -3,11 +3,12 @@
 //! Every drift between them found so far was silent and reader-facing: a flag
 //! renamed in the code and left standing in a table, a page telling an operator
 //! to run something the binary rejects. Nothing else in the build compares the
-//! two — the docs build checks links and frontmatter, not whether the commands
-//! on the page can be typed — so this does.
+//! two (the docs build checks links and frontmatter, not whether the commands
+//! on the page can be typed), so this does.
 //!
 //! Skipped, not failed, when `www/` is absent: the published crate ships without
-//! it, and a test that cannot see the docs has nothing to say about them.
+//! it, and a test that cannot see the docs has nothing to say about them. In a
+//! checkout, a page these tests read that has moved fails them.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,22 @@ fn repo_root() -> PathBuf {
         .nth(2)
         .expect("repo root above crates/exav")
         .to_path_buf()
+}
+
+/// `rel` under the repository root, `None` when `www/` is absent (the
+/// published crate). With `www/` there, `rel` must exist.
+fn docs_path(rel: &str) -> Option<PathBuf> {
+    let root = repo_root();
+    if !root.join("www").is_dir() {
+        eprintln!("skipping: {} is absent", root.join("www").display());
+        return None;
+    }
+    let p = root.join(rel);
+    assert!(
+        p.exists(),
+        "{rel} is missing: the docs moved, update the path here"
+    );
+    Some(p)
 }
 
 /// Long flags the binary really has, from `--help`.
@@ -93,12 +110,9 @@ fn flags_in(path: &Path) -> BTreeSet<String> {
 /// Every flag exav really has is written down somewhere a reader can find it.
 #[test]
 fn every_flag_is_documented() {
-    let root = repo_root();
-    let cli = root.join("www/src/content/docs/reference/cli.md");
-    if !cli.exists() {
-        eprintln!("skipping: {} is absent", cli.display());
+    let Some(cli) = docs_path("www/src/content/docs/scanner/reference/cli.md") else {
         return;
-    }
+    };
     let documented = flags_in(&cli);
     let undocumented: Vec<_> = flags_in_help()
         .into_iter()
@@ -108,8 +122,8 @@ fn every_flag_is_documented() {
     assert!(
         undocumented.is_empty(),
         "these flags exist but are in no table on the CLI reference page:\n  {}\n\n\
-         A flag nobody can find is a flag nobody uses — add it to \
-         www/src/content/docs/reference/cli.md.",
+         A flag nobody can find is a flag nobody uses: add it to \
+         www/src/content/docs/scanner/reference/cli.md.",
         undocumented.join("\n  ")
     );
 }
@@ -124,11 +138,9 @@ fn every_flag_is_documented() {
 #[test]
 fn every_documented_exav_command_uses_real_flags() {
     let root = repo_root();
-    let docs = root.join("www/src/content/docs");
-    if !docs.exists() {
-        eprintln!("skipping: {} is absent", docs.display());
+    let Some(docs) = docs_path("www/src/content/docs") else {
         return;
-    }
+    };
     let real = flags_in_help();
 
     let mut bad: Vec<String> = Vec::new();
@@ -164,7 +176,7 @@ fn every_documented_exav_command_uses_real_flags() {
             if !rest.starts_with('-') && !rest.contains(" -") {
                 continue;
             }
-            // Some examples exist to show a command being REFUSED — the
+            // Some examples exist to show a command being REFUSED: the
             // migration guide demonstrates the error a renamed flag produces.
             // The refusal quoted underneath is the marker: it is what the reader
             // is being shown, so a command followed by one is meant to fail.
@@ -229,7 +241,7 @@ fn every_documented_exav_command_uses_real_flags() {
 fn the_help_text_only_names_flags_exav_has() {
     // Flags the help names on purpose that exav does not have. Each is either
     // another tool's, or a spelling being explained precisely because it is not
-    // the one exav uses — the sentences would be wrong without them. Kept
+    // the one exav uses; the sentences would be wrong without them. Kept
     // explicit and short so adding one is a decision rather than a habit.
     const NOT_EXAVS: &[(&str, &str)] = &[
         ("features", "cargo's, in `--features http-update`"),
@@ -306,7 +318,7 @@ fn the_help_text_only_names_flags_exav_has() {
 ///
 /// `--help` is not the only place a flag name is written down. A runtime warning
 /// told operators to "set a smaller `--max-memory`", a flag that has never
-/// existed — and it fires on any host where the per-job budget exceeds RAM, so
+/// existed, and it fires on any host where the per-job budget exceeds RAM, so
 /// it is one of the messages people see most. Advice naming a flag that does not
 /// parse is worse than no advice: it reads as authoritative and costs a retry to
 /// disprove.
@@ -317,7 +329,7 @@ fn the_help_text_only_names_flags_exav_has() {
 #[test]
 fn every_flag_named_in_a_message_exists() {
     // Mentions that are not exav flags: another tool's, or a spelling discussed
-    // precisely because exav does not use it. Short and explicit — each entry is
+    // precisely because exav does not use it. Short and explicit: each entry is
     // a decision, and the list not growing is the point.
     const NOT_EXAVS: &[&str] = &[
         // clamscan's, named in the flag-mapping hints and the matrix references.
@@ -329,6 +341,7 @@ fn every_flag_named_in_a_message_exists() {
         "copy",
         "max-filesize",
         "max-scansize",
+        "pcre-max-filesize",
         "max-recursion",
         "max-files",
         "suppress-ok-results",
@@ -348,6 +361,8 @@ fn every_flag_named_in_a_message_exists() {
         "alert-phishing-cloak",
         "alert-partition-intersection",
         "alert-encrypted",
+        "alert-encrypted-archive",
+        "alert-encrypted-doc",
         "alert-exceeds-max",
         "structured-ssn-count",
         "structured-cc-count",
@@ -361,6 +376,9 @@ fn every_flag_named_in_a_message_exists() {
         // Spellings named to explain why they are not the ones exav uses.
         "max-depth",
         "password",
+        // Removed from exav, named in the error that says what replaced it.
+        "max-extracted-bytes",
+        "build-shard-bytes",
     ];
 
     let real = flags_in_help();
@@ -424,7 +442,7 @@ fn every_flag_named_in_a_message_exists() {
     }
     // Named messages rather than a count: a threshold passes as soon as the
     // scan finds anything, and what matters is that it reaches the places a flag
-    // name is actually printed — a refusal, a fallback warning, a missing-input
+    // name is actually printed: a refusal, a fallback warning, a missing-input
     // error. If one of these stops being mentioned, this test has stopped
     // reading the file it was written for.
     for expect in ["connect", "listen", "workers", "spill-dir"] {
@@ -456,11 +474,10 @@ fn every_flag_named_in_a_message_exists() {
 /// that true for the whole column rather than the few flags someone got to.
 #[test]
 fn docs_name_the_exav_flag_for_every_renamed_clamscan_flag() {
-    let matrix = repo_root().join("www/src/content/docs/reference/clamav-flag-matrix.md");
-    if !matrix.exists() {
-        eprintln!("skipping: {} is absent", matrix.display());
+    let Some(matrix) = docs_path("www/src/content/docs/scanner/reference/clamav-flag-matrix.md")
+    else {
         return;
-    }
+    };
     let text = std::fs::read_to_string(&matrix).expect("read the flag matrix");
 
     let mut renamed: BTreeSet<String> = BTreeSet::new();
@@ -521,7 +538,7 @@ fn docs_name_the_exav_flag_for_every_renamed_clamscan_flag() {
 /// The environment-variable spelling the CLI reference promises is the one the
 /// binary reads: uppercase, dashes to underscores, `EXAV_` in front.
 ///
-/// A variable that does not follow it is unreachable in practice — nobody looks
+/// A variable that does not follow it is unreachable in practice: nobody looks
 /// it up, they derive it from the flag.
 #[test]
 fn env_var_names_follow_the_documented_rule() {
@@ -573,5 +590,78 @@ fn env_var_names_follow_the_documented_rule() {
         wrong.is_empty(),
         "these variables do not match the rule the CLI reference states:\n  {}",
         wrong.join("\n  ")
+    );
+}
+
+/// Every `EXAV_*` variable the code reads is a flag's, or a diagnostic named
+/// `EXAV_DEBUG_*`: the configuration reference says so, and an operator
+/// reading an `EXAV_*` name elsewhere takes it for a setting.
+#[test]
+fn every_variable_is_a_flag_or_a_debug_one() {
+    let out = Command::new(env!("CARGO_BIN_EXE_exav"))
+        .arg("--help")
+        .output()
+        .expect("run exav --help");
+    let help = String::from_utf8_lossy(&out.stdout);
+    let flags: BTreeSet<String> = help
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("[env: "))
+        .map(|rest| {
+            rest.chars()
+                .take_while(|c| *c != '=' && *c != ']')
+                .collect()
+        })
+        .collect();
+    assert!(
+        flags.len() > 40,
+        "only {} flag variables parsed",
+        flags.len()
+    );
+    // Read only to tell whoever still sets it what replaced it.
+    let removed = ["EXAV_MAX_EXTRACTED_BYTES", "EXAV_BUILD_SHARD_BYTES"];
+
+    let mut files = Vec::new();
+    let mut dirs = vec![repo_root().join("crates")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            let name = e.file_name();
+            if p.is_dir() && name != "target" && name != "node_modules" {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                files.push(p);
+            }
+        }
+    }
+    let mut stray = BTreeSet::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap();
+        for call in [
+            "var(\"",
+            "var_os(\"",
+            "env(\"",
+            "set_var(\"",
+            "remove_var(\"",
+        ] {
+            for (at, _) in text.match_indices(call) {
+                let rest = &text[at + call.len()..];
+                if !rest.starts_with("EXAV_") {
+                    continue;
+                }
+                let var: String = rest.chars().take_while(|c| *c != '"').collect();
+                if !var.starts_with("EXAV_DEBUG_")
+                    && !flags.contains(&var)
+                    && !removed.contains(&var.as_str())
+                {
+                    stray.insert(format!("{var} ({})", f.display()));
+                }
+            }
+        }
+    }
+    assert!(files.len() > 100, "only {} sources found", files.len());
+    assert!(
+        stray.is_empty(),
+        "read, but neither a flag's variable nor `EXAV_DEBUG_*`:\n  {}",
+        stray.into_iter().collect::<Vec<_>>().join("\n  ")
     );
 }

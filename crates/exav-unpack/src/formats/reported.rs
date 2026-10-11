@@ -38,11 +38,6 @@ use crate::{Budget, Entry, Format, LimitHit, Sink};
 /// on it).
 fn report_of(fmt: Format) -> Option<(&'static str, &'static str, bool)> {
     Some(match fmt {
-        Format::Egg => (
-            "egg-archive",
-            "EGG archive: exav has no decoder, so its members were not examined",
-            false,
-        ),
         Format::IshieldMsi => (
             "ishield-msi",
             "InstallShield MSI installer: exav has no unpacker, so its embedded \
@@ -108,7 +103,6 @@ mod tests {
     /// One sample per format, shaped so [`super::super::sniff`] claims it.
     fn samples() -> Vec<(Format, Vec<u8>)> {
         let mut v: Vec<(Format, Vec<u8>)> = vec![
-            (Format::Egg, b"EGGA\x01\x00padding".to_vec()),
             (
                 Format::CryptFf,
                 [
@@ -182,7 +176,7 @@ mod tests {
         // distinction is the only reason both verdicts exist.
         let seen = members(Format::CryptFf, &sample_for(Format::CryptFf));
         assert!(seen[0].encrypted, "CryptFF is encrypted, and must say so");
-        for fmt in [Format::Lrzip, Format::Egg, Format::IshieldCab] {
+        for fmt in [Format::Lrzip, Format::IshieldCab] {
             let seen = members(fmt, &sample_for(fmt));
             assert!(
                 !seen[0].encrypted,
@@ -205,6 +199,9 @@ mod tests {
     #[test]
     fn a_format_this_module_does_not_speak_for_is_declined() {
         let seen = members(Format::Zip, b"PK\x03\x04whatever");
+        assert!(seen.is_empty());
+        // EGG is decoded (formats/egg.rs), so it is not reported here.
+        let seen = members(Format::Egg, b"EGGA\x01\x00padding");
         assert!(seen.is_empty());
     }
 }

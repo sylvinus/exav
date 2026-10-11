@@ -56,17 +56,19 @@ pub(crate) struct IcapConfig {
     /// pointing at those aliases are not going to be reconfigured just because
     /// the server behind them changed.
     pub services: Vec<String>,
-    /// Bytes advertised in the `Preview` header of an `OPTIONS` response — how
-    /// much of a body a client should send before pausing for a verdict.
-    pub preview_size: usize,
+    /// Bytes advertised in the `Preview` header of an `OPTIONS` response: how
+    /// much of a body a client should send before pausing for a verdict. `None`
+    /// leaves the header out.
+    pub preview_size: Option<usize>,
     /// Value of the `Transfer-Preview` header in an `OPTIONS` response. `*`
     /// asks the client to preview every object.
     pub transfer_preview: String,
     /// Concurrent connections accepted, and the value advertised as
     /// `Max-Connections`. c-icap `MaxServers` x `ThreadsPerChild`.
     pub max_connections: usize,
-    /// Seconds a client may cache the `OPTIONS` answer (`Options-TTL`).
-    pub options_ttl: u32,
+    /// Seconds a client may cache the `OPTIONS` answer (`Options-TTL`). `None`
+    /// leaves the header out, which RFC 3507 reads as never expiring.
+    pub options_ttl: Option<u32>,
     /// Requests served on one connection before it is closed. c-icap
     /// `MaxKeepAliveRequests`.
     pub keepalive_requests: u64,
@@ -116,10 +118,10 @@ impl Default for IcapConfig {
                 "srv_clamav".to_string(),
                 "virus_scan".to_string(),
             ],
-            preview_size: 4096,
+            preview_size: Some(4096),
             transfer_preview: "*".to_string(),
             max_connections: 100,
-            options_ttl: 3600,
+            options_ttl: Some(3600),
             keepalive_requests: 100,
             idle_timeout: Duration::from_secs(600),
             max_drain_bytes: crate::daemon::MAX_DRAIN_BYTES,

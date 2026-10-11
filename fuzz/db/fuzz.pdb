@@ -1,0 +1,4 @@
+H:paypal.com
+H:examplebank.test
+R:.+\.examplebank\.test:.*
+R:.*login.*:.*

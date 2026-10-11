@@ -58,7 +58,7 @@ pub(crate) fn emulate_pe(
         trace,
         ..Default::default()
     };
-    let r = x86::run::unpack(data, &limits);
+    let r = crate::profile::timed("emu", data.len() as u64, || x86::run::unpack(data, &limits));
     let mut line = format!(
         "ticks={} dirty={}KiB stop={}",
         r.ticks,
@@ -177,7 +177,7 @@ impl<'a> Pe<'a> {
         let mut sections = Vec::with_capacity(num_sections);
         for i in 0..num_sections {
             let s = sec_table + i * 40;
-            let hdr = data.get(s..s + 40)?;
+            let hdr = crate::bytes::at(data, s, 40)?;
             let mut name = [0u8; 8];
             name.copy_from_slice(&hdr[..8]);
             sections.push(Section {
@@ -345,7 +345,7 @@ fn identify(pe: &Pe) -> Option<Packer> {
     // begin the decompressor with a distinctive load of the packed-source and
     // destination pointers. Match at the entry-point file offset only.
     if let Some(off) = pe.rva_to_off(pe.entry_rva) {
-        if let Some(win) = pe.data.get(off..off + 2) {
+        if let Some(win) = crate::bytes::at(pe.data, off, 2) {
             // `BE xx xx xx xx` (mov esi, imm32) is the canonical FSG 2.0 stub
             // opener; require it to sit right at the entry point.
             if win[0] == 0xBE && fsg_stub_plausible(pe, off) {
@@ -636,7 +636,7 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
     let mut total = 0u32;
     for i in 0..32usize {
         let d = dir_off + i * 20;
-        let Some(desc) = data.get(d..d + 20) else {
+        let Some(desc) = crate::bytes::at(data, d, 20) else {
             break;
         };
         let orig = u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]);
@@ -648,7 +648,7 @@ fn import_count(pe: &Pe, data: &[u8]) -> u32 {
         let Some(mut off) = rva_to_file_offset(pe, thunks) else {
             continue;
         };
-        while let Some(v) = data.get(off..off + 4) {
+        while let Some(v) = crate::bytes::at(data, off, 4) {
             if u32::from_le_bytes([v[0], v[1], v[2], v[3]]) == 0 {
                 break;
             }
@@ -825,8 +825,8 @@ pub(crate) enum Recovered<R> {
 /// Instruction budget for one stub. Runtime packers spend on the order of a
 /// hundred instructions per byte they produce, so this is what bounds the size
 /// of image the emulator can follow to completion — and what bounds the CPU a
-/// hostile file can demand. At roughly 20M ticks a second it is a few seconds
-/// in the worst case, and only for files that already look packed.
+/// hostile file can demand. At tens of millions of ticks a second it is a few
+/// seconds in the worst case, and only for files that already look packed.
 #[cfg(feature = "pe-emu")]
 const MAX_EMU_TICKS: u64 = 120_000_000;
 
@@ -864,13 +864,29 @@ pub(crate) fn emulated_unpack<R>(
 ) -> Result<Recovered<R>, LimitHit> {
     budget.count_entry()?;
     let cap = budget.reserve()?.min(MAX_INNER as u64) as usize;
+    let room = budget.pe_emulation_room();
+    if room == 0 {
+        return Err(budget.pe_emulation_exhausted());
+    }
     let limits = x86::run::EmuLimits {
-        max_ticks: MAX_EMU_TICKS,
+        max_ticks: MAX_EMU_TICKS.min(room),
         max_dump: cap.min(MAX_EMU_DUMP),
         max_pages: cap.min(MAX_EMU_MEMORY) / exav_pe_emu::PAGE_SIZE,
         ..Default::default()
     };
-    let report = x86::run::unpack(data, &limits);
+    let report =
+        crate::profile::timed("emu", data.len() as u64, || x86::run::unpack(data, &limits));
+    budget.charge_pe_emulation(report.ticks);
+    // The per-stub cap ending a run is the emulator's normal behavior; the
+    // scan-wide one ending it means this stub was not given its full share.
+    let cut_short = limits.max_ticks < MAX_EMU_TICKS && report.ticks >= limits.max_ticks;
+    let ended = |budget: &Budget, done: Recovered<R>| {
+        if cut_short {
+            Err(budget.pe_emulation_exhausted())
+        } else {
+            Ok(done)
+        }
+    };
 
     // Payloads the stub built in memory it allocated. Emitted whether or not it
     // also rebuilt its own image: a loader that unfolds the original program
@@ -890,12 +906,13 @@ pub(crate) fn emulated_unpack<R>(
         }
     }
 
+    let fallback = if emitted {
+        Recovered::Emitted
+    } else {
+        Recovered::Nothing
+    };
     let Some(unpacked) = report.unpacked else {
-        return Ok(if emitted {
-            Recovered::Emitted
-        } else {
-            Recovered::Nothing
-        });
+        return ended(budget, fallback);
     };
     // The same output gate the static path uses: only a buffer that reads back
     // as a PE image is emitted. A run that ended mid-decompression leaves the
@@ -903,11 +920,7 @@ pub(crate) fn emulated_unpack<R>(
     // rejects is a dump whose headers the stub overwrote with something else,
     // where there is no way to tell code from rubble.
     if !looks_like_pe(&unpacked.data) {
-        return Ok(if emitted {
-            Recovered::Emitted
-        } else {
-            Recovered::Nothing
-        });
+        return ended(budget, fallback);
     }
     let name = if unpacked.reached_oep {
         format!("{label}-emulated")
@@ -918,13 +931,13 @@ pub(crate) fn emulated_unpack<R>(
     if let Some(r) = visit(Entry::new(name, unpacked.data), budget) {
         return Ok(Recovered::Halt(r));
     }
-    Ok(Recovered::Emitted)
+    ended(budget, Recovered::Emitted)
 }
 
 fn packer_name(p: Packer) -> &'static str {
     // The vendor's own capitalisation, and the single source of truth for it.
     // These strings reach the user twice — in the member name and, with
-    // `--alert-packed`, inside `Heuristics.Packed.<name>` — and a gateway
+    // `--detect packed`, inside `Heuristics.Packed.<name>` — and a gateway
     // filtering on an exact string needs the name the vendor uses. Spelling them
     // once here means the scanner never has to re-derive a display name, so the
     // two can't drift apart and a packer added below is reportable immediately.
@@ -1264,7 +1277,7 @@ mod tests {
         for junk in [&b"MZ"[..], b"MZ\x00\x00", b"MZ\xff\xff\xff\xff garbage"] {
             let _ = is_pepack(junk);
             let mut b = Budget::new(Limits::default());
-            let _ = extract(Format::PePacked, junk, &mut b);
+            let _ = extract(Format::PePacked, &junk, &mut b);
         }
     }
 

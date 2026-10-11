@@ -1,0 +1,153 @@
+[package]
+name = "exav-render"
+description = "Memory-safe decoders that turn files into something to draw: images into pixels, DWG and DXF drawings and IFC and STL models into GPU-ready geometry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["image", "dwg", "ifc", "decoder", "cad"]
+categories = ["multimedia::images", "rendering::data-formats"]
+readme = "README.md"
+# The stroke font the build script compiles in, and its licence.
+include = ["src/**/*", "fonts/**/*", "build.rs", "README.md", "LICENSE"]
+
+# The vendored `tiff` decoder's doc examples are written for it as a crate of
+# its own: here their `use tiff::...` cannot resolve.
+[lib]
+doctest = false
+
+[dependencies]
+# The decoders are at the versions libclamav 1.5.4 links, so that exav-imagehash
+# reproduces ClamAV's hash bit for bit. JPEG and TIFF are not `image` features:
+# they go through `src/image_codecs/`, `image`'s own decoders over zune-jpeg
+# built without its SIMD code (its only `unsafe`), which `image` and `tiff`
+# cannot turn off. Pinned with `=` for `cargo install`, which resolves without
+# Cargo.lock.
+image = { version = "=0.25.9", default-features = false, features = ["png", "gif", "bmp"], optional = true }
+png = { version = "=0.18.0", optional = true }
+gif = { version = "=0.14.1", optional = true }
+zune-jpeg = { version = "=0.5.8", default-features = false, features = ["std"], optional = true }
+zune-core = { version = "=0.5.0", optional = true }
+zune-core-04 = { package = "zune-core", version = "=0.4.12", optional = true }
+# The vendored `tiff` decoder's dependencies, as tiff 0.10.3 has them, and
+# `bytemuck` for its byte casts.
+zune-jpeg-04 = { package = "zune-jpeg", version = "=0.4.21", default-features = false, features = ["std"], optional = true }
+fax34 = { package = "fax", version = "=0.2.6", optional = true }
+flate2 = { version = "1.0.20", optional = true }
+half = { version = "2.4.1", optional = true }
+quick-error = { version = "2.0.1", optional = true }
+# Also `gif`'s LZW. 0.1.12, not libclamav's 0.1.10: it only corrects a debug
+# assertion that a TIFF stream without a clear code tripped; it decodes the same.
+weezl = { version = "=0.1.12", optional = true }
+bytemuck = { version = "1", optional = true }
+# JPEG 2000, JBIG2 and CCITT fax, which libclamav does not decode.
+# `forbid(unsafe_code)` crates, built without `simd` (fearless_simd, whose
+# intrinsics are `unsafe`) and `image` (the `image` and moxcms integration).
+# hayro-ccitt is hayro-jbig2's own MMR decoder.
+hayro-jpeg2000 = { version = "=0.4.1", default-features = false, features = ["std"], optional = true }
+hayro-jbig2 = { version = "=0.3.1", default-features = false, features = ["std"], optional = true }
+hayro-ccitt = { version = "=0.4.0", optional = true }
+# DXF's pairs, records and code pages, and DWG's bit codes, sections and
+# objects, which the drawing model (`cad`) is read from; those formats
+# alone, none of the scanner's others.
+exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["dxf", "dwg"], optional = true }
+
+[features]
+default = ["image", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2", "ccitt"]
+# Raster images: PNG, GIF, JPEG, TIFF and BMP, plus the formats below.
+image = [
+    "dep:image", "dep:png", "dep:gif", "dep:zune-jpeg", "dep:zune-core", "dep:zune-core-04",
+    "dep:zune-jpeg-04", "dep:fax34", "dep:flate2", "dep:half", "dep:quick-error", "dep:weezl",
+    "dep:bytemuck",
+]
+# Each is a decoder without `unsafe`: image-webp and qoi are
+# `forbid(unsafe_code)`, the others are `image`'s own. OpenEXR is left out: its
+# crate pulls `rayon-core` and `smallvec`.
+webp = ["image", "image/webp"]
+ico = ["image", "image/ico"]
+pnm = ["image", "image/pnm"]
+qoi = ["image", "image/qoi"]
+dds = ["image", "image/dds"]
+ff = ["image", "image/ff"]
+hdr = ["image", "image/hdr"]
+# JPEG 2000: with `image`, a JP2 or JPX file or a raw codestream (.j2k,
+# .j2c); and a PDF's JPXDecode streams (`pdf_image`).
+jp2 = ["dep:hayro-jpeg2000"]
+# JBIG2: with `image`, a single-page JBIG2 file; and a PDF's JBIG2Decode
+# streams (`pdf_image`).
+jbig2 = ["dep:hayro-jbig2"]
+# A PDF's CCITTFaxDecode streams (`pdf_image`).
+ccitt = ["dep:hayro-ccitt"]
+# DXF (R12 to 2018) and DWG (R13 to 2018) into the drawing model
+# (`cad`), tessellated for a GPU.
+dwg = ["dep:exav-unpack"]
+# Print what each layout viewport emitted and what it clipped against.
+vp-debug = ["dwg"]
+# IFC (IFC2X3, IFC4, IFC4X3) models into triangle meshes (`ifc`, `mesh`).
+ifc = []
+# Binary and ASCII STL into the same meshes (`stl`, `mesh`).
+stl = []
+
+[dev-dependencies]
+serde_json = "1"
+# The drawing fixtures are gzipped.
+flate2 = "1.0.20"
+# The DWG oracle test names local corpus files by hash.
+sha2 = "0.11"
+
+[[test]]
+name = "dwg"
+required-features = ["dwg"]
+
+[[test]]
+name = "cad_fixtures"
+required-features = ["dwg"]
+
+[[test]]
+name = "cad_oracle"
+required-features = ["dwg"]
+
+[[test]]
+name = "cad_robust"
+required-features = ["dwg"]
+
+[[test]]
+name = "cad_dwg"
+required-features = ["dwg"]
+
+[[test]]
+name = "cad_dwg_oracle"
+required-features = ["dwg"]
+
+[[test]]
+name = "cad_proxy"
+required-features = ["dwg"]
+
+[[test]]
+name = "ifc"
+required-features = ["ifc"]
+
+[[test]]
+name = "ifc_oracle"
+required-features = ["ifc"]
+
+[[test]]
+name = "stl"
+required-features = ["stl"]
+
+[[example]]
+name = "cad_dump"
+required-features = ["dwg"]
+
+[[example]]
+name = "scene_stats"
+required-features = ["dwg"]
+
+[[example]]
+name = "ifc_stats"
+required-features = ["ifc", "stl"]
+
+[package.metadata.docs.rs]
+all-features = true

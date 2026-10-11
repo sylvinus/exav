@@ -118,3 +118,33 @@ fn pwdb_pool_supplies_decryption_password() {
         other => panic!("expected Infected from .pwdb pool, got {other:?}"),
     }
 }
+
+/// A picture with an encrypted ZIP appended opens as that ZIP in the usual
+/// archive tools, so it is reported like the ZIP would be.
+#[test]
+fn an_encrypted_zip_appended_to_a_picture_is_reported() {
+    let db = builtin_db();
+    let zip = fixture("zip_aes256_store.zip");
+    let mut jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00".to_vec();
+    jpeg.resize(4096, 0x42);
+    jpeg.extend_from_slice(b"\xff\xd9");
+    let polyglot = [&jpeg[..], &zip[..]].concat();
+
+    match analyze(&db, &polyglot, &ScanOptions::default()).verdict {
+        Verdict::PasswordProtected { .. } => {}
+        other => panic!("expected PasswordProtected, got {other:?}"),
+    }
+    match analyze(&db, &polyglot, &with_pw("secret")).verdict {
+        Verdict::Infected { .. } => {}
+        other => panic!("expected Infected with the password, got {other:?}"),
+    }
+
+    // Without its central directory the local header alone does not prove an
+    // archive is there: a chance `PK\x03\x04` looks the same.
+    let cd = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    let headless = [&jpeg[..], &zip[..cd]].concat();
+    assert_eq!(
+        analyze(&db, &headless, &ScanOptions::default()).verdict,
+        Verdict::Clean
+    );
+}

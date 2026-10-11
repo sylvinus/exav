@@ -18,9 +18,9 @@
 //!
 //! Decoding it properly means the setup loader, the compressed header block, the
 //! file-entry table and the per-file chunked LZMA streams, with the layout
-//! changing across setup-data versions. The reference implementation
-//! (`innoextract`) is GPL, so it can be used as an oracle but not as a source;
-//! that is a from-scratch project, not an afternoon.
+//! changing across setup-data versions. The reference implementation,
+//! `innoextract`, is zlib-licensed; following it is still a project of its
+//! own, not an afternoon.
 
 use crate::{Budget, Entry, LimitHit, Sink};
 

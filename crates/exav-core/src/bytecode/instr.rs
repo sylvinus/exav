@@ -103,7 +103,7 @@ pub fn parse_header(rec: &[u8]) -> Result<Function, ParseError> {
         return Err(perr("missing 'L' locals marker"));
     }
     let num_locals = r.number().map_err(m)? as usize;
-    let total = num_args as usize + num_locals;
+    let total = (num_args as usize).saturating_add(num_locals);
     if total > MAX_INSTS_PER_BB {
         return Err(perr("too many locals"));
     }

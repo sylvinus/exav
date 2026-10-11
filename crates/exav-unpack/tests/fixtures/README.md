@@ -36,3 +36,33 @@ neither compiled in.
 `scripts/release.sh` re-checks the whole tracked tree with `clamscan` when a
 signature database is present, so a fixture committed in the clear is caught
 before it ships.
+
+## Real malware is never committed
+
+Committed fixtures carry EICAR or synthetic payloads only, masked as above
+when a scanner reacts to them. A few suites also run on real in-the-wild
+samples (`chm/`, `lnk/`, `nsis/`, `onenote/`) when a developer has them
+locally. Those are:
+
+* named `real-malware-*`, which `.gitignore` excludes, and never committed;
+* kept as `<name>.zip`: a ZIP holding the one sample, AES-256 encrypted with
+  the password `infected`, the convention MalwareBazaar distributes samples in;
+* listed with their sha256 in the directory's `README.md`, for re-download.
+
+`read_fixture(path)` falls back to `<path>.zip` when neither `<path>.xor` nor
+`<path>` exists and decrypts it in memory, so call sites pass the plain name.
+That needs the `zip` and `decrypt` features; a build without them, like a
+checkout without the samples, skips the tests that use them.
+
+To add one (`pip install pyzipper`):
+
+```python
+import pyzipper
+with pyzipper.AESZipFile("real-malware-x.one.zip", "w",
+                         compression=pyzipper.ZIP_DEFLATED,
+                         encryption=pyzipper.WZ_AES) as z:
+    z.setpassword(b"infected")
+    z.write("real-malware-x.one")
+```
+
+then delete the plain file and add its sha256 to the directory's README.

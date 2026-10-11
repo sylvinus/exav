@@ -48,6 +48,12 @@ jobs:
             exit 1
           fi
           docker logs exav
+          # The image's HEALTHCHECK is on the container, and its command works.
+          # Not `docker inspect .State.Health`: the first probe is 30s away.
+          HC=$(docker inspect --format '{{json .Config.Healthcheck.Test}}' exav)
+          echo "healthcheck: $HC"
+          [ "$HC" = '["CMD","/exav","--ping"]' ]
+          docker exec exav /exav --ping
           docker rm -f exav
 
   # Static musl binaries for the published image, cross-compiled natively on
@@ -171,15 +177,19 @@ jobs:
           EXPECTED: application/vnd.docker.distribution.manifest.list.v2+json
         run: |
           set -euo pipefail
-          # Every tag in the set points at the same index, so one is enough.
-          TAG=$(printf '%s\n' "$TAGS" | head -1)
-          docker buildx imagetools inspect "$TAG" --raw > "$RUNNER_TEMP/manifest.json"
-          GOT=$(jq -r '.mediaType' "$RUNNER_TEMP/manifest.json")
-          echo "$TAG -> $GOT"
-          if [ "$GOT" != "$EXPECTED" ]; then
-            echo "::error::published $GOT, expected $EXPECTED -- podman will ignore the image HEALTHCHECK"
-            exit 1
-          fi
+          # The tags are already public when this runs: a failure here is an
+          # alarm to fix and re-publish, not a gate.
+          bad=0
+          while read -r TAG; do
+            [ -n "$TAG" ] || continue
+            GOT=$(docker buildx imagetools inspect "$TAG" --raw | jq -r '.mediaType')
+            echo "$TAG -> $GOT"
+            if [ "$GOT" != "$EXPECTED" ]; then
+              echo "::error::$TAG is already published as $GOT, expected $EXPECTED -- podman will ignore the image HEALTHCHECK"
+              bad=1
+            fi
+          done <<<"$TAGS"
+          exit "$bad"
 
       # The assertion above pins the wire format; this one tests the consumer
       # that the format exists for. podman is preinstalled on ubuntu-latest.

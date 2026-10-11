@@ -31,174 +31,235 @@
 //! which is why this is checked against real `compress` output rather than a
 //! round-trip against a matching encoder.
 
-use crate::{Budget, Entry, LimitHit, Sink};
+use std::io::{self, Read};
+
+use crate::source::{ByteSource, Bytes, Stepper};
 
 const INIT_WIDTH: u32 = 9;
 const MAX_WIDTH_LIMIT: u32 = 16;
 const CLEAR: u16 = 256;
 const FIRST_FREE: u16 = 257;
 
-pub(crate) fn extract_lzw<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    if !super::sniff::is(data, crate::Format::Lzw) {
-        return Ok(None);
-    }
-    budget.count_entry()?;
-    let cap = budget.reserve()?;
-    let (out, truncated) = match decompress(data, cap) {
-        Some(v) => v,
-        // A stream we cannot decode at all: the bytes are here and unread, so
-        // report rather than drop.
-        None => {
-            return Ok(visit(
-                Entry::unsupported(
-                    "lzw-content".to_string(),
-                    data.len() as u64,
-                    false,
-                    "malformed Unix compress (.Z) stream",
-                ),
-                budget,
-            ))
-        }
-    };
-    if truncated {
-        return Ok(visit(
-            Entry::unsupported(
-                "lzw-content".to_string(),
-                out.len() as u64,
-                false,
-                "Unix compress (.Z) stream exceeds the per-member size budget",
-            ),
-            budget,
-        ));
-    }
-    if out.is_empty() {
-        return Ok(None);
-    }
-    budget.commit(out.len() as u64);
-    Ok(visit(Entry::new("lzw-content".to_string(), out), budget))
+/// A decoder over a whole `.Z` file, header included, one code at a time.
+struct Lzw<B> {
+    data: B,
+    max_width: u32,
+    block_mode: bool,
+    /// `prefix`/`suffix` are the classic parallel arrays: entry `c` extends
+    /// entry `prefix[c]` by the byte `suffix[c]`.
+    prefix: Vec<u16>,
+    suffix: Vec<u8>,
+    /// The next free code. 65,536 once a 16-bit table is full, which a `u16`
+    /// cannot hold.
+    next: u32,
+    width: u32,
+    prev: Option<u16>,
+    stack: Vec<u8>,
+    /// Bit cursor over the code stream (after the 3-byte header).
+    bitpos: u64,
+    total_bits: u64,
+    /// Codes are written in groups of eight, and on any width change the
+    /// writer pads to the next group boundary at the OLD width. The boundary is
+    /// measured from a base that MOVES to each padding point, not from the
+    /// start of the file: the reference restarts its input buffer there, so a
+    /// decoder that aligns absolutely drifts after the first width change.
+    base: u64,
 }
 
-/// Decode the LZW stream. Returns `(bytes, hit_cap)`; `None` only when the
-/// header itself is unusable. A stream that ends mid-code is *truncated*, not
-/// corrupt: everything decoded so far is returned, matching the salvage rule for
-/// sequential streams (docs/QUIRKS.md).
-fn decompress(data: &[u8], cap: u64) -> Option<(Vec<u8>, bool)> {
-    let max_width = (data[2] & 0x1f) as u32;
-    let block_mode = data[2] & 0x80 != 0;
-    if !(INIT_WIDTH..=MAX_WIDTH_LIMIT).contains(&max_width) {
-        return None;
+impl<B: Bytes> Lzw<B> {
+    /// `None` when the header is unusable.
+    fn new(mut data: B) -> Option<Self> {
+        if data.len() < 3 {
+            return None;
+        }
+        let flags = data.at(2);
+        let max_width = (flags & 0x1f) as u32;
+        let block_mode = flags & 0x80 != 0;
+        if !(INIT_WIDTH..=MAX_WIDTH_LIMIT).contains(&max_width) {
+            return None;
+        }
+        let table_cap = 1usize << max_width;
+        let total_bits = (data.len() as u64 - 3) * 8;
+        Some(Lzw {
+            data,
+            max_width,
+            block_mode,
+            prefix: vec![0u16; table_cap],
+            suffix: vec![0u8; table_cap],
+            next: u32::from(if block_mode { FIRST_FREE } else { CLEAR }),
+            width: INIT_WIDTH,
+            prev: None,
+            stack: Vec::new(),
+            bitpos: 0,
+            total_bits,
+            base: 0,
+        })
     }
 
-    // `prefix`/`suffix` are the classic parallel arrays: entry `c` extends
-    // entry `prefix[c]` by the byte `suffix[c]`.
-    let table_cap = 1usize << max_width;
-    let mut prefix = vec![0u16; table_cap];
-    let mut suffix = vec![0u8; table_cap];
-    let mut next: u16 = if block_mode { FIRST_FREE } else { CLEAR };
-    let mut width = INIT_WIDTH;
+    fn align_to_group(&mut self) {
+        let group = (self.width as u64) * 8;
+        self.bitpos = self.base + (self.bitpos - self.base).div_ceil(group) * group;
+        self.base = self.bitpos;
+    }
 
-    let mut out: Vec<u8> = Vec::new();
-    let mut stack: Vec<u8> = Vec::new();
-    let mut prev: Option<u16> = None;
-
-    // Bit cursor over the code stream (after the 3-byte header).
-    let bits = &data[3..];
-    let total_bits = (bits.len() as u64) * 8;
-    let mut bitpos: u64 = 0;
-
-    // Codes are written in groups of eight, and on any width change the writer
-    // pads to the next group boundary at the OLD width. The boundary is measured
-    // from a base that MOVES to each padding point, not from the start of the
-    // file: the reference restarts its input buffer there, so a decoder that
-    // aligns absolutely drifts after the first width change.
-    let mut base: u64 = 0;
-    let align_to_group = |pos: u64, base: u64, width: u32| -> u64 {
-        let group = (width as u64) * 8;
-        base + (pos - base).div_ceil(group) * group
-    };
-
-    let read_code = |bitpos: &mut u64, width: u32| -> Option<u16> {
-        if *bitpos + width as u64 > total_bits {
+    fn read_code(&mut self) -> Option<u16> {
+        if self.bitpos + self.width as u64 > self.total_bits {
             return None;
         }
         let mut v: u32 = 0;
-        for i in 0..width {
-            let b = *bitpos + i as u64;
-            let byte = bits[(b / 8) as usize];
+        for i in 0..self.width {
+            let b = self.bitpos + i as u64;
+            let byte = self.data.at(3 + (b / 8) as usize);
             let bit = (byte >> (b % 8)) & 1;
             v |= (bit as u32) << i; // LSB-first
         }
-        *bitpos += width as u64;
+        self.bitpos += self.width as u64;
         Some(v as u16)
-    };
-
-    loop {
-        // Widen before reading, mirroring the writer: it grows the code width as
-        // soon as the table reaches `(1 << width) - 1` entries, and pads to the
-        // next group boundary at the old width as it does so.
-        if width < max_width && next as u32 >= (1u32 << width) {
-            bitpos = align_to_group(bitpos, base, width);
-            base = bitpos;
-            width += 1;
-        }
-        let Some(code) = read_code(&mut bitpos, width) else {
-            break; // ran out of input: truncated, keep what we have
-        };
-
-        if block_mode && code == CLEAR {
-            // A reset is also a width change: pad at the width in force, then
-            // start over at the initial width.
-            bitpos = align_to_group(bitpos, base, width);
-            base = bitpos;
-            next = FIRST_FREE;
-            width = INIT_WIDTH;
-            prev = None;
-            continue;
-        }
-
-        // Rebuild the string for `code` by walking the prefix chain.
-        stack.clear();
-        let mut cur = code;
-        if cur >= next {
-            // KwKwK: the code refers to the entry being defined right now.
-            let p = prev?;
-            stack.push(first_byte(&prefix, &suffix, p));
-            cur = p;
-        }
-        let mut guard = 0usize;
-        while cur >= 256 {
-            if cur as usize >= table_cap || guard > table_cap {
-                return None; // cyclic or out-of-range chain: unusable header state
-            }
-            stack.push(suffix[cur as usize]);
-            cur = prefix[cur as usize];
-            guard += 1;
-        }
-        stack.push(cur as u8);
-        for &b in stack.iter().rev() {
-            out.push(b);
-        }
-        if out.len() as u64 > cap {
-            out.truncate(cap as usize);
-            return Some((out, true));
-        }
-
-        // Define the next table entry from the previous code plus this string's
-        // first byte.
-        if let Some(p) = prev {
-            if (next as usize) < table_cap {
-                prefix[next as usize] = p;
-                suffix[next as usize] = *stack.last().unwrap_or(&0);
-                next += 1;
-            }
-        }
-        prev = Some(code);
     }
-    Some((out, false))
+
+    /// Append the string the next code expands to. `Some(false)` at the end of
+    /// the input (a stream that ends mid-code is truncated, not corrupt),
+    /// `None` for a code the table cannot expand.
+    fn step(&mut self, out: &mut Vec<u8>) -> Option<bool> {
+        let table_cap = self.prefix.len();
+        loop {
+            // Widen before reading, mirroring the writer: it grows the code
+            // width as soon as the table reaches `(1 << width) - 1` entries,
+            // and pads to the next group boundary at the old width as it does
+            // so.
+            if self.width < self.max_width && self.next >= (1u32 << self.width) {
+                self.align_to_group();
+                self.width += 1;
+            }
+            let Some(code) = self.read_code() else {
+                return Some(false);
+            };
+
+            if self.block_mode && code == CLEAR {
+                // A reset is also a width change: pad at the width in force,
+                // then start over at the initial width.
+                self.align_to_group();
+                self.next = u32::from(FIRST_FREE);
+                self.width = INIT_WIDTH;
+                self.prev = None;
+                continue;
+            }
+
+            // Rebuild the string for `code` by walking the prefix chain.
+            self.stack.clear();
+            let mut cur = code;
+            if u32::from(cur) >= self.next {
+                // KwKwK: the code refers to the entry being defined right now.
+                let p = self.prev?;
+                self.stack.push(first_byte(&self.prefix, &self.suffix, p));
+                cur = p;
+            }
+            let mut guard = 0usize;
+            while cur >= 256 {
+                if cur as usize >= table_cap || guard > table_cap {
+                    return None; // cyclic or out-of-range chain
+                }
+                self.stack.push(self.suffix[cur as usize]);
+                cur = self.prefix[cur as usize];
+                guard += 1;
+            }
+            self.stack.push(cur as u8);
+            out.extend(self.stack.iter().rev());
+
+            // Define the next table entry from the previous code plus this
+            // string's first byte.
+            if let Some(p) = self.prev {
+                if (self.next as usize) < table_cap {
+                    self.prefix[self.next as usize] = p;
+                    self.suffix[self.next as usize] = *self.stack.last().unwrap_or(&0);
+                    self.next += 1;
+                }
+            }
+            self.prev = Some(code);
+            return Some(true);
+        }
+    }
+}
+
+/// Walk a `.Z` file: one member, decoded as it is read.
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
+    budget: &mut crate::Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, crate::LimitHit> {
+    use crate::stream::{emit_stream, single_meta};
+    budget.count_entry()?;
+    match content_reader(src) {
+        Some(mut dec) => emit_stream(
+            &single_meta("lzw-content", src, None),
+            &mut dec,
+            budget,
+            visit,
+        ),
+        None => {
+            let meta = single_meta(
+                "lzw-content",
+                src,
+                Some("malformed Unix compress (.Z) stream"),
+            );
+            Ok(visit(&meta, None, budget))
+        }
+    }
+}
+
+/// The content of a `.Z` file as a `Read`, decoded as it is read, for the
+/// streaming walk. `None` when the header is unusable.
+pub(crate) fn content_reader(data: &dyn ByteSource) -> Option<LzwReader<'_>> {
+    Some(LzwReader {
+        src: data,
+        lzw: Lzw::new(Stepper::new(data))?,
+        staged: Vec::new(),
+        taken: 0,
+        done: false,
+    })
+}
+
+pub(crate) struct LzwReader<'a> {
+    src: &'a dyn ByteSource,
+    lzw: Lzw<Stepper<'a>>,
+    /// Decoded bytes not yet handed out.
+    staged: Vec<u8>,
+    taken: usize,
+    done: bool,
+}
+
+impl Read for LzwReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        while self.taken == self.staged.len() && !self.done {
+            self.staged.clear();
+            self.taken = 0;
+            while self.staged.len() < 4096 {
+                match self.lzw.step(&mut self.staged) {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.done = true;
+                        break;
+                    }
+                    None => {
+                        return Err(io::Error::other(self.src.read_error().unwrap_or_else(
+                            || "malformed Unix compress (.Z) stream".to_string(),
+                        )));
+                    }
+                }
+            }
+            // A source that failed reads as zeros: what came from them is not
+            // the content.
+            if let Some(e) = self.src.read_error() {
+                self.done = true;
+                self.staged.clear();
+                return Err(io::Error::other(e));
+            }
+        }
+        let n = (self.staged.len() - self.taken).min(out.len());
+        out[..n].copy_from_slice(&self.staged[self.taken..self.taken + n]);
+        self.taken += n;
+        Ok(n)
+    }
 }
 
 /// First byte of the string a code expands to.
@@ -213,4 +274,30 @@ fn first_byte(prefix: &[u16], suffix: &[u8], mut c: u16) -> u8 {
         let _ = suffix;
     }
     c as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    /// Input the source fails to deliver is a read error, not the end of the
+    /// stream.
+    #[test]
+    fn a_source_that_fails_is_not_taken_for_the_end() {
+        let blob = crate::read_fixture(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/lzw/bigreset.b16.Z"
+        ))
+        .unwrap();
+        let mut all = Vec::new();
+        super::content_reader(&blob)
+            .unwrap()
+            .read_to_end(&mut all)
+            .unwrap();
+        let src = crate::source::short_source(&blob[..1000], blob.len() as u64);
+        let mut part = Vec::new();
+        let read = super::content_reader(&src).unwrap().read_to_end(&mut part);
+        assert!(read.is_err());
+        assert!(part.len() < all.len() && all.starts_with(&part));
+    }
 }

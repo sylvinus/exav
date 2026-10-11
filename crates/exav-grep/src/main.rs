@@ -24,7 +24,7 @@ use exav_unpack::Limits;
 #[derive(Parser)]
 #[command(
     name = "exav-grep",
-    about = "grep that searches inside archives (zip, rar, 7z, tar, iso, OLE, PDF, email — recursively)",
+    about = "grep that searches inside archives, recursively (zip, rar, 7z, tar, iso, OLE, PDF, email)",
     long_about = None,
     version
 )]

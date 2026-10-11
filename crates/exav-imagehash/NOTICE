@@ -1,0 +1,43 @@
+exav-imagehash: third-party notices
+===================================
+
+exav-imagehash is licensed under the MIT License (see LICENSE). Parts of its
+source are derived from other projects; this file gives their notices, and
+each directory's README says what was changed. The notices for the components
+the exav binaries link are in the NOTICE file at the root of the exav
+repository: https://github.com/sylvinus/exav/blob/main/NOTICE
+
+
+image, MIT OR Apache-2.0 (source derivative)
+--------------------------------------------
+
+src/image_codecs/jpeg.rs and src/image_codecs/tiff_image.rs are adapted from
+image 0.25.9's JPEG and TIFF decoders. Used under the MIT License, whose text
+is in src/image_codecs/LICENSE-image.
+
+Upstream: https://github.com/image-rs/image
+The image-rs Developers.
+
+
+tiff, MIT (source derivative)
+-----------------------------
+
+src/image_codecs/tiff/ is vendored from the decoder of tiff 0.10.3, with its
+byte casts done through bytemuck. The license is in
+src/image_codecs/tiff/LICENSE.
+
+Upstream: https://github.com/image-rs/image-tiff
+Copyright (c) 2018 PistonDevelopers
+
+
+Pillow, MIT-CMU (source derivative)
+-----------------------------------
+
+src/pillow.rs ports Pillow 12.3.0's resampler (src/libImaging/Resample.c,
+and Image.resize in src/PIL/Image.py) and its conversions to 8-bit grey
+(src/libImaging/Convert.c). The license is in src/LICENSE-pillow.
+
+Upstream: https://github.com/python-pillow/Pillow
+Copyright © 1997-2011 by Secret Labs AB
+Copyright © 1995-2011 by Fredrik Lundh and contributors
+Copyright © 2010 by Jeffrey 'Alex' Clark and contributors

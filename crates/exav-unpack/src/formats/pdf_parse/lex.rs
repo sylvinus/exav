@@ -130,11 +130,22 @@ impl<'a> Lexer<'a> {
                 }
                 b's' if self.starts_with(b"stream") => {
                     self.pos += 6;
-                    if self.pos < self.data.len() && self.data[self.pos] == b'\r' {
-                        self.pos += 1;
+                    // The data starts after the keyword's end of line, which
+                    // some writers put after trailing spaces. Without a line
+                    // end, nothing more is skipped.
+                    let mut p = self.pos;
+                    while p < self.data.len() && matches!(self.data[p], b' ' | b'\t') {
+                        p += 1;
                     }
-                    if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
-                        self.pos += 1;
+                    let eol = p;
+                    if p < self.data.len() && self.data[p] == b'\r' {
+                        p += 1;
+                    }
+                    if p < self.data.len() && self.data[p] == b'\n' {
+                        p += 1;
+                    }
+                    if p > eol {
+                        self.pos = p;
                     }
                     return Token::Stream;
                 }
@@ -347,9 +358,52 @@ impl<'a> Lexer<'a> {
                 }
             }
             self.pos = saved;
-            // Skip forward looking for digit
-            self.pos += 1;
+            // Skip forward looking for digit. A start inside a run of digits
+            // reads to the end of the run as well, so each of a long run's
+            // starts costs the run: only the last few can still be an object
+            // number.
+            let mut next = saved + 1;
+            if self.data[saved].is_ascii_digit() {
+                let run_end = self.data[saved..]
+                    .iter()
+                    .position(|b| !b.is_ascii_digit())
+                    .map_or(self.data.len(), |n| saved + n);
+                next = next.max(run_end.saturating_sub(MAX_OBJ_NUMBER_DIGITS));
+            }
+            self.pos = next;
         }
         None
+    }
+}
+
+/// An object number is read from at most this many digits of a run.
+const MAX_OBJ_NUMBER_DIGITS: usize = 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every start inside a run of digits used to read to the end of the run.
+    #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "needs a thread")]
+    fn a_megabyte_of_digits_is_scanned_in_one_pass() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let data = vec![b'1'; 1 << 20];
+            let mut lex = Lexer::new(&data);
+            let _ = tx.send(lex.find_next_obj().is_none());
+        });
+        let none = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("did not return within 10 s");
+        assert!(none);
+    }
+
+    #[test]
+    fn an_object_after_a_long_digit_run_is_still_found() {
+        let mut data = vec![b'9'; 5000];
+        data.extend_from_slice(b"\n12 3 obj\n");
+        let mut lex = Lexer::new(&data);
+        assert_eq!(lex.find_next_obj().map(|(n, g, _)| (n, g)), Some((12, 3)));
     }
 }

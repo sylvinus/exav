@@ -19,9 +19,10 @@
 //!    overwritten with `"CLAM"`.
 //!
 //! The rules were recovered by diffing exav's output against clamd's, not from
-//! reading its source. Correctness of the *decompression* is separately
-//! guaranteed at runtime by the Adler-32 the `PackHeader` records — a decode
-//! that does not reproduce it is discarded rather than handed over.
+//! reading its source. A decode that does not yield the size the `PackHeader`
+//! records is discarded rather than handed over; one whose Adler-32 disagrees
+//! is handed over only when no candidate matches it, and never when checksums
+//! are verified.
 
 use exav_unpack::{extract, Budget, Format, Limits};
 
@@ -104,10 +105,12 @@ fn packheader_layout_is_routed_not_ignored() {
     );
 }
 
-/// The Adler-32 in the header is the acceptance test for a decode. Here it is
-/// deliberately wrong, so nothing may be handed over as though it decoded.
+/// The "compressed" bytes do not decode to the size the header records (and
+/// its Adler-32 is wrong too), so nothing may be handed over as though it
+/// decoded. A run that decodes in full is handed over whatever its Adler-32
+/// says (`formats::upx` tests).
 #[test]
-fn a_decode_that_fails_its_checksum_is_never_handed_over() {
+fn a_decode_that_fails_is_never_handed_over() {
     let blob = packed_pe();
     let mut budget = Budget::new(Limits::default());
     let entries = extract(Format::Upx, &blob, &mut budget).expect("extract");

@@ -1,4 +1,4 @@
-//! Microsoft Script Encoder (`#@~^`) decoder — VBScript.Encode / JScript.Encode.
+//! Microsoft Script Encoder (`#@~^`) decoder: VBScript.Encode / JScript.Encode.
 //!
 //! `screnc.exe` (and the `Scripting.Encoder` COM object) wraps a plaintext
 //! script into an opaque blob so the payload is not visible at rest. The blob is
@@ -26,13 +26,13 @@
 //! The decode/combination tables are the authentic published ones (Didier
 //! Stevens' public-domain `decode-vbe.py`, equivalently the classic `scrdec`
 //! algorithm). Every index is bounds-checked; truncated or hostile input yields
-//! whatever decoded cleanly (or nothing) and never panics — the crate is
+//! whatever decoded cleanly (or nothing) and never panics. The crate is
 //! `#![forbid(unsafe_code)]`.
 
 use crate::*;
 
 /// Blob start marker.
-const MARKER: &[u8] = b"#@~^";
+pub(crate) const MARKER: &[u8] = b"#@~^";
 /// Blob end marker.
 const TERMINATOR: &[u8] = b"^#~@";
 /// Bytes between the marker and the encoded body: `<6-char length>` + `==`.
@@ -242,8 +242,8 @@ fn decode_body(body: &[u8]) -> Vec<u8> {
 }
 
 /// True iff `data` contains the 4-byte `#@~^` Script Encoder marker.
-pub(crate) fn looks_like_screnc(data: &[u8]) -> bool {
-    memchr::memmem::find(data, MARKER).is_some()
+pub(crate) fn looks_like_screnc(p: &crate::Probe) -> bool {
+    p.find(MARKER).is_some()
 }
 
 /// Find every `#@~^ … ^#~@` blob, decode each, and emit the recovered plaintext
@@ -263,7 +263,7 @@ pub(crate) fn extract_screnc<R>(
         if body_start >= data.len() {
             continue;
         }
-        // Locate the terminator; without one the blob is truncated — skip it.
+        // Locate the terminator; without one the blob is truncated, so skip it.
         let term_rel = match memchr::memmem::find(&data[body_start..], TERMINATOR) {
             Some(t) => t,
             None => continue,
@@ -305,6 +305,10 @@ pub(crate) fn extract_screnc<R>(
 mod tests {
     use super::*;
 
+    fn looks_like_screnc(data: &[u8]) -> bool {
+        super::looks_like_screnc(&crate::Probe::whole(data))
+    }
+
     /// Encoded blob produced by inverting the published table for the plaintext
     /// below, and confirmed to decode to that plaintext by the authentic
     /// public-domain reference decoder (Didier Stevens' `decode-vbe.py`). It
@@ -318,7 +322,7 @@ mod tests {
     #[test]
     fn decodes_real_published_vector() {
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Screnc, REAL_VECTOR, &mut budget).unwrap();
+        let entries = extract(Format::Screnc, &REAL_VECTOR, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "screnc-decoded");
         assert_eq!(

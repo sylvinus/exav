@@ -1,8 +1,5 @@
-# Sample workflow for building and deploying an Astro site to GitHub Pages
-#
-# To get started with Astro see: https://docs.astro.build/en/getting-started/
-#
-name: Deploy Astro site to Pages
+# Builds the website and the viewer demo, and deploys them to GitHub Pages.
+name: Deploy site to Pages
 
 on:
   # Runs on pushes targeting the default branch
@@ -52,6 +49,36 @@ jobs:
             --site "${{ steps.pages.outputs.origin }}" \
             --base "${{ steps.pages.outputs.base_path }}"
         working-directory: ${{ env.BUILD_PATH }}
+      # The @exav/viewer demo, served at /viewer/demo/: the package and its wasm
+      # modules built from this commit, the archive engine's pkg/ too.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/exav-viewer
+            crates/exav-unpack-wasm
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129,wasm-pack
+      - name: Build the viewer demo
+        run: |
+          (cd crates/exav-unpack-wasm && wasm-pack build --release --target web)
+          cd crates/exav-viewer
+          npm ci
+          npm run build:wasm
+          npm run build
+          # The sidebar's files: github.com/sylvinus/exav-samples, HEAD.
+          npm run demo:showcase
+          # DEMO_ORIGIN goes into the sandboxed frame's policy, for Safari.
+          DEMO_BASE="${{ steps.pages.outputs.base_path }}/viewer/demo/" DEMO_ORIGIN="${{ steps.pages.outputs.origin }}" npm run demo:build
+          # dist/viewer/ holds the File viewer docs; the demo must not land on them.
+          test ! -e "$GITHUB_WORKSPACE/${{ env.BUILD_PATH }}/dist/viewer/demo"
+          cp -R demo/dist "$GITHUB_WORKSPACE/${{ env.BUILD_PATH }}/dist/viewer/demo"
+          test -f "$GITHUB_WORKSPACE/${{ env.BUILD_PATH }}/dist/viewer/demo/index.html"
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

@@ -85,7 +85,7 @@ fn read_ptgstr(rgce: &[u8], i: usize) -> Option<(String, usize)> {
     let cch = *rgce.get(i)? as usize;
     let high = rgce.get(i + 1)? & 1 == 1;
     let nbytes = if high { cch * 2 } else { cch };
-    let chars = rgce.get(i + 2..i + 2 + nbytes)?;
+    let chars = crate::bytes::at(rgce, i + 2, nbytes)?;
     let s = if high {
         let units: Vec<u16> = chars
             .as_chunks::<2>()
@@ -140,7 +140,7 @@ fn parse_formula(rgce: &[u8], out: &mut Vec<String>) {
         };
         if let Some(n) = fixed {
             if base == 0x1e {
-                if let Some(b) = rgce.get(i..i + 2) {
+                if let Some(b) = crate::bytes::at(rgce, i, 2) {
                     items.push(u16::from_le_bytes([b[0], b[1]]).to_string());
                 }
             }
@@ -164,7 +164,7 @@ fn parse_formula(rgce: &[u8], out: &mut Vec<String>) {
             }
             0x21 => {
                 // ptgFunc: 2-byte function id.
-                match rgce.get(i..i + 2) {
+                match crate::bytes::at(rgce, i, 2) {
                     Some(b) => {
                         let id = u16::from_le_bytes([b[0], b[1]]);
                         items.push(func_name(id).unwrap_or("FUNC").to_string());
@@ -199,7 +199,7 @@ fn parse_formula(rgce: &[u8], out: &mut Vec<String>) {
 /// header, then `cce:u16`, then the tokens.
 fn formula_rgce(body: &[u8]) -> Option<&[u8]> {
     let cce = u16le(body, 20)? as usize;
-    body.get(22..22 + cce)
+    crate::bytes::at(body, 22, cce)
 }
 
 /// Parse the OLE2 streams; if a `Workbook`/`Book` stream contains at least one
@@ -277,7 +277,7 @@ pub(crate) fn xlm_macro_artifact(streams: &[(String, &[u8])]) -> Option<Vec<u8>>
             R_ARRAY => {
                 // ARRAY body: 12-byte header, then cce:u16, then rgce.
                 if let Some(cce) = u16le(body, 12) {
-                    if let Some(rgce) = body.get(14..14 + cce as usize) {
+                    if let Some(rgce) = crate::bytes::at(body, 14, cce as usize) {
                         parse_formula(rgce, &mut strings);
                     }
                 }

@@ -3,12 +3,13 @@
 #
 # WHY: the docs are the project's single authoritative answer on format coverage,
 # CLI flags and ClamAV parity, and they are edited in the same commits as the
-# code they describe. A build failure — a broken internal link, a malformed
-# frontmatter block, a sidebar entry pointing at a page that no longer exists —
+# code they describe. A build failure (a malformed frontmatter block, a sidebar
+# entry pointing at a page that no longer exists, a page that does not render)
 # is a documentation bug that reaches readers, and nothing else in CI catches it.
 #
-# `astro check` is the type/diagnostic pass; `astro build` is the one that
-# resolves every internal link and renders every page.
+# `astro check` is the type/diagnostic pass; `astro build` renders every page.
+# Neither checks links written inside a page, so check-links.mjs then resolves
+# every internal link and `#anchor` against the built HTML.
 #
 # USAGE: scripts/test-www.sh
 # REQUIREMENTS: node + npm.
@@ -28,3 +29,4 @@ fi
 
 npx astro check
 npm run build
+node "$REPO/scripts/check-links.mjs" "$REPO/www/dist"

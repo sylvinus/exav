@@ -2,10 +2,11 @@
 //!
 //! A set split across `big.zip.001`, `.002`, `.003` is one file cut at arbitrary
 //! byte offsets. Scanned a file at a time — which is all a directory walk does —
-//! no piece decodes and every line reads `OK`, so whatever the archive holds is
-//! never looked at. The fixture below cuts the payload *through the middle of
-//! the signature bytes*, so no individual part can match: only the rejoin can
-//! find it, and these tests would pass on nothing less.
+//! no piece holds the whole payload and every line reads `OK`, so whatever the
+//! archive holds is never looked at. The fixture below cuts the payload
+//! *through the middle of the signature bytes*, so no individual part can
+//! match: only the rejoin can find it, and these tests would pass on nothing
+//! less.
 
 use std::process::Command;
 
@@ -127,8 +128,9 @@ fn a_split_archive_in_a_directory_is_rejoined_and_reported() {
     assert_eq!(parts.len(), 3);
     let objs = scan_dir_json(dir.path());
 
-    // Every part scans clean on its own — that is what makes the rejoin the only
-    // thing that can find this.
+    // Every part scans clean on its own; that is what makes the rejoin the only
+    // thing that can find this. The first part is a ZIP cut short: every byte
+    // of it was scanned, and the rest of its member is absent, not unread.
     let part_lines: Vec<_> = objs
         .iter()
         .filter(|o| {
@@ -187,6 +189,11 @@ fn parts_in_different_directories_are_not_one_set() {
         write_split_set(&p, "x", 2, keep);
     }
     let objs = scan_dir_json(dir.path());
+    assert_eq!(
+        objs.len(),
+        2,
+        "one line per part, none for a join: {objs:#?}"
+    );
     assert!(
         objs.iter().all(|o| o["status"] == "OK"),
         "nothing should have been joined across directories: {objs:#?}"

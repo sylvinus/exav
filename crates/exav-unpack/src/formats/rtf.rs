@@ -190,7 +190,7 @@ mod tests {
             hex(payload)
         );
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
+        let entries = extract(Format::Rtf, &rtf.as_bytes(), &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "rtf-object-1");
         assert_eq!(entries[0].data, payload);
@@ -204,7 +204,7 @@ mod tests {
         let (a, b) = h.split_at(10);
         let rtf = format!("{{\\rtf1{{\\object{{\\objdata\n{a}\r\n\\par {b}\n}}}}}}");
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
+        let entries = extract(Format::Rtf, &rtf.as_bytes(), &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, payload);
     }
@@ -223,7 +223,7 @@ mod tests {
             hex(payload).to_uppercase()
         );
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
+        let entries = extract(Format::Rtf, &rtf.as_bytes(), &mut budget).unwrap();
         let folded = entries
             .iter()
             .find(|e| e.name == "rtf-objdata-hex-1")
@@ -240,7 +240,7 @@ mod tests {
         let payload = b"MALWARETEST-lower";
         let rtf = format!("{{\\rtf1{{\\object{{\\objdata {}}}}}}}", hex(payload));
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
+        let entries = extract(Format::Rtf, &rtf.as_bytes(), &mut budget).unwrap();
         assert!(entries
             .iter()
             .all(|e| !e.name.starts_with("rtf-objdata-hex")));
@@ -255,7 +255,7 @@ mod tests {
             hex(p2)
         );
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Rtf, rtf.as_bytes(), &mut budget).unwrap();
+        let entries = extract(Format::Rtf, &rtf.as_bytes(), &mut budget).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].data, p1);
         assert_eq!(entries[1].data, p2);

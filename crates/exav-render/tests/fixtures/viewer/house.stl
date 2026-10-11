@@ -1,0 +1,212 @@
+solid house
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 0.0000
+  vertex 0.0000 30.0000 0.0000
+  vertex 40.0000 30.0000 0.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 0.0000
+  vertex 40.0000 30.0000 0.0000
+  vertex 40.0000 0.0000 0.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 25.0000
+  vertex 40.0000 0.0000 25.0000
+  vertex 40.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 25.0000
+  vertex 40.0000 30.0000 25.0000
+  vertex 0.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 0.0000
+  vertex 40.0000 0.0000 0.0000
+  vertex 40.0000 0.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 0.0000
+  vertex 40.0000 0.0000 25.0000
+  vertex 0.0000 0.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 0.0000 0.0000
+  vertex 40.0000 30.0000 0.0000
+  vertex 40.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 0.0000 0.0000
+  vertex 40.0000 30.0000 25.0000
+  vertex 40.0000 0.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 30.0000 0.0000
+  vertex 0.0000 30.0000 0.0000
+  vertex 0.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 30.0000 0.0000
+  vertex 0.0000 30.0000 25.0000
+  vertex 40.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 30.0000 0.0000
+  vertex 0.0000 0.0000 0.0000
+  vertex 0.0000 0.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 30.0000 0.0000
+  vertex 0.0000 0.0000 25.0000
+  vertex 0.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 5.0000 0.0000
+  vertex 40.0000 25.0000 0.0000
+  vertex 60.0000 25.0000 0.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 5.0000 0.0000
+  vertex 60.0000 25.0000 0.0000
+  vertex 60.0000 5.0000 0.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 5.0000 15.0000
+  vertex 60.0000 5.0000 15.0000
+  vertex 60.0000 25.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 5.0000 15.0000
+  vertex 60.0000 25.0000 15.0000
+  vertex 40.0000 25.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 5.0000 0.0000
+  vertex 60.0000 5.0000 0.0000
+  vertex 60.0000 5.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 5.0000 0.0000
+  vertex 60.0000 5.0000 15.0000
+  vertex 40.0000 5.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 60.0000 5.0000 0.0000
+  vertex 60.0000 25.0000 0.0000
+  vertex 60.0000 25.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 60.0000 5.0000 0.0000
+  vertex 60.0000 25.0000 15.0000
+  vertex 60.0000 5.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 60.0000 25.0000 0.0000
+  vertex 40.0000 25.0000 0.0000
+  vertex 40.0000 25.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 60.0000 25.0000 0.0000
+  vertex 40.0000 25.0000 15.0000
+  vertex 60.0000 25.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 25.0000 0.0000
+  vertex 40.0000 5.0000 0.0000
+  vertex 40.0000 5.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 25.0000 0.0000
+  vertex 40.0000 5.0000 15.0000
+  vertex 40.0000 25.0000 15.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 25.0000
+  vertex 40.0000 0.0000 25.0000
+  vertex 20.0000 0.0000 40.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 30.0000 25.0000
+  vertex 20.0000 30.0000 40.0000
+  vertex 40.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 25.0000
+  vertex 20.0000 0.0000 40.0000
+  vertex 20.0000 30.0000 40.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 0.0000 0.0000 25.0000
+  vertex 20.0000 30.0000 40.0000
+  vertex 0.0000 30.0000 25.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 0.0000 25.0000
+  vertex 40.0000 30.0000 25.0000
+  vertex 20.0000 30.0000 40.0000
+ endloop
+endfacet
+facet normal 0 0 0
+ outer loop
+  vertex 40.0000 0.0000 25.0000
+  vertex 20.0000 30.0000 40.0000
+  vertex 20.0000 0.0000 40.0000
+ endloop
+endfacet
+endsolid house

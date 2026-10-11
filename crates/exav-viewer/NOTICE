@@ -1,0 +1,167 @@
+@exav/viewer: third-party notices
+=================================
+
+@exav/viewer is licensed under the MIT License (see LICENSE). Its JavaScript
+is exav's own, but for the wasm-bindgen glue in its modules. Its five
+WebAssembly modules are builds of exav-render, and its fonts are
+third-party: this file gives their notices. The licence texts it refers to
+are in LICENSES/, and in assets/fonts/ for the fonts.
+
+The engines a host installs beside the package (pdfjs-dist, three,
+@silurus/ooxml, @exav/unpack-wasm) are not part of its code, and carry their
+own notices; the sandboxed frame app bundles them (Part 5).
+`@exav/viewer/vite` and `exav-viewer-assets` copy some of pdf.js's files
+into the host's build (CMaps, standard fonts, ICC profiles and ICC engine,
+qcms): the host distributes those under their own licences, which
+pdfjs-dist (Apache-2.0, qcms MIT) states. pdf.js's JPEG 2000 and JBIG2 decoders, builds of OpenJPEG and PDFium,
+are not copied: wasm/openjpeg_nowasm_fallback.js and
+wasm/jbig2_nowasm_fallback.js, this package's, take their place.
+
+
+Part 1: in every WebAssembly module
+====================================
+
+wasm/exav_viewer_image_bg.wasm decodes raster images; wasm/exav_viewer_dwg_bg.wasm
+reads DWG and DXF drawings and tessellates them; wasm/exav_viewer_model_bg.wasm
+reads IFC and STL models and meshes them. Two more are embedded, in
+base64, in the modules pdf.js imports in place of its own decoders:
+exav_viewer_pdf_jpx_bg.wasm (JPXDecode) in wasm/openjpeg_nowasm_fallback.js,
+exav_viewer_pdf_jbig2_bg.wasm (JBIG2Decode, CCITTFaxDecode) in
+wasm/jbig2_nowasm_fallback.js.
+
+exav-render, MIT, with, in the image module, source derivatives of image
+0.25.9's JPEG and TIFF decoders and of tiff 0.10.3 (both MIT OR Apache-2.0,
+used under the MIT License). Upstream: https://github.com/image-rs/image
+(The image-rs Developers) and https://github.com/image-rs/image-tiff
+(Copyright (c) 2018 PistonDevelopers). The DWG module also holds exav-unpack's
+DXF and DWG readers, MIT.
+
+Build-time crates (proc-macro2, quote, syn, unicode-ident, thiserror-impl,
+fax_derive, zerocopy-derive, multiversion_no_op, wasm-bindgen-macro,
+wasm-bindgen-macro-support) generate code but do not reach the modules and
+are not listed.
+
+
+Part 2: exav_viewer_dwg_bg.wasm only
+====================================
+
+NewStroke, CC0-1.0
+------------------
+
+The stroke font compiled into the module for SHX text is NewStroke, dedicated
+to the public domain under CC0-1.0 (LICENSES/CC0-1.0.txt).
+
+Upstream: http://vovanium.ru/sledy/newstroke/en
+
+encoding_rs, (Apache-2.0 OR MIT) AND BSD-3-Clause
+-------------------------------------------------
+
+encoding_rs is copyright Mozilla Foundation, used under the MIT License. Its
+tables are derived from the WHATWG Encoding Standard's data, under these
+terms:
+
+  Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+  3. Neither the name of the copyright holder nor the names of its
+     contributors may be used to endorse or promote products derived from
+     this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+
+Part 3: crates linked into the modules
+======================================
+
+Under the MIT License, each offering it (alone, or among MIT OR Apache-2.0,
+Unlicense OR MIT, MIT OR Zlib OR Apache-2.0 and similar), with the copyright
+its licence file states, or its authors where it states none. The MIT text is
+in LICENSE. Each is in the image module unless marked with the modules it
+is in: image, dwg, model, and the pdf.js decoders' jpx and jbig2. bumpalo,
+cfg-if, once_cell, wasm-bindgen and wasm-bindgen-shared are in all five.
+hayro-jpeg2000 carries two ICC profiles (ProPhoto, CIELAB) under CC0-1.0
+(LICENSES/CC0-1.0.txt).
+
+  adler2                 Jonas Schievink
+  bitflags               2014 The Rust Project Developers
+  bumpalo                2019 Nick Fitzgerald                    (all)
+  bytemuck               2019 Daniel "Lokathor" Gee
+  byteorder-lite         2015 Andrew Gallant
+  cfg-if                 2014 Alex Crichton                      (all)
+  color_quant            2016 PistonDevelopers
+  crc32fast              2018 Sam Rijs, Alex Crichton and contributors
+  fax                    Sebastian K
+  fdeflate               The image-rs Developers
+  flate2                 2014-2026 Alex Crichton
+  gif                    2015 nwin
+  half                   Kathryn Long
+  hayro-ccitt            Laurenz Stampfl                         (image, jbig2)
+  hayro-jbig2            Laurenz Stampfl                         (image, jbig2)
+  hayro-jpeg2000         Laurenz Stampfl                         (image, jpx)
+  image                  The image-rs Developers
+  image-webp             The image-rs Developers
+  memchr                 2015 Andrew Gallant                     (dwg)
+  miniz_oxide            Frommi, oyvindln, Rich Geldreich; 2013-2014 RAD Game
+                         Tools and Valve Software; 2010-2014 Rich Geldreich and
+                         Tenacious Software LLC
+  num-traits             2014 The Rust Project Developers
+  once_cell              Aleksey Kladov                          (all)
+  png                    2015 nwin
+  qoi                    2022 Ivan Smirnov
+  quick-error            2015 The quick-error Developers
+  scopeguard             2016-2019 Ulrik Sverdrup "bluss" and scopeguard
+                         developers                              (dwg)
+  simd-adler32           2021 Marvin Countryman
+  thiserror              David Tolnay                            (dwg)
+  wasm-bindgen           2014 Alex Crichton                      (all)
+  wasm-bindgen-shared    2014 Alex Crichton                      (all)
+  weezl                  2020 HeroicKatora
+  zerocopy               2023 The Fuchsia Authors
+  zune-core, zune-jpeg   zune-image developers
+
+Under the Apache License 2.0 (LICENSES/Apache-2.0.txt), each offering it
+among other licences:
+
+  moxcms                 2024 Radzivon Bartoshyk
+  pxfm                   2024 Radzivon Bartoshyk
+
+
+Part 4: fonts
+=============
+
+assets/fonts/ holds Arimo, Cousine and Tinos, which the drawing renderer
+draws a drawing's TrueType styles with, under the SIL Open Font License 1.1
+(assets/fonts/OFL-1.1.txt). assets/fonts/NOTICE.md gives each face's
+copyright and version.
+
+
+Part 5: the sandboxed frame app
+===============================
+
+dist/frame/app/ is a built page (`@exav/viewer/frame`) that carries every
+engine, minified: besides this package's code, modules and fonts, it bundles
+pdfjs-dist (Apache-2.0; its ICC engine qcms, MIT), @silurus/ooxml (MIT),
+three (MIT) and @exav/unpack-wasm (MIT). Of
+pdfjs-dist's wasm/, only qcms is in it: its OpenJPEG and PDFium decoders are
+not, this package's take their place. dist/frame/app/licenses/ holds each
+one's licence and notice files, as installed when the package was built,
+and README.txt lists their versions.

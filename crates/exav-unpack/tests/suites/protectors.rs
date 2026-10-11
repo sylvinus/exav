@@ -75,7 +75,7 @@ fn pe_with_sections(names: &[&[u8]]) -> Vec<u8> {
 /// through its own content-aware routing. A library caller has to name it.
 fn reported_reason(pe: &[u8]) -> Option<&'static str> {
     let mut b = Budget::new(Limits::default());
-    let entries = extract(Format::PePacked, pe, &mut b).ok()?;
+    let entries = extract(Format::PePacked, &pe, &mut b).ok()?;
     entries.into_iter().find_map(|e| e.unsupported)
 }
 

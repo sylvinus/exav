@@ -1,0 +1,329 @@
+---
+title: ICAP server
+description: Serve RFC 3507 ICAP with exav in place of a c-icap + ClamAV container behind Squid or any other ICAP client, with the verdict mapping spelled out.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+An `icap://` address on `--listen` serves ICAP (RFC 3507), the protocol a proxy
+uses to hand an HTTP request or response to a scanner before letting it through.
+It replaces a `c-icap` container running the `virus_scan` service against ClamAV:
+same port, same service names, same `X-Infection-Found` header, so the proxy keeps
+its configuration.
+
+<Aside type="caution" title="Opt-in">
+Nothing listens on 1344 unless an `icap://` address asks for it. A scan, the clamd
+daemon or the container never opens the port as a side effect.
+</Aside>
+
+## Run it
+
+```sh
+exav --listen icap://0.0.0.0:1344 -d /var/lib/exav          # the default services
+exav --listen icap://0.0.0.0:1344/avscan -d /var/lib/exav   # only that one
+```
+
+ICAP runs over TCP, so an `icap://` address is a `host:port`; a socket path is
+refused.
+
+### The service name is the path
+
+An ICAP service name is the path of the URL the client is configured with, so the
+`icap://…` line from a `squid.conf` works unchanged:
+
+```sh
+exav --listen icap://scanner:1344/avscan -d /var/lib/exav
+```
+
+With no path, exav answers on the three names a c-icap `virus_scan` deployment
+uses: `avscan`, `srv_clamav`, `virus_scan`. Naming a service replaces that set.
+An unknown service gets `404 ICAP Service not found`. For two proxies that
+disagree about the name, repeat `service=`:
+
+```sh
+exav --listen 'icap://0.0.0.0:1344?service=avscan&service=srv_clamav' -d /var/lib/exav
+```
+
+(A comma would not work: `--listen` separates addresses with commas.)
+
+### With the clamd listener
+
+Each address is a listener, so the protocols combine:
+
+| Command | What listens |
+|---|---|
+| `exav --listen clamd://0.0.0.0:3310` | clamd only |
+| `exav --listen icap://0.0.0.0:1344` | ICAP only |
+| `exav --listen clamd://0.0.0.0:3310 --listen icap://0.0.0.0:1344` | both, in one process, over one loaded database |
+
+One process for both replaces a `c-icap` + `clamav` pair, and loads the signature
+set once instead of twice.
+
+Under the worker pool the ICAP listener runs in a dedicated child of the
+supervisor, sharing the loaded database copy-on-write. It gets its own process
+rather than a pool slot because ICAP connections are keep-alive and long-lived,
+and idle proxy connections would otherwise occupy every worker. On a signature
+reload the child is replaced along with the workers: the old one finishes the
+requests in progress and closes its idle connections, and proxies reconnect to
+the new one. The ICAP child's own scans run in threads, one per connection, and
+the kernel's per-job limits do not apply to them (see
+[Limits](/scanner/reference/limits/)); what each scan holds is still kept inside the
+per-job memory, as in a worker.
+
+ICAP served alone runs without the pool: one process, scans in threads,
+`--max-scan-secs` refused. Signatures reload on `SIGUSR2` or when the source
+changes on disk, and the new database is swapped in for the next request. With
+no clamd listener there is no `STATS` command; the scan totals are written to
+stderr every `--metrics-secs` (300 by default).
+
+For the container, see [Docker](/scanner/guides/docker/#replacing-a-c-icap-container).
+
+## Point Squid at it
+
+```ini
+icap_enable on
+icap_preview_enable on
+icap_preview_size 4096
+icap_service exav_resp respmod_precache icap://127.0.0.1:1344/avscan bypass=off
+icap_service exav_req  reqmod_precache  icap://127.0.0.1:1344/avscan bypass=off
+adaptation_access exav_resp allow all
+adaptation_access exav_req allow all
+```
+
+Keep `bypass=off`: with `bypass=on`, a scanner that is down lets traffic through
+unscanned.
+
+## Verdict mapping
+
+The mapping is keyed on the status, so a new partial condition is already mapped
+to the blocking side:
+
+| Status | ICAP response | Headers |
+|---|---|---|
+| `OK` | `204 No Content` when the client sent `Allow: 204`, else `200` echoing the message back unchanged | none |
+| `FOUND` | `200 OK` with a block page | `X-Infection-Found: Type=0; Resolution=2; Threat=<signature>;` |
+| `PARTIAL` | `200 OK` with a block page | `X-Exav-Status: PARTIAL`, `X-Exav-Category: <condition>`, `X-Exav-Reason: <detail>`, and `X-Infection-Found: … Threat=Heuristics.Exav.<Condition>;` under the default [`--icap-infection-header blocks`](#if-the-header-should-mean-a-database-hit-only) |
+| `ERROR` (the scan failed) | `200 OK` with a block page | `X-Exav-Status: ERROR`, `X-Exav-Reason: <detail>`, and `X-Infection-Found: … Threat=Heuristics.Exav.ScanError;` under `blocks` |
+
+The threat name for a partial block follows the category:
+
+| `X-Exav-Category` | Threat name in `X-Infection-Found` |
+|---|---|
+| `LIMITS-EXCEEDED` | `Heuristics.Exav.LimitsExceeded` |
+| `UNSCANNABLE` | `Heuristics.Exav.Unscannable` |
+| `PASSWORD-PROTECTED` | `Heuristics.Exav.PasswordProtected` |
+
+Every block carries `X-Infection-Found`, because ICAP clients come in two kinds. A
+proxy acts on the message: a `200` with a replacement body stops the object
+whatever the headers say. A scan wrapper acts on the headers: it greps for
+`X-Infection-Found` and calls anything without it clean. A partial block stays
+distinguishable from a database hit by its `Heuristics.Exav.` name (`Heuristics.`
+is ClamAV's prefix for a policy block, and no database ships `.Exav.` names) and
+by `X-Exav-Category`. The header format is byte for byte what c-icap's
+`virus_scan` emits, since deployed clients parse it by hand.
+
+The block page is an HTTP `403 Forbidden` with a short HTML body naming the
+signature or the condition. A blocked `REQMOD` works the same way: the client is
+handed an HTTP response to serve instead of forwarding the request (RFC 3507's
+request satisfaction).
+
+Blocking partial objects is the default; [`--partial-as`](#delivering-what-exav-could-not-examine)
+delivers them instead. A detection is never delivered.
+
+### If the header should mean a database hit only
+
+`--icap-infection-header detections` restricts `X-Infection-Found` to signature
+matches; a partial object then blocks with the `X-Exav-*` headers alone.
+
+<Aside type="danger" title="What that costs">
+The object is still blocked, but a client that reads only `X-Infection-Found` will
+report it as clean. Use this only when every client reads the response body or
+`X-Exav-Category`.
+</Aside>
+
+## Delivering what exav could not examine
+
+Blocking an object nobody could look inside is right for a proxy, but an upload
+service may prefer to accept a user's password-protected ZIP. c-icap + ClamAV make
+that trade silently: `virus_scan.MaxObjectSize` passes an oversized object, and
+ClamAV calls an encrypted archive clean unless told otherwise. In exav it is an
+explicit setting. `--partial-as` is not ICAP-specific: the same policy decides a
+one-shot scan's exit code and a clamd reply.
+
+```sh
+exav -d /var/lib/exav --listen icap://0.0.0.0:1344 --partial-as ok                    # all three
+exav -d /var/lib/exav --listen icap://0.0.0.0:1344 --partial-as password-protected=ok # just this one
+exav -d /var/lib/exav --listen icap://0.0.0.0:1344 --partial-as limits-exceeded=ok,unscannable=ok
+```
+
+| Value | Effect on an ICAP response |
+|---|---|
+| `partial` *(default)* | Blocks, with `X-Exav-Status: PARTIAL` and the category. |
+| `found` | Blocks as an ordinary detection named `Heuristics.*`. |
+| `error` | The same response as `partial`: ICAP has no exit code, which is all `error` changes. |
+| `ok` | Delivered, as a clean object is (`204`, or `200` echoing the message), with the `X-Exav-*` headers still saying what was skipped. Covers any category a later exav adds. |
+| a per-condition list | Only the named conditions take that value. Conditions are `limits-exceeded`, `unscannable`, `password-protected`. |
+
+An unknown condition is a startup error. A delivered object is never silent: the
+listener announces the policy at startup, every delivered object is logged with
+its verdict and reason, and the response carries `X-Exav-Status`,
+`X-Exav-Category` and `X-Exav-Reason`. It never carries `X-Infection-Found`,
+which would make header-only clients block it.
+
+<Aside type="caution" title="What no policy delivers">
+An object past `--max-input-bytes` or a spill ceiling whose client sent no
+`Allow: 204` is blocked even under `--partial-as ok`: its tail was read and
+discarded to reach the next request, so the full message no longer exists to hand
+back. `--max-input-bytes` is unset by default, and Squid and `c-icap-client` with
+`allow204=on` send `Allow: 204`.
+
+A scan that failed outright (a read error, a decoder that crashed) is not a
+partial result: it is blocked with `X-Exav-Status: ERROR` whatever `--partial-as`
+says.
+</Aside>
+
+## Behind a script that shells out to an ICAP client
+
+Some wrappers ([matrix-content-scanner][mcs], for one) run `c-icap-client`, grep
+the response and turn it into an exit code:
+
+```sh
+resp=$(c-icap-client -i "$ICAP_HOST" -p 1344 -f "$1" \
+         -s 'srv_clamav?allow204=on&force=on&sizelimit=off&mode=simple' -v 2>&1)
+echo "$resp" | grep -q "X-Infection-Found" && exit 4   # infected
+exit 0                                                 # clean
+```
+
+Nothing needs to change to point it at exav: the service name, the per-request
+options, the `204` on a clean object and `X-Infection-Found` on a block are what
+it expects, and under the default policy an encrypted archive arrives as a block.
+The setting to decide is the delivery policy, which for this client decides
+whether a file is accepted:
+
+```sh
+# Like the c-icap + ClamAV container it replaces: deliver what could not be
+# examined, block only what matched.
+exav -d /var/lib/exav --listen icap://0.0.0.0:1344 --partial-as ok
+```
+
+[mcs]: https://github.com/matrix-org/matrix-content-scanner-python
+
+## Size ceilings
+
+In c-icap, `virus_scan.MaxObjectSize` means anything larger passes unscanned.
+
+exav has no ICAP-specific ceiling. An encapsulated body is buffered like a clamd
+stream (in memory up to `--spill-threshold-bytes`, then in a temporary file up
+to `--max-spill-bytes`) and scanned like a file, so the limits that apply are
+the same as for every other input: `--max-input-bytes` (unset by default, the
+`clamscan --max-filesize` equivalent), the spill ceilings, and
+`--max-object-bytes`, past which the checks that parse an object whole (PE
+structure, RAR, OLE) do not run (see
+[Streaming & memory](/scanner/concepts/streaming-memory/)). Past `--max-input-bytes` or
+a spill ceiling the object is `LIMITS-EXCEEDED`, and past `--max-object-bytes`
+too when one of those checks applied, unless something was found. Never quietly
+clean.
+
+Translating `virus_scan.MaxObjectSize 5M` usually means nothing at all: exav scans
+the objects c-icap skipped. To keep the limit, `--max-input-bytes 5M` sets it on
+every surface; to keep c-icap's answer too, add
+`--partial-as limits-exceeded=ok`, and exav still says so in the log and in
+`X-Exav-Category`.
+
+<Aside type="note" title="What buffering needs">
+Past the threshold, buffering writes temporary files, so the listener needs a
+writable temp directory (the published image has one). Location and space are
+[configurable](/scanner/reference/cli/#buffering-a-stream-spill), and
+`--spill-dir off --spill-threshold-bytes <SIZE>` keeps everything in memory for a
+read-only filesystem: of anything larger, the first `SIZE` is scanned and the
+rest reported as a limit.
+</Aside>
+
+## Translating a c-icap configuration
+
+| c-icap directive | exav setting | Default |
+|---|---|---|
+| `Port 1344` | `--listen icap://0.0.0.0:1344` | *(nothing listens without it)* |
+| `Service` / `ServiceAlias` | the path of the `--listen` address, or a repeated `?service=` | `avscan`, `srv_clamav`, `virus_scan` |
+| `MaxServers` x `ThreadsPerChild` | `?max-connections=` on the address | `100` |
+| `MaxKeepAliveRequests` | `--icap-max-requests` | `100` |
+| `KeepAliveTimeout` | `--icap-idle-secs` | `600` |
+| `virus_scan.MaxObjectSize`'s *size* | `--max-input-bytes` (all surfaces) | *(unset)* |
+| `virus_scan.MaxObjectSize`'s *pass* | `--partial-as` (all surfaces) | `partial` (block) |
+| *(preview size, per service)* | `--icap-preview-bytes` | `4096` |
+| *(none)* | `--icap-transfer-preview` | `*` |
+| *(none)* | `--icap-options-ttl-secs` | `3600` |
+| *(none)* | `--icap-max-header-bytes` | `64K` |
+| *(none)* | `--icap-infection-header` | `blocks` |
+
+Every flag has an `EXAV_*` variable spelled the same way (`--icap-max-requests`
+reads `EXAV_ICAP_MAX_REQUESTS`); a flag beats the variable. `Pipelining on` needs
+no setting: several requests per connection always work.
+
+The service names and the connection cap go on the address, since they belong to
+that listener (see [what belongs to one listener](/scanner/reference/cli/#what-belongs-to-one-listener)):
+
+```sh
+exav --listen 'icap://0.0.0.0:1344/avscan?max-connections=200' -d /var/lib/exav
+```
+
+<Aside type="note" title="What a connection costs">
+Buffering a body costs a connection at most `--spill-threshold-bytes` in RAM
+(16 MiB by default), and past that disk, bounded per object by
+`--max-spill-bytes` and across the ICAP process by `--max-total-spill-bytes`.
+The scan itself holds more: up to 1 GiB per connection by default, or what a
+worker's scan may hold under the worker pool, where no kernel limit applies to
+ICAP scans. See
+[Sizing a server](/scanner/guides/sizing/#adding-icap) before raising
+`?max-connections=`.
+</Aside>
+
+### Draining an over-limit body
+
+When exav has its answer before the client has finished sending (the object went
+past `--max-input-bytes`, or a budget refused it), it reads and discards the rest
+before answering. Closing a socket with unread input makes the kernel send an
+`RST`, which also discards the response just written, so the client would get no
+verdict. Draining keeps the verdict and leaves the connection at the next request.
+
+A client that never stops sending would hold a thread forever, so draining stops
+at 64 MiB; past that exav answers and closes, and that client may lose the
+response. The clamd listener drains `INSTREAM` the same way (see
+[size over the wire](/scanner/guides/daemon/#size-over-the-wire)).
+
+## Caching and the `ISTag`
+
+ICAP clients cache results against the `ISTag`. exav derives it from its version
+and the loaded signature set (database version, build time, signature count), so
+a reload changes the tag and invalidates cached verdicts downstream. Signatures
+hot-reload as in [daemon mode](/scanner/guides/daemon/#hot-reloading-signatures).
+
+## What `OPTIONS` advertises
+
+```http
+ICAP/1.0 200 OK
+Server: exav/0.0.2
+ISTag: "exav-ae0b21d4572e711f"
+Methods: REQMOD, RESPMOD
+Service: exav/0.0.2 ICAP service
+Allow: 204
+Max-Connections: 100
+Preview: 4096
+Options-TTL: 3600
+Transfer-Preview: *
+Connection: keep-alive
+Encapsulated: null-body=0
+```
+
+## Not implemented yet
+
+* **Trickling** (`SendPercentData` / `StartSendPercentDataAfter`): c-icap can send
+  part of a body while scanning so a slow download does not time out. exav
+  buffers the whole object first.
+* **ICAP-level ACLs** (`icap_access`, `acl`): restrict access with the bind address
+  and a firewall.
+* **TLS** (ICAPS): terminate it in front, or keep the hop on loopback or a private
+  network.
+* **`X-Violations-Found`**, the older multi-violation header: exav reports one
+  verdict per object through `X-Infection-Found` / `X-Exav-Category`.
+* **`206 Partial Content`**: exav returns a full replacement body instead.

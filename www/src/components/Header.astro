@@ -1,0 +1,92 @@
+---
+// Starlight's header (site title, search, social links) with the site's
+// sections between the title and the search. The theme and language pickers
+// are left out: the site is dark only and in English.
+//
+// From Starlight's `md` breakpoint (50rem) the sections are tabs here, with
+// the search box shrunk to its icon up to 64rem to make room. Below it they
+// are in Starlight's mobile menu (Sidebar.astro), or in SectionsMenu on pages
+// without a sidebar.
+import Search from '@astrojs/starlight/components/Search.astro';
+import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
+import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
+import SectionsMenu from './SectionsMenu.astro';
+import TopicNav from './TopicNav.astro';
+
+const { hasSidebar } = Astro.locals.starlightRoute;
+---
+
+<div class="header">
+  <div class="title-wrapper sl-flex">
+    <SiteTitle />
+  </div>
+  <div class="topics sl-hidden md:sl-flex">
+    <TopicNav />
+  </div>
+  <div class="search sl-flex print:hidden">
+    <Search />
+  </div>
+  <div class="social-icons sl-hidden md:sl-flex print:hidden">
+    <SocialIcons />
+  </div>
+  {
+    !hasSidebar && (
+      <div class="md:sl-hidden">
+        <SectionsMenu />
+      </div>
+    )
+  }
+</div>
+
+<style>
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    height: 100%;
+  }
+
+  .title-wrapper {
+    flex: none;
+    /* Keep a long title from covering the buttons on a narrow screen. */
+    overflow: clip;
+    /* Room for the focus ring of the link inside. */
+    padding: 0.25rem;
+    margin: -0.25rem;
+    min-width: 0;
+  }
+
+  /* The tabs run the header's full height, so the current one's underline
+     sits on its bottom border. */
+  .topics {
+    align-self: stretch;
+    margin-block: calc(-1 * var(--sl-nav-pad-y));
+  }
+
+  .search {
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  @media (min-width: 50rem) {
+    .search :global(button[data-open-modal]) {
+      max-width: 16rem;
+    }
+  }
+
+  @media (min-width: 50rem) and (max-width: 63.99rem) {
+    .search :global(button[data-open-modal]) {
+      width: 2.5rem;
+      padding-inline: 0;
+      justify-content: center;
+    }
+    .search :global(button[data-open-modal] > :not(svg)) {
+      display: none;
+    }
+  }
+
+  .social-icons {
+    gap: 1rem;
+    align-items: center;
+  }
+</style>

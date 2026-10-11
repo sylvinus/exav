@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::byte_source::ByteSource;
 use crate::yara::error::{Error, Result};
 use crate::yara::ir::{Cond, EvalCtx, Value};
 
@@ -80,7 +81,41 @@ impl ModuleCtx {
     /// Builds the module state for one scan. `imported` lists the modules the
     /// rule set imported; `need_entrypoint` is set when any rule uses the
     /// `entrypoint` keyword (which needs a PE parse even without `import "pe"`).
-    pub(crate) fn build(data: &[u8], imported: &[ModuleKind], need_entrypoint: bool) -> Self {
+    ///
+    /// The format parsers read the object whole. One not held in memory is
+    /// read whole when it is at most `materialize` bytes. A larger one gets
+    /// the value the parser gives when the object is not of its format, which
+    /// is exact when the object does not start with that format's magic, and
+    /// the build is otherwise incomplete (the `bool`).
+    pub(crate) fn build(
+        src: &dyn ByteSource,
+        imported: &[ModuleKind],
+        need_entrypoint: bool,
+        materialize: usize,
+    ) -> (Self, bool) {
+        let wants_pe = need_entrypoint
+            || imported.contains(&ModuleKind::Pe)
+            || imported.contains(&ModuleKind::DotNet);
+        let wants_elf = imported.contains(&ModuleKind::Elf);
+        let whole = if wants_pe || wants_elf {
+            src.materialize(materialize)
+        } else {
+            None
+        };
+        let mut complete = true;
+        let data: &[u8] = match &whole {
+            Some(data) => data,
+            None => {
+                let head = src.window(0, 4);
+                complete = !(wants_pe && head.starts_with(b"MZ")
+                    || wants_elf && head.starts_with(b"\x7fELF"));
+                &[]
+            }
+        };
+        (Self::build_from(data, imported, need_entrypoint), complete)
+    }
+
+    fn build_from(data: &[u8], imported: &[ModuleKind], need_entrypoint: bool) -> Self {
         let mut roots = HashMap::new();
         let mut pe_extra = None;
 

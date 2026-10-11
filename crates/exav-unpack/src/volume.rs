@@ -305,6 +305,10 @@ struct Pending {
     key: VolumeName,
     /// `(volume index, name, bytes)`, in arrival order.
     parts: Vec<(usize, String, Vec<u8>)>,
+    /// A part of this set was passed through rather than held, so the set can
+    /// never be joined whole. A lost last part leaves no gap in the indices, so
+    /// this is the only record of it.
+    lost_part: bool,
 }
 
 impl Collector {
@@ -333,13 +337,7 @@ impl Collector {
                 data,
             };
         }
-        if self.held_bytes.saturating_add(data.len() as u64) > self.max_held_bytes {
-            return Offer::PassThrough {
-                name: name.to_string(),
-                data,
-            };
-        }
-
+        let over_budget = self.held_bytes.saturating_add(data.len() as u64) > self.max_held_bytes;
         let slot = self.pending.iter_mut().find(|p| p.key.same_set_as(&vn));
         let set = match slot {
             Some(p) => p,
@@ -347,13 +345,15 @@ impl Collector {
                 self.pending.push(Pending {
                     key: vn.clone(),
                     parts: Vec::new(),
+                    lost_part: false,
                 });
                 self.pending.last_mut().expect("just pushed")
             }
         };
-        // Two members claiming the same position: the set's shape is ambiguous,
+        // Two members claiming the same position make the set's shape ambiguous,
         // so joining would splice bytes in an order nothing wrote.
-        if set.parts.iter().any(|(i, _, _)| *i == vn.index) {
+        if over_budget || set.parts.iter().any(|(i, _, _)| *i == vn.index) {
+            set.lost_part = true;
             return Offer::PassThrough {
                 name: name.to_string(),
                 data,
@@ -373,6 +373,19 @@ impl Collector {
         let mut out = Finished::default();
         for mut set in self.pending {
             set.parts.sort_by_key(|(i, _, _)| *i);
+            if set.lost_part {
+                for (_, name, data) in set.parts {
+                    out.unjoined.push(Unjoined {
+                        name,
+                        data,
+                        incomplete_set: Some(
+                            "part of a multi-volume set one of whose volumes could not be \
+                             held for rejoining",
+                        ),
+                    });
+                }
+                continue;
+            }
             // One numbered file on its own is not a set, however much its name
             // looks like one. Hand it straight back unflagged.
             if set.parts.len() < 2 {
@@ -692,6 +705,30 @@ mod tests {
         );
         assert!(out.iter().any(|(_, d)| d == b"DIFFERENT"));
         let _ = left;
+    }
+
+    /// A part the collector could not hold is scanned on its own, so the set it
+    /// belongs to is missing it. Joining the parts that were held would scan a
+    /// truncated prefix as though it were the archive.
+    #[test]
+    fn a_set_that_lost_a_part_to_the_budget_does_not_join() {
+        let mut c = Collector::new(8);
+        assert!(matches!(
+            c.offer("s.tar.gz.001", b"AAA".to_vec()),
+            Offer::Held
+        ));
+        assert!(matches!(
+            c.offer("s.tar.gz.002", b"BBB".to_vec()),
+            Offer::Held
+        ));
+        assert!(matches!(
+            c.offer("s.tar.gz.003", b"CCCCCC".to_vec()),
+            Offer::PassThrough { .. }
+        ));
+        let done = c.finish();
+        assert!(done.joined.is_empty(), "joined a set missing its last part");
+        assert_eq!(done.unjoined.len(), 2);
+        assert!(done.unjoined.iter().all(|u| u.incomplete_set.is_some()));
     }
 
     #[test]

@@ -1,15 +1,15 @@
-//! The byte sources `exav_unpack::Archive` reads through.
+//! The sources an archive not held in memory is read through.
 //!
-//! `Archive` is `Read + Seek`, which is to say synchronous, and that is not an
-//! obstacle to be worked around — it is the reason this crate can share ONE set
+//! The archive readers read by offset, synchronously, and that is not an
+//! obstacle to be worked around: it is the reason this crate can share ONE set
 //! of archive readers with the rest of exav instead of carrying a second that
-//! drifts. What it needs is a synchronous way to read a `Blob`, and browsers
+//! drifts. What they need is a synchronous way to read a `Blob`, and browsers
 //! have exactly one: [`web_sys::FileReaderSync`], which exists only inside a
 //! Worker. So the `File` path runs in a Worker, and `js/index.js` turns that
 //! into the async API a caller on the main thread sees.
 //!
-//! Bytes already in memory need none of this: a `Cursor` is `Read + Seek`
-//! already, so that path stays on the main thread and costs no Worker at all.
+//! Bytes already in memory need none of this, so that path stays on the main
+//! thread and costs no Worker at all.
 
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -77,9 +77,9 @@ impl<F: Fetch> Read for Windowed<F> {
 impl<F: Fetch> Seek for Windowed<F> {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let at = match to {
-            SeekFrom::Start(n) => n as i64,
-            SeekFrom::End(n) => self.src.len() as i64 + n,
-            SeekFrom::Current(n) => self.pos as i64 + n,
+            SeekFrom::Start(n) => i128::from(n),
+            SeekFrom::End(n) => i128::from(self.src.len()) + i128::from(n),
+            SeekFrom::Current(n) => i128::from(self.pos) + i128::from(n),
         };
         if at < 0 {
             return Err(io::Error::other("seek before the start of the archive"));
@@ -87,7 +87,7 @@ impl<F: Fetch> Seek for Windowed<F> {
         // Seeking PAST the end is legal and reads nothing; the next `read`
         // returns zero bytes. Refusing here would reject a reader that seeks to
         // a computed offset before checking it.
-        self.pos = at as u64;
+        self.pos = u64::try_from(at).map_err(|_| io::Error::other("seek past the largest offset"))?;
         Ok(self.pos)
     }
 }
@@ -127,8 +127,8 @@ impl Fetch for BlobFetch {
 
 /// A caller-supplied `{ read(offset, length): Uint8Array, size: number }`.
 ///
-/// `read` is SYNCHRONOUS. An async one cannot be called from here at all — the
-/// archive readers are `Read + Seek`, and there is no way to await inside a
+/// `read` is SYNCHRONOUS. An async one cannot be called from here at all: the
+/// archive readers read synchronously, and there is no way to await inside a
 /// `read` that returns bytes. Supplying a source is still the escape hatch it
 /// always was; what it hands back is bytes rather than a promise of them.
 pub(crate) struct JsFetch {
@@ -160,11 +160,9 @@ impl Fetch for JsFetch {
 
 /// Whichever source this archive was opened from.
 ///
-/// One concrete type rather than a generic parameter: `exav_unpack::Archive<R>`
-/// would otherwise be a different type per source, and the exported `Archive`
-/// can only be one of them.
+/// One concrete type rather than a generic parameter: the exported `Archive`
+/// holds one, and can only be one type.
 pub(crate) enum Src {
-    Memory(io::Cursor<Vec<u8>>),
     Blob(Box<Windowed<BlobFetch>>),
     Js(Box<Windowed<JsFetch>>),
 }
@@ -211,7 +209,6 @@ impl Src {
 impl Read for Src {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         match self {
-            Src::Memory(c) => c.read(out),
             Src::Blob(b) => b.read(out),
             Src::Js(j) => j.read(out),
         }
@@ -221,7 +218,6 @@ impl Read for Src {
 impl Seek for Src {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         match self {
-            Src::Memory(c) => c.seek(to),
             Src::Blob(b) => b.seek(to),
             Src::Js(j) => j.seek(to),
         }

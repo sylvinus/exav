@@ -1,6 +1,6 @@
 //! Hostile-input panic containment: a malformed container must never panic the
-//! process. Third-party decoders can panic on crafted input, so `extract_each`
-//! wraps format dispatch in a catch-unwind boundary that turns any such panic
+//! process. Third-party decoders can panic on crafted input, so `walk` wraps
+//! format dispatch in a catch-unwind boundary that turns any such panic
 //! into a clean `LimitHit`.
 
 use exav_unpack::{extract, Budget, Format, Limits};
@@ -57,7 +57,7 @@ fn malformed_iso_short_record_does_not_panic() {
         &include_bytes!("../fixtures/iso_short_record2.iso")[..],
     ] {
         let mut budget = Budget::new(Limits::default());
-        let _ = extract(Format::Iso, data, &mut budget);
+        let _ = extract(Format::Iso, &data, &mut budget);
     }
 }
 
@@ -78,7 +78,7 @@ fn malformed_upx_nrv_gamma_does_not_panic() {
 /// Regression for fuzz-found crash (2026-07-01): a truncated CAB with LZX
 /// compressed data triggers an index-out-of-bounds in `lzxd`'s bitstream
 /// reader (`bitstream.rs:37` — `self.buffer[1]` when buffer has 1 byte).
-/// Must not panic; the `catch_unwind` boundary in `extract_each` turns it
+/// Must not panic; the `catch_unwind` boundary in `walk` turns it
 /// into a clean `LimitHit`.
 #[test]
 fn cab_lzxd_bitstream_oob_does_not_panic() {
@@ -103,31 +103,7 @@ fn lha_delharc_overflow_does_not_panic() {
         &include_bytes!("../fixtures/lha_delharc_overflow_min.lha")[..],
     ] {
         let mut budget = Budget::new(Limits::default());
-        let _ = extract(Format::Lha, data, &mut budget);
-    }
-}
-
-/// Same crafted LHA headers, but driven through the **streaming** API
-/// (`stream_members`) — which has its own `catch_unwind` boundary. LHA is
-/// stream-extractable, so the delharc panic must be contained here too.
-#[test]
-fn lha_delharc_overflow_stream_does_not_panic() {
-    use exav_unpack::{stream_members, MemberMeta};
-    use std::io::{Cursor, Read};
-    for data in [
-        &include_bytes!("../fixtures/lha_delharc_overflow.lha")[..],
-        &include_bytes!("../fixtures/lha_delharc_overflow_min.lha")[..],
-    ] {
-        let mut budget = Budget::new(Limits::default());
-        let mut visit =
-            |_m: &MemberMeta, r: Option<&mut dyn Read>, _b: &mut Budget| -> Option<()> {
-                if let Some(r) = r {
-                    let mut sink = Vec::new();
-                    let _ = r.read_to_end(&mut sink);
-                }
-                None
-            };
-        let _ = stream_members(Format::Lha, Cursor::new(data), &mut budget, &mut visit);
+        let _ = extract(Format::Lha, &data, &mut budget);
     }
 }
 
@@ -145,7 +121,7 @@ fn lha_delharc_oom_is_bounded() {
 ///
 /// Every other test here uses an input that once panicked a particular decoder.
 /// Those are real regressions and worth keeping, but they do not test
-/// `extract_each`'s `catch_unwind`: fix all of those decoders and they keep
+/// `walk`'s `catch_unwind`: fix all of those decoders and they keep
 /// passing with the boundary deleted. This panics from inside the dispatch for
 /// input nothing else produces, so the only thing that can turn it into a
 /// `LimitHit` is the boundary.

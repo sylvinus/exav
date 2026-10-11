@@ -26,7 +26,7 @@
 //! that would are present so a stub gets a plausible answer, and they fail the
 //! way they would on a machine where the operation is not permitted.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::cpu::{Cpu, Stop, EAX, ESP};
 use crate::mem::{Mem, PAGE_SIZE};
@@ -79,6 +79,22 @@ const MAPPING_HANDLE_BASE: u32 = 0x0000_0800;
 /// The path the emulator reports for the program, and the only one that opens.
 const SAMPLE_PATH: &str = "C:\\sample.exe";
 const PROCESS_HEAP: u32 = 0x0052_0000;
+
+/// TLS indices a process has: `TLS_MINIMUM_AVAILABLE` (64) plus the 1024
+/// expansion slots. `TlsSetValue`/`TlsGetValue` reject anything past it.
+const TLS_SLOTS: usize = 1088;
+const TLS_OUT_OF_INDEXES: u32 = 0xffff_ffff;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_TOO_MANY_OPEN_FILES: u32 = 4;
+
+/// Handles to the sample open at once. A stub that opens itself without
+/// closing grew the table by an entry a call, as far as the tick budget let it.
+const MAX_OPEN_FILES: usize = 256;
+
+/// What a search of one entry of a table is charged, in bulk bytes (a tick per
+/// page of them): the driver bounds work, not calls, and these searches walk
+/// tables a stub grows.
+const SCAN_CHARGE: u64 = 256;
 
 /// A synthetic loaded module.
 #[derive(Debug, Clone)]
@@ -136,6 +152,7 @@ enum Api {
     TlsAlloc,
     TlsSetValue,
     TlsGetValue,
+    TlsFree,
     Sleep,
     CloseHandle,
     CreateFile {
@@ -264,7 +281,7 @@ const APIS: &[ApiSpec] = &[
     k("TlsAlloc", 0, Api::TlsAlloc),
     k("TlsSetValue", 2, Api::TlsSetValue),
     k("TlsGetValue", 1, Api::TlsGetValue),
-    k("TlsFree", 1, Api::Const(1)),
+    k("TlsFree", 1, Api::TlsFree),
     k("Sleep", 1, Api::Sleep),
     k("CloseHandle", 1, Api::CloseHandle),
     k("CreateFileA", 7, Api::CreateFile { wide: false }),
@@ -707,11 +724,11 @@ pub struct Env<'a> {
     /// touches no host file: the only path that resolves is the program's own.
     file: &'a [u8],
     /// Open handles onto that file, with their read positions.
-    open_files: HashMap<u32, u32>,
+    open_files: FxHashMap<u32, u32>,
     next_handle: u32,
     /// Scratch cell handed back by the CRT's `__p__*` accessors.
     crt_cell: u32,
-    traps: HashMap<u32, Trap>,
+    traps: FxHashMap<u32, Trap>,
     /// Base address of the emulated program image (what `GetModuleHandle(NULL)`
     /// returns).
     pub image_base: u32,
@@ -723,8 +740,10 @@ pub struct Env<'a> {
     last_error: u32,
     tick: u32,
     perf: u64,
-    tls: HashMap<u32, u32>,
-    tls_next: u32,
+    /// Per-index TLS values and which indices `TlsAlloc` handed out, both
+    /// `TLS_SLOTS` long so a guest cannot grow them.
+    tls: Vec<u32>,
+    tls_used: Vec<bool>,
     /// Exports that were called but not implemented, for diagnostics.
     pub missing_apis: Vec<String>,
     /// Record every serviced call. Off on the scan path; the triage tool turns
@@ -754,23 +773,25 @@ impl<'a> Env<'a> {
         let mut env = Env {
             modules: Vec::new(),
             file,
-            open_files: HashMap::new(),
+            open_files: FxHashMap::default(),
             next_handle: FILE_HANDLE_BASE,
             crt_cell: ENV_BASE + 0x100,
-            traps: HashMap::new(),
+            traps: FxHashMap::default(),
             image_base,
             heap_next: HEAP_BASE,
             allocations: Vec::new(),
             last_error: 0,
             tick: 0x0001_0000,
             perf: 0x0010_0000,
-            tls: HashMap::new(),
-            tls_next: 1,
+            tls: vec![0; TLS_SLOTS],
+            tls_used: vec![false; TLS_SLOTS],
             missing_apis: Vec::new(),
             trace: false,
             api_log: Vec::new(),
             bulk_bytes: 0,
         };
+        // Slot 0 starts taken: the first `TlsAlloc` returns 1.
+        env.tls_used[0] = true;
         map(mem, STACK_BASE, STACK_SIZE)?;
         map(mem, ENV_BASE, PAGE_SIZE as u32)?;
         map(mem, LDR_BASE, 0x4000)?;
@@ -1134,7 +1155,7 @@ impl<'a> Env<'a> {
                 match self.find_module_by_name(&name).map(|m| m.base) {
                     Some(b) => b,
                     None => {
-                        let base = self.next_module_base();
+                        let base = self.next_module_base(mem);
                         match self.create_module(mem, &name, base) {
                             Ok(()) => base,
                             Err(_) => 0,
@@ -1164,7 +1185,7 @@ impl<'a> Env<'a> {
                         // unknown DLL is how a stub probes for a sandbox, and
                         // the honest answer there is that it is not there.
                         None if is_system_dll(&name) => {
-                            let base = self.next_module_base();
+                            let base = self.next_module_base(mem);
                             match self.create_module(mem, &name, base) {
                                 Ok(()) => base,
                                 Err(_) => 0,
@@ -1200,15 +1221,18 @@ impl<'a> Env<'a> {
                 let mbi = arg(cpu, mem, 1)?;
                 let page = addr & !(PAGE_SIZE as u32 - 1);
                 let committed = mem.is_mapped(page, 1);
+                // The guest's pointer: its fields can lie past 4 GiB, where
+                // the wrapped address faults.
+                let f = |off: u32| mbi.wrapping_add(off);
                 mem.write_u32(mbi, page).map_err(Stop::Fault)?; // BaseAddress
-                mem.write_u32(mbi + 4, page).map_err(Stop::Fault)?; // AllocationBase
-                mem.write_u32(mbi + 8, 0x40).map_err(Stop::Fault)?; // AllocationProtect
-                mem.write_u32(mbi + 12, PAGE_SIZE as u32)
+                mem.write_u32(f(4), page).map_err(Stop::Fault)?; // AllocationBase
+                mem.write_u32(f(8), 0x40).map_err(Stop::Fault)?; // AllocationProtect
+                mem.write_u32(f(12), PAGE_SIZE as u32)
                     .map_err(Stop::Fault)?; // RegionSize
-                mem.write_u32(mbi + 16, if committed { 0x1000 } else { 0x10000 })
+                mem.write_u32(f(16), if committed { 0x1000 } else { 0x10000 })
                     .map_err(Stop::Fault)?; // State
-                mem.write_u32(mbi + 20, 0x40).map_err(Stop::Fault)?; // Protect
-                mem.write_u32(mbi + 24, 0x20000).map_err(Stop::Fault)?; // Type
+                mem.write_u32(f(20), 0x40).map_err(Stop::Fault)?; // Protect
+                mem.write_u32(f(24), 0x20000).map_err(Stop::Fault)?; // Type
                 28
             }
             Api::HeapCreate => PROCESS_HEAP,
@@ -1222,6 +1246,7 @@ impl<'a> Env<'a> {
                 let size = arg(cpu, mem, 3)?;
                 let new = self.alloc(mem, 0, size);
                 if new != 0 && old != 0 {
+                    self.bulk_bytes += (self.allocations.len() as u64).saturating_mul(SCAN_CHARGE);
                     let keep = self
                         .allocations
                         .iter()
@@ -1293,10 +1318,11 @@ impl<'a> Env<'a> {
             Api::GetVersion => 0x0a28_0105, // Windows XP, as a stub expects
             Api::GetVersionEx => {
                 let p = arg(cpu, mem, 0)?;
-                mem.write_u32(p + 4, 5).map_err(Stop::Fault)?; // major
-                mem.write_u32(p + 8, 1).map_err(Stop::Fault)?; // minor
-                mem.write_u32(p + 12, 2600).map_err(Stop::Fault)?; // build
-                mem.write_u32(p + 16, 2).map_err(Stop::Fault)?; // platform
+                let f = |off: u32| p.wrapping_add(off);
+                mem.write_u32(f(4), 5).map_err(Stop::Fault)?; // major
+                mem.write_u32(f(8), 1).map_err(Stop::Fault)?; // minor
+                mem.write_u32(f(12), 2600).map_err(Stop::Fault)?; // build
+                mem.write_u32(f(16), 2).map_err(Stop::Fault)?; // platform
                 1
             }
             Api::GetTickCount => {
@@ -1307,7 +1333,7 @@ impl<'a> Env<'a> {
                 let p = arg(cpu, mem, 0)?;
                 self.perf = self.perf.wrapping_add(0x1000);
                 mem.write_u32(p, self.perf as u32).map_err(Stop::Fault)?;
-                mem.write_u32(p + 4, (self.perf >> 32) as u32)
+                mem.write_u32(p.wrapping_add(4), (self.perf >> 32) as u32)
                     .map_err(Stop::Fault)?;
                 1
             }
@@ -1340,46 +1366,86 @@ impl<'a> Env<'a> {
                 let p = arg(cpu, mem, 0)?;
                 let zero = [0u8; 36];
                 mem.write_bytes(p, &zero).map_err(Stop::Fault)?;
-                mem.write_u32(p + 4, PAGE_SIZE as u32)
-                    .map_err(Stop::Fault)?; // dwPageSize
-                mem.write_u32(p + 8, 0x0001_0000).map_err(Stop::Fault)?; // lpMinimumApplicationAddress
-                mem.write_u32(p + 12, 0x7ffe_0000).map_err(Stop::Fault)?; // lpMaximumApplicationAddress
-                mem.write_u32(p + 20, 1).map_err(Stop::Fault)?; // dwNumberOfProcessors
-                mem.write_u32(p + 32, 0x1000).map_err(Stop::Fault)?; // dwAllocationGranularity
+                let f = |off: u32| p.wrapping_add(off);
+                mem.write_u32(f(4), PAGE_SIZE as u32).map_err(Stop::Fault)?; // dwPageSize
+                mem.write_u32(f(8), 0x0001_0000).map_err(Stop::Fault)?; // lpMinimumApplicationAddress
+                mem.write_u32(f(12), 0x7ffe_0000).map_err(Stop::Fault)?; // lpMaximumApplicationAddress
+                mem.write_u32(f(20), 1).map_err(Stop::Fault)?; // dwNumberOfProcessors
+                mem.write_u32(f(32), 0x1000).map_err(Stop::Fault)?; // dwAllocationGranularity
                 0
             }
             Api::GetSystemTimeAsFileTime => {
                 let p = arg(cpu, mem, 0)?;
                 self.perf = self.perf.wrapping_add(0x1000);
                 mem.write_u32(p, self.perf as u32).map_err(Stop::Fault)?;
-                mem.write_u32(p + 4, 0x01c9_0000).map_err(Stop::Fault)?;
+                mem.write_u32(p.wrapping_add(4), 0x01c9_0000)
+                    .map_err(Stop::Fault)?;
                 0
             }
-            Api::TlsAlloc => {
-                let i = self.tls_next;
-                self.tls_next += 1;
-                i
-            }
+            Api::TlsAlloc => match self.tls_used.iter().position(|&u| !u) {
+                Some(i) => {
+                    self.tls_used[i] = true;
+                    self.tls[i] = 0;
+                    i as u32
+                }
+                None => TLS_OUT_OF_INDEXES,
+            },
+            // Like Windows, Set/Get only range-check the index; whether it was
+            // allocated is checked by `TlsFree` alone.
             Api::TlsSetValue => {
                 let i = arg(cpu, mem, 0)?;
                 let v = arg(cpu, mem, 1)?;
-                self.tls.insert(i, v);
-                1
+                match self.tls.get_mut(i as usize) {
+                    Some(slot) => {
+                        *slot = v;
+                        1
+                    }
+                    None => {
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        0
+                    }
+                }
             }
             Api::TlsGetValue => {
                 let i = arg(cpu, mem, 0)?;
-                self.tls.get(&i).copied().unwrap_or(0)
+                match self.tls.get(i as usize) {
+                    Some(&v) => v,
+                    None => {
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        0
+                    }
+                }
+            }
+            Api::TlsFree => {
+                let i = arg(cpu, mem, 0)? as usize;
+                if self.tls_used.get(i).copied().unwrap_or(false) {
+                    self.tls_used[i] = false;
+                    self.tls[i] = 0;
+                    1
+                } else {
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    0
+                }
             }
             Api::Sleep => 0,
-            Api::CloseHandle => 1,
+            Api::CloseHandle => {
+                let h = arg(cpu, mem, 0)?;
+                self.open_files.remove(&h);
+                1
+            }
             Api::CreateFile { wide } => {
                 let p = arg(cpu, mem, 0)?;
                 let path = read_str(mem, p, wide)?;
                 if self.is_own_path(&path) {
-                    let h = self.next_handle;
-                    self.next_handle += 4;
-                    self.open_files.insert(h, 0);
-                    h
+                    if self.open_files.len() >= MAX_OPEN_FILES {
+                        self.last_error = ERROR_TOO_MANY_OPEN_FILES;
+                        INVALID_HANDLE
+                    } else {
+                        let h = self.next_handle;
+                        self.next_handle = self.next_handle.wrapping_add(4);
+                        self.open_files.insert(h, 0);
+                        h
+                    }
                 } else {
                     // Every other path does not exist here at all: there is
                     // no host filesystem behind this environment.
@@ -1644,7 +1710,7 @@ impl<'a> Env<'a> {
             let module_base = match self.find_module_by_name(&dll).map(|m| m.base) {
                 Some(b) => b,
                 None => {
-                    let b = self.next_module_base();
+                    let b = self.next_module_base(mem);
                     if self.create_module(mem, &dll, b).is_err() {
                         continue;
                     }
@@ -1707,6 +1773,7 @@ impl<'a> Env<'a> {
         let Some(module_name) = self.find_module(hmod).map(|m| m.name.clone()) else {
             return 0;
         };
+        self.bulk_bytes += (self.traps.len() as u64).saturating_mul(SCAN_CHARGE);
         // The lowest matching trap, not the first one iteration happens to
         // reach. More than one can match — a module created twice under two
         // spellings of its name, or an alias resolved after the export table
@@ -1775,15 +1842,22 @@ impl<'a> Env<'a> {
         p == SAMPLE_PATH.to_ascii_lowercase() || base == "sample.exe"
     }
 
-    fn next_module_base(&self) -> u32 {
+    fn next_module_base(&self, mem: &Mem) -> u32 {
         // Below the preloaded system DLLs, growing down, so a newly "loaded"
-        // module never lands on one that is already mapped.
-        self.modules
+        // module never lands on one that is already mapped. Memory the stub
+        // mapped there itself is stepped over: laying a module on it fails,
+        // and would fail again at the same address for every later load.
+        let mut at = self
+            .modules
             .iter()
             .map(|m| m.base)
             .min()
             .unwrap_or(0x7000_0000)
-            .saturating_sub(MODULE_SIZE)
+            .saturating_sub(MODULE_SIZE);
+        while at > 0 && mem.any_mapped(at, MODULE_SIZE) {
+            at = at.saturating_sub(MODULE_SIZE);
+        }
+        at
     }
 }
 
@@ -2062,6 +2136,31 @@ mod tests {
         );
     }
 
+    /// Found by fuzzing (`pe_emulator`): an import directory whose first
+    /// descriptor starts 16 bytes below 4 GiB, in a mapped top page. Its
+    /// `FirstThunk` field lies past the top, and reading it overflowed.
+    #[test]
+    fn an_import_descriptor_past_the_top_of_memory_is_not_read() {
+        let (mut mem, mut env) = env();
+        mem.map(0xffff_f000, 0x1000).unwrap();
+        let dir_rva = 0xffff_fff0u32.wrapping_sub(0x0040_0000);
+        assert_eq!(env.bind_imports(&mut mem, 0x0040_0000, dir_rva, 20), Ok(0));
+    }
+
+    /// An API's output pointer is the guest's, so its fields can lie past
+    /// 4 GiB: writing them faults, it does not overflow.
+    #[test]
+    fn an_output_struct_past_the_top_of_memory_faults() {
+        let (mut mem, mut env) = env();
+        mem.map(0xffff_f000, 0x1000).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.regs[ESP] = INITIAL_ESP;
+        cpu.push32(&mut mem, 0xffff_fff8).unwrap(); // lpVersionInformation
+        cpu.push32(&mut mem, 0xdead_0000).unwrap();
+        cpu.eip = trap_for(&env, "kernel32.dll", "GetVersionExA");
+        assert!(matches!(env.call(&mut cpu, &mut mem), Err(Stop::Fault(_))));
+    }
+
     #[test]
     fn virtualalloc_hands_out_usable_pages() {
         let (mut mem, mut env) = env();
@@ -2181,6 +2280,124 @@ mod tests {
         assert_eq!(
             env.find_module(h).map(|m| m.name.as_str()),
             Some("wininet.dll")
+        );
+    }
+
+    /// Call a stdcall kernel32 export with `args` and return EAX.
+    fn call_k32(env: &mut Env, mem: &mut Mem, name: &str, args: &[u32]) -> u32 {
+        let mut cpu = Cpu::new();
+        cpu.regs[ESP] = INITIAL_ESP;
+        for &a in args.iter().rev() {
+            cpu.push32(mem, a).unwrap();
+        }
+        cpu.push32(mem, 0xdead_0000).unwrap(); // return address
+        cpu.eip = trap_for(env, "kernel32.dll", name);
+        assert_eq!(env.call(&mut cpu, mem).unwrap(), ApiEffect::Continue);
+        cpu.regs[EAX]
+    }
+
+    /// A module is placed below the others; memory the stub mapped on that
+    /// spot is stepped over. Laid on it, the load failed, and failed again at
+    /// the same address for every library the stub asked for after.
+    #[test]
+    fn a_library_is_loaded_past_memory_the_stub_mapped_where_it_would_go() {
+        let (mut mem, mut env) = env();
+        let blocked = env.next_module_base(&mem);
+        mem.map(blocked, 0x1000).unwrap();
+        let name = 0x0050_0000u32;
+        mem.map(name, 0x1000).unwrap();
+        mem.write_bytes(name, b"some-library.dll\0").unwrap();
+        let base = call_k32(&mut env, &mut mem, "LoadLibraryA", &[name]);
+        assert_ne!(base, 0, "the load failed on the stub's memory");
+        assert!(base < blocked);
+    }
+
+    /// A stub that opens the sample again and again, closing none, gets
+    /// handles up to a limit and then an error; a handle closed is room for one
+    /// more. The table was one entry a call.
+    #[test]
+    fn handles_to_the_sample_are_limited_and_closing_one_makes_room() {
+        let (mut mem, mut env) = env();
+        let path = 0x0050_0000u32;
+        mem.map(path, 0x1000).unwrap();
+        mem.write_bytes(path, b"C:\\sample.exe\0").unwrap();
+        let open = |env: &mut Env, mem: &mut Mem| {
+            call_k32(env, mem, "CreateFileA", &[path, 0x8000_0000, 1, 0, 3, 0, 0])
+        };
+        let first = open(&mut env, &mut mem);
+        assert_ne!(first, INVALID_HANDLE);
+        for _ in 1..MAX_OPEN_FILES {
+            assert_ne!(open(&mut env, &mut mem), INVALID_HANDLE);
+        }
+        assert_eq!(open(&mut env, &mut mem), INVALID_HANDLE);
+        assert_eq!(env.last_error, ERROR_TOO_MANY_OPEN_FILES);
+        assert_eq!(env.open_files.len(), MAX_OPEN_FILES);
+        assert_eq!(call_k32(&mut env, &mut mem, "CloseHandle", &[first]), 1);
+        assert_ne!(open(&mut env, &mut mem), INVALID_HANDLE);
+    }
+
+    /// `GetProcAddress` searches every trap, so with many of them a call is
+    /// charged for the search; one tick each let a stub spend the budget on
+    /// searches of a table it had grown.
+    #[test]
+    fn resolving_an_export_is_charged_for_the_search() {
+        let (mut mem, mut env) = env();
+        let name = 0x0050_0000u32;
+        mem.map(name, 0x1000).unwrap();
+        mem.write_bytes(name, b"VirtualAlloc\0").unwrap();
+        let k32 = env.find_module_by_name("kernel32.dll").unwrap().base;
+        assert_eq!(env.take_bulk_bytes(), 0);
+        let addr = call_k32(&mut env, &mut mem, "GetProcAddress", &[k32, name]);
+        assert_ne!(addr, 0);
+        let charged = env.take_bulk_bytes();
+        // Hundreds of traps: a tick or more, where a lookup is one.
+        assert!(env.traps.len() > 100);
+        assert!(charged >= PAGE_SIZE as u64, "charged {charged}");
+    }
+
+    /// TLS state is bounded by the index range, whatever indices a guest
+    /// passes, and `TlsFree` only releases what `TlsAlloc` handed out.
+    #[test]
+    fn tls_indices_are_bounded_and_freed() {
+        let (mut mem, mut env) = env();
+
+        let i = call_k32(&mut env, &mut mem, "TlsAlloc", &[]);
+        assert_eq!(i, 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsSetValue", &[i, 0x1234]), 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsGetValue", &[i]), 0x1234);
+
+        for bad in [TLS_SLOTS as u32, 0x7fff_ffff, u32::MAX] {
+            assert_eq!(call_k32(&mut env, &mut mem, "TlsSetValue", &[bad, 1]), 0);
+            assert_eq!(env.last_error, ERROR_INVALID_PARAMETER);
+            assert_eq!(call_k32(&mut env, &mut mem, "TlsGetValue", &[bad]), 0);
+        }
+        assert_eq!(env.tls.len(), TLS_SLOTS);
+
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsFree", &[i]), 1);
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsGetValue", &[i]), 0);
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "TlsFree", &[i]),
+            0,
+            "double free"
+        );
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "TlsFree", &[5]),
+            0,
+            "never allocated"
+        );
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsFree", &[u32::MAX]), 0);
+
+        // The freed index is reused, then the pool runs out.
+        assert_eq!(call_k32(&mut env, &mut mem, "TlsAlloc", &[]), 1);
+        for _ in 2..TLS_SLOTS {
+            assert_ne!(
+                call_k32(&mut env, &mut mem, "TlsAlloc", &[]),
+                TLS_OUT_OF_INDEXES
+            );
+        }
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "TlsAlloc", &[]),
+            TLS_OUT_OF_INDEXES
         );
     }
 

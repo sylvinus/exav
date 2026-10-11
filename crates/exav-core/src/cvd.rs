@@ -91,7 +91,7 @@ pub fn read_with_limits(
     // scan input) are disabled.
     let tar_bytes: Vec<u8> = if payload.starts_with(&[0x1f, 0x8b]) {
         let mut budget = cvd_budget(limits.max_tar_bytes, 2);
-        unpack::extract(unpack::Format::Gzip, payload, &mut budget)
+        unpack::extract(unpack::Format::Gzip, &payload, &mut budget)
             .map_err(|h| format!("cvd gunzip: {}", h.reason))?
             .into_iter()
             .next()

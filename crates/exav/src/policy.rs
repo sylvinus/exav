@@ -2,13 +2,13 @@
 //!
 //! Two questions an operator answers, each with one flag:
 //!
-//! * [`PartialStatus`] — what becomes of an object exav could not fully
+//! * [`PartialStatus`]: what becomes of an object exav could not fully
 //!   examine. Blocked, reported as a detection, or delivered.
-//! * [`Detectors`] — which heuristic detectors run at all, over and above the
+//! * [`Detectors`]: which heuristic detectors run at all, over and above the
 //!   signature database.
 //!
 //! One flag each rather than a boolean per condition, for two reasons. A
-//! boolean per condition cannot express "all of them" — a reader has to know
+//! boolean per condition cannot express "all of them": a reader has to know
 //! the whole set to switch it on. And "exav could not fully examine this" is one
 //! condition with three possible outcomes, so spreading it over a family of
 //! switches lets an operator ask for two of them at once and leaves the answer
@@ -38,11 +38,11 @@ pub(crate) fn current() -> PartialAs {
 
 /// Apply the policy to a finished report, in place.
 ///
-/// The single point where `pass` and `alert` take effect, so a partial
+/// The single point where `ok` and `found` take effect, so a partial
 /// object reaches an exit code, a `clamd` reply, a JSON record and a summary
 /// counter having already been through it. Doing it per surface would be four
 /// chances to forget one, and forgetting the CLI's would mean an object the
-/// operator asked to pass still exiting 2.
+/// operator asked to pass still exiting 3.
 ///
 /// `found` is a no-op for the conditions the engine names itself
 /// (`--partial-as password-protected=found` becomes `Heuristics.Encrypted.*`
@@ -64,8 +64,8 @@ pub(crate) fn apply(report: &mut ScanReport, policy: PartialAs) {
             // Loud, per object. A pass an operator configured is a risk they
             // accepted; a pass they cannot count is one they cannot review.
             eprintln!(
-                "exav: reporting an object that could not be fully examined as OK ({tag}: {}) \
-                 — --partial-as says so",
+                "exav: reporting an object that could not be fully examined as OK ({tag}: {}), \
+                 as --partial-as says",
                 report.verdict.detail().unwrap_or_default()
             );
             report.verdict = Verdict::Clean;
@@ -85,7 +85,7 @@ pub(crate) fn apply(report: &mut ScanReport, policy: PartialAs) {
 /// `Heuristics.Exav.Unscannable`.
 ///
 /// `Heuristics.` is the prefix ClamAV puts on a policy finding rather than a
-/// database entry, and `.Exav.` says which scanner synthesised it — so no
+/// database entry, and `.Exav.` says which scanner synthesised it, so no
 /// signature set can collide with it and no analyst can mistake it for a hit.
 pub(crate) fn heuristic_name(tag: &str) -> String {
     let mut out = String::from("Heuristics.Exav.");
@@ -102,7 +102,7 @@ pub(crate) fn heuristic_name(tag: &str) -> String {
 /// Which status a partial verdict is reported as.
 ///
 /// The values are the four statuses themselves, so the name of the value is the
-/// name of the outcome — and, because status and exit code are 1:1, the value
+/// name of the outcome, and, because status and exit code are 1:1, the value
 /// also names the exit code it produces. Nothing to look up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PartialStatus {
@@ -113,7 +113,7 @@ pub(crate) enum PartialStatus {
     Partial,
     /// Deliver it as clean: `OK`, exit `0`, an ICAP `204`.
     ///
-    /// Never silently — a passed object is logged wherever it happens, and the
+    /// Never silently: a passed object is logged wherever it happens, and the
     /// ICAP response still carries the headers saying what was skipped.
     Ok,
     /// Call it a detection, named `Heuristics.*`: `FOUND`, exit `1`,
@@ -125,7 +125,7 @@ pub(crate) enum PartialStatus {
     /// For a caller that would rather not learn a fourth exit code, or that
     /// wants any unexaminable object to stop the pipeline as loudly as a broken
     /// scanner does. Identical to `partial` on every surface that has no exit
-    /// code of its own — the clamd wire and ICAP.
+    /// code of its own: the clamd wire and ICAP.
     Error,
 }
 
@@ -154,9 +154,9 @@ impl fmt::Display for PartialStatus {
     }
 }
 
-/// The status tags a partial verdict reports under — the values
+/// The status tags a partial verdict reports under (the values
 /// [`Verdict::status_tag`](exav_core::Verdict::status_tag) returns for the
-/// `PartialAs` category — paired with the name an operator writes.
+/// `PartialAs` category), paired with the name an operator writes.
 ///
 /// The two spellings differ on purpose: the wire tag is shouted
 /// (`PASSWORD-PROTECTED`) because it appears in a protocol reply, and the flag
@@ -176,7 +176,7 @@ pub(crate) struct PartialAs {
 }
 
 impl PartialAs {
-    /// One status for every category — what a bare `--partial-as ok` means, and
+    /// One status for every category: what a bare `--partial-as ok` means, and
     /// what `--clamav-compat` installs.
     pub(crate) fn uniform(status: PartialStatus) -> Self {
         Self {
@@ -189,7 +189,7 @@ impl PartialAs {
     /// (`password-protected=ok,limits-exceeded=found`).
     ///
     /// A category exav does not know is refused rather than ignored. A setting
-    /// that parsed but named nothing would read as one that never fires — an
+    /// that parsed but named nothing would read as one that never fires: an
     /// operator believing they had opened a hole they had not, or closed one
     /// they had not, and finding out from traffic.
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
@@ -236,11 +236,11 @@ impl PartialAs {
     }
 
     /// Whether any condition is set to `pass`, for the line a listener
-    /// announces itself with — a deployment delivering what it could not
+    /// announces itself with: a deployment delivering what it could not
     /// examine should be legible from its logs alone.
     ///
-    /// Its one caller is the ICAP listener, so a build without `icap` — two of
-    /// which the feature-flag reference offers as copy-paste examples — has
+    /// Its one caller is the ICAP listener, so a build without `icap` (two of
+    /// which the feature-flag reference offers as copy-paste examples) has
     /// nothing calling it. The tests below still do, but they are not compiled
     /// into the binary the warning is raised against.
     #[cfg_attr(not(feature = "icap"), allow(dead_code))]
@@ -281,8 +281,8 @@ impl fmt::Display for PartialAs {
 /// database, off unless asked for.
 ///
 /// `pua` sits in this list even though it is applied at database load rather
-/// than at scan time. From the command line it is the same kind of decision —
-/// "also look for this" — and splitting it out as `--detect-pua` only meant one
+/// than at scan time. From the command line it is the same kind of decision
+/// ("also look for this"), and splitting it out as `--detect-pua` only meant one
 /// more flag to find.
 pub(crate) const DETECTORS: [&str; 8] = [
     "macros",
@@ -359,7 +359,7 @@ impl Detectors {
     pub(crate) fn pua(&self) -> bool {
         self.has("pua")
     }
-    /// TLSH fuzzy matching, the ML scorer and packed-injection-imports — one
+    /// TLSH fuzzy matching, the static scorer and packed-injection-imports: one
     /// engine switch, so one name here. It carries the `exav-` prefix because
     /// ClamAV has no equivalent: every other value names something both engines
     /// can look for, this one names what only exav does.

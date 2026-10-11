@@ -1,0 +1,58 @@
+name: fuzz-nightly
+
+# A longer run of every fuzz target than the 60 seconds a push gets, in fork
+# mode so that one run yields every distinct crash and not the first
+# (scripts/fuzz-campaign.sh). What it finds is uploaded, never committed:
+# triage is docs/FUZZING.md's.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      total:
+        description: "Seconds of fuzzing, split across the targets"
+        default: "10800"
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+      # The corpora of earlier nights: each one starts where the last stopped.
+      - uses: actions/cache@v4
+        with:
+          path: tmp/data
+          key: fuzz-nightly-${{ github.run_id }}
+          restore-keys: fuzz-nightly-
+      - name: cargo-fuzz campaign
+        run: |
+          cargo install cargo-fuzz --locked
+          # A hosted runner has the memory the campaign script's defaults
+          # hold back for a small VM.
+          CARGO_BUILD_JOBS=2 CODEGEN_UNITS=16 TOTAL="${{ inputs.total || 10800 }}" scripts/fuzz-campaign.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+      # Fork mode keeps going after a crash, so the job's status says nothing:
+      # a crash, a hang or an out-of-memory is a file here (a `slow-unit` is
+      # only slow).
+      - name: Fail if the campaign found a crash, a timeout or an OOM
+        run: |
+          found="$(find fuzz/artifacts -type f \( -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' \) 2>/dev/null)"
+          if [ -n "$found" ]; then
+            echo "$found"
+            exit 1
+          fi

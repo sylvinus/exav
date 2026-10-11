@@ -9,27 +9,64 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-# default-features off: the fuzz targets exercise the scan/unpack pipeline, not
-# the yara-x integration (which pulls the heavy wasmtime/cranelift tree and has
-# its own fuzz suite). Keeps the ASan build tractable on a single core.
+# Structured inputs for the targets that write a protocol (clamd, ICAP).
+arbitrary = { version = "1", features = ["derive"] }
+# The custom mutator and the input framing, in a crate of their own so that
+# their tests run without this one's sanitizer build.
+exav-fuzz-support = { path = "support" }
+# Default features off, then what the scanner ships with that matters here: the
+# `yara` feature is the native in-tree engine (no wasmtime), and the targets
+# that scan with `fuzz/db/` and that load signature files reach it. Without it
+# a `.yar` file is stored and never matched.
 # `unstable-internals` re-exposes the engine internals (engine/bytecode/pe/
-# patterns/hashes/…) that several targets fuzz directly — those modules are
+# patterns/hashes/...) that several targets fuzz directly: those modules are
 # crate-private in the default build. `all-formats` fuzzes every extractor
 # (the `unpack`/`analyze`/`full_pipeline` targets rely on it).
 # `decrypt` is enabled so the decryption code paths (ZipCrypto/WinZip-AES, 7z
 # AES, PDF/DMG crypto) are compiled in and fuzzed, not skipped.
-exav-core = { path = "../crates/exav-core", default-features = false, features = ["unstable-internals", "all-formats", "decrypt", "dlp", "phishing"] }
-exav-unpack = { path = "../crates/exav-unpack", default-features = false, features = ["all-formats", "decrypt"] }
+# `checksums` verifies the archives' own CRCs, a path the default scan skips.
+# `image-hash` is `fuzzy_img#` subsignatures.
+exav-core = { path = "../crates/exav-core", default-features = false, features = ["unstable-internals", "all-formats", "decrypt", "dlp", "phishing", "yara", "image-hash", "checksums"] }
+exav-unpack = { path = "../crates/exav-unpack", default-features = false, features = ["all-formats", "decrypt", "checksums"] }
+# The clamd and ICAP parsers, over memory (`exav_cli::fuzzing`): the source of
+# the `exav` binary built as a library, which `exav` itself does not ship.
+exav-cli = { path = "exav-cli" }
 # The x86 emulator, fuzzed directly: it is the only component where the scanned
-# file supplies control flow rather than data, and the only path from those bytes
-# to a dependency that contains `unsafe` (the instruction decoder).
+# file supplies control flow rather than data.
 exav-pe-emu = { path = "../crates/exav-pe-emu" }
 # The instruction decoder, fuzzed differentially against `iced-x86`. Bytes from
 # a scanned file reach it directly, and a decoder that gets a length wrong
-# desynchronises everything after it — so the oracle is compiled in here, and
+# desynchronises everything after it: so the oracle is compiled in here, and
 # only here.
 exav-x86 = { path = "../crates/exav-x86" }
+# The image decoders behind `fuzzy_img#`, every format, fuzzed directly: the
+# scan reaches them only when a database has such a signature.
+exav-imagehash = { path = "../crates/exav-imagehash", default-features = false, features = ["webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2"] }
+# DWG and DXF, which @exav/viewer parses in the browser from whatever a user
+# opens; the scanner does not read them. Its PDF image decoders too (the
+# `imagehash` target), which the viewer runs in place of pdf.js's own.
+exav-render = { path = "../crates/exav-render", default-features = false, features = ["dwg", "image", "jp2", "jbig2", "ccitt", "ifc", "stl"] }
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
+
+# Keep fuzz binaries debuggable while optimized.
+[profile.release]
+debug = 1
+
+# `exav-core` is the memory peak of the whole build. cargo-fuzz forces
+# `codegen-units=1` and full ASan instrumentation through RUSTFLAGS, and on a
+# small host rustc is killed part way through compiling it, which reads in the
+# log exactly like a target that ran and found nothing. Compiling this one crate
+# at a lower optimisation level keeps the peak inside a few gigabytes. It is the
+# harness that gets slower, not the coverage: the instrumentation, the seeds and
+# the assertions are unchanged.
+[profile.release.package.exav-core]
+opt-level = 1
+
+[workspace]
+members = ["support", "exav-cli"]
+
+# Every target is a `fuzz_targets/<name>.rs`. `test = false` because a fuzz
+# target has no unit tests to run; `doc` and `bench` off for the same reason.
 
 [[bin]]
 name = "analyze"
@@ -41,6 +78,69 @@ bench = false
 [[bin]]
 name = "unpack"
 path = "fuzz_targets/unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "full_pipeline"
+path = "fuzz_targets/full_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seekable"
+path = "fuzz_targets/seekable.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yara"
+path = "fuzz_targets/yara.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcre"
+path = "fuzz_targets/pcre.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clamd"
+path = "fuzz_targets/clamd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "icap"
+path = "fuzz_targets/icap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "volumes"
+path = "fuzz_targets/volumes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authenticode"
+path = "fuzz_targets/authenticode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "database"
+path = "fuzz_targets/database.rs"
 test = false
 doc = false
 bench = false
@@ -81,32 +181,25 @@ doc = false
 bench = false
 
 [[bin]]
+name = "imagehash"
+path = "fuzz_targets/imagehash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sigs"
 path = "fuzz_targets/sigs.rs"
 test = false
 doc = false
 bench = false
 
-# Keep fuzz binaries debuggable while optimized.
-[profile.release]
-debug = 1
-
-# `exav-core` is the memory peak of the whole build. cargo-fuzz forces
-# `codegen-units=1` and full ASan instrumentation through RUSTFLAGS, and on a
-# small host rustc is killed part way through compiling it — which reads in the
-# log exactly like a target that ran and found nothing. Compiling this one crate
-# at a lower optimisation level keeps the peak inside a few gigabytes. It is the
-# harness that gets slower, not the coverage: the instrumentation, the seeds and
-# the assertions are unchanged.
-[profile.release.package.exav-core]
-opt-level = 1
-
-[workspace]
-
 [[bin]]
 name = "bytecode"
 path = "fuzz_targets/bytecode.rs"
 test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "rar3_ppmd"
@@ -122,19 +215,40 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "full_pipeline"
-path = "fuzz_targets/full_pipeline.rs"
-test = false
-doc = false
-bench = false
-
 # Nesting depth, which the byte-mutating targets do not reach: every extra level
 # needs another well-formed delimiter pair, so random mutation stalls at two or
 # three. This one constructs the depth instead.
 [[bin]]
 name = "parser_recursion"
 path = "fuzz_targets/parser_recursion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drawing"
+path = "fuzz_targets/drawing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cad_dxf"
+path = "fuzz_targets/cad_dxf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cad_dwg"
+path = "fuzz_targets/cad_dwg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ifc"
+path = "fuzz_targets/ifc.rs"
 test = false
 doc = false
 bench = false

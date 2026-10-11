@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true,
+    "declaration": false,
+    "types": ["vite/client"],
+    "paths": {
+      "@exav/viewer": ["../ts/core/index.ts"],
+      "@exav/viewer/all": ["../ts/all.ts"],
+      "@exav/viewer/*": ["../ts/*/index.ts"]
+    }
+  },
+  "include": ["src", "vite.config.ts"]
+}

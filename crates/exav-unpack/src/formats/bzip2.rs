@@ -1,92 +1,112 @@
-#![allow(unused_imports)]
-use crate::*;
-use std::io::{BufReader, Cursor, Read, Seek, Write};
+//! bzip2: one member, every concatenated stream decoded in turn as it is read.
+use crate::source::{ByteSource, Reader};
+use crate::stream::{emit_stream, single_meta, Visit};
+use crate::{Budget, LimitHit};
+use std::io::Read;
 
-pub(crate) fn extract_bzip2<R>(
-    data: &[u8],
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Visit<T>,
+) -> Result<Option<T>, LimitHit> {
     budget.count_entry()?;
-    let cap = budget.reserve()?;
-    let (out, truncated) = decode_bzip2_streams(data, cap)?;
-    if truncated {
-        return Err(LimitHit::new("bzip2 member exceeds budget".to_string()));
-    }
-    ratio_guard(data.len() as u64, out.len() as u64, budget)?;
-    budget.commit(out.len() as u64);
-    Ok(visit(Entry::new("bzip2-content".to_string(), out), budget))
+    let mut dec = content_reader(src, budget.limits().max_buffer_bytes);
+    emit_stream(
+        &single_meta("bzip2-content", src, None),
+        &mut dec,
+        budget,
+        visit,
+    )
 }
 
-/// Decode every concatenated bzip2 stream (a bzip2 file may be several — `pbzip2`
-/// produces multi-stream output, and the payload can live in a later one).
-/// `DecoderReader` decodes only the first stream.
+/// A reader over the decompressed content of `data`, every concatenated stream
+/// of it (`pbzip2` writes multi-stream files, and the payload can live in a
+/// later one; `DecoderReader` decodes only the first).
 ///
 /// bzip2's decoder buffers a full block ahead, so the exact stream boundary
-/// can't be recovered from the decoder. Instead split on the `BZh[1-9]` stream
-/// magic and decode each slice independently. This is a no-op for the common
-/// single-stream file, and if a `BZh[1-9]` happens to occur *inside* compressed
-/// data (≈1 in 2^32 per position) a slice fails to decode and we fall back to a
-/// plain single-stream decode — so the result is never worse than before.
-fn decode_bzip2_streams(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitHit> {
-    let starts = bzip2_stream_starts(data);
+/// can't be recovered from the decoder. Instead the input is split on the
+/// `BZh[1-9]` stream magic. A single stream, the common case, is handed back
+/// as a decoder over the input. With several magics, each slice between them
+/// must decode on its own, or the input is one stream with a `BZh` inside its
+/// compressed data (about 1 in 2^32 per position). A reader that has handed
+/// bytes to the scanner cannot take them back, so that is settled first, by
+/// decoding each slice with its output discarded, and only then is the
+/// content streamed the way it turned out.
+pub(crate) fn content_reader(data: &dyn ByteSource, cap: u64) -> Box<dyn Read + '_> {
+    let starts = stream_starts(data);
+    let one = || -> Box<dyn Read + '_> {
+        Box::new(super::bzip2_rs::DecoderReader::new(Reader::new(data)))
+    };
     if starts.len() <= 1 {
-        return decode_one_bzip2(data, cap);
+        return one();
     }
-    let mut out = Vec::new();
-    for i in 0..starts.len() {
-        let s = starts[i];
-        let e = starts.get(i + 1).copied().unwrap_or(data.len());
-        let remaining = cap - out.len() as u64;
-        match decode_one_bzip2(&data[s..e], remaining) {
-            Ok((bytes, truncated)) => {
-                out.extend_from_slice(&bytes);
-                if truncated {
-                    return Ok((out, true));
-                }
-            }
-            // A split landed inside a stream (spurious magic): the multi-stream
-            // assumption is wrong — decode the whole input as one stream.
-            Err(_) => return decode_one_bzip2(data, cap),
-        }
+    let bounds: Vec<(usize, usize)> = starts
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (s, starts.get(i + 1).copied().unwrap_or(data.len())))
+        .collect();
+    // A stream that decoded in full and failed a block CRC is whole.
+    let each_decodes = bounds.iter().all(|&(s, e)| {
+        let mut slice = super::bzip2_rs::DecoderReader::new(Reader::range(data, s, e));
+        std::io::copy(
+            &mut (&mut slice).take(cap.saturating_add(1)),
+            &mut std::io::sink(),
+        )
+        .map_or_else(|e| crate::is_checksum_mismatch(&e), |_| true)
+    });
+    if !each_decodes {
+        return one();
     }
-    Ok((out, false))
+    Box::new(Streams {
+        parts: bounds
+            .into_iter()
+            .map(|(s, e)| {
+                Box::new(super::bzip2_rs::DecoderReader::new(Reader::range(
+                    data, s, e,
+                ))) as Box<dyn Read + '_>
+            })
+            .collect(),
+        mismatch: None,
+    })
 }
 
-/// A reader over the decompressed content of `data`, for the streaming path.
-///
-/// The COMMON case — a single stream — is handed back as a decoder, so content
-/// decompressing to any size is scanned without being materialized. That is the
-/// whole point: a `.bz2` output can be orders of magnitude larger than the file.
-///
-/// The multi-stream case is decoded whole instead. It cannot stream: recovering
-/// from a spurious `BZh` needs re-decoding the entire input as one stream (see
-/// [`decode_bzip2_streams`]), and a reader that has already handed bytes to the
-/// scanner cannot take them back. Multi-stream files are rare, so the common
-/// case keeps the win and the rare one keeps the recovery.
-pub(crate) fn content_reader(data: &[u8], cap: u64) -> Result<Box<dyn Read + '_>, LimitHit> {
-    if bzip2_stream_starts(data).len() <= 1 {
-        return Ok(Box::new(bzip2_rs::DecoderReader::new(Cursor::new(data))));
+/// Streams read one after another. A checksum mismatch in one is reported
+/// once all of them are read, so it does not cost the streams after it.
+struct Streams<'a> {
+    parts: std::collections::VecDeque<Box<dyn Read + 'a>>,
+    mismatch: Option<std::io::Error>,
+}
+
+impl Read for Streams<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while let Some(part) = self.parts.front_mut() {
+            match part.read(buf) {
+                Ok(0) => {
+                    self.parts.pop_front();
+                }
+                Err(e) if crate::is_checksum_mismatch(&e) => {
+                    self.mismatch = Some(e);
+                    self.parts.pop_front();
+                }
+                r => return r,
+            }
+        }
+        self.mismatch.take().map_or(Ok(0), Err)
     }
-    let (out, _truncated) = decode_bzip2_streams(data, cap)?;
-    Ok(Box::new(Cursor::new(out)))
 }
 
 /// Offsets of bzip2 stream headers (`BZh` followed by a `1`-`9` block-size).
-fn bzip2_stream_starts(data: &[u8]) -> Vec<usize> {
+fn stream_starts(data: &dyn ByteSource) -> Vec<usize> {
     let mut out = Vec::new();
-    for off in memchr::memmem::find_iter(data, b"BZh") {
-        if matches!(data.get(off + 3), Some(b'1'..=b'9')) {
+    let mut from = 0;
+    while let Some(off) = data.find(b"BZh", from, data.len()) {
+        if matches!(data.window(off + 3, 1).first(), Some(b'1'..=b'9')) {
             out.push(off);
         }
+        from = off + 1;
     }
     out
-}
-
-/// Decode a single bzip2 stream, capped at `cap` output bytes.
-fn decode_one_bzip2(data: &[u8], cap: u64) -> Result<(Vec<u8>, bool), LimitHit> {
-    // A decode failure (bad block-size, corrupt stream) is undecodable content,
-    // not a resource limit — `corrupt` → `Unscannable`, never `LimitsExceeded`.
-    bounded_read(bzip2_rs::DecoderReader::new(Cursor::new(data)), cap)
-        .map_err(|e| LimitHit::corrupt(format!("bzip2: {e}")))
 }

@@ -31,8 +31,9 @@ changed. The body is validated before it can overwrite a good file, and the
 install is atomic (write to a temporary file, then rename), so an interrupted
 update leaves the previous database intact rather than a truncated one.
 
-A downloaded `.exavdb` carries an embedded SHA-256 which is verified before
-installation, for the same reason.
+A downloaded `.exavdb` carries a CRC-32 of its contents, and its format
+version, which are checked before installation, for the same reason. The
+CRC-32 catches a damaged download, not a forged one.
 
 ## What it does not do
 

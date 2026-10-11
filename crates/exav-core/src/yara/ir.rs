@@ -9,6 +9,7 @@ use std::rc::Rc;
 use regex_automata::{meta::Regex, Input};
 use serde::{Deserialize, Serialize};
 
+use crate::byte_source::ByteSource;
 use crate::yara::matcher::{build_regex, Match};
 use crate::yara::modules::{self, FuncId, ModuleCtx, ModuleKind};
 
@@ -365,7 +366,7 @@ pub(crate) enum Binding {
 
 /// Everything the evaluator needs at scan time.
 pub(crate) struct EvalCtx<'a> {
-    pub data: &'a [u8],
+    pub data: &'a dyn ByteSource,
     /// Per global-pattern-id, the sorted match list.
     pub matches: &'a [Vec<Match>],
     /// Results of rules that were evaluated earlier (by rule index).
@@ -637,17 +638,17 @@ fn count_in_range(id: usize, range: &Option<(Box<Cond>, Box<Cond>)>, ctx: &EvalC
 
 /// Reads an integer of the given kind at `offset` (little- or big-endian).
 /// Out-of-bounds or negative offsets yield undefined (`None`), matching yara-x.
-fn read_int(kind: IntKind, data: &[u8], offset: i64) -> Option<Value> {
+fn read_int(kind: IntKind, data: &dyn ByteSource, offset: i64) -> Option<Value> {
     let off: usize = offset.try_into().ok()?;
     macro_rules! rd {
         ($n:literal, $conv:expr) => {{
-            let bytes: [u8; $n] = data.get(off..off + $n)?.try_into().ok()?;
+            let bytes: [u8; $n] = data.window(off, $n).as_ref().try_into().ok()?;
             $conv(bytes)
         }};
     }
     let v: i64 = match kind {
-        IntKind::U8 => *data.get(off)? as i64,
-        IntKind::I8 => *data.get(off)? as i8 as i64,
+        IntKind::U8 => rd!(1, |b: [u8; 1]| b[0] as i64),
+        IntKind::I8 => rd!(1, |b: [u8; 1]| b[0] as i8 as i64),
         IntKind::U16 => rd!(2, |b| u16::from_le_bytes(b) as i64),
         IntKind::I16 => rd!(2, |b| i16::from_le_bytes(b) as i64),
         IntKind::U32 => rd!(4, |b| u32::from_le_bytes(b) as i64),

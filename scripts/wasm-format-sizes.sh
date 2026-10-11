@@ -26,11 +26,12 @@ TARGET="${TARGET:-wasm32-unknown-unknown}"
 BUILDSTD="${BUILDSTD:-0}"
 mkdir -p "$WORK/src"
 
-# Format list: exav-unpack's `all-formats` array (kept in sync automatically).
+# Format list: exav-unpack's `all-formats-no-emu` array plus `pe-emu`, which
+# together make `all-formats` (kept in sync automatically).
 if [ -z "${FMTS:-}" ]; then
-  FMTS=$(awk '/^all-formats = \[/{f=1} f{print} f&&/\]/{exit}' \
-    "$ROOT/crates/exav-unpack/Cargo.toml" | grep -oE '"[a-z0-9]+"' | tr -d '"' \
-    | grep -v '^all-formats$' | tr '\n' ' ')
+  FMTS="$(awk '/^all-formats-no-emu = \[/{f=1} f{print} f&&/\]/{exit}' \
+    "$ROOT/crates/exav-unpack/Cargo.toml" | grep -oE '"[a-z0-9-]+"' | tr -d '"' \
+    | grep -v '^all-formats' | tr '\n' ' ')pe-emu"
 fi
 
 # Generate the minimal wrapper crate (all format features forwarded).

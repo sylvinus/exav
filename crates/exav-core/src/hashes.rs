@@ -1,8 +1,5 @@
-//! Hash signatures (`.hdb`/`.hsb`-style) and a streaming
-//! tee-hasher that computes MD5/SHA1/SHA256 in the same single pass used
-//! for pattern matching — so whole-file hash detection works at any size.
-
-use std::io::{self, Read};
+//! Hash signatures (`.hdb`/`.hsb`-style) and the MD5/SHA1/SHA256 digests they
+//! are matched against, computed in one pass over an object of any size.
 
 use md5::Md5;
 use serde::{Deserialize, Serialize};
@@ -27,7 +24,10 @@ fn hex_array<const N: usize>(hex: &str) -> Option<[u8; N]> {
 /// allocations).
 ///
 /// [`finalize`]: SortedTable::finalize
-#[derive(serde::Serialize, serde::Deserialize)]
+///
+/// Stored as a few blobs rather than millions of entries decoded one element
+/// at a time: the keys as fixed-width records, the spans as words, the names
+/// as one string and the provenance as bits.
 struct SortedTable<K> {
     keys: Vec<K>,
     /// (offset, len) into `names`, parallel to `keys`.
@@ -36,10 +36,96 @@ struct SortedTable<K> {
     /// Per-entry provenance (parallel to `keys`): whether the signature came from
     /// an unofficial (non-`.cvd`) database. The clean name is stored in `names`;
     /// the `.UNOFFICIAL` suffix is applied by the report layer (compat mode).
-    #[serde(default)]
     unofficial: Vec<bool>,
-    #[serde(skip)]
     pending: Vec<(K, String, bool)>,
+}
+
+/// A key a [`SortedTable`] stores as a fixed-width record.
+trait Record: Sized {
+    const WIDTH: usize;
+    fn put(&self, out: &mut Vec<u8>);
+    fn get(b: &[u8]) -> Self;
+}
+
+impl<const N: usize> Record for [u8; N] {
+    const WIDTH: usize = N;
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self);
+    }
+    fn get(b: &[u8]) -> Self {
+        b.try_into().expect("a record of its width")
+    }
+}
+
+impl<const N: usize> Record for (u64, [u8; N]) {
+    const WIDTH: usize = 8 + N;
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_le_bytes());
+        out.extend_from_slice(&self.1);
+    }
+    fn get(b: &[u8]) -> Self {
+        (
+            u64::from_le_bytes(b[..8].try_into().expect("eight bytes")),
+            b[8..].try_into().expect("a record of its width"),
+        )
+    }
+}
+
+impl<K: Record> Serialize for SortedTable<K> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use crate::database::Blob;
+        let mut keys = Vec::with_capacity(self.keys.len() * K::WIDTH);
+        for k in &self.keys {
+            k.put(&mut keys);
+        }
+        let spans: Vec<u8> = self.spans.iter().flat_map(|&(o, l)| [o.to_le_bytes(), l.to_le_bytes()]).flatten().collect();
+        let mut bits = vec![0u8; self.unofficial.len().div_ceil(8)];
+        for (i, _) in self.unofficial.iter().enumerate().filter(|(_, &u)| u) {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+        (Blob(&keys), Blob(&spans), &self.names, Blob(&bits)).serialize(s)
+    }
+}
+
+impl<'de, K: Record + Ord> Deserialize<'de> for SortedTable<K> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use crate::database::BlobBuf;
+        use serde::de::Error;
+        let (keys, spans, names, bits): (BlobBuf, BlobBuf, String, BlobBuf) = Deserialize::deserialize(d)?;
+        let (keys, spans, bits) = (keys.0, spans.0, bits.0);
+        let n = keys.len() / K::WIDTH;
+        if keys.len() % K::WIDTH != 0 || spans.len() != n * 8 || bits.len() != n.div_ceil(8) {
+            return Err(D::Error::custom("hash table blobs of unequal lengths"));
+        }
+        // `as_chunks` cannot take a generic's associated const as its width.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
+        let keys: Vec<K> = keys.chunks_exact(K::WIDTH).map(K::get).collect();
+        let spans: Vec<(u32, u32)> = spans
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|w| {
+                let (o, l) = w.split_at(4);
+                (u32::from_le_bytes(o.try_into().unwrap()), u32::from_le_bytes(l.try_into().unwrap()))
+            })
+            .collect();
+        // In u64, so a corrupt span cannot overflow a 32-bit `usize`.
+        let in_names = |&(o, l): &(u32, u32)| {
+            let e = o as u64 + l as u64;
+            e <= names.len() as u64 && names.is_char_boundary(o as usize) && names.is_char_boundary(e as usize)
+        };
+        if !keys.is_sorted() || !spans.iter().all(in_names) {
+            return Err(D::Error::custom("hash table out of order or out of bounds"));
+        }
+        let unofficial = (0..n).map(|i| bits[i / 8] >> (i % 8) & 1 != 0).collect();
+        Ok(SortedTable {
+            keys,
+            spans,
+            names,
+            unofficial,
+            pending: Vec::new(),
+        })
+    }
 }
 
 impl<K> Default for SortedTable<K> {
@@ -94,11 +180,8 @@ impl<K: Ord + Clone> SortedTable<K> {
     /// Return `(clean_name, unofficial)` for `key`.
     fn get(&self, key: &K) -> Option<(&str, bool)> {
         let i = self.keys.binary_search(key).ok()?;
-        let (off, len) = self.spans[i];
-        // `unofficial` may be empty when loading an older database (serde default);
-        // treat a missing entry as official.
-        let unofficial = self.unofficial.get(i).copied().unwrap_or(false);
-        Some((&self.names[off as usize..(off + len) as usize], unofficial))
+        let (off, len) = (self.spans[i].0 as usize, self.spans[i].1 as usize);
+        Some((&self.names[off..off + len], self.unofficial[i]))
     }
 }
 
@@ -136,8 +219,33 @@ macro_rules! digest_table {
             fn get(&self, key: &[u8; $n], size: u64) -> Option<(&str, bool)> {
                 self.sized.get(&(size, *key)).or_else(|| self.any.get(key))
             }
+            /// Whether a signature could match an object of `size` bytes: one
+            /// of any size, or one of exactly that size.
+            fn wants(&self, size: u64) -> bool {
+                let keys = &self.sized.keys;
+                let i = keys.partition_point(|k| k.0 < size);
+                !self.any.keys.is_empty() || keys.get(i).is_some_and(|k| k.0 == size)
+            }
         }
     };
+}
+
+/// Which digests a lookup can use for an object of one size.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Want {
+    pub(crate) md5: bool,
+    pub(crate) sha1: bool,
+    pub(crate) sha256: bool,
+}
+
+impl Want {
+    pub(crate) fn union(self, o: Want) -> Want {
+        Want {
+            md5: self.md5 || o.md5,
+            sha1: self.sha1 || o.sha1,
+            sha256: self.sha256 || o.sha256,
+        }
+    }
 }
 digest_table!(Md5Table, 16);
 digest_table!(Sha1Table, 20);
@@ -230,26 +338,22 @@ impl HashDb {
         }
     }
 
+    /// The digests [`Self::lookup`] can match for an object of `size` bytes:
+    /// only those of an algorithm with a signature of any size, or of that
+    /// size. Most objects need none of the SHA ones, and some none at all.
+    pub(crate) fn wants(&self, size: u64) -> Want {
+        Want {
+            md5: self.md5.wants(size),
+            sha1: self.sha1.wants(size),
+            sha256: self.sha256.wants(size),
+        }
+    }
+
     /// Look up computed digests for a file of `size` bytes; returns the matching
     /// signature's `(clean_name, unofficial)`. A sized signature matches only at
     /// that exact length; a `*` signature matches any length.
     pub fn lookup(&self, digests: &Digests, size: u64) -> Option<(String, bool)> {
-        if let Some(k) = hex_array::<16>(&digests.md5) {
-            if let Some((n, u)) = self.md5.get(&k, size) {
-                return Some((n.to_string(), u));
-            }
-        }
-        if let Some(k) = hex_array::<20>(&digests.sha1) {
-            if let Some((n, u)) = self.sha1.get(&k, size) {
-                return Some((n.to_string(), u));
-            }
-        }
-        if let Some(k) = hex_array::<32>(&digests.sha256) {
-            if let Some((n, u)) = self.sha256.get(&k, size) {
-                return Some((n.to_string(), u));
-            }
-        }
-        None
+        lookup_in(&self.md5, &self.sha1, &self.sha256, digests, size)
     }
 }
 
@@ -283,14 +387,18 @@ impl SectionHashDb {
         self.sha256.finalize();
     }
 
-    /// True if any SHA (not just MD5) section signatures are loaded, so the
-    /// caller knows whether computing per-section SHA digests is worthwhile.
-    pub fn wants_sha(&self) -> bool {
-        self.sha1.len() > 0 || self.sha256.len() > 0
+    /// The digests [`Self::lookup`] can match for a section of `size` bytes:
+    /// most sections' sizes are no signature's, and need none.
+    pub(crate) fn wants(&self, size: u64) -> Want {
+        Want {
+            md5: self.md5.wants(size),
+            sha1: self.sha1.wants(size),
+            sha256: self.sha256.wants(size),
+        }
     }
 
     /// Parse `.mdb`/`.mdu`/`.msb` lines (`SectionSize:HASH:Name`). The first
-    /// field is the size, the second the hash — the opposite field order from
+    /// field is the size, the second the hash: the opposite field order from
     /// `.hdb`, so this does not reuse `parse_hash_line`.
     pub fn extend_from_text(&mut self, text: &str) {
         self.extend_from_text_prov(text, false);
@@ -346,144 +454,157 @@ impl SectionHashDb {
     /// Look up a section by its raw size and computed digests; returns the
     /// matching signature's `(clean_name, unofficial)`.
     pub fn lookup(&self, size: u64, digests: &Digests) -> Option<(String, bool)> {
-        if let Some(k) = hex_array::<16>(&digests.md5) {
-            if let Some((n, u)) = self.md5.get(&k, size) {
-                return Some((n.to_string(), u));
-            }
-        }
-        if let Some(k) = hex_array::<20>(&digests.sha1) {
-            if let Some((n, u)) = self.sha1.get(&k, size) {
-                return Some((n.to_string(), u));
-            }
-        }
-        if let Some(k) = hex_array::<32>(&digests.sha256) {
-            if let Some((n, u)) = self.sha256.get(&k, size) {
-                return Some((n.to_string(), u));
-            }
-        }
-        None
+        lookup_in(&self.md5, &self.sha1, &self.sha256, digests, size)
     }
 }
 
-/// Hex digests computed over a file.
-#[derive(Debug, Clone)]
+/// The first signature of the three tables matching `digests` at `size`.
+fn lookup_in(
+    md5: &Md5Table,
+    sha1: &Sha1Table,
+    sha256: &Sha256Table,
+    d: &Digests,
+    size: u64,
+) -> Option<(String, bool)> {
+    d.md5
+        .and_then(|k| md5.get(&k, size))
+        .or_else(|| d.sha1.and_then(|k| sha1.get(&k, size)))
+        .or_else(|| d.sha256.and_then(|k| sha256.get(&k, size)))
+        .map(|(n, u)| (n.to_string(), u))
+}
+
+/// Digests computed over a file, those asked for.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Digests {
-    pub md5: String,
-    pub sha1: String,
-    pub sha256: String,
+    pub md5: Option<[u8; 16]>,
+    pub sha1: Option<[u8; 20]>,
+    pub sha256: Option<[u8; 32]>,
 }
 
-/// A reader wrapper that updates MD5/SHA1/SHA256 with every byte read,
-/// so hashing piggybacks on the streaming pattern-match pass.
-pub struct TeeHasher<R> {
-    inner: R,
-    md5: Md5,
-    sha1: Sha1,
-    sha256: Sha256,
-    len: u64,
-}
-
-impl<R: Read> TeeHasher<R> {
-    pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            md5: Md5::new(),
-            sha1: Sha1::new(),
-            sha256: Sha256::new(),
-            len: 0,
-        }
+impl Digests {
+    /// The MD5, in hex; empty when it was not computed.
+    pub fn md5_hex(&self) -> String {
+        self.md5.map(|d| encode_hex(&d)).unwrap_or_default()
     }
 
-    /// Total bytes hashed so far (the file size once the stream is consumed).
-    pub fn bytes_read(&self) -> u64 {
-        self.len
+    /// The SHA-1, in hex; empty when it was not computed.
+    pub fn sha1_hex(&self) -> String {
+        self.sha1.map(|d| encode_hex(&d)).unwrap_or_default()
     }
 
-    /// Finalize and return hex digests. Consumes the hasher.
-    pub fn finalize(self) -> Digests {
-        Digests {
-            md5: encode_hex(&self.md5.finalize()),
-            sha1: encode_hex(&self.sha1.finalize()),
-            sha256: encode_hex(&self.sha256.finalize()),
-        }
+    /// The SHA-256, in hex; empty when it was not computed.
+    pub fn sha256_hex(&self) -> String {
+        self.sha256.map(|d| encode_hex(&d)).unwrap_or_default()
     }
 }
 
-impl<R: Read> Read for TeeHasher<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.md5.update(&buf[..n]);
-            self.sha1.update(&buf[..n]);
-            self.sha256.update(&buf[..n]);
-            self.len += n as u64;
-        }
-        Ok(n)
-    }
-}
-
-/// Digests for section-hash matching: always MD5; SHA1/SHA256 only when
-/// `want_sha` (i.e. `.msb` signatures are loaded), since they are otherwise
-/// unused. Skipped fields are left empty and their lookups simply miss.
-pub fn section_digests(data: &[u8], want_sha: bool) -> Digests {
-    if want_sha {
-        digests_of(data)
-    } else {
-        Digests {
-            md5: encode_hex(&Md5::digest(data)),
-            sha1: String::new(),
-            sha256: String::new(),
-        }
-    }
+/// The digests of section `data`, of `size` bytes, that section signatures of
+/// that size could match; none, without reading it, for most sections.
+pub(crate) fn section_digests(db: &SectionHashDb, size: u64, data: &[u8]) -> Digests {
+    digests_wanted(&data, db.wants(size))
 }
 
 /// Compute digests over a byte slice (used for already-buffered content
 /// such as extracted archive entries).
 pub fn digests_of(data: &[u8]) -> Digests {
-    // Single pass: feed each cache-resident chunk to all three hashers at once,
-    // rather than three independent full passes over `data`. For large buffers
-    // (e.g. a big archive member) three passes evict the buffer from cache
-    // between each, tripling memory traffic; chunking keeps each ~16 KiB slice
-    // hot in L1/L2 across md5+sha1+sha256. Output is byte-identical.
-    let mut md5 = Md5::new();
-    let mut sha1 = Sha1::new();
-    let mut sha256 = Sha256::new();
-    for chunk in data.chunks(16 * 1024) {
-        md5.update(chunk);
-        sha1.update(chunk);
-        sha256.update(chunk);
+    digests_of_source(&data)
+}
+
+/// [`digests_of`] an object that need not be held in memory.
+pub(crate) fn digests_of_source(data: &dyn crate::byte_source::ByteSource) -> Digests {
+    let all = Want {
+        md5: true,
+        sha1: true,
+        sha256: true,
+    };
+    digests_wanted(data, all)
+}
+
+/// The digests of `data` that `want` asks for; the others are left empty, and
+/// a lookup of them misses. Wanting none reads nothing.
+pub(crate) fn digests_wanted(data: &dyn crate::byte_source::ByteSource, want: Want) -> Digests {
+    let mut h = Hashing::new(want);
+    if want != Want::default() {
+        data.chunks(0, data.len(), &mut |_, piece| {
+            h.update(piece);
+            true
+        });
     }
-    Digests {
-        md5: encode_hex(&md5.finalize()),
-        sha1: encode_hex(&sha1.finalize()),
-        sha256: encode_hex(&sha256.finalize()),
+    h.finish()
+}
+
+/// The digests [`digests_wanted`] computes, fed an object's bytes in order by
+/// a read that serves other searches too.
+pub(crate) struct Hashing {
+    md5: Option<Md5>,
+    sha1: Option<Sha1>,
+    sha256: Option<Sha256>,
+}
+
+impl Hashing {
+    pub(crate) fn new(want: Want) -> Self {
+        Hashing {
+            md5: want.md5.then(Md5::new),
+            sha1: want.sha1.then(Sha1::new),
+            sha256: want.sha256.then(Sha256::new),
+        }
+    }
+
+    pub(crate) fn update(&mut self, piece: &[u8]) {
+        // Every hasher over a 16 KiB slice before the next, which stays in
+        // L1/L2 across them.
+        for chunk in piece.chunks(16 * 1024) {
+            self.md5.iter_mut().for_each(|h| h.update(chunk));
+            self.sha1.iter_mut().for_each(|h| h.update(chunk));
+            self.sha256.iter_mut().for_each(|h| h.update(chunk));
+        }
+    }
+
+    pub(crate) fn finish(self) -> Digests {
+        Digests {
+            md5: self.md5.map(|h| h.finalize().into()),
+            sha1: self.sha1.map(|h| h.finalize().into()),
+            sha256: self.sha256.map(|h| h.finalize().into()),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn known_md5() {
         // md5("") = d41d8cd98f00b204e9800998ecf8427e
         let d = digests_of(b"");
-        assert_eq!(d.md5, "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(d.md5_hex(), "d41d8cd98f00b204e9800998ecf8427e");
         // sha256("") = e3b0c442...
-        assert!(d.sha256.starts_with("e3b0c44298fc1c14"));
+        assert!(d.sha256_hex().starts_with("e3b0c44298fc1c14"));
     }
 
+    /// A table stored and read back answers every lookup as before, and one
+    /// whose span runs out of its names is refused rather than read.
     #[test]
-    fn tee_matches_direct() {
-        let data = b"the quick brown fox";
-        let mut tee = TeeHasher::new(Cursor::new(data.to_vec()));
-        let mut sink = Vec::new();
-        tee.read_to_end(&mut sink).unwrap();
-        let teed = tee.finalize();
-        let direct = digests_of(data);
-        assert_eq!(teed.md5, direct.md5);
-        assert_eq!(teed.sha256, direct.sha256);
+    fn hash_tables_round_trip_as_blobs() {
+        let (a, b, c) = (digests_of(b"one"), digests_of(b"two"), digests_of(b"three"));
+        let mut db = HashDb::new();
+        db.extend_from_text(&format!("{}:3:Sized.Md5\n{}:*:Any.Sha1\n", a.md5_hex(), b.sha1_hex()));
+        db.extend_from_text_prov(&format!("{}:5:Sized.Sha256.é\n", c.sha256_hex()), true);
+        db.finalize();
+        let blob = rmp_serde::to_vec(&db).unwrap();
+        let back: HashDb = rmp_serde::from_slice(&blob).unwrap();
+        for (d, size) in [(&a, 3), (&b, 99), (&c, 5), (&a, 4), (&c, 6)] {
+            assert_eq!(back.lookup(d, size), db.lookup(d, size), "{size}");
+        }
+        assert_eq!(back.lookup(&c, 5), Some(("Sized.Sha256.é".to_string(), true)));
+        assert_eq!(back.lookup(&b, 99), Some(("Any.Sha1".to_string(), false)));
+        // Break the last span so it runs past the names: refused.
+        let mut t = SortedTable::<[u8; 4]>::default();
+        t.insert(*b"abcd", "Name", false);
+        t.finalize();
+        t.spans[0].1 = 99;
+        let blob = rmp_serde::to_vec(&t).unwrap();
+        assert!(rmp_serde::from_slice::<SortedTable<[u8; 4]>>(&blob).is_err());
     }
 
     #[test]
@@ -491,7 +612,7 @@ mod tests {
         let mut db = HashDb::new();
         let d = digests_of(b"malware");
         let n = "malware".len() as u64;
-        db.extend_from_text(&format!("{}:*:Test.Malware\n", d.md5));
+        db.extend_from_text(&format!("{}:*:Test.Malware\n", d.md5_hex()));
         db.finalize();
         assert_eq!(
             db.lookup(&d, n).map(|(n, _)| n).as_deref(),
@@ -505,7 +626,7 @@ mod tests {
         // A sized signature matches only at that exact file length.
         let mut db = HashDb::new();
         let d = digests_of(b"malware");
-        db.extend_from_text(&format!("{}:7:Test.Sized\n", d.md5));
+        db.extend_from_text(&format!("{}:7:Test.Sized\n", d.md5_hex()));
         db.finalize();
         assert_eq!(
             db.lookup(&d, 7).map(|(n, _)| n).as_deref(),
@@ -518,7 +639,7 @@ mod tests {
     fn hashdb_sha_whole_file() {
         let mut db = HashDb::new();
         let d = digests_of(b"payload");
-        db.extend_from_text(&format!("{}:*:Test.BySha256\n", d.sha256));
+        db.extend_from_text(&format!("{}:*:Test.BySha256\n", d.sha256_hex()));
         db.finalize();
         assert_eq!(
             db.lookup(&d, 7).map(|(n, _)| n).as_deref(),
@@ -535,10 +656,20 @@ mod tests {
         // .mdb (MD5) sized + wildcard, plus an .msb (SHA256) wildcard entry.
         db.extend_from_text(&format!(
             "4096:{}:Sig.Sized\n*:{}:Sig.AnySize\n*:{}:Sig.BySha\n",
-            s.md5, other.md5, other.sha256
+            s.md5_hex(),
+            other.md5_hex(),
+            other.sha256_hex()
         ));
         db.finalize();
-        assert!(db.wants_sha());
+        // Only what a signature of the size could match.
+        assert_eq!(db.wants(4096), Want { md5: true, sha1: false, sha256: true });
+        assert_eq!(db.wants(512), Want { md5: true, sha1: false, sha256: true });
+        let mut sized = SectionHashDb::new();
+        sized.extend_from_text(&format!("4096:{}:Sig.Sized\n", s.md5_hex()));
+        sized.finalize();
+        assert_eq!(sized.wants(512), Want::default());
+        assert_eq!(section_digests(&sized, 512, b"section-bytes"), Digests::default());
+        assert_eq!(section_digests(&sized, 4096, b"section-bytes").md5, s.md5);
         // exact size+md5
         assert_eq!(
             db.lookup(4096, &s).map(|(n, _)| n).as_deref(),

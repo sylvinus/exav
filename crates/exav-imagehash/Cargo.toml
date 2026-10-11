@@ -1,0 +1,66 @@
+[package]
+name = "exav-imagehash"
+description = "Perceptual image hashes: ClamAV's fuzzy_img hash, equal to `sigtool --fuzzy-img`, and Python imagehash's phash, with every step a parameter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["image", "hash", "perceptual", "phash", "clamav"]
+categories = ["multimedia::images", "algorithms"]
+readme = "README.md"
+exclude = ["tests/fixtures/**"]
+
+# The vendored `tiff` decoder's doc examples are written for it as a crate of
+# its own: here their `use tiff::...` cannot resolve.
+[lib]
+doctest = false
+
+# The CLI ships with the library, as exav-unpack's does, so that
+# `cargo install exav-imagehash` gives the command. It needs nothing the
+# library does not.
+[[bin]]
+name = "exav-imagehash"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+# The decoders, at the versions libclamav 1.5.4 links, so that ClamAV's hash is
+# reproduced bit for bit: the hash is the signature. This crate only hashes the
+# pixels they give.
+exav-render = { path = "../exav-render", version = "0.0.2", default-features = false, features = ["image"] }
+# The resize and the conversions to RGB, as ClamAV runs them; the same `=` pin
+# as exav-render's, since its pixels arrive in this crate's buffers.
+image = { version = "=0.25.9", default-features = false }
+
+[features]
+default = ["cli", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2"]
+# The command-line tool.
+cli = []
+# Formats beyond the five clamscan treats as graphics, which `sigtool
+# --fuzzy-img` also hashes (libclamav 1.5.4 links the same `image` codecs and
+# the same image-webp and qoi). Off, a file of that format is not an image
+# here. See exav-render.
+webp = ["exav-render/webp"]
+ico = ["exav-render/ico"]
+pnm = ["exav-render/pnm"]
+qoi = ["exav-render/qoi"]
+dds = ["exav-render/dds"]
+ff = ["exav-render/ff"]
+hdr = ["exav-render/hdr"]
+# JPEG 2000 and JBIG2, which sigtool does not read: hashed as the same pixels
+# are in any other format.
+jp2 = ["exav-render/jp2"]
+jbig2 = ["exav-render/jbig2"]
+
+[dev-dependencies]
+# The tests encode their inputs.
+image = { version = "=0.25.9", default-features = false, features = ["png", "webp"] }
+crc32fast = "1"
+# What `src/dct.rs` is checked against: it ships rustdct's algorithm without
+# rustdct, its `unsafe` and rustfft's SIMD code.
+rustdct = "=0.7.1"
+
+[package.metadata.docs.rs]
+all-features = true

@@ -70,7 +70,7 @@ fn largest_recovered(file: &[u8]) -> usize {
     limits.max_extracted_bytes = 1 << 30;
     limits.max_buffer_bytes = 1 << 30;
     let mut b = Budget::new(limits);
-    match extract(Format::PePacked, file, &mut b) {
+    match extract(Format::PePacked, &file, &mut b) {
         Ok(entries) => entries.iter().map(|e| e.data.len()).max().unwrap_or(0),
         Err(_) => 0,
     }

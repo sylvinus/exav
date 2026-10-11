@@ -1,4 +1,4 @@
-//! Authenticode (PE code-signing) inspection — **triage without RSA**.
+//! Authenticode (PE code-signing) inspection: **triage without RSA**.
 //!
 //! A signed PE carries a PKCS#7 `SignedData` blob (in the certificate table)
 //! whose `SpcIndirectDataContent` embeds a digest of the file. We extract that
@@ -7,18 +7,18 @@
 //!   * `goblin` (already a dependency) for the certificate table + the byte
 //!     ranges to hash ([`goblin::pe::PE::authenticode_ranges`]);
 //!   * `sha1`/`sha2` (already dependencies) for the hash + thumbprint;
-//!   * a small **vendored** DER reader (the `der` module) — so no `rsa`/`der`/`x509`/`nom`
+//!   * a small **vendored** DER reader (the `der` module), so no `rsa`/`der`/`x509`/`nom`
 //!     crate enters the tree and everything stays `#![forbid(unsafe_code)]`.
 //!
 //! What this gives, with no signature-verification crypto:
 //!   * **digest-covers-file**: recomputed hash vs the embedded digest. A mismatch
-//!     means the file was modified/appended-to after signing — a strong signal.
+//!     means the file was modified/appended-to after signing, a strong signal.
 //!   * signer identity (subject/issuer CN, serial, SHA-1 thumbprint) and whether
-//!     the leaf is **self-signed** — for reporting and `.crb` cert matching.
+//!     the leaf is **self-signed**, for reporting and `.crb` cert matching.
 //!
-//! What it deliberately does NOT do: verify that the digest was actually signed
-//! by the certificate's private key (that needs RSA/ECDSA and is out of scope by
-//! design — see `docs/DEPENDENCIES.md`).
+//! What it does not do yet: verify that the digest was actually signed by the
+//! certificate's private key. That needs RSA/ECDSA (see `docs/DEPENDENCIES.md`),
+//! and is on the roadmap.
 
 mod der;
 
@@ -47,7 +47,7 @@ pub struct CertInfo {
     pub self_signed: bool,
     /// SHA-1 of the whole certificate DER (the "thumbprint").
     pub sha1_thumbprint: [u8; 20],
-    /// SHA-1 of the subject `Name` DER (tag+length+value) — the key a ClamAV
+    /// SHA-1 of the subject `Name` DER (tag+length+value): the key a ClamAV
     /// `.crb` entry matches its `Subject` field against.
     pub subject_sha1: [u8; 20],
 }
@@ -56,7 +56,7 @@ pub struct CertInfo {
 #[derive(Clone, Debug)]
 pub struct PeSignature {
     /// The recomputed Authenticode hash equals the digest embedded in the
-    /// signature — i.e. the signature covers the current file bytes.
+    /// signature, i.e. the signature covers the current file bytes.
     pub digest_matches: bool,
     /// The signer (leaf) certificate.
     pub signer: CertInfo,
@@ -79,7 +79,7 @@ struct CrbEntry {
 /// A ClamAV `.crb` certificate database. We honour **block** entries
 /// (`Trusted == 0`) only: a signed PE carrying a matching certificate is
 /// reported. Trust/whitelist entries (`Trusted == 1`) are ignored, since honoring
-/// them safely would require verifying the RSA signature chain (out of scope —
+/// them safely would require verifying the RSA signature chain (out of scope;
 /// see the module docs).
 #[derive(Default, Debug)]
 pub struct CrbDb {
@@ -110,7 +110,7 @@ impl CrbDb {
 
     /// Parse `.crb` text into this database. Format (`;`-separated):
     /// `Name;Trusted;Subject;Serial;PublicKey;Exp;CodeSign;TimeSign;CertSign;NotBefore;Comment`.
-    /// Malformed lines are skipped (best effort — a bad line never aborts a load).
+    /// Malformed lines are skipped (best effort: a bad line never aborts a load).
     pub fn parse_into(&mut self, text: &str) {
         self.sources.push(text.to_string());
         for line in text.lines() {
@@ -370,30 +370,72 @@ pub fn analyze_pe(data: &[u8]) -> Option<PeSignature> {
     })?;
     let auth = parse_authenticode(pkcs7)?;
 
-    // Recompute the Authenticode hash over goblin's excluded-section ranges.
-    let computed = match auth.digest_alg {
+    // An image whose layout does not hold together has no hash to match: the
+    // signature cannot cover it.
+    let computed = hashed_ranges(&pe, data).map(|ranges| match auth.digest_alg {
         DigestAlg::Sha1 => {
             let mut h = Sha1::new();
-            for r in pe.authenticode_ranges() {
-                h.update(r);
-            }
+            ranges.iter().for_each(|r| h.update(r));
             h.finalize().to_vec()
         }
         DigestAlg::Sha256 => {
             let mut h = Sha256::new();
-            for r in pe.authenticode_ranges() {
-                h.update(r);
-            }
+            ranges.iter().for_each(|r| h.update(r));
             h.finalize().to_vec()
         }
-    };
+    });
 
     let signer = auth.certs.first().cloned()?;
     Some(PeSignature {
-        digest_matches: computed == auth.message_digest,
+        digest_matches: computed.is_some_and(|c| c == auth.message_digest),
         signer,
         certs: auth.certs,
     })
+}
+
+/// The byte ranges the Authenticode hash covers ("Calculating the PE Image
+/// Hash" in the PE/COFF specification), in the order goblin's
+/// `authenticode_ranges` yields them; `None` for an image whose headers,
+/// sections or certificate table do not fit the file. goblin indexes without
+/// checking, so a crafted image panics there.
+fn hashed_ranges<'a>(pe: &goblin::pe::PE<'_>, data: &'a [u8]) -> Option<Vec<&'a [u8]>> {
+    let opt = pe.header.optional_header.as_ref()?;
+    // Past the PE signature and the COFF header. The checksum field sits at
+    // the same offset in PE32 and PE32+; the certificate table entry does not.
+    let opt_off = (pe.header.dos_header.pe_pointer as usize).checked_add(4 + 20)?;
+    let checksum = opt_off + 64;
+    let cert_entry = opt_off + if pe.is_64 { 144 } else { 128 };
+    let headers = opt.windows_fields.size_of_headers as usize;
+    let cert_size = opt
+        .data_directories
+        .get_certificate_table()
+        .map_or(0, |t| t.size as usize);
+    let mut out = vec![
+        data.get(..checksum)?,
+        data.get(checksum + 4..cert_entry)?,
+        data.get(cert_entry + 8..headers)?,
+    ];
+    let mut sections: Vec<_> = pe
+        .sections
+        .iter()
+        .filter(|s| s.size_of_raw_data != 0)
+        .collect();
+    sections.sort_by_key(|s| s.pointer_to_raw_data);
+    let mut hashed = headers;
+    for s in sections {
+        let start = s.pointer_to_raw_data as usize;
+        let size = s.size_of_raw_data as usize;
+        out.push(data.get(start..start.checked_add(size)?)?);
+        hashed = hashed.checked_add(size)?;
+    }
+    // What follows the last section, less the certificate table, then padding
+    // to a multiple of 8.
+    if data.len() > hashed {
+        out.push(data.get(hashed..data.len().checked_sub(cert_size)?)?);
+    }
+    const PADDING: [u8; 7] = [0; 7];
+    out.push(&PADDING[..(8 - data.len() % 8) % 8]);
+    Some(out)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -532,8 +574,8 @@ mod tests {
     }
 
     /// End-to-end: a PE whose embedded Authenticode digest is of *other* bytes
-    /// (not this file) is detected as a signature that does NOT cover the file —
-    /// the append-after-signing / tampering signal — while the signer identity is
+    /// (not this file) is detected as a signature that does NOT cover the file
+    /// (the append-after-signing / tampering signal), while the signer identity is
     /// still recovered. Exercises goblin cert discovery + the vendored parser +
     /// the hash recompute + mismatch detection.
     #[test]
@@ -546,5 +588,34 @@ mod tests {
         );
         assert_eq!(sig.signer.subject_cn.as_deref(), Some("exav Test Signer"));
         assert!(sig.signer.self_signed);
+    }
+
+    /// The ranges hashed are goblin's for a well-formed image, and a signed
+    /// image whose section runs past the end of the file, on which goblin
+    /// panics, is a signature that does not cover it.
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "a panic aborts under WASI, so goblin's cannot be caught"
+    )]
+    fn hashed_ranges_follow_goblin_and_refuse_what_does_not_fit() {
+        let pe = fixture("signed_mismatch.exe");
+        let parsed = goblin::pe::PE::parse(&pe).unwrap();
+        let want: Vec<u8> = parsed.authenticode_ranges().flatten().copied().collect();
+        assert_eq!(hashed_ranges(&parsed, &pe).unwrap().concat(), want);
+
+        let mut bad = pe.clone();
+        let at = u32::from_le_bytes(bad[0x3c..0x40].try_into().unwrap()) as usize;
+        let opt_len = u16::from_le_bytes(bad[at + 20..at + 22].try_into().unwrap()) as usize;
+        let first = at + 24 + opt_len;
+        bad[first + 20..first + 24].copy_from_slice(&0xE727_0000u32.to_le_bytes());
+        let parsed = goblin::pe::PE::parse(&bad).expect("goblin still parses it");
+        let goblin_ranges = std::panic::AssertUnwindSafe(|| parsed.authenticode_ranges().count());
+        assert!(
+            std::panic::catch_unwind(goblin_ranges).is_err(),
+            "goblin no longer panics here, so this image tests nothing"
+        );
+        let sig = analyze_pe(&bad).expect("the signature is still there");
+        assert!(!sig.digest_matches);
     }
 }

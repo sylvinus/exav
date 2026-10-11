@@ -4,12 +4,11 @@
 //! delivery container. Its file data is chunk-compressed, meaning a payload
 //! inside shows none of its bytes to a raw scan.
 //!
-//! The image records a **SHA-1 per resource**, which exav checks on every
-//! decode. That is what these tests lean on: a chunk decoder that is subtly
-//! wrong does not fail, it produces plausible bytes that are not the file, and a
-//! signature that fails to match those looks exactly like a clean file. A
-//! fixture that decoded wrongly would be reported unreadable and never reach the
-//! digest comparison below.
+//! A chunk decoder that is subtly wrong does not fail, it produces plausible
+//! bytes that are not the file, and a signature that fails to match those looks
+//! exactly like a clean file. So these tests compare every decoded resource
+//! with the digest of the file that went in. The image's own SHA-1 per resource
+//! is checked only when checksums are verified.
 //!
 //! Fixtures come from **wimlib** (`wimcapture`), one per compression format,
 //! plus `hard_LZX.wim` — 48 KiB of real x86-64 code (453 `E8` bytes, so LZX's
@@ -22,14 +21,15 @@
 //! wimcapture hardsrc/ hard_LZX.wim --compress=LZX
 //! ```
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the files that went into the images.
 const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
 const NOTES: &str = "3b38534b3df987c96e0d6185b9e59289ad54806698c9ac1248afc85cad276af2";
 const DEEP: &str = "0035fe0884edb216726d771c5bb354fd2150160459cacc18feb0c1f30bcc81a3";
 
-fn fixture(name: &str) -> Vec<u8> {
+pub(super) fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/wim/{name}", env!("CARGO_MANIFEST_DIR"));
     exav_unpack::read_fixture(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
 }
@@ -105,7 +105,7 @@ fn an_xpress_wim_decodes_every_chunk() {
         contents("w_XPRESS.wim"),
         expected(),
         "each chunk is Huffman-coded with its own table; the decoded bytes must \
-         match the SHA-1 the image records, not merely be produced"
+         be the files', not merely be produced"
     );
 }
 
@@ -152,12 +152,71 @@ fn resources_in_a_codec_exav_lacks_are_reported_not_passed_over() {
     );
 }
 
+/// `blob` with the SHA-1 of every file resource wrong in its offset table (a
+/// resource whose 24-byte header is at 48 in the image header: a 7-byte
+/// size, the flags, the offset).
+fn with_wrong_hashes(blob: &[u8]) -> Vec<u8> {
+    let mut d = blob.to_vec();
+    let le = |d: &[u8], at: usize| u64::from_le_bytes(d[at..at + 8].try_into().unwrap());
+    let size = (le(&d, 48) & 0x00FF_FFFF_FFFF_FFFF) as usize;
+    let at = le(&d, 56) as usize;
+    for e in (at..at + size).step_by(50) {
+        if d[e + 7] & 0x02 == 0 && le(&d, e + 16) > 0 {
+            d[e + 30] ^= 1;
+        }
+    }
+    d
+}
+
+/// A resource failing only its recorded SHA-1 decodes to the file all the
+/// same and is handed over: a wrong checksum is no reason not to scan bytes
+/// that are there. (Names come from the directory tree by hash, so these
+/// lose theirs.)
+#[test]
+fn resources_failing_only_their_sha1_are_handed_over() {
+    for name in ["w_XPRESS.wim", "w_LZX.wim"] {
+        let e = members(&with_wrong_hashes(&fixture(name)));
+        assert!(e.iter().all(|x| x.unsupported.is_none()), "{name}");
+        let mut got: Vec<String> = e.iter().map(|x| sha256_hex(&x.data)).collect();
+        got.sort();
+        let mut want = vec![EICAR, NOTES, DEEP];
+        want.sort();
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+#[cfg(feature = "checksums")]
+fn members_verified(blob: &[u8]) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let mut b = Budget::new(Limits::default());
+    b.set_verify_checksums(true);
+    let _ = extract_each(
+        Format::Wim,
+        blob,
+        &mut b,
+        &mut |e: Entry, _: &mut Budget| {
+            out.push(e);
+            None::<()>
+        },
+    );
+    out
+}
+
+/// With checksums verified, a resource failing its SHA-1 is reported.
+#[cfg(feature = "checksums")]
+#[test]
+fn resources_failing_their_sha1_are_reported_when_checksums_are_verified() {
+    let e = members_verified(&with_wrong_hashes(&fixture("w_LZX.wim")));
+    assert_eq!(e.len(), 3);
+    assert!(e.iter().all(|x| x.unsupported.is_some()));
+}
+
+#[cfg(feature = "checksums")]
 #[test]
 fn a_resource_that_decodes_to_the_wrong_bytes_is_not_handed_over() {
     // Corrupting a chunk's Huffman table makes the decoder emit *something*
-    // rather than fail. The recorded SHA-1 is what separates content from
-    // garbage; without checking it, those bytes would be scanned as the file and
-    // the file would come back clean.
+    // rather than fail. With checksums verified, the recorded SHA-1 is what
+    // separates content from garbage.
     let mut raw = fixture("w_XPRESS.wim");
     // Resource data starts right after the 208-byte header; scribble on the
     // first chunk's code-length table.
@@ -165,7 +224,7 @@ fn a_resource_that_decodes_to_the_wrong_bytes_is_not_handed_over() {
         *b ^= 0xFF;
     }
 
-    let e = members(&raw);
+    let e = members_verified(&raw);
     for m in &e {
         if m.unsupported.is_some() {
             continue;

@@ -13,7 +13,7 @@ fn encrypted_zip_is_unsupported_without_decrypt() {
         &include_bytes!("../fixtures/encrypted/zip_zipcrypto_store.zip")[..],
     ] {
         let mut budget = Budget::with_passwords(Limits::default(), vec!["exavtest".into()]);
-        let entries = extract(Format::Zip, data, &mut budget).unwrap();
+        let entries = extract(Format::Zip, &data, &mut budget).unwrap();
         assert!(
             entries.iter().any(|e| e.encrypted && e.unsupported.is_some()),
             "encrypted member must be reported unsupported (not decrypted) without the decrypt feature",
