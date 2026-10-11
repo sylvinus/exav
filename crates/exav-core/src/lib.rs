@@ -2262,6 +2262,17 @@ fn analyze_all_source(
         Some(DeepOutcome::Limits(r)) => AllMatchOutcome::LimitsExceeded(one_line(r)),
         Some(DeepOutcome::Unscannable(r)) => AllMatchOutcome::Unscannable(one_line(r)),
         Some(DeepOutcome::PasswordProtected(r)) => AllMatchOutcome::PasswordProtected(one_line(r)),
+        // A walk stopped by a budget under `--alert-exceeds-max` ends as the
+        // alert (`limits_outcome`): a detection by name, as the unfinished
+        // search below is, and not a clean end.
+        Some(DeepOutcome::Infected {
+            signature, method, ..
+        }) => {
+            if !names.iter().any(|(n, _)| *n == signature) {
+                names.push((signature, method));
+            }
+            AllMatchOutcome::Complete
+        }
         // The same cardinal rule the single-verdict paths apply, which this one
         // was missing: a search that did not finish must not be presented as a
         // complete one. There it downgrades a would-be `Clean`; here there is no

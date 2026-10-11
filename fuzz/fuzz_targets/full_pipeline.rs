@@ -117,6 +117,8 @@ fuzz_target!(|data: &[u8]| {
     match first.verdict.category() {
         VerdictCategory::Infected => {
             if let Verdict::Infected { signature, .. } = &first.verdict {
+                // Including the alert a budget stop becomes under
+                // `--alert-exceeds-max`, which is a name in both.
                 assert!(
                     names.iter().any(|(n, _)| n == signature),
                     "analyze found {signature}, analyze_all listed {:?}",

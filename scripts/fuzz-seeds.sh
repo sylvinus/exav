@@ -128,6 +128,9 @@ for f in "$OUT"/containers/*; do
   name="$(basename "$f")"
   { printf '\000\000\000'; cat "$f"; } >"$OUT/full_pipeline/$name"
   { printf '\000\000\010\000'; cat "$f"; } >"$OUT/seekable/$name"
+  # The same behind a reader that fails: at once, and a quarter of the way in.
+  { printf '\000\000\010\001'; cat "$f"; } >"$OUT/seekable/fail_first_$name"
+  { printf '\000\000\010\100'; cat "$f"; } >"$OUT/seekable/fail_quarter_$name"
 done
 
 # full_pipeline also gets the files of fuzz/db/ in the header, one a seed and
@@ -181,6 +184,13 @@ if [ -z "$exav" ] && cargo build -q -p exav; then
 fi
 if [ -x "$exav" ]; then
   "$exav" -d fuzz/db --build-db "$OUT/database/fuzz.exavdb" "$OUT/database/sample.bin" >/dev/null 2>&1
+  # And one database per file, so each kind's stored form is a seed of its own.
+  for f in fuzz/db/fuzz.*; do
+    one="$(mktemp -d)"
+    cp "$f" "$one/"
+    "$exav" -d "$one" --build-db "$OUT/database/only_${f##*.}.exavdb" "$OUT/database/sample.bin" >/dev/null 2>&1 || true
+    rm -rf "$one"
+  done
 else
   echo "warning: no exav binary, so no seed for the database target" >&2
 fi
@@ -242,6 +252,9 @@ for name, parts in sets.items():
         body += bytes([kind]) + struct.pack("<H", len(d)) + d
     open(f"{sys.argv[1]}/{name}", "wb").write(bytes(body))
 PY
+
+# Small seeds written from what each target's source reads (see the script).
+python3 scripts/fuzz-seeds-synth.py "$OUT"
 
 for t in analyze unpack filetype; do ln -sfn containers "$OUT/$t"; done
 ln -sfn pe "$OUT/pe_emulator"

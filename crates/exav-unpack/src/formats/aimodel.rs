@@ -60,7 +60,9 @@ fn is_safetensors(data: &[u8]) -> bool {
 
 /// [`is_safetensors`] for an object `len` bytes long whose start is `data`.
 fn is_safetensors_in(data: &[u8], len: usize) -> bool {
-    if len < 9 {
+    // `data` is the object's start, and shorter than `len` when a read failed
+    // or the caller kept only a head: what is sniffed is what is there.
+    if len < 9 || data.len() < 9 {
         return false;
     }
     let n = u64::from_le_bytes([
@@ -81,8 +83,10 @@ fn is_safetensors_in(data: &[u8], len: usize) -> bool {
         return false;
     }
     let scan = (n as usize).min(SAFETENSORS_SNIFF);
-    // Header bytes are data[8..8+scan]; scan >= 1 since n >= 2.
-    data[8..8 + scan].contains(&b'"')
+    // Header bytes are data[8..8+scan], as far as `data` goes; scan >= 1 since
+    // n >= 2.
+    let header = data.get(8..8 + scan).unwrap_or(&data[8..]);
+    header.contains(&b'"')
 }
 
 pub(crate) fn extract_aimodel<R>(
@@ -484,6 +488,24 @@ mod tests {
 
     fn is_aimodel(data: &[u8]) -> bool {
         super::is_aimodel(&crate::Probe::whole(data))
+    }
+
+    /// Found by `fuzz/fuzz_targets/seekable.rs`: `head` is the start of an
+    /// object `len` bytes long, and a read that failed leaves it short (or
+    /// empty) while `len` says there is more. The sniff indexed `head` by what
+    /// `len` promised.
+    #[test]
+    fn a_head_shorter_than_the_object_is_not_sniffed_past_its_end() {
+        assert!(!is_safetensors_in(&[], 100));
+        assert!(!is_safetensors_in(&[2, 0, 0, 0, 0, 0, 0, 0], 100));
+        // A header 20 bytes long, of which the head holds three.
+        let mut head = 20u64.to_le_bytes().to_vec();
+        head.extend_from_slice(b"{ab");
+        assert!(!is_safetensors_in(&head, 100));
+        // And the same header with its quote in the part the head holds.
+        let mut head = 20u64.to_le_bytes().to_vec();
+        head.extend_from_slice(b"{\"a");
+        assert!(is_safetensors_in(&head, 100));
     }
 
     fn short_binunicode(s: &str) -> Vec<u8> {

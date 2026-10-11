@@ -400,6 +400,13 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- `--all-matches` with `--alert-exceeds-max`, on a file whose walk a budget
+  stopped (a decompression bomb), dropped the `Heuristics.Limits.Exceeded.*`
+  alert and reported a complete scan with nothing found, which printed as clean.
+  The alert is listed, as a single-match scan reports it.
+- An object whose first read failed (a stream or file that errors at once) made
+  the safetensors sniff index an empty head and panic; the sniff reads what the
+  head holds.
 - A PCRE subsignature with `\b` or `\B` next to a byte above 0x7F found no word
   boundary where PCRE2 does, when the byte before that one was a letter or a
   digit (`1\x9aab` and `\bab`): the backtracking engine read the two bytes as

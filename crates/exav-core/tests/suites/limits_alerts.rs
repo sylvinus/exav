@@ -77,6 +77,23 @@ fn alert_exceeds_max_turns_it_into_a_clamav_named_detection() {
     }
 }
 
+/// Found by `fuzz/fuzz_targets/full_pipeline.rs` (a bz2 bomb under
+/// `--alert-exceeds-max`): `--all-matches` dropped the alert a walk stopped by a
+/// budget turned into, and reported the scan complete with nothing found. A
+/// single-match scan names the budget; so must the list.
+#[test]
+fn all_matches_names_the_budget_that_stopped_the_walk() {
+    let db = scanner();
+    let blob = zip_with_members(40);
+    let opts = tight(true);
+    let Verdict::Infected { signature, .. } = analyze(&db, &blob, &opts).verdict else {
+        panic!("a single-match scan should name the budget");
+    };
+    let (names, outcome) = exav_core::analyze_all_with_outcome(&db, &blob, &opts);
+    let names: Vec<_> = names.into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, [signature.clone()], "{outcome:?}");
+}
+
 #[test]
 fn the_recursion_budget_reports_its_own_name() {
     let db = scanner();

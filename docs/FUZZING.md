@@ -203,6 +203,40 @@ the tree. The corpus accumulates across runs — coverage climbs monotonically.
 > `#[ignore]`d); seeded, it just makes libFuzzer time out on it immediately and
 > abort. Exclude known-slow fixtures from the seed set.
 
+## Synthesized seeds
+
+`scripts/fuzz-seeds-synth.py` (run by `scripts/fuzz-seeds.sh`) writes small
+seeds from what each target's source reads: for each input format, the shapes
+the code branches on. Measured, as the coverage (edges) libFuzzer reports right
+after loading the seed corpus, before any mutation (`-runs=0`, ASan build, the
+fixture seeds as "old"):
+
+| target | no seeds | old seeds | old + synthesized | synthesized alone |
+|---|---|---|---|---|
+| `sigs` | 280 | 280 (none) | 575 | 575 |
+| `ndb_compile` | 339 | 339 (none) | 3,362 | 3,356 |
+| `bytecode` | 76 | 76 (none) | 643 | 643 |
+| `parser_recursion` | 19 | 19 (none) | 540 | 543 |
+| `rar3_ppmd` | 19 | 19 (none) | 329 | 329 |
+| `x86_decode` | 1,855 | 1,855 (none) | 4,250 | 4,250 |
+| `pe_emulator` | 65 | 1,385 | 1,721 | 1,586 |
+| `cvd` | 40 | 20,086 | 20,179 | 20,038 |
+| `authenticode` | 25 | 1,770 | 1,793 | 1,070 |
+| `seekable` | 19 | 65,002 | 65,018 | 19,052 |
+| `analyze` | 183 | 44,219 | 44,958 | 19,443 |
+| `full_pipeline` | 25 | 76,707 | 77,120 | 36,647 |
+| `pe` | 56 | 1,298 | 1,298 | 426 |
+
+Where there were no seeds the gain is large (five to ten times); where the
+fixtures already open the parser it is small, and the point is the inputs the
+fixtures do not have: the option bits, a reader that fails, a PE of the shapes a
+packer's stub takes. `database` has none of its own: its per-file databases are
+in the old count, so it is not measured alone. A seed that breaks a check is
+the best kind: one found the `--alert-exceeds-max` all-match bug in the table
+below the moment `full_pipeline` first loaded it. `clamd` and `icap` are not
+here: their input is `arbitrary`'s encoding, which no one writes by hand, and
+they reach 17,000 edges within seconds without seeds.
+
 ## Running a campaign
 
 CI's `fuzz-smoke` job runs every target for 60 seconds on each push, from the
@@ -334,6 +368,8 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 | 12.6 KB archive reaching the 100,000-member limit (`full_pipeline`, slow unit) | none | the member limit working as designed: ~1.1 s at `opt-level` 1 for 100,000 members, ~22 s per scan under the fuzzer, four scans per input | not a bug; no change |
 | PCRE `\bword` on `1\x9aword` (`pcre`, the two engines disagreed) | vendored fancy-regex 0.19.2 `vm.rs`, `\b`, `\B` and their half forms | in `BytesMode::Ascii` the VM asked regex-automata's Unicode word boundary, which reads the bytes beside the position as UTF-8: a byte over 0x7F was taken with the byte before it for a letter, so no boundary was found where `regex` and PCRE2 find one. A signature using `\b` beside a high byte missed | the ASCII boundary functions in that mode (`a_word_boundary_beside_a_high_byte_reads_the_same_in_both_engines`; `fancy_regex/README.md` records the change) |
 | PCRE `(\bb)x*` on `c\b\x9e` (`pcre`, the two engines disagreed) | vendored fancy-regex `compile.rs` `options_to_rabuilder` | the delegated engines kept regex-automata's default `utf8_empty(true)` in bytes mode: an empty match at a position before a byte over 0x7F was skipped as splitting a UTF-8 character, so a delegated repeat that can match nothing failed the whole pattern there | `utf8_empty` only in `BytesMode::Unicode` (same test) |
+| safetensors sniff of an object whose first read failed (`seekable`, CI smoke run, index out of bounds) | `formats/aimodel.rs` `is_safetensors_in` | `Probe::head` is the start of the object and `len` its length; the sniff checked `len` and then indexed `head`, which a failed read leaves empty or short | the head's own length is checked, and the header is read as far as the head goes (`a_head_shorter_than_the_object_is_not_sniffed_past_its_end`) |
+| bz2 bomb under `--alert-exceeds-max`, all-match mode (`full_pipeline`, found by a synthesized seed) | `lib.rs` `analyze_all_source` | the walk stopped by a budget ends as the alert (`limits_outcome`), and the match on its outcome had arms for `Limits`, `Unscannable` and `PasswordProtected` but not for that: the alert was dropped and the scan reported `Complete` with nothing found, which `--all-matches` printed as clean | the alert is a name in the list, as the unfinished-search arm already did (`all_matches_names_the_budget_that_stopped_the_walk`) |
 | RAR volume numbered 65535 (RAR4) or 2^64 - 1 (RAR5) (`volumes`, overflow panic) | `formats/rar.rs` `join_rar4`, `join_rar5` | the refusal message added one to the number it had read, in its own width; release builds check overflow, so the panic was real and became `Unscannable` for the whole set instead of the volume being named | the sum in `usize` / saturating (`a_volume_numbered_65535_is_refused_by_name_not_by_a_panic`, `a_rar5_volume_numbered_2_pow_64_minus_1_is_refused_by_name_not_by_a_panic`) |
 | `"secret" xor(1-255)` over 64 KB (`analyze`, 6 execs a second after the YARA rules were added; 3 s a scan) | `yara/matcher.rs` `PatternMatcher::search` | every position was compared with every key in the range, 255 times the work, and an `xor` pattern is never gated by an atom, so every scan paid it; a 16 MiB object took 9 s | the one key a position can match with is its first byte's (`a_wide_xor_range_does_not_cost_a_comparison_per_key_per_position`, `xor_finds_each_key_where_it_was_used`) |
 | `/a.{0,32}b[^\x00-\x1f]+c\b/s` over 2 MiB of text (`full_pipeline`, timeout, all-match mode) | the YARA regex matcher | a start position's match runs to the end of the text, so the work is quadratic in it; yara's own engine has the same shape | not a bug in exav: the rule is the cost (`fuzz/db/fuzz.yar` bounds its repetition) |
