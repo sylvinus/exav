@@ -55,7 +55,11 @@ RUN cargo build --release -p exav --features http \
 
 FROM scratch AS prebuilt
 ARG TARGETARCH
-COPY bins/exav-${TARGETARCH} /exav
+# Executable whatever mode the file arrives with: a binary that went through
+# `upload-artifact` and `download-artifact` has lost its permission bits, and an
+# image whose /exav is not executable fails to start (`crun: open executable:
+# Permission denied`), `latest` included.
+COPY --chmod=755 bins/exav-${TARGETARCH} /exav
 
 FROM ${BIN_SOURCE} AS binsrc
 

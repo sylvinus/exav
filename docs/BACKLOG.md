@@ -65,6 +65,19 @@ is on exav.org.
 
 ## Viewer
 
+- **More archive formats in the viewer** (0.0.3): the archive plugin claims
+  only zip, 7z, rar, tar, gz, bz2 and xz (`archive` in
+  `crates/exav-viewer/ts/core/formats.ts`, and the table in
+  www/src/content/docs/viewer/index.md), while `@exav/unpack-wasm`'s default
+  `standard` preset already reads about 60. Add the ones a user thinks of as
+  archives: `.cab .iso .lzh/.lha .arj .ar/.deb .cpio .xar .zst .lz4 .lz .wim
+  .dmg`, each with its MIME type and extension, a sample in exav-samples, an e2e
+  test that opens it and lists its members, and a line in the docs table. Leave
+  out what is not an archive to a user (packers and installers: `upx`, `sfx`,
+  `nsis`, `inno`, `pepack`) and what another plugin opens (`pdf`, `ole`,
+  `email`, `rtf`). Check each through the viewer's tree before listing it: the
+  engine reading a format does not mean the member listing and the bounds do
+  right by it.
 - **JPEG XL**, after 0.0.2: a fork of the `jxl` crate without SIMD and with
   its other `unsafe` rewritten, in the viewer's image module only. The plan is
   on the roadmap page (www/src/content/docs/project/roadmap.md). The demo
