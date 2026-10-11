@@ -1,0 +1,1518 @@
+[
+ {
+  "source": "all",
+  "header": true,
+  "fields": {
+   "insunits": 4,
+   "ltscale": 2.5,
+   "measurement": 1
+  }
+ },
+ {
+  "source": "all",
+  "table": "layers",
+  "name": "WALLS",
+  "fields": {
+   "color": 1,
+   "linetype": "DASHED",
+   "lineweight": 50
+  }
+ },
+ {
+  "source": "all",
+  "table": "layers",
+  "name": "GLASS",
+  "fields": {
+   "color": "#0ac8fa",
+   "alpha": 127
+  }
+ },
+ {
+  "source": "all",
+  "table": "layers",
+  "name": "HIDDEN_OFF",
+  "fields": {
+   "color": 3,
+   "off": true
+  }
+ },
+ {
+  "source": "all",
+  "table": "layers",
+  "name": "FROZEN",
+  "fields": {
+   "flags": 1
+  }
+ },
+ {
+  "source": "all",
+  "table": "linetypes",
+  "name": "DOTTED_X",
+  "fields": {
+   "description": "dots . . .",
+   "elements.*.length": [
+    0.5,
+    -0.1
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "table": "linetypes",
+  "name": "GAS_LINE",
+  "fields": {
+   "elements.*.length": [
+    0.5,
+    -0.2,
+    -0.25
+   ],
+   "elements.1.text": "GAS",
+   "elements.1.scale": 0.1,
+   "elements.1.offset": [
+    -0.1,
+    -0.05
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "table": "text_styles",
+  "name": "LABELS",
+  "fields": {
+   "font_file": "arial.ttf"
+  }
+ },
+ {
+  "source": "all",
+  "table": "text_styles",
+  "name": "NOTES",
+  "fields": {
+   "font_file": "romans.shx",
+   "width_factor": 0.8
+  }
+ },
+ {
+  "source": "all",
+  "handle": "9F",
+  "type": "LINE",
+  "fields": {
+   "start": [
+    1.0,
+    2.0,
+    0.0
+   ],
+   "end": [
+    3.0,
+    4.0,
+    0.0
+   ],
+   "layer": "WALLS",
+   "color": 3
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A0",
+  "type": "LINE",
+  "fields": {
+   "color": "#ff8000"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A1",
+  "type": "LINE",
+  "fields": {
+   "linetype": "DOTTED_X",
+   "linetype_scale": 2.0,
+   "transparency": 191
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A2",
+  "type": "LINE",
+  "fields": {
+   "lineweight": 35,
+   "color": "byblock"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A3",
+  "type": "POINT",
+  "fields": {
+   "location": [
+    5.0,
+    5.0,
+    1.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A4",
+  "type": "CIRCLE",
+  "fields": {
+   "center": [
+    10.0,
+    10.0,
+    0.0
+   ],
+   "radius": 3.0
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A5",
+  "type": "ARC",
+  "fields": {
+   "center": [
+    20.0,
+    10.0,
+    0.0
+   ],
+   "radius": 2.0,
+   "start_angle": 0.5235987755982988,
+   "end_angle": 2.0943951023931953
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A6",
+  "type": "CIRCLE",
+  "fields": {
+   "extrusion": [
+    0.0,
+    0.0,
+    -1.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A7",
+  "type": "ELLIPSE",
+  "fields": {
+   "center": [
+    40.0,
+    10.0,
+    0.0
+   ],
+   "major_axis": [
+    4.0,
+    0.0,
+    0.0
+   ],
+   "ratio": 0.5,
+   "start_param": 0.0,
+   "end_param": 3.141592653589793
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A8",
+  "type": "SPLINE",
+  "fields": {
+   "fit_points": [
+    [
+     0.0,
+     20.0,
+     0.0
+    ],
+    [
+     2.0,
+     23.0,
+     0.0
+    ],
+    [
+     4.0,
+     20.0,
+     0.0
+    ],
+    [
+     6.0,
+     23.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "A9",
+  "type": "SPLINE",
+  "fields": {
+   "degree": 3,
+   "control_points": [
+    [
+     10.0,
+     20.0,
+     0.0
+    ],
+    [
+     12.0,
+     24.0,
+     0.0
+    ],
+    [
+     14.0,
+     20.0,
+     0.0
+    ],
+    [
+     16.0,
+     24.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "AA",
+  "type": "SPLINE",
+  "fields": {
+   "weights": [
+    1.0,
+    2.0,
+    2.0,
+    1.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "AB",
+  "type": "LWPOLYLINE",
+  "fields": {
+   "flags": 1,
+   "vertices": [
+    [
+     0.0,
+     30.0,
+     0.0,
+     0.0,
+     0.5
+    ],
+    [
+     5.0,
+     30.0,
+     0.2,
+     0.4,
+     0.0
+    ],
+    [
+     5.0,
+     35.0,
+     0.0,
+     0.0,
+     -1.0
+    ],
+    [
+     0.0,
+     35.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "AC",
+  "type": "POLYLINE",
+  "fields": {
+   "vertices.*.location": [
+    [
+     10.0,
+     30.0,
+     0.0
+    ],
+    [
+     15.0,
+     30.0,
+     0.0
+    ],
+    [
+     15.0,
+     35.0,
+     0.0
+    ]
+   ],
+   "flags": 1
+  }
+ },
+ {
+  "source": "all",
+  "handle": "B1",
+  "type": "POLYLINE",
+  "fields": {
+   "vertices.0.bulge": 1.0,
+   "vertices#": 2
+  }
+ },
+ {
+  "source": "all",
+  "handle": "B5",
+  "type": "POLYLINE",
+  "fields": {
+   "vertices.2.location": [
+    35.0,
+    35.0,
+    10.0
+   ],
+   "flags": 8
+  }
+ },
+ {
+  "source": "all",
+  "handle": "BA",
+  "type": "POLYLINE",
+  "fields": {
+   "vertices#": 9,
+   "flags": 16,
+   "m_count": 3,
+   "n_count": 3
+  }
+ },
+ {
+  "source": "all",
+  "handle": "C5",
+  "type": "POLYLINE",
+  "fields": {
+   "vertices#": 5,
+   "vertices.4.indices": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "flags": 64
+  }
+ },
+ {
+  "source": "all",
+  "handle": "CC",
+  "type": "SOLID",
+  "fields": {
+   "corners": [
+    [
+     0.0,
+     40.0,
+     0.0
+    ],
+    [
+     2.0,
+     40.0,
+     0.0
+    ],
+    [
+     0.0,
+     42.0,
+     0.0
+    ],
+    [
+     2.0,
+     42.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "CD",
+  "type": "SOLID",
+  "fields": {
+   "corners": [
+    [
+     5.0,
+     40.0,
+     0.0
+    ],
+    [
+     7.0,
+     40.0,
+     0.0
+    ],
+    [
+     5.0,
+     42.0,
+     0.0
+    ],
+    [
+     5.0,
+     42.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "CE",
+  "type": "TRACE",
+  "fields": {
+   "corners": [
+    [
+     10.0,
+     40.0,
+     0.0
+    ],
+    [
+     12.0,
+     40.0,
+     0.0
+    ],
+    [
+     10.0,
+     42.0,
+     0.0
+    ],
+    [
+     12.0,
+     42.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "CF",
+  "type": "3DFACE",
+  "fields": {
+   "corners": [
+    [
+     20.0,
+     40.0,
+     0.0
+    ],
+    [
+     22.0,
+     40.0,
+     1.0
+    ],
+    [
+     22.0,
+     42.0,
+     2.0
+    ],
+    [
+     20.0,
+     42.0,
+     3.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "D0",
+  "type": "TEXT",
+  "fields": {
+   "value": "Left text",
+   "height": 2.5,
+   "rotation": 0.2617993877991494,
+   "style": "LABELS",
+   "insertion": [
+    0.0,
+    50.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "D1",
+  "type": "TEXT",
+  "fields": {
+   "value": "Centred %%c50 %%d",
+   "h_align": "center",
+   "v_align": "middle",
+   "alignment_point": [
+    20.0,
+    50.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "D2",
+  "type": "TEXT",
+  "fields": {
+   "h_align": "fit",
+   "insertion": [
+    30.0,
+    50.0,
+    0.0
+   ],
+   "alignment_point": [
+    40.0,
+    50.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "D3",
+  "type": "TEXT",
+  "fields": {
+   "value": "Unicode Ä ж 中"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "D4",
+  "type": "MTEXT",
+  "fields": {
+   "text": "First line\\PSecond {\\C1;red} line",
+   "height": 1.5,
+   "reference_width": 20.0,
+   "insertion": [
+    0.0,
+    60.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "D5",
+  "type": "MTEXT",
+  "fields": {
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx end"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "D6",
+  "type": "INSERT",
+  "fields": {
+   "attributes.0.tag": "ROOM",
+   "attributes.0.text.value": "Kitchen",
+   "block_name": "RING",
+   "rotation": 0.7853981633974483,
+   "scale": [
+    2.0,
+    3.0,
+    1.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "DA",
+  "type": "INSERT",
+  "fields": {
+   "rows": 2,
+   "columns": 3,
+   "row_spacing": 4.0,
+   "column_spacing": 5.0
+  }
+ },
+ {
+  "source": "all",
+  "handle": "DC",
+  "type": "INSERT",
+  "fields": {
+   "block_name": "NESTED"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "DE",
+  "type": "DIMENSION",
+  "fields": {
+   "kind": "linear"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "DF",
+  "type": "DIMENSION",
+  "fields": {
+   "kind": "linear"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "E0",
+  "type": "DIMENSION",
+  "fields": {
+   "kind": "angular"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "E1",
+  "type": "DIMENSION",
+  "fields": {
+   "kind": "diameter"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "E2",
+  "type": "DIMENSION",
+  "fields": {
+   "kind": "radius"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "E3",
+  "type": "DIMENSION",
+  "fields": {
+   "kind": "angular_3_point"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "E4",
+  "type": "DIMENSION",
+  "fields": {
+   "kind": "ordinate"
+  }
+ },
+ {
+  "source": "all",
+  "handle": "13C",
+  "type": "LEADER",
+  "fields": {
+   "vertices": [
+    [
+     0.0,
+     90.0,
+     0.0
+    ],
+    [
+     5.0,
+     95.0,
+     0.0
+    ],
+    [
+     10.0,
+     95.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "13D",
+  "type": "MULTILEADER",
+  "fields": {
+   "context.text": "Leader text",
+   "context.has_text": true,
+   "context.leaders.0.lines.0.vertices.0": [
+    20.0,
+    90.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "13E",
+  "type": "MLINE",
+  "fields": {
+   "vertices.*.position": [
+    [
+     40.0,
+     90.0,
+     0.0
+    ],
+    [
+     50.0,
+     90.0,
+     0.0
+    ],
+    [
+     50.0,
+     95.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "13F",
+  "type": "HATCH",
+  "fields": {
+   "paths#": 2,
+   "paths.0.vertices.1": [
+    10.0,
+    110.0,
+    0.5
+   ],
+   "solid": true
+  }
+ },
+ {
+  "source": "all",
+  "handle": "140",
+  "type": "HATCH",
+  "fields": {
+   "paths.0.edges.*.type": [
+    "line",
+    "arc",
+    "line",
+    "ellipse",
+    "spline"
+   ],
+   "paths.0.edges.4.control_points#": 4,
+   "paths.0.edges.4.knots": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "pattern_name": "ANSI31",
+   "pattern_scale": 0.5,
+   "pattern_angle": 0.2617993877991494
+  }
+ },
+ {
+  "source": "all",
+  "handle": "141",
+  "type": "HATCH",
+  "fields": {
+   "paths.0.edges.1.counter_clockwise": false,
+   "paths.0.edges.1.radius": 5.0
+  }
+ },
+ {
+  "source": "all",
+  "handle": "142",
+  "type": "HELIX",
+  "fields": {
+   "spline.control_points#": 37,
+   "radius": 2.0,
+   "turns": 3.0
+  }
+ },
+ {
+  "source": "all",
+  "handle": "143",
+  "type": "RAY",
+  "fields": {
+   "base": [
+    0.0,
+    100.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "144",
+  "type": "XLINE",
+  "fields": {
+   "base": [
+    5.0,
+    100.0,
+    0.0
+   ],
+   "direction": [
+    0.0,
+    1.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "145",
+  "type": "WIPEOUT",
+  "fields": {
+   "insertion": [
+    10.0,
+    100.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "14C",
+  "type": "IMAGE",
+  "fields": {
+   "insertion": [
+    20.0,
+    100.0,
+    0.0
+   ],
+   "size": [
+    640.0,
+    480.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "150",
+  "type": "PDFUNDERLAY",
+  "fields": {
+   "insertion": [
+    30.0,
+    100.0,
+    0.0
+   ],
+   "rotation": 0.17453292519943295
+  }
+ },
+ {
+  "source": "all",
+  "handle": "152",
+  "type": "SHAPE",
+  "fields": {
+   "name": "TRACK1",
+   "size": 2.0
+  }
+ },
+ {
+  "source": "all",
+  "handle": "158",
+  "type": "VIEWPORT",
+  "fields": {
+   "frozen_layers#": 1,
+   "center": [
+    200.0,
+    150.0,
+    0.0
+   ],
+   "width": 300.0,
+   "height": 200.0,
+   "view_height": 150.0,
+   "view_center": [
+    30.0,
+    60.0
+   ]
+  }
+ },
+ {
+  "source": "all",
+  "handle": "159",
+  "type": "TEXT",
+  "fields": {
+   "paper_space": true
+  }
+ },
+ {
+  "source": "all",
+  "table": "layouts",
+  "name": "Sheet A",
+  "fields": {
+   "plot.paper_width": 420.0,
+   "plot.paper_height": 297.0
+  }
+ },
+ {
+  "source": "gradient",
+  "handle": "2F",
+  "type": "HATCH",
+  "fields": {
+   "gradient.name": "CYLINDER",
+   "gradient.angle": 0.5235987755982988,
+   "gradient.colors.*.1": [
+    "#ff0000",
+    "#0000ff"
+   ]
+  }
+ },
+ {
+  "source": "cp1251",
+  "table": "layers",
+  "name": "Стены",
+  "fields": {
+   "color": 1
+  }
+ },
+ {
+  "source": "cp1251",
+  "handle": "30",
+  "type": "TEXT",
+  "fields": {
+   "value": "Привет",
+   "layer": "Стены"
+  }
+ },
+ {
+  "source": "cp1251",
+  "handle": "31",
+  "type": "TEXT",
+  "fields": {
+   "value": "中文 ✓"
+  }
+ },
+ {
+  "source": "cp1251",
+  "handle": "32",
+  "type": "MTEXT",
+  "fields": {
+   "text": "Строка\\Pвторая"
+  }
+ },
+ {
+  "source": "dwgcases",
+  "table": "blocks",
+  "name": "XREF_A",
+  "fields": {
+   "flags": 4,
+   "xref_path": "other.dwg",
+   "base_point": [
+    2.0,
+    3.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "dwgcases",
+  "table": "linetypes",
+  "name": "SPR_LINE",
+  "fields": {
+   "elements.1.text": "SPR",
+   "elements.4.text": "SPR"
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "8A",
+  "type": "MTEXT",
+  "fields": {
+   "columns.kind": 1,
+   "columns.count": 2,
+   "columns.width": 8.0,
+   "columns.gutter": 1.0
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "8B",
+  "type": "MTEXT",
+  "fields": {
+   "columns.kind": 2,
+   "columns.count": 3,
+   "columns.heights": [
+    4.0,
+    5.0,
+    6.0
+   ]
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "8C",
+  "type": "MTEXT",
+  "fields": {
+   "background_fill": 1,
+   "background_color": "#c80a1e",
+   "background_scale": 1.25
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "8D",
+  "type": "MTEXT",
+  "fields": {
+   "x_direction": [
+    0.0,
+    1.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "93",
+  "type": "INSERT",
+  "fields": {
+   "attributes.0.tag": "NOTE",
+   "attributes.0.mtext.text": "line one\\Pline two"
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "92",
+  "type": "ATTDEF",
+  "fields": {
+   "tag": "NOTE"
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "99",
+  "type": "DWFUNDERLAY",
+  "fields": {
+   "kind": "dwf",
+   "insertion": [
+    60.0,
+    0.0,
+    0.0
+   ],
+   "scale": [
+    2.0,
+    3.0,
+    1.0
+   ],
+   "rotation": 0.3490658503988659,
+   "contrast": 70,
+   "fade": 10
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "9C",
+  "type": "DGNUNDERLAY",
+  "fields": {
+   "kind": "dgn",
+   "insertion": [
+    70.0,
+    0.0,
+    0.0
+   ],
+   "scale": [
+    2.0,
+    3.0,
+    1.0
+   ],
+   "rotation": 0.3490658503988659,
+   "contrast": 70,
+   "fade": 10
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "9D",
+  "type": "OLE2FRAME",
+  "fields": {
+   "upper_left": [
+    80.0,
+    10.0,
+    0.0
+   ],
+   "lower_right": [
+    90.0,
+    0.0,
+    0.0
+   ],
+   "version": 2
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "9E",
+  "type": "ARC_DIMENSION",
+  "fields": {
+   "kind": "angular_3_point",
+   "point15": [
+    0.0,
+    40.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "AE",
+  "type": "POLYLINE",
+  "fields": {
+   "vertices.1.start_width": 1.0,
+   "vertices.1.end_width": 0.6,
+   "default_start_width": 0.4,
+   "default_end_width": 0.2
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "B3",
+  "type": "SPLINE",
+  "fields": {
+   "flags": 3
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "B4",
+  "type": "SPLINE",
+  "fields": {
+   "fit_points": [
+    [
+     20.0,
+     50.0,
+     0.0
+    ],
+    [
+     22.0,
+     53.0,
+     0.0
+    ],
+    [
+     25.0,
+     51.0,
+     0.0
+    ]
+   ]
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "B5",
+  "type": "TEXT",
+  "fields": {
+   "h_align": "right",
+   "v_align": "bottom",
+   "alignment_point": [
+    35.0,
+    50.0,
+    2.5
+   ]
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "B6",
+  "type": "3DFACE",
+  "fields": {
+   "invisible_edges": 5
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "B7",
+  "type": "INSERT",
+  "fields": {
+   "scale": [
+    2.0,
+    3.0,
+    4.0
+   ]
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "BD",
+  "type": "VIEWPORT",
+  "fields": {
+   "status": 1,
+   "id": 1
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "BE",
+  "type": "VIEWPORT",
+  "fields": {
+   "status": 0,
+   "id": -1
+  }
+ },
+ {
+  "source": "entities",
+  "handle": "C0",
+  "type": "VIEWPORT",
+  "fields": {
+   "clip_boundary": "BF",
+   "id": 3
+  }
+ },
+ {
+  "source": "objects",
+  "handle": "8E",
+  "type": "VIEWPORT",
+  "fields": {
+   "status": 2,
+   "id": 1
+  }
+ },
+ {
+  "source": "objects",
+  "handle": "8F",
+  "type": "VIEWPORT",
+  "fields": {
+   "status": 3,
+   "id": 2
+  }
+ },
+ {
+  "source": "objects",
+  "handle": "90",
+  "type": "VIEWPORT",
+  "fields": {
+   "status": 4,
+   "id": 3
+  }
+ },
+ {
+  "source": "objects",
+  "handle": "91",
+  "type": "VIEWPORT",
+  "fields": {
+   "status": 1,
+   "id": 4
+  }
+ },
+ {
+  "source": "objects",
+  "table": "layouts",
+  "name": "Plot A",
+  "fields": {
+   "insertion_base": [
+    1.5,
+    2.5,
+    3.5
+   ],
+   "ucs_origin": [
+    7.25,
+    8.25,
+    9.25
+   ],
+   "limits_min": [
+    -1.0,
+    -2.0
+   ],
+   "limits_max": [
+    297.0,
+    210.0
+   ],
+   "extents_min": [
+    4.0,
+    5.0,
+    6.0
+   ],
+   "extents_max": [
+    40.0,
+    50.0,
+    60.0
+   ],
+   "elevation": 0.75,
+   "last_viewport": "91",
+   "plot.margins": [
+    5.0,
+    6.0,
+    7.0,
+    8.0
+   ],
+   "plot.paper_width": 297.0,
+   "plot.paper_height": 210.0,
+   "plot.origin": [
+    1.25,
+    2.25
+   ],
+   "plot.window_min": [
+    -3.0,
+    -4.0
+   ],
+   "plot.window_max": [
+    30.0,
+    40.0
+   ],
+   "plot.scale_denominator": 50.0,
+   "plot.rotation": 1,
+   "plot.plot_type": 4,
+   "plot.image_origin": [
+    0.5,
+    0.75
+   ]
+  }
+ },
+ {
+  "source": "objects",
+  "table": "mline_styles",
+  "name": "TRIPLE",
+  "fields": {
+   "flags": 531,
+   "fill_color": 3,
+   "start_angle": 1.3962634015954636,
+   "end_angle": 1.7453292519943295,
+   "elements.*.offset": [
+    0.5,
+    0.0,
+    -0.5
+   ],
+   "elements.*.color": [
+    1,
+    "byblock",
+    5
+   ],
+   "elements.*.linetype": [
+    "DASHED",
+    "BYBLOCK",
+    "BYLAYER"
+   ]
+  }
+ },
+ {
+  "source": "objects",
+  "table": "mleader_styles",
+  "name": "Callout",
+  "fields": {
+   "content_type": 2,
+   "leader_line_type": 2,
+   "leader_line_color": 4,
+   "leader_lineweight": 35,
+   "landing": true,
+   "landing_gap": 0.3,
+   "dogleg": true,
+   "dogleg_length": 1.5,
+   "arrowhead_size": 0.6,
+   "text_left_attachment": 3,
+   "text_right_attachment": 4,
+   "text_angle_type": 2,
+   "text_alignment_type": 1,
+   "text_color": 6,
+   "text_height": 0.4,
+   "text_frame": true,
+   "block_scale": [
+    2.0,
+    3.0,
+    1.0
+   ],
+   "block_rotation": 0.5,
+   "block_connection": 1,
+   "scale": 2.5
+  }
+ },
+ {
+  "source": "objects",
+  "table": "image_defs",
+  "name": "photo.png",
+  "fields": {
+   "size": [
+    640.0,
+    480.0
+   ],
+   "resolution_units": 2,
+   "loaded": true
+  },
+  "key": "file_name"
+ },
+ {
+  "source": "objects",
+  "table": "underlay_defs",
+  "name": "plan.pdf",
+  "fields": {
+   "kind": "pdf",
+   "name": "3"
+  },
+  "key": "file_name"
+ },
+ {
+  "source": "objects",
+  "table": "sort_tables",
+  "name": "17",
+  "fields": {
+   "entries": [
+    [
+     "9D",
+     "FFF0"
+    ],
+    [
+     "9E",
+     "FFE0"
+    ]
+   ]
+  },
+  "key": "block_record"
+ },
+ {
+  "source": "objects",
+  "table": "dictionaries",
+  "name": "A1",
+  "fields": {
+   "cloning": 2,
+   "entries.*.0": [
+    "NOTE"
+   ]
+  },
+  "key": "handle"
+ },
+ {
+  "source": "c7",
+  "handle": "2F",
+  "type": "MTEXT",
+  "fields": {
+   "text": "73° MTEXT"
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "30",
+  "type": "TEXT",
+  "fields": {
+   "value": "TEXT 45°"
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "31",
+  "type": "OLE2FRAME",
+  "fields": {
+   "tile_mode": 0
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "32",
+  "type": "OLE2FRAME",
+  "fields": {
+   "tile_mode": 1
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "36",
+  "type": "OLE2FRAME",
+  "fields": {
+   "tile_mode": 1
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "39",
+  "type": "HATCH",
+  "fields": {
+   "paths.0.edges.0.start_angle": 0.5235987755982988,
+   "paths.0.edges.0.end_angle": 2.0943951023931953
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "3E",
+  "type": "VIEWPORT",
+  "fields": {
+   "id": 1,
+   "status": 0
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "3F",
+  "type": "VIEWPORT",
+  "fields": {
+   "id": 2,
+   "status": 1
+  }
+ },
+ {
+  "source": "c7",
+  "handle": "40",
+  "type": "VIEWPORT",
+  "fields": {
+   "id": -1,
+   "status": 0
+  }
+ }
+]

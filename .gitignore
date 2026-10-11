@@ -15,7 +15,9 @@ Cargo.lock.orig
 # real-malware test samples: kept locally (gitignored) for extra decoder
 # coverage, NEVER committed — the tests that use them skip when absent, and CI
 # relies on the synthetic/EICAR fixtures. Provenance (sha256) is in each dir's
-# README.md. The synthetic `eicar.lnk` and the READMEs stay committed.
+# README.md. Each is kept as `<name>.zip`, AES-256 with the password
+# `infected` (crates/exav-unpack/tests/fixtures/README.md). The synthetic
+# `eicar.lnk` and the READMEs stay committed.
 crates/exav-unpack/tests/fixtures/**/real-malware-*
 /yara-x/
 # internal strategy notes — never commit

@@ -1,0 +1,289 @@
+---
+title: Docker
+description: Run exav as a container, a wire-level replacement for the ClamAV Docker image, with four ways to populate signatures and a dual-container updater pattern.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The published image (`ghcr.io/sylvinus/exav`) replaces the
+[ClamAV Docker image](https://docs.clamav.net/manual/Installing/Docker.html) on
+the wire: the same clamd port 3310 and protocol. It runs the clamd-compatible
+daemon by default, so a host `clamdscan` (or any clamd client) pointed at the
+container's TCP 3310 works.
+
+It is distroless and rootless: a static musl binary on `distroless/static` (no
+shell, no package manager) running as the `nonroot` user (uid 65532).
+Bind-mounted database volumes must be writable by that uid.
+
+## Run it
+
+Signatures are not bundled. Name a source (below), or fill the volume yourself
+with `cvd`/`freshclam` first; until signatures appear exav waits
+(`EXAV_STARTUP_WAIT_SECS`, default 1800) and nothing answers on 3310. The port
+is published on localhost only, because the clamd protocol has no
+authentication; the examples below do the same.
+
+```sh
+docker run -d --name exav -p 127.0.0.1:3310:3310 -v exav-db:/var/lib/exav \
+  -e EXAV_SIG_SOURCES=https://clamav-mirror.internal/ ghcr.io/sylvinus/exav
+```
+
+Once the load is logged (`docker logs exav`), scan through it with a host `exav`
+or with `clamdscan` (`TCPSocket 3310` and `TCPAddr 127.0.0.1` in its
+`clamd.conf`):
+
+```sh
+exav --connect 127.0.0.1:3310 --send-as contents file.bin
+clamdscan --stream file.bin
+```
+
+For a one-shot scan, pass paths: they take precedence over the image's
+`EXAV_LISTEN`. The scan loads its own database, so it needs the signature volume
+as well as the tree to scan:
+
+```sh
+docker run --rm -v exav-db:/var/lib/exav -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+```
+
+`--listen` on the command line together with paths is refused: one command
+either serves or scans.
+
+The image's default command is `--auto-update`, with `EXAV_LISTEN` set to
+`clamd://0.0.0.0:3310`: serve the clamd protocol and keep the signature volume
+current (bootstrap it, wait for a sidecar to fill it if that is where signatures
+come from, refresh the configured sources on a schedule, and hot-reload on every
+change). Everything else comes from the environment, and a flag on the command
+line overrides the matching variable:
+
+```sh
+# EXAV_WORKERS is overridden; every other variable still applies.
+docker run -d -p 127.0.0.1:3310:3310 -e EXAV_WORKERS=8 -v exav-db:/var/lib/exav \
+  ghcr.io/sylvinus/exav --auto-update --workers 2
+```
+
+exav divides the container's memory limit (`--memory`), not the host's RAM,
+between its workers; see [Sizing a server](/scanner/guides/sizing/).
+
+## Health
+
+The image's `HEALTHCHECK` runs `exav --ping`: one exchange in the listener's
+protocol (`PING` on clamd, `OPTIONS` on ICAP), so it fails on a daemon that
+accepts connections and then answers nothing, which a bare TCP probe would call
+healthy. It reads the same `EXAV_LISTEN` the daemon did, so moving the port or
+serving ICAP through that variable needs no change to the check. It cannot see
+a `--listen` given on the container's command line. It also works against any
+daemon:
+
+```sh
+docker exec exav /exav --ping                       # what this container serves
+exav --ping --connect clamd://scanner.internal:3310 # from anywhere
+```
+
+`HEALTHCHECK` is a Docker extension of the image configuration, not part of the
+OCI spec. Docker honours it either way. Podman reads it only from an image
+published with Docker mediatypes, which the publish workflow checks for images
+published after 0.0.1; on older tags, or an image a registry re-exports as OCI,
+`podman image inspect` shows no health check. Kubernetes ignores it entirely.
+Where it matters, say it in the orchestrator's own configuration, with the same
+command:
+
+```yaml
+# Compose
+healthcheck:
+  test: ["CMD", "/exav", "--ping"]
+  interval: 30s
+  timeout: 5s
+  start_period: 60s
+  retries: 3
+```
+
+```yaml
+# Kubernetes, on the container
+livenessProbe:
+  exec: { command: ["/exav", "--ping"] }
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+startupProbe:                  # the time it takes to load the signatures
+  exec: { command: ["/exav", "--ping"] }
+  periodSeconds: 10
+  failureThreshold: 30
+```
+
+A container is unhealthy while it waits for signatures, since it is not serving
+then. The image's start period is 60 seconds. If signatures come from a slow
+sidecar, or the container loads raw `.cvd` files (as the built-in updater does;
+see [what it costs](/scanner/guides/prebuilt-database/#what-it-costs)), raise it
+(`--health-start-period` on `docker run`, `start_period` in Compose) so the
+orchestrator does not kill it mid-load.
+
+The check is for the daemon. A container given another job (building a
+database, a `--connect` client, a one-shot scan) reports unhealthy the whole time
+it works, because nothing is listening. Those runs exit on their own, so this is
+cosmetic under `docker run`; add `--no-healthcheck` if something would act on it:
+
+```sh
+docker run --rm --no-healthcheck -v exav-db:/var/lib/exav \
+  -v "$PWD:/scan" ghcr.io/sylvinus/exav /scan
+```
+
+<Aside type="caution" title="Signatures are never bundled">
+exav ships no GPL database and no CDN URL. With no real signatures the daemon
+refuses to serve (unless `--allow-no-db` / `EXAV_ALLOW_NO_DB=1`, for testing).
+</Aside>
+
+## Four ways to populate signatures
+
+<Tabs>
+  <TabItem label="Managed volume">
+    Mount a `/var/lib/exav` you keep current yourself with `cvd` / `freshclam`.
+    No updater in the container. To reuse an existing ClamAV volume, mount it at
+    `/var/lib/exav`, or mount it elsewhere and set `EXAV_SIG_DIR` to that path.
+  </TabItem>
+  <TabItem label="Built-in updater">
+    Set `EXAV_SIG_SOURCES` to CVD mirror bases you trust (a trailing `/` makes a
+    URL a mirror, expanded to `main`/`daily`/`bytecode.cvd`) or to exact feed
+    URLs; they merge, e.g. `EXAV_SIG_SOURCES=https://clamav-mirror.internal/`.
+    The container fetches on start and every `EXAV_UPDATE_INTERVAL_SECS` after
+    that. Needs the `http-update` build (the default image). It is a plain HTTPS
+    fetch with no signature verification, so trust the mirror. Cisco's
+    `database.clamav.net` serves only `freshclam` and `cvdupdate`: run a mirror
+    with `cvdupdate` (`cvd serve`) and point exav at it.
+  </TabItem>
+  <TabItem label="Sidecar">
+    A second container writes the shared volume and the scanner hot-reloads it.
+    See the dual-container pattern below.
+  </TabItem>
+  <TabItem label="Prebuilt database">
+    Set `EXAV_DB_URL` to an `.exavdb` built elsewhere; the container pulls it
+    (integrity-checked) and hot-reloads on change, so one build serves many
+    scanners.
+  </TabItem>
+</Tabs>
+
+## Environment variables
+
+The four that matter for most deployments:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EXAV_SIG_DIR` | `/var/lib/exav` | Signatures directory (loaded recursively). |
+| `EXAV_SIG_SOURCES` | *(unset)* | Where to fetch signatures from: exact URLs, mirror bases (trailing `/`), or a file of either (a `freshclam.conf` works). Comma-separated for more than one. |
+| `EXAV_DB_URL` | *(unset)* | URL of a prebuilt `.exavdb` to pull and serve; hot-reloads, and replaces the signature-file sources rather than merging with them. |
+| `EXAV_LISTEN` | `clamd://0.0.0.0:3310` | What the container serves, and where. Comma-separated for more than one. |
+
+Every flag has a variable spelled the same way (see
+[Configuration](/scanner/reference/configuration/)). The startup wait, update interval
+and where a pulled database is stored are under
+[signature lifecycle](/scanner/reference/cli/#signature-lifecycle), `--allow-no-db`
+under [signature sources](/scanner/reference/cli/#signature-sources), and
+`--allow-shutdown` under
+[serving and connecting](/scanner/reference/cli/#serving-and-connecting).
+
+## Replacing a c-icap container
+
+The same image serves ICAP (RFC 3507) on port 1344 when `EXAV_LISTEN` names an
+`icap://` address, in place of a `c-icap` container running the `virus_scan`
+service against ClamAV. Setting the variable replaces the default, so list both
+to keep clamd, and one container replaces the `c-icap` + `clamav` pair:
+
+```sh
+docker run -d -p 127.0.0.1:3310:3310 -p 127.0.0.1:1344:1344 \
+  -e EXAV_LISTEN=clamd://0.0.0.0:3310,icap://0.0.0.0:1344 \
+  -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+```
+
+For ICAP alone, set `EXAV_LISTEN` to the ICAP address only. Use the variable
+rather than `--listen`: the health check reads `EXAV_LISTEN`, not the
+container's command line, so it would otherwise probe a clamd port nothing
+listens on.
+
+```sh
+docker run -d -p 127.0.0.1:1344:1344 -e EXAV_LISTEN=icap://0.0.0.0:1344 \
+  -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+```
+
+See the [ICAP guide](/scanner/guides/icap/) for the verdict mapping and the settings.
+
+## Rootless bind mounts
+
+When you bind-mount a host directory instead of a named volume, make it writable
+by uid 65532 so the updater can write signatures there:
+
+```sh
+mkdir -p ./exav-db && sudo chown 65532:65532 ./exav-db
+docker run -d -p 127.0.0.1:3310:3310 -v "$PWD/exav-db:/var/lib/exav" ghcr.io/sylvinus/exav
+```
+
+### `--read-only` needs a writable temp dir
+
+An object larger than `--spill-threshold-bytes` (16M) is written to disk while it
+is scanned, so a `--read-only` container with nowhere to write fails every scan
+above that size while small ones keep working. Give it somewhere to write: a
+`--tmpfs`, or a disk-backed volume with `--spill-dir` pointed at it. A tmpfs
+lives in RAM and counts against the container's memory limit, so size it, and
+keep the spill budget under it. `--max-total-spill-bytes` applies to each
+worker separately (one per CPU core by default), so the budget times the
+workers must fit:
+
+```sh
+docker run -d -p 127.0.0.1:3310:3310 --read-only --tmpfs /tmp:size=4g \
+  -e EXAV_WORKERS=2 -e EXAV_MAX_TOTAL_SPILL_BYTES=1500M \
+  -v exav-db:/var/lib/exav ghcr.io/sylvinus/exav
+```
+
+Without one the daemon logs `connection error:` followed by the filesystem error
+(`Read-only file system`, or `Permission denied`), and the client (`clamdscan` or
+exav's own) reports an error and exits `2`
+([exit codes](/scanner/reference/verdicts/#process-exit-code)): the scan did not happen.
+
+## Dual container (shared volume)
+
+An updater container refreshes a shared volume and the scanner hot-reloads it, as
+in the repository's
+[`docker-compose.yml`](https://github.com/sylvinus/exav/blob/main/docker-compose.yml).
+The updater is `--auto-update` with nothing to listen on:
+
+```yaml
+services:
+  exav:                       # scanner
+    image: ghcr.io/sylvinus/exav:latest
+    ports: ["127.0.0.1:3310:3310"]
+    volumes: [exav-db:/var/lib/exav]
+    healthcheck:              # the image's own, repeated: see Health above
+      test: ["CMD", "/exav", "--ping"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+
+  updater:                    # writes the shared volume, doesn't scan
+    image: ghcr.io/sylvinus/exav:latest
+    command: ["--auto-update", "--update-interval-secs", "43200"]
+    environment:
+      EXAV_LISTEN: ""         # the image's default listener, switched off
+      EXAV_SIG_SOURCES: "${EXAV_SIG_SOURCES:?set EXAV_SIG_SOURCES to one or more signature sources you trust}"
+    volumes: [exav-db:/var/lib/exav]
+    healthcheck:
+      disable: true           # the image's check pings a listener; this has none
+    restart: unless-stopped
+
+volumes:
+  exav-db:
+```
+
+Run it with `EXAV_SIG_SOURCES=https://clamav-mirror.internal/ docker compose up -d`.
+
+The scanner notices the updated files on the shared mount ([a poll of the
+source](/scanner/guides/daemon/#the-watch-polls-the-source)) and
+re-forks its worker pool with the new signatures, with no restart and no
+cross-container signalling.
+
+<Aside type="tip">
+Cisco's own `clamav/clamav` container can be the updater instead, running
+freshclam only (`CLAMAV_NO_CLAMD=true`). Its `NotifyClamd` takes the path of a
+`clamd.conf`: give it one whose `TCPSocket`/`TCPAddr` name the scanner, and exav
+honours the `RELOAD` it sends. Without it, exav notices the new files within
+about 10 seconds anyway.
+</Aside>

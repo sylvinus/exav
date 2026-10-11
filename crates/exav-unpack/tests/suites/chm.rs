@@ -20,6 +20,9 @@ const BENIGN_LZX: &str = "benign-lzx.chm";
 const REAL_SAMPLES: &[&str] = &["real-malware-lzx-1.chm", "real-malware-lzx-2.chm"];
 
 fn read_fixture(name: &str) -> Option<Vec<u8>> {
+    if REAL_SAMPLES.contains(&name) {
+        return super::real_sample(&format!("chm/{name}"));
+    }
     let p = format!("{}/tests/fixtures/chm/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&p).ok()
 }
@@ -48,6 +51,73 @@ fn benign_lzx_detects_and_decodes() {
         joined.windows(5).any(|w| w.eq_ignore_ascii_case(b"<html")),
         "no decompressed HTML markup found"
     );
+}
+
+/// `multi-frame-lzx.chm` resets its LZX stream every two 32 KiB frames, and
+/// `b.html` runs from the first frame into the second, which only decodes
+/// with the state the first left. Each page comes out as `chmcmd` was given it.
+#[test]
+fn every_frame_of_a_reset_interval_decodes() {
+    let data = read_fixture("multi-frame-lzx.chm").expect("multi-frame-lzx.chm must be committed");
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Chm, &data, &mut budget).expect("extract");
+    for name in ["a", "b", "c"] {
+        let mut page = String::from("<html><body>\n");
+        for i in 0..2000u32 {
+            page += &format!("<p>{name} {}</p>\n", i * 7919 % 10007);
+        }
+        page += "</body></html>\n";
+        let path = format!("/{name}.html");
+        let e = entries
+            .iter()
+            .find(|e| e.name == path)
+            .unwrap_or_else(|| panic!("{path} missing"));
+        assert!(e.unsupported.is_none(), "{path}: {:?}", e.unsupported);
+        assert!(e.data == page.as_bytes(), "{path} differs from its source");
+    }
+}
+
+/// The same file with its second frame out of reach: its reset-table entry
+/// points past the compressed stream. `a.html` lies in the first frame alone
+/// and still comes out whole; `b.html` and `c.html` cross the lost frame, so
+/// each comes out as its source or is reported, never as a page with a hole.
+#[test]
+fn a_page_over_a_frame_that_fails_is_reported() {
+    let mut data =
+        read_fixture("multi-frame-lzx.chm").expect("multi-frame-lzx.chm must be committed");
+    // The reset table: version 2, then the entry count, entry size and header
+    // length, and the frame offsets from byte 0x28.
+    let rt = data
+        .windows(16)
+        .position(|w| w[..4] == 2u32.to_le_bytes() && w[8..] == [8, 0, 0, 0, 0x28, 0, 0, 0])
+        .expect("reset table");
+    data[rt + 0x28 + 8..rt + 0x28 + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Chm, &data, &mut budget).expect("extract");
+    let mut reported = 0;
+    for name in ["a", "b", "c"] {
+        let mut page = String::from("<html><body>\n");
+        for i in 0..2000u32 {
+            page += &format!("<p>{name} {}</p>\n", i * 7919 % 10007);
+        }
+        page += "</body></html>\n";
+        let path = format!("/{name}.html");
+        let e = entries
+            .iter()
+            .find(|e| e.name == path)
+            .unwrap_or_else(|| panic!("{path} missing"));
+        if e.unsupported.is_some() {
+            reported += 1;
+        } else {
+            assert!(
+                e.data == page.as_bytes(),
+                "{path} differs from its source unreported"
+            );
+        }
+    }
+    let a = entries.iter().find(|e| e.name == "/a.html").unwrap();
+    assert!(a.unsupported.is_none(), "a.html needs only the first frame");
+    assert!(reported > 0, "the lost frame went unreported");
 }
 
 /// The benign CHM, and any locally-present real samples, extract into at least
@@ -85,7 +155,7 @@ fn truncated_head_does_not_panic() {
         };
         let head = &data[..64.min(data.len())];
         let mut budget = Budget::new(Limits::default());
-        let entries = extract(Format::Chm, head, &mut budget).unwrap();
+        let entries = extract(Format::Chm, &head, &mut budget).unwrap();
         assert!(entries.is_empty(), "{name}: truncated head yielded members");
     }
 }

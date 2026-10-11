@@ -1,0 +1,46 @@
+# Excluded from the workspace (a wasm32-target artifact, with its own lock and
+# target directory), so values are explicit.
+[package]
+name = "exav-viewer"
+version = "0.0.2"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sylvinus/exav"
+rust-version = "1.92"
+description = "The WebAssembly half of @exav/viewer: exav-render's image decoders, DWG/DXF engine and IFC/STL meshes for the browser."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Five modules are built from this crate, one per feature, so that a page
+# downloads only the engine of what it opens (`scripts/build-wasm.sh`).
+[features]
+default = []
+# exav-render's image decoders, for the formats browsers do not draw.
+image = ["exav-render/image", "exav-render/webp", "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds", "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2"]
+# DWG and DXF, parsed and tessellated.
+dwg = ["exav-render/dwg"]
+# IFC and STL models, meshed.
+model = ["exav-render/ifc", "exav-render/stl"]
+# pdf.js's JPXDecode decoder, in place of OpenJPEG (openjpeg_nowasm_fallback.js).
+pdf-jpx = ["exav-render/jp2"]
+# pdf.js's JBIG2Decode and CCITTFaxDecode decoder, in place of PDFium's
+# (jbig2_nowasm_fallback.js). One module, as pdf.js loads one for both.
+pdf-jbig2 = ["exav-render/jbig2", "exav-render/ccitt"]
+
+[dependencies]
+exav-render = { path = "../exav-render", version = "0.0.2", default-features = false }
+wasm-bindgen = "=0.2.129"
+
+# Size-optimised: this crate ships as `.wasm`.
+#
+# `wasm32-unknown-unknown` is a `panic = "abort"` target, so a panic traps the
+# instance and every later call into it fails. The worker that hosts each
+# module replaces it and fails the requests it had.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

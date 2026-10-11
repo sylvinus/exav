@@ -89,7 +89,8 @@ fn source_files(root: &Path) -> Vec<PathBuf> {
                 p.extension().and_then(|s| s.to_str()),
                 Some("rs" | "py" | "sh" | "toml" | "md" | "mdx" | "yml" | "yaml" | "js" | "ts")
             );
-            !in_fixtures && is_text
+            // A tracked file deleted in the working tree ships nowhere.
+            !in_fixtures && is_text && p.exists()
         })
         .collect();
 

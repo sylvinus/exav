@@ -10,7 +10,10 @@ use std::time::Duration;
 
 /// Matchers profiled by `--profile`, in fixed column order so the header and
 /// every row line up. Must match the names passed to `profile::timed` in the
-/// scan path.
+/// scan path. Appended, never reordered: the `verdict` column's position is
+/// covered by test. `unpack` is inclusive wall time inside container-extraction
+/// dispatch (nested member scans included — see the call site); `emu` splits
+/// the packer emulator's share of it back out.
 const MATCHERS: &[&str] = &[
     "engine",
     "yara",
@@ -21,6 +24,9 @@ const MATCHERS: &[&str] = &[
     "bytecode",
     "static",
     "normalize",
+    "unpack",
+    "emu",
+    "filetype",
 ];
 
 /// The header row: metadata columns + `<matcher>_us/_calls/_bytes` per matcher.

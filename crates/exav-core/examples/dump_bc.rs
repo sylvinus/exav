@@ -20,6 +20,7 @@ fn main() {
             match_offsets: &[],
             apis: &bc.apis,
             default_name: &bc.name,
+            write_limits: exec::WriteLimits::NONE,
         };
         let out = exec::run(&bc.functions, 0, &ctx);
         println!("RUN on {target} ({} bytes):", file.len());

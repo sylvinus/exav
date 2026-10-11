@@ -35,7 +35,8 @@
 //! gzip -9 frag.img
 //! ```
 
-use exav_unpack::{detect, extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{detect, Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the ZIP that was written in, which is what following the
 /// extent tree has to reproduce.

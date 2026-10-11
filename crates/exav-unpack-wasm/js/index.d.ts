@@ -25,6 +25,7 @@ export interface MemberInfo {
   name: string;
   index: number;
   compressedSize: number;
+  /** As the archive declares it; -1 where it declares none (a gzip or xz stream). */
   uncompressedSize: number;
   encrypted: boolean;
 }
@@ -79,12 +80,12 @@ export class Archive {
   /** The detected format's name. Known since `open`. */
   format(): string;
   /**
-   * Every member's metadata. Where the archive carries an index this extracts
-   * nothing; an index-less single stream (gzip, xz) is walked once — taking
-   * `passwords`, costing what `extractAll` costs — and the walk is kept.
+   * Every member's metadata, decoding nothing it can avoid: where the archive
+   * carries an index (a ZIP's central directory, a tar's headers) nothing is
+   * extracted. A format read whole (7z, RAR) is decoded to be listed.
    */
   list(passwords?: string[]): Promise<MemberInfo[]>;
-  /** Extract one member by index. */
+  /** Extract one member by index. The archive is walked up to it. */
   extract(index: number, passwords?: string[]): Promise<Entry>;
   /**
    * Extract every member, under one budget for the whole archive. Where a limit

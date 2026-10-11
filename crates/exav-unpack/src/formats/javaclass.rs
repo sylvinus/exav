@@ -70,13 +70,13 @@ pub(crate) fn extract_javaclass<R>(
         let payload_len: usize = match tag {
             TAG_UTF8 => {
                 // Utf8: u16 length, then `length` raw (modified-UTF-8) bytes.
-                let len_bytes = match data.get(pos..pos + 2) {
+                let len_bytes = match crate::bytes::at(data, pos, 2) {
                     Some(b) => b,
                     None => break, // Truncated length field.
                 };
                 let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
                 pos += 2;
-                let bytes = match data.get(pos..pos + len) {
+                let bytes = match crate::bytes::at(data, pos, len) {
                     Some(b) => b,
                     None => break, // Truncated string body.
                 };
@@ -114,7 +114,7 @@ pub(crate) fn extract_javaclass<R>(
         };
 
         // Skip the fixed payload, bounds-checked.
-        match data.get(pos..pos + payload_len) {
+        match crate::bytes::at(data, pos, payload_len) {
             Some(_) => pos += payload_len,
             None => break, // Truncated payload: stop, emit so far.
         }

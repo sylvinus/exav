@@ -3,16 +3,13 @@
 //! came off live samples in a clamd differential run, where each cost a real
 //! detection.
 //!
-//! Every case is asserted against BOTH ZIP walkers — the buffered
-//! [`extract`] path and the [`stream_members`] path the top-level scan takes.
-//! They are separate implementations with separate copies of the skip logic, and
-//! the first fix for the trailing-slash trick landed in only one of them: the
-//! sample still scanned clean afterwards, because the scanner never went through
-//! the code that was fixed. A test that exercises one walker proves nothing
-//! about the other.
+//! Every case is asserted through [`extract`] and through a [`walk`] visitor
+//! reading each member as it comes, the way the scanner does. The first fix for
+//! the trailing-slash trick once landed in a second ZIP walker the scanner did
+//! not use, and the sample still scanned clean; asserting on the walk the
+//! scanner takes is what catches that.
 
-use exav_unpack::{extract, stream_members, Budget, Entry, Format, Limits, MemberMeta};
-use std::io::Read;
+use exav_unpack::{extract, walk, Budget, Entry, Format, Limits, Member, MemberMeta};
 
 /// Bitwise CRC-32 (IEEE), so the fixtures carry real checksums without pulling a
 /// dependency into the test.
@@ -88,27 +85,31 @@ fn zip_stored(members: &[(&str, &[u8], u16, u32)]) -> Vec<u8> {
     out
 }
 
-/// Members the buffered walker yields.
+/// Members [`extract`] yields.
 fn buffered(blob: &[u8]) -> Vec<Entry> {
     let mut budget = Budget::new(Limits::default());
-    extract(Format::Zip, blob, &mut budget).expect("extract")
+    extract(Format::Zip, &blob, &mut budget).expect("extract")
 }
 
-/// Members the streaming walker yields, as `(name, contents)`. A member with no
-/// reader (nothing decodable) comes back with empty contents.
+/// Members a [`walk`] visitor sees, as `(name, contents)`. A member with no
+/// content (nothing decodable) comes back empty.
 fn streamed(blob: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut budget = Budget::new(Limits::default());
     let mut seen: Vec<(String, Vec<u8>)> = Vec::new();
-    let cur = std::io::Cursor::new(blob.to_vec());
-    let _ = stream_members::<_, ()>(
+    let _ = walk::<()>(
         Format::Zip,
-        cur,
+        &blob,
         &mut budget,
-        &mut |meta: &MemberMeta, rdr: Option<&mut dyn Read>, _b: &mut Budget| {
-            let mut buf = Vec::new();
-            if let Some(r) = rdr {
-                let _ = r.read_to_end(&mut buf);
-            }
+        &mut |meta: &MemberMeta, content: Option<Member<'_>>, _b: &mut Budget| {
+            let buf = match content {
+                None => Vec::new(),
+                Some(Member::Bytes(d)) => d,
+                Some(Member::Stream(r)) => {
+                    let mut d = Vec::new();
+                    let _ = r.read_to_end(&mut d);
+                    d
+                }
+            };
             seen.push((meta.name.clone(), buf));
             None
         },
@@ -122,7 +123,7 @@ const PAYLOAD: &[u8] = b"payload-that-must-be-scanned";
 ///
 /// From a live JAR: `kingDavid/9.class/` held a real compressed Java class. The
 /// JVM loads it by name; `unzip`, python's `extractall` and the `zip` crate all
-/// call it a directory and discard it — so the malware inside was never scanned.
+/// call it a directory and discard it, so the malware inside was never scanned.
 #[test]
 fn slash_named_member_with_content_is_extracted() {
     let blob = zip_stored(&[("pkg/9.class/", PAYLOAD, 0, crc32(PAYLOAD))]);
@@ -169,12 +170,12 @@ fn genuine_directory_entry_is_still_skipped() {
     );
 }
 
-/// A member flagged encrypted whose bytes are in fact cleartext — proven by the
-/// CRC-32 in its own header — must be scanned, not reported password-protected.
+/// A member flagged encrypted whose bytes are in fact cleartext (proven by the
+/// CRC-32 in its own header) must be scanned, not reported password-protected.
 ///
 /// From live APKs: the packer sets bit 0 on *every* member (Android's ZIP reader
 /// ignores it), so scanners decline an archive the platform installs happily.
-/// Reporting it is not good enough here — the report is exactly what the packer
+/// Reporting it is not good enough here: the report is exactly what the packer
 /// is buying.
 #[test]
 fn lying_encryption_flag_is_seen_through() {
@@ -196,13 +197,65 @@ fn lying_encryption_flag_is_seen_through() {
     );
 }
 
+/// Typing a ZIP that is not held in memory, then walking it without reading its
+/// members, reads its start, directory and headers, not the members' bytes: a
+/// listing over a network or browser reader must not fetch the whole archive.
+#[test]
+fn listing_a_zip_through_a_reader_skips_its_members() {
+    use exav_unpack::source::BlockCache;
+    use std::cell::Cell;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::rc::Rc;
+
+    struct Counting(Cursor<Vec<u8>>, Rc<Cell<usize>>);
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.set(self.1.get() + n);
+            Ok(n)
+        }
+    }
+    impl Seek for Counting {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(to)
+        }
+    }
+
+    let (one, two) = (vec![1u8; 1 << 20], vec![2u8; 1 << 20]);
+    let blob = zip_stored(&[
+        ("one.bin", &one, 0, crc32(&one)),
+        ("two.bin", &two, 0, crc32(&two)),
+    ]);
+    let read = Rc::new(Cell::new(0));
+    let cache = BlockCache::new(Counting(Cursor::new(blob.clone()), read.clone())).unwrap();
+    assert_eq!(exav_unpack::detect(&cache), Some(Format::Zip));
+    let mut names = Vec::new();
+    let walked = walk(
+        Format::Zip,
+        &cache,
+        &mut Budget::new(Limits::default()),
+        &mut |meta, _, _| {
+            names.push(meta.name.clone());
+            None::<()>
+        },
+    );
+    assert!(walked.is_ok(), "{walked:?}");
+    assert_eq!(names, ["one.bin", "two.bin"]);
+    assert!(
+        read.get() < blob.len() / 2,
+        "listing read {} of the archive's {} bytes",
+        read.get(),
+        blob.len()
+    );
+}
+
 /// The guard must not swing the other way: a member whose contents do NOT match
 /// the declared CRC is truly encrypted (or corrupt), and is still reported
 /// rather than handed over as though it were cleartext.
 #[test]
 fn real_encryption_is_still_reported() {
     // Plausible ciphertext: bytes that are not the payload, with the CRC of the
-    // plaintext — exactly what a real encrypted member looks like from outside.
+    // plaintext: exactly what a real encrypted member looks like from outside.
     let cipher = b"\x9f\x2a\x71\xc3\x04\xde\x88\x10\x55\xab\xcd\xef\x01\x23\x45\x67";
     let blob = zip_stored(&[("secret.bin", cipher, 0x0001, crc32(PAYLOAD))]);
 
@@ -224,4 +277,70 @@ fn real_encryption_is_still_reported() {
         !s.iter().any(|(_, d)| d == PAYLOAD),
         "streaming walker handed over ciphertext as though it had decoded: {s:?}"
     );
+}
+
+/// One stored member as an APK packer writes its manifest: a compression
+/// method no specification defines (a different one in each header) and a
+/// compressed size shorter than the data, which runs for the uncompressed size.
+/// With the central directory, or as a lone local header.
+fn zip_bogus_method(data: &[u8], with_directory: bool) -> Vec<u8> {
+    let name = b"AndroidManifest.xml";
+    let short = (data.len() / 3) as u32;
+    let header = |sig: &[u8], method: u16, central: bool| {
+        let mut h = sig.to_vec();
+        if central {
+            h.extend_from_slice(&20u16.to_le_bytes());
+        }
+        h.extend_from_slice(&20u16.to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes()); // flags
+        h.extend_from_slice(&method.to_le_bytes());
+        h.extend_from_slice(&[0; 4]); // time, date
+        h.extend_from_slice(&crc32(data).to_le_bytes());
+        h.extend_from_slice(&short.to_le_bytes());
+        h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes());
+        if central {
+            h.extend_from_slice(&[0; 6]); // comment length, disk, internal attributes
+            h.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+            h.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        }
+        h.extend_from_slice(name);
+        h
+    };
+    let mut out = header(b"PK\x03\x04", 25411, false);
+    out.extend_from_slice(data);
+    if with_directory {
+        let cd = out.len() as u32;
+        let central = header(b"PK\x01\x02", 21425, true);
+        out.extend_from_slice(&central);
+        out.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    out
+}
+
+/// A member with a made-up compression method is read as Android reads it:
+/// stored, its uncompressed size long.
+#[test]
+fn an_undefined_compression_method_reads_as_android_reads_it() {
+    let manifest: Vec<u8> = (0..900u32).map(|i| (i % 251) as u8).collect();
+    for with_directory in [true, false] {
+        let blob = zip_bogus_method(&manifest, with_directory);
+        let b = buffered(&blob);
+        let m = b
+            .iter()
+            .find(|e| e.name == "AndroidManifest.xml")
+            .unwrap_or_else(|| panic!("{b:?}"));
+        assert_eq!(m.unsupported, None, "directory: {with_directory}");
+        assert_eq!(m.data, manifest, "directory: {with_directory}");
+        let s = streamed(&blob);
+        assert!(
+            s.iter()
+                .any(|(n, d)| n == "AndroidManifest.xml" && *d == manifest),
+            "{with_directory}"
+        );
+    }
 }

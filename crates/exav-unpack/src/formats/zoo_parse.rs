@@ -55,11 +55,15 @@ fn u8_at(b: &[u8], off: usize) -> Option<u8> {
 }
 
 fn u16_at(b: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        crate::bytes::at(b, off, 2)?.try_into().ok()?,
+    ))
 }
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        crate::bytes::at(b, off, 4)?.try_into().ok()?,
+    ))
 }
 
 /// A NUL-terminated name field, decoded lossily: a name that is not valid UTF-8
@@ -124,7 +128,7 @@ impl DirEntry {
             crc16: u16_at(b, 18)?,
             org_size: u32_at(b, 20)?,
             size_now: u32_at(b, 24)?,
-            name: name_at(b.get(name_off..name_off + FNAMESIZE)?),
+            name: name_at(crate::bytes::at(b, name_off, FNAMESIZE)?),
             var_dir_len: u8_at(b, name_off + FNAMESIZE)?,
             namlen: u8_at(b, name_off + FNAMESIZE + 6)?,
             dirlen: u8_at(b, name_off + FNAMESIZE + 7)?,

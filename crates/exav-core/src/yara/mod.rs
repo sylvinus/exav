@@ -3,14 +3,14 @@
 //! Traditional engines support only a restricted YARA subset (no modules, ≤64
 //! strings/rule, etc.). This one targets broad real-world YARA compatibility
 //! (strings, full conditions, for-loops/`with`, and the `pe`/`math`/`hash`/
-//! `string`/`time` modules) while compiling **natively** — no wasmtime/Cranelift
+//! `string`/`time` modules) while compiling **natively**: no wasmtime/Cranelift
 //! JIT, no runtime codegen at scan time (W^X preserved).
 //!
 //! Like the rest of exav's database, [`YaraDb`] serializes its COMPILED form: at
 //! database-build time ([`YaraDb::finalize`]) the rules are compiled and the
 //! compiled rule set is serialized into `YaraDb::compiled_blob`, so a prebuilt
-//! `.exavdb` loads the YARA engine WITHOUT recompiling — in particular without
-//! rebuilding the expensive daachorse atom automaton. The daachorse automaton +
+//! `.exavdb` loads the YARA engine WITHOUT recompiling, in particular without
+//! extracting the atoms and building their index again. The atom index +
 //! owned IR + per-pattern definitions travel in the blob; only the per-pattern
 //! regexes (whose compiled automata are not serializable) are recompiled from
 //! their stored source on load. The rule *sources* are also retained, so a build
@@ -24,7 +24,7 @@
 //! rather than mis-evaluating them. To avoid one unsupported rule silently
 //! dropping a whole third-party feed, we compile **per rule** (see
 //! [`Compiler::add_source_lenient`]) and record every rejection in
-//! [`YaraDb::rejected`], so the coverage gap is always visible — never silent.
+//! [`YaraDb::rejected`], so the coverage gap is always visible, never silent.
 //!
 //! # Where the native engine lives
 //!
@@ -88,20 +88,22 @@ pub fn compile(src: &str) -> Result<Rules> {
 use serde::{Deserialize, Serialize};
 
 /// Format version of [`YaraDb::compiled_blob`]. Bumped whenever the serialized
-/// compiled-rules layout (the `Rules` blob: IR, pattern defs, atom automaton)
+/// compiled-rules layout (the `Rules` blob: IR, pattern defs, atom index)
 /// changes in an incompatible way. A loaded blob whose version does not match
 /// this build is ignored and the rules are recompiled from source, so a stale
-/// blob is never misread — the coverage is preserved, just without the load-time
+/// blob is never misread: the coverage is preserved, just without the load-time
 /// shortcut. (This is independent of the outer `.exavdb` format serial in
-/// `crate::database`, which guards the whole file.)
+/// `crate::database`, which guards the whole file.) Version 1 is exav 0.0.1's;
+/// version 2 replaced the atom automaton with the anchor index the signature
+/// engine uses. Bumped once per release at most.
 #[cfg(feature = "yara")]
-const YARA_BLOB_VERSION: u32 = 1;
+const YARA_BLOB_VERSION: u32 = 2;
 
 /// The data fields are always present (so the on-disk database format is identical
 /// whether or not the `yara` feature is built), but the actual compilation and
 /// matching are gated on the feature. Without it, rule sources are
 /// still stored (a database built with yara can be loaded without it and vice
-/// versa) — they're simply never matched.
+/// versa); they're simply never matched.
 #[derive(Default, Serialize, Deserialize)]
 pub struct YaraDb {
     /// Accumulated rule sources (one per loaded `.yar`/`.yara` file).
@@ -114,21 +116,21 @@ pub struct YaraDb {
     /// Rules the engine could not compile, recorded at [`Self::finalize`]
     /// time (i.e. when the database is built) as `"<rule name>: <reason>"`. This
     /// is serialized into the database so an operator loading a prebuilt `.exavdb`
-    /// can still SEE which rules were dropped and why — a rule that will not
+    /// can still SEE which rules were dropped and why. A rule that will not
     /// compile is always accounted for, never invisibly missing.
     #[serde(default)]
     rejected: Vec<String>,
     /// The serialized COMPILED rule set, produced by [`Self::finalize`] at
     /// database-build time (only when built with the `yara` feature). When
-    /// present and version-compatible, [`Self::rules`] deserializes it — skipping
-    /// the expensive daachorse atom-automaton build — instead of recompiling from
+    /// present and version-compatible, [`Self::rules`] deserializes it (skipping
+    /// the atom extraction and index build) instead of recompiling from
     /// `sources`. This is what makes a prebuilt `.exavdb` load its YARA engine
     /// without recompiling, consistent with the rest of the database (which also
     /// serializes its compiled form). Absent when the database was built without
     /// the `yara` feature, or predates this field; then `rules()` falls back to
     /// compiling `sources`. To a build WITHOUT the `yara` feature these are opaque
     /// bytes that round-trip through the database untouched.
-    #[serde(default)]
+    #[serde(default, with = "crate::database::opt_blob")]
     compiled_blob: Option<Vec<u8>>,
     /// Format version of `compiled_blob` (see [`YARA_BLOB_VERSION`]). A mismatch
     /// makes `rules()` ignore the blob and recompile from source.
@@ -153,7 +155,8 @@ impl YaraDb {
         self.sources.is_empty()
     }
     /// Add one rule file's source text. `unofficial` marks rules loaded from a
-    /// non-`.cvd` database (the usual case), so matches carry `.UNOFFICIAL`.
+    /// non-`.cvd` database (the usual case), so compat scans name matches
+    /// `.UNOFFICIAL`.
     pub fn extend_from_text(&mut self, text: &str, unofficial: bool) {
         self.sources.push(text.to_string());
         self.unofficial |= unofficial;
@@ -175,9 +178,17 @@ impl YaraDb {
     /// validate them and record which rules were rejected (so the coverage gap is
     /// captured in the built database) and (b) SERIALIZE the compiled rule set
     /// into `Self::compiled_blob`, so a prebuilt `.exavdb` loads the YARA engine
-    /// without recompiling — skipping the expensive atom-automaton build — exactly
+    /// without recompiling (skipping the atom extraction and index build), exactly
     /// as the rest of the database serializes its compiled form. Idempotent.
     pub fn finalize(&mut self) {
+        #[cfg(not(feature = "yara"))]
+        if !self.sources.is_empty() {
+            eprintln!(
+                "[exav yara] WARN: {} YARA rule file(s) loaded, but this build has no `yara` \
+                 feature: they will never match.",
+                self.sources.len(),
+            );
+        }
         #[cfg(feature = "yara")]
         {
             if self.sources.is_empty() {
@@ -208,7 +219,7 @@ impl YaraDb {
                     return None;
                 }
                 // Fast path: a version-compatible prebuilt compiled blob loads
-                // the rule set (incl. the atom automaton) without recompiling.
+                // the rule set (incl. the atom index) without recompiling.
                 if let Some(blob) = &self.compiled_blob {
                     if self.blob_version == YARA_BLOB_VERSION {
                         match Rules::deserialize(blob) {
@@ -227,7 +238,7 @@ impl YaraDb {
                     }
                 }
                 // Fallback: no blob (database built without the `yara` feature, or
-                // predating it), or an unusable blob — recompile from source. The
+                // predating it), or an unusable blob: recompile from source. The
                 // coverage is identical; only the load-time shortcut is skipped.
                 let (rules, _rejected) = compile_lenient(&self.sources);
                 Some(rules)
@@ -235,25 +246,46 @@ impl YaraDb {
             .as_ref()
     }
 
-    /// Scan `data`; return the name of the first matching rule, formatted as
-    /// ClamAV reports YARA detections: a `YARA.` prefix and, for rules from an
-    /// unofficial database, a `.UNOFFICIAL` suffix.
+    /// Whether any rule came from an unofficial database, for the report
+    /// layer's `.UNOFFICIAL` suffix.
+    pub fn unofficial(&self) -> bool {
+        self.unofficial
+    }
+
+    /// Scan `data`; return every matching rule, in rule order, named as ClamAV
+    /// reports YARA detections (`YARA.<rule>`). The `.UNOFFICIAL` suffix is the
+    /// report layer's, see [`Self::unofficial`].
     ///
     /// `filename` is the identity of the object being scanned (a file path).
     /// When present, the standard THOR/signature-base external variables are set
     /// for this scan so rules that reference them can match:
     ///
-    /// * `filepath`  — the path as given (original case),
-    /// * `filename`  — the basename (original case),
-    /// * `extension` — the lowercased extension *including* the leading dot
+    /// * `filepath`: the path as given (original case),
+    /// * `filename`: the basename (original case),
+    /// * `extension`: the lowercased extension *including* the leading dot
     ///   (e.g. `".js"`), per the signature-base convention.
     ///
     /// `filetype`/`owner` are left undefined (exav does not model them). When
     /// `filename` is `None`, all externals stay undefined and rules referencing
     /// them simply do not match.
     #[cfg(feature = "yara")]
-    pub fn scan(&self, data: &[u8], filename: Option<&str>) -> Option<String> {
-        let rules = self.rules()?;
+    pub fn scan(&self, data: &[u8], filename: Option<&str>) -> Vec<String> {
+        self.scan_source(&data, filename, usize::MAX)
+    }
+
+    /// As [`Self::scan`], over an object that need not be held in memory.
+    /// `materialize` is the largest such object read whole where a regex or
+    /// a module needs it so.
+    #[cfg(feature = "yara")]
+    pub(crate) fn scan_source(
+        &self,
+        src: &dyn crate::byte_source::ByteSource,
+        filename: Option<&str>,
+        materialize: usize,
+    ) -> Vec<String> {
+        let Some(rules) = self.rules() else {
+            return Vec::new();
+        };
         let mut scanner = Scanner::new(rules);
         if let Some(path) = filename {
             scanner.set_global("filepath", path);
@@ -263,16 +295,34 @@ impl YaraDb {
                 scanner.set_global("extension", ext);
             }
         }
-        let results = scanner.scan(data).ok()?;
-        let id = results.matching_rules().next()?.identifier().to_string();
-        let suffix = if self.unofficial { ".UNOFFICIAL" } else { "" };
-        Some(format!("YARA.{id}{suffix}"))
+        let results = scanner.scan_source(src, materialize);
+        // A condition that ran out of steps evaluated to undefined, and one
+        // that saw part of a pattern's matches or no module values may be
+        // wrong, so a rule may have failed to match for that reason alone.
+        if results.steps_exhausted || !results.complete {
+            crate::engine::mark_scan_truncated();
+        }
+        results
+            .matching
+            .iter()
+            .map(|name| format!("YARA.{name}"))
+            .collect()
     }
 
     /// Built without the `yara` feature: rules are stored but never matched.
     #[cfg(not(feature = "yara"))]
-    pub fn scan(&self, _data: &[u8], _filename: Option<&str>) -> Option<String> {
-        None
+    pub fn scan(&self, _data: &[u8], _filename: Option<&str>) -> Vec<String> {
+        Vec::new()
+    }
+
+    #[cfg(not(feature = "yara"))]
+    pub(crate) fn scan_source(
+        &self,
+        _src: &dyn crate::byte_source::ByteSource,
+        _filename: Option<&str>,
+        _materialize: usize,
+    ) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -344,11 +394,11 @@ fn preview(rejected: &[String]) -> String {
 // `crate::pe`, hashing via `md-5`/`sha1`/`sha2` + `crate::hexsig`, entropy via
 // `crate::pe::shannon_entropy`, `memchr`). It deliberately does NOT reuse the AV
 // matcher or the bytecode VM for evaluating YARA rule *conditions*. A future
-// contributor should not "unify" these — doing so breaks the yara-x A/B
+// contributor should not "unify" these: doing so breaks the yara-x A/B
 // differential (~17k rules, 0 disagreements). The reasons are structural:
 //
 //   * The AV pattern matcher is non-exhaustive by design (it reports the first
-//     hit and stops, and prunes on Aho-Corasick prefilter economics). YARA
+//     hit and stops, and prunes on anchor prefilter economics). YARA
 //     conditions need *exhaustive* per-pattern match sets: counts (`#a`), the
 //     i-th offset/length (`@a[i]`/`!a[i]`), `$a at N`, `$a in (a..b)`, and
 //     `N of`/`P% of` quantifiers all require every match, not just existence.
@@ -372,6 +422,10 @@ fn preview(rejected: &[String]) -> String {
 mod tests {
     use super::*;
 
+    fn first(db: &YaraDb, data: &[u8], filename: Option<&str>) -> Option<String> {
+        db.scan(data, filename).into_iter().next()
+    }
+
     #[test]
     fn matches_a_simple_rule() {
         let mut db = YaraDb::new();
@@ -384,14 +438,15 @@ mod tests {
                     $a
             }
             "#,
-            true, // unofficial -> YARA.<id>.UNOFFICIAL
+            true,
         );
         assert_eq!(db.len(), 1);
+        assert!(db.unofficial());
         assert_eq!(
-            db.scan(b"....UNIQUE_EXAV_YARA_MARKER....", None).as_deref(),
-            Some("YARA.evil_marker.UNOFFICIAL")
+            first(&db, b"....UNIQUE_EXAV_YARA_MARKER....", None).as_deref(),
+            Some("YARA.evil_marker")
         );
-        assert!(db.scan(b"nothing to see here", None).is_none());
+        assert!(first(&db, b"nothing to see here", None).is_none());
     }
 
     #[test]
@@ -407,13 +462,14 @@ mod tests {
                     $mz at 0 and $s
             }
             "#,
-            false, // official -> YARA. prefix only, no .UNOFFICIAL
+            false,
         );
+        assert!(!db.unofficial());
         assert_eq!(
-            db.scan(b"MZ\x90\x00 ... evilfn ...", None).as_deref(),
+            first(&db, b"MZ\x90\x00 ... evilfn ...", None).as_deref(),
             Some("YARA.pe_with_two")
         );
-        assert!(db.scan(b"xxMZ evilfn", None).is_none());
+        assert!(first(&db, b"xxMZ evilfn", None).is_none());
     }
 
     #[test]
@@ -436,7 +492,7 @@ mod tests {
         db.finalize();
         assert_eq!(db.rejected_count(), 0, "rejected: {:?}", db.rejected());
         assert_eq!(
-            db.scan(b"MZ .... evilfn ....", None).as_deref(),
+            first(&db, b"MZ .... evilfn ....", None).as_deref(),
             Some("YARA.uses_pe")
         );
     }
@@ -444,7 +500,7 @@ mod tests {
     /// The COMPILED rule set must survive a full `YaraDb` MessagePack round trip
     /// (the `.exavdb` boundary) and load WITHOUT recompiling from source: after
     /// `finalize`, the serialized blob is present, travels through serialize +
-    /// deserialize, and the reloaded database scans identically — driven by the
+    /// deserialize, and the reloaded database scans identically, driven by the
     /// deserialized compiled blob, not a source recompile.
     #[test]
     fn compiled_blob_survives_database_serialization() {
@@ -475,16 +531,14 @@ mod tests {
         let hit = b"a needle and version42 here";
         let miss = b"a needle but no ver marker";
         for d in [db, reloaded] {
-            assert_eq!(
-                d.scan(hit, None).as_deref(),
-                Some("YARA.blob_demo.UNOFFICIAL")
-            );
-            assert!(d.scan(miss, None).is_none());
+            assert_eq!(first(&d, hit, None).as_deref(), Some("YARA.blob_demo"));
+            assert!(d.unofficial());
+            assert!(first(&d, miss, None).is_none());
         }
     }
 
     /// If the blob version does not match this build, the loader must ignore the
-    /// stale blob and recompile from source — never misread it, never go silent.
+    /// stale blob and recompile from source, never misreading it or going silent.
     #[test]
     fn stale_blob_version_falls_back_to_source() {
         let mut db = YaraDb::new();
@@ -494,7 +548,7 @@ mod tests {
         // Simulate a blob written by an incompatible engine version.
         db.blob_version = YARA_BLOB_VERSION.wrapping_add(1);
         // Still detects (recompiled from the retained sources).
-        assert_eq!(db.scan(b"..marker..", None).as_deref(), Some("YARA.v"));
+        assert_eq!(first(&db, b"..marker..", None).as_deref(), Some("YARA.v"));
     }
 
     #[test]
@@ -521,20 +575,20 @@ mod tests {
         let data = b"....payload....";
         // Right name + extension -> match.
         assert_eq!(
-            db.scan(data, Some("/tmp/Invoice_2026.JS")).as_deref(),
-            Some("YARA.js_dropper.UNOFFICIAL")
+            first(&db, data, Some("/tmp/Invoice_2026.JS")).as_deref(),
+            Some("YARA.js_dropper")
         );
         // Windows path, basename still resolves the extension.
         assert_eq!(
-            db.scan(data, Some("C:\\Users\\x\\invoice.js")).as_deref(),
-            Some("YARA.js_dropper.UNOFFICIAL")
+            first(&db, data, Some("C:\\Users\\x\\invoice.js")).as_deref(),
+            Some("YARA.js_dropper")
         );
         // Wrong extension -> no match.
-        assert!(db.scan(data, Some("/tmp/invoice.txt")).is_none());
+        assert!(first(&db, data, Some("/tmp/invoice.txt")).is_none());
         // Wrong filename -> no match.
-        assert!(db.scan(data, Some("/tmp/report.js")).is_none());
+        assert!(first(&db, data, Some("/tmp/report.js")).is_none());
         // No filename at all -> externals undefined -> no match.
-        assert!(db.scan(data, None).is_none());
+        assert!(first(&db, data, None).is_none());
     }
 
     #[test]
@@ -564,8 +618,8 @@ mod tests {
         assert!(db.rejected()[0].contains("bad_rule"));
         // The good rule still matches despite its neighbour being rejected.
         assert_eq!(
-            db.scan(b"....keepme....", None).as_deref(),
-            Some("YARA.good_rule.UNOFFICIAL")
+            first(&db, b"....keepme....", None).as_deref(),
+            Some("YARA.good_rule")
         );
     }
 }

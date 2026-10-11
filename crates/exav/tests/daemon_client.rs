@@ -224,7 +224,7 @@ fn the_thread_model_socket_is_permissioned_too() {
 }
 
 /// A mode is octal, and a mode that is not one is refused rather than applied.
-/// `666` read as decimal is 0o1232 — a setgid socket nobody asked for.
+/// `666` read as decimal is 0o1232, a setgid socket nobody asked for.
 #[test]
 fn a_mode_that_is_not_a_mode_is_refused() {
     // Under the test's own directory rather than a fixed `/tmp` name: the
@@ -304,7 +304,7 @@ fn the_daemon_logs_what_it_answered() {
 }
 
 /// `--send-as contents` sends the file's bytes (`INSTREAM`), so the daemon needs
-/// no access to the path — the case a milter or a container deployment is in.
+/// no access to the path: the case a milter or a container deployment is in.
 ///
 /// The daemon's own log is the proof of which verb ran: it records a streamed
 /// scan as `stream:` and a path scan under the path it was given.
@@ -415,7 +415,7 @@ fn a_split_set_is_rejoined_when_streamed() {
 
 /// `--verbose` in client mode. The daemon's reply is a verdict and nothing
 /// else, so what `-v` has to add here is which daemon answered and what it was
-/// asked — accepting the flag and printing nothing is the defect.
+/// asked. Accepting the flag and printing nothing is the defect.
 #[test]
 fn verbose_names_the_daemon_and_the_command() {
     let d = Daemon::start("077", &[]);
@@ -440,7 +440,7 @@ fn verbose_names_the_daemon_and_the_command() {
     );
 }
 
-/// A stream the daemon could not examine comes back as `PARTIAL`, exit 3 — the
+/// A stream the daemon could not examine comes back as `PARTIAL`, exit 3: the
 /// same answer a local scan of the same object gives.
 ///
 /// The wire grammar is `<path>: <reason> <CATEGORY> ERROR`, because clamd has no
@@ -452,7 +452,7 @@ fn verbose_names_the_daemon_and_the_command() {
 #[test]
 fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
     // Nowhere to spill and almost no room in RAM, so any real object is one the
-    // daemon cannot examine — the condition, reached the quickest way.
+    // daemon cannot examine: the condition, reached the quickest way.
     let d = Daemon::start(
         "077",
         &["--spill-dir", "off", "--spill-threshold-bytes", "1M"],
@@ -461,7 +461,7 @@ fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
 
     let (code, out) = d.client(&["--send-as", "contents"], &[&big]);
     assert!(
-        out.contains("UNSCANNABLE"),
+        out.contains("LIMITS-EXCEEDED"),
         "the category has to survive the trip: {out}"
     );
     assert!(
@@ -469,6 +469,376 @@ fn an_unexaminable_stream_is_partial_over_the_wire_not_a_hard_error() {
         "and the client must read it back as PARTIAL, not a hard error: {out}"
     );
     assert_eq!(code, 3, "which is exit 3, not 2: {out}");
+}
+
+/// What was held of a stream too large to hold is scanned: a detection in it is
+/// found, as in the start of a file past `--max-input-bytes`.
+#[test]
+fn a_detection_in_what_was_held_of_a_stream_is_found() {
+    use std::io::Write;
+    let d = Daemon::start(
+        "077",
+        &["--spill-dir", "off", "--spill-threshold-bytes", "1M"],
+    );
+    let mut body = eicar().to_vec();
+    body.resize(4 << 20, b'A');
+    let ask = |verb: &str| {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(format!("z{verb}\0").as_bytes()).unwrap();
+        for c in body.chunks(1 << 20) {
+            s.write_all(&(c.len() as u32).to_be_bytes()).unwrap();
+            s.write_all(c).unwrap();
+        }
+        s.write_all(&0u32.to_be_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string()
+    };
+    // The oracle: the same bytes as a file, scanned as far as the same size.
+    let f = d.file("held.bin", &body);
+    let out = exav()
+        .arg("-d")
+        .arg(d._db.path())
+        .args(["--quiet", "--max-input-bytes", "1M"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    let local = String::from_utf8_lossy(&out.stdout);
+    let name = local
+        .trim()
+        .strip_prefix(&format!("{}: ", f.display()))
+        .and_then(|l| l.strip_suffix(" FOUND"))
+        .unwrap_or_else(|| panic!("{local}"))
+        .to_string();
+    assert_eq!(ask("INSTREAM"), format!("stream: {name} FOUND"));
+    let json = ask("EXINSTREAM");
+    assert!(json.contains("\"status\":\"FOUND\""), "{json}");
+    assert!(json.contains(&format!("\"{name}\"")), "{json}");
+}
+
+/// A job cut off by `--max-scan-secs` is answered, not closed in silence: a
+/// connection that ends with no reply reads as a clean scan to some clients.
+#[test]
+fn a_timed_out_job_gets_an_answer() {
+    use std::io::{Read, Write};
+    let d = Daemon::start("077", &["--max-scan-secs", "1"]);
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(b"zINSTREAM\0").unwrap();
+    s.write_all(&4u32.to_be_bytes()).unwrap();
+    s.write_all(b"abcd").unwrap();
+    // Never finished: the job runs into its wall-clock limit.
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out);
+    assert!(
+        reply.contains("LIMITS-EXCEEDED ERROR"),
+        "no verdict for a job the timer stopped: {reply:?}"
+    );
+}
+
+/// The same for a job still scanning when its time runs out, rather than one
+/// waiting on its client.
+#[test]
+fn a_job_still_scanning_when_its_time_runs_out_gets_an_answer() {
+    use std::io::{Read, Write};
+    let d = Daemon::start("077", &["--max-scan-secs", "1"]);
+    // Sparse: seconds of scanning, and no disk.
+    let f = d.dir.path().join("zeros.bin");
+    std::fs::File::create(&f).unwrap().set_len(2 << 30).unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(format!("zSCAN {}\0", f.display()).as_bytes())
+        .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let reply = String::from_utf8_lossy(&out);
+    assert!(
+        reply.contains("exceeded --max-scan-secs LIMITS-EXCEEDED ERROR"),
+        "{reply:?}"
+    );
+}
+
+/// The CPU limit is per job. `RLIMIT_CPU` counts a process's whole life, so set
+/// once per worker it killed whichever job ran when the jobs before it had used
+/// the budget between them, and that job got no reply.
+#[test]
+fn the_cpu_limit_is_per_job_not_per_worker() {
+    use std::io::{Read, Write};
+    let d = Daemon::start("077", &["--workers", "1", "--max-scan-secs", "1"]);
+    // Random bytes, so the scan is CPU work rather than a cache hit.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let body: Vec<u8> = (0..8 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let f = d.file("noise.bin", &body);
+    let start = Instant::now();
+    let mut jobs = 0;
+    // Until the jobs have used three times the limit between them, so the
+    // whole-life limit this replaced is certain to have been crossed.
+    #[cfg(target_os = "linux")]
+    let worker = {
+        // Up and forked.
+        assert_eq!(ping(&d), "PONG");
+        let pids = children_of(d.child.id());
+        assert_eq!(pids.len(), 1, "{pids:?}");
+        pids[0]
+    };
+    #[cfg(target_os = "linux")]
+    let more = || cpu_secs(worker) < 3.0;
+    #[cfg(not(target_os = "linux"))]
+    let more = || start.elapsed() < Duration::from_secs(4);
+    while more() || jobs < 5 {
+        assert!(start.elapsed() < Duration::from_secs(300), "{jobs} jobs");
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(format!("zSCAN {}\0", f.display()).as_bytes())
+            .unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let reply = String::from_utf8_lossy(&out);
+        assert!(
+            reply.trim_end_matches('\0').ends_with("OK"),
+            "job {jobs} after {:?}: {reply:?}",
+            start.elapsed()
+        );
+        jobs += 1;
+    }
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        children_of(d.child.id()),
+        [worker],
+        "the worker was replaced"
+    );
+}
+
+/// User plus system CPU seconds `pid` has used, from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn cpu_secs(pid: u32) -> f64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // Fields 14 and 15, counted after the `(comm)` that may hold spaces.
+    let rest: Vec<&str> = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    let ticks: u64 = rest[11].parse::<u64>().unwrap() + rest[12].parse::<u64>().unwrap();
+    // SAFETY: sysconf reads a constant.
+    ticks as f64 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64
+}
+
+/// The processes whose parent is `pid`.
+#[cfg(target_os = "linux")]
+fn children_of(pid: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            // `pid (comm) state ppid ...`; comm may hold spaces, so split after it.
+            let ppid: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (ppid == pid).then(|| e.file_name().to_str()?.parse().ok())?
+        })
+        .collect()
+}
+
+/// One `zPING` over a fresh connection: a job, as far as the job count goes.
+#[cfg(target_os = "linux")]
+fn ping(d: &Daemon) -> String {
+    use std::io::Write;
+    let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+    s.write_all(b"zPING\0").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    String::from_utf8_lossy(&out)
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+/// `--max-jobs-per-worker off` never recycles the worker, where a count does.
+#[cfg(target_os = "linux")]
+#[test]
+fn max_jobs_per_worker_off_keeps_the_worker() {
+    // Every worker seen across six jobs.
+    let seen = |limit: &str| {
+        let d = Daemon::start("077", &["--workers", "1", "--max-jobs-per-worker", limit]);
+        let mut all = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            assert_eq!(ping(&d), "PONG", "{limit}");
+            std::thread::sleep(Duration::from_millis(200));
+            all.extend(children_of(d.child.id()));
+        }
+        all
+    };
+    // The control: a recycle is something this can see.
+    assert!(seen("2").len() >= 2);
+    assert_eq!(seen("off").len(), 1);
+}
+
+/// `EXINSTREAM` answers a stream it could not hold as `INSTREAM` does: partial,
+/// over a limit, not an error. `MULTI` answers it for that file alone.
+#[test]
+fn an_unexaminable_exinstream_is_partial_too() {
+    use std::io::{Read, Write};
+    let d = Daemon::start(
+        "077",
+        &["--spill-dir", "off", "--spill-threshold-bytes", "1M"],
+    );
+    let big = vec![b'A'; 4 << 20];
+    let chunks = |body: &[u8]| {
+        let mut m = Vec::new();
+        for c in body.chunks(1 << 20) {
+            m.extend_from_slice(&(c.len() as u32).to_be_bytes());
+            m.extend_from_slice(c);
+        }
+        m.extend_from_slice(&0u32.to_be_bytes());
+        m
+    };
+    let ask = |msg: &[u8]| {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(msg).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let text = String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string();
+        serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+    };
+
+    let one = ask(&[&b"zEXINSTREAM\0"[..], &chunks(&big)].concat());
+    assert_eq!(one["status"], "PARTIAL", "{one}");
+    assert_eq!(one["category"], "LIMITS-EXCEEDED", "{one}");
+
+    let mut multi = b"zEXINSTREAM MULTI\0".to_vec();
+    for (name, body) in [("big.bin", &big[..]), ("eicar.txt", eicar())] {
+        multi.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        multi.extend_from_slice(name.as_bytes());
+        multi.extend_from_slice(&chunks(body));
+    }
+    multi.extend_from_slice(&0u32.to_be_bytes());
+    let many = ask(&multi);
+    assert_eq!(many["files"][0]["category"], "LIMITS-EXCEEDED", "{many}");
+    assert_eq!(many["files"][1]["status"], "FOUND", "{many}");
+}
+
+/// A stream the daemon turns down before scanning (over `--max-input-bytes`,
+/// or with nowhere to hold it) is a partial like any other, so `--partial-as`
+/// decides it on `INSTREAM` and `EXINSTREAM` alike.
+#[test]
+fn a_stream_turned_down_follows_partial_as() {
+    use std::io::Write;
+    fn chunks(body: &[u8], terminate: bool) -> Vec<u8> {
+        let mut m = Vec::new();
+        for c in body.chunks(1 << 20) {
+            m.extend_from_slice(&(c.len() as u32).to_be_bytes());
+            m.extend_from_slice(c);
+        }
+        if terminate {
+            m.extend_from_slice(&0u32.to_be_bytes());
+        }
+        m
+    }
+    fn ask(d: &Daemon, verb: &str, body: &[u8], terminate: bool) -> String {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(format!("z{verb}\0").as_bytes()).unwrap();
+        s.write_all(&chunks(body, terminate)).unwrap();
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string()
+    }
+    fn multi(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut m = (name.len() as u32).to_be_bytes().to_vec();
+        m.extend_from_slice(name.as_bytes());
+        m.extend_from_slice(&chunks(body, true));
+        m.extend_from_slice(&0u32.to_be_bytes());
+        m
+    }
+    fn ask_multi(d: &Daemon, body: &[u8]) -> String {
+        let mut s = std::os::unix::net::UnixStream::connect(&d.sock).unwrap();
+        s.write_all(b"zEXINSTREAM MULTI\0").unwrap();
+        s.write_all(&multi("f.bin", body)).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .to_string()
+    }
+    let big = vec![b'A'; 3 << 20];
+    let limits = [
+        "--max-input-bytes",
+        "2M",
+        "--spill-dir",
+        "off",
+        "--spill-threshold-bytes",
+        "4M",
+    ];
+    let spill = ["--spill-dir", "off", "--spill-threshold-bytes", "1M"];
+
+    // Default policy: the flag the limit comes from is the one exav has.
+    let d = Daemon::start("077", &limits);
+    let line = ask(&d, "INSTREAM", &big, true);
+    assert!(
+        line.contains("max-input-bytes") && line.ends_with("LIMITS-EXCEEDED ERROR"),
+        "{line}"
+    );
+    let json = ask(&d, "EXINSTREAM", &big, true);
+    assert!(json.contains("max-input-bytes"), "{json}");
+    assert!(!json.contains("max-filesize"), "{json}");
+    drop(d);
+
+    for (policy, instream, status) in [
+        ("ok", "stream: OK", "\"status\":\"OK\""),
+        // The name a file over the limit gets, since it is the same scan.
+        (
+            "found",
+            "stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND",
+            "\"status\":\"FOUND\"",
+        ),
+    ] {
+        let d = Daemon::start("077", &[&limits[..], &["--partial-as", policy]].concat());
+        assert_eq!(ask(&d, "INSTREAM", &big, true), instream, "{policy}");
+        let json = ask(&d, "EXINSTREAM", &big, true);
+        assert!(json.contains(status), "{policy}: {json}");
+        let json = ask_multi(&d, &big);
+        assert!(json.contains(status), "{policy}: {json}");
+    }
+
+    let d = Daemon::start("077", &[&spill[..], &["--partial-as", "ok"]].concat());
+    assert_eq!(ask(&d, "INSTREAM", &big, true), "stream: OK");
+    let json = ask(&d, "EXINSTREAM", &big, true);
+    assert!(json.contains("\"status\":\"OK\""), "{json}");
+    let json = ask_multi(&d, &big);
+    assert!(json.contains("\"status\":\"OK\""), "{json}");
+
+    // A stream the client never finished is not an object exav could not
+    // examine but a request that never arrived, so no policy passes it: an
+    // `OK` there is a verdict for whoever hangs up after a benign head.
+    let line = ask(&d, "INSTREAM", b"head", false);
+    assert!(
+        line.ends_with(" ERROR") && !line.contains("UNSCANNABLE"),
+        "{line}"
+    );
+    let json = ask(&d, "EXINSTREAM", b"head", false);
+    assert!(json.contains("\"status\":\"ERROR\""), "{json}");
+    assert!(!json.contains("category"), "{json}");
 }
 
 /// `--json` is a machine stream: the informational lines `-v` prints would be
@@ -490,7 +860,7 @@ fn verbose_stays_out_of_the_json_stream() {
 /// `clamdscan` has no `-r`, so a command line migrated from it hands the client
 /// a bare directory. Answering for one file in it and exiting 0 is a clean
 /// verdict over a tree that holds a detection, which is the one thing a scanner
-/// may never report — so the default has to be the whole tree.
+/// may never report, so the default has to be the whole tree.
 ///
 /// Asking for the top level is a different matter: `--no-recursive` is exav's
 /// own flag and the caller typed it. The client does its own walking, so it is
@@ -552,7 +922,7 @@ fn the_summary_counts_every_file_the_daemon_answered_for() {
 }
 
 /// A directory and a file in one run. Both are answered on the same session, so
-/// a reply left unread by the first command is read as the second's answer —
+/// a reply left unread by the first command is read as the second's answer,
 /// which loses the file's verdict and misattributes the tree's.
 #[test]
 fn a_directory_beside_a_file_keeps_every_answer() {
@@ -594,6 +964,21 @@ fn allmatch_answers_for_every_file_in_a_tree() {
     assert_eq!(code, 1, "{stdout}");
 }
 
+/// `--all-matches` on a file the daemon could not fully examine is partial, as
+/// without the flag; it used to exit 0.
+#[test]
+fn allmatch_reports_a_partial_file() {
+    let d = Daemon::start("077", &[]);
+    let dir = TempDir::new().unwrap();
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    gz.extend_from_slice(&[0xff; 64]);
+    std::fs::write(dir.path().join("damaged.gz"), gz).unwrap();
+
+    let (code, stdout) = d.client(&["--all-matches"], &[dir.path()]);
+    assert!(stdout.contains("UNSCANNABLE"), "{stdout}");
+    assert_eq!(code, 3, "{stdout}");
+}
+
 /// `--all-matches` over a byte-split set. No part decodes on its own, so scanning
 /// the parts as the files they are finds nothing; the set has to be rejoined
 /// whichever flag was passed, or the answer is clean over an archive nobody
@@ -622,7 +1007,7 @@ fn allmatch_rejoins_a_split_set() {
 /// A daemon of the test's own answers one `SCAN` with two messages, which is
 /// what a real one does whenever the path it was handed names more than one
 /// file. A client that reads a fixed single line reports the first and drops
-/// the second — and the second is the detection here.
+/// the second, and the second is the detection here.
 #[test]
 fn every_reply_message_of_a_scan_is_reported() {
     use std::io::Write;
@@ -701,7 +1086,7 @@ fn every_reply_message_of_a_scan_is_reported() {
 
 /// The premise the client's session framing rests on: one command, any number
 /// of replies. `SCAN` over a directory answers once per file, every message
-/// tagged with the same command id and nothing marking the last — so a client
+/// tagged with the same command id and nothing marking the last, so a client
 /// that reads a fixed line count drops verdicts, and the one it sends behind
 /// the scan (`PING`) is what tells it the scan has finished talking.
 #[test]

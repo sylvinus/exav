@@ -1,85 +1,77 @@
 ---
 title: exav
-description: A fast, memory-safe malware scanner written in Rust — streaming any file size, and drop-in compatible with ClamAV signature databases and tooling.
+description: Memory-safe tools for untrusted files, written in Rust. A malware scanner compatible with ClamAV's signatures and protocols, an archive extractor, and a file viewer for the browser.
+template: splash
 hero:
-  tagline: A fast, memory-safe malware scanner written in Rust.
+  tagline: Memory-safe tools for untrusted files. Scan them for malware, unpack them, and view them in the browser.
   image:
     file: ../../assets/logo.svg
   actions:
-    - text: Get started
-      link: /getting-started/introduction/
+    - text: Malware scanning
+      link: /scanner/getting-started/introduction/
       icon: right-arrow
       variant: primary
-    - text: View on GitHub
-      link: https://github.com/sylvinus/exav
-      icon: external
-      variant: minimal
+    - text: Archive extraction
+      link: /unpack/
+      variant: secondary
+    - text: File viewer
+      link: /viewer/
+      variant: secondary
 ---
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-exav is a malware scanner written in memory-safe Rust: a single static
-MIT-licensed binary that scans files of any size in constant memory and runs a
-native YARA engine. It reads ClamAV's signature databases, answers the `clamd`
-and ICAP protocols, and prints `clamscan`'s output format — so it drops into an
-existing ClamAV setup without changing anything around it. Its flags are its
-own: a `clamscan` flag exav lacks stops the run rather than being ignored (see
-the [flag matrix](/reference/clamav-flag-matrix/)).
+exav is a set of tools for files you did not write and should not trust: an
+attachment, an upload, a download. They are built on the same parsers,
+written in safe Rust, and each bounds the work a hostile file can cause.
+Each tool is usable on its own.
 
 <CardGrid>
-  <Card title="Memory-safe Rust engine" icon="rocket">
-    The scanning and extraction code is safe Rust (`#![forbid(unsafe_code)]`
-    in the core crates) — no C, no native JIT. Whole classes of CVE are ruled
-    out by construction rather than patched one at a time.
+  <Card title="Malware scanning" icon="magnifier">
+    A ClamAV-compatible scanner, daemon and ICAP server that never reports a
+    file clean unless it fully scanned it.
+
+    ```sh
+    cargo install exav
+    ```
+
+    [Start here](/scanner/getting-started/introduction/) or read the
+    [comparison with ClamAV](/scanner/reference/comparison-with-clamav/)
   </Card>
-  <Card title="Constant-memory streaming" icon="bars">
-    Scans multi-GB files in a single forward pass — a 6 GiB file on a
-    4.8 GiB-RAM machine is detected, with a flat ~2 MiB per-scan working set
-    regardless of file size. Formats that cannot be read forward-only (a ZIP's
-    directory is at its end) are buffered to a temp file first, under
-    [budgets you set](/reference/cli/#buffering-a-stream-spill).
+  <Card title="Archive extraction" icon="download">
+    Bounded, memory-safe extraction of archives, disk images and documents, as
+    a command, a Rust crate, and `@exav/unpack-wasm` for browsers and Node.
+
+    ```sh
+    cargo install exav-unpack
+    ```
+
+    [Start here](/unpack/)
   </Card>
-  <Card title="Native YARA engine" icon="puzzle">
-    Near-full YARA support via a native tree-walking evaluator — no runtime
-    codegen at scan time, a lean pure-Rust dependency tree, on by default.
-  </Card>
-  <Card title="Drop-in compatible" icon="random">
-    Loads existing `.cvd`/`.ndb`/`.ldb`/`.hdb`/YARA signature databases and
-    answers the `clamd` protocol — so `clamdscan`, milters, and existing
-    tooling talk to exav unchanged.
-  </Card>
-  <Card title="Prebuilt `.exavdb`" icon="download">
-    Compile a large signature set once, then load it in seconds everywhere —
-    a ~19× faster, ~5× lighter cold start.
-  </Card>
-  <Card title="WASM sandbox" icon="seti:wasm">
-    The whole engine compiles to a WASI module, so you can load **untrusted**
-    signatures without giving them host access — with zero custom host code.
-  </Card>
-  <Card title="Never a silent clean" icon="approve-check">
-    exav's core safety rule: **never report a file clean unless it was fully
-    scanned.** Anything that stops the scan early surfaces as a distinct
-    verdict — never absorbed into `OK`. A deployment can choose to deliver such
-    an object anyway, but only by saying so, and it is still reported.
-  </Card>
-  <Card title="MIT licensed" icon="open-book">
-    A single static binary under a permissive license, built clean-room from
-    public specifications — nothing derived from GPL sources.
+  <Card title="File viewer" icon="document">
+    `@exav/viewer` shows PDF, images, DWG and DXF, Office documents, IFC and
+    STL models, media and archives in the browser, and can open each file in
+    a sandboxed frame of its own.
+
+    ```sh
+    npm install @exav/viewer
+    ```
+
+    [Start here](/viewer/) or [try the demo](/viewer/demo/)
   </Card>
 </CardGrid>
 
 :::note[Status: beta]
-exav is young. It is tested hard — differentially against ClamAV on a large
-corpus, plus fuzzing — but a scanner earns trust from use, and there has not been
-much of that yet. Please [report anything that looks
-wrong](https://github.com/sylvinus/exav/issues); fixes ship quickly.
+exav is young. It is tested differentially against ClamAV on a large corpus and
+fuzzed, but a scanner earns trust from use, and it has not had much yet. Please
+[report anything that looks wrong](https://github.com/sylvinus/exav/issues).
 :::
 
-## Start here
+## Subprojects and About
 
 <CardGrid>
-  <LinkCard title="Why exav exists" href="/getting-started/introduction/" description="What exav is, and the design principles it is built around." />
-  <LinkCard title="Install" href="/getting-started/installation/" description="Build from source, packages, containers, and the WASM module." />
-  <LinkCard title="Quick start" href="/getting-started/quick-start/" description="Get signatures, run your first scan, understand the output." />
-  <LinkCard title="Design principles" href="/concepts/design-principles/" description="Memory safety, no runtime codegen, constant-memory streaming, never a silent clean, and more." />
+  <LinkCard title="Subprojects" href="/subprojects/" description="exav-grep, exav-imagehash, exav-pe-emu, exav-core as a library, exav-render, exav-x86 and exav-update." />
+  <LinkCard title="Technical architecture" href="/project/architecture/" description="How the crates and the WebAssembly packages depend on each other." />
+  <LinkCard title="Security" href="/project/security/" description="Reporting a vulnerability, the threat model, and where each tool's safety model is documented." />
+  <LinkCard title="Contributing" href="/project/contributing/" description="The clean-room rule, the checks to run, and the 32-bit/WASM tests." />
 </CardGrid>

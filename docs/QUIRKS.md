@@ -152,9 +152,60 @@ CLI flag for it.)
 > naive reader never enumerates, so "clean" would be a claim about bytes nobody
 > read. exav closes that by scanning orphan local-file-header members
 > (`scan_orphan_locals`), and by reporting rather than dropping any orphan it
-> can't decode: encrypted, unsupported codec, deferred size, or extent past EOF
-> each yield a metadata-only `Entry::unsupported` → `UNSCANNABLE`. A damaged zip
-> is only `OK` when every member it still contains was actually read.
+> can't decode: encrypted, unsupported codec or deferred size each yield a
+> metadata-only `Entry::unsupported` → `UNSCANNABLE`. The rule for the rest:
+> `PARTIAL` only when bytes present in the input were not read. An orphan cut
+> off by the end of the file (its extent runs past it, or its stream runs out
+> of input there) follows the gzip rule above, whatever its codec: the bytes
+> present are decoded and scanned, the rest is absent, and the cut does not
+> make a zip cut short `PARTIAL`, the first part of a split zip among them.
+> (A block codec, bzip2 or Zstandard, has nothing to give from the block the
+> cut falls in, and LZMA none from its last few bytes: no decoder can get
+> their content without the rest.) An orphan whose stream stops with more of
+> the file after it is reported as not whole: nothing confirms its extent (no
+> central directory; the size is the local header's, a data descriptor found
+> by search, or a guess up to the next header), so its rest may be in those
+> bytes. So is one damaged part way, or whose decoded size is not the one its
+> header declares (a deflate stream damaged part way can decode on to its end
+> without an error), and a member hidden between listed ones whose extent runs
+> into the next.
+
+The other containers follow the same rule: a 7z, SWF, NSIS, UPX, EGG, ALZ, HWP
+3.0 or XAR member, or a VMDK grain or qcow2 cluster, damaged part way has what
+decoded before the damage scanned and is reported; one cut off by the end of the
+file is decoded as far as it goes and is not. A decoder that fails loses only
+what it decoded and had not handed over: for LZMA (`formats::lzma::SansIo`) at
+most what 1 KiB of input decodes to; for xz (`xz4rust`, which reports nothing
+of a call that fails) the output of the failing call, which `formats::xz` caps
+at 1 KiB; for bzip2, Zstandard, MSZIP and LZX the block or frame the damage
+falls in.
+
+A DMG run (zlib, bzip2, xz, LZFSE) damaged part way keeps what decoded before
+the damage, and the files there are scanned. The image is then reported
+whatever those files hold, unless something is found: a decoder can run on past
+damage before it notices it (zlib does), so bytes before the error may not be
+the disk's. A run that decodes to more than its declared size counts as damaged
+too.
+
+A checksum that fails after a full decode is not damage: the bytes are scanned
+and nothing is reported unless checksums are verified, in ZIP, gzip, EGG, RAR,
+WIM, ARC, ZOO, bzip2, lzip and UPX's `PackHeader` alike. A bzip2 block failing
+its CRC and an lzip member failing its trailer do not stop the stream: the
+blocks and members after them are decoded, and the mismatch is raised at the
+end (`crate::checksum_mismatch`), as gzip's is. Three exceptions remain. The
+CRC of an encrypted member (ZipCrypto, RAR, 7z AES) is how a candidate password
+is confirmed. A solid RAR member decoded after a member of its group that was
+not decoded (failed, encrypted and unopened, stored, split or in an unsupported
+method) gets a window without that member's bytes, so if its CRC disagrees its
+bytes are not its own and it is reported. And xz (`xz4rust`) reports a block's
+failed check as an error that loses the decoder's position, so it still counts
+as damage there.
+
+A UDIF image whose data fork opens with its first bzip2 or xz run, as hdiutil
+writes UDBZ and ULMO images, starts with that run's magic. `detect` checks such
+a file's last 512 bytes for a `koly` trailer (signature, version 4, size 512)
+before calling it bzip2 or xz, one read made only for those two magics, and
+exav-core's file typing defers to that answer.
 
 (Interesting footnote from studying the ecosystem: ClamAV salvages a *truncated*
 deflate stream but **discards** the recovered prefix on a hard mid-stream data

@@ -104,12 +104,21 @@ pub(crate) fn extract_hwp3<R>(
     let cap = budget.reserve()?;
     let entry = if compressed {
         match inflate(body, cap) {
-            Some((out, false)) => {
-                crate::ratio_guard(body.len() as u64, out.len() as u64, budget)?;
-                budget.commit(out.len() as u64);
-                Entry::new("hwp3-body".to_string(), out)
+            Some(s) if !s.over_cap => {
+                crate::ratio_guard(body.len() as u64, s.data.len() as u64, budget)?;
+                budget.commit(s.data.len() as u64);
+                // The body runs to the end of the file, so a stream that runs
+                // out of input was cut there: only damage leaves bytes unread.
+                let why = s.undecoded.then_some(
+                    "HWP3 body failed to decompress part way; the bytes before the failure \
+                     were scanned",
+                );
+                Entry {
+                    unsupported: why,
+                    ..Entry::new("hwp3-body".to_string(), s.data)
+                }
             }
-            Some((_, true)) => Entry::unsupported(
+            Some(_) => Entry::unsupported(
                 "hwp3-body".to_string(),
                 body.len() as u64,
                 false,
@@ -134,16 +143,25 @@ pub(crate) fn extract_hwp3<R>(
 
 /// Inflate the body. Writers differ on whether the stream carries a zlib
 /// wrapper, so both are tried rather than assuming one and reporting the other
-/// as undecodable.
-fn inflate(body: &[u8], cap: u64) -> Option<(Vec<u8>, bool)> {
-    use std::io::Cursor;
-    if let Ok(r) = crate::bounded_read(flate2::read::ZlibDecoder::new(Cursor::new(body)), cap) {
-        if !r.0.is_empty() {
-            return Some(r);
-        }
+/// as undecodable. A stream that decodes whole wins; failing that, one that
+/// only ran out of input (a body cut short); failing that, what decoded
+/// before an error. zlib first each time.
+fn inflate(body: &[u8], cap: u64) -> Option<crate::Salvaged> {
+    let rank = |s: &crate::Salvaged| match (s.undecoded, s.cut_short) {
+        (false, false) => 0,
+        (false, true) => 1,
+        _ => 2,
+    };
+    let zlib = crate::inflate::zlib_body(body)
+        .map(|z| crate::salvage(z, cap))
+        .filter(|s| !s.data.is_empty());
+    if zlib.as_ref().is_some_and(|s| rank(s) == 0) {
+        return zlib;
     }
-    let r = crate::bounded_read(flate2::read::DeflateDecoder::new(Cursor::new(body)), cap).ok()?;
-    (!r.0.is_empty()).then_some(r)
+    let raw = Some(crate::salvage(crate::inflate::Inflate::new(body), cap))
+        .filter(|s| !s.data.is_empty());
+    // `min_by_key` keeps the first of equals.
+    [zlib, raw].into_iter().flatten().min_by_key(rank)
 }
 
 #[cfg(test)]
@@ -228,9 +246,10 @@ mod tests {
 
     #[test]
     fn a_body_that_will_not_decompress_is_reported_not_dropped() {
+        // The zlib header kept, the deflate data after it not deflate.
         let mut v = build(true, 0, 4, b"ignored");
-        let n = v.len();
-        v.truncate(n - 4);
+        let body = at::INFO_BLOCK_LEN + 2 + at::SUMMARY_LEN + 4;
+        v.truncate(body + 2);
         v.extend_from_slice(&[0xFF; 16]);
         let seen = members(&v);
         assert_eq!(seen.len(), 1);

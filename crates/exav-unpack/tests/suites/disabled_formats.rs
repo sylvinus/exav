@@ -98,7 +98,7 @@ fn ordinary_files_are_not_claimed() {
         &b"{\"json\": true}"[..],
     ] {
         assert_eq!(
-            exav_unpack::detect(blob),
+            exav_unpack::detect(&blob),
             None,
             "claimed an ordinary file: {blob:x?}"
         );

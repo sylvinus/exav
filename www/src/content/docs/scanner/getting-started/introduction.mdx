@@ -1,0 +1,118 @@
+---
+title: Introduction
+description: What exav is, a memory-safe malware scanner written in Rust that reads ClamAV signature databases and speaks the clamd and ICAP protocols.
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+exav is a malware scanner written in memory-safe Rust. It ships as one
+MIT-licensed binary with a scanning CLI, a resident daemon and an ICAP server,
+and it drops into an existing ClamAV setup: it loads the signature databases you
+already have and answers the protocols your tooling already speaks.
+
+It reads ClamAV databases (`.cvd`/`.cld`, `.ndb`/`.ldb`/`.hdb`/`.hsb`/`.mdb`/
+`.msb`/`.cdb`/`.imp`/`.cbc`) and YARA rules (`.yar`/`.yara`), and speaks two wire
+protocols: `clamd`, so `clamdscan`, milters and existing tooling talk to it
+unchanged, and [ICAP](/scanner/guides/icap/), so it can replace a `c-icap` container
+behind a proxy or an upload service.
+
+## Why exav
+
+Established engines are large C codebases, and they bound their own work and then
+report a file clean without saying so. ClamAV, for instance, reads a file over
+about 2 GB, scans none of it, and answers `OK`. exav is a memory-safe rewrite
+built around one rule:
+
+> Never report a file clean unless it was fully scanned.
+
+A file exav could not fully examine gets a verdict of its own
+(`LIMITS-EXCEEDED`, `UNSCANNABLE` or `PASSWORD-PROTECTED`) instead of `OK`. A
+deployment may choose to deliver such a file anyway, but only by saying so. See
+[Never a silent clean](/scanner/concepts/design-principles/#never-a-silent-clean)
+for what the rule implies, and [Verdicts & exit codes](/scanner/reference/verdicts/)
+for how each verdict is reported.
+
+<CardGrid>
+  <Card title="Memory-safe Rust engine" icon="rocket">
+    The scanning and extraction code is safe Rust (`#![forbid(unsafe_code)]` in
+    the core crates). The default build links no C and generates no code at run
+    time, so the memory-corruption bugs behind most scanner CVEs cannot occur in
+    the code that parses hostile input.
+  </Card>
+  <Card title="Bounded memory" icon="bars">
+    Most archives are walked member by member instead of being extracted whole,
+    and a stream waits in a temp file under
+    [budgets you set](/scanner/reference/cli/#buffering-a-stream-spill). A file over a
+    bound is reported, not called clean.
+  </Card>
+  <Card title="Native YARA engine" icon="puzzle">
+    Near-full YARA support through a native tree-walking evaluator: no code
+    generation at scan time, a pure-Rust dependency tree, on by default.
+  </Card>
+  <Card title="Drop-in compatible" icon="random">
+    Loads existing `.cvd`/`.ndb`/`.ldb`/`.hdb`/YARA signature databases and
+    answers the `clamd` and ICAP protocols, so `clamdscan`, milters, proxies and
+    existing tooling talk to exav unchanged.
+  </Card>
+  <Card title="Prebuilt .exavdb" icon="download">
+    Compile a large signature set once, then load it quickly and with far less
+    memory everywhere.
+  </Card>
+  <Card title="WASM sandbox" icon="seti:wasm">
+    The whole engine compiles to a WASI module, so **untrusted** signatures can
+    be loaded without host access, with no custom host code.
+  </Card>
+</CardGrid>
+
+## What it looks like
+
+Point it at the signatures you already have:
+
+```console
+$ exav -d ~/.cvdupdate/database suspicious.bin
+suspicious.bin: Win.Trojan.Agent-1234 FOUND
+```
+
+A stream on stdin is scanned like a file:
+
+```console
+$ curl -fsS https://example.com/download.zip | exav -d ~/.cvdupdate/database -
+stdin: OK
+```
+
+Load the database once and serve it over either protocol, or both (neither
+protocol authenticates its clients, so bind to an interface only trusted clients
+reach):
+
+```console
+$ exav --listen clamd://127.0.0.1:3310 --listen icap://127.0.0.1:1344 -d /var/lib/clamav
+exav: prefork daemon: 4 workers; per-job limits: wall 120s, mem 2048 MiB, cpu 120s; recycle every 1000 jobs
+exav: serving ICAP on tcp:127.0.0.1:1344 (services: avscan, srv_clamav, virus_scan; preview 4096 B)
+```
+
+One process and one loaded database replace a `c-icap` + `clamav` container
+pair.
+
+With no signatures, exav refuses to run rather than answer from near-zero
+coverage:
+
+```console
+$ exav suspicious.bin
+exav: no signature database loaded, refusing to run (it would report real
+malware as clean). Load signatures with -d/--database or --sig-dir, or pass
+--allow-no-db to use the built-in EICAR-only baseline (testing only).
+```
+
+## Where to next
+
+- [Installation](/scanner/getting-started/installation/): build from source or pull a
+  container.
+- [Quick start](/scanner/getting-started/quick-start/): signatures, a first scan, the
+  output.
+- [Scanning](/scanner/guides/scanning/) and [Daemon mode](/scanner/guides/daemon/): everyday use.
+- [Comparison with ClamAV](/scanner/reference/comparison-with-clamav/): compatibility,
+  performance, and where the two differ.
+- [Migrating from ClamAV](/scanner/guides/migrating-from-clamav/): replace `clamscan` and
+  `clamd` in place.
+- [exav-core](/subprojects/exav-core/): the engine as a Rust library, to embed
+  in your own program.

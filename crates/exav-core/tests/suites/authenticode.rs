@@ -32,6 +32,32 @@ fn crb_blocklist_flags_signed_pe() {
     }
 }
 
+/// A signed PE whose section runs past the end of the file, its signer on a
+/// loaded `.crb` block-list: the check answers rather than panicking, and the
+/// signer's certificate, which is in the file, is still found.
+#[test]
+fn a_signed_pe_whose_section_runs_past_the_file_is_still_checked() {
+    let subj = "2c190fb742c4be7399e7706dd24610807dc9860c";
+    let mut loader = exav_core::loader::Builder::new();
+    loader.add_named_bytes(
+        "block.crb",
+        format!("Malware.StolenCert;0;{subj};\n").as_bytes(),
+        true,
+    );
+    let db = loader.build().expect("build db");
+
+    let mut pe = fixture("signed_mismatch.exe");
+    let at = u32::from_le_bytes(pe[0x3c..0x40].try_into().unwrap()) as usize;
+    let opt_len = u16::from_le_bytes(pe[at + 20..at + 22].try_into().unwrap()) as usize;
+    let first = at + 24 + opt_len;
+    // The first section's PointerToRawData, far past the end.
+    pe[first + 20..first + 24].copy_from_slice(&0xE727_0000u32.to_le_bytes());
+    match analyze(&db, &pe, &ScanOptions::default()).verdict {
+        Verdict::Infected { signature, .. } => assert_eq!(signature, "Malware.StolenCert"),
+        other => panic!("expected the block-listed signer, got {other:?}"),
+    }
+}
+
 #[test]
 fn broken_authenticode_flagged_only_when_opted_in() {
     let db = Scanner::builtin();

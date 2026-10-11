@@ -4,6 +4,7 @@
 
 use super::logic::parse_expr;
 use super::*;
+use crate::grams::anchor_score;
 
 /// Parse an `.ldb` subsignature: `[Offset:]HexBody[::Modifiers]`. Expands to
 /// one or more compiled variants (ASCII and/or wide). `None` if unsupported
@@ -11,7 +12,7 @@ use super::*;
 /// A subsignature parsed but not yet committed to the engine.
 pub(super) enum ParsedSub {
     Bodies(Vec<Compiled>),
-    Pcre(PcreSub),
+    Pcre(Box<PcreSub>),
     Bcomp(BcompSub),
     /// `fuzzy_img#<hash>[#<dist>]`: the 8-byte perceptual hash and the max Hamming
     /// distance (0 when unspecified) at which the scanned image's hash matches.
@@ -27,7 +28,11 @@ pub(super) fn classify_failure_reason(s: &str) -> &'static str {
     // mislabelled every *alternation* as byte-compare, i.e. 6 of the 16 skipped
     // signatures in a live daily set were filed under the wrong missing feature.
     if s.starts_with("fuzzy_img#") {
-        return "ldb: malformed fuzzy_img# subsignature";
+        return if cfg!(feature = "image-hash") {
+            "ldb: malformed fuzzy_img# subsignature"
+        } else {
+            "ldb: fuzzy_img# subsignature in a build without image-hash"
+        };
     }
     // Byte-compare has the shape `N(offset#properties#value)`: a subsignature
     // reference, then a parenthesised triple separated by '#'.
@@ -42,7 +47,7 @@ pub(super) fn classify_failure_reason(s: &str) -> &'static str {
         return "ldb: unsupported byte-compare subsignature";
     }
     if s.contains('/') {
-        return "ldb: unsupported PCRE subsignature";
+        return parse_pcre(s).err().unwrap_or("ldb: unsupported PCRE subsignature");
     }
     // `(a|b)` alternations, including the empty-branch form `(abc|)` that makes
     // a run optional, and branches that themselves contain nibble wildcards.
@@ -56,13 +61,16 @@ pub(super) fn classify_failure_reason(s: &str) -> &'static str {
 /// (`Trigger/regex/flags`), or a normal hex/pattern body.
 pub(super) fn classify_subsig(s: &str) -> Option<ParsedSub> {
     if let Some(rest) = s.strip_prefix("fuzzy_img#") {
+        if !cfg!(feature = "image-hash") {
+            return None;
+        }
         return parse_fuzzy_subsig(rest).map(|(h, d)| ParsedSub::Fuzzy(h, d));
     }
     if let Some(b) = parse_bcomp_subsig(s) {
         return Some(ParsedSub::Bcomp(b));
     }
     if s.contains('/') {
-        return parse_pcre_subsig(s).map(ParsedSub::Pcre);
+        return parse_pcre_subsig(s).map(|p| ParsedSub::Pcre(Box::new(p)));
     }
     parse_subsig(s).map(ParsedSub::Bodies)
 }
@@ -105,53 +113,72 @@ pub(super) fn parse_num(s: &str) -> Option<i64> {
     }
 }
 
-/// Parse `Trigger/PCRE/[flags]`. The regex is delimited by the first and last
-/// `/`; flags `i`/`s`/`m` map to case-insensitive/dotall/multiline (other
-/// Flags like `g`/`r`/`e` are accepted but don't change a match/no-match
-/// result here).
+/// Parse `[Offset:]Trigger/PCRE/[flags]`. The regex is delimited by the first
+/// and last `/`. `i`, `s`, `m`, `x`, `E` and `U` are PCRE2's options, applied
+/// by `pcre::translate`; `g`, `r`, `e` and `A` are how ClamAV runs it. A
+/// pattern the translation refuses, or another flag, leaves the signature
+/// unsupported.
 pub(super) fn parse_pcre_subsig(s: &str) -> Option<PcreSub> {
-    let first = s.find('/')?;
-    let last = s.rfind('/')?;
+    parse_pcre(s).ok()
+}
+
+/// [`parse_pcre_subsig`], saying why a subsignature is refused.
+pub(super) fn parse_pcre(s: &str) -> Result<PcreSub, &'static str> {
+    const MALFORMED: &str = "ldb: malformed PCRE subsignature";
+    let first = s.find('/').ok_or(MALFORMED)?;
+    let last = s.rfind('/').ok_or(MALFORMED)?;
     if last <= first {
-        return None;
+        return Err(MALFORMED);
     }
     // `[Offset:]Trigger/PCRE/Flags`. An offset prefix constrains where the match
     // may start; on a live `daily.cvd` 368 of the 369 that use one are `EOF-n`
     // (a trailing marker), so leaving it unparsed dropped those signatures.
     let head = &s[..first];
     let (offset, trigger_src) = match head.split_once(':') {
-        Some((o, t)) => (parse_offset(o)?, t),
+        Some((o, t)) => (parse_offset(o).ok_or(MALFORMED)?, t),
         None => (Offset::Any, head),
     };
     // Only offsets resolvable from the file length alone. `EP`/`Sx` need a PE
-    // layout `PcreSub::is_match` does not carry, and matching one without it
+    // layout `PcreSub::count` does not carry, and matching one without it
     // would silently never fire — so it stays counted-unsupported instead.
-    if !matches!(
-        offset,
-        Offset::Any | Offset::Constrained(_)
-    ) || matches!(
+    if matches!(
         &offset,
         Offset::Constrained(k)
             if !matches!(k.as_ref(), OffsetKind::Abs { .. } | OffsetKind::Eof { .. })
     ) {
-        return None;
+        return Err("ldb: PCRE subsignature offset relative to a PE layout");
     }
-    let trigger = parse_expr(trigger_src)?;
+    let trigger = parse_expr(trigger_src).ok_or(MALFORMED)?;
     let pattern = &s[first + 1..last];
     if pattern.is_empty() {
-        return None;
+        return Err(MALFORMED);
     }
     let flags = &s[last + 1..];
-    Some(PcreSub {
-        trigger,
-        offset,
-        pattern: pattern.to_string(),
-        ci: flags.contains('i'),
+    if !flags.chars().all(|c| "greismxAEU".contains(c)) {
+        return Err("ldb: unknown PCRE subsignature flag");
+    }
+    let options = super::pcre::Flags {
+        caseless: flags.contains('i'),
         dotall: flags.contains('s'),
         multiline: flags.contains('m'),
+        extended: flags.contains('x'),
+        dollar_endonly: flags.contains('E'),
+        ungreedy: flags.contains('U'),
+        ..Default::default()
+    };
+    Ok(PcreSub {
+        trigger,
+        offset,
+        pattern: super::pcre::translate(pattern, options)?,
+        global: flags.contains('g'),
+        rolling: flags.contains('r'),
+        encompass: flags.contains('e'),
+        anchored: flags.contains('A'),
         re: std::sync::OnceLock::new(),
         fancy: std::sync::OnceLock::new(),
         prefilter: std::sync::OnceLock::new(),
+        stream_re: std::sync::OnceLock::new(),
+        stream_prefilter: std::sync::OnceLock::new(),
     })
 }
 
@@ -179,7 +206,7 @@ pub(super) fn parse_bcomp_subsig(s: &str) -> Option<BcompSub> {
         (true, n)
     };
     let mag = parse_num(num)?;
-    let offset = if neg { -mag } else { mag };
+    let offset = if neg { mag.checked_neg()? } else { mag };
     // byte_options: [h|d|a|i][l|b]?[e]? num_bytes
     let mut ch = opts_s.chars().peekable();
     let kind = match ch.next()? {
@@ -285,7 +312,7 @@ pub(super) fn parse_subsig(s: &str) -> Option<Vec<Compiled>> {
 /// with `0x00`, wildcards each match one wide char, and gaps count wide chars.
 pub(super) fn compile_wide(body: &str, allow_internal: bool) -> Option<(Vec<Elem>, Vec<u8>, Prefix)> {
     let elems = widen_elems(parse_elems(body)?);
-    let prefix = pick_anchor(&elems, allow_internal)?;
+    let prefix = pick_anchor(&elems, allow_internal, None)?;
     let anchor_idx = match prefix {
         Prefix::Fixed { anchor_idx, .. }
         | Prefix::Floating { anchor_idx }
@@ -356,7 +383,7 @@ pub(super) fn widen_elems(elems: Vec<Elem>) -> Vec<Elem> {
 /// Returns `None` if it uses an unsupported construct or has no usable anchor.
 pub(super) fn compile_body(hex: &str, allow_internal: bool) -> Option<(Vec<Elem>, Vec<u8>, Prefix)> {
     let elems = parse_elems(hex)?;
-    let prefix = pick_anchor(&elems, allow_internal)?;
+    let prefix = pick_anchor(&elems, allow_internal, None)?;
     let anchor_idx = match prefix {
         Prefix::Fixed { anchor_idx, .. }
         | Prefix::Floating { anchor_idx }
@@ -470,25 +497,33 @@ pub(super) fn parse_elems(hex: &str) -> Option<Vec<Elem>> {
     }
 }
 
+/// A gap bound, as wide as the file can be: a number that does not fit a
+/// 32-bit `usize` is the largest one, so a signature behaves the same there
+/// and on a 64-bit build instead of failing to load.
+fn gap_bound(s: &str) -> Option<usize> {
+    let n: u64 = s.trim().parse().ok()?;
+    Some(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 pub(super) fn parse_gap(spec: &str) -> Option<Elem> {
     let spec = spec.trim();
     if let Some(rest) = spec.strip_prefix('-') {
         Some(Elem::Gap {
             min: 0,
-            max: Some(rest.trim().parse().ok()?),
+            max: Some(gap_bound(rest)?),
         })
     } else if let Some(pre) = spec.strip_suffix('-') {
         Some(Elem::Gap {
-            min: pre.trim().parse().ok()?,
+            min: gap_bound(pre)?,
             max: None,
         })
     } else if let Some((a, b)) = spec.split_once('-') {
         Some(Elem::Gap {
-            min: a.trim().parse().ok()?,
-            max: Some(b.trim().parse().ok()?),
+            min: gap_bound(a)?,
+            max: Some(gap_bound(b)?),
         })
     } else {
-        let n = spec.parse().ok()?;
+        let n = gap_bound(spec)?;
         Some(Elem::Gap {
             min: n,
             max: Some(n),
@@ -554,65 +589,46 @@ fn decode_masked_hex(s: &str) -> Option<Vec<(u8, u8)>> {
     Some(out)
 }
 
-/// Choose the literal anchor and classify its prefix.
-/// Selectivity score of a candidate anchor run. A low-entropy run (a constant
-/// byte like a zero/0xFF pad, or a 2-symbol repeat) matches repetitive content
-/// — PE padding, BSS — millions of times, so it is a terrible prefilter even
-/// when long. Down-rank such runs sharply so a shorter but varied run wins; a
-/// varied run scores its length (longer = rarer = better).
-pub(super) fn anchor_score(b: &[u8]) -> usize {
-    let mut seen = [false; 256];
-    let mut distinct = 0usize;
-    for &x in b {
-        if !seen[x as usize] {
-            seen[x as usize] = true;
-            distinct += 1;
-        }
-    }
-    match distinct {
-        0 | 1 => 1,          // constant run: near-useless anchor
-        2 => 3.min(b.len()), // 2-symbol repeat (e.g. ababab): weak
-        _ => b.len(),        // varied: length is the selectivity
-    }
-}
-
-pub(super) fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix> {
-    // Pick the most *selective* literal run as the Aho-Corasick anchor (highest
+pub(super) fn pick_anchor(
+    elems: &[Elem],
+    allow_internal: bool,
+    stats: Option<&GramStats>,
+) -> Option<Prefix> {
+    // Pick the most *selective* literal run as the anchor (highest
     // [`anchor_score`], tie-break longer), not merely the longest: a long
     // constant run is a far worse prefilter than a shorter varied one. Fewer
-    // spurious AC hits → fewer verifies, the dominant scan cost.
+    // spurious anchor hits, fewer verifies, the dominant scan cost.
     //
     // The anchor in the *fixed-width prefix* (before the first variable gap) is
-    // free to verify — its distance back to the pattern start (`len`) is exact.
+    // free to verify: its distance back to the pattern start (`len`) is exact.
     // But some patterns have only a useless literal there (a zero-run) while a
     // rare literal sits past a gap. For those, anchoring past the gap (`Internal`)
-    // and verifying backward across it slashes AC hits by orders of magnitude.
+    // and verifying backward across it cuts anchor hits by orders of magnitude.
     // We only take an internal anchor when it is *strictly more selective* than
     // the best fixed-prefix one and the pattern offset is `*` (so the floating
-    // start need not satisfy a fixed offset) — passed via `allow_internal`.
+    // start need not satisfy a fixed offset), passed via `allow_internal`.
     let mut fixed = 0usize;
     let mut in_fixed_prefix = true;
     // (score, len, prefix) for the best fixed-prefix candidate and the best
     // candidate anywhere.
-    let mut best_fixed: Option<(usize, usize, Prefix)> = None;
-    let mut best_any: Option<(usize, usize, usize)> = None; // (score, len, idx)
+    let mut best_fixed: Option<(isize, usize, Prefix)> = None;
+    let mut best_any: Option<(isize, usize, usize)> = None; // (score, len, idx)
     for (i, e) in elems.iter().enumerate() {
         if let Elem::Bytes(b) = e {
             if b.len() >= MIN_ANCHOR {
-                let score = anchor_score(b);
-                let better = |cur: &Option<(usize, usize, Prefix)>| match cur {
+                let score = anchor_score(b, stats);
+                let better = |cur: &Option<(isize, usize, Prefix)>| match cur {
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
                     None => true,
                 };
-                if in_fixed_prefix && better(&best_fixed) {
-                    best_fixed = Some((
-                        score,
-                        b.len(),
-                        Prefix::Fixed {
-                            anchor_idx: i as u32,
-                            len: fixed as u32,
-                        },
-                    ));
+                // A distance past `u32` cannot be stored: the anchor is then
+                // no fixed-prefix one, instead of one at a wrapped distance.
+                if let (true, Ok(len), Ok(anchor_idx)) =
+                    (in_fixed_prefix, u32::try_from(fixed), u32::try_from(i))
+                {
+                    if better(&best_fixed) {
+                        best_fixed = Some((score, b.len(), Prefix::Fixed { anchor_idx, len }));
+                    }
                 }
                 let any_better = match &best_any {
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
@@ -631,15 +647,19 @@ pub(super) fn pick_anchor(elems: &[Elem], allow_internal: bool) -> Option<Prefix
     // Prefer an internal anchor only when it beats the fixed-prefix one.
     if allow_internal {
         if let Some((any_score, _, idx)) = best_any {
-            let fixed_score = best_fixed.as_ref().map(|(s, ..)| *s).unwrap_or(0);
+            // No fixed-prefix candidate at all must lose to every real one:
+            // scores are signed, so a `0` floor here would reject a merely
+            // common internal anchor and leave the body with no anchor — i.e.
+            // silently drop the signature rather than prefilter it poorly.
+            let fixed_score = best_fixed.as_ref().map(|(s, ..)| *s).unwrap_or(isize::MIN);
             if any_score > fixed_score {
                 // A single leading gap is the cheap `Floating` fast path, not the
                 // general backward-matching `Internal`.
                 if idx == 1 && matches!(elems.first(), Some(Elem::Gap { .. })) {
                     return Some(Prefix::Floating { anchor_idx: 1 });
                 }
-                if idx > 0 {
-                    return Some(Prefix::Internal { anchor_idx: idx as u32 });
+                if let (true, Ok(anchor_idx)) = (idx > 0, u32::try_from(idx)) {
+                    return Some(Prefix::Internal { anchor_idx });
                 }
             }
         }

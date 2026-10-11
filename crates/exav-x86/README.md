@@ -40,11 +40,11 @@ the system-instruction space, SSE/MMX with the `0F 38`/`0F 3A` escapes, 3DNow!,
 VEX (`C4`/`C5`), EVEX (`62`) and AMD's XOP (`8F`). No REX, no RIP-relative
 addressing, no 64-bit forms.
 
-Operands are modelled for the general-purpose and x87 encodings. For the SIMD
-maps the register *file* an operand names — MMX, XMM/YMM, mask — is not
-modelled: a register number is reported as the encoding's own, and a vector
-index register is not reported at all. Nothing in exav interprets those
-operands; their identity and their length are what matter.
+Operands are modelled for the general-purpose and x87 encodings, and for the
+`0F` SIMD encodings whose shape is in the generated table, which report their
+register file (`Op::Mmx`, `Op::Xmm`) and memory width. Elsewhere in the SIMD
+maps (VEX, EVEX, XOP) a register operand is not reported, and a vector index
+register never is; their identity and their length are what matter.
 
 Coverage is measured, not asserted. The corpus sweep decodes every byte offset
 of a set of real packed samples and compares each site where `iced-x86` decodes

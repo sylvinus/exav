@@ -1,38 +1,40 @@
-//! Range decoders for PPMd7.
+//! Range decoders for PPMd7 and PPMd8.
 //!
 //! Two coders share the var.H model:
 //!
-//! * [`SevenZRangeDecoder`] — the 7-Zip range coder, vendored from `ppmd-rust`
-//!   1.4.0 (CC0-1.0 OR MIT-0). Used to validate the vendored model against
-//!   real `.7z` PPMd streams produced by the `7z` CLI.
+//! * [`SevenZRangeDecoder`]: the 7-Zip range coder, vendored from `ppmd-rust`
+//!   1.4.0 (CC0-1.0 OR MIT-0), for 7z PPMd members.
 //! * [`RarRangeDecoder`] — RAR's Subbotin carry-less range coder. Its
 //!   arithmetic (`Low`/`Code`/`Range`/`Bottom`, the `(Low ^ (Low+Range))`
 //!   normalisation, the no-leading-byte init) is reproduced from libarchive's
 //!   BSD-2-Clause `archive_ppmd7.c` `PpmdRAR_RangeDec_*` functions — **not from
-//!   UnRAR**.
+//!   UnRAR**. It is also the range decoder of PPMd8 (ZIP method 98): `ppmd-rust`
+//!   1.5.0's `ppmd8/range_coding.rs` has the same init, the same 2^15 bottom
+//!   and the same normalisation, and keeps `Code - Low` where this keeps both,
+//!   which gives the same thresholds modulo 2^32.
 //!
-//! Both pull bytes from an in-memory cursor (a `&[u8]` + position) so the model
-//! stays allocation-free w.r.t. the input. `out_of_data` records truncation:
-//! once the source is exhausted, reads yield 0 and the flag is set, letting the
-//! framing layer stop cleanly instead of looping.
+//! Both own their input and read it through a position. `out_of_data` records
+//! truncation: once the input is exhausted, reads yield 0 and the flag is set,
+//! letting the framing layer stop instead of looping.
+// Each coder is dead in a build without the format that uses it.
+#![cfg_attr(not(all(feature = "rar", feature = "sevenz")), allow(dead_code))]
 
+use super::common::PPMD_BIN_SCALE;
 use super::RangeDec;
 
 const K_TOP_VALUE: u32 = 1 << 24;
-/// Binary-context probability scale (PPMD_BIN_SCALE = 1 << 14).
-const PPMD_BIN_SCALE: u32 = 1 << 14;
 
-/// A byte source over an in-memory slice that yields 0 past the end and records
-/// that it ran out (so the model can detect truncation). Only the test-only
-/// `SevenZRangeDecoder` uses it; `RarRangeDecoder` owns its buffer directly.
-struct ByteIn<'a> {
-    data: &'a [u8],
+/// A byte source over a buffer that yields 0 past the end and records that it
+/// ran out (so the model can detect truncation). `SevenZRangeDecoder` uses it;
+/// `RarRangeDecoder` reads its buffer directly.
+struct ByteIn {
+    data: Vec<u8>,
     pos: usize,
     out_of_data: bool,
 }
 
-impl<'a> ByteIn<'a> {
-    fn new(data: &'a [u8]) -> Self {
+impl ByteIn {
+    fn new(data: Vec<u8>) -> Self {
         ByteIn {
             data,
             pos: 0,
@@ -59,17 +61,17 @@ impl<'a> ByteIn<'a> {
 // 7z range coder (vendored from ppmd-rust)
 // -------------------------------------------------------------------------
 
-pub(crate) struct SevenZRangeDecoder<'a> {
+pub(crate) struct SevenZRangeDecoder {
     range: u32,
     code: u32,
-    inp: ByteIn<'a>,
+    inp: ByteIn,
     init_ok: bool,
 }
 
-impl<'a> SevenZRangeDecoder<'a> {
+impl SevenZRangeDecoder {
     /// 7z init: a leading byte (must be 0) then four code bytes; `code` must be
     /// `< 0xFFFFFFFF`. `init_ok` is false if the framing byte is non-zero.
-    pub(crate) fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: Vec<u8>) -> Self {
         let mut inp = ByteIn::new(data);
         let lead = inp.read();
         let mut code = 0u32;
@@ -101,7 +103,7 @@ impl<'a> SevenZRangeDecoder<'a> {
     }
 }
 
-impl<'a> RangeDec for SevenZRangeDecoder<'a> {
+impl RangeDec for SevenZRangeDecoder {
     #[inline(always)]
     fn get_threshold(&mut self, total: u32) -> u32 {
         self.range /= total;
@@ -135,6 +137,11 @@ impl<'a> RangeDec for SevenZRangeDecoder<'a> {
     #[inline(always)]
     fn out_of_data(&self) -> bool {
         self.inp.out_of_data
+    }
+
+    #[inline(always)]
+    fn range(&self) -> u32 {
+        self.range
     }
 
     #[inline(always)]
@@ -249,6 +256,11 @@ impl RangeDec for RarRangeDecoder {
     #[inline(always)]
     fn out_of_data(&self) -> bool {
         self.out_of_data
+    }
+
+    #[inline(always)]
+    fn range(&self) -> u32 {
+        self.range
     }
 
     #[inline(always)]

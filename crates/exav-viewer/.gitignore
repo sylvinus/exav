@@ -1,0 +1,8 @@
+# Build output: `npm run build:wasm`, `npm run build`, `npm run demo:build`.
+/dist/
+/wasm/
+/demo/dist/
+# The browser tests' generated files (e2e/delivery.ts).
+/e2e/.out/
+# The demo's sample files, from github.com/sylvinus/exav-samples: `npm run demo:showcase`.
+/demo/public/showcase/

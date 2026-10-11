@@ -5,10 +5,12 @@
 //! In this safe-Rust port the "tagged pointer" abstraction is just a checked
 //! byte offset into the model's `Vec<u8>` arena. There is no raw-pointer
 //! arithmetic; the model dereferences an offset through bounds-checked slice
-//! accessors (see `model.rs`). An offset of `0` is the null sentinel (the byte
-//! at offset 0 is part of the model's reserved alignment padding and is never a
-//! real node, exactly as in the upstream pointer-based allocator where the base
-//! pointer never holds a node).
+//! accessors (see `model.rs`). An offset of `0` is the null sentinel. Offset 0
+//! is alignment padding only when the memory size is not a multiple of 4;
+//! otherwise it is the first byte of the text area. Either way no offset
+//! stored in the model is 0: units are allocated above the text area, and a
+//! successor into the text is taken after the text pointer has advanced past
+//! the symbol it wrote.
 
 const TAG_NULL: u32 = 0;
 

@@ -50,7 +50,7 @@ in wording that says what is true about them.
 
 ## Family-specific ClamAV heuristics
 
-See [the ClamAV comparison](../www/src/content/docs/project/comparison-with-clamav.md)
+See [the ClamAV comparison](../www/src/content/docs/scanner/reference/comparison-with-clamav.md)
 for the list and the reasoning: they are per-family detection content expressed
 as engine code rather than as signatures, so reproducing them means reproducing
 logic that exists only in GPL source — which exav's clean-room rule forbids.

@@ -1,0 +1,68 @@
+---
+// The site's sections as a vertical list, for the menus of narrow screens.
+import { Icon } from '@astrojs/starlight/components';
+
+const { topics } = Astro.locals.starlightSidebarTopics;
+---
+
+<nav aria-label="Sections">
+  <ul>
+    {
+      topics.map((topic) => (
+        <li>
+          <a href={topic.link} aria-current={topic.isCurrent ? 'true' : undefined}>
+            {topic.icon && (
+              <span class="icon">
+                <Icon name={topic.icon} />
+              </span>
+            )}
+            {topic.label}
+          </a>
+        </li>
+      ))
+    }
+  </ul>
+</nav>
+
+<style>
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  li + li {
+    margin-top: 0.25rem;
+  }
+
+  a {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3em 0.5rem;
+    color: var(--sl-color-white);
+    font-size: var(--sl-text-base);
+    font-weight: 600;
+    line-height: 1.5;
+    text-decoration: none;
+  }
+
+  a:is([aria-current], :hover, :focus-visible) {
+    color: var(--sl-color-accent-high);
+  }
+
+  .icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.25rem;
+    border: 1px solid var(--sl-color-gray-4);
+    border-radius: 0.25rem;
+  }
+
+  a:is([aria-current], :hover, :focus-visible) .icon {
+    background-color: var(--sl-color-text-accent);
+    border-color: var(--sl-color-text-accent);
+    color: var(--sl-color-text-invert);
+  }
+</style>

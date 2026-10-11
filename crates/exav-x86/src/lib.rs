@@ -21,12 +21,13 @@
 //! escape map, the system-instruction space, SSE/MMX with the `0F 38` and
 //! `0F 3A` escapes, 3DNow!, VEX, EVEX and AMD's XOP.
 //!
-//! Operands are modelled for the general-purpose and x87 encodings. For the
-//! SIMD maps the register *file* an operand names — MMX, XMM/YMM, mask — is
-//! not: a register number is reported as the encoding's own, and a vector index
-//! register is not reported at all. Nothing in exav interprets those operands,
-//! and reporting one as a general-purpose register would be a plausible-looking
-//! lie. What those encodings are asked for is their identity and their length.
+//! Operands are modelled for the general-purpose and x87 encodings, and for the
+//! `0F` SIMD encodings whose shape is in the generated table, which report their
+//! register file (`Op::Mmx`, `Op::Xmm`) and memory width. Elsewhere in the SIMD
+//! maps (VEX, EVEX, XOP, and an unmodelled `0F` shape) a register operand is not
+//! reported at all, and a vector index register never is: reporting one as a
+//! general-purpose register would be a plausible-looking lie. What those
+//! encodings are asked for is their identity and their length.
 //!
 //! The scope was measured, not guessed: instrumenting the emulator across the
 //! packed-sample corpus records which encodings real stubs actually execute,
@@ -104,10 +105,17 @@ impl Mn {
         }
     }
 
-    /// The mnemonic a generated map's name index names.
-    fn from_generated(i: usize) -> Mn {
-        debug_assert!(i < generated::OF_NAMES.len(), "name index {i} out of range");
-        Mn(i as u16)
+    /// The mnemonic a generated map's name index names; `None` for an index
+    /// the names do not reach.
+    fn from_generated(i: usize) -> Option<Mn> {
+        generated::OF_NAMES.get(i)?;
+        u16::try_from(i).ok().map(Mn)
+    }
+
+    /// The mnemonic of a cell's name field, which holds the index plus one:
+    /// `0` is an empty cell.
+    fn from_field(field: u32) -> Option<Mn> {
+        Mn::from_generated(usize::try_from(field.checked_sub(1)?).ok()?)
     }
 
     /// The index for a name, resolved at compile time.
@@ -361,6 +369,18 @@ mnemonics![
     Outsb,
     Outsw,
     Outsd,
+    // Generated-map encodings with an operand rule the tables cannot carry:
+    // UMONITOR's register is sized by the address size, and a gather faults
+    // when its registers overlap.
+    Umonitor,
+    Vgatherdps,
+    Vgatherdpd,
+    Vgatherqps,
+    Vgatherqpd,
+    Vpgatherdd,
+    Vpgatherdq,
+    Vpgatherqd,
+    Vpgatherqq,
     // x87. `Fnstenv`/`Fnstcw` are the GetPC-trick companions: a stub reads its
     // own address back out of the saved FPU environment.
     Fadd,
@@ -639,8 +659,8 @@ pub enum Op {
     Xmm(u8),
     /// An MMX register, `mm0`–`mm7`.
     Mmx(u8),
-    /// A memory operand whose width is not one of [`Size`]'s three — the x87
-    /// operand sizes (8, 10, 28 and 108 bytes) and nothing else.
+    /// A memory operand whose width is not one of [`Size`]'s three: the x87
+    /// operand sizes (8, 10, 28 and 108 bytes) and the SIMD widths.
     MemWide {
         base: Option<u8>,
         index: Option<u8>,
@@ -1400,7 +1420,7 @@ fn vex_tail(
     if cell & VEX_SUB_BIT != 0 {
         let m = r.peek().unwrap_or(0);
         let block = (cell >> VEX_NAME_SHIFT) as usize;
-        cell = sub[block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0)];
+        cell = *sub.get(block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0))?;
     }
     if cell == 0 {
         return None;
@@ -1411,7 +1431,7 @@ fn vex_tail(
     if cell & VEX_STRICT_VVVV != 0 && vvvv != 0xf {
         return None;
     }
-    let mn = Mn::from_generated(((cell >> VEX_NAME_SHIFT) - 1) as usize);
+    let mn = Mn::from_field(cell >> VEX_NAME_SHIFT)?;
     // Nearly every such encoding reads a ModRM byte; `vzeroupper` and
     // `vzeroall` are the exceptions, and consuming a byte they do not read
     // would report them two to six bytes too long.
@@ -1423,6 +1443,12 @@ fn vex_tail(
         // a smaller form of the instruction — it is not the instruction, and
         // claiming it would put a length on bytes the CPU faults.
         if cell & VEX_VSIB != 0 && r.peek().is_some_and(|b| b & 7 != 4) {
+            return None;
+        }
+        // 16-bit addressing has no SIB byte, so no vector index. Every VEX
+        // VSIB encoding is a gather, which faults when two of its registers
+        // are the same.
+        if cell & VEX_VSIB != 0 && (asz16 || gather_regs_overlap(r, Some(!vvvv & 7))) {
             return None;
         }
         let (_, rm) = modrm(r, Size::B4, seg, asz16)?;
@@ -1629,6 +1655,31 @@ impl Reader<'_> {
     }
 }
 
+fn is_gather(mn: Mn) -> bool {
+    matches!(
+        mn,
+        Mn::Vgatherdps
+            | Mn::Vgatherdpd
+            | Mn::Vgatherqps
+            | Mn::Vgatherqpd
+            | Mn::Vpgatherdd
+            | Mn::Vpgatherdq
+            | Mn::Vpgatherqd
+            | Mn::Vpgatherqq
+    )
+}
+
+/// Whether the gather whose ModRM byte is next names one register twice: its
+/// destination (ModRM `reg`), its index (the SIB byte's) and, when it has a
+/// vector one, its mask. Any such pair is #UD.
+fn gather_regs_overlap(r: &Reader, mask: Option<u8>) -> bool {
+    let (Some(&m), Some(&sib)) = (r.b.get(r.i), r.b.get(r.i + 1)) else {
+        return false;
+    };
+    let (dest, index) = ((m >> 3) & 7, (sib >> 3) & 7);
+    dest == index || mask.is_some_and(|k| k == dest || k == index)
+}
+
 /// Decode one instruction from the start of `bytes`, as if it were at `ip`.
 ///
 /// Returns `None` when the bytes are not an encoding this decoder claims. See
@@ -1708,8 +1759,8 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         if cell & EVEX_SUB_BIT != 0 {
             let m = r.peek().unwrap_or(0);
             let block = (cell >> EVEX_NAME_SHIFT) as usize;
-            cell = generated::EVEX_SUB
-                [block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0)];
+            cell = *generated::EVEX_SUB
+                .get(block * 16 + (((m >> 3) & 7) as usize) * 2 + usize::from(m >= 0xc0))?;
         }
         if cell == 0
             || (cell & EVEX_STRICT_VVVV != 0 && vvvv != 0xf)
@@ -1719,7 +1770,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         {
             return None;
         }
-        let mn = Mn::from_generated(((cell >> EVEX_NAME_SHIFT) - 1) as usize);
+        let mn = Mn::from_field(cell >> EVEX_NAME_SHIFT)?;
         // Every EVEX encoding reads a ModRM byte, and an eight-bit
         // displacement in one is *compressed*: it counts elements, not bytes,
         // so it has to be scaled by a factor the encoding chooses. Nothing in
@@ -1731,6 +1782,12 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         // a shorter form of it, and putting a length on it would step a linear
         // decode into the middle of whatever follows.
         if cell & EVEX_VSIB != 0 && r.peek().is_some_and(|m| m & 7 != 4) {
+            return None;
+        }
+        // As in `vex_tail`: no vector index without a SIB byte, and a gather
+        // faults when its destination is its index. Its mask is a `k`
+        // register, which cannot be either.
+        if cell & EVEX_VSIB != 0 && (asz16 || is_gather(mn) && gather_regs_overlap(&r, None)) {
             return None;
         }
         let (dest, rm) = modrm(&mut r, Size::B4, seg, asz16)?;
@@ -1965,7 +2022,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             }
             return Some(Insn {
                 len: r.i,
-                mn: Mn::from_generated(((cell >> 2) - 1) as usize),
+                mn: Mn::from_field(u32::from(cell >> 2))?,
                 ops: [rm, Op::None, Op::None],
                 rep,
                 repne,
@@ -1992,7 +2049,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
             if cell == 0 {
                 return None;
             }
-            let mn = Mn::from_generated(((cell >> 2) - 1) as usize);
+            let mn = Mn::from_field(u32::from(cell >> 2))?;
             let imm = match cell & 3 {
                 0 => 0usize,
                 1 => 1,
@@ -2077,7 +2134,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         let (mn, imm) = match exact.flatten() {
             Some((_, _, _, name, imm)) => {
                 modrm_is_opcode = true;
-                (Mn::from_generated(name as usize), imm as usize)
+                (Mn::from_generated(usize::from(name))?, usize::from(imm))
             }
             None if keyed_on_modrm => return None,
             None => {
@@ -2091,7 +2148,7 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
                     2 => 2,
                     _ => 4,
                 };
-                (Mn::from_generated(((cell >> 2) - 1) as usize), imm)
+                (Mn::from_field(u32::from(cell >> 2))?, imm)
             }
         };
         // `0F 20`–`23` move to and from the control and debug registers. They
@@ -2174,6 +2231,16 @@ pub fn decode(bytes: &[u8], ip: u64) -> Option<Insn> {
         if asz16 && mn == Mn::Montmul {
             return None;
         }
+        // UMONITOR's register holds an address, so it is as wide as the
+        // address size, not the operand size: `67` makes it 16 bits.
+        let ops = if asz16 && mn == Mn::Umonitor {
+            ops.map(|o| match o {
+                Op::Reg(n, Size::B4) => Op::Reg(n, Size::B2),
+                o => o,
+            })
+        } else {
+            ops
+        };
         if r.i > MAX_INSN_LEN {
             return None;
         }
@@ -2759,6 +2826,84 @@ mod tests {
                 assert!(seen.insert(n), "{n} appears twice in HAND_NAMES");
             }
         }
+    }
+
+    /// The decoder takes a name from a table cell as `field - 1` and an index
+    /// into `OF_NAMES`; every non-empty cell must name one that exists, and
+    /// every block a cell points to must lie in its table.
+    #[test]
+    fn every_table_cell_names_a_mnemonic() {
+        let short = |maps: &[&[u16]]| {
+            for m in maps {
+                for &c in *m {
+                    assert!(
+                        c == 0 || Mn::from_field(u32::from(c >> 2)).is_some(),
+                        "cell {c:#x}"
+                    );
+                }
+            }
+        };
+        short(&[
+            &generated::OF_MAP,
+            &generated::OF38_MAP,
+            &generated::OF3A_MAP,
+            &generated::NOW3D_MAP,
+        ]);
+        for &(_, _, _, name, _) in &generated::OF_MOD3 {
+            assert!(
+                Mn::from_generated(usize::from(name)).is_some(),
+                "OF_MOD3 name {name}"
+            );
+        }
+        let long = |what: &str, cells: &[u32], sub: &[u32], sub_bit: u32, shift: u32| {
+            let named = |c: u32| c == 0 || Mn::from_field(c >> shift).is_some();
+            for &c in cells {
+                if c & sub_bit == 0 {
+                    assert!(named(c), "{what} cell {c:#x}");
+                    continue;
+                }
+                let block = (c >> shift) as usize;
+                let cells = sub
+                    .get(block * 16..block * 16 + 16)
+                    .unwrap_or_else(|| panic!("{what} block {block}"));
+                for &s in cells {
+                    assert!(s & sub_bit == 0 && named(s), "{what} sub cell {s:#x}");
+                }
+            }
+        };
+        long(
+            "VEX",
+            &generated::VEX_MAP,
+            &generated::VEX_SUB,
+            VEX_SUB_BIT,
+            VEX_NAME_SHIFT,
+        );
+        long(
+            "XOP",
+            &generated::XOP_MAP,
+            &generated::XOP_SUB,
+            VEX_SUB_BIT,
+            VEX_NAME_SHIFT,
+        );
+        long(
+            "EVEX",
+            &generated::EVEX_CELLS,
+            &generated::EVEX_SUB,
+            EVEX_SUB_BIT,
+            EVEX_NAME_SHIFT,
+        );
+    }
+
+    /// An index or field the names do not reach is no mnemonic, not a wrong one.
+    #[test]
+    fn a_name_index_past_the_names_is_none() {
+        let n = generated::OF_NAMES.len();
+        assert!(Mn::from_generated(n - 1).is_some());
+        assert!(Mn::from_generated(n).is_none());
+        assert!(Mn::from_field(0).is_none());
+        assert!(Mn::from_field(n as u32).is_some());
+        assert!(Mn::from_field(n as u32 + 1).is_none());
+        assert!(Mn::from_field(u32::MAX).is_none());
     }
 
     /// Interning must round-trip: the index a constant holds must name it back.

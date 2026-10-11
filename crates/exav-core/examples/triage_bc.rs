@@ -183,6 +183,7 @@ fn main() {
             match_offsets: &[],
             apis: &bc.apis,
             default_name: &bc.name,
+            write_limits: exec::WriteLimits::NONE,
         };
         let out = exec::run(&bc.functions, 0, &ctx);
         let (ran, detected) = (!out.hit_unsupported, out.detection.is_some());

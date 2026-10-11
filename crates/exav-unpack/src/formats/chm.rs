@@ -52,14 +52,13 @@ const RTABLE_NAME: &str = "::DataSpace/Storage/MSCompressed/Transform/\
 // ---- little-endian readers, all bounds-checked (return None past EOF) --------
 
 fn u16at(d: &[u8], p: usize) -> Option<u16> {
-    d.get(p..p + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    crate::bytes::at(d, p, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 fn u32at(d: &[u8], p: usize) -> Option<u32> {
-    d.get(p..p + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    crate::bytes::at(d, p, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 fn u64at(d: &[u8], p: usize) -> Option<u64> {
-    d.get(p..p + 8)
+    crate::bytes::at(d, p, 8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
@@ -94,6 +93,8 @@ struct DirEntry {
 struct ChmDir {
     sec0_offset: usize,
     entries: Vec<DirEntry>,
+    /// An entry of the listing could not be read: files after it are unknown.
+    listing_damaged: bool,
 }
 
 /// Parse the ITSF header + ITSP directory. Returns `None` if this isn't a
@@ -103,21 +104,21 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
         return None;
     }
     // Header-section table follows the 0x38-byte ITSF header.
-    let off_hs1 = u64at(d, 0x38 + 0x10)? as usize; // ITSP directory
-                                                   // The directory offset must land inside the file. Bounding it here also keeps
-                                                   // every `off_hs1 + <small const>` read below from overflowing `usize` on a
-                                                   // crafted 64-bit offset (a `d.len() <= isize::MAX` invariant makes the adds
-                                                   // safe once `off_hs1 < d.len()`).
+    let off_hs1 = crate::bytes::to_usize(u64at(d, 0x38 + 0x10)?); // ITSP directory
+                                                                  // The directory offset must land inside the file. Bounding it here also keeps
+                                                                  // every `off_hs1 + <small const>` read below from overflowing `usize` on a
+                                                                  // crafted 64-bit offset (a `d.len() <= isize::MAX` invariant makes the adds
+                                                                  // safe once `off_hs1 < d.len()`).
     if off_hs1 >= d.len() {
         return None;
     }
     // OffsetCS0 (content section 0 base). Present in v3; for v1/2 we recompute
     // it below from the directory geometry.
     let version = u32at(d, 0x04)?;
-    let mut sec0_offset = u64at(d, 0x38 + 0x20).unwrap_or(0) as usize;
+    let mut sec0_offset = crate::bytes::to_usize(u64at(d, 0x38 + 0x20).unwrap_or(0));
 
     // ITSP directory header.
-    if d.get(off_hs1..off_hs1 + 4)? != b"ITSP" {
+    if crate::bytes::at(d, off_hs1, 4)? != b"ITSP" {
         return None;
     }
     let chunk_size = u32at(d, off_hs1 + 0x10)? as usize;
@@ -140,6 +141,7 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
     }
 
     let mut entries = Vec::new();
+    let mut listing_damaged = false;
     for cn in 0..num_chunks {
         let cs = dir_start + cn * chunk_size;
         let chunk = &d[cs..cs + chunk_size];
@@ -150,18 +152,32 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
         // The entry region runs from +0x14 up to the quickref area; the very last
         // u16 of the chunk is the entry count. Read encints bounded by `end`.
         let end = chunk_size - 2;
-        let num_entries = u16at(chunk, end)? as usize;
+        let Some(num_entries) = u16at(chunk, end).map(usize::from) else {
+            listing_damaged = true;
+            continue;
+        };
         let mut p = 0x14usize;
         for _ in 0..num_entries {
-            let name_len = read_encint(chunk, &mut p, end)? as usize;
+            // An entry that cannot be read ends this chunk's listing, and the
+            // listing is reported as damaged: what follows is not in the list.
+            let Some(name_len) = read_encint(chunk, &mut p, end).map(crate::bytes::to_usize) else {
+                listing_damaged = true;
+                break;
+            };
             if name_len > end.saturating_sub(p) {
+                listing_damaged = true;
                 break; // truncated / hostile name length
             }
             let name = String::from_utf8_lossy(&chunk[p..p + name_len]).into_owned();
             p += name_len;
-            let section = read_encint(chunk, &mut p, end)?;
-            let offset = read_encint(chunk, &mut p, end)?;
-            let length = read_encint(chunk, &mut p, end)?;
+            let (Some(section), Some(offset), Some(length)) = (
+                read_encint(chunk, &mut p, end),
+                read_encint(chunk, &mut p, end),
+                read_encint(chunk, &mut p, end),
+            ) else {
+                listing_damaged = true;
+                break;
+            };
             entries.push(DirEntry {
                 name,
                 section,
@@ -174,6 +190,7 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
     Some(ChmDir {
         sec0_offset,
         entries,
+        listing_damaged,
     })
 }
 
@@ -262,8 +279,8 @@ fn parse_reset_table(blob: &[u8]) -> Option<ResetTable> {
 }
 
 /// Decompress the section-1 LZX `content` stream into a single buffer (bounded
-/// to `cap` bytes). Returns the decoded buffer plus whether at least one frame
-/// decoded successfully.
+/// to `cap` bytes). Returns the decoded buffer and, per 32 KiB frame, whether
+/// it decoded.
 ///
 /// LZX in CHM is framed: the stream is padded up to a whole number of 32 KiB
 /// frames (padded to the reset interval), so every frame decodes to exactly
@@ -271,20 +288,19 @@ fn parse_reset_table(blob: &[u8]) -> Option<ResetTable> {
 /// the reset table's "honest" (unpadded) length, or the last block ends mid-way
 /// and the decoder reports EOF.
 ///
-/// Best-effort: only frames that start at an LZX reset boundary are decoded
-/// (each with a fresh decoder). This is exact for single-frame streams and for
-/// streams whose reset interval is one frame — the common cases. Frames inside a
-/// multi-frame reset interval can't be started independently with this crate, so
-/// they're left zero-filled rather than decoded to garbage. Never panics.
+/// The decoder is reset at the start of each reset interval and carried
+/// through its frames, each read from the compressed offset the reset table
+/// gives it. A table with fewer entries than frames gives only where each
+/// interval starts, so then only the first frame of each is decoded.
 fn decompress_content(
     content: &[u8],
     params: &LzxParams,
     rt: &ResetTable,
     cap: usize,
-) -> (Vec<u8>, bool) {
-    let real_len = rt.uncomp_len as usize;
+) -> (Vec<u8>, Vec<bool>) {
+    let real_len = crate::bytes::to_usize(rt.uncomp_len);
     if real_len == 0 || cap == 0 {
-        return (Vec::new(), false);
+        return (Vec::new(), Vec::new());
     }
     // Frames covering the real (unpadded) length — files never index past it.
     let frames_needed = real_len.div_ceil(LZX_FRAME_SIZE);
@@ -293,47 +309,50 @@ fn decompress_content(
     let max_frames = (cap / LZX_FRAME_SIZE).max(1).min(frames_needed);
     let buf_len = max_frames * LZX_FRAME_SIZE;
     let mut out = vec![0u8; buf_len];
+    let mut decoded = vec![false; max_frames];
 
     let rif = params.reset_interval_frames.max(1);
     let per_frame = rt.offsets.len() >= frames_needed;
-
-    let mut any = false;
-    let mut r = 0usize;
-    loop {
-        let frame = match r.checked_mul(rif) {
-            Some(f) if f < max_frames => f,
-            _ => break,
-        };
-        // Compressed byte offset at which this reset-aligned frame begins.
-        let byte_off = if r == 0 && rt.offsets.is_empty() {
-            0
-        } else if per_frame {
-            match rt.offsets.get(frame) {
-                Some(&o) => o as usize,
-                None => break,
-            }
-        } else {
-            match rt.offsets.get(r) {
-                Some(&o) => o as usize,
-                None => break,
-            }
-        };
-        if byte_off > content.len() {
-            break;
+    // Where frame `f` starts in `content`, and the interval index `r` it opens.
+    let start_of = |f: usize, r: usize| -> Option<usize> {
+        if f == 0 && rt.offsets.is_empty() {
+            return Some(0);
         }
-        let chunk = &content[byte_off..];
-        let out_pos = frame * LZX_FRAME_SIZE;
-        // Fresh decoder per reset point (each reset boundary re-initialises the
-        // LZX state); the crate then handles the E8 header and block structure.
+        let o = if per_frame {
+            rt.offsets.get(f)
+        } else if f.is_multiple_of(rif) {
+            rt.offsets.get(r)
+        } else {
+            None
+        };
+        o.and_then(|&o| usize::try_from(o).ok())
+            .filter(|&o| o <= content.len())
+    };
+
+    let mut r = 0usize;
+    while let Some(first) = r.checked_mul(rif).filter(|&f| f < max_frames) {
         let mut lzxd = Lzxd::new(params.window);
-        if let Ok(bytes) = lzxd.decompress_next(chunk, LZX_FRAME_SIZE) {
-            let n = bytes.len().min(out.len() - out_pos);
+        let frames = &mut decoded[first..(first + rif).min(max_frames)];
+        for (f, ok) in (first..).zip(frames) {
+            let Some(from) = start_of(f, r) else { break };
+            let to = match start_of(f + 1, r + 1) {
+                Some(to) if per_frame && to >= from => to,
+                _ => content.len(),
+            };
+            let Ok(bytes) = lzxd.decompress_next(&content[from..to], LZX_FRAME_SIZE) else {
+                break;
+            };
+            let out_pos = f * LZX_FRAME_SIZE;
+            let n = bytes.len().min(LZX_FRAME_SIZE);
             out[out_pos..out_pos + n].copy_from_slice(&bytes[..n]);
-            any = true;
+            *ok = n == LZX_FRAME_SIZE;
+            if !*ok {
+                break;
+            }
         }
         r += 1;
     }
-    (out, any)
+    (out, decoded)
 }
 
 pub(crate) fn extract_chm<R>(
@@ -364,7 +383,7 @@ pub(crate) fn extract_chm<R>(
     // Decode the compressed content section once (shared by all section-1 files).
     // Bounded to what the budget still allows so a huge declared length can't OOM.
     let mut decompressed: Vec<u8> = Vec::new();
-    let mut lzx_ok = false;
+    let mut frames_ok: Vec<bool> = Vec::new();
     if let Some(content_e) = content {
         if let Some(content_bytes) = read_sec0(data, dir.sec0_offset, content_e) {
             let params = control
@@ -387,9 +406,8 @@ pub(crate) fn extract_chm<R>(
             if let (Some(params), Some(rt)) = (params, rt) {
                 let cap = budget.reserve().unwrap_or(0) as usize;
                 if cap > 0 {
-                    let (buf, ok) = decompress_content(content_bytes, &params, &rt, cap);
-                    decompressed = buf;
-                    lzx_ok = ok;
+                    (decompressed, frames_ok) =
+                        decompress_content(content_bytes, &params, &rt, cap);
                 }
             }
         }
@@ -434,7 +452,15 @@ pub(crate) fn extract_chm<R>(
             // Compressed: slice out of the decompressed LZX stream.
             let start = usize::try_from(e.offset).ok();
             let len = usize::try_from(e.length).ok();
-            match (lzx_ok, start, len) {
+            // Every frame the entry covers decoded.
+            let decoded = start.zip(len).is_some_and(|(s, l)| {
+                let first = s / LZX_FRAME_SIZE;
+                let end = s.saturating_add(l).div_ceil(LZX_FRAME_SIZE);
+                frames_ok
+                    .get(first..end)
+                    .is_some_and(|f| f.iter().all(|&ok| ok))
+            });
+            match (decoded, start, len) {
                 // Same again for the compressed section: report rather than
                 // deliver a prefix dressed up as the whole entry.
                 (true, Some(_), Some(l)) if l as u64 > cap => (
@@ -471,6 +497,20 @@ pub(crate) fn extract_chm<R>(
         if let Some(r) = visit(entry, budget) {
             return Ok(Some(r));
         }
+    }
+
+    if dir.listing_damaged {
+        // Files the listing would have named are in the container, unseen.
+        budget.count_entry()?;
+        return Ok(visit(
+            Entry::unsupported(
+                "chm-directory".to_string(),
+                data.len() as u64,
+                false,
+                "CHM directory damaged; the files after the damage are not listed",
+            ),
+            budget,
+        ));
     }
 
     Ok(None)
@@ -584,6 +624,52 @@ mod tests {
         d[dir_start + 0x14] = 0x81;
         d[dir_start + 0x15] = 0x00;
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Chm, &d, &mut budget).unwrap().is_empty());
+        // The listing is damaged, which is reported: no file is named.
+        let entries = extract(Format::Chm, &d, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].unsupported.is_some());
+    }
+
+    /// An entry count past the entries a listing chunk holds runs the reader
+    /// off the end of its entries. The files before that point are still
+    /// extracted, and the damage is reported; the whole CHM used to come back
+    /// as nothing at all.
+    #[test]
+    fn a_listing_chunk_with_too_many_entries_keeps_the_files_before_it() {
+        let path = format!(
+            "{}/tests/fixtures/chm/benign-lzx.chm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let blob = std::fs::read(path).unwrap();
+        let mut budget = Budget::new(Limits::default());
+        let want = extract(Format::Chm, &blob, &mut budget).unwrap();
+        assert!(!want.is_empty());
+        assert!(want.iter().all(|e| e.unsupported.is_none()));
+
+        let hs1 = u64at(&blob, 0x48).unwrap() as usize;
+        let chunk_size = u32at(&blob, hs1 + 0x10).unwrap() as usize;
+        let num_chunks = u32at(&blob, hs1 + 0x2c).unwrap() as usize;
+        let dir_start = hs1 + 0x54;
+        let mut bad = blob.clone();
+        let mut hit = false;
+        for cn in 0..num_chunks {
+            let cs = dir_start + cn * chunk_size;
+            if &bad[cs..cs + 4] == b"PMGL" {
+                let end = cs + chunk_size - 2;
+                bad[end..end + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+                hit = true;
+            }
+        }
+        assert!(hit, "the sample has a listing chunk");
+        let mut budget = Budget::new(Limits::default());
+        let got = extract(Format::Chm, &bad, &mut budget).unwrap();
+        for w in &want {
+            assert!(
+                got.iter().any(|g| g.name == w.name && g.data == w.data),
+                "{} kept",
+                w.name
+            );
+        }
+        assert!(got.iter().any(|g| g.unsupported.is_some()));
     }
 }

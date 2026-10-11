@@ -131,7 +131,7 @@ fn ascii_hex_stream_decoded() {
          trailer\n<< /Size 2 /Root 1 0 R >>\n%%EOF\n"
     );
     let mut budget = Budget::new(Limits::default());
-    let entries = extract(Format::Pdf, pdf.as_bytes(), &mut budget).unwrap();
+    let entries = extract(Format::Pdf, &pdf.as_bytes(), &mut budget).unwrap();
     assert!(
         entries
             .iter()

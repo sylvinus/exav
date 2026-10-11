@@ -43,7 +43,7 @@ done
 
 # Publish order. Each crate needs the ones before it already on crates.io, so
 # this list is a dependency topological sort, not an alphabetical one.
-CRATES=(exav-x86 exav-update exav-pe-emu exav-unpack exav-core exav-grep exav)
+CRATES=(exav-x86 exav-update exav-pe-emu exav-unpack exav-render exav-imagehash exav-core exav-grep exav)
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAILED: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -78,6 +78,9 @@ step "Format and lint"
 $CARGO fmt --all --check || fail "cargo fmt"
 $CARGO clippy --all-targets --features exav-core/http -- -D warnings || fail "clippy"
 $CARGO clippy -p exav-core --all-targets --features unstable-internals -- -D warnings || fail "clippy (unstable-internals)"
+# exav-render's drawing and model readers sit behind features no other crate turns on.
+$CARGO clippy -p exav-render --all-targets --features dwg -- -D warnings || fail "clippy (exav-render dwg)"
+$CARGO clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings || fail "clippy (exav-render ifc,stl)"
 
 step "Tests"
 # The native matrix; `make test` additionally needs wasmtime and node.
@@ -116,9 +119,10 @@ step "The published tarballs build on their own"
 #
 # So the registry is reconstructed from the tarballs themselves and the binary
 # is built from those alone — the same thing `cargo install exav` does. Building
-# `exav` covers exav-core, exav-unpack, exav-pe-emu and exav-x86 transitively;
-# `exav-grep` is the other dependent. exav-x86 and exav-update have no internal
-# dependencies, so their own dry runs verify them completely.
+# `exav` covers exav-core, exav-unpack, exav-render, exav-imagehash, exav-pe-emu
+# and exav-x86 transitively; `exav-grep` is the other dependent. exav-x86 and
+# exav-update have no internal dependencies, so their own dry runs verify them
+# completely.
 tb="$(mktemp -d)"
 trap 'rm -rf "$tb"' EXIT
 for c in "${CRATES[@]}"; do
@@ -133,6 +137,8 @@ resolver = "2"
 exav-x86 = { path = "exav-x86-$VERSION" }
 exav-pe-emu = { path = "exav-pe-emu-$VERSION" }
 exav-unpack = { path = "exav-unpack-$VERSION" }
+exav-render = { path = "exav-render-$VERSION" }
+exav-imagehash = { path = "exav-imagehash-$VERSION" }
 exav-core = { path = "exav-core-$VERSION" }
 exav-update = { path = "exav-update-$VERSION" }
 exav-grep = { path = "exav-grep-$VERSION" }
@@ -217,7 +223,9 @@ if [ "$DRY_RUN" = 1 ]; then
     log="$(mktemp)"
     if $CARGO publish -p "$c" --dry-run --allow-dirty >"$log" 2>&1; then
       echo "  $c: ok"
-    elif grep -q "no matching package named \`exav" "$log"; then
+    elif grep -qE "no matching package named \`exav|failed to select a version for the requirement \`exav-" "$log"; then
+      # The second is the same fact after a first release: the sibling's
+      # earlier version is on crates.io, the one this crate needs is not.
       skipped+=("$c")
       echo "  $c: not verifiable yet (a workspace dependency is not on crates.io)"
     else

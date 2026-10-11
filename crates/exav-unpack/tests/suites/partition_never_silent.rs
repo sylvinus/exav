@@ -7,7 +7,8 @@
 //!
 //! Each case here was a silent `break`/`return Ok(None)` before.
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 const SECTOR: usize = 512;
 const ENTRY_SIZE: u32 = 128;

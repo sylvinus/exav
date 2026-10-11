@@ -1,15 +1,14 @@
 // The public entry point.
 //
-// The wasm module beneath this is synchronous throughout, because
-// `exav_unpack::Archive` is `Read + Seek` and meeting it on its own terms is
-// what lets a browser build share exav's archive readers instead of carrying a
-// second set. Synchronous reads of a `File` need `FileReaderSync`, which exists
-// only inside a Worker — so this file routes a `File` to a Worker and presents
-// the async API a page actually wants.
+// The wasm module beneath this is synchronous throughout, because exav's
+// archive readers read by offset, synchronously, and meeting them on their own
+// terms is what lets a browser build share them instead of carrying a second
+// set. Synchronous reads of a `File` need `FileReaderSync`, which exists only
+// inside a Worker — so this file routes a `File` to a Worker and presents the
+// async API a page actually wants.
 //
-// Bytes already in memory take no Worker at all: a `Cursor` is already
-// `Read + Seek`, so that path runs in-process and the caller cannot tell the
-// difference except in how fast it returns.
+// Bytes already in memory take no Worker at all, so that path runs in-process
+// and the caller cannot tell the difference except in how fast it returns.
 
 import init, {
   Archive as WasmArchive,
@@ -226,13 +225,12 @@ export class Archive {
   }
 
   /**
-   * Every member's metadata.
+   * Every member's metadata, decoding nothing it can avoid.
    *
-   * Where the archive carries an index — a ZIP's central directory, a tar's
-   * headers — this decompresses nothing. A single compressed stream such as
-   * gzip or xz has no index by construction, so its members are only knowable
-   * by walking the archive; there this takes passwords and costs what
-   * `extractAll` costs. The result is held, so calling both is not two walks.
+   * Where the archive carries an index (a ZIP's central directory, a tar's
+   * headers) this decompresses nothing, and `uncompressedSize` is what the
+   * archive declares, or -1 where it declares none (a gzip or xz stream). A
+   * format read whole (7z, RAR) is decoded to be listed.
    */
   async list(passwords) {
     this.#check();

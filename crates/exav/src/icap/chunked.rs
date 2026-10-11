@@ -145,6 +145,9 @@ pub(super) struct BodyOutcome {
     /// the client mid-send, and answering into a socket that still has unread
     /// bytes makes the kernel reset the connection — taking the verdict with it.
     pub(super) rejected: Option<String>,
+    /// The body's size as the chunk headers declared it, kept or not. A lower
+    /// bound when `abandoned`.
+    pub(super) total: u64,
 }
 
 impl std::error::Error for BodyError {}
@@ -236,6 +239,7 @@ pub(super) fn read_chunked_body<R: BufRead>(
     let mut over_limit = false;
     let mut drained: u64 = 0;
     let mut rejected: Option<String> = None;
+    let mut total: u64 = 0;
     // One buffer reused for every discarded chunk: discarding exists so the
     // bytes are not held.
     let mut sink = [0u8; 16 * 1024];
@@ -262,8 +266,10 @@ pub(super) fn read_chunked_body<R: BufRead>(
                 over_limit,
                 abandoned: false,
                 rejected,
+                total,
             });
         }
+        total = total.saturating_add(size);
 
         // Split the chunk at the ceiling: what fits is kept so it can still be
         // scanned, the rest is read and dropped. Keeping the head matters
@@ -293,6 +299,7 @@ pub(super) fn read_chunked_body<R: BufRead>(
                     over_limit: true,
                     abandoned: true,
                     rejected,
+                    total,
                 });
             }
         }
@@ -324,6 +331,7 @@ pub(super) fn read_chunked_body<R: BufRead>(
                             over_limit: true,
                             abandoned: true,
                             rejected,
+                            total,
                         });
                     }
                 }

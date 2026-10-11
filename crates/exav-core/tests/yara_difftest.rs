@@ -2,14 +2,14 @@
 //! engine and to yara-x, and assert the set of matching rule identifiers is
 //! identical.
 //!
-//! yara-x is invoked as a PROGRAM — the `yr` binary — rather than linked as a
+//! yara-x is invoked as a PROGRAM (the `yr` binary) rather than linked as a
 //! library. As a dependency it brings a ~200-crate WebAssembly subtree in for
 //! the benefit of two test files, and a crate in the graph can end up in a
 //! shipped artifact by accident in a way a binary on `PATH` cannot. This is the
 //! same relationship exav already has with `clamscan`: run the reference tool,
 //! compare its output.
 //!
-//! Skipped when `yr` is not installed. Point `EXAV_YR_BIN` at a specific build
+//! Skipped when `yr` is not installed. Point `EXAV_DEBUG_YR_BIN` at a specific build
 //! to override the lookup.
 //!
 //!   cargo install yara-x-cli     # provides `yr`
@@ -120,11 +120,11 @@ fn exav_matches(rules: &exav_core::yara::Rules, data: &[u8]) -> BTreeSet<String>
 /// Where the oracle lives. Overridable so a checkout can point at a specific
 /// build rather than whatever is on `PATH`.
 fn yr_bin() -> String {
-    std::env::var("EXAV_YR_BIN").unwrap_or_else(|_| "yr".to_string())
+    std::env::var("EXAV_DEBUG_YR_BIN").unwrap_or_else(|_| "yr".to_string())
 }
 
 /// Whether the oracle is available at all. Absent is not a failure: the same
-/// rule the clamd differential follows — a harness that needs a tool nobody
+/// rule the clamd differential follows: a harness that needs a tool nobody
 /// installed should skip, not fail, or it becomes noise everyone learns to
 /// ignore.
 fn have_yr() -> bool {
@@ -138,11 +138,18 @@ fn have_yr() -> bool {
 ///
 /// Shelling out rather than linking `yara-x`: as a library it drags a
 /// ~200-crate WebAssembly subtree into the dependency graph for the benefit of
-/// two test files. As a binary it is exactly what it should be — an external
+/// two test files. As a binary it is exactly what it should be: an external
 /// oracle, the same relationship exav already has with `clamscan`, and one that
 /// cannot end up in a shipped artifact by accident.
 fn yr_matches(rules: &str, data: &[u8], defines: &[(&str, &str)]) -> BTreeSet<String> {
-    let dir = std::env::temp_dir().join(format!("exav-yr-{}", std::process::id()));
+    // A directory of its own: tests run in parallel, and one that shared it
+    // would read another's rules (and fail on identifiers the other defines).
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "exav-yr-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::create_dir_all(&dir);
     let rule_path = dir.join("rules.yar");
     let data_path = dir.join("target.bin");
@@ -151,8 +158,10 @@ fn yr_matches(rules: &str, data: &[u8], defines: &[(&str, &str)]) -> BTreeSet<St
 
     let mut cmd = std::process::Command::new(yr_bin());
     cmd.arg("scan");
+    // Every define here is a string, which `yr` takes only quoted.
     for (k, v) in defines {
-        cmd.arg("--define").arg(format!("{k}={v}"));
+        let v = v.replace('\\', "\\\\").replace('"', "\\\"");
+        cmd.arg("--define").arg(format!("{k}=\"{v}\""));
     }
     let out = cmd
         .arg(&rule_path)
@@ -183,7 +192,7 @@ fn differential_matches_agree() {
 
 /// The `elf` module, cross-checked against the real engine. Linux-focused
 /// rulesets lean on this module heavily, so every field exav exposes has to
-/// agree with yara-x — including the undefined-propagation behaviour on inputs
+/// agree with yara-x, including the undefined-propagation behaviour on inputs
 /// that are not ELF at all.
 const ELF_RULES: &str = r#"
 import "elf"
@@ -511,7 +520,7 @@ fn differential_external_variables() {
     }
     // exav pre-declares the standard externals in `Compiler::new`, but
     // declaring them explicitly keeps the comparison independent of that
-    // default — the oracle is given the same values on its command line.
+    // default. The oracle is given the same values on its command line.
     let mut ec = exav_core::yara::Compiler::new();
     ec.define_external("filename", "");
     ec.define_external("filepath", "");

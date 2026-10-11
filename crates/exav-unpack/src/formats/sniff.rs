@@ -19,7 +19,7 @@
 //! tests in their own modules and are not detected in a build that excludes
 //! them.
 
-use crate::Format;
+use crate::{Format, Probe};
 
 /// Does `data` look like `fmt`?
 ///
@@ -27,7 +27,12 @@ use crate::Format;
 /// `false`, because "not recognised by a magic" is not the same claim as "not
 /// this format" and the structural sniffs own that answer.
 pub(crate) fn is(data: &[u8], fmt: Format) -> bool {
-    let d = data;
+    is_in(&Probe::whole(data), fmt)
+}
+
+/// [`is`] for the object `p` looks at.
+pub(crate) fn is_in(p: &Probe, fmt: Format) -> bool {
+    let d = p.head;
     match fmt {
         // `**ACE**` at offset 7 — after the header's CRC-16, size, type, flags.
         Format::Ace => d.get(7..14) == Some(b"**ACE**".as_slice()),
@@ -44,8 +49,8 @@ pub(crate) fn is(data: &[u8], fmt: Format) -> bool {
         // The `conectix` footer cookie. A fixed-disk image carries only the
         // trailing copy, so the head alone is not enough to look for.
         Format::Vhd => {
-            d.len() >= 1024
-                && (d.starts_with(b"conectix") || d[d.len() - 512..].starts_with(b"conectix"))
+            p.len >= 1024
+                && (d.starts_with(b"conectix") || p.window(p.len - 512, 8).starts_with(b"conectix"))
         }
 
         // `compress(1)`: the magic plus a plausible maximum code width.
@@ -119,7 +124,7 @@ pub(crate) fn is(data: &[u8], fmt: Format) -> bool {
             w.windows(TAG.len()).enumerate().any(|(i, x)| {
                 x == TAG && {
                     let at = i + TAG.len() + 292;
-                    d.get(at..at + 8) == Some(&[0x06, 0, 0, 0, 0, 0, 0, 0][..])
+                    crate::bytes::at(d, at, 8) == Some(&[0x06, 0, 0, 0, 0, 0, 0, 0][..])
                         // eight bytes of anything, then the trailing marker
                         && d.get(at + 16..at + 21) == Some(&[0, 0, 0, 0, 1][..])
                 }
@@ -140,10 +145,12 @@ pub(crate) fn is(data: &[u8], fmt: Format) -> bool {
         // of which a coincidental byte-run will not satisfy.
         Format::IshieldZ => {
             let u16at = |o: usize| -> Option<u32> {
-                Some(u16::from_le_bytes(d.get(o..o + 2)?.try_into().ok()?) as u32)
+                Some(u16::from_le_bytes(crate::bytes::at(d, o, 2)?.try_into().ok()?) as u32)
             };
             let u32at = |o: usize| -> Option<u32> {
-                Some(u32::from_le_bytes(d.get(o..o + 4)?.try_into().ok()?))
+                Some(u32::from_le_bytes(
+                    crate::bytes::at(d, o, 4)?.try_into().ok()?,
+                ))
             };
             d.starts_with(&[0x13, 0x5D, 0x65, 0x8C])
                 && (|| {
@@ -156,7 +163,7 @@ pub(crate) fn is(data: &[u8], fmt: Format) -> bool {
                             && dirs > 0
                             && toc >= 51
                             && toc < size
-                            && size as u64 <= d.len() as u64,
+                            && size as u64 <= p.len as u64,
                     )
                 })()
                 .unwrap_or(false)

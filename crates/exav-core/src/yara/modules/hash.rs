@@ -12,6 +12,7 @@ use sha1::Sha1;
 use sha2::Sha256;
 
 use super::FuncId;
+use crate::byte_source::ByteSource;
 use crate::yara::ir::Value;
 
 /// The `hash` module exposes only functions, so its root is an empty struct.
@@ -19,7 +20,7 @@ pub(crate) fn root() -> Value {
     Value::Struct(Rc::new(HashMap::new()))
 }
 
-pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
+pub(crate) fn call(func: FuncId, data: &dyn ByteSource, args: &[Value]) -> Option<Value> {
     use FuncId::*;
     match func {
         HashMd5Data => hex_over_range::<Md5>(data, args).map(Value::Str),
@@ -29,33 +30,48 @@ pub(crate) fn call(func: FuncId, data: &[u8], args: &[Value]) -> Option<Value> {
         HashSha256Data => hex_over_range::<Sha256>(data, args).map(Value::Str),
         HashSha256Str => Some(Value::Str(hex::<Sha256>(args[0].as_bytes()?))),
         HashCrc32Data => {
-            let s = range(data, args)?;
-            Some(Value::Int(crc32fast::hash(s) as i64))
+            let (start, end) = range(data, args)?;
+            let mut h = crc32fast::Hasher::new();
+            data.chunks(start, end, &mut |_, c| {
+                h.update(c);
+                true
+            });
+            Some(Value::Int(h.finalize() as i64))
         }
         HashCrc32Str => Some(Value::Int(crc32fast::hash(args[0].as_bytes()?) as i64)),
         HashChecksum32Data => {
-            let s = range(data, args)?;
-            Some(Value::Int(checksum32(s) as i64))
+            let (start, end) = range(data, args)?;
+            let mut sum = 0u32;
+            data.chunks(start, end, &mut |_, c| {
+                sum = sum.wrapping_add(checksum32(c));
+                true
+            });
+            Some(Value::Int(sum as i64))
         }
         HashChecksum32Str => Some(Value::Int(checksum32(args[0].as_bytes()?) as i64)),
         _ => unreachable!("non-hash FuncId dispatched to hash::call"),
     }
 }
 
-/// Resolves `(offset, size)` args to a byte slice, matching yara-x: the range
+/// Resolves `(offset, size)` args to a byte range, matching yara-x: the range
 /// is `offset..(offset+size)`, and any out-of-bounds/negative bound yields
 /// undefined (`None`).
-fn range<'d>(data: &'d [u8], args: &[Value]) -> Option<&'d [u8]> {
+fn range(data: &dyn ByteSource, args: &[Value]) -> Option<(usize, usize)> {
     let offset = args[0].to_i64()?;
     let size = args[1].to_i64()?;
     let start: usize = offset.try_into().ok()?;
     let end: usize = offset.checked_add(size)?.try_into().ok()?;
-    data.get(start..end)
+    (start <= end && end <= data.len()).then_some((start, end))
 }
 
-fn hex_over_range<D: Digest>(data: &[u8], args: &[Value]) -> Option<Vec<u8>> {
-    let s = range(data, args)?;
-    Some(hex::<D>(s))
+fn hex_over_range<D: Digest>(data: &dyn ByteSource, args: &[Value]) -> Option<Vec<u8>> {
+    let (start, end) = range(data, args)?;
+    let mut d = D::new();
+    data.chunks(start, end, &mut |_, c| {
+        d.update(c);
+        true
+    });
+    Some(crate::hexsig::encode_hex(&d.finalize()).into_bytes())
 }
 
 /// One-shot digest of `data` with `D`, lowercase-hex-encoded (as YARA returns
@@ -159,5 +175,38 @@ mod tests {
             r#"import "hash" rule r { condition: not defined hash.md5(0, 100) }"#,
             b"foobarbaz"
         ));
+    }
+
+    /// Every hash of a range gives, over a source read in chunks, exactly the
+    /// value it gives over the bytes in memory.
+    #[test]
+    fn a_range_read_in_chunks_hashes_as_the_slice_does() {
+        use super::super::FuncId::*;
+        use super::{call, Value};
+        use crate::byte_source::{BlockCache, CHUNK};
+
+        let h: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i * 31 % 251) as u8).collect();
+        let cache = BlockCache::with_sizes(std::io::Cursor::new(h.clone()), 7, 64).unwrap();
+        let n = h.len();
+        for (off, len) in [
+            (0, n),
+            (1, CHUNK + 1),
+            (CHUNK - 5, 2 * CHUNK + 3),
+            (n, 0),
+            (n - 1, 2),
+        ] {
+            let args = [Value::Int(off as i64), Value::Int(len as i64)];
+            for func in [
+                HashMd5Data,
+                HashSha1Data,
+                HashSha256Data,
+                HashCrc32Data,
+                HashChecksum32Data,
+            ] {
+                let want = format!("{:?}", call(func, &h, &args));
+                let got = format!("{:?}", call(func, &cache, &args));
+                assert_eq!(want, got, "{func:?} over {off}+{len}");
+            }
+        }
     }
 }

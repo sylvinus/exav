@@ -1,43 +1,35 @@
 ---
 title: Subprojects
-description: The tools and libraries built alongside the exav scanner — archive extraction, grep inside archives, the YARA engine, the updater, and the WASM builds — each usable on its own.
+description: The smaller pieces built alongside the exav scanner, each usable on its own, from grep inside archives, perceptual image hashes and the x86 emulator to the scanning engine as a library, the renderer, the decoder and the updater library.
 ---
 
-exav is a workspace of focused pieces rather than one binary. Several are useful
-even if you never run a virus scan: the extractor opens more container formats
-than most dedicated tools, the grep searches inside them, and the YARA engine
-runs without a JIT.
+exav is a workspace of focused pieces rather than one binary. Besides the three
+products ([malware scanning](/scanner/getting-started/introduction/),
+[archive extraction](/unpack/) and the [file viewer](/viewer/)), these
+are useful without ever running a virus scan.
 
-Each is listed below with what it is and who it is for.
-[Architecture](/concepts/architecture/) covers
-[how they compose](/concepts/architecture/#how-the-crates-compose) and how a
-scan flows through them.
+## Tools
 
-## Standalone tools
-
-| Subproject | What it is |
+| Crate | What it is |
 |---|---|
-| [exav-unpack](/subprojects/exav-unpack/) | Bounded, memory-safe extraction for the full [supported-format list](/reference/formats/) — as a Rust library, a CLI, and a WASM module that runs in a browser |
-| [exav-grep](/subprojects/exav-grep/) | grep for the *inside* of archives: search recursively through zip/rar/7z/tar/iso/OLE/PDF/email members |
-| [exav-update](/subprojects/exav-update/) | Standalone signature-database fetcher, usable without the scanner |
+| [exav-grep](/subprojects/exav-grep/) | grep for the inside of archives: search recursively through zip/rar/7z/tar/iso/OLE/PDF/email members |
+| [exav-imagehash](/subprojects/exav-imagehash/) | Perceptual image hashes with every step a parameter, reproducing ClamAV's `fuzzy_img` hash and Python imagehash's `phash` bit for bit, as a library and a CLI |
+| [exav-pe-emu](/subprojects/exav-pe-emu/) | A sandboxed x86-32 emulator that unpacks packed Windows executables by running their stub, as a library and a CLI |
 
 ## Libraries
 
-| Subproject | What it is |
+| Crate | What it is |
 |---|---|
-| [exav-core](/subprojects/exav-core/) | The scanning engine: database parsing, pattern/hash matching, file typing, and the verdict model |
-| [exav-pe-emu](/subprojects/exav-pe-emu/) | A sandboxed x86-32 emulator that unpacks packed Windows executables by running their stub |
-| [exav-x86](/subprojects/exav-x86/) | A decode-only x86-32 instruction decoder with no dependencies, checked against an independent decoder over 94 million real decode sites |
+| [exav-core](/subprojects/exav-core/) | The scanning engine: database parsing, pattern and hash matching, file typing, and the verdict model, to embed in a program |
+| [exav-render](/subprojects/exav-render/) | Memory-safe decoders that turn raster images, DWG and DXF drawings and IFC and STL models into something to draw, behind `@exav/viewer` and exav-imagehash |
+| [exav-x86](/subprojects/exav-x86/) | A decode-only x86-32 instruction decoder with no dependencies, checked against an independent decoder over real samples |
+| [exav-update](/subprojects/exav-update/) | The signature-fetching library behind `--auto-update` |
 
-## Why they are separate
+The products' own packages are documented with them:
+[exav-unpack](/unpack/rust/) and
+[`@exav/unpack-wasm`](/unpack/wasm/) under Archive extraction,
+[`@exav/viewer`](/viewer/) under File viewer. `exav`, the scanner's
+binary, publishes no library: embed `exav-core` instead.
 
-1. **Blast radius.** Extraction is the part that touches hostile bytes first and
-   hardest. Keeping it in its own `#![forbid(unsafe_code)]` crate with its own
-   budget and panic containment means a malformed archive cannot reach the
-   engine, let alone the host.
-2. **You can take one piece.** A build system that needs to look inside archives
-   does not need a virus scanner, and a browser tool that unpacks uploads should
-   not ship a signature database. Both are one crate, not a fork.
-3. **Compile only what you use.** Every format is a
-   [Cargo feature](/reference/feature-flags/), so a ZIP-only extractor is a real
-   build target rather than a wish.
+[Technical architecture](/project/architecture/) shows how they depend on each
+other, and why each is a crate of its own.

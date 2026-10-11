@@ -171,13 +171,19 @@ impl Server {
 
 /// Wait for the server to announce its listener, and return the address it
 /// named.
+///
+/// Only a whole line counts: stderr is unbuffered, so the line reaches the log
+/// in several writes and a read can land between them.
 fn announced_addr(log: &std::path::Path) -> String {
     const MARKER: &str = "serving ICAP on tcp:";
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let text = std::fs::read_to_string(log).unwrap_or_default();
-        if let Some(rest) = text.split_once(MARKER).map(|(_, r)| r) {
-            let addr = rest
+        if let Some((line, _)) = text
+            .split_once(MARKER)
+            .and_then(|(_, rest)| rest.split_once('\n'))
+        {
+            let addr = line
                 .split_whitespace()
                 .next()
                 .expect("the announcement names an address");
@@ -189,6 +195,27 @@ fn announced_addr(log: &std::path::Path) -> String {
         "the server never announced its listener:\n{}",
         std::fs::read_to_string(log).unwrap_or_default()
     );
+}
+
+/// The helper above, on a log read between two writes of the announcement.
+#[test]
+fn a_half_written_announcement_is_waited_for() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("stderr.log");
+    std::fs::write(&log, "exav: serving ICAP on tcp:").unwrap();
+    let writer = {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(
+                &log,
+                "exav: serving ICAP on tcp:127.0.0.1:1344 (services: avscan; preview off)\n",
+            )
+            .unwrap();
+        })
+    };
+    assert_eq!(announced_addr(&log), "127.0.0.1:1344");
+    writer.join().unwrap();
 }
 
 /// A server over the built-in baseline and the default configuration.
@@ -503,6 +530,31 @@ fn options_advertises_everything_a_client_needs() {
     assert!(istag.len() <= 32, "{istag}");
 }
 
+/// `off` leaves the header out of `OPTIONS`, which RFC 3507 reads as "do not
+/// preview" and "never expires", while `0` is a value a client acts on: a
+/// headers-only preview, and asking again every time.
+#[test]
+fn off_leaves_preview_and_options_ttl_out_where_0_sends_them() {
+    let options = |extra: &[&str]| {
+        let s = Server::start(TempDir::new().unwrap(), extra);
+        let mut c = s.connect();
+        c.send(b"OPTIONS icap://127.0.0.1/avscan ICAP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+        c.recv()
+    };
+    let r = options(&[
+        "--icap-preview-bytes",
+        "off",
+        "--icap-options-ttl-secs",
+        "off",
+    ]);
+    assert_eq!(r.code, 200, "{r:?}");
+    assert!(!r.has_header("Preview"), "{r:?}");
+    assert!(!r.has_header("Options-TTL"), "{r:?}");
+    let r = options(&["--icap-preview-bytes", "0", "--icap-options-ttl-secs", "0"]);
+    assert_eq!(r.header("Preview"), Some("0"), "{r:?}");
+    assert_eq!(r.header("Options-TTL"), Some("0"), "{r:?}");
+}
+
 #[test]
 fn the_istag_encodes_the_signature_set() {
     // Two servers with different databases must not share an ISTag, or a proxy
@@ -774,10 +826,12 @@ fn an_object_past_the_size_limit_blocks_rather_than_passing() {
 
     assert_eq!(r.code, 200, "an unscanned object must not get a 204: {r:?}");
     assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
-    // Word for word what the clamd listener says about a stream this size.
-    // There is one size setting, and it does not answer differently depending
-    // on which port the object arrived at.
-    assert_eq!(r.header("X-Exav-Reason"), Some("size exceeds 1024"));
+    // Word for word what the clamd listener and a file path say about an
+    // object this size: it is one scan, whatever the object arrived through.
+    assert_eq!(
+        r.header("X-Exav-Reason"),
+        Some("file size 65536 exceeds max-input-bytes 1024; scanned first 1024 bytes only")
+    );
     // Blocked in the c-icap vocabulary too, under a name that says which
     // condition blocked it rather than borrowing a database signature's.
     assert_eq!(
@@ -1208,7 +1262,7 @@ fn an_object_with_nowhere_to_spill_gets_a_verdict_rather_than_a_dropped_connecti
     let r = c.recv();
 
     assert_eq!(r.code, 200, "an object nobody buffered is not a 204: {r:?}");
-    assert_eq!(r.header("X-Exav-Category"), Some("UNSCANNABLE"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(
         r.header("X-Exav-Reason")
             .unwrap_or_default()
@@ -1263,7 +1317,7 @@ fn no_spill_keeps_scanned_bytes_off_the_disk() {
     ));
     let r = c.recv();
     assert_eq!(r.code, 200, "{r:?}");
-    assert_eq!(r.header("X-Exav-Category"), Some("UNSCANNABLE"));
+    assert_eq!(r.header("X-Exav-Category"), Some("LIMITS-EXCEEDED"));
     assert!(
         r.header("X-Exav-Reason")
             .unwrap_or_default()
@@ -1272,6 +1326,26 @@ fn no_spill_keeps_scanned_bytes_off_the_disk() {
     );
     // Still delivered on a connection that survives, like any other verdict.
     assert_eq!(r.header("Connection"), Some("keep-alive"), "{r:?}");
+
+    // What was held of it is still scanned: a detection there is found.
+    let mut held = eicar().to_vec();
+    held.resize(256 * 1024, b'A');
+    let mut c = s.connect();
+    c.send(&request(
+        "RESPMOD",
+        "avscan",
+        Some(REQ_HDR),
+        Some(RES_HDR),
+        Some(&held),
+        &["Allow: 204"],
+    ));
+    let r = c.recv();
+    assert!(
+        r.header("X-Infection-Found")
+            .is_some_and(|v| v.contains("Threat=Eicar-Test-Signature;")),
+        "{r:?}"
+    );
+    assert!(!r.has_header("X-Exav-Category"), "{r:?}");
 
     // That verdict is itself the evidence no file was written: had one been,
     // the object would have been buffered, scanned, and answered `204`. There is

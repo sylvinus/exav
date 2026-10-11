@@ -159,21 +159,27 @@ impl ArjArchive {
     }
 
     pub fn skip(&mut self, header: &LocalFileHeader) -> bool {
-        let skip_to = self.pos + header.compressed_size as usize;
-        if skip_to <= self.data.len() {
-            self.pos = skip_to;
-            true
-        } else {
-            false
+        match self.member_end(header) {
+            Some(skip_to) => {
+                self.pos = skip_to;
+                true
+            }
+            None => false,
         }
     }
 
+    /// Where the member's data ends, if it lies inside the file (the sum wraps
+    /// on a 32-bit build).
+    fn member_end(&self, header: &LocalFileHeader) -> Option<usize> {
+        let end = self.pos.checked_add(header.compressed_size as usize)?;
+        (end <= self.data.len()).then_some(end)
+    }
+
     pub fn read(&mut self, header: &LocalFileHeader, verify_checksum: bool) -> Option<Vec<u8>> {
-        let end = self.pos + header.compressed_size as usize;
-        if end > self.data.len() {
+        let Some(end) = self.member_end(header) else {
             self.skip(header);
             return None;
-        }
+        };
         let raw = self.data[self.pos..end].to_vec();
         self.pos = end;
 
@@ -248,5 +254,23 @@ impl ArjArchive {
             | CompressionMethod::NoData
             | CompressionMethod::Unknown(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A member whose data starts at the top of the address space has no end
+    /// inside the file: the sum is refused, not wrapped.
+    #[test]
+    fn a_member_past_the_top_of_the_address_space_is_not_in_the_file() {
+        let path = format!("{}/tests/fixtures/sample.arj", env!("CARGO_MANIFEST_DIR"));
+        let mut arc = ArjArchive::new(std::fs::read(path).unwrap()).unwrap();
+        let header = arc.get_next_entry().unwrap();
+        assert!(header.compressed_size > 0);
+        arc.pos = usize::MAX - 3;
+        assert!(!arc.skip(&header));
+        assert!(arc.read(&header, false).is_none());
     }
 }

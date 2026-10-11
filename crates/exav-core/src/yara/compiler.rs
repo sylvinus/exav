@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use yara_x_parser::ast::AST;
 use yara_x_parser::ast::{
@@ -238,6 +239,7 @@ impl Compiler {
         let gate = PatternGate::from_gates(&self.atom_gates);
         Rules {
             patterns: self.patterns,
+            stream_regexes: self.defs.iter().map(|_| OnceLock::new()).collect(),
             defs: self.defs,
             pattern_names: self.pattern_names,
             rules: self.rules,

@@ -1,0 +1,162 @@
+{
+  "name": "@exav/viewer",
+  "version": "0.0.2",
+  "type": "module",
+  "description": "An embeddable file viewer for the browser: PDF, images (TIFF, BMP and more through memory-safe WebAssembly), DWG and DXF drawings, Word, Excel, PowerPoint, CSV, IFC and STL models, video, audio, and what is inside an archive. Each format's engine loads only when a file of that format is opened.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sylvinus/exav.git",
+    "directory": "crates/exav-viewer"
+  },
+  "homepage": "https://exav.org/viewer/",
+  "bugs": {
+    "url": "https://github.com/sylvinus/exav/issues"
+  },
+  "author": "Sylvain Zimmer",
+  "keywords": [
+    "viewer",
+    "pdf",
+    "dwg",
+    "dxf",
+    "cad",
+    "ifc",
+    "docx",
+    "xlsx",
+    "tiff",
+    "wasm",
+    "webassembly",
+    "react"
+  ],
+  "sideEffects": [
+    "*.css"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/core/index.d.ts",
+      "default": "./dist/core/index.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "default": "./dist/react/index.js"
+    },
+    "./react/sandbox": {
+      "types": "./dist/react/sandbox.d.ts",
+      "default": "./dist/react/sandbox.js"
+    },
+    "./styles.css": "./dist/react/styles.css",
+    "./pdf": {
+      "types": "./dist/pdf/index.d.ts",
+      "default": "./dist/pdf/index.js"
+    },
+    "./image": {
+      "types": "./dist/image/index.d.ts",
+      "default": "./dist/image/index.js"
+    },
+    "./office": {
+      "types": "./dist/office/index.d.ts",
+      "default": "./dist/office/index.js"
+    },
+    "./cad": {
+      "types": "./dist/cad/index.d.ts",
+      "default": "./dist/cad/index.js"
+    },
+    "./cad/plugin": {
+      "types": "./dist/cad/plugin.d.ts",
+      "default": "./dist/cad/plugin.js"
+    },
+    "./ifc": {
+      "types": "./dist/ifc/index.d.ts",
+      "default": "./dist/ifc/index.js"
+    },
+    "./model": {
+      "types": "./dist/model/index.d.ts",
+      "default": "./dist/model/index.js"
+    },
+    "./media": {
+      "types": "./dist/media/index.d.ts",
+      "default": "./dist/media/index.js"
+    },
+    "./archive": {
+      "types": "./dist/archive/index.d.ts",
+      "default": "./dist/archive/index.js"
+    },
+    "./all": {
+      "types": "./dist/all.d.ts",
+      "default": "./dist/all.js"
+    },
+    "./frame": {
+      "types": "./dist/frame/index.d.ts",
+      "default": "./dist/frame/index.js"
+    },
+    "./vite": {
+      "types": "./dist/vite/index.d.ts",
+      "default": "./dist/vite/index.js"
+    },
+    "./assets/*": "./assets/*",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "exav-viewer-assets": "./dist/vite/cli.js"
+  },
+  "files": [
+    "dist",
+    "wasm/*.js",
+    "wasm/*.d.ts",
+    "wasm/*.wasm",
+    "assets",
+    "LICENSE",
+    "LICENSES",
+    "NOTICE",
+    "README.md"
+  ],
+  "scripts": {
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p demo/tsconfig.json && tsc -p e2e/tsconfig.json",
+    "demo": "vite --config demo/vite.config.ts",
+    "demo:build": "vite build --config demo/vite.config.ts",
+    "demo:showcase": "node scripts/sync-samples.mjs",
+    "prepublishOnly": "node scripts/check-package.mjs"
+  },
+  "peerDependencies": {
+    "@exav/unpack-wasm": ">=0.0.2",
+    "@silurus/ooxml": ">=0.87.0 <1",
+    "pdfjs-dist": ">=5.0.0 <7",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": ">=0.170.0 <1"
+  },
+  "peerDependenciesMeta": {
+    "@exav/unpack-wasm": { "optional": true },
+    "@silurus/ooxml": { "optional": true },
+    "pdfjs-dist": { "optional": true },
+    "react": { "optional": true },
+    "react-dom": { "optional": true },
+    "three": { "optional": true }
+  },
+  "devDependencies": {
+    "@exav/unpack-wasm": "file:../exav-unpack-wasm",
+    "@playwright/test": "1.61.1",
+    "@silurus/ooxml": "^0.88.0",
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "^0.186.0",
+    "esbuild": "0.28.2",
+    "jsdom": "^26.1.0",
+    "pdfjs-dist": "^6.4.299",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "three": "^0.186.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6",
+    "vitest": "^3.2.7",
+    "webpack": "5.111.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,4 @@
+Fuzz.Cdb.DualExt:CL_TYPE_ZIP:*:^[^/\\]+\.(doc|xls|pdf)\.(js|exe)$:*:*:*:*:*:*
+Fuzz.Cdb.Encrypted:CL_TYPE_ZIP:*:.*:*:*:1:*:*:*
+Fuzz.Cdb.Size:CL_TYPE_ANY:100-1000000:.*\.scr:*:*:*:*:*:*
+Fuzz.Cdb.Tar:CL_TYPE_TAR:*:.*:1-4096:*:*:0:*:*:51:255

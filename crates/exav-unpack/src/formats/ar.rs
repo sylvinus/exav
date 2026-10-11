@@ -13,6 +13,17 @@ fn parse_decimal(field: &[u8]) -> u64 {
     s.parse().unwrap_or(0)
 }
 
+/// Walk an `ar` archive, each member streamed from where it lies.
+pub(crate) fn walk<T>(
+    src: &dyn crate::source::ByteSource,
+    budget: &mut Budget,
+    visit: crate::stream::Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let mut source = crate::source::Reader::new(src);
+    let members = stream_offsets(&mut source, budget.limits().max_buffer_bytes)?;
+    crate::stream::stream_stored(&mut source, budget, visit, members)
+}
+
 /// Parse member offsets from a seekable source (the reader-based streaming
 /// path): walk the 60-byte headers, resolving GNU long names via the `//` string
 /// table, and return each *file* member as `(name, data_offset, size)`. Symbol
@@ -64,65 +75,6 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         pos = body + size + (size & 1);
     }
     Ok(out)
-}
-
-pub(crate) fn extract_ar<R>(
-    data: &[u8],
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    if !data.starts_with(MAGIC) {
-        return Err(LimitHit::new("ar: bad magic".to_string()));
-    }
-    let mut pos = MAGIC.len();
-    // GNU long-name string table ("//" member), if present.
-    let mut name_table: Vec<u8> = Vec::new();
-
-    while pos + 60 <= data.len() {
-        let hdr = &data[pos..pos + 60];
-        if &hdr[58..60] != b"`\n" {
-            break; // not a valid header; stop rather than misread
-        }
-        let raw_name = &hdr[0..16];
-        let size = parse_decimal(&hdr[48..58]) as usize;
-        let body = pos + 60;
-        let end = body.saturating_add(size).min(data.len());
-        // Clamped to EOF: a member declaring more than the archive holds is
-        // truncated, and every byte that exists is still scanned. Absent, not
-        // hidden — so this stays a normal member. See docs/QUIRKS.md.
-        let member = &data[body..end];
-
-        let name = resolve_name(raw_name, &name_table);
-        match name.as_str() {
-            // GNU string table: holds long names referenced as "/<offset>".
-            // Bounded by the global peak-buffer limit like any materialized blob.
-            "//" => {
-                if member.len() as u64 > budget.limits.max_buffer_bytes {
-                    return Err(LimitHit::new(
-                        "ar name table exceeds max-buffer".to_string(),
-                    ));
-                }
-                name_table = member.to_vec();
-            }
-            // Symbol tables, not file content.
-            "/" | "/SYM64/" | "__.SYMDEF" => {}
-            _ => {
-                budget.count_entry()?;
-                let cap = budget.reserve()?;
-                if member.len() as u64 > cap {
-                    return Err(LimitHit::new(format!("ar member '{name}' exceeds budget")));
-                }
-                budget.commit(member.len() as u64);
-                if let Some(r) = visit(Entry::new(name, member.to_vec()), budget) {
-                    return Ok(Some(r));
-                }
-            }
-        }
-
-        // Members are padded to an even byte boundary.
-        pos = end + (size & 1);
-    }
-    Ok(None)
 }
 
 /// Resolve an `ar` member name, handling GNU (`/N` → string table) and BSD

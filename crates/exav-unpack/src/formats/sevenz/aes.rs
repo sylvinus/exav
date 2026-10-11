@@ -5,7 +5,7 @@
 //! a single hash context is updated with `salt || password_utf16le || counter`
 //! (`counter` a little-endian `u64`, incremented each round) `2^numCyclesPower`
 //! times, then finalised. The IV and salt travel in the coder properties. This
-//! is the decrypt half only — no key wrapping, no RNG.
+//! is the decrypt half only: no key wrapping, no RNG.
 //!
 //! Only the *data* layer is handled here (the common `7z a -p…` case, plaintext
 //! header). Archives with an AES-encrypted *header* (`-mhe=on`) fail to parse
@@ -16,12 +16,12 @@
 //! the downstream codec rejects (never a panic, never emitted as data).
 
 use crate::LimitHit;
-use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
 use sha2::{Digest, Sha256};
 use std::io::{self, Cursor, Read};
 
 /// The special `numCyclesPower` meaning "use the passphrase (with salt) verbatim
-/// as the key" — no hashing.
+/// as the key", with no hashing.
 const NO_HASH_CYCLES: u32 = 0x3f;
 
 /// Upper bound on `numCyclesPower` we will run the KDF for. The 7-Zip default is
@@ -133,7 +133,7 @@ pub(super) struct Aes7zReader {
 impl Aes7zReader {
     /// Build the decryptor for a 7zAES coder. `password` is the passphrase to
     /// try. Returns an error if the properties are malformed, no password was
-    /// supplied, or the KDF cost is out of range — the caller maps that to the
+    /// supplied, or the KDF cost is out of range; the caller maps that to the
     /// existing "encrypted / unsupported" outcome.
     pub(super) fn new(
         inner: Box<dyn Read>,
@@ -165,7 +165,7 @@ impl Aes7zReader {
         let full = ct.len() - (ct.len() % 16);
         ct.truncate(full);
         let pt = cbc::Decryptor::<aes::Aes256>::new(&self.key.into(), &self.iv.into())
-            .decrypt_padded_mut::<NoPadding>(&mut ct)
+            .decrypt_padded::<NoPadding>(&mut ct)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "7z AES decrypt"))?
             .to_vec();
         self.plain = Cursor::new(pt);
@@ -185,7 +185,7 @@ impl Read for Aes7zReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cbc::cipher::BlockEncryptMut;
+    use cbc::cipher::BlockModeEncrypt;
 
     /// AES-256-CBC encrypt with NoPadding (test-only, mirrors the decrypt path)
     /// to build a ciphertext the reader must recover.
@@ -194,7 +194,7 @@ mod tests {
         data.resize(data.len() + pad, 0);
         let n = data.len();
         cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into())
-            .encrypt_padded_mut::<NoPadding>(&mut data, n)
+            .encrypt_padded::<NoPadding>(&mut data, n)
             .unwrap()
             .to_vec()
     }

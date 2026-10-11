@@ -14,7 +14,8 @@
 //! 7zz a -t7z -mx=9 -mf=BCJ2 bcj2.7z sample.bin eicar.txt
 //! ```
 
-use exav_unpack::{extract_each, Budget, Entry, Format, Limits};
+use super::extract_each;
+use exav_unpack::{Budget, Entry, Format, Limits};
 
 /// `sha256sum` of the members as extracted by `7zz x`.
 const SAMPLE_SHA256: &str = "fb051a6c58961fb6aec758acf50d7d0375eecff740d0706388092829e3fb7a41";
