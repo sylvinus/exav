@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # ct needs history to diff the target branch
+          # `make test-helm` runs the repository's own script: it gets no token.
+          persist-credentials: false
       - uses: azure/setup-helm@v5
       - uses: helm/chart-testing-action@v2.8.0
       - name: ct lint
@@ -39,6 +41,8 @@ jobs:
       packages: write # push to ghcr.io
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: azure/setup-helm@v5
       - name: Verify the tag matches the workspace version
         run: |
