@@ -271,7 +271,8 @@ for c in "${CRATES[@]}"; do
   # fails if it runs before this one is queryable.
   echo "waiting for the index to catch up..."
   for _ in $(seq 1 60); do
-    code="$(curl -sS -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/$c/$VERSION" || echo 000)"
+    # With a User-Agent: crates.io answers 403 to a request without a named one.
+    code="$(curl -sS -A "exav-release-check/$VERSION" -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/$c/$VERSION" || echo 000)"
     [ "$code" = "200" ] && break
     sleep 5
   done
