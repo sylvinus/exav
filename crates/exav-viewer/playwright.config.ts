@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import { defineConfig } from "@playwright/test";
 
 // Against the demo as built for production (`npm run demo:build`): the
@@ -32,8 +34,15 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      // WebGL in a headless Chromium without a GPU.
-      use: { browserName: "chromium", launchOptions: { args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] } },
+      // WebGL in a headless Chromium without a GPU, and text without subpixel
+      // antialiasing on Linux (e2e/fonts.conf).
+      use: {
+        browserName: "chromium",
+        launchOptions: {
+          args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
+          env: { ...process.env, FONTCONFIG_FILE: fileURLToPath(new URL("./e2e/fonts.conf", import.meta.url)) },
+        },
+      },
     },
     // The sandboxed frame's guarantees, and text selection, in the other engines.
     { name: "firefox", testMatch: /(frame|delivery|selection)\.spec\.ts/, use: { browserName: "firefox" } },
