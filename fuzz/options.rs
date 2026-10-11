@@ -47,6 +47,11 @@ pub fn scan_options(bits: u16) -> ScanOptions {
         // PCRE over megabytes of text is the sanitizer's seconds, in all-match
         // mode, which runs every signature to the end.
         o.max_pcre_bytes = Some(1 << 16);
+        // The most an object held whole may take, which is also the budget a
+        // `fuzzy_img#` decode gets: a 486-byte JPEG 2000 stream declaring
+        // 2,097,181 by 17 pixels is 1.5 s in a release build and over 14 s
+        // under the sanitizer, within the default's 256 MiB.
+        o.deep_analysis_max = 8 << 20;
     }
     // An object over this is read through the block cache, which is another
     // way in than a buffer.
