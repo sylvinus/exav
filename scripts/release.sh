@@ -18,6 +18,9 @@
 #   scripts/release.sh --gate-only    # run the checks and stop (safe anywhere)
 #   scripts/release.sh --dry-run      # gate + `cargo publish --dry-run`, no upload
 #   scripts/release.sh --yes          # skip the interactive pause (CI/automation)
+#   scripts/release.sh --skip-tests   # leave out `make test-native`, for a run
+#                                     # right after one that passed it (the
+#                                     # rest of the gate still runs)
 #
 # REQUIREMENTS:
 #   - a crates.io token (`cargo login`) for a real publish
@@ -32,11 +35,13 @@ CARGO="${CARGO:-cargo}"
 GATE_ONLY=0
 DRY_RUN=0
 ASSUME_YES=0
+SKIP_TESTS=0
 for arg in "$@"; do
   case "$arg" in
     --gate-only) GATE_ONLY=1 ;;
     --dry-run)   DRY_RUN=1 ;;
     --yes|-y)    ASSUME_YES=1 ;;
+    --skip-tests) SKIP_TESTS=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -84,7 +89,11 @@ $CARGO clippy -p exav-render --all-targets --no-default-features --features ifc,
 
 step "Tests"
 # The native matrix; `make test` additionally needs wasmtime and node.
-make test-native || fail "make test-native"
+if [ "$SKIP_TESTS" = 1 ]; then
+  echo "  SKIPPED (--skip-tests): run \`make test-native\` on this commit first"
+else
+  make test-native || fail "make test-native"
+fi
 
 step "MSRV $MSRV actually builds"
 # `rust-version` is a promise to anyone pinning an older toolchain, and nothing
