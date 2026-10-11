@@ -249,8 +249,10 @@ for (const mode of ["sandbox", "page"] as const) {
         const stage = engine(page).locator(".exv-image-stage");
         await settled(page.locator(".demo-frame .exv-surface"));
         for (let i = 0; i < 2; i++) await tools.getByRole("button", { name: "Zoom in" }).click();
+        // Both clicks applied: the second reaches the surface a frame after the
+        // first, and a read between them saw one step (`scale(1.25)`) on CI.
+        await expect.poll(() => stage.evaluate((el) => el.style.transform)).toMatch(/scale\(1\.56/);
         const zoomed = await stage.evaluate((el) => el.style.transform);
-        expect(zoomed).toMatch(/scale\(1\.56/);
         const picture = engine(page).locator(".exv-image-picture");
         const before = await picture.evaluate((el) => (el as HTMLImageElement).src);
         // The file again, as the user gives it: another object, the same name.
