@@ -33,6 +33,24 @@ It is vendored rather than depended on because a crate published on crates.io
 can only depend on crates.io releases: `cargo install exav` would build the
 release without the fixes.
 
+## Two fixes of exav's own
+
+`compile.rs`: the delegated regex-automata engines are configured with
+`utf8_empty(false)` outside `BytesMode::Unicode`. With its default (`true`) an
+engine skips an empty match at a position inside what would be a UTF-8
+sequence, so a delegated `x*` found no match before a byte over 0x7F, and
+`(\bb)x*` did not match `b\x9e`. Pinned by the same test as the next fix.
+
+`vm.rs`: in `BytesMode::Ascii`, `\b`, `\B` and `\b{start}`/`\b{end}` (and their
+half forms) read a word character as an ASCII one, as `\w` does. 0.19.2 asks
+regex-automata's Unicode boundary in every mode, which decodes the bytes beside
+the position as UTF-8: `\bab` did not match `1\x9aab` (the byte `\x9a` was read
+with the `1` before it), where `regex` and PCRE2 find a boundary after `\x9a`,
+no word character. Found by `fuzz/fuzz_targets/pcre.rs`, pinned by
+`a_word_boundary_beside_a_high_byte_reads_the_same_in_both_engines` in
+`engine/pcre.rs`. Not yet reported upstream: when it is, say so here, and drop
+the change once a release carries the fix.
+
 ## What differs from upstream's `src/`
 
 Only what building it as a module of exav-core takes:
@@ -61,4 +79,6 @@ Once a release has both fixes (0.19.3 or later):
 3. `crate::fancy_regex::` becomes `fancy_regex::` in `engine/mod.rs` and
    `engine/pcre.rs`.
 4. `cargo test -p exav-core pcre`: the cases there with a byte above 0x7F in a
-   lookaround or back reference fail without the fixes.
+   lookaround or back reference fail without the fixes, and
+   `a_word_boundary_beside_a_high_byte_reads_the_same_in_both_engines` fails
+   unless the release also has the ASCII word boundary fix above.

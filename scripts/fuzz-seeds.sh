@@ -18,10 +18,12 @@
 #   - SKIP, inputs slow by design, which libFuzzer would report as a timeout
 #     on its first pass (docs/FUZZING.md, "Seeding strategy").
 #
-# Targets without fixtures of their input format get no directory:
-# x86_decode, rar3_ppmd and parser_recursion take framed input, and no
-# signature, CVD or bytecode file is committed for sigs, ndb_compile, cvd and
-# bytecode.
+# Targets whose input is framed (full_pipeline, seekable, volumes, yara, pcre)
+# get the fixtures behind the frame's header, or seeds written for them
+# (fuzz/seeds/); cvd and database get a container and a database made from
+# fuzz/db/. x86_decode, rar3_ppmd, parser_recursion, clamd and icap take framed
+# or structured input no file is committed in: sigs, ndb_compile and bytecode
+# start from nothing, and the structured two decode any bytes.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,7 +33,7 @@ SKIP="crates/exav-unpack/tests/fixtures/rar/ppmd_lzss_conversion.rar"
 
 cd "$ROOT"
 rm -rf "$OUT"
-mkdir -p "$OUT"/{containers,pe,drawing,imagehash,cad_dxf,cad_dwg,ifc}
+mkdir -p "$OUT"/{containers,pe,drawing,imagehash,cad_dxf,cad_dwg,ifc,full_pipeline,seekable,volumes,yara,pcre,cvd,database,authenticode}
 
 # Tracked files, and new ones not yet committed (but not ignored ones).
 files() { git ls-files -co --exclude-standard -- "$@"; }
@@ -119,9 +121,131 @@ while IFS= read -r f; do add "$f" "$OUT/ifc"; done < <(
     'crates/exav-render/tests/fixtures/viewer/*'
 )
 
-for t in analyze full_pipeline unpack filetype; do ln -sfn containers "$OUT/$t"; done
+# full_pipeline: a zero header (no option bits, no database files: the
+# signatures are fuzz/db/'s) in front of each fixture. seekable: no option
+# bits, reads of 297 bytes, no failure.
+for f in "$OUT"/containers/*; do
+  name="$(basename "$f")"
+  { printf '\000\000\000'; cat "$f"; } >"$OUT/full_pipeline/$name"
+  { printf '\000\000\010\000'; cat "$f"; } >"$OUT/seekable/$name"
+done
+
+# full_pipeline also gets the files of fuzz/db/ in the header, one a seed and
+# eight of them in one, over a text that several of their signatures match
+# (the kind byte indexes `KINDS` in fuzz/db.rs, bit 7 is "official").
+python3 - "$OUT/full_pipeline" <<'PY'
+import os, struct, sys
+kinds = ["ndb","ldb","hdb","hsb","mdb","msb","cdb","ftm","yar","pdb","gdb","wdb","fdb","imp","crb","db","fp","sfp","ign","ign2","pwdb","cbc","idb"]
+scan = (b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\n"
+        b"hello world MARKER secret ab cd ab payload macro work doc ABCD\n")
+def frame(files):
+    out = struct.pack("<HB", 0, len(files))
+    for k, b in files:
+        out += bytes([k]) + struct.pack("<H", len(b)) + b
+    return out + scan
+allfiles = []
+for name in sorted(os.listdir("fuzz/db")):
+    ext = name.rsplit(".", 1)[-1]
+    if not name.startswith("fuzz.") or ext not in kinds:
+        continue
+    b = open("fuzz/db/" + name, "rb").read()[:65535]
+    allfiles.append((kinds.index(ext), b))
+    open(f"{sys.argv[1]}/db_{ext}", "wb").write(frame([allfiles[-1]]))
+for i in range(0, len(allfiles), 8):
+    open(f"{sys.argv[1]}/db_set{i // 8}", "wb").write(frame(allfiles[i:i + 8]))
+PY
+
+# authenticode: the signed PEs, and the PEs among the fixtures.
+cp crates/exav-core/tests/fixtures/authenticode/*.exe "$OUT/authenticode/"
+cp "$OUT"/pe/* "$OUT/authenticode/" 2>/dev/null || true
+
+# cvd: fuzz/db/ as a signature container; database: the same, built by exav
+# into a prebuilt database (needs a build of the `exav` binary: $EXAV, or
+# cargo builds one).
+python3 - "$OUT/cvd/fuzz.cvd" <<'PY'
+import gzip, io, os, sys, tarfile
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as tar:
+    for name in sorted(os.listdir("fuzz/db")):
+        if name.startswith("fuzz."):
+            tar.add(os.path.join("fuzz/db", name), arcname=name)
+head = b"ClamAV-VDB:01 Jan 2026 00-00 +0000:1:1:90:" + b"0" * 32 + b":dsig:exav-fuzz:1700000000"
+with open(sys.argv[1], "wb") as out:
+    out.write(head.ljust(512, b" "))
+    out.write(gzip.compress(buf.getvalue()))
+PY
+printf 'MZ\220\000 sample\n' >"$OUT/database/sample.bin"
+exav="${EXAV:-}"
+if [ -z "$exav" ] && cargo build -q -p exav; then
+  exav="${CARGO_TARGET_DIR:-target}/debug/exav"
+fi
+if [ -x "$exav" ]; then
+  "$exav" -d fuzz/db --build-db "$OUT/database/fuzz.exavdb" "$OUT/database/sample.bin" >/dev/null 2>&1
+else
+  echo "warning: no exav binary, so no seed for the database target" >&2
+fi
+rm -f "$OUT/database/sample.bin"
+
+# yara: [rule length: u16 LE] [rules] [data]. The rules of fuzz/db/ and
+# fuzz/seeds/yara/, each over a PE, an ELF and some text.
+python3 - "$OUT/yara" <<'PY'
+import glob, os, struct, sys
+out = sys.argv[1]
+data = [
+    open("crates/exav-core/tests/testdata/tiny_pe32.exe", "rb").read(),
+    open("crates/exav-core/tests/testdata/tiny_elf64", "rb").read(),
+    b"hello world MARKER secret ab cd ab payload\n",
+]
+rules = ["fuzz/db/fuzz.yar"] + sorted(glob.glob("fuzz/seeds/yara/*.yar"))
+for r in rules:
+    text = open(r, "rb").read()[:4096]
+    for i, d in enumerate(data):
+        name = os.path.basename(r).replace(".", "_") + f"_{i}"
+        with open(os.path.join(out, name), "wb") as f:
+            f.write(struct.pack("<H", len(text)) + text + d)
+PY
+
+# pcre: [flags: u8, bits for i s m x E U] [pattern length: u16 LE] [pattern]
+# [haystack], from fuzz/seeds/pcre/patterns.txt.
+python3 - "$OUT/pcre" <<'PY'
+import struct, sys
+out = sys.argv[1]
+n = 0
+for line in open("fuzz/seeds/pcre/patterns.txt", encoding="utf-8"):
+    line = line.rstrip("\n")
+    if line.startswith("#"):
+        continue
+    flags, pattern, hay = line.split("\t")
+    bits = sum(1 << i for i, l in enumerate("ismxEU") if l in flags)
+    p = pattern.encode()
+    h = hay.encode().decode("unicode_escape").encode("latin-1", "replace")
+    with open(f"{out}/p{n:03}", "wb") as f:
+        f.write(bytes([bits]) + struct.pack("<H", len(p)) + p + h)
+    n += 1
+PY
+
+# volumes: the RAR sets of exav-unpack's fixtures, in the order and under the
+# kinds `NAMES` in fuzz_targets/volumes.rs gives their names.
+python3 - "$OUT/volumes" <<'PY'
+import struct, sys
+fx = "crates/exav-unpack/tests/fixtures/rar_volumes/"
+sets = {
+    "set5": [(5, "set5.part1.rar"), (6, "set5.part2.rar"), (7, "set5.part3.rar")],
+    "set4": [(9, "set4.r00"), (10, "set4.r01"), (8, "set4.rar")],
+    "set4_inorder": [(8, "set4.rar"), (9, "set4.r00"), (10, "set4.r01")],
+    "set5_gap": [(5, "set5.part1.rar"), (7, "set5.part3.rar")],
+}
+for name, parts in sets.items():
+    body = bytearray(struct.pack("<HB", 0, len(parts)))
+    for kind, f in parts:
+        d = open(fx + f, "rb").read()[:65535]
+        body += bytes([kind]) + struct.pack("<H", len(d)) + d
+    open(f"{sys.argv[1]}/{name}", "wb").write(bytes(body))
+PY
+
+for t in analyze unpack filetype; do ln -sfn containers "$OUT/$t"; done
 ln -sfn pe "$OUT/pe_emulator"
 
-for d in containers pe drawing imagehash cad_dxf cad_dwg ifc; do
+for d in containers pe drawing imagehash cad_dxf cad_dwg ifc full_pipeline seekable volumes yara pcre cvd database authenticode; do
   echo "$d: $(find "$OUT/$d" -type f | wc -l) seeds"
 done

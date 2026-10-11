@@ -3,7 +3,8 @@
 //! 2000 and JBIG2 included), with both presets' grey conversions and resizes,
 //! within a small decode budget; then exav-render's `decode_any`, and the
 //! JPXDecode, JBIG2Decode and CCITTFaxDecode decoders @exav/viewer gives
-//! pdf.js, with parameters taken from the input's length.
+//! pdf.js, with parameters taken from the input's length (JBIG2 with and
+//! without a globals stream).
 use exav_imagehash::{Hasher, Params};
 use exav_render::pdf_image::{decode_ccitt, decode_jbig2, decode_jpx, CcittParams, JpxParams};
 use libfuzzer_sys::fuzz_target;
@@ -38,6 +39,11 @@ fuzz_target!(|data: &[u8]| {
         _ => data,
     };
     let _ = decode_jbig2(embedded, 97, 61, None, BUDGET);
+    // The JBIG2Globals stream a PDF shares among its images (symbol
+    // dictionaries, mostly), from the front of the input: the only way
+    // segments in one stream refer to segments in another.
+    let (globals, page) = embedded.split_at(embedded.len() / 3);
+    let _ = decode_jbig2(page, 97, 61, Some(globals), BUDGET);
     let fax = CcittParams {
         width: 97,
         height: 61,

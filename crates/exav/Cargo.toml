@@ -16,11 +16,19 @@ documentation = "https://exav.org"
 keywords.workspace = true
 categories = ["command-line-utilities", "filesystem"]
 readme = "README.md"
+# Only the fuzz crate compiles `src/fuzzing.rs` (see `[lints.rust]` below): not
+# worth publishing.
+exclude = ["src/fuzzing.rs"]
 description = "A fast, memory-safe malware scanner: a scanning CLI and a clamd- and ICAP-compatible daemon that load ClamAV's own signature databases, with no file-size limit."
 
 [[bin]]
 name = "exav"
 path = "src/main.rs"
+
+# `fuzzing` is a feature of `fuzz/exav-cli`, which compiles `src/main.rs` as a
+# library for the fuzz targets; it is not one of this package's.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("fuzzing"))'] }
 
 [features]
 default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap", "image-hash"]

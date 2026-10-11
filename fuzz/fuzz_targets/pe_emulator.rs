@@ -14,10 +14,11 @@
 //!   overflow checks on, so a single missed wrapping operation in the
 //!   interpreter is a panic, and a panic is a denial of service on a scanner
 //!   that is handed the file by an attacker.
-//! * **The decoder.** `iced-x86` is the only dependency the emulated bytes
-//!   reach, and it contains `unsafe`. exav's own emulator code forbids it, so
-//!   this is the sharpest path from a crafted instruction stream to host memory,
-//!   and it should be fuzzed through the entry point exav actually uses.
+//! * **The decoder.** The emulated bytes reach `exav-x86`, whose decoder is
+//!   hand-written (and `forbid(unsafe_code)`, as the emulator is): a wrong length
+//!   there desynchronises every instruction after it. It is fuzzed on its own
+//!   against `iced-x86` by `x86_decode`, and here through the entry point exav
+//!   actually uses.
 //!
 //! Budgets are tight on purpose: the point is coverage per second, not letting
 //! one input run a hundred million instructions.

@@ -491,7 +491,11 @@ impl PatternMatcher {
                         }
                     }
                 }
-                // XOR: scan every position for every key.
+                // XOR: a position can only match with the key that turns its
+                // first byte into the needle's (an exact comparison), so the
+                // keys are not tried one by one. `nocase` is not combined with
+                // `xor`, but a needle that were would match two keys: it keeps
+                // the loop over the range.
                 Some((s, e)) => {
                     let keys: Vec<u8> = (*s..=*e).collect();
                     for n in needles {
@@ -500,7 +504,17 @@ impl PatternMatcher {
                         }
                         let last = data.len() - n.bytes.len();
                         for pos in keep.start..keep.end.min(last + 1) {
-                            for &key in &keys {
+                            let first;
+                            let candidates: &[u8] = if n.nocase {
+                                &keys
+                            } else {
+                                first = [data[pos] ^ n.bytes[0]];
+                                if first[0] < *s || first[0] > *e {
+                                    continue;
+                                }
+                                &first
+                            };
+                            for &key in candidates {
                                 if needle_hit(data, pos, n, key) {
                                     let end = pos + n.bytes.len();
                                     if !*fullword || verify_full_word(data, pos, end, n.wide, key) {
@@ -1019,6 +1033,61 @@ mod tests {
     fn a_stored_base64_alphabet_of_the_wrong_length_is_refused() {
         assert!(base64_def(b"YWJj", b"abc", Some("abc")).compile().is_err());
         assert!(base64_def(b"YWJj", b"abc", None).compile().is_ok());
+    }
+
+    fn xor_offsets(rule: &str, data: &[u8]) -> Vec<usize> {
+        let rules = crate::yara::compile(rule).unwrap();
+        let results = crate::yara::Scanner::new(&rules).scan(data).unwrap();
+        let mut found = Vec::new();
+        for r in results.matching_rules() {
+            for p in r.patterns() {
+                found.extend(p.matches().map(|m| m.offset()));
+            }
+        }
+        found
+    }
+
+    /// Each key of `xor(1-255)` finds the needle where it was encoded with it,
+    /// and the plain needle (key 0) is outside the range.
+    #[test]
+    fn xor_finds_each_key_where_it_was_used() {
+        let mut data = vec![0x55u8; 80];
+        for (at, key) in [(3usize, 1u8), (20, 0x80), (40, 255)] {
+            for (i, b) in b"secret".iter().enumerate() {
+                data[at + i] = b ^ key;
+            }
+        }
+        data[60..66].copy_from_slice(b"secret");
+        let rule = r#"rule x { strings: $a = "secret" xor(1-255) condition: $a }"#;
+        assert_eq!(xor_offsets(rule, &data), [3, 20, 40]);
+        // The same, as a wide string, and with a narrower range.
+        let wide: Vec<u8> = b"secret".iter().flat_map(|b| [b ^ 7, 7]).collect();
+        let mut data = vec![0x55u8; 40];
+        data[5..5 + wide.len()].copy_from_slice(&wide);
+        let rule = r#"rule x { strings: $a = "secret" wide xor(7-9) condition: $a }"#;
+        assert_eq!(xor_offsets(rule, &data), [5]);
+        let rule = r#"rule x { strings: $a = "secret" wide xor(8-9) condition: $a }"#;
+        assert!(xor_offsets(rule, &data).is_empty());
+    }
+
+    /// Found by `fuzz/fuzz_targets/analyze.rs` as a scan of 64 KB taking
+    /// seconds: every position was tried with every key in the range, 255
+    /// times the work. The needle's first byte decides the one key a position
+    /// can match with.
+    #[test]
+    fn a_wide_xor_range_does_not_cost_a_comparison_per_key_per_position() {
+        let rules =
+            crate::yara::compile(r#"rule x { strings: $a = "secret" xor(1-255) condition: $a }"#)
+                .unwrap();
+        let data = vec![0u8; 16 << 20];
+        let start = std::time::Instant::now();
+        let results = crate::yara::Scanner::new(&rules).scan(&data).unwrap();
+        let took = start.elapsed();
+        assert_eq!(results.matching_rules().len(), 0);
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "16 MiB took {took:?}"
+        );
     }
 
     /// A stored pattern with nothing to decode to has no match to report: it

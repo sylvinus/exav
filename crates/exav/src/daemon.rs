@@ -168,7 +168,7 @@ fn ctime_from_btime(btime: &str) -> String {
 /// A reader that can also surface file descriptors passed over the socket as
 /// `SCM_RIGHTS` ancillary data (the `FILDES` command). Non-fd transports
 /// (TCP) just return `None`.
-trait FdSource {
+pub(crate) trait FdSource {
     fn take_fd(&mut self) -> Option<File>;
 }
 
@@ -2217,7 +2217,7 @@ fn read_until<R: Read>(r: &mut BufReader<R>, delim: u8, buf: &mut Vec<u8>) -> io
 /// `IDSESSION` batch of quick scans isn't killed by a single budget spanning the
 /// whole session, and idle time between commands isn't charged to a scan.
 #[allow(clippy::too_many_arguments)]
-fn handle_conn<R, W>(
+pub(crate) fn handle_conn<R, W>(
     rd: R,
     mut writer: W,
     db: &Scanner,
@@ -2416,6 +2416,17 @@ fn dispatch<R: Read>(
     allow_http_scan: bool,
 ) -> io::Result<Vec<String>> {
     let arg = cmd[word.len()..].trim();
+    // The fuzz target feeds this arbitrary bytes, and a path in them would be
+    // opened on the machine fuzzing.
+    #[cfg(feature = "fuzzing")]
+    if matches!(
+        word.to_ascii_uppercase().as_str(),
+        "SCAN" | "CONTSCAN" | "MULTISCAN" | "ALLMATCHSCAN"
+    ) {
+        return Ok(vec![format!(
+            "{word}: paths are not read when fuzzing ERROR"
+        )]);
+    }
     let reply = match word.to_ascii_uppercase().as_str() {
         "PING" => vec!["PONG".to_string()],
         // clamd-compatible `ClamAV <release>/<db-version>/<db-time>` so version-

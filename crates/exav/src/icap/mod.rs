@@ -104,6 +104,8 @@ mod server;
 mod wire;
 
 pub(crate) use self::config::{IcapConfig, InfectionHeader};
+#[cfg(feature = "fuzzing")]
+pub(crate) use self::server::fuzz_exchange;
 pub(crate) use self::server::Server;
 
 #[cfg(unix)]

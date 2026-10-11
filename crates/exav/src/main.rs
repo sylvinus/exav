@@ -26,6 +26,10 @@
 
 mod daemon;
 mod endpoint;
+// Compiled only by `fuzz/exav-cli`, which builds this file as a library for
+// the fuzz targets (the `fuzzing` feature is that crate's).
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 #[cfg(feature = "icap")]
 mod icap;
 mod metrics;

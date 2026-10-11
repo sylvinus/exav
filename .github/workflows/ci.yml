@@ -173,6 +173,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+      # What the targets found interesting last time, so a 60 s run starts
+      # where the last one stopped. A new key each run, the newest restored.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: The fuzz crate's own tests (the mutator and the input framing)
+        run: cargo test --manifest-path fuzz/Cargo.toml -p exav-fuzz-support
       - name: cargo-fuzz smoke run
         run: |
           cargo install cargo-fuzz --locked
@@ -181,10 +194,16 @@ jobs:
           # the masked fixtures are unmasked.
           seeds="$RUNNER_TEMP/fuzz-seeds"
           scripts/fuzz-seeds.sh "$seeds"
-          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion imagehash drawing cad_dxf cad_dwg ifc; do
+          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline seekable yara pcre clamd icap volumes authenticode database ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion imagehash drawing cad_dxf cad_dwg ifc; do
             mkdir -p "fuzz/corpus/$t"
             extra=""
             [ -d "$seeds/$t" ] && extra="$seeds/$t"
+            # Strings for the targets whose input is text or a protocol.
+            dict=""
+            case "$t" in
+              yara|pcre|icap|clamd) dict="-dict=fuzz/dicts/$t.dict" ;;
+              full_pipeline|ndb_compile|sigs|cvd) dict="-dict=fuzz/dicts/signatures.dict" ;;
+            esac
             # iced-x86, the oracle x86_decode compares against, builds its
             # decoder tables in a `lazy_static` it never frees: the newest
             # nightly's LeakSanitizer reports them at exit (552 bytes, whatever
@@ -193,5 +212,5 @@ jobs:
             asan=""
             [ "$t" = x86_decode ] && asan="detect_leaks=0"
             ASAN_OPTIONS="$asan" cargo +nightly fuzz run "$t" "fuzz/corpus/$t" $extra \
-              -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+              -- $dict -max_total_time=60 -rss_limit_mb=2048 -timeout=10
           done

@@ -400,6 +400,16 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- A PCRE subsignature with `\b` or `\B` next to a byte above 0x7F found no word
+  boundary where PCRE2 does, when the byte before that one was a letter or a
+  digit (`1\x9aab` and `\bab`): the backtracking engine read the two bytes as
+  one UTF-8 character. Such a signature could miss.
+- A RAR volume set whose volume carried the number 65,535 (RAR4) or 2^64 - 1
+  (RAR5) in the wrong place was lost to a panic in building the message that
+  names it; the volume is named now.
+- A YARA `xor` pattern with a wide key range (`xor(1-255)`) cost a comparison
+  per key at every position, 255 times the work: 9 seconds for a 16 MiB object.
+  It looks at the one key a position can match with.
 - A `.Z` (`compress -b16`) or ARC file whose code table filled to 65,536
   entries was lost to a panic in its decoder: a 16-bit counter of the next free
   code overflowed. It decodes now.

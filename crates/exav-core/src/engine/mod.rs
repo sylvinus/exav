@@ -115,6 +115,9 @@ fn image_hash(_: &dyn ByteSource, _: WholeLimits) -> Option<[u8; 8]> {
 mod logic;
 mod parse;
 mod pcre;
+#[cfg(feature = "unstable-internals")]
+#[doc(hidden)]
+pub use pcre::{compare_engines, Compared};
 mod pins;
 use pins::Pins;
 use logic::*;

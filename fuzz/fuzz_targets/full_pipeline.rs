@@ -1,140 +1,157 @@
 #![no_main]
-//! Single comprehensive fuzz target that populates every Scanner subsystem
-//! from fuzz-generated text and exercises all major entry points:
-//! `analyze()`, `analyze_all()`, `scan_seekable()`, and `scan_path()`.
+//! The scanner end to end, built the way a deployment builds it, and held to
+//! what the entry points promise each other.
 //!
-//! This replaces the need for separate per-subsystem targets. The input is
-//! length-prefixed sections:
+//! The input is `fuzz_support::frame`: a header of option bits (the
+//! `options::scan_options` switches) and up to eight database files, each a
+//! kind byte (an extension of the loader's, bit 7 for an official database)
+//! and its text, then the bytes to scan. The files go through
+//! `loader::Builder::add_named_bytes`, the path the CLI and the daemon take, so
+//! every database kind the loader reads is reached: signatures (`ndb`, `ldb`),
+//! hashes, container and file-type rules, YARA, bytecode, phishing and
+//! allow-lists, Authenticode block-lists, passwords. With no file in the
+//! header the signatures are those of `fuzz/db/`, which is what a raw fixture
+//! behind a three-byte zero header scans against.
 //!
-//! ```text
-//! [n_sections:1] [sec0_len:2BE] [sec0..] [sec1_len:2BE] [sec1..] ...
-//! ```
+//! What is checked, and where the claim is made:
 //!
-//! Sections:
-//!  0 — NDB/LDB text (engine signatures)
-//!  1 — HDB text    (whole-file hash sigs)
-//!  2 — FDB text    (fuzzy TLSH/imphash sigs)
-//!  3 — CDB text    (container metadata sigs)
-//!  4 — IDB text    (PE icon hash sigs)
-//!  5 — FP/IGN text (allowlist + ignore names)
-//!  6 — scan data   (the bytes to scan)
-//!
-//! Every section is optional (zero-length = empty DB for that subsystem).
+//! * the same bytes scanned twice give the same report;
+//! * `analyze_all` is a superset of `analyze`: a detection in one is in the
+//!   other, a clean scan lists nothing, and neither is fully scanned when the
+//!   other is not (`tests/suites/allmatch_parity.rs`, the doc on
+//!   `AllMatchOutcome`);
+//! * a stream and a buffer are one scan: `scan_seekable` over a reader that
+//!   returns what it is asked in pieces answers what `analyze` did, while the
+//!   object is within `deep_analysis_max` (`tests/suites/one_scan.rs`);
+//! * a database written out and read back scans as the one it came from.
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
-use std::io::Cursor;
-use libfuzzer_sys::fuzz_target;
 use exav_core::{
-    analyze, analyze_all, database, scan_seekable, Scanner, ScanOptions,
+    analyze, analyze_all_with_outcome, database, loader, scan_seekable, AllMatchOutcome, ScanReport,
+    Scanner, Verdict, VerdictCategory,
 };
-use exav_core::engine::EngineBuilder;
-use exav_core::hashes::HashDb;
-use exav_core::fuzzy::FuzzyDb;
-use exav_core::container::CdbDb;
-use exav_core::icon::IconDb;
+use exav_fuzz_support::{extreme, frame};
+use libfuzzer_sys::fuzz_target;
 
-const NUM_SECTIONS: usize = 7;
+#[path = "../db.rs"]
+mod db;
+#[path = "../options.rs"]
+mod options;
 
-fn read_u16_be(buf: &[u8], off: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*buf.get(off)?, *buf.get(off + 1)?]))
-}
-
-fuzz_target!(|data: &[u8]| {
-    if data.is_empty() {
-        return;
-    }
-    let n_sections = data[0] as usize;
-    if n_sections > NUM_SECTIONS {
-        return;
-    }
-    let mut pos = 1;
-    let mut sections: Vec<&[u8]> = Vec::with_capacity(n_sections);
-    for _ in 0..n_sections {
-        let len = match read_u16_be(data, pos) {
-            Some(l) => l as usize,
-            None => return,
-        };
-        pos += 2;
-        if pos + len > data.len() {
-            return;
-        }
-        sections.push(&data[pos..pos + len]);
-        pos += len;
-    }
-    let scan_data = data.get(pos..).unwrap_or(&[]);
-
-    // Section 0: engine signatures (NDB + LDB)
-    let engine_text = str_from(sections.get(0).copied().unwrap_or(&[]));
-    let mut eb = EngineBuilder::new();
-    if let Some(t) = engine_text {
-        eb.add_ndb(t, false);
-        eb.add_ldb(t, false);
-    }
-    let engine = eb.build();
-
-    // Section 1: whole-file hash sigs (HDB/HSB)
-    let mut hashes = HashDb::new();
-    if let Some(t) = str_from(sections.get(1).copied().unwrap_or(&[])) {
-        hashes.extend_from_text(t);
-    }
-
-    // Section 2: fuzzy sigs (FDB/IMP)
-    let mut fuzzy = FuzzyDb::new();
-    if let Some(t) = str_from(sections.get(2).copied().unwrap_or(&[])) {
-        fuzzy.extend_from_text(t);
-    }
-
-    // Section 3: container metadata sigs (CDB)
-    let mut cdb = CdbDb::new();
-    if let Some(t) = str_from(sections.get(3).copied().unwrap_or(&[])) {
-        cdb.extend_from_text(t);
-    }
-
-    // Section 4: icon hash sigs (IDB)
-    let mut icons = IconDb::new();
-    if let Some(t) = str_from(sections.get(4).copied().unwrap_or(&[])) {
-        icons.extend_from_text(t);
-    }
-
-    // Section 5: allowlist + ignore (FP/IGN)
-    let mut allow = HashDb::new();
-    let mut ignored = std::collections::HashSet::new();
-    if let Some(t) = str_from(sections.get(5).copied().unwrap_or(&[])) {
-        allow.extend_from_text(t);
-        // Also parse ignore-name lines (IGN2 format: just the name).
-        for line in t.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with('#') {
-                ignored.insert(line.to_string());
-            }
-        }
-    }
-
-    let db = Scanner::from_parts(engine, hashes, fuzzy, cdb, icons, allow, ignored);
-
-    let mut opts = ScanOptions::default();
-    opts.heuristics = true;
-
-    // --- Entry point 1: analyze (in-memory, primary path) ---
-    let _ = analyze(&db, scan_data, &opts);
-
-    // --- Entry point 2: analyze_all (all-match mode, no early termination) ---
-    let _ = analyze_all(&db, scan_data, &opts);
-
-    // --- Entry point 3: scan_seekable (Cursor = in-memory seekable reader) ---
-    let cursor = Cursor::new(scan_data);
-    let _ = scan_seekable(&db, cursor, scan_data.len() as u64, &opts);
-
-    // --- Entry point 4: database round-trip (serialize → deserialize → scan) ---
-    {
-        let mut buf = Vec::with_capacity(4096);
-        if database::write(&db, &mut buf).is_ok() {
-            if let Ok(loaded) = database::read(buf.as_slice()) {
-                let _ = analyze(&loaded, scan_data, &opts);
-            }
-        }
+libfuzzer_sys::fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
+    if extreme::set_extreme_field(data, size, seed) {
+        size
+    } else {
+        libfuzzer_sys::fuzzer_mutate(data, size, max_size)
     }
 });
 
-fn str_from(b: &[u8]) -> Option<&str> {
-    std::str::from_utf8(b).ok()
+/// A reader that gives at most a few bytes a call, as a socket does.
+struct Pieces<R>(R, usize);
+
+impl<R: Read> Read for Pieces<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.1);
+        self.0.read(&mut buf[..n])
+    }
 }
+
+impl<R: Seek> Seek for Pieces<R> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(to)
+    }
+}
+
+fn same(what: &str, a: &ScanReport, b: &ScanReport) {
+    assert_eq!(a.verdict, b.verdict, "{what}: the verdicts differ");
+    let findings = |r: &ScanReport| {
+        r.findings
+            .iter()
+            .map(|f| (f.label.clone(), f.detail.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(findings(a), findings(b), "{what}: the findings differ");
+}
+
+/// The static database as a prebuilt file reads it back, once.
+fn static_roundtrip() -> &'static Scanner {
+    static LOADED: std::sync::OnceLock<Scanner> = std::sync::OnceLock::new();
+    LOADED.get_or_init(|| roundtrip(db::scanner()).expect("the fuzz database round-trips"))
+}
+
+fn roundtrip(db: &Scanner) -> Option<Scanner> {
+    let mut buf = Vec::new();
+    database::write(db, &mut buf).ok()?;
+    database::read(buf.as_slice()).ok()
+}
+
+fuzz_target!(|data: &[u8]| {
+    let Some(f) = frame::parse(data) else {
+        return;
+    };
+    let opts = options::scan_options(f.bits);
+    let scan = f.rest;
+
+    let built;
+    let (db, loaded): (&Scanner, Option<Scanner>) = if f.files.is_empty() {
+        (db::scanner(), None)
+    } else {
+        let mut b = loader::Builder::new();
+        for (i, (kind, text)) in f.files.iter().enumerate() {
+            let name = format!("f{i}.{}", db::kind(kind & 0x7f));
+            b.add_named_bytes(&name, text, kind & 0x80 != 0);
+        }
+        let Ok(s) = b.build() else {
+            return;
+        };
+        built = s;
+        let loaded = roundtrip(&built);
+        (&built, loaded)
+    };
+
+    let first = analyze(db, scan, &opts);
+    let again = analyze(db, scan, &opts);
+    same("the same bytes twice", &first, &again);
+
+    let (names, outcome) = analyze_all_with_outcome(db, scan, &opts);
+    match first.verdict.category() {
+        VerdictCategory::Infected => {
+            if let Verdict::Infected { signature, .. } = &first.verdict {
+                assert!(
+                    names.iter().any(|(n, _)| n == signature),
+                    "analyze found {signature}, analyze_all listed {:?}",
+                    names.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                );
+            }
+        }
+        VerdictCategory::Clean => {
+            assert!(names.is_empty(), "analyze says clean, analyze_all lists {names:?}");
+            assert_eq!(outcome, AllMatchOutcome::Complete, "analyze says clean, analyze_all did not finish");
+        }
+        VerdictCategory::Partial => {
+            assert!(
+                outcome != AllMatchOutcome::Complete || !names.is_empty(),
+                "analyze did not finish ({:?}), analyze_all says it did",
+                first.verdict
+            );
+        }
+    }
+
+    // One scan from any source, within the limit that decides how it is read.
+    let len = scan.len() as u64;
+    if len <= opts.deep_analysis_max && opts.max_scan_size.map_or(true, |m| len <= m) {
+        let reader = Pieces(Cursor::new(scan), 1 + scan.len() % 7);
+        let streamed = scan_seekable(db, reader, len, &opts).expect("a memory reader does not fail");
+        same("a stream and a buffer", &first, &streamed);
+    }
+
+    let loaded = match &loaded {
+        Some(l) => Some(l),
+        None if f.files.is_empty() => Some(static_roundtrip()),
+        None => None,
+    };
+    if let Some(loaded) = loaded {
+        let back = analyze(loaded, scan, &opts);
+        same("a database read back", &first, &back);
+    }
+});

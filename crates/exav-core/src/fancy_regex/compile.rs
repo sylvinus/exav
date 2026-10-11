@@ -1078,7 +1078,12 @@ pub(crate) fn compile_inner_from_hir(
 pub(crate) fn options_to_rabuilder(options: &CompileOptions, usage: DelegateUsage) -> RaBuilder {
     use regex_automata::util::syntax::Config as SyntaxConfig;
 
-    let mut config = RaConfig::new();
+    let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
+    // Outside `BytesMode::Unicode` the haystack is bytes, and a position inside
+    // what would be a UTF-8 sequence is a position like any other: with the
+    // default (`true`) the engine skips an empty match there, so a delegated
+    // `x*` found no match before a byte over 0x7F and the whole pattern failed.
+    let mut config = RaConfig::new().utf8_empty(utf8);
     if let Some(limit) = options.delegate_size_limit {
         config = config.nfa_size_limit(Some(limit));
     }
@@ -1112,8 +1117,6 @@ pub(crate) fn options_to_rabuilder(options: &CompileOptions, usage: DelegateUsag
     //       the SyntaxConfig here, and the pattern includes the (?-i) flag, then that flag would
     //       effectively be ignored unless to_str would encode the flag for every node, even when it
     //       is the default, which feels too verbose and hurts readability, is more to parse etc.
-    let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
-
     let syntax = SyntaxConfig::new().utf8(utf8).unicode(options.unicode);
     builder.syntax(syntax);
 

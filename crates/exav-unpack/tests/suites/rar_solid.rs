@@ -523,3 +523,70 @@ fn a_real_volume_set_joins_into_its_archive() {
         );
     }
 }
+
+/// A RAR4 volume of an archive header and an end block that records `number`
+/// as its volume number.
+#[cfg(feature = "rar")]
+fn rar4_volume_numbered(number: u16) -> Vec<u8> {
+    let mut v = b"Rar!\x1a\x07\x00".to_vec();
+    // Archive header: CRC, type 0x73, flags, size 13, and its reserved bytes.
+    v.extend_from_slice(&[0, 0, 0x73, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0]);
+    // End block: type 0x7B, flags EARC_VOLNUMBER, size 9, the number.
+    v.extend_from_slice(&[0, 0, 0x7B, 0x08, 0x00, 9, 0]);
+    v.extend_from_slice(&number.to_le_bytes());
+    v
+}
+
+/// Found by `fuzz/fuzz_targets/volumes.rs`: the message for a volume that is
+/// not the one its place in the set says added one to the 16-bit number it
+/// read, which panicked at the largest (release builds check overflow).
+#[cfg(feature = "rar")]
+#[test]
+fn a_volume_numbered_65535_is_refused_by_name_not_by_a_panic() {
+    let first = rar4_volume_numbered(u16::MAX);
+    let err = exav_unpack::join_rar_volumes(&[&first]).unwrap_err();
+    assert!(err.contains("volume 65536"), "{err}");
+    // And the one that is right joins.
+    let ok = rar4_volume_numbered(0);
+    assert!(exav_unpack::join_rar_volumes(&[&ok]).is_ok());
+}
+
+/// A RAR5 volume whose main header is flagged as a volume and, when given,
+/// records `number` (an unsigned variable-length integer, up to 2^64 - 1).
+#[cfg(feature = "rar")]
+fn rar5_volume_numbered(number: Option<u64>) -> Vec<u8> {
+    fn vint(mut x: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (x & 0x7f) as u8;
+            x >>= 7;
+            if x == 0 {
+                out.push(b);
+                return out;
+            }
+            out.push(b | 0x80);
+        }
+    }
+    // Header type 1 (main), no header flags, archive flags: volume, and with
+    // a number, the number-present bit.
+    let mut body = vec![1u8, 0];
+    body.extend(vint(if number.is_some() { 0x03 } else { 0x01 }));
+    if let Some(n) = number {
+        body.extend(vint(n));
+    }
+    let mut v = b"Rar!\x1a\x07\x01\x00".to_vec();
+    v.extend_from_slice(&[0; 4]); // the header's CRC, which joining does not read
+    v.extend(vint(body.len() as u64));
+    v.extend(body);
+    v
+}
+
+/// As above, for RAR5, whose volume number is a 64-bit integer.
+#[cfg(feature = "rar")]
+#[test]
+fn a_rar5_volume_numbered_2_pow_64_minus_1_is_refused_by_name_not_by_a_panic() {
+    let first = rar5_volume_numbered(None);
+    let second = rar5_volume_numbered(Some(u64::MAX));
+    let err = exav_unpack::join_rar_volumes(&[&first, &second]).unwrap_err();
+    assert!(err.contains("part 2 is volume"), "{err}");
+}

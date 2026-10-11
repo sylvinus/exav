@@ -274,8 +274,8 @@ fn is_benign_disconnect(e: &std::io::Error) -> bool {
     )
 }
 
-fn handle_request<W: Write>(
-    reader: &mut BufReader<TcpStream>,
+fn handle_request<R: BufRead, W: Write>(
+    reader: &mut R,
     writer: &mut W,
     cfg: &IcapConfig,
     db: &dyn Signatures,
@@ -347,8 +347,8 @@ fn handle_request<W: Write>(
 ///
 /// `Ok(None)` means the answer has already gone out and the connection must
 /// close.
-fn modify<W: Write>(
-    reader: &mut BufReader<TcpStream>,
+fn modify<R: BufRead, W: Write>(
+    reader: &mut R,
     writer: &mut W,
     cfg: &IcapConfig,
     req: &RequestHead,
@@ -541,8 +541,8 @@ fn take_rejection(slot: &mut Option<String>, outcome: &BodyOutcome) {
 }
 
 /// Read an encapsulated body, keeping at most `--max-input-bytes` of it.
-fn read_body(
-    reader: &mut BufReader<TcpStream>,
+fn read_body<R: BufRead>(
+    reader: &mut R,
     cfg: &IcapConfig,
     opts: &ScanOptions,
     out: &mut Body,
@@ -722,6 +722,34 @@ fn method_name(req: &RequestHead) -> &'static str {
         IcapMethod::RespMod => "RESPMOD",
         _ => "?",
     }
+}
+
+/// What the fuzz target drives: the requests in `input`, one after another as
+/// on a kept-alive connection, answered into the returned bytes. The loop is
+/// `serve_connection`'s, over memory in place of a socket.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_exchange(input: &[u8], db: Arc<Scanner>, opts: &ScanOptions) -> Vec<u8> {
+    struct Fixed(Arc<Scanner>);
+    impl Signatures for Fixed {
+        fn scanner(&self) -> Arc<Scanner> {
+            self.0.clone()
+        }
+    }
+    let cfg = IcapConfig::default();
+    let db = Fixed(db);
+    let mut reader = std::io::Cursor::new(input);
+    let mut out = Vec::new();
+    for _ in 0..cfg.keepalive_requests {
+        match reader.fill_buf().map(|b| b.is_empty()) {
+            Ok(false) => {}
+            _ => break,
+        }
+        match handle_request(&mut reader, &mut out, &cfg, &db, opts) {
+            Ok(Next::KeepAlive) => {}
+            _ => break,
+        }
+    }
+    out
 }
 
 #[cfg(test)]

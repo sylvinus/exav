@@ -1161,7 +1161,11 @@ fn join_rar4(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
                 let at = pos + 7 + if flags & 0x0002 != 0 { 4 } else { 0 };
                 if let Some(n) = u16le(v, at).filter(|_| at + 2 <= pos + head_size) {
                     if usize::from(n) != k {
-                        return Err(format!("part {} is volume {} of its set", k + 1, n + 1));
+                        return Err(format!(
+                            "part {} is volume {} of its set",
+                            k + 1,
+                            usize::from(n) + 1
+                        ));
                     }
                 }
             }
@@ -1319,7 +1323,11 @@ fn join_rar5(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
             if b.htype == 1 && k > 0 {
                 if let Some(n) = rar5_volume_number(&v[b.hdr..b.data_off]) {
                     if n != k as u64 {
-                        return Err(format!("part {} is volume {} of its set", k + 1, n + 1));
+                        return Err(format!(
+                            "part {} is volume {} of its set",
+                            k + 1,
+                            n.saturating_add(1)
+                        ));
                     }
                 }
             }

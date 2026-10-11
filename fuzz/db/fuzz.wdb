@@ -1,0 +1,3 @@
+M:.+\.paypal\.com/:.*paypal\.com.*
+X:.+\.examplebank\.test/.*:.*examplebank.*
+M:^https?://([a-z0-9-]+\.)*example\.org/:.*example\.org

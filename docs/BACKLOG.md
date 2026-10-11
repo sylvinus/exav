@@ -98,6 +98,17 @@ is on exav.org.
 
 ## Robustness
 
+- **Fuzzing the viewer's TypeScript**: property tests (fast-check, MIT, in
+  vitest) for the two places a hostile document's output meets code the viewer
+  trusts: the host's validation of the messages a sandboxed frame sends
+  (`ts/frame/host.ts`, `protocol.ts`: every message shape, sizes, ports), and
+  the CSV reader. The Rust side is fuzzed (docs/FUZZING.md); this half is not.
+- **A differential oracle for the YARA engine**: yara-x (or libyara) compiled
+  into a fuzz target to compare rule results on fuzzed rules and data. The
+  existing difftests cover the rule corpora; the fuzzer would reach
+  combinations they do not. yara-x pulls wasmtime, so it needs its own fuzz
+  workspace.
+
 The arithmetic audit (`tmp/ARITHMETIC_AUDIT.md`, not committed; its row names
 are used below) found about a hundred sites where a header's number is added
 to or multiplied by something unchecked. Fixed and tested: the disk-image

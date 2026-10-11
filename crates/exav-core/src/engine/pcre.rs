@@ -1484,6 +1484,52 @@ fn emit_set(s: &Set, out: &mut String) {
     out.push(']');
 }
 
+/// What `pattern` does to `hay` in each engine, for the fuzz target that holds
+/// them to the same answer (see `fuzz/fuzz_targets/pcre.rs`). `flags` are the
+/// letters of a subsignature's flag field.
+#[cfg(feature = "unstable-internals")]
+#[doc(hidden)]
+pub struct Compared {
+    /// The pattern as the engines read it.
+    pub translated: String,
+    /// The backtracking engine's answer; `None` when it refused the pattern or
+    /// ran out of its step budget.
+    pub backtracking: Option<bool>,
+    /// The linear engine's, when the translation is in its subset.
+    pub linear: Option<bool>,
+}
+
+/// `None` when the pattern has no translation (the signature is unsupported).
+#[cfg(feature = "unstable-internals")]
+#[doc(hidden)]
+pub fn compare_engines(pattern: &str, flags: &str, hay: &[u8]) -> Option<Compared> {
+    let flags = Flags {
+        caseless: flags.contains('i'),
+        dotall: flags.contains('s'),
+        multiline: flags.contains('m'),
+        extended: flags.contains('x'),
+        dollar_endonly: flags.contains('E'),
+        ungreedy: flags.contains('U'),
+        ..Default::default()
+    };
+    let translated = translate(pattern, flags).ok()?;
+    let backtracking = crate::fancy_regex::RegexBuilder::new(&translated)
+        .bytes_mode(crate::fancy_regex::BytesMode::Ascii)
+        .build()
+        .ok()
+        .and_then(|re| re.is_match(hay).ok());
+    let linear = regex::bytes::RegexBuilder::new(&translated)
+        .unicode(false)
+        .build()
+        .ok()
+        .map(|re| re.is_match(hay));
+    Some(Compared {
+        translated,
+        backtracking,
+        linear,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1714,6 +1760,25 @@ mod tests {
         ] {
             assert!(translate(pattern, Flags::default()).is_err(), "{pattern} was accepted");
         }
+    }
+
+    /// Found by `fuzz/fuzz_targets/pcre.rs`: the two engines disagreed on a
+    /// word boundary beside a byte over 0x7F, which is no word character in
+    /// PCRE2's tables.
+    #[test]
+    fn a_word_boundary_beside_a_high_byte_reads_the_same_in_both_engines() {
+        assert!(matches(r"\bword", "", b"\x9aword"));
+        assert!(matches(r"word\b", "", b"word\x9a"));
+        assert!(!matches(r"\Bword", "", b"\x9aword"));
+        // The byte before the high one is a word character: the engine that
+        // read the two as one letter found no boundary.
+        assert!(matches(r"\bab", "", b"1\x9aab"));
+        assert!(matches(r"\b(?=ab)", "", b"1\x9aab"));
+        // A delegated repeat that can match nothing, before a byte over 0x7F:
+        // the engine skipped the empty match as if it split a UTF-8 character.
+        assert!(matches(r"(\bb)x*", "", b"c\\b\x9e"));
+        assert!(matches(r"(\bb)]*", "", b"c\\b\x9e\x00\x9d\x9c&"));
+        assert!(matches(r"\bword\t\x00", "", b"\\b\x9aword\t\x00\\b\x9a\x9ac$abc\n\x9aa \x8e"));
     }
 
     /// The start-of-pattern items that only tune PCRE2 are dropped.

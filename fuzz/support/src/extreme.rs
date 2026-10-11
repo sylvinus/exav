@@ -6,8 +6,7 @@
 //! 2-, 4- or 8-byte field, at any position, to a value near the top of its
 //! range, a quarter of the time, and leaves the rest to the stock mutator.
 //!
-//! Used with `#[path = "../extreme.rs"] mod extreme;` and
-//! `libfuzzer_sys::fuzz_mutator!` (see `fuzz_targets/unpack.rs`).
+//! Used with `libfuzzer_sys::fuzz_mutator!` (see `fuzz_targets/unpack.rs`).
 
 /// Values written as 2, 4 or 8 bytes (truncated to the width), little- or
 /// big-endian: the top of the range, just under it, the sign bit, and the

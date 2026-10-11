@@ -1036,6 +1036,7 @@ fn run_with<S: HaystackInput + ?Sized, T>(
     state.reset(prog.n_saves, option_flags);
     inner_slots.clear();
     let look_matcher = LookMatcher::new();
+    let ascii_words = matches!(prog.bytes_mode, BytesMode::Ascii);
     #[cfg(true)]
     if option_flags & OPTION_TRACE != 0 {
         println!("pos\tinstruction");
@@ -1197,6 +1198,28 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                         }
                         Assertion::EndLine { crlf: true } => {
                             look_matcher.is_end_crlf(haystack.as_bytes(), ix)
+                        }
+                        // In `BytesMode::Ascii` a word character is an ASCII one,
+                        // as `\w` is: the Unicode boundary reads the bytes
+                        // beside `ix` as UTF-8 and takes a byte over 0x7F, with
+                        // the byte before it, for a letter.
+                        Assertion::LeftWordBoundary if ascii_words => {
+                            look_matcher.is_word_start_ascii(haystack.as_bytes(), ix)
+                        }
+                        Assertion::RightWordBoundary if ascii_words => {
+                            look_matcher.is_word_end_ascii(haystack.as_bytes(), ix)
+                        }
+                        Assertion::LeftWordHalfBoundary if ascii_words => {
+                            look_matcher.is_word_start_half_ascii(haystack.as_bytes(), ix)
+                        }
+                        Assertion::RightWordHalfBoundary if ascii_words => {
+                            look_matcher.is_word_end_half_ascii(haystack.as_bytes(), ix)
+                        }
+                        Assertion::WordBoundary if ascii_words => {
+                            look_matcher.is_word_ascii(haystack.as_bytes(), ix)
+                        }
+                        Assertion::NotWordBoundary if ascii_words => {
+                            look_matcher.is_word_ascii_negate(haystack.as_bytes(), ix)
                         }
                         Assertion::LeftWordBoundary => look_matcher
                             .is_word_start_unicode(haystack.as_bytes(), ix)
