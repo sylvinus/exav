@@ -317,6 +317,27 @@ pub(crate) fn build(mut raw: Raw, ctx: Ctx<'_>) -> Drawing {
         }
     }
 
+    // An insert's clipping boundary: its extension dictionary's ACAD_FILTER
+    // dictionary, whose SPATIAL entry is the filter.
+    if !ctx.insert_dictionaries.is_empty() {
+        let dictionaries: HashMap<Handle, &Dictionary> =
+            raw.dictionaries.iter().map(|d| (d.handle, d)).collect();
+        let filter_of = |xdict: u64| -> Option<InsertClip> {
+            let acad = dictionaries.get(&Handle(xdict))?.get("ACAD_FILTER")?;
+            let spatial = dictionaries.get(&acad)?.get("SPATIAL")?;
+            ctx.spatial_filters.get(&spatial.0).cloned()
+        };
+        for b in &mut blocks {
+            for e in &mut b.entities {
+                if let EntityKind::Insert(ins) = &mut e.kind {
+                    if let Some(&x) = ctx.insert_dictionaries.get(&e.handle.0) {
+                        ins.clip = filter_of(x);
+                    }
+                }
+            }
+        }
+    }
+
     Drawing {
         header: raw.header,
         layers: raw.layers,

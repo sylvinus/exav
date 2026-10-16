@@ -6,11 +6,24 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const seen = new WeakMap<Page, string[]>();
+const screenshots = new WeakMap<Page, number>();
 
 /** The violations reported so far on `page`. */
 export function violations(page: Page): string[] {
   return seen.get(page) ?? [];
 }
+
+/**
+ * Says a screenshot of `page` is taken. In WebKit, Playwright adds a
+ * `<style>` to every frame and removes it first, to sync animations
+ * (`shouldToggleStyleSheetToSyncAnimations`, screenshotter.ts), whatever the
+ * options: a sandboxed frame's policy refuses it, twice a screenshot.
+ */
+export function screenshotting(page: Page): void {
+  screenshots.set(page, (screenshots.get(page) ?? 0) + 1);
+}
+
+const SCREENSHOT_STYLE = /\/frame\/index\.html: style-src-elem inline$/;
 
 /** Installs the collection before each test and fails the test on any violation. */
 export function failOnViolations(): void {
@@ -25,7 +38,8 @@ export function failOnViolations(): void {
       });
     });
   });
-  test.afterEach(async ({ page }) => {
-    expect(violations(page)).toEqual([]);
+  test.afterEach(async ({ page, browserName }) => {
+    let allowed = browserName === "webkit" ? 2 * (screenshots.get(page) ?? 0) : 0;
+    expect(violations(page).filter((v) => !(allowed > 0 && SCREENSHOT_STYLE.test(v) && allowed--))).toEqual([]);
   });
 }

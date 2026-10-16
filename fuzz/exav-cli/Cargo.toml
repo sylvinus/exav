@@ -29,10 +29,10 @@ http-update = []
 # here fails this crate's build, which is how it is noticed.
 [dependencies]
 exav-core = { path = "../../crates/exav-core", default-features = false }
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 walkdir = "2.5"
-libc = "0.2.186"
-regex = "1.12.4"
+libc = "0.2.191"
+regex = "1.13.1"
 serde_json = "1"
 
 [lints.rust]

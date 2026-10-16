@@ -1,7 +1,9 @@
 import { writable } from "../core/store.js";
 import type { Renderer } from "../core/types.js";
-import { createModelEngine, DEFAULT_MAX_TRIANGLES, DEFAULT_TIMEOUT_MS, modelWarnings } from "./engine.js";
+import { createModelEngine, DEFAULT_MAX_TRIANGLES, DEFAULT_TIMEOUT_MS, modelWarnings, type ModelKind } from "./engine.js";
+import { parseGround } from "./camera.js";
 import type { ModelOptions } from "./index.js";
+import { createModelRaster } from "./raster.js";
 
 /**
  * A mid grey rather than white: the ground behind is pale, and a white part
@@ -9,7 +11,10 @@ import type { ModelOptions } from "./index.js";
  */
 const SURFACE = 0x8c97a8;
 
-export const renderer: Renderer<ModelOptions> = {
+/** STL is Z up. OBJ and PLY say nothing, and what three.js and Blender write is Y up; glTF is Y up. */
+const Z_UP: Record<Exclude<ModelKind, "ifc">, boolean> = { stl: true, obj: false, ply: false, gltf: false };
+
+export const rendererFor = (kind: Exclude<ModelKind, "ifc">): Renderer<ModelOptions> => ({
   async mount(host, ctx) {
     ctx.status({ phase: "loading" });
     const engine = createModelEngine();
@@ -30,27 +35,31 @@ export const renderer: Renderer<ModelOptions> = {
         ctx.source.bytes(),
       ]);
       if (disposed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
+      ctx.status({ phase: "loading", step: "read" });
       const bytes = source.slice();
       const model = await engine.call(
-        { kind: "stl", bytes: bytes.buffer as ArrayBuffer, maxTriangles: ctx.options.maxTriangles ?? DEFAULT_MAX_TRIANGLES },
+        { kind, bytes: bytes.buffer as ArrayBuffer, maxTriangles: ctx.options.maxTriangles ?? DEFAULT_MAX_TRIANGLES },
         [bytes.buffer as ArrayBuffer],
         ctx.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       );
       engine.destroy();
       if (disposed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
+      ctx.status({ phase: "loading", step: "render" });
 
       const root = document.createElement("div");
-      root.className = "exv-model";
+      root.className = "exav-viewer-model";
       host.append(root);
       disposers.push(() => root.remove());
 
-      // The engine's facet normals, from the corners: some exporters write
-      // zeros in the file, which would light a mesh black.
+      // The engine's normals: the file's where it gives usable ones, else the
+      // facet's own from the corners (some exporters write zeros in the
+      // file, which would light a mesh black).
       const geometry = new three.BufferGeometry();
       geometry.setAttribute("position", new three.BufferAttribute(model.positions, 3));
       geometry.setAttribute("normal", new three.BufferAttribute(model.normals, 3));
       geometry.setIndex(new three.BufferAttribute(model.indices, 1));
-      // The VisCAM/SolidView or Magics facet colours, as sRGB bytes.
+      // The colours of the file's vertices or facets (STL: VisCAM, SolidView,
+      // Magics), as sRGB bytes.
       const coloured = (model.meta.batches[0]?.color0 ?? -1) >= 0;
       if (coloured) {
         const rgb = new Float32Array(model.colors.length);
@@ -65,7 +74,8 @@ export const renderer: Renderer<ModelOptions> = {
       }
       disposers.push(() => geometry.dispose());
       // Every CAD application and printer means Z up; three.js means Y.
-      if (ctx.options.zUp ?? true) geometry.rotateX(-Math.PI / 2);
+      const zUp = ctx.options.zUp ?? Z_UP[kind];
+      if (zUp) geometry.rotateX(-Math.PI / 2);
       geometry.computeBoundingBox();
       const box = geometry.boundingBox ?? new three.Box3();
       const size = box.getSize(new three.Vector3());
@@ -105,7 +115,7 @@ export const renderer: Renderer<ModelOptions> = {
       gl.shadowMap.type = three.PCFShadowMap;
       gl.toneMapping = three.ACESFilmicToneMapping;
       gl.toneMappingExposure = 0.95;
-      gl.domElement.className = "exv-model-canvas";
+      gl.domElement.className = "exav-viewer-model-canvas";
       root.append(gl.domElement);
 
       // An environment rather than lamps: a part is read by how its faces
@@ -154,6 +164,38 @@ export const renderer: Renderer<ModelOptions> = {
       controls.maxPolarAngle = Math.PI / 2 - 0.02;
       controls.update();
 
+      const raster = createModelRaster({
+        three,
+        scene,
+        camera,
+        controls,
+        renderer: gl,
+        frame: { zUp, origin: model.meta.origin, offset: [mesh.position.x, mesh.position.y, mesh.position.z] },
+        sphere: { center: [0, size.y / 2, 0], radius: size.length() / 2 },
+        // The surface the canvas is drawn over (`--exav-viewer-model-bg`).
+        ground: () => {
+          const style = getComputedStyle(root);
+          return parseGround(style.backgroundImage, style.backgroundColor);
+        },
+        // The lights of the picture's own renderer, as the viewer's.
+        environment: (renderer) => {
+          const pmrem = new three.PMREMGenerator(renderer);
+          const room = new RoomEnvironment();
+          const target = pmrem.fromScene(room, 0.04);
+          return {
+            texture: target.texture,
+            dispose() {
+              target.dispose();
+              room.dispose();
+              pmrem.dispose();
+            },
+          };
+        },
+        tile: ctx.options.rasterTile,
+        supersample: ctx.options.rasterSupersample,
+      });
+      disposers.push(raster.destroy);
+
       const resize = () => {
         const { clientWidth, clientHeight } = root;
         if (!clientWidth || !clientHeight) return;
@@ -170,6 +212,7 @@ export const renderer: Renderer<ModelOptions> = {
       const draw = () => {
         frame = requestAnimationFrame(draw);
         controls.update();
+        raster.sync();
         gl.render(scene, camera);
       };
       draw();
@@ -177,7 +220,7 @@ export const renderer: Renderer<ModelOptions> = {
 
       ctx.status(triangles > 0 ? { phase: "ready" } : { phase: "empty" });
       return {
-        controllers: { info: writable({ triangles }), warnings: writable(modelWarnings(model.meta, "stl")) },
+        controllers: { info: writable({ triangles }), warnings: writable(modelWarnings(model.meta, kind)), pictures: raster.pictures, viewport: raster.viewport },
         resize,
         destroy: dispose,
       };
@@ -187,4 +230,4 @@ export const renderer: Renderer<ModelOptions> = {
       throw error;
     }
   },
-};
+});

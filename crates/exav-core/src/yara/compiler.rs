@@ -147,6 +147,7 @@ impl Compiler {
     /// sources may reference rules defined in earlier ones. Returns an error on
     /// the first parse error or unsupported construct.
     pub fn add_source(&mut self, src: &str) -> Result<&mut Self> {
+        check_paren_depth(src)?;
         let ast = AST::from(src);
         if let Some(err) = ast.errors().first() {
             return Err(Error::new(format!("parse error: {err:?}")));
@@ -190,6 +191,10 @@ impl Compiler {
     /// the returned list.
     pub fn add_source_lenient(&mut self, src: &str) -> Vec<(String, Error)> {
         let mut rejected = Vec::new();
+        if let Err(e) = check_paren_depth(src) {
+            rejected.push((String::new(), e));
+            return rejected;
+        }
         let ast = AST::from(src);
         if let Some(err) = ast.errors().first() {
             rejected.push((String::new(), Error::new(format!("parse error: {err:?}"))));
@@ -1419,6 +1424,72 @@ fn const_to_cond(v: crate::yara::ir::Value) -> Cond {
 /// Maps an integer file-read function name to its [`IntKind`], or `None` for
 /// non-integer reads (e.g. `float32`, which is not implemented). Single-byte
 /// `_be` variants are equivalent to their little-endian forms.
+/// Deepest parenthesis nesting a rule source may have. The parser tries each
+/// `(` twice, as a boolean group and as an arithmetic one, and does not keep
+/// what the first try parsed, so a rule with an error inside `d` open
+/// parentheses costs about 2^d steps (a 3.5 KB rule with 15 took 5.6 s).
+const MAX_PAREN_DEPTH: usize = 12;
+
+/// Refuses a source nested deeper than [`MAX_PAREN_DEPTH`] before it is parsed.
+/// Strings, comments and regular expressions are skipped.
+fn check_paren_depth(src: &str) -> Result<()> {
+    let b = src.as_bytes();
+    let (mut i, mut depth) = (0, 0usize);
+    // The last byte that was not whitespace, to tell a regex from a division.
+    let mut prev = 0u8;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !b[i..].starts_with(b"*/") {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'/' if prev == b'=' || b[..i].trim_ascii_end().ends_with(b"matches") => {
+                i += 1;
+                let mut class = false;
+                while i < b.len() && (class || b[i] != b'/') {
+                    match b[i] {
+                        b'\\' => i += 1,
+                        b'[' => class = true,
+                        b']' => class = false,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                if depth > MAX_PAREN_DEPTH {
+                    return Err(Error::new(format!(
+                        "parentheses nested more than {MAX_PAREN_DEPTH} deep"
+                    )));
+                }
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if !c.is_ascii_whitespace() {
+            prev = c;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 fn int_kind(name: &str) -> Option<IntKind> {
     Some(match name {
         "uint8" | "uint8be" => IntKind::U8,
@@ -1433,4 +1504,60 @@ fn int_kind(name: &str) -> Option<IntKind> {
         "int32be" => IntKind::I32be,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod paren_depth_tests {
+    use super::{Compiler, MAX_PAREN_DEPTH};
+    use std::time::{Duration, Instant};
+
+    fn nested(depth: usize) -> String {
+        format!(
+            "rule r {{ condition: {}true{} }}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        )
+    }
+
+    /// A 3.5 KB rule with an error inside 15 open parentheses (`yara`, fuzz
+    /// timeout): the parser took 5.6 s to refuse it.
+    #[test]
+    fn a_rule_with_an_error_deep_in_parentheses_is_refused_fast() {
+        let src = include_str!("../../tests/fixtures/fuzz/yara_nested_parens.yar");
+        let start = Instant::now();
+        let err = Compiler::new().add_source(src).err().expect("refused");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("nested"), "{err}");
+        let start = Instant::now();
+        let rejected = Compiler::new().add_source_lenient(src);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(rejected.len(), 1);
+    }
+
+    #[test]
+    fn nesting_up_to_the_bound_compiles_and_one_more_is_refused() {
+        assert!(Compiler::new().add_source(&nested(MAX_PAREN_DEPTH)).is_ok());
+        assert!(Compiler::new()
+            .add_source(&nested(MAX_PAREN_DEPTH + 1))
+            .is_err());
+    }
+
+    #[test]
+    fn parentheses_in_strings_comments_and_regexes_are_not_counted() {
+        let many = "(".repeat(40);
+        let src = format!(
+            "rule r {{ strings: $a = \"{many}\" $b = /x\\({many_esc}y/ $c = /[{many}]/ \
+             condition: // {many}\n /* {many} */ ($a or $b or $c) and \"{many}\" contains \"(\" }}",
+            many_esc = "\\(".repeat(40)
+        );
+        Compiler::new().add_source(&src).expect("compiles");
+    }
 }

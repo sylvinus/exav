@@ -155,4 +155,31 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, b"first frame PAYLOAD in frame two");
     }
+
+    /// RUSTSEC-2026-0344: a block may not decode to more than 128 KiB. Here
+    /// 37 bytes of block decode to 640 KiB; with 40,000 sequences instead of
+    /// 10, a block under 128 KiB would decode to 2.6 GB.
+    #[test]
+    fn a_block_decoding_past_its_maximum_is_refused() {
+        const SEQS: usize = 10;
+        let mut block = vec![(SEQS as u8) << 3]; // raw literals, 5-bit size
+        block.extend_from_slice(&[b'A'; SEQS]);
+        block.push(SEQS as u8);
+        // All three codes RLE: literal length 1, repeat offset 1, and match
+        // length code 52 (65,539 plus 16 extra bits, all zero here).
+        block.extend_from_slice(&[0b0101_0100, 1, 0, 52]);
+        block.extend_from_slice(&[0; 2 * SEQS]);
+        block.push(1); // end of the backward bitstream
+        let header = 1 | (2 << 1) | ((block.len() as u32) << 3); // last, compressed
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x50]; // window 1 MiB
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend(block);
+
+        let mut out = Vec::new();
+        let r = std::io::Read::read_to_end(&mut super::ZstdReader::new(&frame[..]), &mut out);
+        assert!(r.is_err(), "decoded {} bytes from one block", out.len());
+        // ruzstd stops at the sequence that crosses the bound: at most one
+        // match (131,074 bytes) past it.
+        assert!(out.len() <= 128 * 1024 + 131_074, "{} bytes", out.len());
+    }
 }

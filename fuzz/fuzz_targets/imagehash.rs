@@ -11,10 +11,16 @@ use libfuzzer_sys::fuzz_target;
 
 const BUDGET: u64 = 64 << 20;
 
+/// What the hasher may decode: the grey conversion and resize of a 16 MiB
+/// image took 10 s under the sanitizer for 805 bytes of JPEG (0.4 s in
+/// release), and what they cost is not what the target looks for. The decoders
+/// still get `BUDGET` through `decode_any` below.
+const HASH_BUDGET: u64 = 4 << 20;
+
 fuzz_target!(|data: &[u8]| {
     for p in [Params::CLAMAV, Params::IMAGEHASH_PHASH] {
         let h = Hasher::with_params(Params {
-            max_decode_bytes: BUDGET,
+            max_decode_bytes: HASH_BUDGET,
             ..p
         })
         .expect("valid parameters");

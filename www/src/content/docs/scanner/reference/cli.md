@@ -388,8 +388,9 @@ paths, which the daemon opens itself; `--send-as` sends the file instead:
 
 `fd` is the cheapest (no copy) and needs a Unix socket; asking for it over TCP is
 refused rather than falling back to the path. `contents` works anywhere. Both
-send the parts of a byte-split archive together (`EXINSTREAM MULTI`) so the
-archive is scanned whole; by path, the same job is a `CONTSCAN` of the directory.
+send the parts of a split archive (byte-split, RAR or ZIP volumes) together
+(`EXINSTREAM MULTI`) so the archive is scanned whole; by path, the same job is a
+`CONTSCAN` of the directory.
 
 A client walks a directory itself in every mode and sends one request per file,
 so `--exclude`, `--exclude-dir`, `--include`, `--files-from` and `--no-recursive`

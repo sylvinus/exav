@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use cad_common::fixture;
 use exav_render::cad::{Drawing, EntityKind, ProxyItem};
-use exav_render::dwg::{Document, Tessellator};
+use exav_render::dwg::{Document, Tessellator, FILL_EDGE};
 
 /// make.py's CASES, in order, then the record of the class's own type.
 const CASES: [&str; 18] = [
@@ -84,15 +84,31 @@ fn stats(t: &mut Tessellator<'_>, e: &exav_render::cad::Entity) -> Stats {
             s.bounds[3].max(y),
         ];
     };
+    // An arc stroke's curve, not its chord.
     for k in &t.scene.strokes {
-        point(k.x0, k.y0);
-        point(k.x1, k.y1);
+        for [a, b] in k.flatten(64) {
+            point(a[0], a[1]);
+            point(b[0], b[1]);
+        }
     }
     for f in &t.scene.fills {
         point(f.x, f.y);
     }
-    for k in &t.scene.strokes {
-        let len = (k.x1 - k.x0).hypot(k.y1 - k.y0);
+    // Not a fill's edges, which only anti-alias it and follow how it was
+    // cut into triangles.
+    for k in t
+        .scene
+        .strokes
+        .iter()
+        .filter(|k| (k.attr >> 16) as u8 != FILL_EDGE)
+    {
+        let chord = (k.x1 - k.x0).hypot(k.y1 - k.y0);
+        let sweep = 4.0 * f64::from(k.bulge).atan();
+        let len = if k.bulge == 0.0 {
+            chord
+        } else {
+            chord * (sweep / 2.0) / (sweep / 2.0).sin()
+        };
         s.length += len;
         let layer = t.layers[(k.attr & 0xffff) as usize].name.clone();
         *s.by
@@ -191,14 +207,16 @@ fn every_release_draws_the_streams_as_the_source_does() {
             };
             let diff = differences(w, g);
             // The converter's R13 to R2000 DWGs have no LWPOLYLINE chunk: it
-            // writes the wide segment's outline and fill, which an
-            // LWPOLYLINE's widths are not drawn as. (Its R13 DXF keeps the
-            // stream as it was.)
+            // writes the wide segment as its fill, and the arc as chords, a
+            // little shorter. (Its R13 DXF keeps the stream as it was.)
             if *name == "lwpolyline"
                 && path.ends_with(".dwg")
                 && matches!(v, "R13" | "R14" | "R2000")
             {
-                assert!(w.area == 0.0 && g.area > 7.0, "{path}: {w:?} {g:?}");
+                assert!(
+                    close(w.area, g.area) && close_to(g.length, w.length, 1e-3),
+                    "{path}: {w:?} {g:?}"
+                );
                 continue;
             }
             assert!(diff.is_empty(), "{path} {name}: {diff:?}");
@@ -266,8 +284,8 @@ fn the_converters_r12_entities_draw_what_the_streams_draw() {
     let (ours, theirs) = get("mesh");
     assert!(close_to(ours.length, 35.0, 1e-9), "{ours:?}");
     assert!(
-        theirs.is_some_and(|t| t.length == 0.0),
-        "R12's mesh is not drawn"
+        theirs.is_some_and(|t| close_to(t.length, 35.0, 1e-9)),
+        "R12's polygon mesh draws the same grid: {theirs:?}"
     );
     // The true colour is red, ACI 1 in R12; xline and ray wait for the
     // drawing's extents, so neither box has them.
@@ -279,15 +297,18 @@ fn the_converters_r12_entities_draw_what_the_streams_draw() {
             .sum::<f64>()
     };
     assert!(close_to(red(ours), 4.0, 1e-9) && theirs.is_some_and(|t| red(t) == red(ours)));
-    // Widths are not drawn: the centre lines (the converter: R12 faces).
+    // The segment with widths 1 to 2 over 5 is its band; the others their
+    // centre lines (the converter: R12 faces).
     let (ours, _) = get("lwpolyline");
     let bulge = 0.5f64;
     let chord = 10.0;
     let radius = chord / 2.0 / (2.0 * bulge.atan()).sin();
     let arc = radius * 4.0 * bulge.atan();
-    assert!(close_to(ours.length, 30.0 + arc + 15.0, 0.002), "{ours:?}");
+    assert!(close_to(ours.length, 30.0 + arc + 10.0, 0.002), "{ours:?}");
+    assert!(close_to(ours.area, 7.5, 1e-9), "{ours:?}");
     // Traits: a layer the stream names is that layer, ByBlock the block
-    // the entity is in (colour 7 here), the lineweight the stream's.
+    // the entity is in (colour 7 here), the lineweight the stream's, else
+    // the default 0.25 mm.
     let (ours, _) = get("traits");
     let on = |layer: &str, lw: u32| -> f64 {
         ours.by
@@ -297,7 +318,7 @@ fn the_converters_r12_entities_draw_what_the_streams_draw() {
             .sum()
     };
     assert!(
-        on("L1", 50) > 0.0 && on("0", 0) > 0.0 && on("L2", 0) > 0.0,
+        on("L1", 50) > 0.0 && on("0", 25) > 0.0 && on("L2", 25) > 0.0,
         "{ours:?}"
     );
 }

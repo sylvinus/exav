@@ -12,8 +12,11 @@
  * store, since the frame runs the code a hostile file would attack.
  */
 import { createDetector } from "../core/detect.js";
-import { BUILTIN_ORDER, MATCHERS, WASM_IMAGES } from "../core/formats.js";
+import { BUILTIN_ORDER, CONVERTED_FORMATS, MATCHERS, WASM_IMAGES } from "../core/formats.js";
+import { asRasterError, isPage, MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS, RasterError } from "../core/pictures.js";
+import { picturesOver } from "../core/raster.js";
 import { derived, writable, type Store, type WritableStore } from "../core/store.js";
+import { checkTheme, themeOf, type FrameTheme } from "../core/theme.js";
 import type {
   ArchiveController,
   ArchiveMember,
@@ -22,6 +25,8 @@ import type {
   FormatId,
   FormatMatcher,
   OutlineEntry,
+  Raster,
+  RasterOptions,
   Session,
   Status,
   Viewer,
@@ -35,6 +40,8 @@ import {
   checkFrameMessage,
   HELLO,
   linkTarget,
+  MAX_DRAWS,
+  NAV_KEYS,
   PROTOCOL,
   type ArchiveSnapshot,
   type BytesMessage,
@@ -43,14 +50,24 @@ import {
   type ControllerKey,
   type FrameMessage,
   type FrameOptions,
+  type NavKey,
   type OpenMessage,
   type OpenSource,
+  type RasterMessage,
+  type RasterResult,
+  type ReplaceMessage,
   type Snapshots,
   type Statics,
   type StatusSnapshot,
+  type ThemeMessage,
+  type UnrasterMessage,
+  type WatchedKey,
+  type WatchMessage,
 } from "./protocol.js";
 
-export type { FrameOptions } from "./protocol.js";
+export type { FrameOptions, NavKey } from "./protocol.js";
+export { NAV_KEYS } from "./protocol.js";
+export type { FrameTheme } from "../core/theme.js";
 export type { Delivery } from "./delivery.js";
 export { FRAME_CSP, FRAME_PERMISSIONS, frameCsp, frameHeaders, type FrameOrigins } from "./policy.js";
 
@@ -61,7 +78,13 @@ export interface SandboxConfig {
    * registrable domain of its own that sets no cookies.
    */
   url: string;
-  /** The formats the frame opens, in detection order. Default: every built-in one. */
+  /**
+   * The formats the frame opens, in detection order. Default: every built-in
+   * one but `CONVERTED_FORMATS`, which are named to be opened (and which
+   * need the frame built with an external converter for what the package's
+   * own converters do not read, `externalConverter`): `BUILTIN_ORDER` names
+   * them all.
+   */
   formats?: readonly BuiltinFormat[];
   /** Plugin options, as plain data. */
   options?: FrameOptions;
@@ -86,15 +109,46 @@ export interface SandboxConfig {
    * reports its policy when it starts: one that differs is refused.
    */
   origins?: FrameOrigins;
+  /**
+   * The keys handed back from the frame when the document does not use them
+   * (`NAV_KEYS`, by default all of them), dispatched as a `keydown` on the
+   * `<iframe>` that bubbles to this page's listeners. `false`: none. They
+   * come from the frame: at most `KEY_RATE` a second, never a key with a
+   * modifier but Shift, and `isTrusted` false.
+   */
+  keys?: readonly NavKey[] | false;
+  /**
+   * The frame's colours and sizes (`TOKENS`): "inherit" (default) reads the
+   * values in force where each file is mounted, so the page's own CSS
+   * custom properties reach the frame; a theme sets them; null leaves the
+   * frame's defaults. Read again on `restyle()`, and when the device's
+   * colour scheme changes.
+   */
+  theme?: "inherit" | FrameTheme | null;
 }
 
+/** A `Viewer` whose files run in sandboxed frames. */
+export interface SandboxedViewer extends Viewer {
+  /** Sends the theme again to every frame shown: after the page's theme changed. */
+  restyle(): void;
+}
+
+/** Keys taken from a frame in one second, at most. */
+export const KEY_RATE = 30;
+
 const ALL: readonly BuiltinFormat[] = BUILTIN_ORDER;
+/** The converted formats only when named: they need the converter. */
+const DEFAULT: readonly BuiltinFormat[] = ALL.filter((f) => !CONVERTED_FORMATS.includes(f));
 
 function matcher(id: BuiltinFormat): FormatMatcher {
   if (id !== "image") return MATCHERS[id];
   // The frame decodes what browsers do not draw.
-  const a = MATCHERS.image;
-  return { types: [...(a.types ?? []), ...(WASM_IMAGES.types ?? [])], extensions: [...(a.extensions ?? []), ...(WASM_IMAGES.extensions ?? [])] };
+  const all = [MATCHERS.image, WASM_IMAGES];
+  return {
+    types: all.flatMap((m) => m.types ?? []),
+    extensions: all.flatMap((m) => m.extensions ?? []),
+    extensionOverrides: all.flatMap((m) => m.extensionOverrides ?? []),
+  };
 }
 
 function toStatus(s: StatusSnapshot): Status {
@@ -103,12 +157,29 @@ function toStatus(s: StatusSnapshot): Status {
 
 const defaultConfirm = (url: string) => window.confirm(`Open this link in a new tab?\n\n${url}`);
 
+/**
+ * Why a picture from the frame is not the one asked for, or null. The size
+ * it was asked at is a promise the frame must keep: the host does not take
+ * a bitmap of another size for it.
+ */
+export function rasterMismatch(asked: Omit<RasterOptions, "signal">, got: Extract<RasterResult, { ok: true }>, space: string): string | null {
+  if (got.space !== space) return `a picture in the space ${got.space}, not ${space}`;
+  if (got.width > MAX_PICTURE_EDGE || got.height > MAX_PICTURE_EDGE || got.width * got.height > MAX_PICTURE_PIXELS) return "a picture past the limits";
+  const whole = (n: number) => Math.max(1, Math.round(n));
+  if (asked.width !== undefined && got.width !== whole(asked.width)) return `a picture ${got.width} px wide, not ${whole(asked.width)}`;
+  if (asked.height !== undefined && got.height !== whole(asked.height)) return `a picture ${got.height} px high, not ${whole(asked.height)}`;
+  if (asked.longEdge !== undefined && Math.max(got.width, got.height) > whole(asked.longEdge)) return `a picture longer than the ${whole(asked.longEdge)} px asked`;
+  return null;
+}
+
 /** The viewer's `plugins` are empty: they live in the frame. */
-export function createSandboxedViewer(config: SandboxConfig): Viewer {
+export function createSandboxedViewer(config: SandboxConfig): SandboxedViewer {
   checkDelivery(config.delivery, config.origins);
-  const formats = (config.formats ?? ALL).filter((f) => ALL.includes(f));
+  const formats = (config.formats ?? DEFAULT).filter((f) => ALL.includes(f));
   const detector = createDetector(formats.map((id) => ({ id, match: matcher(id) })));
-  const mount = (host: HTMLElement, file: ViewerFile): Session => mountFrame(config, formats, detector.detect(file), host, file);
+  /** Each frame shown, by what sends it its theme again. */
+  const shown = new Set<() => void>();
+  const mount = (host: HTMLElement, file: ViewerFile): Session => mountFrame(config, formats, detector.detect, host, file, shown);
   return {
     ...detector,
     plugins: [],
@@ -116,7 +187,17 @@ export function createSandboxedViewer(config: SandboxConfig): Viewer {
     mount,
     // The frame fetches its engines itself, from its own origin.
     prefetch: async () => {},
+    restyle: () => {
+      for (const restyle of shown) restyle();
+    },
   };
+}
+
+/** The theme for a frame in `host`, as `config.theme` says. */
+function themeFor(config: SandboxConfig, host: HTMLElement): FrameTheme {
+  const theme = config.theme === undefined ? "inherit" : config.theme;
+  if (theme === null) return { tokens: {}, scheme: null };
+  return theme === "inherit" ? themeOf(host) : checkTheme(theme);
 }
 
 interface Proxy {
@@ -124,16 +205,30 @@ interface Proxy {
   status: WritableStore<Status>;
   controllers: WritableStore<Controllers>;
   stores: Partial<{ [K in ControllerKey]: WritableStore<Snapshots[K]> }>;
+  /** Listeners on the stores the frame follows only on request, over all the controllers the session has had. */
+  watchers: Record<WatchedKey, number>;
 }
 
-function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], detected: FormatId | null, host: HTMLElement, file: ViewerFile): Session {
-  const format = file.format ?? detected;
+function mountFrame(
+  config: SandboxConfig,
+  formats: readonly BuiltinFormat[],
+  detect: (file: ViewerFile) => FormatId | null,
+  host: HTMLElement,
+  file: ViewerFile,
+  shown: Set<() => void>,
+): Session {
+  const format = file.format ?? detect(file);
   const known = formats.find((f) => f === format) ?? null;
   const abort = new AbortController();
   let ended = false;
   /** The file as the frame will get it, read from the start. */
   let prepared: Promise<Prepared> | null = null;
-  let ranges: Extract<Prepared, { kind: "ranges" }>["ranges"] | null = null;
+  /** The file on screen: the one `replace` last took. */
+  let current = file;
+  /** The bytes of each file read by ranges that is alive, by the number the frame names it with (0 is the first). */
+  const documents = new Map<number, Extract<Prepared, { kind: "ranges" }>["ranges"]>();
+  /** How the first file was delivered: what the frame's engines were made for. */
+  let firstKind: Prepared["kind"] | null = null;
   /** The frame's reads not answered yet. */
   const reads = new Map<number, { length: number; abort: AbortController }>();
   let outstanding = 0;
@@ -145,6 +240,23 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
   let nextCall = 1;
   const pending = new Map<number, () => void>();
   const sessions = new Map<number, Proxy>();
+  /** Pictures asked of the frame, not drawn yet, with what each was asked for. */
+  const draws = new Map<number, { options: RasterOptions; space: string | null; done: (result: RasterResult) => void }>();
+  let nextDraw = 1;
+  /** Documents sent to replace the one shown, not answered yet (`replace`). */
+  const replacements = new Map<number, (ok: boolean) => void>();
+  /** Whether the frame has been given the file: only then can it take another. */
+  let started = false;
+  /** The newest `replace` call, and the one before it still to be answered. */
+  let latest = 0;
+  let superseding: AbortController | null = null;
+  let answered: Promise<unknown> = Promise.resolve();
+  let lastDocument = 0;
+  const keys = new Set<string>(config.keys === false ? [] : (config.keys ?? NAV_KEYS));
+  /** When the keys of the last second came. */
+  let keyTimes: number[] = [];
+  const restyle = () => port?.postMessage({ type: "theme", theme: themeFor(config, host) } satisfies ThemeMessage);
+  const scheme = typeof matchMedia === "function" ? matchMedia("(prefers-color-scheme: dark)") : null;
 
   const proxy = (id: number, info: { file: ViewerFile; format: FormatId | null }): Proxy => {
     const status = writable<Status>({ phase: "loading" });
@@ -153,13 +265,16 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
       status,
       controllers,
       stores: {},
+      watchers: { viewport: 0 },
       session: {
-        file: info.file,
+        get file() {
+          return id === 0 ? current : info.file;
+        },
         format: info.format,
         status,
         controllers,
-        // A frame holds one file: the next document gets a new frame.
-        replace: async () => false,
+        // A member shown by an archive is replaced by opening another.
+        replace: id === 0 ? (next) => replace(next) : async () => false,
         resize: () => {},
         // A member is closed through its archive's `back`.
         destroy: id === 0 ? () => end() : () => {},
@@ -190,6 +305,14 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
     port = null;
     for (const resolve of pending.values()) resolve();
     pending.clear();
+    for (const { done } of draws.values()) done({ ok: false, code: "aborted" });
+    draws.clear();
+    for (const resolve of replacements.values()) resolve(false);
+    replacements.clear();
+    superseding?.abort();
+    documents.clear();
+    shown.delete(restyle);
+    scheme?.removeEventListener("change", restyle);
   };
 
   const end = () => {
@@ -203,9 +326,10 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
   const reply = (m: BytesMessage) => port?.postMessage(m, "data" in m ? [m.data] : []);
 
   /** A read the frame asked for: checked, then answered with the bytes or a refusal. */
-  const read = (id: number, offset: number, length: number) => {
+  const read = (id: number, generation: number, offset: number, length: number) => {
     // An id already in use is the frame's confusion: its first read stands.
     if (reads.has(id)) return;
+    const ranges = documents.get(generation);
     const why = ranges ? readRefusal({ offset, length }, ranges.size, { count: reads.size, bytes: outstanding }) : "the file is not read by ranges";
     if (why) {
       // Said once: a frame could ask a thousand times.
@@ -246,6 +370,44 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
       port.postMessage(message);
     });
 
+  /**
+   * A picture of a page, from the frame. Rejects with a `RasterError`: the
+   * frame's own, or "failed" when too many are being drawn, the frame ends
+   * first, or what it sent is not what was asked for.
+   */
+  const draw = (session: number, page: number, options: RasterOptions, space: string): Promise<Raster> =>
+    new Promise<Raster>((resolve, reject) => {
+      const { signal, ...plain } = options;
+      if (!port || signal?.aborted) return reject(new RasterError("aborted", "aborted"));
+      if (draws.size >= MAX_DRAWS) return reject(new RasterError("failed", `more than ${MAX_DRAWS} pictures at once`));
+      const id = nextDraw++;
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        reject(new RasterError("aborted", "aborted"));
+        // The slot stays taken until the frame answers: a frame that never does cannot be asked for more.
+        port?.postMessage({ type: "unraster", id } satisfies UnrasterMessage);
+      };
+      const done = (result: RasterResult) => {
+        signal?.removeEventListener("abort", onAbort);
+        const bitmap = result.ok ? result.bitmap : null;
+        if (settled) return bitmap?.close();
+        settled = true;
+        if (!result.ok) return reject(new RasterError(result.code));
+        const wrong = rasterMismatch(plain, result, space);
+        if (wrong) {
+          result.bitmap.close();
+          return reject(new RasterError("failed", wrong));
+        }
+        const { ok: _ok, ...raster } = result;
+        resolve(raster);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      draws.set(id, { options: plain, space, done });
+      port.postMessage({ type: "raster", id, session, page, options: plain } satisfies RasterMessage);
+    });
+
   /** The member session each archive session shows. */
   const children = new Map<number, number>();
   const forget = (id: number) => {
@@ -278,12 +440,53 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
   };
 
   /** What the host itself has to say about the file, after the frame's warnings. */
-  let hostWarnings: readonly { key: string; count: number }[] = [];
+  let hostWarnings: Snapshots["warnings"] = [];
+  /** The frame's own warnings for the file shown, as the frame sent them. */
+  let frameWarnings: Store<Snapshots["warnings"]> | null = null;
   const withHostWarnings = (id: number, frame: Store<Snapshots["warnings"]> | null): Store<Snapshots["warnings"]> | null => {
+    if (id === 0) frameWarnings = frame;
     if (id !== 0 || hostWarnings.length === 0) return frame;
     const own = hostWarnings;
     return frame ? derived(frame, (w) => [...w, ...own]) : writable(own);
   };
+  const setHostWarnings = (next: Snapshots["warnings"]) => {
+    hostWarnings = next;
+    root.controllers.update(({ warnings: _, ...rest }) => {
+      const w = withHostWarnings(0, frameWarnings);
+      return w ? { ...rest, warnings: w } : rest;
+    });
+  };
+
+  const watch = (session: number, type: WatchMessage["type"], key: WatchedKey) => port?.postMessage({ type, session, key } satisfies WatchMessage);
+
+  /**
+   * A store the frame follows only while someone listens (`WatchMessage`): it
+   * is watched from the first listener to the last, over all the controllers
+   * the session has. A read with no listener asks the frame to report it once
+   * and returns the last value it reported: the answer is for the next read.
+   */
+  const watchedStore = <K extends WatchedKey>(id: number, key: K, store: WritableStore<Snapshots[K]>): Store<Snapshots[K]> => ({
+    get() {
+      const p = sessions.get(id);
+      if (p && p.watchers[key] === 0) {
+        watch(id, "watch", key);
+        watch(id, "unwatch", key);
+      }
+      return store.get();
+    },
+    subscribe(listener) {
+      const p = sessions.get(id);
+      if (p && p.watchers[key]++ === 0) watch(id, "watch", key);
+      const unsubscribe = store.subscribe(listener);
+      let left = false;
+      return () => {
+        if (left) return;
+        left = true;
+        unsubscribe();
+        if (p && --p.watchers[key] === 0) watch(id, "unwatch", key);
+      };
+    },
+  });
 
   const buildControllers = (id: number, values: Partial<Snapshots>, statics: Statics): Controllers => {
     const p = sessions.get(id)!;
@@ -342,6 +545,19 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
           void command(id, "layers", "setAll", [visible]);
         },
       };
+    const storeys = store("storeys");
+    if (storeys)
+      c.storeys = {
+        ...storeys,
+        setVisible: (storey, visible) => {
+          storeys.update((s) => ({ ...s, items: s.items.map((i) => (i.id === storey ? { ...i, visible } : i)) }));
+          void command(id, "storeys", "setVisible", [storey, visible]);
+        },
+        setAll: (visible) => {
+          storeys.update((s) => ({ ...s, items: s.items.map((i) => ({ ...i, visible })) }));
+          void command(id, "storeys", "setAll", [visible]);
+        },
+      };
     const layouts = store("layouts");
     if (layouts) c.layouts = { ...layouts, select: (layout) => command(id, "layouts", "select", [layout]) };
     const ground = store("ground");
@@ -360,6 +576,23 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
     if (info) c.info = info;
     const warnings = withHostWarnings(id, store("warnings"));
     if (warnings) c.warnings = warnings;
+    const media = store("media");
+    if (media)
+      c.media = {
+        ...media,
+        play: () => command(id, "media", "play"),
+        pause: () => void command(id, "media", "pause"),
+        seek: (seconds) => void command(id, "media", "seek", [seconds]),
+        setVolume: (volume) => void command(id, "media", "setVolume", [volume]),
+        setMuted: (muted) => void command(id, "media", "setMuted", [muted]),
+        setRate: (rate) => void command(id, "media", "setRate", [rate]),
+      };
+    const sheets = store("sheets");
+    if (sheets) c.sheets = { ...sheets, select: (index) => command(id, "sheets", "select", [index]) };
+    const pictures = store("pictures");
+    if (pictures) c.pictures = picturesOver(pictures, (page, options) => draw(id, page, options, pictures.get().space));
+    const viewport = store("viewport");
+    if (viewport) c.viewport = watchedStore(id, "viewport", viewport);
     const archive = store("archive");
     if (archive) {
       const state = writable(archiveState(id, archive.get()));
@@ -387,7 +620,7 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
         return;
       }
       case "read":
-        return read(message.id, message.offset, message.length);
+        return read(message.id, message.generation, message.offset, message.length);
       case "cancel":
         reads.get(message.id)?.abort.abort();
         return;
@@ -412,6 +645,30 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
         resolve?.();
         return;
       }
+      case "rastered": {
+        const asked = draws.get(message.id);
+        draws.delete(message.id);
+        // A picture not asked for is not kept.
+        if (asked) asked.done(message.result);
+        else if (message.result.ok) message.result.bitmap.close();
+        return;
+      }
+      case "replaced": {
+        // An answer to no call is ignored.
+        const resolve = replacements.get(message.call);
+        replacements.delete(message.call);
+        resolve?.(message.ok);
+        return;
+      }
+      case "key": {
+        if (!keys.has(message.key) || !iframe) return;
+        const now = performance.now();
+        keyTimes = keyTimes.filter((t) => now - t < 1000);
+        if (keyTimes.length >= KEY_RATE) return;
+        keyTimes.push(now);
+        iframe.dispatchEvent(new KeyboardEvent("keydown", { key: message.key, code: message.key, shiftKey: message.shift, repeat: message.repeat, bubbles: true, cancelable: true, composed: true }));
+        return;
+      }
       case "link": {
         const url = linkTarget(message.url);
         // One question at a time: a frame cannot queue a hundred.
@@ -429,33 +686,93 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
     }
   };
 
+  /** What the frame is given of a prepared file; a file read by ranges is kept as document `generation`. */
+  const sourceOf = (p: Prepared, generation: number, transfer: Transferable[]): OpenSource => {
+    if (p.kind === "ranges") {
+      documents.set(generation, p.ranges);
+      const head = p.ranges.head.slice().buffer as ArrayBuffer;
+      transfer.push(head);
+      return { kind: "ranges", size: p.ranges.size, head };
+    }
+    return p.kind === "url" ? { kind: "url", url: p.url } : { kind: "blob", blob: p.blob };
+  };
+
+  const readWhole = (p: Prepared): Snapshots["warnings"] => (p.kind === "blob" && p.readWhole ? [{ key: "source_read_whole", count: 1 }] : []);
+
   const send = async () => {
     try {
       const p = await prepared!;
       if (ended || !port) return;
-      if (p.kind === "blob" && p.readWhole) {
-        hostWarnings = [{ key: "source_read_whole", count: 1 }];
-        root.controllers.update((c) => ({ ...c, warnings: withHostWarnings(0, c.warnings ?? null)! }));
-      }
-      let source: OpenSource;
+      firstKind = p.kind;
+      if (readWhole(p).length) setHostWarnings(readWhole(p));
       const transfer: Transferable[] = [];
-      if (p.kind === "ranges") {
-        ranges = p.ranges;
-        const head = p.ranges.head.slice().buffer as ArrayBuffer;
-        transfer.push(head);
-        source = { kind: "ranges", size: p.ranges.size, head };
-      } else source = p.kind === "url" ? { kind: "url", url: p.url } : { kind: "blob", blob: p.blob };
       const message: OpenMessage = {
         type: "open",
         formats,
         file: { name: file.name, type: file.type ?? "", path: file.path ?? file.name, format: known },
-        source,
+        source: sourceOf(p, 0, transfer),
         options: config.options ?? {},
+        theme: themeFor(config, host),
       };
       port.postMessage(message, transfer);
+      started = true;
+      shown.add(restyle);
+      if (config.theme === undefined || config.theme === "inherit") scheme?.addEventListener("change", restyle);
     } catch (error) {
       if (!abort.signal.aborted) fail(errorCode(format), error);
     }
+  };
+
+  /**
+   * `Session.replace` for the file's session. The frame takes one document
+   * at a time: a newer call while an older one is being read supersedes it
+   * (that one resolves true, as in the page), and while one is with the frame
+   * the next waits for its answer.
+   */
+  const replace = async (next: ViewerFile): Promise<boolean> => {
+    if (ended || !started || !port || !known || !next.source) return false;
+    if ((next.format ?? detect(next)) !== known) return false;
+    const mine = ++latest;
+    superseding?.abort();
+    const own = new AbortController();
+    superseding = own;
+    const signal = AbortSignal.any([abort.signal, own.signal]);
+    let p: Prepared;
+    try {
+      p = await prepare(next.source, known, next, { delivery: config.delivery, origins: config.origins, signal });
+    } catch (error) {
+      // Superseded, or the session ended: not a failure. Otherwise the old document stays, under the error.
+      if (signal.aborted) return true;
+      console.warn(`${format ?? "viewer"}: the next document could not be read`, error);
+      root.status.set({ phase: "error", error: { code: errorCode(format), cause: error } });
+      return true;
+    }
+    // The frame's engines were made for the way the first file came: an image shown from a URL is drawn without CORS.
+    if ((p.kind === "url") !== (firstKind === "url")) return false;
+    await answered;
+    if (mine !== latest || ended || !port) return true;
+    const generation = ++lastDocument;
+    const transfer: Transferable[] = [];
+    const message: ReplaceMessage = {
+      type: "replace",
+      call: nextCall++,
+      generation,
+      file: { name: next.name, type: next.type ?? "", path: next.path ?? next.name, format: known },
+      source: sourceOf(p, generation, transfer),
+    };
+    const reply = new Promise<boolean>((resolve) => replacements.set(message.call, resolve));
+    answered = reply;
+    port.postMessage(message, transfer);
+    const ok = await reply;
+    if (!ok) {
+      documents.delete(generation);
+      return false;
+    }
+    // The reads of the documents before this one are over with them.
+    for (const g of [...documents.keys()]) if (g !== generation) documents.delete(g);
+    current = next;
+    setHostWarnings(readWhole(p));
+    return true;
   };
 
   if (!file.source) {
@@ -469,18 +786,21 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
       delivery: config.delivery,
       origins: config.origins,
       signal: abort.signal,
-      progress: (share) => root.status.get().phase === "loading" && root.status.set({ phase: "loading", progress: share }),
+      progress: (share) => root.status.get().phase === "loading" && root.status.set({ phase: "loading", step: "file", progress: share }),
     });
     // Refused or failed: said at once, without waiting for the frame.
     prepared.catch((error) => !abort.signal.aborted && fail(errorCode(format), error));
     const frame = document.createElement("iframe");
     // Scripts only: an opaque origin, no popups, no navigation of this page,
-    // no downloads, no forms, no modal dialogs.
+    // no downloads, no forms, no modal dialogs. Of the powerful features,
+    // autoplay: a player started by this page's controls (`media.play`).
     frame.setAttribute("sandbox", "allow-scripts");
-    frame.setAttribute("allow", "");
+    frame.setAttribute("allow", "autoplay");
     frame.setAttribute("referrerpolicy", "no-referrer");
-    frame.className = "exv-sandbox";
+    frame.className = "exav-viewer-sandbox";
     frame.title = file.name;
+    // Filling the host element without the stylesheet too, for a host drawing its own UI.
+    Object.assign(frame.style, { display: "block", width: "100%", height: "100%", border: "0" });
     let loads = 0;
     frame.addEventListener("load", () => {
       loads += 1;
@@ -503,5 +823,15 @@ function mountFrame(config: SandboxConfig, formats: readonly BuiltinFormat[], de
     host.append(frame);
   }
 
-  return { ...root.session, destroy: end };
+  return {
+    get file() {
+      return current;
+    },
+    format: root.session.format,
+    status: root.session.status,
+    controllers: root.session.controllers,
+    replace,
+    resize: root.session.resize,
+    destroy: end,
+  };
 }

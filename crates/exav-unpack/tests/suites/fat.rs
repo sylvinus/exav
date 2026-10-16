@@ -141,3 +141,64 @@ fn a_corrupt_filesystem_is_reported_not_shrugged_off() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The fixture with the first cluster of the root directory's entry `name`
+/// (8.3, padded to 11 bytes) set to `cluster`.
+fn with_first_cluster(name: &[u8; 11], cluster: u16) -> Vec<u8> {
+    let mut img = fixture();
+    let at = img
+        .windows(11)
+        .position(|w| w == name)
+        .unwrap_or_else(|| panic!("no entry {:?}", String::from_utf8_lossy(name)));
+    img[at + 26..at + 28].copy_from_slice(&cluster.to_le_bytes());
+    img
+}
+
+fn walked(blob: &[u8]) -> (Vec<Entry>, Result<Option<()>, exav_unpack::LimitHit>) {
+    let mut out = Vec::new();
+    let mut b = Budget::new(Limits::default());
+    let end = extract_each(
+        Format::Fat,
+        blob,
+        &mut b,
+        &mut |e: Entry, _: &mut Budget| {
+            out.push(e);
+            None::<()>
+        },
+    );
+    (out, end)
+}
+
+/// `fatfs` takes 2 off a cluster number to find its sector, and cluster 1 is
+/// none: it panicked, and the panic ended the walk of the whole volume as an
+/// undecodable one. A directory that names cluster 1 is reported and the rest
+/// of the volume is walked.
+#[test]
+fn a_directory_at_cluster_1_is_reported_and_the_rest_of_the_volume_is_walked() {
+    let (e, end) = walked(&with_first_cluster(b"SUB        ", 1));
+    end.unwrap_or_else(|h| panic!("the volume was ended: {h:?}"));
+    let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+    assert!(
+        names.contains(&"a.bin") && names.contains(&"c.bin"),
+        "{names:?}"
+    );
+    let bad = e
+        .iter()
+        .find(|x| x.name == "<fat-dir:sub>")
+        .unwrap_or_else(|| panic!("the directory is not reported: {names:?}"));
+    assert!(bad.unsupported.is_some());
+}
+
+/// The same for a file: the others come out, it is reported.
+#[test]
+fn a_file_at_cluster_1_is_reported_and_the_other_files_come_out() {
+    let (e, end) = walked(&with_first_cluster(b"A       BIN", 1));
+    end.unwrap_or_else(|h| panic!("the volume was ended: {h:?}"));
+    let by = |n: &str| e.iter().find(|x| x.name == n);
+    assert!(by("a.bin").is_some_and(|x| x.unsupported.is_some()));
+    assert!(by("c.bin").is_some_and(|x| x.unsupported.is_none()));
+    assert_eq!(
+        by("sub/p.zip").map(|x| sha256_hex(&x.data)).as_deref(),
+        Some(PAYLOAD)
+    );
+}

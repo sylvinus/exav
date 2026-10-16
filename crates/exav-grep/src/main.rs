@@ -101,6 +101,15 @@ struct Cli {
     /// hiding them turns "I couldn't look" into an indistinguishable "no match".
     #[arg(long)]
     quiet_unreadable: bool,
+
+    /// Search the text a reader sees rather than the bytes, for the files that
+    /// have one: Markdown, HTML, Office and OpenDocument XML parts, PDF and
+    /// drawings (DXF, DWG). Entities are decoded and each link is followed by
+    /// where it goes; matches are reported under `file.md!text`, with the
+    /// text's line numbers.
+    #[cfg(feature = "text")]
+    #[arg(long)]
+    text: bool,
 }
 
 fn main() -> ExitCode {
@@ -137,6 +146,10 @@ fn main() -> ExitCode {
         after_context: cli.after_context.max(ctx),
         max_count: cli.max_count,
         binary_as_matches: true,
+        #[cfg(feature = "text")]
+        text: cli.text,
+        #[cfg(not(feature = "text"))]
+        text: false,
     };
 
     let mut searcher = Searcher::new(matcher, opts);

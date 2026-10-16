@@ -54,21 +54,21 @@ const total = (seen: Fetched[]) => seen.reduce((n, f) => n + f.length, 0);
 
 async function open(page: Page, query: string, phase = "ready"): Promise<void> {
   await page.goto(`./?lang=en&${query}`);
-  await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", phase);
+  await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", phase);
 }
 
 async function inside(page: Page): Promise<Frame> {
-  const frame = await (await page.locator(".demo-frame iframe.exv-sandbox").elementHandle())!.contentFrame();
+  const frame = await (await page.locator(".demo-frame iframe.exav-viewer-sandbox").elementHandle())!.contentFrame();
   if (!frame) throw new Error("no frame");
   return frame;
 }
 
 /** The first page's bitmap, once pdf.js has drawn into it (300 x 150 is a new canvas's size). */
 async function firstPageDrawn(page: Page): Promise<void> {
-  const frame = page.frameLocator(".demo-frame iframe.exv-sandbox");
-  const canvas = frame.locator(".exv-pdf-bitmap").first();
+  const frame = page.frameLocator(".demo-frame iframe.exav-viewer-sandbox");
+  const canvas = frame.locator(".exav-viewer-pdf-bitmap").first();
   await expect.poll(() => canvas.evaluate((c: HTMLCanvasElement) => `${c.width}x${c.height}`)).not.toBe("300x150");
-  await expect(frame.locator(".exv-pdf-page")).toHaveCount(PDF_PAGES);
+  await expect(frame.locator(".exav-viewer-pdf-page")).toHaveCount(PDF_PAGES);
 }
 
 test.describe("media by URL", () => {
@@ -76,7 +76,7 @@ test.describe("media by URL", () => {
 
   /** Plays, then seeks near the end and plays on. */
   async function playAndSeek(frame: Frame): Promise<void> {
-    const video = frame.locator(".exv-media video");
+    const video = frame.locator(".exav-viewer-media video");
     await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(1);
     const duration = await video.evaluate((v: HTMLVideoElement) => v.duration);
     expect(duration).toBeGreaterThan(8);
@@ -106,7 +106,7 @@ test.describe("media by URL", () => {
     await open(page, "url=/e2e/paced/clip.webm");
     const frame = await inside(page);
     test.skip(!(await playable(frame)), "this browser plays no VP8");
-    expect(await frame.locator(".exv-media video").evaluate((v: HTMLVideoElement) => v.src)).toBe(new URL("/e2e/paced/clip.webm", page.url()).href);
+    expect(await frame.locator(".exav-viewer-media video").evaluate((v: HTMLVideoElement) => v.src)).toBe(new URL("/e2e/paced/clip.webm", page.url()).href);
     await playAndSeek(frame);
     expect(seen.length).toBeGreaterThan(0);
     for (const f of seen) {
@@ -126,7 +126,7 @@ test.describe("media by URL", () => {
     await open(page, "url=/e2e/clip.webm&delivery=media:blob");
     const frame = await inside(page);
     test.skip(!(await playable(frame)), "this browser plays no VP8");
-    expect(await frame.locator(".exv-media video").evaluate((v: HTMLVideoElement) => v.src)).toMatch(/^blob:/);
+    expect(await frame.locator(".exav-viewer-media video").evaluate((v: HTMLVideoElement) => v.src)).toMatch(/^blob:/);
     await playAndSeek(frame);
     expect(seen.map((f) => [f.byFrame, f.status])).toEqual([[false, 200]]);
     expect(total(seen)).toBe(size("clip.webm"));
@@ -137,7 +137,7 @@ test.describe("media by URL", () => {
     const asked: string[] = [];
     page.on("request", (r) => r.url().startsWith(other) && asked.push(r.url()));
     await open(page, `url=${other}/e2e/clip.webm&delivery=media:url`, "error");
-    await expect(page.locator(".demo-frame iframe.exv-sandbox")).toHaveCount(0);
+    await expect(page.locator(".demo-frame iframe.exav-viewer-sandbox")).toHaveCount(0);
     expect(asked).toEqual([]);
 
     // Given to an element in the frame all the same, it is not fetched.
@@ -159,12 +159,12 @@ test.describe("media by URL", () => {
     const seen = record(page, "/e2e/samples/landscape.png");
     await open(page, "url=/e2e/samples/landscape.png");
     const frame = await inside(page);
-    const img = frame.locator(".exv-image-picture");
+    const img = frame.locator(".exav-viewer-image-picture");
     expect(await img.evaluate((i: HTMLImageElement) => [i.src, i.crossOrigin, i.naturalWidth > 0])).toEqual([new URL("/e2e/samples/landscape.png", page.url()).href, null, true]);
     expect(seen.map((f) => f.byFrame)).toEqual([true]);
     // Drawn into a canvas, it taints it: nothing in the frame reads its pixels.
     const read = await frame.evaluate(() => {
-      const i = document.querySelector<HTMLImageElement>(".exv-image-picture")!;
+      const i = document.querySelector<HTMLImageElement>(".exav-viewer-image-picture")!;
       const c = document.createElement("canvas");
       c.width = c.height = 4;
       const ctx = c.getContext("2d")!;
@@ -180,7 +180,7 @@ test.describe("media by URL", () => {
     // The surface zooms it as any picture.
     const scale = () => img.evaluate((i) => getComputedStyle(i.parentElement!).transform);
     const before = await scale();
-    const box = (await page.locator(".demo-frame iframe.exv-sandbox").boundingBox())!;
+    const box = (await page.locator(".demo-frame iframe.exav-viewer-sandbox").boundingBox())!;
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
     await page.mouse.wheel(0, -300);
     await expect.poll(scale).not.toBe(before);
@@ -207,7 +207,7 @@ test.describe("PDF", () => {
     expect(seen.map((f) => [f.byFrame, f.status])).toEqual([[false, 200]]);
     expect(total(seen)).toBe(size("big.pdf"));
     expect(warned.some((w) => w.includes("does not answer range requests"))).toBe(true);
-    await expect(page.locator(".demo-frame .exv-warnings")).toHaveText("The server does not send parts of the file: all of it was downloaded.");
+    await expect(page.locator(".demo-frame .exav-viewer-warnings")).toHaveText("The server does not send parts of the file: all of it was downloaded.");
   });
 
   test('by "url": pdf.js in the frame fetches it from the connect origin', async ({ page }) => {
@@ -269,7 +269,8 @@ test.describe("PDF", () => {
             out[m.id] = m.data ? `${m.data.byteLength} bytes` : m.error!;
             if (Object.keys(out).length === 6) setTimeout(() => resolve(out), 300);
           });
-          for (const [id, offset, length] of reads) port.postMessage({ type: "read", id, offset, length });
+          // Generation 0 is the first document the frame was opened with.
+          for (const [id, offset, length] of reads) port.postMessage({ type: "read", id, generation: 0, offset, length });
         }),
       [file],
     );
@@ -283,15 +284,15 @@ test.describe("archives", () => {
     const seen = record(page, "/e2e/big.zip");
     await open(page, "url=/e2e/big.zip");
     const body = page.locator(".demo-frame");
-    await expect(body.locator(".exv-archive-head")).toHaveText("16 files");
+    await expect(body.locator(".exav-viewer-archive-head")).toHaveText("16 files");
     expect(seen.every((f) => !f.byFrame && f.status === 206)).toBe(true);
     // Its start, its end, the 64 KiB block of each member's local header.
     expect(total(seen)).toBeLessThan(size("big.zip") * 0.1);
     await body.getByRole("button", { name: new RegExp(ZIP_PICTURE.replace(".", "\\.")) }).click();
-    await expect(page.locator(".demo-frame .exv-body").last()).toHaveAttribute("data-phase", "ready");
-    await expect(page.frameLocator(".demo-frame iframe.exv-sandbox").locator(".exv-image-picture")).toHaveCount(1);
+    await expect(page.locator(".demo-frame .exav-viewer-body").last()).toHaveAttribute("data-phase", "ready");
+    await expect(page.frameLocator(".demo-frame iframe.exav-viewer-sandbox").locator(".exav-viewer-image-picture")).toHaveCount(1);
     expect(total(seen)).toBeLessThan(size("big.zip") * 0.2);
-    await expect(page.locator(".demo-frame .exv-warnings")).toHaveCount(0);
+    await expect(page.locator(".demo-frame .exav-viewer-warnings")).toHaveCount(0);
   });
 
   test("a ZIP the ranged reader cannot list is read whole instead, and listed", async ({ page }) => {
@@ -299,7 +300,7 @@ test.describe("archives", () => {
     page.on("console", (m) => m.type() === "warning" && warned.push(m.text()));
     const seen = record(page, "/e2e/spaced.zip");
     await open(page, "url=/e2e/spaced.zip");
-    await expect(page.locator(".demo-frame .exv-archive-head")).toHaveText(`${SPACED_MEMBERS} files`);
+    await expect(page.locator(".demo-frame .exav-viewer-archive-head")).toHaveText(`${SPACED_MEMBERS} files`);
     expect(warned.some((w) => w.includes("could not be read by ranges"))).toBe(true);
     // Still read by the host, by ranges: the server answers them. All of it, this time.
     expect(seen.every((f) => !f.byFrame && f.status === 206)).toBe(true);

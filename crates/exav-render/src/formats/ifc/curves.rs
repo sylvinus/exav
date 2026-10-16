@@ -122,7 +122,19 @@ impl<'a> Reader<'a> {
             | b"IFCOUTERBOUNDARYCURVE"
             | b"IFCBOUNDARYCURVE" => {
                 let mut out = Vec::new();
-                for seg in p.first()?.list()?.iter().filter_map(Value::id) {
+                let segs = p.first()?.list()?;
+                // IFC4X3: segments cut from parent curves, along an alignment.
+                if segs
+                    .first()
+                    .and_then(Value::id)
+                    .and_then(|s| self.get(s))
+                    .is_some_and(|(t, _)| t == b"IFCCURVESEGMENT")
+                {
+                    return self
+                        .curve_segments(segs)
+                        .map(|s| s.into_iter().map(|(_, q)| q).collect());
+                }
+                for seg in segs.iter().filter_map(Value::id) {
                     let (sty, sp) = self.get(seg)?;
                     if !super::is(
                         sty,
@@ -145,7 +157,11 @@ impl<'a> Reader<'a> {
                 }
                 out
             }
-            b"IFCTRIMMEDCURVE" => self.trimmed(&p, depth)?,
+            b"IFCTRIMMEDCURVE" => self
+                .trimmed(&p, depth)?
+                .into_iter()
+                .map(|(_, q)| q)
+                .collect(),
             b"IFCCIRCLE" | b"IFCELLIPSE" => {
                 let (pos, a, b) = self.conic(ty, &p)?;
                 let n = SEGMENTS_PER_TURN as usize;
@@ -156,6 +172,11 @@ impl<'a> Reader<'a> {
             b"IFCBSPLINECURVEWITHKNOTS" | b"IFCRATIONALBSPLINECURVEWITHKNOTS" => {
                 self.bspline(&p)?.into_iter().map(|(_, q)| q).collect()
             }
+            b"IFCGRADIENTCURVE" => self
+                .gradient_curve(&p, depth)?
+                .into_iter()
+                .map(|(_, q)| q)
+                .collect(),
             b"IFCPCURVE" | b"IFCSURFACECURVE" | b"IFCINTERSECTIONCURVE" | b"IFCSEAMCURVE" => {
                 // The 3D curve; the p-curves are its images on surfaces.
                 self.curve(p.first()?.id()?, depth + 1)?
@@ -205,7 +226,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A circle's or an ellipse's placement and semi-axes.
-    fn conic(&self, ty: &[u8], p: &[Value]) -> Option<(Xf, f64, f64)> {
+    pub(super) fn conic(&self, ty: &[u8], p: &[Value]) -> Option<(Xf, f64, f64)> {
         let pos = self.axis2(p.first()?.id()?)?;
         let a = p.get(1)?.num()?;
         let b = if ty == b"IFCELLIPSE" {
@@ -228,7 +249,9 @@ impl<'a> Reader<'a> {
             .collect()
     }
 
-    fn trimmed(&mut self, p: &[Value], depth: u32) -> Option<Vec<V3>> {
+    /// A trimmed curve's points in order, each with its parameter on the
+    /// basis curve (an angle in the file's unit for a circle or ellipse).
+    pub(super) fn trimmed(&mut self, p: &[Value], depth: u32) -> Option<Vec<(f64, V3)>> {
         let basis = p.first()?.id()?;
         let (t1, t2) = (self.trims(p.get(1)), self.trims(p.get(2)));
         let sense = p.get(3).and_then(Value::boolean).unwrap_or(true);
@@ -277,15 +300,18 @@ impl<'a> Reader<'a> {
                     }
                 }
                 let n = segments(e - s);
-                let mut out: Vec<V3> = (0..=n)
-                    .map(|k| conic_point(&pos, a, b, s + (e - s) * k as f64 / n as f64))
+                let mut out: Vec<(f64, V3)> = (0..=n)
+                    .map(|k| {
+                        let t = s + (e - s) * k as f64 / n as f64;
+                        (t / self.angle, conic_point(&pos, a, b, t))
+                    })
                     .collect();
                 // The ends exactly where the trimming points say.
                 if let Trim::Point(q) = t1[i1] {
-                    out[0] = q;
+                    out[0].1 = q;
                 }
                 if let Trim::Point(q) = t2[i2] {
-                    out[n] = q;
+                    out[n].1 = q;
                 }
                 Some(out)
             }
@@ -293,9 +319,17 @@ impl<'a> Reader<'a> {
                 let o = self.point(bp.first()?.id()?)?;
                 let vp = self.f.params(bp.get(1)?.id()?)?;
                 let d = scale(self.direction(vp.first()?.id()?)?, vp.get(1)?.num()?);
+                let dd = dot(d, d);
                 let at = |t: &Trim| match t {
-                    Trim::Point(q) => *q,
-                    Trim::Param(u) => add(o, scale(d, *u)),
+                    Trim::Point(q) => (
+                        if dd > 0.0 {
+                            dot(sub(*q, o), d) / dd
+                        } else {
+                            0.0
+                        },
+                        *q,
+                    ),
+                    Trim::Param(u) => (*u, add(o, scale(d, *u))),
                 };
                 Some(vec![at(&t1[i1]), at(&t2[i2])])
             }
@@ -349,9 +383,9 @@ impl<'a> Reader<'a> {
                 if samples.is_empty() {
                     return None;
                 }
-                let mut out = vec![at(lo)];
-                out.extend(samples.iter().filter(|x| x.0 > lo && x.0 < hi).map(|x| x.1));
-                out.push(at(hi));
+                let mut out = vec![(lo, at(lo))];
+                out.extend(samples.iter().filter(|x| x.0 > lo && x.0 < hi));
+                out.push((hi, at(hi)));
                 // From the first trim to the second.
                 if s > e {
                     out.reverse();
@@ -362,7 +396,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A B-spline curve sampled, with each sample's parameter.
-    fn bspline(&self, p: &[Value]) -> Option<Vec<(f64, V3)>> {
+    pub(super) fn bspline(&self, p: &[Value]) -> Option<Vec<(f64, V3)>> {
         let degree = usize::try_from(p.first()?.int()?)
             .ok()
             .filter(|d| (1..=16).contains(d))?;

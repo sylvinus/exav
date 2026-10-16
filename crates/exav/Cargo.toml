@@ -31,7 +31,7 @@ path = "src/main.rs"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("fuzzing"))'] }
 
 [features]
-default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap", "image-hash"]
+default = ["yara", "all-formats", "decrypt", "dlp", "phishing", "icap", "image-hash", "visible-text"]
 # ICAP (RFC 3507) server, so exav can stand in for a `c-icap` container at a
 # proxy's adaptation hook. On by default (pure Rust, std-only, no extra crates)
 # because the published image has to be able to serve it. It still binds
@@ -70,6 +70,11 @@ phishing = ["exav-core/phishing"]
 # `fuzzy_img#` subsignatures, through exav-imagehash and its image decoders.
 # Without it they load as unsupported, and no image is ever decoded.
 image-hash = ["exav-core/image-hash"]
+# A Markdown document's visible text is matched as a text view, as well as its
+# bytes, through exav-render's Markdown reader. Pure Rust, `forbid(unsafe_code)`.
+visible-text = ["exav-core/visible-text"]
+visible-text-pdf = ["exav-core/visible-text-pdf"]
+visible-text-office = ["exav-core/visible-text-office"]
 decrypt = ["exav-core/decrypt"]
 
 # Archive/container formats, forwarded to exav-core, then exav-unpack. `all-formats`
@@ -148,8 +153,8 @@ exav-core = { path = "../exav-core", version = "0.0.2", default-features = false
 exav-update = { path = "../exav-update", version = "0.0.2", optional = true }
 clap.workspace = true
 walkdir.workspace = true
-libc = "0.2.186"
-regex = "1.12.4"
+libc = "0.2.191"
+regex = "1.13.1"
 # Machine-readable `--json` output.
 serde_json = "1"
 # Spilling large INSTREAM/EXINSTREAM payloads to a temp file is `src/tmpfile.rs`,

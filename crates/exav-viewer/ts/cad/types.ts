@@ -27,8 +27,9 @@ export interface Warnings {
   hatchPatternsMissing: number
   hatchPatternsTruncated: number
   /**
-   * Images, underlays and OLE objects whose content lives in a file the viewer
-   * was not given. Only their frame is drawn.
+   * Xref inserts, images, underlays and OLE objects whose content lives in a
+   * file the viewer was not given. An xref's path is drawn where it is
+   * inserted, the others' frames.
    */
   externalReferences: number
   depthExceeded: number
@@ -40,6 +41,24 @@ export interface Warnings {
    * them can show them.
    */
   proxyWithoutGraphics: number
+  /** What `unknownEntities` counts, by DXF type (at most 16 types). */
+  notDrawn: Record<string, number>
+  /** The files external references name: xrefs, images, underlays (at most 16). */
+  externalFiles: string[]
+}
+
+/** What a tab is drawn on, beyond its geometry. */
+export interface Sheet {
+  /**
+   * Millimetres per drawing unit, which a lineweight on a layout is a width
+   * in: 25.4 for a sheet in inches. 0 for model space, where a lineweight is
+   * a width on the screen.
+   */
+  mmPerUnit: number
+  /** `$LWDISPLAY`: the drawing is shown with its lineweights. */
+  lineweights: boolean
+  /** A layout's paper, `[minX, minY, maxX, maxY]` relative to `origin`; null in model space. */
+  paper: [number, number, number, number] | null
 }
 
 /** The thumbnail a drawing was saved with: a PNG or a BMP file. */
@@ -64,6 +83,11 @@ export interface ParsedDrawing {
   texts: ArrayBuffer
   /** UTF-8 blob the text records index into. */
   textStrings: ArrayBuffer
+  /**
+   * The regions text runs are clipped to, which a record's clip id numbers
+   * from 1: for each, `u32` triangle count, then `f32 x, y` per corner.
+   */
+  clips: ArrayBuffer
   layers: LayerInfo[]
   /** The drawing's tabs, model space first. */
   layouts: LayoutInfo[]
@@ -74,31 +98,38 @@ export interface ParsedDrawing {
   /** [minX, minY, maxX, maxY], relative to `origin`. */
   extents: [number, number, number, number]
   warnings: Warnings
+  sheet: Sheet
   /** Highest draw-order index, for normalising depth. */
   maxOrder: number
   /**
    * Leading strokes and fill vertices that are opaque. Everything after them
-   * is translucent and is drawn without writing depth, so what lies behind
-   * still blends through.
+   * is translucent, in draw order, and is drawn after all of them.
    */
   opaqueStrokes: number
   opaqueFills: number
   /**
-   * Spatial buckets over `strokes`, so a view can skip what it does not touch:
-   * `u32 start, count | f32 minX, minY, maxX, maxY`, 24 bytes each. The box is
-   * the true extent of the bucket's contents in the same origin-relative frame
-   * as the vertex buffers, and can reach outside its own grid square because a
-   * long line belongs to one bucket and crosses many.
+   * Tiles over `strokes`, so a view can skip what it does not touch: `u32
+   * start, count | f32 minX, minY, maxX, maxY`, 24 bytes each. The opaque
+   * half's are spatial buckets, the translucent half's runs of it in draw
+   * order. The box is the true extent of the tile's contents in the same
+   * origin-relative frame as the vertex buffers, and can reach outside its
+   * own grid square because a long line belongs to one bucket and crosses
+   * many.
    */
   strokeTiles: ArrayBuffer
   /** The same over `fills`, with `start` and `count` counted in vertices. */
   fillTiles: ArrayBuffer
   /**
    * Leading entries of each table that cover the opaque half. The two halves
-   * are separate passes, so their buckets must not be interleaved.
+   * are separate passes, so their tiles must not be interleaved.
    */
   opaqueStrokeTiles: number
   opaqueFillTiles: number
+  /**
+   * The translucent pass in draw order: `u32 kind (1 fills, 0 strokes),
+   * first tile, end tile` per run, indices into that kind's table.
+   */
+  translucentRuns: ArrayBuffer
   /** Milliseconds spent in the worker. */
   parseMs: number
 }
@@ -108,5 +139,6 @@ export interface Layer extends LayerInfo {
   visible: boolean
 }
 
-export const STROKE_BYTES = 28
+/** `f32 x0, y0, x1, y1 | u32 rgba, attr, order | f32 bulge` (scene.rs). */
+export const STROKE_BYTES = 32
 export const FILL_BYTES = 20

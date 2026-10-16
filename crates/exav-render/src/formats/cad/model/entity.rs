@@ -68,6 +68,7 @@ pub enum EntityKind {
     Leader(Box<Leader>),
     Line(Line),
     LwPolyline(LwPolyline),
+    Mesh(Box<Mesh>),
     MLine(Box<MLine>),
     MText(Box<MText>),
     MultiLeader(Box<MultiLeader>),
@@ -80,6 +81,7 @@ pub enum EntityKind {
     Spline(Box<Spline>),
     Table(Box<Table>),
     Text(Box<Text>),
+    Tolerance(Box<Tolerance>),
     Trace(Quad),
     Underlay(Box<Underlay>),
     Viewport(Box<Viewport>),
@@ -106,6 +108,7 @@ impl EntityKind {
             EntityKind::Leader(_) => "LEADER",
             EntityKind::Line(_) => "LINE",
             EntityKind::LwPolyline(_) => "LWPOLYLINE",
+            EntityKind::Mesh(_) => "MESH",
             EntityKind::MLine(_) => "MLINE",
             EntityKind::MText(_) => "MTEXT",
             EntityKind::MultiLeader(_) => "MULTILEADER",
@@ -118,6 +121,7 @@ impl EntityKind {
             EntityKind::Spline(_) => "SPLINE",
             EntityKind::Table(_) => "ACAD_TABLE",
             EntityKind::Text(_) => "TEXT",
+            EntityKind::Tolerance(_) => "TOLERANCE",
             EntityKind::Trace(_) => "TRACE",
             EntityKind::Underlay(u) => match u.kind {
                 UnderlayKind::Pdf => "PDFUNDERLAY",
@@ -412,6 +416,63 @@ pub struct Quad {
     pub plane: Plane,
 }
 
+/// MESH (2010 on): a subdivision mesh's control cage, in world
+/// coordinates; its smoothed levels are not stored.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Mesh {
+    pub vertices: Vec<Vec3>,
+    /// Each face's vertex indices, from 0.
+    pub faces: Vec<Vec<u32>>,
+}
+
+impl Mesh {
+    /// The faces of a stored face list (each its corner count, then its
+    /// corners), those naming a vertex the mesh does not have left out.
+    pub fn faces_from_list(list: &[i64], vertices: usize) -> Vec<Vec<u32>> {
+        let mut faces = Vec::new();
+        let mut i = 0;
+        while let Some(&n) = list.get(i) {
+            let Ok(n) = usize::try_from(n) else { break };
+            let Some(ids) = list.get(i + 1..i + 1 + n) else {
+                break;
+            };
+            let face: Option<Vec<u32>> = ids
+                .iter()
+                .map(|&k| u32::try_from(k).ok().filter(|&k| (k as usize) < vertices))
+                .collect();
+            if let Some(face) = face.filter(|f| f.len() >= 2) {
+                faces.push(face);
+            }
+            i += n + 1;
+        }
+        faces
+    }
+}
+
+/// TOLERANCE: a feature control frame, its text in the GD&T font's codes
+/// (`{\Fgdt;j}`), `%%v` between its boxes and `^J` between its rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tolerance {
+    pub insertion: Vec3,
+    pub x_direction: Vec3,
+    pub extrusion: Vec3,
+    pub text: String,
+    /// The dimension style: its text height, gap and colours.
+    pub dimstyle: String,
+}
+
+impl Default for Tolerance {
+    fn default() -> Self {
+        Tolerance {
+            insertion: Vec3::default(),
+            x_direction: Vec3::new(1.0, 0.0, 0.0),
+            extrusion: Vec3::Z,
+            text: String::new(),
+            dimstyle: String::new(),
+        }
+    }
+}
+
 /// 3DFACE, in world coordinates.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Face3D {
@@ -548,6 +609,39 @@ pub struct Insert {
     pub extrusion: Vec3,
     /// The ATTRIB entities that follow it.
     pub attributes: Vec<Entity>,
+    /// Its clipping boundary (XCLIP), when it has one.
+    pub clip: Option<InsertClip>,
+}
+
+/// An insert's clipping boundary: the SPATIAL_FILTER its extension
+/// dictionary names under ACAD_FILTER, then SPATIAL.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InsertClip {
+    /// In the block's coordinates: the filter's points through its inverse
+    /// insert matrix. Two points are a rectangle's opposite corners.
+    pub boundary: Vec<Vec2>,
+    /// Group 71: clipping is on.
+    pub enabled: bool,
+}
+
+impl InsertClip {
+    /// The boundary from a filter's points and its inverse insert matrix,
+    /// 12 numbers by rows of 4 (x' = m0 x + m1 y + m2 z + m3, ...).
+    pub fn from_filter(points: &[Vec2], inverse: &[f64; 12], enabled: bool) -> InsertClip {
+        let m = inverse;
+        InsertClip {
+            boundary: points
+                .iter()
+                .map(|p| {
+                    Vec2::new(
+                        m[0] * p.x + m[1] * p.y + m[3],
+                        m[4] * p.x + m[5] * p.y + m[7],
+                    )
+                })
+                .collect(),
+            enabled,
+        }
+    }
 }
 
 impl Default for Insert {
@@ -563,6 +657,7 @@ impl Default for Insert {
             row_spacing: 0.0,
             extrusion: Vec3::Z,
             attributes: Vec::new(),
+            clip: None,
         }
     }
 }

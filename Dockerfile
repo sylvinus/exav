@@ -38,9 +38,9 @@ ARG BIN_SOURCE=build
 #     of magnitude slower than cross-compiling it.
 # rust:alpine targets *-unknown-linux-musl and links statically. `build-base`
 # provides the C toolchain the TLS stack (ring, via the `http` feature's ureq →
-# rustls) needs to compile under musl. Pinned to 1.92, the MSRV floor (see the
+# rustls) needs to compile under musl. Pinned to 1.95, the MSRV floor (see the
 # workspace `rust-version`, which says what sets it); bump both together.
-FROM rust:1.92-alpine AS build
+FROM rust:1.95-alpine AS build
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /src
 COPY . .

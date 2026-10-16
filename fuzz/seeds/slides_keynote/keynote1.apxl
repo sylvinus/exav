@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<presentation>
+ <theme slide-size="800 600">
+  <prototype-drawables>
+   <shape stroke-color="0 0 1" stroke-width="3"><styles><fill-style fill-type="color" fill-color="0 1 0"/></styles></shape>
+   <textbox transformation="1 0 0 1 0 0"><content font-name="Helvetica" font-size="18" font-color="g 0"/></textbox>
+  </prototype-drawables>
+  <master-slides>
+   <master-slide id="m1" name="Plain">
+    <background-fill-style fill-type="color" fill-color="0.5 0.5 0.5"/>
+    <drawables>
+     <title size="700 80" location="50 30" vertical-alignment="middle"/>
+     <body size="700 400" location="50 130" bullet-indentation="0 30"/>
+    </drawables>
+    <prototype-bullets>
+     <bullet level="1" marker-type="character"><character-bullet-style size="1"><bullet-characters font-size="20">*</bullet-characters></character-bullet-style><content font-size="20"/></bullet>
+    </prototype-bullets>
+   </master-slide>
+  </master-slides>
+ </theme>
+ <slide-list>
+  <slide master-slide-id="m1">
+   <bullets>
+    <bullet level="0"><content font-size="40" font-color="1 0 0">Title one</content></bullet>
+    <bullet level="1" marker-type="inherited"><content>First point</content></bullet>
+   </bullets>
+   <drawables>
+    <title/>
+    <body/>
+    <textbox size="200 50" transformation="1 0 0 1 100 500"><content>Free <span font-size="30">text</span></content></textbox>
+    <shape path="M 0 0 L 100 0 L 100 50 Z" transformation="0 1 -1 0 300 300"/>
+   </drawables>
+  </slide>
+ </slide-list>
+</presentation>

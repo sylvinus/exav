@@ -11,14 +11,15 @@ repository = "https://github.com/sylvinus/exav"
 homepage = "https://exav.org"
 # Checked by `make msrv` rather than asserted: a floor nothing verifies drifts.
 #
-# The number is set by dependencies, not by this code: exav-render's image
-# decoders hayro-jpeg2000 0.4, hayro-jbig2 0.3.1 and hayro-ccitt 0.4 declare
-# 1.92 (and `yara-x-parser` 1.91), so cargo refuses to build them on anything
-# older. exav's own source needs only 1.88 (`slice::as_chunks`,
+# The number is set by dependencies, not by this code: exav-unpack's LHA reader
+# delharc 0.8 declares 1.95 (if-let guards), `sevenz-rust2` 0.24 1.93,
+# exav-render's image decoders hayro-jpeg2000 0.4, hayro-jbig2 0.3.1 and
+# hayro-ccitt 0.4 1.92, and `yara-x-parser` 1.91, so cargo refuses to build them
+# on anything older. exav's own source needs only 1.88 (`slice::as_chunks`,
 # `is_multiple_of`, and the let-chains the `zip` dependency uses). Worth
 # rechecking when those dependencies move; lowering it means confirming with
 # `make msrv`, not editing this line.
-rust-version = "1.92"
+rust-version = "1.95"
 # crates.io discovery. keywords: max 5, <=20 chars each. categories must be from
 # https://crates.io/category_slugs (an invalid one fails `cargo publish`).
 keywords = ["antivirus", "clamav", "malware", "scanner", "security"]
@@ -28,7 +29,7 @@ categories = ["command-line-utilities", "filesystem"]
 # `env` lets every flag name the environment variable it falls back to, so the
 # precedence (flag, then environment, then default) is one rule the parser
 # applies and `--help` prints, rather than per-flag code.
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 walkdir = "2.5"
 
 # Catch integer overflow in release too: on hostile input a silent wraparound

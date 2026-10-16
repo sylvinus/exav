@@ -3,10 +3,12 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightSidebarTopics from 'starlight-sidebar-topics';
 
+const SITE = 'https://exav.org';
 const GITHUB_REPO = 'https://github.com/sylvinus/exav';
+const OG_ALT = 'exav: Memory-safe tools for untrusted files.';
 
 export default defineConfig({
-  site: 'https://exav.org',
+  site: SITE,
   redirects: {
     // Folded into Design principles; keep old links working.
     '/concepts/never-silent/': '/scanner/concepts/design-principles/#never-a-silent-clean',
@@ -97,6 +99,22 @@ export default defineConfig({
         alt: '',
       },
       favicon: '/favicon.svg',
+      // Starlight already writes the description, canonical link, og:title,
+      // og:description, og:type, og:url, og:site_name, og:locale and
+      // twitter:card (summary_large_image) of every page, and the `lang`
+      // attribute. What it does not: the preview image (public/og.png, drawn
+      // by scripts/make-og-image.py) and the browser's theme colour, which is
+      // the dark theme's background (the site is dark only).
+      head: [
+        { tag: 'meta', attrs: { property: 'og:image', content: `${SITE}/og.png` } },
+        { tag: 'meta', attrs: { property: 'og:image:type', content: 'image/png' } },
+        { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+        { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+        { tag: 'meta', attrs: { property: 'og:image:alt', content: OG_ALT } },
+        { tag: 'meta', attrs: { name: 'twitter:image', content: `${SITE}/og.png` } },
+        { tag: 'meta', attrs: { name: 'twitter:image:alt', content: OG_ALT } },
+        { tag: 'meta', attrs: { name: 'theme-color', content: '#17181c' } },
+      ],
       social: [
         { icon: 'github', label: 'GitHub', href: GITHUB_REPO },
       ],
@@ -199,6 +217,7 @@ export default defineConfig({
               { label: 'React UI', slug: 'viewer/react' },
               { label: 'Core API', slug: 'viewer/api' },
               { label: 'Security', slug: 'viewer/security' },
+              { label: 'Example files', slug: 'viewer/examples' },
               { label: 'Live demo', link: '/viewer/demo/', attrs: { target: '_blank' } },
             ],
           },
@@ -233,6 +252,7 @@ export default defineConfig({
             icon: 'open-book',
             items: [
               { label: 'Technical architecture', slug: 'project/architecture' },
+              { label: 'Format matrix', slug: 'project/formats' },
               { label: 'Roadmap', slug: 'project/roadmap' },
               { label: 'Contributing', slug: 'project/contributing' },
               { label: 'Security', slug: 'project/security' },

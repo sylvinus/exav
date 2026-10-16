@@ -23,6 +23,10 @@ mod broken_media;
 mod bzip2_blocks;
 #[cfg(feature = "cab")]
 mod cab_quantum;
+#[cfg(feature = "cab")]
+mod cab_salvage;
+#[cfg(feature = "cab")]
+mod cab_volumes;
 #[cfg(feature = "chm")]
 mod chm;
 #[cfg(feature = "cpio")]
@@ -59,6 +63,8 @@ mod iso_never_silent;
 mod lha_header_bounds;
 #[cfg(feature = "lz4")]
 mod lz4;
+#[cfg(feature = "dmg")]
+mod lzfse;
 #[cfg(feature = "lzw")]
 mod lzw;
 #[cfg(feature = "nsis")]
@@ -102,6 +108,8 @@ mod sevenz_ppmd;
 mod silent_skips;
 #[cfg(feature = "all-formats")]
 mod stream_read_errors;
+#[cfg(feature = "text")]
+mod text;
 #[cfg(feature = "iso")]
 mod udf;
 #[cfg(feature = "upx")]
@@ -110,6 +118,15 @@ mod upx_rebuild;
 mod vba_module_source;
 #[cfg(feature = "vhd")]
 mod vhd;
+#[cfg(all(
+    feature = "diskimage",
+    feature = "vhd",
+    feature = "partition",
+    feature = "ntfs",
+    feature = "fat",
+    feature = "ext"
+))]
+mod virtual_disks;
 #[cfg(feature = "wim")]
 mod wim;
 #[cfg(feature = "xz")]

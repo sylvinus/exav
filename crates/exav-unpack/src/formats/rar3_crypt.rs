@@ -8,6 +8,8 @@
 //! The format has no password check: a wrong password is found out by the
 //! member's checksum.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use aes::cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
 use sha1::{Digest, Sha1};
 
@@ -64,7 +66,7 @@ pub(crate) struct KeyCache {
     limit: usize,
 }
 
-/// The derivations one archive may make: about half a minute of SHA-1.
+/// The derivations one scan may make, whatever the number of archives in it.
 const MAX_DERIVATIONS: usize = 256;
 
 impl Default for KeyCache {
@@ -78,8 +80,14 @@ impl Default for KeyCache {
 
 impl KeyCache {
     /// The keys of `password` over `salt`; `None` when they are not cached and
-    /// the limit of derivations is reached.
-    pub(crate) fn get(&mut self, password: &str, salt: &[u8; 8]) -> Option<Keys> {
+    /// the limit of derivations is reached. `made` counts the derivations of
+    /// the whole scan.
+    pub(crate) fn get(
+        &mut self,
+        password: &str,
+        salt: &[u8; 8],
+        made: &AtomicUsize,
+    ) -> Option<Keys> {
         if let Some((.., k)) = self
             .keys
             .iter()
@@ -87,7 +95,7 @@ impl KeyCache {
         {
             return Some(k.clone());
         }
-        if self.keys.len() >= self.limit {
+        if made.fetch_add(1, Ordering::Relaxed) >= self.limit {
             return None;
         }
         let k = derive(password, salt);
@@ -121,11 +129,33 @@ mod tests {
             keys: Vec::new(),
             limit: 3,
         };
+        let made = AtomicUsize::new(0);
         for salt in 0..10u8 {
-            let got = cache.get("pw", &[salt; 8]);
+            let got = cache.get("pw", &[salt; 8], &made);
             assert_eq!(got.is_some(), salt < 3, "salt {salt}");
         }
-        assert!(cache.get("pw", &[1; 8]).is_some(), "a cached one is served");
+        assert!(
+            cache.get("pw", &[1; 8], &made).is_some(),
+            "a cached one is served"
+        );
         assert_eq!(cache.keys.len(), 3);
+    }
+
+    /// Archives inside archives each start a cache of their own: the limit is
+    /// the scan's, counted in `made`, not each archive's.
+    #[test]
+    fn archives_of_one_scan_share_the_derivation_limit() {
+        let made = AtomicUsize::new(0);
+        let mut got = 0;
+        for archive in 0..10u8 {
+            let mut cache = KeyCache {
+                keys: Vec::new(),
+                limit: 3,
+            };
+            for salt in 0..5u8 {
+                got += usize::from(cache.get("pw", &[archive * 5 + salt; 8], &made).is_some());
+            }
+        }
+        assert_eq!(got, 3);
     }
 }

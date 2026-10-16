@@ -18,6 +18,7 @@ import re
 import sys
 
 import ezdxf
+from ezdxf import xclip
 from ezdxf.lldxf.const import DXFValueError
 
 UNICODE = re.compile(r"\\[Uu]\+([0-9A-Fa-f]{4})")
@@ -221,6 +222,7 @@ def header(doc):
         "lwdisplay": bool(hv("$LWDISPLAY", 0)),
         "fillmode": bool(hv("$FILLMODE", 1)),
         "mirrtext": bool(hv("$MIRRTEXT", 0)),
+        "xclipframe": int(hv("$XCLIPFRAME", 2)),
     }
 
 
@@ -351,6 +353,12 @@ def dim_style(d, r13, doc):
         "dimtsz": num(get(d, "dimtsz", 0.0)),
         "dimtxt": num(get(d, "dimtxt", 0.18)),
         "dimgap": num(get(d, "dimgap", 0.09)),
+        "dimtad": int(get(d, "dimtad", 0)),
+        "dimzin": int(get(d, "dimzin", 0)),
+        "dimlfac": num(get(d, "dimlfac", 1.0)),
+        "dimdec": int(get(d, "dimdec", 4)),
+        "dimadec": int(get(d, "dimadec", 0)),
+        "dimdsep": int(get(d, "dimdsep", 46)),
         "dimclrd": aci_color(get(d, "dimclrd", 0)),
         "dimclre": aci_color(get(d, "dimclre", 0)),
         "dimclrt": aci_color(get(d, "dimclrt", 0)),
@@ -504,27 +512,37 @@ DIMKIND = [
 ]
 
 
+def stored_angles(edge):
+    """The angles as the file has them: ezdxf loads a clockwise arc or
+    ellipse edge's as (360 - end, 360 - start)."""
+    if edge.ccw:
+        return edge.start_angle, edge.end_angle
+    return 360.0 - edge.end_angle, 360.0 - edge.start_angle
+
+
 def edge_json(edge):
     t = edge.type.name.lower() if hasattr(edge.type, "name") else str(edge.type)
     if t == "line":
         return {"type": "line", "start": v2(edge.start), "end": v2(edge.end)}
     if t == "arc":
+        start, end = stored_angles(edge)
         return {
             "type": "arc",
             "center": v2(edge.center),
             "radius": num(edge.radius),
-            "start_angle": rad(edge.start_angle),
-            "end_angle": rad(edge.end_angle),
+            "start_angle": rad(start),
+            "end_angle": rad(end),
             "counter_clockwise": bool(edge.ccw),
         }
     if t == "ellipse":
+        start, end = stored_angles(edge)
         return {
             "type": "ellipse",
             "center": v2(edge.center),
             "major_axis": v2(edge.major_axis),
             "ratio": num(edge.ratio),
-            "start_angle": rad(edge.start_angle),
-            "end_angle": rad(edge.end_angle),
+            "start_angle": rad(start),
+            "end_angle": rad(end),
             "counter_clockwise": bool(edge.ccw),
         }
     weights = [num(w) for w in edge.weights]
@@ -797,6 +815,20 @@ def kind_fields(e, doc):
             out["invisible_edges"] = int(get(e, "invisible_edges", 0))
         else:
             plane(e, out)
+    elif t == "MESH":
+        n = len(e.vertices)
+        out = {
+            "vertices": [v3(p) for p in e.vertices],
+            "faces": [list(f) for f in e.faces if len(f) >= 2 and all(0 <= i < n for i in f)],
+        }
+    elif t == "TOLERANCE":
+        out = {
+            "insertion": v3(get(e, "insert", (0, 0, 0))),
+            "x_direction": v3(get(e, "x_axis_vector", (1, 0, 0))),
+            "extrusion": v3(get(e, "extrusion", (0, 0, 1))),
+            "text": unescape(get(e, "content", "")),
+            "dimstyle": unescape(get(e, "dimstyle", "")),
+        }
     elif t == "TEXT":
         out = text_fields(e)
     elif t in ("ATTRIB", "ATTDEF"):
@@ -817,6 +849,7 @@ def kind_fields(e, doc):
             "row_spacing": num(get(e, "row_spacing", 0.0)),
             "extrusion": v3(get(e, "extrusion", (0, 0, 1))),
             "attributes": [entity_json(a, doc) for a in e.attribs],
+            "clip": insert_clip(e),
         }
     elif t == "MTEXT":
         out = mtext_fields(e)
@@ -1008,6 +1041,19 @@ TYPE_NAMES = {
     "ARC_DIMENSION": "DIMENSION",
     "LARGE_RADIAL_DIMENSION": "DIMENSION",
 }
+
+
+def insert_clip(e):
+    """The XCLIP boundary in block coordinates, as ezdxf's
+    `XClip.get_block_clipping_path` has it before closing a rectangle."""
+    f = xclip.get_spatial_filter(e)
+    if f is None or len(f.boundary_vertices) < 2:
+        return None
+    m = f.inverse_insert_matrix
+    return {
+        "boundary": [v2(p) for p in m.transform_vertices(f.boundary_vertices)],
+        "enabled": bool(f.dxf.is_clipping_enabled),
+    }
 
 
 def entity_json(e, doc):

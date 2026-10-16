@@ -18,6 +18,7 @@
 
 mod clip;
 mod curves;
+mod dimension;
 mod fill;
 mod font;
 mod gradient;
@@ -31,6 +32,7 @@ pub mod stroke_font;
 mod tessellate;
 mod text;
 mod tiles;
+mod wide;
 
 pub use curves::{flatten_arc, flatten_circle, flatten_ellipse};
 pub use fill::fill_even_odd;
@@ -39,8 +41,10 @@ pub use font::{
 };
 pub use hatch::nesting_depths;
 pub use palette::Palette;
-pub use scene::{Affine, Scene, FILL_BYTES, STROKE_BYTES};
-pub use tessellate::{expand_bulges, LayerInfo, LayoutInfo, Tessellator, Warnings, SCENE_BUDGET};
+pub use scene::{Affine, Scene, FILL_BYTES, FILL_EDGE, STROKE_BYTES};
+pub use tessellate::{
+    expand_bulges, LayerInfo, LayoutInfo, Sheet, Tessellator, Warnings, SCENE_BUDGET,
+};
 pub use text::{mtext_lines, HAlign, TextRun, VAlign, TEXT_RECORD_BYTES};
 
 /// Why a file did not parse.
@@ -198,24 +202,31 @@ impl Document {
                 String::new()
             }
         };
+        // Everything read from the scene before `buffers`, which empties it.
         let (texts, text_strings) = t.scene.text_buffers();
+        let (origin, extents) = (t.scene.origin(), t.scene.extents_local());
+        let clips = t.scene.clip_buffer();
+        let b = t.scene.buffers();
         Drawing {
             layout: drawn,
-            strokes: t.scene.stroke_buffer(),
-            fills: t.scene.fill_buffer(),
+            strokes: b.strokes,
+            fills: b.fills,
             texts,
             text_strings,
-            origin: t.scene.origin(),
-            extents: t.scene.extents_local(),
+            origin,
+            extents,
             max_order: t.scene.max_order(),
-            opaque_strokes: t.scene.opaque_strokes(),
-            opaque_fills: t.scene.opaque_fills(),
-            stroke_tiles: t.scene.stroke_tiles(),
-            fill_tiles: t.scene.fill_tiles(),
-            opaque_stroke_tiles: t.scene.opaque_stroke_tiles(),
-            opaque_fill_tiles: t.scene.opaque_fill_tiles(),
+            opaque_strokes: b.opaque_strokes,
+            opaque_fills: b.opaque_fills,
+            clips,
+            stroke_tiles: b.stroke_tiles,
+            fill_tiles: b.fill_tiles,
+            opaque_stroke_tiles: b.opaque_stroke_tiles,
+            opaque_fill_tiles: b.opaque_fill_tiles,
+            translucent_runs: b.translucent_runs,
             layers: t.layers,
             warnings: t.warnings,
+            sheet: t.sheet,
         }
     }
 }
@@ -236,8 +247,9 @@ pub struct Drawing {
     /// for does not exist.
     pub layout: String,
     /// Stroke instances, [`STROKE_BYTES`] each: `f32 x0, y0, x1, y1 | u32 rgba
-    /// | u32 attr | u32 order`, little-endian. `attr` packs the layer id, the
-    /// lineweight and the flags (see `scene.rs`).
+    /// | u32 attr | u32 order | f32 bulge`, little-endian. `attr` packs the
+    /// layer id, the lineweight and the flags (see `scene.rs`); `bulge` is 0
+    /// for a line, else the stroke is a circular arc (`Stroke::bulge`).
     pub strokes: Vec<u8>,
     /// Fill vertices, [`FILL_BYTES`] each: `f32 x, y | u32 rgba | u32 attr |
     /// u32 order`.
@@ -245,12 +257,16 @@ pub struct Drawing {
     /// Text placement records, [`TEXT_RECORD_BYTES`] each, indexing into
     /// `text_strings`: `f32 x, y, height, rotation, widthFactor, oblique | u32
     /// rgba, attr, strOffset | u16 strLen | u8 hAlign, vAlign | u32 order | u8
-    /// face | 3 bytes padding`. Only runs in an outline face appear here; a
+    /// face | u8 padding | u16 clip`. Only runs in an outline face appear here; a
     /// stroke-font run is drawn as strokes, so that the drawing's lineweight
     /// decides how thick its letters are.
     pub texts: Vec<u8>,
     /// UTF-8, every run's characters back to back.
     pub text_strings: Vec<u8>,
+    /// The regions text runs are clipped to (a viewport's window, an XCLIP
+    /// boundary), which a run's `clip` numbers from 1: for each, `u32`
+    /// triangle count, then `f32 x, y` per corner relative to `origin`.
+    pub clips: Vec<u8>,
     /// World coordinates the buffers are relative to.
     pub origin: [f64; 2],
     /// `[min_x, min_y, max_x, max_y]`, relative to `origin`.
@@ -258,22 +274,29 @@ pub struct Drawing {
     /// Highest draw-order index, for normalising depth.
     pub max_order: u32,
     /// Leading strokes and fill vertices that are opaque; the rest are
-    /// translucent and are drawn after, without writing depth.
+    /// translucent, in draw order, and are drawn after.
     pub opaque_strokes: usize,
     pub opaque_fills: usize,
-    /// Spatial buckets: `u32 start, count | f32 min_x, min_y, max_x, max_y`,
-    /// 24 bytes each, `start` and `count` in strokes (in vertices for fills).
-    /// The box is the true extent of the contents, which can reach outside
-    /// the bucket's grid square.
+    /// Tiles: `u32 start, count | f32 min_x, min_y, max_x, max_y`, 24 bytes
+    /// each, `start` and `count` in strokes (in vertices for fills). The
+    /// opaque half's are spatial buckets, the translucent half's runs of it
+    /// in draw order. The box is the true extent of the contents, which can
+    /// reach outside the bucket's grid square.
     pub stroke_tiles: Vec<u8>,
     pub fill_tiles: Vec<u8>,
     /// Leading entries of each table covering the opaque half.
     pub opaque_stroke_tiles: usize,
     pub opaque_fill_tiles: usize,
+    /// The order of the translucent pass: for each run, `u32` 1 for fill
+    /// tiles or 0 for stroke tiles, then the first tile and the one past the
+    /// last, indices into that kind's table.
+    pub translucent_runs: Vec<u8>,
     /// The layer table; a vertex's layer id indexes it.
     pub layers: Vec<LayerInfo>,
     /// What could not be drawn.
     pub warnings: Warnings,
+    /// What the tab is drawn on.
+    pub sheet: Sheet,
 }
 
 impl Drawing {
@@ -310,11 +333,38 @@ impl Drawing {
         format!("[{}]", items.join(","))
     }
 
+    /// [`Sheet`] as JSON: `{"mmPerUnit", "lineweights"}`.
+    pub fn sheet_json(&self) -> String {
+        let s = &self.sheet;
+        // The paper relative to `origin`, as the buffers are.
+        let paper = match s.paper {
+            Some(p) => format!(
+                "[{},{},{},{}]",
+                json_number(p[0] - self.origin[0]),
+                json_number(p[1] - self.origin[1]),
+                json_number(p[2] - self.origin[0]),
+                json_number(p[3] - self.origin[1])
+            ),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"mmPerUnit":{},"lineweights":{},"paper":{paper}}}"#,
+            json_number(s.mm_per_unit),
+            s.lineweights
+        )
+    }
+
     /// [`Warnings`] as JSON. All zeroes means everything was drawn.
     pub fn warnings_json(&self) -> String {
         let w = &self.warnings;
+        let not_drawn: Vec<String> = w
+            .not_drawn
+            .iter()
+            .map(|(k, n)| format!("{}:{n}", json_string(k)))
+            .collect();
+        let files: Vec<String> = w.external_files.iter().map(|f| json_string(f)).collect();
         format!(
-            r#"{{"unknownEntities":{},"missingBlocks":{},"textRuns":{},"strokeGlyphs":{},"hatchPatternsMissing":{},"hatchPatternsTruncated":{},"externalReferences":{},"depthExceeded":{},"sceneTruncated":{},"proxyWithoutGraphics":{}}}"#,
+            r#"{{"unknownEntities":{},"missingBlocks":{},"textRuns":{},"strokeGlyphs":{},"hatchPatternsMissing":{},"hatchPatternsTruncated":{},"externalReferences":{},"depthExceeded":{},"sceneTruncated":{},"proxyWithoutGraphics":{},"notDrawn":{{{}}},"externalFiles":[{}]}}"#,
             w.unknown_entities,
             w.missing_blocks,
             w.text_runs,
@@ -324,8 +374,19 @@ impl Drawing {
             w.external_references,
             w.depth_exceeded,
             w.scene_truncated,
-            w.proxy_without_graphics
+            w.proxy_without_graphics,
+            not_drawn.join(","),
+            files.join(",")
         )
+    }
+}
+
+/// A number JSON can hold: a non-finite one is 0.
+fn json_number(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "0".to_string()
     }
 }
 

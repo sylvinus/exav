@@ -112,7 +112,13 @@ fn every_fixture_matches_its_closed_form() {
     for (file, exp) in expected() {
         let scene = load(&file);
         let got = stats(&scene);
-        for (name, e) in exp["elements"].as_object().unwrap() {
+        // A fixture that is checked by other tests has no elements here.
+        for (name, e) in exp
+            .get("elements")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
             let Some(g) = got.get(name) else {
                 failures.push(format!("{file} {name}: not drawn"));
                 continue;

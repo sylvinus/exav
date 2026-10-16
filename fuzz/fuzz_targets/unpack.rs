@@ -41,6 +41,7 @@ fn tight_limits() -> Limits {
 }
 
 fuzz_target!(|data: &[u8]| {
+    exav_fuzz_support::panics::tolerate_inside(exav_fuzz_support::panics::CONTAINED);
     // `Format::ALL`, not a list of our own: a hand-kept copy here fell behind
     // the enum and left 26 formats unfuzzed. Each parser's error paths are
     // reached directly, without the mutator synthesising valid magic bytes.

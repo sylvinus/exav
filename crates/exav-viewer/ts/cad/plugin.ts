@@ -27,7 +27,7 @@ export interface CadOptions {
   /**
    * Most strokes and fill vertices one layout may produce. Past it the
    * remaining entities are left out and the `scene_truncated` warning shown.
-   * Default 8_000_000: about 220 MB of vertex buffers, four times the largest
+   * Default 8_000_000: up to 256 MB of vertex buffers, four times the largest
    * real drawing measured. Lower it for memory-constrained devices.
    */
   maxPrimitives?: number;
@@ -38,9 +38,27 @@ export interface CadOptions {
    * keep the reader expanding up to the limit.
    */
   maxDecompressedBytes?: number;
+  /**
+   * Lines at their lineweights: "drawing" as the drawing was saved
+   * (`$LWDISPLAY`, AutoCAD's lineweight button), "always", or "never", every
+   * line one pixel. Default "drawing".
+   */
+  lineweights?: "drawing" | "always" | "never";
+  /**
+   * Everything in ink, black on a light ground and white on a dark one, as
+   * a drawing plotted with monochrome.ctb. Default false.
+   */
+  monochrome?: boolean;
+  /**
+   * The side, in pixels, of the tiles `pictures.raster` draws a large picture
+   * in. Default 2048; never more than 4096 or what the GPU holds. A tuning
+   * and testing knob: a small value makes pictures that would fit in one pass
+   * come out tiled (the same pixels, but each tile is a draw of the drawing).
+   */
+  rasterTile?: number;
 }
 
-const CAPABILITIES = ["layers", "layouts", "ground", "zoom"] as const;
+const CAPABILITIES = ["layers", "layouts", "ground", "zoom", "pictures", "viewport"] as const;
 
 export function dwg(options: CadOptions = {}): FormatPlugin<CadOptions> {
   return {

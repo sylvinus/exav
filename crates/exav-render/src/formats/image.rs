@@ -39,6 +39,9 @@ pub enum Format {
     /// A JBIG2 file.
     #[cfg(feature = "jbig2")]
     Jbig2,
+    /// JPEG XL, a bare codestream or in its ISO BMFF container.
+    #[cfg(feature = "jxl")]
+    Jxl,
 }
 
 impl Format {
@@ -67,6 +70,8 @@ impl Format {
         Format::Jpeg2000,
         #[cfg(feature = "jbig2")]
         Format::Jbig2,
+        #[cfg(feature = "jxl")]
+        Format::Jxl,
     ];
 
     /// The format `data` starts as, by its magic bytes.
@@ -129,6 +134,12 @@ impl Format {
         if data.starts_with(b"\x97JB2\r\n\x1a\n") {
             return Some(Format::Jbig2);
         }
+        // A bare codestream starts 0xFF 0x0A; the container with its
+        // signature box.
+        #[cfg(feature = "jxl")]
+        if data.starts_with(&[0xFF, 0x0A]) || data.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
+            return Some(Format::Jxl);
+        }
         None
     }
 
@@ -158,6 +169,8 @@ impl Format {
             Format::Jpeg2000 => "jpeg2000",
             #[cfg(feature = "jbig2")]
             Format::Jbig2 => "jbig2",
+            #[cfg(feature = "jxl")]
+            Format::Jxl => "jxl",
         }
     }
 }
@@ -174,6 +187,8 @@ pub enum Error {
     Undecodable,
     /// Decoding it takes more than the limit asked for, under [`DECODE_MAX`].
     TooLarge,
+    /// A camera RAW file that holds no preview a decoder reads (`raw`).
+    NoPreview,
 }
 
 impl std::fmt::Display for Error {
@@ -182,15 +197,14 @@ impl std::fmt::Display for Error {
             Error::Unsupported => "not an image format this build decodes",
             Error::Undecodable => "undecodable image",
             Error::TooLarge => "image too large to decode within the limit",
+            Error::NoPreview => "camera RAW file with no preview to show",
         })
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Most bytes a decoded image may take: the `image` crate's default, which
-/// ClamAV decodes with.
-pub const DECODE_MAX: u64 = 512 * 1024 * 1024;
+pub use super::DECODE_MAX;
 
 /// Which channels each pixel has, in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +335,8 @@ pub fn decode(data: &[u8], format: Format, max_alloc: u64) -> Result<Pixels, Err
         Format::Jpeg2000 => jp2::decode(data, max_alloc),
         #[cfg(feature = "jbig2")]
         Format::Jbig2 => jbig2::decode(data, max_alloc),
+        #[cfg(feature = "jxl")]
+        Format::Jxl => jxl::decode(data, max_alloc),
         _ => decode_dynamic(data, format, max_alloc).map(Pixels::from_dynamic),
     })
     .unwrap_or(Err(Error::Undecodable))
@@ -360,8 +376,16 @@ fn cmyk_to_rgb(cmyk: &[u8], alpha: bool) -> Vec<u8> {
     out
 }
 
-/// [`decode`], the format read from the first bytes.
+/// [`decode`], the format read from the first bytes. With the `raw` feature,
+/// a camera RAW file is shown by its largest embedded preview (`raw`),
+/// where [`Format::detect`] and [`decode`] read a TIFF-structured one as the
+/// TIFF it also is.
 pub fn decode_any(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
+    #[cfg(feature = "raw")]
+    match raw::decode(data, max_alloc) {
+        Err(Error::Unsupported) => {}
+        other => return other,
+    }
     decode(
         data,
         Format::detect(data).ok_or(Error::Unsupported)?,
@@ -420,6 +444,8 @@ fn image_format(f: Format) -> Option<ImageFormat> {
         Format::Jpeg2000 => return None,
         #[cfg(feature = "jbig2")]
         Format::Jbig2 => return None,
+        #[cfg(feature = "jxl")]
+        Format::Jxl => return None,
     })
 }
 
@@ -427,5 +453,9 @@ fn image_format(f: Format) -> Option<ImageFormat> {
 mod jbig2;
 #[cfg(feature = "jp2")]
 mod jp2;
+#[cfg(feature = "jxl")]
+mod jxl;
+#[cfg(feature = "raw")]
+pub mod raw;
 #[cfg(test)]
 mod tests;

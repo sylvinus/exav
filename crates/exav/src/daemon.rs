@@ -2689,13 +2689,29 @@ fn volume_set_lines(
             .collect();
         // `fetch` only ever runs for a name that parses as a part, so a
         // directory of large ordinary files is not read here at all.
-        let verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
+        let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
             let mut data = Vec::new();
             File::open(dir.join(name))?
                 .take(opts.deep_analysis_max.saturating_add(1))
                 .read_to_end(&mut data)?;
             Ok(data)
         });
+        // The sets whose volumes carry their own headers (RAR, ZIP, CAB). A
+        // `.cab` is read by its head to see whether it names a neighbour, and
+        // no name is turned into a path: only names in this directory's list.
+        verdicts.extend(exav_core::analyze_split_sets(
+            db,
+            &names,
+            opts,
+            |name, head| {
+                let limit = head.map_or(opts.deep_analysis_max.saturating_add(1), |n| n as u64);
+                let mut data = Vec::new();
+                File::open(dir.join(name))?
+                    .take(limit)
+                    .read_to_end(&mut data)?;
+                Ok(data)
+            },
+        ));
         for v in verdicts {
             // Named for the archive, not the fragment: `big.7z FOUND …` tells an
             // operator what was actually found, which `big.7z.002` does not.
@@ -3222,7 +3238,7 @@ fn exinstream_multi<R: Read>(
 
     // Now the multi-volume pass, which is why these are sent together at all.
     // It reads back only the payloads whose names parse as parts.
-    let verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
+    let held_bytes = |name: &str| {
         // First occurrence wins on a repeated name. Two files claiming one
         // volume position make the set ambiguous, and the collector refuses to
         // splice such a set rather than pick between them.
@@ -3235,7 +3251,22 @@ fn exinstream_multi<R: Read>(
             .ok_or_else(|| io::Error::other("stream was not held"))?
             .bytes_capped(opts.deep_analysis_max)?
             .ok_or_else(|| io::Error::other("stream too large to rejoin"))
-    });
+    };
+    let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, held_bytes);
+    // And the sets whose volumes carry their own headers (RAR, ZIP, CAB), the
+    // heads of `.cab` streams being read to see whether they name a neighbour.
+    verdicts.extend(exav_core::analyze_split_sets(
+        db,
+        &names,
+        opts,
+        |name, head| {
+            let mut data = held_bytes(name)?;
+            if let Some(n) = head {
+                data.truncate(n);
+            }
+            Ok(data)
+        },
+    ));
     for v in verdicts {
         let Some(i) = names.iter().position(|n| *n == v.name) else {
             continue;

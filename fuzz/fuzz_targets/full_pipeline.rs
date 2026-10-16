@@ -86,6 +86,7 @@ fn roundtrip(db: &Scanner) -> Option<Scanner> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    exav_fuzz_support::panics::tolerate_inside(exav_fuzz_support::panics::CONTAINED);
     let Some(f) = frame::parse(data) else {
         return;
     };

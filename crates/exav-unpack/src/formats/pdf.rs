@@ -331,10 +331,10 @@ fn harvest_inner(
 }
 
 /// What decoding a stream's `/Filter` chain produced.
-struct FilterOutcome {
-    buf: Vec<u8>,
+pub(crate) struct FilterOutcome {
+    pub(crate) buf: Vec<u8>,
     /// An output cap was hit: the caller should treat the stream as over budget.
-    truncated: bool,
+    pub(crate) truncated: bool,
     /// An implemented filter failed and nothing was recovered: the caller
     /// should report the stream undecodable rather than scan an empty buffer
     /// as though its bytes were examined. Distinct from "decoded to empty",
@@ -366,7 +366,7 @@ fn salvage_zlib(data: &[u8], cap: u64) -> Salvaged {
 /// filters use the pure decoders in [`filters`]. An unknown/unsupported filter
 /// (e.g. an image codec like DCTDecode) stops the chain and passes through
 /// whatever was decoded so far.
-fn apply_filters(
+pub(crate) fn apply_filters(
     stream_data: &[u8],
     info: &HashMap<String, Primitive>,
     cap: u64,
@@ -472,7 +472,7 @@ fn apply_filters(
 
 /// Collect the ordered list of filter names from `/Filter` (a single name or an
 /// array of names).
-fn filter_names(info: &HashMap<String, Primitive>) -> Vec<String> {
+pub(crate) fn filter_names(info: &HashMap<String, Primitive>) -> Vec<String> {
     match info.get("Filter") {
         Some(Primitive::Name(n)) => vec![n.clone()],
         Some(Primitive::Array(arr)) => arr

@@ -54,6 +54,18 @@ locally. Those are:
 That needs the `zip` and `decrypt` features; a build without them, like a
 checkout without the samples, skips the tests that use them.
 
+## Written by a script
+
+`dmg/udif_lzfse.dmg` is `dmg/hfs_plus_udrw.dmg`'s disk in two LZFSE runs (sectors
+0 to 8, then the rest): a UDIF image with a `koly` trailer and a block map
+around the streams the `lzfse_rust` crate (an LZFSE encoder, MIT) writes, one
+LZVN block and FSE blocks. `tests/suites/lzfse.rs` reads it back against the
+raw image.
+
+`tests/oracle/` holds the C wrappers and `build.sh` for the differential tests
+of the LZFSE and DCL decoders against their reference sources, which are
+fetched, never committed (`src/formats/lzfse.rs`, `src/formats/dcl_explode.rs`).
+
 To add one (`pip install pyzipper`):
 
 ```python

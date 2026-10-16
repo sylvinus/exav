@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 
 import { exavViewer } from "../dist/vite/index.js";
-import type { Sample } from "./src/showcase.js";
+import type { Example, Sample } from "./src/showcase.js";
 
 const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
@@ -29,6 +29,14 @@ const nodeModules = fs.realpathSync(path.join(pkgDir, "node_modules"));
 // A `file:` dependency resolves outside node_modules (to its crate), and the
 // dev server serves its worker and wasm from there.
 const unpackWasm = fs.realpathSync(path.join(nodeModules, "@exav", "unpack-wasm"));
+/**
+ * An external converter for the formats the package's own converters do not
+ * read: the name of an installed package, from `EXAV_EXTERNAL_CONVERTER` when
+ * the demo is built. None by default.
+ */
+const externalConverter = process.env.EXAV_EXTERNAL_CONVERTER || undefined;
+// Its files are served from where it is installed (a `file:` dependency lives outside node_modules).
+const externalDir = externalConverter && fs.existsSync(path.join(nodeModules, externalConverter)) ? fs.realpathSync(path.join(nodeModules, externalConverter)) : undefined;
 
 /** The packages the demo bundles or copies, whose licences travel with it. */
 const ENGINES = ["pdfjs-dist", "three", "@silurus/ooxml", "@exav/unpack-wasm", "react", "react-dom"];
@@ -58,12 +66,25 @@ function licenceFiles(): Map<string, Buffer> {
     "Of pdfjs-dist's wasm/, only its ICC engine (qcms, MIT; LICENSE_QCMS beside it under exav-viewer/pdfjs/) is in the build.",
     "Its OpenJPEG and PDFium image decoders are not: @exav/viewer's own decoders take their place (see its NOTICE).",
   );
-  // The samples copied in by `npm run demo:showcase`, if they were.
+  // The example files copied in by `npm run demo:examples`, if they were (an
+  // example replaces a sample of the same file name in the list), and the samples
+  // copied in by `npm run demo:showcase`.
+  const examplesList = path.join(pkgDir, "demo", "public", "examples", "examples.json");
+  const examples = fs.existsSync(examplesList) ? (JSON.parse(fs.readFileSync(examplesList, "utf8")) as { examples: Example[] }).examples : [];
+  if (examples.length) {
+    index.push("", "The example files, under examples/ (the full list is examples-NOTICE.md; one that has the name of a sample replaces it):");
+    for (const e of examples) {
+      index.push("", e.file, `  ${e.author}: ${e.title}`, `  ${e.source}`, `  ${e.licence}`);
+      if (e.attribution) index.push(`  ${e.attribution}`);
+    }
+    add("examples-NOTICE.md", path.join(pkgDir, "demo", "examples", "NOTICE.md"));
+  }
   const list = path.join(pkgDir, "demo", "public", "showcase", "samples.json");
   if (fs.existsSync(list)) {
     const { samples } = JSON.parse(fs.readFileSync(list, "utf8")) as { samples: Sample[] };
+    const replaced = new Set(examples.map((e) => e.file));
     index.push("", "The sample files, under showcase/, from https://github.com/sylvinus/exav-samples:");
-    for (const s of samples) index.push("", s.file, `  ${s.credit}`, `  ${s.source}`, `  ${s.licence}`);
+    for (const s of samples) index.push("", s.file, `  ${s.credit}`, `  ${s.source}`, `  ${s.licence}`, ...(replaced.has(s.file) ? ["  Not listed: an example of the same name replaces it."] : []));
   }
   files.set("README.txt", Buffer.from(`${index.join("\n")}\n`));
   return files;
@@ -102,7 +123,7 @@ function licences(): Plugin {
  */
 function e2eFiles(): Plugin {
   const dir = path.join(pkgDir, "e2e", ".out");
-  const TYPES: Record<string, string> = { ".pdf": "application/pdf", ".zip": "application/zip", ".webm": "video/webm", ".png": "image/png" };
+  const TYPES: Record<string, string> = { ".pdf": "application/pdf", ".zip": "application/zip", ".webm": "video/webm", ".png": "image/png", ".js": "text/javascript" };
   // A third above clip.webm's bitrate (10 MB for 13 s): it plays without stalling.
   const PACE = 1024 * 1024;
   const send = (file: string, res: ServerResponse, paced: boolean, range?: { start: number; end: number }) => {
@@ -167,11 +188,12 @@ export default defineConfig({
   base: process.env.DEMO_BASE ?? "/",
   resolve: { alias },
   esbuild: { jsx: "automatic" },
-  define: { __DEMO_ORIGIN__: JSON.stringify(origin) },
+  define: { __DEMO_ORIGIN__: JSON.stringify(origin), __EXTERNAL_CONVERTER__: JSON.stringify(externalConverter ?? null) },
   // The sandboxed frame at `${base}frame/`, served with its headers by `vite
   // preview`. It may play the demo's own media by URL and fetch from it.
-  plugins: [exavViewer({ frameDir: "frame", frameOrigin: origin, mediaOrigins: [origin], connectOrigins: [origin] }), licences(), e2eFiles()],
+  plugins: [exavViewer({ frameDir: "frame", frameOrigin: origin, mediaOrigins: [origin], connectOrigins: [origin], externalConverter }), licences(), e2eFiles()],
   // Beside the docs site's 4321.
-  server: { port: 4322, strictPort: true, host: true, fs: { allow: [pkgDir, nodeModules, unpackWasm] } },
-  build: { outDir: "dist", emptyOutDir: true, target: "es2022" },
+  server: { port: 4322, strictPort: true, host: true, fs: { allow: [pkgDir, nodeModules, unpackWasm, ...(externalDir ? [externalDir] : [])] } },
+  // headless.html: a host drawing its own controls, without React.
+  build: { outDir: "dist", emptyOutDir: true, target: "es2022", rollupOptions: { input: { main: path.join(pkgDir, "demo", "index.html"), headless: path.join(pkgDir, "demo", "headless.html") } } },
 });

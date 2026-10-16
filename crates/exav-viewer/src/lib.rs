@@ -1,6 +1,10 @@
-//! The WebAssembly half of `@exav/viewer`. Built five times (see
+//! The WebAssembly half of `@exav/viewer`. Built nine times (see
 //! `Cargo.toml`): with `image`, exav-render's raster decoders; with `dwg`,
-//! its DWG and DXF engine; with `model`, its IFC and STL meshes; with
+//! its DWG and DXF engine; with `model`, its IFC, STL, OBJ, PLY and glTF meshes;
+//! with `text`, its Markdown reader; with `sheets`, its
+//! XLS, ODS and Numbers to XLSX converter; with `slides`,
+//! its PPT, ODP, Keynote, ODG and VSDX to PPTX converter; with `docs`,
+//! its DOC, ODT, RTF, Word 2003 XML and Pages to DOCX converter; with
 //! `pdf-jpx` and `pdf-jbig2`, the image
 //! decoders pdf.js loads in place of its C and C++ ones. Each runs in a
 //! worker, and only finished pixels or vertex buffers cross back to the
@@ -58,6 +62,7 @@ mod image {
             JsError::new(match e {
                 Error::Unsupported => "unsupported",
                 Error::TooLarge => "too-large",
+                Error::NoPreview => "no-preview",
                 _ => "undecodable",
             })
         })?;
@@ -111,6 +116,11 @@ mod dwg {
             std::mem::take(&mut self.0.text_strings)
         }
 
+        #[wasm_bindgen(js_name = takeClips)]
+        pub fn take_clips(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0.clips)
+        }
+
         #[wasm_bindgen(js_name = takeStrokeTiles)]
         pub fn take_stroke_tiles(&mut self) -> Vec<u8> {
             std::mem::take(&mut self.0.stroke_tiles)
@@ -119,6 +129,11 @@ mod dwg {
         #[wasm_bindgen(js_name = takeFillTiles)]
         pub fn take_fill_tiles(&mut self) -> Vec<u8> {
             std::mem::take(&mut self.0.fill_tiles)
+        }
+
+        #[wasm_bindgen(js_name = takeTranslucentRuns)]
+        pub fn take_translucent_runs(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0.translucent_runs)
         }
 
         pub fn origin(&self) -> Vec<f64> {
@@ -162,6 +177,11 @@ mod dwg {
         #[wasm_bindgen(js_name = warningsJson)]
         pub fn warnings_json(&self) -> String {
             self.0.warnings_json()
+        }
+
+        #[wasm_bindgen(js_name = sheetJson)]
+        pub fn sheet_json(&self) -> String {
+            self.0.sheet_json()
         }
     }
 
@@ -292,10 +312,12 @@ mod model {
             std::mem::take(&mut self.colors)
         }
 
-        /// `{origin, bounds, batches: [{class, color, vertex, vertices,
+        /// `{origin, bounds, batches: [{class, color, storey, vertex, vertices,
         /// index, indices, edge, edges, color0}], elements: [{id,
-        /// globalId, class, name, node, ranges: [[batch, first, count]]}],
-        /// nodes: [{id, class, name, parent}], warnings}`; offsets in
+        /// globalId, class, name, node, storey, ranges: [[batch, first,
+        /// count]]}], nodes: [{id, class, name, parent, elevation}],
+        /// warnings}` (`storey` and `parent` index `nodes`; `elevation`
+        /// is a storey's, in metres, or null); offsets in
         /// elements of their arrays (`color0` in bytes, -1 for none).
         #[wasm_bindgen(js_name = metaJson)]
         pub fn meta_json(&self) -> String {
@@ -385,6 +407,10 @@ mod model {
                 }
                 None => -1,
             };
+            match b.storey {
+                Some(s) => o.push_str(&format!(",\"storey\":{s}")),
+                None => o.push_str(",\"storey\":null"),
+            }
             o.push_str(&format!(
                 ",\"vertex\":{},\"vertices\":{},\"index\":{},\"indices\":{},\"edge\":{},\"edges\":{},\"color0\":{}}}",
                 m.positions.len() / 3,
@@ -415,6 +441,10 @@ mod model {
                 Some(n) => o.push_str(&format!(",\"node\":{n}")),
                 None => o.push_str(",\"node\":null"),
             }
+            match e.storey {
+                Some(s) => o.push_str(&format!(",\"storey\":{s}")),
+                None => o.push_str(",\"storey\":null"),
+            }
             o.push_str(",\"ranges\":[");
             for (k, r) in e.ranges.iter().enumerate() {
                 if k > 0 {
@@ -434,8 +464,12 @@ mod model {
             o.push_str(",\"name\":");
             string(o, &n.name);
             match n.parent {
-                Some(p) => o.push_str(&format!(",\"parent\":{p}}}")),
-                None => o.push_str(",\"parent\":null}"),
+                Some(p) => o.push_str(&format!(",\"parent\":{p}")),
+                None => o.push_str(",\"parent\":null"),
+            }
+            match n.elevation {
+                Some(e) => o.push_str(&format!(",\"elevation\":{e}}}")),
+                None => o.push_str(",\"elevation\":null}"),
             }
         }
         let w = &scene.warnings;
@@ -477,6 +511,50 @@ mod model {
         exav_render::stl::read(bytes, budget(max_triangles))
             .map(pack)
             .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Reads a Wavefront OBJ within `max_triangles`.
+    #[wasm_bindgen(js_name = parseObj)]
+    pub fn parse_obj(bytes: &[u8], max_triangles: f64) -> Result<Model, JsError> {
+        exav_render::obj::read(bytes, budget(max_triangles))
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Reads a Stanford PLY, ASCII or binary, within `max_triangles`.
+    #[wasm_bindgen(js_name = parsePly)]
+    pub fn parse_ply(bytes: &[u8], max_triangles: f64) -> Result<Model, JsError> {
+        exav_render::ply::read(bytes, budget(max_triangles))
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Reads a glTF 2.0 document or GLB file within `max_triangles`.
+    #[wasm_bindgen(js_name = parseGltf)]
+    pub fn parse_gltf(bytes: &[u8], max_triangles: f64) -> Result<Model, JsError> {
+        exav_render::gltf::read(bytes, budget(max_triangles))
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+}
+
+#[cfg(feature = "sheets")]
+mod sheets;
+
+#[cfg(feature = "slides")]
+mod slides;
+
+#[cfg(feature = "docs")]
+mod docs;
+
+#[cfg(feature = "text")]
+mod text {
+    use wasm_bindgen::prelude::*;
+
+    /// Reads Markdown into the JSON of `exav_render::markdown::Document`.
+    #[wasm_bindgen(js_name = parseMarkdown)]
+    pub fn parse_markdown(source: &str) -> String {
+        exav_render::markdown::parse(source).to_json()
     }
 }
 

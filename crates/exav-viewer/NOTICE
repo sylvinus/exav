@@ -2,7 +2,7 @@
 =================================
 
 @exav/viewer is licensed under the MIT License (see LICENSE). Its JavaScript
-is exav's own, but for the wasm-bindgen glue in its modules. Its five
+is exav's own, but for the wasm-bindgen glue in its modules. Its nine
 WebAssembly modules are builds of exav-render, and its fonts are
 third-party: this file gives their notices. The licence texts it refers to
 are in LICENSES/, and in assets/fonts/ for the fonts.
@@ -23,7 +23,14 @@ Part 1: in every WebAssembly module
 
 wasm/exav_viewer_image_bg.wasm decodes raster images; wasm/exav_viewer_dwg_bg.wasm
 reads DWG and DXF drawings and tessellates them; wasm/exav_viewer_model_bg.wasm
-reads IFC and STL models and meshes them. Two more are embedded, in
+reads IFC and STL models and meshes them; wasm/exav_viewer_text_bg.wasm reads
+Markdown into a tree; wasm/exav_viewer_sheets_bg.wasm converts XLS, ODS,
+Numbers and other spreadsheets to XLSX (exav-render's office-sheets);
+wasm/exav_viewer_slides_bg.wasm converts PPT, ODP, Keynote, ODG and VSDX
+files to PPTX (exav-render's office-slides, with office-sheets for the charts
+of ODP files); wasm/exav_viewer_docs_bg.wasm converts DOC, ODT, RTF, Word 2003
+XML and Pages documents to DOCX (exav-render's office-docs). Two more
+are embedded, in
 base64, in the modules pdf.js imports in place of its own decoders:
 exav_viewer_pdf_jpx_bg.wasm (JPXDecode) in wasm/openjpeg_nowasm_fallback.js,
 exav_viewer_pdf_jbig2_bg.wasm (JBIG2Decode, CCITTFaxDecode) in
@@ -37,7 +44,7 @@ used under the MIT License). Upstream: https://github.com/image-rs/image
 DXF and DWG readers, MIT.
 
 Build-time crates (proc-macro2, quote, syn, unicode-ident, thiserror-impl,
-fax_derive, zerocopy-derive, multiversion_no_op, wasm-bindgen-macro,
+fax_derive, multiversion_no_op, wasm-bindgen-macro,
 wasm-bindgen-macro-support) generate code but do not reach the modules and
 are not listed.
 
@@ -55,6 +62,9 @@ Upstream: http://vovanium.ru/sledy/newstroke/en
 
 encoding_rs, (Apache-2.0 OR MIT) AND BSD-3-Clause
 -------------------------------------------------
+
+In exav_viewer_sheets_bg.wasm, exav_viewer_slides_bg.wasm and
+exav_viewer_docs_bg.wasm too.
 
 encoding_rs is copyright Mozilla Foundation, used under the MIT License. Its
 tables are derived from the WHATWG Encoding Standard's data, under these
@@ -96,46 +106,82 @@ Under the MIT License, each offering it (alone, or among MIT OR Apache-2.0,
 Unlicense OR MIT, MIT OR Zlib OR Apache-2.0 and similar), with the copyright
 its licence file states, or its authors where it states none. The MIT text is
 in LICENSE. Each is in the image module unless marked with the modules it
-is in: image, dwg, model, and the pdf.js decoders' jpx and jbig2. bumpalo,
-cfg-if, once_cell, wasm-bindgen and wasm-bindgen-shared are in all five.
+is in: image, dwg, model, text, sheets, slides, docs, and the pdf.js decoders'
+jpx and jbig2. bumpalo, cfg-if, once_cell, wasm-bindgen and wasm-bindgen-shared
+are in all nine.
 hayro-jpeg2000 carries two ICC profiles (ProPhoto, CIELAB) under CC0-1.0
 (LICENSES/CC0-1.0.txt).
 
-  adler2                 Jonas Schievink
-  bitflags               2014 The Rust Project Developers
+  adler2                 Jonas Schievink                         (image, sheets,
+                                                                 slides, docs)
+  aligned-vec            2022 sarah                              (image)
+  archmage, archmage-macros
+                         2025-2026 Lilith River                  (image)
+  array-init             2017-2020 The array-init developers     (image)
+  atomic_refcell         2022 Bobby Holley                       (image)
+  bitflags               2014 The Rust Project Developers        (image, text)
+  block-buffer, const-oid, crypto-common, digest, hybrid-array, md-5, sha1
+                         2016-2026 The RustCrypto Project Developers
+                                                                 (sheets, slides)
   bumpalo                2019 Nick Fitzgerald                    (all)
-  bytemuck               2019 Daniel "Lokathor" Gee
+  bytemuck, bytemuck_derive
+                         2019 Daniel "Lokathor" Gee
   byteorder-lite         2015 Andrew Gallant
   cfg-if                 2014 Alex Crichton                      (all)
   color_quant            2016 PistonDevelopers
   crc32fast              2018 Sam Rijs, Alex Crichton and contributors
+                                                                 (image, sheets,
+                                                                 slides, docs)
+  enough                 Lilith River and the enough developers  (image)
+  equator, equator-macro 2023 sarah                              (image)
+  equivalent, indexmap   2016-2023 bluss, Josh Stone             (sheets, slides,
+                                                                 docs)
   fax                    Sebastian K
   fdeflate               The image-rs Developers
-  flate2                 2014-2026 Alex Crichton
+  flate2                 2014-2026 Alex Crichton                 (image, sheets,
+                                                                 slides, docs)
   gif                    2015 nwin
-  half                   Kathryn Long
+  hashbrown              2016 Amanieu d'Antras                   (sheets, slides,
+                                                                 docs)
   hayro-ccitt            Laurenz Stampfl                         (image, jbig2)
   hayro-jbig2            Laurenz Stampfl                         (image, jbig2)
   hayro-jpeg2000         Laurenz Stampfl                         (image, jpx)
   image                  The image-rs Developers
   image-webp             The image-rs Developers
-  memchr                 2015 Andrew Gallant                     (dwg)
+  memchr                 2015 Andrew Gallant                     (dwg, text, sheets,
+                                                                 slides, docs)
   miniz_oxide            Frommi, oyvindln, Rich Geldreich; 2013-2014 RAD Game
                          Tools and Valve Software; 2010-2014 Rich Geldreich and
-                         Tenacious Software LLC
-  num-traits             2014 The Rust Project Developers
+                         Tenacious Software LLC                  (image, sheets,
+                                                                 slides, docs)
+  num-derive, num-traits 2014 The Rust Project Developers        (image)
   once_cell              Aleksey Kladov                          (all)
+  paste                  David Tolnay                            (image)
   png                    2015 nwin
+  proc-macro-error2, proc-macro-error-attr2
+                         2019-2020 CreepySkeleton                (image)
+  safe_unaligned_simd    2025 Collyn O'Kane, 2017 The Rust Project
+                         Developers                              (image)
+  pulldown-cmark         2015 Google Inc.                        (text)
   qoi                    2022 Ivan Smirnov
   quick-error            2015 The quick-error Developers
+  quick-xml              2016 Johann Tuffe                       (sheets, slides,
+                                                                 docs)
   scopeguard             2016-2019 Ulrik Sverdrup "bluss" and scopeguard
                          developers                              (dwg)
-  simd-adler32           2021 Marvin Countryman
+  simd-adler32           2021 Marvin Countryman                  (image, sheets,
+                                                                 slides, docs)
+  smallvec               2018 The Servo Project Developers       (image)
   thiserror              David Tolnay                            (dwg)
+  typed-path             Chip Senkbeil                           (sheets, slides,
+                                                                 docs)
+  typenum                2014 Paho Lurie-Gregg                   (sheets, slides)
+  unicase                2014-2026 Sean McArthur                 (text)
   wasm-bindgen           2014 Alex Crichton                      (all)
   wasm-bindgen-shared    2014 Alex Crichton                      (all)
   weezl                  2020 HeroicKatora
-  zerocopy               2023 The Fuchsia Authors
+  zip                    2014 Mathijs van de Nes                 (sheets, slides,
+                                                                 docs)
   zune-core, zune-jpeg   zune-image developers
 
 Under the Apache License 2.0 (LICENSES/Apache-2.0.txt), each offering it
@@ -143,6 +189,15 @@ among other licences:
 
   moxcms                 2024 Radzivon Bartoshyk
   pxfm                   2024 Radzivon Bartoshyk
+
+Under the BSD 3-Clause License (LICENSES/BSD-3-Clause.txt), whose notice a
+binary distribution must reproduce: the JPEG XL decoder of the image module,
+
+  zenjxl-decoder, zenjxl-decoder-macros, zenjxl-decoder-simd
+                         Copyright (c) the JPEG XL Project Authors. All
+                         rights reserved. A fork of the libjxl team's jxl-rs
+                         (https://github.com/libjxl/jxl-rs), vendored in
+                         vendor/zenjxl-decoder of the source tree.
 
 
 Part 4: fonts

@@ -49,6 +49,10 @@ jobs:
             --site "${{ steps.pages.outputs.origin }}" \
             --base "${{ steps.pages.outputs.base_path }}"
         working-directory: ${{ env.BUILD_PATH }}
+      # Every internal link and #anchor of the built pages must resolve (offline,
+      # a second or two). The demo's own pages are copied in below.
+      - name: Check internal links
+        run: node scripts/check-links.mjs ${{ env.BUILD_PATH }}/dist
       # The @exav/viewer demo, served at /viewer/demo/: the package and its wasm
       # modules built from this commit, the archive engine's pkg/ too.
       - uses: dtolnay/rust-toolchain@stable
@@ -71,8 +75,14 @@ jobs:
           npm ci
           npm run build:wasm
           npm run build
-          # The sidebar's files: github.com/sylvinus/exav-samples, HEAD.
+          # The sidebar's files, from the network: github.com/sylvinus/exav-samples, HEAD.
           npm run demo:showcase
+          # `demo:build` runs `npm run demo:examples` first: the example files
+          # committed under demo/examples/files/ are copied, and the others (tens
+          # of MB, from Zenodo, figshare, Wikimedia Commons and the like) are
+          # downloaded at build time, each checked against its size and SHA-256 in
+          # demo/examples/examples.json. The build fails when one cannot be fetched
+          # or has changed.
           # DEMO_ORIGIN goes into the sandboxed frame's policy, for Safari.
           DEMO_BASE="${{ steps.pages.outputs.base_path }}/viewer/demo/" DEMO_ORIGIN="${{ steps.pages.outputs.origin }}" npm run demo:build
           # dist/viewer/ holds the File viewer docs; the demo must not land on them.

@@ -23,6 +23,9 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+# The format registry against the code, and the pages generated from it.
+node "$REPO/scripts/formats.mjs" check
+
 if [ ! -d node_modules ]; then
   npm ci || npm install
 fi

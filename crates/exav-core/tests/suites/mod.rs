@@ -27,6 +27,9 @@ mod cut_short_members;
 mod embedded_carve;
 #[cfg(feature = "all-formats")]
 mod encrypted_archives;
+mod exec_offsets;
+#[cfg(feature = "all-formats")]
+mod format_registry;
 #[cfg(feature = "image-hash")]
 mod fuzzy_img_formats;
 #[cfg(feature = "all-formats")]
@@ -51,12 +54,18 @@ mod salvage;
 #[cfg(feature = "all-formats")]
 mod sevenz_ppmd;
 mod size_caps;
+#[cfg(feature = "all-formats")]
+mod split_sets;
 mod tar_size_terminator;
 mod target_flash;
 mod target_text;
 #[cfg(feature = "all-formats")]
 mod tdb_attributes;
 mod untyped_container_dispatch;
+#[cfg(feature = "visible-text")]
+mod visible_text;
+#[cfg(feature = "visible-text-office")]
+mod visible_text_office;
 #[cfg(feature = "yara")]
 mod yara_dotnet;
 #[cfg(feature = "all-formats")]

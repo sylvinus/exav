@@ -285,17 +285,24 @@ pub(crate) fn raw_decoder<'a, R: Read + 'a>(
 }
 
 /// [`raw_decoder`] over bytes in hand, read whole up to `cap`. `None` when
-/// there is no decoder or decoding failed; the flag is set when the member
-/// is larger than `cap`.
+/// there is no decoder or the codec's header is unreadable. A stream that
+/// fails part way gives the bytes decoded before the failure, with the
+/// damage in the result ([`crate::Salvaged`]); one larger than `cap` has
+/// `over_cap` set.
 pub(crate) fn decode_zip_raw(
     method: u16,
     raw: &[u8],
     usz: Option<u64>,
     cap: u64,
-) -> Option<(Vec<u8>, bool)> {
+) -> Option<crate::Salvaged> {
     match raw_decoder(method, raw, usz, cap) {
-        Ok(r) => bounded_read(r, cap).ok(),
-        Err(RawRefusal::TooBig) => Some((Vec::new(), true)),
+        Ok(r) => bounded_read_salvage(r, cap, true).ok(),
+        Err(RawRefusal::TooBig) => Some(crate::Salvaged {
+            data: Vec::new(),
+            over_cap: true,
+            undecoded: false,
+            cut_short: false,
+        }),
         Err(RawRefusal::Unsupported(_) | RawRefusal::Truncated) => None,
     }
 }
@@ -1559,11 +1566,25 @@ pub fn extract_zip_from<Rd: Read + Seek + Clone, R>(
         // metadata-only unsupported member and the archive keeps going — one bad
         // member never aborts the whole ZIP.
         let (buf, truncated, part_way) = if !crate_decodes(method) {
-            let (raw, _) = bounded_read(&mut file, budget.limits.max_buffer_bytes)
+            let (raw, raw_over) = bounded_read(&mut file, budget.limits.max_buffer_bytes)
                 .map_err(|e| LimitHit::new(format!("zip raw read: {e}")))?;
             drop(file);
+            // The compressed bytes themselves past the buffer limit: what is
+            // here is a prefix of the member, not the member.
+            if raw_over {
+                if let Some(r) = oversized(budget, "archive member exceeds size budget") {
+                    return Ok(Some(r));
+                }
+                continue;
+            }
             match decode_zip_raw(method, &raw, Some(usz), cap) {
-                Some((out, truncated)) => (out, truncated, false),
+                // All of the member's compressed bytes were here, so a stream
+                // that ran out of them hides nothing, but it is not the
+                // member the directory declares, whose size it does not reach.
+                Some(s) => {
+                    let part_way = s.undecoded || s.cut_short || s.data.len() as u64 != usz;
+                    (s.data, s.over_cap, part_way)
+                }
                 None => {
                     if let Some(r) = oversized(budget, "archive member: unsupported ZIP codec") {
                         return Ok(Some(r));
@@ -2196,6 +2217,118 @@ mod directory_tests {
     }
 }
 
+/// The buffered path (`extract_zip_from`) over a member of a codec the `zip`
+/// crate does not decode.
+#[cfg(all(test, feature = "bzip2"))]
+mod buffered_raw_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A one-member ZIP, central directory included.
+    fn zip_of(method: u16, raw: &[u8], crc: u32, usz: u32) -> Vec<u8> {
+        let fields = |v: &mut Vec<u8>| {
+            v.extend_from_slice(&20u16.to_le_bytes());
+            v.extend_from_slice(&0u16.to_le_bytes());
+            v.extend_from_slice(&method.to_le_bytes());
+            v.extend_from_slice(&[0; 4]);
+            v.extend_from_slice(&crc.to_le_bytes());
+            v.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            v.extend_from_slice(&usz.to_le_bytes());
+            v.extend_from_slice(&5u16.to_le_bytes());
+            v.extend_from_slice(&0u16.to_le_bytes());
+        };
+        let mut z = b"PK\x03\x04".to_vec();
+        fields(&mut z);
+        z.extend_from_slice(b"m.bin");
+        z.extend_from_slice(raw);
+        let mut cd = b"PK\x01\x02".to_vec();
+        cd.extend_from_slice(&20u16.to_le_bytes());
+        fields(&mut cd);
+        cd.extend_from_slice(&[0; 6]);
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(b"m.bin");
+        let cd_at = z.len() as u32;
+        z.extend_from_slice(&cd);
+        z.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+        z.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+        z.extend_from_slice(&cd_at.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z
+    }
+
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u32 = 0x1234_5678;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn bzip2(data: &[u8]) -> Vec<u8> {
+        let mut w = ::bzip2::write::BzEncoder::new(Vec::new(), ::bzip2::Compression::new(1));
+        w.write_all(data).unwrap();
+        w.finish().unwrap()
+    }
+
+    fn entries(zip: &[u8]) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut budget = Budget::new(crate::Limits::default());
+        extract_zip_from(
+            Cursor::new(zip),
+            &mut budget,
+            &mut |e: Entry, _: &mut Budget| {
+                out.push(e);
+                None::<()>
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    /// Three 100 kB blocks, the last damaged: the first two are scanned and the
+    /// member is reported.
+    #[test]
+    fn a_member_damaged_part_way_keeps_its_prefix_and_is_reported() {
+        let data = noise(270_000);
+        let mut raw = bzip2(&data);
+        let at = raw.len() * 4 / 5;
+        raw[at..].fill(0xff);
+        let e = entries(&zip_of(12, &raw, 0, data.len() as u32));
+        assert_eq!(e.len(), 1);
+        assert!(
+            e[0].data.len() >= 100_000 && data.starts_with(&e[0].data),
+            "the blocks before the damage are lost: {} bytes",
+            e[0].data.len()
+        );
+        assert!(
+            e[0].unsupported.is_some(),
+            "a member damaged part way came out whole"
+        );
+    }
+
+    #[test]
+    fn a_whole_member_is_not_reported() {
+        let data = noise(270_000);
+        let e = entries(&zip_of(12, &bzip2(&data), 0, data.len() as u32));
+        assert!(e[0].unsupported.is_none() && e[0].data == data);
+    }
+
+    /// A stream that ends whole but short of the size the directory declares is
+    /// not that member.
+    #[test]
+    fn a_member_shorter_than_declared_is_reported() {
+        let data = noise(1000);
+        let e = entries(&zip_of(12, &bzip2(&data), 0, 5000));
+        assert_eq!(e[0].data, data);
+        assert!(e[0].unsupported.is_some());
+    }
+}
+
 #[cfg(test)]
 mod zip_ppmd_tests {
     use super::*;
@@ -2239,10 +2372,8 @@ mod zip_ppmd_tests {
     fn ppmd_model_over_the_buffer_limit_is_too_big() {
         // order 6, 256 MB.
         let raw = [0xf5u8, 0x0f, 0xde, 0xad, 0xbe, 0xef];
-        assert_eq!(
-            decode_zip_raw(98, &raw, Some(64), 1 << 20),
-            Some((Vec::new(), true))
-        );
+        let s = decode_zip_raw(98, &raw, Some(64), 1 << 20).unwrap();
+        assert!(s.over_cap && s.data.is_empty() && !s.undecoded);
         assert!(matches!(
             raw_decoder(98, &raw[..], Some(64), 1 << 20),
             Err(RawRefusal::TooBig)
@@ -2256,9 +2387,10 @@ mod zip_ppmd_tests {
         let cap = budget.reserve().unwrap();
         // Valid parameter header, garbage stream.
         let raw = [0x07u8, 0x01, 0xde, 0xad, 0xbe, 0xef];
+        let s = decode_zip_raw(98, &raw, Some(64), cap).expect("a decoder is there");
         assert!(
-            decode_zip_raw(98, &raw, Some(64), cap).is_none(),
-            "a corrupt PPMd stream must decode to nothing, so the caller reports it"
+            s.undecoded || s.cut_short,
+            "a corrupt PPMd stream must say so, for the caller to report it"
         );
     }
 
@@ -2278,8 +2410,15 @@ mod zip_ppmd_tests {
         let member = &zip[start..start + comp];
         assert_eq!(member[..2], [0x0b, 0x10]);
         let cap = 1 << 20;
-        let (whole, over) = decode_zip_raw(98, member, usz, cap).expect("intact member decodes");
-        assert_eq!((Some(whole.len() as u64), over), (usz, false));
+        let whole = decode_zip_raw(98, member, usz, cap).expect("intact member decodes");
+        assert_eq!(
+            (
+                Some(whole.data.len() as u64),
+                whole.over_cap,
+                whole.undecoded
+            ),
+            (usz, false, false)
+        );
 
         let flips = (2..18)
             .flat_map(|p| (0..8).map(move |b| (p, b)))
@@ -2287,15 +2426,20 @@ mod zip_ppmd_tests {
         for (pos, bit) in flips {
             let mut bad = member.to_vec();
             bad[pos] ^= 1 << bit;
-            if let Some((out, _)) = decode_zip_raw(98, &bad, usz, cap) {
-                assert!(Some(out.len() as u64) <= usz);
+            if let Some(s) = decode_zip_raw(98, &bad, usz, cap) {
+                assert!(Some(s.data.len() as u64) <= usz);
             }
         }
         for cut in (0..member.len()).step_by(97) {
-            assert!(
-                decode_zip_raw(98, &member[..cut], usz, cap).is_none(),
-                "cut at {cut}: a truncated member is not a decoded one"
-            );
+            // The header's two bytes cut, nothing decodes; later, a prefix does
+            // and the cut is the stream's running out, never a whole member.
+            match decode_zip_raw(98, &member[..cut], usz, cap) {
+                None => assert!(cut < 2, "cut at {cut}: no decoder"),
+                Some(s) => assert!(
+                    Some(s.data.len() as u64) < usz && (s.cut_short || s.undecoded),
+                    "cut at {cut}: a truncated member is not a decoded one"
+                ),
+            }
         }
     }
 }

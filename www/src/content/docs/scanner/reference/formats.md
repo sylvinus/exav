@@ -12,7 +12,9 @@ reported `UNSCANNABLE`, `PASSWORD-PROTECTED` or `LIMITS-EXCEEDED`, never
 
 Containers are opened by the extractor, [exav-unpack](/unpack/). Its
 [Supported formats](/unpack/formats/) page has the codec-level detail; this
-page is what the scanner does with each kind of file.
+page is what the scanner does with each kind of file, and the
+[format matrix](/project/formats/) has every format, with what the extractor
+and the viewer do with it.
 
 ## File types
 
@@ -23,8 +25,8 @@ rules. On top of that:
 | Type | What the scanner does with it | Signatures that apply to it alone |
 |---|---|---|
 | PE (Windows executables and DLLs) | Reads the entry point, sections, imports, icons, version information and Authenticode signer; unpacks a packed file ([below](#packed-executables)) | `Target:1`; `EP`, section and `VI` offsets; section hashes (`.mdb`, `.msb`), import hashes (`.imp`), icons (`.idb`), signer block list (`.crb`); YARA `pe` and `dotnet` |
-| ELF | Scanned as it is; a UPX-packed one is unpacked | `Target:6`; YARA `elf`. `EP` and section offsets do not resolve ([gap](/scanner/reference/comparison-with-clamav/#targets)) |
-| Mach-O | A universal binary is split per architecture; each is scanned as it is, and a UPX-packed one unpacked | `Target:9`, with the same offset gap |
+| ELF | Scanned as it is; a UPX-packed one is unpacked | `Target:6`, with `EP` and section offsets ([how](/scanner/reference/comparison-with-clamav/#targets)); YARA `elf` |
+| Mach-O | A universal binary is split per architecture; each is scanned as it is, and a UPX-packed one unpacked | `Target:9`, with section offsets (`EP` does not resolve, as in clamscan) |
 | OLE2 (legacy Office, MSI) | Every stream; VBA macros decompressed, Excel 4.0 (XLM) macros, `Ole10Native` payloads; encrypted Excel decrypted | `Target:2` |
 | OOXML (`.docx`, `.xlsx`, `.pptx`) | Opened as the ZIP it is; told apart as Word, Excel or PowerPoint for `Container:`; encrypted documents decrypted | as for its members |
 | PDF | Streams decoded through their filters (Flate, LZW, ASCII85, ASCIIHex, RunLength), JavaScript and URI and launch targets collected, the document decrypted. Image streams (DCT, JBIG2, JPX, CCITT) are matched as stored | `Target:10` |
@@ -40,6 +42,25 @@ rules. On top of that:
 not run. `HandlerType:` re-types an object and scans it again as the new
 type, as in ClamAV. [Comparison with ClamAV](/scanner/reference/comparison-with-clamav/#targets)
 covers the targets in detail.
+
+### The text a reader sees
+
+Beside its bytes, a document is matched through its visible text: the words
+without the marks, tags, escapes or run boundaries, entities decoded, and each
+link followed by where it goes (`label (target)`). That text is one more view,
+which `Target:0` and `Target:7` signatures see, and `--detect phishing` judges
+its links. It is the `visible-text` [feature](/scanner/reference/feature-flags/),
+off under `--clamav-compat`.
+
+| Read in the default build | Read with an opt-in feature |
+|---|---|
+| Markdown (`.md`, `.markdown`), HTML, the XML parts of Word, PowerPoint, Excel and OpenDocument files, DXF and DWG drawings | PDF (`visible-text-pdf`); DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, flat OpenDocument (FODT, FODS, FODP, FODG), Numbers, Pages and Keynote (`visible-text-office`) |
+
+A document of a kind that has such a text, whose text cannot be taken out
+(encrypted, past a limit, damaged), is still scanned as bytes, and the scan is
+`PARTIAL`, never `OK`. A compound file (`.doc`, `.xls`, `.ppt` and their
+templates) is read as an office document by its extension only, so that an
+installer is not read whole to find out.
 
 ## Containers
 
@@ -63,8 +84,13 @@ scanned in turn:
   (their embedded objects and preview images; a drawing is not rendered).
 
 A set split into byte-numbered parts (`x.7z.001`, `x.7z.002`, ...) and met
-inside one container is joined and scanned whole. RAR and ZIP volume sets are
-not joined; a member continued in another volume is reported.
+inside one container is joined and scanned whole. RAR, ZIP and CAB volume sets
+met there are not joined; a member continued in another volume is reported.
+Next to each other on disk, or sent together to the daemon, they are: a RAR set
+(`x.part1.rar`, `x.r00`), a ZIP set (`x.z01`, ..., `x.zip`) and a CAB set (each
+cabinet's header names the next). Scanning one volume of such a set by name
+scans the archive its siblings make as well, looked for in the same directory
+among regular files (a symbolic link is not a sibling).
 
 ### Found inside other files
 

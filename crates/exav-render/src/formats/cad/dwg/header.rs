@@ -438,8 +438,11 @@ fn variables(s: &mut HeaderStreams<'_>, v: Version, vars: &mut Vars) -> BitResul
     }
     if r2004 {
         // SORTENTS, INDEXCTL, HIDETEXT, XCLIPFRAME, DIMASSOC, HALOGAP
-        for _ in 0..6 {
-            s.data.rc()?;
+        for i in 0..6 {
+            let x = s.data.rc()?;
+            if i == 3 {
+                vars.header.xclipframe = i16::from(x);
+            }
         }
         // OBSCUREDCOLOR, INTERSECTIONCOLOR
         skip_bs(s, 2)?;

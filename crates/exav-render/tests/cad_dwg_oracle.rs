@@ -365,6 +365,12 @@ const EXPLAINED: &[(&[&str], &str, &str, &str)] = &[
         NO_SOURCES,
     ),
     (&["*"], "linetypes.elements[].flags (bit 8)", "", LTYPE_BIT8),
+    (
+        &["ACAD13", "ACAD14", "orig-R13", "orig-R14"],
+        "dim_styles.dimadec",
+        "",
+        R14_DIMADEC,
+    ),
     (&["*"], "entity:", ".block_name (renumbered)", RENUMBERED),
     (&["*"], "blocks.name (renumbered)", "", RENUMBERED),
     (
@@ -647,6 +653,9 @@ const HAS_ATTRIBUTES: &str = "AutoCAD set the has-attributes flag (2) of two blo
 const R13_CODE_PAGE: &str = "the converter writes R13 DXF's $DWGCODEPAGE in lower case";
 const R13_MEASUREMENT: &str = "R13 DXF has no $MEASUREMENT: the DXF reader gives 0, the DWG's \
     own section (spec 22) says";
+const R14_DIMADEC: &str = "an R13 or R14 DWG's DIMSTYLE has no DIMADEC (spec 20.4.68): the DWG \
+    reader gives 0, the converter's DXF of the same version the style's angular precision from \
+    the drawing it was made from (854c8ebe's 242: 2)";
 const DASH_SCALE: &str = "the converter writes group 46 only for a dash with a shape or text (74 \
     not 0): the DXF reader gives 1 for the others, the DWG holds the stored scale (0.1, 0)";
 const TEMP_REC: &str = "a shape file's STYLE entry of an R11 drawing: the converter names it \

@@ -153,6 +153,7 @@ pub(crate) fn read(
         0x29 => return none(EntityKind::XLine(ray(o)?)),
         0x2C => return none(EntityKind::MText(Box::new(mtext(ctx, o)?))),
         0x2D => return none(EntityKind::Leader(Box::new(leader(ctx, o)?))),
+        0x2E => return none(EntityKind::Tolerance(Box::new(tolerance(ctx, o)?))),
         0x2F => return none(EntityKind::MLine(Box::new(mline(ctx, o)?))),
         _ => {}
     }
@@ -169,6 +170,7 @@ pub(crate) fn read(
         }
         "MULTILEADER" => none(EntityKind::MultiLeader(Box::new(multileader(ctx, o)?))),
         "HELIX" => none(EntityKind::Helix(Box::new(helix(ctx, o)?))),
+        "MESH" => none(EntityKind::Mesh(Box::new(mesh(ctx, o)?))),
         "ACAD_TABLE" => none(EntityKind::Table(Box::new(table(ctx, o)?))),
         "PDFUNDERLAY" => none(EntityKind::Underlay(Box::new(underlay(
             ctx,
@@ -401,6 +403,60 @@ fn quad(o: &mut Object<'_>, v: Version) -> BitResult<Quad> {
     })
 }
 
+/// TOLERANCE: R13 and R14 a BS, the height and the gap (BD each), not
+/// kept; then the
+/// insertion, direction and extrusion (3BD each), the text (TV), and the
+/// dimension style in the handle stream.
+fn tolerance(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<Tolerance> {
+    let b = &mut o.data;
+    if ctx.version < Version::R2000 {
+        b.bs()?;
+        b.bd()?;
+        b.bd()?;
+    }
+    let mut t = Tolerance {
+        insertion: v3(b.bd3()?),
+        x_direction: v3(b.bd3()?),
+        extrusion: v3(b.bd3()?),
+        ..Tolerance::default()
+    };
+    t.text = string(ctx, o)?;
+    t.dimstyle = entry(ctx, o, "dimension style")?;
+    Ok(t)
+}
+
+/// MESH: BS version, B blend crease, BL subdivision level, BL vertex count
+/// and the vertices (3BD), BL face list length and the list (BL each), each
+/// face its count then its corners; the edges and creases after it are not
+/// read.
+fn mesh(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<Mesh> {
+    let b = &mut o.data;
+    b.bs()?;
+    b.b()?;
+    b.bl()?;
+    let n = i64::from(b.bl()?);
+    let n = count(b, n, 6)?;
+    let mut m = Mesh::default();
+    for _ in 0..n {
+        let p = v3(o.data.bd3()?);
+        if ctx.room(m.vertices.len()) {
+            m.vertices.push(p);
+        }
+    }
+    let b = &mut o.data;
+    let n = i64::from(b.bl()?);
+    let n = count(b, n, 2)?;
+    let mut list = Vec::new();
+    for _ in 0..n {
+        let k = i64::from(o.data.bl()?);
+        if ctx.room(list.len()) {
+            list.push(k);
+        }
+    }
+    m.faces = Mesh::faces_from_list(&list, m.vertices.len());
+    Ok(m)
+}
+
 fn face3d(o: &mut Object<'_>, v: Version) -> BitResult<Face3D> {
     let b = &mut o.data;
     let mut f = Face3D::default();
@@ -599,6 +655,9 @@ fn insert(
     let block = o.handle_ref()?;
     i.block_name = ctx.name(block).unwrap_or_default().to_string();
     let f = followers(o, v, has_attribs, n)?;
+    if o.xdictionary != 0 {
+        i.clip = super::objects::insert_clip(ctx, o.xdictionary);
+    }
     Ok((i, f))
 }
 
@@ -1662,8 +1721,12 @@ fn viewport(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<Viewport> {
     }
     let frozen = count(&o.handles, frozen, 8)?;
     for _ in 0..frozen {
+        // AutoCAD's files can hold null references here, which name no
+        // layer and which DXF leaves out.
         let h = o.handle_ref()?;
-        push(ctx, &mut p.frozen_layers, Handle(h));
+        if h != 0 {
+            push(ctx, &mut p.frozen_layers, Handle(h));
+        }
     }
     p.clip_boundary = Handle(o.handle_ref()?);
     Ok(p)

@@ -162,6 +162,17 @@ pub struct DimStyle {
     pub dimtsz: f64,
     pub dimtxt: f64,
     pub dimgap: f64,
+    /// Text above the dimension line (1 and up) or centred on it (0).
+    pub dimtad: i16,
+    /// Zero suppression: 4 leading, 8 trailing.
+    pub dimzin: i16,
+    /// Scale applied to linear measurements.
+    pub dimlfac: f64,
+    /// Decimal places of linear and of angular measurements.
+    pub dimdec: i16,
+    pub dimadec: i16,
+    /// The decimal separator's character code.
+    pub dimdsep: i16,
     pub dimclrd: Color,
     pub dimclre: Color,
     pub dimclrt: Color,
@@ -190,6 +201,12 @@ impl Default for DimStyle {
             dimtsz: 0.0,
             dimtxt: 0.18,
             dimgap: 0.09,
+            dimtad: 0,
+            dimzin: 0,
+            dimlfac: 1.0,
+            dimdec: 4,
+            dimadec: 0,
+            dimdsep: 46,
             dimclrd: Color::ByBlock,
             dimclre: Color::ByBlock,
             dimclrt: Color::ByBlock,

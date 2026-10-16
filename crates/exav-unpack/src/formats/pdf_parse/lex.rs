@@ -223,6 +223,8 @@ impl<'a> Lexer<'a> {
                             b'n' => result.push(b'\n'),
                             b'r' => result.push(b'\r'),
                             b't' => result.push(b'\t'),
+                            b'b' => result.push(0x08),
+                            b'f' => result.push(0x0c),
                             b'\\' => result.push(b'\\'),
                             b'(' => result.push(b'('),
                             b')' => result.push(b')'),
@@ -239,18 +241,15 @@ impl<'a> Lexer<'a> {
                             }
                             d @ b'0'..=b'7' => {
                                 let mut octal = (d - b'0') as u16;
+                                // Up to two more digits; a byte that is not one
+                                // belongs to the string, so it is only peeked at.
                                 for _ in 0..2 {
-                                    self.pos += 1;
-                                    if self.pos < self.data.len() {
-                                        if let Some(o) = self.data[self.pos].checked_sub(b'0') {
-                                            if o <= 7 {
-                                                octal = octal * 8 + o as u16;
-                                            } else {
-                                                break;
-                                            }
-                                        } else {
-                                            break;
+                                    match self.data.get(self.pos + 1) {
+                                        Some(&n @ b'0'..=b'7') => {
+                                            octal = octal * 8 + (n - b'0') as u16;
+                                            self.pos += 1;
                                         }
+                                        _ => break,
                                     }
                                 }
                                 result.push(octal as u8);
@@ -397,6 +396,34 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("did not return within 10 s");
         assert!(none);
+    }
+
+    fn string_of(src: &[u8]) -> Vec<u8> {
+        match Lexer::new(src).next_token() {
+            Token::String(s) => s,
+            other => panic!("not a string: {other:?}"),
+        }
+    }
+
+    /// `\b` and `\f` are backspace and form feed. Read as the letters, an
+    /// `/O` entry that holds one is the wrong key, and an encrypted PDF that
+    /// opens with an empty password is reported password-protected.
+    #[test]
+    fn backspace_and_form_feed_escapes_are_decoded() {
+        assert_eq!(string_of(b"(a\\bb\\fc)"), b"a\x08b\x0cc");
+    }
+
+    /// A short octal escape ended where the next byte is not a digit, and
+    /// that byte was dropped: the `)` after `\0` closed nothing, and the
+    /// string ran on into the rest of the file.
+    #[test]
+    fn a_short_octal_escape_does_not_eat_the_next_byte() {
+        let mut lex = Lexer::new(b"(a\\0) /Next");
+        assert_eq!(lex.next_token(), Token::String(b"a\0".to_vec()));
+        assert_eq!(lex.next_token(), Token::Name("Next".into()));
+        assert_eq!(string_of(b"(\\12x)"), b"\nx");
+        assert_eq!(string_of(b"(\\1234)"), b"S4");
+        assert_eq!(string_of(b"(\\8)"), b"8");
     }
 
     #[test]

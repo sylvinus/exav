@@ -22,11 +22,10 @@
 //! purely static rewriter: it never executes code, so runtime-assembled payloads
 //! (numeric-array VMs, dynamic dispatch) are intentionally out of scope.
 //!
-//! Not yet implemented (tracked in tmp/GAPS.md):
-//! * **Microsoft Script Encoder** (`#@~^…^#~@`, JScript.Encode/VBScript.Encode)
-//!   decoding — needs the exact published 119×3 translation + 64-entry pick
-//!   tables; deferred rather than ship an unverified table (and near-absent in
-//!   the current corpus).
+//! Not done here: Microsoft Script Encoder (`#@~^…^#~@`) blobs are decoded by
+//! exav-unpack's `screnc`, which surfaces the plaintext as a member of its own.
+//!
+//! Not yet implemented:
 //! * **base64→script rescan** — decoding long base64 runs to *script/text* (not
 //!   just exec-magic payloads, which `exav-unpack::base64_payloads` already
 //!   covers). The higher-yield lever per corpus evidence, but needs a distinct

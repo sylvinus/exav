@@ -23,6 +23,8 @@ mod bzip2_rs;
 #[cfg(feature = "cab")]
 pub(crate) mod cab;
 #[cfg(feature = "cab")]
+pub(crate) mod cab_join;
+#[cfg(feature = "cab")]
 mod cab_parse;
 #[cfg(feature = "chm")]
 mod chm;
@@ -64,9 +66,9 @@ mod ole;
 #[cfg(all(feature = "ole", feature = "decrypt"))]
 mod ole_crypto;
 #[cfg(feature = "pdf")]
-mod pdf;
+pub(crate) mod pdf;
 #[cfg(feature = "pdf")]
-mod pdf_parse;
+pub(crate) mod pdf_parse;
 #[cfg(feature = "ole")]
 mod xlm;
 #[cfg(feature = "ole")]
@@ -90,6 +92,8 @@ pub(crate) mod azo;
 pub(crate) mod azo_tables;
 #[cfg(feature = "binhex")]
 mod binhex;
+#[cfg(feature = "ishieldz")]
+mod dcl_explode;
 #[cfg(feature = "ext")]
 pub(crate) mod ext;
 #[cfg(feature = "fat")]
@@ -104,6 +108,8 @@ pub(crate) mod ishield_z;
 mod lnk;
 #[cfg(feature = "lz4")]
 pub(crate) mod lz4;
+#[cfg(feature = "dmg")]
+mod lzfse;
 #[cfg(feature = "lzw")]
 pub(crate) mod lzw;
 #[cfg(feature = "machofat")]
@@ -159,12 +165,25 @@ mod udif;
 mod upx;
 #[cfg(feature = "ole")]
 mod vba;
+// Virtual disks read in place, and the partitions and filesystems walked on
+// them: shared by every format that has a disk in it.
+#[cfg(any(feature = "vhd", feature = "diskimage"))]
+pub(crate) mod vdisk;
 #[cfg(feature = "vhd")]
 pub(crate) mod vhd;
 #[cfg(feature = "diskimage")]
 pub(crate) mod vhdx;
 #[cfg(feature = "diskimage")]
 pub(crate) mod vmdk;
+#[cfg(any(
+    feature = "vhd",
+    feature = "diskimage",
+    feature = "partition",
+    feature = "ntfs",
+    feature = "fat",
+    feature = "ext"
+))]
+pub(crate) mod volumes;
 #[cfg(feature = "wim")]
 pub(crate) mod wim;
 #[cfg(feature = "xar")]

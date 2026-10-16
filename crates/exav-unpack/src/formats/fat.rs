@@ -23,29 +23,28 @@
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
-use std::io::Cursor;
+use std::io::{Read, Seek};
 
+use crate::source::{ByteSource, Reader};
+use crate::stream::Visit;
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// Bound on the tree walk; hitting it is reported, never a quiet stop.
 const MAX_ENTRIES: usize = 20_000;
 const MAX_DEPTH: u32 = 32;
 
-/// A read-only view of the image for `fatfs`, whose storage trait requires
-/// `Write`. Writing is refused rather than supported, which keeps this
-/// zero-copy: wrapping a `Cursor<Vec<u8>>` instead would duplicate the whole
-/// reconstructed disk in memory.
-struct ReadOnly<'a> {
-    inner: Cursor<&'a [u8]>,
-}
+/// A read-only view of the volume for `fatfs`, whose storage trait requires
+/// `Write`. Writing is refused rather than supported. The volume is read where
+/// `fatfs` goes, never copied.
+struct ReadOnly<D>(D);
 
-impl std::io::Read for ReadOnly<'_> {
+impl<D: Read> Read for ReadOnly<D> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf)
+        self.0.read(buf)
     }
 }
 
-impl std::io::Write for ReadOnly<'_> {
+impl<D> std::io::Write for ReadOnly<D> {
     fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
     }
@@ -54,10 +53,28 @@ impl std::io::Write for ReadOnly<'_> {
     }
 }
 
-impl std::io::Seek for ReadOnly<'_> {
+impl<D: Seek> Seek for ReadOnly<D> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(pos)
+        self.0.seek(pos)
     }
+}
+
+/// Runs a read of `fatfs`, a panic of its own standing for the read that failed.
+///
+/// `fatfs` subtracts 2 from a cluster number it takes from the volume (a
+/// directory entry's, or the next one in a chain) without looking at it, so a
+/// chain through cluster 1 panics where a read error would do. Without this
+/// the panic reaches the walk's boundary, which ends the whole volume as
+/// unreadable; here it ends that directory or that file, and the rest of the
+/// volume is walked.
+// Never inlined: the fuzz targets let a panic through by this frame's name.
+#[inline(never)]
+fn contained<R>(read: impl FnOnce() -> std::io::Result<R>) -> std::io::Result<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|_| {
+        Err(std::io::Error::other(
+            "the FAT reader panicked on this volume",
+        ))
+    })
 }
 
 /// Does this look like a FAT volume boot record?
@@ -96,25 +113,46 @@ pub(crate) fn is_fat(data: &[u8]) -> bool {
         || matches!(ty32, Some(b"FAT32"))
 }
 
-pub(crate) fn extract_fat<R>(
-    data: &[u8],
+/// Walk a raw FAT volume.
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
+    budget: &mut Budget,
+    visit: Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    super::volumes::entries(budget, visit, "", |budget, sink| {
+        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
+    })
+}
+
+/// Walk the FAT volume `disk`, which is `len` bytes long, handing each file to
+/// `visit`.
+pub(crate) fn walk_volume<D: Read + Seek, R>(
+    mut disk: D,
+    len: u64,
     budget: &mut Budget,
     visit: Sink<R>,
 ) -> Result<Option<R>, LimitHit> {
-    if !is_fat(data) {
+    if len < 512 {
         return Ok(None);
     }
-    let storage = ReadOnly {
-        inner: Cursor::new(data),
-    };
-    let fs = match fatfs::FileSystem::new(storage, fatfs::FsOptions::new()) {
+    let mut boot = [0u8; 512];
+    // `fatfs` takes the volume at its start, so the boot sector is read and
+    // the volume rewound.
+    disk.seek(std::io::SeekFrom::Start(0))
+        .and_then(|_| disk.read_exact(&mut boot))
+        .and_then(|_| disk.seek(std::io::SeekFrom::Start(0)))
+        .map_err(|e| LimitHit::corrupt(format!("FAT volume: {e}")))?;
+    if !is_fat(&boot) {
+        return Ok(None);
+    }
+    let fs = match fatfs::FileSystem::new(ReadOnly(disk), fatfs::FsOptions::new()) {
         Ok(fs) => fs,
         Err(e) => {
             // The boot sector said FAT; failing to mount leaves every file in it
             // unexamined, which must not pass quietly.
             budget.count_entry()?;
             return Ok(visit(
-                Entry::unsupported("<fat-volume>".to_string(), data.len() as u64, false, {
+                Entry::unsupported("<fat-volume>".to_string(), len, false, {
                     let _ = e;
                     "FAT filesystem could not be mounted"
                 }),
@@ -141,7 +179,8 @@ pub(crate) fn extract_fat<R>(
             }
             continue;
         }
-        for entry in dir.iter() {
+        let mut entries = dir.iter();
+        while let Some(entry) = contained(|| entries.next().transpose()).transpose() {
             let Ok(entry) = entry else {
                 // A directory whose entries stop parsing hides everything after
                 // them in that directory.
@@ -207,10 +246,10 @@ pub(crate) fn extract_fat<R>(
                 continue;
             }
             let mut file = entry.to_file();
-            let mut buf = Vec::with_capacity(declared as usize);
+            let mut buf = Vec::with_capacity(crate::cap_prealloc(crate::bytes::to_usize(declared)));
             // Reading follows the cluster chain, so a fragmented file comes back
             // whole here where a carve would return only its first extent.
-            if let Err(e) = std::io::Read::read_to_end(&mut file, &mut buf) {
+            if let Err(e) = contained(|| std::io::Read::read_to_end(&mut file, &mut buf)) {
                 let _ = e;
                 if let Some(r) = visit(
                     Entry::unsupported(

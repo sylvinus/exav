@@ -12,14 +12,22 @@
 //! Bounded on any input: references are followed to a fixed depth (which
 //! also breaks reference cycles), every curve and surface is sampled with a
 //! fixed number of points per turn, booleans give up past a fixed amount of
-//! work, and all triangles made, kept or not, come out of one budget.
+//! work, and all triangles made, kept or not, come out of one budget. The
+//! evaluations of surfaces and curves that triangles do not count (boundary
+//! points projected on a surface, stations along an alignment, the edges of
+//! a loop) come out of another, `ops`.
 
+mod alignment;
 mod csg;
 mod curves;
+mod directrix;
+mod faces;
+mod grid;
 mod items;
 mod math;
 mod profiles;
 mod solids;
+mod spline;
 pub mod step;
 mod triangulate;
 
@@ -71,6 +79,9 @@ pub(crate) type Color = [f32; 4];
 const MAX_DEPTH: u32 = 32;
 /// Deepest chain of object placements.
 const MAX_PLACEMENT_DEPTH: usize = 256;
+/// Most surface and curve evaluations in one file (about 500 operations
+/// each).
+const MAX_OPS: usize = 20_000_000;
 
 /// Triangles in `f64`, in some coordinate system.
 #[derive(Debug, Clone, Default)]
@@ -157,6 +168,14 @@ pub(crate) struct Reader<'a> {
     /// the next one twice, thirty levels down, is four billion visits of
     /// thirty instances; the depth limit alone does not stop it.
     visits: usize,
+    /// Surface and curve evaluations still allowed, for the work that
+    /// triangles do not count: projecting boundary points on a surface,
+    /// sampling curves for a station.
+    ops: usize,
+    /// Axis -> grid, made when a grid placement first asks.
+    grids: Option<HashMap<u32, u32>>,
+    /// Multiplier of the chords a curve segment is sampled with.
+    density: usize,
     placements: HashMap<u32, Xf>,
     maps: HashMap<u32, Rc<Vec<Piece>>>,
     /// Item -> style, from `IfcStyledItem`.
@@ -179,6 +198,9 @@ impl<'a> Reader<'a> {
             warnings: Warnings::default(),
             work,
             visits: f.len().saturating_add(64).saturating_mul(64),
+            ops: f.len().saturating_add(64).saturating_mul(256).min(MAX_OPS),
+            grids: None,
+            density: 1,
             placements: HashMap::new(),
             maps: HashMap::new(),
             styled: HashMap::new(),
@@ -208,6 +230,12 @@ impl<'a> Reader<'a> {
     /// Takes one read of an item or profile from the visit budget.
     pub fn visit(&mut self) -> Option<()> {
         self.visits = self.visits.checked_sub(1)?;
+        Some(())
+    }
+
+    /// Takes `n` evaluations from the evaluation budget.
+    pub fn charge(&mut self, n: usize) -> Option<()> {
+        self.ops = self.ops.checked_sub(n)?;
         Some(())
     }
 
@@ -432,24 +460,36 @@ impl<'a> Reader<'a> {
                 b"IFCLOCALPLACEMENT" => {
                     (p.first().and_then(Value::id), self.axis2(p.get(1)?.id()?)?)
                 }
-                // IFC4X3: the placement along an alignment, with its
-                // Cartesian equivalent precomputed by the writer.
-                b"IFCLINEARPLACEMENT" => (
-                    p.first().and_then(Value::id),
-                    p.get(2)
+                // IFC4X3: the placement along an alignment. The writer's
+                // Cartesian equivalent is used when it has one, else the
+                // placement is worked out along the curve.
+                b"IFCLINEARPLACEMENT" => {
+                    let local = p
+                        .get(2)
                         .and_then(Value::id)
                         .and_then(|c| self.axis2(c))
-                        .unwrap_or(Xf::IDENTITY),
-                ),
-                b"IFCGRIDPLACEMENT" => {
-                    self.unsupported(ty);
-                    let parent = if self.f.schema == step::Schema::Ifc4x3 {
-                        p.first().and_then(Value::id)
-                    } else {
-                        None
-                    };
-                    (parent, Xf::IDENTITY)
+                        .or_else(|| {
+                            p.get(1)
+                                .and_then(Value::id)
+                                .and_then(|r| self.axis2_linear(r))
+                        });
+                    if local.is_none() {
+                        self.unsupported(ty);
+                    }
+                    (p.first().and_then(Value::id), local.unwrap_or(Xf::IDENTITY))
                 }
+                b"IFCGRIDPLACEMENT" => match self.grid_placement(&p) {
+                    Some(placed) => placed,
+                    None => {
+                        self.unsupported(ty);
+                        let parent = if self.f.schema == step::Schema::Ifc4x3 {
+                            p.first().and_then(Value::id)
+                        } else {
+                            None
+                        };
+                        (parent, Xf::IDENTITY)
+                    }
+                },
                 _ => return None,
             };
             chain.push((pid, local));
@@ -763,6 +803,8 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
 
     // The spatial tree, from the project down.
     let mut node_of: HashMap<u32, u32> = HashMap::new();
+    // Per node, the storey it is or lies in; parents come first.
+    let mut storey_of_node: Vec<Option<u32>> = Vec::new();
     let mut stack: Vec<(u32, Option<u32>)> = f.of_type(b"IFCPROJECT").map(|p| (p, None)).collect();
     stack.reverse();
     while let Some((id, parent)) = stack.pop() {
@@ -774,11 +816,25 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
             continue;
         }
         let index = out.scene.nodes.len() as u32;
+        let is_storey = ty == b"IFCBUILDINGSTOREY";
+        // IfcBuildingStorey.Elevation follows the nine attributes of
+        // IfcSpatialStructureElement.
+        let elevation = p
+            .get(9)
+            .and_then(Value::num)
+            .map(|e| e * r.length)
+            .filter(|e| is_storey && e.is_finite());
         out.scene.nodes.push(Node {
             id,
             class: String::from_utf8_lossy(ty).into_owned(),
             name: p.get(2).and_then(Value::text).unwrap_or_default(),
             parent,
+            elevation,
+        });
+        storey_of_node.push(if is_storey {
+            Some(index)
+        } else {
+            parent.and_then(|q| storey_of_node[q as usize])
         });
         node_of.insert(id, index);
         if let Some(kids) = children.get(&id) {
@@ -869,6 +925,7 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
             class,
             name: p.get(2).and_then(Value::text).unwrap_or_default(),
             node,
+            storey: node.and_then(|n| storey_of_node[n as usize]),
             ranges: Vec::new(),
         };
         out.add(element, parts);

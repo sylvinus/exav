@@ -222,9 +222,11 @@ fn summarise(out: &mut String, d: &Drawing) {
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
         texts.push(format!(
-            "{s}|h={}|rot={}|align={},{}|face={}|rgba={:08x}",
+            "{s}|u={},{}|v={},{}|align={},{}|face={}|rgba={:08x}",
             sig(f32_at(r, 8)),
             sig(f32_at(r, 12)),
+            sig(f32_at(r, 16)),
+            sig(f32_at(r, 20)),
             r[38],
             r[39],
             r[44],

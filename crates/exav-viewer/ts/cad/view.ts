@@ -3,19 +3,45 @@
  * (`exav_viewer_dwg.wasm`), drawn by the WebGL2 renderer.
  *
  * Pan with one finger or the mouse, pinch or wheel to zoom (a trackpad pinch
- * is ctrl+wheel), double-click to fit. Layer toggles never re-tessellate;
+ * is ctrl+wheel, or Safari's gesture events), double-click to fit. A zoom scales the canvas as drawn and
+ * draws sharp once it pauses (`./zoom-gesture.ts`), and `zoom` and `viewport`
+ * follow it once per animation frame. Layer toggles never re-tessellate;
  * switching layout, or the ground between light and dark (indexed colours
  * resolve against it, as in AutoCAD), tessellates again from the parsed
  * document without reading the file again.
+ *
+ * `pictures` draws any layout again at a requested size and region
+ * (`./export.ts`), and `viewport` is the region of the layout in the canvas,
+ * both in drawing units (`./raster.ts`).
  */
+import { RasterError, throwIfAborted } from "../core/pictures.js";
+import { createPictures } from "../core/raster.js";
 import { writable } from "../core/store.js";
-import type { GroundController, LayersController, LayoutsController, Renderer as PluginRenderer, ZoomController } from "../core/types.js";
+import { isColor } from "../core/theme.js";
+import type { GroundController, LayersController, LayoutsController, Raster, RasterOptions, Renderer as PluginRenderer, Viewport, Warning, ZoomController } from "../core/types.js";
 import { createWorkerHost } from "../core/worker-host.js";
+import { drawPicture, parseColor } from "./export.js";
 import type { CadOptions } from "./plugin.js";
+import {
+  abortable,
+  checkScale,
+  currentFor,
+  defaultRegion,
+  exportView,
+  layoutFor,
+  lineweightFactors,
+  linked,
+  planExport,
+  sameRect,
+  serial,
+  viewportRegion,
+} from "./raster.js";
 import { familiesFor, loadFamilies, setFontsUrl } from "./renderer/fonts.js";
 import { Renderer } from "./renderer/renderer.js";
 import { facesUsed } from "./renderer/text-layout.js";
 import type { DrawingPreview, ParsedDrawing } from "./types.js";
+import { cadWarnings } from "./warnings.js";
+import { createZoomGesture, viewTransform } from "./zoom-gesture.js";
 import type { CadAnswer, CadRequest } from "./cad.worker.js";
 
 export const GROUNDS = { light: "#ffffff", dark: "#212830" } as const;
@@ -69,13 +95,24 @@ export const renderer: PluginRenderer<CadOptions> = {
     if (ctx.options.fontsUrl !== undefined) setFontsUrl(ctx.options.fontsUrl);
 
     const root = document.createElement("div");
-    root.className = "exv-cad";
+    root.className = "exav-viewer-cad";
     const canvas = document.createElement("canvas");
-    canvas.className = "exv-cad-canvas";
+    canvas.className = "exav-viewer-cad-canvas";
     root.append(canvas);
     host.append(root);
 
-    const gl = new Renderer(canvas);
+    // A zoom gesture moves the canvas as drawn (`./zoom-gesture.ts`); a frame
+    // drawn from the camera puts it back.
+    canvas.style.transformOrigin = "0 0";
+    const wire = (r: Renderer) => {
+      r.onDraw = () => {
+        if (canvas.style.transform) canvas.style.transform = "";
+      };
+    };
+    let gl = new Renderer(canvas);
+    wire(gl);
+    gl.lineweights = ctx.options.lineweights ?? "drawing";
+    gl.monochrome = ctx.options.monochrome ?? false;
     const engine = createWorkerHost<CadRequest, CadAnswer>(
       () => new Worker(new URL("./cad.worker.js", import.meta.url), { type: "module" }),
     );
@@ -98,7 +135,9 @@ export const renderer: PluginRenderer<CadOptions> = {
     });
     const layoutsStore = writable<{ items: readonly { id: string; name: string; isModel: boolean }[]; current: string }>({ items: [], current: "" });
     const zoomStore = writable({ scale: 1, min: 0, max: Infinity });
-    const warnings = writable<readonly { key: string; count: number }[]>([]);
+    const warnings = writable<readonly Warning[]>([]);
+    // The part of the layout in the canvas, in drawing units (see `./raster.ts`).
+    const viewportStore = writable<Viewport | null>(null);
 
     const applyGround = () => {
       const c = rgb(colors[ground]) ?? [1, 1, 1];
@@ -127,7 +166,23 @@ export const renderer: PluginRenderer<CadOptions> = {
       Object.assign(gl.camera, { cx, cy, scale });
       return fitted;
     };
-    const publishZoom = () => zoomStore.set({ scale: fitScale() / gl.camera.scale, min: 0, max: Infinity });
+    /** The viewport follows the camera; a store is set only when the region moved. */
+    const publishView = () => {
+      const d = drawing;
+      if (!d) return;
+      const region = viewportRegion(gl.camera, d.origin);
+      const now = viewportStore.get();
+      const before = now && "width" in now.region ? now.region : null;
+      if (now && now.layout === d.layout && before && sameRect(before, region)) return;
+      const page = Math.max(1, d.layouts.findIndex((l) => (l.isModel ? "" : l.name) === d.layout) + 1);
+      viewportStore.set({ space: "drawing", page, layout: d.layout, region });
+    };
+    const publishZoom = () => {
+      const fit = fitScale();
+      const { scale, minScale, maxScale } = gl.camera;
+      zoomStore.set({ scale: fit / scale, min: fit / maxScale, max: minScale > 0 ? fit / minScale : Infinity });
+      publishView();
+    };
 
     // The drawing's thumbnail while it parses, when it has one.
     let placeholder: HTMLImageElement | null = null;
@@ -139,7 +194,7 @@ export const renderer: PluginRenderer<CadOptions> = {
     };
     const showPreview = async (p: DrawingPreview) => {
       const img = document.createElement("img");
-      img.className = "exv-cad-preview";
+      img.className = "exav-viewer-cad-preview";
       img.alt = "";
       img.src = URL.createObjectURL(new Blob([p.data], { type: p.mime }));
       try {
@@ -177,26 +232,52 @@ export const renderer: PluginRenderer<CadOptions> = {
       if (reframe) fitted = true;
       gl.setDrawing(d, visible, reframe);
       gl.requestDraw();
-      dropPreview();
+      // A drawing with nothing this viewer draws (a 3D model) keeps the
+      // thumbnail it was saved with.
+      const blank = d.strokes.byteLength === 0 && d.fills.byteLength === 0 && d.texts.byteLength === 0;
+      // The geometry is on the GPU now: the page keeps only what describes
+      // it. A lost context asks the worker for it again (`onRestored`).
+      d.strokes = d.fills = d.strokeTiles = d.fillTiles = new ArrayBuffer(0);
+      const previewShown = blank && placeholder !== null;
+      if (!previewShown) dropPreview();
       publishLayers();
       layoutsStore.set({
         items: d.layouts.map((l) => ({ id: l.isModel ? "" : l.name, name: l.name, isModel: l.isModel })),
         current: d.layout,
       });
-      warnings.set([
-        ...(d.warnings.externalReferences > 0 ? [{ key: "external_references", count: d.warnings.externalReferences }] : []),
-        ...(d.warnings.sceneTruncated > 0 ? [{ key: "scene_truncated", count: d.warnings.sceneTruncated }] : []),
-        ...(d.warnings.proxyWithoutGraphics > 0 ? [{ key: "proxy_without_graphics", count: d.warnings.proxyWithoutGraphics }] : []),
-      ]);
+      if (pictures.state.get().count !== d.layouts.length) pictures.state.set({ count: d.layouts.length, space: "drawing" });
+      warnings.set(cadWarnings(d.warnings, previewShown));
       publishZoom();
       ctx.status({ phase: "ready" });
     };
 
     // ── input ──
     const dpr = () => Math.min(window.devicePixelRatio || 1, 2);
+    // The root's box, which is the canvas's: the canvas's own moves with a zoom gesture.
     const toFb = (e: { clientX: number; clientY: number }): [number, number] => {
-      const r = canvas.getBoundingClientRect();
+      const r = root.getBoundingClientRect();
       return [(e.clientX - r.left) * dpr(), (r.bottom - e.clientY) * dpr()];
+    };
+    const zoomGesture = createZoomGesture({
+      settleMs: 100,
+      staleMs: 500,
+      frame() {
+        const { drawn, camera } = gl;
+        if (drawn.width !== camera.width || drawn.height !== camera.height) {
+          // Nothing drawn at this size yet.
+          gl.requestDraw();
+        } else {
+          const t = viewTransform(drawn, camera, dpr());
+          canvas.style.transform = `translate(${t.x}px, ${t.y}px) scale(${t.k})`;
+        }
+        publishZoom();
+      },
+      draw: () => gl.requestDraw(),
+    });
+    /** A frame drawn from the camera is on its way: what a gesture had pending is over. */
+    const settled = () => {
+      zoomGesture.flush();
+      zoomGesture.cancel();
     };
     const pointers = new Map<number, { x: number; y: number }>();
     let lastPinch = 0;
@@ -204,15 +285,36 @@ export const renderer: PluginRenderer<CadOptions> = {
       const [a, b] = [...pointers.values()];
       return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
     };
+    // Safari's trackpad pinch: gesture events, whose `scale` is the total since the start.
+    let gestureScale = 0;
+    const onGestureStart = (e: Event) => {
+      e.preventDefault();
+      gestureScale = 1;
+    };
+    const onGestureChange = (e: Event) => {
+      e.preventDefault();
+      const g = e as Event & { scale: number; clientX: number; clientY: number };
+      if (!drawing || !gestureScale || !(g.scale > 0)) return;
+      const [sx, sy] = toFb(g);
+      gl.camera.zoomAt(sx, sy, g.scale / gestureScale);
+      gestureScale = g.scale;
+      fitted = false;
+      zoomGesture.touch();
+    };
+    const onGestureEnd = (e: Event) => {
+      e.preventDefault();
+      gestureScale = 0;
+    };
     const onWheel = (e: WheelEvent) => {
       if (!drawing) return;
       e.preventDefault();
+      // Safari reports the same pinch as a ctrl+wheel too: the gesture is the one that counts.
+      if (gestureScale && e.ctrlKey) return;
       const [sx, sy] = toFb(e);
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1;
       gl.camera.zoomAt(sx, sy, Math.exp((-e.deltaY * unit) / 320));
       fitted = false;
-      gl.requestDraw();
-      publishZoom();
+      zoomGesture.touch();
     };
     const onDown = (e: PointerEvent) => {
       try {
@@ -236,7 +338,9 @@ export const renderer: PluginRenderer<CadOptions> = {
         gl.camera.panPixels(x - prev.x, y - prev.y);
         if (x !== prev.x || y !== prev.y) fitted = false;
         pointers.set(e.pointerId, { x, y });
+        settled();
         gl.requestDraw();
+        publishView();
         return;
       }
       pointers.set(e.pointerId, { x, y });
@@ -246,14 +350,14 @@ export const renderer: PluginRenderer<CadOptions> = {
           const [a, b] = [...pointers.values()];
           gl.camera.zoomAt((a!.x + b!.x) / 2, (a!.y + b!.y) / 2, dist / lastPinch);
           fitted = false;
-          gl.requestDraw();
-          publishZoom();
+          zoomGesture.touch();
         }
         lastPinch = dist;
       }
     };
     const fit = () => {
       if (!drawing) return;
+      zoomGesture.cancel();
       gl.resize();
       gl.camera.fit(drawing.extents);
       fitted = true;
@@ -262,28 +366,31 @@ export const renderer: PluginRenderer<CadOptions> = {
     };
     const onResize = () => {
       if (!gl.resize()) return;
+      zoomGesture.cancel();
       if (drawing && fitted) gl.camera.fit(drawing.extents);
       gl.requestDraw();
       publishZoom();
     };
-    // Safari's trackpad pinch would otherwise zoom the page.
-    const cancel = (e: Event) => e.preventDefault();
     canvas.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerup", onUp);
     canvas.addEventListener("pointercancel", onUp);
     canvas.addEventListener("dblclick", fit);
-    canvas.addEventListener("gesturestart", cancel);
-    canvas.addEventListener("gesturechange", cancel);
+    canvas.addEventListener("gesturestart", onGestureStart);
+    canvas.addEventListener("gesturechange", onGestureChange);
+    canvas.addEventListener("gestureend", onGestureEnd);
     const ro = new ResizeObserver(onResize);
     ro.observe(root);
 
     const destroy = () => {
       if (destroyed) return;
       destroyed = true;
+      zoomGesture.cancel();
       ro.disconnect();
       engine.destroy();
+      canvas.removeEventListener("webglcontextlost", onLost);
+      canvas.removeEventListener("webglcontextrestored", onRestored);
       gl.dispose();
       // Give the context back now: a browser holds about sixteen, and a
       // folder of drawings walked with the arrows would exhaust them.
@@ -342,11 +449,37 @@ export const renderer: PluginRenderer<CadOptions> = {
         } else gl.requestDraw();
       },
     };
+    // A lost context (a GPU reset, too many contexts, a phone putting the
+    // tab away) takes every buffer with it. When it comes back, the renderer
+    // is made again with the view as it was, and the worker, which keeps the
+    // document, tessellates the layout again.
+    const onLost = (e: Event) => {
+      e.preventDefault();
+      // Now, while every GL call is a no-op: deleting the dead objects on
+      // the restored context would leave an error for the next check.
+      gl.dispose();
+    };
+    const onRestored = () => {
+      if (destroyed) return;
+      const { camera, background, lineweights, monochrome } = gl;
+      gl = new Renderer(canvas);
+      wire(gl);
+      Object.assign(gl, { background, lineweights, monochrome });
+      Object.assign(gl.camera, { cx: camera.cx, cy: camera.cy, scale: camera.scale });
+      if (!drawing) return;
+      void show(engine.call({ kind: "layout", layout: drawing.layout, background: backgroundBytes(), maxPrimitives }, [], timeoutMs), true).catch(
+        (error) => !destroyed && ctx.status({ phase: "error", error: { code: "drawing", cause: error } }),
+      );
+    };
+    canvas.addEventListener("webglcontextlost", onLost);
+    canvas.addEventListener("webglcontextrestored", onRestored);
+
     const zoom: ZoomController = {
       ...zoomStore,
       setScale(scale, anchor) {
         if (!drawing) return;
-        const r = canvas.getBoundingClientRect();
+        zoomGesture.cancel();
+        const r = root.getBoundingClientRect();
         const a = anchor ?? { x: r.width / 2, y: r.height / 2 };
         gl.camera.zoomAt(a.x * dpr(), (r.height - a.y) * dpr(), scale / (fitScale() / gl.camera.scale));
         fitted = false;
@@ -356,12 +489,81 @@ export const renderer: PluginRenderer<CadOptions> = {
       fit,
     };
 
+    // ── pictures ──
+    // A layout drawn again at the picture's size, in a context of its own
+    // (`./export.ts`); `./raster.ts` has the semantics of regions and line
+    // weights. One picture at a time.
+    const queue = serial();
+    const picture = async (page: number, options: RasterOptions, signal: AbortSignal): Promise<Raster> => {
+      if (destroyed || !drawing) throw new RasterError("failed", "nothing is drawn");
+      const { id, page: at } = layoutFor(layoutsStore.get().items, page, options);
+      // The ground: the session's, or the picture's own.
+      const sessionGround = gl.background;
+      const hex = (bytes: Uint8Array) => `#${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+      const background = options.background ?? hex(backgroundBytes());
+      const parsed = typeof background === "string" ? parseColor(background) : null;
+      if (!parsed || !isColor(background)) throw new RasterError("invalid", "background is a colour or transparent");
+      // What indexed colours are resolved against, and the ink chosen for: the
+      // picture's ground, or the session's when the picture has none.
+      const ground = parsed.alpha === 0 ? sessionGround : parsed.rgb;
+      const bytes = new Uint8Array(ground.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255)));
+      // A zoom gesture publishes once per frame: the camera is the truth.
+      publishView();
+      const current = currentFor(viewportStore.get(), id);
+      const early = planExport(options, null, current, hex(backgroundBytes()));
+
+      const answer = await abortable(engine.call({ kind: "layout", layout: id, background: bytes, maxPrimitives }, [], timeoutMs), signal);
+      const d = answer as ParsedDrawing;
+      throwIfAborted(signal);
+      if (d.layout !== id) throw new RasterError("failed", "the layout could not be drawn");
+      const plan = early ?? planExport(options, defaultRegion(d.extents, d.origin), current, hex(backgroundBytes()))!;
+      const view = exportView(plan);
+      checkScale(view.scale, d.extents);
+      // The layers as the viewer shows them where it shows this layout, else as the file has them.
+      const shown = drawing;
+      const layerVisible = shown && shown.layout === id && visible.length === d.layers.length ? [...visible] : d.layers.map((l) => !l.off && !l.frozen);
+      const bitmap = await drawPicture({
+        drawing: d,
+        visible: layerVisible,
+        view,
+        width: plan.width,
+        height: plan.height,
+        ground,
+        alpha: parsed.alpha,
+        lineweights: gl.lineweights,
+        monochrome: gl.monochrome,
+        dpr: dpr(),
+        factors: lineweightFactors(options.lineweight, view.region, view.scale, gl.camera),
+        tile: ctx.options.rasterTile,
+        signal,
+      });
+      if (signal.aborted) {
+        bitmap.close();
+        throw new RasterError("aborted", "aborted");
+      }
+      return { bitmap, width: plan.width, height: plan.height, page: at, layout: id, space: "drawing", region: view.region };
+    };
+    const pictures = createPictures({
+      count: 0,
+      space: "drawing",
+      async raster(page, options) {
+        const { signal, dispose } = linked([options.signal, ctx.signal]);
+        try {
+          return await queue(signal, () => picture(page, options, signal));
+        } finally {
+          dispose();
+        }
+      },
+    });
+    const viewport = { get: viewportStore.get, subscribe: viewportStore.subscribe };
+
     // A session closed while the file is still being read or parsed: the
     // worker is stopped now, not when it would have finished.
     ctx.signal.addEventListener("abort", destroy, { once: true });
     try {
       const bytes = (await ctx.source.bytes()).slice();
       if (ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
+      ctx.status({ phase: "loading", step: "read" });
       // The file goes to the worker once, which answers its thumbnail at
       // once; the thumbnail is up before the parse starts. Should the load
       // fail (a module that traps is replaced, the file with it), the parse
@@ -400,7 +602,7 @@ export const renderer: PluginRenderer<CadOptions> = {
     }
 
     return {
-      controllers: { layers, layouts, ground: groundController, zoom, warnings },
+      controllers: { layers, layouts, ground: groundController, zoom, warnings, pictures: pictures.controller, viewport },
       resize: onResize,
       destroy,
     };

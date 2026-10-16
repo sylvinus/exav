@@ -235,6 +235,30 @@ pub(crate) fn scan_complete_source(
     (None, true)
 }
 
+/// [`scan_complete`] over links already read: `(display, href)` pairs, from a
+/// document that is not HTML (Markdown, a PDF) and has its own way of saying
+/// where a link goes. Judged as an anchor is, allow-list included.
+#[cfg(feature = "visible-text")]
+pub(crate) fn scan_links(links: &[(String, String)], db: &PhishingDb) -> (Option<Phish>, bool) {
+    let mut allow_checks = 0usize;
+    for (display, href) in links {
+        let Some(p) = classify(href, display, db) else {
+            continue;
+        };
+        if db.has_allow_list() {
+            if allow_checks == MAX_ALLOW_CHECKS {
+                return (None, false);
+            }
+            allow_checks += 1;
+            if allow_listed(href, display, db) {
+                continue;
+            }
+        }
+        return (Some(p), true);
+    }
+    (None, true)
+}
+
 /// Offset of the next `<a ` (case-insensitive) at or after `from`. `bytes`
 /// reads `data` when it is not held in memory, and is kept across calls so
 /// the object is read forward once.

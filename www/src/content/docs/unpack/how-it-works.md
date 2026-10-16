@@ -193,6 +193,9 @@ holds for a bzip2, Zstandard, xz or lzip file cut short, and for the last member
 of a ZIP, NSIS, EGG, ALZ, XAR, SWF, HWP 3.0 or UPX file cut short, or the last
 grain or cluster of a VMDK or qcow2 image. bzip2 and Zstandard decode by block,
 so the block the cut falls in gives nothing: its content went with the cut.
+A cabinet's MSZIP and stored blocks are the exception, giving the part decoded
+before the cut or the damage; its LZX and Quantum frames (32 KiB at most) go
+whole.
 Indexed formats are different: a damaged ZIP index can leave member data
 present but never enumerated, which is why dual indexing exists. A 7z archive
 keeps its index at its end, so one cut short cannot be listed and is

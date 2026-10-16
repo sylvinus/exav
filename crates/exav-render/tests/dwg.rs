@@ -84,16 +84,13 @@ fn a_drawing_comes_back_as_it_was_written_in_dwg_and_dxf() {
                 && near(p[3], 0.0)),
             "{what}: the wall is one stroke from (0,0) to (100,0)"
         );
-        // The column, flattened: every point of its strokes on the circle.
+        // The column, as arc strokes of a quarter turn: their ends on the
+        // circle.
         let on_circle: Vec<_> = s
             .iter()
             .filter(|(p, l)| l == "WALLS" && !(near(p[1], 0.0) && near(p[3], 0.0)))
             .collect();
-        assert!(
-            on_circle.len() >= 16,
-            "{what}: {} column strokes",
-            on_circle.len()
-        );
+        assert_eq!(on_circle.len(), 4, "{what}: column strokes");
         for (p, _) in &on_circle {
             for (x, y) in [(p[0], p[1]), (p[2], p[3])] {
                 let r = ((x - 50.0).powi(2) + (y - 50.0).powi(2)).sqrt();

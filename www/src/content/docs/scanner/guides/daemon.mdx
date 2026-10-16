@@ -48,8 +48,9 @@ or a daemon running as another user. `-` (stdin) is always sent as contents.
 
 A directory names its whole tree in all three modes, as it does for `clamdscan`.
 The client walks it and sends one request per file, so `--exclude` / `--include`
-apply to the tree and each request has one reply. The parts of a byte-split
-archive (`x.001`, `x.002`, ...) are sent together so the daemon can rejoin them
+apply to the tree and each request has one reply. The parts of a split archive
+(`x.001`, `x.002`, ...; a RAR's `x.part1.rar` or `x.r00`; a ZIP's `x.z01`
+and `x.zip`) are sent together so the daemon can rejoin them
 (see [split archives](#split-archives)). By path, a directory holding such parts
 goes as one `CONTSCAN`, and the client's filters and `--no-recursive` do not
 apply to it; with `contents` or `fd`, the parts of each directory go in one
@@ -158,9 +159,15 @@ daemon could not hold in full has what it held scanned and is answered
 scanned. The reply carries `"truncated": true` when the request ended
 before its terminator, so some files never arrived.
 
-RAR `.partN` and ZIP `.zNN` volumes are not rejoined this way: each carries its
-own headers, so concatenating them produces garbage that still looks like an
-archive. Each is scanned on its own.
+Volumes that carry their own headers are rejoined too, by the format's own
+join and not by concatenation (which would produce garbage that still looks like
+an archive): a RAR set (`x.part1.rar`, `x.part2.rar`, ..., or `x.rar`, `x.r00`,
+...), a ZIP set (`x.z01`, ..., and the `x.zip` that ends it) and a set of
+cabinets, found from the names their headers give one another. A set with a
+volume missing, or whose volumes do not fit together, is `PARTIAL`, never
+clean. The client sends a directory as one request when it holds a byte-split,
+RAR or ZIP part by name, with its `.zip` and `.cab` files; a directory of
+cabinets alone is rejoined when the daemon scans it by path (`CONTSCAN`).
 
 ## Size over the wire
 

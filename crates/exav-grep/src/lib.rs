@@ -103,6 +103,14 @@ pub struct Options {
     pub max_count: usize,
     /// Treat a member as binary and report only that it matched, not the line.
     pub binary_as_matches: bool,
+    /// Search the text a reader sees rather than the bytes, for a member that
+    /// has one: Markdown, HTML, the XML parts of Office and OpenDocument files,
+    /// PDF and drawings are searched as their words, with entities decoded and
+    /// each link followed by where it goes, under the path `file.md!text`, its
+    /// line numbers being the text's. A document that is also a container (a
+    /// PDF, a drawing) is walked for its members as before. Does nothing
+    /// without the `text` feature.
+    pub text: bool,
 }
 
 /// One result of the search.
@@ -280,8 +288,8 @@ impl Searcher {
             });
         }
         let Some(fmt) = exav_unpack::detect(&data).or_else(|| packed_executable(data)) else {
-            // A leaf: search its bytes.
-            return self.search_one(label, data, sink);
+            // A leaf: search its bytes, or its text.
+            return self.search_leaf(label, data, sink);
         };
         // A container is searched through its MEMBERS, not its raw bytes — for a
         // stored member those are the same bytes, and reporting both would
@@ -350,7 +358,86 @@ impl Searcher {
         if keep_going && members == 0 {
             return self.search_one(label, data, sink);
         }
+        // A container with text of its own (a PDF, a drawing) is searched as
+        // that too, besides its members.
+        #[cfg(feature = "text")]
+        if keep_going && self.opts.text {
+            if let Some(go) = self.search_text(label, data, sink) {
+                return go;
+            }
+        }
         keep_going
+    }
+
+    /// Search a leaf: its text under `--text` when it has one, else its bytes.
+    fn search_leaf(&mut self, label: &str, data: &[u8], sink: Sink) -> bool {
+        #[cfg(feature = "text")]
+        if self.opts.text {
+            if let Some(go) = self.search_text(label, data, sink) {
+                return go;
+            }
+        }
+        self.search_one(label, data, sink)
+    }
+
+    /// Search the text a reader sees in `data`, as `label!text` (and
+    /// `label!text/<section>` for a sheet or a slide), when it is a kind of
+    /// document that has some (`None` when it is not, and also when its text
+    /// could not be taken out: that is reported unreadable and its bytes are
+    /// searched instead). A text cut short is reported unreadable, as a
+    /// member that failed part way is.
+    #[cfg(feature = "text")]
+    fn search_text(&mut self, label: &str, data: &[u8], sink: Sink) -> Option<bool> {
+        let name = label.rsplit(NESTING_SEP).next().unwrap_or(label);
+        let cap = usize::try_from(self.opts.limits.max_buffer_bytes).unwrap_or(usize::MAX);
+        let cap = data
+            .len()
+            .saturating_mul(4)
+            .saturating_add(64 << 10)
+            .min(cap);
+        let visible = exav_render::text::visible_text(name, data, cap, &self.opts.limits)?;
+        let path = format!("{label}{NESTING_SEP}text");
+        if let Some(why) = &visible.unreadable {
+            // A document of a kind that has text whose text could not be
+            // taken out: said, and its bytes are searched instead.
+            self.unreadable += 1;
+            if !sink(Event::Unreadable {
+                path,
+                reason: format!("visible text: {why}"),
+            }) {
+                return Some(false);
+            }
+            return None;
+        }
+        // One search to a section (a sheet, a slide), so that a match says
+        // where it is: `book.xls!text/sheet "Budget"`; what comes before the
+        // first section, and a document of one block, is `!text`.
+        let mut at = 0;
+        let mut parts: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+        for (section, range) in &visible.sections {
+            if range.start > at {
+                parts.push((path.clone(), at..range.start));
+            }
+            parts.push((format!("{path}/{section}"), range.clone()));
+            at = range.end;
+        }
+        if at < visible.text.len() || parts.is_empty() {
+            parts.push((path.clone(), at..visible.text.len()));
+        }
+        for (part, range) in parts {
+            let bytes = visible.text.as_bytes().get(range).unwrap_or_default();
+            if !self.search_one(&part, bytes, sink) {
+                return Some(false);
+            }
+        }
+        if visible.truncated {
+            self.unreadable += 1;
+            return Some(sink(Event::Unreadable {
+                path,
+                reason: format!("visible text cut at {cap} bytes"),
+            }));
+        }
+        Some(true)
     }
 
     /// Line-match a single object's bytes.

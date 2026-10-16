@@ -24,7 +24,8 @@
 //! * **InstallShield `ISc(` cabinets** — likewise undocumented; the only
 //!   implementation is the LGPL `unshield` **C project**. Not to be confused
 //!   with the MIT `unshield` *crate*, which reads the older InstallShield `.z`
-//!   archive — a different format, and one exav does open (`formats/ishield_z`).
+//!   archive — a different format, and one exav does open (`formats/ishield_z`,
+//!   ported from that crate).
 //!
 //! Both therefore stay recognised-and-reported, which is the honest answer:
 //! `UNSCANNABLE` tells an operator there is a gap, where a decoder that guessed

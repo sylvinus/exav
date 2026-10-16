@@ -42,7 +42,7 @@ use exav_unpack::{detect, Budget, Entry, Format, Limits};
 /// extent tree has to reproduce.
 const PAYLOAD: &str = "d61da8b0c3cd1d5ffa812601aae787c81a7424850c4dca15c27e593f8f92fcc8";
 
-fn fixture() -> Vec<u8> {
+pub(super) fn fixture() -> Vec<u8> {
     let p = format!(
         "{}/tests/fixtures/ext/fragmented.img.gz",
         env!("CARGO_MANIFEST_DIR")

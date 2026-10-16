@@ -89,6 +89,17 @@ export const CAP_RATIO: Record<FamilyName, number> = {
   mono: 0.658691, // Cousine, 1349 / 2048
 }
 
+/**
+ * How far below the baseline each family's descenders reach, in cap heights
+ * (OS/2 sTypoDescender over sCapHeight): where Bottom alignment puts the
+ * baseline. `descent` in crates/exav-render/src/formats/dwg/text.rs has the same.
+ */
+export const DESCENT: Record<FamilyName, number> = {
+  sans: 434 / 1409,
+  serif: 442 / 1341,
+  mono: 615 / 1349,
+}
+
 export interface Face {
   family: FamilyName
   bold: boolean

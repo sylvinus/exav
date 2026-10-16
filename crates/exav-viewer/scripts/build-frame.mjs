@@ -83,13 +83,19 @@ await esbuild.build({
 
 // Each worker, where the code above will ask for it.
 const ooxml = pkg("@silurus/ooxml");
+// No external converter is shipped in the package: the host's build adds
+// its own from its node_modules (`frameFiles(root, name)`), licence included.
 const { assets, manifest } = collectAssets(root);
 const WORKERS = [
   ["cad.worker.js", path.join(root, "ts", "cad", "cad.worker.ts")],
   ["decode.worker.js", path.join(root, "ts", "image", "decode.worker.ts")],
+  ["markdown.worker.js", path.join(root, "ts", "text", "markdown.worker.ts")],
   ["model.worker.js", path.join(root, "ts", "model", "model.worker.ts")],
   ["pdfjs.worker.js", path.join(root, "ts", "pdf", "pdfjs.worker.ts")],
   ["ranges.worker.js", path.join(root, "ts", "archive", "ranges.worker.ts")],
+  ["sheets.worker.js", path.join(root, "ts", "office", "sheets.worker.ts")],
+  ["slides.worker.js", path.join(root, "ts", "office", "slides.worker.ts")],
+  ["docs.worker.js", path.join(root, "ts", "office", "docs.worker.ts")],
   ["worker.js", path.join(pkg("@exav/unpack-wasm"), "js", "worker.js")],
   ...fs
     .readdirSync(path.join(ooxml, "dist", "assets"))
@@ -112,7 +118,7 @@ const copy = (from, to) => {
 };
 
 // The wasm, where each module's glue resolves it from.
-for (const f of ["exav_viewer_dwg_bg.wasm", "exav_viewer_image_bg.wasm", "exav_viewer_model_bg.wasm"]) copy(path.join(root, "wasm", f), f);
+for (const f of ["exav_viewer_dwg_bg.wasm", "exav_viewer_image_bg.wasm", "exav_viewer_model_bg.wasm", "exav_viewer_text_bg.wasm", "exav_viewer_sheets_bg.wasm", "exav_viewer_slides_bg.wasm", "exav_viewer_docs_bg.wasm"]) copy(path.join(root, "wasm", f), f);
 copy(path.join(pkg("@exav/unpack-wasm"), "pkg", "exav_unpack_wasm_bg.wasm"), "exav_unpack_wasm_bg.wasm");
 for (const f of fs.readdirSync(path.join(ooxml, "dist")).filter((f) => f.endsWith(".wasm"))) copy(path.join(ooxml, "dist", f), f);
 
@@ -154,7 +160,7 @@ const html = `<!doctype html>
     <script type="module" src="./app.js"></script>
   </head>
   <body>
-    <div id="root" class="exv-frame-root"></div>
+    <div id="root" class="exav-viewer-frame-root"></div>
   </body>
 </html>
 `;

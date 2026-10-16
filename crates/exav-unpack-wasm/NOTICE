@@ -101,20 +101,31 @@ Each under the MIT License (MIT OR Apache-2.0 ones used under MIT):
   https://github.com/mkrueger/unarc-rs
 - bzip2-rs (bzip2 decoder, vendored): Copyright (c) 2021 Paolo Barbolini.
   https://github.com/paolobarbolini/bzip2-rs
+- unshield and explode (InstallShield .z reader and PKWARE DCL decoder,
+  ported): Copyright (c) 2020 Aaron Griffith. https://github.com/agrif/unshield,
+  https://github.com/agrif/explode
 - EggDotNet (AZO decoder, ported): Copyright (c) Andrew Kolman.
   https://github.com/akolman/EggDotNet
 - AutoIt-Ripper (compiled AutoIt3 layout and tables): Copyright (c) nazywam
   and contributors. https://github.com/nazywam/AutoIt-Ripper
 
 
-NSIS format headers, zlib
--------------------------
+NSIS format headers and blast.c, zlib
+-------------------------------------
 
 exav-unpack's NSIS reader implements the installer layout from NSIS's format
 header Source/exehead/fileform.h.
 
 Upstream: https://github.com/kichik/nsis
 Copyright (c) Nullsoft and contributors
+
+exav-unpack's PKWARE DCL decoder keeps the algorithm and code-length tables of
+blast.c, through the explode port above, altered to decode a whole buffer.
+
+Upstream: https://github.com/madler/zlib/tree/master/contrib/blast
+Copyright (C) Mark Adler
+
+Each under these terms:
 
 This software is provided 'as-is', without any express or implied warranty.
 In no event will the authors be held liable for any damages arising from the
@@ -133,6 +144,42 @@ subject to the following restrictions:
    misrepresented as being the original software.
 
 3. This notice may not be removed or altered from any source distribution.
+
+
+Apple lzfse, BSD-3-Clause (source derivative)
+---------------------------------------------
+
+exav-unpack's LZFSE and LZVN decoder (DMG runs) is a Rust port of the decoder
+of Apple's reference implementation.
+
+Upstream: https://github.com/lzfse/lzfse
+
+Copyright (c) 2015-2016, Apple Inc. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder(s) nor the names of any
+   contributors may be used to endorse or promote products derived from this
+   software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 Apache-2.0 references
@@ -168,7 +215,6 @@ the copyright its license file states, or its authors where it states none:
   adler2                 Jonas Schievink
   aes                    2018 Artyom Pavlov; 2018-2024 The RustCrypto Project Developers
   apfs                   2026 Dil4rd
-  arraydeque             2018 Andy Lok
   base64                 2015 Alice Maz
   bitflags               2014 The Rust Project Developers
   bitstream-io           2017 Brian Langenberger
@@ -195,7 +241,6 @@ the copyright its license file states, or its authors where it states none:
                          2017-2024 The RustCrypto Project Developers
   digest                 2017 Artyom Pavlov; 2017-2025 RustCrypto Developers
   equivalent             2016-2023 the equivalent authors
-  explode                2020 Aaron Griffith
   ext4-view              2023 Google LLC
   fatfs                  2017 Rafał Harabień
   filetime               2014 Alex Crichton
@@ -212,7 +257,6 @@ the copyright its license file states, or its authors where it states none:
   inout                  2022 Artyom Pavlov; 2022-2025 The RustCrypto Project Developers
   js-sys                 2014 Alex Crichton
   log                    2014 The Rust Project Developers
-  lzfse_rust             2020 Vin Singh Ghataore
   lznt1                  Cody Wyatt Neiman
   lzxd                   2020 Lonami
   mail-parser            Stalwart Labs
@@ -240,13 +284,11 @@ the copyright its license file states, or its authors where it states none:
   tar                    The tar-rs Project Contributors
   thiserror              David Tolnay
   tinyvec                2019 Daniel "Lokathor" Gee
-  twox-hash              2015 Jake Goulding
   typed-path             Chip Senkbeil
   typenum                2014 Paho Lurie-Gregg
   unicode-bidi           2015 The Rust Project Developers
   unicode-normalization  2015 The Rust Project Developers
   unicode-properties     2015 The Rust Project Developers
-  unshield               2020 Aaron Griffith
   uuid                   2014 The Rust Project Developers; 2018 Ashley Mannix,
                          Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
   wasm-bindgen           2014 Alex Crichton

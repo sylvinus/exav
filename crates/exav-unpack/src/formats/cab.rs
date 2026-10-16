@@ -124,6 +124,29 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
             }
         }
     }
+    // A file in no folder of this cabinet runs from or into another one of its
+    // set (`iFolder` 0xFFFD to 0xFFFF), or names a folder that is not there.
+    // Its bytes are not here, and it is not for a scan to pass over it.
+    for f in files
+        .iter()
+        .filter(|f| f.folder_index as usize >= folder_metas.len())
+    {
+        budget.count_entry()?;
+        let m = MemberMeta {
+            name: f.name().to_string(),
+            comp_size: f.uncompressed_size as u64,
+            size: Some(f.uncompressed_size as u64),
+            unsupported: Some(if f.folder_index >= 0xFFFD {
+                "CAB member continues in another cabinet of its set"
+            } else {
+                "CAB member names a folder the cabinet does not have"
+            }),
+            ..MemberMeta::default()
+        };
+        if let Some(t) = visit(&m, None, budget) {
+            return Ok(Some(t));
+        }
+    }
     Ok(None)
 }
 

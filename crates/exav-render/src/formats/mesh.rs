@@ -1,14 +1,16 @@
-//! Triangle meshes ready for a GPU, the output of the IFC and STL readers.
+//! Triangle meshes ready for a GPU, the output of the IFC, STL, OBJ, PLY and
+//! glTF readers.
 //!
 //! A [`Scene`] holds its triangles in [`Batch`]es, one per class and colour,
 //! so that a renderer draws a model in few calls; each [`Element`] says
 //! which index ranges of which batches are its own, for picking and
 //! highlighting. Positions are `f32` relative to [`Scene::origin`], which
 //! keeps a georeferenced model, kilometres from zero, precise to the
-//! millimetre. Z is up.
+//! millimetre. Z is up for IFC and STL; OBJ, PLY and glTF keep the axes of
+//! the file (glTF is Y up).
 
-// The scene builder (welding, smoothing, outlines) is the IFC reader's; STL
-// fills its one batch itself.
+// The scene builder (welding, smoothing, outlines) is the IFC reader's; the
+// others fill their one batch themselves.
 #![cfg_attr(not(feature = "ifc"), allow(dead_code))]
 
 use std::collections::{BTreeMap, HashMap};
@@ -44,6 +46,10 @@ pub struct Batch {
     /// RGBA in 0..1 as the file gives it (sRGB); `None` when the file gives
     /// no colour, which leaves the choice to the renderer.
     pub color: Option<[f32; 4]>,
+    /// Index into [`Scene::nodes`] of the storey all its elements belong
+    /// to, so that a storey can be shown or hidden by batch. `None` for
+    /// elements of no storey, and for the other formats.
+    pub storey: Option<u32>,
     /// xyz per vertex.
     pub positions: Vec<f32>,
     /// Unit xyz per vertex.
@@ -67,6 +73,10 @@ pub struct Element {
     pub name: String,
     /// Index into [`Scene::nodes`] of the spatial element that contains it.
     pub node: Option<u32>,
+    /// Index into [`Scene::nodes`] of the building storey it belongs to:
+    /// its container when that is a storey, else the nearest storey above
+    /// it in the spatial tree (a room's storey, for an element in a room).
+    pub storey: Option<u32>,
     pub ranges: Vec<Range>,
 }
 
@@ -87,6 +97,8 @@ pub struct Node {
     pub class: String,
     pub name: String,
     pub parent: Option<u32>,
+    /// A storey's `Elevation` in metres, when the file gives one.
+    pub elevation: Option<f64>,
 }
 
 /// What could not be drawn, counted.
@@ -131,10 +143,13 @@ pub(crate) struct Part {
     pub edges: bool,
 }
 
+/// What a batch is of: class, colour (as bits) and storey.
+type BatchKey = (String, Option<[u32; 4]>, Option<u32>);
+
 /// Builds a [`Scene`] element by element within a triangle budget.
 pub(crate) struct SceneBuilder {
     pub scene: Scene,
-    batches: HashMap<(String, Option<[u32; 4]>), u32>,
+    batches: HashMap<BatchKey, u32>,
     pub budget: usize,
 }
 
@@ -147,8 +162,12 @@ impl SceneBuilder {
         }
     }
 
-    fn batch(&mut self, class: &str, color: Option<[f32; 4]>) -> u32 {
-        let key = (class.to_string(), color.map(|c| c.map(f32::to_bits)));
+    fn batch(&mut self, class: &str, color: Option<[f32; 4]>, storey: Option<u32>) -> u32 {
+        let key = (
+            class.to_string(),
+            color.map(|c| c.map(f32::to_bits)),
+            storey,
+        );
         if let Some(&i) = self.batches.get(&key) {
             return i;
         }
@@ -156,6 +175,7 @@ impl SceneBuilder {
         self.scene.batches.push(Batch {
             class: class.to_string(),
             color,
+            storey,
             ..Batch::default()
         });
         self.batches.insert(key, i);
@@ -176,7 +196,7 @@ impl SceneBuilder {
                 continue;
             }
             self.budget -= finished.indices.len() / 3;
-            let b = self.batch(&element.class, part.color);
+            let b = self.batch(&element.class, part.color, element.storey);
             let batch = &mut self.scene.batches[b as usize];
             let base = (batch.positions.len() / 3) as u32;
             let first = batch.indices.len() as u32;

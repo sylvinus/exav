@@ -10,27 +10,74 @@
 /// segments for something that reads as solid anyway.
 const MAX_DASHES: usize = 20_000;
 
-/// Text carried by one element of a complex linetype.
+/// Text or a shape carried by one element of a complex linetype.
 ///
 /// A linetype like GAZ draws its dashes and stamps "GAS" into the gaps at every
 /// repetition. Without this the line is drawn as plain dashes and the label
 /// that says what the pipe carries is missing.
 #[derive(Clone, Debug)]
 pub struct Label {
-    /// Index into `runs` of the element that carries the text.
+    /// Index into `runs` of the element that carries the label, which is
+    /// placed at that element's end.
     pub run: usize,
-    pub text: String,
-    /// Text height in drawing units.
+    pub mark: Mark,
+    /// Text height, or the shape's unit, in drawing units.
     pub height: f64,
-    /// Offset from the element's position: along the line, then across it.
+    /// Offset from the element's end: along the line, then across it.
     pub offset: [f64; 2],
     pub rotation: f64,
     /// Rotation is world-absolute rather than relative to the line.
     pub absolute_rotation: bool,
-    /// The face the label's text style resolves to. These are usually stroke
-    /// fonts, since a linetype that stamps a symbol along a line is drawn from
-    /// an SHX shape file.
-    pub face: super::font::Face,
+}
+
+#[derive(Clone, Debug)]
+pub enum Mark {
+    /// `face` is what the label's text style resolves to.
+    Text {
+        text: String,
+        face: super::font::Face,
+    },
+    /// A shape of ltypeshp.shx, as `ltypeshp_shape` draws it.
+    Shape(&'static [ShapePart]),
+}
+
+/// A piece of a shape, in shape units from its insertion point, the line
+/// running along +x.
+#[derive(Debug, PartialEq)]
+pub enum ShapePart {
+    Line(&'static [[f64; 2]]),
+    /// Centre, radius, start angle and signed sweep (radians).
+    Arc([f64; 2], f64, f64, f64),
+}
+
+/// The shapes of ltypeshp.shx, which AutoCAD's own complex linetypes
+/// (TRACKS, ZIGZAG, FENCELINE1 and 2, BATTING) stamp, redrawn here: the file
+/// itself cannot be shipped, any more than an SHX font. Others are left out.
+pub fn ltypeshp_shape(number: i16) -> Option<&'static [ShapePart]> {
+    use std::f64::consts::PI;
+    const TRACK1: &[ShapePart] = &[ShapePart::Line(&[[0.0, 1.0], [0.0, -1.0]])];
+    const ZIG: &[ShapePart] = &[ShapePart::Line(&[[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]])];
+    const BOX: &[ShapePart] = &[ShapePart::Line(&[
+        [0.0, -1.0],
+        [2.0, -1.0],
+        [2.0, 1.0],
+        [0.0, 1.0],
+        [0.0, -1.0],
+    ])];
+    const CIRC1: &[ShapePart] = &[ShapePart::Arc([1.0, 0.0], 1.0, PI, -2.0 * PI)];
+    const BAT: &[ShapePart] = &[
+        ShapePart::Line(&[[0.0, 0.0], [-1.0, 2.0]]),
+        ShapePart::Arc([1.0, 2.0], 2.0, PI, -PI),
+        ShapePart::Line(&[[3.0, 2.0], [2.0, 0.0]]),
+    ];
+    match number {
+        130 => Some(TRACK1),
+        131 => Some(ZIG),
+        132 => Some(BOX),
+        133 => Some(CIRC1),
+        134 => Some(BAT),
+        _ => None,
+    }
 }
 
 /// One placed copy of a label, in drawing coordinates.
@@ -215,7 +262,8 @@ pub fn dash_polyline(
     Some(out)
 }
 
-/// Where each copy of the pattern's embedded text lands along a polyline.
+/// Where each copy of the pattern's embedded text and shapes lands along a
+/// polyline: the end of the element carrying it, shifted by its offset.
 ///
 /// The phase is the same walk the dashes use, so a label sits in the gap its
 /// definition puts it in rather than drifting against the dashes.
@@ -241,7 +289,7 @@ pub fn dash_labels(pts: &[[f64; 2]], closed: bool, pattern: &Pattern) -> Vec<Pla
                 if label.run != i {
                     continue;
                 }
-                let at = s + label.offset[0];
+                let at = s + run.abs() + label.offset[0];
                 if at < 0.0 || at > len {
                     continue;
                 }
@@ -323,12 +371,14 @@ mod embedded_text {
             &[10.0, -5.0],
             &[Label {
                 run: 1,
-                text: "GAS".to_string(),
+                mark: Mark::Text {
+                    text: "GAS".to_string(),
+                    face: super::super::font::Face::Stroke,
+                },
                 height: 2.54,
                 offset: [-2.54, -1.27],
                 rotation: 0.0,
                 absolute_rotation: false,
-                face: super::super::font::Face::Stroke,
             }],
             scale,
         )
@@ -361,9 +411,9 @@ mod embedded_text {
     fn the_offsets_place_it_along_and_across_the_line() {
         let places = dash_labels(&[[0.0, 0.0], [100.0, 0.0]], false, &gaz(1.0));
         let first = &places[0];
-        // The dash runs 0..10, so the gap starts at 10 and the label sits
-        // 2.54 back along it and 1.27 below it.
-        assert!((first.x - (10.0 - 2.54)).abs() < 1e-6, "x {}", first.x);
+        // The gap carrying it runs 10..15, and the label sits 2.54 back from
+        // its end and 1.27 below the line.
+        assert!((first.x - (15.0 - 2.54)).abs() < 1e-6, "x {}", first.x);
         assert!((first.y - -1.27).abs() < 1e-6, "y {}", first.y);
         assert!(first.angle.abs() < 1e-9, "angle {}", first.angle);
     }
@@ -374,7 +424,7 @@ mod embedded_text {
         assert!((p.labels[0].height - 5.08).abs() < 1e-9);
         let places = dash_labels(&[[0.0, 0.0], [200.0, 0.0]], false, &p);
         assert!(
-            (places[0].x - (20.0 - 5.08)).abs() < 1e-6,
+            (places[0].x - (30.0 - 5.08)).abs() < 1e-6,
             "x {}",
             places[0].x
         );
@@ -418,12 +468,14 @@ mod tests {
         assert!(dash_polyline(&pts, false, &p).is_none());
         let label = Label {
             run: 1,
-            text: "X".to_string(),
+            mark: Mark::Text {
+                text: "X".to_string(),
+                face: super::super::font::Face::Stroke,
+            },
             height: 1.0,
             offset: [0.0, 0.0],
             rotation: 0.0,
             absolute_rotation: false,
-            face: super::super::font::Face::Stroke,
         };
         let labelled = Pattern::with_labels(&[1.0, -1.0], &[label], 1.0).unwrap();
         assert!(dash_labels(&pts, false, &labelled).is_empty());

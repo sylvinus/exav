@@ -85,7 +85,8 @@ $CARGO clippy --all-targets --features exav-core/http -- -D warnings || fail "cl
 $CARGO clippy -p exav-core --all-targets --features unstable-internals -- -D warnings || fail "clippy (unstable-internals)"
 # exav-render's drawing and model readers sit behind features no other crate turns on.
 $CARGO clippy -p exav-render --all-targets --features dwg -- -D warnings || fail "clippy (exav-render dwg)"
-$CARGO clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings || fail "clippy (exav-render ifc,stl)"
+$CARGO clippy -p exav-render --all-targets --no-default-features --features ifc,stl,obj,ply,gltf -- -D warnings || fail "clippy (exav-render ifc,stl,obj,ply,gltf)"
+$CARGO clippy -p exav-render --all-targets --no-default-features --features office,office-test-util -- -D warnings || fail "clippy (exav-render office)"
 
 step "Tests"
 # The native matrix; `make test` additionally needs wasmtime and node.

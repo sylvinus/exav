@@ -4,6 +4,8 @@
 //! precision, then re-emitted as f32 relative to a per-drawing origin. See
 //! DESIGN.md section 4.4.
 
+use super::tiles::Tile;
+
 /// 2D affine transform, applied as the block/insert stack is walked.
 ///
 /// x' = a*x + c*y + e
@@ -127,7 +129,8 @@ impl Affine {
     }
 }
 
-/// One line segment, pre-transform-applied, still in drawing coordinates.
+/// One line segment, or circular arc, pre-transform-applied, still in drawing
+/// coordinates.
 #[derive(Clone, Copy)]
 pub struct Stroke {
     pub x0: f64,
@@ -139,6 +142,32 @@ pub struct Stroke {
     pub attr: u32,
     /// Position in the drawing's draw order. See `Scene::order`.
     pub order: u32,
+    /// 0 for a line; for an arc from the first point to the second, the tan
+    /// of a quarter of its sweep, positive counter-clockwise (DXF's bulge),
+    /// at most [`MAX_ARC_BULGE`]: the renderer draws it exactly at any zoom.
+    pub bulge: f32,
+}
+
+/// The largest bulge a stroke carries, a quarter turn's: an arc stroke then
+/// lies within the box of its ends widened by a fifth of its chord, and
+/// within its sector the shader's test is two cross products.
+pub const MAX_ARC_BULGE: f64 = 0.414_213_562_373_095_1;
+
+impl Stroke {
+    /// How far an arc stroke's curve stands off its chord, at most.
+    pub fn sagitta(&self) -> f64 {
+        (self.bulge.abs() as f64) * (self.x1 - self.x0).hypot(self.y1 - self.y0) / 2.0
+    }
+
+    /// The stroke as straight segments: itself, or its arc in `n` pieces.
+    pub fn flatten(&self, n: usize) -> Vec<[[f64; 2]; 2]> {
+        let (a, b) = ([self.x0, self.y0], [self.x1, self.y1]);
+        if self.bulge == 0.0 {
+            return vec![[a, b]];
+        }
+        let pts = super::curves::bulge_points(a, b, self.bulge as f64, n);
+        pts.windows(2).map(|w| [w[0], w[1]]).collect()
+    }
 }
 
 /// One triangle corner.
@@ -151,7 +180,7 @@ pub struct FillVertex {
     pub order: u32,
 }
 
-pub const STROKE_BYTES: usize = 28;
+pub const STROKE_BYTES: usize = 32;
 pub const FILL_BYTES: usize = 20;
 
 /// Fill flag: paint the viewer's background colour instead of the vertex's.
@@ -159,6 +188,10 @@ pub const FILL_BYTES: usize = 20;
 /// A WIPEOUT masks whatever lies beneath it, and what it masks to is the
 /// background, which the tessellator does not know. The renderer substitutes it.
 pub const FILL_FLAG_BACKGROUND: u8 = 1;
+
+/// The lineweight code of a fill's edge, a stroke of no width whose fringe is
+/// the fill's anti-aliasing (`shaders.ts`). Lineweights stop at 211.
+pub const FILL_EDGE: u8 = 255;
 
 /// Flag: this colour is AutoCAD's colour 7, so it flips with the background.
 ///
@@ -178,14 +211,21 @@ pub const FLAG_CONTRAST: u8 = 0x80;
 /// should average out to. 0 means "do not fade".
 #[inline]
 pub fn encode_fade_spacing(spacing: f64) -> u8 {
-    if !spacing.is_finite() || spacing <= 1.0 {
+    if !spacing.is_finite() || spacing <= 0.0 {
         return 0;
     }
-    // Logarithmic, eight steps to the octave, which covers millimetres through
-    // to tens of metres in the seven bits left beside the contrast flag.
-    let code = (spacing.log2() * 8.0).round();
+    // Logarithmic, five steps to the octave from 2^-9: in the seven bits left
+    // beside the contrast flag, 0.002 to 86,000 units, a pattern a few
+    // millimetres apart in a drawing in metres to one metres apart in a
+    // drawing in millimetres. `spacingFade` in shaders.ts decodes it.
+    let code = ((spacing.log2() + FADE_OCTAVES_BELOW_ONE) * FADE_STEPS_PER_OCTAVE).round();
     code.clamp(1.0, 127.0) as u8
 }
+
+/// Octaves below a unit `encode_fade_spacing` reaches, and its steps per
+/// octave.
+const FADE_OCTAVES_BELOW_ONE: f64 = 9.0;
+const FADE_STEPS_PER_OCTAVE: f64 = 5.0;
 
 #[inline]
 pub fn pack_attr(layer: u16, lineweight: u8, flags: u8) -> u32 {
@@ -217,11 +257,15 @@ pub struct Scene {
     pub strokes: Vec<Stroke>,
     pub fills: Vec<FillVertex>,
     pub texts: Vec<super::text::TextRun>,
+    /// Clip regions as triangles, a text run's `clip` indexing them from 1.
+    pub clips: Vec<Vec<[[f64; 2]; 3]>>,
     /// Draw order counter. AutoCAD paints entities in this sequence, and later
     /// entities cover earlier ones: a small solid fill placed over a hatch is
     /// how a roof vent masks the tiles beneath it. Without it a viewer that
     /// batches all fills before all strokes draws the hatch back on top.
     pub order: u32,
+    /// Fill vertices `edge_fills` has outlined.
+    edged: usize,
     min_x: f64,
     min_y: f64,
     max_x: f64,
@@ -234,7 +278,9 @@ impl Scene {
             strokes: Vec::new(),
             fills: Vec::new(),
             texts: Vec::new(),
+            clips: Vec::new(),
             order: 0,
+            edged: 0,
             min_x: f64::INFINITY,
             min_y: f64::INFINITY,
             max_x: f64::NEG_INFINITY,
@@ -245,7 +291,10 @@ impl Scene {
     /// Record a text run. Only the anchor grows the extents: the rendered width
     /// depends on font metrics the renderer has and this side does not.
     pub fn push_text(&mut self, run: super::text::TextRun) {
-        if !(run.x.is_finite() && run.y.is_finite() && run.height.is_finite()) {
+        if ![run.x, run.y, run.u[0], run.u[1], run.v[0], run.v[1]]
+            .iter()
+            .all(|c| c.is_finite())
+        {
             return;
         }
         if run.text.is_empty() {
@@ -286,7 +335,63 @@ impl Scene {
             rgba,
             attr,
             order,
+            bulge: 0.0,
         });
+    }
+
+    /// Push a circular arc as arc strokes of at most a quarter turn each:
+    /// centre, radius, start angle and signed sweep (positive
+    /// counter-clockwise), in drawing coordinates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_arc(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        r: f64,
+        start: f64,
+        sweep: f64,
+        rgba: u32,
+        attr: u32,
+    ) {
+        if ![cx, cy, r, start, sweep].iter().all(|v| v.is_finite()) || r <= 0.0 || sweep == 0.0 {
+            return;
+        }
+        let n = (sweep.abs() / std::f64::consts::FRAC_PI_2).ceil().max(1.0) as usize;
+        let step = sweep / n as f64;
+        let bulge = (step / 4.0).tan() as f32;
+        debug_assert!(f64::from(bulge.abs()) <= MAX_ARC_BULGE + 1e-6);
+        let at = |a: f64| [cx + r * a.cos(), cy + r * a.sin()];
+        // The extents: the arc's ends and the quadrant points it passes.
+        let (lo, hi) = if sweep > 0.0 {
+            (start, start + sweep)
+        } else {
+            (start + sweep, start)
+        };
+        let first = (lo / std::f64::consts::FRAC_PI_2).ceil() as i64;
+        let last = (hi / std::f64::consts::FRAC_PI_2).floor() as i64;
+        for k in first..=last.min(first + 4) {
+            let p = at(k as f64 * std::f64::consts::FRAC_PI_2);
+            self.grow(p[0], p[1]);
+        }
+        let order = self.order;
+        for i in 0..n {
+            let (a, b) = (
+                at(start + step * i as f64),
+                at(start + step * (i + 1) as f64),
+            );
+            self.grow(a[0], a[1]);
+            self.grow(b[0], b[1]);
+            self.strokes.push(Stroke {
+                x0: a[0],
+                y0: a[1],
+                x1: b[0],
+                y1: b[1],
+                rgba,
+                attr,
+                order,
+                bulge,
+            });
+        }
     }
 
     /// Push a flattened polyline as a run of segments.
@@ -355,6 +460,60 @@ impl Scene {
     }
 
     /// Where each buffer currently ends, for a later `clip_since`.
+    /// Outline the opaque fills of one colour pushed since the last call with
+    /// `FILL_EDGE` strokes, whose fringe anti-aliases the fill's edge: drawn
+    /// at the fill's depth, each is hidden where the fill is and shows only
+    /// outside it. An edge two triangles share is left out; a translucent,
+    /// shaded or background fill is not outlined.
+    pub fn edge_fills(&mut self) {
+        let from = self.edged.min(self.fills.len());
+        self.edged = self.fills.len();
+        let tris = self.fills[from..].as_chunks::<3>().0;
+        if tris.is_empty() {
+            return;
+        }
+        let key = |a: &FillVertex, b: &FillVertex| {
+            let (pa, pb) = (
+                [a.x.to_bits(), a.y.to_bits()],
+                [b.x.to_bits(), b.y.to_bits()],
+            );
+            let (lo, hi) = if pa <= pb { (pa, pb) } else { (pb, pa) };
+            (a.rgba, a.attr, a.order, lo, hi)
+        };
+        let mut edges = Vec::new();
+        let mut uses: std::collections::HashMap<_, u32> = std::collections::HashMap::new();
+        for t in tris {
+            let one_colour = t[1].rgba == t[0].rgba && t[2].rgba == t[0].rgba;
+            let opaque = t[0].rgba >> 24 == 255;
+            let background = (t[0].attr >> 24) as u8 & FILL_FLAG_BACKGROUND != 0;
+            if !one_colour || !opaque || background {
+                continue;
+            }
+            for (a, b) in [(&t[0], &t[1]), (&t[1], &t[2]), (&t[2], &t[0])] {
+                *uses.entry(key(a, b)).or_insert(0) += 1;
+                edges.push((*a, *b));
+            }
+        }
+        for (a, b) in edges {
+            if uses[&key(&a, &b)] != 1 {
+                continue;
+            }
+            let attr = (a.attr & 0xFFFF)
+                | u32::from(FILL_EDGE) << 16
+                | (a.attr & (u32::from(FLAG_CONTRAST) << 24));
+            self.strokes.push(Stroke {
+                x0: a.x,
+                y0: a.y,
+                x1: b.x,
+                y1: b.y,
+                rgba: a.rgba,
+                attr,
+                order: a.order,
+                bulge: 0.0,
+            });
+        }
+    }
+
     pub fn mark(&self) -> Mark {
         Mark {
             strokes: self.strokes.len(),
@@ -381,15 +540,30 @@ impl Scene {
                 }
                 continue;
             }
-            shape.clip_segment(a, b, &mut spans);
-            for (t0, t1) in spans.iter().copied() {
-                kept.push(Stroke {
-                    x0: a[0] + (b[0] - a[0]) * t0,
-                    y0: a[1] + (b[1] - a[1]) * t0,
-                    x1: a[0] + (b[0] - a[0]) * t1,
-                    y1: a[1] + (b[1] - a[1]) * t1,
-                    ..s
-                });
+            // An arc wholly inside stays one; one crossing the edge is cut as
+            // the straight pieces of its curve.
+            if s.bulge != 0.0 {
+                let [x0, y0, x1, y1] = stroke_box(&s);
+                if [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                    .iter()
+                    .all(|&c| shape.contains(c))
+                {
+                    kept.push(s);
+                    continue;
+                }
+            }
+            for [a, b] in s.flatten(16) {
+                shape.clip_segment(a, b, &mut spans);
+                for (t0, t1) in spans.iter().copied() {
+                    kept.push(Stroke {
+                        x0: a[0] + (b[0] - a[0]) * t0,
+                        y0: a[1] + (b[1] - a[1]) * t0,
+                        x1: a[0] + (b[0] - a[0]) * t1,
+                        y1: a[1] + (b[1] - a[1]) * t1,
+                        bulge: 0.0,
+                        ..s
+                    });
+                }
             }
         }
         self.strokes.extend(kept);
@@ -411,12 +585,87 @@ impl Scene {
             }
         }
         self.fills.extend(kept_fills);
+        // Outlined before they were cut, and the outlines cut with the
+        // strokes.
+        self.edged = self.fills.len();
 
-        // A run is kept or dropped whole: its rendered width lives on the other
-        // side of the worker boundary, so there is no box here to cut against.
+        // A run's glyphs are laid out on the other side of the worker
+        // boundary, so it cannot be cut here: one that may cross the shape's
+        // edge is drawn through a clip region, which the renderer masks it
+        // with. One wholly outside is dropped, one wholly inside is left be.
         let tail: Vec<super::text::TextRun> = self.texts.drain(mark.texts..).collect();
-        self.texts
-            .extend(tail.into_iter().filter(|r| shape.contains([r.x, r.y])));
+        let (min, max) = shape.bounds();
+        let mut regions: std::collections::HashMap<u16, Option<u16>> = Default::default();
+        for mut r in tail {
+            let reach = text_reach(&r);
+            if r.x + reach < min[0]
+                || r.x - reach > max[0]
+                || r.y + reach < min[1]
+                || r.y - reach > max[1]
+            {
+                continue;
+            }
+            let corners = [
+                [r.x - reach, r.y - reach],
+                [r.x + reach, r.y - reach],
+                [r.x + reach, r.y + reach],
+                [r.x - reach, r.y + reach],
+            ];
+            if !corners.iter().all(|c| shape.contains(*c)) {
+                let region = *regions
+                    .entry(r.clip)
+                    .or_insert_with(|| self.clip_region(r.clip, shape));
+                match region {
+                    Some(id) => r.clip = id,
+                    // Nothing of the earlier region is inside this one.
+                    None => continue,
+                }
+            }
+            self.texts.push(r);
+        }
+    }
+
+    /// A new clip region: the shape, or the part of region `within` it, as
+    /// its id; None when that is empty, or when ids have run out (the run is
+    /// then kept or dropped by its anchor, as before regions).
+    fn clip_region(&mut self, within: u16, shape: &super::clip::ClipShape) -> Option<u16> {
+        let triangles = if within == 0 {
+            shape.triangles()
+        } else {
+            let mut out = Vec::new();
+            let mut piece = Vec::new();
+            for t in self
+                .clips
+                .get(within as usize - 1)
+                .cloned()
+                .unwrap_or_default()
+            {
+                shape.clip_triangle(t, &mut piece);
+                out.extend_from_slice(&piece);
+            }
+            out
+        };
+        if triangles.is_empty() || self.clips.len() >= u16::MAX as usize {
+            return None;
+        }
+        self.clips.push(triangles);
+        Some(self.clips.len() as u16)
+    }
+
+    /// The clip regions as the renderer takes them: for each, a `u32`
+    /// triangle count, then `f32 x, y` for each corner, relative to
+    /// `origin()`.
+    pub fn clip_buffer(&self) -> Vec<u8> {
+        let o = self.origin();
+        let mut out = Vec::new();
+        for region in &self.clips {
+            out.extend_from_slice(&(region.len() as u32).to_le_bytes());
+            for p in region.iter().flatten() {
+                out.extend_from_slice(&((p[0] - o[0]) as f32).to_le_bytes());
+                out.extend_from_slice(&((p[1] - o[1]) as f32).to_le_bytes());
+            }
+        }
+        out
     }
 
     /// Declare the extents instead of deriving them from the geometry.
@@ -450,6 +699,48 @@ impl Scene {
         for p in points {
             self.grow(p[0], p[1]);
         }
+    }
+
+    /// Narrow the extents to where the drawing is when a few strays lie far
+    /// off it (a point left at the origin of a drawing in national grid
+    /// coordinates): the f32 origin, the fitted view and the culling grid
+    /// then serve the drawing, not the empty space between it and them,
+    /// which cost it centimetres of precision and showed it as a speck.
+    /// The core is what lies between the 0.5th and 99.5th percentiles on
+    /// each axis, with a margin; the strays are still drawn.
+    pub fn focus_on_core(&mut self) {
+        let points = self.strokes.len() * 2 + self.fills.len() + self.texts.len();
+        if points < 200 || !self.min_x.is_finite() {
+            return;
+        }
+        let stride = (points / 50_000).max(1);
+        let all = self
+            .strokes
+            .iter()
+            .flat_map(|s| [[s.x0, s.y0], [s.x1, s.y1]])
+            .chain(self.fills.iter().map(|v| [v.x, v.y]))
+            .chain(self.texts.iter().map(|r| [r.x, r.y]));
+        let (mut xs, mut ys): (Vec<f64>, Vec<f64>) =
+            all.step_by(stride).map(|p| (p[0], p[1])).unzip();
+        let span = |v: &mut Vec<f64>| -> (f64, f64) {
+            let n = v.len();
+            let (lo, hi) = (n / 200, (n - 1) - n / 200);
+            let a = *v.select_nth_unstable_by(lo, f64::total_cmp).1;
+            let b = *v.select_nth_unstable_by(hi, f64::total_cmp).1;
+            (a, b)
+        };
+        let ((x0, x1), (y0, y1)) = (span(&mut xs), span(&mut ys));
+        let margin = (x1 - x0).max(y1 - y0) * 0.25;
+        let core = [x0 - margin, y0 - margin, x1 + margin, y1 + margin];
+        let (full_w, full_h) = (self.max_x - self.min_x, self.max_y - self.min_y);
+        let (core_w, core_h) = (core[2] - core[0], core[3] - core[1]);
+        if !(core_w > 0.0 && core_h > 0.0) || (full_w <= 4.0 * core_w && full_h <= 4.0 * core_h) {
+            return;
+        }
+        self.min_x = self.min_x.max(core[0]);
+        self.min_y = self.min_y.max(core[1]);
+        self.max_x = self.max_x.min(core[2]);
+        self.max_y = self.max_y.min(core[3]);
     }
 
     /// Highest draw-order value used, for normalising depth.
@@ -492,173 +783,285 @@ impl Scene {
         [self.min_x, self.min_y, self.max_x, self.max_y]
     }
 
-    /// Interleaved stroke instance buffer, `STROKE_BYTES` per segment.
+    /// The geometry as the renderer takes it (see [`Buffers`]).
     ///
-    /// Opaque segments come first, then translucent ones, and each half is
-    /// sorted into spatial buckets so the renderer can skip what a view does
-    /// not touch. The halves stay whole: the opaque pass writes depth and the
-    /// translucent pass only tests it, so interleaving them by bucket would let
-    /// one bucket's opaque geometry paint over another's translucent.
-    pub fn stroke_buffer(&self) -> Vec<u8> {
+    /// Opaque geometry comes first, sorted into spatial buckets so the
+    /// renderer can skip what a view does not touch, then translucent
+    /// geometry in draw order: blending is drawn in order, and the opaque
+    /// pass must be done before any of it, so the halves stay whole.
+    ///
+    /// It takes the strokes and fills out of the scene as it encodes them,
+    /// so each list is freed once its bytes are made: read the origin, the
+    /// extents, the text and the clip regions first.
+    pub fn buffers(&mut self) -> Buffers {
         let o = self.origin();
-        let mut out = Vec::with_capacity(self.strokes.len() * STROKE_BYTES);
-        for half in self.stroke_halves() {
-            let (order, _) = self.bucket_strokes(&half);
-            for i in order {
-                let s = half[i as usize];
-                out.extend_from_slice(&((s.x0 - o[0]) as f32).to_le_bytes());
-                out.extend_from_slice(&((s.y0 - o[1]) as f32).to_le_bytes());
-                out.extend_from_slice(&((s.x1 - o[0]) as f32).to_le_bytes());
-                out.extend_from_slice(&((s.y1 - o[1]) as f32).to_le_bytes());
-                out.extend_from_slice(&s.rgba.to_le_bytes());
-                out.extend_from_slice(&s.attr.to_le_bytes());
-                out.extend_from_slice(&s.order.to_le_bytes());
+        // Indices rather than copies: a stroke is 48 bytes, its index 4.
+        let [opaque_strokes, strokes] = self.stroke_halves();
+        let [opaque_fills, fills] = self.fill_halves();
+        let (stroke_order, mut stroke_tiles) = self.bucket_strokes(&opaque_strokes);
+        let (fill_order, mut fill_tiles) = self.bucket_fills(&opaque_fills);
+        let translucent = self.translucent(&strokes, &fills);
+
+        let mut stroke_bytes = Vec::with_capacity(self.strokes.len() * STROKE_BYTES);
+        let ordered = stroke_order
+            .iter()
+            .map(|&i| opaque_strokes[i as usize])
+            .chain(strokes.iter().copied());
+        for s in ordered.map(|i| &self.strokes[i as usize]) {
+            stroke_bytes.extend_from_slice(&((s.x0 - o[0]) as f32).to_le_bytes());
+            stroke_bytes.extend_from_slice(&((s.y0 - o[1]) as f32).to_le_bytes());
+            stroke_bytes.extend_from_slice(&((s.x1 - o[0]) as f32).to_le_bytes());
+            stroke_bytes.extend_from_slice(&((s.y1 - o[1]) as f32).to_le_bytes());
+            stroke_bytes.extend_from_slice(&s.rgba.to_le_bytes());
+            stroke_bytes.extend_from_slice(&s.attr.to_le_bytes());
+            stroke_bytes.extend_from_slice(&s.order.to_le_bytes());
+            stroke_bytes.extend_from_slice(&s.bulge.to_le_bytes());
+        }
+        drop((stroke_order, strokes));
+        self.strokes = Vec::new();
+        let mut fill_bytes = Vec::with_capacity(self.fills.len() * FILL_BYTES);
+        let ordered = fill_order
+            .iter()
+            .map(|&i| opaque_fills[i as usize])
+            .chain(fills.iter().copied());
+        for t in ordered {
+            for v in &self.fills[t as usize * 3..t as usize * 3 + 3] {
+                fill_bytes.extend_from_slice(&((v.x - o[0]) as f32).to_le_bytes());
+                fill_bytes.extend_from_slice(&((v.y - o[1]) as f32).to_le_bytes());
+                fill_bytes.extend_from_slice(&v.rgba.to_le_bytes());
+                fill_bytes.extend_from_slice(&v.attr.to_le_bytes());
+                fill_bytes.extend_from_slice(&v.order.to_le_bytes());
             }
         }
-        out
-    }
+        drop((fill_order, fills));
+        self.fills = Vec::new();
 
-    /// Interleaved fill vertex buffer, `FILL_BYTES` per vertex.
-    pub fn fill_buffer(&self) -> Vec<u8> {
-        let o = self.origin();
-        let mut out = Vec::with_capacity(self.fills.len() * FILL_BYTES);
-        for half in self.fill_halves() {
-            let (order, _) = self.bucket_fills(&half);
-            for i in order {
-                for v in half[i as usize] {
-                    out.extend_from_slice(&((v.x - o[0]) as f32).to_le_bytes());
-                    out.extend_from_slice(&((v.y - o[1]) as f32).to_le_bytes());
-                    out.extend_from_slice(&v.rgba.to_le_bytes());
-                    out.extend_from_slice(&v.attr.to_le_bytes());
-                    out.extend_from_slice(&v.order.to_le_bytes());
-                }
-            }
+        // Tiles count strokes, and fill vertices (for drawArrays); the
+        // translucent ones start past the opaque half.
+        for tile in &mut fill_tiles {
+            tile.start *= 3;
+            tile.count *= 3;
         }
-        out
+        let (opaque_stroke_tiles, opaque_fill_tiles) = (stroke_tiles.len(), fill_tiles.len());
+        for mut tile in translucent.strokes {
+            tile.start += opaque_strokes.len() as u32;
+            stroke_tiles.push(tile);
+        }
+        for mut tile in translucent.fills {
+            tile.start = (opaque_fills.len() as u32 + tile.start) * 3;
+            tile.count *= 3;
+            fill_tiles.push(tile);
+        }
+        let mut runs = Vec::with_capacity(translucent.runs.len() * 12);
+        for (fill, from, to) in translucent.runs {
+            let base = if fill {
+                opaque_fill_tiles
+            } else {
+                opaque_stroke_tiles
+            } as u32;
+            runs.extend_from_slice(&u32::from(fill).to_le_bytes());
+            runs.extend_from_slice(&(base + from).to_le_bytes());
+            runs.extend_from_slice(&(base + to).to_le_bytes());
+        }
+
+        Buffers {
+            strokes: stroke_bytes,
+            fills: fill_bytes,
+            opaque_strokes: opaque_strokes.len(),
+            opaque_fills: opaque_fills.len() * 3,
+            stroke_tiles: super::tiles::encode(&stroke_tiles, o),
+            fill_tiles: super::tiles::encode(&fill_tiles, o),
+            opaque_stroke_tiles,
+            opaque_fill_tiles,
+            translucent_runs: runs,
+        }
     }
 
-    /// Strokes split into the opaque half and the translucent half, in that
-    /// order. Both buffer emission and the tile table walk this, so they cannot
-    /// disagree about what went where.
-    fn stroke_halves(&self) -> [Vec<Stroke>; 2] {
-        let (a, b): (Vec<Stroke>, Vec<Stroke>) =
-            self.strokes.iter().partition(|s| is_opaque(s.rgba));
+    /// The strokes of the opaque half and of the translucent half, by
+    /// index, the translucent one in draw order. Both buffer emission and
+    /// the tile table walk this, so they cannot disagree about what went
+    /// where.
+    fn stroke_halves(&self) -> [Vec<u32>; 2] {
+        let all = 0..self.strokes.len() as u32;
+        let (a, mut b): (Vec<u32>, Vec<u32>) =
+            all.partition(|&i| is_opaque(self.strokes[i as usize].rgba));
+        b.sort_by_key(|&i| self.strokes[i as usize].order);
         [a, b]
     }
 
-    /// The same for fills, kept as whole triangles. A gradient gives its
-    /// corners different colours but the same alpha, so one corner decides.
-    fn fill_halves(&self) -> [Vec<[FillVertex; 3]>; 2] {
-        let tris: Vec<[FillVertex; 3]> = self.fills.as_chunks::<3>().0.to_vec();
-        let (a, b): (Vec<_>, Vec<_>) = tris.into_iter().partition(|t| is_opaque(t[0].rgba));
+    /// The same for fills, by triangle. A gradient gives its corners
+    /// different colours but the same alpha, so one corner decides.
+    fn fill_halves(&self) -> [Vec<u32>; 2] {
+        let all = 0..(self.fills.len() / 3) as u32;
+        let (a, mut b): (Vec<u32>, Vec<u32>) =
+            all.partition(|&t| is_opaque(self.fills[t as usize * 3].rgba));
+        b.sort_by_key(|&t| self.fills[t as usize * 3].order);
         [a, b]
     }
 
-    fn bucket_strokes(&self, half: &[Stroke]) -> (Vec<u32>, Vec<super::tiles::Tile>) {
+    fn triangle(&self, t: u32) -> &[FillVertex; 3] {
+        let at = t as usize * 3;
+        self.fills[at..at + 3].try_into().expect("three vertices")
+    }
+
+    /// The translucent halves' tiles, and the order to draw them in. A tile
+    /// is a run of the half in draw order, so it is no spatial bucket, but
+    /// neighbours in draw order are often neighbours on the sheet too. Fills
+    /// and strokes interleave by draw order, a run of tiles of one kind at a
+    /// time; past [`MAX_TRANSLUCENT_RUNS`] runs, the fills then the strokes.
+    fn translucent(&self, strokes: &[u32], fills: &[u32]) -> Translucent {
+        let stroke = |i: u32| &self.strokes[i as usize];
+        let mut t = Translucent::default();
+        let (mut i, mut j) = (0, 0);
+        while i < strokes.len() || j < fills.len() {
+            let fill = match (strokes.get(i), fills.get(j)) {
+                (Some(&s), Some(&f)) => self.triangle(f)[0].order <= stroke(s).order,
+                (None, _) => true,
+                (Some(_), None) => false,
+            };
+            if fill {
+                t.push(true, j, fill_box(self.triangle(fills[j])));
+                j += 1;
+            } else {
+                t.push(false, i, stroke_box(stroke(strokes[i])));
+                i += 1;
+            }
+        }
+        if t.runs.len() > MAX_TRANSLUCENT_RUNS {
+            t = Translucent::default();
+            for (j, &f) in fills.iter().enumerate() {
+                t.push(true, j, fill_box(self.triangle(f)));
+            }
+            for (i, &s) in strokes.iter().enumerate() {
+                t.push(false, i, stroke_box(stroke(s)));
+            }
+        }
+        t
+    }
+
+    fn bucket_strokes(&self, half: &[u32]) -> (Vec<u32>, Vec<Tile>) {
+        let stroke = |i: &u32| &self.strokes[*i as usize];
         super::tiles::bucket(
             half,
             self.world_extent(),
-            |s| [(s.x0 + s.x1) / 2.0, (s.y0 + s.y1) / 2.0],
-            |s| {
-                [
-                    s.x0.min(s.x1),
-                    s.y0.min(s.y1),
-                    s.x0.max(s.x1),
-                    s.y0.max(s.y1),
-                ]
+            |i| {
+                let s = stroke(i);
+                [(s.x0 + s.x1) / 2.0, (s.y0 + s.y1) / 2.0]
             },
+            |i| stroke_box(stroke(i)),
         )
     }
 
-    fn bucket_fills(&self, half: &[[FillVertex; 3]]) -> (Vec<u32>, Vec<super::tiles::Tile>) {
+    fn bucket_fills(&self, half: &[u32]) -> (Vec<u32>, Vec<Tile>) {
         super::tiles::bucket(
             half,
             self.world_extent(),
-            |t| {
+            |&i| {
+                let t = self.triangle(i);
                 [
                     (t[0].x + t[1].x + t[2].x) / 3.0,
                     (t[0].y + t[1].y + t[2].y) / 3.0,
                 ]
             },
-            |t| {
-                [
-                    t[0].x.min(t[1].x).min(t[2].x),
-                    t[0].y.min(t[1].y).min(t[2].y),
-                    t[0].x.max(t[1].x).max(t[2].x),
-                    t[0].y.max(t[1].y).max(t[2].y),
-                ]
-            },
+            |&i| fill_box(self.triangle(i)),
         )
-    }
-
-    /// Tile table for `stroke_buffer`, counted in strokes. The translucent
-    /// half's tiles are offset past the opaque half, so a start index addresses
-    /// the whole buffer.
-    pub fn stroke_tiles(&self) -> Vec<u8> {
-        let halves = self.stroke_halves();
-        let mut tiles = Vec::new();
-        let mut base = 0u32;
-        for half in &halves {
-            let (_, mut t) = self.bucket_strokes(half);
-            for tile in &mut t {
-                tile.start += base;
-            }
-            base += half.len() as u32;
-            tiles.extend(t);
-        }
-        super::tiles::encode(&tiles, self.origin())
-    }
-
-    /// Tile table for `fill_buffer`, counted in vertices, so it can be handed
-    /// straight to `drawArrays`.
-    pub fn fill_tiles(&self) -> Vec<u8> {
-        let halves = self.fill_halves();
-        let mut tiles = Vec::new();
-        let mut base = 0u32;
-        for half in &halves {
-            let (_, mut t) = self.bucket_fills(half);
-            for tile in &mut t {
-                tile.start = base + tile.start * 3;
-                tile.count *= 3;
-            }
-            base += half.len() as u32 * 3;
-            tiles.extend(t);
-        }
-        super::tiles::encode(&tiles, self.origin())
-    }
-
-    /// Where the translucent tiles begin, as an index into the tile table.
-    pub fn opaque_stroke_tiles(&self) -> usize {
-        self.bucket_strokes(&self.stroke_halves()[0]).1.len()
-    }
-
-    pub fn opaque_fill_tiles(&self) -> usize {
-        self.bucket_fills(&self.fill_halves()[0]).1.len()
-    }
-
-    /// How many leading strokes of `stroke_buffer` are opaque.
-    pub fn opaque_strokes(&self) -> usize {
-        self.strokes.iter().filter(|s| is_opaque(s.rgba)).count()
-    }
-
-    /// How many leading vertices of `fill_buffer` are opaque.
-    pub fn opaque_fills(&self) -> usize {
-        self.fills
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .filter(|t| is_opaque(t[0].rgba))
-            .count()
-            * 3
     }
 }
 
-/// Fully opaque geometry can write depth; translucent geometry cannot.
-///
-/// The draw order is resolved through the depth buffer, so a translucent
-/// entity that writes depth rejects everything drawn behind it afterwards
-/// instead of letting it blend through. Splitting the buffers lets the
-/// renderer draw the translucent tail with depth writes off.
+/// What [`Scene::buffers`] hands the renderer; see [`super::Drawing`].
+pub struct Buffers {
+    pub strokes: Vec<u8>,
+    pub fills: Vec<u8>,
+    pub opaque_strokes: usize,
+    pub opaque_fills: usize,
+    pub stroke_tiles: Vec<u8>,
+    pub fill_tiles: Vec<u8>,
+    pub opaque_stroke_tiles: usize,
+    pub opaque_fill_tiles: usize,
+    pub translucent_runs: Vec<u8>,
+}
+
+/// Elements in one tile of a translucent half.
+const TRANSLUCENT_TILE: u32 = 4096;
+/// Most runs the translucent pass alternates fills and strokes in, each a
+/// few draw calls.
+const MAX_TRANSLUCENT_RUNS: usize = 1024;
+
+/// The translucent halves' tiles, `start` and `count` in elements of the
+/// half, and the runs of tiles to draw: (fills, first tile, end tile).
+#[derive(Default)]
+struct Translucent {
+    strokes: Vec<Tile>,
+    fills: Vec<Tile>,
+    runs: Vec<(bool, u32, u32)>,
+}
+
+impl Translucent {
+    /// Element `index` of a half, next in draw order.
+    fn push(&mut self, fill: bool, index: usize, b: [f64; 4]) {
+        let tiles = if fill {
+            &mut self.fills
+        } else {
+            &mut self.strokes
+        };
+        let same_run = self.runs.last().is_some_and(|r| r.0 == fill);
+        if let Some(t) = tiles
+            .last_mut()
+            .filter(|t| same_run && t.count < TRANSLUCENT_TILE)
+        {
+            t.count += 1;
+            t.min_x = t.min_x.min(b[0]);
+            t.min_y = t.min_y.min(b[1]);
+            t.max_x = t.max_x.max(b[2]);
+            t.max_y = t.max_y.max(b[3]);
+            return;
+        }
+        tiles.push(Tile {
+            start: index as u32,
+            count: 1,
+            min_x: b[0],
+            min_y: b[1],
+            max_x: b[2],
+            max_y: b[3],
+        });
+        let n = tiles.len() as u32;
+        match self.runs.last_mut() {
+            Some(r) if same_run => r.2 = n,
+            _ => self.runs.push((fill, n - 1, n)),
+        }
+    }
+}
+
+fn stroke_box(s: &Stroke) -> [f64; 4] {
+    let h = s.sagitta();
+    [
+        s.x0.min(s.x1) - h,
+        s.y0.min(s.y1) - h,
+        s.x0.max(s.x1) + h,
+        s.y0.max(s.y1) + h,
+    ]
+}
+
+fn fill_box(t: &[FillVertex; 3]) -> [f64; 4] {
+    [
+        t[0].x.min(t[1].x).min(t[2].x),
+        t[0].y.min(t[1].y).min(t[2].y),
+        t[0].x.max(t[1].x).max(t[2].x),
+        t[0].y.max(t[1].y).max(t[2].y),
+    ]
+}
+
+/// How far from its anchor a run can reach, whatever its alignment and
+/// rotation: every character an em wide, which no bundled face exceeds, and
+/// a line's height.
+fn text_reach(r: &super::text::TextRun) -> f64 {
+    let chars = r.text.chars().count() as f64;
+    r.unit() * (chars + 1.0)
+}
+
+/// Fully opaque geometry can be drawn in any order, the depth buffer
+/// deciding what covers what; translucent geometry blends over what is
+/// already drawn, so it comes after, in draw order.
 #[inline]
 fn is_opaque(rgba: u32) -> bool {
     rgba >> 24 == 255
@@ -736,23 +1139,119 @@ mod tests {
         s.push_triangle([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], clear, 0);
         s.push_triangle([2.0, 0.0], [3.0, 0.0], [2.0, 1.0], solid, 0);
 
-        assert_eq!(s.opaque_strokes(), 1);
-        assert_eq!(s.opaque_fills(), 3);
+        let b = s.buffers();
+        assert_eq!(b.opaque_strokes, 1);
+        assert_eq!(b.opaque_fills, 3);
 
         // The opaque one comes first in the buffer whatever order it arrived in.
-        let buf = s.stroke_buffer();
-        let first_rgba = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let first_rgba = u32::from_le_bytes(b.strokes[16..20].try_into().unwrap());
         assert_eq!(first_rgba, solid);
-        let fills = s.fill_buffer();
-        let first_fill_rgba = u32::from_le_bytes(fills[8..12].try_into().unwrap());
+        let first_fill_rgba = u32::from_le_bytes(b.fills[8..12].try_into().unwrap());
         assert_eq!(first_fill_rgba, solid);
+    }
+
+    fn u32s(b: &[u8]) -> Vec<u32> {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect()
+    }
+
+    /// An opaque fill is outlined by edges of no width, which anti-alias it:
+    /// a square of two triangles by its four sides, not their diagonal. A
+    /// translucent fill and a background one are not.
+    #[test]
+    fn opaque_fills_are_outlined_for_their_edges() {
+        let mut s = Scene::new();
+        let red = pack_rgba(255, 0, 0, 255);
+        let attr = pack_attr(3, 25, FLAG_CONTRAST);
+        s.push_triangle([0.0, 0.0], [1.0, 0.0], [1.0, 1.0], red, attr);
+        s.push_triangle([0.0, 0.0], [1.0, 1.0], [0.0, 1.0], red, attr);
+        s.edge_fills();
+        assert_eq!(s.strokes.len(), 4);
+        for k in &s.strokes {
+            assert_eq!(k.attr, pack_attr(3, FILL_EDGE, FLAG_CONTRAST));
+            assert_eq!(k.rgba, red);
+            assert!(k.x0 == k.x1 || k.y0 == k.y1, "a side, not the diagonal");
+        }
+        // Each fill once: a second call outlines nothing more.
+        s.edge_fills();
+        assert_eq!(s.strokes.len(), 4);
+        s.push_triangle(
+            [5.0, 0.0],
+            [6.0, 0.0],
+            [6.0, 1.0],
+            pack_rgba(255, 0, 0, 128),
+            attr,
+        );
+        s.push_triangle(
+            [7.0, 0.0],
+            [8.0, 0.0],
+            [8.0, 1.0],
+            red,
+            pack_attr(3, 25, FILL_FLAG_BACKGROUND),
+        );
+        s.edge_fills();
+        assert_eq!(s.strokes.len(), 4);
+    }
+
+    /// Translucent geometry is drawn in draw order, fills and strokes
+    /// interleaved, wherever it was pushed from.
+    #[test]
+    fn translucent_geometry_keeps_draw_order() {
+        let mut s = Scene::new();
+        let clear = pack_rgba(255, 0, 0, 128);
+        for (order, fill) in [(3, false), (1, true), (2, false), (4, true), (0, false)] {
+            s.order = order;
+            if fill {
+                s.push_triangle([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], clear, 0);
+            } else {
+                s.push_stroke(0.0, 0.0, 1.0, 0.0, clear, 0);
+            }
+        }
+        // An opaque stroke elsewhere gives the stroke table a bucket first.
+        s.order = 9;
+        s.push_stroke(50.0, 50.0, 60.0, 50.0, pack_rgba(0, 0, 0, 255), 0);
+        let b = s.buffers();
+        let orders: Vec<u32> = b
+            .strokes
+            .chunks(STROKE_BYTES)
+            .map(|c| u32s(&c[24..28])[0])
+            .collect();
+        assert_eq!(orders, [9, 0, 2, 3]);
+        // Strokes 0, fill 1, strokes 2 and 3, fill 4: stroke tiles from 1
+        // (past the opaque bucket), fill tiles from 0.
+        assert_eq!(
+            u32s(&b.translucent_runs),
+            [0, 1, 2, 1, 0, 1, 0, 2, 3, 1, 1, 2]
+        );
+        let tiles = u32s(&b.stroke_tiles);
+        let starts: Vec<u32> = tiles.chunks(6).map(|t| t[0]).collect();
+        let counts: Vec<u32> = tiles.chunks(6).map(|t| t[1]).collect();
+        assert_eq!((starts, counts), (vec![0, 1, 2], vec![1, 1, 2]));
+    }
+
+    /// Past the most runs, the fills then the strokes.
+    #[test]
+    fn translucent_runs_have_a_ceiling() {
+        let mut s = Scene::new();
+        let clear = pack_rgba(255, 0, 0, 128);
+        for i in 0..MAX_TRANSLUCENT_RUNS as u32 {
+            s.order = 2 * i;
+            s.push_triangle([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], clear, 0);
+            s.order = 2 * i + 1;
+            s.push_stroke(0.0, 0.0, 1.0, 0.0, clear, 0);
+        }
+        let runs = u32s(&s.buffers().translucent_runs);
+        assert_eq!(runs, [1, 0, 1, 0, 0, 1]);
     }
 
     #[test]
     fn the_contrast_flag_and_the_fade_code_share_one_byte() {
         // Both live in the flags byte, so a hatch on colour 7 has to carry its
         // spacing and its flip without either eating the other.
-        for spacing in [1.5f64, 16.0, 500.0, 50_000.0] {
+        for spacing in [0.01, 0.5, 1.5f64, 16.0, 500.0, 50_000.0] {
             let fade = encode_fade_spacing(spacing);
             assert!(
                 fade > 0 && fade < FLAG_CONTRAST,
@@ -765,18 +1264,18 @@ mod tests {
             assert_eq!(a & 0xFFFF, 7);
             assert_eq!((a >> 16) & 0xFF, 25);
         }
-        assert_eq!(encode_fade_spacing(0.5), 0);
+        assert_eq!(encode_fade_spacing(0.0), 0);
     }
 
     #[test]
     fn the_fade_code_still_resolves_a_useful_spacing_range() {
-        // Seven bits, eight steps to the octave: a millimetre up to tens of
-        // metres, which is every hatch spacing a drawing uses.
-        let decode = |code: u8| (code as f64 / 8.0).exp2();
-        for spacing in [2.0f64, 40.0, 5000.0] {
+        // Seven bits, five steps to the octave from 2^-9: a pattern
+        // millimetres apart in metres, or metres apart in millimetres.
+        let decode = |code: u8| (code as f64 / 5.0 - 9.0).exp2();
+        for spacing in [0.003f64, 0.05, 0.5, 2.0, 40.0, 5000.0, 80_000.0] {
             let back = decode(encode_fade_spacing(spacing));
             assert!(
-                (back / spacing - 1.0).abs() < 0.05,
+                (back / spacing - 1.0).abs() < 0.075,
                 "{spacing} came back as {back}"
             );
         }
@@ -796,7 +1295,7 @@ mod tests {
         let o = s.origin();
         assert!((o[0] - 6_500_000.5).abs() < 1e-6);
 
-        let buf = s.stroke_buffer();
+        let buf = s.buffers().strokes;
         let x0 = f32::from_le_bytes(buf[0..4].try_into().unwrap());
         let x1 = f32::from_le_bytes(buf[8..12].try_into().unwrap());
         // Relative coordinates keep the 1-unit separation intact.
@@ -814,13 +1313,66 @@ mod tests {
         );
     }
 
+    /// A circle is four quarter arcs, its extents its own box exactly; an
+    /// arc inside a clip stays one, one across it is cut along its curve.
+    #[test]
+    fn arcs_are_strokes_of_a_quarter_turn() {
+        let mut s = Scene::new();
+        s.push_arc(10.0, 0.0, 2.0, 0.0, std::f64::consts::TAU, 0, 0);
+        assert_eq!(s.strokes.len(), 4);
+        let quarter = (std::f64::consts::PI / 8.0).tan() as f32;
+        assert!(s.strokes.iter().all(|k| (k.bulge - quarter).abs() < 1e-6));
+        let o = s.origin();
+        assert_eq!(
+            s.extents_local().map(|v| (v * 1e4).round() / 1e4),
+            [-2.0, -2.0, 2.0, 2.0]
+        );
+        assert_eq!(o, [10.0, 0.0]);
+        // The encoding carries the bulge last.
+        let b = s.buffers();
+        let at = STROKE_BYTES - 4;
+        assert_eq!(
+            f32::from_le_bytes(b.strokes[at..at + 4].try_into().unwrap()),
+            quarter
+        );
+
+        let mut s = Scene::new();
+        s.push_arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::FRAC_PI_2, 0, 0);
+        let mark = Mark {
+            strokes: 0,
+            fills: 0,
+            texts: 0,
+        };
+        s.clip_since(
+            mark,
+            &super::super::clip::ClipShape::rect([0.0, 0.0], 10.0, 10.0),
+        );
+        assert_eq!(s.strokes.len(), 1, "inside: still one arc");
+        s.clip_since(
+            mark,
+            &super::super::clip::ClipShape::rect([1.0, 0.0], 1.0, 10.0),
+        );
+        assert!(
+            s.strokes.len() > 1
+                && s.strokes
+                    .iter()
+                    .all(|k| k.bulge == 0.0 && k.x0 >= 0.5 - 1e-9)
+        );
+        // On the curve, to the flattening's sagitta.
+        assert!(s
+            .strokes
+            .iter()
+            .all(|k| (k.x0.hypot(k.y0) - 1.0).abs() < 2e-3));
+    }
+
     #[test]
     fn buffers_have_the_documented_stride() {
         let mut s = Scene::new();
         s.push_stroke(0.0, 0.0, 1.0, 1.0, 0, 0);
         s.push_triangle([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], 0, 0);
-        assert_eq!(s.stroke_buffer().len(), STROKE_BYTES);
-        assert_eq!(s.fill_buffer().len(), 3 * FILL_BYTES);
+        let b = s.buffers();
+        assert_eq!(b.strokes.len(), STROKE_BYTES);
+        assert_eq!(b.fills.len(), 3 * FILL_BYTES);
     }
 
     #[test]

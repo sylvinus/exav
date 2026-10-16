@@ -310,6 +310,18 @@ fn dispatch<T>(
         Format::Swf => f::swf::walk,
         #[cfg(feature = "dmg")]
         Format::Dmg => f::dmg::walk,
+        #[cfg(feature = "vhd")]
+        Format::Vhd => f::vhd::walk,
+        #[cfg(feature = "diskimage")]
+        Format::Qcow2 => f::qcow2::walk,
+        #[cfg(feature = "diskimage")]
+        Format::Vmdk => f::vmdk::walk,
+        #[cfg(feature = "diskimage")]
+        Format::Vhdx => f::vhdx::walk,
+        #[cfg(feature = "ntfs")]
+        Format::Ntfs => f::ntfs::walk,
+        #[cfg(feature = "fat")]
+        Format::Fat => f::fat::walk,
         #[cfg(feature = "szdd")]
         Format::Szdd => f::szdd::walk,
         _ => return whole(fmt, src, budget, visit),
@@ -1028,7 +1040,7 @@ mod tests {
                 "{path}"
             );
         }
-        assert_eq!(seen, 7);
+        assert_eq!(seen, 8);
     }
 
     // Every codec decodes, including the solid multi-file case, where each file

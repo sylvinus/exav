@@ -186,8 +186,8 @@ recursive extraction the scanner uses.
 exav is younger than ClamAV and does not match it everywhere. Most gaps below
 show up as `UNSCANNABLE`, `LIMITS-EXCEEDED` or a counted skip: a gap costs
 coverage, not a false all-clear. The exceptions are detections exav does not
-implement (the [heuristics](#heuristic-alerts), and the `Target:` values and
-ELF and Mach-O offsets [below](#targets)): there
+implement (the [heuristics](#heuristic-alerts), and the `Target:` values
+[below](#targets)): there
 a file gets `OK` where ClamAV would alert. A signature with a constraint exav
 cannot evaluate is refused rather than loaded without it, since that would make
 it fire more broadly than the format allows. See the [roadmap](/project/roadmap/)
@@ -306,10 +306,10 @@ positives (observed: a Java CVE signature firing on APK members).
 | 3 | HTML | Supported (restricted to HTML and RTF) |
 | 4 | Mail | Supported |
 | 5 | Graphics | Supported: an object that reads as an image, or one a `HandlerType:CL_TYPE_GRAPHICS` signature re-typed |
-| 6 | ELF | Supported, but `EP` and section offsets do not resolve (see below) |
+| 6 | ELF | Supported, with `EP` and section offsets (see below) |
 | 7 | ASCII text | Supported |
 | 8 | *(unused)* | Not implemented; a reserved slot in ClamAV too |
-| 9 | Mach-O | Supported, but `EP` and section offsets do not resolve (see below) |
+| 9 | Mach-O | Supported, with section offsets; `EP` does not resolve, as in clamscan (see below) |
 | 10 | PDF | Supported |
 | 11 | Flash / SWF | Supported (`FWS` uncompressed, `CWS`/`ZWS` compressed) |
 | 12 | Java class | Supported (gated on the `cafebabe` magic) |
@@ -325,11 +325,16 @@ reads: it hashes as the same pixels do in a PNG. A build without the
 is matched against them whatever its target. The hash is ClamAV's to the bit
 ([exav-imagehash](/subprojects/exav-imagehash/)).
 
-The entry point and sections are read from a PE only. ClamAV also resolves
-`EP`, `Sn`, `SL` and `SEn` offsets on ELF and Mach-O files; in exav a
-subsignature anchored that way on one never matches, and the file can come
-back `OK` where ClamAV alerts. None of the 5,767 ELF and Mach-O signatures in
-`daily` 28140 (October 2026) uses such an offset.
+The entry point and sections are read from the headers of a PE, an ELF or a
+Mach-O. On an ELF, `EP` is the entry point's file offset, found through the
+loadable segment that maps it (the memory past the segment's bytes included),
+and `Sn`, `SL` and `SEn` are the section headers' file ranges, counted from the
+null section; on a Mach-O, `Sn`, `SL` and `SEn` count the sections of every
+segment in load order. Each was measured against clamscan 1.4.3 with a
+signature at the offset and a control three bytes off. `EP` on a Mach-O is not
+resolved, by exav or by clamscan (neither `LC_MAIN` nor `LC_UNIXTHREAD`, in
+32 and 64 bits). None of the 5,767 ELF and Mach-O signatures in `daily` 28140
+(October 2026) uses such an offset.
 
 ### Signature-format coverage
 

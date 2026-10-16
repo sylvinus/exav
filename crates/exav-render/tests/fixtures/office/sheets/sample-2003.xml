@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:x="urn:schemas-microsoft-com:office:excel"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:html="http://www.w3.org/TR/REC-html40">
+ <Styles>
+  <Style ss:ID="Default" ss:Name="Normal">
+   <Alignment ss:Vertical="Bottom"/>
+   <Font ss:FontName="Arial" ss:Size="10"/>
+  </Style>
+  <Style ss:ID="head">
+   <Font ss:Bold="1"/>
+   <Interior ss:Color="#4472C4" ss:Pattern="Solid"/>
+   <Borders>
+    <Border ss:Position="Bottom" ss:LineStyle="Continuous" ss:Weight="1"/>
+   </Borders>
+  </Style>
+  <Style ss:ID="money"><NumberFormat ss:Format="#,##0.00"/></Style>
+  <Style ss:ID="date"><NumberFormat ss:Format="yyyy\-mm\-dd"/></Style>
+ </Styles>
+ <Worksheet ss:Name="Budget">
+  <Table>
+   <Column ss:Width="96"/>
+   <Column ss:Width="72"/>
+   <Row>
+    <Cell ss:StyleID="head"><Data ss:Type="String">Item</Data></Cell>
+    <Cell ss:StyleID="head"><Data ss:Type="String">Amount</Data></Cell>
+    <Cell ss:StyleID="head"><Data ss:Type="String">Date</Data></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="String">Rent</Data></Cell>
+    <Cell ss:StyleID="money"><Data ss:Type="Number">1200</Data></Cell>
+    <Cell ss:StyleID="date"><Data ss:Type="DateTime">2024-01-06T00:00:00.000</Data></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="String">Food</Data></Cell>
+    <Cell ss:StyleID="money"><Data ss:Type="Number">345.5</Data></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="String">Travel</Data></Cell>
+    <Cell ss:StyleID="money"><Data ss:Type="Number">89.99</Data></Cell>
+   </Row>
+   <Row>
+    <Cell><Data ss:Type="String">Total</Data></Cell>
+    <Cell ss:StyleID="money" ss:Formula="=SUM(R[-3]C:R[-1]C)"><Data ss:Type="Number">1635.49</Data></Cell>
+   </Row>
+   <Row ss:Index="7" ss:Height="24">
+    <Cell ss:MergeAcross="2"><Data ss:Type="String">Merged note across three columns</Data></Cell>
+   </Row>
+  </Table>
+  <WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel">
+   <FreezePanes/><SplitHorizontal>1</SplitHorizontal><TopRowBottomPane>1</TopRowBottomPane>
+  </WorksheetOptions>
+ </Worksheet>
+ <Worksheet ss:Name="Notes">
+  <Table>
+   <Row><Cell><Data ss:Type="String">Second sheet</Data></Cell><Cell><Data ss:Type="Boolean">1</Data></Cell></Row>
+  </Table>
+ </Worksheet>
+</Workbook>

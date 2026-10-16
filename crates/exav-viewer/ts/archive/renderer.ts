@@ -1,7 +1,7 @@
 import { writable } from "../core/store.js";
 import type { ArchiveController, ArchiveMember, Renderer, Session, ViewerFile } from "../core/types.js";
 import type { ArchiveOptions } from "./index.js";
-import { decompressedName, STREAM_MEMBER } from "./names.js";
+import { decompressedName, memberPath, STREAM_MEMBER } from "./names.js";
 import { isZip, openRanged, type RangedArchive } from "./ranged.js";
 
 /**
@@ -30,7 +30,7 @@ export const renderer: Renderer<ArchiveOptions> = {
         // Directories are left out: the tree is in the names.
         return (await archive.list())
           .filter((m) => !m.name.endsWith("/"))
-          .map((m) => ({ index: m.index, name: m.name, uncompressedSize: m.uncompressedSize, encrypted: m.encrypted }));
+          .map((m) => ({ index: m.index, name: memberPath(m.name), uncompressedSize: m.uncompressedSize, encrypted: m.encrypted }));
       } catch (error) {
         // The archive and its worker are closed whatever went wrong.
         void archive.close();
@@ -92,7 +92,7 @@ export const renderer: Renderer<ArchiveOptions> = {
     const archive = chosen;
 
     const surface = document.createElement("div");
-    surface.className = "exv-archive-member";
+    surface.className = "exav-viewer-archive-member";
     host.append(surface);
 
     const state = writable<State>({ members, opening: null, opened: null, refused: null });

@@ -71,10 +71,16 @@ mod bytes;
     feature = "dmg"
 ))]
 mod inflate;
+#[cfg(all(test, any(feature = "dmg", feature = "ishieldz")))]
+mod oracle;
 pub mod profile;
 pub mod source;
 pub mod span;
 mod stream;
+/// The text a reader sees in HTML, Office and OpenDocument XML parts, and
+/// PDF. Feature `text`.
+#[cfg(feature = "text")]
+pub mod text;
 pub mod volume;
 /// AutoCAD DWG's bit codes, sections and object records, for drawing
 /// readers. Feature `dwg`.
@@ -293,6 +299,13 @@ pub struct Budget {
     pub(crate) scanned: u64,
     /// Emulator instructions spent so far (see [`Limits::max_pe_emulation_steps`]).
     pub(crate) pe_emulation_steps: u64,
+    /// PBKDF2 iterations spent so far on RAR5 passwords, across every archive of
+    /// the scan. Atomic because the RAR readers hold the budget by `&`.
+    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    pub(crate) kdf_rounds: std::sync::atomic::AtomicU64,
+    /// RAR3 key derivations made so far, across every archive of the scan.
+    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    pub(crate) rar3_derivations: std::sync::atomic::AtomicUsize,
     /// Candidate passwords tried, in order, when decrypting an encrypted ZIP,
     /// 7z, RAR, ARJ, PDF, DMG or Office member, before the built-in ones a
     /// format has (a PDF's empty user password goes first). Empty by default:
@@ -328,6 +341,8 @@ impl Budget {
             total_out: 0,
             scanned: 0,
             pe_emulation_steps: 0,
+            kdf_rounds: std::sync::atomic::AtomicU64::new(0),
+            rar3_derivations: std::sync::atomic::AtomicUsize::new(0),
             passwords: Vec::new(),
             verify_checksums: false,
             visit_directories: false,
@@ -2133,14 +2148,6 @@ pub(crate) fn dispatch_extract<R>(
         Format::Upx => extract_upx(data, budget, visit),
         #[cfg(feature = "xar")]
         Format::Xar => extract_xar(data, budget, visit),
-        #[cfg(feature = "vhd")]
-        Format::Vhd => formats::vhd::extract_vhd(data, budget, visit),
-        #[cfg(feature = "diskimage")]
-        Format::Qcow2 => formats::qcow2::extract_qcow2(data, budget, visit),
-        #[cfg(feature = "diskimage")]
-        Format::Vmdk => formats::vmdk::extract_vmdk(data, budget, visit),
-        #[cfg(feature = "diskimage")]
-        Format::Vhdx => formats::vhdx::extract_vhdx(data, budget, visit),
         #[cfg(feature = "wim")]
         Format::Wim => formats::wim::extract_wim(data, budget, visit),
         #[cfg(feature = "arc")]
@@ -2167,12 +2174,8 @@ pub(crate) fn dispatch_extract<R>(
         Format::IshieldZ => formats::ishield_z::extract_ishield_z(data, budget, visit),
         #[cfg(feature = "stuffit")]
         Format::StuffIt => formats::stuffit::extract_stuffit(data, budget, visit),
-        #[cfg(feature = "fat")]
-        Format::Fat => formats::fat::extract_fat(data, budget, visit),
         #[cfg(feature = "inno")]
         Format::Inno => formats::inno::extract_inno(data, budget, visit),
-        #[cfg(feature = "ntfs")]
-        Format::Ntfs => formats::ntfs::extract_ntfs(data, budget, visit),
         #[cfg(feature = "uuencode")]
         Format::Uuencode => extract_uuencode(data, budget, visit),
         #[cfg(feature = "xdp")]
@@ -2321,6 +2324,28 @@ pub fn extract(
 pub fn join_rar_volumes(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
     formats::join_rar_volumes(volumes)
 }
+
+/// What a cabinet's header says of its place in a set of them: the cabinet
+/// before it and the one after it, by the names the header gives (labels, for
+/// a caller to match against the names it was given: nothing here opens
+/// one), its number in the set and the set's. `None` for a cabinet that is not
+/// one of several.
+#[cfg(feature = "cab")]
+pub fn cab_links(cabinet: &[u8]) -> Option<CabLinks> {
+    formats::cab_join::links(cabinet)
+}
+
+/// The cabinets of one set, in order, as the one cabinet they were cut from:
+/// what [`walk`] reads as [`Format::Cab`]. A folder or a file that runs from
+/// one cabinet into the next is read whole that way, where one cabinet at a
+/// time it is cut short. `Err` says what does not fit the set.
+#[cfg(feature = "cab")]
+pub fn join_cab_volumes(cabinets: &[&[u8]]) -> Result<Vec<u8>, String> {
+    formats::cab_join::join(cabinets)
+}
+
+#[cfg(feature = "cab")]
+pub use formats::cab_join::Links as CabLinks;
 
 /// True if `data` looks like a UPX-packed executable (a valid `PackHeader` is
 /// present). Used by callers whose file-type classifier already recognises

@@ -194,3 +194,34 @@ signed = read("crates/exav-core/tests/fixtures/authenticode/signed_mismatch.exe"
 for i, delta in enumerate((0, 1, 8, 64)):
     put("authenticode", f"trunc{i}", signed[: len(signed) - delta])
 put("authenticode", "doubled", signed + signed[-256:])
+
+# --- vdisk: [format: u8][image] (fuzz_targets/vdisk.rs; FORMATS: 4 NTFS, 5 FAT,
+# 6 partition table; 7 and more try every format). The filesystem fixtures are gzipped
+# images of mostly zeros, so what a volume walk reads first is cut out: a FAT
+# image up to its last used byte, and the NTFS image up to the end of the
+# first run of `$MFT` (84 KiB, over the target's buffer limit, so it is walked
+# in place); each alone and as the partition of an MBR and of a GPT disk.
+# What is past the cut reads as missing.
+def unmask_gunzip(path):
+    raw = read(path, 1 << 30)
+    if path.endswith(".xor"):
+        raw = bytes(b ^ 0x5A for b in raw)
+    return gzip.decompress(raw)
+
+
+FIXTURES = "crates/exav-unpack/tests/fixtures/"
+fat = unmask_gunzip(FIXTURES + "fat/fragmented.img.gz.xor").rstrip(b"\0")
+fat += b"\0" * (-len(fat) % 512)
+ntfs = unmask_gunzip(FIXTURES + "ntfs/fragmented.img.gz.xor")[:86016]
+for kind, volume in (("fat", fat), ("ntfs", ntfs)):
+    mbr = bytearray(512)
+    mbr[0x1BE : 0x1BE + 16] = struct.pack("<B3sB3sII", 0x80, b"\0\2\0", 0x0C if kind == "fat" else 0x07, b"\0\0\0", 1, len(volume) // 512)
+    mbr[510:512] = b"\x55\xAA"
+    gpt = bytearray(3 * 512)
+    gpt[512:520] = b"EFI PART"
+    struct.pack_into("<QII", gpt, 512 + 72, 2, 1, 128)
+    gpt[1024] = 0xAB
+    struct.pack_into("<QQ", gpt, 1024 + 32, 3, 2 + len(volume) // 512)
+    put("vdisk", kind, bytes([4 if kind == "ntfs" else 5]) + volume)
+    put("vdisk", f"{kind}_in_mbr", bytes([6]) + bytes(mbr) + volume)
+    put("vdisk", f"{kind}_in_gpt", bytes([6]) + bytes(gpt) + volume)

@@ -70,7 +70,9 @@ goes through the same pipeline (`scan_object`).
   `Read` decoder straight off the source, no buffering on either side.
 - **Stored-offset containers** parse a small header or table through
   `Read + Seek`, then seek and `take` each member (`stream_stored`): ar, cpio,
-  partition, machofat, tnef, onenote, sfx, pyc, and the ISO 9660 trees of iso.
+  partition (a volume over `max_buffer_bytes` that holds NTFS or FAT is walked
+  in place instead), machofat, tnef, onenote, sfx, pyc, and the ISO 9660 trees
+  of iso.
   A part of a table left unwalked (too many partitions or ISO directories, a
   truncated table) is a member of its own, reported unsupported.
 - **ISO** walks its ISO 9660 trees and then its UDF tree, skipping files the
@@ -86,6 +88,19 @@ goes through the same pipeline (`scan_object`).
   input, and AES members take the buffered CRC/password path.
 - **DMG**: the UDIF disk is a `Read + Seek` over its decoded runs, and its
   HFS+/APFS files are read from it.
+- **Virtual disks (VHD, VHDX, QCOW2, VMDK)**: a `VDisk` (`formats/vdisk.rs`),
+  a `Read + Seek` that reads the container's tables from the source as units
+  are reached and holds nothing but a cache of decoded compressed units (32
+  MiB at most) and, for a streamOptimized VMDK, an index of one entry per grain
+  (counted against `max_buffer_bytes`). A disk of at most `max_buffer_bytes` is
+  read into one member; a larger one is walked in place (`formats/volumes.rs`):
+  its NTFS and FAT volumes are read through the disk as a `Read + Seek`, one
+  file at a time, each at most `reserve()`. What the disk decodes is charged to
+  the scan budget. A raw NTFS or FAT image, and a raw partitioned disk with a
+  volume over the limit, are walked the same way.
+- **ext**: the volume is copied into memory (`ext4-view` takes a `'static`
+  reader), bounded by `max_buffer_bytes`; inside a disk, the volume's range
+  only.
 - **Everything else** is read whole (`read_whole`: zero-copy when the source is
   in memory, bounded by `max_buffer_bytes`), and its members come out as
   `Bytes`.

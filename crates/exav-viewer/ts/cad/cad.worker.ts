@@ -3,7 +3,7 @@
 import init, { drawingPreview, parseDrawing, unsupportedDrawingVersion, type Document } from "../../wasm/exav_viewer_dwg.js";
 
 import { serve } from "../core/worker-host.js";
-import type { DrawingPreview, LayerInfo, LayoutInfo, ParsedDrawing, Warnings } from "./types.js";
+import type { DrawingPreview, LayerInfo, LayoutInfo, ParsedDrawing, Sheet, Warnings } from "./types.js";
 
 export type CadRequest =
   /**
@@ -42,14 +42,17 @@ function draw(d: Document, r: { layout: string; background: Uint8Array; maxPrimi
       fills: drawing.takeFills().buffer as ArrayBuffer,
       texts: drawing.takeTexts().buffer as ArrayBuffer,
       textStrings: drawing.takeTextStrings().buffer as ArrayBuffer,
+      clips: drawing.takeClips().buffer as ArrayBuffer,
       strokeTiles: drawing.takeStrokeTiles().buffer as ArrayBuffer,
       fillTiles: drawing.takeFillTiles().buffer as ArrayBuffer,
+      translucentRuns: drawing.takeTranslucentRuns().buffer as ArrayBuffer,
       layers: JSON.parse(drawing.layersJson()) as LayerInfo[],
       layouts: JSON.parse(d.layoutsJson()) as LayoutInfo[],
       layout: drawing.layout,
       origin: Array.from(drawing.origin()) as [number, number],
       extents: Array.from(drawing.extents()) as [number, number, number, number],
       warnings: JSON.parse(drawing.warningsJson()) as Warnings,
+      sheet: JSON.parse(drawing.sheetJson()) as Sheet,
       maxOrder: drawing.maxOrder(),
       opaqueStrokes: drawing.opaqueStrokes(),
       opaqueFills: drawing.opaqueFills(),
@@ -59,7 +62,16 @@ function draw(d: Document, r: { layout: string; background: Uint8Array; maxPrimi
     };
     return {
       value: out,
-      transfer: [out.strokes, out.fills, out.texts, out.textStrings, out.strokeTiles, out.fillTiles],
+      transfer: [
+        out.strokes,
+        out.fills,
+        out.texts,
+        out.textStrings,
+        out.clips,
+        out.strokeTiles,
+        out.fillTiles,
+        out.translucentRuns,
+      ],
     };
   } finally {
     drawing.free();

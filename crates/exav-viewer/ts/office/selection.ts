@@ -24,7 +24,7 @@ export function textSelection(root: HTMLElement): () => void {
     for (const run of root.querySelectorAll("[data-ooxml-selection-run]")) if (run.parentElement) holders.add(run.parentElement);
     for (const holder of holders) {
       const cover = doc.createElement("div");
-      cover.className = "exv-office-text-end";
+      cover.className = "exav-viewer-office-text-end";
       // First: the runs after it are drawn, and hit, above it.
       holder.prepend(cover);
       covers.push(cover);

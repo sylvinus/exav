@@ -413,6 +413,30 @@ fn a_split_set_is_rejoined_when_streamed() {
     assert_eq!(code, 1, "{stdout}");
 }
 
+/// A ZIP cut into `e.z01` and `e.zip` carries its own headers: the part
+/// numbers in its directory say where each member starts. Streamed together,
+/// the daemon rejoins them as the archive they are. The EICAR line is across
+/// the place the first part ends (`tests/fixtures/split`, made by
+/// `zip -0 -s 64k`), so neither part holds it.
+#[test]
+fn a_split_zip_is_rejoined_when_streamed() {
+    let d = Daemon::start("077", &[]);
+    let dir = TempDir::new().unwrap();
+    for n in ["e.z01", "e.zip"] {
+        let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/split")
+            .join(n);
+        std::fs::copy(from, dir.path().join(n)).unwrap();
+    }
+    let (code, stdout) = d.client(&["--send-as", "contents"], &[dir.path()]);
+    assert_eq!(
+        stdout.matches("FOUND (in e.zip)").count(),
+        2,
+        "each part carries the archive's verdict: {stdout}"
+    );
+    assert_eq!(code, 1, "{stdout}");
+}
+
 /// `--verbose` in client mode. The daemon's reply is a verdict and nothing
 /// else, so what `-v` has to add here is which daemon answered and what it was
 /// asked. Accepting the flag and printing nothing is the defect.

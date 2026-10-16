@@ -12,6 +12,11 @@
 //!
 //! exav ran 3, 4 and 7 over raw bytes of any text-like type, and HTML and text
 //! views over every one of them: matches clamscan cannot make.
+//!
+//! The clamscan cases hold under `ScanOptions::clamav_compat()`. With the
+//! `visible-text` feature, the default options add a text view of the words a
+//! reader sees in an HTML file (Markdown, Office XML and drawings too), which
+//! `Target:7` signatures match: a widening on purpose, tested in `visible_text`.
 
 use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
 
@@ -31,6 +36,12 @@ fn found(target: u8, body: &str, file: &[u8]) -> bool {
     matches!(v, Verdict::Infected { .. })
 }
 
+/// As clamscan scans: no visible-text view.
+fn found_compat(target: u8, body: &str, file: &[u8]) -> bool {
+    let v = analyze(&scanner(target, body), file, &ScanOptions::clamav_compat()).verdict;
+    matches!(v, Verdict::Infected { .. })
+}
+
 const TEXT: &[u8] = b"Some text HELLO WORLD MARKER here\n";
 const RTF: &[u8] = b"{\\rtf1\\ansi HELLO WORLD MARKER}\n";
 const HTML: &[u8] = b"<html><body>HELLO WORLD MARKER</body></html>\n";
@@ -44,11 +55,22 @@ fn text_signatures_match_the_text_view_alone() {
     assert!(found(0, lower, TEXT));
     assert!(found(7, lower, TEXT));
     assert!(!found(7, upper, TEXT), "never the raw bytes");
-    assert!(!found(7, lower, HTML), "nor an HTML file");
+    assert!(!found_compat(7, lower, HTML), "nor an HTML file");
     assert!(
         !found(0, lower, b"Some text &#104;ello world marker\n"),
         "a text file's entities are not decoded"
     );
+}
+
+/// The visible-text view is what lets a text signature see an HTML file; its
+/// markup is still not part of it.
+#[cfg(feature = "visible-text")]
+#[test]
+fn text_signatures_see_the_words_of_an_html_file_by_default() {
+    let lower = "hello world marker";
+    assert!(found(7, lower, HTML));
+    assert!(!found(7, "<body>hello world marker", HTML), "no tags");
+    assert!(!found(7, "HELLO WORLD MARKER", HTML), "never the raw bytes");
 }
 
 #[test]

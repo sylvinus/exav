@@ -86,6 +86,13 @@ File type comes from the content, not the extension: an executable renamed
 `.jpg` is still scanned as an executable. The budgets every extraction runs
 under are in [How extraction works](/unpack/how-it-works/).
 
+A document is matched twice: as its bytes, and as the text a reader sees, a
+second view of the same object with its markup, escapes and run boundaries
+gone and each link followed by where it goes. That view is made by the
+`visible-text` feature, on by default; which documents it reads, and what
+happens when one cannot be read, is in
+[Supported formats](/scanner/reference/formats/#the-text-a-reader-sees).
+
 ## Signature types and runtime structures
 
 Different ClamAV signature types compile to different runtime structures rather

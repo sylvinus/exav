@@ -37,7 +37,10 @@ or orientation accessors, which `ImageReader::decode` does not call), turn
 - zune-jpeg 0.4 is the dependency `zune-jpeg-04`, so `zune_jpeg::` is
   `zune_jpeg_04::`.
 - `bytecast.rs` casts through `bytemuck` instead of two `unsafe` slice casts,
-  which this crate forbids, and `f16` through `half`'s view of its bits.
+  which this crate forbids.
+- `half::f16` is `u16`, its bits (`decoder/mod.rs`), which drops `half` and
+  the `zerocopy` it pulls. `tiff_image.rs` only accepts 32-bit floats, so no
+  f16 sample is ever converted.
 - `decoder/image.rs`: `samples.into()` is `usize::from(samples)`, which type
   inference cannot find ambiguous whatever else the dependency graph holds.
 

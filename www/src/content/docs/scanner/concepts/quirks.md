@@ -354,7 +354,10 @@ Which signatures meet which rendering follows clamscan, probed one signature
 at a time: `Target:3` and `Target:7` signatures match only the HTML and text
 renderings, never raw bytes; an HTML file has the HTML rendering and a text file
 the text one, not the other; `Target:4` (mail) signatures match a mail's raw
-bytes. An HTML signature on plain JavaScript is a match clamscan cannot make,
+bytes. The exception is the [visible text](/scanner/reference/feature-flags/) of
+a document (the `visible-text` feature, off under `--clamav-compat`): the words
+of an HTML page, a Markdown file or an Office part are also a text view, which
+`Target:7` signatures see. An HTML signature on plain JavaScript is a match clamscan cannot make,
 and one did fire on obfuscated npm code before. Java signatures (`Target:12`)
 are gated on the `cafebabe` magic because one fired on APK members, and the
 targets exav cannot positively identify are skipped (see

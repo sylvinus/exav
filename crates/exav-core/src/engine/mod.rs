@@ -432,6 +432,53 @@ pub fn reset_scan_truncated() {
     SCAN_TRUNCATED.with(|c| c.set(false));
     SCAN_OVER_SIZE.with(|r| r.borrow_mut().take());
     SCAN_CAPPED.with(|r| r.borrow_mut().take());
+    CLEAN_SEEN.with(|m| m.borrow_mut().clear());
+}
+
+/// Most objects remembered as scanned clean in one scan.
+const CLEAN_SEEN_MAX: usize = 4096;
+
+thread_local! {
+    /// Objects this scan has scanned to the end and found clean, by a digest of
+    /// their bytes and of everything about where they sit that a scan reads,
+    /// with the shallowest depth one was scanned at. Cleared with the
+    /// truncation flags, at the start of each top-level scan.
+    static CLEAN_SEEN: RefCell<std::collections::HashMap<[u8; 32], u32>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether an object with this digest was already scanned clean at `depth` or
+/// shallower. Deeper copies are not covered: the walk has fewer levels left
+/// there, so the same bytes could be reported over the limit.
+pub(crate) fn clean_seen(key: &[u8; 32], depth: u32) -> bool {
+    let seen = CLEAN_SEEN.with(|m| m.borrow().get(key).is_some_and(|&d| d <= depth));
+    #[cfg(test)]
+    if seen {
+        CLEAN_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+    seen
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many objects [`clean_seen`] let a scan skip on this thread.
+    pub(crate) static CLEAN_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Remember an object scanned clean at `depth`.
+pub(crate) fn clean_seen_insert(key: [u8; 32], depth: u32) {
+    CLEAN_SEEN.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() < CLEAN_SEEN_MAX || m.contains_key(&key) {
+            m.entry(key).and_modify(|d| *d = (*d).min(depth)).or_insert(depth);
+        }
+    });
+}
+
+/// The container types above the object being scanned, outermost first, as
+/// `Intermediates:` reads them.
+pub(crate) fn ancestry_snapshot() -> Vec<Option<ClType>> {
+    ANCESTRY.with(|a| a.borrow().clone())
 }
 
 /// Record that carving reached its cap with more to carve, and why. Unlike a

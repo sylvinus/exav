@@ -35,6 +35,23 @@
 //! handler, and resumes from the context the handler leaves behind — including
 //! any registers or instruction pointer it edited, which is exactly the
 //! mechanism those stubs are using.
+//!
+//! ## TLS callbacks
+//!
+//! The Windows loader runs a module's TLS callbacks before its entry point, so
+//! a packer can hide its unpacking there to defeat a tool that starts at the
+//! entry point. The driver does the same: it sets up the static TLS block,
+//! writes the index to `AddressOfIndex`, points the TEB's
+//! `ThreadLocalStoragePointer` at it, then calls each callback as
+//! `cb(image_base, DLL_PROCESS_ATTACH, 0)`, re-reading the callback array after
+//! each one as the loader does (a callback may extend it). Only then does it
+//! start at the entry point. The directory layout, the TEB+0x2C TLS array and
+//! the callback prototype are as Microsoft's PE Format specification gives them
+//! (section "The .tls Section"). A callback that faults or raises goes through the
+//! same SEH machinery as the stub. If nothing handles it, or a callback runs
+//! past its slice of the budget, or the callback count cap is hit, the TLS
+//! phase is abandoned and execution proceeds to the entry point rather than
+//! ending the run: the payload is still worth trying to recover from there.
 
 use crate::cpu::{Cpu, Stop, EAX, EBX, ESP};
 use crate::image::PeImage;
@@ -79,6 +96,24 @@ const MIN_WRITE_SPREAD: u32 = 6;
 /// as no longer following the program. Each one leaves the stack potentially
 /// skewed, so a run that makes many of them is not executing anything real.
 const MAX_UNIMPLEMENTED_CALLS: u32 = 64;
+
+/// Most TLS callbacks a run will invoke before giving up on the rest and
+/// starting the entry point. A real image has one or two; a hostile directory
+/// can name far more, or point its array at itself.
+const MAX_TLS_CALLBACKS: u32 = 64;
+
+/// Fraction of the whole instruction budget any single TLS callback may spend.
+/// A callback is bounded so a stub cannot park the emulator in one forever, but
+/// generously, since a packer that unpacks from a callback does real work there.
+const TLS_CALLBACK_BUDGET_DIVISOR: u64 = 8;
+
+/// Largest static TLS block the loader will build, so a crafted
+/// `SizeOfZeroFill` cannot demand an arbitrary allocation.
+const MAX_TLS_BLOCK: u32 = 1 << 20;
+
+/// `DLL_PROCESS_ATTACH`, the reason a TLS callback and `DllMain` receive at
+/// process start.
+const DLL_PROCESS_ATTACH: u32 = 1;
 
 /// Everything that bounds a run.
 ///
@@ -218,32 +253,39 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
     let _ = env.bind_imports(&mut mem, image.base, dir_rva, dir_size);
 
     let mut cpu = Cpu::new();
-    cpu.eip = image.base.wrapping_add(image.entry_rva);
-    cpu.regs[ESP] = INITIAL_ESP;
     cpu.fs_base = TEB_BASE;
-    // What a thread sees at the entry point on Windows: EBX holds the PEB, and
-    // the return address is into kernel32.
-    cpu.regs[EBX] = crate::win::PEB_BASE;
     let process_return = env.process_return();
     let seh_return = env.seh_return();
-    // A DLL is entered as `DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)`. Those
-    // three arguments have to be on the stack: a packed DLL's stub reads them,
-    // and without them it faults on its first instruction.
-    let pushed = if image.is_dll {
-        cpu.push32(&mut mem, 0)
-            .and_then(|()| cpu.push32(&mut mem, 1))
-            .and_then(|()| cpu.push32(&mut mem, image.base))
-            .and_then(|()| cpu.push32(&mut mem, process_return))
-    } else {
-        cpu.push32(&mut mem, process_return)
+    let tls_return = env.tls_return();
+    let image_end = image.base.saturating_add(image.size_of_image);
+
+    // The loader runs TLS callbacks before the entry point. Set the static TLS
+    // block up and queue the callbacks; if there are none, start at the entry
+    // point straight away. `tls_cb_array` is the VA of the callback array, re-
+    // read before each call because a callback can grow it.
+    let tls_cb_array = setup_tls(&image, &mut env, &mut mem);
+    let mut tls_next: u32 = 0;
+    let mut tls_calls: u32 = 0;
+    let mut in_tls = false;
+    // Per-callback slice of the budget; a callback that outruns it is abandoned.
+    let tls_callback_budget = limits.max_ticks / TLS_CALLBACK_BUDGET_DIVISOR;
+    let mut tls_deadline: u64 = tls_callback_budget;
+
+    let start_ok = match tls_cb_array.and_then(|a| next_tls_callback(&mut mem, a, 0, &image)) {
+        Some(cb) => {
+            in_tls = true;
+            tls_next = 1;
+            tls_calls = 1;
+            enter_tls_callback(&mut cpu, &mut mem, cb, image.base, tls_return).is_ok()
+        }
+        None => start_entry(&mut cpu, &mut mem, &image, process_return).is_ok(),
     };
-    if pushed.is_err() {
+    if !start_ok {
         report.stop = "stack is not mapped".to_string();
         return report;
     }
 
     let stub_section = image.section_of(image.entry_rva);
-    let image_end = image.base.saturating_add(image.size_of_image);
 
     let mut seh = SehState {
         seh_return,
@@ -275,7 +317,48 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
             }
             progress_deadline = ticks + PROGRESS_WINDOW;
         }
+        // A TLS callback that outran its slice of the budget. Abandon the rest
+        // of the TLS phase and start the entry point with what it produced.
+        if in_tls && ticks >= tls_deadline {
+            in_tls = false;
+            if start_entry(&mut cpu, &mut mem, &image, process_return).is_err() {
+                stop_reason = "stack is not mapped".to_string();
+                break;
+            }
+            continue;
+        }
         let eip = cpu.eip;
+
+        if in_tls && eip == tls_return {
+            ticks += 1;
+            // A callback returned. The loader re-reads the array because a
+            // callback may have appended to it; take the next entry if there is
+            // one and the count cap allows, otherwise the TLS phase is done.
+            let next = if tls_calls < MAX_TLS_CALLBACKS {
+                tls_cb_array.and_then(|a| next_tls_callback(&mut mem, a, tls_next, &image))
+            } else {
+                None
+            };
+            match next {
+                Some(cb) => {
+                    tls_next += 1;
+                    tls_calls += 1;
+                    tls_deadline = ticks + tls_callback_budget;
+                    if enter_tls_callback(&mut cpu, &mut mem, cb, image.base, tls_return).is_err() {
+                        stop_reason = "stack is not mapped".to_string();
+                        break;
+                    }
+                }
+                None => {
+                    in_tls = false;
+                    if start_entry(&mut cpu, &mut mem, &image, process_return).is_err() {
+                        stop_reason = "stack is not mapped".to_string();
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
 
         if eip == process_return {
             stop_reason = "the stub returned to the loader".to_string();
@@ -507,6 +590,123 @@ pub fn unpack(file: &[u8], limits: &EmuLimits) -> Report {
         reached_oep: oep.is_some(),
     });
     report
+}
+
+/// Point the CPU at the entry point with the stack a thread starts with: EBX at
+/// the PEB, and a return address (plus `DllMain`'s three arguments for a DLL).
+fn start_entry(
+    cpu: &mut Cpu,
+    mem: &mut Mem,
+    image: &PeImage,
+    process_return: u32,
+) -> Result<(), ()> {
+    cpu.eip = image.base.wrapping_add(image.entry_rva);
+    cpu.regs[ESP] = INITIAL_ESP;
+    cpu.regs[EBX] = crate::win::PEB_BASE;
+    // A DLL is entered as `DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)`. Those
+    // three arguments have to be on the stack: a packed DLL's stub reads them,
+    // and without them it faults on its first instruction.
+    let pushed = if image.is_dll {
+        cpu.push32(mem, 0)
+            .and_then(|()| cpu.push32(mem, DLL_PROCESS_ATTACH))
+            .and_then(|()| cpu.push32(mem, image.base))
+            .and_then(|()| cpu.push32(mem, process_return))
+    } else {
+        cpu.push32(mem, process_return)
+    };
+    pushed.map_err(|_| ())
+}
+
+/// Enter a TLS callback as `cb(image_base, DLL_PROCESS_ATTACH, 0)`, returning to
+/// `tls_return` so the driver can run the next one.
+fn enter_tls_callback(
+    cpu: &mut Cpu,
+    mem: &mut Mem,
+    callback: u32,
+    image_base: u32,
+    tls_return: u32,
+) -> Result<(), ()> {
+    cpu.regs[ESP] = INITIAL_ESP;
+    cpu.push32(mem, 0) // reserved
+        .and_then(|()| cpu.push32(mem, DLL_PROCESS_ATTACH))
+        .and_then(|()| cpu.push32(mem, image_base))
+        .and_then(|()| cpu.push32(mem, tls_return))
+        .map_err(|_| ())?;
+    cpu.eip = callback;
+    Ok(())
+}
+
+/// Set up the static TLS block and return the VA of the callback array, or
+/// `None` when the directory is absent, malformed, or points outside the image.
+///
+/// The `IMAGE_TLS_DIRECTORY32` fields are virtual addresses (the image is mapped
+/// at its preferred base, so a VA is `base + RVA`). Every one is bounds-checked
+/// against the mapped image before it is dereferenced, since a packed file's TLS
+/// directory is attacker-controlled.
+fn setup_tls(image: &PeImage, env: &mut Env, mem: &mut Mem) -> Option<u32> {
+    let (rva, size) = image.tls_dir;
+    if rva == 0 || size < 0x18 {
+        return None;
+    }
+    let image_end = image.base.saturating_add(image.size_of_image);
+    let in_image = |va: u32| va >= image.base && va < image_end;
+    let td = image.base.wrapping_add(rva);
+    if !in_image(td) || !mem.is_mapped(td, 0x18) {
+        return None;
+    }
+    let raw_start = mem.read_u32(td).ok()?;
+    let raw_end = mem.read_u32(td + 4).ok()?;
+    let index_va = mem.read_u32(td + 8).ok()?;
+    let cb_array = mem.read_u32(td + 12).ok()?;
+    let zero_fill = mem.read_u32(td + 16).ok()?;
+
+    // The static TLS template: the raw data, then the zero fill. A directory
+    // whose raw range is backwards or outside the image contributes no data;
+    // the block is still created so `AddressOfIndex` and the TEB are wired up.
+    let mut template = Vec::new();
+    if raw_end > raw_start && in_image(raw_start) && in_image(raw_end) {
+        let len = (raw_end - raw_start).min(MAX_TLS_BLOCK);
+        if mem.is_mapped(raw_start, len) {
+            template = mem.snapshot(raw_start, len as usize);
+        }
+    }
+    let total = (template.len() as u32)
+        .saturating_add(zero_fill)
+        .min(MAX_TLS_BLOCK);
+    template.resize(total as usize, 0);
+
+    // `AddressOfIndex` must be writable storage inside the image; a directory
+    // that points it elsewhere gets no index written, matching a loader that
+    // would fault and abandon the module rather than scribble out of bounds.
+    let index_va = if index_va != 0 && in_image(index_va) && mem.is_mapped(index_va, 4) {
+        index_va
+    } else {
+        0
+    };
+    env.install_static_tls(mem, &template, 0, index_va).ok()??;
+
+    if cb_array != 0 && in_image(cb_array) && mem.is_mapped(cb_array, 4) {
+        Some(cb_array)
+    } else {
+        None
+    }
+}
+
+/// The `idx`-th callback in the array at `cb_array`, if it is present, non-null
+/// and points into the image. Re-read every time because a callback can extend
+/// the array.
+fn next_tls_callback(mem: &mut Mem, cb_array: u32, idx: u32, image: &PeImage) -> Option<u32> {
+    let slot = cb_array.wrapping_add(idx.wrapping_mul(4));
+    if !mem.is_mapped(slot, 4) {
+        return None;
+    }
+    let cb = mem.read_u32(slot).ok()?;
+    let image_end = image.base.saturating_add(image.size_of_image);
+    if cb != 0 && cb >= image.base && cb < image_end {
+        Some(cb)
+    } else {
+        None
+    }
 }
 
 /// Whether the section execution just entered was *rebuilt* rather than merely

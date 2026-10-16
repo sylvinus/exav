@@ -9,6 +9,12 @@ yanked = "deny"
 # release available; none is reachable in exav's usage. Revisit on every
 # dependency bump (a fixed release should drop the ignore, not keep it).
 ignore = [
+    # The JPEG XL decoder of @exav/viewer's image module (zenjxl-decoder, the
+    # viewer workspace only) uses two proc-macro crates that are marked
+    # unmaintained. Both run at build time only: no code of either is in the
+    # wasm module, and neither is a vulnerability.
+    "RUSTSEC-2024-0436", # paste, via zenjxl-decoder and zenjxl-decoder-simd
+    "RUSTSEC-2026-0173", # proc-macro-error2, via zenjxl-decoder-macros and archmage
     # NOTE: RUSTSEC-2023-0071 (`rsa` "Marvin") is intentionally NOT listed. `rsa`
     # is not in the tree: the native YARA engine does `pe` via `goblin`
     # and needs no Authenticode RSA, so the advisory has nothing to apply to.

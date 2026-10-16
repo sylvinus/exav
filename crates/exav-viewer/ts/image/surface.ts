@@ -89,24 +89,24 @@ export function createSurface(
   options: SurfaceOptions,
 ): Surface {
   const root = document.createElement("div");
-  root.className = "exv-image";
+  root.className = "exav-viewer-image";
   root.style.touchAction = "none";
   const stage = document.createElement("div");
-  stage.className = "exv-image-stage";
-  picture.classList.add("exv-image-picture");
+  stage.className = "exav-viewer-image-stage";
+  picture.classList.add("exav-viewer-image-picture");
   picture.draggable = false;
   const detailCanvas = document.createElement("canvas");
-  detailCanvas.className = "exv-image-detail";
+  detailCanvas.className = "exav-viewer-image-detail";
   detailCanvas.setAttribute("aria-hidden", "true");
   const pageLayer = document.createElement("div");
-  pageLayer.className = "exv-image-page-layer";
+  pageLayer.className = "exav-viewer-image-page-layer";
   const screenLayer = document.createElement("div");
-  screenLayer.className = "exv-image-screen-layer";
+  screenLayer.className = "exav-viewer-image-screen-layer";
   stage.append(picture, detailCanvas, pageLayer);
   root.append(stage, screenLayer);
   host.append(root);
 
-  const slot = `exv-image-${++slots}`;
+  const slot = `exav-viewer-image-${++slots}`;
   const view = writable<ViewState>({ page: { width: 0, height: 0 }, container: { width: 0, height: 0 }, scale: 1, x: 0, y: 0 });
   const zoomState = writable({ scale: 1, min: options.minScale, max: options.maxScale });
   let frame = 0;
@@ -120,7 +120,7 @@ export function createSurface(
     stage.style.width = `${v.page.width}px`;
     stage.style.height = `${v.page.height}px`;
     stage.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.scale})`;
-    stage.style.setProperty("--exv-scale", String(v.scale));
+    stage.style.setProperty("--exav-viewer-scale", String(v.scale));
     zoomState.set({ scale: v.scale, min: options.minScale, max: options.maxScale });
   };
 
@@ -384,7 +384,7 @@ export function createSurface(
    */
   const replacePicture = (next: HTMLImageElement | HTMLCanvasElement, size: { width: number; height: number }) => {
     const sameShape = Math.abs(size.width / size.height - natural.width / natural.height) < 1e-3;
-    next.classList.add("exv-image-picture");
+    next.classList.add("exav-viewer-image-picture");
     next.draggable = false;
     const old = picture;
     old.replaceWith(next);

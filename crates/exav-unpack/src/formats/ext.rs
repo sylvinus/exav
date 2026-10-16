@@ -11,15 +11,20 @@
 //! Reading is delegated to the `ext4-view` crate: read-only by construction (it
 //! has no write path at all), no `unsafe`, and no dependencies of its own.
 //!
-//! **This is a forced-materialization site.** `Ext4::load` takes an owned
-//! `Box<dyn Ext4Read>`, so the image is copied once — it cannot borrow the
-//! caller's buffer. The copy is charged against `max_buffer_bytes` like every
-//! other such site, and an image past that budget is reported rather than
-//! quietly skipped.
+//! **This is a forced-materialization site, and the one filesystem that is not
+//! read in place.** `Ext4::load` takes a `Box<dyn Ext4Read>`, which is
+//! `'static`: the reader cannot borrow the disk it reads, so the volume is
+//! copied into memory once. The copy is charged against `max_buffer_bytes`
+//! like every other such site, and a volume past that budget is reported
+//! rather than quietly skipped. What is copied is the volume, not the disk
+//! around it: an ext partition of a large virtual disk is read from its own
+//! range ([`walk_volume`]).
 
 // Every sum and product on a header's number is checked or saturating here; a
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
+
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::{Budget, Entry, LimitHit, Sink};
 
@@ -33,6 +38,50 @@ pub(crate) fn is_ext(data: &[u8]) -> bool {
     super::sniff::is(data, crate::Format::Ext)
 }
 
+/// An ext volume of `len` bytes, which the reader would have to hold whole,
+/// over the buffer limit.
+fn too_big<R>(len: u64, budget: &mut Budget, visit: Sink<R>) -> Result<Option<R>, LimitHit> {
+    budget.count_entry()?;
+    Ok(visit(
+        Entry::unsupported(
+            "<ext-filesystem>".to_string(),
+            len,
+            false,
+            "ext filesystem image exceeds the peak-buffer budget, so the \
+             files inside it were not examined",
+        ),
+        budget,
+    ))
+}
+
+/// Walk the ext volume `disk`, which is `len` bytes long. Only the volume is
+/// read into memory, not the disk it lies in.
+pub(crate) fn walk_volume<D: Read + Seek, R>(
+    mut disk: D,
+    len: u64,
+    budget: &mut Budget,
+    visit: Sink<R>,
+) -> Result<Option<R>, LimitHit> {
+    let mut head = [0u8; 2048];
+    disk.seek(SeekFrom::Start(0))
+        .map_err(|e| LimitHit::corrupt(format!("ext volume: {e}")))?;
+    let got = crate::read_full(&mut disk, &mut head)?;
+    if !is_ext(&head[..got]) {
+        return Ok(None);
+    }
+    if len > budget.limits.max_buffer_bytes {
+        return too_big(len, budget, visit);
+    }
+    let mut data = Vec::with_capacity(crate::cap_prealloc(crate::bytes::to_usize(len)));
+    let read = disk
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| (&mut disk).take(len).read_to_end(&mut data));
+    if let Err(e) = read {
+        return Err(LimitHit::corrupt(format!("ext filesystem: {e}")));
+    }
+    extract_ext(&data, budget, visit)
+}
+
 pub(crate) fn extract_ext<R>(
     data: &[u8],
     budget: &mut Budget,
@@ -42,19 +91,8 @@ pub(crate) fn extract_ext<R>(
         return Ok(None);
     }
     // See the module note: the reader must own its bytes.
-    let cap = budget.limits.max_buffer_bytes;
-    if data.len() as u64 > cap {
-        budget.count_entry()?;
-        return Ok(visit(
-            Entry::unsupported(
-                "<ext-filesystem>".to_string(),
-                data.len() as u64,
-                false,
-                "ext filesystem image exceeds the peak-buffer budget, so the \
-                 files inside it were not examined",
-            ),
-            budget,
-        ));
+    if data.len() as u64 > budget.limits.max_buffer_bytes {
+        return too_big(data.len() as u64, budget, visit);
     }
     let fs = match ext4_view::Ext4::load(Box::new(data.to_vec())) {
         Ok(fs) => fs,

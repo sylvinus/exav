@@ -306,6 +306,22 @@ describe("a plugin that shows another file", () => {
     expect(Object.keys(s.controllers.get())).toEqual(["zoom"]);
   });
 
+  it("with forward, shows the nested session's loading as the drawing of the result", async () => {
+    const reading: FormatPlugin = {
+      ...inner,
+      load: async () => ({
+        async mount(_h: HTMLElement, c: RenderContext): Promise<RendererHandle> {
+          c.status({ phase: "loading", step: "read" });
+          return { controllers: {}, destroy() {} };
+        },
+      }),
+    };
+    const s = createViewer({ plugins: [wrapper(true), reading] }).mount(document.createElement("div"), { id: "w", name: "a.wrap", source: { bytes: new Uint8Array([1]) } });
+    await tick();
+    await tick();
+    expect(s.status.get()).toEqual({ phase: "loading", step: "render" });
+  });
+
   it("without it, wires nothing", async () => {
     const s = createViewer({ plugins: [wrapper(false), inner] }).mount(document.createElement("div"), { id: "w", name: "a.wrap", source: { bytes: new Uint8Array([1]) } });
     await tick();
@@ -313,6 +329,45 @@ describe("a plugin that shows another file", () => {
     await tick();
     expect(s.status.get()).toEqual({ phase: "loading" });
     expect(s.controllers.get()).toEqual({});
+  });
+});
+
+describe("the file step", () => {
+  it("is the status while the file's bytes arrive and the plugin says nothing more precise", async () => {
+    let send!: (chunk: Uint8Array | null) => void;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        send = (chunk) => (chunk ? controller.enqueue(chunk) : controller.close());
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { headers: { "content-length": "4" } })));
+    const seen: Status[] = [];
+    const reading: FormatPlugin = {
+      id: "r",
+      match: { extensions: [".r"] },
+      capabilities: [],
+      options: {},
+      load: async () => ({
+        async mount(_h: HTMLElement, c: RenderContext): Promise<RendererHandle> {
+          c.status({ phase: "loading" });
+          await c.source.bytes();
+          c.status({ phase: "loading", step: "read" });
+          return { controllers: {}, destroy() {} };
+        },
+      }),
+    };
+    const s = createViewer({ plugins: [reading] }).mount(document.createElement("div"), { id: "r", name: "a.r", source: { url: "https://example.test/a.r" } });
+    s.status.subscribe((v) => seen.push(v));
+    await tick();
+    send(new Uint8Array([1, 2]));
+    await tick();
+    send(new Uint8Array([3, 4]));
+    send(null);
+    await tick();
+    await tick();
+    expect(seen).toContainEqual({ phase: "loading", step: "file", progress: 0.5 });
+    expect(s.status.get()).toEqual({ phase: "loading", step: "read" });
+    vi.unstubAllGlobals();
   });
 });
 

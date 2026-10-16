@@ -39,10 +39,11 @@ pub enum VAlign {
 pub struct TextRun {
     pub x: f64,
     pub y: f64,
-    pub height: f64,
-    pub rotation: f64,
-    pub width_factor: f64,
-    pub oblique: f64,
+    /// One cap height of advance along the baseline, width factor applied.
+    pub u: [f64; 2],
+    /// One cap height up the glyphs, oblique applied. With `u`, it carries
+    /// rotation, mirroring and a block's non-uniform scale.
+    pub v: [f64; 2],
     pub rgba: u32,
     pub attr: u32,
     pub h_align: HAlign,
@@ -52,6 +53,101 @@ pub struct TextRun {
     pub face: super::font::Face,
     /// Position in the drawing's draw order.
     pub order: u32,
+    /// The clip region the run is drawn through, from 1 (`Scene::clips`),
+    /// or 0: a run that crosses a viewport's edge or an XCLIP boundary is
+    /// cut there by the renderer, which knows how wide it is.
+    pub clip: u16,
+}
+
+impl TextRun {
+    /// Cap height on the sheet.
+    pub fn height(&self) -> f64 {
+        self.v[0].hypot(self.v[1])
+    }
+
+    /// The longer of the frame's two units, for bounding what the run covers.
+    pub fn unit(&self) -> f64 {
+        self.u[0].hypot(self.u[1]).max(self.height())
+    }
+}
+
+/// A run's frame (`TextRun::u`, `TextRun::v`) from a height, a rotation, a
+/// width factor and an oblique angle (radians, leaning right).
+pub fn frame(height: f64, rotation: f64, width_factor: f64, oblique: f64) -> ([f64; 2], [f64; 2]) {
+    let (s, c) = rotation.sin_cos();
+    let height = if height > 0.0 { height } else { 1.0 };
+    let w = if width_factor > 0.0 {
+        width_factor
+    } else {
+        1.0
+    };
+    let t = if oblique.abs() < std::f64::consts::FRAC_PI_2 {
+        oblique.tan()
+    } else {
+        0.0
+    };
+    (
+        [c * height * w, s * height * w],
+        [(c * t - s) * height, (s * t + c) * height],
+    )
+}
+
+/// A TEXT's or ATTRIB's frame, mirrored as its generation flags say: 2
+/// backward (mirrored along the baseline), 4 upside down. A mirror turns the
+/// slant the other way too.
+pub fn generated_frame(
+    height: f64,
+    rotation: f64,
+    width_factor: f64,
+    oblique: f64,
+    generation: i16,
+) -> ([f64; 2], [f64; 2]) {
+    let backward = generation & 2 != 0;
+    let upside_down = generation & 4 != 0;
+    let lean = if backward != upside_down {
+        -oblique
+    } else {
+        oblique
+    };
+    let (mut u, mut v) = frame(height, rotation, width_factor, lean);
+    if backward {
+        u = [-u[0], -u[1]];
+    }
+    if upside_down {
+        v = [-v[0], -v[1]];
+    }
+    (u, v)
+}
+
+/// How far below the baseline a face's descenders reach, in cap heights:
+/// where Bottom alignment puts the baseline. The outline faces' are their
+/// OS/2 descenders over their cap heights; the stroke font stands in for
+/// SHX fonts, whose usual one (txt.shx: 2 below 6 above) is a third.
+pub fn descent(face: Face) -> f64 {
+    match face {
+        Face::Stroke => 1.0 / 3.0,
+        Face::TrueType(f) => match f.family {
+            super::font::Family::Sans => 434.0 / 1409.0,
+            super::font::Family::Serif => 442.0 / 1341.0,
+            super::font::Family::Mono => 615.0 / 1349.0,
+        },
+    }
+}
+
+/// Where the baseline sits from the anchor, in cap heights up: Bottom puts
+/// the descenders on it, Middle centres the capitals, Top their tops, and
+/// the Middle horizontal alignment (TEXT's MIDDLE, unlike Middle Center)
+/// centres capitals and descenders together.
+pub fn baseline_offset(h: HAlign, v: VAlign, face: Face) -> f64 {
+    if h == HAlign::Middle {
+        return -(1.0 - descent(face)) / 2.0;
+    }
+    match v {
+        VAlign::Baseline => 0.0,
+        VAlign::Bottom => descent(face),
+        VAlign::Middle => -0.5,
+        VAlign::Top => -1.0,
+    }
 }
 
 pub const TEXT_RECORD_BYTES: usize = 48;
@@ -224,6 +320,24 @@ pub fn decode_special(s: &str) -> String {
             // %%u, %%o and %%k toggle under/over/strike; we drop the styling.
             Some('u') | Some('U') | Some('o') | Some('O') | Some('k') | Some('K') => {}
             Some('%') => out.push('%'),
+            // %%nnn: the character of that number, three digits.
+            Some(d) if d.is_ascii_digit() => {
+                let mut code = d.to_digit(10).unwrap_or(0);
+                let mut digits = 1;
+                while digits < 3 {
+                    match chars.peek().and_then(|c| c.to_digit(10)) {
+                        Some(n) => {
+                            code = code * 10 + n;
+                            chars.next();
+                            digits += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if let Some(c) = u8::try_from(code).ok().and_then(windows_1252) {
+                    out.push(c);
+                }
+            }
             Some(other) => {
                 out.push('%');
                 out.push('%');
@@ -235,11 +349,24 @@ pub fn decode_special(s: &str) -> String {
     out
 }
 
-/// Strip MTEXT inline formatting and split into lines.
-///
-/// Formatting is dropped rather than honoured: mixed fonts, per-run colour and
-/// stacked fractions are a documented gap. Stacked fractions degrade to `a/b`
-/// so the content survives even though the layout does not.
+/// A Windows-1252 byte as a character; None for a control character or
+/// one of the five the code page leaves out.
+fn windows_1252(b: u8) -> Option<char> {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
+        0x0152, 0, 0x017D, 0, 0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC,
+        0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+    ];
+    match b {
+        0..=0x1F | 0x7F => None,
+        0x80..=0x9F => {
+            char::from_u32(u32::from(HIGH[usize::from(b - 0x80)])).filter(|&c| c != '\0')
+        }
+        _ => Some(char::from(b)),
+    }
+}
+
+/// MTEXT as plain lines: the formatting gone, a stack as `a/b`.
 pub fn mtext_lines(raw: &str) -> Vec<String> {
     mtext_spans(raw)
         .into_iter()
@@ -265,13 +392,35 @@ pub enum SpanHeight {
 ///
 /// The code is not documented by Autodesk; this follows the arguments the
 /// format is widely understood to use: `l` a left indent applying to every
-/// line, `i` an extra indent on the first line only, and `t` a list of tab
-/// stops. `q` justification and `x` line spacing are read and ignored.
+/// line, `i` an extra indent on the first line only, `t` a list of tab stops
+/// and `q` the justification. `x` line spacing is ignored.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Paragraph {
     pub indent: f64,
     pub first_indent: f64,
     pub tabs: Vec<f64>,
+    /// `q`: the lines aligned in the box this way rather than by the
+    /// attachment point (justified and distributed taken as left).
+    pub align: Option<HAlign>,
+}
+
+/// A stacked fraction from `\S`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stack {
+    pub upper: String,
+    pub lower: String,
+    pub kind: StackKind,
+}
+
+/// The character between a stack's parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackKind {
+    /// `/`: one above the other across a bar.
+    Fraction,
+    /// `#`: side by side across a slash.
+    Diagonal,
+    /// `^`: one above the other, no bar, left-aligned (tolerances).
+    Tolerance,
 }
 
 /// One laid-out line: its runs and the paragraph settings in force.
@@ -295,6 +444,14 @@ pub struct Span {
     pub underline: bool,
     pub overline: bool,
     pub strike: bool,
+    /// `\W`: a width factor in place of the style's.
+    pub width: Option<f64>,
+    /// `\Q`: an oblique angle (radians) in place of the style's.
+    pub oblique: Option<f64>,
+    /// `\T`: each character's advance times this.
+    pub tracking: Option<f64>,
+    /// `\S`: drawn as a stack; `text` holds it as `upper/lower`.
+    pub stack: Option<Stack>,
 }
 
 impl Default for Span {
@@ -307,6 +464,10 @@ impl Default for Span {
             underline: false,
             overline: false,
             strike: false,
+            width: None,
+            oblique: None,
+            tracking: None,
+            stack: None,
         }
     }
 }
@@ -319,6 +480,11 @@ impl Span {
             && self.underline == other.underline
             && self.overline == other.overline
             && self.strike == other.strike
+            && self.width == other.width
+            && self.oblique == other.oblique
+            && self.tracking == other.tracking
+            && self.stack.is_none()
+            && other.stack.is_none()
     }
 }
 
@@ -327,11 +493,10 @@ impl Span {
 /// Colour, height and the three rules (under, over, strike) are kept, since
 /// they change what the sheet says: a legend entry written in colour 30 and
 /// underlined is not the same as the body text around it. A font change picks
-/// which bundled face draws the run (DESIGN.md section 5.3), and paragraph
-/// indents and tabs are read; width, tracking, oblique and alignment codes are
-/// dropped.
-/// Stacked fractions degrade to `a/b` so the content survives even though the
-/// layout does not.
+/// which bundled face draws the run (DESIGN.md section 5.3); width factor,
+/// oblique and tracking style the runs; a stack is a span of its own;
+/// paragraph indents, tabs and justification are read. A run's vertical
+/// alignment (`\A`) is dropped.
 pub fn mtext_spans(raw: &str) -> Vec<Line> {
     let mut lines: Vec<Line> = vec![Line {
         first: true,
@@ -378,7 +543,9 @@ pub fn mtext_spans(raw: &str) -> Vec<Line> {
             '\\' => {
                 let Some(code) = chars.next() else { break };
                 match code {
-                    'P' => {
+                    // `\X` splits a dimension's text above and below its
+                    // line: a line break here.
+                    'P' | 'X' => {
                         // A new paragraph keeps the settings in force.
                         let paragraph = lines.last().unwrap().paragraph.clone();
                         lines.push(Line {
@@ -392,10 +559,34 @@ pub fn mtext_spans(raw: &str) -> Vec<Line> {
                     '{' => push_char(&mut lines, &style, '{'),
                     '}' => push_char(&mut lines, &style, '}'),
                     '~' => push_char(&mut lines, &style, '\u{00A0}'),
-                    // Stacked fraction: \S<upper>^<lower>; becomes upper/lower.
+                    // Stacked fraction: \S<upper>/<lower>; (or # or ^), a
+                    // span of its own.
                     'S' => {
-                        let body = argument(&mut chars).replacen(['^', '#'], "/", 1);
-                        push_str(&mut lines, &style, body.trim_end_matches('/'));
+                        let body = argument(&mut chars);
+                        let Some(at) = body.find(['/', '#', '^']) else {
+                            push_str(&mut lines, &style, &body);
+                            continue;
+                        };
+                        let kind = match &body[at..at + 1] {
+                            "#" => StackKind::Diagonal,
+                            "^" => StackKind::Tolerance,
+                            _ => StackKind::Fraction,
+                        };
+                        let (upper, lower) = (&body[..at], &body[at + 1..]);
+                        let text = if lower.is_empty() {
+                            upper.to_string()
+                        } else {
+                            format!("{upper}/{lower}")
+                        };
+                        lines.last_mut().unwrap().spans.push(Span {
+                            text,
+                            stack: Some(Stack {
+                                upper: upper.to_string(),
+                                lower: lower.to_string(),
+                                kind,
+                            }),
+                            ..style.clone()
+                        });
                     }
                     // Colour by index, and by true colour.
                     'C' => {
@@ -456,8 +647,23 @@ pub fn mtext_spans(raw: &str) -> Vec<Line> {
                         let body = argument(&mut chars);
                         style.face = Some(super::font::resolve_file(&body));
                     }
-                    // Settings that do not survive font substitution.
-                    'W' | 'Q' | 'A' | 'T' | 'h' => {
+                    // Width factor, oblique (degrees) and tracking.
+                    'W' | 'Q' | 'T' => {
+                        let body = argument(&mut chars);
+                        let n = body.trim().trim_end_matches(['x', 'X']).parse::<f64>().ok();
+                        let n = n.filter(|n| n.is_finite());
+                        match code {
+                            'W' => style.width = n.filter(|n| *n > 0.0).or(style.width),
+                            'Q' => {
+                                style.oblique = n
+                                    .map(|d| d.clamp(-85.0, 85.0).to_radians())
+                                    .or(style.oblique)
+                            }
+                            _ => style.tracking = n.map(|t| t.clamp(0.75, 4.0)).or(style.tracking),
+                        }
+                    }
+                    // A run's vertical alignment against taller ones.
+                    'A' | 'h' => {
                         argument(&mut chars);
                     }
                     // `\U+XXXX` is how a codepoint outside the drawing's code
@@ -499,6 +705,10 @@ pub fn mtext_spans(raw: &str) -> Vec<Line> {
     for line in &mut lines {
         for span in line.spans.iter_mut() {
             span.text = decode_special(&span.text);
+            if let Some(s) = &mut span.stack {
+                s.upper = decode_special(&s.upper);
+                s.lower = decode_special(&s.lower);
+            }
         }
         line.spans.retain(|s| !s.text.is_empty());
     }
@@ -507,9 +717,9 @@ pub fn mtext_spans(raw: &str) -> Vec<Line> {
 
 /// Read an MTEXT `\p` argument list: `xi-3,l4,t4` and the like.
 ///
-/// Values are in drawing units. A leading `x` and the `q` justification letter
-/// are consumed and ignored; anything unrecognised is skipped rather than
-/// guessed at, since the code is not documented by Autodesk.
+/// Values are in drawing units. A leading `x` is consumed and ignored;
+/// anything unrecognised is skipped rather than guessed at, since the code is
+/// not documented by Autodesk.
 fn parse_paragraph(body: &str) -> Paragraph {
     let mut p = Paragraph::default();
     for part in body.trim_start_matches(['x', 'X']).split(',') {
@@ -521,6 +731,14 @@ fn parse_paragraph(body: &str) -> Paragraph {
         match key {
             'i' => p.first_indent = value.parse().unwrap_or(0.0),
             'l' => p.indent = value.parse().unwrap_or(0.0),
+            'q' => {
+                p.align = match value {
+                    "c" => Some(HAlign::Center),
+                    "r" => Some(HAlign::Right),
+                    "l" | "j" | "d" => Some(HAlign::Left),
+                    _ => None,
+                }
+            }
             't' => {
                 // Each stop can carry a trailing alignment letter.
                 let number = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -561,7 +779,7 @@ pub fn mtext_layout(attachment: u8, line_count: usize, height: f64, spacing: f64
 /// Serialise runs into the wire format: fixed records plus a UTF-8 string blob.
 ///
 /// Record layout, little-endian, `TEXT_RECORD_BYTES` each:
-/// `f32 x, y, height, rotation, widthFactor, oblique | u32 rgba, attr, strOffset | u16 strLen | u8 hAlign, vAlign | u32 order | u8 face | 3 bytes padding`
+/// `f32 x, y, ux, uy, vx, vy | u32 rgba, attr, strOffset | u16 strLen | u8 hAlign, vAlign | u32 order | u8 face | u8 padding | u16 clip`
 pub fn encode(runs: &[TextRun], origin: [f64; 2]) -> (Vec<u8>, Vec<u8>) {
     let mut records = Vec::with_capacity(runs.len() * TEXT_RECORD_BYTES);
     let mut blob: Vec<u8> = Vec::new();
@@ -579,10 +797,9 @@ pub fn encode(runs: &[TextRun], origin: [f64; 2]) -> (Vec<u8>, Vec<u8>) {
 
         records.extend_from_slice(&((r.x - origin[0]) as f32).to_le_bytes());
         records.extend_from_slice(&((r.y - origin[1]) as f32).to_le_bytes());
-        records.extend_from_slice(&(r.height as f32).to_le_bytes());
-        records.extend_from_slice(&(r.rotation as f32).to_le_bytes());
-        records.extend_from_slice(&(r.width_factor as f32).to_le_bytes());
-        records.extend_from_slice(&(r.oblique as f32).to_le_bytes());
+        for c in [r.u[0], r.u[1], r.v[0], r.v[1]] {
+            records.extend_from_slice(&(c as f32).to_le_bytes());
+        }
         records.extend_from_slice(&r.rgba.to_le_bytes());
         records.extend_from_slice(&r.attr.to_le_bytes());
         records.extend_from_slice(&offset.to_le_bytes());
@@ -591,7 +808,8 @@ pub fn encode(runs: &[TextRun], origin: [f64; 2]) -> (Vec<u8>, Vec<u8>) {
         records.push(r.v_align as u8);
         records.extend_from_slice(&r.order.to_le_bytes());
         records.push(r.face.to_byte());
-        records.extend_from_slice(&[0, 0, 0]);
+        records.push(0);
+        records.extend_from_slice(&r.clip.to_le_bytes());
     }
 
     debug_assert_eq!(records.len(), runs.len() * TEXT_RECORD_BYTES);
@@ -703,9 +921,53 @@ mod spans {
 
     #[test]
     fn an_unreadable_paragraph_code_leaves_the_defaults() {
-        let line = one_line("\\pqc;a");
+        let line = one_line("\\pz9,qy;a");
         assert_eq!(line.paragraph, Paragraph::default());
         assert_eq!(line.spans[0].text, "a");
+    }
+
+    #[test]
+    fn a_paragraph_says_how_its_lines_align() {
+        assert_eq!(one_line("\\pxqc;a").paragraph.align, Some(HAlign::Center));
+        assert_eq!(one_line("\\pxqr;a").paragraph.align, Some(HAlign::Right));
+        assert_eq!(one_line("\\pxqj;a").paragraph.align, Some(HAlign::Left));
+    }
+
+    #[test]
+    fn width_oblique_and_tracking_style_the_runs_they_open() {
+        let spans = one(r"{\T2;tracked} {\W0.5;half} {\Q20;slant}");
+        let get = |t: &str| spans.iter().find(|s| s.text == t).unwrap().clone();
+        assert_eq!(get("tracked").tracking, Some(2.0));
+        assert_eq!(get("half").width, Some(0.5));
+        assert!((get("slant").oblique.unwrap() - 20f64.to_radians()).abs() < 1e-12);
+        assert_eq!(get(" ").width, None);
+    }
+
+    #[test]
+    fn a_stack_is_a_span_of_its_own() {
+        let spans = one(r"1\S1/2;in \S+0.1^-0.2;\S3#4;");
+        let stacks: Vec<_> = spans.iter().filter_map(|s| s.stack.clone()).collect();
+        assert_eq!(
+            stacks,
+            vec![
+                Stack {
+                    upper: "1".into(),
+                    lower: "2".into(),
+                    kind: StackKind::Fraction
+                },
+                Stack {
+                    upper: "+0.1".into(),
+                    lower: "-0.2".into(),
+                    kind: StackKind::Tolerance
+                },
+                Stack {
+                    upper: "3".into(),
+                    lower: "4".into(),
+                    kind: StackKind::Diagonal
+                },
+            ]
+        );
+        assert_eq!(spans[0].text, "1");
     }
 
     #[test]
@@ -917,6 +1179,19 @@ mod tests {
     }
 
     #[test]
+    fn a_percent_number_is_that_character() {
+        assert_eq!(decode_special("%%176 %%065%%0661"), "° AB1");
+        assert_eq!(decode_special("%%128"), "€");
+        // A control character, or none at all, draws nothing.
+        assert_eq!(decode_special("a%%009b%%999c"), "abc");
+    }
+
+    #[test]
+    fn mtext_x_breaks_the_line() {
+        assert_eq!(mtext_lines(r"above\Xbelow"), vec!["above", "below"]);
+    }
+
+    #[test]
     fn mtext_splits_on_paragraph_marks() {
         assert_eq!(mtext_lines(r"one\Ptwo\Pthree"), vec!["one", "two", "three"]);
     }
@@ -1019,10 +1294,8 @@ mod tests {
             TextRun {
                 x: 10.0,
                 y: 20.0,
-                height: 2.5,
-                rotation: 0.0,
-                width_factor: 1.0,
-                oblique: 0.0,
+                u: [2.5, 0.0],
+                v: [0.0, 2.5],
                 rgba: 0xFF00FF00,
                 attr: 7,
                 h_align: HAlign::Center,
@@ -1030,14 +1303,13 @@ mod tests {
                 text: "Chambre 1".into(),
                 face: Face::default(),
                 order: 1,
+                clip: 0,
             },
             TextRun {
                 x: 0.0,
                 y: 0.0,
-                height: 1.0,
-                rotation: 0.0,
-                width_factor: 1.0,
-                oblique: 0.0,
+                u: [-0.5, 0.0],
+                v: [0.25, -1.0],
                 rgba: 0,
                 attr: 0,
                 h_align: HAlign::Left,
@@ -1045,6 +1317,7 @@ mod tests {
                 text: "aménagée".into(),
                 face: Face::default(),
                 order: 2,
+                clip: 3,
             },
         ];
         let (rec, blob) = encode(&runs, [0.0, 0.0]);
@@ -1068,6 +1341,15 @@ mod tests {
         );
         assert_eq!(rec[TEXT_RECORD_BYTES + 38], HAlign::Left as u8);
         assert_eq!(rec[TEXT_RECORD_BYTES + 39], VAlign::Baseline as u8);
+        // The frame after the anchor: a mirrored, slanted one survives.
+        let f = |at: usize| f32::from_le_bytes(rec[at..at + 4].try_into().unwrap());
+        let at = TEXT_RECORD_BYTES + 8;
+        assert_eq!(
+            [f(at), f(at + 4), f(at + 8), f(at + 12)],
+            [-0.5, 0.0, 0.25, -1.0]
+        );
+        // The clip region last, little-endian.
+        assert_eq!(rec[TEXT_RECORD_BYTES + 46..TEXT_RECORD_BYTES + 48], [3, 0]);
     }
 
     #[test]
@@ -1075,10 +1357,8 @@ mod tests {
         let runs = vec![TextRun {
             x: 6_500_000.0,
             y: 100.0,
-            height: 1.0,
-            rotation: 0.0,
-            width_factor: 1.0,
-            oblique: 0.0,
+            u: [1.0, 0.0],
+            v: [0.0, 1.0],
             rgba: 0,
             attr: 0,
             h_align: HAlign::Left,
@@ -1086,6 +1366,7 @@ mod tests {
             text: "x".into(),
             face: Face::default(),
             order: 1,
+            clip: 0,
         }];
         let (rec, _) = encode(&runs, [6_500_000.0, 0.0]);
         let x = f32::from_le_bytes(rec[0..4].try_into().unwrap());

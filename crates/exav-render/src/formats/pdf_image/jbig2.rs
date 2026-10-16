@@ -44,8 +44,10 @@ pub fn decode_jbig2(
     let regions =
         region_pixels(data, false).saturating_add(globals.map_or(0, |g| region_pixels(g, false)));
     // Decoding a region costs time per pixel, whatever the memory its bitmap
-    // takes, so the declared pixels are charged at a byte each as well.
-    if regions > max_alloc {
+    // takes, so the declared pixels are charged at a byte each as well. The
+    // budget may be a gigabyte (the viewer's), but the time is bounded as it
+    // is for a file: by `DECODE_MAX`.
+    if regions > max_alloc.min(crate::formats::DECODE_MAX) {
         return Err(Error::new("Image too large"));
     }
     // The page and region bitmaps, the page's rows as the decoder emits

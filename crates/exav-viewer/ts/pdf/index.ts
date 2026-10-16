@@ -35,7 +35,7 @@ export function pdf(options: PdfOptions = {}): FormatPlugin<PdfOptions> {
   return {
     id: "pdf",
     match: MATCHERS.pdf,
-    capabilities: ["pages", "zoom", "drag", "outline"],
+    capabilities: ["pages", "zoom", "drag", "outline", "pictures", "viewport"],
     options,
     load: () => import("./renderer.js").then((m) => m.renderer),
     async prefetch(assetBase) {

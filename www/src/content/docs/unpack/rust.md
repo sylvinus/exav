@@ -151,6 +151,11 @@ fat · ext · ntfs · wim · upx · inno · nsis · ar · cpio · xar · uuencod
 tnef · swf · binhex · lnk · partition · pyc · autoit · onenote · rtf
 machofat · sfx · stuffit · alz · egg · hwp3 · zoo · ishieldz · pepack
 javaclass · aimodel · screnc · base64scan · dxf · dwg · pe-emu
+
+Not formats, and not in `all-formats`: `text` (the `exav_unpack::text` module,
+the text a reader sees in HTML and in the XML parts of Office and OpenDocument
+files: html5gum's tokenizer and quick-xml) and `text-pdf` (PDF's, through
+hayro, see [exav-render](/subprojects/exav-render/#text)).
 ```
 
 A ZIP member compressed with bzip2, LZMA, zstd or XZ also needs that codec's

@@ -129,7 +129,16 @@ pub fn intersection_alert(data: &dyn crate::source::ByteSource) -> Option<&'stat
     }
 }
 
-/// Walk a disk image, each partition streamed from where it lies.
+/// Whether the start of a disk `len` bytes long, `head` (at least two
+/// sectors of it, or all of a shorter one), holds a partition table.
+#[cfg(feature = "partition")]
+pub(crate) fn is_table(head: &[u8], len: u64) -> bool {
+    is_gpt(head) || is_apm(head) || is_mbr_in(head, len)
+}
+
+/// Walk a disk image, each partition streamed from where it lies. A partition
+/// larger than the buffer limit that holds a filesystem exav reads is walked
+/// in place instead, where the stream would be all of it.
 #[cfg(feature = "partition")]
 pub(crate) fn walk<T>(
     src: &dyn crate::source::ByteSource,
@@ -137,8 +146,14 @@ pub(crate) fn walk<T>(
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
     let mut source = crate::source::Reader::new(src);
-    let members = stream_offsets(&mut source)?;
-    crate::stream::stream_stored(&mut source, budget, visit, members)
+    let regions = stream_offsets(&mut source)?;
+    super::volumes::walk_regions(
+        &mut source,
+        regions,
+        super::volumes::Mode::Raw,
+        budget,
+        visit,
+    )
 }
 
 /// Parse the GPT/APM/MBR table (tiny, near the start) via targeted reads and

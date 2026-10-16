@@ -4,7 +4,7 @@
 
 use std::f64::consts::TAU;
 
-use super::curves::{de_boor, segments, SEGMENTS_PER_TURN};
+use super::curves::{segments, SEGMENTS_PER_TURN};
 use super::math::{add, any_perpendicular, cross, dot, len, scale, sub, unit, Xf, V2, V3};
 use super::profiles::Profile;
 use super::step::Value;
@@ -23,13 +23,6 @@ fn rotate(p: V3, a: V3, d: V3, t: f64) -> V3 {
         scale(d, dot(d, v) * (1.0 - c)),
     );
     add(a, r)
-}
-
-/// The angle `a`, a whole number of turns off, within half a turn of `prev`.
-/// In one step: turns added one at a time take as many steps as the polyline
-/// has wound, which a long spiral makes quadratic.
-fn continuous(a: f64, prev: f64) -> f64 {
-    a - TAU * ((a - prev) / TAU).round()
 }
 
 /// Loops of an area in order: the outer one, then the holes.
@@ -162,7 +155,7 @@ pub fn prism(areas: &[(Vec<V2>, Vec<Vec<V2>>)], z0: f64, z1: f64) -> Option<Mesh
 }
 
 impl<'a> Reader<'a> {
-    fn budget(&self, n: usize) -> Option<()> {
+    pub(super) fn budget(&self, n: usize) -> Option<()> {
         (n <= MAX_ITEM_TRIANGLES && n <= self.work).then_some(())
     }
 
@@ -273,7 +266,7 @@ impl<'a> Reader<'a> {
     /// `IfcSweptDiskSolid`: a circle (with a hole for `InnerRadius`) along
     /// the directrix, its frame carried without twist.
     pub fn swept_disk(&mut self, p: &[Value], depth: u32) -> Option<Mesh> {
-        let path = self.curve(p.first()?.id()?, depth + 1)?;
+        let path = self.directrix(p.first()?.id()?, p.get(3), p.get(4), depth)?;
         let r = p.get(1)?.num().filter(|r| *r > 0.0 && r.is_finite())?;
         let inner = p
             .get(2)
@@ -307,7 +300,7 @@ impl<'a> Reader<'a> {
     pub fn swept_area(&mut self, ty: &[u8], p: &[Value], depth: u32) -> Option<Mesh> {
         let profile = self.profile(p.first()?.id()?, depth + 1)?;
         let pos = self.axis2_or_identity(p.get(1))?;
-        let path = self.curve(p.get(2)?.id()?, depth + 1)?;
+        let path = self.directrix(p.get(2)?.id()?, p.get(3), p.get(4), depth)?;
         let frames = match ty {
             b"IFCSURFACECURVESWEPTAREASOLID" => {
                 let s = p.get(5)?.id()?;
@@ -553,6 +546,7 @@ impl<'a> Reader<'a> {
                     }
                     b"IFCEDGELOOP" => {
                         let Some(pts) = self.edge_loop(&lpp, depth) else {
+                            self.warnings.invalid = self.warnings.invalid.saturating_add(1);
                             continue;
                         };
                         let base = m.p.len() as u32;
@@ -582,8 +576,16 @@ impl<'a> Reader<'a> {
 
     /// The points of an `IfcEdgeLoop`, each edge's curve sampled between
     /// its vertices.
-    fn edge_loop(&mut self, p: &[Value], depth: u32) -> Option<Vec<V3>> {
+    pub(super) fn edge_loop(&mut self, p: &[Value], depth: u32) -> Option<Vec<V3>> {
+        self.edge_loop_checked(p, depth).map(|(pts, _)| pts)
+    }
+
+    /// [`edge_loop`](Self::edge_loop), and whether each edge starts where
+    /// the one before it ends and the last ends where the first starts
+    /// (some writers flag the edges of a loop the wrong way round).
+    pub(super) fn edge_loop_checked(&mut self, p: &[Value], depth: u32) -> Option<(Vec<V3>, bool)> {
         let mut out: Vec<V3> = Vec::new();
+        let mut connected = true;
         for oe in p.first()?.list()?.iter().filter_map(Value::id) {
             let (oty, op) = self.get(oe)?;
             let (edge, forward) = if oty == b"IFCORIENTEDEDGE" {
@@ -614,199 +616,21 @@ impl<'a> Reader<'a> {
             }
             let tol = 1e-9 * (1.0 + len(pts[0]));
             let skip = out.last().is_some_and(|l| len(sub(*l, pts[0])) <= tol);
+            if let Some(l) = out.last() {
+                connected &= len(sub(*l, pts[0])) <= 1e-6 * (1.0 + len(pts[0]));
+            }
+            // Points are charged as they are made: a loop that lists the
+            // same long edge many times is not free.
+            self.charge(pts.len() / 8 + 1)?;
             out.extend(pts.into_iter().skip(skip as usize));
+        }
+        if let (Some(first), Some(last)) = (out.first(), out.last()) {
+            connected &= len(sub(*first, *last)) <= 1e-6 * (1.0 + len(*first));
         }
         while out.len() > 1 && len(sub(out[0], out[out.len() - 1])) <= 1e-9 * (1.0 + len(out[0])) {
             out.pop();
         }
-        (out.len() >= 3).then_some(out)
-    }
-
-    /// A face on a curved surface: a B-spline surface tessellated over its
-    /// whole domain (its bounds are taken to be its natural edges), a
-    /// cylinder's face triangulated around its axis. `None` for a plane and
-    /// what is not handled, which the caller draws from the face's loops.
-    fn surface_face(&mut self, p: &[Value], depth: u32) -> Option<Mesh> {
-        let sid = p.get(1)?.id()?;
-        let (sty, sp) = self.get(sid)?;
-        match sty {
-            b"IFCBSPLINESURFACEWITHKNOTS" | b"IFCRATIONALBSPLINESURFACEWITHKNOTS" => {
-                let mut m = self.bspline_surface(&sp)?;
-                if p.get(2).and_then(Value::boolean) == Some(false) {
-                    for t in &mut m.t {
-                        t.swap(1, 2);
-                    }
-                }
-                Some(m)
-            }
-            b"IFCCYLINDRICALSURFACE" => {
-                let pos = self.axis2(sp.first()?.id()?)?;
-                let inv = pos.inverse()?;
-                let bounds = p.first()?.list()?;
-                let mut lps: Vec<Vec<V3>> = Vec::new();
-                for b in bounds.iter().filter_map(Value::id) {
-                    let bp = self.f.params(b)?;
-                    let (lty, lp) = self.get(bp.first()?.id()?)?;
-                    if lty != b"IFCEDGELOOP" {
-                        return None;
-                    }
-                    let mut pts = self.edge_loop(&lp, depth)?;
-                    if bp.get(1).and_then(Value::boolean) == Some(false) {
-                        pts.reverse();
-                    }
-                    lps.push(pts);
-                }
-                // Unrolled: (angle, height), the angle kept continuous.
-                let mut flat: Vec<V2> = Vec::new();
-                let mut world: Vec<V3> = Vec::new();
-                let mut idx: Vec<Vec<u32>> = Vec::new();
-                for l in &lps {
-                    let mut ring = Vec::with_capacity(l.len());
-                    let mut prev: Option<f64> = None;
-                    for &q in l {
-                        let lq = inv.point(q);
-                        let mut a = lq[1].atan2(lq[0]);
-                        if let Some(pa) = prev {
-                            a = continuous(a, pa);
-                        }
-                        prev = Some(a);
-                        flat.push([a, lq[2]]);
-                        world.push(q);
-                        ring.push((world.len() - 1) as u32);
-                    }
-                    idx.push(ring);
-                }
-                let first = idx.first()?;
-                let mut m = Mesh {
-                    p: world,
-                    t: triangulate(&flat, first, &idx[1..]),
-                };
-                // Facing out of the cylinder unless the face says otherwise.
-                let outward = p.get(2).and_then(Value::boolean).unwrap_or(true);
-                if let Some(t) = m.t.first() {
-                    let (a, b, c) = (m.p[t[0] as usize], m.p[t[1] as usize], m.p[t[2] as usize]);
-                    let n = cross(sub(b, a), sub(c, a));
-                    let radial = sub(a, pos.point([0.0, 0.0, inv.point(a)[2]]));
-                    if (dot(n, radial) > 0.0) != outward {
-                        for t in &mut m.t {
-                            t.swap(1, 2);
-                        }
-                    }
-                }
-                Some(m)
-            }
-            b"IFCPLANE" => None,
-            _ => {
-                self.unsupported(sty);
-                None
-            }
-        }
-    }
-
-    fn bspline_surface(&mut self, p: &[Value]) -> Option<Mesh> {
-        let du = usize::try_from(p.first()?.int()?)
-            .ok()
-            .filter(|d| (1..=16).contains(d))?;
-        let dv = usize::try_from(p.get(1)?.int()?)
-            .ok()
-            .filter(|d| (1..=16).contains(d))?;
-        let rows: Vec<Vec<V3>> = p
-            .get(2)?
-            .list()?
-            .iter()
-            .map(|r| self.points(Some(r)))
-            .collect::<Option<_>>()?;
-        let (nu, nv) = (rows.len(), rows.first()?.len());
-        if rows.iter().any(|r| r.len() != nv) || nu <= du || nv <= dv {
-            return None;
-        }
-        let knots = |m: &Value, k: &Value, n: usize, d: usize| -> Option<Vec<f64>> {
-            let mults: Vec<usize> = m
-                .list()?
-                .iter()
-                .map(|x| usize::try_from(x.int()?).ok())
-                .collect::<Option<_>>()?;
-            let ks: Vec<f64> = k.list()?.iter().map(Value::num).collect::<Option<_>>()?;
-            let total = mults.iter().try_fold(0usize, |a, &x| a.checked_add(x))?;
-            if mults.len() != ks.len() || total > n + 3 * d + 1 {
-                return None;
-            }
-            let u: Vec<f64> = ks
-                .iter()
-                .zip(&mults)
-                .flat_map(|(k, &m)| std::iter::repeat_n(*k, m))
-                .collect();
-            (u.len() > n + d && u.windows(2).all(|w| w[1] >= w[0])).then_some(u)
-        };
-        let ku = knots(p.get(7)?, p.get(9)?, nu, du)?;
-        let kv = knots(p.get(8)?, p.get(10)?, nv, dv)?;
-        let weights: Option<Vec<Vec<f64>>> = match p.get(12) {
-            Some(w) => Some(
-                w.list()?
-                    .iter()
-                    .map(|r| {
-                        r.list()?
-                            .iter()
-                            .map(Value::num)
-                            .collect::<Option<Vec<f64>>>()
-                    })
-                    .collect::<Option<_>>()?,
-            ),
-            None => None,
-        };
-        if weights.as_ref().is_some_and(|w| {
-            w.len() != nu
-                || w.iter()
-                    .any(|r| r.len() != nv || r.iter().any(|x| *x <= 0.0))
-        }) {
-            return None;
-        }
-        let (su, sv) = ((nu * 4).clamp(4, 64), (nv * 4).clamp(4, 64));
-        self.budget(su * sv * 2)?;
-        let (u0, u1, v0, v1) = (ku[du], ku[nu], kv[dv], kv[nv]);
-        if !(u1 > u0 && v1 > v0) {
-            return None;
-        }
-        let mut m = Mesh::default();
-        for i in 0..=su {
-            let u = u0 + (u1 - u0) * i as f64 / su as f64;
-            // Each column of control points evaluated at u, then the curve
-            // through them at each v (weights carried homogeneously).
-            let mut col: Vec<V3> = Vec::with_capacity(nv);
-            let mut colw: Vec<f64> = Vec::with_capacity(nv);
-            for j in 0..nv {
-                let ctrl: Vec<V3> = rows.iter().map(|r| r[j]).collect();
-                let w: Option<Vec<f64>> =
-                    weights.as_ref().map(|w| w.iter().map(|r| r[j]).collect());
-                let pt = de_boor(du, &ctrl, w.as_deref(), &ku, u)?;
-                let wt = match &w {
-                    Some(w) => de_boor(
-                        du,
-                        &w.iter().map(|x| [*x, 0.0, 0.0]).collect::<Vec<_>>(),
-                        None,
-                        &ku,
-                        u,
-                    )?[0],
-                    None => 1.0,
-                };
-                col.push(pt);
-                colw.push(wt);
-            }
-            for k in 0..=sv {
-                let v = v0 + (v1 - v0) * k as f64 / sv as f64;
-                let w = weights.as_ref().map(|_| colw.as_slice());
-                m.p.push(de_boor(dv, &col, w, &kv, v)?);
-            }
-        }
-        let stride = (sv + 1) as u32;
-        for i in 0..su as u32 {
-            for k in 0..sv as u32 {
-                let a = i * stride + k;
-                m.t.push([a, a + stride, a + stride + 1]);
-                m.t.push([a, a + stride + 1, a + 1]);
-            }
-        }
-        Some(m)
+        (out.len() >= 3).then_some((out, connected))
     }
 
     /// `IfcCurveBoundedPlane`: boundaries in the plane's (u, v).
@@ -1010,25 +834,6 @@ fn between(c: &[V3], a: V3, b: V3, same: bool) -> Vec<V3> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The angle is brought next to the previous one by whole turns, however
-    /// far apart they are: adding a turn at a time took a billion steps for
-    /// a polyline wound a billion times.
-    #[test]
-    fn an_angle_is_unrolled_in_one_step_however_far_the_previous_one_is() {
-        use std::f64::consts::PI;
-        assert!((continuous(0.5, 0.5) - 0.5).abs() < 1e-12);
-        assert!((continuous(3.0, -3.0) - (3.0 - TAU)).abs() < 1e-12);
-        assert!((continuous(-3.0, 3.0) - (-3.0 + TAU)).abs() < 1e-12);
-        for prev in [0.0, 7.0, -40.0, 1.0e6, -1.0e12] {
-            for a in [-PI, -1.0, 0.0, 2.5, PI] {
-                let c = continuous(a, prev);
-                assert!((c - prev).abs() <= PI + 1e-6, "{a} next to {prev} gave {c}");
-                let turns = (c - a) / TAU;
-                assert!((turns - turns.round()).abs() < 1e-3, "{a} became {c}");
-            }
-        }
-    }
 
     #[test]
     fn an_extruded_square_with_a_hole() {

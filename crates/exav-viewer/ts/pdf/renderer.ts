@@ -1,4 +1,6 @@
-import type { FileSource, Renderer, SourceReader } from "../core/types.js";
+import { planRect } from "../core/pictures.js";
+import { createPictures } from "../core/raster.js";
+import type { FileSource, RasterRect, Renderer, SourceReader } from "../core/types.js";
 import { createPdfEngine, type LoadedPdf } from "./engine.js";
 import type { PdfOptions } from "./index.js";
 import { createReader, READER_DEFAULTS } from "./reader.js";
@@ -23,6 +25,7 @@ export const renderer: Renderer<PdfOptions> = {
       const streamed = !!given && "url" in given && !given.init;
       const source =
         given && "ranges" in given ? { ranges: given.ranges, onError: fail } : streamed ? { url: await reader.url() } : { data: await reader.bytes() };
+      if (reader === ctx.source) ctx.status({ phase: "loading", step: "read" });
       const doc = await engine.open(source, signal);
       if (signal.aborted) {
         doc.destroy();
@@ -57,9 +60,34 @@ export const renderer: Renderer<PdfOptions> = {
         ctx.status({ phase: "error", error: { code: "pdf", cause: error } });
       },
     );
+    const { controller: pictures, state: count } = createPictures({
+      count: current.doc.numPages,
+      space: "page",
+      async raster(page, options) {
+        const { doc, sizes } = current;
+        const size = sizes[page - 1]!;
+        const view = reader.viewport.get();
+        const here = view && view.space === "page" && view.page === page ? (view.region as RasterRect) : null;
+        const plan = planRect(options, { x: 0, y: 0, width: 1, height: 1 }, { x: size.width, y: size.height }, here);
+        try {
+          const bitmap = await doc.renderPageRegion(page, {
+            width: plan.width,
+            height: plan.height,
+            region: plan.region,
+            background: plan.background === "transparent" ? "rgba(0,0,0,0)" : plan.background,
+            signal: options.signal,
+          });
+          return { bitmap, width: plan.width, height: plan.height, page, space: "page", region: plan.region };
+        } catch (error) {
+          // Replaced or closed meanwhile, or a page pdf.js cannot draw.
+          if (doc === current.doc && !options.signal?.aborted) console.warn("pdf: could not draw a picture of a page", error);
+          throw error;
+        }
+      },
+    });
     ctx.status({ phase: "ready" });
     return {
-      controllers: { pages: reader.pages, zoom: reader.zoom, drag: reader.drag, outline: reader.outline },
+      controllers: { pages: reader.pages, zoom: reader.zoom, drag: reader.drag, outline: reader.outline, pictures, viewport: reader.viewport },
       resize: reader.resize,
       // The same document with other bytes (a report's preview after an
       // option changed): the zoom and scroll position stay.
@@ -68,6 +96,7 @@ export const renderer: Renderer<PdfOptions> = {
         const old = current;
         current = incoming;
         reader.replace(incoming.shown, incoming.sizes);
+        count.set({ count: incoming.doc.numPages, space: "page" });
         old.doc.destroy();
       },
       destroy() {

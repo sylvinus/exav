@@ -25,8 +25,30 @@ const ERROR_CODES: Record<string, ViewerError["code"]> = {
   xlsx: "office",
   pptx: "office",
   csv: "office",
+  rtf: "office",
+  doc: "office",
+  odt: "office",
+  ppt: "office",
+  odp: "office",
+  keynote: "office",
+  xls: "office",
+  ods: "office",
+  numbers: "office",
+  odg: "office",
+  visio: "office",
+  coreldraw: "office",
+  publisher: "office",
+  pagemaker: "office",
+  freehand: "office",
+  quarkxpress: "office",
+  zonerdraw: "office",
+  wpg: "office",
+  text: "text",
   ifc: "model",
   stl: "model",
+  obj: "model",
+  ply: "model",
+  gltf: "model",
   video: "media",
   audio: "media",
   archive: "archive",
@@ -104,6 +126,13 @@ export function createViewer(config: ViewerConfig): Viewer {
 
     if (plugin && doc.reader) {
       const first = doc;
+      // The file's bytes arriving, while the plugin says nothing more precise.
+      const stopFileProgress = first.reader!.progress.subscribe((p) => {
+        const s = status.get();
+        if (ended || !p || s.phase !== "loading" || s.label !== undefined || (s.step !== undefined && s.step !== "file")) return;
+        status.set(p.total !== null && p.loaded >= p.total ? { phase: "loading" } : { phase: "loading", step: "file", ...(p.total ? { progress: Math.min(1, p.loaded / p.total) } : {}) });
+      });
+      first.abort.signal.addEventListener("abort", stopFileProgress, { once: true });
       void (async () => {
         try {
           const renderer = await load(plugin);
@@ -127,8 +156,11 @@ export function createViewer(config: ViewerConfig): Viewer {
               const stops: (() => void)[] = [];
               if (options?.forward) {
                 forwarding = true;
+                // What the nested session loads is, here, the drawing of the result.
                 const follow = () => {
-                  if (!ended) status.set(s.status.get());
+                  if (ended) return;
+                  const n = s.status.get();
+                  status.set(n.phase === "loading" ? { phase: "loading", step: "render", ...(n.label !== undefined && { label: n.label }) } : n);
                 };
                 const mirror = () => {
                   if (!ended) controllers.set(s.controllers.get());

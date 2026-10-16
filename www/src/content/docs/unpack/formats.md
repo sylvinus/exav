@@ -13,7 +13,8 @@ format, and how it reports such content, is on the scanner's
 [Supported formats](/scanner/reference/formats/) page.
 
 Each format is a Cargo feature; see [the crate's features](/unpack/rust/#features)
-to build a subset.
+to build a subset. The [format matrix](/project/formats/) puts what the
+scanner, the extractor and the viewer do with each format side by side.
 
 ## Archives
 

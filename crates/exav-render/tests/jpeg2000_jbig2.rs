@@ -560,6 +560,31 @@ fn a_jbig2_region_larger_than_the_budget_is_refused() {
     );
 }
 
+/// A region's pixels cost time, a few seconds for the half billion that
+/// [`DECODE_MAX`] allows a file and as many again for each further half: the
+/// bound is the same through the PDF decoder, whatever memory it is given
+/// (the viewer gives it a gigabyte).
+#[test]
+fn a_jbig2_stream_declaring_more_region_pixels_than_a_file_may_is_refused_at_any_budget() {
+    // 23,171 squared is just over 2^29.
+    let embedded: Vec<u8> = page_with_a_region(23_171)
+        .iter()
+        .flat_map(|(h, d)| [&h[..], &d[..]].concat())
+        .collect();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        decode_jbig2(&embedded, 120, 64, None, 1 << 40).map_err(|e| e.message()),
+        Err("Image too large")
+    );
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    // Just under it is decoded.
+    let embedded: Vec<u8> = page_with_a_region(1024)
+        .iter()
+        .flat_map(|(h, d)| [&h[..], &d[..]].concat())
+        .collect();
+    assert!(decode_jbig2(&embedded, 120, 64, None, 1 << 40).is_ok());
+}
+
 #[test]
 fn every_ccitt_mode_gives_back_the_encoded_picture() {
     let want = bilevel();

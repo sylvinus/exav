@@ -30,6 +30,24 @@ So we are deliberate about what we pull in.
    - **YARA** (`yara`, on by default) — see the outlier note below.
    - **HTTP(S) range scanning** (`http`, off by default) — the only feature that
      links a TLS stack (`ureq → rustls → ring`).
+   - **Visible text** (`visible-text` in `exav-core` and `exav`, `text` in
+     `exav-grep`, on by default) — the text a reader sees in Markdown
+     (pulldown-cmark, `forbid(unsafe_code)` as built), HTML (html5gum's
+     tokenizer alone: `forbid(unsafe_code)`, no dependency), XML parts (quick-xml, already
+     in) and drawings (exav-render's model, already in). No C.
+   - **Office formats** (exav-render's `office-sheets`, `office-slides`,
+     `office-docs`, off by default; `visible-text-office` and `text-office` add
+     their text) — `zip`, `quick-xml`, `encoding_rs`, `md-5` and `sha1`
+     (Numbers and iWork) and what they pull in: 21 more crates than the
+     default `exav-render` tree (`cargo tree -p exav-render --features
+     office`). The viewer builds them for the browser; the scanner reads them
+     only when `visible-text-office` is on.
+   - **PDF text** (`visible-text-pdf`, `text-pdf`, off by default) — hayro. Its
+     `hayro-interpret` turns on `hayro-syntax`'s `unsafe` feature itself, which
+     switches every `flate2` to zlib-rs and adds SIMD to the image decoders, and
+     adds some 40 crates. It is built without the predefined CJK CMaps so that
+     `brotli` stays out. Making it a default means patching hayro-interpret
+     (vendoring it, as `zenjxl-decoder` is for the viewer).
 
 4. **Prefer pure-Rust, and keep the tree pruned.** The default build links no C
    and no native JIT. Concretely:

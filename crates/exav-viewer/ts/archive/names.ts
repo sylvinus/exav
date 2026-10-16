@@ -38,6 +38,15 @@ export function decompressedName(name: string, fallback: string): string {
   return fallback;
 }
 
+/**
+ * A member's name as the list shows it: relative. A disk image (dmg) and a
+ * help file (chm) name their members from a root, `/docs/index.html`, which
+ * would read as a folder called "" in the tree.
+ */
+export function memberPath(name: string): string {
+  return name.replace(/^[/\\]+/, "");
+}
+
 /** The folder part of a member's name, or "". */
 export function folderOf(name: string): string {
   const i = name.lastIndexOf("/");

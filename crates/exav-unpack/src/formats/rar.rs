@@ -164,7 +164,7 @@ fn rar4_decrypt_member(
         None => rar3_crypt::candidates(&budget.passwords),
     };
     for pw in tries {
-        let Some(keys) = crypt.keys.get(&pw, &salt) else {
+        let Some(keys) = crypt.keys.get(&pw, &salt, &budget.rar3_derivations) else {
             break; // no more derivations: the member stays encrypted
         };
         let mut buf = raw.to_vec();
@@ -234,7 +234,7 @@ fn rar4_open_headers(
         let mut blocks = 0;
         while q < data.len() {
             let salt: [u8; 8] = crate::bytes::at(data, q, 8)?.try_into().ok()?;
-            let keys = crypt.keys.get(&pw, &salt)?;
+            let keys = crypt.keys.get(&pw, &salt, &budget.rar3_derivations)?;
             let mut first = data.get(q + 8..q + 24)?.to_vec();
             rar3_crypt::decrypt(&keys, &mut first);
             let head_size = usize::from(u16::from_le_bytes([first[5], first[6]]));
@@ -883,7 +883,7 @@ fn rar5_decrypt_member(
     if raw.len() as u64 > budget.limits.max_buffer_bytes {
         return None;
     }
-    let k = rar5_crypt::find_keys(&rec, &budget.passwords, keys)?;
+    let k = rar5_crypt::find_keys(&rec, &budget.passwords, keys, &budget.kdf_rounds)?;
     let mut buf = raw.to_vec();
     rar5_crypt::decrypt(&k.key, &rec.iv, &mut buf);
     Some((buf, rec.tweaked.then_some(k.hash_key)))
@@ -913,7 +913,7 @@ fn rar5_open_headers(
     budget: &Budget,
     keys: &mut KeyCache,
 ) -> Option<Vec<u8>> {
-    let k = rar5_crypt::find_keys(rec, &budget.passwords, keys)?;
+    let k = rar5_crypt::find_keys(rec, &budget.passwords, keys, &budget.kdf_rounds)?;
     let mut plain = data.get(..start)?.to_vec();
     let mut headers = 0;
     while p < data.len() {

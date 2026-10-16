@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www test-helm wasm-sizes lint fmt msrv av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www test-formats formats test-helm wasm-sizes lint fmt msrv av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -71,7 +71,32 @@ test-native:
 	$(CARGO) test -p exav-render --no-default-features --features dwg
 	# IFC and STL, behind `ifc` and `stl`, as @exav/viewer's model module
 	# builds them.
-	$(CARGO) test -p exav-render --no-default-features --features ifc,stl
+	$(CARGO) test -p exav-render --no-default-features --features ifc,stl,obj,ply,gltf
+	# Markdown, behind `markdown`, as @exav/viewer's text module builds it.
+	$(CARGO) test -p exav-render --no-default-features --features markdown
+	# The office converters (spreadsheets, presentations, text documents),
+	# behind `office-*`, as @exav/viewer's sheets, slides and docs modules
+	# build them: each alone, since slides compile part of sheets, then all
+	# of them with the test writers the integration tests build documents with.
+	$(CARGO) test -p exav-render --no-default-features --features office-sheets
+	$(CARGO) test -p exav-render --no-default-features --features office-slides,office-test-util
+	$(CARGO) test -p exav-render --no-default-features --features office-docs,office-test-util
+	$(CARGO) test -p exav-render --no-default-features --features office,office-test-util
+	# The text a reader sees, behind `text` (HTML, Office XML parts, drawings)
+	# and `text-pdf` (PDF, through hayro, which switches flate2 to zlib-rs: its
+	# own pass, so that the default passes do not run with it).
+	$(CARGO) test -p exav-unpack --features text
+	$(CARGO) test -p exav-render --no-default-features --features text
+	$(CARGO) test -p exav-unpack --features text-pdf --test all text::
+	$(CARGO) test -p exav-render --no-default-features --features text-pdf
+	$(CARGO) test -p exav-core --features visible-text-pdf --test all visible_text
+	$(CARGO) test -p exav-grep --features text-pdf --test text
+	# The office formats' text (DOC, XLS, PPT, RTF, flat OpenDocument, iWork...),
+	# behind `text-office`.
+	$(CARGO) test -p exav-render --no-default-features --features text-office,office-test-util
+	$(CARGO) test -p exav-core --features visible-text-office --test all visible_text
+	$(CARGO) test -p exav-grep --features text-office --test text --test text_office
+	$(CARGO) test -p exav --features visible-text-office --test office_text
 
 ## test-yara-diff: the yara-x A/B differential harness. Compiles the SAME rules
 ##                 with both engines and asserts equal matching-rule sets. NOT
@@ -119,6 +144,19 @@ test-viewer:
 test-www:
 	./scripts/test-www.sh
 
+## formats: write the pages generated from the format registry
+##          (formats/registry.json): the format matrix and the viewer's
+##          summary sentence in the READMEs and the site.
+formats:
+	node scripts/formats.mjs generate
+
+## test-formats: the format registry against the extractor's formats, the
+##               scanner's file types, the viewer's plugins, and the pages
+##               generated from it (test-www runs it too; the viewer's and the
+##               scanner's own registry tests are in test-viewer and test-native).
+test-formats:
+	node scripts/formats.mjs check
+
 ## test-helm: render-check the Helm chart (render guards, hardening settings,
 ##            packaging). Needs `helm` on PATH, no cluster. CI runs `ct lint`
 ##            in addition. See scripts/test-helm.sh.
@@ -141,7 +179,18 @@ lint:
 	$(CARGO) clippy --all-targets --features exav-core/http -- -D warnings
 	$(CARGO) clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
 	$(CARGO) clippy -p exav-render --all-targets --features dwg -- -D warnings
-	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features ifc,stl,obj,ply,gltf -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features markdown -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features text-pdf -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office-sheets -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office-slides -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office-docs -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features office,office-test-util -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features -- -D warnings
+	$(CARGO) clippy -p exav-render --all-targets --no-default-features --features text-office,office-test-util -- -D warnings
+	$(CARGO) clippy -p exav-core --all-targets --features visible-text-office -- -D warnings
+	$(CARGO) clippy -p exav-grep --all-targets --features text-office -- -D warnings
+	$(CARGO) clippy -p exav-unpack --all-targets --features text-pdf -- -D warnings
 
 ## fmt: format the code
 fmt:

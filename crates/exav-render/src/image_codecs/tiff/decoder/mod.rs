@@ -11,7 +11,9 @@ use crate::image_codecs::tiff::{
     bytecast, ColorType, Directory, TiffError, TiffFormatError, TiffResult, TiffUnsupportedError,
     UsageError,
 };
-use half::f16;
+// exav: an f16 sample's bits, in place of `half::f16`.
+#[allow(non_camel_case_types)]
+type f16 = u16;
 
 use self::image::Image;
 use self::stream::{ByteOrder, EndianReader};
@@ -102,7 +104,7 @@ impl DecodingResult {
         if size > limits.decoding_buffer_size / std::mem::size_of::<u16>() {
             Err(TiffError::LimitsExceeded)
         } else {
-            Ok(DecodingResult::F16(vec![f16::ZERO; size]))
+            Ok(DecodingResult::F16(vec![0; size]))
         }
     }
 

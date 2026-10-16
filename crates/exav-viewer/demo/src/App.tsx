@@ -1,16 +1,44 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 
-import type { ViewerFile } from "@exav/viewer";
+import { BUILTIN_ORDER, type Session, type ViewerFile } from "@exav/viewer";
 import { allPlugins } from "@exav/viewer/all";
+import {
+  coreldraw,
+  doc,
+  freehand,
+  keynote,
+  numbers,
+  odg,
+  odp,
+  ods,
+  odt,
+  pagemaker,
+  ppt,
+  publisher,
+  quarkxpress,
+  rtf,
+  visio,
+  wpg,
+  xls,
+  zonerdraw,
+} from "@exav/viewer/office";
 import { ViewerBody, ViewerProvider } from "@exav/viewer/react";
 import { SandboxedViewerProvider } from "@exav/viewer/react/sandbox";
 
-import { GROUPS, type Sample } from "./showcase.js";
+import { ExportImage } from "./ExportImage.js";
+import { credit, GROUPS, type Example, type Sample } from "./showcase.js";
 
 type Locale = "en" | "fr";
 
 /** A file in the list, shown by its name. */
 type Item = ViewerFile;
+
+/** A sample or an example in the sidebar: its section, and who made it, under what licence. */
+interface Listed {
+  group: string;
+  note: string;
+  item: Item;
+}
 
 const TEXT = {
   en: {
@@ -21,7 +49,7 @@ const TEXT = {
     docs: "Documentation",
     licences: "Licences",
     upload: "Drop files here, or click to choose",
-    formats: "PDF, images, DWG and DXF drawings, Word, Excel, PowerPoint, CSV, IFC and STL models, video, audio and archives. Or pick a sample on the left.",
+    formats: "PDF, images, DWG and DXF drawings, Word, Excel, PowerPoint, CSV, text, Markdown, JSON and XML, IFC, STL, OBJ, PLY and glTF models, video, audio and archives. Or pick a sample on the left.",
   },
   fr: {
     tagline: "Des fichiers affichés dans le navigateur. Rien de ce que vous ouvrez ici ne quitte votre appareil.",
@@ -31,7 +59,7 @@ const TEXT = {
     docs: "Documentation",
     licences: "Licences",
     upload: "Déposez des fichiers ici, ou cliquez pour les choisir",
-    formats: "PDF, images, plans DWG et DXF, Word, Excel, PowerPoint, CSV, maquettes IFC et STL, vidéo, audio et archives. Ou choisissez un exemple à gauche.",
+    formats: "PDF, images, plans DWG et DXF, Word, Excel, PowerPoint, CSV, texte, Markdown, JSON et XML, maquettes IFC, STL, OBJ, PLY et glTF, vidéo, audio et archives. Ou choisissez un exemple à gauche.",
   },
 } satisfies Record<Locale, Record<string, string>>;
 
@@ -47,20 +75,53 @@ const IN_PAGE = QUERY.get("mode") === "page";
 
 /** Where the demo is deployed (vite.config.ts): the frame may show media and fetch from it. */
 declare const __DEMO_ORIGIN__: string;
+/** The external converter the demo was built with (`EXAV_EXTERNAL_CONVERTER`), or null. */
+declare const __EXTERNAL_CONVERTER__: string | null;
 
 /**
  * The frame's delivery per kind of file, defaults unless `?delivery=pdf:url,media:blob`
  * says otherwise (the browser tests).
  */
 const DELIVERY = Object.fromEntries((QUERY.get("delivery") ?? "").split(",").filter(Boolean).map((d) => d.split(":")));
+
+// Every format, the converted Office ones included: where no external
+// converter was copied in, a format only it reads ends in "needs_converter".
+/**
+ * `?converter=exav` or `?converter=external` (the browser tests): without
+ * it, text documents (DOC, ODT, RTF) go to the external converter when the
+ * demo has one, else to exav-render's `docs`.
+ */
+const CONVERTER = {
+  ...(QUERY.get("converter") === "exav" || QUERY.get("converter") === "external" ? { converter: QUERY.get("converter") as "exav" | "external" } : {}),
+  // `?timeoutMs=500&maxMemory=5000000` (the browser tests).
+  ...(QUERY.get("timeoutMs") ? { timeoutMs: Number(QUERY.get("timeoutMs")) } : {}),
+  ...(QUERY.get("maxMemory") ? { maxMemory: Number(QUERY.get("maxMemory")) } : {}),
+  // `?externalConverter=/e2e/fake-converter.js`: a converter by its URL (the browser tests).
+  ...(QUERY.get("externalConverter") || __EXTERNAL_CONVERTER__ ? { externalConverter: QUERY.get("externalConverter") ?? __EXTERNAL_CONVERTER__! } : {}),
+};
+
 const SANDBOX = {
   url: `${BASE}frame/index.html`,
+  options: { conversion: CONVERTER },
   origins: { media: [__DEMO_ORIGIN__], connect: [__DEMO_ORIGIN__] },
   delivery: DELIVERY,
+  formats: BUILTIN_ORDER,
 };
 
 /** `?url=<address>`: a file by its address, opened first. */
 const LINKED = QUERY.get("url");
+
+/** `?cad=monochrome`: drawings in ink, as plotted; `?rasterTile=64`: pictures drawn in small tiles (the browser tests). */
+const CAD = {
+  ...(QUERY.get("cad") === "monochrome" ? { monochrome: true } : {}),
+  ...(QUERY.get("rasterTile") ? { rasterTile: Number(QUERY.get("rasterTile")) } : {}),
+};
+
+/** `?rasterTile=64` and `?rasterSupersample=2`: the models' pictures drawn in small tiles, or supersampled (the browser tests). */
+const MODEL = {
+  ...(QUERY.get("rasterTile") ? { rasterTile: Number(QUERY.get("rasterTile")) } : {}),
+  ...(QUERY.get("rasterSupersample") ? { rasterSupersample: Number(QUERY.get("rasterSupersample")) } : {}),
+};
 
 /** The engines in the page (`?mode=page`), or each file in a sandboxed frame, the default. */
 function Provider({ plugins, locale, children }: { plugins: ReturnType<typeof allPlugins>; locale: Locale; children: ReactNode }) {
@@ -81,40 +142,71 @@ function initialLocale(): Locale {
   return navigator.language.toLowerCase().startsWith("fr") ? "fr" : "en";
 }
 
+/** Hands the viewer's session to the page around it, and takes it back when the file goes. */
+function SessionOut({ session, onSession }: { session: Session | null; onSession: (s: Session | null) => void }) {
+  useEffect(() => {
+    onSession(session);
+    return () => onSession(null);
+  }, [session, onSession]);
+  return null;
+}
+
 export function App() {
   const [locale, setLocale] = useState<Locale>(initialLocale);
   const [own, setOwn] = useState<Item[]>([]);
   // Nothing open until a file is chosen, unless the address names one.
   const [selected, setSelected] = useState<string | null>(() => (LINKED ? "linked" : QUERY.get("file")));
   const [dragging, setDragging] = useState(false);
+  // The session of the file on screen, for the host's controls beside its name.
+  const [session, setSession] = useState<Session | null>(null);
   const input = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
   const t = TEXT[locale];
 
   // One plugin list for the page: `ViewerProvider` starts a viewer per list.
-  const plugins = useMemo(() => allPlugins(), []);
-  // The sidebar's files, from showcase/samples.json (`npm run demo:showcase`);
-  // none when it was not copied in.
+  const plugins = useMemo(
+    () => [
+      ...allPlugins({ cad: CAD, ifc: MODEL, model: MODEL }),
+      ...[rtf(CONVERTER), doc(CONVERTER), odt(CONVERTER), ppt(CONVERTER), odp(CONVERTER), keynote(CONVERTER), xls(CONVERTER), ods(CONVERTER), numbers(CONVERTER)],
+      ...[odg(CONVERTER), visio(CONVERTER), coreldraw(CONVERTER), publisher(CONVERTER), pagemaker(CONVERTER), freehand(CONVERTER), quarkxpress(CONVERTER), zonerdraw(CONVERTER), wpg(CONVERTER)],
+    ],
+    [],
+  );
+  // The sidebar's files, from showcase/samples.json (`npm run demo:showcase`)
+  // and examples/examples.json (`npm run demo:examples`); none when they were
+  // not copied in. A file is fetched only when it is selected.
   const [samples, setSamples] = useState<Sample[]>([]);
+  const [examples, setExamples] = useState<Example[]>([]);
   useEffect(() => {
     fetch(`${BASE}showcase/samples.json`)
       .then((r) => (r.ok ? r.json() : { samples: [] }))
       .then((j: { samples: Sample[] }) => setSamples(j.samples))
       .catch(() => setSamples([]));
+    fetch(`${BASE}examples/examples.json`)
+      .then((r) => (r.ok ? r.json() : { examples: [] }))
+      .then((j: { examples: Example[] }) => setExamples(j.examples))
+      .catch(() => setExamples([]));
   }, []);
-  const showcase = useMemo(
-    () => samples.map((s): Item => ({ id: `showcase:${s.file}`, name: s.file, source: { url: `${BASE}showcase/${s.file}` } })),
-    [samples],
-  );
+  const showcase = useMemo((): Listed[] => {
+    // An example wins over a sample of the same file name.
+    const named = new Set(examples.map((e) => e.file));
+    return [
+      ...samples
+        .filter((s) => !named.has(s.file))
+        .map((s): Listed => ({ group: s.group, note: `${s.credit}. ${s.licence}`, item: { id: `showcase:${s.file}`, name: s.file, source: { url: `${BASE}showcase/${s.file}` } } })),
+      ...examples.map((e): Listed => ({ group: e.group, note: e.attribution || `${credit(e)}. ${e.licence}`, item: { id: `example:${e.file}`, name: e.file, source: { url: `${BASE}examples/${e.file}` } } })),
+    ];
+  }, [samples, examples]);
   // Known groups in their order, then any other, in the order they come.
-  const groups = useMemo(() => [...new Set([...Object.keys(GROUPS), ...samples.map((s) => s.group)])], [samples]);
+  const groups = useMemo(() => [...new Set([...Object.keys(GROUPS), ...showcase.map((l) => l.group)])], [showcase]);
   const linked = useMemo((): Item[] => {
     if (!LINKED) return [];
     const name = decodeURIComponent(new URL(LINKED, location.href).pathname.split("/").pop() || "file");
     return [{ id: "linked", name, source: { url: LINKED } }];
   }, []);
-  const items = useMemo(() => [...linked, ...own, ...showcase], [linked, own, showcase]);
+  const items = useMemo(() => [...linked, ...own, ...showcase.map((l) => l.item)], [linked, own, showcase]);
   const current = items.find((i) => i.id === selected) ?? null;
+  const note = showcase.find((l) => l.item.id === selected)?.note;
 
   useEffect(() => {
     document.documentElement.lang = locale;
@@ -154,9 +246,9 @@ export function App() {
     add(e.dataTransfer.files);
   };
 
-  const entry = (item: Item) => (
+  const entry = (item: Item, note?: string) => (
     <li key={item.id}>
-      <button type="button" className={`demo-file${item.id === selected ? " is-selected" : ""}`} aria-current={item.id === selected} onClick={() => setSelected(item.id)}>
+      <button type="button" className={`demo-file${item.id === selected ? " is-selected" : ""}`} aria-current={item.id === selected} title={note} onClick={() => setSelected(item.id)}>
         {item.name}
       </button>
     </li>
@@ -209,17 +301,16 @@ export function App() {
           {own.length > 0 && (
             <>
               <h2>{t.yours}</h2>
-              <ul>{own.map(entry)}</ul>
+              <ul>{own.map((item) => entry(item))}</ul>
             </>
           )}
           {groups.map((group) => {
-            // `showcase` follows `samples`' order.
-            const list = showcase.filter((_, i) => samples[i]!.group === group);
+            const list = showcase.filter((l) => l.group === group);
             return (
               list.length > 0 && (
                 <section key={group}>
                   <h2>{GROUPS[group]?.[locale] ?? group}</h2>
-                  <ul>{list.map(entry)}</ul>
+                  <ul>{list.map((l) => entry(l.item, l.note))}</ul>
                 </section>
               )
             );
@@ -229,12 +320,20 @@ export function App() {
           {current ? (
             <>
               <div className="demo-bar">
-                <h1>
-                  {current.name}
-                </h1>
+                <div className="demo-title">
+                  <h1>{current.name}</h1>
+                  <ExportImage session={session} name={current.name} />
+                </div>
+                {note && (
+                  <a className="demo-credit" href={`${BASE}licenses/README.txt`} title={note}>
+                    {note}
+                  </a>
+                )}
               </div>
               <div className="demo-frame">
-                <ViewerBody key={current.id} file={current} />
+                <ViewerBody key={current.id} file={current}>
+                  {({ session }) => <SessionOut session={session} onSession={setSession} />}
+                </ViewerBody>
               </div>
             </>
           ) : (

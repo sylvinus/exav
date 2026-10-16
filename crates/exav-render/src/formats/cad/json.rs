@@ -340,6 +340,7 @@ fn header(o: &mut Obj<'_>, h: &Header) {
     o.b("lwdisplay", h.lwdisplay);
     o.b("fillmode", h.fillmode);
     o.b("mirrtext", h.mirrtext);
+    o.i("xclipframe", h.xclipframe);
 }
 
 fn layer(o: &mut Obj<'_>, l: &Layer) {
@@ -401,6 +402,12 @@ fn dim_style(o: &mut Obj<'_>, d: &DimStyle) {
     o.f("dimtsz", d.dimtsz);
     o.f("dimtxt", d.dimtxt);
     o.f("dimgap", d.dimgap);
+    o.i("dimtad", d.dimtad);
+    o.i("dimzin", d.dimzin);
+    o.f("dimlfac", d.dimlfac);
+    o.i("dimdec", d.dimdec);
+    o.i("dimadec", d.dimadec);
+    o.i("dimdsep", d.dimdsep);
     o.color("dimclrd", d.dimclrd);
     o.color("dimclre", d.dimclre);
     o.color("dimclrt", d.dimclrt);
@@ -947,6 +954,26 @@ fn kind(o: &mut Obj<'_>, k: &EntityKind) {
             o.v3s("corners", &f.corners);
             o.i("invisible_edges", f.invisible_edges);
         }
+        EntityKind::Mesh(m) => {
+            o.v3s("vertices", &m.vertices);
+            o.list("faces", &m.faces, |s, f| {
+                s.push('[');
+                for (n, i) in f.iter().enumerate() {
+                    if n > 0 {
+                        s.push(',');
+                    }
+                    let _ = write!(s, "{i}");
+                }
+                s.push(']');
+            });
+        }
+        EntityKind::Tolerance(t) => {
+            o.v3("insertion", t.insertion);
+            o.v3("x_direction", t.x_direction);
+            o.v3("extrusion", t.extrusion);
+            o.str("text", &t.text);
+            o.str("dimstyle", &t.dimstyle);
+        }
         EntityKind::Text(t) => text(o, t),
         EntityKind::Attribute(a) | EntityKind::AttributeDefinition(a) => attribute(o, a),
         EntityKind::Insert(i) => {
@@ -960,6 +987,13 @@ fn kind(o: &mut Obj<'_>, k: &EntityKind) {
             o.f("row_spacing", i.row_spacing);
             o.v3("extrusion", i.extrusion);
             o.objects("attributes", &i.attributes, entity);
+            match &i.clip {
+                Some(c) => o.object("clip", |o| {
+                    o.v2s("boundary", &c.boundary);
+                    o.b("enabled", c.enabled);
+                }),
+                None => o.null("clip"),
+            }
         }
         EntityKind::MText(m) => mtext(o, m),
         EntityKind::Dimension(d) => {

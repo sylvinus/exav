@@ -4,8 +4,9 @@
 use std::f64::consts::TAU;
 
 /// Sagitta error target as a fraction of radius. 0.001 gives ~70 segments for a
-/// full circle, which holds up past the zoom levels a viewer reaches before
-/// re-tessellation would kick in.
+/// full circle. The curves that reach here are flattened once and never
+/// refined at a closer zoom; a circle, arc or bulge that nothing prevents is
+/// not flattened at all (see DESIGN.md).
 const SAGITTA_RATIO: f64 = 0.001;
 const MIN_SEGMENTS: usize = 8;
 const MAX_SEGMENTS: usize = 512;
@@ -29,6 +30,58 @@ fn ccw_sweep(sweep: f64) -> Option<f64> {
     }
     let s = sweep.rem_euclid(TAU);
     Some(if s > 0.0 { s } else { TAU })
+}
+
+/// The centre, radius and angles of the arc from `a` to `b` with this
+/// bulge: (cx, cy, r, start, signed sweep). None for a straight one.
+pub fn bulge_arc(a: [f64; 2], b: [f64; 2], bulge: f64) -> Option<(f64, f64, f64, f64, f64)> {
+    let chord = (b[0] - a[0]).hypot(b[1] - a[1]);
+    if bulge == 0.0 || !bulge.is_finite() || chord < 1e-12 {
+        return None;
+    }
+    let sweep = 4.0 * bulge.atan();
+    let r = chord / (2.0 * (sweep / 2.0).sin().abs());
+    // The centre lies off the chord's middle, to its left for a
+    // counter-clockwise arc under half a turn.
+    let (mx, my) = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0);
+    let (ux, uy) = ((b[0] - a[0]) / chord, (b[1] - a[1]) / chord);
+    let d = chord / 2.0 / (sweep / 2.0).tan();
+    let (cx, cy) = (mx - uy * d, my + ux * d);
+    let start = (a[1] - cy).atan2(a[0] - cx);
+    Some((cx, cy, r, start, sweep))
+}
+
+/// `n` + 1 points along the arc from `a` to `b` with this bulge.
+pub fn bulge_points(a: [f64; 2], b: [f64; 2], bulge: f64, n: usize) -> Vec<[f64; 2]> {
+    let Some((cx, cy, r, start, sweep)) = bulge_arc(a, b, bulge) else {
+        return vec![a, b];
+    };
+    let n = n.max(1);
+    let mut out: Vec<[f64; 2]> = (0..=n)
+        .map(|i| {
+            let t = start + sweep * i as f64 / n as f64;
+            [cx + r * t.cos(), cy + r * t.sin()]
+        })
+        .collect();
+    // The ends exactly where they were.
+    out[0] = a;
+    out[n] = b;
+    out
+}
+
+/// Sample a circular arc from `start` over a signed `sweep` (radians,
+/// positive counter-clockwise).
+pub fn arc_points(cx: f64, cy: f64, r: f64, start: f64, sweep: f64) -> Vec<[f64; 2]> {
+    if !r.is_finite() || r <= 0.0 || !sweep.is_finite() || !start.is_finite() {
+        return Vec::new();
+    }
+    let n = segments_for_sweep(sweep);
+    (0..=n)
+        .map(|i| {
+            let a = start + sweep * (i as f64 / n as f64);
+            [cx + r * a.cos(), cy + r * a.sin()]
+        })
+        .collect()
 }
 
 /// Sample a circular arc counter-clockwise from `start` to `end` (radians).
@@ -527,6 +580,25 @@ mod tests {
 
     fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
         ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn a_bulge_is_its_arc() {
+        let quarter = (PI / 8.0).tan();
+        // Counter-clockwise from (1,0) to (0,1): about the origin, radius 1.
+        let (cx, cy, r, start, sweep) = bulge_arc([1.0, 0.0], [0.0, 1.0], quarter).unwrap();
+        assert!(cx.abs() < 1e-12 && cy.abs() < 1e-12 && (r - 1.0).abs() < 1e-12);
+        assert!(start.abs() < 1e-12 && (sweep - PI / 2.0).abs() < 1e-12);
+        // Clockwise the other way round: about (1,1).
+        let (cx, cy, _, _, sweep) = bulge_arc([1.0, 0.0], [0.0, 1.0], -quarter).unwrap();
+        assert!((cx - 1.0).abs() < 1e-12 && (cy - 1.0).abs() < 1e-12 && sweep < 0.0);
+        // Three quarters of a turn: its middle point on the far side.
+        let pts = bulge_points([1.0, 0.0], [0.0, -1.0], (3.0 * PI / 8.0).tan(), 2);
+        assert!(
+            dist(pts[1], [-(0.5f64.sqrt()), 0.5f64.sqrt()]) < 1e-12,
+            "{pts:?}"
+        );
+        assert!(bulge_arc([1.0, 0.0], [0.0, 1.0], 0.0).is_none());
     }
 
     /// `f`'s result, or a failure if it has not returned within five seconds

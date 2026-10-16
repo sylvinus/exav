@@ -54,6 +54,7 @@ impl Seek for Flaky {
 }
 
 fuzz_target!(|input: &[u8]| {
+    exav_fuzz_support::panics::tolerate_inside(exav_fuzz_support::panics::CONTAINED);
     let [b0, b1, piece, fail, data @ ..] = input else {
         return;
     };

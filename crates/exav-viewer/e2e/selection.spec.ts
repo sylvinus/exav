@@ -19,9 +19,9 @@ const DOCS: Doc[] = [
     file: "report.pdf",
     line: "The north facade, the roof and the stairwell were inspected.",
     find: (root) => {
-      const run = root.locator(".exv-pdf-text span", { hasText: "The north facade" });
+      const run = root.locator(".exav-viewer-pdf-text span", { hasText: "The north facade" });
       // Laid out: its last element comes once every run is placed.
-      return { start: run, end: run, sheet: root.locator(".exv-pdf-page").first(), ready: root.locator(".exv-pdf-text-end").first() };
+      return { start: run, end: run, sheet: root.locator(".exav-viewer-pdf-page").first(), ready: root.locator(".exav-viewer-pdf-text-end").first() };
     },
   },
   {
@@ -51,7 +51,7 @@ for (const mode of ["sandbox", "page"] as const) {
     // What Chromium grants a page on a key press, which its headless mode does not.
     if (browserName === "chromium") await context.grantPermissions(["clipboard-write"]);
     await openSample(page, "quote.xlsx", mode === "page" ? { mode } : {});
-    await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
     await page.waitForTimeout(500);
     // Something else on the clipboard first: the browser keeps it from test to test.
     const paste = page.locator("#paste");
@@ -64,7 +64,7 @@ for (const mode of ["sandbox", "page"] as const) {
     await paste.selectText();
     await page.keyboard.press("ControlOrMeta+c");
     // From A1 to B3: past the row numbers and the column letters, then two columns across and three rows down.
-    const s = (await page.locator(".demo-frame .exv-surface").boundingBox())!;
+    const s = (await page.locator(".demo-frame .exav-viewer-surface").boundingBox())!;
     await page.mouse.move(s.x + 80, s.y + 35);
     await page.mouse.down();
     await page.mouse.move(s.x + 300, s.y + 80, { steps: 8 });
@@ -88,8 +88,8 @@ for (const doc of DOCS) {
     test.describe(`${doc.file}, ${mode}`, () => {
       async function open(page: Page) {
         await openSample(page, doc.file, mode === "page" ? { mode } : {});
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-        const root = mode === "sandbox" ? page.frameLocator(".demo-frame iframe.exv-sandbox") : page.locator(".demo-frame");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        const root = mode === "sandbox" ? page.frameLocator(".demo-frame iframe.exav-viewer-sandbox") : page.locator(".demo-frame");
         const found = doc.find(root);
         await expect(found.start).toHaveCount(1);
         await expect(found.ready).toBeAttached();

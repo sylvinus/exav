@@ -6,3 +6,5 @@
 /e2e/.out/
 # The demo's sample files, from github.com/sylvinus/exav-samples: `npm run demo:showcase`.
 /demo/public/showcase/
+# The demo's example files, from demo/examples/: `npm run demo:examples`.
+/demo/public/examples/

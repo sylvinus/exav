@@ -383,10 +383,7 @@ fn decompress(entry_type: u32, compressed: &[u8], expected_len: usize) -> Result
         ),
         // ULMO blocks are XZ-framed (stream magic FD 37 7A 58 5A 00).
         BLK_LZMA => crate::salvage(super::xz::XzReader::new(Cursor::new(compressed)), cap),
-        BLK_LZFSE => {
-            let mut decoder = lzfse_rust::LzfseRingDecoder::default();
-            crate::salvage(decoder.reader_bytes(compressed), cap)
-        }
+        BLK_LZFSE => super::lzfse::decode(compressed, cap),
         BLK_ADC => {
             return Ok(Run {
                 data: adc_decompress(compressed, expected_len),
@@ -461,7 +458,7 @@ fn parse_plist(xml: &str) -> Result<Vec<Partition>, LimitHit> {
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) => match e.name().as_ref() {
+            Ok(Event::Start(e)) => match e.name().as_ref().as_bytes() {
                 b"array" if last_key == "blkx" => {
                     in_blkx = true;
                 }
@@ -471,9 +468,8 @@ fn parse_plist(xml: &str) -> Result<Vec<Partition>, LimitHit> {
                 _ => {}
             },
             Ok(Event::Text(e)) => {
-                // quick-xml 0.41 replaced `BytesText::unescape()` with
-                // `xml10_content()` (decode + XML-1.0 entity unescape).
-                let text = e.xml10_content().unwrap_or_default();
+                // `xml10_content()` decodes and unescapes XML 1.0 entities.
+                let text = e.xml10_content();
                 let trimmed = text.trim();
                 if e.is_empty() || trimmed.is_empty() {
                     continue;
@@ -497,7 +493,7 @@ fn parse_plist(xml: &str) -> Result<Vec<Partition>, LimitHit> {
                 }
             }
             Ok(Event::End(e)) => {
-                if e.name().as_ref() == b"array" {
+                if e.name().as_ref() == "array" {
                     in_blkx = false;
                 }
             }
@@ -663,6 +659,36 @@ mod tests {
         let past = read_at(&mut d, 1024, 16).unwrap_err();
         assert_eq!(past.kind(), io::ErrorKind::UnexpectedEof, "{past}");
         assert!(!d.damage().load(Ordering::Relaxed));
+    }
+
+    fn lzfse(data: &[u8]) -> Vec<u8> {
+        let mut enc = Vec::new();
+        lzfse_rust::encode_bytes(data, &mut enc).unwrap();
+        enc
+    }
+
+    #[test]
+    fn an_lzfse_run_decodes() {
+        let t = text(64 * 1024);
+        let enc = lzfse(&t);
+        assert!(enc.starts_with(b"bvx2"));
+        let mut d = open(udif(BLK_LZFSE, 128, &enc));
+        assert_eq!(read_at(&mut d, 0, t.len()).unwrap(), t);
+        assert!(!d.damage().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_lzfse_run_damaged_part_way_keeps_its_whole_blocks_and_is_flagged() {
+        // A whole LZVN block, then an FSE block whose header is damaged.
+        let (first, rest) = (text(3000), text(64 * 1024));
+        let mut enc = lzfse(&first);
+        enc.truncate(enc.len() - 4);
+        let at = enc.len();
+        enc.extend(lzfse(&rest));
+        enc[at + 3] = b'Z';
+        let mut d = open(udif(BLK_LZFSE, 136, &enc));
+        assert_eq!(read_at(&mut d, 0, first.len()).unwrap(), first);
+        assert!(d.damage().load(Ordering::Relaxed));
     }
 
     #[test]

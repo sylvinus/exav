@@ -409,6 +409,73 @@ fn table_for(f: TrueTypeFace) -> (&'static [u16], &'static [(u32, u16)], f32) {
     }
 }
 
+/// A font whose letters stand for other characters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Symbols {
+    /// Symbol's Greek and mathematical signs; the SHX Greek fonts' letters.
+    Symbol,
+    /// greeks.shx, greekc.shx: Greek letters only.
+    Greek,
+    /// gdt.shx: the geometric tolerancing signs on lowercase letters.
+    Gdt,
+}
+
+/// The symbol set a font file draws, by name.
+pub fn symbols_of(file: &str) -> Option<Symbols> {
+    let lower = file.trim().to_ascii_lowercase();
+    let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
+    match stem {
+        "symbol" => Some(Symbols::Symbol),
+        "greeks" | "greekc" => Some(Symbols::Greek),
+        "gdt" | "amgdt" => Some(Symbols::Gdt),
+        _ => None,
+    }
+}
+
+/// Greek for the Latin letters, in the order Symbol puts them: A Alpha, C
+/// Chi, F Phi, J theta symbol, Q Theta, V final sigma, W Omega...
+const GREEK_UPPER: [char; 26] = [
+    'Α', 'Β', 'Χ', 'Δ', 'Ε', 'Φ', 'Γ', 'Η', 'Ι', 'ϑ', 'Κ', 'Λ', 'Μ', 'Ν', 'Ο', 'Π', 'Θ', 'Ρ', 'Σ',
+    'Τ', 'Υ', 'ς', 'Ω', 'Ξ', 'Ψ', 'Ζ',
+];
+const GREEK_LOWER: [char; 26] = [
+    'α', 'β', 'χ', 'δ', 'ε', 'φ', 'γ', 'η', 'ι', 'ϕ', 'κ', 'λ', 'μ', 'ν', 'ο', 'π', 'θ', 'ρ', 'σ',
+    'τ', 'υ', 'ϖ', 'ω', 'ξ', 'ψ', 'ζ',
+];
+/// gdt.shx's lowercase letters: a angularity, b perpendicularity, c
+/// flatness, d surface profile, e circularity, f parallelism, g
+/// cylindricity, h circular runout, i symmetry, j position, k line profile,
+/// l LMC, m MMC, n diameter, o square, p projected zone, q centre line, r
+/// concentricity, s RFS, t total runout, u straightness, v counterbore, w
+/// countersink, x depth, y conical taper, z slope.
+const GDT: [char; 26] = [
+    '∠', '⊥', '⏥', '⌓', '○', '∥', '⌭', '↗', '⌯', '⌖', '⌒', 'Ⓛ', 'Ⓜ', '⌀', '□', 'Ⓟ', '℄', '◎', 'Ⓢ',
+    '⌰', '⏤', '⌴', '⌵', '↧', '⌲', '⌳',
+];
+
+/// What a string in a symbol font shows.
+pub fn map_symbols(s: &str, set: Symbols) -> String {
+    let letter = |c: char, table: &[char; 26]| table[(c as u8 - b'a') as usize];
+    s.chars()
+        .map(|c| match (set, c) {
+            (Symbols::Symbol | Symbols::Greek, 'A'..='Z') => GREEK_UPPER[(c as u8 - b'A') as usize],
+            (Symbols::Symbol | Symbols::Greek, 'a'..='z') => letter(c, &GREEK_LOWER),
+            (Symbols::Gdt, 'a'..='z') => letter(c, &GDT),
+            (Symbols::Symbol, '"') => '∀',
+            (Symbols::Symbol, '$') => '∃',
+            (Symbols::Symbol, '\'') => '∋',
+            (Symbols::Symbol, '*') => '∗',
+            (Symbols::Symbol, '-') => '−',
+            (Symbols::Symbol, '@') => '≅',
+            (Symbols::Symbol, '\\') => '∴',
+            (Symbols::Symbol, '^') => '⊥',
+            (Symbols::Symbol, '~') => '∼',
+            _ => c,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +485,28 @@ mod tests {
             Face::TrueType(f) => f,
             Face::Stroke => panic!("expected a TrueType face, got stroke"),
         }
+    }
+
+    /// Greek and Cyrillic have their own widths, not the fallback's.
+    #[test]
+    fn greek_and_cyrillic_are_measured() {
+        let m = Metrics::for_face(Face::default());
+        assert!(m.advance('Ж') > m.advance('г') * 1.5);
+        assert!(m.advance('Ω') > m.advance('ι') * 1.5);
+        assert_eq!(m.advance('Ω'), m.advance('\u{03A9}'));
+    }
+
+    #[test]
+    fn symbol_fonts_draw_what_their_letters_stand_for() {
+        assert_eq!(symbols_of("SYMBOL.TTF"), Some(Symbols::Symbol));
+        assert_eq!(symbols_of("fonts\\greeks.shx"), Some(Symbols::Greek));
+        assert_eq!(symbols_of("gdt"), Some(Symbols::Gdt));
+        assert_eq!(symbols_of("arial.ttf"), None);
+        assert_eq!(map_symbols("abg D=@", Symbols::Symbol), "αβγ Δ=≅");
+        // The SHX Greek fonts change letters only.
+        assert_eq!(map_symbols("abg D=@", Symbols::Greek), "αβγ Δ=@");
+        // GD&T: diameter 0.05, position, MMC; capitals stay.
+        assert_eq!(map_symbols("n0.05 jm A", Symbols::Gdt), "⌀0.05 ⌖Ⓜ A");
     }
 
     /// The case the corpus is full of: a stock stroke font, stored with no

@@ -62,8 +62,8 @@
   },
   "homepage": "https://exav.org/unpack/wasm/",
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
+    "@playwright/test": "^1.64.1",
     "serve": "^14.2.6",
-    "vitest": "^4.1.9"
+    "vitest": "^5.0.5"
   }
 }

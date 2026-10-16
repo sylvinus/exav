@@ -243,6 +243,67 @@ pub(crate) fn annotative_columns(ctx: &mut Ctx<'_, '_>, xdictionary: u64) -> Opt
     first.flatten()
 }
 
+/// An insert's XCLIP boundary: its extension dictionary's ACAD_FILTER
+/// dictionary, whose SPATIAL entry is a SPATIAL_FILTER: BS
+/// count (70), 2RD points (10), 3BD extrusion (210), 3BD origin (11), BS
+/// display boundary (71), BS front clip on (72) and BD distance (40) when
+/// set, the same for the back (73, 41), then the inverse insert matrix and
+/// the clip boundary's, 12BD each (40).
+pub(crate) fn insert_clip(ctx: &mut Ctx<'_, '_>, xdictionary: u64) -> Option<InsertClip> {
+    let entry = |entries: Vec<(String, Handle)>, name: &str| {
+        entries
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, h)| h)
+    };
+    let acad = entry(entries_of(ctx, xdictionary), "ACAD_FILTER")?;
+    let spatial = entry(entries_of(ctx, acad.0), "SPATIAL")?;
+    let mut o = ctx.object(spatial.0, "spatial filter")?;
+    if ctx.dwg.type_name(o.type_code).as_deref() != Some("SPATIAL_FILTER") {
+        return None;
+    }
+    match spatial_filter(ctx, &mut o) {
+        Ok(c) => c,
+        Err(e) => {
+            ctx.warn(
+                WarningKind::Malformed,
+                format!("spatial filter {:X} could not be read: {e}", spatial.0),
+            );
+            None
+        }
+    }
+}
+
+fn spatial_filter(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<Option<InsertClip>> {
+    let b = &mut o.data;
+    let n = i64::from(b.bs()?);
+    let n = count(n, b.remaining(), 128)?;
+    let mut points = Vec::new();
+    for _ in 0..n {
+        let p = v2(b.rd2()?);
+        if ctx.room(points.len()) {
+            points.push(p);
+        }
+    }
+    b.bd3()?; // extrusion
+    b.bd3()?; // origin
+    let enabled = b.bs()? != 0;
+    if b.bs()? != 0 {
+        b.bd()?; // front distance
+    }
+    if b.bs()? != 0 {
+        b.bd()?; // back distance
+    }
+    let mut inverse = [0.0; 12];
+    for m in &mut inverse {
+        *m = b.bd()?;
+    }
+    if points.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(InsertClip::from_filter(&points, &inverse, enabled)))
+}
+
 /// An ACDB_MTEXTOBJECTCONTEXTDATA_CLASS object: whether it is the default
 /// context, and its columns.
 fn mtext_context(

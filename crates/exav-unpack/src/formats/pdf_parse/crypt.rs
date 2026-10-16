@@ -769,6 +769,33 @@ mod tests {
         }
     }
 
+    /// An AES-128 (R4) file whose `/O` holds a backspace, written `\b`, opens
+    /// with the empty password. The dictionary is the one of a real file that
+    /// was reported password-protected while qpdf opened it.
+    #[test]
+    fn an_owner_key_with_a_backspace_escape_still_opens_with_the_empty_password() {
+        use crate::formats::pdf_parse::{lex::Lexer, parse::parse_object};
+        let mut src = b"<</Filter/Standard/O (".to_vec();
+        src.extend_from_slice(
+            b"\xe4\xa5`\xed\xd7\\b\x9c\xd0\x85\x0fB\x8c\xba\\)\x18\\(\xdc\\\\\xd8[\x1d\\)\xefFm\xb4\x96\xe2O\xf3<\xb0",
+        );
+        src.extend_from_slice(b")/U (");
+        src.extend_from_slice(b"\xb7c\x87\xea/\xb6\\n\xa9\x0b\xe5O\x81\xc7\xcf\x80I");
+        src.extend_from_slice(&[0; 16]);
+        src.extend_from_slice(
+            b")/P -300/R 4/EncryptMetadata false/V 4/Length 128/StrF/StdCF/StmF/StdCF\
+              /CF<</StdCF<</Length 16/AuthEvent/DocOpen/CFM/AESV2>>>>>>",
+        );
+        let Some(Primitive::Dictionary(dict)) = parse_object(&mut Lexer::new(&src)) else {
+            panic!("not a dictionary");
+        };
+        let dict = CryptDict::from_primitive(&dict).unwrap();
+        assert_eq!(dict.o.len(), 32);
+        assert_eq!(dict.o[5], 0x08);
+        let id = unhex("4db41f9bda1583e5463f724dd715f4ee");
+        assert!(Decoder::from_password(&dict, &id, b"").is_ok());
+    }
+
     /// RC4 with a 40-bit file key: the object key is 10 bytes (n + 5), and it
     /// covers the generation number. Vector from Python's hashlib and a plain
     /// RC4, object 9, generation 1.

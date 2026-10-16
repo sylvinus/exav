@@ -29,6 +29,7 @@ function fakeDoc(pages: number, log: string[] = [], links: PdfLink[] = []): Load
     pageSize: async () => ({ width: 600, height: 800 }),
     pageAspect: async () => 0.75,
     renderPageToBlob: async () => new Blob(),
+    renderPageRegion: async () => ({}) as ImageBitmap,
     renderPageTo: async () => true,
     cancelRender: () => void log.push("cancel"),
     outline: async () => [],
@@ -49,13 +50,13 @@ function make(doc: LoadedPdf, over: Partial<ReaderOptions> = {}) {
   document.body.append(host);
   const reader = createReader(host, doc, sizes(doc.numPages), { ...READER_DEFAULTS, ...over }, () => {});
   open.push(reader);
-  const scroller = host.querySelector<HTMLElement>(".exv-pdf-scroller")!;
+  const scroller = host.querySelector<HTMLElement>(".exav-viewer-pdf-scroller")!;
   // jsdom lays nothing out: the scroll position is a plain pair of numbers.
   let left = 0;
   let top = 0;
   // What the reader writes, since a browser empties the scroller when its content is replaced.
   const writes: { x: number[]; y: number[] } = { x: [], y: [] };
-  Object.defineProperty(scroller, "clientWidth", { value: 800 });
+  Object.defineProperty(scroller, "clientWidth", { value: 800, configurable: true });
   Object.defineProperty(scroller, "clientHeight", { value: 600 });
   Object.defineProperty(scroller, "scrollLeft", {
     get: () => left,
@@ -71,7 +72,7 @@ function make(doc: LoadedPdf, over: Partial<ReaderOptions> = {}) {
       writes.y.push(v);
     },
   });
-  const root = host.querySelector<HTMLElement>(".exv-pdf")!;
+  const root = host.querySelector<HTMLElement>(".exav-viewer-pdf")!;
   const mouse = (type: string, x: number, y: number, target: EventTarget = scroller, init: MouseEventInit = {}) =>
     target.dispatchEvent(new MouseEvent(type, { clientX: x, clientY: y, bubbles: true, cancelable: true, ...init }));
   return { reader, host, scroller, root, mouse, writes, scrollTo: (x: number, y: number) => ((left = x), (top = y)) };
@@ -105,8 +106,8 @@ describe("dragging with the mouse", () => {
     reader.zoom.setScale(2);
     scrollTo(100, 200);
     const text = document.createElement("span");
-    text.className = "exv-pdf-text";
-    host.querySelector(".exv-pdf-page")!.append(text);
+    text.className = "exav-viewer-pdf-text";
+    host.querySelector(".exav-viewer-pdf-page")!.append(text);
     const selecting = vi.fn();
     host.addEventListener("mousedown", selecting);
     const press = mouse("mousedown", 50, 50, text);
@@ -148,7 +149,7 @@ describe("dragging with the mouse", () => {
     return (async () => {
       // The overlay of a near page is made when the page is: let it be.
       await new Promise((r) => setTimeout(r, 0));
-      const link = host.querySelector<HTMLElement>(".exv-pdf-link");
+      const link = host.querySelector<HTMLElement>(".exav-viewer-pdf-link");
       if (!link) throw new Error("no link overlay");
       // A drag, then the click it ends with.
       mouse("mousedown", 10, 10, link);
@@ -167,17 +168,77 @@ describe("dragging with the mouse", () => {
   });
 });
 
+describe("the viewport", () => {
+  /**
+   * A reader with page 1 scrolled up by 200 in an 800 x 600 viewer. jsdom lays
+   * nothing out, so the boxes report fixed rectangles; `reads` counts the
+   * viewer's width being read, which only the viewport does.
+   */
+  function measured() {
+    const m = make(fakeDoc(3));
+    const rect = (l: number, t: number, w: number, h: number) => ({ left: l, top: t, width: w, height: h, right: l + w, bottom: t + h, x: l, y: t }) as DOMRect;
+    m.scroller.getBoundingClientRect = () => rect(0, 0, 800, 600);
+    const boxes = [...m.host.querySelectorAll<HTMLElement>(".exav-viewer-pdf-page")];
+    boxes[0]!.getBoundingClientRect = () => rect(100, -200, 600, 800);
+    boxes[1]!.getBoundingClientRect = () => rect(100, 620, 600, 800);
+    boxes[2]!.getBoundingClientRect = () => rect(100, 1440, 600, 800);
+    const reads = vi.fn(() => 800);
+    Object.defineProperty(m.scroller, "clientWidth", { get: reads, configurable: true });
+    return { ...m, reads };
+  }
+  const scroll = (scroller: HTMLElement) => scroller.dispatchEvent(new Event("scroll"));
+  const view = { space: "page", page: 1, region: { x: 0, y: 200 / 800, width: 1, height: 600 / 800 } };
+
+  it("is not measured by a reader that does not use it", () => {
+    const { reader, scroller, reads } = measured();
+    scroll(scroller);
+    reader.zoom.setScale(2);
+    expect(reads).not.toHaveBeenCalled();
+  });
+
+  it("is measured while followed, at each scroll, and no more once the last listener left", () => {
+    const { reader, scroller, reads } = measured();
+    const stop = reader.viewport.subscribe(() => {});
+    const other = reader.viewport.subscribe(() => {});
+    expect(reads).toHaveBeenCalled();
+    expect(reader.viewport.get()).toEqual(view);
+    const calls = reads.mock.calls.length;
+    scroll(scroller);
+    expect(reads.mock.calls.length).toBeGreaterThan(calls);
+    stop();
+    const kept = reads.mock.calls.length;
+    scroll(scroller);
+    expect(reads.mock.calls.length).toBeGreaterThan(kept);
+    other();
+    const left = reads.mock.calls.length;
+    scroll(scroller);
+    reader.zoom.setScale(2);
+    expect(reads.mock.calls.length).toBe(left);
+  });
+
+  it("is measured for each read with no listener, which has the current view", () => {
+    const { reader, scroller, reads } = measured();
+    expect(reader.viewport.get()).toEqual(view);
+    const once = reads.mock.calls.length;
+    expect(once).toBeGreaterThan(0);
+    scroll(scroller);
+    expect(reads.mock.calls.length).toBe(once);
+    expect(reader.viewport.get()).toEqual(view);
+    expect(reads.mock.calls.length).toBe(2 * once);
+  });
+});
+
 describe("replacing the document", () => {
   it("shows the new pages at the same zoom and scroll position, frees the old document's renders, and follows the new page count", () => {
     const log: string[] = [];
     const { reader, host, scrollTo, scroller, writes } = make(fakeDoc(3, log));
     reader.zoom.setScale(2);
     scrollTo(40, 500);
-    const before = host.querySelectorAll(".exv-pdf-page").length;
+    const before = host.querySelectorAll(".exav-viewer-pdf-page").length;
     expect(before).toBe(3);
     writes.x.length = writes.y.length = 0;
     reader.replace(fakeDoc(5), sizes(5));
-    expect(host.querySelectorAll(".exv-pdf-page")).toHaveLength(5);
+    expect(host.querySelectorAll(".exav-viewer-pdf-page")).toHaveLength(5);
     expect(reader.zoom.get().scale).toBe(2);
     // Put back where it was, after the new pages are laid out.
     expect([scroller.scrollLeft, scroller.scrollTop]).toEqual([40, 500]);
@@ -196,6 +257,6 @@ describe("replacing the document", () => {
     reader.replace(next, sizes(1));
     await new Promise((r) => setTimeout(r, 0));
     expect(reader.outline.get()).toEqual([{ title: "Intro", page: 1, depth: 0, offset: null }]);
-    expect(host.querySelector<HTMLAnchorElement>(".exv-pdf-link")?.href).toBe("https://example.test/new");
+    expect(host.querySelector<HTMLAnchorElement>(".exav-viewer-pdf-link")?.href).toBe("https://example.test/new");
   });
 });

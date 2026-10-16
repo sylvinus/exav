@@ -4,6 +4,8 @@ import { writable } from "../core/store.js";
 import type { GroundController, LayersController, Renderer, Selection } from "../core/types.js";
 import { createModelEngine, DEFAULT_MAX_TRIANGLES, DEFAULT_TIMEOUT_MS, modelWarnings, type ParsedModel } from "../model/engine.js";
 import { elementBoxes, framingBox } from "../model/framing.js";
+import { createModelRaster } from "../model/raster.js";
+import { createStoreys, storeyShown } from "../model/storeys.js";
 import type { IfcOptions } from "./index.js";
 
 const GROUNDS = { light: "#ffffff", dark: "#212830" } as const;
@@ -55,6 +57,7 @@ export const renderer: Renderer<IfcOptions> = {
         ctx.source.bytes(),
       ]);
       if (destroyed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
+      ctx.status({ phase: "loading", step: "read" });
       const bytes = source.slice();
       const model: ParsedModel = await engine.call(
         { kind: "ifc", bytes: bytes.buffer as ArrayBuffer, maxTriangles: ctx.options.maxTriangles ?? DEFAULT_MAX_TRIANGLES },
@@ -64,10 +67,11 @@ export const renderer: Renderer<IfcOptions> = {
       // The engine's work is done: its memory goes back now.
       engine.destroy();
       if (destroyed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
+      ctx.status({ phase: "loading", step: "render" });
       const { meta } = model;
 
       const root = document.createElement("div");
-      root.className = "exv-ifc";
+      root.className = "exav-viewer-ifc";
       host.append(root);
       disposers.push(() => root.remove());
 
@@ -79,7 +83,7 @@ export const renderer: Renderer<IfcOptions> = {
         gl.domElement.remove();
       });
       gl.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-      gl.domElement.className = "exv-model-canvas";
+      gl.domElement.className = "exav-viewer-model-canvas";
       root.append(gl.domElement);
 
       const scene = new three.Scene();
@@ -112,6 +116,9 @@ export const renderer: Renderer<IfcOptions> = {
 
       // One mesh (and one outline) per batch, grouped by class to hide.
       const byClass = new Map<string, Object3D[]>();
+      // The storey of each batch's objects, and the storeys hidden.
+      const storeyOf = new Map<Object3D, number | null>();
+      let hiddenStoreys: ReadonlySet<number> = new Set();
       const meshes: Mesh[] = [];
       /** Per batch, its triangle -> element. */
       const owner: Int32Array[] = meta.batches.map((b) => new Int32Array(b.indices / 3).fill(-1));
@@ -158,6 +165,7 @@ export const renderer: Renderer<IfcOptions> = {
           world.add(lines);
           objects.push(lines);
         }
+        for (const o of objects) storeyOf.set(o, b.storey ?? null);
         const list = byClass.get(b.class) ?? [];
         list.push(...objects);
         byClass.set(b.class, list);
@@ -166,7 +174,7 @@ export const renderer: Renderer<IfcOptions> = {
       const names = [...byClass.keys()].sort((a, b) => a.localeCompare(b));
       const visible = new Map(names.map((n) => [n, !HIDDEN_AT_FIRST.has(n)]));
       const applyVisibility = () => {
-        for (const [n, objects] of byClass) for (const o of objects) o.visible = visible.get(n) ?? true;
+        for (const [n, objects] of byClass) for (const o of objects) o.visible = (visible.get(n) ?? true) && storeyShown(storeyOf.get(o), hiddenStoreys);
       };
       applyVisibility();
 
@@ -204,6 +212,23 @@ export const renderer: Renderer<IfcOptions> = {
       controls.enableDamping = true;
       controls.update();
 
+      const raster = createModelRaster({
+        three,
+        scene,
+        camera,
+        controls,
+        renderer: gl,
+        // IFC is Z up in metres, the buffers are relative to the engine's origin.
+        frame: { zUp: true, origin: meta.origin, offset: [0, 0, 0] },
+        sphere: { center: [sphere.center.x, sphere.center.y, sphere.center.z], radius },
+        ground: () => ({ type: "solid", color: colors[ground] }),
+        // The viewer's own: the floor grid and the selection's highlight.
+        skip: (o) => o === grid || o === highlight,
+        tile: ctx.options.rasterTile,
+        supersample: ctx.options.rasterSupersample,
+      });
+      disposers.push(raster.destroy);
+
       let dirty = true;
       controls.addEventListener("change", () => (dirty = true));
       const paint = () => {
@@ -235,6 +260,7 @@ export const renderer: Renderer<IfcOptions> = {
       const tick = () => {
         frame = requestAnimationFrame(tick);
         controls.update();
+        raster.sync();
         if (!dirty) return;
         dirty = false;
         gl.render(scene, camera);
@@ -260,7 +286,9 @@ export const renderer: Renderer<IfcOptions> = {
         highlight = null;
       };
       disposers.push(clearHighlight);
+      let selected: number | null = null;
       const select = (index: number | null) => {
+        selected = index;
         clearHighlight();
         if (index === null) {
           selection.set(null);
@@ -325,6 +353,14 @@ export const renderer: Renderer<IfcOptions> = {
         setVisible: (id, v) => setVisible([id], v),
         setAll: (v) => setVisible(names, v),
       };
+      // Storeys: whole batches are hidden; a tapped element in a storey that goes is let go.
+      const storeys = createStoreys(meta, (hidden) => {
+        hiddenStoreys = hidden;
+        applyVisibility();
+        const storey = selected === null ? null : (meta.elements[selected]?.storey ?? null);
+        if (storey !== null && hidden.has(storey)) select(null);
+        dirty = true;
+      });
       const groundStore = writable(ground);
       const groundController: GroundController = {
         ...groundStore,
@@ -338,7 +374,7 @@ export const renderer: Renderer<IfcOptions> = {
       const warnings = writable(modelWarnings(meta, "ifc"));
       ctx.status(meta.elements.length > 0 ? { phase: "ready" } : { phase: "empty" });
       return {
-        controllers: { layers, ground: groundController, selection, warnings },
+        controllers: { layers, ...(storeys ? { storeys } : {}), ground: groundController, selection, warnings, pictures: raster.pictures, viewport: raster.viewport },
         resize,
         destroy,
       };

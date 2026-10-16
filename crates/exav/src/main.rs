@@ -2762,6 +2762,8 @@ fn scan_target(
         // name that parses as one is kept, so a tree of ordinary files costs
         // one parse each and nothing is accumulated.
         let mut parts: Vec<PathBuf> = Vec::new();
+        // The same for the volumes whose headers say how they join.
+        let mut split: Vec<PathBuf> = Vec::new();
         let walk = walk_tree(path, Some(filters), descent);
         totals.dirs += walk.dirs;
         for line in &walk.errors {
@@ -2772,6 +2774,9 @@ fn scan_target(
             if is_volume_part(file) {
                 parts.push(file.clone());
             }
+            if is_split_candidate(file) {
+                split.push(file.clone());
+            }
             scan_one(file, db, opts, cli, totals);
         }
         // A set like `big.7z.001`, `.002`, `.003` is one archive cut into
@@ -2779,8 +2784,132 @@ fn scan_target(
         // only that each fragment is not itself malware. Rejoin and scan the
         // archives they make.
         scan_volume_sets(&parts, db, opts, cli, totals);
+        scan_split_sets(&split, None, db, opts, cli, totals);
     } else if !filters.file_skipped(path) {
         scan_one(path, db, opts, cli, totals);
+        // One volume of a set named on its own: its siblings are looked for
+        // next to it, and the archive they make is scanned too.
+        if is_split_candidate(path) {
+            let siblings = split_siblings(path);
+            scan_split_sets(&siblings, Some(path), db, opts, cli, totals);
+        }
+    }
+}
+
+/// Whether a path's *filename* says it is a part of a set that is joined: a
+/// byte-split part (`big.7z.001`), a RAR volume (`x.part1.rar`, `x.r00`), a ZIP
+/// part (`x.z01`). Names only.
+fn is_set_part(path: &Path) -> bool {
+    use exav_core::unpack::volume::{parse, Scheme};
+    is_volume_part(path)
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse)
+            .is_some_and(|v| {
+                matches!(
+                    v.scheme,
+                    Scheme::RarPart { .. } | Scheme::RarOld | Scheme::ZipSplit
+                )
+            })
+}
+
+/// Whether a path's *filename* could be a volume of a RAR, ZIP or CAB set:
+/// a RAR volume's or a ZIP part's name, or a `.zip` (the last part of a ZIP
+/// set) or a `.cab` (whose header says whether it has neighbours). Names only.
+fn is_split_candidate(path: &Path) -> bool {
+    use exav_core::unpack::volume::{parse, Scheme};
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".zip")
+        || lower.ends_with(".cab")
+        || matches!(
+            parse(name).map(|v| v.scheme),
+            Some(Scheme::RarPart { .. } | Scheme::RarOld | Scheme::ZipSplit)
+        )
+}
+
+/// The regular files next to `path` that could be volumes of the same set
+/// (itself included), by name. A directory is read as far as 100,000 entries;
+/// a symbolic link is not a sibling.
+fn split_siblings(path: &Path) -> Vec<PathBuf> {
+    let Some(dir) = path.parent().map(|p| {
+        if p.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            p
+        }
+    }) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .take(100_000)
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| dir.join(e.file_name()))
+        .filter(|p| is_split_candidate(p))
+        .collect()
+}
+
+/// Rejoin the RAR, ZIP and CAB sets among `files` and scan each as one
+/// archive. As [`scan_volume_sets`], per directory, reporting the archive under
+/// its own name (`dir/big.zip`) and only when it is not clean: each volume's
+/// own line already said that the fragment is not itself malware. `only`
+/// limits the report to the set `only` is a part of.
+fn scan_split_sets(
+    files: &[PathBuf],
+    only: Option<&Path>,
+    db: &Scanner,
+    opts: &ScanOptions,
+    cli: &Cli,
+    totals: &mut Totals,
+) {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+    let mut by_dir: BTreeMap<&Path, Vec<String>> = BTreeMap::new();
+    for p in files {
+        let (Some(dir), Some(name)) = (p.parent(), p.file_name().and_then(|n| n.to_str())) else {
+            continue;
+        };
+        by_dir.entry(dir).or_default().push(name.to_string());
+    }
+    for (dir, names) in by_dir {
+        let verdicts = exav_core::analyze_split_sets(db, &names, opts, |name, head| {
+            let limit = head.map_or(opts.deep_analysis_max.saturating_add(1), |n| n as u64);
+            let mut data = Vec::new();
+            std::fs::File::open(dir.join(name))?
+                .take(limit)
+                .read_to_end(&mut data)?;
+            Ok(data)
+        });
+        // The sets `only` is a part of, or every set.
+        let wanted = only.and_then(|p| p.file_name()).and_then(|n| n.to_str());
+        let relevant: std::collections::HashSet<String> = verdicts
+            .iter()
+            .filter(|v| wanted.is_none_or(|w| v.name == w))
+            .map(|v| v.set.clone())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for v in verdicts {
+            if !relevant.contains(&v.set) || !seen.insert(v.set.clone()) {
+                continue;
+            }
+            if matches!(v.report.verdict.category(), VerdictCategory::Clean) {
+                continue;
+            }
+            totals.scanned += 1;
+            report_result(
+                &dir.join(&v.set).display().to_string(),
+                v.report,
+                cli,
+                totals,
+            );
+        }
     }
 }
 
@@ -3656,19 +3785,34 @@ fn run_client(cli: &Cli) -> ExitCode {
         } else if p.is_dir() {
             let walk = walk_tree(p, Some(&filters), descent(cli));
             walk_errors.extend(walk.errors);
+            // The directories holding a part of a set by its name; the `.zip`
+            // that ends a ZIP set and the cabinets of one go with them.
+            let set_dirs: std::collections::HashSet<&Path> = walk
+                .files
+                .iter()
+                .filter(|f| is_set_part(f))
+                .filter_map(|f| f.parent())
+                .collect();
             if sending_contents {
                 // Grouped by the directory the parts sit in: `a/big.7z.001` and
                 // `b/big.7z.002` are unrelated files that share a name, and
                 // splicing them would join bytes nothing ever wrote.
-                for f in walk.files {
-                    match (is_volume_part(&f), f.parent()) {
-                        (true, Some(dir)) => stream_sets.entry(dir.into()).or_default().push(f),
-                        _ => files.push(f),
+                let mut in_sets = Vec::new();
+                for f in &walk.files {
+                    let together = is_set_part(f)
+                        || (is_split_candidate(f)
+                            && f.parent().is_some_and(|d| set_dirs.contains(d)));
+                    match (together, f.parent()) {
+                        (true, Some(dir)) => in_sets.push((dir.to_path_buf(), f.clone())),
+                        _ => files.push(f.clone()),
                     }
+                }
+                for (dir, f) in in_sets {
+                    stream_sets.entry(dir).or_default().push(f);
                 }
                 continue;
             }
-            if walk.files.iter().any(|f| is_volume_part(f)) {
+            if !set_dirs.is_empty() {
                 // Handed to `CONTSCAN` whole rather than scanned file by file.
                 // The daemon reports a set's verdict on each PART's line (the
                 // part is the file an operator has to act on), so asking for the

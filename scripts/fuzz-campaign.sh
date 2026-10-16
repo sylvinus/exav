@@ -32,7 +32,7 @@ WORK="${WORK:-$ROOT/tmp/data}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 CODEGEN_UNITS="${CODEGEN_UNITS:-16}"
 # Order matters when a campaign is cut short: the broadest targets run first.
-TARGETS="${TARGETS:-analyze full_pipeline unpack seekable yara pcre clamd icap volumes x86_decode pe_emulator imagehash drawing cad_dxf cad_dwg ifc authenticode database cvd bytecode sigs ndb_compile pe filetype rar3_ppmd parser_recursion}"
+TARGETS="${TARGETS:-analyze full_pipeline unpack seekable yara pcre clamd icap volumes x86_decode pe_emulator imagehash drawing cad_dxf cad_dwg ifc mesh markdown visible_text authenticode database cvd bytecode sigs ndb_compile pe filetype rar3_ppmd parser_recursion}"
 # Strings the mutator splices in, for the targets whose input is text or a
 # protocol (fuzz/dicts/).
 dict_for() {
@@ -41,6 +41,7 @@ dict_for() {
     pcre) echo pcre ;;
     icap) echo icap ;;
     clamd) echo clamd ;;
+    markdown) echo markdown ;;
     full_pipeline | ndb_compile | sigs | cvd) echo signatures ;;
   esac
 }

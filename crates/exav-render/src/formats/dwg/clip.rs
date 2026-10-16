@@ -65,6 +65,17 @@ impl ClipShape {
         })
     }
 
+    /// The region as triangles.
+    pub fn triangles(&self) -> Vec<[[f64; 2]; 3]> {
+        match self {
+            ClipShape::Rect { min, max } => vec![
+                [[min[0], min[1]], [max[0], min[1]], [max[0], max[1]]],
+                [[min[0], min[1]], [max[0], max[1]], [min[0], max[1]]],
+            ],
+            ClipShape::Poly { pieces, .. } => pieces.clone(),
+        }
+    }
+
     pub fn bounds(&self) -> ([f64; 2], [f64; 2]) {
         match self {
             ClipShape::Rect { min, max } => (*min, *max),

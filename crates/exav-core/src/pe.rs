@@ -538,6 +538,160 @@ pub fn layout(data: &[u8]) -> Option<PeLayout> {
     })
 }
 
+/// Most sections an ELF or Mach-O layout lists: a section table is a `u16`
+/// long in an ELF, and nothing a real file has comes near it.
+const MAX_EXEC_SECTIONS: u64 = 1 << 16;
+
+/// [`PeLayout`] of an ELF file, for the `EP`, `Sn`, `SL` and `SEn` offsets of a
+/// `Target:6` signature, read from the headers alone (the object is not held).
+///
+/// As clamscan resolves them (measured, with one signature per offset and one
+/// wrong by three bytes as the control): `EP` is the entry point's file
+/// offset, found by the loadable segment whose memory image holds it (the
+/// part past the file's bytes, the `.bss`, included), and `Sn` is the file
+/// offset of section header `n`, counted from the null section at 0.
+/// A section with no bytes in the file (`SHT_NOBITS`) is a point.
+pub fn elf_layout(src: &dyn ByteSource) -> Option<PeLayout> {
+    let mut f = Fields::new(src);
+    let ident = f.get(0, 16)?;
+    if &ident[..4] != b"\x7fELF" {
+        return None;
+    }
+    let wide = match ident[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    // Anything but little-endian is read as big-endian, as `elf_broken` does.
+    f.be = ident[5] != 1;
+    let (header, ph_min, sh_min) = if wide { (64, 56, 64) } else { (52, 32, 40) };
+    f.get(0, header)?;
+    let w = if wide { 8 } else { 4 };
+    let entry_va = f.word(24, wide)?;
+    let (phoff, shoff) = (f.word(24 + w, wide)?, f.word(24 + 2 * w, wide)?);
+    let fields = 28 + 3 * w;
+    let [ph_entsize, phnum, sh_entsize, shnum] =
+        [2, 4, 6, 8].map(|i| f.u16(fields + i).map(u64::from));
+    let (ph_entsize, phnum, sh_entsize, shnum) =
+        (ph_entsize?, phnum?, sh_entsize?, shnum?);
+
+    let mut entry = None;
+    if ph_entsize >= ph_min {
+        let (offset_at, vaddr_at, memsz_at) = if wide { (8, 16, 40) } else { (4, 8, 20) };
+        for i in 0..phnum {
+            let p = phoff.checked_add(i * ph_entsize)?;
+            let (Some(kind), Some(offset), Some(vaddr), Some(memsz)) = (
+                f.u32(p),
+                f.word(p + offset_at, wide),
+                f.word(p + vaddr_at, wide),
+                f.word(p + memsz_at, wide),
+            ) else {
+                break;
+            };
+            // PT_LOAD
+            if kind == 1 && entry_va >= vaddr && entry_va - vaddr < memsz {
+                entry = offset.checked_add(entry_va - vaddr);
+                break;
+            }
+        }
+    }
+
+    let mut section_rawptrs = Vec::new();
+    let mut section_rawsizes = Vec::new();
+    if sh_entsize >= sh_min {
+        let (offset_at, size_at) = if wide { (24, 32) } else { (16, 20) };
+        for i in 0..shnum.min(MAX_EXEC_SECTIONS) {
+            let Some(s) = shoff.checked_add(i * sh_entsize) else {
+                break;
+            };
+            let (Some(kind), Some(offset), Some(size)) =
+                (f.u32(s + 4), f.word(s + offset_at, wide), f.word(s + size_at, wide))
+            else {
+                break;
+            };
+            section_rawptrs.push(offset);
+            // SHT_NOBITS
+            section_rawsizes.push(if kind == 8 { 0 } else { size });
+        }
+    }
+    Some(PeLayout {
+        entry,
+        section_rawptrs,
+        section_rawsizes,
+        version_info: Vec::new(),
+    })
+}
+
+/// [`PeLayout`] of a thin Mach-O file, for the `Sn`, `SL` and `SEn` offsets
+/// of a `Target:9` signature. `n` counts the sections of every segment in the
+/// order of the load commands, and an offset is the section's own.
+///
+/// `EP` is left unresolved: clamscan 1.4.3 does not resolve it on a Mach-O of
+/// either width, from `LC_MAIN` or from `LC_UNIXTHREAD` (a signature
+/// anchored there never fired in any of eight variants, where the section
+/// offsets did, each with a control), so a signature using it matches
+/// nowhere, as it does there.
+pub fn macho_layout(src: &dyn ByteSource) -> Option<PeLayout> {
+    let mut f = Fields::new(src);
+    let (wide, be) = match f.get(0, 4)? {
+        [0xCE, 0xFA, 0xED, 0xFE] => (false, false),
+        [0xCF, 0xFA, 0xED, 0xFE] => (true, false),
+        [0xFE, 0xED, 0xFA, 0xCE] => (false, true),
+        [0xFE, 0xED, 0xFA, 0xCF] => (true, true),
+        _ => return None,
+    };
+    f.be = be;
+    let header: u64 = if wide { 32 } else { 28 };
+    let (ncmds, sizeofcmds) = (u64::from(f.u32(16)?), u64::from(f.u32(20)?));
+    let end = header.checked_add(sizeofcmds)?;
+    if end > src.len() as u64 {
+        return None;
+    }
+    // LC_SEGMENT and LC_SEGMENT_64, and what each one's sections are like.
+    let (segment, nsects_at, first_section, section_len, size_at, offset_at) = if wide {
+        (0x19u32, 64u64, 72u64, 80u64, 40u64, 48u64)
+    } else {
+        (0x1, 48, 56, 68, 36, 40)
+    };
+    let mut section_rawptrs = Vec::new();
+    let mut section_rawsizes = Vec::new();
+    let mut at = header;
+    'commands: for _ in 0..ncmds.min(MAX_EXEC_SECTIONS) {
+        let (Some(cmd), Some(size)) = (f.u32(at), f.u32(at + 4).map(u64::from)) else {
+            break;
+        };
+        if size < 8 || at.checked_add(size)? > end {
+            break;
+        }
+        if cmd == segment {
+            let Some(nsects) = f.u32(at + nsects_at).map(u64::from) else {
+                break;
+            };
+            for i in 0..nsects {
+                let s = at + first_section + i * section_len;
+                if s + section_len > at + size || section_rawptrs.len() as u64 >= MAX_EXEC_SECTIONS {
+                    break 'commands;
+                }
+                let (Some(offset), Some(len)) =
+                    (f.u32(s + offset_at).map(u64::from), f.word(s + size_at, wide))
+                else {
+                    break 'commands;
+                };
+                section_rawptrs.push(offset);
+                // A zero-fill section has no bytes in the file.
+                section_rawsizes.push(if offset == 0 { 0 } else { len });
+            }
+        }
+        at += size;
+    }
+    Some(PeLayout {
+        entry: None,
+        section_rawptrs,
+        section_rawsizes,
+        version_info: Vec::new(),
+    })
+}
+
 /// One PE section in the shape the bytecode PE APIs expect
 /// (`cli_exe_section`).
 ///
@@ -778,7 +932,32 @@ pub(crate) fn embedded_in(data: &dyn ByteSource) -> Embedded {
 pub(crate) struct Carving {
     finders: Vec<memchr::memmem::Finder<'static>>,
     hits: Vec<(usize, Magic)>,
+    /// Where the last ZIP local header seen says the next entry begins, when
+    /// it can say (see [`zip_next_header`]).
+    zip_next: Option<usize>,
     pub(crate) found: Embedded,
+}
+
+/// Where the ZIP local header at `off` says the next entry begins: after its
+/// name, extra field and compressed data. `None` when it cannot say: the entry
+/// is encrypted, its sizes follow the data (a data descriptor), or its size is
+/// ZIP64's.
+fn zip_next_header(data: &dyn ByteSource, off: usize) -> Option<usize> {
+    let h = data.window(off, 30);
+    if h.len() != 30 || h[..4] != *b"PK\x03\x04" {
+        return None;
+    }
+    let flags = u16::from_le_bytes([h[6], h[7]]);
+    if flags & 0b1001 != 0 {
+        return None;
+    }
+    let csize = u32::from_le_bytes([h[18], h[19], h[20], h[21]]);
+    if csize == u32::MAX {
+        return None;
+    }
+    let name = usize::from(u16::from_le_bytes([h[26], h[27]]));
+    let extra = usize::from(u16::from_le_bytes([h[28], h[29]]));
+    off.checked_add(30 + name + extra)?.checked_add(csize as usize)
 }
 
 impl Carving {
@@ -800,6 +979,7 @@ impl Carving {
         Carving {
             finders: CARVE_MAGICS.iter().map(|(m, _)| memchr::memmem::Finder::new(m)).collect(),
             hits: Vec::new(),
+            zip_next: None,
             found: Embedded::default(),
         }
     }
@@ -822,14 +1002,30 @@ impl Carving {
     pub(crate) fn feed(&mut self, data: &dyn ByteSource, at: usize, w: &[u8], owned: usize) {
         let found = &mut self.found;
         let hits = &mut self.hits;
+        let zip_next = &mut self.zip_next;
         hits.clear();
         for (f, (_, kind)) in self.finders.iter().zip(CARVE_MAGICS) {
             hits.extend(f.find_iter(w).take_while(|&p| p < owned).map(|p| (at + p, kind)));
         }
         hits.sort_unstable_by_key(|&(off, _)| off);
         for &(off, kind) in hits.iter() {
+            let zip = matches!(kind, Magic::Archive) && data.window(off, 4)[..] == *b"PK\x03\x04";
             if off == 0 {
-                continue; // the object's own image or archive
+                // The object's own image or archive; a ZIP's later entries
+                // are its own, not archives stapled inside it.
+                if zip {
+                    *zip_next = zip_next_header(data, off);
+                }
+                continue;
+            }
+            // The next entry of a ZIP already taken is read when that ZIP is:
+            // its walk reaches every local header after its own, wherever the
+            // directory points. Counting each as an archive of its own would
+            // fill the cap with one zip's members and rescan the rest of the
+            // object once per member.
+            if zip && *zip_next == Some(off) {
+                *zip_next = zip_next_header(data, off);
+                continue;
             }
             let (list, cap, ok) = match kind {
                 Magic::Pe => (&mut found.pe, MAX_EMBEDDED_PE, pe_at(data, off)),
@@ -838,9 +1034,16 @@ impl Carving {
                 Magic::MachoFat => (&mut found.macho, MAX_EMBEDDED_PE, macho_fat_at(data, off)),
                 Magic::Archive => (&mut found.archives, MAX_EMBEDDED_ARCHIVES, archive_at(data, off)),
             };
+            // The chain follows only a ZIP that will be scanned.
+            if zip {
+                *zip_next = None;
+            }
             if ok {
                 if list.len() < cap {
                     list.push(off);
+                    if zip {
+                        *zip_next = zip_next_header(data, off);
+                    }
                 } else if matches!(kind, Magic::Pe) {
                     found.pe_capped = true;
                 } else {
@@ -1233,6 +1436,82 @@ mod tests {
         let found = embedded_in(&&data[..]);
         assert_eq!(found.archives.len(), MAX_EMBEDDED_ARCHIVES);
         assert!(found.others_capped);
+    }
+
+    /// A ZIP local header for an entry named `name` holding `len` bytes, with
+    /// the general-purpose `flags` and a declared compressed size of `csize`,
+    /// followed by `len` bytes of data.
+    fn zip_entry(name: &str, flags: u16, csize: u32, len: usize) -> Vec<u8> {
+        let mut e = b"PK\x03\x04\x14\0".to_vec();
+        e.extend_from_slice(&flags.to_le_bytes());
+        e.extend_from_slice(&[0, 0, 0, 0, 0x21, 0, 0, 0, 0, 0]);
+        e.extend_from_slice(&csize.to_le_bytes());
+        e.extend_from_slice(&(len as u32).to_le_bytes());
+        e.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        e.extend_from_slice(&[0, 0]);
+        e.extend_from_slice(name.as_bytes());
+        e.extend_from_slice(&vec![b'.'; len]);
+        e
+    }
+
+    /// `entries` entries of a ZIP (each declaring its size truthfully) after a
+    /// text prefix.
+    fn zip_after_prefix(entries: usize, flags: u16) -> (Vec<u8>, usize) {
+        let mut data = b"a carrier with a zip stapled inside it\n".to_vec();
+        let first = data.len();
+        for k in 0..entries {
+            data.extend(zip_entry(&format!("m{k}"), flags, 20, 20));
+        }
+        (data, first)
+    }
+
+    /// The entries of one ZIP stapled into an object are read when the ZIP is,
+    /// so only the first is a candidate: they neither fill the cap nor are the
+    /// object rescanned once per entry.
+    #[test]
+    fn the_entries_of_a_zip_are_not_archives_of_their_own() {
+        let (data, first) = zip_after_prefix(MAX_EMBEDDED_ARCHIVES * 2, 0);
+        let found = embedded_in(&&data[..]);
+        assert_eq!(found.archives, [first]);
+        assert!(!found.others_capped);
+    }
+
+    /// A ZIP that is the object itself: every header after its own is an entry.
+    #[test]
+    fn the_entries_of_a_zip_at_offset_zero_are_not_archives_of_their_own() {
+        let (data, first) = zip_after_prefix(40, 0);
+        let found = embedded_in(&&data[first..]);
+        assert!(found.archives.is_empty() && !found.others_capped);
+    }
+
+    /// Where the header does not say where the next entry begins, each header
+    /// stays a candidate: a data descriptor, encryption or ZIP64's size leaves
+    /// the position unknown.
+    #[test]
+    fn a_header_that_cannot_place_the_next_one_keeps_every_candidate() {
+        for flags in [0b1000, 0b0001] {
+            let (data, _) = zip_after_prefix(5, flags);
+            assert_eq!(embedded_in(&&data[..]).archives.len(), 5, "flags {flags:#b}");
+        }
+        let mut data = b"carrier\n".to_vec();
+        for k in 0..5 {
+            data.extend(zip_entry(&format!("m{k}"), 0, u32::MAX, 20));
+        }
+        assert_eq!(embedded_in(&&data[..]).archives.len(), 5, "ZIP64 size");
+    }
+
+    /// A header that names a size that does not lead to the next header does
+    /// not hide it: a second archive placed anywhere else is still a
+    /// candidate.
+    #[test]
+    fn a_size_that_misses_the_next_header_keeps_it_a_candidate() {
+        let mut data = b"carrier\n".to_vec();
+        let first = data.len();
+        // Declares 10 bytes of data, holds 20: the chain lands inside them.
+        data.extend(zip_entry("a", 0, 10, 20));
+        let second = data.len();
+        data.extend(zip_entry("b", 0, 20, 20));
+        assert_eq!(embedded_in(&&data[..]).archives, [first, second]);
     }
 
     #[test]
