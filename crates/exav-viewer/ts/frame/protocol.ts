@@ -57,6 +57,14 @@ export const READS = {
   head: 65_536,
 };
 
+/** What the frame may know and ask of the files around the one it shows (`FileTree`). */
+export const TREE = {
+  /** Paths listed. */
+  maxPaths: 20_000,
+  /** Bytes of one file the host reads for the frame. */
+  maxFileBytes: 256 * 1024 * 1024,
+};
+
 // ── Host to frame ────────────────────────────────────────────────────────────
 
 /** Plugin options that are plain data, per plugin. Functions stay on the frame's side. */
@@ -110,6 +118,8 @@ export interface OpenMessage {
   formats: readonly BuiltinFormat[];
   file: { name: string; type: string; path: string; format: BuiltinFormat | null };
   source: OpenSource;
+  /** The files around it: their paths, which the frame asks for by a `fetch`. */
+  tree?: { path: string; paths: string[] };
   options: FrameOptions;
   theme: FrameTheme;
 }
@@ -264,7 +274,12 @@ export type FrameMessage =
   | { type: "link"; url: string }
   /** Bytes of the document `generation` read by ranges, answered by a `bytes` with the same id (unique over the frame's life). */
   | { type: "read"; id: number; generation: number; offset: number; length: number }
-  /** A read no longer wanted. Its `bytes` still comes. */
+  /**
+   * A whole file of the tree `open` listed, answered by a `bytes` with the
+   * same id; the id is from the same count as a `read`'s.
+   */
+  | { type: "fetch"; id: number; path: string }
+  /** A read or fetch no longer wanted. Its `bytes` still comes. */
   | { type: "cancel"; id: number }
   /** A key pressed in the frame that the document did not use. */
   | { type: "key"; key: NavKey; shift: boolean; repeat: boolean }
@@ -556,6 +571,8 @@ export function checkFrameMessage(v: unknown): FrameMessage | null {
       return isInt(v.id) && isInt(v.generation) && isInt(v.offset) && isInt(v.length)
         ? { type: "read", id: v.id, generation: v.generation, offset: v.offset, length: v.length }
         : null;
+    case "fetch":
+      return isInt(v.id) && isText(v.path, MAX_PATH) ? { type: "fetch", id: v.id, path: v.path } : null;
     case "cancel":
       return isInt(v.id) ? { type: "cancel", id: v.id } : null;
     case "key":
@@ -722,7 +739,19 @@ export function checkOpen(v: unknown, known: readonly BuiltinFormat[]): OpenMess
   if (!isText(f.name, MAX_PATH) || !isText(f.type, 256) || !isText(f.path, MAX_PATH)) return null;
   const format = f.format === null ? null : oneOf(f.format, known) ? f.format : undefined;
   if (format === undefined) return null;
-  return { type: "open", formats, file: { name: f.name, type: f.type, path: f.path, format }, source, options: checkOptions(v.options), theme: checkTheme(v.theme) };
+  const tree = v.tree === undefined ? undefined : checkTree(v.tree);
+  if (tree === null) return null;
+  return { type: "open", formats, file: { name: f.name, type: f.type, path: f.path, format }, source, ...(tree ? { tree } : {}), options: checkOptions(v.options), theme: checkTheme(v.theme) };
+}
+
+function checkTree(v: unknown): { path: string; paths: string[] } | null {
+  if (!isObject(v) || !isText(v.path, MAX_PATH) || !isList(v.paths, TREE.maxPaths)) return null;
+  const paths: string[] = [];
+  for (const p of v.paths) {
+    if (!isText(p, MAX_PATH)) return null;
+    paths.push(p);
+  }
+  return { path: v.path, paths };
 }
 
 function checkSource(v: unknown): OpenSource | null {

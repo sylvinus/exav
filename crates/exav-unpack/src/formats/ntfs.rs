@@ -50,6 +50,7 @@
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::source::{ByteSource, Reader};
@@ -233,6 +234,7 @@ fn apply_fixups(rec: &mut [u8], sector: usize) -> bool {
 
 /// One extent of a non-resident attribute: `lcn` is `None` for a sparse run,
 /// which reads as zeroes.
+#[derive(Clone)]
 struct Run {
     lcn: Option<i64>,
     clusters: u64,
@@ -445,79 +447,110 @@ impl Mft {
 /// gets read. Which is exactly the kind of gap worth closing rather than
 /// reporting.
 fn data_extents(
-    rec: &[u8],
+    list: &[u8],
     v: &mut Vol,
     mft: &Mft,
     geo: &Geometry,
     sector: usize,
-) -> Option<(Vec<Run>, usize)> {
-    // The list itself is an attribute, resident or not.
-    let list = find_attribute_list(rec, v, geo)?;
+) -> Result<Option<(Vec<Run>, usize)>, TooManyExtents> {
     let mut refs: Vec<(u64, u64)> = Vec::new(); // (starting VCN, MFT record)
     let mut i = 0usize;
     while i.saturating_add(26) <= list.len() {
-        let atype = le_u32(&list, i);
-        let entry_len = le_u16(&list, i.saturating_add(4)) as usize;
+        let atype = le_u32(list, i);
+        let entry_len = le_u16(list, i.saturating_add(4)) as usize;
         if entry_len < 26 {
             break;
         }
         let name_len = list.get(i.saturating_add(6)).copied().unwrap_or(0);
         // Only the unnamed `$DATA`; a named one is an alternate stream.
         if atype == ATTR_DATA && name_len == 0 {
-            let vcn = le_u64(&list, i.saturating_add(8));
+            // More references than any file has: a list made to cost, which is
+            // not followed (the caller reports the file as not fully read).
+            if refs.len() >= MAX_LIST_REFS {
+                return Err(TooManyExtents);
+            }
+            let vcn = le_u64(list, i.saturating_add(8));
             // The low 48 bits of the file reference are the record number.
-            let record = le_u64(&list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
+            let record = le_u64(list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
             refs.push((vcn, record));
         }
         i = i.saturating_add(entry_len);
     }
     if refs.is_empty() {
-        return None;
+        return Ok(None);
     }
+    // An extent starts at one VCN, named once; the first of the entries that
+    // name it (the sort is stable) is the one.
     refs.sort_by_key(|&(vcn, _)| vcn);
+    refs.dedup_by_key(|&mut (vcn, _)| vcn);
 
+    // The extents each record holds, found once however many entries name
+    // the record: reading it for each entry costs the record's size each.
+    type Extents = HashMap<u64, (usize, Vec<Run>)>;
+    let mut records: HashMap<u64, Option<Extents>> = HashMap::new();
     let mut runs: Vec<Run> = Vec::new();
     let mut real_size = 0usize;
     for (vcn, record) in refs {
-        let Some(mut r) = mft.record(v, geo, record) else {
+        let held = records.entry(record).or_insert_with(|| {
+            let mut r = mft.record(v, geo, record)?;
+            if r.get(0..4) != Some(RECORD_MAGIC.as_slice()) || !apply_fixups(&mut r, sector) {
+                return None;
+            }
+            Some(extents_of(&r))
+        });
+        let Some((size, extent)) = held.as_ref().and_then(|h| h.get(&vcn)) else {
             continue;
         };
-        if r.get(0..4) != Some(RECORD_MAGIC.as_slice()) || !apply_fixups(&mut r, sector) {
-            continue;
+        // Only the extent starting at VCN 0 carries the true size.
+        if vcn == 0 {
+            real_size = *size;
         }
-        let mut off = le_u16(&r, 20) as usize;
-        while off.saturating_add(8) <= r.len() {
-            let atype = le_u32(&r, off);
-            if atype == ATTR_END {
-                break;
-            }
-            let alen = le_u32(&r, off.saturating_add(4)) as usize;
-            if alen < 16 || alen > r.len().saturating_sub(off) {
-                break;
-            }
-            let non_resident = r.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
-            if atype == ATTR_DATA
-                && r.get(off.saturating_add(9)).copied().unwrap_or(0) == 0
-                && non_resident
-                && le_u64(&r, off.saturating_add(16)) == vcn
-            {
-                // Only the extent starting at VCN 0 carries the true size.
-                if vcn == 0 {
-                    real_size = crate::bytes::to_usize(le_u64(&r, off.saturating_add(0x30)));
-                }
-                let runs_off = off.saturating_add(le_u16(&r, off.saturating_add(0x20)) as usize);
-                runs.extend(data_runs(
-                    r.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]),
-                ));
-                break;
-            }
-            off = off.saturating_add(alen);
-        }
+        runs.extend(extent.iter().cloned());
     }
     if runs.is_empty() || real_size == 0 {
-        return None;
+        return Ok(None);
     }
-    Some((runs, real_size))
+    Ok(Some((runs, real_size)))
+}
+
+/// The most `$DATA` entries of one attribute list that are followed. A file
+/// with its runs in this many records has more than any volume this reads holds.
+const MAX_LIST_REFS: usize = 1 << 16;
+
+/// An attribute list that names more extents than [`MAX_LIST_REFS`].
+struct TooManyExtents;
+
+/// The unnamed non-resident `$DATA` attributes of an MFT record by the VCN each
+/// starts at: its recorded size (the true one at VCN 0) and its runs. The first
+/// attribute of a VCN is the one.
+fn extents_of(r: &[u8]) -> HashMap<u64, (usize, Vec<Run>)> {
+    let mut found = HashMap::new();
+    let mut off = le_u16(r, 20) as usize;
+    while off.saturating_add(8) <= r.len() {
+        let atype = le_u32(r, off);
+        if atype == ATTR_END {
+            break;
+        }
+        let alen = le_u32(r, off.saturating_add(4)) as usize;
+        if alen < 16 || alen > r.len().saturating_sub(off) {
+            break;
+        }
+        let non_resident = r.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
+        if atype == ATTR_DATA
+            && r.get(off.saturating_add(9)).copied().unwrap_or(0) == 0
+            && non_resident
+        {
+            let vcn = le_u64(r, off.saturating_add(16));
+            found.entry(vcn).or_insert_with(|| {
+                let size = crate::bytes::to_usize(le_u64(r, off.saturating_add(0x30)));
+                let runs_off = off.saturating_add(le_u16(r, off.saturating_add(0x20)) as usize);
+                let runs = data_runs(r.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]));
+                (size, runs)
+            });
+        }
+        off = off.saturating_add(alen);
+    }
+    found
 }
 
 /// The `$ATTRIBUTE_LIST` value.
@@ -595,7 +628,14 @@ fn parse_record(
     }
     // The name is in this record, or, for a file fragmented hard enough to
     // have an attribute list, in an extension record the list names.
-    let name = record_name(rec).or_else(|| name_from_extensions(rec, v, mft, geo, sector));
+    // The attribute list is read once, for the name and for the data.
+    let mut list: Option<Option<Vec<u8>>> = None;
+    let name = record_name(rec).or_else(|| {
+        let l = list
+            .get_or_insert_with(|| find_attribute_list(rec, v, geo))
+            .as_deref()?;
+        name_from_extensions(l, v, mft, geo, sector)
+    });
     let mut file: Option<File> = None;
     let mut off = le_u16(rec, 20) as usize;
 
@@ -637,8 +677,13 @@ fn parse_record(
                 // split across several, listed in `$ATTRIBUTE_LIST`. Gather them
                 // all; falling back to this record alone would return the first
                 // extent and call it the whole file.
-                let spread = data_extents(rec, v, mft, geo, sector);
-                if le_u64(rec, off.saturating_add(16)) != 0 && spread.is_none() {
+                let spread = list
+                    .get_or_insert_with(|| find_attribute_list(rec, v, geo))
+                    .as_deref()
+                    .map_or(Ok(None), |l| data_extents(l, v, mft, geo, sector));
+                let refused = spread.is_err();
+                let spread = spread.ok().flatten();
+                if refused || (le_u64(rec, off.saturating_add(16)) != 0 && spread.is_none()) {
                     // Only this extent is reachable. Report the shortfall, but
                     // still scan the part that is here.
                     let real_size = crate::bytes::to_usize(le_u64(rec, off.saturating_add(0x30)));
@@ -655,10 +700,13 @@ fn parse_record(
                     file = Some(File {
                         name: String::new(),
                         data: Some(part),
-                        unreadable: Some(
+                        unreadable: Some(if refused {
+                            "NTFS file whose attribute list names more extents than exav \
+                             follows; the extent that could be read was scanned"
+                        } else {
                             "NTFS file whose data runs span MFT records exav could not follow; \
-                             the extent that could be read was scanned",
-                        ),
+                             the extent that could be read was scanned"
+                        }),
                         deleted,
                     });
                 } else {
@@ -805,28 +853,36 @@ fn record_name(rec: &[u8]) -> Option<String> {
 /// The name of a file whose record has none because its `$FILE_NAME` is in an
 /// extension record, which the `$ATTRIBUTE_LIST` names.
 fn name_from_extensions(
-    rec: &[u8],
+    list: &[u8],
     v: &mut Vol,
     mft: &Mft,
     geo: &Geometry,
     sector: usize,
 ) -> Option<String> {
-    let list = find_attribute_list(rec, v, geo)?;
     let mut name: Option<String> = None;
     let mut i = 0usize;
+    // A record is read once however many entries name it (each read costs the
+    // record's size), and no more than [`MAX_LIST_REFS`] are.
+    let mut read: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Bounded by the list, which is bounded by the volume.
     while i.saturating_add(26) <= list.len() {
-        let entry_len = le_u16(&list, i.saturating_add(4)) as usize;
+        let entry_len = le_u16(list, i.saturating_add(4)) as usize;
         if entry_len < 26 {
             break;
         }
-        if le_u32(&list, i) == ATTR_FILE_NAME {
-            let record = le_u64(&list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
-            if let Some(mut r) = mft.record(v, geo, record) {
-                if r.get(0..4) == Some(RECORD_MAGIC.as_slice()) && apply_fixups(&mut r, sector) {
-                    if let Some(n) = record_name(&r) {
-                        if name.as_ref().is_none_or(|old| n.len() > old.len()) {
-                            name = Some(n);
+        if le_u32(list, i) == ATTR_FILE_NAME {
+            let record = le_u64(list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
+            if read.len() >= MAX_LIST_REFS {
+                break;
+            }
+            if read.insert(record) {
+                if let Some(mut r) = mft.record(v, geo, record) {
+                    if r.get(0..4) == Some(RECORD_MAGIC.as_slice()) && apply_fixups(&mut r, sector)
+                    {
+                        if let Some(n) = record_name(&r) {
+                            if name.as_ref().is_none_or(|old| n.len() > old.len()) {
+                                name = Some(n);
+                            }
                         }
                     }
                 }

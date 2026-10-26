@@ -15,6 +15,7 @@
 //! count is capped to reject a DoS, and a wrong passphrase simply yields bytes
 //! the downstream codec rejects (never a panic, never emitted as data).
 
+use crate::kdf::Pass;
 use crate::LimitHit;
 use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
 use sha2::{Digest, Sha256};
@@ -138,15 +139,26 @@ impl Aes7zReader {
     pub(super) fn new(
         inner: Box<dyn Read>,
         properties: &[u8],
-        password: Option<&str>,
+        password: Option<Pass<'_>>,
     ) -> Result<Self, LimitHit> {
-        let Some(password) = password else {
+        let Some(pass) = password else {
             return Err(LimitHit::corrupt("7z: AES member needs a password".into()));
         };
         let props =
             parse_props(properties).ok_or_else(|| LimitHit::corrupt("7z: bad AES props".into()))?;
-        let key = derive_key(&utf16le(password), &props.salt, props.num_cycles_power)
-            .ok_or_else(|| LimitHit::corrupt("7z: AES KDF cost too high".into()))?;
+        let word = utf16le(pass.word);
+        // The key is made once per password, salt and count in a scan, and the
+        // scan has a bound on the rounds it spends ([`crate::kdf`]).
+        let key = match props.num_cycles_power {
+            NO_HASH_CYCLES => derive_key(&word, &props.salt, NO_HASH_CYCLES),
+            cycles if cycles > MAX_CYCLES_POWER => None,
+            cycles => pass
+                .kdf
+                .sevenz_key(&word, &props.salt, cycles, 1u64 << cycles, || {
+                    derive_key(&word, &props.salt, cycles)
+                }),
+        }
+        .ok_or_else(|| LimitHit::corrupt("7z: AES KDF cost too high".into()))?;
         Ok(Aes7zReader {
             inner: Some(inner),
             key,
@@ -223,8 +235,12 @@ mod tests {
         let plain = b"CreateObject(\"WScript.Shell\") EICAR body padded out to blocks!!".to_vec();
         let ct = encrypt(&key, &parsed.iv, plain.clone());
 
-        let mut reader =
-            Aes7zReader::new(Box::new(Cursor::new(ct)), &props, Some("s3cr3t")).unwrap();
+        let kdf = crate::kdf::Kdf::default();
+        let pass = Pass {
+            word: "s3cr3t",
+            kdf: &kdf,
+        };
+        let mut reader = Aes7zReader::new(Box::new(Cursor::new(ct)), &props, Some(pass)).unwrap();
         let mut got = Vec::new();
         reader.read_to_end(&mut got).unwrap();
         // Decryption yields the block-padded plaintext; the real caller truncates
@@ -242,8 +258,12 @@ mod tests {
         let key = derive_key(&utf16le("right"), &parsed.salt, parsed.num_cycles_power).unwrap();
         let plain = vec![0x41u8; 32];
         let ct = encrypt(&key, &parsed.iv, plain.clone());
-        let mut reader =
-            Aes7zReader::new(Box::new(Cursor::new(ct)), &props, Some("wrong")).unwrap();
+        let kdf = crate::kdf::Kdf::default();
+        let pass = Pass {
+            word: "wrong",
+            kdf: &kdf,
+        };
+        let mut reader = Aes7zReader::new(Box::new(Cursor::new(ct)), &props, Some(pass)).unwrap();
         let mut got = Vec::new();
         reader.read_to_end(&mut got).unwrap();
         assert_ne!(got, plain, "wrong password must not recover plaintext");
@@ -251,14 +271,56 @@ mod tests {
 
     #[test]
     fn dos_guard_and_missing_password() {
+        let kdf = crate::kdf::Kdf::default();
+        let pass = Pass {
+            word: "x",
+            kdf: &kdf,
+        };
         // Cycle power above the cap is rejected.
         let hot = build_props(40, b"s", &[0u8; 16]);
-        assert!(Aes7zReader::new(Box::new(Cursor::new(vec![])), &hot, Some("x")).is_err());
+        assert!(Aes7zReader::new(Box::new(Cursor::new(vec![])), &hot, Some(pass)).is_err());
         // Missing password is rejected.
         let ok = build_props(16, b"s", &[0u8; 16]);
         assert!(Aes7zReader::new(Box::new(Cursor::new(vec![])), &ok, None).is_err());
         // Malformed props are rejected.
-        assert!(Aes7zReader::new(Box::new(Cursor::new(vec![])), &[], Some("x")).is_err());
+        assert!(Aes7zReader::new(Box::new(Cursor::new(vec![])), &[], Some(pass)).is_err());
+    }
+
+    /// Thousands of folders of one archive, which 7-Zip gives the same key, cost
+    /// one derivation; a scan that asks for more than its share is refused
+    /// the rest, whatever the passwords.
+    #[test]
+    fn a_scan_derives_a_key_once_and_within_its_share() {
+        let kdf = crate::kdf::Kdf::default();
+        let props = build_props(16, b"s", &[9u8; 16]);
+        let start = std::time::Instant::now();
+        for _ in 0..2000 {
+            let pass = Pass {
+                word: "same",
+                kdf: &kdf,
+            };
+            assert!(Aes7zReader::new(Box::new(Cursor::new(vec![])), &props, Some(pass)).is_ok());
+        }
+        // 2000 derivations of 2^16 would be 1.3 s here; one is a few ms.
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(kdf.sevenz_spent(), 1 << 16);
+        // Many passwords at 2^24: 4 are derived, then the scan has no share left.
+        let hot = build_props(24, b"s", &[9u8; 16]);
+        let mut derived = 0;
+        for n in 0..8 {
+            let word = format!("password {n}");
+            let pass = Pass {
+                word: &word,
+                kdf: &kdf,
+            };
+            if Aes7zReader::new(Box::new(Cursor::new(vec![])), &hot, Some(pass)).is_ok() {
+                derived += 1;
+            }
+        }
+        assert_eq!(
+            derived, 3,
+            "2^26 less the 2^16 already spent is three of 2^24"
+        );
     }
 
     /// Build a 7zAES property blob with an explicit salt and IV (both present).

@@ -4,7 +4,10 @@
 //! parameter to the other, by the parametrisation each kind of curve
 //! publishes. A polyline's parameter is the index of its points, a
 //! composite curve's the sum of its segments' parametric lengths, a circle's
-//! an angle in the file's unit, a line's the multiple of its vector.
+//! an angle in the file's unit, a line's the multiple of its vector. Two
+//! writers' habits are read as they meant them: a range of 0 to 1 on a
+//! polyline of more than one segment is the whole polyline, and an end that
+//! counts each polyline of a composite curve once is the end of that curve.
 
 use std::f64::consts::TAU;
 
@@ -75,10 +78,21 @@ impl<'a> Reader<'a> {
             return self.curve(id, depth + 1);
         }
         let ty = self.get(id)?.0;
-        let Some(samples) = self.parametrised(id, s.zip(e), depth + 1) else {
+        let Some(mut samples) = self.parametrised(id, s.zip(e), depth + 1) else {
             self.unsupported(ty);
             return self.curve(id, depth + 1);
         };
+        if let Some(alt) = self.counted_by_polyline(id, e, samples.last()?.0, depth) {
+            samples = alt;
+        }
+        // Allplan writes 0 to 1 for a whole polyline of any length.
+        if matches!(ty, b"IFCPOLYLINE" | b"IFCINDEXEDPOLYCURVE")
+            && samples.len() > 2
+            && s == Some(0.0)
+            && e == Some(1.0)
+        {
+            return Some(samples.into_iter().map(|x| x.1).collect());
+        }
         let first = samples.first()?.0;
         let last = samples.last()?.0;
         cut(&samples, s.unwrap_or(first), e.unwrap_or(last))
@@ -152,48 +166,87 @@ impl<'a> Reader<'a> {
                 if curve_segments {
                     return self.curve_segments(list);
                 }
-                let mut out: Vec<(f64, V3)> = Vec::new();
-                let mut acc = 0.0;
-                for seg in list.iter().filter_map(Value::id) {
-                    let (sty, sp) = self.get(seg)?;
-                    if !is(
-                        sty,
-                        &[
-                            b"IFCCOMPOSITECURVESEGMENT",
-                            b"IFCREPARAMETRISEDCOMPOSITECURVESEGMENT",
-                        ],
-                    ) {
-                        return None;
-                    }
-                    let parent = self.parametrised(sp.get(2)?.id()?, None, depth + 1)?;
-                    let (t0, t1) = (parent.first()?.0, parent.last()?.0);
-                    let own = t1 - t0;
-                    let length = if sty == b"IFCREPARAMETRISEDCOMPOSITECURVESEGMENT" {
-                        sp.get(3)?.num().filter(|l| *l > 0.0 && l.is_finite())?
-                    } else {
-                        own
-                    };
-                    let factor = if own > 0.0 { length / own } else { 0.0 };
-                    let same = sp.get(1).and_then(Value::boolean).unwrap_or(true);
-                    let mut part: Vec<(f64, V3)> = parent
-                        .iter()
-                        .map(|&(t, q)| (acc + if same { t - t0 } else { t1 - t } * factor, q))
-                        .collect();
-                    if !same {
-                        part.reverse();
-                    }
-                    out.extend(part);
-                    acc += length;
-                    if out.len() > MAX_POINTS {
-                        return None;
-                    }
-                }
-                Some(out)
+                self.composite(list, false, depth)
             }
             b"IFCGRADIENTCURVE" => self.gradient_curve(&p, depth),
             _ => None,
         };
         samples.filter(|s| s.len() >= 2 && s.windows(2).all(|w| w[1].0 >= w[0].0))
+    }
+
+    /// The samples of composite curve `id` when its `end` parameter only
+    /// fits a count of 1 per polyline, which is how Revit writes it, and
+    /// not the one `last` of the usual count.
+    fn counted_by_polyline(
+        &mut self,
+        id: u32,
+        end: Option<f64>,
+        last: f64,
+        depth: u32,
+    ) -> Option<Vec<(f64, V3)>> {
+        let fits = |a: f64, b: f64| (a - b).abs() <= 1e-6 * b.abs().max(1.0);
+        let end = end.filter(|e| !fits(*e, last))?;
+        let (ty, p) = self.get(id)?;
+        if ty != b"IFCCOMPOSITECURVE" {
+            return None;
+        }
+        let alt = self.composite(p.first()?.list()?, true, depth + 1)?;
+        fits(end, alt.last()?.0).then_some(alt)
+    }
+
+    /// The segments `list` of a composite curve, each spanning its parent
+    /// curve's parameters. With `unit_polylines` a polyline spans 1 however
+    /// many points it has, as Revit counts it.
+    fn composite(
+        &mut self,
+        list: &[Value],
+        unit_polylines: bool,
+        depth: u32,
+    ) -> Option<Vec<(f64, V3)>> {
+        let mut out: Vec<(f64, V3)> = Vec::new();
+        let mut acc = 0.0;
+        for seg in list.iter().filter_map(Value::id) {
+            let (sty, sp) = self.get(seg)?;
+            if !is(
+                sty,
+                &[
+                    b"IFCCOMPOSITECURVESEGMENT",
+                    b"IFCREPARAMETRISEDCOMPOSITECURVESEGMENT",
+                ],
+            ) {
+                return None;
+            }
+            let parent_id = sp.get(2)?.id()?;
+            let parent = self.parametrised(parent_id, None, depth + 1)?;
+            let (t0, t1) = (parent.first()?.0, parent.last()?.0);
+            let own = t1 - t0;
+            let length = if sty == b"IFCREPARAMETRISEDCOMPOSITECURVESEGMENT" {
+                sp.get(3)?.num().filter(|l| *l > 0.0 && l.is_finite())?
+            } else if unit_polylines
+                && self
+                    .get(parent_id)
+                    .is_some_and(|(t, _)| t == b"IFCPOLYLINE")
+            {
+                1.0
+            } else {
+                own
+            };
+            let factor = if own > 0.0 { length / own } else { 0.0 };
+            let same = sp.get(1).and_then(Value::boolean).unwrap_or(true);
+            let mut part: Vec<(f64, V3)> = parent
+                .iter()
+                .map(|&(t, q)| (acc + if same { t - t0 } else { t1 - t } * factor, q))
+                .collect();
+            if !same {
+                part.reverse();
+            }
+            out.extend(part);
+            acc += length;
+            if out.len() > MAX_POINTS {
+                return None;
+            }
+        }
+        Some(out)
     }
 }
 

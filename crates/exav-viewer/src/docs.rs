@@ -34,7 +34,7 @@ impl ConvertedDocs {
 }
 
 /// Converts `bytes`, a document of `format` ("doc", "odt", "fodt", "rtf",
-/// "wml2003" or "pages"), within `max_paragraphs` paragraphs and `max_memory`
+/// "wml2003", "pages" or "html"), within `max_paragraphs` paragraphs and `max_memory`
 /// bytes. Fails with the error's kind as message: "not-format", "encrypted",
 /// "unsupported", "too-large" or "malformed".
 #[wasm_bindgen(js_name = convertDocs)]

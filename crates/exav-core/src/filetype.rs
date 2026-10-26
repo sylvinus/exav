@@ -555,6 +555,10 @@ pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
         // the filesystem inside, which is typed when the member is scanned.
         Format::Vhd => FileType::Unknown,
         Format::Lzw => FileType::Unknown,
+        // LZMA Utils' `.lzma` has no ClamAV type either.
+        Format::Lzma => FileType::Unknown,
+        // So has an RPM package.
+        Format::Rpm => FileType::Unknown,
         Format::Qcow2 | Format::Vmdk | Format::Vhdx => FileType::Unknown,
         Format::Wim => FileType::Wim,
         Format::Lz4 => FileType::Lz4,
@@ -633,6 +637,8 @@ pub(crate) const MAGIC_DISPATCH_ONLY: &[crate::unpack::Format] = &[
     crate::unpack::Format::Dmg,
     crate::unpack::Format::Vhd,
     crate::unpack::Format::Lzw,
+    crate::unpack::Format::Lzma,
+    crate::unpack::Format::Rpm,
     crate::unpack::Format::Qcow2,
     crate::unpack::Format::Vmdk,
     crate::unpack::Format::Vhdx,

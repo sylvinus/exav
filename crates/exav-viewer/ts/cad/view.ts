@@ -16,9 +16,11 @@
  */
 import { RasterError, throwIfAborted } from "../core/pictures.js";
 import { createPictures } from "../core/raster.js";
+import { createSourceReader } from "../core/source.js";
 import { writable } from "../core/store.js";
 import { isColor } from "../core/theme.js";
-import type { GroundController, LayersController, LayoutsController, Raster, RasterOptions, Renderer as PluginRenderer, Viewport, Warning, ZoomController } from "../core/types.js";
+import { resolveInTree } from "../core/tree.js";
+import type { FileTree, GroundController, LayersController, LayoutsController, Raster, RasterOptions, Renderer as PluginRenderer, Viewport, Warning, ZoomController } from "../core/types.js";
 import { createWorkerHost } from "../core/worker-host.js";
 import { drawPicture, parseColor } from "./export.js";
 import type { CadOptions } from "./plugin.js";
@@ -45,6 +47,9 @@ import { createZoomGesture, viewTransform } from "./zoom-gesture.js";
 import type { CadAnswer, CadRequest } from "./cad.worker.js";
 
 export const GROUNDS = { light: "#ffffff", dark: "#212830" } as const;
+
+/** The external references bound from the files around a drawing: those it names, and those they name. */
+const MAX_BOUND_REFERENCES = 64;
 
 /** exav-render's `SCENE_BUDGET`. */
 const DEFAULT_MAX_PRIMITIVES = 8_000_000;
@@ -557,6 +562,41 @@ export const renderer: PluginRenderer<CadOptions> = {
     });
     const viewport = { get: viewportStore.get, subscribe: viewportStore.subscribe };
 
+    /**
+     * Binds the files the parsed drawing's references name that the tree has,
+     * and those they name in turn. A reference the tree does not have, or a
+     * file that does not read, stays as it is: its path drawn where it is
+     * inserted, and counted in the warnings.
+     */
+    const bindReferences = async (tree: FileTree, named: string[]) => {
+      const tried = new Set<string>();
+      let wanted = named;
+      for (let n = 0; n < MAX_BOUND_REFERENCES; ) {
+        const path = wanted.find((p) => !tried.has(p.toLowerCase()));
+        if (path === undefined) return;
+        tried.add(path.toLowerCase());
+        const found = resolveInTree(tree, path, [".dwg"]);
+        if (found === null) continue;
+        n++;
+        try {
+          const reader = createSourceReader(await tree.open(found, ctx.signal), ctx.signal);
+          let bytes: Uint8Array;
+          try {
+            bytes = (await reader.bytes()).slice();
+          } finally {
+            reader.dispose();
+          }
+          const answer = (await engine.call({ kind: "attach", path, bytes: bytes.buffer as ArrayBuffer, maxDecompressedBytes }, [bytes.buffer as ArrayBuffer], timeoutMs)) as {
+            xrefs: string[];
+          };
+          wanted = answer.xrefs;
+        } catch (error) {
+          if (destroyed || ctx.signal.aborted) throw error;
+          console.warn(`cad: could not bind ${path} from ${found}`, error);
+        }
+      }
+    };
+
     // A session closed while the file is still being read or parsed: the
     // worker is stopped now, not when it would have finished.
     ctx.signal.addEventListener("abort", destroy, { once: true });
@@ -588,14 +628,26 @@ export const renderer: PluginRenderer<CadOptions> = {
         ctx.status({ phase: "error", error: { code: "drawing_version" } });
         return { controllers: {}, resize: onResize, destroy };
       }
-      await show(
-        engine.call(
-          { kind: "parse", bytes: again, layout: "", background: backgroundBytes(), maxPrimitives, maxDecompressedBytes },
+      const tree = ctx.file.tree;
+      if (tree) {
+        // The files around the drawing are bound in before it is drawn.
+        const parsed = (await engine.call(
+          { kind: "parse", bytes: again, layout: "", background: backgroundBytes(), maxPrimitives, maxDecompressedBytes, draw: false },
           again ? [again] : [],
           timeoutMs,
-        ),
-        false,
-      );
+        )) as { xrefs: string[] };
+        await bindReferences(tree, parsed.xrefs);
+        await show(engine.call({ kind: "layout", layout: "", background: backgroundBytes(), maxPrimitives }, [], timeoutMs), false);
+      } else {
+        await show(
+          engine.call(
+            { kind: "parse", bytes: again, layout: "", background: backgroundBytes(), maxPrimitives, maxDecompressedBytes },
+            again ? [again] : [],
+            timeoutMs,
+          ),
+          false,
+        );
+      }
     } catch (error) {
       destroy();
       throw error;

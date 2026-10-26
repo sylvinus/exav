@@ -51,9 +51,14 @@ pub(crate) mod iso;
 pub(crate) mod lha;
 #[cfg(feature = "lzip")]
 pub(crate) mod lzip;
+#[cfg(feature = "lzma")]
+pub(crate) mod lzmaalone;
+#[cfg(feature = "rpm")]
+pub(crate) mod rpm;
 // Every feature that enables `lzma-rust2`.
 #[cfg(any(
     feature = "lzip",
+    feature = "lzma",
     feature = "sevenz",
     feature = "swf",
     feature = "nsis",
@@ -193,6 +198,8 @@ mod xar;
 #[cfg_attr(not(feature = "xz"), allow(dead_code))]
 #[doc(hidden)]
 pub mod xz;
+#[cfg(any(feature = "xz", feature = "dmg"))]
+mod xz_nocheck;
 #[cfg(feature = "zip")]
 #[doc(hidden)]
 pub mod zip;

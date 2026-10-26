@@ -59,11 +59,11 @@ export const renderer: Renderer<IfcOptions> = {
       if (destroyed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
       ctx.status({ phase: "loading", step: "read" });
       const bytes = source.slice();
-      const model: ParsedModel = await engine.call(
+      const model = (await engine.call(
         { kind: "ifc", bytes: bytes.buffer as ArrayBuffer, maxTriangles: ctx.options.maxTriangles ?? DEFAULT_MAX_TRIANGLES },
         [bytes.buffer as ArrayBuffer],
         ctx.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      );
+      )) as ParsedModel;
       // The engine's work is done: its memory goes back now.
       engine.destroy();
       if (destroyed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");

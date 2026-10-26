@@ -1612,7 +1612,7 @@ fn image(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> Image {
             283 => i.fade = t.i16(),
             360 => i.reactor = handle(t),
             71 => i.clip_type = t.i16(),
-            290 => i.clip_inside = t.bool(),
+            290 => i.clip_inverted = t.bool(),
             _ => {}
         }
     }

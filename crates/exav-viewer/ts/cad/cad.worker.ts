@@ -13,7 +13,12 @@ export type CadRequest =
    * (`unsupported`), and not kept.
    */
   | { kind: "load"; bytes: ArrayBuffer }
-  /** Parse a DWG or DXF (the bytes given, else those loaded) and draw a layout; "" is model space. */
+  /**
+   * Parse a DWG or DXF (the bytes given, else those loaded) and draw a
+   * layout; "" is model space. With `draw: false` nothing is drawn: the
+   * answer is the files its external references name (`xrefs`), to be
+   * attached before the first `layout`.
+   */
   | {
       kind: "parse";
       bytes?: ArrayBuffer;
@@ -21,11 +26,18 @@ export type CadRequest =
       background: Uint8Array;
       maxPrimitives: number;
       maxDecompressedBytes: number;
+      draw?: boolean;
     }
   /** Draw another layout of the file already parsed. */
-  | { kind: "layout"; layout: string; background: Uint8Array; maxPrimitives: number };
+  | { kind: "layout"; layout: string; background: Uint8Array; maxPrimitives: number }
+  /**
+   * Bind the drawing in `bytes`, the file `path` names (as the parsed
+   * drawing wrote it), into the references to it. Answers how many blocks it
+   * filled and the files still named.
+   */
+  | { kind: "attach"; path: string; bytes: ArrayBuffer; maxDecompressedBytes: number };
 
-export type CadAnswer = ParsedDrawing | { preview: DrawingPreview | null; unsupported: string | null };
+export type CadAnswer = ParsedDrawing | { preview: DrawingPreview | null; unsupported: string | null } | { xrefs: string[]; attached: number };
 
 let ready: Promise<unknown> | null = null;
 // The parsed document outlives a request, so a layout switch costs only a
@@ -105,8 +117,13 @@ serve<CadRequest, CadAnswer>(async (r) => {
     loaded = null;
     if (!bytes) throw new Error("no drawing loaded");
     doc = parseDrawing(bytes, r.maxDecompressedBytes);
+    if (r.draw === false) return { value: { xrefs: JSON.parse(doc.xrefPathsJson()) as string[], attached: 0 } };
     return draw(doc, r, started);
   }
   if (!doc) throw new Error("no drawing loaded");
+  if (r.kind === "attach") {
+    const attached = doc.attachXref(r.path, new Uint8Array(r.bytes), r.maxDecompressedBytes);
+    return { value: { xrefs: JSON.parse(doc.xrefPathsJson()) as string[], attached } };
+  }
   return draw(doc, r, started);
 });

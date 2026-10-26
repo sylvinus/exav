@@ -244,3 +244,21 @@ fn an_r12_viewport_view_is_read_from_its_extended_data() {
     assert_ne!(v.flags & 0x200, 0);
     assert_eq!((v.grid_spacing.x, v.grid_spacing.y), (0.5, 0.5));
 }
+
+/// An R14 file from a writer with no block record table gives every entity
+/// of the ENTITIES section the owner of its first BLOCK (1F). The section is
+/// the model space's whatever the owner says.
+#[test]
+fn entities_owned_by_an_ordinary_block_are_still_the_models() {
+    let d = drawing(
+        "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n5\n20\n330\n1F\n100\nAcDbEntity\n8\n0\n\
+         100\nAcDbBlockBegin\n2\n*U\n70\n1\n10\n0\n20\n0\n30\n0\n3\n*U\n1\n\n\
+         0\nENDBLK\n5\n21\n330\n1F\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockEnd\n0\nENDSEC\n\
+         0\nSECTION\n2\nENTITIES\n0\nLINE\n5\n8B\n330\n1F\n100\nAcDbEntity\n8\n0\n\
+         100\nAcDbLine\n10\n0\n20\n0\n30\n0\n11\n1\n21\n1\n31\n0\n0\nENDSEC\n",
+    );
+    let model = d.model_space().expect("a model space");
+    assert_eq!(model.entities.len(), 1);
+    let star_u = d.blocks.iter().find(|b| b.name == "*U").expect("*U");
+    assert!(star_u.entities.is_empty());
+}

@@ -31,7 +31,7 @@ pub(super) fn wrap_coder(
     inner: Box<dyn Read>,
     coder: &Coder,
     expected_size: usize,
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
 ) -> Result<Box<dyn Read>, LimitHit> {
     let _ = password;

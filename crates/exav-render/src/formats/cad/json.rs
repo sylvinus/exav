@@ -862,7 +862,7 @@ fn image(o: &mut Obj<'_>, i: &Image) {
     o.h("reactor", i.reactor);
     o.i("clip_type", i.clip_type);
     o.v2s("clip_vertices", &i.clip_vertices);
-    o.b("clip_inside", i.clip_inside);
+    o.b("clip_inverted", i.clip_inverted);
 }
 
 fn entity(o: &mut Obj<'_>, e: &Entity) {

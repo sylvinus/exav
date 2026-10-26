@@ -41,10 +41,19 @@ quick-error = { version = "2.0.1", optional = true }
 # assertion that a TIFF stream without a clear code tripped; it decodes the same.
 weezl = { version = "=0.1.12", optional = true }
 bytemuck = { version = "1", optional = true }
+# Zstandard strips and tiles of a TIFF, for the viewer's `decode_any` only (as
+# exav-unpack reads them, same version).
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"], optional = true }
+# LZMA strips and tiles of a TIFF (libtiff's `LZMA`, written by GDAL), for the
+# viewer's `decode_any` only; the LZMA2 decoder that exav-unpack uses, same version.
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 # JPEG 2000, JBIG2 and CCITT fax, which libclamav does not decode.
 # `forbid(unsafe_code)` crates, built without `simd` (fearless_simd, whose
 # intrinsics are `unsafe`) and `image` (the `image` and moxcms integration).
 # hayro-ccitt is hayro-jbig2's own MMR decoder.
+# BC1 to BC7 blocks for the viewer's DDS fallback (`decode_any`): safe, no
+# dependencies, MIT.
+bcdec_rs = { version = "=0.2.0", optional = true }
 hayro-jpeg2000 = { version = "=0.4.1", default-features = false, features = ["std"], optional = true }
 hayro-jbig2 = { version = "=0.3.1", default-features = false, features = ["std"], optional = true }
 hayro-ccitt = { version = "=0.4.0", optional = true }
@@ -79,7 +88,7 @@ default = ["image", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbi
 image = [
     "dep:image", "dep:png", "dep:gif", "dep:zune-jpeg", "dep:zune-core", "dep:zune-core-04",
     "dep:zune-jpeg-04", "dep:fax34", "dep:flate2", "dep:quick-error", "dep:weezl",
-    "dep:bytemuck",
+    "dep:bytemuck", "dep:ruzstd", "dep:lzma-rust2",
 ]
 # Each is a decoder without `unsafe`: image-webp and qoi are
 # `forbid(unsafe_code)`, the others are `image`'s own. OpenEXR is left out: its
@@ -88,7 +97,7 @@ webp = ["image", "image/webp"]
 ico = ["image", "image/ico"]
 pnm = ["image", "image/pnm"]
 qoi = ["image", "image/qoi"]
-dds = ["image", "image/dds"]
+dds = ["image", "image/dds", "dep:bcdec_rs"]
 ff = ["image", "image/ff"]
 hdr = ["image", "image/hdr"]
 # JPEG 2000: with `image`, a JP2 or JPX file or a raw codestream (.j2k,
@@ -145,8 +154,9 @@ office-sheets = ["_office", "dep:md-5", "dep:sha1"]
 # OTP and Apple Keynote; drawings: ODG, OTG, FODG and Visio (VSDX).
 office-slides = ["_office", "dep:md-5", "dep:sha1"]
 # Text documents into DOCX (`docs`): Word 6 to 2003, ODT, FODT, OTT, RTF,
-# Word 2003 XML and Apple Pages.
-office-docs = ["_office"]
+# Word 2003 XML, Apple Pages and HTML pages (Word's "Save as Web Page"), which
+# are read with the HTML tokenizer and style sheets of `sheets`.
+office-docs = ["_office", "office-sheets"]
 # Every office converter.
 office = ["office-sheets", "office-slides", "office-docs"]
 # Writers of compound files, protobuf messages and Snappy blocks, for the
@@ -284,6 +294,10 @@ required-features = ["office-docs", "office-test-util"]
 
 [[test]]
 name = "office_docs_formats"
+required-features = ["office-docs", "office-test-util"]
+
+[[test]]
+name = "office_docs_html"
 required-features = ["office-docs", "office-test-util"]
 
 [[test]]

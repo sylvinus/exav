@@ -233,7 +233,11 @@ fn compute_chunk_iv(hmac_key: &[u8], chunk_no: u32) -> [u8; 16] {
 /// Decrypt the encrypted DMG data using the given password.
 /// Returns the decrypted raw disk image, or None if the password is wrong.
 #[cfg(feature = "decrypt")]
-fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
+fn try_decrypt_dmg(
+    data: &[u8],
+    password: &str,
+    spent: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<u8>, LimitHit> {
     let header = parse_encrypted_header(data)?;
 
     if header.version != 2 {
@@ -253,6 +257,16 @@ fn try_decrypt_dmg(data: &[u8], password: &str) -> Result<Vec<u8>, LimitHit> {
     }
 
     let hmac_key_bytes = header.hmac_key_bits as usize / 8;
+
+    // The iteration count is the file's, up to 2^32: the scan has a bound on
+    // what it spends on them, over every password and every image
+    // ([`crate::kdf`]). A count of 0 is read as 1000 below.
+    let iterations = u64::from(header.kdf_iteration_count).max(1000);
+    if !crate::kdf::charge(spent, iterations, crate::kdf::PBKDF2_MAX_ROUNDS) {
+        return Err(LimitHit::new(
+            "encrypted DMG: key derivation past the scan's bound".into(),
+        ));
+    }
 
     // Derive key from password.
     let derived_key = derive_key_dmg(
@@ -389,7 +403,7 @@ fn decrypt_image(
         }
         let data = crate::stream::read_whole(Format::Dmg, src, budget)?;
         for pw in &budget.passwords {
-            let Ok(decrypted) = try_decrypt_dmg(&data, pw) else {
+            let Ok(decrypted) = try_decrypt_dmg(&data, pw, &budget.kdf_rounds) else {
                 continue;
             };
             // A right password gives a koly trailer or a filesystem.
@@ -701,8 +715,37 @@ mod tests {
         put32(&mut h, 104, 1); // kdf iterations
         put32(&mut h, 196, 64); // keyblob size
         h.resize(8192, 0);
-        let out = try_decrypt_dmg(&h, "any").expect("the walk ends with nothing decrypted");
+        let spent = std::sync::atomic::AtomicU64::new(0);
+        let out = try_decrypt_dmg(&h, "any", &spent).expect("the walk ends with nothing decrypted");
         assert!(out.is_empty());
+    }
+
+    /// The iteration count is the file's (a `u32`); 264 bytes with u32::MAX took
+    /// 9 minutes of PBKDF2 to refuse every password. A count past what a scan
+    /// may spend is not derived, whatever the passwords.
+    #[test]
+    fn an_iteration_count_past_the_scans_bound_is_not_derived() {
+        let mut h = vec![0u8; 264];
+        h[..8].copy_from_slice(b"encrcdsa");
+        let put32 =
+            |h: &mut Vec<u8>, at: usize, v: u32| h[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        put32(&mut h, 8, 2);
+        put32(&mut h, 24, 128);
+        put32(&mut h, 32, 160);
+        put32(&mut h, 52, 4096);
+        put32(&mut h, 104, u32::MAX);
+        put32(&mut h, 196, 64);
+        let spent = std::sync::atomic::AtomicU64::new(0);
+        let start = std::time::Instant::now();
+        for password in ["a", "b", "c"] {
+            assert!(try_decrypt_dmg(&h, password, &spent).is_err());
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(spent.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // What a header written by Disk Utility asks for is derived, and counted.
+        put32(&mut h, 104, 1000);
+        let _ = try_decrypt_dmg(&h, "a", &spent);
+        assert_eq!(spent.load(std::sync::atomic::Ordering::Relaxed), 1000);
     }
 
     /// Write a well-formed HFS+ volume header at `off`.

@@ -24,7 +24,12 @@ export const LISTS = {
   // This package's: pure computation on the bytes handed in.
   exav_viewer_image_bg: { imports: BINDGEN, why: "exav-render's image decoders" },
   exav_viewer_dwg_bg: { imports: BINDGEN, why: "exav-render's DWG and DXF engine" },
-  exav_viewer_model_bg: { imports: BINDGEN, why: "exav-render's IFC and STL meshes" },
+  // `parseGltfWith` takes the names of a glTF's buffer files as an array of
+  // strings: wasm-bindgen reads each and drops the reference it made.
+  exav_viewer_model_bg: {
+    imports: [...BINDGEN, "glue.__wbg___wbindgen_string_get", "glue.__wbindgen_object_drop_ref"],
+    why: "exav-render's IFC, STL and glTF meshes",
+  },
   exav_viewer_text_bg: { imports: BINDGEN, why: "exav-render's Markdown reader" },
   exav_viewer_sheets_bg: { imports: BINDGEN, why: "exav-render's XLS, ODS and Numbers converter" },
   exav_viewer_slides_bg: { imports: BINDGEN, why: "exav-render's PPT, ODP, Keynote and ODG converter" },

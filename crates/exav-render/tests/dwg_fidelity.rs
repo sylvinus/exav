@@ -17,6 +17,13 @@ fn fixture(name: &str) -> Document {
     Document::parse(&cad_common::gunzip(&gz)).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
+fn fixture_bytes(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dwg")
+        .join(format!("{name}.gz"));
+    cad_common::gunzip(&std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+}
+
 fn f32_at(b: &[u8], i: usize) -> f64 {
     f64::from(f32::from_le_bytes(b[i..i + 4].try_into().unwrap()))
 }
@@ -304,6 +311,155 @@ fn not_drawn(name: &str) {
             .filter(|s| [s[1], s[3]].iter().all(|v| (9.9..13.0).contains(v)))
             .collect();
         assert!(glyphs.len() > 20, "at {x}: {glyphs:?}");
+    }
+}
+
+/// A title block that is a scaled xref, as on every sheet of a real set,
+/// leaves its path where it is inserted: at $TEXTSIZE times the scale in model
+/// space, but on a sheet no taller than a hundredth of the paper.
+#[test]
+fn the_path_of_a_missing_xref_fits_the_sheet() {
+    let doc = fixture("xref_sheet.dxf");
+    let top = |d: &Drawing| {
+        let ys = strokes(d).into_iter().flat_map(|(s, _)| [s[1], s[3]]);
+        ys.fold(f64::MIN, f64::max)
+    };
+    // 40 high at (10,10): its capitals reach well past y 40.
+    let model = doc.tessellate(None, None);
+    assert!(top(&model) > 40.0, "model space: {}", top(&model));
+    // The sheet is 210 high: 2.1 at most, from y 1.
+    let sheet = doc.tessellate(Some("Sheet"), None);
+    let t = top(&sheet);
+    assert!((2.0..4.0).contains(&t), "sheet: {t}");
+}
+
+/// The frame drawn for an image that cannot be loaded is its crop, not the
+/// whole picture: pixels count from the top left, y down.
+#[test]
+fn an_image_frame_follows_its_crop() {
+    let d = fixture("image_crops.dxf").tessellate(None, None);
+    let all = strokes(&d);
+    let bounds = |left: bool| {
+        let pts: Vec<[f64; 2]> = all
+            .iter()
+            .filter(|(s, _)| (s[0] < 150.0) == left)
+            .flat_map(|(s, _)| [[s[0], s[1]], [s[2], s[3]]])
+            .collect();
+        let fold =
+            |f: fn(f64, f64) -> f64, i: usize, init: f64| pts.iter().fold(init, |m, p| f(m, p[i]));
+        (
+            [fold(f64::min, 0, f64::MAX), fold(f64::min, 1, f64::MAX)],
+            [fold(f64::max, 0, f64::MIN), fold(f64::max, 1, f64::MIN)],
+            pts.len() / 2,
+        )
+    };
+    // Pixels 10..60 by 20..70 of a 100 by 200 picture, centres on 0.5.
+    assert_eq!(bounds(true), ([10.5, 129.5], [60.5, 179.5], 4));
+    // The triangle (10,20) (60,20) (60,70), three edges, at x + 200.
+    assert_eq!(bounds(false), ([210.5, 129.5], [260.5, 179.5], 3));
+}
+
+/// A reference the host has the file of is drawn where it is inserted, in the
+/// names AutoCAD gives what it brings, and the references it makes are asked
+/// for in turn.
+#[test]
+fn a_bound_xref_is_drawn_where_it_is_inserted() {
+    let limits = exav_render::cad::Limits::default();
+    let mut doc = fixture("xref_sheet.dxf");
+    assert_eq!(doc.xref_paths(), ["title.dwg"]);
+    let bottoms = |d: &Drawing| {
+        strokes(d)
+            .into_iter()
+            .filter(|(s, _)| {
+                [s[1], s[3]] == [10.0, 10.0]
+                    && (s[0] - 10.0).abs() < 1e-3
+                    && (s[2] - 110.0).abs() < 1e-3
+            })
+            .count()
+    };
+    assert_eq!(bottoms(&doc.tessellate(None, None)), 0, "nothing bound yet");
+
+    // Not a name any reference has, and then the one that is, in any case.
+    let title = fixture_bytes("xref_title.dxf");
+    assert_eq!(doc.attach_xref("other.dwg", &title, &limits).unwrap(), 0);
+    assert_eq!(doc.attach_xref("TITLE.DWG", &title, &limits).unwrap(), 1);
+    assert_eq!(doc.xref_paths(), ["part.dwg"]);
+
+    // The frame, 100 by 50 from (10,10), on the layer the host calls
+    // TITLE|FRAME, which is red.
+    let d = doc.tessellate(None, None);
+    assert_eq!(bottoms(&d), 1, "its bottom edge");
+    let right = strokes(&d).into_iter().any(|(s, _)| {
+        (s[0] - 110.0).abs() < 1e-3 && (s[1] - 10.0).abs() < 1e-3 && (s[3] - 60.0).abs() < 1e-3
+    });
+    assert!(right, "its right edge");
+    let layer = d
+        .layers
+        .iter()
+        .find(|l| l.name == "TITLE|FRAME")
+        .expect("the layer");
+    assert_eq!(layer.rgba.to_le_bytes(), [255, 0, 0, 255]);
+    // The block MARK, a circle of radius 2 at (60,35).
+    let circle = strokes(&d)
+        .iter()
+        .any(|(s, _)| ((s[0] - 60.0).hypot(s[1] - 35.0) - 2.0).abs() < 1e-2);
+    assert!(circle, "the circle of MARK");
+
+    // The part it refers to, a line from (30,30) to (37,37) in green.
+    assert_eq!(
+        doc.attach_xref("part.dwg", &fixture_bytes("xref_part.dxf"), &limits)
+            .unwrap(),
+        1
+    );
+    assert!(doc.xref_paths().is_empty());
+    let d = doc.tessellate(None, None);
+    let line = strokes(&d)
+        .into_iter()
+        .any(|(s, _)| (s[0] - 30.0).abs() < 1e-3 && (s[3] - 37.0).abs() < 1e-3);
+    assert!(line, "the part");
+    assert!(d.layers.iter().any(|l| l.name == "TITLE|PART|PARTLINE"));
+
+    // On the sheet it is at the insert's scale of 10, from (1,1).
+    let sheet = doc.tessellate(Some("Sheet"), None);
+    let wide = strokes(&sheet)
+        .into_iter()
+        .any(|(s, _)| (s[0] - 1.0).abs() < 1e-3 && (s[2] - 1001.0).abs() < 1e-3);
+    assert!(wide, "its edge, 1000 wide");
+}
+
+/// Files that name each other are bound down to a depth and no further.
+#[test]
+fn references_in_a_loop_stop_at_a_depth() {
+    let limits = exav_render::cad::Limits::default();
+    let mut doc = fixture("xref_sheet.dxf");
+    // title.dwg names part.dwg, and here part.dwg is title.dwg again.
+    let title = fixture_bytes("xref_title.dxf");
+    let mut rounds = 0;
+    while let Some(path) = doc.xref_paths().first().cloned() {
+        assert_eq!(doc.attach_xref(&path, &title, &limits).unwrap(), 1);
+        rounds += 1;
+        assert!(rounds < 30, "it does not stop");
+    }
+    assert_eq!(rounds, 8);
+}
+
+/// A wipeout's boundary counts pixels of a 1 by 1 image from the top left, y
+/// down: the triangle with its right angle at the bottom left stays so.
+#[test]
+fn a_wipeout_is_not_mirrored() {
+    let d = fixture("wipeout_triangle.dxf").tessellate(None, None);
+    // The closing vertex a file repeats leaves a degenerate triangle: only
+    // the corners matter.
+    let mut corners: Vec<[f64; 2]> = triangles(&d).into_iter().flatten().collect();
+    corners.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    corners.dedup();
+    let want = [[100.0, 200.0], [100.0, 210.0], [140.0, 200.0]];
+    assert_eq!(corners.len(), 3, "{corners:?}");
+    for (c, w) in corners.iter().zip(want) {
+        assert!(
+            (c[0] - w[0]).abs() < 1e-3 && (c[1] - w[1]).abs() < 1e-3,
+            "{corners:?}"
+        );
     }
 }
 

@@ -603,6 +603,17 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
             let Some(formula) = r1c1::to_a1(refers, (0, 0)) else {
                 continue;
             };
+            // A print area or titles of a sheet name its cells with the sheet in
+            // XLSX; some writers leave the sheet out (`=R1`), which readers refuse.
+            let formula = match scope.and_then(|i| wb.sheets.get(i)) {
+                Some(sheet) if name.starts_with("_xlnm.") && !formula.contains('!') => {
+                    format!(
+                        "{}!{formula}",
+                        super::xls::formula::quote_sheet(&sheet.name)
+                    )
+                }
+                _ => formula,
+            };
             wb.names.push(DefinedName {
                 name,
                 sheet: scope,

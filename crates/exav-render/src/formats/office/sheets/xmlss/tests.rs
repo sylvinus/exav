@@ -73,6 +73,34 @@ fn sample() -> String {
     )
 }
 
+/// Some writers leave the sheet out of a print area or print titles
+/// (`=R1`); XLSX needs it (`'My data'!$1:$1`) and readers refuse the file
+/// without.
+#[test]
+fn a_print_area_without_its_sheet_is_given_it() {
+    let wb = read_str(&book(
+        "",
+        r#"<Worksheet ss:Name="My data"><Names>
+<NamedRange ss:Name="Print_Titles" ss:RefersTo="=R1"/>
+<NamedRange ss:Name="Print_Area" ss:RefersTo="='My data'!R1C1:R2C2"/>
+<NamedRange ss:Name="mine" ss:RefersTo="=R3C3"/>
+</Names><Table><Row><Cell><Data ss:Type="String">a</Data></Cell></Row></Table></Worksheet>"#,
+    ));
+    let names: Vec<(&str, &str)> = wb
+        .names
+        .iter()
+        .map(|n| (n.name.as_str(), n.formula.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("_xlnm.Print_Titles", "'My data'!$1:$1"),
+            ("_xlnm.Print_Area", "'My data'!$A$1:$B$2"),
+            ("mine", "$C$3"),
+        ]
+    );
+}
+
 #[test]
 fn cells_indexes_and_types() {
     let wb = read_str(&sample());

@@ -156,7 +156,7 @@ it into the view matrix.
 | Symbol fonts | symbol.ttf, greeks/greekc.shx and gdt.shx as the characters they draw |
 | Characters the stroke font lacks (CJK) | The run drawn in the outline face, completed from the browser's fonts |
 | Paper-space layouts and viewports | Drawn |
-| External references, images, OLE | Xrefs: their path at the insertion point; images, underlays, OLE: frame only; all counted, with the files they name, in the warnings |
+| External references, images, OLE | Xrefs: the drawing bound in when the caller has its file (`cad::xref`: its model space becomes the xref block's content, its layers, styles, linetypes and blocks named `XREF\|NAME` as AutoCAD names them in the host, its handles tagged so they do not meet the host's, nested references in turn to a depth of eight); else their path at the insertion point (on a layout, at most a hundredth of the paper high). Images, underlays, OLE: frame only (an image's is its crop). The ones not drawn are counted, with the files they name, in the warnings |
 | XCLIP | The block cut to its boundary, the frame as `$XCLIPFRAME` says |
 | Points | `$PDMODE` shapes, `$PDSIZE` (a share of the drawing's height when not in units) |
 | 3DFACE, polyface and polygon meshes, MESH | Their visible edges, in plan |
@@ -185,7 +185,12 @@ extrusion vector, and an extrusion of (0, 0, -1) mirrors the X axis: a block
 at x = 16613 drawn at x = -16613. The transform is the Arbitrary Axis
 Algorithm, not a sign flip, and applies only to the entity types that are in
 OCS: LINE, POINT, SPLINE, ELLIPSE, 3DFACE and MLINE carry an extrusion vector
-but store world coordinates.
+but store world coordinates. An ELLIPSE's extrusion is the plane's normal: the
+minor axis is the normal crossed with the major, so a normal of -Z runs the
+parameter the other way and a tilted plane is squashed as seen from above. An
+MTEXT's is the normal of the plane the text lies in, its insertion point and
+X-axis direction being world coordinates: the text's own axes are the X
+direction and the normal crossed with it, and the plan view takes their XY.
 
 ### 5.3 SHX
 

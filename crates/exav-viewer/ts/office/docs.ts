@@ -7,7 +7,7 @@
 import { createWorkerHost, type WorkerHost } from "../core/worker-host.js";
 
 /** What the converter reads. */
-export type DocFormat = "doc" | "odt" | "fodt" | "rtf" | "wml2003" | "pages";
+export type DocFormat = "doc" | "odt" | "fodt" | "rtf" | "wml2003" | "pages" | "html";
 
 export interface DocRequest {
   bytes: ArrayBuffer;
@@ -106,6 +106,12 @@ export function sniffDocs(bytes: Uint8Array): DocFormat | "docx" | null {
     if (has("content.xml") && has("styles.xml") && !has("ppt/") && !has("xl/")) return "odt";
     return null;
   }
+  // Word's "Save as Web Page": an HTML page that declares Word's namespace,
+  // alone or in the MIME message of "Single File Web Page". Before the XML
+  // kinds, which look for the same namespace.
+  const mime = ascii(bytes, at, "MIME-Version:") || ascii(bytes, at, "MIME-version:") || ascii(bytes, at, "Mime-Version:");
+  const html = contains(bytes, 0, 4096, "<html") || contains(bytes, 0, 4096, "<HTML") || contains(bytes, 0, 4096, "<!DOCTYPE html") || contains(bytes, 0, 4096, "<!doctype html");
+  if ((html || mime) && contains(bytes, 0, mime ? 16384 : 4096, "schemas-microsoft-com:office:word")) return "html";
   // XML: flat ODF text, or Word 2003 XML.
   if (contains(bytes, 0, 2048, "office:document") && contains(bytes, 0, 4096, "opendocument.text")) return "fodt";
   if (contains(bytes, 0, 4096, "w:wordDocument") || contains(bytes, 0, 4096, "schemas-microsoft-com:office:word")) return "wml2003";

@@ -8,6 +8,32 @@ follow [semantic versioning](https://semver.org/).
 
 ### Added
 
+- **A file can be shown with the files around it.** `ViewerFile.tree` (a
+  `FileTree`: the file's path, the paths of the others, and `open(path)`) is
+  what a host gives a file that was opened with others: the demo does it for
+  files picked or dropped together and for a folder (a new "Open a folder"
+  button, and folders dropped), and an archive does it for each member. In the
+  sandboxed frame the host lists the paths in `open` and answers a new `fetch`
+  for a path it listed. `resolveInTree` finds the file a reference written for
+  another machine (`.\Plans\x.dwg`, `C:\Projects\x.dwg`, a bare name) names,
+  by its path from the file, then by the end of it, case and accents aside.
+  Three formats use it so far:
+  - **DWG and DXF external references are drawn** when their files are in the
+    tree: the drawing is bound into the reference, its layers, styles, linetypes
+    and blocks named `XREF|NAME` as AutoCAD names them in the host, and the
+    references it makes are bound in turn (64 files, eight deep). One not found
+    is still its path where it is inserted, counted in the warnings.
+    `exav-render`: `Document::xref_paths` and `Document::attach_xref`.
+  - **A glTF's buffer files are read from the tree**: a `.gltf` is nearly always
+    a document and files beside it, and was an error without them.
+    `exav-render`: `gltf::external_buffers` and `gltf::read_with`.
+  - **Split archives open from the files beside them**: `big.7z.001` with its
+    other parts, `x.part1.rar` or `x.rar` with `x.r00`, `x.z01` with `x.zip`.
+    `@exav/unpack-wasm` gains `volumeSet` (the parts of a set, from names) and
+    `joinSet` (the set as one archive: the RAR and ZIP volumes through their
+    decoders, which `joinVolumes` leaves alone). `.7z.001`, `.zip.001`,
+    `.rar.001`, `.tar.001` and `.z01` are archives by name.
+
 - **Pictures of pages from the formats that draw something.**
   `controllers.pictures` gives `raster(page, options)`, `toBlob(page, options)`
   and `render(page, longEdge)`. A page is drawn again from the document's own
@@ -298,6 +324,61 @@ follow [semantic versioning](https://semver.org/).
   third less memory at its peak, the page no longer keeps a copy of the
   geometry once it is on the GPU, and a lost GL context comes back with the
   drawing on it.
+- **More archives and images are read, from what a sweep of public repositories
+  could not open**:
+  - **RPM packages are opened** (`Format::Rpm`, feature `rpm`, no dependency):
+    each install script (`scripts/prein`, `postin`, `preun`, `postun`, the
+    transaction and trigger scripts) is a member, as text, and the payload is a
+    member named for its format and compressor (`payload.cpio.xz`), which the
+    scanner opens in turn. The headers' counts are checked against the file.
+    155 of 2,246 packages from distributions' repositories were refused before;
+    all open now. A package of the old kind (a signature that is not a header)
+    is reported, never read as if it had one.
+  - **LZMA-alone files (`.lzma`) are opened** (`Format::Lzma`, feature `lzma`):
+    no magic number, so a file is told by its header's own rules (properties,
+    a dictionary of 2^n or 2^n + 2^(n-1), a size that is unknown or below
+    256 GiB, the zero byte a range coder starts with), as the xz utilities tell
+    it. The dictionary the header asks for is bounded at 128 MiB.
+  - **A ZIP behind other bytes is a ZIP**: a zipapp's script line, padding, a
+    spanned archive's marker, offsets counted from the file's start. It is told
+    by its end record, which must close the file (padding may follow), whose
+    directory must end where it starts, and whose first entry's local header must
+    be where its offset puts it. The walker already read such archives. Self-
+    extractors (an executable in front) were handled before.
+  - **xz with SHA-256, or a reserved check type, is decoded**, as liblzma does
+    (it warns that the check is not verified): the stream is rewritten as it is
+    read, with no check fields, a smaller index and flags that say "no check";
+    the data are not touched. No new dependency: `xz4rust`'s `sha256` feature
+    (sha2 0.10 beside our 0.11 and six more crates) is not taken.
+  - **Targa (TGA) images are shown.** No magic number, so a file is taken for one
+    when its header is sane and its pixels fill the rest of the file (or it ends
+    with the `TRUEVISION-XFILE.` footer): colour-mapped, true-colour and grey,
+    raw or run-length coded, 8 to 32 bits, any origin. A 32-bit file's alpha is
+    shown unless nothing set it (all zero) or its extension area says it holds
+    nothing. The viewer takes `.tga` and `.icb`. The hash path is not touched.
+  - **More TIFFs are shown** (the viewer's reader only: what is hashed is
+    unchanged, as ClamAV's is): LZMA strips (libtiff's compression 34925, what
+    GDAL writes), ThunderScan, old-style JPEG (compression 6, in the three
+    layouts files have it in: a whole JPEG as the strip, a scan with its tables
+    in tags 519 to 521, a JPEG stream the file points to), grey of 12 bits (9 to
+    15, packed), BitsPerSample with more entries than samples, and a file with
+    no PhotometricInterpretation (grey, or RGB with three samples). Checked
+    against Pillow on the files of GDAL, libtiff, Pillow and image-tiff that were
+    refused (the 12-bit ones by their ordering: libtiff cannot show them).
+    `lzma-rust2` is
+    now also an `image` dependency of exav-render (already in the tree).
+  - **Word's "Save as Web Page" is read** (`docs::Format::Html`, `"html"` in the
+    viewer): the HTML a `.doc` holds when Word saved it as a web page, alone or
+    in its MIME message ("Single File Web Page", with its pictures). Text,
+    headings, lists, tables (spans, borders, widths, shading), links, pictures
+    in `data:` addresses or in the message, the page of an `@page` rule and the
+    character and paragraph formatting of the style sheet and of `style`
+    attributes. A link is kept only when it goes to a web, mail, phone or FTP
+    address or to a place in the page: a script, a data address and a path on
+    the author's computer are text. It uses the HTML tokenizer and style sheets
+    of the spreadsheet converter, so `office-docs` now needs `office-sheets`.
+    About 6% of the files that were refused as "not a document" in a sweep of
+    17,000 `.doc` files were this.
 
 ### Changed
 
@@ -383,6 +464,343 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **Four findings of an adversarial review of the disk-image and unpacker
+  changes**, each reproduced first and fixed with a test:
+  - **An NTFS file's attribute list no longer costs a record read per entry.**
+    `data_extents` read a full MFT record (up to 1 MiB) and applied its fix-ups
+    for every entry of the list, and `name_from_extensions` did the same for
+    every `$FILE_NAME` entry, so a 39 MB volume held 8 s of CPU (and a 256 MiB
+    list 13 minutes). A record is now read once however many entries name it,
+    an extent's VCN is followed once, and the list is read once for the name and
+    the data. A list naming more than 65,536 extents is not followed, and the
+    file is reported as not read whole (it was passed off as its first extent).
+    7.7 s and 2.0 s became 0.05 s on the review's samples.
+  - **A disk image's PBKDF2 iteration count is bounded.** An encrypted DMG
+    (`encrcdsa`) names the count in a `u32`: 264 bytes with `u32::MAX` cost
+    9 minutes (21 in a test build) for each password. The iterations of all the
+    derivations of a scan (RAR5's and the disk images') now add up to 2^22 at
+    most, about 0.7 s, and the member is reported encrypted past that.
+  - **7z key derivations are counted and kept.** 7-Zip runs 2^`numCyclesPower`
+    SHA-256 rounds (up to 2^24) for each password over each folder, and a hostile
+    archive of 2,000 folders took 20 s, 30 folders at 2^24 took 9 s, and the
+    defaults allowed days. The key of a password, salt and count is derived
+    once in a scan (7-Zip gives the folders of an archive one key), and a scan
+    may spend 2^26 rounds (about 1.3 s) on them; a member past that is reported
+    encrypted. The two samples now take 0.02 s and 0.3 s.
+  - **7z archives with an encrypted header over LZMA (`-mhe=on`, 7-Zip's and
+    sevenz-rust2's) are listed with the right password.** The header's coders were
+    all given the sum of their output sizes, so the LZMA stage behind the AES one
+    expected more than there was and ended "truncated"; the archive was reported
+    as an `encrypted.7z` member whatever the password. Each coder decodes to its
+    own size now, as the members' do. (The one fixture with a header that had no
+    compressed layer worked.)
+- **`exav-render` builds with `--features image` alone again** (`within` was
+  compiled only with `jp2` or `jbig2`), and an uncompressed Targa that starts
+  `00 00 02 00` (no ID, no colour map) is no longer taken for a cursor file with
+  no images.
+- **An XML Spreadsheet's print titles without a sheet no longer make the XLSX
+  unreadable.** Some writers give a print area or titles as `=R1`, with no sheet;
+  the workbook was written with `$1:$1`, which openpyxl refuses ("could not
+  assign names") and Excel repairs. The sheet the name belongs to is put in
+  front, as Excel writes it.
+- **A JBIG2 symbol dictionary that declares far more symbols than its bytes can
+  hold is refused before it is decoded.** hayro-jbig2 goes on decoding symbols
+  from what is left of the stream: a sample's dictionary with its symbol count
+  changed in two bytes (243 bytes in all) took two minutes and 7 GB, and others
+  of the kind half a minute. The declared count is now checked against the
+  segment's length (eight symbols a byte at most), in the pre-check that already
+  charges region sizes, for JBIG2 files and for PDF streams alike. Found by
+  mutating images (`fuzzlite`); to report to hayro-jbig2.
+- **A Zstandard file that opens with a skippable frame is read as Zstandard.**
+  Skippable frames (`0x184D2A50` to `5F`) are shared by LZ4 and Zstandard, and
+  the LZ4 test came first, so a `.zst` with a padding frame ahead of its data
+  failed as an LZ4 file with no block (ClamAV's `skip_prefix.txt.zst`). What
+  follows the skippable frames now decides.
+- **A missing xref's path on a sheet is no longer drawn as giant letters.** The
+  label was `$TEXTSIZE` times the insert's scale, so a title block inserted
+  at scale 10 in a drawing with `$TEXTSIZE` 40 put 400-unit characters on
+  every sheet, covering it in black. On a layout the label is now at most a
+  hundredth of the paper.
+- **The frame of a DWG image that is not loaded follows its crop.** It was the
+  whole picture, so a photo cropped on a sheet drew lines far outside the
+  paper, past its edge. A polygonal crop is followed too; an inverted crop
+  keeps the whole frame.
+- **A DWG wipeout is no longer mirrored vertically.** Its boundary counts from
+  the top left with y down, as an image's crop does; it was read y up, so a
+  mask landed away from what it hides, and a far one stretched the view until
+  the drawing was a dot.
+- **Large DWG files (R2004 to R2018) with a section map past 32 KiB are read.**
+  Their compression is LZO1X's, where bit 3 of an opcode from 0x10 to 0x1F
+  is a distance past 32 KiB and the length is its low three bits; the
+  reader took them as 0x10 to 0x17, which only a section map that long (a
+  drawing of thousands of 3D solids, here 38 and 74 MB files) can show: it
+  failed as "damaged".
+- **IFC files whose header the reader could not scan are read.** A quote that
+  `\S\` shifts (Vectorworks writes one in a Japanese path) ended the header's
+  string early, and a stray `;` in `FILE_SCHEMA(('IFC4'););` stopped the whole
+  read, both as "no instances in the file". The schema is taken from what the
+  header names before the `;`, and the instances are read.
+- **An IFC solid written with some faces the wrong way round is cut right by
+  its openings.** A faceted B-rep's faces are made to agree on which way they
+  face before the boolean, as exporters do not always write them so; a wall
+  lost the part of itself below its window.
+- **glTF with quantized positions is drawn.** `KHR_mesh_quantization` stores
+  positions and normals as 8 or 16-bit integers that the node's scale puts
+  back (gltfpack writes it); the reader took anything but floats as an invalid
+  mesh, so such a model (a 25 MB map, 5.8 million triangles) showed nothing.
+- **IFC openings written as face sets are cut.** A polygonal or triangulated
+  face set that leaves its optional `Closed` out (Bonsai and BlenderBIM do) was
+  taken as open, so every wall and slab it should have cut was drawn whole; its
+  edges now say whether it is closed. In the tutorial models of the sweep, the
+  triangles of a floor of walls went from 2,558 to 4,258.
+- **TIFF files of floats, signed values, palettes, planar colour, YCbCr (JPEG
+  or not), grey of 2 or 4 bits and BigTIFF are drawn.** The decoder that is kept equal to ClamAV's refuses them (an
+  elevation model, a scientific raster, a palette scan: 83 of 96 such files of
+  a GitHub sweep showed nothing). The viewer's `decode_any` now reads them
+  with the same `tiff` decoder, stretching samples that are not 8 bits from
+  the 0.5th to the 99.5th percentile of the values, nodata left out. `decode`
+  and the image hash are unchanged.
+- **TIFF fax (Group 3, 1 and 2 dimensional, and Huffman RLE) is drawn, and
+  Group 4 with a fill order of 2 is read right.** The decoder behind the hash
+  reads Group 4 only. The viewer's `decode_any` decodes the strips with
+  hayro-ccitt, as libtiff does a white run (a 0 bit, white or black by the
+  photometric interpretation); the 11 fax files of the conformance sweep that
+  showed nothing now equal Pillow's pixels.
+- **A TIFF of 1 to 7 bit samples with a fill order of 2 is drawn in order.** The
+  decoder ignores the tag, so a 1-bit scan came out scrambled in groups of 8
+  pixels. The viewer's `decode_any` reverses the bits of each byte first, as
+  libtiff does; `decode` and the hash are unchanged.
+- **A DWG whose BLOCK control cannot be read is not blank.** The block records
+  are looked up through that control; one writer's bit size for it is the whole
+  record, so its handles were never found and the drawing came out empty
+  (LibreCAD's `ordinary_enc_AC1015.dwg`, three lines). The records are now the
+  objects of their type when the control lists none, and the drawing says so.
+  Its R2004 and R2013 siblings still have unreadable entities (the same bit size
+  fault in each object).
+- **An RTF with a `}` too many is read to its end.** The reader stopped at the
+  first close of the outermost group; html2rtf writes files whose braces do not
+  balance, and 2 paragraphs of 1,559 words came out. What follows an early close
+  is now read, in a group of its own, as unrtf does.
+- **A palette TIFF with an alpha sample is drawn.** Indices with an extra sample
+  beside each (SamplesPerPixel 2; ImageMagick's `input_256_matte.tiff`, GDAL
+  and QGIS test rasters) were refused. The viewer's `decode_any` draws them
+  as RGBA; `decode` and the hash still refuse them, as ClamAV's decoder does.
+- **A CMYK TIFF with spot or alpha channels is drawn.** Photoshop writes
+  SamplesPerPixel 6 after its four inks (chunky or planar), which the decoder
+  refused. The viewer's `decode_any` draws the inks and leaves the rest out;
+  `decode` and the hash are unchanged.
+- **An old-style LZW TIFF is drawn, and so is an RLE BMP that ends with a delta
+  past the last row.** TIFF 5.0 files (least significant bit first, a code late
+  like GIF, starting 0x00 and an odd byte) failed on a code that is not in the
+  table (libtiff's `quad-lzw-compat.tiff`); `image` calls an RLE stream that
+  moves past the picture corrupt, where Windows and Pillow draw what came
+  before (Mozilla's `rle4-delta-320x240.bmp`). `decode_any` only.
+- **A YCbCr TIFF with subsampled chroma and no JPEG is drawn.** LZW, Deflate,
+  PackBits or uncompressed YCbCr stores its chroma once for each 2 by 2 (or
+  2 by 1, 4 by 1...) block of luma values, in units of the luma then Cb and Cr;
+  the decoder read it as pixels of three samples and failed (libtiff's
+  `ycbcr-cat.tif`). The viewer's reader spreads each unit over its pixels, as
+  libtiff does. The hashing decoder is unchanged.
+- **A Deflate TIFF with a wrong Adler-32 is drawn.** The checksum at the end of
+  a strip is not checked by the viewer's reader, as libtiff does not (OpenCV's
+  `multipage.tif`, written by a faulty encoder, showed nothing). The hashing
+  decoder is unchanged.
+- **A TIFF whose directory links to itself is drawn.** The viewer's reader takes
+  a link back to a directory already read as the end of the chain, as libtiff
+  does (`test_ifd_loop_to_self.tif`); the hashing decoder keeps calling it a
+  cycle.
+- **A TIFF strip with no StripByteCounts is drawn.** A file with a StripOffsets
+  and no byte counts (an office suite's `tdf115863.tif`, a one-strip scan) was
+  refused; libtiff and Pillow read the strip to the end of the file, and so does
+  `decode_any` now. `decode` and the hash are unchanged.
+- **A CIELab TIFF of 8 bits is drawn.** L*a*b* (photometric 8, ImageSharp's
+  `CieLab.tiff`) was refused; `decode_any` converts it to sRGB with a D50
+  white, within a few levels of libtiff's own conversion. `decode` and the
+  hash are unchanged.
+- **A tiled TIFF that names its tiles with the strip tags is drawn, and so is a
+  JPEG-in-TIFF of RGB components.** libtiff keeps the offsets of tiles and of
+  strips in one field, so a file with TileWidth and StripOffsets reads there
+  and Pillow draws it (ImageSharp's `quad-tile.tiff`). zune-jpeg 0.4 takes a
+  three-component JPEG with an Adobe marker and the ids R, G, B for CMYK
+  and fails (`rgb_jpegcompressed_nojpegtable.tiff`); the file's own sample
+  count wins. Both for `decode_any` only; `decode` and the hash are unchanged.
+- **A TIFF of 3 to 6 bands with no colour meaning shows its first band.**
+  Satellite scenes and other multi-band rasters (photometric MinIsBlack with
+  several samples) were refused; the viewer's `decode_any` draws band 1 as
+  grey, stretched when it has 16 bits.
+- **A footnote or endnote in a list nested four deep keeps its text.** An ODT's
+  note was read only when the nesting depth so far was under four, a limit
+  meant for notes in notes, so a bibliography's endnote in a nested bullet
+  list came out empty. Notes inside notes are now counted on their own (three
+  levels are read).
+- **An MTEXT is placed by its world insertion point, not an OCS one.** The
+  insertion point and text direction of an MTEXT are world coordinates and its
+  extrusion is the normal of the plane it lies in (ezdxf reads it so; the DXF
+  reference marks only the direction as WCS). It was put through the
+  extrusion's OCS frame like a TEXT: with an extrusion of -Z the text landed
+  mirrored across the origin (at x = -100 for an insertion at 100), and in a
+  tilted plane it was moved by the plane's frame. A text in a plain plane is
+  drawn as before.
+- **An ellipse is drawn in the plane of its extrusion.** The ELLIPSE's centre and
+  major axis are in world coordinates, its extrusion gives the plane and the
+  way the parameter runs; the tessellator took the plane for the drawing's, so
+  an elliptical arc with an extrusion of -Z (a mirrored one) was the other half
+  of the ellipse, and one in a tilted plane was not squashed as seen from above
+  (dxf-viewer's `ocs-curves.dxf`).
+- **A TIFF with an extra sample of no stated use is drawn opaque.** A fourth band
+  that ExtraSamples calls unspecified (0) was taken for an alpha: a 16-bit
+  texture from the glTF sample models, and test files of image-tiff and
+  OpenImageIO, came out nearly or partly invisible. The viewer's `decode_any`
+  draws them opaque, as libtiff's reader and Pillow do; an extra sample
+  declared an alpha (1 or 2) is still one. `decode` and the hash are unchanged.
+- **A TIFF is drawn turned as its Orientation tag says.** A scan stored on its
+  side (orientation 6 or 8) or mirrored was shown as stored; the viewer's
+  `decode_any` now turns it, as libtiff and a browser do for a JPEG. `decode`
+  and the hash are unchanged.
+- **A TIFF with premultiplied alpha is drawn with its colours divided by it.**
+  Colours stored multiplied by their alpha (ExtraSamples 1, what OpenImageIO
+  and Photoshop write) were drawn as plain colours, darker where the image is
+  soft; the viewer's `decode_any` now divides them, as Pillow and libtiff do.
+  `decode` and the hash are unchanged.
+- **TIFF files compressed with Zstandard are drawn.** GeoTIFFs and cloud
+  optimised ones use it; the decoder behind the hash has no Zstandard (nor has
+  ClamAV's), so all 10 such files of the GDAL test suite showed nothing. The
+  viewer's `decode_any` reads them with ruzstd, which exav-unpack already
+  links; `decode` and the image hash still refuse them.
+- **LZW tiles that `weezl` ends short are drawn whole.** Asked for the 2 bytes of
+  a tile row and then its 14 of padding, `weezl` can stop 30 bytes before the end
+  of a valid stream, and the tile (and the TIFF) is refused; GDAL's
+  `gtiff_rgbsmall_LZW_tiled_separate.tif` is one. The viewer's `decode_any`
+  decodes such a stream a block at a time; `decode` and the hash keep what
+  ClamAV's decoder gives.
+- **LZW tiles that overhang the image no longer panic the TIFF decoder.** When the
+  data of a row was asked for at the end of a tile's stream, `weezl` gave its
+  last two bytes and said `NoProgress`, and the reader asserted that it had
+  given none. A 20x20 image in 16x16 tiles was refused by `decode` and
+  `decode_any`, and aborted a WebAssembly build. The reader now returns the
+  bytes.
+- **BMP files with an OS/2 2.x header, a plane count other than 1 or RLE rows
+  stored top-down are drawn.** `image` refuses all three; Pillow and other
+  readers open them. The viewer's `decode_any` rewrites the header (the
+  64-byte one cut to 40, planes 1, a negative height made positive and the
+  rows turned over) and decodes again. `decode` and the hash are unchanged.
+- **A plain PNM with a comment after the maximum value or among the samples is
+  drawn.** `image` refuses such a file (9 of 5,115 `.ppm` files of a sweep,
+  Blender and test-suite renders among them). The viewer's `decode_any` cuts
+  the comments out and decodes it again.
+- **Cursors, and icons with a wrong length, a wrong size or a cut AND mask, are
+  drawn.** `.cur` files were not recognised as images. In the viewer's
+  `decode_any`, a cursor is read as the icon it is laid out as, and each icon
+  image is tried with the length its entry gives and with all the bytes that
+  follow, its entry corrected to the size the image holds and a short mask
+  filled with zeros. Of the images of one size in an icon file, the one with
+  most colour is shown (the 8-bit one was before, without its soft edges), and
+  a 32-bit image is drawn by its alpha, not cut by its AND mask as `image`
+  does, which Windows does not do either; a colour profile after the pixels of
+  a V5 header is not read as the mask; a count of colours in the header of a
+  32-bit image no longer moves its pixels.
+  `decode` and the image hash are unchanged.
+- **A 7z with archive properties whose ids are more than a byte is read.** 7-Zip
+  reads a property id as a number and skips the property by its size; the
+  reader took the id for a byte, lost its place and refused the archive as
+  ending early (Apache Commons Compress's `COMPRESS-681.7z`).
+- **An ASCII PLY whose lines carry more values than the header declares is
+  read.** A face line of the VCG library's `fuze_ascii.ply` ends in nine values
+  the header does not name; read as a stream, the second face started inside
+  the first line's leftovers, and 1 face of 1,000 was drawn. A file that reads
+  as damaged is now read again with a line to a record, and that is kept when
+  it is the better reading.
+- **A GLB whose JSON chunk is not padded to four bytes is read.** Older
+  trimesh exports (`cube.glb`, `pins.glb`) put the next chunk right after a
+  JSON chunk of 962 bytes; the reader skipped to the next multiple of four and
+  refused the file for a chunk length. It now takes the next chunk where one
+  starts, with or without the padding.
+- **A bare JPEG 2000 codestream with subsampled chroma is read as YCbCr.** With no
+  colour box to say so, its samples were drawn as RGB (a green and magenta
+  picture); OpenJPEG's tools read three components whose second is
+  subsampled as sYCC, and so does exav now.
+- **A JPEG 2000 of four bands under a greyscale colour box shows its first
+  band.** GDAL writes a multi-band raster (Sentinel-2 patches, SPOT scenes)
+  that way, and the decoder takes any four components for CMYK, so it was
+  drawn as a pale wash.
+- **A DXT1 texture keeps its transparent texels.** `image` draws the "no
+  colour" index of a BC1 block opaque and black, so a tree or fence texture cut
+  out of its picture showed a black box; `decode_any` reads such a file with
+  bcdec_rs. `decode` and the hash are unchanged.
+- **DDS textures of BC4, BC5, BC6H and BC7, of sizes that are not multiples of 4,
+  and uncompressed, 8-bit palette or float layouts are drawn.** `image` reads DXT1, DXT3 and
+  DXT5 of multiples of 4 only: 160 of 2,580 `.dds` files of a GitHub sweep
+  (game textures, normal maps, cube maps) showed nothing. The viewer's
+  `decode_any` reads them with bcdec_rs (MIT, safe, no dependencies), the
+  first surface of the file; `decode` and the hash are unchanged.
+- **A fast-saved Word 6 or 95 document opens, and its text is in its own code
+  page.** The length of the piece table was read as two bytes and is four, so
+  the pieces came out as CPs of billions and the file was refused as damaged;
+  and the 8-bit text was always Windows 1252, so a Russian, Greek, Polish or
+  Turkish document was mojibake. The language in the header now gives the
+  code page (Windows 1250, 1251, 1253 to 1258, 874, or Mac Roman for a
+  Macintosh file); double-byte languages are not read yet.
+- **Shared strings of an XLS after a header that ends its record are read as
+  they are written.** The CONTINUE that holds the characters starts with the
+  width flag, which was skipped when the header ended exactly at the record's
+  end: 16-bit strings came out as `C_x0000_L_x0000_A` and the cells after
+  them were wrong (3,400 of 11,000 cells of one workbook, 190,000 of 244,000
+  of another).
+- **A DXF whose entities name an ordinary block as their owner is drawn.**
+  LibreDWG's R14 output gives the ENTITIES section the owner of its first
+  BLOCK (`*U`), so the model space came out empty and the drawing was blank.
+  The section is the layouts' whatever the owner says; the owner only picks
+  which layout.
+- **An ICO whose PNG is not 32-bit, or with one image that does not decode among
+  several, is drawn.** `image` refuses the whole file; each image is now tried
+  alone, the largest first, in the viewer's `decode_any`.
+- **A tar from before `ustar` (V7) is recognised.** It has no magic, so it was
+  taken for an unknown file and not unpacked; its first header is now accepted
+  when the name, the octal mode and size and the checksum are all right.
+- **7z archives with empty files or directories among more than eight entries
+  are read.** The header's `EmptyFile` and `Anti` bit vectors have one bit per
+  entry without a stream, and were read with one per entry, so the property
+  after them started at the wrong byte: the names were lost (`entry_1`,
+  `entry_2`), or the header was refused with "unexpected NID". Which entries
+  were directories was also taken from the wrong bit. Found on 6 of the first
+  517 `.7z` files of a GitHub sweep, all of which 7-Zip tests as sound.
+- **A 7z of nothing, or of empty files and directories only, is read.** It has
+  no streams: an archive that is the signature header alone ("unexpected end of
+  data"), or a header with the file list and no stream list ("FILES_INFO
+  before MAIN_STREAMS_INFO"), which is what 7-Zip writes for a folder of
+  empty files.
+- **Office packages are no longer read whole from a source that fetches ranges.**
+  The `zip` crate looks for a package's directory from the start of the file
+  unless told the archive starts there, so opening an ODP or a Keynote file
+  read all of it, pictures included. The directory is taken where the end
+  record says first, and the crate's search is the fallback for a package
+  something precedes.
+- **IFC products with a null `GlobalId` are drawn.** The schema requires one,
+  web-ifc writes `$`, and the reader took every such product for no product:
+  a floor plan of 176 elements showed 26.
+- **IFC bars swept along a polyline or a composite curve are whole.** Allplan
+  writes `StartParam` 0 and `EndParam` 1 for a polyline of any length, which
+  cut a bent bar to its first segment; and Revit counts a polyline of a
+  composite curve once, where the reader counted its segments, which cut a
+  spiral bar to a few turns. Both are read as the end of the curve when the
+  number fits that count and not the other.
+- **The text of shapes in a group is kept in an ODT converted to DOCX.** A
+  `draw:g` was dropped whole, with the text boxes and shapes in it.
+- **An IFC that holds only alignments says so.** An alignment is a curve, which
+  is not drawn, and a model of nothing else showed an empty view with no
+  warning; it now counts `IFCALIGNMENT` as not drawn.
+- **glTF with a node rotation of all zeros is drawn.** Exporters write it for
+  no rotation (FF7 model dumps do); it failed the whole file as an invalid node
+  transform.
+- **An ASCII STL after a byte-order mark or lines of comment is read as text.**
+  The file was taken for a binary one, and drawn as garbage or not at all.
+- **PLY headers some writers make are read.** The remarks in braces of the
+  format's own example, a line of text with no keyword (Blender 2.4 wrote
+  one) or a `comment` with no space after it, an empty `face` element before
+  the vertices, and vertices with no `z` (a flat drawing).
+- **Volumes of two archives are no longer one set.** `a.7z.001` with
+  `a.zip.002` were joined, as the base extension was not compared. The scanner
+  rejoined volumes the same way.
 - **A malformed `raster` message to the sandboxed frame is answered.** The frame
   dropped one whose options failed the checks, so the host's promise stayed
   pending until aborted; the frame now answers `rastered` with the error

@@ -35,6 +35,26 @@ struct Record {
 /// first, as DXF's BLOCK_RECORD table has them.
 pub(crate) fn read(ctx: &mut Ctx<'_, '_>, vars: &Vars) -> Vec<Block> {
     let mut handles = entries(ctx, vars.block_control, "the BLOCK control", 2);
+    if handles.is_empty() {
+        // A control that cannot be read (a writer that gets its bit size
+        // wrong) lists nothing: the records are the objects of that type.
+        let dwg = ctx.dwg;
+        handles = dwg
+            .object_map()
+            .iter()
+            .filter(|(_, at)| dwg.type_at(*at) == Ok(BLOCK_HEADER))
+            .map(|(h, _)| *h)
+            .collect();
+        if !handles.is_empty() {
+            ctx.warn(
+                WarningKind::Malformed,
+                format!(
+                    "the block records ({}) were found in the object map",
+                    handles.len()
+                ),
+            );
+        }
+    }
     // The control lists model and paper space last.
     for space in [vars.paper_space, vars.model_space] {
         if let Some(i) = handles.iter().position(|h| *h == space) {

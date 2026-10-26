@@ -402,6 +402,43 @@ fn colours_of_each_type_are_scaled_to_bytes() {
 }
 
 #[test]
+fn headers_as_some_writers_make_them_are_read() {
+    // The remarks in braces of the format's own example.
+    let text = "ply\nformat ascii 1.0\nelement vertex 3\nproperty float x { the x }\n\
+                property float y\nproperty float z\nelement face 1\n\
+                property list uchar int vertex_index { corners }\nend_header\n\
+                0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n";
+    assert_eq!(parse(text.as_bytes()).triangles(), 1);
+    // A comment keyword with no space after it, and a line of text with none.
+    let text = text.replace("ply\n", "ply\ncommentWFhZ\nCreated by Blender3D 246\n");
+    assert_eq!(parse(text.as_bytes()).triangles(), 1);
+    // An empty list of faces before the vertices.
+    let text = "ply\nformat ascii 1.0\nelement face 0\nproperty list uchar int vertex_indices\n\
+                element vertex 1\nproperty float x\nproperty float y\nproperty float z\n\
+                end_header\n0 0 0\n";
+    assert!(matches!(
+        read(text.as_bytes(), 10).unwrap_err(),
+        Error::Unsupported(_)
+    ));
+    // Faces with something in them still need the vertices first.
+    let text = text.replace("element face 0", "element face 1");
+    let e = read(format!("{text}3 0 0 0\n").as_bytes(), 10).unwrap_err();
+    assert!(e.to_string().contains("faces before vertices"), "{e}");
+}
+
+#[test]
+fn vertices_with_no_z_are_flat() {
+    let text = "ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\n\
+                element face 1\nproperty list uchar int vertex_index\nend_header\n\
+                0 0\n2 0\n0 2\n3 0 1 2\n";
+    let s = parse(text.as_bytes());
+    assert_eq!(s.triangles(), 1);
+    assert_eq!(extent(&s), [[0., 0., 0.], [2., 2., 0.]]);
+    let e = read(text.replace("property float y\n", "").as_bytes(), 10).unwrap_err();
+    assert!(e.to_string().contains("x and y"), "{e}");
+}
+
+#[test]
 fn a_point_cloud_is_reported_as_unsupported() {
     let bytes = file(Enc::Little, &[vertex_element(&CUBE, true)]);
     let e = read(&bytes, 100).unwrap_err();
@@ -493,15 +530,37 @@ fn faces_that_cannot_be_drawn_are_dropped_and_counted() {
         ],
     );
     assert!(matches!(read(&bytes, 10).unwrap_err(), Error::Invalid(_)));
-    // Vertices without a z.
+    // Vertices without a y.
     let mut v = vertex_element(&CUBE, false);
-    v.props.remove(2);
-    v.rows.iter_mut().for_each(|r| drop(r.remove(2)));
+    v.props.remove(1);
+    v.rows.iter_mut().for_each(|r| drop(r.remove(1)));
     let bytes = file(
         Enc::Ascii,
         &[v, face_element(&cube_faces(), "uchar", "int")],
     );
     assert!(matches!(read(&bytes, 10).unwrap_err(), Error::Invalid(_)));
+}
+
+const SQUARE_HEADER: &str = "ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\n\
+    property float y\nproperty float z\nelement face 2\nproperty list uchar int vertex_indices\n\
+    end_header\n";
+
+#[test]
+fn an_ascii_line_with_more_values_than_the_header_names_is_one_record() {
+    // Each face line has three values the header does not declare, as the
+    // VCG library wrote its wedge colours.
+    let extra =
+        format!("{SQUARE_HEADER}0 0 0\n1 0 0\n1 1 0\n0 1 0\n3 0 1 2 9 9 9\n3 0 2 3 9 9 9\n");
+    let s = parse(extra.as_bytes());
+    assert_eq!(s.triangles(), 2);
+    assert!(!s.warnings.damaged);
+    assert_eq!(s.warnings.invalid, 0);
+    // A file that is right as a stream of values is read as one: records
+    // that share a line or run over several.
+    let stream = format!("{SQUARE_HEADER}0 0 0 1 0 0\n1 1 0 0 1 0\n3 0 1 2 3 0 2\n3\n");
+    let s = parse(stream.as_bytes());
+    assert_eq!(s.triangles(), 2);
+    assert!(!s.warnings.damaged);
 }
 
 #[test]

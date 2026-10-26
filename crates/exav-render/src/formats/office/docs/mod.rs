@@ -7,6 +7,7 @@ mod docx;
 mod error;
 mod fields;
 mod grid;
+mod html;
 mod limits;
 mod model;
 mod odt;
@@ -34,6 +35,8 @@ pub enum Format {
     Wml2003,
     /// Apple Pages documents (.pages).
     Pages,
+    /// HTML pages: Word's "Save as Web Page" (a `.doc` that is HTML).
+    Html,
 }
 
 impl Format {
@@ -46,6 +49,7 @@ impl Format {
             "rtf" => Format::Rtf,
             "xml" | "wml" | "wml2003" => Format::Wml2003,
             "pages" => Format::Pages,
+            "html" | "htm" => Format::Html,
             _ => return None,
         })
     }
@@ -58,6 +62,7 @@ impl Format {
             Format::Rtf => "rtf",
             Format::Wml2003 => "wml2003",
             Format::Pages => "pages",
+            Format::Html => "html",
         }
     }
 }
@@ -117,6 +122,7 @@ fn read(
             crate::formats::office::common::package::Zip::open(input)?,
             &mut budget,
         )?,
+        Format::Html => html::read(input, &mut budget)?,
     };
     Ok((doc, budget))
 }

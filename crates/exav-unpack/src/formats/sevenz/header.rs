@@ -56,7 +56,20 @@ pub(super) struct Archive {
 
 // ─── Public entry point ────────────────────────────────────────────────────
 
+/// [`parse_archive_with`] with a scan of its own (the one that reads only this
+/// archive).
+#[cfg(test)]
 pub(super) fn parse_archive(data: &[u8], passwords: &[String]) -> Result<Archive, LimitHit> {
+    parse_archive_with(data, passwords, &crate::kdf::Kdf::default())
+}
+
+/// The archive's structure, its encrypted header opened with the first of
+/// `passwords` that does it; the derivations count against `kdf`, the scan's.
+pub(super) fn parse_archive_with(
+    data: &[u8],
+    passwords: &[String],
+    kdf: &crate::kdf::Kdf,
+) -> Result<Archive, LimitHit> {
     if data.len() < 32 {
         return Err(LimitHit::corrupt("7z: file too small".into()));
     }
@@ -89,6 +102,17 @@ pub(super) fn parse_archive(data: &[u8], passwords: &[String]) -> Result<Archive
         ));
     }
 
+    // An archive of nothing is the signature header alone.
+    if next_header_size == 0 {
+        return Ok(Archive {
+            pack_pos: 0,
+            pack_sizes: Vec::new(),
+            blocks: Vec::new(),
+            files: Vec::new(),
+            stream_map: calculate_stream_map(&[], &[], &[]),
+        });
+    }
+
     let nh = &data[nh_start..nh_end];
     let mut nr = SevenZReader::new(nh);
 
@@ -111,7 +135,9 @@ pub(super) fn parse_archive(data: &[u8], passwords: &[String]) -> Result<Archive
                 // correct one yields bytes that parse as a valid 7z header.
                 let mut decoded = None;
                 for pw in passwords {
-                    if let Ok(bytes) = decompress_encoded_header(data, &mut streams_info, Some(pw))
+                    let pass = crate::kdf::Pass { word: pw, kdf };
+                    if let Ok(bytes) =
+                        decompress_encoded_header(data, &mut streams_info, Some(pass))
                     {
                         if parse_header(&bytes).is_ok() {
                             decoded = Some(bytes);
@@ -562,16 +588,20 @@ fn parse_files_info(
             break;
         }
         let _prop_size = read_var_u64(r)?;
+        let prop_start = r.pos;
 
+        // EmptyFile and Anti have one bit per entry that has no stream, not
+        // one per entry.
+        let num_empty = (0..num_files).filter(|&i| empty_streams.get(i)).count();
         match prop_type {
             NID_EMPTY_STREAM => {
                 empty_streams = BitSet::read_bits(r, num_files, BitSet::new(num_files))?;
             }
             NID_EMPTY_FILE => {
-                empty_files = BitSet::read_bits(r, num_files, BitSet::new(num_files))?;
+                empty_files = BitSet::read_bits(r, num_empty, BitSet::new(num_empty))?;
             }
             NID_ANTI => {
-                let _ = BitSet::read_bits(r, num_files, BitSet::new(num_files))?;
+                let _ = BitSet::read_bits(r, num_empty, BitSet::new(num_empty))?;
             }
             NID_NAME => {
                 let external = r.read_byte()?;
@@ -631,10 +661,18 @@ fn parse_files_info(
                 let _ = r.read_bytes(_prop_size as usize)?;
             }
         }
+        // A property ends where its size says, whatever was read of it.
+        if let Some(end) = prop_start
+            .checked_add(_prop_size as usize)
+            .filter(|&e| e <= r.data.len())
+        {
+            r.pos = end;
+        }
     }
 
     // Post-process: determine has_stream / is_directory for each file
     let mut non_empty_counter = 0usize;
+    let mut empty_counter = 0usize;
 
     let total_unpack_sub_streams: usize = blocks.iter().map(|b| b.num_unpack_sub_streams).sum();
 
@@ -660,7 +698,8 @@ fn parse_files_info(
             non_empty_counter += 1;
         } else {
             file.has_stream = false;
-            file.is_directory = !empty_files.get(i);
+            file.is_directory = !empty_files.get(empty_counter);
+            empty_counter += 1;
             file.size = 0;
         }
     }
@@ -727,7 +766,7 @@ fn calculate_stream_map(blocks: &[Block], files: &[FileEntry], pack_sizes: &[u64
 fn decompress_encoded_header(
     data: &[u8],
     streams_info: &mut StreamsInfo,
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
 ) -> Result<Vec<u8>, LimitHit> {
     if streams_info.blocks.is_empty() {
         return Err(LimitHit::corrupt("7z: encoded header has no blocks".into()));
@@ -775,26 +814,19 @@ fn decompress_encoded_header(
         .copied()
         .fold(0u64, u64::saturating_add);
 
-    // Build decoder chain and decompress
-    // We must own the data so Box<dyn Read> can be 'static
-    let owned_pack_data = pack_data.to_vec();
-    let reader = std::io::Cursor::new(owned_pack_data);
-    let mut current: Box<dyn std::io::Read> = Box::new(reader);
-
     // The 7z parser threads no `Budget`, so the encoded header/TOC is bounded by
     // the *default* global peak-buffer limit. A header is metadata (not the
     // operator's tuning surface), and it must be buffered whole for random-access
     // parsing — so a fixed default ceiling is the right bound here.
     let max_buffer = crate::Limits::default().max_buffer_bytes;
 
-    let chain = ordered_coder_iter(block);
-    for coder_idx in chain {
-        let coder = &block.coders[coder_idx];
-        // Header decompression: `password` is threaded so AES-encrypted headers
-        // (`-mhe=on`) can be decrypted when a candidate password is supplied.
-        current =
-            super::decode::wrap_coder(current, coder, total_unpack as usize, password, max_buffer)?;
-    }
+    // Build the decoder chain as a block's is built: each coder decodes to its
+    // own declared size (an AES coder's output is its padded input, an LZMA
+    // coder behind it is the header's own length), not to their sum. `password`
+    // is threaded so AES-encrypted headers (`-mhe=on`) can be decrypted when a
+    // candidate password is supplied.
+    let mut current =
+        super::entry::decode_block_reader(block, pack_data, total_unpack, password, max_buffer)?;
 
     let (buf, truncated) = crate::bounded_read(&mut current, max_buffer)
         .map_err(|e| LimitHit::corrupt(format!("7z: decompress header: {e}")))?;
@@ -830,9 +862,13 @@ fn parse_header(data: &[u8]) -> Result<Archive, LimitHit> {
                 streams = Some(parse_streams_info(&mut r)?);
             }
             NID_FILES_INFO => {
-                let s = streams.as_ref().ok_or_else(|| {
-                    LimitHit::corrupt("7z: NID_FILES_INFO before NID_MAIN_STREAMS_INFO".into())
-                })?;
+                // An archive of empty files and directories has no streams.
+                let s = streams.get_or_insert_with(|| StreamsInfo {
+                    pack_pos: 0,
+                    pack_sizes: Vec::new(),
+                    blocks: Vec::new(),
+                    sub_streams_info: None,
+                });
                 files = Some(parse_files_info(&mut r, &s.blocks, &s.sub_streams_info)?);
             }
             _ => {
@@ -940,6 +976,52 @@ pub(super) fn ordered_coder_iter(block: &Block) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signature header and the header it points to.
+    fn archive_of(header: &[u8]) -> Vec<u8> {
+        let mut d = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4, 0, 0, 0, 0];
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        d.extend_from_slice(&[0; 4]);
+        d.extend_from_slice(header);
+        d
+    }
+
+    #[test]
+    fn an_archive_of_nothing_and_one_of_empty_files_have_no_streams() {
+        // The signature header alone.
+        let a = parse_archive(&archive_of(&[]), &[]).unwrap();
+        assert!(a.files.is_empty());
+        // Files with no streams info before them: one empty file, "a".
+        let header = [
+            0x01, 0x05, 0x01, 0x0E, 0x01, 0x80, 0x0F, 0x01, 0x80, 0x11, 0x05, 0x00, b'a', 0, 0, 0,
+            0x00, 0x00,
+        ];
+        let a = parse_archive(&archive_of(&header), &[]).unwrap();
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].name, "a");
+        assert!(!a.files[0].has_stream && !a.files[0].is_directory);
+    }
+
+    #[test]
+    fn archive_properties_with_ids_of_more_than_a_byte_are_skipped_by_their_size() {
+        // The empty-file header above, with three archive properties in front
+        // of its files: ids of 9 bytes, 2 bytes and 1 byte, as 7-Zip reads them.
+        let header = [
+            0x01, // header
+            0x02, // archive properties
+            0xFF, 1, 0, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x3F, 0x03, 0xAA, 0xBB,
+            0xCC, // id, size 3
+            0x80, 0x90, 0x01, 0xEE, // id 0x90, size 1
+            0x07, 0x00, // id 7, size 0
+            0x00, // end of properties
+            0x05, 0x01, 0x0E, 0x01, 0x80, 0x0F, 0x01, 0x80, 0x11, 0x05, 0x00, b'a', 0, 0, 0, 0x00,
+            0x00,
+        ];
+        let a = parse_archive(&archive_of(&header), &[]).unwrap();
+        assert_eq!(a.files.len(), 1);
+        assert_eq!(a.files[0].name, "a");
+    }
 
     #[test]
     fn varint_basic() {

@@ -38,6 +38,14 @@ same bytes).
   line on layer GREY in its layer's colour (y -40); lineweights shown.
 - not_drawn: a line, two inserts of the xref WALLS (walls.dwg) at (10,10)
   and (50,10), an image of photo.png, two 3DSOLIDs and a REGION.
+- image_crops: a 100 by 200 image at the origin cropped to the pixels
+  (10,20) (60,70), and one at x 200 cropped to a triangle.
+- xref_title, xref_part: the files xref_sheet's reference TITLE names
+  (title.dwg), and the one it refers to in turn (part.dwg, a line on layer
+  PARTLINE). title.dwg is a 100 by 50 frame on layer FRAME, a block MARK
+  (a circle of radius 2) at (50,25), a text in style LABELS and PART at
+  (20,20).
+- wipeout_triangle: a WIPEOUT over the triangle (100,200) (140,200) (100,210).
 - solid_only: one 3DSOLID, and an 8 by 8 red thumbnail.
 - text_frames: a block LABEL (an Arial "LABEL" and a stroke "STROKE" 5
   below) inserted mirrored at x 100 and stretched twice in x at (100,20);
@@ -89,6 +97,8 @@ same bytes).
   without it.
 - colours: a yellow line (y 0) and a red one (y 20), 2.11 mm wide, and a
   cyan fill from y 40 to 60; lineweights shown.
+- xref_sheet: $TEXTSIZE 40 and an xref TITLE (title.dwg) in model space at
+  (10,10) and, at scale 10 at (1,1), on a 297 by 210 layout "Sheet".
 
 ezdxf orders some objects by Python's string hashes: a run without
 PYTHONHASHSEED set rewrites the other files with their objects shuffled, the
@@ -305,6 +315,57 @@ def not_drawn():
     msp.add_image(photo, insert=(0, 20), size_in_units=(64, 36))
     for body in (msp.add_3dsolid(), msp.add_3dsolid(), msp.add_region()):
         acis(body)
+    return doc
+
+
+def xref_sheet():
+    doc = new()
+    doc.header["$TEXTSIZE"] = 40
+    doc.add_xref_def("title.dwg", "TITLE")
+    doc.modelspace().add_blockref("TITLE", (10, 10))
+    layout = doc.layouts.new("Sheet")
+    layout.page_setup(size=(297, 210), margins=(0, 0, 0, 0), units="mm")
+    layout.add_blockref("TITLE", (1, 1), dxfattribs={"xscale": 10, "yscale": 10, "zscale": 10})
+    return doc
+
+
+def image_crops():
+    doc = new()
+    msp = doc.modelspace()
+    photo = doc.add_image_def(filename="photo.png", size_in_pixel=(100, 200))
+    rect = msp.add_image(photo, insert=(0, 0), size_in_units=(100, 200))
+    rect.set_boundary_path([(10, 20), (60, 70)])
+    tri = msp.add_image(photo, insert=(200, 0), size_in_units=(100, 200))
+    tri.set_boundary_path([(10, 20), (60, 20), (60, 70)])
+    return doc
+
+
+def xref_title():
+    doc = new()
+    doc.layers.add("FRAME", color=1)
+    doc.styles.add("LABELS", font="arial.ttf")
+    mark = doc.blocks.new("MARK")
+    mark.add_circle((0, 0), 2)
+    msp = doc.modelspace()
+    msp.add_lwpolyline([(0, 0), (100, 0), (100, 50), (0, 50)], close=True, dxfattribs={"layer": "FRAME"})
+    msp.add_blockref("MARK", (50, 25))
+    msp.add_text("TITLE", height=5, dxfattribs={"style": "LABELS", "insert": (5, 5)})
+    doc.add_xref_def("part.dwg", "PART")
+    msp.add_blockref("PART", (20, 20))
+    return doc
+
+
+def xref_part():
+    doc = new()
+    doc.layers.add("PARTLINE", color=3)
+    doc.modelspace().add_line((0, 0), (7, 7), dxfattribs={"layer": "PARTLINE"})
+    return doc
+
+
+def wipeout_triangle():
+    doc = new()
+    msp = doc.modelspace()
+    msp.add_wipeout([(100, 200), (140, 200), (100, 210)])
     return doc
 
 
@@ -601,6 +662,11 @@ DRAWINGS = {
     "xclip": xclip,
     "transparency": transparency,
     "not_drawn": not_drawn,
+    "xref_sheet": xref_sheet,
+    "image_crops": image_crops,
+    "xref_title": xref_title,
+    "xref_part": xref_part,
+    "wipeout_triangle": wipeout_triangle,
     "solid_only": solid_only,
     "text_frames": text_frames,
     "text_symbols": text_symbols,

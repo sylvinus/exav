@@ -631,6 +631,51 @@ fn an_rtf_has_everything_a_reader_sees_but_comments() {
     assert_links(&t);
 }
 
+/// A `}` too many closes the document's group; what follows is still the
+/// document (html2rtf writes such files, and unrtf reads them whole).
+#[test]
+fn an_rtf_with_a_brace_too_many_goes_on() {
+    let t = extract(
+        br"{\rtf1\ansi{\b First}\par}} Second\par Third\par}",
+        Format::Rtf,
+    );
+    let words: Vec<&str> = t.text.split_whitespace().collect();
+    assert_eq!(words, ["First", "Second", "Third"], "{:?}", t.text);
+}
+
+/// A note in a list four levels deep is still a note (a bibliography's
+/// endnote in a nested bullet list lost its text), and notes in notes stop
+/// after a few levels.
+#[test]
+fn a_note_in_a_deeply_nested_list_keeps_its_text() {
+    let note = |body: &str| {
+        format!(
+            r#"<text:note text:note-class="endnote"><text:note-citation>1</text:note-citation><text:note-body>{body}</text:note-body></text:note>"#
+        )
+    };
+    let mut body = format!("<text:p>item{}</text:p>", note("<text:p>NOTETEXT</text:p>"));
+    for _ in 0..4 {
+        body = format!("<text:list><text:list-item>{body}</text:list-item></text:list>");
+    }
+    let fodt = format!(
+        r#"<?xml version="1.0"?><office:document {ODF_NS} office:mimetype="application/vnd.oasis.opendocument.text"><office:body><office:text>{body}</office:text></office:body></office:document>"#
+    );
+    let t = extract(fodt.as_bytes(), Format::Fodt);
+    assert_eq!(section(&t, "endnotes"), "NOTETEXT\n");
+
+    // Notes inside notes: the first levels are read, a long chain is cut.
+    let mut chain = "<text:p>LEAF</text:p>".to_string();
+    for level in (1..=6).rev() {
+        chain = format!("<text:p>L{level}{}</text:p>", note(&chain));
+    }
+    let fodt = format!(
+        r#"<?xml version="1.0"?><office:document {ODF_NS} office:mimetype="application/vnd.oasis.opendocument.text"><office:body><office:text>{chain}</office:text></office:body></office:document>"#
+    );
+    let t = extract(fodt.as_bytes(), Format::Fodt);
+    let notes = section(&t, "endnotes");
+    assert!(notes.contains("L2") && !notes.contains("LEAF"), "{notes:?}");
+}
+
 #[test]
 fn a_word_2003_xml_has_everything_a_reader_sees() {
     let t = extract(&wml(), Format::Wml2003);
@@ -754,6 +799,20 @@ fn a_picture_has_its_alt_text_and_a_text_box_its_text() {
     );
     let t = extract(flat.as_bytes(), Format::Fodt);
     assert_text(&t, "Look here\nA red kite\nNext\n", &[]);
+}
+
+#[test]
+fn the_text_of_shapes_in_a_group_is_kept() {
+    let body = r#"<text:p>before <draw:g text:anchor-type="paragraph"><draw:frame svg:width="5cm" svg:height="2cm"><draw:text-box><text:p>BOXTEXT</text:p></draw:text-box></draw:frame><draw:g><draw:rect svg:width="3cm" svg:height="1cm"><text:p>RECTTEXT</text:p></draw:rect></draw:g></draw:g> after</text:p>"#;
+    let flat = format!(
+        r#"<office:document {ODF_NS}><office:body><office:text>{body}</office:text></office:body></office:document>"#
+    );
+    let c = convert(flat.as_bytes(), Format::Fodt, &Limits::default()).unwrap();
+    let words = docx_words(&c.docx);
+    for w in ["BOXTEXT", "RECTTEXT", "before", "after"] {
+        assert!(words.iter().any(|x| x == w), "{w}: {words:?}");
+    }
+    same_words_as_the_converter("group", flat.as_bytes(), Format::Fodt);
 }
 
 #[test]

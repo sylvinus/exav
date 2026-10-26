@@ -1,6 +1,6 @@
 //! Public entry point for 7z extraction.
 
-use super::header::{ordered_coder_iter, parse_archive};
+use super::header::ordered_coder_iter;
 use super::parse::SIGNATURE_HEADER_SIZE;
 use crate::*;
 use std::io::{Cursor, Read};
@@ -35,11 +35,11 @@ fn has_unsupported_codec(block: &super::header::Block, has_password: bool) -> Op
 /// data, without decoding it. The streaming path reads this incrementally (skip
 /// to a file's offset, then `take(size)`) so the whole decompressed solid block
 /// is never buffered. `password` is threaded to an AES coder (if any).
-fn decode_block_reader(
+pub(super) fn decode_block_reader(
     block: &super::header::Block,
     pack_data: &[u8],
     expected_total: u64,
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
 ) -> Result<Box<dyn Read>, LimitHit> {
     let mut current: Box<dyn Read> = Box::new(Cursor::new(pack_data.to_vec()));
@@ -71,7 +71,7 @@ fn decode_block_reader(
 fn decode_block_graph(
     block: &super::header::Block,
     pack_streams: &[&[u8]],
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
 ) -> Result<Decoded, LimitHit> {
     // Exclusive prefix sums: the global index of each coder's first in/out stream.
@@ -101,7 +101,7 @@ fn decode_block_graph(
         in_base: &'a [u64],
         out_base: &'a [u64],
         producer: &'a dyn Fn(u64) -> Option<usize>,
-        password: Option<&'a str>,
+        password: Option<crate::kdf::Pass<'a>>,
         max_buffer: u64,
     }
 
@@ -226,7 +226,7 @@ fn decode_block(
     pack_data: &[u8],
     pack_sizes: &[u64],
     expected_total: u64,
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
 ) -> Result<Decoded, LimitHit> {
     // A folder whose coders take more inputs than there are coders cannot be a
@@ -406,7 +406,8 @@ fn stream_sevenz<T>(
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
     use crate::stream::{emit_bytes, emit_stream, MemberMeta};
-    let archive = match parse_archive(data, &budget.passwords) {
+    let kdf = std::sync::Arc::clone(&budget.kdf);
+    let archive = match super::header::parse_archive_with(data, &budget.passwords, &kdf) {
         Ok(a) => a,
         Err(e) => {
             let reason = e.reason.as_str();
@@ -566,7 +567,10 @@ fn stream_sevenz<T>(
                         pack_data,
                         &block_pack_sizes,
                         block_total,
-                        Some(pw.as_str()),
+                        Some(crate::kdf::Pass {
+                            word: pw.as_str(),
+                            kdf: &kdf,
+                        }),
                         max_buffer,
                     ) {
                         Ok((dec, None)) => match member(&dec) {

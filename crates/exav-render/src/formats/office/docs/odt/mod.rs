@@ -58,6 +58,8 @@ pub(crate) struct Odt<'a> {
     pub image_cache: HashMap<String, Option<usize>>,
     pub even_odd: bool,
     pub in_header: bool,
+    /// Notes the one being read is inside of.
+    pub note_level: u32,
 }
 
 pub(crate) fn read_odt(mut zip: Zip<'_>, budget: &mut Budget) -> Result<Document> {
@@ -142,6 +144,7 @@ fn convert(
         image_cache: HashMap::new(),
         even_odd: false,
         in_header: false,
+        note_level: 0,
     };
     o.load(styles_root, content_root);
     o.build_styles();

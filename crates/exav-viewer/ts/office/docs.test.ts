@@ -66,6 +66,16 @@ describe("what the bytes are", () => {
     expect(sniffDocs(bytes("<html><body>"))).toBeNull();
     expect(sniffDocs(new Uint8Array())).toBeNull();
   });
+
+  it("reads Word's Web Page, alone or in its MIME message, and no other HTML", () => {
+    const word = '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word"><body>';
+    expect(sniffDocs(bytes(word))).toBe("html");
+    expect(sniffDocs(bytes(`<!DOCTYPE html>\n${word}`))).toBe("html");
+    expect(sniffDocs(bytes(`MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary="b"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n${word}`))).toBe("html");
+    // An Excel page, a plain page and a mail with no Word in it.
+    expect(sniffDocs(bytes('<html xmlns:x="urn:schemas-microsoft-com:office:excel"><body>'))).toBeNull();
+    expect(sniffDocs(bytes("MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nhello"))).toBeNull();
+  });
 });
 
 const convertDocs = vi.fn();

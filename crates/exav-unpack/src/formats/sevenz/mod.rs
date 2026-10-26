@@ -266,6 +266,25 @@ mod tests {
         }
     }
 
+    /// 40 folders (7-Zip gives the folders of an archive one key), each with a
+    /// CRC that no password satisfies, tried with five passwords at 2^19 rounds:
+    /// the keys are derived once each, not once for each folder (200 times, 2 s
+    /// in a release build; and 2000 folders took 20 s, 30 at 2^24 took 9 s). Every
+    /// member is still reported encrypted.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn a_scan_derives_the_key_of_a_password_once_for_all_the_folders() {
+        let data = fixture("aes_40_folders_2p19.7z");
+        let words = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let mut budget = Budget::with_passwords(Limits::default(), words);
+        let entries = extract(Format::SevenZip, &data, &mut budget).unwrap();
+        assert_eq!(entries.len(), 40);
+        assert!(entries
+            .iter()
+            .all(|e| e.encrypted && e.unsupported.is_some()));
+        assert_eq!(budget.kdf.sevenz_spent(), 5 << 19);
+    }
+
     /// Without a password an AES archive is still reported encrypted/unsupported.
     #[test]
     fn aes_without_password_unsupported() {

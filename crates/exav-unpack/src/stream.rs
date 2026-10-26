@@ -278,6 +278,10 @@ fn dispatch<T>(
         Format::Zstd => f::zstd::walk,
         #[cfg(feature = "lzip")]
         Format::Lzip => f::lzip::walk,
+        #[cfg(feature = "lzma")]
+        Format::Lzma => f::lzmaalone::walk,
+        #[cfg(feature = "rpm")]
+        Format::Rpm => f::rpm::walk,
         #[cfg(feature = "sevenz")]
         Format::SevenZip => f::sevenz::walk,
         #[cfg(feature = "cab")]

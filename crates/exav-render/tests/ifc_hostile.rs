@@ -381,6 +381,89 @@ fn huge_sweep_ranges_do_not_run_away() {
 }
 
 #[test]
+fn a_range_of_0_to_1_on_a_polyline_of_many_points_is_the_whole_polyline() {
+    // Allplan writes it for bent bars. A two-point polyline is cut as written.
+    let extent = |points: &[&str], end: &str| {
+        let mut f = File::new();
+        let ids: Vec<String> = points
+            .iter()
+            .map(|p| f.add(format!("IFCCARTESIANPOINT(({p}))")))
+            .collect();
+        let line = f.add(format!("IFCPOLYLINE(({}))", ids.join(",")));
+        let d = f.add(format!("IFCSWEPTDISKSOLID({line},0.1,$,0.,{end})"));
+        f.product(&d, "#5");
+        let b = f.read("0 to 1").bounds.unwrap();
+        b[1][1] - b[0][1]
+    };
+    let bent = ["0.,0.,0.", "2.,0.,0.", "2.,2.,0."];
+    // Along y: the second segment is 2 long, and the first leaves 0.2 of disk.
+    assert!(extent(&bent, "1.") > 1.9);
+    assert!(extent(&bent, "1.5") < 1.5);
+    assert!(extent(&["0.,0.,0.", "2.,0.,0."], "1.") < 0.5);
+}
+
+#[test]
+fn an_alignment_is_counted_as_not_drawn() {
+    let mut f = File::new();
+    let a = f.add("IFCCARTESIANPOINT((0.,0.,0.))");
+    let b = f.add("IFCCARTESIANPOINT((10.,0.,0.))");
+    let line = f.add(format!("IFCPOLYLINE(({a},{b}))"));
+    let rep = f.add(format!(
+        "IFCSHAPEREPRESENTATION(#6,'Axis','Curve3D',({line}))"
+    ));
+    let shape = f.add(format!("IFCPRODUCTDEFINITIONSHAPE($,$,({rep}))"));
+    f.add(format!(
+        "IFCALIGNMENT('0000000000000000000003',$,'a',$,$,#5,{shape},$)"
+    ));
+    let s = f.read("alignment");
+    assert!(s.elements.is_empty());
+    assert_eq!(s.warnings.unsupported.get("IFCALIGNMENT"), Some(&1));
+}
+
+#[test]
+fn a_product_with_no_global_id_is_drawn() {
+    // web-ifc writes `$`, which the schema does not allow.
+    let mut f = File::new();
+    let profile = f.add("IFCRECTANGLEPROFILEDEF(.AREA.,$,$,2.,1.)");
+    let solid = f.add(format!("IFCEXTRUDEDAREASOLID({profile},#4,#2,3.)"));
+    let rep = f.add(format!(
+        "IFCSHAPEREPRESENTATION(#6,'Body','SweptSolid',({solid}))"
+    ));
+    let shape = f.add(format!("IFCPRODUCTDEFINITIONSHAPE($,$,({rep}))"));
+    f.add(format!("IFCWALLSTANDARDCASE($,$,'w',$,$,#5,{shape},$,$)"));
+    let s = f.read("null global id");
+    assert_eq!(s.elements.len(), 1);
+    assert!(s.triangles() > 0);
+}
+
+#[test]
+fn an_end_that_counts_each_polyline_of_a_composite_curve_once_is_the_whole_curve() {
+    // Revit: two polylines of three points are 2 long, not 4.
+    let extent = |end: &str| {
+        let mut f = File::new();
+        let mut segment = |points: [&str; 3]| {
+            let ids: Vec<String> = points
+                .iter()
+                .map(|p| f.add(format!("IFCCARTESIANPOINT(({p}))")))
+                .collect();
+            let line = f.add(format!("IFCPOLYLINE(({}))", ids.join(",")));
+            f.add(format!("IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,{line})"))
+        };
+        let a = segment(["0.,0.,0.", "2.,0.,0.", "4.,0.,0."]);
+        let b = segment(["4.,0.,0.", "4.,2.,0.", "4.,4.,0."]);
+        let curve = f.add(format!("IFCCOMPOSITECURVE(({a},{b}),.F.)"));
+        let d = f.add(format!("IFCSWEPTDISKSOLID({curve},0.1,$,0.,{end})"));
+        f.product(&d, "#5");
+        let b = f.read(end).bounds.unwrap();
+        b[1][1] - b[0][1]
+    };
+    assert!(extent("2.") > 3.9);
+    assert!(extent("4.") > 3.9);
+    // Neither count: cut as the usual count says, 3 is half way up.
+    assert!((1.9..2.5).contains(&extent("3.")));
+}
+
+#[test]
 fn a_sweep_with_a_parameter_that_is_no_number_is_counted_invalid() {
     let mut f = File::new();
     let a = f.add("IFCCARTESIANPOINT((0.,0.,0.))");

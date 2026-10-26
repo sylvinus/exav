@@ -49,7 +49,8 @@ fn v_align_of(a: VAlign) -> text::VAlign {
 /// Only some entity types are stored in OCS. LINE, POINT, SPLINE, ELLIPSE,
 /// 3DFACE and MLINE carry an extrusion vector but their coordinates are
 /// already world-space, so applying the transform to them would mirror
-/// geometry that was correct to begin with.
+/// geometry that was correct to begin with. MTEXT is world-space too, with
+/// its own plane (`mtext_plane`).
 fn ocs_of(e: &EntityKind) -> Option<Affine> {
     let (n, elevation) = match e {
         EntityKind::Circle(x) => (x.plane.extrusion, x.center.z),
@@ -60,7 +61,7 @@ fn ocs_of(e: &EntityKind) -> Option<Affine> {
         }
         EntityKind::Solid(x) | EntityKind::Trace(x) => (x.plane.extrusion, x.corners[0].z),
         EntityKind::Text(x) => (x.plane.extrusion, x.insertion.z),
-        EntityKind::MText(x) => (x.extrusion, x.insertion.z),
+        EntityKind::MText(x) => return mtext_plane(x),
         EntityKind::Attribute(x) | EntityKind::AttributeDefinition(x) => {
             (x.text.plane.extrusion, x.text.insertion.z)
         }
@@ -73,6 +74,52 @@ fn ocs_of(e: &EntityKind) -> Option<Affine> {
         return None;
     }
     Some(Affine::from_extrusion(n.x, n.y, n.z, elevation))
+}
+
+/// An MTEXT is not in OCS: its insertion point and text direction are world
+/// coordinates, and its extrusion is the normal of the plane the text lies in
+/// (ezdxf reads it so, tested against AutoCAD's own files). `None` for the
+/// plain plane, the drawing's own. Otherwise the map of the text's own
+/// (along, up) to the plan view, with the insertion point as its origin.
+fn mtext_plane(m: &crate::cad::MText) -> Option<Affine> {
+    let n = m.extrusion;
+    let len = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+    if !len.is_finite()
+        || len < 1e-12
+        || (n.z > 0.0 && n.x.abs() / len < 1e-12 && n.y.abs() / len < 1e-12)
+    {
+        return None;
+    }
+    let x_axis = match m.x_direction {
+        Some(d) if d.x != 0.0 || d.y != 0.0 || d.z != 0.0 => [d.x, d.y, d.z],
+        // A rotation is an angle in the plane's own frame: the arbitrary axis
+        // algorithm's X and Y, as ezdxf takes it.
+        _ => {
+            let unit = [n.x / len, n.y / len, n.z / len];
+            let cross = |a: [f64; 3], b: [f64; 3]| {
+                [
+                    a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0],
+                ]
+            };
+            let ax = if unit[0].abs() < 1.0 / 64.0 && unit[1].abs() < 1.0 / 64.0 {
+                cross([0.0, 1.0, 0.0], unit)
+            } else {
+                cross([0.0, 0.0, 1.0], unit)
+            };
+            let al = ax.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let ax = ax.map(|v| v / al);
+            let ay = cross(unit, ax);
+            let (s, c) = m.rotation.sin_cos();
+            [
+                c * ax[0] + s * ay[0],
+                c * ax[1] + s * ay[1],
+                c * ax[2] + s * ay[2],
+            ]
+        }
+    };
+    Affine::from_plane(x_axis, [n.x, n.y, n.z], [m.insertion.x, m.insertion.y])
 }
 
 /// How a hatch wants its islands treated (group 75).
@@ -1111,16 +1158,25 @@ impl<'a> Tessellator<'a> {
             };
 
         // DWG stores the text direction as a vector when it has one.
+        let in_plane = mtext_plane(m).is_some();
         let rotation = match m.x_direction {
+            _ if in_plane => 0.0,
             Some(d) if d.x != 0.0 || d.y != 0.0 => d.y.atan2(d.x),
             _ => m.rotation,
+        };
+        // Out of the drawing's plane the text is laid out in its own frame
+        // from the origin, and the entity's map places it.
+        let origin = if in_plane {
+            [0.0, 0.0]
+        } else {
+            [m.insertion.x, m.insertion.y]
         };
         let (h_align, dy0) = text::mtext_layout(m.attachment as u8, lines.len(), height, spacing);
         let (sin_r, cos_r) = rotation.sin_cos();
         let at = |along: f64, up: f64| {
             [
-                m.insertion.x + along * cos_r - up * sin_r,
-                m.insertion.y + along * sin_r + up * cos_r,
+                origin[0] + along * cos_r - up * sin_r,
+                origin[1] + along * sin_r + up * cos_r,
             ]
         };
 
@@ -1601,13 +1657,13 @@ impl<'a> Tessellator<'a> {
         if !layout.is_model {
             self.sheet.mm_per_unit = layout.mm_per_unit;
         }
+        // The paper is known first: what is drawn on it is sized by it.
+        let limits = layout.limits.filter(|_| !layout.is_model);
+        self.sheet.paper = limits;
         self.run_block(&block, !layout.is_model);
         // The sheet, not the contents: see `Scene::set_extents`.
-        if let Some(l) = layout.limits.filter(|_| !layout.is_model) {
+        if let Some(l) = limits {
             self.scene.set_extents([l[0], l[1]], [l[2], l[3]]);
-            if l[2] > l[0] && l[3] > l[1] {
-                self.sheet.paper = Some(l);
-            }
         }
         true
     }
@@ -1809,11 +1865,10 @@ impl<'a> Tessellator<'a> {
                 expand_bulges(&pts, true)
             }
             EntityKind::Circle(c) => curves::flatten_circle(c.center.x, c.center.y, c.radius),
-            EntityKind::Ellipse(el) => curves::flatten_ellipse(
-                el.center.x,
-                el.center.y,
-                el.major_axis.x,
-                el.major_axis.y,
+            EntityKind::Ellipse(el) => curves::flatten_ellipse_in_space(
+                [el.center.x, el.center.y, el.center.z],
+                [el.major_axis.x, el.major_axis.y, el.major_axis.z],
+                [el.extrusion.x, el.extrusion.y, el.extrusion.z],
                 el.ratio,
                 el.start_param,
                 el.end_param,
@@ -1974,11 +2029,10 @@ impl<'a> Tessellator<'a> {
             }
 
             EntityKind::Ellipse(el) => {
-                let pts = curves::flatten_ellipse(
-                    el.center.x,
-                    el.center.y,
-                    el.major_axis.x,
-                    el.major_axis.y,
+                let pts = curves::flatten_ellipse_in_space(
+                    [el.center.x, el.center.y, el.center.z],
+                    [el.major_axis.x, el.major_axis.y, el.major_axis.z],
+                    [el.extrusion.x, el.extrusion.y, el.extrusion.z],
                     el.ratio,
                     el.start_param,
                     el.end_param,
@@ -2265,13 +2319,13 @@ impl<'a> Tessellator<'a> {
             }),
 
             // A WIPEOUT blanks everything beneath it. Its boundary is given in
-            // image pixel coordinates along the u and v vectors.
+            // image pixel coordinates along the u and v vectors, from the top
+            // left with y down, of a 1 by 1 image.
             EntityKind::Wipeout(w) => {
                 let to_world = |p: [f64; 2]| {
-                    let x =
-                        w.insertion.x + w.u_vector.x * (p[0] + 0.5) + w.v_vector.x * (p[1] + 0.5);
-                    let y =
-                        w.insertion.y + w.u_vector.y * (p[0] + 0.5) + w.v_vector.y * (p[1] + 0.5);
+                    let (a, b) = (p[0] + 0.5, 0.5 - p[1]);
+                    let x = w.insertion.x + w.u_vector.x * a + w.v_vector.x * b;
+                    let y = w.insertion.y + w.u_vector.y * a + w.v_vector.y * b;
                     xf.apply(x, y)
                 };
                 let v = &w.clip_vertices;
@@ -2369,12 +2423,31 @@ impl<'a> Tessellator<'a> {
                         o[1] + u[1] * a * w + v[1] * b * h,
                     ]
                 };
-                let frame = [
+                let mut frame = vec![
                     corner(0.0, 0.0),
                     corner(1.0, 0.0),
                     corner(1.0, 1.0),
                     corner(0.0, 1.0),
                 ];
+                // A crop shows only its boundary. Its pixels count from the
+                // top left, y down, and the first pixel is centred on 0.
+                let v = &img.clip_vertices;
+                if img.clipping && !img.clip_inverted && v.len() >= 2 && w > 0.0 && h > 0.0 {
+                    let at = |p: [f64; 2]| corner((p[0] + 0.5) / w, 1.0 - (p[1] + 0.5) / h);
+                    // Two vertices are opposite corners of a rectangle.
+                    let mut poly: Vec<[f64; 2]> = if v.len() == 2 {
+                        let (a, b) = (v[0], v[1]);
+                        vec![[a.x, a.y], [b.x, a.y], [b.x, b.y], [a.x, b.y]]
+                    } else {
+                        v.iter().map(|p| [p.x, p.y]).collect()
+                    };
+                    // A path may repeat its first point to close; the frame
+                    // closes itself.
+                    if poly.len() > 3 && poly.first() == poly.last() {
+                        poly.pop();
+                    }
+                    frame = poly.into_iter().map(at).collect();
+                }
                 self.push_transformed(&frame, true, xf, rgba, attr, pattern);
             }
 
@@ -3352,11 +3425,19 @@ impl<'a> Tessellator<'a> {
             };
             let flags = if contrast { FLAG_CONTRAST } else { 0 };
             let face = self.style_face(&self.doc.header.textstyle);
+            // $TEXTSIZE through the insert's scale is a label metres tall on
+            // a sheet whose title block is a scaled xref: on a layout it is
+            // held to a hundredth of the paper.
+            let mut height = self.doc.header.textsize;
+            if let Some(p) = self.sheet.paper {
+                let cap = (p[2] - p[0]).min(p[3] - p[1]) / 100.0;
+                height = height.min(cap / xf.scale_magnitude());
+            }
             self.push_text_run(
                 file.clone(),
                 0.0,
                 0.0,
-                text::frame(self.doc.header.textsize, 0.0, 1.0, 0.0),
+                text::frame(height, 0.0, 1.0, 0.0),
                 text::HAlign::Left,
                 text::VAlign::Baseline,
                 &at,

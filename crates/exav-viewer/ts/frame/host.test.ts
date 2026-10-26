@@ -3,12 +3,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import "../test/blob.js";
-import type { ByteRanges, Controllers, FileSource, Session } from "../core/types.js";
+import type { ByteRanges, Controllers, FileSource, FileTree, Session } from "../core/types.js";
 import { builtinTranslate } from "../react/messages.js";
 import type { FrameTheme } from "../core/theme.js";
 import { createSandboxedViewer, KEY_RATE, type SandboxConfig, type SandboxedViewer } from "./index.js";
 import { frameCsp, readPolicy, type FramePolicy } from "./policy.js";
-import { HELLO, MAX_DRAWS, PROTOCOL, READS } from "./protocol.js";
+import { HELLO, MAX_DRAWS, PROTOCOL, READS, TREE } from "./protocol.js";
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -51,11 +51,12 @@ async function mountWith(
   ready = true,
   source: FileSource = { bytes: new Uint8Array([1, 2, 3]) },
   policy: FramePolicy | null = null,
+  tree?: FileTree,
 ): Promise<Frame> {
   const host = document.createElement("div");
   document.body.append(host);
   hosts.push(host);
-  const session = viewer.mount(host, { id: "f1", name, source });
+  const session = viewer.mount(host, { id: "f1", name, source, ...(tree && { tree }) });
   const iframe = host.querySelector("iframe")!;
   const hello: { message: any; target: string; transfer: MessagePort[] }[] = [];
   iframe.contentWindow!.postMessage = ((message: unknown, target: string, transfer: MessagePort[]) => hello.push({ message, target, transfer })) as never;
@@ -708,6 +709,68 @@ function heldRanges(size: number) {
 }
 
 const answer = (f: Frame, id: number) => f.received.find((m) => m.type === "bytes" && m.id === id);
+
+describe("the files around the one shown", () => {
+  const files: Record<string, Uint8Array> = { "site/title.dwg": new Uint8Array([7, 8, 9]), "site/big.bin": new Uint8Array(TREE.maxFileBytes + 1) };
+  const opened: string[] = [];
+  const tree = (): FileTree => ({
+    path: "site/plan.dwg",
+    paths: ["site/plan.dwg", ...Object.keys(files), "site/gone.dwg"],
+    async open(path) {
+      opened.push(path);
+      const bytes = files[path];
+      if (!bytes) throw new Error("gone");
+      return { bytes };
+    },
+  });
+  const mountTree = () => mountWith(createSandboxedViewer({ url: "https://frame.test/index.html" }), "plan.dwg", true, { bytes: new Uint8Array([1]) }, null, tree());
+
+  it("are listed to the frame with the file", async () => {
+    const f = await mountTree();
+    expect(f.received.find((m) => m.type === "open").tree).toEqual({ path: "site/plan.dwg", paths: ["site/plan.dwg", "site/title.dwg", "site/big.bin", "site/gone.dwg"] });
+    const alone = await mount();
+    expect("tree" in alone.received.find((m) => m.type === "open")).toBe(false);
+  });
+
+  it("are given whole when the frame asks for one it was told of, and for no other", async () => {
+    opened.length = 0;
+    const f = await mountTree();
+    await f.send({ type: "fetch", id: 1, path: "site/title.dwg" });
+    expect([...new Uint8Array(answer(f, 1).data)]).toEqual([7, 8, 9]);
+    // Not in the list, and not a path of the list in another spelling: never opened.
+    await f.send({ type: "fetch", id: 2, path: "site/secret.dwg" });
+    await f.send({ type: "fetch", id: 3, path: "SITE/TITLE.DWG" });
+    expect(answer(f, 2)).toEqual({ type: "bytes", id: 2, error: "refused" });
+    expect(answer(f, 3)).toEqual({ type: "bytes", id: 3, error: "refused" });
+    expect(opened).toEqual(["site/title.dwg"]);
+    // Listed and unreadable, or past the size the host reads for the frame.
+    await f.send({ type: "fetch", id: 4, path: "site/gone.dwg" });
+    await f.send({ type: "fetch", id: 5, path: "site/big.bin" });
+    expect(answer(f, 4)).toEqual({ type: "bytes", id: 4, error: "failed" });
+    expect(answer(f, 5)).toEqual({ type: "bytes", id: 5, error: "refused" });
+  });
+
+  it("are refused to a file that has none", async () => {
+    const f = await mount();
+    await f.send({ type: "fetch", id: 1, path: "site/title.dwg" });
+    expect(answer(f, 1)).toEqual({ type: "bytes", id: 1, error: "refused" });
+  });
+
+  it("are read once for an id in use, and no more once the fetch is cancelled", async () => {
+    const signals: AbortSignal[] = [];
+    const slow: FileTree = { path: "a.dwg", paths: ["a.dwg", "b.dwg"], open: (_p, s) => (signals.push(s), new Promise(() => undefined)) };
+    const f = await mountWith(createSandboxedViewer({ url: "https://frame.test/index.html" }), "a.dwg", true, { bytes: new Uint8Array([1]) }, null, slow);
+    await f.send({ type: "fetch", id: 9, path: "b.dwg" });
+    await f.send({ type: "fetch", id: 9, path: "b.dwg" });
+    expect(signals).toHaveLength(1);
+    await f.send({ type: "cancel", id: 9 });
+    expect(signals[0]!.aborted).toBe(true);
+    // The ones that stay open are limited as reads are.
+    for (let i = 0; i < READS.maxReads; i++) await f.send({ type: "fetch", id: 100 + i, path: "b.dwg" });
+    await f.send({ type: "fetch", id: 200, path: "b.dwg" });
+    expect(answer(f, 200)).toEqual({ type: "bytes", id: 200, error: "refused" });
+  });
+});
 
 describe("a file read by ranges", () => {
   it("gives the frame its size and first bytes, then what it asks within the file and the limits", async () => {

@@ -149,7 +149,14 @@ impl VolumeName {
     /// archive.
     pub fn same_set_as(&self, other: &VolumeName) -> bool {
         self.stem.eq_ignore_ascii_case(&other.stem)
-            && std::mem::discriminant(&self.scheme) == std::mem::discriminant(&other.scheme)
+            && match (&self.scheme, &other.scheme) {
+                // `a.7z.001` and `a.zip.002` are the volumes of two archives.
+                (
+                    Scheme::NumberedSuffix { base_ext: a, .. },
+                    Scheme::NumberedSuffix { base_ext: b, .. },
+                ) => a.eq_ignore_ascii_case(b),
+                (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+            }
     }
 }
 
@@ -523,6 +530,32 @@ mod tests {
         let names = ["a.part1.rar", "a.part2.rar", "a.7z.001", "a.7z.002"];
         let sets = group(&names);
         assert_eq!(sets.len(), 2, "got {sets:?}");
+    }
+
+    #[test]
+    fn a_shared_stem_with_other_formats_numbered_is_two_archives() {
+        // The same stem and the same kind of numbering, but a 7z and a zip.
+        let names = ["a.7z.001", "a.zip.002", "a.ZIP.001", "a.7z.002"];
+        let sets = group(&names);
+        assert_eq!(sets.len(), 2, "got {sets:?}");
+        for s in &sets {
+            let exts: Vec<_> = s
+                .iter()
+                .map(|&i| {
+                    names[i]
+                        .rsplit_once('.')
+                        .unwrap()
+                        .0
+                        .rsplit('.')
+                        .next()
+                        .unwrap()
+                })
+                .collect();
+            assert!(
+                exts.iter().all(|e| e.eq_ignore_ascii_case(exts[0])),
+                "{exts:?}"
+            );
+        }
     }
 
     #[test]

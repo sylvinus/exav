@@ -378,9 +378,12 @@ tables, dimensions, leaders and multileaders, blocks with their attributes,
 in their linetypes and lineweights, paper layouts through their
 viewports, and custom objects (ACAD_PROXY_ENTITY, an application's own
 entities such as TArch's walls or Civil 3D's alignments) from the proxy
-graphics they were saved with. External references are counted in
-`Drawing`'s warnings, not drawn, and so are custom objects saved without
-graphics (`proxy_without_graphics`).
+graphics they were saved with. An external reference is drawn
+when the caller has the file it names (`Document::xref_paths` lists the paths,
+`Document::attach_xref` binds a file into the references to it, nested ones
+included, to a depth of eight); otherwise it is counted in `Drawing`'s
+warnings and its path is drawn where it is inserted. Custom objects saved
+without graphics are counted too (`proxy_without_graphics`).
 
 A damaged file is meant to be an error, not a panic, a hang or an
 allocation of gigabytes: the readers' panics are caught where unwinding is

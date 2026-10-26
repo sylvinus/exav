@@ -10,6 +10,7 @@ export { createViewer, errorCode } from "./viewer.js";
 export { createDetector, sniff, HEAD_BYTES } from "./detect.js";
 export { MATCHERS, WASM_IMAGES, SIGNATURES, UNKNOWN_TYPES, BUILTIN_ORDER, CONVERTED_FORMATS } from "./formats.js";
 export { canOpenInTab, createSourceReader, sameSource, type OwnedSourceReader } from "./source.js";
+export { resolveInTree } from "./tree.js";
 export {
   fitCamera,
   fitRect,

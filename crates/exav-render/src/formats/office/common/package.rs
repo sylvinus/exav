@@ -33,6 +33,22 @@ impl std::error::Error for Error {}
 pub trait Source: Read + Seek {}
 impl<T: Read + Seek> Source for T {}
 
+/// Opens `reader` as a ZIP archive. The directory is first taken where the
+/// end record says, which reads only the end of the file; the crate's own
+/// search for it, which also finds an archive that something precedes,
+/// reads the whole file from its start, and comes second.
+pub(crate) fn open_zip<R: Read + Seek>(
+    mut reader: R,
+) -> zip::result::ZipResult<zip::ZipArchive<R>> {
+    let config = || zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    if zip::ZipArchive::with_config(config(), &mut reader).is_ok() {
+        return zip::ZipArchive::with_config(config(), reader);
+    }
+    zip::ZipArchive::new(reader)
+}
+
 pub struct Zip<'a> {
     z: zip::ZipArchive<Box<dyn Source + 'a>>,
 }
@@ -43,7 +59,7 @@ impl<'a> Zip<'a> {
     }
 
     pub fn from_source(source: Box<dyn Source + 'a>) -> Result<Zip<'a>, Error> {
-        let z = zip::ZipArchive::new(source).map_err(|e| Error::NotZip(e.to_string()))?;
+        let z = open_zip(source).map_err(|e| Error::NotZip(e.to_string()))?;
         Ok(Zip { z })
     }
 

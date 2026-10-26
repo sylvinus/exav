@@ -4,7 +4,8 @@
 //! Read: the scene's node tree with its transforms (`matrix`, or
 //! `translation`, `rotation` and `scale`), the meshes' triangle primitives
 //! with their `POSITION`, `NORMAL`, `COLOR_0` and indices (8, 16 or 32 bits),
-//! sparse accessors, and the material's `baseColorFactor`, which with
+//! positions and normals as floats or as small integers (what
+//! `KHR_mesh_quantization` says the node's scale restores), sparse accessors, and the material's `baseColorFactor`, which with
 //! `COLOR_0` colours the vertices. Coordinates are returned as written: glTF
 //! is Y up, in metres.
 //!
@@ -135,6 +136,11 @@ fn srgb(v: f32) -> u8 {
 /// Reads at most `max_triangles`; past them the rest is left out and
 /// `warnings.truncated` is 1.
 pub fn read(bytes: &[u8], max_triangles: usize) -> Result<Scene, Error> {
+    read_with(bytes, max_triangles, &[])
+}
+
+/// The JSON of a document and the binary chunk of a GLB file.
+fn document(bytes: &[u8]) -> Result<(Value, Option<&[u8]>), Error> {
     let (json_bytes, bin) = if bytes.starts_with(b"glTF") {
         container(bytes)?
     } else {
@@ -162,8 +168,34 @@ pub fn read(bytes: &[u8], max_triangles: usize) -> Result<Scene, Error> {
     if !version.starts_with("2.") {
         return Err(Error::Unsupported("version"));
     }
+    Ok((root, bin))
+}
+
+/// The files the document's buffers are in, as the document writes them (a
+/// relative URI, percent-encoded), in the order of the buffers: those with a
+/// URI that is not a `data:` one. [`read_with`] is given what they hold.
+pub fn external_buffers(bytes: &[u8]) -> Result<Vec<String>, Error> {
+    let (root, _) = document(bytes)?;
+    Ok(root
+        .get("buffers")
+        .map_or(&[][..], Value::array)
+        .iter()
+        .filter_map(|b| b.get("uri").and_then(Value::str))
+        .filter(|u| !u.starts_with("data:"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// [`read`], with the contents of buffer files: each `(uri, bytes)` is
+/// the buffer whose `uri` is that, as written.
+pub fn read_with(
+    bytes: &[u8],
+    max_triangles: usize,
+    files: &[(&str, &[u8])],
+) -> Result<Scene, Error> {
+    let (root, bin) = document(bytes)?;
     let mut doc = Doc {
-        buffers: buffers(&root, bin)?,
+        buffers: buffers(&root, bin, files)?,
         root: &root,
         floats: HashMap::new(),
         indices: HashMap::new(),
@@ -219,11 +251,25 @@ fn container(bytes: &[u8]) -> Result<(&[u8], Option<&[u8]>), Error> {
             0x004E_4942 if bin.is_none() && json.is_some() => bin = Some(data),
             _ => {}
         }
-        // Chunks are padded to four bytes.
-        at = end
+        // A chunk's length includes its padding to four bytes. Some writers
+        // leave the padding out of the length, or out of the file; the next
+        // chunk is where one starts that is a JSON or binary chunk.
+        let padded = end
             .checked_add(3)
             .ok_or(Error::Invalid("GLB chunk length"))?
             & !3;
+        let starts_chunk = |p: usize| {
+            matches!(
+                (word(p), word(p + 4)),
+                (Some(n), Some(0x4E4F_534A | 0x004E_4942))
+                    if p.saturating_add(8).saturating_add(n as usize) <= length
+            )
+        };
+        at = if padded != end && !starts_chunk(padded) && starts_chunk(end) {
+            end
+        } else {
+            padded
+        };
     }
     Ok((json.ok_or(Error::Invalid("GLB without JSON"))?, bin))
 }
@@ -234,7 +280,11 @@ enum Buffer<'a> {
     External,
 }
 
-fn buffers<'a>(root: &Value, bin: Option<&'a [u8]>) -> Result<Vec<Buffer<'a>>, Error> {
+fn buffers<'a>(
+    root: &Value,
+    bin: Option<&'a [u8]>,
+    files: &[(&str, &'a [u8])],
+) -> Result<Vec<Buffer<'a>>, Error> {
     let mut out = Vec::new();
     for (i, b) in root
         .get("buffers")
@@ -246,6 +296,11 @@ fn buffers<'a>(root: &Value, bin: Option<&'a [u8]>) -> Result<Vec<Buffer<'a>>, E
             .get("byteLength")
             .and_then(Value::usize)
             .ok_or(Error::Invalid("buffer length"))?;
+        let file = b
+            .get("uri")
+            .and_then(Value::str)
+            .and_then(|u| files.iter().find(|(f, _)| *f == u))
+            .map(|(_, d)| *d);
         let data: Cow<[u8]> = match (b.get("uri").map(Value::str), bin) {
             (None, Some(bin)) if i == 0 => Cow::Borrowed(bin),
             (Some(Some(uri)), _) if uri.starts_with("data:") => {
@@ -254,10 +309,13 @@ fn buffers<'a>(root: &Value, bin: Option<&'a [u8]>) -> Result<Vec<Buffer<'a>>, E
                     .ok_or(Error::Invalid("data URI"))?;
                 Cow::Owned(base64(payload.as_bytes()).ok_or(Error::Invalid("base64"))?)
             }
-            _ => {
-                out.push(Buffer::External);
-                continue;
-            }
+            _ => match file {
+                Some(d) => Cow::Borrowed(d),
+                None => {
+                    out.push(Buffer::External);
+                    continue;
+                }
+            },
         };
         if data.len() < length {
             return Err(Error::Invalid("buffer shorter than its length"));
@@ -479,12 +537,7 @@ impl<'a> Doc<'a> {
     }
 
     /// An accessor's components as floats, `count * width` of them.
-    fn floats(
-        &mut self,
-        index: usize,
-        widths: &[usize],
-        float_only: bool,
-    ) -> Result<(Rc<Vec<f32>>, usize), Error> {
+    fn floats(&mut self, index: usize, widths: &[usize]) -> Result<(Rc<Vec<f32>>, usize), Error> {
         let a = self
             .list("accessors")
             .get(index)
@@ -501,7 +554,7 @@ impl<'a> Doc<'a> {
             .and_then(Value::usize)
             .and_then(Comp::from)
             .ok_or(Error::Invalid("component type"))?;
-        if !widths.contains(&width) || (float_only && comp != Comp::F32) {
+        if !widths.contains(&width) {
             return Err(Error::Invalid("accessor type"));
         }
         if let Some(c) = self.floats.get(&index) {
@@ -650,15 +703,17 @@ impl<'a> Doc<'a> {
             .ok_or(Error::Invalid("primitive without attributes"))?;
         let attribute = |name: &str| attributes.get(name).and_then(Value::usize);
         let at = attribute("POSITION").ok_or(Error::Invalid("primitive without positions"))?;
-        let (position, _) = self.floats(at, &[3], true)?;
+        // Positions and normals may be small integers (KHR_mesh_quantization,
+        // which gltfpack writes): the node's scale puts them back.
+        let (position, _) = self.floats(at, &[3])?;
         let vertices = position.len() / 3;
         // A normal or a colour for another count of vertices is left out.
         let normal = attribute("NORMAL")
-            .and_then(|i| self.floats(i, &[3], true).ok())
+            .and_then(|i| self.floats(i, &[3]).ok())
             .map(|(n, _)| n)
             .filter(|n| n.len() / 3 == vertices);
         let color = attribute("COLOR_0")
-            .and_then(|i| self.floats(i, &[3, 4], false).ok())
+            .and_then(|i| self.floats(i, &[3, 4]).ok())
             .filter(|(c, w)| c.len() / w == vertices);
         let indices = match p.get("indices") {
             Some(i) => Some(self.index_list(i.usize().ok_or(Error::Invalid("indices"))?)?),
@@ -794,10 +849,15 @@ impl<'a> Doc<'a> {
         let q = vector("rotation", 4, &[0.0, 0.0, 0.0, 1.0])?;
         let s = vector("scale", 3, &[1.0, 1.0, 1.0])?;
         let len = q.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if !len.is_finite() || len <= 1e-9 {
+        if !len.is_finite() {
             return Err(bad);
         }
-        let (x, y, z, w) = (q[0] / len, q[1] / len, q[2] / len, q[3] / len);
+        // All zeros is not a rotation; some exporters write it for none.
+        let (x, y, z, w) = if len <= 1e-9 {
+            (0.0, 0.0, 0.0, 1.0)
+        } else {
+            (q[0] / len, q[1] / len, q[2] / len, q[3] / len)
+        };
         let r = [
             [
                 1.0 - 2.0 * (y * y + z * z),

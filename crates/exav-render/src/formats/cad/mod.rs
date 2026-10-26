@@ -47,12 +47,14 @@ mod json;
 pub mod model;
 mod preview;
 mod proxy;
+mod xref;
 
 pub use exav_unpack::dwg::{looks_like_dwg, pre_r13_version};
 pub use exav_unpack::dxf::{looks_like_dxf, Limits};
 pub use json::to_json;
 pub use model::*;
 pub use preview::preview;
+pub use xref::MAX_BOUND_ENTITIES;
 
 /// Why a file could not be read at all.
 #[derive(Clone, Debug, PartialEq, Eq)]

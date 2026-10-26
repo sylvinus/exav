@@ -751,7 +751,8 @@ fixtures. The shipped 7z reader is native (§1m), the bzip2 decoder is vendored
 (§1h3) and the LZFSE decoder is ported from Apple's (§1h6).
 
 MIT-only components (the MIT copyright and permission notice must be retained;
-the MIT text is in the exav LICENSE file): apfs, ascii_tree, cfb, color_quant,
+the MIT text is in the exav LICENSE file): apfs, ascii_tree, bcdec_rs (2023 SMG;
+a port of bcdec, MIT or public domain, 2022 Sergii Kudlai), cfb, color_quant,
 deflate64, fatfs, fax, fax_derive, goblin, hfsplus, lznt1, quick-xml,
 rmp, rmp-serde, ruzstd, salzweg, scroll, scroll_derive, simd-adler32, slab,
 strsim, xz4rust, zip, zmij, and bytes (`http` features only). fancy-regex and

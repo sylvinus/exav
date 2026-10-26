@@ -77,6 +77,7 @@ import {
   type StatusSnapshot,
 } from "../protocol.js";
 import { portRanges, type PortRanges } from "./ranges.js";
+import { portTree, type PortTree } from "./tree.js";
 import { installWorkers } from "./workers.js";
 
 const base = new URL("./", import.meta.url);
@@ -428,7 +429,7 @@ async function replace(m: ReplaceMessage): Promise<boolean> {
   const { name, type, path, format } = m.file;
   let ok = false;
   try {
-    ok = await live.replace({ id: "file", name, type, path, ...(format && { format }), source });
+    ok = await live.replace({ id: "file", name, type, path, ...(format && { format }), source, ...(around && { tree: around.tree }) });
   } catch (error) {
     console.warn("frame: a replacement failed", error);
   }
@@ -492,6 +493,8 @@ addEventListener("keydown", (e) => {
 let opened = false;
 /** The files read by ranges that are alive: the document shown, and one replacing it. */
 const ranges = new Set<PortRanges>();
+/** The files around the one shown, when the host listed them. */
+let around: PortTree | null = null;
 
 function receive(data: unknown) {
   if (!opened) {
@@ -509,7 +512,8 @@ function receive(data: unknown) {
       ranges.add(first);
       source = { ranges: first };
     } else source = s.kind === "url" ? { url: s.url } : { blob: s.blob };
-    const session = viewer.mount(host, { id: "file", name, type, path, ...(format && { format }), source });
+    if (open.tree) around = portTree(post, open.tree);
+    const session = viewer.mount(host, { id: "file", name, type, path, ...(format && { format }), source, ...(around && { tree: around.tree }) });
     root = session;
     start({ id: 0, session, stop: () => {} });
     addEventListener("resize", () => session.resize());
@@ -519,6 +523,7 @@ function receive(data: unknown) {
   // Each file ignores the ids it did not ask for.
   if (bytes) {
     for (const r of ranges) r.receive(bytes);
+    around?.receive(bytes);
     return;
   }
   const theme = checkThemeMessage(data);

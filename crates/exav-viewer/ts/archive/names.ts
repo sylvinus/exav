@@ -14,12 +14,12 @@ export function safeFileName(name: string, fallback = "file"): string {
 }
 
 /** The name @exav/unpack-wasm gives the one member of a compressed stream: "gzip-content". */
-export const STREAM_MEMBER = /^(gzip|bzip2|xz|zstd|lzip|lz4|lzw)-content$/;
+export const STREAM_MEMBER = /^(gzip|bzip2|xz|zstd|lzip|lzma|lz4|lzw)-content$/;
 
 /** A compressed file's name, and what it is called once decompressed. */
 const SUFFIXES: [RegExp, string][] = [
   [/\.(tgz|taz|tbz2?|txz|tzst|tlz)$/i, ".tar"],
-  [/\.(gz|bz2|xz|zst|lz|lz4|z)$/i, ""],
+  [/\.(gz|bz2|xz|zst|lz|lzma|lz4|z)$/i, ""],
 ];
 
 /**

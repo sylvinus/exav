@@ -7,7 +7,7 @@ mod mesh_common;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use exav_render::gltf::{read, Error, MAX_DEPTH};
+use exav_render::gltf::{external_buffers, read, read_with, Error, MAX_DEPTH};
 use exav_render::mesh::Scene;
 use mesh_common::*;
 
@@ -192,6 +192,52 @@ fn a_glb_holds_the_same_cube() {
     }
 }
 
+/// A GLB of the cube whose JSON chunk is 2 bytes over a multiple of 4: its
+/// length counts the padding (`counted`) or not, and the padding is in the
+/// file (`present`) or not. Only the first is valid; the others are what some
+/// writers made.
+fn glb_of_cube_with_json_padding(counted: bool, present: bool) -> Vec<u8> {
+    let data = cube_data("u16");
+    let mut json = document(
+        "",
+        data.len(),
+        &format!(
+            "\"bufferViews\":[{{\"buffer\":0,\"byteLength\":96}},{{\"buffer\":0,\"byteOffset\":96,\"byteLength\":{}}}],\
+             \"accessors\":[{{\"bufferView\":0,\"componentType\":5126,\"count\":8,\"type\":\"VEC3\"}},{{\"bufferView\":1,\"componentType\":{},\"count\":36,\"type\":\"SCALAR\"}}],\
+             \"meshes\":[{{\"primitives\":[{{\"attributes\":{{\"POSITION\":0}},\"indices\":1}}]}}]",
+            data.len() - 96,
+            component("u16")
+        ),
+        &with_nodes(&[node("")]),
+    )
+    .into_bytes();
+    while json.len() % 4 != 2 {
+        json.push(b' ');
+    }
+    let bin = pad(data);
+    let padding = if present { 2 } else { 0 };
+    let mut out = b"glTF".to_vec();
+    out.extend(2u32.to_le_bytes());
+    out.extend(((12 + 8 + json.len() + padding + 8 + bin.len()) as u32).to_le_bytes());
+    out.extend(((json.len() + if counted { 2 } else { 0 }) as u32).to_le_bytes());
+    out.extend(0x4E4F534Au32.to_le_bytes());
+    out.extend(json);
+    out.extend(vec![b' '; padding]);
+    out.extend((bin.len() as u32).to_le_bytes());
+    out.extend(0x004E4942u32.to_le_bytes());
+    out.extend(bin);
+    out
+}
+
+#[test]
+fn a_glb_whose_json_chunk_is_not_padded_as_it_says_is_read() {
+    for (counted, present) in [(true, true), (false, true), (false, false)] {
+        let file = glb_of_cube_with_json_padding(counted, present);
+        let s = read(&file, usize::MAX).unwrap_or_else(|e| panic!("{counted} {present}: {e:?}"));
+        assert_eq!(s.triangles(), 12, "{counted} {present}");
+    }
+}
+
 #[test]
 fn a_mesh_without_indices_is_read_three_vertices_to_a_triangle() {
     let data = floats(&[0., 0., 0., 1., 0., 0., 0., 1., 0., 5., 5., 5.]);
@@ -207,6 +253,63 @@ fn a_mesh_without_indices_is_read_three_vertices_to_a_triangle() {
     let s = parse(&json);
     assert_eq!(s.triangles(), 1);
     assert_eq!(triangles(&s)[0], [[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]);
+}
+
+/// The cube's corners as three shorts each, padded to 8 bytes a vertex,
+/// scaled by `scale`; then its indices as u16.
+fn quantized_cube(scale: f64) -> Vec<u8> {
+    let mut data = Vec::new();
+    for p in CUBE {
+        for v in p {
+            data.extend(((v * scale).round() as i16).to_le_bytes());
+        }
+        data.extend([0, 0]);
+    }
+    data.extend(pad(encode(&cube_indices(), "u16")));
+    data
+}
+
+fn quantized_doc(data: &[u8], accessor_extra: &str, rest: &str) -> String {
+    document(
+        &format!("\"uri\":\"data:application/octet-stream;base64,{}\"", base64(data)),
+        data.len(),
+        &format!(
+            "\"bufferViews\":[{{\"buffer\":0,\"byteOffset\":0,\"byteLength\":64,\"byteStride\":8}},{{\"buffer\":0,\"byteOffset\":64,\"byteLength\":{}}}],\
+             \"accessors\":[{{\"bufferView\":0,\"componentType\":5122,\"count\":8,\"type\":\"VEC3\"{accessor_extra}}},{{\"bufferView\":1,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"}}],\
+             \"meshes\":[{{\"primitives\":[{{\"attributes\":{{\"POSITION\":0}},\"indices\":1}}]}}],\
+             \"extensionsUsed\":[\"KHR_mesh_quantization\"],\"extensionsRequired\":[\"KHR_mesh_quantization\"]",
+            data.len() - 64
+        ),
+        rest,
+    )
+}
+
+#[test]
+fn a_cube_of_shorts_is_the_cube_the_node_scale_restores() {
+    // Normalized: -1..1 of the type's range, so 32767 is 1, and the node
+    // scales the unit cube up to 4 across.
+    let s = parse(&quantized_doc(
+        &quantized_cube(32767.0),
+        ",\"normalized\":true",
+        &with_nodes(&[node("\"scale\":[4,4,4]")]),
+    ));
+    assert_eq!(s.triangles(), 12);
+    let b = bounds_of(&s);
+    for k in 0..3 {
+        assert!(
+            (b[0][k]).abs() < 1e-4 && (b[1][k] - 4.0).abs() < 1e-3,
+            "{b:?}"
+        );
+    }
+    // Not normalized: the shorts are the coordinates, scaled by the node.
+    let s = parse(&quantized_doc(
+        &quantized_cube(1000.0),
+        "",
+        &with_nodes(&[node("\"scale\":[0.001,0.001,0.001]")]),
+    ));
+    assert_eq!(s.triangles(), 12);
+    assert_near(volume(&s), 1.0, "volume");
+    assert_sound(&s);
 }
 
 #[test]
@@ -243,6 +346,16 @@ fn a_rotation_turns_the_cube_and_a_matrix_says_the_same() {
             }
         }
     }
+}
+
+#[test]
+fn a_rotation_of_all_zeros_is_no_rotation() {
+    let s = parse(&cube_doc(
+        "u16",
+        &with_nodes(&[node("\"rotation\":[0,0,0,0],\"translation\":[10,0,0]")]),
+    ));
+    assert_eq!(bounds_of(&s), [[10., 0., 0.], [11., 1., 1.]]);
+    assert_sound(&s);
 }
 
 #[test]
@@ -513,6 +626,37 @@ fn textures_animations_and_cameras_are_ignored_and_nothing_is_fetched() {
     assert_eq!(s.warnings, Default::default());
 }
 
+/// A buffer in a file next to the document is read from the bytes the caller
+/// gives for its URI, named as the document writes it.
+#[test]
+fn a_buffer_in_another_file_is_read_from_what_it_is_given() {
+    let d = cube_doc("u16", &with_nodes(&[node("")]));
+    let uri_start = d.find("data:application").unwrap();
+    let uri_end = uri_start + d[uri_start..].find('"').unwrap();
+    let doc = format!("{}cube%20one.bin{}", &d[..uri_start], &d[uri_end..]);
+    assert_eq!(
+        external_buffers(doc.as_bytes()).unwrap(),
+        ["cube%20one.bin"]
+    );
+    assert_eq!(read(doc.as_bytes(), 100).unwrap_err(), Error::External);
+    let bin = cube_data("u16");
+    let s = read_with(doc.as_bytes(), 100, &[("cube%20one.bin", &bin)]).unwrap();
+    assert_eq!(s.triangles(), 12);
+    assert_eq!(bounds_of(&s), [[0.; 3], [1.; 3]]);
+    // Another name is not this buffer; one too short is refused.
+    assert_eq!(
+        read_with(doc.as_bytes(), 100, &[("other.bin", &bin)]).unwrap_err(),
+        Error::External
+    );
+    assert!(matches!(
+        read_with(doc.as_bytes(), 100, &[("cube%20one.bin", &bin[..40])]),
+        Err(Error::Invalid(_))
+    ));
+    // A document whose buffers are all inside it names no file.
+    assert!(external_buffers(d.as_bytes()).unwrap().is_empty());
+    assert_eq!(external_buffers(b"not gltf").unwrap_err(), Error::NotGltf);
+}
+
 #[test]
 fn buffers_in_other_files_are_refused_not_fetched() {
     let d = cube_doc("u16", &with_nodes(&[node("")]));
@@ -639,8 +783,7 @@ fn accessors_that_do_not_fit_their_buffers_are_errors() {
         (acc0, "\"bufferView\":99,\"componentType\":5126,\"count\":8"),
         (acc0, "\"bufferView\":-1,\"componentType\":5126,\"count\":8"),
         (acc0, "\"bufferView\":0.5,\"componentType\":5126,\"count\":8"),
-        // Types that are not positions.
-        (acc0, "\"bufferView\":0,\"componentType\":5123,\"count\":8"),
+        // Types that are not positions (a 16-bit one is a quantized position).
         (acc0, "\"bufferView\":0,\"componentType\":9999,\"count\":8"),
         (acc0, "\"bufferView\":0,\"componentType\":5126,\"count\":8,\"type\":\"MAT4\""),
         // No view and a count of a billion: zeros are not made.
@@ -895,7 +1038,6 @@ fn coordinates_that_are_not_numbers_or_not_sizes_drop_their_triangles() {
 #[test]
 fn transforms_that_are_not_valid_are_errors() {
     for transform in [
-        "\"rotation\":[0,0,0,0]",
         "\"rotation\":[0,0,0]",
         "\"scale\":[1,1]",
         "\"translation\":\"x\"",

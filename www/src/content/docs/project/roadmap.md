@@ -115,8 +115,9 @@ formats in the browser. What is not done:
   hayro's `unsafe` and the size of the readers. OCR for images and scanned
   pages, and QR codes for the scanner, are proposed.
 - **Drawings and models.** DWG before R13 is reported unsupported. Large
-  drawings have no level of detail, annotative objects, external references
-  and linked images are not resolved, and 3D is out of scope. IFC geometry has
+  drawings have no level of detail, annotative objects and linked images are
+  not resolved (external references are, from the files around the drawing),
+  and 3D is out of scope. IFC geometry has
   [known gaps](/subprojects/exav-render/#ifc-and-stl-models). glTF with Draco
   or meshopt, and PLY point clouds, are not drawn.
 - **Camera RAW.** The sensor data is never decoded, so a file with no preview

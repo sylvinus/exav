@@ -6,7 +6,8 @@
 //! vertex x y z .. endloop endfacet` records, then `endsolid`. Binary
 //! headers often start with "solid" too, so a file is read as ASCII only
 //! when its size is not that of the binary file its count declares and its
-//! start is text.
+//! start is text: `solid`, after a byte-order mark and lines of comment
+//! (`#` or `;`) if there are any.
 //!
 //! The facet normals are not used: some writers leave them zero. Each facet
 //! is shaded flat with the normal its corners give.
@@ -71,11 +72,19 @@ pub fn read(bytes: &[u8], max_triangles: usize) -> Result<Scene, Error> {
 }
 
 fn looks_ascii(bytes: &[u8]) -> bool {
-    let start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let rest = &bytes[start..];
+    // A byte-order mark, and lines of comment (`#` or `;`), may come first.
+    let mut rest = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    loop {
+        let start = rest
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        rest = &rest[start..];
+        if !matches!(rest.first(), Some(b'#' | b';')) {
+            break;
+        }
+        rest = &rest[rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len())..];
+    }
     rest.len() >= 5
         && rest[..5].eq_ignore_ascii_case(b"solid")
         && rest[..rest.len().min(4096)]
@@ -257,6 +266,17 @@ mod tests {
         let text = b"solid q\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 1 1 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid q\n";
         let s = read(text, 100).unwrap();
         assert_eq!(s.triangles(), 2);
+    }
+
+    #[test]
+    fn ascii_after_a_byte_order_mark_or_lines_of_comment_is_ascii() {
+        let body = "solid q\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 1 1 0\nendloop\nendfacet\nendsolid q\n";
+        for head in ["\u{feff}", "# a\n;; b\n\n", "\u{feff}#x\n"] {
+            let s = read(format!("{head}{body}").as_bytes(), 100).unwrap();
+            assert_eq!(s.triangles(), 1, "{head:?}");
+        }
+        // Comments and nothing else are not a solid.
+        assert_eq!(read(b"# a\n# b\n# c\n", 10).unwrap_err(), Error::NotStl);
     }
 
     #[test]

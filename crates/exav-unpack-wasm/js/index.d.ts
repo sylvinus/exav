@@ -114,5 +114,23 @@ export function joinVolumes(
 /** Whether a filename marks one part of a byte-split archive (`big.7z.001`). */
 export function isVolumePart(name: string): boolean;
 
+/**
+ * The volumes of the set `name` belongs to among `names`, the file names of one
+ * directory: in volume order, by scheme ("split" `big.7z.001`, "rar" `x.part1.rar`
+ * or `x.rar` with `x.r00`, "zip" `x.z01` to `x.zip`), and whether every volume is
+ * there. `null` for a name that is not one of two or more volumes. Names only.
+ */
+export function volumeSet(
+  name: string,
+  names: string[],
+): { parts: string[]; scheme: "split" | "rar" | "zip"; complete: boolean } | null;
+
+/**
+ * A complete set's volumes, in volume order, as the one archive they make, for
+ * `Archive.open`. RAR and ZIP volumes are joined by their decoders, not by
+ * concatenation.
+ */
+export function joinSet(scheme: "split" | "rar" | "zip", parts: Uint8Array[]): Uint8Array;
+
 /** Instantiate the wasm module. Memoised; awaited internally by every call. */
 export default function init(module_or_path?: unknown): Promise<unknown>;

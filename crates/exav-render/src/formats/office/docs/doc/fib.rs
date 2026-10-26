@@ -224,6 +224,17 @@ const CP1252_HIGH: [u16; 32] = [
 
 /// The text of every piece as UTF-16 code units, indexed by CP.
 pub fn read_text(wd: &[u8], pieces: &[Piece], total: usize) -> Vec<u16> {
+    read_text_in(wd, pieces, total, None)
+}
+
+/// [`read_text`], the 8-bit characters in a code page of 256 entries rather
+/// than Windows 1252 (a Word 6 or 95 file keeps the document's own).
+pub fn read_text_in(
+    wd: &[u8],
+    pieces: &[Piece],
+    total: usize,
+    table: Option<&[u16; 256]>,
+) -> Vec<u16> {
     let mut out = vec![0x0Du16; total];
     for p in pieces {
         let (a, b) = (p.cp0 as usize, (p.cp1 as usize).min(total));
@@ -234,6 +245,9 @@ pub fn read_text(wd: &[u8], pieces: &[Piece], total: usize) -> Vec<u16> {
         for (k, slot) in out[a..b].iter_mut().enumerate() {
             *slot = if p.compressed {
                 match wd.get(fc + k) {
+                    Some(&c) if table.is_some_and(|_| c >= 0x80) => {
+                        table.map_or(u16::from(c), |t| t[usize::from(c)])
+                    }
                     Some(&c) if (0x80..0xA0).contains(&c) => CP1252_HIGH[usize::from(c - 0x80)],
                     Some(&c) => u16::from(c),
                     None => 0x0D,

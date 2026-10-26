@@ -442,6 +442,16 @@ impl Odt<'_> {
             | "svg:title"
             | "svg:desc"
             | "text:note-citation" => {}
+            // A group is drawn as its members, one by one, so that their text
+            // is kept.
+            "draw:g" => {
+                if self.depth <= 12 {
+                    self.depth += 1;
+                    let r = self.inline_children(n, ctx, out);
+                    self.depth -= 1;
+                    r?;
+                }
+            }
             n2 if n2.starts_with("draw:") => {
                 if let Some(d) = self.drawing(n)? {
                     push_item(out, &ctx.rpr, RunItem::Drawing(Box::new(d)));
@@ -492,10 +502,13 @@ impl Odt<'_> {
             self.doc.footnotes.push(slot);
         }
         let mut content = match n.child("text:note-body") {
-            Some(b) if self.depth < 4 => {
+            // A note in a note is read twice over, and never deep in the tree.
+            Some(b) if self.note_level < 3 && self.depth < 40 => {
                 let saved = self.depth;
                 self.depth += 2;
+                self.note_level += 1;
                 let r = self.blocks(b);
+                self.note_level -= 1;
                 self.depth = saved;
                 r?
             }

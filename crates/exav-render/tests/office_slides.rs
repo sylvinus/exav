@@ -376,6 +376,15 @@ fn a_picture_past_64_mib_fails_the_conversion_that_reads_it() {
     assert!(convert_first(&odp, Format::Odp, &Limits::default(), 1).is_ok());
 }
 
+#[test]
+fn a_package_with_bytes_before_it_is_still_opened() {
+    // Something ahead of the archive (a self-extractor's stub) moves every offset.
+    let mut odp = vec![b'M'; 1000];
+    odp.extend(odp_with_picture(1 << 10));
+    let c = convert_first(&odp, Format::Odp, &Limits::default(), 1).unwrap();
+    assert_eq!((c.slides, c.total_slides), (1, 2));
+}
+
 /// A source that counts the bytes read from it.
 struct Counting<'a> {
     c: std::io::Cursor<&'a [u8]>,

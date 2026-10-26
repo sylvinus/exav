@@ -24,7 +24,7 @@ const MAX_CELL_TEXT: usize = 32_767;
 // ------------------------------------------------------------ tokenizer
 
 #[derive(Debug, PartialEq)]
-enum Token {
+pub(crate) enum Token {
     Start {
         name: String,
         attrs: Vec<(String, String)>,
@@ -227,7 +227,7 @@ const RAW: &[&str] = &[
     "script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript",
 ];
 
-fn tokenize(s: &str) -> Result<Vec<Token>> {
+pub(crate) fn tokenize(s: &str) -> Result<Vec<Token>> {
     let mut out = vec![];
     let b = s.as_bytes();
     let mut i = 0;
@@ -396,7 +396,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>> {
     Ok(out)
 }
 
-fn get<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+pub(crate) fn get<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     attrs.iter().find(|a| a.0 == key).map(|a| a.1.as_str())
 }
 
@@ -405,12 +405,12 @@ fn get<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// A style sheet: the declarations of each simple selector (`td`,
 /// `.xl65`, `td.xl65`), in source order.
 #[derive(Default)]
-struct Sheet {
+pub(crate) struct Sheet {
     rules: Vec<(String, Vec<(String, String)>)>,
 }
 
 impl Sheet {
-    fn add(&mut self, css_text: &str) {
+    pub(crate) fn add(&mut self, css_text: &str) {
         // Comments out, the HTML comment markers Excel wraps it in too.
         let mut t = String::with_capacity(css_text.len());
         let mut rest = css_text;
@@ -441,7 +441,7 @@ impl Sheet {
     /// Declarations for an element of `tag` and `classes`: the element's
     /// rules, then its classes', each in source order. A class naming
     /// `mso-style-parent` gets that style's declarations under its own.
-    fn lookup(&self, tag: &str, classes: &[&str], out: &mut Vec<(String, String)>) {
+    pub(crate) fn lookup(&self, tag: &str, classes: &[&str], out: &mut Vec<(String, String)>) {
         for (sel, decls) in &self.rules {
             if sel == tag {
                 out.extend(decls.iter().cloned());

@@ -133,6 +133,113 @@ impl Mesh {
         }
     }
 
+    /// Whether the mesh has triangles and every edge of it is on exactly two,
+    /// which is what a solid is.
+    pub fn is_closed(&self) -> bool {
+        let mut edges: std::collections::HashMap<(u32, u32), u8> =
+            std::collections::HashMap::with_capacity(self.t.len() * 3 / 2 + 1);
+        for t in &self.t {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let n = edges.entry((a.min(b), a.max(b))).or_insert(0);
+                *n = n.saturating_add(1);
+            }
+        }
+        !edges.is_empty() && edges.values().all(|&n| n == 2)
+    }
+
+    /// Makes the triangles that share edges face the same way round, as the
+    /// faces of a shell written by a careless exporter do not, and then
+    /// turns every closed piece outward. A piece that is not closed keeps the
+    /// way its first triangle faces. Edges shared by other than two
+    /// triangles join nothing.
+    pub fn orient_consistently(&mut self) {
+        let n = self.t.len();
+        // Edge (low, high) -> the triangles on it and whether each runs it
+        // low to high.
+        let mut edges: std::collections::HashMap<(u32, u32), Vec<(u32, bool)>> =
+            std::collections::HashMap::with_capacity(n * 3 / 2 + 1);
+        for (i, t) in self.t.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                if a != b {
+                    edges
+                        .entry((a.min(b), a.max(b)))
+                        .or_default()
+                        .push((i as u32, a < b));
+                }
+            }
+        }
+        // Per triangle: the neighbours across its edges, with whether they
+        // must be turned when it is not.
+        let mut next: Vec<Vec<(u32, bool)>> = vec![Vec::new(); n];
+        let mut open = vec![false; n];
+        for users in edges.values() {
+            if let [(a, da), (b, db)] = users[..] {
+                // Two triangles agree when they run their edge in opposite ways.
+                let opposite = da != db;
+                next[a as usize].push((b, !opposite));
+                next[b as usize].push((a, !opposite));
+            } else {
+                for &(i, _) in users {
+                    open[i as usize] = true;
+                }
+            }
+        }
+        let mut turn = vec![None::<bool>; n];
+        let mut stack = Vec::new();
+        for seed in 0..n {
+            if turn[seed].is_some() {
+                continue;
+            }
+            turn[seed] = Some(false);
+            let mut members = vec![seed];
+            stack.push(seed);
+            while let Some(i) = stack.pop() {
+                let here = turn[i].unwrap_or(false);
+                for &(j, flips) in &next[i] {
+                    let j = j as usize;
+                    if turn[j].is_none() {
+                        turn[j] = Some(here != flips);
+                        members.push(j);
+                        stack.push(j);
+                    }
+                }
+            }
+            // A closed piece faces outward: six times its volume is positive.
+            let closed = members.iter().all(|&i| !open[i]);
+            if closed {
+                let volume: f64 = members
+                    .iter()
+                    .map(|&i| {
+                        let t = self.t[i];
+                        let (a, b, c) = (
+                            self.p[t[0] as usize],
+                            self.p[t[1] as usize],
+                            self.p[t[2] as usize],
+                        );
+                        let v = math::dot(a, cross(b, c));
+                        if turn[i] == Some(true) {
+                            -v
+                        } else {
+                            v
+                        }
+                    })
+                    .sum();
+                if volume < 0.0 {
+                    for &i in &members {
+                        turn[i] = turn[i].map(|x| !x);
+                    }
+                }
+            }
+        }
+        for (t, turn) in self.t.iter_mut().zip(&turn) {
+            if *turn == Some(true) {
+                t.swap(1, 2);
+            }
+        }
+    }
+
     pub fn bounds(&self) -> Option<(V3, V3)> {
         let mut lo = [f64::INFINITY; 3];
         let mut hi = [f64::NEG_INFINITY; 3];
@@ -844,11 +951,15 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
         }
     }
 
-    // Products: GlobalId first, a product definition shape in seventh place.
+    // Products: GlobalId first (some exporters leave it null), a product
+    // definition shape in seventh place.
     let mut origin: Option<V3> = None;
+    // Alignments are axes, curves, which are not drawn.
+    let mut alignments = 0u32;
     for &id in &ids {
         let Some(raw) = f.raw(id) else { continue };
-        if !raw.trim_ascii_start().starts_with(b"'") || !raw.contains(&b'#') {
+        let raw_start = raw.trim_ascii_start();
+        if !(raw_start.starts_with(b"'") || raw_start.starts_with(b"$")) || !raw.contains(&b'#') {
             continue;
         }
         let Some((ty, p)) = r.get(id) else { continue };
@@ -872,6 +983,7 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
             .and_then(|m| r.material_color(m, &material_reps, 0));
         let mut pieces = r.product(shape);
         if pieces.is_empty() {
+            alignments += u32::from(ty == b"IFCALIGNMENT");
             continue;
         }
         if let Some(openings) = voids.get(&id) {
@@ -931,6 +1043,12 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
         out.add(element, parts);
     }
     out.scene.origin = origin.unwrap_or([0.0; 3]);
+    // A model of nothing else would show nothing and say nothing.
+    if out.scene.elements.is_empty() {
+        for _ in 0..alignments {
+            r.unsupported(b"IFCALIGNMENT");
+        }
+    }
     let mut warnings = r.warnings;
     warnings.truncated = warnings
         .truncated

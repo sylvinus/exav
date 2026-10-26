@@ -497,7 +497,15 @@ pub(crate) fn read(wd: Vec<u8>, budget: &mut Budget) -> Result<Document> {
         return Err(Error::TooLarge("characters"));
     }
     budget.alloc(2 * total as u64)?;
-    let text = fib::read_text(&wd, &clx.pieces, total);
+    let table = codepage(&wd).map(|cp| {
+        std::array::from_fn(|b| {
+            crate::formats::office::common::codepage::decode(&[b as u8], cp)
+                .encode_utf16()
+                .next()
+                .unwrap_or(0xFFFD)
+        })
+    });
+    let text = fib::read_text_in(&wd, &clx.pieces, total, table.as_ref());
     // A modifier of a piece, or an index to a list of them, in Word 97's form.
     let mut anlds = vec![];
     let mut prcs: Vec<Vec<u8>> = vec![];
@@ -520,8 +528,29 @@ pub(crate) fn read(wd: Vec<u8>, budget: &mut Budget) -> Result<Document> {
     Ok(r.doc)
 }
 
-/// The grpprls and the piece table of a fast-saved file, whose lengths are
-/// two bytes.
+/// The Windows code page of a Word 6 or 95 document other than 1252, from
+/// the language in its header (the text is in the code page of the system
+/// that wrote it), or Mac Roman for a Macintosh one.
+fn codepage(wd: &[u8]) -> Option<u16> {
+    if u16_at(wd, 0x14) == 256 {
+        return Some(10000);
+    }
+    Some(match u16_at(wd, 6) & 0x3FF {
+        0x19 | 0x22 | 0x02 | 0x23 | 0x2F | 0x3F | 0x40 | 0x44 | 0x50 => 1251,
+        0x15 | 0x05 | 0x0E | 0x1B | 0x24 | 0x1A | 0x18 | 0x1C => 1250,
+        0x08 => 1253,
+        0x1F | 0x2C => 1254,
+        0x0D => 1255,
+        0x01 | 0x29 | 0x20 => 1256,
+        0x25..=0x27 => 1257,
+        0x2A => 1258,
+        0x1E => 874,
+        _ => return None,
+    })
+}
+
+/// The grpprls and the piece table of a fast-saved file: the length of each
+/// group is two bytes, that of the piece table four.
 fn read_clx(wd: &[u8]) -> Result<Clx> {
     let d = part(wd, at::CLX);
     let mut p = 0usize;
@@ -537,8 +566,11 @@ fn read_clx(wd: &[u8]) -> Result<Clx> {
                 }
             }
             Some(2) => {
-                let n = usize::from(u16_at(d, p + 1));
-                let plc = d.get(p + 3..p + 3 + n).unwrap_or(&[]);
+                // The piece table's length is four bytes, the groups' two.
+                let n = u32_at(d, p + 1) as usize;
+                let plc = d
+                    .get(p + 5..p.saturating_add(5).saturating_add(n))
+                    .unwrap_or(&[]);
                 let count = plc.len().saturating_sub(4) / 12;
                 let mut pieces = Vec::with_capacity(count);
                 for i in 0..count {
@@ -1176,6 +1208,41 @@ mod tests {
     }
 
     #[test]
+    fn the_text_of_a_word_6_file_is_in_the_code_page_of_its_language() {
+        let mut wd = vec![0u8; 0x20];
+        assert_eq!(codepage(&wd), None);
+        // Russian, 0x0419: Windows 1251; Greek: 1253; Mac: Roman.
+        wd[6..8].copy_from_slice(&0x0419u16.to_le_bytes());
+        assert_eq!(codepage(&wd), Some(1251));
+        wd[6..8].copy_from_slice(&0x0408u16.to_le_bytes());
+        assert_eq!(codepage(&wd), Some(1253));
+        wd[0x14] = 0;
+        wd[0x15] = 1;
+        assert_eq!(codepage(&wd), Some(10000));
+        // The bytes of "Привет" in 1251 come out as Cyrillic.
+        let pieces = [Piece {
+            cp0: 0,
+            cp1: 6,
+            fc: 0x20,
+            compressed: true,
+            prm: 0,
+        }];
+        let mut wd = vec![0u8; 0x30];
+        wd[0x20..0x26].copy_from_slice(&[0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]);
+        let table = std::array::from_fn(|b| {
+            crate::formats::office::common::codepage::decode(&[b as u8], 1251)
+                .encode_utf16()
+                .next()
+                .unwrap()
+        });
+        let t = fib::read_text_in(&wd, &pieces, 6, Some(&table));
+        assert_eq!(String::from_utf16(&t).unwrap(), "Привет");
+        // Without a table it is Windows 1252, as before.
+        let t = fib::read_text_in(&wd, &pieces, 6, None);
+        assert_eq!(String::from_utf16(&t).unwrap(), "Ïðèâåò");
+    }
+
+    #[test]
     fn a_fast_saved_file_has_its_pieces_and_modifier_lists_in_the_complex_part() {
         // A list of one modifier (bold), then a piece table of two pieces: the
         // first at byte 0x500 with a list, the second at 0x600 with a single
@@ -1190,7 +1257,7 @@ mod tests {
             plc.extend_from_slice(&fc.to_le_bytes());
             plc.extend_from_slice(&prm.to_le_bytes());
         }
-        clx.extend_from_slice(&(plc.len() as u16).to_le_bytes());
+        clx.extend_from_slice(&(plc.len() as u32).to_le_bytes());
         clx.extend_from_slice(&plc);
         let mut wd = vec![0u8; 0x300];
         wd[0x100..0x100 + clx.len()].copy_from_slice(&clx);

@@ -154,7 +154,7 @@ all-formats = ["all-formats-no-emu", "pe-emu"]
 # attacker-supplied control flow. `pepack` stays in: it decompresses known
 # packers with native decoders and does not execute anything.
 all-formats-no-emu = [
-    "zip", "gzip", "tar", "bzip2", "xz", "zstd", "lzip", "cab", "sevenz", "rar",
+    "zip", "gzip", "tar", "bzip2", "xz", "zstd", "lzip", "lzma", "rpm", "cab", "sevenz", "rar",
     "arj", "lha", "iso", "ole", "pdf", "email", "dmg", "upx", "ar", "cpio", "xar", "chm",
     "uuencode", "xdp", "szdd", "tnef", "swf", "binhex", "lnk", "partition", "vhd", "lzw",
     "diskimage", "wim", "lz4", "arc", "ace", "stuffit", "alz", "egg", "hwp3",
@@ -171,10 +171,12 @@ bzip2 = ["bzip2-decoder"]
 # Internal: the vendored bzip2 decoder, shared by every format that carries
 # bzip2. Not a format of its own; select `bzip2` instead.
 bzip2-decoder = ["dep:tinyvec", "dep:crc32fast"]
-xz = ["dep:xz4rust"]
+xz = ["dep:xz4rust", "dep:crc32fast"]
 zstd = ["dep:ruzstd"]
 lzip = ["dep:lzma-rust2", "dep:crc32fast"]
-cab = ["dep:lzxd", "dep:flate2", "dep:byteorder"]
+lzma = ["dep:lzma-rust2"]
+rpm = []
+cab =["dep:lzxd", "dep:flate2", "dep:byteorder"]
 chm = ["dep:lzxd"]
 sevenz = ["dep:lzma-rust2", "bzip2-decoder", "dep:flate2", "dep:crc32fast"]
 rar = []

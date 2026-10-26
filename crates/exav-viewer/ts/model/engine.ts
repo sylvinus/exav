@@ -18,7 +18,16 @@ export interface ModelRequest {
   kind: ModelKind;
   bytes: ArrayBuffer;
   maxTriangles: number;
+  /**
+   * glTF: the files its buffers are in, by the URI the document writes them.
+   * With `list`, nothing is read: the answer is those URIs (`{ buffers }`).
+   */
+  files?: { name: string; bytes: ArrayBuffer }[];
+  list?: boolean;
 }
+
+/** What the engine answers: the model, or for a `list` request the buffer files a glTF names. */
+export type ModelAnswer = ParsedModel | { buffers: string[] };
 
 /** One class and colour's part of the buffers; offsets in vertices, indices and edge vertices. */
 export interface BatchMeta {
@@ -71,8 +80,8 @@ export interface ParsedModel {
   parseMs: number;
 }
 
-export function createModelEngine(): WorkerHost<ModelRequest, ParsedModel> {
-  return createWorkerHost<ModelRequest, ParsedModel>(() => new Worker(new URL("./model.worker.js", import.meta.url), { type: "module" }));
+export function createModelEngine(): WorkerHost<ModelRequest, ModelAnswer> {
+  return createWorkerHost<ModelRequest, ModelAnswer>(() => new Worker(new URL("./model.worker.js", import.meta.url), { type: "module" }));
 }
 
 /** What is missing from the picture, for the `warnings` controller. */

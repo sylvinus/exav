@@ -101,8 +101,12 @@ mod rar4_compat;
 mod rar5_encryption;
 #[cfg(feature = "rar")]
 mod rar_solid;
+#[cfg(feature = "rpm")]
+mod rpm;
 #[cfg(feature = "sevenz")]
 mod sevenz_bcj2;
+#[cfg(feature = "sevenz")]
+mod sevenz_entries;
 #[cfg(feature = "sevenz")]
 mod sevenz_ppmd;
 mod silent_skips;
@@ -129,6 +133,8 @@ mod vhd;
 mod virtual_disks;
 #[cfg(feature = "wim")]
 mod wim;
+#[cfg(feature = "xz")]
+mod xz_checks;
 #[cfg(feature = "xz")]
 mod xz_dict;
 #[cfg(feature = "zip")]

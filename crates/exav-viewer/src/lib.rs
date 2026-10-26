@@ -197,6 +197,32 @@ mod dwg {
             self.0.layouts_json()
         }
 
+        /// The files external references name that are not bound yet, as a
+        /// JSON array of the paths the drawing wrote.
+        #[wasm_bindgen(js_name = xrefPathsJson)]
+        pub fn xref_paths_json(&self) -> String {
+            self.0.xref_paths_json()
+        }
+
+        /// Bind the drawing in `bytes`, the file `path` names, into the
+        /// references to it; how many blocks it filled.
+        #[wasm_bindgen(js_name = attachXref)]
+        pub fn attach_xref(
+            &mut self,
+            path: &str,
+            bytes: &[u8],
+            max_decompressed_bytes: f64,
+        ) -> Result<u32, JsError> {
+            let limits = exav_render::cad::Limits {
+                max_decompressed_bytes: max_decompressed_bytes as u64,
+                ..exav_render::cad::Limits::default()
+            };
+            self.0
+                .attach_xref(path, bytes, &limits)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
         /// One layout; none, empty or unknown is model space. `background` is
         /// the RGB the drawing is shown on, which indexed colours resolve
         /// against. Stops at `max_primitives` strokes and fill vertices.
@@ -533,6 +559,48 @@ mod model {
     #[wasm_bindgen(js_name = parseGltf)]
     pub fn parse_gltf(bytes: &[u8], max_triangles: f64) -> Result<Model, JsError> {
         exav_render::gltf::read(bytes, budget(max_triangles))
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// The files a glTF document's buffers are in, as the URIs it writes
+    /// them: a JSON array of strings, empty when it needs none.
+    #[wasm_bindgen(js_name = gltfBuffers)]
+    pub fn gltf_buffers(bytes: &[u8]) -> Result<String, JsError> {
+        let names = exav_render::gltf::external_buffers(bytes)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let quoted: Vec<String> = names
+            .iter()
+            .map(|n| {
+                let mut o = String::new();
+                string(&mut o, n);
+                o
+            })
+            .collect();
+        Ok(format!("[{}]", quoted.join(",")))
+    }
+
+    /// [`parse_gltf`], given the buffer files: `names[i]` is the URI whose
+    /// bytes are the `lengths[i]` bytes of `files` after those before.
+    #[wasm_bindgen(js_name = parseGltfWith)]
+    pub fn parse_gltf_with(
+        bytes: &[u8],
+        max_triangles: f64,
+        names: Vec<String>,
+        files: &[u8],
+        lengths: Vec<u32>,
+    ) -> Result<Model, JsError> {
+        let mut at = 0usize;
+        let mut given: Vec<(&str, &[u8])> = Vec::new();
+        for (name, len) in names.iter().zip(&lengths) {
+            let end = at
+                .checked_add(*len as usize)
+                .filter(|e| *e <= files.len())
+                .ok_or_else(|| JsError::new("a buffer file is longer than the bytes given"))?;
+            given.push((name.as_str(), files.get(at..end).unwrap_or(&[])));
+            at = end;
+        }
+        exav_render::gltf::read_with(bytes, budget(max_triangles), &given)
             .map(pack)
             .map_err(|e| JsError::new(&e.to_string()))
     }

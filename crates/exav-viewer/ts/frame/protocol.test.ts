@@ -18,7 +18,9 @@ import {
   MAX_ITEMS,
   MAX_TEXT,
   PROTOCOL,
+  MAX_PATH,
   READS,
+  TREE,
   refusedRasterId,
 } from "./protocol.js";
 
@@ -159,6 +161,13 @@ describe("reads and the policy the frame reports", () => {
     expect(checkFrameMessage({ type: "cancel", id: "3" })).toBeNull();
   });
 
+  it("ask for a file of the tree by its path, or are null", () => {
+    expect(checkFrameMessage({ type: "fetch", id: 4, path: "a/b.dwg", extra: 1 })).toEqual({ type: "fetch", id: 4, path: "a/b.dwg" });
+    for (const m of [{ id: "4", path: "a" }, { id: -1, path: "a" }, { id: 4 }, { id: 4, path: 7 }, { id: 4, path: "x".repeat(MAX_PATH + 1) }]) {
+      expect(checkFrameMessage({ type: "fetch", ...m }), JSON.stringify(m).slice(0, 40)).toBeNull();
+    }
+  });
+
   it("come as lists of sources, or null", () => {
     const policy = { script: ["'self'"], connect: ["'self'", "https://a.test"], img: [], media: ["blob:"] };
     expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy })).toEqual({ type: "ready", protocol: PROTOCOL, policy });
@@ -187,6 +196,15 @@ describe("what the frame takes from the host", () => {
     expect(checkOpen(open({ source: { kind: "blob", blob: "x" } }), BUILTIN_ORDER)).toBeNull();
     expect(checkOpen(open({ blob, source: undefined }), BUILTIN_ORDER)).toBeNull();
     expect(checkOpen(open({ file: { name: "a", type: "", path: "a", format: "evil" } }), BUILTIN_ORDER)).toBeNull();
+  });
+
+  it("is an open that lists the files around it, within the limits, or null", () => {
+    const tree = { path: "a/a.dwg", paths: ["a/a.dwg", "a/b.dwg"] };
+    expect(checkOpen(open({ tree: { ...tree, extra: 1 } }), BUILTIN_ORDER)?.tree).toEqual(tree);
+    expect("tree" in checkOpen(open(), BUILTIN_ORDER)!).toBe(false);
+    for (const bad of [{ path: 1, paths: [] }, { path: "a", paths: "b" }, { path: "a", paths: [1] }, { path: "a", paths: new Array(TREE.maxPaths + 1).fill("a") }, { path: "a", paths: ["x".repeat(MAX_PATH + 1)] }, "a", null]) {
+      expect(checkOpen(open({ tree: bad }), BUILTIN_ORDER), JSON.stringify(bad)?.slice(0, 40)).toBeNull();
+    }
   });
 
   it("is an open with an http(s) URL, or a size and the first bytes", () => {

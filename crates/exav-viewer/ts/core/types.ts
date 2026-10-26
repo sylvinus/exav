@@ -92,9 +92,25 @@ export interface FileInfo {
   size?: number;
 }
 
+/**
+ * The files around the one shown: a folder the user opened, the members of an
+ * archive. A format that points at other files (a drawing's external
+ * references) finds them here instead of asking the user for each.
+ */
+export interface FileTree {
+  /** The path of the file shown, `/` separated, from the root of the tree. */
+  path: string;
+  /** Every file of the tree, this one included, by the same kind of path. */
+  paths: readonly string[];
+  /** The bytes of one of `paths`. */
+  open(path: string, signal: AbortSignal): Promise<FileSource>;
+}
+
 export interface ViewerFile<Meta = unknown> extends FileInfo {
   /** `null` while the host has nothing to show yet; see `placeholder`. */
   source: FileSource | null;
+  /** The files around this one, for the files it refers to. */
+  tree?: FileTree;
   /**
    * Shown instead of a surface while `source` is null. "pending": the bytes
    * will arrive. "unavailable": they will not on this device. `label`

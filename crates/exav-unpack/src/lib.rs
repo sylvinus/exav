@@ -54,6 +54,7 @@ pub(crate) mod formats;
 use formats::*;
 
 mod bytes;
+// What a build uses of it depends on the formats with a password it has.
 #[cfg(any(
     feature = "gzip",
     feature = "zip",
@@ -71,6 +72,8 @@ mod bytes;
     feature = "dmg"
 ))]
 mod inflate;
+#[allow(dead_code)]
+mod kdf;
 #[cfg(all(test, any(feature = "dmg", feature = "ishieldz")))]
 mod oracle;
 pub mod profile;
@@ -303,6 +306,11 @@ pub struct Budget {
     /// the scan. Atomic because the RAR readers hold the budget by `&`.
     #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
     pub(crate) kdf_rounds: std::sync::atomic::AtomicU64,
+    /// What the scan has spent on 7z key derivations, and the keys it made
+    /// ([`kdf`]). A handle, so that a reader can hold it while the budget is
+    /// borrowed for something else.
+    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    pub(crate) kdf: std::sync::Arc<kdf::Kdf>,
     /// RAR3 key derivations made so far, across every archive of the scan.
     #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
     pub(crate) rar3_derivations: std::sync::atomic::AtomicUsize,
@@ -342,6 +350,7 @@ impl Budget {
             scanned: 0,
             pe_emulation_steps: 0,
             kdf_rounds: std::sync::atomic::AtomicU64::new(0),
+            kdf: std::sync::Arc::default(),
             rar3_derivations: std::sync::atomic::AtomicUsize::new(0),
             passwords: Vec::new(),
             verify_checksums: false,
@@ -717,6 +726,10 @@ pub enum Format {
     Zstd,
     /// Lzip compressed stream.
     Lzip,
+    /// LZMA-alone (`.lzma`) compressed stream, as LZMA Utils wrote it.
+    Lzma,
+    /// RPM package: its install scripts and its payload (a compressed cpio).
+    Rpm,
     /// uuencode / Base64-uuencode (`begin`…`end`) wrapped file.
     Uuencode,
     /// Adobe XDP (XML-wrapped, base64-encoded PDF).
@@ -815,6 +828,8 @@ impl Format {
         Format::Ntfs,
         Format::Zstd,
         Format::Lzip,
+        Format::Lzma,
+        Format::Rpm,
         Format::Uuencode,
         Format::Xdp,
         Format::Szdd,
@@ -919,6 +934,8 @@ mod format_all_tests {
                 Format::Screnc => 44,
                 Format::Dxf => 66,
                 Format::Dwg => 67,
+                Format::Lzma => 68,
+                Format::Rpm => 69,
             }
         }
         let mut seen: Vec<u8> = Format::ALL.iter().map(|f| tag(*f)).collect();
@@ -926,7 +943,7 @@ mod format_all_tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            67,
+            69,
             "Format::ALL is missing a variant (or lists one twice)"
         );
     }
@@ -1560,6 +1577,51 @@ fn udif_or(fmt: Format, len: usize, read: impl FnOnce(usize) -> Vec<u8>) -> Form
     fmt
 }
 
+/// The first header of a tar from before `ustar` (V7), which has no magic:
+/// a name, octal mode and size, and a checksum of the header that is right.
+fn is_v7_tar(data: &[u8]) -> bool {
+    let Some(h) = data.get(..512) else {
+        return false;
+    };
+    let octal = |f: &[u8]| {
+        let t = f
+            .iter()
+            .take_while(|&&b| b != 0)
+            .copied()
+            .collect::<Vec<u8>>();
+        let t = t.trim_ascii();
+        (!t.is_empty() && t.iter().all(|b| (b'0'..=b'7').contains(b))).then(|| {
+            t.iter().fold(0u64, |a, b| {
+                a.wrapping_mul(8).wrapping_add(u64::from(b - b'0'))
+            })
+        })
+    };
+    if h[0] == 0 || octal(&h[100..108]).is_none() || octal(&h[124..136]).is_none() {
+        return false;
+    }
+    let Some(sum) = octal(&h[148..156]) else {
+        return false;
+    };
+    let field = 148..156;
+    let unsigned: u64 = h
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| if field.contains(&i) { 32 } else { u64::from(b) })
+        .sum();
+    let signed: i64 = h
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if field.contains(&i) {
+                32
+            } else {
+                i64::from(b as i8)
+            }
+        })
+        .sum();
+    sum == unsigned || i64::try_from(sum).is_ok_and(|s| s == signed)
+}
+
 fn is_rar_magic(data: &[u8]) -> bool {
     data.starts_with(b"Rar!\x1a\x07\x00") || data.starts_with(b"Rar!\x1a\x07\x01\x00")
 }
@@ -1583,6 +1645,9 @@ fn detect_probe(p: &Probe) -> Option<Format> {
         return Some(Format::Pdf);
     }
     if data.len() >= 263 && &data[257..262] == b"ustar" {
+        return Some(Format::Tar);
+    }
+    if is_v7_tar(data) {
         return Some(Format::Tar);
     }
     if data.len() >= 7 && data[2] == b'-' && data[6] == b'-' && matches!(data[3], b'l' | b'p') {
@@ -1689,7 +1754,7 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     if formats::sniff::is_in(p, Format::Vhdx) {
         return Some(Format::Vhdx);
     }
-    if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) || formats::sniff::zstd_after_skippable(data) {
         return Some(Format::Zstd);
     }
     if data.starts_with(b"!<arch>\n") {
@@ -1697,6 +1762,12 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     }
     if data.starts_with(b"LZIP") {
         return Some(Format::Lzip);
+    }
+    if formats::sniff::is_in(p, Format::Lzma) {
+        return Some(Format::Lzma);
+    }
+    if formats::sniff::is_in(p, Format::Rpm) {
+        return Some(Format::Rpm);
     }
     if data.starts_with(b"070701")
         || data.starts_with(b"070702")
@@ -1835,6 +1906,12 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     #[cfg(feature = "partition")]
     if is_partition(p) {
         return Some(Format::Partition);
+    }
+    // Last: a ZIP behind a script line or padding, found by its end record.
+    // The walker reads such an archive (`open_archive`'s prepended case).
+    #[cfg(feature = "zip")]
+    if formats::sniff::prefixed_zip(p) {
+        return Some(Format::Zip);
     }
     None
 }
@@ -2964,6 +3041,29 @@ mod tests {
         buf
     }
 
+    #[test]
+    fn a_tar_from_before_ustar_has_no_magic_and_is_found_by_its_checksum() {
+        let mut buf = Vec::new();
+        {
+            let mut b = ::tar::Builder::new(&mut buf);
+            let mut h = ::tar::Header::new_old();
+            h.set_size(5);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "input.txt", &b"hello"[..]).unwrap();
+            b.finish().unwrap();
+        }
+        assert_eq!(&buf[257..262], &[0u8; 5], "no magic");
+        assert_eq!(detect(&buf), Some(Format::Tar));
+        let entries = extract(Format::Tar, &buf, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(entries[0].data, b"hello");
+        // One byte of the header changed: the checksum no longer fits.
+        buf[1] ^= 1;
+        assert_eq!(detect(&buf), None);
+        // Text that happens to be octal is not one.
+        assert_eq!(detect(&[b'7'; 2048]), None);
+    }
+
     fn cab_of(members: &[(&str, &[u8])]) -> Vec<u8> {
         let mut b = ::cab::CabinetBuilder::new();
         {
@@ -3301,6 +3401,23 @@ mod tests {
         assert_eq!(entries[0].data, payload);
     }
 
+    /// ClamAV's `skip_prefix.txt.zst`: a skippable frame (which LZ4 uses as
+    /// well) ahead of the Zstandard one was taken for an LZ4 file.
+    #[test]
+    fn zstd_after_a_skippable_frame_is_zstd() {
+        let payload = b"hello exav inside zstd";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        blob.extend_from_slice(&5u32.to_le_bytes());
+        blob.extend_from_slice(b"PADDY");
+        blob.extend(zstd_of(payload));
+        assert_eq!(detect(&blob), Some(Format::Zstd));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Zstd, &blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, payload);
+    }
+
     #[test]
     fn zstd_bomb_trips_ratio() {
         let mut w =
@@ -3558,6 +3675,82 @@ mod tests {
         let entries = extract(Format::Lzip, blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, payload);
+    }
+
+    /// A ZIP behind a script line (a zipapp), with a marker of a spanned archive
+    /// in front, or with padding before and after is told by its end record, and
+    /// opens as it does without them; text that merely ends like a ZIP is not.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_zip_behind_other_bytes_is_a_zip() {
+        let zip = include_bytes!("../tests/fixtures/zip/legacy_implode.zip").to_vec();
+        let plain = extract(
+            Format::Zip,
+            &zip.as_slice(),
+            &mut Budget::new(Limits::default()),
+        )
+        .unwrap();
+        assert!(!plain.is_empty());
+        let names = |blob: &[u8]| -> Vec<(String, Vec<u8>)> {
+            extract(Format::Zip, &blob, &mut Budget::new(Limits::default()))
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.data))
+                .collect()
+        };
+        let want = names(&zip);
+        for (what, blob) in [
+            (
+                "a zipapp",
+                [&b"#!/usr/bin/env python3\n"[..], &zip].concat(),
+            ),
+            (
+                "padding around",
+                [&[7u8; 300][..], &zip, &[9u8; 100]].concat(),
+            ),
+        ] {
+            assert_eq!(detect(&blob.as_slice()), Some(Format::Zip), "{what}");
+            assert_eq!(names(&blob), want, "{what}");
+        }
+        // A directory that points at no local header, and an end record cut off.
+        let mut broken = [&b"#!/bin/sh\n"[..], &zip].concat();
+        let at = broken.len() - zip.len();
+        broken[at..at + 4].copy_from_slice(b"XXXX");
+        assert_eq!(detect(&broken.as_slice()), None);
+        let cut = [&b"#!/bin/sh\n"[..], &zip[..zip.len() - 30]].concat();
+        assert_eq!(detect(&cut.as_slice()), None);
+    }
+
+    /// `xz --format=lzma`: a stream that ends with a marker, and the same with
+    /// its size in the header (what LZMA Utils wrote).
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn lzma_alone_roundtrip() {
+        let payload = b"hello exav inside lzma";
+        for blob in [
+            &include_bytes!("../tests/fixtures/lzma_simple.lzma")[..],
+            &include_bytes!("../tests/fixtures/lzma_sized.lzma")[..],
+        ] {
+            assert_eq!(detect(&blob), Some(Format::Lzma));
+            let mut budget = Budget::new(Limits::default());
+            let entries = extract(Format::Lzma, &blob, &mut budget).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "lzma-content");
+            assert_eq!(entries[0].data, payload);
+        }
+    }
+
+    /// The header chooses the dictionary the decoder allocates: one of 2 GiB is
+    /// refused, not allocated.
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn lzma_alone_with_a_huge_dictionary_is_refused() {
+        let mut blob = include_bytes!("../tests/fixtures/lzma_simple.lzma").to_vec();
+        blob[1..5].copy_from_slice(&(1u32 << 31).to_le_bytes());
+        assert_eq!(detect(&blob.as_slice()), Some(Format::Lzma));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Lzma, &blob.as_slice(), &mut budget).unwrap();
+        assert!(entries[0].data.is_empty() && entries[0].unsupported.is_some());
     }
 }
 

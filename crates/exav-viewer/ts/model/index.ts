@@ -75,7 +75,11 @@ export function ply(options: ModelOptions = {}): FormatPlugin<ModelOptions> {
   };
 }
 
-/** glTF 2.0, `.gltf` with its buffers embedded as `data:` URIs, and `.glb`; textures and animations are not read. */
+/**
+ * glTF 2.0, `.gltf` and `.glb`; textures and animations are not read. The
+ * buffers of a `.gltf` are embedded as `data:` URIs or files among the files
+ * around it (`ViewerFile.tree`); one that is neither is an error.
+ */
 export function gltf(options: ModelOptions = {}): FormatPlugin<ModelOptions> {
   return {
     id: "gltf",

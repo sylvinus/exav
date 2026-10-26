@@ -737,7 +737,7 @@ def image_fields(e):
         "reactor": h(get(e, "image_def_reactor_handle", None)),
         "clip_type": int(get(e, "clipping_boundary_type", 1)),
         "clip_vertices": [v2(p) for p in e.boundary_path],
-        "clip_inside": bool(get(e, "clip_mode", 0)),
+        "clip_inverted": bool(get(e, "clip_mode", 0)),
     }
 
 

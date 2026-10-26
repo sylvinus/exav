@@ -110,12 +110,21 @@ is on exav.org.
   content examined is not reported as examined.
 - **xz checksum after a full block** counts as damage, because the decoder
   cannot tell whether more blocks follow.
+- **Small gaps found by the wild-sample sweeps**:
+  a UPX-packed DOS `.exe` (`upx -t` accepts it; exav's UPX reader covers PE and
+  ELF); CHM overlays appended to PE files (PuTTY builds: 7-Zip lists them,
+  ClamAV does not scan overlays); an ext4 image whose journal has features that
+  `ext4-view` does not know is refused (`MissingRequiredJournalFeatures`, a
+  limit of the crate); an empty spreadsheet template (no table) reads as
+  "damaged: no sheets" instead of an empty workbook.
 - **JBIG2 symbol dictionaries** are bounded only by hayro-jbig2's own
   65,535 × 65,535 symbol limit: the symbol sizes sit inside the compressed
   data, so they cannot be counted against the memory budget before decoding,
   and the crate has no budget setting. Regions are counted (fuzz finding,
-  docs/FUZZING.md). Needs a budget hook upstream or a pre-pass that bounds
-  the dictionaries.
+  docs/FUZZING.md), and so is the symbol count of a dictionary (at most eight
+  symbols a byte: one with its count changed in two bytes took 100 s and 7 GB),
+  but a dictionary within that count can still cost seconds. Needs a budget
+  hook upstream or a pre-pass that bounds the dictionaries.
 - **Image decode time**, measured on a build with optimisations: JBIG2
   regions decode at about 230 Mpx a second when the data is empty (a few times
   slower on real data), JPEG 2000 at about 50 Mpx a second, and the grey

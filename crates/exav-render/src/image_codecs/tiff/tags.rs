@@ -214,6 +214,9 @@ pub enum CompressionMethod(u16) unknown(
 
     // Self-assigned by libtiff
     ZSTD = 0xC350,
+    // exav: read for the viewer only (`with_viewer_codecs`).
+    ThunderScan = 32809,
+    LZMA = 34925,
 }
 }
 

@@ -1,6 +1,7 @@
 import { writable } from "../core/store.js";
 import type { Renderer } from "../core/types.js";
-import { createModelEngine, DEFAULT_MAX_TRIANGLES, DEFAULT_TIMEOUT_MS, modelWarnings, type ModelKind } from "./engine.js";
+import { createModelEngine, DEFAULT_MAX_TRIANGLES, DEFAULT_TIMEOUT_MS, modelWarnings, type ModelKind, type ParsedModel } from "./engine.js";
+import { readBuffers } from "./buffers.js";
 import { parseGround } from "./camera.js";
 import type { ModelOptions } from "./index.js";
 import { createModelRaster } from "./raster.js";
@@ -37,11 +38,20 @@ export const rendererFor = (kind: Exclude<ModelKind, "ifc">): Renderer<ModelOpti
       if (disposed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
       ctx.status({ phase: "loading", step: "read" });
       const bytes = source.slice();
-      const model = await engine.call(
-        { kind, bytes: bytes.buffer as ArrayBuffer, maxTriangles: ctx.options.maxTriangles ?? DEFAULT_MAX_TRIANGLES },
-        [bytes.buffer as ArrayBuffer],
-        ctx.options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      );
+      const maxTriangles = ctx.options.maxTriangles ?? DEFAULT_MAX_TRIANGLES;
+      const timeout = ctx.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      // A glTF whose buffers are other files finds them among the files
+      // around it, when it has any.
+      let files: { name: string; bytes: ArrayBuffer }[] | undefined;
+      if (kind === "gltf" && ctx.file.tree) {
+        const listed = (await engine.call({ kind, bytes: bytes.slice().buffer as ArrayBuffer, maxTriangles, list: true }, [], timeout)) as { buffers: string[] };
+        files = await readBuffers(ctx.file.tree, listed.buffers, ctx.signal);
+      }
+      const model = (await engine.call(
+        { kind, bytes: bytes.buffer as ArrayBuffer, maxTriangles, ...(files?.length && { files }) },
+        [bytes.buffer as ArrayBuffer, ...(files ?? []).map((f) => f.bytes)],
+        timeout,
+      )) as ParsedModel;
       engine.destroy();
       if (disposed || ctx.signal.aborted) throw new DOMException("aborted", "AbortError");
       ctx.status({ phase: "loading", step: "render" });

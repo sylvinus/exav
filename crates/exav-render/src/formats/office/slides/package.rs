@@ -1,5 +1,6 @@
 //! ZIP packages (ODP, Keynote) read within the limits.
 
+use crate::formats::office::common::package::open_zip;
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::limits::Budget;
 use std::io::{Read, Seek};
@@ -19,8 +20,8 @@ impl<'a> Zip<'a> {
     }
 
     pub fn from_source(source: Box<dyn Source + 'a>) -> Result<Zip<'a>> {
-        let z = zip::ZipArchive::new(source)
-            .map_err(|e| Error::NotFormat(format!("not a ZIP package: {e}")))?;
+        let z =
+            open_zip(source).map_err(|e| Error::NotFormat(format!("not a ZIP package: {e}")))?;
         Ok(Zip { z })
     }
 

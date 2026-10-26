@@ -95,6 +95,24 @@ for (const mode of ["sandbox", "page"] as const) {
       }
     });
 
+    test("a glTF whose buffer is another file is drawn when that file is given with it", async ({ page }) => {
+      await page.goto(`./?${new URLSearchParams({ lang: "en", ...(mode === "page" ? { mode } : {}) })}`);
+      await pick(page, "external.gltf", "house.bin");
+      await expect(phase(page)).toHaveAttribute("data-phase", "ready");
+      await expect.poll(() => triangles(page)).toBe(30);
+    });
+
+    test("a glTF in an archive is drawn from the buffer file in the archive, in a folder below it", async ({ page }) => {
+      await openSample(page, "models.zip", mode === "page" ? { mode } : {});
+      await expect(phase(page)).toHaveAttribute("data-phase", "ready");
+      await page.locator(".demo-frame").getByRole("button", { name: /scene\.gltf/ }).click();
+      await expect(engine(page).locator(".exav-viewer-model-canvas")).toHaveCount(1);
+      const p = await settled(engine(page).locator(".exav-viewer-model-canvas"));
+      // The house, as when it is opened on its own.
+      expect(find(p, (r, g, b) => r < 200 || g < 200 || b < 200).count).toBeGreaterThan(500);
+      await expect(page.locator(".demo-frame .exav-viewer-status-error")).toHaveCount(0);
+    });
+
     for (const [name, why] of [
       ["external.gltf", "a glTF whose buffer is another file"],
       ["cloud.ply", "a PLY without faces"],

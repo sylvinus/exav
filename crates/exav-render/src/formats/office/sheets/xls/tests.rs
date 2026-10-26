@@ -249,3 +249,29 @@ fn damaged_compound_files_are_read_leniently() {
         let _ = read(&d);
     }
 }
+
+/// A shared string whose header ends with its record: the CONTINUE that holds
+/// the characters starts with the width flag, which may differ from the
+/// header's. Strings after it were read as 8-bit when they were 16-bit.
+#[test]
+fn a_string_whose_header_ends_its_record_takes_the_width_of_the_next() {
+    use super::SplitReader;
+    // 3 characters, flags 0 (8-bit) in the first record; the second says 16-bit.
+    let mut d = vec![3, 0, 0];
+    d.extend([1, b'x', 0, b'y', 0, b'z', 0]);
+    let mut r = SplitReader {
+        d: &d,
+        breaks: &[3],
+        p: 0,
+    };
+    assert_eq!(r.rich().0, "xyz");
+    // The same string with the flag byte first in the record when 8-bit stays so.
+    let mut d = vec![3, 0, 0];
+    d.extend([0, b'a', b'b', b'c']);
+    let mut r = SplitReader {
+        d: &d,
+        breaks: &[3],
+        p: 0,
+    };
+    assert_eq!(r.rich().0, "abc");
+}

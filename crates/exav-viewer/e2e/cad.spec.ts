@@ -2,13 +2,15 @@
 // built to show each thing (its tests/fixtures/dwg/make.py, copied as
 // cad-*.dxf by make-samples.mjs), measured on the picture. In the page: the
 // sandboxed frame draws the same pixels (demo.spec.ts compares the two).
+import fs from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
 import { failOnViolations } from "./csp.js";
 import { bands, decodePng, difference, find, type Pixels } from "./pixels.js";
-import { openSample } from "./samples.js";
+import { openSample, sample } from "./samples.js";
 
 failOnViolations();
 
@@ -300,6 +302,71 @@ test.describe("sheets", () => {
       const width = line.to - line.from + 1;
       expect(width / side).toBeGreaterThan(0.05);
       expect(width / side).toBeLessThan(0.13);
+    });
+  }
+});
+
+// A drawing shown with the files it refers to (cad-xref_*: the sheet refers to
+// title.dwg, which refers to part.dwg). The viewer's file input takes several
+// files at once, and a folder: they are one tree.
+test.describe("files that refer to others", () => {
+  const red = (r: number, g: number, b: number) => r > 215 && g < 140 && b < 140;
+  const green = (r: number, g: number, b: number) => g > 180 && r < 120 && b < 120;
+  const files = [
+    ["sheet.dxf", "cad-xref_sheet.dxf"],
+    ["title.dwg", "cad-xref_title.dxf"],
+    ["part.dwg", "cad-xref_part.dxf"],
+  ] as const;
+
+  for (const mode of ["page", "sandbox"] as const) {
+    // The drawing is in the frame in one mode and in the page in the other; the warnings are the page's in both.
+    const canvas = (page: Page) => (mode === "sandbox" ? page.frameLocator(".demo-frame iframe.exav-viewer-sandbox") : page.locator(".demo-frame")).locator(".exav-viewer-cad-canvas");
+    const warnings = (page: Page) => page.locator(".demo-frame .exav-viewer-warnings");
+    const start = async (page: Page, input: "file-input" | "folder-input", given: Parameters<Locator["setInputFiles"]>[0]) => {
+      await page.goto(`./?${new URLSearchParams({ lang: "en", ...(mode === "page" ? { mode } : {}) })}`);
+      await page.getByTestId(input).setInputFiles(given);
+      await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+    };
+    const picture = async (page: Page) => settled(canvas(page));
+
+    test(`in the ${mode}: the reference is drawn from the files given with it`, async ({ page }) => {
+      await start(page, "file-input", files.map(([name, from]) => ({ name, mimeType: "", buffer: sample(from) })));
+      const p = await picture(page);
+      expect(find(p, red).count, "the frame of title.dwg").toBeGreaterThan(20);
+      expect(find(p, green).count, "part.dwg, which title.dwg refers to").toBeGreaterThan(0);
+      await expect(warnings(page)).toHaveCount(0);
+    });
+
+    test(`in the ${mode}: alone, it says what it could not draw`, async ({ page }) => {
+      await start(page, "file-input", [{ name: "sheet.dxf", mimeType: "", buffer: sample("cad-xref_sheet.dxf") }]);
+      expect(find(await picture(page), red).count).toBe(0);
+      await expect(warnings(page)).toContainText("title.dwg");
+    });
+
+    test(`in the ${mode}: a reference not among the files is said, the others are drawn`, async ({ page }) => {
+      await start(page, "file-input", files.slice(0, 2).map(([name, from]) => ({ name, mimeType: "", buffer: sample(from) })));
+      expect(find(await picture(page), red).count).toBeGreaterThan(20);
+      await expect(warnings(page)).toContainText("part.dwg");
+    });
+
+    test(`in the ${mode}: it is found among the members of the archive the drawing is in`, async ({ page }) => {
+      await start(page, "file-input", [{ name: "project.zip", mimeType: "", buffer: sample("project.zip") }]);
+      await page.locator(".demo-frame").getByRole("button", { name: /sheet\.dxf/ }).click();
+      // The canvas is first made for the box beside the member list and then
+      // for the one without it: a shot is taken until it has the frame.
+      await expect(canvas(page)).toHaveCount(1);
+      await expect.poll(async () => find(await shot(canvas(page)), red).count).toBeGreaterThan(20);
+    });
+
+    test(`in the ${mode}: it is found in a folder, below the drawing's own`, async ({ page }, info) => {
+      const dir = info.outputPath("project");
+      for (const [name, from] of files) {
+        const at = path.join(dir, name === "sheet.dxf" ? "plans" : path.join("plans", "xrefs"), name);
+        fs.mkdirSync(path.dirname(at), { recursive: true });
+        fs.writeFileSync(at, sample(from));
+      }
+      await start(page, "folder-input", dir);
+      expect(find(await picture(page), red).count).toBeGreaterThan(20);
     });
   }
 });

@@ -38,12 +38,15 @@ pub(crate) fn is_in(p: &Probe, fmt: Format) -> bool {
         Format::Ace => d.get(7..14) == Some(b"**ACE**".as_slice()),
 
         // LZ4 frame, the pre-1.5 legacy frame, or a skippable frame
-        // (`0x184D2A50`..`5F`).
+        // (`0x184D2A50`..`5F`), which Zstandard has as well: those that are
+        // followed by a Zstandard frame are Zstandard's.
         Format::Lz4 => {
             d.len() > 7
                 && (d.starts_with(&[0x04, 0x22, 0x4D, 0x18])
                     || d.starts_with(&[0x02, 0x21, 0x4C, 0x18])
-                    || (d[0] & 0xF0 == 0x50 && d[1..4] == [0x2A, 0x4D, 0x18]))
+                    || (d[0] & 0xF0 == 0x50
+                        && d[1..4] == [0x2A, 0x4D, 0x18]
+                        && !zstd_after_skippable(d)))
         }
 
         // The `conectix` footer cookie. A fixed-disk image carries only the
@@ -190,13 +193,121 @@ pub(crate) fn is_in(p: &Probe, fmt: Format) -> bool {
             d.starts_with(&[0x00, 0x05, 0x16, 0x00]) || d.starts_with(&[0x00, 0x05, 0x16, 0x07])
         }
 
+        Format::Lzma => lzma_alone_header(d),
+
+        // The lead: magic, then the major version of the format (1 to 4).
+        Format::Rpm => {
+            d.len() >= 96 && d.starts_with(&[0xED, 0xAB, 0xEE, 0xDB]) && (1..=4).contains(&d[4])
+        }
+
         _ => false,
     }
+}
+
+/// Whether the start of a file is the header of an LZMA-alone stream, as the xz
+/// utilities decide it when they are not told: valid properties, a dictionary
+/// size of the form 2^n or 2^n + 2^(n-1) (what the encoders write), a size that
+/// is unknown or below 256 GiB, and the zero byte every range coder starts
+/// with. A file that is not LZMA passes by chance about once in 10^10, which
+/// matters because this runs against every file.
+fn lzma_alone_header(d: &[u8]) -> bool {
+    let Some(h) = d.get(..14) else {
+        return false;
+    };
+    let dict = u32::from_le_bytes([h[1], h[2], h[3], h[4]]);
+    let size = u64::from_le_bytes(h[5..13].try_into().unwrap());
+    h[0] < 9 * 5 * 5
+        && (dict == u32::MAX
+            || (12..=31).any(|n| dict == 1 << n || (n > 12 && dict == (1 << n) + (1 << (n - 1)))))
+        && (size == u64::MAX || size < 1 << 38)
+        && h[13] == 0
+}
+
+/// Whether a file that is no other format is a ZIP that does not start with a
+/// local header: behind a script line (a Python zipapp), padding or a stub, or
+/// with the marker of a spanned archive in front. Readers find a ZIP by its end
+/// record, so these open everywhere. The end record (and its comment) may be
+/// followed by padding, the directory must end where it starts, and the first
+/// entry's local header must be where its offset puts it, counted from the
+/// archive's start or from the file's. ZIP64 is not followed.
+#[cfg(feature = "zip")]
+pub(crate) fn prefixed_zip(p: &Probe) -> bool {
+    const EOCD: usize = 22;
+    if p.len < EOCD + 30 {
+        return false;
+    }
+    let from = p.len.saturating_sub(EOCD + usize::from(u16::MAX));
+    let tail = p.window(from, p.len - from);
+    let Some(rel) = tail.windows(4).rposition(|w| w == b"PK\x05\x06") else {
+        return false;
+    };
+    let Some(end) = tail.get(rel..rel + EOCD) else {
+        return false;
+    };
+    let eocd = from + rel;
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([end[at], end[at + 1]]));
+    let u32_at = |at: usize| u32::from_le_bytes([end[at], end[at + 1], end[at + 2], end[at + 3]]);
+    let (entries, cd_size, cd_off) = (u16_at(10), u32_at(12), u32_at(16));
+    if eocd + EOCD + u16_at(20) > p.len
+        || entries == 0
+        || entries == 0xFFFF
+        || cd_size == u32::MAX
+        || cd_off == u32::MAX
+    {
+        return false;
+    }
+    let Some(cd_start) = eocd.checked_sub(cd_size as usize) else {
+        return false;
+    };
+    let Some(prefix) = cd_start.checked_sub(cd_off as usize) else {
+        return false;
+    };
+    let entry = p.window(cd_start, 46);
+    if !entry.starts_with(b"PK\x01\x02") || entry.len() < 46 {
+        return false;
+    }
+    let local = u32::from_le_bytes([entry[42], entry[43], entry[44], entry[45]]) as usize;
+    p.window(prefix + local, 4).starts_with(b"PK\x03\x04")
+}
+
+/// Whether `d` is skippable frames (`0x184D2A50`..`5F`, a length, that many
+/// bytes) and then a Zstandard frame. A file may open with a skippable frame
+/// and be LZ4 or Zstandard; only what follows says which.
+pub(crate) fn zstd_after_skippable(d: &[u8]) -> bool {
+    let mut rest = d;
+    // A few frames is all a real file has; the bound keeps a long run cheap.
+    for _ in 0..16 {
+        match rest {
+            [m, 0x2A, 0x4D, 0x18, a, b, c, e, tail @ ..] if m & 0xF0 == 0x50 => {
+                let len = u32::from_le_bytes([*a, *b, *c, *e]) as usize;
+                match tail.get(len..) {
+                    Some(next) => rest = next,
+                    None => return false,
+                }
+            }
+            _ => return rest.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]),
+        }
+    }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skippable_frame_is_lz4_or_zstd_by_what_follows() {
+        let skip = [&[0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0][..], b"xyz"].concat();
+        let zstd = [&skip[..], &[0x28, 0xB5, 0x2F, 0xFD, 0, 0, 0, 0][..]].concat();
+        let lz4 = [&skip[..], &[0x04, 0x22, 0x4D, 0x18, 0, 0, 0, 0][..]].concat();
+        assert!(!is(&zstd, Format::Lz4));
+        assert!(zstd_after_skippable(&zstd));
+        assert!(is(&lz4, Format::Lz4));
+        assert!(!zstd_after_skippable(&lz4));
+        // Skippable frames and nothing after: LZ4 as before.
+        let only = [&skip[..], &[0; 8][..]].concat();
+        assert!(is(&only, Format::Lz4));
+    }
 
     #[test]
     fn each_format_accepts_its_own_magic() {
@@ -300,6 +411,35 @@ mod tests {
         assert!(!is(b"MSWIM\0\0\0", Format::Wim));
         assert!(!is(b"QFI\xfb", Format::Qcow2));
         assert!(!is(b"KDMV", Format::Vmdk));
+    }
+
+    fn lzma_header(props: u8, dict: u32, size: u64) -> Vec<u8> {
+        let mut h = vec![props];
+        h.extend_from_slice(&dict.to_le_bytes());
+        h.extend_from_slice(&size.to_le_bytes());
+        h.extend_from_slice(&[0, 1, 2]);
+        h
+    }
+
+    #[test]
+    fn a_header_of_lzma_utils_is_told() {
+        let is_lzma = |h: &[u8]| is(h, Format::Lzma);
+        // `lzma` writes 0x5D (lc 3, lp 0, pb 2) and a 2^n dictionary.
+        assert!(is_lzma(&lzma_header(0x5D, 1 << 26, u64::MAX)));
+        assert!(is_lzma(&lzma_header(0x5D, 3 << 23, 1234)));
+        assert!(is_lzma(&lzma_header(0x5D, u32::MAX, 0)));
+        // A properties byte past lc 8, lp 4, pb 4.
+        assert!(!is_lzma(&lzma_header(225, 1 << 26, 1)));
+        // A dictionary that is not 2^n or 2^n + 2^(n-1), or is below 4 KiB.
+        assert!(!is_lzma(&lzma_header(0x5D, (1 << 26) + 1, 1)));
+        assert!(!is_lzma(&lzma_header(0x5D, 1 << 11, 1)));
+        // A size of 256 GiB or more that is not "unknown".
+        assert!(!is_lzma(&lzma_header(0x5D, 1 << 26, 1 << 38)));
+        // A range coder starts with a zero byte.
+        let mut h = lzma_header(0x5D, 1 << 26, 1);
+        h[13] = 1;
+        assert!(!is_lzma(&h));
+        assert!(!is_lzma(&h[..13]));
     }
 
     /// A format this module does not speak for must answer `false` rather than

@@ -857,6 +857,11 @@ impl SplitReader<'_> {
 
     pub fn chars(&mut self, mut n: usize, mut wide: bool) -> String {
         let mut units: Vec<u16> = Vec::with_capacity(n.min(self.d.len()));
+        // The header of the string ended with its record: the CONTINUE that
+        // holds the characters starts with the width flag.
+        if n > 0 && self.breaks.contains(&self.p) && self.p < self.d.len() {
+            wide = self.u8() & 1 != 0;
+        }
         while n > 0 && self.p < self.d.len() {
             let end = self.next_break();
             let w = if wide { 2 } else { 1 };

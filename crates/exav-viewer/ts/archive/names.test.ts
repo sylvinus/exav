@@ -18,6 +18,8 @@ describe("what a compressed stream's file is called", () => {
     expect(decompressedName("site.txz", "xz-content")).toBe("site.tar");
     expect(decompressedName("site.tzst", "zstd-content")).toBe("site.tar");
     expect(decompressedName("site.tlz", "lzip-content")).toBe("site.tar");
+    expect(decompressedName("site.tar.lzma", "lzma-content")).toBe("site.tar");
+    expect(decompressedName("notes.txt.lzma", "lzma-content")).toBe("notes.txt");
     expect(decompressedName("site.taz", "lzw-content")).toBe("site.tar");
     expect(decompressedName("site.tbz", "bzip2-content")).toBe("site.tar");
   });
@@ -42,7 +44,7 @@ describe("what a compressed stream's file is called", () => {
   });
 
   it("is told by the library's name for it, and only that", () => {
-    for (const n of ["gzip-content", "bzip2-content", "xz-content", "zstd-content", "lzip-content", "lz4-content", "lzw-content"]) {
+    for (const n of ["gzip-content", "bzip2-content", "xz-content", "zstd-content", "lzip-content", "lzma-content", "lz4-content", "lzw-content"]) {
       expect(STREAM_MEMBER.test(n), n).toBe(true);
     }
     for (const n of ["content", "gzip-content.txt", "docs/gzip-content", "zip-content"]) {

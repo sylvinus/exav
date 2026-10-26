@@ -15,6 +15,7 @@ import { createDetector } from "../core/detect.js";
 import { BUILTIN_ORDER, CONVERTED_FORMATS, MATCHERS, WASM_IMAGES } from "../core/formats.js";
 import { asRasterError, isPage, MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS, RasterError } from "../core/pictures.js";
 import { picturesOver } from "../core/raster.js";
+import { createSourceReader } from "../core/source.js";
 import { derived, writable, type Store, type WritableStore } from "../core/store.js";
 import { checkTheme, themeOf, type FrameTheme } from "../core/theme.js";
 import type {
@@ -43,6 +44,8 @@ import {
   MAX_DRAWS,
   NAV_KEYS,
   PROTOCOL,
+  READS,
+  TREE,
   type ArchiveSnapshot,
   type BytesMessage,
   type CommandMessage,
@@ -361,6 +364,43 @@ function mountFrame(
       });
   };
 
+  /**
+   * A whole file of the tree the frame was told of, answered with its bytes.
+   * Only a path the host listed is read: the frame names no other file.
+   */
+  const fetchFile = (id: number, path: string) => {
+    if (reads.has(id)) return;
+    const tree = current.tree;
+    const refuse = (why: string) => {
+      if (!refusedOnce) console.warn(`${format ?? "viewer"}: a file asked for by the sandboxed frame refused: ${why}`);
+      refusedOnce = true;
+      reply({ type: "bytes", id, error: "refused" });
+    };
+    if (!tree || !tree.paths.slice(0, TREE.maxPaths).includes(path)) return refuse("it is not in the tree");
+    if (reads.size >= READS.maxReads) return refuse("too many reads at once");
+    const own = new AbortController();
+    reads.set(id, { length: 0, abort: own });
+    const signal = AbortSignal.any([abort.signal, own.signal]);
+    let opened: ReturnType<typeof createSourceReader> | undefined;
+    void (async (): Promise<BytesMessage> => {
+      opened = createSourceReader(await tree.open(path, signal), signal);
+      const bytes = await opened.bytes();
+      if (bytes.byteLength > TREE.maxFileBytes) return { type: "bytes", id, error: "refused" };
+      // Its own buffer, to transfer: the source may keep the one it read.
+      return { type: "bytes", id, data: bytes.slice().buffer as ArrayBuffer };
+    })()
+      .catch((error): BytesMessage => {
+        if (!abort.signal.aborted && !own.signal.aborted) console.warn(`${format ?? "viewer"}: a file for the sandboxed frame could not be read`, error);
+        return { type: "bytes", id, error: "failed" };
+      })
+      .then((m) => {
+        opened?.dispose();
+        if (reads.get(id)?.abort !== own) return;
+        reads.delete(id);
+        reply(m);
+      });
+  };
+
   const command = (session: number, target: CommandTarget, action: string, args: unknown[] = []) =>
     new Promise<void>((resolve) => {
       if (!port) return resolve();
@@ -621,6 +661,8 @@ function mountFrame(
       }
       case "read":
         return read(message.id, message.generation, message.offset, message.length);
+      case "fetch":
+        return fetchFile(message.id, message.path);
       case "cancel":
         reads.get(message.id)?.abort.abort();
         return;
@@ -711,6 +753,7 @@ function mountFrame(
         formats,
         file: { name: file.name, type: file.type ?? "", path: file.path ?? file.name, format: known },
         source: sourceOf(p, 0, transfer),
+        ...(file.tree ? { tree: { path: file.tree.path, paths: file.tree.paths.slice(0, TREE.maxPaths) } } : {}),
         options: config.options ?? {},
         theme: themeFor(config, host),
       };

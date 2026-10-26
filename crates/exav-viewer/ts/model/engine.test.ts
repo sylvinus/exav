@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import init, { parseGltf, parseIfc, parseObj, parsePly, parseStl } from "../../wasm/exav_viewer_model.js";
+import init, { gltfBuffers, parseGltf, parseGltfWith, parseIfc, parseObj, parsePly, parseStl } from "../../wasm/exav_viewer_model.js";
 import { modelWarnings, type ModelMeta } from "./engine.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -112,5 +112,30 @@ describe("the model module", () => {
     m.free();
     expect(() => parseGltf(new TextEncoder().encode(doc("http://example.com/a.bin", "{}")), 10)).toThrow("references external files");
     expect(() => parseGltf(new TextEncoder().encode("{}"), 10)).toThrow("not a glTF file");
+  });
+
+  it("reads a glTF whose buffer is a file it is given, by the name the document writes", () => {
+    const f = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const doc = new TextEncoder().encode(
+      JSON.stringify({
+        asset: { version: "2.0" },
+        buffers: [{ uri: "tri%20one.bin", byteLength: 36 }],
+        bufferViews: [{ buffer: 0, byteLength: 36 }],
+        accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3" }],
+        meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+        nodes: [{ mesh: 0, translation: [10, 0, 0] }],
+        scenes: [{ nodes: [0] }],
+      }),
+    );
+    expect(JSON.parse(gltfBuffers(doc))).toEqual(["tri%20one.bin"]);
+    const bin = new Uint8Array(f.buffer);
+    // Two files given: the one the document names is the second.
+    const files = new Uint8Array([7, 7, 7, ...bin]);
+    const m = parseGltfWith(doc, 10, ["other.bin", "tri%20one.bin"], files, new Uint32Array([3, 36]));
+    expect((JSON.parse(m.metaJson()) as ModelMeta).bounds).toEqual([10, 0, 0, 11, 1, 0]);
+    m.free();
+    expect(() => parseGltfWith(doc, 10, ["other.bin"], files, new Uint32Array([3]))).toThrow("references external files");
+    expect(() => parseGltfWith(doc, 10, ["tri%20one.bin"], files, new Uint32Array([300]))).toThrow("longer than the bytes given");
+    expect(JSON.parse(gltfBuffers(new TextEncoder().encode(JSON.stringify({ asset: { version: "2.0" }, buffers: [{ uri: "data:;base64,AAAA", byteLength: 3 }] }))))).toEqual([]);
   });
 });

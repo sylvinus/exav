@@ -80,6 +80,13 @@ pub(crate) struct Image {
     pub tile_attributes: Option<TileAttributes>,
     pub chunk_offsets: Vec<u64>,
     pub chunk_bytes: Vec<u64>,
+    /// exav: YCbCrSubSampling (horizontal, vertical) of a YCbCr image.
+    pub ycbcr_subsampling: (u16, u16),
+    /// exav: where the header of the JPEG stream of an old-style JPEG file
+    /// ends in the file, 0 for none (see `ojpeg`).
+    pub ojpeg_header_end: u64,
+    /// And where that stream ends.
+    pub ojpeg_stream_end: u64,
 }
 
 impl Image {
@@ -97,12 +104,10 @@ impl Image {
             )));
         }
 
-        let photometric_interpretation = tag_reader
+        let photometric_tag = tag_reader
             .find_tag(Tag::PhotometricInterpretation)?
             .map(Value::into_u16)
-            .transpose()?
-            .and_then(PhotometricInterpretation::from_u16)
-            .ok_or(TiffUnsupportedError::UnknownInterpretation)?;
+            .transpose()?;
 
         // Try to parse both the compression method and the number, format, and bits of the included samples.
         // If they are not explicitly specified, those tags are reset to their default values and not carried from previous images.
@@ -133,10 +138,42 @@ impl Image {
             .find_tag(Tag::SamplesPerPixel)?
             .map(Value::into_u16)
             .transpose()?
-            .unwrap_or(1);
+            // exav: libtiff finds three in an old-style JPEG file that does not
+            // say (for the viewer's reader only).
+            .unwrap_or(if super::viewer_codecs() && compression_method == CompressionMethod::JPEG {
+                3
+            } else {
+                1
+            });
         if samples == 0 {
             return Err(TiffFormatError::SamplesPerPixelIsZero.into());
         }
+
+        let photometric_interpretation = match photometric_tag {
+            Some(p) => PhotometricInterpretation::from_u16(p)
+                .ok_or(TiffUnsupportedError::UnknownInterpretation)?,
+            // exav: a file with no photometric interpretation (a raster some
+            // GIS program wrote) is grey, or RGB with three samples, for the
+            // viewer's reader only (see `with_viewer_codecs`).
+            None if super::viewer_codecs() => {
+                if samples == 3 {
+                    PhotometricInterpretation::RGB
+                } else {
+                    PhotometricInterpretation::BlackIsZero
+                }
+            }
+            None => return Err(TiffUnsupportedError::UnknownInterpretation.into()),
+        };
+        // exav: libtiff reads old-style JPEG of three samples as YCbCr whatever
+        // the photometric interpretation says; so does the viewer's reader.
+        let photometric_interpretation = if super::viewer_codecs()
+            && compression_method == CompressionMethod::JPEG
+            && photometric_interpretation == PhotometricInterpretation::RGB
+        {
+            PhotometricInterpretation::YCbCr
+        } else {
+            photometric_interpretation
+        };
 
         let sample_format = match tag_reader.find_tag_uint_vec(Tag::SampleFormat)? {
             Some(vals) => {
@@ -159,9 +196,14 @@ impl Image {
             None => SampleFormat::Uint,
         };
 
-        let bits_per_sample: Vec<u8> = tag_reader
+        let mut bits_per_sample: Vec<u8> = tag_reader
             .find_tag_uint_vec(Tag::BitsPerSample)?
             .unwrap_or_else(|| vec![1]);
+        // exav: libtiff ignores the entries past the samples a pixel has; so
+        // does the viewer's reader (see `with_viewer_codecs`).
+        if super::viewer_codecs() && bits_per_sample.len() > usize::from(samples) {
+            bits_per_sample.truncate(usize::from(samples));
+        }
 
         // Technically bits_per_sample.len() should be *equal* to samples, but libtiff also allows
         // it to be a single value that applies to all samples.
@@ -210,23 +252,46 @@ impl Image {
         let chunk_bytes;
         let strip_decoder;
         let tile_attributes;
+        // exav: libtiff keeps the offsets of tiles and of strips in one field, so
+        // a tiled file may name them with the strip tags. For the viewer's
+        // reader only (see `with_viewer_codecs`).
+        let tiles_by_strip_tags = super::viewer_codecs()
+            && !ifd.contains(Tag::TileOffsets)
+            && ifd.contains(Tag::TileWidth)
+            && ifd.contains(Tag::TileLength);
         match (
             ifd.contains(Tag::StripByteCounts),
             ifd.contains(Tag::StripOffsets),
             ifd.contains(Tag::TileByteCounts),
             ifd.contains(Tag::TileOffsets),
         ) {
-            (true, true, false, false) => {
+            // exav: for the viewer's reader, strips with no byte counts
+            // (libtiff reads them) run to the end of the file.
+            (counts, true, false, false)
+                if !tiles_by_strip_tags && (counts || super::viewer_codecs()) =>
+            {
                 chunk_type = ChunkType::Strip;
 
                 chunk_offsets = tag_reader
                     .find_tag(Tag::StripOffsets)?
                     .unwrap()
                     .into_u64_vec()?;
-                chunk_bytes = tag_reader
-                    .find_tag(Tag::StripByteCounts)?
-                    .unwrap()
-                    .into_u64_vec()?;
+                chunk_bytes = if counts {
+                    tag_reader
+                        .find_tag(Tag::StripByteCounts)?
+                        .unwrap()
+                        .into_u64_vec()?
+                } else {
+                    let end = tag_reader
+                        .decoder
+                        .reader
+                        .inner()
+                        .seek(io::SeekFrom::End(0))?;
+                    chunk_offsets
+                        .iter()
+                        .map(|&o| end.saturating_sub(o))
+                        .collect()
+                };
                 let rows_per_strip = tag_reader
                     .find_tag(Tag::RowsPerStrip)?
                     .map(Value::into_u32)
@@ -246,8 +311,13 @@ impl Image {
                     ));
                 }
             }
-            (false, false, true, true) => {
+            (false, false, true, true) | (true, true, false, false) => {
                 chunk_type = ChunkType::Tile;
+                let (offsets_tag, bytes_tag) = if tiles_by_strip_tags {
+                    (Tag::StripOffsets, Tag::StripByteCounts)
+                } else {
+                    (Tag::TileOffsets, Tag::TileByteCounts)
+                };
 
                 let tile_width =
                     usize::try_from(tag_reader.require_tag(Tag::TileWidth)?.into_u32()?)?;
@@ -268,11 +338,11 @@ impl Image {
                     tile_length,
                 });
                 chunk_offsets = tag_reader
-                    .find_tag(Tag::TileOffsets)?
+                    .find_tag(offsets_tag)?
                     .unwrap()
                     .into_u64_vec()?;
                 chunk_bytes = tag_reader
-                    .find_tag(Tag::TileByteCounts)?
+                    .find_tag(bytes_tag)?
                     .unwrap()
                     .into_u64_vec()?;
 
@@ -296,6 +366,68 @@ impl Image {
             }
         };
 
+        // exav: the sampling of the chroma, 2 by 2 when the file does not say.
+        let ycbcr_subsampling = if photometric_interpretation == PhotometricInterpretation::YCbCr {
+            match tag_reader
+                .find_tag(Tag::from_u16_exhaustive(530))
+                .ok()
+                .flatten()
+                .and_then(|v| v.into_u16_vec().ok())
+            {
+                Some(v) if v.len() == 2 => (v[0], v[1]),
+                _ => (2, 2),
+            }
+        } else {
+            (1, 1)
+        };
+
+        // exav: the header of an old-style JPEG, made from its tags, in place of
+        // the tables a modern one has (see `ojpeg`).
+        let (mut ojpeg_header_end, mut ojpeg_stream_end) = (0, 0);
+        let jpeg_tables = if super::viewer_codecs() && compression_method == CompressionMethod::JPEG
+        {
+            let mut tag = |n: u16| tag_reader.find_tag(Tag::from_u16_exhaustive(n)).ok().flatten();
+            let tags = super::ojpeg::Tags {
+                interchange: tag(513)
+                    .and_then(|v| v.into_u64().ok())
+                    .zip(tag(514).and_then(|v| v.into_u64().ok())),
+                q: tag(519).and_then(|v| v.into_u64_vec().ok()).unwrap_or_default(),
+                dc: tag(520).and_then(|v| v.into_u64_vec().ok()).unwrap_or_default(),
+                ac: tag(521).and_then(|v| v.into_u64_vec().ok()).unwrap_or_default(),
+                restart: tag(515).and_then(|v| v.into_u16().ok()).unwrap_or(0),
+                subsampling: ycbcr_subsampling,
+            };
+            // The frame is a strip or a tile, whole, whatever the image's own size.
+            let (frame_width, frame_rows) = match &tile_attributes {
+                Some(t) => (t.tile_width as u32, t.tile_length as u32),
+                None => (
+                    width,
+                    match tag_reader.find_tag(Tag::RowsPerStrip)?.map(Value::into_u32) {
+                        Some(Ok(rows)) if rows > 0 => rows.min(height),
+                        _ => height,
+                    },
+                ),
+            };
+            // No tables to make a header of: each strip is a JPEG of its own.
+            Some(Arc::new(
+                super::ojpeg::header(
+                    tag_reader.decoder.reader.inner(),
+                    &tags,
+                    frame_width,
+                    frame_rows,
+                    samples,
+                )
+                .map(|(header, header_end, stream_end)| {
+                    ojpeg_header_end = header_end;
+                    ojpeg_stream_end = stream_end;
+                    header
+                })
+                .unwrap_or_default(),
+            ))
+        } else {
+            jpeg_tables
+        };
+
         Ok(Image {
             ifd: Some(ifd),
             width,
@@ -313,6 +445,9 @@ impl Image {
             tile_attributes,
             chunk_offsets,
             chunk_bytes,
+            ycbcr_subsampling,
+            ojpeg_header_end,
+            ojpeg_stream_end,
         })
     }
 
@@ -336,6 +471,12 @@ impl Image {
             PhotometricInterpretation::CMYK => match self.samples {
                 4 => Ok(ColorType::CMYK(self.bits_per_sample)),
                 5 => Ok(ColorType::CMYKA(self.bits_per_sample)),
+                // exav: Photoshop's spot or alpha channels after the four inks,
+                // for the viewer's reader only (see `with_viewer_codecs`).
+                6..=8 if super::viewer_codecs() => Ok(ColorType::Multiband {
+                    bit_depth: self.bits_per_sample,
+                    num_samples: self.samples,
+                }),
                 _ => Err(TiffError::UnsupportedError(
                     TiffUnsupportedError::InterpretationWithBits(
                         self.photometric_interpretation,
@@ -363,6 +504,30 @@ impl Image {
                         num_samples: self.samples,
                     }),
                 }
+            }
+            // exav: a palette is a colour type, as in later versions of `tiff`.
+            // `tiff_image` refuses it all the same, so what `image` decodes is as before.
+            PhotometricInterpretation::RGBPalette if self.samples == 1 => {
+                Ok(ColorType::Palette(self.bits_per_sample))
+            }
+            // exav: indices and an alpha, for the viewer's reader only (see
+            // `with_viewer_codecs`); what is hashed is refused, as ClamAV's is.
+            PhotometricInterpretation::RGBPalette
+                if self.samples == 2 && super::viewer_codecs() =>
+            {
+                Ok(ColorType::Multiband {
+                    bit_depth: self.bits_per_sample,
+                    num_samples: 2,
+                })
+            }
+            // exav: three bytes of L*a*b*, for the viewer's reader only.
+            PhotometricInterpretation::CIELab
+                if self.samples == 3 && self.bits_per_sample == 8 && super::viewer_codecs() =>
+            {
+                Ok(ColorType::Multiband {
+                    bit_depth: 8,
+                    num_samples: 3,
+                })
             }
             // TODO: this is bad we should not fail at this point
             PhotometricInterpretation::RGBPalette
@@ -392,6 +557,38 @@ impl Image {
             .and_then(NonZeroUsize::new)
     }
 
+    /// JPEG data decoded to the samples it holds, in the colour space it holds
+    /// them.
+    fn decode_jpeg(jpeg_data: Vec<u8>, samples: usize) -> TiffResult<Box<dyn Read>> {
+        use zune_jpeg_04::zune_core;
+
+        let mut decoder = zune_jpeg_04::JpegDecoder::new(jpeg_data);
+        let mut options: zune_core::options::DecoderOptions = Default::default();
+
+        // Disable color conversion by setting the output colorspace to the input
+        // colorspace.
+        decoder.decode_headers()?;
+        if let Some(colorspace) = decoder.get_input_colorspace() {
+            // exav, for the viewer's reader only (see `with_viewer_codecs`):
+            // zune-jpeg 0.4 takes three components with an Adobe marker
+            // for CMYK and then fails to read them, so the file's own
+            // count wins.
+            let colorspace =
+                if super::viewer_codecs() && samples == 3 && colorspace.num_components() == 4 {
+                    zune_core::colorspace::ColorSpace::RGB
+                } else {
+                    colorspace
+                };
+            options = options.jpeg_set_out_colorspace(colorspace);
+        }
+
+        decoder.set_options(options);
+
+        let data = decoder.decode()?;
+
+        Ok(Box::new(Cursor::new(data)))
+    }
+
     fn create_reader<'r, R: 'r + Read>(
         reader: R,
         compression_method: CompressionMethod,
@@ -399,6 +596,10 @@ impl Image {
         // FIXME: these should be `expect` attributes or we choose another way of passing them.
         #[cfg_attr(not(true), allow(unused_variables))] jpeg_tables: Option<&[u8]>,
         #[cfg_attr(not(true), allow(unused_variables))] dimensions: (u32, u32),
+        // exav: the samples to a pixel of the chunk.
+        samples: usize,
+        // exav: the bytes of an old-style JPEG strip that are its stream's header.
+        ojpeg_skip: u64,
     ) -> TiffResult<Box<dyn Read + 'r>> {
         Ok(match compression_method {
             CompressionMethod::None => Box::new(reader),
@@ -407,12 +608,36 @@ impl Image {
                 reader,
                 usize::try_from(compressed_length)?,
             )),
-            #[cfg(false)]
-            CompressionMethod::ZSTD => Box::new(zstd::Decoder::new(reader)?),
+            // exav: through ruzstd, and only for the viewer's reader.
+            CompressionMethod::ZSTD if super::viewer_codecs() => Box::new(
+                ruzstd::decoding::StreamingDecoder::new(reader.take(compressed_length))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+            ),
+            // exav: the viewer's reader only.
+            CompressionMethod::LZMA if super::viewer_codecs() => {
+                let window = u64::from(dimensions.0) * u64::from(dimensions.1) * samples as u64 * 2;
+                super::stream::xz_lzma2(
+                    reader.take(compressed_length),
+                    window.clamp(4096, 64 << 20) as u32,
+                )?
+            }
+            CompressionMethod::ThunderScan if super::viewer_codecs() => {
+                let mut data = Vec::new();
+                reader.take(compressed_length).read_to_end(&mut data)?;
+                Box::new(Cursor::new(super::stream::thunder_scan(
+                    &data,
+                    dimensions.0 as usize,
+                    dimensions.1 as usize,
+                )))
+            }
             CompressionMethod::PackBits => Box::new(PackBitsReader::new(reader, compressed_length)),
             #[cfg(true)]
             CompressionMethod::Deflate | CompressionMethod::OldDeflate => {
-                Box::new(super::stream::DeflateReader::new(reader))
+                if super::viewer_codecs() {
+                    super::stream::lenient_zlib(reader)?
+                } else {
+                    Box::new(super::stream::DeflateReader::new(reader))
+                }
             }
             #[cfg(true)]
             CompressionMethod::ModernJPEG => {
@@ -450,21 +675,20 @@ impl Image {
                 let mut jpeg_data = Vec::new();
                 jpeg_reader.read_to_end(&mut jpeg_data)?;
 
-                let mut decoder = zune_jpeg_04::JpegDecoder::new(jpeg_data);
-                let mut options: zune_core::options::DecoderOptions = Default::default();
-
-                // Disable color conversion by setting the output colorspace to the input
-                // colorspace.
-                decoder.decode_headers()?;
-                if let Some(colorspace) = decoder.get_input_colorspace() {
-                    options = options.jpeg_set_out_colorspace(colorspace);
-                }
-
-                decoder.set_options(options);
-
-                let data = decoder.decode()?;
-
-                Box::new(Cursor::new(data))
+                Self::decode_jpeg(jpeg_data, samples)?
+            }
+            // exav: old-style JPEG, for the viewer's reader only: the header was
+            // made from the tags (`ojpeg`), and each strip is a JPEG with it.
+            CompressionMethod::JPEG if super::viewer_codecs() && jpeg_tables.is_some() => {
+                let mut strip = Vec::new();
+                reader.take(compressed_length).read_to_end(&mut strip)?;
+                let jpeg = super::ojpeg::strip_jpeg(
+                    jpeg_tables.unwrap_or_default(),
+                    strip,
+                    dimensions.1,
+                    ojpeg_skip,
+                );
+                Self::decode_jpeg(jpeg, samples)?
             }
             #[cfg(true)]
             CompressionMethod::Fax4 => Box::new(super::stream::Group4Reader::new(
@@ -593,11 +817,13 @@ impl Image {
             | ColorType::CMYKA(n)
             | ColorType::YCbCr(n)
             | ColorType::Gray(n)
+            | ColorType::Palette(n)
             | ColorType::Multiband {
                 bit_depth: n,
                 num_samples: _,
             } if n == 8 || n == 16 || n == 32 || n == 64 => {}
             ColorType::Gray(n)
+            | ColorType::Palette(n)
             | ColorType::Multiband {
                 bit_depth: n,
                 num_samples: _,
@@ -614,12 +840,21 @@ impl Image {
                     ));
                 }
             },
+            // exav: grey of 9 to 15 bits, the bits packed one after another (12 is
+            // the usual), read as they lie for the viewer's reader only (see
+            // `with_viewer_codecs`); `tiff_view` unpacks them.
+            ColorType::Gray(n)
+                if super::viewer_codecs()
+                    && (9..=15).contains(&n)
+                    && self.predictor == Predictor::None
+                    && self.sample_format == SampleFormat::Uint => {}
             type_ => {
                 return Err(TiffError::UnsupportedError(
                     TiffUnsupportedError::UnsupportedColorType(type_),
                 ));
             }
         }
+        let packed = super::viewer_codecs() && matches!(color_type, ColorType::Gray(9..=15));
 
         // Validate that the predictor is supported for the sample type.
         match (self.predictor, self.sample_format) {
@@ -673,13 +908,50 @@ impl Image {
         assert!(output_row_stride >= data_row_bytes);
         assert!(buf.len() >= output_row_stride * (data_dims.1 as usize - 1) + data_row_bytes);
 
+        let offset = self.chunk_offsets[chunk_index as usize];
+        // exav: a strip of old-style JPEG that lies in the JPEG stream the file
+        // points to runs to the end of that stream, as libtiff reads it,
+        // whatever its byte count says.
+        let compressed_bytes = if self.ojpeg_header_end > 0 && offset < self.ojpeg_stream_end {
+            (*compressed_bytes).max(self.ojpeg_stream_end - offset)
+        } else {
+            *compressed_bytes
+        };
         let mut reader = Self::create_reader(
             reader,
             compression_method,
-            *compressed_bytes,
+            compressed_bytes,
             self.jpeg_tables.as_deref().map(|a| &**a),
             chunk_dims,
+            samples,
+            self.ojpeg_header_end.saturating_sub(offset),
         )?;
+        // exav: for the viewer's reader, chroma sampled less than luma is
+        // stored in units (see `YcbcrUnits`) and drawn here as one value for
+        // each pixel. JPEG data is decoded to pixels by its own decoder.
+        let (h, v) = self.ycbcr_subsampling;
+        if super::viewer_codecs()
+            && photometric_interpretation == PhotometricInterpretation::YCbCr
+            && (h, v) != (1, 1)
+            && matches!((h, v), (1 | 2 | 4, 1 | 2 | 4))
+            && samples == 3
+            && self.bits_per_sample == 8
+            && !matches!(
+                compression_method,
+                CompressionMethod::ModernJPEG | CompressionMethod::JPEG
+            )
+        {
+            if chunk_row_bytes > limits.decoding_buffer_size {
+                return Err(TiffError::LimitsExceeded);
+            }
+            reader = Box::new(super::stream::YcbcrUnits::new(
+                reader,
+                chunk_dims.0 as usize,
+                data_dims.1 as usize,
+                usize::from(h),
+                usize::from(v),
+            ));
+        }
 
         if output_row_stride == chunk_row_bytes {
             let tile = &mut buf[..chunk_row_bytes * data_dims.1 as usize];
@@ -688,13 +960,14 @@ impl Image {
             for row in tile.chunks_mut(chunk_row_bytes) {
                 super::fix_endianness_and_predict(
                     row,
-                    color_type.bit_depth(),
+                    // exav: packed samples have no byte order.
+                    if packed { 8 } else { color_type.bit_depth() },
                     samples,
                     byte_order,
                     predictor,
                 );
             }
-            if photometric_interpretation == PhotometricInterpretation::WhiteIsZero {
+            if photometric_interpretation == PhotometricInterpretation::WhiteIsZero && !packed {
                 super::invert_colors(tile, color_type, self.sample_format)?;
             }
         } else if chunk_row_bytes > data_row_bytes && self.predictor == Predictor::FloatingPoint {
@@ -733,12 +1006,12 @@ impl Image {
 
                 super::fix_endianness_and_predict(
                     row,
-                    color_type.bit_depth(),
+                    if packed { 8 } else { color_type.bit_depth() },
                     samples,
                     byte_order,
                     predictor,
                 );
-                if photometric_interpretation == PhotometricInterpretation::WhiteIsZero {
+                if photometric_interpretation == PhotometricInterpretation::WhiteIsZero && !packed {
                     super::invert_colors(row, color_type, self.sample_format)?;
                 }
             }

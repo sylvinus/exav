@@ -103,10 +103,37 @@ fn clip_last_segment(data: &[u8]) -> Option<Vec<u8>> {
 /// The pixels of the bitmaps the region segments of `segments` declare
 /// (T.88 7.4.1: text, halftone, generic and refinement regions), which
 /// hayro-jbig2 decodes at their declared size, up to 65,535 by 65,535,
-/// wherever they lie on the page. `random_access`: every header comes
+/// wherever they lie on the page. A symbol dictionary that declares more
+/// new symbols than its length can hold counts as `u64::MAX`: the decoder
+/// goes on decoding symbols from what is left of the stream, and 243 bytes
+/// took it two minutes and 7 GB. `random_access`: every header comes
 /// first, up to an end of file segment, then every data part (Annex D.2);
 /// otherwise each header is followed by its data.
 pub(crate) fn region_pixels(segments: &[u8], random_access: bool) -> u64 {
+    // T.88 7.4.2.1: flags, the adaptive template pixels (none for Huffman
+    // coding), the refinement ones, then the numbers of exported and new
+    // symbols. A real symbol takes more than a byte of the stream.
+    let too_many_symbols = |data_at: usize, length: u32| {
+        let be = |at: usize, n: usize| {
+            let b = segments.get(at..at.checked_add(n)?)?;
+            Some(b.iter().fold(0u64, |v, &x| v << 8 | u64::from(x)))
+        };
+        let Some(flags) = be(data_at, 2) else {
+            return false;
+        };
+        let (huffman, aggregate) = (flags & 1 != 0, flags & 2 != 0);
+        let template = flags >> 10 & 3;
+        let refinement_template = flags >> 12 & 1;
+        let mut at = data_at + 2;
+        if !huffman {
+            at += if template == 0 { 8 } else { 2 };
+        }
+        if aggregate && refinement_template == 0 {
+            at += 4;
+        }
+        be(at + 4, 4)
+            .is_some_and(|new| new > u64::from(length).saturating_mul(8).saturating_add(64))
+    };
     let size = |data_at: usize| {
         let be32 = |at: usize| {
             Some(u64::from(u32::from_be_bytes(
@@ -137,6 +164,8 @@ pub(crate) fn region_pixels(segments: &[u8], random_access: bool) -> u64 {
         }
         if is_region(flags) {
             total = total.saturating_add(size(h).unwrap_or(0));
+        } else if flags & 0x3F == 0 && too_many_symbols(h, length) {
+            return u64::MAX;
         }
         match h.checked_add(length as usize) {
             Some(end) if length != u32::MAX => at = end,
@@ -146,6 +175,8 @@ pub(crate) fn region_pixels(segments: &[u8], random_access: bool) -> u64 {
     for (flags, length) in headers {
         if is_region(flags) {
             total = total.saturating_add(size(at).unwrap_or(0));
+        } else if flags & 0x3F == 0 && too_many_symbols(at, length) {
+            return u64::MAX;
         }
         match at.checked_add(length as usize) {
             Some(end) if length != u32::MAX => at = end,

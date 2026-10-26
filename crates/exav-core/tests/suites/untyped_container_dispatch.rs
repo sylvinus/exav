@@ -48,6 +48,21 @@ fn a_unix_compress_stream_is_decompressed_and_scanned() {
 }
 
 #[test]
+#[cfg(feature = "lzma")]
+fn an_lzma_alone_stream_is_decompressed_and_scanned() {
+    // `xz --format=lzma`: no magic number, found by the header's own rules.
+    assert_found("eicar.txt.lzma");
+}
+
+#[test]
+#[cfg(feature = "rpm")]
+fn an_rpm_payload_is_decompressed_and_scanned() {
+    // A package whose gzip cpio payload holds the EICAR file (`make.py` in
+    // exav-unpack's rpm fixtures).
+    assert_found("eicar.rpm");
+}
+
+#[test]
 #[cfg(feature = "diskimage")]
 fn a_compressed_qcow2_is_reconstructed_and_scanned() {
     // `qemu-img convert -c` — every cluster deflated.

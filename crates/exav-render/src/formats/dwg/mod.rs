@@ -151,6 +151,31 @@ impl Document {
         &self.doc
     }
 
+    /// The files the drawing's external references name and that are not
+    /// bound yet, as the drawing wrote them. A bound drawing may name more.
+    pub fn xref_paths(&self) -> Vec<String> {
+        self.doc.unresolved_xrefs()
+    }
+
+    /// [`xref_paths`](Self::xref_paths) as a JSON array of strings.
+    pub fn xref_paths_json(&self) -> String {
+        let items: Vec<String> = self.xref_paths().iter().map(|p| json_string(p)).collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// Bind the drawing in `bytes`, the file `path` names, into the
+    /// references to it. Returns how many it filled, which is none for a path
+    /// no reference names or once the entity limit is reached.
+    pub fn attach_xref(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        limits: &crate::cad::Limits,
+    ) -> Result<usize, ParseError> {
+        let xref = Self::parse_with(bytes, limits)?;
+        Ok(self.doc.attach_xref(path, &xref.doc))
+    }
+
     /// The drawing's tabs, model space first.
     pub fn layouts(&self) -> Vec<LayoutInfo> {
         Tessellator::new(&self.doc).layouts()

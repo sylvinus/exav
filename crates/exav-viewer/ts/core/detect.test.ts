@@ -94,13 +94,14 @@ describe("what the viewer can show", () => {
       "lib.jar", "site.war", "app.apk", "split.apks", "store.xapk", "bundle.aab", "app.ipa", "ext.xpi", "pkg.whl", "pkg.nupkg", "ext.vsix", "map.kmz",
       "app.appx", "app.appxbundle", "app.msix", "app.msixbundle", "sd-card.img",
       "comic.cbz", "comic.cbr", "comic.cb7", "comic.cbt",
+      "big.7z.001", "docs.ZIP.001", "set.rar.001", "set.tar.001", "span.z01",
     ];
     for (const path of named) {
       expect(kind({ path }), path).toBe("archive");
       expect(kind({ type: "application/octet-stream", path }), path).toBe("archive");
     }
     const typed = [
-      "application/zstd", "application/x-lz4", "application/x-lzip", "application/x-compress", "application/vnd.ms-cab-compressed",
+      "application/zstd", "application/x-lz4", "application/x-lzip", "application/x-lzma", "application/x-rpm", "application/x-compress", "application/vnd.ms-cab-compressed",
       "application/x-iso9660-image", "application/x-lzh-compressed", "application/x-arj", "application/x-archive",
       "application/vnd.debian.binary-package", "application/x-cpio", "application/x-xar", "application/x-apple-diskimage",
       "application/x-ms-wim", "application/vnd.ms-tnef", "application/java-archive", "application/vnd.android.package-archive",
@@ -387,6 +388,7 @@ describe("what the first bytes say", () => {
       ["application/zstd", bytes([0x28, 0xb5, 0x2f, 0xfd, 0x24])],
       ["application/x-lz4", bytes([0x04, 0x22, 0x4d, 0x18, 0x64])],
       ["application/x-lzip", bytes("LZIP", [1, 12])],
+      ["application/x-rpm", bytes([0xed, 0xab, 0xee, 0xdb, 3, 0])],
       ["application/x-compress", bytes([0x1f, 0x9d, 0x90])],
       ["application/x-tar", at(257, "ustar", [0], "00")],
       ["application/vnd.ms-cab-compressed", bytes("MSCF", [0, 0, 0, 0, 0x10])],

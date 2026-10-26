@@ -1410,8 +1410,9 @@ pub struct Image {
     /// Group 71: 1 rectangular, 2 polygonal.
     pub clip_type: i16,
     pub clip_vertices: Vec<Vec2>,
-    /// Group 290: true keeps the inside of the boundary.
-    pub clip_inside: bool,
+    /// Group 290: false keeps the inside of the boundary, true the outside.
+    /// Vertices are in pixels from the image's top left, y down.
+    pub clip_inverted: bool,
 }
 
 impl Default for Image {
@@ -1431,7 +1432,7 @@ impl Default for Image {
             reactor: Handle::NULL,
             clip_type: 1,
             clip_vertices: Vec::new(),
-            clip_inside: false,
+            clip_inverted: false,
         }
     }
 }

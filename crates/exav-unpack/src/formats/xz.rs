@@ -118,7 +118,9 @@ pub(crate) fn content_reader(
 
 /// Every stream of an `.xz` input read from `input`, decoded as it is read.
 pub(crate) struct XzReader<R> {
-    input: R,
+    /// The input, with a check the decoder does not read taken out
+    /// ([`super::xz_nocheck`]).
+    input: super::xz_nocheck::NoCheck<R>,
     inbuf: Vec<u8>,
     in_pos: usize,
     in_len: usize,
@@ -138,7 +140,7 @@ pub(crate) struct XzReader<R> {
 impl<R: std::io::Read> XzReader<R> {
     pub(crate) fn new(input: R) -> Self {
         XzReader {
-            input,
+            input: super::xz_nocheck::NoCheck::new(input),
             inbuf: vec![0; 8192],
             in_pos: 0,
             in_len: 0,

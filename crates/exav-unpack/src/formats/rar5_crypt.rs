@@ -6,7 +6,7 @@
 //! key that tweaks the member's checksum, and the password check, the last
 //! folded to 8 bytes by XOR.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use hmac::{Hmac, KeyInit, Mac};
@@ -147,23 +147,9 @@ pub(crate) fn find_keys(
 /// HMACs: 128 derivations at the count RAR writes (15), or one at 22. A
 /// header asking for 2^24 took 2.6 s a scan, and a member with a larger count
 /// than this is reported as encrypted, like one no password opens.
-const MAX_KDF_ROUNDS: u64 = 1 << 22;
+const MAX_KDF_ROUNDS: u64 = crate::kdf::PBKDF2_MAX_ROUNDS;
 
-/// Adds `rounds` to `spent` unless that passes `max`; a refused derivation
-/// is not charged, so one member asking for too much leaves the rest of the
-/// scan its share.
-fn charge(spent: &AtomicU64, rounds: u64, max: u64) -> bool {
-    let mut now = spent.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = now.checked_add(rounds).filter(|&t| t <= max) else {
-            return false;
-        };
-        match spent.compare_exchange_weak(now, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return true,
-            Err(seen) => now = seen,
-        }
-    }
-}
+use crate::kdf::charge;
 
 /// `spent` counts the iterations derived so far in the scan, `cache` only the
 /// ones of this archive.

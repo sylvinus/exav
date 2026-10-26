@@ -263,6 +263,139 @@ fn an_attribute_list_that_reads_short_is_reported_not_half_used() {
     );
 }
 
+/// A volume of 512-byte clusters and 1 MiB records (the format's largest)
+/// whose record 16 is a file with a non-resident `$ATTRIBUTE_LIST` of `entries`
+/// entries of type `kind`, all naming record 2 (a valid file of 1 MiB). 39 MB,
+/// made in memory; the list is the one bytes a reviewer's generator wrote
+/// (`entries * 26` of them).
+fn volume_with_a_list(entries: usize, kind: u32) -> Vec<u8> {
+    const CLUSTER: usize = 512;
+    const REC: usize = 1 << 20;
+    const USA: usize = 0x30;
+    let attr_off = (USA + 2 * (REC / CLUSTER + 1) + 7) & !7;
+    let list_len = entries * 26;
+    let (list_at, mft_at, rec2_data, rec16_data) = (60_000usize, 5usize, 70_000usize, 71_000usize);
+    let mft_bytes = 17 * 1024 * 1024;
+    let mut vol = vec![0u8; (72_000 + 4096) * CLUSTER];
+    vol[..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    vol[3..11].copy_from_slice(b"NTFS    ");
+    vol[11..13].copy_from_slice(&512u16.to_le_bytes());
+    vol[13] = 1;
+    vol[0x30..0x38].copy_from_slice(&(mft_at as u64).to_le_bytes());
+    vol[0x40] = 0xEC;
+    vol[510..512].copy_from_slice(&[0x55, 0xAA]);
+
+    for k in 0..entries {
+        let at = list_at * CLUSTER + k * 26;
+        vol[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        vol[at + 4..at + 6].copy_from_slice(&26u16.to_le_bytes());
+        vol[at + 8..at + 16].copy_from_slice(&(k as u64).to_le_bytes());
+        vol[at + 16..at + 24].copy_from_slice(&2u64.to_le_bytes());
+    }
+
+    let run = |lcn: usize, clusters: usize| {
+        let mut r = vec![0x33];
+        r.extend_from_slice(&clusters.to_le_bytes()[..3]);
+        r.extend_from_slice(&lcn.to_le_bytes()[..3]);
+        r.push(0);
+        r
+    };
+    // A non-resident attribute at `off` of the record; its length.
+    let attribute = |rec: &mut Vec<u8>, off: usize, ty: u32, size: usize, runs: &[u8]| {
+        let len = 64 + runs.len();
+        rec[off..off + 4].copy_from_slice(&ty.to_le_bytes());
+        rec[off + 4..off + 6].copy_from_slice(&(len as u16).to_le_bytes());
+        rec[off + 8] = 1;
+        rec[off + 0x18..off + 0x20].copy_from_slice(&(size.div_ceil(CLUSTER) as u64).to_le_bytes());
+        rec[off + 0x20..off + 0x22].copy_from_slice(&64u16.to_le_bytes());
+        rec[off + 0x28..off + 0x30].copy_from_slice(&(size as u64).to_le_bytes());
+        rec[off + 0x30..off + 0x38].copy_from_slice(&(size as u64).to_le_bytes());
+        rec[off + 0x38..off + 0x40].copy_from_slice(&(size as u64).to_le_bytes());
+        rec[off + 64..off + len].copy_from_slice(runs);
+        len
+    };
+    let mut record = |n: usize, attrs: &[(u32, usize, Vec<u8>)]| {
+        let mut r = vec![0u8; REC];
+        r[..4].copy_from_slice(b"FILE");
+        r[0x14..0x16].copy_from_slice(&(attr_off as u16).to_le_bytes());
+        r[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        r[0x18..0x1C].copy_from_slice(&(REC as u32).to_le_bytes());
+        r[0x1C..0x20].copy_from_slice(&(REC as u32).to_le_bytes());
+        let mut off = attr_off;
+        for (ty, size, runs) in attrs {
+            off += attribute(&mut r, off, *ty, *size, runs);
+        }
+        // The update sequence: its number at the start, and at the end of
+        // each sector (the values they replace are zeros here).
+        let count = REC / CLUSTER + 1;
+        r[4..6].copy_from_slice(&(USA as u16).to_le_bytes());
+        r[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+        r[USA..USA + 2].copy_from_slice(&[0xAA, 0xBB]);
+        for i in 1..count {
+            r[i * CLUSTER - 2..i * CLUSTER].copy_from_slice(&[0xAA, 0xBB]);
+        }
+        let at = mft_at * CLUSTER + n * REC;
+        vol[at..at + REC].copy_from_slice(&r);
+    };
+    record(0, &[(0x80, mft_bytes, run(mft_at, mft_bytes / CLUSTER))]);
+    record(2, &[(0x80, 1 << 20, run(rec2_data, 2048))]);
+    record(
+        16,
+        &[
+            (0x80, 1 << 15, run(rec16_data, 64)),
+            (0x20, list_len, run(list_at, list_len.div_ceil(CLUSTER))),
+        ],
+    );
+    vol
+}
+
+/// One record named by tens of thousands of list entries was read, and its
+/// fix-ups applied, once for each: 40,000 entries took 2 s, 160,000 took 8 s
+/// in a release build, and a 256 MiB list (the most a volume may give) about
+/// 13 minutes. Read once, it costs what one read does.
+#[test]
+fn a_record_named_by_a_list_thousands_of_times_is_read_once() {
+    for kind in [0x30, 0x80] {
+        let start = std::time::Instant::now();
+        let e = members(&volume_with_a_list(40_000, kind));
+        assert!(
+            e.iter()
+                .any(|x| x.name.starts_with("<mft-record-") && x.unsupported.is_none()),
+            "kind {kind:#x}: {:?}",
+            e.iter()
+                .map(|x| (&x.name, x.unsupported))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "kind {kind:#x}: {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+/// A list that names more extents than a file has is not followed, and the file
+/// is reported as not read whole, never passed off as its first extent.
+#[test]
+fn a_list_naming_more_extents_than_exav_follows_is_reported() {
+    let start = std::time::Instant::now();
+    let e = members(&volume_with_a_list(70_000, 0x80));
+    let file = e
+        .iter()
+        .find(|x| x.name.starts_with("<mft-record-"))
+        .unwrap();
+    assert!(
+        file.unsupported.is_some_and(|r| r.contains("more extents")),
+        "{:?}",
+        file.unsupported
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn the_payload_is_absent_from_the_raw_volume() {
     // Guards the premise: if EICAR were visible in the sectors, a raw scan would

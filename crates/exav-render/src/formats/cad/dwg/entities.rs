@@ -1624,7 +1624,7 @@ fn image(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<Image> {
         ..Image::default()
     };
     if v >= Version::R2010 {
-        i.clip_inside = b.b()?;
+        i.clip_inverted = b.b()?;
     }
     i.clip_type = b.bs()?;
     if i.clip_type == 1 {

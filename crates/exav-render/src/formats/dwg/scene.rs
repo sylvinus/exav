@@ -121,6 +121,33 @@ impl Affine {
         }
     }
 
+    /// A text plane in world coordinates, as an MTEXT has it: its X axis (a
+    /// vector, not necessarily unit) and its normal. The Y axis is the normal
+    /// crossed with X, so a normal of -Z mirrors the text. The map takes the
+    /// text's own (along, up) to the plan view, with `origin` as its corner.
+    /// `None` when the axes are not a plane.
+    pub fn from_plane(x_axis: [f64; 3], normal: [f64; 3], origin: [f64; 2]) -> Option<Affine> {
+        let unit = |v: [f64; 3]| {
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            (l.is_finite() && l > 1e-12).then(|| v.map(|c| c / l))
+        };
+        let x = unit(x_axis)?;
+        let n = unit(normal)?;
+        let y = unit([
+            n[1] * x[2] - n[2] * x[1],
+            n[2] * x[0] - n[0] * x[2],
+            n[0] * x[1] - n[1] * x[0],
+        ])?;
+        Some(Affine {
+            a: x[0],
+            b: x[1],
+            c: y[0],
+            d: y[1],
+            e: origin[0],
+            f: origin[1],
+        })
+    }
+
     /// Mean absolute scale, used to keep lineweight sane through scaled blocks.
     pub fn scale_magnitude(&self) -> f64 {
         let sx = (self.a * self.a + self.b * self.b).sqrt();

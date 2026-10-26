@@ -120,6 +120,7 @@ interface ViewerFile<Meta = unknown> {
   size?: number;
   source: FileSource | null;
   placeholder?: { state: "pending" | "unavailable"; label?: string };
+  tree?: FileTree;       // the files around this one
   format?: FormatId;     // skips detection
   meta?: Meta;           // the host's own data, for options resolved per file
 }
@@ -142,6 +143,40 @@ A `ranges` source is read as pdf.js and the ZIP reader ask for it (a PDF's
 pages on screen, an archive's directory and the members opened), and whole,
 4 MiB at a time, by the other engines. The sandboxed frame reads files this
 way, over its port.
+
+### The files around a file
+
+```ts
+interface FileTree {
+  path: string;                       // this file's, "/" separated from the root of the tree
+  paths: readonly string[];           // every file of the tree, this one included
+  open(path: string, signal: AbortSignal): Promise<FileSource>;
+}
+```
+
+A format that points at other files finds them in the tree instead of asking
+the user for each: a folder the user opened, the files dropped together, the
+members of an archive. The demo gives every file of a drop or of a folder a
+tree of the others, and an archive gives each member a tree of the other
+members. What uses it today:
+
+- **Drawings.** A DWG or DXF's external references are looked for by the path
+  the drawing wrote (`.\Plans\title.dwg`, `C:\Projects\title.dwg`, a bare
+  name): beside the file, then by the end of the path, down to the name alone,
+  the nearest winning; case and accents' form are not told apart. A reference
+  found is bound in before the drawing is drawn, and the references it makes
+  are looked for in turn (at most 64 files, eight deep). One not found is drawn
+  as its path and counted in the warnings, as before.
+- **glTF.** The files its buffers name (`"uri": "scene.bin"`, or percent-encoded
+  `my%20scene.bin`) are read from the tree the same way. Textures are not read.
+- **Split archives.** A part of a split archive, with the rest in the same
+  folder of the tree, opens as the one archive: `big.7z.001` with `.002`...,
+  `x.part1.rar` or `x.rar` with `x.r00`..., `x.z01` with `x.zip`. A set with a
+  part missing is not joined.
+
+`resolveInTree(tree, reference, extensions?)` is the lookup, for a plugin of
+your own. In the sandboxed frame, `open` is answered by the host over the
+port, for the paths it listed ([security](/viewer/security/#the-messages)).
 
 A type of `""`, `application/octet-stream` or `binary/octet-stream` is
 unknown, and the extension decides. A container type yields to the

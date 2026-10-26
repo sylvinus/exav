@@ -1,10 +1,11 @@
 //! Stanford PLY into a [`Scene`] of one element, ASCII or binary in either
 //! byte order.
 //!
-//! Read: the `vertex` element's `x y z`, `nx ny nz` and colours (`red green
-//! blue`, or `r g b`; alpha is ignored), and the `face` element's list of
-//! vertex indices (`vertex_indices` or `vertex_index`) of any count and
-//! index type, triangulated as [`Soup`] does. Every other element and
+//! Read: the `vertex` element's `x y z` (`z` is 0 when absent), `nx ny nz`
+//! and colours (`red green blue`, or `r g b`; alpha is ignored), and the
+//! `face` element's list of vertex indices (`vertex_indices` or
+//! `vertex_index`) of any count and index type, triangulated as [`Soup`]
+//! does. Every other element and
 //! property is skipped by its declared type. A byte colour is used as is; a
 //! 16-bit one is scaled down; a float one is taken as 0..1.
 //!
@@ -137,6 +138,11 @@ fn header(bytes: &[u8]) -> Result<Header, Error> {
             return Err(Error::NotPly);
         }
         let text = std::str::from_utf8(line).map_err(|_| Error::NotPly)?;
+        // The `{ ... }` remarks of the format's own example are not words.
+        let text = match (text.find('{'), text.rfind('}')) {
+            (Some(a), Some(b)) if a < b => format!("{} {}", &text[..a], &text[b + 1..]),
+            _ => text.to_string(),
+        };
         let words: Vec<&str> = text.split_ascii_whitespace().collect();
         match words.as_slice() {
             ["ply"] | ["comment", ..] | ["obj_info", ..] | [] => {}
@@ -191,6 +197,9 @@ fn header(bytes: &[u8]) -> Result<Header, Error> {
                     body: at,
                 });
             }
+            // A line of text of a writer's own: Blender 2.4 wrote one, and
+            // some converters leave no space after `comment`.
+            [first, ..] if !matches!(*first, "format" | "element" | "property" | "end_header") => {}
             _ => return Err(Error::Invalid("header line")),
         }
     }
@@ -201,9 +210,23 @@ struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
     format: Format,
+    /// An ASCII record is a line: values past what the header declares, up to
+    /// the end of the line, are left out.
+    by_line: bool,
 }
 
 impl Cursor<'_> {
+    /// The end of a record.
+    fn end_record(&mut self) {
+        if self.by_line && self.format == Format::Ascii {
+            let rest = &self.data[self.pos..];
+            self.pos += rest
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(rest.len(), |n| n + 1);
+        }
+    }
+
     fn scalar(&mut self, ty: Ty) -> Option<f64> {
         if self.format == Format::Ascii {
             let rest = &self.data[self.pos..];
@@ -288,6 +311,7 @@ fn record(
             }
         }
     }
+    cur.end_record();
     true
 }
 
@@ -309,12 +333,40 @@ fn records(cur: &Cursor, el: &Element) -> (usize, bool) {
 
 /// Reads at most `max_triangles`; past them the rest is left out and
 /// `warnings.truncated` is 1.
+///
+/// An ASCII file is a stream of values, and a record can run over lines. A
+/// file that reads as damaged or with faces past the vertices may instead have
+/// lines with more values than its header declares (a writer's extra
+/// columns); it is read again a line to a record, and that is kept if it is
+/// the better reading.
 pub fn read(bytes: &[u8], max_triangles: usize) -> Result<Scene, Error> {
+    let first = read_records(bytes, max_triangles, false);
+    let dirty = match &first {
+        Ok(scene) => scene.warnings.damaged || scene.warnings.invalid > 0,
+        Err(error) => matches!(error, Error::Invalid(_)),
+    };
+    if dirty && header(bytes).is_ok_and(|h| h.format == Format::Ascii) {
+        if let Ok(lines) = read_records(bytes, max_triangles, true) {
+            let clean = !lines.warnings.damaged && lines.warnings.invalid == 0;
+            let better = match &first {
+                Err(_) => true,
+                Ok(f) => clean || lines.triangles() > f.triangles(),
+            };
+            if better {
+                return Ok(lines);
+            }
+        }
+    }
+    first
+}
+
+fn read_records(bytes: &[u8], max_triangles: usize, by_line: bool) -> Result<Scene, Error> {
     let head = header(bytes)?;
     let mut cur = Cursor {
         data: bytes,
         pos: head.body,
         format: head.format,
+        by_line,
     };
     let mut damaged = false;
     let mut vertices: Option<Vertices> = None;
@@ -334,6 +386,8 @@ pub fn read(bytes: &[u8], max_triangles: usize) -> Result<Scene, Error> {
                 damaged |= v.short;
                 vertices = Some(v);
             }
+            // An empty list of faces may come first.
+            "face" if vertices.is_none() && count == 0 => {}
             "face" => {
                 let Some(v) = &vertices else {
                     return Err(Error::Invalid("faces before vertices"));
@@ -386,8 +440,9 @@ fn vertex_data(cur: &mut Cursor, el: &Element, count: usize) -> Result<Vertices,
             .iter()
             .position(|p| p.count.is_none() && names.contains(&p.name.as_str()))
     };
-    let (Some(x), Some(y), Some(z)) = (find(&["x"]), find(&["y"]), find(&["z"])) else {
-        return Err(Error::Invalid("vertices without x, y and z"));
+    // A flat drawing has no z.
+    let (Some(x), Some(y), z) = (find(&["x"]), find(&["y"]), find(&["z"])) else {
+        return Err(Error::Invalid("vertices without x and y"));
     };
     let normal = match (find(&["nx"]), find(&["ny"]), find(&["nz"])) {
         (Some(a), Some(b), Some(c)) => Some([a, b, c]),
@@ -417,8 +472,11 @@ fn vertex_data(cur: &mut Cursor, el: &Element, count: usize) -> Result<Vertices,
             break;
         }
         // `as f32` makes infinity of what is too large: dropped later.
-        out.positions
-            .push([values[x] as f32, values[y] as f32, values[z] as f32]);
+        out.positions.push([
+            values[x] as f32,
+            values[y] as f32,
+            z.map_or(0.0, |z| values[z] as f32),
+        ]);
         if let (Some([a, b, c]), Some(n)) = (normal, out.normals.as_mut()) {
             n.push([values[a] as f32, values[b] as f32, values[c] as f32]);
         }

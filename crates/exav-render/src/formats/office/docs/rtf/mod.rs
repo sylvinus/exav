@@ -282,10 +282,20 @@ impl Parser<'_> {
 
     fn run(&mut self) -> Result<()> {
         let max = self.b.limits.max_part;
+        // The outermost group has been closed: a file with a `}` too many
+        // (html2rtf writes them) goes on, as unrtf reads it, in a group of its
+        // own.
+        let mut closed = false;
         while let Some(t) = self.lex.next_tok() {
             self.tokens += 1;
             if self.tokens > 200_000_000 {
                 return Err(Error::TooLarge("tokens"));
+            }
+            if closed && !matches!(t, Tok::Close) {
+                closed = false;
+                if matches!(t, Tok::Open | Tok::Word(..) | Tok::Text(_)) {
+                    self.stack.push(St::new(self.default_cp));
+                }
             }
             match t {
                 Tok::Open => {
@@ -309,9 +319,7 @@ impl Parser<'_> {
                         continue;
                     }
                     self.close_group()?;
-                    if self.stack.is_empty() {
-                        break;
-                    }
+                    closed = self.stack.is_empty();
                 }
                 Tok::Word(w, n) => {
                     if self.stack.is_empty() {

@@ -22,12 +22,15 @@ codecs, encryption, limits.
 |---|---|---|---|---|
 | ZIP | `.zip` | Opened, members scanned | Streamed | `archive` |
 | Packages that are ZIP files (JAR, APK, IPA, wheel, NuGet, VSIX, MSIX...) | `.jar` `.war` `.ear` `.apk` `.apks` `.xapk` `.aab` `.ipa` `.xpi` `.whl` `.nupkg` `.vsix` `.kmz` `.appx` `.appxbundle` `.msix` `.msixbundle` | Opened, members scanned | Streamed | `archive` |
+| First part of a split archive (.7z.001, .zip.001, .rar.001, .tar.001, .z01) | `.7z.001` `.zip.001` `.rar.001` `.tar.001` `.z01` | Opened, members scanned | Streamed | `archive` |
 | Comic book archives (CBZ, CBR, CB7, CBT) | `.cbz` `.cbr` `.cb7` `.cbt` | Opened, members scanned | Streamed | `archive` |
 | gzip | `.gz` `.tgz` | Opened, members scanned | Streamed | `archive` |
 | bzip2 | `.bz2` `.tbz` `.tbz2` | Opened, members scanned | Streamed | `archive` |
 | xz | `.xz` `.txz` | Opened, members scanned | Streamed | `archive` |
 | Zstandard | `.zst` `.tzst` | Opened, members scanned | Streamed | `archive` |
 | LZ4 | `.lz4` | Opened, members scanned | Streamed | `archive` |
+| LZMA (.lzma) | `.lzma` | Opened, members scanned | Streamed | `archive` |
+| RPM package | `.rpm` | Opened, members scanned | Streamed | `archive` |
 | lzip | `.lz` `.tlz` | Opened, members scanned | Streamed | `archive` |
 | Unix compress (.Z) | `.z` `.taz` | Opened, members scanned | Streamed | `archive` |
 | tar | `.tar` | Opened, members scanned | Streamed | `archive` |
@@ -130,7 +133,8 @@ codecs, encryption, limits.
 | PNG, JPEG, GIF, WebP and SVG | `.png` `.jpg` `.jpeg` `.webp` `.gif` `.svg` | Typed, signatures applied | No | `image` |
 | TIFF | `.tif` `.tiff` | Typed, signatures applied | No | `image` |
 | BMP | `.bmp` | Typed, signatures applied | No | `image` |
-| ICO, PNM, QOI, DDS, farbfeld, Radiance HDR | `.ico` `.pbm` `.pgm` `.ppm` `.pnm` `.pam` `.qoi` `.dds` `.ff` `.hdr` | Typed, signatures applied | No | `image` |
+| ICO, PNM, QOI, DDS, farbfeld, Radiance HDR | `.ico` `.cur` `.pbm` `.pgm` `.ppm` `.pnm` `.pam` `.qoi` `.dds` `.ff` `.hdr` | Typed, signatures applied | No | `image` |
+| Targa (TGA) | `.tga` `.icb` | Bytes only | No | `image` |
 | JPEG 2000 | `.jp2` `.jpf` `.jpx` `.j2k` `.j2c` | Typed, signatures applied | No | `image` |
 | JBIG2 | `.jb2` `.jbig2` | Typed, signatures applied | No | `image` |
 | JPEG XL | `.jxl` | Typed, signatures applied | No | `image` |

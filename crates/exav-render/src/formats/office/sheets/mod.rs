@@ -4,11 +4,13 @@
 //! read as text ([`text()`]) for a scanner or a search.
 
 mod charts;
-mod css;
+// The HTML tokenizer, its style sheets and the CSS values are the docs
+// converter's too (Word's HTML pages).
+pub(crate) mod css;
 mod error;
 mod fonts;
 mod geom;
-mod html;
+pub(crate) mod html;
 mod limits;
 mod model;
 mod numbers;
@@ -17,7 +19,7 @@ mod ods;
 mod r1c1;
 mod sylk;
 mod text;
-mod textenc;
+pub(crate) mod textenc;
 mod xls;
 mod xlsx;
 mod xmlss;

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 
-import { BUILTIN_ORDER, type Session, type ViewerFile } from "@exav/viewer";
+import { BUILTIN_ORDER, type FileTree, type Session, type ViewerFile } from "@exav/viewer";
 import { allPlugins } from "@exav/viewer/all";
 import {
   coreldraw,
@@ -33,6 +33,57 @@ type Locale = "en" | "fr";
 /** A file in the list, shown by its name. */
 type Item = ViewerFile;
 
+/** A file chosen or dropped, and where it is in the folder it came from. */
+interface Picked {
+  file: File;
+  path: string;
+}
+
+const picked = (files: FileList | File[]): Picked[] => Array.from(files).map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+
+/**
+ * What a drop holds, folders walked: the files by their path from the
+ * dropped folder's parent. `entries` are read before the first await, which
+ * is when the browser lets them be.
+ */
+async function dropped(data: DataTransfer): Promise<Picked[]> {
+  const entries = Array.from(data.items ?? [])
+    .map((i) => i.webkitGetAsEntry?.())
+    .filter((e): e is FileSystemEntry => !!e);
+  if (!entries.length) return picked(data.files);
+  const out: Picked[] = [];
+  const walk = async (entry: FileSystemEntry): Promise<void> => {
+    if (entry.isFile) {
+      const file = await new Promise<File>((resolve, reject) => (entry as FileSystemFileEntry).file(resolve, reject));
+      out.push({ file, path: entry.fullPath.replace(/^\//, "") });
+    } else if (entry.isDirectory) {
+      const reader = (entry as FileSystemDirectoryEntry).createReader();
+      // A directory is read in batches until one is empty.
+      for (;;) {
+        const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => reader.readEntries(resolve, reject));
+        if (!batch.length) break;
+        for (const e of batch) await walk(e);
+      }
+    }
+  };
+  for (const e of entries) await walk(e);
+  return out;
+}
+
+/** The files of a batch, each seen as one of them: a drawing finds the files it refers to among the others. */
+function around(batch: Picked[], at: Picked): FileTree | undefined {
+  if (batch.length < 2) return undefined;
+  return {
+    path: at.path,
+    paths: batch.map((b) => b.path),
+    open: async (path) => {
+      const hit = batch.find((b) => b.path === path);
+      if (!hit) throw new Error(`no ${path} in the folder`);
+      return { blob: hit.file };
+    },
+  };
+}
+
 /** A sample or an example in the sidebar: its section, and who made it, under what licence. */
 interface Listed {
   group: string;
@@ -45,7 +96,8 @@ const TEXT = {
     tagline: "Files viewed in the browser. Nothing you open here leaves your device.",
     yours: "Your files",
     open: "Open one of your files",
-    drop: "Drop files to view them",
+    folder: "Open a folder",
+    drop: "Drop files or a folder to view them",
     docs: "Documentation",
     licences: "Licences",
     upload: "Drop files here, or click to choose",
@@ -55,7 +107,8 @@ const TEXT = {
     tagline: "Des fichiers affichés dans le navigateur. Rien de ce que vous ouvrez ici ne quitte votre appareil.",
     yours: "Vos fichiers",
     open: "Ouvrir un de vos fichiers",
-    drop: "Déposez des fichiers pour les afficher",
+    folder: "Ouvrir un dossier",
+    drop: "Déposez des fichiers ou un dossier pour les afficher",
     docs: "Documentation",
     licences: "Licences",
     upload: "Déposez des fichiers ici, ou cliquez pour les choisir",
@@ -160,6 +213,7 @@ export function App() {
   // The session of the file on screen, for the host's controls beside its name.
   const [session, setSession] = useState<Session | null>(null);
   const input = useRef<HTMLInputElement>(null);
+  const folder = useRef<HTMLInputElement>(null);
   const counter = useRef(0);
   const t = TEXT[locale];
 
@@ -213,17 +267,18 @@ export function App() {
   }, [locale]);
 
   const add = useCallback(
-    (files: FileList | File[]) => {
-      const picked = Array.from(files);
-      if (!picked.length) return;
+    (batch: Picked[]) => {
+      if (!batch.length) return;
       // A file given again under the name of one already listed is the same
       // document with other bytes: it replaces it in place, and the viewer
       // keeps the zoom and scroll position where it can.
       const next = [...own];
       const added: Item[] = [];
       const shown: string[] = [];
-      for (const f of picked) {
-        const fields = { name: f.name, type: f.type, size: f.size, source: { blob: f } };
+      for (const p of batch) {
+        const f = p.file;
+        const tree = around(batch, p);
+        const fields = { name: f.name, type: f.type, size: f.size, source: { blob: f }, ...(tree && { tree }) };
         const same = next.findIndex((i) => i.name === f.name);
         if (same >= 0) {
           next[same] = { ...next[same]!, ...fields };
@@ -243,7 +298,7 @@ export function App() {
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     setDragging(false);
-    add(e.dataTransfer.files);
+    void dropped(e.dataTransfer).then(add);
   };
 
   const entry = (item: Item, note?: string) => (
@@ -294,7 +349,21 @@ export function App() {
             hidden
             data-testid="file-input"
             onChange={(e) => {
-              if (e.target.files) add(e.target.files);
+              if (e.target.files) add(picked(e.target.files));
+              e.target.value = "";
+            }}
+          />
+          <button type="button" className="demo-open" onClick={() => folder.current?.click()}>
+            {t.folder}
+          </button>
+          <input
+            ref={folder}
+            type="file"
+            {...{ webkitdirectory: "" }}
+            hidden
+            data-testid="folder-input"
+            onChange={(e) => {
+              if (e.target.files) add(picked(e.target.files));
               e.target.value = "";
             }}
           />
