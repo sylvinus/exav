@@ -1,6 +1,6 @@
 {
   "name": "@exav/viewer",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "description": "An embeddable file viewer for the browser: PDF, images (TIFF, BMP and more through memory-safe WebAssembly), DWG and DXF drawings, Word, Excel, PowerPoint, CSV, text, Markdown, JSON and XML, IFC, STL, OBJ, PLY and glTF models, video, audio, and what is inside an archive. Each format's engine loads only when a file of that format is opened.",
   "license": "MIT",
@@ -127,7 +127,7 @@
     "prepublishOnly": "node scripts/check-package.mjs"
   },
   "peerDependencies": {
-    "@exav/unpack-wasm": ">=0.0.2",
+    "@exav/unpack-wasm": ">=0.0.3",
     "@silurus/ooxml": ">=0.87.0 <1",
     "pdfjs-dist": ">=5.0.0 <7",
     "react": "^19.0.0",

@@ -16,14 +16,14 @@ name = "exav-grep"
 path = "src/main.rs"
 
 [dependencies]
-exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["all-formats"] }
+exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, features = ["all-formats"] }
 memchr = "2"
 regex = "1"
 clap = { workspace = true }
 walkdir = { workspace = true }
 # The text of a document as a reader sees it (`text` feature): exav-render's
 # `text`: Markdown, HTML, Office and OpenDocument XML parts, PDF and drawings.
-exav-render = { path = "../exav-render", version = "0.0.2", default-features = false, features = ["text"], optional = true }
+exav-render = { path = "../exav-render", version = "0.0.3", default-features = false, features = ["text"], optional = true }
 
 [features]
 default = ["decrypt", "text"]

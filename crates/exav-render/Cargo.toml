@@ -64,7 +64,7 @@ zenjxl-decoder = { version = "=0.3.10", default-features = false, optional = tru
 # DXF's pairs, records and code pages, and DWG's bit codes, sections and
 # objects, which the drawing model (`cad`) is read from; those formats
 # alone, none of the scanner's others.
-exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["dxf", "dwg"], optional = true }
+exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, features = ["dxf", "dwg"], optional = true }
 # Markdown: CommonMark with tables and strikethrough, read as events. Without
 # its `html` and `simd` features: no markup is made, and its only `unsafe`
 # (the SIMD scanners) is off.

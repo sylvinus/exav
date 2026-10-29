@@ -232,7 +232,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "exav-render"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "exav-unpack"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "encoding_rs",
  "flate2",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "exav-viewer"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "exav-render",
  "wasm-bindgen",

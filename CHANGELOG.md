@@ -6,6 +6,8 @@ follow [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-10-29
+
 ### Added
 
 - **`--listen-health ADDR`: a listener that answers while the workers are busy.**

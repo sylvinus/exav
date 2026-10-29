@@ -11,10 +11,10 @@ so is the DWG reader it vendors.
 
 ```toml
 [dependencies]
-exav-render = "0.0.2"                                            # images
-exav-render = { version = "0.0.2", features = ["dwg"] }           # and drawings
-exav-render = { version = "0.0.2", features = ["ifc", "stl"] }    # and models
-exav-render = { version = "0.0.2", features = ["office"] }        # and office documents
+exav-render = "0.0.3"                                            # images
+exav-render = { version = "0.0.3", features = ["dwg"] }           # and drawings
+exav-render = { version = "0.0.3", features = ["ifc", "stl"] }    # and models
+exav-render = { version = "0.0.3", features = ["office"] }        # and office documents
 ```
 
 ## Images

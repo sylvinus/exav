@@ -154,10 +154,10 @@ dwg = ["exav-core/dwg"]
 pe-emu = ["exav-core/pe-emu"]
 
 [dependencies]
-exav-core = { path = "../exav-core", version = "0.0.2", default-features = false }
+exav-core = { path = "../exav-core", version = "0.0.3", default-features = false }
 # Standalone signature updater (its own TLS stack), enabled by the `http`
 # feature so the default pure-Rust build never links it.
-exav-update = { path = "../exav-update", version = "0.0.2", optional = true }
+exav-update = { path = "../exav-update", version = "0.0.3", optional = true }
 clap.workspace = true
 walkdir.workspace = true
 libc = "0.2.191"

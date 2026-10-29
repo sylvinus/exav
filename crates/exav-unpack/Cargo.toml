@@ -41,7 +41,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # it is useful on its own and because it is the only thing that needs a CPU
 # decoder: keeping it out of here means a build without `pepack` never compiles
 # `exav-x86` at all.
-exav-pe-emu = { version = "0.0.2", path = "../exav-pe-emu", optional = true }
+exav-pe-emu = { version = "0.0.3", path = "../exav-pe-emu", optional = true }
 
 # --- Per-format optional deps. Each is pulled in only by the feature(s) below
 # that need it; a dep shared by several formats (e.g. `flate2`) is compiled if

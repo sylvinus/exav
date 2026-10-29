@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 use crate::*;
 use mail_parser::{Message, MessageParser, MessagePart, MimeHeaders, PartType};
+use std::collections::HashSet;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::ops::Deref;
 
@@ -91,11 +92,25 @@ fn boundaries(msg: &Message<'_>) -> Vec<String> {
 /// that its writer never closed, has its last part dropped by the parser, and
 /// a mail reader shows that part. Inner multiparts are closed first.
 fn missing_closings(msg: &Message<'_>, data: &[u8]) -> Vec<u8> {
+    let boundaries = boundaries(msg);
+    // One pass over the lines for all of them: a search for each boundary in
+    // turn reads the whole message once per multipart.
+    let wanted: HashSet<&[u8]> = boundaries.iter().map(String::as_bytes).collect();
+    let mut closed: HashSet<&[u8]> = HashSet::new();
+    for line in data.split(|&c| c == b'\n') {
+        if let Some(b) = line
+            .trim_ascii_end()
+            .strip_prefix(b"--")
+            .and_then(|l| l.strip_suffix(b"--"))
+            && wanted.contains(b)
+        {
+            closed.insert(b);
+        }
+    }
     let mut out = Vec::new();
-    for b in boundaries(msg).iter().rev() {
-        let closing = format!("--{b}--");
-        if memchr::memmem::find(data, closing.as_bytes()).is_none() {
-            out.extend_from_slice(format!("\r\n{closing}\r\n").as_bytes());
+    for b in boundaries.iter().rev() {
+        if !closed.contains(b.as_bytes()) {
+            out.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
         }
     }
     out

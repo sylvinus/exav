@@ -38,24 +38,24 @@ goblin = { version = "0.10", default-features = false, features = ["std", "elf32
 # x86 instruction decoder for the bytecode disasm_x86 API. Decode-only, in the
 # workspace, and dependency-free: a general-purpose decoder covers the whole ISA
 # at the cost of hundreds of `unsafe` blocks, which is a poor trade for one API.
-exav-x86 = { path = "../exav-x86", version = "0.0.2" }
+exav-x86 = { path = "../exav-x86", version = "0.0.3" }
 # archive/container extraction (its own crate). Formats are selected via this
 # crate's forwarding features (see `[features]`); `default-features = false` so a
 # lean build can pick only the formats it needs.
 # gzip+tar are not optional: a `.cvd` is a gzip'd tar, a `.cld` a raw one, so
 # loading any signature database needs both.
-exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["gzip", "tar"] }
+exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, features = ["gzip", "tar"] }
 # fuzzy hashing
 tlsh2 = { version = "1", features = ["diff"] }
 # The `fuzzy_img#` image hash, ClamAV's to the bit (`image-hash` feature). Its
 # formats past the five clamscan treats as graphics, JPEG 2000 and JBIG2
 # included, are hashed except under `--clamav-compat`.
-exav-imagehash = { path = "../exav-imagehash", version = "0.0.2", default-features = false, features = ["webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2"], optional = true }
+exav-imagehash = { path = "../exav-imagehash", version = "0.0.3", default-features = false, features = ["webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2"], optional = true }
 # The text of a document as a reader sees it (`visible-text` feature):
 # exav-render's `text`: Markdown (pulldown-cmark without its `html` and `simd`
 # features), HTML (html5gum's tokenizer), Office and OpenDocument XML parts,
 # PDF (hayro) and drawings.
-exav-render = { path = "../exav-render", version = "0.0.2", default-features = false, features = ["text"], optional = true }
+exav-render = { path = "../exav-render", version = "0.0.3", default-features = false, features = ["text"], optional = true }
 # HTTP(S) range-request backend (optional)
 ureq = { version = "3", optional = true }
 # Anchor-frequency counting at database build: tens of millions of u64 gram

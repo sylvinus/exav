@@ -140,3 +140,31 @@ fn a_file_uuencoded_into_the_text_is_read() {
     assert_hidden_from_a_byte_search(&msg);
     assert!(has_payload(&entries(&msg)));
 }
+
+/// Each multipart has its own boundary, so a search of the message for each
+/// closing delimiter reads all of it once per multipart.
+#[test]
+fn messages_nested_deep_with_boundaries_of_their_own_are_read_in_linear_time() {
+    let depth = 40_000;
+    let mut msg = Vec::new();
+    for i in 0..depth {
+        msg.extend_from_slice(
+            format!(
+                "Content-Type: multipart/mixed; boundary=\"b{i}\"\r\n\r\n--b{i}\r\n\
+                 Content-Type: message/rfc822\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    for i in (0..depth).rev() {
+        msg.extend_from_slice(format!("\r\n--b{i}--\r\n").as_bytes());
+    }
+    let start = std::time::Instant::now();
+    let mut budget = Budget::new(Limits::default());
+    let _ = extract(Format::Email, &msg, &mut budget);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+}

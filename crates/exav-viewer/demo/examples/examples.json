@@ -3506,8 +3506,8 @@
       "attribution": "",
       "fetched": "https://www.innerscene.com/api/library/hospital-ward-wing-1200-square-metres-plan-and-section-73a3f4dd/download",
       "committed": false,
-      "bytes": 307408,
-      "sha256": "4fabf62d6d7bbc7c8bdc5f3c9d292d4980c3ec504281b0bd77f487d3c6bb9ba3"
+      "bytes": 307641,
+      "sha256": "3042880c63b7d093f287528bc723298879ffe7c9cf7b47cd8de0d81045867b69"
     },
     {
       "file": "grocery-store-plan-section.dxf",
@@ -3523,8 +3523,8 @@
       "attribution": "",
       "fetched": "https://www.innerscene.com/api/library/grocery-store-600-square-metres-plan-and-section-2a67d041/download",
       "committed": false,
-      "bytes": 130840,
-      "sha256": "0b875304e1769e0f7c9377abf270f1fb4d103547cc27a3795a57c34fb4619d30"
+      "bytes": 131073,
+      "sha256": "b3d430fa6b47801e99cda102cd2a56c342fdc55f776d57e1e4b28fc59c2ec1bb"
     },
     {
       "file": "ezdxf-uncommon-entities.dxf",

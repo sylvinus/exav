@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "exav-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64",
  "bit-set",
@@ -653,7 +653,7 @@ version = "0.0.0"
 
 [[package]]
 name = "exav-imagehash"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "exav-render",
  "image",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "exav-pe-emu"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "exav-x86",
  "rustc-hash 2.1.3",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "exav-render"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "exav-unpack"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aes",
  "base64",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "exav-x86"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "fastrand"

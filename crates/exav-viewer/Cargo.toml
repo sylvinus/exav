@@ -2,7 +2,7 @@
 # target directory), so values are explicit.
 [package]
 name = "exav-viewer"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
@@ -39,7 +39,7 @@ pdf-jpx = ["exav-render/jp2"]
 pdf-jbig2 = ["exav-render/jbig2", "exav-render/ccitt"]
 
 [dependencies]
-exav-render = { path = "../exav-render", version = "0.0.2", default-features = false }
+exav-render = { path = "../exav-render", version = "0.0.3", default-features = false }
 wasm-bindgen = "=0.2.129"
 
 # zenjxl-decoder reads `std::time::Instant` for every frame, which panics on

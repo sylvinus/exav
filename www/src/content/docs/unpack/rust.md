@@ -124,7 +124,7 @@ Every format is a Cargo feature, so you build only what you use:
 
 ```toml
 # a ZIP-only extractor
-exav-unpack = { version = "0.0.2", default-features = false, features = ["zip"] }
+exav-unpack = { version = "0.0.3", default-features = false, features = ["zip"] }
 ```
 
 The defaults are `all-formats`, `decrypt` and `cli`.
