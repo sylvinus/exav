@@ -31,8 +31,8 @@ scanner, the extractor and the viewer do with each format side by side.
 | ARJ · LHA | classic archivers |
 | ALZ · EGG | ESTsoft's Korean archivers: ALZ stored, deflate and bzip2 members; EGG stored, deflate, bzip2, LZMA and AZO members (a block failing its CRC after a full decode is still returned, as in ZIP) |
 | InstallShield `.z` | the older installer archive (PKWARE DCL implode) |
-| ISO · UDF | CD/DVD/Blu-ray images: the ISO 9660 tree (with Joliet) and the UDF tree, including UDF-only images with no ISO 9660 descriptor. A bridge image carrying both is walked once per file |
-| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix and package archives |
+| ISO · UDF | CD/DVD/Blu-ray images: the ISO 9660 tree (with Joliet) and the UDF tree, including UDF-only images with no ISO 9660 descriptor. A bridge image carrying both is walked once per file (a file is its first sector and its length) |
+| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix and package archives. A cpio is read to the end of the file, every archive of an initramfs in turn, and bytes that are not a header are scanned as they lie |
 | DMG | Apple UDIF, including [encrypted](#encryption-support), with HFS+/APFS extraction; recognised by its trailer when its data opens with a bzip2 or xz run |
 | FAT12/16/32 | files inside a disk image, with their paths, reassembled from the cluster chain, so a fragmented file comes back whole |
 | exFAT | files inside a disk image or a memory card's, with their paths, reassembled from the cluster chain (or the run a file with no chain is in). What is past a file's valid length reads as zeros |

@@ -121,7 +121,7 @@ a third-party decoder, or a loop that produces no output.
 
 | Flag | Bounds | Default | Where it applies |
 |---|---|---|---|
-| `--max-scan-secs SECS` | Wall clock, and CPU time in the pool | 120 in the pool, unset otherwise | Per job in the clamd worker pool; the whole run in a one-shot scan. Refused on any other listener (`--workers threads`, ICAP alone). |
+| `--max-scan-secs SECS` | Wall clock, and CPU time in the pool | 120 in the pool, unset otherwise | Per job in the clamd worker pool; the whole run in a one-shot scan, which the limit ends where it is, the files after it unscanned, with the exit status of what was found by then (`1` for a detection, `2` for an error) and otherwise the one `--partial-as` gives a `LIMITS-EXCEEDED` (`3`). Refused on any other listener (`--workers threads`, ICAP alone). |
 | `--max-process-bytes SIZE` | Address space (`RLIMIT_AS`) | 2G in the pool, unset otherwise | Per clamd worker in the pool; the whole process in a one-shot scan or any other listener. |
 
 ICAP scans get no `--max-scan-secs` in any mode. Under the pool the ICAP

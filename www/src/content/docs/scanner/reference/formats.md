@@ -29,10 +29,10 @@ rules. On top of that:
 | Mach-O | A universal binary is split per architecture; each is scanned as it is, and a UPX-packed one unpacked | `Target:9`, with section offsets (`EP` does not resolve, as in clamscan) |
 | OLE2 (legacy Office, MSI) | Every stream; VBA macros decompressed, Excel 4.0 (XLM) macros, `Ole10Native` payloads; encrypted Excel decrypted | `Target:2` |
 | OOXML (`.docx`, `.xlsx`, `.pptx`) | Opened as the ZIP it is; told apart as Word, Excel or PowerPoint for `Container:`; encrypted documents decrypted | as for its members |
-| PDF | Streams decoded through their filters (Flate, LZW, ASCII85, ASCIIHex, RunLength), JavaScript and URI and launch targets collected, the document decrypted. Image streams (DCT, JBIG2, JPX, CCITT) are matched as stored | `Target:10` |
+| PDF | Streams decoded through their filters (Flate, LZW, ASCII85, ASCIIHex, RunLength; a filter given as a reference is followed, and the identity `/Crypt` is passed over), JavaScript and URI and launch targets collected, the document decrypted. Image streams (DCT, JBIG2, JPX, CCITT) are matched as stored; a stream with any other filter is reported. The header may follow up to a kilobyte of other bytes, and an object that does not end does not hide the ones after it | `Target:10` |
 | HTML | A normalised view (entities decoded, lowercased, whitespace collapsed) and, for script, a normalised and a deobfuscated JavaScript view; inline base64 assets extracted | `Target:3`, on the normalised view |
 | RTF | Both an HTML and a text view; embedded objects extracted | `Target:3` and `Target:7` |
-| Email (MIME), MHTML | Every part decoded and scanned; a MIME document with no mail envelope is a saved web page (MHTML) | `Target:4`, on the raw message |
+| Email (MIME), MHTML | Every part decoded and scanned, the last part of a multipart nothing closed included, a base64 part read as far as it decodes, and a file uuencoded into a text part; a message is known by its header block (any first field, in any case), and a MIME document with no mail envelope is a saved web page (MHTML) | `Target:4`, on the raw message |
 | Text, scripts | A normalised text view, and JavaScript views when the content looks like script; Script Encoder (`#@~^`) decoded; base64-encoded executables decoded ([below](#found-inside-other-files)) | `Target:7`, on the normalised view |
 | Images | PNG, GIF, JPEG, TIFF, BMP; with the `image-hash` feature (on by default) also WebP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000 and JBIG2. Each is hashed as ClamAV's `sigtool --fuzzy-img` hashes it | `Target:5`; `fuzzy_img#` |
 | SWF | Compressed movies (`CWS`, `ZWS`) decompressed and rescanned | `Target:11` |
@@ -106,10 +106,15 @@ them in every object:
   own type: up to 16 images of each kind and 32 archives per object. An
   object holding more is reported `LIMITS-EXCEEDED` unless something is
   found, and the other members of its container are still scanned.
-- **Base64.** A base64-encoded executable in a text file (a PE in a PowerShell
-  one-liner) is decoded and scanned, and so are the `data:` URIs and base64
-  assets of HTML and flat-XML Office documents. `--no-decode base64` turns it
-  off (see [Detection](/scanner/reference/cli/#detection)).
+- **Base64.** A base64-encoded executable or archive (ZIP, gzip, 7z, RAR, xz)
+  in a text file (a PE in a PowerShell one-liner, a ZIP in an `atob` string) is
+  decoded and scanned, and so are the `data:` URIs and base64 assets of HTML
+  and flat-XML Office documents. A text file is one with a stretch that is
+  mostly text, sampled from its start to its end. Up to 8 executables or
+  archives, from 64 runs that start like one, are decoded in a text file, and 16
+  assets in a page; a file with more is reported `LIMITS-EXCEEDED` unless
+  something is found. `--no-decode base64` turns it off (see
+  [Detection](/scanner/reference/cli/#detection)).
 
 ### Packed executables
 

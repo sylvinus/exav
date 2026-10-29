@@ -143,6 +143,17 @@ pub fn overlapping_local_records(_data: &dyn ByteSource) -> usize {
 #[cfg(feature = "zip")]
 pub use formats::zip::directory_is_consistent as zip_directory_is_consistent;
 
+/// Where a ZIP appended to another file begins, by its end record at the end of
+/// the file.
+#[cfg(feature = "zip")]
+pub use formats::zip::appended_start as appended_zip_start;
+
+/// Without the `zip` feature no ZIP is found.
+#[cfg(not(feature = "zip"))]
+pub fn appended_zip_start(_src: &dyn ByteSource) -> Option<u64> {
+    None
+}
+
 /// Without the `zip` feature no ZIP is ever confirmed.
 #[cfg(not(feature = "zip"))]
 pub fn zip_directory_is_consistent(_data: &[u8]) -> bool {
@@ -1025,14 +1036,65 @@ fn is_bzip2_magic(data: &[u8]) -> bool {
             || data[4..10] == [0x17, 0x72, 0x45, 0x38, 0x50, 0x90])
 }
 
+/// A second format the object also is, when its first bytes were claimed by
+/// `first`, for the formats that leave their own start free: an ISO 9660 image
+/// keeps its first 32 KiB for the system area, and an ext volume its first
+/// kilobyte for boot code, so either can start with an archive's magic and be
+/// mounted all the same.
+pub fn also_reads_as(src: &dyn ByteSource, first: Format) -> Option<Format> {
+    #[cfg(feature = "iso")]
+    if first != Format::Iso && src.window(32769, 5).starts_with(b"CD001") {
+        return Some(Format::Iso);
+    }
+    #[cfg(feature = "ext")]
+    if first != Format::Ext && formats::ext::is_volume(src) {
+        return Some(Format::Ext);
+    }
+    let _ = (src, first);
+    None
+}
+
+/// Whether `data` is a PDF: `%PDF-` and a version digit within its first
+/// kilobyte, which is where Acrobat, qpdf, pdfium and pdf.js look. A file with a
+/// newline, a byte-order mark or a mail's leftover headers before it is a PDF
+/// to every one of them, and offsets in the file count from the header.
+fn pdf_header_near_start(data: &[u8]) -> bool {
+    // At the start the magic alone has always been enough.
+    if data.starts_with(b"%PDF-") {
+        return true;
+    }
+    let head = &data[..data.len().min(1024)];
+    memchr::memmem::find_iter(head, b"%PDF-")
+        .any(|at| head.get(at + 5).is_some_and(u8::is_ascii_digit))
+}
+
 /// Whether `data` begins with a real CAB (Microsoft Cabinet) header: `MSCF`
 /// followed by the `reserved1` field, which the MS-CAB spec fixes at zero in
 /// every genuine cabinet. The bare 4-byte `MSCF` magic collides with binary data
 /// (e.g. inside an ISO), and a false hit routed to the cabinet parser fails deep
 /// in string parsing and reports the object `LIMITS-EXCEEDED`; requiring the zero
 /// `reserved1` rejects those without dropping any real cabinet.
+///
+/// Readers do not check `reserved1` (`cabextract` opens a cabinet whose field is
+/// anything), so a cabinet is also recognised by what follows it: a size, the
+/// offset of the first file entry inside it, and version 1.3, none of which a
+/// chance `MSCF` has.
 fn is_cab_magic(data: &[u8]) -> bool {
-    data.len() >= 8 && data.starts_with(b"MSCF") && data[4..8] == [0, 0, 0, 0]
+    if !data.starts_with(b"MSCF") || data.len() < 8 {
+        return false;
+    }
+    if data[4..8] == [0, 0, 0, 0] {
+        return true;
+    }
+    let u32_at = |o: usize| {
+        data.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let (Some(size), Some(files)) = (u32_at(8), u32_at(16)) else {
+        return false;
+    };
+    // `versionMinor`, `versionMajor`.
+    data.get(24..26) == Some(&[3, 1]) && size >= 36 && (36..=size).contains(&files)
 }
 
 /// Whether `data` begins with an ARJ main header: `60 EA`, a size of at most
@@ -1078,6 +1140,30 @@ fn starts_executable_magic(d: &[u8]) -> bool {
         || d.starts_with(&[0xd0, 0xcf, 0x11, 0xe0])
 }
 
+/// Whether `d` starts with the magic of an archive a script or page may carry
+/// in base64 (HTML smuggling puts a ZIP in a `data:` URI or an `atob` string):
+/// the magics long enough not to turn up by chance, and ZIP's and gzip's, which
+/// [`is_archive_payload`] confirms from what follows.
+#[cfg(feature = "base64scan")]
+fn starts_archive_magic(d: &[u8]) -> bool {
+    d.starts_with(b"PK\x03\x04")
+        || is_gzip_magic(d)
+        || d.starts_with(b"7z\xBC\xAF\x27\x1C")
+        || d.starts_with(b"Rar!\x1a\x07")
+        || d.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00])
+}
+
+/// Whether a fully-decoded blob is an archive worth scanning as one: a magic of
+/// [`starts_archive_magic`], and for a ZIP a directory that holds together, so
+/// four bytes of coincidence are not enough.
+#[cfg(feature = "base64scan")]
+fn is_archive_payload(d: &[u8]) -> bool {
+    if d.len() < 22 || !starts_archive_magic(d) {
+        return false;
+    }
+    !d.starts_with(b"PK\x03\x04") || zip_directory_is_consistent(d)
+}
+
 /// Whether a fully-decoded blob is a real, re-scannable executable: one of
 /// [`starts_executable_magic`] and, for a PE, with a *valid* PE header at
 /// `e_lfanew` (rejecting a bare `MZ`). See [`base64_payloads`].
@@ -1111,6 +1197,13 @@ fn is_executable_payload(d: &[u8]) -> bool {
 /// nothing more. Bounded by `cap` per payload and by a cap on how many return.
 #[cfg(feature = "base64scan")]
 pub fn markup_embedded_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> {
+    markup_embedded_payloads_capped(src, cap).0
+}
+
+/// [`markup_embedded_payloads`], and whether it stopped at the number it
+/// returns with another run behind them that it would have decoded.
+#[cfg(feature = "base64scan")]
+pub fn markup_embedded_payloads_capped(src: &dyn ByteSource, cap: u64) -> (Vec<Vec<u8>>, bool) {
     match src.as_slice() {
         Some(data) => markup_payloads_on(&mut Indexed(data), cap),
         None => markup_payloads_on(&mut Stepper::new(src), cap),
@@ -1118,7 +1211,7 @@ pub fn markup_embedded_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> 
 }
 
 #[cfg(feature = "base64scan")]
-fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
+fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> (Vec<Vec<u8>>, bool) {
     use base64::Engine;
     /// Shortest base64 run worth decoding; below this it cannot be an asset.
     const MIN_RUN: usize = 64;
@@ -1128,9 +1221,10 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
     let plain = base64::engine::general_purpose::STANDARD_NO_PAD;
     let is_b64 = |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'/';
     let mut out = Vec::new();
+    let mut capped = false;
     let mut i = 0usize;
     let n = data.len();
-    while i < n && out.len() < MAX_PAYLOADS {
+    while i < n {
         if !is_b64(data.at(i)) {
             i += 1;
             continue;
@@ -1151,8 +1245,14 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         // Cheap gate first: 8 base64 chars decode to 6 bytes, enough for every
         // magic we care about, and costs no allocation on a miss.
         match plain.decode(data.range(start, start + 8)) {
-            Ok(head) if starts_asset_magic(&head) => {}
+            Ok(head) if starts_asset_magic(&head) || starts_archive_magic(&head) => {}
             _ => continue,
+        }
+        // Another run worth decoding, with the number returned already at its
+        // limit: the rest of the document is not read.
+        if out.len() >= MAX_PAYLOADS {
+            capped = true;
+            break;
         }
         // Absorb the padding the run scan stopped at, so a well-formed URI
         // decodes whole. Without it the tail falls off the last 4-char group and
@@ -1176,11 +1276,12 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         if let Ok(dec) = decoded
             && !dec.is_empty()
             && dec.len() as u64 <= cap
+            && (!starts_archive_magic(&dec) || is_archive_payload(&dec))
         {
             out.push(dec);
         }
     }
-    out
+    (out, capped)
 }
 
 /// Magics of things worth pulling out of a document: raster images (what
@@ -1211,6 +1312,13 @@ fn starts_asset_magic(d: &[u8]) -> bool {
 /// `cap` (per-payload size), `MAX_PAYLOADS`, and `MAX_ATTEMPTS` (decode tries).
 #[cfg(feature = "base64scan")]
 pub fn base64_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> {
+    base64_payloads_capped(src, cap).0
+}
+
+/// [`base64_payloads`], and whether it stopped at its limits with another run
+/// behind them that it would have decoded.
+#[cfg(feature = "base64scan")]
+pub fn base64_payloads_capped(src: &dyn ByteSource, cap: u64) -> (Vec<Vec<u8>>, bool) {
     match src.as_slice() {
         Some(data) => base64_payloads_on(&mut Indexed(data), cap),
         None => base64_payloads_on(&mut Stepper::new(src), cap),
@@ -1218,7 +1326,7 @@ pub fn base64_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> {
 }
 
 #[cfg(feature = "base64scan")]
-fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
+fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> (Vec<Vec<u8>>, bool) {
     use base64::Engine;
     // A base64-encoded PE is at minimum a few hundred bytes; require a run that
     // decodes to ≥ ~1 KB so we never trial-decode short incidental runs.
@@ -1230,10 +1338,11 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
     let engine = base64::engine::general_purpose::STANDARD_NO_PAD;
 
     let mut out = Vec::new();
+    let mut capped = false;
     let mut attempts = 0;
     let n = data.len();
     let mut i = 0;
-    while i < n && out.len() < MAX_PAYLOADS && attempts < MAX_ATTEMPTS {
+    while i < n {
         if !is_b64(data.at(i)) {
             i += 1;
             continue;
@@ -1268,8 +1377,14 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         // NOT executables (RTF `\objdata` hex, benign base64 text) cost nothing
         // beyond the byte count above: no full decode, no payload allocation.
         match engine.decode(head) {
-            Ok(prefix) if starts_executable_magic(&prefix) => {}
+            Ok(prefix) if starts_executable_magic(&prefix) || starts_archive_magic(&prefix) => {}
             _ => continue,
+        }
+        // Another run worth decoding, with the limits already reached: the
+        // rest of the text is not read.
+        if out.len() >= MAX_PAYLOADS || attempts >= MAX_ATTEMPTS {
+            capped = true;
+            break;
         }
         attempts += 1;
         // Whole 4-char groups decode to exactly 3 bytes each, so a run too
@@ -1298,12 +1413,12 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         }
         if let Ok(dec) = engine.decode(&run)
             && dec.len() as u64 <= cap
-            && is_executable_payload(&dec)
+            && (is_executable_payload(&dec) || is_archive_payload(&dec))
         {
             out.push(dec);
         }
     }
-    out
+    (out, capped)
 }
 
 /// What [`detect`] reads of an object: its start (all of it when it is held in
@@ -1571,7 +1686,7 @@ fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> O
     // read `DETECT_HEAD` deep: over a network or browser reader that is most
     // of a small archive. Only those `detect_probe` makes first: a later one,
     // such as RAR's, could be overruled by an earlier check that needs more.
-    if let Some(fmt) = archive_magic(&src.window(0, 16)) {
+    if let Some(fmt) = archive_magic(&src.window(0, 32)) {
         return Some(udif_or(fmt, src.len(), |off| {
             src.window(off, 12).into_owned()
         }));
@@ -1594,7 +1709,7 @@ fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> O
 /// RAR), as [`detect`] would type it: what an archive carved out of another
 /// object at its magic needs confirmed, without a search through the rest.
 pub fn detect_archive_start(src: &dyn ByteSource) -> Option<Format> {
-    let head = src.window(0, 16);
+    let head = src.window(0, 32);
     archive_magic(&head).or_else(|| is_rar_magic(&head).then_some(Format::Rar))
 }
 
@@ -1984,6 +2099,11 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     #[cfg(feature = "partition")]
     if is_partition(p) {
         return Some(Format::Partition);
+    }
+    // After every structural check: a tar or a disk image holds a PDF in its
+    // first kilobyte as a member, which is not the file's own header.
+    if pdf_header_near_start(data) {
+        return Some(Format::Pdf);
     }
     // Last: a ZIP behind a script line or padding, found by its end record.
     // The walker reads such an archive (`open_archive`'s prepended case).
@@ -3309,6 +3429,31 @@ mod tests {
         // offset 4747707: `MSCF` then `LB1S…`, nonzero reserved1) → not a cabinet.
         assert_eq!(detect(b"MSCFLB1S6GBcextra"), None);
         assert_eq!(detect(b"MSCF"), None);
+    }
+
+    /// `reserved1` is reserved: `cabextract` opens a cabinet whatever it holds,
+    /// so a cabinet with a nonzero field is a cabinet, not data.
+    #[cfg(feature = "cab")]
+    #[test]
+    fn a_cabinet_with_a_nonzero_reserved_field_is_still_a_cabinet() {
+        let real = include_bytes!("../tests/fixtures/cab/mszip_lzx_qtm.cab");
+        let mut odd = real.to_vec();
+        odd[4..8].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(detect(&odd), Some(Format::Cab));
+        let names = |blob: &[u8]| {
+            let mut budget = Budget::new(Limits::default());
+            extract(Format::Cab, &blob, &mut budget)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.data))
+                .collect::<Vec<_>>()
+        };
+        assert!(!names(real).is_empty());
+        assert_eq!(names(&odd), names(real));
+        // And a header that only starts like one is still not.
+        let mut chance = odd.clone();
+        chance[24] = 9;
+        assert_eq!(detect(&chance), None);
     }
 
     /// `60 EA` is two bytes, so about one object in 65,536 starts with it by

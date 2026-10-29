@@ -2929,6 +2929,7 @@ fn scan_target(
             totals.errors += 1;
             errln(line);
         }
+        daemon::note_run(totals.infected, totals.errors);
         for file in &walk.files {
             if is_volume_part(file) {
                 parts.push(file.clone());
@@ -3336,6 +3337,7 @@ fn scan_input(
 /// difference between a consumer that can react and one that cannot tell.
 fn report_error(name: &str, message: &str, cli: &Cli, totals: &mut Totals) {
     totals.errors += 1;
+    daemon::note_run(totals.infected, totals.errors);
     if cli.json {
         println!(
             "{}",
@@ -4570,6 +4572,7 @@ fn report_result(name: &str, mut report: ScanReport, cli: &Cli, totals: &mut Tot
         }
         VerdictCategory::Clean => {}
     }
+    daemon::note_run(totals.infected, totals.errors);
     if cli.json {
         emit_json_result(name, &report, cli);
         return;

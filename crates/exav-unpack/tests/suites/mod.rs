@@ -14,6 +14,8 @@
 mod allowed_formats;
 #[cfg(feature = "alz")]
 mod alz;
+#[cfg(all(feature = "ar", feature = "cpio"))]
+mod ar_cpio_irregular;
 #[cfg(feature = "arc")]
 mod arc;
 #[cfg(feature = "arj")]
@@ -33,6 +35,8 @@ mod chm;
 mod cpio_never_silent;
 #[cfg(feature = "cramfs")]
 mod cramfs;
+#[cfg(all(feature = "bzip2", feature = "xz"))]
+mod cut_streams;
 #[cfg(all(not(feature = "decrypt"), feature = "zip"))]
 mod decrypt_disabled;
 mod disabled_formats;
@@ -47,6 +51,8 @@ mod dxf;
 mod egg;
 #[cfg(feature = "email")]
 mod email;
+#[cfg(feature = "email")]
+mod email_readers_agree;
 #[cfg(feature = "decrypt")]
 mod encrypted_zip;
 #[cfg(feature = "tar")]
@@ -94,6 +100,8 @@ mod partition_never_silent;
 mod pdf_empty_password;
 #[cfg(feature = "pdf")]
 mod pdf_parse;
+#[cfg(feature = "pdf")]
+mod pdf_readers_agree;
 #[cfg(feature = "pepack")]
 mod pe_emulation;
 #[cfg(feature = "pepack")]
@@ -159,6 +167,8 @@ mod zip_codecs;
 mod zip_deflate64;
 #[cfg(feature = "zip")]
 mod zip_disguised_members;
+#[cfg(feature = "zip")]
+mod zip_local_vs_directory;
 #[cfg(feature = "zip")]
 mod zip_overlap;
 #[cfg(feature = "zoo")]

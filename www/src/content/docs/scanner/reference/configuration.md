@@ -55,10 +55,11 @@ have no flag or variable: they go on the `--listen` address. See
 
 ### Removed variables
 
-The variables of two removed flags are still read, only to stop the run with a
-message naming what replaced them: `EXAV_MAX_EXTRACTED_BYTES` (see
-[Limits](/scanner/reference/limits/)) and `EXAV_BUILD_SHARD_BYTES`. Delete them from an
-image or unit file when upgrading to 0.0.2.
+The variable of a removed flag is still read, only to stop the run with a
+message naming what replaced it: `EXAV_BUILD_SHARD_BYTES`. Delete it from an
+image or unit file when upgrading. (`EXAV_MAX_EXTRACTED_BYTES` was removed in
+0.0.2 and is the variable of `--max-extracted-bytes` again; see
+[Limits](/scanner/reference/limits/).)
 
 ### Diagnostics
 

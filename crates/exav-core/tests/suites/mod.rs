@@ -53,6 +53,8 @@ mod ooxml_container;
 mod oversize_container;
 mod salvage;
 #[cfg(feature = "all-formats")]
+mod second_structure;
+#[cfg(feature = "all-formats")]
 mod sevenz_ppmd;
 mod size_caps;
 #[cfg(feature = "all-formats")]

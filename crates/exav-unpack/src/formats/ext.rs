@@ -764,6 +764,19 @@ fn open(v: &mut Vol) -> Option<Fs> {
     (root.kind() == S_IFDIR).then_some(fs)
 }
 
+/// Whether `src` is an ext volume a system would mount: a superblock, and a root
+/// that is a directory. The first kilobyte is left to boot code, so a file that
+/// starts as something else can be one too.
+pub(crate) fn is_volume(src: &dyn ByteSource) -> bool {
+    let mut disk = Reader::new(src);
+    let mut v = Vol {
+        disk: &mut disk,
+        len: src.len() as u64,
+        max: 1 << 20,
+    };
+    v.at(1080, 2).is_some_and(|m| m == [0x53, 0xEF]) && open(&mut v).is_some()
+}
+
 /// Walk an ext volume given whole as a source.
 pub(crate) fn walk<T>(
     src: &dyn ByteSource,

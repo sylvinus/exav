@@ -132,6 +132,33 @@ mod http {
                     resp.status()
                 )));
             }
+            // The range it says it sent, of the object it said it was: a server
+            // that answers another range hands over bytes of another place, and
+            // one whose object has changed since a scan began hands over a
+            // mixture. Neither is the object that was asked to be scanned.
+            let range = resp
+                .headers()
+                .get("Content-Range")
+                .and_then(|cr| cr.to_str().ok())
+                .and_then(|cr| cr.trim().strip_prefix("bytes "))
+                .and_then(|cr| {
+                    let (span, total) = cr.split_once('/')?;
+                    let (from, _) = span.split_once('-')?;
+                    Some((
+                        from.trim().parse::<u64>().ok()?,
+                        total.trim().parse::<u64>().ok(),
+                    ))
+                });
+            match range {
+                Some((from, total)) if from == start && total.is_none_or(|t| t == self.len) => {}
+                other => {
+                    return Err(io::Error::other(format!(
+                        "range request for bytes {start}-{last} of {} answered with {other:?} \
+                         (the object is {} bytes)",
+                        self.url, self.len
+                    )));
+                }
+            }
             let mut buf = Vec::new();
             resp.into_body()
                 .into_reader()
@@ -254,6 +281,68 @@ mod tests {
             }
         });
         url
+    }
+
+    /// A server that answers the first request as it should and every later one
+    /// with the range `shift` bytes on from the one asked for (`Offset`), or with
+    /// the range asked for of an object of another size (`Total`).
+    enum Wrong {
+        Offset,
+        Total,
+    }
+
+    fn serve_wrong(body: Vec<u8>, wrong: Wrong) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/obj", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { return };
+                let mut range = (0usize, 0usize);
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        let (a, b) = r.trim().split_once('-').unwrap();
+                        range = (a.parse().unwrap(), b.parse().unwrap());
+                    }
+                }
+                let (a, b) = range;
+                let (from, to, total) = match (&wrong, n) {
+                    (_, 0) => (a, b, body.len()),
+                    (Wrong::Offset, _) => (
+                        (a + 1).min(body.len() - 1),
+                        (b + 1).min(body.len() - 1),
+                        body.len(),
+                    ),
+                    (Wrong::Total, _) => (a, b, body.len() + 7),
+                };
+                let part = &body[from..=to];
+                let h = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{to}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    part.len()
+                );
+                let _ = conn.write_all(&[h.as_bytes(), part].concat());
+            }
+        });
+        url
+    }
+
+    /// The bytes of a range are the bytes of the range that was asked for, of
+    /// the object that was asked about.
+    #[test]
+    fn an_answer_for_another_range_or_another_object_is_refused() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        for wrong in [Wrong::Offset, Wrong::Total] {
+            let mut r = HttpRangeReader::open(&serve_wrong(body.clone(), wrong)).unwrap();
+            let mut all = Vec::new();
+            let e = r
+                .read_to_end(&mut all)
+                .expect_err("the answer is not the range asked for");
+            assert!(e.to_string().contains("answered with"), "{e}");
+        }
     }
 
     #[test]

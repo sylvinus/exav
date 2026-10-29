@@ -514,6 +514,21 @@ fn open_archive<R: Read + Seek + Clone>(
     ::zip::ZipArchive::new(Patched::new(reader))
 }
 
+/// Where a ZIP begins when it is appended to something else: the bytes before
+/// it count in no offset of its, and `unzip` finds it by its end record, which
+/// is at the end of the file. `None` for a file that is not one, or that starts
+/// where its offsets say.
+pub fn appended_start(src: &dyn crate::source::ByteSource) -> Option<u64> {
+    let mut r = crate::source::Reader::new(src);
+    // The longest comment an end record may carry, and the record.
+    match directory_shift_within(&mut r, 2 * 65_536)? {
+        Shift::Prepended(n) if n > 0 && src.window(n as usize, 4).starts_with(b"PK\x03\x04") => {
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
 /// Where a ZIP's central directory is, against where its end record says.
 enum Shift {
     /// `n` bytes precede the archive, and every offset counts from its start.
@@ -572,6 +587,14 @@ impl<R: Seek> Seek for Patched<R> {
 /// crate tries first. `None` for ZIP64, an empty archive, or no central header
 /// where that record puts the directory.
 fn directory_shift<R: Read + Seek>(r: &mut R) -> Option<Shift> {
+    directory_shift_within(r, u64::MAX)
+}
+
+/// [`directory_shift`] looking at the last `reach` bytes of the file and no
+/// further back. An end record that closes an archive stapled to the end of a
+/// file is within the longest comment of it, so a search for one that reads
+/// the whole of a large file is a pass over it for nothing.
+fn directory_shift_within<R: Read + Seek>(r: &mut R, reach: u64) -> Option<Shift> {
     use std::io::SeekFrom;
     const EOCD_LEN: usize = 22;
     const CHUNK: u64 = 1 << 16;
@@ -597,7 +620,7 @@ fn directory_shift<R: Read + Seek>(r: &mut R) -> Option<Shift> {
                 break 'found at;
             }
         }
-        if start == 0 {
+        if start == 0 || len - start >= reach {
             return None;
         }
         end = start + 3;
@@ -670,9 +693,32 @@ fn scan_orphan_locals<R>(
     // Local-header offsets the central directory already covered.
     let mut known = std::collections::HashSet::new();
     if let Ok(mut zip) = open_archive(Cursor::new(data)) {
+        let read = |at: u64, len: usize| {
+            usize::try_from(at)
+                .ok()
+                .and_then(|at| crate::bytes::at(data, at, len))
+                .map_or_else(
+                    || {
+                        let from = usize::try_from(at).unwrap_or(usize::MAX).min(data.len());
+                        data[from..].iter().take(len).copied().collect()
+                    },
+                    <[u8]>::to_vec,
+                )
+        };
         for i in 0..zip.len() {
             if let Ok(f) = zip.by_index_raw(i) {
-                known.insert(f.header_start() as usize);
+                let start = f.header_start();
+                // A member whose local header says otherwise than the
+                // directory is read once more, as the local header says.
+                if local_header_agrees(
+                    &read,
+                    start,
+                    f.name_raw(),
+                    zip_method_code(&f.compression()),
+                    f.compressed_size(),
+                ) {
+                    known.insert(start as usize);
+                }
             }
         }
     }
@@ -1650,6 +1696,7 @@ pub fn extract_zip_from<Rd: Read + Seek + Clone, R>(
 /// members are laid out end to end, this is empty and costs nothing.
 fn unclaimed_spans<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
+    read: &dyn Fn(u64, usize) -> Vec<u8>,
 ) -> (Vec<(u64, u64)>, std::collections::HashSet<u64>) {
     let cd = zip.central_directory_start();
     let mut claimed: Vec<(u64, u64)> = Vec::with_capacity(zip.len());
@@ -1657,6 +1704,18 @@ fn unclaimed_spans<R: Read + Seek>(
     for i in 0..zip.len() {
         if let Ok(f) = zip.by_index_raw(i) {
             let start = f.header_start();
+            // A member the local header describes otherwise is read as the
+            // local header says too, by the orphan scan: it is not known, and
+            // it claims no space, least of all the bytes of another member.
+            if !local_header_agrees(
+                read,
+                start,
+                f.name_raw(),
+                zip_method_code(&f.compression()),
+                f.compressed_size(),
+            ) {
+                continue;
+            }
             known.insert(start);
             // A member using a trailing data descriptor declares no data start,
             // so its extent is not knowable here. Claiming only the header
@@ -1686,6 +1745,41 @@ fn unclaimed_spans<R: Read + Seek>(
     // A local header is 30 bytes; nothing shorter can hold one.
     gaps.retain(|(a, b)| b - a >= LFH_LEN as u64);
     (gaps, known)
+}
+
+/// Whether the local header at `start` says of a member what the central
+/// directory says: its name, its method, and its compressed size when the
+/// header carries one.
+///
+/// Readers differ in which they believe. The `zip` crate decodes with the
+/// directory's method and size, and Info-ZIP `unzip` with the local header's, so
+/// an archive whose two disagree holds one thing for one and another for the
+/// other. `read(offset, len)` returns what is there, short at the end of the
+/// input. A header that cannot be read as one is left to the errors the member's
+/// own open gives.
+fn local_header_agrees(
+    read: &dyn Fn(u64, usize) -> Vec<u8>,
+    start: u64,
+    name_raw: &[u8],
+    method: u16,
+    comp: u64,
+) -> bool {
+    let h = read(start, LFH_LEN);
+    if h.len() < LFH_LEN || h[..4] != *b"PK\x03\x04" {
+        return true;
+    }
+    let flags = u16::from_le_bytes([h[6], h[7]]);
+    if u16::from_le_bytes([h[8], h[9]]) != method {
+        return false;
+    }
+    // The sizes follow the data (bit 3), or are in a ZIP64 field (all ones).
+    let local_comp = u32::from_le_bytes([h[18], h[19], h[20], h[21]]);
+    if flags & 0x08 == 0 && local_comp != u32::MAX && u64::from(local_comp) != comp {
+        return false;
+    }
+    let name_len = usize::from(u16::from_le_bytes([h[26], h[27]]));
+    let name = read(start + LFH_LEN as u64, name_len);
+    name.len() < name_len || name == name_raw
 }
 
 /// Whether the local header at `off` names a member with something to scan:
@@ -1999,7 +2093,7 @@ pub(crate) fn walk<T>(
     }
     // Members left out of the central directory while their local headers and
     // data stay in the file, which is what the target extracts.
-    for entry in hidden_members(zip, budget)? {
+    for entry in hidden_members(zip, src, budget)? {
         if let Some(t) = emit_entry(entry, budget, visit)? {
             return Ok(Some(t));
         }
@@ -2170,9 +2264,12 @@ fn walk_encrypted<R: Read + Seek, T>(
 #[inline(never)]
 pub(crate) fn hidden_members<Rd: Read + Seek>(
     mut zip: ::zip::ZipArchive<Rd>,
+    src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
 ) -> Result<Vec<Entry>, LimitHit> {
-    let (gaps, known) = unclaimed_spans(&mut zip);
+    let (gaps, known) = unclaimed_spans(&mut zip, &|at, len| {
+        usize::try_from(at).map_or_else(|_| Vec::new(), |at| src.window(at, len).into_owned())
+    });
     if gaps.is_empty() {
         return Ok(Vec::new());
     }
@@ -2200,6 +2297,43 @@ pub(crate) fn hidden_members<Rd: Read + Seek>(
 
 /// The member that says the search for hidden members stopped at its limit.
 const HIDDEN_SEARCH_TRUNCATED: &str = "<hidden-member search stopped at its limit>";
+
+/// The search for a ZIP stapled to the end of a file reads the end of it.
+#[cfg(test)]
+mod appended_start_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Tally(std::io::Cursor<Vec<u8>>, Arc<AtomicU64>);
+    impl Read for Tally {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+    impl Seek for Tally {
+        fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(p)
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_end_record_is_not_read_through_for_one() {
+        let read = Arc::new(AtomicU64::new(0));
+        let cache = crate::source::BlockCache::with_sizes(
+            Tally(std::io::Cursor::new(vec![b'x'; 8 << 20]), read.clone()),
+            64 * 1024,
+            1 << 20,
+        )
+        .unwrap();
+        let before = read.load(Ordering::Relaxed);
+        assert_eq!(appended_start(&cache), None);
+        let used = read.load(Ordering::Relaxed) - before;
+        assert!(used <= 1 << 20, "{used} bytes read for an 8 MiB file");
+    }
+}
 
 #[cfg(test)]
 mod orphan_scan_tests {

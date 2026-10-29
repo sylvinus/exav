@@ -35,7 +35,6 @@ pub(crate) const NSIS_SIG: [u8; 16] = [
 const FIRSTHEADER_LEN: usize = 0x1c;
 /// `firstheader.flags`: the installer carries no CRC-32 after its data.
 const FH_FLAGS_NO_CRC: u32 = 4;
-const MAX_BLOCKS: usize = 10_000;
 const SOLID_MIN_OUTPUT: usize = 64;
 
 #[inline]
@@ -102,12 +101,16 @@ pub(crate) fn extract_nsis<R>(
     // Non-solid: a `[u32 size][data]` block sequence.
     let mut pos = data_start;
     let mut n = 0usize;
-    while pos + 4 <= arch_end && n < MAX_BLOCKS {
+    // Each block is counted against the archive's member limit, an empty one
+    // too, and that is the bound on the walk: it ends in a limit that is said,
+    // where a count of its own ended it quietly with blocks left.
+    while pos + 4 <= arch_end {
         let word = u32le(data, pos);
         pos += 4;
         let compressed = word & 0x8000_0000 != 0;
         let size = (word & 0x7fff_ffff) as usize;
         if size == 0 {
+            budget.count_entry()?;
             n += 1;
             continue;
         }

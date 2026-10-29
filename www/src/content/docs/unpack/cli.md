@@ -131,8 +131,9 @@ On purpose:
   members exits 82; when other members came out, the run exits 1 and each
   member left behind is reported `skipping: NAME  incorrect password`. `-t`
   checks without writing anything.
-- A symbolic link whose target leaves the extraction directory is not made, and
-  nothing is written through a link already there. A member name's `..` and
+- A symbolic link whose target leaves the extraction directory is not made,
+  the target being followed through the links already made, and nothing is
+  written through a link already there. A member name's `..` and
   root (`/`, a drive letter) are dropped, so every file lands under the
   extraction directory. Links are made last, once every member is out.
 - Every member is `extracting:`, whatever its compression.

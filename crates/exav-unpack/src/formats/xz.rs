@@ -138,6 +138,8 @@ pub(crate) struct XzReader<R> {
     done: bool,
     /// Input was fed to the decoder since the last end of stream.
     mid_stream: bool,
+    /// The input ended inside a stream, and that is yet to be reported.
+    cut: bool,
 }
 
 impl<R: std::io::Read> XzReader<R> {
@@ -155,6 +157,31 @@ impl<R: std::io::Read> XzReader<R> {
             taken: 0,
             done: false,
             mid_stream: false,
+            cut: false,
+        }
+    }
+
+    /// Stage what the decoder holds when the input ends inside a stream. It
+    /// reads ahead of what it writes, so the last bytes it could decode from
+    /// what it was given stay in it until it is given more; `xz -dc` writes
+    /// them. One zero byte stands for the input that is missing, and the
+    /// decoder, having its lookahead, writes them all at once. Output that
+    /// comes out byte for byte with the one zero given is not the stream's:
+    /// an uncompressed chunk copies its input, so the zero is all it makes of
+    /// it. Nothing is read from the decoder after that call, the rest of what
+    /// it writes being made of the padding.
+    fn drain(&mut self) {
+        self.cut = true;
+        let mut buf = [0u8; OUT_STEP];
+        if let Ok(result) = self.decoder.decode(&[0u8], &mut buf) {
+            let n = result.output_produced();
+            if matches!(result, xz4rust::XzNextBlockResult::EndOfStream(_, _)) {
+                // It ended after all: nothing was cut.
+                self.staged.extend_from_slice(&buf[..n]);
+                self.cut = false;
+            } else if n > result.input_consumed() {
+                self.staged.extend_from_slice(&buf[..n]);
+            }
         }
     }
 
@@ -184,20 +211,23 @@ impl<R: std::io::Read> std::io::Read for XzReader<R> {
                 return Ok(n);
             }
             if self.done {
-                return Ok(0);
-            }
-            self.staged.clear();
-            self.taken = 0;
-            if !self.fill()? {
-                self.done = true;
                 // The input ended inside a stream: the rest of it is not here.
-                if self.mid_stream {
+                if std::mem::take(&mut self.cut) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "xz: stream cut short",
                     ));
                 }
                 return Ok(0);
+            }
+            self.staged.clear();
+            self.taken = 0;
+            if !self.fill()? {
+                self.done = true;
+                if self.mid_stream {
+                    self.drain();
+                }
+                continue;
             }
             self.mid_stream = true;
             let mut buf = [0u8; OUT_STEP];

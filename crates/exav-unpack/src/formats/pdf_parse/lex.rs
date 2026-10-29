@@ -45,10 +45,24 @@ impl<'a> Lexer<'a> {
         self.data
     }
 
+    /// White space only. A `%` here is the byte it is: a comment is no reason to
+    /// miss an `N G obj` after it on the same line, which a reader that goes by
+    /// the cross-reference table finds, and the scan for objects must too.
+    fn skip_blank(&mut self) {
+        while self.pos < self.data.len()
+            && matches!(
+                self.data[self.pos],
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x00'
+            )
+        {
+            self.pos += 1;
+        }
+    }
+
     fn skip_whitespace(&mut self) {
         while self.pos < self.data.len() {
             match self.data[self.pos] {
-                b' ' | b'\t' | b'\r' | b'\n' | b'\x00' => self.pos += 1,
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x00' => self.pos += 1,
                 b'%' => {
                     // PDF comment: skip to end of line
                     self.pos += 1;
@@ -272,8 +286,8 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         while self.pos < self.data.len() {
             match self.data[self.pos] {
-                b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'<' | b'>' | b'/' | b'[' | b']'
-                | b'{' | b'}' | b'%' | 0 => break,
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'(' | b')' | b'<' | b'>' | b'/'
+                | b'[' | b']' | b'{' | b'}' | b'%' | 0 => break,
                 _ => self.pos += 1,
             }
         }
@@ -329,7 +343,7 @@ impl<'a> Lexer<'a> {
     /// Returns (obj_number, gen_number, offset_of_first_byte_after_obj_keyword) or None.
     pub(crate) fn find_next_obj(&mut self) -> Option<(u32, u32, usize)> {
         while self.pos < self.data.len() {
-            self.skip_whitespace();
+            self.skip_blank();
             if self.pos >= self.data.len() {
                 return None;
             }
@@ -338,7 +352,7 @@ impl<'a> Lexer<'a> {
             if let Token::Integer(n) = self.read_number()
                 && n >= 0
             {
-                self.skip_whitespace();
+                self.skip_blank();
                 if self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
                     // This might be the generation number
                     let gen_start = self.pos;
@@ -349,7 +363,7 @@ impl<'a> Lexer<'a> {
                         .unwrap_or("0")
                         .parse()
                         .unwrap_or(0);
-                    self.skip_whitespace();
+                    self.skip_blank();
                     if self.starts_with(b"obj") {
                         self.pos += 3;
                         return Some((n as u32, r#gen, self.pos));

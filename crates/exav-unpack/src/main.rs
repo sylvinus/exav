@@ -20,6 +20,31 @@
 
 #![forbid(unsafe_code)]
 
+/// `println!`, except that a closed standard output ends the run quietly.
+///
+/// Rust's runtime ignores `SIGPIPE`, so `exav-unpack -l archive | head` made
+/// `println!` panic on the `EPIPE` and print a backtrace at the user. Every
+/// other Unix filter just stops.
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if let Err(e) = writeln!(std::io::stdout(), $($arg)*) {
+            stdout_closed(&e);
+        }
+    }};
+}
+
+/// The end of a run whose standard output cannot be written to: 141, what a
+/// shell reports for a process killed by `SIGPIPE`, when the reader went away,
+/// and 2 for any other write error.
+fn stdout_closed(e: &std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(141);
+    }
+    eprintln!("exav-unpack:  cannot write to standard output: {e}");
+    std::process::exit(2);
+}
+
 use chrono::{Local, LocalResult, TimeZone};
 use exav_unpack::source::BlockCache;
 use exav_unpack::{Budget, ByteSource, Format, Limits, Member, MemberMeta, Mtime, detect, walk};
@@ -1160,12 +1185,70 @@ fn escapes(root: &Path, path: &Path, target: &str) -> bool {
     false
 }
 
+/// Whether a link at `path` to `target` leads out of `root` once the links
+/// already made are followed. [`escapes`] reads the words of the target alone,
+/// and counts a `..` against the link's own depth: `a -> .` and `b -> a/..` each
+/// pass it, and `b` is the directory above the root.
+fn resolves_outside(root: &Path, path: &Path, target: &str) -> bool {
+    let Ok(root) = fs::canonicalize(root) else {
+        return true;
+    };
+    let Some(mut at) = path.parent().and_then(|p| fs::canonicalize(p).ok()) else {
+        return true;
+    };
+    if !at.starts_with(&root) {
+        return true;
+    }
+    // The words still to be read, the next one last.
+    let words = |t: &str| -> Option<Vec<std::ffi::OsString>> {
+        let mut out = Vec::new();
+        for c in Path::new(t).components().rev() {
+            match c {
+                Component::RootDir | Component::Prefix(_) => return None,
+                Component::CurDir => {}
+                Component::ParentDir => out.push("..".into()),
+                Component::Normal(n) => out.push(n.to_os_string()),
+            }
+        }
+        Some(out)
+    };
+    let Some(mut todo) = words(target) else {
+        return true;
+    };
+    let mut hops = 0;
+    while let Some(w) = todo.pop() {
+        if w == ".." {
+            if !at.pop() || !at.starts_with(&root) {
+                return true;
+            }
+            continue;
+        }
+        at.push(&w);
+        if fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            hops += 1;
+            let Some(next) = (hops <= 40)
+                .then(|| fs::read_link(&at).ok())
+                .flatten()
+                .and_then(|l| words(&l.to_string_lossy()))
+            else {
+                return true;
+            };
+            at.pop();
+            todo.extend(next);
+        }
+    }
+    !at.starts_with(&root)
+}
+
 /// Make the link at `path` to `target`, if the target stays under `root`.
 fn make_link(root: &Path, path: &Path, target: &str) -> Result<(), String> {
     if escapes(root, path, target) {
         return Err("symbolic link points outside the extraction directory".to_string());
     }
     directories(root, path, false)?;
+    if resolves_outside(root, path, target) {
+        return Err("symbolic link points outside the extraction directory".to_string());
+    }
     if fs::symlink_metadata(path).is_ok() {
         fs::remove_file(path).map_err(|e| e.to_string())?;
     }

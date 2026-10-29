@@ -117,10 +117,10 @@ fn collect_ole_entries(
         entries.push(entry);
     }
 
-    append_ole10native_payloads(&mut entries, budget);
+    append_ole10native_payloads(&mut entries, budget)?;
     // Before the macro pass: an embedded storage can itself hold the VBA
     // project, and the artifacts are synthesised from whatever is present.
-    append_ppt_embedded_storages(&mut entries, budget);
+    append_ppt_embedded_storages(&mut entries, budget)?;
     append_macro_artifacts(&mut entries, budget);
     Ok(entries)
 }
@@ -138,7 +138,10 @@ fn collect_ole_entries(
 /// 13 corpus documents carried an encrypted OLE2 this way that exav never saw,
 /// and the detection was already correct once the payload was carved by hand.
 /// It is a routine malware-delivery shape, so the value is well beyond those 13.
-fn append_ole10native_payloads(entries: &mut Vec<Entry>, budget: &mut Budget) {
+fn append_ole10native_payloads(
+    entries: &mut Vec<Entry>,
+    budget: &mut Budget,
+) -> Result<(), LimitHit> {
     let mut carved: Vec<Entry> = Vec::new();
     for e in entries.iter() {
         // Stream names arrive as paths (`/\x01Ole10Native`), and the `\x01`
@@ -156,18 +159,26 @@ fn append_ole10native_payloads(entries: &mut Vec<Entry>, budget: &mut Budget) {
         let Some(payload) = ole10native_payload(&e.data) else {
             continue;
         };
-        if budget.count_entry().is_err() {
-            break;
-        }
-        let Ok(cap) = budget.reserve() else { break };
+        budget.count_entry()?;
+        let cap = budget.reserve()?;
         if payload.len() as u64 > cap {
+            carved.push(Entry::unsupported(
+                format!("{leaf}-payload"),
+                payload.len() as u64,
+                false,
+                "embedded object exceeds the per-member budget",
+            ));
             continue;
         }
         budget.commit(payload.len() as u64);
         carved.push(Entry::new(format!("{leaf}-payload"), payload.to_vec()));
     }
     entries.extend(carved);
+    Ok(())
 }
+
+/// An embedded storage's bytes, and why they are not all of it when they are not.
+type Storage = (Vec<u8>, Option<&'static str>);
 
 /// Inflate every object PowerPoint 97 embedded in its own record stream and
 /// append it.
@@ -185,20 +196,21 @@ fn append_ole10native_payloads(entries: &mut Vec<Entry>, budget: &mut Budget) {
 /// 10,752-byte compound file deflated inside one of these records, and exav's
 /// own OLE reader decompresses the module source from it once it is handed over.
 /// The value is wider than macros — *any* embedded object was unreachable.
-fn append_ppt_embedded_storages(entries: &mut Vec<Entry>, budget: &mut Budget) {
+fn append_ppt_embedded_storages(
+    entries: &mut Vec<Entry>,
+    budget: &mut Budget,
+) -> Result<(), LimitHit> {
     let mut carved: Vec<Entry> = Vec::new();
     for e in entries.iter() {
         let leaf = e.name.rsplit(['/', '\\']).next().unwrap_or(&e.name);
         if !leaf.eq_ignore_ascii_case("PowerPoint Document") {
             continue;
         }
-        for (i, (blob, why)) in ppt_embedded_storages(&e.data, budget)
+        for (i, (blob, why)) in ppt_embedded_storages(&e.data, budget)?
             .into_iter()
             .enumerate()
         {
-            if budget.count_entry().is_err() {
-                break;
-            }
+            budget.count_entry()?;
             budget.commit(blob.len() as u64);
             let mut entry = Entry::new(format!("ppt-embedded-{i}"), blob);
             entry.unsupported = why;
@@ -206,6 +218,7 @@ fn append_ppt_embedded_storages(entries: &mut Vec<Entry>, budget: &mut Budget) {
         }
     }
     entries.extend(carved);
+    Ok(())
 }
 
 /// Walk a `PowerPoint Document` record tree and return the payload of every
@@ -217,22 +230,14 @@ fn append_ppt_embedded_storages(entries: &mut Vec<Entry>, budget: &mut Budget) {
 /// how a record nested three levels down is reached at all. The instance (the
 /// high twelve bits) selects the storage form: `0` is stored, `1` is
 /// `[uncompressedSize:u32]` followed by a zlib stream.
-fn ppt_embedded_storages(
-    stream: &[u8],
-    budget: &mut Budget,
-) -> Vec<(Vec<u8>, Option<&'static str>)> {
+fn ppt_embedded_storages(stream: &[u8], budget: &mut Budget) -> Result<Vec<Storage>, LimitHit> {
     /// `RT_ExternalOleObjectStg`.
     const EXT_OLE_OBJ_STG: u16 = 0x1011;
-    /// A record tree deep enough to need more steps than this is malformed, and
-    /// bounding the walk is cheaper than reasoning about whether it can loop.
-    const MAX_RECORDS: usize = 100_000;
-
     let mut out = Vec::new();
     let mut off = 0usize;
-    for _ in 0..MAX_RECORDS {
-        let Some(hdr) = crate::bytes::at(stream, off, 8) else {
-            break;
-        };
+    // Every step moves `off` forward by a header at least, so the walk ends
+    // with the stream. It has no count of its own to stop it with records left.
+    while let Some(hdr) = crate::bytes::at(stream, off, 8) {
         let ver_instance = u16::from_le_bytes([hdr[0], hdr[1]]);
         let rec_type = u16::from_le_bytes([hdr[2], hdr[3]]);
         let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
@@ -242,10 +247,18 @@ fn ppt_embedded_storages(
             continue;
         }
         if rec_type == EXT_OLE_OBJ_STG
-            && let Some(body) = crate::bytes::at(stream, off + 8, len)
-            && let Some(blob) = ppt_storage_payload(ver_instance >> 4, body, budget)
+            && let Some(rest) = stream.get(off.saturating_add(8)..)
         {
-            out.push(blob);
+            // A record that runs past the end of the stream is read as far as
+            // the stream goes, and says so.
+            let cut = len > rest.len();
+            let body = &rest[..len.min(rest.len())];
+            if let Some((blob, why)) = ppt_storage_payload(ver_instance >> 4, body, budget)? {
+                let why = why
+                    .or(cut
+                        .then_some("embedded PowerPoint storage runs past the end of its stream"));
+                out.push((blob, why));
+            }
         }
         // `len` is attacker-controlled; a wrapping step would walk the stream
         // again from the top.
@@ -254,7 +267,7 @@ fn ppt_embedded_storages(
             _ => break,
         }
     }
-    out
+    Ok(out)
 }
 
 /// One storage record's bytes: stored as-is, or inflated, bounded by the
@@ -263,38 +276,39 @@ fn ppt_storage_payload(
     instance: u16,
     body: &[u8],
     budget: &mut Budget,
-) -> Option<(Vec<u8>, Option<&'static str>)> {
+) -> Result<Option<Storage>, LimitHit> {
     const OVER: &str = "embedded PowerPoint storage exceeds the per-member budget";
     const BROKEN: &str = "embedded PowerPoint storage could not be decompressed";
     const PART_WAY: &str = "embedded PowerPoint storage failed to decompress part way; \
                             the bytes before the failure were scanned";
-    let cap = budget.reserve().ok()?;
+    let cap = budget.reserve()?;
     if instance == 0 {
         // Stored. The record is the compound file.
-        return Some(if body.len() as u64 <= cap {
+        return Ok(Some(if body.len() as u64 <= cap {
             (body.to_vec(), None)
         } else {
             (Vec::new(), Some(OVER))
-        });
+        }));
     }
     // Compressed: a declared size then a zlib stream. The declared size is a
     // hint from the file, so it is not trusted for allocation — the read is
     // bounded by the budget and salvages a truncated tail, which is how a
     // deliberately-truncated object still gets scanned rather than dropped.
-    let deflated = body.get(4..)?;
-    let Some(zlib) = crate::inflate::zlib_body(deflated) else {
-        return Some((Vec::new(), Some(BROKEN)));
+    let Some(zlib) = body.get(4..).and_then(crate::inflate::zlib_body) else {
+        return Ok(Some((Vec::new(), Some(BROKEN))));
     };
-    let s = bounded_read_salvage(zlib, cap, true).ok()?;
+    let Ok(s) = bounded_read_salvage(zlib, cap, true) else {
+        return Ok(Some((Vec::new(), Some(BROKEN))));
+    };
     let why = match (s.over_cap, s.undecoded, s.data.is_empty()) {
         (true, _, _) => Some(OVER),
         (_, true, true) => Some(BROKEN),
         (_, true, false) => Some(PART_WAY),
         // Nothing decoded and nothing left undecoded: an empty storage.
-        (_, false, true) => return None,
+        (_, false, true) => return Ok(None),
         (_, false, false) => None,
     };
-    Some((s.data, why))
+    Ok(Some((s.data, why)))
 }
 
 /// The payload bytes inside an `Ole10Native` stream, or `None` when the header
@@ -611,13 +625,13 @@ mod macro_artifact_tests {
         let mut b = Budget::new(Limits::default());
 
         let intact = compressed(b"storage");
-        let got = ppt_storage_payload(1, &intact, &mut b).unwrap();
+        let got = ppt_storage_payload(1, &intact, &mut b).unwrap().unwrap();
         assert_eq!(got, (b"storage".to_vec(), None));
 
         let mut bad_adler = intact.clone();
         let n = bad_adler.len();
         bad_adler[n - 1] ^= 1;
-        let got = ppt_storage_payload(1, &bad_adler, &mut b).unwrap();
+        let got = ppt_storage_payload(1, &bad_adler, &mut b).unwrap().unwrap();
         assert_eq!(got, (b"storage".to_vec(), None));
 
         // Damaged after a long run of content: that run, and a reason.
@@ -628,18 +642,22 @@ mod macro_artifact_tests {
         let mut damaged = vec![0, 0, 0, 0, 0x78, 0x9c];
         damaged.extend_from_slice(e.get_ref());
         damaged.extend_from_slice(&[0x06, 0x5a, 0x5a]);
-        let (data, why) = ppt_storage_payload(1, &damaged, &mut b).unwrap();
+        let (data, why) = ppt_storage_payload(1, &damaged, &mut b).unwrap().unwrap();
         assert_eq!(data, content);
         assert!(why.is_some_and(|w| w.contains("part way")), "{why:?}");
 
-        let (data, why) = ppt_storage_payload(1, b"\0\0\0\0not zlib", &mut b).unwrap();
+        let (data, why) = ppt_storage_payload(1, b"\0\0\0\0not zlib", &mut b)
+            .unwrap()
+            .unwrap();
         assert!(data.is_empty() && why.is_some());
 
         let mut small = Budget::new(Limits {
             max_buffer_bytes: 4,
             ..Limits::default()
         });
-        let (data, why) = ppt_storage_payload(0, b"stored storage", &mut small).unwrap();
+        let (data, why) = ppt_storage_payload(0, b"stored storage", &mut small)
+            .unwrap()
+            .unwrap();
         assert!(data.is_empty() && why.is_some());
     }
 

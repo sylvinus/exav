@@ -758,7 +758,7 @@ struct Node {
 fn walk<T>(
     img: &mut dyn Image,
     max_dir: u64,
-    seen_extents: &mut HashSet<u64>,
+    seen_extents: &mut HashSet<(u64, u64)>,
     sink: Emit<'_, T>,
 ) -> Result<Option<T>, LimitHit> {
     macro_rules! emit {
@@ -906,7 +906,7 @@ fn walk<T>(
             // image's two trees point at the same blocks.
             let part = child.icb.part;
             if let Some(s) = first_extent_sector(img, &vol, fe, part, &fe_head, ad_kind)?
-                && !seen_extents.insert(s)
+                && !seen_extents.insert((s, declared))
             {
                 continue;
             }
@@ -945,7 +945,7 @@ pub(crate) fn stream_udf<R: Read + Seek, T>(
     source: &mut R,
     budget: &mut Budget,
     visit: Visit<T>,
-    seen_extents: &mut HashSet<u64>,
+    seen_extents: &mut HashSet<(u64, u64)>,
 ) -> Result<Option<T>, LimitHit> {
     let head = crate::read_at(source, 0, RECOGNITION_END)?;
     if !has_udf(&head) {

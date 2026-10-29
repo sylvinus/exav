@@ -221,3 +221,46 @@ fn an_ole2_file_is_carved_from_its_own_bytes() {
         other => panic!("expected the carved executable to match, got {other:?}"),
     }
 }
+
+/// A carved executable that cannot be read whole is a finding of its own, but
+/// not the end of the scan: an archive stapled before it is still opened. Else a
+/// damaged decoy after a payload turns `FOUND` into `PARTIAL`, or into `OK`
+/// under `--partial-as ok`.
+#[test]
+fn a_damaged_executable_in_a_carrier_does_not_hide_the_archive_with_the_payload() {
+    // `upx_nrv2d.upx` with five bytes of its compressed data changed.
+    let decoy = include_bytes!("../fixtures/upx_damaged.elf");
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("e.com", deflated).unwrap();
+    // Repetitive, so the compressor codes it and the string is not in the bytes.
+    zip.write_all(&[exav_core::unpack::eicar(), b"\n"].concat().repeat(64))
+        .unwrap();
+    let zip = zip.finish().unwrap().into_inner();
+    let eicar = exav_core::unpack::eicar();
+    assert!(
+        !zip.windows(eicar.len()).any(|w| w == eicar),
+        "the string must not be in the archive's bytes"
+    );
+
+    let mut stub = b"MZ".to_vec();
+    stub.resize(62, 0);
+    let control = [stub.as_slice(), &zip].concat();
+    assert!(
+        matches!(verdict(&control), Verdict::Infected { .. }),
+        "the premise"
+    );
+    let alone = [stub.as_slice(), decoy.as_slice()].concat();
+    assert!(
+        matches!(verdict(&alone), Verdict::Unscannable { .. }),
+        "the decoy must not unpack"
+    );
+    let both = [stub.as_slice(), &zip, decoy.as_slice()].concat();
+    match verdict(&both) {
+        Verdict::Infected { .. } => {}
+        other => {
+            panic!("the archive before a damaged executable must still be found, got {other:?}")
+        }
+    }
+}

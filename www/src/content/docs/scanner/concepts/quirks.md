@@ -139,7 +139,12 @@ is a 1 KiB decoy and whose second holds the malware was a real false negative.
 **Appended archives** are carved too: ZIP, gzip, bzip2, xz, 7z, RAR and CAB
 magics after offset 0 (self-extractors, PE overlays, droppers that staple an
 archive onto a carrier). A carve that fails to decode is usually a chance byte
-run and is dropped rather than making the carrier `UNSCANNABLE`. The exception is
+run and is dropped rather than making the carrier `UNSCANNABLE`. A file that
+the magic at its start types as an archive (a PDF, a tar, a gzip, a bzip2) is
+not carved for magics, but a ZIP behind it is found by the record at the end of
+the file, which is how `unzip` finds it, and is scanned as the ZIP it is. An
+ISO 9660 or ext image whose first bytes are an archive's magic, in the space
+those formats leave free, is walked as the image too. The exception is
 an encrypted ZIP appended to a picture or a document whose central directory
 checks out: archive tools open such a polyglot through its trailing directory, so
 it is reported `PASSWORD-PROTECTED`.

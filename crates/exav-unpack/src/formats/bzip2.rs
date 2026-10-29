@@ -34,9 +34,7 @@ pub(crate) fn walk<T>(
 /// content streamed the way it turned out.
 pub(crate) fn content_reader(data: &dyn ByteSource, cap: u64) -> Box<dyn Read + '_> {
     let starts = stream_starts(data);
-    let one = || -> Box<dyn Read + '_> {
-        Box::new(super::bzip2_rs::DecoderReader::new(Reader::new(data)))
-    };
+    let one = || -> Box<dyn Read + '_> { Box::new(Recovering::new(data, 0, data.len())) };
     if starts.len() <= 1 {
         return one();
     }
@@ -55,19 +53,120 @@ pub(crate) fn content_reader(data: &dyn ByteSource, cap: u64) -> Box<dyn Read + 
         .map_or_else(|e| crate::is_checksum_mismatch(&e), |_| true)
     });
     if !each_decodes {
-        return one();
+        // Either one stream with a `BZh` in its compressed data, or streams of
+        // which a later one is cut short or damaged. The first is read whole as
+        // one stream. The ones behind the first are read as far as they go in
+        // either case, so that what a later stream holds is scanned and a
+        // false split costs only a stream that decodes to nothing.
+        let mut parts: std::collections::VecDeque<Box<dyn Read + '_>> =
+            std::collections::VecDeque::new();
+        parts.push_back(one());
+        for &(s, e) in bounds.iter().skip(1) {
+            parts.push_back(Box::new(AsFarAsItGoes(Recovering::new(data, s, e))));
+        }
+        return Box::new(Streams {
+            parts,
+            mismatch: None,
+        });
     }
     Box::new(Streams {
         parts: bounds
             .into_iter()
-            .map(|(s, e)| {
-                Box::new(super::bzip2_rs::DecoderReader::new(Reader::range(
-                    data, s, e,
-                ))) as Box<dyn Read + '_>
-            })
+            .map(|(s, e)| Box::new(Recovering::new(data, s, e)) as Box<dyn Read + '_>)
             .collect(),
         mismatch: None,
     })
+}
+
+/// A reader that ends where the one inside it fails.
+struct AsFarAsItGoes<R>(R);
+
+impl<R: Read> Read for AsFarAsItGoes<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(self.0.read(buf).unwrap_or(0))
+    }
+}
+
+/// One stream of `data[start..end]`, decoded; a stream cut short, whose last
+/// block the decoder holds back because it looks ahead past the end of the
+/// input (a cut inside the ten bytes of the trailer loses the whole block, and
+/// `bzip2 -dc` writes it), is decoded again behind zeros that stand for the
+/// missing bytes, from where the first pass stopped, and the cut is reported
+/// once the block is out.
+struct Recovering<'a> {
+    data: &'a dyn ByteSource,
+    range: (usize, usize),
+    first: super::bzip2_rs::DecoderReader<Reader<'a>>,
+    /// Bytes `first` produced, to skip in the second pass.
+    produced: u64,
+    second: Option<
+        super::bzip2_rs::DecoderReader<std::io::Chain<Reader<'a>, std::io::Take<std::io::Repeat>>>,
+    >,
+    skip: u64,
+    cut: Option<(std::io::ErrorKind, String)>,
+}
+
+impl<'a> Recovering<'a> {
+    fn new(data: &'a dyn ByteSource, start: usize, end: usize) -> Self {
+        Recovering {
+            data,
+            range: (start, end),
+            first: super::bzip2_rs::DecoderReader::new(Reader::range(data, start, end)),
+            produced: 0,
+            second: None,
+            skip: 0,
+            cut: None,
+        }
+    }
+}
+
+impl Read for Recovering<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(second) = &mut self.second {
+                if self.skip > 0 {
+                    let mut scratch = [0u8; 4096];
+                    let want = scratch.len().min(self.skip as usize);
+                    match second.read(&mut scratch[..want]) {
+                        Ok(n) if n > 0 => {
+                            self.skip -= n as u64;
+                            continue;
+                        }
+                        _ => return Err(self.cut_error()),
+                    }
+                }
+                return match second.read(buf) {
+                    Ok(0) | Err(_) => Err(self.cut_error()),
+                    Ok(n) => Ok(n),
+                };
+            }
+            match self.first.read(buf) {
+                Ok(n) => {
+                    self.produced += n as u64;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    self.cut = Some((e.kind(), e.to_string()));
+                    self.skip = self.produced;
+                    let (start, end) = self.range;
+                    self.second = Some(super::bzip2_rs::DecoderReader::new(
+                        Reader::range(self.data, start, end).chain(std::io::repeat(0).take(16)),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Recovering<'_> {
+    fn cut_error(&mut self) -> std::io::Error {
+        let (kind, msg) = self.cut.clone().unwrap_or((
+            std::io::ErrorKind::UnexpectedEof,
+            "bzip2: stream cut short".into(),
+        ));
+        std::io::Error::new(kind, msg)
+    }
 }
 
 /// Streams read one after another. A checksum mismatch in one is reported

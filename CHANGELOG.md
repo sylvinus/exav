@@ -661,6 +661,51 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **Readers that disagree with the program that opens a file no longer scan
+  less than it shows.** A file was reported `OK` where `unzip`, `qpdf`, `xz`,
+  `cpio` or a mail client shows a payload exav did not look at:
+  - ZIP: a central directory record that gives another method, compressed size
+    or name than the member's local header. The member is read as the header
+    says too.
+  - PDF: bytes before the header (within the first kilobyte), a form feed as
+    white space, a `/Filter` given as a reference or behind an identity
+    `/Crypt`, a filter nothing here decodes (now reported), an object that does
+    not end, and a comment mark before an object on the same line.
+  - Mail: a first header other than ten known ones, headers over 8 KiB, a
+    multipart nothing closed, a base64 part with a stray byte, a file uuencoded
+    into the text.
+  - ISO 9660 and UDF: a record of no length at the start of a file's extent
+    stood in for the file.
+  - A ZIP behind a PDF, a tar, a gzip or a bzip2 (found by the record at the end
+    of the file), and an ISO or ext image that begins with an archive's magic.
+  - `ar` size fields with a stray byte; `cpio` headers with a bad digit, and the
+    archives of an initramfs after the first.
+  - A bzip2 stream cut inside its trailer, later bzip2 streams that fail, and
+    an xz stream cut short, now give what `bzip2 -dc` and `xz -dc` give.
+  - A CAB whose reserved field is not zero.
+  - A damaged executable carved from a file turned a detection in the archive
+    behind it into `PARTIAL`, or into `OK` under `--partial-as ok`.
+  - Base64 in scripts and pages: a ZIP (HTML smuggling), gzip, 7z, RAR or xz is
+    decoded as well; the number of files decoded is said when it is reached
+    (`LIMITS-EXCEEDED`); a script behind a long run of high bytes is read as
+    text; and what a decoded file turns up beyond a detection is reported.
+  - NSIS and PowerPoint object records are read to the end of the file, and an
+    embedded object over the budget is reported where it was dropped.
+- **A one-shot scan that `--max-scan-secs` ended exited `3` after printing a
+  detection.** It keeps the status of what it had found (`1`, then `2`), and
+  otherwise the one `--partial-as` gives a `LIMITS-EXCEEDED`.
+- **A `.cvd` cut short or damaged loaded with signatures missing and no word.**
+  Its header's md5 is checked.
+- **A server could answer a range request with another range or object.** The
+  `Content-Range` of every answer is checked against what was asked.
+- **`exav-unpack` made symbolic links that led out of the extraction
+  directory** by way of links it had made, and panicked on a closed pipe
+  (`exav-unpack -l archive | head`).
+- **`exav /dev/zero` said `OK`.** A source that reads on without end and
+  measures itself as empty is an error.
+- **`VERSIONCOMMANDS` listed `SHUTDOWN` and `QUIT` on a daemon that refuses
+  them**, and the release workflow checks that the workspace and the npm packages
+  carry the tag's version and does not tag a pre-release `latest`.
 - **A large file over HTTP made a request for each executable candidate.**
   Carving looks at the header an `MZ` points to, wherever it is, and in an
   object read in place each lookup was a block of its own: a 1 GB text file

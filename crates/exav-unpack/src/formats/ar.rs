@@ -3,14 +3,23 @@
 //! `.deb` files are `ar` archives whose members are usually `control.tar.*` and
 //! `data.tar.*`; emitting those members lets the engine recurse into them.
 
+use crate::stream::Region;
 use crate::*;
 use std::io::{Read, Seek, SeekFrom};
 
 const MAGIC: &[u8] = b"!<arch>\n";
 
-fn parse_decimal(field: &[u8]) -> u64 {
-    let s = std::str::from_utf8(field).unwrap_or("").trim();
-    s.parse().unwrap_or(0)
+/// A header's decimal field as `ar` and `dpkg-deb` read it: leading white space
+/// skipped, then the digits, and whatever follows them (spaces, a stray byte)
+/// ignored. `None` when there are no digits.
+fn parse_decimal(field: &[u8]) -> Option<u64> {
+    let digits: Vec<u8> = field
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
 }
 
 /// Walk an `ar` archive, each member streamed from where it lies.
@@ -32,7 +41,7 @@ pub(crate) fn walk<T>(
 pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
     max_buffer: u64,
-) -> Result<Vec<(String, u64, u64)>, LimitHit> {
+) -> Result<Vec<Region>, LimitHit> {
     let mut magic = [0u8; 8];
     source
         .seek(SeekFrom::Start(0))
@@ -41,21 +50,38 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     if magic != MAGIC {
         return Err(LimitHit::new("ar: bad magic".to_string()));
     }
-    let mut out = Vec::new();
+    let mut out: Vec<Region> = Vec::new();
     let mut name_table: Vec<u8> = Vec::new();
     let mut pos = MAGIC.len() as u64;
+    let len = source
+        .seek(SeekFrom::End(0))
+        .map_err(|e| LimitHit::corrupt(format!("ar: {e}")))?;
     loop {
-        if source.seek(SeekFrom::Start(pos)).is_err() {
+        if pos >= len {
             break;
         }
+        source
+            .seek(SeekFrom::Start(pos))
+            .map_err(|e| LimitHit::corrupt(format!("ar: {e}")))?;
         let mut hdr = [0u8; 60];
-        if source.read_exact(&mut hdr).is_err() {
+        let got = source.read(&mut hdr).unwrap_or(0);
+        let size = (got == 60 && &hdr[58..60] == b"`\n")
+            .then(|| parse_decimal(&hdr[48..58]))
+            .flatten();
+        let Some(size) = size else {
+            // Not a header, with bytes left. `ar` and `dpkg-deb` do not all
+            // agree about what a damaged one is, so what is left is scanned as
+            // it lies, unless it is only the padding a writer leaves.
+            let rest = crate::read_at(source, pos, 4096)?;
+            if rest.iter().any(|b| !matches!(b, b'\n' | b' ' | 0)) {
+                out.push(Region::Member(
+                    format!("<ar-from-{pos}>"),
+                    pos,
+                    len.saturating_sub(pos),
+                ));
+            }
             break;
-        }
-        if &hdr[58..60] != b"`\n" {
-            break;
-        }
-        let size = parse_decimal(&hdr[48..58]);
+        };
         let body = pos + 60;
         let name = resolve_name(&hdr[0..16], &name_table);
         match name.as_str() {
@@ -70,9 +96,9 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
                 source.read_exact(&mut name_table).ok();
             }
             "/" | "/SYM64/" | "__.SYMDEF" => {}
-            _ => out.push((name, body, size)),
+            _ => out.push(Region::Member(name, body, size)),
         }
-        pos = body + size + (size & 1);
+        pos = body.saturating_add(size).saturating_add(size & 1);
     }
     Ok(out)
 }

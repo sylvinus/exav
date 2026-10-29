@@ -91,6 +91,25 @@ use exav_core::{
 };
 use walkdir::WalkDir;
 
+/// Whether this daemon honours `SHUTDOWN` and `QUIT`, set once at startup and
+/// inherited by every forked worker, so that `VERSIONCOMMANDS` lists them only
+/// when they work.
+static SHUTDOWN_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The `VERSIONCOMMANDS` reply: the version, then the verbs this daemon honours.
+fn versioncommands(version: &str, shutdown: bool, scanurl: bool) -> String {
+    format!(
+        "{version}| COMMANDS: SCAN CONTSCAN MULTISCAN ALLMATCHSCAN INSTREAM EXINSTREAM FILDES \
+         STATS VERSION VERSIONCOMMANDS RELOAD{} PING IDSESSION SESSION END{}",
+        if shutdown { " SHUTDOWN QUIT" } else { "" },
+        if cfg!(feature = "http-scan") && scanurl {
+            " SCANURL"
+        } else {
+            ""
+        }
+    )
+}
+
 /// Worker/thread count advertised as `max` in the clamd-compatible `STATS`
 /// reply. Set once at daemon startup (prefork: the configured worker count) and
 /// inherited by every forked worker via copy-on-write. `0` = unset (unit tests
@@ -517,6 +536,7 @@ pub fn run(
     max_connections: usize,
 ) -> io::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
     let conns = Arc::new(AtomicUsize::new(0));
     // A client that disconnects right after reading a reply delivers SIGPIPE on
     // the next write. `main` set the default disposition, which kills the
@@ -1391,6 +1411,45 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
     Some((usable / workers.max(1) as u64).max(FLOOR))
 }
 
+/// What the one-shot run has found so far, kept where the alarm's handler can
+/// read it: an atomic is the only state an async-signal-safe handler may read.
+#[cfg(unix)]
+static ONESHOT_INFECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static ONESHOT_ERRORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The exit code of a run that ran out of time and had found nothing else:
+/// what `--partial-as` gives a `LIMITS-EXCEEDED`.
+#[cfg(unix)]
+static ONESHOT_TIMEOUT_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(3);
+
+/// The run's detections and errors so far, for the exit code of a run the alarm
+/// ends. Cheap enough to call after every file.
+pub(crate) fn note_run(infected: u64, errors: u64) {
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ONESHOT_INFECTED.store(infected > 0, Relaxed);
+        ONESHOT_ERRORS.store(errors > 0, Relaxed);
+    }
+    #[cfg(not(unix))]
+    let _ = (infected, errors);
+}
+
+/// The exit code a one-shot run ends with when the alarm cuts it short, by the
+/// same precedence as a run that finished: a detection, then an error, then the
+/// file that ran out of time as `--partial-as` says.
+#[cfg(unix)]
+fn oneshot_exit_code() -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if ONESHOT_INFECTED.load(Relaxed) {
+        1
+    } else if ONESHOT_ERRORS.load(Relaxed) {
+        2
+    } else {
+        ONESHOT_TIMEOUT_EXIT.load(Relaxed)
+    }
+}
+
 /// Handler for the one-shot CLI's wall-clock alarm.
 ///
 /// Separate from [`on_sigalrm`], which serves a pool worker that a parent will
@@ -1399,16 +1458,15 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
 /// handler may use.
 #[cfg(unix)]
 extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
-    const MSG: &[u8] = b"exav: scan exceeded --max-scan-secs\n";
+    const MSG: &[u8] =
+        b"exav: scan exceeded --max-scan-secs; the files after it were not scanned\n";
     unsafe {
         libc::write(2, MSG.as_ptr().cast(), MSG.len());
-        // Exit 3, the `PARTIAL` code, rather than the pool's dedicated timeout
-        // code: a scan that ran out of time is one more object exav declined to
-        // call clean, and it should sort with the others. The handler cannot
-        // consult `--partial-as` (reading it here would not be
-        // async-signal-safe), so a run that folds partials elsewhere still gets
-        // 3 from this path alone.
-        libc::_exit(3)
+        // The code the run would have had: a detection already reported stays
+        // a 1, however the run ended. The file that ran out of time counts as a
+        // `LIMITS-EXCEEDED` under `--partial-as`, read at startup because the
+        // policy cannot be consulted here.
+        libc::_exit(oneshot_exit_code())
     }
 }
 
@@ -1430,6 +1488,14 @@ pub(crate) fn apply_oneshot_limits(max_scan_time: Option<u64>, max_scan_memory: 
         set_rlimit(libc::RLIMIT_AS as libc::c_int, bytes);
     }
     if let Some(secs) = max_scan_time {
+        use crate::policy::PartialStatus;
+        let code = match crate::policy::current().for_tag("LIMITS-EXCEEDED") {
+            PartialStatus::Partial => 3,
+            PartialStatus::Ok => 0,
+            PartialStatus::Found => 1,
+            PartialStatus::Error => 2,
+        };
+        ONESHOT_TIMEOUT_EXIT.store(code, std::sync::atomic::Ordering::Relaxed);
         install_handler(libc::SIGALRM, on_oneshot_alarm);
         set_timer(std::time::Duration::from_secs(secs));
     }
@@ -2011,6 +2077,7 @@ fn worker_main(
     // `SHUTDOWN` likewise forwards to the supervisor (SIGTERM → graceful
     // teardown of the whole pool). Disabled → report it wasn't honoured.
     let allow_shutdown = cfg.allow_shutdown;
+    SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
     let allow_http_scan = cfg.allow_http_scan;
     let shutdown = move || -> bool {
         if allow_shutdown {
@@ -2470,15 +2537,10 @@ fn dispatch<R: Read>(
         // a verb that is listed but refused is a capability nobody can use.
         // `SCANURL` is therefore listed only when this daemon would honour it:
         // built with `http-scan` and started with `--allow-http-scan`.
-        "VERSIONCOMMANDS" => vec![format!(
-            "{}| COMMANDS: SCAN CONTSCAN MULTISCAN ALLMATCHSCAN INSTREAM EXINSTREAM FILDES \
-             STATS VERSION VERSIONCOMMANDS RELOAD SHUTDOWN QUIT PING IDSESSION SESSION END{}",
-            clamav_version(db),
-            if cfg!(feature = "http-scan") && allow_http_scan {
-                " SCANURL"
-            } else {
-                ""
-            }
+        "VERSIONCOMMANDS" => vec![versioncommands(
+            &clamav_version(db),
+            SHUTDOWN_ALLOWED.load(Ordering::Relaxed),
+            allow_http_scan,
         )],
         // RELOAD is intercepted in `run_command` (it needs the supervisor hook).
         // clamd-compatible status block: POOLS/STATE/THREADS/QUEUE/MEMSTATS/END,
@@ -4667,6 +4729,16 @@ mod tests {
         let reply = String::from_utf8_lossy(&buf);
         assert!(reply.contains("FOUND"), "got {reply}");
         let _ = w.write(b""); // keep w alive until reply read
+    }
+
+    /// A verb is listed when it works and not when it is refused, so a client
+    /// that reads the list does not send a command that cannot do anything.
+    #[test]
+    fn versioncommands_lists_shutdown_only_when_it_is_honoured() {
+        assert!(!versioncommands("v", false, false).contains("SHUTDOWN"));
+        assert!(!versioncommands("v", false, false).contains("QUIT"));
+        assert!(versioncommands("v", true, false).contains(" SHUTDOWN QUIT "));
+        assert!(!versioncommands("v", false, false).contains("SCANURL"));
     }
 
     #[test]

@@ -478,6 +478,34 @@ scanner's, and are not part of this aim.
 
 ## Robustness
 
+- **An LZMA-alone stream cut short gives about 20 bytes less than `xz -dc`.**
+  `LzmaStream`, the decoder `lzma-rust2` offers without I/O, will not decode the
+  symbols of the last bytes it was given, and a `Finish` call fails with no
+  output. The xz reader gets the same bytes by giving its decoder one zero byte
+  at the end of the input, which `LzmaStream` does not take: its first call
+  with one fails after a few bytes. The Read-based `LzmaReader` writes every
+  byte when read a byte at a time, but drops the output of a read that meets
+  damage, which is what `SansIo` exists to avoid. Options: a one-byte read
+  for the last chunk only, found by reading ahead of the input; or a decoder of
+  our own for the last symbols.
+- **`group()` drops a RAR set with two parts at one index.** `x.part1.rar` and
+  `x.part01.rar` name one volume twice, so `volume::group` returns no set for
+  them and each part is scanned alone (and reports `UNSCANNABLE`, as a RAR
+  volume alone does). Reporting the set, with the reason, would say what it
+  is.
+- **`is_budget_overflow` recognises an error by its text.** `stream.rs` compares
+  the message of an `io::Error` with a sentinel string to tell a budget
+  overflow from damage. A typed error carried in the `io::Error` would not
+  break when a message is reworded.
+- **`read_member` skips a member whose bytes are its container's.** A
+  `Container:`-scoped signature cannot fire on that copy. Contrived, and the
+  copy is scanned as the container.
+- **Limits set from a `u64` use `as usize` in the volume-set functions.** On
+  wasm32 a limit above 4 GiB wraps to a small one, which fails closed
+  (`Unscannable`). `usize::try_from` with a saturating fallback would say what
+  is meant.
+- **Word's `{\rt` as RTF.** exav types RTF by `{\rtf` at offset 0 only; whether
+  Word opens `{\rt` and what follows is untested.
 - **A JPEG XL file can still take a gigabyte for one section.** The vendored
   decoder (`zenjxl-decoder`) sizes the buffer of each section of a frame from
   the length its table of contents declares, and zero-fills it, before the data

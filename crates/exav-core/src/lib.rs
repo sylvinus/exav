@@ -1588,8 +1588,18 @@ fn scan_within<R: Read + Seek>(
         if data.len() as u64 <= opts.deep_analysis_max {
             return Ok(analyze(db, &data, opts));
         }
-        // It grew while it was read: scanned as the larger object it now is.
+        // It grew while it was read: scanned as the larger object it now is,
+        // if it says it is. A device that reads on without end (`/dev/zero`)
+        // measures nothing, and a scan of its measure would be of no bytes.
+        let end = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
+        if end <= opts.deep_analysis_max {
+            return Err(io::Error::other(format!(
+                "the source gave more than {} bytes and says it has {end}: \
+                 it is not a file with a length, and cannot be scanned as one",
+                opts.deep_analysis_max
+            )));
+        }
     }
     let cache = opts.object_cache(reader)?;
     let report = analyze_source(db, &cache, opts);
@@ -2057,8 +2067,8 @@ pub struct VolumeSetVerdict {
 /// whole set with it. Byte-split naming records no part count, so a set missing
 /// its LAST part still looks contiguous and would join into a truncated prefix,
 /// which parses as the archive and scans clean. The set is reported
-/// `Unscannable` instead. The dropped part's own scan, which the caller does
-/// separately, still covers that part's bytes.
+/// `Unscannable` instead, each part read and not held included. The caller's
+/// own scan of a part says only that the fragment is not malware itself.
 ///
 /// Returns one entry per *part*, each carrying the verdict of the archive that
 /// part belongs to, including `Unscannable` for a set with a hole in it, whose
@@ -3374,10 +3384,23 @@ fn scan_archive(
     if obj.depth == 0 {
         findings.push(Finding::new("type", ft.as_str()));
     }
-    if let Some(o) = scan_carried(db, data, obj, ft, opts, budget, findings, sink) {
+    let mut carried = DeepOutcome::Clean;
+    if let Some(o) = scan_carried(
+        db,
+        data,
+        obj,
+        ft,
+        opts,
+        budget,
+        findings,
+        sink,
+        &mut carried,
+    ) {
         return o;
     }
-    let members = walk_members(db, data, obj, ft, fmt, opts, budget, findings, sink);
+    let mut members = walk_members(db, data, obj, ft, fmt, opts, budget, findings, sink);
+    // What the encoded files in the object turned up, if the walk found nothing.
+    defer(&mut members, carried);
     // Matched whatever stopped the walk short of a detection: a detection beats
     // a limit.
     if matches!(members, DeepOutcome::Infected { .. }) || !obj.core {
@@ -3408,6 +3431,49 @@ fn scan_archive(
         &mut outcome,
     ) {
         return o;
+    }
+    // A file can be two archives. The magic at its start types it as one, and a
+    // reader that goes by another structure opens the other: a ZIP appended to a
+    // PDF, a tar or a gzip is the archive `unzip` finds by the record at the end
+    // of the file, and an ISO or ext image may begin with an archive's magic in
+    // the space it leaves free. What the first walk did not reach is walked as
+    // the second.
+    if obj.carve && obj.depth < budget.limits().max_recursion {
+        let second = Obj {
+            carve: false,
+            embedded: true,
+            ..obj.inner(obj.container)
+        };
+        if fmt != unpack::Format::Zip
+            && let Some(at) = unpack::appended_zip_start(data)
+            && let Ok(at) = usize::try_from(at)
+            && at < data.len()
+        {
+            let sub = &byte_source::Sub::new(data, at, data.len() - at);
+            match scan_found(db, sub, second, opts, budget, findings, sink) {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
+                o => defer(&mut outcome, o),
+            }
+        }
+        if let Some(other) = unpack::also_reads_as(data, fmt) {
+            let o = walk_members(
+                db,
+                data,
+                second,
+                filetype::filetype_of_format(other),
+                other,
+                opts,
+                budget,
+                findings,
+                sink,
+            );
+            match o {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
+                o => defer(&mut outcome, o),
+            }
+        }
     }
     // An OLE2 file's executables are also carved from its own bytes, each
     // scanned from its header to the end of the file, as ClamAV carves them.
@@ -3451,6 +3517,7 @@ fn scan_carried(
     budget: &mut Budget,
     findings: &mut Vec<Finding>,
     sink: &mut Sink,
+    deferred: &mut DeepOutcome,
 ) -> Option<DeepOutcome> {
     // Embedded base64-encoded executables. Scripts/RTF/HTML carriers stash a
     // PE/ELF as a long base64 string (PowerShell reflective loaders, JS/VBS
@@ -3459,14 +3526,13 @@ fn scan_carried(
     // real executable. Bounded by recursion depth and the scan budget;
     // exav-exclusive, so off under `--clamav-compat` and `--no-base64`.
     #[cfg(feature = "base64scan")]
-    if opts.decode_base64
-        && obj.depth < budget.limits().max_recursion
-        && mostly_text(&data.window(0, 8192))
-    {
-        for (b64ix, payload) in unpack::base64_payloads(data, budget.limits().max_buffer_bytes)
-            .into_iter()
-            .enumerate()
-        {
+    if opts.decode_base64 && obj.depth < budget.limits().max_recursion && text_anywhere(data) {
+        let (payloads, capped) =
+            unpack::base64_payloads_capped(data, budget.limits().max_buffer_bytes);
+        if capped {
+            engine::mark_capped(base64_capped);
+        }
+        for (b64ix, payload) in payloads.into_iter().enumerate() {
             // Name the decoded run so a hit inside it is attributable. Without
             // this the detection reports no location and reads as a match on the
             // carrier's own bytes, which is how a correct `Win.Trojan.Mimikatz`
@@ -3484,9 +3550,10 @@ fn scan_carried(
                 carve: false,
                 ..obj.inner(payload_container)
             };
-            let o = scan_found(db, &payload, inner, opts, budget, findings, sink);
-            if matches!(o, DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) {
-                return Some(o);
+            match scan_found(db, &payload, inner, opts, budget, findings, sink) {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return Some(o),
+                o => defer(deferred, o),
             }
         }
     }
@@ -3505,19 +3572,21 @@ fn scan_carried(
         && let Some(mc) = markup_cltype(ft, &data.window(0, 4096))
     {
         let _ag = engine::AncestryGuard::enter(Some(mc));
-        for (ix, payload) in
-            unpack::markup_embedded_payloads(data, budget.limits().max_buffer_bytes)
-                .into_iter()
-                .enumerate()
-        {
+        let (payloads, capped) =
+            unpack::markup_embedded_payloads_capped(data, budget.limits().max_buffer_bytes);
+        if capped {
+            engine::mark_capped(base64_capped);
+        }
+        for (ix, payload) in payloads.into_iter().enumerate() {
             let _mpg = MatchPathGuard::enter(&format!("embedded-asset-{}", ix + 1));
             let inner = Obj {
                 carve: false,
                 ..obj.inner(Some(mc))
             };
-            let o = scan_found(db, &payload, inner, opts, budget, findings, sink);
-            if matches!(o, DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) {
-                return Some(o);
+            match scan_found(db, &payload, inner, opts, budget, findings, sink) {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return Some(o),
+                o => defer(deferred, o),
             }
         }
     }
@@ -3666,7 +3735,17 @@ fn scan_file(
     ) {
         return o;
     }
-    if let Some(o) = scan_carried(db, data, obj, ft, opts, budget, findings, sink) {
+    if let Some(o) = scan_carried(
+        db,
+        data,
+        obj,
+        ft,
+        opts,
+        budget,
+        findings,
+        sink,
+        &mut deferred,
+    ) {
         return o;
     }
 
@@ -3719,7 +3798,11 @@ fn scan_file(
             let sub = &byte_source::Sub::new(data, off, data.len() - off);
             match scan_found(db, sub, carved, opts, budget, findings, sink) {
                 DeepOutcome::Clean => {}
-                other => return other,
+                // As in the loops below: an image that could not be read whole
+                // is reported if nothing else is found, and must not stop the
+                // scan of the rest of the carrier.
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
+                o => defer(&mut deferred, o),
             }
         }
 
@@ -4124,6 +4207,33 @@ fn mostly_text(data: &[u8]) -> bool {
         .filter(|&&b| b == b'\t' || b == b'\r' || b == b'\n' || (0x20..=0x7e).contains(&b))
         .count();
     printable * 100 >= sample.len() * 90
+}
+
+/// Whether any stretch of `data` is text, going by up to four 8 KiB samples (its
+/// start, its end and the thirds between, stopping at the first that has any)
+/// and by the kilobytes of a sample one by one. A script behind a binary header
+/// or a long comment of high bytes is text where it matters. Each sample over a
+/// cache is a block of it read, so a binary object pays at most three more than
+/// the first.
+#[cfg(feature = "base64scan")]
+fn text_anywhere(data: &dyn ByteSource) -> bool {
+    const SAMPLE: usize = 8192;
+    let texty = |at: usize| data.window(at, SAMPLE).chunks(1024).any(mostly_text);
+    let len = data.len();
+    if len <= SAMPLE {
+        return texty(0);
+    }
+    let last = len - SAMPLE;
+    [0, last, last / 3, last / 3 * 2].into_iter().any(texty)
+}
+
+/// Why an object that has more base64-encoded files than are decoded in one
+/// object is not fully scanned.
+#[cfg(feature = "base64scan")]
+fn base64_capped() -> String {
+    "more base64-encoded executables, archives or images than are decoded in one object: \
+     the rest were not scanned"
+        .to_string()
 }
 
 /// The normalised views of `data` a textual file is matched against, in order.
@@ -4725,6 +4835,34 @@ mod tests {
             fine_reads > 8 * small_reads,
             "{fine_reads} vs {small_reads}"
         );
+    }
+
+    /// A source that reads on without end and measures itself as empty (a
+    /// character device such as `/dev/zero`) is an error, not a clean scan of
+    /// nothing.
+    #[test]
+    fn a_source_with_no_length_is_an_error_not_a_clean_scan() {
+        struct Endless;
+        impl std::io::Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+        impl std::io::Seek for Endless {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                Ok(0)
+            }
+        }
+        let opts = ScanOptions {
+            deep_analysis_max: 4096,
+            ..ScanOptions::default()
+        };
+        let e = scan_seekable(&Scanner::builtin(), Endless, 0, &opts).unwrap_err();
+        assert!(e.to_string().contains("not a file with a length"), "{e}");
+        // A file that grew while it was read is still scanned as what it is.
+        let big = std::io::Cursor::new(vec![b'a'; 10_000]);
+        assert!(scan_seekable(&Scanner::builtin(), big, 100, &opts).is_ok());
     }
 
     /// The one read of a streamed object finds what each step's own read of

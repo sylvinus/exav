@@ -412,6 +412,55 @@ fn nothing_is_written_through_a_link() {
     assert!(!fresh.join("up").is_symlink());
 }
 
+/// Each link of a chain passes a check of its own words: `a -> .` stays, and
+/// `b -> a/..` has one `..` against two components. Followed through `a`, `b` is
+/// the directory above the root, and `c -> b/..` the one above that.
+#[cfg(unix)]
+#[test]
+fn a_chain_of_links_does_not_walk_out_of_the_extraction_directory() {
+    let sc = Scratch::new("link-chain");
+    let t = sc.write(
+        "chain.tar",
+        &tar_of(&[
+            ("a", b'2', 0o777, 0, ".", b""),
+            ("b", b'2', 0o777, 0, "a/..", b""),
+            ("c", b'2', 0o777, 0, "b/..", b""),
+            ("d", b'2', 0o777, 0, "c/etc", b""),
+            ("fine", b'2', 0o777, 0, "a/sub", b""),
+        ]),
+    );
+    let fresh = sc.subdir("outer/root");
+    let o = run(&[s(&t), "-d", s(&fresh)]);
+    assert!(
+        stderr(&o).contains("outside the extraction directory"),
+        "{}",
+        stderr(&o)
+    );
+    let root = std::fs::canonicalize(&fresh).unwrap();
+    for name in ["a", "b", "c", "d", "fine"] {
+        let l = fresh.join(name);
+        if l.is_symlink() {
+            let resolved = std::fs::canonicalize(&l).unwrap_or_else(|_| {
+                // Dangling: judge it by where its parent's target would be.
+                root.join(std::fs::read_link(&l).unwrap())
+            });
+            assert!(
+                resolved.starts_with(&root) || name == "fine",
+                "{name} leaves the root: {}",
+                resolved.display()
+            );
+        }
+    }
+    assert!(
+        !fresh.join("b").is_symlink(),
+        "b -> a/.. is the directory above the root"
+    );
+    assert!(
+        fresh.join("a").is_symlink(),
+        "a link inside the root is still made"
+    );
+}
+
 /// tar keeps what unzip restores: the time, the permission bits, the links.
 #[cfg(unix)]
 #[test]
@@ -834,4 +883,43 @@ fn an_unrecognised_format_fails_rather_than_reporting_an_empty_archive() {
     assert_eq!(code(&o), 9, "stderr: {}", stderr(&o));
     assert!(stderr(&o).contains("not an archive"), "{}", stderr(&o));
     assert_eq!(stdout(&o), "");
+}
+
+/// `exav-unpack -l archive | head` ends quietly, as every Unix filter does:
+/// Rust ignores `SIGPIPE`, and `println!` panics on the `EPIPE` it gets back.
+#[cfg(unix)]
+#[test]
+fn a_listing_into_a_closed_pipe_ends_quietly() {
+    use std::io::Read;
+    let sc = Scratch::new("closed-pipe");
+    // Far more output than a pipe holds, so the program is still writing when
+    // the reader goes away.
+    let names: Vec<String> = (0..6000)
+        .map(|i| format!("member-with-a-long-name-{i:05}.txt"))
+        .collect();
+    let members: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b""[..])).collect();
+    let arc = sc.write("many.zip", &zip_of(&members));
+    let mut child = Command::new(BIN)
+        .arg("-l")
+        .arg(&arc)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // One byte read, then the pipe closed.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut one = [0u8; 1];
+    stdout.read_exact(&mut one).unwrap();
+    drop(stdout);
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(!err.contains("failed printing"), "{err}");
+    assert_ne!(status.code(), Some(101), "{err}");
 }

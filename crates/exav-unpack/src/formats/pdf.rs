@@ -160,11 +160,51 @@ pub(crate) fn extract_pdf<R>(
     let mut js_acc: Vec<u8> = Vec::new();
     let mut uri_acc: Vec<u8> = Vec::new();
     let mut lex = Lexer::new(data);
+    // Where each object number is, found when a stream's `/Filter` or
+    // `/DecodeParms` is a reference to one.
+    let mut index: Option<HashMap<u32, usize>> = None;
+    // Bytes read again because an object ended before its parse did, or did not
+    // parse. Bounded, since every object of a crafted file can claim the rest of
+    // it, and the bound is said when it is reached.
+    let mut reread = 0u64;
+    let reread_cap = (data.len() as u64)
+        .saturating_mul(8)
+        .saturating_add(1 << 20);
+    let mut gave_up = false;
     while let Some((obj_id, r#gen, obj_start)) = lex.find_next_obj() {
         lex.set_pos(obj_start);
-        let Some((obj, _end)) = parse_indirect_object_body(&mut lex) else {
+        let Some((obj, end)) = parse_indirect_object_body(&mut lex) else {
+            // An object that does not parse (an unterminated string in it runs
+            // to the end of the file) is not the end of the document: the scan
+            // goes on from its start, as a reader going by the cross-reference
+            // table reaches every object after it.
+            reread = reread.saturating_add(lex.pos().saturating_sub(obj_start) as u64);
+            if reread > reread_cap {
+                gave_up = true;
+            } else {
+                lex.set_pos(obj_start);
+            }
             continue;
         };
+        // An object that does not end where it says (a string left open takes
+        // the rest of the file for itself, and the dictionary round it still
+        // parses) must not take the objects after it. Parsing resumes after the
+        // first `endobj`, as a reader that goes by the cross-reference table
+        // finds each of them.
+        if let Some(p) = memchr::memmem::find(
+            &data[obj_start.min(data.len())..end.min(data.len())],
+            b"endobj",
+        ) {
+            let stop = obj_start + p + b"endobj".len();
+            if end > stop {
+                reread = reread.saturating_add((end - stop) as u64);
+                if reread > reread_cap {
+                    gave_up = true;
+                } else {
+                    lex.set_pos(stop);
+                }
+            }
+        }
         budget.count_entry()?;
 
         // Harvest JS / URI / launch strings from this object's dictionary(s).
@@ -192,6 +232,7 @@ pub(crate) fn extract_pdf<R>(
             }
             let raw_len = stream_data.len() as u64;
             let cap = budget.reserve()?;
+            let info = resolve_filter_references(info, data, &mut index);
             let outcome = apply_filters(&stream_data, &info, cap)?;
             if outcome.truncated {
                 return Err(LimitHit::new("pdf stream exceeds budget".to_string()));
@@ -225,7 +266,12 @@ pub(crate) fn extract_pdf<R>(
                 e
             } else {
                 let mut e = Entry::new(format!("pdf-obj-{obj_id}-{gen}"), buf);
-                if outcome.part_way {
+                if outcome.unknown_filter {
+                    e.unsupported = Some(
+                        "PDF stream uses a filter that is not decoded; its bytes were \
+                         scanned as far as the filters before it decode them",
+                    );
+                } else if outcome.part_way {
                     e.unsupported = Some(
                         "PDF stream failed to decode part way; the bytes before the \
                          failure were scanned",
@@ -236,6 +282,21 @@ pub(crate) fn extract_pdf<R>(
             if let Some(r) = visit(entry, budget) {
                 return Ok(Some(r));
             }
+        }
+    }
+
+    if gave_up {
+        budget.count_entry()?;
+        if let Some(r) = visit(
+            Entry::unsupported(
+                "pdf-overlapping-objects".to_string(),
+                data.len() as u64,
+                false,
+                "PDF objects run into one another more than can be read again; the rest of the file was not scanned object by object",
+            ),
+            budget,
+        ) {
+            return Ok(Some(r));
         }
     }
 
@@ -330,6 +391,80 @@ fn harvest_inner(
     }
 }
 
+/// `info` with the references in `/Filter` and `/DecodeParms` replaced by the
+/// objects they name, which a PDF may use for either. The scan is object by
+/// object, so a filter written as `7 0 R` was no filter at all, and the stream
+/// was scanned compressed.
+fn resolve_filter_references(
+    mut info: HashMap<String, Primitive>,
+    data: &[u8],
+    index: &mut Option<HashMap<u32, usize>>,
+) -> HashMap<String, Primitive> {
+    let mut resolve = |p: &Primitive| -> Option<Primitive> {
+        let mut at = p.clone();
+        // A reference to a reference is followed, a loop of them not forever.
+        for _ in 0..8 {
+            let Primitive::Reference(id) = at else {
+                return Some(at);
+            };
+            let index = index.get_or_insert_with(|| {
+                let mut found = HashMap::new();
+                let mut lex = Lexer::new(data);
+                // The last definition of a number wins, as in an incremental
+                // update.
+                while let Some((n, _gen, start)) = lex.find_next_obj() {
+                    found.insert(n, start);
+                }
+                found
+            });
+            let start = *index.get(&id)?;
+            let mut lex = Lexer::new(data);
+            lex.set_pos(start);
+            at = match parse_indirect_object_body(&mut lex)?.0 {
+                Primitive::Stream { .. } => return None,
+                other => other,
+            };
+        }
+        None
+    };
+    for key in ["Filter", "DecodeParms", "DP"] {
+        let Some(value) = info.get(key) else {
+            continue;
+        };
+        let resolved = match value {
+            Primitive::Reference(_) => resolve(value),
+            Primitive::Array(items)
+                if items.iter().any(|i| matches!(i, Primitive::Reference(_))) =>
+            {
+                Some(Primitive::Array(
+                    items
+                        .iter()
+                        .map(|i| resolve(i).unwrap_or(Primitive::Null))
+                        .collect(),
+                ))
+            }
+            _ => continue,
+        };
+        match resolved {
+            Some(v) => {
+                info.insert(key.to_string(), v);
+            }
+            // A reference to nothing: the stream names a filter it does not
+            // give. Left as a name no decoder has, so the stream is reported.
+            None if key == "Filter" => {
+                info.insert(
+                    key.to_string(),
+                    Primitive::Name("<unresolved filter reference>".to_string()),
+                );
+            }
+            None => {
+                info.remove(key);
+            }
+        }
+    }
+    info
+}
+
 /// What decoding a stream's `/Filter` chain produced.
 pub(crate) struct FilterOutcome {
     pub(crate) buf: Vec<u8>,
@@ -344,6 +479,9 @@ pub(crate) struct FilterOutcome {
     /// A filter decoded part of its input and failed on the rest: `buf` holds
     /// what came before the failure.
     part_way: bool,
+    /// The chain names a filter that is neither decoded here nor an image
+    /// codec: what follows it was not decoded, and `buf` is not the content.
+    unknown_filter: bool,
 }
 
 /// A zlib stream decoded up to any damage, without its Adler-32 check.
@@ -380,11 +518,13 @@ pub(crate) fn apply_filters(
             // No decoding involved: raw bytes pass through, nothing to fail.
             decode_error: false,
             part_way: false,
+            unknown_filter: false,
         });
     }
     let parms = decode_parms_list(info, names.len());
     let mut buf = stream_data.to_vec();
     let mut part_way = false;
+    let mut unknown_filter = false;
     // Whether an implemented filter failed with nothing recovered. Sticky
     // across the chain: only a successful decode producing content clears the
     // question, and the caller reports `unsupported` solely on
@@ -448,7 +588,18 @@ pub(crate) fn apply_filters(
             // (an image codec over raw bytes reads as the raw bytes — same as
             // ClamAV, which matches signatures against the stream content
             // without decoding image codecs either).
-            _ => break,
+            // The identity crypt filter, which every reader passes over:
+            // what a `/Crypt` before `/FlateDecode` leaves is still to be
+            // inflated. (A named crypt filter is applied with the document's
+            // key, in the pass that decrypts streams.)
+            "Crypt" => continue,
+            // An image codec ends the chain. Any other name is a filter no
+            // decoder here has, and what follows it cannot be reached.
+            "DCTDecode" | "DCT" | "JPXDecode" | "CCITTFaxDecode" | "CCF" | "JBIG2Decode" => break,
+            _ => {
+                unknown_filter = true;
+                break;
+            }
         };
         decode_error |= err;
         if truncated {
@@ -457,6 +608,7 @@ pub(crate) fn apply_filters(
                 truncated: true,
                 decode_error,
                 part_way,
+                unknown_filter,
             });
         }
         buf = out;
@@ -467,6 +619,7 @@ pub(crate) fn apply_filters(
         truncated,
         decode_error,
         part_way,
+        unknown_filter,
     })
 }
 

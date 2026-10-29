@@ -141,15 +141,21 @@ zip-slip, path traversal and symlink attacks still have nowhere to write.
 ## Containers have two indexes
 
 A ZIP lists its members twice: a local file header before each member's data, and
-a central directory at the end. Every normal reader trusts the central directory,
-because that is what the specification says is authoritative.
+a central directory at the end. The specification says the central directory is
+authoritative, and many readers go by it. Others, `unzip` among them, go by the
+local header.
 
-So a member can be hidden: leave it out of the central directory and keep its
-local header and data in the file. Plenty of extractors still write it out.
+So a member can be hidden in two ways: leave it out of the central directory and
+keep its local header and data in the file, or give the directory's record a
+method, a size or a name that is not the local header's, so that the two kinds of
+reader read two different members. Plenty of extractors still write both out.
 
 exav does dual indexing: after the central-directory pass it scans the raw bytes
-for local headers the directory did not cover, and extracts those too. The same
-path is the salvage route when the central directory is corrupt, forged or
+for local headers the directory did not cover, and extracts those too. A member
+whose local header says another method, another compressed size (when the header
+carries one) or another name than its directory record is read as its local
+header says as well, and claims none of the space of the members around it. The
+same path is the salvage route when the central directory is corrupt, forged or
 truncated. On a ZIP read from its source rather than held in memory, the search
 covers at most 16 MiB of unclaimed bytes, and a search cut short there is
 reported, not taken as complete.
@@ -165,7 +171,9 @@ it from readers that check the method.
 ISO images have the same shape: a CD image carries several volume descriptors,
 each with its own directory tree over the same sectors. A malicious ISO lists its
 payload only in the Joliet tree and leaves the primary tree empty, so a reader
-that parses the primary one sees an empty disc. exav walks every tree.
+that parses the primary one sees an empty disc. exav walks every tree. A file
+is its first sector and its length: a record of no length at the start of
+another file's extent does not take that file's place.
 
 ## Recovering what a naive reader would skip
 
