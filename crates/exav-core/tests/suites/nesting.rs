@@ -245,6 +245,7 @@ fn phishing_and_regex_databases() {
     );
 }
 
+#[cfg(feature = "yara")]
 #[test]
 fn yara_sources() {
     use exav_core::yara::Compiler;

@@ -845,8 +845,8 @@ struct Cli {
     ///
     /// Larger blocks make fewer requests for reads that land at scattered
     /// offsets, and fetch more bytes than those reads use. Against a 300 MB
-    /// object, 1M took 2.4 times less time than 64K at 100 ms a request, and
-    /// 4M no less than 1M while fetching twice the bytes.
+    /// object, 1M took 2.5 times less time than 64K at 100 ms a request, and
+    /// 4M no less than 1M.
     #[arg(
         long = "object-cache-block-bytes",
         env = "EXAV_OBJECT_CACHE_BLOCK_BYTES",

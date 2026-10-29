@@ -3,7 +3,7 @@ title: Sizing a server
 description: What to set on a 4 GiB machine running exav as a clamd or ICAP server, and how each flag divides the memory.
 ---
 
-A worked example: one machine with 4 GiB of RAM and 6 GB of free disk for
+A worked example: one machine with 4 GiB of RAM and 40 GB of free disk for
 temp files, serving the clamd protocol (and optionally ICAP) with the full
 official database. The database figures were measured with the official
 `main`, `daily` and `bytecode` databases of September 2026 (3.6 million
@@ -16,23 +16,49 @@ them are worked out by exav at every start and printed in its log.
 exav --listen /run/clamav/clamd.ctl \
      -d /var/lib/exav/official.exavdb \
      --workers 2 \
-     --spill-dir /var/cache/exav --max-total-spill-bytes 2G
+     --max-process-bytes 818M \
+     --max-object-bytes 204M \
+     --max-extracted-bytes 311M \
+     --max-bytecode-memory-bytes 204M \
+     --object-cache-bytes 8M \
+     --spill-threshold-bytes 16M \
+     --spill-dir /var/cache/exav \
+     --max-spill-bytes 4G --max-total-spill-bytes 12G
 ```
 
-The spill directory must exist (exav refuses to start otherwise) and be writable
-by the daemon. The packaged unit makes the filesystem read-only, so add
-`CacheDirectory=exav` with `systemctl edit exav`, which creates
-`/var/cache/exav` for the unit's user.
+Each memory setting says how much one thing may hold, and the numbers add up
+to the machine ([where they come from](#where-the-4-gib-goes)):
 
-`--max-total-spill-bytes 2G` comes from the disk. The limit is per process,
-and three processes spill here: the two workers, and the ICAP child once
-[ICAP is added](#adding-icap). 6 GB over three is 2 GB each. It cannot go
-lower without lowering `--max-spill-bytes` too: one stream may spill up to that
-(2 GB by default), and exav refuses to start with a total below it. With more
-disk, raise it; the default, 8 GB per process, would let the three use 24 GB.
+| Flag | Value | What it bounds | Where the value comes from |
+|---|---|---|---|
+| `--workers` | 2 | Scans at once | The memory left after the database, shared between them |
+| `--max-process-bytes` | 818M | Everything one scan holds, as address space | (4096 MiB − a third kept for the system − the 1094 MiB database) / 2 workers |
+| `--max-object-bytes` | 204M | The largest object held whole; a larger one is read through a block cache or a spill file | A quarter of the scan's memory: matching may also need an image decoded from the object and its grey copy, each as large again |
+| `--max-extracted-bytes` | 311M | What formats that decode a member whole have produced, added up over the scan | What is left after those two copies, a 16 MiB lowercase copy and a tenth to spare: 818 − 2 × 204 − 16 − 82 |
+| `--max-bytecode-memory-bytes` | 204M | What one run of a bytecode signature holds | A quarter of the scan's memory |
+| `--object-cache-bytes` | 8M | The block cache of each object read in place | The default; an eighth of the scan's memory at most. More fetches an object less often |
+| `--spill-threshold-bytes` | 16M | What a stream holds in RAM before it goes to disk | The default; each connection holds this much |
 
-Everything else stays at its default, and exav fits the rest to the machine at
-startup:
+exav checks each of them against the machine at startup and only ever lowers
+one that does not fit, never raises one.
+
+The disk settings come from the 40 GB. The spill directory must exist (exav
+refuses to start otherwise) and be writable by the daemon. The packaged unit
+makes the filesystem read-only, so add `CacheDirectory=exav` with
+`systemctl edit exav`, which creates `/var/cache/exav` for the unit's user.
+
+- `--max-total-spill-bytes 12G` is per process, and three processes spill here:
+  the two workers, and the ICAP child once [ICAP is added](#adding-icap).
+  Keeping 4 GB spare, 36 GB over three is 12 GB each. The default, 8 GB per
+  process, would let the three use 24 GB.
+- `--max-spill-bytes 4G` is the most one stream or one member may take. A text
+  member also needs its normalised views beside it, which came to more than the
+  member again in the [measurements below](#archives-past-the-spill-ceiling), so
+  4G keeps a member and its views inside 12G. exav refuses to start with a total
+  below `--max-spill-bytes`.
+
+Leave the memory flags out and exav works out the same values on this machine
+and prints them at startup, which is how the figures above were found:
 
 ```text
 exav: per-job memory 2048 MiB x 2 workers exceeds what this host can back; using 818 MiB per job (two thirds of RAM, less the 1094 MiB shared database, over the workers). ...
@@ -82,15 +108,15 @@ used for case-insensitive matching, and a tenth to spare:
 
 ## What this host scans, and what to change to scan more
 
-With the command above (2 workers, 818 MiB a scan, 2 GiB of spill per process),
+With the command above (2 workers, 818 MiB a scan, 4 GiB for one stream or member and 12 GiB of spill per process),
 by kind of input:
 
 | Input | Scanned in full | Past that | To go further |
 |---|---|---|---|
-| A file on disk, an `http(s)://` object | Any size. Up to 204 MiB it is held whole; larger, it is read through an 8 MiB block cache | A PE, ELF or .NET file skips the checks that need it whole, and RAR, OLE, PDF and the other [formats read whole](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole) are not opened. Either is `LIMITS-EXCEEDED` if nothing is found | `--workers 1` gives a scan 1637 MiB, and one object 409 MiB. Beyond that, more RAM |
-| Members of ZIP, tar, 7z, CAB, ISO, the compressors and the other formats decoded as read | Each member up to 2 GiB: held up to 204 MiB, and past that written to disk. All of them together up to 10 GiB fed to the matcher | A member over 2 GiB is not scanned. An archive past 10 GiB is scanned as far as that | `--max-spill-bytes` (disk for one member), `--max-total-spill-bytes` (disk for all of a process's), `--max-matcher-bytes` (the 10 GiB, a time bound) |
+| A file on disk, an `http(s)://` object | Any size. Up to 204 MiB it is held whole; larger, it is read through an 8 MiB block cache | A PE, ELF or .NET file is not parsed, so the signatures and rules on its structure are not evaluated, and RAR, OLE, PDF and the other [formats read whole](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole) are not opened. Either is `LIMITS-EXCEEDED` if nothing is found | `--workers 1` gives a scan 1637 MiB, and one object 409 MiB. Beyond that, more RAM |
+| Members of ZIP, tar, 7z, CAB, ISO, the compressors and the other formats decoded as read | Each member up to 4 GiB: held up to 204 MiB, and past that written to disk. All of them together up to 10 GiB fed to the matcher | A member over 4 GiB is not scanned. An archive past 10 GiB is scanned as far as that | `--max-spill-bytes` (disk for one member), `--max-total-spill-bytes` (disk for all of a process's), `--max-matcher-bytes` (the 10 GiB, a time bound) |
 | Members that have to be decoded whole: encrypted ZIP members, RAR, OLE and PDF streams, installers, files a filesystem stores compressed | 311 MiB added up over one scan, 204 MiB in one object | `LIMITS-EXCEEDED`, naming the limit | `--workers 1` raises them to 640 MiB and 409 MiB; `--max-process-bytes` sets the memory a scan gets. `--max-extracted-bytes` and `--max-object-bytes` only lower what that memory allows |
-| A stream: `INSTREAM`, an ICAP body, stdin | The first 2 GiB, 16 MiB of it in RAM and the rest on disk | The first 2 GiB is scanned and the stream is `LIMITS-EXCEEDED` | `--max-spill-bytes`, `--max-total-spill-bytes` and the disk under `--spill-dir` |
+| A stream: `INSTREAM`, an ICAP body, stdin | The first 4 GiB, 16 MiB of it in RAM and the rest on disk | The first 4 GiB is scanned and the stream is `LIMITS-EXCEEDED` | `--max-spill-bytes`, `--max-total-spill-bytes` and the disk under `--spill-dir` |
 | A bytecode signature | 204 MiB held by one run | The run stops, the scan says so | `--max-bytecode-memory-bytes`, itself capped at a quarter of a scan's memory |
 
 Scanning a file or object past 204 MiB is slow rather than limited: it is read
@@ -163,8 +189,8 @@ with the member: 270 MB is one 204 MiB object and the block caches.
    `--spill-dir` at a filesystem with room. `--max-total-spill-bytes` is per
    process, and every worker and the ICAP child counts separately, so set it to
    what the disk can spare divided by the number of processes, and no lower
-   than `--max-spill-bytes`: 2G each above lets the 2 workers and the ICAP child
-   use 6G together. Do not leave it on a small `/tmp` held in RAM (`tmpfs`),
+   than `--max-spill-bytes`: 12G each above lets the 2 workers and the ICAP
+   child use 36G together. Do not leave it on a small `/tmp` held in RAM (`tmpfs`),
    which is memory again.
 
 6. **`--max-input-bytes`**, if the clients should not send anything larger. The
@@ -187,7 +213,14 @@ exav --listen /run/clamav/clamd.ctl \
      --listen 'icap://0.0.0.0:1344?max-connections=4' \
      -d /var/lib/exav/official.exavdb \
      --workers 2 \
-     --spill-dir /var/cache/exav --max-total-spill-bytes 2G
+     --max-process-bytes 818M \
+     --max-object-bytes 204M \
+     --max-extracted-bytes 311M \
+     --max-bytecode-memory-bytes 204M \
+     --object-cache-bytes 8M \
+     --spill-threshold-bytes 16M \
+     --spill-dir /var/cache/exav \
+     --max-spill-bytes 4G --max-total-spill-bytes 12G
 ```
 
 The only way to lower what one scan holds is a smaller `--max-process-bytes`,

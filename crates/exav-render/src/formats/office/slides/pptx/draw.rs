@@ -68,6 +68,10 @@ pub struct Ctx<'a> {
     /// The number of the last chart part, and the charts this part adds.
     pub chart_no: usize,
     pub charts: Vec<(usize, String)>,
+    /// The most bytes of XML the part may reach, and whether it did: the
+    /// shapes after that are not written.
+    pub limit: usize,
+    pub over: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -86,6 +90,8 @@ impl<'a> Ctx<'a> {
             used: vec![],
             chart_no,
             charts: vec![],
+            limit: usize::MAX,
+            over: false,
         }
     }
 
@@ -421,6 +427,10 @@ fn nvpr(o: &mut String, s: &Shape) {
 /// The shapes of a tree, in order.
 pub fn shapes(o: &mut String, list: &[Shape], ctx: &mut Ctx) {
     for s in list {
+        if o.len() > ctx.limit {
+            ctx.over = true;
+            return;
+        }
         shape(o, s, ctx);
     }
 }

@@ -236,7 +236,10 @@ fn a_field_at_its_extreme_costs_nothing_like_what_it_says() {
             ));
         }
     }
-    assert!(corpus.len() > 30, "only {} fixtures", corpus.len());
+    // The office fixtures alone, when the readers of the other formats are
+    // not built, are fewer.
+    let least = if cfg!(feature = "image") { 30 } else { 10 };
+    assert!(corpus.len() > least, "only {} fixtures", corpus.len());
     let (positions, values) = sweep();
     let mut findings: Vec<String> = vec![];
     let mut runs = 0u64;

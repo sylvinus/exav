@@ -1,5 +1,5 @@
 use super::error::{Error, Result};
-use super::model::{Shape, Sp};
+use super::model::{Paragraph, Run, RunKind, Shape, Sp, TextBody};
 
 /// Bounds on the work one conversion may do. A document past one of them is
 /// refused with [`Error::TooLarge`] rather than partly converted.
@@ -58,6 +58,28 @@ pub(crate) struct Budget {
 /// What one shape costs in the model, beyond its text and pictures: the shape
 /// and the largest of what it holds.
 pub(crate) const SHAPE_BYTES: u64 = (size_of::<Shape>() + size_of::<Sp>()) as u64;
+
+/// What the paragraphs and runs of a text body take in the model: each one's
+/// size, as it is held, and the text of the runs.
+pub(crate) fn text_bytes(text: &TextBody) -> u64 {
+    text.paras
+        .iter()
+        .map(|p| {
+            let runs: usize = p
+                .runs
+                .iter()
+                .map(|r| {
+                    size_of::<Run>()
+                        + match &r.kind {
+                            RunKind::Text(s) | RunKind::Field(_, s) => s.len(),
+                            RunKind::Break => 0,
+                        }
+                })
+                .sum();
+            (size_of::<Paragraph>() + runs) as u64
+        })
+        .sum()
+}
 
 impl Budget {
     pub fn new(limits: Limits) -> Self {

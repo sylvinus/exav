@@ -371,7 +371,13 @@ pub(crate) fn write(p: &mut Presentation, limit: u64) -> Result<Vec<u8>> {
             None => x.push_str("><p:cSld>"),
         }
         draw::background(&mut x, &s.background, &mut ctx);
+        // A slide's XML is held whole: it is bound by what the conversion
+        // has left, as its output is.
+        ctx.limit = usize::try_from(limit).unwrap_or(usize::MAX);
         draw::tree(&mut x, &s.shapes, &mut ctx);
+        if ctx.over {
+            return Err(Error::TooLarge("memory"));
+        }
         x.push_str("</p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>");
         pkg.put(
             &format!("ppt/slides/{}", slide_names[i]),

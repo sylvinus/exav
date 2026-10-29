@@ -910,7 +910,7 @@ const CARVE_MAGICS: [(&[u8], Magic); 14] = [
 /// is validated as it is met. The search stops once every kind is at its cap
 /// and one more candidate has been seen past a cap.
 pub(crate) fn embedded_in(data: &dyn ByteSource) -> Embedded {
-    let mut carving = Carving::new();
+    let mut carving = Carving::new(usize::MAX);
     let len = data.len();
     let mut at = 0;
     while at < len && !carving.full() {
@@ -926,6 +926,7 @@ pub(crate) fn embedded_in(data: &dyn ByteSource) -> Embedded {
         }
         at += owned;
     }
+    carving.settle(data);
     carving.found
 }
 
@@ -937,6 +938,13 @@ pub(crate) struct Carving {
     /// Where the last ZIP local header seen says the next entry begins, when
     /// it can say (see [`zip_next_header`]).
     zip_next: Option<usize>,
+    /// `(header, MZ)` of candidates whose `PE\0\0` header lies beyond the
+    /// window they were found in, in an object not held in memory. Checked
+    /// by [`Carving::settle`] in offset order, so a header costs one read of
+    /// its block however many candidates point near it.
+    far: Vec<(usize, usize)>,
+    /// How many of those wait before they are settled.
+    far_max: usize,
     pub(crate) found: Embedded,
 }
 
@@ -977,11 +985,14 @@ impl Carving {
         longest - 1
     };
 
-    pub(crate) fn new() -> Self {
+    /// A search that settles its far candidates once `far_max` wait.
+    pub(crate) fn new(far_max: usize) -> Self {
         Carving {
             finders: CARVE_MAGICS.iter().map(|(m, _)| memchr::memmem::Finder::new(m)).collect(),
             hits: Vec::new(),
             zip_next: None,
+            far: Vec::new(),
+            far_max: far_max.max(1),
             found: Embedded::default(),
         }
     }
@@ -990,7 +1001,8 @@ impl Carving {
     /// at its cap, and candidates past the caps were already seen.
     pub(crate) fn full(&self) -> bool {
         let f = &self.found;
-        f.pe_capped
+        self.far.is_empty()
+            && f.pe_capped
             && f.others_capped
             && f.pe.len() >= MAX_EMBEDDED_PE
             && f.elf.len() >= MAX_EMBEDDED_PE
@@ -1005,6 +1017,11 @@ impl Carving {
         let found = &mut self.found;
         let hits = &mut self.hits;
         let zip_next = &mut self.zip_next;
+        let far = &mut self.far;
+        // A header beyond the window is a read of its own, where the object
+        // is not in memory.
+        let held = at + w.len();
+        let in_memory = data.as_slice().is_some();
         hits.clear();
         for (f, (_, kind)) in self.finders.iter().zip(CARVE_MAGICS) {
             hits.extend(f.find_iter(w).take_while(|&p| p < owned).map(|p| (at + p, kind)));
@@ -1030,7 +1047,14 @@ impl Carving {
                 continue;
             }
             let (list, cap, ok) = match kind {
-                Magic::Pe => (&mut found.pe, MAX_EMBEDDED_PE, pe_at(data, off)),
+                Magic::Pe => {
+                    match pe_target(data, off) {
+                        Some(pe) if pe >= held && !in_memory => far.push((pe, off)),
+                        Some(pe) if pe_header_at(data, pe) => accept_pe(found, off),
+                        _ => {}
+                    }
+                    continue;
+                }
                 Magic::Elf => (&mut found.elf, MAX_EMBEDDED_PE, elf_at(data, off)),
                 Magic::MachoThin(be) => (&mut found.macho, MAX_EMBEDDED_PE, macho_thin_at(data, off, be)),
                 Magic::MachoFat => (&mut found.macho, MAX_EMBEDDED_PE, macho_fat_at(data, off)),
@@ -1046,13 +1070,36 @@ impl Carving {
                     if zip {
                         *zip_next = zip_next_header(data, off);
                     }
-                } else if matches!(kind, Magic::Pe) {
-                    found.pe_capped = true;
                 } else {
                     found.others_capped = true;
                 }
             }
         }
+        if self.far.len() >= self.far_max {
+            self.settle(data);
+        }
+    }
+
+    /// Check the far candidates waiting, in the order of the headers they
+    /// point at. Call it once the object is fed.
+    pub(crate) fn settle(&mut self, data: &dyn ByteSource) {
+        self.far.sort_unstable();
+        for (pe, off) in std::mem::take(&mut self.far) {
+            if pe_header_at(data, pe) {
+                accept_pe(&mut self.found, off);
+            }
+        }
+    }
+}
+
+/// Take the PE at `off`: the lowest [`MAX_EMBEDDED_PE`] offsets are listed
+/// whatever order they are found in, and one more makes the object capped.
+fn accept_pe(found: &mut Embedded, off: usize) {
+    let at = found.pe.partition_point(|&o| o < off);
+    found.pe.insert(at, off);
+    if found.pe.len() > MAX_EMBEDDED_PE {
+        found.pe.pop();
+        found.pe_capped = true;
     }
 }
 
@@ -1073,22 +1120,26 @@ fn archive_at(data: &dyn ByteSource, off: usize) -> bool {
     }
 }
 
-/// An `MZ` at `off` whose `e_lfanew` points to a sane `PE\0\0` header.
+/// An `MZ` at `off` whose `e_lfanew` points to a sane `PE\0\0` header: what
+/// carving finds, one candidate at a time, for the tests to compare it to.
+#[cfg(test)]
 fn pe_at(data: &dyn ByteSource, off: usize) -> bool {
+    pe_target(data, off).is_some_and(|pe| pe_header_at(data, pe))
+}
+
+/// Where the `MZ` at `off` says its PE header is, if that is in bounds.
+fn pe_target(data: &dyn ByteSource, off: usize) -> Option<usize> {
     if off + 0x40 > data.len() {
-        return false;
+        return None;
     }
-    let Some(e_lfanew) = le_u32_at(data, off + 0x3c) else {
-        return false;
-    };
-    let e_lfanew = e_lfanew as usize;
+    let e_lfanew = le_u32_at(data, off + 0x3c)? as usize;
     // e_lfanew is relative to the MZ; the PE header must be in-bounds.
-    let Some(pe) = off.checked_add(e_lfanew) else {
-        return false;
-    };
-    if e_lfanew < 0x40 || pe + 4 > data.len() {
-        return false;
-    }
+    let pe = off.checked_add(e_lfanew)?;
+    (e_lfanew >= 0x40 && pe + 4 <= data.len()).then_some(pe)
+}
+
+/// A sane `PE\0\0` header at `pe`.
+fn pe_header_at(data: &dyn ByteSource, pe: usize) -> bool {
     data.window(pe, 4)[..] == *b"PE\0\0" && valid_pe_coff(data, pe)
 }
 
@@ -1435,6 +1486,61 @@ mod tests {
             assert_eq!(got.archives, want.archives);
             assert_eq!((got.pe_capped, got.others_capped), (want.pe_capped, want.others_capped));
         }
+    }
+
+    /// An `MZ` points its header anywhere in the object. Over a source that
+    /// is not in memory, those headers are checked in order, so many
+    /// candidates cost about one pass over the object and not a block read
+    /// each, and a real header far from its `MZ` is still found.
+    #[test]
+    fn far_headers_are_read_in_order() {
+        use crate::byte_source::BlockCache;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Tally(std::io::Cursor<Vec<u8>>, std::sync::Arc<AtomicU64>);
+        impl std::io::Read for Tally {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.read(buf)
+            }
+        }
+        impl std::io::Seek for Tally {
+            fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(p)
+            }
+        }
+        const BLOCK: usize = 4096;
+        let len = 1024 * BLOCK;
+        let mut data = vec![b'a'; len];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        // Candidates whose headers are somewhere else in the object.
+        for k in 0..8000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let off = 1000 + k * 500;
+            let to = 0x40 + (state as usize % (len - off - 0x80));
+            data[off..off + 2].copy_from_slice(b"MZ");
+            data[off + 0x3c..off + 0x40].copy_from_slice(&(to as u32).to_le_bytes());
+        }
+        // A real one, whose header is 3 MiB on.
+        let at = 100;
+        let header = at + (3 << 20);
+        data[at..at + 2].copy_from_slice(b"MZ");
+        data[at + 0x3c..at + 0x40].copy_from_slice(&(3u32 << 20).to_le_bytes());
+        let mut pe = b"PE\0\0\x4c\x01\x03\0".to_vec();
+        pe.resize(20, 0);
+        pe.extend_from_slice(&0xe0u16.to_le_bytes());
+        pe.extend_from_slice(&[0, 0, 0x0b, 0x01]);
+        data[header..header + pe.len()].copy_from_slice(&pe);
+
+        let reads = std::sync::Arc::new(AtomicU64::new(0));
+        let src = BlockCache::with_sizes(Tally(std::io::Cursor::new(data), reads.clone()), BLOCK, 8 * BLOCK).unwrap();
+        let found = embedded_in(&src);
+        assert_eq!(found.pe, [at]);
+        assert!(!found.pe_capped);
+        let reads = reads.load(Ordering::Relaxed) as usize;
+        let blocks = len / BLOCK;
+        assert!(reads <= 3 * blocks, "{reads} reads for {blocks} blocks");
     }
 
     /// A chance `1f 8b 08` run is not a gzip candidate unless the header's

@@ -18,16 +18,20 @@ What changes with size is where the file is while that runs.
 ## Can a file be larger than the RAM?
 
 Most can. A file on disk is never loaded past `--max-object-bytes`, so what a
-scan holds does not grow with the file: a 20 GiB file with a signature at
-19.5 GB was matched in 33 seconds with a 24 MB peak, using a one-signature
-database. A real database is the larger part of the memory:
+scan holds does not grow with the file. The time does: a file past the limit is
+read several times over, and each pass goes through the whole signature
+database, so a 20 GB file takes minutes with a handful of signatures and longer
+with a full database. Served over HTTP and scanned with only the four built-in
+signatures, 20 GB objects of text, RAR, OLE and PDF took from 2 to 21 minutes
+and held 50 to 61 MB at their peak ([the figures](/scanner/guides/sizing/#what-this-host-scans-and-what-to-change-to-scan-more)).
+A real database is the larger part of the memory:
 [sizing a server](/scanner/guides/sizing/) works through a 4 GiB machine.
 
 What happens past `--max-object-bytes` (256 MiB), by kind of input:
 
 | Input | Held in memory | Needs disk | A 20 GB input |
 |---|---|---|---|
-| A file on disk: executable, script, document, raw disk or filesystem image | Block cache, 8 MiB | No | Scanned in full. A PE, ELF or .NET file skips the [checks that need it whole](#past-it-through-a-block-cache) and, if nothing is found, is reported `LIMITS-EXCEEDED` |
+| A file on disk: executable, script, document, raw disk or filesystem image | Block cache, 8 MiB | No | Every signature on its bytes is matched. A PE, ELF or .NET file is not [parsed](#past-it-through-a-block-cache), so the signatures and rules on its structure (sections, imports, YARA's `pe`, `elf` and `dotnet`) are not evaluated; if nothing is found, the verdict is `LIMITS-EXCEEDED` |
 | ZIP, tar, CAB, ISO, LHA, `ar`, cpio, 7z, WIM, xar, the single-stream compressors, self-extracting executables, and the formats built on them | One member, up to 256 MiB | Only for a member over 256 MiB, up to `--max-spill-bytes` (2 GiB) | Scanned member by member. A member past the spill ceiling, or any member with `--spill-dir off`, is not scanned and the file is `LIMITS-EXCEEDED`. A 7z folder with an encrypted coder or several packed streams (BCJ2) is decoded whole, under 256 MiB |
 | Disk images (VHD, VHDX, QCOW2, VMDK, DMG) and the filesystems inside them or on their own: FAT, exFAT, NTFS, ext, SquashFS, cramfs, romfs, EROFS, HFS+, APFS | A cache of up to 32 MiB (8 MiB for a raw image), and one file up to 256 MiB | Only for a file over 256 MiB, up to `--max-spill-bytes` (2 GiB) | Walked in place, each file read from where the volume has it, and one past 256 MiB goes to a spill file as a ZIP member does. A file stored compressed by the filesystem (HFS+, APFS, NTFS, EROFS) is decoded whole under the limit and reported past it. A raw image's own bytes are matched as part of the image |
 | RAR, OLE, PDF, CHM, ARJ, email and the other formats [read whole](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole) | Not held: the container is not opened | No | The file's own bytes are scanned, its members are not unpacked, and the result is `LIMITS-EXCEEDED` unless something is found. Raising `--max-object-bytes` to cover it takes that much RAM |
@@ -199,26 +203,26 @@ Which setting to change:
 
 | Setting | Raise it when | What it costs |
 |---|---|---|
-| `--object-cache-block-bytes` | requests are slow (HTTP, network storage) and there are many small misses: fewer requests for the same scattered reads | each miss moves a whole block: 1 MiB to verify a 100-byte match. Past about 1 MiB the misses stop falling and the bytes fetched keep growing |
+| `--object-cache-block-bytes` | requests are slow (HTTP, network storage) and there are many small misses: fewer requests for the same scattered reads | each miss moves a whole block: 1 MiB to verify a 100-byte match. Past about 1 MiB the misses stop falling |
 | `--object-cache-bytes` | the object is not much bigger than the cache: every pass but the first is then free, and a few more blocks hold more of the places verification goes back to | that much memory per object being scanned in place, nested ones included |
 | `--http-request-bytes` | a pass over a large object is bound by round trips, not bandwidth | that much memory held while the object is read |
 
 What each setting did against a local server that waits before answering each
 request, so the delay stands for the round trip. The first object is a 300 MB
 file under a database with a pattern, a logical signature with a gap and the
-hash of that size. It is read about 4.5 times over, and 300 MB is past
+hash of that size. It is read about 4.4 times over, and 300 MB is past
 `--max-object-bytes`, so it goes through the cache. Block, cache and request
 sizes in the first three columns, defaults in bold:
 
 | Block | Cache | Request | Requests | Fetched | No delay | 20 ms | 100 ms |
 |---|---|---|---|---|---|---|---|
-| 64K | 8M | 8M | 1,080 | 1.34 GB | 4.7 s | 26.3 s | 112.7 s |
-| 256K | 8M | 8M | 764 | 1.37 GB | 4.5 s | 20.0 s | 81.0 s |
-| **1M** | **8M** | **8M** | 431 | 1.42 GB | 4.5 s | 13.5 s | 47.6 s |
-| 4M | 8M | 8M | 417 | 2.73 GB | 4.5 s | 13.3 s | 46.7 s |
-| 1M | 32M | 8M | 375 | 1.38 GB | 4.3 s | 11.9 s | 42.3 s |
-| 1M | 8M | 1M | 1,324 | 1.38 GB | 4.6 s | 31.6 s | 138.2 s |
-| 1M | 8M | 32M | 343 | 1.42 GB | 4.2 s | 11.3 s | 38.9 s |
+| 64K | 8M | 8M | 506 | 1.23 GB | 4.4 s | 15.0 s | 55.9 s |
+| 256K | 8M | 8M | 361 | 1.29 GB | 4.1 s | 12.0 s | 41.2 s |
+| **1M** | **8M** | **8M** | 176 | 1.33 GB | 4.0 s | 8.0 s | 22.1 s |
+| 4M | 8M | 8M | 170 | 1.35 GB | 4.1 s | 7.9 s | 21.4 s |
+| 1M | 32M | 8M | 176 | 1.33 GB | 4.2 s | 8.2 s | 22.1 s |
+| 1M | 8M | 1M | 1,275 | 1.33 GB | 4.4 s | 31.7 s | 136.0 s |
+| 1M | 8M | 32M | 66 | 1.33 GB | 4.0 s | 5.4 s | 10.7 s |
 
 The second is a 20 MB ZIP of 2,000 small members, read in place (with
 `--max-object-bytes 1M`, as a much larger archive would be). The cache is
@@ -244,15 +248,15 @@ An `http(s)://` target (`--allow-http-scan`, and `SCANURL` on the daemon) is
 read by range requests and never written to disk. It takes the same two paths
 as a file, with the network in place of the disk:
 
-- **Up to `--max-object-bytes`:** fetched in full into memory, once. A 100 MiB
-  object cost 20 requests, 1.0 times its size on the wire, and a 140 MB peak.
+- **Up to `--max-object-bytes`:** fetched in full into memory, once. A 100 MB
+  object cost 16 requests, 1.0 times its size on the wire, and a 226 MB peak.
 - **Past it:** read through the [block cache](#the-block-cache), so every pass
-  over the file fetches it again. A 3 GiB object cost 2.0 times its size on the
-  wire (6.4 GB) with a 54 MB peak, against a one-signature database. A database
-  with a hash of that size, a gap signature and a pattern made it 4.7 times for
-  a 300 MB object (1.42 GB in 431 requests). Rules that need more passes
-  (YARA's prefilter reads the file twice more) transfer more, so a 20 GB object
-  is 40 GB to 100 GB of egress. To pay in disk instead,
+  over the file fetches it again. A 300 MB object, under a database with a hash
+  of that size, a gap signature and a pattern, cost 4.4 times its size on the
+  wire (1.33 GB in 176 requests). How many passes there are depends on the
+  database: detection and the signature sweep make two at least, and rules that
+  need more (YARA's prefilter reads the file twice more) transfer more. So a
+  20 GB object is tens of gigabytes of egress or more. To pay in disk instead,
   [download it and scan the file](/scanner/guides/scanning/#scanning-over-http).
   `--object-cache-block-bytes`, `--object-cache-bytes` and `--http-request-bytes`
   set how many requests that takes.

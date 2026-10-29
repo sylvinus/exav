@@ -238,7 +238,7 @@ av-audit:
 	@[ -d $(DBDIR) ] || { echo "av-audit needs $(DBDIR); run 'make db'"; exit 1; }
 	@echo "scanning $$(git ls-files | wc -l | tr -d ' ') tracked files with $(DBDIR)"
 	@hits=$$(git ls-files -z | xargs -0 clamscan -d $(DBDIR) --no-summary 2>/dev/null \
-	          | grep -v ': OK$$' || true); \
+	          | grep -v -e ': OK$$' -e ': Empty file$$' || true); \
 	  if [ -n "$$hits" ]; then echo "$$hits"; \
 	    echo "-> mask these (see crates/exav-unpack/tests/fixtures/README.md)"; exit 1; \
 	  fi; \

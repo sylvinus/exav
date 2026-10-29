@@ -9,7 +9,7 @@ use super::resolve::Tree;
 use super::text;
 use crate::formats::office::common::image;
 use crate::formats::office::slides::error::{Error, Result};
-use crate::formats::office::slides::limits::Budget;
+use crate::formats::office::slides::limits::{Budget, text_bytes};
 use crate::formats::office::slides::model::*;
 use crate::formats::office::slides::package::Zip;
 use std::collections::HashMap;
@@ -300,12 +300,7 @@ impl Conv<'_, '_, '_> {
                 sp.line = format::line(t, n);
             }
             if let Some(mut b) = body {
-                let chars: usize = b
-                    .paras
-                    .iter()
-                    .map(|p| 64 + p.runs.len() * 64 + p.runs.iter().map(run_len).sum::<usize>())
-                    .sum();
-                self.budget.alloc(chars as u64)?;
+                self.budget.alloc(text_bytes(&b))?;
                 match text_block(t, n, &xf, own, ws, hs) {
                     Block::Whole => sp.text = Some(b),
                     Block::Inside(r) => {
@@ -380,13 +375,6 @@ impl Conv<'_, '_, '_> {
             }
         }
         Ok(out)
-    }
-}
-
-fn run_len(r: &Run) -> usize {
-    match &r.kind {
-        RunKind::Text(s) | RunKind::Field(_, s) => s.len(),
-        RunKind::Break => 1,
     }
 }
 

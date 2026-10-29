@@ -142,10 +142,13 @@ scanner's, and are not part of this aim.
   (detection and the digests share one read; the signature sweep, YARA's
   prefilter and the checks that verify a match read again). Feeding them from
   one pass makes a large scan faster and cheaper over HTTP. Measured over HTTP
-  with a hash, a gap and a pattern signature: 4.7 passes of a 300 MB object, and
-  most of its requests are the scattered reads of verification, not the passes.
-  The sweeps would collect the places a match must be verified, and a last pass
-  would verify them sorted by offset, so each block is fetched once. That also
+  with a hash, a gap and a pattern signature: 4.4 passes of a 300 MB object in
+  176 requests, which the passes alone account for (1.33 GB in requests of up
+  to 8 MiB is about 160), so verification's scattered reads are a small part
+  there; a database that matches more verifies more. The sweeps would collect
+  the places a match must be verified, and a last pass would verify them sorted
+  by offset, so each block is fetched once. Carving's lookups of the headers an
+  `MZ` points to already work that way. That also
   settles the compressed members below, since the passes could re-run a decoder
   instead of re-reading a spill file.
 - **The block cache's policy**: it is LRU, which is the worst policy for passes
@@ -162,9 +165,8 @@ scanner's, and are not part of this aim.
     container's directory and headers) keep the cache;
   - the head of the object (detection, headers, a ZIP's directory) pinned;
   - sorting the verification reads, which is the forward pass above and beats
-    any policy: raising the cache from 8M to 32M cut the requests of the 300 MB
-    scan only from 431 to 375, so most scattered misses are first touches, not
-    reuse.
+    any policy: raising the cache from 8M to 32M left the requests of the 300 MB
+    scan at 176, so the scattered misses there are first touches, not reuse.
 
   The cache also evicts by scanning its blocks for the least recently used, so a
   cache of many small blocks (`--object-cache-block-bytes 4K` with a large

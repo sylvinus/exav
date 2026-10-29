@@ -19,7 +19,7 @@ mod text;
 
 use crate::formats::office::common::bytes::{Cur, u32_at};
 use crate::formats::office::slides::error::{Error, Result};
-use crate::formats::office::slides::limits::{Budget, SHAPE_BYTES};
+use crate::formats::office::slides::limits::{Budget, SHAPE_BYTES, text_bytes};
 use crate::formats::office::slides::model::*;
 use escher::{OShape, Props};
 use exav_unpack::cfb::Compound;
@@ -1136,8 +1136,7 @@ impl<'a> Reader<'a> {
             let geom = shapes::geometry(o, xf.w, xf.h);
             let text = self.text_body(o, &props, ctx, master_ph);
             if let Some(t) = &text {
-                let chars: usize = t.paras.iter().map(|p| p.runs.len() * 16).sum();
-                budget.alloc(chars as u64)?;
+                budget.alloc(text_bytes(t))?;
             }
             ShapeKind::Sp(Box::new(Sp {
                 geom,

@@ -10,7 +10,7 @@ mod text;
 use crate::formats::office::common::base64;
 use crate::formats::office::common::xml::{self, Node};
 use crate::formats::office::slides::error::{Error, Result};
-use crate::formats::office::slides::limits::Budget;
+use crate::formats::office::slides::limits::{Budget, text_bytes};
 use crate::formats::office::slides::model::*;
 use crate::formats::office::slides::package::{Zip, image_ext};
 use std::collections::HashMap;
@@ -931,13 +931,13 @@ impl<'d> Reader<'d> {
                 p.props.align.get_or_insert("ctr");
             }
         }
-        let chars: usize = paras.iter().map(|p| p.runs.len() * 32).sum();
-        budget.alloc(chars as u64)?;
-        Ok(Some(TextBody {
+        let text = TextBody {
             body: self.body_props(props, frame),
             paras,
             levels: ListStyle::default(),
-        }))
+        };
+        budget.alloc(text_bytes(&text))?;
+        Ok(Some(text))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -33,8 +33,8 @@ follow [semantic versioning](https://semver.org/).
   requests of an `http(s)://` source, had sizes fixed in the code (64 KiB blocks,
   8 MiB held, requests of 64 KiB growing to 8 MiB). They are settings now, and
   the block is 1 MiB by default: against a 300 MB object with a server that
-  waits 100 ms for each request, 1M blocks took 48 s where 64K took 113 s, and
-  4M took no less while fetching twice the bytes. A scan with `--max-process-bytes`
+  waits 100 ms for each request, 1M blocks took 22 s where 64K took 56 s, and
+  4M took no less. A scan with `--max-process-bytes`
   lowers the cache and the request to an eighth of its memory each. The
   [block cache](https://exav.org/scanner/concepts/streaming-memory/#the-block-cache)
   page has the model and the measurements.
@@ -661,6 +661,13 @@ follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **A large file over HTTP made a request for each executable candidate.**
+  Carving looks at the header an `MZ` points to, wherever it is, and in an
+  object read in place each lookup was a block of its own: a 1 GB text file
+  took 7,700 requests and 11 GB over HTTP, and 12,000 requests with 64K blocks.
+  The headers are checked in order of offset now, once enough wait (the size of
+  `--object-cache-bytes`) and at the end, so the same file takes 594 requests
+  and 4.8 GB, about the passes it needs.
 - **A message attached to an email was never scanned.** The email reader took
   the text and binary parts of the top message and skipped the parts that are
   messages themselves (`message/rfc822`, a forwarded mail), so an attachment of

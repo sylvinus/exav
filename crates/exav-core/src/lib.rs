@@ -259,6 +259,8 @@ pub(crate) struct Facts<'a> {
 struct Shared {
     want: hashes::Want,
     carve: bool,
+    /// Far candidates carving holds before it checks them.
+    far: usize,
 }
 
 impl<'a> Facts<'a> {
@@ -276,12 +278,13 @@ impl<'a> Facts<'a> {
 
     /// The facts of `data` scanned by `db`, carved when `carve`: when `data`
     /// is not held in memory, all worked out in one read of it.
-    fn for_scan(data: &'a dyn ByteSource, db: &Scanner, carve: bool) -> Self {
+    fn for_scan(data: &'a dyn ByteSource, db: &Scanner, carve: bool, opts: &ScanOptions) -> Self {
         let facts = Facts::new(data);
         if data.as_slice().is_none() {
             facts.shared.set(Some(Shared {
                 want: digests_wanted_by(db, data.len() as u64),
                 carve,
+                far: opts.carve_pending(),
             }));
         }
         facts
@@ -330,7 +333,7 @@ impl<'a> Facts<'a> {
     /// The one read of an object not held in memory, the first time a step
     /// asks, if it was not made yet.
     fn read_once(&self) {
-        let Some(Shared { want, carve }) = self.shared.take() else {
+        let Some(Shared { want, carve, far }) = self.shared.take() else {
             return;
         };
         let search = self.fmt.get().is_none() && unpack::Prescan::needed(self.data.len());
@@ -340,7 +343,7 @@ impl<'a> Facts<'a> {
         let data = self.data;
         let len = data.len();
         let mut hashing = (want != hashes::Want::default()).then(|| hashes::Hashing::new(want));
-        let mut carving = carve.then(pe::Carving::new);
+        let mut carving = carve.then(|| pe::Carving::new(far));
         let mut prescan = None;
         let overlap = unpack::Prescan::OVERLAP.max(pe::Carving::OVERLAP);
         let mut at = 0;
@@ -377,7 +380,8 @@ impl<'a> Facts<'a> {
         if let Some(h) = hashing {
             let _ = self.digests.set(h.finish());
         }
-        if let Some(c) = carving {
+        if let Some(mut c) = carving {
+            c.settle(data);
             *self.embedded.borrow_mut() = Some(c.found);
         }
         *self.prescan.borrow_mut() = prescan;
@@ -880,7 +884,9 @@ pub struct ScanOptions {
     /// Memory of the block cache of an object read in place, in bytes
     /// (`--object-cache-bytes`): an object past `deep_analysis_max`, a spilled
     /// member or view, a spilled stream. One cache for each such object being
-    /// scanned, nested ones included. Default 8 MiB.
+    /// scanned, nested ones included. Carving also holds up to this much of
+    /// candidates waiting for a check while it reads such an object. Default
+    /// 8 MiB.
     pub object_cache_bytes: u64,
     /// One block of that cache, in bytes (`--object-cache-block-bytes`): the
     /// unit it reads from the object, and over HTTP what a read at an offset
@@ -1057,6 +1063,14 @@ impl ScanOptions {
             .max(1);
         let bytes = usize::try_from(self.object_cache_bytes).unwrap_or(usize::MAX);
         (block, bytes)
+    }
+
+    /// How many far candidates carving holds before it checks them: their
+    /// 16 bytes each fill no more than the object cache does.
+    pub(crate) fn carve_pending(&self) -> usize {
+        usize::try_from(self.object_cache_bytes / 16)
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 
     /// A block cache over `reader`, sized by these options.
@@ -3298,7 +3312,7 @@ fn scan_object(
     // anything inside it is a detection. Keyed on the object's bytes, so an
     // entry means the same thing wherever the object is found.
     let carve = obj.carve && obj.depth < budget.limits().max_recursion;
-    let facts = Facts::for_scan(data, db, carve);
+    let facts = Facts::for_scan(data, db, carve, opts);
     if allowlisted(db, &facts) {
         return DeepOutcome::Clean;
     }
@@ -4727,7 +4741,7 @@ mod tests {
             let cache =
                 byte_source::BlockCache::with_sizes(Cursor::new(data.clone()), 4093, 16 * 4093)
                     .unwrap();
-            let facts = Facts::for_scan(&cache, &db, true);
+            let facts = Facts::for_scan(&cache, &db, true, &ScanOptions::default());
             let mut embedded = None;
             for step in (0..3).map(|k| (first + k) % 3) {
                 match step {
@@ -4777,7 +4791,7 @@ mod tests {
             let read = std::sync::Arc::new(AtomicU64::new(0));
             let reader = Counting(Cursor::new(vec![b'.'; len]), read.clone());
             let cache = byte_source::BlockCache::with_sizes(reader, 4093, 16 * 4093).unwrap();
-            let facts = Facts::for_scan(&cache, &db, false);
+            let facts = Facts::for_scan(&cache, &db, false, &ScanOptions::default());
             let before = read.load(Ordering::Relaxed);
             assert!(!allowlisted(&db, &facts));
             assert_eq!(

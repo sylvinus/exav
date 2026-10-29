@@ -990,6 +990,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_family = "wasm", ignore = "needs a thread")]
     fn a_chain_of_operators_is_written_without_recursion() {
         // 1 followed by 16000 percent signs, in a thread whose stack could
         // not hold that many nested calls.

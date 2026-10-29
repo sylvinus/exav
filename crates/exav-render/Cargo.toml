@@ -68,7 +68,7 @@ exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = f
 # Markdown: CommonMark with tables and strikethrough, read as events. Without
 # its `html` and `simd` features: no markup is made, and its only `unsafe`
 # (the SIMD scanners) is off.
-pulldown-cmark = { version = "=0.13.4", default-features = false, optional = true }
+pulldown-cmark = { version = "=0.13.5", default-features = false, optional = true }
 # The office converters (`office-*`): packages are read, and the XLSX, PPTX
 # and DOCX written, as ZIP.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"], optional = true }

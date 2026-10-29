@@ -410,9 +410,28 @@ mod sheets {
         out
     }
 
+    /// The spreadsheet name of column `n` (1 is `A`, 27 is `AA`).
+    fn column_name(mut n: usize) -> String {
+        let mut name = Vec::new();
+        while n > 0 {
+            n -= 1;
+            name.push(b'A' + (n % 26) as u8);
+            n /= 26;
+        }
+        name.reverse();
+        String::from_utf8(name).unwrap()
+    }
+
     /// An ODS of 10,000 text cells and a chart of `n` series over all of them.
     fn chart_ods(n: usize) -> Vec<u8> {
+        chart_ods_of(n, 20, 500)
+    }
+
+    /// An ODS of `cols` by `rows` text cells and a chart of `n` series over
+    /// all of them.
+    fn chart_ods_of(n: usize, cols: usize, rows: usize) -> Vec<u8> {
         use std::io::Write as _;
+        let range = format!("Sheet.A1:.{}{rows}", column_name(cols));
         let ns = "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
                   xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
                   xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" \
@@ -425,11 +444,11 @@ mod sheets {
         );
         let mut content = format!(
             "<?xml version=\"1.0\"?><office:document-content {ns}><office:body><office:spreadsheet>\
-             <table:table table:name=\"Sheet\"><table:table-column table:number-columns-repeated=\"20\"/>"
+             <table:table table:name=\"Sheet\"><table:table-column table:number-columns-repeated=\"{cols}\"/>"
         );
-        for r in 0..500 {
+        for r in 0..rows {
             content.push_str("<table:table-row>");
-            content.push_str(&cell.repeat(20));
+            content.push_str(&cell.repeat(cols));
             if r == 0 {
                 content.push_str(
                     "<table:table-cell><draw:frame draw:name=\"c1\"><draw:object xlink:href=\"./Object 1\"/>\
@@ -441,13 +460,15 @@ mod sheets {
         content.push_str(
             "</table:table></office:spreadsheet></office:body></office:document-content>",
         );
-        let series = "<chart:series chart:values-cell-range-address=\"Sheet.A1:.T500\" \
-                      chart:label-cell-address=\"Sheet.A1\"/>"
-            .repeat(n);
+        let series = format!(
+            "<chart:series chart:values-cell-range-address=\"{range}\" \
+             chart:label-cell-address=\"Sheet.A1\"/>"
+        )
+        .repeat(n);
         let chart = format!(
             "<?xml version=\"1.0\"?><office:document-content {ns}><office:body><office:chart>\
              <chart:chart chart:class=\"chart:bar\"><chart:plot-area><chart:axis chart:dimension=\"x\">\
-             <chart:categories table:cell-range-address=\"Sheet.A1:.T500\"/></chart:axis>{series}\
+             <chart:categories table:cell-range-address=\"{range}\"/></chart:axis>{series}\
              </chart:plot-area></chart:chart></office:chart></office:body></office:document-content>"
         );
         let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -481,6 +502,32 @@ mod sheets {
             },
             256,
         );
+    }
+
+    /// The same at a hundred thousand cells, where a copy of the cells per
+    /// series is megabytes a series.
+    #[test]
+    fn chart_series_over_a_large_range() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (series, limit) in [(256, 256u64 << 20), (1024, 256 << 20), (1024, 1 << 30)] {
+            let input = chart_ods_of(series, 100, 1000);
+            let limits = Limits::default().with_max_memory(limit);
+            let (peak, out) = peak_of(|| convert(&input, Format::Ods, &limits));
+            let verdict = match &out {
+                Ok(_) => "converted",
+                Err(Error::TooLarge(_)) => "refused",
+                Err(e) => panic!("the workbook was not read: {e}"),
+            };
+            eprintln!(
+                "{series} series over 100,000 cells, limit {} MiB: {verdict}, peak {:.1} MiB",
+                limit >> 20,
+                peak as f64 / (1 << 20) as f64
+            );
+            assert!(
+                peak as f64 <= SLACK * limit as f64,
+                "the limit is {limit} bytes and the conversion held {peak} at {series} series"
+            );
+        }
     }
 
     #[test]
