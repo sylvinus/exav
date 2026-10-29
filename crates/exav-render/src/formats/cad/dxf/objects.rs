@@ -34,10 +34,10 @@ pub(crate) fn object(rec: &Record<'_>, raw: &mut Raw, ctx: &mut Ctx<'_>) {
                     281 => d.cloning = t.i16(),
                     3 => pending = Some(ctx.text(t)),
                     350 | 360 => {
-                        if let Some(n) = pending.take() {
-                            if ctx.room(d.entries.len()) {
-                                d.entries.push((n, Handle(t.handle())));
-                            }
+                        if let Some(n) = pending.take()
+                            && ctx.room(d.entries.len())
+                        {
+                            d.entries.push((n, Handle(t.handle())));
                         }
                     }
                     _ => {}
@@ -93,10 +93,10 @@ pub(crate) fn object(rec: &Record<'_>, raw: &mut Raw, ctx: &mut Ctx<'_>) {
                     330 => s.block_record = Handle(t.handle()),
                     331 => entity = Some(Handle(t.handle())),
                     5 => {
-                        if let Some(e) = entity.take() {
-                            if ctx.room(s.entries.len()) {
-                                s.entries.push((e, Handle(t.handle())));
-                            }
+                        if let Some(e) = entity.take()
+                            && ctx.room(s.entries.len())
+                        {
+                            s.entries.push((e, Handle(t.handle())));
                         }
                     }
                     _ => {}

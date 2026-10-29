@@ -3,7 +3,7 @@
 //! link leads. Which files are Markdown is their name's: `.md` and
 //! `.markdown`, the input's or a member's.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
 /// A one-signature database: `Target:7`, which a text view alone matches.
 fn scanner(target: u8, body: &str) -> Scanner {

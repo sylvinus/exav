@@ -5,7 +5,7 @@
 //! present and never decoded); one cut by the end of the file is not (nothing
 //! is hidden: the rest is absent).
 
-use exav_unpack::{extract, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, extract};
 use std::io::{Cursor, Write};
 
 /// Text that deflates well, so a block holds a long run of it.

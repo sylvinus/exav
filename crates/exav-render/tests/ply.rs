@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use exav_render::mesh::Scene;
-use exav_render::ply::{read, Error};
+use exav_render::ply::{Error, read};
 use mesh_common::*;
 
 #[derive(Clone, Copy, PartialEq)]

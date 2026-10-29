@@ -9,7 +9,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use exav_render::image::raw::{self, Kind};
-use exav_render::image::{decode, decode_any, Error, Format, Pixels, Samples, DECODE_MAX};
+use exav_render::image::{DECODE_MAX, Error, Format, Pixels, Samples, decode, decode_any};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/fixtures/raw/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -628,7 +628,7 @@ fn a_preview_declared_enormous_is_not_allocated() {
     assert_eq!(info.width, 32);
     // JPEG streams too: a frame header that says 65,535 by 65,535.
     let mut d = fixture("fujifilm-o1.raf");
-    let sof = d.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+    let sof = d.array_windows().position(|w| *w == [0xFF, 0xC0]).unwrap();
     d[sof + 5..sof + 9].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
     // Past a limit that is the caller's, it is a size; past the decoder's own,
     // the image is undecodable.

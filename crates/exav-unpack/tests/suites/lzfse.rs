@@ -5,7 +5,7 @@
 //! (`lzfse_rust`), so the files that come out are checked against the same
 //! disk read from its raw runs.
 
-use exav_unpack::{extract, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, extract};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/dmg/{name}", env!("CARGO_MANIFEST_DIR"));

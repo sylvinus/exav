@@ -17,7 +17,7 @@
 //! * `SEn`: the match starts inside section `n`, its end included.
 //! * Mach-O `EP`: never resolved (`LC_MAIN` and `LC_UNIXTHREAD`, both widths).
 
-use exav_core::{analyze, loader, ScanOptions, Verdict};
+use exav_core::{ScanOptions, Verdict, analyze, loader};
 
 /// 64 bytes of distinct content for a section: `seed` and the position.
 fn block(seed: u8) -> Vec<u8> {

@@ -32,10 +32,10 @@ use super::formula::TableDims;
 use super::proto::Msg;
 use super::style::TextProps;
 use super::table::{push_merge, region, serial, width_chars};
+use crate::formats::office::common::xml::{self as dom, Node};
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
-use crate::formats::office::sheets::ods::dom::{self, Node};
 use std::collections::HashMap;
 
 const MAX_CHAIN: usize = 32;
@@ -94,10 +94,10 @@ impl<'a> Doc<'a> {
         let mut cur = Some(style);
         for _ in 0..MAX_CHAIN {
             let s = cur?;
-            if let Some(p) = s.child("sf:property-map").and_then(|m| m.child(name)) {
-                if p.nodes().next().is_some() {
-                    return Some(p);
-                }
+            if let Some(p) = s.child("sf:property-map").and_then(|m| m.child(name))
+                && p.nodes().next().is_some()
+            {
+                return Some(p);
             }
             cur = s
                 .attr("sf:parent-ident")
@@ -584,8 +584,7 @@ struct StyleKey {
 }
 
 pub(crate) fn read(xml: &[u8], budget: &mut Budget) -> Result<Workbook> {
-    budget.alloc(xml.len() as u64 * 4)?;
-    let root = dom::parse(xml, dom::MAX_ELEMENTS)?;
+    let root = dom::parse(xml, &mut budget.tree())?;
     if root.name != "ls:document" {
         return Err(Error::NotFormat("not a Numbers '08 or '09 document".into()));
     }
@@ -809,10 +808,10 @@ fn read_table(
             if let Some(p) = paragraph_style(doc, s) {
                 tp = text_props(doc, p);
             }
-            if let Some(f) = doc.prop(s, "sf:fill") {
-                if let Some(c) = doc.value_of(f).and_then(fill_color) {
-                    st.fill = Fill::solid(c);
-                }
+            if let Some(f) = doc.prop(s, "sf:fill")
+                && let Some(c) = doc.value_of(f).and_then(fill_color)
+            {
+                st.fill = Fill::solid(c);
             }
             st.align.wrap = doc
                 .number(s, "sf:SFTCellTextWrapProperty")

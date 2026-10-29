@@ -143,6 +143,7 @@ It restores what the archive records: modification times, the permission bits
 for ZIP and tar. Other formats record less.
 
 Members are written as they are decoded and the archive is read from disk as
-needed, so neither is held in memory whole, except where a format's decoder
-needs it (a 7z solid block, a RAR archive, a CAB folder). A packed executable
-(UPX, or a PE the emulator unpacks) is read whole, up to `--max-memory`.
+needed, so neither is held in memory whole, except for the formats
+[read whole](/unpack/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
+(RAR, OLE and others), up to `--max-memory`. So is a packed executable (UPX, or
+a PE the emulator unpacks).

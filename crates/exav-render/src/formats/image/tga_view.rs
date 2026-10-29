@@ -6,7 +6,7 @@
 //! version 2 files, when there is one). Colour-mapped, true-colour and grey
 //! images, raw or run-length coded (types 1 to 3 and 9 to 11), 8 to 32 bits.
 
-use super::{within, Channels, Error, Pixels, Samples};
+use super::{Channels, Error, Pixels, Samples, within};
 
 const SIGNATURE: &[u8] = b"TRUEVISION-XFILE.\0";
 

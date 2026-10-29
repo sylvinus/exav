@@ -95,12 +95,11 @@ fn layer(parts: &Parts<'_>, handle: Handle, ctx: &mut Ctx<'_>) -> Layer {
     if let Some(c) = rgb {
         l.color = c;
     }
-    if let Some(x) = parts.xdata("AcCmTransparency") {
-        if let Some(t) = x.iter().find(|t| t.code == 1071) {
-            if let Transparency::Alpha(a) = Transparency::from_code(t.int()) {
-                l.alpha = a;
-            }
-        }
+    if let Some(x) = parts.xdata("AcCmTransparency")
+        && let Some(t) = x.iter().find(|t| t.code == 1071)
+        && let Transparency::Alpha(a) = Transparency::from_code(t.int())
+    {
+        l.alpha = a;
     }
     l
 }

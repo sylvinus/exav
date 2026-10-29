@@ -1,6 +1,6 @@
 //! ODF data styles (number:*-style) to Excel number format codes.
 
-use super::dom::Node;
+use crate::formats::office::common::xml::Node;
 use std::collections::HashMap;
 
 /// Windows language identifiers of currency symbols' locales, as Excel
@@ -304,10 +304,11 @@ pub fn collect(roots: &[&Node]) -> HashMap<String, String> {
     let mut raw: HashMap<String, &Node> = HashMap::new();
     for r in roots {
         for n in r.nodes() {
-            if n.name.starts_with("number:") && n.name.ends_with("-style") {
-                if let Some(name) = n.attr("style:name") {
-                    raw.insert(name.to_string(), n);
-                }
+            if n.name.starts_with("number:")
+                && n.name.ends_with("-style")
+                && let Some(name) = n.attr("style:name")
+            {
+                raw.insert(name.to_string(), n);
             }
         }
     }
@@ -372,10 +373,10 @@ fn code(n: &Node, raw: &HashMap<String, &Node>, depth: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::office::sheets::ods::dom::parse;
+    use crate::formats::office::common::xml::{parse, within};
 
     fn fmt(xml: &str) -> String {
-        let doc = parse(format!(r#"<office:styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0">{xml}</office:styles>"#).as_bytes(), 1000).unwrap();
+        let doc = parse(format!(r#"<office:styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0">{xml}</office:styles>"#).as_bytes(), &mut within(1 << 20)).unwrap();
         collect(&[&doc]).remove("N1").unwrap()
     }
 

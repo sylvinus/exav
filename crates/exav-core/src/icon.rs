@@ -421,19 +421,17 @@ impl<'a> Resources<'a> {
                 Some(a) => a,
                 None => continue,
             };
-            if let Some(namedir) = self.find_id_subdir(t3abs, icon_id) {
-                if let Some((coff, csize)) = self.first_data_leaf(namedir, 0) {
+            if let Some(namedir) = self.find_id_subdir(t3abs, icon_id)
+                && let Some((coff, csize)) = self.first_data_leaf(namedir, 0) {
                     let end = coff
                         .checked_add(csize)
                         .map(|e| e.min(self.data.len()))
                         .unwrap_or(self.data.len());
-                    if let Some(slice) = self.data.get(coff..end) {
-                        if !slice.is_empty() {
+                    if let Some(slice) = self.data.get(coff..end)
+                        && !slice.is_empty() {
                             out.push(slice);
                         }
-                    }
                 }
-            }
         }
         out
     }
@@ -1260,11 +1258,10 @@ fn take_cells(
     let mut cells = [Cell::default(); 3];
     for c in cells.iter_mut() {
         let avg = take_field(b, pos, avg_n)?;
-        if let Some(mx) = avg_max {
-            if avg > mx {
+        if let Some(mx) = avg_max
+            && avg > mx {
                 return None;
             }
-        }
         let x = take_field(b, pos, 2)?;
         if x > coord_max {
             return None;
@@ -1346,11 +1343,10 @@ fn matchpoint(side: u32, a: &[Cell; 3], b: &[Cell; 3], max: u32) -> u32 {
     for ca in a {
         let mut best = 0u32;
         for cb in b {
-            if let Some(score) = cell_score(ca, cb, dist_lim, avg_lim) {
-                if score > best {
+            if let Some(score) = cell_score(ca, cb, dist_lim, avg_lim)
+                && score > best {
                     best = score;
                 }
-            }
         }
         total += best;
     }
@@ -1365,11 +1361,10 @@ fn matchbwpoint(side: u32, a: &[Cell; 6], b: &[Cell; 6]) -> u32 {
     for ca in a {
         let mut best = 0u32;
         for cb in b {
-            if let Some(score) = cell_score(ca, cb, dist_lim, avg_lim) {
-                if score > best {
+            if let Some(score) = cell_score(ca, cb, dist_lim, avg_lim)
+                && score > best {
                     best = score;
                 }
-            }
         }
         total += best;
     }

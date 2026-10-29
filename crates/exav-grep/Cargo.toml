@@ -9,7 +9,7 @@ homepage.workspace = true
 keywords = ["grep", "search", "archive", "zip", "extract"]
 categories = ["command-line-utilities", "filesystem"]
 readme = "README.md"
-description = "grep for the inside of archives: search text across zip/rar/7z/tar/iso/OLE/PDF/email members, recursively, in memory."
+description = "grep for the inside of archives: search text across zip/rar/7z/tar/iso/OLE/PDF/email members, recursively, in bounded memory."
 
 [[bin]]
 name = "exav-grep"
@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["all-formats"] }
+memchr = "2"
 regex = "1"
 clap = { workspace = true }
 walkdir = { workspace = true }

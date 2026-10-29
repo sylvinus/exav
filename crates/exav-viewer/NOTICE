@@ -199,7 +199,8 @@ binary distribution must reproduce: the JPEG XL decoder of the image module,
                          Copyright (c) the JPEG XL Project Authors. All
                          rights reserved. A fork of the libjxl team's jxl-rs
                          (https://github.com/libjxl/jxl-rs), vendored in
-                         vendor/zenjxl-decoder of the source tree.
+                         vendor/zenjxl-decoder and
+                         vendor/zenjxl-decoder-macros of the source tree.
 
 
 Part 4: fonts

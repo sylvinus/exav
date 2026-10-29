@@ -11,9 +11,9 @@ use std::cell::Cell;
 use std::sync::Once;
 
 use exav_render::image::{
-    decode, decode_any, Channels, Error, Format, Pixels, Samples, DECODE_MAX,
+    Channels, DECODE_MAX, Error, Format, Pixels, Samples, decode, decode_any,
 };
-use exav_render::pdf_image::{decode_ccitt, decode_jbig2, decode_jpx, CcittParams, JpxParams};
+use exav_render::pdf_image::{CcittParams, JpxParams, decode_ccitt, decode_jbig2, decode_jpx};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(

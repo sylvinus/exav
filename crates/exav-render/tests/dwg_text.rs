@@ -267,9 +267,10 @@ fn an_mtext_mask_is_under_its_text_only() {
         .unwrap();
     assert_eq!(order(masked, 40), order(mask, 16) + 1);
     // The framed one: the background (fill flag 1) and four sides.
-    assert!(tris
-        .iter()
-        .any(|v| v[15] == 1 && f32_at(v, 0) + d.origin[0] > 40.0));
+    assert!(
+        tris.iter()
+            .any(|v| v[15] == 1 && f32_at(v, 0) + d.origin[0] > 40.0)
+    );
     let frame = bounds(&ink(&d, [45.0, 25.0], [80.0, 36.0]));
     assert!(
         (frame[0] - 48.75).abs() < 1e-3 && (frame[3] - 31.25).abs() < 1e-3,

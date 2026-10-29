@@ -195,9 +195,11 @@ mod tests {
         assert_eq!(entries[0].name, "macho-arch-0");
         assert_eq!(entries[0].data, b"first-arch-image");
         assert_eq!(entries[1].name, "macho-arch-1");
-        assert!(entries
-            .iter()
-            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST"))
+        );
     }
 
     #[test]
@@ -209,25 +211,31 @@ mod tests {
         blob.extend_from_slice(&[0xABu8; 200]); // constant pool: not valid arch records
         assert!(!looks_like_machofat(&crate::Probe::whole(&blob)));
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Machofat, &blob, &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Machofat, &blob, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn truncated_and_garbage_do_not_panic() {
         let mut budget = Budget::new(Limits::default());
         // Too short for even the header.
-        assert!(extract(Format::Machofat, b"\xCA\xFE", &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Machofat, b"\xCA\xFE", &mut budget)
+                .unwrap()
+                .is_empty()
+        );
         // Valid magic + count but a truncated arch table.
         let mut blob = FAT_MAGIC.to_be_bytes().to_vec();
         blob.extend_from_slice(&2u32.to_be_bytes());
         blob.extend_from_slice(&[0u8; 10]); // < 2 * 20 bytes of records
-        assert!(extract(Format::Machofat, &blob, &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Machofat, &blob, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
         // Arch offset/size pointing past EOF must be rejected, not sliced.
         let mut blob = FAT_MAGIC.to_be_bytes().to_vec();
         blob.extend_from_slice(&1u32.to_be_bytes());
@@ -236,8 +244,10 @@ mod tests {
         blob.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // offset past EOF
         blob.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // size past EOF
         blob.extend_from_slice(&0u32.to_be_bytes()); // align
-        assert!(extract(Format::Machofat, &blob, &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Machofat, &blob, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

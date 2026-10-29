@@ -7,16 +7,16 @@
 //! file or a URL is told by its alternative text, and a link is kept only when
 //! it goes to a web, mail, phone or FTP address or to a place in the page.
 //!
-//! The tokenizer and the style sheets are the spreadsheet converter's (Excel's
-//! HTML pages): [`crate::formats::office::sheets::html`].
+//! The tokens are those of `exav_unpack::html`, which the spreadsheet
+//! converter reads Excel's pages with too; the style sheets are
+//! `common::css`.
 
+use crate::formats::office::common::css::{self, Sheet};
 use crate::formats::office::common::{base64, image};
 use crate::formats::office::docs::error::{Error, Result};
 use crate::formats::office::docs::limits::Budget;
 use crate::formats::office::docs::model::*;
-use crate::formats::office::sheets::css;
-use crate::formats::office::sheets::html::{get, tokenize, Sheet, Token};
-use crate::formats::office::sheets::textenc::html_utf8;
+use exav_unpack::html::{self, Token, attr as get};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -142,9 +142,11 @@ pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
     // A page saved with its pictures in one MIME message is read from it.
     let (text, pictures): (Cow<str>, Vec<mime::Picture>) = match mime::parse(input, budget)? {
         Some(m) => (Cow::Owned(m.html), m.pictures),
-        None => (html_utf8(input), vec![]),
+        None => (html::decode(input), vec![]),
     };
-    let tokens = tokenize(&text).map_err(|_| Error::TooLarge("HTML elements"))?;
+    let tokens = html::without_downlevel(
+        html::read(&text, &mut budget.tree()).map_err(|_| Error::TooLarge("HTML elements"))?,
+    );
     if !tokens.iter().any(|t| {
         matches!(t, Token::Start { name, .. }
             if matches!(name.as_str(), "html" | "body" | "p" | "div" | "table" | "h1" | "span"))
@@ -154,13 +156,12 @@ pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
     let mut css = Sheet::default();
     let mut page = None;
     for (k, t) in tokens.iter().enumerate() {
-        if let Token::Start { name, .. } = t {
-            if name == "style" {
-                if let Some(Token::Text(c)) = tokens.get(k + 1) {
-                    css.add(c);
-                    page = page.or_else(|| page_rule(c));
-                }
-            }
+        if let Token::Start { name, .. } = t
+            && name == "style"
+            && let Some(Token::Text(c)) = tokens.get(k + 1)
+        {
+            css.add(c);
+            page = page.or_else(|| page_rule(c));
         }
     }
     let mut h = Html {
@@ -326,11 +327,11 @@ impl Html<'_> {
             return Ok(());
         };
         // Trailing white space is not shown.
-        if let Some(Inline::Run(r)) = p.content.last_mut() {
-            if let Some(RunItem::Text(t)) = r.items.last_mut() {
-                let trimmed = t.trim_end_matches(' ').len();
-                t.truncate(trimmed);
-            }
+        if let Some(Inline::Run(r)) = p.content.last_mut()
+            && let Some(RunItem::Text(t)) = r.items.last_mut()
+        {
+            let trimmed = t.trim_end_matches(' ').len();
+            t.truncate(trimmed);
         }
         // One with nothing to show (the white space between two blocks) is not
         // a paragraph.
@@ -536,6 +537,10 @@ impl Html<'_> {
         }
         match name {
             "table" => {
+                // Tables nest as deep as elements do, and no deeper.
+                if self.frames.len() >= MAX_DEPTH {
+                    return Ok(());
+                }
                 self.flush(false)?;
                 self.push_frame(name, attrs);
                 let t = table_props(attrs, &self.decls(name, attrs));
@@ -567,10 +572,10 @@ impl Html<'_> {
                 if name == "th" && props.v_align.is_none() {
                     props.v_align = Some(VAlign::Center);
                 }
-                if name == "th" {
-                    if let Some(f) = self.frames.last_mut() {
-                        f.para.jc = f.para.jc.or(Some(Jc::Center));
-                    }
+                if name == "th"
+                    && let Some(f) = self.frames.last_mut()
+                {
+                    f.para.jc = f.para.jc.or(Some(Jc::Center));
                 }
                 self.b.cell()?;
                 let n = |k: &str| get(attrs, k).and_then(|v| v.trim().parse::<u32>().ok());
@@ -582,6 +587,10 @@ impl Html<'_> {
                 }));
             }
             "a" => {
+                // A link does not hold another: it ends where the next begins.
+                if let Some(open) = self.links.pop() {
+                    self.link_into(open);
+                }
                 self.push_frame(name, attrs);
                 if let Some(n) = get(attrs, "name").or_else(|| get(attrs, "id")) {
                     let id = self.next_bookmark;
@@ -786,10 +795,10 @@ impl Html<'_> {
             "td" | "th" => self.close_cell()?,
             "tr" => {
                 self.close_cell()?;
-                if let Some(Cont::Table(t)) = self.conts.last_mut() {
-                    if let Some(r) = t.row.take() {
-                        t.rows.push(r);
-                    }
+                if let Some(Cont::Table(t)) = self.conts.last_mut()
+                    && let Some(r) = t.row.take()
+                {
+                    t.rows.push(r);
                 }
             }
             "table" => {
@@ -799,7 +808,7 @@ impl Html<'_> {
                     if let Some(r) = t.row.take() {
                         t.rows.push(r);
                     }
-                    if let Some(table) = self.build_table(t) {
+                    if let Some(table) = self.build_table(t)? {
                         self.push_block(Block::Table(table));
                     }
                 }
@@ -862,7 +871,7 @@ impl Html<'_> {
                         if let Some(r) = t.row.take() {
                             t.rows.push(r);
                         }
-                        if let Some(table) = self.build_table(t) {
+                        if let Some(table) = self.build_table(t)? {
                             self.push_block(Block::Table(table));
                         }
                     }
@@ -885,10 +894,10 @@ impl Html<'_> {
 
     /// The model table of the cells read: the grid, and the cells a row span
     /// continues into the rows below.
-    fn build_table(&mut self, t: TableB) -> Option<Table> {
+    fn build_table(&mut self, t: TableB) -> Result<Option<Table>> {
         let rows: Vec<Vec<CellB>> = t.rows.into_iter().filter(|r| !r.is_empty()).collect();
         if rows.is_empty() {
-            return None;
+            return Ok(None);
         }
         // Columns: the widest row, its row-spanned cells counted.
         let mut carry: HashMap<usize, (u32, u32)> = HashMap::new();
@@ -899,21 +908,13 @@ impl Html<'_> {
             let mut col = 0usize;
             let mut it = row.into_iter();
             loop {
-                if let Some(&(left, span)) = carry.get(&col) {
-                    if left > 0 {
-                        let props = CellProps {
-                            grid_span: span,
-                            v_merge: VMerge::Continue,
-                            ..CellProps::default()
-                        };
-                        cells.push(Cell {
-                            props,
-                            content: vec![Block::Para(Para::default())],
-                        });
-                        carry.insert(col, (left - 1, span));
-                        col += span as usize;
-                        continue;
-                    }
+                if let Some(&(left, span)) = carry.get(&col)
+                    && left > 0
+                {
+                    cells.push(self.continued(span)?);
+                    carry.insert(col, (left - 1, span));
+                    col += span as usize;
+                    continue;
                 }
                 let Some(mut c) = it.next() else { break };
                 c.props.grid_span = c.colspan;
@@ -932,15 +933,7 @@ impl Html<'_> {
                 if left == 0 {
                     break;
                 }
-                let props = CellProps {
-                    grid_span: span,
-                    v_merge: VMerge::Continue,
-                    ..CellProps::default()
-                };
-                cells.push(Cell {
-                    props,
-                    content: vec![Block::Para(Para::default())],
-                });
+                cells.push(self.continued(span)?);
                 carry.insert(col, (left - 1, span));
                 col += span as usize;
             }
@@ -955,10 +948,24 @@ impl Html<'_> {
         let width =
             (self.doc.section.width - self.doc.section.left - self.doc.section.right).max(1440);
         let grid = vec![(width / columns as i32).max(120); columns];
-        Some(Table {
+        Ok(Some(Table {
             props: t.props,
             grid,
             rows: out_rows,
+        }))
+    }
+
+    /// The cell a row span continues into, counted like any other.
+    fn continued(&mut self, span: u32) -> Result<Cell> {
+        self.b.cell()?;
+        self.b.paragraph(0)?;
+        Ok(Cell {
+            props: CellProps {
+                grid_span: span,
+                v_merge: VMerge::Continue,
+                ..CellProps::default()
+            },
+            content: vec![Block::Para(Para::default())],
         })
     }
 }
@@ -986,12 +993,13 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         let hex = |x: u8| (x as char).to_digit(16);
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(a), Some(c)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((a * 16 + c) as u8);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(a), Some(c)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((a * 16 + c) as u8);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;

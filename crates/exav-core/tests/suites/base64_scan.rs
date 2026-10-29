@@ -3,7 +3,7 @@
 //! pattern) is detected when — and only when — `decode_base64` is on.
 
 use base64::Engine;
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 // The standard EICAR test string — the built-in DB carries a signature for it.
 // Assembled at runtime; see `exav_core::unpack::eicar` for why it is never a

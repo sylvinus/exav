@@ -14,7 +14,7 @@
 
 use std::io::{Read, Write};
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 #[derive(Clone, Copy, Debug)]
 enum Want {

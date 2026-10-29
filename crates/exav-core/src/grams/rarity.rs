@@ -144,11 +144,7 @@ impl GramStats {
 /// literal is never penalised, and the penalty grows with an order of
 /// magnitude rather than with a raw count that spans 1..10^6.
 fn log2_floor(c: u32) -> isize {
-    if c <= 1 {
-        0
-    } else {
-        c.ilog2() as isize
-    }
+    if c <= 1 { 0 } else { c.ilog2() as isize }
 }
 
 /// How rare `b` should be from its bytes alone. A low-entropy run (a constant

@@ -37,15 +37,15 @@ mod wide;
 pub use curves::{flatten_arc, flatten_circle, flatten_ellipse};
 pub use fill::fill_even_odd;
 pub use font::{
-    resolve_file, resolve_override, resolve_style, Face, Family, Metrics, TrueTypeFace, FACE_COUNT,
+    FACE_COUNT, Face, Family, Metrics, TrueTypeFace, resolve_file, resolve_override, resolve_style,
 };
 pub use hatch::nesting_depths;
 pub use palette::Palette;
-pub use scene::{Affine, Scene, FILL_BYTES, FILL_EDGE, STROKE_BYTES};
+pub use scene::{Affine, FILL_BYTES, FILL_EDGE, STROKE_BYTES, Scene};
 pub use tessellate::{
-    expand_bulges, LayerInfo, LayoutInfo, Sheet, Tessellator, Warnings, SCENE_BUDGET,
+    LayerInfo, LayoutInfo, SCENE_BUDGET, Sheet, Tessellator, Warnings, expand_bulges,
 };
-pub use text::{mtext_lines, HAlign, TextRun, VAlign, TEXT_RECORD_BYTES};
+pub use text::{HAlign, TEXT_RECORD_BYTES, TextRun, VAlign, mtext_lines};
 
 /// Why a file did not parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +220,14 @@ impl Document {
         };
         let mut t = Tessellator::with_palette(&self.doc, palette);
         t.budget = budget;
+        // What the reader dropped at one of its limits is part of the drawing
+        // left out, as the entities the scene budget stops are.
+        if (self.doc.warnings)
+            .iter()
+            .any(|w| w.kind == crate::cad::WarningKind::LimitReached)
+        {
+            t.warnings.scene_truncated = t.warnings.scene_truncated.saturating_add(1);
+        }
         let drawn = match layout {
             Some(name) if !name.is_empty() && t.run_layout(name) => name.to_string(),
             _ => {

@@ -11,7 +11,7 @@
 //! The fixtures here are built rather than vendored, so each one isolates a
 //! single property of the record walk.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use std::io::Write;
 
 const MARKER: &[u8] = b"EMBEDDED-OBJECT-MARKER";

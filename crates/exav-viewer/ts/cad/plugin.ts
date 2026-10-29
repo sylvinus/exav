@@ -39,6 +39,15 @@ export interface CadOptions {
    */
   maxDecompressedBytes?: number;
   /**
+   * Most entities read from a drawing, block contents included; the rest are
+   * left out and the `scene_truncated` warning shown. Default 1_000_000: an
+   * entity takes about 512 bytes of the module's memory, so the default is
+   * about 512 MiB, and a small hostile file can declare millions. The
+   * largest drawing in a sweep of about 1,100 public DWG and DXF files has
+   * about 360,000.
+   */
+  maxEntities?: number;
+  /**
    * Lines at their lineweights: "drawing" as the drawing was saved
    * (`$LWDISPLAY`, AutoCAD's lineweight button), "always", or "never", every
    * line one pixel. Default "drawing".

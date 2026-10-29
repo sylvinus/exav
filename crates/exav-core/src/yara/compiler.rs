@@ -18,7 +18,7 @@ use crate::yara::ir::{
     Quant, StrOp, Value,
 };
 use crate::yara::matcher::{
-    build_regex, build_wide_regex, widen, Base64SubDef, Needle, PatternDef, PatternMatcher,
+    Base64SubDef, Needle, PatternDef, PatternMatcher, build_regex, build_wide_regex, widen,
 };
 use crate::yara::modules::{self, FieldName, ModuleKind, SchemaNode};
 use crate::yara::scanner::{CompiledRule, Rules};
@@ -765,7 +765,7 @@ impl RuleCtx<'_> {
             Expr::LiteralFloat(f) => Cond::Float(f.value),
             Expr::LiteralString(s) => Cond::Str(ls_bytes(s)),
             Expr::Regexp(_) => {
-                return Err(Error::unsupported("bare regular expression in condition"))
+                return Err(Error::unsupported("bare regular expression in condition"));
             }
 
             Expr::Ident(id) => {
@@ -777,7 +777,7 @@ impl RuleCtx<'_> {
                                 "variable `{}` is a struct and cannot be used as a value \
                                  (access one of its fields)",
                                 id.name
-                            )))
+                            )));
                         }
                     }
                 } else if let Some(&idx) = self.rule_index.get(id.name) {
@@ -935,7 +935,7 @@ impl RuleCtx<'_> {
                     _ => {
                         return Err(Error::unsupported(format!(
                             "method call `{name}()` on a non-module value"
-                        )))
+                        )));
                     }
                 };
                 let args: Vec<Cond> = fc
@@ -1332,7 +1332,7 @@ impl RuleCtx<'_> {
                     _ => {
                         return Err(Error::new(
                             "expression is not iterable (expected an array or map)",
-                        ))
+                        ));
                     }
                 };
                 let (elem, nvars) = node.iterable().ok_or_else(|| {
@@ -1430,11 +1430,37 @@ fn const_to_cond(v: crate::yara::ir::Value) -> Cond {
 /// parentheses costs about 2^d steps (a 3.5 KB rule with 15 took 5.6 s).
 const MAX_PAREN_DEPTH: usize = 12;
 
-/// Refuses a source nested deeper than [`MAX_PAREN_DEPTH`] before it is parsed.
-/// Strings, comments and regular expressions are skipped.
+/// Most operators (characters and keywords) one expression of a condition may
+/// chain, between `and`, `or`, a comma or a parenthesis. The parser and what
+/// is built from it recurse once per operator of a chain (`1 << 1 << 1 ...`,
+/// `not not not ...`, `a contains b contains c ...`): 20,000 of them, a 40 KB
+/// rule, overflowed a 2 MiB stack and aborted the process.
+const MAX_OP_CHAIN: usize = 256;
+
+/// Words of a condition that are operators.
+const OP_WORDS: [&[u8]; 10] = [
+    b"not",
+    b"defined",
+    b"contains",
+    b"icontains",
+    b"startswith",
+    b"istartswith",
+    b"endswith",
+    b"iendswith",
+    b"iequals",
+    b"matches",
+];
+
+/// Refuses a source nested deeper than [`MAX_PAREN_DEPTH`], or with more than
+/// [`MAX_OP_CHAIN`] chained operators, before it is parsed. Strings, comments
+/// and regular expressions are skipped.
 fn check_paren_depth(src: &str) -> Result<()> {
     let b = src.as_bytes();
-    let (mut i, mut depth) = (0, 0usize);
+    let mut i = 0;
+    // `ops` at the start of each open parenthesis or bracket: the chain that
+    // `and` and `or` inside it go back to.
+    let mut open: Vec<usize> = vec![];
+    let (mut ops, mut in_condition) = (0usize, false);
     // The last byte that was not whitespace, to tell a regex from a division.
     let mut prev = 0u8;
     while i < b.len() {
@@ -1471,16 +1497,54 @@ fn check_paren_depth(src: &str) -> Result<()> {
                     i += 1;
                 }
             }
-            b'(' => {
-                depth += 1;
-                if depth > MAX_PAREN_DEPTH {
+            b'(' | b'[' if c == b'(' || in_condition => {
+                open.push(ops);
+                if open.len() > MAX_PAREN_DEPTH {
                     return Err(Error::new(format!(
                         "parentheses nested more than {MAX_PAREN_DEPTH} deep"
                     )));
                 }
             }
-            b')' => depth = depth.saturating_sub(1),
+            b')' | b']' if c == b')' || in_condition => {
+                // The group is one operand of the chain it sits in.
+                let at = open.pop();
+                if in_condition {
+                    ops = at.map_or(ops, |at| at + 1);
+                }
+            }
+            b',' => ops = open.last().copied().unwrap_or(0),
+            _ if c.is_ascii_alphabetic() || c == b'_' => {
+                let end = b[i..]
+                    .iter()
+                    .position(|x| !(x.is_ascii_alphanumeric() || *x == b'_'))
+                    .map_or(b.len(), |n| i + n);
+                let word = &b[i..end];
+                // `$rule`, `#and`: the name of a string.
+                if !(i > 0 && matches!(b[i - 1], b'$' | b'#' | b'@' | b'!')) {
+                    if word == b"rule" {
+                        in_condition = false;
+                    } else if word == b"condition" {
+                        (in_condition, ops) = (true, 0);
+                    } else if in_condition && (word == b"and" || word == b"or") {
+                        ops = open.last().copied().unwrap_or(0);
+                    } else if in_condition && OP_WORDS.contains(&word) {
+                        ops += 1;
+                    }
+                }
+                i = end - 1;
+            }
+            b'<' | b'>' | b'=' | b'!' | b'-' | b'+' | b'*' | b'%' | b'&' | b'|' | b'^' | b'~'
+            | b'/'
+                if in_condition =>
+            {
+                ops += 1;
+            }
             _ => {}
+        }
+        if ops > MAX_OP_CHAIN {
+            return Err(Error::new(format!(
+                "more than {MAX_OP_CHAIN} operators chained in one expression"
+            )));
         }
         if !c.is_ascii_whitespace() {
             prev = c;
@@ -1508,7 +1572,7 @@ fn int_kind(name: &str) -> Option<IntKind> {
 
 #[cfg(test)]
 mod paren_depth_tests {
-    use super::{Compiler, MAX_PAREN_DEPTH};
+    use super::{Compiler, MAX_OP_CHAIN, MAX_PAREN_DEPTH};
     use std::time::{Duration, Instant};
 
     fn nested(depth: usize) -> String {
@@ -1545,9 +1609,97 @@ mod paren_depth_tests {
     #[test]
     fn nesting_up_to_the_bound_compiles_and_one_more_is_refused() {
         assert!(Compiler::new().add_source(&nested(MAX_PAREN_DEPTH)).is_ok());
-        assert!(Compiler::new()
-            .add_source(&nested(MAX_PAREN_DEPTH + 1))
-            .is_err());
+        assert!(
+            Compiler::new()
+                .add_source(&nested(MAX_PAREN_DEPTH + 1))
+                .is_err()
+        );
+    }
+
+    fn rule(condition: &str) -> String {
+        format!("import \"pe\"\nrule r {{ strings: $a = \"x\" condition: {condition} }}")
+    }
+
+    /// Compiles `src` on a 1 MiB stack, where a chain this long recursed to
+    /// an overflow before it was bounded.
+    fn compile_small_stack(src: String) -> bool {
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || Compiler::new().add_source(&src).is_ok())
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_long_chain_of_operators_is_refused_not_recursed_into() {
+        let n = 20_000;
+        let chain = |op: &str| format!("{} == 1", vec!["1"; n].join(op));
+        let conditions = [
+            format!("{}true", "not ".repeat(n)),
+            format!("{}true", "defined ".repeat(n)),
+            format!("{}1 == 1", "- ".repeat(n)),
+            format!("{}1 == 1", "~ ".repeat(n)),
+            chain(" << "),
+            chain(" | "),
+            chain(" & "),
+            chain(" ^ "),
+            chain(" == "),
+            chain(" - 1 + "),
+            format!("\"a\"{}", " contains \"a\"".repeat(n)),
+            format!("\"a\" matches /x/{}", " matches /x/".repeat(n)),
+            format!("{}0{} == 1", "pe.sections[".repeat(n), "]".repeat(n)),
+        ];
+        for c in conditions {
+            assert!(!compile_small_stack(rule(&c)), "{}", &c[..40]);
+        }
+    }
+
+    #[test]
+    fn a_chain_up_to_the_bound_compiles_and_one_more_is_refused() {
+        let chain = |terms: usize| rule(&format!("{} == 1", vec!["1"; terms].join(" << ")));
+        // A term is an operator and its operand, and the `==` is two characters.
+        let ok = (MAX_OP_CHAIN - 2) / 2 + 1;
+        assert!(compile_small_stack(chain(ok)));
+        let err = Compiler::new().add_source(&chain(ok + 1)).err().unwrap();
+        assert!(err.to_string().contains("chained"), "{err}");
+    }
+
+    #[test]
+    fn and_or_and_commas_start_a_new_chain() {
+        let each = "1 << 1 << 1 << 1 == 1";
+        let ors = vec![each; 5_000].join(" or ");
+        assert!(compile_small_stack(rule(&ors)));
+        let ands = vec![each; 5_000].join(" and ");
+        assert!(compile_small_stack(rule(&ands)));
+        let of = format!("any of ({})", vec!["$a"; 5_000].join(", "));
+        assert!(compile_small_stack(rule(&of)));
+    }
+
+    #[test]
+    fn a_group_is_one_operand_of_the_chain_it_is_in() {
+        // `or` inside each group must not hide the chain outside them.
+        let mut c = String::from("true");
+        for _ in 0..200 {
+            c.push_str(" == (true or true)");
+        }
+        let err = Compiler::new().add_source(&rule(&c)).err().unwrap();
+        assert!(err.to_string().contains("chained"), "{err}");
+    }
+
+    #[test]
+    fn operators_outside_the_condition_are_not_counted() {
+        let mut src = String::from("rule r { strings:");
+        for i in 0..400 {
+            src.push_str(&format!(
+                " $s{i} = \"abc\" xor(1-2) $h{i} = {{ 41 [1-2] 42 }}"
+            ));
+        }
+        src.push_str(" condition: $s0 }");
+        Compiler::new().add_source(&src).expect("compiles");
+        // Nor the name of a string that looks like a keyword.
+        let src = rule("$a and #a > 0 and @a[1] > 0 and !a[1] > 0");
+        Compiler::new().add_source(&src).expect("compiles");
     }
 
     #[test]

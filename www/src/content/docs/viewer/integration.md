@@ -530,7 +530,8 @@ Files from users are untrusted. Every engine bounds what a file may cost:
 the image decoders refuse more than 256 MiB of pixels (`maxDecodeBytes`),
 a drawing's layout stops at eight million strokes and fill vertices
 (`maxPrimitives`; lower it for devices with little memory) and a DWG's
-compressed sections at 512 MiB expanded (`maxDecompressedBytes`), archives
+compressed sections at 512 MiB expanded (`maxDecompressedBytes`) and the
+entities read at a million (`maxEntities`), archives
 stop at 512 MiB extracted, 5000 members and a ratio of 200 (the `archive()`
 options), a document's ZIP at 20000 entries (`maxArchiveEntries`), and a
 conversion at 120 seconds (`timeoutMs`) and 1 GiB of memory (`maxMemory`;

@@ -5,9 +5,9 @@
 use std::rc::Rc;
 
 use super::csg::{self, Op, Poly};
-use super::math::{self, cross, dot, sub, unit, Xf, V3};
+use super::math::{self, V3, Xf, cross, dot, sub, unit};
 use super::step::Value;
-use super::{is, Color, Mesh, Piece, Reader, MAX_DEPTH};
+use super::{Color, MAX_DEPTH, Mesh, Piece, Reader, is};
 
 /// Representation identifiers that are not the body: axes, footprints,
 /// boxes, 2D plan symbols and the like.

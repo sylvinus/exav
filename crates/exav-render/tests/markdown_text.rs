@@ -10,7 +10,9 @@ fn text(md: &str) -> String {
 #[test]
 fn blocks_are_lines_and_marks_are_gone() {
     assert_eq!(
-        text("# Title\n\nSome *em* and **strong** and ~~gone~~ and `code`.\n\n> quoted\n\n- one\n- two\n\n3. three\n\n---\n\nend\n"),
+        text(
+            "# Title\n\nSome *em* and **strong** and ~~gone~~ and `code`.\n\n> quoted\n\n- one\n- two\n\n3. three\n\n---\n\nend\n"
+        ),
         "Title\nSome em and strong and gone and code.\nquoted\none\ntwo\nthree\nend\n"
     );
 }

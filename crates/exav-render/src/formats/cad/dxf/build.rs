@@ -337,10 +337,10 @@ pub(crate) fn build(mut raw: Raw, ctx: Ctx<'_>) -> Drawing {
         };
         for b in &mut blocks {
             for e in &mut b.entities {
-                if let EntityKind::Insert(ins) = &mut e.kind {
-                    if let Some(&x) = ctx.insert_dictionaries.get(&e.handle.0) {
-                        ins.clip = filter_of(x);
-                    }
+                if let EntityKind::Insert(ins) = &mut e.kind
+                    && let Some(&x) = ctx.insert_dictionaries.get(&e.handle.0)
+                {
+                    ins.clip = filter_of(x);
                 }
             }
         }

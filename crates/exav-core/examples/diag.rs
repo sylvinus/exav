@@ -99,6 +99,8 @@ fn main() {
     }
     eprintln!("  top fan-out groups (alen gsize hits fanout | best_off coverage%):");
     for (alen, gsize, hits, fan, off, cov) in db.engine().scan_diag_groups(&data, ft) {
-        eprintln!("    alen={alen} gsize={gsize:>5} hits={hits:>7} fanout={fan:>10} | off={off:>4} cov={cov}%");
+        eprintln!(
+            "    alen={alen} gsize={gsize:>5} hits={hits:>7} fanout={fan:>10} | off={off:>4} cov={cov}%"
+        );
     }
 }

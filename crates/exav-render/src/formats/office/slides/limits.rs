@@ -1,4 +1,5 @@
 use super::error::{Error, Result};
+use super::model::{Shape, Sp};
 
 /// Bounds on the work one conversion may do. A document past one of them is
 /// refused with [`Error::TooLarge`] rather than partly converted.
@@ -54,8 +55,9 @@ pub(crate) struct Budget {
     wanted: std::ops::Range<usize>,
 }
 
-/// What one shape costs in the model, beyond its text and pictures.
-pub(crate) const SHAPE_BYTES: u64 = 512;
+/// What one shape costs in the model, beyond its text and pictures: the shape
+/// and the largest of what it holds.
+pub(crate) const SHAPE_BYTES: u64 = (size_of::<Shape>() + size_of::<Sp>()) as u64;
 
 impl Budget {
     pub fn new(limits: Limits) -> Self {
@@ -94,6 +96,11 @@ impl Budget {
             return Err(Error::TooLarge("memory"));
         }
         Ok(())
+    }
+
+    /// What `xml::parse` charges the memory of a tree to.
+    pub fn tree(&mut self) -> impl FnMut(u64) -> bool + '_ {
+        |bytes| self.alloc(bytes).is_ok()
     }
 
     /// One more slide, `count` being those read so far.

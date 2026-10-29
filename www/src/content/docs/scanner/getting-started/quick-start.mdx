@@ -49,11 +49,12 @@ signatures loaded it refuses to run. Fetching signatures is the first step below
    eicar.com: Eicar-Test-Signature FOUND
    ```
 
-   A `SCAN SUMMARY` block follows the result lines. This first run parses the raw signatures, which takes a while and needs
-   memory to spare (see [what it costs](/scanner/guides/prebuilt-database/#what-it-costs)).
-   If the process dies with no message, it ran out of memory. exav always knows
-   EICAR, so the check that the ClamAV signatures loaded is `Known viruses` in
-   the summary: it should be in the millions.
+   A `SCAN SUMMARY` block follows the result lines. This first run parses the
+   raw signatures, which is slow and needs memory to spare (see
+   [what it costs](/scanner/guides/prebuilt-database/#what-it-costs)); a process
+   that dies with no message ran out of memory. exav always knows EICAR, so the
+   check that the ClamAV signatures loaded is `Known viruses` in the summary,
+   which should be in the millions.
 
 4. **Scan a file.** The output follows `clamscan`'s format:
 
@@ -89,8 +90,8 @@ pass. See [which code a run exits with](/scanner/reference/verdicts/#process-exi
 
 ## Faster startup: build a database once
 
-Loading the raw signatures parses millions of them on every start. Do it once
-and reuse the result:
+Parsing the raw signatures takes a while on every start. Do it once and reuse
+the result:
 
 ```sh
 exav --build-db exav.exavdb     # run daily, e.g. in CI
@@ -107,20 +108,18 @@ load cost. The daemon stays in the foreground, so run the client from a second
 terminal:
 
 ```sh
-exav --listen /tmp/exav.sock -d exav.exavdb    # load once, serve
-exav --connect /tmp/exav.sock /data            # client
+exav --listen $XDG_RUNTIME_DIR/exav.sock -d exav.exavdb    # load once, serve
+exav --connect $XDG_RUNTIME_DIR/exav.sock /data            # client
 ```
 
 A daemon can also keep its signatures current itself, fetching from a mirror
 with `--auto-update` (a `--features http` build); see
 [Signatures](/scanner/guides/signatures/#built-in-updater---auto-update).
 
-`--listen` accepts connections and `--connect` makes one. The protocol travels in
-the address: `--listen icap://0.0.0.0:1344` serves ICAP, and naming both serves
-both from one process. ClamAV's own `clamdscan` works too, given a `clamd.conf`
-whose `LocalSocket` or `TCPSocket` points at the daemon.
-
-See the [daemon guide](/scanner/guides/daemon/).
+The protocol travels in the address: `--listen icap://0.0.0.0:1344` serves ICAP,
+and naming both protocols serves both from one process. ClamAV's own `clamdscan`
+works too, given a `clamd.conf` whose `LocalSocket` or `TCPSocket` points at the
+daemon. See the [daemon guide](/scanner/guides/daemon/).
 
 ## Next
 

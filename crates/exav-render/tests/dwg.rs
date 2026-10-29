@@ -9,7 +9,7 @@
 
 mod cad_common;
 
-use exav_render::dwg::{Document, Drawing, ParseError, FILL_BYTES, STROKE_BYTES};
+use exav_render::dwg::{Document, Drawing, FILL_BYTES, ParseError, STROKE_BYTES};
 
 /// A drawing of `tests/fixtures/dwg`, by file name without `.gz`.
 fn fixture(name: &str) -> Vec<u8> {
@@ -204,11 +204,12 @@ fn a_block_control_that_cannot_be_read_does_not_blank_the_drawing() {
     let doc = Document::parse(&bad).unwrap();
     let d = doc.tessellate(None, None);
     assert_eq!(d.stroke_count(), whole.stroke_count());
-    assert!(doc
-        .drawing()
-        .warnings
-        .iter()
-        .any(|w| w.message.contains("object map")));
+    assert!(
+        doc.drawing()
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("object map"))
+    );
 }
 
 /// An ELLIPSE is in world coordinates, and its extrusion says which way its
@@ -649,4 +650,31 @@ fn a_corpus_of_real_drawings_reads_cleanly() {
         }
     }
     eprintln!("{read} read, {refused} refused, of {}", files.len());
+}
+
+/// Entities a reader drops at its limit are part of the drawing left out, and
+/// the drawing says so with the warning of a scene cut short: a viewer that
+/// capped the entities without saying would show a plan missing rooms.
+#[test]
+fn a_drawing_cut_at_the_entity_limit_says_so() {
+    let mut dxf = String::from("  0\nSECTION\n  2\nENTITIES\n");
+    for i in 0..10 {
+        dxf.push_str(&format!("  0\nLINE\n 10\n{i}\n 20\n0\n 11\n{i}\n 21\n1\n"));
+    }
+    dxf.push_str("  0\nENDSEC\n  0\nEOF\n");
+    let whole = Document::parse(dxf.as_bytes())
+        .unwrap()
+        .tessellate(None, None);
+    assert_eq!(whole.strokes.len() / STROKE_BYTES, 10);
+    assert_eq!(whole.warnings.scene_truncated, 0);
+
+    let limits = exav_render::cad::Limits {
+        max_entities: 4,
+        ..exav_render::cad::Limits::default()
+    };
+    let cut = Document::parse_with(dxf.as_bytes(), &limits)
+        .unwrap()
+        .tessellate(None, None);
+    assert_eq!(cut.strokes.len() / STROKE_BYTES, 4);
+    assert!(cut.warnings.scene_truncated > 0);
 }

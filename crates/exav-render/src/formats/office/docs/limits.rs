@@ -1,4 +1,5 @@
 use crate::formats::office::docs::error::{Error, Result};
+use crate::formats::office::docs::model::{Block, Cell, Inline, inline_bytes};
 
 /// Bounds on the work one conversion may do. A document past one of them is
 /// refused with [`Error::TooLarge`] rather than partly converted.
@@ -59,10 +60,12 @@ pub(crate) struct Budget {
     memory: u64,
 }
 
-/// What one paragraph costs in the model, beyond its text.
-pub(crate) const PARA_BYTES: u64 = 256;
-/// What one table cell costs in the model, beyond its content.
-pub(crate) const CELL_BYTES: u64 = 192;
+/// What one paragraph costs in the model, beyond its text: its slot among the
+/// blocks and the first allocation of its runs (four).
+pub(crate) const PARA_BYTES: u64 = (size_of::<Block>() + 4 * size_of::<Inline>()) as u64;
+/// What one table cell costs in the model, beyond its content: the cell, and
+/// the room its block list has for more than the first paragraph.
+pub(crate) const CELL_BYTES: u64 = (size_of::<Cell>() + 3 * size_of::<Block>()) as u64;
 
 impl Budget {
     pub fn new(limits: Limits) -> Self {
@@ -99,6 +102,16 @@ impl Budget {
             return Err(Error::TooLarge("memory"));
         }
         Ok(())
+    }
+
+    /// The inlines of a paragraph just built, by what they take.
+    pub fn inlines(&mut self, inlines: &[Inline]) -> Result<()> {
+        self.alloc(inline_bytes(inlines) as u64)
+    }
+
+    /// What `xml::parse` charges the memory of a tree to.
+    pub fn tree(&mut self) -> impl FnMut(u64) -> bool + '_ {
+        |bytes| self.alloc(bytes).is_ok()
     }
 
     pub fn used(&self) -> u64 {

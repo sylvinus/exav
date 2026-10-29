@@ -448,17 +448,16 @@ impl Parser<'_> {
             "fcharset" => {
                 if let (Dest::FontEntry(id), Some(cp)) =
                     (self.top().dest.clone(), cp_of_charset(n.unwrap_or(0)))
+                    && let Some(f) = self.fonts.get_mut(&id)
                 {
-                    if let Some(f) = self.fonts.get_mut(&id) {
-                        f.cp = cp;
-                    }
+                    f.cp = cp;
                 }
             }
             "cpg" => {
-                if let Dest::FontEntry(id) = self.top().dest.clone() {
-                    if let Some(f) = self.fonts.get_mut(&id) {
-                        f.cp = n.unwrap_or(1252).clamp(0, 65535) as u16;
-                    }
+                if let Dest::FontEntry(id) = self.top().dest.clone()
+                    && let Some(f) = self.fonts.get_mut(&id)
+                {
+                    f.cp = n.unwrap_or(1252).clamp(0, 65535) as u16;
                 }
             }
             _ => {}
@@ -1199,16 +1198,16 @@ pub(crate) fn build_styles(p: &mut Parser<'_>) {
         if s.kind == StyleKind::Table {
             st.tbl = Some(TableProps::default());
         }
-        if s.kind == StyleKind::Paragraph && s.name.to_ascii_lowercase().starts_with("heading ") {
-            if let Some(n) = s.name[8..]
+        if s.kind == StyleKind::Paragraph
+            && s.name.to_ascii_lowercase().starts_with("heading ")
+            && let Some(n) = s.name[8..]
                 .trim()
                 .parse::<u32>()
                 .ok()
                 .filter(|n| (1..=9).contains(n))
-            {
-                st.name = format!("heading {n}");
-                st.ppr.outline_level = Some(n - 1);
-            }
+        {
+            st.name = format!("heading {n}");
+            st.ppr.outline_level = Some(n - 1);
         }
         out.push(st);
     }

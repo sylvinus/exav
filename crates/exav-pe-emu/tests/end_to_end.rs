@@ -6,7 +6,7 @@
 //! real PE32 with the sections, entry point and (optionally) TLS directory each
 //! test needs.
 
-use exav_pe_emu::{unpack, EmuLimits};
+use exav_pe_emu::{EmuLimits, unpack};
 
 /// A minimal PE32 builder. The image has two sections, `.text` (the empty
 /// destination a stub fills) at RVA 0x1000 and `.pack` (the stub's own bytes)
@@ -50,7 +50,7 @@ mod pe {
             d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // FileAlignment
             d[opt + 56..opt + 60].copy_from_slice(&0x3000u32.to_le_bytes()); // SizeOfImage
             d[opt + 60..opt + 64].copy_from_slice(&0x400u32.to_le_bytes()); // SizeOfHeaders
-                                                                            // 16 data directories, so the TLS slot (9) is present.
+            // 16 data directories, so the TLS slot (9) is present.
             d[opt + 92..opt + 96].copy_from_slice(&16u32.to_le_bytes());
             if let Some(tls_rva) = self.tls_dir_rva {
                 let dd = opt + 96 + 9 * 8; // data directory 9

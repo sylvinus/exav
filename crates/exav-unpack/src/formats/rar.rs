@@ -1159,14 +1159,14 @@ fn join_rar4(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
             // it is given.
             if htype == 0x7B && flags & 0x0008 != 0 {
                 let at = pos + 7 + if flags & 0x0002 != 0 { 4 } else { 0 };
-                if let Some(n) = u16le(v, at).filter(|_| at + 2 <= pos + head_size) {
-                    if usize::from(n) != k {
-                        return Err(format!(
-                            "part {} is volume {} of its set",
-                            k + 1,
-                            usize::from(n) + 1
-                        ));
-                    }
+                if let Some(n) = u16le(v, at).filter(|_| at + 2 <= pos + head_size)
+                    && usize::from(n) != k
+                {
+                    return Err(format!(
+                        "part {} is volume {} of its set",
+                        k + 1,
+                        usize::from(n) + 1
+                    ));
                 }
             }
             match htype {
@@ -1186,13 +1186,13 @@ fn join_rar4(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
                         (false, None) => out.extend_from_slice(&v[pos..end]),
                         (true, Some(p)) => p.data.extend_from_slice(data),
                         (false, Some(_)) => {
-                            return Err(format!("part {} drops a member mid-way", k + 1))
+                            return Err(format!("part {} drops a member mid-way", k + 1));
                         }
                         (true, None) => {
                             return Err(format!(
                                 "part {} goes on with a member whose start is missing",
                                 k + 1
-                            ))
+                            ));
                         }
                     }
                     if before && !after {
@@ -1248,7 +1248,7 @@ fn rar4_whole(mut p: Pending, crc: u32) -> Result<Vec<u8>, String> {
     match (flags & 0x100 != 0, h.len() >= 40) {
         (true, true) => h[32..36].copy_from_slice(&((total >> 32) as u32).to_le_bytes()),
         _ if total > u64::from(u32::MAX) => {
-            return Err("a member past 4 GiB with no 64-bit size".to_string())
+            return Err("a member past 4 GiB with no 64-bit size".to_string());
         }
         _ => {}
     }
@@ -1320,16 +1320,16 @@ fn join_rar5(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
             let Some(b) = rar5_block(v, pos) else { break };
             // A volume past the first records its number: it must be where
             // it is given.
-            if b.htype == 1 && k > 0 {
-                if let Some(n) = rar5_volume_number(&v[b.hdr..b.data_off]) {
-                    if n != k as u64 {
-                        return Err(format!(
-                            "part {} is volume {} of its set",
-                            k + 1,
-                            n.saturating_add(1)
-                        ));
-                    }
-                }
+            if b.htype == 1
+                && k > 0
+                && let Some(n) = rar5_volume_number(&v[b.hdr..b.data_off])
+                && n != k as u64
+            {
+                return Err(format!(
+                    "part {} is volume {} of its set",
+                    k + 1,
+                    n.saturating_add(1)
+                ));
             }
             match b.htype {
                 1 if k == 0 => out.extend_from_slice(&v[pos..b.end]),
@@ -1354,13 +1354,13 @@ fn join_rar5(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
                             deferred.extend_from_slice(&v[pos..b.end])
                         }
                         (false, Some(_)) => {
-                            return Err(format!("part {} drops a member mid-way", k + 1))
+                            return Err(format!("part {} drops a member mid-way", k + 1));
                         }
                         (true, None) => {
                             return Err(format!(
                                 "part {} goes on with a member whose start is missing",
                                 k + 1
-                            ))
+                            ));
                         }
                     }
                     if before && !after {
@@ -1565,7 +1565,7 @@ mod tests {
         v.extend_from_slice(&0u16.to_le_bytes()); // flags
         v.extend_from_slice(&13u16.to_le_bytes()); // head_size
         v.extend_from_slice(&[0; 6]); // reserved1(2)+reserved2(4) = 6 -> total 13
-                                      // file header (type 0x74), flags 0x8000 (ADD_SIZE present)
+        // file header (type 0x74), flags 0x8000 (ADD_SIZE present)
         let mut fh = Vec::new();
         fh.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // PACK_SIZE
         fh.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // UNP_SIZE
@@ -1577,8 +1577,8 @@ mod tests {
         fh.extend_from_slice(&(name.len() as u16).to_le_bytes()); // NAME_SIZE
         fh.extend_from_slice(&0u32.to_le_bytes()); // ATTR
         fh.extend_from_slice(name); // NAME
-                                    // PACK_SIZE (first field of `fh`) doubles as the block's ADD_SIZE; there
-                                    // is no separate ADD_SIZE field. Header = generic(7) + fields.
+        // PACK_SIZE (first field of `fh`) doubles as the block's ADD_SIZE; there
+        // is no separate ADD_SIZE field. Header = generic(7) + fields.
         let head_size = 7 + fh.len();
         v.extend_from_slice(&[0, 0]); // crc
         v.push(0x74);

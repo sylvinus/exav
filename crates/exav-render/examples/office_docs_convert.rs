@@ -7,7 +7,7 @@
 //! per file: its name, the outcome, the time in microseconds, the size of
 //! the DOCX, and the warnings.
 
-use exav_render::docs::{convert, Format, Limits};
+use exav_render::docs::{Format, Limits, convert};
 use std::time::Instant;
 
 fn format(name: &str) -> Format {

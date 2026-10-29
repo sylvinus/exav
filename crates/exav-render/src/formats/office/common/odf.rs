@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn styles_resolve_through_parents_and_defaults() {
         let x = br##"<office:styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><style:default-style style:family="paragraph"><style:paragraph-properties fo:margin-left="1cm" fo:text-align="start"/></style:default-style><style:style style:name="a" style:family="paragraph"><style:paragraph-properties fo:text-align="center"/></style:style><style:style style:name="b" style:family="paragraph" style:parent-style-name="a"><style:text-properties fo:color="#ff0000"/><style:paragraph-properties fo:margin-right="2cm"/></style:style><style:style style:name="c" style:family="paragraph" style:parent-style-name="b"><style:paragraph-properties fo:text-align="end"/></style:style></office:styles>"##;
-        let n = super::super::xml::parse(x, 100).unwrap();
+        let n = super::super::xml::parse(x, &mut super::super::xml::within(1 << 20)).unwrap();
         let mut s = Styles::default();
         s.add(&n, false);
         let p = s.resolve("paragraph", Some("b"));

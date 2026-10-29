@@ -1,6 +1,8 @@
 //! ZIP packages (OpenDocument, OOXML, iWork) read and written within limits.
 
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Why a package part was not read or written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +87,7 @@ impl<'a> Zip<'a> {
             Err(zip::result::ZipError::UnsupportedArchive(m))
                 if m == zip::result::ZipError::PASSWORD_REQUIRED =>
             {
-                return Err(Error::Encrypted)
+                return Err(Error::Encrypted);
             }
             Err(_) => return Ok(None),
         };
@@ -102,17 +104,60 @@ impl<'a> Zip<'a> {
 
 /// A ZIP archive written to memory, refused past `limit` bytes.
 pub struct PackageWriter {
-    z: zip::ZipWriter<Out>,
+    // Declared first: dropped first, so that the limit is lifted before the
+    // writer below is finalized by its own drop.
+    _lift: Lift,
+    z: Option<zip::ZipWriter<Out>>,
 }
 
-struct Out {
+/// The output of a ZIP writer, refused past a limit.
+pub(crate) struct Out {
     buf: Cursor<Vec<u8>>,
-    limit: u64,
+    limit: Arc<AtomicU64>,
+}
+
+/// Lifts its [`Out`]'s limit when dropped. A ZIP writer dropped without being
+/// finished is finalized by the `zip` crate, which says on stderr when it
+/// cannot: and a writer that was refused (past its limit) is the usual one. Its
+/// archive is wanted by no one, so it is let finish its last small write
+/// quietly.
+pub(crate) struct Lift(Arc<AtomicU64>);
+
+impl Lift {
+    /// Lets the writer finish: only its central directory and the last of its
+    /// compressed data are left to write, and what was written before is what
+    /// the limit was about.
+    pub(crate) fn lift(&self) {
+        self.0.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Lift {
+    fn drop(&mut self) {
+        self.lift();
+    }
+}
+
+impl Out {
+    /// An output of up to `limit` bytes, with room for `capacity` made at
+    /// once.
+    pub(crate) fn new(capacity: usize, limit: u64) -> (Out, Lift) {
+        let limit = Arc::new(AtomicU64::new(limit));
+        let out = Out {
+            buf: Cursor::new(Vec::with_capacity(capacity)),
+            limit: Arc::clone(&limit),
+        };
+        (out, Lift(limit))
+    }
+
+    pub(crate) fn into_inner(self) -> Vec<u8> {
+        self.buf.into_inner()
+    }
 }
 
 impl Write for Out {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        if self.buf.position() + b.len() as u64 > self.limit {
+        if self.buf.position() + b.len() as u64 > self.limit.load(Ordering::Relaxed) {
             return Err(std::io::Error::other("output too large"));
         }
         self.buf.write(b)
@@ -140,11 +185,10 @@ fn werr(e: impl std::fmt::Display) -> Error {
 
 impl PackageWriter {
     pub fn new(limit: u64) -> PackageWriter {
+        let (out, lift) = Out::new(0, limit);
         PackageWriter {
-            z: zip::ZipWriter::new(Out {
-                buf: Cursor::new(Vec::new()),
-                limit,
-            }),
+            _lift: lift,
+            z: Some(zip::ZipWriter::new(out)),
         }
     }
 
@@ -159,14 +203,21 @@ impl PackageWriter {
             .compression_method(method)
             .compression_level(compress.then_some(6))
             .last_modified_time(zip::DateTime::default());
-        self.z.start_file(name, opt).map_err(werr)?;
-        self.z.write_all(data).map_err(werr)
+        let Some(z) = self.z.as_mut() else {
+            return Err(Error::Write("the package is finished".to_string()));
+        };
+        z.start_file(name, opt).map_err(werr)?;
+        z.write_all(data).map_err(werr)
     }
 
     /// The archive's bytes.
-    pub fn finish(self) -> Result<Vec<u8>, Error> {
-        let out = self.z.finish().map_err(werr)?;
-        Ok(out.buf.into_inner())
+    pub fn finish(mut self) -> Result<Vec<u8>, Error> {
+        let Some(z) = self.z.take() else {
+            return Err(Error::Write("the package is finished".to_string()));
+        };
+        self._lift.lift();
+        let out = z.finish().map_err(werr)?;
+        Ok(out.into_inner())
     }
 }
 

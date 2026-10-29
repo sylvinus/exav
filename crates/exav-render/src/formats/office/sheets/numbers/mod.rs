@@ -56,18 +56,18 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
         let data = z.get(inner, max, budget)?.unwrap_or_default();
         let mut iz = crate::formats::office::sheets::ods::Zip::open(&data)?;
         for n in iz.names() {
-            if n.ends_with(".iwa") {
-                if let Some(d) = iz.get(&n, max, budget)? {
-                    files.push((n, d));
-                }
+            if n.ends_with(".iwa")
+                && let Some(d) = iz.get(&n, max, budget)?
+            {
+                files.push((n, d));
             }
         }
     }
     for n in &names {
-        if n.ends_with(".iwa") {
-            if let Some(d) = z.get(n, max, budget)? {
-                files.push((n.clone(), d));
-            }
+        if n.ends_with(".iwa")
+            && let Some(d) = z.get(n, max, budget)?
+        {
+            files.push((n.clone(), d));
         }
     }
     read_iwa(
@@ -93,10 +93,10 @@ pub(crate) fn read_package<'a>(
         let max = budget.limits.max_part;
         let mut iz = crate::formats::office::sheets::ods::Zip::open(data)?;
         for n in iz.names() {
-            if n.ends_with(".iwa") {
-                if let Some(d) = iz.get(&n, max, budget)? {
-                    all.push((n, d));
-                }
+            if n.ends_with(".iwa")
+                && let Some(d) = iz.get(&n, max, budget)?
+            {
+                all.push((n, d));
             }
         }
     }
@@ -241,10 +241,10 @@ fn convert(store: &Store, doc: Msg, budget: &mut Budget) -> Result<Workbook> {
         if ids.is_empty() {
             // Older documents list only some drawables: tables name their sheet.
             for ti in store.ids_of(TABLE_INFO) {
-                if let Some(m) = store.typed(ti, TABLE_INFO) {
-                    if m.msg(1).and_then(|s| s.reference(2)) == Some(sid) {
-                        ids.extend(m.reference(2));
-                    }
+                if let Some(m) = store.typed(ti, TABLE_INFO)
+                    && m.msg(1).and_then(|s| s.reference(2)) == Some(sid)
+                {
+                    ids.extend(m.reference(2));
                 }
             }
         }
@@ -330,10 +330,10 @@ fn convert(store: &Store, doc: Msg, budget: &mut Budget) -> Result<Workbook> {
         }
         wb.sheets.push(sheet);
     }
-    if wb.sheets.iter().all(|s| s.state != SheetState::Visible) {
-        if let Some(s) = wb.sheets.first_mut() {
-            s.state = SheetState::Visible;
-        }
+    if wb.sheets.iter().all(|s| s.state != SheetState::Visible)
+        && let Some(s) = wb.sheets.first_mut()
+    {
+        s.state = SheetState::Visible;
     }
     wb.active = wb
         .sheets

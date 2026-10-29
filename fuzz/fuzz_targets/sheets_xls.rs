@@ -4,7 +4,7 @@
 //! formulas, drawings and charts) and the XLSX writer, as @exav/viewer's
 //! sheets module runs them. A panic traps the wasm instance in the browser,
 //! so every one is a finding, and so is an output that is not an XLSX.
-use exav_render::sheets::{convert, Format};
+use exav_render::sheets::{Format, convert};
 use libfuzzer_sys::fuzz_target;
 
 #[path = "sheets_check.rs"]

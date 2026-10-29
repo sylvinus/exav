@@ -274,15 +274,13 @@ fn merge(acc: &mut Cabinet, mut next: Cabinet) -> Result<(), String> {
             return Err("a folder runs on in a cabinet that compresses it otherwise".into());
         }
         let mut rest = first.blocks.into_iter();
-        if cut_block {
-            if let Some(b) = rest.next() {
-                let end = into.blocks.last_mut().expect("a cut block");
-                end.payload.extend_from_slice(&b.payload);
-                if end.payload.len() > usize::from(u16::MAX) {
-                    return Err("a block cut across cabinets is longer than a block can be".into());
-                }
-                end.uncompressed = b.uncompressed;
+        if cut_block && let Some(b) = rest.next() {
+            let end = into.blocks.last_mut().expect("a cut block");
+            end.payload.extend_from_slice(&b.payload);
+            if end.payload.len() > usize::from(u16::MAX) {
+                return Err("a block cut across cabinets is longer than a block can be".into());
             }
+            end.uncompressed = b.uncompressed;
         }
         into.blocks.extend(rest);
         if into.blocks.len() > usize::from(u16::MAX) {

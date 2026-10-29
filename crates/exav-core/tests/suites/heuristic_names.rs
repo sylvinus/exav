@@ -16,7 +16,7 @@
 //! Both were found by enumerating ClamAV's emitted names rather than by reading
 //! exav, which is the only way this class of bug shows up.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 use std::io::Write;
 
 fn empty_db() -> Scanner {

@@ -3,4 +3,3 @@
 
 pub mod extreme;
 pub mod frame;
-pub mod panics;

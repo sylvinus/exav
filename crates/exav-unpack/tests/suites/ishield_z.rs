@@ -13,7 +13,7 @@
 //! Fixtures are the `unshield` project's own examples (MIT); see `NOTICE`.
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!(

@@ -582,9 +582,9 @@ pub fn elf_layout(src: &dyn ByteSource) -> Option<PeLayout> {
             let p = phoff.checked_add(i * ph_entsize)?;
             let (Some(kind), Some(offset), Some(vaddr), Some(memsz)) = (
                 f.u32(p),
-                f.word(p + offset_at, wide),
-                f.word(p + vaddr_at, wide),
-                f.word(p + memsz_at, wide),
+                p.checked_add(offset_at).and_then(|a| f.word(a, wide)),
+                p.checked_add(vaddr_at).and_then(|a| f.word(a, wide)),
+                p.checked_add(memsz_at).and_then(|a| f.word(a, wide)),
             ) else {
                 break;
             };
@@ -604,9 +604,11 @@ pub fn elf_layout(src: &dyn ByteSource) -> Option<PeLayout> {
             let Some(s) = shoff.checked_add(i * sh_entsize) else {
                 break;
             };
-            let (Some(kind), Some(offset), Some(size)) =
-                (f.u32(s + 4), f.word(s + offset_at, wide), f.word(s + size_at, wide))
-            else {
+            let (Some(kind), Some(offset), Some(size)) = (
+                s.checked_add(4).and_then(|a| f.u32(a)),
+                s.checked_add(offset_at).and_then(|a| f.word(a, wide)),
+                s.checked_add(size_at).and_then(|a| f.word(a, wide)),
+            ) else {
                 break;
             };
             section_rawptrs.push(offset);
@@ -1327,6 +1329,27 @@ mod tests {
         };
         assert_eq!(pe.rawaddr(0x1010, 0x10000), Some(0xFFFF_FF10));
         assert_eq!(pe.rawaddr(0x1200, 0x10000), None);
+    }
+
+    /// Header offsets near the top of u64 are the file's to claim: the table
+    /// they name is past the file, not an overflow.
+    #[test]
+    fn elf_table_offsets_near_the_top_of_u64_are_absent_not_a_panic() {
+        for off in [u64::MAX, u64::MAX - 1, u64::MAX - 8, u64::MAX - 40] {
+            let mut elf = vec![0u8; 120];
+            elf[..4].copy_from_slice(b"\x7fELF");
+            elf[4] = 2;
+            elf[5] = 1;
+            elf[32..40].copy_from_slice(&off.to_le_bytes());
+            elf[40..48].copy_from_slice(&off.to_le_bytes());
+            // e_phentsize, e_phnum, e_shentsize, e_shnum
+            for (at, v) in [(54, 56u16), (56, 2), (58, 64), (60, 2)] {
+                elf[at..at + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            assert!(elf_broken(&elf.as_slice()), "{off:#x}");
+            let layout = elf_layout(&elf.as_slice()).unwrap();
+            assert!(layout.section_rawptrs.is_empty(), "{off:#x}");
+        }
     }
 
     /// One read finds what looking for each magic at every offset finds:

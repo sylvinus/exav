@@ -2,7 +2,7 @@
 name = "exav-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -94,6 +94,20 @@ bench = false
 [[bin]]
 name = "vdisk"
 path = "fuzz_targets/vdisk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fsimage"
+path = "fuzz_targets/fsimage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lzo"
+path = "fuzz_targets/lzo.rs"
 test = false
 doc = false
 bench = false
@@ -384,6 +398,13 @@ bench = false
 [[bin]]
 name = "docs_wml"
 path = "fuzz_targets/docs_wml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docs_html"
+path = "fuzz_targets/docs_html.rs"
 test = false
 doc = false
 bench = false

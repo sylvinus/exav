@@ -12,9 +12,9 @@
 use std::f64::consts::TAU;
 
 use super::curves::{conic_point, segments};
-use super::math::{add, scale, sub, V3};
+use super::math::{V3, add, scale, sub};
 use super::step::Value;
-use super::{is, Reader, MAX_DEPTH};
+use super::{MAX_DEPTH, Reader, is};
 
 /// Most points of a curve that carries parameters.
 const MAX_POINTS: usize = 1 << 16;
@@ -171,7 +171,7 @@ impl<'a> Reader<'a> {
             b"IFCGRADIENTCURVE" => self.gradient_curve(&p, depth),
             _ => None,
         };
-        samples.filter(|s| s.len() >= 2 && s.windows(2).all(|w| w[1].0 >= w[0].0))
+        samples.filter(|s| s.len() >= 2 && s.array_windows().all(|[a, b]| b.0 >= a.0))
     }
 
     /// The samples of composite curve `id` when its `end` parameter only

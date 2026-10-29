@@ -2,13 +2,24 @@
 //! alpha, or RGBA), in the colour space the file's own profile names
 //! converted to sRGB by the decoder.
 
-use zenjxl_decoder::api::{decode_with, Error as JxlError, JxlDecoderLimits, JxlDecoderOptions};
+use zenjxl_decoder::api::{Error as JxlError, JxlDecoderLimits, JxlDecoderOptions, decode_with};
 
-use super::{Channels, Error, Pixels, Samples, DECODE_MAX};
+use super::{Channels, DECODE_MAX, Error, Pixels, Samples};
 
 /// Most pixels of one image, whatever the memory: the decode costs time per
 /// pixel (about 20 Mpx a second in a browser).
 const MAX_PIXELS: u64 = 1 << 27;
+
+/// What the decoder holds for a pixel while it works: the colour as three
+/// floats, each extra channel as one, and the 8-bit result. Its own memory
+/// budget does not see all of it, so the pixel count is what holds it: a file
+/// that declares the most pixels the budget allows, and the most channels,
+/// takes this much of each.
+const BYTES_PER_PIXEL: u64 = 12 + 4 * MAX_EXTRA_CHANNELS as u64 + 4;
+
+/// Extra channels beyond what is drawn: the alpha, and one more. A file with
+/// more is refused as too large, and each costs a float a pixel.
+const MAX_EXTRA_CHANNELS: usize = 2;
 
 pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     let limit = max_alloc.min(DECODE_MAX);
@@ -16,7 +27,8 @@ pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     // The decoder tracks what it allocates against this budget. The result
     // is 8 bits a sample and four samples a pixel at most.
     limits.max_memory_bytes = Some(limit);
-    limits.max_pixels = Some((limit / 4).min(MAX_PIXELS) as usize);
+    limits.max_extra_channels = Some(MAX_EXTRA_CHANNELS);
+    limits.max_pixels = Some((limit / BYTES_PER_PIXEL).min(MAX_PIXELS) as usize);
     let mut options = JxlDecoderOptions::default();
     options.limits = limits;
     let image = decode_with(data, options).map_err(|e| match e {

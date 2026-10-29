@@ -12,9 +12,9 @@ use crate::formats::office::common::xml::{self, Node};
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::limits::Budget;
 use crate::formats::office::slides::model::*;
-use crate::formats::office::slides::package::{image_ext, Zip};
+use crate::formats::office::slides::package::{Zip, image_ext};
 use std::collections::HashMap;
-use styles::{color, len, percent, Props, Styles};
+use styles::{Props, Styles, color, len, percent};
 
 /// What a document holds: slides, or the pages of a drawing, each of which
 /// becomes a slide of its own size.
@@ -78,13 +78,9 @@ fn read_package(mut z: Zip, budget: &mut Budget, kind: Kind) -> Result<Presentat
         .get("content.xml", max, budget)?
         .ok_or_else(|| Error::NotFormat("no content.xml".into()))?;
     let styles_xml = z.get("styles.xml", max, budget)?;
-    budget.alloc(content.len() as u64 * 4)?;
-    let content = xml::parse(&content, xml::MAX_ELEMENTS)?;
+    let content = xml::parse(&content, &mut budget.tree())?;
     let styles_doc = match styles_xml {
-        Some(s) => {
-            budget.alloc(s.len() as u64 * 4)?;
-            xml::parse(&s, xml::MAX_ELEMENTS).ok()
-        }
+        Some(s) => xml::parse(&s, &mut budget.tree()).ok(),
         None => None,
     };
     // Pictures and objects are read when a slide uses them.
@@ -101,20 +97,19 @@ pub(crate) fn read_fodg(bytes: &[u8], budget: &mut Budget) -> Result<Presentatio
 }
 
 fn read_flat(bytes: &[u8], budget: &mut Budget, kind: Kind) -> Result<Presentation> {
-    budget.alloc(bytes.len() as u64 * 4)?;
-    let doc = xml::parse(bytes, xml::MAX_ELEMENTS)?;
+    let doc = xml::parse(bytes, &mut budget.tree())?;
     if doc.name != "office:document" {
         return Err(Error::NotFormat(format!(
             "not a flat ODF document: {}",
             doc.name
         )));
     }
-    if let Some(m) = doc.attr("office:mimetype") {
-        if !kind.is_type(m) {
-            return Err(Error::NotFormat(format!(
-                "a flat OpenDocument file of type {m}"
-            )));
-        }
+    if let Some(m) = doc.attr("office:mimetype")
+        && !kind.is_type(m)
+    {
+        return Err(Error::NotFormat(format!(
+            "a flat OpenDocument file of type {m}"
+        )));
     }
     let r = Reader::new(&doc, None, None, kind);
     r.read(budget)
@@ -231,11 +226,7 @@ fn auto_color(bg: Option<&Fill>) -> Rgb {
         _ => 0xFFFFFF,
     };
     let l = ((c >> 16) & 0xFF) * 299 + ((c >> 8) & 0xFF) * 587 + (c & 0xFF) * 114;
-    if l < 128_000 {
-        0xFFFFFF
-    } else {
-        0x000000
-    }
+    if l < 128_000 { 0xFFFFFF } else { 0x000000 }
 }
 
 impl<'d> Reader<'d> {
@@ -529,10 +520,8 @@ impl<'d> Reader<'d> {
                     }
                     _ => false,
                 };
-                if wanted {
-                    if let Some(s) = self.shape(n, Scope::Master, &ctx, None, budget, 0)? {
-                        shapes.push(s);
-                    }
+                if wanted && let Some(s) = self.shape(n, Scope::Master, &ctx, None, budget, 0)? {
+                    shapes.push(s);
                 }
             }
         }
@@ -1275,22 +1264,22 @@ impl<'d> Reader<'d> {
             "draw:line" | "draw:measure" | "draw:connector" => {
                 let g = |k: &str| n.attr(k).and_then(len).unwrap_or(0);
                 let (x1, y1, x2, y2) = (g("svg:x1"), g("svg:y1"), g("svg:x2"), g("svg:y2"));
-                if n.name == "draw:connector" {
-                    if let (Some(d), Some(v)) = (n.attr("svg:d"), vb(n)) {
-                        // The path's box is the view box, in 1/100 mm.
-                        let bx = (v[0] * 360.0).round() as Emu;
-                        let by = (v[1] * 360.0).round() as Emu;
-                        let bw = (v[2] * 360.0).round() as Emu;
-                        let bh = (v[3] * 360.0).round() as Emu;
-                        *xf = Xfrm {
-                            x: bx,
-                            y: by,
-                            w: bw.max(1),
-                            h: bh.max(1),
-                            ..Xfrm::default()
-                        };
-                        return (geom::svg_path(d, v, false), true);
-                    }
+                if n.name == "draw:connector"
+                    && let (Some(d), Some(v)) = (n.attr("svg:d"), vb(n))
+                {
+                    // The path's box is the view box, in 1/100 mm.
+                    let bx = (v[0] * 360.0).round() as Emu;
+                    let by = (v[1] * 360.0).round() as Emu;
+                    let bw = (v[2] * 360.0).round() as Emu;
+                    let bh = (v[3] * 360.0).round() as Emu;
+                    *xf = Xfrm {
+                        x: bx,
+                        y: by,
+                        w: bw.max(1),
+                        h: bh.max(1),
+                        ..Xfrm::default()
+                    };
+                    return (geom::svg_path(d, v, false), true);
                 }
                 *xf = Xfrm {
                     x: x1.min(x2),
@@ -1858,7 +1847,7 @@ mod tests {
     #[test]
     fn rotation_transform_to_box_and_angle() {
         let x = br#"<draw:rect xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" svg:width="2cm" svg:height="1cm" draw:transform="rotate (1.5707963267949) translate (5cm 5cm)"/>"#;
-        let n = xml::parse(x, 10).unwrap();
+        let n = xml::parse(x, &mut xml::within(1 << 20)).unwrap();
         let xf = transform(&n);
         // Turned a quarter counterclockwise about its top left at (5, 5):
         // it covers x 5..6, y 3..5 (cm); its own box is centred there.

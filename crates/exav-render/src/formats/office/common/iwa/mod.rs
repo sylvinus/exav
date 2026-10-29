@@ -6,7 +6,7 @@
 pub mod proto;
 pub mod snappy;
 
-use proto::{varint, Msg};
+use proto::{Msg, varint};
 use std::collections::HashMap;
 
 /// The objects of a document's IWA streams.
@@ -94,7 +94,7 @@ impl Store {
         let mut v: Vec<u64> = self
             .objects
             .iter()
-            .filter(|o| o.1 .0 == kind)
+            .filter(|o| o.1.0 == kind)
             .map(|o| *o.0)
             .collect();
         v.sort_unstable();

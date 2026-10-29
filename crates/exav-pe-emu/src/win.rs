@@ -28,7 +28,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::cpu::{Cpu, Stop, EAX, ESP};
+use crate::cpu::{Cpu, EAX, ESP, Stop};
 use crate::mem::{Mem, PAGE_SIZE};
 
 /// How far below the initial stack the emulator will keep mapping pages on
@@ -1206,9 +1206,9 @@ impl<'a> Env<'a> {
             mem.write_u32(e + 0x18, l.base).map_err(Stop::Fault)?; // DllBase [wtl]
             mem.write_u32(e + 0x1c, l.base).map_err(Stop::Fault)?; // EntryPoint: reserved slot [wtl], meaning [obs]
             mem.write_u32(e + 0x20, l.size).map_err(Stop::Fault)?; // SizeOfImage: reserved slot [wtl], meaning [obs]
-                                                                   // FullDllName at 0x24 [wtl] and BaseDllName at 0x2c (reserved slot
-                                                                   // [wtl], meaning [obs]), as UNICODE_STRINGs into the string area
-                                                                   // after the entries.
+            // FullDllName at 0x24 [wtl] and BaseDllName at 0x2c (reserved slot
+            // [wtl], meaning [obs]), as UNICODE_STRINGs into the string area
+            // after the entries.
             let str_addr = entry0 + list.len() as u32 * ENTRY_SIZE + i as u32 * 0x80;
             let wide: Vec<u8> = l
                 .name
@@ -2497,10 +2497,11 @@ mod tests {
         let effect = env.call(&mut cpu, &mut mem).unwrap();
         assert_eq!(effect, ApiEffect::Unimplemented);
         assert_eq!(cpu.regs[EAX], 0);
-        assert!(env
-            .missing_apis
-            .iter()
-            .any(|m| m.ends_with("GetVolumeInformationA")));
+        assert!(
+            env.missing_apis
+                .iter()
+                .any(|m| m.ends_with("GetVolumeInformationA"))
+        );
     }
 
     #[test]

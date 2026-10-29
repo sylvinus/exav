@@ -302,19 +302,9 @@ deployment reloads on swap too, with no explicit `RELOAD`.
 ## As a managed service
 
 A systemd unit (`packaging/exav.service`, also shipped in the `.deb`) runs exav
-in place of `clamav-daemon` on the same socket, reading the raw signatures
-`freshclam` keeps in `/var/lib/clamav`. It runs as the `clamav` user, which the
-package does not create, so install it where ClamAV is installed:
-
-```sh
-sudo systemctl disable --now clamav-daemon.socket clamav-daemon.service
-sudo systemctl enable --now exav
-clamdscan --ping 1
-```
-
-Stopping `clamav-daemon.socket` matters on Debian and Ubuntu: while it holds the
-socket, the first connection starts clamd again. `systemctl reload exav` sends
-`SIGUSR2`.
-
-See [Migrating from ClamAV](/scanner/guides/migrating-from-clamav/) for the full swap,
-and the [Docker guide](/scanner/guides/docker/) for the containerised daemon.
+in place of `clamav-daemon` on the same socket. It runs as the `clamav` user,
+which the package does not create, so install it where ClamAV is installed;
+`systemctl reload exav` sends `SIGUSR2`. See
+[Migrating from ClamAV](/scanner/guides/migrating-from-clamav/#as-a-managed-service)
+for the swap, and the [Docker guide](/scanner/guides/docker/) for the
+containerised daemon.

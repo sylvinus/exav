@@ -19,7 +19,7 @@
 //! cargo test --release -p exav-unpack --test all -- --ignored pe_emulation_corpus
 //! ```
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use std::path::{Path, PathBuf};
 
 /// Packers where every sample is expected to yield a reconstructed image.

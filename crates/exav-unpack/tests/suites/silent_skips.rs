@@ -95,11 +95,11 @@ fn a_cab_member_beyond_its_folder_data_is_reported() {
     blob.extend_from_slice(&0u16.to_le_bytes()); // flags
     blob.extend_from_slice(&0u16.to_le_bytes()); // setID
     blob.extend_from_slice(&0u16.to_le_bytes()); // iCabinet
-                                                 // CFFOLDER
+    // CFFOLDER
     blob.extend_from_slice(&(data_off as u32).to_le_bytes()); // coffCabStart
     blob.extend_from_slice(&1u16.to_le_bytes()); // cCFData
     blob.extend_from_slice(&0u16.to_le_bytes()); // typeCompress = none
-                                                 // CFFILE a: offset 0, fits.
+    // CFFILE a: offset 0, fits.
     blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     blob.extend_from_slice(&0u32.to_le_bytes()); // uoffFolderStart
     blob.extend_from_slice(&0u16.to_le_bytes()); // iFolder

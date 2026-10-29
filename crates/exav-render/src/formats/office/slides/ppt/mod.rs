@@ -17,13 +17,13 @@ mod records;
 mod shapes;
 mod text;
 
-use crate::formats::office::common::bytes::{u32_at, Cur};
-use crate::formats::office::common::cfb::Compound;
+use crate::formats::office::common::bytes::{Cur, u32_at};
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::limits::{Budget, SHAPE_BYTES};
 use crate::formats::office::slides::model::*;
 use escher::{OShape, Props};
-use records::{read_at, Children, Rec};
+use exav_unpack::cfb::Compound;
+use records::{Children, Rec, read_at};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use text::{Cf, Levels, Pf, RawText, TColor, TextCtx};
@@ -311,22 +311,22 @@ pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Presentation> {
 
     let mut current_edit = None;
     let current_user = cf.stream(&["Current User"]);
-    if let Some(cu) = current_user {
-        if let Some(r) = read_at(&cu, 0).filter(|r| r.typ == rt::CURRENT_USER_ATOM) {
-            let mut c = r.cur();
-            c.skip(4);
-            let token = c.u32();
-            if token == 0xF3D1_C4DF {
-                return Err(Error::Encrypted);
-            }
-            current_edit = Some(c.u32() as usize);
-            c.skip(2);
-            let version = c.u16();
-            if version != 0x03F4 && version != 0 {
-                return Err(Error::Unsupported(format!(
-                    "PowerPoint file version {version:#x}"
-                )));
-            }
+    if let Some(cu) = current_user
+        && let Some(r) = read_at(&cu, 0).filter(|r| r.typ == rt::CURRENT_USER_ATOM)
+    {
+        let mut c = r.cur();
+        c.skip(4);
+        let token = c.u32();
+        if token == 0xF3D1_C4DF {
+            return Err(Error::Encrypted);
+        }
+        current_edit = Some(c.u32() as usize);
+        c.skip(2);
+        let version = c.u16();
+        if version != 0x03F4 && version != 0 {
+            return Err(Error::Unsupported(format!(
+                "PowerPoint file version {version:#x}"
+            )));
         }
     }
     let persist = persist_directory(&stream, current_edit);
@@ -476,13 +476,13 @@ impl<'a> Reader<'a> {
                 }
             }
         }
-        if let Some(dg) = doc.child(rt::DRAWING_GROUP) {
-            if let Some(dgg) = dg.child(0xF000) {
-                self.blip_recs = escher::blip_records(&dgg, pictures);
-                self.blips = vec![None; self.blip_recs.len()];
-                if let Some(opt) = dgg.child(0xF00B) {
-                    self.defaults = escher::read_props(opt.data, opt.inst);
-                }
+        if let Some(dg) = doc.child(rt::DRAWING_GROUP)
+            && let Some(dgg) = dg.child(0xF000)
+        {
+            self.blip_recs = escher::blip_records(&dgg, pictures);
+            self.blips = vec![None; self.blip_recs.len()];
+            if let Some(opt) = dgg.child(0xF00B) {
+                self.defaults = escher::read_props(opt.data, opt.inst);
             }
         }
         if let Some(list) = doc.child(rt::EX_OBJ_LIST) {
@@ -541,10 +541,10 @@ impl<'a> Reader<'a> {
                 let pid = c.u32();
                 c.skip(8);
                 let id = c.u32();
-                if let Some(m) = self.object(pid) {
-                    if let Some(ms) = self.master(&m, id, budget)? {
-                        masters.push(ms);
-                    }
+                if let Some(m) = self.object(pid)
+                    && let Some(ms) = self.master(&m, id, budget)?
+                {
+                    masters.push(ms);
                 }
                 if masters.len() > 1024 {
                     break;
@@ -564,14 +564,13 @@ impl<'a> Reader<'a> {
         }
         // Title masters' styles are their main master's.
         for i in 0..masters.len() {
-            if masters[i].title {
-                if let Some(main) = masters
+            if masters[i].title
+                && let Some(main) = masters
                     .iter()
                     .find(|m| !m.title && m.id == masters[i].follows)
-                {
-                    let styles = main.styles.clone();
-                    masters[i].styles = styles;
-                }
+            {
+                let styles = main.styles.clone();
+                masters[i].styles = styles;
             }
         }
         let mut model_of: HashMap<u32, (usize, usize)> = HashMap::new();
@@ -986,10 +985,8 @@ impl<'a> Reader<'a> {
                     pt::MASTER_FOOTER => hf.footer,
                     _ => false,
                 };
-                if show {
-                    if let Some(x) = self.shape(o, &ctx, false, budget)? {
-                        out.push(x);
-                    }
+                if show && let Some(x) = self.shape(o, &ctx, false, budget)? {
+                    out.push(x);
                 }
             }
         }
@@ -1234,13 +1231,12 @@ impl<'a> Reader<'a> {
         }
         let links = |info: &[u8; 16]| self.link_of(info);
         let mut body = body;
-        if let Some(tags) = o.client_data.and_then(|c| c.child(pp9::PROG_TAGS)) {
-            if let Some(k) = pp9::tag_records(&tags)
+        if let Some(tags) = o.client_data.and_then(|c| c.child(pp9::PROG_TAGS))
+            && let Some(k) = pp9::tag_records(&tags)
                 .iter()
                 .find(|k| k.typ == pp9::STYLE_TEXT_PROP9)
-            {
-                body.pp9 = pp9::style_text_prop9(k.data);
-            }
+        {
+            body.pp9 = pp9::style_text_prop9(k.data);
         }
         let tctx = TextCtx {
             bullet_media: &self.bullet_media,

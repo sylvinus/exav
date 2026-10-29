@@ -36,7 +36,7 @@ fn next(state: &mut u32) -> u32 {
 /// `data` as it was) when `seed` does not choose to, or `size` is too small.
 pub fn set_extreme_field(data: &mut [u8], size: usize, seed: u32) -> bool {
     let mut state = seed;
-    if next(&mut state) % 4 != 0 {
+    if !next(&mut state).is_multiple_of(4) {
         return false;
     }
     let width = [2usize, 4, 8][next(&mut state) as usize % 3];
@@ -53,7 +53,11 @@ pub fn set_extreme_field(data: &mut [u8], size: usize, seed: u32) -> bool {
     };
     // Little-endian keeps the low bytes, big-endian the low bytes too (they are
     // at the end of `to_be_bytes`): the field gets the value truncated.
-    let field = if big { &bytes[8 - width..] } else { &bytes[..width] };
+    let field = if big {
+        &bytes[8 - width..]
+    } else {
+        &bytes[..width]
+    };
     data[at..at + width].copy_from_slice(field);
     true
 }

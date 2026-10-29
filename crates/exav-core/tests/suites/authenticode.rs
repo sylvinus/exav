@@ -2,7 +2,7 @@
 //! embedded digest does not cover the file (tampered / appended-to after
 //! signing), and stays silent unless the flag is set.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!(

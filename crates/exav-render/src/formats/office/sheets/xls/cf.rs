@@ -3,7 +3,7 @@
 
 use super::formula::{self, Ctx};
 use super::stream::Rec;
-use super::{Globals, SplitReader, BORDER_STYLES, PATTERNS};
+use super::{BORDER_STYLES, Globals, PATTERNS, SplitReader};
 use crate::formats::office::common::bytes::Cur;
 use crate::formats::office::sheets::model::*;
 

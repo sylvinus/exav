@@ -19,7 +19,7 @@
 //! ```
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
 const TEXT: &str = "080d15586f0165e6fe26ccc32060051fb67344c54691e3bca8ea7871b2c5d23f";

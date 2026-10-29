@@ -70,8 +70,8 @@ goes through the same pipeline (`scan_object`).
   `Read` decoder straight off the source, no buffering on either side.
 - **Stored-offset containers** parse a small header or table through
   `Read + Seek`, then seek and `take` each member (`stream_stored`): ar, cpio,
-  partition (a volume over `max_buffer_bytes` that holds NTFS or FAT is walked
-  in place instead), machofat, tnef, onenote, sfx, pyc, and the ISO 9660 trees
+  partition (a volume over `max_buffer_bytes` that holds a filesystem exav
+  reads is walked in place instead), machofat, tnef, onenote, sfx, pyc, and the ISO 9660 trees
   of iso.
   A part of a table left unwalked (too many partitions or ISO directories, a
   truncated table) is a member of its own, reported unsupported.
@@ -84,23 +84,44 @@ goes through the same pipeline (`scan_object`).
   FWS header. **szdd**: SZDD's LZSS as a streaming `Read`; KWAJ is decoded whole.
 - **Solid blocks (7z, cab)**: the block or folder is a forward-only `Read`;
   each file is a `take(size)` window after skipping to its offset, so the
-  decompressed solid unit is never buffered. 7z still holds its compressed
-  input, and AES members take the buffered CRC/password path.
+  decompressed solid unit is never buffered. 7z reads its header from the end
+  of the source and a folder's packed bytes from where they are
+  (`source::Reader`), so the archive is not held; the members before the one
+  wanted are skipped and charged to the scan budget before they are decoded.
+  AES folders take the buffered CRC/password path and BCJ2 folders the graph
+  decoder, each holding the folder's packed bytes (at most `max_buffer_bytes`).
+- **WIM** (`formats/wim`): the header, the table of resources and the directory
+  tree (held, up to `max_buffer_bytes`) are read from where they are; a file
+  resource is a `ResourceReader` that reads and decodes a chunk at a time. With
+  checksums verified its SHA-1 is checked as it is read, and a mismatch is an
+  error at its end. **xar**: the table of contents is inflated (up to 64 MiB)
+  and each member is a reader over its range of the heap.
 - **DMG**: the UDIF disk is a `Read + Seek` over its decoded runs, and its
-  HFS+/APFS files are read from it.
+  HFS+/APFS files are read from it (`formats/hfsplus.rs`, `formats/apfs.rs`).
+  The directory records of a volume are kept, up to `max_members`, to build
+  paths; a file within `max_buffer_bytes` is held while it is read, a longer
+  one is streamed.
 - **Virtual disks (VHD, VHDX, QCOW2, VMDK)**: a `VDisk` (`formats/vdisk.rs`),
   a `Read + Seek` that reads the container's tables from the source as units
   are reached and holds nothing but a cache of decoded compressed units (32
   MiB at most) and, for a streamOptimized VMDK, an index of one entry per grain
   (counted against `max_buffer_bytes`). A disk of at most `max_buffer_bytes` is
   read into one member; a larger one is walked in place (`formats/volumes.rs`):
-  its NTFS and FAT volumes are read through the disk as a `Read + Seek`, one
-  file at a time, each at most `reserve()`. What the disk decodes is charged to
-  the scan budget. A raw NTFS or FAT image, and a raw partitioned disk with a
-  volume over the limit, are walked the same way.
-- **ext**: the volume is copied into memory (`ext4-view` takes a `'static`
-  reader), bounded by `max_buffer_bytes`; inside a disk, the volume's range
-  only.
+  its filesystems (NTFS, FAT, exFAT, ext, HFS+, APFS, SquashFS, cramfs, romfs,
+  EROFS) are read through the disk as a `Read + Seek`, one file at a time, a
+  file within `reserve()` held and a longer one streamed (`vol::Got::Stream`).
+  What the disk decodes is charged to the scan budget. A
+  raw image of one of them, and a raw partitioned disk with a volume over the
+  limit, are walked the same way.
+- **The filesystems** (`formats/{ntfs,fat,exfat,ext,hfsplus,apfs,squashfs,
+  cramfs,romfs,erofs}.rs`, on `formats/vol.rs`) hold a few blocks of metadata
+  and one file of at most `reserve()` bytes, whatever the volume; a longer file
+  is a `Read` over its stretches (`vol::Pieces` over a `vol::Plan`, or a
+  `vol::Fill` of their own for the compressed ones), which fails where the
+  volume stops giving it. Directories are read a block at a time;
+  the total read of directories is bounded by the volume's size (a directory
+  that lists one above it, or shares blocks with another, is walked once or
+  runs the bound out and is reported).
 - **Everything else** is read whole (`read_whole`: zero-copy when the source is
   in memory, bounded by `max_buffer_bytes`), and its members come out as
   `Bytes`.
@@ -149,7 +170,8 @@ it.
   so unwritten extents (zeroes) cost nothing until then.
 - **Decoders that thread `max_buffer`**: CAB (`Cabinet::new`, each folder and the
   combined buffer), 7z solid blocks, PPMd input and output, BCJ filters, DMG
-  HFS+/APFS files (read into a writer capped at `reserve()`), an encrypted
+  HFS+/APFS files (a size past `reserve()` is a limit; a compressed one is
+  unpacked under the same cap), an encrypted
   DMG (decrypted whole), encrypted ZIP members
   (`read_encrypted_member`), ARJ (the whole archive on entry), VBA
   (`decompress`, `build_artifacts`), the `ar` name table, the RAR3 window

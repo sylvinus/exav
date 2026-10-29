@@ -141,8 +141,8 @@ impl Pattern {
 #[cfg(test)]
 fn polyline_length(pts: &[[f64; 2]], closed: bool) -> f64 {
     let mut total = 0.0;
-    for w in pts.windows(2) {
-        total += ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt();
+    for [a, b] in pts.array_windows() {
+        total += ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
     }
     if closed && pts.len() > 2 {
         let a = pts[pts.len() - 1];
@@ -344,8 +344,8 @@ fn arc_lengths(pts: &[[f64; 2]], closed: bool) -> Option<(Vec<[f64; 2]>, Vec<f64
     let mut cum = Vec::with_capacity(path.len());
     let mut acc = 0.0;
     cum.push(0.0);
-    for w in path.windows(2) {
-        acc += ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt();
+    for [a, b] in path.array_windows() {
+        acc += ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
         cum.push(acc);
     }
     (acc > 1e-12).then_some((path, cum))
@@ -397,13 +397,8 @@ mod embedded_text {
         );
 
         // Evenly spaced, one period apart.
-        for w in places.windows(2) {
-            assert!(
-                (w[1].x - w[0].x - 15.0).abs() < 1e-6,
-                "{} to {}",
-                w[0].x,
-                w[1].x
-            );
+        for [a, b] in places.array_windows() {
+            assert!((b.x - a.x - 15.0).abs() < 1e-6, "{} to {}", a.x, b.x);
         }
     }
 
@@ -610,9 +605,11 @@ mod tests {
         assert!(dash_polyline(&[], false, &p).unwrap().is_empty());
         assert!(dash_polyline(&[[0.0, 0.0]], false, &p).unwrap().is_empty());
         // Zero-length path.
-        assert!(dash_polyline(&[[1.0, 1.0], [1.0, 1.0]], false, &p)
-            .unwrap()
-            .is_empty());
+        assert!(
+            dash_polyline(&[[1.0, 1.0], [1.0, 1.0]], false, &p)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

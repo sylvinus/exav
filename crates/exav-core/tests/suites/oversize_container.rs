@@ -12,7 +12,7 @@
 //! and one rule, so the rule needs a test on both or they drift.
 
 use exav_core::spill::{Spill, SpillReader, SpillWriter};
-use exav_core::{loader, scan_path, scan_seekable, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, loader, scan_path, scan_seekable};
 use std::io::Write;
 
 /// Spill space held in memory.
@@ -192,6 +192,79 @@ fn an_oversize_disk_image_has_its_files_scanned() {
     match report.verdict {
         Verdict::Infected { signature, .. } => assert_eq!(signature, "Zzz.InDmg"),
         other => panic!("expected the file on the image to be found, got {other:?}"),
+    }
+}
+
+/// A file inside a filesystem that is past the limit is read as it goes and
+/// scanned from spill space, or is the size limit where there is none. The
+/// image is compressed, so the signature is in no byte of it: only the file
+/// holds it.
+#[cfg(feature = "all-formats")]
+#[test]
+fn an_oversize_file_in_a_filesystem_is_scanned_from_spill_space() {
+    // `frag.bin` of the fixture tree: 100000 bytes, made by `pat` with seed 9.
+    let pat = |seed: u32, n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|i| {
+                if (i / 64) % 2 == 0 {
+                    (((i as u32).wrapping_mul(2654435761)).wrapping_add(seed.wrapping_mul(40503))
+                        >> 13) as u8
+                } else {
+                    b"abcdefghij0123456789"[(i + seed as usize) % 20]
+                }
+            })
+            .collect()
+    };
+    // The bytes of `pat` repeat from one seed to another at some offsets, so
+    // the window is one that no other file of the tree has.
+    let file = pat(9, 100000);
+    let hex: String = file[38400..38424]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut l = loader::Builder::new();
+    l.add_named_bytes("t.ndb", format!("Zzz.InFile:0:*:{hex}\n").as_bytes(), true);
+    let db = l.build().expect("build database");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../exav-unpack/tests/fixtures/fs/squashfs_gzip.img.gz"
+    );
+    let mut image = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap()),
+        &mut image,
+    )
+    .unwrap();
+    assert!(
+        !image.windows(24).any(|w| w == &file[38400..38424]),
+        "compressed"
+    );
+    let size = image.len() as u64;
+
+    let mut spilling = tiny_deep_analysis();
+    spilling.spill = Some(std::sync::Arc::new(MemSpill));
+    let report =
+        scan_seekable(&db, std::io::Cursor::new(image.clone()), size, &spilling).expect("scan");
+    match report.verdict {
+        Verdict::Infected { signature, .. } => assert_eq!(signature, "Zzz.InFile"),
+        other => panic!("expected the file to be found, got {other:?}"),
+    }
+
+    let report = scan_seekable(
+        &db,
+        std::io::Cursor::new(image),
+        size,
+        &tiny_deep_analysis(),
+    )
+    .expect("scan");
+    match report.verdict {
+        Verdict::LimitsExceeded { reason } => {
+            assert!(reason.contains("--max-object-bytes"), "{reason}")
+        }
+        other => panic!(
+            "expected LIMITS-EXCEEDED without spill space, got {other:?} {:?}",
+            report.findings
+        ),
     }
 }
 

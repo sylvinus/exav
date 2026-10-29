@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use exav_render::docs::{convert, text, Error, Format, Limits};
+use exav_render::docs::{Error, Format, Limits, convert, text};
 
 fn run(html: &str) -> Vec<u8> {
     convert(html.as_bytes(), Format::Html, &Limits::default())
@@ -249,4 +249,55 @@ fn the_text_of_a_page_is_what_it_shows() {
         t.text
     );
     assert!(!t.text.contains("script text") && !t.text.contains("not shown"));
+}
+
+/// Tables left open and nested a hundred thousand deep are read to the
+/// depth elements nest to; the model they make is not as deep as the page.
+#[test]
+fn tables_nested_without_end_do_not_exhaust_the_stack() {
+    let page = format!("<body>{}cell</body>", "<table><tr><td>".repeat(100_000));
+    let docx = convert(page.as_bytes(), Format::Html, &Limits::default())
+        .unwrap()
+        .docx;
+    assert!(body(&docx).contains("cell"));
+}
+
+/// The cells a row span continues into are cells of the model, and are
+/// counted: 5,000 rows each spanning 1,000 rows made some 5 million of them.
+#[test]
+fn the_cells_a_row_span_continues_into_are_counted() {
+    let page = format!(
+        "<body><table>{}</table></body>",
+        "<tr><td rowspan=1000>x".repeat(5_000)
+    );
+    let limits = Limits::default().with_max_memory(256 << 20);
+    let e = convert(page.as_bytes(), Format::Html, &limits).unwrap_err();
+    assert!(matches!(e, Error::TooLarge(_)), "{e:?}");
+}
+
+/// Raw text elements are found by their end tag without a copy of the rest of
+/// the page for each: 200,000 of them are a page of a few MB, not a minute.
+#[test]
+fn many_raw_text_elements_are_linear() {
+    let page = format!(
+        "<body>{}</body>",
+        "<script></script><style></style>".repeat(100_000)
+    );
+    let start = std::time::Instant::now();
+    assert!(convert(page.as_bytes(), Format::Html, &Limits::default()).is_ok());
+    assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+}
+
+/// A link opened inside a link ends the first, as in HTML: links left open
+/// by the thousand do not nest into a model as deep.
+#[test]
+fn links_left_open_do_not_nest() {
+    let page = format!("<body>{}end</body>", "<a href='http://x/'>l".repeat(50_000));
+    let docx = convert(page.as_bytes(), Format::Html, &Limits::default())
+        .unwrap()
+        .docx;
+    assert!(body(&docx).contains("end"));
+    // Every link is a link of its own, none within another.
+    let d = body(&docx);
+    assert!(d.matches("<w:hyperlink").count() >= 40_000);
 }

@@ -14,16 +14,15 @@ supply the signatures.
 The ClamAV signature database (`main.cvd`, `daily.cvd`) is GPL-licensed. exav is
 MIT-licensed, so it does not bundle or redistribute it.
 
-- Reading the CVD format is interoperability, not redistribution.
-- You run Cisco's own updater on your machine and point exav at the directory.
-  The GPL governs distribution, not use.
-- exav does not re-implement `freshclam`'s update protocol: no DNS `TXT` version
-  probing, no `.cdiff` patching, no verification of the CVD's digital signature
-  (`dsig`). [`cvdupdate`](https://github.com/Cisco-Talos/cvdupdate)
-  (Apache-2.0) and `freshclam` are the supported way to fetch the official
-  database, and they spare Cisco's CDN. exav's own
-  [`--auto-update`](#built-in-updater---auto-update) only fetches from a mirror
-  you run.
+You run Cisco's own updater on your machine and point exav at the directory;
+the GPL governs distribution, not use.
+
+exav does not re-implement `freshclam`'s update protocol: no DNS `TXT` version
+probing, no `.cdiff` patching, no verification of the CVD's digital signature
+(`dsig`). [`cvdupdate`](https://github.com/Cisco-Talos/cvdupdate) (Apache-2.0)
+and `freshclam` are the supported way to fetch the official database, and they
+spare Cisco's CDN. exav's own [`--auto-update`](#built-in-updater---auto-update)
+only fetches from a mirror you run.
 
 ## Get the official signatures
 
@@ -94,13 +93,10 @@ Community YARA rulesets, commercial vendor feeds and add-on signature sets load
 the same way: put the files, or a nested directory of them, in the signature
 directory.
 
-- Prefer permissively licensed sets if you intend to redistribute them.
-- Feeds distributed through updater tools that lay signatures out in nested
-  directories load unchanged.
-- A database is recognised by its extension, not its contents. Anything else in
-  the directory is passed over without being read, which lets `.cdiff`, `.sign`,
-  `.info` and updater state live there safely; a signature file saved under
-  another name is skipped the same way, so rename it.
+A database is recognised by its extension, not its contents. Anything else in
+the directory is passed over without being read, which lets `.cdiff`, `.sign`,
+`.info` and updater state live there safely; a signature file saved under
+another name is skipped the same way, so rename it.
 
 ## Built-in updater (`--auto-update`)
 

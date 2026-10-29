@@ -87,17 +87,16 @@ fn resolve_name(raw: &[u8], name_table: &[u8]) -> String {
         return trimmed.to_string();
     }
     // GNU long name: "/<offset>" into the string table.
-    if let Some(rest) = trimmed.strip_prefix('/') {
-        if let Ok(off) = rest.parse::<usize>() {
-            if off < name_table.len() {
-                let end = name_table[off..]
-                    .iter()
-                    .position(|&b| b == b'/' || b == b'\n')
-                    .map(|p| off + p)
-                    .unwrap_or(name_table.len());
-                return String::from_utf8_lossy(&name_table[off..end]).into_owned();
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix('/')
+        && let Ok(off) = rest.parse::<usize>()
+        && off < name_table.len()
+    {
+        let end = name_table[off..]
+            .iter()
+            .position(|&b| b == b'/' || b == b'\n')
+            .map(|p| off + p)
+            .unwrap_or(name_table.len());
+        return String::from_utf8_lossy(&name_table[off..end]).into_owned();
     }
     // GNU short name: trailing '/'.
     trimmed.trim_end_matches('/').to_string()

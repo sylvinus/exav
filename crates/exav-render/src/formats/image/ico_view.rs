@@ -4,7 +4,7 @@
 //! those the one with most colour. Used by `decode_any` only, so that the
 //! image the hash is of stays the one ClamAV's decoder picks.
 
-use super::{decode, Error, Format, Pixels};
+use super::{Error, Format, Pixels, decode};
 
 pub(super) fn decode_largest(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     let count = usize::from(u16::from_le_bytes([
@@ -103,14 +103,16 @@ fn single_icon(entry: &[u8], image: &[u8]) -> Vec<u8> {
         {
             image.resize(with_mask as usize, 0);
         }
-        if bpp == 32 && compression == 0 && (image.len() as u64) >= with_mask {
-            if let (Ok(start), Ok(w), Ok(r)) = (
+        if bpp == 32
+            && compression == 0
+            && (image.len() as u64) >= with_mask
+            && let (Ok(start), Ok(w), Ok(r)) = (
                 usize::try_from(start),
                 usize::try_from(width),
                 usize::try_from(rows),
-            ) {
-                alpha_or_mask(&mut image, start, w, r);
-            }
+            )
+        {
+            alpha_or_mask(&mut image, start, w, r);
         }
         // Zero stands for 256.
         e[0] = if width >= 256 { 0 } else { width as u8 };

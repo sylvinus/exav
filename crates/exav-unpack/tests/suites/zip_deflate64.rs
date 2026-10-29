@@ -35,7 +35,7 @@
 //! repetitive and high-entropy) through `7z a -tzip -mm=Deflate64` and comparing
 //! exav's output byte-for-byte against the originals.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 

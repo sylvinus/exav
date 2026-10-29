@@ -4,8 +4,8 @@
 // Each test crate uses some of these.
 #![allow(dead_code)]
 
-use exav_render::formats::office::test_util::build_cfb as cfb;
 use exav_render::formats::office::test_util::Zip;
+use exav_render::formats::office::test_util::build_cfb as cfb;
 
 /// A part of a DOCX.
 pub fn part(docx: &[u8], name: &str) -> String {

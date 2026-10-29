@@ -193,10 +193,11 @@ impl Conv<'_, '_, '_> {
             }
             // A page of this drawing, by its name (a shape of it after "!").
             let page = sub.split('!').next().unwrap_or("");
-            if address.is_empty() && !page.is_empty() {
-                if let Some(i) = self.slide_names.iter().position(|n| n == page) {
-                    return (Some(Link::Slide(i)), descr);
-                }
+            if address.is_empty()
+                && !page.is_empty()
+                && let Some(i) = self.slide_names.iter().position(|n| n == page)
+            {
+                return (Some(Link::Slide(i)), descr);
             }
         }
         (None, String::new())
@@ -240,42 +241,42 @@ impl Conv<'_, '_, '_> {
         };
 
         // A picture.
-        if kind == "Foreign" {
-            if let Some(fd) = t.foreign(n) {
-                match fd.target.as_deref().and_then(|p| self.picture(p)) {
-                    Some(media) => {
-                        let (iw, ih) = (g("ImgWidth"), g("ImgHeight"));
-                        let crop = if iw > 0.0 && ih > 0.0 {
-                            let (ox, oy) = (g("ImgOffsetX"), g("ImgOffsetY"));
-                            let c = |v: f64| (v * 100_000.0).clamp(-1e6, 1e6).round() as i32;
-                            [
-                                c(-ox / iw),
-                                c((oy + ih - xf.h) / ih),
-                                c(1.0 - (xf.w - ox) / iw),
-                                c(-oy / ih),
-                            ]
-                        } else {
-                            [0; 4]
-                        };
-                        let tr = g("Transparency").clamp(0.0, 1.0);
-                        let pic = Pic {
-                            media,
-                            crop,
-                            geom: Geometry::default(),
-                            line: Line::default(),
-                            shadow: None,
-                            alpha: (tr > 0.0).then(|| ((1.0 - tr) * 100_000.0).round() as u32),
-                        };
-                        out.push(finish(
-                            Shape::new(ShapeKind::Pic(Box::new(pic)), xfrm.clone()),
-                            &link,
-                        ));
-                        return Ok(out);
-                    }
-                    None => self
-                        .p
-                        .warn("embedded objects without a picture it can draw"),
+        if kind == "Foreign"
+            && let Some(fd) = t.foreign(n)
+        {
+            match fd.target.as_deref().and_then(|p| self.picture(p)) {
+                Some(media) => {
+                    let (iw, ih) = (g("ImgWidth"), g("ImgHeight"));
+                    let crop = if iw > 0.0 && ih > 0.0 {
+                        let (ox, oy) = (g("ImgOffsetX"), g("ImgOffsetY"));
+                        let c = |v: f64| (v * 100_000.0).clamp(-1e6, 1e6).round() as i32;
+                        [
+                            c(-ox / iw),
+                            c((oy + ih - xf.h) / ih),
+                            c(1.0 - (xf.w - ox) / iw),
+                            c(-oy / ih),
+                        ]
+                    } else {
+                        [0; 4]
+                    };
+                    let tr = g("Transparency").clamp(0.0, 1.0);
+                    let pic = Pic {
+                        media,
+                        crop,
+                        geom: Geometry::default(),
+                        line: Line::default(),
+                        shadow: None,
+                        alpha: (tr > 0.0).then(|| ((1.0 - tr) * 100_000.0).round() as u32),
+                    };
+                    out.push(finish(
+                        Shape::new(ShapeKind::Pic(Box::new(pic)), xfrm.clone()),
+                        &link,
+                    ));
+                    return Ok(out);
                 }
+                None => self
+                    .p
+                    .warn("embedded objects without a picture it can draw"),
             }
         }
 

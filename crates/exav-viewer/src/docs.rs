@@ -1,7 +1,7 @@
 //! exav-render's `docs`: DOC, ODT, FODT, RTF and the other word-processing
 //! formats converted to DOCX, which the document engine shows.
 
-use exav_render::docs::{convert, Error, Format, Limits};
+use exav_render::docs::{Error, Format, Limits, convert};
 use wasm_bindgen::prelude::*;
 
 /// A converted document.

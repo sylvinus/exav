@@ -247,18 +247,18 @@ pub fn read_table(
             push_merge(sheet, &d, r1, c1, r2, c2);
         }
     }
-    if sheet.merges.is_empty() {
-        if let Some((_, m)) = ds.reference(13).and_then(|i| store.get(i)) {
-            for cr in m.msgs(1).take(1 << 16) {
-                let packed = |f: u32| cr.msg(f).and_then(|x| x.uint(1)).map(|v| v as u32);
-                let (Some(o), Some(s)) = (packed(1), packed(2)) else {
-                    continue;
-                };
-                let (c1, r1) = (o >> 16, o & 0xFFFF);
-                let (nc, nr) = (s >> 16, s & 0xFFFF);
-                if nc > 0 && nr > 0 {
-                    push_merge(sheet, &d, r1, c1, r1 + nr - 1, c1 + nc - 1);
-                }
+    if sheet.merges.is_empty()
+        && let Some((_, m)) = ds.reference(13).and_then(|i| store.get(i))
+    {
+        for cr in m.msgs(1).take(1 << 16) {
+            let packed = |f: u32| cr.msg(f).and_then(|x| x.uint(1)).map(|v| v as u32);
+            let (Some(o), Some(s)) = (packed(1), packed(2)) else {
+                continue;
+            };
+            let (c1, r1) = (o >> 16, o & 0xFFFF);
+            let (nc, nr) = (s >> 16, s & 0xFFFF);
+            if nc > 0 && nr > 0 {
+                push_merge(sheet, &d, r1, c1, r1 + nr - 1, c1 + nc - 1);
             }
         }
     }
@@ -595,11 +595,7 @@ fn style_for(
 /// Earlier dates, which the system cannot show, are left as they count.
 pub(super) fn serial(secs: f64) -> f64 {
     let v = EPOCH_DAYS + secs / 86_400.0;
-    if (2.0..61.0).contains(&v) {
-        v - 1.0
-    } else {
-        v
-    }
+    if (2.0..61.0).contains(&v) { v - 1.0 } else { v }
 }
 
 /// A cell's value, and the link of a rich text cell that holds one.
@@ -672,10 +668,10 @@ fn rich_text(
         .collect();
     let mut link = None;
     for e in s.msg(11).into_iter().flat_map(|t| t.msgs(1)) {
-        if let Some((_, h)) = e.reference(2).and_then(|o| store.get(o)) {
-            if let Some(u) = h.string(2).filter(|u| !u.is_empty()) {
-                link.get_or_insert(u);
-            }
+        if let Some((_, h)) = e.reference(2).and_then(|o| store.get(o))
+            && let Some(u) = h.string(2).filter(|u| !u.is_empty())
+        {
+            link.get_or_insert(u);
         }
     }
     let runs: Vec<(usize, Option<u64>)> = s

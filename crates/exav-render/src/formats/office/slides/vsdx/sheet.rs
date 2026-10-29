@@ -237,7 +237,7 @@ mod tests {
     use crate::formats::office::common::xml;
 
     fn sheet(x: &str) -> Sheet {
-        let n = xml::parse(x.as_bytes(), 100_000).unwrap();
+        let n = xml::parse(x.as_bytes(), &mut xml::within(1 << 24)).unwrap();
         let rels: HashMap<String, String> =
             [("rId1".to_string(), "visio/media/image1.png".to_string())].into();
         parse(&n, &Rels(&rels), &mut 0, 0)

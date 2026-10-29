@@ -18,7 +18,7 @@
 //! reader sees in an HTML file (Markdown, Office XML and drawings too), which
 //! `Target:7` signatures match: a widening on purpose, tested in `visible_text`.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
 fn scanner(target: u8, body: &str) -> Scanner {
     let hex: String = body.bytes().map(|b| format!("{b:02x}")).collect();

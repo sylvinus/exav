@@ -10,7 +10,7 @@
 //! written by RAR and zoo. EICAR is compressed in every one, so it is found
 //! only in the decoded member, never in the archive's own bytes.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Want {

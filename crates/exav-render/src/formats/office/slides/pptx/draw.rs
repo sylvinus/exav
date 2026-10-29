@@ -25,7 +25,10 @@ impl Rels {
     }
 
     pub fn xml(&self) -> String {
-        let mut r = format!("{}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">", super::xml::XML_HEAD);
+        let mut r = format!(
+            "{}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+            super::xml::XML_HEAD
+        );
         for (i, (kind, target, ext)) in self.0.iter().enumerate() {
             // A full type, or one of the office document's.
             let ty = if kind.starts_with("http") {
@@ -509,16 +512,14 @@ pub fn shape(o: &mut String, s: &Shape, ctx: &mut Ctx) {
             match &sp.text {
                 // The text area is the insets: a renderer need not honour
                 // a custom geometry's own text rectangle.
-                Some(t) if sp.text_rect.is_some() => {
+                Some(t) if let Some(a) = sp.text_rect => {
                     let mut t = t.clone();
-                    if let Some(a) = sp.text_rect {
-                        let (w, h) = (s.xfrm.w.max(0) as f64, s.xfrm.h.max(0) as f64);
-                        let [l, tp, r, b] = &mut t.body.insets;
-                        *l += (a[0] * w).round() as Emu;
-                        *tp += (a[1] * h).round() as Emu;
-                        *r += ((1.0 - a[2]) * w).round() as Emu;
-                        *b += ((1.0 - a[3]) * h).round() as Emu;
-                    }
+                    let (w, h) = (s.xfrm.w.max(0) as f64, s.xfrm.h.max(0) as f64);
+                    let [l, tp, r, b] = &mut t.body.insets;
+                    *l += (a[0] * w).round() as Emu;
+                    *tp += (a[1] * h).round() as Emu;
+                    *r += ((1.0 - a[2]) * w).round() as Emu;
+                    *b += ((1.0 - a[3]) * h).round() as Emu;
                     write_text_body(o, "p:txBody", &t, ctx)
                 }
                 Some(t) => write_text_body(o, "p:txBody", t, ctx),
@@ -582,7 +583,10 @@ pub fn shape(o: &mut String, s: &Shape, ctx: &mut Ctx) {
             nvpr(o, s);
             o.push_str("</p:nvGraphicFramePr>");
             xfrm(o, "p:xfrm", &s.xfrm, None);
-            let _ = write!(o, "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"{rid}\"/></a:graphicData></a:graphic></p:graphicFrame>");
+            let _ = write!(
+                o,
+                "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"{rid}\"/></a:graphicData></a:graphic></p:graphicFrame>"
+            );
         }
     }
 }

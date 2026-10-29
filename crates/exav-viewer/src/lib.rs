@@ -14,7 +14,7 @@
 
 #[cfg(feature = "image")]
 mod image {
-    use exav_render::image::{decode_any, Error, Format};
+    use exav_render::image::{Error, Format, decode_any};
     use wasm_bindgen::prelude::*;
 
     /// A decoded image, as RGBA8.
@@ -212,13 +212,10 @@ mod dwg {
             path: &str,
             bytes: &[u8],
             max_decompressed_bytes: f64,
+            max_entities: f64,
         ) -> Result<u32, JsError> {
-            let limits = exav_render::cad::Limits {
-                max_decompressed_bytes: max_decompressed_bytes as u64,
-                ..exav_render::cad::Limits::default()
-            };
             self.0
-                .attach_xref(path, bytes, &limits)
+                .attach_xref(path, bytes, &limits(max_decompressed_bytes, max_entities))
                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
                 .map_err(|e| JsError::new(&e.to_string()))
         }
@@ -274,18 +271,27 @@ mod dwg {
     }
 
     /// Parse a DWG or a DXF, told apart by its first bytes. A DWG whose
-    /// compressed sections expand past `max_decompressed_bytes` is refused.
+    /// compressed sections expand past `max_decompressed_bytes` is refused,
+    /// and so is a drawing of more than `max_entities` entities.
     #[wasm_bindgen(js_name = parseDrawing)]
-    pub fn parse_drawing(bytes: &[u8], max_decompressed_bytes: f64) -> Result<Document, JsError> {
-        // Saturating: Infinity is no limit, NaN and anything not positive
-        // refuse every compressed section.
-        let limits = exav_render::cad::Limits {
-            max_decompressed_bytes: max_decompressed_bytes as u64,
-            ..exav_render::cad::Limits::default()
-        };
-        dwg::Document::parse_with(bytes, &limits)
+    pub fn parse_drawing(
+        bytes: &[u8],
+        max_decompressed_bytes: f64,
+        max_entities: f64,
+    ) -> Result<Document, JsError> {
+        dwg::Document::parse_with(bytes, &limits(max_decompressed_bytes, max_entities))
             .map(Document)
             .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// The limits of a drawing. Saturating: Infinity is no limit, NaN and
+    /// anything not positive refuse every compressed section and every entity.
+    fn limits(max_decompressed_bytes: f64, max_entities: f64) -> exav_render::cad::Limits {
+        exav_render::cad::Limits {
+            max_decompressed_bytes: max_decompressed_bytes as u64,
+            max_entities: max_entities as usize,
+            ..exav_render::cad::Limits::default()
+        }
     }
 }
 
@@ -567,8 +573,8 @@ mod model {
     /// them: a JSON array of strings, empty when it needs none.
     #[wasm_bindgen(js_name = gltfBuffers)]
     pub fn gltf_buffers(bytes: &[u8]) -> Result<String, JsError> {
-        let names = exav_render::gltf::external_buffers(bytes)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let names =
+            exav_render::gltf::external_buffers(bytes).map_err(|e| JsError::new(&e.to_string()))?;
         let quoted: Vec<String> = names
             .iter()
             .map(|n| {
@@ -634,7 +640,7 @@ const PDF_IMAGE_MAX: u64 = 1 << 30;
 /// `_jp2_decode`.
 #[cfg(feature = "pdf-jpx")]
 mod pdf_jpx {
-    use exav_render::pdf_image::{decode_jpx, JpxParams};
+    use exav_render::pdf_image::{JpxParams, decode_jpx};
     use wasm_bindgen::prelude::*;
 
     /// The pixels pdf.js reads, or `undefined` where its decoder gives none.
@@ -663,7 +669,7 @@ mod pdf_jpx {
 /// `_jbig2_decode` and `_ccitt_decode`.
 #[cfg(feature = "pdf-jbig2")]
 mod pdf_jbig2 {
-    use exav_render::pdf_image::{decode_ccitt, decode_jbig2, CcittParams};
+    use exav_render::pdf_image::{CcittParams, decode_ccitt, decode_jbig2};
     use wasm_bindgen::prelude::*;
 
     /// Rows of 1-bit pixels, 1 for white. Empty `globals` is none.

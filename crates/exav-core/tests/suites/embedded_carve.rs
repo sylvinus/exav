@@ -2,7 +2,7 @@
 //! dropper — must be carved and scanned. The normal scan only types offset 0, so
 //! without embedded-archive carving the payload in the overlay is invisible.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 use std::io::Write;
 
 /// A text carrier holding `n` copies of `item`, each after some filler, so no

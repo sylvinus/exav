@@ -1,9 +1,9 @@
 //! Drawings of a table: pictures, charts (embedded objects), text boxes and
 //! shapes, anchored to a cell or to the page.
 
-use super::dom::Node;
 use super::styles::{parse_color, parse_len_pt};
-use super::{paragraphs, parse_addr, Doc};
+use super::{Doc, paragraphs, parse_addr};
+use crate::formats::office::common::xml::Node;
 use crate::formats::office::sheets::error::Result;
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;

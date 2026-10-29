@@ -7,7 +7,7 @@
 //! name, the outcome, the time in microseconds, the size of the PPTX, the
 //! slides, and the warnings.
 
-use exav_render::slides::{convert, Format, Limits};
+use exav_render::slides::{Format, Limits, convert};
 use std::time::Instant;
 
 fn format(name: &str) -> Format {

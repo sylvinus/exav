@@ -12,19 +12,19 @@
 //! hayro is contained.
 
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use hayro_interpret::font::{Glyph, GlyphRun};
 use hayro_interpret::hayro_cmap::BfString;
 use hayro_interpret::{
-    interpret_page, BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image,
-    ImageDrawProps, InterpreterCache, InterpreterSettings, SoftMask,
+    BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
+    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
 };
 use hayro_syntax::Pdf;
 use kurbo::{Affine, BezPath, Point, Rect, Shape};
 
-use super::pdf_screen::images_are_small;
 use super::Out;
+use super::pdf_screen::images_are_small;
 use crate::{Budget, Format, Limits};
 
 /// Glyph shapes remembered, for how far each reaches.

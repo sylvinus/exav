@@ -41,15 +41,15 @@ pub(crate) fn bm_name(n: &str) -> String {
 }
 
 fn push_item(out: &mut Vec<Inline>, rpr: &RunProps, item: RunItem) {
-    if let Some(Inline::Run(r)) = out.last_mut() {
-        if r.props == *rpr {
-            if let (RunItem::Text(t), Some(RunItem::Text(last))) = (&item, r.items.last_mut()) {
-                last.push_str(t);
-                return;
-            }
-            r.items.push(item);
+    if let Some(Inline::Run(r)) = out.last_mut()
+        && r.props == *rpr
+    {
+        if let (RunItem::Text(t), Some(RunItem::Text(last))) = (&item, r.items.last_mut()) {
+            last.push_str(t);
             return;
         }
+        r.items.push(item);
+        return;
     }
     out.push(Inline::Run(Run {
         props: rpr.clone(),
@@ -118,12 +118,11 @@ impl Odt<'_> {
             if let Some(Block::Para(_)) = out.get(before) {
                 // A forced break after a paragraph.
             }
-            if c.name == "text:p" || c.name == "text:h" {
-                if let Some(s) = c.attr("text:style-name") {
-                    if self.apply("paragraph", s).break_after {
-                        self.pending_break = true;
-                    }
-                }
+            if (c.name == "text:p" || c.name == "text:h")
+                && let Some(s) = c.attr("text:style-name")
+                && self.apply("paragraph", s).break_after
+            {
+                self.pending_break = true;
             }
         }
         Ok(out)
@@ -155,10 +154,17 @@ impl Odt<'_> {
                 }
             }
             "text:section" => {
-                if c.attr("text:display") != Some("none") {
+                if c.attr("text:display") != Some("none") && self.depth <= 24 {
+                    self.depth += 1;
+                    let mut r = Ok(());
                     for k in c.nodes() {
-                        self.block(k, out, list)?;
+                        r = self.block(k, out, list);
+                        if r.is_err() {
+                            break;
+                        }
                     }
+                    self.depth -= 1;
+                    r?;
                 }
             }
             "text:table-of-content"
@@ -236,11 +242,11 @@ impl Odt<'_> {
             }
             None => {
                 if let Some(h) = heading {
-                    if n.attr("text:is-list-header") != Some("true") {
-                        if let Some(id) = self.outline_num_id() {
-                            ppr.num_id = Some(id);
-                            ppr.num_level = Some((h - 1).min(8));
-                        }
+                    if n.attr("text:is-list-header") != Some("true")
+                        && let Some(id) = self.outline_num_id()
+                    {
+                        ppr.num_id = Some(id);
+                        ppr.num_level = Some((h - 1).min(8));
                     }
                     if ppr.outline_level.is_none() {
                         ppr.outline_level = Some((h - 1).min(8));
@@ -265,6 +271,7 @@ impl Odt<'_> {
             space: true,
         };
         self.inline_children(n, &mut ctx, &mut para.content)?;
+        self.b.inlines(&para.content)?;
         Ok(para)
     }
 
@@ -496,6 +503,8 @@ impl Odt<'_> {
             id,
             content: vec![],
         };
+        // Where it is kept: an id is a place in the list plus one.
+        let at = id as usize - 1;
         if endnote {
             self.doc.endnotes.push(slot);
         } else {
@@ -541,7 +550,7 @@ impl Odt<'_> {
         } else {
             &mut self.doc.footnotes
         };
-        if let Some(s) = list.iter_mut().find(|s| s.id == id) {
+        if let Some(s) = list.get_mut(at) {
             s.content = content;
         }
         Ok(())

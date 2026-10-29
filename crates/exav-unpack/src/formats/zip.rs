@@ -698,10 +698,10 @@ fn scan_orphan_locals<R>(
         if !plausible_local_header(data, off) {
             continue;
         }
-        if let Some(entry) = parse_local_member(data, off, true, budget)? {
-            if let Some(r) = visit(entry, budget) {
-                return Ok(Some(r));
-            }
+        if let Some(entry) = parse_local_member(data, off, true, budget)?
+            && let Some(r) = visit(entry, budget)
+        {
+            return Ok(Some(r));
         }
     }
     Ok(None)
@@ -1134,7 +1134,7 @@ fn parse_local_member(
                         "streaming zip member with unrecoverable size (orphan local header)",
                         false,
                         budget,
-                    )
+                    );
                 }
             },
         }
@@ -1231,7 +1231,7 @@ fn parse_local_member(
                     comp,
                     false,
                     "unsupported zip compression method (orphan local header)",
-                )))
+                )));
             }
         },
     };
@@ -1269,6 +1269,7 @@ const PAST_END: &str =
 /// declaring 0 bytes compressed and uncompressed is empty (Civil 3D writes
 /// them; Python's zipfile reads them so), not a stream cut before its first
 /// block.
+#[inline(never)]
 pub(crate) fn member_reader<'a, R: Read + Seek>(
     zip: &'a mut ::zip::ZipArchive<R>,
     i: usize,
@@ -1826,12 +1827,63 @@ fn zip_mtime<'a>(
 /// crate's decompressing reader, so a member decompressing to any size is
 /// never held. An encrypted member is decrypted whole (decryption needs the
 /// full ciphertext), bounded by the buffer limit.
+/// What `walk` takes from the directory entry of a member.
+struct RawEntry {
+    name: String,
+    is_dir: bool,
+    encrypted: bool,
+    comp: u64,
+    size: u64,
+    method: u16,
+    mtime: Option<crate::Mtime>,
+    mode: Option<u32>,
+    local: Option<u16>,
+}
+
+// The three below open a `ZipFile`, which holds the decoders of every codec
+// inline: tens of kilobytes. Opened in `walk` itself, one would be in its frame
+// for as long as a member is scanned, and a ZIP inside a ZIP inside a ZIP
+// takes that once for each level.
+
+#[inline(never)]
+fn raw_entry<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    src: &dyn crate::source::ByteSource,
+    i: usize,
+) -> ::zip::result::ZipResult<RawEntry> {
+    let f = zip.by_index_raw(i)?;
+    Ok(RawEntry {
+        name: member_name(&f),
+        is_dir: f.is_dir(),
+        encrypted: f.encrypted(),
+        comp: f.compressed_size(),
+        size: f.size(),
+        method: zip_method_code(&f.compression()),
+        mtime: zip_mtime(f.extra_data_fields(), f.last_modified()),
+        mode: f.unix_mode(),
+        local: local_flags(&src.window(f.header_start() as usize, 8)),
+    })
+}
+
+#[inline(never)]
+fn header_parses<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    i: usize,
+) -> ::zip::result::ZipResult<()> {
+    zip.by_index_raw(i).map(|_| ())
+}
+
+#[inline(never)]
+fn member_decodes<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>, i: usize) -> bool {
+    zip.by_index(i).is_ok()
+}
+
 pub(crate) fn walk<T>(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use crate::stream::{emit_entry, emit_stream, whole, MemberMeta};
+    use crate::stream::{MemberMeta, emit_entry, emit_stream, whole};
     // A forged or corrupt central directory (a bad CDFH offset in the EOCD,
     // say) makes the seekable walk impossible, but the members' local file
     // headers are still in the file. Fall back to reading the archive whole
@@ -1852,7 +1904,7 @@ pub(crate) fn walk<T>(
         // strand every later member: the salvage pass skips them as already
         // covered, so a payload behind one bad directory pointer would never
         // be scanned.
-        if let Err(e) = zip.by_index_raw(i).map(|_| ()) {
+        if let Err(e) = header_parses(&mut zip, i) {
             let hit = zip_entry_error(i, &e);
             if !hit.is_corrupt() {
                 return Err(hit);
@@ -1867,20 +1919,17 @@ pub(crate) fn walk<T>(
             }
             continue;
         }
-        let (name, is_dir, encrypted, comp, size, method, mtime, mode, local) = {
-            let f = zip.by_index_raw(i).map_err(|e| zip_entry_error(i, &e))?;
-            (
-                member_name(&f),
-                f.is_dir(),
-                f.encrypted(),
-                f.compressed_size(),
-                f.size(),
-                zip_method_code(&f.compression()),
-                zip_mtime(f.extra_data_fields(), f.last_modified()),
-                f.unix_mode(),
-                local_flags(&src.window(f.header_start() as usize, 8)),
-            )
-        };
+        let RawEntry {
+            name,
+            is_dir,
+            encrypted,
+            comp,
+            size,
+            method,
+            mtime,
+            mode,
+            local,
+        } = raw_entry(&mut zip, src, i).map_err(|e| zip_entry_error(i, &e))?;
         // `is_dir()` is true purely because the name ends in '/'. A JAR packer
         // buys exactly that: `kingDavid/9.class/` holds a real deflate-compressed
         // class that the JVM loads by name, while every ZIP tool discards it as a
@@ -1934,8 +1983,7 @@ pub(crate) fn walk<T>(
         // decoder, so fall back to the raw bytes and decode them ourselves,
         // as `extract_zip_from` does. Probe first so the borrow of `zip` ends
         // before the fallback needs it.
-        let decodable = zip.by_index(i).is_ok();
-        let mut file = match decodable {
+        let mut file = match member_decodes(&mut zip, i) {
             true => member_reader(&mut zip, i).map_err(|e| zip_entry_error(i, &e))?,
             false => {
                 let out = walk_raw_decode(&mut zip, src, i, meta, budget, visit, &mut deferred)?;
@@ -1959,11 +2007,41 @@ pub(crate) fn walk<T>(
     deferred.map_or(Ok(None), Err)
 }
 
+/// A member's raw bytes behind the decoder for its method.
+struct RawMember<'a> {
+    method: u16,
+    usz: u64,
+    data_start: Option<u64>,
+    decoder: Result<Box<dyn Read + 'a>, RawRefusal>,
+}
+
+/// Opens member `i` raw and puts its decoder on it. Kept out of
+/// `walk_raw_decode`: a `ZipFile` is tens of kilobytes, and a frame that held
+/// one would stay on the stack while the member is scanned.
+#[inline(never)]
+fn raw_member<'a, R: Read + Seek>(
+    zip: &'a mut ::zip::ZipArchive<R>,
+    i: usize,
+    cap: u64,
+) -> Option<RawMember<'a>> {
+    let f = zip.by_index_raw(i).ok()?;
+    let method = zip_method_code(&f.compression());
+    let usz = f.size();
+    let data_start = f.data_start();
+    Some(RawMember {
+        method,
+        usz,
+        data_start,
+        decoder: raw_decoder(method, f, Some(usz), cap),
+    })
+}
+
 /// Decode a member the `zip` crate refused, from its RAW bytes, using exav's own
 /// codec set, as it is read. The member is visited once: decoded, or as a
 /// marker saying why it could not be. A decoder needing more memory than the
 /// buffer limit leaves the member unread, and the limit goes in `deferred`
 /// for the walk to report once the other members are scanned.
+#[inline(never)]
 fn walk_raw_decode<R: Read + Seek, T>(
     zip: &mut ::zip::ZipArchive<R>,
     src: &dyn crate::source::ByteSource,
@@ -1974,17 +2052,17 @@ fn walk_raw_decode<R: Read + Seek, T>(
     deferred: &mut Option<LimitHit>,
 ) -> Result<Option<T>, LimitHit> {
     let cap = budget.limits.max_buffer_bytes;
-    let f = match zip.by_index_raw(i) {
-        Ok(f) => f,
-        Err(_) => {
-            meta.unsupported = Some("ZIP member header will not parse");
-            return Ok(visit(&meta, None, budget));
-        }
+    let Some(RawMember {
+        method,
+        usz,
+        data_start,
+        decoder,
+    }) = raw_member(zip, i, cap)
+    else {
+        meta.unsupported = Some("ZIP member header will not parse");
+        return Ok(visit(&meta, None, budget));
     };
-    let method = zip_method_code(&f.compression());
-    let usz = f.size();
-    let data_start = f.data_start();
-    match raw_decoder(method, f, Some(usz), cap) {
+    match decoder {
         Ok(mut r) => crate::stream::emit_stream(&meta, &mut r, budget, visit),
         Err(RawRefusal::Unsupported(_)) if !defined_method(method) && data_start.is_some() => {
             // A method no ZIP specification defines is no codec at all.
@@ -2027,6 +2105,7 @@ fn walk_raw_decode<R: Read + Seek, T>(
 /// One encrypted ZIP member: try the password pool and hand over the
 /// plaintext on success, else a metadata-only unsupported member, so the
 /// caller reports it without masking later members.
+#[inline(never)]
 fn walk_encrypted<R: Read + Seek, T>(
     zip: &mut ::zip::ZipArchive<R>,
     i: usize,
@@ -2034,7 +2113,7 @@ fn walk_encrypted<R: Read + Seek, T>(
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use crate::stream::{emit_bytes, MemberMeta};
+    use crate::stream::{MemberMeta, emit_bytes};
     let unsupported_meta = MemberMeta {
         encrypted: true,
         unsupported: Some("encrypted ZIP member"),
@@ -2088,6 +2167,7 @@ fn walk_encrypted<R: Read + Seek, T>(
 /// bounded search [`ZipMembers`] uses: only the space the directory leaves
 /// unaccounted for is read, up to [`MAX_ORPHAN_SCAN`], and a search that stops
 /// there yields a member saying so.
+#[inline(never)]
 pub(crate) fn hidden_members<Rd: Read + Seek>(
     mut zip: ::zip::ZipArchive<Rd>,
     budget: &mut Budget,

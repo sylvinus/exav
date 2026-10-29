@@ -4,7 +4,7 @@
 //! layout of RPM's own file format (lead, signature header, header, payload);
 //! the walker was also run over 155 packages from distributions' repositories.
 
-use exav_unpack::{extract, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, extract};
 
 fn hello() -> Vec<u8> {
     let p = format!(
@@ -87,4 +87,27 @@ fn an_old_style_signature_is_reported() {
     let m = members(&blob).unwrap();
     assert_eq!(m.len(), 1);
     assert!(m[0].unsupported.is_some());
+}
+
+/// Entries that each point at the same long array of scripts make a member
+/// for every string of every one: they are listed up to a bound, and the rest
+/// is reported.
+#[test]
+fn scripts_listed_are_bounded() {
+    let mut blob = hello()[..96].to_vec();
+    blob.extend([0x8e, 0xad, 0xe8, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let entries = 300u32;
+    let data = b"a\0".repeat(4096);
+    blob.extend([0x8e, 0xad, 0xe8, 0x01, 0, 0, 0, 0]);
+    blob.extend(entries.to_be_bytes());
+    blob.extend((data.len() as u32).to_be_bytes());
+    for _ in 0..entries {
+        for v in [1065u32, 8, 0, 4096] {
+            blob.extend(v.to_be_bytes());
+        }
+    }
+    blob.extend(data);
+    let m = members(&blob).unwrap();
+    assert!(m.len() <= 4100, "{}", m.len());
+    assert!(m.iter().any(|e| e.unsupported.is_some()));
 }

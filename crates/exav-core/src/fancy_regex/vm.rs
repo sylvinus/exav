@@ -179,7 +179,7 @@ pub enum CharClassMatcher {
 
 impl fmt::Debug for CharClassMatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref name) = match self {
+        if let Some(name) = match self {
             CharClassMatcher::Codepoint { name, .. } => name,
             CharClassMatcher::Byte { name, .. } => name,
         } {

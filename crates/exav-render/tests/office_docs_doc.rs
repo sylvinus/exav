@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use exav_render::docs::{convert, Error, Format, Limits};
+use exav_render::docs::{Error, Format, Limits, convert};
 
 fn bold(a: usize, b: usize) -> (usize, usize, Vec<u8>) {
     (a, b, vec![0x35, 0x08, 1])

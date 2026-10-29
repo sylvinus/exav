@@ -93,7 +93,7 @@ impl<R: BufRead> Inflate<R> {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "deflate stream ends before its last block",
-                    ))
+                    ));
                 }
                 Ok(_) => self.out.resize(OUT, 0),
                 Err(e) => {
@@ -189,7 +189,7 @@ impl<R: BufRead> Gunzip<R> {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "not a gzip stream",
-                    ))
+                    ));
                 }
             }
         }

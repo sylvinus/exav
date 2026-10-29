@@ -1,7 +1,7 @@
 //! Character, paragraph and section modifiers ([MS-DOC] 2.6) applied to the
 //! model's property structs.
 
-use super::sprm::{parse, Prl};
+use super::sprm::{Prl, parse};
 use crate::formats::office::common::bytes::Cur;
 use crate::formats::office::docs::model::*;
 
@@ -722,22 +722,22 @@ pub fn apply_sep(s: &mut Section, grpprl: &[u8]) {
             _ => {}
         }
         // sprmSDxaColWidth and sprmSDxaColSpacing: (column, twips).
-        if matches!(p.op, 0xF203 | 0xF204) {
-            if let [_, i, a, b, ..] = p.val {
-                let v = i32::from(u16::from_le_bytes([*a, *b]));
-                let i = usize::from(*i);
-                let e = match widths.iter().position(|w| w.0 == i) {
-                    Some(k) => k,
-                    None => {
-                        widths.push((i, 0, 0));
-                        widths.len() - 1
-                    }
-                };
-                if p.op == 0xF203 {
-                    widths[e].1 = v;
-                } else {
-                    widths[e].2 = v;
+        if matches!(p.op, 0xF203 | 0xF204)
+            && let [_, i, a, b, ..] = p.val
+        {
+            let v = i32::from(u16::from_le_bytes([*a, *b]));
+            let i = usize::from(*i);
+            let e = match widths.iter().position(|w| w.0 == i) {
+                Some(k) => k,
+                None => {
+                    widths.push((i, 0, 0));
+                    widths.len() - 1
                 }
+            };
+            if p.op == 0xF203 {
+                widths[e].1 = v;
+            } else {
+                widths[e].2 = v;
             }
         }
     }

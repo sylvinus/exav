@@ -4,8 +4,8 @@
 
 use exav_unpack::dwg::{BitResult, EedValue, Object, Version};
 
-use super::header::Vars;
 use super::Ctx;
+use super::header::Vars;
 use crate::formats::cad::model::*;
 
 /// The fixed type codes of the tables' objects (spec 20.3).
@@ -248,10 +248,10 @@ fn layer(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<Layer> {
             continue;
         }
         for (code, value) in eed.items(ctx.version) {
-            if let (1071, EedValue::Long(v)) = (code, value) {
-                if let Transparency::Alpha(a) = Transparency::from_code(i64::from(v)) {
-                    l.alpha = a;
-                }
+            if let (1071, EedValue::Long(v)) = (code, value)
+                && let Transparency::Alpha(a) = Transparency::from_code(i64::from(v))
+            {
+                l.alpha = a;
             }
         }
     }
@@ -431,7 +431,7 @@ fn dim_style(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<DimStyle> {
             b.rc()?;
         }
         b.b()?; // DIMUPT
-                // DIMTZIN, DIMALTZ, DIMALTTZ
+        // DIMTZIN, DIMALTZ, DIMALTTZ
         for _ in 0..3 {
             b.rc()?;
         }
@@ -520,7 +520,7 @@ fn dim_style(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<DimStyle> {
         b.bd()?; // DIMALTRND
         b.b()?; // DIMALT
         b.bs()?; // DIMALTD
-                 // DIMTOFL, DIMSAH, DIMTIX, DIMSOXD
+        // DIMTOFL, DIMSAH, DIMTIX, DIMSOXD
         for _ in 0..4 {
             b.b()?;
         }

@@ -3,17 +3,16 @@
 
 mod cf;
 pub(crate) mod chart;
-pub(crate) mod dom;
 mod draw;
 pub(crate) mod formula;
 mod numfmt;
 mod styles;
 mod table;
 
+use crate::formats::office::common::xml::{self, Child, Node};
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
-use dom::{Child, Node};
 use std::collections::HashMap;
 use std::io::Read;
 use styles::{Props, Styles};
@@ -92,13 +91,12 @@ pub(crate) fn read_ods(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
         .ok_or_else(|| Error::NotFormat("no content.xml".into()))?;
     let styles = z.get("styles.xml", max, budget)?;
     let settings = z.get("settings.xml", max, budget)?;
-    budget.alloc(content.len() as u64 * 4)?;
-    let content = dom::parse(&content, dom::MAX_ELEMENTS)?;
+    let content = xml::parse(&content, &mut budget.tree())?;
     let styles = match styles {
-        Some(s) => dom::parse(&s, dom::MAX_ELEMENTS).ok(),
+        Some(s) => xml::parse(&s, &mut budget.tree()).ok(),
         None => None,
     };
-    let settings = settings.and_then(|s| dom::parse(&s, dom::MAX_ELEMENTS).ok());
+    let settings = settings.and_then(|s| xml::parse(&s, &mut budget.tree()).ok());
     let mut parts: HashMap<String, Vec<u8>> = HashMap::new();
     for n in z.names() {
         let name = n.trim_start_matches("./").to_string();
@@ -106,30 +104,29 @@ pub(crate) fn read_ods(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
         let picture = name.starts_with("Pictures/")
             || name.starts_with("media/")
             || name.starts_with("ObjectReplacements/");
-        if object || picture {
-            if let Some(v) = z.get(&n, 64 << 20, budget)? {
-                parts.insert(name, v);
-            }
+        if (object || picture)
+            && let Some(v) = z.get(&n, 64 << 20, budget)?
+        {
+            parts.insert(name, v);
         }
     }
     read_doc(&content, styles.as_ref(), settings.as_ref(), &parts, budget)
 }
 
 pub(crate) fn read_fods(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
-    budget.alloc(bytes.len() as u64 * 4)?;
-    let doc = dom::parse(bytes, dom::MAX_ELEMENTS)?;
+    let doc = xml::parse(bytes, &mut budget.tree())?;
     if doc.name != "office:document" {
         return Err(Error::NotFormat(format!(
             "not a flat ODF document: {}",
             doc.name
         )));
     }
-    if let Some(m) = doc.attr("office:mimetype") {
-        if !m.contains("spreadsheet") {
-            return Err(Error::NotFormat(format!(
-                "a flat OpenDocument file of type {m}"
-            )));
-        }
+    if let Some(m) = doc.attr("office:mimetype")
+        && !m.contains("spreadsheet")
+    {
+        return Err(Error::NotFormat(format!(
+            "a flat OpenDocument file of type {m}"
+        )));
     }
     let settings = doc.child("office:settings");
     read_doc(&doc, None, settings, &HashMap::new(), budget)
@@ -518,10 +515,11 @@ fn read_doc(
             if let Some(z) = g("ZoomValue") {
                 sheet.zoom = z;
             }
-            if let Some(c) = m.get("TabColor").and_then(|v| v.parse::<i64>().ok()) {
-                if (0..0x100_0000).contains(&c) && sheet.tab_color.is_none() {
-                    sheet.tab_color = Some(c as u32);
-                }
+            if let Some(c) = m.get("TabColor").and_then(|v| v.parse::<i64>().ok())
+                && (0..0x100_0000).contains(&c)
+                && sheet.tab_color.is_none()
+            {
+                sheet.tab_color = Some(c as u32);
             }
         }
         if settings
@@ -529,10 +527,9 @@ fn read_doc(
             .get(&sheet.name)
             .and_then(|m| m.get("ShowGrid"))
             .is_none()
+            && let Some(v) = settings.global.get("ShowGrid")
         {
-            if let Some(v) = settings.global.get("ShowGrid") {
-                sheet.show_grid = v == "true";
-            }
+            sheet.show_grid = v == "true";
         }
         if let Some(v) = settings.global.get("ShowZeroValues") {
             sheet.show_zeros = v == "true";
@@ -548,10 +545,11 @@ fn read_doc(
     // Charts, once every sheet's values are known.
     for (i, list) in pending_charts.into_iter().enumerate() {
         for (anchor, href, fallback) in list {
-            match parts
-                .get(&format!("{href}/content.xml"))
-                .and_then(|xml| chart::read(xml, anchor, &wb.sheets))
-            {
+            let chart = match parts.get(&format!("{href}/content.xml")) {
+                Some(xml) => chart::read(xml, anchor, &wb.sheets, &mut budget.tree())?,
+                None => None,
+            };
+            match chart {
                 Some(c) => wb.sheets[i].charts.push(c),
                 None => wb.sheets[i].images.extend(fallback),
             }
@@ -573,15 +571,15 @@ fn read_doc(
                 "table:named-expression" => n.attr("table:expression").and_then(|e| fc.convert(e)),
                 _ => None,
             };
-            if let Some(f) = f.filter(|f| !f.is_empty()) {
-                if wb.names.len() < 1 << 16 {
-                    wb.names.push(DefinedName {
-                        name: name.to_string(),
-                        sheet: scope,
-                        formula: f,
-                        hidden: false,
-                    });
-                }
+            if let Some(f) = f.filter(|f| !f.is_empty())
+                && wb.names.len() < 1 << 16
+            {
+                wb.names.push(DefinedName {
+                    name: name.to_string(),
+                    sheet: scope,
+                    formula: f,
+                    hidden: false,
+                });
             }
         }
     };
@@ -601,10 +599,9 @@ fn read_doc(
             if let Some((sheet, r)) = d
                 .attr("table:target-range-address")
                 .and_then(parse_range_addr)
+                && let Some(s) = wb.sheets.iter_mut().find(|s| s.name == sheet)
             {
-                if let Some(s) = wb.sheets.iter_mut().find(|s| s.name == sheet) {
-                    s.autofilter = Some(r);
-                }
+                s.autofilter = Some(r);
             }
         }
     }
@@ -680,6 +677,30 @@ mod tests {
         let cfs = &wb.sheets[0].cond_formats;
         assert_eq!(cfs.len(), 1);
         assert_eq!(cfs[0].ranges, [Range::cell(0, 0)]);
+    }
+
+    /// Checking what a styled empty cell shows along its width costs the
+    /// width for each row, so it is bounded over a workbook; past the bound
+    /// the formatting of the area is left out, with a warning.
+    #[test]
+    fn the_width_swept_for_styled_empty_cells_is_bounded() {
+        let row = r#"<table:table-row table:number-rows-repeated="1025"><table:table-cell table:style-name="ce1" table:number-columns-repeated="1048576"/></table:table-row>"#;
+        let fods = format!(
+            r##"<?xml version="1.0"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+<office:automatic-styles><style:style style:name="ce1" style:family="table-cell"/></office:automatic-styles>
+<office:body><office:spreadsheet><table:table table:name="S">{}<table:table-row><table:table-cell office:value-type="string"><text:p>end</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document>"##,
+            row.repeat(6)
+        );
+        let read = |sweeps: u64| {
+            let limits = crate::formats::office::sheets::limits::Limits::default();
+            let mut budget = Budget::new(limits).with_max_swept(sweeps << 14);
+            read_fods(fods.as_bytes(), &mut budget).unwrap().warnings
+        };
+        assert!(read(6).is_empty());
+        let warnings = read(3);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("formatting"), "{warnings:?}");
     }
 
     #[test]

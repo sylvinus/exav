@@ -8,12 +8,13 @@ mod drawing;
 mod styles;
 pub(crate) mod xml;
 
+use crate::formats::office::common::package::{Lift, Out};
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::model::*;
 use crate::formats::office::sheets::numtext;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::io::Write;
 use xml::{argb, esc, esc_into};
 
 pub(crate) use styles::ms_font_name;
@@ -23,32 +24,9 @@ const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relati
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const XML_HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
 
-/// The output, refused past `limit` bytes.
-struct Out {
-    buf: Cursor<Vec<u8>>,
-    limit: u64,
-}
-
-impl Write for Out {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        if self.buf.position() + b.len() as u64 > self.limit {
-            return Err(std::io::Error::other("output too large"));
-        }
-        self.buf.write(b)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Seek for Out {
-    fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
-        self.buf.seek(p)
-    }
-}
-
 struct Package {
+    // Dropped first: see `Lift`.
+    _lift: Lift,
     z: zip::ZipWriter<Out>,
     content_types: Vec<(String, &'static str)>,
     defaults: Vec<(&'static str, &'static str)>,
@@ -104,7 +82,9 @@ impl Rels {
     }
 
     fn xml(&self) -> String {
-        let mut r = format!("{XML_HEAD}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+        let mut r = format!(
+            "{XML_HEAD}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        );
         for (i, (kind, target, ext)) in self.0.iter().enumerate() {
             let _ = write!(
                 r,
@@ -201,32 +181,36 @@ fn sheet_view(x: &mut String, sh: &Sheet, active: bool) {
     if sh.zoom != 100 && (10..=400).contains(&sh.zoom) {
         let _ = write!(view, " zoomScale=\"{}\"", sh.zoom);
     }
-    if let Some((r, c)) = sh.top_left {
-        if sh.freeze.is_none() && r <= MAX_ROW && c <= MAX_COL {
-            let _ = write!(view, " topLeftCell=\"{}\"", cell_ref(r, c));
-        }
+    if let Some((r, c)) = sh.top_left
+        && sh.freeze.is_none()
+        && r <= MAX_ROW
+        && c <= MAX_COL
+    {
+        let _ = write!(view, " topLeftCell=\"{}\"", cell_ref(r, c));
     }
     view.push_str(" workbookViewId=\"0\">");
-    if let Some((rows, cols)) = sh.freeze {
-        if (rows > 0 || cols > 0) && rows <= MAX_ROW && cols <= MAX_COL {
-            let pane = match (rows > 0, cols > 0) {
-                (true, true) => "bottomRight",
-                (true, false) => "bottomLeft",
-                _ => "topRight",
-            };
-            view.push_str("<pane");
-            if cols > 0 {
-                let _ = write!(view, " xSplit=\"{cols}\"");
-            }
-            if rows > 0 {
-                let _ = write!(view, " ySplit=\"{rows}\"");
-            }
-            let _ = write!(
-                view,
-                " topLeftCell=\"{}\" activePane=\"{pane}\" state=\"frozen\"/>",
-                cell_ref(rows, cols)
-            );
+    if let Some((rows, cols)) = sh.freeze
+        && (rows > 0 || cols > 0)
+        && rows <= MAX_ROW
+        && cols <= MAX_COL
+    {
+        let pane = match (rows > 0, cols > 0) {
+            (true, true) => "bottomRight",
+            (true, false) => "bottomLeft",
+            _ => "topRight",
+        };
+        view.push_str("<pane");
+        if cols > 0 {
+            let _ = write!(view, " xSplit=\"{cols}\"");
         }
+        if rows > 0 {
+            let _ = write!(view, " ySplit=\"{rows}\"");
+        }
+        let _ = write!(
+            view,
+            " topLeftCell=\"{}\" activePane=\"{pane}\" state=\"frozen\"/>",
+            cell_ref(rows, cols)
+        );
     }
     view.push_str("</sheetView>");
     let _ = write!(x, "<sheetViews>{view}</sheetViews>");
@@ -325,14 +309,14 @@ fn cell_xml(x: &mut String, sst: &mut Sst, sh: &Sheet, (r, c): (u32, u32), cell:
 fn row_open(x: &mut String, sh: &Sheet, r: u32) {
     let _ = write!(x, "<row r=\"{}\"", r + 1);
     if let Some(i) = sh.rows.get(&r) {
-        if let Some(h) = i.height {
-            if i.custom_height || (h - sh.default_row_height).abs() > 1e-9 {
-                let _ = write!(
-                    x,
-                    " ht=\"{}\" customHeight=\"1\"",
-                    numtext::xml(h.clamp(0.0, 409.5))
-                );
-            }
+        if let Some(h) = i.height
+            && (i.custom_height || (h - sh.default_row_height).abs() > 1e-9)
+        {
+            let _ = write!(
+                x,
+                " ht=\"{}\" customHeight=\"1\"",
+                numtext::xml(h.clamp(0.0, 409.5))
+            );
         }
         if i.hidden {
             x.push_str(" hidden=\"1\"");
@@ -840,7 +824,10 @@ fn workbook_xml(wb: &Workbook, chart_sheets: &[bool]) -> String {
     );
     let active = wb.active.min(wb.sheets.len().saturating_sub(1));
     let first = wb.first_tab.min(wb.sheets.len().saturating_sub(1));
-    let _ = write!(w, "<bookViews><workbookView activeTab=\"{active}\" firstSheet=\"{first}\"/></bookViews><sheets>");
+    let _ = write!(
+        w,
+        "<bookViews><workbookView activeTab=\"{active}\" firstSheet=\"{first}\"/></bookViews><sheets>"
+    );
     let sheet_list = sheet_names(wb.sheets.iter().map(|s| s.name.as_str()));
     for (i, (sh, name)) in wb.sheets.iter().zip(&sheet_list).enumerate() {
         let state = match sh.state {
@@ -891,7 +878,9 @@ fn workbook_xml(wb: &Workbook, chart_sheets: &[bool]) -> String {
         let _ = write!(
             names,
             "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"{i}\" hidden=\"1\">{}!{}:{}</definedName>",
-            esc(&crate::formats::office::sheets::xls::formula::quote_sheet(&sheet_list[i])),
+            esc(&crate::formats::office::sheets::xls::formula::quote_sheet(
+                &sheet_list[i]
+            )),
             abs(a.r1, a.c1),
             abs(a.r2, a.c2)
         );
@@ -908,11 +897,9 @@ pub(crate) fn write(wb: &Workbook, max_bytes: u64) -> Result<Vec<u8>> {
     if wb.sheets.is_empty() {
         return Err(Error::Malformed("no sheets".into()));
     }
-    let out = Out {
-        buf: Cursor::new(Vec::new()),
-        limit: max_bytes,
-    };
+    let (out, lift) = Out::new(0, max_bytes);
     let mut pkg = Package {
+        _lift: lift,
         z: zip::ZipWriter::new(out),
         content_types: vec![],
         defaults: vec![
@@ -1019,8 +1006,9 @@ pub(crate) fn write(wb: &Workbook, max_bytes: u64) -> Result<Vec<u8>> {
     }
     ct.push_str("</Types>");
     pkg.put("[Content_Types].xml", ct.as_bytes())?;
+    pkg._lift.lift();
     let out = pkg.z.finish().map_err(zip_err)?;
-    Ok(out.buf.into_inner())
+    Ok(out.into_inner())
 }
 
 #[cfg(test)]

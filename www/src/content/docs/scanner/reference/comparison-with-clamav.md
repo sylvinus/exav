@@ -74,9 +74,39 @@ anchor-index pass plus cheap hash lookups, checked for correctness by
 a raw database builds the signature index, which costs time and memory; the
 [prebuilt `.exavdb`](/scanner/guides/prebuilt-database/) moves that cost off the
 scanning hosts, and the resident [daemon](/scanner/guides/daemon/) pays the load once.
-Raw matching throughput on very large databases is still being optimised. No
-speed comparison is claimed: the differential harness measures agreement, not
-speed.
+
+### A measurement
+
+`clamscan` and `exav` scanned the same 5,705 samples (1.54 GB, every
+MalwareBazaar file of a local corpus up to 1 MiB: PE, ELF, Office documents,
+PDF, scripts, archives and disk images), each as one process on one core, with
+the signatures `freshclam` keeps (ClamAV 1.4.3, `main`, `daily` and `bytecode`)
+and the files in the page cache. The start, which loads the signatures, is
+timed on one small file and taken off. Each figure is the median of three runs.
+
+| | Start | Scan | Files/s | MB/s | CPU time | Peak memory |
+|---|---|---|---|---|---|---|
+| `clamscan` | 8.7 s | 1,432 s | 4.0 | 1.1 | 1,350 s | 1.3 GB |
+| `exav` | 17.6 s | 339 s | 16.8 | 4.5 | 328 s | 1.5 GB |
+| `exav --clamav-compat` | 16.1 s | 328 s | 17.4 | 4.7 | 318 s | 1.5 GB |
+
+exav scans about 4 times faster here, in wall time and in CPU time alike.
+`--clamav-compat` is the row that does no more work than ClamAV does (its
+limits, its unpackers, no extra decoders), and it is no slower. Loading the
+raw signatures takes twice as long as `clamscan`'s start; from a prebuilt
+[`.exavdb`](/scanner/guides/prebuilt-database/#what-it-costs) it takes a second
+or two.
+
+What this is not: one machine (3 cores, arm64), one corpus (malware, not
+typical files), one signature set, one thread. It says nothing about the
+daemons, which scan in parallel, nor about large files, since the set was kept
+small enough to stay in the cache. Two runs were stretched by hours of wall
+time by a pause of the virtual machine, with their CPU time unchanged, which is
+why the medians are taken. `scripts/bench-speed.sh` runs it again on any corpus.
+The detection counts differ (1,143 files for `clamscan`, 1,381 for exav, 1,305
+under `--clamav-compat`): the count is not what is measured here, and
+[differential testing](/scanner/concepts/differential-testing/) is what
+compares what each finds.
 
 Wildcard-signature verification does not backtrack. A body's token program is
 run as a simulation over reachable position intervals, so an unbounded gap costs
@@ -102,7 +132,7 @@ each axis. (For the catalogue see [Supported formats](/scanner/reference/formats
 | **Signature scope (`Target:`, TDB)** | Most `Target:` values ([details](#targets)), and every TDB attribute any engine implements. A signature with a constraint exav cannot evaluate is refused and counted ([details](#signature-metadata-tdb-attributes)). | none |
 | **YARA** | none | Seven modules work (`pe`, `elf`, `dotnet`, `math`, `hash`, `string`, `time`); rules importing another (such as `macho`, `dex` or `cuckoo`) are rejected per rule and counted, so one unsupported rule cannot drop a feed. Matching is cross-checked against `yara-x`. No wasmtime or Cranelift behind it. In ClamAV no module works; even `pe` fails to load. |
 | **Archive codecs** | none | ZIP members compressed with LZMA, bzip2, zstd, XZ or PPMd are decoded. Members whose sizes are deferred to a trailing data descriptor are carved and scanned. |
-| **Container formats** | none | Virtual disks ClamAV does not open: VHD, VHDX, QCOW2 (compressed clusters included) and VMDK (sparse and streamOptimized, as inside an OVA), reconstructed to the guest disk and rescanned, with the NTFS and FAT filesystems inside them. Also UDF, WIM, KWAJ, LZ4, ARC and Unix `compress` (`.Z`). |
+| **Container formats** | none | Virtual disks ClamAV does not open: VHD, VHDX, QCOW2 (compressed clusters included) and VMDK (sparse and streamOptimized, as inside an OVA), reconstructed to the guest disk and rescanned, with the filesystems inside them (NTFS, FAT, exFAT, ext2/3/4, HFS+, APFS). Also SquashFS, cramfs, romfs, EROFS, UDF, WIM, KWAJ, LZ4, ARC and Unix `compress` (`.Z`). |
 | **Decryption** | none | ZIP, 7z and RAR3/RAR5 (encrypted headers included), encrypted DMG, PDF and Office are decrypted with the password pool and the built-in passwords ([details](/scanner/reference/formats/#encryption-and-passwords)). What stays encrypted, PKWARE Strong Encryption included, is reported `PASSWORD-PROTECTED`; ClamAV returns `OK` for an encrypted archive unless `--alert-encrypted-archive` is passed. |
 | **PE unpacking** | none | UPX and the aPLib family are unpacked by decoders, and the result is rebuilt in ClamAV's layout so ClamAV hash signatures over its rebuilt image match. Everything else that looks packed has its stub run under a bounded x86 interpreter ([how](/scanner/concepts/pe-emulation/)); ClamAV ships a hand-written unpacker per family. |
 | **PE trust** | Authenticode is parsed and matched against a block list; the certificate chain is not verified. | none |
@@ -126,11 +156,9 @@ make exav skip content or crash, report it privately as a
 
 ## Evidence for what ClamAV does not open
 
-Each container, codec and decryption claim above was checked by building a container of the
-format with the EICAR test file inside and scanning it with ClamAV 1.4.3 and
-1.5.3: detection proves the container was decoded and walked, while recognising
-the type proves nothing. Where EICAR could not be injected, real samples were
-extracted with a third-party tool and their members hash-matched.
+Each container, codec and decryption claim above was checked by scanning a
+container of the format with the EICAR test file inside: detection proves the
+container was decoded and walked, while recognising the type proves nothing.
 
 ClamAV has no support for NTFS, FAT12/16/32, VHD, VHDX, QCOW2 or VMDK: no file
 type is defined for any of them, and images containing EICAR came back clean. It
@@ -201,15 +229,65 @@ subsets where the shipped database has so far used only the implemented part).
 
 ### Formats and unpacking
 
-| Gap | ClamAV | exav |
-|---|---|---|
-| **InstallShield MSI** | `CL_TYPE_ISHIELD_MSI` | Recognised, reported `UNSCANNABLE` |
-| **CRYPTFF** | `CL_TYPE_CRYPTFF` | Recognised, reported `PASSWORD-PROTECTED` |
+Measured with ClamAV 1.4.3 and 1.5.3. Where a container could hold the EICAR
+test file, it was scanned with it inside; otherwise its members were extracted
+with a third-party tool, hashed into a signature database, and the untouched
+container scanned. For everything exav does not decode, see the
+[complete gap list](/unpack/formats/#the-complete-gap-list).
 
-These rows come from ClamAV's own `CL_TYPE_*` enumeration (see
-[the full format status](/scanner/reference/formats/#checked-against-clamavs-own-type-list)).
-For everything exav does not decode, including formats neither engine opens, see
-the [complete gap list](/unpack/formats/#the-complete-gap-list).
+**Neither engine opens these.** ClamAV answers `OK` for each, and exav says the
+members went unexamined.
+
+| Format / codec | ClamAV | exav |
+|---|---|---|
+| ACE | No support: 200 members of a real ACE went unextracted | `UNSCANNABLE` |
+| StuffIt / StuffIt X | No support: real `.sit` and `.sitx` unextracted | `UNSCANNABLE` |
+| Inno Setup | No support: stops at "Recognized MS-EXE/DLL", 71 members unreached | `UNSCANNABLE` |
+| ZIP method 10 (DCL Implode) | Enumerates the entry, then `unsupported method (10)` | `UNSCANNABLE` |
+| ZIP methods 94 / 96 / 97 (MP3, JPEG, WavPack) | No support | `UNSCANNABLE` |
+| PKWARE Strong Encryption | No support | `PASSWORD-PROTECTED` |
+| WIM LZMS resources | No support for WIM at all: no `CL_TYPE_WIM`, all four test images clean | `UNSCANNABLE`; other WIM resources are decoded |
+
+Not measured, and likely a gap: RAR 1.5 and 2.x compression, which ClamAV's
+UnRAR-derived RAR support reads.
+
+**Both decode these**, or ClamAV types them. This comes from checking exav
+against ClamAV's own `CL_TYPE_*` enumeration rather than a hand-assembled list;
+`clamscan --debug` reports dedicated submodules for EGG, ALZ and HWP, all on by
+default.
+
+| Format | ClamAV | exav |
+|---|---|---|
+| **EGG** (ESTsoft, Korean) | Decodes; `Heuristics.Encrypted.EGG` shows members are parsed deeply enough to detect encryption | Decodes (store/deflate/bzip2/LZMA/AZO) |
+| **ALZ** (ESTsoft, Korean) | Decodes; magic added at flevel 210 | Decodes (store/bzip2/deflate) |
+| **HWP3** (Hangul Word Processor) | Decodes, with its own scan-option bit, `MAX_RECHWP3` and `--max-rechwp3` | Decodes (deflate body) |
+| CAB Quantum | Decodes | Decodes |
+| **InstallShield MSI** | `CL_TYPE_ISHIELD_MSI`, types and handles | Recognised, reported `UNSCANNABLE` |
+| **CRYPTFF** | `CL_TYPE_CRYPTFF`, types and handles | Recognised, reported `PASSWORD-PROTECTED` |
+
+EGG and ALZ matter for Korean-language targets, where ALZip is common; HWP3 is
+the Korean government's standard document format and a recurring spear-phishing
+carrier. SZDD is decoded regardless of layout; ClamAV accepts it only when the
+tenth byte is zero and reports "not supported" otherwise. PDF `DCTDecode`,
+`CCITTFax`, `JBIG2` and `JPXDecode` streams are decoded by neither: the raw
+stream is matched as stored.
+
+**ClamAV does not recognise these.** A format with no detection is the weaker
+failure: the file is scanned as whatever it types as, its members are never
+reached, and the scan can come back clean.
+
+| Format | ClamAV | exav |
+|---|---|---|
+| InstallShield `.z` archive | No support | Decoded |
+| ext2/3/4, exFAT, SquashFS, cramfs, romfs, EROFS | No support | Decoded |
+| ZOO | No support | Decoded |
+| VHD, VHDX, QCOW2, VMDK, NTFS, FAT, HFS+, APFS | No support | Decoded |
+| InstallShield InstallScript cabinet | No support | Recognised, reported `UNSCANNABLE` |
+| AppleSingle / AppleDouble | No support | Recognised, reported `UNSCANNABLE` |
+| lrzip | No support | Recognised, reported `UNSCANNABLE` |
+
+[Evidence for what ClamAV does not open](#evidence-for-what-clamav-does-not-open)
+has the disk image measurements.
 
 ClamAV natively unpacks 10 PE packer families. exav unpacks four of them with
 decoders (UPX, Petite, FSG, NsPack) and the other six by
@@ -473,21 +551,6 @@ recognition rather than extraction.
   [out of scope](#out-of-scope-for-now).
 * **RAR volume sets** are not joined by either engine. exav reports the split
   member and scans the part present in the volume it was given.
-
-### Things that look like gaps and are not
-
-Formats neither engine decodes, or both do:
-
-| Format | ClamAV | exav |
-|---|---|---|
-| ACE, StuffIt, Inno Setup | No support | Recognised, reported |
-| ZIP method 10 (DCL Implode) | Enumerates the entry, cannot extract | Reported per member |
-| PDF `DCTDecode` / `CCITTFax` / `JBIG2` / `JPXDecode` | Not decoded; falls back to the raw stream | Not decoded |
-| CAB Quantum | Decodes | Decodes |
-| EGG (store, deflate, bzip2, LZMA, AZO), ALZ, HWP3 | Decodes | Decodes |
-
-SZDD is decoded regardless of layout; ClamAV accepts it only when the tenth byte
-is zero and reports "not supported" otherwise.
 
 ## Out of scope for now
 

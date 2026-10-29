@@ -5,7 +5,7 @@
 //! applications its proxy and custom objects demand, for signatures and
 //! heuristics to match.
 
-use super::{file, BitError, BitResult, Dwg, Error, PreviewKind, Version};
+use super::{BitError, BitResult, Dwg, Error, PreviewKind, Version, file};
 use crate::*;
 
 /// The compound file signature (MS-CFB 2.2).
@@ -219,10 +219,10 @@ fn from_objects<R>(
                 None if bytes.is_empty() => None,
                 None => Some((format!("{label}.bin"), bytes)),
             };
-            if let Some((name, bytes)) = member {
-                if let Some(r) = emit(name, bytes, budget, visit)? {
-                    return Ok(Some(r));
-                }
+            if let Some((name, bytes)) = member
+                && let Some(r) = emit(name, bytes, budget, visit)?
+            {
+                return Ok(Some(r));
             }
         } else if t == VBA_PROJECT
             || (t >= 500 && dwg.class(t).is_some_and(|c| c.name() == "VBA_PROJECT"))
@@ -233,10 +233,9 @@ fn from_objects<R>(
             if let Some((name, bytes)) = dwg
                 .object_bytes(offset)
                 .and_then(|b| vba_member(format!("vbaproject-{handle:X}.ole"), b))
+                && let Some(r) = emit(name, bytes, budget, visit)?
             {
-                if let Some(r) = emit(name, bytes, budget, visit)? {
-                    return Ok(Some(r));
-                }
+                return Ok(Some(r));
             }
         }
         meta.note_xref(&dwg, t, offset);
@@ -246,15 +245,14 @@ fn from_objects<R>(
     if let Some((name, bytes)) = dwg
         .vba_project()
         .and_then(|b| vba_member("vbaproject.ole".to_string(), b))
+        && let Some(r) = emit(name, bytes, budget, visit)?
     {
-        if let Some(r) = emit(name, bytes, budget, visit)? {
-            return Ok(Some(r));
-        }
+        return Ok(Some(r));
     }
-    if let Some(bytes) = meta.finish() {
-        if let Some(r) = emit("dwg-metadata".to_string(), bytes, budget, visit)? {
-            return Ok(Some(r));
-        }
+    if let Some(bytes) = meta.finish()
+        && let Some(r) = emit("dwg-metadata".to_string(), bytes, budget, visit)?
+    {
+        return Ok(Some(r));
     }
     Ok(None)
 }
@@ -300,12 +298,11 @@ impl Metadata {
         if t != BLOCK_HEADER {
             return;
         }
-        if let Ok(mut o) = dwg.object_at(offset) {
-            if let Some(path) = block_xref_path(&mut o, dwg.version()) {
-                if !path.is_empty() {
-                    self.lines.push(format!("xref: {path}"));
-                }
-            }
+        if let Ok(mut o) = dwg.object_at(offset)
+            && let Some(path) = block_xref_path(&mut o, dwg.version())
+            && !path.is_empty()
+        {
+            self.lines.push(format!("xref: {path}"));
         }
     }
 

@@ -459,10 +459,11 @@ fn custom_number(c: Msg, outer: Msg) -> Option<String> {
         // A pattern without digits shows the text alone.
         return Some(format!("{out};{out};{out}"));
     }
-    if thousands && !out.contains(',') {
-        if let Some(p) = out.find(['0', '#', '?']) {
-            out.insert_str(p, "#,##");
-        }
+    if thousands
+        && !out.contains(',')
+        && let Some(p) = out.find(['0', '#', '?'])
+    {
+        out.insert_str(p, "#,##");
     }
     Some(out)
 }
@@ -496,8 +497,8 @@ fn custom_text(p: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::proto::write::W;
     use super::super::proto::Msg;
+    use super::super::proto::write::W;
     use super::*;
 
     fn fmt(w: W, v: Option<f64>) -> Option<String> {

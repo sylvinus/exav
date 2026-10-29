@@ -403,11 +403,7 @@ impl Comp {
             Comp::U32 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
             Comp::F32 => return f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
         };
-        if normalized {
-            v.max(-1.0)
-        } else {
-            v
-        }
+        if normalized { v.max(-1.0) } else { v }
     }
 }
 

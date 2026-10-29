@@ -115,7 +115,18 @@ fn print_stats(s: &Scene) {
         let closed = !edges.is_empty() && edges.values().all(|&n| n == 2);
         println!(
             "{{\"id\":{},\"class\":\"{}\",\"triangles\":{},\"min\":[{},{},{}],\"max\":[{},{},{}],\"area\":{},\"volume\":{},\"closed\":{}}}",
-            e.id, e.class, triangles, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], area, volume, closed
+            e.id,
+            e.class,
+            triangles,
+            lo[0],
+            lo[1],
+            lo[2],
+            hi[0],
+            hi[1],
+            hi[2],
+            area,
+            volume,
+            closed
         );
     }
 }

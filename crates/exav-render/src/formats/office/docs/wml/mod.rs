@@ -45,7 +45,7 @@ fn utf8(input: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 
 pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
     let bytes = utf8(input);
-    let root = xml::parse(&bytes, xml::MAX_ELEMENTS)?;
+    let root = xml::parse(&bytes, &mut budget.tree())?;
     if root.name != "w:wordDocument" {
         return Err(Error::NotFormat(format!("root element {}", root.name)));
     }
@@ -65,10 +65,10 @@ pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
     if let Some(l) = root.child("w:lists") {
         w.lists(l);
     }
-    if let Some(d) = root.child("w:docPr") {
-        if let Some(t) = d.child("w:defaultTabStop") {
-            w.doc.settings.default_tab_stop = t.attr("w:val").and_then(|v| v.parse().ok());
-        }
+    if let Some(d) = root.child("w:docPr")
+        && let Some(t) = d.child("w:defaultTabStop")
+    {
+        w.doc.settings.default_tab_stop = t.attr("w:val").and_then(|v| v.parse().ok());
     }
     let body = root
         .child("w:body")
@@ -94,13 +94,13 @@ impl Wml<'_> {
         let max = self.b.limits.max_part as usize;
         let mut stack = vec![n];
         while let Some(x) = stack.pop() {
-            if x.name == "w:binData" {
-                if let Some(name) = x.attr("w:name") {
-                    let text = crate::formats::office::common::odf::text_of(x);
-                    if let Some(d) = base64::decode(&text, max) {
-                        self.b.alloc(d.len() as u64)?;
-                        self.bin.insert(name.to_string(), d);
-                    }
+            if x.name == "w:binData"
+                && let Some(name) = x.attr("w:name")
+            {
+                let text = crate::formats::office::common::odf::text_of(x);
+                if let Some(d) = base64::decode(&text, max) {
+                    self.b.alloc(d.len() as u64)?;
+                    self.bin.insert(name.to_string(), d);
                 }
             }
             stack.extend(x.nodes());
@@ -391,6 +391,7 @@ impl Wml<'_> {
             }
         }
         self.inlines(n, &mut p.content)?;
+        self.b.inlines(&p.content)?;
         Ok(p)
     }
 
@@ -669,11 +670,9 @@ impl Wml<'_> {
                         .child("w:hmerge")
                         .is_some_and(|m| m.attr("w:val") == Some("continue"));
                 }
-                if continues {
-                    if let Some(prev) = row.cells.last_mut() {
-                        prev.props.grid_span += cell.props.grid_span;
-                        continue;
-                    }
+                if continues && let Some(prev) = row.cells.last_mut() {
+                    prev.props.grid_span += cell.props.grid_span;
+                    continue;
                 }
                 self.depth += 1;
                 let r = self.body(c, &mut cell.content);

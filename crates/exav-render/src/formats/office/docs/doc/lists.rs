@@ -1,8 +1,8 @@
 //! Lists ([MS-DOC] 2.9.147 to 2.9.150, 2.9.200, 2.9.201): list definitions
 //! and the list instances paragraphs refer to.
 
-use super::props::{apply_chp_list, apply_pap_list, ChpAux, Ctx, PapAux};
-use crate::formats::office::common::bytes::{u16_at, u32_at, Cur};
+use super::props::{ChpAux, Ctx, PapAux, apply_chp_list, apply_pap_list};
+use crate::formats::office::common::bytes::{Cur, u16_at, u32_at};
 use crate::formats::office::docs::model::*;
 
 /// The ST_NumberFormat of an MSONFC ([MS-OSHARED] 2.2.1.3).
@@ -101,10 +101,10 @@ fn bullet(ch: u16, font: Option<&str>) -> (String, bool) {
             _ => return None,
         })
     };
-    if ch & 0xF000 != 0 || f == "symbol" || f == "wingdings" {
-        if let Some(c) = map(low) {
-            return (c.to_string(), true);
-        }
+    if (ch & 0xF000 != 0 || f == "symbol" || f == "wingdings")
+        && let Some(c) = map(low)
+    {
+        return (c.to_string(), true);
     }
     (
         char::from_u32(u32::from(if ch & 0xF000 != 0 { low } else { ch }))

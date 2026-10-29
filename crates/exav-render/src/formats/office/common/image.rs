@@ -2,7 +2,7 @@
 //! natural size in EMU where the file says it (resolution of a bitmap,
 //! frame of a metafile).
 
-use super::bytes::{u16_at, u32_at, Cur};
+use super::bytes::{Cur, u16_at, u32_at};
 
 /// The extension of a picture's format: png, jpeg, gif, bmp, tiff, emf,
 /// wmf or svg.
@@ -190,11 +190,7 @@ pub fn dib_to_bmp(dib: &[u8]) -> Vec<u8> {
     let bits = u32::from(u16_at(dib, 14));
     let used = u32_at(dib, 32);
     let colors = if bits <= 8 && bits > 0 {
-        if used > 0 {
-            used.min(256)
-        } else {
-            1 << bits
-        }
+        if used > 0 { used.min(256) } else { 1 << bits }
     } else {
         used.min(256)
     };

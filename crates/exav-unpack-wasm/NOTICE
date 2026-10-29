@@ -104,6 +104,8 @@ Each under the MIT License (MIT OR Apache-2.0 ones used under MIT):
 - unshield and explode (InstallShield .z reader and PKWARE DCL decoder,
   ported): Copyright (c) 2020 Aaron Griffith. https://github.com/agrif/unshield,
   https://github.com/agrif/explode
+- cmpfs (decoder of the files macOS compresses, after its layouts): Copyright
+  (c) 2026 Dil4rd. https://github.com/Dil4rd/dpp
 - EggDotNet (AZO decoder, ported): Copyright (c) Andrew Kolman.
   https://github.com/akolman/EggDotNet
 - AutoIt-Ripper (compiled AutoIt3 layout and tables): Copyright (c) nazywam
@@ -214,7 +216,6 @@ the copyright its license file states, or its authors where it states none:
 
   adler2                 Jonas Schievink
   aes                    2018 Artyom Pavlov; 2018-2024 The RustCrypto Project Developers
-  apfs                   2026 Dil4rd
   base64                 2015 Alice Maz
   bitflags               2014 The Rust Project Developers
   bitstream-io           2017 Brian Langenberger
@@ -230,8 +231,6 @@ the copyright its license file states, or its authors where it states none:
   cmov                   2022-2026 The RustCrypto Project Developers
   const-oid              2020-2026 The RustCrypto Project Developers
   cpubits                2023-2026 The RustCrypto Project Developers
-  crc                    2017 crc-rs Developers
-  crc-catalog            2019 Akhil Velagapudi
   crc32fast              2018 Sam Rijs, Alex Crichton and contributors
   crypto-common          2021-2026 RustCrypto Developers
   ctutils                2025-2026 The RustCrypto Project Developers
@@ -241,8 +240,6 @@ the copyright its license file states, or its authors where it states none:
                          2017-2024 The RustCrypto Project Developers
   digest                 2017 Artyom Pavlov; 2017-2025 RustCrypto Developers
   equivalent             2016-2023 the equivalent authors
-  ext4-view              2023 Google LLC
-  fatfs                  2017 Rafał Harabień
   filetime               2014 Alex Crichton
   flate2                 2014-2026 Alex Crichton
   fnv                    2017 Contributors
@@ -250,7 +247,6 @@ the copyright its license file states, or its authors where it states none:
   futures-task           2016 Alex Crichton; 2017 The Tokio Authors
   futures-util           2016 Alex Crichton; 2017 The Tokio Authors
   hashbrown              2016 Amanieu d'Antras
-  hfsplus                2026 Dil4rd
   hmac                   2017 Artyom Pavlov
   hybrid-array           2022-2026 The RustCrypto Project Developers
   indexmap               2016-2017 the indexmap authors
@@ -292,7 +288,6 @@ the copyright its license file states, or its authors where it states none:
   uuid                   2014 The Rust Project Developers; 2018 Ashley Mannix,
                          Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
   wasm-bindgen           2014 Alex Crichton
-  wasm-bindgen-futures   2014 Alex Crichton
   wasm-bindgen-shared    2014 Alex Crichton
   web-sys                2014 Alex Crichton
   web-time               2023 dAxpeDDa
@@ -304,10 +299,6 @@ Under the Apache License, Version 2.0 (text below), its only license; it ships
 no NOTICE file:
 
   lzma-rust2             the lzma-rust2 authors
-
-Under CC0-1.0 (public domain; no notice required, recorded for completeness):
-
-  constant_time_eq       Cesar Eduardo Barros
 
 
 MIT License

@@ -3,9 +3,9 @@
 //! reach (DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, the
 //! flat OpenDocument files, Numbers, Pages, Keynote). For [`crate::text`].
 
-use super::common::cfb::Compound;
 use super::text::Text;
 use super::{docs, sheets, slides};
+use exav_unpack::cfb::Compound;
 
 /// What a file is, among what is read here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

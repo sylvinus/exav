@@ -80,7 +80,11 @@ fn series(k: usize, s: &ChartSeries, kind: ChartKind) -> String {
         if s.marker {
             match s.color {
                 Some(c) => {
-                    let _ = write!(x, "<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/><c:spPr>{}</c:spPr></c:marker>", solid(c));
+                    let _ = write!(
+                        x,
+                        "<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/><c:spPr>{}</c:spPr></c:marker>",
+                        solid(c)
+                    );
                 }
                 None => {
                     x.push_str("<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/></c:marker>")
@@ -194,8 +198,18 @@ fn group(chart: &Chart, kind: ChartKind, sers: &str, ids: &AxisIds) -> (String, 
     match kind {
         ChartKind::Pie => {
             let tag = if d3 { "pie3DChart" } else { "pieChart" };
-            let slice = if d3 { String::new() } else { format!("<c:firstSliceAng val=\"{}\"/>", chart.first_slice.unwrap_or(0).min(360)) };
-            (format!("<c:{tag}><c:varyColors val=\"{vary}\"/>{sers}{slice}</c:{tag}>"), false)
+            let slice = if d3 {
+                String::new()
+            } else {
+                format!(
+                    "<c:firstSliceAng val=\"{}\"/>",
+                    chart.first_slice.unwrap_or(0).min(360)
+                )
+            };
+            (
+                format!("<c:{tag}><c:varyColors val=\"{vary}\"/>{sers}{slice}</c:{tag}>"),
+                false,
+            )
         }
         ChartKind::Doughnut => (
             format!(
@@ -205,27 +219,76 @@ fn group(chart: &Chart, kind: ChartKind, sers: &str, ids: &AxisIds) -> (String, 
             ),
             false,
         ),
-        ChartKind::Scatter => (format!("<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"{vary}\"/>{sers}{ax}</c:scatterChart>"), true),
-        ChartKind::Bubble => (format!("<c:bubbleChart><c:varyColors val=\"{vary}\"/>{sers}{ax}</c:bubbleChart>"), true),
+        ChartKind::Scatter => (
+            format!(
+                "<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"{vary}\"/>{sers}{ax}</c:scatterChart>"
+            ),
+            true,
+        ),
+        ChartKind::Bubble => (
+            format!("<c:bubbleChart><c:varyColors val=\"{vary}\"/>{sers}{ax}</c:bubbleChart>"),
+            true,
+        ),
         ChartKind::Radar | ChartKind::FilledRadar => {
-            let style = if kind == ChartKind::FilledRadar { "filled" } else { "marker" };
-            (format!("<c:radarChart><c:radarStyle val=\"{style}\"/><c:varyColors val=\"{vary}\"/>{sers}{ax}</c:radarChart>"), false)
+            let style = if kind == ChartKind::FilledRadar {
+                "filled"
+            } else {
+                "marker"
+            };
+            (
+                format!(
+                    "<c:radarChart><c:radarStyle val=\"{style}\"/><c:varyColors val=\"{vary}\"/>{sers}{ax}</c:radarChart>"
+                ),
+                false,
+            )
         }
-        ChartKind::Surface => (format!("<c:surfaceChart><c:wireframe val=\"0\"/>{sers}{ax}<c:axId val=\"{}\"/></c:surfaceChart>", ids.val + 1), false),
-        ChartKind::Stock => (format!("<c:stockChart>{sers}<c:hiLowLines/>{ax}</c:stockChart>"), false),
+        ChartKind::Surface => (
+            format!(
+                "<c:surfaceChart><c:wireframe val=\"0\"/>{sers}{ax}<c:axId val=\"{}\"/></c:surfaceChart>",
+                ids.val + 1
+            ),
+            false,
+        ),
+        ChartKind::Stock => (
+            format!("<c:stockChart>{sers}<c:hiLowLines/>{ax}</c:stockChart>"),
+            false,
+        ),
         ChartKind::Line | ChartKind::Area => {
-            let base = if kind == ChartKind::Area { "area" } else { "line" };
+            let base = if kind == ChartKind::Area {
+                "area"
+            } else {
+                "line"
+            };
             let tag = format!("{base}{}Chart", if d3 { "3D" } else { "" });
-            let grouping = if chart.grouping == "clustered" { "standard" } else { chart.grouping };
-            let extra = if base == "line" && !d3 { "<c:marker val=\"1\"/>" } else { "" };
-            (format!("<c:{tag}><c:grouping val=\"{grouping}\"/><c:varyColors val=\"{vary}\"/>{sers}{extra}{ax}</c:{tag}>"), false)
+            let grouping = if chart.grouping == "clustered" {
+                "standard"
+            } else {
+                chart.grouping
+            };
+            let extra = if base == "line" && !d3 {
+                "<c:marker val=\"1\"/>"
+            } else {
+                ""
+            };
+            (
+                format!(
+                    "<c:{tag}><c:grouping val=\"{grouping}\"/><c:varyColors val=\"{vary}\"/>{sers}{extra}{ax}</c:{tag}>"
+                ),
+                false,
+            )
         }
         ChartKind::Bar => {
             let tag = if d3 { "bar3DChart" } else { "barChart" };
-            let grouping = if chart.grouping == "standard" { "clustered" } else { chart.grouping };
+            let grouping = if chart.grouping == "standard" {
+                "clustered"
+            } else {
+                chart.grouping
+            };
             let overlap = match chart.overlap {
                 Some(o) => format!("<c:overlap val=\"{}\"/>", o.clamp(-100, 100)),
-                None if grouping == "stacked" || grouping == "percentStacked" => "<c:overlap val=\"100\"/>".into(),
+                None if grouping == "stacked" || grouping == "percentStacked" => {
+                    "<c:overlap val=\"100\"/>".into()
+                }
                 None => String::new(),
             };
             (

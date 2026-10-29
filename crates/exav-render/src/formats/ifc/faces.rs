@@ -8,8 +8,8 @@
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use super::curves::segments;
-use super::math::{len, sub, Xf, V2, V3};
-use super::spline::{expand_knots, Spline, MAX_DEGREE};
+use super::math::{V2, V3, Xf, len, sub};
+use super::spline::{MAX_DEGREE, Spline, expand_knots};
 use super::step::Value;
 use super::triangulate::triangulate;
 use super::{Mesh, Reader};

@@ -1,11 +1,11 @@
 //! Whole workbooks: the fixture as Excel 97 saved it, encrypted here with
 //! the default password; and BIFF2 to BIFF5 files built record by record.
 
-use super::crypto::encrypt;
-use crate::formats::office::common::cfb::Compound;
 use crate::formats::office::sheets::error::Error;
 use crate::formats::office::sheets::limits::{Budget, Limits};
 use crate::formats::office::sheets::model::*;
+use exav_unpack::cfb::Compound;
+use exav_unpack::offcrypto::encrypt;
 
 const SAMPLE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),

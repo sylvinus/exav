@@ -14,7 +14,7 @@
 //! member must surface as `unsupported(encrypted=true)` (→ `PasswordProtected`),
 //! never silently clean.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const EICAR_PREFIX: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 

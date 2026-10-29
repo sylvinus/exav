@@ -9,7 +9,7 @@
 // Each reader uses some of the helpers.
 #![allow(dead_code)]
 
-use super::mesh::{cross, dot, sub, Batch, Element, Range, Scene};
+use super::mesh::{Batch, Element, Range, Scene, cross, dot, sub};
 
 /// Elements a scene may hold. Past them the triangles join the last one:
 /// a file of a million one-face groups would otherwise hold a million names.
@@ -104,15 +104,16 @@ impl Soup {
         if corners.len() == 3 {
             return self.emit(&corners[0], &corners[1], &corners[2]);
         }
-        if corners.len() <= EAR_MAX && self.work < EAR_WORK {
-            if let Some(order) = self.ears(corners) {
-                for t in order {
-                    if !self.emit(&corners[t[0]], &corners[t[1]], &corners[t[2]]) {
-                        return false;
-                    }
+        if corners.len() <= EAR_MAX
+            && self.work < EAR_WORK
+            && let Some(order) = self.ears(corners)
+        {
+            for t in order {
+                if !self.emit(&corners[t[0]], &corners[t[1]], &corners[t[2]]) {
+                    return false;
                 }
-                return true;
             }
+            return true;
         }
         for k in 1..corners.len() - 1 {
             if !self.emit(&corners[0], &corners[k], &corners[k + 1]) {

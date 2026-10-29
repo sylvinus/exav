@@ -1236,6 +1236,196 @@ fn the_baseline_still_answers_on_an_opted_in_run() {
     assert!(icap_respmod(icap, eicar()).contains("Exav.Test.EICAR"));
 }
 
+/// One clamd command answered in `limit`, or `None` when nothing came back.
+fn clamd_command_within(port: u16, command: &[u8], limit: Duration) -> Option<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(limit)).ok()?;
+    s.write_all(command).ok()?;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    // A reply ends at its terminator; the connection may stay open after it.
+    while !out.ends_with(&[0]) && !out.ends_with(b"\n") {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    (!out.is_empty()).then(|| {
+        String::from_utf8_lossy(&out)
+            .trim_end_matches('\0')
+            .trim()
+            .into()
+    })
+}
+
+/// A `PING` to the scan listener waits for a worker, and a health listener
+/// does not: with the only worker held in a job, the first gets no answer and
+/// the second, and `exav --ping` pointed at the same configuration, do.
+#[test]
+fn a_health_listener_answers_while_every_worker_is_busy() {
+    let sigs = sig_dir();
+    let (clamd, health) = (free_port(), free_port());
+    let listen = format!("clamd://127.0.0.1:{clamd}");
+    let listen_health = format!("clamd://127.0.0.1:{health}");
+    let args = [
+        "--workers",
+        "1",
+        "--listen",
+        &listen,
+        "--listen-health",
+        &listen_health,
+        "--sig-dir",
+        sigs.path().to_str().unwrap(),
+    ];
+    let _server = Server::start(TempDir::new().unwrap(), &args);
+    assert_eq!(clamd_ping(clamd), "PONG");
+    // The worker, held in an INSTREAM that never ends.
+    let mut busy = dial(clamd, "clamd");
+    busy.write_all(b"zINSTREAM\0").unwrap();
+    busy.write_all(&4u32.to_be_bytes()).unwrap();
+    busy.write_all(b"ab").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert_eq!(
+        clamd_command_within(clamd, b"zPING\0", Duration::from_secs(2)),
+        None,
+        "the scan listener has no worker to answer with"
+    );
+    let started = Instant::now();
+    let reply = until_answered("health ping", || {
+        clamd_command_within(health, b"zPING\0", Duration::from_secs(5))
+            .ok_or_else(|| io::Error::other("no reply"))
+    });
+    assert_eq!(reply, "PONG");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let version = clamd_command_within(health, b"zVERSION\0", Duration::from_secs(5)).unwrap();
+    assert!(version.starts_with("ClamAV "), "{version}");
+    let refused =
+        clamd_command_within(health, b"zSCAN /etc/passwd\0", Duration::from_secs(5)).unwrap();
+    assert!(
+        refused.contains("only PING, VERSION and STATS"),
+        "{refused}"
+    );
+
+    let ping = Command::new(exav_bin())
+        .args([
+            "--ping",
+            "--listen",
+            &listen,
+            "--listen-health",
+            &listen_health,
+        ])
+        .output()
+        .expect("run exav --ping");
+    assert!(
+        ping.status.success(),
+        "exav --ping: {}",
+        String::from_utf8_lossy(&ping.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ping.stdout).contains(&health.to_string()));
+    drop(busy);
+}
+
+/// What a process that scanned nothing reports of the pool: the scans the
+/// workers made. Each worker counted into its own
+/// memory before, so the health child (and any worker asked) said "0".
+#[test]
+fn stats_are_the_pools_from_any_process() {
+    let sigs = sig_dir();
+    let (clamd, health) = (free_port(), free_port());
+    let _server = Server::start(
+        TempDir::new().unwrap(),
+        &[
+            "--workers",
+            "3",
+            "--listen",
+            &format!("clamd://127.0.0.1:{clamd}"),
+            "--listen-health",
+            &format!("clamd://127.0.0.1:{health}"),
+            "--sig-dir",
+            sigs.path().to_str().unwrap(),
+        ],
+    );
+    for _ in 0..6 {
+        assert!(clamd_instream(clamd, eicar()).contains("FOUND"));
+    }
+    let field = |stats: &str, name: &str| -> u64 {
+        let rest = stats.split(&format!("{name} ")).nth(1).unwrap_or_default();
+        rest.split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in {stats}"))
+    };
+    let stats = |port: u16| {
+        until_answered("stats", || {
+            clamd_command_within(port, b"zSTATS\0", Duration::from_secs(5))
+                .map(|s| s.replace('\0', ""))
+                .ok_or_else(|| io::Error::other("no reply"))
+        })
+    };
+    let from_health = stats(health);
+    assert!(from_health.contains("SCANSTATS"), "{from_health}");
+    assert!(field(&from_health, "scans") >= 6, "{from_health}");
+    assert!(field(&from_health, "infected") >= 6, "{from_health}");
+    // The same from a worker, which has handled only some of the six.
+    assert!(field(&stats(clamd), "scans") >= 6);
+}
+
+#[test]
+fn an_icap_health_listener_answers_options_and_refuses_the_rest() {
+    for workers in ["1", "threads"] {
+        let sigs = sig_dir();
+        let (clamd, health) = (free_port(), free_port());
+        let _server = Server::start(
+            TempDir::new().unwrap(),
+            &[
+                "--workers",
+                workers,
+                "--listen",
+                &format!("clamd://127.0.0.1:{clamd}"),
+                "--listen-health",
+                &format!("icap://127.0.0.1:{health}"),
+                "--sig-dir",
+                sigs.path().to_str().unwrap(),
+            ],
+        );
+        let ask = |method: &str| {
+            until_answered("health request", || {
+                let mut s = dial(health, "icap health");
+                s.write_all(
+                    format!(
+                        "{method} icap://127.0.0.1:{health}/avscan ICAP/1.0\r\nHost: h\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )?;
+                let mut out = Vec::new();
+                s.read_to_end(&mut out)?;
+                Ok(String::from_utf8_lossy(&out).into_owned())
+            })
+        };
+        assert!(ask("OPTIONS").starts_with("ICAP/1.0 200 OK"), "{workers}");
+        assert!(ask("REQMOD").starts_with("ICAP/1.0 405 "), "{workers}");
+    }
+}
+
+#[test]
+fn a_health_listener_without_a_scan_listener_is_refused() {
+    let out = Command::new(exav_bin())
+        .args(["--allow-no-db", "--listen-health", "clamd://127.0.0.1:1"])
+        .output()
+        .expect("run exav");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--listen-health"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Paths outside a temp dir are never touched by this suite; the helper exists
 /// so a stray absolute path in a future test fails to compile rather than
 /// scanning the developer's disk.

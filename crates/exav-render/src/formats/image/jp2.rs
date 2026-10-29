@@ -2,7 +2,7 @@
 
 use hayro_jpeg2000::{ColorSpace, DecodeSettings, DecoderContext, Image};
 
-use super::{cmyk_to_rgb, within, ycc_to_rgb, Channels, Error, Pixels, Samples};
+use super::{Channels, Error, Pixels, Samples, cmyk_to_rgb, within, ycc_to_rgb};
 
 pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     let image = Image::new(data, &DecodeSettings::default()).map_err(|_| Error::Undecodable)?;

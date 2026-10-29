@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 /// Bytes no compressor can shrink, from a fixed seed.
 fn noise(len: usize) -> Vec<u8> {

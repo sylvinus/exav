@@ -53,7 +53,8 @@ pub(crate) mod formats;
 #[allow(unused_imports)]
 use formats::*;
 
-mod bytes;
+/// The bounds-checked little-endian cursor of the record readers.
+pub mod bytes;
 // What a build uses of it depends on the formats with a password it has.
 #[cfg(any(
     feature = "gzip",
@@ -69,9 +70,17 @@ mod bytes;
     feature = "xar",
     feature = "diskimage",
     feature = "upx",
-    feature = "dmg"
+    feature = "dmg",
+    feature = "squashfs",
+    feature = "cramfs"
 ))]
 mod inflate;
+// Each item is read by a different mix of the `decrypt`, `sevenz`, `dmg` and
+// `rar` features, so any build leaves some of them unused.
+/// HTML as tokens, and the bytes of a page as text: the one HTML reader of
+/// the scanner's text view and the converters. Feature `html`.
+#[cfg(feature = "html")]
+pub mod html;
 #[allow(dead_code)]
 mod kdf;
 #[cfg(all(test, any(feature = "dmg", feature = "ishieldz")))]
@@ -85,6 +94,18 @@ mod stream;
 #[cfg(feature = "text")]
 pub mod text;
 pub mod volume;
+/// What BIFF (Excel up to 2003) shares: the built-in function table that
+/// formula tokens name by number. Feature `ole`.
+#[cfg(feature = "ole")]
+pub use formats::biff;
+/// OLE2 compound files: the one reader of Word, Excel and PowerPoint 97 to
+/// 2003 files and the like, lenient and bounded. Feature `ole`.
+#[cfg(feature = "ole")]
+pub use formats::cfb;
+/// Text in a Windows code page number, as BIFF records and Office fonts name
+/// them. Feature `ole`.
+#[cfg(feature = "ole")]
+pub use formats::charset;
 /// AutoCAD DWG's bit codes, sections and object records, for drawing
 /// readers. Feature `dwg`.
 #[cfg(feature = "dwg")]
@@ -95,9 +116,17 @@ pub use formats::dwg;
 pub use formats::dxf;
 #[cfg(feature = "pdf")]
 pub use formats::has_obfuscated_name_object;
+/// Excel workbooks saved with a password (RC4, CryptoAPI, XOR), opened with
+/// the default password or those given. Feature `offcrypto`.
+#[cfg(feature = "offcrypto")]
+pub use formats::offcrypto;
+/// RTF's tokenizer, which the scanner's extractor of embedded objects and
+/// exav-render's converter both read with. Feature `rtf`.
+#[cfg(feature = "rtf")]
+pub use formats::rtf;
 #[allow(unused_imports)]
 pub(crate) use stream::Region;
-pub use stream::{is_budget_overflow, walk, Member, MemberMeta, Mtime, Visit};
+pub use stream::{Member, MemberMeta, Mtime, Visit, is_budget_overflow, walk};
 
 /// Count of overlapping ZIP local file records, the signal behind ClamAV's
 /// `Heuristics.Zip.OverlappingFiles`. Zero for any well-formed archive.
@@ -125,7 +154,7 @@ pub fn zip_directory_is_consistent(_data: &[u8]) -> bool {
 /// `Heuristics.XZ.DicSizeLimit`: memory a decoder must commit before producing
 /// a single byte.
 #[cfg(feature = "xz")]
-pub use formats::xz::{declared_dict_size as xz_declared_dict_size, XZ_MAX_DICT};
+pub use formats::xz::{XZ_MAX_DICT, declared_dict_size as xz_declared_dict_size};
 
 #[cfg(not(feature = "xz"))]
 pub fn xz_declared_dict_size(_data: &[u8]) -> Option<u64> {
@@ -160,6 +189,11 @@ pub fn has_obfuscated_name_object(_data: &[u8]) -> bool {
 #[cfg(feature = "rar")]
 #[doc(hidden)]
 pub use formats::{unpack29, unpack50, window_size_from_comp_info};
+// The LZO decoder of SquashFS, exposed for the fuzz target that drives it.
+// Diagnostic surface, not part of the stable API: may change in any release.
+#[cfg(feature = "squashfs")]
+#[doc(hidden)]
+pub use formats::lzo::decompress as lzo_decompress;
 
 /// Limits governing recursive extraction.
 ///
@@ -226,6 +260,11 @@ pub struct Limits {
     /// large file. Deterministic, so it trips identically on every machine
     /// (unlike a wall-clock deadline).
     pub max_scanned_bytes: u64,
+    /// What one run of a bytecode signature may hold in all: its `malloc`s
+    /// (a program frees nothing), the frames of its calls in progress, and the
+    /// globals it has read. A run that reaches it stops as incomplete. Default
+    /// 256 MiB.
+    pub max_bytecode_memory_bytes: u64,
     /// Cap on the instructions the PE stub emulator may run across the whole
     /// recursive analysis of one top-level file.
     ///
@@ -274,6 +313,7 @@ impl Default for Limits {
             // and runaway scan time, and lets a multi-gigabyte member be fully
             // scanned.
             max_scanned_bytes: 10 * 1024 * 1024 * 1024,
+            max_bytecode_memory_bytes: 256 * 1024 * 1024,
             // A few seconds to tens of seconds of emulation per top-level file,
             // against the per-stub budget of `formats::pepack`.
             max_pe_emulation_steps: 1_000_000_000,
@@ -302,8 +342,8 @@ pub struct Budget {
     pub(crate) scanned: u64,
     /// Emulator instructions spent so far (see [`Limits::max_pe_emulation_steps`]).
     pub(crate) pe_emulation_steps: u64,
-    /// PBKDF2 iterations spent so far on RAR5 passwords, across every archive of
-    /// the scan. Atomic because the RAR readers hold the budget by `&`.
+    /// PBKDF2 iterations spent so far on RAR5 and disk image passwords, across
+    /// every archive of the scan. Atomic because the readers hold the budget by `&`.
     #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
     pub(crate) kdf_rounds: std::sync::atomic::AtomicU64,
     /// What the scan has spent on 7z key derivations, and the keys it made
@@ -776,6 +816,16 @@ pub enum Format {
     /// the objects its OLE2FRAMEs embed. A drawing of an older release is
     /// one unsupported entry. See [`dwg`] (feature `dwg`).
     Dwg,
+    /// exFAT filesystem, walked, so fragmented files come back whole.
+    Exfat,
+    /// SquashFS 4 image: walked, each block decompressed as it is read.
+    Squashfs,
+    /// cramfs image: walked, each block inflated as it is read.
+    Cramfs,
+    /// romfs image: walked, its files being stored as they are.
+    Romfs,
+    /// EROFS image: walked, files stored plain or compressed with LZ4.
+    Erofs,
 }
 
 impl Format {
@@ -851,6 +901,11 @@ impl Format {
         Format::Screnc,
         Format::Dxf,
         Format::Dwg,
+        Format::Exfat,
+        Format::Squashfs,
+        Format::Cramfs,
+        Format::Romfs,
+        Format::Erofs,
     ];
 }
 
@@ -936,6 +991,11 @@ mod format_all_tests {
                 Format::Dwg => 67,
                 Format::Lzma => 68,
                 Format::Rpm => 69,
+                Format::Exfat => 70,
+                Format::Squashfs => 71,
+                Format::Cramfs => 72,
+                Format::Romfs => 73,
+                Format::Erofs => 74,
             }
         }
         let mut seen: Vec<u8> = Format::ALL.iter().map(|f| tag(*f)).collect();
@@ -943,7 +1003,7 @@ mod format_all_tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            69,
+            74,
             "Format::ALL is missing a variant (or lists one twice)"
         );
     }
@@ -1113,10 +1173,11 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         let decoded = engine
             .decode(&run)
             .or_else(|_| plain.decode(&run[..bare - usize::from(bare % 4 == 1)]));
-        if let Ok(dec) = decoded {
-            if !dec.is_empty() && dec.len() as u64 <= cap {
-                out.push(dec);
-            }
+        if let Ok(dec) = decoded
+            && !dec.is_empty()
+            && dec.len() as u64 <= cap
+        {
+            out.push(dec);
         }
     }
     out
@@ -1235,10 +1296,11 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         if run.len() % 4 == 1 {
             run.pop();
         }
-        if let Ok(dec) = engine.decode(&run) {
-            if dec.len() as u64 <= cap && is_executable_payload(&dec) {
-                out.push(dec);
-            }
+        if let Ok(dec) = engine.decode(&run)
+            && dec.len() as u64 <= cap
+            && is_executable_payload(&dec)
+        {
+            out.push(dec);
         }
     }
     out
@@ -1717,6 +1779,18 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     if formats::sniff::is_in(p, Format::AppleSingle) {
         return Some(Format::AppleSingle);
     }
+    if formats::sniff::is_in(p, Format::Squashfs) {
+        return Some(Format::Squashfs);
+    }
+    if formats::sniff::is_in(p, Format::Cramfs) {
+        return Some(Format::Cramfs);
+    }
+    if formats::sniff::is_in(p, Format::Romfs) {
+        return Some(Format::Romfs);
+    }
+    if formats::sniff::is_in(p, Format::Erofs) {
+        return Some(Format::Erofs);
+    }
     // ext last of the filesystem sniffs: its magic is 1080 bytes in, so a
     // partition table or boot sector at offset 0 is the more specific answer.
     if formats::sniff::is_in(p, Format::Ext) {
@@ -1727,6 +1801,10 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     #[cfg(feature = "fat")]
     if formats::fat::is_fat(data) {
         return Some(Format::Fat);
+    }
+    #[cfg(feature = "exfat")]
+    if formats::exfat::is_exfat(data) {
+        return Some(Format::Exfat);
     }
     if formats::sniff::is_in(p, Format::Ntfs) {
         return Some(Format::Ntfs);
@@ -1937,10 +2015,10 @@ mod detect_source_tests {
             let path = e.path();
             if path.is_dir() {
                 fixtures(&path, out);
-            } else if let Ok(data) = std::fs::read(&path) {
-                if data.len() < 8 << 20 {
-                    out.push((path.display().to_string(), data));
-                }
+            } else if let Ok(data) = std::fs::read(&path)
+                && data.len() < 8 << 20
+            {
+                out.push((path.display().to_string(), data));
             }
         }
     }
@@ -2223,10 +2301,6 @@ pub(crate) fn dispatch_extract<R>(
         Format::Rar => emit_collected(extract_rar(data, budget)?, budget, visit),
         #[cfg(feature = "upx")]
         Format::Upx => extract_upx(data, budget, visit),
-        #[cfg(feature = "xar")]
-        Format::Xar => extract_xar(data, budget, visit),
-        #[cfg(feature = "wim")]
-        Format::Wim => formats::wim::extract_wim(data, budget, visit),
         #[cfg(feature = "arc")]
         Format::Arc => formats::arc::extract_arc(data, budget, visit),
         #[cfg(feature = "ace")]
@@ -2243,8 +2317,6 @@ pub(crate) fn dispatch_extract<R>(
         | Format::CryptFf
         | Format::Lrzip
         | Format::AppleSingle => formats::reported::extract_reported(fmt, data, budget, visit),
-        #[cfg(feature = "ext")]
-        Format::Ext => formats::ext::extract_ext(data, budget, visit),
         #[cfg(feature = "zoo")]
         Format::Zoo => formats::zoo::extract_zoo(data, budget, visit),
         #[cfg(feature = "ishieldz")]
@@ -2925,8 +2997,8 @@ mod markup_payload_tests {
 #[cfg(all(test, feature = "all-formats"))]
 mod tests {
     use super::*;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::{Cursor, Write};
 
     fn gz(data: &[u8]) -> Vec<u8> {
@@ -3332,8 +3404,8 @@ mod tests {
             detect(&[0x1f, 0x8b, 0x08, 0x08, 0, 0, 0, 0]),
             Some(Format::Gzip)
         ); // FNAME set
-           // Coincidental `1f 8b` in binary data with a non-deflate CM or reserved
-           // flag bits set → not gzip (would otherwise fail inflate → UNSCANNABLE).
+        // Coincidental `1f 8b` in binary data with a non-deflate CM or reserved
+        // flag bits set → not gzip (would otherwise fail inflate → UNSCANNABLE).
         assert_eq!(detect(&[0x1f, 0x8b, 0x99, 0xff]), None); // CM != 8
         assert_eq!(detect(&[0x1f, 0x8b, 0x08, 0xe0]), None); // reserved flag bits set
         assert_eq!(detect(&[0x1f, 0x8b]), None); // too short
@@ -3472,7 +3544,7 @@ mod tests {
         // Build an OLE2/CFB with a stream holding EICAR, then extract it.
         let mut buf = Cursor::new(Vec::new());
         {
-            let mut comp = cfb::CompoundFile::create(&mut buf).unwrap();
+            let mut comp = ::cfb::CompoundFile::create(&mut buf).unwrap();
             comp.create_storage("Macros").unwrap();
             let mut s = comp.create_stream("Macros/Module1").unwrap();
             std::io::Write::write_all(&mut s, eicar()).unwrap();
@@ -3585,7 +3657,7 @@ mod tests {
         img[pvd] = 1; // type = primary
         img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
         img[pvd + 6] = 1; // version
-                          // Root directory record at PVD+156 (length 34).
+        // Root directory record at PVD+156 (length 34).
         let rd = pvd + 156;
         img[rd] = 34; // record length
         img[rd + 2..rd + 6].copy_from_slice(&17u32.to_le_bytes()); // extent LBA (LE)
@@ -3593,7 +3665,7 @@ mod tests {
         img[rd + 25] = 0x02; // flags: directory
         img[rd + 32] = 1; // name len
         img[rd + 33] = 0; // name "\0" (self)
-                          // --- Root directory at sector 17 ---
+        // --- Root directory at sector 17 ---
         let dir = 17 * S;
         let mut p = dir;
         // "." record

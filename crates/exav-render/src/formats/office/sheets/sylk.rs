@@ -215,10 +215,10 @@ fn value(k: &str) -> Value {
         "FALSE" => return Value::Bool(false),
         _ => {}
     }
-    if k.starts_with('#') {
-        if let Some(e) = CellError::parse(k) {
-            return Value::Error(e);
-        }
+    if k.starts_with('#')
+        && let Some(e) = CellError::parse(k)
+    {
+        return Value::Error(e);
     }
     match k.trim().parse::<f64>() {
         Ok(v) if v.is_finite() => Value::Number(v),
@@ -409,18 +409,17 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
                                 .split_whitespace()
                                 .filter_map(|n| n.parse().ok())
                                 .collect();
-                            if let [a, b, w] = p[..] {
-                                if a >= 1.0
-                                    && b >= a
-                                    && (0.0..=255.0).contains(&w)
-                                    && widths.len() < 4096
-                                {
-                                    widths.push((
-                                        (a - 1.0).min(f64::from(MAX_COL)) as u32,
-                                        (b - 1.0).min(f64::from(MAX_COL)) as u32,
-                                        w,
-                                    ));
-                                }
+                            if let [a, b, w] = p[..]
+                                && a >= 1.0
+                                && b >= a
+                                && (0.0..=255.0).contains(&w)
+                                && widths.len() < 4096
+                            {
+                                widths.push((
+                                    (a - 1.0).min(f64::from(MAX_COL)) as u32,
+                                    (b - 1.0).min(f64::from(MAX_COL)) as u32,
+                                    w,
+                                ));
                             }
                         }
                         "R" => row = coord(v, MAX_ROW),

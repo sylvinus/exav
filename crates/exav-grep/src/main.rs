@@ -1,7 +1,7 @@
 //! `exav-grep` — grep that can see inside archives.
 //!
 //! Familiar flags, but every ZIP/RAR/7z/tar/ISO/OLE/PDF/email it meets is
-//! descended into, recursively, in memory. Matches are reported with the nesting
+//! descended into, recursively, in bounded memory. Matches are reported with the nesting
 //! path (`backup.zip!logs.tar!app.log:42:…`) so the output stays greppable.
 //!
 //! Exit codes follow `grep`, with one addition:
@@ -80,7 +80,10 @@ struct Cli {
     #[arg(long = "passwords", value_name = "PASSWORD")]
     passwords: Vec<String>,
 
-    /// Max bytes any single member may decompress to.
+    /// Most bytes held in memory at once for one file or member (default
+    /// 256M). A member up to it is held, so a container in it can be opened;
+    /// a longer one is searched as it is read, and a container in it is
+    /// reported unreadable.
     #[arg(long = "max-object-bytes", value_name = "BYTES")]
     max_object_bytes: Option<u64>,
 

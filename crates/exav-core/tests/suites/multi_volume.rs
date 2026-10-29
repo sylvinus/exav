@@ -11,7 +11,7 @@
 //! rejoined: those bytes were withheld from the scan, and dropping them there
 //! would be a silent clean — the exact failure this scanner exists to prevent.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()

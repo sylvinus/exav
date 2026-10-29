@@ -12,11 +12,11 @@ mod tables;
 mod word6;
 
 use crate::formats::office::common::bytes::{u16_at, u32_at};
-use crate::formats::office::common::cfb::Compound;
 use crate::formats::office::docs::error::{Error, Result};
 use crate::formats::office::docs::limits::Budget;
 use crate::formats::office::docs::model::*;
-use fib::{idx, Fib, Piece};
+use exav_unpack::cfb::Compound;
+use fib::{Fib, Piece, idx};
 use std::collections::HashMap;
 
 /// An FKP entry: the bytes `lo..hi` of the WordDocument stream and the
@@ -452,17 +452,18 @@ impl Reader<'_> {
 
     fn read_bookmarks(&mut self) {
         let (o, l) = self.fib.at(idx::STTBF_BKMK);
-        if let Some(d) = self.tbl.get(o..o.saturating_add(l).min(self.tbl.len())) {
-            if u16_at(d, 0) == 0xFFFF && d.len() >= 6 {
-                let n = usize::from(u16_at(d, 2));
-                let extra = usize::from(u16_at(d, 4));
-                let mut p = 6usize;
-                for _ in 0..n.min(1 << 16) {
-                    let cch = usize::from(u16_at(d, p));
-                    let s = d.get(p + 2..p + 2 + cch * 2).unwrap_or(&[]);
-                    self.bookmark_names.push(utf16(s));
-                    p += 2 + cch * 2 + extra;
-                }
+        if let Some(d) = self.tbl.get(o..o.saturating_add(l).min(self.tbl.len()))
+            && u16_at(d, 0) == 0xFFFF
+            && d.len() >= 6
+        {
+            let n = usize::from(u16_at(d, 2));
+            let extra = usize::from(u16_at(d, 4));
+            let mut p = 6usize;
+            for _ in 0..n.min(1 << 16) {
+                let cch = usize::from(u16_at(d, p));
+                let s = d.get(p + 2..p + 2 + cch * 2).unwrap_or(&[]);
+                self.bookmark_names.push(utf16(s));
+                p += 2 + cch * 2 + extra;
             }
         }
         let (o, l) = self.fib.at(idx::PLCF_BKF);

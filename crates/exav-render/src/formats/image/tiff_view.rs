@@ -10,12 +10,12 @@
 
 use std::io::Cursor;
 
-use super::{within, Channels, Error, Pixels, Samples};
+use super::{Channels, Error, Pixels, Samples, within};
+use crate::image_codecs::tiff::ColorType;
 use crate::image_codecs::tiff::decoder::{
-    with_viewer_codecs, ChunkType, Decoder, DecodingResult, Limits,
+    ChunkType, Decoder, DecodingResult, Limits, with_viewer_codecs,
 };
 use crate::image_codecs::tiff::tags::Tag;
-use crate::image_codecs::tiff::ColorType;
 
 /// Most values looked at to find the range to stretch.
 const RANGE_SAMPLE: usize = 1 << 20;
@@ -251,7 +251,7 @@ fn fax(
     height: u32,
     max_alloc: u64,
 ) -> Result<Pixels, Error> {
-    use crate::formats::pdf_image::{decode_ccitt, CcittParams};
+    use crate::formats::pdf_image::{CcittParams, decode_ccitt};
 
     let offsets = d
         .get_tag_u64_vec(Tag::StripOffsets)
@@ -312,11 +312,7 @@ fn fax(
         for row in bits.chunks(w.div_ceil(8)).take(rows as usize) {
             grey.extend((0..w).map(|x| {
                 let white_run = row[x / 8] >> (7 - x % 8) & 1 == 1;
-                if white_run != black_is_zero {
-                    255
-                } else {
-                    0
-                }
+                if white_run != black_is_zero { 255 } else { 0 }
             }));
         }
     }

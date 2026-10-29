@@ -1,7 +1,7 @@
 //! OpenDocument drawings (ODG, OTG, FODG) as slides: one slide to a page,
 //! named as the page is, in the pages' largest size.
 
-use exav_render::slides::{convert, Error, Format, Limits};
+use exav_render::slides::{Error, Format, Limits, convert};
 use std::io::Read;
 
 fn fixture(name: &str) -> Vec<u8> {

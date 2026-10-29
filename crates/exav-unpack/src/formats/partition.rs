@@ -380,8 +380,8 @@ mod tests {
         b[3..11].copy_from_slice(b"MTOO4048");
         b[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes per sector
         b[13] = 1; // sectors per cluster
-                   // Boot code that parses as: bootable, type 0x01 (FAT12), LBA 0, 4096
-                   // sectors — i.e. a "partition" covering the entire image.
+        // Boot code that parses as: bootable, type 0x01 (FAT12), LBA 0, 4096
+        // sectors — i.e. a "partition" covering the entire image.
         b[446] = 0x80;
         b[446 + 4] = 0x01;
         b[446 + 8..446 + 12].copy_from_slice(&0u32.to_le_bytes());
@@ -438,12 +438,12 @@ mod tests {
         img[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes()); // entries_lba = 2
         img[h + 80..h + 84].copy_from_slice(&1u32.to_le_bytes()); // num_entries = 1
         img[h + 84..h + 88].copy_from_slice(&128u32.to_le_bytes()); // entry_size = 128
-                                                                    // Partition entry at sector 2.
+        // Partition entry at sector 2.
         let e = 2 * SECTOR;
         img[e] = 0xAB; // non-zero type GUID => used
         img[e + 32..e + 40].copy_from_slice(&3u64.to_le_bytes()); // first_lba = 3
         img[e + 40..e + 48].copy_from_slice(&3u64.to_le_bytes()); // last_lba  = 3
-                                                                  // Partition region at sector 3.
+        // Partition region at sector 3.
         img[3 * SECTOR..3 * SECTOR + MARKER.len()].copy_from_slice(MARKER);
         img
     }

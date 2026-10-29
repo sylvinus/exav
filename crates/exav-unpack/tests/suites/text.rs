@@ -1,8 +1,8 @@
 //! The text a reader sees in HTML, in the XML parts of Office and OpenDocument
 //! files, and in PDF.
 
-use exav_unpack::text::{extract, kind, Kind, XmlPart};
 use exav_unpack::Limits;
+use exav_unpack::text::{Kind, XmlPart, extract, kind};
 
 fn html(src: &str) -> String {
     extract(Kind::Html, src.as_bytes(), 1 << 20, &Limits::default()).text
@@ -35,7 +35,9 @@ fn blocks_are_lines_and_a_table_row_is_a_line_with_tabs() {
 #[test]
 fn scripts_styles_comments_and_templates_are_not_text() {
     assert_eq!(
-        html("a<script>var x = \"<b>no</b>\"; </script><style>p { } </style><!-- hid -->b<template><p>t</p></template>c"),
+        html(
+            "a<script>var x = \"<b>no</b>\"; </script><style>p { } </style><!-- hid -->b<template><p>t</p></template>c"
+        ),
         "abc\n"
     );
     // A raw-text element ends at its own end tag only.
@@ -48,7 +50,9 @@ fn scripts_styles_comments_and_templates_are_not_text() {
 #[test]
 fn entities_are_decoded_whatever_their_name() {
     assert_eq!(
-        html("&amp; &lt;b&gt; &hearts; &#65; &#x42; &nbsp;x &zzzz; &CounterClockwiseContourIntegral;"),
+        html(
+            "&amp; &lt;b&gt; &hearts; &#65; &#x42; &nbsp;x &zzzz; &CounterClockwiseContourIntegral;"
+        ),
         "& <b> \u{2665} A B x &zzzz; \u{2233}\n"
     );
     // The specification's legacy names need no semicolon.
@@ -176,7 +180,10 @@ fn a_word_document_is_its_paragraphs_without_field_codes_and_deleted_text() {
 #[test]
 fn slides_shared_strings_and_sheets_have_their_own_places_for_text() {
     assert_eq!(
-        xml(XmlPart::Slide, "<p:sld><a:p><a:r><a:t>Title</a:t></a:r></a:p><a:p><a:r><a:t>Body</a:t></a:r><a:br/><a:r><a:t>next</a:t></a:r></a:p></p:sld>"),
+        xml(
+            XmlPart::Slide,
+            "<p:sld><a:p><a:r><a:t>Title</a:t></a:r></a:p><a:p><a:r><a:t>Body</a:t></a:r><a:br/><a:r><a:t>next</a:t></a:r></a:p></p:sld>"
+        ),
         "Title\nBody\nnext\n"
     );
     assert_eq!(
@@ -187,7 +194,10 @@ fn slides_shared_strings_and_sheets_have_their_own_places_for_text() {
         "one\ntwo\n"
     );
     assert_eq!(
-        xml(XmlPart::Sheet, "<worksheet><sheetData><row><c t=\"s\"><v>5</v></c><c><f>HYPERLINK(\"http://x\",\"y\")</f><v>0</v></c></row><row><c t=\"inlineStr\"><is><t>z</t></is></c></row></sheetData></worksheet>"),
+        xml(
+            XmlPart::Sheet,
+            "<worksheet><sheetData><row><c t=\"s\"><v>5</v></c><c><f>HYPERLINK(\"http://x\",\"y\")</f><v>0</v></c></row><row><c t=\"inlineStr\"><is><t>z</t></is></c></row></sheetData></worksheet>"
+        ),
         "HYPERLINK(\"http://x\",\"y\")\nz\n"
     );
 }
@@ -195,7 +205,10 @@ fn slides_shared_strings_and_sheets_have_their_own_places_for_text() {
 #[test]
 fn opendocument_text_is_read_wherever_it_is() {
     assert_eq!(
-        xml(XmlPart::Odf, "<office:text><text:h>Head</text:h><text:p>a <text:span>b</text:span><text:s/>c<text:line-break/>d</text:p><table:table-row><table:table-cell><text:p>x</text:p></table:table-cell><table:table-cell><text:p>y</text:p></table:table-cell></table:table-row></office:text>"),
+        xml(
+            XmlPart::Odf,
+            "<office:text><text:h>Head</text:h><text:p>a <text:span>b</text:span><text:s/>c<text:line-break/>d</text:p><table:table-row><table:table-cell><text:p>x</text:p></table:table-cell><table:table-cell><text:p>y</text:p></table:table-cell></table:table-row></office:text>"
+        ),
         "Head\na b c\nd\nx\ty\n"
     );
 }
@@ -261,7 +274,10 @@ mod pdf {
         };
         put(&mut out, "<</Type/Catalog/Pages 2 0 R>>");
         put(&mut out, "<</Type/Pages/Kids[3 0 R]/Count 1>>");
-        put(&mut out, "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>");
+        put(
+            &mut out,
+            "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>",
+        );
         put(
             &mut out,
             &format!(

@@ -584,7 +584,10 @@ pub struct RunProps {
 /// Paragraph and run defaults for each of the nine outline levels.
 #[derive(Debug, Clone, Default)]
 pub struct ListStyle {
-    pub levels: [Option<(ParaProps, RunProps)>; 9],
+    /// Up to nine, none until one is set. Nine inline are 6 KB, which every
+    /// `TextBody` and `Sp` would take, on the stack of each function that
+    /// builds a shape and again in the memory of each shape.
+    pub levels: Vec<Option<(ParaProps, RunProps)>>,
 }
 
 impl ListStyle {

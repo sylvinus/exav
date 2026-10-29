@@ -1,8 +1,8 @@
 //! Table rows ([MS-DOC] 2.4.3): the modifiers of a row mark define its cells.
 
 use super::props::{brc, brc80, colorref, shd, shd80};
-use super::sprm::{parse, Prl};
-use crate::formats::office::common::bytes::{u16_at, Cur};
+use super::sprm::{Prl, parse};
+use crate::formats::office::common::bytes::{Cur, u16_at};
 use crate::formats::office::docs::grid::{self, CellIn, RowIn};
 use crate::formats::office::docs::model::*;
 

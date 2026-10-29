@@ -8,7 +8,7 @@ use std::fmt::Write;
 use std::time::Duration;
 
 use exav_render::mesh::Scene;
-use exav_render::obj::{read, Error};
+use exav_render::obj::{Error, read};
 use mesh_common::*;
 
 fn parse(text: &str) -> Scene {

@@ -34,7 +34,7 @@ codecs, encryption, limits.
 | lzip | `.lz` `.tlz` | Opened, members scanned | Streamed | `archive` |
 | Unix compress (.Z) | `.z` `.taz` | Opened, members scanned | Streamed | `archive` |
 | tar | `.tar` | Opened, members scanned | Streamed | `archive` |
-| 7z | `.7z` | Opened, members scanned | Read whole, members streamed | `archive` |
+| 7z | `.7z` | Opened, members scanned | Streamed | `archive` |
 | RAR (RAR3 and RAR5) | `.rar` | Opened, members scanned | Read whole | `archive` |
 | Cabinet (CAB) | `.cab` | Opened, members scanned | Streamed | `archive` |
 | Compiled HTML Help (CHM) | `.chm` | Opened, members scanned | Read whole | `archive` |
@@ -42,7 +42,7 @@ codecs, encryption, limits.
 | ARJ | `.arj` | Opened, members scanned | Read whole | `archive` |
 | ar (static libraries, Debian packages) | `.ar` `.a` `.deb` `.udeb` | Opened, members scanned | Streamed | `archive` |
 | cpio (RPM payloads, initramfs) | `.cpio` | Opened, members scanned | Streamed | `archive` |
-| xar (macOS packages) | `.xar` `.pkg` `.xip` | Opened, members scanned | Read whole | `archive` |
+| xar (macOS packages) | `.xar` `.pkg` `.xip` | Opened, members scanned | Streamed | `archive` |
 | ZOO | `.zoo` | Opened, members scanned | Read whole | `archive` |
 | ARC / PKARC / PAK | `.arc` | Opened, members scanned | Read whole | `archive` |
 | ALZ | `.alz` | Opened, members scanned | Read whole | `archive` |
@@ -66,11 +66,16 @@ codecs, encryption, limits.
 | VHDX | `.vhdx` | Opened, members scanned | Streamed | `archive` |
 | VMDK (and OVA) | `.vmdk` `.ova` | Opened, members scanned | Streamed | `archive` |
 | QCOW2 | `.qcow2` | Opened, members scanned | Streamed | `archive` |
-| Windows imaging (WIM, ESD) | `.wim` `.esd` | Opened, members scanned | Read whole | `archive` |
+| Windows imaging (WIM, ESD) | `.wim` `.esd` | Opened, members scanned | Streamed | `archive` |
 | Partition maps (GPT, APM, MBR) and raw disk images | `.img` | Opened, members scanned | Streamed | `archive` |
 | FAT12, FAT16, FAT32 |  | Opened, members scanned | Streamed | No |
 | NTFS |  | Opened, members scanned | Streamed | No |
-| ext2, ext3, ext4 |  | Opened, members scanned | Read whole | No |
+| ext2, ext3, ext4 |  | Opened, members scanned | Streamed | No |
+| exFAT |  | Opened, members scanned | Streamed | No |
+| SquashFS | `.squashfs` `.sqfs` `.snap` | Opened, members scanned | Streamed | No |
+| cramfs | `.cramfs` | Opened, members scanned | Streamed | No |
+| romfs | `.romfs` | Opened, members scanned | Streamed | No |
+| EROFS | `.erofs` | Opened, members scanned | Streamed | No |
 
 ## Installers, self-extractors and packers
 

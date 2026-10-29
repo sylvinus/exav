@@ -1,7 +1,8 @@
 #![no_main]
 //! Virtual disks and the filesystems read in place, on hostile bytes: QCOW2,
-//! VMDK, VHD and VHDX through their tables and compressed units, and NTFS, FAT
-//! and partition tables through the volume walker. The budgets are small, so an
+//! VMDK, VHD and VHDX through their tables and compressed units, and NTFS, FAT,
+//! HFS+ and APFS (in a DMG) and partition tables through the volume walker. The
+//! budgets are small, so an
 //! image of more than a few KiB declares a disk over the buffer limit and is
 //! walked in place rather than read into one member.
 //!
@@ -15,9 +16,9 @@
 //! at most 64 KiB).
 use exav_fuzz_support::extreme;
 use exav_unpack::source::BlockCache;
-use exav_unpack::{walk, Budget, ByteSource, Format, LimitHit, Limits, Member};
+use exav_unpack::{Budget, ByteSource, Format, LimitHit, Limits, Member, walk};
 use libfuzzer_sys::fuzz_target;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 libfuzzer_sys::fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
     if extreme::set_extreme_field(data, size, seed) {
@@ -27,7 +28,7 @@ libfuzzer_sys::fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, see
     }
 });
 
-const FORMATS: [Format; 7] = [
+const FORMATS: [Format; 8] = [
     Format::Qcow2,
     Format::Vmdk,
     Format::Vhd,
@@ -35,6 +36,7 @@ const FORMATS: [Format; 7] = [
     Format::Ntfs,
     Format::Fat,
     Format::Partition,
+    Format::Dmg,
 ];
 
 const BUFFER: u64 = 64 * 1024;
@@ -83,17 +85,19 @@ fn found(fmt: Format, src: &dyn ByteSource) -> Found {
         out.push((meta.name.clone(), n, meta.unsupported.is_some()));
         None::<()>
     });
-    // A panic is let through only where a read of the filesystem crate is
-    // wrapped to lose that read alone; one that reaches the walk's boundary
-    // ends the volume, and is a finding.
+    // A panic that reaches the walk's boundary ends the volume: a finding.
     if let Err(hit) = &end {
-        assert!(!hit.reason.contains("panicked"), "{fmt:?}: {}", hit.reason);
+        // Error texts may echo input bytes, so match the walk's own wording.
+        assert!(
+            !hit.reason.ends_with(" decoder panicked on malformed input"),
+            "{fmt:?}: {}",
+            hit.reason
+        );
     }
     (out, end.map(|_| ()))
 }
 
 fuzz_target!(|data: &[u8]| {
-    exav_fuzz_support::panics::tolerate_inside(exav_fuzz_support::panics::CONTAINED);
     let Some((&pick, image)) = data.split_first() else {
         return;
     };
@@ -108,7 +112,10 @@ fuzz_target!(|data: &[u8]| {
         // The same members, in the same order; the same end, or both ended in an
         // error (its text names offsets the cache does not change, but not what
         // a block boundary does).
-        assert_eq!(mem.0, via_cache.0, "{fmt:?}: the cache changed what was found");
+        assert_eq!(
+            mem.0, via_cache.0,
+            "{fmt:?}: the cache changed what was found"
+        );
         assert_eq!(
             mem.1.is_err(),
             via_cache.1.is_err(),

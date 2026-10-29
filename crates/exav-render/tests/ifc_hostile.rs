@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use exav_render::ifc::{read, Limits};
+use exav_render::ifc::{Limits, read};
 use exav_render::mesh::Scene;
 
 /// Instances numbered from #100 under a context, a placement (#5) and a

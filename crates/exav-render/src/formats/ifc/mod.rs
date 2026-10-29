@@ -35,9 +35,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
-use self::math::{cross, unit, Xf, V3};
+use self::math::{V3, Xf, cross, unit};
 use self::step::{StepFile, Value};
-use super::mesh::{Element, Node, Part, Scene, SceneBuilder, Warnings, DEFAULT_MAX_TRIANGLES};
+use super::mesh::{DEFAULT_MAX_TRIANGLES, Element, Node, Part, Scene, SceneBuilder, Warnings};
 
 /// How much a reader may produce.
 #[derive(Debug, Clone, Copy)]
@@ -219,11 +219,7 @@ impl Mesh {
                             self.p[t[2] as usize],
                         );
                         let v = math::dot(a, cross(b, c));
-                        if turn[i] == Some(true) {
-                            -v
-                        } else {
-                            v
-                        }
+                        if turn[i] == Some(true) { -v } else { v }
                     })
                     .sum();
                 if volume < 0.0 {

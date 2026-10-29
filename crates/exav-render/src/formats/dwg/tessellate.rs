@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::cad::{
     Color, Drawing as CadDrawing, Edge, Entity, EntityKind, HAlign, Handle, LineWeight,
-    PolylineKind, Transparency, VAlign, MODEL_SPACE, PAPER_SPACE,
+    MODEL_SPACE, PAPER_SPACE, PolylineKind, Transparency, VAlign,
 };
 
 use super::clip::ClipShape;
@@ -14,11 +14,11 @@ use super::fill;
 use super::font;
 use super::gradient::{self, Gradient};
 use super::hatch;
-use super::linetype::{self, dash_polyline, Pattern};
+use super::linetype::{self, Pattern, dash_polyline};
 use super::palette::Palette;
 use super::proxy;
 use super::scene::{
-    encode_fade_spacing, pack_attr, pack_rgba, Affine, Scene, FILL_FLAG_BACKGROUND, FLAG_CONTRAST,
+    Affine, FILL_FLAG_BACKGROUND, FLAG_CONTRAST, Scene, encode_fade_spacing, pack_attr, pack_rgba,
 };
 use super::text;
 use super::wide::{self, WideVertex};
@@ -1696,14 +1696,12 @@ impl<'a> Tessellator<'a> {
 
         let roots = self.in_draw_order(entities);
         for e in roots {
-            if paper {
-                if let EntityKind::Viewport(v) = &e.kind {
-                    self.scene.order = self.scene.order.saturating_add(1);
-                    if Some(e.handle.0) != sheet_view {
-                        self.viewport(v);
-                    }
-                    continue;
+            if paper && let EntityKind::Viewport(v) = &e.kind {
+                self.scene.order = self.scene.order.saturating_add(1);
+                if Some(e.handle.0) != sheet_view {
+                    self.viewport(v);
                 }
+                continue;
             }
             self.entity(e, &ctx);
         }
@@ -2566,40 +2564,37 @@ impl<'a> Tessellator<'a> {
         } else {
             1.0
         };
-        if stretched {
-            if let Some(second) = t.alignment_point {
-                let first = t.insertion;
-                let span = (second.x - first.x).hypot(second.y - first.y);
-                let natural =
-                    font::Metrics::for_face(face).measure(&value) * t.height * width_factor;
-                if span > 1e-9 && natural > 1e-9 {
-                    let factor = span / natural;
-                    let fit = t.h_align == HAlign::Fit;
-                    let frame = text::generated_frame(
-                        if fit { t.height } else { t.height * factor },
-                        (second.y - first.y).atan2(second.x - first.x),
-                        if fit {
-                            width_factor * factor
-                        } else {
-                            width_factor
-                        },
-                        t.oblique,
-                        t.generation,
-                    );
-                    self.push_text_run(
-                        value,
-                        first.x,
-                        first.y,
-                        frame,
-                        text::HAlign::Left,
-                        text::VAlign::Baseline,
-                        ctx,
-                        rgba,
-                        attr,
-                        face,
-                    );
-                    return;
-                }
+        if stretched && let Some(second) = t.alignment_point {
+            let first = t.insertion;
+            let span = (second.x - first.x).hypot(second.y - first.y);
+            let natural = font::Metrics::for_face(face).measure(&value) * t.height * width_factor;
+            if span > 1e-9 && natural > 1e-9 {
+                let factor = span / natural;
+                let fit = t.h_align == HAlign::Fit;
+                let frame = text::generated_frame(
+                    if fit { t.height } else { t.height * factor },
+                    (second.y - first.y).atan2(second.x - first.x),
+                    if fit {
+                        width_factor * factor
+                    } else {
+                        width_factor
+                    },
+                    t.oblique,
+                    t.generation,
+                );
+                self.push_text_run(
+                    value,
+                    first.x,
+                    first.y,
+                    frame,
+                    text::HAlign::Left,
+                    text::VAlign::Baseline,
+                    ctx,
+                    rgba,
+                    attr,
+                    face,
+                );
+                return;
             }
         }
 
@@ -2850,18 +2845,18 @@ impl<'a> Tessellator<'a> {
         attr: u32,
         pattern: Option<&Pattern>,
     ) {
-        if pattern.is_none() {
-            if let Some((scale, turn, mirrored)) = similarity(xf) {
-                let c = xf.apply(cx, cy);
-                let (start, sweep) = if mirrored {
-                    (turn - start, -sweep)
-                } else {
-                    (start + turn, sweep)
-                };
-                self.scene
-                    .push_arc(c[0], c[1], r * scale, start, sweep, rgba, attr);
-                return;
-            }
+        if pattern.is_none()
+            && let Some((scale, turn, mirrored)) = similarity(xf)
+        {
+            let c = xf.apply(cx, cy);
+            let (start, sweep) = if mirrored {
+                (turn - start, -sweep)
+            } else {
+                (start + turn, sweep)
+            };
+            self.scene
+                .push_arc(c[0], c[1], r * scale, start, sweep, rgba, attr);
+            return;
         }
         let pts = curves::arc_points(cx, cy, r, start, sweep);
         self.push_transformed(&pts, false, xf, rgba, attr, pattern);
@@ -2987,8 +2982,8 @@ impl<'a> Tessellator<'a> {
                     for part in *parts {
                         match part {
                             linetype::ShapePart::Line(ps) => {
-                                for w in ps.windows(2) {
-                                    let (a, b) = (at(w[0]), at(w[1]));
+                                for &[p, q] in ps.array_windows() {
+                                    let (a, b) = (at(p), at(q));
                                     self.scene.push_stroke(a[0], a[1], b[0], b[1], rgba, attr);
                                 }
                             }
@@ -3340,10 +3335,10 @@ impl<'a> Tessellator<'a> {
             depth: ctx.depth + 1,
         };
         for a in &ins.attributes {
-            if let EntityKind::Attribute(at) = &a.kind {
-                if !at.is_invisible() {
-                    self.entity(a, &attr_ctx);
-                }
+            if let EntityKind::Attribute(at) = &a.kind
+                && !at.is_invisible()
+            {
+                self.entity(a, &attr_ctx);
             }
         }
     }
@@ -3979,10 +3974,11 @@ mod tests {
         let wide = tessellated(EntityKind::LwPolyline(line(2.0)));
         // Only the band's four edges, which anti-alias it.
         assert_eq!(wide.strokes.len(), 4);
-        assert!(wide
-            .strokes
-            .iter()
-            .all(|s| (s.attr >> 16) as u8 == super::super::scene::FILL_EDGE));
+        assert!(
+            wide.strokes
+                .iter()
+                .all(|s| (s.attr >> 16) as u8 == super::super::scene::FILL_EDGE)
+        );
         assert!(
             (fill_area(&wide) - 20.0).abs() < 1e-9,
             "{}",

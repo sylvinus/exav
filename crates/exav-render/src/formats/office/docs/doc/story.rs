@@ -4,7 +4,7 @@
 use super::fib::{self, idx};
 use super::props::*;
 use super::sprm::parse;
-use super::tables::{parse_tap, Tap};
+use super::tables::{Tap, parse_tap};
 use super::{Reader, Run as FkpRun};
 use crate::formats::office::common::bytes::u16_at;
 use crate::formats::office::docs::error::Result;
@@ -146,13 +146,12 @@ impl Reader<'_> {
         let mut start = 0;
         for i in 0..n.saturating_sub(1) {
             let end = self.sections[i].cp1;
-            if end <= start {
-                if let Some(src) = self.sect_ready[i].take() {
-                    if let Some(dst) = self.sect_ready[i + 1].as_mut() {
-                        inherit(&mut dst.headers, src.headers, dst.title_page, self.facing);
-                        inherit(&mut dst.footers, src.footers, dst.title_page, self.facing);
-                    }
-                }
+            if end <= start
+                && let Some(src) = self.sect_ready[i].take()
+                && let Some(dst) = self.sect_ready[i + 1].as_mut()
+            {
+                inherit(&mut dst.headers, src.headers, dst.title_page, self.facing);
+                inherit(&mut dst.footers, src.footers, dst.title_page, self.facing);
             }
             start = end;
         }
@@ -546,12 +545,12 @@ impl Reader<'_> {
         };
         let mut istd = 0u16;
         let mut g = vec![];
-        if let Some(r) = Self::lookup(&self.papx, fc) {
-            if r.len >= 2 {
-                let b = &self.wd[r.off as usize..r.off as usize + usize::from(r.len)];
-                istd = u16_at(b, 0);
-                g.extend_from_slice(&b[2..]);
-            }
+        if let Some(r) = Self::lookup(&self.papx, fc)
+            && r.len >= 2
+        {
+            let b = &self.wd[r.off as usize..r.off as usize + usize::from(r.len)];
+            istd = u16_at(b, 0);
+            g.extend_from_slice(&b[2..]);
         }
         if let Some(pi) = self.piece_index(cp) {
             g.extend(self.prm_grpprl(pi));
@@ -629,12 +628,11 @@ impl Reader<'_> {
             }
             let end = e.min(hi - 1);
             let mut rec = self.para_rec(p, end, story)?;
-            if in_main {
-                if let Some(i) = self.section_ending_at(end + 1) {
-                    if let (Some(para), Some(s)) = (rec.para.as_mut(), self.sect_ready[i].take()) {
-                        para.section = Some(Box::new(s));
-                    }
-                }
+            if in_main
+                && let Some(i) = self.section_ending_at(end + 1)
+                && let (Some(para), Some(s)) = (rec.para.as_mut(), self.sect_ready[i].take())
+            {
+                para.section = Some(Box::new(s));
             }
             let first_depth = rec.depth;
             // Close tables deeper than this paragraph; open new ones.
@@ -776,10 +774,10 @@ impl Reader<'_> {
                 f.h_anchor = Some("text");
                 f.v_anchor = Some("text");
             }
-        } else if let Some(f) = aux.frame {
-            if f.width.is_some() || f.x.is_some() || f.x_align.is_some() || f.y.is_some() {
-                pp.frame = Some(f);
-            }
+        } else if let Some(f) = aux.frame
+            && (f.width.is_some() || f.x.is_some() || f.x_align.is_some() || f.y.is_some())
+        {
+            pp.frame = Some(f);
         }
         // The paragraph mark's formatting.
         let base = self.base_rpr(istd, None);
@@ -970,8 +968,11 @@ impl Reader<'_> {
                     flush!();
                     out.push(Inline::FieldChar(FieldCharKind::End));
                 }
-                0x01 if span.aux.spec && !span.aux.data && span.aux.pic_loc.is_some() => {
-                    if let Some(d) = self.inline_picture(span.aux.pic_loc.unwrap_or(0))? {
+                0x01 if span.aux.spec
+                    && !span.aux.data
+                    && let Some(loc) = span.aux.pic_loc =>
+                {
+                    if let Some(d) = self.inline_picture(loc)? {
                         items.push(RunItem::Drawing(Box::new(d)));
                     }
                 }
@@ -996,8 +997,9 @@ impl Reader<'_> {
                         items.push(RunItem::Drawing(Box::new(d)));
                     }
                 }
-                0x28 if span.aux.spec && span.aux.symbol.is_some() => {
-                    let (ftc, ch) = span.aux.symbol.unwrap_or((0, 0));
+                0x28 if span.aux.spec
+                    && let Some((ftc, ch)) = span.aux.symbol =>
+                {
                     let font = self
                         .fonts
                         .get(usize::from(ftc))
@@ -1045,16 +1047,16 @@ impl Reader<'_> {
                 c => {
                     // A surrogate pair stays whole across atoms.
                     if (0xD800..0xDC00).contains(&c) {
-                        if let Some(n) = atoms.get(i + 1) {
-                            if (0xDC00..0xE000).contains(&n.ch) {
-                                let ch = char::decode_utf16([c, n.ch])
-                                    .next()
-                                    .and_then(|r| r.ok())
-                                    .unwrap_or('\u{FFFD}');
-                                text.push(ch);
-                                i += 2;
-                                continue;
-                            }
+                        if let Some(n) = atoms.get(i + 1)
+                            && (0xDC00..0xE000).contains(&n.ch)
+                        {
+                            let ch = char::decode_utf16([c, n.ch])
+                                .next()
+                                .and_then(|r| r.ok())
+                                .unwrap_or('\u{FFFD}');
+                            text.push(ch);
+                            i += 2;
+                            continue;
                         }
                         text.push('\u{FFFD}');
                     } else if let Some(ch) = char::from_u32(u32::from(c)) {

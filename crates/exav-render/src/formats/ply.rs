@@ -19,7 +19,7 @@
 use std::fmt;
 
 use super::mesh::Scene;
-use super::soup::{number, Corner, Soup};
+use super::soup::{Corner, Soup, number};
 
 /// Why a file was not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,16 +345,17 @@ pub fn read(bytes: &[u8], max_triangles: usize) -> Result<Scene, Error> {
         Ok(scene) => scene.warnings.damaged || scene.warnings.invalid > 0,
         Err(error) => matches!(error, Error::Invalid(_)),
     };
-    if dirty && header(bytes).is_ok_and(|h| h.format == Format::Ascii) {
-        if let Ok(lines) = read_records(bytes, max_triangles, true) {
-            let clean = !lines.warnings.damaged && lines.warnings.invalid == 0;
-            let better = match &first {
-                Err(_) => true,
-                Ok(f) => clean || lines.triangles() > f.triangles(),
-            };
-            if better {
-                return Ok(lines);
-            }
+    if dirty
+        && header(bytes).is_ok_and(|h| h.format == Format::Ascii)
+        && let Ok(lines) = read_records(bytes, max_triangles, true)
+    {
+        let clean = !lines.warnings.damaged && lines.warnings.invalid == 0;
+        let better = match &first {
+            Err(_) => true,
+            Ok(f) => clean || lines.triangles() > f.triangles(),
+        };
+        if better {
+            return Ok(lines);
         }
     }
     first

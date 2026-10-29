@@ -1,11 +1,11 @@
 //! Pictures and shapes: inline pictures in the data stream and floating
 //! shapes in the drawing layer ([MS-DOC] 2.9.190, 2.9.253, [MS-ODRAW]).
 
+use super::Reader;
 use super::fib::idx;
 use super::story::Story;
-use super::Reader;
 use crate::formats::office::common::bytes::{u16_at, u32_at};
-use crate::formats::office::common::escher::{self, read_at, Rec};
+use crate::formats::office::common::escher::{self, Rec, read_at};
 use crate::formats::office::common::image;
 use crate::formats::office::docs::error::Result;
 use crate::formats::office::docs::model::*;
@@ -241,23 +241,23 @@ impl Reader<'_> {
                 .copied()
                 .flatten()
                 .and_then(|r| escher::blip(&r));
-            if let Some(blip) = blip {
-                if let Some(media) = self.add_blip(blip)? {
-                    let crop = Crop {
-                        t: p.get(0x0100).map(fixed).unwrap_or(0),
-                        b: p.get(0x0101).map(fixed).unwrap_or(0),
-                        l: p.get(0x0102).map(fixed).unwrap_or(0),
-                        r: p.get(0x0103).map(fixed).unwrap_or(0),
-                    };
-                    return Ok(Some(Drawing {
-                        anchor: Some(anchor),
-                        cx,
-                        cy,
-                        name: "Picture".into(),
-                        descr: None,
-                        kind: DrawingKind::Picture { media, crop },
-                    }));
-                }
+            if let Some(blip) = blip
+                && let Some(media) = self.add_blip(blip)?
+            {
+                let crop = Crop {
+                    t: p.get(0x0100).map(fixed).unwrap_or(0),
+                    b: p.get(0x0101).map(fixed).unwrap_or(0),
+                    l: p.get(0x0102).map(fixed).unwrap_or(0),
+                    r: p.get(0x0103).map(fixed).unwrap_or(0),
+                };
+                return Ok(Some(Drawing {
+                    anchor: Some(anchor),
+                    cx,
+                    cy,
+                    name: "Picture".into(),
+                    descr: None,
+                    kind: DrawingKind::Picture { media, crop },
+                }));
             }
         }
         // A text box or an autoshape.
@@ -329,12 +329,11 @@ impl Reader<'_> {
             if b > a + 1 {
                 let mut blocks = self.story_blocks(a, b, Story::Textbox)?;
                 // The mark that ends the text box is not a paragraph of it.
-                if blocks.len() > 1 {
-                    if let Some(Block::Para(last)) = blocks.last() {
-                        if last.content.is_empty() {
-                            blocks.pop();
-                        }
-                    }
+                if blocks.len() > 1
+                    && let Some(Block::Para(last)) = blocks.last()
+                    && last.content.is_empty()
+                {
+                    blocks.pop();
                 }
                 sh.text = blocks;
             }

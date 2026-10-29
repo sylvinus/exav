@@ -292,9 +292,12 @@ detection. A macro sheet is a `BOUNDSHEET` record (`0x0085`) with sheet type 1,
 and the macros are `FORMULA` records holding `ptg` token streams in which built-in
 functions (`EXEC`, `CALL`, `ALERT`) are numeric ids. The bytes `EXEC` never
 appear in the file, so a byte-pattern signature for them cannot match. exav walks
-the record stream and produces an artifact with the macro-sheet names, the string
-constants and each formula's tokens with function ids decoded back to names, so
-signatures match the real calls and `--detect macros` fires for XLM as for VBA.
+the record stream with the reader the XLS converter uses and produces an artifact
+with the macro-sheet names, the defined names, the text cells and each formula as
+Excel shows it (`=EXEC("calc.exe")`), function ids decoded back to names, so
+signatures match the real calls and `--detect macros` fires for XLM as for VBA. A
+formula the reader cannot finish still gives the calls and strings it read before
+the token it could not.
 
 Other content that must be decoded before any signature can see it:
 

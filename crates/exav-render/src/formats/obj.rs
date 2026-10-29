@@ -18,7 +18,7 @@
 use std::fmt;
 
 use super::mesh::Scene;
-use super::soup::{number, unit_byte, Corner, Soup};
+use super::soup::{Corner, Soup, number, unit_byte};
 
 /// Why a file was not read.
 #[derive(Debug, Clone, PartialEq, Eq)]

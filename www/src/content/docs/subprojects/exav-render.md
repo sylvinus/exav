@@ -175,7 +175,7 @@ except an XLS encrypted with Excel's default password, which opens.
 |---|---|---|
 | `sheets` | XLSX | Excel 2.x to 2003 (BIFF2 to BIFF8, templates and workspaces; a lenient compound file reader), ODS, FODS and OTS, Apple Numbers (3 and later, '08 and '09), and the text formats Excel opens from a .xls name: XML Spreadsheet 2003, HTML tables and SYLK |
 | `slides` | PPTX | PowerPoint 95 and 97 to 2003 (.ppt, .pps, .pot; 2 to 4 are recognised and reported as unsupported), ODP, FODP and OTP, Apple Keynote of every version; and drawings: ODG, OTG and FODG, and Visio 2013 and later (VSDX, VSDM, VSTX, VSTM) |
-| `docs` | DOCX | Word 6 to 2003 (.doc, .dot), ODT, OTT and FODT, RTF, Word 2003 XML and Apple Pages (text, page size and margins) |
+| `docs` | DOCX | Word 6 to 2003 (.doc, .dot), ODT, OTT and FODT, RTF, Word 2003 XML, Word's HTML (and its MHT form) and Apple Pages (text, page size and margins) |
 
 What each keeps:
 
@@ -260,11 +260,10 @@ The median document of `docs` takes 0.36 ms to read and 0.52 ms to convert.
 
 ### In the viewer
 
-The wasm modules are `exav_viewer_sheets` (1,081,680 bytes, 450,494 brotli),
-`exav_viewer_slides` (1,015,358 bytes, 434,088 brotli; it was 891,741 bytes
-before the Visio reader) and `exav_viewer_docs` (826,632 bytes, 359,102
-brotli). Each is built with a 2 GiB memory cap and imports nothing but
-wasm-bindgen's plumbing ([Security](/viewer/security/)).
+The converters are the wasm modules `exav_viewer_sheets`, `exav_viewer_slides`
+and `exav_viewer_docs` (sizes on the [viewer's Integration page](/viewer/integration/#two-kinds-of-files)).
+Each is built with a 2 GiB memory cap and imports nothing but wasm-bindgen's
+plumbing ([Security](/viewer/security/)).
 
 ## Text
 

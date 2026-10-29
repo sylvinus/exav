@@ -8,7 +8,7 @@
 //! them. Every panic is a finding, and so is an output that is not an XLSX.
 use std::io::Write;
 
-use exav_render::sheets::{convert, Format};
+use exav_render::sheets::{Format, convert};
 use libfuzzer_sys::fuzz_target;
 
 #[path = "sheets_check.rs"]

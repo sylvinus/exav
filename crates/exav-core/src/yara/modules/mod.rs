@@ -445,7 +445,7 @@ pub(crate) fn resolve_func(module: ModuleKind, name: &str, args: &[Cond]) -> Res
                         "unsupported pe.imports() overload (only string dll, \
                          (dll, func) and (dll, ordinal) forms are implemented; \
                          regexp and import_flags forms are not)",
-                    ))
+                    ));
                 }
             },
             "exports" => match kinds.as_slice() {
@@ -456,7 +456,7 @@ pub(crate) fn resolve_func(module: ModuleKind, name: &str, args: &[Cond]) -> Res
                         "unsupported pe.exports() overload (only string name and \
                          integer ordinal forms are implemented; the regexp form \
                          is not)",
-                    ))
+                    ));
                 }
             },
             "section_index" if kinds.as_slice() == [ArgKind::Str] => FuncId::PeSectionIndexName,

@@ -189,10 +189,10 @@ impl<'a> Lexer<'a> {
                 if let Ok(b) = u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("0"), 16) {
                     result.push(b);
                 }
-            } else if pair.len() == 1 {
-                if let Ok(b) = u8::from_str_radix(&format!("{}0", char::from(pair[0])), 16) {
-                    result.push(b);
-                }
+            } else if pair.len() == 1
+                && let Ok(b) = u8::from_str_radix(&format!("{}0", char::from(pair[0])), 16)
+            {
+                result.push(b);
             }
         }
         result
@@ -282,14 +282,14 @@ impl<'a> Lexer<'a> {
         let mut name = String::with_capacity(raw.len());
         let mut i = 0;
         while i < raw.len() {
-            if raw[i] == b'#' && i + 2 < raw.len() {
-                if let Ok(b) =
+            if raw[i] == b'#'
+                && i + 2 < raw.len()
+                && let Ok(b) =
                     u8::from_str_radix(std::str::from_utf8(&raw[i + 1..i + 3]).unwrap_or("0"), 16)
-                {
-                    name.push(b as char);
-                    i += 3;
-                    continue;
-                }
+            {
+                name.push(b as char);
+                i += 3;
+                continue;
             }
             name.push(raw[i] as char);
             i += 1;
@@ -335,24 +335,24 @@ impl<'a> Lexer<'a> {
             }
             // Try to read: number number obj
             let saved = self.pos;
-            if let Token::Integer(n) = self.read_number() {
-                if n >= 0 {
+            if let Token::Integer(n) = self.read_number()
+                && n >= 0
+            {
+                self.skip_whitespace();
+                if self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
+                    // This might be the generation number
+                    let gen_start = self.pos;
+                    while self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
+                        self.pos += 1;
+                    }
+                    let r#gen: u32 = std::str::from_utf8(&self.data[gen_start..self.pos])
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
                     self.skip_whitespace();
-                    if self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
-                        // This might be the generation number
-                        let gen_start = self.pos;
-                        while self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
-                            self.pos += 1;
-                        }
-                        let gen: u32 = std::str::from_utf8(&self.data[gen_start..self.pos])
-                            .unwrap_or("0")
-                            .parse()
-                            .unwrap_or(0);
-                        self.skip_whitespace();
-                        if self.starts_with(b"obj") {
-                            self.pos += 3;
-                            return Some((n as u32, gen, self.pos));
-                        }
+                    if self.starts_with(b"obj") {
+                        self.pos += 3;
+                        return Some((n as u32, r#gen, self.pos));
                     }
                 }
             }

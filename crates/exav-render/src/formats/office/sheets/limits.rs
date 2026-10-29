@@ -50,10 +50,19 @@ pub(crate) struct Budget {
     pub limits: Limits,
     cells: u64,
     memory: u64,
+    swept: u64,
+    max_swept: u64,
 }
 
-/// What one cell costs in the model, beyond its strings.
-pub(crate) const CELL_BYTES: u64 = 96;
+/// What one cell costs in the model, beyond its strings: the cell, its key and
+/// the room a tree of cells has beyond them. Measured: a workbook of cells
+/// that hold one short string each takes about 190 bytes a cell in all, the
+/// string among them (`tests/office_memory.rs` keeps it so).
+pub(crate) const CELL_BYTES: u64 = 160;
+
+/// Columns the formatting of empty cells may be checked over, in all: a
+/// couple of seconds.
+const MAX_SWEPT: u64 = 1 << 26;
 
 impl Budget {
     pub fn new(limits: Limits) -> Self {
@@ -61,7 +70,25 @@ impl Budget {
             limits,
             cells: 0,
             memory: 0,
+            swept: 0,
+            max_swept: MAX_SWEPT,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_max_swept(mut self, columns: u64) -> Self {
+        self.max_swept = columns;
+        self
+    }
+
+    /// Whether `columns` more may be checked, counting them if so.
+    pub fn sweep(&mut self, columns: u64) -> bool {
+        let total = self.swept.saturating_add(columns);
+        if total > self.max_swept {
+            return false;
+        }
+        self.swept = total;
+        true
     }
 
     /// One more cell, and `extra` bytes of its own text.
@@ -80,6 +107,16 @@ impl Budget {
             return Err(Error::TooLarge("memory"));
         }
         Ok(())
+    }
+
+    /// What `xml::parse` charges the memory of a tree to.
+    pub fn tree(&mut self) -> impl FnMut(u64) -> bool + '_ {
+        |bytes| self.alloc(bytes).is_ok()
+    }
+
+    /// Memory counted so far.
+    pub fn used(&self) -> u64 {
+        self.memory
     }
 
     /// Whether `n` more cells would still fit, without counting them.

@@ -818,8 +818,8 @@ enum Slot {
 /// One `/digit` entry. `None` is a digit the group does not define.
 type Grp = Option<(Mn, F)>;
 
-use Slot::{Bad as X, B, G, I};
 use F::*;
+use Slot::{B, Bad as X, G, I};
 
 const NIL: Grp = None;
 
@@ -2802,9 +2802,11 @@ mod tests {
     /// the group's instruction with an invented operand instead of `vmcall`.
     #[test]
     fn the_modrm_keyed_table_is_sorted() {
-        assert!(generated::OF_MOD3
-            .windows(2)
-            .all(|w| (w[0].0, w[0].1, w[0].2) < (w[1].0, w[1].1, w[1].2)));
+        assert!(
+            generated::OF_MOD3
+                .array_windows()
+                .all(|[a, b]| (a.0, a.1, a.2) < (b.0, b.1, b.2))
+        );
     }
 
     /// `Mn` compares by index, so one name must never have two.

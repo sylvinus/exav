@@ -3,7 +3,7 @@
 
 use hayro_jbig2::{DecodeError, Decoder, FormatError, Image};
 
-use super::{row_bytes, Error};
+use super::{Error, row_bytes};
 
 /// The page as `height` rows of `width` bits (the image dictionary's size),
 /// 1 for white, each row padded to a byte with 1s. A page of another size is
@@ -36,7 +36,7 @@ pub fn decode_jbig2(
     let image = match Image::new_embedded(data, globals) {
         Ok(image) => image,
         Err(DecodeError::Format(FormatError::MissingPageInfo)) => {
-            return Ok(vec![0xFF; out_len as usize])
+            return Ok(vec![0xFF; out_len as usize]);
         }
         Err(_) => return Err(failed()),
     };

@@ -7,9 +7,8 @@ import { Steps } from '@astrojs/starlight/components';
 
 exav runs on Linux, macOS and Windows and ships as a single binary. The Linux
 release builds are static (musl); the macOS and Windows builds link the system
-libraries. On Windows there is no prefork worker pool, no per-job limits
-(`--max-scan-secs`, `--max-process-bytes`) and no `--auto-update`, which are
-Unix only.
+libraries. The prefork worker pool, the per-job limits (`--max-scan-secs`,
+`--max-process-bytes`) and `--auto-update` are Unix only.
 
 ## Prebuilt binaries
 
@@ -28,12 +27,12 @@ sudo install -m755 exav /usr/local/bin/exav
 exav --version
 ```
 
-They are the default build, without HTTP support: to fetch signatures with
-`--auto-update` or scan URLs, build with `--features http` below.
+The binaries are the default build, without HTTP support. To fetch signatures
+with `--auto-update` or scan URLs, build with `--features http` (below).
 
 Every archive carries the `LICENSE` and the `NOTICE` of what the binary links.
-The same releases carry the other tools in archives of their own, each
-installed as its page says: [exav-unpack](/unpack/cli/),
+The same releases carry the other tools in archives of their own, installed as
+their pages say: [exav-unpack](/unpack/cli/),
 [exav-grep](/subprojects/exav-grep/), [exav-pe-emu](/subprojects/exav-pe-emu/#cli)
 and [exav-imagehash](/subprojects/exav-imagehash/).
 
@@ -87,7 +86,7 @@ scanning and signature auto-update):
 cargo build --release -p exav --features http
 ```
 
-For a smaller binary without YARA, DLP, the phishing heuristic or ICAP:
+For a smaller binary with only the archive formats and decryption:
 
 ```sh
 cargo build --release -p exav --no-default-features --features all-formats,decrypt

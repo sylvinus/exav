@@ -252,9 +252,11 @@ fn pixels_hash_as_the_file_does() {
             "{preset:?}"
         );
     }
-    assert!(Hasher::new(Preset::ClamAv)
-        .hash_rgb8(97, 61, &[0; 5])
-        .is_err());
+    assert!(
+        Hasher::new(Preset::ClamAv)
+            .hash_rgb8(97, 61, &[0; 5])
+            .is_err()
+    );
 }
 
 /// Dimensions are the caller's: ones whose pixel count does not fit a `usize`
@@ -322,9 +324,11 @@ fn bad_params_are_refused() {
             "{p:?}"
         );
     }
-    assert!(Hasher::with_params(Params {
-        keep_dc: false,
-        ..Params::CLAMAV
-    })
-    .is_ok());
+    assert!(
+        Hasher::with_params(Params {
+            keep_dc: false,
+            ..Params::CLAMAV
+        })
+        .is_ok()
+    );
 }

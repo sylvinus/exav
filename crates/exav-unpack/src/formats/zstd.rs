@@ -6,7 +6,7 @@ use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
 use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
 use crate::source::{ByteSource, Reader};
-use crate::stream::{emit_stream, single_meta, Visit};
+use crate::stream::{Visit, emit_stream, single_meta};
 use crate::{Budget, LimitHit};
 
 pub(crate) fn walk<T>(
@@ -136,8 +136,8 @@ impl<R: Read> Read for ZstdReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{extract, Budget, Format, Limits};
-    use ruzstd::encoding::{compress_to_vec, CompressionLevel};
+    use crate::{Budget, Format, Limits, extract};
+    use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
     #[test]
     fn every_frame_is_decoded() {

@@ -11,7 +11,7 @@
 //! a member exav could not read is content it did not examine, and reporting the
 //! containing file clean on that basis is exactly the silent-clean bug.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()

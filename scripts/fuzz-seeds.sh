@@ -33,7 +33,7 @@ SKIP="crates/exav-unpack/tests/fixtures/rar/ppmd_lzss_conversion.rar"
 
 cd "$ROOT"
 rm -rf "$OUT"
-mkdir -p "$OUT"/{containers,pe,drawing,imagehash,raw_preview,cad_dxf,cad_dwg,ifc,mesh,markdown,visible_text,full_pipeline,seekable,volumes,vdisk,yara,pcre,cvd,database,authenticode,sheets_xls,sheets_ods,sheets_numbers,sheets_text,slides_ppt,slides_odp,slides_odg,slides_vsdx,slides_keynote,docs_doc,docs_odt,docs_rtf,docs_wml,docs_pages}
+mkdir -p "$OUT"/{containers,pe,drawing,imagehash,raw_preview,cad_dxf,cad_dwg,ifc,mesh,markdown,visible_text,full_pipeline,seekable,volumes,vdisk,fsimage,lzo,yara,pcre,cvd,database,authenticode,sheets_xls,sheets_ods,sheets_numbers,sheets_text,slides_ppt,slides_odp,slides_odg,slides_vsdx,slides_keynote,docs_doc,docs_odt,docs_rtf,docs_wml,docs_html,docs_pages}
 
 # Tracked files, and new ones not yet committed (but not ignored ones).
 files() { git ls-files -co --exclude-standard -- "$@"; }
@@ -129,14 +129,25 @@ while IFS= read -r f; do add "$f" "$OUT/ifc"; done < <(
 )
 
 # vdisk: the disk images written for it (fuzz/seeds/vdisk, each behind the byte
-# that picks its format), and the disk image fixtures behind 0x07, which tries
+# that picks its format), and the disk image fixtures behind 0x08, which tries
 # every format.
 cp fuzz/seeds/vdisk/* "$OUT/vdisk/"
 for f in "$OUT"/containers/*; do
   if [ -n "$(head -c 4 "$f" | grep -a -e 'QFI' -e 'KDMV' -e 'vhdx' -e 'cone')" ]; then
-    { printf '\007'; cat "$f"; } >"$OUT/vdisk/fixture_$(basename "$f")"
+    { printf '\010'; cat "$f"; } >"$OUT/vdisk/fixture_$(basename "$f")"
   fi
 done
+# The small DMG fixtures (HFS+ in a zlib run and in LZFSE runs), behind 0x07: a
+# koly trailer, no magic first. The APFS ones are too big for a seed.
+for f in crates/exav-unpack/tests/fixtures/dmg/hfs_plus_udzo.dmg crates/exav-unpack/tests/fixtures/dmg/udif_lzfse.dmg; do
+  { printf '\007'; cat "$f"; } >"$OUT/vdisk/fixture_$(basename "$f")"
+done
+
+# fsimage and lzo: the small images and blocks written for them
+# (fuzz/seeds/fsimage and fuzz/seeds/lzo, each behind the byte or the two bytes
+# their target reads first).
+cp fuzz/seeds/fsimage/*.bin "$OUT/fsimage/"
+cp fuzz/seeds/lzo/*.bin "$OUT/lzo/"
 
 # full_pipeline: a zero header (no option bits, no database files: the
 # signatures are fuzz/db/'s) in front of each fixture. seekable: no option
@@ -426,6 +437,7 @@ for f in fuzz/seeds/docs_doc/*; do add "$f" "$OUT/docs_doc"; done
 for f in "$D/sample.odt" "$D/sample.fodt"; do add "$f" "$OUT/docs_odt"; done
 add "$D/sample.rtf" "$OUT/docs_rtf"
 add "$D/sample-2003.xml" "$OUT/docs_wml"
+add "$D/sample.html" "$OUT/docs_html"
 cp "$OUT/slides_keynote/sample.iwa" "$OUT/docs_pages/sample.iwa"
 
 # visible_text, the office formats: each fixture behind the byte that picks its
@@ -451,6 +463,6 @@ python3 scripts/fuzz-seeds-synth.py "$OUT"
 for t in analyze unpack filetype; do ln -sfn containers "$OUT/$t"; done
 ln -sfn pe "$OUT/pe_emulator"
 
-for d in containers pe drawing imagehash raw_preview cad_dxf cad_dwg ifc mesh markdown visible_text full_pipeline seekable volumes yara pcre cvd database authenticode sheets_xls sheets_ods sheets_numbers sheets_text slides_ppt slides_odp slides_odg slides_vsdx slides_keynote docs_doc docs_odt docs_rtf docs_wml docs_pages; do
+for d in containers pe drawing imagehash raw_preview cad_dxf cad_dwg ifc mesh markdown visible_text full_pipeline seekable volumes yara pcre cvd database authenticode sheets_xls sheets_ods sheets_numbers sheets_text slides_ppt slides_odp slides_odg slides_vsdx slides_keynote docs_doc docs_odt docs_rtf docs_wml docs_html docs_pages; do
   echo "$d: $(find "$OUT/$d" -type f | wc -l) seeds"
 done

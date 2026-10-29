@@ -1,7 +1,7 @@
 //! The text of presentations and drawings, taken from the model the readers
 //! fill and not from a PPTX written and read back.
 
-use exav_render::slides::{convert, text, Error, Format, Limits};
+use exav_render::slides::{Error, Format, Limits, convert, text};
 use std::io::Read;
 
 fn fixture(dir: &str, name: &str) -> Vec<u8> {

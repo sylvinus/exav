@@ -23,7 +23,7 @@ pub(crate) fn stream_cab<R: Read + Seek, T>(
 ) -> Result<Option<T>, LimitHit> {
     use crate::formats::cab_parse::cabinet::Cabinet;
     use crate::formats::cab_parse::folder::FolderReader;
-    use crate::stream::{emit_stream, MemberMeta};
+    use crate::stream::{MemberMeta, emit_stream};
     let (folder_metas, files) =
         Cabinet::layout(source).map_err(|e| LimitHit::new(format!("cab: {e}")))?;
     for (folder_idx, meta) in folder_metas.iter().enumerate() {

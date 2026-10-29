@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()

@@ -2,7 +2,7 @@
 name = "exav-cli"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 description = "crates/exav's src/main.rs built as a library, for the fuzz targets that drive the clamd and ICAP parsers. Not published: `exav` itself ships no library."
 
 # The same file the `exav` binary is built from, so what is fuzzed is what

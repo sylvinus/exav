@@ -11,7 +11,7 @@
 //! is the one outcome worse than not unpacking them — it reads identically to
 //! "we looked and found nothing".
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 /// Build a minimal but structurally valid PE with the given section names.
 fn pe_with_sections(names: &[&[u8]]) -> Vec<u8> {

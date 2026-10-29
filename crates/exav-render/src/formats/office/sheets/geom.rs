@@ -54,7 +54,7 @@ impl Grid {
         for r in 0..=mr {
             top.push(y);
             y += match it.peek() {
-                Some((&k, _)) if k == r => {
+                Some(&(&k, _)) if k == r => {
                     it.next();
                     row_px(sh, r)
                 }

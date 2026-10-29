@@ -271,7 +271,7 @@ impl<'a> StepFile<'a> {
         if file.entries.is_empty() {
             return Err(Error::NoData);
         }
-        if file.entries.windows(2).any(|w| w[0].id >= w[1].id) {
+        if file.entries.array_windows().any(|[a, b]| a.id >= b.id) {
             let mut sorted: Vec<(u32, u32)> = file
                 .entries
                 .iter()
@@ -691,10 +691,8 @@ impl<'a> Parser<'a> {
                 let text = std::str::from_utf8(&self.src[start..start + n]).ok()?;
                 self.pos += n;
                 let is_real = text.bytes().any(|c| matches!(c, b'.' | b'e' | b'E'));
-                if !is_real {
-                    if let Ok(i) = text.parse::<i64>() {
-                        return Some(Value::Int(i));
-                    }
+                if !is_real && let Ok(i) = text.parse::<i64>() {
+                    return Some(Value::Int(i));
                 }
                 // `1.E5` is STEP; Rust wants a digit after the point.
                 let r = text.parse::<f64>().ok().or_else(|| {
@@ -802,7 +800,9 @@ mod tests {
     use super::*;
 
     fn file(data: &str) -> String {
-        format!("ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}\nENDSEC;\nEND-ISO-10303-21;\n")
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}\nENDSEC;\nEND-ISO-10303-21;\n"
+        )
     }
 
     #[test]

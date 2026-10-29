@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use exav_render::ifc::{read, Limits};
+use exav_render::ifc::{Limits, read};
 use exav_render::mesh::Scene;
 use serde_json::Value;
 
@@ -360,11 +360,12 @@ fn storeys_have_their_names_and_elevations_and_their_elements() {
         assert!((got.1 - z).abs() < 1e-9, "{name}: {}", got.1);
     }
     // Only storeys have one.
-    assert!(s
-        .nodes
-        .iter()
-        .filter(|n| n.class != "IFCBUILDINGSTOREY")
-        .all(|n| n.elevation.is_none()));
+    assert!(
+        s.nodes
+            .iter()
+            .filter(|n| n.class != "IFCBUILDINGSTOREY")
+            .all(|n| n.elevation.is_none())
+    );
     for (name, storey) in exp["membership"].as_object().unwrap() {
         let e = s
             .elements

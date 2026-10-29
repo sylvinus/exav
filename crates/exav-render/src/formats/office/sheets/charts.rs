@@ -40,6 +40,10 @@ pub(crate) fn parse_ref(f: &str) -> Option<(Option<String>, Range)> {
     ))
 }
 
+/// What a cached value takes written as XML, beside its text: the point, its
+/// index and its value element.
+pub(crate) const XML_PER_POINT: usize = 48;
+
 fn values(wb: &Workbook, here: usize, f: &str) -> Option<Vec<Value>> {
     let (sheet, r) = parse_ref(f)?;
     if r.area() > 100_000 {
@@ -74,47 +78,73 @@ fn nums(v: Vec<Value>) -> Vec<Option<f64>> {
         .collect()
 }
 
-/// Fills the caches of every series that has a reference and no values.
-pub(crate) fn fill(wb: &mut Workbook) {
+/// Fills the caches of every series that has a reference and no values. Each
+/// series gets a copy of the cells it refers to, however many series refer to
+/// the same ones: what the copies take is told to `charge`, and `false` comes
+/// back when it refuses.
+pub(crate) fn fill(wb: &mut Workbook, charge: &mut dyn FnMut(u64) -> bool) -> bool {
     let mut updates: Vec<(usize, usize, usize, ChartSeries)> = vec![];
     for (si, sh) in wb.sheets.iter().enumerate() {
         for (ci, ch) in sh.charts.iter().enumerate() {
             for (k, s) in ch.series.iter().enumerate() {
                 let mut s = s.clone();
                 let mut changed = false;
-                if s.vals.is_empty() {
-                    if let Some(v) = s.val_ref.as_deref().and_then(|f| values(wb, si, f)) {
-                        s.vals = nums(v);
-                        changed = true;
-                    }
+                let mut held = 0usize;
+                // Values written out as XML, which is `XML_PER_POINT` a point
+                // and the text of each.
+                let mut points = 0usize;
+                let mut text = 0usize;
+                if s.vals.is_empty()
+                    && let Some(v) = s.val_ref.as_deref().and_then(|f| values(wb, si, f))
+                {
+                    s.vals = nums(v);
+                    held += s.vals.len() * size_of::<Option<f64>>();
+                    points += s.vals.len();
+                    changed = true;
                 }
-                if s.sizes.is_empty() {
-                    if let Some(v) = s.size_ref.as_deref().and_then(|f| values(wb, si, f)) {
-                        s.sizes = nums(v);
-                        changed = true;
-                    }
+                if s.sizes.is_empty()
+                    && let Some(v) = s.size_ref.as_deref().and_then(|f| values(wb, si, f))
+                {
+                    s.sizes = nums(v);
+                    held += s.sizes.len() * size_of::<Option<f64>>();
+                    points += s.sizes.len();
+                    changed = true;
                 }
                 let empty_cats =
                     s.cats.is_empty() && s.cat_nums.as_ref().is_none_or(|c| c.is_empty());
-                if empty_cats {
-                    if let Some(v) = s.cat_ref.as_deref().and_then(|f| values(wb, si, f)) {
-                        let numeric = matches!(ch.kind, ChartKind::Scatter | ChartKind::Bubble)
-                            || s.cat_nums.is_some();
-                        if numeric {
-                            s.cat_nums = Some(nums(v));
-                        } else {
-                            s.cats = v.into_iter().map(|x| x.display()).collect();
-                        }
-                        changed = true;
+                if empty_cats && let Some(v) = s.cat_ref.as_deref().and_then(|f| values(wb, si, f))
+                {
+                    let numeric = matches!(ch.kind, ChartKind::Scatter | ChartKind::Bubble)
+                        || s.cat_nums.is_some();
+                    if numeric {
+                        let n = nums(v);
+                        held += n.len() * size_of::<Option<f64>>();
+                        points += n.len();
+                        s.cat_nums = Some(n);
+                    } else {
+                        s.cats = v.into_iter().map(|x| x.display()).collect();
+                        held += s
+                            .cats
+                            .iter()
+                            .map(|c| size_of::<String>() + c.len())
+                            .sum::<usize>();
+                        points += s.cats.len();
+                        text += s.cats.iter().map(String::len).sum::<usize>();
                     }
+                    changed = true;
                 }
-                if s.name.is_none() {
-                    if let Some(v) = s.name_ref.as_deref().and_then(|f| values(wb, si, f)) {
-                        s.name = Some(v.iter().map(Value::display).collect::<Vec<_>>().join(" "));
-                        changed = true;
-                    }
+                if s.name.is_none()
+                    && let Some(v) = s.name_ref.as_deref().and_then(|f| values(wb, si, f))
+                {
+                    let name = v.iter().map(Value::display).collect::<Vec<_>>().join(" ");
+                    held += name.len();
+                    s.name = Some(name);
+                    changed = true;
                 }
                 if changed {
+                    if !charge((held + points * XML_PER_POINT + text) as u64) {
+                        return false;
+                    }
                     updates.push((si, ci, k, s));
                 }
             }
@@ -123,6 +153,7 @@ pub(crate) fn fill(wb: &mut Workbook) {
     for (si, ci, k, s) in updates {
         wb.sheets[si].charts[ci].series[k] = s;
     }
+    true
 }
 
 #[cfg(test)]

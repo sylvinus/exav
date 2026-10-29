@@ -7,7 +7,7 @@ mod mesh_common;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use exav_render::gltf::{external_buffers, read, read_with, Error, MAX_DEPTH};
+use exav_render::gltf::{Error, MAX_DEPTH, external_buffers, read, read_with};
 use exav_render::mesh::Scene;
 use mesh_common::*;
 
@@ -84,7 +84,10 @@ fn cube_data(ty: &str) -> Vec<u8> {
 fn cube_doc(ty: &str, rest: &str) -> String {
     let data = cube_data(ty);
     document(
-        &format!("\"uri\":\"data:application/octet-stream;base64,{}\"", base64(&data)),
+        &format!(
+            "\"uri\":\"data:application/octet-stream;base64,{}\"",
+            base64(&data)
+        ),
         data.len(),
         &format!(
             "\"bufferViews\":[{{\"buffer\":0,\"byteOffset\":0,\"byteLength\":96}},{{\"buffer\":0,\"byteOffset\":96,\"byteLength\":{}}}],\
@@ -271,7 +274,10 @@ fn quantized_cube(scale: f64) -> Vec<u8> {
 
 fn quantized_doc(data: &[u8], accessor_extra: &str, rest: &str) -> String {
     document(
-        &format!("\"uri\":\"data:application/octet-stream;base64,{}\"", base64(data)),
+        &format!(
+            "\"uri\":\"data:application/octet-stream;base64,{}\"",
+            base64(data)
+        ),
         data.len(),
         &format!(
             "\"bufferViews\":[{{\"buffer\":0,\"byteOffset\":0,\"byteLength\":64,\"byteStride\":8}},{{\"buffer\":0,\"byteOffset\":64,\"byteLength\":{}}}],\
@@ -428,12 +434,14 @@ fn a_material_colours_the_mesh_in_srgb() {
     assert!(c.chunks(3).all(|v| v == [255, 0, 0]));
     // Linear one half is 188 of 255 in sRGB.
     let grey = with("{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.5,0.5,0.5,0.1]}}");
-    assert!(grey.batches[0]
-        .colors
-        .as_ref()
-        .unwrap()
-        .chunks(3)
-        .all(|v| v == [188, 188, 188]));
+    assert!(
+        grey.batches[0]
+            .colors
+            .as_ref()
+            .unwrap()
+            .chunks(3)
+            .all(|v| v == [188, 188, 188])
+    );
     // No colour factor, or white: the renderer's colour.
     assert!(with("{}").batches[0].colors.is_none());
     assert!(
@@ -770,22 +778,52 @@ fn accessors_that_do_not_fit_their_buffers_are_errors() {
     let acc1 = "\"bufferView\":1,\"componentType\":5123,\"count\":36";
     let cases = [
         // Counts of billions over a few hundred bytes.
-        (acc0, "\"bufferView\":0,\"componentType\":5126,\"count\":4294967295"),
-        (acc1, "\"bufferView\":1,\"componentType\":5123,\"count\":4294967295"),
-        (acc0, "\"bufferView\":0,\"componentType\":5126,\"count\":9007199254740992"),
-        (acc1, "\"bufferView\":1,\"componentType\":5123,\"count\":1e300"),
+        (
+            acc0,
+            "\"bufferView\":0,\"componentType\":5126,\"count\":4294967295",
+        ),
+        (
+            acc1,
+            "\"bufferView\":1,\"componentType\":5123,\"count\":4294967295",
+        ),
+        (
+            acc0,
+            "\"bufferView\":0,\"componentType\":5126,\"count\":9007199254740992",
+        ),
+        (
+            acc1,
+            "\"bufferView\":1,\"componentType\":5123,\"count\":1e300",
+        ),
         // Offsets past, or wrapping around, the end.
-        (acc0, "\"bufferView\":0,\"byteOffset\":9007199254740992,\"componentType\":5126,\"count\":8"),
-        (acc0, "\"bufferView\":0,\"byteOffset\":18446744073709551615,\"componentType\":5126,\"count\":8"),
-        (acc1, "\"bufferView\":1,\"byteOffset\":-4,\"componentType\":5123,\"count\":36"),
-        (acc0, "\"bufferView\":0,\"byteOffset\":1,\"componentType\":5126,\"count\":8"),
+        (
+            acc0,
+            "\"bufferView\":0,\"byteOffset\":9007199254740992,\"componentType\":5126,\"count\":8",
+        ),
+        (
+            acc0,
+            "\"bufferView\":0,\"byteOffset\":18446744073709551615,\"componentType\":5126,\"count\":8",
+        ),
+        (
+            acc1,
+            "\"bufferView\":1,\"byteOffset\":-4,\"componentType\":5123,\"count\":36",
+        ),
+        (
+            acc0,
+            "\"bufferView\":0,\"byteOffset\":1,\"componentType\":5126,\"count\":8",
+        ),
         // A view that is not there, or wrong.
         (acc0, "\"bufferView\":99,\"componentType\":5126,\"count\":8"),
         (acc0, "\"bufferView\":-1,\"componentType\":5126,\"count\":8"),
-        (acc0, "\"bufferView\":0.5,\"componentType\":5126,\"count\":8"),
+        (
+            acc0,
+            "\"bufferView\":0.5,\"componentType\":5126,\"count\":8",
+        ),
         // Types that are not positions (a 16-bit one is a quantized position).
         (acc0, "\"bufferView\":0,\"componentType\":9999,\"count\":8"),
-        (acc0, "\"bufferView\":0,\"componentType\":5126,\"count\":8,\"type\":\"MAT4\""),
+        (
+            acc0,
+            "\"bufferView\":0,\"componentType\":5126,\"count\":8,\"type\":\"MAT4\"",
+        ),
         // No view and a count of a billion: zeros are not made.
         (acc0, "\"componentType\":5126,\"count\":1000000000"),
     ];
@@ -889,7 +927,11 @@ fn nodes_that_loop_or_share_a_child_are_refused() {
         "\"nodes\":[{}],\"scenes\":[{\"nodes\":[0]}],\"scene\":5",
     ] {
         let r = read(cyc(nodes).as_bytes(), 10);
-        assert!(matches!(r, Err(Error::Invalid(_))), "{nodes}: {:?}", r.map(|s| s.triangles()));
+        assert!(
+            matches!(r, Err(Error::Invalid(_))),
+            "{nodes}: {:?}",
+            r.map(|s| s.triangles())
+        );
     }
     // A diamond that doubles at every level would be 2^60 visits.
     let mut nodes = String::from("\"nodes\":[");

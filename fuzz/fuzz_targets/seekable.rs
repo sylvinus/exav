@@ -23,7 +23,7 @@
 //!   and the report says so (the crate docs).
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
-use exav_core::{analyze, scan_seekable, Verdict, VerdictCategory};
+use exav_core::{Verdict, VerdictCategory, analyze, scan_seekable};
 use libfuzzer_sys::fuzz_target;
 
 #[path = "../db.rs"]
@@ -54,7 +54,6 @@ impl Seek for Flaky {
 }
 
 fuzz_target!(|input: &[u8]| {
-    exav_fuzz_support::panics::tolerate_inside(exav_fuzz_support::panics::CONTAINED);
     let [b0, b1, piece, fail, data @ ..] = input else {
         return;
     };
@@ -70,11 +69,14 @@ fuzz_target!(|input: &[u8]| {
 
     match (fail_at, answer) {
         (None, Ok(report)) => {
-            let held = len <= opts.deep_analysis_max && opts.max_scan_size.map_or(true, |m| len <= m);
+            let held = len <= opts.deep_analysis_max && opts.max_scan_size.is_none_or(|m| len <= m);
             if held {
                 let direct = analyze(db::scanner(), data, &opts);
-                assert_eq!(report.verdict, direct.verdict, "a reader and a buffer got two answers");
-            } else if opts.max_scan_size.map_or(true, |m| len <= m) {
+                assert_eq!(
+                    report.verdict, direct.verdict,
+                    "a reader and a buffer got two answers"
+                );
+            } else if opts.max_scan_size.is_none_or(|m| len <= m) {
                 assert_ne!(
                     report.verdict.category(),
                     VerdictCategory::Clean,
@@ -86,7 +88,10 @@ fuzz_target!(|input: &[u8]| {
         (Some(at), Ok(report)) => {
             // Reading stopped at `at`: only a detection can have been reached.
             if !matches!(report.verdict, Verdict::Infected { .. }) {
-                panic!("a read failed at byte {at} of {len} and the scan went on to say {:?}", report.verdict);
+                panic!(
+                    "a read failed at byte {at} of {len} and the scan went on to say {:?}",
+                    report.verdict
+                );
             }
             let whole = analyze(db::scanner(), data, &opts);
             assert_ne!(

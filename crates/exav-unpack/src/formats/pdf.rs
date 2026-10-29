@@ -66,17 +66,17 @@ pub fn has_obfuscated_name_object(data: &[u8]) -> bool {
         let mut decoded: Vec<u8> = Vec::new();
         let mut gratuitous = false;
         while j < data.len() && !TERM.contains(&data[j]) {
-            if data[j] == b'#' && j + 2 < data.len() {
-                if let Ok(b) =
+            if data[j] == b'#'
+                && j + 2 < data.len()
+                && let Ok(b) =
                     u8::from_str_radix(std::str::from_utf8(&data[j + 1..j + 3]).unwrap_or("x"), 16)
-                {
-                    if b.is_ascii_alphanumeric() {
-                        gratuitous = true;
-                    }
-                    decoded.push(b);
-                    j += 3;
-                    continue;
+            {
+                if b.is_ascii_alphanumeric() {
+                    gratuitous = true;
                 }
+                decoded.push(b);
+                j += 3;
+                continue;
             }
             decoded.push(data[j]);
             j += 1;
@@ -160,7 +160,7 @@ pub(crate) fn extract_pdf<R>(
     let mut js_acc: Vec<u8> = Vec::new();
     let mut uri_acc: Vec<u8> = Vec::new();
     let mut lex = Lexer::new(data);
-    while let Some((obj_id, gen, obj_start)) = lex.find_next_obj() {
+    while let Some((obj_id, r#gen, obj_start)) = lex.find_next_obj() {
         lex.set_pos(obj_start);
         let Some((obj, _end)) = parse_indirect_object_body(&mut lex) else {
             continue;
@@ -174,7 +174,7 @@ pub(crate) fn extract_pdf<R>(
         harvest_actions(
             &obj,
             decoder.as_ref(),
-            (obj_id, gen),
+            (obj_id, r#gen),
             &mut js_acc,
             &mut uri_acc,
         );
@@ -188,7 +188,7 @@ pub(crate) fn extract_pdf<R>(
         {
             #[cfg(feature = "decrypt")]
             if let Some(ref dec) = decoder {
-                dec.decrypt_stream(obj_id, gen, &mut stream_data);
+                dec.decrypt_stream(obj_id, r#gen, &mut stream_data);
             }
             let raw_len = stream_data.len() as u64;
             let cap = budget.reserve()?;
@@ -407,10 +407,10 @@ pub(crate) fn apply_filters(
                     Ok((out, truncated)) => (out, truncated, false),
                     Err(_) => {
                         let mut s = salvage_zlib(&buf, cap);
-                        if s.data.is_empty() {
-                            if let Some(z) = buf.iter().position(|&b| b == 0x78) {
-                                s = salvage_zlib(&buf[z..], cap);
-                            }
+                        if s.data.is_empty()
+                            && let Some(z) = buf.iter().position(|&b| b == 0x78)
+                        {
+                            s = salvage_zlib(&buf[z..], cap);
                         }
                         // Empty input decodes vacuously (nothing to fail on);
                         // only non-empty input decoding to nothing is an error.
@@ -564,26 +564,25 @@ fn detect_encryption(data: &[u8]) -> Option<CryptDict> {
             parse_indirect_object_body(&mut lex)
         {
             // Strategy 1: dict contains an /Encrypt key
-            if let Some(Primitive::Dictionary(enc)) = dict.get("Encrypt") {
-                if let Some(cd) = CryptDict::from_primitive(enc) {
-                    return Some(cd);
-                }
+            if let Some(Primitive::Dictionary(enc)) = dict.get("Encrypt")
+                && let Some(cd) = CryptDict::from_primitive(enc)
+            {
+                return Some(cd);
             }
             // Strategy 2: this IS the encrypt dict (standalone)
-            if is_encrypt_dict(&dict) {
-                if let Some(cd) = CryptDict::from_primitive(&dict) {
-                    return Some(cd);
-                }
+            if is_encrypt_dict(&dict)
+                && let Some(cd) = CryptDict::from_primitive(&dict)
+            {
+                return Some(cd);
             }
         }
     }
     // Strategy 3: check trailer
-    if let Some(trailer) = parse_trailer_dict(data) {
-        if let Some(Primitive::Dictionary(enc)) = trailer.get("Encrypt") {
-            if let Some(cd) = CryptDict::from_primitive(enc) {
-                return Some(cd);
-            }
-        }
+    if let Some(trailer) = parse_trailer_dict(data)
+        && let Some(Primitive::Dictionary(enc)) = trailer.get("Encrypt")
+        && let Some(cd) = CryptDict::from_primitive(enc)
+    {
+        return Some(cd);
     }
     None
 }
@@ -597,21 +596,18 @@ fn find_doc_id(data: &[u8]) -> Option<Vec<u8>> {
         lex.set_pos(obj_start);
         if let Some((Primitive::Dictionary(dict) | Primitive::Stream { info: dict, .. }, _end)) =
             parse_indirect_object_body(&mut lex)
+            && let Some(Primitive::Array(arr)) = dict.get("ID")
+            && let Some(Primitive::String(s)) = arr.first()
         {
-            if let Some(Primitive::Array(arr)) = dict.get("ID") {
-                if let Some(Primitive::String(s)) = arr.first() {
-                    return Some(s.clone());
-                }
-            }
+            return Some(s.clone());
         }
     }
     // Check the trailer
-    if let Some(trailer) = parse_trailer_dict(data) {
-        if let Some(Primitive::Array(arr)) = trailer.get("ID") {
-            if let Some(Primitive::String(s)) = arr.first() {
-                return Some(s.clone());
-            }
-        }
+    if let Some(trailer) = parse_trailer_dict(data)
+        && let Some(Primitive::Array(arr)) = trailer.get("ID")
+        && let Some(Primitive::String(s)) = arr.first()
+    {
+        return Some(s.clone());
     }
     None
 }
@@ -627,11 +623,11 @@ mod tests {
         assert!(has_obfuscated_name_object(b"<</#4f#70enAction 2 0 R>>")); // /OpenAction
         assert!(has_obfuscated_name_object(b"/J#61vaScript")); // → JavaScript
         assert!(has_obfuscated_name_object(b"/La#75nch")); // → Launch
-                                                           // An incidental escape in an *ordinary* name is benign and must NOT fire
-                                                           // (this is the false positive that made it unsafe to run by default).
+        // An incidental escape in an *ordinary* name is benign and must NOT fire
+        // (this is the false positive that made it unsafe to run by default).
         assert!(!has_obfuscated_name_object(b"/Ty#70e")); // → Type (not sensitive)
         assert!(!has_obfuscated_name_object(b"/C#31")); // → C1 (a real benign-PDF FP)
-                                                        // No escapes, or only legitimate ones → not flagged.
+        // No escapes, or only legitimate ones → not flagged.
         assert!(!has_obfuscated_name_object(b"/Type/Catalog/OpenAction"));
         assert!(!has_obfuscated_name_object(b"/JavaScript")); // unobfuscated → not flagged
         assert!(!has_obfuscated_name_object(b"/Weird#20Name")); // #20 = space, needs escaping
@@ -917,8 +913,10 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             b"%PDF-1.5\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF";
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Pdf, pdf, &mut budget).unwrap();
-        assert!(entries
-            .iter()
-            .all(|e| e.name != "pdf-javascript" && e.name != "pdf-uris"));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.name != "pdf-javascript" && e.name != "pdf-uris")
+        );
     }
 }

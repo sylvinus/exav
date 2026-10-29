@@ -29,7 +29,7 @@ mod source;
 
 use exav_unpack::source::BlockCache;
 use exav_unpack::{
-    walk, Budget, ByteSource, Entry as UnpackEntry, Format, LimitHit, Limits, Member, MemberMeta,
+    Budget, ByteSource, Entry as UnpackEntry, Format, LimitHit, Limits, Member, MemberMeta, walk,
 };
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use source::Src;
@@ -248,16 +248,16 @@ fn limits_from_js(v: &JsValue) -> Limits {
     // An unknown name is ignored rather than rejected: a page pinned to an
     // older module should not fail outright because it listed a format that
     // build does not have, and anything not listed is excluded anyway.
-    if let Ok(v) = Reflect::get(v, &JsValue::from_str("allowedFormats")) {
-        if let Some(arr) = v.dyn_ref::<Array>() {
-            let mut set = std::collections::BTreeSet::new();
-            for item in arr.iter() {
-                if let Some(f) = item.as_string().and_then(|n| format_by_name(&n)) {
-                    set.insert(f);
-                }
+    if let Ok(v) = Reflect::get(v, &JsValue::from_str("allowedFormats"))
+        && let Some(arr) = v.dyn_ref::<Array>()
+    {
+        let mut set = std::collections::BTreeSet::new();
+        for item in arr.iter() {
+            if let Some(f) = item.as_string().and_then(|n| format_by_name(&n)) {
+                set.insert(f);
             }
-            l.allowed_formats = Some(set);
         }
+        l.allowed_formats = Some(set);
     }
     l
 }
@@ -622,10 +622,10 @@ pub fn volume_set(name: &str, names: Vec<String>) -> JsValue {
     };
     let mut found: Vec<(usize, String)> = Vec::new();
     for n in &names {
-        if let Some(v) = volume::parse(n) {
-            if seed.same_set_as(&v) {
-                found.push((v.index, n.clone()));
-            }
+        if let Some(v) = volume::parse(n)
+            && seed.same_set_as(&v)
+        {
+            found.push((v.index, n.clone()));
         }
     }
     let mut last_zip = None;
@@ -637,7 +637,7 @@ pub fn volume_set(name: &str, names: Vec<String>) -> JsValue {
     }
     found.sort_by_key(|(i, _)| *i);
     // Two names for one position: the shape is not the one a writer made.
-    let clash = found.windows(2).any(|w| w[0].0 == w[1].0);
+    let clash = found.array_windows().any(|[a, b]| a.0 == b.0);
     let mut parts: Vec<String> = found.iter().map(|(_, n)| n.clone()).collect();
     let mut complete = !clash && found.iter().enumerate().all(|(k, (i, _))| k == *i);
     if matches!(seed.scheme, Scheme::ZipSplit) {
@@ -696,7 +696,7 @@ pub fn join_set(scheme: &str, parts: &Array) -> Result<Uint8Array, JsValue> {
         other => {
             return Err(JsValue::from_str(&format!(
                 "a \"{other}\" set cannot be joined by this build"
-            )))
+            )));
         }
     };
     Ok(Uint8Array::from(joined.as_slice()))

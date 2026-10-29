@@ -8,7 +8,7 @@ use crate::formats::office::common::package::PackageWriter;
 use crate::formats::office::common::xmlout::XML_HEAD;
 use crate::formats::office::docs::error::{Error, Result};
 use crate::formats::office::docs::model::*;
-use body::{root, Rels, W};
+use body::{Rels, W, root};
 use std::fmt::Write;
 
 const CT_MAIN: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml";
@@ -48,7 +48,7 @@ fn rels_xml(r: &Rels) -> String {
 /// Writes `doc` as a DOCX, refusing to grow past `limit` bytes.
 pub fn write(doc: &Document, limit: u64) -> Result<Vec<u8>> {
     let mut z = PackageWriter::new(limit);
-    let mut w = W::new(doc);
+    let mut w = W::new(doc, limit);
     let mut rels = Rels::default();
 
     // Parts that other parts refer to are numbered first, so that their
@@ -69,6 +69,9 @@ pub fn write(doc: &Document, limit: u64) -> Result<Vec<u8>> {
     let last = w.sect_pr(&doc.section, &mut rels, true);
     body.push_str(&last);
     body.push_str("</w:body></w:document>");
+    if w.over {
+        return Err(Error::TooLarge("memory"));
+    }
 
     let mut notes_rels = Rels::default();
     let footnotes = (!doc.footnotes.is_empty())

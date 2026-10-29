@@ -90,7 +90,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'exav',
-      tagline: 'Memory-safe tools for untrusted files.',
+      description: 'Memory-safe tools for untrusted files.',
       // Mark only: the "exav" wordmark next to it is rendered as real text by
       // Starlight, so it uses the site font rather than whatever the viewer's
       // OS happens to substitute inside an <img>-loaded SVG.

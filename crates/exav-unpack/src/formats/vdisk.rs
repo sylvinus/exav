@@ -300,10 +300,10 @@ impl<'a, L: Layout> VDisk<'a, L> {
     }
 
     fn lookup(&mut self, idx: u64) -> Map {
-        if let Some((i, m)) = self.last {
-            if i == idx {
-                return m;
-            }
+        if let Some((i, m)) = self.last
+            && i == idx
+        {
+            return m;
         }
         let m = self.layout.map(idx);
         self.last = Some((idx, m));

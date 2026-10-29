@@ -1,6 +1,6 @@
 //! bzip2: one member, every concatenated stream decoded in turn as it is read.
 use crate::source::{ByteSource, Reader};
-use crate::stream::{emit_stream, single_meta, Visit};
+use crate::stream::{Visit, emit_stream, single_meta};
 use crate::{Budget, LimitHit};
 use std::io::Read;
 

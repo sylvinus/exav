@@ -3,8 +3,8 @@
 //! time, stack and size.
 
 use exav_render::markdown::{
-    parse, Align, Block, Document, Inline, MAX_BLOCK_DEPTH, MAX_COLUMNS, MAX_INLINE_DEPTH,
-    MAX_NODES, MAX_TARGET,
+    Align, Block, Document, Inline, MAX_BLOCK_DEPTH, MAX_COLUMNS, MAX_INLINE_DEPTH, MAX_NODES,
+    MAX_TARGET, parse,
 };
 
 fn doc(md: &str) -> Document {
@@ -98,11 +98,7 @@ fn marks(d: &Document, f: fn(&Inline) -> Option<&Vec<Inline>>) -> Vec<String> {
 }
 
 fn em(n: &Inline) -> Option<&Vec<Inline>> {
-    if let Inline::Em(c) = n {
-        Some(c)
-    } else {
-        None
-    }
+    if let Inline::Em(c) = n { Some(c) } else { None }
 }
 fn strong(n: &Inline) -> Option<&Vec<Inline>> {
     if let Inline::Strong(c) = n {
@@ -439,7 +435,9 @@ fn a_target_of_the_longest_size_is_kept_and_one_byte_more_is_not() {
 
 #[test]
 fn an_image_is_its_alt_text_and_loads_nothing() {
-    let d = doc("![a diagram](https://example.com/d.png) ![](https://example.com/e.png) ![x *y* `z`](data:image/png;base64,AAAA)");
+    let d = doc(
+        "![a diagram](https://example.com/d.png) ![](https://example.com/e.png) ![x *y* `z`](data:image/png;base64,AAAA)",
+    );
     let alts: Vec<_> = all_inlines(&d)
         .into_iter()
         .filter_map(|n| {
@@ -561,7 +559,9 @@ fn assert_kinds(v: &serde_json::Value) {
 
 #[test]
 fn the_json_is_valid_and_has_the_shape_the_page_reads() {
-    let d = doc("# H\n\ntext **b** [l](https://example.com/\"q\")\n\n- a\n- b\n\n| x | y |\n|:-|-:|\n| 1 | 2 |\n\n> q\n\n```\ncode\n```\n\n---\n\n<div>raw</div>\n");
+    let d = doc(
+        "# H\n\ntext **b** [l](https://example.com/\"q\")\n\n- a\n- b\n\n| x | y |\n|:-|-:|\n| 1 | 2 |\n\n> q\n\n```\ncode\n```\n\n---\n\n<div>raw</div>\n",
+    );
     let v: serde_json::Value = serde_json::from_str(&d.to_json()).unwrap();
     assert_eq!(v["truncated"], false);
     let kinds: Vec<_> = v["blocks"]
@@ -760,10 +760,11 @@ fn a_list_start_is_nine_digits_at_most() {
             ..
         }
     ));
-    assert!(d
-        .blocks
-        .iter()
-        .all(|b| !matches!(b, Block::List { start, .. } if *start > 999_999_999)));
+    assert!(
+        d.blocks
+            .iter()
+            .all(|b| !matches!(b, Block::List { start, .. } if *start > 999_999_999))
+    );
 }
 
 fn rep(n: usize, s: &str) -> String {

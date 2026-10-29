@@ -212,12 +212,11 @@ pub fn run_props(p: &Props, st: &Styles, base_half: u32) -> RunProps {
             }
         }
     }
-    if let Some(v) = t("fo:letter-spacing") {
-        if v != "normal" {
-            if let Some(tw) = odf::twips(v) {
-                r.spacing = Some(tw);
-            }
-        }
+    if let Some(v) = t("fo:letter-spacing")
+        && v != "normal"
+        && let Some(tw) = odf::twips(v)
+    {
+        r.spacing = Some(tw);
     }
     if let Some(v) = t("style:text-scale").and_then(odf::percent) {
         r.scale = Some(((v * 100.0).round() as u32).clamp(1, 600));
@@ -289,11 +288,11 @@ pub fn para_props(p: &Props, in_list: bool) -> ParaProps {
         if let Some(pc) = odf::percent(v) {
             r.line = Some((pc * 240.0).round() as i32);
             r.line_rule = Some(LineRule::Auto);
-        } else if let Some(t) = odf::twips(v) {
-            if t > 0 {
-                r.line = Some(t);
-                r.line_rule = Some(LineRule::Exact);
-            }
+        } else if let Some(t) = odf::twips(v)
+            && t > 0
+        {
+            r.line = Some(t);
+            r.line_rule = Some(LineRule::Exact);
         }
     }
     if let Some(t) = g("style:line-height-at-least").and_then(odf::twips) {

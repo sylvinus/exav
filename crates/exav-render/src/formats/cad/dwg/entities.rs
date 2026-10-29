@@ -10,8 +10,8 @@
 
 use exav_unpack::dwg::{BitError, BitResult, Bits, EedValue, Object, Version};
 
-use super::tables::cmc;
 use super::Ctx;
+use super::tables::cmc;
 use crate::formats::cad::model::*;
 
 /// The entities an INSERT or a POLYLINE owns (its ATTRIBs, its VERTEXes):
@@ -127,7 +127,7 @@ pub(crate) fn read(
         0x03 => {
             return none(EntityKind::AttributeDefinition(Box::new(attribute(
                 ctx, o, true,
-            )?)))
+            )?)));
         }
         0x07 | 0x08 => {
             let (i, f) = insert(ctx, o, o.type_code == 0x08)?;

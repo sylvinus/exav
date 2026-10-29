@@ -90,7 +90,7 @@ fn check(file: &str, version: &str, source: &str, d: &Value) -> (usize, Vec<Stri
                         || ty == "VIEWPORT"
                         || fields.get("paper_space") == Some(&Value::Bool(true))) =>
                 {
-                    continue
+                    continue;
                 }
                 Some(e) => {
                     failed.push(format!("{file}: {ty} {handle} read as {}", e["type"]));

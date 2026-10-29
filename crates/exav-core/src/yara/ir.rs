@@ -6,11 +6,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use regex_automata::{meta::Regex, Input};
+use regex_automata::{Input, meta::Regex};
 use serde::{Deserialize, Serialize};
 
 use crate::byte_source::ByteSource;
-use crate::yara::matcher::{build_regex, Match};
+use crate::yara::matcher::{Match, build_regex};
 use crate::yara::modules::{self, FuncId, ModuleCtx, ModuleKind};
 
 /// A compiled `matches` regexp plus the source it was built from.
@@ -641,7 +641,7 @@ fn count_in_range(id: usize, range: &Option<(Box<Cond>, Box<Cond>)>, ctx: &EvalC
 fn read_int(kind: IntKind, data: &dyn ByteSource, offset: i64) -> Option<Value> {
     let off: usize = offset.try_into().ok()?;
     macro_rules! rd {
-        ($n:literal, $conv:expr) => {{
+        ($n:literal, $conv:expr_2021) => {{
             let bytes: [u8; $n] = data.window(off, $n).as_ref().try_into().ok()?;
             $conv(bytes)
         }};
@@ -726,11 +726,7 @@ fn index_value(idx: &Option<Box<Cond>>, ctx: &EvalCtx) -> Option<usize> {
         None => 1,
         Some(e) => eval_int(e, ctx)?,
     };
-    if i < 1 {
-        None
-    } else {
-        Some((i - 1) as usize)
-    }
+    if i < 1 { None } else { Some((i - 1) as usize) }
 }
 
 fn eval_arith(op: ArithOp, a: &Cond, b: &Cond, ctx: &EvalCtx) -> Option<Value> {

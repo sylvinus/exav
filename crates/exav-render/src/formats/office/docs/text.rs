@@ -257,10 +257,10 @@ impl<'a, 'b> Walk<'a, 'b> {
     }
 
     fn para(&mut self, p: &'a Para) {
-        if self.collect {
-            if let Some(s) = p.section.as_deref() {
-                self.sections.push(s);
-            }
+        if self.collect
+            && let Some(s) = p.section.as_deref()
+        {
+            self.sections.push(s);
         }
         self.para_hidden = self.hidden.para(p);
         self.at_start = true;
@@ -364,10 +364,10 @@ impl<'a, 'b> Walk<'a, 'b> {
                         continue;
                     }
                     let mark = self.links.len();
-                    if word.eq_ignore_ascii_case("HYPERLINK") {
-                        if let (Some(t), _, _) = parse_hyperlink(instr.trim()) {
-                            self.push_link(t);
-                        }
+                    if word.eq_ignore_ascii_case("HYPERLINK")
+                        && let (Some(t), _, _) = parse_hyperlink(instr.trim())
+                    {
+                        self.push_link(t);
                     }
                     self.inlines(result);
                     self.close_links_to(mark);
@@ -439,10 +439,11 @@ impl<'a, 'b> Walk<'a, 'b> {
         if self.extra_fields > 0 {
             return;
         }
-        if let Some(f) = self.fields.last_mut() {
-            if !f.result && f.instr.len() < MAX_INSTR {
-                f.instr.push_str(s);
-            }
+        if let Some(f) = self.fields.last_mut()
+            && !f.result
+            && f.instr.len() < MAX_INSTR
+        {
+            f.instr.push_str(s);
         }
     }
 
@@ -478,13 +479,13 @@ impl<'a, 'b> Walk<'a, 'b> {
                 if is_page_number(word) {
                     f.skip = true;
                     self.hide += 1;
-                } else if word.eq_ignore_ascii_case("HYPERLINK") {
-                    if let (Some(t), _, _) = parse_hyperlink(instr.trim()) {
-                        let mark = self.links.len();
-                        self.push_link(t);
-                        if let Some(f) = self.fields.last_mut() {
-                            f.link = Some(mark);
-                        }
+                } else if word.eq_ignore_ascii_case("HYPERLINK")
+                    && let (Some(t), _, _) = parse_hyperlink(instr.trim())
+                {
+                    let mark = self.links.len();
+                    self.push_link(t);
+                    if let Some(f) = self.fields.last_mut() {
+                        f.link = Some(mark);
                     }
                 }
             }
@@ -520,10 +521,10 @@ impl<'a, 'b> Walk<'a, 'b> {
     /// Closes the links opened after the first `len`.
     fn close_links_to(&mut self, len: usize) {
         while self.links.len() > len {
-            if let Some(l) = self.links.pop() {
-                if l.open {
-                    self.out.end_link();
-                }
+            if let Some(l) = self.links.pop()
+                && l.open
+            {
+                self.out.end_link();
             }
         }
     }

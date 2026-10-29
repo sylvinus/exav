@@ -26,6 +26,8 @@ const MAX_ENTRIES: u32 = 0xFFFF;
 const MAX_DATA: u32 = 64 << 20;
 /// The most strings of one script array taken (triggers).
 const MAX_STRINGS: u32 = 4096;
+/// The most script members of a package.
+const MAX_SCRIPTS: usize = 4096;
 
 const TAG_PAYLOAD_FORMAT: u32 = 1124;
 const TAG_PAYLOAD_COMPRESSOR: u32 = 1125;
@@ -179,7 +181,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     let header = read_header(source, signature.end.next_multiple_of(8), total)?;
 
     let mut regions = Vec::new();
-    for &(tag, name) in SCRIPTS {
+    'scripts: for &(tag, name) in SCRIPTS {
         for e in header.entries.iter().filter(|e| e.tag == tag) {
             let strings = match e.kind {
                 STRING => 1,
@@ -188,6 +190,15 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
             };
             let mut at = e.offset as usize;
             for i in 0..strings {
+                // Entries may share their strings: the members are bounded
+                // here, before anything is built for each.
+                if regions.len() >= MAX_SCRIPTS {
+                    regions.push(Region::Unwalked(
+                        "scripts".into(),
+                        "an RPM with more scripts than exav lists",
+                    ));
+                    break 'scripts;
+                }
                 let Some((start, n)) = header.string_at(at) else {
                     break;
                 };

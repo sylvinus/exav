@@ -5,7 +5,7 @@
 //! the base paragraph formatting has no fields for.
 
 use super::escher;
-use super::records::{read_at, Children, Rec};
+use super::records::{Children, Rec, read_at};
 use crate::formats::office::common::bytes::Cur;
 
 pub const PROG_TAGS: u16 = 0x1388;

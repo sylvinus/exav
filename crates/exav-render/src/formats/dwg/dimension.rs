@@ -176,11 +176,11 @@ pub fn graphics(d: &Dimension, s: &Style, measure: &dyn Fn(&str) -> f64) -> Opti
 /// An extension line from `from` to `to` on the dimension line: `exo` short
 /// of the feature, `exe` past the line.
 fn extension(g: &mut Graphics, from: P, to: P, s: &Style) {
-    if let Some(e) = unit(sub(to, from)) {
-        if len(sub(to, from)) > s.exo {
-            g.lines
-                .push([add(from, mul(e, s.exo)), add(to, mul(e, s.exe))]);
-        }
+    if let Some(e) = unit(sub(to, from))
+        && len(sub(to, from)) > s.exo
+    {
+        g.lines
+            .push([add(from, mul(e, s.exo)), add(to, mul(e, s.exe))]);
     }
 }
 

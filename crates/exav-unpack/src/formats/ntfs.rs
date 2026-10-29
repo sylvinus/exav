@@ -53,57 +53,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
+use super::vol::{Attrs, Emit, Found, Next, Piece, Pieces, Plan, Vol, hand, read_file};
 use crate::source::{ByteSource, Reader};
 use crate::stream::Visit;
-use crate::{Budget, Entry, LimitHit, Sink};
-
-/// A `Read + Seek` volume, whichever it is.
-trait Disk: Read + Seek {}
-impl<T: Read + Seek + ?Sized> Disk for T {}
-
-/// How much of the volume one read asks of it at once.
-const STEP: usize = 1 << 20;
-
-/// The volume, read at offsets the filesystem's own numbers give.
-struct Vol<'a> {
-    disk: &'a mut dyn Disk,
-    len: u64,
-    /// The most an on-disk structure (a table, an attribute list) is read
-    /// whole: the buffer limit.
-    max: usize,
-}
-
-impl Vol<'_> {
-    /// `len` bytes at `off`, or `None` when they are not all in the volume.
-    fn at(&mut self, off: u64, len: usize) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        self.append(off, len, &mut out).then_some(out)
-    }
-
-    /// Append `len` bytes at `off` to `out`, if they are all in the volume.
-    /// They are read a step at a time, so what is held grows with what is read.
-    fn append(&mut self, off: u64, len: usize, out: &mut Vec<u8>) -> bool {
-        let Some(end) = off.checked_add(len as u64) else {
-            return false;
-        };
-        if end > self.len || self.disk.seek(SeekFrom::Start(off)).is_err() {
-            return false;
-        }
-        let base = out.len();
-        let mut done = 0usize;
-        while done < len {
-            let step = len.saturating_sub(done).min(STEP);
-            let from = base.saturating_add(done);
-            out.resize(from.saturating_add(step), 0);
-            if self.disk.read_exact(&mut out[from..]).is_err() {
-                out.truncate(base);
-                return false;
-            }
-            done = done.saturating_add(step);
-        }
-        true
-    }
-}
+use crate::{Budget, Entry, LimitHit};
 
 /// The OEM name every NTFS boot sector carries at offset 3.
 /// Every MFT record starts with this.
@@ -296,6 +249,37 @@ fn data_runs(d: &[u8]) -> Vec<Run> {
         });
     }
     runs
+}
+
+/// The stretches of a non-resident attribute: each run in order, a sparse one
+/// zeros.
+struct Runs {
+    runs: std::vec::IntoIter<Run>,
+    cluster: u64,
+}
+
+impl Plan for Runs {
+    fn next(&mut self, _: &mut Vol) -> Next {
+        let Some(r) = self.runs.next() else {
+            return Next::End;
+        };
+        let len = r.clusters.saturating_mul(self.cluster);
+        match r.lcn {
+            None => Next::Piece(Piece::Zeros(len)),
+            Some(lcn) => match u64::try_from(lcn)
+                .ok()
+                .and_then(|l| l.checked_mul(self.cluster))
+            {
+                Some(at) => Next::Piece(Piece::Disk(at, len)),
+                None => Next::Broken,
+            },
+        }
+    }
+}
+
+/// `visit`'s member `e`, held whole.
+fn held<R>(visit: Emit<R>, e: Entry, budget: &mut Budget) -> Option<R> {
+    visit(Found::Held(e), budget)
 }
 
 /// Read a non-resident attribute's bytes by following its runs. Short where
@@ -505,6 +489,11 @@ fn data_extents(
         if vcn == 0 {
             real_size = *size;
         }
+        // Each record can hold thousands of runs, and a list names thousands
+        // of records: the runs of one file are bounded in all.
+        if runs.len().saturating_add(extent.len()) > MAX_FILE_RUNS {
+            return Err(TooManyExtents);
+        }
         runs.extend(extent.iter().cloned());
     }
     if runs.is_empty() || real_size == 0 {
@@ -517,7 +506,12 @@ fn data_extents(
 /// with its runs in this many records has more than any volume this reads holds.
 const MAX_LIST_REFS: usize = 1 << 16;
 
-/// An attribute list that names more extents than [`MAX_LIST_REFS`].
+/// The most data runs of one file followed, over all its extents: a million is
+/// a file in a million fragments, and 24 MB of runs.
+const MAX_FILE_RUNS: usize = 1 << 20;
+
+/// An attribute list that names more extents than [`MAX_LIST_REFS`], or more
+/// runs than [`MAX_FILE_RUNS`].
 struct TooManyExtents;
 
 /// The unnamed non-resident `$DATA` attributes of an MFT record by the VCN each
@@ -601,6 +595,8 @@ struct File {
     /// Set when the bytes are present but exav could not read them.
     unreadable: Option<&'static str>,
     deleted: bool,
+    /// The runs and the size of a file too long to hold, to be read as it goes.
+    stream: Option<(Vec<Run>, u64)>,
 }
 
 /// Parse one MFT record into a file, or `None` when it holds nothing to scan.
@@ -661,6 +657,7 @@ fn parse_record(
                     data: None,
                     unreadable: Some("EFS-encrypted NTFS file"),
                     deleted,
+                    stream: None,
                 });
             } else if !non_resident {
                 let vlen = le_u32(rec, off.saturating_add(16)) as usize;
@@ -671,6 +668,7 @@ fn parse_record(
                     data: Some(bytes),
                     unreadable: None,
                     deleted,
+                    stream: None,
                 });
             } else {
                 // A file fragmented past what one record can hold has its runs
@@ -708,6 +706,7 @@ fn parse_record(
                              the extent that could be read was scanned"
                         }),
                         deleted,
+                        stream: None,
                     });
                 } else {
                     let (runs, real_size) = match spread {
@@ -725,12 +724,30 @@ fn parse_record(
                             )
                         }
                     };
-                    if real_size > cap {
+                    if real_size > cap && attr_flags & ATTR_COMPRESSED == 0 {
+                        // Read as it goes, its holes zeros, where the volume
+                        // gives it. Runs short of the declared size are
+                        // reported before it, as for a file that is held.
+                        let covered = runs.iter().fold(0u64, |n, r| {
+                            n.saturating_add(r.clusters.saturating_mul(geo.cluster as u64))
+                        });
+                        file = Some(File {
+                            name: String::new(),
+                            data: None,
+                            unreadable: (covered < real_size as u64).then_some(
+                                "NTFS file whose data runs did not cover its declared size; \
+                                 the part that could be read was scanned",
+                            ),
+                            deleted,
+                            stream: Some((runs, real_size as u64)),
+                        });
+                    } else if real_size > cap {
                         file = Some(File {
                             name: String::new(),
                             data: None,
                             unreadable: Some("NTFS file exceeds the per-member size budget"),
                             deleted,
+                            stream: None,
                         });
                     } else if attr_flags & ATTR_COMPRESSED != 0 {
                         // A compression unit is 2^4 clusters in practice.
@@ -753,12 +770,14 @@ fn parse_record(
                                 data: Some(d),
                                 unreadable: None,
                                 deleted,
+                                stream: None,
                             },
                             None => File {
                                 name: String::new(),
                                 data: None,
                                 unreadable: Some("NTFS-compressed file that would not decompress"),
                                 deleted,
+                                stream: None,
                             },
                         });
                     } else if attr_flags & ATTR_SPARSE != 0 || runs.iter().any(|r| r.lcn.is_none())
@@ -770,6 +789,7 @@ fn parse_record(
                             data: Some(read_runs(v, &runs, geo.cluster, real_size)),
                             unreadable: None,
                             deleted,
+                            stream: None,
                         });
                     } else {
                         let bytes = read_runs(v, &runs, geo.cluster, real_size);
@@ -788,6 +808,7 @@ fn parse_record(
                                  the part that could be read was scanned",
                             ),
                             deleted,
+                            stream: None,
                         });
                     }
                 }
@@ -838,12 +859,12 @@ fn record_name(rec: &[u8]) -> Option<String> {
             break;
         }
         let non_resident = rec.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
-        if atype == ATTR_FILE_NAME && !non_resident {
-            if let Some(n) = file_name_attr(rec, off) {
-                if name.as_ref().is_none_or(|old| n.len() > old.len()) {
-                    name = Some(n);
-                }
-            }
+        if atype == ATTR_FILE_NAME
+            && !non_resident
+            && let Some(n) = file_name_attr(rec, off)
+            && name.as_ref().is_none_or(|old| n.len() > old.len())
+        {
+            name = Some(n);
         }
         off = off.saturating_add(alen);
     }
@@ -875,17 +896,14 @@ fn name_from_extensions(
             if read.len() >= MAX_LIST_REFS {
                 break;
             }
-            if read.insert(record) {
-                if let Some(mut r) = mft.record(v, geo, record) {
-                    if r.get(0..4) == Some(RECORD_MAGIC.as_slice()) && apply_fixups(&mut r, sector)
-                    {
-                        if let Some(n) = record_name(&r) {
-                            if name.as_ref().is_none_or(|old| n.len() > old.len()) {
-                                name = Some(n);
-                            }
-                        }
-                    }
-                }
+            if read.insert(record)
+                && let Some(mut r) = mft.record(v, geo, record)
+                && r.get(0..4) == Some(RECORD_MAGIC.as_slice())
+                && apply_fixups(&mut r, sector)
+                && let Some(n) = record_name(&r)
+                && name.as_ref().is_none_or(|old| n.len() > old.len())
+            {
+                name = Some(n);
             }
         }
         i = i.saturating_add(entry_len);
@@ -935,7 +953,7 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
     mut disk: D,
     len: u64,
     budget: &mut Budget,
-    visit: Sink<R>,
+    visit: Emit<R>,
 ) -> Result<Option<R>, LimitHit> {
     let mut v = Vol {
         disk: &mut disk,
@@ -955,7 +973,8 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
     }
     let Some(geo) = geometry(&boot) else {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
                 len,
@@ -972,7 +991,8 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
     let mft_start = geo.mft_lcn.saturating_mul(geo.cluster as u64);
     let Some(mut rec0) = v.at(mft_start, geo.record_size) else {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
                 len,
@@ -985,7 +1005,8 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
     let sector = le_u16(&boot, 11) as usize;
     if !apply_fixups(&mut rec0, sector) || rec0.get(0..4) != Some(RECORD_MAGIC.as_slice()) {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
                 len,
@@ -997,7 +1018,8 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
     }
     let Some(mft) = Mft::open(&rec0, &mut v, &geo) else {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
                 len,
@@ -1012,7 +1034,8 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
     let n = records.min(MAX_RECORDS);
     if records > MAX_RECORDS {
         budget.count_entry()?;
-        if let Some(r) = visit(
+        if let Some(r) = held(
+            visit,
             Entry::unsupported(
                 format!("<ntfs-records-beyond-{MAX_RECORDS}>"),
                 0,
@@ -1038,7 +1061,8 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
         // above, and conflating the two hides real files.
         if !apply_fixups(&mut rec, sector) {
             budget.count_entry()?;
-            if let Some(r) = visit(
+            if let Some(r) = held(
+                visit,
                 Entry::unsupported(
                     format!("<mft-record-{i}>"),
                     0,
@@ -1075,20 +1099,31 @@ pub(crate) fn walk_volume<D: Read + Seek, R>(
         // of the two would either hide the gap or throw away content.
         if let Some(why) = f.unreadable {
             budget.count_entry()?;
-            if let Some(r) = visit(
+            if let Some(r) = held(
+                visit,
                 Entry::unsupported(name.clone(), 0, why.contains("encrypted"), why),
                 budget,
             ) {
                 return Ok(Some(r));
             }
         }
-        if let Some(d) = f.data {
-            if !d.is_empty() {
-                budget.count_entry()?;
-                budget.commit(d.len() as u64);
-                if let Some(r) = visit(Entry::new(name, d), budget) {
-                    return Ok(Some(r));
-                }
+        if let Some(d) = f.data
+            && !d.is_empty()
+        {
+            budget.count_entry()?;
+            budget.commit(d.len() as u64);
+            if let Some(r) = held(visit, Entry::new(name, d), budget) {
+                return Ok(Some(r));
+            }
+        } else if let Some((runs, size)) = f.stream {
+            budget.count_entry()?;
+            let plan = Runs {
+                runs: runs.into_iter(),
+                cluster: geo.cluster as u64,
+            };
+            let got = read_file(&mut v, Pieces::new(plan, size), size, 0);
+            if let Some(r) = hand(budget, &mut *visit, name, Attrs::default(), got) {
+                return Ok(Some(r));
             }
         }
     }

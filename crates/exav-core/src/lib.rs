@@ -204,6 +204,11 @@ fn unpack_format(ft: FileType) -> Option<unpack::Format> {
         FileType::Fat => unpack::Format::Fat,
         FileType::Inno => unpack::Format::Inno,
         FileType::Ntfs => unpack::Format::Ntfs,
+        FileType::Exfat => unpack::Format::Exfat,
+        FileType::Squashfs => unpack::Format::Squashfs,
+        FileType::Cramfs => unpack::Format::Cramfs,
+        FileType::Romfs => unpack::Format::Romfs,
+        FileType::Erofs => unpack::Format::Erofs,
         FileType::Zstd => unpack::Format::Zstd,
         FileType::Lzip => unpack::Format::Lzip,
         FileType::Uuencode => unpack::Format::Uuencode,
@@ -420,28 +425,26 @@ fn unpack_target(
     // from the magic. Compat mode leaves them off: stock ClamAV opens none of
     // them, and extracting more there would be counted as a disagreement.
     let detected = || facts.format();
-    if !restrict {
-        if let Some(fmt) = detected() {
-            if filetype::MAGIC_DISPATCH_ONLY.contains(&fmt) {
-                return Some(fmt);
-            }
-        }
+    if !restrict
+        && let Some(fmt) = detected()
+        && filetype::MAGIC_DISPATCH_ONLY.contains(&fmt)
+    {
+        return Some(fmt);
     }
     // Installers and self-extractors: real executables, so `identify` answers
     // `Pe`/`Elf` and `unpack_format` has nothing to map. Their payload is the
     // installer's own format rather than a recognisable archive, so carving does
     // not reach it either. Without this an NSIS or Inno installer scans clean
     // with every file it packages unexamined.
-    if ft.is_executable() {
-        if let Some(fmt) = detected() {
-            if filetype::EXECUTABLE_CONTAINERS.contains(&fmt) {
-                // Stock ClamAV unpacks NSIS, AutoIt and SFX, so those stay on in
-                // compat mode; it has no Inno Setup support, and claiming the
-                // extra reach there would register as a disagreement.
-                if !restrict || fmt != unpack::Format::Inno {
-                    return Some(fmt);
-                }
-            }
+    if ft.is_executable()
+        && let Some(fmt) = detected()
+        && filetype::EXECUTABLE_CONTAINERS.contains(&fmt)
+    {
+        // Stock ClamAV unpacks NSIS, AutoIt and SFX, so those stay on in
+        // compat mode; it has no Inno Setup support, and claiming the
+        // extra reach there would register as a disagreement.
+        if !restrict || fmt != unpack::Format::Inno {
+            return Some(fmt);
         }
     }
     // UPX unpacking. ClamAV's UPX unpacker is invoked only from its PE scan path;
@@ -874,6 +877,19 @@ pub struct ScanOptions {
     /// over this limit with no spill to go to is not scanned, and reported.
     /// A scan also holds `limits.max_buffer_bytes` to it. Default 256 MiB.
     pub deep_analysis_max: u64,
+    /// Memory of the block cache of an object read in place, in bytes
+    /// (`--object-cache-bytes`): an object past `deep_analysis_max`, a spilled
+    /// member or view, a spilled stream. One cache for each such object being
+    /// scanned, nested ones included. Default 8 MiB.
+    pub object_cache_bytes: u64,
+    /// One block of that cache, in bytes (`--object-cache-block-bytes`): the
+    /// unit it reads from the object, and over HTTP what a read at an offset
+    /// elsewhere fetches. Default 1 MiB.
+    pub object_cache_block_bytes: u64,
+    /// Over HTTP, the most one range request fetches (`--http-request-bytes`),
+    /// reached by a read that goes on from where the last stopped, which asks
+    /// for twice as much each time from one block. Default 8 MiB.
+    pub http_request_bytes: u64,
     /// Largest object PCRE subsignatures run on (`--max-pcre-bytes`); on a
     /// larger one they do not match, as ClamAV's `PCREMaxFileSize` has it.
     /// `None` = no limit (default); 100 MiB under `--clamav-compat`.
@@ -1032,11 +1048,35 @@ pub struct ScanOptions {
     pub spill: Option<std::sync::Arc<dyn spill::Spill>>,
 }
 
+impl ScanOptions {
+    /// The block and capacity, in bytes, of a block cache: at least a byte a
+    /// block, and room for two.
+    pub(crate) fn cache_sizes(&self) -> (usize, usize) {
+        let block = usize::try_from(self.object_cache_block_bytes)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let bytes = usize::try_from(self.object_cache_bytes).unwrap_or(usize::MAX);
+        (block, bytes)
+    }
+
+    /// A block cache over `reader`, sized by these options.
+    pub(crate) fn object_cache<R: Read + Seek>(
+        &self,
+        reader: R,
+    ) -> io::Result<byte_source::BlockCache<R>> {
+        let (block, bytes) = self.cache_sizes();
+        byte_source::BlockCache::with_sizes(reader, block, bytes)
+    }
+}
+
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             max_scan_size: None,
             deep_analysis_max: 256 * 1024 * 1024,
+            object_cache_bytes: 8 * 1024 * 1024,
+            object_cache_block_bytes: 1024 * 1024,
+            http_request_bytes: 8 * 1024 * 1024,
             max_pcre_bytes: None,
             min_scan_bytes: MIN_SCAN_BYTES,
             heuristics: false,
@@ -1084,6 +1124,9 @@ impl ScanOptions {
         Self {
             max_scan_size: Some(100 * 1024 * 1024),
             deep_analysis_max: 400 * 1024 * 1024,
+            object_cache_bytes: 8 * 1024 * 1024,
+            object_cache_block_bytes: 1024 * 1024,
+            http_request_bytes: 8 * 1024 * 1024,
             // ClamAV's PCREMaxFileSize default.
             max_pcre_bytes: Some(100 * 1024 * 1024),
             min_scan_bytes: MIN_SCAN_BYTES,
@@ -1267,10 +1310,10 @@ impl Scanner {
     fn identify_inner(&self, facts: &Facts) -> FileType {
         let data = facts.data;
         let mut ft = filetype::identify_source_with(data, || facts.format());
-        if ft == FileType::Unknown {
-            if let Some(f) = self.ftm.identify_source(data) {
-                ft = f;
-            }
+        if ft == FileType::Unknown
+            && let Some(f) = self.ftm.identify_source(data)
+        {
+            ft = f;
         }
         // The bzip2 (`BZh`), CAB (`MSCF`), gzip (`1f 8b`) and ARJ (`60 ea`)
         // file-type magics are short and collide with ordinary binary data; a
@@ -1500,16 +1543,16 @@ pub fn scan_seekable<R: Read + Seek>(
     // Thread-local, so it carries over from whatever this thread scanned last
     // unless every entry point clears it.
     engine::reset_scan_truncated();
-    if let Some(max) = opts.max_scan_size {
-        if size > max {
-            // Invariant 2 (see crate docs): scan what is within the limit
-            // before refusing by size, so a detection in it still wins.
-            let head = scan_within(db, Window::new(&mut reader, max)?, max, opts)?;
-            if head.verdict.category() == VerdictCategory::Infected {
-                return Ok(head);
-            }
-            return Ok(max_file_size_report(size, max, opts));
+    if let Some(max) = opts.max_scan_size
+        && size > max
+    {
+        // Invariant 2 (see crate docs): scan what is within the limit
+        // before refusing by size, so a detection in it still wins.
+        let head = scan_within(db, Window::new(&mut reader, max)?, max, opts)?;
+        if head.verdict.category() == VerdictCategory::Infected {
+            return Ok(head);
         }
+        return Ok(max_file_size_report(size, max, opts));
     }
     scan_within(db, reader, size, opts)
 }
@@ -1534,7 +1577,7 @@ fn scan_within<R: Read + Seek>(
         // It grew while it was read: scanned as the larger object it now is.
         reader.seek(SeekFrom::Start(0))?;
     }
-    let cache = byte_source::BlockCache::new(reader)?;
+    let cache = opts.object_cache(reader)?;
     let report = analyze_source(db, &cache, opts);
     // A read that failed part way leaves bytes the scan never saw.
     if let Some(e) = cache.read_error() {
@@ -1644,11 +1687,11 @@ fn max_file_size_report(size: u64, max: u64, opts: &ScanOptions) -> ScanReport {
 /// The alert a top-level file larger than `max_scan_size` is reported as
 /// under `--alert-exceeds-max`, or else the reason it is over the limit.
 fn max_file_size(size: u64, max: u64, opts: &ScanOptions) -> Result<&'static str, String> {
-    if opts.alert_exceeds_max {
-        if let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize) {
-            match_loc_record();
-            return Ok(name);
-        }
+    if opts.alert_exceeds_max
+        && let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize)
+    {
+        match_loc_record();
+        return Ok(name);
     }
     Err(format!(
         "file size {size} exceeds max-input-bytes {max}; scanned first {max} bytes only"
@@ -1661,15 +1704,15 @@ fn max_file_size(size: u64, max: u64, opts: &ScanOptions) -> Result<&'static str
 /// treated as complete: a kind with no alert name keeps the `LimitsExceeded`
 /// verdict and its reason.
 fn limits_outcome(opts: &ScanOptions, kind: unpack::LimitKind, reason: String) -> DeepOutcome {
-    if opts.alert_exceeds_max {
-        if let Some(name) = limits_alert_name(kind) {
-            match_loc_record();
-            return DeepOutcome::Infected {
-                signature: name.to_string(),
-                offset: 0,
-                method: Method::Heuristic,
-            };
-        }
+    if opts.alert_exceeds_max
+        && let Some(name) = limits_alert_name(kind)
+    {
+        match_loc_record();
+        return DeepOutcome::Infected {
+            signature: name.to_string(),
+            offset: 0,
+            method: Method::Heuristic,
+        };
     }
     DeepOutcome::Limits(reason)
 }
@@ -1753,7 +1796,11 @@ fn read_member(
     let Some(spill) = &cx.opts.spill else {
         return not_scanned(tally, "spilling to disk is off");
     };
-    match spill::spill_stream(spill.as_ref(), &mut io::Cursor::new(buf).chain(rest)) {
+    match spill::spill_stream(
+        spill.as_ref(),
+        &mut io::Cursor::new(buf).chain(rest),
+        cx.opts.cache_sizes(),
+    ) {
         Ok(spilled) => Ok(Body::Spilled(spilled)),
         Err(spill::SpillStreamError::Read(e)) if unpack::is_budget_overflow(&e) => {
             Err(over_budget())
@@ -1805,10 +1852,11 @@ fn visit_member(
     // to decompress to itself, so the guard lives here rather than in any
     // extractor. The length test is false for essentially every real member,
     // so the comparison is only reached by a genuine fixed point.
-    if let Body::Mem(data) = &body {
-        if data.len() == container.len() && *container.window(0, data.len()) == data[..] {
-            return None;
-        }
+    if let Body::Mem(data) = &body
+        && data.len() == container.len()
+        && *container.window(0, data.len()) == data[..]
+    {
+        return None;
     }
     let size_real = match &body {
         Body::Mem(data) => data.len() as u64,
@@ -1959,12 +2007,11 @@ fn walk_members(
         let _mpg = MatchPathGuard::enter(&name);
         terminal = member_content_scan(&cx, &mut tally, &name, &buf, budget, findings, sink);
     }
-    if let Some(name) = tally.encrypted.take() {
-        if !matches!(terminal, Some(DeepOutcome::Infected { .. })) {
-            if let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic) {
-                return o;
-            }
-        }
+    if let Some(name) = tally.encrypted.take()
+        && !matches!(terminal, Some(DeepOutcome::Infected { .. }))
+        && let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic)
+    {
+        return o;
     }
     terminal.unwrap_or_else(|| tally.verdict())
 }
@@ -2116,7 +2163,7 @@ pub fn analyze_split_sets<F>(
 where
     F: FnMut(&str, Option<usize>) -> io::Result<Vec<u8>>,
 {
-    use unpack::volume::{group, parse, Scheme};
+    use unpack::volume::{Scheme, group, parse};
 
     #[derive(Clone, Copy, PartialEq)]
     enum Kind {
@@ -2163,10 +2210,10 @@ where
     // ZIP: `x.z01` ... and the `x.zip` that comes last and holds the directory.
     let mut stems: Vec<String> = Vec::new();
     for n in names {
-        if let Some(v) = parse(n).filter(|v| v.scheme == Scheme::ZipSplit) {
-            if !stems.iter().any(|s| s.eq_ignore_ascii_case(&v.stem)) {
-                stems.push(v.stem);
-            }
+        if let Some(v) = parse(n).filter(|v| v.scheme == Scheme::ZipSplit)
+            && !stems.iter().any(|s| s.eq_ignore_ascii_case(&v.stem))
+        {
+            stems.push(v.stem);
         }
     }
     for stem in stems {
@@ -2267,7 +2314,9 @@ where
                 Ok(d) => {
                     held_total = held_total.saturating_add(d.len());
                     if held_total > opts.deep_analysis_max as usize {
-                        lost = Some("part of a multi-volume set too large to hold for rejoining (--max-object-bytes)");
+                        lost = Some(
+                            "part of a multi-volume set too large to hold for rejoining (--max-object-bytes)",
+                        );
                         break;
                     }
                     data.push(d);
@@ -2314,6 +2363,21 @@ where
         verdict(report, &mut out);
     }
     out
+}
+
+/// Without `all-formats` no archive format is read, so no part of a set of
+/// volumes is known to belong to one: nothing is joined.
+#[cfg(not(feature = "all-formats"))]
+pub fn analyze_split_sets<F>(
+    _db: &Scanner,
+    _names: &[String],
+    _opts: &ScanOptions,
+    _fetch: F,
+) -> Vec<VolumeSetVerdict>
+where
+    F: FnMut(&str, Option<usize>) -> io::Result<Vec<u8>>,
+{
+    Vec::new()
 }
 
 /// The name a part's SET is reported under, matching what
@@ -2435,17 +2499,17 @@ pub fn analyze_all_seekable<R: Read + Seek>(
     size: u64,
     opts: &ScanOptions,
 ) -> io::Result<(Vec<(String, Method)>, AllMatchOutcome)> {
-    if let Some(max) = opts.max_scan_size {
-        if size > max {
-            let (mut names, outcome) = all_within(db, Window::new(&mut reader, max)?, max, opts)?;
-            return Ok(match max_file_size(size, max, opts) {
-                Ok(name) => {
-                    names.push((name.to_string(), Method::Heuristic));
-                    (names, outcome)
-                }
-                Err(reason) => (names, AllMatchOutcome::LimitsExceeded(reason)),
-            });
-        }
+    if let Some(max) = opts.max_scan_size
+        && size > max
+    {
+        let (mut names, outcome) = all_within(db, Window::new(&mut reader, max)?, max, opts)?;
+        return Ok(match max_file_size(size, max, opts) {
+            Ok(name) => {
+                names.push((name.to_string(), Method::Heuristic));
+                (names, outcome)
+            }
+            Err(reason) => (names, AllMatchOutcome::LimitsExceeded(reason)),
+        });
     }
     all_within(db, reader, size, opts)
 }
@@ -2467,7 +2531,7 @@ fn all_within<R: Read + Seek>(
         }
         reader.seek(SeekFrom::Start(0))?;
     }
-    let cache = byte_source::BlockCache::new(reader)?;
+    let cache = opts.object_cache(reader)?;
     let found = analyze_all_source(db, &cache, opts);
     // A read that failed part way leaves bytes the scan never saw.
     if let Some(e) = cache.read_error() {
@@ -2614,14 +2678,14 @@ fn whole_buffer_heuristics(
     // many.
     if (opts.clamav_heuristics || opts.heuristics) && ft == FileType::Zip {
         const OVERLAP_THRESHOLD: usize = 5;
-        if unpack::overlapping_local_records(src) > OVERLAP_THRESHOLD {
-            if let Some(o) = sink.hit(
+        if unpack::overlapping_local_records(src) > OVERLAP_THRESHOLD
+            && let Some(o) = sink.hit(
                 "Heuristics.Zip.OverlappingFiles".to_string(),
                 0,
                 Method::Heuristic,
-            ) {
-                return Some(o);
-            }
+            )
+        {
+            return Some(o);
         }
     }
 
@@ -2633,16 +2697,15 @@ fn whole_buffer_heuristics(
     if ft == FileType::Xz {
         // The stream header and the first block header, which is at most
         // 1024 bytes.
-        if let Some(dict) = unpack::xz_declared_dict_size(&src.window(0, 12 + 1024 + 64)) {
-            if dict > unpack::XZ_MAX_DICT {
-                if let Some(o) = sink.hit(
-                    "Heuristics.XZ.DicSizeLimit".to_string(),
-                    0,
-                    Method::Heuristic,
-                ) {
-                    return Some(o);
-                }
-            }
+        if let Some(dict) = unpack::xz_declared_dict_size(&src.window(0, 12 + 1024 + 64))
+            && dict > unpack::XZ_MAX_DICT
+            && let Some(o) = sink.hit(
+                "Heuristics.XZ.DicSizeLimit".to_string(),
+                0,
+                Method::Heuristic,
+            )
+        {
+            return Some(o);
         }
     }
 
@@ -2661,12 +2724,12 @@ fn whole_buffer_heuristics(
     ]
     .iter()
     .any(|m| head.starts_with(m));
-    if opts.alert_broken_media && media {
-        if let Some(name) = whole().and_then(unpack::broken_media_alert) {
-            if let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic) {
-                return Some(o);
-            }
-        }
+    if opts.alert_broken_media
+        && media
+        && let Some(name) = whole().and_then(unpack::broken_media_alert)
+        && let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic)
+    {
+        return Some(o);
     }
 
     // A file that claims to be an executable and whose headers describe a
@@ -2680,14 +2743,17 @@ fn whole_buffer_heuristics(
     // that does not parse is a fragment or a false hit, not a broken file.
     // clamscan `--alert-broken` agrees: it reports a broken PE or ELF alone and
     // not embedded in another file.
-    if opts.alert_broken && executable && !embedded && pe::looks_broken_in(src) {
-        if let Some(o) = sink.hit(
+    if opts.alert_broken
+        && executable
+        && !embedded
+        && pe::looks_broken_in(src)
+        && let Some(o) = sink.hit(
             "Heuristics.Broken.Executable".to_string(),
             0,
             Method::Heuristic,
-        ) {
-            return Some(o);
-        }
+        )
+    {
+        return Some(o);
     }
     // An ELF whose section-header table has been stripped. Detected in BOTH
     // modes; only the name differs. It is not breakage (the program headers are
@@ -2713,12 +2779,11 @@ fn whole_buffer_heuristics(
     // so the image shows one filesystem to whatever mounts it and another to
     // whatever scans it. Parser confusion one layer below the ZIP case above.
     // Opt-in, matching ClamAV's `--alert-partition-intersection`.
-    if opts.alert_partition_intersection {
-        if let Some(name) = unpack::partition_intersection_alert(src) {
-            if let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic) {
-                return Some(o);
-            }
-        }
+    if opts.alert_partition_intersection
+        && let Some(name) = unpack::partition_intersection_alert(src)
+        && let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic)
+    {
+        return Some(o);
     }
 
     // ClamAV `Heuristics.PDF.ObfuscatedNameObject`: a PDF whose name objects
@@ -2729,14 +2794,13 @@ fn whole_buffer_heuristics(
     if (opts.clamav_heuristics || opts.heuristics)
         && ft == FileType::Pdf
         && whole().is_some_and(unpack::has_obfuscated_name_object)
-    {
-        if let Some(o) = sink.hit(
+        && let Some(o) = sink.hit(
             "Heuristics.PDF.ObfuscatedNameObject".to_string(),
             0,
             Method::Heuristic,
-        ) {
-            return Some(o);
-        }
+        )
+    {
+        return Some(o);
     }
     None
 }
@@ -2948,12 +3012,11 @@ fn member_metadata_scan(
     // Opt-in (`--detect packed`): name the packer as well as reporting that its
     // payload went unread. Same rule as the encryption case above: two facts,
     // both true, both reported.
-    if cx.opts.alert_packed {
-        if let Some(n) = packed_heuristic_name(&e.name) {
-            if let Some(o) = sink.hit(n, 0, Method::Heuristic) {
-                return Some(o);
-            }
-        }
+    if cx.opts.alert_packed
+        && let Some(n) = packed_heuristic_name(&e.name)
+        && let Some(o) = sink.hit(n, 0, Method::Heuristic)
+    {
+        return Some(o);
     }
     if let Some(r) = e.unsupported {
         if e.encrypted {
@@ -2974,14 +3037,14 @@ fn member_metadata_scan(
         // for an Excel 4.0 macro sheet. Emitting the bare name looked harmless
         // and is not: a gateway filtering on ClamAV's exact string matches
         // neither of ours.
-        if let Some(kind) = macro_dialect(&e.name) {
-            if let Some(o) = sink.hit(
+        if let Some(kind) = macro_dialect(&e.name)
+            && let Some(o) = sink.hit(
                 format!("Heuristics.OLE2.ContainsMacros.{kind}"),
                 0,
                 Method::Heuristic,
-            ) {
-                return Some(o);
-            }
+            )
+        {
+            return Some(o);
         }
     }
     if !cx.db.cdb.is_empty() {
@@ -3391,23 +3454,24 @@ fn scan_carried(
     // those constraints exist to separate "this image, in a document" from
     // "this image, on its own".
     #[cfg(feature = "base64scan")]
-    if opts.decode_base64 && obj.depth < budget.limits().max_recursion {
-        if let Some(mc) = markup_cltype(ft, &data.window(0, 4096)) {
-            let _ag = engine::AncestryGuard::enter(Some(mc));
-            for (ix, payload) in
-                unpack::markup_embedded_payloads(data, budget.limits().max_buffer_bytes)
-                    .into_iter()
-                    .enumerate()
-            {
-                let _mpg = MatchPathGuard::enter(&format!("embedded-asset-{}", ix + 1));
-                let inner = Obj {
-                    carve: false,
-                    ..obj.inner(Some(mc))
-                };
-                let o = scan_found(db, &payload, inner, opts, budget, findings, sink);
-                if matches!(o, DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) {
-                    return Some(o);
-                }
+    if opts.decode_base64
+        && obj.depth < budget.limits().max_recursion
+        && let Some(mc) = markup_cltype(ft, &data.window(0, 4096))
+    {
+        let _ag = engine::AncestryGuard::enter(Some(mc));
+        for (ix, payload) in
+            unpack::markup_embedded_payloads(data, budget.limits().max_buffer_bytes)
+                .into_iter()
+                .enumerate()
+        {
+            let _mpg = MatchPathGuard::enter(&format!("embedded-asset-{}", ix + 1));
+            let inner = Obj {
+                carve: false,
+                ..obj.inner(Some(mc))
+            };
+            let o = scan_found(db, &payload, inner, opts, budget, findings, sink);
+            if matches!(o, DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) {
+                return Some(o);
             }
         }
     }
@@ -3697,26 +3761,26 @@ fn scan_file(
     // Only a PE carries one, and it is parsed from all of the file.
     let signed =
         (opts.alert_broken_authenticode || !db.crb.is_empty()) && data.window(0, 2)[..] == *b"MZ";
-    if signed {
-        if let Some(sig) =
+    if signed
+        && let Some(sig) =
             whole(data, opts, "the Authenticode checks").and_then(|w| authenticode::analyze_pe(&w))
+    {
+        for cert in &sig.certs {
+            if let Some(name) = db.crb.blocked(cert)
+                && let Some(o) = sink.hit(name.to_string(), 0, Method::Hash)
+            {
+                return o;
+            }
+        }
+        if opts.alert_broken_authenticode
+            && !sig.digest_matches
+            && let Some(o) = sink.hit(
+                "Heuristics.Authenticode.HashMismatch".to_string(),
+                0,
+                Method::Heuristic,
+            )
         {
-            for cert in &sig.certs {
-                if let Some(name) = db.crb.blocked(cert) {
-                    if let Some(o) = sink.hit(name.to_string(), 0, Method::Hash) {
-                        return o;
-                    }
-                }
-            }
-            if opts.alert_broken_authenticode && !sig.digest_matches {
-                if let Some(o) = sink.hit(
-                    "Heuristics.Authenticode.HashMismatch".to_string(),
-                    0,
-                    Method::Heuristic,
-                ) {
-                    return o;
-                }
-            }
+            return o;
         }
     }
 
@@ -3728,14 +3792,13 @@ fn scan_file(
 
     // TLSH fuzzy matching is exav-exclusive (ClamAV has no TLSH), so it stays
     // behind the full `--detect exav-heuristics` flag and off under `--clamav-compat`.
-    if opts.heuristics {
-        if let Some(hit) = profile::timed("fuzzy", data.len() as u64, || {
+    if opts.heuristics
+        && let Some(hit) = profile::timed("fuzzy", data.len() as u64, || {
             db.fuzzy.match_tlsh_source(data)
-        }) {
-            if let Some(o) = sink.hit(hit, 0, Method::Fuzzy) {
-                return o;
-            }
-        }
+        })
+        && let Some(o) = sink.hit(hit, 0, Method::Fuzzy)
+    {
+        return o;
     }
 
     // Parsed from all of the PE, so read only when something below uses it.
@@ -3755,10 +3818,9 @@ fn scan_file(
             if let Some(hit) = db
                 .fuzzy
                 .match_imphash(&info.imphash, info.import_count as u64)
+                && let Some(o) = sink.hit(hit, 0, Method::Fuzzy)
             {
-                if let Some(o) = sink.hit(hit, 0, Method::Fuzzy) {
-                    return o;
-                }
+                return o;
             }
             if opts.heuristics {
                 if depth == 0 {
@@ -3790,23 +3852,24 @@ fn scan_file(
                         format!("{score:.2} ({})", db.model.name()),
                     ));
                 }
-                if score >= db.ml_threshold {
-                    if let Some(o) = sink.hit(
+                if score >= db.ml_threshold
+                    && let Some(o) = sink.hit(
                         format!("Heuristics.Static.Suspect.{:.0}", score * 100.0),
                         0,
                         Method::Static,
-                    ) {
-                        return o;
-                    }
+                    )
+                {
+                    return o;
                 }
-                if info.looks_packed() && info.suspicious_imports.len() >= 2 {
-                    if let Some(o) = sink.hit(
+                if info.looks_packed()
+                    && info.suspicious_imports.len() >= 2
+                    && let Some(o) = sink.hit(
                         "Heuristics.PE.PackedWithInjectionImports".to_string(),
                         0,
                         Method::Heuristic,
-                    ) {
-                        return o;
-                    }
+                    )
+                {
+                    return o;
                 }
             }
         }
@@ -3880,27 +3943,25 @@ fn structured_data_scan(
         Some(d) => dlp::count_ssns(d, dlp::SsnMode::Both),
         None => dlp::count_ssns_in(&mut byte_source::Stepper::new(data), dlp::SsnMode::Both),
     };
-    if let Some(threshold) = opts.structured_cc_count {
-        if count_cards() >= threshold as usize {
-            if let Some(o) = sink.hit(
-                "Heuristics.Structured.CreditCardNumber".to_string(),
-                0,
-                Method::Heuristic,
-            ) {
-                return Some(o);
-            }
-        }
+    if let Some(threshold) = opts.structured_cc_count
+        && count_cards() >= threshold as usize
+        && let Some(o) = sink.hit(
+            "Heuristics.Structured.CreditCardNumber".to_string(),
+            0,
+            Method::Heuristic,
+        )
+    {
+        return Some(o);
     }
-    if let Some(threshold) = opts.structured_ssn_count {
-        if count_ssns() >= threshold as usize {
-            if let Some(o) = sink.hit(
-                "Heuristics.Structured.SSN".to_string(),
-                0,
-                Method::Heuristic,
-            ) {
-                return Some(o);
-            }
-        }
+    if let Some(threshold) = opts.structured_ssn_count
+        && count_ssns() >= threshold as usize
+        && let Some(o) = sink.hit(
+            "Heuristics.Structured.SSN".to_string(),
+            0,
+            Method::Heuristic,
+        )
+    {
+        return Some(o);
     }
     None
 }
@@ -4039,7 +4100,7 @@ fn normalizations(ft: FileType, data: &dyn ByteSource) -> Vec<(ViewKind, FileTyp
             return vec![
                 (ViewKind::Html, FileType::HtmlView),
                 (ViewKind::Text, FileType::TextView),
-            ]
+            ];
         }
         FileType::Html => (ViewKind::Html, FileType::HtmlView),
         _ => (ViewKind::Text, FileType::TextView),
@@ -4175,7 +4236,7 @@ fn make_view(kind: ViewKind, data: &dyn ByteSource, opts: &ScanOptions) -> Optio
         ViewKind::Text => normalize::text_into(&mut src, &mut out),
         _ => normalize::javascript_into(&mut src, &mut out),
     }
-    match out.finish() {
+    match out.finish(opts.cache_sizes()) {
         Ok(spilled) => Some(View::Spilled(spilled)),
         Err(e) => {
             not_made(&e);
@@ -4233,6 +4294,7 @@ fn write_limits(budget: &Budget) -> bytecode::exec::WriteLimits {
     bytecode::exec::WriteLimits {
         file: budget.limits().max_buffer_bytes,
         total: budget.remaining_scan(),
+        memory: budget.limits().max_bytecode_memory_bytes,
     }
 }
 
@@ -4367,22 +4429,23 @@ fn core_matches(
     // on another, markup, an entity, a compressed stream or an escape in the
     // middle of a signature's text).
     #[cfg(feature = "visible-text")]
-    if !opts.clamav_compat && !db.engine.is_empty() {
-        if let Some(view) = profile::timed("visible-text", data.len() as u64, || {
+    if !opts.clamav_compat
+        && !db.engine.is_empty()
+        && let Some(view) = profile::timed("visible-text", data.len() as u64, || {
             visible_text_view(obj.name.unwrap_or(""), data, opts)
-        }) {
-            // Reported where the document is, as the other views are.
-            engine_pass(&view.text, FileType::TextView, None, None, None)?;
-            // A link that says one site and goes to another, in a document
-            // that is not HTML: judged as an anchor of an HTML one is.
-            if opts.alert_phishing {
-                let (found, complete) = phishing::scan_links(&view.links, &db.phishing);
-                if !complete {
-                    engine::mark_scan_truncated();
-                }
-                if let Some(p) = found {
-                    hit(p.signature(), false, 0, Method::Heuristic)?;
-                }
+        })
+    {
+        // Reported where the document is, as the other views are.
+        engine_pass(&view.text, FileType::TextView, None, None, None)?;
+        // A link that says one site and goes to another, in a document
+        // that is not HTML: judged as an anchor of an HTML one is.
+        if opts.alert_phishing {
+            let (found, complete) = phishing::scan_links(&view.links, &db.phishing);
+            if !complete {
+                engine::mark_scan_truncated();
+            }
+            if let Some(p) = found {
+                hit(p.signature(), false, 0, Method::Heuristic)?;
             }
         }
     }
@@ -4399,28 +4462,29 @@ fn core_matches(
         }
         unpacked = extracted;
     }
-    if !db.sections.is_empty() {
-        if let Some(image) = &image {
-            let found: Vec<_> = profile::timed("sections", data.len() as u64, || {
-                pe::section_slices(image)
-                    .into_iter()
-                    .filter_map(|(size, slice)| {
-                        db.sections
-                            .lookup(size, &hashes::section_digests(&db.sections, size, slice))
-                    })
-                    .collect()
-            });
-            for (name, unofficial) in found {
-                hit(&name, unofficial, 0, Method::Hash)?;
-            }
-        }
-    }
-    if !db.hashes.is_empty() && hash_matchable(data.len() as u64) {
-        if let Some((name, unofficial)) = profile::timed("hashes", data.len() as u64, || {
-            db.hashes.lookup(facts.digests(db), data.len() as u64)
-        }) {
+    if !db.sections.is_empty()
+        && let Some(image) = &image
+    {
+        let found: Vec<_> = profile::timed("sections", data.len() as u64, || {
+            pe::section_slices(image)
+                .into_iter()
+                .filter_map(|(size, slice)| {
+                    db.sections
+                        .lookup(size, &hashes::section_digests(&db.sections, size, slice))
+                })
+                .collect()
+        });
+        for (name, unofficial) in found {
             hit(&name, unofficial, 0, Method::Hash)?;
         }
+    }
+    if !db.hashes.is_empty()
+        && hash_matchable(data.len() as u64)
+        && let Some((name, unofficial)) = profile::timed("hashes", data.len() as u64, || {
+            db.hashes.lookup(facts.digests(db), data.len() as u64)
+        })
+    {
+        hit(&name, unofficial, 0, Method::Hash)?;
     }
     if !db.yara.is_empty() {
         let unofficial = db.yara.unofficial();
@@ -4463,8 +4527,8 @@ mod tests {
     /// How many times over a scan by `db` reads `data` from a source it does
     /// not hold in memory.
     fn passes_over(db: &Scanner, data: &[u8]) -> f64 {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         let read = Arc::new(AtomicU64::new(0));
         let reader = Counting(Cursor::new(data.to_vec()), read.clone());
         let opts = ScanOptions {
@@ -4543,6 +4607,78 @@ mod tests {
                 "{what}: read {passes:.2} times over, the bound is {bound}"
             );
         }
+    }
+
+    /// The size of the cache of an object read in place and of its blocks are
+    /// the scan's: a cache past the object serves the later reads of it from
+    /// memory, and a smaller block is more reads of the source.
+    #[test]
+    fn the_object_cache_follows_the_options() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Tally(Cursor<Vec<u8>>, std::sync::Arc<(AtomicU64, AtomicU64)>);
+        impl std::io::Read for Tally {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                self.1.0.fetch_add(n as u64, Ordering::Relaxed);
+                self.1.1.fetch_add(1, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl std::io::Seek for Tally {
+            fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(p)
+            }
+        }
+        // Noise with no magic, a hash signature of its size: detection, the
+        // digests and the sweep each read it through.
+        let size = 12 << 20;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut noise: Vec<u8> = (0..size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        for w in 0..noise.len() - 1 {
+            if matches!(
+                &noise[w..w + 2],
+                b"MZ" | b"PK" | b"7z" | b"BZ" | b"\x1f\x8b" | b"Ra" | b"MS"
+            ) {
+                noise[w] ^= 0x80;
+            }
+        }
+        let mut l = loader::Builder::new();
+        l.add_named_bytes("a.ndb", b"Sig.Pat:0:*:0badc0de0badf00d0bad\n", true);
+        let hdb = format!("0123456789abcdef0123456789abcdef:{size}:Sig.Hash\n");
+        l.add_named_bytes("c.hdb", hdb.as_bytes(), true);
+        let db = l.build().unwrap();
+        // (bytes read from the source, reads of it) for a scan.
+        let reads = |cache: u64, block: u64| {
+            let tally = std::sync::Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+            let opts = ScanOptions {
+                deep_analysis_max: 1 << 20,
+                object_cache_bytes: cache,
+                object_cache_block_bytes: block,
+                ..ScanOptions::default()
+            };
+            let reader = Tally(Cursor::new(noise.clone()), tally.clone());
+            scan_seekable(&db, reader, size as u64, &opts).unwrap();
+            (
+                tally.0.load(Ordering::Relaxed),
+                tally.1.load(Ordering::Relaxed),
+            )
+        };
+        let (small, small_reads) = reads(8 << 20, 64 << 10);
+        let (big, _) = reads(16 << 20, 64 << 10);
+        assert!(small > size as u64 * 3 / 2, "{small}");
+        assert!(big <= size as u64 + (1 << 20), "{big}");
+        let (_, fine_reads) = reads(8 << 20, 4 << 10);
+        assert!(
+            fine_reads > 8 * small_reads,
+            "{fine_reads} vs {small_reads}"
+        );
     }
 
     /// The one read of a streamed object finds what each step's own read of
@@ -5962,8 +6098,8 @@ mod tests {
 
     #[test]
     fn finds_eicar_inside_gzip() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
         e.write_all(eicar()).unwrap();
@@ -6101,8 +6237,8 @@ mod tests {
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn streamed_gzip_over_cap_finds_eicar() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
         e.write_all(eicar()).unwrap();
@@ -6190,8 +6326,8 @@ mod tests {
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn nested_gzip_over_entry_cap_is_streamed_and_found() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         // gzip whose decompressed content (padding + EICAR at the end) far exceeds
         // the tiny per-member buffer cap set below.
@@ -6364,8 +6500,8 @@ mod tests {
     fn http_range_scan_fetches_only_what_it_needs() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
 
         let big: Vec<u8> = (0..1_000_000u32).map(|i| (i as u8) ^ 0x5a).collect();
@@ -6422,7 +6558,10 @@ mod tests {
                 served_t.fetch_add(slice.len() as u64, Ordering::SeqCst);
                 let hdr = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    a, b, blob_t.len(), slice.len()
+                    a,
+                    b,
+                    blob_t.len(),
+                    slice.len()
                 );
                 let _ = stream.write_all(hdr.as_bytes());
                 let _ = stream.write_all(slice);
@@ -6485,10 +6624,9 @@ mod parity {
                     unpack::read_fixture(
                         path.to_string_lossy().trim_end_matches(".xor"),
                     )
+                    && data.len() < 8 << 20
                 {
-                    if data.len() < 8 << 20 {
-                        out.push((path.display().to_string(), data));
-                    }
+                    out.push((path.display().to_string(), data));
                 }
             }
         }

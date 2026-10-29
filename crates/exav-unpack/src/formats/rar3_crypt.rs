@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use aes::cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
+use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
 use sha1::{Digest, Sha1};
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;

@@ -7,10 +7,10 @@ use std::collections::HashSet;
 
 use exav_unpack::dwg::{BitResult, Bits, Object, Version};
 
+use super::Ctx;
 use super::entities::{self, Followers};
 use super::header::Vars;
 use super::tables::{entries, entry_head, lineweight, typed};
-use super::Ctx;
 use crate::formats::cad::model::*;
 use crate::formats::cad::proxy;
 

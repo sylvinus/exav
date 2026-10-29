@@ -17,9 +17,9 @@
 //! entries 3 (key 1, string 3, reference 4, rich_text_payload 9) and
 //! segments 4.
 
-use super::{text, ty, Reader};
-use crate::formats::office::common::iwa::proto::Msg;
+use super::{Reader, text, ty};
 use crate::formats::office::common::iwa::Store;
+use crate::formats::office::common::iwa::proto::Msg;
 use crate::formats::office::slides::error::Result;
 use crate::formats::office::slides::limits::Budget;
 use crate::formats::office::slides::model::*;
@@ -589,13 +589,11 @@ pub fn table(
             .collect(),
         rows: (0..d.rows)
             .map(|rw| Row {
-                h: to_emu(rows_h.get(&rw).map_or(def_h, |h| {
-                    if h.0 > 0.0 {
-                        f64::from(h.0)
-                    } else {
-                        def_h
-                    }
-                })),
+                h: to_emu(
+                    rows_h
+                        .get(&rw)
+                        .map_or(def_h, |h| if h.0 > 0.0 { f64::from(h.0) } else { def_h }),
+                ),
                 cells: vec![Cell::default(); d.cols as usize],
             })
             .collect(),
@@ -678,10 +676,10 @@ pub fn table(
             // Every second body row, from the second, over cells that set
             // no fill of their own.
             let own = raw.is_some_and(|c| c.cell_style.is_some());
-            if let Some(band) = band.filter(|_| reg == 0 && !own) {
-                if (rw - d.header_rows) % 2 == 1 {
-                    cell.fill = Fill::Solid(band);
-                }
+            if let Some(band) = band.filter(|_| reg == 0 && !own)
+                && (rw - d.header_rows) % 2 == 1
+            {
+                cell.fill = Fill::Solid(band);
             }
             if let Some(b) = borders.get(&(rw, col)) {
                 cell.borders = [

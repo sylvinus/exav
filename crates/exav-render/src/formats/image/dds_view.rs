@@ -8,7 +8,7 @@
 //! The first surface of the file is the picture: the largest mip level of the
 //! first face of a cube map, slice of a volume or element of an array.
 
-use super::{within, Channels, Error, Pixels, Samples};
+use super::{Channels, Error, Pixels, Samples, within};
 
 fn u32_at(data: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))

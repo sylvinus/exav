@@ -9,8 +9,8 @@
 //! member is reported encrypted like one no password opens.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// SHA-256 rounds all the 7z derivations of one scan may add up to: about
 /// 1.3 s (a round is about 20 ns), 128 derivations at 7-Zip's default of 2^19.
@@ -74,10 +74,10 @@ impl Kdf {
             return None;
         }
         let key = derive()?;
-        if let Ok(mut keys) = self.sevenz_keys.lock() {
-            if keys.len() < MAX_KEYS {
-                keys.insert(id, key);
-            }
+        if let Ok(mut keys) = self.sevenz_keys.lock()
+            && keys.len() < MAX_KEYS
+        {
+            keys.insert(id, key);
         }
         Some(key)
     }

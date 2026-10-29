@@ -1,6 +1,6 @@
 //! Keynote 1 to 5 documents (XML), over documents written here.
 
-use exav_render::slides::{convert, convert_keynote_package, Error, Format, Limits};
+use exav_render::slides::{Error, Format, Limits, convert, convert_keynote_package};
 use std::io::{Read, Write};
 
 fn part(pptx: &[u8], name: &str) -> String {

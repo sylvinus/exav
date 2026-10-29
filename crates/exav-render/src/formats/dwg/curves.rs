@@ -364,8 +364,8 @@ pub fn fit_spline(
     // Chord-length parameters.
     let mut t = Vec::with_capacity(pts.len());
     t.push(0.0);
-    for w in pts.windows(2) {
-        let d = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
+    for [a, b] in pts.array_windows() {
+        let d = (b[0] - a[0]).hypot(b[1] - a[1]);
         t.push(t[t.len() - 1] + d.max(1e-9));
     }
 
@@ -426,7 +426,7 @@ fn second_derivatives(t: &[f64], y: &[f64], d0: Option<f64>, dn: Option<f64>) ->
     if n < 2 {
         return vec![0.0; n];
     }
-    let h: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+    let h: Vec<f64> = t.array_windows().map(|[a, b]| b - a).collect();
 
     // Tridiagonal system, row i: lower[i] * m[i-1] + diag[i] * m[i] + upper[i] * m[i+1] = rhs[i]
     let mut lower = vec![0.0; n];

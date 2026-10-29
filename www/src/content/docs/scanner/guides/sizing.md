@@ -5,9 +5,10 @@ description: What to set on a 4 GiB machine running exav as a clamd or ICAP serv
 
 A worked example: one machine with 4 GiB of RAM and 6 GB of free disk for
 temp files, serving the clamd protocol (and optionally ICAP) with the full
-official database. The figures were measured with exav 0.0.2 and the official
+official database. The database figures were measured with the official
 `main`, `daily` and `bytecode` databases of September 2026 (3.6 million
-signatures); a later database is somewhat larger.
+signatures); a later database is somewhat larger. The limits that follow from
+them are worked out by exav at every start and printed in its log.
 
 ## The short answer
 
@@ -78,6 +79,52 @@ decoded from it and that image's grey copy, each as large again. What the scan
 holds in all is what is left after those two copies, a 16 MiB lowercase copy
 used for case-insensitive matching, and a tenth to spare:
 818 − 2 × 204 − 16 − 82 = 311 MiB.
+
+## What this host scans, and what to change to scan more
+
+With the command above (2 workers, 818 MiB a scan, 2 GiB of spill per process),
+by kind of input:
+
+| Input | Scanned in full | Past that | To go further |
+|---|---|---|---|
+| A file on disk, an `http(s)://` object | Any size. Up to 204 MiB it is held whole; larger, it is read through an 8 MiB block cache | A PE, ELF or .NET file skips the checks that need it whole, and RAR, OLE, PDF and the other [formats read whole](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole) are not opened. Either is `LIMITS-EXCEEDED` if nothing is found | `--workers 1` gives a scan 1637 MiB, and one object 409 MiB. Beyond that, more RAM |
+| Members of ZIP, tar, 7z, CAB, ISO, the compressors and the other formats decoded as read | Each member up to 2 GiB: held up to 204 MiB, and past that written to disk. All of them together up to 10 GiB fed to the matcher | A member over 2 GiB is not scanned. An archive past 10 GiB is scanned as far as that | `--max-spill-bytes` (disk for one member), `--max-total-spill-bytes` (disk for all of a process's), `--max-matcher-bytes` (the 10 GiB, a time bound) |
+| Members that have to be decoded whole: encrypted ZIP members, RAR, OLE and PDF streams, installers, files a filesystem stores compressed | 311 MiB added up over one scan, 204 MiB in one object | `LIMITS-EXCEEDED`, naming the limit | `--workers 1` raises them to 640 MiB and 409 MiB; `--max-process-bytes` sets the memory a scan gets. `--max-extracted-bytes` and `--max-object-bytes` only lower what that memory allows |
+| A stream: `INSTREAM`, an ICAP body, stdin | The first 2 GiB, 16 MiB of it in RAM and the rest on disk | The first 2 GiB is scanned and the stream is `LIMITS-EXCEEDED` | `--max-spill-bytes`, `--max-total-spill-bytes` and the disk under `--spill-dir` |
+| A bytecode signature | 204 MiB held by one run | The run stops, the scan says so | `--max-bytecode-memory-bytes`, itself capped at a quarter of a scan's memory |
+
+Scanning a file or object past 204 MiB is slow rather than limited: it is read
+from its source several times over. Over a network each read is a request, and
+`--object-cache-block-bytes`, `--object-cache-bytes` and `--http-request-bytes`
+set how many. The [block cache](/scanner/concepts/streaming-memory/#the-block-cache)
+page explains the model and shows what each setting did against a slow server.
+
+Measured on this configuration over HTTP, against a local server that makes up
+each object from its offset, so there was nothing to download and no disk to
+fill: a 20 GB object of text, RAR, OLE or PDF magic, held between 50 and 61 MB at
+its peak, and took from 2 to 21 minutes (the server answers at several GB/s, so
+this is the scan's own time). Archives holding one 20 GB member (ZIP, tar, gzip)
+peaked near 260 MB and, with the default 2 GiB spill ceiling, were reported
+`LIMITS-EXCEEDED` for the member, as was a small PE followed by 20 GB (19
+minutes, 258 MB). Raising the limits scans a member that size,
+as [the next measurements](#archives-past-the-spill-ceiling) show.
+
+### Archives past the spill ceiling
+
+A ZIP, a tar and a gzip, each holding one 5 GB text member (same server, same
+818 MiB scan), with `--max-matcher-bytes 30G` and `--max-spill-bytes` raised so
+that the member fits:
+
+| `--max-total-spill-bytes` | Result | Time | Peak memory |
+|---|---|---|---|
+| 6G | The member was scanned, but not its normalised text views: `LIMITS-EXCEEDED PARTIAL`, `no room in the 6 GiB process-wide spill budget` (all three formats) | 189 to 257 s | 261 to 269 MB |
+| 12G | tar: `OK` | 226 s | 272 MB |
+
+A text member is written to disk once as it is decoded, and its normalised
+views, which are as large as it is, are written beside it. Give the spill
+directory the member's size several times over, and set both
+`--max-spill-bytes` and `--max-total-spill-bytes` to it. Memory does not grow
+with the member: 270 MB is one 204 MiB object and the block caches.
 
 ## The flags, in the order to decide them
 

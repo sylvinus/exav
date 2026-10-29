@@ -33,13 +33,29 @@ It is vendored rather than depended on because a crate published on crates.io
 can only depend on crates.io releases: `cargo install exav` would build the
 release without the fixes.
 
-## Two fixes of exav's own
+## Fixes of exav's own
+
+0.20.0 (2026-10-24) has the two pull requests above and, on its own, the last
+two fixes below (`utf8_empty(false)` is in its `compile.rs`, the ASCII word
+boundaries in its `vm.rs`). Run against it, `cargo test -p exav-core pcre`
+passes but for the first fix.
+
+`analyze.rs`, `compile.rs`: the size analysis adds and multiplies with
+saturating arithmetic where 0.19.2 and 0.20.0 use `+` and `*` for the minimum
+size (`min_size * lo` of a repeat, the sums over a conditional and over the
+children of a sequence, `go_back` of a lookbehind). A signature of nested
+repeat counts, `((((a{65535}){65535}){65535}){65535}){65535}\1`, overflows
+`usize`: a panic where overflow checks are on (this workspace's release
+profile has them), a wrong size where they are off. Pinned by
+`nested_repeat_counts_do_not_overflow_the_size_analysis` in `engine/pcre.rs`,
+which panics inside 0.20.0's `analyze.rs`. Not yet reported upstream.
 
 `compile.rs`: the delegated regex-automata engines are configured with
 `utf8_empty(false)` outside `BytesMode::Unicode`. With its default (`true`) an
 engine skips an empty match at a position inside what would be a UTF-8
 sequence, so a delegated `x*` found no match before a byte over 0x7F, and
 `(\bb)x*` did not match `b\x9e`. Pinned by the same test as the next fix.
+Fixed in 0.20.0.
 
 `vm.rs`: in `BytesMode::Ascii`, `\b`, `\B` and `\b{start}`/`\b{end}` (and their
 half forms) read a word character as an ASCII one, as `\w` does. 0.19.2 asks
@@ -48,8 +64,7 @@ the position as UTF-8: `\bab` did not match `1\x9aab` (the byte `\x9a` was read
 with the `1` before it), where `regex` and PCRE2 find a boundary after `\x9a`,
 no word character. Found by `fuzz/fuzz_targets/pcre.rs`, pinned by
 `a_word_boundary_beside_a_high_byte_reads_the_same_in_both_engines` in
-`engine/pcre.rs`. Not yet reported upstream: when it is, say so here, and drop
-the change once a release carries the fix.
+`engine/pcre.rs`. Fixed in 0.20.0.
 
 ## What differs from upstream's `src/`
 
@@ -70,15 +85,18 @@ and do not run here.
 
 ## Going back to the crates.io release
 
-Once a release has both fixes (0.19.3 or later):
+Once a release has the size analysis fix above. 0.20.0 has everything else
+(with `variable-lookbehinds` in its features, which `exav-core` needs) and fails
+`nested_repeat_counts_do_not_overflow_the_size_analysis`. It also depends on
+`bit-set` 0.8, so the direct `bit-set` 0.11 goes with the copy.
 
 1. Delete this directory, and in `lib.rs` the `mod fancy_regex` declaration and
    `extern crate alloc`.
-2. In `Cargo.toml`, add `fancy-regex = "0.19.3"`, and remove `bit-set`, the
+2. In `Cargo.toml`, add `fancy-regex` with `default-features = false` and the
+   features `std`, `unicode`, `perf` and `variable-lookbehinds`, and remove `bit-set`, the
    `matches` and `quickcheck` dev-dependencies, and `[lib] doctest = false`.
 3. `crate::fancy_regex::` becomes `fancy_regex::` in `engine/mod.rs` and
    `engine/pcre.rs`.
-4. `cargo test -p exav-core pcre`: the cases there with a byte above 0x7F in a
-   lookaround or back reference fail without the fixes, and
-   `a_word_boundary_beside_a_high_byte_reads_the_same_in_both_engines` fails
-   unless the release also has the ASCII word boundary fix above.
+4. `cargo test -p exav-core pcre`, then the `pcre` fuzz target for a few
+   minutes: the cases with a byte above 0x7F in a lookaround or back reference,
+   and the word boundary ones, are what the fixes above are pinned by.

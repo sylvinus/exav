@@ -518,19 +518,82 @@ fn gunzipped_fat() -> Vec<u8> {
 
 // ─── Volumes written here ────────────────────────────────────────────────────
 
-/// A FAT volume of `size` bytes holding `files`.
+/// A FAT12 or FAT16 volume of `size` bytes holding `files` (names of 8.3 in
+/// lower case, which the entry says with its case flags), each in a run of
+/// clusters.
 fn fat_volume(size: usize, files: &[(&str, &[u8])]) -> Vec<u8> {
-    use std::io::Write;
-    let mut disk = std::io::Cursor::new(vec![0u8; size]);
-    fatfs::format_volume(&mut disk, fatfs::FormatVolumeOptions::new()).unwrap();
-    let fs = fatfs::FileSystem::new(&mut disk, fatfs::FsOptions::new()).unwrap();
-    let root = fs.root_dir();
-    for (name, data) in files {
-        root.create_file(name).unwrap().write_all(data).unwrap();
+    let sectors = size / 512;
+    let root_sectors = 32;
+    // The smallest cluster that keeps the volume within FAT16.
+    let spc = [1usize, 2, 4, 8, 16, 32, 64]
+        .into_iter()
+        .find(|&s| (sectors - 1 - root_sectors) / s < 60000)
+        .unwrap();
+    let guess = (sectors - 1 - root_sectors) / spc;
+    let bits = if guess < 4085 { 12 } else { 16 };
+    let fat_sectors = ((guess + 2) * bits / 8).div_ceil(512);
+    let first_data = 1 + 2 * fat_sectors + root_sectors;
+    let clusters = (sectors - first_data) / spc;
+    let mut d = vec![0u8; size];
+    d[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+    d[3..11].copy_from_slice(b"MSDOS5.0");
+    d[11..13].copy_from_slice(&512u16.to_le_bytes());
+    d[13] = spc as u8;
+    d[14..16].copy_from_slice(&1u16.to_le_bytes());
+    d[16] = 2;
+    d[17..19].copy_from_slice(&512u16.to_le_bytes());
+    // The sector count is in a 16-bit field, or in a 32-bit one when it is more.
+    match u16::try_from(sectors) {
+        Ok(n) => d[19..21].copy_from_slice(&n.to_le_bytes()),
+        Err(_) => d[32..36].copy_from_slice(&(sectors as u32).to_le_bytes()),
     }
-    drop(root);
-    fs.unmount().unwrap();
-    disk.into_inner()
+    d[21] = 0xF8;
+    d[22..24].copy_from_slice(&(fat_sectors as u16).to_le_bytes());
+    d[38] = 0x29;
+    d[54..62].copy_from_slice(if bits == 12 { b"FAT12   " } else { b"FAT16   " });
+    d[510..512].copy_from_slice(&[0x55, 0xAA]);
+    let fat = 512;
+    let set = |d: &mut Vec<u8>, c: usize, v: usize| {
+        for copy in 0..2 {
+            let t = fat + copy * fat_sectors * 512;
+            if bits == 16 {
+                d[t + c * 2..t + c * 2 + 2].copy_from_slice(&(v as u16).to_le_bytes());
+            } else {
+                let at = t + c + c / 2;
+                let pair = u16::from_le_bytes([d[at], d[at + 1]]);
+                let pair = if c % 2 == 1 {
+                    (pair & 0x000F) | ((v as u16) << 4)
+                } else {
+                    (pair & 0xF000) | v as u16
+                };
+                d[at..at + 2].copy_from_slice(&pair.to_le_bytes());
+            }
+        }
+    };
+    let end = if bits == 16 { 0xFFFF } else { 0xFFF };
+    set(&mut d, 0, if bits == 16 { 0xFFF8 } else { 0xFF8 });
+    set(&mut d, 1, end);
+    let (mut next, root) = (2usize, fat + 2 * fat_sectors * 512);
+    for (i, (name, data)) in files.iter().enumerate() {
+        let n = data.len().div_ceil(spc * 512);
+        assert!(next + n <= clusters + 2, "the volume is full");
+        for c in next..next + n {
+            set(&mut d, c, if c + 1 == next + n { end } else { c + 1 });
+        }
+        let at = first_data * 512 + (next - 2) * spc * 512;
+        d[at..at + data.len()].copy_from_slice(data);
+        let (base, ext) = name.split_once('.').unwrap_or((name, ""));
+        let e = root + i * 32;
+        d[e..e + 11].fill(b' ');
+        d[e..e + base.len()].copy_from_slice(base.to_ascii_uppercase().as_bytes());
+        d[e + 8..e + 8 + ext.len()].copy_from_slice(ext.to_ascii_uppercase().as_bytes());
+        d[e + 11] = 0x20;
+        d[e + 12] = 0x18;
+        d[e + 26..e + 28].copy_from_slice(&(next as u16).to_le_bytes());
+        d[e + 28..e + 32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        next += n;
+    }
+    d
 }
 
 /// `n` bytes that compress, and differ from those of another `seed`.
@@ -808,9 +871,8 @@ fn the_boot_area_of_a_walked_disk_comes_out() {
     assert_eq!(boot.data[510..512], [0x55, 0xAA]);
 }
 
-/// ext is read from a copy of its volume, so a volume over the limit is
-/// reported, and one under it is streamed for the engine to walk: either way
-/// the volume, not the disk, is what is copied.
+/// An ext volume under the limit is streamed for the engine to walk, and one
+/// over it is walked in place, from its own range of the disk.
 #[test]
 fn an_ext_volume_in_a_big_disk_is_read_from_its_own_range() {
     let ext = super::ext::fixture();
@@ -821,11 +883,55 @@ fn an_ext_volume_in_a_big_disk_is_read_from_its_own_range() {
     assert!(named(&e, "mbr-part-1").data == ext);
     let (e, end) = walked(Format::Qcow2, &blob, limits(MIB));
     end.unwrap();
-    let r = named(&e, "mbr-part-1/<ext-filesystem>");
-    assert!(
-        r.unsupported.is_some_and(|w| w.contains("peak-buffer")),
-        "{r:?}"
+    unreported(&e);
+    let p = named(&e, "mbr-part-1/sub/p.zip");
+    assert_eq!(
+        sha256_hex(&p.data),
+        "d61da8b0c3cd1d5ffa812601aae787c81a7424850c4dca15c27e593f8f92fcc8"
     );
+}
+
+/// The raw volume of an Apple image: the disk of a UDRW image, which is its
+/// bytes before the trailer, from where the filesystem's header says it starts.
+#[cfg(feature = "dmg")]
+fn apple_volume(dmg: &str, magic: &[u8], header_at: usize) -> Vec<u8> {
+    let p = format!("{}/tests/fixtures/dmg/{dmg}", env!("CARGO_MANIFEST_DIR"));
+    let image = exav_unpack::read_fixture(&p).unwrap();
+    let disk = &image[..image.len() - 512];
+    let at = disk
+        .windows(magic.len())
+        .position(|w| w == magic)
+        .unwrap_or_else(|| panic!("no filesystem in {dmg}"))
+        - header_at;
+    disk[at..].to_vec()
+}
+
+/// An HFS+ or an APFS volume in a disk is walked where it lies, as the others
+/// are, and one that fits the limit is streamed as it was.
+#[cfg(feature = "dmg")]
+#[test]
+fn an_hfs_plus_or_apfs_volume_in_a_big_disk_is_walked_from_its_own_range() {
+    for (dmg, magic, header_at, ptype) in [
+        ("hfs_plus_udrw.dmg", &[0x48u8, 0x2B, 0, 4][..], 1024, 0xAF),
+        ("apfs_udrw.dmg", b"NXSB", 32, 0xAB),
+    ] {
+        let volume = apple_volume(dmg, magic, header_at);
+        let disk = mbr_disk(100 * GIB, volume.clone(), ptype);
+        let blob = qcow2(128 * GIB, 16, &disk, Packing::Deflate);
+        let (e, end) = walked(Format::Qcow2, &blob, limits(volume.len() as u64 + 1));
+        end.unwrap();
+        assert!(named(&e, "mbr-part-1").data == volume, "{dmg}");
+        let (e, end) = walked(Format::Qcow2, &blob, limits(volume.len() as u64 / 2));
+        end.unwrap_or_else(|h| panic!("{dmg}: {h:?}"));
+        unreported(&e);
+        let hello = e
+            .iter()
+            .find(|x| x.name.starts_with("mbr-part-1/") && x.data.starts_with(b"hello hfs+"))
+            .unwrap_or_else(|| {
+                panic!("{dmg}: {:?}", e.iter().map(|x| &x.name).collect::<Vec<_>>())
+            });
+        assert!(hello.name.ends_with("test.txt"), "{dmg}: {}", hello.name);
+    }
 }
 
 // ─── Bounds ──────────────────────────────────────────────────────────────────

@@ -11,9 +11,9 @@
 //! Seeds: `scripts/fuzz-seeds.sh` (the `containers` directory, every test
 //! fixture of at most 64 KiB), so the mutator starts inside each parser instead
 //! of rediscovering magic bytes.
-use libfuzzer_sys::fuzz_target;
 use exav_fuzz_support::extreme;
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
+use libfuzzer_sys::fuzz_target;
 
 // A quarter of the mutations set one header field to the top of its range, where
 // unchecked sums overflow (see `extreme.rs`).
@@ -41,7 +41,6 @@ fn tight_limits() -> Limits {
 }
 
 fuzz_target!(|data: &[u8]| {
-    exav_fuzz_support::panics::tolerate_inside(exav_fuzz_support::panics::CONTAINED);
     // `Format::ALL`, not a list of our own: a hand-kept copy here fell behind
     // the enum and left 26 formats unfuzzed. Each parser's error paths are
     // reached directly, without the mutator synthesising valid magic bytes.

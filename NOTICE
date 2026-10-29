@@ -409,6 +409,19 @@ Copyright (c) 2015-2016, Apple Inc. All rights reserved.
 
 
 -------------------------------------------------------------------------------
+1h7. cmpfs, MIT (source derivative)
+-------------------------------------------------------------------------------
+
+crates/exav-unpack/src/formats/decmpfs.rs, the decoder of the files macOS
+compresses (decmpfs) for HFS+ and APFS, follows cmpfs 0.1.0's reading of the
+attribute and of the resource fork (the types, the block tables, the stored-block
+markers), over exav's own codecs and with its own bounds.
+
+Upstream: https://github.com/Dil4rd/dpp
+Copyright (c) 2026 Dil4rd
+
+
+-------------------------------------------------------------------------------
 1h. oletools test sample, BSD-2-Clause (test fixture)
 -------------------------------------------------------------------------------
 
@@ -721,7 +734,6 @@ the distributor's choice. Notable examples:
   delharc, lzxd                          LHA/CAB codecs
   bitstream-io                           bit-level readers for decoders
   stringprep                             PDF password normalization
-  ext4-view                              ext2/3/4 filesystem reader
   image                                  image decoding (image hashing)
   pulldown-cmark                         Markdown in exav-render (`markdown`
                                            feature) and @exav/viewer; MIT,
@@ -751,9 +763,9 @@ fixtures. The shipped 7z reader is native (§1m), the bzip2 decoder is vendored
 (§1h3) and the LZFSE decoder is ported from Apple's (§1h6).
 
 MIT-only components (the MIT copyright and permission notice must be retained;
-the MIT text is in the exav LICENSE file): apfs, ascii_tree, bcdec_rs (2023 SMG;
+the MIT text is in the exav LICENSE file): ascii_tree, bcdec_rs (2023 SMG;
 a port of bcdec, MIT or public domain, 2022 Sergii Kudlai), cfb, color_quant,
-deflate64, fatfs, fax, fax_derive, goblin, hfsplus, lznt1, quick-xml,
+deflate64, fax, fax_derive, goblin, lznt1, quick-xml,
 rmp, rmp-serde, ruzstd, salzweg, scroll, scroll_derive, simd-adler32, slab,
 strsim, xz4rust, zip, zmij, and bytes (`http` features only). fancy-regex and
 tiff are vendored, and Pillow's resampler ported (§1h5); unshield and explode
@@ -770,8 +782,7 @@ RustCrypto crates are MIT OR Apache-2.0. Offered under Zlib among other
 licenses: miniz_oxide, tinyvec, bytemuck. Zlib: zlib-rs (§1l). Unicode-3.0:
 unicode-ident (build-time), and yoke, yoke-derive, zerofrom and
 zerofrom-derive (§1s). Other permissive
-licenses: CC0-1.0 OR MIT-0 OR Apache-2.0 (constant_time_eq),
-CDLA-Permissive-2.0 (webpki-roots, TLS root store, `http` features only). The
+licenses: CDLA-Permissive-2.0 (webpki-roots, TLS root store, `http` features only). The
 dev-only crates add CC0-1.0 / MIT-0 (ppmd-rust) and bzip2-1.0.6
 (libbz2-rs-sys), which reach no shipped artifact.
 

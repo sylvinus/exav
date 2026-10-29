@@ -8,7 +8,7 @@
 //! unwinding. The only place to stop it is before the reader is handed the
 //! bytes.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 /// The 143-byte archive that reserves ~3.2 GB. Its level-3 header states a
 /// total of 0xFFFFFFDF, which cannot be true of a file this size.

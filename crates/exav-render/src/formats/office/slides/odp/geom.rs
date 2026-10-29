@@ -590,11 +590,7 @@ impl Env<'_> {
             env: self,
         };
         let v = p.expr(0);
-        if v.is_finite() {
-            v
-        } else {
-            0.0
-        }
+        if v.is_finite() { v } else { 0.0 }
     }
 
     /// A path parameter: number, ?equation, $modifier or keyword.
@@ -1019,7 +1015,11 @@ mod tests {
     #[test]
     fn enhanced_paths_with_equations_and_modifiers() {
         let x = br#"<draw:enhanced-geometry xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" svg:viewBox="0 0 21600 21600" draw:modifiers="5400" draw:enhanced-path="M $0 0 L right ?f0 ?f1 bottom Z N"><draw:equation draw:name="f0" draw:formula="$0 * 2"/><draw:equation draw:name="f1" draw:formula="if(-1, 3, max(?f0, 7) - 10800)"/></draw:enhanced-geometry>"#;
-        let n = crate::formats::office::common::xml::parse(x, 100).unwrap();
+        let n = crate::formats::office::common::xml::parse(
+            x,
+            &mut crate::formats::office::common::xml::within(1 << 20),
+        )
+        .unwrap();
         let (g, _, _, _) = enhanced(&n, 100, 100).unwrap();
         // In path units: the 21600 view box scaled to 100000.
         assert_eq!(

@@ -12,14 +12,14 @@ mod resolve;
 mod sheet;
 mod text;
 
-use crate::formats::office::common::cfb::Compound;
 use crate::formats::office::common::xml::{self, Node};
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::limits::Budget;
 use crate::formats::office::slides::model::*;
 use crate::formats::office::slides::package::{Source, Zip};
+use exav_unpack::cfb::Compound;
 use resolve::{Doc, Master as MasterPart};
-use sheet::{local, Rels, Sheet};
+use sheet::{Rels, Sheet, local};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -102,8 +102,7 @@ fn dir_of(part: &str) -> &str {
 }
 
 fn parse_part(bytes: &[u8], budget: &mut Budget) -> Result<Node> {
-    budget.alloc(bytes.len() as u64 * 3)?;
-    Ok(xml::parse(bytes, xml::MAX_ELEMENTS)?)
+    Ok(xml::parse(bytes, &mut budget.tree())?)
 }
 
 /// The relationships of `part` ("" for the package).
@@ -411,10 +410,11 @@ fn collect_masters(shapes: &[Sheet], ids: &mut Vec<u32>, depth: u32) {
         return;
     }
     for s in shapes {
-        if let Some(m) = s.master {
-            if !ids.contains(&m) && ids.len() < 4096 {
-                ids.push(m);
-            }
+        if let Some(m) = s.master
+            && !ids.contains(&m)
+            && ids.len() < 4096
+        {
+            ids.push(m);
         }
         collect_masters(&s.shapes, ids, depth + 1);
     }
@@ -486,12 +486,11 @@ pub(crate) fn read(mut z: Zip, budget: &mut Budget) -> Result<Presentation> {
     let mut doc = read_doc(&docx, budget)?;
     drop(docx);
     let doc_rels = rels_of(&mut z, &doc_part, budget)?;
-    if let Some(theme) = of_kind(&doc_rels, "/theme") {
-        if let Some(b) = z.get(theme, max, budget)? {
-            if let Ok(n) = parse_part(&b, budget) {
-                read_theme(&n, &mut doc);
-            }
-        }
+    if let Some(theme) = of_kind(&doc_rels, "/theme")
+        && let Some(b) = z.get(theme, max, budget)?
+        && let Ok(n) = parse_part(&b, budget)
+    {
+        read_theme(&n, &mut doc);
     }
     let pages = match of_kind(&doc_rels, "/pages") {
         Some(part) => read_pages(&mut z, part, budget, &mut p)?,

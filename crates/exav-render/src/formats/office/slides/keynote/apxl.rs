@@ -59,10 +59,10 @@ impl Pkg<'_> {
         match self {
             Pkg::None => Ok(None),
             Pkg::Zip(z, base) => {
-                if !base.is_empty() {
-                    if let Some(d) = z.read(&format!("{base}{path}"), 64 << 20)? {
-                        return Ok(Some(d));
-                    }
+                if !base.is_empty()
+                    && let Some(d) = z.read(&format!("{base}{path}"), 64 << 20)?
+                {
+                    return Ok(Some(d));
                 }
                 z.read(path, 64 << 20)
             }
@@ -168,10 +168,10 @@ impl<'a> Reader<'a> {
         if let Some(id) = n.attr("sfa:ID") {
             self.ids.entry(id).or_insert((n, sheet));
         }
-        if sheet != NONE {
-            if let Some(ident) = n.attr("sf:ident") {
-                self.sheets[sheet].idents.entry(ident).or_insert(n);
-            }
+        if sheet != NONE
+            && let Some(ident) = n.attr("sf:ident")
+        {
+            self.sheets[sheet].idents.entry(ident).or_insert(n);
         }
         for c in n.nodes() {
             self.index(c, sheet, depth + 1);
@@ -193,10 +193,10 @@ impl<'a> Reader<'a> {
                 return None;
             }
             let s = &self.sheets[cur];
-            if let Some(&node) = s.idents.get(ident) {
-                if not.is_none_or(|x| !std::ptr::eq(x, node)) {
-                    return Some(Sty { node, sheet: cur });
-                }
+            if let Some(&node) = s.idents.get(ident)
+                && not.is_none_or(|x| !std::ptr::eq(x, node))
+            {
+                return Some(Sty { node, sheet: cur });
             }
             cur = s.parent.unwrap_or(NONE);
         }
@@ -221,13 +221,13 @@ impl<'a> Reader<'a> {
         let mut cur = style;
         for _ in 0..MAX_CHAIN {
             let s = cur?;
-            if let Some(p) = s.node.child("sf:property-map").and_then(|m| m.child(name)) {
-                if let Some(v) = p.nodes().next() {
-                    if v.name == "sf:null" {
-                        return None;
-                    }
-                    return Some(self.deref(v, s.sheet));
+            if let Some(p) = s.node.child("sf:property-map").and_then(|m| m.child(name))
+                && let Some(v) = p.nodes().next()
+            {
+                if v.name == "sf:null" {
+                    return None;
                 }
+                return Some(self.deref(v, s.sheet));
             }
             cur = self.parent(s);
         }
@@ -1205,10 +1205,9 @@ impl<'a> Reader<'a> {
                 "sng"
             }
         });
-        rp.strike =
-            get("sf:strikethru")
-                .and_then(num)
-                .map(|u| if u == 0.0 { "noStrike" } else { "sngStrike" });
+        rp.strike = get("sf:strikethru")
+            .and_then(num)
+            .map(|u| if u == 0.0 { "noStrike" } else { "sngStrike" });
         rp.caps = match get("sf:capitalization").and_then(num) {
             Some(1.0) => Some("all"),
             Some(2.0) => Some("small"),

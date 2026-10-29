@@ -55,6 +55,8 @@ const MAX_BOUND_REFERENCES = 64;
 const DEFAULT_MAX_PRIMITIVES = 8_000_000;
 /** 512 MiB: half the native reader's default, the module's memory being smaller. */
 const DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024;
+/** About 512 MiB of the module's memory, at the 512 bytes an entity takes. */
+const DEFAULT_MAX_ENTITIES = 1_000_000;
 
 /** WebGL2, which the renderer needs. */
 export function isCadSupported(): boolean {
@@ -125,6 +127,7 @@ export const renderer: PluginRenderer<CadOptions> = {
     const timeoutMs = ctx.options.timeoutMs ?? 120_000;
     const maxPrimitives = ctx.options.maxPrimitives ?? DEFAULT_MAX_PRIMITIVES;
     const maxDecompressedBytes = ctx.options.maxDecompressedBytes ?? DEFAULT_MAX_DECOMPRESSED_BYTES;
+    const maxEntities = ctx.options.maxEntities ?? DEFAULT_MAX_ENTITIES;
     let drawing: ParsedDrawing | null = null;
     let visible: boolean[] = [];
     let destroyed = false;
@@ -586,7 +589,7 @@ export const renderer: PluginRenderer<CadOptions> = {
           } finally {
             reader.dispose();
           }
-          const answer = (await engine.call({ kind: "attach", path, bytes: bytes.buffer as ArrayBuffer, maxDecompressedBytes }, [bytes.buffer as ArrayBuffer], timeoutMs)) as {
+          const answer = (await engine.call({ kind: "attach", path, bytes: bytes.buffer as ArrayBuffer, maxDecompressedBytes, maxEntities }, [bytes.buffer as ArrayBuffer], timeoutMs)) as {
             xrefs: string[];
           };
           wanted = answer.xrefs;
@@ -632,7 +635,7 @@ export const renderer: PluginRenderer<CadOptions> = {
       if (tree) {
         // The files around the drawing are bound in before it is drawn.
         const parsed = (await engine.call(
-          { kind: "parse", bytes: again, layout: "", background: backgroundBytes(), maxPrimitives, maxDecompressedBytes, draw: false },
+          { kind: "parse", bytes: again, layout: "", background: backgroundBytes(), maxPrimitives, maxDecompressedBytes, maxEntities, draw: false },
           again ? [again] : [],
           timeoutMs,
         )) as { xrefs: string[] };
@@ -641,7 +644,7 @@ export const renderer: PluginRenderer<CadOptions> = {
       } else {
         await show(
           engine.call(
-            { kind: "parse", bytes: again, layout: "", background: backgroundBytes(), maxPrimitives, maxDecompressedBytes },
+            { kind: "parse", bytes: again, layout: "", background: backgroundBytes(), maxPrimitives, maxDecompressedBytes, maxEntities },
             again ? [again] : [],
             timeoutMs,
           ),

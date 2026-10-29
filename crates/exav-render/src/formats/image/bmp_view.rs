@@ -5,7 +5,7 @@
 //! rewritten, or the data expanded, and the file decoded again. A fallback of
 //! `decode_any` only.
 
-use super::{decode, within, Error, Format, Pixels, Samples};
+use super::{Error, Format, Pixels, Samples, decode, within};
 
 pub(super) fn decode_repaired(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     let mut file = data.to_vec();
@@ -50,12 +50,10 @@ pub(super) fn decode_repaired(data: &[u8], max_alloc: u64) -> Result<Pixels, Err
         other => other,
     };
     let mut pixels = decoded?;
-    if flip {
-        if let Samples::U8(samples) = &mut pixels.samples {
-            let row = pixels.width as usize * pixels.channels.count();
-            let rows: Vec<&[u8]> = samples.chunks(row.max(1)).collect();
-            *samples = rows.into_iter().rev().flatten().copied().collect();
-        }
+    if flip && let Samples::U8(samples) = &mut pixels.samples {
+        let row = pixels.width as usize * pixels.channels.count();
+        let rows: Vec<&[u8]> = samples.chunks(row.max(1)).collect();
+        *samples = rows.into_iter().rev().flatten().copied().collect();
     }
     Ok(pixels)
 }

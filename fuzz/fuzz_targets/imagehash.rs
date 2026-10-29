@@ -6,7 +6,7 @@
 //! pdf.js, with parameters taken from the input's length (JBIG2 with and
 //! without a globals stream).
 use exav_imagehash::{Hasher, Params};
-use exav_render::pdf_image::{decode_ccitt, decode_jbig2, decode_jpx, CcittParams, JpxParams};
+use exav_render::pdf_image::{CcittParams, JpxParams, decode_ccitt, decode_jbig2, decode_jpx};
 use libfuzzer_sys::fuzz_target;
 
 const BUDGET: u64 = 64 << 20;

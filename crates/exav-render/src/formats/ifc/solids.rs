@@ -4,12 +4,12 @@
 
 use std::f64::consts::TAU;
 
-use super::curves::{segments, SEGMENTS_PER_TURN};
-use super::math::{add, any_perpendicular, cross, dot, len, scale, sub, unit, Xf, V2, V3};
+use super::curves::{SEGMENTS_PER_TURN, segments};
+use super::math::{V2, V3, Xf, add, any_perpendicular, cross, dot, len, scale, sub, unit};
 use super::profiles::Profile;
 use super::step::Value;
 use super::triangulate::{triangulate, triangulate_3d};
-use super::{is, Mesh, Reader};
+use super::{Mesh, Reader, is};
 
 /// Most triangles one swept or sampled item may have before it is made.
 const MAX_ITEM_TRIANGLES: usize = 4_000_000;
@@ -343,8 +343,8 @@ impl<'a> Reader<'a> {
             + profile.open.iter().map(Vec::len).sum::<usize>();
         self.budget(ring_len.saturating_mul(2).saturating_mul(pts.len()))?;
         let dirs: Vec<V3> = pts
-            .windows(2)
-            .map(|w| unit(sub(w[1], w[0])))
+            .array_windows()
+            .map(|&[a, b]| unit(sub(b, a)))
             .collect::<Option<_>>()?;
         // The profile's x axis on each segment.
         let mut xs: Vec<V3> = Vec::with_capacity(dirs.len());
@@ -459,12 +459,13 @@ impl<'a> Reader<'a> {
         let faces = p.get(2)?.list()?;
         for f in faces.iter().filter_map(Value::id) {
             let (fty, fp) = self.get(f)?;
-            let mut lps: Vec<Vec<u32>> = vec![fp
-                .first()?
-                .list()?
-                .iter()
-                .map(|i| index(i, &pn, n))
-                .collect::<Option<_>>()?];
+            let mut lps: Vec<Vec<u32>> = vec![
+                fp.first()?
+                    .list()?
+                    .iter()
+                    .map(|i| index(i, &pn, n))
+                    .collect::<Option<_>>()?,
+            ];
             if fty == b"IFCINDEXEDPOLYGONALFACEWITHVOIDS" {
                 for h in fp.get(1)?.list()? {
                     lps.push(
@@ -501,12 +502,12 @@ impl<'a> Reader<'a> {
                 self.warnings.invalid = self.warnings.invalid.saturating_add(1);
                 continue;
             };
-            if fty == b"IFCADVANCEDFACE" || fty == b"IFCFACESURFACE" {
-                if let Some(face) = self.surface_face(&fp, depth) {
-                    self.spend(face.t.len())?;
-                    m.append(&face);
-                    continue;
-                }
+            if (fty == b"IFCADVANCEDFACE" || fty == b"IFCFACESURFACE")
+                && let Some(face) = self.surface_face(&fp, depth)
+            {
+                self.spend(face.t.len())?;
+                m.append(&face);
+                continue;
             }
             let Some(bounds) = fp.first().and_then(Value::list) else {
                 continue;

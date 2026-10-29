@@ -1,6 +1,5 @@
 //! Text documents in other encodings than UTF-8, to UTF-8: SpreadsheetML in
-//! the encoding its XML declaration names, HTML in the one its BOM or
-//! `<meta>` names, SYLK in a Windows code page.
+//! the encoding its XML declaration names (HTML is `exav_unpack::html::decode`).
 
 use std::borrow::Cow;
 
@@ -91,29 +90,6 @@ pub fn xml_utf8(b: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-/// An HTML document as UTF-8 text: its BOM's encoding, else the charset a
-/// `<meta>` in its first kilobytes names, else UTF-8 when it is valid
-/// UTF-8, else Windows-1252.
-pub fn html_utf8(b: &[u8]) -> Cow<'_, str> {
-    if let Some(enc) = utf16(b) {
-        return enc.decode_with_bom_removal(even(b, enc)).0;
-    }
-    if let Some(rest) = b.strip_prefix(b"\xEF\xBB\xBF") {
-        return String::from_utf8_lossy(rest);
-    }
-    let head = String::from_utf8_lossy(&b[..b.len().min(HEAD * 4)]);
-    let named =
-        attr_value(&head, "charset").and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()));
-    let enc = match named {
-        // A page declaring UTF-16 that is not is read as ASCII-compatible.
-        Some(e) if e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE => encoding_rs::UTF_8,
-        Some(e) => e,
-        None if std::str::from_utf8(b).is_ok() => encoding_rs::UTF_8,
-        None => encoding_rs::WINDOWS_1252,
-    };
-    enc.decode_without_bom_handling(b).0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,21 +111,5 @@ mod tests {
             &*xml_utf8(b"<a encoding='latin1'>\xE9</a>"),
             b"<a encoding='latin1'>\xE9</a>"
         );
-    }
-
-    #[test]
-    fn html() {
-        assert_eq!(
-            html_utf8(b"<meta charset=windows-1251><td>\xC0"),
-            "<meta charset=windows-1251><td>\u{410}"
-        );
-        assert_eq!(
-            html_utf8(
-                b"<meta http-equiv=Content-Type content=\"text/html; charset=iso-8859-1\">\xE9"
-            ),
-            "<meta http-equiv=Content-Type content=\"text/html; charset=iso-8859-1\">\u{E9}"
-        );
-        assert_eq!(html_utf8("<td>é".as_bytes()), "<td>é");
-        assert_eq!(html_utf8(b"<td>\xE9"), "<td>\u{E9}");
     }
 }

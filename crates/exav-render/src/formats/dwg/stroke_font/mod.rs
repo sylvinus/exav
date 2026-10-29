@@ -186,7 +186,7 @@ impl<'a> Glyph<'a> {
 
     /// The strokes, each a run of points in cap-height units with the origin on
     /// the baseline at the glyph's left edge.
-    pub fn polylines(&self) -> impl Iterator<Item = Polyline<'a>> + 'a {
+    pub fn polylines(&self) -> impl Iterator<Item = Polyline<'a>> + 'a + use<'a> {
         let (a, z) = self.poly_range();
         let font = self.font;
         (a..z).map(move |i| Polyline { font, index: i })
@@ -218,7 +218,7 @@ impl<'a> Polyline<'a> {
     }
 
     /// The points, in cap heights.
-    pub fn points(&self) -> impl Iterator<Item = [f32; 2]> + 'a {
+    pub fn points(&self) -> impl Iterator<Item = [f32; 2]> + 'a + use<'a> {
         let (a, z) = self.range();
         let font = self.font;
         (a..z).map(move |i| {

@@ -768,14 +768,14 @@ impl Cpu {
         // clearing every slot each time costs more than the decoding it was
         // meant to save. A self-modifying stub turns the cache into pure
         // overhead, by orders of magnitude, unless invalidation is this cheap.
-        let gen = mem.code_generation();
+        let r#gen = mem.code_generation();
         // Indexed by the full address, not `eip >> 1`: consecutive
         // instructions often differ by one byte (`inc ecx; dec ecx`), and
         // folding that bit away maps neighbours onto the same slot, so
         // straight-line code evicts itself every step and never hits.
         let slot = self.eip as usize & (CACHE_SLOTS - 1);
         let insn = match &self.cache[slot] {
-            Some((g, ip, insn)) if *g == gen && *ip == self.eip => insn.clone(),
+            Some((g, ip, insn)) if *g == r#gen && *ip == self.eip => insn.clone(),
             _ => {
                 let mut buf = [0u8; MAX_INSN];
                 let n = mem.read_code(self.eip, &mut buf);
@@ -795,7 +795,7 @@ impl Cpu {
                 // to either one invalidates the cached decode.
                 mem.mark_executed(self.eip);
                 mem.mark_executed(self.eip.wrapping_add(insn.len as u32 - 1));
-                self.cache[slot] = Some((gen, self.eip, insn.clone()));
+                self.cache[slot] = Some((r#gen, self.eip, insn.clone()));
                 insn
             }
         };
@@ -1359,7 +1359,7 @@ impl Cpu {
 
             // Port I/O from ring 3: a fault the program is expected to catch.
             In | Out | Insb | Insw | Insd | Outsb | Outsw | Outsd => {
-                return Err(Stop::Privileged(ip))
+                return Err(Stop::Privileged(ip));
             }
 
             // Packed BCD. No compiler emits these; obfuscators do, precisely
@@ -1769,11 +1769,9 @@ impl Cpu {
                 let merges = matches!(m, Movss | Movsd)
                     && matches!(insn.ops[0], Op::Xmm(_))
                     && matches!(insn.ops[1], Op::Xmm(_));
-                if merges {
-                    if let Op::Xmm(r) = insn.ops[0] {
-                        self.xmm[r as usize & 7][..n].copy_from_slice(&v[..n]);
-                        return Ok(true);
-                    }
+                if merges && let Op::Xmm(r) = insn.ops[0] {
+                    self.xmm[r as usize & 7][..n].copy_from_slice(&v[..n]);
+                    return Ok(true);
                 }
                 self.write_simd(mem, insn, 0, &v)?;
                 Ok(true)

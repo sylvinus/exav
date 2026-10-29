@@ -6,473 +6,23 @@
 //! `rowspan` as merges, `<col>` widths and `<tr>` heights.
 //!
 //! Data only: scripts, frames, images and links to other files are not
-//! followed; nothing is fetched. The tokenizer is bounded like the XML
-//! readers: elements, attributes, nesting and text.
+//! followed; nothing is fetched. The tokens are those of
+//! `exav_unpack::html`, charged to the budget as they are made; the nesting
+//! and the text of a cell are bounded here.
 
+use crate::formats::office::common::css::Sheet;
 use crate::formats::office::sheets::css;
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
+use exav_unpack::html::{self, Token, attr as get};
 use std::collections::HashSet;
 
-const MAX_TOKENS: usize = 20_000_000;
-const MAX_ATTRS: usize = 256;
 const MAX_DEPTH: usize = 256;
 /// Characters of one cell's text.
 const MAX_CELL_TEXT: usize = 32_767;
 
-// ------------------------------------------------------------ tokenizer
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum Token {
-    Start {
-        name: String,
-        attrs: Vec<(String, String)>,
-        closed: bool,
-    },
-    End(String),
-    Text(String),
-    Comment(String),
-}
-
-/// HTML 4's named character references (the Latin-1 set and the common
-/// symbols), sorted.
-const ENTITIES: &[(&str, char)] = &[
-    ("AElig", 'Æ'),
-    ("Aacute", 'Á'),
-    ("Acirc", 'Â'),
-    ("Agrave", 'À'),
-    ("Aring", 'Å'),
-    ("Atilde", 'Ã'),
-    ("Auml", 'Ä'),
-    ("Ccedil", 'Ç'),
-    ("Dagger", '‡'),
-    ("ETH", 'Ð'),
-    ("Eacute", 'É'),
-    ("Ecirc", 'Ê'),
-    ("Egrave", 'È'),
-    ("Euml", 'Ë'),
-    ("Iacute", 'Í'),
-    ("Icirc", 'Î'),
-    ("Igrave", 'Ì'),
-    ("Iuml", 'Ï'),
-    ("Ntilde", 'Ñ'),
-    ("OElig", 'Œ'),
-    ("Oacute", 'Ó'),
-    ("Ocirc", 'Ô'),
-    ("Ograve", 'Ò'),
-    ("Oslash", 'Ø'),
-    ("Otilde", 'Õ'),
-    ("Ouml", 'Ö'),
-    ("Scaron", 'Š'),
-    ("THORN", 'Þ'),
-    ("Uacute", 'Ú'),
-    ("Ucirc", 'Û'),
-    ("Ugrave", 'Ù'),
-    ("Uuml", 'Ü'),
-    ("Yacute", 'Ý'),
-    ("Yuml", 'Ÿ'),
-    ("aacute", 'á'),
-    ("acirc", 'â'),
-    ("acute", '´'),
-    ("aelig", 'æ'),
-    ("agrave", 'à'),
-    ("amp", '&'),
-    ("apos", '\''),
-    ("aring", 'å'),
-    ("atilde", 'ã'),
-    ("auml", 'ä'),
-    ("bdquo", '„'),
-    ("brvbar", '¦'),
-    ("bull", '•'),
-    ("ccedil", 'ç'),
-    ("cedil", '¸'),
-    ("cent", '¢'),
-    ("circ", 'ˆ'),
-    ("copy", '©'),
-    ("curren", '¤'),
-    ("dagger", '†'),
-    ("deg", '°'),
-    ("divide", '÷'),
-    ("eacute", 'é'),
-    ("ecirc", 'ê'),
-    ("egrave", 'è'),
-    ("emsp", '\u{2003}'),
-    ("ensp", '\u{2002}'),
-    ("eth", 'ð'),
-    ("euml", 'ë'),
-    ("euro", '€'),
-    ("frac12", '½'),
-    ("frac14", '¼'),
-    ("frac34", '¾'),
-    ("gt", '>'),
-    ("hellip", '…'),
-    ("iacute", 'í'),
-    ("icirc", 'î'),
-    ("iexcl", '¡'),
-    ("igrave", 'ì'),
-    ("iquest", '¿'),
-    ("iuml", 'ï'),
-    ("laquo", '«'),
-    ("ldquo", '“'),
-    ("lsaquo", '‹'),
-    ("lsquo", '‘'),
-    ("lt", '<'),
-    ("macr", '¯'),
-    ("mdash", '—'),
-    ("micro", 'µ'),
-    ("middot", '·'),
-    ("nbsp", '\u{A0}'),
-    ("ndash", '–'),
-    ("not", '¬'),
-    ("ntilde", 'ñ'),
-    ("oacute", 'ó'),
-    ("ocirc", 'ô'),
-    ("oelig", 'œ'),
-    ("ograve", 'ò'),
-    ("ordf", 'ª'),
-    ("ordm", 'º'),
-    ("oslash", 'ø'),
-    ("otilde", 'õ'),
-    ("ouml", 'ö'),
-    ("para", '¶'),
-    ("permil", '‰'),
-    ("plusmn", '±'),
-    ("pound", '£'),
-    ("quot", '"'),
-    ("raquo", '»'),
-    ("rdquo", '”'),
-    ("reg", '®'),
-    ("rsaquo", '›'),
-    ("rsquo", '’'),
-    ("sbquo", '‚'),
-    ("scaron", 'š'),
-    ("sect", '§'),
-    ("shy", '\u{AD}'),
-    ("sup1", '¹'),
-    ("sup2", '²'),
-    ("sup3", '³'),
-    ("szlig", 'ß'),
-    ("thinsp", '\u{2009}'),
-    ("thorn", 'þ'),
-    ("tilde", '˜'),
-    ("times", '×'),
-    ("trade", '™'),
-    ("uacute", 'ú'),
-    ("ucirc", 'û'),
-    ("ugrave", 'ù'),
-    ("uml", '¨'),
-    ("uuml", 'ü'),
-    ("yacute", 'ý'),
-    ("yen", '¥'),
-    ("yuml", 'ÿ'),
-];
-
-/// Text with its character references resolved.
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(p) = rest.find('&') {
-        out.push_str(&rest[..p]);
-        rest = &rest[p..];
-        let end = rest[1..]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '#'))
-            .map_or(rest.len(), |e| e + 1);
-        let name = &rest[1..end];
-        let semi = rest[end..].starts_with(';');
-        let c = if let Some(num) = name.strip_prefix('#') {
-            let v = match num.strip_prefix(['x', 'X']) {
-                Some(h) => u32::from_str_radix(h, 16).ok(),
-                None => num.parse::<u32>().ok(),
-            };
-            // Windows-1252's C1 range, as browsers read it.
-            v.map(|v| match v {
-                0x80 => 0x20AC,
-                0x91 => 0x2018,
-                0x92 => 0x2019,
-                0x93 => 0x201C,
-                0x94 => 0x201D,
-                0x96 => 0x2013,
-                0x97 => 0x2014,
-                v => v,
-            })
-            .and_then(char::from_u32)
-            .filter(|c| *c != '\0')
-        } else {
-            ENTITIES
-                .binary_search_by_key(&name, |e| e.0)
-                .ok()
-                .map(|i| ENTITIES[i].1)
-        };
-        match c {
-            Some(c) if name.len() > 1 || semi => {
-                out.push(c);
-                rest = &rest[end + usize::from(semi)..];
-            }
-            _ => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Elements whose content is text up to their end tag.
-const RAW: &[&str] = &[
-    "script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript",
-];
-
-pub(crate) fn tokenize(s: &str) -> Result<Vec<Token>> {
-    let mut out = vec![];
-    let b = s.as_bytes();
-    let mut i = 0;
-    let mut text_start = 0;
-    let lower = |a: usize, z: usize| s[a..z].to_ascii_lowercase();
-    macro_rules! push {
-        ($t:expr) => {{
-            if out.len() >= MAX_TOKENS {
-                return Err(Error::TooLarge("HTML elements"));
-            }
-            out.push($t);
-        }};
-    }
-    while i < b.len() {
-        if b[i] != b'<' {
-            i += 1;
-            continue;
-        }
-        let flush = |out: &mut Vec<Token>, from: usize, to: usize| {
-            if to > from {
-                out.push(Token::Text(unescape(&s[from..to])));
-            }
-        };
-        if s[i..].starts_with("<!--") {
-            flush(&mut out, text_start, i);
-            let end = s[i + 4..].find("-->").map_or(b.len(), |e| i + 4 + e);
-            push!(Token::Comment(s[i + 4..end].to_string()));
-            i = (end + 3).min(b.len());
-            text_start = i;
-            continue;
-        }
-        if s[i..].starts_with("<![if") {
-            // Downlevel-revealed conditional markup: what Excel writes for
-            // browsers (`!supportTabStrip`, `!vml`, `supportMisalignedColumns`
-            // and the like) is not what Excel reads.
-            flush(&mut out, text_start, i);
-            let end = s[i..].find('>').map_or(b.len(), |e| i + e + 1);
-            let cond = s.get(i + 5..end).unwrap_or("").to_ascii_lowercase();
-            i = end;
-            if cond.contains('!') || cond.contains("support") {
-                let mut depth = 1;
-                while depth > 0 && i < b.len() {
-                    let next_if = s[i..].find("<![if").map(|p| i + p);
-                    let next_end = s[i..].find("<![endif]>").map(|p| i + p);
-                    match (next_if, next_end) {
-                        (Some(a), Some(e)) if a < e => {
-                            depth += 1;
-                            i = a + 5;
-                        }
-                        (_, Some(e)) => {
-                            depth -= 1;
-                            i = e + 10;
-                        }
-                        _ => i = b.len(),
-                    }
-                }
-            }
-            text_start = i;
-            continue;
-        }
-        if s[i..].starts_with("<!") || s[i..].starts_with("<?") {
-            // Doctype, processing instructions, `<![endif]>`.
-            flush(&mut out, text_start, i);
-            i = s[i..].find('>').map_or(b.len(), |e| i + e + 1);
-            text_start = i;
-            continue;
-        }
-        let close = b.get(i + 1) == Some(&b'/');
-        let ns = i + 1 + usize::from(close);
-        let mut j = ns;
-        while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b':' | b'-' | b'_')) {
-            j += 1;
-        }
-        if j == ns || !b[ns].is_ascii_alphabetic() {
-            // A "<" that starts no tag is text.
-            i += 1;
-            continue;
-        }
-        flush(&mut out, text_start, i);
-        let name = lower(ns, j);
-        // Attributes.
-        let mut attrs = vec![];
-        let mut k = j;
-        let mut closed = false;
-        loop {
-            while k < b.len() && (b[k].is_ascii_whitespace() || b[k] == b'/') {
-                if b[k] == b'/' {
-                    closed = true;
-                }
-                k += 1;
-            }
-            if k >= b.len() || b[k] == b'>' {
-                break;
-            }
-            closed = false;
-            let a = k;
-            while k < b.len() && !b[k].is_ascii_whitespace() && !matches!(b[k], b'=' | b'>' | b'/')
-            {
-                k += 1;
-            }
-            let key = lower(a, k);
-            while k < b.len() && b[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            let mut value = String::new();
-            if b.get(k) == Some(&b'=') {
-                k += 1;
-                while k < b.len() && b[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                match b.get(k) {
-                    Some(&q @ (b'"' | b'\'')) => {
-                        let v = k + 1;
-                        let e = s[v..].find(char::from(q)).map_or(b.len(), |e| v + e);
-                        value = unescape(&s[v..e]);
-                        k = (e + 1).min(b.len());
-                    }
-                    _ => {
-                        let v = k;
-                        while k < b.len() && !b[k].is_ascii_whitespace() && b[k] != b'>' {
-                            k += 1;
-                        }
-                        value = unescape(&s[v..k]);
-                    }
-                }
-            }
-            if a == k {
-                k += 1;
-                continue;
-            }
-            if attrs.len() < MAX_ATTRS && !key.is_empty() {
-                attrs.push((key, value));
-            }
-        }
-        i = (k + 1).min(b.len());
-        text_start = i;
-        if close {
-            push!(Token::End(name));
-            continue;
-        }
-        let raw = RAW.contains(&name.as_str()) && !closed;
-        push!(Token::Start {
-            name: name.clone(),
-            attrs,
-            closed
-        });
-        if raw {
-            let end_tag = format!("</{name}");
-            let rest = s[i..].to_ascii_lowercase();
-            let e = rest.find(&end_tag).map_or(b.len(), |e| i + e);
-            if name == "style" || name == "title" {
-                push!(Token::Text(if name == "title" {
-                    unescape(&s[i..e])
-                } else {
-                    s[i..e].to_string()
-                }));
-            }
-            push!(Token::End(name));
-            i = s[e..].find('>').map_or(b.len(), |g| e + g + 1);
-            text_start = i;
-        }
-    }
-    if text_start < b.len() {
-        out.push(Token::Text(unescape(&s[text_start..])));
-    }
-    Ok(out)
-}
-
-pub(crate) fn get<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    attrs.iter().find(|a| a.0 == key).map(|a| a.1.as_str())
-}
-
 // ------------------------------------------------------------------ CSS
-
-/// A style sheet: the declarations of each simple selector (`td`,
-/// `.xl65`, `td.xl65`), in source order.
-#[derive(Default)]
-pub(crate) struct Sheet {
-    rules: Vec<(String, Vec<(String, String)>)>,
-}
-
-impl Sheet {
-    pub(crate) fn add(&mut self, css_text: &str) {
-        // Comments out, the HTML comment markers Excel wraps it in too.
-        let mut t = String::with_capacity(css_text.len());
-        let mut rest = css_text;
-        while let Some(p) = rest.find("/*") {
-            t.push_str(&rest[..p]);
-            rest = rest[p + 2..]
-                .find("*/")
-                .map_or("", |e| &rest[p + 2 + e + 2..]);
-        }
-        t.push_str(rest);
-        let t = t.replace("<!--", " ").replace("-->", " ");
-        let mut rest = t.as_str();
-        while let Some(open) = rest.find('{') {
-            let Some(close) = rest[open..].find('}').map(|c| open + c) else {
-                break;
-            };
-            let decls = css::declarations(&rest[open + 1..close]);
-            for sel in rest[..open].split(',') {
-                let sel = sel.trim().to_ascii_lowercase();
-                if !sel.is_empty() && !sel.starts_with('@') && self.rules.len() < 1 << 16 {
-                    self.rules.push((sel, decls.clone()));
-                }
-            }
-            rest = &rest[close + 1..];
-        }
-    }
-
-    /// Declarations for an element of `tag` and `classes`: the element's
-    /// rules, then its classes', each in source order. A class naming
-    /// `mso-style-parent` gets that style's declarations under its own.
-    pub(crate) fn lookup(&self, tag: &str, classes: &[&str], out: &mut Vec<(String, String)>) {
-        for (sel, decls) in &self.rules {
-            if sel == tag {
-                out.extend(decls.iter().cloned());
-            }
-        }
-        for cls in classes {
-            let cls = cls.to_ascii_lowercase();
-            let dot = format!(".{cls}");
-            let tagged = format!("{tag}.{cls}");
-            for (sel, decls) in &self.rules {
-                if *sel == dot || *sel == tagged {
-                    if let Some(parent) = decls
-                        .iter()
-                        .find(|d| d.0 == "mso-style-parent")
-                        .map(|d| d.1.trim().to_ascii_lowercase())
-                    {
-                        if parent != cls {
-                            let p = format!(".{parent}");
-                            for (s2, d2) in &self.rules {
-                                if *s2 == p {
-                                    out.extend(d2.iter().cloned());
-                                }
-                            }
-                        }
-                    }
-                    out.extend(decls.iter().cloned());
-                }
-            }
-        }
-    }
-}
 
 /// CSS string escapes (`\0022`, `\@`) resolved, its quotes off.
 fn css_string(v: &str) -> String {
@@ -969,7 +519,7 @@ fn options(c: &str, o: &mut Options) {
         while let Some(p) = rest.find(&open) {
             let v = &rest[p + open.len()..];
             let e = v.find(&close).unwrap_or(v.len());
-            out.push(unescape(v[..e].trim()));
+            out.push(html::unescape(v[..e].trim()));
             rest = &v[e..];
             if out.len() > 4096 {
                 break;
@@ -1000,8 +550,10 @@ fn options(c: &str, o: &mut Options) {
 
 pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
     budget.alloc(bytes.len() as u64 * 6)?;
-    let text = crate::formats::office::sheets::textenc::html_utf8(bytes);
-    let tokens = tokenize(&text)?;
+    let text = html::decode(bytes);
+    let tokens = html::without_downlevel(
+        html::read(&text, &mut budget.tree()).map_err(|_| Error::TooLarge("HTML elements"))?,
+    );
     if !tokens.iter().any(|t| matches!(t, Token::Start { name, .. } if matches!(name.as_str(), "html" | "table" | "body" | "head" | "td" | "tr"))) {
         return Err(Error::NotFormat("not an HTML document".into()));
     }
@@ -1027,10 +579,7 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
     // a browser's for other pages.
     let excel = tokens.iter().any(
         |t| matches!(t, Token::Start { attrs, .. } if attrs.iter().any(|a| a.0.starts_with("x:"))),
-    ) || sheet_css
-        .rules
-        .iter()
-        .any(|r| r.1.iter().any(|d| d.0.starts_with("mso-")));
+    ) || sheet_css.declarations().any(|d| d.0.starts_with("mso-"));
     let mut base = Style {
         font: Font {
             name: if excel {
@@ -1183,10 +732,10 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
             }
             let (value, formula, extra) = cell_value(c, t.strings, t.seps);
             let mut st = c.style.clone();
-            if let Some(f) = extra {
-                if st.numfmt == "General" {
-                    st.numfmt = f.to_string();
-                }
+            if let Some(f) = extra
+                && st.numfmt == "General"
+            {
+                st.numfmt = f.to_string();
             }
             if c.header {
                 st.font.bold = true;
@@ -1340,10 +889,10 @@ fn cell_value(
         );
     }
     if let Some(n) = get(&c.attrs, "x:num") {
-        if let Ok(v) = n.trim().parse::<f64>() {
-            if v.is_finite() {
-                return (Value::Number(v), formula, None);
-            }
+        if let Ok(v) = n.trim().parse::<f64>()
+            && v.is_finite()
+        {
+            return (Value::Number(v), formula, None);
         }
         if let Some((v, f)) = parse_number(&text, seps) {
             return (Value::Number(v), formula, f);
@@ -1363,10 +912,11 @@ fn cell_value(
     if text.is_empty() {
         return (Value::Empty, formula, None);
     }
-    if !strings && c.style.numfmt != "@" {
-        if let Some((v, f)) = parse_number(&text, seps) {
-            return (Value::Number(v), formula, f);
-        }
+    if !strings
+        && c.style.numfmt != "@"
+        && let Some((v, f)) = parse_number(&text, seps)
+    {
+        return (Value::Number(v), formula, f);
     }
     (text_value(&c.runs, &c.style.font, text), formula, None)
 }
@@ -1387,7 +937,7 @@ fn text_value(r: &Runs, font: &Font, text: String) -> Value {
             l.text = l.text.trim_end_matches([' ', '\n']).to_string();
         }
         runs.retain(|r| !r.text.is_empty());
-        if runs.len() > 1 && runs.windows(2).any(|w| w[0].font != w[1].font) {
+        if runs.len() > 1 && runs.array_windows().any(|[a, b]| a.font != b.font) {
             return Value::Rich(runs.into());
         }
     }
@@ -1422,7 +972,7 @@ struct Open {
 }
 
 /// Elements whose content is not data: scripts, frames, the head's title
-/// and styles (read apart). The tokenizer closes each of them.
+/// and styles (read apart).
 const SKIPPED: &[&str] = &[
     "script", "noscript", "iframe", "noframes", "noembed", "title", "style", "textarea", "xmp",
 ];
@@ -1505,7 +1055,9 @@ fn build_tables(
                 closed,
             } => {
                 let n = name.as_str();
-                if SKIPPED.contains(&n) && !closed {
+                // A self-closed one opens too: the tokenizer reads what follows
+                // as the element's content, as a browser does.
+                if SKIPPED.contains(&n) {
                     skip += 1;
                     continue;
                 }
@@ -1772,26 +1324,25 @@ fn build_tables(
                             .rev()
                             .find(|x| x.0 == "mso-data-placement")
                             .is_some_and(|x| x.1.trim() == "same-cell");
-                        if let (Some(o), Some((_, f))) = (stack.last_mut(), fonts.last()) {
-                            if let Some(cell) = &mut o.cell {
-                                if same || cell.below.len() >= 1024 {
-                                    cell.runs.newline(f);
-                                } else {
-                                    cell.below.push(Runs {
-                                        space: true,
-                                        ..Runs::default()
-                                    });
-                                }
+                        if let (Some(o), Some((_, f))) = (stack.last_mut(), fonts.last())
+                            && let Some(cell) = &mut o.cell
+                        {
+                            if same || cell.below.len() >= 1024 {
+                                cell.runs.newline(f);
+                            } else {
+                                cell.below.push(Runs {
+                                    space: true,
+                                    ..Runs::default()
+                                });
                             }
                         }
                     }
                     "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                        if let (Some(o), Some((_, f))) = (stack.last_mut(), fonts.last()) {
-                            if let Some(cell) = &mut o.cell {
-                                if cell.runs.len > 0 {
-                                    cell.runs.newline(f);
-                                }
-                            }
+                        if let (Some(o), Some((_, f))) = (stack.last_mut(), fonts.last())
+                            && let Some(cell) = &mut o.cell
+                            && cell.runs.len > 0
+                        {
+                            cell.runs.newline(f);
                         }
                         if n.starts_with('h') {
                             push_font(&mut fonts, n, |f| f.bold = true);
@@ -1816,10 +1367,10 @@ fn build_tables(
                             css_sheet.lookup(n, &classes(attrs), &mut d);
                             d
                         };
-                        if n == "a" {
-                            if let Some(h) = get(attrs, "href") {
-                                link = Some(h.trim().to_string());
-                            }
+                        if n == "a"
+                            && let Some(h) = get(attrs, "href")
+                        {
+                            link = Some(h.trim().to_string());
                         }
                         if !closed {
                             push_font(&mut fonts, n, |f| {
@@ -1833,15 +1384,14 @@ fn build_tables(
                                 if let Some(c) = color.as_deref().and_then(css::color) {
                                     f.color = c.filter(|&c| c != 0);
                                 }
-                                if let Some(face) = &face {
-                                    if let Some(first) = face
+                                if let Some(face) = &face
+                                    && let Some(first) = face
                                         .split(',')
                                         .next()
                                         .map(str::trim)
                                         .filter(|s| !s.is_empty())
-                                    {
-                                        f.name = first.chars().take(64).collect();
-                                    }
+                                {
+                                    f.name = first.chars().take(64).collect();
                                 }
                                 if let Some(s) = size {
                                     // HTML's font sizes 1 to 7.
@@ -1945,10 +1495,10 @@ fn build_tables(
                             Some(b) => b.push(s, f, pre > 0),
                             None => cell.runs.push(s, f, pre > 0),
                         }
-                    } else if o.in_caption {
-                        if let Some(c) = &mut o.table.caption {
-                            c.push(s, f, pre > 0);
-                        }
+                    } else if o.in_caption
+                        && let Some(c) = &mut o.table.caption
+                    {
+                        c.push(s, f, pre > 0);
                     }
                 }
             }
@@ -1987,10 +1537,10 @@ fn push_font(fonts: &mut Vec<(String, Font)>, tag: &str, f: impl FnOnce(&mut Fon
 }
 
 fn pop_font(fonts: &mut Vec<(String, Font)>, tag: &str) {
-    if let Some(p) = fonts.iter().rposition(|x| x.0 == tag) {
-        if p > 0 {
-            fonts.truncate(p);
-        }
+    if let Some(p) = fonts.iter().rposition(|x| x.0 == tag)
+        && p > 0
+    {
+        fonts.truncate(p);
     }
 }
 

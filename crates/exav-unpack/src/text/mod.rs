@@ -130,7 +130,7 @@ pub fn looks_text(head: &[u8]) -> bool {
 pub fn extract(kind: Kind, data: &[u8], cap: usize, limits: &crate::Limits) -> Extracted {
     let mut out = Out::new(cap);
     match kind {
-        Kind::Html => html::read(&decode(data), &mut out),
+        Kind::Html => html::read(&crate::html::decode(data), &mut out),
         #[cfg(feature = "text-pdf")]
         Kind::Pdf => pdf::read(data, limits, &mut out),
         #[cfg(not(feature = "text-pdf"))]

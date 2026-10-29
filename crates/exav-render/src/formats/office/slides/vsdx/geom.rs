@@ -242,7 +242,7 @@ fn nurbs(
     let n = count - 1;
     let mut u: Vec<f64> = knots.to_vec();
     u.extend(std::iter::repeat_n(last, degree + 1));
-    if u.iter().any(|k| !k.is_finite()) || u.windows(2).any(|w| w[1] < w[0]) {
+    if u.iter().any(|k| !k.is_finite()) || u.array_windows().any(|[a, b]| b < a) {
         return polygon();
     }
     let (lo, hi) = (u[degree], u[n + 1]);
@@ -258,9 +258,9 @@ fn nurbs(
     }
     let per = 8usize;
     let mut out = vec![];
-    for w in cuts.windows(2) {
+    for [a, b] in cuts.array_windows() {
         for i in 1..=per {
-            let t = w[0] + (w[1] - w[0]) * i as f64 / per as f64;
+            let t = a + (b - a) * i as f64 / per as f64;
             if out.len() >= 4096 {
                 return polygon();
             }
@@ -464,10 +464,10 @@ fn rows(t: &Tree, n: usize, six: u32, w: f64, h: f64, b: &mut Builder) -> Result
                 .map_or(0.0, |v| v.clamp(-LIMIT, LIMIT))
         };
         let ty = ty.unwrap_or("");
-        if ty != "SplineKnot" {
-            if let Some((c, k, wt, last, d)) = spline.take() {
-                b.spline(&c, &k, &wt, last, d)?;
-            }
+        if ty != "SplineKnot"
+            && let Some((c, k, wt, last, d)) = spline.take()
+        {
+            b.spline(&c, &k, &wt, last, d)?;
         }
         match ty {
             "MoveTo" => b.move_to(v("X"), v("Y"))?,
@@ -661,7 +661,7 @@ fn clip_line(p: (f64, f64), q: (f64, f64), w: f64, h: f64) -> Option<((f64, f64)
 mod tests {
     use super::*;
     use crate::formats::office::slides::limits::{Budget, Limits};
-    use crate::formats::office::slides::vsdx::resolve::{tests::shapes, Doc, Master};
+    use crate::formats::office::slides::vsdx::resolve::{Doc, Master, tests::shapes};
     use std::collections::HashMap;
 
     fn geometry(rows: &str, w: f64, h: f64, max: usize) -> Result<Vec<GPath>> {

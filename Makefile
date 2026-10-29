@@ -11,7 +11,7 @@ DBDIR   ?= exav-db
 EXAVDB  ?= exav.exavdb
 
 .DEFAULT_GOAL := build
-.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www test-formats formats test-helm wasm-sizes lint fmt msrv av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
+.PHONY: build release test test-native test-yara-diff test-wasm test-js test-viewer test-www test-formats formats test-helm wasm-sizes lint fmt msrv stack-frames deps-review av-audit miri publish-check publish fuzz db exavdb cache daily clean www-dev www-build help
 
 ## build: compile the release binary
 build release:
@@ -207,6 +207,23 @@ msrv:
 	@v=$$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
 	  rustup toolchain install $$v --profile minimal >/dev/null 2>&1 || true; \
 	  echo "checking MSRV $$v"; rustup run $$v cargo check --workspace --all-targets
+
+## stack-frames: the stack frames of the functions that recurse into nested input
+##               (container walks, shape and block walks of the converters), read
+##               from release builds. A frame over 16 KiB is a value held while the
+##               next level is read, once per level; see scripts/stack-frames.py.
+stack-frames:
+	$(CARGO) build --release -p exav
+	$(CARGO) test --release -p exav-render --features office-docs,office-slides,office-sheets --test nesting --no-run
+	python3 -I scripts/stack-frames.py $(EXAV) \
+	  $$(ls -t target/release/deps/nesting-* | grep -v '\.d$$' | head -1)
+
+## deps-review: the dependency report of docs/DEPENDENCIES.md ("Lifecycle"):
+##              versions, release age, `unsafe`, vendored copies against their
+##              upstream. Queries crates.io, GitHub and PyPI; `DEPS_ARGS=--offline`
+##              uses the last answers.
+deps-review:
+	python3 -I scripts/deps-review.py $(DEPS_ARGS)
 
 ## av-audit: scan the tracked tree with a real engine and signature set, to catch
 ##           a committed fixture that other people's scanners will detect. Run it

@@ -237,10 +237,11 @@ table {mso-displayed-decimal-separator:"\,"; mso-displayed-thousand-separator:"\
     // Excel's own width unit, the phantom row and the comments left out.
     assert_eq!(s.col_info(0).and_then(|c| c.width), Some(14.0));
     assert_eq!(s.cells.keys().map(|k| k.0).max(), Some(3));
-    assert!(!s
-        .cells
-        .values()
-        .any(|c| c.value == Value::text("a comment")));
+    assert!(
+        !s.cells
+            .values()
+            .any(|c| c.value == Value::text("a comment"))
+    );
 }
 
 #[test]
@@ -311,7 +312,9 @@ fn captions_rules_and_breaks() {
     assert_eq!(value(s, 2, 1), &Value::text("y"));
     assert_eq!(style(&wb, s, 1, 1).border.left.style, Some("thin"));
     // Excel's style sheet keeps it in the cell.
-    let wb = read_str("<style>br {mso-data-placement:same-cell;}</style><table><tr><td>one<br>two</td></tr></table>");
+    let wb = read_str(
+        "<style>br {mso-data-placement:same-cell;}</style><table><tr><td>one<br>two</td></tr></table>",
+    );
     assert_eq!(value(&wb.sheets[0], 0, 0), &Value::text("one\ntwo"));
 }
 
@@ -374,4 +377,17 @@ fn hostile_pages() {
     ] {
         let _ = read(page.as_bytes(), &mut Budget::new(Limits::default()));
     }
+}
+
+/// What Excel writes for browsers between `<![if !vml]>` and `<![endif]>` is
+/// not what Excel reads: the cell it holds is not a cell.
+#[test]
+fn downlevel_conditionals_hide_what_excel_writes_for_browsers() {
+    let wb = read_str(
+        "<table><tr><td>a</td><![if !vml]><td>b</td><![endif]><![if gte x]><td>c</td><![endif]></tr></table>",
+    );
+    let s = &wb.sheets[0];
+    assert_eq!(value(s, 0, 0), &Value::text("a"));
+    assert_eq!(value(s, 0, 1), &Value::text("c"));
+    assert_eq!(value(s, 0, 2), &Value::Empty);
 }

@@ -8,7 +8,7 @@
 //! and an object 2 (or, for paragraph data, first 2 and second 3).
 
 use super::shapes::{color, shadow};
-use super::{ty, Props, Reader};
+use super::{Props, Reader, ty};
 use crate::formats::office::common::iwa::proto::Msg;
 use crate::formats::office::slides::error::Result;
 use crate::formats::office::slides::limits::Budget;

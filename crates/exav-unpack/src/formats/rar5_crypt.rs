@@ -275,7 +275,6 @@ mod tests {
         assert!(cache.is_empty());
         assert!(start.elapsed() < std::time::Duration::from_millis(500));
         // Counts RAR writes by default are still derived.
-        assert!(cache.is_empty());
         let _ = find_keys(&record(1, 15), &passwords, &mut cache, &spent);
         assert!(!cache.is_empty());
     }

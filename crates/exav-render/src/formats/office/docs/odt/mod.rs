@@ -79,31 +79,30 @@ pub(crate) fn read_odt(mut zip: Zip<'_>, budget: &mut Budget) -> Result<Document
     budget.alloc(content.len() as u64)?;
     let styles = zip.read("styles.xml", max)?.unwrap_or_default();
     budget.alloc(styles.len() as u64)?;
-    if zip.names().iter().any(|n| n == "META-INF/manifest.xml") {
-        if let Some(m) = zip.read("META-INF/manifest.xml", 1 << 22)? {
-            if find(&m, b"manifest:encryption-data") {
-                return Err(Error::Encrypted);
-            }
-        }
+    if zip.names().iter().any(|n| n == "META-INF/manifest.xml")
+        && let Some(m) = zip.read("META-INF/manifest.xml", 1 << 22)?
+        && find(&m, b"manifest:encryption-data")
+    {
+        return Err(Error::Encrypted);
     }
-    let content = xml::parse(&content, xml::MAX_ELEMENTS)?;
+    let content = xml::parse(&content, &mut budget.tree())?;
     let styles = if styles.is_empty() {
         Node::default()
     } else {
-        xml::parse(&styles, xml::MAX_ELEMENTS)?
+        xml::parse(&styles, &mut budget.tree())?
     };
     convert(&styles, &content, Some(zip), budget)
 }
 
 pub(crate) fn read_fodt(input: &[u8], budget: &mut Budget) -> Result<Document> {
-    let root = xml::parse(input, xml::MAX_ELEMENTS)?;
+    let root = xml::parse(input, &mut budget.tree())?;
     if root.name != "office:document" {
         return Err(Error::NotFormat(format!("root element {}", root.name)));
     }
-    if let Some(m) = root.attr("office:mimetype") {
-        if !m.starts_with("application/vnd.oasis.opendocument.text") {
-            return Err(Error::NotFormat(format!("mimetype {m}")));
-        }
+    if let Some(m) = root.attr("office:mimetype")
+        && !m.starts_with("application/vnd.oasis.opendocument.text")
+    {
+        return Err(Error::NotFormat(format!("mimetype {m}")));
     }
     // The one tree plays both parts: its styles and its content.
     convert(&root, &root, None, budget)
@@ -164,16 +163,16 @@ pub(crate) fn decode_name(n: &str) -> String {
     let b = n.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'_' {
-            if let Some(end) = n[i + 1..].find('_') {
-                let hex = &n[i + 1..i + 1 + end];
-                if (2..=6).contains(&hex.len()) {
-                    if let Some(c) = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
-                        out.push(c);
-                        i += end + 2;
-                        continue;
-                    }
-                }
+        if b[i] == b'_'
+            && let Some(end) = n[i + 1..].find('_')
+        {
+            let hex = &n[i + 1..i + 1 + end];
+            if (2..=6).contains(&hex.len())
+                && let Some(c) = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            {
+                out.push(c);
+                i += end + 2;
+                continue;
             }
         }
         let ch = n[i..].chars().next().unwrap_or(' ');
@@ -364,10 +363,10 @@ impl<'a> Odt<'a> {
         }
         self.doc.defaults_run = rpr;
         self.doc.defaults_para = props::para_props(&dp, false);
-        if let Some(t) = dp.twips("paragraph/style:tab-stop-distance") {
-            if t > 0 {
-                self.doc.settings.default_tab_stop = Some(t);
-            }
+        if let Some(t) = dp.twips("paragraph/style:tab-stop-distance")
+            && t > 0
+        {
+            self.doc.settings.default_tab_stop = Some(t);
         }
         // Named styles.
         let order = self.cs.order.clone();
@@ -438,11 +437,10 @@ impl<'a> Odt<'a> {
                     .find(|a| a.0 == "style:list-style-name")
                     .map(|a| a.1.clone())
                     .filter(|l| !l.is_empty())
+                    && let Some(nid) = self.list_num(&ls, true, false)
                 {
-                    if let Some(nid) = self.list_num(&ls, true, false) {
-                        st.ppr.num_id = Some(nid);
-                        st.ppr.num_level = heading.map(|h| h - 1);
-                    }
+                    st.ppr.num_id = Some(nid);
+                    st.ppr.num_level = heading.map(|h| h - 1);
                 }
             }
             out.push(st);
@@ -455,10 +453,10 @@ impl<'a> Odt<'a> {
     fn collect_annotation_ends(&mut self, n: &Node) {
         let mut stack = vec![n];
         while let Some(x) = stack.pop() {
-            if x.name == "office:annotation-end" {
-                if let Some(name) = x.attr("office:name") {
-                    self.annotation_ends.insert(name.to_string());
-                }
+            if x.name == "office:annotation-end"
+                && let Some(name) = x.attr("office:name")
+            {
+                self.annotation_ends.insert(name.to_string());
             }
             stack.extend(x.nodes());
         }

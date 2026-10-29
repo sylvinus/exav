@@ -11,7 +11,7 @@
 // `extract` and `Budget` are used only by the tests that open a real container,
 // which are behind the `zip` feature; `Format` and `Limits` are always needed.
 #[allow(unused_imports)]
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use std::collections::BTreeSet;
 
 /// A two-member ZIP, stored (no compression), so the test does not depend on a

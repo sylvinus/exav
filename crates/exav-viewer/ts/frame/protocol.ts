@@ -93,6 +93,7 @@ export interface FrameOptions {
     timeoutMs?: number;
     maxPrimitives?: number;
     maxDecompressedBytes?: number;
+    maxEntities?: number;
     lineweights?: "drawing" | "always" | "never";
     monochrome?: boolean;
   };
@@ -690,6 +691,7 @@ export function checkOptions(v: unknown): FrameOptions {
       timeoutMs: num(cad.timeoutMs),
       maxPrimitives: num(cad.maxPrimitives),
       maxDecompressedBytes: num(cad.maxDecompressedBytes),
+      maxEntities: num(cad.maxEntities),
       lineweights: oneOf(cad.lineweights, ["drawing", "always", "never"] as const) ? cad.lineweights : undefined,
       monochrome: typeof cad.monochrome === "boolean" ? cad.monochrome : undefined,
     });

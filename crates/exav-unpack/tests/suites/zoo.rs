@@ -12,7 +12,7 @@
 //! written by real `zoo`; see `NOTICE`.
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/tests/fixtures/zoo/{name}", env!("CARGO_MANIFEST_DIR"));

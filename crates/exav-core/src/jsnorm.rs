@@ -804,13 +804,12 @@ fn percent_decode(s: &[u8]) -> Vec<u8> {
                 continue;
             }
         }
-        if s[i] == b'%' && i + 2 < n {
-            if let Some(v) = hex2(s[i + 1], s[i + 2]) {
+        if s[i] == b'%' && i + 2 < n
+            && let Some(v) = hex2(s[i + 1], s[i + 2]) {
                 out.push(v);
                 i += 3;
                 continue;
             }
-        }
         out.push(s[i]);
         i += 1;
     }
@@ -899,11 +898,10 @@ impl Emitter {
             }
             Tok::Punct(b) => std::slice::from_ref(b),
         };
-        if let (Some(&last), Some(&first)) = (self.out.last(), piece.first()) {
-            if is_ident(last) && is_ident(first) {
+        if let (Some(&last), Some(&first)) = (self.out.last(), piece.first())
+            && is_ident(last) && is_ident(first) {
                 self.out.push(b' ');
             }
-        }
         self.out.extend_from_slice(piece);
     }
 

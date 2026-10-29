@@ -11,8 +11,8 @@
 //! table_char_style 8, table_attachment 9. Each table's entries hold a
 //! character index 1 and an object 2.
 
-use crate::formats::office::common::iwa::proto::{Msg, Val};
 use crate::formats::office::common::iwa::Store;
+use crate::formats::office::common::iwa::proto::{Msg, Val};
 use crate::formats::office::common::package::Zip;
 use crate::formats::office::docs::error::{Error, Result};
 use crate::formats::office::docs::limits::Budget;
@@ -174,11 +174,12 @@ impl<'a> Pages<'a> {
     fn document(&mut self, d: Msg<'a>) -> Result<()> {
         let pt = |n: u32| d.float(n).map(|v| (f64::from(v) * 20.0).round() as i32);
         let s = &mut self.doc.section;
-        if let (Some(w), Some(h)) = (pt(30), pt(31)) {
-            if w > 100 && h > 100 {
-                s.width = w;
-                s.height = h;
-            }
+        if let (Some(w), Some(h)) = (pt(30), pt(31))
+            && w > 100
+            && h > 100
+        {
+            s.width = w;
+            s.height = h;
         }
         for (n, slot) in [
             (32, &mut s.top),
@@ -303,11 +304,11 @@ impl<'a> Pages<'a> {
                 }
             }
         }
-        if let Some(l) = list {
-            if let Some(id) = self.list_num(l) {
-                pp.num_id = Some(id);
-                pp.num_level = Some(level.min(8));
-            }
+        if let Some(l) = list
+            && let Some(id) = self.list_num(l)
+        {
+            pp.num_id = Some(id);
+            pp.num_level = Some(level.min(8));
         }
         pp
     }
@@ -465,10 +466,10 @@ impl<'a> Pages<'a> {
             let mut runs: Vec<Inline> = vec![];
             let flush =
                 |text: &mut String, cur: &Option<(u32, RunProps)>, runs: &mut Vec<Inline>| {
-                    if !text.is_empty() {
-                        if let Some((_, rp)) = cur {
-                            runs.push(Inline::Run(Run::text(rp.clone(), std::mem::take(text))));
-                        }
+                    if !text.is_empty()
+                        && let Some((_, rp)) = cur
+                    {
+                        runs.push(Inline::Run(Run::text(rp.clone(), std::mem::take(text))));
                     }
                 };
             for (i, &c) in chars.iter().enumerate().take(end).skip(start) {

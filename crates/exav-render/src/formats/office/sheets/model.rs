@@ -39,17 +39,7 @@ impl CellError {
 
     /// The BIFF error code ([MS-XLS] 2.5.97 BErr).
     pub fn from_biff(code: u8) -> Option<CellError> {
-        Some(match code {
-            0x00 => CellError::Null,
-            0x07 => CellError::Div0,
-            0x0F => CellError::Value,
-            0x17 => CellError::Ref,
-            0x1D => CellError::Name,
-            0x24 => CellError::Num,
-            0x2A => CellError::NA,
-            0x2B => CellError::GettingData,
-            _ => return None,
-        })
+        exav_unpack::biff::error_name(code).and_then(CellError::parse)
     }
 
     /// An error as text: one of XLSX's names, case folded.
@@ -744,17 +734,7 @@ pub fn safe_url(u: &str) -> bool {
 }
 
 /// "A1" style column letters for 0-based `col`.
-pub fn col_name(col: u32) -> String {
-    let mut n = u64::from(col) + 1;
-    let mut s = Vec::new();
-    while n > 0 {
-        let r = (n - 1) % 26;
-        s.push(b'A' + r as u8);
-        n = (n - 1) / 26;
-    }
-    s.reverse();
-    String::from_utf8(s).unwrap_or_default()
-}
+pub use exav_unpack::biff::formula::col_name;
 
 pub fn cell_ref(row: u32, col: u32) -> String {
     format!("{}{}", col_name(col), u64::from(row) + 1)

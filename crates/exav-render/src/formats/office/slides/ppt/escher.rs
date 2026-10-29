@@ -3,7 +3,7 @@
 //! property table, anchor and the client records PowerPoint adds (text,
 //! placeholder, links). The picture store (BStore) is read here too.
 
-use super::records::{read_at, Rec};
+use super::records::{Rec, read_at};
 use crate::formats::office::common::bytes::Cur;
 use std::io::Read;
 
@@ -370,11 +370,7 @@ fn dib_to_bmp(dib: &[u8]) -> Vec<u8> {
     let bits = Cur::at(dib, 14).u16() as u32;
     let used = Cur::at(dib, 32).u32();
     let colors = if bits <= 8 && bits > 0 {
-        if used > 0 {
-            used.min(256)
-        } else {
-            1 << bits
-        }
+        if used > 0 { used.min(256) } else { 1 << bits }
     } else {
         used.min(256)
     };

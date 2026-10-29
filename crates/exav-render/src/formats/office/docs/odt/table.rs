@@ -1,6 +1,6 @@
 //! Tables ([ODF 1.2] 9): columns, rows, cells and their spans.
 
-use super::{props, Odt};
+use super::{Odt, props};
 use crate::formats::office::common::odf::{self, Props};
 use crate::formats::office::common::xml::Node;
 use crate::formats::office::docs::error::Result;

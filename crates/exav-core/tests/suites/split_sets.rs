@@ -13,7 +13,7 @@
 //! ZIP is `zip -0 -s 64k split.zip payload.bin` of 100,000 bytes of
 //! `random.Random(77)`, whose rejoined archive (`zip -s 0`) holds the payload.
 
-use exav_core::{analyze, analyze_split_sets, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, analyze_split_sets, loader};
 use std::cell::RefCell;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -270,10 +270,12 @@ fn a_cab_set_is_found_by_the_names_its_headers_give() {
     }
     // A text file is not read at all; a cabinet is read by its head to see whether it names a neighbour.
     assert!(!reads.borrow().iter().any(|(n, _)| n == "readme.txt"));
-    assert!(reads
-        .borrow()
-        .iter()
-        .any(|(n, h)| n == "part1.cab" && h.is_some()));
+    assert!(
+        reads
+            .borrow()
+            .iter()
+            .any(|(n, h)| n == "part1.cab" && h.is_some())
+    );
 }
 
 #[test]

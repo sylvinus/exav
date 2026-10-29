@@ -24,7 +24,10 @@
 //! ```
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use super::fs_tree::{
+    assert_streams_alike, assert_tree, image, members as walk_members, tree, walked as fs_walked,
+};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 /// `sha256sum` of the ZIP that was copied in, which is what following the
 /// cluster chain has to reproduce.
@@ -128,14 +131,16 @@ fn a_corrupt_filesystem_is_reported_not_shrugged_off() {
     // The boot sector still says FAT, so the files are there and a real mount
     // would read them; failing to must not read as clean.
     let mut img = fixture();
-    // Scribble over the file allocation table itself.
-    for b in &mut img[512..2048] {
-        *b = 0xFF;
-    }
+    // Scribble over the file allocation table itself: the first copy, which
+    // begins after the reserved sectors.
+    let sector = usize::from(u16::from_le_bytes([img[11], img[12]]));
+    let start = usize::from(u16::from_le_bytes([img[14], img[15]])) * sector;
+    let len = usize::from(u16::from_le_bytes([img[22], img[23]])) * sector;
+    img[start..start + len].fill(0xFF);
     let e = members(&img);
     assert!(
-        e.is_empty() || e.iter().any(|x| x.unsupported.is_some()),
-        "a filesystem that cannot be walked must be reported, got {:?}",
+        e.iter().any(|x| x.unsupported.is_some()),
+        "a file whose chain is gone must be reported, got {:?}",
         e.iter()
             .map(|x| (&x.name, x.unsupported))
             .collect::<Vec<_>>()
@@ -169,24 +174,19 @@ fn walked(blob: &[u8]) -> (Vec<Entry>, Result<Option<()>, exav_unpack::LimitHit>
     (out, end)
 }
 
-/// `fatfs` takes 2 off a cluster number to find its sector, and cluster 1 is
-/// none: it panicked, and the panic ended the walk of the whole volume as an
-/// undecodable one. A directory that names cluster 1 is reported and the rest
-/// of the volume is walked.
+/// Clusters are numbered from 2, and a directory that names cluster 1 has no
+/// place to be read from. The rest of the volume is walked, and the walk ends
+/// as one over a damaged volume.
 #[test]
-fn a_directory_at_cluster_1_is_reported_and_the_rest_of_the_volume_is_walked() {
+fn a_directory_at_cluster_1_ends_the_walk_as_damaged_after_the_rest_of_the_volume() {
     let (e, end) = walked(&with_first_cluster(b"SUB        ", 1));
-    end.unwrap_or_else(|h| panic!("the volume was ended: {h:?}"));
+    assert!(end.unwrap_err().is_corrupt());
     let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
     assert!(
         names.contains(&"a.bin") && names.contains(&"c.bin"),
         "{names:?}"
     );
-    let bad = e
-        .iter()
-        .find(|x| x.name == "<fat-dir:sub>")
-        .unwrap_or_else(|| panic!("the directory is not reported: {names:?}"));
-    assert!(bad.unsupported.is_some());
+    assert!(!names.iter().any(|n| n.starts_with("sub/")), "{names:?}");
 }
 
 /// The same for a file: the others come out, it is reported.
@@ -201,4 +201,119 @@ fn a_file_at_cluster_1_is_reported_and_the_other_files_come_out() {
         by("sub/p.zip").map(|x| sha256_hex(&x.data)).as_deref(),
         Some(PAYLOAD)
     );
+}
+
+/// The same tree comes out of FAT12, FAT16 and FAT32, long names included, and
+/// of a volume a kernel wrote, which keeps the case of a short name in two flags
+/// where the other images have a long name. The deleted entries (pads written
+/// first, to fragment the files) and the volume label are not files.
+#[test]
+fn every_kind_of_fat_reads_the_same_tree() {
+    for name in ["fat12", "fat16", "fat32", "fat16_kernel"] {
+        let e = walk_members(Format::Fat, &image(name));
+        std::panic::catch_unwind(|| assert_tree(&e, &tree(false)))
+            .unwrap_or_else(|_| panic!("{name}"));
+    }
+}
+
+/// A file over the buffer limit is read as it goes, in every kind of FAT, a
+/// fragmented one included.
+#[test]
+fn files_over_the_buffer_limit_are_read_as_they_go() {
+    for name in ["fat12", "fat16", "fat32", "fat16_kernel"] {
+        assert_streams_alike(Format::Fat, &image(name), 1000);
+    }
+}
+
+/// The place of the 32-byte directory entry with the short name `name`.
+fn entry_of(img: &[u8], name: &[u8; 11]) -> usize {
+    img.windows(12)
+        .position(|w| w[..11] == name[..] && w[11] & 0x10 != 0)
+        .unwrap_or_else(|| panic!("no folder {:?}", String::from_utf8_lossy(name)))
+}
+
+/// A folder that names a folder it is in is walked once.
+#[test]
+fn a_folder_that_names_the_folder_it_is_in_is_walked_once() {
+    let mut img = image("fat16");
+    let a = entry_of(&img, b"A          ");
+    let b = entry_of(&img, b"B          ");
+    let first = [img[a + 26], img[a + 27]];
+    img[b + 26..b + 28].copy_from_slice(&first);
+    let e = walk_members(Format::Fat, &img);
+    let mut want = tree(false);
+    want.retain(|(p, _)| p != "a/b/c/deep.bin");
+    assert_tree(&e, &want);
+}
+
+/// A file with a chain that ends before its size does is reported with what
+/// there is.
+#[test]
+fn a_chain_that_ends_early_is_a_file_reported_with_what_it_holds() {
+    let mut img = image("fat16");
+    // The table begins after the reserved sectors; cluster 3 is the second
+    // entry of a file in the first run, and an end of chain makes it the last.
+    let e = walk_members(Format::Fat, &img);
+    assert!(e.iter().all(|x| x.unsupported.is_none()));
+    let reserved = usize::from(u16::from_le_bytes([img[14], img[15]]));
+    let table = reserved * usize::from(u16::from_le_bytes([img[11], img[12]]));
+    let frag = entry_of_file(&img, b"FRAG    BIN");
+    let first = usize::from(u16::from_le_bytes([img[frag + 26], img[frag + 27]]));
+    img[table + first * 2..table + first * 2 + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    let (e, end) = walked(&img);
+    end.unwrap();
+    let f = e.iter().find(|x| x.name == "frag.bin").unwrap();
+    assert_eq!(
+        f.unsupported,
+        Some("file could not be read from the volume")
+    );
+    assert!(!f.data.is_empty() && f.data.len() < 100000);
+}
+
+fn entry_of_file(img: &[u8], name: &[u8; 11]) -> usize {
+    img.windows(12)
+        .position(|w| w[..11] == name[..] && w[11] & 0x10 == 0)
+        .unwrap_or_else(|| panic!("no file {:?}", String::from_utf8_lossy(name)))
+}
+
+/// Entries past the member limit are not lost without a word.
+#[test]
+fn a_directory_longer_than_the_member_limit_stops_the_walk() {
+    let img = image("fat16");
+    // The root holds 10 files and 3 folders, `many` 300 files.
+    let run = |max: u64| {
+        let mut limits = Limits::default();
+        limits.max_members = max;
+        fs_walked(Format::Fat, &img, limits)
+    };
+    let (e, end) = run(1000);
+    end.unwrap();
+    assert_eq!(e.len(), 310);
+    let (e, end) = run(100);
+    assert!(!end.unwrap_err().is_corrupt());
+    assert!(!e.is_empty() && e.len() <= 100);
+}
+
+/// An image cut short is a volume whose structures are not all there.
+#[test]
+fn an_image_cut_short_is_reported() {
+    let img = image("fat16");
+    let (_, end) = fs_walked(Format::Fat, &img[..2048], Limits::default());
+    assert!(end.unwrap_err().is_corrupt());
+    // Cut where the files are, the volume opens and the files are partial.
+    let (e, end) = fs_walked(Format::Fat, &img[..200 * 1024], Limits::default());
+    let _ = end;
+    assert!(e.iter().any(|x| x.unsupported.is_some()));
+}
+
+/// What a file records of when it was written is kept, as the wall-clock time
+/// a FAT volume records it as.
+#[test]
+fn a_file_comes_with_the_time_it_was_written() {
+    let e = walk_members(Format::Fat, &image("fat16_kernel"));
+    let tiny = e.iter().find(|x| x.name == "tiny.txt").unwrap();
+    assert!(matches!(
+        tiny.mtime,
+        Some(exav_unpack::Mtime::Local { year: 2026, .. })
+    ));
 }

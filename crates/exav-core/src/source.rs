@@ -14,19 +14,20 @@ mod http {
     use std::io::{self, Read, Seek, SeekFrom};
 
     /// Bytes fetched by a range request that does not continue the previous
-    /// one.
-    const BLOCK: u64 = 64 * 1024;
+    /// one, unless the caller says otherwise: the block of the cache that
+    /// reads through the reader, so that a block is one request.
+    pub const BLOCK: u64 = 1024 * 1024;
 
-    /// Most bytes one range request fetches.
-    const MAX_BLOCK: u64 = 8 * 1024 * 1024;
+    /// Most bytes one range request fetches, unless the caller says otherwise.
+    pub const MAX_BLOCK: u64 = 8 * 1024 * 1024;
 
     /// A `Read + Seek` view over an HTTP(S) resource, served by range
     /// requests, the last one's bytes kept.
     ///
     /// A request that continues the previous one fetches twice as much, up to
-    /// [`MAX_BLOCK`]: a pass through the object costs a request per 8 MiB
-    /// rather than per 64 KiB, while reads scattered through it (a ZIP's
-    /// directory, then its members) stay small.
+    /// the largest request (8 MiB unless set): a pass through the object costs a
+    /// request per 8 MiB rather than per block, while reads scattered through it
+    /// (a ZIP's directory, then its members) stay one block.
     pub struct HttpRangeReader {
         agent: ureq::Agent,
         url: String,
@@ -38,12 +39,25 @@ mod http {
         pub bytes_fetched: u64,
         /// Number of range requests issued.
         pub requests: u64,
+        /// What a request that does not continue the previous one fetches.
+        first: u64,
+        /// The most one request fetches.
+        most: u64,
     }
 
     impl HttpRangeReader {
         /// Open a URL, probing its length and range support with a single
         /// `bytes=0-0` request.
         pub fn open(url: &str) -> io::Result<Self> {
+            Self::open_with(url, BLOCK, MAX_BLOCK)
+        }
+
+        /// [`Self::open`] with the size of a request that does not continue
+        /// the previous one (`first`, at least 1) and the most any request
+        /// fetches (`most`, never below `first`).
+        pub fn open_with(url: &str, first: u64, most: u64) -> io::Result<Self> {
+            let first = first.max(1);
+            let most = most.max(first);
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .user_agent(concat!("exav/", env!("CARGO_PKG_VERSION")))
                 .build()
@@ -74,6 +88,8 @@ mod http {
                 block_start: 0,
                 bytes_fetched: 0,
                 requests: 0,
+                first,
+                most,
             })
         }
 
@@ -93,8 +109,8 @@ mod http {
             let continues =
                 !self.block.is_empty() && start == self.block_start + self.block.len() as u64;
             let size = match continues {
-                true => (self.block.len() as u64 * 2).min(MAX_BLOCK),
-                false => BLOCK,
+                true => (self.block.len() as u64 * 2).min(self.most),
+                false => self.first,
             };
             self.block.clear();
             self.block_start = start;
@@ -139,7 +155,7 @@ mod http {
                 // holding a position elsewhere.
                 let start = match self.pos == next {
                     true => next,
-                    false => (self.pos / BLOCK) * BLOCK,
+                    false => (self.pos / self.first) * self.first,
                 };
                 self.fetch_block(start)?;
             }
@@ -253,6 +269,38 @@ mod tests {
         r.seek(SeekFrom::Start(0)).unwrap();
         r.read_to_end(&mut all).unwrap();
         assert_eq!(all, body);
+    }
+
+    /// The size of a request that starts a read, and the most one may grow to,
+    /// are the caller's.
+    #[test]
+    fn the_request_sizes_are_the_callers() {
+        let body = vec![7u8; 3_000_000];
+        let sequential = |first, most| {
+            let mut r =
+                HttpRangeReader::open_with(&serve(body.clone(), false), first, most).unwrap();
+            let mut all = Vec::new();
+            r.read_to_end(&mut all).unwrap();
+            assert_eq!(all, body);
+            r
+        };
+        // One request per 100,000 bytes.
+        assert_eq!(sequential(100_000, 100_000).requests, 30);
+        // 10 KB, doubling up to 1 MB: seven requests to 1,270,000 bytes, two
+        // of 1 MB, the rest.
+        let mut r = sequential(10_000, 1_000_000);
+        assert_eq!(r.requests, 9);
+        // A read elsewhere is one request of the first size, from its block.
+        let (requests, fetched) = (r.requests, r.bytes_fetched);
+        r.seek(SeekFrom::Start(123)).unwrap();
+        r.read_exact(&mut [0u8; 10]).unwrap();
+        assert_eq!(r.requests, requests + 1);
+        assert_eq!(r.bytes_fetched, fetched + 10_000);
+        // The defaults are the ones `open` has.
+        assert_eq!(
+            (super::http::BLOCK, super::http::MAX_BLOCK),
+            (1 << 20, 8 << 20)
+        );
     }
 
     /// A seek past the largest offset is refused, not wrapped to a small one.

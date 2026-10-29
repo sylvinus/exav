@@ -2,7 +2,7 @@
 //! spans, lists and fields, with paragraph, text and list styles resolved
 //! into explicit DrawingML properties.
 
-use super::styles::{len, percent, ListDef, ListLevel, Props, Styles};
+use super::styles::{ListDef, ListLevel, Props, Styles, len, percent};
 use crate::formats::office::common::xml::{Child, Node};
 use crate::formats::office::slides::model::*;
 
@@ -309,11 +309,11 @@ impl Inline<'_, '_> {
             kind: RunKind::Text(t),
             props: p,
         }) = self.runs.last_mut()
+            && !fresh
+            && p == props
         {
-            if !fresh && p == props {
-                t.push_str(&s);
-                return;
-            }
+            t.push_str(&s);
+            return;
         }
         self.runs.push(Run {
             kind: RunKind::Text(s),
@@ -470,18 +470,18 @@ fn paragraph(p: &Node, ctx: &mut TextCtx, list_level: usize, list: Option<&ListD
     let lv = list_level.max(1);
     // Shape style, outline level style, then the paragraph's own style.
     let mut props = ctx.base.clone();
-    if list_level > 0 {
-        if let Some(l) = (ctx.levels)(lv) {
-            props.overlay(&l.0);
-        }
+    if list_level > 0
+        && let Some(l) = (ctx.levels)(lv)
+    {
+        props.overlay(&l.0);
     }
     let ps = ctx.styles.chain("paragraph", p.attr("text:style-name"));
     props.overlay(&ps.0);
     let mut size = font_size(ctx.base, 18.0);
-    if list_level > 0 {
-        if let Some(l) = (ctx.levels)(lv) {
-            size = font_size(&l, size);
-        }
+    if list_level > 0
+        && let Some(l) = (ctx.levels)(lv)
+    {
+        size = font_size(&l, size);
     }
     size = font_size(&ps, size);
     let mut pp = para_props(&props);

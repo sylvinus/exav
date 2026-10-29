@@ -11,7 +11,7 @@ mod tests;
 
 use std::borrow::Cow;
 
-use exav_unpack::dxf::{looks_like_dxf, Decoder, Parts, Record, Records, Stop, Tag, Value};
+use exav_unpack::dxf::{Decoder, Parts, Record, Records, Stop, Tag, Value, looks_like_dxf};
 
 use super::model::*;
 use super::{Error, Limits};
@@ -413,7 +413,7 @@ impl<'a> Reader<'a, '_> {
                         || r.is("SECTION")
                         || r.is("EOF") =>
                 {
-                    return
+                    return;
                 }
                 _ => {}
             }

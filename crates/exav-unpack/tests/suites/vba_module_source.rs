@@ -12,7 +12,7 @@
 //! and the ContainsMacros heuristic still fires, while every macro-content
 //! signature quietly matches nothing.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use std::io::Write;
 
 /// An MS-OVBA CompressedContainer holding `payload` in one UNCOMPRESSED chunk.

@@ -148,8 +148,7 @@ pub fn band(verts: &[WideVertex], closed: bool) -> Band {
                 .push(s.sections.iter().map(|&(p, _, _)| p).collect());
             continue;
         }
-        for w in e.windows(2) {
-            let ((l0, r0), (l1, r1)) = (w[0], w[1]);
+        for &[(l0, r0), (l1, r1)] in e.array_windows() {
             out.triangles.push([l0, r0, l1]);
             out.triangles.push([r0, r1, l1]);
         }
@@ -235,11 +234,12 @@ mod tests {
         let a = area(&b.triangles);
         assert!((a - expected).abs() < 1e-9, "{a} vs {expected}");
         // The outer corner reaches (11, -1).
-        assert!(b
-            .triangles
-            .iter()
-            .flatten()
-            .any(|p| (p[0] - 11.0).abs() < 1e-9 && (p[1] + 1.0).abs() < 1e-9));
+        assert!(
+            b.triangles
+                .iter()
+                .flatten()
+                .any(|p| (p[0] - 11.0).abs() < 1e-9 && (p[1] + 1.0).abs() < 1e-9)
+        );
     }
 
     #[test]

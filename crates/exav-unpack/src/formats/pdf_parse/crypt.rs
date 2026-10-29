@@ -160,17 +160,17 @@ impl Decoder {
         Err(PdfCryptError::UnsupportedRevision(level))
     }
 
-    pub(crate) fn decrypt_stream(&self, obj_id: u32, gen: u32, data: &mut Vec<u8>) {
+    pub(crate) fn decrypt_stream(&self, obj_id: u32, r#gen: u32, data: &mut Vec<u8>) {
         if data.is_empty() || self.method == CryptMethod::None {
             return;
         }
         match self.method {
             CryptMethod::V2 => {
-                let key = self.per_object_key(obj_id, gen, None);
+                let key = self.per_object_key(obj_id, r#gen, None);
                 rc4_apply(&key, data);
             }
             CryptMethod::AESV2 => {
-                let key = self.per_object_key(obj_id, gen, Some(b"sAlT"));
+                let key = self.per_object_key(obj_id, r#gen, Some(b"sAlT"));
                 aes_cbc_decrypt(&key, data);
             }
             CryptMethod::AESV3 => {
@@ -184,12 +184,12 @@ impl Decoder {
     /// ISO 32000-1 7.6.2, algorithm 1: MD5 of the file key, the object
     /// number's low 3 bytes and the generation's low 2, and for AES the salt;
     /// the first n + 5 bytes of it, at most 16, are the object's key.
-    fn per_object_key(&self, obj_id: u32, gen: u32, salt: Option<&[u8]>) -> Vec<u8> {
+    fn per_object_key(&self, obj_id: u32, r#gen: u32, salt: Option<&[u8]>) -> Vec<u8> {
         let n = self.key_size.min(16).min(self.key.len());
         let mut data = Vec::with_capacity(n + 5 + 4);
         data.extend_from_slice(&self.key[..n]);
         data.extend_from_slice(&obj_id.to_le_bytes()[..3]);
-        data.extend_from_slice(&gen.to_le_bytes()[..2]);
+        data.extend_from_slice(&r#gen.to_le_bytes()[..2]);
         if let Some(s) = salt {
             data.extend_from_slice(s);
         }
@@ -755,8 +755,14 @@ mod tests {
             method: CryptMethod::AESV2,
         };
         let cases = [
-            (&v3, "222222222222222222222222222222221667316af8df34c59a9cfbb282f3f15390b837b680e02362584c9426a765787eba74d5ee5529da8aad289df5c742541b"),
-            (&v2, "22222222222222222222222222222222c0f2686b1de9823bb0b732f174856be9b2bde49ef0768d91635c34a59383f9e6064367ffe1064032238b380d4224a448"),
+            (
+                &v3,
+                "222222222222222222222222222222221667316af8df34c59a9cfbb282f3f15390b837b680e02362584c9426a765787eba74d5ee5529da8aad289df5c742541b",
+            ),
+            (
+                &v2,
+                "22222222222222222222222222222222c0f2686b1de9823bb0b732f174856be9b2bde49ef0768d91635c34a59383f9e6064367ffe1064032238b380d4224a448",
+            ),
         ];
         for (dec, hex) in cases {
             // As extracted, and with the end-of-line a stream body can carry.

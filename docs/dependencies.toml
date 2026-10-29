@@ -1,0 +1,358 @@
+# What the dependency review reads by hand (docs/DEPENDENCIES.md, "Lifecycle").
+# `scripts/deps-review.py` checks it against the manifests and upstream.
+#
+# - [[pin]]      a `=` requirement: why, and what lets it go.
+# - [[patch]]    a `[patch]` entry.
+# - [[vendored]] source copied or ported into the tree: where from, which
+#                version, and what lets it go back to a dependency (or be dropped).
+#
+# `track` says where the script looks for upstream's newest release: "crates",
+# "github" (owner/repo), "pypi", or "none" (a port of a file with no releases).
+# `version = "unrecorded"` is a finding: say which upstream version or commit the
+# copy was taken from the next time the file is touched.
+
+# ---------------------------------------------------------------- pins
+
+[[pin]]
+crate = "image"
+why = "libclamav 1.5.4 links this version; exav-imagehash reproduces ClamAV's fuzzy image hash bit for bit from its pixels."
+until = "ClamAV moves to another release, and the hash parity tests pass on the new decoders."
+
+[[pin]]
+crate = "png"
+why = "libclamav's version (decoder parity, see image)."
+until = "as image."
+
+[[pin]]
+crate = "gif"
+why = "libclamav's version (decoder parity, see image)."
+until = "as image."
+
+[[pin]]
+crate = "zune-jpeg"
+why = "libclamav's versions, 0.5.8 for JPEG and 0.4.21 for JPEG inside TIFF (decoder parity, see image)."
+until = "as image."
+
+[[pin]]
+crate = "zune-core"
+why = "zune-jpeg 0.5.8's companion, named in the code; zune-jpeg 0.4.21's own zune-core is not declared (the vendored tiff decoder reaches it as zune_jpeg_04::zune_core)."
+until = "as zune-jpeg."
+
+[[pin]]
+crate = "fax"
+why = "libclamav's version, for CCITT strips of a TIFF (decoder parity, see image)."
+until = "as image."
+
+[[pin]]
+crate = "weezl"
+why = "0.1.12 where libclamav has 0.1.10: only a debug assertion that a TIFF LZW strip without a clear code tripped is corrected; it decodes the same."
+until = "as image."
+
+[[pin]]
+crate = "bcdec_rs"
+why = "BC1 to BC7 blocks for the viewer's DDS fallback. A 0.x crate pinned with `=` so `cargo install`, which ignores Cargo.lock, builds what was tested."
+until = "1.0, or a reason to follow its releases."
+
+[[pin]]
+crate = "hayro-jpeg2000"
+why = "JPEG 2000, a 0.x crate pinned with `=` so `cargo install` builds what was tested; shared with the PDF text reader."
+until = "1.0, or a reason to follow its releases."
+
+[[pin]]
+crate = "hayro-jbig2"
+why = "JBIG2, as hayro-jpeg2000."
+until = "as hayro-jpeg2000."
+
+[[pin]]
+crate = "hayro-ccitt"
+why = "hayro-jbig2's own MMR decoder, at the version it builds with."
+until = "as hayro-jpeg2000."
+
+[[pin]]
+crate = "hayro-interpret"
+why = "PDF text. Turns on hayro-syntax's `unsafe` feature itself, which is why text-pdf is not a default; pinned with `=` so `cargo install` builds what was tested."
+until = "it can be built without that `unsafe` feature (then vendor or patch it, or make text-pdf a default)."
+
+[[pin]]
+crate = "hayro-syntax"
+why = "as hayro-interpret."
+until = "as hayro-interpret."
+
+[[pin]]
+crate = "html5gum"
+why = "HTML tokens for the shared reader; 0.x, pinned with `=` so `cargo install` builds what was tested."
+until = "1.0, or a reason to follow its releases."
+
+[[pin]]
+crate = "pulldown-cmark"
+why = "Markdown events for the viewer and the scanner's visible text; pinned with `=` so `cargo install` builds what was tested."
+until = "a reason to follow its releases."
+
+[[pin]]
+crate = "zenjxl-decoder"
+why = "JPEG XL for the viewer; the viewer builds a patched copy of this exact version (see [[patch]])."
+until = "as the patch."
+
+[[pin]]
+crate = "rustdct"
+why = "Dev-dependency: the oracle exav-imagehash's src/dct.rs is checked against. It must stay at the version that file was ported from."
+until = "dct.rs is ported from a newer rustdct, or the oracle is dropped."
+
+[[pin]]
+crate = "wasm-bindgen"
+why = "Must equal the version of the wasm-bindgen CLI that generates the glue."
+until = "never pinned apart from the CLI: bump both together."
+
+# ---------------------------------------------------------------- patches
+
+[[patch]]
+crate = "zenjxl-decoder"
+where = "crates/exav-viewer/vendor/zenjxl-decoder"
+why = "Instant::now() panics on wasm32-unknown-unknown and the decoder calls it for every frame. crates/exav-viewer/vendor/zenjxl-decoder/EXAV.md lists the differences."
+until = "upstream reads its clock only when phase timing is asked for, or takes the patch."
+
+[[patch]]
+crate = "zenjxl-decoder-macros"
+where = "crates/exav-viewer/vendor/zenjxl-decoder-macros"
+why = "Its proc-macro-error2 is unmaintained (RUSTSEC-2026-0173) and cargo reports it as future-incompatible. abort! is a local panicking macro; EXAV.md beside it."
+until = "upstream drops proc-macro-error2."
+
+# ---------------------------------------------------------------- vendored
+
+[[vendored]]
+path = "crates/exav-core/src/fancy_regex"
+upstream = "fancy-regex"
+track = "crates"
+version = "0.19.2"
+kind = "adapted copy"
+why = "Backtracking engine for PCRE lookaround, backreferences and atomic groups. Carries two upstream pull requests unreleased when taken (278 and 292, both in 0.20.0) and, of exav's three fixes, only the size analysis overflow is still missing from 0.20.0 (README)."
+return_when = "a release has saturating size arithmetic in analyze.rs and compile.rs; the README lists the steps back, checked by cargo test -p exav-core pcre against the crate."
+
+[[vendored]]
+path = "crates/exav-render/src/image_codecs/jpeg.rs"
+upstream = "image"
+track = "crates"
+version = "0.25.9"
+kind = "adapted copy"
+why = "image's JPEG decoder over zune-jpeg built without its SIMD code, which `image` cannot turn off."
+return_when = "zune-jpeg's SIMD is a feature image can leave off, or the SIMD `unsafe` is gone."
+
+[[vendored]]
+path = "crates/exav-render/src/image_codecs/tiff_image.rs"
+upstream = "image"
+track = "crates"
+version = "0.25.9"
+kind = "adapted copy"
+why = "image's TIFF decoder, as jpeg.rs."
+return_when = "as jpeg.rs."
+
+[[vendored]]
+path = "crates/exav-render/src/image_codecs/tiff"
+upstream = "tiff"
+track = "crates"
+version = "0.10.3"
+kind = "adapted copy"
+why = "The tiff decoder over zune-jpeg 0.4 without SIMD, with `half` and `zerocopy` kept out."
+return_when = "as jpeg.rs."
+
+[[vendored]]
+path = "crates/exav-imagehash/src/pillow.rs"
+upstream = "pillow"
+track = "pypi"
+version = "12.3.0"
+kind = "port"
+why = "Pillow's resampler and grey conversions, for ClamAV's imagehash preset."
+return_when = "never: ClamAV's hash is defined by this algorithm."
+
+[[vendored]]
+path = "crates/exav-imagehash/src/dct.rs"
+upstream = "rustdct"
+track = "crates"
+version = "0.7.1"
+kind = "adapted copy"
+why = "DCT-II for power-of-two lengths with bounds checks where upstream uses `unsafe`; other lengths go through rustfft's SIMD upstream."
+return_when = "never: rustdct is unmaintained and `unsafe`."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/ppmd7"
+upstream = "ppmd-rust"
+track = "crates"
+version = "1.4.0"
+kind = "adapted copy"
+why = "PPMd var.H generalised over a range-decoder trait (7-Zip's and RAR's coders)."
+return_when = "upstream makes its range-decoder trait public (pub(crate) in 1.5.2) so RAR's coder can drive the model. 1.5.2 is forbid(unsafe_code), so the copy can then go; ppmd-rust is already a dev-dependency oracle."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/ppmd8"
+upstream = "ppmd-rust"
+track = "crates"
+version = "1.5.0"
+kind = "port"
+why = "PPMd var.I rev.1 (ZIP method 98) with the sub-allocator rewritten over a bounds-checked byte arena."
+return_when = "now: ppmd-rust 1.5.2 is forbid(unsafe_code), which was the reason for the arena rewrite. Compare its Ppmd8Decoder with this copy on the ZIP method-98 fixtures and the fuzz target, and drop the copy if they agree."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/udif.rs"
+upstream = "dmg-core"
+track = "crates"
+version = "0.1.2"
+kind = "adapted copy"
+why = "UDIF block reader, with lzma-rust2 for XZ instead of lzma-rs."
+return_when = "upstream uses lzma-rust2, or it is not worth following."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/cab_parse"
+upstream = "cab"
+track = "crates"
+version = "unrecorded"
+kind = "adapted copy"
+why = "CAB reader without write support, with bounds checks added for two panics on malformed cabinets (rust-cab on GitHub)."
+return_when = "upstream fixes the panics."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/arj_parse"
+upstream = "unarc-rs"
+track = "crates"
+version = "unrecorded"
+kind = "adapted copy"
+why = "ARJ reader. Depending on unarc-rs brings a second `zip` with default features, which unifies in codecs that bypass the per-member budget."
+return_when = "unarc-rs no longer depends on zip's default codecs."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/zoo_parse.rs"
+upstream = "unarc-rs"
+track = "crates"
+version = "unrecorded"
+kind = "adapted copy"
+why = "ZOO structures, as arj_parse."
+return_when = "as arj_parse."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/bzip2_rs"
+upstream = "bzip2-rs"
+track = "crates"
+version = "0.1.2"
+kind = "adapted copy"
+why = "Pure-Rust bzip2 decoder; the streaming decoder buffers a whole compressed block (upstream issue 13), plus a mode for NSIS's headerless bzip2."
+return_when = "never while upstream stays unreleased since 2021."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/azo.rs"
+upstream = "akolman/EggDotNet"
+track = "github"
+version = "unrecorded"
+kind = "port"
+why = "AZO, the codec of EGG and ALZ; the only permissively licensed implementation."
+return_when = "never: a port from C#."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/rar5_unpack.rs"
+upstream = "libarchive/libarchive"
+track = "github"
+version = "unrecorded"
+kind = "port"
+why = "RAR5 decompression core, from archive_read_support_format_rar5.c."
+return_when = "never: a port from C."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/rar3_unpack.rs"
+upstream = "nwaples/rardecode"
+track = "github"
+version = "unrecorded"
+kind = "port"
+why = "RAR3 and RAR4 decompression core, from the Go package."
+return_when = "never: a port from Go."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/lzfse.rs"
+upstream = "lzfse/lzfse"
+track = "github"
+version = "unrecorded"
+kind = "port"
+why = "LZFSE and LZVN decoder of Apple's reference implementation, decoding a whole buffer into a capped one."
+return_when = "never: a port from C."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/decmpfs.rs"
+upstream = "cmpfs"
+track = "crates"
+version = "0.1.0"
+kind = "port"
+why = "decmpfs (files macOS compresses) for HFS+ and APFS, over exav's own LZFSE and LZVN and its bounds; cmpfs brings lzfse_rust, lzvn-core and thiserror."
+return_when = "never: the HFS+ and APFS readers around it are in-tree."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/dcl_explode.rs"
+upstream = "explode"
+track = "crates"
+version = "0.1.2"
+kind = "port"
+why = "PKWARE DCL implode (blast.c's algorithm), whole slice into a capped buffer."
+return_when = "never: upstream unreleased since 2020 and a byte-at-a-time state machine."
+
+[[vendored]]
+path = "crates/exav-unpack/src/formats/ishield_z.rs"
+upstream = "unshield"
+track = "crates"
+version = "0.2.0"
+kind = "port"
+why = "Table of contents of InstallShield .z archives."
+return_when = "never: upstream unreleased since 2020."
+
+[[vendored]]
+path = "crates/exav-core/src/yara"
+upstream = "yara-x"
+track = "crates"
+version = "1.19"
+kind = "derived"
+why = "The native YARA engine; the pe, elf, dotnet, math, hash and string modules and the compiler's base64 handling derive from yara-x's (per-file headers). yara-x-parser is a regular dependency."
+return_when = "never: yara-x's runtime would bring a WASM runtime and a JIT (docs/DEPENDENCIES.md)."
+
+[[vendored]]
+path = "crates/exav-x86/src/generated.rs"
+upstream = "iced-x86"
+track = "crates"
+version = "1.21"
+kind = "generated tables"
+why = "Opcode tables emitted by crates/exav-x86/tools/gen-tables from iced-x86's decoder; iced-x86 stays a dev-dependency oracle."
+return_when = "never: regenerate if iced-x86 gains encodings."
+
+# ---------------------------------------------------------------- reviews
+#
+# One entry per workspace at the end of a late pass, from the last block
+# scripts/deps-review.py prints. `crates` and `unsafe` are for the shipped
+# default build (the CLI for the root workspace, the union of the wasm modules
+# for the viewer); `*_all` with every feature on. `unsafe` counts the keyword in
+# each crate's src/ with comments stripped, so it includes code a feature turns
+# off: read it as surface, and compare it with the last entry, not with zero.
+# The fuzz workspace is not shipped and is not recorded.
+
+[[review]]
+workspace = "root"
+date = "2026-10-27"
+release = "0.0.2"
+crates = 143
+unsafe = 5110
+crates_all = 191
+unsafe_all = 7829
+twice = 7
+
+[[review]]
+workspace = "unpack-wasm"
+date = "2026-10-27"
+release = "0.0.2"
+crates = 83
+unsafe = 3264
+crates_all = 84
+unsafe_all = 3264
+twice = 1
+
+[[review]]
+workspace = "viewer"
+date = "2026-10-27"
+release = "0.0.2"
+crates = 69
+unsafe = 3833
+crates_all = 69
+unsafe_all = 3833
+twice = 3

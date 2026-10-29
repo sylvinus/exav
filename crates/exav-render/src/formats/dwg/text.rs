@@ -742,10 +742,10 @@ fn parse_paragraph(body: &str) -> Paragraph {
             't' => {
                 // Each stop can carry a trailing alignment letter.
                 let number = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-                if let Ok(v) = number.parse::<f64>() {
-                    if v.is_finite() {
-                        p.tabs.push(v);
-                    }
+                if let Ok(v) = number.parse::<f64>()
+                    && v.is_finite()
+                {
+                    p.tabs.push(v);
                 }
             }
             _ => {}

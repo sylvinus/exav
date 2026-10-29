@@ -66,7 +66,8 @@ confounded in at least four ways:
 An earlier revision of the website quoted a mean/median table from such a run
 and concluded a 1.27x speed ratio. That was not supportable from the data it
 cited, so it was withdrawn. A speed claim needs a dedicated benchmark (one job,
-warm cache, repeated runs, equal environments).
+warm cache, repeated runs, equal environments): `scripts/bench-speed.sh` is
+that, and its result is on the comparison page.
 
 ## Corrections
 

@@ -207,7 +207,7 @@ pub enum DecodingBuffer<'a> {
 impl<'a> DecodingBuffer<'a> {
     fn as_bytes_mut(&mut self) -> &mut [u8] {
         match self {
-            DecodingBuffer::U8(ref mut buf) => buf,
+            DecodingBuffer::U8(buf) => buf,
             DecodingBuffer::I8(buf) => bytecast::i8_as_ne_mut_bytes(buf),
             DecodingBuffer::U16(buf) => bytecast::u16_as_ne_mut_bytes(buf),
             DecodingBuffer::I16(buf) => bytecast::i16_as_ne_mut_bytes(buf),

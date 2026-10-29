@@ -93,6 +93,16 @@ Reconstructing a disk image gives a pile of sectors. Reading the *filesystem* on
 it is what turns those into files with names, and what reassembles a
 **fragmented** file — which a raw carve can only see as disconnected pieces.
 
+**Since then every filesystem reader is in-tree** (`formats/vol.rs` and one
+file for each of NTFS, FAT, exFAT, ext, HFS+, APFS, SquashFS, cramfs, romfs and
+EROFS), validated against the tools that make the images, and the kernel's own
+view of the volumes it wrote. `fatfs` (feature `fat`), `ext4-view` and the
+`ntfs` crate were each taken first; what follows is why, kept for the numbers.
+The ones that went last, `fatfs` and `ext4-view`, went for the reasons the
+backlog gave: `fatfs` panicked on a chain through cluster 1 and needed a
+`catch_unwind` around every call, and `ext4-view` could only be given a volume
+held whole in memory.
+
 `fatfs` was taken (feature `fat`). It fits the principles above almost exactly:
 MIT, no `unsafe`, and `bitflags` + `log` are its only dependencies.
 
@@ -148,10 +158,9 @@ answered them better:
 - **Scope**: read-only access to files by path is precisely what a scanner
   needs, with none of the mount/journal-replay surface a driver carries.
 
-The one real cost is recorded in `formats/ext.rs`: `Ext4::load` takes an owned
-`Box<dyn Ext4Read>`, so the image is copied once rather than borrowed. That is a
-forced-materialization site, charged against `max_buffer_bytes` like the
-others, and an image past the budget is reported rather than skipped.
+The one real cost was that `Ext4::load` takes an owned `Box<dyn Ext4Read>`, so
+the image was copied once rather than borrowed, and an image past
+`max_buffer_bytes` was reported rather than read. That is why it was replaced.
 
 ### ZOO: vendored, after linking it broke something else
 
@@ -361,7 +370,7 @@ to show for it.
 reaches no shipped binary, and every encoding the decoder claims is checked
 against it on each test run.
 
-## Adding or bumping a dependency — checklist
+## Adding a dependency: checklist
 
 - Is there a smaller/leaf alternative, or can we do it in-crate over our bounded
   byte arena? (Several parsers are vendored for exactly this reason — see
@@ -373,6 +382,152 @@ against it on each test run.
 - Gate it behind a feature if it's format- or capability-specific.
 - CI must stay green: `cargo deny check` (advisories/bans/sources/licenses) and
   the license allowlist in `deny.toml`.
+
+## Lifecycle
+
+What we want, in this order when they conflict:
+
+1. **As few dependencies as the features need.** exav keeps a maximalist
+   feature list, so a heavy feature is not refused: its cost is moved. First
+   into an opt-in Cargo feature (principle 3), so the default build does not
+   pay it; then, where the dependency is bigger than the reader it serves,
+   into a reader written in-tree.
+2. **No `unsafe` in what ships**, ours or theirs. A dependency's `unsafe` goes
+   by turning off the feature that holds it, by vendoring the safe part, or by
+   replacing the crate. Only then is it accepted, and it is listed with its
+   reason on the site's dependencies page.
+3. **One copy of each thing**: one version of a crate in the tree, one reader
+   per format ([ARCHITECTURE.md](ARCHITECTURE.md)), one vendored copy of an
+   upstream.
+4. **Vendoring serves 1 to 3.** It is for a dependency that cannot be made to
+   do what we need, never a way to stop following upstream. Every vendored copy
+   has a condition under which it goes back to being a dependency.
+
+The default build is judged strictly and an opt-in feature loosely: a
+feature's dependencies are paid by the builds that enable it, so a new
+format with a heavy decoder lands behind a feature, and an old feature moves
+into the default only when it fits the numbers below.
+
+`docs/dependencies.toml` holds what a script cannot know: why each `=` pin
+exists and what lets it go, each `[patch]`, and every vendored copy with its
+upstream, the version it was taken from and its return condition.
+`scripts/deps-review.py` reads it with the manifests, the lock files, the
+source of every crate in them and crates.io (`make deps-review`).
+
+### The numbers
+
+Compared with the last `[[review]]` entry of the register, and written there
+at the end of every late pass:
+
+- crates in the default shipped tree of the CLI, and in the tree with every
+  feature on;
+- `unsafe` keywords in each (the same count as the site's tables: comments
+  stripped, `src/` only, so it is surface to review, not risk);
+- crates resolved at two versions;
+- vendored copies, and how many have an upstream that moved;
+- pins, patches and `deny.toml` ignores.
+
+A number that goes up is explained in the changelog or the backlog.
+
+### Two passes a release
+
+**Early**, right after the previous release is cut, while there is time to
+find what a change broke.
+
+1. Run `scripts/deps-review.py` with the network. Read the register part
+   first (pins without a reason, vendored copies whose upstream moved), then
+   the findings.
+2. Take the dependencies one by one, every direct dependency, not only the
+   flagged ones, and answer the questions below. The script answers most of
+   them.
+3. Make the changes that alter behaviour now: major upgrades, removals,
+   replacements, vendoring and un-vendoring. One change each, with its own
+   tests, so that the nightly fuzz campaign and a long round (RELEASING.md,
+   step 4) see them.
+4. A decision that is not taken goes to [BACKLOG.md](BACKLOG.md) with the
+   question it is waiting on.
+
+**Late**, at the freeze: step 2 of [RELEASING.md](RELEASING.md).
+
+1. `cargo update` in each workspace, and read the lock file diff.
+2. Run the script again and compare with the early run. What is new is an
+   advisory, a yanked release or a fix we asked for: take it. Anything else
+   waits for the next early pass. No replacement, vendoring or major upgrade
+   in this pass unless an advisory forces it.
+3. `cargo deny` and `cargo audit`; drop every `deny.toml` ignore whose crate
+   has a fixed release; `npm audit`; the MSRV.
+4. Bring the register up to date (versions of vendored copies, pins, the new
+   `[[review]]` entry), the `NOTICE` versions, and the counts in the site's
+   dependencies tables.
+
+### The questions
+
+Asked of each direct dependency, in this order. The first answer that is
+bad decides.
+
+| Question | Where the answer is | If it is bad |
+|---|---|---|
+| Is it used? | the script's "never named in its sources"; `grep` | remove it |
+| Does the default build need it? | `optional = true`, the feature graph | gate it behind a feature |
+| Is it maintained? | release age and releases a year in the report; its repository | replace, or vendor what is used |
+| How much `unsafe`, and can a feature turn it off? | the report; the crate's features | turn it off; else vendor the safe part; else replace |
+| What does it pull in alone? | `cargo tree -e no-dev -i <crate>` | replace with a leaf, or write the reader |
+| Is a smaller reader enough? | how much of the crate we call; an oracle to test against | write it in-tree, keep the crate as a dev-dependency oracle (as `iced-x86`) |
+| Is the reason for its pin, patch or vendoring still true? | `docs/dependencies.toml` | act on its `until` or `return_when` |
+
+### The moves
+
+**Upgrade.** A compatible release is taken by `cargo update` and the lock file
+diff is read. A breaking release is read in its changelog first; for a 0.x
+crate every minor is breaking. A release that needs a newer Rust than the MSRV
+waits, or raises the MSRV with a reason (`rust-version` in `Cargo.toml`). A
+pinned crate is moved by editing its pin, the register and, for the
+decoders that must match ClamAV's, the parity tests.
+
+**Remove.** Delete it from every manifest and feature list, then check the
+other workspaces (`fuzz`, the wasm crates, the viewer) and the site tables.
+A crate that is only a dev-dependency stays out of the shipped tree already
+and costs only the test build.
+
+**Replace.** Measure the candidates the way the filesystem section does:
+crates added to the lock file, `unsafe`, who maintains it and since when,
+whether a fixture and an independent oracle can be built without root. A
+crate published within the last months by one author, with a long chain
+behind it, is declined for the reason given there.
+
+**Vendor.** Allowed when one of these holds: the dependency holds `unsafe` or
+a codec that no feature turns off; a fix we need is merged and unreleased,
+and `cargo install` can only build from crates.io; its feature unification
+pulls in what bypasses the budget (the ZOO case); or it is a large tree for a
+small reader. It is done in this form:
+
+- a module under the consuming crate with `#![forbid(unsafe_code)]`;
+- a `README.md` beside it listing every difference from upstream, or the
+  header of the file for a single file;
+- the license file and a `NOTICE` entry (upstream, version, copyright);
+- upstream's tests where its license allows;
+- an entry in `docs/dependencies.toml` with `version` filled in (the upstream
+  release or commit) and a `return_when` that can be checked.
+
+**Un-vendor.** When the `return_when` holds, or the script shows a release
+newer than the copy: point the module at the crate, run the tests that
+exercise it, and remove the module, its `NOTICE` entry, its register entry and
+its doc mentions in the same change. If the crate lacks a fix of ours, report
+it upstream first and say so in the module's README; a fix that stays local is
+the reason a copy lives forever.
+
+**Patch.** `[patch.crates-io]` is for the excluded workspaces that are never
+published (the viewer). A crate that `cargo install` builds cannot carry one.
+The patched copy has an `EXAV.md` of what differs, and a register entry.
+
+**Pin.** `=` is for a version that something outside the repository fixes (a
+decoder's output that must equal ClamAV's, the `wasm-bindgen` CLI) or a 0.x
+crate whose releases we do not follow. It needs a register entry with its
+reason.
+
+**Advisory.** An ignore in `deny.toml` has a comment saying why it does not
+apply. A fixed release removes the ignore; an unmaintained crate with no
+replacement is replaced in the next early pass, not left to the ignore.
 
 ## Measuring WASM size fairly
 

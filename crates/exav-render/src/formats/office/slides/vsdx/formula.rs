@@ -218,14 +218,27 @@ impl Parser<'_> {
         Some(v)
     }
 
+    /// The signs in front of an operand, taken in a loop: a recursion per
+    /// sign is a frame of the stack for each byte of a formula.
     fn unary(&mut self, depth: u32) -> Option<Val> {
-        if self.eat("-") {
-            return Some(Val::Num(-self.unary(depth)?.num()?));
+        let mut minus = 0u32;
+        loop {
+            if self.eat("-") {
+                minus += 1;
+            } else if !self.eat("+") {
+                break;
+            }
+            self.steps += 1;
+            if self.steps > MAX_STEPS {
+                return None;
+            }
         }
-        if self.eat("+") {
-            return self.unary(depth);
+        let v = self.primary(depth)?;
+        if minus == 0 {
+            return Some(v);
         }
-        self.primary(depth)
+        let n = v.num()?;
+        Some(Val::Num(if minus % 2 == 1 { -n } else { n }))
     }
 
     fn primary(&mut self, depth: u32) -> Option<Val> {
@@ -271,10 +284,11 @@ impl Parser<'_> {
             }
             let word = std::str::from_utf8(&self.s[start..self.i]).ok()?;
             let next = self.s.get(self.i).copied();
-            if !word.is_empty() && !matches!(next, Some(b'(' | b'.' | b'!')) {
-                if let Some(f) = unit_factor(word) {
-                    return Some(Val::Num(v * f));
-                }
+            if !word.is_empty()
+                && !matches!(next, Some(b'(' | b'.' | b'!'))
+                && let Some(f) = unit_factor(word)
+            {
+                return Some(Val::Num(v * f));
             }
             self.i = save;
             return Some(Val::Num(v));
@@ -585,6 +599,29 @@ mod tests {
         assert_eq!(num("Width/Height*0.5"), Some(1.0));
         assert_eq!(num("Width-1-1"), Some(2.0));
         assert_eq!(num("1/0"), None);
+    }
+
+    #[test]
+    fn signs_in_front_of_an_operand() {
+        assert_eq!(num("--3"), Some(3.0));
+        assert_eq!(num("-+-3"), Some(3.0));
+        assert_eq!(num("-+3"), Some(-3.0));
+        assert_eq!(num("+-Width"), Some(-4.0));
+        assert_eq!(eval("+User.Name", &mut Cells), Some(Val::Str("a".into())));
+        assert_eq!(eval("-User.Name", &mut Cells), None);
+        assert_eq!(eval("--User.Name", &mut Cells), None);
+    }
+
+    /// 200,000 signs on a 256 KB stack: a recursion per sign overflows it.
+    #[test]
+    fn a_formula_of_signs_is_refused_not_recursed_into() {
+        let f = format!("{}1", "-".repeat(200_000));
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || assert_eq!(eval(&f, &mut Cells), None))
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

@@ -69,15 +69,13 @@ impl PhishingDb {
                                 disp.trim().to_ascii_lowercase(),
                             ));
                         }
-                    } else if let Some(rest) = line.strip_prefix("X:") {
-                        if let Some((real, disp)) = rest.split_once(':') {
-                            if let (Ok(re), Ok(rd)) = (compile_pattern(real), compile_pattern(disp))
-                            {
-                                self.allow_regex.push((re, rd));
-                                self.allow_regex_src
-                                    .push((real.to_string(), disp.to_string()));
-                            }
-                        }
+                    } else if let Some(rest) = line.strip_prefix("X:")
+                        && let Some((real, disp)) = rest.split_once(':')
+                        && let (Ok(re), Ok(rd)) = (compile_pattern(real), compile_pattern(disp))
+                    {
+                        self.allow_regex.push((re, rd));
+                        self.allow_regex_src
+                            .push((real.to_string(), disp.to_string()));
                     }
                 }
                 _ => {}
@@ -259,7 +257,13 @@ pub(crate) fn scan_links(links: &[(String, String)], db: &PhishingDb) -> (Option
     (None, true)
 }
 
-/// Offset of the next `<a ` (case-insensitive) at or after `from`. `bytes`
+/// The bytes HTML5 takes for white space after a tag name.
+fn is_tag_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+}
+
+/// Offset of the next `<a` and white space (case-insensitive) at or after
+/// `from`. `bytes`
 /// reads `data` when it is not held in memory, and is kept across calls so
 /// the object is read forward once.
 fn find_anchor(
@@ -271,7 +275,7 @@ fn find_anchor(
     if let Some(data) = data.as_slice() {
         let hay = data.get(from..)?;
         return memchr::memchr_iter(b'<', hay)
-            .find(|&i| matches!(hay.get(i + 1..i + 3), Some([b'a' | b'A', b' '])))
+            .find(|&i| matches!(hay.get(i + 1..i + 3), Some([b'a' | b'A', b]) if is_tag_space(*b)))
             .map(|i| from + i);
     }
     let n = data.len();
@@ -279,7 +283,7 @@ fn find_anchor(
         bytes.at(i) == b'<'
             && i + 2 < n
             && matches!(bytes.at(i + 1), b'a' | b'A')
-            && bytes.at(i + 2) == b' '
+            && is_tag_space(bytes.at(i + 2))
     })
 }
 
@@ -301,17 +305,19 @@ fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
     let disp_host = display_host(display);
     // Userinfo cloak: `http://paypal.com@evil/` — flag only when the userinfo
     // itself looks like a hostname of a different registered domain.
-    if let Some(ui) = userinfo {
-        if ui.contains('.') && registered(ui) != registered(host) {
-            return Some(Phish::CloakedUsername);
-        }
+    if let Some(ui) = userinfo
+        && ui.contains('.')
+        && registered(ui) != registered(host)
+    {
+        return Some(Phish::CloakedUsername);
     }
     // Raw-IP host under a domain-looking display.
     if is_ipv4(host) {
-        if let Some(dh) = &disp_host {
-            if !is_ipv4(dh) && dh.contains('.') {
-                return Some(Phish::CloakedIp);
-            }
+        if let Some(dh) = &disp_host
+            && !is_ipv4(dh)
+            && dh.contains('.')
+        {
+            return Some(Phish::CloakedIp);
         }
         return None;
     }
@@ -320,13 +326,14 @@ fn classify(href: &str, display: &str, db: &PhishingDb) -> Option<Phish> {
     // the scheme is a domain spoof, the more specific finding. (Getting this
     // order wrong made a paypal.com-spoofing link report as a mere SSL
     // mismatch — the existing `spoofed_domain` test caught it.)
-    if let Some(dh) = &disp_host {
-        if !dh.is_empty() && registered(dh) != registered(host) {
-            if db.scoped() && !db.is_protected(dh) {
-                return None;
-            }
-            return Some(Phish::SpoofedDomain);
+    if let Some(dh) = &disp_host
+        && !dh.is_empty()
+        && registered(dh) != registered(host)
+    {
+        if db.scoped() && !db.is_protected(dh) {
+            return None;
         }
+        return Some(Phish::SpoofedDomain);
     }
     // Transport lie: the display promises https, the href is plain http, and the
     // domains agree — the one phishing shape where everything except the scheme
@@ -422,10 +429,10 @@ fn strip_http(url: &str) -> Option<&str> {
 /// The host named by anchor display text, if it is (or contains) a URL or bare host.
 fn display_host(display: &str) -> Option<String> {
     let d = display.trim();
-    if let Some((_, h)) = split_host(d) {
-        if !h.is_empty() {
-            return Some(h.to_ascii_lowercase());
-        }
+    if let Some((_, h)) = split_host(d)
+        && !h.is_empty()
+    {
+        return Some(h.to_ascii_lowercase());
     }
     let token = d
         .split_whitespace()
@@ -447,15 +454,34 @@ fn display_host(display: &str) -> Option<String> {
     None
 }
 
-/// Approximate registered domain: the last two DNS labels, lowercased.
+/// Labels that stand before a country code in a two-label public suffix:
+/// `co.uk`, `com.au`, `gov.uk`, `ne.jp`, `ac.nz`. Not the whole of the public
+/// suffix list, which has thousands of entries (`city.kawasaki.jp`,
+/// `pvt.k12.ma.us`): these are the ones that carry nearly all the registrations
+/// of the countries that use the form.
+const SECOND_LEVEL: &[&str] = &[
+    "ac", "asn", "biz", "co", "com", "edu", "go", "gob", "gouv", "gov", "id", "info", "int", "ltd",
+    "me", "mil", "mod", "ne", "net", "nhs", "nom", "or", "org", "plc", "police", "sch", "web",
+];
+
+/// Approximate registered domain, lowercased: the last two DNS labels, or the
+/// last three when they end in a two-label public suffix of a country
+/// (`barclays.co.uk`), where the last two would be the suffix alone and every
+/// brand under it one and the same.
 fn registered(host: &str) -> String {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     let labels: Vec<&str> = h.split('.').filter(|s| !s.is_empty()).collect();
-    if labels.len() <= 2 {
-        labels.join(".")
+    let n = labels.len();
+    let keep = if n >= 3
+        && labels[n - 1].len() == 2
+        && labels[n - 1].bytes().all(|b| b.is_ascii_alphabetic())
+        && SECOND_LEVEL.contains(&labels[n - 2])
+    {
+        3
     } else {
-        labels[labels.len() - 2..].join(".")
-    }
+        2
+    };
+    labels[n.saturating_sub(keep)..].join(".")
 }
 
 /// True for a dotted-quad IPv4 literal.
@@ -519,6 +545,78 @@ mod tests {
             scan0(br#"<html><a href="http://secure-update.ru/x">www.bankofamerica.com</a></html>"#),
             Some(Phish::SpoofedDomain)
         );
+    }
+
+    /// HTML5 takes a space, a tab, a line feed, a form feed and a carriage
+    /// return alike after a tag name, and so does every browser and mail client.
+    #[test]
+    fn an_anchor_may_be_followed_by_any_html_space() {
+        use crate::byte_source::{BlockCache, CHUNK};
+        for space in [" ", "\t", "\n", "\r", "\x0c", "\r\n\t "] {
+            let html =
+                format!("<a{space}href=\"http://evil.example/login\">http://paypal.com/signin</a>");
+            assert_eq!(
+                scan0(html.as_bytes()),
+                Some(Phish::SpoofedDomain),
+                "{space:?}"
+            );
+            let upper = html.replace("<a", "<A");
+            assert_eq!(
+                scan0(upper.as_bytes()),
+                Some(Phish::SpoofedDomain),
+                "{space:?}"
+            );
+            // Read in blocks, from an offset that puts the tag name's end at
+            // the end of a block.
+            let mut page = vec![b' '; CHUNK - 2];
+            page.extend_from_slice(html.as_bytes());
+            let cache =
+                BlockCache::with_sizes(std::io::Cursor::new(page.clone()), 61, 4 * 61).unwrap();
+            assert_eq!(
+                scan_complete_source(&cache, &PhishingDb::default()).0,
+                Some(Phish::SpoofedDomain),
+                "{space:?} in blocks"
+            );
+        }
+        // A tag that only begins with `a` is not an anchor.
+        assert_eq!(
+            scan0(br#"<abbr href="http://evil.example/">http://paypal.com</abbr>"#),
+            None
+        );
+    }
+
+    #[test]
+    fn a_brand_under_a_two_label_suffix_is_its_own_registered_domain() {
+        assert_eq!(registered("www.barclays.co.uk"), "barclays.co.uk");
+        assert_eq!(registered("barclays.co.uk"), "barclays.co.uk");
+        assert_eq!(registered("co.uk"), "co.uk");
+        assert_eq!(registered("a.b.shop.com.au"), "shop.com.au");
+        assert_eq!(registered("x.example.co.jp."), "example.co.jp");
+        assert_eq!(registered("www.paypal.com"), "paypal.com");
+        assert_eq!(registered("paypal.com"), "paypal.com");
+        // A generic label before a generic top-level domain is a domain.
+        assert_eq!(registered("www.co.com"), "co.com");
+        assert_eq!(registered("localhost"), "localhost");
+        assert_eq!(registered(""), "");
+    }
+
+    #[test]
+    fn spoofs_under_a_two_label_suffix_are_found() {
+        let spoof = br#"<a href="http://secure-barclays-login.co.uk/">http://barclays.co.uk</a>"#;
+        let cloak = br#"<a href="http://barclays.co.uk@phishing-login.co.uk/x">your bank</a>"#;
+        assert_eq!(scan0(spoof), Some(Phish::SpoofedDomain));
+        assert_eq!(scan0(cloak), Some(Phish::CloakedUsername));
+        // The same brand under its own subdomain is not a spoof.
+        let same = br#"<a href="http://online.barclays.co.uk/x">www.barclays.co.uk</a>"#;
+        assert_eq!(scan0(same), None);
+        // A monitored brand under a two-label suffix is monitored as itself,
+        // not as every domain under the suffix.
+        let mut db = PhishingDb::default();
+        db.add_text("pdb", "H:smile.co.uk\n");
+        let hit = br#"<a href="http://evil-login.co.uk/">www.smile.co.uk</a>"#;
+        let other = br#"<a href="http://evil-login.co.uk/">www.example.co.uk</a>"#;
+        assert_eq!(scan(hit, &db), Some(Phish::SpoofedDomain));
+        assert_eq!(scan(other, &db), None);
     }
 
     #[test]

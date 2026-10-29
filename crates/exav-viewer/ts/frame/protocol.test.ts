@@ -229,13 +229,13 @@ describe("what the frame takes from the host", () => {
     expect(
       checkOptions({
         pdf: { maxZoom: 4, minZoom: "1", prerenderMargin: "50%" },
-        cad: { ground: "dark", colors: { light: "#fff", dark: "url(x)" }, timeoutMs: Infinity, maxDecompressedBytes: 1e8 },
+        cad: { ground: "dark", colors: { light: "#fff", dark: "url(x)" }, timeoutMs: Infinity, maxDecompressedBytes: 1e8, maxEntities: 5e5 },
         image: { maxDecodeBytes: 1e6, detail: () => null },
         ifc: { highlight: "red" },
         evil: {},
       }),
-    ).toEqual({ pdf: { maxZoom: 4, prerenderMargin: "50%" }, cad: { ground: "dark", maxDecompressedBytes: 1e8 }, image: { maxDecodeBytes: 1e6 }, ifc: {} });
-    expect(checkOptions({ cad: { maxDecompressedBytes: "1e8" } })).toEqual({ cad: {} });
+    ).toEqual({ pdf: { maxZoom: 4, prerenderMargin: "50%" }, cad: { ground: "dark", maxDecompressedBytes: 1e8, maxEntities: 5e5 }, image: { maxDecodeBytes: 1e6 }, ifc: {} });
+    expect(checkOptions({ cad: { maxDecompressedBytes: "1e8", maxEntities: "5e5" } })).toEqual({ cad: {} });
     expect(checkOptions({ cad: { monochrome: true, lineweights: "always" } })).toEqual({ cad: { monochrome: true, lineweights: "always" } });
     expect(checkOptions({ cad: { monochrome: "yes", lineweights: "thick" } })).toEqual({ cad: {} });
     // The IFC and STL engine's limits reach the frame's plugins.

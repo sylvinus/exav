@@ -1,9 +1,9 @@
 //! A table:table to a sheet: columns, rows, cells, merges, notes, links,
 //! validation, conditional formats and drawings.
 
-use super::dom::{Child, Node};
 use super::styles::Props;
-use super::{cf, draw, paragraphs, parse_date, parse_duration, parse_range_addr, text_of, Doc};
+use super::{Doc, cf, draw, paragraphs, parse_date, parse_duration, parse_range_addr, text_of};
+use crate::formats::office::common::xml::{Child, Node};
 use crate::formats::office::sheets::error::Result;
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
@@ -327,6 +327,8 @@ pub(crate) fn read_table(
                                 .style = Some(id);
                         }
                     }
+                } else if !budget.sweep(u64::from(crep)) {
+                    skipped_format = true;
                 } else {
                     let differ: Vec<u32> = (0..crep)
                         .filter(|&j| {
@@ -560,17 +562,17 @@ fn first_copy<'a>(
 ) {
     let cs = repeat(cell, "table:number-columns-spanned");
     let rs = repeat(cell, "table:number-rows-spanned");
-    if (cs > 1 || rs > 1) && sheet.merges.len() < 1 << 20 {
-        if let Some(m) = (Range {
+    if (cs > 1 || rs > 1)
+        && sheet.merges.len() < 1 << 20
+        && let Some(m) = (Range {
             r1: r,
             c1: c,
             r2: r.saturating_add(rs - 1),
             c2: c.saturating_add(cs - 1),
         })
         .clipped()
-        {
-            sheet.merges.push(m);
-        }
+    {
+        sheet.merges.push(m);
     }
     let mc = cell
         .attr("table:number-matrix-columns-spanned")
@@ -578,25 +580,22 @@ fn first_copy<'a>(
     let mr = cell
         .attr("table:number-matrix-rows-spanned")
         .and_then(|v| v.parse::<u32>().ok());
-    if let (Some(mc), Some(mr)) = (mc, mr) {
-        if mc > 0
-            && mr > 0
-            && sheet
-                .cells
-                .get(&(r, c))
-                .is_some_and(|x| x.formula.is_some())
-        {
-            if let Some(a) = (Range {
-                r1: r,
-                c1: c,
-                r2: r.saturating_add(mr - 1),
-                c2: c.saturating_add(mc - 1),
-            })
-            .clipped()
-            {
-                sheet.arrays.insert((r, c), a);
-            }
-        }
+    if let (Some(mc), Some(mr)) = (mc, mr)
+        && mc > 0
+        && mr > 0
+        && sheet
+            .cells
+            .get(&(r, c))
+            .is_some_and(|x| x.formula.is_some())
+        && let Some(a) = (Range {
+            r1: r,
+            c1: c,
+            r2: r.saturating_add(mr - 1),
+            c2: c.saturating_add(mc - 1),
+        })
+        .clipped()
+    {
+        sheet.arrays.insert((r, c), a);
     }
     if let Some(a) = cell.child("office:annotation") {
         let mut text = String::new();
@@ -636,33 +635,33 @@ fn first_copy<'a>(
             });
         }
     }
-    if let Some(vn) = cell.attr("table:content-validation-name") {
-        if let Some(v) = doc.validations.get(vn) {
-            let rng = Range {
-                r1: r,
-                c1: c,
-                r2: r + rep - 1,
-                c2: c + crep - 1,
-            };
-            match sheet.validations.iter_mut().find(|x| {
-                x.prompt == v.prompt
-                    && x.formula1 == v.formula1
-                    && x.kind == v.kind
-                    && x.operator == v.operator
-                    && x.formula2 == v.formula2
-                    && x.error == v.error
-            }) {
-                Some(existing) => {
-                    if existing.ranges.len() < 1024 {
-                        existing.ranges.push(rng);
-                    }
+    if let Some(vn) = cell.attr("table:content-validation-name")
+        && let Some(v) = doc.validations.get(vn)
+    {
+        let rng = Range {
+            r1: r,
+            c1: c,
+            r2: r + rep - 1,
+            c2: c + crep - 1,
+        };
+        match sheet.validations.iter_mut().find(|x| {
+            x.prompt == v.prompt
+                && x.formula1 == v.formula1
+                && x.kind == v.kind
+                && x.operator == v.operator
+                && x.formula2 == v.formula2
+                && x.error == v.error
+        }) {
+            Some(existing) => {
+                if existing.ranges.len() < 1024 {
+                    existing.ranges.push(rng);
                 }
-                None => {
-                    if sheet.validations.len() < 1 << 12 {
-                        let mut v = v.clone();
-                        v.ranges = vec![rng];
-                        sheet.validations.push(v);
-                    }
+            }
+            None => {
+                if sheet.validations.len() < 1 << 12 {
+                    let mut v = v.clone();
+                    v.ranges = vec![rng];
+                    sheet.validations.push(v);
                 }
             }
         }
@@ -682,10 +681,11 @@ fn find_link(n: &Node, depth: u32) -> Option<String> {
         if c.name == "text:a" {
             return c.attr("xlink:href").map(str::to_string);
         }
-        if c.name != "office:annotation" && !c.name.starts_with("draw:") {
-            if let Some(x) = find_link(c, depth + 1) {
-                return Some(x);
-            }
+        if c.name != "office:annotation"
+            && !c.name.starts_with("draw:")
+            && let Some(x) = find_link(c, depth + 1)
+        {
+            return Some(x);
         }
     }
     None
@@ -832,11 +832,11 @@ fn rich(runs: Vec<(String, Props)>, doc: &Doc) -> Value {
     let mut out: Vec<Run> = vec![];
     for (text, p) in runs {
         let font = doc.st.to_style(&p).font;
-        if let Some(last) = out.last_mut() {
-            if last.font.as_ref() == Some(&font) {
-                last.text.push_str(&text);
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && last.font.as_ref() == Some(&font)
+        {
+            last.text.push_str(&text);
+            continue;
         }
         out.push(Run {
             text,

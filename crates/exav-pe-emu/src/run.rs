@@ -53,7 +53,7 @@
 //! phase is abandoned and execution proceeds to the entry point rather than
 //! ending the run: the payload is still worth trying to recover from there.
 
-use crate::cpu::{Cpu, Stop, EAX, EBX, ESP};
+use crate::cpu::{Cpu, EAX, EBX, ESP, Stop};
 use crate::image::PeImage;
 use crate::mem::{Mem, PAGE_SIZE};
 use crate::win::{ApiEffect, Env, INITIAL_ESP, TEB_BASE};
@@ -822,8 +822,14 @@ fn disassemble(cpu: &Cpu, mem: &mut Mem) -> String {
     format!(
         "{:08x}  {text:<32} eax={:08x} ecx={:08x} edx={:08x} ebx={:08x} esp={:08x} ebp={:08x} esi={:08x} edi={:08x}",
         cpu.eip,
-        cpu.regs[0], cpu.regs[1], cpu.regs[2], cpu.regs[3],
-        cpu.regs[4], cpu.regs[5], cpu.regs[6], cpu.regs[7],
+        cpu.regs[0],
+        cpu.regs[1],
+        cpu.regs[2],
+        cpu.regs[3],
+        cpu.regs[4],
+        cpu.regs[5],
+        cpu.regs[6],
+        cpu.regs[7],
     )
 }
 

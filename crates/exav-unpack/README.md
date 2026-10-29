@@ -15,14 +15,14 @@ member is reported as unsupported, never silently dropped.
 zstd, XZ, PPMd and the PKZIP 1.x ones), gzip, tar, xz, bzip2, zstd, lzip, LZ4,
 Unix `compress`, CAB, 7z, RAR (RAR3 LZ+PPMd, RAR5 LZ), ARJ, LHA, ZOO, ARC, EGG,
 ALZ, ISO 9660 and UDF, ar, cpio, xar, WIM, OLE2, PDF, MIME email and TNEF, Apple
-DMG (UDIF + HFS+/APFS), virtual disks (VHD, VHDX, QCOW2, VMDK) with the NTFS and
-FAT filesystems inside them, UPX and other PE packers, and more. The full list
+DMG (UDIF + HFS+/APFS), virtual disks (VHD, VHDX, QCOW2, VMDK), and the
+filesystems of disks and partitions (NTFS, FAT, exFAT, ext2/3/4, HFS+, APFS,
+SquashFS, cramfs, romfs, EROFS), UPX and other PE packers, and more. The full list
 is at [exav.org](https://exav.org/unpack/formats/).
 
 A virtual disk, or a raw disk image, larger than the buffer limit is not held:
 its tables are read as the walk reaches them, an unallocated range costs
-nothing, and the files of its NTFS and FAT volumes come out one at a time.
-An ext volume is copied into memory, bounded by the limit.
+nothing, and the files of its filesystems come out one at a time.
 
 Every format is a **Cargo feature**, so you can build only what you need
 (`--no-default-features --features zip` for a ZIP-only extractor). Decryption

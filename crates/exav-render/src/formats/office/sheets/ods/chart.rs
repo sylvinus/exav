@@ -1,7 +1,10 @@
 //! ODF charts (an embedded object's office:chart) to the chart model.
 
-use super::dom::{self, Node};
+use crate::formats::office::common::xml::{self, Node};
+use crate::formats::office::sheets::charts::XML_PER_POINT;
+use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::model::*;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 fn text(n: &Node) -> String {
@@ -34,9 +37,24 @@ fn excel_ref(sheet: &str, r: &Range) -> String {
 struct Data<'a> {
     sheets: &'a [Sheet],
     local: HashMap<(u32, u32), Value>,
+    /// Tells the workbook's memory budget what a series copied out of the
+    /// cells: every series gets its own copy of its range, and a chart may
+    /// have a few hundred of them over the same hundred thousand cells.
+    charge: RefCell<&'a mut dyn FnMut(u64) -> bool>,
+    /// A copy was refused: the conversion is.
+    refused: Cell<bool>,
 }
 
 impl Data<'_> {
+    /// Whether `bytes` more may be held; a refusal is remembered.
+    fn afford(&self, bytes: usize) -> bool {
+        if (self.charge.borrow_mut())(bytes as u64) {
+            return true;
+        }
+        self.refused.set(true);
+        false
+    }
+
     fn cells(&self, sheet: &str, r: &Range) -> Vec<Value> {
         if r.area() > 100_000 {
             return vec![];
@@ -59,7 +77,8 @@ impl Data<'_> {
     }
 
     fn nums(&self, sheet: &str, r: &Range) -> Vec<Option<f64>> {
-        self.cells(sheet, r)
+        let out: Vec<Option<f64>> = self
+            .cells(sheet, r)
             .into_iter()
             .map(|v| {
                 if let Value::Number(n) = v {
@@ -68,14 +87,26 @@ impl Data<'_> {
                     None
                 }
             })
-            .collect()
+            .collect();
+        // The values, and the XML they are written as.
+        if self.afford(out.len() * (size_of::<Option<f64>>() + XML_PER_POINT)) {
+            out
+        } else {
+            vec![]
+        }
     }
 
     fn strs(&self, sheet: &str, r: &Range) -> Vec<String> {
-        self.cells(sheet, r)
+        let out: Vec<String> = self
+            .cells(sheet, r)
             .into_iter()
             .map(|v| v.display())
-            .collect()
+            .collect();
+        let bytes = out
+            .iter()
+            .map(|s| size_of::<String>() + 2 * s.len() + XML_PER_POINT)
+            .sum();
+        if self.afford(bytes) { out } else { vec![] }
     }
 }
 
@@ -122,8 +153,34 @@ fn local_table(doc: &Node) -> HashMap<(u32, u32), Value> {
     out
 }
 
-pub(crate) fn read(xml: &[u8], anchor: Anchor, sheets: &[Sheet]) -> Option<Chart> {
-    let doc = dom::parse(xml, 2_000_000).ok()?;
+/// What the tree of one chart may take; it is dropped once the chart is read.
+const CHART_TREE_BYTES: u64 = 64 << 20;
+
+/// The chart of an embedded object, or `None` when it is not one. What its
+/// series copy out of `sheets` is told to `charge`, and a chart that cannot be
+/// afforded fails the conversion.
+pub(crate) fn read(
+    xml: &[u8],
+    anchor: Anchor,
+    sheets: &[Sheet],
+    charge: &mut dyn FnMut(u64) -> bool,
+) -> Result<Option<Chart>> {
+    let refused = Cell::new(false);
+    let chart = read_in(xml, anchor, sheets, charge, &refused);
+    if refused.get() {
+        return Err(Error::TooLarge("memory"));
+    }
+    Ok(chart)
+}
+
+fn read_in(
+    xml: &[u8],
+    anchor: Anchor,
+    sheets: &[Sheet],
+    charge: &mut dyn FnMut(u64) -> bool,
+    refused: &Cell<bool>,
+) -> Option<Chart> {
+    let doc = xml::parse(xml, &mut xml::within(CHART_TREE_BYTES)).ok()?;
     let ch = doc.find("chart:chart")?;
     let mut styles: HashMap<String, &Node> = HashMap::new();
     if let Some(a) = doc.child("office:automatic-styles") {
@@ -200,6 +257,8 @@ pub(crate) fn read(xml: &[u8], anchor: Anchor, sheets: &[Sheet]) -> Option<Chart
     let data = Data {
         sheets,
         local: local_table(&doc),
+        charge: RefCell::new(charge),
+        refused: Cell::new(false),
     };
     let mut cat_range = None;
     for ax in plot.all("chart:axis") {
@@ -220,6 +279,9 @@ pub(crate) fn read(xml: &[u8], anchor: Anchor, sheets: &[Sheet]) -> Option<Chart
         }
     }
     for s in plot.all("chart:series").take(256) {
+        if data.refused.get() {
+            break;
+        }
         let mut cs = ChartSeries {
             line: true,
             ..Default::default()
@@ -269,14 +331,14 @@ pub(crate) fn read(xml: &[u8], anchor: Anchor, sheets: &[Sheet]) -> Option<Chart
                     cs.cat_ref = Some(excel_ref(&sh, &r));
                 }
             }
-            if this_kind == ChartKind::Bubble {
-                if let Some((sh, r)) = domains.first() {
-                    cs.sizes = std::mem::take(&mut cs.vals);
-                    cs.size_ref = cs.val_ref.take();
-                    cs.vals = data.nums(sh, r);
-                    if sh != "local-table" {
-                        cs.val_ref = Some(excel_ref(sh, r));
-                    }
+            if this_kind == ChartKind::Bubble
+                && let Some((sh, r)) = domains.first()
+            {
+                cs.sizes = std::mem::take(&mut cs.vals);
+                cs.size_ref = cs.val_ref.take();
+                cs.vals = data.nums(sh, r);
+                if sh != "local-table" {
+                    cs.val_ref = Some(excel_ref(sh, r));
                 }
             }
         } else if let Some((sh, r)) = &cat_range {
@@ -327,5 +389,6 @@ pub(crate) fn read(xml: &[u8], anchor: Anchor, sheets: &[Sheet]) -> Option<Chart
         }
         c.series.push(cs);
     }
+    refused.set(data.refused.get());
     Some(c)
 }

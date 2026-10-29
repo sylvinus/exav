@@ -1,7 +1,7 @@
 //! What the docs targets check of a conversion that succeeds.
 use std::io::Read;
 
-use exav_render::docs::{convert, Format, Limits};
+use exav_render::docs::{Format, Limits, convert};
 
 /// Converts `doc` and checks the DOCX.
 pub fn run(doc: &[u8], format: Format) {

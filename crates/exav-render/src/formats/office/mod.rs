@@ -34,9 +34,8 @@ pub mod visible;
 #[cfg(feature = "office-test-util")]
 #[doc(hidden)]
 pub mod test_util {
-    pub use super::common::cfb::tests::build as build_cfb;
-    pub use super::common::cfb::Compound;
     pub use super::common::iwa::proto::write::W;
     pub use super::common::iwa::snappy::literal_block;
     pub use super::common::package::{PackageWriter, Zip};
+    pub use exav_unpack::cfb::{Compound, build as build_cfb};
 }

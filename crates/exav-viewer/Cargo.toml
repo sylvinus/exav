@@ -3,10 +3,10 @@
 [package]
 name = "exav-viewer"
 version = "0.0.2"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
-rust-version = "1.92"
+rust-version = "1.95"
 description = "The WebAssembly half of @exav/viewer: exav-render's image decoders, DWG/DXF engine and IFC/STL meshes for the browser."
 publish = false
 
@@ -44,9 +44,12 @@ wasm-bindgen = "=0.2.129"
 
 # zenjxl-decoder reads `std::time::Instant` for every frame, which panics on
 # this target: the copy here reads a clock that says zero there, and is the
-# published 0.3.10 in everything else (vendor/zenjxl-decoder/EXAV.md).
+# published 0.3.10 in everything else (vendor/zenjxl-decoder/EXAV.md). Its
+# macros crate is copied without `proc-macro-error2`, which is unmaintained
+# (vendor/zenjxl-decoder-macros/EXAV.md).
 [patch.crates-io]
 zenjxl-decoder = { path = "vendor/zenjxl-decoder" }
+zenjxl-decoder-macros = { path = "vendor/zenjxl-decoder-macros" }
 
 # Size-optimised: this crate ships as `.wasm`.
 #

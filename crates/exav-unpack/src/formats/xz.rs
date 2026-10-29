@@ -126,7 +126,10 @@ pub(crate) struct XzReader<R> {
     in_len: usize,
     /// The decoder owns its dictionary allocation, so its lifetime is
     /// independent of the input; `'static` keeps it out of the caller's way.
-    decoder: xz4rust::XzDecoder<'static>,
+    /// Boxed: its tables are about 30 KB, which the frame of whatever holds
+    /// the reader would take for as long as a member is scanned, once per
+    /// level of xz inside xz.
+    decoder: Box<xz4rust::XzDecoder<'static>>,
     /// Decoded bytes not yet handed to the caller. A single `decode` call can
     /// produce more than the caller asked for, and those bytes cannot be
     /// re-derived, so they wait here.
@@ -144,7 +147,10 @@ impl<R: std::io::Read> XzReader<R> {
             inbuf: vec![0; 8192],
             in_pos: 0,
             in_len: 0,
-            decoder: xz4rust::XzDecoder::with_alloc_dict_size(8192, XZ_MAX_DICT as usize),
+            decoder: Box::new(xz4rust::XzDecoder::with_alloc_dict_size(
+                8192,
+                XZ_MAX_DICT as usize,
+            )),
             staged: Vec::new(),
             taken: 0,
             done: false,

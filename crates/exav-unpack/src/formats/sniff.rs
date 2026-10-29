@@ -196,6 +196,26 @@ pub(crate) fn is_in(p: &Probe, fmt: Format) -> bool {
         Format::Lzma => lzma_alone_header(d),
 
         // The lead: magic, then the major version of the format (1 to 4).
+        // The superblock's magic, in either byte order, and its 96 bytes.
+        Format::Squashfs => d.len() >= 96 && (d.starts_with(b"hsqs") || d.starts_with(b"sqsh")),
+
+        // The superblock's magic, in either byte order, and the signature
+        // after it, at the start or 512 bytes in (room for boot code).
+        Format::Cramfs => [0usize, 512].iter().any(|&at| {
+            d.get(at..at.saturating_add(32)).is_some_and(|h| {
+                (h.starts_with(&[0x45, 0x3D, 0xCD, 0x28])
+                    || h.starts_with(&[0x28, 0xCD, 0x3D, 0x45]))
+                    && h.get(16..32) == Some(b"Compressed ROMFS".as_slice())
+            })
+        }),
+
+        // The eight bytes the first line of a romfs image is, and the file
+        // system's name after it.
+        Format::Romfs => d.len() >= 32 && d.starts_with(b"-rom1fs-"),
+
+        // The superblock is 1024 bytes in, with its magic first (little-endian).
+        Format::Erofs => d.get(1024..1028) == Some(&[0xE2, 0xE1, 0xF5, 0xE0][..]),
+
         Format::Rpm => {
             d.len() >= 96 && d.starts_with(&[0xED, 0xAB, 0xEE, 0xDB]) && (1..=4).contains(&d[4])
         }
@@ -267,7 +287,8 @@ pub(crate) fn prefixed_zip(p: &Probe) -> bool {
         return false;
     }
     let local = u32::from_le_bytes([entry[42], entry[43], entry[44], entry[45]]) as usize;
-    p.window(prefix + local, 4).starts_with(b"PK\x03\x04")
+    p.window(prefix.saturating_add(local), 4)
+        .starts_with(b"PK\x03\x04")
 }
 
 /// Whether `d` is skippable frames (`0x184D2A50`..`5F`, a length, that many

@@ -1,7 +1,7 @@
 //! The text of spreadsheets, taken from what the readers parse.
 
 use exav_render::formats::office::text::Text;
-use exav_render::sheets::{convert, text, Error, Format, Limits};
+use exav_render::sheets::{Error, Format, Limits, convert, text};
 use std::io::{Read, Write};
 
 const ALL: [(&str, Format); 8] = [

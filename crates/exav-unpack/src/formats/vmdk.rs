@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use super::vdisk::{self, bytes_at, le32, Health, Layout, Map, Unpacked, VDisk, MAX_PACKED_UNIT};
+use super::vdisk::{self, Health, Layout, MAX_PACKED_UNIT, Map, Unpacked, VDisk, bytes_at, le32};
 use super::volumes::report;
 use crate::source::ByteSource;
 use crate::stream::Visit;
@@ -584,9 +584,11 @@ mod tests {
         }
         let mut budget = crate::Budget::new(crate::Limits::default());
         let got = crate::extract(crate::Format::Vmdk, &img.as_slice(), &mut budget).unwrap();
-        assert!(got[0]
-            .unsupported
-            .is_some_and(|w| w.contains("could not be decompressed")));
+        assert!(
+            got[0]
+                .unsupported
+                .is_some_and(|w| w.contains("could not be decompressed"))
+        );
         let disk = &got[1];
         assert!(disk.unsupported.is_none() && disk.name == "vmdk-disk");
         assert!(disk.data.len() == 512 * 512);

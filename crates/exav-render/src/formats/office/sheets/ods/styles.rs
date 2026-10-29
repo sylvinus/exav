@@ -1,8 +1,8 @@
 //! ODF styles: cell styles with their parent chain resolved, to the model's
 //! styles and differential formats.
 
-use super::dom::{Child, Node};
 use super::numfmt;
+use crate::formats::office::common::xml::{Child, Node};
 use crate::formats::office::sheets::model::*;
 use std::collections::HashMap;
 
@@ -187,12 +187,11 @@ pub(crate) fn text_props(tp: &Node, fonts: &HashMap<String, String>, p: &mut Pro
         }
     }
     p.text = true;
-    if let Some(v) = tp.attr("fo:font-size") {
-        if !v.ends_with('%') {
-            if let Some(pt) = parse_len_pt(v) {
-                p.size = Some(pt.clamp(1.0, 409.0));
-            }
-        }
+    if let Some(v) = tp.attr("fo:font-size")
+        && !v.ends_with('%')
+        && let Some(pt) = parse_len_pt(v)
+    {
+        p.size = Some(pt.clamp(1.0, 409.0));
     }
     if let Some(v) = tp.attr("fo:font-weight") {
         p.bold = Some(v == "bold" || v.parse::<u32>().is_ok_and(|w| w >= 600));
@@ -324,16 +323,16 @@ pub(crate) fn style_props(st: &Node, fonts: &HashMap<String, String>) -> Props {
             .child("style:table-cell-properties")
             .and_then(|t| t.attr("style:text-align-source"))
             != Some("value-type");
-        if let Some(v) = pp.attr("fo:text-align") {
-            if fixed {
-                p.halign = Some(match v {
-                    "start" | "left" => Some("left"),
-                    "center" => Some("center"),
-                    "end" | "right" => Some("right"),
-                    "justify" => Some("justify"),
-                    _ => None,
-                });
-            }
+        if let Some(v) = pp.attr("fo:text-align")
+            && fixed
+        {
+            p.halign = Some(match v {
+                "start" | "left" => Some("left"),
+                "center" => Some("center"),
+                "end" | "right" => Some("right"),
+                "justify" => Some("justify"),
+                _ => None,
+            });
         }
         if let Some(pt) = pp.attr("fo:margin-left").and_then(parse_len_pt) {
             p.indent = Some((pt / 10.0).round().clamp(0.0, 15.0) as u8);

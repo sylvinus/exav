@@ -5,7 +5,7 @@
 //! `R2` alone is a whole row, `C3` a whole column. Relative references
 //! past the sheet's edge wrap around, as Excel's do.
 
-use crate::formats::office::sheets::model::{col_name, MAX_COL, MAX_ROW};
+use crate::formats::office::sheets::model::{MAX_COL, MAX_ROW, col_name};
 
 const MAX_LEN: usize = 16_384;
 

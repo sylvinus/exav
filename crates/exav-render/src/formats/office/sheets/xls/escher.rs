@@ -2,9 +2,9 @@
 //! (MSODRAWINGGROUP) and each sheet's shapes (MSODRAWING), matched with the
 //! OBJ records that follow them, as pictures, charts and shapes.
 
-use super::sheet::{biff_anchor, Obj};
+use super::sheet::{Obj, biff_anchor};
 use super::stream::Rec;
-use super::{chart, Globals};
+use super::{Globals, chart};
 use crate::formats::office::common::bytes::Cur;
 use crate::formats::office::sheets::error::Result;
 use crate::formats::office::sheets::geom::Grid;
@@ -164,11 +164,7 @@ fn dib_to_bmp(dib: &[u8]) -> Vec<u8> {
     let bits = Cur::at(dib, 14).u16() as u32;
     let used = Cur::at(dib, 32).u32();
     let colors = if bits <= 8 && bits > 0 {
-        if used > 0 {
-            used.min(256)
-        } else {
-            1 << bits
-        }
+        if used > 0 { used.min(256) } else { 1 << bits }
     } else {
         used.min(256)
     };
@@ -361,7 +357,7 @@ pub(crate) fn place(
     objs: &[Obj],
     recs: &[Rec],
 ) -> Result<()> {
-    if g.ver < 8 {
+    if g.book.ver < 8 {
         // BIFF5: no drawing; the objects carry their anchors.
         for o in objs {
             let Some(a) = o.anchor else { continue };
@@ -413,10 +409,10 @@ pub(crate) fn place(
                 });
             }
             5 => {
-                if let Some((a, b)) = o.chart {
-                    if let Some(ch) = chart::read_chart(g, &recs[a..b], Some(anchor), wb) {
-                        sheet.charts.push(ch);
-                    }
+                if let Some((a, b)) = o.chart
+                    && let Some(ch) = chart::read_chart(g, &recs[a..b], Some(anchor), wb)
+                {
+                    sheet.charts.push(ch);
                 }
             }
             1 | 2 | 3 | 4 | 6 | 9 | 30 => {

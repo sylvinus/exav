@@ -15,7 +15,7 @@ use std::cell::Cell;
 use std::sync::Once;
 
 use exav_render::image::{
-    decode, decode_any, Channels, Error, Format, Pixels, Samples, DECODE_MAX,
+    Channels, DECODE_MAX, Error, Format, Pixels, Samples, decode, decode_any,
 };
 
 const W: usize = 64;

@@ -3,7 +3,7 @@
 
 use hayro_jbig2::{Decoder, Image};
 
-use super::{within, Channels, Error, Pixels, Samples};
+use super::{Channels, Error, Pixels, Samples, within};
 use crate::formats::pdf_image::region_pixels;
 
 pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {

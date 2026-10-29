@@ -21,8 +21,9 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::stream::{emit_entry, Region, Visit};
-use crate::{Budget, Entry, LimitHit, Sink};
+use super::vol::{Emit, Found};
+use crate::stream::{MemberMeta, Region, Visit, emit_entry, emit_stream};
+use crate::{Budget, Entry, LimitHit};
 
 /// A member that is only a report: `reason` about `size` bytes of `name`.
 pub(crate) fn report<T>(
@@ -77,10 +78,32 @@ enum Fs {
     Fat,
     #[cfg(feature = "ext")]
     Ext,
+    #[cfg(feature = "exfat")]
+    Exfat,
+    #[cfg(feature = "squashfs")]
+    Squashfs,
+    #[cfg(feature = "cramfs")]
+    Cramfs,
+    #[cfg(feature = "romfs")]
+    Romfs,
+    #[cfg(feature = "erofs")]
+    Erofs,
+    #[cfg(feature = "dmg")]
+    Hfs,
+    #[cfg(feature = "dmg")]
+    Apfs,
 }
 
 /// The filesystem a volume starting with `head` is. The order is `detect`'s.
 fn sniff(head: &[u8]) -> Option<Fs> {
+    #[cfg(feature = "dmg")]
+    if super::apfs::is_apfs(head) {
+        return Some(Fs::Apfs);
+    }
+    #[cfg(feature = "dmg")]
+    if super::hfsplus::is_hfsplus(head) {
+        return Some(Fs::Hfs);
+    }
     #[cfg(feature = "ext")]
     if super::ext::is_ext(head) {
         return Some(Fs::Ext);
@@ -88,6 +111,26 @@ fn sniff(head: &[u8]) -> Option<Fs> {
     #[cfg(feature = "fat")]
     if super::fat::is_fat(head) {
         return Some(Fs::Fat);
+    }
+    #[cfg(feature = "exfat")]
+    if super::exfat::is_exfat(head) {
+        return Some(Fs::Exfat);
+    }
+    #[cfg(feature = "squashfs")]
+    if super::squashfs::is_squashfs(head) {
+        return Some(Fs::Squashfs);
+    }
+    #[cfg(feature = "cramfs")]
+    if super::cramfs::is_cramfs(head) {
+        return Some(Fs::Cramfs);
+    }
+    #[cfg(feature = "romfs")]
+    if super::romfs::is_romfs(head) {
+        return Some(Fs::Romfs);
+    }
+    #[cfg(feature = "erofs")]
+    if super::erofs::is_erofs(head) {
+        return Some(Fs::Erofs);
     }
     #[cfg(feature = "ntfs")]
     if super::sniff::is(head, crate::Format::Ntfs) {
@@ -147,27 +190,44 @@ impl<D> Seek for Window<'_, D> {
     }
 }
 
-/// Run a filesystem walker, which hands each file to a [`Sink`] as an
-/// [`Entry`], as a walk handing members to `visit`, each name under `prefix`.
+/// Run a filesystem walker, which hands each file to an [`Emit`], as a walk
+/// handing members to `visit`, each name under `prefix`. A file read as it
+/// goes is a streamed member.
 pub(crate) fn entries<T>(
     budget: &mut Budget,
     visit: Visit<T>,
     prefix: &str,
     run: impl FnOnce(
         &mut Budget,
-        Sink<Result<T, LimitHit>>,
+        Emit<Result<T, LimitHit>>,
     ) -> Result<Option<Result<T, LimitHit>>, LimitHit>,
 ) -> Result<Option<T>, LimitHit> {
-    let mut emit = |e: Entry, budget: &mut Budget| -> Option<Result<T, LimitHit>> {
-        let e = if prefix.is_empty() {
+    let under = |e: Entry| {
+        if prefix.is_empty() {
             e
         } else {
             Entry {
                 name: format!("{prefix}/{}", e.name),
                 ..e
             }
-        };
-        emit_entry(e, budget, &mut *visit).transpose()
+        }
+    };
+    let mut emit = |found: Found<'_>, budget: &mut Budget| -> Option<Result<T, LimitHit>> {
+        match found {
+            Found::Held(e) => emit_entry(under(e), budget, &mut *visit).transpose(),
+            Found::Read(e, reader) => {
+                let e = under(e);
+                let meta = MemberMeta {
+                    name: e.name,
+                    comp_size: e.comp_size,
+                    size: Some(e.comp_size),
+                    mtime: e.mtime,
+                    mode: e.mode,
+                    ..MemberMeta::default()
+                };
+                emit_stream(&meta, reader, budget, &mut *visit).transpose()
+            }
+        }
     };
     run(budget, &mut emit)?.transpose()
 }
@@ -191,6 +251,20 @@ fn walk_fs<D: Read + Seek, T>(
         Fs::Fat => super::fat::walk_volume(window, len, budget, sink),
         #[cfg(feature = "ext")]
         Fs::Ext => super::ext::walk_volume(window, len, budget, sink),
+        #[cfg(feature = "exfat")]
+        Fs::Exfat => super::exfat::walk_volume(window, len, budget, sink),
+        #[cfg(feature = "squashfs")]
+        Fs::Squashfs => super::squashfs::walk_volume(window, len, budget, sink),
+        #[cfg(feature = "cramfs")]
+        Fs::Cramfs => super::cramfs::walk_volume(window, len, budget, sink),
+        #[cfg(feature = "romfs")]
+        Fs::Romfs => super::romfs::walk_volume(window, len, budget, sink),
+        #[cfg(feature = "erofs")]
+        Fs::Erofs => super::erofs::walk_volume(window, len, budget, sink),
+        #[cfg(feature = "dmg")]
+        Fs::Hfs => super::hfsplus::walk_volume(window, budget, sink),
+        #[cfg(feature = "dmg")]
+        Fs::Apfs => super::apfs::walk_volume(window, budget, sink),
     })
 }
 

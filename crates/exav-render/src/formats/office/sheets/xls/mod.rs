@@ -5,20 +5,19 @@
 
 mod cf;
 mod chart;
-pub(crate) mod crypto;
 mod escher;
-pub(crate) mod formula;
-mod ftab;
 mod sheet;
 pub(crate) mod stream;
 #[cfg(test)]
 mod tests;
 
-use crate::formats::office::common::bytes::{u16_at, u32_at, Cur};
+use crate::formats::office::common::bytes::{Cur, u16_at, u32_at};
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
-use formula::{Ctx, ExtSheet5, Supbook};
+use exav_unpack::biff::Book;
+pub(crate) use exav_unpack::biff::formula;
+use exav_unpack::offcrypto::{DEFAULT_PASSWORDS, Decryptor, Refused};
 use std::collections::HashMap;
 use stream::Rec;
 
@@ -185,44 +184,18 @@ pub(crate) struct XfRec {
     used: u8,
 }
 
-pub(crate) struct BoundSheet {
-    pos: usize,
-    name: String,
-    state: u8,
-    kind: u8,
-}
-
-pub(crate) struct NameRec {
-    name: String,
-    /// 1-based sheet of a local name.
-    sheet: u16,
-    hidden: bool,
-    rgce: Vec<u8>,
-    extra: Vec<u8>,
-}
-
 pub(crate) struct Globals {
-    pub ver: u8,
-    pub codepage: u16,
+    /// What formulas need: version, code page, sheets, names, references.
+    pub book: Book,
     date1904: bool,
     fonts: Vec<FontRec>,
     formats: HashMap<u16, String>,
     fmt_index: u16,
     xfs: Vec<XfRec>,
     palette: Vec<u32>,
-    sheets: Vec<BoundSheet>,
     sst: Vec<Value>,
-    names: Vec<NameRec>,
-    pub name_texts: Vec<String>,
-    pub xti: Vec<(u16, i16, i16)>,
-    pub supbooks: Vec<Supbook>,
-    /// BIFF5 globals' EXTERNSHEET entries (for names).
-    pub ext5: Vec<ExtSheet5>,
-    /// External documents, numbered from 1 by their place here.
-    ext_docs: Vec<String>,
     blips: Vec<escher::Blip>,
     xf_style: HashMap<u32, u32>,
-    pub sheet_names: Vec<String>,
     active: usize,
     first_tab: usize,
 }
@@ -230,8 +203,7 @@ pub(crate) struct Globals {
 impl Globals {
     fn new(ver: u8) -> Globals {
         Globals {
-            ver,
-            codepage: if ver >= 8 { 1200 } else { 1252 },
+            book: Book::new(ver),
             date1904: false,
             fonts: vec![],
             formats: HashMap::new(),
@@ -242,47 +214,11 @@ impl Globals {
             } else {
                 BIFF34_PALETTE.to_vec()
             },
-            sheets: vec![],
             sst: vec![],
-            names: vec![],
-            name_texts: vec![],
-            xti: vec![],
-            supbooks: vec![],
-            ext5: vec![],
-            ext_docs: vec![],
             blips: vec![],
             xf_style: HashMap::new(),
-            sheet_names: vec![],
             active: 0,
             first_tab: 0,
-        }
-    }
-
-    pub fn ctx<'a>(&'a self, ext5: &'a [ExtSheet5]) -> Ctx<'a> {
-        Ctx {
-            ver: self.ver,
-            sheets: &self.sheet_names,
-            names: &self.name_texts,
-            xti: &self.xti,
-            supbooks: &self.supbooks,
-            ext5,
-            codepage: self.codepage,
-        }
-    }
-
-    /// A string in the BIFF5-and-older code page, or BIFF8's Unicode, with
-    /// a length of `len_bytes` (1 or 2) before it.
-    pub fn string(&self, c: &mut Cur, len_bytes: u8) -> String {
-        let n = if len_bytes == 1 {
-            c.u8() as usize
-        } else {
-            c.u16() as usize
-        };
-        if self.ver >= 8 {
-            let f = c.u8();
-            formula::read_chars(c, n, f & 1 != 0)
-        } else {
-            crate::formats::office::common::codepage::decode(c.bytes(n), self.codepage)
         }
     }
 
@@ -335,7 +271,7 @@ impl Globals {
         if let Some(s) = self.formats.get(&id) {
             return s.clone();
         }
-        if self.ver <= 4 {
+        if self.book.ver <= 4 {
             return "General".into();
         }
         BUILTIN_FMT
@@ -413,7 +349,7 @@ impl Globals {
     /// flag is clear from the style.
     fn resolve_xf(&self, x: &XfRec) -> XfRec {
         let mut r = x.clone();
-        if x.is_style || self.ver >= 5 {
+        if x.is_style || self.book.ver >= 5 {
             return r;
         }
         let Some(p) = self.xfs.get(x.parent as usize).filter(|p| p.is_style) else {
@@ -459,7 +395,7 @@ impl Globals {
     }
 
     fn default_xf(&self) -> usize {
-        if self.ver >= 5 && self.xfs.len() > 15 {
+        if self.book.ver >= 5 && self.xfs.len() > 15 {
             15
         } else {
             0
@@ -509,42 +445,6 @@ impl Globals {
         self.xf_style.insert(key, id);
         id
     }
-
-    fn ext_doc(&mut self, doc: &str) -> usize {
-        match self.ext_docs.iter().position(|d| d == doc) {
-            Some(i) => i + 1,
-            None => {
-                self.ext_docs.push(doc.to_string());
-                self.ext_docs.len()
-            }
-        }
-    }
-
-    /// A BIFF5 EXTERNSHEET record's entry.
-    pub fn ext_sheet5(&mut self, d: &[u8]) -> ExtSheet5 {
-        let n = d.first().copied().unwrap_or(0) as usize;
-        let body = d.get(1..).unwrap_or(&[]);
-        match body.first() {
-            Some(0x02..=0x04) | None => ExtSheet5::Own,
-            Some(&0x3A) if n == 1 => ExtSheet5::Names(vec![]),
-            Some(_) => {
-                let s = crate::formats::office::common::codepage::decode(
-                    &body[..n.min(body.len())],
-                    self.codepage,
-                );
-                let s = s.strip_prefix('\u{1}').unwrap_or(&s).to_string();
-                let (doc, sheet) = match s.rfind(']') {
-                    Some(i) => (s[..i].replace('[', ""), s[i + 1..].to_string()),
-                    None => (s.clone(), String::new()),
-                };
-                let doc: String = doc.chars().filter(|c| (*c as u32) >= 0x20).collect();
-                ExtSheet5::External {
-                    doc: self.ext_doc(&doc),
-                    sheet,
-                }
-            }
-        }
-    }
 }
 
 /// BIFF2's alignment, border and shading byte.
@@ -567,24 +467,26 @@ fn biff2_look(x: &mut XfRec, a: u8) {
 pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
     let mut data = stream::open(bytes)?;
     budget.alloc(data.len() as u64 * 2)?;
-    let mut recs = stream::records(&data);
-    let first = recs
-        .first()
+    let mut found = exav_unpack::biff::records(&data);
+    let first = found
+        .next()
         .ok_or_else(|| Error::Malformed("empty stream".into()))?;
-    let ver = stream::bof_version(first);
+    let ver = stream::bof_version(&first);
     if ver == 0 {
         return Err(Error::NotFormat("no BOF record".into()));
     }
-    if let Some(fp) = recs.iter().position(|r| r.id == 0x002F) {
+    let filepass = found
+        .find(|r| r.id == 0x002F)
+        .map(|r| (r.pos, r.data.into_owned()));
+    if let Some((pos, body)) = filepass {
         let dec =
-            crypto::Decryptor::from_filepass(&recs[fp].data, ver >= 8).map_err(|e| match e {
-                crypto::Refused::Password => Error::Encrypted,
-                crypto::Refused::Method => Error::Unsupported("encryption method".into()),
+            Decryptor::from_filepass(&body, ver >= 8, DEFAULT_PASSWORDS).map_err(|e| match e {
+                Refused::Password => Error::Encrypted,
+                Refused::Method => Error::Unsupported("encryption method".into()),
             })?;
-        dec.decrypt_stream(&mut data, recs[fp].pos);
-        recs = stream::records(&data);
+        dec.decrypt_stream(&mut data, pos);
     }
-    drop(data);
+    let recs = stream::records(&data);
     let mut wb = Workbook::new(Style::default());
     if ver <= 4 && stream::bof_type(&recs[0]) == 0x0100 {
         read_biff4w(&recs, &mut wb, budget)?;
@@ -595,7 +497,7 @@ pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
             globals_record(&mut g, r);
         }
         finish_globals(&mut g, &mut wb);
-        g.sheet_names = vec!["Sheet1".into()];
+        g.book.sheet_names = vec!["Sheet1".into()];
         let mut sheet = Sheet::new("Sheet1".into());
         if stream::bof_type(&recs[0]) == 0x20 {
             wb.warn("a chart file");
@@ -623,7 +525,7 @@ fn read_biff4w(recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) -> Result<(
         if r.id == 0x008F {
             let mut c = Cur::new(&r.data);
             c.u32();
-            names.push(g0.string(&mut c, 1));
+            names.push(g0.book.string(&mut c, 1));
         } else if stream::BOF_IDS.contains(&r.id) {
             let start = i;
             let end = substream_end(recs, start);
@@ -631,7 +533,7 @@ fn read_biff4w(recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) -> Result<(
                 return Err(Error::TooLarge("sheets"));
             }
             let mut g = Globals::new(4);
-            g.codepage = g0.codepage;
+            g.book.codepage = g0.book.codepage;
             for r in &recs[start..end] {
                 globals_record(&mut g, r);
             }
@@ -642,7 +544,7 @@ fn read_biff4w(recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) -> Result<(
                 .get(wb.sheets.len())
                 .cloned()
                 .unwrap_or_else(|| format!("Sheet{}", wb.sheets.len() + 1));
-            g.sheet_names = names.clone();
+            g.book.sheet_names = names.clone();
             let mut sheet = Sheet::new(name);
             sheet::read_sheet(&mut g, wb, budget, &recs[start..end], &mut sheet)?;
             wb.sheets.push(sheet);
@@ -680,15 +582,15 @@ fn read_workbook(ver: u8, recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) 
         i += 1;
     }
     finish_globals(&mut g, wb);
-    if g.sheets.len() > budget.limits.max_sheets as usize {
+    if g.book.sheets.len() > budget.limits.max_sheets as usize {
         return Err(Error::TooLarge("sheets"));
     }
-    g.sheet_names = g.sheets.iter().map(|s| s.name.clone()).collect();
-    g.name_texts = g.names.iter().map(|n| n.name.clone()).collect();
+    g.book.finish();
     budget.alloc(g.sst.iter().map(|v| v.text_len() as u64 + 32).sum())?;
 
     // Substreams, matched to BOUNDSHEET by their position, else by order.
     let by_pos: HashMap<usize, usize> = g
+        .book
         .sheets
         .iter()
         .enumerate()
@@ -702,7 +604,7 @@ fn read_workbook(ver: u8, recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) 
             let start = i;
             let end = substream_end(recs, start);
             let k = by_pos.get(&recs[start].pos).copied().unwrap_or_else(|| {
-                while order < g.sheets.len() && g.sheets[order].kind == 6 {
+                while order < g.book.sheets.len() && g.book.sheets[order].kind == 6 {
                     order += 1;
                 }
                 order
@@ -714,19 +616,19 @@ fn read_workbook(ver: u8, recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) 
             i += 1;
         }
     }
-    let mut built: Vec<Option<Sheet>> = (0..g.sheets.len()).map(|_| None).collect();
-    let mut filter = vec![false; g.sheets.len()];
+    let mut built: Vec<Option<Sheet>> = (0..g.book.sheets.len()).map(|_| None).collect();
+    let mut filter = vec![false; g.book.sheets.len()];
     for (k, start, end) in subs {
-        if k >= g.sheets.len() || built[k].is_some() {
+        if k >= g.book.sheets.len() || built[k].is_some() {
             continue;
         }
-        let mut sheet = Sheet::new(g.sheets[k].name.clone());
-        sheet.state = match g.sheets[k].state & 3 {
+        let mut sheet = Sheet::new(g.book.sheets[k].name.clone());
+        sheet.state = match g.book.sheets[k].state & 3 {
             1 => SheetState::Hidden,
             2 => SheetState::VeryHidden,
             _ => SheetState::Visible,
         };
-        let kind = g.sheets[k].kind;
+        let kind = g.book.sheets[k].kind;
         if kind == 2 || stream::bof_type(&recs[start]) == 0x20 {
             sheet.chart_sheet = true;
             if let Some(ch) = chart::read_chart(&g, &recs[start..end], None, wb) {
@@ -741,13 +643,13 @@ fn read_workbook(ver: u8, recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) 
     let mut index: Vec<Option<usize>> = vec![];
     let mut filters = vec![];
     for (k, s) in built.into_iter().enumerate() {
-        if g.sheets[k].kind == 6 {
+        if g.book.sheets[k].kind == 6 {
             index.push(None);
             continue;
         }
         index.push(Some(wb.sheets.len()));
         filters.push(filter[k]);
-        let mut s = s.unwrap_or_else(|| Sheet::new(g.sheets[k].name.clone()));
+        let mut s = s.unwrap_or_else(|| Sheet::new(g.book.sheets[k].name.clone()));
         // A chart sheet whose chart could not be read stays a worksheet.
         if s.chart_sheet && s.charts.is_empty() {
             s.chart_sheet = false;
@@ -756,6 +658,7 @@ fn read_workbook(ver: u8, recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) 
     }
     // The active tab counts the VB modules left out.
     let skipped = g
+        .book
         .sheets
         .iter()
         .take(wb.active)
@@ -770,11 +673,11 @@ fn read_workbook(ver: u8, recs: &[Rec], wb: &mut Workbook, budget: &mut Budget) 
 /// sheet of the model has filter buttons; `index`: each BOUNDSHEET's sheet
 /// in the model.
 fn finish_names(g: &Globals, wb: &mut Workbook, filters: &[bool], index: &[Option<usize>]) {
-    for n in &g.names {
+    for n in &g.book.names {
         if n.rgce.is_empty() || n.name.starts_with("_xlfn.") {
             continue;
         }
-        let Ok(d) = formula::decode(&g.ctx(&g.ext5), &n.rgce, &n.extra, 0, 0) else {
+        let Ok(d) = formula::decode(&g.book.ctx(&g.book.ext5), &n.rgce, &n.extra, 0, 0) else {
             continue;
         };
         if d.text.is_empty() || d.text.contains("#NAME?") {
@@ -788,16 +691,14 @@ fn finish_names(g: &Globals, wb: &mut Workbook, filters: &[bool], index: &[Optio
             },
         };
         if n.name == "_xlnm._FilterDatabase" {
-            if let Some(s) = scope {
-                if let Some(sh) = wb
+            if let Some(s) = scope
+                && let Some(sh) = wb
                     .sheets
                     .get_mut(s)
                     .filter(|_| filters.get(s) == Some(&true))
-                {
-                    if sh.autofilter.is_none() {
-                        sh.autofilter = parse_area(&d.text);
-                    }
-                }
+                && sh.autofilter.is_none()
+            {
+                sh.autofilter = parse_area(&d.text);
             }
             continue;
         }
@@ -937,82 +838,13 @@ pub(crate) fn rich_value(g: &Globals, s: String, runs: &[(u16, u16)]) -> Value {
     }
 }
 
-fn read_name(g: &Globals, r: &Rec) -> NameRec {
-    let ver = g.ver;
-    let mut c = Cur::new(&r.data);
-    let (flags, cch, cce, sheet, name);
-    if ver == 2 {
-        flags = u16::from(c.u8()) & 0xFFFE;
-        c.skip(2);
-        cch = c.u8() as usize;
-        cce = c.u8() as usize;
-        sheet = 0;
-        name = crate::formats::office::common::codepage::decode(c.bytes(cch), g.codepage);
-    } else {
-        flags = c.u16();
-        c.u8();
-        cch = c.u8() as usize;
-        cce = c.u16() as usize;
-        if ver >= 5 {
-            c.u16();
-            sheet = c.u16();
-            c.skip(4);
-        } else {
-            sheet = 0;
-        }
-        name = if ver >= 8 {
-            let f = c.u8();
-            formula::read_chars(&mut c, cch, f & 1 != 0)
-        } else {
-            crate::formats::office::common::codepage::decode(c.bytes(cch), g.codepage)
-        };
-    }
-    let builtin = flags & 0x20 != 0;
-    let name = if builtin {
-        let b = match name.chars().next().map_or(0xFF, |c| c as u32) {
-            0 => "Consolidate_Area",
-            1 => "Auto_Open",
-            2 => "Auto_Close",
-            3 => "Extract",
-            4 => "Database",
-            5 => "Criteria",
-            6 => "Print_Area",
-            7 => "Print_Titles",
-            8 => "Recorder",
-            9 => "Data_Form",
-            10 => "Auto_Activate",
-            11 => "Auto_Deactivate",
-            12 => "Sheet_Title",
-            13 => "_FilterDatabase",
-            _ => "Unknown",
-        };
-        format!("_xlnm.{b}")
-    } else if name == "_FilterDatabase" {
-        "_xlnm._FilterDatabase".into()
-    } else {
-        name
-    };
-    let rgce = c.bytes(cce).to_vec();
-    let extra = r.data[c.p.min(r.data.len())..].to_vec();
-    NameRec {
-        name,
-        sheet,
-        hidden: flags & 1 != 0,
-        rgce,
-        extra,
-    }
-}
-
 fn globals_record(g: &mut Globals, r: &Rec) {
-    let ver = g.ver;
+    if g.book.record(r) {
+        return;
+    }
+    let ver = g.book.ver;
     let mut c = Cur::new(&r.data);
     match r.id {
-        0x0042 => {
-            g.codepage = c.u16();
-            if ver >= 8 {
-                g.codepage = 1200;
-            }
-        }
         0x0022 => g.date1904 = c.u16() == 1,
         0x0031 | 0x0231 => {
             let mut f = FontRec {
@@ -1037,7 +869,7 @@ fn globals_record(g: &mut Globals, r: &Rec) {
                 f.charset = c.u8();
                 c.u8();
             }
-            f.name = g.string(&mut c, 1);
+            f.name = g.book.string(&mut c, 1);
             g.fonts.push(f);
         }
         0x0045 => {
@@ -1047,14 +879,14 @@ fn globals_record(g: &mut Globals, r: &Rec) {
         }
         0x041E if ver >= 5 => {
             let id = c.u16();
-            let s = g.string(&mut c, if ver >= 8 { 2 } else { 1 });
+            let s = g.book.string(&mut c, if ver >= 8 { 2 } else { 1 });
             g.formats.insert(id, s);
         }
         0x041E | 0x001E => {
             if r.id == 0x041E {
                 c.u16();
             }
-            let s = g.string(&mut c, 1);
+            let s = g.book.string(&mut c, 1);
             g.formats.insert(g.fmt_index, s);
             g.fmt_index = g.fmt_index.saturating_add(1);
         }
@@ -1198,18 +1030,6 @@ fn globals_record(g: &mut Globals, r: &Rec) {
                 }
             }
         }
-        0x0085 => {
-            let pos = c.u32() as usize;
-            let state = c.u8();
-            let kind = c.u8();
-            let name = g.string(&mut c, 1);
-            g.sheets.push(BoundSheet {
-                pos,
-                name,
-                state,
-                kind,
-            });
-        }
         0x00FC => {
             let mut sr = SplitReader {
                 d: &r.data,
@@ -1228,64 +1048,6 @@ fn globals_record(g: &mut Globals, r: &Rec) {
                     rich_value(g, s, &runs)
                 };
                 g.sst.push(v);
-            }
-        }
-        0x0018 | 0x0218 => {
-            let n = read_name(g, r);
-            g.names.push(n);
-        }
-        0x0017 if ver >= 8 => {
-            let n = c.u16() as usize;
-            for _ in 0..n {
-                let sb = c.u16();
-                let a = c.i16();
-                let b = c.i16();
-                if c.short {
-                    break;
-                }
-                g.xti.push((sb, a, b));
-            }
-        }
-        0x0017 => {
-            let e = g.ext_sheet5(&r.data);
-            g.ext5.push(e);
-        }
-        0x01AE => {
-            let ctab = c.u16();
-            let cch = c.u16();
-            let mut sb = Supbook::default();
-            if cch == 0x0401 {
-                sb.internal = true;
-            } else if cch == 0x3A01 {
-                sb.addin = true;
-            } else {
-                let mut c2 = Cur::at(&r.data, 2);
-                let url = g.string(&mut c2, 2);
-                for _ in 0..ctab.min(4096) {
-                    if c2.left() == 0 {
-                        break;
-                    }
-                    sb.sheets.push(g.string(&mut c2, 2));
-                }
-                sb.ext_index = g.ext_doc(&url);
-            }
-            g.supbooks.push(sb);
-        }
-        0x0023 => {
-            if ver >= 8 {
-                let _flags = c.u16();
-                c.u32();
-                let name = g.string(&mut c, 1);
-                if let Some(sb) = g.supbooks.last_mut() {
-                    sb.names.push(name);
-                }
-            } else if ver == 5 {
-                c.skip(6);
-                let n = c.u8() as usize;
-                let name = crate::formats::office::common::codepage::decode(c.bytes(n), g.codepage);
-                if let Some(ExtSheet5::Names(v)) = g.ext5.last_mut() {
-                    v.push(name);
-                }
             }
         }
         0x00EB => g.blips.extend(escher::blips(&r.data)),
@@ -1310,8 +1072,11 @@ fn orientation(o: u8) -> u8 {
 
 fn finish_globals(g: &mut Globals, wb: &mut Workbook) {
     wb.date1904 = g.date1904;
-    if !crate::formats::office::common::codepage::known(g.codepage) {
-        wb.warn(format!("code page {} read as Windows 1252", g.codepage));
+    if !crate::formats::office::common::codepage::known(g.book.codepage) {
+        wb.warn(format!(
+            "code page {} read as Windows 1252",
+            g.book.codepage
+        ));
     }
     wb.active = g.active;
     wb.first_tab = g.first_tab;

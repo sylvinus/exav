@@ -5,8 +5,8 @@
 mod common;
 
 use common::*;
-use exav_render::docs::{convert, Error, Format, Limits};
-use exav_render::formats::office::test_util::{literal_block, PackageWriter, W};
+use exav_render::docs::{Error, Format, Limits, convert};
+use exav_render::formats::office::test_util::{PackageWriter, W, literal_block};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!(
@@ -334,7 +334,9 @@ fn rtf_positioned_paragraphs_are_frames() {
 #[test]
 fn rtf_characters_in_every_encoding() {
     // \'e9 in the code page, \u with its fallback skipped, Cyrillic by font charset.
-    let d = rtf("{\\rtf1\\ansi\\ansicpg1252\\deff0{\\fonttbl{\\f0 A;}{\\f1\\fcharset204 B;}}caf\\'e9 \\u8364?x \\uc0\\u233 y {\\f1\\'cf\\'f0\\'e8}\\par}");
+    let d = rtf(
+        "{\\rtf1\\ansi\\ansicpg1252\\deff0{\\fonttbl{\\f0 A;}{\\f1\\fcharset204 B;}}caf\\'e9 \\u8364?x \\uc0\\u233 y {\\f1\\'cf\\'f0\\'e8}\\par}",
+    );
     assert!(d.contains("café €x éy"), "{d}");
     assert!(d.contains("При"), "{d}");
 }
@@ -554,4 +556,38 @@ fn pages_text_with_its_styles_and_page() {
             .kind(),
         "not-format"
     );
+}
+
+/// The memory bound counts what the model takes, which is a few kilobytes
+/// for a table cell and for a paragraph: 20,000 cells, or 100,000 paragraphs,
+/// hold some 100 and 270 MB.
+#[test]
+fn rtf_cells_and_paragraphs_are_counted_at_what_they_take() {
+    let cells = format!(
+        "{{\\rtf1 {}}}",
+        "\\trowd\\cellx100\\cell\\row".repeat(20_000)
+    );
+    let paras = format!("{{\\rtf1 {}}}", "x\\par ".repeat(100_000));
+    for rtf in [cells, paras] {
+        let within = |mib: u64| {
+            let limits = Limits::default().with_max_memory(mib << 20);
+            convert(rtf.as_bytes(), Format::Rtf, &limits)
+        };
+        assert_eq!(within(64).unwrap_err(), Error::TooLarge("memory"));
+        assert!(within(512).is_ok());
+    }
+}
+
+#[test]
+fn a_tree_of_elements_nothing_reads_is_charged_for() {
+    let x = format!(
+        "<w:wordDocument xmlns:w=\"http://schemas.microsoft.com/office/word/2003/wordml\"><w:body>{}</w:body></w:wordDocument>",
+        "<w:x/>".repeat(100_000)
+    );
+    let small = Limits::default().with_max_memory(8 << 20);
+    assert_eq!(
+        convert(x.as_bytes(), Format::Wml2003, &small).unwrap_err(),
+        Error::TooLarge("memory")
+    );
+    assert!(convert(x.as_bytes(), Format::Wml2003, &Limits::default()).is_ok());
 }

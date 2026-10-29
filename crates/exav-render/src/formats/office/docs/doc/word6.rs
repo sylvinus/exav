@@ -7,7 +7,7 @@
 use super::fib::{self, Clx, Fib, Piece};
 use super::props::ico;
 use super::styles::{Std, Stsh};
-use super::{read_plc, Reader, Run, SectionSpan};
+use super::{Reader, Run, SectionSpan, read_plc};
 use crate::formats::office::common::bytes::{u16_at, u32_at};
 use crate::formats::office::common::image;
 use crate::formats::office::docs::error::{Error, Result};

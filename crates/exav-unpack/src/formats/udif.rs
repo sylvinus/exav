@@ -7,12 +7,12 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 use crate::LimitHit;
 
@@ -374,7 +374,7 @@ fn decompress(entry_type: u32, compressed: &[u8], expected_len: usize) -> Result
                 return Ok(Run {
                     data: Vec::new(),
                     damaged: true,
-                })
+                });
             }
         },
         BLK_BZIP2 => crate::salvage(
@@ -388,12 +388,12 @@ fn decompress(entry_type: u32, compressed: &[u8], expected_len: usize) -> Result
             return Ok(Run {
                 data: adc_decompress(compressed, expected_len),
                 damaged: false,
-            })
+            });
         }
         other => {
             return Err(LimitHit::corrupt(format!(
                 "UDIF unsupported block type {other:#010x}"
-            )))
+            )));
         }
     };
     // The run's compressed bytes are all here, so a stream that runs out of

@@ -1,5 +1,5 @@
 //! NSIS installer extraction: real-sample robustness + synthetic-payload recovery.
-use exav_unpack::{detect, extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, detect, extract};
 
 /// A real NSIS installer (PE stub + NSIS firstheader + compressed data block).
 /// Its blocks use NSIS's modified bzip2, and every one of them decodes. It is
@@ -34,7 +34,7 @@ fn real_sample_decodes_every_block() {
 
 #[test]
 fn synthetic_deflate_block_recovers_marker() {
-    use flate2::{write::DeflateEncoder, Compression};
+    use flate2::{Compression, write::DeflateEncoder};
     use std::io::Write;
 
     // Build a minimal non-solid NSIS: MZ stub + firstheader + one raw-deflate

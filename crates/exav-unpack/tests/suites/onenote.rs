@@ -5,7 +5,7 @@
 //! their embedded FileDataStoreObject payloads and assert the extractor is
 //! panic-safe. See `tests/fixtures/onenote/README.md` for sha256 provenance.
 
-use exav_unpack::{detect, extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, detect, extract};
 
 /// The `.one` samples present locally, as `(name, bytes)`, each kept in its
 /// AES ZIP (`../README.md`).

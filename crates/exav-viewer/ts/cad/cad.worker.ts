@@ -26,6 +26,7 @@ export type CadRequest =
       background: Uint8Array;
       maxPrimitives: number;
       maxDecompressedBytes: number;
+      maxEntities: number;
       draw?: boolean;
     }
   /** Draw another layout of the file already parsed. */
@@ -35,7 +36,7 @@ export type CadRequest =
    * drawing wrote it), into the references to it. Answers how many blocks it
    * filled and the files still named.
    */
-  | { kind: "attach"; path: string; bytes: ArrayBuffer; maxDecompressedBytes: number };
+  | { kind: "attach"; path: string; bytes: ArrayBuffer; maxDecompressedBytes: number; maxEntities: number };
 
 export type CadAnswer = ParsedDrawing | { preview: DrawingPreview | null; unsupported: string | null } | { xrefs: string[]; attached: number };
 
@@ -116,13 +117,13 @@ serve<CadRequest, CadAnswer>(async (r) => {
     const bytes = r.bytes ? new Uint8Array(r.bytes) : loaded;
     loaded = null;
     if (!bytes) throw new Error("no drawing loaded");
-    doc = parseDrawing(bytes, r.maxDecompressedBytes);
+    doc = parseDrawing(bytes, r.maxDecompressedBytes, r.maxEntities);
     if (r.draw === false) return { value: { xrefs: JSON.parse(doc.xrefPathsJson()) as string[], attached: 0 } };
     return draw(doc, r, started);
   }
   if (!doc) throw new Error("no drawing loaded");
   if (r.kind === "attach") {
-    const attached = doc.attachXref(r.path, new Uint8Array(r.bytes), r.maxDecompressedBytes);
+    const attached = doc.attachXref(r.path, new Uint8Array(r.bytes), r.maxDecompressedBytes, r.maxEntities);
     return { value: { xrefs: JSON.parse(doc.xrefPathsJson()) as string[], attached } };
   }
   return draw(doc, r, started);

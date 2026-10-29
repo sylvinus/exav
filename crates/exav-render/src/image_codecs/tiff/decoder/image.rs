@@ -183,7 +183,7 @@ impl Image {
                     .collect();
 
                 // TODO: for now, only homogenous formats across samples are supported.
-                if !sample_format.windows(2).all(|s| s[0] == s[1]) {
+                if !sample_format.array_windows().all(|[a, b]| a == b) {
                     return Err(TiffUnsupportedError::UnsupportedSampleFormat(sample_format).into());
                 }
 
@@ -679,11 +679,11 @@ impl Image {
             }
             // exav: old-style JPEG, for the viewer's reader only: the header was
             // made from the tags (`ojpeg`), and each strip is a JPEG with it.
-            CompressionMethod::JPEG if super::viewer_codecs() && jpeg_tables.is_some() => {
+            CompressionMethod::JPEG if super::viewer_codecs() && let Some(tables) = jpeg_tables => {
                 let mut strip = Vec::new();
                 reader.take(compressed_length).read_to_end(&mut strip)?;
                 let jpeg = super::ojpeg::strip_jpeg(
-                    jpeg_tables.unwrap_or_default(),
+                    tables,
                     strip,
                     dimensions.1,
                     ojpeg_skip,

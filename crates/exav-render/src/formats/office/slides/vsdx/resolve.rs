@@ -330,15 +330,15 @@ impl<'a> Tree<'a> {
     pub fn find(&self, n: usize, name: &str) -> Option<(&'a Cell, Origin)> {
         let node = &self.nodes[n];
         for (i, l) in node.layers.iter().enumerate() {
-            if let Some(c) = l.cells.get(name) {
-                if c.v.is_some() || c.formula().is_some() {
-                    let o = if i == 0 && node.inst {
-                        Origin::Local
-                    } else {
-                        Origin::Master
-                    };
-                    return Some((c, o));
-                }
+            if let Some(c) = l.cells.get(name)
+                && (c.v.is_some() || c.formula().is_some())
+            {
+                let o = if i == 0 && node.inst {
+                    Origin::Local
+                } else {
+                    Origin::Master
+                };
+                return Some((c, o));
             }
         }
         let k = kind_of(name)?;
@@ -449,10 +449,10 @@ impl<'a> Tree<'a> {
     }
 
     fn cell_val(&self, n: usize, key: &str, c: &Cell, o: Origin) -> Option<Val> {
-        if o == Origin::Master {
-            if let Some(v) = c.formula().and_then(|f| self.eval(n, key, f)) {
-                return Some(v);
-            }
+        if o == Origin::Master
+            && let Some(v) = c.formula().and_then(|f| self.eval(n, key, f))
+        {
+            return Some(v);
         }
         match c.v.as_deref() {
             Some(v) => Some(parse_val(v)),
@@ -560,15 +560,15 @@ impl<'a> Tree<'a> {
                     if r.del {
                         return None;
                     }
-                    if let Some(c) = r.cells.get(cell) {
-                        if c.v.is_some() || c.formula().is_some() {
-                            let o = if i == 0 && node.inst {
-                                Origin::Local
-                            } else {
-                                Origin::Master
-                            };
-                            return Some((c, o));
-                        }
+                    if let Some(c) = r.cells.get(cell)
+                        && (c.v.is_some() || c.formula().is_some())
+                    {
+                        let o = if i == 0 && node.inst {
+                            Origin::Local
+                        } else {
+                            Origin::Master
+                        };
+                        return Some((c, o));
                     }
                 }
             }
@@ -624,16 +624,16 @@ impl<'a> Tree<'a> {
                 .iter()
                 .filter(|s| s.name == sec && s.ix.unwrap_or(0) == six)
             {
-                if let Some(c) = s.cells.get(cell) {
-                    if c.v.is_some() || c.formula().is_some() {
-                        let o = if i == 0 && node.inst {
-                            Origin::Local
-                        } else {
-                            Origin::Master
-                        };
-                        let k = format!("{sec}{six}.{cell}");
-                        return self.cell_val(n, &k, c, o);
-                    }
+                if let Some(c) = s.cells.get(cell)
+                    && (c.v.is_some() || c.formula().is_some())
+                {
+                    let o = if i == 0 && node.inst {
+                        Origin::Local
+                    } else {
+                        Origin::Master
+                    };
+                    let k = format!("{sec}{six}.{cell}");
+                    return self.cell_val(n, &k, c, o);
                 }
             }
         }
@@ -724,12 +724,11 @@ fn split_digits(s: &str) -> Option<(&str, u32)> {
 /// A V attribute as a value.
 pub fn parse_val(v: &str) -> Val {
     let t = v.trim();
-    if let Some(h) = t.strip_prefix('#') {
-        if h.len() == 6 {
-            if let Ok(c) = u32::from_str_radix(h, 16) {
-                return Val::Color(c);
-            }
-        }
+    if let Some(h) = t.strip_prefix('#')
+        && h.len() == 6
+        && let Ok(c) = u32::from_str_radix(h, 16)
+    {
+        return Val::Color(c);
     }
     match formula::parse_number(t) {
         Some(n) => Val::Num(n),
@@ -770,10 +769,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::formats::office::common::xml;
     use crate::formats::office::slides::limits::Limits;
-    use crate::formats::office::slides::vsdx::sheet::{parse, Rels};
+    use crate::formats::office::slides::vsdx::sheet::{Rels, parse};
 
     pub fn shapes(x: &str) -> Vec<Sheet> {
-        let n = xml::parse(x.as_bytes(), 100_000).unwrap();
+        let n = xml::parse(x.as_bytes(), &mut xml::within(1 << 24)).unwrap();
         let rels = HashMap::new();
         n.nodes()
             .map(|s| parse(s, &Rels(&rels), &mut 0, 0))

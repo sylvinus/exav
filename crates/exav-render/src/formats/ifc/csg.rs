@@ -6,7 +6,7 @@
 //! its bound is given up (`None`), so that the caller draws the first
 //! operand as it is.
 
-use super::math::{cross, dot, lerp, sub, unit, V3};
+use super::math::{V3, cross, dot, lerp, sub, unit};
 
 /// Most polygon placements (into a tree or through one) per operation.
 const WORK: usize = 30_000_000;

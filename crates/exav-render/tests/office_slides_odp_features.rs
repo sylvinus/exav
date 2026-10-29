@@ -1,6 +1,6 @@
 //! OpenDocument features, over flat documents written here.
 
-use exav_render::slides::{convert, Format, Limits};
+use exav_render::slides::{Format, Limits, convert};
 use std::io::Read;
 
 fn part(pptx: &[u8], name: &str) -> String {

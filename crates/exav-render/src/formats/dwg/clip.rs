@@ -248,11 +248,7 @@ fn liang_barsky(a: [f64; 2], b: [f64; 2], min: [f64; 2], max: [f64; 2]) -> Optio
             }
         }
     }
-    if t1 <= t0 {
-        None
-    } else {
-        Some((t0, t1))
-    }
+    if t1 <= t0 { None } else { Some((t0, t1)) }
 }
 
 /// Sutherland-Hodgman against the four edges of a box.

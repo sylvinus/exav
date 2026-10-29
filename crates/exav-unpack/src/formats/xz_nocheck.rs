@@ -21,11 +21,7 @@ const MAX_INDEX: usize = 64 << 20;
 
 /// Bytes of the check field for a check type (xz file format, 2.1.1.2).
 fn check_size(id: u8) -> usize {
-    if id == 0 {
-        0
-    } else {
-        4 << ((id - 1) / 3)
-    }
+    if id == 0 { 0 } else { 4 << ((id - 1) / 3) }
 }
 
 /// Whether `xz4rust` reads the check.

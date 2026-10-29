@@ -1,7 +1,7 @@
 //! exav-render's `slides`: PPT, ODP, FODP and Keynote converted to PPTX, which
 //! the presentation engine shows.
 
-use exav_render::slides::{convert_first, Error, Format, Limits};
+use exav_render::slides::{Error, Format, Limits, convert_first};
 use wasm_bindgen::prelude::*;
 
 /// A converted presentation.

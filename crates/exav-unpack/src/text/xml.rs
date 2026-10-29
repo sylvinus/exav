@@ -8,8 +8,8 @@
 //! tabs. Entities are the XML ones and character references; a DTD, and so a
 //! custom entity, is never read.
 
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 
 use super::{Out, XmlPart};
 

@@ -46,6 +46,40 @@ is on exav.org.
 
 ## Formats
 
+- **One reader per format**: the compound file, the encrypted workbook, RTF,
+  BIFF (records, workbook tables, formulas) and HTML are read once for the
+  scanner and the converters ([ARCHITECTURE.md](ARCHITECTURE.md)). Left to
+  extract into `exav-unpack`: the PowerPoint records and the Word FIB (the
+  scanner reads them to find embedded storages and the encryption flag, the
+  converters to build the document), ZIP packages (the converters open them
+  with the `zip` crate and limits of their own), the XML trees, and the two
+  tables of code pages (AutoCAD's names for drawings, numbers for BIFF; both
+  end in `encoding_rs`). Merging the three `limits.rs` of the converters into
+  one budget is part of it. The scripts that generated the function table of
+  BIFF (`ftab.py`, `ftab.json` in `exav-render/scripts/office/sheets`) write a
+  file that no longer exists; the table in `biff/ftab.rs` is edited by hand.
+- **Recognised, not opened (planned for 0.0.4)**: these formats are typed and
+  reported `UNSCANNABLE` (`formats/reported.rs`, `formats/inno.rs`), never
+  clean, and none is extracted. By how much each needs:
+  - *AppleSingle and AppleDouble*: a short header and a table of entries
+    (RFC 1740); the data fork and the resource fork are members. Read the RFC
+    and write a fixture first.
+  - *InstallShield InstallScript cabinets* (`ISc(`): port of the C `unshield`
+    project, which is under the MIT licence (NOTICE entry). The format is
+    undocumented apart from that code. *InstallShield MSI* is a compound file
+    with the cabinet in a stream; to check what the cabinet reader needs.
+  - *StuffIt* (`.sit`): methods 0, 13, 14 and 15 are read by the `stuffit`
+    crate (Apache-2.0 or MIT, which names The Unarchiver as its reference: its
+    provenance has to be checked against the rule about sources read). StuffIt
+    X (`.sitx`) is not covered by it.
+  - *Inno Setup*: see the item below; innoextract (zlib licence) is the
+    reference, and the layout changes by version.
+  - *ACE*: `acefile` (BSD-2) documents ACE 1.0 and 2.0 from a 1998 format note
+    and two reference tools. There is no valid sample to check a decoder
+    against, so it stays reported until one is found.
+  - *lrzip*: defined only by GPL source that exav does not read; no
+    permissive implementation exists. Stays reported.
+  - *CryptFF*: encrypted; the right outcome is `PASSWORD-PROTECTED`, as now.
 - **Decoder oracle tests**: the LZFSE/LZVN and DCL differential tests against
   Apple's lzfse and zlib's blast (`#[ignore]`d, built by
   `crates/exav-unpack/tests/oracle/build.sh`) run on request only; a `make`
@@ -55,16 +89,147 @@ is on exav.org.
   parts, encodings, scripts, viewer support. To scope first.
 - **DWG before R13** (AC1009 and older): reported as an unsupported version
   today; the ODA specification does not document these releases.
-- **Disks read in place, what is left** (docs/STREAMING_FORMATS.md): ext is
-  copied into memory as a volume because `ext4-view` takes a `'static` reader
-  (reading it in place needs a copy of the crate with a lifetime on its
-  types); HFS+ and APFS inside a VHD, VHDX, QCOW2 or VMDK are streamed or
-  reported, not walked in place (the DMG code does it for a DMG); a partition
-  table inside a partition is not followed in place; a file larger than the
-  buffer limit is refused rather than streamed out of the filesystem; DMG's
+- **Disks read in place, what is left** (docs/STREAMING_FORMATS.md): a
+  partition table inside a partition is not followed in place; DMG's
   reader does not count what it decodes against the scan budget as the other
   disks do; a truncated or damaged streamOptimized VMDK is indexed by its
   markers, which is not how VMware finds a grain (its tables).
+
+## Large files and memory
+
+What a scan holds does not grow with a file's size for most inputs
+([Streaming & memory](https://exav.org/scanner/concepts/streaming-memory/)).
+What is left, most worth doing first.
+
+**Tabled for 0.0.4: no scan holds a whole object.** The aim is that a file
+of any size is scanned in bounded memory, with no check skipped for being large
+and no format opened only if it fits. What still holds a whole object, in the
+order to take it:
+
+1. RAR, the largest gap (the first item below).
+2. A PE's structure and the checks that follow from it, read through the block
+   cache (the second item), which takes the packed-PE readers (NSIS, AutoIt,
+   UPX) with it.
+3. One forward pass over a file past the limit, the members that spill, the
+   block cache's policy, and HTTP sources (the next four items).
+4. OLE and MSI, then email and mailboxes.
+5. 7z folders with an encrypted coder or BCJ2, and the files a filesystem stores
+   compressed.
+6. Sparse files, and exav-grep's container inside a member over the limit.
+7. The small formats read whole (CHM, ARJ, ZOO, ARC, ALZ, EGG, InstallShield Z,
+   BinHex, uuencode) and the WIM name tree, each only when someone meets one past
+   the limit.
+
+PDF stays on the block cache: its cross-reference table is at the end, and
+holding the file is what recovery needs. The `exav-render` converters hold their
+document model, bounded by `max_memory`; they are the viewer's, not the
+scanner's, and are not part of this aim.
+
+- **RAR**: `rar3_unpack.rs` and `rar5_unpack.rs` are vendored decoders that
+  build the whole output, so a RAR past `--max-object-bytes` is
+  `LIMITS-EXCEEDED` and its members are not reached, and big RARs are common.
+  Streaming them means turning both into resumable readers that keep only the
+  window, on fuzzed and differential-tested code where a subtle break costs
+  correctness on a format attackers use. A focused effort of its own.
+- **PE structure past the limit**: a PE over `--max-object-bytes` skips the
+  checks that parse it whole (layout, imports, icons, Authenticode, packer
+  unpacking, YARA's `pe`, `elf` and `dotnet` modules) and is `LIMITS-EXCEEDED`
+  unless something is found. Parsing the headers, sections and imports through
+  the block cache would cover a small executable with a large overlay and
+  installers past the limit. NSIS, AutoIt, UPX and the other packed-PE
+  readers take the executable whole too, and follow from it.
+- **One forward pass**: a file past the limit is read several times over
+  (detection and the digests share one read; the signature sweep, YARA's
+  prefilter and the checks that verify a match read again). Feeding them from
+  one pass makes a large scan faster and cheaper over HTTP. Measured over HTTP
+  with a hash, a gap and a pattern signature: 4.7 passes of a 300 MB object, and
+  most of its requests are the scattered reads of verification, not the passes.
+  The sweeps would collect the places a match must be verified, and a last pass
+  would verify them sorted by offset, so each block is fetched once. That also
+  settles the compressed members below, since the passes could re-run a decoder
+  instead of re-reading a spill file.
+- **The block cache's policy**: it is LRU, which is the worst policy for passes
+  over an object larger than the cache (each block is evicted just before the
+  next pass needs it; a 20 MB ZIP was read six times over with 8 MiB). Ideas, to
+  be tried on a recorded trace before any is built (log the block indexes of the
+  300 MB scan with a hash, a gap and a pattern signature, replay them offline
+  under each policy):
+  - most recently used for the sequential passes, which keeps the head of the
+    object resident, a hit rate of cache over size (about 40% for that ZIP, 2.7%
+    for the 300 MB file); no help once the object is many times the cache;
+  - scan resistance: a sequential run reads through without being inserted, or
+    into a small area of its own, so the scattered reads (verification, a
+    container's directory and headers) keep the cache;
+  - the head of the object (detection, headers, a ZIP's directory) pinned;
+  - sorting the verification reads, which is the forward pass above and beats
+    any policy: raising the cache from 8M to 32M cut the requests of the 300 MB
+    scan only from 431 to 375, so most scattered misses are first touches, not
+    reuse.
+
+  The cache also evicts by scanning its blocks for the least recently used, so a
+  cache of many small blocks (`--object-cache-block-bytes 4K` with a large
+  `--object-cache-bytes`) pays that scan at each miss; a linked list would not.
+- **Members without a spill**: every streamed member over `--max-object-bytes`
+  is written to a spill file, which bounds the member by `--max-spill-bytes`
+  (2 GiB) and needs the disk, and its normalised text views need as much again.
+  `Member` has `Bytes` and `Stream` only. Two ways to avoid it:
+  - A member that is a plain range of a seekable container (a stored ZIP
+    member, a tar member, any format whose entry is its bytes in the file) gets
+    a variant naming the range, and the walk scans it as a `Sub` of the
+    container's block cache, as a carved region is. No disk, no copy, no
+    ceiling, over a file or HTTP alike. Done first.
+  - A compressed member has no range. Either a seekable decoder under the
+    block cache, with restart points: a deflate window (32 KiB) every N MiB as
+    zlib's `zran` keeps, bzip2 blocks, xz blocks, zstd frames. The index grows
+    with the member, so the spacing must grow with it (at 20 GB and 64 MiB
+    apart it is about 10 MB), a single-stream xz or single-frame zstd or a solid
+    7z/LZMA block has no points but the start, and a scattered read decodes up
+    to N MiB, so a hostile file multiplies decode time unless that is charged to
+    `--max-matcher-bytes`. Or the forward pass above, re-running the decoder for
+    each pass in place of reading a spill file: deflate decodes at several
+    hundred MB/s, xz slower. A container inside a compressed member needs seeks
+    too and meets the same costs. Spill stays the default; streaming is for no
+    disk or a member past the ceiling.
+- **HTTP sources** (`HttpRangeReader`): a large object costs two to five times
+  its size in transfer, by how many passes the database makes. To do: write the object to a spill file on the first pass,
+  as an option, for one transfer in place of several; pin it (`If-Range` and
+  the `ETag`, so that a server cannot answer differently on each pass); a
+  timeout of the transfer's own; a limit on redirects and on where they lead
+  (a daemon with `--allow-http-scan` fetches any address); a fallback to a
+  download for a server that does not answer range requests.
+- **exav-grep, a container in a member over the limit**: such a member is
+  searched as it is read, but a container inside it is reported unreadable,
+  since opening it takes a seekable copy. A spill file (an anonymous temporary
+  file, with a directory and a budget, as the scanner has) would open it.
+- **OLE and MSI**: the compound file is read whole. Its streams are small
+  nearly always, so the loss is a large MSI, whose cabinets are streams; sector
+  by sector reading over a seekable source would take it.
+- **Email**: a message is read whole. A mailbox of gigabytes, and a message
+  with a large attachment, would be read part by part, decoding base64 as it
+  goes.
+- **Read whole, rarely large**: CHM (an index, then LZX sections with a reset
+  table), ARJ, ZOO, ARC, ALZ, EGG, InstallShield Z, BinHex and uuencode. Each
+  needs its own reader to take a source, and none is often past the limit.
+- **PDF**: not worth it. The file is held (the cross-reference table is at the
+  end, and recovery scans the whole of it) and each stream object is decoded one
+  at a time under the buffer limit, so streaming would save one object.
+- **Compressed files in filesystems past the limit**: a file stored compressed
+  by HFS+ or APFS (decmpfs) or by NTFS (LZNT1), and an EROFS file stored
+  compressed, is decoded whole under the buffer limit; past it the file is
+  reported (EROFS compressed files are not read at all).
+- **Sparse files**: a hole of a file in a filesystem comes out as zeros and
+  counts as scanned bytes, so a large sparse file (a swap file, a VM image in
+  an image) can use up `--max-matcher-bytes` and end the walk. Telling the
+  scan that a run is a hole, or charging it less, would keep the rest of the
+  volume in reach.
+- **7z**: a folder with an encrypted coder or with several packed streams
+  (BCJ2) is decoded whole under the buffer limit, and the header is held
+  whole. A member past the limit in such a folder is reported.
+- **WIM**: the directory tree (the names) is held whole under the buffer limit;
+  without it the files are scanned under the names `wim-resource-N`. LZMS
+  resources are reported, not read.
+- **xar**: only zlib members are decoded. bzip2, xz and LZMA members (rare in
+  `.pkg`, used by some `.xip`) come out as the compressed bytes, not decoded.
 - **IFC geometry**, what is left (listed on the exav-render docs page):
   cones, which no IFC schema has as a surface (`IfcConicalSurface` does not
   exist; a cone is an `IfcSurfaceOfRevolution`, with its sibling
@@ -113,9 +278,7 @@ is on exav.org.
 - **Small gaps found by the wild-sample sweeps**:
   a UPX-packed DOS `.exe` (`upx -t` accepts it; exav's UPX reader covers PE and
   ELF); CHM overlays appended to PE files (PuTTY builds: 7-Zip lists them,
-  ClamAV does not scan overlays); an ext4 image whose journal has features that
-  `ext4-view` does not know is refused (`MissingRequiredJournalFeatures`, a
-  limit of the crate); an empty spreadsheet template (no table) reads as
+  ClamAV does not scan overlays); an empty spreadsheet template (no table) reads as
   "damaged: no sheets" instead of an empty workbook.
 - **JBIG2 symbol dictionaries** are bounded only by hayro-jbig2's own
   65,535 × 65,535 symbol limit: the symbol sizes sit inside the compressed
@@ -158,10 +321,9 @@ is on exav.org.
     table borders follow the style (hidden means none); about 20 ODP chart documents differ because of the sheets chart
     writer (axes, legends).
   - Three OfficeArt readers (`common/escher.rs`, `slides/ppt/escher.rs`,
-    `sheets/xls/escher.rs`), two ODF XML trees (`common/xml.rs` and
-    `sheets/ods/dom.rs`, which counts against the sheets budget and error
-    type), and two ZIP readers (`common/package.rs` and `slides/package.rs`,
-    which handles an encrypted member in its own way) are still apart. The byte
+    `sheets/xls/escher.rs`) and two ZIP readers (`common/package.rs` and
+    `slides/package.rs`, which handles an encrypted member in its own way) are
+    still apart. The byte
     cursor, compound file, code pages, iWork archive, base64 and the ODF colour,
     percentage and text helpers are shared.
 - **Demo examples**: DWG, IFC, PLY, STL and some PDFs from Zenodo and figshare
@@ -314,12 +476,40 @@ is on exav.org.
 
 ## Robustness
 
-- **A read-only FAT reader of our own**: the `fatfs` crate panics on a chain
-  through cluster 1 (it subtracts 2 from any cluster number it reads). The
-  volume walk now contains the panic per directory or file, and the fuzz
-  targets tolerate that call site, so other `fatfs` panics there would not
-  show up in fuzzing. A hand-written reader would remove the class, as was
-  done for CAB and ARJ.
+- **A JPEG XL file can still take a gigabyte for one section.** The vendored
+  decoder (`zenjxl-decoder`) sizes the buffer of each section of a frame from
+  the length its table of contents declares, and zero-fills it, before the data
+  is looked at. The pixel and channel limits set in `image::jxl` do not reach
+  it, so the saturation sweep leaves JPEG XL out. The fix is in the decoder:
+  read the section into a buffer that grows with what arrives, or check the
+  declared lengths against the bytes left in the file. The viewer decodes JPEG
+  XL in a tab that can be reloaded; the scanner does not decode it.
+- **A Prometheus and HTTP metrics endpoint.** The daemon has no metrics
+  endpoint, only the clamd `STATS` command. The counters behind it are shared
+  by the processes of the pool since the health listener was added, so the
+  endpoint is the small part left: `--listen-health http://host:port` serving
+  `GET /metrics` in the Prometheus text format and `GET /healthz` from the
+  health child, so Kubernetes has a native probe and Prometheus a scrape
+  target without touching the scan path.
+- **`make stack-frames` in CI.** The audit of release frames runs by hand. It
+  needs a release build of `exav` and of the `exav-render` nesting test (about
+  two minutes), which the `test` job does not otherwise make; a job of its own
+  after `msrv` would run it on every push.
+- **Nesting sweeps for the formats with no fixture or no tool here.** The
+  `nesting` suites build their documents by hand or with `zip`, `7z`, `tar`,
+  `cpio`, `ar`, `mksquashfs`, `genisoimage`, `gcab`, `gzip`, `bzip2`, `xz`,
+  `zstd` and `lz4`. A container inside itself is not yet built for LHA, ARJ,
+  ZOO, ACE, ALZ, EGG, TNEF, OLE, CHM, DMG, the virtual disks, WIM, NSIS, Inno
+  and the packers; the 26-layer chain of `matryoshka` crosses each once.
+  `scripts/stack-frames.py --all --min-kib 8` lists the frames that would
+  matter for them.
+- **Compressed EROFS.** A file stored compressed (LZ4, LZMA, DEFLATE, Zstandard
+  in logical clusters of the full or the compact layout) is reported, not read;
+  `mkfs.erofs -z` makes them, and so does most of what ships a compressed
+  image. The index of clusters (`z_erofs_map_header`, then 8-byte full or packed
+  4-byte entries) is the work; the codecs are in the tree. Other filesystems
+  that would be worth a reader: XFS, Btrfs and F2FS (larger than any here);
+  squashfs before version 4.
 - **Fuzzing the viewer's TypeScript**: property tests (fast-check, MIT, in
   vitest) for the two places a hostile document's output meets code the viewer
   trusts: the host's validation of the messages a sandboxed frame sends
@@ -339,8 +529,8 @@ is on exav.org.
   emulator's layout. The x86 CONTEXT layout `run.rs` builds for exception
   dispatch is unverified too and could be checked the same way.
 
-The arithmetic audit (`tmp/ARITHMETIC_AUDIT.md`, not committed; its row names
-are used below) found about a hundred sites where a header's number is added
+The arithmetic audit (kept outside the repository; its row names are used
+below) found about a hundred sites where a header's number is added
 to or multiplied by something unchecked. Fixed and tested: the disk-image
 formats, the signature engine's gaps, offsets, byte comparisons, PCRE group
 references and logic sums, the dotnet, elf and bytecode-PE readers, the
@@ -395,8 +585,8 @@ Open:
   Slices written `d[a..a + b]`, and `get` on a `&str` or a `Vec` of another
   type, were not touched.
 - **`clippy::arithmetic_side_effects`**: denied in the disk-image formats
-  (vhd, vmdk, qcow2, vhdx, vdisk, volumes, ntfs, wim without its two codecs, ext, fat,
-  partition, iso, dmg, udif, udf); the codecs `wim/lzx.rs` and `wim::xpress`
+  (vhd, vmdk, qcow2, vhdx, vdisk, volumes, ntfs, wim without its two codecs, the
+  filesystem readers, lzo, partition, iso, dmg, udif, udf); the codecs `wim/lzx.rs` and `wim::xpress`
   allow it. The lint is far too noisy for the other decoders (about 2,500
   sites in `exav-unpack`). Extend it file by file as each is cleaned.
 - **The wasm32 sweep's samples**: `make test-wasm` runs the `extreme` suite,
@@ -410,3 +600,34 @@ Open:
 - **TLS without C or assembly**: `ring` (via rustls) is the only C/assembly in
   the tree, in the `http` features and the published Docker image. A pure-Rust
   rustls crypto provider would remove it once one is mature and audited.
+- **fancy-regex back to a dependency**: 0.20.0 has the two pull requests the
+  vendored copy was taken for and two of exav's three own fixes. What is left
+  is the saturating size analysis (README of `src/fancy_regex/`), whose test
+  panics inside 0.20.0. Report it upstream, then follow the README's steps
+  back; that also drops `matches`, `quickcheck` and the direct `bit-set`.
+- **`image` brings `moxcms` and `pxfm`** (about 570 `unsafe` keywords in the
+  default tree) for ICC transforms exav never calls; no feature turns them off
+  and the pin is ClamAV's version. Options: vendor the containers and codecs
+  `exav-render` uses from `image` as was done for JPEG and TIFF, or ask
+  upstream for a feature.
+- **Readers that would remove a crate**: `tar` and `filetime` (the reader is
+  80 lines over the crate; an in-tree one also drops the error-message
+  matching in `tar::is_truncation`), `bitstream-io` (ARJ's one codec), `byteorder` as a
+  direct dependency (three files), `quick-error` (the vendored TIFF decoder's
+  error type), `salzweg` beside `weezl` (two LZW crates).
+- **`encoding_rs` 0.8.40 and later depend on `simdutf8`** (135 `unsafe`
+  keywords, and `core_detect` on x86); 0.8.35 does not. Pin back, or accept.
+- **`yara-x-parser` costs 12 crates** (`rowan`, `logos`, `hashbrown` 0.14,
+  `rustc-hash` 1.x, `bstr`...; 416 `unsafe` keywords) for a parser whose AST
+  the in-tree engine then lowers. An in-tree YARA parser is the only way out
+  and a large one.
+- **`paste` is the last `deny.toml` ignore**: it is unmaintained, build-time
+  only, and comes from `zenjxl-decoder-simd`'s `simd_function!`, which expands
+  to `paste::paste!` in the decoder. Dropping it means copying that 9,000-line
+  crate (and rewriting the macro) for no change in the module; not worth it
+  until the macro changes upstream.
+- **`mail-parser` 1.0.0** (a rewrite with parse limits, needs Rust 1.98; the
+  MSRV is 1.95) and **`lzma-rust2` 0.24**: decide at the next early pass.
+- **Vendored copies with no recorded upstream version**: `cab_parse`,
+  `arj_parse`, `zoo_parse`, `azo`, `rar5_unpack`, `rar3_unpack`, `lzfse`
+  (`docs/dependencies.toml`, `version = "unrecorded"`).

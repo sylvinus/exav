@@ -228,9 +228,9 @@ names.
 | Feature | What it does |
 |---|---|
 | default | `yara`, `all-formats`, `decrypt`, `dlp`, `phishing`, `image-hash`, `visible-text`: the `exav` binary's defaults minus its `icap` |
-| `visible-text` | A document's visible text (Markdown, HTML, Office and OpenDocument XML parts, DXF and DWG drawings) is matched as a text view, and each link as its label then its target (see [feature flags](/scanner/reference/feature-flags/)) |
+| `visible-text` | [The text a reader sees](/scanner/reference/formats/#the-text-a-reader-sees) of a document is matched as a text view |
 | `visible-text-pdf` | And PDF's, through hayro; not a default (see [feature flags](/scanner/reference/feature-flags/)) |
-| `visible-text-office` | And the legacy and flat office formats: DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, FODT, FODS, FODP, FODG, Numbers, Pages and Keynote, through exav-render's office converters; not a default. A document of those formats whose text cannot be taken out (encrypted, past a limit, damaged) marks the scan incomplete (see [feature flags](/scanner/reference/feature-flags/)) |
+| `visible-text-office` | And the legacy and flat office formats, through exav-render's office converters; not a default |
 | `http` | The HTTP range-request reader (`dep:ureq`) |
 | `checksums` | Lets `ScanOptions::verify_checksums` make a container checksum mismatch an error |
 | `unstable-internals` | Makes the engine internals (`engine`, `bytecode`, `pe`, …) public, for tools; no stability promise |

@@ -45,4 +45,15 @@ impl Error {
     }
 }
 
+impl From<crate::formats::office::common::xml::Error> for Error {
+    fn from(e: crate::formats::office::common::xml::Error) -> Self {
+        use crate::formats::office::common::xml::Error as X;
+        match e {
+            X::Malformed(why) => Error::Malformed(format!("XML: {why}")),
+            X::TooLarge(what) => Error::TooLarge(what),
+            X::NotFormat(why) => Error::NotFormat(why),
+        }
+    }
+}
+
 pub(crate) type Result<T> = std::result::Result<T, Error>;

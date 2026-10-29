@@ -1,6 +1,7 @@
 //! A small element tree over quick-xml, with element and attribute names
 //! given the usual ODF prefixes whatever prefixes a file declares. Bounded:
-//! nesting depth, element count and text are limited.
+//! nesting depth is limited, and the memory of the tree is told to the caller
+//! as it grows.
 
 use quick_xml::events::Event;
 use std::fmt;
@@ -28,8 +29,8 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
-use quick_xml::name::ResolveResult;
 use quick_xml::NsReader;
+use quick_xml::name::ResolveResult;
 
 #[derive(Debug, Default)]
 pub struct Node {
@@ -99,6 +100,7 @@ const NS: &[(&str, &str)] = &[
     // Apple's iWork '04 to '09 documents (Keynote 2 to 5).
     ("http://developer.apple.com/namespaces/sf", "sf"),
     ("http://developer.apple.com/namespaces/sfa", "sfa"),
+    ("http://developer.apple.com/namespaces/ls", "ls"),
     ("http://developer.apple.com/namespaces/keynote2", "key"),
     ("http://www.w3.org/2001/XMLSchema-instance", "xsi"),
     // Early OpenDocument drafts used the W3C namespaces.
@@ -115,6 +117,10 @@ const NS: &[(&str, &str)] = &[
     ("urn:schemas-microsoft-com:vml", "v"),
     ("urn:schemas-microsoft-com:office:word", "w10"),
     ("http://schemas.microsoft.com/aml/2001/core", "aml"),
+    // Excel 2003 XML Spreadsheet.
+    ("urn:schemas-microsoft-com:office:spreadsheet", "ss"),
+    ("urn:schemas-microsoft-com:office:excel", "x"),
+    ("http://www.w3.org/TR/REC-html40", "html"),
     // Visio drawings (VSDX) and the Open Packaging Conventions.
     (
         "http://schemas.microsoft.com/office/visio/2012/main",
@@ -158,17 +164,49 @@ fn qualify(p: String, l: &str) -> String {
 
 /// Bounds of one document.
 pub const MAX_DEPTH: usize = 256;
-pub const MAX_ELEMENTS: usize = 20_000_000;
 
-/// Parses a document. `max_elements` bounds the elements read.
-pub fn parse(xml: &[u8], max_elements: usize) -> Result<Node> {
+/// What the tree takes for an element or a text in its parent's list: the
+/// room of the list doubles as it grows.
+const SLOT: u64 = 2 * size_of::<Child>() as u64;
+
+/// What the allocator takes for `len` bytes: a header, a 16-byte grain, and 32
+/// at least.
+fn heap(len: usize) -> u64 {
+    if len == 0 {
+        0
+    } else {
+        ((len as u64 + 8 + 15) & !15).max(32)
+    }
+}
+
+/// A `charge` for [`parse`] that refuses past `max` bytes in all.
+pub fn within(max: u64) -> impl FnMut(u64) -> bool {
+    let mut left = max;
+    move |bytes| match left.checked_sub(bytes) {
+        Some(l) => {
+            left = l;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Parses a document. The memory of the tree is told to `charge` as it grows,
+/// in bytes, and the parse fails once `charge` returns false.
+pub fn parse(xml: &[u8], charge: &mut dyn FnMut(u64) -> bool) -> Result<Node> {
+    let mut spend = |bytes: u64| {
+        if charge(bytes) {
+            Ok(())
+        } else {
+            Err(Error::TooLarge("memory"))
+        }
+    };
     let mut r = NsReader::from_reader(xml);
     r.config_mut().check_end_names = false;
     let mut stack: Vec<Node> = vec![Node {
         name: "#root".into(),
         ..Default::default()
     }];
-    let mut count = 0usize;
     let mut buf = Vec::new();
     loop {
         let (res, ev) = r
@@ -176,11 +214,8 @@ pub fn parse(xml: &[u8], max_elements: usize) -> Result<Node> {
             .map_err(|e| Error::Malformed(format!("XML: {e}")))?;
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                count += 1;
-                if count > max_elements {
-                    return Err(Error::TooLarge("XML elements"));
-                }
                 let name = qualify(prefix_of(&res), e.local_name().as_ref());
+                let mut cost = SLOT + heap(name.len());
                 let mut attrs = Vec::new();
                 for a in e.attributes().with_checks(false).flatten() {
                     let (ar, local) = r.resolver().resolve_attribute(a.key);
@@ -189,8 +224,11 @@ pub fn parse(xml: &[u8], max_elements: usize) -> Result<Node> {
                         .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.into_owned())
                         .unwrap_or_else(|_| a.value.to_string());
+                    cost += heap(key.len()) + heap(v.len());
                     attrs.push((key, v));
                 }
+                cost += heap(attrs.capacity() * size_of::<(String, String)>());
+                spend(cost)?;
                 let node = Node {
                     name,
                     attrs,
@@ -208,20 +246,19 @@ pub fn parse(xml: &[u8], max_elements: usize) -> Result<Node> {
                 }
             }
             Event::End(_) => {
-                if stack.len() > 1 {
-                    if let Some(n) = stack.pop() {
-                        if let Some(top) = stack.last_mut() {
-                            top.children.push(Child::Node(n));
-                        }
-                    }
+                if stack.len() > 1
+                    && let Some(n) = stack.pop()
+                    && let Some(top) = stack.last_mut()
+                {
+                    top.children.push(Child::Node(n));
                 }
             }
             Event::Text(t) => {
                 let s = t.xml10_content().into_owned();
-                push_text(&mut stack, &s);
+                spend(push_text(&mut stack, &s))?;
             }
             Event::CData(t) => {
-                push_text(&mut stack, &t);
+                spend(push_text(&mut stack, &t))?;
             }
             Event::GeneralRef(g) => {
                 let s = match g.resolve_char_ref() {
@@ -235,7 +272,7 @@ pub fn parse(xml: &[u8], max_elements: usize) -> Result<Node> {
                         _ => String::new(),
                     },
                 };
-                push_text(&mut stack, &s);
+                spend(push_text(&mut stack, &s))?;
             }
             Event::Eof => break,
             _ => {}
@@ -243,10 +280,10 @@ pub fn parse(xml: &[u8], max_elements: usize) -> Result<Node> {
         buf.clear();
     }
     while stack.len() > 1 {
-        if let Some(n) = stack.pop() {
-            if let Some(top) = stack.last_mut() {
-                top.children.push(Child::Node(n));
-            }
+        if let Some(n) = stack.pop()
+            && let Some(top) = stack.last_mut()
+        {
+            top.children.push(Child::Node(n));
         }
     }
     let mut root = stack.pop().unwrap_or_default();
@@ -257,12 +294,15 @@ pub fn parse(xml: &[u8], max_elements: usize) -> Result<Node> {
     }
 }
 
-fn push_text(stack: &mut [Node], s: &str) {
-    let Some(n) = stack.last_mut() else { return };
+/// Adds `s` to the text of the open element; the bytes it takes in the tree.
+fn push_text(stack: &mut [Node], s: &str) -> u64 {
+    let Some(n) = stack.last_mut() else { return 0 };
     if let Some(Child::Text(t)) = n.children.last_mut() {
         t.push_str(s);
+        s.len() as u64
     } else {
         n.children.push(Child::Text(s.to_string()));
+        SLOT + heap(s.len())
     }
 }
 
@@ -375,23 +415,24 @@ mod tests {
     #[test]
     fn prefixes_are_normalized() {
         let x = br#"<a:document xmlns:a="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:t="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><t:table t:name="S&amp;1">x&#65;<![CDATA[<y>]]></t:table></a:document>"#;
-        let d = parse(x, 100).unwrap();
+        let d = parse(x, &mut within(1 << 20)).unwrap();
         assert_eq!(d.name, "office:document");
         let t = d.child("table:table").unwrap();
         assert_eq!(t.attr("table:name"), Some("S&1"));
         assert_eq!(t.own_text(), "xA<y>");
         // An early draft's W3C SVG namespace reads as svg.
         let x = br#"<d xmlns:s="http://www.w3.org/2000/svg" s:width="2cm"/>"#;
-        assert_eq!(parse(x, 10).unwrap().attr("svg:width"), Some("2cm"));
+        let d = parse(x, &mut within(1 << 20)).unwrap();
+        assert_eq!(d.attr("svg:width"), Some("2cm"));
     }
 
     #[test]
     fn written_back_reads_the_same() {
         let x = br#"<o:document xmlns:o="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:t="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:z="urn:other" z:skip="1"><t:table t:name="S&amp;&quot;1&quot;">a &lt; b<z:skipped/><t:row/></t:table></o:document>"#;
-        let d = parse(x, 100).unwrap();
+        let d = parse(x, &mut within(1 << 20)).unwrap();
         let back = d.to_xml();
         assert!(!back.contains("skip"), "{back}");
-        let e = parse(back.as_bytes(), 100).unwrap();
+        let e = parse(back.as_bytes(), &mut within(1 << 20)).unwrap();
         assert_eq!(e.name, "office:document");
         let t = e.child("table:table").unwrap();
         assert_eq!(t.attr("table:name"), Some("S&\"1\""));
@@ -405,12 +446,30 @@ mod tests {
         for _ in 0..300 {
             x.push_str("<a>");
         }
-        assert!(parse(x.as_bytes(), 1000).is_err());
-        assert_eq!(
-            parse(b"<a><b/><b/><b/></a>", 2).err(),
-            Some(Error::TooLarge("XML elements"))
-        );
+        assert!(parse(x.as_bytes(), &mut within(1 << 20)).is_err());
         // Unclosed elements are closed at the end.
-        assert_eq!(parse(b"<a><b>", 10).unwrap().nodes().count(), 1);
+        let d = parse(b"<a><b>", &mut within(1 << 20)).unwrap();
+        assert_eq!(d.nodes().count(), 1);
+    }
+
+    #[test]
+    fn the_memory_of_the_tree_is_told_as_it_grows() {
+        // An element of four bytes of input takes a node, whatever its size.
+        let x = format!("<r>{}</r>", "<a/>".repeat(10_000));
+        let mut told = 0;
+        parse(x.as_bytes(), &mut |n| {
+            told += n;
+            true
+        })
+        .unwrap();
+        assert!(told >= 10_000 * size_of::<Node>() as u64, "{told}");
+        let refused = parse(x.as_bytes(), &mut within(told / 2));
+        assert_eq!(refused.err(), Some(Error::TooLarge("memory")));
+        // A text takes its slot and its bytes.
+        let x = format!("<r>{}</r>", "x".repeat(100_000));
+        assert_eq!(
+            parse(x.as_bytes(), &mut within(99_999)).err(),
+            Some(Error::TooLarge("memory"))
+        );
     }
 }

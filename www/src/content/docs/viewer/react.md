@@ -1,6 +1,6 @@
 ---
 title: React UI
-description: "@exav/viewer/react: ViewerProvider, ViewerBody and ViewerDialog, replacing any piece of the UI, the CSS custom properties, and the built-in English and French strings."
+description: "@exav/viewer/react: ViewerProvider, ViewerBody and ViewerDialog, replacing any piece of the UI, the CSS custom properties, and the built-in strings in five languages."
 ---
 
 `@exav/viewer/react` is the default UI, on React 19. It can be taken at
@@ -22,7 +22,7 @@ One viewer for the components inside it.
 | `plugins` | The plugins, run in the page. Keep the list stable (a module constant, or `useMemo`): a new list starts a new viewer. |
 | `viewer` | Instead of `plugins`: a viewer built elsewhere, used as it is (`createViewer`, or `createSandboxedViewer` from `@exav/viewer/frame`). |
 | `assetBase` | Where the [runtime files](/viewer/integration/) are served. Default `"/exav-viewer/"`. Not used with `viewer`. |
-| `locale` | Picks the built-in strings: `"fr"` and its variants for French, English otherwise. |
+| `locale` | Picks the built-in strings by language (`"fr"`, `"de-AT"`...): English, French, German, Spanish or Dutch; English otherwise. |
 | `translate` | Replaces the built-in strings: `(key, vars) => string`, for a host with its own i18n. |
 | `components` | Replaces pieces of the UI (below). |
 

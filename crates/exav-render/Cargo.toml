@@ -30,7 +30,6 @@ png = { version = "=0.18.0", optional = true }
 gif = { version = "=0.14.1", optional = true }
 zune-jpeg = { version = "=0.5.8", default-features = false, features = ["std"], optional = true }
 zune-core = { version = "=0.5.0", optional = true }
-zune-core-04 = { package = "zune-core", version = "=0.4.12", optional = true }
 # The vendored `tiff` decoder's dependencies, as tiff 0.10.3 has them less
 # `half`, and `bytemuck` for its byte casts.
 zune-jpeg-04 = { package = "zune-jpeg", version = "=0.4.21", default-features = false, features = ["std"], optional = true }
@@ -78,15 +77,12 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"], 
 quick-xml = { version = "0.42", optional = true }
 # Text in Windows and Mac code pages; the DOS ones are tables of our own.
 encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc"], optional = true }
-# XLS decryption with the default password ([MS-OFFCRYPTO] RC4, RC4 CryptoAPI).
-md-5 = { version = "0.11", optional = true }
-sha1 = { version = "0.11", optional = true }
 
 [features]
 default = ["image", "webp", "ico", "pnm", "qoi", "dds", "ff", "hdr", "jp2", "jbig2", "ccitt", "raw"]
 # Raster images: PNG, GIF, JPEG, TIFF and BMP, plus the formats below.
 image = [
-    "dep:image", "dep:png", "dep:gif", "dep:zune-jpeg", "dep:zune-core", "dep:zune-core-04",
+    "dep:image", "dep:png", "dep:gif", "dep:zune-jpeg", "dep:zune-core",
     "dep:zune-jpeg-04", "dep:fax34", "dep:flate2", "dep:quick-error", "dep:weezl",
     "dep:bytemuck", "dep:ruzstd", "dep:lzma-rust2",
 ]
@@ -144,29 +140,33 @@ text-pdf = ["text", "exav-unpack/text-pdf"]
 # OpenDocument, Numbers, Pages, Keynote.
 text-office = ["text", "office"]
 # What every office converter shares (`formats::office::common`): ZIP
-# packages, ODF's XML, code pages. Not a feature to ask for.
-_office = ["dep:zip", "dep:flate2", "dep:quick-xml", "dep:encoding_rs"]
+# packages, ODF's XML, style sheets, and the readers of exav-unpack (compound
+# files, BIFF, code pages, HTML). Not a feature to ask for.
+_office = ["dep:zip", "dep:flate2", "dep:quick-xml", "dep:encoding_rs", "dep:exav-unpack", "exav-unpack/ole", "exav-unpack/html"]
 # Spreadsheets into XLSX (`sheets`): Excel 2 to 2003, ODS, FODS, OTS, Apple
 # Numbers, XML Spreadsheet 2003, HTML tables and SYLK. Also the chart writer
 # the presentations use for ODF charts.
-office-sheets = ["_office", "dep:md-5", "dep:sha1"]
+office-sheets = ["_office", "exav-unpack/offcrypto"]
 # Presentations into PPTX (`slides`): PowerPoint 95 and 97 to 2003, ODP, FODP,
-# OTP and Apple Keynote; drawings: ODG, OTG, FODG and Visio (VSDX).
-office-slides = ["_office", "dep:md-5", "dep:sha1"]
+# OTP and Apple Keynote; drawings: ODG, OTG, FODG and Visio (VSDX). It
+# compiles the spreadsheet reader (an embedded workbook's chart), which opens
+# a workbook with a password.
+office-slides = ["_office", "exav-unpack/offcrypto"]
 # Text documents into DOCX (`docs`): Word 6 to 2003, ODT, FODT, OTT, RTF,
 # Word 2003 XML, Apple Pages and HTML pages (Word's "Save as Web Page"), which
-# are read with the HTML tokenizer and style sheets of `sheets`.
-office-docs = ["_office", "office-sheets"]
+# are read with the HTML reader of `exav-unpack`.
+office-docs = ["_office", "exav-unpack/rtf"]
 # Every office converter.
 office = ["office-sheets", "office-slides", "office-docs"]
 # Writers of compound files, protobuf messages and Snappy blocks, for the
 # tests that build the documents they read. Not a feature to ask for.
-office-test-util = ["_office"]
+office-test-util = ["_office", "exav-unpack/test-util"]
 
 [dev-dependencies]
 serde_json = "1"
-# The strict compound file reader the lenient one of `office` is checked against.
-cfb = "0.15.0"
+# The writers of compound files and encrypted workbooks the converters' own
+# tests build their inputs with.
+exav-unpack = { path = "../exav-unpack", default-features = false, features = ["ole", "offcrypto", "test-util"] }
 # The drawing fixtures are gzipped.
 flate2 = "1.1.10"
 # The DWG oracle test names local corpus files by hash.
@@ -291,6 +291,18 @@ required-features = ["office-slides", "office-test-util"]
 [[test]]
 name = "office_docs_doc"
 required-features = ["office-docs", "office-test-util"]
+
+[[test]]
+name = "saturate"
+required-features = ["office-docs", "office-slides", "office-sheets"]
+
+[[test]]
+name = "nesting"
+required-features = ["office-docs", "office-slides", "office-sheets"]
+
+[[test]]
+name = "office_memory"
+required-features = ["office-docs", "office-slides", "office-sheets", "office-test-util"]
 
 [[test]]
 name = "office_docs_formats"

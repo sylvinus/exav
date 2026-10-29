@@ -1,6 +1,6 @@
 //! styles.xml, numbering.xml, settings.xml, notes and comments.
 
-use super::body::{root, Rels, W};
+use super::body::{Rels, W, root};
 use super::props::*;
 use crate::formats::office::common::xmlout::XML_HEAD;
 use crate::formats::office::docs::model::*;

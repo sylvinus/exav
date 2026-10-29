@@ -1,7 +1,7 @@
 //! What the slides targets check of a conversion that succeeds.
 use std::io::Read;
 
-use exav_render::slides::{convert, convert_first, Format, Limits};
+use exav_render::slides::{Format, Limits, convert, convert_first};
 
 /// Converts `doc` whole, then, when it has more than one slide, its first
 /// slide alone; checks both.

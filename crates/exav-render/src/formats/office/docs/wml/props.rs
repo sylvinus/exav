@@ -19,10 +19,10 @@ fn int(n: &Node, k: &str) -> Option<i32> {
 
 fn color(v: &str) -> Color {
     let h = v.trim().trim_start_matches('#');
-    if h.len() == 6 {
-        if let Ok(c) = u32::from_str_radix(h, 16) {
-            return Color::Rgb(c);
-        }
+    if h.len() == 6
+        && let Ok(c) = u32::from_str_radix(h, 16)
+    {
+        return Color::Rgb(c);
     }
     Color::Auto
 }
@@ -395,7 +395,7 @@ pub fn cell_props(n: &Node) -> CellProps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::office::common::xml::parse;
+    use crate::formats::office::common::xml::{parse, within};
 
     const NS: &str = "xmlns:w=\"http://schemas.microsoft.com/office/word/2003/wordml\"";
 
@@ -404,7 +404,7 @@ mod tests {
         let x = format!(
             "<w:rPr {NS}><w:b/><w:i w:val=\"off\"/><w:rFonts w:ascii=\"Arial\" w:h-ansi=\"Arial\"/><w:color w:val=\"FF0000\"/><w:sz w:val=\"28\"/><w:u w:val=\"double\"/></w:rPr>"
         );
-        let r = run_props(&parse(x.as_bytes(), 100).unwrap());
+        let r = run_props(&parse(x.as_bytes(), &mut within(1 << 20)).unwrap());
         assert_eq!((r.bold, r.italic), (Some(true), Some(false)));
         assert_eq!(r.fonts.ascii.as_deref(), Some("Arial"));
         assert_eq!(r.color, Some(Color::Rgb(0xFF0000)));
@@ -412,7 +412,7 @@ mod tests {
         let x = format!(
             "<w:pPr {NS}><w:jc w:val=\"center\"/><w:ind w:left=\"720\" w:hanging=\"360\"/><w:spacing w:before=\"120\" w:line=\"240\" w:line-rule=\"exact\"/><w:listPr><w:ilvl w:val=\"1\"/><w:ilfo w:val=\"3\"/></w:listPr></w:pPr>"
         );
-        let p = para_props(&parse(x.as_bytes(), 100).unwrap());
+        let p = para_props(&parse(x.as_bytes(), &mut within(1 << 20)).unwrap());
         assert_eq!(p.jc, Some(Jc::Center));
         assert_eq!((p.ind_left, p.ind_hanging), (Some(720), Some(360)));
         assert_eq!(

@@ -51,7 +51,7 @@ pub fn build(rows: Vec<RowIn>, mut props: TableProps) -> Table {
     let m = grid.len() - 1;
     let mut table = Table {
         props,
-        grid: grid.windows(2).map(|w| w[1] - w[0]).collect(),
+        grid: grid.array_windows().map(|[a, b]| b - a).collect(),
         rows: vec![],
     };
     for r in rows {
@@ -69,11 +69,11 @@ pub fn build(rows: Vec<RowIn>, mut props: TableProps) -> Table {
                 continue;
             };
             let (l, rr) = (nearest(&grid, le), nearest(&grid, re));
-            if c.merged_left {
-                if let Some(prev) = placed.last_mut() {
-                    prev.1 = rr.max(prev.1);
-                    continue;
-                }
+            if c.merged_left
+                && let Some(prev) = placed.last_mut()
+            {
+                prev.1 = rr.max(prev.1);
+                continue;
             }
             let mut cell = Cell {
                 props: c.props,

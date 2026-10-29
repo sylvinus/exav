@@ -1,7 +1,7 @@
 //! exav-render's `sheets`: XLS, ODS, FODS and Numbers converted to XLSX, which
 //! the spreadsheet engine shows.
 
-use exav_render::sheets::{convert, Error, Format, Limits};
+use exav_render::sheets::{Error, Format, Limits, convert};
 use wasm_bindgen::prelude::*;
 
 /// A converted spreadsheet.

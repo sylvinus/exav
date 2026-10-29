@@ -451,10 +451,10 @@ impl Builder {
                 if !self.spend() {
                     return;
                 }
-                if let Some(Open::Table { row, .. }) = self.stack.last_mut() {
-                    if row.len() < MAX_COLUMNS {
-                        row.push(children);
-                    }
+                if let Some(Open::Table { row, .. }) = self.stack.last_mut()
+                    && row.len() < MAX_COLUMNS
+                {
+                    row.push(children);
                 }
             }
         }

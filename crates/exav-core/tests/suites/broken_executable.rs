@@ -12,7 +12,7 @@
 //! `.so` with junk section headers. Meanwhile PEs whose alignment or section
 //! layout no loader accepts parsed fine and passed.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
 fn empty_db() -> Scanner {
     let mut l = loader::Builder::new();

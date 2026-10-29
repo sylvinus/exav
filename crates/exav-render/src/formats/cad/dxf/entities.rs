@@ -184,10 +184,9 @@ pub(crate) fn entity(rec: &Record<'_>, ctx: &mut Ctx<'_>) -> Entity {
 /// AcDbZombieEntity) before the entity's own data.
 fn graphics(parts: &Parts<'_>, ctx: &mut Ctx<'_>) -> Option<Box<ProxyGraphics>> {
     fn sized<'p, 'a>(tags: &'p [Tag<'a>]) -> Option<(i64, &'p [Tag<'a>])> {
-        let at = tags.windows(2).position(|w| {
-            matches!(w.first(), Some(t) if t.code == 92 || t.code == 160)
-                && matches!(w.get(1), Some(t) if t.code == 310)
-        })?;
+        let at = tags
+            .array_windows()
+            .position(|[a, b]| (a.code == 92 || a.code == 160) && b.code == 310)?;
         Some((tags.get(at)?.int(), tags.get(at + 1..)?))
     }
     let (size, chunks) = sized(parts.common())
@@ -982,10 +981,10 @@ fn multileader(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> MultiLeader {
                     continue;
                 }
                 if t.code == 304 {
-                    if let Some(r) = m.context.leaders.last_mut() {
-                        if ctx.room(r.lines.len()) {
-                            r.lines.push(MLeaderLine::default());
-                        }
+                    if let Some(r) = m.context.leaders.last_mut()
+                        && ctx.room(r.lines.len())
+                    {
+                        r.lines.push(MLeaderLine::default());
                     }
                     state = MlState::Line;
                     continue;
@@ -1222,10 +1221,10 @@ fn hatch(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> Hatch {
                         }
                     }
                     63 => {
-                        if let Some(stop) = g.colors.last_mut() {
-                            if stop.1 == Color::ByLayer {
-                                stop.1 = Color::from_aci(t.int());
-                            }
+                        if let Some(stop) = g.colors.last_mut()
+                            && stop.1 == Color::ByLayer
+                        {
+                            stop.1 = Color::from_aci(t.int());
                         }
                     }
                     _ => {
@@ -1329,10 +1328,10 @@ fn edge(c: &mut Cursor<'_, '_>, ctx: &mut Ctx<'_>) -> Option<Edge> {
             let mut weights = Vec::new();
             for _ in 0..n_points {
                 let Some(p) = c.point2(10) else { break };
-                if let Some(w) = c.f64(42) {
-                    if ctx.room(weights.len()) {
-                        weights.push(w);
-                    }
+                if let Some(w) = c.f64(42)
+                    && ctx.room(weights.len())
+                {
+                    weights.push(w);
                 }
                 if ctx.room(control_points.len()) {
                     control_points.push(p);
@@ -1583,10 +1582,10 @@ fn r12_viewport(v: &mut Viewport, x: &[Tag<'_>], ctx: &mut Ctx<'_>) {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(&name))
             .map(|(_, h)| *h);
-        if let Some(h) = found {
-            if ctx.room(v.frozen_layers.len()) {
-                v.frozen_layers.push(h);
-            }
+        if let Some(h) = found
+            && ctx.room(v.frozen_layers.len())
+        {
+            v.frozen_layers.push(h);
         }
     }
 }

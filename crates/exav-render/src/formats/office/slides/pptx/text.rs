@@ -1,6 +1,6 @@
 //! Text bodies, paragraphs and runs as DrawingML.
 
-use super::draw::{angle, color, line, solid, Ctx};
+use super::draw::{Ctx, angle, color, line, solid};
 use super::xml::{esc, esc_into};
 use crate::formats::office::slides::model::*;
 use std::fmt::Write as _;
@@ -227,10 +227,10 @@ pub fn run_pr(o: &mut String, tag: &str, r: &RunProps, ctx: &mut Ctx) {
     if let Some(s) = r.spacing {
         let _ = write!(o, " spc=\"{}\"", s.clamp(-400_000, 400_000));
     }
-    if let Some(b) = r.baseline {
-        if b != 0 {
-            let _ = write!(o, " baseline=\"{}\"", b.clamp(-1_000_000, 1_000_000));
-        }
+    if let Some(b) = r.baseline
+        && b != 0
+    {
+        let _ = write!(o, " baseline=\"{}\"", b.clamp(-1_000_000, 1_000_000));
     }
     o.push('>');
     if let Some(l) = &r.outline {
@@ -265,10 +265,10 @@ pub fn run_pr(o: &mut String, tag: &str, r: &RunProps, ctx: &mut Ctx) {
             let _ = write!(o, "<a:{t} typeface=\"{}\"/>", esc(f));
         }
     }
-    if let Some(l) = &r.link {
-        if let Some(attrs) = ctx.link_attrs(l) {
-            let _ = write!(o, "<a:hlinkClick{attrs}/>");
-        }
+    if let Some(l) = &r.link
+        && let Some(attrs) = ctx.link_attrs(l)
+    {
+        let _ = write!(o, "<a:hlinkClick{attrs}/>");
     }
     let _ = write!(o, "</{tag}>");
 }

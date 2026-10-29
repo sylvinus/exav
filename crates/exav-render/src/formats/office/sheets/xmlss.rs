@@ -5,11 +5,11 @@
 //! rich text, R1C1 formulas, styles and their parents, merges, sizes,
 //! names, links, comments, filters and the Excel worksheet options.
 
+use crate::formats::office::common::xml::{self as dom, Node};
 use crate::formats::office::sheets::css;
 use crate::formats::office::sheets::error::{Error, Result};
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
-use crate::formats::office::sheets::ods::dom::{self, Node};
 use crate::formats::office::sheets::r1c1;
 use std::collections::HashMap;
 
@@ -286,7 +286,7 @@ fn apply(st: &mut Style, s: &Node) {
                     }
                     Some(None) => st.fill = Fill::NONE,
                     // A colour without a pattern: Excel reads a solid fill.
-                    None if color.is_some() => st.fill = color.map_or(Fill::NONE, Fill::solid),
+                    None if let Some(c) = color => st.fill = Fill::solid(c),
                     None => {}
                 }
             }
@@ -405,12 +405,12 @@ fn rich(data: &Node, base: &Font) -> Option<Value> {
                                     }
                                     "Face" => f.name = v.chars().take(64).collect(),
                                     "Size" => {
-                                        if let Ok(s) = v.trim().parse::<f64>() {
-                                            if s.is_finite() && s > 0.0 {
-                                                f.size_centipt =
-                                                    (s * 100.0).round().clamp(100.0, 40_000.0)
-                                                        as u32;
-                                            }
+                                        if let Ok(s) = v.trim().parse::<f64>()
+                                            && s.is_finite()
+                                            && s > 0.0
+                                        {
+                                            f.size_centipt =
+                                                (s * 100.0).round().clamp(100.0, 40_000.0) as u32;
                                         }
                                     }
                                     _ => {}
@@ -486,9 +486,8 @@ fn range_r1c1(s: &str) -> Option<Range> {
 }
 
 pub(crate) fn read(bytes: &[u8], budget: &mut Budget) -> Result<Workbook> {
-    budget.alloc(bytes.len() as u64 * 4)?;
     let xml = crate::formats::office::sheets::textenc::xml_utf8(bytes);
-    let root = dom::parse(&xml, dom::MAX_ELEMENTS)?;
+    let root = dom::parse(&xml, &mut budget.tree())?;
     if root.name != "ss:Workbook" {
         return Err(Error::NotFormat(format!(
             "not an XML Spreadsheet: {}",
@@ -772,21 +771,21 @@ fn read_table(
                     None => *bad_formulas += 1,
                 }
             }
-            if let (Some(a), true) = (attr(cell, "ArrayRange"), formula.is_some()) {
-                if let Some(a1) = r1c1::to_a1(a, (r, c)) {
-                    let a1 = a1.replace('$', "");
-                    let (x, y) = a1.split_once(':').unwrap_or((&a1, &a1));
-                    if let (Some((r1, c1)), Some((r2, c2))) = (parse_cell(x), parse_cell(y)) {
-                        sheet.arrays.insert(
-                            (r, c),
-                            Range {
-                                r1: r1.min(r2),
-                                c1: c1.min(c2),
-                                r2: r1.max(r2),
-                                c2: c1.max(c2),
-                            },
-                        );
-                    }
+            if let (Some(a), true) = (attr(cell, "ArrayRange"), formula.is_some())
+                && let Some(a1) = r1c1::to_a1(a, (r, c))
+            {
+                let a1 = a1.replace('$', "");
+                let (x, y) = a1.split_once(':').unwrap_or((&a1, &a1));
+                if let (Some((r1, c1)), Some((r2, c2))) = (parse_cell(x), parse_cell(y)) {
+                    sheet.arrays.insert(
+                        (r, c),
+                        Range {
+                            r1: r1.min(r2),
+                            c1: c1.min(c2),
+                            r2: r1.max(r2),
+                            c2: c1.max(c2),
+                        },
+                    );
                 }
             }
             if let Some(href) = attr(cell, "HRef") {

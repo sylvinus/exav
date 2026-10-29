@@ -299,11 +299,7 @@ impl SerialCorrelation {
         let scc = (len * adjacent_product_sum - byte_sum_squared)
             / (len * self.byte_square_sum - byte_sum_squared);
 
-        if scc.is_nan() {
-            -100000.0
-        } else {
-            scc
-        }
+        if scc.is_nan() { -100000.0 } else { scc }
     }
 }
 
@@ -596,7 +592,7 @@ mod tests {
     #[test]
     fn a_range_read_in_chunks_computes_what_the_slice_does() {
         use super::super::FuncId::*;
-        use super::{call, Value};
+        use super::{Value, call};
         use crate::byte_source::{BlockCache, CHUNK};
 
         let h: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i * 31 % 251) as u8).collect();

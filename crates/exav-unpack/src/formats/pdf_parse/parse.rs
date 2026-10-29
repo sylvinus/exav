@@ -25,10 +25,10 @@ fn parse_object_depth(lex: &mut Lexer, depth: usize) -> Option<Primitive> {
             // encrypted-PDF key derivation). The reference target isn't resolved
             // here, so it surfaces as the leading integer.
             let saved = lex.pos();
-            if let Token::Integer(_gen) = lex.next_token() {
-                if let Token::R = lex.next_token() {
-                    return Some(Primitive::Reference(n as u32));
-                }
+            if let Token::Integer(_gen) = lex.next_token()
+                && let Token::R = lex.next_token()
+            {
+                return Some(Primitive::Reference(n as u32));
             }
             lex.set_pos(saved);
             Some(Primitive::Integer(n))

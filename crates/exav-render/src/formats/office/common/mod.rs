@@ -1,8 +1,8 @@
-//! Readers shared by the office converters (`sheets`, `slides`, `docs`): a
-//! lenient OLE2 compound file reader, legacy code pages, OfficeArt records,
-//! ZIP packages, iWork archives (Snappy, protocol buffers, the IWA object
-//! store), a bounded XML tree with OpenDocument's prefixes, and a
-//! little-endian cursor that never panics.
+//! Readers shared by the office converters (`sheets`, `slides`, `docs`):
+//! legacy code pages, OfficeArt records, ZIP packages, iWork archives
+//! (Snappy, protocol buffers, the IWA object store), a bounded XML tree with
+//! OpenDocument's prefixes, and a little-endian cursor that never panics.
+//! Compound files are read by `exav_unpack::cfb`, which the scanner uses too.
 //!
 //! Each converter uses a subset: what a build leaves unused is not an error.
 
@@ -10,9 +10,8 @@
 
 pub mod base64;
 pub mod bytes;
-pub mod cfb;
-pub mod codepage;
-mod codepage_tables;
+pub use exav_unpack::charset as codepage;
+pub mod css;
 pub mod escher;
 pub mod image;
 pub mod iwa;

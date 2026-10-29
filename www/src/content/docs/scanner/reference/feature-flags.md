@@ -31,9 +31,9 @@ The default build is pure Rust and links no TLS stack; HTTP is opt-in.
 | `dlp` | yes | The structured-data leak heuristics (`--dlp-credit-cards` / `--dlp-ssns`). |
 | `phishing` | yes | The phishing heuristic `--detect phishing` runs, and the `.pdb`/`.gdb`/`.wdb` URL lists it reads. |
 | `image-hash` | yes | `fuzzy_img#` subsignatures, through [exav-imagehash](/subprojects/exav-imagehash/) and its image decoders. Without it those signatures load as unsupported (counted, with the reason), and no image is ever decoded. |
-| `visible-text` | yes | A document is matched through the text a reader sees as well as its bytes: its words without the marks, tags, escapes or run boundaries, entities decoded, and each link followed by where it goes (`label (target)`, whatever the target), as a text view that `Target:0` and `Target:7` signatures see. Markdown (`.md`, `.markdown`), HTML (pages and fragments), the XML parts of Word, PowerPoint, Excel and OpenDocument files (by their path in the package), and AutoCAD drawings (DXF, DWG), as the input or as a member. With `--detect phishing`, each link whose label names one site and whose target another is judged as an HTML anchor is. Not under `--clamav-compat`. Read by [exav-render](/subprojects/exav-render/#text)'s `text`: pulldown-cmark, html5gum's tokenizer and quick-xml. A document past `--max-object-bytes` is not read and the scan is reported incomplete. |
+| `visible-text` | yes | [The text a reader sees](/scanner/reference/formats/#the-text-a-reader-sees) of Markdown, HTML, the XML parts of Office and OpenDocument files, and DXF/DWG drawings, matched as one more text view. Read by [exav-render](/subprojects/exav-render/#text)'s `text` (pulldown-cmark, html5gum's tokenizer, quick-xml). Not under `--clamav-compat`. |
 | `visible-text-pdf` | **no** | And PDF's, read by hayro. Off by default because `hayro-interpret` turns on `hayro-syntax`'s `unsafe` feature, which switches every `flate2` in the build to zlib-rs (a damaged stream then gives back other bytes) and adds SIMD to the image decoders, and because it adds some 40 crates. hayro puts no bound on what a stream decompresses to, so a PDF is given to it only after exav's own reader has taken every stream within the limits. |
-| `visible-text-office` | **no** | And the legacy and flat office formats the XML parts do not reach: DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, FODT, FODS, FODP, FODG, Numbers, Pages and Keynote, with the same text view, link handling and `--detect phishing` judging. Read by [exav-render](/subprojects/exav-render/#text)'s `text-office`, from what its office converters read. Safe Rust and within the scan's limits, but the largest readers of the scan, so not a default. A document of those formats whose text cannot be taken out (encrypted, past a limit, damaged) marks the scan incomplete (`PARTIAL`), never clean; its bytes are still scanned. A compound file is read as an office document only by its extension (`.doc`, `.dot`, `.xls`, `.xlt`, `.xlw`, `.ppt`, `.pps`, `.pot`), so that an installer is not read whole to find out. Speaker notes and the text of animations are not in the view. |
+| `visible-text-office` | **no** | And the legacy and flat office formats (DOC, XLS, PPT, RTF, SYLK, Numbers, Pages, Keynote and others, listed under [the text a reader sees](/scanner/reference/formats/#the-text-a-reader-sees)), read by [exav-render](/subprojects/exav-render/#text)'s `text-office`. Safe Rust and within the scan's limits, but the largest readers of the scan, so not a default. Speaker notes and the text of animations are not in the view. |
 | `icap` | yes | The [ICAP (RFC 3507) server](/scanner/guides/icap/) and its `--icap-*` flags. Pure Rust, no extra dependencies; binds nothing unless an `icap://` address is given. |
 | `http` | **no** | HTTP(S) support: both halves below, and the only thing that links a TLS stack (`ureq` → `rustls` → `ring`). In `exav-core`, `http` is only the range-request backend (`dep:ureq`); in `exav` it is `http = ["http-scan", "http-update"]`. |
 | `http-scan` | no | Scanning an `http(s)://` argument, and the daemon's `SCANURL` command. Both also need `--allow-http-scan` at run time. |
@@ -85,9 +85,8 @@ member name and offers `__exav_panic__`, `__exav_oom__` and `__exav_stack__`.
 
 A panic must come back as a reported result rather than a dead process. An abort
 or a stack overflow cannot be contained inside the process; the tests check that
-both are reported, not taken for clean. `make test-native` runs `panic_containment` in `exav-unpack` and the
-`decoder_crash` suite in `exav` with the feature on; without it those tests skip.
-The browser package runs the same checks in `npm run test:e2e`.
+both are reported, not taken for clean. `make test-native` runs the checks with
+the feature on, and the browser package runs them in `npm run test:e2e`.
 
 It is never in a shipped build: the container image, release binaries and npm
 package are built without it, and no default enables it.
@@ -97,7 +96,8 @@ package are built without it, and no default enables it.
 Turn off the defaults and pick what you need:
 
 ```sh
-# Pure-Rust scanner: no TLS, YARA, DLP, phishing or ICAP
+# Archive formats and decryption only: no YARA, DLP, phishing, ICAP,
+# image hashing or visible-text views
 cargo build --release -p exav --no-default-features --features all-formats,decrypt
 
 # A ZIP scanner with YARA

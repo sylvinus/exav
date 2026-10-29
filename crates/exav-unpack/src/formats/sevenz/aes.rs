@@ -15,9 +15,9 @@
 //! count is capped to reject a DoS, and a wrong passphrase simply yields bytes
 //! the downstream codec rejects (never a panic, never emitted as data).
 
-use crate::kdf::Pass;
 use crate::LimitHit;
-use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
+use crate::kdf::Pass;
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
 use sha2::{Digest, Sha256};
 use std::io::{self, Cursor, Read};
 
@@ -124,20 +124,20 @@ fn utf16le(password: &str) -> Vec<u8> {
 /// ciphertext on first read (folder streams are bounded by the archive/budget),
 /// AES-256-CBC-decrypts it with no padding (7z streams are block-aligned; the
 /// exact unpacked length is enforced by the caller), and serves the plaintext.
-pub(super) struct Aes7zReader {
-    inner: Option<Box<dyn Read>>,
+pub(super) struct Aes7zReader<'a> {
+    inner: Option<Box<dyn Read + 'a>>,
     key: [u8; 32],
     iv: [u8; 16],
     plain: Cursor<Vec<u8>>,
 }
 
-impl Aes7zReader {
+impl<'a> Aes7zReader<'a> {
     /// Build the decryptor for a 7zAES coder. `password` is the passphrase to
     /// try. Returns an error if the properties are malformed, no password was
     /// supplied, or the KDF cost is out of range; the caller maps that to the
     /// existing "encrypted / unsupported" outcome.
     pub(super) fn new(
-        inner: Box<dyn Read>,
+        inner: Box<dyn Read + 'a>,
         properties: &[u8],
         password: Option<Pass<'_>>,
     ) -> Result<Self, LimitHit> {
@@ -185,7 +185,7 @@ impl Aes7zReader {
     }
 }
 
-impl Read for Aes7zReader {
+impl Read for Aes7zReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.inner.is_some() {
             self.fill()?;

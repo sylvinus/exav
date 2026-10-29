@@ -5,14 +5,16 @@
 //! markup, character sets) and SYLK (records, escapes, shared formulas),
 //! then the XLSX writer. The first byte picks the reader. Every panic is a
 //! finding, and so is an output that is not an XLSX.
-use exav_render::sheets::{convert, Format};
+use exav_render::sheets::{Format, convert};
 use libfuzzer_sys::fuzz_target;
 
 #[path = "sheets_check.rs"]
 mod sheets_check;
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&pick, doc)) = data.split_first() else { return };
+    let Some((&pick, doc)) = data.split_first() else {
+        return;
+    };
     let format = match pick % 3 {
         0 => Format::SpreadsheetMl,
         1 => Format::Html,

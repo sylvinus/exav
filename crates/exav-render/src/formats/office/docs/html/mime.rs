@@ -6,7 +6,7 @@
 use crate::formats::office::common::base64;
 use crate::formats::office::docs::error::Result;
 use crate::formats::office::docs::limits::Budget;
-use crate::formats::office::sheets::textenc::html_utf8;
+use exav_unpack::html::decode as html_utf8;
 
 /// Parts read, and levels of multipart in multipart.
 const MAX_PARTS: usize = 4096;
@@ -113,8 +113,8 @@ fn walk(
             }
             at = p + delim.len();
         }
-        for pair in starts.windows(2) {
-            let after = pair[0] + delim.len();
+        for &[start, next] in starts.array_windows() {
+            let after = start + delim.len();
             // The delimiter's line ends; the part follows, up to the line break
             // that belongs to the next delimiter.
             let Some(nl) = body[after..]
@@ -124,7 +124,7 @@ fn walk(
             else {
                 continue;
             };
-            let mut end = pair[1];
+            let mut end = next;
             if end > nl && body[end - 1] == b'\n' {
                 end -= 1;
                 if end > nl && body[end - 1] == b'\r' {

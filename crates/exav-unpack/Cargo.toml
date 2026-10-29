@@ -59,18 +59,11 @@ tar = { version = "0.4", default-features = false, optional = true }
 tinyvec = { version = "1.13", optional = true }
 byteorder = { version = "1", optional = true }
 lzxd = { version = "0.2", optional = true }
-# FAT filesystem reader (a few `unsafe` uses of its own); `chrono` (timestamps)
-# is left off, so the only transitive deps are `bitflags` and `log`.
-fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"], optional = true }
 # LZNT1, the compression NTFS applies per compression unit. Single-purpose and
 # dependency-free; the MFT walk itself is in-tree.
 lznt1 = { version = "0.1", optional = true }
-# ext2/3/4 reader. Read-only by construction, no `unsafe`, no dependencies.
-ext4-view = { version = "1", optional = true }
 # LZW, for ZOO's LZD codec. Dependency-free.
 salzweg = { version = "0.1", optional = true }
-# structured documents that contain embedded files
-cfb = { version = "0.15.0", optional = true }
 # AutoCAD drawings before 2007 are in the code page `$DWGCODEPAGE` names,
 # among them the double-byte Asian ones, which `\M+` escapes use too.
 # encoding_rs is the WHATWG decoder set Firefox ships; built without
@@ -89,10 +82,6 @@ aes = { version = "0.9", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
-constant_time_eq = { version = "0.6", optional = true }
-# DMG support
-hfsplus = { version = "0.4", optional = true }
-apfs = { version = "0.4", optional = true }
 base64 = { version = "0.23", optional = true }
 quick-xml = { version = "0.42", optional = true }
 des = { version = "0.9", default-features = false, optional = true }
@@ -115,7 +104,7 @@ xz4rust = { version = "0.2.3", default-features = false, features = ["std", "bcj
 # (`twox-hash`): exav does not check zstd's content checksum.
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"], optional = true }
 crc32fast = { version = "1.5.3", optional = true }
-# The text of a document (`text`, `text-pdf`). HTML is read by html5gum's
+# HTML (`html`) and the text of a document (`text`, `text-pdf`). HTML is read by html5gum's
 # tokenizer alone (no tree; `forbid(unsafe_code)`, no dependency without its
 # `jetscii` feature), a PDF's text by hayro, which draws glyphs with their
 # Unicode: the same decoders (hayro-jpeg2000, hayro-jbig2) that
@@ -158,7 +147,7 @@ all-formats-no-emu = [
     "arj", "lha", "iso", "ole", "pdf", "email", "dmg", "upx", "ar", "cpio", "xar", "chm",
     "uuencode", "xdp", "szdd", "tnef", "swf", "binhex", "lnk", "partition", "vhd", "lzw",
     "diskimage", "wim", "lz4", "arc", "ace", "stuffit", "alz", "egg", "hwp3",
-    "fat", "ext", "zoo", "ishieldz", "inno", "ntfs", "pyc",
+    "fat", "exfat", "squashfs", "cramfs", "romfs", "erofs", "ext", "zoo", "ishieldz", "inno", "ntfs", "pyc",
     "nsis", "machofat", "sfx", "autoit", "onenote", "rtf", "pepack",
     "javaclass", "aimodel", "screnc", "base64scan", "dxf", "dwg",
 ]
@@ -236,10 +225,22 @@ alz = ["dep:flate2", "bzip2-decoder"]
 egg = ["dep:flate2", "bzip2-decoder", "dep:lzma-rust2"]
 hwp3 = ["dep:flate2"]
 # FAT filesystem reader.
-fat =["dep:fatfs"]
+fat = []
+# exFAT, walked like FAT: a fragmented file comes back whole from its chain.
+exfat = []
+# SquashFS 4, in the compressions it has: gzip, LZMA, LZO (in-tree), XZ, LZ4
+# and Zstandard, whose decoders are those of the formats of the same names.
+squashfs = ["dep:flate2", "xz", "lzma", "lz4", "zstd"]
+# cramfs, the small read-only filesystem of boot images: blocks of zlib.
+cramfs = ["dep:flate2"]
+# romfs, the smallest read-only filesystem: files stored as they are.
+romfs = []
+# EROFS, the read-only filesystem of Android and of container images; the files
+# stored as they are. A compressed file is reported.
+erofs = []
 # ext2/3/4, walked as a filesystem for the same reason as FAT: a fragmented file
 # comes back whole from the inode's block map and in pieces from a carve.
-ext = ["dep:ext4-view"]
+ext = []
 # ZOO carries LZD (LZW) and LZH. The latter is `lh5` on the wire, so `delharc`
 # already covers it.
 zoo = ["dep:salzweg", "dep:delharc"]
@@ -253,11 +254,15 @@ ntfs = ["dep:lznt1"]
 upx = ["dep:flate2", "dep:lzma-rust2", "dep:base64"]
 
 # Structured documents.
-ole = ["dep:cfb", "dep:flate2"]
+ole = ["dep:flate2", "dep:encoding_rs"]
+# The builders of the tests of what reads compound files (`cfb::build`).
+test-util = []
 pdf = ["dep:flate2"]
+# HTML as tokens and its bytes as text (the public `html` module).
+html = ["dep:html5gum", "dep:encoding_rs"]
 # The text a reader sees in HTML and in the XML parts of Office and
 # OpenDocument files (the public `text` module). `text-pdf` adds PDF's.
-text = ["dep:html5gum", "dep:quick-xml", "dep:encoding_rs"]
+text = ["html", "dep:quick-xml"]
 text-pdf = ["text", "pdf", "dep:hayro-interpret", "dep:hayro-syntax", "dep:kurbo"]
 email =["dep:mail-parser", "dep:base64"]
 # AutoCAD DXF: the files a drawing embeds (an OLE2FRAME's object), and the
@@ -271,7 +276,7 @@ dwg = ["dep:encoding_rs"]
 # Apple disk images (UDIF + HFS+/APFS). The encrypted-DMG cipher stack is under
 # the `decrypt` feature, not here.
 dmg = [
-    "dep:hfsplus", "dep:apfs", "dep:xz4rust", "bzip2-decoder",
+    "dep:xz4rust", "bzip2-decoder",
     "dep:flate2", "dep:base64", "dep:quick-xml",
 ]
 
@@ -284,9 +289,12 @@ dmg = [
 # same as when no password is supplied. Effective only combined with a format
 # that has encryptable members. ARJ's ciphers come with `arj`, not this.
 decrypt = [
-    "dep:aes", "dep:hmac", "dep:pbkdf2", "dep:sha1", "dep:constant_time_eq",
+    "offcrypto", "dep:aes", "dep:hmac", "dep:pbkdf2", "dep:sha1",
     "dep:des", "dep:cbc", "dep:md-5", "dep:sha2", "dep:digest", "dep:stringprep",
 ]
+# Excel workbooks saved with a password: RC4, RC4 CryptoAPI and XOR
+# obfuscation (the public `offcrypto` module), which exav-render opens too.
+offcrypto = ["dep:md-5", "dep:sha1"]
 
 # Verify RAR5-decompressed output against the header CRC-32 (debug assert).
 # Off by default; enabled by the rar5_check example/tests.
@@ -345,8 +353,8 @@ lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "e
 # Reference bzip2 encoder (a port of libbzip2), used only in tests to build
 # streams the vendored decoder must read.
 bzip2 = "0.6"
-# Used only in tests to prove the strict CFB reader rejects a malformed
-# compound file that exav's lenient OLE fallback still recovers.
+# Used only in tests: an independent writer and strict reader of compound
+# files, to build them and to check exav's lenient reader against.
 cfb = "0.15.0"
 # The oracle `formats/lzfse` is checked against, and its encoder builds the
 # streams it reads.

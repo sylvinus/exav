@@ -4,7 +4,7 @@
 //! that file extracted and scanned. Walking only the primary volume descriptor's
 //! directory tree would silently miss such files.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 const SECTOR: usize = 2048;

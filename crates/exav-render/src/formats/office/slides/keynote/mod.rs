@@ -19,8 +19,8 @@ mod shapes;
 mod table;
 mod text;
 
-use crate::formats::office::common::iwa::proto::Msg;
 use crate::formats::office::common::iwa::Store;
+use crate::formats::office::common::iwa::proto::Msg;
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::limits::Budget;
 use crate::formats::office::slides::model::*;
@@ -74,18 +74,18 @@ pub(crate) fn read(z: Result<Zip>, budget: &mut Budget) -> Result<Presentation> 
         let data = z.get(inner, max, budget)?.unwrap_or_default();
         let mut iz = Zip::open(&data)?;
         for n in iz.names() {
-            if n.ends_with(".iwa") {
-                if let Some(d) = iz.get(&n, max, budget)? {
-                    files.push((n, d));
-                }
+            if n.ends_with(".iwa")
+                && let Some(d) = iz.get(&n, max, budget)?
+            {
+                files.push((n, d));
             }
         }
     }
     for n in &names {
-        if n.ends_with(".iwa") {
-            if let Some(d) = z.get(n, max, budget)? {
-                files.push((n.clone(), d));
-            }
+        if n.ends_with(".iwa")
+            && let Some(d) = z.get(n, max, budget)?
+        {
+            files.push((n.clone(), d));
         }
     }
     let refs: Vec<(&str, &[u8])> = files
@@ -135,10 +135,10 @@ pub(crate) fn read_package(files: &[(&str, &[u8])], budget: &mut Budget) -> Resu
         let max = budget.limits.max_part;
         let mut iz = Zip::open(data)?;
         for n in iz.names() {
-            if n.ends_with(".iwa") {
-                if let Some(d) = iz.get(&n, max, budget)? {
-                    all.push((n, d));
-                }
+            if n.ends_with(".iwa")
+                && let Some(d) = iz.get(&n, max, budget)?
+            {
+                all.push((n, d));
             }
         }
     }
@@ -205,11 +205,7 @@ pub(crate) fn read_xml<'a>(
     pkg: apxl::Pkg<'a>,
     budget: &mut Budget,
 ) -> Result<Presentation> {
-    // The tree takes about a hundred bytes an element; the shapes bound
-    // what is made of it.
-    budget.alloc(xml.len() as u64 * 4)?;
-    let max_elements = (budget.limits.max_memory / 128).clamp(1000, 20_000_000) as usize;
-    let root = crate::formats::office::common::xml::parse(xml, max_elements)?;
+    let root = crate::formats::office::common::xml::parse(xml, &mut budget.tree())?;
     match root.name.as_str() {
         "key:presentation" => apxl::read(&root, pkg, budget),
         "presentation" => apxl1::read(&root, pkg, budget),
@@ -401,10 +397,10 @@ impl<'a> Reader<'a> {
         let mut nodes: Vec<u64> = vec![];
         if let Some(tree) = show.msg(3) {
             nodes.extend(tree.references(2).take(100_000));
-            if nodes.is_empty() {
-                if let Some(root) = tree.reference(1) {
-                    self.walk_nodes(root, &mut nodes, 0);
-                }
+            if nodes.is_empty()
+                && let Some(root) = tree.reference(1)
+            {
+                self.walk_nodes(root, &mut nodes, 0);
             }
         }
         let mut n = 0usize;

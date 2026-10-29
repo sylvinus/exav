@@ -1,10 +1,10 @@
 //! Conditional formats (calcext:conditional-formats, and the style:map of
 //! older documents) and content validations.
 
-use super::dom::Node;
 use super::formula::Converter;
 use super::styles::parse_color;
-use super::{parse_addr, parse_range_addr, text_of, Doc};
+use super::{Doc, parse_addr, parse_range_addr, text_of};
+use crate::formats::office::common::xml::Node;
 use crate::formats::office::sheets::model::*;
 use std::collections::HashMap;
 
@@ -236,28 +236,30 @@ pub(crate) fn shift_refs(f: &str, dr: i64, dc: i64) -> String {
             let row: String = ch[rs..j].iter().collect();
             let next_word = j < ch.len()
                 && (ch[j].is_alphanumeric() || ch[j] == '_' || ch[j] == '(' || ch[j] == '.');
-            if (1..=3).contains(&col.len()) && !row.is_empty() && !next_word {
-                if let Some((r, cc)) = parse_cell(&format!("{col}{row}")) {
-                    let r2 = if rabs {
-                        i64::from(r)
-                    } else {
-                        (i64::from(r) + dr).rem_euclid(i64::from(MAX_ROW) + 1)
-                    };
-                    let c2 = if cabs {
-                        i64::from(cc)
-                    } else {
-                        (i64::from(cc) + dc).rem_euclid(i64::from(MAX_COL) + 1)
-                    };
-                    out += &format!(
-                        "{}{}{}{}",
-                        if cabs { "$" } else { "" },
-                        col_name(c2 as u32),
-                        if rabs { "$" } else { "" },
-                        r2 + 1
-                    );
-                    i = j;
-                    continue;
-                }
+            if (1..=3).contains(&col.len())
+                && !row.is_empty()
+                && !next_word
+                && let Some((r, cc)) = parse_cell(&format!("{col}{row}"))
+            {
+                let r2 = if rabs {
+                    i64::from(r)
+                } else {
+                    (i64::from(r) + dr).rem_euclid(i64::from(MAX_ROW) + 1)
+                };
+                let c2 = if cabs {
+                    i64::from(cc)
+                } else {
+                    (i64::from(cc) + dc).rem_euclid(i64::from(MAX_COL) + 1)
+                };
+                out += &format!(
+                    "{}{}{}{}",
+                    if cabs { "$" } else { "" },
+                    col_name(c2 as u32),
+                    if rabs { "$" } else { "" },
+                    r2 + 1
+                );
+                i = j;
+                continue;
             }
             let mut k = i;
             while k < ch.len()
@@ -367,7 +369,7 @@ fn condition_rule(v: &str, dxf: Dxf, fc: &mut Converter, tl: (u32, u32)) -> Opti
                 vec![("aboveAverage", "0".into())],
                 vec![],
                 dxf,
-            )
+            );
         }
         "above-equal-average" => {
             return other(
@@ -375,7 +377,7 @@ fn condition_rule(v: &str, dxf: Dxf, fc: &mut Converter, tl: (u32, u32)) -> Opti
                 vec![("equalAverage", "1".into())],
                 vec![],
                 dxf,
-            )
+            );
         }
         "below-equal-average" => {
             return other(
@@ -383,7 +385,7 @@ fn condition_rule(v: &str, dxf: Dxf, fc: &mut Converter, tl: (u32, u32)) -> Opti
                 vec![("aboveAverage", "0".into()), ("equalAverage", "1".into())],
                 vec![],
                 dxf,
-            )
+            );
         }
         "is-error" => {
             return other(
@@ -391,7 +393,7 @@ fn condition_rule(v: &str, dxf: Dxf, fc: &mut Converter, tl: (u32, u32)) -> Opti
                 vec![],
                 vec![format!("ISERROR({})", cell_ref(tl.0, tl.1))],
                 dxf,
-            )
+            );
         }
         "is-no-error" => {
             return other(
@@ -399,7 +401,7 @@ fn condition_rule(v: &str, dxf: Dxf, fc: &mut Converter, tl: (u32, u32)) -> Opti
                 vec![],
                 vec![format!("NOT(ISERROR({}))", cell_ref(tl.0, tl.1))],
                 dxf,
-            )
+            );
         }
         _ => {}
     }
@@ -636,11 +638,12 @@ fn column_runs(cells: &[(u32, u32)]) -> Vec<Range> {
     v.sort_by_key(|&(r, c)| (c, r));
     let mut out: Vec<Range> = vec![];
     for (r, c) in v {
-        if let Some(l) = out.last_mut() {
-            if l.c1 == c && l.r2 + 1 == r {
-                l.r2 = r;
-                continue;
-            }
+        if let Some(l) = out.last_mut()
+            && l.c1 == c
+            && l.r2 + 1 == r
+        {
+            l.r2 = r;
+            continue;
         }
         out.push(Range::cell(r, c));
     }

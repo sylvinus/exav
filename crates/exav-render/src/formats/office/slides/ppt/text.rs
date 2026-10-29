@@ -2,7 +2,7 @@
 //! master text styles, a text body's atoms, and their resolution into the
 //! model's paragraphs and runs with every property explicit.
 
-use super::pp9::{Pf9, NO_NUMBERING};
+use super::pp9::{NO_NUMBERING, Pf9};
 use super::records::Rec;
 use super::rt;
 use crate::formats::office::common::bytes::Cur;
@@ -440,10 +440,10 @@ pub fn read_bodies<'a>(records: impl Iterator<Item = Rec<'a>>) -> Vec<RawText> {
             rt::TEXT_INTERACTIVE_INFO => {
                 let mut c = r.cur();
                 let (a, b) = (c.u32(), c.u32());
-                if let Some(info) = pending_link.take() {
-                    if r.inst == 0 {
-                        t.link_info.push((a, b, info));
-                    }
+                if let Some(info) = pending_link.take()
+                    && r.inst == 0
+                {
+                    t.link_info.push((a, b, info));
                 }
             }
             _ => {}
@@ -564,10 +564,7 @@ pub fn para_props(pf: &Pf, cf: &Cf, level: u16, ruler: Option<&Ruler>, ctx: &Tex
             .bullet_blip
             .and_then(|b| ctx.bullet_media.get(usize::from(b)).copied().flatten());
         match pf.autonum {
-            _ if picture.is_some() => Some(Bullet::Picture {
-                media: picture.unwrap_or_default(),
-                size,
-            }),
+            _ if let Some(media) = picture => Some(Bullet::Picture { media, size }),
             Some((scheme, start)) => Some(Bullet::AutoNum {
                 scheme: autonum_scheme(scheme),
                 start: u32::from(start.max(1)),
@@ -834,10 +831,10 @@ fn link_index(links: &[(u32, u32, Option<Link>)], at: u32) -> Option<usize> {
 /// dropped.
 fn decode_unit(chars: &[u16], i: usize) -> String {
     let c = chars[i];
-    if (0xD800..0xDC00).contains(&c) {
-        if let Some(&lo) = chars.get(i + 1) {
-            return String::from_utf16_lossy(&[c, lo]);
-        }
+    if (0xD800..0xDC00).contains(&c)
+        && let Some(&lo) = chars.get(i + 1)
+    {
+        return String::from_utf16_lossy(&[c, lo]);
     }
     match c {
         0x09 => "\t".into(),

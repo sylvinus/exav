@@ -193,7 +193,7 @@ impl Stroke {
             return vec![[a, b]];
         }
         let pts = super::curves::bulge_points(a, b, self.bulge as f64, n);
-        pts.windows(2).map(|w| [w[0], w[1]]).collect()
+        pts.array_windows().copied().collect()
     }
 }
 
@@ -426,8 +426,8 @@ impl Scene {
         if pts.len() < 2 {
             return;
         }
-        for w in pts.windows(2) {
-            self.push_stroke(w[0][0], w[0][1], w[1][0], w[1][1], rgba, attr);
+        for [a, b] in pts.array_windows() {
+            self.push_stroke(a[0], a[1], b[0], b[1], rgba, attr);
         }
         if closed {
             let a = pts[pts.len() - 1];
@@ -1386,10 +1386,11 @@ mod tests {
                     .all(|k| k.bulge == 0.0 && k.x0 >= 0.5 - 1e-9)
         );
         // On the curve, to the flattening's sagitta.
-        assert!(s
-            .strokes
-            .iter()
-            .all(|k| (k.x0.hypot(k.y0) - 1.0).abs() < 2e-3));
+        assert!(
+            s.strokes
+                .iter()
+                .all(|k| (k.x0.hypot(k.y0) - 1.0).abs() < 2e-3)
+        );
     }
 
     #[test]

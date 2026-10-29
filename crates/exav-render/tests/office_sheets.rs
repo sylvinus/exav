@@ -1,6 +1,6 @@
 //! The fixtures converted through the public API, the XLSX read back.
 
-use exav_render::sheets::{convert, Error, Format, Limits};
+use exav_render::sheets::{Error, Format, Limits, convert};
 use std::io::Read;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -78,9 +78,10 @@ fn ods() {
 fn fods() {
     let mut x = Xlsx::of("sample.fods", Format::Fods);
     budget(&mut x);
-    assert!(x
-        .part("xl/worksheets/sheet2.xml")
-        .contains(r#"t="b"><v>1</v>"#));
+    assert!(
+        x.part("xl/worksheets/sheet2.xml")
+            .contains(r#"t="b"><v>1</v>"#)
+    );
 }
 
 #[test]
@@ -91,9 +92,10 @@ fn xls() {
 #[test]
 fn numbers() {
     let mut x = Xlsx::of("sample.numbers", Format::Numbers);
-    assert!(x
-        .part("xl/workbook.xml")
-        .contains(r#"<sheet name="Sheet 1""#));
+    assert!(
+        x.part("xl/workbook.xml")
+            .contains(r#"<sheet name="Sheet 1""#)
+    );
     let sst = x.part("xl/sharedStrings.xml");
     assert!(sst.contains("SheetJS") && sst.contains("B3:D3"), "{sst}");
     let s1 = x.part("xl/worksheets/sheet1.xml");
@@ -171,17 +173,19 @@ fn xml_spreadsheet() {
     text_budget(&mut x, true);
     assert!(x.part("xl/styles.xml").contains("FF4472C4"));
     assert!(x.part("xl/worksheets/sheet1.xml").contains(r#"ySplit="1""#));
-    assert!(x
-        .part("xl/worksheets/sheet2.xml")
-        .contains(r#"t="b"><v>1</v>"#));
+    assert!(
+        x.part("xl/worksheets/sheet2.xml")
+            .contains(r#"t="b"><v>1</v>"#)
+    );
 }
 
 #[test]
 fn html_table() {
     let mut x = Xlsx::of("sample.html", Format::Html);
-    assert!(x
-        .part("xl/workbook.xml")
-        .contains(r#"<sheet name="Budget""#));
+    assert!(
+        x.part("xl/workbook.xml")
+            .contains(r#"<sheet name="Budget""#)
+    );
     text_budget(&mut x, true);
     assert!(x.part("xl/styles.xml").contains("FF4472C4"));
     assert!(x.part("xl/worksheets/sheet1.xml").contains(r#"ySplit="1""#));
@@ -270,4 +274,21 @@ fn truncated_files() {
             let _ = convert(&data[..n], format, &Limits::default());
         }
     }
+}
+
+#[test]
+fn a_tree_of_elements_nothing_reads_is_charged_for() {
+    let x = format!(
+        "<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\">{}</Workbook>",
+        "<x/>".repeat(100_000)
+    );
+    let small = Limits::default().with_max_memory(8 << 20);
+    assert_eq!(
+        convert(x.as_bytes(), Format::SpreadsheetMl, &small).unwrap_err(),
+        Error::TooLarge("memory")
+    );
+    // Within the default bound the tree is read; a workbook of no sheet is
+    // what is refused then.
+    let e = convert(x.as_bytes(), Format::SpreadsheetMl, &Limits::default()).unwrap_err();
+    assert_ne!(e, Error::TooLarge("memory"));
 }

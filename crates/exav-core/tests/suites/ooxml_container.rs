@@ -7,7 +7,7 @@
 //! plain ZIP member and the `Container:`-scoped sig was skipped. A plain ZIP
 //! carrying the same bytes must NOT fire (the constraint still discriminates).
 
-use exav_core::{loader, scan_seekable, ScanOptions, Verdict};
+use exav_core::{ScanOptions, Verdict, loader, scan_seekable};
 use std::io::Cursor;
 
 /// The marker the logical signature keys on (appears in `word/document.xml`).

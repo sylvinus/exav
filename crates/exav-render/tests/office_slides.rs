@@ -1,9 +1,9 @@
 //! The public API over the fixtures (see fixtures/office/slides/README.md).
 
-use exav_render::formats::office::test_util::build_cfb as build;
 use exav_render::formats::office::test_util::Compound;
+use exav_render::formats::office::test_util::build_cfb as build;
 use exav_render::slides::{
-    convert, convert_first, convert_first_from, convert_keynote_package, Error, Format, Limits,
+    Error, Format, Limits, convert, convert_first, convert_first_from, convert_keynote_package,
 };
 use std::io::Read;
 
@@ -274,9 +274,11 @@ fn pictures_are_read_when_a_slide_shows_them() {
         Error::TooLarge("memory")
     );
     let first = convert_first(&odp, Format::Odp, &small, 1).unwrap();
-    assert!(!names(&first.pptx)
-        .iter()
-        .any(|n| n.starts_with("ppt/media/")));
+    assert!(
+        !names(&first.pptx)
+            .iter()
+            .any(|n| n.starts_with("ppt/media/"))
+    );
 }
 
 fn base64(d: &[u8]) -> String {
@@ -509,4 +511,33 @@ fn damaged_files_do_not_panic() {
             &Limits::default(),
         );
     }
+}
+
+/// The memory bound counts what a shape takes in the model, some 7 kB:
+/// 20,000 text boxes hold more than 100 MB.
+#[test]
+fn shapes_are_counted_at_what_they_take() {
+    let fodp = format!(
+        r#"<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:mimetype="application/vnd.oasis.opendocument.presentation"><office:body><office:presentation><draw:page>{}</draw:page></office:presentation></office:body></office:document>"#,
+        "<draw:frame><draw:text-box><text:p>x</text:p></draw:text-box></draw:frame>".repeat(20_000)
+    );
+    let within = |mib: u64| {
+        let limits = Limits::default().with_max_memory(mib << 20);
+        convert(fodp.as_bytes(), Format::Fodp, &limits)
+    };
+    assert_eq!(within(64).unwrap_err(), Error::TooLarge("memory"));
+    assert!(within(512).is_ok());
+}
+
+#[test]
+fn a_tree_of_elements_nothing_reads_is_charged_for() {
+    let x = format!(
+        "<office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" office:mimetype=\"application/vnd.oasis.opendocument.presentation\">{}</office:document>",
+        "<office:x/>".repeat(100_000)
+    );
+    let small = Limits::default().with_max_memory(8 << 20);
+    assert_eq!(
+        convert(x.as_bytes(), Format::Fodp, &small).unwrap_err(),
+        Error::TooLarge("memory")
+    );
 }

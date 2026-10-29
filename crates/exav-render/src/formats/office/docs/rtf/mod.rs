@@ -1,6 +1,5 @@
 //! Rich Text Format ([RTF 1.9.1]) to the document model.
 
-mod lex;
 mod pict;
 mod words;
 
@@ -10,7 +9,7 @@ use crate::formats::office::docs::fields::parse_hyperlink;
 use crate::formats::office::docs::grid::{self, CellIn, RowIn};
 use crate::formats::office::docs::limits::Budget;
 use crate::formats::office::docs::model::*;
-use lex::{Lexer, Tok};
+use exav_unpack::rtf::{Lexer, Tok};
 use std::collections::HashMap;
 
 const MAX_DEPTH: usize = 200;
@@ -215,6 +214,9 @@ pub(crate) struct Parser<'a> {
     pub list_text: Vec<u32>,
     pub list_numbers: Vec<u8>,
     pub tokens: u64,
+    /// The first memory charge that was refused, for the main loop to raise:
+    /// text and runs are added from places that return nothing.
+    pub over: Option<Error>,
 }
 
 pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
@@ -263,9 +265,13 @@ pub(crate) fn read(input: &[u8], budget: &mut Budget) -> Result<Document> {
         list_text: vec![],
         list_numbers: vec![],
         tokens: 0,
+        over: None,
     };
     p.cur_sect = p.defaults.clone();
     p.run()?;
+    if let Some(e) = p.over.take() {
+        return Err(e);
+    }
     p.finish()
 }
 
@@ -290,6 +296,9 @@ impl Parser<'_> {
             self.tokens += 1;
             if self.tokens > 200_000_000 {
                 return Err(Error::TooLarge("tokens"));
+            }
+            if let Some(e) = self.over.take() {
+                return Err(e);
             }
             if closed && !matches!(t, Tok::Close) {
                 closed = false;
@@ -454,10 +463,10 @@ impl Parser<'_> {
                         self.buf.push_str(name);
                         let name = self.buf.trim().to_string();
                         self.buf.clear();
-                        if let Some(f) = self.fonts.get_mut(&n) {
-                            if f.name.is_empty() {
-                                f.name = name;
-                            }
+                        if let Some(f) = self.fonts.get_mut(&n)
+                            && f.name.is_empty()
+                        {
+                            f.name = name;
                         }
                         self.top().dest = Dest::FontTable;
                     }
@@ -493,23 +502,39 @@ impl Parser<'_> {
         self.add_item(RunItem::Text(s));
     }
 
+    /// `bytes` more held in the model. A refusal is kept for the main loop.
+    fn charge(&mut self, bytes: usize) {
+        if self.over.is_none()
+            && let Err(e) = self.b.alloc(bytes as u64)
+        {
+            self.over = Some(e);
+        }
+    }
+
     pub(crate) fn add_item(&mut self, item: RunItem) {
+        let text = match &item {
+            RunItem::Text(t) => t.len(),
+            _ => 0,
+        };
+        self.charge(text);
         let rp = self.top().chp.clone();
         let content = self.content_mut();
-        if let Some(Inline::Run(r)) = content.last_mut() {
-            if r.props == rp {
-                if let (RunItem::Text(t), Some(RunItem::Text(last))) = (&item, r.items.last_mut()) {
-                    last.push_str(t);
-                    return;
-                }
-                r.items.push(item);
+        if let Some(Inline::Run(r)) = content.last_mut()
+            && r.props == rp
+        {
+            if let (RunItem::Text(t), Some(RunItem::Text(last))) = (&item, r.items.last_mut()) {
+                last.push_str(t);
                 return;
             }
+            r.items.push(item);
+            self.charge(size_of::<RunItem>());
+            return;
         }
         content.push(Inline::Run(Run {
             props: rp,
             items: vec![item],
         }));
+        self.charge(size_of::<Inline>() + size_of::<RunItem>());
     }
 
     fn story(&mut self) -> &mut Story {
@@ -583,10 +608,10 @@ impl Parser<'_> {
             Dest::FontEntry(n) => {
                 let name = self.buf.trim().trim_end_matches(';').trim().to_string();
                 self.buf.clear();
-                if let Some(f) = self.fonts.get_mut(n) {
-                    if f.name.is_empty() {
-                        f.name = name;
-                    }
+                if let Some(f) = self.fonts.get_mut(n)
+                    && f.name.is_empty()
+                {
+                    f.name = name;
                 }
             }
             Dest::StyleEntry(i) => {

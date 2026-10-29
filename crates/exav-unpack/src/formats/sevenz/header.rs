@@ -60,16 +60,26 @@ pub(super) struct Archive {
 /// archive).
 #[cfg(test)]
 pub(super) fn parse_archive(data: &[u8], passwords: &[String]) -> Result<Archive, LimitHit> {
-    parse_archive_with(data, passwords, &crate::kdf::Kdf::default())
+    parse_archive_with(
+        &data,
+        passwords,
+        &crate::kdf::Kdf::default(),
+        crate::Limits::default().max_buffer_bytes,
+    )
 }
 
 /// The archive's structure, its encrypted header opened with the first of
 /// `passwords` that does it; the derivations count against `kdf`, the scan's.
+/// Only the signature header, the header and the packed header are read from
+/// `src`, and the header is held up to `max_buffer` bytes.
 pub(super) fn parse_archive_with(
-    data: &[u8],
+    src: &dyn crate::source::ByteSource,
     passwords: &[String],
     kdf: &crate::kdf::Kdf,
+    max_buffer: u64,
 ) -> Result<Archive, LimitHit> {
+    let head = src.window(0, 32);
+    let data: &[u8] = &head;
     if data.len() < 32 {
         return Err(LimitHit::corrupt("7z: file too small".into()));
     }
@@ -93,13 +103,20 @@ pub(super) fn parse_archive_with(
         .checked_add(next_header_offset)
         .and_then(|v| usize::try_from(v).ok())
         .ok_or_else(|| LimitHit::corrupt("7z: next header offset overflow".into()))?;
-    let nh_end = nh_start
-        .checked_add(next_header_size as usize)
+    let nh_end = usize::try_from(next_header_size)
+        .ok()
+        .and_then(|n| nh_start.checked_add(n))
         .ok_or_else(|| LimitHit::corrupt("7z: next header offset overflow".into()))?;
-    if nh_end > data.len() {
+    if nh_end > src.len() {
         return Err(LimitHit::corrupt(
             "7z: next header extends past end of file".into(),
         ));
+    }
+    // The header is parsed from memory, whole.
+    if next_header_size > max_buffer {
+        return Err(LimitHit::new(format!(
+            "7z header is {next_header_size} bytes, over the {max_buffer}-byte buffer limit"
+        )));
     }
 
     // An archive of nothing is the signature header alone.
@@ -113,7 +130,13 @@ pub(super) fn parse_archive_with(
         });
     }
 
-    let nh = &data[nh_start..nh_end];
+    let nh_bytes = src.window(nh_start, nh_end.saturating_sub(nh_start));
+    if nh_bytes.len() != nh_end.saturating_sub(nh_start) {
+        return Err(LimitHit::corrupt(
+            "7z: next header could not be read".into(),
+        ));
+    }
+    let nh: &[u8] = &nh_bytes;
     let mut nr = SevenZReader::new(nh);
 
     let first_nid = nr.read_nid()?;
@@ -136,13 +159,11 @@ pub(super) fn parse_archive_with(
                 let mut decoded = None;
                 for pw in passwords {
                     let pass = crate::kdf::Pass { word: pw, kdf };
-                    if let Ok(bytes) =
-                        decompress_encoded_header(data, &mut streams_info, Some(pass))
+                    if let Ok(bytes) = decompress_encoded_header(src, &mut streams_info, Some(pass))
+                        && parse_header(&bytes).is_ok()
                     {
-                        if parse_header(&bytes).is_ok() {
-                            decoded = Some(bytes);
-                            break;
-                        }
+                        decoded = Some(bytes);
+                        break;
                     }
                 }
                 decoded.ok_or_else(|| {
@@ -151,7 +172,7 @@ pub(super) fn parse_archive_with(
             } else {
                 // No password (or no AES): a `-mhe` header without a password
                 // surfaces as unsupported via the AES coder, never a silent clean.
-                decompress_encoded_header(data, &mut streams_info, None)?
+                decompress_encoded_header(src, &mut streams_info, None)?
             }
         }
         NID_HEADER => nh.to_vec(),
@@ -581,6 +602,7 @@ fn parse_files_info(
 
     let mut empty_streams = BitSet::new(num_files);
     let mut empty_files = BitSet::new(num_files);
+    let mut num_empty = 0usize;
 
     loop {
         let prop_type = r.read_nid()?;
@@ -590,12 +612,12 @@ fn parse_files_info(
         let _prop_size = read_var_u64(r)?;
         let prop_start = r.pos;
 
-        // EmptyFile and Anti have one bit per entry that has no stream, not
-        // one per entry.
-        let num_empty = (0..num_files).filter(|&i| empty_streams.get(i)).count();
         match prop_type {
             NID_EMPTY_STREAM => {
                 empty_streams = BitSet::read_bits(r, num_files, BitSet::new(num_files))?;
+                // EmptyFile and Anti have one bit per entry that has no
+                // stream, not one per entry.
+                num_empty = (0..num_files).filter(|&i| empty_streams.get(i)).count();
             }
             NID_EMPTY_FILE => {
                 empty_files = BitSet::read_bits(r, num_empty, BitSet::new(num_empty))?;
@@ -764,7 +786,7 @@ fn calculate_stream_map(blocks: &[Block], files: &[FileEntry], pack_sizes: &[u64
 // ─── Decompress encoded header ─────────────────────────────────────────────
 
 fn decompress_encoded_header(
-    data: &[u8],
+    src: &dyn crate::source::ByteSource,
     streams_info: &mut StreamsInfo,
     password: Option<crate::kdf::Pass<'_>>,
 ) -> Result<Vec<u8>, LimitHit> {
@@ -798,14 +820,13 @@ fn decompress_encoded_header(
         .and_then(|v| v.checked_add(pack_stream_offset))
         .and_then(|v| usize::try_from(v).ok())
         .ok_or_else(|| LimitHit::corrupt("7z: pack stream offset overflow".into()))?;
-    let pack_size = streams_info.pack_sizes[pack_idx] as usize;
-
-    let pack_end = pack_offset
-        .checked_add(pack_size)
-        .filter(|&e| e <= data.len())
+    let pack_end = usize::try_from(streams_info.pack_sizes[pack_idx])
+        .ok()
+        .and_then(|n| pack_offset.checked_add(n))
+        .filter(|&e| e <= src.len())
         .ok_or_else(|| LimitHit::corrupt("7z: pack stream extends past end of file".into()))?;
 
-    let pack_data = &data[pack_offset..pack_end];
+    let pack_data = Box::new(crate::source::Reader::range(src, pack_offset, pack_end));
     // Sum of attacker-controlled coder output sizes: saturate instead of `.sum()`
     // (which panics on overflow). `cap_prealloc` bounds the resulting allocation.
     let total_unpack: u64 = block
@@ -819,6 +840,11 @@ fn decompress_encoded_header(
     // operator's tuning surface), and it must be buffered whole for random-access
     // parsing — so a fixed default ceiling is the right bound here.
     let max_buffer = crate::Limits::default().max_buffer_bytes;
+    // Its decoder may hold what it is given, so what it is given is bounded
+    // too, not by the archive's size.
+    if (pack_end.saturating_sub(pack_offset)) as u64 > max_buffer {
+        return Err(LimitHit::new("7z encoded header exceeds max-buffer".into()));
+    }
 
     // Build the decoder chain as a block's is built: each coder decodes to its
     // own declared size (an AES coder's output is its padded input, an LZMA

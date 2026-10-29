@@ -14,7 +14,7 @@
 //! tar — clean. Every npm package tarball is written by node-tar, which uses the
 //! space-then-NUL form.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -147,7 +147,7 @@ fn a_size_field_terminated_by_a_space_alone_is_parsed() {
 /// Pinning them together is what stops the next divergence hiding the same way.
 #[test]
 fn both_tar_readers_see_the_same_members() {
-    use exav_unpack::{extract, Budget, Format, Limits};
+    use exav_unpack::{Budget, Format, Limits, extract};
 
     // A COMPRESSED member, so the payload appears nowhere verbatim: the raw scan
     // cannot reach it and only the streaming walk can. With a plain member this

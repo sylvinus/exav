@@ -37,7 +37,7 @@
 //! sample files from raw.pixls.us, with tools of our own, not from another
 //! implementation.
 
-use super::{Channels, Error, Pixels, Samples, DECODE_MAX};
+use super::{Channels, DECODE_MAX, Error, Pixels, Samples};
 use crate::image_codecs;
 
 mod bmff;

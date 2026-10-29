@@ -3,7 +3,7 @@
 //! to 4.
 
 use exav_render::formats::office::test_util::build_cfb as build;
-use exav_render::slides::{convert, Error, Format, Limits};
+use exav_render::slides::{Error, Format, Limits, convert};
 use std::io::Read;
 
 fn part(pptx: &[u8], name: &str) -> String {

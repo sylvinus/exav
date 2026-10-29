@@ -34,14 +34,14 @@ use std::fmt;
 use std::str::FromStr;
 
 use exav_render::image::{Channels, Pixels, Samples};
-use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer};
+use image::{DynamicImage, GrayImage, ImageBuffer, imageops::FilterType};
 
 mod dct;
 mod pillow;
 
 use dct::dct2d;
 
-pub use exav_render::image::{Format, DECODE_MAX};
+pub use exav_render::image::{DECODE_MAX, Format};
 pub use pillow::PillowFilter;
 
 /// The format's bit in a [`Formats`]: its place in [`Format::ALL`].

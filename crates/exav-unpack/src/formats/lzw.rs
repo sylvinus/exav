@@ -168,12 +168,12 @@ impl<B: Bytes> Lzw<B> {
 
             // Define the next table entry from the previous code plus this
             // string's first byte.
-            if let Some(p) = self.prev {
-                if (self.next as usize) < table_cap {
-                    self.prefix[self.next as usize] = p;
-                    self.suffix[self.next as usize] = *self.stack.last().unwrap_or(&0);
-                    self.next += 1;
-                }
+            if let Some(p) = self.prev
+                && (self.next as usize) < table_cap
+            {
+                self.prefix[self.next as usize] = p;
+                self.suffix[self.next as usize] = *self.stack.last().unwrap_or(&0);
+                self.next += 1;
             }
             self.prev = Some(code);
             return Some(true);

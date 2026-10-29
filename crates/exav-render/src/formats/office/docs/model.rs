@@ -813,6 +813,49 @@ impl Document {
     }
 }
 
+/// What the inlines of a paragraph take in memory: each one's slot, the room
+/// of the items of a run, and the text and names they own. A reader that
+/// builds a paragraph's content at once charges this, so that what it holds
+/// is counted by what it is and not by a guess per paragraph.
+pub(crate) fn inline_bytes(inlines: &[Inline]) -> usize {
+    inlines
+        .iter()
+        .map(|i| {
+            size_of::<Inline>()
+                + match i {
+                    Inline::Run(r) => {
+                        r.items.len() * size_of::<RunItem>()
+                            + r.items
+                                .iter()
+                                .map(|it| match it {
+                                    RunItem::Text(t) => t.len(),
+                                    RunItem::Symbol { font, .. } => font.len(),
+                                    RunItem::Drawing(_) => size_of::<Drawing>(),
+                                    _ => 0,
+                                })
+                                .sum::<usize>()
+                    }
+                    Inline::InstrText(s) => s.len(),
+                    Inline::Field { instr, result, .. } => instr.len() + inline_bytes(result),
+                    Inline::Hyperlink {
+                        target,
+                        anchor,
+                        tooltip,
+                        content,
+                    } => {
+                        [target, anchor, tooltip]
+                            .iter()
+                            .map(|o| o.as_ref().map_or(0, String::len))
+                            .sum::<usize>()
+                            + inline_bytes(content)
+                    }
+                    Inline::BookmarkStart { name, .. } => name.len(),
+                    _ => 0,
+                }
+        })
+        .sum()
+}
+
 impl Run {
     pub fn text(props: RunProps, s: impl Into<String>) -> Run {
         Run {

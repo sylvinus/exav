@@ -3,7 +3,7 @@
 //! `make.py` in `tests/fixtures/xz_checks/`; `xz -t` accepts them, with a
 //! warning that the check is not verified for the reserved ones.
 
-use exav_unpack::{extract, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, extract};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!(

@@ -6,8 +6,8 @@
 mod common;
 
 use common::*;
-use exav_render::docs::{convert, text, Error, Format, Limits};
-use exav_render::formats::office::test_util::{build_cfb, literal_block, PackageWriter, Zip, W};
+use exav_render::docs::{Error, Format, Limits, convert, text};
+use exav_render::formats::office::test_util::{PackageWriter, W, Zip, build_cfb, literal_block};
 use exav_render::formats::office::text::Text;
 
 const CAP: usize = 1 << 20;
@@ -111,10 +111,10 @@ fn docx_text(xml: &str) -> String {
             ("w:t", false) if !tag.ends_with('/') => {
                 let end = rest.find("</w:t>").expect("w:t ends");
                 // Not an instruction's, nor a page number's.
-                if fields.iter().all(|f| f.result && !f.skip) {
-                    if let Some(r) = runs.last_mut() {
-                        r.0.push_str(&unescape(&rest[..end]));
-                    }
+                if fields.iter().all(|f| f.result && !f.skip)
+                    && let Some(r) = runs.last_mut()
+                {
+                    r.0.push_str(&unescape(&rest[..end]));
                 }
                 rest = &rest[end..];
             }

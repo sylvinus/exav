@@ -4,8 +4,6 @@
 //! read as text ([`text()`]) for a scanner or a search.
 
 mod charts;
-// The HTML tokenizer, its style sheets and the CSS values are the docs
-// converter's too (Word's HTML pages).
 pub(crate) mod css;
 mod error;
 mod fonts;
@@ -87,7 +85,8 @@ pub struct Converted {
 
 /// Converts `input`, a document of `format`, to XLSX.
 pub fn convert(input: &[u8], format: Format, limits: &Limits) -> Result<Converted, Error> {
-    finish(read(input, format, limits)?, limits)
+    let (wb, used) = read(input, format, limits)?;
+    finish(wb, limits, used)
 }
 
 /// The text of `input`, a workbook of `format`, cut at `cap` bytes: each
@@ -100,16 +99,17 @@ pub fn text(
     limits: &Limits,
     cap: usize,
 ) -> Result<crate::formats::office::text::Text, Error> {
-    Ok(text::of(&read(input, format, limits)?, cap))
+    Ok(text::of(&read(input, format, limits)?.0, cap))
 }
 
-/// Reads `input` into the model, within `limits`.
-fn read(input: &[u8], format: Format, limits: &Limits) -> Result<model::Workbook, Error> {
+/// Reads `input` into the model, within `limits`, and says how much of the
+/// memory limit the model took.
+fn read(input: &[u8], format: Format, limits: &Limits) -> Result<(model::Workbook, u64), Error> {
     if input.len() as u64 > limits.max_input {
         return Err(Error::TooLarge("input"));
     }
     let mut budget = limits::Budget::new(*limits);
-    match format {
+    let wb = match format {
         Format::Xls => xls::read(input, &mut budget),
         Format::Ods => ods::read_ods(input, &mut budget),
         Format::Fods => ods::read_fods(input, &mut budget),
@@ -117,7 +117,8 @@ fn read(input: &[u8], format: Format, limits: &Limits) -> Result<model::Workbook
         Format::SpreadsheetMl => xmlss::read(input, &mut budget),
         Format::Html => html::read(input, &mut budget),
         Format::Sylk => sylk::read(input, &mut budget),
-    }
+    }?;
+    Ok((wb, budget.used()))
 }
 
 /// Converts an Apple Numbers document saved as a package directory, given
@@ -132,7 +133,7 @@ pub fn convert_numbers_package(
     }
     let mut budget = limits::Budget::new(*limits);
     let wb = numbers::read_package(files, &mut budget)?;
-    finish(wb, limits)
+    finish(wb, limits, budget.used())
 }
 
 /// An ODF chart object's content (an office:chart holding its own data
@@ -143,7 +144,7 @@ pub fn odf_chart_part(content: &[u8]) -> Option<String> {
         from: (0, 0, 0, 0),
         to: (0, 0, 0, 0),
     };
-    let mut chart = ods::chart::read(content, anchor, &[])?;
+    let mut chart = ods::chart::read(content, anchor, &[], &mut |_| true).ok()??;
     for s in &mut chart.series {
         s.name_ref = None;
         s.cat_ref = None;
@@ -153,9 +154,22 @@ pub fn odf_chart_part(content: &[u8]) -> Option<String> {
     Some(xlsx::chart::chart_xml(&chart))
 }
 
-fn finish(mut wb: model::Workbook, limits: &Limits) -> Result<Converted, Error> {
-    charts::fill(&mut wb);
-    let xlsx = xlsx::write(&wb, limits.max_memory)?;
+/// Writes the workbook, in what the model left of the memory limit: the
+/// limit is for the model and the output together.
+fn finish(mut wb: model::Workbook, limits: &Limits, used: u64) -> Result<Converted, Error> {
+    let mut left = limits.max_memory.saturating_sub(used);
+    // The caches charts keep of the cells they draw are copies, one per series.
+    let fits = charts::fill(&mut wb, &mut |bytes| {
+        if bytes > left {
+            return false;
+        }
+        left -= bytes;
+        true
+    });
+    if !fits {
+        return Err(Error::TooLarge("memory"));
+    }
+    let xlsx = xlsx::write(&wb, left)?;
     Ok(Converted {
         xlsx,
         warnings: wb.warnings,

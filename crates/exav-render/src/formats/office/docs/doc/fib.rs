@@ -1,7 +1,7 @@
 //! The file information block and the text it locates: the piece table
 //! ([MS-DOC] 2.5, 2.9.38).
 
-use crate::formats::office::common::bytes::{u16_at, u32_at, Cur};
+use crate::formats::office::common::bytes::{Cur, u16_at, u32_at};
 use crate::formats::office::docs::error::{Error, Result};
 
 pub struct Fib {
@@ -141,11 +141,7 @@ pub struct Piece {
 
 impl Piece {
     pub fn unit(&self) -> u32 {
-        if self.compressed {
-            1
-        } else {
-            2
-        }
+        if self.compressed { 1 } else { 2 }
     }
 
     pub fn fc_of(&self, cp: u32) -> u32 {
@@ -179,7 +175,7 @@ pub fn read_clx(tbl: &[u8], off: usize, len: usize) -> Result<Clx> {
             _ => {
                 return Err(Error::Malformed(
                     "no piece table in the table stream".into(),
-                ))
+                ));
             }
         }
         if c.short {

@@ -404,10 +404,10 @@ pub fn decode_any(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     }
     // A cursor is read as the icon file it is laid out as.
     #[cfg(feature = "ico")]
-    if data.starts_with(&[0, 0, 2, 0]) {
-        if let Some(icon) = ico_view::cursor_as_icon(data) {
-            return decode_any(&icon, max_alloc);
-        }
+    if data.starts_with(&[0, 0, 2, 0])
+        && let Some(icon) = ico_view::cursor_as_icon(data)
+    {
+        return decode_any(&icon, max_alloc);
     }
     // BigTIFF has a magic of its own, which only the viewer reads.
     let bigtiff = data.starts_with(b"II+\0") || data.starts_with(b"MM\0+");

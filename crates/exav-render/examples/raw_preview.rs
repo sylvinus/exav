@@ -7,8 +7,8 @@
 
 use std::time::Instant;
 
-use exav_render::image::raw;
 use exav_render::image::DECODE_MAX;
+use exav_render::image::raw;
 
 fn main() {
     let mut args = std::env::args().skip(1).peekable();

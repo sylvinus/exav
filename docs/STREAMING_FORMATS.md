@@ -4,9 +4,21 @@ exav optimises for memory, not bandwidth. `walk` hands a format's members over
 straight off the seekable source, each decoded as it is read, so peak memory is
 one member's window rather than the whole decoded object. Most containers
 already work that way (every arm of `dispatch` in `stream.rs` but the last),
-including tar, zip, 7z, cab, lz4, `.Z`, DMG, the virtual disks and the NTFS,
-FAT and partition readers; the rest are read whole (`read_whole`). Two of those
-matter, for different reasons, and only one of them is worth changing.
+including tar, zip, 7z, WIM, xar, cab, lz4, `.Z`, DMG, the virtual disks and the
+filesystem and partition readers; the rest are read whole (`read_whole`). What
+is left of those is in [BACKLOG.md](BACKLOG.md), with the reason for each.
+
+**7z, WIM and xar** read their header, their directory tree or their table of
+contents from where it is in the source, and each member from its place in it,
+through `source::Reader`. A 7z folder's packed bytes are a `Read` under its
+coder chain, and its members are read in order, the ones before the one wanted
+decoded and dropped, which is charged to the scan budget before it is done. A
+WIM resource is a `ResourceReader` that decodes a chunk at a time; an xar
+member is a zlib reader over its range of the heap. What is still held is
+named in each: a 7z folder with an encrypted coder or with several packed
+streams (BCJ2) is decoded whole under the buffer limit, a 7z's header and a
+WIM's directory tree are held under it, and an xar's table of contents under
+64 MiB.
 
 **Disks: done.** A disk is read as a `Read + Seek`, and the filesystem and
 partition readers take one, so a file comes out of a disk without the disk being
@@ -29,32 +41,33 @@ held.
   is charged to the scan budget, and a read that would pass what is left of it
   fails: an image that lands the filesystem walker on a different compressed unit
   for every small read stops there.
-- *NTFS, FAT.* Read in place over a `Read + Seek` (`ntfs.rs` follows the MFT
-  record by record through `$MFT`'s own runs; `fat.rs` lets `fatfs` seek). A
-  raw image over the buffer limit is walked, not refused.
+- *The filesystems.* Read in place over a `Read + Seek`: `ntfs.rs` follows the
+  MFT record by record through `$MFT`'s own runs; `fat.rs`, `exfat.rs`,
+  `ext.rs`, `hfsplus.rs`, `apfs.rs`, `squashfs.rs`, `cramfs.rs`, `romfs.rs` and
+  `erofs.rs` read the directories and then each file by its clusters, extents
+  or blocks (`vol.rs` is what they read through). A raw image over the buffer
+  limit is walked, not refused. A file within the buffer limit is read into
+  memory; a longer one is a `Got::Stream`, a `Read` over the file's stretches
+  (`Pieces`, a list of where on the volume each is, or a block reader for the
+  compressed ones) that the walk hands over as a streamed member, so the scan
+  puts it in a spill file as it does a ZIP member. A stretch the volume does not
+  give ends the stream with an error after the bytes before it; a hole reads as
+  zeros. A file stored compressed by the filesystem (decmpfs, LZNT1, EROFS) is
+  not read as it goes.
 - *Partitions.* `partition::stream_offsets` already took a `Read + Seek`.
 
 A disk that fits the buffer limit is still handed over as one member, so its raw
 bytes are scanned and typed one level down. A larger one is walked in place
 (`formats/volumes.rs`): the filesystem that starts it, or the volumes of its
 partition table. A volume that fits the limit is streamed whole, as a partition
-of a raw disk always was; a larger one that holds an NTFS or FAT filesystem is
+of a raw disk always was; a larger one that holds a filesystem exav reads is
 walked in place, and each file comes out under the partition's name. A larger
-one that is neither is streamed from a raw file, where those bytes are the input,
+one that is not is streamed from a raw file, where those bytes are the input,
 and reported from a virtual disk, where the size is only what a header declares
 and reading it could be a long walk through zeros. The bytes before the first
-partition (the boot code) come out as `<boot-area>`, up to 1 MiB. Each file is
-still returned whole, so a file is bounded by the peak-buffer limit.
+partition (the boot code) come out as `<boot-area>`, up to 1 MiB.
 
-**ext is the exception.** `ext4-view` takes a `Box<dyn Ext4Read>`, which is
-`'static`: the reader cannot borrow the disk it reads, so the volume is copied
-into memory once. The copy is the volume, not the disk around it, and a volume
-over the buffer limit is reported. Reading it in place would take a copy of the
-crate with a lifetime added to every type that holds the reader.
-
-Not covered: HFS+ and APFS inside a VHD, VHDX, QCOW2 or VMDK (the volume is
-streamed or reported, as any filesystem exav does not read in place); a
-partition table inside a partition; differencing VHD and VHDX and QCOW2 with a
+Not covered: a partition table inside a partition; differencing VHD and VHDX and QCOW2 with a
 backing file, which are reported because the parent is not in the file.
 
 **RAR: real work, deliberately not rushed.** `rar3_unpack.rs` and

@@ -95,7 +95,7 @@ pub(super) fn read_head<R: BufRead>(r: &mut R, max: usize) -> io::Result<Option<
                         io::ErrorKind::UnexpectedEof,
                         "connection closed inside an ICAP head",
                     ))
-                }
+                };
             }
         };
         let blank = line == b"\r\n" || line == b"\n";

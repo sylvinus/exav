@@ -458,12 +458,10 @@ fn table_borders(o: &mut String, name: &str, b: &TableBorders, cell: bool) {
 
 pub fn table_props(o: &mut String, t: &TableProps, with_style: bool) {
     let mut b = String::new();
-    if with_style {
-        if let Some(s) = &t.style {
-            b.push_str("<w:tblStyle");
-            attr(&mut b, "w:val", s);
-            b.push_str("/>");
-        }
+    if with_style && let Some(s) = &t.style {
+        b.push_str("<w:tblStyle");
+        attr(&mut b, "w:val", s);
+        b.push_str("/>");
     }
     if let Some(f) = &t.float {
         b.push_str("<w:tblpPr");

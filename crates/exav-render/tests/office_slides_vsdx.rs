@@ -2,8 +2,8 @@
 //! is, in the pages' largest size; shapes with their geometry, formats and
 //! text; masters, styles and themes resolved.
 
-use exav_render::formats::office::test_util::{build_cfb, PackageWriter};
-use exav_render::slides::{convert, convert_first, convert_first_from, Error, Format, Limits};
+use exav_render::formats::office::test_util::{PackageWriter, build_cfb};
+use exav_render::slides::{Error, Format, Limits, convert, convert_first, convert_first_from};
 use std::io::{Cursor, Read};
 
 const NS: &str = "xmlns='http://schemas.microsoft.com/office/visio/2012/main' xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'";
@@ -360,7 +360,9 @@ fn master_package(instance: &str) -> Vec<u8> {
         ),
         (
             "visio/pages/pages.xml",
-            format!("<Pages {NS}><Page ID='0' Name='P'><PageSheet><Cell N='PageWidth' V='6'/><Cell N='PageHeight' V='4'/></PageSheet><Rel r:id='rId1'/></Page></Pages>"),
+            format!(
+                "<Pages {NS}><Page ID='0' Name='P'><PageSheet><Cell N='PageWidth' V='6'/><Cell N='PageHeight' V='4'/></PageSheet><Rel r:id='rId1'/></Page></Pages>"
+            ),
         ),
         (
             "visio/pages/_rels/pages.xml.rels",
@@ -469,8 +471,7 @@ fn text_has_runs_paragraphs_and_a_block_where_the_cells_put_it() {
 
 #[test]
 fn what_is_hidden_deleted_or_a_guide_is_left_out() {
-    let layers =
-        "<Section N='Layer'><Row IX='0'><Cell N='Name' V='A'/><Cell N='Visible' V='1'/></Row>\
+    let layers = "<Section N='Layer'><Row IX='0'><Cell N='Name' V='A'/><Cell N='Visible' V='1'/></Row>\
                   <Row IX='1'><Cell N='Name' V='B'/><Cell N='Visible' V='0'/></Row></Section>";
     let shapes = [
         boxed(1, 1.0, 1.0, 1.0, 1.0, &(cell("LayerMember", "0") + "<Text>shown</Text>")),

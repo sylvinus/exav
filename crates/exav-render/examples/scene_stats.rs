@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 
 use exav_render::cad::EntityKind;
 use exav_render::dwg::{
-    Document, Drawing, Tessellator, FILL_BYTES, STROKE_BYTES, TEXT_RECORD_BYTES,
+    Document, Drawing, FILL_BYTES, STROKE_BYTES, TEXT_RECORD_BYTES, Tessellator,
 };
 
 /// Cells per side of the occupancy grids.

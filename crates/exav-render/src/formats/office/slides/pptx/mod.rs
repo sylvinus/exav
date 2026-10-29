@@ -8,37 +8,13 @@ mod draw;
 mod text;
 pub(crate) mod xml;
 
+use crate::formats::office::common::package::{Lift, Out};
 use crate::formats::office::slides::error::{Error, Result};
 use crate::formats::office::slides::model::*;
 use draw::{Ctx, Rels};
 use std::fmt::Write as _;
-use std::io::{Cursor, Seek, SeekFrom, Write};
-use xml::{esc, hex, ns_decl, XML_HEAD};
-
-/// The output, refused past `limit` bytes.
-struct Out {
-    buf: Cursor<Vec<u8>>,
-    limit: u64,
-}
-
-impl Write for Out {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        if self.buf.position() + b.len() as u64 > self.limit {
-            return Err(std::io::Error::other("output too large"));
-        }
-        self.buf.write(b)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Seek for Out {
-    fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
-        self.buf.seek(p)
-    }
-}
+use std::io::Write;
+use xml::{XML_HEAD, esc, hex, ns_decl};
 
 fn zip_err(e: impl std::fmt::Display) -> Error {
     let s = e.to_string();
@@ -50,6 +26,8 @@ fn zip_err(e: impl std::fmt::Display) -> Error {
 }
 
 struct Package {
+    // Dropped first: see `Lift`.
+    _lift: Lift,
     z: zip::ZipWriter<Out>,
 }
 
@@ -100,11 +78,10 @@ pub(crate) fn write(p: &mut Presentation, limit: u64) -> Result<Vec<u8>> {
     // buffer is not grown to twice its size on the way.
     let media: u64 = data.iter().flatten().map(|d| d.len() as u64).sum();
     let guess = media + (64 << 10) + p.slides.len() as u64 * (8 << 10);
+    let (out, lift) = Out::new(guess.min(limit) as usize, limit);
     let mut pkg = Package {
-        z: zip::ZipWriter::new(Out {
-            buf: Cursor::new(Vec::with_capacity(guess.min(limit) as usize)),
-            limit,
-        }),
+        _lift: lift,
+        z: zip::ZipWriter::new(out),
     };
     let width = p.width.clamp(914_400, 51_206_400);
     let height = p.height.clamp(914_400, 51_206_400);
@@ -128,7 +105,9 @@ pub(crate) fn write(p: &mut Presentation, limit: u64) -> Result<Vec<u8>> {
         .collect();
 
     // [Content_Types].xml
-    let mut ct = format!("{XML_HEAD}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/>");
+    let mut ct = format!(
+        "{XML_HEAD}<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+    );
     let mut exts: Vec<&str> = p.media.iter().map(|m| m.ext).collect();
     exts.sort_unstable();
     exts.dedup();
@@ -408,8 +387,9 @@ pub(crate) fn write(p: &mut Presentation, limit: u64) -> Result<Vec<u8>> {
         charts_done = put_charts(&mut pkg, &ctx)?;
     }
 
+    pkg._lift.lift();
     let out = pkg.z.finish().map_err(zip_err)?;
-    Ok(out.buf.into_inner())
+    Ok(out.into_inner())
 }
 
 /// Writes the pictures of `used` not yet written, dropping their bytes.

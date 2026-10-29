@@ -1,7 +1,7 @@
 //! The stylesheet ([MS-DOC] 2.9.271): style definitions as their raw
 //! modifier lists.
 
-use crate::formats::office::common::bytes::{u16_at, Cur};
+use crate::formats::office::common::bytes::{Cur, u16_at};
 
 pub struct Std {
     pub name: String,

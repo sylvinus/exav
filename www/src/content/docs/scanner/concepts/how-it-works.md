@@ -264,13 +264,11 @@ least as much) rules most objects out first.
 </svg>
 </div>
 
-Neither the sweep nor a check has a window to fall out of. The sweep reads the
-object once, in order, and looks up the few positions before a seam from the
-bytes on both sides of it, so an anchor split across a seam is found without
-re-reading the chunk. A check
-asks for the bytes it needs at their offset, before or after the hit, from
-memory or, past `--max-object-bytes`, from the
-[block cache](/scanner/concepts/streaming-memory/#past-it-through-a-block-cache).
+The sweep reads the object once, in order, and looks up the few positions before
+a seam from the bytes on both sides of it, so an anchor split across a seam is
+found without re-reading the chunk. A check asks for the bytes it needs at their
+offset, before or after the hit, from memory or, past `--max-object-bytes`, from
+the [block cache](/scanner/concepts/streaming-memory/#past-it-through-a-block-cache).
 
 Over an object not held in memory, regular expressions (PCRE subsignatures,
 YARA strings) run as lazy DFAs stepped through it, forward to find where a match

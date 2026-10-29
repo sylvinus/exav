@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use cad_common::fixture;
 use exav_render::cad::{Drawing, EntityKind, ProxyItem};
-use exav_render::dwg::{Document, Tessellator, FILL_EDGE};
+use exav_render::dwg::{Document, FILL_EDGE, Tessellator};
 
 /// make.py's CASES, in order, then the record of the class's own type.
 const CASES: [&str; 18] = [

@@ -35,10 +35,10 @@ pub fn fill(t: &Tree, n: usize) -> Fill {
     }
     let fg = color(t, n, "FillForegnd", "FillForegndTrans");
     let bg = color(t, n, "FillBkgnd", "FillBkgndTrans");
-    if t.num(n, "FillGradientEnabled") == Some(1.0) {
-        if let Some(g) = gradient(t, n) {
-            return Fill::Gradient(g);
-        }
+    if t.num(n, "FillGradientEnabled") == Some(1.0)
+        && let Some(g) = gradient(t, n)
+    {
+        return Fill::Gradient(g);
     }
     match pattern {
         1 => Fill::Solid(fg),
@@ -257,7 +257,7 @@ pub fn has_effects(t: &Tree, n: usize) -> bool {
 mod tests {
     use super::*;
     use crate::formats::office::slides::limits::{Budget, Limits};
-    use crate::formats::office::slides::vsdx::resolve::{tests::shapes, Doc, Master};
+    use crate::formats::office::slides::vsdx::resolve::{Doc, Master, tests::shapes};
     use std::collections::HashMap;
 
     fn with<R>(styles: &str, shape: &str, f: impl Fn(&Tree, usize) -> R) -> R {
@@ -304,7 +304,11 @@ mod tests {
         // Without a pattern cell there is no fill, and a themed one is solid.
         assert_eq!(with("", "<Shape ID='1'/>", fill), Fill::None);
         assert_eq!(
-            with("", "<Shape ID='1'><Cell N='FillPattern' V='Themed'/><Cell N='FillForegnd' V='2'/></Shape>", fill),
+            with(
+                "",
+                "<Shape ID='1'><Cell N='FillPattern' V='Themed'/><Cell N='FillForegnd' V='2'/></Shape>",
+                fill
+            ),
             Fill::Solid(Color::rgb(0xFF0000))
         );
     }

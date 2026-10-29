@@ -17,7 +17,10 @@ use libfuzzer_sys::fuzz_target;
 mod slides_check;
 
 fuzz_target!(|data: &[u8]| {
-    let doc = if data.starts_with(b"PK") || data.first() == Some(&b'<') || data.starts_with(&[0x1F, 0x8B]) {
+    let doc = if data.starts_with(b"PK")
+        || data.first() == Some(&b'<')
+        || data.starts_with(&[0x1F, 0x8B])
+    {
         data.to_vec()
     } else {
         let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));

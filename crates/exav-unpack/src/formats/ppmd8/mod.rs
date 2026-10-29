@@ -12,8 +12,8 @@ mod model;
 
 use std::io::{self, Read};
 
-use crate::formats::ppmd7::{RarRangeDecoder, SYM_END};
 use crate::LimitHit;
+use crate::formats::ppmd7::{RarRangeDecoder, SYM_END};
 pub(crate) use model::Ppmd8;
 
 pub(crate) const PPMD8_MIN_ORDER: u32 = 2;

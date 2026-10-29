@@ -1,7 +1,7 @@
 //! B-spline surfaces (`IfcBSplineSurfaceWithKnots`, and the rational one):
 //! evaluation at a parameter pair, and the parameter pair nearest a point.
 
-use super::math::{add, dot, len, scale, sub, V3};
+use super::math::{V3, add, dot, len, scale, sub};
 
 /// Highest degree read.
 pub const MAX_DEGREE: usize = 16;
@@ -39,7 +39,7 @@ pub fn expand_knots(mults: &[usize], values: &[f64], n: usize, p: usize) -> Opti
         .zip(mults)
         .flat_map(|(k, &m)| std::iter::repeat_n(*k, m))
         .collect();
-    (u.len() > n + p && u.iter().all(|k| k.is_finite()) && u.windows(2).all(|w| w[1] >= w[0]))
+    (u.len() > n + p && u.iter().all(|k| k.is_finite()) && u.array_windows().all(|[a, b]| b >= a))
         .then_some(u)
 }
 
@@ -101,13 +101,12 @@ impl Spline {
         if ku.len() <= nu + du || kv.len() <= nv + dv {
             return None;
         }
-        if let Some(w) = &weights {
-            if w.len() != nu
+        if let Some(w) = &weights
+            && (w.len() != nu
                 || w.iter()
-                    .any(|r| r.len() != nv || r.iter().any(|x| x.is_nan() || *x <= 0.0))
-            {
-                return None;
-            }
+                    .any(|r| r.len() != nv || r.iter().any(|x| x.is_nan() || *x <= 0.0)))
+        {
+            return None;
         }
         let (u, v) = ((ku[du], ku[nu]), (kv[dv], kv[nv]));
         if !(u.1 > u.0 && v.1 > v.0 && u.1.is_finite() && v.1.is_finite()) {

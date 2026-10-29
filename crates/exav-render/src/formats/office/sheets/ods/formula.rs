@@ -278,15 +278,15 @@ impl Converter {
                 return out;
             }
             out += &quote_sheet(s);
-            if let Some((Some(s2), _)) = conv.get(1) {
-                if s2 != s {
-                    // Sheet1:Sheet3!A1, quoted whole when either name needs it.
-                    out = if quote_sheet(s) == *s && quote_sheet(s2) == *s2 {
-                        format!("{s}:{s2}")
-                    } else {
-                        format!("'{}:{}'", s.replace('\'', "''"), s2.replace('\'', "''"))
-                    };
-                }
+            if let Some((Some(s2), _)) = conv.get(1)
+                && s2 != s
+            {
+                // Sheet1:Sheet3!A1, quoted whole when either name needs it.
+                out = if quote_sheet(s) == *s && quote_sheet(s2) == *s2 {
+                    format!("{s}:{s2}")
+                } else {
+                    format!("'{}:{}'", s.replace('\'', "''"), s2.replace('\'', "''"))
+                };
             }
             out.push('!');
         }

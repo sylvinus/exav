@@ -1,12 +1,13 @@
 //! A worksheet substream's records to a sheet of the model.
 
-use super::formula::{self, ExtSheet5};
+use super::formula;
 use super::stream::{self, Rec};
-use super::{cf, chart, escher, rich_value, Globals, SplitReader};
-use crate::formats::office::common::bytes::{u16_at, Cur};
+use super::{Globals, SplitReader, cf, chart, escher, rich_value};
+use crate::formats::office::common::bytes::{Cur, u16_at};
 use crate::formats::office::sheets::error::Result;
 use crate::formats::office::sheets::limits::Budget;
 use crate::formats::office::sheets::model::*;
+use exav_unpack::biff::ExtSheet5;
 use std::collections::HashMap;
 
 /// A shared, array or table formula, by the cell its range starts at.
@@ -66,11 +67,7 @@ pub(crate) fn rk(v: u32) -> f64 {
     } else {
         f64::from_bits(u64::from(v & 0xFFFF_FFFC) << 32)
     };
-    if v & 1 != 0 {
-        x / 100.0
-    } else {
-        x
-    }
+    if v & 1 != 0 { x / 100.0 } else { x }
 }
 
 /// Reads the sheet; returns whether it has filter buttons (AUTOFILTERINFO),
@@ -82,7 +79,7 @@ pub(crate) fn read_sheet(
     recs: &[Rec],
     sheet: &mut Sheet,
 ) -> Result<bool> {
-    let ver = g.ver;
+    let ver = g.book.ver;
     // Shared and array formulas first: a cell's PtgExp may come before.
     let mut shared: HashMap<(u32, u32), Shared> = HashMap::new();
     let mut ext5: Vec<ExtSheet5> = vec![];
@@ -127,13 +124,14 @@ pub(crate) fn read_sheet(
                 }
             }
             0x0017 if depth == 1 && ver <= 5 => {
-                let e = g.ext_sheet5(&r.data);
+                let e = g.book.ext_sheet5(&r.data);
                 ext5.push(e);
             }
             0x0023 if depth == 1 && ver <= 5 => {
                 let mut c = Cur::at(&r.data, 6);
                 let n = c.u8() as usize;
-                let name = crate::formats::office::common::codepage::decode(c.bytes(n), g.codepage);
+                let name =
+                    crate::formats::office::common::codepage::decode(c.bytes(n), g.book.codepage);
                 if let Some(ExtSheet5::Names(v)) = ext5.last_mut() {
                     v.push(name);
                 }
@@ -270,7 +268,7 @@ pub(crate) fn read_sheet(
                 let col = c.u16() as u32;
                 let s = cell_style!();
                 let text = if ver == 2 {
-                    g.string(&mut c, 1)
+                    g.book.string(&mut c, 1)
                 } else if ver >= 8 {
                     let mut sr = SplitReader {
                         d: &r.data,
@@ -283,7 +281,7 @@ pub(crate) fn read_sheet(
                     c.p = sr.p;
                     t
                 } else {
-                    g.string(&mut c, 2)
+                    g.book.string(&mut c, 2)
                 };
                 let value = if r.id == 0x00D6 {
                     let n = if ver >= 8 {
@@ -396,11 +394,10 @@ pub(crate) fn read_sheet(
                     b.copy_from_slice(&res);
                     Value::Number(f64::from_le_bytes(b))
                 };
-                let ctx = g.ctx(&ext5);
+                let ctx = g.book.ctx(&ext5);
                 let mut f = None;
                 match formula::decode(&ctx, &rgce, &extra, row, col) {
-                    Ok(d) if d.exp.is_some() => {
-                        let (ar, ac) = d.exp.unwrap_or_default();
+                    Ok(d) if let Some((ar, ac)) = d.exp => {
                         // The record at the cell the token names, else one whose
                         // range holds the cell (some writers start it elsewhere).
                         let found = shared.get(&(ar, ac)).or_else(|| {
@@ -414,13 +411,12 @@ pub(crate) fn read_sheet(
                         });
                         if let Some(sh) = found {
                             if sh.array {
-                                if (row, col) == (sh.range.r1, sh.range.c1) {
-                                    if let Ok(dd) =
+                                if (row, col) == (sh.range.r1, sh.range.c1)
+                                    && let Ok(dd) =
                                         formula::decode(&ctx, &sh.rgce, &sh.extra, row, col)
-                                    {
-                                        f = Some(dd.text);
-                                        sheet.arrays.insert((row, col), sh.range);
-                                    }
+                                {
+                                    f = Some(dd.text);
+                                    sheet.arrays.insert((row, col), sh.range);
                                 }
                             } else if let Ok(dd) =
                                 formula::decode(&ctx, &sh.rgce, &sh.extra, row, col)
@@ -448,7 +444,7 @@ pub(crate) fn read_sheet(
             0x0207 | 0x0007 => {
                 if let Some(at) = pending_string.take() {
                     let s = if ver == 2 {
-                        g.string(&mut c, 1)
+                        g.book.string(&mut c, 1)
                     } else if ver >= 8 {
                         let mut sr = SplitReader {
                             d: &r.data,
@@ -459,7 +455,7 @@ pub(crate) fn read_sheet(
                         let f = sr.u8();
                         sr.chars(n, f & 1 != 0)
                     } else {
-                        g.string(&mut c, 2)
+                        g.book.string(&mut c, 2)
                     };
                     budget.alloc(s.len() as u64)?;
                     if let Some(cell) = sheet.cells.get_mut(&at) {
@@ -650,10 +646,10 @@ pub(crate) fn read_sheet(
             0x0012 => sheet.protected = c.u16() != 0,
             0x009D => has_autofilter = true,
             0x01B8 => {
-                if let Some(h) = read_hlink(&r.data) {
-                    if sheet.hyperlinks.len() < 1 << 16 {
-                        sheet.hyperlinks.push(h);
-                    }
+                if let Some(h) = read_hlink(&r.data)
+                    && sheet.hyperlinks.len() < 1 << 16
+                {
+                    sheet.hyperlinks.push(h);
                 }
             }
             0x0800 => {
@@ -723,19 +719,19 @@ pub(crate) fn read_sheet(
                 if ver >= 8 {
                     let flags = c.u16();
                     let id = c.u16();
-                    let author = g.string(&mut c, 2);
+                    let author = g.book.string(&mut c, 2);
                     notes.push((row, col, Some(id), author, flags & 2 != 0));
                 } else {
                     let n = c.u16() as usize;
                     let text = crate::formats::office::common::codepage::decode(
                         c.bytes(n.min(2048)),
-                        g.codepage,
+                        g.book.codepage,
                     );
                     if row == 0xFFFF {
-                        if let Some(last) = notes.last_mut() {
-                            if last.3.len() < 1 << 20 {
-                                last.3.push_str(&text);
-                            }
+                        if let Some(last) = notes.last_mut()
+                            && last.3.len() < 1 << 20
+                        {
+                            last.3.push_str(&text);
                         }
                     } else if notes.len() < 1 << 16 {
                         notes.push((row, col, None, text, false));
@@ -748,15 +744,15 @@ pub(crate) fn read_sheet(
                 }
             }
             0x01B1 | 0x087A | 0x087B => {
-                let ctx = g.ctx(&ext5);
+                let ctx = g.book.ctx(&ext5);
                 cf::rule(g, &ctx, r, &mut cfs);
             }
             0x01BE => {
-                let ctx = g.ctx(&ext5);
-                if let Some(v) = cf::validation(&ctx, &r.data, &r.breaks) {
-                    if sheet.validations.len() < 1 << 16 {
-                        sheet.validations.push(v);
-                    }
+                let ctx = g.book.ctx(&ext5);
+                if let Some(v) = cf::validation(&ctx, &r.data, &r.breaks)
+                    && sheet.validations.len() < 1 << 16
+                {
+                    sheet.validations.push(v);
                 }
             }
             _ => {}
@@ -786,12 +782,12 @@ pub(crate) fn read_sheet(
     row_styles(sheet, budget)?;
     for cell in sheet.cells.values_mut() {
         // A first run without a font has the cell's.
-        if let Value::Rich(runs) = &cell.value {
-            if runs.first().is_some_and(|r| r.font.is_none()) {
-                let mut v: Vec<Run> = runs.to_vec();
-                v[0].font = Some(wb.styles.get(cell.style).font.clone());
-                cell.value = Value::Rich(v.into());
-            }
+        if let Value::Rich(runs) = &cell.value
+            && runs.first().is_some_and(|r| r.font.is_none())
+        {
+            let mut v: Vec<Run> = runs.to_vec();
+            v[0].font = Some(wb.styles.get(cell.style).font.clone());
+            cell.value = Value::Rich(v.into());
         }
     }
     let shapes = if drawing.is_empty() {
@@ -802,12 +798,12 @@ pub(crate) fn read_sheet(
     escher::place(g, wb, sheet, budget, &shapes, &objs, recs)?;
     for o in &objs {
         // BIFF5 charts, anchored by their OBJ record.
-        if ver < 8 && o.kind == 5 {
-            if let (Some((a, b)), Some(anchor)) = (o.chart, o.anchor) {
-                if let Some(ch) = chart::read_chart(g, &recs[a..b], Some(anchor), wb) {
-                    sheet.charts.push(ch);
-                }
-            }
+        if ver < 8
+            && o.kind == 5
+            && let (Some((a, b)), Some(anchor)) = (o.chart, o.anchor)
+            && let Some(ch) = chart::read_chart(g, &recs[a..b], Some(anchor), wb)
+        {
+            sheet.charts.push(ch);
         }
     }
     Ok(has_autofilter)

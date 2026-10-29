@@ -49,6 +49,10 @@ pub struct W<'a> {
     pub parts: Vec<HfPart>,
     /// The part being written is a note or a comment: no section breaks.
     pub depth: u32,
+    /// What one part's XML may take in memory before it is deflated.
+    pub limit: u64,
+    /// A part's XML grew past `limit`: what is left is not written.
+    pub over: bool,
 }
 
 const NS_DECL: &str = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:wpg=\"http://schemas.microsoft.com/office/word/2010/wordprocessingGroup\"";
@@ -61,12 +65,14 @@ pub fn root(name: &str) -> String {
 }
 
 impl<'a> W<'a> {
-    pub fn new(doc: &'a Document) -> W<'a> {
+    pub fn new(doc: &'a Document, limit: u64) -> W<'a> {
         W {
             doc,
             next_id: 1,
             parts: vec![],
             depth: 0,
+            limit,
+            over: false,
         }
     }
 
@@ -75,6 +81,12 @@ impl<'a> W<'a> {
             match b {
                 Block::Para(p) => self.para(o, p, rels),
                 Block::Table(t) => self.table(o, t, rels),
+            }
+            // The XML of a part is held whole before it is deflated, and it
+            // is what the model's text and runs become with their markup.
+            if o.len() as u64 > self.limit {
+                self.over = true;
+                return;
             }
         }
     }
@@ -471,7 +483,13 @@ impl<'a> W<'a> {
         let _ = write!(
             o,
             "/><w:pgMar w:top=\"{}\" w:right=\"{}\" w:bottom=\"{}\" w:left=\"{}\" w:header=\"{}\" w:footer=\"{}\" w:gutter=\"{}\"/>",
-            s.top, s.right, s.bottom, s.left, s.header.max(0), s.footer.max(0), s.gutter.max(0)
+            s.top,
+            s.right,
+            s.bottom,
+            s.left,
+            s.header.max(0),
+            s.footer.max(0),
+            s.gutter.max(0)
         );
         if !s.page_borders.is_empty() {
             o.push_str("<w:pgBorders>");
@@ -573,6 +591,31 @@ mod tests {
         assert!(
             !body.contains("<w:tbl>") && body.contains("<w:p>"),
             "{body}"
+        );
+    }
+
+    /// The XML of the body is held whole before it is deflated, so a body that
+    /// deflates to nothing still counts at its own size.
+    #[test]
+    fn a_body_that_deflates_small_is_still_refused_at_its_size() {
+        let para = |text: &str| {
+            Block::Para(Para {
+                content: vec![Inline::Run(Run::text(RunProps::default(), text))],
+                ..Para::default()
+            })
+        };
+        let long = "a".repeat(1000);
+        let doc = Document {
+            body: (0..1000).map(|_| para(&long)).collect(),
+            ..Document::default()
+        };
+        // About a megabyte of XML, a few kilobytes deflated.
+        assert!(crate::formats::office::docs::docx::write(&doc, 2 << 20).is_ok());
+        assert_eq!(
+            crate::formats::office::docs::docx::write(&doc, 100 << 10),
+            Err(crate::formats::office::docs::error::Error::TooLarge(
+                "memory"
+            ))
         );
     }
 }

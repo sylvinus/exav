@@ -33,8 +33,33 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+/// The counters are the process's: one test measures at a time.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn an_entity_takes_what_the_limits_count() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut dxf = String::from("  0\nSECTION\n  2\nENTITIES\n");
+    for _ in 0..100_000 {
+        dxf.push_str("  0\nLINE\n 10\n0\n 20\n0\n 11\n1\n 21\n1\n");
+    }
+    dxf.push_str("  0\nENDSEC\n  0\nEOF\n");
+    let before = NOW.load(Ordering::Relaxed);
+    let drawing = exav_render::cad::read_dxf(dxf.as_bytes()).unwrap();
+    let held = NOW.load(Ordering::Relaxed) - before;
+    // The allocator rounds each of an entity's strings up to a grain of its
+    // own, which the counter does not see.
+    let per_entity = held as u64 / 100_000 + 3 * 24;
+    assert!(
+        per_entity <= exav_render::cad::ENTITY_BYTES,
+        "{per_entity} bytes per entity held"
+    );
+    drop(drawing);
+}
+
 #[test]
 fn tessellating_takes_no_copy_of_the_scene() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut dxf = String::from("  0\nSECTION\n  2\nENTITIES\n");
     for i in 0..100_000 {
         let (x, y) = ((i % 1000) as f64, (i / 1000) as f64);

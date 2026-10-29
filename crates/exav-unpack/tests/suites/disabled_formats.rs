@@ -10,7 +10,7 @@
 //! come back clean — the one outcome exav refuses.
 #![cfg(not(feature = "all-formats"))]
 
-use exav_unpack::{detect, extract, Budget, Limits};
+use exav_unpack::{Budget, Limits, detect, extract};
 
 /// `(what it is, a blob that sniffs as it)`. Magic only — enough for `detect`,
 /// not a valid archive, which is deliberate: recognition must not need a

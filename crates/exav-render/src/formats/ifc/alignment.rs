@@ -16,9 +16,9 @@
 use std::f64::consts::TAU;
 
 use super::curves::segments;
-use super::math::{add, cross, len, scale, sub, unit, Xf, V3};
+use super::math::{V3, Xf, add, cross, len, scale, sub, unit};
 use super::step::Value;
-use super::{first_proj_axis, is, Reader, MAX_DEPTH};
+use super::{MAX_DEPTH, Reader, first_proj_axis, is};
 
 /// Most points one segment or curve may have.
 const MAX_POINTS: usize = 1 << 16;
@@ -276,7 +276,7 @@ impl<'a> Reader<'a> {
         }
         let profile = self.curve_segments(p.first()?.list()?)?;
         // The profile runs in (distance along, height).
-        if profile.windows(2).any(|w| w[1].1[0] < w[0].1[0]) {
+        if profile.array_windows().any(|[a, b]| b.1[0] < a.1[0]) {
             return None;
         }
         let plan = self.stations(p.get(2)?.id()?, depth + 1)?;

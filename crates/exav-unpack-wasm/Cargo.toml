@@ -2,7 +2,7 @@
 [package]
 name = "exav-unpack-wasm"
 version = "0.0.2"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
 rust-version = "1.95"
@@ -122,9 +122,7 @@ wasm-opt = [
 [dependencies]
 exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false }
 wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-flate2 = "1"
 web-sys = { version = "0.3", features = [
     "Blob",
     "BlobPropertyBag",

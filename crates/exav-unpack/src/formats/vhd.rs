@@ -32,7 +32,7 @@
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
-use super::vdisk::{self, be32, bytes_at, Layout, Map, VDisk};
+use super::vdisk::{self, Layout, Map, VDisk, be32, bytes_at};
 use super::volumes::report;
 use crate::source::ByteSource;
 use crate::stream::Visit;
@@ -71,10 +71,9 @@ fn footer(src: &dyn ByteSource) -> Option<Vec<u8>> {
     if let Some(tail) = len
         .checked_sub(FOOTER_LEN)
         .and_then(|at| bytes_at(src, at, FOOTER_LEN as usize))
+        && tail.starts_with(FOOTER_COOKIE)
     {
-        if tail.starts_with(FOOTER_COOKIE) {
-            return Some(tail.into_owned());
-        }
+        return Some(tail.into_owned());
     }
     let head = bytes_at(src, 0, FOOTER_LEN as usize)?;
     head.starts_with(FOOTER_COOKIE).then(|| head.into_owned())

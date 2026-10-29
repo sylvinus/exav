@@ -3,7 +3,7 @@
 //! its links are judged, and one whose text cannot be taken out is never
 //! reported clean.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
 const DOC: &[u8] = include_bytes!("../../../exav-render/tests/fixtures/office/docs/sample.doc");
 const XLS: &[u8] = include_bytes!("../../../exav-render/tests/fixtures/office/sheets/sample.xls");

@@ -1,6 +1,6 @@
 //! List styles as numbering definitions.
 
-use super::{props, Odt};
+use super::{Odt, props};
 use crate::formats::office::common::odf::{self, ListDef, Props};
 use crate::formats::office::docs::model::*;
 
@@ -171,12 +171,11 @@ impl Odt<'_> {
     /// The instance of list style `style` for a list that starts here.
     pub(crate) fn list_num(&mut self, style: &str, continue_: bool, restart: bool) -> Option<u32> {
         let abs = self.abstract_of(style)?;
-        if continue_ || restart {
-            if let Some(n) = self.last_num.get(style) {
-                if !restart {
-                    return Some(*n);
-                }
-            }
+        if (continue_ || restart)
+            && let Some(n) = self.last_num.get(style)
+            && !restart
+        {
+            return Some(*n);
         }
         let id = self.doc.numbering.nums.len() as u32 + 1;
         let seen = self.last_num.contains_key(style);

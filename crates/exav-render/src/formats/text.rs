@@ -26,9 +26,6 @@ use super::dwg::mtext_lines;
 use super::markdown;
 pub use super::markdown::Visible;
 
-/// Layers, blocks and entities read of a drawing.
-const MAX_ENTITIES: usize = 1 << 20;
-
 /// A Markdown file is known by its name, and by being text.
 fn is_markdown(name: &str, head: &[u8]) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -79,7 +76,7 @@ pub fn visible_text(
             unreadable: None,
         });
     }
-    if let Some(v) = drawing(data, head, cap) {
+    if let Some(v) = drawing(data, head, cap, limits) {
         return Some(v);
     }
     #[cfg(feature = "text-office")]
@@ -92,7 +89,7 @@ pub fn visible_text(
 /// formats and iWork's, read by exav-render's `sheets`, `slides` and `docs`.
 #[cfg(feature = "text-office")]
 fn office(name: &str, data: &[u8], cap: usize, limits: &exav_unpack::Limits) -> Option<Visible> {
-    use super::office::visible::{read, Read};
+    use super::office::visible::{Read, read};
     Some(match read(name, data, cap, limits)? {
         Read::Text(t) => Visible {
             text: t.text,
@@ -111,18 +108,34 @@ fn office(name: &str, data: &[u8], cap: usize, limits: &exav_unpack::Limits) -> 
     })
 }
 
-fn drawing(data: &[u8], head: &[u8], cap: usize) -> Option<Visible> {
-    let limits = cad::Limits {
-        max_entities: MAX_ENTITIES,
-        ..cad::Limits::default()
-    };
-    let drawing = if cad::looks_like_dwg(head) {
-        cad::read_dwg_with(data, &limits).ok()?
+/// A drawing's text; the drawing may take what the caller's `limits` allow
+/// of memory, and the text is `truncated` when it did not fit.
+fn drawing(data: &[u8], head: &[u8], cap: usize, limits: &exav_unpack::Limits) -> Option<Visible> {
+    let within = cad::limits_within(limits.max_buffer_bytes);
+    let read = if cad::looks_like_dwg(head) {
+        cad::read_dwg_with(data, &within)
     } else if cad::looks_like_dxf(head) {
-        cad::read_dxf_with(data, &limits).ok()?
+        cad::read_dxf_with(data, &within)
     } else {
         return None;
     };
+    let drawing = match read {
+        Ok(d) => d,
+        Err(cad::Error::LimitExceeded(why)) => {
+            return Some(Visible {
+                text: String::new(),
+                truncated: false,
+                links: Vec::new(),
+                sections: Vec::new(),
+                unreadable: Some(format!("too-large: {why}")),
+            });
+        }
+        Err(_) => return None,
+    };
+    let cut = drawing
+        .warnings
+        .iter()
+        .any(|w| w.kind == cad::WarningKind::LimitReached);
     let mut lines = Lines {
         text: String::new(),
         cap,
@@ -131,7 +144,7 @@ fn drawing(data: &[u8], head: &[u8], cap: usize) -> Option<Visible> {
     drawing_lines(&drawing, &mut lines);
     Some(Visible {
         text: lines.text,
-        truncated: lines.truncated,
+        truncated: lines.truncated || cut,
         links: Vec::new(),
         sections: Vec::new(),
         unreadable: None,

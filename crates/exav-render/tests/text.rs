@@ -84,6 +84,30 @@ fn the_text_of_a_drawing_is_cut_at_the_cap() {
 }
 
 #[test]
+fn a_drawing_is_read_within_the_memory_the_caller_allows() {
+    let mut dxf = String::from("  0\nSECTION\n  2\nENTITIES\n");
+    for _ in 0..1000 {
+        dxf.push_str("  0\nLINE\n 10\n0\n 20\n0\n 11\n1\n 21\n1\n");
+    }
+    dxf.push_str("  0\nTEXT\n  1\nafter the lines\n 10\n0\n 20\n0\n  0\nENDSEC\n  0\nEOF\n");
+    let mut limits = Limits::default();
+    let v = visible_text("a.dxf", dxf.as_bytes(), 1 << 20, &limits).unwrap();
+    assert!(v.text.contains("after the lines") && !v.truncated);
+    // Room for fewer entities than the drawing has: the text found is kept,
+    // and the scan is told it is not all there.
+    limits.max_buffer_bytes = 100 * exav_render::cad::ENTITY_BYTES;
+    let v = visible_text("a.dxf", dxf.as_bytes(), 1 << 20, &limits).unwrap();
+    assert!(!v.text.contains("after the lines") && v.truncated);
+
+    // A DWG whose sections expand past it is unreadable, not empty.
+    let dwg = common::fixture("dwg/R2018/all.dwg").expect("fixture");
+    limits.max_buffer_bytes = 1 << 10;
+    let v = visible_text("a.dwg", &dwg, 1 << 20, &limits).unwrap();
+    assert!(v.text.is_empty());
+    assert!(v.unreadable.is_some_and(|w| w.starts_with("too-large")));
+}
+
+#[test]
 fn damaged_drawings_and_documents_do_not_panic() {
     let dxf = common::fixture("ascii/R2018/all.dxf").expect("fixture");
     let dwg = common::fixture("dwg/R2018/all.dwg").expect("fixture");

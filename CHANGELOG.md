@@ -8,6 +8,60 @@ follow [semantic versioning](https://semver.org/).
 
 ### Added
 
+- **`--listen-health ADDR`: a listener that answers while the workers are busy.**
+  Under the pool a `PING` waits for a free worker, so a health check timed out
+  on a daemon that was only busy and had it restarted. The health listener
+  speaks the protocol of its scheme and does nothing else: `clamd://` answers
+  `PING`, `VERSION` and `STATS`, `icap://` answers `OPTIONS` (`REQMOD` and
+  `RESPMOD` get 405). A child process of its own serves it under the pool,
+  threads otherwise; `exav --ping` probes it when the configuration names one.
+- **`STATS` is the pool's.** The counters were statics in each process, so under
+  the pool `STATS` reported the one worker that happened to answer, and ICAP's
+  child counted apart. They are in memory shared by the processes of the pool
+  now, `STATS` from any of them (the health listener included) is the pool's
+  totals, and a worker killed mid-scan does not leave the in-flight gauge too
+  high.
+- **`--max-extracted-bytes` is back, and `--max-bytecode-memory-bytes` is new.** The
+  total of the members that a scan decodes whole (1G, 400M under
+  `--clamav-compat`) had no setting since 0.0.2 took the flag away, and
+  `--max-process-bytes` could only lower it. Members that are streamed (ZIP,
+  7z, TAR, CAB, the stream codecs) are not in it: 1.5 GB archives of these scan
+  past it. `off` or `0` removes either limit; `--max-process-bytes` still
+  lowers both to what fits the memory a scan gets.
+- **`--object-cache-bytes`, `--object-cache-block-bytes` and `--http-request-bytes`.**
+  The block cache an object past `--max-object-bytes` is read through, and the
+  requests of an `http(s)://` source, had sizes fixed in the code (64 KiB blocks,
+  8 MiB held, requests of 64 KiB growing to 8 MiB). They are settings now, and
+  the block is 1 MiB by default: against a 300 MB object with a server that
+  waits 100 ms for each request, 1M blocks took 48 s where 64K took 113 s, and
+  4M took no less while fetching twice the bytes. A scan with `--max-process-bytes`
+  lowers the cache and the request to an eighth of its memory each. The
+  [block cache](https://exav.org/scanner/concepts/streaming-memory/#the-block-cache)
+  page has the model and the measurements.
+- **Sweeps for oversized and deeply nested input.** Each is deterministic and
+  reproduces by a name and a position:
+  - `saturate` (`exav-unpack`, `exav-render`): every length and count of every
+    fixture set in turn to `0xFFFFFFFF` and `0x7FFFFFFF`, and the file read; none
+    may hold more than a few times the file (resident memory, so a request never
+    touched costs nothing), take seconds or panic. `EXAV_DEBUG_SATURATE=full`
+    takes more positions and values, `deep` the first 64 KB of the fixtures up to
+    256 KB, where the tables of the file systems are.
+  - `nesting` (`exav-unpack`, `exav-core`, `exav-render`): MIME parts, RTF
+    groups, PDF objects, XDP elements, HTML and XML parts, every signature
+    database kind, YARA sources, script and markup, ODF, Word 2003 XML,
+    SpreadsheetML, Visio, glTF, IFC and DXF, nested as deep as 200 KB of input
+    makes them, on a stack of 256 to 512 KB.
+  - `office_memory` (`exav-render`): what each converter allocates, against
+    what its memory limit says, for each kind of unit.
+- **`exav-grep` searches in bounded memory.** A file is no longer read whole
+  past 16 MiB: a container is walked through a block cache, and anything else
+  is searched a megabyte at a time. A 3.4 GB log was searched with an 18 MB
+  peak, and a 1.5 GB stored member of a ZIP with 280 MB. A file over
+  `--max-object-bytes` used to be reported unreadable, and a member over it
+  ended the walk. A member over it is now searched as it is read; a container
+  inside one, and a line longer than the limit, are reported unreadable.
+- **A speed benchmark against `clamscan`** (`scripts/bench-speed.sh`): one
+  process each over the same files and signatures, with a warm cache.
 - **A file can be shown with the files around it.** `ViewerFile.tree` (a
   `FileTree`: the file's path, the paths of the others, and `open(path)`) is
   what a host gives a file that was opened with others: the demo does it for
@@ -55,7 +109,7 @@ follow [semantic versioning](https://semver.org/).
   toggle) from `@exav/viewer/react`.
 - **`session.replace` works in the sandboxed frame**, so zoom and place are
   kept when a host swaps a document, for PDF and images.
-- **A format registry** (`formats/registry.json`, 117 formats) from which the
+- **A format registry** (`formats/registry.json`, 126 formats) from which the
   format matrix page and the viewer summary are generated, and which
   `make test-formats` and the viewer's and the scanner's tests check against
   the extractor's formats, the scanner's file types and the viewer's matchers.
@@ -64,11 +118,54 @@ follow [semantic versioning](https://semver.org/).
   read through a `Read + Seek` that reads the container's tables as the walk
   reaches them and keeps only a 32 MiB cache of decoded units, so a disk of any
   declared size costs what it holds. A disk over the buffer limit is walked
-  through its partitions and its NTFS and FAT files come out one at a time; a
-  smaller one is still one member. What a disk decodes is counted against the
-  scan budget. NTFS and FAT are read in place too, and a raw NTFS or FAT image
-  or partition over the limit is walked instead of refused or streamed whole.
-  ext is still copied into memory, as its volume only.
+  through its partitions and the files of its filesystems come out one at a
+  time; a smaller one is still one member. What a disk decodes is counted
+  against the scan budget. The filesystems are read in place too, and a raw
+  image or a partition of one over the limit is walked instead of refused or
+  streamed whole.
+- **Six more filesystems are walked: exFAT, SquashFS, cramfs, romfs, EROFS**
+  (and the ext2/3/4 and FAT readers are rewritten, below). Each is a format of
+  its own (a file of one is typed and opened) and a filesystem in a disk or a
+  partition. SquashFS has both byte orders and all six compressions (gzip,
+  LZMA, LZO, XZ, LZ4, Zstandard) and reads sparse blocks and fragments; cramfs
+  has both byte orders, the padding for boot code, holes and extended block
+  pointers; exFAT follows the chain of a fragmented file and reads zeros past
+  the valid length of a file as the system that mounts it does; EROFS reads
+  files stored plain, with their tail after the inode, and in chunks with holes
+  (a compressed file is reported). A symbolic link and a device node, which
+  hold no file's bytes, are not members. The `squashfs`, `cramfs`, `romfs`,
+  `erofs` and `exfat` features are in `all-formats`.
+- **HFS+ and APFS volumes in a disk or a partition are walked** like the other
+  filesystems, where they were only read inside a DMG.
+- **A file past `--max-object-bytes` comes out of a disk image or a filesystem**
+  instead of being reported `UNSCANNABLE` and skipped. Every reader (FAT, exFAT,
+  NTFS, ext, SquashFS, cramfs, romfs, EROFS, HFS+, APFS, and so a disk, a
+  partition and a DMG) hands such a file over as a stream read from where the
+  volume has it, and the scan puts it in a spill file as it does a ZIP member
+  (a 20 GB VM disk with a 1 GB file in it is scanned in full, not partial). A
+  stretch the volume does not give ends the stream with an error after the
+  bytes before it. A file stored compressed by the filesystem (decmpfs, LZNT1)
+  is still decoded whole, and reported past the limit, as an EROFS compressed
+  file is at any size. A HFS+ or APFS file over the limit no longer ends the
+  walk with a limit; it is read like the rest.
+- **7z, WIM and xar are read from where they lie on a seekable source**, not
+  held: a 7z archive, a WIM image or a xar package over `--max-object-bytes`
+  (a Windows install image, a macOS installer, a large 7z) was
+  `LIMITS-EXCEEDED` with its members not reached, and is now opened and
+  scanned member by member. A 7z reads its header from the end and each
+  folder's packed bytes as its members are read; a WIM decodes a resource a
+  chunk at a time; a xar inflates a member from its place in the heap. A 7z
+  member far into a solid folder, past the buffer limit, is read where it
+  was reported unreachable, the members before it counted against the scan
+  budget as they are decoded and dropped. A WIM resource that fails its SHA-1
+  with checksums verified now ends its stream with an error, not a report in
+  place of the file. A xar whose table of contents is cut short is
+  `UNSCANNABLE`, where it was a limit. A container found damaged where its
+  source failed to give it is reported with the source's error.
+- **Two fuzz targets.** `fsimage` walks hostile ext, exFAT, SquashFS, cramfs,
+  romfs, EROFS, 7z, WIM and xar images and partitioned disks holding them, from
+  memory and through a block cache, which must agree; `lzo` drives the LZO
+  decoder.
 - **3D model pictures and viewport.** IFC, STL, OBJ, PLY and glTF expose
   `controllers.pictures` (one page) and `controllers.viewport`. A picture is
   redrawn from the geometry by an off-screen renderer at the requested size, in
@@ -375,20 +472,94 @@ follow [semantic versioning](https://semver.org/).
     character and paragraph formatting of the style sheet and of `style`
     attributes. A link is kept only when it goes to a web, mail, phone or FTP
     address or to a place in the page: a script, a data address and a path on
-    the author's computer are text. It uses the HTML tokenizer and style sheets
-    of the spreadsheet converter, so `office-docs` now needs `office-sheets`.
+    the author's computer are text. It reads with `exav_unpack::html` and the
+    style sheets the spreadsheet converter shares (`common::css`).
     About 6% of the files that were refused as "not a document" in a sweep of
     17,000 `.doc` files were this.
+- **`maxEntities`, an option of the DWG and DXF viewer** (default 1,000,000,
+  about 512 MiB of the module's memory): past it the rest of the drawing is
+  left out and the "too large to show whole" warning is shown. Before,
+  `maxDecompressedBytes` bound a DWG's sections and the entities were bound at
+  8,000,000 (4 GB), which a small hostile file can declare. Entities dropped at
+  a reader's limit were not reported by the viewer at all; they count as
+  `scene_truncated` now. `parseDrawing` and `attachXref` of the module take
+  the option as an argument.
 
 ### Changed
 
+- **Rust edition 2024** in every crate (the workspace, the viewer and
+  unpack-wasm modules, the fuzz crates and the table generators), resolver 3,
+  rustfmt's 2024 style. The code uses what the 1.95 floor has: let chains
+  (nested `if` and `if let` collapsed by clippy), `if let` in match guards,
+  `array_windows` and `Vec::push_mut`. The minimum Rust version is unchanged.
+- **One reader per format, shared by the scanner and the converters** (see
+  `docs/ARCHITECTURE.md`). The scanner and `exav-render` each parsed the
+  formats they both read, so that what one saw, the other could see otherwise.
+  Three readers are now public modules of `exav-unpack`, and `exav-render`'s
+  converters read with them:
+  - **`exav_unpack::cfb`, the OLE2 compound file reader.** There were three:
+    the `cfb` crate (strict, then a fallback of the scanner's when it
+    refused a file), the scanner's lenient one, and the converters' own.
+    One lenient reader, bounded by the file and by a cap per stream, now
+    serves the scanner and every converter (DOC, XLS, PPT, VSDX, text
+    views). The `cfb` crate is only a dev-dependency, the writer and strict
+    reader the tests check the new one against. A stream past the cap is
+    reported the way it was for a clean file. Members of a compound file
+    come in the order of its directory.
+  - **`exav_unpack::offcrypto`, the decryption of Excel workbooks with a
+    password** (RC4, RC4 CryptoAPI, XOR obfuscation), written twice (the
+    scanner's and the XLS converter's). The scanner's passwords and the
+    converter's default one are tried by the one implementation, which
+    decrypts in place instead of holding three copies of the stream, and
+    which the real-file reference vectors of both pass. A key size past 128
+    bits is refused as a method not had, where the scanner cut it.
+    `exav-render` no longer depends on `md-5` and `sha1`.
+  - **`exav_unpack::rtf`, the RTF tokenizer.** The scanner found embedded
+    objects with a scan of its own for backslashes; it reads with the
+    converter's lexer now, so a control word, a group or a hex digit is the
+    same thing to both. An `\objdata` ends at its own closing brace whatever
+    groups open inside it.
+  - **`exav_unpack::biff`, the records, workbook tables and formulas of
+    Excel 2 to 2003.** The scanner (to name the `EXEC` and `CALL` of an Excel
+    4.0 macro sheet) and the XLS converter each had a table of the function
+    ids, 765 and 373 entries that agreed on the 368 they shared, and each
+    read the formula tokens: the scanner's walker wrote them in postfix
+    order and stopped at the first token it did not know, the converter's
+    wrote Excel's formula text. There is one reader now: the record stream
+    (CONTINUE joined, read as it is asked for), the sheets, names and
+    external references formulas refer to, and the tokens, with the argument
+    counts. The converter writes a macro command by its name (`ALERT`,
+    `OPEN`), where it wrote `CMD` and the number. The `xlm_macro` member of a
+    scan holds the formulas as Excel shows them (`=ALERT("x")`, `=HALT()`)
+    where it held `"x" ALERT HALT`, the macro-sheet names, the defined names
+    with what they refer to (`_xlnm.Auto_Open=Macro1!$A$1`) and the text
+    cells; a formula with a token the reader cannot read still gives the
+    calls and strings before it. A formula is written once per operand, not
+    once per operator above it, so a chain of thousands of operators costs
+    its text.
+  - **`exav_unpack::html`, HTML as tokens, and a page's bytes as text.** The
+    scanner's text view read HTML with html5gum, and the spreadsheet and text
+    document converters with a tokenizer of their own (and a table of HTML
+    4's character references). Both read the tokens of html5gum now, so an
+    entity, a `<script>` or a `<style>` is the same thing to each, and a
+    token is charged to the converter's budget as it is made. A page names
+    its encoding with a `<meta>` for the text view too, which it ignored. The
+    text document converter no longer reaches into the spreadsheet one:
+    style sheets are `common::css`.
+  - **`exav_unpack::charset`, text in a Windows code page number** (BIFF, fonts),
+    with its tables, which were exav-render's.
+  `exav-render`'s office features now depend on `exav-unpack` (features `ole`,
+  `html`, `offcrypto`, `rtf`); `exav-unpack`'s `ole` feature no longer pulls the
+  `cfb` crate and does pull `encoding_rs`. `exav_unpack::bytes::Cur`, the
+  bounds-checked little-endian cursor, is public. The viewer's document module
+  now includes html5gum.
 - **Dependencies are at their latest versions**, except the image decoders
   pinned to the versions libclamav 1.5.4 links (`image`, `png`, `gif`,
   `zune-jpeg`, `fax`, `weezl`), which `exav-imagehash` needs for ClamAV's hash.
   Notable: `quick-xml` 0.42, `hfsplus` and `apfs` 0.4, `cfb` 0.15,
   `lzma-rust2` 0.23, `sevenz-rust2` 0.24, `delharc` 0.8 (which also reads
   PMarc LHA archives), `base64` 0.23, `bit-set` 0.11, `yara-x-parser` 1.19;
-  and for the viewer and docs, Vite 8, vitest 5, jsdom 30 and Playwright 1.64.
+  and for the viewer and docs, Vite 8, vitest 5, jsdom 30 and Playwright 1.61 (the viewer) and 1.64 (exav-unpack-wasm).
   This clears three RustSec advisories (`ctutils`, `rustls-webpki`,
   `webpki-roots`).
 - **The minimum Rust version is 1.95** (it was 1.92), which `delharc` 0.8
@@ -402,7 +573,7 @@ follow [semantic versioning](https://semver.org/).
   fails part way keeps the bytes before the failure and is reported. An
   InstallShield Z member that stops short or fails part way keeps its decoded
   start and is reported, where it used to come out as whole or be dropped.
-- The sandboxed frame's protocol is version 5 (it was 4): `draw` and `drawn`
+- The sandboxed frame's protocol is version 5 (it was 3): `draw` and `drawn`
   became `raster` and `rastered`, `replace` and `replaced` are new, and each
   `read` names its document. `MAX_PICTURE_EDGE` is 16,384 (was 4,096) with a
   new `MAX_PICTURE_PIXELS`, and the `pictures` store holds `{ count, space }`.
@@ -461,11 +632,184 @@ follow [semantic versioning](https://semver.org/).
   exav never checked; and `goblin` without the parsers exav does not use. A
   default build has 8 crates fewer, and 1,155 fewer `unsafe` uses in the code it
   links (plus 807 in `zerocopy`'s derive macro).
+- **HFS+ and APFS are read in-tree**, as NTFS is, in place of `hfsplus`, `apfs`
+  and `cmpfs` (and `lzvn-core` with them): the catalog is read once for the
+  paths, and each file for its bytes. A file macOS compressed (decmpfs) is
+  unpacked from its attribute or its resource fork on both; on HFS+ one
+  compressed into its resource fork was only reported. Every volume of an APFS
+  container is walked, under its name when there are several, and an encrypted
+  one is reported. A file with a resource fork has its data fork read as well as
+  the fork reported. A file the volume holds only part of comes out with what
+  there is, reported; a hole reads as zeros. The catalog of a volume with more
+  entries than `max_members` is walked to that limit.
+- **ext2/3/4 and FAT are read in-tree** in place of `ext4-view` and `fatfs`
+  (and `bitflags` 1.x, `crc` and `crc-catalog` with them), and are read where
+  they lie, as NTFS is: the whole volume is no longer copied into memory to
+  walk an ext one (a volume over the buffer limit was reported unread). ext
+  follows extents and block maps through the third level, inline data, meta
+  block groups, 64-bit descriptors and bigalloc; a preallocated extent reads as
+  zeros. FAT reads long names only when their checksum is their short name's,
+  with the case flags and CP437 of short names. A file in an encrypted ext
+  directory is reported as encrypted. Names no longer begin with `/`. A file
+  over the per-member budget is reported and the walk goes on, as before; a
+  damaged volume ends with an error after the files before the damage, where
+  it was one reported member. A volume with more entries than `max_members` is
+  walked to that limit.
+- **Checksums of APFS are checked only when asked,** as every format's are: a
+  wrong one no longer ends the walk of a tree, and the newest superblock whose
+  checksum holds is the one used.
 
 ### Fixed
 
-- **Four findings of an adversarial review of the disk-image and unpacker
-  changes**, each reproduced first and fixed with a test:
+- **A message attached to an email was never scanned.** The email reader took
+  the text and binary parts of the top message and skipped the parts that are
+  messages themselves (`message/rfc822`, a forwarded mail), so an attachment of
+  a forwarded message read as clean. The parts of attached messages are members
+  now (`email-part-3-0` is part 0 of the message that is part 3), to 64 levels,
+  and a chain deeper is reported unreadable. The parsed message is also taken
+  apart without recursion: 40,000 messages in one another (a 1.4 MB file)
+  overflowed the stack when the parser's result was dropped.
+- **An HFS+ volume whose catalog loops walked to the end of the catalog's
+  declared size.** The leaves of the catalog are a chain, and a chain that
+  returns to a leaf it has been through was ended only by the number of nodes
+  the catalog fork says it holds: on a 19 KB disk image in a DMG that is 1 s,
+  and 21 s under the fuzzer's sanitizer (the `timeout` of an 8-hour run), and a
+  fork declaring 2^62 bytes would not end. A leaf met again is damage now
+  (Brent's cycle check: no memory, and a loop is found within a few steps of
+  where it starts).
+- **Converting an ODT of many footnotes took time quadratic in their number.**
+  Each note looked for its own place among all the notes before it, from the
+  first: 160,000 footnotes took 5 s and 300,000 took 18 s, against 1 s and 2 s
+  now. Some 90 other kinds of unit in the flat and text formats of the document,
+  sheet and slide converters (runs, rows, cells, shapes, styles, comments,
+  links, images, fields, tracked changes) were measured at 5,000 and 20,000 and
+  scale linearly; the `scaling` test of `exav-render` holds footnotes to that.
+- **The phishing check missed an anchor with a tab, a line break or a form feed
+  after `<a`.** It looked for `<a` and a space, so `<a\thref=…>`, which every
+  browser renders as the same link, was clean to the scan of the raw bytes, and
+  under `--clamav-compat`, which has no second pass over the document's links,
+  clean outright. Space, tab, line feed, form feed and carriage return are the
+  white space of HTML5 after a tag name, and all five find the anchor.
+- **A brand under a two-label suffix was every other brand under it.** The
+  registered domain was the last two labels, so `barclays.co.uk` and
+  `secure-barclays-login.co.uk` were both `co.uk`: no `.co.uk`, `.com.au`,
+  `.co.jp` or `.com.br` page could spoof another, and the brands of the
+  `.pdb` list under such a suffix (`smile.co.uk`) were stored as the suffix and
+  never consulted. A country code preceded by one of `co`, `com`, `org`, `net`,
+  `gov`, `ac`, `ne`, `or` and the like now takes three labels. It is not the
+  whole public suffix list (thousands of entries such as `city.kawasaki.jp`).
+- **A YARA rule with a long chain of operators aborted the process.** `not not
+  not ...`, `1 << 1 << 1 ...`, `a contains b contains c ...`, a chain of `==`,
+  `|`, `-` and `+` mixed, or `pe.sections[pe.sections[...` recursed once per
+  operator in the parser and in what is built from it: 20,000 of them (40 KB of
+  rule) overflowed a 2 MiB stack. A condition may chain 256 operators between
+  `and`, `or`, commas and parentheses (a parenthesis counts as one operand of the
+  chain it is in), and nest 12 deep; a rule past that is refused before it is
+  parsed.
+- **A Visio formula of signs aborted the process.** `-----...1` recursed once
+  per sign, and the steps counter it is bounded by was not counted for them;
+  200,000 signs overflowed a 256 KB stack. The signs are read in a loop.
+- **The slide readers took 28 to 40 KB of stack for each level of nested
+  shapes.** A text body held the nine outline levels inline (6 KB), so the
+  functions that build a shape (ODP and ODG groups, Visio sub-shapes, PPT and
+  Keynote groups) had frames of 28 to 40 KB, and 32 nested groups needed
+  1 MB. The levels were never filled by any reader, and are a list that is
+  empty until one is: a frame is under 8 KB, and the whole nesting the parser
+  admits fits 256 KB. A shape is 0.7 KB in the model and in the memory limit's
+  count, where it was 7 KB, so the same limit admits ten times the shapes. Nested `text:section`s of an ODT, bounded by
+  nothing but the parser's 256 levels (3 KB each), stop at 24 as lists do.
+- **A ZIP or an XZ file inside itself took 750 KB and 550 KB of stack for 15
+  levels.** The walk of a ZIP held a `ZipFile` (its decoders are inline, 40 KB)
+  for as long as a member was scanned, and an XZ reader its decoder tables
+  (30 KB). Both are out of the frame now, and 200 levels (`--max-unpack-depth
+  255`) scan on a 2 MiB stack, where 120 aborted on 8 MiB.
+  `make stack-frames` reads the frames of the functions that recurse into
+  nested input from release builds and fails on one over 16 KiB.
+- **A PPMd header could take its whole memory size at once.** The model of
+  7z, RAR and ZIP PPMd streams zero-filled its arena as it was made, so a
+  header declaring 4 GiB made the process touch 4 GiB before the first byte
+  was decoded. The arena is made of zeroed pages that are touched as they are
+  used.
+- **The document, sheet and slide converters keep to the memory limit they are
+  given.** The limit is an estimate of what the converter's model takes, and
+  for text it was off: a paragraph's runs, the XML parts held before they are
+  compressed and the charts of a sheet were not counted, so an RTF of one long
+  paragraph of runs or a workbook of charts took several times the limit. Each
+  is counted at the point it is made, the output is bounded by what is left of
+  the limit, and `crates/exav-render/tests/office_memory.rs` measures what a
+  converter allocates against what its limit says, for each kind of unit
+  (paragraph, cell, shape, chart series, table cell).
+- **A bytecode program could take the host's memory three ways, and its CPU a
+  fourth.** The frames of the calls in progress (each up to 16 MiB, 64 deep, so
+  a gigabyte), the allocations of `malloc` (each under 128 MiB, none freed) and
+  the globals (a zero initializer is two bytes of signature for up to 16.7
+  million components, each made as 9 bytes at the start of every run: 1,000
+  of them were a 5 KB signature and an OOM kill) were bounded one by one or not
+  at all. One budget now holds the three, `--max-bytecode-memory-bytes` (256M by
+  default; `Limits::max_bytecode_memory_bytes`): globals are made when the program
+  first reads them, and a run that reaches the budget stops as incomplete.
+  `get_environment` and the other calls that fill memory stored it a byte at a
+  time and counted one step for the call, so 100 calls of 16 MB took 0.8 s and
+  a loop of them took years inside the step limit; they copy in one piece now
+  and cost a step for each 16 bytes (the 268-byte signature of the report ends
+  in 0.7 s).
+- **A JPEG XL file could take far more than the budget.** Its pixel count was
+  limited but not its extra channels, each a float a pixel: the pixels allowed
+  are now what the budget divides by the bytes a pixel takes with the channels
+  allowed (two). The decoder still sizes the buffers of a frame's sections from
+  the lengths of its table of contents before reading them (a file declaring
+  one section of a gigabyte takes it); it is listed in `docs/BACKLOG.md`.
+- **`exav-grep` printed a match inside the trailing context of another as
+  context.** With `-A`, a matching line within the lines after a match came out
+  as a context line (`-`) and not as a match (`:`).
+- **The memory of an XML tree is counted by what the tree takes.** The
+  converters of Word 2003 XML, ODT, FODT, ODP, FODP, FODG, Visio, Keynote,
+  ODS, FODS, SpreadsheetML 2003 and Numbers '08/'09 counted the tree of a
+  document as at most four times its bytes (not at all for Word 2003 XML and
+  ODT), but a tree takes at least 170 bytes an element whatever the element's
+  size, so four bytes of `<a/>` cost forty times that. A file of 1,000,000 paragraphs
+  (36 MB) used 1.5 GB and one of 1,000,000 cells (2 MB, `.numbers`) used 800 MB
+  before any limit applied. The parser now tells the budget the memory of
+  each element and text as it builds them, and the two XML trees of the
+  converters (`common/xml.rs` and `sheets/ods/dom.rs`) are one.
+- **A drawing in the scanner's text view is read within the caller's memory
+  limit.** The text of a DXF or DWG was read with the module's defaults (a
+  million entities, 1 GiB of decompressed sections), whatever `max_buffer_bytes`
+  the scan had: a 16 MB DXF took 555 MB, and a DWG of 66 KB whose sections
+  repeat one page took 485 MB. The limits come from `max_buffer_bytes` now
+  (`cad::limits_within`, 512 bytes an entity), a drawing past them says its
+  text was cut (the scan is marked incomplete), and one whose sections expand
+  past them is reported unreadable instead of silently empty.
+- **Six findings of an adversarial review of the disk-image, unpacker and
+  office changes**, each reproduced first and fixed with a test:
+  - **The memory bound of the document and presentation converters counts what
+    the model takes.** A table cell was counted as 192 bytes and a paragraph
+    as 256, a shape as 512, and they take about 5 kB, 2.7 kB and 13 kB of memory
+    in all: an RTF of 1,000,000 cells (24 MB) or an ODP of 300,000 text boxes
+    (76 KB) was inside every limit and used 5 GB and 2.4 GB (killed, or a tab
+    crashed in the viewer) instead of being refused with `TooLarge("memory")`. The counts
+    follow the size of the model's types now, so a document is refused at about
+    1 GiB of what it takes (the cell sample stops at 1 GB of memory). The
+    workbook converters count 96 bytes for the 48 a cell takes and were left.
+  - **Checking the formatting of styled empty ODS cells is bounded.** Each row
+    of a sheet whose empty cells are repeated across its width checks every
+    column (16,384) for what it shows, uncharged: 16 sheets of 1,023 such rows
+    took 7.2 s, and the 4,096 sheets allowed would take 30 minutes. The columns
+    checked add up to 2^26 in a workbook (about 2 s); past that the formatting of
+    the area is left out, with the warning that already says so.
+  - **The runs of an NTFS file are bounded over all its extents.** Each record
+    of an attribute list could add thousands of runs and a list names tens of
+    thousands of records, so a 64 MiB image could make a file of 20 million
+    runs (about 500 MB). A file past a million runs is reported as not read
+    whole.
+  - **Web pages read as spreadsheets or documents no longer cost the product of
+    their style rules and elements.** Each element looked through every rule
+    (up to 65,536), and a rule with an `mso-style-parent` looked through them
+    all again: a 3 MB page of 200,000 rules and 20,000 elements took 186 s. The
+    rules are found by selector, and the declarations a page's elements are
+    given add up to 2^24 at most (about 1 s). Each `<script>`, `<style>` or
+    `<iframe>` also copied the rest of the page in lower case to find its end
+    tag: 200,000 of them took 15 s.
   - **An NTFS file's attribute list no longer costs a record read per entry.**
     `data_extents` read a full MFT record (up to 1 MiB) and applied its fix-ups
     for every entry of the list, and `name_from_extensions` did the same for
@@ -494,6 +838,24 @@ follow [semantic versioning](https://semver.org/).
     as an `encrypted.7z` member whatever the password. Each coder decodes to its
     own size now, as the members' do. (The one fixture with a header that had no
     compressed layer worked.)
+- **A 7z header with many properties over many files took quadratic time.**
+  The entries with no stream were counted again for every property: a 400 KB
+  header of 200,000 files and 200,000 properties took 24 s. They are counted
+  once, when the property that sets them is read.
+- **An RPM whose entries share their scripts no longer builds a member for
+  each.** 65,535 entries pointing at one array of 4,096 strings made 268
+  million members before the member bound was looked at, and a 1 MB file
+  aborted the process for lack of memory. The scripts listed are bounded at
+  4,096, and the rest is reported.
+- **An ELF header with a table offset at the top of the 64-bit range no longer
+  panics.** `e_phoff` or `e_shoff` near `u64::MAX` overflowed an addition in the
+  layout read for `Target:6` signatures, so a 120-byte file made the scan an
+  error where the signatures should have been applied.
+- **`exav` builds again without `all-formats`** (`--no-default-features
+  --features yara,zip`, the slim build the documentation describes):
+  `analyze_split_sets` is there, and joins nothing, when no archive format is.
+  The docs site builds with Starlight's current configuration (`description`,
+  for the `tagline` it no longer accepts).
 - **`exav-render` builds with `--features image` alone again** (`within` was
   compiled only with `jp2` or `jbig2`), and an uncompressed Targa that starts
   `00 00 02 00` (no ID, no colour map) is no longer taken for a cursor file with
@@ -864,12 +1226,6 @@ Found by an 8-hour fuzzing run:
 
 Found by fuzzing the virtual disk walker and the Office readers:
 
-- **A FAT directory or file at cluster 1 no longer ends the walk of the whole
-  volume.** The `fatfs` crate subtracts 2 from a cluster number it takes from
-  the volume without looking at it, so a directory entry or a chain naming
-  cluster 1 made it panic, and the panic was caught at the walk's boundary as
-  an undecodable volume, losing every other file. It now ends only that
-  directory or file, which is reported.
 - **A PowerPoint 95 bullet size of 4,294,968 percent or more no longer panics.**
   The size is dropped when it is not from 25 to 400, but the product was taken
   first, and overflowed: a panic in a build that checks overflow.

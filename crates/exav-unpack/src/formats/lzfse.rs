@@ -70,21 +70,18 @@ enum Stop {
 /// Decode `input` up to `cap` bytes, salvaging what came out before an
 /// error, as [`crate::salvage`] reports a reader's.
 pub(crate) fn decode(input: &[u8], cap: u64) -> Salvaged {
-    let limit = usize::try_from(cap).unwrap_or(usize::MAX).saturating_add(1);
-    let mut out = Out {
-        buf: Vec::new(),
-        limit,
-    };
+    let mut out = Out::new(cap);
     let stop = run(input, &mut out);
-    let mut data = out.buf;
-    let over_cap = data.len() > limit - 1;
-    data.truncate(limit - 1);
-    Salvaged {
-        data,
-        over_cap,
-        undecoded: matches!(stop, Some(Stop::Invalid)),
-        cut_short: matches!(stop, Some(Stop::Truncated)),
-    }
+    out.finish(stop)
+}
+
+/// [`decode`] of a bare LZVN stream, as macOS stores a compressed file's
+/// blocks (`formats/decmpfs`): the opcodes of a `bvxn` block's payload, up to
+/// its end-of-stream opcode, with no block header.
+pub(crate) fn decode_lzvn(input: &[u8], cap: u64) -> Salvaged {
+    let mut out = Out::new(cap);
+    let stop = lzvn(input, &mut out).err();
+    out.finish(stop)
 }
 
 /// The output, which LZVN and LZFSE matches reach back into across blocks.
@@ -94,6 +91,27 @@ struct Out {
 }
 
 impl Out {
+    /// An output of at most `cap` bytes (one more is held, to see the cap passed).
+    fn new(cap: u64) -> Self {
+        Out {
+            buf: Vec::new(),
+            limit: usize::try_from(cap).unwrap_or(usize::MAX).saturating_add(1),
+        }
+    }
+
+    fn finish(self, stop: Option<Stop>) -> Salvaged {
+        let kept = self.limit - 1;
+        let over_cap = self.buf.len() > kept;
+        let mut data = self.buf;
+        data.truncate(kept);
+        Salvaged {
+            data,
+            over_cap,
+            undecoded: matches!(stop, Some(Stop::Invalid)),
+            cut_short: matches!(stop, Some(Stop::Truncated)),
+        }
+    }
+
     fn literal(&mut self, bytes: &[u8]) -> Result<(), Stop> {
         let room = self.limit - self.buf.len();
         self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
@@ -278,7 +296,7 @@ fn lzvn(src: &[u8], out: &mut Out) -> Result<usize, Stop> {
                 return match left >= 8 {
                     true => Ok(i + 8),
                     false => Err(Stop::Truncated),
-                }
+                };
             }
             Op::Undefined => return Err(Stop::Invalid),
             Op::Nop => {
@@ -665,7 +683,7 @@ impl<'a> Stream<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use super::{decode, decode_lzvn};
 
     fn encode(data: &[u8]) -> Vec<u8> {
         let mut enc = Vec::new();
@@ -843,6 +861,23 @@ mod tests {
         let s = decode(&stream, u64::MAX);
         assert!(!s.undecoded && !s.cut_short);
         assert_eq!(s.data, want);
+    }
+
+    /// The payload of the block above is a bare LZVN stream, as decmpfs
+    /// stores one.
+    #[test]
+    fn a_bare_lzvn_stream_decodes() {
+        let (stream, want) = every_lzvn_opcode();
+        let bare = &stream[12..stream.len() - 4];
+        let s = decode_lzvn(bare, u64::MAX);
+        assert!(!s.undecoded && !s.cut_short && !s.over_cap);
+        assert_eq!(s.data, want);
+
+        let s = decode_lzvn(&bare[..bare.len() - 8], u64::MAX);
+        assert!(s.cut_short && !s.undecoded, "no end opcode");
+        let s = decode_lzvn(bare, 10);
+        assert!(s.over_cap);
+        assert_eq!(s.data, want[..10]);
     }
 
     #[test]

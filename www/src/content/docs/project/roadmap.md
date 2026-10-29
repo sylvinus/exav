@@ -29,7 +29,7 @@ The exceptions are the documented detection gaps: unimplemented
   `inflate`) come first, with differential validation against `clamscan`.
 - **Extended and continuous fuzzing**, and a large no-silent-skip CI suite.
 
-## Large files: fewer passes, PE structure
+## Large files: fewer passes, PE structure, HTTP
 
 A file larger than `--max-object-bytes` gets the full engine, read through a
 block cache (see [Streaming & memory](/scanner/concepts/streaming-memory/)). Two things
@@ -44,13 +44,21 @@ remain:
   is `LIMITS-EXCEEDED` unless something is found. Reading only the headers and
   sections would cover the common case of a small executable with a large
   overlay. YARA's `pe`, `elf` and `dotnet` modules have the same limit.
+- **A spill file for `exav-grep`.** A container inside a member longer than
+  `--max-object-bytes` is reported unreadable, because opening it takes
+  somewhere to write it.
+- **HTTP sources.** A scan over HTTP has no timeout of its own, follows
+  redirects without filtering where they lead, and does not check that the
+  object stays the same between range requests (see
+  [HTTP sources](/scanner/concepts/streaming-memory/#http-sources)).
 
 ## Streaming the containers read whole
 
-Most containers, DMG disk images included, are walked member by member off the
-source, so peak memory is one member rather than the whole decoded object (see
-[how extraction works](/unpack/how-it-works/)). RAR, 7z, OLE, the virtual
-disks and filesystems, and a few others are still read whole (see
+Most containers, disk images and filesystems included, are walked member by
+member off the source, so peak memory is one member rather than the whole
+decoded object (see [how extraction works](/unpack/how-it-works/)), the files
+of a disk image or an archive past `--max-object-bytes` through a spill file.
+RAR, OLE, CHM, ARJ, email and a few others are still read whole (see
 [Supported formats](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)):
 past `--max-object-bytes` their own bytes get the full scan but their members are
 not extracted, and the file is `LIMITS-EXCEEDED` unless something is found.

@@ -358,7 +358,11 @@ mod tests {
     #[test]
     fn styles_resolve_through_parents_and_defaults() {
         let x = br##"<office:styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"><style:default-style style:family="graphic"><style:graphic-properties draw:fill-color="#729fcf" draw:stroke="solid"/></style:default-style><style:style style:name="a" style:family="graphic"><style:graphic-properties draw:fill="solid"/></style:style><style:style style:name="b" style:family="graphic" style:parent-style-name="a"><style:graphic-properties draw:fill-color="#ff0000"/></style:style></office:styles>"##;
-        let n = crate::formats::office::common::xml::parse(x, 100).unwrap();
+        let n = crate::formats::office::common::xml::parse(
+            x,
+            &mut crate::formats::office::common::xml::within(1 << 20),
+        )
+        .unwrap();
         let mut s = Styles::default();
         s.add(&n);
         let p = s.resolve("graphic", Some("b"));

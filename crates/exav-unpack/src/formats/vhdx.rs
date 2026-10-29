@@ -24,7 +24,7 @@
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
-use super::vdisk::{self, bytes_at, le32, le64, Health, Layout, Map, VDisk};
+use super::vdisk::{self, Health, Layout, Map, VDisk, bytes_at, le32, le64};
 use super::volumes::report;
 use crate::source::ByteSource;
 use crate::stream::Visit;

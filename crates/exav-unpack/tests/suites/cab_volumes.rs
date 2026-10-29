@@ -9,7 +9,7 @@
 //! real ones, written by the `cab` crate and cut apart here.
 
 use super::extract_each;
-use exav_unpack::{cab_links, join_cab_volumes, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, cab_links, join_cab_volumes};
 
 struct FileSpec {
     size: u32,

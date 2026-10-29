@@ -8,7 +8,7 @@
 //! owned_storage 4. TSD.ImageArchive: super 1, style 3, data 11,
 //! originalData 13. TSD.GroupArchive: super 1, children 2.
 
-use super::{text, ty, Props, Reader};
+use super::{Props, Reader, text, ty};
 use crate::formats::office::common::iwa::proto::Msg;
 use crate::formats::office::slides::error::Result;
 use crate::formats::office::slides::limits::Budget;
@@ -317,7 +317,7 @@ fn geometry(ps: Msg, w: f64, h: f64) -> Geometry {
             let p0 = pt(first.msg(2));
             out.cmds.push(PathCmd::Move(p0.0, p0.1));
             let closed = sub.boolean(2).unwrap_or(false);
-            let mut segs: Vec<(Msg, Msg)> = nodes.windows(2).map(|w| (w[0], w[1])).collect();
+            let mut segs: Vec<(Msg, Msg)> = nodes.array_windows().map(|&[a, b]| (a, b)).collect();
             if closed && nodes.len() > 1 {
                 segs.push((nodes[nodes.len() - 1], nodes[0]));
             }

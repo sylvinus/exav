@@ -23,7 +23,7 @@
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
-use super::vdisk::{self, be64, bytes_at, Health, Layout, Map, Unpacked, VDisk};
+use super::vdisk::{self, Health, Layout, Map, Unpacked, VDisk, be64, bytes_at};
 use super::volumes::report_enc;
 use crate::source::ByteSource;
 use crate::stream::Visit;
@@ -192,7 +192,7 @@ impl Layout for Qcow2<'_> {
                 return Unpacked {
                     data: Vec::new(),
                     damaged: true,
-                }
+                };
             }
         };
         Unpacked {
@@ -510,9 +510,11 @@ mod tests {
     fn the_features_that_change_how_the_image_is_read_are_not_ignored() {
         assert!(unread(&v3(1 << 2, 104, 0)).1.contains("external data file"));
         assert!(unread(&v3(1 << 4, 104, 0)).1.contains("extended L2"));
-        assert!(unread(&v3(1 << 5, 104, 0))
-            .1
-            .contains("feature exav does not know"));
+        assert!(
+            unread(&v3(1 << 5, 104, 0))
+                .1
+                .contains("feature exav does not know")
+        );
         assert!(unread(&v3(1 << 3, 112, 9)).1.contains("compression type"));
         // Dirty and corrupt do not change where anything is.
         assert!(matches!(

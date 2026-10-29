@@ -70,12 +70,8 @@ production.
 | `EXAV_DEBUG_BC_WARN` | Set: warn once per stubbed bytecode API a signature calls. See [Bytecode sandbox](/scanner/concepts/bytecode-sandbox/). |
 | `EXAV_DEBUG_BC_TRACE`, `EXAV_DEBUG_BC_FN=<n>` | Trace bytecode execution, optionally for one function. |
 
-The test suites and examples read a few more, each described where it is
-used: `EXAV_DEBUG_YR_BIN` (the `yr` binary the YARA differential tests run),
-`EXAV_DEBUG_YARA_CORPUS`, `EXAV_DEBUG_YARA_BENCH_RULES`,
-`EXAV_DEBUG_PARITY_DB`, `EXAV_DEBUG_PARITY_CORPUS`, `EXAV_DEBUG_PARITY_LIMIT`,
-`EXAV_DEBUG_RAR_CORPUS` (a directory of RAR samples whose members the RAR
-decoder checks against their stored CRCs) and `EXAV_DEBUG_BC_FORCED`.
+The test suites and examples read a few more `EXAV_DEBUG_*` variables, described
+where they are used.
 
 ## Migrating a ClamAV container
 

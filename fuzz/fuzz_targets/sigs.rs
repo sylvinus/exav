@@ -1,9 +1,9 @@
 #![no_main]
 //! Signature-text parsers (simple Name=HEX, hash db, fuzzy db) on arbitrary
 //! UTF-8. `.ndb` text is fuzzed through the engine by `ndb_compile`.
-use libfuzzer_sys::fuzz_target;
 use exav_core::fuzzy::FuzzyDb;
 use exav_core::hashes::HashDb;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {

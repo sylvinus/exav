@@ -60,7 +60,7 @@ daemon must be able to see them; otherwise send the contents (see
 | `-d`, `--database <PATH>` | none | Load this file or directory instead of `--sig-dir`. A directory of signature files (`.cvd`/`.ndb`/`.hdb`/…) is loaded recursively, skipping hidden subdirectories. A prebuilt `.exavdb` loads only when named as the file itself; inside a directory it is skipped. |
 | `--sig-dir <DIR>` | `/var/lib/exav` | The directory signatures live in, loaded when `-d` is not given. |
 | `--allow-no-db` | off | Testing only. Run against the built-in EICAR-only baseline when no real database is present, instead of refusing. |
-| `--build-db <FILE>` | none | Compile the loaded signatures into a prebuilt `.exavdb` and exit. Refused with `--listen`. `--build-shard-bytes`, which split the build before 0.0.2, is refused with a message saying so. |
+| `--build-db <FILE>` | none | Compile the loaded signatures into a prebuilt `.exavdb` and exit. Refused with `--listen`. |
 
 `--auto-update` writes to `-d` when it is given, and to `--sig-dir` otherwise,
 so the updater and the server of a two-container deployment name the same
@@ -129,6 +129,11 @@ change. `--workers` takes a count or `threads`, and refuses `0`.
 |---|---|---|---|
 | `--max-input-bytes <SIZE\|off>` | unlimited | `100M` | Largest top-level input taken. Past it the first bytes get the whole scan, and without a detection there the input is `LIMITS-EXCEEDED`. The same for a file, stdin and every daemon verb. |
 | `--max-object-bytes <SIZE\|off>` | `256M` | unchanged, but a top-level file up to 400M is held whole | The most memory one object may take when held whole. A larger one gets the same scan through a block cache or spill file, except the checks that need it whole (PE structure, YARA's `pe`/`elf`/`dotnet`, containers read whole); if one of those applied, it is `LIMITS-EXCEEDED` unless something is found. |
+| `--max-extracted-bytes <SIZE\|off>` | `1G` | `400M` | The most bytes of members that a format decodes whole, added up over one scan and never released. A member streamed to the matcher (ZIP, 7z, TAR, CAB, the stream codecs) is not counted. Lowered by `--max-process-bytes`. |
+| `--max-bytecode-memory-bytes <SIZE\|off>` | `256M` | unchanged | What one run of a bytecode signature may hold: its `malloc`s, call frames and the globals it reads. A run that reaches it stops as incomplete. Lowered by `--max-process-bytes`. |
+| `--object-cache-bytes <SIZE>` | `8M` | unchanged | Memory of the block cache of an object read in place (a file past `--max-object-bytes`, a spilled member or view, an `http(s)://` input), for each such object being scanned. At least two blocks. A cache that holds the whole object reads it once from the source. Lowered by `--max-process-bytes` to an eighth of a scan's memory. [How the cache works](/scanner/concepts/streaming-memory/#the-block-cache). |
+| `--object-cache-block-bytes <SIZE>` | `1M` | unchanged | One block of that cache: what it reads from the object at a time, and over HTTP what a request away from the previous one fetches. Larger means fewer requests for scattered reads and more bytes moved by each. |
+| `--http-request-bytes <SIZE>` | `8M` | unchanged | Over HTTP, the most one range request fetches. A read that goes on from the last request asks for twice as much each time, from one block up to this. Held in memory while read. Lowered by `--max-process-bytes` to an eighth of a scan's memory. |
 | `--max-matcher-bytes <SIZE\|off>` | `10G` | unchanged | Bytes fed to the matcher across one top-level file: a CPU bound, not a memory one. `clamscan`'s `--max-scansize`. |
 | `--max-pcre-bytes <SIZE\|off>` | unlimited | `100M` | The largest object PCRE subsignatures run on; on a larger one they do not match. Per object, so a small member of a large archive is still matched. A CPU bound: an object is matched without being copied. `clamscan`'s `--pcre-max-filesize`. |
 | `--min-scan-bytes <SIZE>` | `6` | unchanged | The smallest object scanned. A smaller file or member, at any depth, is neither matched nor unpacked and counts as clean, as ClamAV scans no object under 6 bytes. `0` scans every object. |
@@ -139,9 +144,6 @@ change. `--workers` takes a count or `threads`, and refuses `0`.
 What a scan holds in total has no flag of its own and cannot be raised: it is
 1 GiB (400M under `--clamav-compat`), and `--max-process-bytes` can only lower
 it, to what fits the memory a scan gets (see [Limits](/scanner/reference/limits/)).
-`--max-extracted-bytes`, which set it before
-0.0.2, is refused with a message saying so. [Limits](/scanner/reference/limits/) has
-the details.
 
 Each bound has one spelling. `clamscan`'s names (`--max-filesize`,
 `--max-scansize`, `--max-files`) are refused, with an error naming the exav flag.
@@ -340,6 +342,7 @@ always reads it and advertises it as `Max-Connections`.
 | Flag | Default | Description |
 |---|---|---|
 | `--listen <ADDR>` | none | Serve on this address. Repeatable (comma-separated in the environment). |
+| `--listen-health <ADDR>` | none | Also answer "are you there?" on this address, and nothing else. Repeatable (comma-separated in the environment). Needs `--listen`. See [Health listener](#health-listener). |
 | `--connect <ADDR>` | none | Scan by handing each file to a daemon already running there, instead of loading a database. Listener options (`?mode=`, `?max-connections=`, `?service=`) are refused here. |
 | `--send-as <WHAT>` | `path` | What a `--connect` client hands the daemon: `path`, `contents` or `fd`. |
 | `--ping` | off | Ask a daemon whether it is answering, and exit `0` or `2`. Probes `--connect` when given, otherwise the listener this configuration would serve (so a container health check needs no address of its own), with `PING` on clamd and `OPTIONS` on ICAP. One probe; retrying is up to the caller. |
@@ -353,25 +356,50 @@ always reads it and advertises it as `Max-Connections`.
 `SHUTDOWN` is off by default because a scanner that is not running reports
 nothing, and a pipeline that reads no answer as "fine" passes everything.
 
-Naming both protocols serves both from one process over one loaded database,
-replacing a `c-icap` + `clamav` container pair:
+Naming both protocols serves both from one process over one loaded database:
 
 ```sh
 exav --listen clamd://0.0.0.0:3310 --listen icap://0.0.0.0:1344
 ```
 
-Under the worker pool the ICAP listener runs in its own child of the supervisor,
-sharing the loaded database copy-on-write and replaced along with the workers on
-a reload, since ICAP connections are keep-alive and would otherwise occupy every
-worker. Two `--listen` addresses on the same protocol are refused.
+Two `--listen` addresses on the same protocol are refused. Under the worker pool
+the ICAP listener runs in a child process of its own (see the
+[ICAP guide](/scanner/guides/icap/#with-the-clamd-listener)).
+
+### Health listener
+
+Under the worker pool, a `PING` to the clamd listener waits for a free worker,
+so while every worker is in a long scan a health check times out and restarts a
+daemon that is only busy. `--listen-health` opens an address that does no
+scanning and waits for no worker, and answers in the protocol of its scheme:
+
+```sh
+exav --listen clamd://0.0.0.0:3310 --listen-health clamd://127.0.0.1:3311
+exav --listen icap://0.0.0.0:1344  --listen-health icap://127.0.0.1:1345
+```
+
+| Scheme | Answers | Refuses |
+|---|---|---|
+| `clamd://` | `PING` (`PONG`), `VERSION`, and `STATS` | every other command, with an error |
+| `icap://` | `OPTIONS` | `REQMOD` and `RESPMOD`, with `405` |
+
+`STATS` is the pool's: the counters are kept in memory every process of the pool
+shares, so the health listener, the scan listener and a `clamdtop` pointed at
+either report the same totals. Without the pool (`--workers threads`, ICAP
+alone) there is one process and the totals are its own.
+
+The listeners are served by a child process of their own under the pool, and by
+threads otherwise. Each connection is a thread, up to `?max-connections=` (64
+by default), and a client has five seconds to send its request. No address is
+opened unless one is named. `exav --ping` probes the health listener when the
+same configuration names one, so a container health check stays `exav --ping`.
 
 ### Socket permissions
 
 The Unix socket is created `0600` (owner only); `?mode=` widens it, as
-`LocalSocketMode` does in `clamd.conf`. A milter, MTA or web server under
-another UID needs it; prefer a shared group (`660`) to `666`. The mode is octal,
-a value that is not a workable mode is refused, and the socket is created with
-no permissions and given its mode immediately, whatever the umask.
+`LocalSocketMode` does in `clamd.conf`. The mode is octal, and a value that is
+not a workable mode is refused. See
+[Who may connect](/scanner/guides/daemon/#who-may-connect).
 
 ### Sending a file the daemon cannot open
 
@@ -471,8 +499,6 @@ the [ClamAV flag matrix](/scanner/reference/clamav-flag-matrix/).
 
 ## Exit codes
 
-`0` `OK`, clean; `1` `FOUND`, a detection; `2` `ERROR`, exav could not do its job;
-`3` `PARTIAL`, something could not be fully examined (`LIMITS-EXCEEDED`,
-`UNSCANNABLE` or `PASSWORD-PROTECTED`), unless `--partial-as` says otherwise.
-When files differ, `1` wins over `2`, and `2` over `3`; see
+`0` `OK`, `1` `FOUND`, `2` `ERROR`, `3` `PARTIAL`, unless `--partial-as` says
+otherwise. When files differ, `1` wins over `2`, and `2` over `3`; see
 [Verdicts & exit codes](/scanner/reference/verdicts/#process-exit-code).

@@ -1,7 +1,7 @@
 //! OfficeArt shapes to the model: anchors, geometry (preset and custom
 //! paths), fills, lines, shadows and pictures ([MS-ODRAW] 2.3).
 
-use super::escher::{array, OShape, Props, F_CONNECTOR, F_FLIP_H, F_FLIP_V};
+use super::escher::{F_CONNECTOR, F_FLIP_H, F_FLIP_V, OShape, Props, array};
 use super::presets;
 use crate::formats::office::common::bytes::Cur;
 use crate::formats::office::slides::model::*;

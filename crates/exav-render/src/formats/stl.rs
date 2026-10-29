@@ -21,7 +21,7 @@
 
 use std::fmt;
 
-use super::mesh::{cross, dot, sub, Batch, Element, Range, Scene};
+use super::mesh::{Batch, Element, Range, Scene, cross, dot, sub};
 
 /// Why a file was not read.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,10 +7,10 @@
 
 use exav_unpack::dwg::{BitError, BitResult, Object, Version};
 
+use super::Ctx;
 use super::blocks::number_viewports;
 use super::header::Vars;
 use super::tables::cmc;
-use super::Ctx;
 use crate::formats::cad::model::*;
 
 fn v3(p: [f64; 3]) -> Vec3 {

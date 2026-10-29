@@ -44,6 +44,7 @@ mod match_location;
 mod matryoshka;
 #[cfg(feature = "all-formats")]
 mod multi_volume;
+mod nesting;
 #[cfg(feature = "all-formats")]
 mod one_scan;
 #[cfg(feature = "all-formats")]

@@ -92,14 +92,13 @@ of it. (A magic at the start does not always settle it: a DMG whose data opens
 with a bzip2 or xz run, as macOS writes compressed images, starts with that
 run's magic, and its trailer is what names it a disk image.) `walk()` then
 hands the members to a visitor one at a time. A format whose
-decoder reads forward (ZIP, tar, CAB, ISO, the single-stream compressors, …)
-produces each member as a reader that decodes as it is read, so neither the
-container nor the member is resident. A format whose decoder needs random access
-over the whole container (7z, RAR, OLE, PDF, CHM, the virtual disks and
-filesystem images, …) is read
-whole, bounded before it is allocated, up to `--max-object-bytes`; past it the
-container is `LIMITS-EXCEEDED`. 7z's members still stream once the container is
-in memory. Which it is is a property of the decoder, not of how exav was
+decoder reads forward, or finds its members by an index it reads from where it
+is (ZIP, tar, CAB, ISO, 7z, WIM, xar, the filesystems, the single-stream
+compressors, …) produces each member as a reader that decodes as it is read,
+so neither the container nor the member is resident. A format whose decoder
+needs random access over the whole container (RAR, OLE, PDF, CHM, ARJ, …) is
+read whole, bounded before it is allocated, up to `--max-object-bytes`; past it
+the container is `LIMITS-EXCEEDED`. Which it is is a property of the decoder, not of how exav was
 invoked; [Supported formats](/unpack/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
 lists both.
 

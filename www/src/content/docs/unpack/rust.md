@@ -30,8 +30,9 @@ to prevent.
 
 **It opens containers most extractors decline.** Virtual disks (VHD, VHDX, QCOW2,
 VMDK) are reconstructed to the guest disk, and the filesystems inside them (NTFS
-through an MFT walk, FAT through the cluster chain, ext2/3/4) are walked for files with
-their paths; UDF, WIM and Unix `compress` are handled natively. See
+through an MFT walk, FAT and exFAT through the cluster chain, ext2/3/4, HFS+, APFS) are
+walked for files with their paths; SquashFS, cramfs, romfs and EROFS images, UDF,
+WIM and Unix `compress` are handled natively. See
 [Supported formats](/unpack/formats/).
 
 **It survives adversarial archives.** ZIP members hidden from the central
@@ -101,26 +102,20 @@ A ZIP's walk runs past its central directory: members with a local header and
 no directory entry are visited too, after the directory's own.
 
 With the `dxf` feature, `exav_unpack::dxf` is the low layer of a DXF reader:
-`Tags` reads ASCII and binary DXF's group code and value pairs, `Records`
-groups them by group code 0, `Parts` splits a record into its subclasses,
-application groups and extended data, and `Decoder` decodes strings in the
-drawing's code page. It interprets nothing; exav-render's drawing model is
-built on it. As a container, a DXF's members are the files it embeds, such as
-an OLE2FRAME's object.
+`Tags` reads group code and value pairs (ASCII or binary), `Records` groups them
+by group code 0, `Parts` splits a record into subclasses, application groups and
+extended data, and `Decoder` decodes strings in the drawing's code page. It
+interprets nothing; exav-render's drawing model is built on it. As a container,
+a DXF's members are the files it embeds, such as an OLE2FRAME's object.
 
-With the `dwg` feature, `exav_unpack::dwg` is the low layer of a DWG reader,
-R13 to 2018, following the Open Design Specification for .dwg
-files: `Bits` reads the bit codes, `Dwg` the sections (located by the file
-header to R2000; from 2004 found by name in a paged container whose maps it
-decrypts and whose pages it checks and decompresses, within a byte limit;
-2007's container is Reed-Solomon coded, with a compression of its own):
-the header variables, left to the reader, the classes and the object map.
-`Dwg::object` reads any object the map holds, with its extended data, its
-common entity data and the streams its own data, strings and handles are
-read from. As a container, a DWG's members are its preview images and the
-object each OLE2FRAME embeds (`ole2frame-<handle>.ole`, the compound file);
-a drawing whose objects cannot be read is reported as not fully examined,
-and so is a drawing of a release before R13 (`pre_r13_version`), as one
+With the `dwg` feature, `exav_unpack::dwg` is the low layer of a DWG reader, R13
+to 2018, following the Open Design Specification for .dwg files: `Bits` reads
+the bit codes, `Dwg` the sections (the classes, the object map and the raw
+header variables, which are left to the reader), and `Dwg::object` any object
+the map holds, with its extended data and common entity data. As a container, a
+DWG's members are its preview images and the object each OLE2FRAME embeds
+(`ole2frame-<handle>.ole`). A drawing whose objects cannot be read, or one
+before R13 (`pre_r13_version`), is reported as not fully examined, as one
 unsupported `dwg-<version ID>` entry.
 
 ## Features
@@ -145,9 +140,9 @@ The defaults are `all-formats`, `decrypt` and `cli`.
 The per-format features, which `all-formats` turns on:
 
 ```text
-zip · gzip · tar · bzip2 · xz · zstd · lzip · lzw · lz4 · cab · chm · sevenz
+zip · gzip · tar · bzip2 · xz · zstd · lzip · lzma · lzw · lz4 · rpm · cab · chm · sevenz
 rar · arj · arc · ace · lha · iso · ole · pdf · email · dmg · vhd · diskimage
-fat · ext · ntfs · wim · upx · inno · nsis · ar · cpio · xar · uuencode · xdp · szdd
+fat · exfat · ext · ntfs · squashfs · cramfs · romfs · erofs · wim · upx · inno · nsis · ar · cpio · xar · uuencode · xdp · szdd
 tnef · swf · binhex · lnk · partition · pyc · autoit · onenote · rtf
 machofat · sfx · stuffit · alz · egg · hwp3 · zoo · ishieldz · pepack
 javaclass · aimodel · screnc · base64scan · dxf · dwg · pe-emu

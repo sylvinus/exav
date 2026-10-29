@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use exav_render::ifc::{read, Limits};
+use exav_render::ifc::{Limits, read};
 use exav_render::mesh::Scene;
 use serde_json::Value;
 

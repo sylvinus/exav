@@ -3,10 +3,10 @@
 //! references to cells, read once the workbook is (`charts::fill`), or the
 //! chart's own cached data where it has some.
 
+use super::Globals;
 use super::formula;
 use super::stream::Rec;
-use super::Globals;
-use crate::formats::office::common::bytes::{u16_at, Cur};
+use crate::formats::office::common::bytes::{Cur, u16_at};
 use crate::formats::office::sheets::model::*;
 
 /// What a Begin/End block is about.
@@ -60,7 +60,7 @@ pub(crate) fn read_chart(
     anchor: Option<Anchor>,
     wb: &mut Workbook,
 ) -> Option<Chart> {
-    let ctx = g.ctx(&[]);
+    let ctx = g.book.ctx(&[]);
     let mut stack: Vec<Ctx> = vec![];
     let mut last = Ctx::Other;
     let mut series: Vec<ChartSeries> = vec![];
@@ -128,10 +128,10 @@ pub(crate) fn read_chart(
                 });
                 ser_group.push(0);
                 // Numeric or text categories.
-                if u16_at(d, 0) == 1 {
-                    if let Some(s) = series.last_mut() {
-                        s.cat_nums = Some(vec![]);
-                    }
+                if u16_at(d, 0) == 1
+                    && let Some(s) = series.last_mut()
+                {
+                    s.cat_nums = Some(vec![]);
                 }
                 last = Ctx::Series(series.len() - 1);
             }
@@ -169,10 +169,10 @@ pub(crate) fn read_chart(
                 }
             }
             0x1045 => {
-                if let Ctx::Series(i) = top {
-                    if let Some(x) = ser_group.get_mut(i) {
-                        *x = u16_at(d, 0) as usize;
-                    }
+                if let Ctx::Series(i) = top
+                    && let Some(x) = ser_group.get_mut(i)
+                {
+                    *x = u16_at(d, 0) as usize;
                 }
             }
             0x1006 => {
@@ -197,13 +197,13 @@ pub(crate) fn read_chart(
                 };
                 match top {
                     Ctx::DataFormat(Some(i), point) => {
-                        if let Some(s) = series.get_mut(i) {
-                            if fls != 0 {
-                                match point {
-                                    Some(p) => s.point_colors.push((p, color)),
-                                    None if !auto => s.color = Some(color),
-                                    None => {}
-                                }
+                        if let Some(s) = series.get_mut(i)
+                            && fls != 0
+                        {
+                            match point {
+                                Some(p) => s.point_colors.push((p, color)),
+                                None if !auto => s.color = Some(color),
+                                None => {}
                             }
                         }
                     }
@@ -215,13 +215,13 @@ pub(crate) fn read_chart(
             0x1007 => {
                 let lns = u16_at(d, 4);
                 let auto = u16_at(d, 8) & 1 != 0;
-                if let Ctx::DataFormat(Some(i), None) = top {
-                    if let Some(s) = series.get_mut(i) {
-                        if lns == 5 {
-                            s.line = false;
-                        } else if !auto && s.color.is_none() {
-                            s.color = Some(rgb(d, 0));
-                        }
+                if let Ctx::DataFormat(Some(i), None) = top
+                    && let Some(s) = series.get_mut(i)
+                {
+                    if lns == 5 {
+                        s.line = false;
+                    } else if !auto && s.color.is_none() {
+                        s.color = Some(rgb(d, 0));
                     }
                 }
                 if top == Ctx::Axis(1) && axis_line == Some(1) && lns != 5 {
@@ -229,10 +229,10 @@ pub(crate) fn read_chart(
                 }
             }
             0x1009 => {
-                if let Ctx::DataFormat(Some(i), None) = top {
-                    if let Some(s) = series.get_mut(i) {
-                        s.marker = u16_at(d, 8) != 0;
-                    }
+                if let Ctx::DataFormat(Some(i), None) = top
+                    && let Some(s) = series.get_mut(i)
+                {
+                    s.marker = u16_at(d, 8) != 0;
                 }
             }
             0x1032 => {
@@ -314,10 +314,10 @@ pub(crate) fn read_chart(
                 }
             }
             0x103A => {
-                if let Ctx::ChartFormat(gi) = top {
-                    if let Some(gr) = groups.get_mut(gi) {
-                        gr.three_d = true;
-                    }
+                if let Ctx::ChartFormat(gi) = top
+                    && let Some(gr) = groups.get_mut(gi)
+                {
+                    gr.three_d = true;
                 }
             }
             0x1015 => {
@@ -328,10 +328,10 @@ pub(crate) fn read_chart(
                     4 => "l",
                     _ => "r",
                 };
-                if let Ctx::ChartFormat(gi) = top {
-                    if let Some(gr) = groups.get_mut(gi) {
-                        gr.legend = Some(pos);
-                    }
+                if let Ctx::ChartFormat(gi) = top
+                    && let Some(gr) = groups.get_mut(gi)
+                {
+                    gr.legend = Some(pos);
                 }
                 legend = legend.or(Some(pos));
                 last = Ctx::Legend;
@@ -349,7 +349,7 @@ pub(crate) fn read_chart(
                 let mut c = Cur::at(d, 6);
                 let v = match r.id {
                     0x0203 => Value::Number(c.f64()),
-                    0x0204 => Value::text(g.string(&mut c, 2)),
+                    0x0204 => Value::text(g.book.string(&mut c, 2)),
                     0x027E => Value::Number(super::sheet::rk(c.u32())),
                     _ => Value::Empty,
                 };

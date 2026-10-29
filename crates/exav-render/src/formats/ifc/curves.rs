@@ -4,9 +4,9 @@
 
 use std::f64::consts::TAU;
 
-use super::math::{self, add, cross, dot, len, scale, sub, unit, Xf, V3};
+use super::math::{self, V3, Xf, add, cross, dot, len, scale, sub, unit};
 use super::step::Value;
-use super::{coords, Reader, MAX_DEPTH};
+use super::{MAX_DEPTH, Reader, coords};
 
 /// Chords per full turn of a circle.
 pub const SEGMENTS_PER_TURN: f64 = 32.0;
@@ -65,11 +65,7 @@ pub fn arc3(a: V3, m: V3, b: V3) -> Vec<V3> {
     let angle = |p: V3| {
         let d = sub(p, c);
         let t = dot(d, e2).atan2(dot(d, e1));
-        if t < 0.0 {
-            t + TAU
-        } else {
-            t
-        }
+        if t < 0.0 { t + TAU } else { t }
     };
     let (tm, tb) = (angle(m), angle(b));
     let sweep = if tm <= tb { tb } else { tb - TAU };
@@ -427,7 +423,7 @@ impl<'a> Reader<'a> {
             .zip(&mults)
             .flat_map(|(k, &m)| std::iter::repeat_n(*k, m))
             .collect();
-        if u.len() < n + degree + 1 || u.windows(2).any(|w| w[1] < w[0]) {
+        if u.len() < n + degree + 1 || u.array_windows().any(|[a, b]| b < a) {
             return None;
         }
         if weights
@@ -501,9 +497,10 @@ mod tests {
     fn three_points_make_the_arc_through_them() {
         let pts = arc3([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]);
         assert_eq!(pts.len(), 17);
-        assert!(pts
-            .iter()
-            .all(|p| (len(*p) - 1.0).abs() < 1e-9 && p[1] >= -1e-12));
+        assert!(
+            pts.iter()
+                .all(|p| (len(*p) - 1.0).abs() < 1e-9 && p[1] >= -1e-12)
+        );
         // The other way round: through the bottom.
         let pts = arc3([1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [-1.0, 0.0, 0.0]);
         assert!(pts.iter().all(|p| p[1] <= 1e-12));

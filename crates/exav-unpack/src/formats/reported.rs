@@ -12,8 +12,8 @@
 //!
 //! # Why these are still here
 //!
-//! Two of them are blocked on licensing rather than on effort, and that is
-//! worth writing down so nobody re-derives the search:
+//! One is blocked on licensing, the others on effort or on a way to check a
+//! decoder; that is worth writing down so nobody re-derives the search:
 //!
 //! * **lrzip** — the rzip long-range match stream has no published
 //!   specification. It is defined only by lrzip's own GPL source, which exav
@@ -21,13 +21,14 @@
 //!   language. Running the tool as an *oracle* is allowed, but inferring an
 //!   exact bitstream from black-box behaviour is not something to attempt and
 //!   then claim.
-//! * **InstallShield `ISc(` cabinets** — likewise undocumented; the only
-//!   implementation is the LGPL `unshield` **C project**. Not to be confused
-//!   with the MIT `unshield` *crate*, which reads the older InstallShield `.z`
-//!   archive — a different format, and one exav does open (`formats/ishield_z`,
-//!   ported from that crate).
+//! * **InstallShield `ISc(` cabinets** — undocumented; the implementation is
+//!   the `unshield` **C project**, under the MIT licence, so its source may be
+//!   read and ported with a NOTICE entry. Not to be confused with the MIT
+//!   `unshield` *crate*, which reads the older InstallShield `.z` archive — a
+//!   different format, and one exav does open (`formats/ishield_z`, ported
+//!   from that crate).
 //!
-//! Both therefore stay recognised-and-reported, which is the honest answer:
+//! They stay recognised-and-reported, which is the honest answer:
 //! `UNSCANNABLE` tells an operator there is a gap, where a decoder that guessed
 //! would produce plausible bytes and a confident `OK`.
 

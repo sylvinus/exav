@@ -237,7 +237,7 @@ mod tests {
     fn is_nsis(data: &[u8]) -> bool {
         super::is_nsis(&crate::Probe::whole(data))
     }
-    use flate2::{write::DeflateEncoder, Compression};
+    use flate2::{Compression, write::DeflateEncoder};
     use std::io::Write;
 
     /// A declared dictionary size is attacker input and is allocated UP FRONT.
@@ -314,9 +314,11 @@ mod tests {
             entries.iter().all(|e| e.unsupported.is_none()),
             "{entries:?}"
         );
-        assert!(entries
-            .iter()
-            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST"))
+        );
     }
 
     /// The CRC-32 after the data is not one more block.
@@ -342,9 +344,11 @@ mod tests {
         assert_eq!(detect(&blob), Some(Format::Nsis));
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
-        assert!(entries
-            .iter()
-            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST"))
+        );
     }
 
     #[test]
@@ -353,9 +357,11 @@ mod tests {
         blob.extend_from_slice(&[0u8; 512]);
         assert!(!is_nsis(&blob));
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Nsis, &blob, &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Nsis, &blob, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -364,9 +370,11 @@ mod tests {
         blob.extend_from_slice(&[0u8; 8]);
         blob.extend_from_slice(&NSIS_SIG);
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Nsis, &blob, &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Nsis, &blob, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -376,9 +384,11 @@ mod tests {
         let blob = synthetic_nsis(&junk);
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
-        assert!(entries
-            .iter()
-            .all(|e| e.unsupported.is_some() || !e.data.is_empty()));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.unsupported.is_some() || !e.data.is_empty())
+        );
     }
 
     #[test]

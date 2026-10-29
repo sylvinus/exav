@@ -1,7 +1,7 @@
 //! Records written by hand, for the cases where a group code means one thing
 //! in one subclass or position and another elsewhere.
 
-use super::super::{read_dxf, EntityKind, HAlign, VAlign};
+use super::super::{EntityKind, HAlign, VAlign, read_dxf};
 
 fn drawing(sections: &str) -> super::super::Drawing {
     let text = format!("{sections}0\nEOF\n");

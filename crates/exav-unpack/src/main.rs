@@ -22,7 +22,7 @@
 
 use chrono::{Local, LocalResult, TimeZone};
 use exav_unpack::source::BlockCache;
-use exav_unpack::{detect, walk, Budget, ByteSource, Format, Limits, Member, MemberMeta, Mtime};
+use exav_unpack::{Budget, ByteSource, Format, Limits, Member, MemberMeta, Mtime, detect, walk};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -282,7 +282,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                             format!("-{c} ({what}) is an unzip option exav-unpack does not take")
                         }
                         None => format!("unknown option -{c}"),
-                    })
+                    });
                 }
             }
             k += 1;
@@ -589,11 +589,11 @@ impl<'a> Archive<'a> {
             println!("---------  ---------- -----   ----");
         }
         let root = o.dir.clone().unwrap_or_else(|| PathBuf::from("."));
-        if o.mode == Mode::Extract {
-            if let Err(e) = fs::create_dir_all(&root) {
-                eprintln!("exav-unpack:  cannot create {}: {e}", root.display());
-                return status::ERROR;
-            }
+        if o.mode == Mode::Extract
+            && let Err(e) = fs::create_dir_all(&root)
+        {
+            eprintln!("exav-unpack:  cannot create {}: {e}", root.display());
+            return status::ERROR;
         }
         let mut budget = Budget::with_passwords(o.limits.clone(), o.passwords.clone());
         budget.set_visit_directories(true);
@@ -1240,7 +1240,7 @@ fn directories(root: &Path, path: &Path, last: bool) -> Result<(), String> {
         at.push(c);
         match fs::symlink_metadata(&at) {
             Ok(m) if m.file_type().is_symlink() => {
-                return Err(format!("{} is a link, not followed", at.display()))
+                return Err(format!("{} is a link, not followed", at.display()));
             }
             Ok(m) if m.is_dir() => {}
             Ok(_) => return Err(format!("{} is a file, not a directory", at.display())),

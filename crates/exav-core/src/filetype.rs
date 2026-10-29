@@ -187,6 +187,11 @@ pub enum FileType {
     Fat,         // FAT12/16/32 filesystem
     Inno,        // Inno Setup installer (recognised, not decoded)
     Ntfs,        // NTFS filesystem
+    Exfat,       // exFAT filesystem
+    Squashfs,    // SquashFS image
+    Cramfs,      // cramfs image
+    Romfs,       // romfs image
+    Erofs,       // EROFS image
     Zstd,        // Zstandard compressed stream
     Lzip,        // Lzip compressed stream
     Uuencode,    // uuencode / base64-uuencode wrapped file
@@ -271,6 +276,11 @@ impl FileType {
             FileType::Fat => "FAT",
             FileType::Inno => "InnoSetup",
             FileType::Ntfs => "NTFS",
+            FileType::Exfat => "exFAT",
+            FileType::Squashfs => "SquashFS",
+            FileType::Cramfs => "cramfs",
+            FileType::Romfs => "romfs",
+            FileType::Erofs => "EROFS",
             FileType::Zstd => "ZSTD",
             FileType::Lzip => "LZIP",
             FileType::Uuencode => "uuencode",
@@ -579,6 +589,11 @@ pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
         Format::Fat => FileType::Fat,
         Format::Inno => FileType::Inno,
         Format::Ntfs => FileType::Ntfs,
+        Format::Exfat => FileType::Exfat,
+        Format::Squashfs => FileType::Squashfs,
+        Format::Cramfs => FileType::Cramfs,
+        Format::Romfs => FileType::Romfs,
+        Format::Erofs => FileType::Erofs,
         Format::Zstd => FileType::Zstd,
         Format::Lzip => FileType::Lzip,
         Format::Uuencode => FileType::Uuencode,

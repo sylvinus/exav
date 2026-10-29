@@ -1764,21 +1764,18 @@ impl Ldb {
                 SubSig::Bcomp(b) => {
                     if b.trigger < n && c[b.trigger] > 0 {
                         // Offset anchored at the trigger subsig's first match.
-                        if let SubSig::Bodies(ids) = &self.subs[b.trigger] {
-                            if let Some(off) = ids.iter().filter_map(|&id| body_off(id)).min() {
-                                if b.matches(buf.src, off) {
+                        if let SubSig::Bodies(ids) = &self.subs[b.trigger]
+                            && let Some(off) = ids.iter().filter_map(|&id| body_off(id)).min()
+                                && b.matches(buf.src, off) {
                                     c[i] = 1;
                                 }
-                            }
-                        }
                     }
                 }
                 SubSig::Fuzzy(h, dist) => {
-                    if let Some(ih) = img_hash {
-                        if hamming64(&ih, h) <= *dist {
+                    if let Some(ih) = img_hash
+                        && hamming64(&ih, h) <= *dist {
                             c[i] = 1;
                         }
-                    }
                 }
                 SubSig::Bodies(_) => {}
             }
@@ -2275,11 +2272,10 @@ impl EngineBuilder {
             match &body.elems {
                 Some(elems) => {
                     for e in elems {
-                        if let Elem::Bytes(b) = e {
-                            if b.len() >= MIN_ANCHOR {
+                        if let Elem::Bytes(b) = e
+                            && b.len() >= MIN_ANCHOR {
                                 f(b);
                             }
-                        }
                     }
                 }
                 None => {
@@ -2530,7 +2526,7 @@ impl Groups {
     fn valid(&self, n: usize) -> bool {
         self.start.first() == Some(&0)
             && self.start.last().is_some_and(|&e| e as usize == self.bodies.len())
-            && self.start.windows(2).all(|w| w[0] <= w[1])
+            && self.start.array_windows().all(|[a, b]| a <= b)
             && self.bodies.iter().all(|&b| (b as usize) < n)
     }
 }
@@ -3309,11 +3305,10 @@ impl SigEngine {
                     total += count as u64;
                     return true;
                 }
-                if let Some(hits) = buffered.take() {
-                    if v.replay(&hits, None) {
+                if let Some(hits) = buffered.take()
+                    && v.replay(&hits, None) {
                         return false;
                     }
-                }
                 !v.hit(pidx, value, start, count, None)
             };
             // The pinned bodies first, each a group of its own in the
@@ -3496,11 +3491,10 @@ impl SigEngine {
             }
             let body_off = |b: usize| sc.first_offset(b);
             if let Some(program) = ldb.bytecode {
-                if let Some(fired) = fired.as_deref_mut() {
-                    if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
+                if let Some(fired) = fired.as_deref_mut()
+                    && ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
                         fired.push((program, sub_offsets(ldb, &sc)));
                     }
-                }
                 continue;
             }
             if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
@@ -3629,22 +3623,20 @@ impl SigEngine {
                 continue;
             }
             if let Some(program) = ldb.bytecode {
-                if let Some(fired) = fired.as_deref_mut() {
-                    if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
+                if let Some(fired) = fired.as_deref_mut()
+                    && ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
                         fired.push((program, sub_offsets(ldb, &sc)));
                     }
-                }
                 continue;
             }
             // A `HandlerType:` signature re-types rather than alerts, so it has
             // no name to collect, but the re-type itself must still be recorded,
             // or `--all-matches` runs a different signature set than a normal scan.
             if ldb.handler_type.is_some() {
-                if let Some(ft) = ldb.handler_type {
-                    if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
+                if let Some(ft) = ldb.handler_type
+                    && ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx) {
                         set_retype(src, ft);
                     }
-                }
                 continue;
             }
             if ldb.eval(&hay,&|b| sc.counts[b], &body_off, img_hash, icon_ctx)
@@ -4077,7 +4069,7 @@ fn verify_inner<B: ByteSource + ?Sized, L: ByteSource + ?Sized>(
     // run hits thousands of times per file, and all but the pinned hit are
     // rejected without running it.
     macro_rules! sim {
-        ($toks:expr, $at:expr) => {{
+        ($toks:expr_2021, $at:expr_2021) => {{
             if *budget == 0 {
                 SCAN_TRUNCATED.with(|c| c.set(true));
                 return None;
@@ -4255,9 +4247,9 @@ fn match_forward<B: ByteSource + ?Sized>(
             // SIMD-search for each occurrence of that literal within the gap
             // window and recurse only there. Case-sensitive only (memmem can't
             // fold case); the `nocase` path keeps the scalar fallback.
-            if !nocase {
-                if let Some((Elem::Bytes(lit), tail)) = rest.split_first() {
-                    if !lit.is_empty() {
+            if !nocase
+                && let Some((Elem::Bytes(lit), tail)) = rest.split_first()
+                    && !lit.is_empty() {
                         let lo = pos + *min;
                         let last_start = pos + hi; // literal may start up to here
                         if lo > last_start || lo >= buf.len() {
@@ -4299,8 +4291,6 @@ fn match_forward<B: ByteSource + ?Sized>(
                         }
                         return false;
                     }
-                }
-            }
             for g in *min..=hi {
                 if match_forward(rest, buf, pos + g, nocase, budget) {
                     return true;
@@ -4394,11 +4384,10 @@ fn match_backward<B: ByteSource + ?Sized>(
         }
         Elem::AltMasked { opts } => {
             for o in opts {
-                if end >= o.len() && masked_eq(o, &buf.window(end - o.len(), o.len()), nocase) {
-                    if let Some(s) = match_backward(rest, buf, end - o.len(), nocase, budget) {
+                if end >= o.len() && masked_eq(o, &buf.window(end - o.len(), o.len()), nocase)
+                    && let Some(s) = match_backward(rest, buf, end - o.len(), nocase, budget) {
                         return Some(s);
                     }
-                }
                 if *budget == 0 {
                     SCAN_TRUNCATED.with(|c| c.set(true));
                     return None;
@@ -4420,11 +4409,10 @@ fn match_backward<B: ByteSource + ?Sized>(
                 match_backward(rest, buf, end - l, nocase, budget)
             } else {
                 for o in opts {
-                    if end >= o.len() && bytes_eq(&buf.window(end - o.len(), o.len()), o, nocase) {
-                        if let Some(s) = match_backward(rest, buf, end - o.len(), nocase, budget) {
+                    if end >= o.len() && bytes_eq(&buf.window(end - o.len(), o.len()), o, nocase)
+                        && let Some(s) = match_backward(rest, buf, end - o.len(), nocase, budget) {
                             return Some(s);
                         }
-                    }
                     if *budget == 0 {
                         return None;
                     }
@@ -4581,12 +4569,11 @@ const MAX_REACH: usize = 1 << 20;
 /// interval when they touch it. `false`, with the scan flagged incomplete,
 /// when the set is full.
 fn reach_push(out: &mut Vec<(usize, usize)>, lo: usize, hi: usize) -> bool {
-    if let Some(last) = out.last_mut() {
-        if lo >= last.0 && lo <= last.1.saturating_add(1) {
+    if let Some(last) = out.last_mut()
+        && lo >= last.0 && lo <= last.1.saturating_add(1) {
             last.1 = last.1.max(hi);
             return true;
         }
-    }
     if out.len() >= MAX_REACH {
         SCAN_TRUNCATED.with(|c| c.set(true));
         return false;

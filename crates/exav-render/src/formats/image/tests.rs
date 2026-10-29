@@ -745,7 +745,7 @@ fn a_twelve_bit_grey_tiff_is_shown() {
         assert_eq!(v[5], 255);
         // The two brightest share the top of the stretch.
         assert!(
-            v.windows(2).all(|w| w[0] <= w[1]) && v[0] < v[1] && v[1] < v[2],
+            v.array_windows().all(|[a, b]| a <= b) && v[0] < v[1] && v[1] < v[2],
             "{v:?}"
         );
     }
@@ -1440,7 +1440,9 @@ fn dds_of_other_blocks_sizes_and_layouts_is_shown() {
     let v = u8s(decode_any(&dds(2, 2, masks, None, &body), DECODE_MAX).unwrap());
     assert_eq!(
         v,
-        [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+        [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255
+        ]
     );
 
     // A luminance of 8 bits.
@@ -2165,7 +2167,6 @@ fn the_alpha_of_a_32_bit_targa_is_shown_unless_it_is_all_zero() {
     assert_eq!(p.to_rgba8(), [30, 20, 10, 255, 60, 50, 40, 255]);
 }
 
-#[cfg(feature = "jp2")]
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)

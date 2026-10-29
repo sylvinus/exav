@@ -43,7 +43,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::stream::{emit_stream, MemberMeta, Visit};
+use crate::stream::{MemberMeta, Visit, emit_stream};
 use crate::{Budget, LimitHit};
 
 /// UDF descriptors are addressed in 2048-byte sectors regardless of the logical
@@ -762,7 +762,7 @@ fn walk<T>(
     sink: Emit<'_, T>,
 ) -> Result<Option<T>, LimitHit> {
     macro_rules! emit {
-        ($item:expr) => {
+        ($item:expr_2021) => {
             if let Some(t) = sink(&mut *img, $item)? {
                 return Ok(Some(t));
             }
@@ -905,10 +905,10 @@ fn walk<T>(
             // Deduplicate against the ISO 9660 walk of the same image: a bridge
             // image's two trees point at the same blocks.
             let part = child.icb.part;
-            if let Some(s) = first_extent_sector(img, &vol, fe, part, &fe_head, ad_kind)? {
-                if !seen_extents.insert(s) {
-                    continue;
-                }
+            if let Some(s) = first_extent_sector(img, &vol, fe, part, &fe_head, ad_kind)?
+                && !seen_extents.insert(s)
+            {
+                continue;
             }
             let Some(l) = layout(img, &vol, fe, part, &fe_head, FILE_TYPE_FILE)? else {
                 // The directory names this file, so it exists; its extents just
@@ -1013,20 +1013,21 @@ fn read_fids(dir: &[u8], parent: &str) -> Vec<Fid> {
         let total = impl_len.saturating_add(38).saturating_add(name_len);
 
         // `..` carries no name and points back up the tree.
-        if characteristics & FID_PARENT == 0 && name_len > 0 {
-            if let Some(raw) = crate::bytes::at(dir, name_at, name_len) {
-                let name = decode_name(raw);
-                let path = if parent.is_empty() {
-                    name
-                } else {
-                    format!("{parent}/{name}")
-                };
-                out.push(Fid {
-                    path,
-                    icb,
-                    is_dir: characteristics & FID_DIRECTORY != 0,
-                });
-            }
+        if characteristics & FID_PARENT == 0
+            && name_len > 0
+            && let Some(raw) = crate::bytes::at(dir, name_at, name_len)
+        {
+            let name = decode_name(raw);
+            let path = if parent.is_empty() {
+                name
+            } else {
+                format!("{parent}/{name}")
+            };
+            out.push(Fid {
+                path,
+                icb,
+                is_dir: characteristics & FID_DIRECTORY != 0,
+            });
         }
         // Descriptors are padded to a four-byte boundary.
         let step = total.div_ceil(4).saturating_mul(4);

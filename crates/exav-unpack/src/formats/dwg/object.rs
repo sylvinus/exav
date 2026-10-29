@@ -3,9 +3,9 @@
 //! from: the data before the handles, from R2007 the strings after the data,
 //! and the handles.
 
+use super::Version;
 use super::bits::{BitError, BitResult, Bits, HandleRef};
 use super::file::Dwg;
-use super::Version;
 
 /// A TV string as stored (spec 2): bytes in the drawing's code page to
 /// R2004, UTF-16 from R2007.

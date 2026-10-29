@@ -78,7 +78,7 @@ fn a_segment_longer_than_the_data_is_not_a_stream() {
     let d = baseline(8, 8);
     // Up to the end of the scan header (past it the stream is cut short, not
     // refused).
-    let header = d.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap() + 2 + 8;
+    let header = d.array_windows().position(|w| *w == [0xFF, 0xDA]).unwrap() + 2 + 8;
     for cut in 0..header {
         assert_eq!(jpeg::parse(&d[..cut]), None, "cut at {cut}");
     }
@@ -168,7 +168,7 @@ fn the_orientation_of_a_streams_exif_is_read() {
     d.extend_from_slice(&baseline(8, 8)[2..]);
     assert_eq!(jpeg::parse(&d).unwrap().orientation, Some(6));
     // A value outside 1 to 8 is none.
-    let at = d.windows(2).position(|w| w == [6, 0]).unwrap();
+    let at = d.array_windows().position(|w| *w == [6, 0]).unwrap();
     d[at] = 9;
     assert_eq!(jpeg::parse(&d).unwrap().orientation, None);
     // A segment that is not Exif says nothing.

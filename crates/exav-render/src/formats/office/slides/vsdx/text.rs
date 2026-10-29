@@ -248,7 +248,7 @@ fn para_props(t: &Tree, n: usize, pp: u32) -> ParaProps {
 mod tests {
     use super::*;
     use crate::formats::office::slides::limits::{Budget, Limits};
-    use crate::formats::office::slides::vsdx::resolve::{tests::shapes, Doc, Master};
+    use crate::formats::office::slides::vsdx::resolve::{Doc, Master, tests::shapes};
     use std::collections::HashMap;
 
     fn body(shape: &str) -> Option<TextBody> {

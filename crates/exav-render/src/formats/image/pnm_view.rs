@@ -3,7 +3,7 @@
 //! (P1 to P3) file. The comments are cut out and the file decoded again. A
 //! fallback of `decode_any` only.
 
-use super::{decode, Error, Format, Pixels};
+use super::{Error, Format, Pixels, decode};
 
 pub(super) fn decode_uncommented(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
     let fixed = uncomment(data).ok_or(Error::Undecodable)?;

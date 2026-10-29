@@ -31,6 +31,8 @@ mod cab_volumes;
 mod chm;
 #[cfg(feature = "cpio")]
 mod cpio_never_silent;
+#[cfg(feature = "cramfs")]
+mod cramfs;
 #[cfg(all(not(feature = "decrypt"), feature = "zip"))]
 mod decrypt_disabled;
 mod disabled_formats;
@@ -43,15 +45,22 @@ mod dwg;
 #[cfg(feature = "dxf")]
 mod dxf;
 mod egg;
+#[cfg(feature = "email")]
+mod email;
 #[cfg(feature = "decrypt")]
 mod encrypted_zip;
 #[cfg(feature = "tar")]
 mod entry_accounting;
+#[cfg(feature = "erofs")]
+mod erofs;
+#[cfg(feature = "exfat")]
+mod exfat;
 #[cfg(feature = "ext")]
 mod ext;
 mod extreme;
 #[cfg(feature = "fat")]
 mod fat;
+mod fs_tree;
 mod hwp3;
 #[cfg(feature = "ishieldz")]
 mod ishield_z;
@@ -67,6 +76,7 @@ mod lz4;
 mod lzfse;
 #[cfg(feature = "lzw")]
 mod lzw;
+mod nesting;
 #[cfg(feature = "nsis")]
 mod nsis;
 #[cfg(feature = "ntfs")]
@@ -101,6 +111,8 @@ mod rar4_compat;
 mod rar5_encryption;
 #[cfg(feature = "rar")]
 mod rar_solid;
+#[cfg(feature = "romfs")]
+mod romfs;
 #[cfg(feature = "rpm")]
 mod rpm;
 #[cfg(feature = "sevenz")]
@@ -110,6 +122,8 @@ mod sevenz_entries;
 #[cfg(feature = "sevenz")]
 mod sevenz_ppmd;
 mod silent_skips;
+#[cfg(feature = "squashfs")]
+mod squashfs;
 #[cfg(feature = "all-formats")]
 mod stream_read_errors;
 #[cfg(feature = "text")]
@@ -150,7 +164,7 @@ mod zip_overlap;
 #[cfg(feature = "zoo")]
 mod zoo;
 
-use exav_unpack::{walk, Budget, Entry, Format, LimitHit, Member};
+use exav_unpack::{Budget, Entry, Format, LimitHit, Member, walk};
 
 /// A real-malware sample under `tests/fixtures/`, kept locally only (see
 /// `read_fixture`), or `None` when it is absent or this build cannot open its

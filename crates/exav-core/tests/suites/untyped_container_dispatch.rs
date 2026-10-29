@@ -12,7 +12,7 @@
 //! appears nowhere in their bytes (asserted below), so a verdict of `Infected`
 //! can only come from the container actually being opened.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()

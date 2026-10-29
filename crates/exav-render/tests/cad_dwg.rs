@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use common::compare::{entity_diffs, object_differences};
 use common::{entity_by_handle, expected, resolve, same, same_name};
-use exav_render::cad::{read_dwg, read_dwg_with, Error, Limits, WarningKind};
+use exav_render::cad::{Error, Limits, WarningKind, read_dwg, read_dwg_with};
 use serde_json::Value;
 
 const VERSIONS: [&str; 8] = [
@@ -453,10 +453,11 @@ fn the_entity_limit_holds() {
     let d = read_dwg_with(&dwg("R2000", "all"), &limits).expect("reads");
     let n: usize = d.blocks.iter().map(|b| b.entities.len()).sum();
     assert_eq!(n, 3);
-    assert!(d
-        .warnings
-        .iter()
-        .any(|w| w.kind == WarningKind::LimitReached));
+    assert!(
+        d.warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::LimitReached)
+    );
 }
 
 /// exav-unpack's preview fixtures: the converter made the bitmap its

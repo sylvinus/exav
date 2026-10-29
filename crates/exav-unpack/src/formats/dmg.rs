@@ -5,6 +5,7 @@
 // Every sum and product on a header's number is checked or saturating here; a
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
+use super::volumes;
 use crate::source::{ByteSource, Reader};
 use crate::*;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -185,7 +186,7 @@ fn decrypt_keyblob(
     header: &EncryptedDmgHeader,
     derived_key: &[u8; 24],
 ) -> Result<Vec<u8>, LimitHit> {
-    use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
 
     let iv_len = header.blob_enc_iv_size as usize;
     let mut iv = [0u8; 8];
@@ -322,7 +323,7 @@ fn try_decrypt_dmg(
         let iv = compute_chunk_iv(hmac_key, chunk_no as u32);
 
         // AES-CBC decrypt.
-        use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
+        use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
         type Aes128Cbc = cbc::Decryptor<aes::Aes128>;
         type Aes256Cbc = cbc::Decryptor<aes::Aes256>;
 
@@ -338,7 +339,7 @@ fn try_decrypt_dmg(
                 Err(_) => {
                     return Err(LimitHit::corrupt(
                         "AES-128 decryption failed (wrong password?)".into(),
-                    ))
+                    ));
                 }
             }
         } else {
@@ -350,7 +351,7 @@ fn try_decrypt_dmg(
                 Err(_) => {
                     return Err(LimitHit::corrupt(
                         "AES-256 decryption failed (wrong password?)".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -369,21 +370,18 @@ pub(crate) fn walk<T>(
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
     budget.count_entry()?;
-    let mut emit =
-        |entry: Entry, budget: &mut Budget| crate::stream::emit_entry(entry, budget, &mut *visit);
     if src.window(0, 8)[..] != ENCRCDSA_SIG[..] {
-        return walk_disk(Reader::new(src), budget, &mut emit);
+        return walk_disk(Reader::new(src), budget, visit);
     }
     match decrypt_image(src, budget)? {
-        Ok(disk) => walk_disk(Cursor::new(disk), budget, &mut emit),
-        Err(reason) => emit(
+        Ok(disk) => walk_disk(Cursor::new(disk), budget, visit),
+        Err(reason) => crate::stream::emit_entry(
             Entry::unsupported("encrypted.dmg".to_string(), src.len() as u64, true, reason),
             budget,
+            visit,
         ),
     }
 }
-
-type Emit<'a, T> = &'a mut dyn FnMut(Entry, &mut Budget) -> Result<Option<T>, LimitHit>;
 
 /// The decrypted image of an encrypted DMG, or why it was not decrypted.
 /// Decryption takes the whole image.
@@ -433,23 +431,20 @@ fn decrypt_image(
 fn walk_disk<D: Read + Seek, T>(
     disk: D,
     budget: &mut Budget,
-    emit: Emit<T>,
+    visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
     let disk = super::udif::disk(disk)?;
     let damaged = disk.damage();
-    let found = walk_fs(disk, budget, emit)?;
+    let found = walk_fs(disk, budget, &mut *visit)?;
     if found.is_some() || !damaged.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(found);
     }
-    budget.count_entry()?;
-    emit(
-        Entry::unsupported(
-            "dmg-disk".to_string(),
-            0,
-            false,
-            "DMG run failed to decode part way; the bytes before the failure were scanned",
-        ),
+    volumes::report(
+        "dmg-disk",
+        0,
+        "DMG run failed to decode part way; the bytes before the failure were scanned",
         budget,
+        visit,
     )
 }
 
@@ -457,7 +452,7 @@ fn walk_disk<D: Read + Seek, T>(
 fn walk_fs<D: Read + Seek, T>(
     mut disk: super::udif::Disk<D>,
     budget: &mut Budget,
-    emit: Emit<T>,
+    visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
     // Both filesystems are looked for in the first 64 KiB, as `is_dmg` does.
     let mut head = Vec::new();
@@ -467,117 +462,21 @@ fn walk_fs<D: Read + Seek, T>(
 
     if let Some(nxsb_off) = find_apfs_offset(&head) {
         let part = Part::new(disk, nxsb_off.saturating_sub(32) as u64)?;
-        let mut vol = apfs::ApfsVolume::open(part)
-            .map_err(|e| LimitHit::corrupt(format!("apfs open: {e}")))?;
-        let walk = vol
-            .walk()
-            .map_err(|e| LimitHit::corrupt(format!("apfs walk: {e}")))?;
-        for we in walk {
-            if we.entry.kind != apfs::EntryKind::File {
-                continue;
-            }
-            let hit = read_file(we.path, budget, emit, |path, out| {
-                vol.read_file_to(path, out).map(|_| ())
-            })?;
-            if hit.is_some() {
-                return Ok(hit);
-            }
-        }
-        return Ok(None);
+        return volumes::entries(budget, visit, "", |budget, sink| {
+            super::apfs::walk_volume(part, budget, sink)
+        });
     }
 
     if let Some(hfs_off) = find_hfs_offset(&head) {
         let part = Part::new(disk, hfs_off.saturating_sub(1024) as u64)?;
-        let mut vol = hfsplus::HfsVolume::open(part)
-            .map_err(|e| LimitHit::corrupt(format!("hfs+ open: {e}")))?;
-        let walk = vol
-            .walk()
-            .map_err(|e| LimitHit::corrupt(format!("hfs+ walk: {e}")))?;
-        for we in walk {
-            if we.entry.kind != hfsplus::EntryKind::File {
-                continue;
-            }
-            // Only the data fork is read. A resource fork is content too, and
-            // where macOS compressed a file (decmpfs) it holds the file's
-            // bytes while the data fork is empty: reported, not scanned as
-            // empty.
-            if vol.stat(&we.path).is_ok_and(|s| s.resource_fork_size > 0) {
-                budget.count_entry()?;
-                let e = Entry::unsupported(we.path, 0, false, "HFS+ resource fork not read");
-                if let Some(t) = emit(e, budget)? {
-                    return Ok(Some(t));
-                }
-                continue;
-            }
-            let hit = read_file(we.path, budget, emit, |path, out| {
-                vol.read_file_to(path, out).map(|_| ())
-            })?;
-            if hit.is_some() {
-                return Ok(hit);
-            }
-        }
-        return Ok(None);
+        return volumes::entries(budget, visit, "", |budget, sink| {
+            super::hfsplus::walk_volume(part, budget, sink)
+        });
     }
 
     Err(LimitHit::corrupt(
         "no HFS+ or APFS filesystem found in DMG".into(),
     ))
-}
-
-/// Read one file, bounded by the peak-buffer limit, and emit it. The
-/// filesystem crates hand a file over whole.
-fn read_file<T, E>(
-    path: String,
-    budget: &mut Budget,
-    emit: Emit<T>,
-    read: impl FnOnce(&str, &mut Capped) -> Result<(), E>,
-) -> Result<Option<T>, LimitHit> {
-    budget.count_entry()?;
-    let mut out = Capped {
-        data: Vec::new(),
-        cap: budget.reserve()?,
-        over: false,
-    };
-    let read = read(&path, &mut out);
-    if out.over {
-        return Err(LimitHit::new(format!("DMG file '{path}' exceeds budget")));
-    }
-    if read.is_err() {
-        // Its bytes are in the image and were not all read: reported, not
-        // dropped, and those read before the failure scanned.
-        budget.commit(out.data.len() as u64);
-        return emit(
-            Entry {
-                unsupported: Some("DMG file could not be read"),
-                ..Entry::new(path, out.data)
-            },
-            budget,
-        );
-    }
-    budget.commit(out.data.len() as u64);
-    emit(Entry::new(path, out.data), budget)
-}
-
-/// A `Write` that refuses to grow past `cap`.
-struct Capped {
-    data: Vec<u8>,
-    cap: u64,
-    over: bool,
-}
-
-impl std::io::Write for Capped {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        if (self.data.len() as u64).saturating_add(b.len() as u64) > self.cap {
-            self.over = true;
-            return Err(std::io::Error::other("over the buffer limit"));
-        }
-        self.data.extend_from_slice(b);
-        Ok(b.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// The disk from `start` on, where a filesystem begins.
@@ -723,6 +622,7 @@ mod tests {
     /// The iteration count is the file's (a `u32`); 264 bytes with u32::MAX took
     /// 9 minutes of PBKDF2 to refuse every password. A count past what a scan
     /// may spend is not derived, whatever the passwords.
+    #[cfg(feature = "decrypt")]
     #[test]
     fn an_iteration_count_past_the_scans_bound_is_not_derived() {
         let mut h = vec![0u8; 264];

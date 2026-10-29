@@ -90,11 +90,9 @@ const FROZEN_341: &str = "a 2000 file lists a VIEWPORT's frozen layers in group 
 
 const R12_HANDLES: &str = "R12 table entries and blocks have no handle and R12 entities no \
      owner group: both readers number them, differently";
-const NO_LAYOUTS: &str =
-    "LAYOUT objects came with 2000: exav-render makes Model and Layout1 from the \
+const NO_LAYOUTS: &str = "LAYOUT objects came with 2000: exav-render makes Model and Layout1 from the \
      header's limits and extents, ezdxf from its own template (an A3 page setup)";
-const EZDXF_UPGRADE: &str =
-    "ezdxf upgrades a pre-2000 drawing to its 2000 structure on load, adding \
+const EZDXF_UPGRADE: &str = "ezdxf upgrades a pre-2000 drawing to its 2000 structure on load, adding \
      dictionaries, styles, plot styles, BYBLOCK/BYLAYER linetypes and arrow blocks";
 const EZDXF_MATERIAL: &str = "ezdxf adds the MATERIAL objects (2007) a drawing lacks, with their \
      dictionary, and points layers without group 347 at them";
@@ -102,11 +100,9 @@ const DEFPOINTS: &str = "ezdxf adds the Defpoints layer when missing and forces 
      (pre-2000 layers have no group 290)";
 const MVIEW: &str = "before 2000 a VIEWPORT keeps its view in ACAD extended data after 1000 MVIEW \
      (the AcDbViewport class has only 10, 40, 41, 68, 69); ezdxf leaves its defaults";
-const SCALABLE: &str =
-    "group 281 of BLOCK_RECORD is absent before 2007; exav-render reads absent as \
+const SCALABLE: &str = "group 281 of BLOCK_RECORD is absent before 2007; exav-render reads absent as \
      scalable, ezdxf as 0";
-const HARD_OWNER: &str =
-    "group 280 of DICTIONARY is absent; the reference gives no default, ezdxf \
+const HARD_OWNER: &str = "group 280 of DICTIONARY is absent; the reference gives no default, ezdxf \
      assumes 1 (its source says so: undocumented)";
 const DIMSTYLE_DEFAULTS: &str = "the converter omits DIMSTYLE groups equal to AutoCAD's imperial \
      defaults (DIMASZ 0.18, DIMTXT 0.18, DIMEXO 0.0625, DIMEXE 0.18, DIMGAP 0.09): the header's \

@@ -98,11 +98,11 @@ fn check_archive(data: &[u8]) -> (u32, u32, u32, u32, u32) {
             let mut extra_size = 0u64;
             {
                 let mut qq = hdr + t1 + t2;
-                if hflags & 0x01 != 0 {
-                    if let Some((v, n)) = vint(data, qq) {
-                        extra_size = v;
-                        qq += n;
-                    }
+                if hflags & 0x01 != 0
+                    && let Some((v, n)) = vint(data, qq)
+                {
+                    extra_size = v;
+                    qq += n;
                 }
                 let _ = qq;
             }

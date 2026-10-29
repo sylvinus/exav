@@ -72,7 +72,7 @@ code, not a dependency.
 | [`regex-automata`](https://crates.io/crates/regex-automata) / [`regex-syntax`](https://crates.io/crates/regex-syntax) | Linear-time (DoS-safe) regex engine + parser (YARA regexes, the atom prefilter's required literals) | MIT OR Apache-2.0 | 55 / **none** (`forbid`) |
 | [`bit-set`](https://crates.io/crates/bit-set) | For the backtracking regex engine vendored in exav-core (below) | Apache-2.0 OR MIT | 2 |
 | [`goblin`](https://crates.io/crates/goblin) | PE / ELF executable parsing, built without its Mach-O, `ar` and TE parsers | MIT | 34 |
-| [`md-5`](https://crates.io/crates/md-5) / [`sha1`](https://crates.io/crates/sha1) / [`sha2`](https://crates.io/crates/sha2) | Hash signatures (whole-file / section digests), key derivation in `decrypt`, and, for `md-5` and `sha1`, the opening of an XLS encrypted with Excel's default password in exav-render's `office-sheets` and `office-slides` features | MIT OR Apache-2.0 | 1 / 7 / 50 (CPU-feature detection, SIMD) |
+| [`md-5`](https://crates.io/crates/md-5) / [`sha1`](https://crates.io/crates/sha1) / [`sha2`](https://crates.io/crates/sha2) | Hash signatures (whole-file / section digests), key derivation in `decrypt`, and, for `md-5` and `sha1`, the opening of an XLS encrypted with a password (Excel's default one for exav-render's `office-sheets`), in exav-unpack's `offcrypto` | MIT OR Apache-2.0 | 1 / 7 / 50 (CPU-feature detection, SIMD) |
 | [`crc32fast`](https://crates.io/crates/crc32fast) | CRC-32 (the `.exavdb` trailer, YARA's `hash` module, archive CRCs) | MIT OR Apache-2.0 | 15 (SIMD) |
 | [`base64`](https://crates.io/crates/base64) | Base64 decode (YARA `base64` modifiers; uuencode, email, XDP and embedded payloads in `exav-unpack`) | MIT OR Apache-2.0 | **none** (`forbid`) |
 | [`yara-x-parser`](https://crates.io/crates/yara-x-parser) | YARA grammar/AST parser (the native engine's front end) | BSD-3-Clause | 5 |
@@ -84,7 +84,7 @@ code, not a dependency.
 | [`fax`](https://crates.io/crates/fax) / [`weezl`](https://crates.io/crates/weezl) / [`quick-error`](https://crates.io/crates/quick-error) / [`bytemuck`](https://crates.io/crates/bytemuck) | The vendored TIFF decoder's: CCITT fax, LZW, error types, byte casts | MIT / MIT OR Apache-2.0 / MIT OR Apache-2.0 / Zlib OR Apache-2.0 OR MIT | **none** / **none** (`forbid`) / **none** / 323 |
 | [`bcdec_rs`](https://crates.io/crates/bcdec_rs) | BC1 to BC7 blocks of a DDS texture, in exav-render's viewer reader (`decode_any`), never in what is hashed; no dependencies | MIT | **none** |
 | [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark) | Markdown (CommonMark, tables, strikethrough) read as events, into a tree of data in `@exav/viewer`'s text module and into the text a reader sees for the scanner's `visible-text` feature (on by default) and `exav-grep --text` (exav-render's `markdown` feature); without its `html` and `simd` features, so no markup is made and the crate is `forbid(unsafe_code)`. It was measured linear on 35 hostile 1 MB inputs (worst 8 ms) and without advisories | MIT | **none** (`forbid`; the 4 uses are its SIMD feature, off) |
-| [`html5gum`](https://crates.io/crates/html5gum) | HTML visible text (`visible-text`, on by default; `exav-grep --text`): a spec-compliant tokenizer alone (it passes the html5lib tokenizer tests), pulled token by token, keeping the words and where each link leads. No tree is built. Without its default `jetscii` feature it has no dependency | MIT | **none** (`forbid`) |
+| [`html5gum`](https://crates.io/crates/html5gum) | HTML visible text (`visible-text`, on by default; `exav-grep --text`) and the HTML pages the office converters read (`exav_unpack::html`): a spec-compliant tokenizer alone (it passes the html5lib tokenizer tests), pulled token by token, keeping the words and where each link leads. No tree is built. Without its default `jetscii` feature it has no dependency | MIT | **none** (`forbid`) |
 | [`hayro-interpret`](https://crates.io/crates/hayro-interpret) / [`hayro-syntax`](https://crates.io/crates/hayro-syntax) | PDF visible text (`visible-text-pdf` / `text-pdf`, **not a default**): hayro interprets each page and hands over its glyphs with their Unicode (`ToUnicode`, else glyph names). It is by the author of the JPEG 2000 and JBIG2 decoders exav-render already uses, and shares them. hayro puts no bound on what a stream decompresses to (a 1 MB PDF took 2.1 GB), so exav reads a PDF with it only after its own reader has taken every stream within the budget; a panic in it is contained. Built without the predefined CJK CMaps (`embed-cmaps`, which brings `brotli`). **Why it is off by default:** `hayro-interpret` turns on `hayro-syntax`'s `unsafe` feature itself, which switches every `flate2` in the build to `zlib-rs` (damaged streams then give back other bytes: two of exav-unpack's tests fail with it) and adds SIMD to the image decoders | Apache-2.0 OR MIT | **none** (`forbid`) / 11 (a lifetime `transmute`; with its `unsafe` feature, which is on, `flate2` and SIMD) |
 | [`tlsh2`](https://crates.io/crates/tlsh2) | TLSH fuzzy hashing | Apache-2.0 OR BSD-3-Clause | **none** |
 | [`rmp-serde`](https://crates.io/crates/rmp-serde) / [`rmp`](https://crates.io/crates/rmp) / [`serde`](https://crates.io/crates/serde) | MessagePack encoding of the prebuilt `.exavdb` | MIT / MIT / MIT OR Apache-2.0 | **none** (`forbid`) / 1 / 2 |
@@ -120,16 +120,19 @@ table generator and fuzz target check against.
 [exav-render](/subprojects/exav-render/#office-documents)'s `office-sheets`,
 `office-slides` and `office-docs` features (`office` for the three; none is a
 default) read ZIP packages and compound files and write XLSX, PPTX and DOCX.
-They add five crates to its dependencies, all in the tables on this page:
-`zip` (without default features, deflate through `flate2`), `quick-xml`,
-`encoding_rs`, and `md-5` and `sha1` (for an XLS encrypted with Excel's
-default password). `flate2` is already there for the image decoders, and the
-compound file reader, the iWork (protobuf and Snappy) readers and the OfficeArt
-reader are exav-render's own code.
+They add `exav-unpack` (its `ole`, `html`, `offcrypto` and `rtf` readers: the
+compound file and BIFF readers, the HTML tokens, the decryption of an XLS with
+Excel's default password, which brings `md-5` and `sha1`, and the RTF
+tokenizer, the same ones the scanner reads with) and three crates, all in the
+tables on this page: `zip` (without default features, deflate through
+`flate2`), `quick-xml` and `encoding_rs`; `html5gum` comes with the HTML
+tokens.
+`flate2` is already there for the image decoders, and the iWork (protobuf and
+Snappy) readers and the OfficeArt reader are exav-render's own code.
 
 Counted as above, `cargo tree -p exav-render -e no-dev --prefix none | sort -u
-| wc -l` gives 37 packages by default and 59 with `--features office` on
-Linux (56 for `wasm32-unknown-unknown`), the crate itself included. The scanner
+| wc -l` gives 47 packages by default and 76 with `--features office` on
+Linux (73 for `wasm32-unknown-unknown`), the crate itself included. The scanner
 links every one of them already, through exav-unpack, so its
 `visible-text-office` feature adds code and no crate.
 
@@ -158,13 +161,9 @@ DMG runs is `formats/lzfse.rs`, ported from Apple's reference implementation
 | [`bitstream-io`](https://crates.io/crates/bitstream-io) | Bit-level readers for decoders | MIT OR Apache-2.0 | **none** (`forbid`) |
 | [`tar`](https://crates.io/crates/tar) | tar archives (`xattr` disabled, which drops its syscall crates) | MIT OR Apache-2.0 | 26 |
 | [`zip`](https://crates.io/crates/zip) | ZIP container parsing; also the packages the office converters of [exav-render](/subprojects/exav-render/#office-documents) read and write (built without default features, deflate through `flate2`) | MIT | 25 |
-| [`cfb`](https://crates.io/crates/cfb) | OLE2 / Compound File Binary (Office) | MIT | **none** |
 | [`encoding_rs`](https://crates.io/crates/encoding_rs) | the code pages of DXF and DWG drawings before 2007, Asian double-byte ones included (features `dxf`, `dwg`), and of the text of the legacy office formats (exav-render's `office-*` features), built without `simd-accel` | (Apache-2.0 OR MIT) AND BSD-3-Clause | 180 |
 | [`quick-xml`](https://crates.io/crates/quick-xml) | OOXML / XML parsing; also the OpenDocument, Visio and Word 2003 XML the office converters read and the XML they write | MIT | **none** (`forbid`) |
 | [`mail-parser`](https://crates.io/crates/mail-parser) | MIME / email parsing | Apache-2.0 OR MIT | **none** (`forbid`) |
-| [`apfs`](https://crates.io/crates/apfs) / [`hfsplus`](https://crates.io/crates/hfsplus) | DMG filesystem parsing | MIT | **none** |
-| [`ext4-view`](https://crates.io/crates/ext4-view) | ext2/3/4 filesystem walking (virtual disks) | MIT OR Apache-2.0 | **none** (`forbid`) |
-| [`fatfs`](https://crates.io/crates/fatfs) | FAT12/16/32 cluster-chain walking | MIT | 11 |
 | [`lznt1`](https://crates.io/crates/lznt1) | LZNT1 (NTFS compressed streams) | MIT | **none** (`forbid`) |
 | [`salzweg`](https://crates.io/crates/salzweg) | LZW (ZOO, Unix `compress`) | MIT | **none** |
 | [`tinyvec`](https://crates.io/crates/tinyvec) | Inline vectors for the vendored bzip2 decoder | Zlib OR Apache-2.0 OR MIT | **none** (`forbid`) |
@@ -182,7 +181,6 @@ SIMD (AES-NI) and CPU-feature detection.
 | [`aes`](https://crates.io/crates/aes) / [`cbc`](https://crates.io/crates/cbc) | AES block cipher + CBC (ZIP, 7z, PDF, DMG, Office) | MIT OR Apache-2.0 | 60 / **none** |
 | [`des`](https://crates.io/crates/des) | Triple DES (encrypted DMG key unwrap) | MIT OR Apache-2.0 | **none** |
 | [`hmac`](https://crates.io/crates/hmac) / [`pbkdf2`](https://crates.io/crates/pbkdf2) / [`digest`](https://crates.io/crates/digest) | Key derivation + MAC | MIT OR Apache-2.0 | **none** / **none** / **none** (`forbid`) |
-| [`constant_time_eq`](https://crates.io/crates/constant_time_eq) | Constant-time comparison | CC0-1.0 OR MIT-0 OR Apache-2.0 | 2 |
 | [`stringprep`](https://crates.io/crates/stringprep) | Password normalization | MIT OR Apache-2.0 | **none** |
 
 ## Opt-in dependencies (not in the default binary)
@@ -248,7 +246,7 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`beef`](https://crates.io/crates/beef) | MIT OR Apache-2.0 | 26 | `yara-x-parser` |
 | [`bit-vec`](https://crates.io/crates/bit-vec) | Apache-2.0 OR MIT | 4 | `bit-set` |
 | [`autocfg`](https://crates.io/crates/autocfg) | Apache-2.0 OR MIT | **none** | build-time: `num-traits` and its users |
-| [`bitflags`](https://crates.io/crates/bitflags) | MIT OR Apache-2.0 | 21 (two versions resolve: 19 + 2) | `delharc`, `ext4-view`, `fatfs`, `image`, `png`, `pulldown-cmark`, `yara-x-parser` |
+| [`bitflags`](https://crates.io/crates/bitflags) | MIT OR Apache-2.0 | 19 | `delharc`, `image`, `png`, `pulldown-cmark`, `yara-x-parser` |
 | [`block-buffer`](https://crates.io/crates/block-buffer) | MIT OR Apache-2.0 | 21 | `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`block-padding`](https://crates.io/crates/block-padding) | MIT OR Apache-2.0 | **none** | `aes`, `cbc`, `des` |
 | [`bstr`](https://crates.io/crates/bstr) | MIT OR Apache-2.0 | 39 | `yara-x-parser` |
@@ -267,8 +265,6 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`countme`](https://crates.io/crates/countme) | MIT OR Apache-2.0 | 1 | `yara-x-parser` |
 | [`cpubits`](https://crates.io/crates/cpubits) | MIT OR Apache-2.0 | **none** | `aes` |
 | [`cpufeatures`](https://crates.io/crates/cpufeatures) | MIT OR Apache-2.0 | 11 | `aes`, `sha1`, `sha2` |
-| [`crc`](https://crates.io/crates/crc) | MIT OR Apache-2.0 | **none** (`forbid`) | `ext4-view` |
-| [`crc-catalog`](https://crates.io/crates/crc-catalog) | MIT OR Apache-2.0 | **none** (`forbid`) | `ext4-view` |
 | [`crypto-common`](https://crates.io/crates/crypto-common) | MIT OR Apache-2.0 | **none** (`forbid`) | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`ctutils`](https://crates.io/crates/ctutils) | Apache-2.0 OR MIT | **none** (`forbid`) | `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`either`](https://crates.io/crates/either) | MIT OR Apache-2.0 | 2 | `yara-x-parser` |
@@ -277,7 +273,7 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`fax_derive`](https://crates.io/crates/fax_derive) | MIT | **none** | `fax` |
 | [`fdeflate`](https://crates.io/crates/fdeflate) | MIT OR Apache-2.0 | **none** (`forbid`) | `image`, `png` |
 | [`filetime`](https://crates.io/crates/filetime) | MIT/Apache-2.0 | 9 | `tar` |
-| [`fnv`](https://crates.io/crates/fnv) | Apache-2.0 / MIT | **none** | `cfb`, `yara-x-parser` |
+| [`fnv`](https://crates.io/crates/fnv) | Apache-2.0 / MIT | **none** | `yara-x-parser` |
 | [`hashbrown`](https://crates.io/crates/hashbrown) | MIT OR Apache-2.0 | 751 (two versions resolve: 450 + 301) | `mail-parser`, `yara-x-parser`, `zip` |
 | [`hashify`](https://crates.io/crates/hashify) | Apache-2.0 OR MIT | **none** | `mail-parser` |
 | [`hayro-ccitt`](https://crates.io/crates/hayro-ccitt) | Apache-2.0 OR MIT | **none** (`forbid`) | `hayro-jbig2` |
@@ -291,7 +287,7 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`itertools`](https://crates.io/crates/itertools) | MIT OR Apache-2.0 | 10 | `yara-x-parser` |
 | [`itoa`](https://crates.io/crates/itoa) | MIT OR Apache-2.0 | 13 | `serde_json` |
 | [`lazy_static`](https://crates.io/crates/lazy_static) | MIT OR Apache-2.0 | 2 | `yara-x-parser` |
-| [`log`](https://crates.io/crates/log) | MIT OR Apache-2.0 | 6 | `fatfs`, `goblin` |
+| [`log`](https://crates.io/crates/log) | MIT OR Apache-2.0 | 6 | `goblin` |
 | [`logos`](https://crates.io/crates/logos) | MIT OR Apache-2.0 | 18 | `yara-x-parser` |
 | [`logos-codegen`](https://crates.io/crates/logos-codegen) | MIT OR Apache-2.0 | 4 | `yara-x-parser` |
 | [`logos-derive`](https://crates.io/crates/logos-derive) | MIT OR Apache-2.0 | **none** | `yara-x-parser` |
@@ -302,10 +298,10 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`num-derive`](https://crates.io/crates/num-derive) / [`paste`](https://crates.io/crates/paste) | MIT OR Apache-2.0 | **none** / **none** | `zenjxl-decoder` |
 | [`num-traits`](https://crates.io/crates/num-traits) | MIT OR Apache-2.0 | 1 | `delharc`, `image`, `rmp`, `rmp-serde`, `yara-x-parser` |
 | [`plain`](https://crates.io/crates/plain) | MIT/Apache-2.0 | 23 | `goblin` |
-| [`proc-macro2`](https://crates.io/crates/proc-macro2) | MIT OR Apache-2.0 | 6 | `apfs`, `clap`, `fax`, `goblin`, `hfsplus`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
+| [`proc-macro2`](https://crates.io/crates/proc-macro2) | MIT OR Apache-2.0 | 6 | `clap`, `fax`, `goblin`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`pxfm`](https://crates.io/crates/pxfm) | BSD-3-Clause OR Apache-2.0 | 224 | `image` |
 | [`qoi`](https://crates.io/crates/qoi) | MIT/Apache-2.0 | **none** (`forbid`) | `image` |
-| [`quote`](https://crates.io/crates/quote) | MIT OR Apache-2.0 | **none** | `apfs`, `clap`, `fax`, `goblin`, `hfsplus`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
+| [`quote`](https://crates.io/crates/quote) | MIT OR Apache-2.0 | **none** | `clap`, `fax`, `goblin`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`rowan`](https://crates.io/crates/rowan) | MIT OR Apache-2.0 | 55 | `yara-x-parser` |
 | [`rustc-hash`](https://crates.io/crates/rustc-hash) | Apache-2.0 OR MIT | **none** | a second version (1.x) for `yara-x-parser` |
 | [`rustc_version`](https://crates.io/crates/rustc_version) | MIT OR Apache-2.0 | **none** | build-time: `yara-x-parser` |
@@ -320,19 +316,17 @@ find ~/.cargo/registry/src/*/<crate>-<version>/src -name '*.rs' -print0 \
 | [`simd-adler32`](https://crates.io/crates/simd-adler32) | MIT | 36 | `flate2`, `image`, `png`, `zip` |
 | [`simdutf8`](https://crates.io/crates/simdutf8) | MIT OR Apache-2.0 | 135 (SIMD UTF-8 validation, on x86, x86-64, aarch64 and wasm32 with `simd128`) | `encoding_rs` |
 | [`strsim`](https://crates.io/crates/strsim) | MIT | **none** (`forbid`) | `clap` |
-| [`syn`](https://crates.io/crates/syn) | MIT OR Apache-2.0 | 152 (two versions resolve: 71 + 81) | `apfs`, `clap`, `fax`, `goblin`, `hfsplus`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
+| [`syn`](https://crates.io/crates/syn) | MIT OR Apache-2.0 | 152 (two versions resolve: 71 + 81) | `clap`, `fax`, `goblin`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`text-size`](https://crates.io/crates/text-size) | MIT OR Apache-2.0 | **none** (`forbid`) | `yara-x-parser` |
-| [`thiserror-impl`](https://crates.io/crates/thiserror-impl) | MIT OR Apache-2.0 | 1 | `apfs`, `hfsplus`, `lznt1`, `thiserror` |
+| [`thiserror-impl`](https://crates.io/crates/thiserror-impl) | MIT OR Apache-2.0 | 1 | `lznt1`, `thiserror` |
 | [`typed-path`](https://crates.io/crates/typed-path) | MIT OR Apache-2.0 | 32 | `zip` |
 | [`typenum`](https://crates.io/crates/typenum) | MIT OR Apache-2.0 | **none** (`forbid`) | `aes`, `cbc`, `des`, `digest`, `hmac`, `md-5`, `pbkdf2`, `sha1`, `sha2` |
 | [`unicase`](https://crates.io/crates/unicase) | MIT OR Apache-2.0 | **none** | `pulldown-cmark` |
 | [`unicode-bidi`](https://crates.io/crates/unicode-bidi) | MIT OR Apache-2.0 | 1 | `stringprep` |
-| [`unicode-ident`](https://crates.io/crates/unicode-ident) | (MIT OR Apache-2.0) AND Unicode-3.0 | 2 | `apfs`, `clap`, `fax`, `goblin`, `hfsplus`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
+| [`unicode-ident`](https://crates.io/crates/unicode-ident) | (MIT OR Apache-2.0) AND Unicode-3.0 | 2 | `clap`, `fax`, `goblin`, `lznt1`, `mail-parser`, `rmp-serde`, `serde`, `thiserror`, `yara-x-parser` |
 | [`unicode-normalization`](https://crates.io/crates/unicode-normalization) | MIT OR Apache-2.0 | 5 | `stringprep` |
 | [`unicode-properties`](https://crates.io/crates/unicode-properties) | MIT/Apache-2.0 | **none** | `stringprep` |
 | [`utf8parse`](https://crates.io/crates/utf8parse) | Apache-2.0 OR MIT | 1 | `clap` |
-| [`uuid`](https://crates.io/crates/uuid) | Apache-2.0 OR MIT | 15 | `cfb` |
-| [`web-time`](https://crates.io/crates/web-time) | MIT OR Apache-2.0 | **none** | `cfb` |
 | [`zmij`](https://crates.io/crates/zmij) | MIT | 70 | `serde_json` |
 | [`phf`](https://crates.io/crates/phf) / `phf_shared` (two versions of each resolve) | MIT | **none** / 1 | `hayro-interpret` |
 | [`smallvec`](https://crates.io/crates/smallvec) | MIT OR Apache-2.0 | 80 | `hayro-syntax`, `hayro-interpret`, `kurbo` |

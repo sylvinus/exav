@@ -10,7 +10,7 @@ const NS_XDR: &str = "http://schemas.openxmlformats.org/drawingml/2006/spreadshe
 const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const NS_C: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
 const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-use crate::formats::office::sheets::geom::{col_px, row_px, Grid, EMU_PER_PX};
+use crate::formats::office::sheets::geom::{EMU_PER_PX, Grid, col_px, row_px};
 
 fn off(frac: i64, px: f64) -> i64 {
     (frac.clamp(0, 1_000_000) as f64 / 1e6 * px * EMU_PER_PX).round() as i64
@@ -280,7 +280,9 @@ pub(crate) fn chartsheet(
     )?;
     let mut drels = Rels::default();
     let rid = drels.add("chart", format!("../charts/chart{}.xml", n.chart), false);
-    let mut d = format!("{XML_HEAD}<xdr:wsDr xmlns:xdr=\"{NS_XDR}\" xmlns:a=\"{NS_A}\" xmlns:r=\"{NS_R}\"><xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"0\"/><xdr:ext cx=\"9293679\" cy=\"6068786\"/>");
+    let mut d = format!(
+        "{XML_HEAD}<xdr:wsDr xmlns:xdr=\"{NS_XDR}\" xmlns:a=\"{NS_A}\" xmlns:r=\"{NS_R}\"><xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"0\"/><xdr:ext cx=\"9293679\" cy=\"6068786\"/>"
+    );
     chart_frame(&mut d, 2, "Chart 1", &rid);
     d.push_str("<xdr:clientData/></xdr:absoluteAnchor></xdr:wsDr>");
     pkg.part(
@@ -295,7 +297,11 @@ pub(crate) fn chartsheet(
     let drid = rels.add("drawing", format!("../drawings/drawing{k}.xml"), false);
     let x = format!(
         "{XML_HEAD}<chartsheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"{NS_R}\"><sheetPr/><sheetViews><sheetView{} workbookViewId=\"0\"/></sheetViews><pageMargins left=\"0.75\" right=\"0.75\" top=\"1\" bottom=\"1\" header=\"0.5\" footer=\"0.5\"/><drawing r:id=\"{drid}\"/></chartsheet>",
-        if si == wb.active { " tabSelected=\"1\"" } else { "" }
+        if si == wb.active {
+            " tabSelected=\"1\""
+        } else {
+            ""
+        }
     );
     pkg.part(
         &format!("xl/chartsheets/sheet{}.xml", si + 1),

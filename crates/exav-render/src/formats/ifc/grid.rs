@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 
-use super::math::{cross, len, scale, sub, unit, Xf, V3};
+use super::math::{V3, Xf, cross, len, scale, sub, unit};
 use super::step::Value;
-use super::{step, Reader};
+use super::{Reader, step};
 
 /// Most pairs of segments tried for one intersection.
 const MAX_PAIRS: usize = 4_000_000;
@@ -59,8 +59,8 @@ impl Axis {
                 vec![s]
             }
             Axis::Poly(pts) => pts
-                .windows(2)
-                .map(|w| shifted(w[0], sub(w[1], w[0])))
+                .array_windows()
+                .map(|&[a, b]| shifted(a, sub(b, a)))
                 .collect(),
         }
     }
