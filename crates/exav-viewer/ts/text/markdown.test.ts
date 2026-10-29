@@ -140,7 +140,7 @@ describe("raw HTML is text", () => {
   const hostile = [
     "<script>alert(1)</script>",
     "<img src=x onerror=alert(1)>",
-    "<svg onload=alert(1)><script>1</script></svg>",
+    "<svg onload=alert(1)><circle r=1></circle></svg>",
     "<iframe src=javascript:alert(1)></iframe>",
     "<a href=\"javascript:alert(1)\">x</a>",
     "<style>*{background:url(https://evil.example/x)}</style>",

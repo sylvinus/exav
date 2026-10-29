@@ -33,9 +33,10 @@ in archives would make the ZIP and 7z tests depend on working ZIP and decryption
 support to load their own inputs, and the `--no-default-features` build has
 neither compiled in.
 
-`scripts/release.sh` re-checks the whole tracked tree with `clamscan` when a
-signature database is present, so a fixture committed in the clear is caught
-before it ships.
+`scripts/release.sh` greps the tracked tree for the EICAR string on every run.
+`make av-audit` scans it with `clamscan` and a signature database, which needs
+both installed, so it is run when fixtures change; `docs/RELEASING.md` also
+has the release build scanned over the tree.
 
 ## Real malware is never committed
 

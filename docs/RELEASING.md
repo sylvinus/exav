@@ -52,6 +52,11 @@ rewritten at the end of this step.
 - `scripts/check-features.sh`: each format feature of `exav-unpack` builds
   alone.
 - `make av-audit` when fixtures changed (no EICAR literal committed unmasked).
+- The release build over the whole tracked tree, with the full database:
+  `git ls-files -z | xargs -0 target/release/exav -d <database>`. Nothing may
+  be `FOUND`: a fixture that holds EICAR or a signature's match, whole or inside
+  an archive, is committed masked (`.xor`). `PASSWORD-PROTECTED`,
+  `UNSCANNABLE` and `LIMITS-EXCEEDED` lines are the fixtures made for them.
 - The differential harnesses are research signals, not gates, and are run when
   the area changed: `scripts/difftest.sh` (against ClamAV), `make test-yara-diff`.
 

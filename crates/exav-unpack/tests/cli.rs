@@ -716,7 +716,7 @@ fn a_real_rar_volume_set_extracts_from_any_part() {
 /// joined; parts named otherwise are given with `--volume`.
 #[test]
 fn a_rar_volume_set_is_read_whole() {
-    let arc = std::fs::read(concat!(
+    let arc = exav_unpack::read_fixture(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar_solid/solid_rar4.rar"
     ))

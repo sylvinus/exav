@@ -305,3 +305,30 @@ fn cabinets_that_do_not_follow_one_another_as_their_headers_say_are_not_joined()
         );
     }
 }
+
+#[test]
+fn a_set_turned_away_for_its_size_does_not_use_up_the_budget_of_the_next() {
+    // The first set trips the cap. The part that did it was counted and never
+    // given back, so the second set, which fits, was "too large to hold" too.
+    let scanner = db(&[]);
+    let mut opts = ScanOptions::default();
+    opts.deep_analysis_max = 4096;
+    let given = names(&["a.part1.rar", "a.part2.rar", "b.part1.rar", "b.part2.rar"]);
+    let got = analyze_split_sets(&scanner, &given, &opts, |n, _| {
+        Ok(vec![0u8; if n == "a.part1.rar" { 4097 } else { 1000 }])
+    });
+    let reason = |name: &str| match &got.iter().find(|v| v.name == name).unwrap().report.verdict {
+        Verdict::Unscannable { reason } => reason.clone(),
+        other => format!("{other:?}"),
+    };
+    assert!(
+        reason("a.part1.rar").contains("too large to hold"),
+        "{}",
+        reason("a.part1.rar")
+    );
+    assert!(
+        !reason("b.part1.rar").contains("too large to hold"),
+        "b fits the budget: {}",
+        reason("b.part1.rar")
+    );
+}

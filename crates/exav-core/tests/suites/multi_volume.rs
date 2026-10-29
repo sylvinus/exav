@@ -415,3 +415,83 @@ fn ordinary_names_cost_nothing_and_return_nothing() {
     );
     assert!(v.is_empty(), "no sets, no verdicts");
 }
+
+/// `analyze_volume_sets` over `parts` with `opts`, the `unreadable` ones failing to read.
+fn sets_with(
+    parts: &[(String, Vec<u8>)],
+    unreadable: &[&str],
+    opts: &ScanOptions,
+) -> Vec<exav_core::VolumeSetVerdict> {
+    let names: Vec<String> = parts.iter().map(|(n, _)| n.clone()).collect();
+    exav_core::analyze_volume_sets(&Scanner::builtin(), &names, opts, |want| {
+        if unreadable.contains(&want) {
+            return Err(std::io::Error::other("permission denied"));
+        }
+        parts
+            .iter()
+            .find(|(n, _)| n == want)
+            .map(|(_, d)| d.clone())
+            .ok_or_else(|| std::io::Error::other("no such file"))
+    })
+}
+
+#[test]
+fn a_set_none_of_whose_parts_fits_the_budget_is_not_clean_part_by_part() {
+    // Every part is read and turned away, so the collector holds nothing of the
+    // set and has no entry to report. Each part then scanned alone as an
+    // ordinary file, and the archive was never looked at.
+    let parts = vec![
+        ("big.7z.001".to_string(), vec![b'A'; 5000]),
+        ("big.7z.002".to_string(), vec![b'B'; 5000]),
+    ];
+    let mut opts = ScanOptions::default();
+    opts.deep_analysis_max = 4096;
+    let v = sets_with(&parts, &[], &opts);
+    assert_eq!(v.len(), 2, "a verdict for each part: {v:?}");
+    for e in &v {
+        assert!(
+            matches!(e.report.verdict, Verdict::Unscannable { .. }),
+            "{}: got {:?}",
+            e.name,
+            e.report.verdict
+        );
+    }
+}
+
+#[test]
+fn a_set_is_known_by_the_same_name_whatever_the_case_of_its_parts() {
+    // The collector groups parts without regard to case. The unreadable last
+    // part was recorded under its own case, so the set joined under the first
+    // part's case missed it and its readable prefix scanned clean.
+    let mut parts = set_with_payload_in_the_tail("truncated");
+    parts[0].0 = parts[0].0.to_uppercase();
+    let last = parts[2].0.clone();
+    let v = sets(&parts, &[last.as_str()]);
+    assert!(!v.is_empty());
+    for e in &v {
+        assert!(
+            !matches!(e.report.verdict, Verdict::Clean),
+            "{}: a set that lost a volume was reported CLEAN: {:?}",
+            e.name,
+            e.report.verdict
+        );
+    }
+}
+
+#[test]
+fn the_one_readable_part_of_a_set_with_an_unreadable_part_is_not_a_lone_file() {
+    // `big.bin.001` alone looks like an ordinary numbered file, which is left
+    // to the caller's own scan. With `.002` present and unreadable it is half of
+    // an archive, and that scan says nothing about the other half.
+    let parts = vec![
+        ("big.bin.001".to_string(), vec![b'A'; 100]),
+        ("big.bin.002".to_string(), eicar().to_vec()),
+    ];
+    let v = sets(&parts, &["big.bin.002"]);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(
+        matches!(v[0].report.verdict, Verdict::Unscannable { .. }),
+        "{:?}",
+        v[0].report.verdict
+    );
+}

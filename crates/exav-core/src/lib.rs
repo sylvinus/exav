@@ -2086,13 +2086,21 @@ where
     // missing trailing index leaves no trace in them.
     let mut broken: std::collections::BTreeMap<String, &'static str> =
         std::collections::BTreeMap::new();
+    // The parts the collector read and would not hold. It keeps no trace of
+    // them, so a set none of whose parts it holds comes back with no entry.
+    let mut passed: Vec<String> = Vec::new();
+    // Parts group without regard to case, so a set is known by its lower-case
+    // name here, whichever part's case it was joined under.
+    fn set_key(name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
     for name in names {
         if !unpack::volume::parse(name).is_some_and(|v| v.scheme.is_byte_split()) {
             continue;
         }
         let Ok(data) = fetch(name) else {
             broken.insert(
-                volume_set_name(name),
+                set_key(&volume_set_name(name)),
                 "part of a multi-volume set one of whose volumes could not be read",
             );
             continue;
@@ -2102,9 +2110,10 @@ where
         // cap, or a second part claiming an index another part already holds.
         if let unpack::volume::Offer::PassThrough { name, .. } = collector.offer(name, data) {
             broken.insert(
-                volume_set_name(&name),
+                set_key(&volume_set_name(&name)),
                 "part of a multi-volume set that could not be reassembled whole",
             );
+            passed.push(name);
         }
     }
     if !any {
@@ -2120,7 +2129,7 @@ where
     for j in held.joined {
         // A set with a hole gets the hole's verdict, not a verdict read off the
         // bytes that happened to arrive.
-        let report = match broken.get(j.name.as_str()) {
+        let report = match broken.get(set_key(&j.name).as_str()) {
             Some(reason) => ScanReport::unscannable((*reason).to_string(), Vec::new()),
             None => analyze(db, &j.data, opts),
         };
@@ -2135,14 +2144,35 @@ where
     for u in held.unjoined {
         // A lone numbered file is not a set: plenty of ordinary files end in
         // `.001`, and the caller's own scan of it is the right answer.
-        let Some(reason) = u.incomplete_set else {
+        // Unless a part of it was lost: one readable part of a set whose other
+        // part could not be read is not a lone file.
+        let set = volume_set_name(&u.name);
+        let Some(reason) = u
+            .incomplete_set
+            .or_else(|| broken.get(set_key(&set).as_str()).copied())
+        else {
             continue;
         };
-        let set = volume_set_name(&u.name);
         out.push(VolumeSetVerdict {
             name: u.name,
             set,
             report: ScanReport::unscannable(reason.to_string(), Vec::new()),
+        });
+    }
+    // A part that was read and not held belongs to a set that cannot be
+    // rejoined: it is not a clean file because its own bytes scan clean.
+    for name in passed {
+        if out.iter().any(|v| v.name == name) {
+            continue;
+        }
+        let set = volume_set_name(&name);
+        out.push(VolumeSetVerdict {
+            name,
+            set,
+            report: ScanReport::unscannable(
+                "part of a multi-volume set that could not be reassembled whole".to_string(),
+                Vec::new(),
+            ),
         });
     }
     out
@@ -2326,13 +2356,15 @@ where
         for part in &set.parts {
             match fetch(part, None) {
                 Ok(d) => {
-                    held_total = held_total.saturating_add(d.len());
-                    if held_total > opts.deep_analysis_max as usize {
+                    // Counted only once held, so a part turned away leaves
+                    // the budget as the sets after it found it.
+                    if held_total.saturating_add(d.len()) > opts.deep_analysis_max as usize {
                         lost = Some(
                             "part of a multi-volume set too large to hold for rejoining (--max-object-bytes)",
                         );
                         break;
                     }
+                    held_total += d.len();
                     data.push(d);
                 }
                 Err(_) => {

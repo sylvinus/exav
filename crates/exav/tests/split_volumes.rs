@@ -23,7 +23,8 @@ fn exav() -> Command {
 
 fn fixture(dir: &str, name: &str) -> Vec<u8> {
     let p: PathBuf = [env!("CARGO_MANIFEST_DIR"), dir, name].iter().collect();
-    std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+    exav_core::unpack::read_fixture(&p.to_string_lossy())
+        .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
 /// `exav --json -d <empty> <targets>` -> the result objects, the summary dropped.

@@ -1786,8 +1786,8 @@ mod tests {
         let arcs = [
             rar4_stored(b"hi.txt", &[b'z'; 1000]),
             rar5_stored(b"a/b.bin", &[b'y'; 1000]),
-            std::fs::read(format!("{dir}/solid_rar4.rar")).unwrap(),
-            std::fs::read(format!("{dir}/solid_rar5.rar")).unwrap(),
+            crate::read_fixture(&format!("{dir}/solid_rar4.rar")).unwrap(),
+            crate::read_fixture(&format!("{dir}/solid_rar5.rar")).unwrap(),
         ];
         let names = |e: &[Entry]| {
             e.iter()

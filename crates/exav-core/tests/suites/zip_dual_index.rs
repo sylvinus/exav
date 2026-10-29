@@ -309,7 +309,7 @@ fn streamed_orphan_members_carrying_eicar_are_found() {
         env!("CARGO_MANIFEST_DIR"),
         "/../exav-unpack/tests/fixtures/zip/eicar_lzma.zip"
     );
-    let zip = std::fs::read(path).unwrap();
+    let zip = exav_core::unpack::read_fixture(path).unwrap();
     let field = |o: usize| u32::from_le_bytes(zip[o..o + 4].try_into().unwrap()) as usize;
     let start = 30 + usize::from(u16::from_le_bytes([zip[26], zip[27]]));
     assert_eq!((&zip[..4], zip[8], zip[28]), (&b"PK\x03\x04"[..], 14, 0));

@@ -426,7 +426,8 @@ fn a_split_zip_is_rejoined_when_streamed() {
         let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/split")
             .join(n);
-        std::fs::copy(from, dir.path().join(n)).unwrap();
+        let bytes = exav_core::unpack::read_fixture(&from.to_string_lossy()).unwrap();
+        std::fs::write(dir.path().join(n), bytes).unwrap();
     }
     let (code, stdout) = d.client(&["--send-as", "contents"], &[dir.path()]);
     assert_eq!(

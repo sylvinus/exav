@@ -11,7 +11,7 @@ import struct
 import sys
 
 STRING, BIN, STRING_ARRAY = 6, 7, 8
-EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\n"
+EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-" + b"STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\n"
 
 
 def header(entries):

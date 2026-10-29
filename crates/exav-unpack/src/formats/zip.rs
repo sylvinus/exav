@@ -2482,7 +2482,7 @@ mod zip_ppmd_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/zip/7z_ppmd_large_then_small.zip"
         );
-        let zip = std::fs::read(path).unwrap();
+        let zip = crate::read_fixture(path).unwrap();
         let u32_at = |o: usize| u32::from_le_bytes(zip[o..o + 4].try_into().unwrap());
         let u16_at = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]) as usize;
         let (comp, usz) = (u32_at(18) as usize, Some(u32_at(22) as u64));

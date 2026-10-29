@@ -21,11 +21,12 @@
 //!
 //! ## Under the worker pool
 //!
-//! The prefork daemon answers each connection from a forked child, so these
-//! counters live in whichever process handled the request and cover that
-//! process's own jobs. `STATS` says so rather than presenting one worker's
-//! numbers as the pool's. The thread-model daemon (`--workers 0`) and the ICAP
-//! listener are single processes, where the totals are the whole story.
+//! The prefork daemon answers each connection from a forked child. The counters
+//! are in memory the supervisor maps shared before it forks, each process
+//! writing its own slot of the in-flight gauge, so `STATS` from any process of
+//! the pool reports the pool's totals. A slot is cleared when its process is
+//! reaped. The thread-model daemon (`--workers 0`) and the ICAP listener are
+//! single processes.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Duration;
@@ -254,6 +255,8 @@ pub(crate) fn scans() -> u64 {
 /// decrements on the happy path reads as a permanently busy server.
 pub(crate) struct ScanTimer {
     start: std::time::Instant,
+    /// The gauge was given back, by `finish` or by dropping the timer.
+    released: bool,
 }
 
 impl ScanTimer {
@@ -266,21 +269,30 @@ impl ScanTimer {
         }
         Self {
             start: std::time::Instant::now(),
+            released: false,
+        }
+    }
+
+    /// Give the in-flight gauge back, once.
+    fn release(&mut self) {
+        if std::mem::replace(&mut self.released, true) {
+            return;
+        }
+        // Not below zero: a supervisor that cleared this slot after this
+        // process was thought dead must not wrap it.
+        let slot = &c().in_flight[my_slot()];
+        if slot.fetch_sub(1, Ordering::Relaxed) == 0 {
+            slot.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Record the finished scan. `target` names the object for the slow-scan
     /// line; `bytes` is its size.
-    pub(crate) fn finish(self, target: &str, bytes: u64, category: Category) {
+    pub(crate) fn finish(mut self, target: &str, bytes: u64, category: Category) {
         let elapsed = self.start.elapsed();
         let ns = elapsed.as_nanos() as u64;
         let k = c();
-        // Not below zero: a supervisor that cleared this slot after this
-        // process was thought dead must not wrap it.
-        let slot = &k.in_flight[my_slot()];
-        if slot.fetch_sub(1, Ordering::Relaxed) == 0 {
-            slot.fetch_add(1, Ordering::Relaxed);
-        }
+        self.release();
         k.scans.fetch_add(1, Ordering::Relaxed);
         k.bytes.fetch_add(bytes, Ordering::Relaxed);
         k.nanos.fetch_add(ns, Ordering::Relaxed);
@@ -319,6 +331,19 @@ impl ScanTimer {
                     .map(|p| format!(" [{}]", breakdown(&p)))
                     .unwrap_or_default()
             );
+        }
+    }
+}
+
+/// A scan that ends without `finish` (a panic unwinding, an early return)
+/// still gives the gauge back. It is not counted as a scan.
+impl Drop for ScanTimer {
+    fn drop(&mut self) {
+        if !self.released {
+            self.release();
+            // Profiling was enabled on this thread for a scan that did not
+            // report.
+            let _ = exav_core::profile::take();
         }
     }
 }
@@ -551,5 +576,31 @@ mod tests {
         assert!(c().in_flight[my_slot()].load(Ordering::Relaxed) > before);
         t.finish("gone", 0, Category::Partial);
         assert_eq!(c().in_flight[my_slot()].load(Ordering::Relaxed), before);
+
+        // A scan that panics, or returns, without reaching `finish`.
+        let slot = &c().in_flight[my_slot()];
+        let before = slot.load(Ordering::Relaxed);
+        let scans = c().scans.load(Ordering::Relaxed);
+        let panicked = std::panic::catch_unwind(|| {
+            let _t = ScanTimer::start();
+            panic!("the scan died");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            before,
+            "the panic leaked the gauge"
+        );
+        assert_eq!(
+            c().scans.load(Ordering::Relaxed),
+            scans,
+            "a dropped timer is not a finished scan"
+        );
+        drop(ScanTimer::start());
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            before,
+            "an early return leaked the gauge"
+        );
     }
 }
