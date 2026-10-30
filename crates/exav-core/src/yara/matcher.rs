@@ -13,9 +13,9 @@
 use std::ops::Range;
 
 use base64::Engine;
-use regex_automata::{meta, meta::Regex, util::syntax, Input};
-use regex_syntax::hir::{self, Hir, HirKind};
+use regex_automata::{Input, meta, meta::Regex, util::syntax};
 use regex_syntax::ParserBuilder;
+use regex_syntax::hir::{self, Hir, HirKind};
 use serde::{Deserialize, Serialize};
 
 use crate::byte_source::{ByteSource, CHUNK};
@@ -241,15 +241,17 @@ fn verify_full_word(data: &[u8], start: usize, end: usize, wide: bool, xor_key: 
 /// (up to) two bytes after it.
 fn full_word_between(before: &[u8], after: &[u8], wide: bool, xor_key: u8) -> bool {
     if wide {
-        if let [a, b] = before {
-            if (b ^ xor_key) == 0 && is_word(a ^ xor_key) {
-                return false;
-            }
+        if let [a, b] = before
+            && (b ^ xor_key) == 0
+            && is_word(a ^ xor_key)
+        {
+            return false;
         }
-        if let [a, b] = after {
-            if (b ^ xor_key) == 0 && is_word(a ^ xor_key) {
-                return false;
-            }
+        if let [a, b] = after
+            && (b ^ xor_key) == 0
+            && is_word(a ^ xor_key)
+        {
+            return false;
         }
     } else {
         if before.last().is_some_and(|b| is_word(b ^ xor_key)) {
@@ -553,17 +555,17 @@ impl PatternMatcher {
                     }
                     let last = data.len() - e.searched.len();
                     for pos in keep.start..keep.end.min(last + 1) {
-                        if data[pos..].starts_with(&e.searched) {
-                            if let Some(r) = verify_base64(
+                        if data[pos..].starts_with(&e.searched)
+                            && let Some(r) = verify_base64(
                                 &e.pattern,
                                 data,
                                 e.padding as usize,
                                 pos,
                                 &e.engine,
                                 e.wide,
-                            ) {
-                                out.push(origin + r.0, r.1 - r.0);
-                            }
+                            )
+                        {
+                            out.push(origin + r.0, r.1 - r.0);
                         }
                     }
                 }

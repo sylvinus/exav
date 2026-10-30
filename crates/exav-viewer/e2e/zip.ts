@@ -54,6 +54,37 @@ export function storedZip(files: [string, Uint8Array][], gap = 0): Buffer {
   return Buffer.concat([...parts, directory, end]);
 }
 
+/** A Unix `ar` archive, GNU style (what a `.deb` is made of), for the same tests. */
+export function ar(files: [string, Uint8Array][]): Buffer {
+  const parts: Buffer[] = [Buffer.from("!<arch>\n")];
+  for (const [name, data] of files) {
+    const header = Buffer.alloc(60, " ");
+    header.write(`${name}/`, 0, 16);
+    header.write("0", 16);
+    header.write("0", 28);
+    header.write("0", 34);
+    header.write("100644", 40);
+    header.write(String(data.length), 48);
+    header.write("`\n", 58);
+    parts.push(header, Buffer.from(data), Buffer.alloc(data.length % 2, "\n"));
+  }
+  return Buffer.concat(parts);
+}
+
+/** A cpio archive in the "new ASCII" format (what an initramfs and an RPM payload are). */
+export function cpio(files: [string, Uint8Array][]): Buffer {
+  const parts: Buffer[] = [];
+  const entry = (name: string, data: Uint8Array, mode: number) => {
+    const fields = [1, mode, 0, 0, 1, 0, data.length, 0, 0, 0, 0, name.length + 1, 0];
+    const header = Buffer.from(`070701${fields.map((f) => f.toString(16).padStart(8, "0")).join("")}${name}\0`);
+    const pad = (n: number) => Buffer.alloc((4 - (n % 4)) % 4);
+    parts.push(header, pad(header.length), Buffer.from(data), pad(data.length));
+  };
+  for (const [name, data] of files) entry(name, data, 0o100644);
+  entry("TRAILER!!!", new Uint8Array(), 0);
+  return Buffer.concat(parts);
+}
+
 /** A ustar archive of regular files (POSIX.1-1988), for the same tests. */
 export function tar(files: [string, Uint8Array][]): Buffer {
   const blocks: Buffer[] = [];

@@ -106,8 +106,11 @@ impl<'a> SevenZReader<'a> {
         ]))
     }
 
+    /// A property id. 7-Zip reads it as a number, so an id from 128 up is more
+    /// than a byte; it is returned as 255, which no id the reader knows is, and
+    /// the property is skipped by its size.
     pub fn read_nid(&mut self) -> Result<u8, LimitHit> {
-        self.read_byte()
+        Ok(u8::try_from(read_var_u64(self)?).unwrap_or(u8::MAX))
     }
 }
 

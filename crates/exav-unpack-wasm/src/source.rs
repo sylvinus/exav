@@ -87,7 +87,8 @@ impl<F: Fetch> Seek for Windowed<F> {
         // Seeking PAST the end is legal and reads nothing; the next `read`
         // returns zero bytes. Refusing here would reject a reader that seeks to
         // a computed offset before checking it.
-        self.pos = u64::try_from(at).map_err(|_| io::Error::other("seek past the largest offset"))?;
+        self.pos =
+            u64::try_from(at).map_err(|_| io::Error::other("seek past the largest offset"))?;
         Ok(self.pos)
     }
 }

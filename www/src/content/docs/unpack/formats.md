@@ -13,14 +13,16 @@ format, and how it reports such content, is on the scanner's
 [Supported formats](/scanner/reference/formats/) page.
 
 Each format is a Cargo feature; see [the crate's features](/unpack/rust/#features)
-to build a subset.
+to build a subset. The [format matrix](/project/formats/) puts what the
+scanner, the extractor and the viewer do with each format side by side.
 
 ## Archives
 
 | Format | Notes |
 |---|---|
 | ZIP | Every common method (see [codecs](#codec-level-coverage)) and [decryption](#encryption-support); orphan local headers and deferred-size members are carved too |
-| gzip · bzip2 · xz · zstd · lzip · `.Z` (LZW) · LZ4 | Streaming decompressors: a member is decoded as it is read, at any size. Concatenated streams and frames are followed for all of them |
+| gzip · bzip2 · xz · zstd · lzip · `.lzma` · `.Z` (LZW) · LZ4 | Streaming decompressors: a member is decoded as it is read, at any size. Concatenated streams and frames are followed for all of them. An xz stream with a check the decoder does not read (SHA-256, the reserved types) is decoded without it, as liblzma does; a `.lzma` file is known by its extension and a plausible header |
+| RPM | The package's install scripts, one member each, and its payload (usually a compressed cpio) |
 | ARC (SEA ARC / PKARC / PAK) | the pre-ZIP archiver; a member failing its CRC-16 after a full decode is still returned, as in ZIP |
 | tar | POSIX/GNU |
 | 7z | Every common coder (see [codecs](#codec-level-coverage)) and AES-256 [decryption](#encryption-support) |
@@ -29,14 +31,18 @@ to build a subset.
 | ARJ · LHA | classic archivers |
 | ALZ · EGG | ESTsoft's Korean archivers: ALZ stored, deflate and bzip2 members; EGG stored, deflate, bzip2, LZMA and AZO members (a block failing its CRC after a full decode is still returned, as in ZIP) |
 | InstallShield `.z` | the older installer archive (PKWARE DCL implode) |
-| ISO · UDF | CD/DVD/Blu-ray images: the ISO 9660 tree (with Joliet) and the UDF tree, including UDF-only images with no ISO 9660 descriptor. A bridge image carrying both is walked once per file |
-| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix and package archives |
+| ISO · UDF | CD/DVD/Blu-ray images: the ISO 9660 tree (with Joliet) and the UDF tree, including UDF-only images with no ISO 9660 descriptor. A bridge image carrying both is walked once per file (a file is its first sector and its length) |
+| `ar` (.deb / .a) · cpio (RPM) · xar (.pkg) | Unix and package archives. A cpio is read to the end of the file, every archive of an initramfs in turn, and bytes that are not a header are scanned as they lie |
 | DMG | Apple UDIF, including [encrypted](#encryption-support), with HFS+/APFS extraction; recognised by its trailer when its data opens with a bzip2 or xz run |
 | FAT12/16/32 | files inside a disk image, with their paths, reassembled from the cluster chain, so a fragmented file comes back whole |
-| ext2/3/4 | files inside a Linux disk image, with their paths, reassembled from the inode's extent tree or block map. Symlinks and device nodes hold no bytes and are skipped |
+| exFAT | files inside a disk image or a memory card's, with their paths, reassembled from the cluster chain (or the run a file with no chain is in). What is past a file's valid length reads as zeros |
+| ext2/3/4 | files inside a Linux disk image, with their paths, reassembled from the inode's extent tree or block map (inline data, meta block groups and bigalloc included; a preallocated extent reads as zeros). A file in an encrypted directory is reported. Symlinks and device nodes hold no bytes and are skipped. The journal is not replayed |
+| SquashFS | firmware, live and snap images: gzip, LZMA, LZO, XZ, LZ4 and Zstandard blocks, fragments and sparse blocks, both byte orders; version 4 |
+| cramfs · romfs | the small read-only filesystems of boot images; cramfs in both byte orders, with room for boot code and with holes; romfs with its hard links read as the files they name |
+| EROFS | files stored plain, with their tail after the inode, or in chunks with holes; a file stored compressed is reported |
 | ZOO | Rahul Dhesi's 1986 archiver, both codecs (LZD, a 13-bit LZW, and LZH). A member failing its CRC-16 is still returned, as in ZIP. Deleted members are extracted too: ZOO flags them and leaves the bytes in place |
 | NTFS | files inside a disk image, walked through the MFT: reassembled from their data runs (including across `$ATTRIBUTE_LIST`), read in place when resident, LZNT1-decompressed when compressed. Data runs short of the declared size are reported. The MFT walk also surfaces deleted-but-resident records a directory walk cannot see |
-| WIM (`.wim`/`.esd`) | Windows imaging format: file resources with their paths, uncompressed, XPRESS or LZX. A resource failing its SHA-1 after a full decode is still returned, as in ZIP; LZMS resources are reported |
+| WIM (`.wim`/`.esd`) | Windows imaging format: file resources with their paths, uncompressed, XPRESS or LZX. When checksums are verified (the `checksums` feature), a resource failing its SHA-1 delivers its bytes and then ends its stream with an error; LZMS resources are reported |
 | VHD · VHDX · QCOW2 · VMDK | virtual disks, reconstructed to the guest disk, then opened in turn: VHD fixed and dynamic, VHDX through its block allocation table, QCOW2 including deflate-compressed clusters, VMDK sparse and streamOptimized (the shape inside an OVA). Delta images against a parent (differencing VHD/VHDX, QCOW2 with a backing file) are reported, not skipped |
 
 ALZ and EGG matter for Korean-language targets, where ALZip is common, and so
@@ -58,25 +64,37 @@ The bound on what is held in memory at once is `Limits::max_buffer_bytes`
 (256 MiB by default; `--max-memory` on the command, 1 GiB).
 
 These are decoded as they are read, at any size, and their members come out as
-a `Member::Stream`: ZIP, tar, CAB, ISO/UDF, LHA, `ar`, cpio, TNEF, OneNote,
-SWF, SZDD, partition maps, self-extracting executables, universal Mach-O,
-`.pyc`, and the single-stream compressors above. The exceptions: ZIP Shrink,
-Reduce and Implode members, and encrypted ZIP members, are decoded whole under
-that bound.
+a `Member::Stream`: ZIP, tar, CAB, ISO/UDF, LHA, `ar`, cpio, 7z, WIM, xar,
+TNEF, OneNote, SWF, SZDD, partition maps, self-extracting executables,
+universal Mach-O, `.pyc`, and the single-stream compressors above. The
+exceptions: ZIP Shrink, Reduce and Implode members, encrypted ZIP members, and
+the folders of a 7z with an encrypted coder or with several packed streams
+(BCJ2), are decoded whole under that bound. A 7z reads its header and a WIM its
+directory tree whole under it too; the rest of each is read from where it lies
+in the source, so the archive is never held.
 
-A DMG is walked at any size, but each file in it is held whole, under the
-bound; an encrypted DMG is decrypted whole under the same bound. Only data
-forks are read. A file macOS compressed (decmpfs) keeps its bytes in an
-attribute or its resource fork instead: on HFS+, a file with a resource fork
-is reported unsupported; on APFS, and for small HFS+ files compressed into the
-attribute alone, such a file reads as empty.
+Disk images are walked at any size, and a file in one comes out as a stream,
+read from where the volume has it, when it is past the bound; a file within it
+is held. That covers a DMG (an encrypted one is decrypted whole under the same
+bound), the virtual disks VHD, VHDX, QCOW2 and VMDK, which are read as a
+seekable disk (a unit is fetched when a read reaches it, and decoded units are
+cached up to 32 MiB), and the partition maps and filesystems on them or on
+their own: FAT, exFAT, NTFS, ext, SquashFS, cramfs, romfs, EROFS, HFS+ and APFS,
+read in place. A file a filesystem stores compressed is decoded whole under the
+bound and reported, not read, past it, and the walk goes on. A stream that
+fails where the volume stops giving the file ends with an error after the
+bytes there were. A hole of a sparse file reads as zeros, and a file can
+declare a length far past what the volume backs: what a stream gives is bounded
+by the scan budget (`Limits::max_scanned_bytes`). Every APFS volume of a container is walked. A file macOS
+compressed (decmpfs) keeps its bytes in an attribute or its resource fork
+instead, and is unpacked (zlib, LZVN, LZFSE). Any other resource fork is
+reported, not read, and the data fork is read beside it. An encrypted APFS
+volume is reported.
 
 Every other format is read whole: a container larger than the bound is a
 `LimitHit` and its members are not reached. That includes RAR, OLE, PDF, CHM,
-ARJ, xar, email, WIM, and the virtual disks and filesystems (VHD, VHDX, QCOW2,
-VMDK, FAT, NTFS, ext), which are often larger than that: raise the bound where
-such images are expected. 7z is read whole too, but its members stream out of
-it. The scanner's own bounds for the same formats are on its
+ARJ and email, so raise the bound where such files are expected. The
+scanner's own bounds for the same formats are on its
 [Supported formats](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
 page.
 
@@ -126,6 +144,11 @@ cheaper than decoding and removes that hole on its own:
 | InstallShield InstallScript cabinet | Recognised, reported | `ISc(` at 0 |
 | InstallShield `.z` archive | **Decoded** | `13 5D 65 8C` at 0, confirmed against the header's own arithmetic (declared archive size, table-of-contents offset) |
 | ext2/3/4 | **Decoded** | `0xEF53` at offset 1080; nothing at offset 0 identifies the image |
+| exFAT | **Decoded** | `EXFAT   ` at 3, zeros to 64 and `55 AA` at 510 |
+| SquashFS | **Decoded** | `hsqs` (or `sqsh`, big-endian) at 0, and the 96 bytes of the superblock |
+| cramfs | **Decoded** | the magic in either byte order and `Compressed ROMFS` at 16, at 0 or 512 |
+| romfs | **Decoded** | `-rom1fs-` at 0 |
+| EROFS | **Decoded** | `E2 E1 F5 E0` at 1024 |
 | ZOO | **Decoded** | tag `0xFDC4A7DC` at 20 plus a non-zero version byte at 32; the leading `ZOO ?.?? Archive.` text may be anything |
 | AppleSingle / AppleDouble | Recognised, reported | `0x00051600` / `0x00051607` |
 | lrzip | Recognised, reported | `LRZI` at 0 |
@@ -200,7 +223,8 @@ are still returned. The command joins a volume set it is given
 intervals missing.
 
 **Disk images:** ISO 9660 + Joliet, UDF, DMG (HFS+/APFS, LZFSE/LZVN, encrypted),
-VHD, VHDX, QCOW2, VMDK, FAT12/16/32, NTFS and ext2/3/4. Images whose payload
+VHD, VHDX, QCOW2, VMDK, FAT12/16/32, exFAT, NTFS, ext2/3/4, SquashFS, cramfs,
+romfs and EROFS. Images whose payload
 lives in a parent file (differencing VHD/VHDX, QCOW2 with a backing file) are
 reported rather than partially reconstructed.
 
@@ -240,7 +264,7 @@ it reads back as a valid PE. See [PE stub emulation](/scanner/concepts/pe-emulat
 | PDF | object streams (FlateDecode, LZW, ASCII85, ASCIIHex, RunLength and filter chains), JavaScript, URI and launch-action harvesting; [decryption](#encryption-support) |
 | HWP3 (Hangul Word Processor 3) | the deflate-compressed body |
 | RTF | embedded hex objects |
-| MIME email | decoded attachments and parts |
+| MIME email | decoded attachments and parts, and those of attached messages (64 deep) |
 | TNEF (`winmail.dat`) · OneNote · Adobe XDP | embedded-file carriers |
 
 ## Executables

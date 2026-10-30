@@ -13,11 +13,9 @@
 //!    `order` and is resolved by the depth buffer rather than by the sequence
 //!    of draw calls. This is what makes spatial sorting possible at all.
 //! 2. **Opaque geometry must still be drawn before any translucent geometry**,
-//!    globally, not per bucket. The opaque pass writes depth and the
-//!    translucent pass only tests it; interleaving them by bucket would let a
-//!    later bucket's opaque geometry paint over an earlier bucket's
-//!    translucent. So the buffer is partitioned first and bucketed within each
-//!    half, and the renderer keeps its two passes.
+//!    globally, not per bucket: blending needs what lies behind already
+//!    drawn. So the buffer is partitioned first and only the opaque half is
+//!    bucketed; the translucent half keeps draw order (`scene.rs`).
 //! 3. **A bucket's contents can reach outside it.** A long line belongs to one
 //!    bucket but crosses many, so each bucket records the true bounding box of
 //!    what it holds rather than its own grid square. The renderer tests that.

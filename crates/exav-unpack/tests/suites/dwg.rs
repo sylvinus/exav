@@ -13,8 +13,8 @@
 
 use std::io::Read;
 
-use exav_unpack::dwg::{looks_like_dwg, Dwg, PreviewKind, Version};
-use exav_unpack::{detect, extract, Budget, Entry, Format, Limits};
+use exav_unpack::dwg::{Dwg, PreviewKind, Version, looks_like_dwg};
+use exav_unpack::{Budget, Entry, Format, Limits, detect, extract};
 
 /// Every version the converter writes, as the fixture directories name them.
 const VERSIONS: [&str; 8] = [

@@ -10,9 +10,10 @@ import type { FormatPlugin } from "./core/types.js";
 import { ifc, type IfcOptions } from "./ifc/index.js";
 import { image, type ImageOptions } from "./image/index.js";
 import { audio, video } from "./media/index.js";
-import { stl, type ModelOptions } from "./model/index.js";
+import { gltf, obj, ply, stl, type ModelOptions } from "./model/index.js";
 import { csv, docx, pptx, xlsx, type OfficeOptions } from "./office/index.js";
 import { pdf, type PdfOptions } from "./pdf/index.js";
+import { text } from "./text/index.js";
 
 export interface AllOptions {
   pdf?: PdfOptions;
@@ -34,10 +35,14 @@ export function allPlugins(o: AllOptions = {}): FormatPlugin<any>[] {
     audio(),
     ifc(o.ifc),
     stl(o.model),
+    obj(o.model),
+    ply(o.model),
+    gltf(o.model),
     docx(o.office),
     xlsx(o.office),
     pptx(o.office),
     csv(o.office),
+    text(),
     archive(o.archive),
   ];
 }

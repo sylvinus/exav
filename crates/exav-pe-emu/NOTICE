@@ -1,7 +1,85 @@
 exav-pe-emu: third-party notices
+================================
 
-This crate is part of exav and contains no third-party source. The notices
-for the components exav links are in the NOTICE file at the root of the exav
-repository, which also ships in every release archive:
+exav-pe-emu is licensed under the MIT License (see LICENSE). This file gives the
+notices for the third-party data in this crate's source. The notices for the
+components the exav binaries link are in the NOTICE file at the root of the
+exav repository: https://github.com/sylvinus/exav/blob/main/NOTICE
 
-https://github.com/sylvinus/exav/blob/main/NOTICE
+
+Microsoft API documentation, CC BY 4.0 (export name lists)
+----------------------------------------------------------
+
+src/exports/{kernel32,ntdll,user32,advapi32}.txt list the export names the
+synthetic system DLLs advertise. scripts/gen-exports.py, in this crate,
+extracts them from the metadata of Microsoft's API reference pages: for each
+page marked as a DLL export, the function name and the DLLs that export it.
+Nothing else from the pages is used. The lists are a selection and
+rearrangement of that metadata (names only, sorted, one per line). One name is
+added by the script with its reason stated there: ntdll's RtlDecompressBuffer,
+which the documentation records only under NtosKrnl.exe.
+
+Sources, pinned by commit:
+
+  MicrosoftDocs/sdk-api
+    https://github.com/MicrosoftDocs/sdk-api
+    commit 9e0d205d747b5e0f08019cc7e202112c3aa1f68c
+  MicrosoftDocs/windows-driver-docs-ddi
+    https://github.com/MicrosoftDocs/windows-driver-docs-ddi
+    commit 7515063cea4c9e98db6a92986c5b4ddb0463fd16
+
+Copyright (c) Microsoft Corporation.
+
+The documentation is licensed under the Creative Commons Attribution 4.0
+International Public License (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/legalcode
+
+The material is provided as-is, without warranties of any kind, as stated in
+section 5 of that licence.
+
+
+Layout facts for the synthetic TEB, PEB, loader lists and KUSER_SHARED_DATA
+---------------------------------------------------------------------------
+
+src/win.rs tags each field it writes with where its offset comes from. No text
+is copied; these are the sources of the facts, all Microsoft documentation
+under the CC BY 4.0 notice above:
+
+  [pe]  PE Format specification, "The .tls Section" (TEB+0x2C TLS array)
+        MicrosoftDocs/win32, desktop-src/Debug/pe-format.md,
+        commit 8a9c5d8f32001411f5e572a17e6d736d6fcc055f
+  [dbg] Debugger documentation, `dt` output from 32-bit Windows: TEB NtTib
+        (0x00), ClientId (0x20), ThreadLocalStoragePointer (0x2C),
+        ProcessEnvironmentBlock (0x30); PEB Ldr (0x0C); PEB_LDR_DATA Length
+        (0x28), Initialized (0x04) and its three list heads (0x0C, 0x14, 0x1C).
+        MicrosoftDocs/windows-driver-docs, commit
+        6de78e042e0eaba466569c7f5ed65c250c644a0b: debugger/
+        debugging-a-stack-overflow.md, debuggercmds/dt--display-type-.md,
+        debuggercmds/c---numbers-and-operators.md
+  [wtl] winternl.h reference: LDR_DATA_TABLE_ENTRY (InMemoryOrderLinks 0x08,
+        DllBase 0x18, FullDllName 0x24, and the positions of the reserved
+        slots at 0x00, 0x10, 0x1C and 0x2C), MicrosoftDocs/sdk-api (commit
+        above), ns-winternl-peb_ldr_data.md
+  [kus] KUSER_SHARED_DATA reference: field order only,
+        MicrosoftDocs/windows-driver-docs-ddi (commit above),
+        ns-ntddk-kuser_shared_data.md
+
+Fields tagged [obs] are not given by these sources. Each holds a value a
+32-bit Windows process can compare against an API that reports the same thing,
+which is how the offset is established:
+
+  TEB 0x00/0x04/0x08   ExceptionList, StackBase, StackLimit: the SEH chain
+                       head and the stack bounds of the running thread
+  TEB 0x18             Self: equals the TEB address
+  TEB 0x20/0x24        GetCurrentProcessId(), GetCurrentThreadId()
+  PEB 0x08             GetModuleHandle(NULL)
+  PEB 0x18             GetProcessHeap()
+  PEB 0x64             GetSystemInfo().dwNumberOfProcessors
+  PEB 0x68             global flags as set with gflags for the image
+  PEB 0xA4..0xB0       RtlGetVersion(): major, minor, build, platform id
+  LDR entry 0x00/0x10  walking the load-order and initialisation-order lists
+                       reaches the same entries the memory-order list does
+  LDR entry 0x1C/0x20  the module's entry point and SizeOfImage from its headers
+  LDR entry 0x2C       the module's file name
+  KUSER 0x00..0x270    GetTickCount(), the system time, the system root and
+                       RtlGetVersion() major/minor

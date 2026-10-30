@@ -16,7 +16,10 @@ import { expect, test, type FrameLocator, type Locator, type Page } from "@playw
 import { failOnViolations } from "./csp.js";
 import { bands, decodePng, difference, find, type Pixels } from "./pixels.js";
 import { openSample, pick, sample } from "./samples.js";
-import { storedZip, tar } from "./zip.js";
+import { ar, cpio, storedZip, tar } from "./zip.js";
+
+/** exav-unpack's fixtures: real files of the formats the archive plugin opens, made by their own tools. */
+const UNPACK_FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "exav-unpack", "tests", "fixtures");
 
 /** The requests a page made, by URL. */
 function recordRequests(page: Page): string[] {
@@ -27,12 +30,12 @@ function recordRequests(page: Page): string[] {
 
 /**
  * Runs `read` with the zoom buttons hidden: they sit over a corner of the
- * surface, which is not what the pixels are read for. Hidden through the
- * element's style, which the frame's policy has no say over (a `style` given to
- * the screenshot is an inline sheet it refuses).
+ * surface, which is not what the pixels are read for.
+ * Hidden through the element's style, which the frame's policy has no say over
+ * (a `style` given to the screenshot is an inline sheet it refuses).
  */
 async function withoutTools<T>(page: Page, read: () => Promise<T>): Promise<T> {
-  const set = (value: string) => page.locator(".exv-tools").evaluateAll((els, v) => els.forEach((e) => ((e as HTMLElement).style.visibility = v)), value);
+  const set = (value: string) => page.locator(".exav-viewer-tools").evaluateAll((els, v) => els.forEach((e) => ((e as HTMLElement).style.visibility = v)), value);
   await set("hidden");
   try {
     return await read();
@@ -68,18 +71,18 @@ for (const mode of ["sandbox", "page"] as const) {
 
   async function open(page: Page, name: string, lang = "en") {
     await openSample(page, name, { lang, ...(mode === "page" && { mode }) });
-    await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
   }
 
   /** What the engine put on screen: in the frame's document, or in the page's. */
   const engine = (page: Page, within = ".demo-frame"): FrameLocator | Locator =>
-    mode === "sandbox" ? page.frameLocator(`${within} iframe.exv-sandbox`) : page.locator(within);
+    mode === "sandbox" ? page.frameLocator(`${within} iframe.exav-viewer-sandbox`) : page.locator(within);
 
   test.describe(mode, () => {
     test.describe("drawings", () => {
       test("a DWG plan is drawn whole, in its proportions, beside its rails", async ({ page }) => {
         await open(page, "plan.dwg");
-        const canvas = engine(page).locator(".exv-cad-canvas");
+        const canvas = engine(page).locator(".exav-viewer-cad-canvas");
         const p = await settled(canvas);
         // The outer walls are a 12 m by 8 m rectangle, black on the light ground:
         // the dark pixels' box is that rectangle.
@@ -95,9 +98,9 @@ for (const mode of ["sandbox", "page"] as const) {
 
       test("the layer rail lists the file's layer table, and a layer turned off is not drawn", async ({ page }) => {
         await open(page, "plan.dwg");
-        const rows = page.locator(".exv-layer");
+        const rows = page.locator(".exav-viewer-layer");
         await expect(rows).toHaveText(["0", "WALLS", "DOORS", "FURNITURE", "TEXT", "COLUMNS"]);
-        const canvas = engine(page).locator(".exv-cad-canvas");
+        const canvas = engine(page).locator(".exav-viewer-cad-canvas");
         // FURNITURE is colour 4, cyan, and the only cyan in the plan.
         expect(find(await settled(canvas), cyan).count).toBeGreaterThan(200);
         await rows.filter({ hasText: "FURNITURE" }).getByRole("checkbox").uncheck();
@@ -108,9 +111,9 @@ for (const mode of ["sandbox", "page"] as const) {
 
       test("the DXF the DWG plan was converted from draws the same picture", async ({ page }) => {
         await open(page, "plan.dwg");
-        const fromDwg = await settled(engine(page).locator(".exv-cad-canvas"));
+        const fromDwg = await settled(engine(page).locator(".exav-viewer-cad-canvas"));
         await open(page, "plan.dxf");
-        const fromDxf = await settled(engine(page).locator(".exv-cad-canvas"));
+        const fromDxf = await settled(engine(page).locator(".exav-viewer-cad-canvas"));
         expect(find(fromDxf, dark).box).toEqual(find(fromDwg, dark).box);
         expect(difference(fromDwg, fromDxf)).toBeLessThan(1);
       });
@@ -123,7 +126,7 @@ for (const mode of ["sandbox", "page"] as const) {
           const log: { event: string; at: number; width?: number; height?: number }[] = [];
           (window as unknown as { thumbnailLog: typeof log }).thumbnailLog = log;
           const at = () => performance.timeOrigin + performance.now();
-          const thumbnail = (n: Node): n is HTMLImageElement => n instanceof HTMLImageElement && n.classList.contains("exv-cad-preview");
+          const thumbnail = (n: Node): n is HTMLImageElement => n instanceof HTMLImageElement && n.classList.contains("exav-viewer-cad-preview");
           new MutationObserver((records) => {
             for (const r of records) {
               if (r.type === "attributes" && r.target instanceof Element && r.target.getAttribute("data-phase") === "ready") log.push({ event: "ready", at: at() });
@@ -141,16 +144,16 @@ for (const mode of ["sandbox", "page"] as const) {
         const dwg = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "exav-unpack", "tests", "fixtures", "dwg", "preview", "R2018.dwg.gz");
         await page.goto(`./?lang=en${query}`);
         await page.getByTestId("file-input").setInputFiles({ name: "thumbnail.dwg", mimeType: "", buffer: zlib.gunzipSync(fs.readFileSync(dwg)) });
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
         await expect.poll(async () => (await logs()).map((e) => e.event)).toEqual(["shown", "gone", "ready"]);
         const [shown] = await logs();
         expect([shown!.width, shown!.height]).toEqual([4, 2]);
-        await expect(engine(page).locator(".exv-cad-preview")).toHaveCount(0);
+        await expect(engine(page).locator(".exav-viewer-cad-preview")).toHaveCount(0);
         // A drawing saved without one shows none (in sandbox mode, in a frame
         // of its own).
         const before = Date.now();
         await pick(page, "plan.dwg");
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
         await expect.poll(async () => (await logs()).filter((e) => e.event === "ready").length).toBe(2);
         expect((await logs()).filter((e) => e.event === "shown" && e.at > before)).toHaveLength(0);
       });
@@ -161,25 +164,25 @@ for (const mode of ["sandbox", "page"] as const) {
         const dwg = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "exav-render", "tests", "fixtures", "cad", "proxy", "dwg", "R2018", "proxy.dwg.gz");
         await page.goto(`./?lang=en${query}`);
         await page.getByTestId("file-input").setInputFiles({ name: "proxy.dwg", mimeType: "", buffer: zlib.gunzipSync(fs.readFileSync(dwg)) });
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-        await expect(page.locator(".exv-warnings")).toHaveText(
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".exav-viewer-warnings")).toHaveText(
           "2 custom objects were saved without their graphics: only the application that made them can show them.",
         );
-        expect(find(await settled(engine(page).locator(".exv-cad-canvas")), ink).count).toBeGreaterThan(100);
+        expect(find(await settled(engine(page).locator(".exav-viewer-cad-canvas")), ink).count).toBeGreaterThan(100);
         // The notice covers a corner of the drawing: it can be put away.
-        await page.getByRole("button", { name: "Close" }).and(page.locator(".exv-warnings button")).click();
-        await expect(page.locator(".exv-warnings")).toHaveCount(0);
+        await page.getByRole("button", { name: "Close" }).and(page.locator(".exav-viewer-warnings button")).click();
+        await expect(page.locator(".exav-viewer-warnings")).toHaveCount(0);
       });
 
       test("a truncated drawing is an error the page survives", async ({ page }) => {
         await page.goto(`./?lang=en${query}`);
         await page.getByTestId("file-input").setInputFiles({ name: "broken.dwg", mimeType: "", buffer: sample("plan.dwg").subarray(0, 3000) });
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "error");
-        await expect(page.locator(".exv-status-error")).toHaveText("The drawing could not be shown.");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "error");
+        await expect(page.locator(".exav-viewer-status-error")).toHaveText("The drawing could not be shown.");
         // The next drawing opens.
         await pick(page, "plan.dwg");
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-        await expect(page.locator(".exv-layer")).toHaveCount(6);
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".exav-viewer-layer")).toHaveCount(6);
       });
 
       test("a drawing older than R13 says so instead of failing to draw", async ({ page }) => {
@@ -188,21 +191,21 @@ for (const mode of ["sandbox", "page"] as const) {
         const dwg = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "exav-unpack", "tests", "fixtures", "dwg", "pre-r13", "R12.dwg.gz");
         await page.goto(`./?lang=en${query}`);
         await page.getByTestId("file-input").setInputFiles({ name: "r12.dwg", mimeType: "", buffer: zlib.gunzipSync(fs.readFileSync(dwg)) });
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "error");
-        await expect(page.locator(".exv-status-error")).toHaveText(
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "error");
+        await expect(page.locator(".exav-viewer-status-error")).toHaveText(
           "This drawing is saved in a format older than AutoCAD R13, which cannot be shown here.",
         );
         // The next drawing opens.
         await pick(page, "plan.dwg");
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
       });
 
       test("switching the ground keeps the view the user zoomed to", async ({ page }) => {
         await open(page, "plan.dwg");
         // The column alone, found as whatever differs from the ground.
         await page.getByRole("button", { name: "None" }).click();
-        await page.locator(".exv-layer", { hasText: "COLUMNS" }).getByRole("checkbox").check();
-        const canvas = engine(page).locator(".exv-cad-canvas");
+        await page.locator(".exav-viewer-layer", { hasText: "COLUMNS" }).getByRole("checkbox").check();
+        const canvas = engine(page).locator(".exav-viewer-cad-canvas");
         /** The column's box, and the ground's brightness. */
         const look = async () => {
           // Inside the canvas's edge, which the frame's border reaches.
@@ -243,31 +246,30 @@ for (const mode of ["sandbox", "page"] as const) {
     });
 
     test.describe("images", () => {
-      test("the same picture given again replaces the one shown, in the page at the zoom it was at, and the frame starts over", async ({ page }) => {
+      test("the same picture given again replaces the one shown, at the zoom it was at, in the page and in the frame", async ({ page }) => {
         await open(page, "landscape.png");
-        const tools = page.locator(".demo-frame .exv-tools");
-        const stage = engine(page).locator(".exv-image-stage");
-        await settled(page.locator(".demo-frame .exv-surface"));
+        const tools = page.locator(".demo-frame .exav-viewer-tools");
+        const stage = engine(page).locator(".exav-viewer-image-stage");
+        await settled(page.locator(".demo-frame .exav-viewer-surface"));
         for (let i = 0; i < 2; i++) await tools.getByRole("button", { name: "Zoom in" }).click();
         // Both clicks applied: the second reaches the surface a frame after the
         // first, and a read between them saw one step (`scale(1.25)`) on CI.
         await expect.poll(() => stage.evaluate((el) => el.style.transform)).toMatch(/scale\(1\.56/);
         const zoomed = await stage.evaluate((el) => el.style.transform);
-        const picture = engine(page).locator(".exv-image-picture");
+        const picture = engine(page).locator(".exav-viewer-image-picture");
         const before = await picture.evaluate((el) => (el as HTMLImageElement).src);
         // The file again, as the user gives it: another object, the same name.
         await pick(page, "landscape.png");
         await expect.poll(async () => picture.evaluate((el) => (el as HTMLImageElement).src)).not.toBe(before);
-        await settled(page.locator(".demo-frame .exv-surface"));
+        await settled(page.locator(".demo-frame .exav-viewer-surface"));
         const now = await stage.evaluate((el) => el.style.transform);
-        if (mode === "page") expect(now).toBe(zoomed);
-        else expect(now).toMatch(/scale\(1\)/);
+        expect(now).toBe(zoomed);
       });
 
       test("a TIFF, decoded in WebAssembly, looks as the same picture as a PNG the browser decodes", async ({ page }) => {
         const requests = recordRequests(page);
         await open(page, "landscape.png");
-        const surface = page.locator(".demo-frame .exv-surface");
+        const surface = page.locator(".demo-frame .exav-viewer-surface");
         const png = await settled(surface);
         expect(requests.some((u) => u.includes("exav_viewer_image"))).toBe(false);
         await open(page, "landscape.tif");
@@ -278,19 +280,20 @@ for (const mode of ["sandbox", "page"] as const) {
         expect(find(tif, (r, g, b) => r > 235 && g > 185 && g < 215 && b < 100).count).toBeGreaterThan(1000);
       });
 
-      test("JPEG 2000 and JBIG2 files, decoded in WebAssembly, look as the PNGs they were encoded from", async ({ page }) => {
-        // exav-render's fixtures, encoded losslessly by opj_compress and jbig2enc
-        // (crates/exav-render/tests/fixtures/images/make.py).
+      test("JPEG 2000, JBIG2 and JPEG XL files, decoded in WebAssembly, look as the PNGs they were encoded from", async ({ page }) => {
+        // exav-render's fixtures, encoded losslessly by opj_compress, jbig2enc
+        // and cjxl (crates/exav-render/tests/fixtures/images/make.py; the
+        // JPEG XL ones with `cjxl x.png x.jxl -d 0 -e 7`).
         const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "exav-render", "tests", "fixtures", "images");
-        const surface = page.locator(".demo-frame .exv-surface");
+        const surface = page.locator(".demo-frame .exav-viewer-surface");
         const show = async (name: string) => {
           await page.getByTestId("file-input").setInputFiles({ name, mimeType: "", buffer: fs.readFileSync(path.join(fixtures, name)) });
-          await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+          await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
           return settled(surface);
         };
         await page.goto(`./?lang=en${query}`);
         for (const [png, others] of [
-          ["rgb.png", ["rgb.jp2", "rgb.j2k"]],
+          ["rgb.png", ["rgb.jp2", "rgb.j2k", "rgb.jxl"]],
           ["bilevel.png", ["generic.jb2"]],
         ] as const) {
           const want = await show(png);
@@ -302,17 +305,23 @@ for (const mode of ["sandbox", "page"] as const) {
     test.describe("documents", () => {
       test("a PDF zoomed with the buttons is moved by dragging the page, and selects text once the toggle says so", async ({ page }) => {
         await open(page, "report.pdf");
-        const tools = page.locator(".demo-frame .exv-tools");
+        const tools = page.locator(".demo-frame .exav-viewer-tools");
         const hand = tools.getByRole("button", { name: "Move the page" });
         const text = tools.getByRole("button", { name: "Select text" });
-        const scroller = engine(page).locator(".exv-pdf-scroller");
+        const scroller = engine(page).locator(".exav-viewer-pdf-scroller");
         const position = () => scroller.evaluate((el) => [el.scrollLeft, el.scrollTop]);
         const selection = () => scroller.evaluate((el) => el.ownerDocument.getSelection()?.toString() ?? "");
         // The page fits: nothing to choose, and the zoom buttons are there.
         await expect(tools.getByRole("button", { name: "Zoom in" })).toBeVisible();
         await expect(hand).toHaveCount(0);
-        await expect(tools.getByRole("button", { name: "Zoom out" })).toBeDisabled();
+        await expect(tools.getByRole("button", { name: "Zoom out" })).toBeEnabled();
+        await expect(tools.getByRole("button", { name: "Fit to the window" })).toHaveCount(0);
+        const zoomInAt = async () => (await tools.getByRole("button", { name: "Zoom in" }).boundingBox())!.x;
+        const stable = await zoomInAt();
         for (let i = 0; i < 3; i++) await tools.getByRole("button", { name: "Zoom in" }).click();
+        await expect(tools.getByRole("button", { name: "Fit to the window" })).toBeVisible();
+        // The fit button came in on the left: the others did not move.
+        expect(await zoomInAt()).toBe(stable);
         await expect(hand).toBeVisible();
         await expect(hand).toHaveAttribute("aria-pressed", "true");
         await expect(tools.getByRole("button", { name: "Zoom out" })).toBeEnabled();
@@ -331,7 +340,7 @@ for (const mode of ["sandbox", "page"] as const) {
         // Chosen to select, the same drag, across the first line, selects it and moves nothing.
         await text.click();
         await expect(text).toHaveAttribute("aria-pressed", "true");
-        const run = engine(page).locator(".exv-pdf-text span", { hasText: "The north facade" });
+        const run = engine(page).locator(".exav-viewer-pdf-text span", { hasText: "The north facade" });
         await run.scrollIntoViewIfNeeded();
         const a = (await run.boundingBox())!;
         const held = await position();
@@ -349,11 +358,67 @@ for (const mode of ["sandbox", "page"] as const) {
         await expect(hand).toHaveCount(0);
       });
 
-      test("the same file given again replaces the document: in the page a zoomed PDF keeps its zoom and place, and the frame starts over", async ({ page }) => {
+      test("a PDF zooms out past the width to a whole page, where there is nothing to pan, and back", async ({ page }) => {
         await open(page, "report.pdf");
-        const tools = page.locator(".demo-frame .exv-tools");
-        const pages = engine(page).locator(".exv-pdf-page");
-        const scroller = engine(page).locator(".exv-pdf-scroller");
+        const tools = page.locator(".demo-frame .exav-viewer-tools");
+        const scroller = engine(page).locator(".exav-viewer-pdf-scroller");
+        const pageBox = engine(page).locator(".exav-viewer-pdf-page").first();
+        const zoomOut = tools.getByRole("button", { name: "Zoom out" });
+        const fitted = (await pageBox.boundingBox())!;
+        const view = (await scroller.boundingBox())!;
+        // The page at the width is taller than the viewer.
+        expect(fitted.height).toBeGreaterThan(view.height);
+        for (let i = 0; i < 4; i++) await zoomOut.click();
+        await expect.poll(async () => (await pageBox.boundingBox())!.height).toBeLessThan(view.height);
+        const small = (await pageBox.boundingBox())!;
+        // Centred, in a viewer wider than it is.
+        expect(Math.abs(small.x + small.width / 2 - (view.x + view.width / 2))).toBeLessThan(12);
+        await expect(tools.getByRole("button", { name: "Move the page" })).toHaveCount(0);
+        await tools.getByRole("button", { name: "Fit to the window" }).click();
+        await expect.poll(async () => Math.round((await pageBox.boundingBox())!.width)).toBe(Math.round(fitted.width));
+        await expect(tools.getByRole("button", { name: "Fit to the window" })).toHaveCount(0);
+      });
+
+      test("a Word document opens fitted to the width: the fit button comes with a zoom, goes with the fit, and survives a resize", async ({ page }) => {
+        await open(page, "notes.docx");
+        const tools = page.locator(".demo-frame .exav-viewer-tools");
+        const fit = tools.getByRole("button", { name: "Fit to the window" });
+        await expect(tools.getByRole("button", { name: "Zoom in" })).toBeVisible();
+        await expect(fit).toHaveCount(0);
+        // Resized while fitted, the page refits: still the fitted view.
+        await page.setViewportSize({ width: 1000, height: 800 });
+        await page.waitForTimeout(500);
+        await expect(fit).toHaveCount(0);
+        await tools.getByRole("button", { name: "Zoom in" }).click();
+        await expect(fit).toBeVisible();
+        // The zoom keeps its ratio to the fit across a resize.
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await page.waitForTimeout(500);
+        await expect(fit).toBeVisible();
+        await fit.click();
+        await expect(fit).toHaveCount(0);
+      });
+
+      test("the full screen button puts the viewer's box in full screen, frame and tools with it, and leaves it", async ({ page }) => {
+        await open(page, "report.pdf");
+        const tools = page.locator(".demo-frame .exav-viewer-tools");
+        const inFullscreen = () => page.evaluate(() => document.fullscreenElement?.className ?? null);
+        expect(await inFullscreen()).toBeNull();
+        await tools.getByRole("button", { name: "Full screen" }).click();
+        await expect.poll(inFullscreen).toContain("exav-viewer-body");
+        // The viewer fills the screen, and its tools are still there to leave it.
+        const box = (await page.locator(".demo-frame .exav-viewer-body").boundingBox())!;
+        expect(box).toMatchObject({ x: 0, y: 0, width: 1280, height: 800 });
+        await tools.getByRole("button", { name: "Leave full screen" }).click();
+        await expect.poll(inFullscreen).toBeNull();
+        await expect(tools.getByRole("button", { name: "Full screen" })).toBeVisible();
+      });
+
+      test("the same file given again replaces the document: a zoomed PDF keeps its zoom and place, in the page and in the frame", async ({ page }) => {
+        await open(page, "report.pdf");
+        const tools = page.locator(".demo-frame .exav-viewer-tools");
+        const pages = engine(page).locator(".exav-viewer-pdf-page");
+        const scroller = engine(page).locator(".exav-viewer-pdf-scroller");
         const position = () => scroller.evaluate((el) => [el.scrollLeft, el.scrollTop]);
         await expect(pages).toHaveCount(3);
         for (let i = 0; i < 3; i++) await tools.getByRole("button", { name: "Zoom in" }).click();
@@ -368,20 +433,16 @@ for (const mode of ["sandbox", "page"] as const) {
         const longer = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), ".out", "big.pdf"));
         await page.getByTestId("file-input").setInputFiles({ name: "report.pdf", mimeType: "", buffer: longer });
         await expect(pages).toHaveCount(12);
-        if (mode === "page") {
-          await expect.poll(position).toEqual([60, 200]);
-          await expect(tools.getByRole("button", { name: "Zoom out" })).toBeEnabled();
-        } else {
-          await expect(tools.getByRole("button", { name: "Zoom out" })).toBeDisabled();
-        }
+        await expect.poll(position).toEqual([60, 200]);
+        await expect(tools.getByRole("button", { name: "Zoom out" })).toBeEnabled();
       });
 
       test("a PDF opens on its first page, and its outline goes to the page of each section", async ({ page }) => {
         await open(page, "report.pdf");
-        const outline = page.locator(".exv-outline-entry");
+        const outline = page.locator(".exav-viewer-outline-entry");
         await expect(outline).toHaveText(["Scope", "Findings", "Actions"]);
         // Scope, Findings and Actions start pages 1, 2 and 3.
-        const pages = engine(page).locator(".exv-pdf-page");
+        const pages = engine(page).locator(".exav-viewer-pdf-page");
         await expect(pages).toHaveCount(3);
         await expect(pages.nth(0)).toBeInViewport({ ratio: 0.5 });
         await outline.filter({ hasText: "Actions" }).click();
@@ -395,7 +456,7 @@ for (const mode of ["sandbox", "page"] as const) {
       test("a PDF's text lies over the drawn text, at any zoom", async ({ page }) => {
         await open(page, "report.pdf");
         const sentence = "The north facade, the roof and the stairwell were inspected.";
-        const run = engine(page).locator(".exv-pdf-text span", { hasText: sentence });
+        const run = engine(page).locator(".exav-viewer-pdf-text span", { hasText: sentence });
         /** The drawn ink beside the run, in the run's band: it starts and ends where the run does. */
         const lined = async () => {
           let width = 0;
@@ -428,13 +489,13 @@ for (const mode of ["sandbox", "page"] as const) {
       test("a PDF's links go to their place in it, or open their address as any link the document follows", async ({ page, context }) => {
         await context.route("https://example.com/**", (route) => route.fulfill({ contentType: "text/plain", body: "guide" }));
         await open(page, "report.pdf");
-        const pages = engine(page).locator(".exv-pdf-page");
-        const links = pages.nth(0).locator(".exv-pdf-link");
+        const pages = engine(page).locator(".exav-viewer-pdf-page");
+        const links = pages.nth(0).locator(".exav-viewer-pdf-link");
         await expect(links).toHaveCount(2);
         // "See 3. Actions": to the third page's heading.
         await links.nth(0).click();
         await expect(pages.nth(2)).toBeInViewport({ ratio: 0.5 });
-        await page.locator(".exv-outline-entry", { hasText: "Scope" }).click();
+        await page.locator(".exav-viewer-outline-entry", { hasText: "Scope" }).click();
         await expect(pages.nth(0)).toBeInViewport({ ratio: 0.5 });
         // The address: in the frame, the host asks first; in the page, it opens as any link would.
         const asked: string[] = [];
@@ -453,7 +514,7 @@ for (const mode of ["sandbox", "page"] as const) {
 
       test("a Word document shows the seven paragraphs of its first page", async ({ page }) => {
         await open(page, "notes.docx");
-        const p = await settled(page.locator(".demo-frame .exv-surface"));
+        const p = await settled(page.locator(".demo-frame .exav-viewer-surface"));
         // One band of ink per paragraph, title included.
         expect(bands(p, ink, 3).length).toBe(7);
       });
@@ -465,7 +526,7 @@ for (const mode of ["sandbox", "page"] as const) {
         const first = runs.filter({ hasText: /^1\. $/ });
         const last = runs.filter({ hasText: /^spring\.$/ });
         await expect(first).toHaveCount(1);
-        await settled(page.locator(".demo-frame .exv-surface"));
+        await settled(page.locator(".demo-frame .exav-viewer-surface"));
         const a = (await first.boundingBox())!;
         const b = (await last.boundingBox())!;
         // The ink of the line, in its runs' band: it starts and ends where they do.
@@ -525,7 +586,7 @@ for (const mode of ["sandbox", "page"] as const) {
         const first = runs.filter({ hasText: /^Roof inspected\.$/ });
         const second = runs.filter({ hasText: /^Gutter replaced\.$/ });
         await expect(first).toHaveCount(1);
-        await settled(page.locator(".demo-frame .exv-surface"));
+        await settled(page.locator(".demo-frame .exav-viewer-surface"));
         const a = (await first.boundingBox())!;
         const b = (await second.boundingBox())!;
         // The ink of the first point, in its run's band: it starts and ends where the run does.
@@ -546,14 +607,14 @@ for (const mode of ["sandbox", "page"] as const) {
       test("a deck with a byte after its end record, which the engine's strict check refuses, still opens", async ({ page }) => {
         await page.goto(`./?lang=en${query}`);
         await page.getByTestId("file-input").setInputFiles({ name: "tail.pptx", mimeType: "", buffer: Buffer.concat([sample("visit.pptx"), Buffer.from("\n")]) });
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
         await expect(engine(page).locator("[data-ooxml-selection-run]", { hasText: /^Roof inspected\.$/ })).toHaveCount(1);
       });
 
       test("a slide is shown whole, at its own proportions, centred on the surface, and fitted again when the view changes size", async ({ page }) => {
         await open(page, "visit.pptx");
-        const slide = engine(page).locator("canvas.exv-office-canvas");
-        const surface = page.locator(".demo-frame .exv-surface");
+        const slide = engine(page).locator("canvas.exav-viewer-office-canvas");
+        const surface = page.locator(".demo-frame .exav-viewer-surface");
         const check = async () => {
           const s = (await slide.boundingBox())!;
           const v = (await surface.boundingBox())!;
@@ -601,17 +662,17 @@ for (const mode of ["sandbox", "page"] as const) {
 
       test("a spreadsheet and a semicolon CSV of the same quote both render", async ({ page }) => {
         await open(page, "quote.xlsx");
-        expect(find(await settled(page.locator(".demo-frame .exv-surface")), ink).count).toBeGreaterThan(500);
+        expect(find(await settled(page.locator(".demo-frame .exav-viewer-surface")), ink).count).toBeGreaterThan(500);
         await open(page, "quote.csv");
-        expect(find(await settled(page.locator(".demo-frame .exv-surface")), ink).count).toBeGreaterThan(500);
+        expect(find(await settled(page.locator(".demo-frame .exav-viewer-surface")), ink).count).toBeGreaterThan(500);
       });
     });
 
     test.describe("models and media", () => {
       test("an IFC model is drawn, lists its categories, and names what is tapped", async ({ page }) => {
         await open(page, "house.ifc");
-        await expect(page.locator(".exv-layer")).toHaveText(["IFCSLAB", "IFCWALL"]);
-        const canvas = engine(page).locator(".exv-model-canvas");
+        await expect(page.locator(".exav-viewer-layer")).toHaveText(["IFCSLAB", "IFCWALL"]);
+        const canvas = engine(page).locator(".exav-viewer-model-canvas");
         // The house fills a good part of the view in its categories'
         // colours (the file gives none), framed whole: the ground shows on
         // every side. The ground, the grid and the outline are greys.
@@ -625,22 +686,22 @@ for (const mode of ["sandbox", "page"] as const) {
         expect(house.box!.maxY).toBeLessThan(p.height - 3);
         // Seen from above the walls, the middle of the view is the slab's top.
         await canvas.click();
-        const rail = page.locator(".exv-rail-section", { hasText: "Element" });
-        await expect(rail.locator(".exv-strong")).toHaveText("Ground slab");
-        await expect(rail.locator(".exv-muted")).toHaveText(["IFCSLAB", "Ground floor"]);
+        const rail = page.locator(".exav-viewer-rail-section", { hasText: "Element" });
+        await expect(rail.locator(".exav-viewer-strong")).toHaveText("Ground slab");
+        await expect(rail.locator(".exav-viewer-muted")).toHaveText(["IFCSLAB", "Ground floor"]);
         // Hidden, the slab is not drawn and cannot be tapped: the ray goes
         // through to nothing.
-        await page.locator(".exv-layer", { hasText: "IFCSLAB" }).getByRole("checkbox").uncheck();
+        await page.locator(".exav-viewer-layer", { hasText: "IFCSLAB" }).getByRole("checkbox").uncheck();
         await canvas.click();
         await expect(rail.getByText("Tap an element to identify it.")).toBeVisible();
         // Everything hidden: only the grey floor grid is left.
-        await page.locator(".exv-layer", { hasText: "IFCWALL" }).getByRole("checkbox").uncheck();
+        await page.locator(".exav-viewer-layer", { hasText: "IFCWALL" }).getByRole("checkbox").uncheck();
         expect(find(await settled(canvas), coloured).count).toBe(0);
       });
 
       test("an IFC model with a beam left a kilometre away is framed on the house, and zooms where the pointer is", async ({ page }) => {
         await open(page, "stray.ifc");
-        const canvas = engine(page).locator(".exv-model-canvas");
+        const canvas = engine(page).locator(".exav-viewer-model-canvas");
         const coloured = (r: number, g: number, b: number) => Math.max(r, g, b) - Math.min(r, g, b) > 50;
         // Framed as the house alone is (above): it fills a good part of the view, whole.
         const p = await settled(canvas);
@@ -662,7 +723,7 @@ for (const mode of ["sandbox", "page"] as const) {
 
       test("an STL zooms where the pointer is, as an IFC model does", async ({ page }) => {
         await open(page, "house.stl");
-        const canvas = engine(page).locator(".exv-model-canvas");
+        const canvas = engine(page).locator(".exav-viewer-model-canvas");
         // The grey of the surface against the light ground, which is lighter everywhere.
         const surface = (r: number) => r < 180;
         const first = find(await settled(canvas), (r) => surface(r));
@@ -677,10 +738,12 @@ for (const mode of ["sandbox", "page"] as const) {
         expect(Math.abs(after.box!.minX - first.box!.minX)).toBeLessThan(12);
       });
 
-      test("an STL reports its triangle count", async ({ page }) => {
+      test("an STL reports its triangle count through its info controller", async ({ page }) => {
         await open(page, "house.stl");
         // Two boxes of twelve, two gable ends, two roof slopes of two.
-        await expect(page.locator(".exv-badge")).toHaveText("30 triangles");
+        await expect
+          .poll(() => page.evaluate(() => (window as any).exavDemo.session()?.controllers.get().info?.get().triangles))
+          .toBe(30);
       });
 
       test("a WAV plays for the two seconds it holds", async ({ page }) => {
@@ -696,14 +759,14 @@ for (const mode of ["sandbox", "page"] as const) {
       test("members open in place, an archive inside an archive too, with their own rails", async ({ page }) => {
         await open(page, "delivery.zip");
         const frame = page.locator(".demo-frame");
-        await expect(frame.locator(".exv-archive-head")).toHaveText("4 files");
-        const names = frame.locator(".exv-member-name > .exv-truncate:first-child");
+        await expect(frame.locator(".exav-viewer-archive-head")).toHaveText("4 files");
+        const names = frame.locator(".exav-viewer-member-name > .exav-viewer-truncate:first-child");
         await expect(names).toHaveText(["report.pdf", "quote.csv", "plan.dwg", "photos.zip"]);
-        await expect(frame.locator(".exv-member-folder")).toHaveText(["documents", "documents", "drawings"]);
+        await expect(frame.locator(".exav-viewer-member-folder")).toHaveText(["documents", "documents", "drawings"]);
 
         await frame.getByRole("button", { name: /report\.pdf/ }).click();
         // The member's outline goes to the rail, one level down.
-        await expect(frame.locator(".exv-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
+        await expect(frame.locator(".exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
         await frame.getByRole("button", { name: "Back to the archive" }).click();
 
         await frame.getByRole("button", { name: /photos\.zip/ }).click();
@@ -712,7 +775,7 @@ for (const mode of ["sandbox", "page"] as const) {
         const back = frame.getByRole("button", { name: "Back to the archive" });
         await expect(back).toHaveCount(2);
         // The sun of the landscape, drawn two archives down.
-        await expect.poll(async () => find(await shot(frame.locator(".exv-stage")), (r, g, b) => r > 235 && g > 185 && g < 215 && b < 100).count).toBeGreaterThan(1000);
+        await expect.poll(async () => find(await shot(frame.locator(".exav-viewer-stage")), (r, g, b) => r > 235 && g > 185 && g < 215 && b < 100).count).toBeGreaterThan(1000);
         await back.last().click();
         await expect(names).toHaveText(["landscape.tif"]);
         // Out of the inner archive, whose list fills the stage, by the outer bar.
@@ -723,19 +786,68 @@ for (const mode of ["sandbox", "page"] as const) {
       test("a .tar.gz lists the files of its tar, and a .gz the file it holds, by its name", async ({ page }) => {
         await page.goto(`./?lang=en${query}`);
         const frame = page.locator(".demo-frame");
-        const names = frame.locator(".exv-member-name > .exv-truncate:first-child");
+        const names = frame.locator(".exav-viewer-member-name > .exav-viewer-truncate:first-child");
         const tarball = zlib.gzipSync(tar([["documents/report.pdf", sample("report.pdf")], ["quote.csv", sample("quote.csv")]]));
         await page.getByTestId("file-input").setInputFiles({ name: "bundle.tar.gz", mimeType: "application/gzip", buffer: tarball });
         await expect(names).toHaveText(["report.pdf", "quote.csv"]);
-        await expect(frame.locator(".exv-member-folder")).toHaveText(["documents"]);
+        await expect(frame.locator(".exav-viewer-member-folder")).toHaveText(["documents"]);
         await frame.getByRole("button", { name: /report\.pdf/ }).click();
-        await expect(frame.locator(".exv-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
+        await expect(frame.locator(".exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
 
         await page.getByTestId("file-input").setInputFiles({ name: "quote.csv.gz", mimeType: "application/gzip", buffer: zlib.gzipSync(sample("quote.csv")) });
         await expect(names).toHaveText(["quote.csv"]);
         await frame.getByRole("button", { name: /quote\.csv/ }).click();
         await expect(frame.getByRole("button", { name: "Back to the archive" })).toBeVisible();
-        await expect(frame.locator(".exv-body").last()).toHaveAttribute("data-phase", "ready");
+        await expect(frame.locator(".exav-viewer-body").last()).toHaveAttribute("data-phase", "ready");
+      });
+
+      // Each file is opened by its name alone, as a download folder has it: the
+      // type is the one a browser gives a file it does not know.
+      const OTHER_FORMATS: [file: string, members: string[]][] = [
+        ["cab/mszip_lzx_qtm.cab", ["mszip.txt", "lzx.txt", "qtm.txt"]],
+        ["sample.arj", ["payload.txt"]],
+        ["wim/hard_LZX.wim", ["code.bin", "rand.bin"]],
+        ["zoo/default.zoo", ["license"]],
+        ["arc/microsoft_testdata.arc", ["TestFile.txt"]],
+        ["egg/directories.egg", ["test.txt"]],
+        ["dmg/hfs_plus_udzo.dmg", ["test.txt"]],
+        // In the archive's table order.
+        ["ishieldz/demo.z", ["hello.txt", "test.txt"]],
+        // A compressed stream holds one file, which is named after the stream.
+        ["lz4/one.lz4", ["one"]],
+        ["lzip_simple.lz", ["lzip_simple"]],
+        ["lzw/repetitive.b16.Z", ["repetitive.b16"]],
+        ["xz/simple.xz", ["simple"]],
+      ];
+      for (const [file, members] of OTHER_FORMATS) {
+        test(`${path.basename(file)} lists its files`, async ({ page }) => {
+          await page.goto(`./?lang=en${query}`);
+          const names = page.locator(".demo-frame .exav-viewer-member-name > .exav-viewer-truncate:first-child");
+          await page.getByTestId("file-input").setInputFiles({ name: path.basename(file), mimeType: "", buffer: fs.readFileSync(path.join(UNPACK_FIXTURES, file)) });
+          await expect(names).toHaveText(members);
+        });
+      }
+
+      test("a .deb, a cpio and a .tar.zst list their files, and the tar inside the zstd is shown as a tar", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        const frame = page.locator(".demo-frame");
+        const names = frame.locator(".exav-viewer-member-name > .exav-viewer-truncate:first-child");
+        const files: [string, Uint8Array][] = [["documents/report.pdf", sample("report.pdf")], ["quote.csv", sample("quote.csv")]];
+        const give = (name: string, buffer: Buffer) => page.getByTestId("file-input").setInputFiles({ name, mimeType: "", buffer });
+
+        await give("tool.deb", ar([["debian-binary", Buffer.from("2.0\n")], ["data.tar", tar(files)]]));
+        await expect(names).toHaveText(["debian-binary", "data.tar"]);
+        // A member that is an archive opens as one.
+        await frame.getByRole("button", { name: /data\.tar/ }).click();
+        await expect(names).toHaveText(["report.pdf", "quote.csv"]);
+
+        await give("initrd.cpio", cpio(files));
+        await expect(names).toHaveText(["report.pdf", "quote.csv"]);
+
+        await give("bundle.tar.zst", zlib.zstdCompressSync(tar(files)));
+        await expect(names).toHaveText(["report.pdf", "quote.csv"]);
+        await frame.getByRole("button", { name: /report\.pdf/ }).click();
+        await expect(frame.locator(".exav-viewer-outline-entry")).toHaveText(["Scope", "Findings", "Actions"]);
       });
 
       test("a member that cannot be shown leaves the way back to the archive open", async ({ page }) => {
@@ -747,10 +859,177 @@ for (const mode of ["sandbox", "page"] as const) {
         await page.getByTestId("file-input").setInputFiles({ name: "mixed.zip", mimeType: "application/zip", buffer: zip });
         const frame = page.locator(".demo-frame");
         await frame.getByRole("button", { name: /broken\.dwg/ }).click();
-        await expect(frame.locator(".exv-status-error")).toHaveText("The drawing could not be shown.");
+        await expect(frame.locator(".exav-viewer-status-error")).toHaveText("The drawing could not be shown.");
         await frame.getByRole("button", { name: "Back to the archive" }).click();
         await frame.getByRole("button", { name: /plan\.dxf/ }).click();
-        await expect(frame.locator(".exv-layer")).toHaveCount(6);
+        await expect(frame.locator(".exav-viewer-layer")).toHaveCount(6);
+      });
+    });
+
+    test.describe("text", () => {
+      const text = (page: Page) => engine(page).locator(".exav-viewer-text");
+      /** The text shown is exactly this: whitespace counts, which `toHaveText` ignores. */
+      const exactly = (page: Page, expected: string) => expect.poll(async () => await text(page).textContent()).toBe(expected);
+      /** Requests to anywhere but the demo's own origin or an object URL. */
+      const outside = (page: Page, requests: string[]) => {
+        const origin = `${new URL(page.url()).origin}/`;
+        return requests.filter((u) => !u.startsWith(origin) && !u.startsWith("blob:") && !u.startsWith("about:") && !u.startsWith("data:"));
+      };
+
+      test("a text file is shown as written, markup in it is only text, and its text selects", async ({ page }) => {
+        await open(page, "notes.txt");
+        const shown = "Site visit, north facade\n\tRender cracked above the windows.\n\nNext visit: Monday <b>not bold</b> & more";
+        await exactly(page, shown);
+        await expect(text(page).locator("b")).toHaveCount(0);
+        // A drag across a line, then the whole text, as the browser's selection reads them.
+        await text(page).locator(".exav-viewer-text-chunk").click({ clickCount: 3, position: { x: 40, y: 29 } });
+        const line = (await text(page).evaluate(() => String(getSelection()))).trim();
+        expect(line.length).toBeGreaterThan(0);
+        expect(shown).toContain(line);
+        const all = await text(page).evaluate((el) => {
+          const selection = getSelection()!;
+          selection.selectAllChildren(el);
+          return String(selection);
+        });
+        expect(all.trim()).toBe(shown);
+      });
+
+      test("Markdown shows its headings, emphasis, lists, table and code, and a link with the address it goes to", async ({ page }) => {
+        await open(page, "survey.md");
+        await expect(text(page).locator("h1")).toHaveText("Site survey");
+        await expect(text(page).locator("strong")).toHaveText("north facade");
+        await expect(text(page).locator("em")).toHaveText("repointing");
+        await expect(text(page).locator(".exav-viewer-text-link")).toHaveText("guide");
+        await expect(text(page).locator(".exav-viewer-text-url")).toHaveText(" (https://example.com/guide)");
+        await expect(text(page).locator("li")).toHaveText(["render", "gutter jointnorth-east corner", "north-east corner"]);
+        await expect(text(page).locator("th")).toHaveText(["Item", "Qty"]);
+        await expect(text(page).locator("td")).toHaveText(["Render", "120"]);
+        await expect(text(page).locator("pre")).toHaveText("make survey");
+        await expect(text(page).locator("a")).toHaveCount(0);
+      });
+
+      test("Markdown is read by its own wasm module, fetched only when one is opened", async ({ page }) => {
+        const requests = recordRequests(page);
+        await open(page, "notes.txt");
+        await expect(text(page)).toContainText("Site visit");
+        expect(requests.filter((u) => u.includes("exav_viewer_text"))).toEqual([]);
+        await open(page, "survey.md");
+        await expect(text(page).locator("h1")).toHaveText("Site survey");
+        expect(requests.filter((u) => u.includes("exav_viewer_text_bg") && u.includes(".wasm")).length).toBeGreaterThan(0);
+        expect(outside(page, requests)).toEqual([]);
+      });
+
+      test("a Markdown link opens its address as any link the document follows", async ({ page, context }) => {
+        await open(page, "survey.md");
+        // In the frame the host asks first; in the page it opens as any link would.
+        const asked: string[] = [];
+        page.on("dialog", (d) => {
+          asked.push(d.message());
+          void d.accept();
+        });
+        const popup = context.waitForEvent("page");
+        await text(page).locator(".exav-viewer-text-link").click();
+        const opened = await popup;
+        expect(opened.url()).toBe("https://example.com/guide");
+        expect(await opened.evaluate(() => window.opener)).toBeNull();
+        expect(asked).toEqual(mode === "sandbox" ? ["The document links to https://example.com/guide. Open it in a new tab?"] : []);
+        await opened.close();
+        // The document itself did not navigate.
+        await expect(text(page).locator("h1")).toHaveText("Site survey");
+      });
+
+      test("a hostile Markdown file runs nothing, loads nothing and links nowhere", async ({ page }) => {
+        const requests = recordRequests(page);
+        await open(page, "hostile.md");
+        const body = text(page);
+        await expect(body.locator("h1")).toContainText("<img src=x onerror=");
+        await expect(body).toContainText("<script>document.title = 'pwned'</script>");
+        await expect(body).toContainText("[tracker]");
+        await expect(body.locator("a, img, script, iframe, svg, object, embed")).toHaveCount(0);
+        // The label stays, the unsafe targets go: the only link is the safe one.
+        await expect(body).toContainText("run and data and relative");
+        await expect(body.locator(".exav-viewer-text-link")).toHaveText(["site"]);
+        await page.waitForTimeout(300);
+        expect(await page.title()).not.toContain("pwned");
+        expect(requests.filter((u) => u.includes("evil.example"))).toEqual([]);
+        expect(outside(page, requests)).toEqual([]);
+      });
+
+      test("JSON is indented with its numbers as they were written, and XML is indented as text", async ({ page }) => {
+        await open(page, "data.json");
+        await expect(text(page)).toContainText('"id": 12345678901234567890,');
+        await expect(text(page)).toContainText('"price": 1.10,');
+        await expect(text(page).locator(".exav-viewer-text-key")).toHaveCount(8);
+        expect((await text(page).textContent())!.split("\n").slice(0, 3)).toEqual(["{", '  "id": 12345678901234567890,', '  "price": 1.10,']);
+        await open(page, "feed.xml");
+        await exactly(
+          page,
+          ['<?xml version="1.0"?>', "<feed>", '  <entry id="1">', "    <title>Render</title>", "    <summary>Cracked &amp; loose</summary>", "  </entry>", '  <entry id="2"/>', "</feed>"].join("\n"),
+        );
+      });
+
+      test("a UTF-16 file is read by its mark", async ({ page }) => {
+        await open(page, "utf16.txt");
+        await exactly(page, "Zażółć gęślą jaźń\nsecond line");
+      });
+
+      test("a file that is not text is refused as such", async ({ page }) => {
+        await openSample(page, "photo.txt", { lang: "en", ...(mode === "page" && { mode }) });
+        await expect(page.locator(".demo-frame .exav-viewer-status-error")).toHaveText("This file is not text, so it cannot be shown here.");
+        await expect(text(page)).toHaveCount(0);
+      });
+
+      test("a file past the size limit shows its beginning and says so", async ({ page }) => {
+        await open(page, "huge.log");
+        await expect(page.locator(".demo-frame .exav-viewer-warnings")).toHaveText("The file is too large to show whole: only its beginning is shown.");
+        await expect(text(page).locator(".exav-viewer-text-chunk").first()).toContainText("line 1: inspection entry");
+        // 2 MiB of 51-byte lines, 200 lines to a block: about 205 blocks, never the 600 of the whole file.
+        await expect.poll(async () => await text(page).locator(".exav-viewer-text-chunk").count(), { timeout: 30_000 }).toBeGreaterThan(150);
+        expect(await text(page).locator(".exav-viewer-text-chunk").count()).toBeLessThanOrEqual(250);
+        await expect(text(page)).not.toContainText("line 120000:");
+      });
+
+      test("HTML is shown as its source and nothing in it runs or loads", async ({ page }) => {
+        const requests = recordRequests(page);
+        await open(page, "page.html");
+        await expect(page.locator(".demo-frame .exav-viewer-warnings")).toHaveText("HTML is shown as source text, not as a page.");
+        await expect(text(page)).toContainText('<script src="https://evil.example/x.js"></script>');
+        await expect(text(page).locator("script, img, p, body")).toHaveCount(0);
+        await page.waitForTimeout(300);
+        expect(await page.title()).not.toContain("pwned");
+        expect(requests.filter((u) => u.includes("evil.example"))).toEqual([]);
+      });
+
+      test("a diff colours its added and removed lines", async ({ page }) => {
+        await open(page, "fix.patch");
+        await expect(text(page).locator(".exav-viewer-text-add")).toHaveText("+repointed");
+        await expect(text(page).locator(".exav-viewer-text-del")).toHaveText("-cracked");
+        await expect(text(page).locator(".exav-viewer-text-hunk")).toHaveText("@@ -1,2 +1,2 @@");
+      });
+
+      test("text members of an archive open with the text viewer, and a binary one is refused", async ({ page }) => {
+        await page.goto(`./?lang=en${query}`);
+        const zip = storedZip([
+          ["docs/notes.txt", sample("notes.txt")],
+          ["data.json", sample("data.json")],
+          // No signature the detector knows: only its name says what it is.
+          ["fake.log", Uint8Array.from({ length: 400 }, (_, i) => (i * 37) % 256)],
+        ]);
+        await page.getByTestId("file-input").setInputFiles({ name: "texts.zip", mimeType: "application/zip", buffer: zip });
+        const frame = page.locator(".demo-frame");
+        await frame.getByRole("button", { name: /notes\.txt/ }).click();
+        await expect(text(page)).toContainText("Render cracked above the windows.");
+        await frame.getByRole("button", { name: "Back to the archive" }).click();
+        await frame.getByRole("button", { name: /data\.json/ }).click();
+        await expect(text(page)).toContainText('"price": 1.10,');
+        await frame.getByRole("button", { name: "Back to the archive" }).click();
+        await frame.getByRole("button", { name: /fake\.log/ }).click();
+        await expect(frame.locator(".exav-viewer-status-error")).toHaveText("This file is not text, so it cannot be shown here.");
+      });
+
+      test("the French locale words the notices", async ({ page }) => {
+        await open(page, "huge.log", "fr");
+        await expect(page.locator(".demo-frame .exav-viewer-warnings")).toHaveText("Le fichier est trop grand pour être affiché en entier : seul son début est affiché.");
       });
     });
 
@@ -759,9 +1038,9 @@ for (const mode of ["sandbox", "page"] as const) {
         const requests = recordRequests(page);
         await page.goto(`./?lang=en${query}`);
         await page.getByTestId("file-input").setInputFiles({ name: "mine.dxf", mimeType: "", buffer: sample("plan.dxf") });
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
         await expect(page.getByRole("heading", { name: "Your files" })).toBeVisible();
-        await expect(page.locator(".exv-layer")).toHaveCount(6);
+        await expect(page.locator(".exav-viewer-layer")).toHaveCount(6);
         // Every request went to the demo's own origin, or to an object URL
         // the page or the frame made, and none carried the file.
         const origin = `${new URL(page.url()).origin}/`;
@@ -779,40 +1058,50 @@ for (const mode of ["sandbox", "page"] as const) {
         const loaded = async (marker: string) => (await Promise.all(scripts)).some((s) => s.includes(marker));
         const requests = recordRequests(page);
         await open(page, "report.pdf");
-        for (const marker of ["exv-cad-canvas", "exv-model-canvas", "exv-archive-member", "exv-office exv-office-"]) expect(await loaded(marker), marker).toBe(false);
+        for (const marker of ["exav-viewer-cad-canvas", "exav-viewer-model-canvas", "exav-viewer-archive-member", "exav-viewer-office exav-viewer-office-"]) expect(await loaded(marker), marker).toBe(false);
         expect(requests.filter((u) => /\.wasm$/.test(u) && !u.includes("/pdfjs/"))).toEqual([]);
         await pick(page, "plan.dwg");
-        await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-        expect(await loaded("exv-cad-canvas")).toBe(true);
+        await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+        expect(await loaded("exav-viewer-cad-canvas")).toBe(true);
         expect(requests.some((u) => /exav_viewer_dwg_bg.*\.wasm/.test(u))).toBe(true);
-        for (const marker of ["exv-model-canvas", "exv-archive-member", "exv-office exv-office-"]) expect(await loaded(marker), marker).toBe(false);
+        for (const marker of ["exav-viewer-model-canvas", "exav-viewer-archive-member", "exav-viewer-office exav-viewer-office-"]) expect(await loaded(marker), marker).toBe(false);
       });
 
       test("the French locale translates the viewer's own strings", async ({ page }) => {
         await open(page, "plan.dwg", "fr");
-        await expect(page.locator(".exv-rail-label", { hasText: "Calques" })).toBeVisible();
+        await expect(page.locator(".exav-viewer-rail-label", { hasText: "Calques" })).toBeVisible();
       });
     });
   });
 }
 
-test("the sidebar lists each sample of samples.json once, and each is served and credited", async ({ page, request }) => {
-  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "demo", "public", "showcase");
+test("the sidebar lists each sample of samples.json and each example of examples.json once, and each is served and credited", async ({ page, request }) => {
+  const pub = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "demo", "public");
+  const dir = path.join(pub, "showcase");
   const json = path.join(dir, "samples.json");
   expect(fs.existsSync(json), "no samples: run npm run demo:showcase").toBe(true);
   const samples = (JSON.parse(fs.readFileSync(json, "utf8")) as { samples: { file: string }[] }).samples.map((s) => s.file).sort();
   // Every file copied in is in the list, and nothing else is.
   expect(fs.readdirSync(dir).filter((f) => !f.startsWith(".") && f !== "samples.json").sort()).toEqual(samples);
+  // The examples (npm run demo:examples), if they were copied in; one named like a sample replaces it.
+  const exampleDir = path.join(pub, "examples");
+  const exampleJson = path.join(exampleDir, "examples.json");
+  const examples = fs.existsSync(exampleJson) ? (JSON.parse(fs.readFileSync(exampleJson, "utf8")) as { examples: { file: string }[] }).examples.map((e) => e.file) : [];
+  expect(new Set(examples).size).toBe(examples.length);
+  const shown = [...samples.filter((s) => !examples.includes(s)), ...examples].sort();
   await page.goto("./?lang=en");
-  await expect(page.locator(".demo-side .demo-file")).toHaveCount(samples.length);
+  await expect(page.locator(".demo-side .demo-file")).toHaveCount(shown.length);
   const listed = (await page.locator(".demo-side .demo-file").allTextContents()).sort();
-  expect(listed).toEqual(samples);
+  expect(listed).toEqual(shown);
   const credits = await (await request.get("licenses/README.txt")).text();
-  for (const name of samples) {
-    const served = await request.get(`showcase/${name}`);
-    expect(served.ok(), name).toBe(true);
-    expect((await served.body()).length, name).toBe(fs.statSync(path.join(dir, name)).size);
-    expect(credits, name).toContain(`\n${name}\n`);
+  for (const [folder, root, names] of [["showcase", dir, samples], ["examples", exampleDir, examples]] as const) {
+    for (const name of names) {
+      const served = await request.get(`${folder}/${name}`);
+      expect(served.ok(), name).toBe(true);
+      // The preview server sends a .gz with Content-Encoding: gzip, and the request decodes it.
+      if (served.headers()["content-encoding"] !== "gzip") expect((await served.body()).length, name).toBe(fs.statSync(path.join(root, name)).size);
+      expect(credits, name).toContain(`\n${name}\n`);
+    }
   }
 });
 

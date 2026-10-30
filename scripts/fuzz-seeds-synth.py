@@ -194,3 +194,74 @@ signed = read("crates/exav-core/tests/fixtures/authenticode/signed_mismatch.exe"
 for i, delta in enumerate((0, 1, 8, 64)):
     put("authenticode", f"trunc{i}", signed[: len(signed) - delta])
 put("authenticode", "doubled", signed + signed[-256:])
+
+# --- vdisk: [format: u8][image] (fuzz_targets/vdisk.rs; FORMATS: 4 NTFS, 5 FAT,
+# 6 partition table; 7 and more try every format). The filesystem fixtures are gzipped
+# images of mostly zeros, so what a volume walk reads first is cut out: a FAT
+# image up to its last used byte, and the NTFS image up to the end of the
+# first run of `$MFT` (84 KiB, over the target's buffer limit, so it is walked
+# in place); each alone and as the partition of an MBR and of a GPT disk.
+# What is past the cut reads as missing.
+def unmask_gunzip(path):
+    raw = read(path, 1 << 30)
+    if path.endswith(".xor"):
+        raw = bytes(b ^ 0x5A for b in raw)
+    return gzip.decompress(raw)
+
+
+FIXTURES = "crates/exav-unpack/tests/fixtures/"
+fat = unmask_gunzip(FIXTURES + "fat/fragmented.img.gz.xor").rstrip(b"\0")
+fat += b"\0" * (-len(fat) % 512)
+ntfs = unmask_gunzip(FIXTURES + "ntfs/fragmented.img.gz.xor")[:86016]
+for kind, volume in (("fat", fat), ("ntfs", ntfs)):
+    mbr = bytearray(512)
+    mbr[0x1BE : 0x1BE + 16] = struct.pack("<B3sB3sII", 0x80, b"\0\2\0", 0x0C if kind == "fat" else 0x07, b"\0\0\0", 1, len(volume) // 512)
+    mbr[510:512] = b"\x55\xAA"
+    gpt = bytearray(3 * 512)
+    gpt[512:520] = b"EFI PART"
+    struct.pack_into("<QII", gpt, 512 + 72, 2, 1, 128)
+    gpt[1024] = 0xAB
+    struct.pack_into("<QQ", gpt, 1024 + 32, 3, 2 + len(volume) // 512)
+    put("vdisk", kind, bytes([4 if kind == "ntfs" else 5]) + volume)
+    put("vdisk", f"{kind}_in_mbr", bytes([6]) + bytes(mbr) + volume)
+    put("vdisk", f"{kind}_in_gpt", bytes([6]) + bytes(gpt) + volume)
+
+# --- imagehash: JPEG 2000 codestreams whose SIZ segment (ISO 15444-1, A.5.1:
+# Xsiz, Ysiz, XOsiz, YOsiz, XTsiz, YTsiz, XTOsiz, YTOsiz, Csiz, then Ssiz, XRsiz
+# and YRsiz per component) gives other sizes than the fixture's. What a decoder
+# does with the tiles, the subsampling and the offsets is what costs time and
+# memory, and a mutation reaches one of these fields rarely: a header that
+# implies hundreds of thousands of tiles took minutes to decode.
+J2K = "crates/exav-render/tests/fixtures/images/"
+SIZ = b"\xff\x4f\xff\x51"
+variants = (
+    ("tiles1", {"XTsiz": 1, "YTsiz": 1}),
+    ("tiles2", {"XTsiz": 2, "YTsiz": 2}),
+    ("tiles3", {"XTsiz": 3, "YTsiz": 7}),
+    ("wide", {"Xsiz": 1 << 22}),
+    ("wide_tiles16", {"Xsiz": 1 << 22, "XTsiz": 16, "YTsiz": 16}),
+    ("tall_tiles1", {"Ysiz": 1 << 22, "XTsiz": 1, "YTsiz": 1}),
+    ("huge", {"Xsiz": 0xFFFFFFFF, "Ysiz": 0xFFFFFFFF}),
+    ("offset", {"XOsiz": 1 << 20, "YOsiz": 1 << 20}),
+    ("tile_offset", {"XTOsiz": 1 << 20, "YTOsiz": 1 << 20}),
+    ("subsampled", {"XR": 130, "YR": 2}),
+    ("subsampled_max", {"XR": 255, "YR": 255}),
+    ("components", {"Csiz": 4}),
+)
+FIELDS = {"Xsiz": 8, "Ysiz": 12, "XOsiz": 16, "YOsiz": 20, "XTsiz": 24, "YTsiz": 28, "XTOsiz": 32, "YTOsiz": 36}
+for name in ("grey.j2k", "rgb.j2k", "rgb38-tiles.j2k", "grey-subsampled-tiles.j2k", "rgb.jp2", "rgba.jp2"):
+    data = read(J2K + name)
+    at = data.find(SIZ)
+    if at < 0:
+        continue
+    for tag, edit in variants:
+        d = bytearray(data)
+        for field, value in edit.items():
+            if field in FIELDS:
+                struct.pack_into(">I", d, at + FIELDS[field], value)
+            elif field == "Csiz":
+                struct.pack_into(">H", d, at + 40, value)
+            else:
+                # The first component's subsampling.
+                d[at + 43 if field == "XR" else at + 44] = value
+        put("imagehash", f"j2k_{name}_{tag}", bytes(d))

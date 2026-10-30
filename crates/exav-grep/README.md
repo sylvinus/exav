@@ -24,12 +24,19 @@ searcher.search_path(std::path::Path::new("backup.zip"), &mut |ev| {
 })?;
 ```
 
-## Everything happens in memory
+## Bounded memory, nothing on disk
 
 No member is ever written to disk, so the zip-slip / path-traversal / symlink
 class of bug does not arise: there is no path to traverse to. Extraction runs
 under the same decompression-bomb budgets the exav scanner uses, so a malicious
 archive cannot turn a search into an unbounded allocation.
+
+A file is never read whole past 16 MiB: a container is walked through a block
+cache, and anything else is searched a megabyte at a time. A 3.4 GB log was
+searched with an 18 MB peak, and a 1.5 GB stored member of a ZIP with 280 MB.
+A member up to `--max-object-bytes` (256 MiB) is held, so that a container
+inside it can be opened; a longer one is searched as it is read, and a
+container in it is reported unreadable. So is a line longer than that limit.
 
 `#![forbid(unsafe_code)]`, in this crate and in the extractor beneath it.
 

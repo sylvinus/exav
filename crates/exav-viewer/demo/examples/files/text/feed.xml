@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- An Atom feed, to show XML as text. -->
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+  <title>Notes from the east quay</title>
+  <subtitle type="html">Moorings, tides &amp; weather</subtitle>
+  <link href="https://example.invalid/feed.xml" rel="self"/>
+  <link href="https://example.invalid/"/>
+  <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+  <updated>2000-01-03T12:00:00Z</updated>
+  <author><name>The harbour office</name><email>office@example.invalid</email></author>
+  <entry>
+    <title>New berths on the east quay</title>
+    <link href="https://example.invalid/2000/01/berths"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+    <updated>2000-01-03T12:00:00Z</updated>
+    <summary>Twelve berths for visiting boats open on 1 March.</summary>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>The <b>east quay</b> is longer by 40&#160;metres.</p></div></content>
+    <category term="moorings"/>
+  </entry>
+  <entry>
+    <title>Tide tables for the year</title>
+    <link href="https://example.invalid/2000/01/tides"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6b</id>
+    <updated>2000-01-01T08:00:00Z</updated>
+    <summary><![CDATA[High water at 06:12 & 18:34; low water at <12:00.]]></summary>
+  </entry>
+</feed>

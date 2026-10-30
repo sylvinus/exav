@@ -329,11 +329,7 @@ fn note(kind: &str, k: &str, e: &Value, t: &Value, repair: &[String]) -> &'stati
         ("HATCH", "paths") => {
             let mut d = Vec::new();
             compare(&canonical_paths(&e[k]), &canonical_paths(&t[k]), "", &mut d);
-            if d.is_empty() {
-                " (same boundary)"
-            } else {
-                ""
-            }
+            if d.is_empty() { " (same boundary)" } else { "" }
         }
         ("DIMENSION", _) if e["style"] == "" && t["style"] != "" => " (regenerated)",
         ("VIEWPORT", "id") if number(&e[k]) > 0.0 && number(&t[k]) > 0.0 => " (stacking)",
@@ -615,10 +611,11 @@ fn dictionary_families(d: &Value) -> BTreeMap<String, &'static str> {
         if names.iter().any(|n| n.eq_ignore_ascii_case("CEPSNTYPE")) {
             todo.push((own.clone(), " (roundtrip)"));
         }
-        if let Some(first) = names.first().map(|n| entry_family(n)) {
-            if !first.is_empty() && names.iter().all(|n| !entry_family(n).is_empty()) {
-                todo.push((own, first));
-            }
+        if let Some(first) = names.first().map(|n| entry_family(n))
+            && !first.is_empty()
+            && names.iter().all(|n| !entry_family(n).is_empty())
+        {
+            todo.push((own, first));
         }
         for e in x["entries"].as_array().into_iter().flatten() {
             let f = entry_family(e[0].as_str().unwrap_or(""));
@@ -693,11 +690,11 @@ fn pairs_diff(
     if sa == sb {
         let null = ra.len() != la.len() || rb.len() != lb.len();
         let sorted = if kind == "dictionaries" {
-            rb.windows(2)
-                .all(|w| w[0].0.to_ascii_lowercase() <= w[1].0.to_ascii_lowercase())
+            rb.array_windows()
+                .all(|[a, b]| a.0.to_ascii_lowercase() <= b.0.to_ascii_lowercase())
         } else {
-            rb.windows(2)
-                .all(|w| hex(&Value::from(w[0].0.as_str())) <= hex(&Value::from(w[1].0.as_str())))
+            rb.array_windows()
+                .all(|[a, b]| hex(&Value::from(a.0.as_str())) <= hex(&Value::from(b.0.as_str())))
         };
         let note = match (null, sorted, ra == rb) {
             (true, _, true) => " (null entity)",
@@ -843,10 +840,10 @@ pub fn object_differences(dwg: &Value, dxf: &Value, seed: u64) -> Vec<ObjectDiff
         let theirs = by_handle(&dxf[kind]);
         let mut remade: BTreeMap<String, Vec<&str>> = BTreeMap::new();
         for (h, b) in theirs.iter().filter(|(h, _)| !ours.contains_key(*h)) {
-            if hex(&Value::from(h.as_str())) >= seed {
-                if let Some(id) = identity(kind, b) {
-                    remade.entry(id).or_default().push(h.as_str());
-                }
+            if hex(&Value::from(h.as_str())) >= seed
+                && let Some(id) = identity(kind, b)
+            {
+                remade.entry(id).or_default().push(h.as_str());
             }
         }
         let mut paired: Vec<&str> = Vec::new();

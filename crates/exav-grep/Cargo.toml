@@ -9,20 +9,34 @@ homepage.workspace = true
 keywords = ["grep", "search", "archive", "zip", "extract"]
 categories = ["command-line-utilities", "filesystem"]
 readme = "README.md"
-description = "grep for the inside of archives: search text across zip/rar/7z/tar/iso/OLE/PDF/email members, recursively, in memory."
+description = "grep for the inside of archives: search text across zip/rar/7z/tar/iso/OLE/PDF/email members, recursively, in bounded memory."
 
 [[bin]]
 name = "exav-grep"
 path = "src/main.rs"
 
 [dependencies]
-exav-unpack = { path = "../exav-unpack", version = "0.0.2", default-features = false, features = ["all-formats"] }
+exav-unpack = { path = "../exav-unpack", version = "0.0.3", default-features = false, features = ["all-formats"] }
+memchr = "2"
 regex = "1"
 clap = { workspace = true }
 walkdir = { workspace = true }
+# The text of a document as a reader sees it (`text` feature): exav-render's
+# `text`: Markdown, HTML, Office and OpenDocument XML parts, PDF and drawings.
+exav-render = { path = "../exav-render", version = "0.0.3", default-features = false, features = ["text"], optional = true }
 
 [features]
-default = ["decrypt"]
+default = ["decrypt", "text"]
+# `--text`: search the text a reader sees rather than the bytes, for the
+# formats that have one (Markdown, HTML, Office and OpenDocument XML parts,
+# PDF, drawings).
+text = ["dep:exav-render"]
+# And PDF's, read by hayro.
+text-pdf = ["text", "exav-render/text-pdf"]
+# And the office formats the XML parts do not reach: DOC, XLS, PPT, RTF, Word
+# 2003 XML, SpreadsheetML 2003, SYLK, flat OpenDocument, Numbers, Pages and
+# Keynote, by sheet, slide and part. The largest readers: not a default.
+text-office = ["text", "exav-render/text-office"]
 # Decrypt encrypted members (ZIP/7z/DMG/Office) so their contents are searchable
 # rather than reported as unreadable.
 decrypt = ["exav-unpack/decrypt"]

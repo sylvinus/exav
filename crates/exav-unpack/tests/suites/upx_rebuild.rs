@@ -24,7 +24,7 @@
 //! is handed over only when no candidate matches it, and never when checksums
 //! are verified.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 /// Assemble a minimal UPX-packed PE whose payload is a stored (uncompressed)
 /// run — enough to drive routing and the rebuild without depending on the NRV

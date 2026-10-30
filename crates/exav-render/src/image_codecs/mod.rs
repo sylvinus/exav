@@ -4,7 +4,7 @@
 pub(crate) mod jpeg;
 #[allow(dead_code, unused_imports, clippy::all)]
 #[rustfmt::skip]
-mod tiff;
+pub(crate) mod tiff;
 // As upstream wrote it.
 #[allow(clippy::chunks_exact_to_as_chunks, clippy::manual_is_multiple_of)]
 pub(crate) mod tiff_image;

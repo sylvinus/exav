@@ -99,10 +99,10 @@ fn find_archive_from(data: &[u8], from: usize) -> Option<(usize, &'static str)> 
         let found = memchr::memmem::find_iter(hay, sig)
             .map(|rel| rel + from)
             .find(|&off| plausible(data, off));
-        if let Some(off) = found {
-            if best.is_none_or(|(b, _)| off < b) {
-                best = Some((off, name));
-            }
+        if let Some(off) = found
+            && best.is_none_or(|(b, _)| off < b)
+        {
+            best = Some((off, name));
         }
     }
     best

@@ -92,14 +92,13 @@ of it. (A magic at the start does not always settle it: a DMG whose data opens
 with a bzip2 or xz run, as macOS writes compressed images, starts with that
 run's magic, and its trailer is what names it a disk image.) `walk()` then
 hands the members to a visitor one at a time. A format whose
-decoder reads forward (ZIP, tar, CAB, ISO, the single-stream compressors, …)
-produces each member as a reader that decodes as it is read, so neither the
-container nor the member is resident. A format whose decoder needs random access
-over the whole container (7z, RAR, OLE, PDF, CHM, the virtual disks and
-filesystem images, …) is read
-whole, bounded before it is allocated, up to `--max-object-bytes`; past it the
-container is `LIMITS-EXCEEDED`. 7z's members still stream once the container is
-in memory. Which it is is a property of the decoder, not of how exav was
+decoder reads forward, or finds its members by an index it reads from where it
+is (ZIP, tar, CAB, ISO, 7z, WIM, xar, the filesystems, the single-stream
+compressors, …) produces each member as a reader that decodes as it is read,
+so neither the container nor the member is resident. A format whose decoder
+needs random access over the whole container (RAR, OLE, PDF, CHM, ARJ, …) is
+read whole, bounded before it is allocated, up to `--max-object-bytes`; past it
+the container is `LIMITS-EXCEEDED`. Which it is is a property of the decoder, not of how exav was
 invoked; [Supported formats](/unpack/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
 lists both.
 
@@ -142,15 +141,21 @@ zip-slip, path traversal and symlink attacks still have nowhere to write.
 ## Containers have two indexes
 
 A ZIP lists its members twice: a local file header before each member's data, and
-a central directory at the end. Every normal reader trusts the central directory,
-because that is what the specification says is authoritative.
+a central directory at the end. The specification says the central directory is
+authoritative, and many readers go by it. Others, `unzip` among them, go by the
+local header.
 
-So a member can be hidden: leave it out of the central directory and keep its
-local header and data in the file. Plenty of extractors still write it out.
+So a member can be hidden in two ways: leave it out of the central directory and
+keep its local header and data in the file, or give the directory's record a
+method, a size or a name that is not the local header's, so that the two kinds of
+reader read two different members. Plenty of extractors still write both out.
 
 exav does dual indexing: after the central-directory pass it scans the raw bytes
-for local headers the directory did not cover, and extracts those too. The same
-path is the salvage route when the central directory is corrupt, forged or
+for local headers the directory did not cover, and extracts those too. A member
+whose local header says another method, another compressed size (when the header
+carries one) or another name than its directory record is read as its local
+header says as well, and claims none of the space of the members around it. The
+same path is the salvage route when the central directory is corrupt, forged or
 truncated. On a ZIP read from its source rather than held in memory, the search
 covers at most 16 MiB of unclaimed bytes, and a search cut short there is
 reported, not taken as complete.
@@ -166,7 +171,9 @@ it from readers that check the method.
 ISO images have the same shape: a CD image carries several volume descriptors,
 each with its own directory tree over the same sectors. A malicious ISO lists its
 payload only in the Joliet tree and leaves the primary tree empty, so a reader
-that parses the primary one sees an empty disc. exav walks every tree.
+that parses the primary one sees an empty disc. exav walks every tree. A file
+is its first sector and its length: a record of no length at the start of
+another file's extent does not take that file's place.
 
 ## Recovering what a naive reader would skip
 
@@ -193,6 +200,9 @@ holds for a bzip2, Zstandard, xz or lzip file cut short, and for the last member
 of a ZIP, NSIS, EGG, ALZ, XAR, SWF, HWP 3.0 or UPX file cut short, or the last
 grain or cluster of a VMDK or qcow2 image. bzip2 and Zstandard decode by block,
 so the block the cut falls in gives nothing: its content went with the cut.
+A cabinet's MSZIP and stored blocks are the exception, giving the part decoded
+before the cut or the damage; its LZX and Quantum frames (32 KiB at most) go
+whole.
 Indexed formats are different: a damaged ZIP index can leave member data
 present but never enumerated, which is why dual indexing exists. A 7z archive
 keeps its index at its end, so one cut short cannot be listed and is

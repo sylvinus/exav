@@ -2,8 +2,8 @@
 //! Feed arbitrary bytes through the RAR3 PPMd unpacker.  The fuzzer supplies
 //! both the (possibly malformed) packed data and the metadata; the decoder
 //! must never panic regardless of input.
+use exav_unpack::{Budget, Limits, unpack29};
 use libfuzzer_sys::fuzz_target;
-use exav_unpack::{unpack29, Budget, Limits};
 
 fuzz_target!(|data: &[u8]| {
     // Interpret the first 16 bytes as little-endian metadata, rest as packed

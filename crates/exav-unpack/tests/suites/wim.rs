@@ -22,7 +22,7 @@
 //! ```
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 /// `sha256sum` of the files that went into the images.
 const EICAR: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
@@ -131,6 +131,98 @@ fn lzx_handles_call_translation_and_stored_blocks() {
     assert_eq!(contents("hard_LZX.wim"), want);
 }
 
+/// Every member of `blob` read from a source that is not in memory, under a
+/// buffer limit of `cap`: its name, its bytes, whether it was read as it goes,
+/// and the error that ended its read.
+fn off_a_source(blob: &[u8], cap: u64) -> Vec<(String, Vec<u8>, bool, Option<String>)> {
+    use exav_unpack::Member;
+    use exav_unpack::source::BlockCache;
+    let cache = BlockCache::with_sizes(std::io::Cursor::new(blob.to_vec()), 256, 4 * 256).unwrap();
+    let mut limits = Limits::default();
+    limits.max_buffer_bytes = cap;
+    let mut budget = Budget::new(limits);
+    let mut out = Vec::new();
+    let end = exav_unpack::walk(Format::Wim, &cache, &mut budget, &mut |meta, content, _| {
+        let (data, streamed, error) = match content {
+            None => (Vec::new(), false, None),
+            Some(Member::Bytes(b)) => (b, false, None),
+            Some(Member::Stream(r)) => {
+                let mut b = Vec::new();
+                let e = r.read_to_end(&mut b).err().map(|e| e.to_string());
+                (b, true, e)
+            }
+        };
+        assert!(meta.unsupported.is_none(), "{}", meta.name);
+        out.push((meta.name.clone(), data, streamed, error));
+        None::<()>
+    });
+    end.unwrap();
+    out
+}
+
+/// A resource past the buffer limit is decoded a chunk at a time off a source
+/// that is not in memory, and comes out as the file that went in: the resources
+/// of every codec, and the several chunks of the one that is 88 KB.
+#[test]
+fn resources_over_the_buffer_limit_are_read_as_they_go_off_a_source_not_in_memory() {
+    for name in ["w_none.wim", "w_XPRESS.wim", "w_LZX.wim", "hard_LZX.wim"] {
+        // The directory tree is held whole, under the limit, and is larger
+        // than 400 bytes, so the names are not there: the bytes are.
+        let mut got: Vec<String> = off_a_source(&fixture(name), 400)
+            .into_iter()
+            .map(|(n, d, streamed, error)| {
+                assert_eq!(error, None, "{name}: {n}");
+                assert!(streamed, "{name}: {n} is past the limit");
+                sha256_hex(&d)
+            })
+            .collect();
+        got.sort();
+        let mut want: Vec<String> = contents(name).into_iter().map(|(_, h)| h).collect();
+        want.sort();
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+/// A chunk table that names a chunk past the end of its resource ends the
+/// read with an error, where the table is read, and not with a panic or bytes
+/// that are not the file's.
+#[test]
+fn a_chunk_past_the_end_of_its_resource_ends_the_read_with_an_error() {
+    let mut raw = fixture("hard_LZX.wim");
+    // Resource headers are at the start of the offset table: find the one for
+    // the resource of more than one chunk, and make its second chunk start
+    // far past its end.
+    let le = |d: &[u8], at: usize| u64::from_le_bytes(d[at..at + 8].try_into().unwrap());
+    let size = (le(&raw, 48) & 0x00FF_FFFF_FFFF_FFFF) as usize;
+    let table = le(&raw, 56) as usize;
+    let mut changed = 0;
+    for e in (table..table + size).step_by(50) {
+        let in_wim = (le(&raw, e) & 0x00FF_FFFF_FFFF_FFFF) as usize;
+        let at = le(&raw, e + 8) as usize;
+        let original = le(&raw, e + 16);
+        let flags = raw[e + 7];
+        if flags & 0x04 != 0 && original > 32768 {
+            assert!(in_wim > 4, "the chunk table is in the resource");
+            raw[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            changed += 1;
+        }
+    }
+    assert!(changed > 0, "a resource of more than one chunk");
+    let got = off_a_source(&raw, 400);
+    let broken: Vec<_> = got.iter().filter(|m| m.3.is_some()).collect();
+    assert!(
+        !broken.is_empty(),
+        "{:?}",
+        got.iter().map(|m| &m.0).collect::<Vec<_>>()
+    );
+    for (name, data, streamed, error) in broken {
+        assert!(*streamed, "{name}");
+        assert!(error.as_ref().unwrap().contains("outside"), "{name}");
+        // The first chunk ends where the second starts, which is not in it.
+        assert!(data.is_empty(), "{name}");
+    }
+}
+
 #[test]
 fn resources_in_a_codec_exav_lacks_are_reported_not_passed_over() {
     // LZMS is not decoded yet. That costs coverage, and it must not cost a
@@ -185,20 +277,31 @@ fn resources_failing_only_their_sha1_are_handed_over() {
     }
 }
 
+/// The members of `blob` with checksums verified. A resource is a stream whose
+/// read fails at its end where its SHA-1 does not hold, which a scan treats as
+/// the member not scanned, so it comes here as a member reported, with no data.
 #[cfg(feature = "checksums")]
 fn members_verified(blob: &[u8]) -> Vec<Entry> {
+    use exav_unpack::Member;
     let mut out = Vec::new();
     let mut b = Budget::new(Limits::default());
     b.set_verify_checksums(true);
-    let _ = extract_each(
-        Format::Wim,
-        blob,
-        &mut b,
-        &mut |e: Entry, _: &mut Budget| {
-            out.push(e);
-            None::<()>
-        },
-    );
+    let _ = exav_unpack::walk(Format::Wim, &blob, &mut b, &mut |meta, content, _| {
+        let mut entry = Entry::new(meta.name.clone(), Vec::new());
+        entry.unsupported = meta.unsupported;
+        match content {
+            Some(Member::Bytes(bytes)) => entry.data = bytes,
+            Some(Member::Stream(r)) => {
+                if r.read_to_end(&mut entry.data).is_err() {
+                    entry.data.clear();
+                    entry.unsupported = Some("stream read failed");
+                }
+            }
+            None => {}
+        }
+        out.push(entry);
+        None::<()>
+    });
     out
 }
 

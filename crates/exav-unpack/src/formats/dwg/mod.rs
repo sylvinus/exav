@@ -41,7 +41,7 @@ pub use bits::{BitError, BitResult, Bits, HandleRef};
 pub use extract::bmp_file;
 pub(crate) use extract::extract_dwg;
 pub use file::{
-    preview, trim_zeros, Class, Dwg, Locator, PreviewImage, PreviewKind, DEFAULT_MAX_BYTES,
+    Class, DEFAULT_MAX_BYTES, Dwg, Locator, PreviewImage, PreviewKind, preview, trim_zeros,
 };
 pub use object::{Eed, EedValue, EntityColor, EntityCommon, HeaderStreams, Object, Text};
 

@@ -152,7 +152,7 @@ native `catch_unwind` boundary, but at the WASM level.
 ## Building
 
 ```sh
-# Requires Rust 1.92+ and the wasm32-wasip1 target
+# Requires Rust 1.95+ and the wasm32-wasip1 target
 rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1 -p exav-core --features wasi-bin
 ```

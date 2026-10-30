@@ -1,8 +1,8 @@
 //! CCITTFaxDecode (T.4 and T.6), through hayro-ccitt.
 
-use hayro_ccitt::{decode, DecodeSettings, Decoder, DecoderContext, EncodingMode};
+use hayro_ccitt::{DecodeSettings, Decoder, DecoderContext, EncodingMode, decode};
 
-use super::{row_bytes, Error};
+use super::{Error, row_bytes};
 
 /// The stream's `/DecodeParms`, and the image dictionary's size.
 #[derive(Clone, Copy, Debug)]

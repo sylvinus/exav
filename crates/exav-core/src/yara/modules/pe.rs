@@ -194,10 +194,7 @@ fn build_pe(_data: &[u8], pe: &goblin::pe::PE) -> (Value, PeExtra) {
         let dll = imp.dll.to_string();
         let entry = match imports.iter_mut().find(|(d, _)| *d == dll) {
             Some(e) => e,
-            None => {
-                imports.push((dll, Vec::new()));
-                imports.last_mut().unwrap()
-            }
+            None => imports.push_mut((dll, Vec::new())),
         };
         entry.1.push(ImpFunc {
             name: Some(imp.name.to_string()),

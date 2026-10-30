@@ -12,7 +12,9 @@ reported `UNSCANNABLE`, `PASSWORD-PROTECTED` or `LIMITS-EXCEEDED`, never
 
 Containers are opened by the extractor, [exav-unpack](/unpack/). Its
 [Supported formats](/unpack/formats/) page has the codec-level detail; this
-page is what the scanner does with each kind of file.
+page is what the scanner does with each kind of file, and the
+[format matrix](/project/formats/) has every format, with what the extractor
+and the viewer do with it.
 
 ## File types
 
@@ -23,14 +25,14 @@ rules. On top of that:
 | Type | What the scanner does with it | Signatures that apply to it alone |
 |---|---|---|
 | PE (Windows executables and DLLs) | Reads the entry point, sections, imports, icons, version information and Authenticode signer; unpacks a packed file ([below](#packed-executables)) | `Target:1`; `EP`, section and `VI` offsets; section hashes (`.mdb`, `.msb`), import hashes (`.imp`), icons (`.idb`), signer block list (`.crb`); YARA `pe` and `dotnet` |
-| ELF | Scanned as it is; a UPX-packed one is unpacked | `Target:6`; YARA `elf`. `EP` and section offsets do not resolve ([gap](/scanner/reference/comparison-with-clamav/#targets)) |
-| Mach-O | A universal binary is split per architecture; each is scanned as it is, and a UPX-packed one unpacked | `Target:9`, with the same offset gap |
+| ELF | Scanned as it is; a UPX-packed one is unpacked | `Target:6`, with `EP` and section offsets ([how](/scanner/reference/comparison-with-clamav/#targets)); YARA `elf` |
+| Mach-O | A universal binary is split per architecture; each is scanned as it is, and a UPX-packed one unpacked | `Target:9`, with section offsets (`EP` does not resolve, as in clamscan) |
 | OLE2 (legacy Office, MSI) | Every stream; VBA macros decompressed, Excel 4.0 (XLM) macros, `Ole10Native` payloads; encrypted Excel decrypted | `Target:2` |
 | OOXML (`.docx`, `.xlsx`, `.pptx`) | Opened as the ZIP it is; told apart as Word, Excel or PowerPoint for `Container:`; encrypted documents decrypted | as for its members |
-| PDF | Streams decoded through their filters (Flate, LZW, ASCII85, ASCIIHex, RunLength), JavaScript and URI and launch targets collected, the document decrypted. Image streams (DCT, JBIG2, JPX, CCITT) are matched as stored | `Target:10` |
+| PDF | Streams decoded through their filters (Flate, LZW, ASCII85, ASCIIHex, RunLength; a filter given as a reference is followed, and the identity `/Crypt` is passed over), JavaScript and URI and launch targets collected, the document decrypted. Image streams (DCT, JBIG2, JPX, CCITT) are matched as stored; a stream with any other filter is reported. The header may follow up to a kilobyte of other bytes, and an object that does not end does not hide the ones after it | `Target:10` |
 | HTML | A normalised view (entities decoded, lowercased, whitespace collapsed) and, for script, a normalised and a deobfuscated JavaScript view; inline base64 assets extracted | `Target:3`, on the normalised view |
 | RTF | Both an HTML and a text view; embedded objects extracted | `Target:3` and `Target:7` |
-| Email (MIME), MHTML | Every part decoded and scanned; a MIME document with no mail envelope is a saved web page (MHTML) | `Target:4`, on the raw message |
+| Email (MIME), MHTML | Every part decoded and scanned, the last part of a multipart nothing closed included, a base64 part read as far as it decodes, and a file uuencoded into a text part; a message is known by its header block (any first field, in any case), and a MIME document with no mail envelope is a saved web page (MHTML) | `Target:4`, on the raw message |
 | Text, scripts | A normalised text view, and JavaScript views when the content looks like script; Script Encoder (`#@~^`) decoded; base64-encoded executables decoded ([below](#found-inside-other-files)) | `Target:7`, on the normalised view |
 | Images | PNG, GIF, JPEG, TIFF, BMP; with the `image-hash` feature (on by default) also WebP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000 and JBIG2. Each is hashed as ClamAV's `sigtool --fuzzy-img` hashes it | `Target:5`; `fuzzy_img#` |
 | SWF | Compressed movies (`CWS`, `ZWS`) decompressed and rescanned | `Target:11` |
@@ -41,6 +43,25 @@ not run. `HandlerType:` re-types an object and scans it again as the new
 type, as in ClamAV. [Comparison with ClamAV](/scanner/reference/comparison-with-clamav/#targets)
 covers the targets in detail.
 
+### The text a reader sees
+
+Beside its bytes, a document is matched through its visible text: the words
+without the marks, tags, escapes or run boundaries, entities decoded, and each
+link followed by where it goes (`label (target)`). That text is one more view,
+which `Target:0` and `Target:7` signatures see, and `--detect phishing` judges
+its links. It is the `visible-text` [feature](/scanner/reference/feature-flags/),
+off under `--clamav-compat`.
+
+| Read in the default build | Read with an opt-in feature |
+|---|---|
+| Markdown (`.md`, `.markdown`), HTML, the XML parts of Word, PowerPoint, Excel and OpenDocument files, DXF and DWG drawings | PDF (`visible-text-pdf`); DOC, XLS, PPT, RTF, Word 2003 XML, SpreadsheetML 2003, SYLK, flat OpenDocument (FODT, FODS, FODP, FODG), Numbers, Pages and Keynote (`visible-text-office`) |
+
+A document of a kind that has such a text, whose text cannot be taken out
+(encrypted, past a limit, damaged), is still scanned as bytes, and the scan is
+`PARTIAL`, never `OK`. A compound file (`.doc`, `.xls`, `.ppt` and their
+templates) is read as an office document by its extension only, so that an
+installer is not read whole to find out.
+
 ## Containers
 
 Every format exav-unpack opens is opened when scanning, and its members
@@ -48,11 +69,14 @@ scanned in turn:
 
 - **Archives:** ZIP (every common method), 7z, RAR3 and RAR5, tar, CAB, CHM,
   ARJ, LHA, ZOO, ARC, ALZ, EGG, InstallShield `.z`, `ar`, cpio, xar.
-- **Compressed streams:** gzip, bzip2, xz, zstd, lzip, LZ4, Unix `compress`
-  (`.Z`), SZDD, KWAJ.
+- **Compressed streams:** gzip, bzip2, xz, zstd, lzip, `.lzma`, LZ4, Unix
+  `compress` (`.Z`), SZDD, KWAJ.
+- **Packages:** RPM (scripts and payload). A ZIP behind other bytes (a stub, a
+  header, padding) is opened when its end record agrees with where it starts.
 - **Disk images:** ISO 9660 and UDF, Apple DMG, the virtual disks VHD, VHDX,
   QCOW2 and VMDK reconstructed to the guest disk, GPT, APM and MBR partition
-  maps, and the FAT, NTFS and ext2/3/4 filesystems inside them, WIM.
+  maps, and the filesystems inside them (FAT, exFAT, NTFS, ext2/3/4, HFS+,
+  APFS), SquashFS, cramfs, romfs and EROFS images, WIM.
 - **Documents:** OLE2, OOXML, PDF, RTF, HWP3, OneNote, Adobe XDP, Word and
   Excel 2003 flat XML.
 - **Mail:** MIME, TNEF (`winmail.dat`), BinHex, uuencode.
@@ -63,8 +87,13 @@ scanned in turn:
   (their embedded objects and preview images; a drawing is not rendered).
 
 A set split into byte-numbered parts (`x.7z.001`, `x.7z.002`, ...) and met
-inside one container is joined and scanned whole. RAR and ZIP volume sets are
-not joined; a member continued in another volume is reported.
+inside one container is joined and scanned whole. RAR, ZIP and CAB volume sets
+met there are not joined; a member continued in another volume is reported.
+Next to each other on disk, or sent together to the daemon, they are: a RAR set
+(`x.part1.rar`, `x.r00`), a ZIP set (`x.z01`, ..., `x.zip`) and a CAB set (each
+cabinet's header names the next). Scanning one volume of such a set by name
+scans the archive its siblings make as well, looked for in the same directory
+among regular files (a symbolic link is not a sibling).
 
 ### Found inside other files
 
@@ -77,10 +106,15 @@ them in every object:
   own type: up to 16 images of each kind and 32 archives per object. An
   object holding more is reported `LIMITS-EXCEEDED` unless something is
   found, and the other members of its container are still scanned.
-- **Base64.** A base64-encoded executable in a text file (a PE in a PowerShell
-  one-liner) is decoded and scanned, and so are the `data:` URIs and base64
-  assets of HTML and flat-XML Office documents. `--no-decode base64` turns it
-  off (see [Detection](/scanner/reference/cli/#detection)).
+- **Base64.** A base64-encoded executable or archive (ZIP, gzip, 7z, RAR, xz)
+  in a text file (a PE in a PowerShell one-liner, a ZIP in an `atob` string) is
+  decoded and scanned, and so are the `data:` URIs and base64 assets of HTML
+  and flat-XML Office documents. A text file is one with a stretch that is
+  mostly text, sampled from its start to its end. Up to 8 executables or
+  archives, from 64 runs that start like one, are decoded in a text file, and 16
+  assets in a page; a file with more is reported `LIMITS-EXCEEDED` unless
+  something is found. `--no-decode base64` turns it off (see
+  [Detection](/scanner/reference/cli/#detection)).
 
 ### Packed executables
 
@@ -96,24 +130,22 @@ signatures unpack is scanned too.
 
 ## Size: what is read as it goes, and what is read whole
 
-These are decoded as they are read, at any size: ZIP, tar, CAB, ISO/UDF, LHA,
-`ar`, cpio, TNEF, OneNote, SWF, SZDD, partition maps, self-extracting
-executables, universal Mach-O, `.pyc`, and the single-stream compressors. A
-member that decodes past `--max-object-bytes` goes to a
+[Which formats the extractor reads as it goes](/unpack/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
+(ZIP, tar, 7z, WIM, xar, disk images and the filesystems in them, and more) is
+on its page. In the scanner, a member or a file in a filesystem that is past
+`--max-object-bytes` goes to a
 [spill file](/scanner/reference/cli/#buffering-a-stream-spill) and is scanned
-from there, or is reported `LIMITS-EXCEEDED` with spilling off. The
-exceptions: ZIP Shrink, Reduce and Implode members, and encrypted ZIP
-members, are decoded whole under that limit.
+from there, or is reported `LIMITS-EXCEEDED` with spilling off. A file a
+filesystem stores compressed (HFS+ and APFS decmpfs, NTFS LZNT1) is decoded
+whole under that limit and reported `UNSCANNABLE` past it, and the walk goes on.
 
-A DMG is walked at any size, but each file in it is held whole, under
-`--max-object-bytes`; an encrypted DMG is decrypted whole under the same limit.
+Every format the extractor reads whole (RAR, OLE, PDF, CHM, ARJ and email, among
+others) is reported `LIMITS-EXCEEDED` when larger than `--max-object-bytes`
+(256 MiB by default), and its members are not scanned. Raise the limit where
+such files are expected.
 
-Every other container is read whole: one larger than `--max-object-bytes`
-(256 MiB by default) is reported `LIMITS-EXCEEDED` and its members are not
-scanned. That includes RAR, OLE, PDF, CHM, ARJ, xar, email, WIM, and the
-virtual disks and filesystems (VHD, VHDX, QCOW2, VMDK, FAT, NTFS, ext), which
-are often larger than that: raise `--max-object-bytes` where such images are
-expected. 7z is read whole too, but its members stream out of it.
+For what a scan holds, and what needs disk, by kind of input, see
+[Streaming & memory](/scanner/concepts/streaming-memory/#can-a-file-be-larger-than-the-ram).
 
 A file of any size is scanned through a block cache rather than loaded. The
 checks that parse an object whole (a PE's structure, YARA's `pe`, `elf` and
@@ -179,70 +211,5 @@ ClamAV, not the unpacking of executables.
 
 ## Compared with ClamAV
 
-The measurements below come from ClamAV 1.4.3 and 1.5.3. Where a container
-could hold the EICAR test file, it was scanned with it inside; otherwise its
-members were extracted with a third-party tool, hashed into a signature
-database, and the untouched container scanned.
-
-### Formats neither opens
-
-| Format / codec | ClamAV | exav |
-|---|---|---|
-| ACE | No support: 200 members of a real ACE went unextracted | `UNSCANNABLE` |
-| StuffIt / StuffIt X | No support: real `.sit` and `.sitx` unextracted | `UNSCANNABLE` |
-| Inno Setup | No support: stops at "Recognized MS-EXE/DLL", 71 members unreached | `UNSCANNABLE` |
-| ZIP method 10 (DCL Implode) | No support: enumerates the entry, then `unsupported method (10)` | `UNSCANNABLE` |
-| ZIP methods 94 / 96 / 97 (MP3, JPEG, WavPack) | No support | `UNSCANNABLE` |
-| PKWARE Strong Encryption | No support | `PASSWORD-PROTECTED` |
-| WIM LZMS resources | No support for WIM at all: no `CL_TYPE_WIM`, all four test images clean | `UNSCANNABLE`; other WIM resources are decoded |
-
-None of these is a capability gap against ClamAV, but ClamAV answers `OK`
-for each, and exav says the members went unexamined. Not measured, and
-likely a gap: RAR 1.5 and 2.x compression, which ClamAV's UnRAR-derived RAR
-support reads.
-
-### Checked against ClamAV's own type list
-
-These come from checking exav against ClamAV's own `CL_TYPE_*` enumeration
-rather than a hand-assembled list. `clamscan --debug` reports dedicated
-submodules for EGG, ALZ and HWP, all on by default, and its shipped magic
-database types all five formats below.
-
-| Format | ClamAV | exav | Evidence of decoding in ClamAV |
-|---|---|---|---|
-| **EGG** (ESTsoft, Korean) | Decodes | **Decodes** (store/deflate/bzip2/LZMA/AZO) | `EGG` submodule on by default; `Heuristics.Encrypted.EGG` exists, so members are parsed deeply enough to detect encryption |
-| **ALZ** (ESTsoft, Korean) | Decodes | **Decodes** (store/bzip2/deflate) | `ALZ` submodule on by default; magic added at flevel 210 |
-| **HWP3** (Hangul Word Processor) | Decodes | **Decodes** (deflate body) | `HWP` submodule on by default, with its own scan-option bit, engine option `MAX_RECHWP3` and `--max-rechwp3` flag |
-| **ISHIELD_MSI** (InstallShield MSI) | Types and handles | Recognised, reported `UNSCANNABLE` | dedicated `CL_TYPE_ISHIELD_MSI` |
-| **CRYPTFF** | Types and handles | Recognised, reported `PASSWORD-PROTECTED` | dedicated `CL_TYPE_CRYPTFF` |
-
-EGG and ALZ matter for Korean-language targets, where ALZip is common; HWP3 is
-the Korean government's standard document format and a recurring
-spear-phishing carrier.
-
-### Formats ClamAV does not recognise
-
-A format with no detection is the weaker failure: the file is scanned as
-whatever it types as, its members are never reached, and the scan can come
-back clean.
-
-| Format | ClamAV | exav |
-|---|---|---|
-| InstallShield `.z` archive | No support | Decoded |
-| ext2/3/4 | No support | Decoded |
-| ZOO | No support | Decoded |
-| VHD, VHDX, QCOW2, VMDK, NTFS, FAT | No support | Decoded |
-| InstallShield InstallScript cabinet | No support | Recognised, reported `UNSCANNABLE` |
-| AppleSingle / AppleDouble | No support | Recognised, reported `UNSCANNABLE` |
-| lrzip | No support | Recognised, reported `UNSCANNABLE` |
-
-[Evidence for what ClamAV does not open](/scanner/reference/comparison-with-clamav/#evidence-for-what-clamav-does-not-open)
-has the disk image measurements.
-
-### Packers
-
-ClamAV natively unpacks 10 packer families, each with a hand-written
-submodule. exav unpacks four of them with dedicated decoders and the rest
-through the emulator. SUE and Yoda's Protector (not Yoda's Cryptor) are
-detection-only in ClamAV, covered by PUA packer signatures in the optional
-`.?du` databases, and so is MPRESS outside its bytecode signature.
+Which formats ClamAV opens and exav does not, and the reverse, is in
+[Comparison with ClamAV](/scanner/reference/comparison-with-clamav/#formats-and-unpacking).

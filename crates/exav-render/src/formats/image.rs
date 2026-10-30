@@ -39,6 +39,9 @@ pub enum Format {
     /// A JBIG2 file.
     #[cfg(feature = "jbig2")]
     Jbig2,
+    /// JPEG XL, a bare codestream or in its ISO BMFF container.
+    #[cfg(feature = "jxl")]
+    Jxl,
 }
 
 impl Format {
@@ -67,6 +70,8 @@ impl Format {
         Format::Jpeg2000,
         #[cfg(feature = "jbig2")]
         Format::Jbig2,
+        #[cfg(feature = "jxl")]
+        Format::Jxl,
     ];
 
     /// The format `data` starts as, by its magic bytes.
@@ -129,6 +134,12 @@ impl Format {
         if data.starts_with(b"\x97JB2\r\n\x1a\n") {
             return Some(Format::Jbig2);
         }
+        // A bare codestream starts 0xFF 0x0A; the container with its
+        // signature box.
+        #[cfg(feature = "jxl")]
+        if data.starts_with(&[0xFF, 0x0A]) || data.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
+            return Some(Format::Jxl);
+        }
         None
     }
 
@@ -158,6 +169,8 @@ impl Format {
             Format::Jpeg2000 => "jpeg2000",
             #[cfg(feature = "jbig2")]
             Format::Jbig2 => "jbig2",
+            #[cfg(feature = "jxl")]
+            Format::Jxl => "jxl",
         }
     }
 }
@@ -174,6 +187,8 @@ pub enum Error {
     Undecodable,
     /// Decoding it takes more than the limit asked for, under [`DECODE_MAX`].
     TooLarge,
+    /// A camera RAW file that holds no preview a decoder reads (`raw`).
+    NoPreview,
 }
 
 impl std::fmt::Display for Error {
@@ -182,15 +197,14 @@ impl std::fmt::Display for Error {
             Error::Unsupported => "not an image format this build decodes",
             Error::Undecodable => "undecodable image",
             Error::TooLarge => "image too large to decode within the limit",
+            Error::NoPreview => "camera RAW file with no preview to show",
         })
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Most bytes a decoded image may take: the `image` crate's default, which
-/// ClamAV decodes with.
-pub const DECODE_MAX: u64 = 512 * 1024 * 1024;
+pub use super::DECODE_MAX;
 
 /// Which channels each pixel has, in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +335,8 @@ pub fn decode(data: &[u8], format: Format, max_alloc: u64) -> Result<Pixels, Err
         Format::Jpeg2000 => jp2::decode(data, max_alloc),
         #[cfg(feature = "jbig2")]
         Format::Jbig2 => jbig2::decode(data, max_alloc),
+        #[cfg(feature = "jxl")]
+        Format::Jxl => jxl::decode(data, max_alloc),
         _ => decode_dynamic(data, format, max_alloc).map(Pixels::from_dynamic),
     })
     .unwrap_or(Err(Error::Undecodable))
@@ -328,7 +344,6 @@ pub fn decode(data: &[u8], format: Format, max_alloc: u64) -> Result<Pixels, Err
 
 /// Refuses a decode that needs more than `max_alloc` bytes (at most
 /// [`DECODE_MAX`]), as the `image` crate's limit does.
-#[cfg(any(feature = "jp2", feature = "jbig2"))]
 fn within(needed: u64, max_alloc: u64) -> Result<(), Error> {
     let limit = max_alloc.min(DECODE_MAX);
     if needed <= limit {
@@ -360,13 +375,88 @@ fn cmyk_to_rgb(cmyk: &[u8], alpha: bool) -> Vec<u8> {
     out
 }
 
-/// [`decode`], the format read from the first bytes.
+/// Full-range YCbCr bytes to RGB, as OpenJPEG and libtiff do it with the
+/// default coefficients.
+fn ycc_to_rgb(mut samples: Vec<u8>) -> Vec<u8> {
+    for px in samples.as_chunks_mut::<3>().0 {
+        let (y, cb, cr) = (
+            i32::from(px[0]),
+            i32::from(px[1]) - 128,
+            i32::from(px[2]) - 128,
+        );
+        let clamp = |v: i32| v.clamp(0, 255) as u8;
+        px[0] = clamp(y + (1.402 * f64::from(cr)) as i32);
+        px[1] = clamp(y - (0.344 * f64::from(cb) + 0.714 * f64::from(cr)) as i32);
+        px[2] = clamp(y + (1.772 * f64::from(cb)) as i32);
+    }
+    samples
+}
+
+/// [`decode`], the format read from the first bytes. With the `raw` feature,
+/// a camera RAW file is shown by its largest embedded preview (`raw`),
+/// where [`Format::detect`] and [`decode`] read a TIFF-structured one as the
+/// TIFF it also is.
 pub fn decode_any(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
-    decode(
-        data,
-        Format::detect(data).ok_or(Error::Unsupported)?,
-        max_alloc,
-    )
+    #[cfg(feature = "raw")]
+    match raw::decode(data, max_alloc) {
+        Err(Error::Unsupported) => {}
+        other => return other,
+    }
+    // A cursor is read as the icon file it is laid out as.
+    #[cfg(feature = "ico")]
+    if data.starts_with(&[0, 0, 2, 0])
+        && let Some(icon) = ico_view::cursor_as_icon(data)
+    {
+        return decode_any(&icon, max_alloc);
+    }
+    // BigTIFF has a magic of its own, which only the viewer reads.
+    let bigtiff = data.starts_with(b"II+\0") || data.starts_with(b"MM\0+");
+    let Some(format) = Format::detect(data).or(bigtiff.then_some(Format::Tiff)) else {
+        // No magic number, so no `Format`: a Targa file is told by its layout.
+        return std::panic::catch_unwind(|| tga_view::decode(data, max_alloc))
+            .unwrap_or(Err(Error::Undecodable));
+    };
+    let pixels = viewed_pixels(data, format, max_alloc)?;
+    Ok(if format == Format::Tiff {
+        tiff_view::oriented(data, pixels)
+    } else {
+        pixels
+    })
+}
+
+/// What `decode_any` shows of a file of this format, before a TIFF's
+/// orientation is applied.
+fn viewed_pixels(data: &[u8], format: Format, max_alloc: u64) -> Result<Pixels, Error> {
+    // What the hashing decoder reads wrongly, or not as the eye would pick
+    // (the image of an icon file with most colour), for the eye only.
+    let viewed = std::panic::catch_unwind(|| match format {
+        Format::Tiff if tiff_view::reads_differently(data) => tiff_view::decode(data, max_alloc),
+        #[cfg(feature = "ico")]
+        Format::Ico => ico_view::decode_largest(data, max_alloc),
+        #[cfg(feature = "dds")]
+        Format::Dds if dds_view::punches_through(data) => dds_view::decode(data, max_alloc),
+        _ => Err(Error::Undecodable),
+    });
+    if let Ok(Ok(pixels)) = viewed {
+        return Ok(pixels);
+    }
+    let decoded = decode(data, format, max_alloc);
+    // What the hashing decoder refuses, for the eye only.
+    if decoded == Err(Error::Undecodable) {
+        let viewed = std::panic::catch_unwind(|| match format {
+            Format::Tiff => tiff_view::decode(data, max_alloc),
+            Format::Bmp => bmp_view::decode_repaired(data, max_alloc),
+            #[cfg(feature = "dds")]
+            Format::Dds => dds_view::decode(data, max_alloc),
+            #[cfg(feature = "pnm")]
+            Format::Pnm => pnm_view::decode_uncommented(data, max_alloc),
+            _ => Err(Error::Undecodable),
+        });
+        if let Ok(Ok(pixels)) = viewed {
+            return Ok(pixels);
+        }
+    }
+    decoded
 }
 
 fn decode_dynamic(data: &[u8], format: Format, max_alloc: u64) -> Result<DynamicImage, Error> {
@@ -420,12 +510,27 @@ fn image_format(f: Format) -> Option<ImageFormat> {
         Format::Jpeg2000 => return None,
         #[cfg(feature = "jbig2")]
         Format::Jbig2 => return None,
+        #[cfg(feature = "jxl")]
+        Format::Jxl => return None,
     })
 }
 
+mod bmp_view;
+#[cfg(feature = "dds")]
+mod dds_view;
+#[cfg(feature = "ico")]
+mod ico_view;
 #[cfg(feature = "jbig2")]
 mod jbig2;
 #[cfg(feature = "jp2")]
 mod jp2;
+#[cfg(feature = "jxl")]
+mod jxl;
+#[cfg(feature = "pnm")]
+mod pnm_view;
+#[cfg(feature = "raw")]
+pub mod raw;
 #[cfg(test)]
 mod tests;
+mod tga_view;
+mod tiff_view;

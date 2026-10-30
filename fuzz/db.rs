@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use exav_core::{loader, Scanner};
+use exav_core::{Scanner, loader};
 
 /// Every file of `fuzz/db/`, by the extension the loader routes it on.
 pub const FILES: &[(&str, &[u8])] = &[
@@ -53,8 +53,16 @@ fn built() -> &'static Arc<Scanner> {
         }
         let db = b.build().expect("the fuzz signature files build");
         // A line the loader rejects is a line no input reaches.
-        assert_eq!(db.unsupported_count(), 0, "a signature of fuzz/db/ does not load");
-        let yara = FILES.iter().find(|(e, _)| *e == "yar").expect("a YARA file").1;
+        assert_eq!(
+            db.unsupported_count(),
+            0,
+            "a signature of fuzz/db/ does not load"
+        );
+        let yara = FILES
+            .iter()
+            .find(|(e, _)| *e == "yar")
+            .expect("a YARA file")
+            .1;
         exav_core::yara::compile(std::str::from_utf8(yara).expect("UTF-8"))
             .unwrap_or_else(|e| panic!("a rule of fuzz/db/fuzz.yar does not compile: {e}"));
         Arc::new(db)

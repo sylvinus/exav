@@ -92,6 +92,20 @@ fn plane(p: &mut Plane, t: &Tag<'_>) -> bool {
     p3(&mut p.extrusion, t, 210)
 }
 
+/// A record's extension dictionary: group 360 of its `{ACAD_XDICTIONARY`
+/// application group, which `Parts` sets aside.
+fn xdictionary(tags: &[Tag<'_>]) -> Option<u64> {
+    let start = tags
+        .iter()
+        .position(|t| t.code == 102 && t.is("{ACAD_XDICTIONARY"))?;
+    tags.get(start + 1..)?
+        .iter()
+        .take_while(|t| t.code != 102)
+        .find(|t| t.code == 360)
+        .map(|t| t.handle())
+        .filter(|h| *h != 0)
+}
+
 pub(crate) fn entity(rec: &Record<'_>, ctx: &mut Ctx<'_>) -> Entity {
     let parts = Parts::new(&rec.tags, false);
     let mut e = Entity {
@@ -114,10 +128,17 @@ pub(crate) fn entity(rec: &Record<'_>, ctx: &mut Ctx<'_>) -> Entity {
         "SOLID" => EntityKind::Solid(quad(data)),
         "TRACE" => EntityKind::Trace(quad(data)),
         "3DFACE" => EntityKind::Face3D(face3d(data)),
+        "MESH" => EntityKind::Mesh(Box::new(mesh(data, ctx))),
+        "TOLERANCE" => EntityKind::Tolerance(Box::new(tolerance(data, ctx))),
         "TEXT" => EntityKind::Text(Box::new(text(data, false, ctx).0)),
         "ATTRIB" => EntityKind::Attribute(Box::new(attribute(&parts, data, ctx))),
         "ATTDEF" => EntityKind::AttributeDefinition(Box::new(attribute(&parts, data, ctx))),
-        "INSERT" => EntityKind::Insert(Box::new(insert(data, ctx))),
+        "INSERT" => {
+            if let Some(d) = xdictionary(&rec.tags) {
+                ctx.insert_dictionaries.insert(e.handle.0, d);
+            }
+            EntityKind::Insert(Box::new(insert(data, ctx)))
+        }
         "MTEXT" => {
             let mut m = mtext(data, ctx);
             if m.columns.is_none() {
@@ -163,10 +184,9 @@ pub(crate) fn entity(rec: &Record<'_>, ctx: &mut Ctx<'_>) -> Entity {
 /// AcDbZombieEntity) before the entity's own data.
 fn graphics(parts: &Parts<'_>, ctx: &mut Ctx<'_>) -> Option<Box<ProxyGraphics>> {
     fn sized<'p, 'a>(tags: &'p [Tag<'a>]) -> Option<(i64, &'p [Tag<'a>])> {
-        let at = tags.windows(2).position(|w| {
-            matches!(w.first(), Some(t) if t.code == 92 || t.code == 160)
-                && matches!(w.get(1), Some(t) if t.code == 310)
-        })?;
+        let at = tags
+            .array_windows()
+            .position(|[a, b]| (a.code == 92 || a.code == 160) && b.code == 310)?;
         Some((tags.get(at)?.int(), tags.get(at + 1..)?))
     }
     let (size, chunks) = sized(parts.common())
@@ -434,6 +454,81 @@ fn quad(data: &[Tag<'_>]) -> Quad {
         q.corners[3] = q.corners[2];
     }
     q
+}
+
+/// MESH: its level 0 cage, 92 vertices (10, 20, 30) and a face list of 93
+/// values (90), each face its corner count then its corners; the edges
+/// (94), creases (95) and overrides after it are not read.
+fn mesh(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> Mesh {
+    #[derive(PartialEq)]
+    enum At {
+        Head,
+        Vertices,
+        Faces(usize),
+        Tail,
+    }
+    let mut m = Mesh::default();
+    let mut list: Vec<i64> = Vec::new();
+    let mut at = At::Head;
+    for t in data {
+        match (&at, t.code) {
+            (At::Head, 92) => at = At::Vertices,
+            (At::Vertices, 10) => {
+                if ctx.room(m.vertices.len()) {
+                    m.vertices.push(Vec3::new(t.f64(), 0.0, 0.0));
+                }
+            }
+            (At::Vertices, 20) => {
+                if let Some(v) = m.vertices.last_mut() {
+                    v.y = t.f64();
+                }
+            }
+            (At::Vertices, 30) => {
+                if let Some(v) = m.vertices.last_mut() {
+                    v.z = t.f64();
+                }
+            }
+            (At::Head | At::Vertices, 93) => {
+                let n = usize::try_from(t.int()).unwrap_or(0);
+                at = if n > 0 { At::Faces(n) } else { At::Tail };
+            }
+            (At::Faces(left), 90) => {
+                let left = *left;
+                if ctx.room(list.len()) {
+                    list.push(t.int());
+                }
+                at = if left > 1 {
+                    At::Faces(left - 1)
+                } else {
+                    At::Tail
+                };
+            }
+            (_, 94) => at = At::Tail,
+            _ => {}
+        }
+    }
+    m.faces = Mesh::faces_from_list(&list, m.vertices.len());
+    m
+}
+
+/// TOLERANCE: insertion (10), direction (11), extrusion (210), text (1),
+/// dimension style (3).
+fn tolerance(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> Tolerance {
+    let mut x = Tolerance::default();
+    for t in data {
+        if p3(&mut x.insertion, t, 10)
+            || p3(&mut x.x_direction, t, 11)
+            || p3(&mut x.extrusion, t, 210)
+        {
+            continue;
+        }
+        match t.code {
+            1 => x.text = ctx.text(t),
+            3 => x.dimstyle = ctx.text(t),
+            _ => {}
+        }
+    }
+    x
 }
 
 fn face3d(data: &[Tag<'_>]) -> Face3D {
@@ -886,10 +981,10 @@ fn multileader(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> MultiLeader {
                     continue;
                 }
                 if t.code == 304 {
-                    if let Some(r) = m.context.leaders.last_mut() {
-                        if ctx.room(r.lines.len()) {
-                            r.lines.push(MLeaderLine::default());
-                        }
+                    if let Some(r) = m.context.leaders.last_mut()
+                        && ctx.room(r.lines.len())
+                    {
+                        r.lines.push(MLeaderLine::default());
                     }
                     state = MlState::Line;
                     continue;
@@ -1126,10 +1221,10 @@ fn hatch(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> Hatch {
                         }
                     }
                     63 => {
-                        if let Some(stop) = g.colors.last_mut() {
-                            if stop.1 == Color::ByLayer {
-                                stop.1 = Color::from_aci(t.int());
-                            }
+                        if let Some(stop) = g.colors.last_mut()
+                            && stop.1 == Color::ByLayer
+                        {
+                            stop.1 = Color::from_aci(t.int());
                         }
                     }
                     _ => {
@@ -1233,10 +1328,10 @@ fn edge(c: &mut Cursor<'_, '_>, ctx: &mut Ctx<'_>) -> Option<Edge> {
             let mut weights = Vec::new();
             for _ in 0..n_points {
                 let Some(p) = c.point2(10) else { break };
-                if let Some(w) = c.f64(42) {
-                    if ctx.room(weights.len()) {
-                        weights.push(w);
-                    }
+                if let Some(w) = c.f64(42)
+                    && ctx.room(weights.len())
+                {
+                    weights.push(w);
                 }
                 if ctx.room(control_points.len()) {
                     control_points.push(p);
@@ -1487,10 +1582,10 @@ fn r12_viewport(v: &mut Viewport, x: &[Tag<'_>], ctx: &mut Ctx<'_>) {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(&name))
             .map(|(_, h)| *h);
-        if let Some(h) = found {
-            if ctx.room(v.frozen_layers.len()) {
-                v.frozen_layers.push(h);
-            }
+        if let Some(h) = found
+            && ctx.room(v.frozen_layers.len())
+        {
+            v.frozen_layers.push(h);
         }
     }
 }
@@ -1516,7 +1611,7 @@ fn image(data: &[Tag<'_>], ctx: &mut Ctx<'_>) -> Image {
             283 => i.fade = t.i16(),
             360 => i.reactor = handle(t),
             71 => i.clip_type = t.i16(),
-            290 => i.clip_inside = t.bool(),
+            290 => i.clip_inverted = t.bool(),
             _ => {}
         }
     }

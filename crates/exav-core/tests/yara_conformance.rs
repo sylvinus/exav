@@ -43,7 +43,7 @@ fn pattern_data(pattern: &str, data: &[u8]) -> Option<Vec<u8>> {
 }
 
 macro_rules! condition_true {
-    ($cond:literal, $data:expr) => {
+    ($cond:literal, $data:expr_2021) => {
         test_condition($cond, $data, true)
     };
     ($cond:literal) => {
@@ -51,7 +51,7 @@ macro_rules! condition_true {
     };
 }
 macro_rules! condition_false {
-    ($cond:literal, $data:expr) => {
+    ($cond:literal, $data:expr_2021) => {
         test_condition($cond, $data, false)
     };
     ($cond:literal) => {
@@ -59,23 +59,23 @@ macro_rules! condition_false {
     };
 }
 macro_rules! rule_true {
-    ($rule:expr, $data:expr) => {
+    ($rule:expr_2021, $data:expr_2021) => {
         test_rule($rule, $data, true)
     };
-    ($rule:expr) => {
+    ($rule:expr_2021) => {
         test_rule($rule, &[], true)
     };
 }
 macro_rules! rule_false {
-    ($rule:expr, $data:expr) => {
+    ($rule:expr_2021, $data:expr_2021) => {
         test_rule($rule, $data, false)
     };
-    ($rule:expr) => {
+    ($rule:expr_2021) => {
         test_rule($rule, &[], false)
     };
 }
 macro_rules! pattern_true {
-    ($pattern:literal, $data:expr) => {
+    ($pattern:literal, $data:expr_2021) => {
         assert!(
             pattern_data($pattern, $data).is_some(),
             "pattern `{}` should match {:?}",
@@ -85,7 +85,7 @@ macro_rules! pattern_true {
     };
 }
 macro_rules! pattern_false {
-    ($pattern:literal, $data:expr) => {
+    ($pattern:literal, $data:expr_2021) => {
         assert!(
             pattern_data($pattern, $data).is_none(),
             "pattern `{}` should NOT match {:?}",
@@ -95,7 +95,7 @@ macro_rules! pattern_false {
     };
 }
 macro_rules! pattern_match {
-    ($pattern:literal, $data:expr, $expected:expr) => {{
+    ($pattern:literal, $data:expr_2021, $expected:expr_2021) => {{
         let got = pattern_data($pattern, $data)
             .unwrap_or_else(|| panic!("pattern `{}` should match", $pattern));
         assert_eq!(
@@ -648,7 +648,9 @@ fn xor() {
     pattern_false!(r#""mississippi" xor(2-255)"#, b"lhrrhrrhqqh");
     pattern_true!(
         r#""mississippi" xor(255)"#,
-        &[0x92, 0x96, 0x8C, 0x8C, 0x96, 0x8C, 0x8C, 0x96, 0x8F, 0x8F, 0x96]
+        &[
+            0x92, 0x96, 0x8C, 0x8C, 0x96, 0x8C, 0x8C, 0x96, 0x8F, 0x8F, 0x96
+        ]
     );
 }
 

@@ -26,13 +26,13 @@ failOnViolations();
 
 async function open(page: Page, name: string): Promise<Frame> {
   await openSample(page, name);
-  await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+  await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
   return inside(page);
 }
 
 /** The document of the frame the demo shows. */
 async function inside(page: Page): Promise<Frame> {
-  const frame = await (await page.locator(".demo-frame iframe.exv-sandbox").elementHandle())!.contentFrame();
+  const frame = await (await page.locator(".demo-frame iframe.exav-viewer-sandbox").elementHandle())!.contentFrame();
   if (!frame) throw new Error("no frame");
   return frame;
 }
@@ -67,9 +67,9 @@ for (const served of ["headers", "meta"] as const) {
 
     test("the frame is an iframe sandboxed to scripts, in an opaque origin", async ({ page }) => {
       const frame = await open(page, "report.pdf");
-      const iframe = page.locator(".demo-frame iframe.exv-sandbox");
+      const iframe = page.locator(".demo-frame iframe.exav-viewer-sandbox");
       await expect(iframe).toHaveAttribute("sandbox", "allow-scripts");
-      await expect(iframe).toHaveAttribute("allow", "");
+      await expect(iframe).toHaveAttribute("allow", "autoplay");
       await expect(iframe).toHaveAttribute("referrerpolicy", "no-referrer");
       expect(await frame.evaluate(() => [self.origin, document.referrer])).toEqual(["null", ""]);
     });
@@ -227,15 +227,15 @@ test.describe("the host", () => {
   test("a frame that navigates itself away is dropped", async ({ page }) => {
     const frame = await open(page, "report.pdf");
     await frame.evaluate(() => (location.href = "/frame/licenses/README.txt"));
-    await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "error");
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "error");
   });
 
   test("one frame per file: the next file gets a new one, the last is gone", async ({ page }) => {
     await open(page, "report.pdf");
     const first = await inside(page);
     await pick(page, "landscape.tif");
-    await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-    await expect(page.locator("iframe.exv-sandbox")).toHaveCount(1);
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+    await expect(page.locator("iframe.exav-viewer-sandbox")).toHaveCount(1);
     expect(first.isDetached()).toBe(true);
   });
 });
@@ -273,8 +273,8 @@ test.describe("formats", () => {
     const draw = async (pdf: string, query: string, inFrame: boolean): Promise<Pixels> => {
       await page.goto(`./?lang=en${query}`);
       await page.getByTestId("file-input").setInputFiles({ name: pdf, mimeType: "application/pdf", buffer: fs.readFileSync(path.join(fixtures, pdf)) });
-      await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-      const canvas = (inFrame ? page.frameLocator(".demo-frame iframe.exv-sandbox") : page.locator(".demo-frame")).locator(".exv-pdf-bitmap").first();
+      await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+      const canvas = (inFrame ? page.frameLocator(".demo-frame iframe.exav-viewer-sandbox") : page.locator(".demo-frame")).locator(".exav-viewer-pdf-bitmap").first();
       const read = async () => decodePng(Buffer.from((await canvas.evaluate((c: HTMLCanvasElement) => c.toDataURL("image/png"))).split(",")[1]!, "base64"));
       // Sized once pdf.js has drawn into it: 300 x 150 is a new canvas's.
       await expect.poll(() => canvas.evaluate((c: HTMLCanvasElement) => `${c.width}x${c.height}`)).not.toBe("300x150");

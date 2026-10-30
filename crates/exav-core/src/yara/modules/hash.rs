@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn a_range_read_in_chunks_hashes_as_the_slice_does() {
         use super::super::FuncId::*;
-        use super::{call, Value};
+        use super::{Value, call};
         use crate::byte_source::{BlockCache, CHUNK};
 
         let h: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i * 31 % 251) as u8).collect();

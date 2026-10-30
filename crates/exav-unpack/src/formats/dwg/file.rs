@@ -7,9 +7,9 @@
 use std::borrow::Cow;
 
 use super::bits::{BitError, Bits};
-use super::object::{split_strings, HeaderStreams, Object, Text};
-use super::{r2004, r2007};
+use super::object::{HeaderStreams, Object, Text, split_strings};
 use super::{Error, Version};
+use super::{r2004, r2007};
 
 /// The named sections of an R2004 to R2018 file: R2007's container (spec
 /// 5) or the others' (spec 4).

@@ -1,0 +1,13 @@
+# Not part of the workspace: a harness (see ../README.md), with its own lock and target directory.
+[package]
+name = "hayro-eval"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+hayro = "=0.8.0"
+hayro-interpret = "=0.8.0"
+hayro-syntax = "=0.8.0"

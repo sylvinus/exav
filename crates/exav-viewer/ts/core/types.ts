@@ -17,10 +17,32 @@ export type BuiltinFormat =
   | "xlsx"
   | "pptx"
   | "csv"
+  | "rtf"
+  | "doc"
+  | "odt"
+  | "ppt"
+  | "odp"
+  | "keynote"
+  | "xls"
+  | "ods"
+  | "numbers"
+  | "odg"
+  | "visio"
+  | "coreldraw"
+  | "publisher"
+  | "pagemaker"
+  | "freehand"
+  | "quarkxpress"
+  | "zonerdraw"
+  | "wpg"
+  | "text"
   | "dwg"
   | "dxf"
   | "ifc"
   | "stl"
+  | "obj"
+  | "ply"
+  | "gltf"
   | "video"
   | "audio"
   | "archive";
@@ -70,9 +92,25 @@ export interface FileInfo {
   size?: number;
 }
 
+/**
+ * The files around the one shown: a folder the user opened, the members of an
+ * archive. A format that points at other files (a drawing's external
+ * references) finds them here instead of asking the user for each.
+ */
+export interface FileTree {
+  /** The path of the file shown, `/` separated, from the root of the tree. */
+  path: string;
+  /** Every file of the tree, this one included, by the same kind of path. */
+  paths: readonly string[];
+  /** The bytes of one of `paths`. */
+  open(path: string, signal: AbortSignal): Promise<FileSource>;
+}
+
 export interface ViewerFile<Meta = unknown> extends FileInfo {
   /** `null` while the host has nothing to show yet; see `placeholder`. */
   source: FileSource | null;
+  /** The files around this one, for the files it refers to. */
+  tree?: FileTree;
   /**
    * Shown instead of a surface while `source` is null. "pending": the bytes
    * will arrive. "unavailable": they will not on this device. `label`
@@ -166,12 +204,17 @@ export type Capability =
   | "drag"
   | "outline"
   | "layers"
+  | "storeys"
   | "layouts"
   | "ground"
   | "selection"
   | "info"
   | "image-surface"
-  | "nested";
+  | "nested"
+  | "media"
+  | "sheets"
+  | "pictures"
+  | "viewport";
 
 export interface FormatPlugin<Options = unknown> {
   id: FormatId;
@@ -244,15 +287,35 @@ export interface RendererHandle {
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
+/**
+ * What a load is doing, for a progress display; `progress` is the share of
+ * that step done, absent when the step does not count. Steps come in this
+ * order and a plugin goes through those it has: the engine's download, say,
+ * only the first time.
+ */
+export type LoadStep =
+  /** The file's bytes arrive. */
+  | "file"
+  /** The engine's code and data arrive: an external converter's, tens of MB. */
+  | "engine"
+  /** The engine starts. */
+  | "start"
+  /** The document is read. */
+  | "read"
+  /** It is converted to what is shown. */
+  | "convert"
+  /** What is shown is drawn. */
+  | "render";
+
 export type Status =
   /**
    * `label`: what the plugin is doing, worded for the user in the host's
    * language, shown instead of the stock message (a host's plugin decoding
    * a photo is not "preparing the model").
    */
-  | { phase: "loading"; progress?: number; label?: string }
+  | { phase: "loading"; progress?: number; label?: string; step?: LoadStep }
   /** A step after the fetch that takes seconds and reports its progress. */
-  | { phase: "converting"; progress?: number; label?: string }
+  | { phase: "converting"; progress?: number; label?: string; step?: LoadStep }
   /**
    * `partial`: something reached the screen and the engine then failed (an
    * Office file that lays out seven pages and throws on an embedded object).
@@ -264,7 +327,7 @@ export type Status =
   | { phase: "error"; error: ViewerError };
 
 /** The codes the built-in plugins report; a plugin of the host may use its own. */
-export type BuiltinErrorCode = "pdf" | "image" | "drawing" | "drawing_version" | "office" | "media" | "model" | "archive" | "file";
+export type BuiltinErrorCode = "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "file";
 
 export interface ViewerError {
   /**
@@ -272,7 +335,10 @@ export interface ViewerError {
    * in the host's `translate` like any other: a host's own code, `heic`, is
    * worded by its table's `error_heic` (or by `message`, below).
    * `drawing_version`: a DWG of a release the engine does not read (R12
-   * and older).
+   * and older). `image_no_preview`: a camera RAW file that embeds no
+   * preview. `needs_converter`: a format only an external converter reads,
+   * and none is set (the cause is a `NeedsConverterError`, `kind`
+   * "needs-converter", with the format's name).
    */
   code: BuiltinErrorCode | (string & {});
   /** Worded for the user in the host's language, shown instead of the stock message for `code`. */
@@ -288,12 +354,17 @@ export interface Controllers {
   drag?: DragController;
   outline?: OutlineController;
   layers?: LayersController;
+  storeys?: StoreysController;
   layouts?: LayoutsController;
   ground?: GroundController;
   selection?: Store<Selection | null>;
   info?: Store<Record<string, number>>;
   image?: ImageSurface;
   archive?: ArchiveController;
+  media?: MediaController;
+  sheets?: SheetsController;
+  pictures?: PicturesController;
+  viewport?: ViewportController;
   /**
    * What the user should know about what is shown, as message keys
    * (`warning_<key>`) and counts: what is left out of the picture (a
@@ -301,10 +372,21 @@ export interface Controllers {
    * sandboxed frame, that a file to be read by ranges was downloaded whole
    * (`source_read_whole`).
    */
-  warnings?: Store<readonly { key: string; count: number }[]>;
+  warnings?: Store<readonly Warning[]>;
 }
 
-/** PDF and DOCX report pages; PPTX reports slides and is stepped by buttons. */
+/**
+ * A warning: the message `warning_<key>` with its count, and what it is
+ * about when the view can name it (a drawing's entity types left out, the
+ * files its external references point at), as written in the file.
+ */
+export interface Warning {
+  key: string;
+  count: number;
+  names?: readonly string[];
+}
+
+/** PDF and DOCX report pages; PPTX reports slides. */
 export interface PagesController
   extends Store<{
     unit: "page" | "slide";
@@ -317,6 +399,11 @@ export interface PagesController
   prev?(): Promise<void>;
 }
 
+/**
+ * `scale` is 1 at the fitted view (what `fit()` goes back to), more when zoomed
+ * in and less when zoomed out, so a button to go back is wanted when it is not
+ * 1; `min` and `max` are its bounds, `max` possibly `Infinity`.
+ */
 export interface ZoomController extends Store<{ scale: number; min: number; max: number }> {
   /** `anchor` in container pixels; the centre by default. */
   setScale(scale: number, anchor?: { x: number; y: number }): void;
@@ -365,6 +452,21 @@ export interface LayersController
     kind: "layers" | "categories";
     items: readonly LayerItem[];
   }> {
+  setVisible(id: string, visible: boolean): void;
+  setAll(visible: boolean): void;
+}
+
+export interface StoreyItem {
+  /** What `setVisible` takes. */
+  id: string;
+  name: string;
+  /** The storey's elevation in metres, when the file gives one. */
+  elevation: number | null;
+  visible: boolean;
+}
+
+/** IFC: the building storeys of a model, highest first, shown or hidden. */
+export interface StoreysController extends Store<{ items: readonly StoreyItem[] }> {
   setVisible(id: string, visible: boolean): void;
   setAll(visible: boolean): void;
 }
@@ -420,6 +522,212 @@ export interface ArchiveController
   back(): void;
 }
 
+export interface MediaState {
+  kind: "video" | "audio";
+  paused: boolean;
+  ended: boolean;
+  /** In seconds. */
+  currentTime: number;
+  /** In seconds: 0 until known, Infinity for a live stream. */
+  duration: number;
+  /** Where the buffered range that holds `currentTime` ends, in seconds. */
+  buffered: number;
+  /** 0..1. */
+  volume: number;
+  muted: boolean;
+  rate: number;
+  /** Stalled for want of data. */
+  waiting: boolean;
+  /**
+   * The browser refused to start playing without a click on the player
+   * itself; a click on the surface plays it.
+   */
+  blocked: boolean;
+}
+
+/** Video and audio: for a host that draws its own player controls (`controls: "none"`). */
+export interface MediaController extends Store<MediaState> {
+  play(): Promise<void>;
+  pause(): void;
+  seek(seconds: number): void;
+  setVolume(volume: number): void;
+  setMuted(muted: boolean): void;
+  setRate(rate: number): void;
+}
+
+/** XLSX: the workbook's sheets, the shown one by its `index`. */
+export interface SheetsController
+  extends Store<{
+    items: readonly { index: number; name: string }[];
+    current: number;
+  }> {
+  select(index: number): Promise<void>;
+}
+
+// ── Rasters ──────────────────────────────────────────────────────────────────
+
+/**
+ * The coordinates a format's regions are written in:
+ *
+ * - "page": fractions of a page (0..1, origin at the top left): PDF, Word,
+ *   PowerPoint and the other office pages, a sheet.
+ * - "pixels": pixels of the source image (origin at the top left).
+ * - "drawing": drawing units of a CAD layout (y up), see `RasterOptions.layout`.
+ * - "camera": a 3D camera.
+ * - "frame": the whole picture (video): no region.
+ */
+export type RegionSpace = "page" | "pixels" | "drawing" | "camera" | "frame";
+
+/** A rectangle: `RegionSpace` "page", "pixels" or "drawing" regions. */
+export interface RasterRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * A 3D camera, "camera" regions. `aspect` is the width over the height the
+ * camera was framed for (a viewer's canvas): what `fit` keeps of it when the
+ * picture has another.
+ */
+export interface CameraRegion {
+  /** World coordinates, in the model's axes. */
+  position: readonly [number, number, number];
+  target: readonly [number, number, number];
+  /** Default (0, 1, 0), or (0, 0, 1) for a model the viewer shows Z up. */
+  up?: readonly [number, number, number];
+  projection: { type: "perspective"; fov: number } | { type: "orthographic"; height: number };
+  aspect: number;
+}
+
+export type RasterRegion = RasterRect | CameraRegion;
+
+/** How a picture of another shape than its region is made. */
+export type RasterFit = "contain" | "cover";
+
+/**
+ * What a raster is asked for. The size: `longEdge`, or `width` and `height`
+ * (one of the two alone takes the other from the region's shape). Past the
+ * limits (`MAX_PICTURE_EDGE` on a side, `MAX_PICTURE_PIXELS` in all) a
+ * `longEdge` is brought down to them; a `width` and `height` are refused with
+ * a `RasterError` "too-large".
+ */
+export interface RasterOptions {
+  longEdge?: number;
+  width?: number;
+  height?: number;
+  /**
+   * What to draw, in the coordinates of the controller's `space`; the whole
+   * page, image or drawing extents when absent. "current": what the session
+   * shows now (`Controllers.viewport`).
+   */
+  region?: RasterRegion | "current";
+  /** CAD: the layout (`LayoutsController` id) the region and the page are those of. Default: the one shown. */
+  layout?: string;
+  /**
+   * When the picture's shape is not the region's: "contain" (default) widens
+   * the region to the picture's shape, so that all of it is drawn; "cover"
+   * narrows it, so that the picture is filled. Never stretches.
+   */
+  fit?: RasterFit;
+  /**
+   * CAD: "screen" (default) draws lines as many pixels wide as the viewer
+   * does at its own zoom; "scaled" scales them with the picture, as if the
+   * viewer's zoom were brought up to the picture's size.
+   */
+  lineweight?: "screen" | "scaled";
+  /**
+   * A CSS colour (the formats check it: hex or a colour function) or
+   * "transparent". Default: white for a document, the viewer's ground for
+   * CAD and 3D. A format that cannot draw on transparency says so
+   * (`RasterError` "unsupported") rather than ignore it.
+   */
+  background?: string;
+  /** Stops the drawing: the promise rejects with a `RasterError` "aborted". */
+  signal?: AbortSignal;
+}
+
+/** A picture drawn, and where from. */
+export interface Raster {
+  /** The caller owns it and closes it. */
+  bitmap: ImageBitmap;
+  width: number;
+  height: number;
+  page: number;
+  /** CAD: the layout drawn. */
+  layout?: string;
+  space: RegionSpace;
+  /** The region actually drawn, in the same coordinates as the one asked for: map picture pixels back with it. Absent for "frame". */
+  region?: RasterRegion;
+}
+
+export type RasterType = "png" | "jpeg" | "webp";
+
+export interface EncodeOptions {
+  /** Default "png". JPEG has no transparency: it is drawn on `background`, or white. */
+  type?: RasterType;
+  /** 0..1 for "jpeg" and "webp". */
+  quality?: number;
+}
+
+/** A raster encoded to an image file. */
+export interface RasterBlob extends Omit<Raster, "bitmap"> {
+  blob: Blob;
+}
+
+/**
+ * Pages drawn as pictures: for thumbnails, printing, saving or analysing
+ * what the session shows. A PDF's, Word's and PowerPoint's pages, a
+ * spreadsheet's sheets, an image (one page), a drawing or a model (one page
+ * for each layout / one for the model), a video (one page: the frame being
+ * shown). `count` is the number of pages. Text and archives have none.
+ */
+export interface PicturesController extends Store<{ count: number; space: RegionSpace }> {
+  /**
+   * Page `page` (1-based) drawn at the requested size and region. Rejects
+   * with a `RasterError`. The caller owns the bitmap and closes it. Drawn
+   * again from the document's own data (vectors, geometry), not read off the
+   * screen: sharp at any size, whatever the view's zoom.
+   */
+  raster(page: number, options?: RasterOptions): Promise<Raster>;
+  /**
+   * `raster`, then encoded by the page that owns the session (never by the
+   * document's own code, in the sandboxed frame).
+   */
+  toBlob(page: number, options?: RasterOptions & EncodeOptions): Promise<RasterBlob>;
+  /**
+   * Page `page`, its longest side `longEdge` px (held to
+   * `MAX_PICTURE_EDGE` and `MAX_PICTURE_PIXELS`), a document's page on white.
+   * Null when it cannot be drawn. The caller owns the bitmap and closes it.
+   */
+  render(page: number, longEdge: number): Promise<ImageBitmap | null>;
+}
+
+/** What the session shows now, as a region of one page of its pictures. */
+export interface Viewport {
+  space: RegionSpace;
+  /** 1-based; the page most in view. */
+  page: number;
+  /** CAD: the layout shown. */
+  layout?: string;
+  region: RasterRegion;
+}
+
+/**
+ * The part of the document in view, in the coordinates of `pictures.space`;
+ * null while nothing is drawn. Pass it as `region` to `pictures.raster`
+ * (with `region: "current"`, or change it first) to draw what the user sees.
+ *
+ * Worked out for the formats where that costs (Word, PowerPoint, Excel, CSV,
+ * PDF) only while the store has a listener, and once for each `get` without
+ * one. A spreadsheet's is measured on a second copy of the workbook: its `get`
+ * returns the last one measured and starts the next. In the sandboxed frame a
+ * `get` returns the last value the frame reported and asks it for a fresh
+ * one: subscribe to follow the viewport.
+ */
+export type ViewportController = Store<Viewport | null>;
+
 // ── Image surface ────────────────────────────────────────────────────────────
 
 /**
@@ -447,7 +755,7 @@ export interface ImageSurface extends Store<ViewState> {
   pick<T extends { x: number; y: number }>(markers: Iterable<T>, at: { x: number; y: number }, radius?: number): T | null;
   /**
    * Laid out in page pixels and transformed with the image: an overlay drawn
-   * here pans and zooms with it. `--exv-scale` keeps a marker's screen size.
+   * here pans and zooms with it. `--exav-viewer-scale` keeps a marker's screen size.
    */
   pageLayer: HTMLElement;
   /** Untransformed, above everything: HTML controls placed with `toScreen`. */
@@ -498,11 +806,12 @@ export interface Session {
   /**
    * Shows `file`, the same document under the same id with other bytes, in
    * place of the current one, keeping the zoom and scroll position where the
-   * format can (PDF, images). Resolves `true` when it did. `false`: this
-   * session cannot (another format, a plugin without `replace`, a document
-   * in a sandboxed frame), and nothing was changed: mount a new session, as
-   * for a new file. A new document that cannot be read ends in an error
-   * status.
+   * format can (PDF, images), in the page and in the sandboxed frame alike.
+   * Resolves `true` when it did. `false`: this session cannot (another
+   * format, a plugin without `replace`, a frame not started yet, a file
+   * delivered another way than the first), and nothing was changed: mount a
+   * new session, as for a new file. A new document that cannot be read ends
+   * in an error status.
    */
   replace(file: ViewerFile): Promise<boolean>;
   resize(): void;

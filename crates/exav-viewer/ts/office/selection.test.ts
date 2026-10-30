@@ -133,11 +133,11 @@ describe("textSelection", () => {
     const surface = root.firstElementChild!;
     // A press elsewhere: no cover.
     root.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    expect(root.querySelector(".exv-office-text-end")).toBeNull();
+    expect(root.querySelector(".exav-viewer-office-text-end")).toBeNull();
     runs[0]!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    expect(surface.firstElementChild?.className).toBe("exv-office-text-end");
+    expect(surface.firstElementChild?.className).toBe("exav-viewer-office-text-end");
     document.dispatchEvent(new Event("pointerup"));
-    expect(root.querySelector(".exv-office-text-end")).toBeNull();
+    expect(root.querySelector(".exav-viewer-office-text-end")).toBeNull();
     stop();
   });
 
@@ -158,8 +158,8 @@ describe("textSelection", () => {
     document.body.append(root);
     const stop = textSelection(root);
     shapes[0]!.firstElementChild!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    for (const holder of [surface, ...shapes]) expect(holder.firstElementChild?.className).toBe("exv-office-text-end");
-    expect(root.querySelectorAll(".exv-office-text-end")).toHaveLength(3);
+    for (const holder of [surface, ...shapes]) expect(holder.firstElementChild?.className).toBe("exav-viewer-office-text-end");
+    expect(root.querySelectorAll(".exav-viewer-office-text-end")).toHaveLength(3);
     stop();
   });
 });

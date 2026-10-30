@@ -33,7 +33,7 @@
 
 #![no_main]
 
-use exav_x86::{decode, Insn, Op, Size};
+use exav_x86::{Insn, Op, Size, decode};
 use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind, Register};
 use libfuzzer_sys::fuzz_target;
 
@@ -228,8 +228,9 @@ fuzz_target!(|data: &[u8]| {
             // Re-decoding from exactly the reported length must agree: a
             // decoder that reads further than it reports would still have
             // passed every check above.
-            let exact = decode(&window[..o.len], ip)
-                .unwrap_or_else(|| panic!("{window:02x?} does not decode from its own {} bytes", o.len));
+            let exact = decode(&window[..o.len], ip).unwrap_or_else(|| {
+                panic!("{window:02x?} does not decode from its own {} bytes", o.len)
+            });
             assert_eq!(exact.len, o.len, "length not self-consistent");
             assert_eq!(exact.mn, o.mn, "mnemonic not self-consistent");
 

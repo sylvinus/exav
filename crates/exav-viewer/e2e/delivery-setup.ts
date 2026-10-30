@@ -139,6 +139,8 @@ export default async function setup(): Promise<void> {
   fs.writeFileSync(path.join(OUT, "big.pdf"), bigPdf());
   fs.writeFileSync(path.join(OUT, "big.zip"), bigZip());
   fs.writeFileSync(path.join(OUT, "spaced.zip"), spacedZip());
+  // The external converter of external.spec.ts, served at /e2e/fake-converter.js.
+  fs.copyFileSync(path.join(here, "fixtures", "fake-converter.js"), path.join(OUT, "fake-converter.js"));
   // Recorded in real time: kept once made (delete e2e/.out/ to remake it).
   const clip = path.join(OUT, "clip.webm");
   if (!fs.existsSync(clip)) await recordClip(clip);

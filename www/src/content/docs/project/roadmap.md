@@ -1,6 +1,6 @@
 ---
 title: Roadmap
-description: What's next for exav, from signature-matching performance and one read pass for large files to broader bytecode coverage, streaming RAR, multi-volume archives, JPEG XL in the viewer and less dependency unsafe.
+description: What's next for exav, from signature-matching performance and one read pass for large files to broader bytecode coverage, streaming RAR, multi-volume archives, the viewer's Office converters, document text search and less dependency unsafe.
 ---
 
 exav is beta and `0.0.x`: any release may change behaviour or APIs. What has
@@ -29,7 +29,7 @@ The exceptions are the documented detection gaps: unimplemented
   `inflate`) come first, with differential validation against `clamscan`.
 - **Extended and continuous fuzzing**, and a large no-silent-skip CI suite.
 
-## Large files: fewer passes, PE structure
+## Large files: fewer passes, PE structure, HTTP
 
 A file larger than `--max-object-bytes` gets the full engine, read through a
 block cache (see [Streaming & memory](/scanner/concepts/streaming-memory/)). Two things
@@ -44,13 +44,21 @@ remain:
   is `LIMITS-EXCEEDED` unless something is found. Reading only the headers and
   sections would cover the common case of a small executable with a large
   overlay. YARA's `pe`, `elf` and `dotnet` modules have the same limit.
+- **A spill file for `exav-grep`.** A container inside a member longer than
+  `--max-object-bytes` is reported unreadable, because opening it takes
+  somewhere to write it.
+- **HTTP sources.** A scan over HTTP has no timeout of its own, follows
+  redirects without filtering where they lead, and does not check that the
+  object stays the same between range requests (see
+  [HTTP sources](/scanner/concepts/streaming-memory/#http-sources)).
 
 ## Streaming the containers read whole
 
-Most containers, DMG disk images included, are walked member by member off the
-source, so peak memory is one member rather than the whole decoded object (see
-[how extraction works](/unpack/how-it-works/)). RAR, 7z, OLE, the virtual
-disks and filesystems, and a few others are still read whole (see
+Most containers, disk images and filesystems included, are walked member by
+member off the source, so peak memory is one member rather than the whole
+decoded object (see [how extraction works](/unpack/how-it-works/)), the files
+of a disk image or an archive past `--max-object-bytes` through a spill file.
+RAR, OLE, CHM, ARJ, email and a few others are still read whole (see
 [Supported formats](/scanner/reference/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)):
 past `--max-object-bytes` their own bytes get the full scan but their members are
 not extracted, and the file is `LIMITS-EXCEEDED` unless something is found.
@@ -71,20 +79,15 @@ bounded object, so streaming it would save little memory; raising
   counted, so the list of what to add is measured.
 - Verifying Authenticode signatures cryptographically. Parsing, digest checks
   and `.crb` matching exist today.
-- **Joining format-aware volume sets**: RAR `.partN`/`.rNN`, ZIP `.zNN`, and
-  multi-cabinet CAB. Byte-split sets (`x.7z.001`, `x.7z.002`, ...) are already
-  joined when their parts arrive together (see
-  [split archives](/scanner/guides/daemon/#split-archives)). A format-aware volume
-  carries its own headers and a member's data resumes past the next volume's
-  header, so the join belongs in the format's decoder. ClamAV does not join
-  them either; exav reports the split member and scans the part in the volume
-  it was given. Sibling volumes will only be looked for next to the scanned
-  file, under names generated from its own, as regular files (no symlinks). A
-  cabinet names its successor inside the file, so that name will be matched
-  against the directory listing and never opened as a path.
+- **Volume sets met inside a container.** RAR, ZIP and CAB volume sets are
+  joined when their volumes sit next to each other on disk, or arrive together
+  at the daemon (see [split archives](/scanner/guides/daemon/#split-archives)),
+  but not when the volumes are members of another archive: each is then scanned
+  on its own and the member continued in another volume is reported.
 - The unimplemented `Target:` values (internal, other, and ClamAV's reserved
-  slot 8), `EP` and section offsets on ELF and Mach-O files, and the unloaded
-  database extensions (`.cat`, `.ioc`, and the legacy `.sdb`/`.zmd`/`.rmd`).
+  slot 8), `EP` on Mach-O files (clamscan does not resolve it either), and the
+  unloaded database extensions (`.cat`, `.ioc`, and the legacy
+  `.sdb`/`.zmd`/`.rmd`).
   None appears in a stock official database; all matter for third-party feeds.
   See [Targets](/scanner/reference/comparison-with-clamav/#targets).
 
@@ -93,28 +96,45 @@ bounded object, so streaming it would save little memory; raising
 - QEMU/KVM dynamic detonation: a separate, heavyweight feature, only if there is
   demand.
 
-## File viewer: JPEG XL, after 0.0.2
+## Documents, search and the viewer
 
-The viewer does not open JPEG XL yet. The decoder to build on is
-[`jxl`](https://crates.io/crates/jxl) (jxl-rs, the libjxl team's own,
-BSD-3-Clause), forked as a crate of exav's so that it can be
-`#![forbid(unsafe_code)]` like the other decoders the viewer runs:
+The viewer opens JPEG XL (a fork of the libjxl team's jxl-rs, `forbid(unsafe_code)`
+and built without SIMD), camera RAW previews, and converts the old Office
+formats in the browser. What is not done:
 
-- **Without SIMD.** Its SIMD (347 `unsafe` sites) is behind features, and the
-  WebAssembly build does without it.
-- **Without the rest of its `unsafe`**, about 80 sites that no feature turns
-  off. Most are in the image buffers: allocation by hand, buffers
-  reinterpreted as another number type, rows sliced from raw pointers. They
-  become typed vectors. The others are unchecked indexing in the modular
-  predictor and the entropy decoder, a small-vector type and a few casts. Its
-  `array-init` and `byteorder` dependencies give way to the standard library.
-- **Checked** against libjxl's `djxl` on its conformance files, and fuzzed.
-- **In the viewer only,** in its WebAssembly image module: the scanner's image
-  hashing gains nothing from it, since ClamAV's image signatures do not cover
-  the format.
-
-The cost is speed (no SIMD, bounds checks), and following upstream, which
-releases about monthly, by hand.
+- **The text-document converter is a prototype.** On the project's test files,
+  32% of the pages of DOC files come out close to a reference rendering,
+  against 50% for DOCX drawn natively. Open decisions: falling back to the
+  external converter for what it reports unsupported (Pages '09, Word 1 and
+  2), making it the default even where an external converter is set, keeping
+  tracked changes in DOC, and Pages tables, pictures and headers.
+- **Presentations.** PowerPoint 2, 3 and 4 are recognised and reported
+  unsupported. PowerPoint 95 pictures, freeforms and arcs are left out. The
+  first slide could be drawn while the rest converts. Binary Visio, CorelDRAW,
+  Publisher and the other page layout formats are read only by an
+  [external converter](/viewer/integration/#the-external-converter).
+- **Searching documents.** `exav-grep --text` and the scanner's text view read
+  Markdown, HTML, the XML parts of Office and OpenDocument files, DXF and DWG,
+  and, behind opt-in features, PDF and the legacy and flat office formats.
+  Still to do: IFC names and property values, an email's headers, the
+  hyperlinks of OOXML files (apart from their labels), PDF link annotations,
+  the speaker notes of presentations, and matches located by page and by
+  drawing entity. PDF text and the office readers are not defaults because of
+  hayro's `unsafe` and the size of the readers. OCR for images and scanned
+  pages, and QR codes for the scanner, are proposed.
+- **Drawings and models.** DWG before R13 is reported unsupported. Large
+  drawings have no level of detail, annotative objects and linked images are
+  not resolved (external references are, from the files around the drawing),
+  and 3D is out of scope. IFC geometry has
+  [known gaps](/subprojects/exav-render/#ifc-and-stl-models). glTF with Draco
+  or meshopt, and PLY point clouds, are not drawn.
+- **Camera RAW.** The sensor data is never decoded, so a file with no preview
+  (most phones' DNG, Minolta MRW, CR3 whose preview is HEIF) shows an error.
+- **Other viewer gaps.** Replacing a document in a sandboxed frame starts the
+  zoom and position over. Archives left out on purpose: email, OLE
+  containers, OpenDocument and EPUB, packers and installers. Text previews
+  have no line numbers, tree view or search. The browser's own JPEG XL decoder
+  could spare the module's size where it exists.
 
 ## Hardening: less dependency `unsafe`
 
@@ -128,10 +148,11 @@ ongoing goal:
 - **Audit** each dependency's `unsafe` by reachability from a hostile-input scan
   path (the per-crate counts are done).
 - **Drop** dependencies exav does not need (done for `tar`'s `xattr`, which was
-  the largest source of syscall `unsafe`).
+  the largest source of syscall `unsafe`, for `half` and `zerocopy`, and for
+  zstd's checksum, `twox-hash`).
 - **Make safe** what can be: portable builds without SIMD where the speed cost is
-  acceptable, and vendoring then removing `unsafe` (the RAR PPMd decoder has
-  none).
+  acceptable, and vendoring then removing `unsafe` (the RAR PPMd, LZFSE and
+  InstallShield Z decoders have none).
 - **Reuse exav's own safe code** where it duplicates an `unsafe` dependency.
 - **Verify** the rest with `cargo-fuzz` and Miri (`make miri`), and document the
   containment (panic isolation, the prefork process boundary, the WASM build).

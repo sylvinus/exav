@@ -33,6 +33,22 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # Everything a release publishes is labelled with a version of its own:
+      # the binaries with the workspace's, the npm packages with theirs. One
+      # that was not bumped ships next to the others under another number, and
+      # nothing else fails. Checked before anything is built.
+      - name: Check every version matches the tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          WORKSPACE=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml | head -1)
+          VIEWER=$(node -p "require('./crates/exav-viewer/package.json').version")
+          UNPACK=$(node -p "require('./crates/exav-unpack-wasm/package.json').version")
+          status=0
+          for pair in "Cargo.toml:$WORKSPACE" "crates/exav-viewer/package.json:$VIEWER" "crates/exav-unpack-wasm/package.json:$UNPACK"; do
+            file="${pair%%:*}"; version="${pair#*:}"
+            [ "$version" = "$TAG_VERSION" ] || { echo "$file is $version, the tag is $TAG_VERSION"; status=1; }
+          done
+          exit $status
       - uses: taiki-e/create-gh-release-action@v1
         with:
           # The release notes are this tag's section of the changelog

@@ -44,8 +44,14 @@ SPARSE = sorted(
         0x2206, 0x2300,                  # increment, diameter
         0x2264, 0x2265, 0x2260,          # <=, >=, !=
         0x00B0, 0x00B1, 0x00B2, 0x00B3,  # already dense, listed to assert
-        0x03A9, 0x03BC,                  # ohm, micro
+        0x2200, 0x2203, 0x220B, 0x2217,  # Symbol's for all, exists, contains, star
+        0x2212, 0x2234, 0x223C, 0x2245,  # minus, therefore, tilde, congruent
+        0x22A5,                          # perpendicular
     }
+    # Greek, with Symbol's theta, phi and pi symbols, and basic Cyrillic:
+    # what Greek and Russian notes on a sheet are written in.
+    | set(range(0x0384, 0x03D7))
+    | set(range(0x0400, 0x0460))
 )
 
 # Fixed-point divisor for a stored advance, in em units. An advance is under

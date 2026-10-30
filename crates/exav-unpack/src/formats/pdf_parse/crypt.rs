@@ -160,17 +160,17 @@ impl Decoder {
         Err(PdfCryptError::UnsupportedRevision(level))
     }
 
-    pub(crate) fn decrypt_stream(&self, obj_id: u32, gen: u32, data: &mut Vec<u8>) {
+    pub(crate) fn decrypt_stream(&self, obj_id: u32, r#gen: u32, data: &mut Vec<u8>) {
         if data.is_empty() || self.method == CryptMethod::None {
             return;
         }
         match self.method {
             CryptMethod::V2 => {
-                let key = self.per_object_key(obj_id, gen, None);
+                let key = self.per_object_key(obj_id, r#gen, None);
                 rc4_apply(&key, data);
             }
             CryptMethod::AESV2 => {
-                let key = self.per_object_key(obj_id, gen, Some(b"sAlT"));
+                let key = self.per_object_key(obj_id, r#gen, Some(b"sAlT"));
                 aes_cbc_decrypt(&key, data);
             }
             CryptMethod::AESV3 => {
@@ -184,12 +184,12 @@ impl Decoder {
     /// ISO 32000-1 7.6.2, algorithm 1: MD5 of the file key, the object
     /// number's low 3 bytes and the generation's low 2, and for AES the salt;
     /// the first n + 5 bytes of it, at most 16, are the object's key.
-    fn per_object_key(&self, obj_id: u32, gen: u32, salt: Option<&[u8]>) -> Vec<u8> {
+    fn per_object_key(&self, obj_id: u32, r#gen: u32, salt: Option<&[u8]>) -> Vec<u8> {
         let n = self.key_size.min(16).min(self.key.len());
         let mut data = Vec::with_capacity(n + 5 + 4);
         data.extend_from_slice(&self.key[..n]);
         data.extend_from_slice(&obj_id.to_le_bytes()[..3]);
-        data.extend_from_slice(&gen.to_le_bytes()[..2]);
+        data.extend_from_slice(&r#gen.to_le_bytes()[..2]);
         if let Some(s) = salt {
             data.extend_from_slice(s);
         }
@@ -755,8 +755,14 @@ mod tests {
             method: CryptMethod::AESV2,
         };
         let cases = [
-            (&v3, "222222222222222222222222222222221667316af8df34c59a9cfbb282f3f15390b837b680e02362584c9426a765787eba74d5ee5529da8aad289df5c742541b"),
-            (&v2, "22222222222222222222222222222222c0f2686b1de9823bb0b732f174856be9b2bde49ef0768d91635c34a59383f9e6064367ffe1064032238b380d4224a448"),
+            (
+                &v3,
+                "222222222222222222222222222222221667316af8df34c59a9cfbb282f3f15390b837b680e02362584c9426a765787eba74d5ee5529da8aad289df5c742541b",
+            ),
+            (
+                &v2,
+                "22222222222222222222222222222222c0f2686b1de9823bb0b732f174856be9b2bde49ef0768d91635c34a59383f9e6064367ffe1064032238b380d4224a448",
+            ),
         ];
         for (dec, hex) in cases {
             // As extracted, and with the end-of-line a stream body can carry.
@@ -767,6 +773,33 @@ mod tests {
                 assert_eq!(data, PLAIN, "{:?} with tail {tail:?}", dec.method);
             }
         }
+    }
+
+    /// An AES-128 (R4) file whose `/O` holds a backspace, written `\b`, opens
+    /// with the empty password. The dictionary is the one of a real file that
+    /// was reported password-protected while qpdf opened it.
+    #[test]
+    fn an_owner_key_with_a_backspace_escape_still_opens_with_the_empty_password() {
+        use crate::formats::pdf_parse::{lex::Lexer, parse::parse_object};
+        let mut src = b"<</Filter/Standard/O (".to_vec();
+        src.extend_from_slice(
+            b"\xe4\xa5`\xed\xd7\\b\x9c\xd0\x85\x0fB\x8c\xba\\)\x18\\(\xdc\\\\\xd8[\x1d\\)\xefFm\xb4\x96\xe2O\xf3<\xb0",
+        );
+        src.extend_from_slice(b")/U (");
+        src.extend_from_slice(b"\xb7c\x87\xea/\xb6\\n\xa9\x0b\xe5O\x81\xc7\xcf\x80I");
+        src.extend_from_slice(&[0; 16]);
+        src.extend_from_slice(
+            b")/P -300/R 4/EncryptMetadata false/V 4/Length 128/StrF/StdCF/StmF/StdCF\
+              /CF<</StdCF<</Length 16/AuthEvent/DocOpen/CFM/AESV2>>>>>>",
+        );
+        let Some(Primitive::Dictionary(dict)) = parse_object(&mut Lexer::new(&src)) else {
+            panic!("not a dictionary");
+        };
+        let dict = CryptDict::from_primitive(&dict).unwrap();
+        assert_eq!(dict.o.len(), 32);
+        assert_eq!(dict.o[5], 0x08);
+        let id = unhex("4db41f9bda1583e5463f724dd715f4ee");
+        assert!(Decoder::from_password(&dict, &id, b"").is_ok());
     }
 
     /// RC4 with a 40-bit file key: the object key is 10 bytes (n + 5), and it

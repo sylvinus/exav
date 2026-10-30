@@ -39,6 +39,10 @@ scan.
 - **The native [YARA engine](/scanner/guides/yara/)** and a step-capped
   [bytecode interpreter](/scanner/concepts/bytecode-sandbox/) for `.cbc` programs, both
   without runtime code generation.
+- **A text view of documents** (`visible-text`): a document's words as a
+  reader sees them, with each link followed by where it goes, are matched
+  beside its bytes, through [exav-render](/subprojects/exav-render/#text). A
+  document whose text cannot be taken out marks the scan incomplete.
 - **Content-based file typing**, PE parsing, fuzzy and similarity scoring, the
   prebuilt-`.exavdb` builder, and an HTTP range-reader backend (`http`
   feature) that scans a large remote file through the block cache instead of
@@ -223,7 +227,10 @@ names.
 
 | Feature | What it does |
 |---|---|
-| default | `yara`, `all-formats`, `decrypt`, `dlp`, `phishing`, `image-hash`: the `exav` binary's defaults minus its `icap` |
+| default | `yara`, `all-formats`, `decrypt`, `dlp`, `phishing`, `image-hash`, `visible-text`: the `exav` binary's defaults minus its `icap` |
+| `visible-text` | [The text a reader sees](/scanner/reference/formats/#the-text-a-reader-sees) of a document is matched as a text view |
+| `visible-text-pdf` | And PDF's, through hayro; not a default (see [feature flags](/scanner/reference/feature-flags/)) |
+| `visible-text-office` | And the legacy and flat office formats, through exav-render's office converters; not a default |
 | `http` | The HTTP range-request reader (`dep:ureq`) |
 | `checksums` | Lets `ScanOptions::verify_checksums` make a container checksum mismatch an error |
 | `unstable-internals` | Makes the engine internals (`engine`, `bytecode`, `pe`, …) public, for tools; no stability promise |

@@ -139,7 +139,12 @@ is a 1 KiB decoy and whose second holds the malware was a real false negative.
 **Appended archives** are carved too: ZIP, gzip, bzip2, xz, 7z, RAR and CAB
 magics after offset 0 (self-extractors, PE overlays, droppers that staple an
 archive onto a carrier). A carve that fails to decode is usually a chance byte
-run and is dropped rather than making the carrier `UNSCANNABLE`. The exception is
+run and is dropped rather than making the carrier `UNSCANNABLE`. A file that
+the magic at its start types as an archive (a PDF, a tar, a gzip, a bzip2) is
+not carved for magics, but a ZIP behind it is found by the record at the end of
+the file, which is how `unzip` finds it, and is scanned as the ZIP it is. An
+ISO 9660 or ext image whose first bytes are an archive's magic, in the space
+those formats leave free, is walked as the image too. The exception is
 an encrypted ZIP appended to a picture or a document whose central directory
 checks out: archive tools open such a polyglot through its trailing directory, so
 it is reported `PASSWORD-PROTECTED`.
@@ -292,9 +297,12 @@ detection. A macro sheet is a `BOUNDSHEET` record (`0x0085`) with sheet type 1,
 and the macros are `FORMULA` records holding `ptg` token streams in which built-in
 functions (`EXEC`, `CALL`, `ALERT`) are numeric ids. The bytes `EXEC` never
 appear in the file, so a byte-pattern signature for them cannot match. exav walks
-the record stream and produces an artifact with the macro-sheet names, the string
-constants and each formula's tokens with function ids decoded back to names, so
-signatures match the real calls and `--detect macros` fires for XLM as for VBA.
+the record stream with the reader the XLS converter uses and produces an artifact
+with the macro-sheet names, the defined names, the text cells and each formula as
+Excel shows it (`=EXEC("calc.exe")`), function ids decoded back to names, so
+signatures match the real calls and `--detect macros` fires for XLM as for VBA. A
+formula the reader cannot finish still gives the calls and strings it read before
+the token it could not.
 
 Other content that must be decoded before any signature can see it:
 
@@ -354,7 +362,10 @@ Which signatures meet which rendering follows clamscan, probed one signature
 at a time: `Target:3` and `Target:7` signatures match only the HTML and text
 renderings, never raw bytes; an HTML file has the HTML rendering and a text file
 the text one, not the other; `Target:4` (mail) signatures match a mail's raw
-bytes. An HTML signature on plain JavaScript is a match clamscan cannot make,
+bytes. The exception is the [visible text](/scanner/reference/feature-flags/) of
+a document (the `visible-text` feature, off under `--clamav-compat`): the words
+of an HTML page, a Markdown file or an Office part are also a text view, which
+`Target:7` signatures see. An HTML signature on plain JavaScript is a match clamscan cannot make,
 and one did fire on obfuscated npm code before. Java signatures (`Target:12`)
 are gated on the `cafebabe` magic because one fired on APK members, and the
 targets exav cannot positively identify are skipped (see

@@ -11,9 +11,9 @@ use std::cell::Cell;
 use std::sync::Once;
 
 use exav_render::image::{
-    decode, decode_any, Channels, Error, Format, Pixels, Samples, DECODE_MAX,
+    Channels, DECODE_MAX, Error, Format, Pixels, Samples, decode, decode_any,
 };
-use exav_render::pdf_image::{decode_ccitt, decode_jbig2, decode_jpx, CcittParams, JpxParams};
+use exav_render::pdf_image::{CcittParams, JpxParams, decode_ccitt, decode_jbig2, decode_jpx};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(
@@ -558,6 +558,55 @@ fn a_jbig2_region_larger_than_the_budget_is_refused() {
         decode_jbig2(stream, want.width, want.height, None, budget).unwrap(),
         packed(&want)
     );
+}
+
+/// A region's pixels cost time, a few seconds for the half billion that
+/// [`DECODE_MAX`] allows a file and as many again for each further half: the
+/// bound is the same through the PDF decoder, whatever memory it is given
+/// (the viewer gives it a gigabyte).
+#[test]
+fn a_jbig2_stream_declaring_more_region_pixels_than_a_file_may_is_refused_at_any_budget() {
+    // 23,171 squared is just over 2^29.
+    let embedded: Vec<u8> = page_with_a_region(23_171)
+        .iter()
+        .flat_map(|(h, d)| [&h[..], &d[..]].concat())
+        .collect();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        decode_jbig2(&embedded, 120, 64, None, 1 << 40).map_err(|e| e.message()),
+        Err("Image too large")
+    );
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    // Just under it is decoded.
+    let embedded: Vec<u8> = page_with_a_region(1024)
+        .iter()
+        .flat_map(|(h, d)| [&h[..], &d[..]].concat())
+        .collect();
+    assert!(decode_jbig2(&embedded, 120, 64, None, 1 << 40).is_ok());
+}
+
+/// A JBIG2 file of 243 bytes whose symbol dictionary says it has 50,044 new
+/// symbols (a sample's 12 with two bytes changed): hayro-jbig2 went on
+/// decoding symbols from what was left of the stream, for two minutes and
+/// 7 GB. A dictionary cannot hold more symbols than its length allows.
+#[test]
+fn a_jbig2_symbol_dictionary_with_far_more_symbols_than_its_bytes_is_refused_at_once() {
+    const FILE: &str = "\
+         974a42320d0a1a0a01000000010000000000010000000071000003fffdff02fefefe0000000c0000\
+         c37c06f1cc488c06ba0000001601030001000000001000001701040001000000140000001a010500\
+         01000000e20100001b01050001000000ea010000a276087fff7fff76313cd54eee9ca11f0a8e7f95\
+         7f2da4b136d84b29412bd2fb179115ffac00007f0130000100000013000000530000002500000000\
+         00000000000000000000020622000100000035000000530000002500000000000000000000000000\
+         00139fd47be658ea8ffbdaa32383a44e98d95f322818ddce8e89d1caacc8ffac0000000331000100\
+         000000";
+    let data: Vec<u8> = (0..FILE.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&FILE[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(data.len(), 243);
+    let started = std::time::Instant::now();
+    assert_eq!(decode_any(&data, DECODE_MAX), Err(Error::Undecodable));
+    assert!(started.elapsed().as_secs() < 5);
 }
 
 #[test]

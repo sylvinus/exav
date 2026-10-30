@@ -12,7 +12,7 @@
 //! matched. Recording is first-write-wins, so the assertion is that *some*
 //! location is reported for a hit that is nested.
 
-use exav_core::{scan_seekable_located, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, scan_seekable_located};
 use std::io::Cursor;
 
 fn eicar() -> &'static [u8] {

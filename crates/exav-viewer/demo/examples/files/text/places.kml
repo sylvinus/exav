@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Places (made up)</name>
+    <Style id="harbour"><IconStyle><color>ff0000ff</color><scale>1.2</scale></IconStyle><PolyStyle><color>7f00ff00</color></PolyStyle></Style>
+    <Placemark>
+      <name>East quay</name>
+      <description><![CDATA[<b>Moorings</b> for 60 boats.]]></description>
+      <styleUrl>#harbour</styleUrl>
+      <Point><coordinates>-4.4860,48.3830,0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Breakwater</name>
+      <LineString><tessellate>1</tessellate><coordinates>-4.4900,48.3790,0 -4.4850,48.3820,0 -4.4800,48.3835,0</coordinates></LineString>
+    </Placemark>
+    <Placemark>
+      <name>Anchorage</name>
+      <styleUrl>#harbour</styleUrl>
+      <Polygon><outerBoundaryIs><LinearRing><coordinates>-4.4950,48.3850,0 -4.4900,48.3850,0 -4.4900,48.3900,0 -4.4950,48.3900,0 -4.4950,48.3850,0</coordinates></LinearRing></outerBoundaryIs></Polygon>
+    </Placemark>
+  </Document>
+</kml>

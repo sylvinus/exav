@@ -142,6 +142,290 @@ impl<R: Read> EndianReader<R> {
 #[cfg(true)]
 pub type DeflateReader<R> = flate2::read::ZlibDecoder<R>;
 
+/// exav: YCbCr stored with the chroma sampled `h` by `v` times less often than
+/// the luma, as TIFF 6.0 lays it out: in units of `h` by `v` pixels, each its
+/// `h * v` luma values (row by row) then one Cb and one Cr, the units in raster
+/// order. The unit rows are read and given back as `width` pixels of
+/// Y, Cb, Cr to a row, `rows` of them, the chroma repeated over its unit.
+pub struct YcbcrUnits<R: Read> {
+    inner: R,
+    width: usize,
+    rows: usize,
+    h: usize,
+    v: usize,
+    pixels: Vec<u8>,
+    at: usize,
+    given: usize,
+}
+
+impl<R: Read> YcbcrUnits<R> {
+    pub fn new(inner: R, width: usize, rows: usize, h: usize, v: usize) -> Self {
+        Self {
+            inner,
+            width,
+            rows,
+            h,
+            v,
+            pixels: Vec::new(),
+            at: 0,
+            given: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for YcbcrUnits<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.at == self.pixels.len() {
+            if self.given >= self.rows {
+                return Ok(0);
+            }
+            let unit = self.h * self.v + 2;
+            let mut raw = vec![0u8; self.width.div_ceil(self.h) * unit];
+            self.inner.read_exact(&mut raw)?;
+            self.pixels.clear();
+            self.at = 0;
+            for r in 0..self.v {
+                for x in 0..self.width {
+                    let u = &raw[x / self.h * unit..][..unit];
+                    self.pixels
+                        .extend_from_slice(&[u[r * self.h + x % self.h], u[unit - 2], u[unit - 1]]);
+                }
+            }
+            self.given += self.v;
+        }
+        let n = buf.len().min(self.pixels.len() - self.at);
+        buf[..n].copy_from_slice(&self.pixels[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+/// exav: a zlib stream read for the viewer, which does not check the Adler-32
+/// of what it has decoded: libtiff's readers go on past a wrong one, and some
+/// writers got it wrong (OpenCV's `multipage.tif`). A stream that does not
+/// start as zlib does is left to the zlib reader.
+#[cfg(true)]
+pub fn lenient_zlib<'r, R: Read + 'r>(mut reader: R) -> io::Result<Box<dyn Read + 'r>> {
+    let mut head = [0u8; 2];
+    reader.read_exact(&mut head)?;
+    let check = u16::from_be_bytes(head);
+    // Deflate, a window of 32 KiB at most, no preset dictionary, a valid check.
+    if head[0] & 0x0f == 8 && head[0] >> 4 <= 7 && head[1] & 0x20 == 0 && check % 31 == 0 {
+        Ok(Box::new(flate2::read::DeflateDecoder::new(reader)))
+    } else {
+        Ok(Box::new(DeflateReader::new(io::Cursor::new(head).chain(reader))))
+    }
+}
+
+/// exav: the LZMA2 data of an `.xz` stream with one block, as libtiff writes
+/// `LZMA` (34925) strips: `lzma_stream_encoder` with the LZMA2 filter and, by
+/// default, no check. Only the stream header and the block header are read;
+/// the data run to LZMA2's own end marker. `window` bounds the dictionary
+/// that is allocated: no more than the strip decodes to is ever looked back
+/// on. For the viewer's reader only.
+pub fn xz_lzma2<'r, R: Read + 'r>(mut reader: R, window: u32) -> io::Result<Box<dyn Read + 'r>> {
+    let bad = |what| io::Error::new(io::ErrorKind::InvalidData, what);
+    let mut head = [0u8; 13];
+    reader.read_exact(&mut head)?;
+    if head[..6] != [0xFD, b'7', b'z', b'X', b'Z', 0] || head[12] == 0 {
+        return Err(bad("lzma: not an xz stream"));
+    }
+    // The block header: its size, its flags, optional sizes, then the filters.
+    let mut block = vec![0u8; usize::from(head[12]) * 4 + 3];
+    reader.read_exact(&mut block)?;
+    let flags = block[0];
+    let mut at = 1;
+    for bit in [0x40, 0x80] {
+        if flags & bit != 0 {
+            while *block.get(at).ok_or_else(|| bad("lzma: bad block header"))? & 0x80 != 0 {
+                at += 1;
+            }
+            at += 1;
+        }
+    }
+    // The filters: LZMA2 (0x21) with one byte of properties, behind a delta
+    // filter (0x03, one byte: the distance less one) that libtiff puts in for a
+    // horizontal predictor.
+    let mut delta = None;
+    let mut dict = None;
+    for i in 0..=(flags & 3) {
+        let Some(&[id, 1, p]) = block.get(at..at + 3).and_then(|b| <&[u8; 3]>::try_from(b).ok())
+        else {
+            return Err(bad("lzma: unknown filter"));
+        };
+        at += 3;
+        match (id, i == flags & 3) {
+            (0x03, false) if delta.is_none() => delta = Some(usize::from(p) + 1),
+            (0x21, true) if p <= 40 => dict = Some(u64::from(2 | (p & 1)) << (p / 2 + 11)),
+            _ => return Err(bad("lzma: unknown filter")),
+        }
+    }
+    let dict = dict.ok_or_else(|| bad("lzma: no LZMA2 filter"))?.min(u64::from(window)) as u32;
+    let lzma = Lzma2Reader::new(reader, dict);
+    Ok(match delta {
+        Some(distance) => Box::new(DeltaReader::new(lzma, distance)),
+        None => Box::new(lzma),
+    })
+}
+
+/// exav: the xz delta filter undone: each byte is a difference from the one
+/// `distance` bytes before it.
+pub struct DeltaReader<R: Read> {
+    inner: R,
+    history: Vec<u8>,
+    at: usize,
+}
+
+impl<R: Read> DeltaReader<R> {
+    fn new(inner: R, distance: usize) -> Self {
+        Self {
+            inner,
+            history: vec![0; distance],
+            at: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for DeltaReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        for b in &mut buf[..n] {
+            *b = b.wrapping_add(self.history[self.at]);
+            self.history[self.at] = *b;
+            self.at = (self.at + 1) % self.history.len();
+        }
+        Ok(n)
+    }
+}
+
+/// exav: raw LZMA2 data, for the viewer's reader only.
+pub struct Lzma2Reader<R: Read> {
+    inner: R,
+    stream: lzma_rust2::Lzma2Stream,
+    input: Box<[u8]>,
+    start: usize,
+    end: usize,
+    ended: bool,
+    done: bool,
+}
+
+impl<R: Read> Lzma2Reader<R> {
+    /// `dict` is the window the decoder keeps: no more than the strip decodes to
+    /// is ever looked back on.
+    pub fn new(inner: R, dict: u32) -> Self {
+        Self {
+            inner,
+            stream: lzma_rust2::Lzma2Stream::new(dict.max(4096)),
+            input: vec![0; 4096].into_boxed_slice(),
+            start: 0,
+            end: 0,
+            ended: false,
+            done: false,
+        }
+    }
+}
+
+impl<R: Read> Read for Lzma2Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use lzma_rust2::{Action, Status};
+        if buf.is_empty() || self.done {
+            return Ok(0);
+        }
+        loop {
+            if self.start == self.end && !self.ended {
+                self.start = 0;
+                self.end = self.inner.read(&mut self.input)?;
+                self.ended = self.end == 0;
+            }
+            let action = if self.ended {
+                Action::Finish
+            } else {
+                Action::Run
+            };
+            let r = self
+                .stream
+                .process(&self.input[self.start..self.end], buf, action)?;
+            self.start += r.bytes_consumed;
+            if r.status == Status::StreamEnd {
+                self.done = true;
+                return Ok(r.bytes_produced);
+            }
+            if r.bytes_produced > 0 {
+                return Ok(r.bytes_produced);
+            }
+            if self.ended {
+                // Cut short: what was decoded is all there is.
+                self.done = true;
+                return Ok(0);
+            }
+            if r.bytes_consumed == 0 && self.start < self.end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "lzma: decoder made no progress",
+                ));
+            }
+        }
+    }
+}
+
+/// exav: ThunderScan (`ThunderScan`, 32809), 4-bit samples as runs, deltas and
+/// raw values, for the viewer's reader only. `rows` rows of `width` pixels, each
+/// padded to a byte; a row the data ends in, and the rows after it, keep the
+/// pixels decoded and are black. libtiff's `tif_thunder.c` is the reference.
+pub fn thunder_scan(data: &[u8], width: usize, rows: usize) -> Vec<u8> {
+    const TWO_BIT: [i32; 4] = [0, 1, 0, -1];
+    const THREE_BIT: [i32; 8] = [0, 1, 2, 3, 0, -3, -2, -1];
+    let stride = width.div_ceil(2);
+    let mut out = vec![0u8; stride.saturating_mul(rows)];
+    let mut input = data.iter();
+    for row in out.chunks_exact_mut(stride.max(1)) {
+        let mut put = |at: usize, v: u32| {
+            row[at / 2] |= if at % 2 == 0 { (v as u8) << 4 } else { v as u8 };
+        };
+        let (mut pixels, mut last) = (0usize, 0u32);
+        while pixels < width {
+            let Some(&n) = input.next() else {
+                return out;
+            };
+            let n = u32::from(n);
+            match n & 0xC0 {
+                0x00 => {
+                    for _ in 0..(n & 0x3F).min((width - pixels) as u32) {
+                        put(pixels, last);
+                        pixels += 1;
+                    }
+                }
+                0x40 => {
+                    for (shift, skip) in [(4, 2), (2, 2), (0, 2)] {
+                        let code = ((n >> shift) & 3) as usize;
+                        if code != skip && pixels < width {
+                            last = (last as i32 + TWO_BIT[code]) as u32 & 0xF;
+                            put(pixels, last);
+                            pixels += 1;
+                        }
+                    }
+                }
+                0x80 => {
+                    for shift in [3, 0] {
+                        let code = ((n >> shift) & 7) as usize;
+                        if code != 4 && pixels < width {
+                            last = (last as i32 + THREE_BIT[code]) as u32 & 0xF;
+                            put(pixels, last);
+                            pixels += 1;
+                        }
+                    }
+                }
+                _ => {
+                    last = n & 0xF;
+                    put(pixels, last);
+                    pixels += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 //
 // ## LZW Reader
 //
@@ -151,6 +435,13 @@ pub type DeflateReader<R> = flate2::read::ZlibDecoder<R>;
 pub struct LZWReader<R: Read> {
     reader: BufReader<Take<R>>,
     decoder: weezl::decode::Decoder,
+    // exav: in the viewer's reader, output is decoded a block at a time and
+    // handed out from there. A caller asking for a few bytes at a time (a tile
+    // row, then its padding) can make `weezl` end a valid stream short.
+    block: Option<(Vec<u8>, usize, usize)>,
+    // exav: whether the start of the stream was looked at for the old-style
+    // LZW that libtiff reads (only done in the viewer's reader).
+    probed: bool,
 }
 
 #[cfg(true)]
@@ -166,6 +457,8 @@ impl<R: Read> LZWReader<R> {
                 reader.take(u64::try_from(compressed_length).unwrap()),
             ),
             decoder: configuration.build(),
+            block: super::viewer_codecs().then(|| (vec![0; 64 * 1024], 0, 0)),
+            probed: !super::viewer_codecs(),
         }
     }
 }
@@ -173,6 +466,38 @@ impl<R: Read> LZWReader<R> {
 #[cfg(true)]
 impl<R: Read> Read for LZWReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.probed {
+            self.probed = true;
+            // Old-style LZW (TIFF 5.0) starts 0x00 and an odd byte: its codes
+            // are least significant bit first and grow a code late, as in GIF.
+            let head = self.reader.fill_buf()?;
+            if head.len() >= 2 && head[0] == 0 && head[1] & 1 == 1 {
+                self.decoder = weezl::decode::Configuration::new(weezl::BitOrder::Lsb, 8)
+                    .with_yield_on_full_buffer(true)
+                    .build();
+            }
+        }
+        let Some((mut block, mut at, mut end)) = self.block.take() else {
+            return self.decode_into(buf);
+        };
+        if at == end {
+            let n = self.decode_into(&mut block);
+            (at, end) = (0, *n.as_ref().unwrap_or(&0));
+            if let Err(e) = n {
+                self.block = Some((block, at, end));
+                return Err(e);
+            }
+        }
+        let n = buf.len().min(end - at);
+        buf[..n].copy_from_slice(&block[at..at + n]);
+        self.block = Some((block, at + n, end));
+        Ok(n)
+    }
+}
+
+#[cfg(true)]
+impl<R: Read> LZWReader<R> {
+    fn decode_into(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let result = self.decoder.decode_bytes(self.reader.fill_buf()?, buf);
             self.reader.consume(result.consumed_in);
@@ -186,8 +511,18 @@ impl<R: Read> Read for LZWReader<R> {
                     }
                 }
                 Ok(weezl::LzwStatus::NoProgress) => {
-                    assert_eq!(result.consumed_in, 0);
-                    assert_eq!(result.consumed_out, 0);
+                    // exav: weezl can give the last bytes of output and
+                    // say `NoProgress` in the same call, when the input is all
+                    // taken and the end code is still to be read; and it can
+                    // take the last input bytes and give nothing. Neither is a
+                    // panic: the first is data, the second asks again, and the
+                    // call after it gives the error below.
+                    if result.consumed_out > 0 {
+                        return Ok(result.consumed_out);
+                    }
+                    if result.consumed_in > 0 {
+                        continue;
+                    }
                     assert!(self.reader.buffer().is_empty());
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,

@@ -14,7 +14,7 @@ use lzma_rust2::LzmaStream;
 
 use super::lzma::SansIo;
 use crate::source::{ByteSource, Reader};
-use crate::stream::{stream_single, Visit};
+use crate::stream::{Visit, stream_single};
 use crate::{Budget, LimitHit};
 
 const HEADER: usize = 6;
@@ -159,11 +159,11 @@ impl Read for Members<'_> {
             };
             match member.read(buf) {
                 Ok(0) => {
-                    if let Some(m) = self.member.take() {
-                        if let Err(e) = self.finish(m) {
-                            self.done = true;
-                            return Err(e);
-                        }
+                    if let Some(m) = self.member.take()
+                        && let Err(e) = self.finish(m)
+                    {
+                        self.done = true;
+                        return Err(e);
                     }
                 }
                 Ok(n) => {

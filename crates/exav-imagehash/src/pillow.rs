@@ -35,11 +35,7 @@ impl PillowFilter {
             }
             PillowFilter::Bilinear => {
                 let x = x.abs();
-                if x < 1.0 {
-                    1.0 - x
-                } else {
-                    0.0
-                }
+                if x < 1.0 { 1.0 - x } else { 0.0 }
             }
             PillowFilter::Hamming => {
                 let x = x.abs();

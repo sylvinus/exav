@@ -118,14 +118,16 @@ await archive.close();
 |---|---|
 | `Archive.open(source, limits?, options?)` | Open a `File`/`Blob` (in the Worker), or a `Uint8Array`/`ArrayBuffer`/sync reader (in-process). |
 | `archive.format()` | The detected format's name, known since `open`. |
-| `archive.list(passwords?)` | Every member's metadata, decoding nothing it can avoid: where the archive carries an index (a ZIP's central directory, a tar's headers) nothing is decompressed. `uncompressedSize` is what the archive declares, or -1 where it declares none (a gzip or xz stream). A format read whole (7z, RAR) is decoded to be listed. Where a limit stops the listing, the last entry says so. |
+| `archive.list(passwords?)` | Every member's metadata, decoding nothing it can avoid: where the archive carries an index (a ZIP's central directory, a tar's headers) nothing is decompressed. `uncompressedSize` is what the archive declares, or -1 where it declares none (a gzip or xz stream). A solid 7z block, or a format read whole (RAR), is decoded to be listed. Where a limit stops the listing, the last entry says so. |
 | `archive.extract(index, passwords?)` | One member, as an `Entry`. The archive is walked up to it, skipping the members before it undecoded where the format allows. |
-| `archive.extractAll(passwords?)` | Every member, under one budget for the whole archive. Where a limit stops the walk, the last entry says so. For a format read whole (7z, RAR) this is one pass, where `extract(i)` over every `i` is many. |
+| `archive.extractAll(passwords?)` | Every member, under one budget for the whole archive. Where a limit stops the walk, the last entry says so. For a solid 7z or a format read whole (RAR) this is one pass, where `extract(i)` over every `i` is many. |
 | `archive.close()` | Release the archive and its reader. Safe to call twice. |
 | `unpack(bytes, passwords?, limits?)` | `open` + `extractAll` in one call, for bytes in memory. |
 | `detectFormat(bytes)` | The format these magic bytes name, or `undefined`. Like the next two, synchronous: call `await init()` once before using it. |
 | `isVolumePart(name)` | Whether a filename marks one part of a byte-split archive (`big.7z.001`). Names only, cheap enough to run over a whole drop. |
 | `joinVolumes(files)` | Rejoin the split archives among files dropped together, into data `Archive.open` can take. |
+| `volumeSet(name, names)` | The volumes of the set `name` belongs to among `names` (the file names of one directory), in order, with their scheme (`"split"`, `"rar"`, `"zip"`) and whether every volume is there; `null` for a name that is not one of two or more volumes. Names only. |
+| `joinSet(scheme, parts)` | A complete set's volumes, in order, as the one archive they make, for `Archive.open`: RAR and ZIP volumes by their decoders' joiners. |
 
 An `Entry` is `{ name, bytes: Uint8Array, data: ReadableStream, encrypted,
 unsupported }`. `unsupported` is empty when the member decoded, and otherwise says
@@ -186,10 +188,22 @@ for (const s of sets) {
 not, with `data` holding the pieces that were present rather than dropping
 them. Files that are not part of a set are absent from the result.
 
-RAR `.partN` and ZIP `.zNN` volumes are not rejoined here: each carries its own
-headers, and a member's data resumes past the next volume's header, so
-concatenating them gives something that still looks like an archive but is
-not. The [command](/unpack/cli/) reads those sets.
+RAR `.partN` and ZIP `.zNN` volumes are not rejoined by `joinVolumes`: each
+carries its own headers, and a member's data resumes past the next volume's
+header, so concatenating them gives something that still looks like an archive
+but is not. `volumeSet` and `joinSet` read all three kinds of set: the first
+tells a set from the names of a folder, the second joins a complete one the way
+the format needs (the RAR decoder's joiner, the ZIP spanning reader):
+
+```js
+const set = volumeSet("x.part1.rar", namesInTheFolder);   // { parts, scheme, complete } or null
+if (set?.complete) {
+  const volumes = await Promise.all(set.parts.map(read));  // Uint8Arrays, in order
+  const archive = await Archive.open(joinSet(set.scheme, volumes));
+}
+```
+
+The [command](/unpack/cli/) reads those sets from the files themselves.
 
 ## Builds
 
@@ -208,7 +222,7 @@ yourself (`wasm-pack`, from `crates/exav-unpack-wasm`):
 
 These formats are also features one by one, for a build narrower than
 `minimal` (`wasm-pack build --release --target web -- --no-default-features --features zip,rar`):
-`zip`, `gzip`, `tar`, `bzip2`, `xz`, `zstd`, `lzip`, `cab`, `sevenz`, `rar`,
+`zip`, `gzip`, `tar`, `bzip2`, `xz`, `zstd`, `lzip`, `lzma`, `rpm`, `cab`, `sevenz`, `rar`,
 `arj`, `lha`, `iso`, `ole`, `pdf`, `email`, `dmg`, `upx`, `ar`, `cpio`, `xar`.
 For the rest, pick a preset.
 

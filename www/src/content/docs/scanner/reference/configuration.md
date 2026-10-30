@@ -55,10 +55,11 @@ have no flag or variable: they go on the `--listen` address. See
 
 ### Removed variables
 
-The variables of two removed flags are still read, only to stop the run with a
-message naming what replaced them: `EXAV_MAX_EXTRACTED_BYTES` (see
-[Limits](/scanner/reference/limits/)) and `EXAV_BUILD_SHARD_BYTES`. Delete them from an
-image or unit file when upgrading to 0.0.2.
+The variable of a removed flag is still read, only to stop the run with a
+message naming what replaced it: `EXAV_BUILD_SHARD_BYTES`. Delete it from an
+image or unit file when upgrading. (`EXAV_MAX_EXTRACTED_BYTES` was removed in
+0.0.2 and is the variable of `--max-extracted-bytes` again; see
+[Limits](/scanner/reference/limits/).)
 
 ### Diagnostics
 
@@ -70,12 +71,8 @@ production.
 | `EXAV_DEBUG_BC_WARN` | Set: warn once per stubbed bytecode API a signature calls. See [Bytecode sandbox](/scanner/concepts/bytecode-sandbox/). |
 | `EXAV_DEBUG_BC_TRACE`, `EXAV_DEBUG_BC_FN=<n>` | Trace bytecode execution, optionally for one function. |
 
-The test suites and examples read a few more, each described where it is
-used: `EXAV_DEBUG_YR_BIN` (the `yr` binary the YARA differential tests run),
-`EXAV_DEBUG_YARA_CORPUS`, `EXAV_DEBUG_YARA_BENCH_RULES`,
-`EXAV_DEBUG_PARITY_DB`, `EXAV_DEBUG_PARITY_CORPUS`, `EXAV_DEBUG_PARITY_LIMIT`,
-`EXAV_DEBUG_RAR_CORPUS` (a directory of RAR samples whose members the RAR
-decoder checks against their stored CRCs) and `EXAV_DEBUG_BC_FORCED`.
+The test suites and examples read a few more `EXAV_DEBUG_*` variables, described
+where they are used.
 
 ## Migrating a ClamAV container
 

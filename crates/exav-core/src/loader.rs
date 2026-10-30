@@ -89,11 +89,11 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, LoadError> {
     }
     Ok(buf)
 }
+use crate::Scanner;
 use crate::fuzzy::FuzzyDb;
 use crate::hashes::{HashDb, SectionHashDb};
 use crate::ml::HeuristicModel;
 use crate::patterns::eicar;
-use crate::Scanner;
 
 /// Accumulates parsed signatures from multiple files before building.
 #[derive(Default)]
@@ -799,7 +799,7 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn report_time_suffix_from_one_db() {
-        use crate::{analyze, ScanOptions, Verdict};
+        use crate::{ScanOptions, Verdict, analyze};
         let dir = crate::tmpfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("a.ndb"), "Demo.Loose:0:*:6d616c77617265\n").unwrap();
         let db = load(dir.path()).unwrap();
@@ -828,7 +828,7 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
     /// mixed source.
     #[test]
     fn official_cvd_never_suffixed_mixed_source() {
-        use crate::{analyze, ScanOptions, Verdict};
+        use crate::{ScanOptions, Verdict, analyze};
         let mut builder = Builder::new();
         // Official member (as if from a `.cvd`): 6f6666696369616c = "official".
         builder.add_named_text("main.ndb", "Demo.Official:0:*:6f6666696369616c\n", true);
@@ -866,7 +866,7 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn ign_suppresses_suffixed_name_in_compat() {
-        use crate::{analyze, ScanOptions, Verdict};
+        use crate::{ScanOptions, Verdict, analyze};
         let dir = crate::tmpfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("a.ndb"), "Demo.Loose:0:*:6d616c77617265\n").unwrap();
         // A real-world compat `.ign2` names the suffixed detection.
@@ -896,7 +896,7 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn a_db_signature_matches_in_memory() {
-        use crate::{analyze, ScanOptions, Verdict};
+        use crate::{ScanOptions, Verdict, analyze};
         let dir = crate::tmpfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("x.db"), "Test.Db=6576696c31706179\n").unwrap();
         let db = load(dir.path()).unwrap();
@@ -913,7 +913,7 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn pua_literals_stay_off_by_default() {
-        use crate::{analyze, ScanOptions, Verdict};
+        use crate::{ScanOptions, Verdict, analyze};
         let scan = |db: &Scanner, data: &[u8]| analyze(db, data, &ScanOptions::default());
         let dir = crate::tmpfile::TempDir::new().unwrap();
         std::fs::write(
@@ -943,7 +943,7 @@ Sig.C;td;0;cleartext-pw\n"; // duplicate password de-duped
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn pua_signatures_stay_off_on_every_scan_path() {
-        use crate::{analyze, scan_path, scan_seekable, ScanOptions, Verdict};
+        use crate::{ScanOptions, Verdict, analyze, scan_path, scan_seekable};
         use std::io::Write;
         let dir = crate::tmpfile::TempDir::new().unwrap();
         std::fs::write(

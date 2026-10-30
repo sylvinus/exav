@@ -14,7 +14,7 @@ export function reactOverlay(render: (surface: ImageSurface, view: ViewState) =>
   return {
     mount(surface) {
       const host = document.createElement("div");
-      host.className = "exv-overlay";
+      host.className = "exav-viewer-overlay";
       (options.layer === "screen" ? surface.screenLayer : surface.pageLayer).append(host);
       const root = createRoot(host);
       const draw = (view: ViewState) => root.render(render(surface, view));

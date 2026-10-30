@@ -41,12 +41,22 @@
 //! the size the record declares, the shortfall is reported *and* the bytes that
 //! were read are still handed over, rather than a prefix being passed off as the
 //! whole file.
+//!
+//! The volume is a `Read + Seek`, read where the walk goes: the boot sector, the
+//! MFT record by record through `$MFT`'s own runs, and the runs of each file.
+//! Only a file is ever held, bounded by the buffer limit.
 
 // Every sum and product on a header's number is checked or saturating here; a
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
-use crate::{Budget, Entry, LimitHit, Sink};
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
+
+use super::vol::{Attrs, Emit, Found, Next, Piece, Pieces, Plan, Vol, hand, read_file};
+use crate::source::{ByteSource, Reader};
+use crate::stream::Visit;
+use crate::{Budget, Entry, LimitHit};
 
 /// The OEM name every NTFS boot sector carries at offset 3.
 /// Every MFT record starts with this.
@@ -177,6 +187,7 @@ fn apply_fixups(rec: &mut [u8], sector: usize) -> bool {
 
 /// One extent of a non-resident attribute: `lcn` is `None` for a sparse run,
 /// which reads as zeroes.
+#[derive(Clone)]
 struct Run {
     lcn: Option<i64>,
     clusters: u64,
@@ -240,8 +251,41 @@ fn data_runs(d: &[u8]) -> Vec<Run> {
     runs
 }
 
-/// Read a non-resident attribute's bytes by following its runs.
-fn read_runs(volume: &[u8], runs: &[Run], cluster: usize, real_size: usize) -> Vec<u8> {
+/// The stretches of a non-resident attribute: each run in order, a sparse one
+/// zeros.
+struct Runs {
+    runs: std::vec::IntoIter<Run>,
+    cluster: u64,
+}
+
+impl Plan for Runs {
+    fn next(&mut self, _: &mut Vol) -> Next {
+        let Some(r) = self.runs.next() else {
+            return Next::End;
+        };
+        let len = r.clusters.saturating_mul(self.cluster);
+        match r.lcn {
+            None => Next::Piece(Piece::Zeros(len)),
+            Some(lcn) => match u64::try_from(lcn)
+                .ok()
+                .and_then(|l| l.checked_mul(self.cluster))
+            {
+                Some(at) => Next::Piece(Piece::Disk(at, len)),
+                None => Next::Broken,
+            },
+        }
+    }
+}
+
+/// `visit`'s member `e`, held whole.
+fn held<R>(visit: Emit<R>, e: Entry, budget: &mut Budget) -> Option<R> {
+    visit(Found::Held(e), budget)
+}
+
+/// Read a non-resident attribute's bytes by following its runs. Short where
+/// the runs stop being readable, and never longer than `real_size`, which the
+/// caller has bounded: a sparse run is zeros held in memory.
+fn read_runs(v: &mut Vol, runs: &[Run], cluster: usize, real_size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(real_size.min(1 << 20));
     for r in runs {
         if out.len() >= real_size {
@@ -254,12 +298,11 @@ fn read_runs(volume: &[u8], runs: &[Run], cluster: usize, real_size: usize) -> V
             // victim's machine too.
             None => out.resize(out.len().saturating_add(take), 0),
             Some(lcn) if lcn >= 0 => {
-                let start = crate::bytes::to_usize(lcn as u64).saturating_mul(cluster);
-                match crate::bytes::at(volume, start, take) {
-                    Some(s) => out.extend_from_slice(s),
-                    // Past the end of the image: those bytes are absent rather
-                    // than hidden, so what exists still stands.
-                    None => break,
+                let start = (lcn as u64).saturating_mul(cluster as u64);
+                // Past the end of the image: those bytes are absent rather
+                // than hidden, so what exists still stands.
+                if !v.append(start, take, &mut out) {
+                    break;
                 }
             }
             Some(_) => break,
@@ -267,6 +310,116 @@ fn read_runs(volume: &[u8], runs: &[Run], cluster: usize, real_size: usize) -> V
     }
     out.truncate(real_size);
     out
+}
+
+/// `len` bytes at `offset` of the attribute the runs describe, appended to
+/// `out`. False when any of them is not readable.
+fn read_runs_at(
+    v: &mut Vol,
+    runs: &[Run],
+    cluster: usize,
+    offset: u64,
+    len: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    let Some(end) = offset.checked_add(len as u64) else {
+        return false;
+    };
+    let cl = cluster as u64;
+    let mut pos = 0u64;
+    for r in runs {
+        if pos >= end {
+            break;
+        }
+        let run_end = pos.saturating_add(r.clusters.saturating_mul(cl));
+        if run_end > offset {
+            let from = offset.max(pos);
+            let take = crate::bytes::to_usize(end.min(run_end).saturating_sub(from));
+            match r.lcn {
+                None => out.resize(out.len().saturating_add(take), 0),
+                Some(lcn) if lcn >= 0 => {
+                    let host = (lcn as u64)
+                        .saturating_mul(cl)
+                        .saturating_add(from.saturating_sub(pos));
+                    if !v.append(host, take, out) {
+                        return false;
+                    }
+                }
+                Some(_) => return false,
+            }
+        }
+        pos = run_end;
+    }
+    pos >= end
+}
+
+/// `$MFT`, read a record at a time through its own runs: it can be
+/// fragmented, so it cannot simply be read from its first cluster.
+struct Mft {
+    runs: Vec<Run>,
+    /// Bytes of the table that are readable from its start.
+    size: u64,
+}
+
+impl Mft {
+    /// The table `rec0`, record 0, describes.
+    fn open(rec0: &[u8], v: &mut Vol, geo: &Geometry) -> Option<Mft> {
+        let mut off = le_u16(rec0, 20) as usize;
+        while off.saturating_add(8) <= rec0.len() {
+            let atype = le_u32(rec0, off);
+            if atype == ATTR_END {
+                break;
+            }
+            let alen = le_u32(rec0, off.saturating_add(4)) as usize;
+            if alen < 16 || alen > rec0.len().saturating_sub(off) {
+                break;
+            }
+            if atype == ATTR_DATA && rec0.get(off.saturating_add(8)).copied().unwrap_or(0) != 0 {
+                let real_size = le_u64(rec0, off.saturating_add(0x30));
+                let runs_off = off.saturating_add(le_u16(rec0, off.saturating_add(0x20)) as usize);
+                let runs = data_runs(rec0.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]));
+                // The table cannot be larger than the volume it is in. It is
+                // only as long as its runs can be read.
+                let limit = real_size.min(v.len);
+                let cl = geo.cluster as u64;
+                let mut size = 0u64;
+                for r in &runs {
+                    if size >= limit {
+                        break;
+                    }
+                    let take = r
+                        .clusters
+                        .saturating_mul(cl)
+                        .min(limit.saturating_sub(size));
+                    match r.lcn {
+                        None => size = size.saturating_add(take),
+                        Some(lcn) if lcn >= 0 => {
+                            let start = (lcn as u64).saturating_mul(cl);
+                            if start.checked_add(take).is_none_or(|e| e > v.len) {
+                                break;
+                            }
+                            size = size.saturating_add(take);
+                        }
+                        Some(_) => break,
+                    }
+                }
+                return (size > 0).then_some(Mft { runs, size });
+            }
+            off = off.saturating_add(alen);
+        }
+        None
+    }
+
+    /// Record `n`, as stored (the fix-ups not undone).
+    fn record(&self, v: &mut Vol, geo: &Geometry, n: u64) -> Option<Vec<u8>> {
+        let size = geo.record_size as u64;
+        let at = n.checked_mul(size)?;
+        if at.checked_add(size)? > self.size {
+            return None;
+        }
+        let mut out = Vec::with_capacity(geo.record_size);
+        read_runs_at(v, &self.runs, geo.cluster, at, geo.record_size, &mut out).then_some(out)
+    }
 }
 
 /// Every extent of the unnamed `$DATA`, gathered across MFT records.
@@ -278,81 +431,120 @@ fn read_runs(volume: &[u8], runs: &[Run], cluster: usize, real_size: usize) -> V
 /// gets read. Which is exactly the kind of gap worth closing rather than
 /// reporting.
 fn data_extents(
-    rec: &[u8],
-    volume: &[u8],
-    mft: &[u8],
+    list: &[u8],
+    v: &mut Vol,
+    mft: &Mft,
     geo: &Geometry,
     sector: usize,
-) -> Option<(Vec<Run>, usize)> {
-    // The list itself is an attribute, resident or not.
-    let list = find_attribute_list(rec, volume, geo)?;
+) -> Result<Option<(Vec<Run>, usize)>, TooManyExtents> {
     let mut refs: Vec<(u64, u64)> = Vec::new(); // (starting VCN, MFT record)
     let mut i = 0usize;
     while i.saturating_add(26) <= list.len() {
-        let atype = le_u32(&list, i);
-        let entry_len = le_u16(&list, i.saturating_add(4)) as usize;
+        let atype = le_u32(list, i);
+        let entry_len = le_u16(list, i.saturating_add(4)) as usize;
         if entry_len < 26 {
             break;
         }
         let name_len = list.get(i.saturating_add(6)).copied().unwrap_or(0);
         // Only the unnamed `$DATA`; a named one is an alternate stream.
         if atype == ATTR_DATA && name_len == 0 {
-            let vcn = le_u64(&list, i.saturating_add(8));
+            // More references than any file has: a list made to cost, which is
+            // not followed (the caller reports the file as not fully read).
+            if refs.len() >= MAX_LIST_REFS {
+                return Err(TooManyExtents);
+            }
+            let vcn = le_u64(list, i.saturating_add(8));
             // The low 48 bits of the file reference are the record number.
-            let record = le_u64(&list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
+            let record = le_u64(list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
             refs.push((vcn, record));
         }
         i = i.saturating_add(entry_len);
     }
     if refs.is_empty() {
-        return None;
+        return Ok(None);
     }
+    // An extent starts at one VCN, named once; the first of the entries that
+    // name it (the sort is stable) is the one.
     refs.sort_by_key(|&(vcn, _)| vcn);
+    refs.dedup_by_key(|&mut (vcn, _)| vcn);
 
+    // The extents each record holds, found once however many entries name
+    // the record: reading it for each entry costs the record's size each.
+    type Extents = HashMap<u64, (usize, Vec<Run>)>;
+    let mut records: HashMap<u64, Option<Extents>> = HashMap::new();
     let mut runs: Vec<Run> = Vec::new();
     let mut real_size = 0usize;
     for (vcn, record) in refs {
-        let at = crate::bytes::to_usize(record).checked_mul(geo.record_size)?;
-        let Some(slice) = crate::bytes::at(mft, at, geo.record_size) else {
+        let held = records.entry(record).or_insert_with(|| {
+            let mut r = mft.record(v, geo, record)?;
+            if r.get(0..4) != Some(RECORD_MAGIC.as_slice()) || !apply_fixups(&mut r, sector) {
+                return None;
+            }
+            Some(extents_of(&r))
+        });
+        let Some((size, extent)) = held.as_ref().and_then(|h| h.get(&vcn)) else {
             continue;
         };
-        let mut r = slice.to_vec();
-        if r.get(0..4) != Some(RECORD_MAGIC.as_slice()) || !apply_fixups(&mut r, sector) {
-            continue;
+        // Only the extent starting at VCN 0 carries the true size.
+        if vcn == 0 {
+            real_size = *size;
         }
-        let mut off = le_u16(&r, 20) as usize;
-        while off.saturating_add(8) <= r.len() {
-            let atype = le_u32(&r, off);
-            if atype == ATTR_END {
-                break;
-            }
-            let alen = le_u32(&r, off.saturating_add(4)) as usize;
-            if alen < 16 || alen > r.len().saturating_sub(off) {
-                break;
-            }
-            let non_resident = r.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
-            if atype == ATTR_DATA
-                && r.get(off.saturating_add(9)).copied().unwrap_or(0) == 0
-                && non_resident
-                && le_u64(&r, off.saturating_add(16)) == vcn
-            {
-                // Only the extent starting at VCN 0 carries the true size.
-                if vcn == 0 {
-                    real_size = crate::bytes::to_usize(le_u64(&r, off.saturating_add(0x30)));
-                }
-                let runs_off = off.saturating_add(le_u16(&r, off.saturating_add(0x20)) as usize);
-                runs.extend(data_runs(
-                    r.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]),
-                ));
-                break;
-            }
-            off = off.saturating_add(alen);
+        // Each record can hold thousands of runs, and a list names thousands
+        // of records: the runs of one file are bounded in all.
+        if runs.len().saturating_add(extent.len()) > MAX_FILE_RUNS {
+            return Err(TooManyExtents);
         }
+        runs.extend(extent.iter().cloned());
     }
     if runs.is_empty() || real_size == 0 {
-        return None;
+        return Ok(None);
     }
-    Some((runs, real_size))
+    Ok(Some((runs, real_size)))
+}
+
+/// The most `$DATA` entries of one attribute list that are followed. A file
+/// with its runs in this many records has more than any volume this reads holds.
+const MAX_LIST_REFS: usize = 1 << 16;
+
+/// The most data runs of one file followed, over all its extents: a million is
+/// a file in a million fragments, and 24 MB of runs.
+const MAX_FILE_RUNS: usize = 1 << 20;
+
+/// An attribute list that names more extents than [`MAX_LIST_REFS`], or more
+/// runs than [`MAX_FILE_RUNS`].
+struct TooManyExtents;
+
+/// The unnamed non-resident `$DATA` attributes of an MFT record by the VCN each
+/// starts at: its recorded size (the true one at VCN 0) and its runs. The first
+/// attribute of a VCN is the one.
+fn extents_of(r: &[u8]) -> HashMap<u64, (usize, Vec<Run>)> {
+    let mut found = HashMap::new();
+    let mut off = le_u16(r, 20) as usize;
+    while off.saturating_add(8) <= r.len() {
+        let atype = le_u32(r, off);
+        if atype == ATTR_END {
+            break;
+        }
+        let alen = le_u32(r, off.saturating_add(4)) as usize;
+        if alen < 16 || alen > r.len().saturating_sub(off) {
+            break;
+        }
+        let non_resident = r.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
+        if atype == ATTR_DATA
+            && r.get(off.saturating_add(9)).copied().unwrap_or(0) == 0
+            && non_resident
+        {
+            let vcn = le_u64(r, off.saturating_add(16));
+            found.entry(vcn).or_insert_with(|| {
+                let size = crate::bytes::to_usize(le_u64(r, off.saturating_add(0x30)));
+                let runs_off = off.saturating_add(le_u16(r, off.saturating_add(0x20)) as usize);
+                let runs = data_runs(r.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]));
+                (size, runs)
+            });
+        }
+        off = off.saturating_add(alen);
+    }
+    found
 }
 
 /// The `$ATTRIBUTE_LIST` value.
@@ -362,7 +554,7 @@ fn data_extents(
 /// So the non-resident form is followed too, by walking its own data runs.
 /// Stopping at the resident case would leave the most fragmented files, which is
 /// to say the ones someone took the trouble to fragment, unread.
-fn find_attribute_list(rec: &[u8], volume: &[u8], geo: &Geometry) -> Option<Vec<u8>> {
+fn find_attribute_list(rec: &[u8], v: &mut Vol, geo: &Geometry) -> Option<Vec<u8>> {
     let mut off = le_u16(rec, 20) as usize;
     while off.saturating_add(8) <= rec.len() {
         let atype = le_u32(rec, off);
@@ -385,7 +577,8 @@ fn find_attribute_list(rec: &[u8], volume: &[u8], geo: &Geometry) -> Option<Vec<
             let runs = data_runs(rec.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]));
             // No table of this kind is larger than the volume, and a sparse run
             // costs memory for every zero it reads.
-            let bytes = read_runs(volume, &runs, geo.cluster, real_size.min(volume.len()));
+            let bound = crate::bytes::to_usize(v.len).min(v.max);
+            let bytes = read_runs(v, &runs, geo.cluster, real_size.min(bound));
             // A list read short would silently drop the extents it names, so it
             // is treated as unusable rather than half-used.
             return (bytes.len() == real_size && real_size > 0).then_some(bytes);
@@ -402,13 +595,15 @@ struct File {
     /// Set when the bytes are present but exav could not read them.
     unreadable: Option<&'static str>,
     deleted: bool,
+    /// The runs and the size of a file too long to hold, to be read as it goes.
+    stream: Option<(Vec<Run>, u64)>,
 }
 
 /// Parse one MFT record into a file, or `None` when it holds nothing to scan.
 fn parse_record(
     rec: &[u8],
-    volume: &[u8],
-    mft: &[u8],
+    v: &mut Vol,
+    mft: &Mft,
     geo: &Geometry,
     sector: usize,
     cap: usize,
@@ -429,7 +624,14 @@ fn parse_record(
     }
     // The name is in this record, or, for a file fragmented hard enough to
     // have an attribute list, in an extension record the list names.
-    let name = record_name(rec).or_else(|| name_from_extensions(rec, volume, mft, geo, sector));
+    // The attribute list is read once, for the name and for the data.
+    let mut list: Option<Option<Vec<u8>>> = None;
+    let name = record_name(rec).or_else(|| {
+        let l = list
+            .get_or_insert_with(|| find_attribute_list(rec, v, geo))
+            .as_deref()?;
+        name_from_extensions(l, v, mft, geo, sector)
+    });
     let mut file: Option<File> = None;
     let mut off = le_u16(rec, 20) as usize;
 
@@ -455,6 +657,7 @@ fn parse_record(
                     data: None,
                     unreadable: Some("EFS-encrypted NTFS file"),
                     deleted,
+                    stream: None,
                 });
             } else if !non_resident {
                 let vlen = le_u32(rec, off.saturating_add(16)) as usize;
@@ -465,14 +668,20 @@ fn parse_record(
                     data: Some(bytes),
                     unreadable: None,
                     deleted,
+                    stream: None,
                 });
             } else {
                 // A file fragmented past what one record can hold has its runs
                 // split across several, listed in `$ATTRIBUTE_LIST`. Gather them
                 // all; falling back to this record alone would return the first
                 // extent and call it the whole file.
-                let spread = data_extents(rec, volume, mft, geo, sector);
-                if le_u64(rec, off.saturating_add(16)) != 0 && spread.is_none() {
+                let spread = list
+                    .get_or_insert_with(|| find_attribute_list(rec, v, geo))
+                    .as_deref()
+                    .map_or(Ok(None), |l| data_extents(l, v, mft, geo, sector));
+                let refused = spread.is_err();
+                let spread = spread.ok().flatten();
+                if refused || (le_u64(rec, off.saturating_add(16)) != 0 && spread.is_none()) {
                     // Only this extent is reachable. Report the shortfall, but
                     // still scan the part that is here.
                     let real_size = crate::bytes::to_usize(le_u64(rec, off.saturating_add(0x30)));
@@ -480,24 +689,28 @@ fn parse_record(
                         off.saturating_add(le_u16(rec, off.saturating_add(0x20)) as usize);
                     let runs =
                         data_runs(rec.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]));
-                    let part = read_runs(
-                        volume,
-                        &runs,
-                        geo.cluster,
-                        real_size.clamp(1, volume.len().max(1)),
-                    );
+                    let size = real_size.clamp(1, crate::bytes::to_usize(v.len).max(1));
+                    let part = if size > cap {
+                        Vec::new()
+                    } else {
+                        read_runs(v, &runs, geo.cluster, size)
+                    };
                     file = Some(File {
                         name: String::new(),
                         data: Some(part),
-                        unreadable: Some(
+                        unreadable: Some(if refused {
+                            "NTFS file whose attribute list names more extents than exav \
+                             follows; the extent that could be read was scanned"
+                        } else {
                             "NTFS file whose data runs span MFT records exav could not follow; \
-                             the extent that could be read was scanned",
-                        ),
+                             the extent that could be read was scanned"
+                        }),
                         deleted,
+                        stream: None,
                     });
                 } else {
                     let (runs, real_size) = match spread {
-                        Some(v) => v,
+                        Some(found) => found,
                         None => {
                             let real_size =
                                 crate::bytes::to_usize(le_u64(rec, off.saturating_add(0x30)));
@@ -511,24 +724,43 @@ fn parse_record(
                             )
                         }
                     };
-                    if real_size > cap {
+                    if real_size > cap && attr_flags & ATTR_COMPRESSED == 0 {
+                        // Read as it goes, its holes zeros, where the volume
+                        // gives it. Runs short of the declared size are
+                        // reported before it, as for a file that is held.
+                        let covered = runs.iter().fold(0u64, |n, r| {
+                            n.saturating_add(r.clusters.saturating_mul(geo.cluster as u64))
+                        });
+                        file = Some(File {
+                            name: String::new(),
+                            data: None,
+                            unreadable: (covered < real_size as u64).then_some(
+                                "NTFS file whose data runs did not cover its declared size; \
+                                 the part that could be read was scanned",
+                            ),
+                            deleted,
+                            stream: Some((runs, real_size as u64)),
+                        });
+                    } else if real_size > cap {
                         file = Some(File {
                             name: String::new(),
                             data: None,
                             unreadable: Some("NTFS file exceeds the per-member size budget"),
                             deleted,
+                            stream: None,
                         });
                     } else if attr_flags & ATTR_COMPRESSED != 0 {
                         // A compression unit is 2^4 clusters in practice.
                         let unit = Some(le_u16(rec, off.saturating_add(0x22)))
                             .filter(|&s| s <= 16)
                             .and_then(|s| 1usize.checked_shl(s.into()))
-                            .and_then(|n| n.checked_mul(geo.cluster));
+                            .and_then(|n| n.checked_mul(geo.cluster))
+                            .filter(|&n| n <= cap);
                         // Stored compressed, so never more than the file's size
                         // plus a unit; a sparse run is not read past that.
                         let raw = match unit {
                             Some(u) => {
-                                read_runs(volume, &runs, geo.cluster, real_size.saturating_add(u))
+                                read_runs(v, &runs, geo.cluster, real_size.saturating_add(u))
                             }
                             None => Vec::new(),
                         };
@@ -538,12 +770,14 @@ fn parse_record(
                                 data: Some(d),
                                 unreadable: None,
                                 deleted,
+                                stream: None,
                             },
                             None => File {
                                 name: String::new(),
                                 data: None,
                                 unreadable: Some("NTFS-compressed file that would not decompress"),
                                 deleted,
+                                stream: None,
                             },
                         });
                     } else if attr_flags & ATTR_SPARSE != 0 || runs.iter().any(|r| r.lcn.is_none())
@@ -552,12 +786,13 @@ fn parse_record(
                         // sees too, so this is still the file.
                         file = Some(File {
                             name: String::new(),
-                            data: Some(read_runs(volume, &runs, geo.cluster, real_size)),
+                            data: Some(read_runs(v, &runs, geo.cluster, real_size)),
                             unreadable: None,
                             deleted,
+                            stream: None,
                         });
                     } else {
-                        let bytes = read_runs(volume, &runs, geo.cluster, real_size);
+                        let bytes = read_runs(v, &runs, geo.cluster, real_size);
                         // Short of the size the record declares. Passing that off
                         // as the file would be a silent truncation, so it is
                         // reported — *and* the bytes that were read are still
@@ -573,6 +808,7 @@ fn parse_record(
                                  the part that could be read was scanned",
                             ),
                             deleted,
+                            stream: None,
                         });
                     }
                 }
@@ -623,12 +859,12 @@ fn record_name(rec: &[u8]) -> Option<String> {
             break;
         }
         let non_resident = rec.get(off.saturating_add(8)).copied().unwrap_or(0) != 0;
-        if atype == ATTR_FILE_NAME && !non_resident {
-            if let Some(n) = file_name_attr(rec, off) {
-                if name.as_ref().is_none_or(|old| n.len() > old.len()) {
-                    name = Some(n);
-                }
-            }
+        if atype == ATTR_FILE_NAME
+            && !non_resident
+            && let Some(n) = file_name_attr(rec, off)
+            && name.as_ref().is_none_or(|old| n.len() > old.len())
+        {
+            name = Some(n);
         }
         off = off.saturating_add(alen);
     }
@@ -638,33 +874,36 @@ fn record_name(rec: &[u8]) -> Option<String> {
 /// The name of a file whose record has none because its `$FILE_NAME` is in an
 /// extension record, which the `$ATTRIBUTE_LIST` names.
 fn name_from_extensions(
-    rec: &[u8],
-    volume: &[u8],
-    mft: &[u8],
+    list: &[u8],
+    v: &mut Vol,
+    mft: &Mft,
     geo: &Geometry,
     sector: usize,
 ) -> Option<String> {
-    let list = find_attribute_list(rec, volume, geo)?;
     let mut name: Option<String> = None;
     let mut i = 0usize;
+    // A record is read once however many entries name it (each read costs the
+    // record's size), and no more than [`MAX_LIST_REFS`] are.
+    let mut read: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // Bounded by the list, which is bounded by the volume.
     while i.saturating_add(26) <= list.len() {
-        let entry_len = le_u16(&list, i.saturating_add(4)) as usize;
+        let entry_len = le_u16(list, i.saturating_add(4)) as usize;
         if entry_len < 26 {
             break;
         }
-        if le_u32(&list, i) == ATTR_FILE_NAME {
-            let record = le_u64(&list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
-            let at = crate::bytes::to_usize(record).checked_mul(geo.record_size)?;
-            if let Some(slice) = crate::bytes::at(mft, at, geo.record_size) {
-                let mut r = slice.to_vec();
-                if r.get(0..4) == Some(RECORD_MAGIC.as_slice()) && apply_fixups(&mut r, sector) {
-                    if let Some(n) = record_name(&r) {
-                        if name.as_ref().is_none_or(|old| n.len() > old.len()) {
-                            name = Some(n);
-                        }
-                    }
-                }
+        if le_u32(list, i) == ATTR_FILE_NAME {
+            let record = le_u64(list, i.saturating_add(16)) & RECORD_NUMBER_MASK;
+            if read.len() >= MAX_LIST_REFS {
+                break;
+            }
+            if read.insert(record)
+                && let Some(mut r) = mft.record(v, geo, record)
+                && r.get(0..4) == Some(RECORD_MAGIC.as_slice())
+                && apply_fixups(&mut r, sector)
+                && let Some(n) = record_name(&r)
+                && name.as_ref().is_none_or(|old| n.len() > old.len())
+            {
+                name = Some(n);
             }
         }
         i = i.saturating_add(entry_len);
@@ -697,20 +936,48 @@ fn decompress(raw: &[u8], unit_bytes: usize, real_size: usize) -> Option<Vec<u8>
     Some(out)
 }
 
-pub(crate) fn extract_ntfs<R>(
-    data: &[u8],
+/// Walk a raw NTFS volume.
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Sink<R>,
+    visit: Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    super::volumes::entries(budget, visit, "", |budget, sink| {
+        walk_volume(Reader::new(src), src.len() as u64, budget, sink)
+    })
+}
+
+/// Walk the NTFS volume `disk`, which is `len` bytes long, handing each file
+/// to `visit`.
+pub(crate) fn walk_volume<D: Read + Seek, R>(
+    mut disk: D,
+    len: u64,
+    budget: &mut Budget,
+    visit: Emit<R>,
 ) -> Result<Option<R>, LimitHit> {
-    if !super::sniff::is(data, crate::Format::Ntfs) {
+    let mut v = Vol {
+        disk: &mut disk,
+        len,
+        max: crate::bytes::to_usize(budget.limits().max_buffer_bytes),
+    };
+    if len < 512 {
         return Ok(None);
     }
-    let Some(geo) = geometry(data) else {
+    let mut boot = vec![0u8; 512];
+    v.disk
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| v.disk.read_exact(&mut boot))
+        .map_err(|e| LimitHit::corrupt(format!("NTFS volume: {e}")))?;
+    if !super::sniff::is(&boot, crate::Format::Ntfs) {
+        return Ok(None);
+    }
+    let Some(geo) = geometry(&boot) else {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
-                data.len() as u64,
+                len,
                 false,
                 "implausible NTFS geometry",
             ),
@@ -721,52 +988,54 @@ pub(crate) fn extract_ntfs<R>(
     // Record 0 is `$MFT` itself, and its `$DATA` gives the runs of the whole
     // table — which can be fragmented, so the MFT cannot simply be read
     // linearly from its first cluster.
-    let mft_start = crate::bytes::to_usize(geo.mft_lcn).saturating_mul(geo.cluster);
-    let Some(first) = crate::bytes::at(data, mft_start, geo.record_size) else {
+    let mft_start = geo.mft_lcn.saturating_mul(geo.cluster as u64);
+    let Some(mut rec0) = v.at(mft_start, geo.record_size) else {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
-                data.len() as u64,
+                len,
                 false,
                 "NTFS master file table lies outside the image",
             ),
             budget,
         ));
     };
-    let mut rec0 = first.to_vec();
-    let sector = le_u16(data, 11) as usize;
+    let sector = le_u16(&boot, 11) as usize;
     if !apply_fixups(&mut rec0, sector) || rec0.get(0..4) != Some(RECORD_MAGIC.as_slice()) {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
-                data.len() as u64,
+                len,
                 false,
                 "NTFS master file table record is not readable",
             ),
             budget,
         ));
     }
-    let mft = mft_bytes(&rec0, data, &geo);
-    if mft.is_empty() {
+    let Some(mft) = Mft::open(&rec0, &mut v, &geo) else {
         budget.count_entry()?;
-        return Ok(visit(
+        return Ok(held(
+            visit,
             Entry::unsupported(
                 "<ntfs-volume>".to_string(),
-                data.len() as u64,
+                len,
                 false,
                 "NTFS master file table could not be read",
             ),
             budget,
         ));
-    }
+    };
 
-    let records = mft.len().checked_div(geo.record_size).unwrap_or(0);
+    let records = crate::bytes::to_usize(mft.size.checked_div(geo.record_size as u64).unwrap_or(0));
     let n = records.min(MAX_RECORDS);
     if records > MAX_RECORDS {
         budget.count_entry()?;
-        if let Some(r) = visit(
+        if let Some(r) = held(
+            visit,
             Entry::unsupported(
                 format!("<ntfs-records-beyond-{MAX_RECORDS}>"),
                 0,
@@ -780,23 +1049,20 @@ pub(crate) fn extract_ntfs<R>(
     }
 
     for i in FIRST_USER_RECORD..n {
-        let Some(slice) = i
-            .checked_mul(geo.record_size)
-            .and_then(|at| crate::bytes::at(&mft, at, geo.record_size))
-        else {
+        let Some(mut rec) = mft.record(&mut v, &geo, i as u64) else {
             break;
         };
-        if slice.get(0..4) != Some(RECORD_MAGIC.as_slice()) {
+        if rec.get(0..4) != Some(RECORD_MAGIC.as_slice()) {
             continue; // an unused slot
         }
         // Past this point the slot carries the `FILE` magic, so a record IS here
         // and whatever it names is a file on the volume. Failing to read it is a
         // gap to report, not a slot to skip — an unused slot was already handled
         // above, and conflating the two hides real files.
-        let mut rec = slice.to_vec();
         if !apply_fixups(&mut rec, sector) {
             budget.count_entry()?;
-            if let Some(r) = visit(
+            if let Some(r) = held(
+                visit,
                 Entry::unsupported(
                     format!("<mft-record-{i}>"),
                     0,
@@ -809,11 +1075,11 @@ pub(crate) fn extract_ntfs<R>(
             }
             continue;
         }
-        let cap = budget.reserve()? as usize;
+        let cap = crate::bytes::to_usize(budget.reserve()?);
         // `None` here means "not a user file with content" — a directory, or the
         // volume's own metadata — not a parse failure. Reporting it would flag
         // every healthy volume, which the reserved records 16..63 make loud.
-        let Some(f) = parse_record(&rec, data, &mft, &geo, sector, cap) else {
+        let Some(f) = parse_record(&rec, &mut v, &mft, &geo, sector, cap) else {
             continue;
         };
         // A deleted record's runs may since have been reused by another file, so
@@ -833,46 +1099,132 @@ pub(crate) fn extract_ntfs<R>(
         // of the two would either hide the gap or throw away content.
         if let Some(why) = f.unreadable {
             budget.count_entry()?;
-            if let Some(r) = visit(
+            if let Some(r) = held(
+                visit,
                 Entry::unsupported(name.clone(), 0, why.contains("encrypted"), why),
                 budget,
             ) {
                 return Ok(Some(r));
             }
         }
-        if let Some(d) = f.data {
-            if !d.is_empty() {
-                budget.count_entry()?;
-                budget.commit(d.len() as u64);
-                if let Some(r) = visit(Entry::new(name, d), budget) {
-                    return Ok(Some(r));
-                }
+        if let Some(d) = f.data
+            && !d.is_empty()
+        {
+            budget.count_entry()?;
+            budget.commit(d.len() as u64);
+            if let Some(r) = held(visit, Entry::new(name, d), budget) {
+                return Ok(Some(r));
+            }
+        } else if let Some((runs, size)) = f.stream {
+            budget.count_entry()?;
+            let plan = Runs {
+                runs: runs.into_iter(),
+                cluster: geo.cluster as u64,
+            };
+            let got = read_file(&mut v, Pieces::new(plan, size), size, 0);
+            if let Some(r) = hand(budget, &mut *visit, name, Attrs::default(), got) {
+                return Ok(Some(r));
             }
         }
     }
     Ok(None)
 }
 
-/// The whole MFT, gathered by following `$MFT`'s own data runs.
-fn mft_bytes(rec0: &[u8], volume: &[u8], geo: &Geometry) -> Vec<u8> {
-    let mut off = le_u16(rec0, 20) as usize;
-    while off.saturating_add(8) <= rec0.len() {
-        let atype = le_u32(rec0, off);
-        if atype == ATTR_END {
-            break;
-        }
-        let alen = le_u32(rec0, off.saturating_add(4)) as usize;
-        if alen < 16 || alen > rec0.len().saturating_sub(off) {
-            break;
-        }
-        if atype == ATTR_DATA && rec0.get(off.saturating_add(8)).copied().unwrap_or(0) != 0 {
-            let real_size = crate::bytes::to_usize(le_u64(rec0, off.saturating_add(0x30)));
-            let runs_off = off.saturating_add(le_u16(rec0, off.saturating_add(0x20)) as usize);
-            let runs = data_runs(rec0.get(runs_off..off.saturating_add(alen)).unwrap_or(&[]));
-            // The table cannot be larger than the volume it is in.
-            return read_runs(volume, &runs, geo.cluster, real_size.min(volume.len()));
-        }
-        off = off.saturating_add(alen);
+// The tests lay out their inputs by index arithmetic on small constants.
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A volume of 16 clusters of 4 bytes, each byte its own index.
+    fn volume() -> Cursor<Vec<u8>> {
+        Cursor::new((0..64u8).collect())
     }
-    Vec::new()
+
+    fn runs() -> Vec<Run> {
+        vec![
+            Run {
+                lcn: Some(2),
+                clusters: 2,
+            },
+            Run {
+                lcn: None,
+                clusters: 1,
+            },
+            Run {
+                lcn: Some(8),
+                clusters: 1,
+            },
+        ]
+    }
+
+    /// The attribute those runs describe, 16 bytes.
+    fn attribute() -> Vec<u8> {
+        let v: Vec<u8> = (0..64).collect();
+        [&v[8..16], &[0; 4][..], &v[32..36]].concat()
+    }
+
+    fn range(vol: &mut Cursor<Vec<u8>>, runs: &[Run], at: u64, len: usize) -> Option<Vec<u8>> {
+        let mut v = Vol {
+            len: vol.get_ref().len() as u64,
+            disk: vol,
+            max: usize::MAX,
+        };
+        let mut out = Vec::new();
+        read_runs_at(&mut v, runs, 4, at, len, &mut out).then_some(out)
+    }
+
+    #[test]
+    fn a_range_of_an_attribute_is_read_across_its_runs_and_holes() {
+        let want = attribute();
+        for (at, len) in [(0, 16), (3, 9), (8, 4), (11, 2), (12, 4), (15, 1), (16, 0)] {
+            assert_eq!(
+                range(&mut volume(), &runs(), at, len),
+                Some(want[at as usize..at as usize + len].to_vec()),
+                "({at}, {len})"
+            );
+        }
+        // Past the end of the runs.
+        assert_eq!(range(&mut volume(), &runs(), 14, 4), None);
+        assert_eq!(range(&mut volume(), &runs(), u64::MAX - 2, 8), None);
+    }
+
+    #[test]
+    fn a_range_is_none_where_a_run_is_not_readable() {
+        let past = vec![Run {
+            lcn: Some(15),
+            clusters: 2,
+        }];
+        assert_eq!(range(&mut volume(), &past, 0, 4).map(|v| v.len()), Some(4));
+        assert_eq!(range(&mut volume(), &past, 0, 8), None);
+        let negative = vec![Run {
+            lcn: Some(-1),
+            clusters: 2,
+        }];
+        assert_eq!(range(&mut volume(), &negative, 0, 4), None);
+        let top = vec![Run {
+            lcn: Some(i64::MAX),
+            clusters: u64::MAX,
+        }];
+        assert_eq!(range(&mut volume(), &top, 0, 4), None);
+    }
+
+    /// A read the volume cannot satisfy appends nothing, however much it asks.
+    #[test]
+    fn a_read_past_the_volume_appends_nothing_and_allocates_nothing() {
+        let mut vol = volume();
+        let mut v = Vol {
+            len: 64,
+            disk: &mut vol,
+            max: usize::MAX,
+        };
+        let mut out = vec![9u8];
+        assert!(!v.append(60, 5, &mut out));
+        assert!(!v.append(0, usize::MAX, &mut out));
+        assert!(!v.append(u64::MAX, 2, &mut out));
+        assert_eq!(out, [9]);
+        assert!(v.append(60, 4, &mut out));
+        assert_eq!(out, [9, 60, 61, 62, 63]);
+    }
 }

@@ -44,9 +44,11 @@ import { image } from "@exav/viewer/image";
 const params = new URLSearchParams(location.search);
 const budget = params.get("maxPrimitives");
 const expand = params.get("maxDecompressedBytes");
+const entities = params.get("maxEntities");
 const cad = {};
 if (budget) cad.maxPrimitives = Number(budget);
 if (expand) cad.maxDecompressedBytes = Number(expand);
+if (entities) cad.maxEntities = Number(entities);
 const viewer = createViewer({ plugins: [dwg(cad), image({ wasmDecoders: true })] });
 const name = params.get("file");
 const session = viewer.mount(document.getElementById("host"), { id: name, name, source: { url: "./" + name } });
@@ -129,6 +131,17 @@ test("maxDecompressedBytes reaches the engine: below what the plan's sections ex
 
   await page.goto(`${base}?file=plan.dwg&maxDecompressedBytes=1000`);
   await expect(page.locator("body")).toHaveAttribute("data-phase", "error");
+});
+
+// plan.dwg holds about twenty entities: more than 10, fewer than 100000.
+test("maxEntities reaches the engine: below what the plan holds, the rest is left out and said so", async ({ page }) => {
+  await page.goto(`${base}?file=plan.dwg&maxEntities=100000`);
+  await expect(page.locator("body")).toHaveAttribute("data-phase", "ready");
+  await expect(page.locator("body")).not.toHaveAttribute("data-warnings", /scene_truncated/);
+
+  await page.goto(`${base}?file=plan.dwg&maxEntities=10`);
+  await expect(page.locator("body")).toHaveAttribute("data-phase", "ready");
+  await expect(page.locator("body")).toHaveAttribute("data-warnings", /scene_truncated/);
 });
 
 test("webpack, unconfigured, emits the image decoders and a TIFF is drawn", async ({ page }) => {

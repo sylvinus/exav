@@ -74,7 +74,7 @@ pub(crate) fn walk<T>(
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use crate::stream::{emit_stream, MemberMeta};
+    use crate::stream::{MemberMeta, emit_stream};
     check_first_header(src)?;
     let mut dec = delharc::LhaDecodeReader::new(crate::source::Reader::new(src))
         .map_err(|e| LimitHit::new(format!("lha: {e}")))?;

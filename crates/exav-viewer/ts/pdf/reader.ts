@@ -18,8 +18,8 @@
  * document scrolls there; one to an address calls `window.open`, which the
  * sandboxed frame turns into the host's question.
  */
-import { writable } from "../core/store.js";
-import type { DragController, OutlineEntry, PagesController, ZoomController, OutlineController } from "../core/types.js";
+import { onDemand, writable } from "../core/store.js";
+import type { DragController, OutlineEntry, PagesController, RasterRect, Viewport, ViewportController, ZoomController, OutlineController } from "../core/types.js";
 import { renderDpr, type LoadedPdf, type PageRegion, type PdfLink } from "./engine.js";
 
 export interface ReaderOptions {
@@ -35,7 +35,8 @@ export interface ReaderOptions {
 }
 
 export const READER_DEFAULTS: ReaderOptions = {
-  minZoom: 1,
+  // Zoom is a multiple of the page fitted to the width: a quarter shows a whole page, and more, on any screen.
+  minZoom: 0.25,
   maxZoom: 6,
   drag: "pan",
   prerenderMargin: "100%",
@@ -78,6 +79,8 @@ export interface Reader {
   zoom: ZoomController;
   drag: DragController;
   outline: OutlineController;
+  /** The part of the page in view. */
+  viewport: ViewportController;
   /**
    * Shows another document in place of this one, at the same zoom and scroll
    * position. The old `doc` is the caller's to destroy afterwards.
@@ -104,13 +107,13 @@ export function createReader(
   let sizes = initialSizes;
   let aspects = sizes.map((s) => s.width / s.height);
   const root = document.createElement("div");
-  root.className = "exv-pdf";
+  root.className = "exav-viewer-pdf";
   // Scrolling stays the browser's, zooming never is: its zoom takes the page.
   root.style.touchAction = "pan-x pan-y";
   const scroller = document.createElement("div");
-  scroller.className = "exv-pdf-scroller";
+  scroller.className = "exav-viewer-pdf-scroller";
   const content = document.createElement("div");
-  content.className = "exv-pdf-content";
+  content.className = "exav-viewer-pdf-content";
   scroller.append(content);
   root.append(scroller);
   host.append(root);
@@ -122,12 +125,12 @@ export function createReader(
   const build = () => {
     aspects.forEach((_, page) => {
       const box = document.createElement("div");
-      box.className = "exv-pdf-page";
+      box.className = "exav-viewer-pdf-page";
       box.dataset.page = String(page);
       const canvas = document.createElement("canvas");
-      canvas.className = "exv-pdf-bitmap";
+      canvas.className = "exav-viewer-pdf-bitmap";
       const detail = document.createElement("canvas");
-      detail.className = "exv-pdf-detail";
+      detail.className = "exav-viewer-pdf-detail";
       detail.setAttribute("aria-hidden", "true");
       box.append(canvas, detail);
       content.append(box);
@@ -153,13 +156,14 @@ export function createReader(
   });
   const zoomState = writable({ scale: 1, min: options.minZoom, max: options.maxZoom });
   const outline = writable<readonly OutlineEntry[]>([]);
+  const viewport = writable<Viewport | null>(null);
 
   // A drag pans where a page is larger than the viewer, if the user did not
   // choose to select; below that it selects, as there is nothing to pan.
   let choice = options.drag;
   const dragState = writable<{ mode: "pan" | "select"; available: boolean }>({ mode: "select", available: false });
   const updateDrag = () => {
-    const available = zoom > options.minZoom * ZOOMED;
+    const available = zoom > ZOOMED;
     const mode = available ? choice : "select";
     root.dataset.drag = mode;
     const now = dragState.get();
@@ -180,6 +184,7 @@ export function createReader(
       // What the text layer is sized by.
       box.style.setProperty("--scale-factor", String(w / (sizes[i]?.width || 1)));
     });
+    updateViewport();
   };
 
   // ── text and links ──
@@ -197,7 +202,7 @@ export function createReader(
 
   const linkElement = (link: PdfLink, area: PageRegion) => {
     const a = document.createElement("a");
-    a.className = "exv-pdf-link";
+    a.className = "exav-viewer-pdf-link";
     a.style.left = `${area.x * 100}%`;
     a.style.top = `${area.y * 100}%`;
     a.style.width = `${area.width * 100}%`;
@@ -216,9 +221,9 @@ export function createReader(
     const box = boxes[page];
     if (!box) return;
     const text = document.createElement("div");
-    text.className = "exv-pdf-text";
+    text.className = "exav-viewer-pdf-text";
     const links = document.createElement("div");
-    links.className = "exv-pdf-links";
+    links.className = "exav-viewer-pdf-links";
     box.append(text, links);
     let live = true;
     const task = doc.textLayer(page + 1, text);
@@ -226,7 +231,7 @@ export function createReader(
       () => {
         // What a selection dragged past the text lands on (see the stylesheet).
         const end = document.createElement("div");
-        end.className = "exv-pdf-text-end";
+        end.className = "exav-viewer-pdf-text-end";
         if (live) text.append(end);
       },
       // Without its text, the page is still shown.
@@ -258,10 +263,10 @@ export function createReader(
   // was: Firefox and WebKit otherwise move its start to the page's top (how
   // pdf.js's viewer does it).
   const onSelectStart = (e: MouseEvent) => {
-    (e.target as Element | null)?.closest?.(".exv-pdf-text")?.classList.add("exv-pdf-selecting");
+    (e.target as Element | null)?.closest?.(".exav-viewer-pdf-text")?.classList.add("exav-viewer-pdf-selecting");
   };
   const onSelectEnd = () => {
-    for (const layer of content.querySelectorAll(".exv-pdf-selecting")) layer.classList.remove("exv-pdf-selecting");
+    for (const layer of content.querySelectorAll(".exav-viewer-pdf-selecting")) layer.classList.remove("exav-viewer-pdf-selecting");
   };
 
   const draw = (page: number) => {
@@ -367,8 +372,30 @@ export function createReader(
     return page;
   };
 
+  /** Whether the viewport store has a listener: only then is it kept up to date. */
+  let following = false;
+  const updateViewport = () => following && measureViewport();
+  /** The part of the page in the middle of the viewer that is in view, in fractions of the page. */
+  const measureViewport = () => {
+    const page = currentPage();
+    const box = boxes[page - 1];
+    if (!box) return viewport.set(null);
+    const view = scroller.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    const left = Math.max(b.left, view.left);
+    const top = Math.max(b.top, view.top);
+    const right = Math.min(b.right, view.left + scroller.clientWidth);
+    const bottom = Math.min(b.bottom, view.top + scroller.clientHeight);
+    if (!(b.width > 0 && b.height > 0 && right > left && bottom > top)) return viewport.set(null);
+    const next = { x: (left - b.left) / b.width, y: (top - b.top) / b.height, width: (right - left) / b.width, height: (bottom - top) / b.height };
+    const now = viewport.get();
+    const same = now && now.page === page && (["x", "y", "width", "height"] as const).every((k) => Math.abs((now.region as RasterRect)[k] - next[k]) < 1e-4);
+    if (!same) viewport.set({ space: "page", page, region: next });
+  };
+
   const onScroll = () => {
     pages.set({ unit: "page", current: currentPage(), total: aspects.length });
+    updateViewport();
     scheduleDetail();
   };
 
@@ -514,7 +541,7 @@ export function createReader(
   const onPanEnd = () => {
     const was = panning;
     panning = null;
-    root.classList.remove("exv-pdf-panning");
+    root.classList.remove("exav-viewer-pdf-panning");
     document.removeEventListener("mousemove", onPanMove);
     document.removeEventListener("mouseup", onPanEnd);
     if (!was?.moved) return;
@@ -532,7 +559,7 @@ export function createReader(
     e.preventDefault();
     e.stopPropagation();
     panning = { x: e.clientX, y: e.clientY, left: scroller.scrollLeft, top: scroller.scrollTop, moved: false };
-    root.classList.add("exv-pdf-panning");
+    root.classList.add("exav-viewer-pdf-panning");
     document.addEventListener("mousemove", onPanMove);
     document.addEventListener("mouseup", onPanEnd);
   };
@@ -626,6 +653,7 @@ export function createReader(
     scroller.scrollLeft = left;
     scroller.scrollTop = top;
     pages.set({ unit: "page", current: currentPage(), total: aspects.length });
+    updateViewport();
     refresh();
     scheduleDetail();
     loadOutline();
@@ -642,6 +670,14 @@ export function createReader(
       },
     },
     outline: { ...outline, goTo: (entry) => goTo(entry.page, entry.offset, true) },
+    viewport: onDemand(viewport, {
+      start() {
+        following = true;
+        measureViewport();
+        return () => void (following = false);
+      },
+      once: measureViewport,
+    }),
     replace,
     resize: measure,
     destroy() {

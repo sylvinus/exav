@@ -89,13 +89,13 @@ pub(crate) fn walk<T>(
 }
 
 /// The ISO 9660 regions, and the sectors the files start at.
-type StreamedTree = (Vec<Region>, HashSet<u64>);
+type StreamedTree = (Vec<Region>, HashSet<(u64, u64)>);
 
 /// Walk the ISO 9660 directory tree(s) via targeted reads (directory records
 /// are small) and return each file as a region; file extents, the bulk of a
 /// disc image, are streamed by the caller. `max_buffer` bounds each directory
 /// read. Both the primary and Joliet trees are walked; a file present in both
-/// (by extent) is emitted once. The extents emitted come back too, for the UDF
+/// (by extent and length) is emitted once. The extents emitted come back too, for the UDF
 /// walk that follows to skip.
 pub(crate) fn stream_offsets<R: Read + Seek>(
     source: &mut R,
@@ -123,7 +123,7 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
         return Err(e);
     }
     let mut out = Vec::new();
-    let mut seen_files: HashSet<u64> = HashSet::new();
+    let mut seen_files: HashSet<(u64, u64)> = HashSet::new();
     if roots.is_empty() {
         return Ok((out, seen_files));
     }
@@ -132,7 +132,9 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
     // A directory is walked once per tree, however many records name it: a
     // record can point back at its own extent.
     let mut queued: HashSet<(bool, u64)> = roots.iter().map(|&(j, lba, _)| (j, lba)).collect();
-    let mut dirs: Vec<(bool, u64, u64)> = roots;
+    // Popped from the end: the Joliet roots, which `vd_roots` puts first, are
+    // walked first, and a file in both trees takes its long name.
+    let mut dirs: Vec<(bool, u64, u64)> = roots.into_iter().rev().collect();
     while let Some((joliet, lba, len)) = dirs.pop() {
         visited = visited.saturating_add(1);
         if visited > MAX_DIRS {
@@ -188,7 +190,10 @@ pub(crate) fn stream_offsets<R: Read + Seek>(
                 if queued.insert((joliet, child_lba)) {
                     dirs.push((joliet, child_lba, child_len));
                 }
-            } else if seen_files.insert(child_lba) {
+            // A file is its extent and its length: two records at one start with
+            // different lengths are two files, and the empty one must not take
+            // the place of the other.
+            } else if seen_files.insert((child_lba, child_len)) {
                 let raw = rec
                     .get(33..33usize.saturating_add(name_len.min(rec_len.saturating_sub(33))))
                     .unwrap_or(&[]);

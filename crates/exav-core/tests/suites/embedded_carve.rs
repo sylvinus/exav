@@ -2,7 +2,7 @@
 //! dropper — must be carved and scanned. The normal scan only types offset 0, so
 //! without embedded-archive carving the payload in the overlay is invisible.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 use std::io::Write;
 
 /// A text carrier holding `n` copies of `item`, each after some filler, so no
@@ -110,6 +110,80 @@ fn appended_overlay_zip_is_carved_and_scanned() {
     }
 }
 
+/// A zip of a few hundred entries stapled into a document is one archive, not
+/// one per entry: it is scanned once and does not trip the carving cap.
+#[test]
+fn a_zip_of_many_entries_stapled_into_a_document_is_clean() {
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for k in 0..300 {
+        z.start_file(format!("entry{k}.txt"), stored).unwrap();
+        z.write_all(b"nothing to see here").unwrap();
+    }
+    let z = z.finish().unwrap().into_inner();
+    let mut doc = b"a document with a zip stapled inside it\n".to_vec();
+    doc.extend_from_slice(&z);
+    doc.extend_from_slice(&[b'.'; 100]);
+    assert_eq!(verdict(&doc), Verdict::Clean);
+}
+
+/// A zip whose first header names a size that lands on a second archive does
+/// not hide that archive: the first one's walk reaches every local header
+/// after its own, whether the second sits inside the first one's span (before
+/// its central directory) or after its end.
+#[test]
+fn a_second_zip_at_the_offset_the_first_one_names_is_still_found() {
+    let eicar = exav_core::unpack::eicar();
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut x = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    x.start_file("p.txt", deflated).unwrap();
+    x.write_all(&[eicar, b"\n"].concat().repeat(64)).unwrap();
+    let x = x.finish().unwrap().into_inner();
+    assert!(!x.windows(eicar.len()).any(|w| w == eicar));
+
+    // A: one stored entry "a.txt", then `middle`, then its directory.
+    let a = |middle: &[u8]| {
+        let data = b"hello";
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        let mut out = b"PK\x03\x04\x14\0\0\0\0\0\0\0\x21\0".to_vec();
+        out.extend_from_slice(&crc.sum().to_le_bytes());
+        out.extend_from_slice(&[5, 0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0]);
+        out.extend_from_slice(b"a.txt");
+        out.extend_from_slice(data);
+        let cd_at = out.len() + middle.len();
+        out.extend_from_slice(middle);
+        let cd = out.len();
+        out.extend_from_slice(b"PK\x01\x02\x14\0\x14\0\0\0\0\0\0\0\x21\0");
+        out.extend_from_slice(&crc.sum().to_le_bytes());
+        // Sizes, name length 5, then the extra, comment, disk, attribute and
+        // local header offset fields, all zero.
+        out.extend_from_slice(&[5, 0, 0, 0, 5, 0, 0, 0, 5, 0]);
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(b"a.txt");
+        let size = (out.len() - cd) as u32;
+        out.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&(cd_at as u32).to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    };
+    for (what, zip) in [("inside", a(&x)), ("after", [a(b""), x.clone()].concat())] {
+        let mut doc = b"a document with two zips stapled inside it\n".to_vec();
+        doc.extend_from_slice(&zip);
+        doc.extend_from_slice(&[b'.'; 100]);
+        match verdict(&doc) {
+            Verdict::Infected { signature, .. } => assert!(
+                signature.to_ascii_uppercase().contains("EICAR"),
+                "{what}: unexpected signature {signature}"
+            ),
+            other => panic!("{what}: EICAR in the second zip must be found, got {other:?}"),
+        }
+    }
+}
+
 /// An executable in an OLE2 file is also carved from the file's own bytes and
 /// scanned to the end of the file, as ClamAV carves it: a PE-only signature on
 /// bytes of a later stream matches, which carving inside the executable's own
@@ -145,5 +219,48 @@ fn an_ole2_file_is_carved_from_its_own_bytes() {
     match analyze(&db, &file, &ScanOptions::default()).verdict {
         Verdict::Infected { signature, .. } => assert_eq!(signature, "Test.Ole2.Carved"),
         other => panic!("expected the carved executable to match, got {other:?}"),
+    }
+}
+
+/// A carved executable that cannot be read whole is a finding of its own, but
+/// not the end of the scan: an archive stapled before it is still opened. Else a
+/// damaged decoy after a payload turns `FOUND` into `PARTIAL`, or into `OK`
+/// under `--partial-as ok`.
+#[test]
+fn a_damaged_executable_in_a_carrier_does_not_hide_the_archive_with_the_payload() {
+    // `upx_nrv2d.upx` with five bytes of its compressed data changed.
+    let decoy = include_bytes!("../fixtures/upx_damaged.elf");
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("e.com", deflated).unwrap();
+    // Repetitive, so the compressor codes it and the string is not in the bytes.
+    zip.write_all(&[exav_core::unpack::eicar(), b"\n"].concat().repeat(64))
+        .unwrap();
+    let zip = zip.finish().unwrap().into_inner();
+    let eicar = exav_core::unpack::eicar();
+    assert!(
+        !zip.windows(eicar.len()).any(|w| w == eicar),
+        "the string must not be in the archive's bytes"
+    );
+
+    let mut stub = b"MZ".to_vec();
+    stub.resize(62, 0);
+    let control = [stub.as_slice(), &zip].concat();
+    assert!(
+        matches!(verdict(&control), Verdict::Infected { .. }),
+        "the premise"
+    );
+    let alone = [stub.as_slice(), decoy.as_slice()].concat();
+    assert!(
+        matches!(verdict(&alone), Verdict::Unscannable { .. }),
+        "the decoy must not unpack"
+    );
+    let both = [stub.as_slice(), &zip, decoy.as_slice()].concat();
+    match verdict(&both) {
+        Verdict::Infected { .. } => {}
+        other => {
+            panic!("the archive before a damaged executable must still be found, got {other:?}")
+        }
     }
 }

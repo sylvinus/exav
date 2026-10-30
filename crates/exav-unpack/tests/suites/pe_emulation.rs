@@ -11,7 +11,7 @@
 //! recovered image, a bounded run, and nothing invented when there is nothing
 //! to recover.
 
-use exav_unpack::{extract, is_pepack, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract, is_pepack};
 
 const IMAGE_BASE: u32 = 0x0040_0000;
 const DEST_RVA: u32 = 0x1000;

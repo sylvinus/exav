@@ -232,6 +232,12 @@ pub fn walk<T>(
             Some(e) => Err(LimitHit::corrupt(format!("{fmt:?}: {e}"))),
             None => Ok(None),
         },
+        // A container that is found damaged where the source failed to give it
+        // is damaged by the failure: that is the reason to report.
+        Ok(Err(hit)) if hit.is_corrupt() => match src.read_error() {
+            Some(e) => Err(LimitHit::corrupt(format!("{fmt:?}: {e}"))),
+            None => Err(hit),
+        },
         Ok(r) => r,
         Err(_) => Err(LimitHit::corrupt(format!(
             "{fmt:?} decoder panicked on malformed input"
@@ -278,6 +284,10 @@ fn dispatch<T>(
         Format::Zstd => f::zstd::walk,
         #[cfg(feature = "lzip")]
         Format::Lzip => f::lzip::walk,
+        #[cfg(feature = "lzma")]
+        Format::Lzma => f::lzmaalone::walk,
+        #[cfg(feature = "rpm")]
+        Format::Rpm => f::rpm::walk,
         #[cfg(feature = "sevenz")]
         Format::SevenZip => f::sevenz::walk,
         #[cfg(feature = "cab")]
@@ -310,8 +320,36 @@ fn dispatch<T>(
         Format::Swf => f::swf::walk,
         #[cfg(feature = "dmg")]
         Format::Dmg => f::dmg::walk,
+        #[cfg(feature = "vhd")]
+        Format::Vhd => f::vhd::walk,
+        #[cfg(feature = "diskimage")]
+        Format::Qcow2 => f::qcow2::walk,
+        #[cfg(feature = "diskimage")]
+        Format::Vmdk => f::vmdk::walk,
+        #[cfg(feature = "diskimage")]
+        Format::Vhdx => f::vhdx::walk,
+        #[cfg(feature = "ntfs")]
+        Format::Ntfs => f::ntfs::walk,
+        #[cfg(feature = "fat")]
+        Format::Fat => f::fat::walk,
+        #[cfg(feature = "ext")]
+        Format::Ext => f::ext::walk,
+        #[cfg(feature = "exfat")]
+        Format::Exfat => f::exfat::walk,
+        #[cfg(feature = "squashfs")]
+        Format::Squashfs => f::squashfs::walk,
+        #[cfg(feature = "cramfs")]
+        Format::Cramfs => f::cramfs::walk,
+        #[cfg(feature = "romfs")]
+        Format::Romfs => f::romfs::walk,
+        #[cfg(feature = "erofs")]
+        Format::Erofs => f::erofs::walk,
         #[cfg(feature = "szdd")]
         Format::Szdd => f::szdd::walk,
+        #[cfg(feature = "wim")]
+        Format::Wim => f::wim::walk,
+        #[cfg(feature = "xar")]
+        Format::Xar => f::xar::walk,
         _ => return whole(fmt, src, budget, visit),
     };
     walk(src, budget, visit)
@@ -1028,7 +1066,7 @@ mod tests {
                 "{path}"
             );
         }
-        assert_eq!(seen, 7);
+        assert_eq!(seen, 8);
     }
 
     // Every codec decodes, including the solid multi-file case, where each file
@@ -1084,11 +1122,11 @@ mod tests {
             out.extend_from_slice(&0u16.to_le_bytes()); // flags
             out.extend_from_slice(&0u16.to_le_bytes()); // setID
             out.extend_from_slice(&0u16.to_le_bytes()); // iCabinet
-                                                        // CFFOLDER
+            // CFFOLDER
             out.extend_from_slice(&cfdata_start.to_le_bytes()); // coffCabStart
             out.extend_from_slice(&1u16.to_le_bytes()); // cCFData
             out.extend_from_slice(&0u16.to_le_bytes()); // typeCompress = None (stored)
-                                                        // CFFILE table
+            // CFFILE table
             let mut off = 0u32;
             for (n, d) in files {
                 out.extend_from_slice(&(d.len() as u32).to_le_bytes()); // cbFile

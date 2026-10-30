@@ -35,7 +35,6 @@ pub(crate) const NSIS_SIG: [u8; 16] = [
 const FIRSTHEADER_LEN: usize = 0x1c;
 /// `firstheader.flags`: the installer carries no CRC-32 after its data.
 const FH_FLAGS_NO_CRC: u32 = 4;
-const MAX_BLOCKS: usize = 10_000;
 const SOLID_MIN_OUTPUT: usize = 64;
 
 #[inline]
@@ -102,12 +101,16 @@ pub(crate) fn extract_nsis<R>(
     // Non-solid: a `[u32 size][data]` block sequence.
     let mut pos = data_start;
     let mut n = 0usize;
-    while pos + 4 <= arch_end && n < MAX_BLOCKS {
+    // Each block is counted against the archive's member limit, an empty one
+    // too, and that is the bound on the walk: it ends in a limit that is said,
+    // where a count of its own ended it quietly with blocks left.
+    while pos + 4 <= arch_end {
         let word = u32le(data, pos);
         pos += 4;
         let compressed = word & 0x8000_0000 != 0;
         let size = (word & 0x7fff_ffff) as usize;
         if size == 0 {
+            budget.count_entry()?;
             n += 1;
             continue;
         }
@@ -237,7 +240,7 @@ mod tests {
     fn is_nsis(data: &[u8]) -> bool {
         super::is_nsis(&crate::Probe::whole(data))
     }
-    use flate2::{write::DeflateEncoder, Compression};
+    use flate2::{Compression, write::DeflateEncoder};
     use std::io::Write;
 
     /// A declared dictionary size is attacker input and is allocated UP FRONT.
@@ -314,9 +317,11 @@ mod tests {
             entries.iter().all(|e| e.unsupported.is_none()),
             "{entries:?}"
         );
-        assert!(entries
-            .iter()
-            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST"))
+        );
     }
 
     /// The CRC-32 after the data is not one more block.
@@ -342,9 +347,11 @@ mod tests {
         assert_eq!(detect(&blob), Some(Format::Nsis));
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
-        assert!(entries
-            .iter()
-            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST"))
+        );
     }
 
     #[test]
@@ -353,9 +360,11 @@ mod tests {
         blob.extend_from_slice(&[0u8; 512]);
         assert!(!is_nsis(&blob));
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Nsis, &blob, &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Nsis, &blob, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -364,9 +373,11 @@ mod tests {
         blob.extend_from_slice(&[0u8; 8]);
         blob.extend_from_slice(&NSIS_SIG);
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Nsis, &blob, &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Nsis, &blob, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -376,9 +387,11 @@ mod tests {
         let blob = synthetic_nsis(&junk);
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
-        assert!(entries
-            .iter()
-            .all(|e| e.unsupported.is_some() || !e.data.is_empty()));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.unsupported.is_some() || !e.data.is_empty())
+        );
     }
 
     #[test]

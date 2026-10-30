@@ -1,0 +1,50 @@
+/* A small stylesheet with custom properties, grid and a media query. CC0-1.0, exav project. */
+:root {
+  --ink: #1b2430;
+  --paper: #fbfaf7;
+  --accent: #0b7285;
+  --radius: 0.5rem;
+  --gap: clamp(0.75rem, 2vw, 1.5rem);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { --ink: #e7edf3; --paper: #12171d; --accent: #66d9e8; }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 1rem/1.55 system-ui, sans-serif;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: var(--gap);
+  padding: var(--gap);
+}
+
+.card {
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, var(--ink) 20%, transparent);
+  border-radius: var(--radius);
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.card:hover,
+.card:focus-within {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 0.12);
+}
+
+.card > h2::after { content: " \2192"; color: var(--accent); }
+
+a:not([class]) { color: var(--accent); text-underline-offset: 0.2em; }
+
+@media (max-width: 40rem) {
+  .cards { grid-template-columns: 1fr; }
+}

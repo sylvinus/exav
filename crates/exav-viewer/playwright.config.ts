@@ -8,6 +8,10 @@ import { defineConfig } from "@playwright/test";
 // ("http://localhost:8000/viewer/demo/"); without it, `vite preview` serves it.
 const external = process.env.E2E_BASE_URL;
 
+// Text without subpixel antialiasing on Linux, and the generic families the
+// Liberation fonts (e2e/fonts.conf), in every engine.
+const fonts = { ...process.env, FONTCONFIG_FILE: fileURLToPath(new URL("./e2e/fonts.conf", import.meta.url)) };
+
 export default defineConfig({
   testDir: "./e2e",
   // The large files the delivery tests open.
@@ -34,18 +38,20 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      // WebGL in a headless Chromium without a GPU, and text without subpixel
-      // antialiasing on Linux (e2e/fonts.conf).
+      // WebGL in a headless Chromium without a GPU.
       use: {
         browserName: "chromium",
-        launchOptions: {
-          args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
-          env: { ...process.env, FONTCONFIG_FILE: fileURLToPath(new URL("./e2e/fonts.conf", import.meta.url)) },
-        },
+        launchOptions: { args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"], env: fonts },
       },
     },
-    // The sandboxed frame's guarantees, and text selection, in the other engines.
-    { name: "firefox", testMatch: /(frame|delivery|selection)\.spec\.ts/, use: { browserName: "firefox" } },
-    { name: "webkit", testMatch: /(frame|delivery|selection)\.spec\.ts/, use: { browserName: "webkit" } },
+    // The sandboxed frame's guarantees, text selection, the converted Office
+    // formats and the pictures of Office documents in the other engines (in
+    // WebKit, in the page only: it refuses the workers of a frame served
+    // isolated). Headless Firefox here has no WebGL, so the model pictures run
+    // in WebKit only. The CAD specs stay on Chromium: WebKit on Linux shows
+    // nothing for a WebGL canvas made with `antialias: false`, which CAD
+    // drawings need (docs/BACKLOG.md, "Cross-browser").
+    { name: "firefox", testMatch: /(frame|delivery|selection|converted|office-raster)\.spec\.ts/, use: { browserName: "firefox", launchOptions: { env: fonts } } },
+    { name: "webkit", testMatch: /(frame|delivery|selection|converted|office-raster|model-raster)\.spec\.ts/, use: { browserName: "webkit", launchOptions: { env: fonts } } },
   ],
 });

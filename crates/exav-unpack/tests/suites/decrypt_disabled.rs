@@ -2,7 +2,7 @@
 //! never decrypted (the cipher stack isn't compiled in) — the same as when no
 //! password is supplied, and never a silent clean. Compiled/run only in a
 //! no-decrypt build: `cargo test -p exav-unpack --no-default-features --features zip`.
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 #[test]
 fn encrypted_zip_is_unsupported_without_decrypt() {
@@ -15,7 +15,9 @@ fn encrypted_zip_is_unsupported_without_decrypt() {
         let mut budget = Budget::with_passwords(Limits::default(), vec!["exavtest".into()]);
         let entries = extract(Format::Zip, &data, &mut budget).unwrap();
         assert!(
-            entries.iter().any(|e| e.encrypted && e.unsupported.is_some()),
+            entries
+                .iter()
+                .any(|e| e.encrypted && e.unsupported.is_some()),
             "encrypted member must be reported unsupported (not decrypted) without the decrypt feature",
         );
         // And never handed back as decrypted plaintext.

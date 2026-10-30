@@ -12,7 +12,7 @@
 //! * `ppmd_use_after_free*.rar` — crafted malformed PPMd inputs (libarchive
 //!   crash-test corpus); they must fail gracefully without panicking.
 
-use exav_unpack::{unpack29, Budget, Limits};
+use exav_unpack::{Budget, Limits, unpack29};
 
 const RAR4_MAGIC: &[u8] = &[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 

@@ -47,12 +47,30 @@ mod json;
 pub mod model;
 mod preview;
 mod proxy;
+mod xref;
 
 pub use exav_unpack::dwg::{looks_like_dwg, pre_r13_version};
-pub use exav_unpack::dxf::{looks_like_dxf, Limits};
+pub use exav_unpack::dxf::{Limits, looks_like_dxf};
 pub use json::to_json;
 pub use model::*;
 pub use preview::preview;
+pub use xref::MAX_BOUND_ENTITIES;
+
+/// What an entity takes in memory once read, as a line does, the commonest
+/// (the room a list grows into while the drawing is read is not counted).
+pub const ENTITY_BYTES: u64 = 512;
+
+/// Limits for a drawing that may take about `memory` bytes: its entities and
+/// what the compressed sections of a DWG expand to are each bound by it.
+pub fn limits_within(memory: u64) -> Limits {
+    let default = Limits::default();
+    Limits {
+        max_entities: usize::try_from(memory / ENTITY_BYTES)
+            .map_or(default.max_entities, |n| n.min(default.max_entities)),
+        max_decompressed_bytes: memory,
+        ..default
+    }
+}
 
 /// Why a file could not be read at all.
 #[derive(Clone, Debug, PartialEq, Eq)]

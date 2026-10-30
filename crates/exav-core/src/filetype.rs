@@ -187,6 +187,11 @@ pub enum FileType {
     Fat,         // FAT12/16/32 filesystem
     Inno,        // Inno Setup installer (recognised, not decoded)
     Ntfs,        // NTFS filesystem
+    Exfat,       // exFAT filesystem
+    Squashfs,    // SquashFS image
+    Cramfs,      // cramfs image
+    Romfs,       // romfs image
+    Erofs,       // EROFS image
     Zstd,        // Zstandard compressed stream
     Lzip,        // Lzip compressed stream
     Uuencode,    // uuencode / base64-uuencode wrapped file
@@ -271,6 +276,11 @@ impl FileType {
             FileType::Fat => "FAT",
             FileType::Inno => "InnoSetup",
             FileType::Ntfs => "NTFS",
+            FileType::Exfat => "exFAT",
+            FileType::Squashfs => "SquashFS",
+            FileType::Cramfs => "cramfs",
+            FileType::Romfs => "romfs",
+            FileType::Erofs => "EROFS",
             FileType::Zstd => "ZSTD",
             FileType::Lzip => "LZIP",
             FileType::Uuencode => "uuencode",
@@ -308,7 +318,7 @@ pub fn identify(buf: &[u8]) -> FileType {
 }
 
 /// Bytes of an object's start the content sniffers below read.
-const SNIFF_HEAD: usize = 8192;
+const SNIFF_HEAD: usize = 64 * 1024;
 
 /// As [`identify`], over an object that need not be held in memory: its start
 /// is read, and the container detection reads what it needs.
@@ -456,32 +466,61 @@ fn looks_like_html(buf: &[u8]) -> bool {
         .any(|m| memchr::memmem::find(&lower, m).is_some())
 }
 
-/// Heuristic RFC822/MIME detection (email has no magic bytes). Conservative:
-/// the message must start with a recognized header line *and* carry a
-/// MIME-Version/Content-Type header, or be an mbox (`From ` separator).
+/// How much of the start is read to judge a message by its headers.
+const EMAIL_HEAD: usize = 64 * 1024;
+
+/// Heuristic RFC822/MIME detection (email has no magic bytes).
+///
+/// An mbox (`From ` separator), or a header block that starts with a header
+/// field and carries a MIME header and a header only mail has. Names are not
+/// case sensitive and the first field is any: a mail client writes its own
+/// (`X-Mozilla-Status`, `X-Account-Key`) ahead of the rest, and a gateway adds
+/// a long run of `Received` fields before the MIME headers.
 fn looks_like_email(buf: &[u8]) -> bool {
-    let head = &buf[..buf.len().min(8192)];
-    let text = String::from_utf8_lossy(head);
-    if text.starts_with("From ") {
+    let head = &buf[..buf.len().min(EMAIL_HEAD)];
+    if head.starts_with(b"From ") {
         return true; // mbox
     }
-    let first_is_header = text.lines().next().is_some_and(|l| {
-        let key = l.split_once(':').map(|(k, _)| k).unwrap_or("");
-        matches!(
-            key,
-            "Received"
-                | "Return-Path"
-                | "From"
-                | "To"
-                | "Subject"
-                | "Date"
-                | "Message-ID"
-                | "Delivered-To"
-                | "MIME-Version"
-                | "Content-Type"
-        )
-    });
-    first_is_header && (text.contains("MIME-Version:") || text.contains("Content-Type:"))
+    // The header block: up to the first empty line.
+    let end = head
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .into_iter()
+        .chain(head.windows(4).position(|w| w == b"\r\n\r\n"))
+        .min()
+        .unwrap_or(head.len());
+    let block = &head[..end];
+    let field_name = |line: &[u8]| -> Option<String> {
+        let colon = line.iter().position(|&b| b == b':')?;
+        let name = &line[..colon];
+        (!name.is_empty()
+            && name.len() <= 64
+            && name.iter().all(|b| b.is_ascii_graphic() && *b != b':'))
+        .then(|| String::from_utf8_lossy(name).to_ascii_lowercase())
+    };
+    let mut lines = block.split(|&b| b == b'\n');
+    let Some(first) = lines.next().and_then(field_name) else {
+        return false;
+    };
+    // Folded lines start with white space and name nothing.
+    let names: Vec<String> = std::iter::once(first.clone())
+        .chain(lines.filter_map(field_name))
+        .collect();
+    let has = |n: &str| names.iter().any(|x| x == n);
+    let mime = has("mime-version") || has("content-type");
+    const ONLY_MAIL: &[&str] = &[
+        "received",
+        "return-path",
+        "from",
+        "to",
+        "subject",
+        "date",
+        "message-id",
+        "delivered-to",
+        "mime-version",
+    ];
+    // A part saved on its own starts with its `Content-Type`.
+    mime && (first == "content-type" || ONLY_MAIL.iter().any(|n| has(n)))
 }
 
 /// Whether a MIME document is an **MHTML web archive** rather than a mail
@@ -555,6 +594,10 @@ pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
         // the filesystem inside, which is typed when the member is scanned.
         Format::Vhd => FileType::Unknown,
         Format::Lzw => FileType::Unknown,
+        // LZMA Utils' `.lzma` has no ClamAV type either.
+        Format::Lzma => FileType::Unknown,
+        // So has an RPM package.
+        Format::Rpm => FileType::Unknown,
         Format::Qcow2 | Format::Vmdk | Format::Vhdx => FileType::Unknown,
         Format::Wim => FileType::Wim,
         Format::Lz4 => FileType::Lz4,
@@ -575,6 +618,11 @@ pub(crate) fn filetype_of_format(fmt: crate::unpack::Format) -> FileType {
         Format::Fat => FileType::Fat,
         Format::Inno => FileType::Inno,
         Format::Ntfs => FileType::Ntfs,
+        Format::Exfat => FileType::Exfat,
+        Format::Squashfs => FileType::Squashfs,
+        Format::Cramfs => FileType::Cramfs,
+        Format::Romfs => FileType::Romfs,
+        Format::Erofs => FileType::Erofs,
         Format::Zstd => FileType::Zstd,
         Format::Lzip => FileType::Lzip,
         Format::Uuencode => FileType::Uuencode,
@@ -633,6 +681,8 @@ pub(crate) const MAGIC_DISPATCH_ONLY: &[crate::unpack::Format] = &[
     crate::unpack::Format::Dmg,
     crate::unpack::Format::Vhd,
     crate::unpack::Format::Lzw,
+    crate::unpack::Format::Lzma,
+    crate::unpack::Format::Rpm,
     crate::unpack::Format::Qcow2,
     crate::unpack::Format::Vmdk,
     crate::unpack::Format::Vhdx,
@@ -768,5 +818,59 @@ mod tests {
         assert_eq!(identify(eml), FileType::Email);
         // Plain prose with a colon must not be misread as email (it is text).
         assert_eq!(identify(b"Notes: buy milk\nand eggs\n"), FileType::Text);
+    }
+
+    /// A message is a message by what its headers are, not by which one comes
+    /// first or how it is spelt: a mail client writes its own header ahead of the
+    /// rest, and a header name is not case sensitive.
+    #[test]
+    fn a_message_is_known_by_its_headers_not_by_the_first_of_them() {
+        let rest = "Subject: x\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nhi";
+        for first in [
+            "X-Mozilla-Status: 0001",
+            "X-Account-Key: account1",
+            "Cc: a@b",
+            "Message-Id: <1@b>",
+            "Authentication-Results: mx; spf=pass",
+            "FROM: a@b",
+            "received: from x",
+        ] {
+            let eml = format!("{first}\r\n{rest}");
+            assert_eq!(identify(eml.as_bytes()), FileType::Email, "{first}");
+        }
+        let lower = "from: a@b\nmime-version: 1.0\ncontent-type: text/plain\n\nhi";
+        assert_eq!(identify(lower.as_bytes()), FileType::Email);
+    }
+
+    /// Header blocks of mail that went through gateways run past 8 KiB.
+    #[test]
+    fn a_long_header_block_does_not_hide_the_mime_headers() {
+        let mut eml = String::new();
+        for i in 0..200 {
+            eml.push_str(&format!("Received: from relay{i}.example.org by mx{i}.example.net; Tue, 1 Jan 2030 00:00:00 +0000\r\n"));
+        }
+        let at = eml.len();
+        eml.push_str("MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nhi");
+        assert!(at > 8192, "{at}");
+        assert_eq!(identify(eml.as_bytes()), FileType::Email);
+    }
+
+    #[test]
+    fn headers_alone_do_not_make_a_message() {
+        // No MIME header.
+        assert_ne!(
+            identify(b"X-Thing: a\r\nFrom: a@b\r\n\r\nhi"),
+            FileType::Email
+        );
+        // MIME headers in the body, not the headers.
+        assert_ne!(
+            identify(b"X-Thing: a\r\nFrom: a@b\r\n\r\nContent-Type: text/plain\r\nhi"),
+            FileType::Email
+        );
+        // A header-looking first line and nothing mail about it.
+        assert_ne!(
+            identify(b"Server: x\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n\r\nhi"),
+            FileType::Email
+        );
     }
 }

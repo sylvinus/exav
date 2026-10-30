@@ -86,6 +86,13 @@ File type comes from the content, not the extension: an executable renamed
 `.jpg` is still scanned as an executable. The budgets every extraction runs
 under are in [How extraction works](/unpack/how-it-works/).
 
+A document is matched twice: as its bytes, and as the text a reader sees, a
+second view of the same object with its markup, escapes and run boundaries
+gone and each link followed by where it goes. That view is made by the
+`visible-text` feature, on by default; which documents it reads, and what
+happens when one cannot be read, is in
+[Supported formats](/scanner/reference/formats/#the-text-a-reader-sees).
+
 ## Signature types and runtime structures
 
 Different ClamAV signature types compile to different runtime structures rather
@@ -257,13 +264,11 @@ least as much) rules most objects out first.
 </svg>
 </div>
 
-Neither the sweep nor a check has a window to fall out of. The sweep reads the
-object once, in order, and looks up the few positions before a seam from the
-bytes on both sides of it, so an anchor split across a seam is found without
-re-reading the chunk. A check
-asks for the bytes it needs at their offset, before or after the hit, from
-memory or, past `--max-object-bytes`, from the
-[block cache](/scanner/concepts/streaming-memory/#past-it-through-a-block-cache).
+The sweep reads the object once, in order, and looks up the few positions before
+a seam from the bytes on both sides of it, so an anchor split across a seam is
+found without re-reading the chunk. A check asks for the bytes it needs at their
+offset, before or after the hit, from memory or, past `--max-object-bytes`, from
+the [block cache](/scanner/concepts/streaming-memory/#past-it-through-a-block-cache).
 
 Over an object not held in memory, regular expressions (PCRE subsignatures,
 YARA strings) run as lazy DFAs stepped through it, forward to find where a match

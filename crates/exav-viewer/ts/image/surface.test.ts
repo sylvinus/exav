@@ -50,7 +50,7 @@ describe("a surface's wheel", () => {
     const picture = document.createElement("canvas");
     const surface = createSurface(host, picture, { width: 100, height: 100 }, { ...SURFACE_DEFAULTS, ...options });
     open.push(surface);
-    const root = host.querySelector<HTMLElement>(".exv-image")!;
+    const root = host.querySelector<HTMLElement>(".exav-viewer-image")!;
     const send = (init: WheelEventInit) => root.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, ...init }));
     return { surface, send, root };
   }
@@ -101,8 +101,8 @@ describe("a surface's wheel", () => {
     const before = surface.get();
     const next = document.createElement("canvas");
     surface.replacePicture(next, { width: 200, height: 200 });
-    expect(root.querySelector(".exv-image-picture")).toBe(next);
-    expect(root.querySelectorAll(".exv-image-picture")).toHaveLength(1);
+    expect(root.querySelector(".exav-viewer-image-picture")).toBe(next);
+    expect(root.querySelectorAll(".exav-viewer-image-picture")).toHaveLength(1);
     expect(surface.get()).toMatchObject({ scale: before.scale, x: before.x, y: before.y });
     // Another shape is fitted again.
     surface.replacePicture(document.createElement("canvas"), { width: 100, height: 200 });

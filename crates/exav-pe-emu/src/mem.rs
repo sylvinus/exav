@@ -129,10 +129,11 @@ impl Mem {
     #[inline]
     fn count_dirty(&mut self, page: u32) {
         self.dirty_pages += 1;
-        if let Some((lo, hi)) = self.watch {
-            if page >= lo && page < hi {
-                self.watch_dirty += 1;
-            }
+        if let Some((lo, hi)) = self.watch
+            && page >= lo
+            && page < hi
+        {
+            self.watch_dirty += 1;
         }
     }
 

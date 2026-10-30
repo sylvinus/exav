@@ -33,9 +33,10 @@ in archives would make the ZIP and 7z tests depend on working ZIP and decryption
 support to load their own inputs, and the `--no-default-features` build has
 neither compiled in.
 
-`scripts/release.sh` re-checks the whole tracked tree with `clamscan` when a
-signature database is present, so a fixture committed in the clear is caught
-before it ships.
+`scripts/release.sh` greps the tracked tree for the EICAR string on every run.
+`make av-audit` scans it with `clamscan` and a signature database, which needs
+both installed, so it is run when fixtures change; `docs/RELEASING.md` also
+has the release build scanned over the tree.
 
 ## Real malware is never committed
 
@@ -53,6 +54,18 @@ locally. Those are:
 `<path>` exists and decrypts it in memory, so call sites pass the plain name.
 That needs the `zip` and `decrypt` features; a build without them, like a
 checkout without the samples, skips the tests that use them.
+
+## Written by a script
+
+`dmg/udif_lzfse.dmg` is `dmg/hfs_plus_udrw.dmg`'s disk in two LZFSE runs (sectors
+0 to 8, then the rest): a UDIF image with a `koly` trailer and a block map
+around the streams the `lzfse_rust` crate (an LZFSE encoder, MIT) writes, one
+LZVN block and FSE blocks. `tests/suites/lzfse.rs` reads it back against the
+raw image.
+
+`tests/oracle/` holds the C wrappers and `build.sh` for the differential tests
+of the LZFSE and DCL decoders against their reference sources, which are
+fetched, never committed (`src/formats/lzfse.rs`, `src/formats/dcl_explode.rs`).
 
 To add one (`pip install pyzipper`):
 

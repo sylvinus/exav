@@ -1,0 +1,133 @@
+{
+  "title": "A small recipe book",
+  "version": 3,
+  "published": true,
+  "updated": null,
+  "tags": [
+    "cooking",
+    "demo",
+    "café",
+    "日本語"
+  ],
+  "numbers": {
+    "integer": 42,
+    "negative": -7,
+    "float": 3.14159,
+    "exponent": 6.02e+23,
+    "tiny": 1e-09,
+    "zero": 0
+  },
+  "recipes": [
+    {
+      "name": "Crepes",
+      "serves": 4,
+      "time": {
+        "prep_min": 10,
+        "rest_min": 30,
+        "cook_min": 20
+      },
+      "ingredients": [
+        {
+          "item": "flour",
+          "amount": 250,
+          "unit": "g"
+        },
+        {
+          "item": "milk",
+          "amount": 0.5,
+          "unit": "l"
+        },
+        {
+          "item": "eggs",
+          "amount": 3,
+          "unit": null
+        },
+        {
+          "item": "salt",
+          "amount": "a pinch"
+        }
+      ],
+      "steps": [
+        "Whisk the flour and eggs.",
+        "Add the milk slowly.",
+        "Rest for 30 minutes.",
+        "Cook in a hot pan, a minute a side."
+      ],
+      "nutrition": {
+        "kcal": 210,
+        "protein_g": 8.5,
+        "vegetarian": true
+      }
+    },
+    {
+      "name": "Ratatouille",
+      "serves": 6,
+      "time": {
+        "prep_min": 25,
+        "cook_min": 60
+      },
+      "ingredients": [
+        {
+          "item": "aubergine",
+          "amount": 2
+        },
+        {
+          "item": "courgette",
+          "amount": 3
+        },
+        {
+          "item": "tomatoes",
+          "amount": 500,
+          "unit": "g"
+        },
+        {
+          "item": "olive oil",
+          "amount": 4,
+          "unit": "tbsp"
+        }
+      ],
+      "steps": [
+        "Dice the vegetables.",
+        "Fry each in turn.",
+        "Stew together for an hour."
+      ],
+      "nutrition": {
+        "kcal": 160,
+        "protein_g": 3.1,
+        "vegetarian": true,
+        "vegan": true
+      }
+    }
+  ],
+  "nested": {
+    "a": {
+      "b": {
+        "c": {
+          "d": {
+            "e": [
+              1,
+              [
+                2,
+                [
+                  3,
+                  [
+                    4,
+                    [
+                      5
+                    ]
+                  ]
+                ]
+              ]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "escapes": "quote \" backslash \\ slash / newline \n tab \t unicode é 中 😀",
+  "empty": {
+    "object": {},
+    "array": [],
+    "string": ""
+  }
+}

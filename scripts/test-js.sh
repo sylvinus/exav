@@ -42,7 +42,7 @@ if [ ! -d node_modules ]; then
 fi
 
 echo "== vitest (pure-JS helpers) =="
-npx vitest run
+npx vitest run tests/helpers.test.ts
 
 if [ "${1:-}" = "--unit" ]; then
   exit 0
@@ -58,6 +58,9 @@ fi
 # provoke either on demand is the fault-injection feature. Built without it
 # those tests do not skip — they fail, on a build that is working correctly.
 wasm-pack build --release --target web -- --features testing-faults
+
+echo "== vitest (on the built pkg/) =="
+npx vitest run tests/volumes.test.ts
 
 echo "== playwright (headless chromium, real wasm) =="
 # `--with-deps` needs root and is only wanted on a fresh CI image; locally the

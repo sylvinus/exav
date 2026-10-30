@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>A page, shown as its source</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="style.css">
+  <style>.note { font-style: italic; }</style>
+</head>
+<body>
+  <!-- HTML is shown as text: nothing in this file runs. CC0-1.0, exav project. -->
+  <header><h1>Harbour office</h1><nav><a href="#berths">Berths</a> <a href="#tides">Tides</a></nav></header>
+  <main>
+    <section id="berths">
+      <h2>Berths</h2>
+      <table>
+        <thead><tr><th scope="col">Berth</th><th scope="col">Length</th></tr></thead>
+        <tbody><tr><td>1</td><td>6.5&nbsp;m</td></tr><tr><td>2</td><td>8.2&nbsp;m</td></tr></tbody>
+      </table>
+      <p class="note">Lengths are over all, in metres.</p>
+    </section>
+    <form action="/search" method="get"><label>Boat <input name="q" type="search" required></label> <button>Search</button></form>
+  </main>
+  <script>
+    document.querySelectorAll("nav a").forEach((a) => a.addEventListener("click", () => console.log(a.hash)));
+  </script>
+</body>
+</html>

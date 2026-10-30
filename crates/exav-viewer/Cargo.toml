@@ -2,27 +2,36 @@
 # target directory), so values are explicit.
 [package]
 name = "exav-viewer"
-version = "0.0.2"
-edition = "2021"
+version = "0.0.3"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/sylvinus/exav"
-rust-version = "1.92"
+rust-version = "1.95"
 description = "The WebAssembly half of @exav/viewer: exav-render's image decoders, DWG/DXF engine and IFC/STL meshes for the browser."
 publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Five modules are built from this crate, one per feature, so that a page
+# Nine modules are built from this crate, one per feature, so that a page
 # downloads only the engine of what it opens (`scripts/build-wasm.sh`).
 [features]
 default = []
 # exav-render's image decoders, for the formats browsers do not draw.
-image = ["exav-render/image", "exav-render/webp", "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds", "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2"]
+image = ["exav-render/image", "exav-render/webp", "exav-render/ico", "exav-render/pnm", "exav-render/qoi", "exav-render/dds", "exav-render/ff", "exav-render/hdr", "exav-render/jp2", "exav-render/jbig2", "exav-render/jxl", "exav-render/raw"]
 # DWG and DXF, parsed and tessellated.
 dwg = ["exav-render/dwg"]
-# IFC and STL models, meshed.
-model = ["exav-render/ifc", "exav-render/stl"]
+# IFC, STL, OBJ, PLY and glTF models, meshed.
+model = ["exav-render/ifc", "exav-render/stl", "exav-render/obj", "exav-render/ply", "exav-render/gltf"]
+# Markdown, read into a tree of blocks and inlines.
+text = ["exav-render/markdown"]
+# XLS, ODS, FODS and Numbers, converted to XLSX for the spreadsheet engine.
+sheets = ["exav-render/office-sheets"]
+# PPT, ODP, FODP and Keynote, converted to PPTX for the presentation engine.
+slides = ["exav-render/office-slides"]
+# DOC, ODT, FODT and RTF, converted to DOCX for the document engine (opt-in:
+# `converter: "exav"`).
+docs = ["exav-render/office-docs"]
 # pdf.js's JPXDecode decoder, in place of OpenJPEG (openjpeg_nowasm_fallback.js).
 pdf-jpx = ["exav-render/jp2"]
 # pdf.js's JBIG2Decode and CCITTFaxDecode decoder, in place of PDFium's
@@ -30,8 +39,17 @@ pdf-jpx = ["exav-render/jp2"]
 pdf-jbig2 = ["exav-render/jbig2", "exav-render/ccitt"]
 
 [dependencies]
-exav-render = { path = "../exav-render", version = "0.0.2", default-features = false }
+exav-render = { path = "../exav-render", version = "0.0.3", default-features = false }
 wasm-bindgen = "=0.2.129"
+
+# zenjxl-decoder reads `std::time::Instant` for every frame, which panics on
+# this target: the copy here reads a clock that says zero there, and is the
+# published 0.3.10 in everything else (vendor/zenjxl-decoder/EXAV.md). Its
+# macros crate is copied without `proc-macro-error2`, which is unmaintained
+# (vendor/zenjxl-decoder-macros/EXAV.md).
+[patch.crates-io]
+zenjxl-decoder = { path = "vendor/zenjxl-decoder" }
+zenjxl-decoder-macros = { path = "vendor/zenjxl-decoder-macros" }
 
 # Size-optimised: this crate ships as `.wasm`.
 #

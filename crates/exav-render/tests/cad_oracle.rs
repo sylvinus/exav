@@ -53,6 +53,10 @@ const EXPLAINED: &[(&str, &str, &str)] = &[
     ("pre-2000 dictionaries.hard_owner", "", HARD_OWNER),
     ("dictionaries.hard_owner", "", HARD_OWNER),
     ("dim_styles.dim", "", DIMSTYLE_DEFAULTS),
+    ("entity:MULTILEADER.arrowhead_size", "", MLEADER_ARROW),
+    ("entity:", " (caret)", CARET),
+    ("pre-2000 dim_styles.dimadec", "", R14_DIMSTYLE),
+    ("pre-2000 dim_styles.dimdsep", "", R14_DIMSTYLE),
     ("entity:LEADER.hook", "", LEADER_DEFAULTS),
     ("entity:LEADER.text_", "", LEADER_DEFAULTS),
     ("pre-2000 entity:LEADER.hook", "", LEADER_DEFAULTS),
@@ -86,11 +90,9 @@ const FROZEN_341: &str = "a 2000 file lists a VIEWPORT's frozen layers in group 
 
 const R12_HANDLES: &str = "R12 table entries and blocks have no handle and R12 entities no \
      owner group: both readers number them, differently";
-const NO_LAYOUTS: &str =
-    "LAYOUT objects came with 2000: exav-render makes Model and Layout1 from the \
+const NO_LAYOUTS: &str = "LAYOUT objects came with 2000: exav-render makes Model and Layout1 from the \
      header's limits and extents, ezdxf from its own template (an A3 page setup)";
-const EZDXF_UPGRADE: &str =
-    "ezdxf upgrades a pre-2000 drawing to its 2000 structure on load, adding \
+const EZDXF_UPGRADE: &str = "ezdxf upgrades a pre-2000 drawing to its 2000 structure on load, adding \
      dictionaries, styles, plot styles, BYBLOCK/BYLAYER linetypes and arrow blocks";
 const EZDXF_MATERIAL: &str = "ezdxf adds the MATERIAL objects (2007) a drawing lacks, with their \
      dictionary, and points layers without group 347 at them";
@@ -98,15 +100,20 @@ const DEFPOINTS: &str = "ezdxf adds the Defpoints layer when missing and forces 
      (pre-2000 layers have no group 290)";
 const MVIEW: &str = "before 2000 a VIEWPORT keeps its view in ACAD extended data after 1000 MVIEW \
      (the AcDbViewport class has only 10, 40, 41, 68, 69); ezdxf leaves its defaults";
-const SCALABLE: &str =
-    "group 281 of BLOCK_RECORD is absent before 2007; exav-render reads absent as \
+const SCALABLE: &str = "group 281 of BLOCK_RECORD is absent before 2007; exav-render reads absent as \
      scalable, ezdxf as 0";
-const HARD_OWNER: &str =
-    "group 280 of DICTIONARY is absent; the reference gives no default, ezdxf \
+const HARD_OWNER: &str = "group 280 of DICTIONARY is absent; the reference gives no default, ezdxf \
      assumes 1 (its source says so: undocumented)";
 const DIMSTYLE_DEFAULTS: &str = "the converter omits DIMSTYLE groups equal to AutoCAD's imperial \
      defaults (DIMASZ 0.18, DIMTXT 0.18, DIMEXO 0.0625, DIMEXE 0.18, DIMGAP 0.09): the header's \
      values for the current style agree in 696 of 702 corpus records; ezdxf fills metric defaults";
+const CARET: &str = "ezdxf keeps DXF's caret notation as written (`^I`); the DXF reader decodes \
+     it to the control character it stands for (a tab), as the DWG holds it";
+const MLEADER_ARROW: &str = "group 42 absent: the converter leaves it out where the DWG holds 0 \
+     (0e74f0aa's multileaders, which the DWG oracle reads as 0 too), which the DXF reader gives; \
+     ezdxf assumes 4";
+const R14_DIMSTYLE: &str = "DIMADEC (179) and DIMDSEP (278) came with R2000: an R13 or R14 file \
+     has neither, the DXF reader gives AutoCAD's defaults (0, '.'), ezdxf its metric ones (2, ',')";
 const LEADER_DEFAULTS: &str = "LEADER groups 74, 75, 40 and 41 are absent; the reference gives no \
      default, ezdxf assumes 1";
 const STANDARD: &str = "group 7 absent: the reference's default is STANDARD, ezdxf's is Standard \
@@ -142,6 +149,27 @@ impl Diffs {
 
 fn close(a: f64, b: f64) -> bool {
     a == b || (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
+}
+
+/// DXF's caret notation decoded: `^I` a tab, `^J` a line feed..., `^ ` a
+/// caret.
+fn uncaret(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek().copied()) {
+            ('^', Some(' ')) => {
+                chars.next();
+                out.push('^');
+            }
+            ('^', Some(n @ '@'..='_')) => {
+                chars.next();
+                out.push(char::from(n as u8 - b'@'));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Compare two values; push one difference per differing leaf.
@@ -195,6 +223,9 @@ fn compare(a: &Value, b: &Value, path: &str, pattern: &str, found: &mut Vec<(Str
         // they can be explained on their own.
         (Value::String(x), Value::String(y)) if x.eq_ignore_ascii_case(y) => {
             found.push((format!("{pattern} (case)"), format!("{path}: {a} vs {b}")));
+        }
+        (Value::String(x), Value::String(y)) if *x == uncaret(y) => {
+            found.push((format!("{pattern} (caret)"), path.to_string()));
         }
         (Value::Null, Value::Array(y)) if *y == [1.0, 0.0, 0.0] => {
             found.push((

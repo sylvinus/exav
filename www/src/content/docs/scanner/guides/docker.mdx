@@ -81,13 +81,18 @@ docker exec exav /exav --ping                       # what this container serves
 exav --ping --connect clamd://scanner.internal:3310 # from anywhere
 ```
 
+Under the worker pool the scan listener answers a `PING` when a worker is free,
+which under heavy load can be after the check's timeout. To have the check
+answered whatever the workers are doing, add a health listener
+(`EXAV_LISTEN_HEALTH=clamd://127.0.0.1:3311`); `exav --ping` then probes it
+instead, and the command of the check does not change. See
+[the health listener](/scanner/reference/cli/#health-listener).
+
 `HEALTHCHECK` is a Docker extension of the image configuration, not part of the
-OCI spec. Docker honours it either way. Podman reads it only from an image
-published with Docker mediatypes, which the publish workflow checks for images
-published after 0.0.1; on older tags, or an image a registry re-exports as OCI,
-`podman image inspect` shows no health check. Kubernetes ignores it entirely.
-Where it matters, say it in the orchestrator's own configuration, with the same
-command:
+OCI spec. Docker honours it. Podman reads it only from an image published with
+Docker mediatypes, so an image a registry re-exports as OCI shows no health
+check in `podman image inspect`. Kubernetes ignores it. Where it matters, say it
+in the orchestrator's own configuration, with the same command:
 
 ```yaml
 # Compose

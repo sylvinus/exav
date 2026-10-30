@@ -32,9 +32,11 @@ a temporary file past 16 MiB), then gets the same scan as a file. See
 
 ### Scanning over HTTP
 
-The server must answer range requests. An object up to `--max-object-bytes` is
-read once, in full; a larger one is read in ranges as the scan needs them, some
-parts more than once (see
+The server must answer range requests, or the scan fails. An object up to
+`--max-object-bytes` is read once, in full; a larger one is read in ranges as
+the scan needs them, and costs about twice its size in transfer (see
+[HTTP sources](/scanner/concepts/streaming-memory/#http-sources) for the
+measurements and what is not checked, and
 [the block cache](/scanner/concepts/streaming-memory/#past-it-through-a-block-cache)).
 
 To pay in disk instead of transfer (metered egress, a slow link, per-request
@@ -64,8 +66,9 @@ A file that could not be fully examined ends with the reason, then the
 (The `huge.bin` line comes from a run with `--max-input-bytes 4G`; by default
 there is no input size limit.)
 
-`--quiet` suppresses the `OK` lines and the summary, never an error; `-v` adds
-detail.
+`--quiet` suppresses the `OK` lines and the summary, never an error. `-v` adds
+informational findings: the detected file type, and with
+`--detect exav-heuristics` the imphash, section entropy and static score.
 
 ### JSON output
 
@@ -94,12 +97,6 @@ exav --json /data | jq 'select(.status and .status != "OK")'     # everything no
 `signatures` and carries `"partial":true` and `partial_reasons` when the search
 stopped short.
 
-### Verbose findings
-
-`-v` / `--verbose` prints informational findings alongside the verdict: the
-detected file type, and with `--detect exav-heuristics` also the imphash, section
-entropy and the static score.
-
 ## All-match mode
 
 By default exav stops at the first matching signature per file. `--all-matches`
@@ -124,9 +121,8 @@ nested below it and lets files directly inside through. To anchor it, write
 
 ## Exit codes
 
-`0` `OK`, `1` `FOUND`, `2` `ERROR` (exav could not do its job), `3` `PARTIAL` (a
-file could not be fully examined). `3` is kept apart from `2` so that "the
-scanner broke" and "this file needs a decision" are different signals;
+`0` `OK`, `1` `FOUND`, `2` `ERROR`, `3` `PARTIAL`. `3` is kept apart from `2` so
+that "the scanner broke" and "this file needs a decision" are different signals;
 [`--partial-as`](/scanner/reference/cli/#what-an-unscannable-object-becomes) maps it to
 another status. See [which code a run exits with](/scanner/reference/verdicts/#process-exit-code).
 

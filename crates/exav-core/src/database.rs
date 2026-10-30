@@ -16,11 +16,11 @@ use std::path::Path;
 
 use crc32fast::Hasher as Crc32;
 
+use crate::Scanner;
 use crate::engine::SigEngine;
 use crate::fuzzy::FuzzyDb;
 use crate::hashes::{HashDb, SectionHashDb};
 use crate::ml::HeuristicModel;
-use crate::Scanner;
 
 /// 8-byte format tag for the `.exavdb` prebuilt database. The 6-char ASCII name
 /// plus two fixed bytes; the format *serial* lives in the separate [`VERSION`]
@@ -677,7 +677,7 @@ pub fn load(path: &Path) -> io::Result<Scanner> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{analyze, ScanOptions, Verdict};
+    use crate::{ScanOptions, Verdict, analyze};
 
     /// What the indexed encoder writes, rmp-serde reads back as the same
     /// value, every shape serde has; and no variant goes by its name.

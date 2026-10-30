@@ -41,7 +41,7 @@ pub(crate) fn walk<T>(
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use crate::stream::{emit_stream, whole, MemberMeta};
+    use crate::stream::{MemberMeta, emit_stream, whole};
     let hdr = src.window(0, 14);
     if !hdr.starts_with(SZDD_MAGIC) {
         return whole(Format::Szdd, src, budget, visit);

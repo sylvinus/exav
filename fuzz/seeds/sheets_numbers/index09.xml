@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<ls:document xmlns:ls="http://developer.apple.com/namespaces/ls" xmlns:sf="http://developer.apple.com/namespaces/sf" xmlns:sfa="http://developer.apple.com/namespaces/sfa" ls:version="92008102400">
+<ls:stylesheet sfa:ID="ss"><sf:styles>
+<sf:paragraphstyle sfa:ID="p" sf:ident="pb"><sf:property-map><sf:fontName><sf:string sfa:string="Cochin-Bold"/></sf:fontName><sf:fontSize><sf:number sfa:number="11"/></sf:fontSize><sf:bold><sf:number sfa:number="1"/></sf:bold><sf:alignment><sf:number sfa:number="2"/></sf:alignment></sf:property-map></sf:paragraphstyle>
+<sf:cell-style sfa:ID="c" sf:ident="cb"><sf:property-map><sf:fill><sf:color sfa:r="1" sfa:g="0" sfa:b="0" sfa:a="0.5"/></sf:fill><sf:SFTCellTextWrapProperty><sf:number sfa:number="0"/></sf:SFTCellTextWrapProperty><sf:SFTCellStylePropertyParagraphStyle><sf:paragraphstyle-ref sfa:IDREF="p"/></sf:SFTCellStylePropertyParagraphStyle></sf:property-map></sf:cell-style>
+<sf:cell-style sfa:ID="cur" sf:parent-ident="cb"><sf:property-map><sf:fill><sf:null/></sf:fill><sf:SFTCellStylePropertyFormatType><sf:number sfa:number="257"/></sf:SFTCellStylePropertyFormatType><sf:SFTCellStylePropertyNumberFormat><sf:number-format sf:format-type="1" sf:format-decimal-places="2" sf:format-currency-code="EUR" sf:format-negative-style="2" sf:format-show-thousands-separator="true" sf:format-use-accounting-style="true"/></sf:SFTCellStylePropertyNumberFormat><sf:SFTCellStylePropertyDateTimeFormat><sf:date-format sfa:ID="df" sf:fmt="EEEE, MMMM d, y"/></sf:SFTCellStylePropertyDateTimeFormat></sf:property-map></sf:cell-style>
+<sf:vector-style sfa:ID="v"><sf:property-map><sf:SFTStrokeProperty><sf:stroke sf:width="1"><sf:pattern sf:type="solid"/><sf:color sfa:w="0.8" sfa:a="1"/></sf:stroke></sf:SFTStrokeProperty></sf:property-map></sf:vector-style>
+<sf:tabular-style sfa:ID="ts"><sf:property-map><sf:SFTTableBandedRowsProperty><sf:number sfa:number="1"/></sf:SFTTableBandedRowsProperty><sf:SFTTableBandedCellFillProperty><sf:color sfa:r="0" sfa:g="0" sfa:b="1" sfa:a="0.25"/></sf:SFTTableBandedCellFillProperty><sf:SFTDefaultBodyVectorStyleProperty><sf:vector-style-ref sfa:IDREF="v"/></sf:SFTDefaultBodyVectorStyleProperty><sf:SFTDefaultHeaderRowCellStyleProperty><sf:cell-style-ref sfa:IDREF="c"/></sf:SFTDefaultHeaderRowCellStyleProperty></sf:property-map></sf:tabular-style>
+</sf:styles></ls:stylesheet>
+<ls:workspace-array><ls:workspace ls:workspace-name="Budget"><ls:page-info><sf:layers><sf:layer><sf:drawables>
+<sf:tabular-info><sf:tabular-model sf:name="T1" sf:id="0A0A" sf:num-header-rows="1" sf:num-header-columns="1" sf:num-footer-rows="1" sf:header-rows-frozen="true" sf:header-columns-frozen="true"><sf:tabular-style-ref sfa:IDREF="ts"/>
+<sf:grid sf:numcols="3" sf:numrows="5"><sf:columns><sf:grid-column sf:width="72"/><sf:grid-column sf:width="144"/><sf:grid-column sf:width="0"/></sf:columns><sf:rows><sf:grid-row sf:height="20"/><sf:grid-row sf:height="30"/></sf:rows>
+<sf:vertical-gridline-styles><sf:style-run sf:gridline-index="1"><sf:vector-style-ref sfa:IDREF="v" sf:start-index="0" sf:stop-index="5"/></sf:style-run></sf:vertical-gridline-styles>
+<sf:datasource>
+<sf:t sf:ct="0" sf:s="c" sf:col-span="2" sf:row-span="1"><sf:ct sfa:s="Head"/></sf:t><sf:s sf:ho="1"/><sf:g sf:s="c"/>
+<sf:n sf:ct="254" sf:s="cur" sf:v="-1.5"/><sf:d sf:s="cur" sf:cell-date="276048000"/><sf:cb sf:v="1"/>
+<sf:pm sf:ct="254"><sf:menu-choices><sf:t sfa:ID="ch1"><sf:ct sfa:s="Home"/></sf:t><sf:n sfa:ID="ch2" sf:v="7"/></sf:menu-choices><sf:proxied-cell-ref sfa:IDREF="ch2"/></sf:pm>
+<sf:n sf:v="1234.5"><sf:cf sf:implicit-format-type="256"><sf:number-format sf:format-type="0" sf:format-decimal-places="65534"/></sf:cf></sf:n>
+<sf:f sf:ct="511"><sf:fo sf:fs="=SUM(B)×2≠IFS($A$2,1)" sf:ht="0A0A" sf:hc="1024"/><sf:r><sf:rn sf:v="5"/></sf:r></sf:f>
+<sf:f><sf:fo sf:fs="=SFTGlobalID_0B0B :: A1:B$1&amp;&quot;x&quot;"/><sf:r><sf:rs><sf:ct sfa:s="kept"/></sf:rs></sf:r></sf:f>
+<sf:f><sf:fo sf:fs="=__CHART(A1)"/></sf:f>
+</sf:datasource></sf:grid></sf:tabular-model></sf:tabular-info>
+<sf:tabular-info><sf:tabular-model sf:name="T2" sf:id="0B0B"><sf:grid sf:numcols="2" sf:numrows="1"><sf:datasource><sf:n sf:v="1"/><sf:t><sf:ct sfa:s="b"/></sf:t></sf:datasource></sf:grid></sf:tabular-model></sf:tabular-info>
+</sf:drawables></sf:layer></sf:layers></ls:page-info></ls:workspace></ls:workspace-array>
+</ls:document>

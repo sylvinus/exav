@@ -242,34 +242,18 @@ impl<'a> Meta<'a> {
     }
 
     fn str_w(&self) -> usize {
-        if self.wide_str {
-            4
-        } else {
-            2
-        }
+        if self.wide_str { 4 } else { 2 }
     }
     fn guid_w(&self) -> usize {
-        if self.wide_guid {
-            4
-        } else {
-            2
-        }
+        if self.wide_guid { 4 } else { 2 }
     }
     fn blob_w(&self) -> usize {
-        if self.wide_blob {
-            4
-        } else {
-            2
-        }
+        if self.wide_blob { 4 } else { 2 }
     }
 
     /// A simple index into one table: two bytes unless that table is large.
     fn idx_w(&self, table: usize) -> usize {
-        if self.rows[table] >= 1 << 16 {
-            4
-        } else {
-            2
-        }
+        if self.rows[table] >= 1 << 16 { 4 } else { 2 }
     }
 
     /// A coded index packs a table tag into the low bits, so it widens once any

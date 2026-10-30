@@ -7,10 +7,10 @@ use std::collections::HashSet;
 
 use exav_unpack::dwg::{BitResult, Bits, Object, Version};
 
+use super::Ctx;
 use super::entities::{self, Followers};
 use super::header::Vars;
 use super::tables::{entries, entry_head, lineweight, typed};
-use super::Ctx;
 use crate::formats::cad::model::*;
 use crate::formats::cad::proxy;
 
@@ -35,6 +35,26 @@ struct Record {
 /// first, as DXF's BLOCK_RECORD table has them.
 pub(crate) fn read(ctx: &mut Ctx<'_, '_>, vars: &Vars) -> Vec<Block> {
     let mut handles = entries(ctx, vars.block_control, "the BLOCK control", 2);
+    if handles.is_empty() {
+        // A control that cannot be read (a writer that gets its bit size
+        // wrong) lists nothing: the records are the objects of that type.
+        let dwg = ctx.dwg;
+        handles = dwg
+            .object_map()
+            .iter()
+            .filter(|(_, at)| dwg.type_at(*at) == Ok(BLOCK_HEADER))
+            .map(|(h, _)| *h)
+            .collect();
+        if !handles.is_empty() {
+            ctx.warn(
+                WarningKind::Malformed,
+                format!(
+                    "the block records ({}) were found in the object map",
+                    handles.len()
+                ),
+            );
+        }
+    }
     // The control lists model and paper space last.
     for space in [vars.paper_space, vars.model_space] {
         if let Some(i) = handles.iter().position(|h| *h == space) {
@@ -74,12 +94,19 @@ pub(crate) fn read(ctx: &mut Ctx<'_, '_>, vars: &Vars) -> Vec<Block> {
                 }
             }
         }
-        ctx.names.insert(h, block.name.clone());
         if block.end_handle.0 != 0 {
             let _ = typed(ctx, block.end_handle.0, ENDBLK, "ENDBLK");
         }
-        records.push(rec);
+        records.push((h, rec));
     }
+    number_anonymous(&mut records);
+    let records: Vec<Record> = records
+        .into_iter()
+        .map(|(h, rec)| {
+            ctx.names.insert(h, rec.block.name.clone());
+            rec
+        })
+        .collect();
     let mut out = Vec::new();
     for rec in records {
         let mut block = rec.block;
@@ -110,6 +137,33 @@ pub(crate) fn read(ctx: &mut Ctx<'_, '_>, vars: &Vars) -> Vec<Block> {
         out.push(block);
     }
     out
+}
+
+/// AutoCAD's files can keep an anonymous block's name without its number in
+/// both its record and its BLOCK entity: several `*U` blocks, each named by
+/// its inserts, and found by that name. Each gets a number past the highest
+/// one the drawing has, as AutoCAD numbers them when it loads the file.
+fn number_anonymous(records: &mut [(u64, Record)]) {
+    let bare = |n: &str| matches!(n.as_bytes(), [b'*', c] if c.is_ascii_alphabetic());
+    let mut next = records
+        .iter()
+        .filter_map(|(_, r)| {
+            let n = &r.block.name;
+            let digits = n
+                .trim_start_matches('*')
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic());
+            (n.starts_with('*') && !digits.is_empty())
+                .then(|| digits.parse::<u64>().ok())
+                .flatten()
+        })
+        .max()
+        .unwrap_or(0);
+    for (_, r) in records.iter_mut() {
+        if bare(&r.block.name) {
+            next = next.saturating_add(1);
+            r.block.name = format!("{}{next}", r.block.name);
+        }
+    }
 }
 
 /// A layout's viewports have no number or status in DWG (spec 20.4.38),
@@ -555,6 +609,52 @@ fn common(ctx: &mut Ctx<'_, '_>, vars: &Vars, o: &Object<'_>, record: Handle) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inserts find their block by name, so two blocks named `*U` drew the
+    /// first one for both (AutoCAD's blocks_and_tables sample).
+    #[test]
+    fn bare_anonymous_names_are_numbered_past_the_highest() {
+        let mut records: Vec<(u64, Record)> = [
+            "*Model_Space",
+            "*Paper_Space0",
+            "*U2",
+            "*U",
+            "*U",
+            "*D",
+            "*B12",
+        ]
+        .iter()
+        .map(|n| {
+            let block = Block {
+                name: (*n).to_string(),
+                ..Block::default()
+            };
+            (
+                0,
+                Record {
+                    block,
+                    first: 0,
+                    last: 0,
+                    owned: Vec::new(),
+                },
+            )
+        })
+        .collect();
+        number_anonymous(&mut records);
+        let names: Vec<&str> = records.iter().map(|(_, r)| r.block.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "*Model_Space",
+                "*Paper_Space0",
+                "*U2",
+                "*U13",
+                "*U14",
+                "*D15",
+                "*B12"
+            ]
+        );
+    }
 
     #[test]
     fn the_spaces_have_their_names_whatever_the_release_wrote() {

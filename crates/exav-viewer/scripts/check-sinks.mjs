@@ -36,6 +36,12 @@ export const ALLOWED = [
     why: "the frame app's URL, from the host's own configuration",
   },
   {
+    file: "ts/office/external.ts",
+    rule: "import() of a variable",
+    code: "import(/* @vite-ignore */ /* webpackIgnore: true */ url)",
+    why: "the external converter's module: the URL the host set in its own options, or the path the asset manifest the copy step wrote names under the host's assetBase: never from the file",
+  },
+  {
     file: "ts/frame/app/main.ts",
     rule: "window.open",
     code: 'window.open = (url?: string | URL) => { if (url !== undefined) post({ type: "link", url: String(url) }); return null; }',
@@ -52,6 +58,12 @@ export const ALLOWED = [
     rule: "href from a variable",
     code: 'a.href = "url" in link ? link.url : "#"',
     why: "the same absolute http(s) address, shown on hover; a click is handled by the line above",
+  },
+  {
+    file: "ts/text/markdown-view.ts",
+    rule: "window.open",
+    code: 'window.open(url, "_blank", "noopener,noreferrer")',
+    why: "a Markdown link the user clicked: the reader keeps only absolute http, https and mailto targets without credentials, safeTarget checks the address again with the browser's URL reader, and the click handler is set for http and https alone; in the frame, a request to the host (linkTarget), which asks first",
   },
   {
     file: "ts/react/ViewerDialog.tsx",
@@ -76,6 +88,12 @@ export const ALLOWED = [
     rule: "src from a variable",
     code: "el.src = url",
     why: "the file's own URL or an object URL of its bytes, played as media",
+  },
+  {
+    file: "ts/core/print.ts",
+    rule: "src from a variable",
+    code: "img.src = url",
+    why: "an object URL of a PNG this page encoded from a page's picture, in a frame made to print it",
   },
 ];
 

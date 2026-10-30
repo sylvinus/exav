@@ -44,8 +44,7 @@ cargo install exav-unpack
 
 ## File viewer: `@exav/viewer`
 
-A file viewer for the browser: PDF, images, DWG and DXF drawings, Office
-documents, IFC and STL models, media and archives. Each file can open in a
+A file viewer for the browser: <!-- formats:viewer-summary -->PDF, images, DWG and DXF drawings, Word, Excel, PowerPoint and CSV, text (Markdown, JSON, XML, source code), IFC, STL, OBJ, PLY and glTF models, video, audio, and what is inside an archive<!-- /formats:viewer-summary -->. Each file can open in a
 sandboxed frame of its own, and exav's own decoders run in WebAssembly.
 
 ```sh
@@ -62,7 +61,7 @@ npm install @exav/viewer
 |---|---|
 | [`exav-grep`](crates/exav-grep/README.md) | `grep`, but it can see inside archives |
 | [`exav-core`](crates/exav-core/README.md) | The scanning engine, as a Rust library |
-| [`exav-render`](crates/exav-render/README.md) | The decoders behind the viewer: images, DWG, DXF, IFC, STL |
+| [`exav-render`](crates/exav-render/README.md) | The decoders behind the viewer: images, DWG, DXF, IFC, STL, OBJ, PLY, glTF, Office documents |
 | [`exav-imagehash`](crates/exav-imagehash/README.md) | Perceptual image hashes, ClamAV's `fuzzy_img` among them |
 | [`exav-pe-emu`](crates/exav-pe-emu/README.md) | A bounded x86-32 emulator that runs packer stubs to unpack them |
 | [`exav-x86`](crates/exav-x86/README.md) | A decode-only x86-32 instruction decoder |

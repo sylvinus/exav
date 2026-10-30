@@ -1,8 +1,9 @@
 import { writable } from "../core/store.js";
 import type { ArchiveController, ArchiveMember, Renderer, Session, ViewerFile } from "../core/types.js";
 import type { ArchiveOptions } from "./index.js";
-import { decompressedName, STREAM_MEMBER } from "./names.js";
+import { decompressedName, memberPath, STREAM_MEMBER } from "./names.js";
 import { isZip, openRanged, type RangedArchive } from "./ranged.js";
+import { volumesAround, type Volumes } from "./volumes.js";
 
 /**
  * What one archive may cost. The library enforces them: an archive is
@@ -30,7 +31,7 @@ export const renderer: Renderer<ArchiveOptions> = {
         // Directories are left out: the tree is in the names.
         return (await archive.list())
           .filter((m) => !m.name.endsWith("/"))
-          .map((m) => ({ index: m.index, name: m.name, uncompressedSize: m.uncompressedSize, encrypted: m.encrypted }));
+          .map((m) => ({ index: m.index, name: memberPath(m.name), uncompressedSize: m.uncompressedSize, encrypted: m.encrypted }));
       } catch (error) {
         // The archive and its worker are closed whatever went wrong.
         void archive.close();
@@ -45,7 +46,23 @@ export const renderer: Renderer<ArchiveOptions> = {
     const ranges = given && "ranges" in given ? given.ranges : null;
     let chosen: RangedArchive | null = null;
     let members: ArchiveMember[] = [];
-    if (ranges && isZip(await ranges.read(0, Math.min(4, ranges.size), ctx.signal))) {
+    // One part of a split archive is nothing on its own: with the other
+    // parts among the files around it, the set is the archive.
+    let volumes: Volumes = null;
+    if (ctx.file.tree) {
+      try {
+        volumes = await volumesAround(ctx.file.tree, ctx.signal);
+      } catch (error) {
+        if (ctx.signal.aborted) throw error;
+        console.warn("archive: the volumes of the set could not be read", error);
+      }
+      if (volumes?.kind === "incomplete") console.warn(`archive: ${ctx.file.name} is a part of a set that is not whole among the files around it`);
+    }
+    if (volumes?.kind === "joined") {
+      const { Archive } = await import("@exav/unpack-wasm");
+      chosen = await Archive.open(volumes.data, limits);
+      members = await list(chosen);
+    } else if (ranges && isZip(await ranges.read(0, Math.min(4, ranges.size), ctx.signal))) {
       try {
         chosen = await openRanged(ranges, limits, ctx.signal);
         members = await list(chosen);
@@ -92,7 +109,7 @@ export const renderer: Renderer<ArchiveOptions> = {
     const archive = chosen;
 
     const surface = document.createElement("div");
-    surface.className = "exv-archive-member";
+    surface.className = "exav-viewer-archive-member";
     host.append(surface);
 
     const state = writable<State>({ members, opening: null, opened: null, refused: null });
@@ -133,6 +150,19 @@ export const renderer: Renderer<ArchiveOptions> = {
             path: member.name,
             format,
             source: { bytes: entry.bytes },
+            // The other members are the files around it: a drawing finds
+            // the ones it refers to among them, extracted when asked for.
+            tree: {
+              path: member.name,
+              paths: members.map((m) => m.name),
+              async open(path) {
+                const other = members.find((m) => m.name === path);
+                if (!other) throw new Error(`no ${path} in the archive`);
+                const extracted = await archive.extract(other.index);
+                if (extracted.unsupported) throw new Error(`${path}: ${extracted.unsupported}`);
+                return { bytes: extracted.bytes };
+              },
+            },
           };
           const session = ctx.mountNested(surface, file);
           nested = session;

@@ -9,7 +9,7 @@
 //! not use, and the sample still scanned clean; asserting on the walk the
 //! scanner takes is what catches that.
 
-use exav_unpack::{extract, walk, Budget, Entry, Format, Limits, Member, MemberMeta};
+use exav_unpack::{Budget, Entry, Format, Limits, Member, MemberMeta, extract, walk};
 
 /// Bitwise CRC-32 (IEEE), so the fixtures carry real checksums without pulling a
 /// dependency into the test.

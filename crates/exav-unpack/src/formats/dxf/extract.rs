@@ -121,10 +121,10 @@ pub(crate) fn extract_dxf<R>(
         } else {
             whole_file_extension(&chunks).map(|ext| (format!("{label}.{ext}"), chunks))
         };
-        if let Some((name, bytes)) = out {
-            if let Some(r) = emit(name, bytes, budget, visit)? {
-                return Ok(Some(r));
-            }
+        if let Some((name, bytes)) = out
+            && let Some(r) = emit(name, bytes, budget, visit)?
+        {
+            return Ok(Some(r));
         }
     }
     // A pair that is not one leaves the rest of the file undecoded: whatever

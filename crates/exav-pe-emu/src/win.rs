@@ -28,7 +28,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::cpu::{Cpu, Stop, EAX, ESP};
+use crate::cpu::{Cpu, EAX, ESP, Stop};
 use crate::mem::{Mem, PAGE_SIZE};
 
 /// How far below the initial stack the emulator will keep mapping pages on
@@ -60,15 +60,35 @@ const ENV_BASE: u32 = 0x0009_0000;
 const HEAP_BASE: u32 = 0x0100_0000;
 const HEAP_LIMIT: u32 = 0x6000_0000;
 
-/// Address space each synthetic DLL occupies. The first 0x4000 bytes hold the
-/// headers and export directory; the rest is the trap range its exports point
-/// into.
-const MODULE_SIZE: u32 = 0x0001_0000;
-const TRAP_OFFSET: u32 = 0x4000;
+/// Address space each synthetic DLL occupies. The headers and export directory
+/// live below `TRAP_OFFSET`; the trap range its exports point into runs from
+/// there. The region is large because a synthetic DLL advertises the real one's
+/// documented export names (over a thousand for `kernel32`), so a stub that
+/// resolves imports by hashing export names finds what it looks for.
+const MODULE_SIZE: u32 = 0x0004_0000;
+const TRAP_OFFSET: u32 = 0x0001_8000;
 const TRAP_STRIDE: u32 = 0x10;
-/// Offset within `kernel32` that the emulator's two return sentinels sit at:
-/// past the trap range, still inside the module image.
-const RETURN_OFFSET: u32 = 0xc000;
+/// Offset within `kernel32` that the emulator's return sentinels sit at: past
+/// the trap range, still inside the module image.
+const RETURN_OFFSET: u32 = 0x0003_f000;
+
+/// Largest export directory, in bytes, a synthetic module may build below its
+/// trap range. Bounds the per-module name set so the directory cannot grow into
+/// the traps.
+const MAX_EXPORT_DIR: u32 = TRAP_OFFSET - 0x1000;
+
+/// The documented export-name set each synthetic system DLL advertises, beyond
+/// the handful the emulator implements. Names only, extracted from Microsoft's
+/// API documentation by `scripts/gen-exports.py` (provenance and licence in
+/// this crate's NOTICE). Undocumented exports are not in it. A name here with
+/// no implementation resolves to a trap that reports itself and returns
+/// failure, never to undefined behaviour.
+const EXTRA_EXPORTS: &[(&str, &str)] = &[
+    ("kernel32.dll", include_str!("exports/kernel32.txt")),
+    ("ntdll.dll", include_str!("exports/ntdll.txt")),
+    ("user32.dll", include_str!("exports/user32.txt")),
+    ("advapi32.dll", include_str!("exports/advapi32.txt")),
+];
 
 /// Handle values with fixed meanings on Windows.
 const INVALID_HANDLE: u32 = 0xffff_ffff;
@@ -162,6 +182,9 @@ enum Api {
     WriteFile,
     SetFilePointer,
     GetFileSize,
+    GetFileAttributesEx {
+        wide: bool,
+    },
     CreateFileMapping,
     MapViewOfFile,
     GetStdHandle,
@@ -484,6 +507,16 @@ const APIS: &[ApiSpec] = &[
     k("CreateDirectoryW", 2, Api::Const(0)),
     k("GetFileAttributesA", 1, Api::Const(0xffff_ffff)),
     k("GetFileAttributesW", 1, Api::Const(0xffff_ffff)),
+    k(
+        "GetFileAttributesExA",
+        3,
+        Api::GetFileAttributesEx { wide: false },
+    ),
+    k(
+        "GetFileAttributesExW",
+        3,
+        Api::GetFileAttributesEx { wide: true },
+    ),
     k("SetFileAttributesA", 2, Api::Const(0)),
     k("CopyFileA", 3, Api::Const(0)),
     k("MoveFileA", 2, Api::Const(0)),
@@ -846,6 +879,45 @@ impl<'a> Env<'a> {
         self.kernel32_base() + RETURN_OFFSET + 0x10
     }
 
+    /// Return address a TLS callback returns to, so the driver runs the next
+    /// one. A distinct sentinel from `process_return` because a callback
+    /// returning is not the stub returning to the loader.
+    pub fn tls_return(&self) -> u32 {
+        self.kernel32_base() + RETURN_OFFSET + 0x20
+    }
+
+    /// Set up the static TLS block the way the loader does before a TLS
+    /// callback runs: a copy of the module's TLS template (raw data plus zero
+    /// fill), the TEB's `ThreadLocalStoragePointer` pointing at a one-slot array
+    /// that holds it, and the assigned index written to `*index_va`.
+    ///
+    /// Returns the block's base, or `None` when the allocation does not fit.
+    pub fn install_static_tls(
+        &mut self,
+        mem: &mut Mem,
+        template: &[u8],
+        index: u32,
+        index_va: u32,
+    ) -> Result<Option<u32>, Stop> {
+        let block = self.alloc(mem, 0, (template.len() as u32).max(1));
+        if block == 0 {
+            return Ok(None);
+        }
+        mem.write_bytes(block, template).map_err(Stop::Fault)?;
+        let array = self.alloc(mem, 0, (index + 1) * 4);
+        if array == 0 {
+            return Ok(None);
+        }
+        mem.write_u32(array + index * 4, block)
+            .map_err(Stop::Fault)?;
+        // TEB.ThreadLocalStoragePointer is at offset 0x2C on x86 [pe][dbg].
+        mem.write_u32(TEB_BASE + 0x2c, array).map_err(Stop::Fault)?;
+        if index_va != 0 {
+            mem.write_u32(index_va, index).map_err(Stop::Fault)?;
+        }
+        Ok(Some(block))
+    }
+
     fn kernel32_base(&self) -> u32 {
         self.find_module_by_name("kernel32.dll")
             .map(|m| m.base)
@@ -861,18 +933,67 @@ impl<'a> Env<'a> {
         self.modules.iter().find(|m| m.name == want)
     }
 
-    /// Create a synthetic DLL: PE headers, an export directory naming every API
-    /// the emulator implements for it, and one trap address per export.
+    /// The sorted export set a synthetic module advertises: every API the
+    /// emulator implements for it, plus the real DLL's other documented export
+    /// names, bounded so the directory stays below the trap range.
+    ///
+    /// The list is sorted by name, because Windows keeps the export name table
+    /// sorted and hand-written resolvers binary-search it. Implemented exports
+    /// are never dropped by the size bound; only extra names are.
+    fn module_exports(&self, name: &str) -> Vec<(&'static str, Option<Api>, u8)> {
+        let mut implemented: Vec<(&'static str, Option<Api>, u8)> = APIS
+            .iter()
+            .filter(|s| s.module == name)
+            .map(|s| (s.name, Some(s.api), s.argc))
+            .collect();
+
+        // Running size of the export directory below RVA 0x1000: the three
+        // parallel arrays (10 bytes an entry) plus the name strings, plus the
+        // module's own name string. Kept under `MAX_EXPORT_DIR`.
+        let mut used = 40u32 + export_dir_name(name).len() as u32 + 1;
+        let entry_cost = |s: &str| 10 + s.len() as u32 + 1;
+        for (ename, ..) in &implemented {
+            used += entry_cost(ename);
+        }
+
+        if let Some((_, list)) = EXTRA_EXPORTS.iter().find(|(m, _)| *m == name) {
+            let known: std::collections::HashSet<&str> =
+                implemented.iter().map(|(n, ..)| *n).collect();
+            for ename in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if known.contains(ename) {
+                    continue;
+                }
+                let cost = entry_cost(ename);
+                if used + cost > MAX_EXPORT_DIR {
+                    break;
+                }
+                used += cost;
+                // A name this module exports but the emulator implements under
+                // another module (a forwarder) resolves to that implementation,
+                // as `export_addr` does by name across modules. Only a name no
+                // module implements becomes an unimplemented trap.
+                let spec = APIS.iter().find(|s| s.name == ename);
+                implemented.push((
+                    ename,
+                    spec.map(|s| s.api),
+                    spec.map(|s| s.argc).unwrap_or(0),
+                ));
+            }
+        }
+        implemented.sort_by(|a, b| a.0.cmp(b.0));
+        implemented
+    }
+
+    /// Create a synthetic DLL: PE headers and an export directory. The directory
+    /// names every API the emulator implements for the module *and* the real
+    /// DLL's other documented exports (names only), so a stub that resolves imports by
+    /// hashing export names finds what it looks for. Each export points at a
+    /// trap; an unimplemented one's trap reports itself and returns failure when
+    /// called, never undefined behaviour.
     fn create_module(&mut self, mem: &mut Mem, name: &str, base: u32) -> Result<(), Stop> {
         map(mem, base, MODULE_SIZE)?;
         let name = normalize_module(name);
-        let exports: Vec<&ApiSpec> = {
-            let mut v: Vec<&ApiSpec> = APIS.iter().filter(|s| s.module == name).collect();
-            // Windows keeps the export name table sorted, and hand-written
-            // resolvers binary-search it.
-            v.sort_by_key(|s| s.name);
-            v
-        };
+        let exports = self.module_exports(&name);
 
         let mut trap = base + TRAP_OFFSET;
         // Export directory at RVA 0x1000, arrays and strings after it.
@@ -887,11 +1008,7 @@ impl<'a> Env<'a> {
         ed.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
         ed.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
         ed.extend_from_slice(&0u32.to_le_bytes()); // Major/Minor version
-        ed.extend_from_slice(&strings_rva.to_le_bytes()); // Name (points at the
-                                                          // first string, which
-                                                          // is close enough for
-                                                          // a resolver that
-                                                          // only reads exports)
+        ed.extend_from_slice(&0u32.to_le_bytes()); // Name, patched below
         ed.extend_from_slice(&1u32.to_le_bytes()); // Base ordinal
         ed.extend_from_slice(&n.to_le_bytes()); // NumberOfFunctions
         ed.extend_from_slice(&n.to_le_bytes()); // NumberOfNames
@@ -901,7 +1018,7 @@ impl<'a> Env<'a> {
         mem.write_bytes(base + ed_rva, &ed).map_err(Stop::Fault)?;
 
         let mut str_rva = strings_rva;
-        for (i, spec) in exports.iter().enumerate() {
+        for (i, (ename, api, argc)) in exports.iter().enumerate() {
             let i = i as u32;
             mem.write_u32(base + funcs_rva + i * 4, trap - base)
                 .map_err(Stop::Fault)?;
@@ -909,19 +1026,27 @@ impl<'a> Env<'a> {
                 .map_err(Stop::Fault)?;
             mem.write_u16(base + ords_rva + i * 2, i as u16)
                 .map_err(Stop::Fault)?;
-            write_c_str(mem, base + str_rva, spec.name)?;
-            str_rva += spec.name.len() as u32 + 1;
+            write_c_str(mem, base + str_rva, ename)?;
+            str_rva += ename.len() as u32 + 1;
             self.traps.insert(
                 trap,
                 Trap {
-                    api: Some(spec.api),
-                    argc: spec.argc,
+                    api: *api,
+                    argc: *argc,
                     module: name.clone(),
-                    name: spec.name.to_string(),
+                    name: ename.to_string(),
                 },
             );
             trap += TRAP_STRIDE;
         }
+        // The DLL's own name, spelled as the real export directory spells it.
+        // tElock reads it to check that the module it found is `KERNEL32` and
+        // spins forever when it is not.
+        let export_name = export_dir_name(&name);
+        write_c_str(mem, base + str_rva, &export_name)?;
+        mem.write_u32(base + ed_rva + 12, str_rva)
+            .map_err(Stop::Fault)?;
+        str_rva += export_name.len() as u32 + 1;
 
         write_module_headers(mem, base, MODULE_SIZE, ed_rva, str_rva - ed_rva)?;
         self.modules.push(Module {
@@ -933,23 +1058,34 @@ impl<'a> Env<'a> {
         Ok(())
     }
 
+    // Where each layout fact below comes from (pinned sources in the NOTICE):
+    //   [pe]  Microsoft PE Format specification, "The .tls Section".
+    //   [dbg] Microsoft debugger documentation: `dt` output on 32-bit Windows.
+    //   [wtl] Microsoft winternl.h reference; x86 offsets follow from the
+    //         documented member types.
+    //   [kus] Microsoft WDK reference for KUSER_SHARED_DATA, which gives the
+    //         field order but not every type, so not the offsets.
+    //   [obs] Not given by those sources. Each is observable on 32-bit Windows
+    //         by comparing the field with the API that reports the same value
+    //         (listed in the NOTICE); kept on that basis.
+
     /// Fill `KUSER_SHARED_DATA` with the handful of fields a stub reads: the
     /// interrupt/tick counters (used for timing checks) and the OS version.
     fn build_shared_user_data(&self, mem: &mut Mem) -> Result<(), Stop> {
         map(mem, SHARED_USER_DATA, PAGE_SIZE as u32)?;
         mem.write_u32(SHARED_USER_DATA, 0x0010_0000)
-            .map_err(Stop::Fault)?; // TickCountLow
+            .map_err(Stop::Fault)?; // TickCountLowDeprecated [kus][obs]
         mem.write_u32(SHARED_USER_DATA + 0x04, 0x000f_a000)
-            .map_err(Stop::Fault)?; // TickCountMultiplier
+            .map_err(Stop::Fault)?; // TickCountMultiplier [kus][obs]
         mem.write_u32(SHARED_USER_DATA + 0x08, 0x0010_0000)
-            .map_err(Stop::Fault)?; // InterruptTime.LowPart
+            .map_err(Stop::Fault)?; // InterruptTime, low part [kus][obs]
         mem.write_u32(SHARED_USER_DATA + 0x14, 0x1000_0000)
-            .map_err(Stop::Fault)?; // SystemTime.LowPart
-        write_utf16(mem, SHARED_USER_DATA + 0x30, "C:\\WINDOWS")?; // NtSystemRoot
+            .map_err(Stop::Fault)?; // SystemTime, low part [kus][obs]
+        write_utf16(mem, SHARED_USER_DATA + 0x30, "C:\\WINDOWS")?; // NtSystemRoot [kus][obs]
         mem.write_u32(SHARED_USER_DATA + 0x26c, 5)
-            .map_err(Stop::Fault)?; // NtMajorVersion
+            .map_err(Stop::Fault)?; // NtMajorVersion [kus][obs]
         mem.write_u32(SHARED_USER_DATA + 0x270, 1)
-            .map_err(Stop::Fault)?; // NtMinorVersion
+            .map_err(Stop::Fault)?; // NtMinorVersion [kus][obs]
         Ok(())
     }
 
@@ -963,35 +1099,36 @@ impl<'a> Env<'a> {
         map(mem, TEB_BASE, PAGE_SIZE as u32)?;
         map(mem, PEB_BASE, PAGE_SIZE as u32)?;
 
-        // TEB.
-        mem.write_u32(TEB_BASE, 0xffff_ffff).map_err(Stop::Fault)?; // ExceptionList: chain end
+        // TEB. NtTib (an NT_TIB) is at 0x00 [dbg]; its members' order is
+        // consistent with the [dbg] `dd` example, and is [obs].
+        mem.write_u32(TEB_BASE, 0xffff_ffff).map_err(Stop::Fault)?; // NtTib.ExceptionList: chain end [obs]
         mem.write_u32(TEB_BASE + 0x04, STACK_TOP)
-            .map_err(Stop::Fault)?; // StackBase
+            .map_err(Stop::Fault)?; // NtTib.StackBase [obs]
         mem.write_u32(TEB_BASE + 0x08, STACK_BASE)
-            .map_err(Stop::Fault)?; // StackLimit
+            .map_err(Stop::Fault)?; // NtTib.StackLimit [obs]
         mem.write_u32(TEB_BASE + 0x18, TEB_BASE)
-            .map_err(Stop::Fault)?; // Self
+            .map_err(Stop::Fault)?; // NtTib.Self [obs]
         mem.write_u32(TEB_BASE + 0x20, 0x0000_0abc)
-            .map_err(Stop::Fault)?; // ProcessId
+            .map_err(Stop::Fault)?; // ClientId.UniqueProcess: ClientId at 0x20 [dbg], member order [obs]
         mem.write_u32(TEB_BASE + 0x24, 0x0000_0def)
-            .map_err(Stop::Fault)?; // ThreadId
+            .map_err(Stop::Fault)?; // ClientId.UniqueThread [obs]
         mem.write_u32(TEB_BASE + 0x30, PEB_BASE)
-            .map_err(Stop::Fault)?; // PEB
+            .map_err(Stop::Fault)?; // ProcessEnvironmentBlock [dbg]
 
         // PEB. `BeingDebugged` and `NtGlobalFlag` are the two fields anti-debug
         // stubs read directly, and both say "no debugger".
         mem.write_u32(PEB_BASE + 0x08, image_base)
-            .map_err(Stop::Fault)?; // ImageBaseAddress
+            .map_err(Stop::Fault)?; // ImageBaseAddress [obs]
         mem.write_u32(PEB_BASE + 0x0c, LDR_BASE)
-            .map_err(Stop::Fault)?; // Ldr
+            .map_err(Stop::Fault)?; // Ldr [dbg]
         mem.write_u32(PEB_BASE + 0x18, PROCESS_HEAP)
-            .map_err(Stop::Fault)?; // ProcessHeap
-        mem.write_u32(PEB_BASE + 0x64, 1).map_err(Stop::Fault)?; // NumberOfProcessors
-        mem.write_u32(PEB_BASE + 0x68, 0).map_err(Stop::Fault)?; // NtGlobalFlag
-        mem.write_u32(PEB_BASE + 0xa4, 5).map_err(Stop::Fault)?; // OSMajorVersion
-        mem.write_u32(PEB_BASE + 0xa8, 1).map_err(Stop::Fault)?; // OSMinorVersion
-        mem.write_u32(PEB_BASE + 0xac, 2600).map_err(Stop::Fault)?; // OSBuildNumber
-        mem.write_u32(PEB_BASE + 0xb0, 2).map_err(Stop::Fault)?; // PlatformId
+            .map_err(Stop::Fault)?; // ProcessHeap [obs]
+        mem.write_u32(PEB_BASE + 0x64, 1).map_err(Stop::Fault)?; // NumberOfProcessors [obs]
+        mem.write_u32(PEB_BASE + 0x68, 0).map_err(Stop::Fault)?; // NtGlobalFlag [obs]
+        mem.write_u32(PEB_BASE + 0xa4, 5).map_err(Stop::Fault)?; // OSMajorVersion [obs]
+        mem.write_u32(PEB_BASE + 0xa8, 1).map_err(Stop::Fault)?; // OSMinorVersion [obs]
+        mem.write_u32(PEB_BASE + 0xac, 2600).map_err(Stop::Fault)?; // OSBuildNumber [obs]
+        mem.write_u32(PEB_BASE + 0xb0, 2).map_err(Stop::Fault)?; // OSPlatformId [obs]
 
         // PEB_LDR_DATA followed by one LDR_DATA_TABLE_ENTRY per module. The
         // executable itself comes first in load and memory order, but not in
@@ -1027,8 +1164,10 @@ impl<'a> Env<'a> {
         let mem_head = ldr + 0x14;
         let init_head = ldr + 0x1c;
 
-        mem.write_u32(ldr, 0x28).map_err(Stop::Fault)?; // Length
-        mem.write_u32(ldr + 4, 1).map_err(Stop::Fault)?; // Initialized
+        // PEB_LDR_DATA: Length (0x28), Initialized, and the three list heads at
+        // 0x0c / 0x14 / 0x1c [dbg].
+        mem.write_u32(ldr, 0x28).map_err(Stop::Fault)?; // Length [dbg]
+        mem.write_u32(ldr + 4, 1).map_err(Stop::Fault)?; // Initialized [dbg]
 
         let init_idx: Vec<usize> = (0..list.len()).filter(|&i| list[i].in_init).collect();
         let all_idx: Vec<usize> = (0..list.len()).collect();
@@ -1053,17 +1192,23 @@ impl<'a> Env<'a> {
             mem.write_u32(head + 4, last).map_err(Stop::Fault)?;
             Ok(())
         };
+        // LDR_DATA_TABLE_ENTRY links. InMemoryOrderLinks at 0x08 [wtl]. The
+        // load-order links at 0x00 follow from the [dbg] example, where the two
+        // lists' heads point 8 bytes apart into the same entry. The
+        // initialisation-order links fill the documented reserved slot at 0x10
+        // [wtl], their meaning [obs].
         link(mem, load_head, 0x00, &all_idx)?;
         link(mem, mem_head, 0x08, &all_idx)?;
         link(mem, init_head, 0x10, &init_idx)?;
 
         for (i, l) in list.iter().enumerate() {
             let e = addr_of(i);
-            mem.write_u32(e + 0x18, l.base).map_err(Stop::Fault)?; // DllBase
-            mem.write_u32(e + 0x1c, l.base).map_err(Stop::Fault)?; // EntryPoint
-            mem.write_u32(e + 0x20, l.size).map_err(Stop::Fault)?; // SizeOfImage
-                                                                   // FullDllName / BaseDllName as UNICODE_STRINGs pointing into the
-                                                                   // string area after the entries.
+            mem.write_u32(e + 0x18, l.base).map_err(Stop::Fault)?; // DllBase [wtl]
+            mem.write_u32(e + 0x1c, l.base).map_err(Stop::Fault)?; // EntryPoint: reserved slot [wtl], meaning [obs]
+            mem.write_u32(e + 0x20, l.size).map_err(Stop::Fault)?; // SizeOfImage: reserved slot [wtl], meaning [obs]
+            // FullDllName at 0x24 [wtl] and BaseDllName at 0x2c (reserved slot
+            // [wtl], meaning [obs]), as UNICODE_STRINGs into the string area
+            // after the entries.
             let str_addr = entry0 + list.len() as u32 * ENTRY_SIZE + i as u32 * 0x80;
             let wide: Vec<u8> = l
                 .name
@@ -1518,6 +1663,28 @@ impl<'a> Env<'a> {
                 }
                 self.file.len() as u32
             }
+            Api::GetFileAttributesEx { wide } => {
+                // The program's own file exists and reports a size; every other
+                // path is absent, as with `CreateFile`. A stub that stats itself
+                // before unpacking (Alienyze does) needs the success answer, not
+                // the "file not found" that stops it.
+                let p = arg(cpu, mem, 0)?;
+                let path = read_str(mem, p, wide)?;
+                let out = arg(cpu, mem, 2)?;
+                if self.is_own_path(&path) && out != 0 {
+                    // WIN32_FILE_ATTRIBUTE_DATA: attributes, three FILETIMEs,
+                    // then the 64-bit size. Only the attributes and size carry
+                    // information a stub acts on.
+                    let mut data = [0u8; 0x24];
+                    data[0..4].copy_from_slice(&0x80u32.to_le_bytes()); // FILE_ATTRIBUTE_NORMAL
+                    data[0x20..0x24].copy_from_slice(&(self.file.len() as u32).to_le_bytes());
+                    mem.write_bytes(out, &data).map_err(Stop::Fault)?;
+                    1
+                } else {
+                    self.last_error = 2; // ERROR_FILE_NOT_FOUND
+                    0
+                }
+            }
             Api::CreateFileMapping => {
                 let h = arg(cpu, mem, 0)?;
                 if self.open_files.contains_key(&h) {
@@ -1930,6 +2097,18 @@ fn normalize_module(name: &str) -> String {
     }
 }
 
+/// The name a DLL's export directory gives itself: `KERNEL32.dll`, `ntdll.dll`.
+/// Most system DLLs spell the stem in capitals; `ntdll` and `msvcrt` do not.
+fn export_dir_name(normalized: &str) -> String {
+    if matches!(normalized, "ntdll.dll" | "msvcrt.dll") {
+        return normalized.to_string();
+    }
+    match normalized.rsplit_once('.') {
+        Some((stem, ext)) => format!("{}.{ext}", stem.to_ascii_uppercase()),
+        None => normalized.to_ascii_uppercase(),
+    }
+}
+
 fn write_utf16(mem: &mut Mem, addr: u32, s: &str) -> Result<(), Stop> {
     let b: Vec<u8> = s
         .encode_utf16()
@@ -2090,6 +2269,23 @@ mod tests {
             _env.is_trap(addr),
             "the exported address is a trap the driver will service"
         );
+    }
+
+    #[test]
+    fn a_synthetic_dll_names_itself_as_the_real_one_does() {
+        // The export directory's Name field is `KERNEL32.dll`, not the lower-
+        // case internal name. A stub that walks the loader list and checks the
+        // export name (tElock does, and spins when it does not match) has to see
+        // what a real module shows.
+        let (mut mem, _env) = env();
+        for (base, want) in [(0x7c80_0000u32, "KERNEL32.dll"), (0x7c90_0000, "ntdll.dll")] {
+            let e_lfanew = mem.read_u32(base + 0x3c).unwrap();
+            let dd = base + e_lfanew + 24 + 96;
+            let ed = base + mem.read_u32(dd).unwrap();
+            let name_va = base + mem.read_u32(ed + 12).unwrap();
+            let name = read_str(&mut mem, name_va, false).unwrap();
+            assert_eq!(name, want);
+        }
     }
 
     /// A block copy reports the volume it moved, so the driver can charge for it.
@@ -2262,6 +2458,85 @@ mod tests {
         env.call(&mut cpu, &mut mem).unwrap();
         assert!(cpu.regs[EAX] != 0);
         assert!(env.is_trap(cpu.regs[EAX]));
+    }
+
+    #[test]
+    fn the_export_directory_advertises_the_real_dll_names_not_just_implemented() {
+        // A stub that resolves imports by hashing export names walks the name
+        // table itself. The synthetic kernel32 therefore advertises the real
+        // DLL's exports, not only the handful the emulator implements, so such a
+        // walk finds its function. Alienyze fails exactly this way otherwise.
+        let (mut mem, mut env) = env();
+        let base = 0x7c80_0000u32;
+        let e_lfanew = mem.read_u32(base + 0x3c).unwrap();
+        let ed = base + mem.read_u32(base + e_lfanew + 24 + 96).unwrap();
+        let n_names = mem.read_u32(ed + 24).unwrap();
+        let names = base + mem.read_u32(ed + 32).unwrap();
+        let funcs = base + mem.read_u32(ed + 28).unwrap();
+        // `GetVolumeInformationA` is a real kernel32 export the emulator does not
+        // implement. It must still be in the directory, and resolve to a trap.
+        let mut found = None;
+        for i in 0..n_names {
+            let p = base + mem.read_u32(names + i * 4).unwrap();
+            if read_str(&mut mem, p, false).unwrap() == "GetVolumeInformationA" {
+                found = Some(base + mem.read_u32(funcs + i * 4).unwrap());
+            }
+        }
+        let addr = found.expect("an unimplemented real export is still advertised");
+        assert!(
+            env.is_trap(addr),
+            "it resolves to a trap the driver services"
+        );
+
+        // Calling it is safe and observable: it returns failure and is recorded,
+        // never undefined behaviour.
+        let mut cpu = Cpu::new();
+        cpu.regs[ESP] = INITIAL_ESP;
+        cpu.push32(&mut mem, 0xdead_0000).unwrap(); // return address
+        cpu.eip = addr;
+        let effect = env.call(&mut cpu, &mut mem).unwrap();
+        assert_eq!(effect, ApiEffect::Unimplemented);
+        assert_eq!(cpu.regs[EAX], 0);
+        assert!(
+            env.missing_apis
+                .iter()
+                .any(|m| m.ends_with("GetVolumeInformationA"))
+        );
+    }
+
+    #[test]
+    fn get_file_attributes_ex_reports_the_program_exists_with_its_size() {
+        // The program's own file exists and reports its size; a stub that stats
+        // itself before unpacking (Alienyze does) needs the success answer, not
+        // the "not found" that stops it. Every other path is absent.
+        let mut mem = Mem::new(4096);
+        mem.map(0x0040_0000, 0x1000).unwrap();
+        let file: &[u8] = &vec![0u8; 0x1234];
+        let mut env = Env::new(&mut mem, 0x0040_0000, 0x1_0000, file).unwrap();
+
+        let name = 0x0050_0000u32;
+        let out = 0x0051_0000u32;
+        mem.map(name, 0x1000).unwrap();
+        mem.map(out, 0x1000).unwrap();
+        mem.write_bytes(name, b"C:\\sample.exe\0").unwrap();
+        // GetFileAttributesExA(lpFileName, GetFileExInfoStandard, out).
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "GetFileAttributesExA", &[name, 0, out]),
+            1
+        );
+        assert_eq!(mem.read_u32(out).unwrap(), 0x80, "FILE_ATTRIBUTE_NORMAL");
+        assert_eq!(
+            mem.read_u32(out + 0x20).unwrap(),
+            0x1234,
+            "nFileSizeLow is the file length"
+        );
+
+        mem.write_bytes(name, b"C:\\other.exe\0").unwrap();
+        assert_eq!(
+            call_k32(&mut env, &mut mem, "GetFileAttributesExA", &[name, 0, out]),
+            0,
+            "a path that is not the program does not exist"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 name = "exav-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -25,8 +25,9 @@ exav-fuzz-support = { path = "support" }
 # `decrypt` is enabled so the decryption code paths (ZipCrypto/WinZip-AES, 7z
 # AES, PDF/DMG crypto) are compiled in and fuzzed, not skipped.
 # `checksums` verifies the archives' own CRCs, a path the default scan skips.
-# `image-hash` is `fuzzy_img#` subsignatures.
-exav-core = { path = "../crates/exav-core", default-features = false, features = ["unstable-internals", "all-formats", "decrypt", "dlp", "phishing", "yara", "image-hash", "checksums"] }
+# `image-hash` is `fuzzy_img#` subsignatures. `visible-text` (and `-pdf`) is a
+# document's text view.
+exav-core = { path = "../crates/exav-core", default-features = false, features = ["unstable-internals", "all-formats", "decrypt", "dlp", "phishing", "yara", "image-hash", "visible-text", "visible-text-pdf", "visible-text-office", "checksums"] }
 exav-unpack = { path = "../crates/exav-unpack", default-features = false, features = ["all-formats", "decrypt", "checksums"] }
 # The clamd and ICAP parsers, over memory (`exav_cli::fuzzing`): the source of
 # the `exav` binary built as a library, which `exav` itself does not ship.
@@ -45,8 +46,16 @@ exav-imagehash = { path = "../crates/exav-imagehash", default-features = false, 
 # DWG and DXF, which @exav/viewer parses in the browser from whatever a user
 # opens; the scanner does not read them. Its PDF image decoders too (the
 # `imagehash` target), which the viewer runs in place of pdf.js's own.
-exav-render = { path = "../crates/exav-render", default-features = false, features = ["dwg", "image", "jp2", "jbig2", "ccitt", "ifc", "stl"] }
+#
+# The office converters too (`office`): XLS, ODS and Numbers to XLSX, PPT, ODP
+# and Keynote to PPTX, DOC, ODT, RTF, Word 2003 XML and Pages to DOCX, which
+# @exav/viewer converts in the browser from whatever a user opens; the
+# scanner does not read them this way. `office-test-util` is the compound file
+# writer the PPT and DOC targets store their input with.
+exav-render = { path = "../crates/exav-render", default-features = false, features = ["dwg", "image", "raw", "jp2", "jbig2", "ccitt", "jxl", "ifc", "stl", "obj", "ply", "gltf", "markdown", "text-pdf", "text-office", "office", "office-test-util"] }
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
+# `zip` wraps the Numbers target's input and reads the XLSX back.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 # Keep fuzz binaries debuggable while optimized.
 [profile.release]
@@ -78,6 +87,27 @@ bench = false
 [[bin]]
 name = "unpack"
 path = "fuzz_targets/unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vdisk"
+path = "fuzz_targets/vdisk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fsimage"
+path = "fuzz_targets/fsimage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lzo"
+path = "fuzz_targets/lzo.rs"
 test = false
 doc = false
 bench = false
@@ -188,6 +218,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "raw_preview"
+path = "fuzz_targets/raw_preview.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sigs"
 path = "fuzz_targets/sigs.rs"
 test = false
@@ -249,6 +286,132 @@ bench = false
 [[bin]]
 name = "ifc"
 path = "fuzz_targets/ifc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mesh"
+path = "fuzz_targets/mesh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "visible_text"
+path = "fuzz_targets/visible_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "markdown"
+path = "fuzz_targets/markdown.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sheets_xls"
+path = "fuzz_targets/sheets_xls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sheets_ods"
+path = "fuzz_targets/sheets_ods.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sheets_numbers"
+path = "fuzz_targets/sheets_numbers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sheets_text"
+path = "fuzz_targets/sheets_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slides_ppt"
+path = "fuzz_targets/slides_ppt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slides_odp"
+path = "fuzz_targets/slides_odp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slides_odg"
+path = "fuzz_targets/slides_odg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slides_vsdx"
+path = "fuzz_targets/slides_vsdx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slides_keynote"
+path = "fuzz_targets/slides_keynote.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docs_doc"
+path = "fuzz_targets/docs_doc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docs_odt"
+path = "fuzz_targets/docs_odt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docs_rtf"
+path = "fuzz_targets/docs_rtf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docs_wml"
+path = "fuzz_targets/docs_wml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docs_html"
+path = "fuzz_targets/docs_html.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "docs_pages"
+path = "fuzz_targets/docs_pages.rs"
 test = false
 doc = false
 bench = false

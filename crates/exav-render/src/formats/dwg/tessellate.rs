@@ -1,25 +1,27 @@
 //! Walk a drawing model and turn drawable entities into GPU buffers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::cad::{
     Color, Drawing as CadDrawing, Edge, Entity, EntityKind, HAlign, Handle, LineWeight,
-    PolylineKind, Transparency, VAlign, MODEL_SPACE, PAPER_SPACE,
+    MODEL_SPACE, PAPER_SPACE, PolylineKind, Transparency, VAlign,
 };
 
 use super::clip::ClipShape;
 use super::curves;
+use super::dimension;
 use super::fill;
 use super::font;
 use super::gradient::{self, Gradient};
 use super::hatch;
-use super::linetype::{self, dash_polyline, Pattern};
+use super::linetype::{self, Pattern, dash_polyline};
 use super::palette::Palette;
 use super::proxy;
 use super::scene::{
-    encode_fade_spacing, pack_attr, pack_rgba, Affine, Scene, FILL_FLAG_BACKGROUND, FLAG_CONTRAST,
+    Affine, FILL_FLAG_BACKGROUND, FLAG_CONTRAST, Scene, encode_fade_spacing, pack_attr, pack_rgba,
 };
 use super::text;
+use super::wide::{self, WideVertex};
 
 fn h_align_of(a: HAlign) -> text::HAlign {
     match a {
@@ -47,7 +49,8 @@ fn v_align_of(a: VAlign) -> text::VAlign {
 /// Only some entity types are stored in OCS. LINE, POINT, SPLINE, ELLIPSE,
 /// 3DFACE and MLINE carry an extrusion vector but their coordinates are
 /// already world-space, so applying the transform to them would mirror
-/// geometry that was correct to begin with.
+/// geometry that was correct to begin with. MTEXT is world-space too, with
+/// its own plane (`mtext_plane`).
 fn ocs_of(e: &EntityKind) -> Option<Affine> {
     let (n, elevation) = match e {
         EntityKind::Circle(x) => (x.plane.extrusion, x.center.z),
@@ -58,7 +61,7 @@ fn ocs_of(e: &EntityKind) -> Option<Affine> {
         }
         EntityKind::Solid(x) | EntityKind::Trace(x) => (x.plane.extrusion, x.corners[0].z),
         EntityKind::Text(x) => (x.plane.extrusion, x.insertion.z),
-        EntityKind::MText(x) => (x.extrusion, x.insertion.z),
+        EntityKind::MText(x) => return mtext_plane(x),
         EntityKind::Attribute(x) | EntityKind::AttributeDefinition(x) => {
             (x.text.plane.extrusion, x.text.insertion.z)
         }
@@ -71,6 +74,52 @@ fn ocs_of(e: &EntityKind) -> Option<Affine> {
         return None;
     }
     Some(Affine::from_extrusion(n.x, n.y, n.z, elevation))
+}
+
+/// An MTEXT is not in OCS: its insertion point and text direction are world
+/// coordinates, and its extrusion is the normal of the plane the text lies in
+/// (ezdxf reads it so, tested against AutoCAD's own files). `None` for the
+/// plain plane, the drawing's own. Otherwise the map of the text's own
+/// (along, up) to the plan view, with the insertion point as its origin.
+fn mtext_plane(m: &crate::cad::MText) -> Option<Affine> {
+    let n = m.extrusion;
+    let len = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+    if !len.is_finite()
+        || len < 1e-12
+        || (n.z > 0.0 && n.x.abs() / len < 1e-12 && n.y.abs() / len < 1e-12)
+    {
+        return None;
+    }
+    let x_axis = match m.x_direction {
+        Some(d) if d.x != 0.0 || d.y != 0.0 || d.z != 0.0 => [d.x, d.y, d.z],
+        // A rotation is an angle in the plane's own frame: the arbitrary axis
+        // algorithm's X and Y, as ezdxf takes it.
+        _ => {
+            let unit = [n.x / len, n.y / len, n.z / len];
+            let cross = |a: [f64; 3], b: [f64; 3]| {
+                [
+                    a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0],
+                ]
+            };
+            let ax = if unit[0].abs() < 1.0 / 64.0 && unit[1].abs() < 1.0 / 64.0 {
+                cross([0.0, 1.0, 0.0], unit)
+            } else {
+                cross([0.0, 0.0, 1.0], unit)
+            };
+            let al = ax.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let ax = ax.map(|v| v / al);
+            let ay = cross(unit, ax);
+            let (s, c) = m.rotation.sin_cos();
+            [
+                c * ax[0] + s * ay[0],
+                c * ax[1] + s * ay[1],
+                c * ax[2] + s * ay[2],
+            ]
+        }
+    };
+    Affine::from_plane(x_axis, [n.x, n.y, n.z], [m.insertion.x, m.insertion.y])
 }
 
 /// How a hatch wants its islands treated (group 75).
@@ -94,6 +143,230 @@ fn island_style(h: &crate::cad::Hatch) -> fill::IslandStyle {
 /// step AutoCAD's own editor appears to use and is the width of a typical list
 /// indent; it is a guess, and it is only ever reached by text that tabs without
 /// declaring where to.
+/// An arrowhead one unit long, its tip at the origin pointing along +x:
+/// triangles to fill and lines to stroke.
+struct ArrowShape {
+    filled: Vec<[f64; 2]>,
+    lines: Vec<Vec<[f64; 2]>>,
+}
+
+/// AutoCAD's built-in arrowheads by block name (`_OPEN`...); an empty or
+/// unknown name is the closed filled one.
+fn arrow_shape(name: &str) -> ArrowShape {
+    let circle = |r: f64, cx: f64| -> Vec<[f64; 2]> {
+        let mut c = curves::flatten_circle(cx, 0.0, r);
+        if let Some(&first) = c.first() {
+            c.push(first);
+        }
+        c
+    };
+    let disc = |r: f64| -> Vec<[f64; 2]> {
+        let ring = curves::flatten_circle(0.0, 0.0, r);
+        (0..ring.len())
+            .flat_map(|i| [[0.0, 0.0], ring[i], ring[(i + 1) % ring.len()]])
+            .collect()
+    };
+    let triangle = |w: f64, l: f64| vec![[0.0, 0.0], [-l, w], [-l, -w]];
+    let (filled, lines) = match name {
+        "_NONE" => (vec![], vec![]),
+        "_OPEN" => (
+            vec![],
+            vec![vec![[-1.0, 1.0 / 6.0], [0.0, 0.0], [-1.0, -1.0 / 6.0]]],
+        ),
+        "_OPEN30" => (
+            vec![],
+            vec![vec![[-1.0, 0.268], [0.0, 0.0], [-1.0, -0.268]]],
+        ),
+        "_OPEN90" => (vec![], vec![vec![[-0.5, 0.5], [0.0, 0.0], [-0.5, -0.5]]]),
+        "_CLOSEDBLANK" => (
+            vec![],
+            vec![{
+                let mut t = triangle(1.0 / 6.0, 1.0);
+                t.push([0.0, 0.0]);
+                t
+            }],
+        ),
+        "_CLOSED" => (
+            vec![],
+            vec![
+                {
+                    let mut t = triangle(1.0 / 6.0, 1.0);
+                    t.push([0.0, 0.0]);
+                    t
+                },
+                vec![[-1.0, 0.0], [0.0, 0.0]],
+            ],
+        ),
+        "_SMALL" => (triangle(1.0 / 12.0, 0.5), vec![]),
+        "_DOT" => (disc(0.25), vec![]),
+        "_DOTSMALL" => (disc(1.0 / 16.0), vec![]),
+        "_DOTBLANK" => (vec![], vec![circle(0.25, 0.0)]),
+        "_ORIGIN" => (vec![], vec![circle(0.5, 0.0)]),
+        "_ORIGIN2" => (vec![], vec![circle(0.5, 0.0), circle(0.25, 0.0)]),
+        "_OBLIQUE" | "_ARCHTICK" => (vec![], vec![vec![[-0.5, -0.5], [0.5, 0.5]]]),
+        "_BOXFILLED" => (
+            vec![
+                [-0.5, -0.5],
+                [0.5, -0.5],
+                [0.5, 0.5],
+                [-0.5, -0.5],
+                [0.5, 0.5],
+                [-0.5, 0.5],
+            ],
+            vec![],
+        ),
+        "_BOXBLANK" => (
+            vec![],
+            vec![vec![
+                [-0.5, -0.5],
+                [0.5, -0.5],
+                [0.5, 0.5],
+                [-0.5, 0.5],
+                [-0.5, -0.5],
+            ]],
+        ),
+        "_DATUMFILLED" => (vec![[0.0, 0.577], [0.0, -0.577], [-1.0, 0.0]], vec![]),
+        "_DATUMBLANK" => (
+            vec![],
+            vec![vec![[0.0, 0.577], [0.0, -0.577], [-1.0, 0.0], [0.0, 0.577]]],
+        ),
+        _ => (triangle(1.0 / 6.0, 1.0), vec![]),
+    };
+    ArrowShape { filled, lines }
+}
+
+/// A tolerance box's text with its GD&T font runs (`{\Fgdt;j}`, the font
+/// code in any case) as the symbols they stand for, the braces gone.
+fn gdt_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.to_ascii_lowercase().find("\\fgdt;") {
+        let before = &rest[..at];
+        out.push_str(before.strip_suffix('{').unwrap_or(before));
+        let after = &rest[at + "\\fgdt;".len()..];
+        let end = after.find('}').unwrap_or(after.len());
+        out.push_str(&font::map_symbols(&after[..end], font::Symbols::Gdt));
+        rest = after.get(end + 1..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A polygon mesh's lines: along M and along N, closed as its flags say
+/// (1 in M, 32 in N).
+fn polygon_mesh_edges(p: &crate::cad::Polyline) -> Vec<Vec<[f64; 2]>> {
+    let (m, n) = (p.m_count.max(0) as usize, p.n_count.max(0) as usize);
+    let pts: Vec<[f64; 2]> = p
+        .vertices
+        .iter()
+        .map(|v| [v.location.x, v.location.y])
+        .collect();
+    if m < 1 || n < 1 || pts.len() < m * n {
+        return Vec::new();
+    }
+    let at = |i: usize, j: usize| pts[i * n + j];
+    let mut out = Vec::new();
+    for i in 0..m {
+        let mut row: Vec<[f64; 2]> = (0..n).map(|j| at(i, j)).collect();
+        if p.flags & 32 != 0 && n > 2 {
+            row.push(at(i, 0));
+        }
+        out.push(row);
+    }
+    for j in 0..n {
+        let mut column: Vec<[f64; 2]> = (0..m).map(|i| at(i, j)).collect();
+        if p.flags & 1 != 0 && m > 2 {
+            column.push(at(0, j));
+        }
+        out.push(column);
+    }
+    out
+}
+
+/// A polyface mesh's visible edges: each face's sides, but those whose
+/// starting index is negative, each side once.
+fn polyface_edges(p: &crate::cad::Polyline) -> Vec<Vec<[f64; 2]>> {
+    let corners: Vec<[f64; 2]> = p
+        .vertices
+        .iter()
+        .filter(|v| v.flags & 64 != 0)
+        .map(|v| [v.location.x, v.location.y])
+        .collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for face in p
+        .vertices
+        .iter()
+        .filter(|v| v.flags & 64 == 0 && v.flags & 128 != 0)
+    {
+        let ids: Vec<i32> = face
+            .indices
+            .iter()
+            .copied()
+            .take_while(|&i| i != 0)
+            .collect();
+        for k in 0..ids.len() {
+            let (a, b) = (ids[k], ids[(k + 1) % ids.len()]);
+            if a < 0 || ids.len() < 2 {
+                continue;
+            }
+            let (a, b) = (a.unsigned_abs() as usize, b.unsigned_abs() as usize);
+            let (Some(&pa), Some(&pb)) = (corners.get(a - 1), corners.get(b - 1)) else {
+                continue;
+            };
+            if seen.insert((a.min(b), a.max(b))) {
+                out.push(vec![pa, pb]);
+            }
+        }
+    }
+    out
+}
+
+/// Opacity of the fill drawn for a pattern too dense to draw: about what
+/// sub-pixel lines, faded by their spacing, add up to on screen.
+const TRUNCATED_PATTERN_TONE: f64 = 0.5;
+
+/// The scale, turn and mirroring of a transform that keeps circles round
+/// (rotation, uniform scale, perhaps a mirror); None for any other.
+fn similarity(xf: &Affine) -> Option<(f64, f64, bool)> {
+    let scale = xf.a.hypot(xf.b);
+    let tolerance = 1e-9 * scale.max(1e-300);
+    let turn = xf.b.atan2(xf.a);
+    if (xf.a - xf.d).abs() <= tolerance && (xf.b + xf.c).abs() <= tolerance {
+        return (scale > 0.0).then_some((scale, turn, false));
+    }
+    if (xf.a + xf.d).abs() <= tolerance && (xf.b - xf.c).abs() <= tolerance {
+        return (scale > 0.0).then_some((scale, turn, true));
+    }
+    None
+}
+
+/// A stack's parts against the text height: AutoCAD's default (`TSTACKSIZE`).
+const STACK_SIZE: f64 = 0.7;
+
+/// A run's height: the entity's, times a `\H...x` factor, or a `\H` height.
+fn span_height(s: &text::Span, base: f64) -> f64 {
+    match s.height {
+        text::SpanHeight::Factor(f) if f > 0.0 => base * f,
+        text::SpanHeight::Absolute(h) if h > 0.0 => h,
+        _ => base,
+    }
+}
+
+/// How wide a stack is drawn: its wider part, or both parts and the slash
+/// of a diagonal one.
+fn stack_width(s: &text::Stack, metrics: &font::Metrics, height: f64, w: f64) -> f64 {
+    let part = height * STACK_SIZE;
+    let (upper, lower) = (
+        metrics.measure(&s.upper) * part * w,
+        metrics.measure(&s.lower) * part * w,
+    );
+    match s.kind {
+        text::StackKind::Diagonal => upper + 0.5 * part + lower,
+        _ => upper.max(lower),
+    }
+}
+
 fn next_tab_stop(cursor: f64, paragraph: &text::Paragraph, height: f64) -> f64 {
     if let Some(stop) = paragraph.tabs.iter().find(|s| **s > cursor + 1e-9) {
         return *stop;
@@ -130,39 +403,67 @@ struct LineTypeDef {
     labels: Vec<linetype::Label>,
 }
 
-/// The text a complex linetype embeds, ready to scale.
+/// The text and shapes a complex linetype embeds, ready to scale.
 ///
-/// Shape elements are skipped: they name a glyph in an SHX shape file, which
-/// cannot be shipped any more than an SHX font can (DESIGN.md section 5.3).
+/// A shape names a glyph in an SHX shape file, which cannot be shipped any
+/// more than an SHX font can (DESIGN.md section 5.3): only ltypeshp.shx's,
+/// which AutoCAD's own linetypes use, are drawn, redrawn here.
 fn embedded_labels(doc: &CadDrawing, lt: &crate::cad::Linetype) -> Vec<linetype::Label> {
     let mut out = Vec::new();
     for (run, e) in lt.elements.iter().enumerate() {
-        if !e.has_text() || e.text.is_empty() || !e.scale.is_finite() || e.scale <= 0.0 {
+        if !e.scale.is_finite() || e.scale <= 0.0 {
             continue;
         }
-        // The element's scale multiplies the style's fixed height, or is the
-        // height itself when the style leaves it free, which is the usual case.
         let style = doc
             .text_styles
             .iter()
             .find(|s| !e.style.is_null() && s.handle == e.style);
-        let style_height = style.map(|s| s.height).unwrap_or(0.0);
-        let height = if style_height > 0.0 {
-            style_height * e.scale
+        let (mark, height) = if e.has_text() && !e.text.is_empty() {
+            // The element's scale multiplies the style's fixed height, or is
+            // the height itself when the style leaves it free, which is the
+            // usual case.
+            let style_height = style.map(|s| s.height).unwrap_or(0.0);
+            let height = if style_height > 0.0 {
+                style_height * e.scale
+            } else {
+                e.scale
+            };
+            let face = style.map(font::resolve_style).unwrap_or(font::Face::Stroke);
+            (
+                linetype::Mark::Text {
+                    text: text::decode_special(&e.text),
+                    face,
+                },
+                height,
+            )
+        } else if e.has_shape() {
+            let Some(shape) = style
+                .filter(|s| is_ltypeshp(&s.font_file))
+                .and_then(|_| linetype::ltypeshp_shape(e.shape_number))
+            else {
+                continue;
+            };
+            (linetype::Mark::Shape(shape), e.scale)
         } else {
-            e.scale
+            continue;
         };
         out.push(linetype::Label {
             run,
-            text: text::decode_special(&e.text),
+            mark,
             height,
             offset: [e.offset.x, e.offset.y],
             rotation: e.rotation,
             absolute_rotation: e.absolute_rotation(),
-            face: style.map(font::resolve_style).unwrap_or(font::Face::Stroke),
         });
     }
     out
+}
+
+/// A style's font file is ltypeshp.shx, under any path or case.
+fn is_ltypeshp(file: &str) -> bool {
+    let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let stem = name.split('.').next().unwrap_or(name);
+    stem.eq_ignore_ascii_case("ltypeshp")
 }
 
 /// A RAY or XLINE, held back until the drawing's extents are known.
@@ -219,6 +520,32 @@ pub struct LayoutInfo {
     pub tab_order: i16,
     /// The sheet, as `[min_x, min_y, max_x, max_y]` in paper units.
     pub limits: Option<[f64; 4]>,
+    /// Millimetres per paper unit: 25.4 for a sheet set up in inches.
+    pub mm_per_unit: f64,
+}
+
+/// What a tab is drawn on, beyond its geometry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sheet {
+    /// Millimetres per drawing unit, which a lineweight on a layout is a
+    /// width in: 25.4 for a sheet in inches. 0 for model space, where a
+    /// lineweight is a width on the screen.
+    pub mm_per_unit: f64,
+    /// `$LWDISPLAY`: the drawing is shown with its lineweights.
+    pub lineweights: bool,
+    /// A layout's paper, `[min_x, min_y, max_x, max_y]` in drawing units:
+    /// its limits. None for model space.
+    pub paper: Option<[f64; 4]>,
+}
+
+impl Default for Sheet {
+    fn default() -> Self {
+        Sheet {
+            mm_per_unit: 0.0,
+            lineweights: true,
+            paper: None,
+        }
+    }
 }
 
 pub struct LayerInfo {
@@ -259,6 +586,33 @@ pub struct Warnings {
     /// without proxy graphics, or with graphics that draw nothing: only the
     /// application that made them can show them.
     pub proxy_without_graphics: u32,
+    /// What `unknown_entities` counts, by DXF type, at most
+    /// [`MAX_NAMED`] types.
+    pub not_drawn: BTreeMap<String, u32>,
+    /// The files external references name (xrefs, images, underlays), at
+    /// most [`MAX_NAMED`].
+    pub external_files: BTreeSet<String>,
+}
+
+/// Most names a warning lists.
+pub const MAX_NAMED: usize = 16;
+
+impl Warnings {
+    fn not_drawn(&mut self, kind: &str) {
+        self.unknown_entities = self.unknown_entities.saturating_add(1);
+        if let Some(n) = self.not_drawn.get_mut(kind) {
+            *n = n.saturating_add(1);
+        } else if self.not_drawn.len() < MAX_NAMED {
+            self.not_drawn.insert(kind.to_string(), 1);
+        }
+    }
+
+    fn external(&mut self, file: &str) {
+        self.external_references = self.external_references.saturating_add(1);
+        if !file.is_empty() && self.external_files.len() < MAX_NAMED {
+            self.external_files.insert(file.to_string());
+        }
+    }
 }
 
 /// Default for [`Tessellator::budget`]: strokes and fill vertices one layout
@@ -318,13 +672,14 @@ pub struct Tessellator<'a> {
     /// because a drawing names a handful of styles and uses them thousands of
     /// times.
     style_faces: HashMap<String, font::Face>,
-    /// The same, by style handle: entities that reference a style by name are
-    /// the common case, but leaders and dimensions point at one by handle.
-    style_faces_by_handle: HashMap<u64, font::Face>,
+    /// Styles whose font draws symbols for letters (symbol.ttf, gdt.shx).
+    style_symbols: HashMap<String, font::Symbols>,
     /// Which ACI table indexed colours resolve through.
     palette: Palette,
     /// Block names currently being expanded, to break reference cycles.
     stack: Vec<String>,
+    /// What the tab drawn last is drawn on.
+    pub sheet: Sheet,
 }
 
 fn normalize(name: &str) -> String {
@@ -449,13 +804,17 @@ impl<'a> Tessellator<'a> {
                 .iter()
                 .map(|s| (normalize(&s.name), font::resolve_style(s)))
                 .collect(),
-            style_faces_by_handle: doc
+            style_symbols: doc
                 .text_styles
                 .iter()
-                .map(|s| (s.handle.0, font::resolve_style(s)))
+                .filter_map(|s| Some((normalize(&s.name), font::symbols_of(&s.font_file)?)))
                 .collect(),
             palette,
             stack: Vec::new(),
+            sheet: Sheet {
+                lineweights: doc.header.lwdisplay,
+                ..Sheet::default()
+            },
         }
     }
 
@@ -504,60 +863,74 @@ impl<'a> Tessellator<'a> {
         maxy += pad;
 
         for line in std::mem::take(&mut self.pending_infinite) {
-            let len = (line.dir[0] * line.dir[0] + line.dir[1] * line.dir[1]).sqrt();
-            if !len.is_finite() || len < 1e-12 {
-                continue;
-            }
-            let u = [line.dir[0] / len, line.dir[1] / len];
-
-            // Slab clip: the parameter range where the line is inside the box.
-            let mut t0 = if line.both_ways {
-                f64::NEG_INFINITY
-            } else {
-                0.0
-            };
-            let mut t1 = f64::INFINITY;
-            let mut outside = false;
-            for (p, d, lo, hi) in [
-                (line.base[0], u[0], minx, maxx),
-                (line.base[1], u[1], miny, maxy),
-            ] {
-                if d.abs() < 1e-12 {
-                    if p < lo || p > hi {
-                        outside = true;
-                    }
-                    continue;
-                }
-                let (a, b) = ((lo - p) / d, (hi - p) / d);
-                let (a, b) = if a <= b { (a, b) } else { (b, a) };
-                t0 = t0.max(a);
-                t1 = t1.min(b);
-            }
-            if outside || !(t1 > t0) || !t0.is_finite() || !t1.is_finite() {
-                continue;
-            }
-
-            self.scene.push_stroke(
-                line.base[0] + u[0] * t0,
-                line.base[1] + u[1] * t0,
-                line.base[0] + u[0] * t1,
-                line.base[1] + u[1] * t1,
-                line.rgba,
-                line.attr,
-            );
+            self.push_infinite(&line, [minx, miny], [maxx, maxy]);
         }
+    }
+
+    /// The part of a ray or xline inside a box, as a stroke.
+    fn push_infinite(&mut self, line: &InfiniteLine, min: [f64; 2], max: [f64; 2]) {
+        let len = (line.dir[0] * line.dir[0] + line.dir[1] * line.dir[1]).sqrt();
+        if !len.is_finite() || len < 1e-12 {
+            return;
+        }
+        let u = [line.dir[0] / len, line.dir[1] / len];
+
+        // Slab clip: the parameter range where the line is inside the box.
+        let mut t0 = if line.both_ways {
+            f64::NEG_INFINITY
+        } else {
+            0.0
+        };
+        let mut t1 = f64::INFINITY;
+        for (p, d, lo, hi) in [
+            (line.base[0], u[0], min[0], max[0]),
+            (line.base[1], u[1], min[1], max[1]),
+        ] {
+            if d.abs() < 1e-12 {
+                if p < lo || p > hi {
+                    return;
+                }
+                continue;
+            }
+            let (a, b) = ((lo - p) / d, (hi - p) / d);
+            let (a, b) = if a <= b { (a, b) } else { (b, a) };
+            t0 = t0.max(a);
+            t1 = t1.min(b);
+        }
+        if !(t1 > t0) || !t0.is_finite() || !t1.is_finite() {
+            return;
+        }
+
+        self.scene.push_stroke(
+            line.base[0] + u[0] * t0,
+            line.base[1] + u[1] * t0,
+            line.base[0] + u[0] * t1,
+            line.base[1] + u[1] * t1,
+            line.rgba,
+            line.attr,
+        );
     }
 
     /// Leader lines plus the label they point at.
     fn multi_leader(&mut self, m: &crate::cad::MultiLeader, ctx: &Ctx, rgba: u32, attr: u32) {
         let c = &m.context;
 
-        // Every leader root contributes one or more polylines.
+        // Every leader root contributes one or more polylines, each with
+        // its arrowhead at its first vertex.
+        let scale = if c.scale > 0.0 { c.scale } else { 1.0 };
+        let size = m.arrowhead_size * scale;
         for root in &c.leaders {
             for line in &root.lines {
-                let pts: Vec<[f64; 2]> = line.vertices.iter().map(|p| [p.x, p.y]).collect();
+                // From the arrow's tip through the line's vertices to where
+                // the root lands.
+                let mut pts: Vec<[f64; 2]> = line.vertices.iter().map(|p| [p.x, p.y]).collect();
+                let landing = [root.connection_point.x, root.connection_point.y];
+                if pts.last() != Some(&landing) && (root.has_connection_point || pts.len() < 2) {
+                    pts.push(landing);
+                }
                 if pts.len() >= 2 {
                     self.push_transformed(&pts, false, &ctx.xf, rgba, attr, None);
+                    self.arrowhead(m.arrowhead, pts[0], pts[1], size, ctx, rgba, attr);
                 }
             }
             // The landing runs from the last leader point to the content.
@@ -582,47 +955,32 @@ impl<'a> Tessellator<'a> {
             } else {
                 2.5
             };
-            let spacing = height
-                * text::MTEXT_LINE_SPACING
-                * if c.line_spacing_factor > 0.0 {
-                    c.line_spacing_factor
-                } else {
-                    1.0
-                };
-            let lines = text::mtext_lines(&c.text);
-            let face = self.style_face_by_handle(c.text_style);
-            // Attachment codes match MTEXT's.
-            let (h_align, dy0) =
-                text::mtext_layout(c.text_attachment as u8, lines.len(), height, spacing);
-            let (sin_r, cos_r) = rotation.sin_cos();
             let text_rgba = match c.text_color {
                 Color::ByLayer | Color::ByBlock => rgba,
                 ref col => colour_rgb(col, self.palette)
-                    .map(|(r, g, b)| pack_rgba(r, g, b, 255))
+                    .map(|(r, g, b)| pack_rgba(r, g, b, (rgba >> 24) as u8))
                     .unwrap_or(rgba),
             };
-
-            for (i, line) in lines.iter().enumerate() {
-                if line.is_empty() {
-                    continue;
-                }
-                let dy = dy0 - i as f64 * spacing;
-                self.push_text_run(
-                    line.clone(),
-                    c.text_location.x - dy * sin_r,
-                    c.text_location.y + dy * cos_r,
-                    height,
-                    rotation,
-                    1.0,
-                    0.0,
-                    h_align,
-                    text::VAlign::Baseline,
-                    ctx,
-                    text_rgba,
-                    attr,
-                    face,
-                );
-            }
+            // The content is MTEXT, drawn as one (attachment codes match).
+            let style = self
+                .doc
+                .text_styles
+                .iter()
+                .find(|s| s.handle == c.text_style && !c.text_style.is_null())
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            let content = crate::cad::MText {
+                insertion: c.text_location,
+                height,
+                reference_width: c.text_width,
+                attachment: c.text_attachment,
+                style,
+                rotation,
+                line_spacing_factor: c.line_spacing_factor,
+                text: c.text.clone(),
+                ..crate::cad::MText::default()
+            };
+            self.mtext(&content, ctx, text_rgba, attr);
         }
     }
 
@@ -717,13 +1075,14 @@ impl<'a> Tessellator<'a> {
             .unwrap_or(font::Face::Stroke)
     }
 
-    /// The same, for an entity that points at its style by handle.
-    fn style_face_by_handle(&self, handle: Handle) -> font::Face {
-        self.style_faces_by_handle
-            .get(&handle.0)
-            .copied()
-            .filter(|_| !handle.is_null())
-            .unwrap_or(font::Face::Stroke)
+    /// A TEXT's or ATTRIB's string as its style shows it: the `%%` codes
+    /// decoded, then a symbol font's letters as the symbols they draw.
+    fn style_text(&self, style: &str, raw: &str) -> String {
+        let s = text::decode_special(raw);
+        match self.style_symbols.get(&normalize(style)) {
+            Some(&set) => font::map_symbols(&s, set),
+            None => s,
+        }
     }
 
     /// MTEXT content as the lines it is drawn on: the explicit `\P` breaks,
@@ -755,92 +1114,204 @@ impl<'a> Tessellator<'a> {
             .collect()
     }
 
-    /// Draw one laid-out MTEXT line, honouring per-run colour, height and rules.
-    ///
-    /// A line of one run is handed to the renderer to align, which measures the
-    /// string with the real font. A line of several has to be placed here,
-    /// because each run starts where the one before it ended.
-    #[allow(clippy::too_many_arguments)]
-    fn push_mtext_line(
+    /// A style's width factor and oblique angle, which MTEXT takes unless
+    /// `\W` and `\Q` say otherwise.
+    fn style_shape(&self, style: &str) -> (f64, f64) {
+        self.doc
+            .text_styles
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(style))
+            .map(|s| {
+                let w = if s.width_factor > 0.0 {
+                    s.width_factor
+                } else {
+                    1.0
+                };
+                (w, s.oblique)
+            })
+            .unwrap_or((1.0, 0.0))
+    }
+
+    /// An MTEXT, or a multiline attribute: its lines wrapped to its box and
+    /// stacked from the attachment point, each aligned as its paragraph
+    /// says, over its background mask when it has one.
+    fn mtext(&mut self, m: &crate::cad::MText, ctx: &Ctx, rgba: u32, attr: u32) {
+        let height = if m.height > 0.0 { m.height } else { 1.0 };
+        let face = self.style_face(&m.style);
+        let shape = self.style_shape(&m.style);
+        let mut lines = self.wrap_mtext(&m.text, m.reference_width / shape.0, height, face);
+        if let Some(&set) = self.style_symbols.get(&normalize(&m.style)) {
+            for s in lines
+                .iter_mut()
+                .flat_map(|l| l.spans.iter_mut())
+                .filter(|s| s.face.is_none())
+            {
+                s.text = font::map_symbols(&s.text, set);
+            }
+        }
+        let spacing = height
+            * text::MTEXT_LINE_SPACING
+            * if m.line_spacing_factor > 0.0 {
+                m.line_spacing_factor
+            } else {
+                1.0
+            };
+
+        // DWG stores the text direction as a vector when it has one.
+        let in_plane = mtext_plane(m).is_some();
+        let rotation = match m.x_direction {
+            _ if in_plane => 0.0,
+            Some(d) if d.x != 0.0 || d.y != 0.0 => d.y.atan2(d.x),
+            _ => m.rotation,
+        };
+        // Out of the drawing's plane the text is laid out in its own frame
+        // from the origin, and the entity's map places it.
+        let origin = if in_plane {
+            [0.0, 0.0]
+        } else {
+            [m.insertion.x, m.insertion.y]
+        };
+        let (h_align, dy0) = text::mtext_layout(m.attachment as u8, lines.len(), height, spacing);
+        let (sin_r, cos_r) = rotation.sin_cos();
+        let at = |along: f64, up: f64| {
+            [
+                origin[0] + along * cos_r - up * sin_r,
+                origin[1] + along * sin_r + up * cos_r,
+            ]
+        };
+
+        // The box lines align in and the mask covers: the entity's width,
+        // else its widest line.
+        let realigned = lines
+            .iter()
+            .any(|l| l.paragraph.align.is_some_and(|a| a != h_align));
+        let masked = m.background_fill & 0x13 != 0;
+        let box_width = if m.reference_width > 0.0 {
+            m.reference_width
+        } else if realigned || masked {
+            lines
+                .iter()
+                .map(|l| self.mtext_line_layout(l, height, face, shape.0).1)
+                .fold(0.0, f64::max)
+        } else {
+            0.0
+        };
+        let left = match h_align {
+            text::HAlign::Center | text::HAlign::Middle => -box_width / 2.0,
+            text::HAlign::Right => -box_width,
+            _ => 0.0,
+        };
+
+        if masked {
+            // A border of (scale - 1) heights around the lines, from the
+            // first line's capitals to the last line's baseline.
+            let scale = if m.background_scale > 0.0 {
+                m.background_scale
+            } else {
+                1.5
+            };
+            let border = height * (scale - 1.0).max(0.0);
+            let top = dy0 + height + border;
+            let bottom = dy0 - (lines.len().max(1) - 1) as f64 * spacing - border;
+            let corners: Vec<[f64; 2]> = [
+                (left - border, bottom),
+                (left + box_width + border, bottom),
+                (left + box_width + border, top),
+                (left - border, top),
+            ]
+            .iter()
+            .map(|&(a, b)| {
+                let p = at(a, b);
+                ctx.xf.apply(p[0], p[1])
+            })
+            .collect();
+            self.mtext_background(m, &corners, rgba, attr);
+            // The text over its own mask: one step later in draw order.
+            self.scene.order = self.scene.order.saturating_add(1);
+            if m.background_fill & 0x10 != 0 {
+                self.scene.push_polyline(&corners, true, rgba, attr);
+            }
+        }
+
+        for (i, line) in lines.iter().enumerate() {
+            if line.spans.is_empty() {
+                continue;
+            }
+            // Lines stack along the text's own down direction.
+            let dy = dy0 - i as f64 * spacing;
+            let (align, along) = match line.paragraph.align {
+                Some(a) if a != h_align && box_width > 0.0 => (
+                    a,
+                    left + match a {
+                        text::HAlign::Center => box_width / 2.0,
+                        text::HAlign::Right => box_width,
+                        _ => 0.0,
+                    },
+                ),
+                _ => (h_align, 0.0),
+            };
+            let p = at(along, dy);
+            self.mtext_line(
+                line, height, p, rotation, align, shape, ctx, rgba, attr, face,
+            );
+        }
+    }
+
+    /// An MTEXT's background: its colour (group 90 bit 1) or the drawing
+    /// area's (bit 2), as a WIPEOUT paints it.
+    fn mtext_background(
         &mut self,
-        line: &text::Line,
-        base_height: f64,
-        x: f64,
-        y: f64,
-        rotation: f64,
-        h_align: text::HAlign,
-        ctx: &Ctx,
+        m: &crate::cad::MText,
+        corners: &[[f64; 2]],
         rgba: u32,
         attr: u32,
-        face: font::Face,
     ) {
-        let spans = &line.spans;
-        let height_of = |s: &text::Span| match s.height {
-            text::SpanHeight::Factor(f) if f > 0.0 => base_height * f,
-            text::SpanHeight::Absolute(h) if h > 0.0 => h,
-            _ => base_height,
+        let base = attr & 0x00FF_FFFF;
+        let colour = (m.background_fill & 2 == 0)
+            .then(|| colour_rgb(&m.background_color, self.palette))
+            .flatten();
+        let (fill, fill_attr) = match colour {
+            Some((r, g, b)) => (pack_rgba(r, g, b, 255), base),
+            None => (rgba, base | u32::from(FILL_FLAG_BACKGROUND) << 24),
         };
-        // A `\f` run draws in the face it names; the rest take the entity's.
-        let face_of = |s: &text::Span| s.face.unwrap_or(face);
+        for t in fill::fill_even_odd(&[corners.to_vec()]).chunks(3) {
+            if t.len() == 3 {
+                self.scene.push_triangle(t[0], t[1], t[2], fill, fill_attr);
+            }
+        }
+    }
 
-        // Where the line starts, from its paragraph's indents. The first line
-        // of a paragraph can be indented differently from the rest, which is
-        // what makes a numbered list hang.
-        let indent = line.paragraph.indent
+    /// Where each run of an MTEXT line goes, from the line's left edge: the
+    /// runs as (span, text, start, width), and the line's width. A tab stop
+    /// is measured from that edge, so alignment comes after.
+    fn mtext_line_layout(
+        &self,
+        line: &text::Line,
+        base_height: f64,
+        face: font::Face,
+        base_width: f64,
+    ) -> (Vec<(usize, String, f64, f64)>, f64) {
+        let mut placed = Vec::new();
+        // The paragraph's indents; a first line can be indented differently
+        // from the rest, which is what makes a numbered list hang.
+        let mut cursor = line.paragraph.indent
             + if line.first {
                 line.paragraph.first_indent
             } else {
                 0.0
             };
-        let tabbed = spans.iter().any(|s| s.text.contains('\t'));
-
-        let styled = tabbed
-            || indent != 0.0
-            || spans.iter().any(|s| {
-                s.color.is_some()
-                    || s.face.is_some_and(|f| f != face)
-                    || s.underline
-                    || s.overline
-                    || s.strike
-                    || height_of(s) != base_height
-            });
-
-        // Nothing to place: hand the whole line over as one run.
-        if !styled
-            || spans.len() == 1
-                && !spans[0].underline
-                && !spans[0].overline
-                && !spans[0].strike
-                && spans[0].color.is_none()
-        {
-            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-            let height = spans.first().map(height_of).unwrap_or(base_height);
-            let face = spans.first().map(face_of).unwrap_or(face);
-            self.push_text_run(
-                text,
-                x,
-                y,
-                height,
-                rotation,
-                1.0,
-                0.0,
-                h_align,
-                text::VAlign::Baseline,
-                ctx,
-                rgba,
-                attr,
-                face,
-            );
-            return;
-        }
-
-        // Lay the line out from its own left edge first. A tab stop is measured
-        // from there, not from the anchor, so alignment can only be applied
-        // once the whole line has been placed.
-        let mut placed: Vec<(usize, String, f64, f64)> = Vec::new();
-        let mut cursor = indent;
-        for (i, span) in spans.iter().enumerate() {
-            let height = height_of(span);
+        for (i, span) in line.spans.iter().enumerate() {
+            let height = span_height(span, base_height);
+            let w = span.width.unwrap_or(base_width);
+            // Each run is measured in its own face, since a `\f` in the
+            // middle of a line changes how wide the rest of it sits.
+            let metrics = font::Metrics::for_face(span.face.unwrap_or(face));
+            if let Some(stack) = &span.stack {
+                let width = stack_width(stack, &metrics, height, w);
+                placed.push((i, String::new(), cursor, width));
+                cursor += width;
+                continue;
+            }
             for (n, piece) in span.text.split('\t').enumerate() {
                 if n > 0 {
                     cursor = next_tab_stop(cursor, &line.paragraph, base_height);
@@ -848,45 +1319,142 @@ impl<'a> Tessellator<'a> {
                 if piece.is_empty() {
                     continue;
                 }
-                // Each run is measured in its own face, since a `\f` in the
-                // middle of a line changes how wide the rest of it sits.
-                let width = font::Metrics::for_face(face_of(span)).measure(piece) * height;
+                let width = metrics.measure(piece) * height * w * span.tracking.unwrap_or(1.0);
                 placed.push((i, piece.to_string(), cursor, width));
                 cursor += width;
             }
         }
+        (placed, cursor)
+    }
 
-        let offset = match h_align {
-            text::HAlign::Center | text::HAlign::Middle => -cursor / 2.0,
-            text::HAlign::Right => -cursor,
-            _ => 0.0,
+    /// Draw one laid-out MTEXT line, honouring per-run colour, height, width
+    /// factor, slant, tracking, stacks and rules.
+    ///
+    /// A line of plain text is handed to the renderer to align, which
+    /// measures the string with the real font. Any other has to be placed
+    /// here, because each run starts where the one before it ended.
+    #[allow(clippy::too_many_arguments)]
+    fn mtext_line(
+        &mut self,
+        line: &text::Line,
+        base_height: f64,
+        [x, y]: [f64; 2],
+        rotation: f64,
+        h_align: text::HAlign,
+        (base_width, base_oblique): (f64, f64),
+        ctx: &Ctx,
+        rgba: u32,
+        attr: u32,
+        face: font::Face,
+    ) {
+        let spans = &line.spans;
+        let plain = |s: &text::Span| {
+            s.color.is_none()
+                && !s.underline
+                && !s.overline
+                && !s.strike
+                && s.width.is_none()
+                && s.oblique.is_none()
+                && s.tracking.is_none()
+                && s.stack.is_none()
+                && !s.text.contains('\t')
         };
+        let indented =
+            line.paragraph.indent != 0.0 || line.first && line.paragraph.first_indent != 0.0;
+        let first = &spans[0];
+        let one_style = spans.iter().all(|s| {
+            s.face.unwrap_or(face) == first.face.unwrap_or(face)
+                && span_height(s, base_height) == span_height(first, base_height)
+        });
 
-        let (sin_r, cos_r) = rotation.sin_cos();
-        for (i, piece, start, width) in placed {
-            let span = &spans[i];
-            let along = start + offset;
-            let width = &width;
-            let height = height_of(span);
-            let (rgba, attr) = match span.color {
-                Some(c) => self.span_colour(c, rgba, attr),
-                None => (rgba, attr),
-            };
+        // Nothing to place: hand the whole line over as one run.
+        if !indented && one_style && spans.iter().all(plain) {
+            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
             self.push_text_run(
-                piece,
-                x + along * cos_r,
-                y + along * sin_r,
-                height,
-                rotation,
-                1.0,
-                0.0,
-                text::HAlign::Left,
+                text,
+                x,
+                y,
+                text::frame(
+                    span_height(first, base_height),
+                    rotation,
+                    base_width,
+                    base_oblique,
+                ),
+                h_align,
                 text::VAlign::Baseline,
                 ctx,
                 rgba,
                 attr,
-                face_of(span),
+                first.face.unwrap_or(face),
             );
+            return;
+        }
+
+        let (placed, total) = self.mtext_line_layout(line, base_height, face, base_width);
+        let offset = match h_align {
+            text::HAlign::Center | text::HAlign::Middle => -total / 2.0,
+            text::HAlign::Right => -total,
+            _ => 0.0,
+        };
+
+        let (sin_r, cos_r) = rotation.sin_cos();
+        let at = |along: f64, up: f64| {
+            [
+                x + along * cos_r - up * sin_r,
+                y + along * sin_r + up * cos_r,
+            ]
+        };
+        for (i, piece, start, width) in placed {
+            let span = &spans[i];
+            let along = start + offset;
+            let height = span_height(span, base_height);
+            let (rgba, attr) = match span.color {
+                Some(c) => self.span_colour(c, rgba, attr),
+                None => (rgba, attr),
+            };
+            let face = span.face.unwrap_or(face);
+            let w = span.width.unwrap_or(base_width);
+            let frame = text::frame(height, rotation, w, span.oblique.unwrap_or(base_oblique));
+            if let Some(stack) = &span.stack {
+                let shape = (w, span.oblique.unwrap_or(base_oblique));
+                self.mtext_stack(
+                    stack,
+                    at(along, 0.0),
+                    rotation,
+                    height,
+                    shape,
+                    width,
+                    ctx,
+                    rgba,
+                    attr,
+                    face,
+                );
+            } else if let Some(t) = span.tracking.filter(|t| *t != 1.0) {
+                // Each character at its advance times the tracking.
+                let metrics = font::Metrics::for_face(face);
+                let mut pen = along;
+                for c in piece.chars() {
+                    let p = at(pen, 0.0);
+                    let (l, b) = (text::HAlign::Left, text::VAlign::Baseline);
+                    self.push_text_run(
+                        c.to_string(),
+                        p[0],
+                        p[1],
+                        frame,
+                        l,
+                        b,
+                        ctx,
+                        rgba,
+                        attr,
+                        face,
+                    );
+                    pen += metrics.advance(c) * height * w * t;
+                }
+            } else {
+                let p = at(along, 0.0);
+                let (l, b) = (text::HAlign::Left, text::VAlign::Baseline);
+                self.push_text_run(piece, p[0], p[1], frame, l, b, ctx, rgba, attr, face);
+            }
 
             // The three rules, as strokes along the run at the usual offsets.
             for (on, dy) in [
@@ -897,16 +1465,73 @@ impl<'a> Tessellator<'a> {
                 if !on {
                     continue;
                 }
-                let a = ctx.xf.apply(
-                    x + along * cos_r - dy * sin_r,
-                    y + along * sin_r + dy * cos_r,
-                );
-                let b = ctx.xf.apply(
-                    x + (along + width) * cos_r - dy * sin_r,
-                    y + (along + width) * sin_r + dy * cos_r,
-                );
+                let (a, b) = (at(along, dy), at(along + width, dy));
+                let (a, b) = (ctx.xf.apply(a[0], a[1]), ctx.xf.apply(b[0], b[1]));
                 self.scene.push_stroke(a[0], a[1], b[0], b[1], rgba, attr);
             }
+        }
+    }
+
+    /// A stack on the baseline at `p`, `width` wide (`stack_width`): its
+    /// parts at [`STACK_SIZE`] of the height, one above the other about the
+    /// capitals' middle (across a bar for a fraction, left-aligned for a
+    /// tolerance), or side by side across a slash.
+    #[allow(clippy::too_many_arguments)]
+    fn mtext_stack(
+        &mut self,
+        s: &text::Stack,
+        p: [f64; 2],
+        rotation: f64,
+        height: f64,
+        (w, oblique): (f64, f64),
+        width: f64,
+        ctx: &Ctx,
+        rgba: u32,
+        attr: u32,
+        face: font::Face,
+    ) {
+        let part = height * STACK_SIZE;
+        let metrics = font::Metrics::for_face(face);
+        let wide = |t: &str| metrics.measure(t) * part * w;
+        let (sin_r, cos_r) = rotation.sin_cos();
+        let at = |along: f64, up: f64| {
+            [
+                p[0] + along * cos_r - up * sin_r,
+                p[1] + along * sin_r + up * cos_r,
+            ]
+        };
+        let frame = text::frame(part, rotation, w, oblique);
+        // Where each part's baseline starts, and the bar or slash.
+        let (upper, lower, line) = match s.kind {
+            text::StackKind::Diagonal => {
+                let slant = 0.5 * part;
+                let wu = wide(&s.upper);
+                (
+                    (0.0, height - part),
+                    (wu + slant, 0.0),
+                    Some(((wu, 0.0), (wu + slant, height))),
+                )
+            }
+            kind => {
+                let (bar, gap) = (0.5 * height, 0.2 * part);
+                let centre = kind == text::StackKind::Fraction;
+                let x = |t: &str| if centre { (width - wide(t)) / 2.0 } else { 0.0 };
+                (
+                    (x(&s.upper), bar + gap),
+                    (x(&s.lower), bar - gap - part),
+                    centre.then_some(((0.0, bar), (width, bar))),
+                )
+            }
+        };
+        for (t, (along, up)) in [(&s.upper, upper), (&s.lower, lower)] {
+            let q = at(along, up);
+            let (l, b) = (text::HAlign::Left, text::VAlign::Baseline);
+            self.push_text_run(t.clone(), q[0], q[1], frame, l, b, ctx, rgba, attr, face);
+        }
+        if let Some(((a0, a1), (b0, b1))) = line {
+            let (a, b) = (at(a0, a1), at(b0, b1));
+            let (a, b) = (ctx.xf.apply(a[0], a[1]), ctx.xf.apply(b[0], b[1]));
+            self.scene.push_stroke(a[0], a[1], b[0], b[1], rgba, attr);
         }
     }
 
@@ -970,8 +1595,17 @@ impl<'a> Tessellator<'a> {
                     && limits[2] > limits[0]
                     && limits[3] > limits[1])
                     .then_some(limits),
+                // Group 72: 0 inches, 1 millimetres, 2 pixels (no physical
+                // size, taken as millimetres).
+                mm_per_unit: if l.plot.paper_units == 0 { 25.4 } else { 1.0 },
             });
         }
+        // Without LAYOUT objects, the sheet is in the drawing's own system.
+        let mm_per_unit = if self.doc.header.measurement == 0 {
+            25.4
+        } else {
+            1.0
+        };
 
         // Some drawings carry no LAYOUT objects at all (R13 and R14 DWG
         // saved by AutoCAD before layouts): model space still draws, and so
@@ -984,6 +1618,7 @@ impl<'a> Tessellator<'a> {
                 is_model: true,
                 tab_order: 0,
                 limits: None,
+                mm_per_unit,
             });
         }
         let paper = self
@@ -1002,6 +1637,7 @@ impl<'a> Tessellator<'a> {
                     && limits[2] > limits[0]
                     && limits[3] > limits[1])
                     .then_some(limits),
+                mm_per_unit,
             });
         }
         out.sort_by_key(|l| (!l.is_model, l.tab_order));
@@ -1018,9 +1654,15 @@ impl<'a> Tessellator<'a> {
             return false;
         };
         let block = layout.block.clone();
+        if !layout.is_model {
+            self.sheet.mm_per_unit = layout.mm_per_unit;
+        }
+        // The paper is known first: what is drawn on it is sized by it.
+        let limits = layout.limits.filter(|_| !layout.is_model);
+        self.sheet.paper = limits;
         self.run_block(&block, !layout.is_model);
         // The sheet, not the contents: see `Scene::set_extents`.
-        if let Some(l) = layout.limits.filter(|_| !layout.is_model) {
+        if let Some(l) = limits {
             self.scene.set_extents([l[0], l[1]], [l[2], l[3]]);
         }
         true
@@ -1054,14 +1696,12 @@ impl<'a> Tessellator<'a> {
 
         let roots = self.in_draw_order(entities);
         for e in roots {
-            if paper {
-                if let EntityKind::Viewport(v) = &e.kind {
-                    self.scene.order = self.scene.order.saturating_add(1);
-                    if Some(e.handle.0) != sheet_view {
-                        self.viewport(v);
-                    }
-                    continue;
+            if paper && let EntityKind::Viewport(v) = &e.kind {
+                self.scene.order = self.scene.order.saturating_add(1);
+                if Some(e.handle.0) != sheet_view {
+                    self.viewport(v);
                 }
+                continue;
             }
             self.entity(e, &ctx);
         }
@@ -1071,6 +1711,7 @@ impl<'a> Tessellator<'a> {
         if paper {
             self.scene.recompute_extents();
         }
+        self.scene.focus_on_core();
     }
 
     fn root_ctx(&self) -> Ctx {
@@ -1222,11 +1863,10 @@ impl<'a> Tessellator<'a> {
                 expand_bulges(&pts, true)
             }
             EntityKind::Circle(c) => curves::flatten_circle(c.center.x, c.center.y, c.radius),
-            EntityKind::Ellipse(el) => curves::flatten_ellipse(
-                el.center.x,
-                el.center.y,
-                el.major_axis.x,
-                el.major_axis.y,
+            EntityKind::Ellipse(el) => curves::flatten_ellipse_in_space(
+                [el.center.x, el.center.y, el.center.z],
+                [el.major_axis.x, el.major_axis.y, el.major_axis.z],
+                [el.extrusion.x, el.extrusion.y, el.extrusion.z],
                 el.ratio,
                 el.start_param,
                 el.end_param,
@@ -1292,19 +1932,21 @@ impl<'a> Tessellator<'a> {
 
         // Colour 7 flips with the background; every other colour, including a
         // true colour that happens to be white, is drawn as stored.
-        let (rgba, contrast) = match common.color {
-            Color::ByLayer => (layer.rgba, layer.contrast),
-            Color::ByBlock => (ctx.rgba, ctx.contrast),
+        let (rgb, contrast) = match common.color {
+            Color::ByLayer => (layer.rgba & 0x00ff_ffff, layer.contrast),
+            Color::ByBlock => (ctx.rgba & 0x00ff_ffff, ctx.contrast),
             ref c => {
                 let (r, g, b) = colour_rgb(c, self.palette)?;
-                let alpha = match common.transparency {
-                    Transparency::Alpha(a) => a,
-                    Transparency::ByBlock => (ctx.rgba >> 24) as u8,
-                    Transparency::ByLayer => (layer.rgba >> 24) as u8,
-                };
-                (pack_rgba(r, g, b, alpha), is_contrast_color(c))
+                (pack_rgba(r, g, b, 0), is_contrast_color(c))
             }
         };
+        // Transparency resolves on its own, whatever the colour does.
+        let alpha = match common.transparency {
+            Transparency::Alpha(a) => a,
+            Transparency::ByBlock => (ctx.rgba >> 24) as u8,
+            Transparency::ByLayer => (layer.rgba >> 24) as u8,
+        };
+        let rgba = rgb | u32::from(alpha) << 24;
         let flags = if contrast { FLAG_CONTRAST } else { 0 };
 
         let lw = match common.lineweight {
@@ -1317,6 +1959,11 @@ impl<'a> Tessellator<'a> {
     }
 
     fn entity(&mut self, e: &Entity, outer: &Ctx) {
+        self.entity_geometry(e, outer);
+        self.scene.edge_fills();
+    }
+
+    fn entity_geometry(&mut self, e: &Entity, outer: &Ctx) {
         // Advance the draw order for every entity, drawn or not, so the
         // sequence matches the document's own.
         self.scene.order = self.scene.order.saturating_add(1);
@@ -1361,27 +2008,29 @@ impl<'a> Tessellator<'a> {
             }
 
             EntityKind::Circle(c) => {
-                let pts = curves::flatten_circle(c.center.x, c.center.y, c.radius);
-                self.push_transformed(&pts, false, xf, rgba, attr, pattern);
+                let tau = std::f64::consts::TAU;
+                self.push_curve(
+                    c.center.x, c.center.y, c.radius, 0.0, tau, xf, rgba, attr, pattern,
+                );
             }
 
             EntityKind::Arc(a) => {
-                let pts = curves::flatten_arc(
-                    a.center.x,
-                    a.center.y,
-                    a.radius,
-                    a.start_angle,
-                    a.end_angle,
-                );
-                self.push_transformed(&pts, false, xf, rgba, attr, pattern);
+                // DWG arcs always run counter-clockwise from start to end.
+                let sweep = (a.end_angle - a.start_angle).rem_euclid(std::f64::consts::TAU);
+                let sweep = if sweep > 0.0 {
+                    sweep
+                } else {
+                    std::f64::consts::TAU
+                };
+                let (c, r) = (a.center, a.radius);
+                self.push_curve(c.x, c.y, r, a.start_angle, sweep, xf, rgba, attr, pattern);
             }
 
             EntityKind::Ellipse(el) => {
-                let pts = curves::flatten_ellipse(
-                    el.center.x,
-                    el.center.y,
-                    el.major_axis.x,
-                    el.major_axis.y,
+                let pts = curves::flatten_ellipse_in_space(
+                    [el.center.x, el.center.y, el.center.z],
+                    [el.major_axis.x, el.major_axis.y, el.major_axis.z],
+                    [el.extrusion.x, el.extrusion.y, el.extrusion.z],
                     el.ratio,
                     el.start_param,
                     el.end_param,
@@ -1390,25 +2039,49 @@ impl<'a> Tessellator<'a> {
             }
 
             EntityKind::LwPolyline(p) => {
-                let pts: Vec<([f64; 2], f64)> = p
+                // Group 43, the constant width, stands for every vertex's.
+                let wide: Vec<WideVertex> = p
                     .vertices
                     .iter()
-                    .map(|v| ([v.point.x, v.point.y], v.bulge))
+                    .map(|v| {
+                        let (w0, w1) = if p.constant_width > 0.0 {
+                            (p.constant_width, p.constant_width)
+                        } else {
+                            (v.start_width, v.end_width)
+                        };
+                        WideVertex {
+                            p: [v.point.x, v.point.y],
+                            bulge: v.bulge,
+                            start_width: w0,
+                            end_width: w1,
+                        }
+                    })
                     .collect();
-                let closed = p.is_closed();
-                let flat = expand_bulges(&pts, closed);
-                self.push_transformed(&flat, closed, xf, rgba, attr, pattern);
+                let pattern = pattern.map(|q| (q, p.flags & 128 != 0));
+                self.polyline(&wide, p.is_closed(), xf, rgba, attr, pattern);
             }
 
             EntityKind::Polyline(p) if p.kind() == PolylineKind::Polyline2D => {
-                let pts: Vec<([f64; 2], f64)> = p
+                // A vertex without widths of its own takes the polyline's.
+                let wide: Vec<WideVertex> = p
                     .vertices
                     .iter()
-                    .map(|v| ([v.location.x, v.location.y], v.bulge))
+                    .map(|v| {
+                        let (w0, w1) = if v.start_width == 0.0 && v.end_width == 0.0 {
+                            (p.default_start_width, p.default_end_width)
+                        } else {
+                            (v.start_width, v.end_width)
+                        };
+                        WideVertex {
+                            p: [v.location.x, v.location.y],
+                            bulge: v.bulge,
+                            start_width: w0,
+                            end_width: w1,
+                        }
+                    })
                     .collect();
-                let closed = p.is_closed();
-                let flat = expand_bulges(&pts, closed);
-                self.push_transformed(&flat, closed, xf, rgba, attr, pattern);
+                let pattern = pattern.map(|q| (q, p.flags & 128 != 0));
+                self.polyline(&wide, p.is_closed(), xf, rgba, attr, pattern);
             }
 
             EntityKind::Polyline(p) if p.kind() == PolylineKind::Polyline3D => {
@@ -1425,11 +2098,7 @@ impl<'a> Tessellator<'a> {
                 self.push_transformed(&pts, false, xf, rgba, attr, pattern);
             }
 
-            EntityKind::Point(p) => {
-                // Zero-length stroke; the renderer draws it as a round dot.
-                let a = xf.apply(p.location.x, p.location.y);
-                self.scene.push_stroke(a[0], a[1], a[0], a[1], rgba, attr);
-            }
+            EntityKind::Point(p) => self.point(p, xf, rgba, attr),
 
             EntityKind::Solid(s) | EntityKind::Trace(s) => {
                 // SOLID and TRACE store their corners in Z order, so corners 3
@@ -1453,8 +2122,50 @@ impl<'a> Tessellator<'a> {
                     xf.apply(c[2].x, c[2].y),
                     xf.apply(c[3].x, c[3].y),
                 ];
-                // 3DFACE is an outline in a 2D view, not a filled region.
-                self.push_path(&q, true, rgba, attr, pattern);
+                // 3DFACE is an outline in a 2D view, not a filled region,
+                // without the edges its flags hide.
+                if f.invisible_edges & 0x0F == 0 {
+                    self.push_path(&q, true, rgba, attr, pattern);
+                } else {
+                    for i in 0..4 {
+                        if f.invisible_edges & (1 << i) == 0 {
+                            self.push_path(&[q[i], q[(i + 1) % 4]], false, rgba, attr, pattern);
+                        }
+                    }
+                }
+            }
+
+            // Meshes in plan: their edges.
+            EntityKind::Mesh(m) => {
+                let mut seen = HashSet::new();
+                for f in &m.faces {
+                    for (k, &a) in f.iter().enumerate() {
+                        let b = f[(k + 1) % f.len()];
+                        if !seen.insert((a.min(b), a.max(b))) {
+                            continue;
+                        }
+                        let (pa, pb) = (m.vertices[a as usize], m.vertices[b as usize]);
+                        self.push_transformed(
+                            &[[pa.x, pa.y], [pb.x, pb.y]],
+                            false,
+                            xf,
+                            rgba,
+                            attr,
+                            pattern,
+                        );
+                    }
+                }
+            }
+            EntityKind::Tolerance(t) => self.tolerance(t, ctx, rgba, attr),
+            EntityKind::Polyline(p) if p.kind() == PolylineKind::PolygonMesh => {
+                for edge in polygon_mesh_edges(p) {
+                    self.push_transformed(&edge, false, xf, rgba, attr, pattern);
+                }
+            }
+            EntityKind::Polyline(p) if p.kind() == PolylineKind::PolyfaceMesh => {
+                for edge in polyface_edges(p) {
+                    self.push_transformed(&edge, false, xf, rgba, attr, pattern);
+                }
             }
 
             EntityKind::MLine(m) => {
@@ -1521,6 +2232,12 @@ impl<'a> Tessellator<'a> {
 
             EntityKind::Insert(ins) => self.insert(ins, ctx, lid, rgba, contrast, lw, lt),
 
+            EntityKind::Dimension(d)
+                if d.block_name.is_empty() || self.block(&d.block_name).is_none() =>
+            {
+                self.dimension(d, ctx, rgba, attr);
+            }
+
             EntityKind::Dimension(d) => {
                 // AutoCAD bakes dimension graphics into an anonymous block.
                 // Render that instead of reimplementing the dimension engine.
@@ -1555,49 +2272,23 @@ impl<'a> Tessellator<'a> {
 
             EntityKind::Text(t) => self.text(t, ctx, rgba, attr),
 
-            EntityKind::Attribute(a) => self.attribute_text(&a.text, ctx, rgba, attr),
+            // A multiline attribute (2018 on) is an MTEXT.
+            EntityKind::Attribute(a) => match &a.mtext {
+                Some(m) => self.mtext(m, ctx, rgba, attr),
+                None => self.attribute_text(&a.text, ctx, rgba, attr),
+            },
 
-            EntityKind::MText(m) => {
-                let height = if m.height > 0.0 { m.height } else { 1.0 };
-                let face = self.style_face(&m.style);
-                let lines = self.wrap_mtext(&m.text, m.reference_width, height, face);
-                let spacing = height
-                    * text::MTEXT_LINE_SPACING
-                    * if m.line_spacing_factor > 0.0 {
-                        m.line_spacing_factor
-                    } else {
-                        1.0
-                    };
-
-                // DWG stores the text direction as a vector when it has one.
-                let rotation = match m.x_direction {
-                    Some(d) if d.x != 0.0 || d.y != 0.0 => d.y.atan2(d.x),
-                    _ => m.rotation,
-                };
-                let (h_align, dy0) =
-                    text::mtext_layout(m.attachment as u8, lines.len(), height, spacing);
-
-                let (sin_r, cos_r) = rotation.sin_cos();
-                for (i, line) in lines.iter().enumerate() {
-                    if line.spans.is_empty() {
-                        continue;
-                    }
-                    // Lines stack along the text's own down direction.
-                    let dy = dy0 - i as f64 * spacing;
-                    let x = m.insertion.x - dy * sin_r;
-                    let y = m.insertion.y + dy * cos_r;
-                    self.push_mtext_line(
-                        line, height, x, y, rotation, h_align, ctx, rgba, attr, face,
-                    );
-                }
-            }
+            EntityKind::MText(m) => self.mtext(m, ctx, rgba, attr),
 
             // An ordinary ATTDEF is the template for an ATTRIB carried by the
             // insert, so drawing it too would double the text. A *constant*
             // attribute has no ATTRIB: the definition is the only copy, and
-            // AutoCAD draws it.
-            EntityKind::AttributeDefinition(a) if a.is_constant() => {
-                self.attribute_text(&a.text, ctx, rgba, attr)
+            // AutoCAD draws it, unless it is invisible too.
+            EntityKind::AttributeDefinition(a) if a.is_constant() && !a.is_invisible() => {
+                match &a.mtext {
+                    Some(m) => self.mtext(m, ctx, rgba, attr),
+                    None => self.attribute_text(&a.text, ctx, rgba, attr),
+                }
             }
             EntityKind::AttributeDefinition(_) => {}
 
@@ -1626,13 +2317,13 @@ impl<'a> Tessellator<'a> {
             }),
 
             // A WIPEOUT blanks everything beneath it. Its boundary is given in
-            // image pixel coordinates along the u and v vectors.
+            // image pixel coordinates along the u and v vectors, from the top
+            // left with y down, of a 1 by 1 image.
             EntityKind::Wipeout(w) => {
                 let to_world = |p: [f64; 2]| {
-                    let x =
-                        w.insertion.x + w.u_vector.x * (p[0] + 0.5) + w.v_vector.x * (p[1] + 0.5);
-                    let y =
-                        w.insertion.y + w.u_vector.y * (p[0] + 0.5) + w.v_vector.y * (p[1] + 0.5);
+                    let (a, b) = (p[0] + 0.5, 0.5 - p[1]);
+                    let x = w.insertion.x + w.u_vector.x * a + w.v_vector.x * b;
+                    let y = w.insertion.y + w.u_vector.y * a + w.v_vector.y * b;
                     xf.apply(x, y)
                 };
                 let v = &w.clip_vertices;
@@ -1695,26 +2386,17 @@ impl<'a> Tessellator<'a> {
                 }
 
                 if l.arrowhead {
-                    // A filled triangle at the first vertex, pointing back
-                    // along the first segment, as long as the dimension
-                    // style's arrow size (DIMASZ times DIMSCALE) and a third
-                    // as wide: AutoCAD's default closed filled arrowhead.
+                    // At the first vertex, pointing back along the first
+                    // segment, the dimension style's arrow size (DIMASZ
+                    // times DIMSCALE) long, in its leader arrow (DIMLDRBLK).
                     let size = self.arrow_size(&l.style);
-                    let d = [pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]];
-                    let len = d[0].hypot(d[1]);
-                    if size > 0.0 && len > 1e-9 {
-                        let u = [d[0] / len, d[1] / len];
-                        let n = [-u[1], u[0]];
-                        let base = [pts[0][0] + u[0] * size, pts[0][1] + u[1] * size];
-                        let half = size / 6.0;
-                        self.scene.push_triangle(
-                            xf.apply(pts[0][0], pts[0][1]),
-                            xf.apply(base[0] + n[0] * half, base[1] + n[1] * half),
-                            xf.apply(base[0] - n[0] * half, base[1] - n[1] * half),
-                            rgba,
-                            attr,
-                        );
-                    }
+                    let block = self
+                        .doc
+                        .dim_styles
+                        .iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(&l.style))
+                        .map_or(Handle::NULL, |s| s.dimldrblk);
+                    self.arrowhead(block, pts[0], pts[1], size, ctx, rgba, attr);
                 }
             }
 
@@ -1722,8 +2404,13 @@ impl<'a> Tessellator<'a> {
             // that can be drawn is the frame, which is what AutoCAD shows for
             // an image it cannot load, and the count so the host can say so.
             EntityKind::Image(img) => {
-                self.warnings.external_references =
-                    self.warnings.external_references.saturating_add(1);
+                let file = self
+                    .doc
+                    .image_defs
+                    .iter()
+                    .find(|d| d.handle == img.image_def);
+                self.warnings
+                    .external(file.map_or("", |d| d.file_name.as_str()));
                 let u = [img.u_vector.x, img.u_vector.y];
                 let v = [img.v_vector.x, img.v_vector.y];
                 let o = [img.insertion.x, img.insertion.y];
@@ -1734,18 +2421,42 @@ impl<'a> Tessellator<'a> {
                         o[1] + u[1] * a * w + v[1] * b * h,
                     ]
                 };
-                let frame = [
+                let mut frame = vec![
                     corner(0.0, 0.0),
                     corner(1.0, 0.0),
                     corner(1.0, 1.0),
                     corner(0.0, 1.0),
                 ];
+                // A crop shows only its boundary. Its pixels count from the
+                // top left, y down, and the first pixel is centred on 0.
+                let v = &img.clip_vertices;
+                if img.clipping && !img.clip_inverted && v.len() >= 2 && w > 0.0 && h > 0.0 {
+                    let at = |p: [f64; 2]| corner((p[0] + 0.5) / w, 1.0 - (p[1] + 0.5) / h);
+                    // Two vertices are opposite corners of a rectangle.
+                    let mut poly: Vec<[f64; 2]> = if v.len() == 2 {
+                        let (a, b) = (v[0], v[1]);
+                        vec![[a.x, a.y], [b.x, a.y], [b.x, b.y], [a.x, b.y]]
+                    } else {
+                        v.iter().map(|p| [p.x, p.y]).collect()
+                    };
+                    // A path may repeat its first point to close; the frame
+                    // closes itself.
+                    if poly.len() > 3 && poly.first() == poly.last() {
+                        poly.pop();
+                    }
+                    frame = poly.into_iter().map(at).collect();
+                }
                 self.push_transformed(&frame, true, xf, rgba, attr, pattern);
             }
 
             EntityKind::Underlay(u) => {
-                self.warnings.external_references =
-                    self.warnings.external_references.saturating_add(1);
+                let file = self
+                    .doc
+                    .underlay_defs
+                    .iter()
+                    .find(|d| d.handle == u.definition);
+                self.warnings
+                    .external(file.map_or("", |d| d.file_name.as_str()));
                 if u.clip_vertices.len() >= 2 {
                     let pts: Vec<[f64; 2]> = u.clip_vertices.iter().map(|p| [p.x, p.y]).collect();
                     // Two points are the corners of a rectangle, more are a path.
@@ -1771,8 +2482,7 @@ impl<'a> Tessellator<'a> {
             }
 
             EntityKind::Ole2Frame(o) => {
-                self.warnings.external_references =
-                    self.warnings.external_references.saturating_add(1);
+                self.warnings.external("");
                 let (a, b) = (o.upper_left, o.lower_right);
                 let frame = [[a.x, a.y], [b.x, a.y], [b.x, b.y], [a.x, b.y]];
                 self.push_transformed(&frame, true, xf, rgba, attr, pattern);
@@ -1796,11 +2506,11 @@ impl<'a> Tessellator<'a> {
                     self.warnings.proxy_without_graphics.saturating_add(1);
             }
 
-            // Meshes, SHAPE (a glyph of an SHX file, which cannot be shipped)
-            // and every other type the model does not hold.
-            EntityKind::Polyline(_) | EntityKind::Shape(_) | EntityKind::Unknown(_) => {
-                self.warnings.unknown_entities = self.warnings.unknown_entities.saturating_add(1);
-            }
+            // SHAPE (a glyph of an SHX file, which cannot be shipped) and
+            // every other type the model does not hold.
+            EntityKind::Polyline(_) => self.warnings.not_drawn("POLYLINE"),
+            EntityKind::Shape(_) => self.warnings.not_drawn("SHAPE"),
+            EntityKind::Unknown(u) => self.warnings.not_drawn(&u.type_name),
         }
     }
 
@@ -1841,7 +2551,7 @@ impl<'a> Tessellator<'a> {
         } else {
             t.alignment_point.unwrap_or(t.insertion)
         };
-        let value = text::decode_special(&t.value);
+        let value = self.style_text(&t.style, &t.value);
 
         // Aligned and Fit stretch the string between two points rather than
         // anchoring it at one, so they need its width. Aligned scales the
@@ -1849,31 +2559,42 @@ impl<'a> Tessellator<'a> {
         // instead.
         let stretched = matches!(t.h_align, HAlign::Aligned | HAlign::Fit);
         let face = self.style_face(&t.style);
-        if stretched {
-            if let Some(second) = t.alignment_point {
-                let first = t.insertion;
-                let span = (second.x - first.x).hypot(second.y - first.y);
-                let natural = font::Metrics::for_face(face).measure(&value) * t.height;
-                if span > 1e-9 && natural > 1e-9 {
-                    let factor = span / natural;
-                    let fit = t.h_align == HAlign::Fit;
-                    self.push_text_run(
-                        value,
-                        first.x,
-                        first.y,
-                        if fit { t.height } else { t.height * factor },
-                        (second.y - first.y).atan2(second.x - first.x),
-                        if fit { factor } else { 1.0 },
-                        t.oblique,
-                        text::HAlign::Left,
-                        v_align_of(t.v_align),
-                        ctx,
-                        rgba,
-                        attr,
-                        face,
-                    );
-                    return;
-                }
+        let width_factor = if t.width_factor > 0.0 {
+            t.width_factor
+        } else {
+            1.0
+        };
+        if stretched && let Some(second) = t.alignment_point {
+            let first = t.insertion;
+            let span = (second.x - first.x).hypot(second.y - first.y);
+            let natural = font::Metrics::for_face(face).measure(&value) * t.height * width_factor;
+            if span > 1e-9 && natural > 1e-9 {
+                let factor = span / natural;
+                let fit = t.h_align == HAlign::Fit;
+                let frame = text::generated_frame(
+                    if fit { t.height } else { t.height * factor },
+                    (second.y - first.y).atan2(second.x - first.x),
+                    if fit {
+                        width_factor * factor
+                    } else {
+                        width_factor
+                    },
+                    t.oblique,
+                    t.generation,
+                );
+                self.push_text_run(
+                    value,
+                    first.x,
+                    first.y,
+                    frame,
+                    text::HAlign::Left,
+                    text::VAlign::Baseline,
+                    ctx,
+                    rgba,
+                    attr,
+                    face,
+                );
+                return;
             }
         }
 
@@ -1881,10 +2602,13 @@ impl<'a> Tessellator<'a> {
             value,
             anchor.x,
             anchor.y,
-            t.height,
-            t.rotation,
-            t.width_factor,
-            t.oblique,
+            text::generated_frame(
+                t.height,
+                t.rotation,
+                t.width_factor,
+                t.oblique,
+                t.generation,
+            ),
             h_align_of(t.h_align),
             v_align_of(t.v_align),
             ctx,
@@ -1905,13 +2629,16 @@ impl<'a> Tessellator<'a> {
         };
         let face = self.style_face(&t.style);
         self.push_text_run(
-            text::decode_special(&t.value),
+            self.style_text(&t.style, &t.value),
             anchor.x,
             anchor.y,
-            t.height,
-            t.rotation,
-            t.width_factor,
-            t.oblique,
+            text::generated_frame(
+                t.height,
+                t.rotation,
+                t.width_factor,
+                t.oblique,
+                t.generation,
+            ),
             h_align_of(t.h_align),
             v_align_of(t.v_align),
             ctx,
@@ -1932,10 +2659,7 @@ impl<'a> Tessellator<'a> {
         value: String,
         x: f64,
         y: f64,
-        height: f64,
-        rotation: f64,
-        width_factor: f64,
-        oblique: f64,
+        (u, v): ([f64; 2], [f64; 2]),
         h_align: text::HAlign,
         v_align: text::VAlign,
         ctx: &Ctx,
@@ -1946,22 +2670,30 @@ impl<'a> Tessellator<'a> {
         if value.trim().is_empty() {
             return;
         }
+        // The stroke font has no CJK and few symbols: a run with characters
+        // it lacks goes to an outline face, which the browser completes from
+        // the system's fonts where the bundle has none.
+        let stroke = super::stroke_font::newstroke();
+        let face = if face == font::Face::Stroke
+            && value
+                .chars()
+                .any(|c| !c.is_whitespace() && stroke.glyph(c).is_none())
+        {
+            font::Face::default()
+        } else {
+            face
+        };
         let p = ctx.xf.apply(x, y);
-        // Blocks rotate and scale their contents, so the text follows.
-        let block_rotation = ctx.xf.b.atan2(ctx.xf.a);
-        let scale = ctx.xf.scale_magnitude();
+        // Blocks rotate, scale and mirror their contents, so the text
+        // follows, its frame with them.
+        let xf = &ctx.xf;
+        let linear = |w: [f64; 2]| [xf.a * w[0] + xf.c * w[1], xf.b * w[0] + xf.d * w[1]];
         self.warnings.text_runs = self.warnings.text_runs.saturating_add(1);
         let run = text::TextRun {
             x: p[0],
             y: p[1],
-            height: if height > 0.0 { height * scale } else { scale },
-            rotation: rotation + block_rotation,
-            width_factor: if width_factor > 0.0 {
-                width_factor
-            } else {
-                1.0
-            },
-            oblique,
+            u: linear(u),
+            v: linear(v),
             rgba,
             attr,
             h_align,
@@ -1969,6 +2701,7 @@ impl<'a> Tessellator<'a> {
             text: value,
             face,
             order: self.scene.order,
+            clip: 0,
         };
         match face {
             font::Face::Stroke => self.push_stroke_text(&run),
@@ -1985,19 +2718,14 @@ impl<'a> Tessellator<'a> {
     /// order, layer visibility and viewport clipping all come from `attr`.
     fn push_stroke_text(&mut self, run: &text::TextRun) {
         let stroke = super::stroke_font::newstroke();
-        let height = run.height;
-        if !(height > 0.0) {
+        if !(run.height() > 0.0) {
             return;
         }
-        let advance_scale = height * run.width_factor;
-        let width: f64 = run
-            .text
-            .chars()
-            .map(|c| stroke.advance(c) as f64 * advance_scale)
-            .sum();
+        // Everything is in cap heights until the frame places it.
+        let width: f64 = run.text.chars().map(|c| stroke.advance(c) as f64).sum();
 
-        // Aligned and Fit stretch between two points the record does not carry,
-        // so they centre, as the host's path does.
+        // Aligned and Fit arrive stretched and left-aligned (`text`); here
+        // they centre, as the host's path does.
         let dx = match run.h_align {
             text::HAlign::Center
             | text::HAlign::Middle
@@ -2006,17 +2734,12 @@ impl<'a> Tessellator<'a> {
             text::HAlign::Right => -width,
             text::HAlign::Left => 0.0,
         };
-        let dy = match run.v_align {
-            text::VAlign::Middle => -height / 2.0,
-            text::VAlign::Top => -height,
-            text::VAlign::Baseline | text::VAlign::Bottom => 0.0,
-        };
-
-        let (sin_r, cos_r) = run.rotation.sin_cos();
-        let tan_o = if run.oblique.abs() < std::f64::consts::FRAC_PI_2 {
-            run.oblique.tan()
-        } else {
-            0.0
+        let dy = text::baseline_offset(run.h_align, run.v_align, font::Face::Stroke);
+        let at = |a: f64, b: f64| {
+            [
+                run.x + a * run.u[0] + b * run.v[0],
+                run.y + a * run.u[1] + b * run.v[1],
+            ]
         };
 
         let mut pen = dx;
@@ -2031,22 +2754,142 @@ impl<'a> Tessellator<'a> {
                 for polyline in glyph.polylines() {
                     points.clear();
                     for p in polyline.points() {
-                        // Glyph units are cap heights, so the text height is
-                        // the only scale there is.
-                        let gx = pen + p[0] as f64 * advance_scale;
-                        let gy = dy + p[1] as f64 * height;
-                        // Oblique leans the vertical, shifting x by height.
-                        let sx = gx + gy * tan_o;
-                        points.push([
-                            run.x + sx * cos_r - gy * sin_r,
-                            run.y + sx * sin_r + gy * cos_r,
-                        ]);
+                        points.push(at(pen + p[0] as f64, dy + p[1] as f64));
                     }
                     self.scene.push_polyline(&points, false, run.rgba, run.attr);
                 }
             }
-            pen += stroke.advance(c) as f64 * advance_scale;
+            pen += stroke.advance(c) as f64;
         }
+    }
+
+    /// An LWPOLYLINE or 2D POLYLINE: a line through its bulges, or, where its
+    /// segments have width, the band they fill (outlined under `$FILLMODE`
+    /// 0). The band is in object coordinates and transformed corner by
+    /// corner, so a scaled block widens it too.
+    ///
+    /// A dashed one carries whether its linetype runs on across its vertices
+    /// (group 70 bit 128, PLINEGEN); without it each segment starts its
+    /// pattern afresh, as AutoCAD draws it.
+    fn polyline(
+        &mut self,
+        verts: &[WideVertex],
+        closed: bool,
+        xf: &Affine,
+        rgba: u32,
+        attr: u32,
+        dashes: Option<(&Pattern, bool)>,
+    ) {
+        let pattern = dashes.map(|(p, _)| p);
+        if !verts
+            .iter()
+            .any(|v| v.start_width > 0.0 || v.end_width > 0.0)
+        {
+            let pts: Vec<([f64; 2], f64)> = verts.iter().map(|v| (v.p, v.bulge)).collect();
+            if pattern.is_none()
+                && pts.iter().any(|p| p.1 != 0.0)
+                && self.push_bulged(&pts, closed, xf, rgba, attr)
+            {
+                return;
+            }
+            if let Some((p, false)) = dashes {
+                let segments = if closed {
+                    pts.len()
+                } else {
+                    pts.len().saturating_sub(1)
+                };
+                for i in 0..segments {
+                    let piece = expand_bulges(&[pts[i], pts[(i + 1) % pts.len()]], false);
+                    self.push_transformed(&piece, false, xf, rgba, attr, Some(p));
+                }
+                return;
+            }
+            let flat = expand_bulges(&pts, closed);
+            self.push_transformed(&flat, closed, xf, rgba, attr, pattern);
+            return;
+        }
+        let band = wide::band(verts, closed);
+        for run in &band.thin {
+            self.push_transformed(run, false, xf, rgba, attr, pattern);
+        }
+        if self.doc.header.fillmode {
+            for [a, b, c] in &band.triangles {
+                self.scene.push_triangle(
+                    xf.apply(a[0], a[1]),
+                    xf.apply(b[0], b[1]),
+                    xf.apply(c[0], c[1]),
+                    rgba,
+                    attr,
+                );
+            }
+        } else {
+            for outline in &band.outlines {
+                self.push_transformed(outline, true, xf, rgba, attr, None);
+            }
+        }
+    }
+
+    /// A circular arc in object coordinates (centre, radius, start angle,
+    /// signed sweep): arc strokes, exact at any zoom, when nothing dashes it
+    /// and the transform keeps circles round; else its flattened points.
+    #[allow(clippy::too_many_arguments)]
+    fn push_curve(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        r: f64,
+        start: f64,
+        sweep: f64,
+        xf: &Affine,
+        rgba: u32,
+        attr: u32,
+        pattern: Option<&Pattern>,
+    ) {
+        if pattern.is_none()
+            && let Some((scale, turn, mirrored)) = similarity(xf)
+        {
+            let c = xf.apply(cx, cy);
+            let (start, sweep) = if mirrored {
+                (turn - start, -sweep)
+            } else {
+                (start + turn, sweep)
+            };
+            self.scene
+                .push_arc(c[0], c[1], r * scale, start, sweep, rgba, attr);
+            return;
+        }
+        let pts = curves::arc_points(cx, cy, r, start, sweep);
+        self.push_transformed(&pts, false, xf, rgba, attr, pattern);
+    }
+
+    /// A polyline's straight and bulged segments, the bulged ones as arc
+    /// strokes, under a transform that keeps circles round; false, drawing
+    /// nothing, under any other.
+    fn push_bulged(
+        &mut self,
+        pts: &[([f64; 2], f64)],
+        closed: bool,
+        xf: &Affine,
+        rgba: u32,
+        attr: u32,
+    ) -> bool {
+        let Some((_, _, mirrored)) = similarity(xf) else {
+            return false;
+        };
+        let n = pts.len();
+        let segments = if closed { n } else { n.saturating_sub(1) };
+        for i in 0..segments {
+            let ((a, bulge), (b, _)) = (pts[i], pts[(i + 1) % n]);
+            let (wa, wb) = (xf.apply(a[0], a[1]), xf.apply(b[0], b[1]));
+            let bulge = if mirrored { -bulge } else { bulge };
+            if bulge == 0.0 || !bulge.is_finite() {
+                self.scene
+                    .push_stroke(wa[0], wa[1], wb[0], wb[1], rgba, attr);
+            } else if let Some((cx, cy, r, start, sweep)) = curves::bulge_arc(wa, wb, bulge) {
+                self.scene.push_arc(cx, cy, r, start, sweep, rgba, attr);
+            }
+        }
+        true
     }
 
     fn push_transformed(
@@ -2089,7 +2932,8 @@ impl<'a> Tessellator<'a> {
         self.scene.push_polyline(pts, closed, rgba, attr);
     }
 
-    /// Stamp a complex linetype's text along a path it has just dashed.
+    /// Stamp a complex linetype's text and shapes along a path it has just
+    /// dashed.
     fn push_line_labels(
         &mut self,
         pts: &[[f64; 2]],
@@ -2103,26 +2947,303 @@ impl<'a> Tessellator<'a> {
         }
         for place in linetype::dash_labels(pts, closed, pattern) {
             let label = &pattern.labels[place.label];
-            let run = text::TextRun {
-                x: place.x,
-                y: place.y,
-                height: label.height,
-                rotation: place.angle,
-                width_factor: 1.0,
-                oblique: 0.0,
-                rgba,
-                attr,
-                h_align: text::HAlign::Left,
-                v_align: text::VAlign::Baseline,
-                text: label.text.clone(),
-                face: label.face,
-                order: self.scene.order,
-            };
-            self.warnings.text_runs = self.warnings.text_runs.saturating_add(1);
-            match label.face {
-                font::Face::Stroke => self.push_stroke_text(&run),
-                font::Face::TrueType(_) => self.scene.push_text(run),
+            match &label.mark {
+                linetype::Mark::Text { text, face } => {
+                    let (u, v) = text::frame(label.height, place.angle, 1.0, 0.0);
+                    let run = text::TextRun {
+                        x: place.x,
+                        y: place.y,
+                        u,
+                        v,
+                        rgba,
+                        attr,
+                        h_align: text::HAlign::Left,
+                        v_align: text::VAlign::Baseline,
+                        text: text.clone(),
+                        face: *face,
+                        order: self.scene.order,
+                        clip: 0,
+                    };
+                    self.warnings.text_runs = self.warnings.text_runs.saturating_add(1);
+                    match face {
+                        font::Face::Stroke => self.push_stroke_text(&run),
+                        font::Face::TrueType(_) => self.scene.push_text(run),
+                    }
+                }
+                linetype::Mark::Shape(parts) => {
+                    let (sin, cos) = place.angle.sin_cos();
+                    let k = label.height;
+                    let at = |p: [f64; 2]| {
+                        [
+                            place.x + k * (p[0] * cos - p[1] * sin),
+                            place.y + k * (p[0] * sin + p[1] * cos),
+                        ]
+                    };
+                    for part in *parts {
+                        match part {
+                            linetype::ShapePart::Line(ps) => {
+                                for &[p, q] in ps.array_windows() {
+                                    let (a, b) = (at(p), at(q));
+                                    self.scene.push_stroke(a[0], a[1], b[0], b[1], rgba, attr);
+                                }
+                            }
+                            linetype::ShapePart::Arc(c, r, start, sweep) => {
+                                let c = at(*c);
+                                self.scene.push_arc(
+                                    c[0],
+                                    c[1],
+                                    r * k,
+                                    start + place.angle,
+                                    *sweep,
+                                    rgba,
+                                    attr,
+                                );
+                            }
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    /// An arrowhead `size` long at `tip`, pointing away from `from`: the
+    /// arrow block `block` names, drawn from the drawing's block of that
+    /// name when it has one (AutoCAD saves `_Open` and the like there), else
+    /// the built-in shape of that name, else the closed filled default.
+    #[allow(clippy::too_many_arguments)]
+    fn arrowhead(
+        &mut self,
+        block: Handle,
+        tip: [f64; 2],
+        from: [f64; 2],
+        size: f64,
+        ctx: &Ctx,
+        rgba: u32,
+        attr: u32,
+    ) {
+        let d = [tip[0] - from[0], tip[1] - from[1]];
+        if !(size > 0.0) || !(d[0].hypot(d[1]) > 1e-9) {
+            return;
+        }
+        let angle = d[1].atan2(d[0]);
+        let place = ctx.xf.mul(&Affine::new(tip[0], tip[1], size, size, angle));
+        let name = (!block.is_null())
+            .then(|| self.doc.blocks.iter().find(|b| b.record == block))
+            .flatten();
+        if let Some(b) = name.filter(|b| !b.entities.is_empty()) {
+            let (lid, lw) = (attr as u16, (attr >> 16) as u8);
+            let contrast = (attr >> 24) as u8 & FLAG_CONTRAST != 0;
+            let name = b.name.clone();
+            self.expand_block(
+                &name,
+                &place,
+                lid,
+                rgba,
+                contrast,
+                lw,
+                0,
+                ctx.lt_scale,
+                ctx.depth,
+            );
+            return;
+        }
+        let kind = name.map_or(String::new(), |b| b.name.to_ascii_uppercase());
+        let shape = arrow_shape(&kind);
+        let world = |p: &[f64; 2]| place.apply(p[0], p[1]);
+        for t in shape.filled.chunks(3) {
+            if let [a, b, c] = t {
+                self.scene
+                    .push_triangle(world(a), world(b), world(c), rgba, attr);
+            }
+        }
+        for line in shape.lines {
+            let pts: Vec<[f64; 2]> = line.iter().map(world).collect();
+            self.scene.push_polyline(&pts, false, rgba, attr);
+        }
+    }
+
+    /// A dimension saved without its block, drawn from its definition points
+    /// and its style (`dimension.rs`). A style the drawing does not have
+    /// falls back to the header's variables.
+    fn dimension(&mut self, d: &crate::cad::Dimension, ctx: &Ctx, rgba: u32, attr: u32) {
+        let h = &self.doc.header;
+        let style = self
+            .doc
+            .dim_styles
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&d.style))
+            .cloned()
+            .unwrap_or_else(|| crate::cad::DimStyle {
+                dimscale: h.dimscale,
+                dimasz: h.dimasz,
+                dimtxt: h.dimtxt,
+                dimgap: h.dimgap,
+                ..crate::cad::DimStyle::default()
+            });
+        let text_style = self
+            .doc
+            .text_styles
+            .iter()
+            .find(|ts| ts.handle == style.dimtxsty && !style.dimtxsty.is_null())
+            .map(|ts| ts.name.clone())
+            .unwrap_or_default();
+        let face = self.style_face(&text_style);
+        let metrics = font::Metrics::for_face(face);
+        let s = dimension::Style::new(&style);
+        let measure = |t: &str| metrics.measure(&text::decode_special(t));
+        let Some(g) = dimension::graphics(d, &s, &measure) else {
+            return;
+        };
+        for [a, b] in &g.lines {
+            let (a, b) = (ctx.xf.apply(a[0], a[1]), ctx.xf.apply(b[0], b[1]));
+            self.scene.push_stroke(a[0], a[1], b[0], b[1], rgba, attr);
+        }
+        for (c, r, start, sweep) in &g.arcs {
+            self.push_curve(c[0], c[1], *r, *start, *sweep, &ctx.xf, rgba, attr, None);
+        }
+        for (tip, from) in &g.arrows {
+            self.arrowhead(style.dimblk, *tip, *from, s.asz, ctx, rgba, attr);
+        }
+        if let Some(label) = g.label {
+            let content = crate::cad::MText {
+                insertion: crate::cad::Vec3::new(label.at[0], label.at[1], 0.0),
+                height: s.txt,
+                attachment: 5,
+                style: text_style,
+                rotation: label.rotation,
+                text: label.text,
+                ..crate::cad::MText::default()
+            };
+            self.mtext(&content, ctx, rgba, attr);
+        }
+    }
+
+    /// A TOLERANCE's feature control frame: a row per `^J`, a box per
+    /// `%%v`, each its text and the style's gap around it, the GD&T codes as
+    /// the symbols they stand for; hung from the middle of the first row's
+    /// left side, along its direction.
+    fn tolerance(&mut self, t: &crate::cad::Tolerance, ctx: &Ctx, rgba: u32, attr: u32) {
+        let style = self
+            .doc
+            .dim_styles
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&t.dimstyle));
+        let header = &self.doc.header;
+        let (txt, gap, scale) = match style {
+            Some(s) => (s.dimtxt, s.dimgap, s.dimscale),
+            None => (header.dimtxt, header.dimgap, header.dimscale),
+        };
+        let scale = if scale > 0.0 && scale.is_finite() {
+            scale
+        } else {
+            1.0
+        };
+        let height = if txt > 0.0 { txt * scale } else { 0.18 };
+        let gap = gap.abs() * scale;
+        let face = style
+            .and_then(|s| {
+                self.doc
+                    .text_styles
+                    .iter()
+                    .find(|ts| ts.handle == s.dimtxsty && !s.dimtxsty.is_null())
+            })
+            .map_or(font::Face::Stroke, |ts| self.style_face(&ts.name));
+        let metrics = font::Metrics::for_face(face);
+        let rotation = t.x_direction.y.atan2(t.x_direction.x);
+        let (sin_r, cos_r) = rotation.sin_cos();
+        let at = |a: f64, b: f64| {
+            ctx.xf.apply(
+                t.insertion.x + a * cos_r - b * sin_r,
+                t.insertion.y + a * sin_r + b * cos_r,
+            )
+        };
+        let row_height = height + 2.0 * gap;
+        for (r, row) in t.text.split("^J").enumerate() {
+            // The first row's middle is on the insertion point.
+            let top = row_height / 2.0 - r as f64 * row_height;
+            let mut left = 0.0;
+            for cell in row.split("%%v") {
+                let shown = text::decode_special(&gdt_codes(cell));
+                if shown.is_empty() {
+                    continue;
+                }
+                let width = metrics.measure(&shown) * height + 2.0 * gap;
+                let corners = [
+                    (left, top),
+                    (left + width, top),
+                    (left + width, top - row_height),
+                    (left, top - row_height),
+                ]
+                .map(|(a, b)| at(a, b));
+                self.scene.push_polyline(&corners, true, rgba, attr);
+                let (x, y) = (
+                    t.insertion.x + (left + gap) * cos_r - (top - gap - height) * sin_r,
+                    t.insertion.y + (left + gap) * sin_r + (top - gap - height) * cos_r,
+                );
+                let frame = text::frame(height, rotation, 1.0, 0.0);
+                let (l, b) = (text::HAlign::Left, text::VAlign::Baseline);
+                self.push_text_run(shown, x, y, frame, l, b, ctx, rgba, attr, face);
+                left += width;
+            }
+        }
+    }
+
+    /// A POINT in the drawing's `$PDMODE`: a dot (0), nothing (1), a plus
+    /// (2), a cross (3), a tick up (4), and around it a circle (+32) or a
+    /// square (+64), `$PDSIZE` across: units when above 0, else a share of
+    /// the drawing's height (5% at 0, -n for n%), as AutoCAD takes the
+    /// window's.
+    fn point(&mut self, p: &crate::cad::Point, xf: &Affine, rgba: u32, attr: u32) {
+        let h = &self.doc.header;
+        let mode = h.pdmode;
+        let at = xf.apply(p.location.x, p.location.y);
+        if mode & 7 == 0 {
+            // A zero-length stroke, which the renderer draws as a round dot.
+            self.scene
+                .push_stroke(at[0], at[1], at[0], at[1], rgba, attr);
+        }
+        if mode & !(7 | 32 | 64) != 0 || matches!(mode & 7, 0 | 1) && mode & 96 == 0 {
+            return;
+        }
+        let tall = h.extmax.y - h.extmin.y;
+        let tall = if tall.is_finite() && tall > 0.0 {
+            tall
+        } else {
+            20.0
+        };
+        let size = match h.pdsize {
+            s if s > 0.0 => s,
+            s if s < 0.0 => tall * -s / 100.0,
+            _ => tall * 0.05,
+        };
+        let r = size / 2.0;
+        let (sin_a, cos_a) = p.x_axis_angle.sin_cos();
+        let local = |x: f64, y: f64| {
+            xf.apply(
+                p.location.x + x * cos_a - y * sin_a,
+                p.location.y + x * sin_a + y * cos_a,
+            )
+        };
+        let segments: &[[(f64, f64); 2]] = match mode & 7 {
+            2 => &[[(-r, 0.0), (r, 0.0)], [(0.0, -r), (0.0, r)]],
+            3 => &[[(-r, -r), (r, r)], [(-r, r), (r, -r)]],
+            4 => &[[(0.0, 0.0), (0.0, r)]],
+            _ => &[],
+        };
+        for [(x0, y0), (x1, y1)] in segments {
+            let (a, b) = (local(*x0, *y0), local(*x1, *y1));
+            self.scene.push_stroke(a[0], a[1], b[0], b[1], rgba, attr);
+        }
+        if mode & 32 != 0 {
+            let ring: Vec<[f64; 2]> = curves::flatten_circle(0.0, 0.0, r)
+                .into_iter()
+                .map(|q| local(q[0], q[1]))
+                .collect();
+            self.scene.push_polyline(&ring, true, rgba, attr);
+        }
+        if mode & 64 != 0 {
+            let square = [(-r, -r), (r, -r), (r, r), (-r, r)].map(|(x, y)| local(x, y));
+            self.scene.push_polyline(&square, true, rgba, attr);
         }
     }
 
@@ -2168,9 +3289,12 @@ impl<'a> Tessellator<'a> {
                 ins.insertion.y + dx * sin_r + dy * cos_r,
             ];
             let child = Affine::new(p[0], p[1], sx, sy, ins.rotation);
+            let xf = ctx.xf.mul(&child);
+            let mark = self.scene.mark();
+            let infinite = self.pending_infinite.len();
             self.expand_block(
                 &ins.block_name,
-                &ctx.xf.mul(&child),
+                &xf,
                 lid,
                 rgba,
                 contrast,
@@ -2179,6 +3303,22 @@ impl<'a> Tessellator<'a> {
                 ctx.lt_scale,
                 ctx.depth,
             );
+            if let Some(outline) = self.xclip_outline(ins, &xf) {
+                if let Some(shape) = ClipShape::polygon(outline.clone()) {
+                    // The block's rays and xlines end at the boundary rather
+                    // than at the drawing's extents.
+                    let (min, max) = shape.bounds();
+                    for line in self.pending_infinite.split_off(infinite) {
+                        self.push_infinite(&line, min, max);
+                    }
+                    self.scene.clip_since(mark, &shape);
+                }
+                if self.doc.header.xclipframe != 0 {
+                    let flags = if contrast { FLAG_CONTRAST } else { 0 };
+                    let attr = pack_attr(lid, lw, flags);
+                    self.push_path(&outline, true, rgba, attr, None);
+                }
+            }
         }
 
         // The insert's attributes (title-block fields, room tags) are not in
@@ -2195,12 +3335,35 @@ impl<'a> Tessellator<'a> {
             depth: ctx.depth + 1,
         };
         for a in &ins.attributes {
-            if let EntityKind::Attribute(at) = &a.kind {
-                if !at.is_invisible() {
-                    self.entity(a, &attr_ctx);
-                }
+            if let EntityKind::Attribute(at) = &a.kind
+                && !at.is_invisible()
+            {
+                self.entity(a, &attr_ctx);
             }
         }
+    }
+
+    /// An insert's XCLIP boundary in world coordinates, when clipping is on:
+    /// it is in block coordinates, so the block's base point comes off as
+    /// for its entities. Two points are the corners of a rectangle.
+    fn xclip_outline(&self, ins: &crate::cad::Insert, xf: &Affine) -> Option<Vec<[f64; 2]>> {
+        let clip = ins.clip.as_ref().filter(|c| c.enabled)?;
+        let base = self.block(&ins.block_name)?.base_point;
+        let local: Vec<[f64; 2]> = match clip.boundary.as_slice() {
+            [a, b] => {
+                let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+                let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+                vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+            }
+            ps if ps.len() >= 3 => ps.iter().map(|p| [p.x, p.y]).collect(),
+            _ => return None,
+        };
+        Some(
+            local
+                .iter()
+                .map(|p| xf.apply(p[0] - base.x, p[1] - base.y))
+                .collect(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2234,6 +3397,51 @@ impl<'a> Tessellator<'a> {
             self.warnings.missing_blocks = self.warnings.missing_blocks.saturating_add(1);
             return;
         };
+
+        // An xref's content is in another file, which this viewer was not
+        // given: its path is drawn at the insertion point, as AutoCAD shows
+        // an xref it cannot find.
+        if block.is_xref() && block.entities.is_empty() {
+            let file = if block.xref_path.is_empty() {
+                &block.name
+            } else {
+                &block.xref_path
+            };
+            self.warnings.external(file);
+            let at = Ctx {
+                xf: *xf,
+                layer: lid,
+                rgba,
+                contrast,
+                lw,
+                lt,
+                lt_scale,
+                depth,
+            };
+            let flags = if contrast { FLAG_CONTRAST } else { 0 };
+            let face = self.style_face(&self.doc.header.textstyle);
+            // $TEXTSIZE through the insert's scale is a label metres tall on
+            // a sheet whose title block is a scaled xref: on a layout it is
+            // held to a hundredth of the paper.
+            let mut height = self.doc.header.textsize;
+            if let Some(p) = self.sheet.paper {
+                let cap = (p[2] - p[0]).min(p[3] - p[1]) / 100.0;
+                height = height.min(cap / xf.scale_magnitude());
+            }
+            self.push_text_run(
+                file.clone(),
+                0.0,
+                0.0,
+                text::frame(height, 0.0, 1.0, 0.0),
+                text::HAlign::Left,
+                text::VAlign::Baseline,
+                &at,
+                rgba,
+                pack_attr(lid, lw, flags),
+                face,
+            );
+            return;
+        }
 
         // Block geometry is defined relative to the block's base point.
         let base = block.base_point;
@@ -2463,6 +3671,17 @@ impl<'a> Tessellator<'a> {
         if truncated {
             self.warnings.hatch_patterns_truncated =
                 self.warnings.hatch_patterns_truncated.saturating_add(1);
+            // Too dense to draw line by line: the region in the tone so many
+            // lines average out to, rather than some of them and a gap.
+            let alpha = ((rgba >> 24) as f64 * TRUNCATED_PATTERN_TONE).round() as u32;
+            let tone = (rgba & 0x00FF_FFFF) | (alpha << 24);
+            for t in fill::fill_region(&loops, island_style(h)).chunks(3) {
+                if t.len() == 3 {
+                    let [a, b, c] = [t[0], t[1], t[2]].map(|p| ctx.xf.apply(p[0], p[1]));
+                    self.scene.push_triangle(a, b, c, tone, attr);
+                }
+            }
+            return;
         }
 
         // Record the pattern's spacing so the renderer can fade these lines
@@ -2537,12 +3756,16 @@ fn spline_points(s: &crate::cad::Spline) -> Vec<[f64; 2]> {
     )
 }
 
+/// What "Default" stands for: AutoCAD's `LWDEFAULT`, 0.25 mm unless a user
+/// changed it, which is a setting of their AutoCAD, not of the drawing.
+const DEFAULT_LINEWEIGHT: u8 = 25;
+
 /// Resolve a lineweight to hundredths of a millimetre, 0 meaning hairline.
 fn lineweight_value(lw: LineWeight, inherited: u8) -> u8 {
     match lw {
         LineWeight::Value(v) if v > 0 => v.min(211) as u8,
         LineWeight::Value(_) => 0,
-        LineWeight::Default => 0,
+        LineWeight::Default => DEFAULT_LINEWEIGHT,
         LineWeight::ByLayer | LineWeight::ByBlock => inherited,
     }
 }
@@ -2650,8 +3873,11 @@ mod tests {
 
     #[test]
     fn a_minsert_asking_past_the_budget_is_drawn_up_to_it() {
-        // 160,000 rings of about seventy strokes: eleven million asked for.
-        let doc = minsert(400, 400);
+        // 810,000 cells of three rings of four arc strokes: 9.7 million
+        // asked for, under the cell cap.
+        let mut doc = minsert(900, 900);
+        let ring = doc.blocks[1].entities[0].clone();
+        doc.blocks[1].entities.extend([ring.clone(), ring]);
         let mut t = Tessellator::new(&doc);
         t.run();
         // Stopped between entities: over by one circle at most, and not short.
@@ -2713,6 +3939,81 @@ mod tests {
             ..Entity::default()
         });
         t.scene
+    }
+
+    fn fill_area(s: &Scene) -> f64 {
+        s.fills
+            .chunks(3)
+            .map(|t| {
+                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y))
+                    .abs()
+                    / 2.0
+            })
+            .sum()
+    }
+
+    /// A polyline with width fills its band, constant width standing for
+    /// every vertex's; one without stays strokes.
+    #[test]
+    fn a_wide_polyline_is_a_filled_band() {
+        use crate::cad::{LwPolyline, LwVertex, Vec2};
+        let line = |w: f64| LwPolyline {
+            constant_width: w,
+            vertices: vec![
+                LwVertex {
+                    point: Vec2::new(0.0, 0.0),
+                    ..LwVertex::default()
+                },
+                LwVertex {
+                    point: Vec2::new(10.0, 0.0),
+                    ..LwVertex::default()
+                },
+            ],
+            ..LwPolyline::default()
+        };
+        let wide = tessellated(EntityKind::LwPolyline(line(2.0)));
+        // Only the band's four edges, which anti-alias it.
+        assert_eq!(wide.strokes.len(), 4);
+        assert!(
+            wide.strokes
+                .iter()
+                .all(|s| (s.attr >> 16) as u8 == super::super::scene::FILL_EDGE)
+        );
+        assert!(
+            (fill_area(&wide) - 20.0).abs() < 1e-9,
+            "{}",
+            fill_area(&wide)
+        );
+        let thin = tessellated(EntityKind::LwPolyline(line(0.0)));
+        assert_eq!((thin.strokes.len(), thin.fills.len()), (1, 0));
+    }
+
+    /// `$FILLMODE` 0 draws the band's edges instead.
+    #[test]
+    fn without_fillmode_a_wide_polyline_is_its_outline() {
+        use crate::cad::{LwPolyline, LwVertex, Vec2};
+        let mut doc = CadDrawing::default();
+        doc.header.fillmode = false;
+        let mut t = Tessellator::new(&doc);
+        t.tessellate_entity(&Entity {
+            kind: EntityKind::LwPolyline(LwPolyline {
+                constant_width: 2.0,
+                vertices: vec![
+                    LwVertex {
+                        point: Vec2::new(0.0, 0.0),
+                        ..LwVertex::default()
+                    },
+                    LwVertex {
+                        point: Vec2::new(10.0, 0.0),
+                        ..LwVertex::default()
+                    },
+                ],
+                ..LwPolyline::default()
+            }),
+            ..Entity::default()
+        });
+        assert!(t.scene.fills.is_empty());
+        assert_eq!(t.scene.strokes.len(), 4);
     }
 
     /// TRACE is filled like SOLID, its corners in the same Z order.
@@ -2800,7 +4101,7 @@ mod tests {
     #[test]
     fn lineweight_resolution() {
         assert_eq!(lineweight_value(LineWeight::Value(50), 9), 50);
-        assert_eq!(lineweight_value(LineWeight::Default, 9), 0);
+        assert_eq!(lineweight_value(LineWeight::Default, 9), DEFAULT_LINEWEIGHT);
         assert_eq!(lineweight_value(LineWeight::ByLayer, 9), 9);
         assert_eq!(lineweight_value(LineWeight::ByBlock, 13), 13);
         // Out-of-range values clamp rather than wrapping through the u8 cast.

@@ -41,6 +41,9 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 
 | target          | entry point                       | covers                                   |
 |-----------------|-----------------------------------|------------------------------------------|
+| `vdisk`         | `unpack::walk()` of QCOW2, VMDK, VHD, VHDX, NTFS, FAT and partition tables | the virtual disks and the volume walker, with a buffer limit of 64 KiB so any image of a few KiB declares a disk walked in place: the tables read as units are reached, compressed units and their cache, the filesystems read through a `Read + Seek`. The first byte picks the format. Each image is walked from memory and through a block cache of 512-byte blocks, which must find the same members and end the same way, and no member held whole may pass the buffer limit. |
+| `fsimage`       | `unpack::walk()` of ext, exFAT, SquashFS, cramfs, romfs, EROFS, 7z, WIM, xar and partition tables | the filesystem readers on hostile images, and the archives read where they lie on a seekable source: the superblocks, the directories and their loops, extent trees and block maps, chunk maps, the sparse and the compressed blocks, a 7z's header and folders, a WIM's chunk tables and a xar's table of contents, with a buffer limit of 64 KiB so a volume of a few KiB declares more. A file past the limit is read as it goes, up to the 4 MiB the scan budget gives. The first byte picks the format. Each image is walked from memory and through a block cache of 512-byte blocks, and again from memory: the three must find the same members, the first two must end the same way, and no member held whole may pass the buffer limit. |
+| `lzo`           | the LZO1X decoder (`exav_unpack::lzo_decompress`) | SquashFS's LZO blocks: the decoder never panics, never writes past the size it is given, and gives the same bytes twice; a stream of literals made from the input must come back as it is. |
 | `analyze`       | `analyze()` — the whole scanner   | format detection → every extractor (recursively) → pattern/hash matching → PE/ML/fuzzy heuristics → bytecode, against the signature files of `fuzz/db/` (every signature kind, the YARA rules, a bytecode program), under options the input's last two bytes choose (`fuzz/options.rs`: the heuristics, every `alert_*`, the structured-data and phishing checks, tight or production bounds, an object read in memory or through the block cache). **Broadest; the primary target.** |
 | `full_pipeline` | the scanner as a deployment builds it | up to eight database files (a kind byte, bit 7 official, and their text) go through `loader::Builder::add_named_bytes` as the CLI does, so every kind the loader reads is reached (signatures, hashes, container and file-type rules, YARA, bytecode, phishing and allow-lists, `.crb`, passwords); then the scan, held to what the entry points promise each other: the same bytes scanned twice agree, `analyze_all` is a superset of `analyze` and a clean scan lists nothing, a stream read in pieces answers what a buffer did, and a database written out and read back scans as the one it came from. **Widest single target.** |
 | `seekable`      | `scan_seekable()` over a reader that returns a few bytes a call and fails part way | the block-cache read of an object over `deep_analysis_max`, which no other target reaches. Checked: a reader and a buffer give one answer, a reader that fails is an error unless a detection was already made, and an object read through the cache that found nothing is not `Clean`. |
@@ -60,10 +63,29 @@ panic instead of wrapping). Targets in `fuzz/fuzz_targets/`:
 | `bytecode`      | `.cbc` bytecode loader            | bytecode verification                    |
 | `rar3_ppmd`     | RAR3 PPMd decompression          | PPMd/LZSS conversion path               |
 | `pe_emulator`   | `exav_pe_emu::unpack()`               | the x86 emulator that runs packer stubs: instruction decode + semantics, the emulated Windows environment, SEH, and the dump path. **The only target where the input supplies control flow rather than data.** Its decoder, `exav-x86`, is hand-written and `forbid(unsafe_code)` like the emulator (`x86_decode` checks it against `iced-x86`); the target goes through the entry point the scanner uses. Asserts the invariant the scanner relies on: anything emitted parses as a PE. |
-| `imagehash`     | `exav_imagehash::Hasher::hash()`, `exav_render::image::decode_any()`, `exav_render::pdf_image` | every image decoder behind `fuzzy_img#` (PNG, GIF, JPEG, TIFF, BMP, WebP, ICO, PNM, QOI, DDS, farbfeld, HDR, and JPEG 2000 and JBIG2 through hayro-jpeg2000 and hayro-jbig2), then the grey conversion, resize and DCT of both presets, with a 64 MiB decode budget. The scan reaches these only when a database has a `fuzzy_img#` signature, so `analyze` rarely does. Then the JPXDecode, JBIG2Decode and CCITTFaxDecode decoders `@exav/viewer` puts in place of pdf.js's, their parameters taken from the input's length. Those do not catch panics: in the browser a panic traps the wasm instance. |
+| `imagehash`     | `exav_imagehash::Hasher::hash()`, `exav_render::image::decode_any()`, `exav_render::pdf_image` | every image decoder behind `fuzzy_img#` (PNG, GIF, JPEG, TIFF, BMP, WebP, ICO, PNM, QOI, DDS, farbfeld, HDR, and JPEG 2000 and JBIG2 through hayro-jpeg2000 and hayro-jbig2, and JPEG XL through zenjxl-decoder (the `jxl` feature, which the scanner's builds leave off)), then the grey conversion, resize and DCT of both presets, with a 4 MiB decode budget (64 MiB for the other decoders). The scan reaches these only when a database has a `fuzzy_img#` signature, so `analyze` rarely does. Then the JPXDecode, JBIG2Decode and CCITTFaxDecode decoders `@exav/viewer` puts in place of pdf.js's, their parameters taken from the input's length. Those do not catch panics: in the browser a panic traps the wasm instance. |
+| `raw_preview`   | `exav_render::image::raw::detect()` + `preview()`, `decode_any()` | camera RAW files as `@exav/viewer` opens them: detection by the bytes (TIFF-structured files told from plain TIFFs, ISO base media, Fujifilm, Sigma, CIFF and Minolta signatures), the TIFF directories (chains, SubIFDs, Exif pointers, strips, JPEGInterchangeFormat, 8 and 16-bit samples), the JPEG stream search over the whole file, the Exif orientation of the files and of the streams, and the budgets, with a 16 MiB decode budget. The scanner does not read RAW files, so no other target reaches it. A panic `preview` would catch counts: in the browser it traps the wasm instance. |
 | `drawing`       | `exav_render::dwg::Document::parse()` + `tessellate()` | DXF, ASCII and binary, and DWG (R13 to 2018), into the drawing model, then the tessellation of every layout on a light and a dark ground: what `@exav/viewer`'s DWG module runs on any file a user opens. The scanner does not read drawings, so no other target reaches it. A panic `parse` would catch counts: in the browser it traps the wasm instance. |
 | `cad_dxf`       | `exav_render::cad::read_dxf_with()` + `to_json()`, `cad::preview()` | DXF, ASCII and binary, R12 to 2018, into the drawing model: the meaning of each group code in each record (hatch boundaries, multileader context data, R12 viewport extended data, subclass splits, proxy graphics streams), and the thumbnail found from the end of the file. `unpack` and `analyze` reach DXF's tokenizer and the payload extraction through exav-unpack's `dxf` format, but not this reading of it. |
-| `ifc`           | `exav_render::ifc::read()` + `exav_render::stl::read()` | IFC (IFC2X3, IFC4, IFC4X3) and STL into triangle meshes, as `@exav/viewer`'s model module reads them: the STEP index and parameter parser, units, placements, profiles, curves, swept and tessellated solids, B-reps, booleans (BSP trees) and openings, within a 200,000-triangle budget; and binary and ASCII STL. No other target reaches them. |
+| `ifc`           | `exav_render::ifc::read()` + `exav_render::stl::read()` | IFC (IFC2X3, IFC4, IFC4X3) and STL into triangle meshes, as `@exav/viewer`'s model module reads them: the STEP index and parameter parser, units, placements (local, grid and linear), profiles, curves (alignment curve segments among them), swept and tessellated solids, B-reps with their curved faces, booleans (BSP trees) and openings, within a 200,000-triangle budget; and binary and ASCII STL. No other target reaches them. |
+| `mesh`          | `exav_render::obj::read()`, `ply::read()`, `gltf::read()` | Wavefront OBJ, Stanford PLY (ASCII and binary, both byte orders) and glTF 2.0 (`.gltf` with `data:` buffers, `.glb`) into triangle meshes, within a 200,000-triangle budget: polygon triangulation, PLY headers and list types, glTF's own JSON reader, accessors, sparse accessors, node transforms and trees, base64. The target also checks that every scene it gets back has whole triangles, indices in range and finite positions. |
+| `markdown`      | `exav_render::markdown::parse()` + `to_json()`, `visible_text()` | Markdown (CommonMark, tables, strikethrough) into the tree `@exav/viewer`'s text module draws, through pulldown-cmark: the nesting, column and node bounds, the link targets the tree may carry (http, https and mailto, no space, control, separator, bidirectional control or credentials, checked on their own terms), padded table rows, and that the JSON is balanced and ends as the page expects. |
+| `sheets_xls`    | `exav_render::sheets::convert(.., Format::Xls, ..)` | XLS into the XLSX `@exav/viewer`'s sheets module shows: the lenient compound file reader, BIFF2 to BIFF8 records and their CONTINUE joins, decryption with the default password (XOR, RC4, RC4 CryptoAPI), code pages, formulas, conditional formats, validations, the drawing layer (pictures, shapes, charts) and the XLSX writer, within 200,000 cells and 64 MiB. Checks that what converts is a ZIP whose first parts are XML without a C0 control character. No other target reaches it. |
+| `sheets_ods`    | `exav_render::sheets::convert(.., Format::Ods / Fods, ..)` | ODS (a ZIP) and FODS (anything else): the XML tree's bounds, styles and data styles, OpenFormula conversion, conditional formats and validations, frames and charts, the repeated rows and columns, then the XLSX writer, under the same limits and checks. |
+| `sheets_numbers` | `exav_render::sheets::convert(.., Format::Numbers, ..)` | Apple Numbers: the input is an IWA stream the target stores as `Index/Document.iwa`, or a Numbers '08/'09 `index.xml` when it starts with `<` (`index.xml.gz` when gzipped), or a whole document when it is a ZIP, so the mutations reach the Snappy blocks, the protobuf archives, the tiles and cell records, the '09 XML's styles, data source and formulas, not the ZIP around them. Same limits and checks. |
+| `sheets_text` | `exav_render::sheets::convert(.., Format::SpreadsheetMl / Html / Sylk, ..)` | The text formats Excel opens from a .xls file, the first byte picking the reader: XML Spreadsheet 2003 (declared encodings, styles and their parents, R1C1 formulas), HTML tables (the bounded tokenizer, CSS and `mso-` properties, spans, conditional markup, character sets) and SYLK (records, ISO 6937 escapes, shared formulas). Same limits and checks. |
+| `slides_ppt` | `exav_render::slides::convert(.., Format::Ppt, ..)` | PowerPoint 95 and 97 to 2003 into the PPTX `@exav/viewer`'s slides module shows: the input is the `PowerPoint Document` stream, which the target stores in a compound file it builds, or a whole compound file (or a file of PowerPoint 2 to 4, or BinHex text), so the mutations reach the record tree, the persist directory and user edits, the text and style atoms, the OfficeArt drawing layer (property tables, shapes, custom paths), the blip store, the PowerPoint 95 records and the OLE charts, then the PPTX writer, within 20,000 shapes and 64 MiB. Checks that what converts is a ZIP holding the parts the viewer reads first, whose XML parts have no C0 control character, and that a document of several slides also converts with its first slide alone (`convert_first`), counting the same slides. No other target reaches it. |
+| `slides_odp` | `exav_render::slides::convert(.., Format::Odp / Fodp, ..)` | ODP (a ZIP) and FODP (anything else): the XML tree's bounds, styles and their parents, list styles, masters, enhanced geometry and its formulas, SVG paths, text and fields, tables, pictures and chart objects (through the `sheets` chart writer), then the PPTX writer, under the same limits and checks. |
+| `slides_odg` | `exav_render::slides::convert(.., Format::Odg / Fodg, ..)` | OpenDocument drawings, ODG (a ZIP) and FODG (anything else), into the PPTX `@exav/viewer`'s slides module shows, a page to a slide: what `slides_odp` reaches, and the master pages' page sizes (the largest becomes the PPTX's), the layers that are not displayed and the pages' names, under the same limits and checks. |
+| `slides_vsdx` | `exav_render::slides::convert(.., Format::Vsdx, ..)` | Visio 2013 and later drawings (an Open Packaging package of XML parts) into the PPTX `@exav/viewer`'s slides module shows: the package and its relationships, document, pages and masters, shape sheets and their inheritance from masters and style sheets, formulas, geometry rows and splines, text, pictures and themes, under the same limits and checks. |
+| `slides_keynote` | `exav_render::slides::convert(.., Format::Keynote, ..)` | Apple Keynote: the input is an IWA stream the target stores as `Index/Document.iwa` (Keynote 6 and later), or a whole document when it is a ZIP, or an `.apxl` file when it starts with `<` or is gzipped (Keynote 1 to 5), so the mutations reach the Snappy blocks, the protobuf archives, the XML trees, the slides, masters, placeholders, styles, shapes, paths, tables and text storages, not the ZIP around them. Same limits and checks. |
+| `docs_doc` | `exav_render::docs::convert(.., Format::Doc, ..)` | Word 97 to 2003, and Word 6 and 95 (a `WordDocument` stream whose first word says so, which the mutations reach), into the DOCX `@exav/viewer`'s docs module shows: the input is the `WordDocument` stream, which the target stores in a compound file it builds next to table streams made of its second half, or a whole compound file, so the mutations reach the FIB, the piece table, the character and paragraph FKPs, the sprms, the stylesheet, lists, sections, tables, notes, comments, fields and the OfficeArt layer, then the DOCX writer, within 20,000 paragraphs and cells and 64 MiB. Checks that what converts is a ZIP holding the parts the viewer reads first, whose XML parts have no C0 control character. |
+| `docs_odt` | `exav_render::docs::convert(.., Format::Odt / Fodt, ..)` | ODT (a ZIP) and FODT (anything else): the XML tree's bounds, automatic and named styles and their parents, master pages, lists, tables, frames, pictures, notes and fields, then the DOCX writer, under the same limits and checks. |
+| `docs_rtf` | `exav_render::docs::convert(.., Format::Rtf, ..)` | RTF: the tokenizer, the group stack and its destinations, font and color tables, code pages, `\u` and its skip count, list tables, tables, fields, pictures in hex and `\bin`, notes and headers, then the DOCX writer, under the same limits and checks. |
+| `docs_wml` | `exav_render::docs::convert(.., Format::Wml2003, ..)` | Word 2003 XML in UTF-8 or UTF-16: styles, lists, sections, tables, fields, `binData` pictures and comments, under the same limits and checks. |
+| `docs_html` | `exav_render::docs::convert(.., Format::Html, ..)` | Web pages as documents, Word's "Save as Web Page" and its MIME form included: the tokenizer, style sheets, tables with spans, lists, links, pictures in `data:` addresses and MIME parts, then the DOCX writer, under the same limits and checks. |
+| `docs_pages` | `exav_render::docs::convert(.., Format::Pages, ..)` | Apple Pages: the input is an IWA stream the target stores as `Index/Document.iwa`, or a whole document when it is a ZIP, so the mutations reach the Snappy blocks, the protobuf archives and the text storages, not the ZIP around them. Same limits and checks. |
+| `visible_text`  | `exav_render::text::visible_text()` | The text of a document as a reader sees it, for the scanner and `exav-grep --text`: the first byte picks the reader (Markdown, HTML, each Office and OpenDocument XML part, PDF through hayro, DXF, DWG, and with `text-office` DOC, XLS, PPT, RTF, Word 2003 XML, SYLK, the flat OpenDocument files, Numbers, Pages, Keynote), the rest is hostile bytes. Checks the text stays within its cap, the links within their bound, the sections in order on character boundaries, and that `wants` announces whatever is read. The PDF path takes every stream through exav-unpack's budget first, so a decompression bomb is refused rather than inflated. |
 | `cad_dwg`       | `exav_render::cad::read_dwg_with()` + `to_json()`, `cad::preview()` | DWG, R13 to R2018, into the drawing model: exav-unpack's `dwg` bit codes, the sections the file header locates (R2004 on: the encrypted file header, the page and section maps, page checksums and the LZ77 decompression; R2007: the Reed-Solomon coded file header, maps and pages, their CRCs and copies, and its own LZ77 variant), the classes, the object map and each object's common data and string stream, then the header variables, the tables and the blocks with their entities, each entity type's own data and the proxy graphics streams of the others, and the thumbnail read alone. `unpack` and `analyze` reach the file header, the preview images and, opening the drawing, the OLE2FRAME objects. |
 | `parser_recursion` | nesting depth, constructed        | Builds deep nesting from a couple of input bytes rather than waiting for the mutator to find it — every extra level needs another well-formed delimiter pair, so byte mutation stalls at two or three while this reaches thousands. Targets the failure the panic boundary cannot contain: `catch_unwind` catches a bounds check, not a stack overflow, and `max_recursion` bounds containers-inside-containers rather than a grammar that nests into itself. A finding looks like a crash with **no panic message**. |
 | `x86_decode`    | `exav_x86::decode()`                  | **differential against `iced-x86`**, which is compiled in as the oracle. Asserts six properties per input: never claim an encoding iced rejects; agree on length; agree on mnemonic; agree on the memory operand's base/index/scale/displacement and on every register operand's file, number and position; re-decoding from exactly the reported length gives the same answer; and no proper prefix of an instruction decodes. Declining is not a failure — `None` means "not an encoding this decoder claims", which the caller reports as unsupported. |
@@ -144,7 +166,9 @@ pass as an extra, read-only corpus directory:
    they lack, one tiny DDS, farbfeld and HDR file in `fuzz/seeds/imagehash`;
    exav-render's JPEG 2000, JBIG2 and CCITT fixtures
    (`crates/exav-render/tests/fixtures/images`) and the viewer's PDF image
-   streams (`crates/exav-viewer/e2e/fixtures/pdf-images`).
+   streams (`crates/exav-viewer/e2e/fixtures/pdf-images`). For `raw_preview`:
+   the synthetic RAW files of `crates/exav-render/tests/fixtures/raw`
+   (`make.py`, one per family) and the TIFF and JPEG images above.
 3. **Drawings**, for `drawing`: exav-render's fuzz-finding fixtures and the
    viewer tests' `plan.dxf` and `plan.dwg`, which
    `crates/exav-viewer/e2e/fixtures/make-plan.py` writes with ezdxf and the
@@ -170,6 +194,60 @@ pass as an extra, read-only corpus directory:
    (`crates/exav-render/tests/fixtures/ifc` and `stl`, STEP text and STL
    written by their `make.py`, a file per kind of geometry) and the viewer
    tests' `house.ifc` and `house.stl` (`tests/fixtures/viewer`).
+   **Meshes**, for `mesh`: a few files written by the script itself (a quad
+   and a triangle as OBJ, PLY in the three encodings, and a tetrahedron as
+   glTF with an embedded buffer and as GLB).
+   **Document text**, for `visible_text`: one document of each kind the target
+   reads, behind a byte that picks its reader (HTML pages and fragments, a part
+   of each Office and OpenDocument kind, PDFs plain and deflated, a DXF, the
+   drawing seeds of `cad_dxf` and `cad_dwg`, and the office fixtures behind
+   their names: a DOC, an XLS, a PPT, an RTF, a Word 2003 XML and a
+   SpreadsheetML 2003 file, a SYLK file, the flat OpenDocument files, a
+   Numbers, a Pages and a Keynote document).
+   **Markdown**, for `markdown`: three files written by the script (every
+   construct the reader folds, the link targets it must refuse, deep quotes and
+   lists), and a dictionary of Markdown's punctuation (`fuzz/dicts/markdown.dict`).
+   **Spreadsheets**, for `sheets_xls`, `sheets_ods`, `sheets_numbers` and
+   `sheets_text` (its three text fixtures behind their reader's byte):
+   the `sheets` fixtures (`crates/exav-render/tests/fixtures/office/sheets`:
+   an Excel 97 workbook, an ODS and a FODS, a Numbers document), and for
+   `sheets_numbers` the Numbers document's IWA streams joined into one and a
+   Numbers '09 `index.xml` (`fuzz/seeds/sheets_numbers/`), plain and gzipped.
+   **Presentations and drawings**, for `slides_ppt`, `slides_odp`,
+   `slides_odg`, `slides_vsdx` and `slides_keynote` (`slides_odg` and
+   `slides_vsdx` get the ODG, FODG and VSDX files of
+   `tests/fixtures/office/draw`):
+   the `slides` fixtures (`crates/exav-render/tests/fixtures/office/slides`):
+   the PowerPoint 97 file's `PowerPoint Document` stream (the file is over
+   the size cap with its thumbnail), the ODP and the FODP, and the Keynote
+   document's IWA streams joined into one, but its package metadata, and
+   hand-written seeds (`fuzz/seeds/slides_keynote/`: a Keynote 1 and a
+   Keynote 2 to 5 `.apxl`; `fuzz/seeds/slides_ppt/`: a PowerPoint 95
+   stream).
+   **Documents**, for `docs_doc`, `docs_odt`, `docs_rtf`, `docs_wml`,
+   `docs_html` and `docs_pages`: the `docs` fixtures
+   (`crates/exav-render/tests/fixtures/office/docs`: a Word 97 file, an ODT, a FODT, an
+   RTF, a Word 2003 XML file and a web page), a Word 6 document for `docs_doc`
+   (`fuzz/seeds/docs_doc/`, written by the reader's tests) and for `docs_pages`
+   the Keynote IWA streams, which share the archive layer.
+   **Virtual disks and volumes**, for `vdisk`: the QCOW2 fixtures and the
+   hand-written images of `fuzz/seeds/vdisk/` (QCOW2, VHD and VMDK), behind the
+   byte that picks the format; and, from the filesystem fixtures, which are
+   gzipped images of mostly zeros, the part a walk reads first: the FAT image
+   up to its last used byte and the NTFS image up to the end of the first run
+   of its `$MFT`, each alone and as the partition of an MBR and of a GPT disk
+   (`scripts/fuzz-seeds-synth.py`). There is no VHDX seed: the fixture is 9 MiB, almost all
+   zeros, and its structures lie megabytes apart.
+
+   **Filesystem images and LZO blocks**, for `fsimage` and `lzo`: small images
+   of a tree of three files in each of ext2, ext4 with inline data, exFAT,
+   SquashFS (in each of its compressions), cramfs, romfs and EROFS, a 7z, a
+   WIM (whose chunks are stored as they are, so that it needs no codec) and a
+   xar, the filesystems again behind a partition table that declares more than
+   the target's buffer limit, and the first blocks `lzop` makes of two inputs at
+   its levels 1 and 9
+   (`fuzz/seeds/fsimage/make.py` and `fuzz/seeds/lzo/make.py`, which say what
+   they need).
 
 7. **Framed targets**, written by the script: `full_pipeline` and `seekable` get
    every fixture behind their header (and `full_pipeline` each file of
@@ -226,6 +304,7 @@ fixture seeds as "old"):
 | `analyze` | 183 | 44,219 | 44,958 | 19,443 |
 | `full_pipeline` | 25 | 76,707 | 77,120 | 36,647 |
 | `pe` | 56 | 1,298 | 1,298 | 426 |
+| `vdisk` | 293 | 3,818 | 4,683 | 1,544 |
 
 Where there were no seeds the gain is large (five to ten times); where the
 fixtures already open the parser it is small, and the point is the inputs the
@@ -236,6 +315,49 @@ the best kind: one found the `--alert-exceeds-max` all-match bug in the table
 below the moment `full_pipeline` first loaded it. `clamd` and `icap` are not
 here: their input is `arbitrary`'s encoding, which no one writes by hand, and
 they reach 17,000 edges within seconds without seeds.
+
+## Reference decoders as oracles
+
+exav-unpack's in-tree LZFSE and DCL ("implode") decoders are checked on
+damaged streams against the reference sources they were written from: Apple's
+`lzfse` (BSD-3-Clause) and zlib's `contrib/blast` (zlib licence). The sources
+are fetched and compiled by `crates/exav-unpack/tests/oracle/build.sh` (with
+AddressSanitizer and UndefinedBehaviorSanitizer, so a stream the reference
+itself mishandles is reported); nothing of them is committed. Two
+`#[ignore]`d tests feed it streams cut and damaged in many ways (bit flips,
+fields set to extremes, cuts, insertions, repeats) and compare the bytes
+written and the verdict (whole, output past the limit, cut, damaged):
+
+```sh
+crates/exav-unpack/tests/oracle/build.sh DIR
+EXAV_LZFSE_ORACLE=DIR/lzfse_oracle EXAV_DCL_ORACLE=DIR/dcl_oracle \
+  cargo test -p exav-unpack --lib -- --ignored oracle
+```
+
+They are ignored, not skipped: a run that did not ask for them lists them as
+ignored, and a run that did fails when the oracle is not built.
+`EXAV_DEBUG_ORACLE_ROUNDS` sets the streams per base (3000 and 5000 by default),
+`EXAV_DEBUG_ORACLE_DUMP` a directory to write a stream that differs to. A stream
+whose output depends on what the reference's destination held before (an LZVN
+match reaching bytes never written) is told by running it with two fills; it
+is invalid here.
+
+The reference reports a damaged LZVN payload as "destination full", counts a
+failed block's last instruction out of the bytes it returns, and writes the
+part of a match that fits a block's declared size; the tests state which of
+these differences they allow. Where the two decoders disagree on a stream the
+reference accepts, or accept one it refuses, the test fails.
+
+The unpack target reaches both decoders through `dmg/udif_lzfse.dmg` (two
+LZFSE runs, an LZVN block and FSE blocks) and the `ishieldz/` archives, which
+`scripts/fuzz-seeds.sh` takes with every fixture of at most 64 KiB. They were
+also fuzzed on their own, through the DMG extractor with one LZFSE run of the
+input's bytes and through InstallShield Z archives (whole, or the input as the
+one member of a well-formed one), in a standalone `cargo fuzz` crate outside
+the repository, under AddressSanitizer: 741,736 executions in 40 minutes for
+LZFSE and 1.4 million for InstallShield Z, no crash, hang or out-of-memory
+(one 36-second stall inside `malloc` on a loaded machine, an input that runs in
+56 ms alone).
 
 ## Running a campaign
 
@@ -249,17 +371,29 @@ uploading `fuzz/artifacts`.
 fork mode, and reports what each one found:
 
 ```sh
-scripts/fuzz-campaign.sh                          # one hour, split evenly
-TOTAL=1800 scripts/fuzz-campaign.sh               # half an hour
+scripts/fuzz-campaign.sh                          # one hour, one worker
+TOTAL=25200 WORKERS=3 scripts/fuzz-campaign.sh    # seven hours, three at a time
 TARGETS="analyze x86_decode" scripts/fuzz-campaign.sh
 ```
 
-It builds every target **before** running any of them and refuses to start if
-one fails. That gate is not ceremony: `cargo fuzz run` per target, with its
-output piped away, turns a compile error into a target that "ran" and found
-nothing — the same shape in the log as a clean run, which is the worst possible
-way to be wrong about test coverage. It also reports only the artifacts *this*
-campaign produced, so a stale directory does not read as new findings.
+It runs every `fuzz/fuzz_targets/*.rs` unless `TARGETS` names some, `WORKERS`
+at a time (one per core). A target's slice is what is left of `TOTAL` shared
+among the targets not started, so a slow build shortens the slices and not the
+campaign. The timeout and memory limit are those of `fuzz-smoke`, so a finding
+is one CI would have made, and a unit over `SLOW` seconds (4) is kept as a
+`slow-unit-*` artifact: those time out on a slower machine. A target's binary
+is deleted once it has run (`KEEP_BINARIES=1` keeps them); each is hundreds of
+megabytes.
+
+A target that does not build is reported with its log, and the script exits
+non-zero: a compile error must not read as a target that "ran" and found
+nothing, which is the worst possible way to be wrong about test coverage. It
+reports only the artifacts *this* campaign produced, so a stale directory does
+not read as new findings. The logs are in `tmp/data/fuzzlogs/`.
+
+The seeds are `scripts/fuzz-seeds.sh`'s, which also takes the files of a
+directory of wild samples (`tmp/samples-issues`, or `WILD`) for the targets that
+read a whole file of a format (`scripts/fuzz-seeds-wild.sh`).
 
 ### Memory
 
@@ -374,6 +508,23 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 | RAR volume numbered 65535 (RAR4) or 2^64 - 1 (RAR5) (`volumes`, overflow panic) | `formats/rar.rs` `join_rar4`, `join_rar5` | the refusal message added one to the number it had read, in its own width; release builds check overflow, so the panic was real and became `Unscannable` for the whole set instead of the volume being named | the sum in `usize` / saturating (`a_volume_numbered_65535_is_refused_by_name_not_by_a_panic`, `a_rar5_volume_numbered_2_pow_64_minus_1_is_refused_by_name_not_by_a_panic`) |
 | `"secret" xor(1-255)` over 64 KB (`analyze`, 6 execs a second after the YARA rules were added; 3 s a scan) | `yara/matcher.rs` `PatternMatcher::search` | every position was compared with every key in the range, 255 times the work, and an `xor` pattern is never gated by an atom, so every scan paid it; a 16 MiB object took 9 s | the one key a position can match with is its first byte's (`a_wide_xor_range_does_not_cost_a_comparison_per_key_per_position`, `xor_finds_each_key_where_it_was_used`) |
 | `/a.{0,32}b[^\x00-\x1f]+c\b/s` over 2 MiB of text (`full_pipeline`, timeout, all-match mode) | the YARA regex matcher | a start position's match runs to the end of the text, so the work is quadratic in it; yara's own engine has the same shape | not a bug in exav: the rule is the cost (`fuzz/db/fuzz.yar` bounds its repetition) |
+| InstallShield Z table of 498 bytes (`unpack`, 8-hour run, OOM at 1.5 GB, 10 s) | `formats/ishield_z.rs` `declared_members` | `unshield` builds an entry for each of `dirs` x `dir_files` (two `u16`) before checking anything, and a directory record whose chunk size is 0 is read again for the next, so a few bytes ask for billions of entries; the walk's `MAX_ENTRIES` came after | the members the records declare are summed first, as `unshield` walks them, and a table over `MAX_ENTRIES` is reported as unexamined (`a_table_declaring_more_members_than_the_walk_bound_is_reported_not_built`, `a_table_of_many_directories_each_declaring_many_members_stays_small`) |
+| 3.5 KB YARA rule with an error inside 15 open parentheses (`yara`, 8-hour run, timeout; 5.6 s in a release build) | `yara/compiler.rs` `check_paren_depth` | `yara-x-parser` (1.21 too) tries each `(` as a boolean group and as an arithmetic one and keeps nothing of the first try, so a rule that fails inside `d` parentheses costs about 2^d steps; its fuel (100M steps) is not configurable | nesting past 10 is refused before the parse (it was 12, until a rule with 12 took 6 s under the sanitizer), strings, comments and regular expressions skipped (`a_rule_with_an_error_deep_in_parentheses_is_refused_fast`, `a_rule_with_an_error_in_twelve_parentheses_is_refused_fast`, `nesting_up_to_the_bound_compiles_and_one_more_is_refused`) |
+| RAR5 encrypted headers asking for 2^24 PBKDF2 iterations (`full_pipeline`, 8-hour run, two slow units of 21 and 28 s under the sanitizer) | `formats/rar5_crypt.rs` `find_keys_within` | one derivation at the largest count RAR writes is 2.6 s in a release build, and the bound on a scan's derivations (2^25 iterations) allowed two. The bound was also kept in each archive's cache, and an archive inside another starts a cache of its own; RAR3's (256 derivations of 2^18 SHA-1 rounds) was kept the same way | the bound is 2^22 and the scan's (0.65 s; the two units still take 11 and 14 s under the sanitizer because `full_pipeline` scans an input four times to compare the answers), counted in `Budget`: a count past it is reported as encrypted like a member no password opens, and a refused derivation is not charged (`a_count_whose_derivation_exceeds_the_scan_bound_is_not_derived`, `archives_of_one_scan_share_the_derivation_bound`, and RAR3's `archives_of_one_scan_share_the_derivation_limit`) |
+| 805-byte JPEG declaring a large image (`imagehash`, 8-hour run, slow unit, 10 s under the sanitizer) | none | the grey conversion and Lanczos resize of a 16 MiB image: 0.44 s in a release build. A different filter would change the hash, which must be ClamAV's | not a bug; the target gives the hasher 4 MiB (`HASH_BUDGET`), as for the JPEG 2000 row above |
+| LZVN block (DMG, from the differential test against Apple's decoder, not the fuzzer) whose payload ends before its end opcode, or whose declared payload is longer than the input yet ends | `formats/lzfse.rs` `lzvn_block` | any shortfall of the payload was called "cut" when the input was shorter than declared, even when the end opcode had been read; a cut run is not reported as damaged by DMG | cut only when the payload ends without its end opcode and the input ends there; otherwise damaged (`an_lzvn_payload_longer_than_the_input_that_still_ends_is_damaged_not_cut`) |
+| LZVN instruction past the block's declared size, under a tighter output limit (same test) | `formats/lzfse.rs` `lzvn_block` | the size check ran before the limit and before the part that fits was written, so output past the limit was reported as damage and the fitting part dropped | the block's size is a lowered output limit; whichever is reached first ends the block (`an_lzvn_instruction_past_the_block_size_is_damaged_and_clipped`, `the_output_limit_comes_before_a_block_size_it_is_inside_of`) |
+| DCL stream of one byte, `02` (same test, against `blast.c`) | `formats/dcl_explode.rs` `run` | both header bytes were read before either was judged, so a bad first byte with no second one was called cut | each byte judged as read (`a_bad_header_or_distance_is_invalid`) |
+| InstallShield Z member that stops short or is damaged part way (review) | `formats/ishield_z.rs` `extract_ishield_z` | a stream that ran out of input came out as a whole member with nothing said, and one that failed part way dropped what it had decoded | the decoded start is kept and the member reported, as for NSIS (`a_member_cut_inside_its_stream_keeps_its_prefix_and_is_reported`, `a_member_damaged_part_way_keeps_its_prefix_and_is_reported`, `a_member_whose_range_runs_past_the_file_is_reported`) |
+| FAT12 volume with a directory at cluster 1, inside a sparse VMDK (`vdisk`, first run, 3 overflow panics) | `fatfs` 0.3.6 `fs.rs` `sector_from_cluster`, through `formats/fat.rs` | the crate subtracts 2 from any cluster number it reads (a directory entry's, or the next one of a chain) without looking at it; the panic reached the walk's boundary and ended the whole volume as undecodable. Upstream master has the same line | the crate was replaced by the in-tree reader, which takes no cluster number on trust; a directory at cluster 1 is reported as damage after the rest of the volume is walked, and `vdisk` and `fsimage` assert no walk ends as "panicked" (`a_directory_at_cluster_1_ends_the_walk_as_damaged_after_the_rest_of_the_volume`, `a_file_at_cluster_1_is_reported_and_the_other_files_come_out`) |
+| PowerPoint 95 paragraph with a bullet size over 4,294,967 (`slides_ppt`, 4 overflow panics) | `slides/ppt/ppt95.rs` `para_props` | the size is kept from 25 to 400, but `bool::then_some(bsize * 1000)` takes its argument whether or not the condition holds, so a `u32` that large overflowed (a panic in release builds, which check overflow, and in the viewer's wasm a wrapped value that was then dropped) | the product is taken only of a size in range (`a_bullet_size_out_of_range_is_dropped`) |
+| 1.4 MB of `Content-Type: message/rfc822` (the `nesting` suite, not the fuzzer; stack overflow) | `formats/email.rs`, `mail-parser` 0.11.9 | the parser keeps messages in messages (`PartType::Message`) with no depth limit, and dropping the chain recursed once per level | the result is taken apart without recursion (`Parsed`); the same review found that the parts of attached messages were never read, so an attachment of a forwarded mail scanned clean (`mime_parts`, `the_parts_of_an_attached_message_are_members_too`) |
+| 40 KB YARA condition of `not not not ...`, `1 << 1 << ...`, `a contains b contains ...` (the `nesting` suite; stack overflow on 2 MiB) | `yara/compiler.rs` `check_paren_depth`, `yara-x-parser` | one recursion per operator of a chain, in the parser and in the tree built from it | a chain past 256 operators, and brackets nested past 12, are refused before the parse (`a_long_chain_of_operators_is_refused_not_recursed_into`) |
+| 200,000 signs in a Visio formula (the `nesting` suite; stack overflow on 256 KB) | `slides/vsdx/formula.rs` `unary` | a call per sign, outside the step counter that bounds the rest of the parser | the signs are read in a loop, and counted (`a_formula_of_signs_is_refused_not_recursed_into`) |
+| 32 nested `draw:g` of an ODP, 11 nested Visio shapes (the `nesting` suite; stack overflow on 512 KB) | `slides/model.rs` `ListStyle` | the nine outline levels were inline (6 KB), so every `TextBody` and `Sp` on a function's stack took that, and the shape builders had frames of 28 to 40 KB | the levels, which no reader ever filled, are a list empty until one is (`odf_drawings_and_presentations`, `visio_pages`, `make stack-frames`) |
+| a ZIP in a ZIP, 15 levels (a CLI run under `ulimit -s`, then `scripts/stack-frames.py`) | `formats/zip.rs` `walk`, `formats/xz.rs` `XzReader` | a `ZipFile` (decoders inline, 40 KB) and the XZ decoder tables (30 KB) lived in the frame of the walk while a member was scanned | opened in functions of their own, and boxed (`make stack-frames`) |
+| 19 KB image whose HFS+ catalog leaves are each other's next (`vdisk`, 7-hour run, timeout: 21 s under the sanitizer, 1 s in a release build) | `formats/hfsplus.rs` `Tree::scan` | the chain was bounded by the nodes the catalog fork declares (the virtual disk's size over the node size), and each is read as valid from a disk of zeros | a leaf met again is damage (Brent's cycle check) (`a_leaf_chain_that_loops_is_damage_not_a_walk_to_the_end_of_the_fork`) |
+| PPMd header declaring a 4 GiB model (`saturate`) | `formats/ppmd7/model.rs`, `ppmd8/model.rs` | the arena was filled with zeros as it was made, so the pages were touched | `vec![0; n]`, which asks for zeroed pages (`saturate`) |
 
 Header numbers at the top of their range are what unchecked sums overflow on,
 and libFuzzer's stock mutations seldom put one in a chosen field. Two things

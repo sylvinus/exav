@@ -53,8 +53,9 @@ pub(crate) fn extract_arj<R>(
             // unsupported compression method is different: the member is there
             // and the victim's extractor will unpack it, so report rather than
             // step over it.
-            if !supported && !matches!(header.file_type, ArjFileType::Directory) {
-                if let Some(r) = visit(
+            if !supported
+                && !matches!(header.file_type, ArjFileType::Directory)
+                && let Some(r) = visit(
                     Entry::unsupported(
                         header.name.clone(),
                         header.compressed_size as u64,
@@ -62,9 +63,9 @@ pub(crate) fn extract_arj<R>(
                         "unsupported ARJ compression method",
                     ),
                     budget,
-                ) {
-                    return Ok(Some(r));
-                }
+                )
+            {
+                return Ok(Some(r));
             }
             if !arc.skip(&header) {
                 return Err(LimitHit::corrupt("arj: truncated entry".to_string()));
@@ -162,7 +163,7 @@ pub(crate) fn extract_arj<R>(
 
 #[cfg(test)]
 mod tests {
-    use crate::{extract, Budget, Format, Limits};
+    use crate::{Budget, Format, Limits, extract};
 
     /// A garbled (encrypted, `arj -g`) member is decrypted with a pool password
     /// and its plaintext recovered — identical to the unencrypted `sample.arj`.

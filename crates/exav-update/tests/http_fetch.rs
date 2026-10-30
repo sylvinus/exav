@@ -8,7 +8,7 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use exav_update::{
-    fetch_db_if_changed, fetch_signature_if_changed, prune_env_sources, sig_dest, Fetch,
+    Fetch, fetch_db_if_changed, fetch_signature_if_changed, prune_env_sources, sig_dest,
 };
 
 struct State {
@@ -396,9 +396,10 @@ fn sig_dest_namespaces_by_origin_and_resists_traversal() {
     // The layout still reads as the origin it came from; the final component
     // carries a digest of the whole URL, so the exact filename is not pinned.
     assert!(a.to_string_lossy().contains("mirror-a.example.com/daily"));
-    assert!(b
-        .to_string_lossy()
-        .contains("mirror-b.example.com/feeds/daily"));
+    assert!(
+        b.to_string_lossy()
+            .contains("mirror-b.example.com/feeds/daily")
+    );
 
     // The extension survives the digest, for every source and every suffix. The
     // loader routes a database file by extension and nothing else, so a name it

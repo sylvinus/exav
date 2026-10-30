@@ -7,11 +7,15 @@
  * the host treats every frame message as untrusted, since the frame runs the
  * parsers.
  */
-import type { BuiltinFormat, LayerItem, OutlineEntry, Selection } from "../core/types.js";
+import { checkRasterOptions, checkRegion, isRasterErrorCode, MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS, regionMatches, type RasterErrorCode } from "../core/pictures.js";
+import { checkTheme, isColor, type FrameTheme } from "../core/theme.js";
+import type { BuiltinFormat, LayerItem, LoadStep, MediaState, OutlineEntry, RasterOptions, RasterRegion, RegionSpace, Selection, StoreyItem, Viewport, Warning } from "../core/types.js";
 import type { FramePolicy } from "./policy.js";
 
+export { isColor };
+
 /** Bumped on any change to the messages; both sides must agree. */
-export const PROTOCOL = 3;
+export const PROTOCOL = 5;
 
 /** The `type` of the one `window.postMessage`, which carries the port. */
 export const HELLO = "exav-frame/hello";
@@ -26,6 +30,17 @@ export const MAX_PATH = 4096;
 export const MAX_URL = 2048;
 /** Most items in one list (layers, members, outline entries...). */
 export const MAX_ITEMS = 100_000;
+/** Pictures the host waits for at once. */
+export const MAX_DRAWS = 8;
+
+/**
+ * The keys the frame hands back to the host when the document does not use
+ * them: moving between files, closing. Never one with Ctrl, Alt or Meta,
+ * never one that types: a frame that could send those could press a host's
+ * shortcuts.
+ */
+export const NAV_KEYS = ["Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"] as const;
+export type NavKey = (typeof NAV_KEYS)[number];
 
 /**
  * A file read by ranges: what the frame may ask of the host at once. The
@@ -40,6 +55,14 @@ export const READS = {
   maxBytes: 16 * 1024 * 1024,
   /** The first bytes, sent with the file. */
   head: 65_536,
+};
+
+/** What the frame may know and ask of the files around the one it shows (`FileTree`). */
+export const TREE = {
+  /** Paths listed. */
+  maxPaths: 20_000,
+  /** Bytes of one file the host reads for the frame. */
+  maxFileBytes: 256 * 1024 * 1024,
 };
 
 // ── Host to frame ────────────────────────────────────────────────────────────
@@ -64,10 +87,23 @@ export interface FrameOptions {
     detailMaxPixels?: number;
     maxDecodeBytes?: number;
   };
-  cad?: { ground?: "light" | "dark"; colors?: { light: string; dark: string }; timeoutMs?: number; maxPrimitives?: number; maxDecompressedBytes?: number };
+  cad?: {
+    ground?: "light" | "dark";
+    colors?: { light: string; dark: string };
+    timeoutMs?: number;
+    maxPrimitives?: number;
+    maxDecompressedBytes?: number;
+    maxEntities?: number;
+    lineweights?: "drawing" | "always" | "never";
+    monochrome?: boolean;
+  };
   ifc?: { ground?: "light" | "dark"; colors?: { light: string; dark: string }; highlight?: string; timeoutMs?: number; maxTriangles?: number };
   model?: { surface?: number; zUp?: boolean; timeoutMs?: number; maxTriangles?: number };
   archive?: { maxExtractedBytes?: number; maxMembers?: number; maxCompressionRatio?: number };
+  /** For the converted Office formats (`rtf()`, `doc()`...). */
+  conversion?: { timeoutMs?: number; maxMemory?: number; converter?: "exav" | "external"; externalConverter?: string };
+  /** "none": no player controls in the frame, for a host drawing its own (`MediaController`). */
+  media?: { controls?: "native" | "none" };
 }
 
 /**
@@ -83,13 +119,57 @@ export interface OpenMessage {
   formats: readonly BuiltinFormat[];
   file: { name: string; type: string; path: string; format: BuiltinFormat | null };
   source: OpenSource;
+  /** The files around it: their paths, which the frame asks for by a `fetch`. */
+  tree?: { path: string; paths: string[] };
   options: FrameOptions;
+  theme: FrameTheme;
 }
 
 /** The answer to a `read`: the bytes, exactly as many as asked (fewer only at the end of the file), or why not. */
 export type BytesMessage = { type: "bytes"; id: number; data: ArrayBuffer } | { type: "bytes"; id: number; error: "refused" | "failed" };
 
-export type CommandTarget = "pages" | "zoom" | "drag" | "outline" | "layers" | "layouts" | "ground" | "archive";
+/** The page's theme changed (`SandboxedViewer.restyle`). */
+export interface ThemeMessage {
+  type: "theme";
+  theme: FrameTheme;
+}
+
+/**
+ * A page drawn as a picture (`PicturesController.raster`), answered by a
+ * `rastered` with the same id. `options` are the request's, without its
+ * signal (`unraster` is that).
+ */
+export interface RasterMessage {
+  type: "raster";
+  id: number;
+  session: number;
+  page: number;
+  options: Omit<RasterOptions, "signal">;
+}
+
+/** A picture no longer wanted. Its `rastered` still comes. */
+export interface UnrasterMessage {
+  type: "unraster";
+  id: number;
+}
+
+/**
+ * The next document of the session: the file with other bytes, as `open`
+ * gave the first. `generation` numbers the documents (0 is the one `open`
+ * gave): the frame names it in each `read`, so that the host answers from the
+ * bytes of the document asked about while two are alive. Answered by a
+ * `replaced` with the same call.
+ */
+export interface ReplaceMessage {
+  type: "replace";
+  call: number;
+  generation: number;
+  file: OpenMessage["file"];
+  source: OpenSource;
+}
+
+export type CommandTarget = "pages" | "zoom" | "drag" | "outline" | "layers" | "storeys" | "layouts" | "ground" | "archive" | "media" | "sheets";
+const COMMAND_TARGETS: readonly CommandTarget[] = ["pages", "zoom", "drag", "outline", "layers", "storeys", "layouts", "ground", "archive", "media", "sheets"];
 
 export interface CommandMessage {
   type: "command";
@@ -101,17 +181,32 @@ export interface CommandMessage {
   args: readonly unknown[];
 }
 
-export type HostMessage = OpenMessage | CommandMessage | BytesMessage;
+/**
+ * The controllers whose store the frame follows only on request, because
+ * working its value out costs: the frame reports it (`state`) from a `watch`
+ * until the matching `unwatch`. Until then its value in `controllers` is null.
+ */
+export const WATCHED_KEYS = ["viewport"] as const satisfies readonly ControllerKey[];
+export type WatchedKey = (typeof WATCHED_KEYS)[number];
+
+/** Someone follows the store of `key` (a first listener, or a read), or no one does any more. */
+export interface WatchMessage {
+  type: "watch" | "unwatch";
+  session: number;
+  key: WatchedKey;
+}
+
+export type HostMessage = OpenMessage | CommandMessage | BytesMessage | ThemeMessage | RasterMessage | UnrasterMessage | ReplaceMessage | WatchMessage;
 
 // ── Frame to host ────────────────────────────────────────────────────────────
 
 export type StatusSnapshot =
-  | { phase: "loading" | "converting"; progress?: number }
+  | { phase: "loading" | "converting"; progress?: number; step?: LoadStep }
   | { phase: "ready"; partial?: boolean }
   | { phase: "empty" }
   | { phase: "error"; code: ErrorCode };
 
-export type ErrorCode = "pdf" | "image" | "drawing" | "drawing_version" | "office" | "media" | "model" | "archive" | "file";
+export type ErrorCode = "pdf" | "image" | "image_no_preview" | "drawing" | "drawing_version" | "office" | "needs_converter" | "media" | "model" | "archive" | "text" | "text_binary" | "file";
 
 export interface ArchiveSnapshot {
   members: readonly { index: number; name: string; uncompressedSize: number; encrypted: boolean }[];
@@ -128,17 +223,39 @@ export interface Snapshots {
   drag: { mode: "pan" | "select"; available: boolean };
   outline: readonly OutlineEntry[];
   layers: { kind: "layers" | "categories"; items: readonly LayerItem[] };
+  storeys: { items: readonly StoreyItem[] };
   layouts: { items: readonly { id: string; name: string; isModel: boolean }[]; current: string };
   ground: "light" | "dark";
   selection: Selection | null;
   info: Record<string, number>;
-  warnings: readonly { key: string; count: number }[];
+  warnings: readonly Warning[];
   archive: ArchiveSnapshot;
+  media: MediaState;
+  sheets: { items: readonly { index: number; name: string }[]; current: number };
+  pictures: { count: number; space: RegionSpace };
+  viewport: Viewport | null;
 }
 
 export type ControllerKey = keyof Snapshots;
 
-export const CONTROLLER_KEYS: readonly ControllerKey[] = ["pages", "zoom", "drag", "outline", "layers", "layouts", "ground", "selection", "info", "warnings", "archive"];
+export const CONTROLLER_KEYS: readonly ControllerKey[] = [
+  "pages",
+  "zoom",
+  "drag",
+  "outline",
+  "layers",
+  "storeys",
+  "layouts",
+  "ground",
+  "selection",
+  "info",
+  "warnings",
+  "archive",
+  "media",
+  "sheets",
+  "pictures",
+  "viewport",
+];
 
 /** What a controller has besides its store. */
 export interface Statics {
@@ -156,10 +273,26 @@ export type FrameMessage =
   | { type: "done"; call: number; ok: boolean }
   /** A link the user followed in the document. The host decides. */
   | { type: "link"; url: string }
-  /** Bytes of a file read by ranges, answered by a `bytes` with the same id. */
-  | { type: "read"; id: number; offset: number; length: number }
-  /** A read no longer wanted. Its `bytes` still comes. */
-  | { type: "cancel"; id: number };
+  /** Bytes of the document `generation` read by ranges, answered by a `bytes` with the same id (unique over the frame's life). */
+  | { type: "read"; id: number; generation: number; offset: number; length: number }
+  /**
+   * A whole file of the tree `open` listed, answered by a `bytes` with the
+   * same id; the id is from the same count as a `read`'s.
+   */
+  | { type: "fetch"; id: number; path: string }
+  /** A read or fetch no longer wanted. Its `bytes` still comes. */
+  | { type: "cancel"; id: number }
+  /** A key pressed in the frame that the document did not use. */
+  | { type: "key"; key: NavKey; shift: boolean; repeat: boolean }
+  /** The answer to a `raster`: the picture and what it shows, or why there is none. */
+  | { type: "rastered"; id: number; result: RasterResult }
+  /** The answer to a `replace`: whether the document was replaced. False: nothing changed. */
+  | { type: "replaced"; call: number; ok: boolean };
+
+/** The picture of a `rastered`, as the frame sends it. */
+export type RasterResult =
+  | { ok: true; bitmap: ImageBitmap; width: number; height: number; page: number; layout?: string; space: RegionSpace; region?: RasterRegion }
+  | { ok: false; code: RasterErrorCode };
 
 // ── Checks ───────────────────────────────────────────────────────────────────
 
@@ -174,25 +307,40 @@ const oneOf = <T extends string>(v: unknown, values: readonly T[]): v is T => ty
 /** A key the host may use as an object key or in a message key: a plain word, not one of Object's. */
 const isWord = (v: unknown): v is string => typeof v === "string" && /^[a-z_]{1,64}$/.test(v) && !["__proto__", "constructor", "prototype"].includes(v);
 
-/**
- * A colour the host may put in a style: hex, or rgb()/hsl() of plain
- * numbers. Anything else could be `url(...)`, a request the frame chose.
- */
-export function isColor(v: unknown): v is string {
-  if (typeof v !== "string" || v.length > 64) return false;
-  return /^#[0-9a-f]{3,8}$/i.test(v) || /^(rgb|hsl)a?\(\s*[\d.]+%?(\s*[\s,/]\s*[\d.]+%?){2,3}\s*\)$/i.test(v);
+/** A bitmap within the picture limits (`MAX_PICTURE_EDGE` a side, `MAX_PICTURE_PIXELS` in all); false where the platform has none. */
+function isPicture(v: unknown): v is ImageBitmap {
+  return (
+    typeof ImageBitmap !== "undefined" &&
+    v instanceof ImageBitmap &&
+    v.width >= 1 &&
+    v.height >= 1 &&
+    v.width <= MAX_PICTURE_EDGE &&
+    v.height <= MAX_PICTURE_EDGE &&
+    v.width * v.height <= MAX_PICTURE_PIXELS
+  );
 }
 
-const ERROR_CODES: readonly ErrorCode[] = ["pdf", "image", "drawing", "drawing_version", "office", "media", "model", "archive", "file"];
+const SPACES: readonly RegionSpace[] = ["page", "pixels", "drawing", "camera", "frame"];
+
+const ERROR_CODES: readonly ErrorCode[] = ["pdf", "image", "image_no_preview", "drawing", "drawing_version", "office", "needs_converter", "media", "model", "archive", "text", "text_binary", "file"];
 const REFUSALS = ["archive_no_reader", "archive_failed_member", "archive_member_encrypted", "archive_member_unsupported"] as const;
+
+const STEPS: readonly LoadStep[] = ["file", "engine", "start", "read", "convert", "render"];
 
 export function checkStatus(v: unknown): StatusSnapshot | null {
   if (!isObject(v)) return null;
   const progress = v.progress === undefined || (isFinite(v.progress) && v.progress >= 0 && v.progress <= 1);
+  const step = v.step === undefined || oneOf(v.step, STEPS);
   switch (v.phase) {
     case "loading":
     case "converting":
-      return progress ? { phase: v.phase, ...(v.progress !== undefined && { progress: v.progress as number }) } : null;
+      return progress && step
+        ? {
+            phase: v.phase,
+            ...(v.progress !== undefined && { progress: v.progress as number }),
+            ...(v.step !== undefined && { step: v.step as LoadStep }),
+          }
+        : null;
     case "ready":
       return v.partial === undefined || typeof v.partial === "boolean" ? { phase: "ready", ...(v.partial && { partial: true }) } : null;
     case "empty":
@@ -244,6 +392,16 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
     }
     return { kind: v.kind, items };
   },
+  storeys(v) {
+    if (!isObject(v) || !isList(v.items)) return undefined;
+    const items: StoreyItem[] = [];
+    for (const i of v.items) {
+      if (!isObject(i) || !isText(i.id) || !isText(i.name) || typeof i.visible !== "boolean") return undefined;
+      if (i.elevation !== null && !isFinite(i.elevation)) return undefined;
+      items.push({ id: i.id, name: i.name, elevation: i.elevation, visible: i.visible });
+    }
+    return { items };
+  },
   layouts(v) {
     if (!isObject(v) || !isList(v.items) || !isText(v.current)) return undefined;
     const items: { id: string; name: string; isModel: boolean }[] = [];
@@ -272,10 +430,15 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
   },
   warnings(v) {
     if (!isList(v, 64)) return undefined;
-    const out: { key: string; count: number }[] = [];
+    const out: Warning[] = [];
     for (const w of v) {
       if (!isObject(w) || !isWord(w.key) || !isInt(w.count)) return undefined;
-      out.push({ key: w.key, count: w.count });
+      if (w.names === undefined) {
+        out.push({ key: w.key, count: w.count });
+        continue;
+      }
+      if (!isList(w.names, 16) || !w.names.every((n) => isText(n, 256))) return undefined;
+      out.push({ key: w.key, count: w.count, names: w.names as string[] });
     }
     return out;
   },
@@ -301,6 +464,46 @@ const CHECKS: { [K in ControllerKey]: (v: unknown) => Snapshots[K] | undefined }
       refused = { key: v.refused.key };
     }
     return { members, opening: v.opening, opened, refused };
+  },
+  media(v) {
+    if (!isObject(v) || !oneOf(v.kind, ["video", "audio"] as const)) return undefined;
+    const flags = ["paused", "ended", "muted", "waiting", "blocked"] as const;
+    if (!flags.every((f) => typeof v[f] === "boolean")) return undefined;
+    const seconds = (n: unknown) => isFinite(n) && n >= 0;
+    if (!seconds(v.currentTime) || !seconds(v.buffered) || !(isNumber(v.duration) && v.duration >= 0)) return undefined;
+    if (!isFinite(v.volume) || v.volume < 0 || v.volume > 1 || !isFinite(v.rate) || v.rate <= 0 || v.rate > 16) return undefined;
+    return {
+      kind: v.kind,
+      paused: v.paused as boolean,
+      ended: v.ended as boolean,
+      currentTime: v.currentTime as number,
+      duration: v.duration,
+      buffered: v.buffered as number,
+      volume: v.volume,
+      muted: v.muted as boolean,
+      rate: v.rate,
+      waiting: v.waiting as boolean,
+      blocked: v.blocked as boolean,
+    };
+  },
+  sheets(v) {
+    if (!isObject(v) || !isList(v.items) || !isInt(v.current)) return undefined;
+    const items: { index: number; name: string }[] = [];
+    for (const i of v.items) {
+      if (!isObject(i) || !isInt(i.index) || !isText(i.name)) return undefined;
+      items.push({ index: i.index, name: i.name });
+    }
+    return { items, current: v.current };
+  },
+  pictures: (v) => (isObject(v) && isInt(v.count, 0, MAX_ITEMS) && oneOf(v.space, SPACES) ? { count: v.count, space: v.space } : undefined),
+  viewport(v) {
+    if (v === null) return null;
+    if (!isObject(v) || !oneOf(v.space, SPACES) || !isInt(v.page, 1, MAX_ITEMS) || !(v.layout === undefined || isText(v.layout))) return undefined;
+    if (!regionMatches(v.space, v.region)) return undefined;
+    const region = v.region === undefined ? undefined : checkRegion(v.region);
+    // Only a rectangle or a camera has a region; "frame" has none, and no viewport to follow.
+    if (!region) return undefined;
+    return { space: v.space, page: v.page, ...(v.layout !== undefined && { layout: v.layout }), region };
   },
 };
 
@@ -366,12 +569,59 @@ export function checkFrameMessage(v: unknown): FrameMessage | null {
       return isText(v.url, MAX_URL) ? { type: "link", url: v.url } : null;
     // Shapes only: whether a read is within the file and the limits is the host's to judge.
     case "read":
-      return isInt(v.id) && isInt(v.offset) && isInt(v.length) ? { type: "read", id: v.id, offset: v.offset, length: v.length } : null;
+      return isInt(v.id) && isInt(v.generation) && isInt(v.offset) && isInt(v.length)
+        ? { type: "read", id: v.id, generation: v.generation, offset: v.offset, length: v.length }
+        : null;
+    case "fetch":
+      return isInt(v.id) && isText(v.path, MAX_PATH) ? { type: "fetch", id: v.id, path: v.path } : null;
     case "cancel":
       return isInt(v.id) ? { type: "cancel", id: v.id } : null;
+    case "key":
+      return oneOf(v.key, NAV_KEYS) && typeof v.shift === "boolean" && typeof v.repeat === "boolean" ? { type: "key", key: v.key, shift: v.shift, repeat: v.repeat } : null;
+    case "replaced":
+      return isInt(v.call) && typeof v.ok === "boolean" ? { type: "replaced", call: v.call, ok: v.ok } : null;
+    case "rastered":
+      return isInt(v.id) ? { type: "rastered", id: v.id, result: checkRasterResult(v.result) } : (closeBitmap(isObject(v.result) ? v.result.bitmap : undefined), null);
     default:
       return null;
   }
+}
+
+function closeBitmap(v: unknown): void {
+  if (typeof ImageBitmap !== "undefined" && v instanceof ImageBitmap) v.close();
+}
+
+/**
+ * A picture the frame sent, or the failure it stands for: one that is not
+ * well formed (a bitmap that is none, past the limits, of another size than
+ * it says) is closed and is a "failed". The page of the host that asked
+ * checks the rest: its space, the size it asked for.
+ */
+function checkRasterResult(v: unknown): RasterResult {
+  const fail: RasterResult = { ok: false, code: "failed" };
+  if (!isObject(v)) return fail;
+  if (v.ok === false) return isRasterErrorCode(v.code) ? { ok: false, code: v.code } : fail;
+  const bad = (): RasterResult => (closeBitmap(v.bitmap), fail);
+  if (v.ok !== true || !isPicture(v.bitmap)) return bad();
+  const { bitmap } = v;
+  if (v.width !== bitmap.width || v.height !== bitmap.height || !isInt(v.page, 1, MAX_ITEMS) || !oneOf(v.space, SPACES)) return bad();
+  if (!(v.layout === undefined || isText(v.layout))) return bad();
+  let region: RasterRegion | undefined;
+  if (v.space !== "frame") {
+    if (!regionMatches(v.space, v.region)) return bad();
+    region = checkRegion(v.region);
+    if (!region) return bad();
+  } else if (v.region !== undefined) return bad();
+  return {
+    ok: true,
+    bitmap,
+    width: bitmap.width,
+    height: bitmap.height,
+    page: v.page,
+    ...(v.layout !== undefined && { layout: v.layout }),
+    space: v.space,
+    ...(region && { region }),
+  };
 }
 
 /** Lists of short words without markup: what a policy's sources look like. */
@@ -413,7 +663,7 @@ function defined<T extends Record<string, unknown>>(o: T): T {
 /** The options the frame will use: known keys of the right type, the rest dropped. */
 export function checkOptions(v: unknown): FrameOptions {
   const out: FrameOptions = {};
-  const { pdf, image, cad, ifc, model, archive } = isObject(v) ? v : {};
+  const { pdf, image, cad, ifc, model, archive, conversion, media } = isObject(v) ? v : {};
   if (isObject(pdf))
     out.pdf = defined({
       minZoom: num(pdf.minZoom),
@@ -441,6 +691,9 @@ export function checkOptions(v: unknown): FrameOptions {
       timeoutMs: num(cad.timeoutMs),
       maxPrimitives: num(cad.maxPrimitives),
       maxDecompressedBytes: num(cad.maxDecompressedBytes),
+      maxEntities: num(cad.maxEntities),
+      lineweights: oneOf(cad.lineweights, ["drawing", "always", "never"] as const) ? cad.lineweights : undefined,
+      monochrome: typeof cad.monochrome === "boolean" ? cad.monochrome : undefined,
     });
   if (isObject(ifc))
     out.ifc = defined({
@@ -463,6 +716,18 @@ export function checkOptions(v: unknown): FrameOptions {
       maxMembers: num(archive.maxMembers),
       maxCompressionRatio: num(archive.maxCompressionRatio),
     });
+  if (isObject(conversion)) {
+    const converter = oneOf(conversion.converter, ["exav", "external"] as const) ? conversion.converter : undefined;
+    // A package name the asset manifest lists, or a path or an http(s) URL.
+    const external = conversion.externalConverter;
+    const externalConverter =
+      typeof external === "string" &&
+      (/^(@[a-z0-9._-]{1,64}\/)?[a-z0-9._-]{1,64}$/.test(external) || /^(\.{0,2}\/|https?:\/\/)[^\s\u0000-\u001f\u007f]{1,500}$/.test(external))
+        ? external
+        : undefined;
+    out.conversion = defined({ timeoutMs: num(conversion.timeoutMs), maxMemory: num(conversion.maxMemory), converter, externalConverter });
+  }
+  if (isObject(media)) out.media = defined({ controls: oneOf(media.controls, ["native", "none"] as const) ? media.controls : undefined });
   return out;
 }
 
@@ -476,7 +741,19 @@ export function checkOpen(v: unknown, known: readonly BuiltinFormat[]): OpenMess
   if (!isText(f.name, MAX_PATH) || !isText(f.type, 256) || !isText(f.path, MAX_PATH)) return null;
   const format = f.format === null ? null : oneOf(f.format, known) ? f.format : undefined;
   if (format === undefined) return null;
-  return { type: "open", formats, file: { name: f.name, type: f.type, path: f.path, format }, source, options: checkOptions(v.options) };
+  const tree = v.tree === undefined ? undefined : checkTree(v.tree);
+  if (tree === null) return null;
+  return { type: "open", formats, file: { name: f.name, type: f.type, path: f.path, format }, source, ...(tree ? { tree } : {}), options: checkOptions(v.options), theme: checkTheme(v.theme) };
+}
+
+function checkTree(v: unknown): { path: string; paths: string[] } | null {
+  if (!isObject(v) || !isText(v.path, MAX_PATH) || !isList(v.paths, TREE.maxPaths)) return null;
+  const paths: string[] = [];
+  for (const p of v.paths) {
+    if (!isText(p, MAX_PATH)) return null;
+    paths.push(p);
+  }
+  return { path: v.path, paths };
 }
 
 function checkSource(v: unknown): OpenSource | null {
@@ -505,6 +782,45 @@ export function checkBytes(v: unknown): BytesMessage | null {
 
 export function checkCommand(v: unknown): CommandMessage | null {
   if (!isObject(v) || v.type !== "command" || !isInt(v.call) || !isInt(v.session) || !isText(v.action, 32) || !isList(v.args, 4)) return null;
-  if (!oneOf(v.target, ["pages", "zoom", "drag", "outline", "layers", "layouts", "ground", "archive"] as const)) return null;
+  if (!oneOf(v.target, COMMAND_TARGETS)) return null;
   return { type: "command", call: v.call, session: v.session, target: v.target, action: v.action, args: v.args };
+}
+
+export function checkThemeMessage(v: unknown): ThemeMessage | null {
+  return isObject(v) && v.type === "theme" ? { type: "theme", theme: checkTheme(v.theme) } : null;
+}
+
+/** A `raster`: a page and well-formed options; sizes are checked against the limits where the picture is drawn. */
+export function checkRaster(v: unknown): RasterMessage | null {
+  if (!isObject(v) || v.type !== "raster" || !isInt(v.id) || !isInt(v.session) || !isInt(v.page, 1)) return null;
+  const options = checkRasterOptions(v.options);
+  return options ? { type: "raster", id: v.id, session: v.session, page: v.page, options } : null;
+}
+
+/**
+ * The id of a message that claims to be a `raster` but is not one `checkRaster`
+ * takes, or null: the frame still owes it an answer.
+ */
+export function refusedRasterId(v: unknown): number | null {
+  return isObject(v) && v.type === "raster" && isInt(v.id) && !checkRaster(v) ? v.id : null;
+}
+
+export function checkUnraster(v: unknown): UnrasterMessage | null {
+  return isObject(v) && v.type === "unraster" && isInt(v.id) ? { type: "unraster", id: v.id } : null;
+}
+
+export function checkWatch(v: unknown): WatchMessage | null {
+  if (!isObject(v) || (v.type !== "watch" && v.type !== "unwatch") || !isInt(v.session) || !oneOf(v.key, WATCHED_KEYS)) return null;
+  return { type: v.type, session: v.session, key: v.key };
+}
+
+/** A `replace`, its file and source checked as an `open`'s are. */
+export function checkReplace(v: unknown, known: readonly BuiltinFormat[]): ReplaceMessage | null {
+  if (!isObject(v) || v.type !== "replace" || !isInt(v.call) || !isInt(v.generation, 1) || !isObject(v.file)) return null;
+  const source = checkSource(v.source);
+  const f = v.file;
+  if (!source || !isText(f.name, MAX_PATH) || !isText(f.type, 256) || !isText(f.path, MAX_PATH)) return null;
+  const format = f.format === null ? null : oneOf(f.format, known) ? f.format : undefined;
+  if (format === undefined) return null;
+  return { type: "replace", call: v.call, generation: v.generation, file: { name: f.name, type: f.type, path: f.path, format }, source };
 }

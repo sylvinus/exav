@@ -3,7 +3,7 @@
 use std::io::{Seek, SeekFrom};
 
 use crate::source::{ByteSource, Reader};
-use crate::stream::{emit_stream, MemberMeta, Mtime, Visit};
+use crate::stream::{MemberMeta, Mtime, Visit, emit_stream};
 use crate::{Budget, LimitHit};
 
 pub(crate) fn walk<T>(

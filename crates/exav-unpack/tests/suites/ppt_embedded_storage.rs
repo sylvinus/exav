@@ -11,7 +11,7 @@
 //! The fixtures here are built rather than vendored, so each one isolates a
 //! single property of the record walk.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use std::io::Write;
 
 const MARKER: &[u8] = b"EMBEDDED-OBJECT-MARKER";
@@ -191,4 +191,35 @@ fn a_truncated_deflate_stream_still_yields_what_it_decoded() {
         has_marker(&entries),
         "a truncated object gave back nothing at all"
     );
+}
+
+/// The record walk ends with the stream. A count of records of its own ended it
+/// at 100,000 and left the objects after them unread, with nothing said.
+#[test]
+#[cfg(feature = "ole")]
+fn an_object_after_many_records_is_still_recovered() {
+    let mut records = record(0x0000, 0x0001, b"").repeat(150_000);
+    records.extend(compressed_storage(MARKER));
+    assert!(
+        has_marker(&members(&ppt_with(&records))),
+        "the object behind 150,000 records was not read"
+    );
+}
+
+/// A record that runs past the end of its stream is read as far as the stream
+/// goes, and reported as cut, not dropped.
+#[test]
+#[cfg(feature = "ole")]
+fn an_object_cut_by_the_end_of_the_stream_is_read_and_reported() {
+    let mut full = stored_storage(MARKER);
+    // The header says more than there is.
+    full[4..8].copy_from_slice(&((MARKER.len() as u32) + 500).to_le_bytes());
+    let es = members(&ppt_with(&full));
+    let cut = es
+        .iter()
+        .find(|e| {
+            e.name.starts_with("ppt-embedded") && e.data.windows(MARKER.len()).any(|w| w == MARKER)
+        })
+        .expect("the part that is there is scanned");
+    assert!(cut.unsupported.is_some(), "{:?}", cut.unsupported);
 }

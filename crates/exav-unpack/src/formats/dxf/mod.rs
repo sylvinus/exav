@@ -28,7 +28,7 @@ mod parts;
 mod records;
 
 pub(crate) use extract::extract_dxf;
-pub use pairs::{Stop, Tag, Tags, Value, BINARY_SENTINEL};
+pub use pairs::{BINARY_SENTINEL, Stop, Tag, Tags, Value};
 pub use parts::Parts;
 pub use records::{Record, Records};
 

@@ -68,6 +68,18 @@ describe('Camera', () => {
     expect(c.scale).toBeCloseTo(4, 6)
   })
 
+  it('zooms no closer than f32 allows the drawing, nor further than twenty fits', () => {
+    const c = cam()
+    // A plan 100 across, 1,000,000 from its origin.
+    const extents: [number, number, number, number] = [1e6, 1e6, 1e6 + 100, 1e6 + 100]
+    c.fit(extents)
+    c.limit(extents)
+    for (let i = 0; i < 200; i++) c.zoomAt(10, 10, 2)
+    expect(c.scale).toBeCloseTo((1e6 + 100) * 2 ** -21, 9)
+    for (let i = 0; i < 200; i++) c.zoomAt(10, 10, 0.5)
+    expect(c.scale).toBeCloseTo((100 * 20) / Math.min(c.width, c.height), 9)
+  })
+
   it('pans by exactly the pixel delta given', () => {
     const c = cam()
     c.scale = 0.5

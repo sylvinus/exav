@@ -40,7 +40,7 @@
 //!    scanner that gives up quietly on a deeply nested archive has been evaded
 //!    by nothing more than a shell loop.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 /// Recursion levels needed to reach the payload. One less than this and exav
 /// cannot get there; the fixture sits exactly at this depth so the boundary is

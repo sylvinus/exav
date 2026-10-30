@@ -82,14 +82,33 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use exav_core::{
-    analyze_all_seekable, scan_path, scan_seekable_located, AllMatchOutcome, ScanOptions,
-    ScanReport, Scanner, Verdict, VerdictCategory,
+    AllMatchOutcome, ScanOptions, ScanReport, Scanner, Verdict, VerdictCategory,
+    analyze_all_seekable, scan_path, scan_seekable_located,
 };
 use walkdir::WalkDir;
+
+/// Whether this daemon honours `SHUTDOWN` and `QUIT`, set once at startup and
+/// inherited by every forked worker, so that `VERSIONCOMMANDS` lists them only
+/// when they work.
+static SHUTDOWN_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The `VERSIONCOMMANDS` reply: the version, then the verbs this daemon honours.
+fn versioncommands(version: &str, shutdown: bool, scanurl: bool) -> String {
+    format!(
+        "{version}| COMMANDS: SCAN CONTSCAN MULTISCAN ALLMATCHSCAN INSTREAM EXINSTREAM FILDES \
+         STATS VERSION VERSIONCOMMANDS RELOAD{} PING IDSESSION SESSION END{}",
+        if shutdown { " SHUTDOWN QUIT" } else { "" },
+        if cfg!(feature = "http-scan") && scanurl {
+            " SCANURL"
+        } else {
+            ""
+        }
+    )
+}
 
 /// Worker/thread count advertised as `max` in the clamd-compatible `STATS`
 /// reply. Set once at daemon startup (prefork: the configured worker count) and
@@ -109,12 +128,28 @@ fn daemon_max_workers() -> usize {
     }
 }
 
+/// The `STATS` reply: clamd's block, then exav's counters. Under the pool the
+/// counters are shared by every process (`metrics::share_across_fork`), so any
+/// process, the health child included, reports the pool's totals.
+pub(crate) fn stats_reply() -> String {
+    let max = daemon_max_workers();
+    let live = crate::metrics::in_flight();
+    format!(
+        "POOLS: 1\n\nSTATE: VALID PRIMARY\n\
+         THREADS: live {live}  idle 0 max {max} idle-timeout 30\n\
+         QUEUE: {live} items\n\tSTATS 0.000000 \n\n\
+         MEMSTATS: heap N/A mmap N/A used N/A free N/A releasable N/A \
+         pools 1 pools_used N/A pools_total N/A\n{}\nEND",
+        crate::metrics::stats_block()
+    )
+}
+
 /// The clamd-compatible `VERSION` string: `ClamAV <flevel-release>/<db-version>/
 /// <db-build-time>` when a signed container is loaded (what `clamdtop` parses
 /// into its ENGINE / DBVER / DBTIME columns), degrading to just `ClamAV
 /// <release>` for the loose-signature / built-in-baseline case (no container to
 /// report a version for).
-fn clamav_version(db: &Scanner) -> String {
+pub(crate) fn clamav_version(db: &Scanner) -> String {
     match db.db_version() {
         Some((ver, btime)) => format!(
             "ClamAV {}/{}/{}",
@@ -501,6 +536,7 @@ pub fn run(
     max_connections: usize,
 ) -> io::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
     let conns = Arc::new(AtomicUsize::new(0));
     // A client that disconnects right after reading a reply delivers SIGPIPE on
     // the next write. `main` set the default disposition, which kills the
@@ -551,10 +587,9 @@ pub fn run(
                         &request_reload,
                         &shutdown,
                         allow_http_scan,
-                    ) {
-                        if !is_benign_disconnect(&e) {
-                            eprintln!("exav: connection error: {e}");
-                        }
+                    ) && !is_benign_disconnect(&e)
+                    {
+                        eprintln!("exav: connection error: {e}");
                     }
                 });
             }
@@ -591,10 +626,9 @@ pub fn run(
                         &request_reload,
                         &shutdown,
                         allow_http_scan,
-                    ) {
-                        if !is_benign_disconnect(&e) {
-                            eprintln!("exav: connection error: {e}");
-                        }
+                    ) && !is_benign_disconnect(&e)
+                    {
+                        eprintln!("exav: connection error: {e}");
                     }
                 });
             }
@@ -705,7 +739,7 @@ fn bind_listener(addr: &ListenAddr) -> io::Result<BoundListener> {
 /// owner can write (`$XDG_RUNTIME_DIR` or `/var/run`), not world-writable
 /// `/tmp`, where another local user can pre-create the path.
 #[cfg(unix)]
-fn bind_unix_socket(
+pub(crate) fn bind_unix_socket(
     path: &std::path::Path,
     mode: u32,
 ) -> io::Result<std::os::unix::net::UnixListener> {
@@ -874,8 +908,8 @@ pub(crate) const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::fro
 /// replaced it.
 #[cfg(unix)]
 struct Retiring {
-    /// The side listener's child rather than a worker.
-    side: bool,
+    /// The name of the side listener this child served, `None` for a worker.
+    name: Option<&'static str>,
     since: std::time::Instant,
     /// Sent SIGTERM for outliving its grace.
     stopped: bool,
@@ -883,9 +917,9 @@ struct Retiring {
 
 #[cfg(unix)]
 impl Retiring {
-    fn new(side: bool, since: std::time::Instant) -> Self {
+    fn new(name: Option<&'static str>, since: std::time::Instant) -> Self {
         Self {
-            side,
+            name,
             since,
             stopped: false,
         }
@@ -1230,6 +1264,11 @@ pub(crate) fn fit_limits_to_job_memory(opts: &mut ScanOptions, job_memory: u64) 
     };
     cap(&mut opts.limits.max_buffer_bytes, job_memory / 4);
     cap(&mut opts.deep_analysis_max, job_memory / 4);
+    cap(&mut opts.limits.max_bytecode_memory_bytes, job_memory / 4);
+    // The cache of an object read in place, and one HTTP request held while it
+    // is read, each an eighth of the job's memory at most.
+    cap(&mut opts.object_cache_bytes, job_memory / 8);
+    cap(&mut opts.http_request_bytes, job_memory / 8);
     let object = opts.limits.max_buffer_bytes.max(opts.deep_analysis_max);
     cap(
         &mut opts.limits.max_extracted_bytes,
@@ -1289,10 +1328,11 @@ fn cgroup_limit_from(proc_self_cgroup: &str, read: impl Fn(&str) -> Option<Strin
                 let raw = raw.trim();
                 // v1 reports "unlimited" as a huge page-aligned number rather
                 // than a word; anything past the host's own RAM is no ceiling.
-                if let Ok(v) = raw.parse::<u64>() {
-                    if v > 0 && v < (u64::MAX >> 10) {
-                        limit = Some(limit.map_or(v, |l| l.min(v)));
-                    }
+                if let Ok(v) = raw.parse::<u64>()
+                    && v > 0
+                    && v < (u64::MAX >> 10)
+                {
+                    limit = Some(limit.map_or(v, |l| l.min(v)));
                 }
             }
             match dir.rfind('/') {
@@ -1371,6 +1411,45 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
     Some((usable / workers.max(1) as u64).max(FLOOR))
 }
 
+/// What the one-shot run has found so far, kept where the alarm's handler can
+/// read it: an atomic is the only state an async-signal-safe handler may read.
+#[cfg(unix)]
+static ONESHOT_INFECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static ONESHOT_ERRORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The exit code of a run that ran out of time and had found nothing else:
+/// what `--partial-as` gives a `LIMITS-EXCEEDED`.
+#[cfg(unix)]
+static ONESHOT_TIMEOUT_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(3);
+
+/// The run's detections and errors so far, for the exit code of a run the alarm
+/// ends. Cheap enough to call after every file.
+pub(crate) fn note_run(infected: u64, errors: u64) {
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ONESHOT_INFECTED.store(infected > 0, Relaxed);
+        ONESHOT_ERRORS.store(errors > 0, Relaxed);
+    }
+    #[cfg(not(unix))]
+    let _ = (infected, errors);
+}
+
+/// The exit code a one-shot run ends with when the alarm cuts it short, by the
+/// same precedence as a run that finished: a detection, then an error, then the
+/// file that ran out of time as `--partial-as` says.
+#[cfg(unix)]
+fn oneshot_exit_code() -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if ONESHOT_INFECTED.load(Relaxed) {
+        1
+    } else if ONESHOT_ERRORS.load(Relaxed) {
+        2
+    } else {
+        ONESHOT_TIMEOUT_EXIT.load(Relaxed)
+    }
+}
+
 /// Handler for the one-shot CLI's wall-clock alarm.
 ///
 /// Separate from [`on_sigalrm`], which serves a pool worker that a parent will
@@ -1379,16 +1458,15 @@ fn affordable_job_memory(workers: usize, shared_db_bytes: u64) -> Option<u64> {
 /// handler may use.
 #[cfg(unix)]
 extern "C" fn on_oneshot_alarm(_sig: libc::c_int) {
-    const MSG: &[u8] = b"exav: scan exceeded --max-scan-secs\n";
+    const MSG: &[u8] =
+        b"exav: scan exceeded --max-scan-secs; the files after it were not scanned\n";
     unsafe {
         libc::write(2, MSG.as_ptr().cast(), MSG.len());
-        // Exit 3, the `PARTIAL` code, rather than the pool's dedicated timeout
-        // code: a scan that ran out of time is one more object exav declined to
-        // call clean, and it should sort with the others. The handler cannot
-        // consult `--partial-as` (reading it here would not be
-        // async-signal-safe), so a run that folds partials elsewhere still gets
-        // 3 from this path alone.
-        libc::_exit(3)
+        // The code the run would have had: a detection already reported stays
+        // a 1, however the run ended. The file that ran out of time counts as a
+        // `LIMITS-EXCEEDED` under `--partial-as`, read at startup because the
+        // policy cannot be consulted here.
+        libc::_exit(oneshot_exit_code())
     }
 }
 
@@ -1410,6 +1488,14 @@ pub(crate) fn apply_oneshot_limits(max_scan_time: Option<u64>, max_scan_memory: 
         set_rlimit(libc::RLIMIT_AS as libc::c_int, bytes);
     }
     if let Some(secs) = max_scan_time {
+        use crate::policy::PartialStatus;
+        let code = match crate::policy::current().for_tag("LIMITS-EXCEEDED") {
+            PartialStatus::Partial => 3,
+            PartialStatus::Ok => 0,
+            PartialStatus::Found => 1,
+            PartialStatus::Error => 2,
+        };
+        ONESHOT_TIMEOUT_EXIT.store(code, std::sync::atomic::Ordering::Relaxed);
         install_handler(libc::SIGALRM, on_oneshot_alarm);
         set_timer(std::time::Duration::from_secs(secs));
     }
@@ -1566,8 +1652,9 @@ pub(crate) fn await_connection(listener: std::os::fd::RawFd, retire: std::os::fd
 /// the volume triggers a reload without sending `RELOAD`. `reload_db` re-reads the
 /// signatures; on a `RELOAD`/SIGUSR2/data-dir change the supervisor calls it,
 /// warms the result, and re-forks the pool with the new DB. A failed reload is
-/// logged and the running DB is kept. `side` is an additional listener served by
-/// one more child, forked, reaped and reloaded exactly as the workers are.
+/// logged and the running DB is kept. Each of `side` is an additional listener
+/// served by a child of its own, forked, reaped and reloaded exactly as the
+/// workers are.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_prefork(
@@ -1577,7 +1664,7 @@ pub fn run_prefork(
     mut cfg: PoolConfig,
     mut datadir: Option<Watch>,
     reload_db: &dyn Fn() -> Result<Scanner, String>,
-    side: Option<&SideListener>,
+    side: &[SideListener],
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     // Same SIGPIPE rationale as `run`.
@@ -1599,20 +1686,20 @@ pub fn run_prefork(
     // once the database is loaded and warmed, and both the per-job ceiling and
     // the in-core budget that must sit under it are decided from that figure.
     let db_bytes = current_address_space().unwrap_or(0);
-    if let Some(afford) = affordable_job_memory(cfg.workers, db_bytes) {
-        if cfg.max_memory_bytes > afford {
-            eprintln!(
-                "exav: per-job memory {} MiB x {} workers exceeds what this host can back; \
+    if let Some(afford) = affordable_job_memory(cfg.workers, db_bytes)
+        && cfg.max_memory_bytes > afford
+    {
+        eprintln!(
+            "exav: per-job memory {} MiB x {} workers exceeds what this host can back; \
                  using {} MiB per job (two thirds of RAM, less the {} MiB shared database, \
                  over the workers). Raise RAM, lower --workers, or set a smaller \
                  --max-process-bytes to silence this.",
-                cfg.max_memory_bytes >> 20,
-                cfg.workers,
-                afford >> 20,
-                db_bytes >> 20,
-            );
-            cfg.max_memory_bytes = afford;
-        }
+            cfg.max_memory_bytes >> 20,
+            cfg.workers,
+            afford >> 20,
+            db_bytes >> 20,
+        );
+        cfg.max_memory_bytes = afford;
     }
     let opts = {
         let mut opts = opts;
@@ -1658,15 +1745,21 @@ pub fn run_prefork(
     install_handler(libc::SIGUSR2, on_sigusr2);
     install_handler(libc::SIGCHLD, on_sigchld);
 
-    let mut gen = Generation::new()?;
+    // Before the first fork, so every child counts into the same block and a
+    // `STATS` answered by any of them is the pool's. Without it each process
+    // counts its own jobs, which `STATS` then reports as the pool's.
+    if let Err(e) = crate::metrics::share_across_fork() {
+        eprintln!("exav: the counters stay per process, so STATS shows one process's: {e}");
+    }
+    let mut r#gen = Generation::new()?;
     let mut children = std::collections::HashSet::new();
     for _ in 0..cfg.workers {
-        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
+        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &r#gen)?);
     }
-    let mut side_pid = match side {
-        Some(s) => Some(spawn_side(s, &db, &opts, &gen)?),
-        None => None,
-    };
+    let mut side_pids: Vec<Option<libc::pid_t>> = Vec::with_capacity(side.len());
+    for s in side {
+        side_pids.push(Some(spawn_side(s, &db, &opts, &r#gen)?));
+    }
     // Children of retired generations, still finishing their last job. They
     // are reaped but not replaced, and stopped once their grace has passed.
     let mut retiring: std::collections::HashMap<libc::pid_t, Retiring> =
@@ -1688,35 +1781,27 @@ pub fn run_prefork(
             if pid <= 0 {
                 break; // 0 = none exited yet; <0 = no children / error
             }
-            let side_name = side.map_or("worker", |s| s.name);
+            // A child that died mid-scan (its time ran out) takes its scans in
+            // flight with it.
+            crate::metrics::release(pid);
             if let Some(r) = retiring.remove(&pid) {
-                log_child_exit(pid, status, if r.side { side_name } else { "worker" }, true);
+                log_child_exit(pid, status, r.name.unwrap_or("worker"), true);
                 continue;
             }
-            let is_side = side_pid == Some(pid);
-            if is_side {
-                side_pid = None;
-            } else {
-                children.remove(&pid);
+            let which = side_pids.iter().position(|p| *p == Some(pid));
+            match which {
+                Some(i) => side_pids[i] = None,
+                None => {
+                    children.remove(&pid);
+                }
             }
-            log_child_exit(
-                pid,
-                status,
-                if is_side { side_name } else { "worker" },
-                false,
-            );
+            log_child_exit(pid, status, which.map_or("worker", |i| side[i].name), false);
             if !SHUTDOWN.load(Ordering::Relaxed) {
-                if is_side {
-                    // Unwrapping is sound: `is_side` is only ever true when a
-                    // side listener was configured in the first place.
-                    side_pid = Some(spawn_side(
-                        side.expect("a side listener exited, so there is one"),
-                        &db,
-                        &opts,
-                        &gen,
-                    )?);
-                } else {
-                    children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
+                match which {
+                    Some(i) => side_pids[i] = Some(spawn_side(&side[i], &db, &opts, &r#gen)?),
+                    None => {
+                        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &r#gen)?);
+                    }
                 }
             }
         }
@@ -1725,7 +1810,7 @@ pub fn run_prefork(
         if HUP_RECEIVED.swap(false, Ordering::Relaxed) {
             for &pid in children
                 .iter()
-                .chain(side_pid.iter())
+                .chain(side_pids.iter().flatten())
                 .chain(retiring.keys())
             {
                 // SAFETY: signals a child of this process that has not been
@@ -1755,19 +1840,24 @@ pub fn run_prefork(
                     // write end. The side listener goes with them, which is the
                     // whole of its signature swap: it comes back forked from
                     // the new database.
-                    gen = Generation::new()?;
+                    r#gen = Generation::new()?;
                     let since = std::time::Instant::now();
                     retiring.extend(
                         children
                             .drain()
-                            .map(|pid| (pid, Retiring::new(false, since))),
+                            .map(|pid| (pid, Retiring::new(None, since))),
                     );
-                    retiring.extend(side_pid.take().map(|pid| (pid, Retiring::new(true, since))));
-                    for _ in 0..cfg.workers {
-                        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &gen)?);
+                    for (slot, s) in side_pids.iter_mut().zip(side) {
+                        retiring.extend(
+                            slot.take()
+                                .map(|pid| (pid, Retiring::new(Some(s.name), since))),
+                        );
                     }
-                    if let Some(s) = side {
-                        side_pid = Some(spawn_side(s, &db, &opts, &gen)?);
+                    for _ in 0..cfg.workers {
+                        children.insert(spawn_worker(&listener, &db, &opts, &cfg, &r#gen)?);
+                    }
+                    for (slot, s) in side_pids.iter_mut().zip(side) {
+                        *slot = Some(spawn_side(s, &db, &opts, &r#gen)?);
                     }
                 }
                 Err(e) => {
@@ -1787,11 +1877,7 @@ pub fn run_prefork(
                 continue;
             };
             if now >= due {
-                let what = if r.side {
-                    side.map_or("worker", |s| s.name)
-                } else {
-                    "worker"
-                };
+                let what = r.name.unwrap_or("worker");
                 eprintln!(
                     "exav: {what} {pid} of a retired generation is still busy after {}s; stopping it",
                     grace.as_secs()
@@ -1813,7 +1899,7 @@ pub fn run_prefork(
     let all: Vec<libc::pid_t> = children
         .iter()
         .copied()
-        .chain(side_pid)
+        .chain(side_pids.iter().flatten().copied())
         .chain(retiring.keys().copied())
         .collect();
     for &pid in &all {
@@ -1882,7 +1968,7 @@ fn spawn_side(
     side: &SideListener,
     db: &Arc<Scanner>,
     opts: &Arc<ScanOptions>,
-    gen: &Generation,
+    r#gen: &Generation,
 ) -> io::Result<libc::pid_t> {
     use std::io::Write as _;
     let _ = io::stderr().flush();
@@ -1893,7 +1979,7 @@ fn spawn_side(
     match pid {
         -1 => Err(io::Error::last_os_error()),
         0 => {
-            let retire = gen.enter();
+            let retire = r#gen.enter();
             child_signals();
             // After the resets above, so the SIGTERM it arranges is the default
             // disposition; a handler inherited from the supervisor would
@@ -1914,7 +2000,7 @@ fn spawn_worker(
     db: &Arc<Scanner>,
     opts: &Arc<ScanOptions>,
     cfg: &PoolConfig,
-    gen: &Generation,
+    r#gen: &Generation,
 ) -> io::Result<libc::pid_t> {
     // Flush so buffered parent output isn't duplicated into the child.
     use std::io::Write as _;
@@ -1924,7 +2010,7 @@ fn spawn_worker(
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(io::Error::last_os_error()),
-        0 => worker_main(listener, db, opts, cfg, supervisor, gen.enter()), // never returns
+        0 => worker_main(listener, db, opts, cfg, supervisor, r#gen.enter()), // never returns
         n => Ok(n),
     }
 }
@@ -1991,6 +2077,7 @@ fn worker_main(
     // `SHUTDOWN` likewise forwards to the supervisor (SIGTERM → graceful
     // teardown of the whole pool). Disabled → report it wasn't honoured.
     let allow_shutdown = cfg.allow_shutdown;
+    SHUTDOWN_ALLOWED.store(allow_shutdown, Ordering::Relaxed);
     let allow_http_scan = cfg.allow_http_scan;
     let shutdown = move || -> bool {
         if allow_shutdown {
@@ -2080,10 +2167,10 @@ fn worker_main(
                 },
             },
         };
-        if let Err(e) = outcome {
-            if !is_benign_disconnect(&e) {
-                eprintln!("exav: connection error: {e}");
-            }
+        if let Err(e) = outcome
+            && !is_benign_disconnect(&e)
+        {
+            eprintln!("exav: connection error: {e}");
         }
         jobs += 1;
         if cfg.max_jobs != 0 && jobs >= cfg.max_jobs {
@@ -2124,13 +2211,13 @@ fn log_child_exit(pid: libc::pid_t, status: libc::c_int, what: &str, retired: bo
 
 /// Command terminator, mirrored from the request onto the reply.
 #[derive(Clone, Copy, PartialEq)]
-enum Delim {
+pub(crate) enum Delim {
     Newline,
     Null,
 }
 
 impl Delim {
-    fn byte(self) -> u8 {
+    pub(crate) fn byte(self) -> u8 {
         match self {
             Delim::Newline => b'\n',
             Delim::Null => b'\0',
@@ -2141,7 +2228,7 @@ impl Delim {
 /// Read one command. Returns `None` at clean end-of-connection. The leading
 /// `z`/`n` prefix (if any) selects the terminator; a bare command is treated as
 /// legacy newline-terminated.
-fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(String, Delim)>> {
+pub(crate) fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(String, Delim)>> {
     let mut first = [0u8; 1];
     if read_full(r, &mut first)? == 0 {
         return Ok(None);
@@ -2174,7 +2261,7 @@ fn read_command<R: Read>(r: &mut BufReader<R>) -> io::Result<Option<(String, Del
                 io::ErrorKind::InvalidData,
                 "command is not valid UTF-8 (a path with non-UTF-8 bytes cannot \
                  be sent over this protocol; scan it by descriptor with FILDES)",
-            ))
+            ));
         }
     };
     Ok(Some((cmd, delim)))
@@ -2450,15 +2537,10 @@ fn dispatch<R: Read>(
         // a verb that is listed but refused is a capability nobody can use.
         // `SCANURL` is therefore listed only when this daemon would honour it:
         // built with `http-scan` and started with `--allow-http-scan`.
-        "VERSIONCOMMANDS" => vec![format!(
-            "{}| COMMANDS: SCAN CONTSCAN MULTISCAN ALLMATCHSCAN INSTREAM EXINSTREAM FILDES \
-             STATS VERSION VERSIONCOMMANDS RELOAD SHUTDOWN QUIT PING IDSESSION SESSION END{}",
-            clamav_version(db),
-            if cfg!(feature = "http-scan") && allow_http_scan {
-                " SCANURL"
-            } else {
-                ""
-            }
+        "VERSIONCOMMANDS" => vec![versioncommands(
+            &clamav_version(db),
+            SHUTDOWN_ALLOWED.load(Ordering::Relaxed),
+            allow_http_scan,
         )],
         // RELOAD is intercepted in `run_command` (it needs the supervisor hook).
         // clamd-compatible status block: POOLS/STATE/THREADS/QUEUE/MEMSTATS/END,
@@ -2473,18 +2555,7 @@ fn dispatch<R: Read>(
         // human or a scraper can read. `QUEUE` reports the scans actually in
         // flight rather than the constant `0 items` a stub would give, since a
         // saturated listener is exactly what someone runs this command to see.
-        "STATS" => {
-            let max = daemon_max_workers();
-            let live = crate::metrics::in_flight();
-            vec![format!(
-                "POOLS: 1\n\nSTATE: VALID PRIMARY\n\
-                 THREADS: live {live}  idle 0 max {max} idle-timeout 30\n\
-                 QUEUE: {live} items\n\tSTATS 0.000000 \n\n\
-                 MEMSTATS: heap N/A mmap N/A used N/A free N/A releasable N/A \
-                 pools 1 pools_used N/A pools_total N/A\n{}\nEND",
-                crate::metrics::stats_block()
-            )]
-        }
+        "STATS" => vec![stats_reply()],
         // clamd's SCAN takes a file OR a directory, and recurses into one. A
         // client that sends a directory and gets `Is a directory ERROR` back is
         // a client that works against clamd and not against exav, which is the
@@ -2512,7 +2583,9 @@ fn dispatch<R: Read>(
             vec![if allow_http_scan {
                 scan_url(db, opts, arg)
             } else {
-                format!("{arg}: SCANURL disabled (the daemon was not started with --allow-http-scan) ERROR")
+                format!(
+                    "{arg}: SCANURL disabled (the daemon was not started with --allow-http-scan) ERROR"
+                )
             }]
         }
         #[cfg(not(feature = "http-scan"))]
@@ -2524,7 +2597,12 @@ fn dispatch<R: Read>(
     Ok(reply)
 }
 
-fn write_reply<W: Write>(w: &mut W, id: Option<u64>, reply: &str, delim: Delim) -> io::Result<()> {
+pub(crate) fn write_reply<W: Write>(
+    w: &mut W,
+    id: Option<u64>,
+    reply: &str,
+    delim: Delim,
+) -> io::Result<()> {
     // In session (IDSESSION) mode each reply MESSAGE is tagged with its command
     // id on its FIRST line only; the remaining lines of a multi-line reply (the
     // STATS block) travel raw, exactly as clamd frames them. Prefixing every line
@@ -2689,13 +2767,29 @@ fn volume_set_lines(
             .collect();
         // `fetch` only ever runs for a name that parses as a part, so a
         // directory of large ordinary files is not read here at all.
-        let verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
+        let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
             let mut data = Vec::new();
             File::open(dir.join(name))?
                 .take(opts.deep_analysis_max.saturating_add(1))
                 .read_to_end(&mut data)?;
             Ok(data)
         });
+        // The sets whose volumes carry their own headers (RAR, ZIP, CAB). A
+        // `.cab` is read by its head to see whether it names a neighbour, and
+        // no name is turned into a path: only names in this directory's list.
+        verdicts.extend(exav_core::analyze_split_sets(
+            db,
+            &names,
+            opts,
+            |name, head| {
+                let limit = head.map_or(opts.deep_analysis_max.saturating_add(1), |n| n as u64);
+                let mut data = Vec::new();
+                File::open(dir.join(name))?
+                    .take(limit)
+                    .read_to_end(&mut data)?;
+                Ok(data)
+            },
+        ));
         for v in verdicts {
             // Named for the archive, not the fragment: `big.7z FOUND …` tells an
             // operator what was actually found, which `big.7z.002` does not.
@@ -2797,7 +2891,11 @@ fn scan_url(db: &Scanner, opts: &ScanOptions, url: &str) -> String {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return format!("{url}: SCANURL requires an http(s) URL ERROR");
     }
-    let reader = match exav_core::source::HttpRangeReader::open(url) {
+    let reader = match exav_core::source::HttpRangeReader::open_with(
+        url,
+        opts.object_cache_block_bytes,
+        opts.http_request_bytes,
+    ) {
         Ok(r) => r,
         Err(e) => return format!("{url}: {e} ERROR"),
     };
@@ -2917,7 +3015,7 @@ pub(crate) fn buffer_to_seekable<R: Read>(reader: &mut R) -> io::Result<Held> {
             return Ok(Held {
                 payload: StreamPayload::Mem(buf),
                 short: Some(why),
-            })
+            });
         }
         Err(SpillError::Io(e)) => return Err(e),
     };
@@ -3222,7 +3320,7 @@ fn exinstream_multi<R: Read>(
 
     // Now the multi-volume pass, which is why these are sent together at all.
     // It reads back only the payloads whose names parse as parts.
-    let verdicts = exav_core::analyze_volume_sets(db, &names, opts, |name| {
+    let held_bytes = |name: &str| {
         // First occurrence wins on a repeated name. Two files claiming one
         // volume position make the set ambiguous, and the collector refuses to
         // splice such a set rather than pick between them.
@@ -3235,7 +3333,22 @@ fn exinstream_multi<R: Read>(
             .ok_or_else(|| io::Error::other("stream was not held"))?
             .bytes_capped(opts.deep_analysis_max)?
             .ok_or_else(|| io::Error::other("stream too large to rejoin"))
-    });
+    };
+    let mut verdicts = exav_core::analyze_volume_sets(db, &names, opts, held_bytes);
+    // And the sets whose volumes carry their own headers (RAR, ZIP, CAB), the
+    // heads of `.cab` streams being read to see whether they name a neighbour.
+    verdicts.extend(exav_core::analyze_split_sets(
+        db,
+        &names,
+        opts,
+        |name, head| {
+            let mut data = held_bytes(name)?;
+            if let Some(n) = head {
+                data.truncate(n);
+            }
+            Ok(data)
+        },
+    ));
     for v in verdicts {
         let Some(i) = names.iter().position(|n| *n == v.name) else {
             continue;
@@ -3477,14 +3590,14 @@ impl<R: Read> Read for Instream<'_, R> {
             self.remaining -= n as u32;
             let before = self.total;
             self.total += n as u64;
-            if let Some(max) = self.max {
-                if self.total > max {
-                    // Hand over up to one byte past the limit, so the payload
-                    // holds everything the scan looks at and shows it is over;
-                    // the rest is only counted, by `drain`.
-                    self.over_limit = true;
-                    return Ok((max + 1 - before) as usize);
-                }
+            if let Some(max) = self.max
+                && self.total > max
+            {
+                // Hand over up to one byte past the limit, so the payload
+                // holds everything the scan looks at and shows it is over;
+                // the rest is only counted, by `drain`.
+                self.over_limit = true;
+                return Ok((max + 1 - before) as usize);
             }
             return Ok(n);
         }
@@ -3579,6 +3692,21 @@ mod tests {
         assert_eq!(opts.limits.max_extracted_bytes, 100 << 20);
         assert_eq!(opts.limits.max_buffer_bytes, 250 << 20);
         assert_eq!(opts.deep_analysis_max, 250 << 20);
+    }
+
+    /// The cache of an object read in place and an HTTP request are held
+    /// memory too: an eighth of the grant each at most.
+    #[test]
+    fn the_cache_and_the_request_fit_the_grant() {
+        let mut opts = ScanOptions::default();
+        opts.object_cache_bytes = 1 << 30;
+        opts.http_request_bytes = 1 << 30;
+        fit_limits_to_job_memory(&mut opts, 400 << 20);
+        assert_eq!(opts.object_cache_bytes, 50 << 20);
+        assert_eq!(opts.http_request_bytes, 50 << 20);
+        let mut opts = ScanOptions::default();
+        fit_limits_to_job_memory(&mut opts, 818 << 20);
+        assert_eq!(opts.object_cache_bytes, 8 << 20);
     }
 
     /// From live archives scanned with objects allowed up to 2000M in 2 GiB
@@ -4601,6 +4729,16 @@ mod tests {
         let reply = String::from_utf8_lossy(&buf);
         assert!(reply.contains("FOUND"), "got {reply}");
         let _ = w.write(b""); // keep w alive until reply read
+    }
+
+    /// A verb is listed when it works and not when it is refused, so a client
+    /// that reads the list does not send a command that cannot do anything.
+    #[test]
+    fn versioncommands_lists_shutdown_only_when_it_is_honoured() {
+        assert!(!versioncommands("v", false, false).contains("SHUTDOWN"));
+        assert!(!versioncommands("v", false, false).contains("QUIT"));
+        assert!(versioncommands("v", true, false).contains(" SHUTDOWN QUIT "));
+        assert!(!versioncommands("v", false, false).contains("SCANURL"));
     }
 
     #[test]

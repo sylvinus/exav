@@ -1,5 +1,5 @@
 //! NSIS installer extraction: real-sample robustness + synthetic-payload recovery.
-use exav_unpack::{detect, extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, detect, extract};
 
 /// A real NSIS installer (PE stub + NSIS firstheader + compressed data block).
 /// Its blocks use NSIS's modified bzip2, and every one of them decodes. It is
@@ -34,7 +34,7 @@ fn real_sample_decodes_every_block() {
 
 #[test]
 fn synthetic_deflate_block_recovers_marker() {
-    use flate2::{write::DeflateEncoder, Compression};
+    use flate2::{Compression, write::DeflateEncoder};
     use std::io::Write;
 
     // Build a minimal non-solid NSIS: MZ stub + firstheader + one raw-deflate
@@ -98,4 +98,44 @@ fn truncated_and_garbage_do_not_panic() {
     let mut budget = Budget::new(Limits::default());
     let entries = extract(Format::Nsis, b"not an nsis file at all", &mut budget).unwrap();
     assert!(entries.is_empty());
+}
+
+/// A non-solid installer's blocks are walked to the end of its data. A count of
+/// blocks of its own ended the walk at 10,000 and left what came after
+/// unread, with nothing said; the walk is bounded by the member limit instead.
+#[test]
+fn a_block_after_many_empty_ones_is_still_read() {
+    use flate2::{Compression, write::DeflateEncoder};
+    use std::io::Write;
+    let sig: [u8; 16] = [
+        0xEF, 0xBE, 0xAD, 0xDE, b'N', b'u', b'l', b'l', b's', b'o', b'f', b't', b'I', b'n', b's',
+        b't',
+    ];
+    let payload = b"MALWARETEST hidden behind twelve thousand empty blocks";
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(payload).unwrap();
+    let deflate = enc.finish().unwrap();
+    let empties = 12_000usize;
+
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"MZ");
+    blob.extend_from_slice(&[0u8; 62]);
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&sig);
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&((0x1c + empties * 4 + 4 + deflate.len() + 4) as u32).to_le_bytes());
+    blob.extend(std::iter::repeat_n(0u8, empties * 4));
+    blob.extend_from_slice(&((deflate.len() as u32) | 0x8000_0000).to_le_bytes());
+    blob.extend_from_slice(&deflate);
+    blob.extend_from_slice(&0u32.to_le_bytes());
+
+    assert_eq!(detect(&blob), Some(Format::Nsis));
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Nsis, &blob, &mut budget).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.data.windows(11).any(|w| w == b"MALWARETEST")),
+        "the block behind the empty ones was not read"
+    );
 }

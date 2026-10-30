@@ -31,6 +31,39 @@ export function writable<T>(initial: T): WritableStore<T> {
 }
 
 /**
+ * `source`, kept up to date only while it is wanted. `start` runs when the
+ * first listener arrives and returns the `stop` that runs when the last one
+ * leaves. `get` with no listener runs `once` first, to bring `source` up to
+ * date for that read. Work that cannot finish inside `once` (it is async)
+ * shows in `source` later: the next `get` has it.
+ */
+export function onDemand<T>(source: Store<T>, work: { start(): () => void; once(): void }): Store<T> {
+  let listeners = 0;
+  let stop: (() => void) | null = null;
+  return {
+    get() {
+      if (listeners === 0) work.once();
+      return source.get();
+    },
+    subscribe(listener) {
+      if (listeners++ === 0) stop = work.start();
+      const unsubscribe = source.subscribe(listener);
+      let left = false;
+      return () => {
+        if (left) return;
+        left = true;
+        unsubscribe();
+        if (--listeners === 0) {
+          const end = stop;
+          stop = null;
+          end?.();
+        }
+      };
+    },
+  };
+}
+
+/**
  * A store derived from another, recomputed when its source changes, and
  * only then: `get` returns the same value until it does, which React's
  * `useSyncExternalStore` requires of a snapshot.

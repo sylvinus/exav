@@ -83,24 +83,67 @@ pub(crate) enum Decompressor {
     Quantum(Box<super::qtm::QuantumDecompressor>),
 }
 
+/// What one CFDATA block gave: the bytes it decoded, and the error that
+/// stopped it short of its size, if one did.
+pub(crate) struct Decoded {
+    pub(crate) data: Vec<u8>,
+    pub(crate) error: Option<io::Error>,
+}
+
+impl Decoded {
+    pub(crate) fn failed(error: io::Error) -> Self {
+        Decoded {
+            data: Vec::new(),
+            error: Some(error),
+        }
+    }
+
+    fn of(result: io::Result<Vec<u8>>) -> Self {
+        match result {
+            Ok(data) => Decoded { data, error: None },
+            Err(e) => Decoded::failed(e),
+        }
+    }
+}
+
 impl Decompressor {
+    /// Decode one block. `cut`: the file ended inside it, so `data` is what
+    /// was there. Only MSZIP and stored blocks give back a part of a block
+    /// that failed or was cut: LZX and Quantum hand over a frame whole or not
+    /// at all.
     pub(crate) fn decompress(
         &mut self,
         data: Vec<u8>,
         uncompressed_size: usize,
-    ) -> io::Result<Vec<u8>> {
+        cut: bool,
+    ) -> Decoded {
+        let cut_error = |e: io::Error| {
+            if cut {
+                io::Error::new(io::ErrorKind::UnexpectedEof, e)
+            } else {
+                e
+            }
+        };
         match self {
-            Decompressor::Uncompressed => Ok(data),
+            Decompressor::Uncompressed => Decoded {
+                data,
+                error: cut.then(|| io::ErrorKind::UnexpectedEof.into()),
+            },
             Decompressor::MsZip(decompressor) => {
-                decompressor.decompress_block(&data, uncompressed_size)
+                decompressor.decompress_block(&data, uncompressed_size, cut)
             }
-            Decompressor::Lzx(decompressor) => decompressor
-                .decompress_next(&data, uncompressed_size)
-                .map(|slice| slice.to_vec())
-                .map_err(io::Error::other),
-            Decompressor::Quantum(decompressor) => {
-                decompressor.decompress_block(&data, uncompressed_size)
-            }
+            Decompressor::Lzx(decompressor) => Decoded::of(
+                decompressor
+                    .decompress_next(&data, uncompressed_size)
+                    .map(|slice| slice.to_vec())
+                    .map_err(io::Error::other)
+                    .map_err(cut_error),
+            ),
+            Decompressor::Quantum(decompressor) => Decoded::of(
+                decompressor
+                    .decompress_block(&data, uncompressed_size)
+                    .map_err(cut_error),
+            ),
         }
     }
 }

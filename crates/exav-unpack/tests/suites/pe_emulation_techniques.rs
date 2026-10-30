@@ -16,7 +16,7 @@
 //! bytes, and addresses are computed from the layout constants rather than
 //! hard-coded.
 
-use exav_unpack::{extract, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, extract};
 
 const BASE: u32 = 0x0040_0000;
 /// Destination section: reserved in memory, empty on disk.

@@ -9,7 +9,7 @@
 
 mod cad_common;
 
-use exav_render::dwg::{Document, Drawing, ParseError, FILL_BYTES, STROKE_BYTES};
+use exav_render::dwg::{Document, Drawing, FILL_BYTES, ParseError, STROKE_BYTES};
 
 /// A drawing of `tests/fixtures/dwg`, by file name without `.gz`.
 fn fixture(name: &str) -> Vec<u8> {
@@ -84,16 +84,13 @@ fn a_drawing_comes_back_as_it_was_written_in_dwg_and_dxf() {
                 && near(p[3], 0.0)),
             "{what}: the wall is one stroke from (0,0) to (100,0)"
         );
-        // The column, flattened: every point of its strokes on the circle.
+        // The column, as arc strokes of a quarter turn: their ends on the
+        // circle.
         let on_circle: Vec<_> = s
             .iter()
             .filter(|(p, l)| l == "WALLS" && !(near(p[1], 0.0) && near(p[3], 0.0)))
             .collect();
-        assert!(
-            on_circle.len() >= 16,
-            "{what}: {} column strokes",
-            on_circle.len()
-        );
+        assert_eq!(on_circle.len(), 4, "{what}: column strokes");
         for (p, _) in &on_circle {
             for (x, y) in [(p[0], p[1]), (p[2], p[3])] {
                 let r = ((x - 50.0).powi(2) + (y - 50.0).powi(2)).sqrt();
@@ -161,6 +158,136 @@ fn a_hatch_edge_on_an_ellipse_spans_its_angles() {
             hi(1)
         );
     }
+}
+
+/// A BLOCK control whose bit size is the whole record (as one writer's are)
+/// has handles that cannot be found; the block records are then the objects of
+/// their type, and the drawing is what it was.
+#[test]
+fn a_block_control_that_cannot_be_read_does_not_blank_the_drawing() {
+    let good = fixture("plan-R2000.dwg");
+    let whole = Document::parse(&good).unwrap().tessellate(None, None);
+    assert!(whole.stroke_count() > 0);
+
+    let dwg = exav_unpack::dwg::Dwg::open(&good).unwrap();
+    // The BLOCK control is the object of type 48.
+    let at = dwg
+        .object_map()
+        .iter()
+        .find(|(_, at)| dwg.type_at(*at) == Ok(48))
+        .expect("a BLOCK control")
+        .1;
+    // The record's size is a 2-byte modular short here; its bits start after
+    // it, with the object type (a BS of 10 bits for 48), then the bit size.
+    let size = usize::from(u16::from_le_bytes([good[at], good[at + 1]]));
+    assert!(size < 0x8000);
+    let bit_size_at = (at + 2) * 8 + 10;
+    let read = |bytes: &[u8]| {
+        (0..32).fold(0u64, |v, i| {
+            let p = bit_size_at + i;
+            v << 1 | u64::from(bytes[p / 8] >> (7 - p % 8) & 1)
+        })
+    };
+    let bit_size = u32::from_le_bytes(read(&good).to_be_bytes()[4..].try_into().unwrap());
+    assert!(
+        u64::from(bit_size) < size as u64 * 8,
+        "the position of the bit size: {bit_size}"
+    );
+    let mut bad = good.clone();
+    for (n, byte) in (size as u32 * 8).to_le_bytes().iter().enumerate() {
+        for bit in 0..8 {
+            let p = bit_size_at + n * 8 + bit;
+            let on = byte >> (7 - bit) & 1 == 1;
+            bad[p / 8] = bad[p / 8] & !(0x80 >> (p % 8)) | if on { 0x80 >> (p % 8) } else { 0 };
+        }
+    }
+    let doc = Document::parse(&bad).unwrap();
+    let d = doc.tessellate(None, None);
+    assert_eq!(d.stroke_count(), whole.stroke_count());
+    assert!(
+        doc.drawing()
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("object map"))
+    );
+}
+
+/// An ELLIPSE is in world coordinates, and its extrusion says which way its
+/// parameter runs: a quarter from the end of the major axis goes up with +Z
+/// and down with -Z, and in a plane tilted about the x axis the minor axis
+/// (5 long) is seen from above 4 long.
+#[test]
+fn an_ellipse_is_drawn_in_the_plane_of_its_extrusion() {
+    let dxf = |extrusion: &str, end: &str| {
+        format!(
+            "0\nSECTION\n2\nENTITIES\n0\nELLIPSE\n8\n0\n10\n0.0\n20\n0.0\n30\n0.0\n11\n10.0\n21\n0.0\n\
+             31\n0.0\n{extrusion}40\n0.5\n41\n0.0\n42\n{end}\n0\nENDSEC\n0\nEOF\n"
+        )
+    };
+    let y_range = |text: String| {
+        let doc = Document::parse(text.as_bytes()).expect("parses");
+        let d = doc.tessellate(None, None);
+        let ys: Vec<f64> = strokes(&d).iter().flat_map(|(s, _)| [s[1], s[3]]).collect();
+        assert!(!ys.is_empty());
+        (
+            ys.iter().copied().fold(f64::INFINITY, f64::min),
+            ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let quarter = "1.5707963267948966";
+    let (lo, hi) = y_range(dxf("210\n0.0\n220\n0.0\n230\n1.0\n", quarter));
+    assert!(lo > -1e-4 && (hi - 5.0).abs() < 1e-3, "{lo} {hi}");
+    let (lo, hi) = y_range(dxf("210\n0.0\n220\n0.0\n230\n-1.0\n", quarter));
+    assert!(hi < 1e-4 && (lo + 5.0).abs() < 1e-3, "{lo} {hi}");
+    let (lo, hi) = y_range(dxf("210\n0.0\n220\n-0.6\n230\n0.8\n", "6.283185307179586"));
+    assert!(
+        (lo + 4.0).abs() < 1e-3 && (hi - 4.0).abs() < 1e-3,
+        "{lo} {hi}"
+    );
+}
+
+/// An MTEXT's insertion point is in world coordinates, not in OCS like a
+/// TEXT's: with an extrusion of -Z and a text direction of -X it stays at
+/// (100, 50) and the text runs to its left; in a tilted plane it is not moved
+/// by the plane's frame either (it was drawn at x = -100, and at y = 40).
+#[test]
+fn an_mtext_insertion_is_in_world_coordinates() {
+    let dxf = |extrusion: &str, direction: &str| {
+        format!(
+            "0\nSECTION\n2\nENTITIES\n0\nMTEXT\n8\n0\n10\n100.0\n20\n50.0\n30\n0.0\n40\n2.0\n71\n1\n\
+             1\nHELLO\n{extrusion}{direction}0\nENDSEC\n0\nEOF\n"
+        )
+    };
+    let range = |text: String| {
+        let doc = Document::parse(text.as_bytes()).expect("parses");
+        let d = doc.tessellate(None, None);
+        let s = strokes(&d);
+        assert!(!s.is_empty());
+        let fold = |f: &dyn Fn(&[f64; 4]) -> [f64; 2]| {
+            let v: Vec<f64> = s.iter().flat_map(|(c, _)| f(c)).collect();
+            (
+                v.iter().copied().fold(f64::INFINITY, f64::min),
+                v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            )
+        };
+        (fold(&|c| [c[0], c[2]]), fold(&|c| [c[1], c[3]]))
+    };
+    let ((x0, x1), (y0, y1)) = range(dxf(
+        "210\n0.0\n220\n0.0\n230\n-1.0\n",
+        "11\n-1.0\n21\n0.0\n31\n0.0\n",
+    ));
+    assert!(
+        x0 > 92.0 && x1 < 100.5 && y0 > 47.5 && y1 < 50.5,
+        "{x0} {x1} {y0} {y1}"
+    );
+    let ((x0, x1), (y0, y1)) = range(dxf(
+        "210\n0.0\n220\n-0.6\n230\n0.8\n",
+        "11\n1.0\n21\n0.0\n31\n0.0\n",
+    ));
+    assert!(
+        x0 > 99.5 && x1 < 108.0 && y0 > 47.5 && y1 < 50.5,
+        "{x0} {x1} {y0} {y1}"
+    );
 }
 
 #[test]
@@ -523,4 +650,31 @@ fn a_corpus_of_real_drawings_reads_cleanly() {
         }
     }
     eprintln!("{read} read, {refused} refused, of {}", files.len());
+}
+
+/// Entities a reader drops at its limit are part of the drawing left out, and
+/// the drawing says so with the warning of a scene cut short: a viewer that
+/// capped the entities without saying would show a plan missing rooms.
+#[test]
+fn a_drawing_cut_at_the_entity_limit_says_so() {
+    let mut dxf = String::from("  0\nSECTION\n  2\nENTITIES\n");
+    for i in 0..10 {
+        dxf.push_str(&format!("  0\nLINE\n 10\n{i}\n 20\n0\n 11\n{i}\n 21\n1\n"));
+    }
+    dxf.push_str("  0\nENDSEC\n  0\nEOF\n");
+    let whole = Document::parse(dxf.as_bytes())
+        .unwrap()
+        .tessellate(None, None);
+    assert_eq!(whole.strokes.len() / STROKE_BYTES, 10);
+    assert_eq!(whole.warnings.scene_truncated, 0);
+
+    let limits = exav_render::cad::Limits {
+        max_entities: 4,
+        ..exav_render::cad::Limits::default()
+    };
+    let cut = Document::parse_with(dxf.as_bytes(), &limits)
+        .unwrap()
+        .tessellate(None, None);
+    assert_eq!(cut.strokes.len() / STROKE_BYTES, 4);
+    assert!(cut.warnings.scene_truncated > 0);
 }

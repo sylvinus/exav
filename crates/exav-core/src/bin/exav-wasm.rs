@@ -22,7 +22,7 @@
 
 #![forbid(unsafe_code)]
 
-use exav_core::{analyze, ScanOptions, Scanner, VerdictCategory};
+use exav_core::{ScanOptions, Scanner, VerdictCategory, analyze};
 use std::path::{Path, PathBuf};
 
 fn main() {

@@ -6,6 +6,114 @@ follow [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-10-29
+
+Many more formats read, in place and in bounded memory; a visible-text layer;
+a much larger viewer; and a review round that closed the cases where exav read
+a file differently from the program that opens it.
+
+### Highlights
+
+- **More formats, read where they lie.** Virtual disks (VHD, VHDX, QCOW2,
+  VMDK), filesystems (exFAT, SquashFS, cramfs, romfs, EROFS, HFS+, APFS, with
+  ext, FAT and NTFS) and 7z, WIM and xar are read from a seekable source
+  without holding them. A file past `--max-object-bytes` inside one is
+  scanned in full, not skipped. The registry lists 126 formats.
+- **A visible-text layer** (`visible-text`, on by default, off under
+  `--clamav-compat`): Markdown, HTML, Word, PowerPoint, Excel, OpenDocument and
+  AutoCAD files are also scanned as the text a reader sees, for `Target:0` and
+  `Target:7` signatures and `--alert-phishing`. PDF text and the text of legacy
+  and flat office files (DOC, XLS, PPT, RTF, FODT and others) are opt-in
+  (`visible-text-pdf`, `visible-text-office`). `exav-grep --text` searches it.
+- **Office documents converted in safe Rust, in `exav-render`** (features
+  `office-sheets`, `office-slides`, `office-docs`, `office`; none is a
+  default): XLS, ODS, FODS, Numbers, Excel 2003 XML, HTML tables and SYLK to
+  XLSX; PowerPoint 95 to 2003, ODP, FODP and Keynote to PPTX; DOC, ODT, FODT,
+  RTF, Word 2003 XML and Pages to DOCX; ODG, FODG and Visio (VSDX) to PPTX.
+  The viewer shows them through `xlsx()`, `pptx()` and `docx()`. Each file is
+  bounded in input, memory and decompressed size, and an encrypted, oversized
+  or damaged file is reported with its reason.
+- **One reader per format.** The scanner and `exav-render` share the readers
+  for OLE2 (`exav_unpack::cfb`), Excel decryption, RTF, BIFF and code pages.
+- **Bounded memory and time.** Deterministic sweeps (`saturate`, `nesting`,
+  `office_memory`) and new limits for the block cache, bytecode memory and
+  archive entries; `exav-grep` searches a file of any size in bounded memory.
+- **The viewer** (`@exav/viewer`) opens many more files (RAW cameras, JPEG XL,
+  SVG, OBJ, PLY, glTF, more IFC, older Office, more archives), draws pages of
+  documents, 3D models and drawings, can be driven by the host's own UI, and
+  speaks German, Spanish and Dutch.
+- **Daemon**: `--listen-health ADDR`, a listener that answers while the
+  workers are busy, and a `STATS` that reports the whole pool.
+
+### Breaking changes
+
+- The minimum Rust version is 1.95 (it was 1.92) and every crate is edition
+  2024.
+- A `.cvd` whose header md5 does not match, or that is cut short, is refused.
+- A source with no end (`exav /dev/zero`) is an error, not `OK`.
+- A YARA rule nested more than 10 parentheses deep is refused (12 before): the
+  parser's time doubles with each level.
+- A one-shot scan that `--max-scan-secs` ends keeps the exit status of what it
+  found (`1`, then `2`) and otherwise follows `--partial-as`; it was always `3`.
+- The `Content-Range` of an HTTP answer is checked; a server that answers
+  with another range or object is an error.
+- `--object-cache-block-bytes` defaults to 1 MiB (it was 64 KiB, fixed).
+- The viewer's CSS prefix is `exav-viewer-` (it was `exv-`), the sandboxed
+  frame's protocol is version 5 (it was 3), and `controllers.viewport` is
+  computed only while used.
+- exav-render's office features depend on `exav-unpack`. `exav-unpack`'s `ole`
+  feature no longer pulls the `cfb` crate, now a dev-dependency.
+- `exav-unpack` ext, FAT, HFS+ and APFS readers are in-tree: member names no
+  longer begin with `/`, and a damaged volume ends with an error after the
+  files before the damage.
+- Objects already scanned clean in the same place are scanned once per scan.
+
+### Added
+
+- Settings: `--max-extracted-bytes` (back), `--max-bytecode-memory-bytes`,
+  `--object-cache-bytes`, `--object-cache-block-bytes`, `--http-request-bytes`,
+  `maxArchiveEntries` and `maxEntities` in the viewer.
+- Formats: LZFSE, LZVN and InstallShield Z in-tree, camera RAW, DDS, ICO and cursors, PLY, OBJ, glTF, TIFF variants (fax,
+  CMYK, Zstandard, tiled, planar and more), and an external converter hook for
+  the viewer.
+- `scripts/bench-speed.sh`, a speed benchmark against `clamscan`.
+- 243 freely licensed example files for the viewer demo.
+
+### Changed
+
+- Dependencies are at their latest versions, except the image decoders pinned
+  to libclamav 1.5.4. Fewer dependencies and less `unsafe`: 8 crates and
+  1,155 `unsafe` uses fewer in a default build.
+- `fuzzy_img` JPEGs are decoded by zune-jpeg 0.5.15, not libclamav's 0.5.8: the
+  hashes are the same except for baseline JPEGs with a scan for each component,
+  which 0.5.8 drew flat (`8000000000000000`), and damaged files it panicked on.
+- A damaged CAB or archive keeps more of what it decoded.
+
+### Fixed
+
+The ones that could change a verdict:
+
+- **Files that a reader opens differently from exav are read as that reader
+  reads them:** ZIP, PDF, mail, ISO and UDF, `ar`, `cpio`, bzip2, xz, CAB,
+  NSIS and PowerPoint objects, and files holding a second archive. A message
+  attached to an email is now scanned.
+- **Base64 in scripts and pages:** more archive types are decoded, and a cap
+  on the number of decoded files is reported (`LIMITS-EXCEEDED`).
+- A damaged executable carved from a file no longer turns a detection behind
+  it into `PARTIAL` or `OK`.
+- Large files over HTTP no longer cost a request per executable candidate.
+- `exav-unpack` no longer makes symbolic links that lead out of the extraction
+  directory, and no longer panics on a closed pipe. `VERSIONCOMMANDS` no longer
+  lists `SHUTDOWN` and `QUIT` on a daemon that refuses them.
+- Resource bounds: nested documents, YARA rules, Visio formulas, PPMd, zstd,
+  JPEG XL, JBIG2, bytecode, 7z headers, RAR key derivation, and the memory of
+  XML trees, converters and drawings are bounded. Several recursive readers
+  no longer overflow the stack.
+- Rendering and decoding fixes across TIFF, BMP, PNM, ICO, DWG, DXF, IFC, STL,
+  glTF, JPEG 2000, DDS, Word, Excel and PowerPoint files.
+- PDF strings `\b` and `\f`, which made encrypted PDFs that open with an empty
+  password report password-protected.
+
 ## [0.0.2] - 2026-10-11
 
 The scanner, rebuilt around one streaming scan; three new projects (a browser

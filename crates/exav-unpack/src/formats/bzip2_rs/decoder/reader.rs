@@ -62,7 +62,7 @@ impl<R: Read> Read for DecoderReader<R> {
             let state = match self.decoder.read(buf) {
                 Ok(state) => state,
                 Err(e) if e.is_truncated() && self.input_ended => {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, e))
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, e));
                 }
                 Err(e) => return Err(e.into()),
             };

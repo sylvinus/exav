@@ -204,6 +204,11 @@ fn unpack_format(ft: FileType) -> Option<unpack::Format> {
         FileType::Fat => unpack::Format::Fat,
         FileType::Inno => unpack::Format::Inno,
         FileType::Ntfs => unpack::Format::Ntfs,
+        FileType::Exfat => unpack::Format::Exfat,
+        FileType::Squashfs => unpack::Format::Squashfs,
+        FileType::Cramfs => unpack::Format::Cramfs,
+        FileType::Romfs => unpack::Format::Romfs,
+        FileType::Erofs => unpack::Format::Erofs,
         FileType::Zstd => unpack::Format::Zstd,
         FileType::Lzip => unpack::Format::Lzip,
         FileType::Uuencode => unpack::Format::Uuencode,
@@ -254,6 +259,8 @@ pub(crate) struct Facts<'a> {
 struct Shared {
     want: hashes::Want,
     carve: bool,
+    /// Far candidates carving holds before it checks them.
+    far: usize,
 }
 
 impl<'a> Facts<'a> {
@@ -271,12 +278,13 @@ impl<'a> Facts<'a> {
 
     /// The facts of `data` scanned by `db`, carved when `carve`: when `data`
     /// is not held in memory, all worked out in one read of it.
-    fn for_scan(data: &'a dyn ByteSource, db: &Scanner, carve: bool) -> Self {
+    fn for_scan(data: &'a dyn ByteSource, db: &Scanner, carve: bool, opts: &ScanOptions) -> Self {
         let facts = Facts::new(data);
         if data.as_slice().is_none() {
             facts.shared.set(Some(Shared {
                 want: digests_wanted_by(db, data.len() as u64),
                 carve,
+                far: opts.carve_pending(),
             }));
         }
         facts
@@ -325,7 +333,7 @@ impl<'a> Facts<'a> {
     /// The one read of an object not held in memory, the first time a step
     /// asks, if it was not made yet.
     fn read_once(&self) {
-        let Some(Shared { want, carve }) = self.shared.take() else {
+        let Some(Shared { want, carve, far }) = self.shared.take() else {
             return;
         };
         let search = self.fmt.get().is_none() && unpack::Prescan::needed(self.data.len());
@@ -335,7 +343,7 @@ impl<'a> Facts<'a> {
         let data = self.data;
         let len = data.len();
         let mut hashing = (want != hashes::Want::default()).then(|| hashes::Hashing::new(want));
-        let mut carving = carve.then(pe::Carving::new);
+        let mut carving = carve.then(|| pe::Carving::new(far));
         let mut prescan = None;
         let overlap = unpack::Prescan::OVERLAP.max(pe::Carving::OVERLAP);
         let mut at = 0;
@@ -372,7 +380,8 @@ impl<'a> Facts<'a> {
         if let Some(h) = hashing {
             let _ = self.digests.set(h.finish());
         }
-        if let Some(c) = carving {
+        if let Some(mut c) = carving {
+            c.settle(data);
             *self.embedded.borrow_mut() = Some(c.found);
         }
         *self.prescan.borrow_mut() = prescan;
@@ -420,28 +429,26 @@ fn unpack_target(
     // from the magic. Compat mode leaves them off: stock ClamAV opens none of
     // them, and extracting more there would be counted as a disagreement.
     let detected = || facts.format();
-    if !restrict {
-        if let Some(fmt) = detected() {
-            if filetype::MAGIC_DISPATCH_ONLY.contains(&fmt) {
-                return Some(fmt);
-            }
-        }
+    if !restrict
+        && let Some(fmt) = detected()
+        && filetype::MAGIC_DISPATCH_ONLY.contains(&fmt)
+    {
+        return Some(fmt);
     }
     // Installers and self-extractors: real executables, so `identify` answers
     // `Pe`/`Elf` and `unpack_format` has nothing to map. Their payload is the
     // installer's own format rather than a recognisable archive, so carving does
     // not reach it either. Without this an NSIS or Inno installer scans clean
     // with every file it packages unexamined.
-    if ft.is_executable() {
-        if let Some(fmt) = detected() {
-            if filetype::EXECUTABLE_CONTAINERS.contains(&fmt) {
-                // Stock ClamAV unpacks NSIS, AutoIt and SFX, so those stay on in
-                // compat mode; it has no Inno Setup support, and claiming the
-                // extra reach there would register as a disagreement.
-                if !restrict || fmt != unpack::Format::Inno {
-                    return Some(fmt);
-                }
-            }
+    if ft.is_executable()
+        && let Some(fmt) = detected()
+        && filetype::EXECUTABLE_CONTAINERS.contains(&fmt)
+    {
+        // Stock ClamAV unpacks NSIS, AutoIt and SFX, so those stay on in
+        // compat mode; it has no Inno Setup support, and claiming the
+        // extra reach there would register as a disagreement.
+        if !restrict || fmt != unpack::Format::Inno {
+            return Some(fmt);
         }
     }
     // UPX unpacking. ClamAV's UPX unpacker is invoked only from its PE scan path;
@@ -874,6 +881,21 @@ pub struct ScanOptions {
     /// over this limit with no spill to go to is not scanned, and reported.
     /// A scan also holds `limits.max_buffer_bytes` to it. Default 256 MiB.
     pub deep_analysis_max: u64,
+    /// Memory of the block cache of an object read in place, in bytes
+    /// (`--object-cache-bytes`): an object past `deep_analysis_max`, a spilled
+    /// member or view, a spilled stream. One cache for each such object being
+    /// scanned, nested ones included. Carving also holds up to this much of
+    /// candidates waiting for a check while it reads such an object. Default
+    /// 8 MiB.
+    pub object_cache_bytes: u64,
+    /// One block of that cache, in bytes (`--object-cache-block-bytes`): the
+    /// unit it reads from the object, and over HTTP what a read at an offset
+    /// elsewhere fetches. Default 1 MiB.
+    pub object_cache_block_bytes: u64,
+    /// Over HTTP, the most one range request fetches (`--http-request-bytes`),
+    /// reached by a read that goes on from where the last stopped, which asks
+    /// for twice as much each time from one block. Default 8 MiB.
+    pub http_request_bytes: u64,
     /// Largest object PCRE subsignatures run on (`--max-pcre-bytes`); on a
     /// larger one they do not match, as ClamAV's `PCREMaxFileSize` has it.
     /// `None` = no limit (default); 100 MiB under `--clamav-compat`.
@@ -1032,11 +1054,43 @@ pub struct ScanOptions {
     pub spill: Option<std::sync::Arc<dyn spill::Spill>>,
 }
 
+impl ScanOptions {
+    /// The block and capacity, in bytes, of a block cache: at least a byte a
+    /// block, and room for two.
+    pub(crate) fn cache_sizes(&self) -> (usize, usize) {
+        let block = usize::try_from(self.object_cache_block_bytes)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let bytes = usize::try_from(self.object_cache_bytes).unwrap_or(usize::MAX);
+        (block, bytes)
+    }
+
+    /// How many far candidates carving holds before it checks them: their
+    /// 16 bytes each fill no more than the object cache does.
+    pub(crate) fn carve_pending(&self) -> usize {
+        usize::try_from(self.object_cache_bytes / 16)
+            .unwrap_or(usize::MAX)
+            .max(1)
+    }
+
+    /// A block cache over `reader`, sized by these options.
+    pub(crate) fn object_cache<R: Read + Seek>(
+        &self,
+        reader: R,
+    ) -> io::Result<byte_source::BlockCache<R>> {
+        let (block, bytes) = self.cache_sizes();
+        byte_source::BlockCache::with_sizes(reader, block, bytes)
+    }
+}
+
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             max_scan_size: None,
             deep_analysis_max: 256 * 1024 * 1024,
+            object_cache_bytes: 8 * 1024 * 1024,
+            object_cache_block_bytes: 1024 * 1024,
+            http_request_bytes: 8 * 1024 * 1024,
             max_pcre_bytes: None,
             min_scan_bytes: MIN_SCAN_BYTES,
             heuristics: false,
@@ -1084,6 +1138,9 @@ impl ScanOptions {
         Self {
             max_scan_size: Some(100 * 1024 * 1024),
             deep_analysis_max: 400 * 1024 * 1024,
+            object_cache_bytes: 8 * 1024 * 1024,
+            object_cache_block_bytes: 1024 * 1024,
+            http_request_bytes: 8 * 1024 * 1024,
             // ClamAV's PCREMaxFileSize default.
             max_pcre_bytes: Some(100 * 1024 * 1024),
             min_scan_bytes: MIN_SCAN_BYTES,
@@ -1267,10 +1324,10 @@ impl Scanner {
     fn identify_inner(&self, facts: &Facts) -> FileType {
         let data = facts.data;
         let mut ft = filetype::identify_source_with(data, || facts.format());
-        if ft == FileType::Unknown {
-            if let Some(f) = self.ftm.identify_source(data) {
-                ft = f;
-            }
+        if ft == FileType::Unknown
+            && let Some(f) = self.ftm.identify_source(data)
+        {
+            ft = f;
         }
         // The bzip2 (`BZh`), CAB (`MSCF`), gzip (`1f 8b`) and ARJ (`60 ea`)
         // file-type magics are short and collide with ordinary binary data; a
@@ -1500,16 +1557,16 @@ pub fn scan_seekable<R: Read + Seek>(
     // Thread-local, so it carries over from whatever this thread scanned last
     // unless every entry point clears it.
     engine::reset_scan_truncated();
-    if let Some(max) = opts.max_scan_size {
-        if size > max {
-            // Invariant 2 (see crate docs): scan what is within the limit
-            // before refusing by size, so a detection in it still wins.
-            let head = scan_within(db, Window::new(&mut reader, max)?, max, opts)?;
-            if head.verdict.category() == VerdictCategory::Infected {
-                return Ok(head);
-            }
-            return Ok(max_file_size_report(size, max, opts));
+    if let Some(max) = opts.max_scan_size
+        && size > max
+    {
+        // Invariant 2 (see crate docs): scan what is within the limit
+        // before refusing by size, so a detection in it still wins.
+        let head = scan_within(db, Window::new(&mut reader, max)?, max, opts)?;
+        if head.verdict.category() == VerdictCategory::Infected {
+            return Ok(head);
         }
+        return Ok(max_file_size_report(size, max, opts));
     }
     scan_within(db, reader, size, opts)
 }
@@ -1531,10 +1588,20 @@ fn scan_within<R: Read + Seek>(
         if data.len() as u64 <= opts.deep_analysis_max {
             return Ok(analyze(db, &data, opts));
         }
-        // It grew while it was read: scanned as the larger object it now is.
+        // It grew while it was read: scanned as the larger object it now is,
+        // if it says it is. A device that reads on without end (`/dev/zero`)
+        // measures nothing, and a scan of its measure would be of no bytes.
+        let end = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
+        if end <= opts.deep_analysis_max {
+            return Err(io::Error::other(format!(
+                "the source gave more than {} bytes and says it has {end}: \
+                 it is not a file with a length, and cannot be scanned as one",
+                opts.deep_analysis_max
+            )));
+        }
     }
-    let cache = byte_source::BlockCache::new(reader)?;
+    let cache = opts.object_cache(reader)?;
     let report = analyze_source(db, &cache, opts);
     // A read that failed part way leaves bytes the scan never saw.
     if let Some(e) = cache.read_error() {
@@ -1644,11 +1711,11 @@ fn max_file_size_report(size: u64, max: u64, opts: &ScanOptions) -> ScanReport {
 /// The alert a top-level file larger than `max_scan_size` is reported as
 /// under `--alert-exceeds-max`, or else the reason it is over the limit.
 fn max_file_size(size: u64, max: u64, opts: &ScanOptions) -> Result<&'static str, String> {
-    if opts.alert_exceeds_max {
-        if let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize) {
-            match_loc_record();
-            return Ok(name);
-        }
+    if opts.alert_exceeds_max
+        && let Some(name) = limits_alert_name(unpack::LimitKind::MaxFileSize)
+    {
+        match_loc_record();
+        return Ok(name);
     }
     Err(format!(
         "file size {size} exceeds max-input-bytes {max}; scanned first {max} bytes only"
@@ -1661,15 +1728,15 @@ fn max_file_size(size: u64, max: u64, opts: &ScanOptions) -> Result<&'static str
 /// treated as complete: a kind with no alert name keeps the `LimitsExceeded`
 /// verdict and its reason.
 fn limits_outcome(opts: &ScanOptions, kind: unpack::LimitKind, reason: String) -> DeepOutcome {
-    if opts.alert_exceeds_max {
-        if let Some(name) = limits_alert_name(kind) {
-            match_loc_record();
-            return DeepOutcome::Infected {
-                signature: name.to_string(),
-                offset: 0,
-                method: Method::Heuristic,
-            };
-        }
+    if opts.alert_exceeds_max
+        && let Some(name) = limits_alert_name(kind)
+    {
+        match_loc_record();
+        return DeepOutcome::Infected {
+            signature: name.to_string(),
+            offset: 0,
+            method: Method::Heuristic,
+        };
     }
     DeepOutcome::Limits(reason)
 }
@@ -1753,7 +1820,11 @@ fn read_member(
     let Some(spill) = &cx.opts.spill else {
         return not_scanned(tally, "spilling to disk is off");
     };
-    match spill::spill_stream(spill.as_ref(), &mut io::Cursor::new(buf).chain(rest)) {
+    match spill::spill_stream(
+        spill.as_ref(),
+        &mut io::Cursor::new(buf).chain(rest),
+        cx.opts.cache_sizes(),
+    ) {
         Ok(spilled) => Ok(Body::Spilled(spilled)),
         Err(spill::SpillStreamError::Read(e)) if unpack::is_budget_overflow(&e) => {
             Err(over_budget())
@@ -1805,10 +1876,11 @@ fn visit_member(
     // to decompress to itself, so the guard lives here rather than in any
     // extractor. The length test is false for essentially every real member,
     // so the comparison is only reached by a genuine fixed point.
-    if let Body::Mem(data) = &body {
-        if data.len() == container.len() && *container.window(0, data.len()) == data[..] {
-            return None;
-        }
+    if let Body::Mem(data) = &body
+        && data.len() == container.len()
+        && *container.window(0, data.len()) == data[..]
+    {
+        return None;
     }
     let size_real = match &body {
         Body::Mem(data) => data.len() as u64,
@@ -1829,7 +1901,7 @@ fn visit_member(
                 // of it is a real Clean: exav scans for malware, it is not a
                 // file-integrity validator. Undecodable bytes still present
                 // keep the not-fully-scanned verdict.
-                let o = member_content_scan(cx, tally, &data, budget, findings, sink);
+                let o = member_content_scan(cx, tally, &meta.name, &data, budget, findings, sink);
                 if o.is_none() && unpack::decode_error_hides_content(&e) {
                     tally.unscannable.get_or_insert_with(|| {
                         format!(
@@ -1848,10 +1920,10 @@ fn visit_member(
                 unpack::volume::Offer::Held => return None,
                 unpack::volume::Offer::PassThrough { data, .. } => data,
             };
-            member_content_scan(cx, tally, &data, budget, findings, sink)
+            member_content_scan(cx, tally, &meta.name, &data, budget, findings, sink)
         }
         Body::Spilled(spilled) => {
-            let o = member_content_scan(cx, tally, &spilled, budget, findings, sink);
+            let o = member_content_scan(cx, tally, &meta.name, &spilled, budget, findings, sink);
             if let Some(e) = spilled.read_error() {
                 tally
                     .unscannable
@@ -1957,14 +2029,13 @@ fn walk_members(
             break;
         }
         let _mpg = MatchPathGuard::enter(&name);
-        terminal = member_content_scan(&cx, &mut tally, &buf, budget, findings, sink);
+        terminal = member_content_scan(&cx, &mut tally, &name, &buf, budget, findings, sink);
     }
-    if let Some(name) = tally.encrypted.take() {
-        if !matches!(terminal, Some(DeepOutcome::Infected { .. })) {
-            if let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic) {
-                return o;
-            }
-        }
+    if let Some(name) = tally.encrypted.take()
+        && !matches!(terminal, Some(DeepOutcome::Infected { .. }))
+        && let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic)
+    {
+        return o;
     }
     terminal.unwrap_or_else(|| tally.verdict())
 }
@@ -1996,8 +2067,8 @@ pub struct VolumeSetVerdict {
 /// whole set with it. Byte-split naming records no part count, so a set missing
 /// its LAST part still looks contiguous and would join into a truncated prefix,
 /// which parses as the archive and scans clean. The set is reported
-/// `Unscannable` instead. The dropped part's own scan, which the caller does
-/// separately, still covers that part's bytes.
+/// `Unscannable` instead, each part read and not held included. The caller's
+/// own scan of a part says only that the fragment is not malware itself.
 ///
 /// Returns one entry per *part*, each carrying the verdict of the archive that
 /// part belongs to, including `Unscannable` for a set with a hole in it, whose
@@ -2025,13 +2096,21 @@ where
     // missing trailing index leaves no trace in them.
     let mut broken: std::collections::BTreeMap<String, &'static str> =
         std::collections::BTreeMap::new();
+    // The parts the collector read and would not hold. It keeps no trace of
+    // them, so a set none of whose parts it holds comes back with no entry.
+    let mut passed: Vec<String> = Vec::new();
+    // Parts group without regard to case, so a set is known by its lower-case
+    // name here, whichever part's case it was joined under.
+    fn set_key(name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
     for name in names {
         if !unpack::volume::parse(name).is_some_and(|v| v.scheme.is_byte_split()) {
             continue;
         }
         let Ok(data) = fetch(name) else {
             broken.insert(
-                volume_set_name(name),
+                set_key(&volume_set_name(name)),
                 "part of a multi-volume set one of whose volumes could not be read",
             );
             continue;
@@ -2041,9 +2120,10 @@ where
         // cap, or a second part claiming an index another part already holds.
         if let unpack::volume::Offer::PassThrough { name, .. } = collector.offer(name, data) {
             broken.insert(
-                volume_set_name(&name),
+                set_key(&volume_set_name(&name)),
                 "part of a multi-volume set that could not be reassembled whole",
             );
+            passed.push(name);
         }
     }
     if !any {
@@ -2059,7 +2139,7 @@ where
     for j in held.joined {
         // A set with a hole gets the hole's verdict, not a verdict read off the
         // bytes that happened to arrive.
-        let report = match broken.get(j.name.as_str()) {
+        let report = match broken.get(set_key(&j.name).as_str()) {
             Some(reason) => ScanReport::unscannable((*reason).to_string(), Vec::new()),
             None => analyze(db, &j.data, opts),
         };
@@ -2074,17 +2154,286 @@ where
     for u in held.unjoined {
         // A lone numbered file is not a set: plenty of ordinary files end in
         // `.001`, and the caller's own scan of it is the right answer.
-        let Some(reason) = u.incomplete_set else {
+        // Unless a part of it was lost: one readable part of a set whose other
+        // part could not be read is not a lone file.
+        let set = volume_set_name(&u.name);
+        let Some(reason) = u
+            .incomplete_set
+            .or_else(|| broken.get(set_key(&set).as_str()).copied())
+        else {
             continue;
         };
-        let set = volume_set_name(&u.name);
         out.push(VolumeSetVerdict {
             name: u.name,
             set,
             report: ScanReport::unscannable(reason.to_string(), Vec::new()),
         });
     }
+    // A part that was read and not held belongs to a set that cannot be
+    // rejoined: it is not a clean file because its own bytes scan clean.
+    for name in passed {
+        if out.iter().any(|v| v.name == name) {
+            continue;
+        }
+        let set = volume_set_name(&name);
+        out.push(VolumeSetVerdict {
+            name,
+            set,
+            report: ScanReport::unscannable(
+                "part of a multi-volume set that could not be reassembled whole".to_string(),
+                Vec::new(),
+            ),
+        });
+    }
     out
+}
+
+/// The sets of **format-aware volumes** among a group of files that arrived
+/// together, each put back into the one archive it was cut from and scanned:
+/// RAR (`x.part1.rar`, `x.part2.rar`, ..., or `x.rar`, `x.r00`, ...), ZIP
+/// (`x.z01`, `x.z02`, ..., `x.zip`) and CAB (`a.cab`, `b.cab`, as each header
+/// names the one after it). Each volume carries its own headers, so the join is
+/// the format's, not a concatenation, and the parts of a set scanned alone are
+/// cut short.
+///
+/// `fetch(name, None)` is a whole file and `fetch(name, Some(n))` its first `n`
+/// bytes. Whole files are fetched only for the parts of a set, up to
+/// `max-object-bytes` of them together; the heads of `.cab` files are read to
+/// find which of them name a neighbour. Names are labels, never paths: a
+/// cabinet's own header names its neighbours, and they are looked for in
+/// `names` only.
+///
+/// As [`analyze_volume_sets`]: one entry per *part*, with the verdict of the
+/// archive that part belongs to, `Unscannable` for a set with a hole in it or
+/// one that does not fit together. A file that is not part of a set is not in
+/// the result.
+#[cfg(feature = "all-formats")]
+pub fn analyze_split_sets<F>(
+    db: &Scanner,
+    names: &[String],
+    opts: &ScanOptions,
+    mut fetch: F,
+) -> Vec<VolumeSetVerdict>
+where
+    F: FnMut(&str, Option<usize>) -> io::Result<Vec<u8>>,
+{
+    use unpack::volume::{Scheme, group, parse};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Rar,
+        Zip,
+        Cab,
+    }
+    struct Set {
+        name: String,
+        kind: Kind,
+        parts: Vec<String>,
+        /// Why the set cannot be joined, when it is known from the names.
+        broken: Option<&'static str>,
+    }
+    let mut sets: Vec<Set> = Vec::new();
+    let lower = |s: &str| s.to_ascii_lowercase();
+
+    // RAR: the naming schemes say the order, and a gap says a part is missing.
+    let rar: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| {
+            matches!(
+                parse(n).map(|v| v.scheme),
+                Some(Scheme::RarPart { .. } | Scheme::RarOld)
+            )
+        })
+        .collect();
+    for set in group(&rar) {
+        let parts: Vec<&str> = set.iter().map(|&i| rar[i]).collect();
+        let first = parse(parts[0]).expect("grouped by name");
+        let contiguous = parts
+            .iter()
+            .enumerate()
+            .all(|(i, p)| parse(p).is_some_and(|v| v.index == i));
+        sets.push(Set {
+            name: format!("{}.rar", first.stem),
+            kind: Kind::Rar,
+            parts: parts.iter().map(|p| (*p).to_string()).collect(),
+            broken: (!contiguous).then_some("part of a multi-volume RAR set with a volume missing"),
+        });
+    }
+
+    // ZIP: `x.z01` ... and the `x.zip` that comes last and holds the directory.
+    let mut stems: Vec<String> = Vec::new();
+    for n in names {
+        if let Some(v) = parse(n).filter(|v| v.scheme == Scheme::ZipSplit)
+            && !stems.iter().any(|s| s.eq_ignore_ascii_case(&v.stem))
+        {
+            stems.push(v.stem);
+        }
+    }
+    for stem in stems {
+        let mut numbered: Vec<(usize, &String)> = names
+            .iter()
+            .filter_map(|n| {
+                parse(n)
+                    .filter(|v| v.scheme == Scheme::ZipSplit && v.stem.eq_ignore_ascii_case(&stem))
+                    .map(|v| (v.index, n))
+            })
+            .collect();
+        numbered.sort();
+        let last = names
+            .iter()
+            .find(|n| lower(n) == lower(&format!("{stem}.zip")));
+        let contiguous = numbered.iter().enumerate().all(|(i, (idx, _))| *idx == i);
+        let mut parts: Vec<String> = numbered.iter().map(|(_, n)| (*n).clone()).collect();
+        let broken = match last {
+            Some(l) => {
+                parts.push(l.clone());
+                (!contiguous).then_some("part of a multi-volume ZIP set with a volume missing")
+            }
+            None => Some(
+                "part of a multi-volume ZIP set whose last volume, the `.zip`, was not present",
+            ),
+        };
+        sets.push(Set {
+            name: format!("{stem}.zip"),
+            kind: Kind::Zip,
+            parts,
+            broken,
+        });
+    }
+
+    // CAB: no naming scheme; each header names its neighbours.
+    let mut cabs: Vec<(String, unpack::CabLinks)> = Vec::new();
+    for n in names.iter().filter(|n| lower(n).ends_with(".cab")) {
+        // The header, its reserved area and the two names fit in 64 KiB.
+        if let Some(l) = fetch(n, Some(64 * 1024))
+            .ok()
+            .and_then(|h| unpack::cab_links(&h))
+        {
+            cabs.push((n.clone(), l));
+        }
+    }
+    let mut ids: Vec<u16> = cabs.iter().map(|(_, l)| l.set_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        let mut members: Vec<&(String, unpack::CabLinks)> =
+            cabs.iter().filter(|(_, l)| l.set_id == id).collect();
+        members.sort_by_key(|(_, l)| l.index);
+        // The header's name is a label: its last component, whatever separator.
+        let leaf = |s: &str| lower(s.rsplit(['/', '\\']).next().unwrap_or(s));
+        let chained = members.iter().enumerate().all(|(i, (name, l))| {
+            usize::from(l.index) == i
+                && (i == 0) == l.prev.is_none()
+                && (i + 1 == members.len()) == l.next.is_none()
+                && l.next
+                    .as_deref()
+                    .is_none_or(|n| members.get(i + 1).is_some_and(|m| leaf(n) == lower(&m.0)))
+                && l.prev
+                    .as_deref()
+                    .is_none_or(|p| i > 0 && leaf(p) == lower(&members[i - 1].0))
+                && !name.is_empty()
+        });
+        sets.push(Set {
+            name: members[0].0.clone(),
+            kind: Kind::Cab,
+            parts: members.iter().map(|(n, _)| n.clone()).collect(),
+            broken: (!chained).then_some("part of a multi-volume CAB set whose cabinets do not follow one another as their headers say"),
+        });
+    }
+
+    let mut out = Vec::new();
+    let mut held_total = 0usize;
+    for set in sets {
+        let verdict = |report: ScanReport, out: &mut Vec<VolumeSetVerdict>| {
+            for part in &set.parts {
+                out.push(VolumeSetVerdict {
+                    name: part.clone(),
+                    set: set.name.clone(),
+                    report: report.clone(),
+                });
+            }
+        };
+        if let Some(reason) = set.broken {
+            verdict(
+                ScanReport::unscannable(reason.to_string(), Vec::new()),
+                &mut out,
+            );
+            continue;
+        }
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut lost = None;
+        for part in &set.parts {
+            match fetch(part, None) {
+                Ok(d) => {
+                    // Counted only once held, so a part turned away leaves
+                    // the budget as the sets after it found it.
+                    if held_total.saturating_add(d.len()) > opts.deep_analysis_max as usize {
+                        lost = Some(
+                            "part of a multi-volume set too large to hold for rejoining (--max-object-bytes)",
+                        );
+                        break;
+                    }
+                    held_total += d.len();
+                    data.push(d);
+                }
+                Err(_) => {
+                    lost =
+                        Some("part of a multi-volume set one of whose volumes could not be read");
+                    break;
+                }
+            }
+        }
+        held_total = held_total.saturating_sub(data.iter().map(Vec::len).sum());
+        if let Some(reason) = lost {
+            verdict(
+                ScanReport::unscannable(reason.to_string(), Vec::new()),
+                &mut out,
+            );
+            continue;
+        }
+        let joined: Result<ScanReport, String> = match set.kind {
+            Kind::Rar | Kind::Cab => {
+                let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                let joined = if set.kind == Kind::Rar {
+                    unpack::join_rar_volumes(&refs)
+                } else {
+                    unpack::join_cab_volumes(&refs)
+                };
+                joined.map(|j| analyze(db, &j, opts))
+            }
+            Kind::Zip => {
+                let parts = data
+                    .into_iter()
+                    .map(|d| Box::new(d) as Box<dyn ByteSource>)
+                    .collect();
+                unpack::span::ZipSpan::new(parts).map(|s| analyze_source(db, &s, opts))
+            }
+        };
+        let report = joined.unwrap_or_else(|e| {
+            ScanReport::unscannable(
+                format!("part of a multi-volume set that could not be rejoined: {e}"),
+                Vec::new(),
+            )
+        });
+        verdict(report, &mut out);
+    }
+    out
+}
+
+/// Without `all-formats` no archive format is read, so no part of a set of
+/// volumes is known to belong to one: nothing is joined.
+#[cfg(not(feature = "all-formats"))]
+pub fn analyze_split_sets<F>(
+    _db: &Scanner,
+    _names: &[String],
+    _opts: &ScanOptions,
+    _fetch: F,
+) -> Vec<VolumeSetVerdict>
+where
+    F: FnMut(&str, Option<usize>) -> io::Result<Vec<u8>>,
+{
+    Vec::new()
 }
 
 /// The name a part's SET is reported under, matching what
@@ -2206,17 +2555,17 @@ pub fn analyze_all_seekable<R: Read + Seek>(
     size: u64,
     opts: &ScanOptions,
 ) -> io::Result<(Vec<(String, Method)>, AllMatchOutcome)> {
-    if let Some(max) = opts.max_scan_size {
-        if size > max {
-            let (mut names, outcome) = all_within(db, Window::new(&mut reader, max)?, max, opts)?;
-            return Ok(match max_file_size(size, max, opts) {
-                Ok(name) => {
-                    names.push((name.to_string(), Method::Heuristic));
-                    (names, outcome)
-                }
-                Err(reason) => (names, AllMatchOutcome::LimitsExceeded(reason)),
-            });
-        }
+    if let Some(max) = opts.max_scan_size
+        && size > max
+    {
+        let (mut names, outcome) = all_within(db, Window::new(&mut reader, max)?, max, opts)?;
+        return Ok(match max_file_size(size, max, opts) {
+            Ok(name) => {
+                names.push((name.to_string(), Method::Heuristic));
+                (names, outcome)
+            }
+            Err(reason) => (names, AllMatchOutcome::LimitsExceeded(reason)),
+        });
     }
     all_within(db, reader, size, opts)
 }
@@ -2238,7 +2587,7 @@ fn all_within<R: Read + Seek>(
         }
         reader.seek(SeekFrom::Start(0))?;
     }
-    let cache = byte_source::BlockCache::new(reader)?;
+    let cache = opts.object_cache(reader)?;
     let found = analyze_all_source(db, &cache, opts);
     // A read that failed part way leaves bytes the scan never saw.
     if let Some(e) = cache.read_error() {
@@ -2385,14 +2734,14 @@ fn whole_buffer_heuristics(
     // many.
     if (opts.clamav_heuristics || opts.heuristics) && ft == FileType::Zip {
         const OVERLAP_THRESHOLD: usize = 5;
-        if unpack::overlapping_local_records(src) > OVERLAP_THRESHOLD {
-            if let Some(o) = sink.hit(
+        if unpack::overlapping_local_records(src) > OVERLAP_THRESHOLD
+            && let Some(o) = sink.hit(
                 "Heuristics.Zip.OverlappingFiles".to_string(),
                 0,
                 Method::Heuristic,
-            ) {
-                return Some(o);
-            }
+            )
+        {
+            return Some(o);
         }
     }
 
@@ -2404,16 +2753,15 @@ fn whole_buffer_heuristics(
     if ft == FileType::Xz {
         // The stream header and the first block header, which is at most
         // 1024 bytes.
-        if let Some(dict) = unpack::xz_declared_dict_size(&src.window(0, 12 + 1024 + 64)) {
-            if dict > unpack::XZ_MAX_DICT {
-                if let Some(o) = sink.hit(
-                    "Heuristics.XZ.DicSizeLimit".to_string(),
-                    0,
-                    Method::Heuristic,
-                ) {
-                    return Some(o);
-                }
-            }
+        if let Some(dict) = unpack::xz_declared_dict_size(&src.window(0, 12 + 1024 + 64))
+            && dict > unpack::XZ_MAX_DICT
+            && let Some(o) = sink.hit(
+                "Heuristics.XZ.DicSizeLimit".to_string(),
+                0,
+                Method::Heuristic,
+            )
+        {
+            return Some(o);
         }
     }
 
@@ -2432,12 +2780,12 @@ fn whole_buffer_heuristics(
     ]
     .iter()
     .any(|m| head.starts_with(m));
-    if opts.alert_broken_media && media {
-        if let Some(name) = whole().and_then(unpack::broken_media_alert) {
-            if let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic) {
-                return Some(o);
-            }
-        }
+    if opts.alert_broken_media
+        && media
+        && let Some(name) = whole().and_then(unpack::broken_media_alert)
+        && let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic)
+    {
+        return Some(o);
     }
 
     // A file that claims to be an executable and whose headers describe a
@@ -2451,14 +2799,17 @@ fn whole_buffer_heuristics(
     // that does not parse is a fragment or a false hit, not a broken file.
     // clamscan `--alert-broken` agrees: it reports a broken PE or ELF alone and
     // not embedded in another file.
-    if opts.alert_broken && executable && !embedded && pe::looks_broken_in(src) {
-        if let Some(o) = sink.hit(
+    if opts.alert_broken
+        && executable
+        && !embedded
+        && pe::looks_broken_in(src)
+        && let Some(o) = sink.hit(
             "Heuristics.Broken.Executable".to_string(),
             0,
             Method::Heuristic,
-        ) {
-            return Some(o);
-        }
+        )
+    {
+        return Some(o);
     }
     // An ELF whose section-header table has been stripped. Detected in BOTH
     // modes; only the name differs. It is not breakage (the program headers are
@@ -2484,12 +2835,11 @@ fn whole_buffer_heuristics(
     // so the image shows one filesystem to whatever mounts it and another to
     // whatever scans it. Parser confusion one layer below the ZIP case above.
     // Opt-in, matching ClamAV's `--alert-partition-intersection`.
-    if opts.alert_partition_intersection {
-        if let Some(name) = unpack::partition_intersection_alert(src) {
-            if let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic) {
-                return Some(o);
-            }
-        }
+    if opts.alert_partition_intersection
+        && let Some(name) = unpack::partition_intersection_alert(src)
+        && let Some(o) = sink.hit(name.to_string(), 0, Method::Heuristic)
+    {
+        return Some(o);
     }
 
     // ClamAV `Heuristics.PDF.ObfuscatedNameObject`: a PDF whose name objects
@@ -2500,14 +2850,13 @@ fn whole_buffer_heuristics(
     if (opts.clamav_heuristics || opts.heuristics)
         && ft == FileType::Pdf
         && whole().is_some_and(unpack::has_obfuscated_name_object)
-    {
-        if let Some(o) = sink.hit(
+        && let Some(o) = sink.hit(
             "Heuristics.PDF.ObfuscatedNameObject".to_string(),
             0,
             Method::Heuristic,
-        ) {
-            return Some(o);
-        }
+        )
+    {
+        return Some(o);
     }
     None
 }
@@ -2719,12 +3068,11 @@ fn member_metadata_scan(
     // Opt-in (`--detect packed`): name the packer as well as reporting that its
     // payload went unread. Same rule as the encryption case above: two facts,
     // both true, both reported.
-    if cx.opts.alert_packed {
-        if let Some(n) = packed_heuristic_name(&e.name) {
-            if let Some(o) = sink.hit(n, 0, Method::Heuristic) {
-                return Some(o);
-            }
-        }
+    if cx.opts.alert_packed
+        && let Some(n) = packed_heuristic_name(&e.name)
+        && let Some(o) = sink.hit(n, 0, Method::Heuristic)
+    {
+        return Some(o);
     }
     if let Some(r) = e.unsupported {
         if e.encrypted {
@@ -2745,14 +3093,14 @@ fn member_metadata_scan(
         // for an Excel 4.0 macro sheet. Emitting the bare name looked harmless
         // and is not: a gateway filtering on ClamAV's exact string matches
         // neither of ours.
-        if let Some(kind) = macro_dialect(&e.name) {
-            if let Some(o) = sink.hit(
+        if let Some(kind) = macro_dialect(&e.name)
+            && let Some(o) = sink.hit(
                 format!("Heuristics.OLE2.ContainsMacros.{kind}"),
                 0,
                 Method::Heuristic,
-            ) {
-                return Some(o);
-            }
+            )
+        {
+            return Some(o);
         }
     }
     if !cx.db.cdb.is_empty() {
@@ -2790,6 +3138,54 @@ fn member_metadata_scan(
     None
 }
 
+/// Smallest and largest member worth remembering as scanned clean: below the
+/// first, scanning again costs about what the digest does; past the second, the
+/// digest is another read of a very large object.
+const CLEAN_MEMO_MIN: usize = 64 * 1024;
+const CLEAN_MEMO_MAX: usize = 512 * 1024 * 1024;
+
+/// A digest of a member's bytes and of what a scan of it reads from its place:
+/// the type of its container, the type its container forces on it, the types
+/// above it, and the extension of its name. `None` for a member outside the
+/// sizes worth remembering.
+fn clean_memo_key(
+    cx: &MemberCtx<'_>,
+    name: &str,
+    core_type: Option<FileType>,
+    data: &dyn ByteSource,
+) -> Option<[u8; 32]> {
+    use sha2::Digest;
+    let len = data.len();
+    if !(CLEAN_MEMO_MIN..=CLEAN_MEMO_MAX).contains(&len) {
+        return None;
+    }
+    let ext = name
+        .rsplit_once('.')
+        .map_or("", |(_, e)| e)
+        .to_ascii_lowercase();
+    let mut h = sha2::Sha256::new();
+    h.update(
+        format!(
+            "{:?}|{core_type:?}|{:?}|{ext}|{len}|",
+            cx.member_container,
+            engine::ancestry_snapshot()
+        )
+        .as_bytes(),
+    );
+    let mut at = 0;
+    while at < len {
+        let w = data.window(at, byte_source::CHUNK.min(len - at));
+        if w.is_empty() {
+            return None;
+        }
+        h.update(&w[..]);
+        at += w.len();
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&h.finalize());
+    Some(key)
+}
+
 /// Scan one member's bytes, as an object one level below its container.
 ///
 /// Split from [`member_metadata_scan`] because a member of a multi-volume set
@@ -2800,6 +3196,7 @@ fn member_metadata_scan(
 fn member_content_scan(
     cx: &MemberCtx<'_>,
     tally: &mut MemberTally,
+    name: &str,
     data: &dyn ByteSource,
     budget: &mut Budget,
     findings: &mut Vec<Finding>,
@@ -2825,11 +3222,30 @@ fn member_content_scan(
         container: cx.member_container,
         core_type,
         filename: None,
+        name: Some(name),
         core: true,
         carve: true,
         embedded: false,
     };
-    match scan_object(cx.db, data, obj, cx.opts, budget, findings, sink) {
+    // The same bytes in the same place, already scanned clean at this depth or
+    // shallower, cannot give a different answer, and a document that holds
+    // copies of itself would otherwise be scanned once per copy.
+    let seen = clean_memo_key(cx, name, core_type, data);
+    if seen
+        .as_ref()
+        .is_some_and(|k| engine::clean_seen(k, obj.depth))
+    {
+        return None;
+    }
+    let truncated_before = engine::scan_was_truncated();
+    let outcome = scan_object(cx.db, data, obj, cx.opts, budget, findings, sink);
+    if let (DeepOutcome::Clean, Some(k)) = (&outcome, seen) {
+        // A scan that stopped short on the way has not seen all of it.
+        if truncated_before || !engine::scan_was_truncated() {
+            engine::clean_seen_insert(k, obj.depth);
+        }
+    }
+    match outcome {
         DeepOutcome::Clean => None,
         // Nested unscannable/encrypted members are remembered, not propagated as
         // a stop: keep scanning the rest of this container.
@@ -2866,6 +3282,11 @@ struct Obj<'a> {
     /// The input's name, for YARA's filename externals. Nothing inside the
     /// input has one.
     filename: Option<&'a str>,
+    /// The name the object has where it sits (the input's, or a member's), for
+    /// what only a name says, like which text format a plain file is. Unlike
+    /// `filename`, a member has one; what is carved or decoded does not.
+    #[cfg_attr(not(feature = "visible-text"), allow(dead_code))]
+    name: Option<&'a str>,
     /// Whether to match the object's own bytes. Off for an archive carved out
     /// of an object whose own match already covered them.
     core: bool,
@@ -2888,6 +3309,7 @@ impl<'a> Obj<'a> {
             container: None,
             core_type: None,
             filename: opts.filename.as_deref(),
+            name: opts.filename.as_deref(),
             core: true,
             carve: true,
             embedded: false,
@@ -2901,6 +3323,7 @@ impl<'a> Obj<'a> {
             container,
             core_type: None,
             filename: None,
+            name: None,
             core: true,
             carve: true,
             embedded: false,
@@ -2931,7 +3354,7 @@ fn scan_object(
     // anything inside it is a detection. Keyed on the object's bytes, so an
     // entry means the same thing wherever the object is found.
     let carve = obj.carve && obj.depth < budget.limits().max_recursion;
-    let facts = Facts::for_scan(data, db, carve);
+    let facts = Facts::for_scan(data, db, carve, opts);
     if allowlisted(db, &facts) {
         return DeepOutcome::Clean;
     }
@@ -2961,10 +3384,23 @@ fn scan_archive(
     if obj.depth == 0 {
         findings.push(Finding::new("type", ft.as_str()));
     }
-    if let Some(o) = scan_carried(db, data, obj, ft, opts, budget, findings, sink) {
+    let mut carried = DeepOutcome::Clean;
+    if let Some(o) = scan_carried(
+        db,
+        data,
+        obj,
+        ft,
+        opts,
+        budget,
+        findings,
+        sink,
+        &mut carried,
+    ) {
         return o;
     }
-    let members = walk_members(db, data, obj, ft, fmt, opts, budget, findings, sink);
+    let mut members = walk_members(db, data, obj, ft, fmt, opts, budget, findings, sink);
+    // What the encoded files in the object turned up, if the walk found nothing.
+    defer(&mut members, carried);
     // Matched whatever stopped the walk short of a detection: a detection beats
     // a limit.
     if matches!(members, DeepOutcome::Infected { .. }) || !obj.core {
@@ -2995,6 +3431,49 @@ fn scan_archive(
         &mut outcome,
     ) {
         return o;
+    }
+    // A file can be two archives. The magic at its start types it as one, and a
+    // reader that goes by another structure opens the other: a ZIP appended to a
+    // PDF, a tar or a gzip is the archive `unzip` finds by the record at the end
+    // of the file, and an ISO or ext image may begin with an archive's magic in
+    // the space it leaves free. What the first walk did not reach is walked as
+    // the second.
+    if obj.carve && obj.depth < budget.limits().max_recursion {
+        let second = Obj {
+            carve: false,
+            embedded: true,
+            ..obj.inner(obj.container)
+        };
+        if fmt != unpack::Format::Zip
+            && let Some(at) = unpack::appended_zip_start(data)
+            && let Ok(at) = usize::try_from(at)
+            && at < data.len()
+        {
+            let sub = &byte_source::Sub::new(data, at, data.len() - at);
+            match scan_found(db, sub, second, opts, budget, findings, sink) {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
+                o => defer(&mut outcome, o),
+            }
+        }
+        if let Some(other) = unpack::also_reads_as(data, fmt) {
+            let o = walk_members(
+                db,
+                data,
+                second,
+                filetype::filetype_of_format(other),
+                other,
+                opts,
+                budget,
+                findings,
+                sink,
+            );
+            match o {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
+                o => defer(&mut outcome, o),
+            }
+        }
     }
     // An OLE2 file's executables are also carved from its own bytes, each
     // scanned from its header to the end of the file, as ClamAV carves them.
@@ -3038,6 +3517,7 @@ fn scan_carried(
     budget: &mut Budget,
     findings: &mut Vec<Finding>,
     sink: &mut Sink,
+    deferred: &mut DeepOutcome,
 ) -> Option<DeepOutcome> {
     // Embedded base64-encoded executables. Scripts/RTF/HTML carriers stash a
     // PE/ELF as a long base64 string (PowerShell reflective loaders, JS/VBS
@@ -3046,14 +3526,13 @@ fn scan_carried(
     // real executable. Bounded by recursion depth and the scan budget;
     // exav-exclusive, so off under `--clamav-compat` and `--no-base64`.
     #[cfg(feature = "base64scan")]
-    if opts.decode_base64
-        && obj.depth < budget.limits().max_recursion
-        && mostly_text(&data.window(0, 8192))
-    {
-        for (b64ix, payload) in unpack::base64_payloads(data, budget.limits().max_buffer_bytes)
-            .into_iter()
-            .enumerate()
-        {
+    if opts.decode_base64 && obj.depth < budget.limits().max_recursion && text_anywhere(data) {
+        let (payloads, capped) =
+            unpack::base64_payloads_capped(data, budget.limits().max_buffer_bytes);
+        if capped {
+            engine::mark_capped(base64_capped);
+        }
+        for (b64ix, payload) in payloads.into_iter().enumerate() {
             // Name the decoded run so a hit inside it is attributable. Without
             // this the detection reports no location and reads as a match on the
             // carrier's own bytes, which is how a correct `Win.Trojan.Mimikatz`
@@ -3071,9 +3550,10 @@ fn scan_carried(
                 carve: false,
                 ..obj.inner(payload_container)
             };
-            let o = scan_found(db, &payload, inner, opts, budget, findings, sink);
-            if matches!(o, DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) {
-                return Some(o);
+            match scan_found(db, &payload, inner, opts, budget, findings, sink) {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return Some(o),
+                o => defer(deferred, o),
             }
         }
     }
@@ -3087,23 +3567,26 @@ fn scan_carried(
     // those constraints exist to separate "this image, in a document" from
     // "this image, on its own".
     #[cfg(feature = "base64scan")]
-    if opts.decode_base64 && obj.depth < budget.limits().max_recursion {
-        if let Some(mc) = markup_cltype(ft, &data.window(0, 4096)) {
-            let _ag = engine::AncestryGuard::enter(Some(mc));
-            for (ix, payload) in
-                unpack::markup_embedded_payloads(data, budget.limits().max_buffer_bytes)
-                    .into_iter()
-                    .enumerate()
-            {
-                let _mpg = MatchPathGuard::enter(&format!("embedded-asset-{}", ix + 1));
-                let inner = Obj {
-                    carve: false,
-                    ..obj.inner(Some(mc))
-                };
-                let o = scan_found(db, &payload, inner, opts, budget, findings, sink);
-                if matches!(o, DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) {
-                    return Some(o);
-                }
+    if opts.decode_base64
+        && obj.depth < budget.limits().max_recursion
+        && let Some(mc) = markup_cltype(ft, &data.window(0, 4096))
+    {
+        let _ag = engine::AncestryGuard::enter(Some(mc));
+        let (payloads, capped) =
+            unpack::markup_embedded_payloads_capped(data, budget.limits().max_buffer_bytes);
+        if capped {
+            engine::mark_capped(base64_capped);
+        }
+        for (ix, payload) in payloads.into_iter().enumerate() {
+            let _mpg = MatchPathGuard::enter(&format!("embedded-asset-{}", ix + 1));
+            let inner = Obj {
+                carve: false,
+                ..obj.inner(Some(mc))
+            };
+            match scan_found(db, &payload, inner, opts, budget, findings, sink) {
+                DeepOutcome::Clean => {}
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return Some(o),
+                o => defer(deferred, o),
             }
         }
     }
@@ -3252,7 +3735,17 @@ fn scan_file(
     ) {
         return o;
     }
-    if let Some(o) = scan_carried(db, data, obj, ft, opts, budget, findings, sink) {
+    if let Some(o) = scan_carried(
+        db,
+        data,
+        obj,
+        ft,
+        opts,
+        budget,
+        findings,
+        sink,
+        &mut deferred,
+    ) {
         return o;
     }
 
@@ -3305,7 +3798,11 @@ fn scan_file(
             let sub = &byte_source::Sub::new(data, off, data.len() - off);
             match scan_found(db, sub, carved, opts, budget, findings, sink) {
                 DeepOutcome::Clean => {}
-                other => return other,
+                // As in the loops below: an image that could not be read whole
+                // is reported if nothing else is found, and must not stop the
+                // scan of the rest of the carrier.
+                o @ (DeepOutcome::Infected { .. } | DeepOutcome::Limits(_)) => return o,
+                o => defer(&mut deferred, o),
             }
         }
 
@@ -3393,26 +3890,26 @@ fn scan_file(
     // Only a PE carries one, and it is parsed from all of the file.
     let signed =
         (opts.alert_broken_authenticode || !db.crb.is_empty()) && data.window(0, 2)[..] == *b"MZ";
-    if signed {
-        if let Some(sig) =
+    if signed
+        && let Some(sig) =
             whole(data, opts, "the Authenticode checks").and_then(|w| authenticode::analyze_pe(&w))
+    {
+        for cert in &sig.certs {
+            if let Some(name) = db.crb.blocked(cert)
+                && let Some(o) = sink.hit(name.to_string(), 0, Method::Hash)
+            {
+                return o;
+            }
+        }
+        if opts.alert_broken_authenticode
+            && !sig.digest_matches
+            && let Some(o) = sink.hit(
+                "Heuristics.Authenticode.HashMismatch".to_string(),
+                0,
+                Method::Heuristic,
+            )
         {
-            for cert in &sig.certs {
-                if let Some(name) = db.crb.blocked(cert) {
-                    if let Some(o) = sink.hit(name.to_string(), 0, Method::Hash) {
-                        return o;
-                    }
-                }
-            }
-            if opts.alert_broken_authenticode && !sig.digest_matches {
-                if let Some(o) = sink.hit(
-                    "Heuristics.Authenticode.HashMismatch".to_string(),
-                    0,
-                    Method::Heuristic,
-                ) {
-                    return o;
-                }
-            }
+            return o;
         }
     }
 
@@ -3424,14 +3921,13 @@ fn scan_file(
 
     // TLSH fuzzy matching is exav-exclusive (ClamAV has no TLSH), so it stays
     // behind the full `--detect exav-heuristics` flag and off under `--clamav-compat`.
-    if opts.heuristics {
-        if let Some(hit) = profile::timed("fuzzy", data.len() as u64, || {
+    if opts.heuristics
+        && let Some(hit) = profile::timed("fuzzy", data.len() as u64, || {
             db.fuzzy.match_tlsh_source(data)
-        }) {
-            if let Some(o) = sink.hit(hit, 0, Method::Fuzzy) {
-                return o;
-            }
-        }
+        })
+        && let Some(o) = sink.hit(hit, 0, Method::Fuzzy)
+    {
+        return o;
     }
 
     // Parsed from all of the PE, so read only when something below uses it.
@@ -3451,10 +3947,9 @@ fn scan_file(
             if let Some(hit) = db
                 .fuzzy
                 .match_imphash(&info.imphash, info.import_count as u64)
+                && let Some(o) = sink.hit(hit, 0, Method::Fuzzy)
             {
-                if let Some(o) = sink.hit(hit, 0, Method::Fuzzy) {
-                    return o;
-                }
+                return o;
             }
             if opts.heuristics {
                 if depth == 0 {
@@ -3486,23 +3981,24 @@ fn scan_file(
                         format!("{score:.2} ({})", db.model.name()),
                     ));
                 }
-                if score >= db.ml_threshold {
-                    if let Some(o) = sink.hit(
+                if score >= db.ml_threshold
+                    && let Some(o) = sink.hit(
                         format!("Heuristics.Static.Suspect.{:.0}", score * 100.0),
                         0,
                         Method::Static,
-                    ) {
-                        return o;
-                    }
+                    )
+                {
+                    return o;
                 }
-                if info.looks_packed() && info.suspicious_imports.len() >= 2 {
-                    if let Some(o) = sink.hit(
+                if info.looks_packed()
+                    && info.suspicious_imports.len() >= 2
+                    && let Some(o) = sink.hit(
                         "Heuristics.PE.PackedWithInjectionImports".to_string(),
                         0,
                         Method::Heuristic,
-                    ) {
-                        return o;
-                    }
+                    )
+                {
+                    return o;
                 }
             }
         }
@@ -3576,27 +4072,25 @@ fn structured_data_scan(
         Some(d) => dlp::count_ssns(d, dlp::SsnMode::Both),
         None => dlp::count_ssns_in(&mut byte_source::Stepper::new(data), dlp::SsnMode::Both),
     };
-    if let Some(threshold) = opts.structured_cc_count {
-        if count_cards() >= threshold as usize {
-            if let Some(o) = sink.hit(
-                "Heuristics.Structured.CreditCardNumber".to_string(),
-                0,
-                Method::Heuristic,
-            ) {
-                return Some(o);
-            }
-        }
+    if let Some(threshold) = opts.structured_cc_count
+        && count_cards() >= threshold as usize
+        && let Some(o) = sink.hit(
+            "Heuristics.Structured.CreditCardNumber".to_string(),
+            0,
+            Method::Heuristic,
+        )
+    {
+        return Some(o);
     }
-    if let Some(threshold) = opts.structured_ssn_count {
-        if count_ssns() >= threshold as usize {
-            if let Some(o) = sink.hit(
-                "Heuristics.Structured.SSN".to_string(),
-                0,
-                Method::Heuristic,
-            ) {
-                return Some(o);
-            }
-        }
+    if let Some(threshold) = opts.structured_ssn_count
+        && count_ssns() >= threshold as usize
+        && let Some(o) = sink.hit(
+            "Heuristics.Structured.SSN".to_string(),
+            0,
+            Method::Heuristic,
+        )
+    {
+        return Some(o);
     }
     None
 }
@@ -3715,6 +4209,33 @@ fn mostly_text(data: &[u8]) -> bool {
     printable * 100 >= sample.len() * 90
 }
 
+/// Whether any stretch of `data` is text, going by up to four 8 KiB samples (its
+/// start, its end and the thirds between, stopping at the first that has any)
+/// and by the kilobytes of a sample one by one. A script behind a binary header
+/// or a long comment of high bytes is text where it matters. Each sample over a
+/// cache is a block of it read, so a binary object pays at most three more than
+/// the first.
+#[cfg(feature = "base64scan")]
+fn text_anywhere(data: &dyn ByteSource) -> bool {
+    const SAMPLE: usize = 8192;
+    let texty = |at: usize| data.window(at, SAMPLE).chunks(1024).any(mostly_text);
+    let len = data.len();
+    if len <= SAMPLE {
+        return texty(0);
+    }
+    let last = len - SAMPLE;
+    [0, last, last / 3, last / 3 * 2].into_iter().any(texty)
+}
+
+/// Why an object that has more base64-encoded files than are decoded in one
+/// object is not fully scanned.
+#[cfg(feature = "base64scan")]
+fn base64_capped() -> String {
+    "more base64-encoded executables, archives or images than are decoded in one object: \
+     the rest were not scanned"
+        .to_string()
+}
+
 /// The normalised views of `data` a textual file is matched against, in order.
 /// The caller makes each with [`make_view`] and drops it before the next.
 ///
@@ -3735,7 +4256,7 @@ fn normalizations(ft: FileType, data: &dyn ByteSource) -> Vec<(ViewKind, FileTyp
             return vec![
                 (ViewKind::Html, FileType::HtmlView),
                 (ViewKind::Text, FileType::TextView),
-            ]
+            ];
         }
         FileType::Html => (ViewKind::Html, FileType::HtmlView),
         _ => (ViewKind::Text, FileType::TextView),
@@ -3746,6 +4267,58 @@ fn normalizations(ft: FileType, data: &dyn ByteSource) -> Vec<(ViewKind, FileTyp
         v.push((ViewKind::Deobfuscated, as_type));
     }
     v
+}
+
+/// The text a reader sees in the object `data` called `name` (Markdown, HTML,
+/// an Office or OpenDocument XML part, PDF, a drawing): its words, and where
+/// each link leads (`exav_render::text`).
+///
+/// The text as a text view is matched, and each link whose label is not its
+/// target as `(label, target)`.
+///
+/// `None` when the object has none, or when it cannot be made, and the scan is
+/// then marked incomplete: the object is past `deep_analysis_max`, so it is
+/// neither held in memory nor read whole. A text cut at four times the object and a little,
+/// which no real document comes to, and a PDF past the extraction limits, mark
+/// the scan incomplete too; what was made is still scanned. So does an
+/// office document (with `visible-text-office`) whose text cannot be taken
+/// out: encrypted, past a limit, damaged.
+#[cfg(feature = "visible-text")]
+fn visible_text_view(name: &str, data: &dyn ByteSource, opts: &ScanOptions) -> Option<VisibleView> {
+    if !exav_render::text::wants(name, &data.window(0, 1024)) {
+        return None;
+    }
+    let bytes = whole(data, opts, "the reading of its visible text")?;
+    let cap = bytes
+        .len()
+        .saturating_mul(4)
+        .saturating_add(64 << 10)
+        .min(usize::try_from(opts.deep_analysis_max).unwrap_or(usize::MAX));
+    let visible = exav_render::text::visible_text(name, &bytes, cap, &opts.limits)?;
+    if visible.truncated {
+        engine::mark_scan_truncated();
+    }
+    // A document of a kind that has text, whose text could not be taken out
+    // (encrypted, past a limit, damaged): its bytes are still scanned, and the
+    // scan is not complete.
+    if visible.unreadable.is_some() {
+        engine::mark_scan_truncated();
+        return None;
+    }
+    // As any text view is, so that `Target:7` signatures, written against the
+    // lowercased, whitespace-collapsed form, apply.
+    Some(VisibleView {
+        text: normalize::text(visible.text.as_bytes()),
+        links: visible.links,
+    })
+}
+
+/// A document's visible text as a text view, and its links.
+#[cfg(feature = "visible-text")]
+struct VisibleView {
+    text: Vec<u8>,
+    /// Each link whose label is not its target, as `(label, target)`.
+    links: Vec<(String, String)>,
 }
 
 /// A normalised view of an object: [`normalize`]'s three, and [`jsnorm`]'s.
@@ -3819,7 +4392,7 @@ fn make_view(kind: ViewKind, data: &dyn ByteSource, opts: &ScanOptions) -> Optio
         ViewKind::Text => normalize::text_into(&mut src, &mut out),
         _ => normalize::javascript_into(&mut src, &mut out),
     }
-    match out.finish() {
+    match out.finish(opts.cache_sizes()) {
         Ok(spilled) => Some(View::Spilled(spilled)),
         Err(e) => {
             not_made(&e);
@@ -3877,6 +4450,7 @@ fn write_limits(budget: &Budget) -> bytecode::exec::WriteLimits {
     bytecode::exec::WriteLimits {
         file: budget.limits().max_buffer_bytes,
         total: budget.remaining_scan(),
+        memory: budget.limits().max_bytecode_memory_bytes,
     }
 }
 
@@ -3938,8 +4512,13 @@ fn core_matches(
     };
     // A PE's structure (layout, icons, section table) is parsed from all of it.
     let image = pe_image(ft, data, opts);
-    // PE layout lets the engine resolve EP/section-relative offsets.
-    let layout = image.as_deref().and_then(pe::layout);
+    // PE layout lets the engine resolve EP/section-relative offsets, and so
+    // does an ELF's or a Mach-O's, read from its headers.
+    let layout = image.as_deref().and_then(pe::layout).or_else(|| match ft {
+        FileType::Elf => pe::elf_layout(data),
+        FileType::MachO => pe::macho_layout(data),
+        _ => None,
+    });
     // PE-icon perceptual metrics for `IconGroup1/2`-constrained logical
     // signatures: computed only for a PE when `.idb` entries are loaded. They
     // gate such sigs (the structural condition must also hold); see [`icon`].
@@ -4001,6 +4580,31 @@ fn core_matches(
             engine_pass(view.source(), as_type, None, None, None)?;
         }
     }
+    // The words of a document, and where each link leads: what a reader sees,
+    // which the bytes above do not give (a label naming one site over a target
+    // on another, markup, an entity, a compressed stream or an escape in the
+    // middle of a signature's text).
+    #[cfg(feature = "visible-text")]
+    if !opts.clamav_compat
+        && !db.engine.is_empty()
+        && let Some(view) = profile::timed("visible-text", data.len() as u64, || {
+            visible_text_view(obj.name.unwrap_or(""), data, opts)
+        })
+    {
+        // Reported where the document is, as the other views are.
+        engine_pass(&view.text, FileType::TextView, None, None, None)?;
+        // A link that says one site and goes to another, in a document
+        // that is not HTML: judged as an anchor of an HTML one is.
+        if opts.alert_phishing {
+            let (found, complete) = phishing::scan_links(&view.links, &db.phishing);
+            if !complete {
+                engine::mark_scan_truncated();
+            }
+            if let Some(p) = found {
+                hit(p.signature(), false, 0, Method::Heuristic)?;
+            }
+        }
+    }
     // Bytecode programs whose trigger/hook fires (gated execution). Their
     // names are reported verbatim, never `.UNOFFICIAL`-suffixed.
     let mut unpacked = Vec::new();
@@ -4014,28 +4618,29 @@ fn core_matches(
         }
         unpacked = extracted;
     }
-    if !db.sections.is_empty() {
-        if let Some(image) = &image {
-            let found: Vec<_> = profile::timed("sections", data.len() as u64, || {
-                pe::section_slices(image)
-                    .into_iter()
-                    .filter_map(|(size, slice)| {
-                        db.sections
-                            .lookup(size, &hashes::section_digests(&db.sections, size, slice))
-                    })
-                    .collect()
-            });
-            for (name, unofficial) in found {
-                hit(&name, unofficial, 0, Method::Hash)?;
-            }
-        }
-    }
-    if !db.hashes.is_empty() && hash_matchable(data.len() as u64) {
-        if let Some((name, unofficial)) = profile::timed("hashes", data.len() as u64, || {
-            db.hashes.lookup(facts.digests(db), data.len() as u64)
-        }) {
+    if !db.sections.is_empty()
+        && let Some(image) = &image
+    {
+        let found: Vec<_> = profile::timed("sections", data.len() as u64, || {
+            pe::section_slices(image)
+                .into_iter()
+                .filter_map(|(size, slice)| {
+                    db.sections
+                        .lookup(size, &hashes::section_digests(&db.sections, size, slice))
+                })
+                .collect()
+        });
+        for (name, unofficial) in found {
             hit(&name, unofficial, 0, Method::Hash)?;
         }
+    }
+    if !db.hashes.is_empty()
+        && hash_matchable(data.len() as u64)
+        && let Some((name, unofficial)) = profile::timed("hashes", data.len() as u64, || {
+            db.hashes.lookup(facts.digests(db), data.len() as u64)
+        })
+    {
+        hit(&name, unofficial, 0, Method::Hash)?;
     }
     if !db.yara.is_empty() {
         let unofficial = db.yara.unofficial();
@@ -4078,8 +4683,8 @@ mod tests {
     /// How many times over a scan by `db` reads `data` from a source it does
     /// not hold in memory.
     fn passes_over(db: &Scanner, data: &[u8]) -> f64 {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         let read = Arc::new(AtomicU64::new(0));
         let reader = Counting(Cursor::new(data.to_vec()), read.clone());
         let opts = ScanOptions {
@@ -4160,6 +4765,106 @@ mod tests {
         }
     }
 
+    /// The size of the cache of an object read in place and of its blocks are
+    /// the scan's: a cache past the object serves the later reads of it from
+    /// memory, and a smaller block is more reads of the source.
+    #[test]
+    fn the_object_cache_follows_the_options() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Tally(Cursor<Vec<u8>>, std::sync::Arc<(AtomicU64, AtomicU64)>);
+        impl std::io::Read for Tally {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                self.1.0.fetch_add(n as u64, Ordering::Relaxed);
+                self.1.1.fetch_add(1, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl std::io::Seek for Tally {
+            fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(p)
+            }
+        }
+        // Noise with no magic, a hash signature of its size: detection, the
+        // digests and the sweep each read it through.
+        let size = 12 << 20;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut noise: Vec<u8> = (0..size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        for w in 0..noise.len() - 1 {
+            if matches!(
+                &noise[w..w + 2],
+                b"MZ" | b"PK" | b"7z" | b"BZ" | b"\x1f\x8b" | b"Ra" | b"MS"
+            ) {
+                noise[w] ^= 0x80;
+            }
+        }
+        let mut l = loader::Builder::new();
+        l.add_named_bytes("a.ndb", b"Sig.Pat:0:*:0badc0de0badf00d0bad\n", true);
+        let hdb = format!("0123456789abcdef0123456789abcdef:{size}:Sig.Hash\n");
+        l.add_named_bytes("c.hdb", hdb.as_bytes(), true);
+        let db = l.build().unwrap();
+        // (bytes read from the source, reads of it) for a scan.
+        let reads = |cache: u64, block: u64| {
+            let tally = std::sync::Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+            let opts = ScanOptions {
+                deep_analysis_max: 1 << 20,
+                object_cache_bytes: cache,
+                object_cache_block_bytes: block,
+                ..ScanOptions::default()
+            };
+            let reader = Tally(Cursor::new(noise.clone()), tally.clone());
+            scan_seekable(&db, reader, size as u64, &opts).unwrap();
+            (
+                tally.0.load(Ordering::Relaxed),
+                tally.1.load(Ordering::Relaxed),
+            )
+        };
+        let (small, small_reads) = reads(8 << 20, 64 << 10);
+        let (big, _) = reads(16 << 20, 64 << 10);
+        assert!(small > size as u64 * 3 / 2, "{small}");
+        assert!(big <= size as u64 + (1 << 20), "{big}");
+        let (_, fine_reads) = reads(8 << 20, 4 << 10);
+        assert!(
+            fine_reads > 8 * small_reads,
+            "{fine_reads} vs {small_reads}"
+        );
+    }
+
+    /// A source that reads on without end and measures itself as empty (a
+    /// character device such as `/dev/zero`) is an error, not a clean scan of
+    /// nothing.
+    #[test]
+    fn a_source_with_no_length_is_an_error_not_a_clean_scan() {
+        struct Endless;
+        impl std::io::Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+        impl std::io::Seek for Endless {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                Ok(0)
+            }
+        }
+        let opts = ScanOptions {
+            deep_analysis_max: 4096,
+            ..ScanOptions::default()
+        };
+        let e = scan_seekable(&Scanner::builtin(), Endless, 0, &opts).unwrap_err();
+        assert!(e.to_string().contains("not a file with a length"), "{e}");
+        // A file that grew while it was read is still scanned as what it is.
+        let big = std::io::Cursor::new(vec![b'a'; 10_000]);
+        assert!(scan_seekable(&Scanner::builtin(), big, 100, &opts).is_ok());
+    }
+
     /// The one read of a streamed object finds what each step's own read of
     /// it would, whichever step asks first.
     #[test]
@@ -4206,7 +4911,7 @@ mod tests {
             let cache =
                 byte_source::BlockCache::with_sizes(Cursor::new(data.clone()), 4093, 16 * 4093)
                     .unwrap();
-            let facts = Facts::for_scan(&cache, &db, true);
+            let facts = Facts::for_scan(&cache, &db, true, &ScanOptions::default());
             let mut embedded = None;
             for step in (0..3).map(|k| (first + k) % 3) {
                 match step {
@@ -4256,7 +4961,7 @@ mod tests {
             let read = std::sync::Arc::new(AtomicU64::new(0));
             let reader = Counting(Cursor::new(vec![b'.'; len]), read.clone());
             let cache = byte_source::BlockCache::with_sizes(reader, 4093, 16 * 4093).unwrap();
-            let facts = Facts::for_scan(&cache, &db, false);
+            let facts = Facts::for_scan(&cache, &db, false, &ScanOptions::default());
             let before = read.load(Ordering::Relaxed);
             assert!(!allowlisted(&db, &facts));
             assert_eq!(
@@ -5123,6 +5828,111 @@ mod tests {
         }
     }
 
+    /// 128 KiB of text that differs with `seed`.
+    #[cfg(feature = "all-formats")]
+    fn memo_body(seed: usize) -> Vec<u8> {
+        let text: String = (0..4096)
+            .map(|i| format!("line {seed} {i} of a member with nothing in it\n"))
+            .collect();
+        text.as_bytes()[..128 * 1024].to_vec()
+    }
+
+    /// A stored zip of `n` members of `memo_body`, the same in each when `same`.
+    #[cfg(feature = "all-formats")]
+    fn memo_zip(n: usize, same: bool) -> Vec<u8> {
+        use std::io::Write;
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for k in 0..n {
+            z.start_file(format!("member{k}.txt"), stored).unwrap();
+            z.write_all(&memo_body(if same { 0 } else { k })).unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    fn clean_skips_of(data: &[u8]) -> (Verdict, u64) {
+        engine::CLEAN_SKIPS.with(|c| c.set(0));
+        let v = analyze(&Scanner::builtin(), data, &ScanOptions::default()).verdict;
+        (v, engine::CLEAN_SKIPS.with(|c| c.get()))
+    }
+
+    /// Bytes already scanned clean in the same place are not scanned again:
+    /// the first of 40 copies is scanned and the other 39 are not.
+    #[test]
+    #[cfg(feature = "all-formats")]
+    fn copies_of_a_clean_member_are_scanned_once() {
+        assert_eq!(clean_skips_of(&memo_zip(40, true)), (Verdict::Clean, 39));
+    }
+
+    /// The control: members that differ are each scanned.
+    #[test]
+    #[cfg(feature = "all-formats")]
+    fn members_that_differ_are_each_scanned() {
+        assert_eq!(clean_skips_of(&memo_zip(40, false)), (Verdict::Clean, 0));
+    }
+
+    /// Members under the size worth remembering are scanned every time.
+    #[test]
+    #[cfg(feature = "all-formats")]
+    fn small_copies_are_each_scanned() {
+        use std::io::Write;
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for k in 0..10 {
+            z.start_file(format!("m{k}.txt"), stored).unwrap();
+            z.write_all(&memo_body(0)[..1000]).unwrap();
+        }
+        let z = z.finish().unwrap().into_inner();
+        assert_eq!(clean_skips_of(&z), (Verdict::Clean, 0));
+    }
+
+    /// A copy that is not clean is found wherever it is, after clean ones with
+    /// the same start.
+    #[test]
+    #[cfg(feature = "all-formats")]
+    fn an_infected_member_after_clean_copies_is_found() {
+        use std::io::Write;
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // Deflated, so the signature is in the member only, not in the zip's bytes.
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for k in 0..3 {
+            z.start_file(format!("clean{k}.bin"), stored).unwrap();
+            z.write_all(&memo_body(0)).unwrap();
+        }
+        let mut dirty = memo_body(0);
+        dirty.extend_from_slice(&[eicar(), b"\n"].concat().repeat(64));
+        z.start_file("dirty.bin", deflated).unwrap();
+        z.write_all(&dirty).unwrap();
+        let z = z.finish().unwrap().into_inner();
+        let (v, skips) = clean_skips_of(&z);
+        assert_eq!(skips, 2);
+        assert!(matches!(v, Verdict::Infected { .. }), "{v:?}");
+    }
+
+    /// The memo remembers the shallowest depth a clean scan was at: a copy
+    /// deeper than that is covered, one shallower is not.
+    #[test]
+    fn a_clean_copy_covers_only_the_same_depth_or_deeper() {
+        engine::reset_scan_truncated();
+        let key = [7u8; 32];
+        assert!(!engine::clean_seen(&key, 3));
+        engine::clean_seen_insert(key, 3);
+        assert!(!engine::clean_seen(&key, 2));
+        assert!(engine::clean_seen(&key, 3));
+        assert!(engine::clean_seen(&key, 9));
+        engine::clean_seen_insert(key, 1);
+        assert!(engine::clean_seen(&key, 1));
+        assert!(!engine::clean_seen(&key, 0));
+        // A new scan starts with nothing remembered.
+        engine::reset_scan_truncated();
+        assert!(!engine::clean_seen(&key, 9));
+    }
+
     #[test]
     fn detects_eicar_pattern() {
         let db = Scanner::builtin();
@@ -5472,8 +6282,8 @@ mod tests {
 
     #[test]
     fn finds_eicar_inside_gzip() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
         e.write_all(eicar()).unwrap();
@@ -5611,8 +6421,8 @@ mod tests {
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn streamed_gzip_over_cap_finds_eicar() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
         e.write_all(eicar()).unwrap();
@@ -5700,8 +6510,8 @@ mod tests {
         ignore = "host filesystem/tempdir unavailable under WASI"
     )]
     fn nested_gzip_over_entry_cap_is_streamed_and_found() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         // gzip whose decompressed content (padding + EICAR at the end) far exceeds
         // the tiny per-member buffer cap set below.
@@ -5874,8 +6684,8 @@ mod tests {
     fn http_range_scan_fetches_only_what_it_needs() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
 
         let big: Vec<u8> = (0..1_000_000u32).map(|i| (i as u8) ^ 0x5a).collect();
@@ -5932,7 +6742,10 @@ mod tests {
                 served_t.fetch_add(slice.len() as u64, Ordering::SeqCst);
                 let hdr = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    a, b, blob_t.len(), slice.len()
+                    a,
+                    b,
+                    blob_t.len(),
+                    slice.len()
                 );
                 let _ = stream.write_all(hdr.as_bytes());
                 let _ = stream.write_all(slice);
@@ -5995,10 +6808,9 @@ mod parity {
                     unpack::read_fixture(
                         path.to_string_lossy().trim_end_matches(".xor"),
                     )
+                    && data.len() < 8 << 20
                 {
-                    if data.len() < 8 << 20 {
-                        out.push((path.display().to_string(), data));
-                    }
+                    out.push((path.display().to_string(), data));
                 }
             }
         }

@@ -65,6 +65,17 @@ impl ClipShape {
         })
     }
 
+    /// The region as triangles.
+    pub fn triangles(&self) -> Vec<[[f64; 2]; 3]> {
+        match self {
+            ClipShape::Rect { min, max } => vec![
+                [[min[0], min[1]], [max[0], min[1]], [max[0], max[1]]],
+                [[min[0], min[1]], [max[0], max[1]], [min[0], max[1]]],
+            ],
+            ClipShape::Poly { pieces, .. } => pieces.clone(),
+        }
+    }
+
     pub fn bounds(&self) -> ([f64; 2], [f64; 2]) {
         match self {
             ClipShape::Rect { min, max } => (*min, *max),
@@ -237,11 +248,7 @@ fn liang_barsky(a: [f64; 2], b: [f64; 2], min: [f64; 2], max: [f64; 2]) -> Optio
             }
         }
     }
-    if t1 <= t0 {
-        None
-    } else {
-        Some((t0, t1))
-    }
+    if t1 <= t0 { None } else { Some((t0, t1)) }
 }
 
 /// Sutherland-Hodgman against the four edges of a box.

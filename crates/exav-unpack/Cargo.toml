@@ -41,7 +41,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # it is useful on its own and because it is the only thing that needs a CPU
 # decoder: keeping it out of here means a build without `pepack` never compiles
 # `exav-x86` at all.
-exav-pe-emu = { version = "0.0.2", path = "../exav-pe-emu", optional = true }
+exav-pe-emu = { version = "0.0.3", path = "../exav-pe-emu", optional = true }
 
 # --- Per-format optional deps. Each is pulled in only by the feature(s) below
 # that need it; a dep shared by several formats (e.g. `flate2`) is compiled if
@@ -56,34 +56,21 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2", "
 # entirely (~8,600 `unsafe` ops, the single largest source in the dep tree).
 tar = { version = "0.4", default-features = false, optional = true }
 # For the bzip2 decoder vendored from `bzip2-rs` in `formats/bzip2_rs`.
-tinyvec = { version = "1.11", optional = true }
+tinyvec = { version = "1.13", optional = true }
 byteorder = { version = "1", optional = true }
 lzxd = { version = "0.2", optional = true }
-# FAT filesystem reader (a few `unsafe` uses of its own); `chrono` (timestamps)
-# is left off, so the only transitive deps are `bitflags` and `log`.
-fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"], optional = true }
 # LZNT1, the compression NTFS applies per compression unit. Single-purpose and
 # dependency-free; the MFT walk itself is in-tree.
 lznt1 = { version = "0.1", optional = true }
-# ext2/3/4 reader. Read-only by construction, no `unsafe`, no dependencies.
-ext4-view = { version = "1", optional = true }
 # LZW, for ZOO's LZD codec. Dependency-free.
 salzweg = { version = "0.1", optional = true }
-# InstallShield `.z` reader. Its only real dep is `explode` (MIT), a leaf
-# decoder for the PKWARE DCL "implode" codec those archives use.
-unshield = { version = "0.2", default-features = false, optional = true }
-# The same decoder, read through a cap of our own: `unshield` only gives a
-# member whole, whatever it expands to.
-explode = { version = "0.1", optional = true }
-# structured documents that contain embedded files
-cfb = { version = "0.14.0", optional = true }
 # AutoCAD drawings before 2007 are in the code page `$DWGCODEPAGE` names,
 # among them the double-byte Asian ones, which `\M+` escapes use too.
 # encoding_rs is the WHATWG decoder set Firefox ships; built without
 # `simd-accel`.
 encoding_rs = { version = "0.8.42", default-features = false, features = ["alloc"], optional = true }
-mail-parser = { version = "0.11.4", optional = true }
-delharc = { version = "0.6.2", optional = true }
+mail-parser = { version = "0.11.9", optional = true }
+delharc = { version = "0.8.0", optional = true }
 # ARJ decompression: bitstream-io for the "fastest" LZ77 codec
 bitstream-io = { version = "4.10.0", optional = true }
 # Pure-Rust crypto for decrypting password-known encrypted archive members
@@ -95,31 +82,42 @@ aes = { version = "0.9", optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
-constant_time_eq = { version = "0.3", optional = true }
-# DMG support
-hfsplus = { version = "0.2", optional = true }
-apfs = { version = "0.2", optional = true }
-lzfse_rust = { version = "0.2.1", optional = true }
-base64 = { version = "0.22", optional = true }
-quick-xml = { version = "0.41", optional = true }
+base64 = { version = "0.23", optional = true }
+quick-xml = { version = "0.42", optional = true }
 des = { version = "0.9", default-features = false, optional = true }
 cbc = { version = "0.2", optional = true }
-flate2 = { version = "1.1.9", optional = true }
+flate2 = { version = "1.1.10", optional = true }
 # ZIP method 9 (Deflate64 / "enhanced deflate"). A leaf dep: zero runtime
 # dependencies, MIT, and `#![forbid(unsafe_code)]` like this crate. It is the
 # same decoder the `zip` crate uses behind its own `deflate64` feature; we depend
 # on it directly so the raw-bytes path (orphan local headers, where we never go
 # through the `zip` crate's reader) decodes method 9 too.
 deflate64 = { version = "0.1.12", optional = true }
-lzma-rust2 = { version = "0.21", default-features = false, features = ["std"], optional = true }
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 # PDF crypto primitives (replacing hand-rolled implementations)
 md-5 = { version = "0.11", optional = true }
 sha2 = { version = "0.11", optional = true }
 digest = { version = "0.11", optional = true }
 stringprep = { version = "0.1", optional = true }
-xz4rust = { version = "0.2.1", default-features = false, features = ["std", "bcj", "crc64", "delta", "no_unsafe"], optional = true }
-ruzstd = { version = "0.8", optional = true }
-crc32fast = { version = "1.5.0", optional = true }
+xz4rust = { version = "0.2.3", default-features = false, features = ["std", "bcj", "crc64", "delta", "no_unsafe"], optional = true }
+# 0.9.1 bounds a block's decoded size (RUSTSEC-2026-0344). Without `hash`
+# (`twox-hash`): exav does not check zstd's content checksum.
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"], optional = true }
+crc32fast = { version = "1.5.3", optional = true }
+# HTML (`html`) and the text of a document (`text`, `text-pdf`). HTML is read by html5gum's
+# tokenizer alone (no tree; `forbid(unsafe_code)`, no dependency without its
+# `jetscii` feature), a PDF's text by hayro, which draws glyphs with their
+# Unicode: the same decoders (hayro-jpeg2000, hayro-jbig2) that
+# exav-render uses. Pinned with `=` for `cargo install`.
+#
+# hayro-interpret without `embed-cmaps` (the predefined CJK CMaps, brotli
+# compressed: it brings `brotli`), and it turns on hayro-syntax's `unsafe`
+# feature itself, which switches every `flate2` in the build to zlib-rs and
+# adds SIMD to the image decoders: `text-pdf` is therefore not a default.
+html5gum = { version = "=0.8.4", default-features = false, optional = true }
+hayro-interpret = { version = "=0.8.0", default-features = false, features = ["embed-fonts"], optional = true }
+hayro-syntax = { version = "=0.8.0", optional = true }
+kurbo = { version = "0.13", optional = true }
 
 [features]
 default = ["all-formats", "decrypt", "cli"]
@@ -145,11 +143,11 @@ all-formats = ["all-formats-no-emu", "pe-emu"]
 # attacker-supplied control flow. `pepack` stays in: it decompresses known
 # packers with native decoders and does not execute anything.
 all-formats-no-emu = [
-    "zip", "gzip", "tar", "bzip2", "xz", "zstd", "lzip", "cab", "sevenz", "rar",
+    "zip", "gzip", "tar", "bzip2", "xz", "zstd", "lzip", "lzma", "rpm", "cab", "sevenz", "rar",
     "arj", "lha", "iso", "ole", "pdf", "email", "dmg", "upx", "ar", "cpio", "xar", "chm",
     "uuencode", "xdp", "szdd", "tnef", "swf", "binhex", "lnk", "partition", "vhd", "lzw",
     "diskimage", "wim", "lz4", "arc", "ace", "stuffit", "alz", "egg", "hwp3",
-    "fat", "ext", "zoo", "ishieldz", "inno", "ntfs", "pyc",
+    "fat", "exfat", "squashfs", "cramfs", "romfs", "erofs", "ext", "zoo", "ishieldz", "inno", "ntfs", "pyc",
     "nsis", "machofat", "sfx", "autoit", "onenote", "rtf", "pepack",
     "javaclass", "aimodel", "screnc", "base64scan", "dxf", "dwg",
 ]
@@ -162,10 +160,12 @@ bzip2 = ["bzip2-decoder"]
 # Internal: the vendored bzip2 decoder, shared by every format that carries
 # bzip2. Not a format of its own; select `bzip2` instead.
 bzip2-decoder = ["dep:tinyvec", "dep:crc32fast"]
-xz = ["dep:xz4rust"]
+xz = ["dep:xz4rust", "dep:crc32fast"]
 zstd = ["dep:ruzstd"]
 lzip = ["dep:lzma-rust2", "dep:crc32fast"]
-cab = ["dep:lzxd", "dep:flate2", "dep:byteorder"]
+lzma = ["dep:lzma-rust2"]
+rpm = []
+cab =["dep:lzxd", "dep:flate2", "dep:byteorder"]
 chm = ["dep:lzxd"]
 sevenz = ["dep:lzma-rust2", "bzip2-decoder", "dep:flate2", "dep:crc32fast"]
 rar = []
@@ -225,16 +225,28 @@ alz = ["dep:flate2", "bzip2-decoder"]
 egg = ["dep:flate2", "bzip2-decoder", "dep:lzma-rust2"]
 hwp3 = ["dep:flate2"]
 # FAT filesystem reader.
-fat =["dep:fatfs"]
+fat = []
+# exFAT, walked like FAT: a fragmented file comes back whole from its chain.
+exfat = []
+# SquashFS 4, in the compressions it has: gzip, LZMA, LZO (in-tree), XZ, LZ4
+# and Zstandard, whose decoders are those of the formats of the same names.
+squashfs = ["dep:flate2", "xz", "lzma", "lz4", "zstd"]
+# cramfs, the small read-only filesystem of boot images: blocks of zlib.
+cramfs = ["dep:flate2"]
+# romfs, the smallest read-only filesystem: files stored as they are.
+romfs = []
+# EROFS, the read-only filesystem of Android and of container images; the files
+# stored as they are. A compressed file is reported.
+erofs = []
 # ext2/3/4, walked as a filesystem for the same reason as FAT: a fragmented file
 # comes back whole from the inode's block map and in pieces from a carve.
-ext = ["dep:ext4-view"]
+ext = []
 # ZOO carries LZD (LZW) and LZH. The latter is `lh5` on the wire, so `delharc`
 # already covers it.
 zoo = ["dep:salzweg", "dep:delharc"]
 # InstallShield `.z`. NOT the `ISc(` InstallScript cabinet, whose only
 # implementation is LGPL and which stays recognised-but-unopened.
-ishieldz = ["dep:unshield", "dep:explode"]
+ishieldz = []
 inno = []
 # NTFS is walked through the MFT rather than as a filesystem tree: a scanner
 # wants every file's bytes, and the MFT also still holds deleted records.
@@ -242,9 +254,17 @@ ntfs = ["dep:lznt1"]
 upx = ["dep:flate2", "dep:lzma-rust2", "dep:base64"]
 
 # Structured documents.
-ole = ["dep:cfb", "dep:flate2"]
+ole = ["dep:flate2", "dep:encoding_rs"]
+# The builders of the tests of what reads compound files (`cfb::build`).
+test-util = []
 pdf = ["dep:flate2"]
-email = ["dep:mail-parser", "dep:base64"]
+# HTML as tokens and its bytes as text (the public `html` module).
+html = ["dep:html5gum", "dep:encoding_rs"]
+# The text a reader sees in HTML and in the XML parts of Office and
+# OpenDocument files (the public `text` module). `text-pdf` adds PDF's.
+text = ["html", "dep:quick-xml"]
+text-pdf = ["text", "pdf", "dep:hayro-interpret", "dep:hayro-syntax", "dep:kurbo"]
+email =["dep:mail-parser", "dep:base64"]
 # AutoCAD DXF: the files a drawing embeds (an OLE2FRAME's object), and the
 # public `dxf` module that drawing readers (exav-render's) build on.
 dxf = ["dep:encoding_rs"]
@@ -256,7 +276,7 @@ dwg = ["dep:encoding_rs"]
 # Apple disk images (UDIF + HFS+/APFS). The encrypted-DMG cipher stack is under
 # the `decrypt` feature, not here.
 dmg = [
-    "dep:hfsplus", "dep:apfs", "dep:lzfse_rust", "dep:xz4rust", "bzip2-decoder",
+    "dep:xz4rust", "bzip2-decoder",
     "dep:flate2", "dep:base64", "dep:quick-xml",
 ]
 
@@ -269,9 +289,12 @@ dmg = [
 # same as when no password is supplied. Effective only combined with a format
 # that has encryptable members. ARJ's ciphers come with `arj`, not this.
 decrypt = [
-    "dep:aes", "dep:hmac", "dep:pbkdf2", "dep:sha1", "dep:constant_time_eq",
+    "offcrypto", "dep:aes", "dep:hmac", "dep:pbkdf2", "dep:sha1",
     "dep:des", "dep:cbc", "dep:md-5", "dep:sha2", "dep:digest", "dep:stringprep",
 ]
+# Excel workbooks saved with a password: RC4, RC4 CryptoAPI and XOR
+# obfuscation (the public `offcrypto` module), which exav-render opens too.
+offcrypto = ["dep:md-5", "dep:sha1"]
 
 # Verify RAR5-decompressed output against the header CRC-32 (debug assert).
 # Off by default; enabled by the rar5_check example/tests.
@@ -316,23 +339,26 @@ required-features = ["zip", "cli"]
 sha2 = "0.11"
 # Test helpers build ZIP fixtures and gunzip stored disk images; as optional
 # normal dependencies they would be missing from a single-format test build.
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Reference PPMd7 (var.H) and PPMd8 (var.I) encoders, used only to validate the
 # models in `formats/ppmd7` and `formats/ppmd8` (CC0-1.0/MIT-0).
 ppmd-rust = "1"
 # Used only in tests to create 7z archives for roundtrip testing.
-sevenz-rust2 = { version = "0.20.2", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
+sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "ppmd", "util", "compress"] }
 # Used only in tests to build CAB fixtures for roundtrip testing.
 cab = "0.6.0"
 # Its XZ writer, used only in tests to build XZ (method 95) ZIP members.
-lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "encoder", "xz"] }
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "encoder", "xz"] }
 # Reference bzip2 encoder (a port of libbzip2), used only in tests to build
 # streams the vendored decoder must read.
 bzip2 = "0.6"
-# Used only in tests to prove the strict CFB reader rejects a malformed
-# compound file that exav's lenient OLE fallback still recovers.
-cfb = "0.14.0"
+# Used only in tests: an independent writer and strict reader of compound
+# files, to build them and to check exav's lenient reader against.
+cfb = "0.15.0"
+# The oracle `formats/lzfse` is checked against, and its encoder builds the
+# streams it reads.
+lzfse_rust = "0.2.1"
 
 # docs.rs builds with every feature on, so the parts gated behind a feature
 # (in particular exav-core's `unstable-internals`) appear on the rendered page

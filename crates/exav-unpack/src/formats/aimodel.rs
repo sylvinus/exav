@@ -138,8 +138,8 @@ fn extract_safetensors<R>(
     // it were the header hides whatever falls past the cut, so an over-cap header
     // is reported — and the part that fits is still handed over, since a prefix
     // is content even when it is not all of it.
-    if header.len() as u64 > cap {
-        if let Some(r) = visit(
+    if header.len() as u64 > cap
+        && let Some(r) = visit(
             Entry::unsupported(
                 "safetensors-header".into(),
                 header.len() as u64,
@@ -148,9 +148,9 @@ fn extract_safetensors<R>(
                  the part that fits was scanned",
             ),
             budget,
-        ) {
-            return Ok(Some(r));
-        }
+        )
+    {
+        return Ok(Some(r));
     }
     let take = (header.len() as u64).min(cap) as usize;
     let member = header[..take].to_vec();
@@ -204,7 +204,7 @@ fn disassemble(data: &[u8], cap: u64) -> Vec<u8> {
     // Append `bytes` + `\n` to output, honoring the cap. Returns false if the
     // cap was reached (caller stops the walk).
     macro_rules! push_out {
-        ($bytes:expr) => {{
+        ($bytes:expr_2021) => {{
             let b: &[u8] = $bytes;
             if out.len() >= cap {
                 return out;
@@ -221,7 +221,7 @@ fn disassemble(data: &[u8], cap: u64) -> Vec<u8> {
     // Record a freshly-pushed string literal for later STACK_GLOBAL use and add
     // it to output.
     macro_rules! record_str {
-        ($bytes:expr) => {{
+        ($bytes:expr_2021) => {{
             let v: Vec<u8> = $bytes;
             push_out!(&v);
             prev2 = prev1.take();
@@ -232,7 +232,7 @@ fn disassemble(data: &[u8], cap: u64) -> Vec<u8> {
     // Read a little-endian unsigned integer of `n` bytes starting at `i+1`;
     // returns None on short read.
     macro_rules! read_le {
-        ($n:expr) => {{
+        ($n:expr_2021) => {{
             let n: usize = $n;
             match crate::bytes::at(data, i + 1, n) {
                 Some(s) => {
@@ -561,7 +561,7 @@ mod tests {
         let entries = extract(Format::AiModel, &pkl, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         let out = &entries[0].data;
-        assert!(out.windows(2).any(|w| w == b"os"), "os not surfaced");
+        assert!(out.array_windows().any(|w| w == b"os"), "os not surfaced");
         assert!(
             out.windows(6).any(|w| w == b"system"),
             "system not surfaced"
@@ -609,7 +609,7 @@ mod tests {
         let entries = extract(Format::AiModel, &pkl, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         let out = &entries[0].data;
-        assert!(out.windows(2).any(|w| w == b"os"));
+        assert!(out.array_windows().any(|w| w == b"os"));
         assert!(out.windows(6).any(|w| w == b"system"));
         // The truncated string literal must not appear.
         assert!(!out.windows(3).any(|w| w == b"abc"));

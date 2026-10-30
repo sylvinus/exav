@@ -4,7 +4,7 @@ macro_rules! tags {
         $( #[$enum_attr:meta] )*
         $vis:vis enum $name:ident($ty:tt) $(unknown(#[$unknown_meta:meta] $unknown_doc:ident))* {
             // Each of the `Name = Val,` permitting documentation.
-            $($(#[$ident_attr:meta])* $tag:ident = $val:expr,)*
+            $($(#[$ident_attr:meta])* $tag:ident = $val:expr_2021,)*
         }
     } => {
         $( #[$enum_attr] )*
@@ -214,6 +214,9 @@ pub enum CompressionMethod(u16) unknown(
 
     // Self-assigned by libtiff
     ZSTD = 0xC350,
+    // exav: read for the viewer only (`with_viewer_codecs`).
+    ThunderScan = 32809,
+    LZMA = 34925,
 }
 }
 

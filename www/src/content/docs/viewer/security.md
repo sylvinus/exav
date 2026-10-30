@@ -41,7 +41,10 @@ const sandbox = { url: "https://viewer-frame.example-files.com/index.html" };
 ```
 
 The default UI (rails, pager, archive list, dialog) stays in the host page;
-what the engine draws is in the frame.
+what the engine draws is in the frame. A host that draws its own UI does the
+same from the session's controllers ([Core API](/viewer/api/#the-viewer-in-a-sandboxed-frame)):
+page fields, zoom, sheet tabs, a player's controls, thumbnails and printing
+all live in the page, and the frame holds the document alone.
 
 ### What makes it hold
 
@@ -55,9 +58,13 @@ These are properties of the browser, not of the viewer's code:
 - **No way out of the frame.** Without `allow-popups`,
   `allow-top-navigation`, `allow-downloads`, `allow-forms` or
   `allow-modals`, it cannot open a window, navigate the page, start a
-  download, submit a form or show a dialog. `allow=""` refuses it every
-  powerful feature (camera, microphone, location, clipboard, fullscreen,
-  payment...).
+  download, submit a form or show a dialog. `allow="autoplay"` and the
+  frame's `Permissions-Policy` refuse it every powerful feature (camera,
+  microphone, location, clipboard, fullscreen, payment...) but autoplay:
+  without it, a player started by the page's own controls would refuse to
+  play, as the click was in the page and not in the frame. What a
+  compromised frame gains from it is sound or video starting by itself,
+  once the user has interacted with the page.
 - **Its own policy.** The frame's page is served with this
   Content-Security-Policy:
 
@@ -94,17 +101,62 @@ be named) and carries nothing else. Everything else goes over the port:
 
 | From | Messages |
 |---|---|
-| host | `open` (the file as its delivery says, below; its name and type, the formats, the plugin options as plain data), `command` (go to a page, zoom, fit, a layer on or off, a layout, the ground, open or leave an archive member), `bytes` (the answer to a `read`) |
-| frame | `ready` (with its page's policy), `status`, `controllers` and `state` (each controller's value), `done` (a command finished), `link`, `read` and `cancel` (bytes of a file read by ranges) |
+| host | `open` (the file as its delivery says, below; its name and type, the paths of the files around it when it has a tree, the formats, the plugin options as plain data, the theme), `command` (go to a page, zoom, fit, a layer on or off, a layout, the ground, open or leave an archive member, a sheet, play, pause, seek, the volume), `bytes` (the answer to a `read` or a `fetch`), `theme` (the page's colours again), `replace` (the next document of the session, delivered as `open` delivers the first), `raster` and `unraster` (a page as a picture, with its size and region; stop drawing it), `watch` and `unwatch` (follow the viewport, whose upkeep costs: from a first listener or a read to the last one leaving) |
+| frame | `ready` (with its page's policy), `status`, `controllers` and `state` (each controller's value; the viewport's only while the host watches it), `done` (a command finished), `replaced` (a `replace` finished, or refused), `link`, `read` and `cancel` (bytes of a file read by ranges, the read naming the document it is for), `fetch` (a whole file of the tree the host listed, by its path), `key` (a key the document did not use), `rastered` (the picture asked for, with the region it shows, or why there is none) |
+
+The protocol is versioned: the frame says which in `ready` (`PROTOCOL`, now 5),
+and a host that does not speak it refuses the frame, so the page and the frame
+must come from the same release. Version 5 added `replace`, `raster`,
+`unraster`, `watch`, `unwatch` and the `viewport` controller, put the document
+in each `read`, and replaced `draw` and `drawn`. A `raster` the frame finds
+malformed is answered by a `rastered` that says `invalid`.
+
+A file shown with others around it (a drawing with the files its external
+references name, a split archive's parts) has a tree: the host lists the paths
+in `open`, and the frame asks for a file by one of them with `fetch`. The host
+answers only for a path it listed, spelled as it listed it, reads at most
+256 MiB for it and keeps eight reads and fetches outstanding at most; any other
+path, a file too large or a tree the file has none of is refused. A frame can
+know, then, only the names the user gave the page together with the file, and
+read no file the page did not hold.
+
+A `replace` puts the next document in the frame's session, so that the zoom
+and the scroll position stay (PDF, images). Only one is with the frame at a
+time: while it is, the next is read by the host and waits for the answer,
+and a newer call supersedes one still being read. Both documents' bytes stay
+readable by their own `generation` until the frame answers `replaced`; after
+it, a read of the old one is refused, so the frame can never be answered with
+the new file's bytes for the old document's read. The host sends a
+replacement only if the file's format is the one on screen and it is
+delivered the way the first was (an image shown from a URL stays one: its
+engine was made for it); otherwise `session.replace` resolves `false` and the
+caller mounts a new session.
 
 The host treats every message from the frame as hostile: each is checked
 against the protocol's shapes (`ts/frame/protocol.ts`), copied field by
 field, and dropped whole if any part does not match. Strings have length
-limits and lists item limits; a colour must be hex, `rgb()` or `hsl()` of
+limits and lists item limits; a colour must be hex or a colour function of
 numbers (a CSS value could otherwise be a `url()` the host would fetch);
-message keys are plain words. The default UI shows every string as text.
-A frame that loads a second document, having navigated itself away, is
-removed and its file reported unreadable.
+message keys are plain words; a player's numbers are within their ranges.
+The default UI shows every string as text. A frame that loads a second
+document, having navigated itself away, is removed and its file reported
+unreadable.
+
+A picture is an `ImageBitmap` of at most 16,384 pixels a side and 64 Mi
+pixels in all, transferred: pixels only, which the host draws, prints or
+encodes itself (the document's code never writes an image file or touches
+the host's canvases); anything else is no picture, one that is not the size
+asked for is a failure, and at most 8 are asked for at once. The options of a
+`raster` (size, region, layout, fit, line weight, background) are checked
+on both sides: numbers finite and bounded, a colour a hex value or a colour
+function, never a `url()`. A key is one of Escape, the arrows,
+Page Up and Down, Home and End, without Ctrl, Alt or Meta, at most 30 a
+second, and only those the host listed (`keys`); it reaches the page as a
+`keydown` dispatched on the `<iframe>`, `isTrusted` false. A frame could
+press those keys at will (move to the next file, close the viewer), never
+type or press a shortcut. The theme goes the other way, and the frame
+checks it too: known properties only, colours, lengths and font names, so
+that nothing in it is a URL.
 
 A link the user follows in a document (a PDF's links, Word, Excel and
 PowerPoint hyperlinks) becomes a `link` message. The host takes absolute `http:` and
@@ -191,7 +243,7 @@ Every file under the frame's directory gets these headers:
 | Header | Value |
 |---|---|
 | `Content-Security-Policy` | the policy above, then `; frame-ancestors https://app.example.com; sandbox allow-scripts` |
-| `Permissions-Policy` | every feature refused: `accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), gamepad=(), geolocation=(), gyroscope=(), hid=(), identity-credentials-get=(), idle-detection=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), otp-credentials=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), storage-access=(), usb=(), window-management=(), xr-spatial-tracking=()` |
+| `Permissions-Policy` | every feature refused but autoplay: `autoplay=*, accelerometer=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), gamepad=(), geolocation=(), gyroscope=(), hid=(), identity-credentials-get=(), idle-detection=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), otp-credentials=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), storage-access=(), usb=(), window-management=(), xr-spatial-tracking=()` |
 | `Referrer-Policy` | `no-referrer` |
 | `X-Content-Type-Options` | `nosniff` |
 | `Access-Control-Allow-Origin` | `*`: required, the opaque-origin frame and its workers fetch their own scripts and wasm in CORS mode |
@@ -201,7 +253,7 @@ Every file under the frame's directory gets these headers:
 frame stays sandboxed even when opened on its own) work only as headers. The
 frame's `index.html` carries the policy in a meta tag as well, for static
 hosts that set no headers (GitHub Pages): there, the iframe's `sandbox`
-attribute is what isolates it. `frameHeaders(frameAncestors, origin)` from
+attribute is what isolates it. `frameHeaders(frameAncestors, origin, origins)` from
 `@exav/viewer/frame` returns these headers, and the Vite plugin sets them
 in development and `vite preview`.
 
@@ -223,7 +275,7 @@ full list above):
 ```nginx
 location /exav-frame/ {
     add_header Content-Security-Policy "default-src 'none'; script-src 'self' https://viewer-frame.example-files.com 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self' https://viewer-frame.example-files.com; img-src 'self' https://viewer-frame.example-files.com blob: data:; font-src 'self' https://viewer-frame.example-files.com blob: data:; media-src blob:; style-src 'self' https://viewer-frame.example-files.com 'sha256-cNjvEN1YtFd5aB7iXA1oXslKUFoYbgxutdTl7pOEOTA='; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; require-trusted-types-for 'script'; trusted-types exav-worker default; frame-ancestors https://app.example.com; sandbox allow-scripts" always;
-    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=(), clipboard-write=(), fullscreen=()" always;
+    add_header Permissions-Policy "autoplay=*, camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=(), clipboard-write=(), fullscreen=()" always;
     add_header Referrer-Policy "no-referrer" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Access-Control-Allow-Origin "*" always;
@@ -238,7 +290,7 @@ Caddy:
 @frame path /exav-frame/*
 header @frame {
 	Content-Security-Policy "default-src 'none'; script-src 'self' https://viewer-frame.example-files.com 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self' https://viewer-frame.example-files.com; img-src 'self' https://viewer-frame.example-files.com blob: data:; font-src 'self' https://viewer-frame.example-files.com blob: data:; media-src blob:; style-src 'self' https://viewer-frame.example-files.com 'sha256-cNjvEN1YtFd5aB7iXA1oXslKUFoYbgxutdTl7pOEOTA='; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; require-trusted-types-for 'script'; trusted-types exav-worker default; frame-ancestors https://app.example.com; sandbox allow-scripts"
-	Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=(), clipboard-write=(), fullscreen=()"
+	Permissions-Policy "autoplay=*, camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=(), clipboard-write=(), fullscreen=()"
 	Referrer-Policy "no-referrer"
 	X-Content-Type-Options "nosniff"
 	Access-Control-Allow-Origin "*"
@@ -253,7 +305,8 @@ package is updated. The frame's files are named without hashes: serve them
 
 The host page needs `frame-src` (or `child-src`) to allow the frame's
 origin. In this mode it needs none of what the engines need: no
-`'wasm-unsafe-eval'`, no `worker-src blob:`, no `blob:` sources.
+`'wasm-unsafe-eval'`, no `worker-src blob:`, no `blob:` sources, no
+`'unsafe-inline'` styles; `img-src blob:` only to print (`printPictures`).
 
 ## Per browser
 
@@ -277,8 +330,8 @@ Playwright runs:
 | a frame that navigates away is dropped | tested | tested | tested |
 | every format opens | tested | tested, but WebGL formats (DWG, DXF, IFC, STL): no WebGL in the headless Firefox of the test machine | tested |
 
-Browsers implement `Permissions-Policy` unevenly; the iframe's `allow=""`
-refuses the same features from the host's side. In Firefox and WebKit, a
+Browsers implement `Permissions-Policy` unevenly; the iframe's
+`allow` attribute refuses the same features from the host's side. In Firefox and WebKit, a
 frame that tries a download navigates itself to the file instead: the
 host's `frame-src` refuses it, and the host drops the frame.
 
@@ -313,7 +366,7 @@ policy's SVG rule, and the reviewed sinks in the dependencies (below).
 
   | Module | May import | Memory |
   |---|---|---|
-  | exav_viewer_image, exav_viewer_dwg, exav_viewer_model, the two pdf.js decoders | wasm-bindgen's plumbing (errors, its tables): no global, clock, randomness or I/O | capped: 1 GiB, 2 GiB, 3 GiB, 1 GiB, 1 GiB |
+  | exav_viewer_image, exav_viewer_dwg, exav_viewer_model, exav_viewer_text, exav_viewer_sheets, exav_viewer_slides, exav_viewer_docs, the two pdf.js decoders | wasm-bindgen's plumbing (errors, its tables): no global, clock, randomness or I/O | capped: 1 GiB, 2 GiB, 3 GiB, 256 MiB, 2 GiB, 2 GiB, 2 GiB, 1 GiB, 1 GiB |
   | @exav/unpack-wasm | plumbing, `FileReaderSync` on the archive's `Blob`, a reader function the caller passes, arrays of members | 4 GiB |
   | @silurus/ooxml's three parsers | plumbing, and a panic's message to `console.error` | 4 GiB |
   | pdf.js's qcms | plumbing, a callback copying converted colours out | 4 GiB |
@@ -328,7 +381,10 @@ policy's SVG rule, and the reviewed sinks in the dependencies (below).
   once), 2 GiB for drawings (the largest real drawing measured, 14 MB with
   75 layouts, peaks at 1.2 GiB), 3 GiB for IFC and STL models (the file,
   its index and the meshes twice for the default 6 million triangles fit in
-  1.5), 1 GiB for each image pdf.js hands its
+  1.5), 256 MiB for Markdown (a 2 MiB file, a tree of at most 100,000
+  nodes), 2 GiB for each Office converter (the file, and the document and
+  the package written, which the converter counts against its own limit of
+  1 GiB by default), 1 GiB for each image pdf.js hands its
   decoders. A test decodes a picture whose RGBA copy needs more than its
   module's cap, and expects the trap and a fresh instance to work.
 - **The policies, in the browser**: the demo's browser tests run each
@@ -346,6 +402,13 @@ policy's SVG rule, and the reviewed sinks in the dependencies (below).
   others) inside its frame. Timeouts stop exav's decoders; the frame is
   removed when the user moves on. In Chromium a cross-site frame has a
   process of its own; a same-site one may share the host's.
+- **An external converter.** It is code the host chooses and installs, and it
+  reads the hostile file with whatever engine it carries. In the sandboxed
+  mode it runs in the frame, under the frame's policy like every engine; in
+  the page, it has the page's rights. Its memory is the browser's: the
+  `maxMemory` it is handed is a request it has to honour, and the viewer stops
+  waiting after `timeoutMs`. The package's own converters (spreadsheets,
+  presentations, drawings, text documents) need none.
 - **Misleading content.** A document draws what it likes in its frame,
   including what looks like the host's own UI or a message telling the user
   to visit an address. It cannot submit a form, open a window or send

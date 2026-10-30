@@ -6,7 +6,7 @@
 //! tree of an ISO image, and the typing of a top-level input too large to
 //! buffer.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 use std::io::{Cursor, Read};
 #[cfg(feature = "all-formats")]
 use {exav_core::scan_seekable, std::io::Write};

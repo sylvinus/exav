@@ -20,7 +20,7 @@ pub(crate) use entry::walk;
 
 #[cfg(test)]
 mod tests {
-    use crate::{detect, extract, Budget, Format, Limits};
+    use crate::{Budget, Format, Limits, detect, extract};
     use std::collections::HashMap;
     use std::fs;
 
@@ -213,9 +213,10 @@ mod tests {
         let data = fixture("aes_stored.7z");
         // Correct password → recovered.
         let ok = extract_entries_pw(&data, &["hunter2"]);
-        assert!(ok
-            .values()
-            .any(|v| v.windows(16).any(|w| w == b"EICAR-7Z-AES-MAR")));
+        assert!(
+            ok.values()
+                .any(|v| v.windows(16).any(|w| w == b"EICAR-7Z-AES-MAR"))
+        );
         // Wrong password → no plaintext member; reported unsupported instead.
         let mut budget = Budget::with_passwords(Limits::default(), vec!["wrongpw".into()]);
         let entries = extract(Format::SevenZip, &data, &mut budget).expect("no error");
@@ -225,9 +226,11 @@ mod tests {
                 .all(|e| e.unsupported.is_some() || !e.data.windows(5).any(|w| w == b"EICAR")),
             "wrong password must not surface plaintext"
         );
-        assert!(entries
-            .iter()
-            .any(|e| e.encrypted && e.unsupported.is_some()));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.encrypted && e.unsupported.is_some())
+        );
     }
 
     /// A solid multi-file AES block decrypts all members with one password.
@@ -266,15 +269,38 @@ mod tests {
         }
     }
 
+    /// 40 folders (7-Zip gives the folders of an archive one key), each with a
+    /// CRC that no password satisfies, tried with five passwords at 2^19 rounds:
+    /// the keys are derived once each, not once for each folder (200 times, 2 s
+    /// in a release build; and 2000 folders took 20 s, 30 at 2^24 took 9 s). Every
+    /// member is still reported encrypted.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn a_scan_derives_the_key_of_a_password_once_for_all_the_folders() {
+        let data = fixture("aes_40_folders_2p19.7z");
+        let words = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let mut budget = Budget::with_passwords(Limits::default(), words);
+        let entries = extract(Format::SevenZip, &data, &mut budget).unwrap();
+        assert_eq!(entries.len(), 40);
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.encrypted && e.unsupported.is_some())
+        );
+        assert_eq!(budget.kdf.sevenz_spent(), 5 << 19);
+    }
+
     /// Without a password an AES archive is still reported encrypted/unsupported.
     #[test]
     fn aes_without_password_unsupported() {
         let data = fixture("aes_lzma2.7z");
         let mut budget = Budget::new(Limits::default());
         let entries = extract(Format::SevenZip, &data, &mut budget).expect("no error");
-        assert!(entries
-            .iter()
-            .any(|e| e.encrypted && e.unsupported.is_some()));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.encrypted && e.unsupported.is_some())
+        );
     }
 
     /// Fuzz regressions: crafted 7z headers with absurd stream/file counts must
@@ -386,5 +412,186 @@ mod tests {
             assert_eq!(entries.len(), 1, "{filter:?}");
             assert!(entries[0].data == payload, "{filter:?} altered the member");
         }
+    }
+
+    /// Every member `walk` hands over, a streamed one read to its end, and how
+    /// the walk ended.
+    type Walked = (Vec<(String, Vec<u8>, Option<&'static str>)>, bool);
+
+    fn walked_from(
+        src: &dyn crate::source::ByteSource,
+        mut budget: Budget,
+    ) -> (Walked, Result<(), crate::LimitHit>) {
+        use crate::Member;
+        let mut out = Vec::new();
+        let end = crate::walk(
+            Format::SevenZip,
+            src,
+            &mut budget,
+            &mut |meta, content, _| {
+                let data = match content {
+                    None => Vec::new(),
+                    Some(Member::Bytes(b)) => b,
+                    Some(Member::Stream(r)) => {
+                        let mut b = Vec::new();
+                        let _ = r.read_to_end(&mut b);
+                        b
+                    }
+                };
+                out.push((meta.name.clone(), data, meta.unsupported));
+                None::<()>
+            },
+        );
+        ((out, end.is_ok()), end.map(|_| ()))
+    }
+
+    fn cache_of(blob: &[u8]) -> crate::source::BlockCache<std::io::Cursor<Vec<u8>>> {
+        // Blocks and a capacity far under the archive, so it is never in memory.
+        crate::source::BlockCache::with_sizes(std::io::Cursor::new(blob.to_vec()), 64, 4 * 64)
+            .unwrap()
+    }
+
+    /// An archive on a source that is not in memory gives the members it gives
+    /// when it is, under a buffer limit far under the archive.
+    #[test]
+    fn an_archive_on_a_source_that_is_not_in_memory_gives_the_same_members() {
+        for name in [
+            "lzma2.7z",
+            "lzma.7z",
+            "bzip2.7z",
+            "deflate.7z",
+            "copy.7z",
+            "ppmd.7z",
+            "lzma2_solid.7z",
+            "lzma2_nonsolid.7z",
+            "bcj_lzma.7z",
+            "delta_lzma.7z",
+            "ppmd_plain_header.7z",
+            "many_entries.7z",
+        ] {
+            let blob = fixture(name);
+            let (held, _) = walked_from(&blob.as_slice(), Budget::new(Limits::default()));
+            // PPMd holds its model, which is 64 KiB at the least.
+            let limits = Limits {
+                max_buffer_bytes: if name.starts_with("ppmd") {
+                    1 << 20
+                } else {
+                    1000
+                },
+                ..Limits::default()
+            };
+            let (cached, end) = walked_from(&cache_of(&blob), Budget::new(limits));
+            end.unwrap_or_else(|h| panic!("{name}: {h:?}"));
+            assert_eq!(held.0, cached.0, "{name}");
+            assert!(!held.0.is_empty(), "{name}");
+        }
+    }
+
+    /// A solid folder of three files, stored, so that the third starts 6000
+    /// bytes into it.
+    fn solid_of_three() -> (Vec<u8>, Vec<Vec<u8>>) {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderMethod, SourceReader};
+        use std::io::Cursor;
+        let files: Vec<Vec<u8>> = vec![
+            (0..3000u32).map(|i| (i * 7 % 251) as u8).collect(),
+            (0..3000u32).map(|i| (i * 13 % 241) as u8).collect(),
+            b"the tail".to_vec(),
+        ];
+        let mut sink = Cursor::new(Vec::new());
+        {
+            let mut w = ArchiveWriter::new(&mut sink).unwrap();
+            w.set_content_methods(vec![EncoderMethod::COPY.into()]);
+            let entries = ["a", "b", "c"]
+                .iter()
+                .map(|n| ArchiveEntry::new_file(n))
+                .collect();
+            let readers = files
+                .iter()
+                .map(|f| SourceReader::new(Cursor::new(f.clone())))
+                .collect();
+            w.push_archive_entries(entries, readers).unwrap();
+            w.finish().unwrap();
+        }
+        (sink.into_inner(), files)
+    }
+
+    /// A member far into a solid folder is read, not reported: it starts past
+    /// the buffer limit, which a folder streamed through is not held under.
+    #[test]
+    fn a_member_far_into_a_solid_folder_is_read_not_reported() {
+        let (blob, files) = solid_of_three();
+        let limits = Limits {
+            max_buffer_bytes: 1000,
+            ..Limits::default()
+        };
+        let ((got, _), end) = walked_from(&cache_of(&blob), Budget::new(limits));
+        end.unwrap();
+        let want: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .zip(&files)
+            .map(|(n, f)| (n.to_string(), f.clone(), None))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// The members before the one wanted are decoded and dropped, which counts
+    /// against the scan budget: a folder that declares more than it allows is
+    /// not decoded to reach a member.
+    #[test]
+    fn what_is_skipped_to_reach_a_member_counts_against_the_scan_budget() {
+        let (blob, _) = solid_of_three();
+        // A visitor that reads no member, so that reaching the third skips the
+        // 6000 bytes of the two before it.
+        let reached = |scanned: u64| {
+            let mut budget = Budget::new(Limits {
+                max_scanned_bytes: scanned,
+                ..Limits::default()
+            });
+            let mut names = Vec::new();
+            let end = crate::walk(
+                Format::SevenZip,
+                &blob.as_slice(),
+                &mut budget,
+                &mut |meta, _, _| {
+                    names.push(meta.name.clone());
+                    None::<()>
+                },
+            );
+            (names, end)
+        };
+        let (names, end) = reached(1 << 20);
+        end.unwrap();
+        assert_eq!(names, ["a", "b", "c"]);
+        let (names, end) = reached(5000);
+        assert_eq!(names, ["a", "b"], "c is not reached");
+        assert!(end.is_err_and(|h| !h.is_corrupt()));
+    }
+
+    /// A folder decoded whole, as an encrypted one is, is held under the buffer
+    /// limit, read from where it is in the source.
+    #[cfg(feature = "decrypt")]
+    #[test]
+    fn an_encrypted_folder_is_held_under_the_buffer_limit_and_read_from_the_source() {
+        let blob = fixture("aes_stored.7z");
+        let limits = Limits {
+            max_buffer_bytes: 4096,
+            ..Limits::default()
+        };
+        let budget = Budget::with_passwords(limits, vec!["hunter2".into()]);
+        let ((got, _), end) = walked_from(&cache_of(&blob), budget);
+        end.unwrap();
+        assert!(
+            got.iter()
+                .any(|(_, d, _)| d.windows(16).any(|w| w == b"EICAR-7Z-AES-MAR"))
+        );
+        // Under a limit the packed bytes do not fit, it is the limit.
+        let limits = Limits {
+            max_buffer_bytes: 32,
+            ..Limits::default()
+        };
+        let budget = Budget::with_passwords(limits, vec!["hunter2".into()]);
+        let (_, end) = walked_from(&cache_of(&blob), budget);
+        let hit = end.unwrap_err();
+        assert!(!hit.is_corrupt(), "{}", hit.reason);
     }
 }

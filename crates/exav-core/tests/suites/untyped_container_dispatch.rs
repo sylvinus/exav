@@ -12,7 +12,7 @@
 //! appears nowhere in their bytes (asserted below), so a verdict of `Infected`
 //! can only come from the container actually being opened.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -45,6 +45,21 @@ fn assert_found(name: &str) {
 fn a_unix_compress_stream_is_decompressed_and_scanned() {
     // Produced by ncompress 5.0 (`compress -c`), not by any encoder of ours.
     assert_found("eicar.txt.Z");
+}
+
+#[test]
+#[cfg(feature = "lzma")]
+fn an_lzma_alone_stream_is_decompressed_and_scanned() {
+    // `xz --format=lzma`: no magic number, found by the header's own rules.
+    assert_found("eicar.txt.lzma");
+}
+
+#[test]
+#[cfg(feature = "rpm")]
+fn an_rpm_payload_is_decompressed_and_scanned() {
+    // A package whose gzip cpio payload holds the EICAR file (`make.py` in
+    // exav-unpack's rpm fixtures).
+    assert_found("eicar.rpm");
 }
 
 #[test]

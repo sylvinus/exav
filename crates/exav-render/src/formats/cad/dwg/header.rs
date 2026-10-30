@@ -250,7 +250,7 @@ fn variables(s: &mut HeaderStreams<'_>, v: Version, vars: &mut Vars) -> BitResul
     // TDINDWG, TDUSRTIMER
     skip_bl(s, 4)?;
     cmc(s, v)?; // CECOLOR
-                // HANDSEED is in the data stream, also from R2007.
+    // HANDSEED is in the data stream, also from R2007.
     hd.handle_seed = Handle(s.data.h()?.value);
     vars.clayer = h(s)?;
     vars.textstyle = h(s)?;
@@ -308,7 +308,7 @@ fn variables(s: &mut HeaderStreams<'_>, v: Version, vars: &mut Vars) -> BitResul
             s.data.rc()?;
         }
         s.data.b()?; // DIMUPT
-                     // DIMTZIN, DIMALTZ, DIMALTTZ, DIMTAD
+        // DIMTZIN, DIMALTZ, DIMALTTZ, DIMTAD
         for _ in 0..4 {
             s.data.rc()?;
         }
@@ -349,7 +349,7 @@ fn variables(s: &mut HeaderStreams<'_>, v: Version, vars: &mut Vars) -> BitResul
         s.data.bd()?; // DIMALTRND
         s.data.b()?; // DIMALT
         s.data.bs()?; // DIMALTD
-                      // DIMTOFL, DIMSAH, DIMTIX, DIMSOXD
+        // DIMTOFL, DIMSAH, DIMTIX, DIMSOXD
         skip_b(s, 4)?;
     }
     // DIMCLRD, DIMCLRE, DIMCLRT
@@ -361,7 +361,7 @@ fn variables(s: &mut HeaderStreams<'_>, v: Version, vars: &mut Vars) -> BitResul
         // DIMLUNIT, DIMDSEP, DIMTMOVE, DIMJUST
         skip_bs(s, 11)?;
         skip_b(s, 2)?; // DIMSD1, DIMSD2
-                       // DIMTOLJ, DIMTZIN, DIMALTZ, DIMALTTZ
+        // DIMTOLJ, DIMTZIN, DIMALTZ, DIMALTTZ
         skip_bs(s, 4)?;
         s.data.b()?; // DIMUPT
         s.data.bs()?; // DIMATFIT
@@ -438,8 +438,11 @@ fn variables(s: &mut HeaderStreams<'_>, v: Version, vars: &mut Vars) -> BitResul
     }
     if r2004 {
         // SORTENTS, INDEXCTL, HIDETEXT, XCLIPFRAME, DIMASSOC, HALOGAP
-        for _ in 0..6 {
-            s.data.rc()?;
+        for i in 0..6 {
+            let x = s.data.rc()?;
+            if i == 3 {
+                vars.header.xclipframe = i16::from(x);
+            }
         }
         // OBSCUREDCOLOR, INTERSECTIONCOLOR
         skip_bs(s, 2)?;

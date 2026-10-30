@@ -614,8 +614,8 @@ pub(super) fn pick_anchor(
     let mut best_fixed: Option<(isize, usize, Prefix)> = None;
     let mut best_any: Option<(isize, usize, usize)> = None; // (score, len, idx)
     for (i, e) in elems.iter().enumerate() {
-        if let Elem::Bytes(b) = e {
-            if b.len() >= MIN_ANCHOR {
+        if let Elem::Bytes(b) = e
+            && b.len() >= MIN_ANCHOR {
                 let score = anchor_score(b, stats);
                 let better = |cur: &Option<(isize, usize, Prefix)>| match cur {
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
@@ -625,11 +625,9 @@ pub(super) fn pick_anchor(
                 // no fixed-prefix one, instead of one at a wrapped distance.
                 if let (true, Ok(len), Ok(anchor_idx)) =
                     (in_fixed_prefix, u32::try_from(fixed), u32::try_from(i))
-                {
-                    if better(&best_fixed) {
+                    && better(&best_fixed) {
                         best_fixed = Some((score, b.len(), Prefix::Fixed { anchor_idx, len }));
                     }
-                }
                 let any_better = match &best_any {
                     Some((s, l, _)) => score > *s || (score == *s && b.len() > *l),
                     None => true,
@@ -638,15 +636,14 @@ pub(super) fn pick_anchor(
                     best_any = Some((score, b.len(), i));
                 }
             }
-        }
         match e.width() {
             Some(w) => fixed = fixed.saturating_add(w),
             None => in_fixed_prefix = false, // past the first variable element
         }
     }
     // Prefer an internal anchor only when it beats the fixed-prefix one.
-    if allow_internal {
-        if let Some((any_score, _, idx)) = best_any {
+    if allow_internal
+        && let Some((any_score, _, idx)) = best_any {
             // No fixed-prefix candidate at all must lose to every real one:
             // scores are signed, so a `0` floor here would reject a merely
             // common internal anchor and leave the body with no anchor — i.e.
@@ -663,18 +660,15 @@ pub(super) fn pick_anchor(
                 }
             }
         }
-    }
     if let Some((.., p)) = best_fixed {
         return Some(p);
     }
     // Floating: a single leading variable gap, then a usable literal.
-    if matches!(elems.first(), Some(Elem::Gap { .. })) {
-        if let Some(Elem::Bytes(b)) = elems.get(1) {
-            if b.len() >= MIN_ANCHOR {
+    if matches!(elems.first(), Some(Elem::Gap { .. }))
+        && let Some(Elem::Bytes(b)) = elems.get(1)
+            && b.len() >= MIN_ANCHOR {
                 return Some(Prefix::Floating { anchor_idx: 1 });
             }
-        }
-    }
     None
 }
 
@@ -881,14 +875,13 @@ fn digits_or_empty(s: &str) -> Option<u64> {
 
 pub(super) fn parse_tdb_engine(tdb: &str) -> (u32, u32) {
     for field in tdb.split(',') {
-        if let Some(v) = field.trim().strip_prefix("Engine:") {
-            if let Some((a, b)) = v.trim().split_once('-') {
+        if let Some(v) = field.trim().strip_prefix("Engine:")
+            && let Some((a, b)) = v.trim().split_once('-') {
                 return (
                     a.trim().parse().unwrap_or(0),
                     b.trim().parse().unwrap_or(u32::MAX),
                 );
             }
-        }
     }
     (0, u32::MAX)
 }

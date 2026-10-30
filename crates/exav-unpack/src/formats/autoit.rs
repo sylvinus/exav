@@ -672,7 +672,7 @@ mod tests {
         d.extend_from_slice(MARKER_EA05);
         d.extend_from_slice(&[0u8; 16]); // checksum region
         d.extend_from_slice(&mt_apply(b"FILE", KEY_FILE_TAG)); // tag
-                                                               // subtype string
+        // subtype string
         d.extend_from_slice(&((subtype.len() as u32) ^ KEY_SUBTYPE_LEN).to_le_bytes());
         d.extend_from_slice(&mt_apply(
             subtype,
@@ -979,8 +979,10 @@ mod tests {
             let _ = extract(Format::Autoit, &&full[..cut.min(full.len())], &mut budget).unwrap();
         }
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Autoit, b"not autoit", &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Autoit, b"not autoit", &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

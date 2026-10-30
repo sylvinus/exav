@@ -15,7 +15,7 @@
 //! `analyze` calls the bytes anything but clean, and is not when it calls them
 //! clean (`crates/exav/src/icap/mod.rs`, the verdict table).
 use arbitrary::Arbitrary;
-use exav_core::{analyze, ScanOptions, VerdictCategory};
+use exav_core::{ScanOptions, VerdictCategory, analyze};
 use libfuzzer_sys::fuzz_target;
 
 #[path = "../db.rs"]
@@ -114,7 +114,10 @@ impl Body {
             && !self.ieof
             && self.trailer.is_empty()
             && matches!(self.eol, Eol::Crlf)
-            && self.chunks.iter().all(|c| c.lie == 0 && c.extension.is_none());
+            && self
+                .chunks
+                .iter()
+                .all(|c| c.lie == 0 && c.extension.is_none());
         plain.then(|| {
             self.chunks
                 .iter()
@@ -177,7 +180,10 @@ impl Request {
             Offsets::Raw(s) => s.clone(),
         };
 
-        out.extend_from_slice(format!("{method} icap://127.0.0.1/{service} ICAP/1.0\r\nHost: 127.0.0.1\r\n").as_bytes());
+        out.extend_from_slice(
+            format!("{method} icap://127.0.0.1/{service} ICAP/1.0\r\nHost: 127.0.0.1\r\n")
+                .as_bytes(),
+        );
         if self.allow_204 {
             out.extend_from_slice(b"Allow: 204\r\n");
         }
@@ -236,14 +242,21 @@ fuzz_target!(|data: &[u8]| {
     let opts = options();
     let out = exav_cli::fuzzing::icap(&input, db::shared(), &opts);
 
-    if let [only] = requests.as_slice() {
-        if let Some(body) = only.plain_body() {
-            if body.is_empty() {
-                return;
-            }
-            let blocked = analyze(db::scanner(), &body, &opts).verdict.category() != VerdictCategory::Clean;
-            let said = String::from_utf8_lossy(&out).contains("X-Infection-Found:");
-            assert_eq!(said, blocked, "ICAP said {:?} of bytes analyze judges {:?}", String::from_utf8_lossy(&out), blocked);
+    if let [only] = requests.as_slice()
+        && let Some(body) = only.plain_body()
+    {
+        if body.is_empty() {
+            return;
         }
+        let blocked =
+            analyze(db::scanner(), &body, &opts).verdict.category() != VerdictCategory::Clean;
+        let said = String::from_utf8_lossy(&out).contains("X-Infection-Found:");
+        assert_eq!(
+            said,
+            blocked,
+            "ICAP said {:?} of bytes analyze judges {:?}",
+            String::from_utf8_lossy(&out),
+            blocked
+        );
     }
 });

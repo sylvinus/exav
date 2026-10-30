@@ -56,9 +56,8 @@ See [Signatures](/scanner/guides/signatures/) for the former.
 
 </Steps>
 
-Build the database daily on a capable host or in CI, distribute the file, and
-have every CLI and daemon instance load it. Constrained hosts never pay the build
-peak.
+Build daily on a capable host or in CI and have every CLI and daemon instance
+load the file, so constrained hosts never pay the build peak.
 
 ## Rebuild after an exav upgrade
 
@@ -70,12 +69,12 @@ half-understood:
 exav: loading database old.exavdb: unsupported database version 3 (this build expects 4)
 ```
 
-Rebuild after an upgrade whose changelog mentions a new format version. Nothing
-is lost: the sources are the `.cvd`/`.cld` files `freshclam` or `cvdupdate`
-already fetched. If you ship a prebuilt database to other hosts, upgrade the builder and
-the scanners together: a download is checked for integrity, not for its format
+Rebuild after an upgrade whose changelog mentions a new format version; the
+sources are the `.cvd`/`.cld` files `freshclam` or `cvdupdate` already fetched.
+If you ship a prebuilt database to other hosts, upgrade the builder and the
+scanners together: a download is checked for integrity, not for its format
 version, so a scanner offered a newer format keeps the database it has on a
-reload, and fails to start from scratch.
+reload and fails to start from scratch.
 
 <Aside type="caution">
 The database is a trusted artifact: build and fetch it over a channel you trust.

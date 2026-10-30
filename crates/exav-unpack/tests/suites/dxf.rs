@@ -11,7 +11,7 @@
 
 use std::io::{Read, Write};
 
-use exav_unpack::{detect, extract, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, detect, extract};
 
 fn members(data: &[u8]) -> Vec<Entry> {
     let mut budget = Budget::new(Limits::default());

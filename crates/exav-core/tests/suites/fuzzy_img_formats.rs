@@ -10,7 +10,7 @@
 //! the same segments reordered. The hashes are what `sigtool --fuzzy-img`
 //! (ClamAV 1.4.3) prints for the two PNGs.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = format!(

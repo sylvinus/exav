@@ -1,6 +1,6 @@
 {
   "name": "@exav/unpack-wasm",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "description": "WebAssembly bindings for exav-unpack: in-browser, memory-safe universal archive extraction. Supports zip, rar, 7z, tar, gz, bz2, xz, cab, arj, lha, iso, cpio, ar, xar, ole, pdf, email, UPX.",
   "license": "MIT",
@@ -62,8 +62,8 @@
   },
   "homepage": "https://exav.org/unpack/wasm/",
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
+    "@playwright/test": "^1.64.1",
     "serve": "^14.2.6",
-    "vitest": "^4.1.9"
+    "vitest": "^5.0.5"
   }
 }

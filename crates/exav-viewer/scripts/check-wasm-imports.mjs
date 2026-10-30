@@ -24,7 +24,16 @@ export const LISTS = {
   // This package's: pure computation on the bytes handed in.
   exav_viewer_image_bg: { imports: BINDGEN, why: "exav-render's image decoders" },
   exav_viewer_dwg_bg: { imports: BINDGEN, why: "exav-render's DWG and DXF engine" },
-  exav_viewer_model_bg: { imports: BINDGEN, why: "exav-render's IFC and STL meshes" },
+  // `parseGltfWith` takes the names of a glTF's buffer files as an array of
+  // strings: wasm-bindgen reads each and drops the reference it made.
+  exav_viewer_model_bg: {
+    imports: [...BINDGEN, "glue.__wbg___wbindgen_string_get", "glue.__wbindgen_object_drop_ref"],
+    why: "exav-render's IFC, STL and glTF meshes",
+  },
+  exav_viewer_text_bg: { imports: BINDGEN, why: "exav-render's Markdown reader" },
+  exav_viewer_sheets_bg: { imports: BINDGEN, why: "exav-render's XLS, ODS and Numbers converter" },
+  exav_viewer_slides_bg: { imports: BINDGEN, why: "exav-render's PPT, ODP, Keynote and ODG converter" },
+  exav_viewer_docs_bg: { imports: BINDGEN, why: "exav-render's DOC, ODT and RTF converter" },
   exav_viewer_pdf_jpx_bg: { imports: BINDGEN, why: "the JPEG 2000 decoder given to pdf.js" },
   exav_viewer_pdf_jbig2_bg: { imports: BINDGEN, why: "the JBIG2 and CCITT decoder given to pdf.js" },
   exav_unpack_wasm_bg: {
@@ -74,6 +83,10 @@ export const MEMORY_CAPS = {
   exav_viewer_image_bg: 16384,
   exav_viewer_dwg_bg: 32768,
   exav_viewer_model_bg: 49152,
+  exav_viewer_text_bg: 4096,
+  exav_viewer_sheets_bg: 32768,
+  exav_viewer_slides_bg: 32768,
+  exav_viewer_docs_bg: 32768,
   exav_viewer_pdf_jpx_bg: 16384,
   exav_viewer_pdf_jbig2_bg: 16384,
 };

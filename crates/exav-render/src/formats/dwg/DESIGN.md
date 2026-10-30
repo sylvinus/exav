@@ -71,11 +71,26 @@ entities.
 | Fills | Hatch, Solid, Face3D, gradients | triangles: colour, layer id |
 | Glyphs | Text, MText, Attribute in an outline face | instanced quads into a Canvas-built atlas |
 
-Curves are flattened at a tolerance chosen from the drawing's extents. Both
+Circles, arcs and bulged polyline segments are strokes too, when nothing
+dashes them and the transform keeps circles round: each carries a bulge, at
+most a quarter turn's, and the fragment shader measures the distance to the
+arc itself, so a curve is exact at any zoom. Other curves (ellipses,
+splines, dashed arcs, arcs in a block scaled unevenly) are flattened at a
+fixed sagitta of a thousandth of their radius, and an arc crossing a clip
+boundary is cut as its flattened pieces. Both
 the stroke and fill buffers are sorted into spatial buckets recording the true
-box of their contents, so a view draws only the buckets it touches. Buckets
-are built within the opaque and the translucent halves, which are two passes
-(only the first writes depth).
+box of their contents, so a view draws only the buckets it touches. Only the
+opaque half is bucketed. The translucent half follows it in draw order, cut
+into tiles of consecutive entities, and is drawn after all opaque geometry,
+fills and strokes interleaved by draw order (`translucent_runs`). Both passes
+write depth, so an entity's overlaps with itself blend once. Text under
+translucent geometry is drawn in two parts: the glyphs' solid cores before
+the translucent pass, their edges after it.
+
+The context has no multisampling: strokes measure their own coverage. An
+opaque fill of one colour is outlined by strokes of no width (`FILL_EDGE`),
+whose fringe is the coverage of the pixels just outside it; drawn at the
+fill's depth, they are hidden wherever the fill is.
 
 ### 3.3 Layer show and hide without re-uploading
 
@@ -125,19 +140,28 @@ it into the view matrix.
 |---|---|
 | Lines, arcs, circles, ellipses, polylines, splines | Drawn |
 | Blocks and inserts, nested, scaled, rotated, MINSERT arrays | Drawn, with a cycle guard |
-| Dimensions | Drawn from the anonymous block AutoCAD bakes |
+| Dimensions | Drawn from the anonymous block AutoCAD bakes; one saved without it from its definition points and style (`dimension.rs`: no DIMTIH, feet and inches, tolerances or alternate units) |
 | MLINE, HELIX | Drawn |
 | Layers: colour, on/off, freeze, transparency | From the file |
 | Lineweight | Instanced quads, zoom-aware |
 | Solid and gradient hatch, islands | Even-odd, holes bridged into the outer ring |
 | Pattern hatch | Line families clipped to the region, with dash phase |
 | Linetypes | Dashed in drawing units, phase carried along a polyline; LTSCALE, per-entity and block scale |
+| Complex linetypes | Their text; the shapes of ltypeshp.shx (AutoCAD's own TRACKS, ZIGZAG, FENCELINE1 and 2, BATTING), redrawn; other shape files' shapes left out |
 | Extrusion (OCS) | Arbitrary Axis Algorithm, for the entity types stored in object coordinates |
-| TrueType text | Bundled faces, glyph atlas |
+| TrueType text | Bundled faces, glyph atlas sized to the view; distance fields when the character set is too large for that size |
 | SHX text | Substituted, see 5.3 |
-| MTEXT formatting | Colour, height, font, the three rules, indents and tabs kept; stacked fractions as `a/b` |
+| MTEXT formatting | Colour, height, font, width factor, oblique, tracking, the three rules, indents, tabs, justification, stacks, background masks and frames |
+| Text placement | Mirrored and stretched with its block, TEXT's backward and upside-down flags, Bottom and Middle on the face's descender |
+| Symbol fonts | symbol.ttf, greeks/greekc.shx and gdt.shx as the characters they draw |
+| Characters the stroke font lacks (CJK) | The run drawn in the outline face, completed from the browser's fonts |
 | Paper-space layouts and viewports | Drawn |
-| External references, images, OLE | Frame only; counted in the warnings |
+| External references, images, OLE | Xrefs: the drawing bound in when the caller has its file (`cad::xref`: its model space becomes the xref block's content, its layers, styles, linetypes and blocks named `XREF\|NAME` as AutoCAD names them in the host, its handles tagged so they do not meet the host's, nested references in turn to a depth of eight); else their path at the insertion point (on a layout, at most a hundredth of the paper high). Images, underlays, OLE: frame only (an image's is its crop). The ones not drawn are counted, with the files they name, in the warnings |
+| XCLIP | The block cut to its boundary, the frame as `$XCLIPFRAME` says |
+| Points | `$PDMODE` shapes, `$PDSIZE` (a share of the drawing's height when not in units) |
+| 3DFACE, polyface and polygon meshes, MESH | Their visible edges, in plan |
+| TOLERANCE | Feature control frame, GD&T symbols |
+| Leader arrowheads | The style's arrow block, else AutoCAD's built-in shape of that name |
 | Custom objects (proxy graphics) | Drawn from the graphics saved with them, see 5.4; those saved without are counted in the warnings |
 | Plot styles (CTB/STB) | Not planned |
 
@@ -161,7 +185,12 @@ extrusion vector, and an extrusion of (0, 0, -1) mirrors the X axis: a block
 at x = 16613 drawn at x = -16613. The transform is the Arbitrary Axis
 Algorithm, not a sign flip, and applies only to the entity types that are in
 OCS: LINE, POINT, SPLINE, ELLIPSE, 3DFACE and MLINE carry an extrusion vector
-but store world coordinates.
+but store world coordinates. An ELLIPSE's extrusion is the plane's normal: the
+minor axis is the normal crossed with the major, so a normal of -Z runs the
+parameter the other way and a tilted plane is squashed as seen from above. An
+MTEXT's is the normal of the plane the text lies in, its insertion point and
+X-axis direction being world coordinates: the text's own axes are the X
+direction and the normal crossed with it, and the plan view takes their XY.
 
 ### 5.3 SHX
 

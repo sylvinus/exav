@@ -4,7 +4,7 @@
 #
 # Build it the way the scanner does, from the repository root:
 #   docker build -f .oss-scanner/Dockerfile -t exav-oss-scanner .
-FROM rust:1.92-bookworm
+FROM rust:1.95-bookworm
 
 # Frame pointers and line tables for a debugger, without the full debug info
 # that makes the build several times larger.

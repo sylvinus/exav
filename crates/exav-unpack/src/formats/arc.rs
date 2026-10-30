@@ -240,12 +240,12 @@ fn lzw(src: &[u8], max_width: u32, cap: usize) -> Option<Vec<u8>> {
         }
         out.extend(stack.iter().rev());
 
-        if let Some(p) = prev {
-            if (next as usize) < table_cap {
-                prefix[next as usize] = p;
-                suffix[next as usize] = *stack.last()?;
-                next += 1;
-            }
+        if let Some(p) = prev
+            && (next as usize) < table_cap
+        {
+            prefix[next as usize] = p;
+            suffix[next as usize] = *stack.last()?;
+            next += 1;
         }
         prev = Some(code);
 

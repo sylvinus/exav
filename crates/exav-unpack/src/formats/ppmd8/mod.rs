@@ -12,8 +12,8 @@ mod model;
 
 use std::io::{self, Read};
 
-use crate::formats::ppmd7::{RarRangeDecoder, SYM_END};
 use crate::LimitHit;
+use crate::formats::ppmd7::{RarRangeDecoder, SYM_END};
 pub(crate) use model::Ppmd8;
 
 pub(crate) const PPMD8_MIN_ORDER: u32 = 2;
@@ -203,6 +203,10 @@ mod tests {
     /// The reference `ppmd-rust` PPMd8 encoder, restart method only: its
     /// cut-off path swaps a state with itself through `mem::swap`, which a
     /// debug build aborts on. Cut-off streams come from fixtures instead.
+    /// The smallest model the reference encoder takes: ppmd-rust 1.5.2 refuses
+    /// the 2048 bytes the format allows (and the port reads).
+    const REF_MIN_MEM: u32 = 2064;
+
     fn encode(data: &[u8], order: u32, mem: u32, end_marker: bool) -> Vec<u8> {
         let mut packed = Vec::new();
         let mut enc = ppmd_rust::Ppmd8Encoder::new(
@@ -329,7 +333,7 @@ mod tests {
 
     #[test]
     fn model_matches_reference_small() {
-        roundtrip(b"a", 2, 2048);
+        roundtrip(b"a", 2, REF_MIN_MEM);
         roundtrip(b"abcabcabcabc", 3, 4096);
         roundtrip(&[0u8; 1000], 6, 1 << 16);
         roundtrip(&(0..=255u8).collect::<Vec<_>>(), 16, 1 << 16);
@@ -362,7 +366,7 @@ mod tests {
             lcg_bytes(100 * 1024, 43, 20),
         ];
         for data in &inputs {
-            for (order, mem) in [(2, 2048), (6, 4096), (16, 16 * 1024), (8, 64 * 1024)] {
+            for (order, mem) in [(2, REF_MIN_MEM), (6, 4096), (16, 16 * 1024), (8, 64 * 1024)] {
                 roundtrip(data, order, mem);
                 let packed = encode(data, order, mem, false);
                 let (restarts, cut_offs, _) =

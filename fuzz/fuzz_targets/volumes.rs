@@ -15,7 +15,7 @@
 //! of what it joins neither panic nor overrun the budget.
 use exav_fuzz_support::frame;
 use exav_unpack::volume::{Collector, Offer};
-use exav_unpack::{extract, join_rar_volumes, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract, join_rar_volumes};
 use libfuzzer_sys::fuzz_target;
 
 const NAMES: &[&str] = &[
@@ -67,8 +67,15 @@ fuzz_target!(|data: &[u8]| {
     let finished = collector.finish();
     for j in &finished.joined {
         // The parts' names, and between them the joined bytes.
-        let parts: Vec<_> = offered.iter().filter(|(n, _)| j.parts.contains(n)).collect();
-        assert!(!parts.is_empty(), "a joined set names parts nobody offered: {:?}", j.parts);
+        let parts: Vec<_> = offered
+            .iter()
+            .filter(|(n, _)| j.parts.contains(n))
+            .collect();
+        assert!(
+            !parts.is_empty(),
+            "a joined set names parts nobody offered: {:?}",
+            j.parts
+        );
         out.extend(j.parts.iter().map(|p| {
             let len = offered.iter().find(|(n, _)| n == p).map_or(0, |(_, l)| *l);
             (p.clone(), len)
@@ -88,7 +95,10 @@ fuzz_target!(|data: &[u8]| {
     offered_set.dedup();
     let mut out_set = key(&out);
     out_set.dedup();
-    assert_eq!(out_set, offered_set, "what was offered is not what came out");
+    assert_eq!(
+        out_set, offered_set,
+        "what was offered is not what came out"
+    );
     let joined_bytes: usize = finished.joined.iter().map(|j| j.data.len()).sum();
     let parts_bytes: usize = finished
         .joined
@@ -96,7 +106,10 @@ fuzz_target!(|data: &[u8]| {
         .flat_map(|j| j.parts.iter())
         .map(|p| offered.iter().find(|(n, _)| n == p).map_or(0, |(_, l)| *l))
         .sum();
-    assert_eq!(joined_bytes, parts_bytes, "a joined set has other bytes than its parts");
+    assert_eq!(
+        joined_bytes, parts_bytes,
+        "a joined set has other bytes than its parts"
+    );
 
     // The RAR joiner: the files, in order, as the volumes of one set.
     let volumes: Vec<&[u8]> = f.files.iter().map(|(_, b)| *b).collect();

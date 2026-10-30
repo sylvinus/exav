@@ -156,7 +156,7 @@ mod tests {
         data.extend_from_slice(&0xCAFEBABEu32.to_be_bytes()); // magic
         data.extend_from_slice(&0u16.to_be_bytes()); // minor
         data.extend_from_slice(&52u16.to_be_bytes()); // major (Java 8)
-                                                      // constant_pool_count = slots + 1 (1-indexed, count is entries + 1).
+        // constant_pool_count = slots + 1 (1-indexed, count is entries + 1).
         data.extend_from_slice(&(pool_slots + 1).to_be_bytes());
         data.extend_from_slice(pool_bytes);
         data
@@ -213,7 +213,7 @@ mod tests {
         data.extend_from_slice(&0u16.to_be_bytes());
         data.extend_from_slice(&52u16.to_be_bytes());
         data.extend_from_slice(&1001u16.to_be_bytes()); // count => 1000 entries
-                                                        // One complete Utf8, then EOF mid-pool.
+        // One complete Utf8, then EOF mid-pool.
         push_utf8(&mut data, b"present");
         data.push(TAG_UTF8); // dangling tag, no length/body follows
 
@@ -221,10 +221,12 @@ mod tests {
         let entries = extract(Format::JavaClass, &data, &mut budget).unwrap();
         // At most the one fully-parsed string is surfaced; no panic.
         assert_eq!(entries.len(), 1);
-        assert!(entries[0]
-            .data
-            .windows(b"present".len())
-            .any(|w| w == b"present"));
+        assert!(
+            entries[0]
+                .data
+                .windows(b"present".len())
+                .any(|w| w == b"present")
+        );
     }
 
     #[test]

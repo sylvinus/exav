@@ -19,8 +19,8 @@
 // Each coder is dead in a build without the format that uses it.
 #![cfg_attr(not(all(feature = "rar", feature = "sevenz")), allow(dead_code))]
 
-use super::common::PPMD_BIN_SCALE;
 use super::RangeDec;
+use super::common::PPMD_BIN_SCALE;
 
 const K_TOP_VALUE: u32 = 1 << 24;
 

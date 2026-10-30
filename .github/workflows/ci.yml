@@ -24,13 +24,25 @@ jobs:
       # default build, so lint it in a dedicated pass.
       - run: cargo clippy -p exav-core --all-targets --features unstable-internals -- -D warnings
       - run: cargo clippy -p exav-render --all-targets --features dwg -- -D warnings
-      - run: cargo clippy -p exav-render --all-targets --no-default-features --features ifc,stl -- -D warnings
+      - run: cargo clippy -p exav --all-targets --no-default-features --features yara,zip -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features ifc,stl,obj,ply,gltf -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features markdown -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features text-pdf -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features office-sheets -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features office-slides -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features office-docs -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features office,office-test-util -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy -p exav-render --all-targets --no-default-features --features text-office,office-test-util -- -D warnings
+      - run: cargo clippy -p exav-core --all-targets --features visible-text-office -- -D warnings
+      - run: cargo clippy -p exav-grep --all-targets --features text-office -- -D warnings
+      - run: cargo clippy -p exav-unpack --all-targets --features text-pdf -- -D warnings
       # The full native test matrix, every feature pass. Defined once in the
       # Makefile so this and a local `make test` can't drift.
       - run: make test-native
 
-  # The promised floor is `rust-version` in Cargo.toml (1.92, imposed by the
-  # hayro image decoders). `make msrv` reads it there and installs that toolchain on
+  # The promised floor is `rust-version` in Cargo.toml (1.95, imposed by the
+  # delharc LHA reader). `make msrv` reads it there and installs that toolchain on
   # demand, so a bump flows through with no edit here, and a contributor on
   # stable can't land a newer feature without this going red.
   msrv:
@@ -127,7 +139,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: www/package-lock.json
       # exav.org is the authoritative answer on format coverage and CLI flags,
@@ -194,7 +206,7 @@ jobs:
           # the masked fixtures are unmasked.
           seeds="$RUNNER_TEMP/fuzz-seeds"
           scripts/fuzz-seeds.sh "$seeds"
-          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline seekable yara pcre clamd icap volumes authenticode database ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion imagehash drawing cad_dxf cad_dwg ifc; do
+          for t in filetype sigs cvd pe unpack analyze bytecode full_pipeline seekable yara pcre clamd icap volumes authenticode database ndb_compile rar3_ppmd pe_emulator x86_decode parser_recursion imagehash drawing cad_dxf cad_dwg ifc mesh; do
             mkdir -p "fuzz/corpus/$t"
             extra=""
             [ -d "$seeds/$t" ] && extra="$seeds/$t"

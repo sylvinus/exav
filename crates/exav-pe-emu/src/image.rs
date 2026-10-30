@@ -2,10 +2,17 @@
 //!
 //! Loading follows what the Windows loader does to the parts a stub can
 //! observe: headers at the image base, each section at its virtual address,
-//! zero-fill where the virtual size exceeds the raw size. Nothing else — no
-//! relocations (the emulator maps at the image's preferred base, so there are
-//! none to apply), no import binding (the stub resolves its own), no TLS
-//! callbacks.
+//! zero-fill where the virtual size exceeds the raw size. No relocations (the
+//! emulator maps at the image's preferred base, so there are none to apply) and
+//! no import binding here (the stub resolves its own, with a hand from
+//! [`crate::win::Env::bind_imports`]).
+//!
+//! The one piece of loader work this module parses but [`crate::run`] performs
+//! is the **TLS directory** (data directory 9): its callbacks run, with
+//! `DLL_PROCESS_ATTACH`, before the entry point, because a packer can put its
+//! unpacking there precisely so a tool that starts at the entry point sees
+//! nothing. [`PeImage::tls_dir`] is the directory's `(rva, size)`; the run
+//! driver reads the `IMAGE_TLS_DIRECTORY32` it points at.
 //!
 //! Dumping is the reverse, with one deliberate difference: the dump is written
 //! in **memory layout**, with `PointerToRawData == VirtualAddress` and the file
@@ -46,6 +53,10 @@ pub struct PeImage {
     /// functions its stub needs, and the *loader* — not the stub — fills those
     /// slots in. Emulating that binding is what lets the stub call them.
     pub import_dir: (u32, u32),
+    /// TLS directory (RVA, size), data directory 9. Zero when absent. The run
+    /// driver reads the `IMAGE_TLS_DIRECTORY32` here and runs its callbacks
+    /// before the entry point, as the Windows loader does.
+    pub tls_dir: (u32, u32),
     pub sections: Vec<Section>,
     /// Offset of the section table within the file, so the dump can patch it.
     sec_table_off: usize,
@@ -105,6 +116,15 @@ impl PeImage {
         } else {
             (0, 0)
         };
+        // Data directory 9 is the TLS directory, at opt + 96 + 9 * 8.
+        let tls_dir = if num_dirs >= 10 {
+            (
+                u32_at(data, opt + 168).unwrap_or(0),
+                u32_at(data, opt + 172).unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
 
         let mut sections = Vec::with_capacity(num_sections);
         for i in 0..num_sections {
@@ -140,6 +160,7 @@ impl PeImage {
             file_align,
             is_dll,
             import_dir,
+            tls_dir,
             sections,
             sec_table_off,
             pe_off,

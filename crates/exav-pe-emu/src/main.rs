@@ -18,7 +18,7 @@
 
 #![forbid(unsafe_code)]
 
-use exav_pe_emu::{unpack, EmuLimits};
+use exav_pe_emu::{EmuLimits, unpack};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -74,7 +74,7 @@ fn parse_args() -> Result<Opts, String> {
                     .map_err(|_| "--ticks needs a number")?
             }
             other if other.starts_with('-') && other.len() > 1 => {
-                return Err(format!("unknown option {other}"))
+                return Err(format!("unknown option {other}"));
             }
             other => o.files.push(other.into()),
         }
@@ -103,11 +103,11 @@ fn main() -> ExitCode {
             };
         }
     };
-    if let Some(dir) = &opts.dir {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("exav-pe-emu: {}: {e}", dir.display());
-            return ExitCode::from(2);
-        }
+    if let Some(dir) = &opts.dir
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("exav-pe-emu: {}: {e}", dir.display());
+        return ExitCode::from(2);
     }
 
     let limits = EmuLimits {

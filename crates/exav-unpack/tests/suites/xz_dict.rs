@@ -11,7 +11,7 @@
 //! does not fully understand is deliberate: a guessed dictionary size would
 //! either invent alerts on ordinary archives or miss the ones that matter.
 
-use exav_unpack::{xz_declared_dict_size, XZ_MAX_DICT};
+use exav_unpack::{XZ_MAX_DICT, xz_declared_dict_size};
 
 /// Build an XZ stream header plus one block header declaring an LZMA2 filter
 /// with dictionary-size property `prop`. The body is irrelevant — the whole

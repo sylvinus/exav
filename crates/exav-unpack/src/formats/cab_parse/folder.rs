@@ -15,6 +15,9 @@ pub(crate) struct FolderReader<'a, R: Read + Seek> {
     blocks_left: u16,
     out: Vec<u8>,
     out_pos: usize,
+    /// The error that ended the last block short, raised once what the block
+    /// did decode has been read.
+    pending: Option<io::Error>,
 }
 
 impl<'a, R: Read + Seek> FolderReader<'a, R> {
@@ -32,25 +35,40 @@ impl<'a, R: Read + Seek> FolderReader<'a, R> {
             blocks_left: num_data_blocks,
             out: Vec::new(),
             out_pos: 0,
+            pending: None,
         })
     }
 
     /// Decompress the next CFDATA block into `out`. Returns `false` at the last
-    /// block.
+    /// block. A block that fails, or that the file ends inside, leaves the
+    /// bytes it did decode in `out` and its error for the call after they are
+    /// read; nothing is decoded past it.
     fn refill(&mut self) -> io::Result<bool> {
+        if let Some(e) = self.pending.take() {
+            self.blocks_left = 0;
+            return Err(e);
+        }
         if self.blocks_left == 0 {
             return Ok(false);
         }
         let _checksum = self.reader.read_u32::<LittleEndian>()?;
         let compressed_size = self.reader.read_u16::<LittleEndian>()? as usize;
         let uncompressed_size = self.reader.read_u16::<LittleEndian>()? as usize;
-        let mut compressed = vec![0u8; compressed_size];
-        self.reader.read_exact(&mut compressed)?;
-        self.out = self
+        let mut compressed = Vec::new();
+        (&mut *self.reader)
+            .take(compressed_size as u64)
+            .read_to_end(&mut compressed)?;
+        let cut = compressed.len() < compressed_size;
+        let decoded = self
             .decompressor
-            .decompress(compressed, uncompressed_size)?;
+            .decompress(compressed, uncompressed_size, cut);
+        self.out = decoded.data;
         self.out_pos = 0;
         self.blocks_left -= 1;
+        // A cut block that decoded in full is only followed by the cut.
+        self.pending = decoded
+            .error
+            .or_else(|| cut.then(|| io::Error::new(io::ErrorKind::UnexpectedEof, "CAB block cut")));
         Ok(true)
     }
 }

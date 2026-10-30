@@ -12,7 +12,7 @@
 //! and the ContainsMacros heuristic still fires, while every macro-content
 //! signature quietly matches nothing.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use std::io::Write;
 
 /// An MS-OVBA CompressedContainer holding `payload` in one UNCOMPRESSED chunk.
@@ -280,4 +280,43 @@ fn an_ole10native_payload_with_a_counted_temp_path_is_carved() {
         .find(|e| e.name.contains("Ole10Native-payload"))
         .expect("the payload");
     assert_eq!(carved.data, PAYLOAD);
+}
+
+/// A payload the budget has no room for is a member that says so, where it was
+/// dropped without a word.
+#[test]
+fn an_ole10native_payload_over_the_budget_is_reported_not_dropped() {
+    let payload = vec![0x41u8; 4096];
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&0u32.to_le_bytes());
+    stream.extend_from_slice(&2u16.to_le_bytes());
+    stream.extend_from_slice(b"invoice.exe\0");
+    stream.extend_from_slice(b"C:\\Users\\x\\invoice.exe\0");
+    stream.extend_from_slice(b"C:\\Temp\\invoice.exe\0");
+    stream.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    stream.extend_from_slice(&payload);
+
+    let mut cf = cfb::CompoundFile::create(std::io::Cursor::new(Vec::<u8>::new())).unwrap();
+    cf.create_stream("/\u{1}Ole10Native")
+        .unwrap()
+        .write_all(&stream)
+        .unwrap();
+    cf.flush().unwrap();
+    let blob = cf.into_inner().into_inner();
+
+    // Room for the stream and not for the payload carved out of it.
+    let mut limits = Limits::default();
+    limits.max_extracted_bytes = stream.len() as u64 + 512;
+    let mut budget = Budget::new(limits);
+    let entries = extract(Format::Ole, &blob, &mut budget).expect("extract OLE");
+    let carved = entries
+        .iter()
+        .find(|e| e.name.contains("Ole10Native-payload"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the payload must be reported; got {:?}",
+                entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        });
+    assert!(carved.unsupported.is_some(), "{:?}", carved.unsupported);
 }

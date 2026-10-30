@@ -53,7 +53,9 @@ pub(crate) mod formats;
 #[allow(unused_imports)]
 use formats::*;
 
-mod bytes;
+/// The bounds-checked little-endian cursor of the record readers.
+pub mod bytes;
+// What a build uses of it depends on the formats with a password it has.
 #[cfg(any(
     feature = "gzip",
     feature = "zip",
@@ -68,14 +70,42 @@ mod bytes;
     feature = "xar",
     feature = "diskimage",
     feature = "upx",
-    feature = "dmg"
+    feature = "dmg",
+    feature = "squashfs",
+    feature = "cramfs"
 ))]
 mod inflate;
+// Each item is read by a different mix of the `decrypt`, `sevenz`, `dmg` and
+// `rar` features, so any build leaves some of them unused.
+/// HTML as tokens, and the bytes of a page as text: the one HTML reader of
+/// the scanner's text view and the converters. Feature `html`.
+#[cfg(feature = "html")]
+pub mod html;
+#[allow(dead_code)]
+mod kdf;
+#[cfg(all(test, any(feature = "dmg", feature = "ishieldz")))]
+mod oracle;
 pub mod profile;
 pub mod source;
 pub mod span;
 mod stream;
+/// The text a reader sees in HTML, Office and OpenDocument XML parts, and
+/// PDF. Feature `text`.
+#[cfg(feature = "text")]
+pub mod text;
 pub mod volume;
+/// What BIFF (Excel up to 2003) shares: the built-in function table that
+/// formula tokens name by number. Feature `ole`.
+#[cfg(feature = "ole")]
+pub use formats::biff;
+/// OLE2 compound files: the one reader of Word, Excel and PowerPoint 97 to
+/// 2003 files and the like, lenient and bounded. Feature `ole`.
+#[cfg(feature = "ole")]
+pub use formats::cfb;
+/// Text in a Windows code page number, as BIFF records and Office fonts name
+/// them. Feature `ole`.
+#[cfg(feature = "ole")]
+pub use formats::charset;
 /// AutoCAD DWG's bit codes, sections and object records, for drawing
 /// readers. Feature `dwg`.
 #[cfg(feature = "dwg")]
@@ -86,9 +116,17 @@ pub use formats::dwg;
 pub use formats::dxf;
 #[cfg(feature = "pdf")]
 pub use formats::has_obfuscated_name_object;
+/// Excel workbooks saved with a password (RC4, CryptoAPI, XOR), opened with
+/// the default password or those given. Feature `offcrypto`.
+#[cfg(feature = "offcrypto")]
+pub use formats::offcrypto;
+/// RTF's tokenizer, which the scanner's extractor of embedded objects and
+/// exav-render's converter both read with. Feature `rtf`.
+#[cfg(feature = "rtf")]
+pub use formats::rtf;
 #[allow(unused_imports)]
 pub(crate) use stream::Region;
-pub use stream::{is_budget_overflow, walk, Member, MemberMeta, Mtime, Visit};
+pub use stream::{Member, MemberMeta, Mtime, Visit, is_budget_overflow, walk};
 
 /// Count of overlapping ZIP local file records, the signal behind ClamAV's
 /// `Heuristics.Zip.OverlappingFiles`. Zero for any well-formed archive.
@@ -105,6 +143,17 @@ pub fn overlapping_local_records(_data: &dyn ByteSource) -> usize {
 #[cfg(feature = "zip")]
 pub use formats::zip::directory_is_consistent as zip_directory_is_consistent;
 
+/// Where a ZIP appended to another file begins, by its end record at the end of
+/// the file.
+#[cfg(feature = "zip")]
+pub use formats::zip::appended_start as appended_zip_start;
+
+/// Without the `zip` feature no ZIP is found.
+#[cfg(not(feature = "zip"))]
+pub fn appended_zip_start(_src: &dyn ByteSource) -> Option<u64> {
+    None
+}
+
 /// Without the `zip` feature no ZIP is ever confirmed.
 #[cfg(not(feature = "zip"))]
 pub fn zip_directory_is_consistent(_data: &[u8]) -> bool {
@@ -116,7 +165,7 @@ pub fn zip_directory_is_consistent(_data: &[u8]) -> bool {
 /// `Heuristics.XZ.DicSizeLimit`: memory a decoder must commit before producing
 /// a single byte.
 #[cfg(feature = "xz")]
-pub use formats::xz::{declared_dict_size as xz_declared_dict_size, XZ_MAX_DICT};
+pub use formats::xz::{XZ_MAX_DICT, declared_dict_size as xz_declared_dict_size};
 
 #[cfg(not(feature = "xz"))]
 pub fn xz_declared_dict_size(_data: &[u8]) -> Option<u64> {
@@ -151,6 +200,11 @@ pub fn has_obfuscated_name_object(_data: &[u8]) -> bool {
 #[cfg(feature = "rar")]
 #[doc(hidden)]
 pub use formats::{unpack29, unpack50, window_size_from_comp_info};
+// The LZO decoder of SquashFS, exposed for the fuzz target that drives it.
+// Diagnostic surface, not part of the stable API: may change in any release.
+#[cfg(feature = "squashfs")]
+#[doc(hidden)]
+pub use formats::lzo::decompress as lzo_decompress;
 
 /// Limits governing recursive extraction.
 ///
@@ -217,6 +271,11 @@ pub struct Limits {
     /// large file. Deterministic, so it trips identically on every machine
     /// (unlike a wall-clock deadline).
     pub max_scanned_bytes: u64,
+    /// What one run of a bytecode signature may hold in all: its `malloc`s
+    /// (a program frees nothing), the frames of its calls in progress, and the
+    /// globals it has read. A run that reaches it stops as incomplete. Default
+    /// 256 MiB.
+    pub max_bytecode_memory_bytes: u64,
     /// Cap on the instructions the PE stub emulator may run across the whole
     /// recursive analysis of one top-level file.
     ///
@@ -265,6 +324,7 @@ impl Default for Limits {
             // and runaway scan time, and lets a multi-gigabyte member be fully
             // scanned.
             max_scanned_bytes: 10 * 1024 * 1024 * 1024,
+            max_bytecode_memory_bytes: 256 * 1024 * 1024,
             // A few seconds to tens of seconds of emulation per top-level file,
             // against the per-stub budget of `formats::pepack`.
             max_pe_emulation_steps: 1_000_000_000,
@@ -293,6 +353,18 @@ pub struct Budget {
     pub(crate) scanned: u64,
     /// Emulator instructions spent so far (see [`Limits::max_pe_emulation_steps`]).
     pub(crate) pe_emulation_steps: u64,
+    /// PBKDF2 iterations spent so far on RAR5 and disk image passwords, across
+    /// every archive of the scan. Atomic because the readers hold the budget by `&`.
+    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    pub(crate) kdf_rounds: std::sync::atomic::AtomicU64,
+    /// What the scan has spent on 7z key derivations, and the keys it made
+    /// ([`kdf`]). A handle, so that a reader can hold it while the budget is
+    /// borrowed for something else.
+    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    pub(crate) kdf: std::sync::Arc<kdf::Kdf>,
+    /// RAR3 key derivations made so far, across every archive of the scan.
+    #[cfg_attr(not(feature = "decrypt"), allow(dead_code))]
+    pub(crate) rar3_derivations: std::sync::atomic::AtomicUsize,
     /// Candidate passwords tried, in order, when decrypting an encrypted ZIP,
     /// 7z, RAR, ARJ, PDF, DMG or Office member, before the built-in ones a
     /// format has (a PDF's empty user password goes first). Empty by default:
@@ -328,6 +400,9 @@ impl Budget {
             total_out: 0,
             scanned: 0,
             pe_emulation_steps: 0,
+            kdf_rounds: std::sync::atomic::AtomicU64::new(0),
+            kdf: std::sync::Arc::default(),
+            rar3_derivations: std::sync::atomic::AtomicUsize::new(0),
             passwords: Vec::new(),
             verify_checksums: false,
             visit_directories: false,
@@ -702,6 +777,10 @@ pub enum Format {
     Zstd,
     /// Lzip compressed stream.
     Lzip,
+    /// LZMA-alone (`.lzma`) compressed stream, as LZMA Utils wrote it.
+    Lzma,
+    /// RPM package: its install scripts and its payload (a compressed cpio).
+    Rpm,
     /// uuencode / Base64-uuencode (`begin`…`end`) wrapped file.
     Uuencode,
     /// Adobe XDP (XML-wrapped, base64-encoded PDF).
@@ -748,6 +827,16 @@ pub enum Format {
     /// the objects its OLE2FRAMEs embed. A drawing of an older release is
     /// one unsupported entry. See [`dwg`] (feature `dwg`).
     Dwg,
+    /// exFAT filesystem, walked, so fragmented files come back whole.
+    Exfat,
+    /// SquashFS 4 image: walked, each block decompressed as it is read.
+    Squashfs,
+    /// cramfs image: walked, each block inflated as it is read.
+    Cramfs,
+    /// romfs image: walked, its files being stored as they are.
+    Romfs,
+    /// EROFS image: walked, files stored plain or compressed with LZ4.
+    Erofs,
 }
 
 impl Format {
@@ -800,6 +889,8 @@ impl Format {
         Format::Ntfs,
         Format::Zstd,
         Format::Lzip,
+        Format::Lzma,
+        Format::Rpm,
         Format::Uuencode,
         Format::Xdp,
         Format::Szdd,
@@ -821,6 +912,11 @@ impl Format {
         Format::Screnc,
         Format::Dxf,
         Format::Dwg,
+        Format::Exfat,
+        Format::Squashfs,
+        Format::Cramfs,
+        Format::Romfs,
+        Format::Erofs,
     ];
 }
 
@@ -904,6 +1000,13 @@ mod format_all_tests {
                 Format::Screnc => 44,
                 Format::Dxf => 66,
                 Format::Dwg => 67,
+                Format::Lzma => 68,
+                Format::Rpm => 69,
+                Format::Exfat => 70,
+                Format::Squashfs => 71,
+                Format::Cramfs => 72,
+                Format::Romfs => 73,
+                Format::Erofs => 74,
             }
         }
         let mut seen: Vec<u8> = Format::ALL.iter().map(|f| tag(*f)).collect();
@@ -911,7 +1014,7 @@ mod format_all_tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            67,
+            74,
             "Format::ALL is missing a variant (or lists one twice)"
         );
     }
@@ -933,14 +1036,65 @@ fn is_bzip2_magic(data: &[u8]) -> bool {
             || data[4..10] == [0x17, 0x72, 0x45, 0x38, 0x50, 0x90])
 }
 
+/// A second format the object also is, when its first bytes were claimed by
+/// `first`, for the formats that leave their own start free: an ISO 9660 image
+/// keeps its first 32 KiB for the system area, and an ext volume its first
+/// kilobyte for boot code, so either can start with an archive's magic and be
+/// mounted all the same.
+pub fn also_reads_as(src: &dyn ByteSource, first: Format) -> Option<Format> {
+    #[cfg(feature = "iso")]
+    if first != Format::Iso && src.window(32769, 5).starts_with(b"CD001") {
+        return Some(Format::Iso);
+    }
+    #[cfg(feature = "ext")]
+    if first != Format::Ext && formats::ext::is_volume(src) {
+        return Some(Format::Ext);
+    }
+    let _ = (src, first);
+    None
+}
+
+/// Whether `data` is a PDF: `%PDF-` and a version digit within its first
+/// kilobyte, which is where Acrobat, qpdf, pdfium and pdf.js look. A file with a
+/// newline, a byte-order mark or a mail's leftover headers before it is a PDF
+/// to every one of them, and offsets in the file count from the header.
+fn pdf_header_near_start(data: &[u8]) -> bool {
+    // At the start the magic alone has always been enough.
+    if data.starts_with(b"%PDF-") {
+        return true;
+    }
+    let head = &data[..data.len().min(1024)];
+    memchr::memmem::find_iter(head, b"%PDF-")
+        .any(|at| head.get(at + 5).is_some_and(u8::is_ascii_digit))
+}
+
 /// Whether `data` begins with a real CAB (Microsoft Cabinet) header: `MSCF`
 /// followed by the `reserved1` field, which the MS-CAB spec fixes at zero in
 /// every genuine cabinet. The bare 4-byte `MSCF` magic collides with binary data
 /// (e.g. inside an ISO), and a false hit routed to the cabinet parser fails deep
 /// in string parsing and reports the object `LIMITS-EXCEEDED`; requiring the zero
 /// `reserved1` rejects those without dropping any real cabinet.
+///
+/// Readers do not check `reserved1` (`cabextract` opens a cabinet whose field is
+/// anything), so a cabinet is also recognised by what follows it: a size, the
+/// offset of the first file entry inside it, and version 1.3, none of which a
+/// chance `MSCF` has.
 fn is_cab_magic(data: &[u8]) -> bool {
-    data.len() >= 8 && data.starts_with(b"MSCF") && data[4..8] == [0, 0, 0, 0]
+    if !data.starts_with(b"MSCF") || data.len() < 8 {
+        return false;
+    }
+    if data[4..8] == [0, 0, 0, 0] {
+        return true;
+    }
+    let u32_at = |o: usize| {
+        data.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let (Some(size), Some(files)) = (u32_at(8), u32_at(16)) else {
+        return false;
+    };
+    // `versionMinor`, `versionMajor`.
+    data.get(24..26) == Some(&[3, 1]) && size >= 36 && (36..=size).contains(&files)
 }
 
 /// Whether `data` begins with an ARJ main header: `60 EA`, a size of at most
@@ -986,6 +1140,30 @@ fn starts_executable_magic(d: &[u8]) -> bool {
         || d.starts_with(&[0xd0, 0xcf, 0x11, 0xe0])
 }
 
+/// Whether `d` starts with the magic of an archive a script or page may carry
+/// in base64 (HTML smuggling puts a ZIP in a `data:` URI or an `atob` string):
+/// the magics long enough not to turn up by chance, and ZIP's and gzip's, which
+/// [`is_archive_payload`] confirms from what follows.
+#[cfg(feature = "base64scan")]
+fn starts_archive_magic(d: &[u8]) -> bool {
+    d.starts_with(b"PK\x03\x04")
+        || is_gzip_magic(d)
+        || d.starts_with(b"7z\xBC\xAF\x27\x1C")
+        || d.starts_with(b"Rar!\x1a\x07")
+        || d.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00])
+}
+
+/// Whether a fully-decoded blob is an archive worth scanning as one: a magic of
+/// [`starts_archive_magic`], and for a ZIP a directory that holds together, so
+/// four bytes of coincidence are not enough.
+#[cfg(feature = "base64scan")]
+fn is_archive_payload(d: &[u8]) -> bool {
+    if d.len() < 22 || !starts_archive_magic(d) {
+        return false;
+    }
+    !d.starts_with(b"PK\x03\x04") || zip_directory_is_consistent(d)
+}
+
 /// Whether a fully-decoded blob is a real, re-scannable executable: one of
 /// [`starts_executable_magic`] and, for a PE, with a *valid* PE header at
 /// `e_lfanew` (rejecting a bare `MZ`). See [`base64_payloads`].
@@ -1019,6 +1197,13 @@ fn is_executable_payload(d: &[u8]) -> bool {
 /// nothing more. Bounded by `cap` per payload and by a cap on how many return.
 #[cfg(feature = "base64scan")]
 pub fn markup_embedded_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> {
+    markup_embedded_payloads_capped(src, cap).0
+}
+
+/// [`markup_embedded_payloads`], and whether it stopped at the number it
+/// returns with another run behind them that it would have decoded.
+#[cfg(feature = "base64scan")]
+pub fn markup_embedded_payloads_capped(src: &dyn ByteSource, cap: u64) -> (Vec<Vec<u8>>, bool) {
     match src.as_slice() {
         Some(data) => markup_payloads_on(&mut Indexed(data), cap),
         None => markup_payloads_on(&mut Stepper::new(src), cap),
@@ -1026,7 +1211,7 @@ pub fn markup_embedded_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> 
 }
 
 #[cfg(feature = "base64scan")]
-fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
+fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> (Vec<Vec<u8>>, bool) {
     use base64::Engine;
     /// Shortest base64 run worth decoding; below this it cannot be an asset.
     const MIN_RUN: usize = 64;
@@ -1036,9 +1221,10 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
     let plain = base64::engine::general_purpose::STANDARD_NO_PAD;
     let is_b64 = |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'/';
     let mut out = Vec::new();
+    let mut capped = false;
     let mut i = 0usize;
     let n = data.len();
-    while i < n && out.len() < MAX_PAYLOADS {
+    while i < n {
         if !is_b64(data.at(i)) {
             i += 1;
             continue;
@@ -1059,8 +1245,14 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         // Cheap gate first: 8 base64 chars decode to 6 bytes, enough for every
         // magic we care about, and costs no allocation on a miss.
         match plain.decode(data.range(start, start + 8)) {
-            Ok(head) if starts_asset_magic(&head) => {}
+            Ok(head) if starts_asset_magic(&head) || starts_archive_magic(&head) => {}
             _ => continue,
+        }
+        // Another run worth decoding, with the number returned already at its
+        // limit: the rest of the document is not read.
+        if out.len() >= MAX_PAYLOADS {
+            capped = true;
+            break;
         }
         // Absorb the padding the run scan stopped at, so a well-formed URI
         // decodes whole. Without it the tail falls off the last 4-char group and
@@ -1081,13 +1273,15 @@ fn markup_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         let decoded = engine
             .decode(&run)
             .or_else(|_| plain.decode(&run[..bare - usize::from(bare % 4 == 1)]));
-        if let Ok(dec) = decoded {
-            if !dec.is_empty() && dec.len() as u64 <= cap {
-                out.push(dec);
-            }
+        if let Ok(dec) = decoded
+            && !dec.is_empty()
+            && dec.len() as u64 <= cap
+            && (!starts_archive_magic(&dec) || is_archive_payload(&dec))
+        {
+            out.push(dec);
         }
     }
-    out
+    (out, capped)
 }
 
 /// Magics of things worth pulling out of a document: raster images (what
@@ -1118,6 +1312,13 @@ fn starts_asset_magic(d: &[u8]) -> bool {
 /// `cap` (per-payload size), `MAX_PAYLOADS`, and `MAX_ATTEMPTS` (decode tries).
 #[cfg(feature = "base64scan")]
 pub fn base64_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> {
+    base64_payloads_capped(src, cap).0
+}
+
+/// [`base64_payloads`], and whether it stopped at its limits with another run
+/// behind them that it would have decoded.
+#[cfg(feature = "base64scan")]
+pub fn base64_payloads_capped(src: &dyn ByteSource, cap: u64) -> (Vec<Vec<u8>>, bool) {
     match src.as_slice() {
         Some(data) => base64_payloads_on(&mut Indexed(data), cap),
         None => base64_payloads_on(&mut Stepper::new(src), cap),
@@ -1125,7 +1326,7 @@ pub fn base64_payloads(src: &dyn ByteSource, cap: u64) -> Vec<Vec<u8>> {
 }
 
 #[cfg(feature = "base64scan")]
-fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
+fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> (Vec<Vec<u8>>, bool) {
     use base64::Engine;
     // A base64-encoded PE is at minimum a few hundred bytes; require a run that
     // decodes to ≥ ~1 KB so we never trial-decode short incidental runs.
@@ -1137,10 +1338,11 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
     let engine = base64::engine::general_purpose::STANDARD_NO_PAD;
 
     let mut out = Vec::new();
+    let mut capped = false;
     let mut attempts = 0;
     let n = data.len();
     let mut i = 0;
-    while i < n && out.len() < MAX_PAYLOADS && attempts < MAX_ATTEMPTS {
+    while i < n {
         if !is_b64(data.at(i)) {
             i += 1;
             continue;
@@ -1175,8 +1377,14 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         // NOT executables (RTF `\objdata` hex, benign base64 text) cost nothing
         // beyond the byte count above: no full decode, no payload allocation.
         match engine.decode(head) {
-            Ok(prefix) if starts_executable_magic(&prefix) => {}
+            Ok(prefix) if starts_executable_magic(&prefix) || starts_archive_magic(&prefix) => {}
             _ => continue,
+        }
+        // Another run worth decoding, with the limits already reached: the
+        // rest of the text is not read.
+        if out.len() >= MAX_PAYLOADS || attempts >= MAX_ATTEMPTS {
+            capped = true;
+            break;
         }
         attempts += 1;
         // Whole 4-char groups decode to exactly 3 bytes each, so a run too
@@ -1203,13 +1411,14 @@ fn base64_payloads_on<B: Bytes>(data: &mut B, cap: u64) -> Vec<Vec<u8>> {
         if run.len() % 4 == 1 {
             run.pop();
         }
-        if let Ok(dec) = engine.decode(&run) {
-            if dec.len() as u64 <= cap && is_executable_payload(&dec) {
-                out.push(dec);
-            }
+        if let Ok(dec) = engine.decode(&run)
+            && dec.len() as u64 <= cap
+            && (is_executable_payload(&dec) || is_archive_payload(&dec))
+        {
+            out.push(dec);
         }
     }
-    out
+    (out, capped)
 }
 
 /// What [`detect`] reads of an object: its start (all of it when it is held in
@@ -1477,7 +1686,7 @@ fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> O
     // read `DETECT_HEAD` deep: over a network or browser reader that is most
     // of a small archive. Only those `detect_probe` makes first: a later one,
     // such as RAR's, could be overruled by an earlier check that needs more.
-    if let Some(fmt) = archive_magic(&src.window(0, 16)) {
+    if let Some(fmt) = archive_magic(&src.window(0, 32)) {
         return Some(udif_or(fmt, src.len(), |off| {
             src.window(off, 12).into_owned()
         }));
@@ -1500,7 +1709,7 @@ fn detect_with(src: &dyn ByteSource, prescan: Option<&dyn Fn() -> Prescan>) -> O
 /// RAR), as [`detect`] would type it: what an archive carved out of another
 /// object at its magic needs confirmed, without a search through the rest.
 pub fn detect_archive_start(src: &dyn ByteSource) -> Option<Format> {
-    let head = src.window(0, 16);
+    let head = src.window(0, 32);
     archive_magic(&head).or_else(|| is_rar_magic(&head).then_some(Format::Rar))
 }
 
@@ -1545,6 +1754,51 @@ fn udif_or(fmt: Format, len: usize, read: impl FnOnce(usize) -> Vec<u8>) -> Form
     fmt
 }
 
+/// The first header of a tar from before `ustar` (V7), which has no magic:
+/// a name, octal mode and size, and a checksum of the header that is right.
+fn is_v7_tar(data: &[u8]) -> bool {
+    let Some(h) = data.get(..512) else {
+        return false;
+    };
+    let octal = |f: &[u8]| {
+        let t = f
+            .iter()
+            .take_while(|&&b| b != 0)
+            .copied()
+            .collect::<Vec<u8>>();
+        let t = t.trim_ascii();
+        (!t.is_empty() && t.iter().all(|b| (b'0'..=b'7').contains(b))).then(|| {
+            t.iter().fold(0u64, |a, b| {
+                a.wrapping_mul(8).wrapping_add(u64::from(b - b'0'))
+            })
+        })
+    };
+    if h[0] == 0 || octal(&h[100..108]).is_none() || octal(&h[124..136]).is_none() {
+        return false;
+    }
+    let Some(sum) = octal(&h[148..156]) else {
+        return false;
+    };
+    let field = 148..156;
+    let unsigned: u64 = h
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| if field.contains(&i) { 32 } else { u64::from(b) })
+        .sum();
+    let signed: i64 = h
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if field.contains(&i) {
+                32
+            } else {
+                i64::from(b as i8)
+            }
+        })
+        .sum();
+    sum == unsigned || i64::try_from(sum).is_ok_and(|s| s == signed)
+}
+
 fn is_rar_magic(data: &[u8]) -> bool {
     data.starts_with(b"Rar!\x1a\x07\x00") || data.starts_with(b"Rar!\x1a\x07\x01\x00")
 }
@@ -1568,6 +1822,9 @@ fn detect_probe(p: &Probe) -> Option<Format> {
         return Some(Format::Pdf);
     }
     if data.len() >= 263 && &data[257..262] == b"ustar" {
+        return Some(Format::Tar);
+    }
+    if is_v7_tar(data) {
         return Some(Format::Tar);
     }
     if data.len() >= 7 && data[2] == b'-' && data[6] == b'-' && matches!(data[3], b'l' | b'p') {
@@ -1637,6 +1894,18 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     if formats::sniff::is_in(p, Format::AppleSingle) {
         return Some(Format::AppleSingle);
     }
+    if formats::sniff::is_in(p, Format::Squashfs) {
+        return Some(Format::Squashfs);
+    }
+    if formats::sniff::is_in(p, Format::Cramfs) {
+        return Some(Format::Cramfs);
+    }
+    if formats::sniff::is_in(p, Format::Romfs) {
+        return Some(Format::Romfs);
+    }
+    if formats::sniff::is_in(p, Format::Erofs) {
+        return Some(Format::Erofs);
+    }
     // ext last of the filesystem sniffs: its magic is 1080 bytes in, so a
     // partition table or boot sector at offset 0 is the more specific answer.
     if formats::sniff::is_in(p, Format::Ext) {
@@ -1647,6 +1916,10 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     #[cfg(feature = "fat")]
     if formats::fat::is_fat(data) {
         return Some(Format::Fat);
+    }
+    #[cfg(feature = "exfat")]
+    if formats::exfat::is_exfat(data) {
+        return Some(Format::Exfat);
     }
     if formats::sniff::is_in(p, Format::Ntfs) {
         return Some(Format::Ntfs);
@@ -1674,7 +1947,7 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     if formats::sniff::is_in(p, Format::Vhdx) {
         return Some(Format::Vhdx);
     }
-    if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+    if data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) || formats::sniff::zstd_after_skippable(data) {
         return Some(Format::Zstd);
     }
     if data.starts_with(b"!<arch>\n") {
@@ -1682,6 +1955,12 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     }
     if data.starts_with(b"LZIP") {
         return Some(Format::Lzip);
+    }
+    if formats::sniff::is_in(p, Format::Lzma) {
+        return Some(Format::Lzma);
+    }
+    if formats::sniff::is_in(p, Format::Rpm) {
+        return Some(Format::Rpm);
     }
     if data.starts_with(b"070701")
         || data.starts_with(b"070702")
@@ -1821,6 +2100,17 @@ fn detect_probe(p: &Probe) -> Option<Format> {
     if is_partition(p) {
         return Some(Format::Partition);
     }
+    // After every structural check: a tar or a disk image holds a PDF in its
+    // first kilobyte as a member, which is not the file's own header.
+    if pdf_header_near_start(data) {
+        return Some(Format::Pdf);
+    }
+    // Last: a ZIP behind a script line or padding, found by its end record.
+    // The walker reads such an archive (`open_archive`'s prepended case).
+    #[cfg(feature = "zip")]
+    if formats::sniff::prefixed_zip(p) {
+        return Some(Format::Zip);
+    }
     None
 }
 
@@ -1845,10 +2135,10 @@ mod detect_source_tests {
             let path = e.path();
             if path.is_dir() {
                 fixtures(&path, out);
-            } else if let Ok(data) = std::fs::read(&path) {
-                if data.len() < 8 << 20 {
-                    out.push((path.display().to_string(), data));
-                }
+            } else if let Ok(data) = std::fs::read(&path)
+                && data.len() < 8 << 20
+            {
+                out.push((path.display().to_string(), data));
             }
         }
     }
@@ -2131,18 +2421,6 @@ pub(crate) fn dispatch_extract<R>(
         Format::Rar => emit_collected(extract_rar(data, budget)?, budget, visit),
         #[cfg(feature = "upx")]
         Format::Upx => extract_upx(data, budget, visit),
-        #[cfg(feature = "xar")]
-        Format::Xar => extract_xar(data, budget, visit),
-        #[cfg(feature = "vhd")]
-        Format::Vhd => formats::vhd::extract_vhd(data, budget, visit),
-        #[cfg(feature = "diskimage")]
-        Format::Qcow2 => formats::qcow2::extract_qcow2(data, budget, visit),
-        #[cfg(feature = "diskimage")]
-        Format::Vmdk => formats::vmdk::extract_vmdk(data, budget, visit),
-        #[cfg(feature = "diskimage")]
-        Format::Vhdx => formats::vhdx::extract_vhdx(data, budget, visit),
-        #[cfg(feature = "wim")]
-        Format::Wim => formats::wim::extract_wim(data, budget, visit),
         #[cfg(feature = "arc")]
         Format::Arc => formats::arc::extract_arc(data, budget, visit),
         #[cfg(feature = "ace")]
@@ -2159,20 +2437,14 @@ pub(crate) fn dispatch_extract<R>(
         | Format::CryptFf
         | Format::Lrzip
         | Format::AppleSingle => formats::reported::extract_reported(fmt, data, budget, visit),
-        #[cfg(feature = "ext")]
-        Format::Ext => formats::ext::extract_ext(data, budget, visit),
         #[cfg(feature = "zoo")]
         Format::Zoo => formats::zoo::extract_zoo(data, budget, visit),
         #[cfg(feature = "ishieldz")]
         Format::IshieldZ => formats::ishield_z::extract_ishield_z(data, budget, visit),
         #[cfg(feature = "stuffit")]
         Format::StuffIt => formats::stuffit::extract_stuffit(data, budget, visit),
-        #[cfg(feature = "fat")]
-        Format::Fat => formats::fat::extract_fat(data, budget, visit),
         #[cfg(feature = "inno")]
         Format::Inno => formats::inno::extract_inno(data, budget, visit),
-        #[cfg(feature = "ntfs")]
-        Format::Ntfs => formats::ntfs::extract_ntfs(data, budget, visit),
         #[cfg(feature = "uuencode")]
         Format::Uuencode => extract_uuencode(data, budget, visit),
         #[cfg(feature = "xdp")]
@@ -2321,6 +2593,28 @@ pub fn extract(
 pub fn join_rar_volumes(volumes: &[&[u8]]) -> Result<Vec<u8>, String> {
     formats::join_rar_volumes(volumes)
 }
+
+/// What a cabinet's header says of its place in a set of them: the cabinet
+/// before it and the one after it, by the names the header gives (labels, for
+/// a caller to match against the names it was given: nothing here opens
+/// one), its number in the set and the set's. `None` for a cabinet that is not
+/// one of several.
+#[cfg(feature = "cab")]
+pub fn cab_links(cabinet: &[u8]) -> Option<CabLinks> {
+    formats::cab_join::links(cabinet)
+}
+
+/// The cabinets of one set, in order, as the one cabinet they were cut from:
+/// what [`walk`] reads as [`Format::Cab`]. A folder or a file that runs from
+/// one cabinet into the next is read whole that way, where one cabinet at a
+/// time it is cut short. `Err` says what does not fit the set.
+#[cfg(feature = "cab")]
+pub fn join_cab_volumes(cabinets: &[&[u8]]) -> Result<Vec<u8>, String> {
+    formats::cab_join::join(cabinets)
+}
+
+#[cfg(feature = "cab")]
+pub use formats::cab_join::Links as CabLinks;
 
 /// True if `data` looks like a UPX-packed executable (a valid `PackHeader` is
 /// present). Used by callers whose file-type classifier already recognises
@@ -2823,8 +3117,8 @@ mod markup_payload_tests {
 #[cfg(all(test, feature = "all-formats"))]
 mod tests {
     use super::*;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::{Cursor, Write};
 
     fn gz(data: &[u8]) -> Vec<u8> {
@@ -2937,6 +3231,29 @@ mod tests {
             b.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn a_tar_from_before_ustar_has_no_magic_and_is_found_by_its_checksum() {
+        let mut buf = Vec::new();
+        {
+            let mut b = ::tar::Builder::new(&mut buf);
+            let mut h = ::tar::Header::new_old();
+            h.set_size(5);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "input.txt", &b"hello"[..]).unwrap();
+            b.finish().unwrap();
+        }
+        assert_eq!(&buf[257..262], &[0u8; 5], "no magic");
+        assert_eq!(detect(&buf), Some(Format::Tar));
+        let entries = extract(Format::Tar, &buf, &mut Budget::new(Limits::default())).unwrap();
+        assert_eq!(entries[0].data, b"hello");
+        // One byte of the header changed: the checksum no longer fits.
+        buf[1] ^= 1;
+        assert_eq!(detect(&buf), None);
+        // Text that happens to be octal is not one.
+        assert_eq!(detect(&[b'7'; 2048]), None);
     }
 
     fn cab_of(members: &[(&str, &[u8])]) -> Vec<u8> {
@@ -3114,6 +3431,31 @@ mod tests {
         assert_eq!(detect(b"MSCF"), None);
     }
 
+    /// `reserved1` is reserved: `cabextract` opens a cabinet whatever it holds,
+    /// so a cabinet with a nonzero field is a cabinet, not data.
+    #[cfg(feature = "cab")]
+    #[test]
+    fn a_cabinet_with_a_nonzero_reserved_field_is_still_a_cabinet() {
+        let real = include_bytes!("../tests/fixtures/cab/mszip_lzx_qtm.cab");
+        let mut odd = real.to_vec();
+        odd[4..8].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(detect(&odd), Some(Format::Cab));
+        let names = |blob: &[u8]| {
+            let mut budget = Budget::new(Limits::default());
+            extract(Format::Cab, &blob, &mut budget)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.data))
+                .collect::<Vec<_>>()
+        };
+        assert!(!names(real).is_empty());
+        assert_eq!(names(&odd), names(real));
+        // And a header that only starts like one is still not.
+        let mut chance = odd.clone();
+        chance[24] = 9;
+        assert_eq!(detect(&chance), None);
+    }
+
     /// `60 EA` is two bytes, so about one object in 65,536 starts with it by
     /// chance, and reading such an object as a damaged ARJ reports it
     /// `UNSCANNABLE`. The main header carries a CRC-32 that settles it.
@@ -3207,8 +3549,8 @@ mod tests {
             detect(&[0x1f, 0x8b, 0x08, 0x08, 0, 0, 0, 0]),
             Some(Format::Gzip)
         ); // FNAME set
-           // Coincidental `1f 8b` in binary data with a non-deflate CM or reserved
-           // flag bits set → not gzip (would otherwise fail inflate → UNSCANNABLE).
+        // Coincidental `1f 8b` in binary data with a non-deflate CM or reserved
+        // flag bits set → not gzip (would otherwise fail inflate → UNSCANNABLE).
         assert_eq!(detect(&[0x1f, 0x8b, 0x99, 0xff]), None); // CM != 8
         assert_eq!(detect(&[0x1f, 0x8b, 0x08, 0xe0]), None); // reserved flag bits set
         assert_eq!(detect(&[0x1f, 0x8b]), None); // too short
@@ -3276,6 +3618,23 @@ mod tests {
         assert_eq!(entries[0].data, payload);
     }
 
+    /// ClamAV's `skip_prefix.txt.zst`: a skippable frame (which LZ4 uses as
+    /// well) ahead of the Zstandard one was taken for an LZ4 file.
+    #[test]
+    fn zstd_after_a_skippable_frame_is_zstd() {
+        let payload = b"hello exav inside zstd";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        blob.extend_from_slice(&5u32.to_le_bytes());
+        blob.extend_from_slice(b"PADDY");
+        blob.extend(zstd_of(payload));
+        assert_eq!(detect(&blob), Some(Format::Zstd));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Zstd, &blob, &mut budget).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].data, payload);
+    }
+
     #[test]
     fn zstd_bomb_trips_ratio() {
         let mut w =
@@ -3330,7 +3689,7 @@ mod tests {
         // Build an OLE2/CFB with a stream holding EICAR, then extract it.
         let mut buf = Cursor::new(Vec::new());
         {
-            let mut comp = cfb::CompoundFile::create(&mut buf).unwrap();
+            let mut comp = ::cfb::CompoundFile::create(&mut buf).unwrap();
             comp.create_storage("Macros").unwrap();
             let mut s = comp.create_stream("Macros/Module1").unwrap();
             std::io::Write::write_all(&mut s, eicar()).unwrap();
@@ -3443,7 +3802,7 @@ mod tests {
         img[pvd] = 1; // type = primary
         img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
         img[pvd + 6] = 1; // version
-                          // Root directory record at PVD+156 (length 34).
+        // Root directory record at PVD+156 (length 34).
         let rd = pvd + 156;
         img[rd] = 34; // record length
         img[rd + 2..rd + 6].copy_from_slice(&17u32.to_le_bytes()); // extent LBA (LE)
@@ -3451,7 +3810,7 @@ mod tests {
         img[rd + 25] = 0x02; // flags: directory
         img[rd + 32] = 1; // name len
         img[rd + 33] = 0; // name "\0" (self)
-                          // --- Root directory at sector 17 ---
+        // --- Root directory at sector 17 ---
         let dir = 17 * S;
         let mut p = dir;
         // "." record
@@ -3533,6 +3892,82 @@ mod tests {
         let entries = extract(Format::Lzip, blob, &mut budget).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].data, payload);
+    }
+
+    /// A ZIP behind a script line (a zipapp), with a marker of a spanned archive
+    /// in front, or with padding before and after is told by its end record, and
+    /// opens as it does without them; text that merely ends like a ZIP is not.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_zip_behind_other_bytes_is_a_zip() {
+        let zip = include_bytes!("../tests/fixtures/zip/legacy_implode.zip").to_vec();
+        let plain = extract(
+            Format::Zip,
+            &zip.as_slice(),
+            &mut Budget::new(Limits::default()),
+        )
+        .unwrap();
+        assert!(!plain.is_empty());
+        let names = |blob: &[u8]| -> Vec<(String, Vec<u8>)> {
+            extract(Format::Zip, &blob, &mut Budget::new(Limits::default()))
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.data))
+                .collect()
+        };
+        let want = names(&zip);
+        for (what, blob) in [
+            (
+                "a zipapp",
+                [&b"#!/usr/bin/env python3\n"[..], &zip].concat(),
+            ),
+            (
+                "padding around",
+                [&[7u8; 300][..], &zip, &[9u8; 100]].concat(),
+            ),
+        ] {
+            assert_eq!(detect(&blob.as_slice()), Some(Format::Zip), "{what}");
+            assert_eq!(names(&blob), want, "{what}");
+        }
+        // A directory that points at no local header, and an end record cut off.
+        let mut broken = [&b"#!/bin/sh\n"[..], &zip].concat();
+        let at = broken.len() - zip.len();
+        broken[at..at + 4].copy_from_slice(b"XXXX");
+        assert_eq!(detect(&broken.as_slice()), None);
+        let cut = [&b"#!/bin/sh\n"[..], &zip[..zip.len() - 30]].concat();
+        assert_eq!(detect(&cut.as_slice()), None);
+    }
+
+    /// `xz --format=lzma`: a stream that ends with a marker, and the same with
+    /// its size in the header (what LZMA Utils wrote).
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn lzma_alone_roundtrip() {
+        let payload = b"hello exav inside lzma";
+        for blob in [
+            &include_bytes!("../tests/fixtures/lzma_simple.lzma")[..],
+            &include_bytes!("../tests/fixtures/lzma_sized.lzma")[..],
+        ] {
+            assert_eq!(detect(&blob), Some(Format::Lzma));
+            let mut budget = Budget::new(Limits::default());
+            let entries = extract(Format::Lzma, &blob, &mut budget).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "lzma-content");
+            assert_eq!(entries[0].data, payload);
+        }
+    }
+
+    /// The header chooses the dictionary the decoder allocates: one of 2 GiB is
+    /// refused, not allocated.
+    #[cfg(feature = "lzma")]
+    #[test]
+    fn lzma_alone_with_a_huge_dictionary_is_refused() {
+        let mut blob = include_bytes!("../tests/fixtures/lzma_simple.lzma").to_vec();
+        blob[1..5].copy_from_slice(&(1u32 << 31).to_le_bytes());
+        assert_eq!(detect(&blob.as_slice()), Some(Format::Lzma));
+        let mut budget = Budget::new(Limits::default());
+        let entries = extract(Format::Lzma, &blob.as_slice(), &mut budget).unwrap();
+        assert!(entries[0].data.is_empty() && entries[0].unsupported.is_some());
     }
 }
 

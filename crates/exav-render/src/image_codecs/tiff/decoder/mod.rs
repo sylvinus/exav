@@ -11,7 +11,9 @@ use crate::image_codecs::tiff::{
     bytecast, ColorType, Directory, TiffError, TiffFormatError, TiffResult, TiffUnsupportedError,
     UsageError,
 };
-use half::f16;
+// exav: an f16 sample's bits, in place of `half::f16`.
+#[allow(non_camel_case_types)]
+type f16 = u16;
 
 use self::image::Image;
 use self::stream::{ByteOrder, EndianReader};
@@ -19,8 +21,29 @@ use self::stream::{ByteOrder, EndianReader};
 mod cycles;
 pub mod ifd;
 mod image;
+mod ojpeg;
 mod stream;
 mod tag_reader;
+
+// exav: codecs that only the viewer's reader turns on. What is hashed is what
+// ClamAV's `tiff` reads, which has no Zstandard.
+thread_local!(static VIEWER_CODECS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// Runs `f` with the viewer's codecs (Zstandard) on, for this thread.
+pub fn with_viewer_codecs<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            VIEWER_CODECS.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(VIEWER_CODECS.with(|c| c.replace(true)));
+    f()
+}
+
+fn viewer_codecs() -> bool {
+    VIEWER_CODECS.with(std::cell::Cell::get)
+}
 
 /// Result of a decoding process
 #[derive(Debug)]
@@ -102,7 +125,7 @@ impl DecodingResult {
         if size > limits.decoding_buffer_size / std::mem::size_of::<u16>() {
             Err(TiffError::LimitsExceeded)
         } else {
-            Ok(DecodingResult::F16(vec![f16::ZERO; size]))
+            Ok(DecodingResult::F16(vec![0; size]))
         }
     }
 
@@ -184,7 +207,7 @@ pub enum DecodingBuffer<'a> {
 impl<'a> DecodingBuffer<'a> {
     fn as_bytes_mut(&mut self) -> &mut [u8] {
         match self {
-            DecodingBuffer::U8(ref mut buf) => buf,
+            DecodingBuffer::U8(buf) => buf,
             DecodingBuffer::I8(buf) => bytecast::i8_as_ne_mut_bytes(buf),
             DecodingBuffer::U16(buf) => bytecast::u16_as_ne_mut_bytes(buf),
             DecodingBuffer::I16(buf) => bytecast::i16_as_ne_mut_bytes(buf),
@@ -639,6 +662,9 @@ impl<R: Read + Seek> Decoder<R> {
                 tile_attributes: None,
                 chunk_offsets: Vec::new(),
                 chunk_bytes: Vec::new(),
+                ycbcr_subsampling: (1, 1),
+                ojpeg_header_end: 0,
+                ojpeg_stream_end: 0,
             },
         };
         decoder.next_image()?;
@@ -719,7 +745,15 @@ impl<R: Read + Seek> Decoder<R> {
         let ifd = self.value_reader.read_directory(next_ifd)?;
 
         // Ensure this walk does not get us into a cycle.
-        self.seen_ifds.insert_next(next_ifd, ifd.next())?;
+        // exav: the viewer's reader draws the directory it has and takes the
+        // link back as the end of the chain (libtiff does the same).
+        let mut next = ifd.next();
+        if let Err(e) = self.seen_ifds.insert_next(next_ifd, next) {
+            if !viewer_codecs() {
+                return Err(e);
+            }
+            next = None;
+        }
 
         // Extend the list of known IFD offsets in this chain, if needed.
         if self.ifd_offsets.last().copied() == self.current_ifd {
@@ -727,7 +761,7 @@ impl<R: Read + Seek> Decoder<R> {
         }
 
         self.current_ifd = Some(next_ifd);
-        self.next_ifd = ifd.next();
+        self.next_ifd = next;
 
         Ok(ifd)
     }

@@ -6,7 +6,7 @@
 //! 16 MB), its header left uncompressed so a test can rewrite the packed size
 //! declared in it.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 fn fixture() -> Vec<u8> {
     let p = format!(

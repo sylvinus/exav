@@ -5,7 +5,7 @@
 //! every member past that point without a word.
 
 use exav_unpack::source::BlockCache;
-use exav_unpack::{walk, Budget, Format, Limits, Member};
+use exav_unpack::{Budget, Format, Limits, Member, walk};
 use std::io::{self, Read, Seek, SeekFrom};
 
 /// Seeks anywhere in `len` bytes; every read fails.
