@@ -159,11 +159,16 @@ fn kind(name: &str, data: &[u8]) -> Option<Doc> {
     // The first kilobyte, as `wants` reads it; a flat OpenDocument file's
     // root element, which declares many namespaces before it says what it is,
     // may need more, and its name has asked for it.
-    let text = ascii_head(&head[..head.len().min(1024)], 1024);
-    if text.starts_with("id;") {
+    let first = &head[..head.len().min(1024)];
+    // Text, as `wants` asks first: a binary file with a marker among its bytes
+    // is not a document of that kind.
+    let utf16 = first.starts_with(&[0xFF, 0xFE]) || first.starts_with(&[0xFE, 0xFF]);
+    let sniffable = utf16 || exav_unpack::text::looks_text(first);
+    let text = ascii_head(first, 1024);
+    if sniffable && text.starts_with("id;") {
         return Some(Doc::Sheets(sheets::Format::Sylk));
     }
-    xml_kind(&text).or_else(|| {
+    sniffable.then(|| xml_kind(&text)).flatten().or_else(|| {
         has_extension(name, &[".fodt", ".fods", ".fodp", ".fodg"])
             .then(|| xml_kind(&ascii_head(head, 4096)))
             .flatten()

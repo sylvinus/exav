@@ -18,6 +18,7 @@ const BUDGET: u64 = 64 << 20;
 const HASH_BUDGET: u64 = 4 << 20;
 
 fuzz_target!(|data: &[u8]| {
+    exav_fuzz_support::panics::contained_panics();
     for p in [Params::CLAMAV, Params::IMAGEHASH_PHASH] {
         let h = Hasher::with_params(Params {
             max_decode_bytes: HASH_BUDGET,

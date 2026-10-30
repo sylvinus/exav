@@ -30,12 +30,12 @@ until = "as image."
 
 [[pin]]
 crate = "zune-jpeg"
-why = "libclamav's versions, 0.5.8 for JPEG and 0.4.21 for JPEG inside TIFF (decoder parity, see image)."
-until = "as image."
+why = "0.5.15 for JPEG (libclamav's 0.5.8 panics on some damaged files and draws baseline JPEGs with a scan for each component flat; the hashes of other JPEGs are the same, see image_codecs/README.md) and libclamav's 0.4.21 for JPEG inside TIFF (decoder parity, see image)."
+until = "0.4.21 as image; 0.5.x is the latest stable."
 
 [[pin]]
 crate = "zune-core"
-why = "zune-jpeg 0.5.8's companion, named in the code; zune-jpeg 0.4.21's own zune-core is not declared (the vendored tiff decoder reaches it as zune_jpeg_04::zune_core)."
+why = "zune-jpeg 0.5.15's companion, named in the code; zune-jpeg 0.4.21's own zune-core is not declared (the vendored tiff decoder reaches it as zune_jpeg_04::zune_core)."
 until = "as zune-jpeg."
 
 [[pin]]

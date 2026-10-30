@@ -675,15 +675,19 @@ fn planes(
 fn unpack(packed: &[u8], width: usize, height: usize, bits: u8, reversed: bool) -> Vec<u8> {
     let bits = usize::from(bits);
     let row = (width * bits).div_ceil(8);
+    let mask = (1u16 << bits) - 1;
+    let byte = |i: usize| {
+        packed.get(i).map_or(0, |&b| {
+            u16::from(if reversed { b.reverse_bits() } else { b })
+        })
+    };
     let mut out = Vec::with_capacity(width * height);
     for y in 0..height {
         for x in 0..width {
+            // A value of 3, 5, 6 or 7 bits can run into the next byte.
             let at = y * row + x * bits / 8;
-            let shift = 8 - bits - (x * bits) % 8;
-            out.push(packed.get(at).map_or(0, |&b| {
-                let b = if reversed { b.reverse_bits() } else { b };
-                (b >> shift) & ((1u8 << bits) - 1)
-            }));
+            let word = byte(at) << 8 | byte(at + 1);
+            out.push(((word >> (16 - bits - (x * bits) % 8)) & mask) as u8);
         }
     }
     out
@@ -757,9 +761,8 @@ fn stretch<T: Copy>(values: &[T], f: impl Fn(T) -> f64, nodata: Option<f64>) -> 
         .collect();
     sample.sort_by(f64::total_cmp);
     let at = |q: f64| {
-        sample
-            .get(((sample.len() - 1) as f64 * q) as usize)
-            .copied()
+        let last = sample.len().checked_sub(1)?;
+        sample.get((last as f64 * q) as usize).copied()
     };
     let (lo, hi) = match (at(0.005), at(0.995)) {
         (Some(lo), Some(hi)) => (lo, hi),

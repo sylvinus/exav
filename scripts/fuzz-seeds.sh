@@ -457,6 +457,10 @@ for pick, path in (
         open(f"{dst}/office-{path.replace('/', '-')}", "wb").write(bytes([pick]) + data)
 PY
 
+# Files found in the wild, when a directory of them is there (tmp/samples-issues,
+# or WILD): the variants of each format that the fixtures do not have.
+scripts/fuzz-seeds-wild.sh "$OUT" "${WILD:-$ROOT/tmp/samples-issues}"
+
 # Small seeds written from what each target's source reads (see the script).
 python3 scripts/fuzz-seeds-synth.py "$OUT"
 

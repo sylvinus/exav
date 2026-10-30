@@ -51,6 +51,8 @@ a file differently from the program that opens it.
   2024.
 - A `.cvd` whose header md5 does not match, or that is cut short, is refused.
 - A source with no end (`exav /dev/zero`) is an error, not `OK`.
+- A YARA rule nested more than 10 parentheses deep is refused (12 before): the
+  parser's time doubles with each level.
 - A one-shot scan that `--max-scan-secs` ends keeps the exit status of what it
   found (`1`, then `2`) and otherwise follows `--partial-as`; it was always `3`.
 - The `Content-Range` of an HTTP answer is checked; a server that answers
@@ -82,6 +84,9 @@ a file differently from the program that opens it.
 - Dependencies are at their latest versions, except the image decoders pinned
   to libclamav 1.5.4. Fewer dependencies and less `unsafe`: 8 crates and
   1,155 `unsafe` uses fewer in a default build.
+- `fuzzy_img` JPEGs are decoded by zune-jpeg 0.5.15, not libclamav's 0.5.8: the
+  hashes are the same except for baseline JPEGs with a scan for each component,
+  which 0.5.8 drew flat (`8000000000000000`), and damaged files it panicked on.
 - A damaged CAB or archive keeps more of what it decoded.
 
 ### Fixed

@@ -145,6 +145,39 @@ fn a_jpeg_decodes_to_the_size_its_frame_header_declares() {
     assert_eq!(p.to_rgba8().len(), width as usize * height as usize * 4);
 }
 
+/// Found by the `imagehash` fuzz target: zune-jpeg 0.5.8 asserts in its
+/// upsampler when the components' sampling factors do not nest (here luma 1x2,
+/// a chroma component 2x1). 0.5.15 decodes the file.
+#[test]
+fn a_jpeg_whose_sampling_factors_do_not_nest_is_decoded() {
+    let jpeg: &[u8] =
+        include_bytes!("../../../tests/fixtures/fuzz/jpeg-sampling-factors-that-do-not-nest.jpg");
+    let p = decode(jpeg, Format::Jpeg, DECODE_MAX).unwrap();
+    assert_eq!((p.width, p.height), (150, 103));
+}
+
+/// A baseline JPEG with a scan for each component draws what the same picture
+/// in one scan does. zune-jpeg 0.5.8 drew it flat, so that it hashed as
+/// `8000000000000000`, which `sigtool --fuzzy-img` still gives (the pictures
+/// are written by `tests/fixtures/images/make.py`).
+#[test]
+fn a_jpeg_with_a_scan_for_each_component_is_drawn() {
+    let samples = |jpeg: &[u8]| {
+        let p = decode(jpeg, Format::Jpeg, DECODE_MAX).unwrap();
+        let Samples::U8(v) = p.samples else { panic!() };
+        v
+    };
+    let one = samples(include_bytes!(
+        "../../../tests/fixtures/images/sequential-interleaved.jpg"
+    ));
+    let each = samples(include_bytes!(
+        "../../../tests/fixtures/images/sequential-non-interleaved.jpg"
+    ));
+    assert_eq!(one.len(), each.len());
+    assert!(one.iter().any(|&b| b != one[0]), "the picture has detail");
+    assert!(one.iter().zip(&each).all(|(a, b)| a.abs_diff(*b) <= 2));
+}
+
 /// Found by the `imagehash` fuzz target: weezl 0.1.10 asserted, in debug
 /// builds, that a TIFF LZW table never holds 4,095 codes, which a stream
 /// without a clear code reaches. One clear code, then a literal per pixel,
@@ -1216,6 +1249,26 @@ fn short(v: u16) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 
+/// No value is a number, so no range is worked out from them.
+#[test]
+fn a_float_tiff_of_nothing_but_nan_is_drawn_black() {
+    let strip: Vec<u8> = [f32::NAN; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let file = tiff_strip(
+        4,
+        1,
+        &strip,
+        &[
+            (258, 3, short(32)),
+            (262, 3, short(1)),
+            (277, 3, short(1)),
+            (339, 3, short(3)),
+        ],
+    );
+    let p = decode_any(&file, DECODE_MAX).unwrap();
+    let Samples::U8(v) = p.samples else { panic!() };
+    assert_eq!(v, [0, 0, 0, 0]);
+}
+
 /// What the hashing decoder refuses, `decode_any` draws for the eye.
 #[test]
 fn tiffs_of_floats_signed_values_and_palettes_are_shown() {
@@ -1705,6 +1758,36 @@ fn tiffs_of_ccitt_fax_are_shown() {
     };
     assert_ne!(hashed, half);
     assert_eq!(grey(&file), half);
+}
+
+/// Found by the `imagehash` fuzz target: values of 3, 5, 6 and 7 bits run
+/// into the next byte, which the unpacking did not allow for (it subtracted
+/// below zero).
+#[test]
+fn tiffs_of_samples_that_run_into_the_next_byte_are_shown() {
+    let grey = |p: Pixels| {
+        let Samples::U8(v) = p.samples else { panic!() };
+        v
+    };
+    // 3 bits: 0 to 7, as 000 001 010 011 100 101 110 111.
+    let three = tiff_strip(
+        8,
+        1,
+        &[0b0000_0101, 0b0011_1001, 0b0111_0111],
+        &[(258, 3, short(3)), (262, 3, short(1)), (277, 3, short(1))],
+    );
+    assert_eq!(
+        grey(decode_any(&three, DECODE_MAX).unwrap()),
+        [0, 36, 72, 109, 145, 182, 218, 255]
+    );
+    // 5 bits, 3 of them: 31, 0, 17 as 11111 00000 10001, then a pad bit.
+    let five = tiff_strip(
+        3,
+        1,
+        &[0b1111_1000, 0b0010_0010],
+        &[(258, 3, short(5)), (262, 3, short(1)), (277, 3, short(1))],
+    );
+    assert_eq!(grey(decode_any(&five, DECODE_MAX).unwrap()), [255, 0, 139]);
 }
 
 /// A fill order of 2 has the bits of each byte in reverse order (libtiff

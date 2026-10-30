@@ -12,6 +12,7 @@ use libfuzzer_sys::fuzz_target;
 const BUDGET: u64 = 16 << 20;
 
 fuzz_target!(|data: &[u8]| {
+    exav_fuzz_support::panics::contained_panics();
     let _ = exav_render::image::raw::detect(data);
     let _ = exav_render::image::raw::preview(data, BUDGET);
     let _ = exav_render::image::decode_any(data, BUDGET);

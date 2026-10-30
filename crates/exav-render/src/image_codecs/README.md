@@ -7,6 +7,18 @@ for JPEG-compressed TIFF, `image` and `tiff` decode with zune-jpeg 0.5.8 and
 code (IDCT, upsampling and colour conversion for AVX2 and NEON), all of its
 `unsafe`, chosen at run time. Nothing downstream can turn those features off.
 
+The JPEG path here runs zune-jpeg **0.5.15**, not 0.5.8: ClamAV is not a
+reference to track version by version, and 0.5.8 panics on damaged files
+(sampling factors that do not nest, in its upsampler) that 0.5.15 decodes. On
+532 JPEGs (every chroma subsampling, quality 10 to 100, progressive, restart
+markers, odd sizes, grey, and the fixtures and wild files) the two give the same
+hash for all but the files below. Where they differ, 0.5.8 gives
+`8000000000000000`, the hash of a flat image: a baseline JPEG with a scan for
+each component instead of one for all (libjxl's `*_non_interleaved` and
+`*_partially_interleaved` samples; `tests/fixtures/images/make.py` writes
+one), which 0.5.15 decodes, so the hash is its pixels' and no longer what
+`sigtool --fuzzy-img` gives. The 0.4.21 of JPEG-compressed TIFF is unchanged.
+
 So `image` is built without its `jpeg` and `tiff` features, and this module
 holds what it would have run, over zune-jpeg built with `std` only, where it
 applies `forbid(unsafe_code)`:

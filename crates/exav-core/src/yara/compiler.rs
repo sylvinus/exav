@@ -1427,8 +1427,9 @@ fn const_to_cond(v: crate::yara::ir::Value) -> Cond {
 /// Deepest parenthesis nesting a rule source may have. The parser tries each
 /// `(` twice, as a boolean group and as an arithmetic one, and does not keep
 /// what the first try parsed, so a rule with an error inside `d` open
-/// parentheses costs about 2^d steps (a 3.5 KB rule with 15 took 5.6 s).
-const MAX_PAREN_DEPTH: usize = 12;
+/// parentheses costs about 2^d steps (a 3.5 KB rule with 15 took 5.6 s, and
+/// one of 3 KB with 12 took 0.3 s, which is 6 s under a sanitizer).
+const MAX_PAREN_DEPTH: usize = 10;
 
 /// Most operators (characters and keywords) one expression of a condition may
 /// chain, between `and`, `or`, a comma or a parenthesis. The parser and what
@@ -1604,6 +1605,22 @@ mod paren_depth_tests {
             start.elapsed()
         );
         assert_eq!(rejected.len(), 1);
+    }
+
+    /// A 3 KB rule with an error inside 12 open parentheses (`yara`, fuzz run
+    /// of the 2026-10-30 campaign): 0.3 s in a release build, 6 s under the
+    /// sanitizer, so it was close to the fuzzer's timeout.
+    #[test]
+    fn a_rule_with_an_error_in_twelve_parentheses_is_refused_fast() {
+        let src = include_str!("../../tests/fixtures/fuzz/yara_nested_parens_12.yar");
+        let start = Instant::now();
+        let err = Compiler::new().add_source(src).err().expect("refused");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("nested"), "{err}");
     }
 
     #[test]

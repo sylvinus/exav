@@ -20,16 +20,17 @@ doctest = false
 
 [dependencies]
 # The decoders are at the versions libclamav 1.5.4 links, so that exav-imagehash
-# reproduces ClamAV's hash bit for bit. JPEG and TIFF are not `image` features:
-# they go through `src/image_codecs/`, `image`'s own decoders over zune-jpeg
-# built without its SIMD code (its only `unsafe`), which `image` and `tiff`
-# cannot turn off. Pinned with `=` for `cargo install`, which resolves without
-# Cargo.lock.
+# reproduces ClamAV's hash bit for bit, except zune-jpeg for JPEG, which is
+# newer (see `src/image_codecs/README.md`). JPEG and TIFF are not `image`
+# features: they go through `src/image_codecs/`, `image`'s own decoders over
+# zune-jpeg built without its SIMD code (its only `unsafe`), which `image` and
+# `tiff` cannot turn off. Pinned with `=` for `cargo install`, which resolves
+# without Cargo.lock.
 image = { version = "=0.25.9", default-features = false, features = ["png", "gif", "bmp"], optional = true }
 png = { version = "=0.18.0", optional = true }
 gif = { version = "=0.14.1", optional = true }
-zune-jpeg = { version = "=0.5.8", default-features = false, features = ["std"], optional = true }
-zune-core = { version = "=0.5.0", optional = true }
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"], optional = true }
+zune-core = { version = "=0.5.3", optional = true }
 # The vendored `tiff` decoder's dependencies, as tiff 0.10.3 has them less
 # `half`, and `bytemuck` for its byte casts.
 zune-jpeg-04 = { package = "zune-jpeg", version = "=0.4.21", default-features = false, features = ["std"], optional = true }

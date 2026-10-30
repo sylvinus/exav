@@ -371,17 +371,29 @@ uploading `fuzz/artifacts`.
 fork mode, and reports what each one found:
 
 ```sh
-scripts/fuzz-campaign.sh                          # one hour, split evenly
-TOTAL=1800 scripts/fuzz-campaign.sh               # half an hour
+scripts/fuzz-campaign.sh                          # one hour, one worker
+TOTAL=25200 WORKERS=3 scripts/fuzz-campaign.sh    # seven hours, three at a time
 TARGETS="analyze x86_decode" scripts/fuzz-campaign.sh
 ```
 
-It builds every target **before** running any of them and refuses to start if
-one fails. That gate is not ceremony: `cargo fuzz run` per target, with its
-output piped away, turns a compile error into a target that "ran" and found
-nothing — the same shape in the log as a clean run, which is the worst possible
-way to be wrong about test coverage. It also reports only the artifacts *this*
-campaign produced, so a stale directory does not read as new findings.
+It runs every `fuzz/fuzz_targets/*.rs` unless `TARGETS` names some, `WORKERS`
+at a time (one per core). A target's slice is what is left of `TOTAL` shared
+among the targets not started, so a slow build shortens the slices and not the
+campaign. The timeout and memory limit are those of `fuzz-smoke`, so a finding
+is one CI would have made, and a unit over `SLOW` seconds (4) is kept as a
+`slow-unit-*` artifact: those time out on a slower machine. A target's binary
+is deleted once it has run (`KEEP_BINARIES=1` keeps them); each is hundreds of
+megabytes.
+
+A target that does not build is reported with its log, and the script exits
+non-zero: a compile error must not read as a target that "ran" and found
+nothing, which is the worst possible way to be wrong about test coverage. It
+reports only the artifacts *this* campaign produced, so a stale directory does
+not read as new findings. The logs are in `tmp/data/fuzzlogs/`.
+
+The seeds are `scripts/fuzz-seeds.sh`'s, which also takes the files of a
+directory of wild samples (`tmp/samples-issues`, or `WILD`) for the targets that
+read a whole file of a format (`scripts/fuzz-seeds-wild.sh`).
 
 ### Memory
 
@@ -497,7 +509,7 @@ boundary is a backstop, not an excuse to leave our own parsers panicky.
 | `"secret" xor(1-255)` over 64 KB (`analyze`, 6 execs a second after the YARA rules were added; 3 s a scan) | `yara/matcher.rs` `PatternMatcher::search` | every position was compared with every key in the range, 255 times the work, and an `xor` pattern is never gated by an atom, so every scan paid it; a 16 MiB object took 9 s | the one key a position can match with is its first byte's (`a_wide_xor_range_does_not_cost_a_comparison_per_key_per_position`, `xor_finds_each_key_where_it_was_used`) |
 | `/a.{0,32}b[^\x00-\x1f]+c\b/s` over 2 MiB of text (`full_pipeline`, timeout, all-match mode) | the YARA regex matcher | a start position's match runs to the end of the text, so the work is quadratic in it; yara's own engine has the same shape | not a bug in exav: the rule is the cost (`fuzz/db/fuzz.yar` bounds its repetition) |
 | InstallShield Z table of 498 bytes (`unpack`, 8-hour run, OOM at 1.5 GB, 10 s) | `formats/ishield_z.rs` `declared_members` | `unshield` builds an entry for each of `dirs` x `dir_files` (two `u16`) before checking anything, and a directory record whose chunk size is 0 is read again for the next, so a few bytes ask for billions of entries; the walk's `MAX_ENTRIES` came after | the members the records declare are summed first, as `unshield` walks them, and a table over `MAX_ENTRIES` is reported as unexamined (`a_table_declaring_more_members_than_the_walk_bound_is_reported_not_built`, `a_table_of_many_directories_each_declaring_many_members_stays_small`) |
-| 3.5 KB YARA rule with an error inside 15 open parentheses (`yara`, 8-hour run, timeout; 5.6 s in a release build) | `yara/compiler.rs` `check_paren_depth` | `yara-x-parser` (1.21 too) tries each `(` as a boolean group and as an arithmetic one and keeps nothing of the first try, so a rule that fails inside `d` parentheses costs about 2^d steps; its fuel (100M steps) is not configurable | nesting past 12 is refused before the parse, strings, comments and regular expressions skipped (`a_rule_with_an_error_deep_in_parentheses_is_refused_fast`, `nesting_up_to_the_bound_compiles_and_one_more_is_refused`) |
+| 3.5 KB YARA rule with an error inside 15 open parentheses (`yara`, 8-hour run, timeout; 5.6 s in a release build) | `yara/compiler.rs` `check_paren_depth` | `yara-x-parser` (1.21 too) tries each `(` as a boolean group and as an arithmetic one and keeps nothing of the first try, so a rule that fails inside `d` parentheses costs about 2^d steps; its fuel (100M steps) is not configurable | nesting past 10 is refused before the parse (it was 12, until a rule with 12 took 6 s under the sanitizer), strings, comments and regular expressions skipped (`a_rule_with_an_error_deep_in_parentheses_is_refused_fast`, `a_rule_with_an_error_in_twelve_parentheses_is_refused_fast`, `nesting_up_to_the_bound_compiles_and_one_more_is_refused`) |
 | RAR5 encrypted headers asking for 2^24 PBKDF2 iterations (`full_pipeline`, 8-hour run, two slow units of 21 and 28 s under the sanitizer) | `formats/rar5_crypt.rs` `find_keys_within` | one derivation at the largest count RAR writes is 2.6 s in a release build, and the bound on a scan's derivations (2^25 iterations) allowed two. The bound was also kept in each archive's cache, and an archive inside another starts a cache of its own; RAR3's (256 derivations of 2^18 SHA-1 rounds) was kept the same way | the bound is 2^22 and the scan's (0.65 s; the two units still take 11 and 14 s under the sanitizer because `full_pipeline` scans an input four times to compare the answers), counted in `Budget`: a count past it is reported as encrypted like a member no password opens, and a refused derivation is not charged (`a_count_whose_derivation_exceeds_the_scan_bound_is_not_derived`, `archives_of_one_scan_share_the_derivation_bound`, and RAR3's `archives_of_one_scan_share_the_derivation_limit`) |
 | 805-byte JPEG declaring a large image (`imagehash`, 8-hour run, slow unit, 10 s under the sanitizer) | none | the grey conversion and Lanczos resize of a 16 MiB image: 0.44 s in a release build. A different filter would change the hash, which must be ClamAV's | not a bug; the target gives the hasher 4 MiB (`HASH_BUDGET`), as for the JPEG 2000 row above |
 | LZVN block (DMG, from the differential test against Apple's decoder, not the fuzzer) whose payload ends before its end opcode, or whose declared payload is longer than the input yet ends | `formats/lzfse.rs` `lzvn_block` | any shortfall of the payload was called "cut" when the input was shorter than declared, even when the end opcode had been read; a cut run is not reported as damaged by DMG | cut only when the payload ends without its end opcode and the input ends there; otherwise damaged (`an_lzvn_payload_longer_than_the_input_that_still_ends_is_damaged_not_cut`) |
