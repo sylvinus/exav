@@ -379,10 +379,13 @@ test.describe("a CSV", () => {
     await pages(page).toBe(1);
     await page.waitForTimeout(800);
     const box = (await sheetCanvas(page).boundingBox())!;
-    // Four columns of 59 and four rows of 20 under the 50 x 22 headers.
-    const screen = await shot(page, { x: box.x + 50, y: box.y + 22, width: 236, height: 80 });
-    const p = await raster(page, 1, { width: 236 });
-    expect([p.width, p.height]).toEqual([236, 80]);
+    // Four rows of 20 under the 50 x 22 headers, and four columns as wide as
+    // the machine's font makes them (59 in one, 67 in another).
+    const shape = await raster(page, 1, { width: 1000 });
+    const width = Math.round((shape.width / shape.height) * 80);
+    const screen = await shot(page, { x: box.x + 50, y: box.y + 22, width, height: 80 });
+    const p = await raster(page, 1, { width });
+    expect([p.width, p.height]).toEqual([width, 80]);
     expect(close(screen, p)).toBeLessThan(6);
     const left = await raster(page, 1, { width: 118, region: { x: 0, y: 0, width: 0.5, height: 1 } });
     expect(ink(left)).toBeGreaterThan(50);

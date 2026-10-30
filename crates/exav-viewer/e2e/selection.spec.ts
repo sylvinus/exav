@@ -93,15 +93,24 @@ for (const doc of DOCS) {
         const found = doc.find(root);
         await expect(found.start).toHaveCount(1);
         await expect(found.ready).toBeAttached();
+        // Placed: an attached run has no box until the layout reaches it.
+        await expect(found.start).toBeVisible();
         return found;
       }
 
       const selection = (inside: Locator) => inside.evaluate((el) => el.ownerDocument.getSelection()?.toString() ?? "");
 
+      // WebKit has no box for a run for a moment after the page is laid out again.
+      async function boxOf(place: Locator) {
+        let box = null as { x: number; y: number; width: number; height: number } | null;
+        await expect.poll(async () => (box = await place.boundingBox())).not.toBeNull();
+        return box!;
+      }
+
       test("a line dragged across, from its first letter to its last, is selected as written", async ({ page }) => {
         const { start, end } = await open(page);
-        const a = (await start.boundingBox())!;
-        const b = (await end.boundingBox())!;
+        const a = await boxOf(start);
+        const b = await boxOf(end);
         const y = a.y + a.height / 2;
         await page.mouse.move(a.x + 1, y);
         await page.mouse.down();
@@ -113,8 +122,8 @@ for (const doc of DOCS) {
 
       test("a selection dragged on into the blank beside the text keeps its start", async ({ page }) => {
         const { start, sheet } = await open(page);
-        const a = (await start.boundingBox())!;
-        const s = (await sheet.boundingBox())!;
+        const a = await boxOf(start);
+        const s = await boxOf(sheet);
         await page.mouse.move(a.x + 1, a.y + a.height / 2);
         await page.mouse.down();
         // Three lines down, at the right of the page, where there is no text.

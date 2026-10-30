@@ -10,6 +10,8 @@ pub mod gltf;
 pub mod ifc;
 #[cfg(feature = "image")]
 pub mod image;
+#[cfg(feature = "jp2")]
+mod jp2_tiles;
 #[cfg(feature = "markdown")]
 pub mod markdown;
 #[cfg(any(

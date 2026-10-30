@@ -2071,6 +2071,40 @@ fn four_bands_under_a_greyscale_colour_box_show_the_first() {
     assert_eq!(v[..4], [5, 15, 25, 35]);
 }
 
+/// A codestream of 776 bytes whose header gives tiles of 16 by 16 samples on a
+/// grid of 3,997,753 by 33: three quarters of a million tiles, where 16 bits
+/// name 65,535. The decoder worked through all of them (0.4 s here, and with
+/// tiles of two samples, minutes).
+#[cfg(feature = "jp2")]
+#[test]
+fn a_codestream_with_more_tiles_than_a_file_can_name_is_refused() {
+    let file = hex(
+        "ff4fff5100290000003d0039000000210000000000000000000000100000001000000000000000000001\
+         078202ff52000c00000001000204040001ff5c000a4040484850484850ff640025000143726561746564\
+         206279204f70656e4a5045472076657273696f6e20322e352e33ff90000a0000000000530001ff93df80\
+         300784051bfd7fc1f38583e70b00f8430cf56f9e7f0b80ff48470be7f3c0f904c0f904c07c8280221cdf\
+         ee8847529fb519be95fcdc789b50f71693b8a2768beb93b9bfff90000a0001000000520001ff93cfb414\
+         0fa88786b7c3ea0483e709ffd8ff0d01987b0b3afcbf0368c3c0f905c0f905407c824022161b4d4a7585\
+         5184a67f1edacf2ad385968304f3202ae04814a5c1269fff90000a0002000000670001ff93df803004e9\
+         1f0fa9e7cfc01a7e00d1f8028004c2f1d9cebf0c4438ef770b0b57902498cfc0423ed0f8fc038015fcd8\
+         48941b94868dc4c0fa2366b9b715fcf2a41807caa44106a5e2b3afdf06c1ed8a09f467872c1b741182e3\
+         ff90000a0003000000420001ff93cfb414078b7669c3c03a0c1f385807c210040f7d03ff7f0447c00055\
+         0001ff93cfb41808f838e7ad7fc1f38383e70901f2030cf64a0b80e9410d590fc1f38c81f20b80f905ad\
+         6d492a80000000b5fa8004ab754844aada945500005b00005faea0000aaa948957b552ab80000000b5fa\
+         940155552112b55524ad000000005fb6a1000955442556d5492b080100002dc0f904407c818011e5c01f\
+         a619cfae42f9a5fd730109bc266716ff90000a0008000000200001ff93c7d4060affffffffffffffffff\
+         ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+         ffffffffffffffffffffffffffffffffffffffffffffffffff19be95fcdc789b50f71693b8a2768beb93\
+         b9bfff90000a0001000000520001ff93cfb4140fa88786b7c3eaa2cfc01004b5ff7fc7da0c0b40a5f14f\
+         7fff90000a000a000000200001ef93c7d40606ab5fc1f3820b0bc1f3840f9b66d7ff90000a000b000000\
+         1b0001ff93cfb4080ab580c07c218008ff7fffd9",
+    );
+    assert_eq!(
+        decode(&file, Format::Jpeg2000, DECODE_MAX),
+        Err(Error::Undecodable)
+    );
+}
+
 /// The 18 bytes that start a Targa file: colour map type, image type, first
 /// map entry, map length and entry bits, size, depth and descriptor.
 #[allow(clippy::too_many_arguments)]

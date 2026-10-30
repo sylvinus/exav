@@ -58,6 +58,9 @@ pub fn decode_jpx(
         return Err(Error::new("Unknown format"));
     };
     let siz = read_siz(codestream)?;
+    if crate::formats::jp2_tiles::has_too_many_tiles(codestream) {
+        return Err(Error::new("Too many tiles"));
+    }
     check_tile_parts(codestream)?;
 
     if params.reduce_power > 0 && !siz.reducible(params.reduce_power) {
@@ -664,6 +667,25 @@ impl<'a> Iterator for BoxIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tiles of one sample over a grid of 2^32: the header alone is refused,
+    /// before the decoder starts on them.
+    #[test]
+    fn a_header_with_more_tiles_than_a_file_can_name_is_refused() {
+        let mut cs = vec![0xFF, 0x4F, 0xFF, 0x51, 0, 41, 0, 0];
+        for n in [u32::MAX, u32::MAX, 0, 0, 1, 1, 0, 0] {
+            cs.extend_from_slice(&n.to_be_bytes());
+        }
+        cs.extend_from_slice(&[0, 1, 7, 1, 1]);
+        let params = JpxParams {
+            num_components: 1,
+            indexed: false,
+            smask_in_data: false,
+            reduce_power: 0,
+        };
+        let err = decode_jpx(&cs, params, 1 << 30).unwrap_err();
+        assert_eq!(err.to_string(), "Too many tiles");
+    }
 
     /// Each entry of the component mapping box is a plane of its own, so a
     /// few kilobytes of boxes asked for planes without end.

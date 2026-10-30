@@ -5,6 +5,9 @@ use hayro_jpeg2000::{ColorSpace, DecodeSettings, DecoderContext, Image};
 use super::{Channels, Error, Pixels, Samples, cmyk_to_rgb, within, ycc_to_rgb};
 
 pub(super) fn decode(data: &[u8], max_alloc: u64) -> Result<Pixels, Error> {
+    if crate::formats::jp2_tiles::has_too_many_tiles(data) {
+        return Err(Error::Undecodable);
+    }
     let image = Image::new(data, &DecodeSettings::default()).map_err(|_| Error::Undecodable)?;
     let (width, height) = (image.width(), image.height());
     let colour = u64::from(image.color_space().num_channels());
