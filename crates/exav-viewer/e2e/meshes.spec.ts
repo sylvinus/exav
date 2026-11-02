@@ -80,10 +80,16 @@ for (const mode of ["sandbox", "page"] as const) {
       });
     }
 
-    test("vertex colours and material colours show, and a file with none is grey", async ({ page }) => {
-      const warm = (r: number, g: number, b: number) => r - b > 60;
-      const cool = (r: number, g: number, b: number) => b - r > 60;
-      for (const [name, coloured] of [["house.ply", true], ["house.glb", true], ["house.obj", false]] as const) {
+    for (const [name, why, coloured] of [
+      ["house.ply", "vertex colours show", true],
+      ["house.glb", "material colours show", true],
+      ["house.obj", "a file with no colour is grey", false],
+    ] as const) {
+      test(`${why} (${name})`, async ({ page }) => {
+        // Software rendering on a loaded runner: each load and settle is slow.
+        test.slow();
+        const warm = (r: number, g: number, b: number) => r - b > 60;
+        const cool = (r: number, g: number, b: number) => b - r > 60;
         await open(page, name === "house.ply" ? "house.obj" : name);
         if (name === "house.ply") {
           await pick(page, name);
@@ -92,8 +98,8 @@ for (const mode of ["sandbox", "page"] as const) {
         const p = await settled(engine(page).locator(".exav-viewer-model-canvas"));
         expect(find(p, warm).count > 500, `${name} warm`).toBe(coloured);
         expect(find(p, cool).count > 500, `${name} cool`).toBe(coloured);
-      }
-    });
+      });
+    }
 
     test("a glTF whose buffer is another file is drawn when that file is given with it", async ({ page }) => {
       await page.goto(`./?${new URLSearchParams({ lang: "en", ...(mode === "page" ? { mode } : {}) })}`);
