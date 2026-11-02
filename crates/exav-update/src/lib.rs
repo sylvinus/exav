@@ -639,6 +639,22 @@ fn prune_empty_dirs(dir: &Path, is_root: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// The version is written here and in exav-core, which this crate cannot
+    /// depend on: a bump in one only would make every download be refused, or
+    /// accepted and misread. Not checked from a package without the workspace.
+    #[test]
+    fn the_database_version_is_that_of_exav_core() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../exav-core/src/database.rs");
+        let Ok(core) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let line = core
+            .lines()
+            .find(|l| l.starts_with("const VERSION: u32 = "))
+            .expect("exav-core's database::VERSION");
+        assert_eq!(line, format!("const VERSION: u32 = {EXAV_DB_VERSION};"));
+    }
+
     #[test]
     fn base64_matches_known_vectors() {
         assert_eq!(base64(b""), "");

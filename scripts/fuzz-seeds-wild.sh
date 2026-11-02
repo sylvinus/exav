@@ -4,8 +4,8 @@
 #
 #   scripts/fuzz-seeds-wild.sh OUT [DIR]    # adds OUT/<target>/wild_* from DIR
 #
-# DIR is a tree of sample files (default: tmp/samples-issues, which is not in
-# the repository). The test fixtures give a target one file of a format; a
+# DIR is a tree of sample files (none by default, and none in the repository:
+# fuzz-seeds.sh passes $WILD). The test fixtures give a target one file of a format; a
 # directory of what other programs write gives it the variants that parsers
 # are written against, and the fuzzer starts from the structure instead of
 # finding it. Run by scripts/fuzz-seeds.sh; nothing is copied into the
@@ -17,11 +17,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:?usage: scripts/fuzz-seeds-wild.sh OUT [DIR]}"
-DIR="${2:-$ROOT/tmp/samples-issues}"
+DIR="${2:-}"
 MAX_BYTES="${MAX_BYTES:-65536}"
 PER_TARGET="${PER_TARGET:-300}"
 
-[ -d "$DIR" ] || exit 0
+[ -n "$DIR" ] && [ -d "$DIR" ] || exit 0
 
 # wild TARGET EXT...: the files of DIR with one of the extensions.
 wild() {

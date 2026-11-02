@@ -35,6 +35,8 @@ const unpackWasm = fs.realpathSync(path.join(nodeModules, "@exav", "unpack-wasm"
  * the demo is built. None by default.
  */
 const externalConverter = process.env.EXAV_EXTERNAL_CONVERTER || undefined;
+/** The formats the demo's frame is published for, comma separated; all by default (e2e/frame-formats.spec.ts). */
+const frameFormats = process.env.EXAV_FRAME_FORMATS ? process.env.EXAV_FRAME_FORMATS.split(",") : undefined;
 // Its files are served from where it is installed (a `file:` dependency lives outside node_modules).
 const externalDir = externalConverter && fs.existsSync(path.join(nodeModules, externalConverter)) ? fs.realpathSync(path.join(nodeModules, externalConverter)) : undefined;
 
@@ -191,7 +193,7 @@ export default defineConfig({
   define: { __DEMO_ORIGIN__: JSON.stringify(origin), __EXTERNAL_CONVERTER__: JSON.stringify(externalConverter ?? null) },
   // The sandboxed frame at `${base}frame/`, served with its headers by `vite
   // preview`. It may play the demo's own media by URL and fetch from it.
-  plugins: [exavViewer({ frameDir: "frame", frameOrigin: origin, mediaOrigins: [origin], connectOrigins: [origin], externalConverter }), licences(), e2eFiles()],
+  plugins: [exavViewer({ frameDir: "frame", frameOrigin: origin, mediaOrigins: [origin], connectOrigins: [origin], externalConverter, formats: frameFormats }), licences(), e2eFiles()],
   // Beside the docs site's 4321.
   server: { port: 4322, strictPort: true, host: true, fs: { allow: [pkgDir, nodeModules, unpackWasm, ...(externalDir ? [externalDir] : [])] } },
   // headless.html: a host drawing its own controls, without React.

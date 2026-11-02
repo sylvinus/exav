@@ -18,6 +18,7 @@ import type { Connect, Plugin } from "vite";
 
 import { frameCsp, frameHeaders } from "../frame/policy.js";
 import { collectAssets, contentType, frameFileBytes, frameFiles, type Asset } from "./assets.js";
+import { checkFrameFormats } from "./subset.js";
 
 export interface ExavViewerPluginOptions {
   /**
@@ -33,6 +34,15 @@ export interface ExavViewerPluginOptions {
    * documentation lists, ideally from a domain of its own.
    */
   frameDir?: string;
+  /**
+   * The formats the published frame opens (`BUILTIN_ORDER` names them all),
+   * with `frameDir`. The frame is published with the files of their engines
+   * only, and opens no other format: the viewer's `sandbox.formats` must be
+   * within them. All of them by default. A format brings the others of its engine
+   * (`stl` those of the meshes) and those a converted one is shown as; see
+   * "The sandboxed frame" in the documentation for what each costs.
+   */
+  formats?: string[];
   /**
    * The origin the frame is served from ("https://viewer.example.com"),
    * written into its policy beside `'self'`: WebKit matches `'self'` against
@@ -67,8 +77,10 @@ export function exavViewer(options: ExavViewerPluginOptions = {}): Plugin {
   const dir = trim(options.assetDir ?? "exav-viewer");
   const frameDir = options.frameDir === undefined ? null : trim(options.frameDir);
   const origins = { media: options.mediaOrigins ?? [], connect: options.connectOrigins ?? [] };
-  // A bad origin fails the build here, not in the browser.
+  // A bad origin or format fails the build here, not in the browser.
   frameCsp(options.frameOrigin, origins);
+  if (options.formats && !frameDir) throw new Error("formats needs frameDir: it says what the frame published there opens");
+  const frameFormats = options.formats && checkFrameFormats(options.formats);
   let base = `/${dir}`;
   let frameBase = frameDir && `/${frameDir}`;
   let root = process.cwd();
@@ -107,7 +119,7 @@ export function exavViewer(options: ExavViewerPluginOptions = {}): Plugin {
       const { assets, manifest } = collectAssets(root, { externalConverter: options.externalConverter });
       for (const a of assets) this.emitFile({ type: "asset", fileName: `${dir}${a.path}`, source: fs.readFileSync(a.source) });
       this.emitFile({ type: "asset", fileName: `${dir}manifest.json`, source: JSON.stringify(manifest) });
-      if (frameDir) for (const f of frameFiles(root, options.externalConverter)) this.emitFile({ type: "asset", fileName: `${frameDir}${f.path}`, source: frameFileBytes(f, options.frameOrigin, origins) });
+      if (frameDir) for (const f of frameFiles(root, options.externalConverter, frameFormats)) this.emitFile({ type: "asset", fileName: `${frameDir}${f.path}`, source: frameFileBytes(f, options.frameOrigin, origins) });
     },
     configurePreviewServer(server) {
       server.middlewares.use(frame());
@@ -115,7 +127,7 @@ export function exavViewer(options: ExavViewerPluginOptions = {}): Plugin {
     configureServer(server) {
       const { assets, manifest } = collectAssets(root, { externalConverter: options.externalConverter });
       const served = new Map<string, Asset>(assets.map((a) => [`${base}${a.path}`, a]));
-      if (frameDir) for (const f of frameFiles(root, options.externalConverter)) served.set(`${frameBase}${f.path}`, f);
+      if (frameDir) for (const f of frameFiles(root, options.externalConverter, frameFormats)) served.set(`${frameBase}${f.path}`, f);
       server.middlewares.use(frame());
       server.middlewares.use((req, res, next) => {
         const asked = (req.url ?? "").split("?")[0] ?? "";

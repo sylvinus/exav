@@ -132,3 +132,64 @@ fn an_xz_stream_cut_anywhere_gives_a_prefix_of_the_whole() {
         );
     }
 }
+
+#[cfg(feature = "lzma")]
+fn lzma_alone(data: &[u8]) -> Vec<u8> {
+    let mut w = lzma_rust2::LzmaWriter::new_use_header(
+        Vec::new(),
+        &lzma_rust2::LzmaOptions::with_preset(6),
+        None,
+    )
+    .unwrap();
+    w.write_all(data).unwrap();
+    w.finish().unwrap()
+}
+
+/// What reading the stream of an LZMA-alone file gives: the bytes, and whether
+/// the error it ends in says content was left undecoded.
+#[cfg(feature = "lzma")]
+fn read_lzma_alone(blob: &[u8]) -> (Vec<u8>, Option<bool>) {
+    use exav_unpack::{Member, decode_error_hides_content, walk};
+    let mut out = (Vec::new(), None);
+    let mut visit = |_: &exav_unpack::MemberMeta, m: Option<Member<'_>>, _: &mut Budget| {
+        if let Some(Member::Stream(r)) = m {
+            let mut data = Vec::new();
+            let end = r
+                .read_to_end(&mut data)
+                .err()
+                .map(|e| decode_error_hides_content(&e));
+            out = (data, end);
+        }
+        None::<()>
+    };
+    let _ = walk(
+        Format::Lzma,
+        &blob,
+        &mut Budget::new(Limits::default()),
+        &mut visit,
+    );
+    out
+}
+
+/// `xz -dc` writes more of an LZMA-alone stream that is cut than the decoder
+/// here gives (it keeps back the symbols of the last bytes it was given:
+/// hundreds of bytes of text), so a cut stream is not one whose every byte was
+/// decoded: the error it ends in says content is left, and the scan reports the
+/// file as not fully examined. What it gives is a prefix of the whole.
+#[cfg(feature = "lzma")]
+#[test]
+fn an_lzma_alone_stream_cut_short_is_reported_as_such() {
+    let data = words_then_payload();
+    let blob = lzma_alone(&data);
+    assert_eq!(read_lzma_alone(&blob), (data.clone(), None), "whole");
+    for cut in [1, 2, 3, 5, 20, 100, 400] {
+        let (got, end) = read_lzma_alone(&blob[..blob.len() - cut]);
+        assert!(data.starts_with(&got), "cut {cut}");
+        assert_eq!(
+            end,
+            Some(true),
+            "cut {cut}: {} bytes, error {end:?}",
+            got.len()
+        );
+    }
+}

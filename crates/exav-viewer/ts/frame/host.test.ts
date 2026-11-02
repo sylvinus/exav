@@ -90,7 +90,7 @@ async function mountWith(
     },
     controllers: () => session.controllers.get(),
   };
-  if (ready) await frame.send({ type: "ready", protocol: PROTOCOL, policy });
+  if (ready) await frame.send({ type: "ready", protocol: PROTOCOL, policy, formats: null });
   await tick(5);
   return frame;
 }
@@ -146,7 +146,7 @@ describe("the frame element", () => {
 
   it("is dropped when it speaks another protocol, or does not start", async () => {
     const f = await mount({}, "plan.dwg", false);
-    await f.send({ type: "ready", protocol: PROTOCOL + 1, policy: null });
+    await f.send({ type: "ready", protocol: PROTOCOL + 1, policy: null, formats: null });
     expect(f.session.status.get().phase).toBe("error");
     expect(f.received.find((m) => m.type === "open")).toBeUndefined();
 
@@ -156,6 +156,21 @@ describe("the frame element", () => {
     const s = viewer.mount(host, { id: "x", name: "a.pdf", source: { bytes: new Uint8Array(1) } });
     await tick(60);
     expect(s.status.get()).toMatchObject({ phase: "error", error: { code: "pdf" } });
+  });
+
+  it("is dropped when it was published without the format of the file, and says so", async () => {
+    const f = await mount({}, "plan.dwg", false);
+    await f.send({ type: "ready", protocol: PROTOCOL, policy: null, formats: ["pdf", "image"] });
+    expect(f.received.find((m) => m.type === "open")).toBeUndefined();
+    expect(f.session.status.get()).toMatchObject({ phase: "error", error: { code: "drawing" } });
+    expect(f.session.status.get()).toMatchObject({ error: { cause: { message: expect.stringContaining("published without dwg") } } });
+
+    // One that was published with it, or for all of them, is given the file.
+    for (const formats of [["dwg", "dxf"] as const, null]) {
+      const g = await mount({}, "plan.dwg", false);
+      await g.send({ type: "ready", protocol: PROTOCOL, policy: null, formats });
+      expect(g.received.find((m) => m.type === "open")).toBeDefined();
+    }
   });
 
   it("goes with the session", async () => {

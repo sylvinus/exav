@@ -102,12 +102,13 @@ be named) and carries nothing else. Everything else goes over the port:
 | From | Messages |
 |---|---|
 | host | `open` (the file as its delivery says, below; its name and type, the paths of the files around it when it has a tree, the formats, the plugin options as plain data, the theme), `command` (go to a page, zoom, fit, a layer on or off, a layout, the ground, open or leave an archive member, a sheet, play, pause, seek, the volume), `bytes` (the answer to a `read` or a `fetch`), `theme` (the page's colours again), `replace` (the next document of the session, delivered as `open` delivers the first), `raster` and `unraster` (a page as a picture, with its size and region; stop drawing it), `watch` and `unwatch` (follow the viewport, whose upkeep costs: from a first listener or a read to the last one leaving) |
-| frame | `ready` (with its page's policy), `status`, `controllers` and `state` (each controller's value; the viewport's only while the host watches it), `done` (a command finished), `replaced` (a `replace` finished, or refused), `link`, `read` and `cancel` (bytes of a file read by ranges, the read naming the document it is for), `fetch` (a whole file of the tree the host listed, by its path), `key` (a key the document did not use), `rastered` (the picture asked for, with the region it shows, or why there is none) |
+| frame | `ready` (with its page's policy, and the formats it was published for), `status`, `controllers` and `state` (each controller's value; the viewport's only while the host watches it), `done` (a command finished), `replaced` (a `replace` finished, or refused), `link`, `read` and `cancel` (bytes of a file read by ranges, the read naming the document it is for), `fetch` (a whole file of the tree the host listed, by its path), `key` (a key the document did not use), `rastered` (the picture asked for, with the region it shows, or why there is none) |
 
 The protocol is versioned: the frame says which in `ready` (`PROTOCOL`, now 5),
 and a host that does not speak it refuses the frame, so the page and the frame
 must come from the same release. Version 5 added `replace`, `raster`,
-`unraster`, `watch`, `unwatch` and the `viewport` controller, put the document
+`unraster`, `watch`, `unwatch` and the `viewport` controller, put the formats
+a frame was published for in `ready`, put the document
 in each `read`, and replaced `draw` and `drawn`. A `raster` the frame finds
 malformed is answered by a `rastered` that says `invalid`.
 

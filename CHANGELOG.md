@@ -22,7 +22,7 @@ a file differently from the program that opens it.
 - **A visible-text layer** (`visible-text`, on by default, off under
   `--clamav-compat`): Markdown, HTML, Word, PowerPoint, Excel, OpenDocument and
   AutoCAD files are also scanned as the text a reader sees, for `Target:0` and
-  `Target:7` signatures and `--alert-phishing`. PDF text and the text of legacy
+  `Target:7` signatures and `--detect phishing`. PDF text and the text of legacy
   and flat office files (DOC, XLS, PPT, RTF, FODT and others) are opt-in
   (`visible-text-pdf`, `visible-text-office`). `exav-grep --text` searches it.
 - **Office documents converted in safe Rust, in `exav-render`** (features
@@ -41,7 +41,10 @@ a file differently from the program that opens it.
 - **The viewer** (`@exav/viewer`) opens many more files (RAW cameras, JPEG XL,
   SVG, OBJ, PLY, glTF, more IFC, older Office, more archives), draws pages of
   documents, 3D models and drawings, can be driven by the host's own UI, and
-  speaks German, Spanish and Dutch.
+  speaks German, Spanish and Dutch. A sandboxed frame can be published for
+  some formats only (`formats`, `--format`), with the files of
+  their engines alone (31 MiB for all, 4 MiB for PDF), and the
+  documentation's size tables are written from the build.
 - **Daemon**: `--listen-health ADDR`, a listener that answers while the
   workers are busy, and a `STATS` that reports the whole pool.
 
@@ -77,7 +80,7 @@ a file differently from the program that opens it.
   CMYK, Zstandard, tiled, planar and more), and an external converter hook for
   the viewer.
 - `scripts/bench-speed.sh`, a speed benchmark against `clamscan`.
-- 243 freely licensed example files for the viewer demo.
+- 235 freely licensed example files for the viewer demo.
 
 ### Changed
 
@@ -96,7 +99,8 @@ The ones that could change a verdict:
 - **Files that a reader opens differently from exav are read as that reader
   reads them:** ZIP, PDF, mail, ISO and UDF, `ar`, `cpio`, bzip2, xz, CAB,
   NSIS and PowerPoint objects, and files holding a second archive. A message
-  attached to an email is now scanned.
+  attached to an email is now scanned. A `.lzma` file cut short is reported
+  as not fully examined (the decoder keeps back the last bytes).
 - **Base64 in scripts and pages:** more archive types are decoded, and a cap
   on the number of decoded files is reported (`LIMITS-EXCEEDED`).
 - A damaged executable carved from a file no longer turns a detection behind

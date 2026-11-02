@@ -187,11 +187,6 @@ pub enum FileType {
     Fat,         // FAT12/16/32 filesystem
     Inno,        // Inno Setup installer (recognised, not decoded)
     Ntfs,        // NTFS filesystem
-    Exfat,       // exFAT filesystem
-    Squashfs,    // SquashFS image
-    Cramfs,      // cramfs image
-    Romfs,       // romfs image
-    Erofs,       // EROFS image
     Zstd,        // Zstandard compressed stream
     Lzip,        // Lzip compressed stream
     Uuencode,    // uuencode / base64-uuencode wrapped file
@@ -226,6 +221,12 @@ pub enum FileType {
     // (`Target:7`) signatures match.
     HtmlView,
     TextView,
+    // Stored by index in the `.exavdb`: add new variants below, never above.
+    Exfat,    // exFAT filesystem
+    Squashfs, // SquashFS image
+    Cramfs,   // cramfs image
+    Romfs,    // romfs image
+    Erofs,    // EROFS image
 }
 
 impl FileType {

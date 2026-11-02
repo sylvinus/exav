@@ -170,12 +170,21 @@ describe("reads and the policy the frame reports", () => {
 
   it("come as lists of sources, or null", () => {
     const policy = { script: ["'self'"], connect: ["'self'", "https://a.test"], img: [], media: ["blob:"] };
-    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy })).toEqual({ type: "ready", protocol: PROTOCOL, policy });
-    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: null })).toEqual({ type: "ready", protocol: PROTOCOL, policy: null });
-    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL })).toBeNull();
-    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: { ...policy, media: ["<b>"] } })).not.toBeNull();
-    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: { ...policy, media: ["a b"] } })).toBeNull();
-    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: { ...policy, img: "x" } })).toBeNull();
+    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy, formats: null })).toEqual({ type: "ready", protocol: PROTOCOL, policy, formats: null });
+    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: null, formats: null })).toEqual({ type: "ready", protocol: PROTOCOL, policy: null, formats: null });
+    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, formats: null })).toBeNull();
+    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: { ...policy, media: ["<b>"] }, formats: null })).not.toBeNull();
+    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: { ...policy, media: ["a b"] }, formats: null })).toBeNull();
+    expect(checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: { ...policy, img: "x" }, formats: null })).toBeNull();
+  });
+
+  it("say which formats the frame was published for, as known ones, or null for all", () => {
+    const ready = (formats: unknown) => checkFrameMessage({ type: "ready", protocol: PROTOCOL, policy: null, formats });
+    expect(ready(["pdf", "image"])).toEqual({ type: "ready", protocol: PROTOCOL, policy: null, formats: ["pdf", "image"] });
+    // A name it does not know is dropped, as in an `open`.
+    expect(ready(["pdf", "nope", 4])).toEqual({ type: "ready", protocol: PROTOCOL, policy: null, formats: ["pdf"] });
+    expect(ready([])).toEqual({ type: "ready", protocol: PROTOCOL, policy: null, formats: [] });
+    for (const bad of [undefined, "pdf", {}, 1, Array.from({ length: 200 }, () => "pdf")]) expect(ready(bad), JSON.stringify(bad)?.slice(0, 30)).toBeNull();
   });
 });
 

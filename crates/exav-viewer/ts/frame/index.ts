@@ -656,6 +656,8 @@ function mountFrame(
         // error, said here rather than left to the policy to block.
         const mismatch = policyMismatch(message.policy, config.origins ?? {});
         if (mismatch) return fail(errorCode(format), new Error(mismatch));
+        // Likewise a frame published without this file's format: said here, with its cause.
+        if (known && message.formats && !message.formats.includes(known)) return fail(errorCode(format), new Error(`the frame was published without ${known}: name it in the \`formats\` of the Vite plugin, or with \`--format\``));
         void send();
         return;
       }

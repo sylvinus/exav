@@ -62,6 +62,10 @@ then the engines of the formats you open (all optional peer dependencies):
 | Archives | `archive()` from `@exav/viewer/archive` | `@exav/unpack-wasm` |
 | Default UI | `@exav/viewer/react` | `react`, `react-dom` (19) |
 
+What each format costs to load, wasm modules and frame included, in bytes
+(raw, brotli and gzip), is on the
+[Integration](https://exav.org/viewer/integration/#two-kinds-of-files) page.
+
 IFC models (IFC2X3, IFC4, IFC4X3) are read and meshed by exav's own engine
 (exav-render), and three.js draws them. Categories and building storeys
 (`controllers.storeys`, for a model with two or more) can be hidden.
@@ -182,6 +186,12 @@ page lists, ideally from a domain of its own.
 // vite.config.ts
 export default { plugins: [exavViewer({ frameDir: "exav-frame", frameOrigin: "https://app.example.com" })] };
 ```
+
+The frame is published with every engine (about 31 MiB). The plugin's
+`formats: ["pdf", "image"]` publishes the files of those formats' engines only, and
+the frame opens no other format; give the viewer the same list in `sandbox`
+(`formats`). The sizes are on the
+[Integration](https://exav.org/viewer/integration/#a-frame-for-some-formats-only) page.
 
 ```tsx
 import { SandboxedViewerProvider } from "@exav/viewer/react/sandbox";

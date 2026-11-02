@@ -356,3 +356,33 @@ unsafe = 3833
 crates_all = 69
 unsafe_all = 3833
 twice = 3
+
+[[review]]
+workspace = "root"
+date = "2026-10-30"
+release = "0.0.3"
+crates = 133
+unsafe = 4660
+crates_all = 181
+unsafe_all = 7379
+twice = 6
+
+[[review]]
+workspace = "unpack-wasm"
+date = "2026-10-30"
+release = "0.0.3"
+crates = 72
+unsafe = 2793
+crates_all = 73
+unsafe_all = 2793
+twice = 0
+
+[[review]]
+workspace = "viewer"
+date = "2026-10-30"
+release = "0.0.3"
+crates = 69
+unsafe = 3848
+crates_all = 69
+unsafe_all = 3848
+twice = 3

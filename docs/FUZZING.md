@@ -391,9 +391,11 @@ nothing, which is the worst possible way to be wrong about test coverage. It
 reports only the artifacts *this* campaign produced, so a stale directory does
 not read as new findings. The logs are in `tmp/data/fuzzlogs/`.
 
-The seeds are `scripts/fuzz-seeds.sh`'s, which also takes the files of a
-directory of wild samples (`tmp/samples-issues`, or `WILD`) for the targets that
-read a whole file of a format (`scripts/fuzz-seeds-wild.sh`).
+The seeds are `scripts/fuzz-seeds.sh`'s: the fixtures, the files the tools of
+each format write (`scripts/fuzz-seeds-generate.py`: archivers, `mkfs`,
+an office suite, Pillow, libjpeg, OpenJPEG, `qpdf`, `ezdxf`; what is installed is
+used), and the files of a directory of wild samples when `WILD` names one
+(`scripts/fuzz-seeds-wild.sh`).
 
 ### Memory
 

@@ -29,7 +29,7 @@ is on exav.org.
   (opt-in) PDF and (opt-in, `visible-text-office`) the legacy and flat office
   formats: `visible-text` in exav-core, `exav-grep --text`, through
   `exav_render::text::visible_text`, matched as a text view; a link's label and
-  target are in that text, and `--alert-phishing` judges them. An office
+  target are in that text, and `--detect phishing` judges them. An office
   document whose text cannot be taken out (encrypted, past a limit, damaged)
   marks the scan incomplete. To do: an email's headers (its bodies are members,
   HTML and text, and are read); the hyperlinks of OOXML files, which live in
@@ -478,7 +478,10 @@ scanner's, and are not part of this aim.
 
 ## Robustness
 
-- **An LZMA-alone stream cut short gives about 20 bytes less than `xz -dc`.**
+- **An LZMA stream cut short gives less than `xz -dc`: up to hundreds of bytes
+  for text that compresses well.** A `.lzma` file cut short is reported as not
+  fully examined; a ZIP or 7z member cut by the end of the file is not (the
+  decoder here is the one for both).
   `LzmaStream`, the decoder `lzma-rust2` offers without I/O, will not decode the
   symbols of the last bytes it was given, and a `Finish` call fails with no
   output. The xz reader gets the same bytes by giving its decoder one zero byte

@@ -23,9 +23,11 @@ pub(crate) fn walk<T>(
 ) -> Result<Option<T>, LimitHit> {
     let mut source = Reader::new(src);
     stream_single(&mut source, budget, visit, "lzma-content", |r| {
-        Ok(Box::new(SansIo::new(
-            r,
-            LzmaStream::new_mem_limit(MEM_LIMIT_KIB, None),
-        )) as Box<dyn Read + '_>)
+        // A file cut short is damage here: the decoder keeps back the symbols of
+        // the last bytes it has, which `xz -dc` writes.
+        Ok(
+            Box::new(SansIo::new(r, LzmaStream::new_mem_limit(MEM_LIMIT_KIB, None)).cut_is_damage())
+                as Box<dyn Read + '_>,
+        )
     })
 }

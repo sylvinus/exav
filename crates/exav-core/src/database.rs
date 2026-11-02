@@ -41,7 +41,7 @@ const MAGIC: &[u8; 8] = b"EXAVDB\x00\x01";
 /// Enum variants are stored by index ([`to_vec_indexed`]), so reordering the
 /// variants of a stored enum, or inserting one before others, changes the
 /// format as much as a new field does: bump this then, and exav-update's
-/// `EXAV_DB_VERSION` with it.
+/// `EXAV_DB_VERSION` with it. New variants go at the end instead.
 const VERSION: u32 = 4;
 /// Fixed header: 8-byte magic + 4-byte little-endian version.
 const HEADER_LEN: u64 = 12;
@@ -732,6 +732,24 @@ mod tests {
             "a variant written by its name"
         );
         assert!(bytes.len() < rmp_serde::to_vec(&v).unwrap().len());
+    }
+
+    /// A `FileType` is stored by the position of its variant, so a variant
+    /// inserted or moved changes how every database written before is read,
+    /// with no error. Pinned: the first variant, one in the middle, `Unknown`,
+    /// the last of those exav 0.0.2 stored, and the first and last since. When
+    /// one moves, bump `VERSION` and exav-update's `EXAV_DB_VERSION`, then
+    /// write the new bytes here.
+    #[test]
+    fn file_type_variants_keep_their_stored_index() {
+        use crate::filetype::FileType;
+        let stored = |t: FileType| super::to_vec_indexed(&t).unwrap();
+        assert_eq!(stored(FileType::Pe), [0], "Pe");
+        assert_eq!(stored(FileType::Zstd), [41], "Zstd");
+        assert_eq!(stored(FileType::Unknown), [64], "Unknown");
+        assert_eq!(stored(FileType::TextView), [66], "TextView");
+        assert_eq!(stored(FileType::Exfat), [67], "Exfat");
+        assert_eq!(stored(FileType::Erofs), [71], "Erofs");
     }
 
     #[test]

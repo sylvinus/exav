@@ -51,7 +51,7 @@ import { createSandboxedViewer } from "@exav/viewer/frame";
 
 const viewer = createSandboxedViewer({
   url: "https://viewer-frame.example-files.com/exav-frame/index.html",
-  formats: ["pdf", "image", "dwg", "dxf"], // default: every built-in format but the converted Office ones (BUILTIN_ORDER names all)
+  formats: ["pdf", "image", "dwg", "dxf"], // default: every built-in format but the converted Office ones (BUILTIN_ORDER names all); a frame published with the plugin's `formats` opens those only
   options: { cad: { ground: "dark" }, image: { maxDecodeBytes: 128 * 2 ** 20 } },
   confirmLink: (url) => window.confirm(`Open ${url}?`), // the default asks the same
 });

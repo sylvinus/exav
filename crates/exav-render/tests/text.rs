@@ -40,11 +40,11 @@ fn markdown_html_and_package_parts_by_what_they_are() {
 /// `wants`, which the scanner asks first, wants text to begin with.
 #[test]
 fn a_binary_file_with_a_spreadsheet_marker_among_its_bytes_is_not_that_document() {
-    let mut data = b"AC1012\0\0\0\0\0\0\x01X\0\0\0\0\0\x1e\0\x05\0\0\0\x12".to_vec();
-    data.extend_from_slice(
+    let xml: &[u8] =
         b"<?xml version=\"1.0\"?><Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\">\
-          <Worksheet/></Workbook>",
-    );
+                       <Worksheet/></Workbook>";
+    let mut data = b"AC1012\0\0\0\0\0\0\x01X\0\0\0\0\0\x1e\0\x05\0\0\0\x12".to_vec();
+    data.extend_from_slice(xml);
     // And a flat OpenDocument file's root element.
     let mut flat = b"{\\rinrtf2\0\x05\xb2\0\0\0\x01X\0\0\0\0\0\x1e\0\x05".to_vec();
     flat.extend_from_slice(
@@ -56,10 +56,12 @@ fn a_binary_file_with_a_spreadsheet_marker_among_its_bytes_is_not_that_document(
             assert!(!wants(name, &data[..data.len().min(1024)]), "{name}");
         }
     }
-    // The same document as text is read, and wanted.
-    let doc = &data[data.len() - 107..];
-    assert!(wants("a.xml", doc));
-    assert!(text("a.xml", doc).is_some());
+    // The same document as text is read, and wanted, where the office formats are.
+    #[cfg(feature = "text-office")]
+    {
+        assert!(wants("a.xml", xml));
+        assert!(text("a.xml", xml).is_some());
+    }
 }
 
 #[test]

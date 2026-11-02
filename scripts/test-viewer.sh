@@ -20,7 +20,8 @@
 #      the page, against samples whose content is known; and the frame's
 #      guarantees (e2e/frame.spec.ts) and text selection and copy in PDF,
 #      Word, PowerPoint and Excel files (e2e/selection.spec.ts) in
-#      Chromium, Firefox and WebKit.
+#      Chromium, Firefox and WebKit. Then the demo again with its frame
+#      published for some formats only (e2e/frame-formats.spec.ts).
 #
 # USAGE:
 #   scripts/test-viewer.sh            # all three
@@ -76,6 +77,9 @@ npm run build
 # Vite plugin, neither of which is checked in.
 npm run typecheck
 node scripts/check-package.mjs
+# The size tables of the documentation, written from this build
+# (`npm run sizes`): the same rows, the sizes within a few percent.
+node scripts/size-tables.mjs --check
 
 echo "== the demo, and what it ships =="
 # Its sidebar's files, from github.com/sylvinus/exav-samples (HEAD), or from
@@ -93,3 +97,12 @@ else
   npx playwright install chromium firefox webkit
 fi
 npx playwright test
+
+echo "== playwright (a frame published for some formats only) =="
+# The same demo with the frame's files for PDF, RTF and XLS alone (`formats` of the plugin):
+# what it opens must not need a file that was left out, and the other formats
+# must end in an error.
+FRAME_FORMATS=pdf,rtf,xls
+rm -rf demo/dist
+EXAV_FRAME_FORMATS=$FRAME_FORMATS npm run demo:build
+EXAV_FRAME_FORMATS=$FRAME_FORMATS npx playwright test e2e/frame-formats.spec.ts --project=chromium

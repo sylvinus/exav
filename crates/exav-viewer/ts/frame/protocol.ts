@@ -7,6 +7,7 @@
  * the host treats every frame message as untrusted, since the frame runs the
  * parsers.
  */
+import { BUILTIN_ORDER } from "../core/formats.js";
 import { checkRasterOptions, checkRegion, isRasterErrorCode, MAX_PICTURE_EDGE, MAX_PICTURE_PIXELS, regionMatches, type RasterErrorCode } from "../core/pictures.js";
 import { checkTheme, isColor, type FrameTheme } from "../core/theme.js";
 import type { BuiltinFormat, LayerItem, LoadStep, MediaState, OutlineEntry, RasterOptions, RasterRegion, RegionSpace, Selection, StoreyItem, Viewport, Warning } from "../core/types.js";
@@ -264,8 +265,11 @@ export interface Statics {
 }
 
 export type FrameMessage =
-  /** `policy`: the frame page's own Content-Security-Policy, null when it carries none in a meta tag. */
-  | { type: "ready"; protocol: number; policy: FramePolicy | null }
+  /**
+   * `policy`: the frame page's own Content-Security-Policy, null when it carries none in a meta tag.
+   * `formats`: the formats it was published for (`formats` of the Vite plugin), null for all of them.
+   */
+  | { type: "ready"; protocol: number; policy: FramePolicy | null; formats: readonly BuiltinFormat[] | null }
   | { type: "status"; session: number; status: StatusSnapshot }
   /** The session's controllers changed: these keys, with their values now. */
   | { type: "controllers"; session: number; values: Partial<Snapshots>; statics: Statics }
@@ -537,9 +541,11 @@ export function checkFrameMessage(v: unknown): FrameMessage | null {
   switch (v.type) {
     case "ready": {
       if (!isInt(v.protocol)) return null;
-      if (v.policy === null) return { type: "ready", protocol: v.protocol, policy: null };
+      if (v.formats !== null && !isList(v.formats, BUILTIN_ORDER.length)) return null;
+      const formats = v.formats === null ? null : v.formats.filter((f): f is BuiltinFormat => oneOf(f, BUILTIN_ORDER));
+      if (v.policy === null) return { type: "ready", protocol: v.protocol, policy: null, formats };
       const policy = checkPolicy(v.policy);
-      return policy ? { type: "ready", protocol: v.protocol, policy } : null;
+      return policy ? { type: "ready", protocol: v.protocol, policy, formats } : null;
     }
     case "status": {
       const status = checkStatus(v.status);

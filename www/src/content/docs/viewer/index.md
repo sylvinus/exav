@@ -71,9 +71,9 @@ file you open in it stays in your browser.
 | Video, audio (MP4, MOV, WebM, Ogg; MP3, M4A, AAC, WAV, Ogg, Opus, FLAC) | `video()`, `audio()`, `@exav/viewer/media` | the browser, with its controls or the host's | |
 | Archives: zip, 7z, rar, tar, cab, lzh, arj, ar and deb, cpio, xar and pkg, zoo, arc, alz, egg; compressed files: gz, bz2, xz, zst, lz4, lz, Z; packages that are zips (jar, war, apk, aab, ipa, xpi, whl, nupkg, vsix, kmz); comic books (cbz, cbr, cb7, cbt); disc and disk images: iso, dmg, wim, vhd, vhdx, vmdk, qcow2; chm help files; `winmail.dat` | `archive()`, `@exav/viewer/archive` | [exav-unpack](/unpack/wasm/) in wasm | `@exav/unpack-wasm` |
 
-The peer ranges: `@silurus/ooxml` `>=0.87.0 <1` (the package is built and
-tested with 0.89.1), `pdfjs-dist` `>=5.0.0 <7`, `three` `>=0.170.0 <1`,
-React 19. All are optional.
+The peer ranges, the versions the package is built with and what each adds
+to a build are in a [table](/viewer/integration/#peer-dependencies). All are
+optional.
 
 `@exav/viewer/all` exports `allPlugins()`, every plugin at once, for a host
 that installs every engine.

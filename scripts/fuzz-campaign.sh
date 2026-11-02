@@ -47,7 +47,7 @@ CODEGEN_UNITS="${CODEGEN_UNITS:-16}"
 # and GNU ld stops with "relocation truncated to fit: R_AARCH64_CALL26". LLD adds
 # the branch thunks. cargo-fuzz adds its flags to RUSTFLAGS; the lld setup in
 # .cargo/config.toml does not apply once RUSTFLAGS is set.
-if command -v ld.lld >/dev/null 2>&1; then
+if [ "$(uname -m)" = aarch64 ] && command -v ld.lld >/dev/null 2>&1; then
   export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=lld"
 fi
 # Order matters when a campaign is cut short: the broadest targets run first.

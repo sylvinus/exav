@@ -15,8 +15,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { AssetManifest } from "../core/assets.js";
+import type { BuiltinFormat } from "../core/types.js";
 import { FRAME_CSP, frameCsp, type FrameOrigins } from "../frame/policy.js";
 import { PDFJS_ASSET_DIRS, pdfjsAssetDir, pdfjsWasmDir } from "../pdf/assets.js";
+import { checkFrameFormats, frameSubset, pageFor, type FrameFilesManifest } from "./subset.js";
 
 /**
  * pdf.js's decoders this package replaces: its OpenJPEG and PDFium builds and
@@ -157,24 +159,47 @@ export function collectAssets(root: string, { externalConverter }: { externalCon
  * directory it is published in. Built with the package, not from the host's
  * node_modules: the frame carries its own engines. No external converter:
  * with `root` and `externalConverter`, the package installed there is added
- * under the frame's `exav-viewer/`, and its manifest names it.
+ * under the frame's `exav-viewer/`, and its manifest names it. With
+ * `formats`, only the files of the engines that open them (and those they
+ * need), and a page that says which formats it opens: the frame then opens
+ * no other.
  */
-export function frameFiles(root?: string, externalConverter?: string): Asset[] {
+export function frameFiles(root?: string, externalConverter?: string, formats?: readonly BuiltinFormat[]): Asset[] {
   const dir = own(path.join("dist", "frame", "app"));
   if (!fs.existsSync(dir)) throw new Error(`${dir} is missing: the package was built without its frame app`);
-  const files: Asset[] = walk(dir).map((source) => ({ source, path: path.relative(dir, source).split(path.sep).join("/") }));
+  let files: Asset[] = walk(dir).map((source) => ({ source, path: path.relative(dir, source).split(path.sep).join("/") }));
+  const manifest = files.find((f) => f.path === "exav-viewer/manifest.json");
+  if (formats !== undefined) {
+    // Only the engines of these formats. The page lists the formats it then
+    // opens, the notices the packages that are left, and the manifest the
+    // files that are.
+    const listing = own(path.join("dist", "frame", "files.json"));
+    if (!fs.existsSync(listing)) throw new Error(`${listing} is missing: the package was built without it`);
+    const subset = frameSubset(JSON.parse(fs.readFileSync(listing, "utf8")) as FrameFilesManifest, checkFrameFormats(formats), externalConverter !== undefined);
+    files = files.filter((f) => subset.files.has(f.path));
+    for (const f of files) {
+      if (f.path === "index.html") f.bytes = Buffer.from(pageFor(fs.readFileSync(f.source, "utf8"), subset.formats));
+      else if (f.path === "licenses/README.txt") f.bytes = Buffer.from(subset.readme);
+      else if (f === manifest) {
+        const m = JSON.parse(fs.readFileSync(f.source, "utf8")) as AssetManifest;
+        const kept = m.all.filter((p) => subset.files.has(`exav-viewer/${p}`));
+        const dirs = Object.fromEntries(Object.entries(m.dirs).filter(([, d]) => kept.some((p) => p.startsWith(d))));
+        f.bytes = Buffer.from(JSON.stringify({ ...m, dirs, all: kept }));
+      }
+    }
+  }
   if (root === undefined || externalConverter === undefined) return files;
   const external = converterAssets(root, externalConverter);
   if (!external) throw new Error(`the external converter ${externalConverter} is not installed beside ${root}`);
-  const manifest = files.find((f) => f.path === "exav-viewer/manifest.json");
-  if (!manifest) throw new Error("the frame app has no exav-viewer/manifest.json");
-  const m = JSON.parse(fs.readFileSync(manifest.source, "utf8")) as AssetManifest;
+  const kept = files.find((f) => f.path === "exav-viewer/manifest.json");
+  if (!kept) throw new Error("the frame app has no exav-viewer/manifest.json");
+  const m = JSON.parse((kept.bytes ?? fs.readFileSync(kept.source)).toString("utf8")) as AssetManifest;
   const merged: AssetManifest = {
     ...m,
     converters: { ...m.converters, [externalConverter]: `${external.dir}${external.entry}` },
     all: [...m.all, ...external.assets.map((a) => a.path)],
   };
-  manifest.bytes = Buffer.from(JSON.stringify(merged));
+  kept.bytes = Buffer.from(JSON.stringify(merged));
   return [...files, ...external.assets.map((a) => ({ ...a, path: `exav-viewer/${a.path}` }))];
 }
 

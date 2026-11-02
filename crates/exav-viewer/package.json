@@ -116,6 +116,7 @@
   ],
   "scripts": {
     "build:wasm": "bash scripts/build-wasm.sh",
+    "sizes": "node scripts/size-tables.mjs",
     "build": "node scripts/build.mjs",
     "test": "vitest run",
     "test:e2e": "playwright test",

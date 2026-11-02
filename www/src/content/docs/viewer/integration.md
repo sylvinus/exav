@@ -18,21 +18,28 @@ opens: the DWG module only when a drawing does, the spreadsheet converter
 only when an XLS, ODS or Numbers file does, and so on. The modules, as built
 from the current source:
 
+<!-- sizes:wasm -->
 | Module | Opens | Size | Brotli | Gzip |
-|---|---|---|---|---|
-| `exav_viewer_image` | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW | 1,887,799 | 545,639 | 692,041 |
-| `exav_viewer_dwg` | DWG, DXF | 910,004 | 364,922 | 443,809 |
-| `exav_viewer_model` | IFC, STL, OBJ, PLY, glTF | 343,651 | 130,295 | 156,216 |
-| `exav_viewer_text` | Markdown | 188,193 | 68,594 | 82,022 |
-| `exav_viewer_sheets` | XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX | 1,081,680 | 450,494 | 543,282 |
-| `exav_viewer_slides` | PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX | 1,015,358 | 434,088 | 521,416 |
-| `exav_viewer_docs` | DOC, ODT, FODT, RTF, to DOCX | 826,632 | 359,102 | 432,727 |
+| --- | --- | --- | --- | --- |
+| `exav_viewer_image` | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW | 2,082,327 | 599,290 | 768,562 |
+| `exav_viewer_dwg` | DWG, DXF | 921,111 | 369,630 | 461,103 |
+| `exav_viewer_model` | IFC, STL, OBJ, PLY, glTF | 415,447 | 156,293 | 189,171 |
+| `exav_viewer_text` | Markdown | 189,431 | 69,646 | 83,509 |
+| `exav_viewer_sheets` | XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX | 1,215,153 | 487,591 | 596,288 |
+| `exav_viewer_slides` | PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX | 1,019,003 | 435,522 | 525,127 |
+| `exav_viewer_docs` | DOC, ODT, FODT, RTF, to DOCX | 1,020,818 | 416,529 | 512,002 |
+| `openjpeg_nowasm_fallback.js` | JPEG 2000 images in PDFs (pdf.js's JPXDecode), the module in base64 | 269,813 | 83,250 | 100,297 |
+| `jbig2_nowasm_fallback.js` | JBIG2 and CCITT fax images in PDFs, the module in base64 | 317,903 | 69,613 | 87,921 |
+<!-- /sizes:wasm -->
 
-Sizes are in bytes, of the `.wasm` files in the package's `wasm/`. A server
-that compresses sends about the brotli or gzip column. pdf.js's two
-replacement decoders are inside their JavaScript fallbacks
-(`openjpeg_nowasm_fallback.js`, 269 KB, and `jbig2_nowasm_fallback.js`,
-318 KB, each holding its module in base64).
+Sizes are in bytes, of the files in the package's `wasm/`; a server that
+compresses sends about the brotli or gzip column. pdf.js's two replacement
+decoders are the two JavaScript fallbacks, each holding its module in
+base64. The table is written from the build (`npm run sizes`), not by hand.
+
+**JPEG XL** is in `exav_viewer_image` with the other decoders. Its decoder
+is about 0.8 MB of that module's 2 MB, and a page that opens a TIFF
+fetches it too.
 
 **The engines' runtime files**, which no import reaches: pdf.js's CMaps,
 standard fonts, ICC profiles and image decoders. They come from the host's own `node_modules`, so their
@@ -62,6 +69,27 @@ directory is named after this package's decoders too.
 
 Only the engines installed are copied. A host without `pdfjs-dist` gets no
 `pdfjs/` directory.
+
+## Peer dependencies
+
+The engines the package does not write are peer dependencies, all optional:
+a host installs the ones for the formats it opens, and none for the
+sandboxed frame, which carries its own. What each adds, as the frame bundles
+it (minified, with the workers, wasm and runtime files it brings); a host's
+bundler gives about the same. The Office engines load per format, not
+together: Word, Excel and PowerPoint each load their own code and parser,
+and the [frame table](#a-frame-for-some-formats-only) has the totals per
+format. The table is written from the build (`npm run sizes`):
+
+<!-- sizes:peers -->
+| Peer | Range | Tested with | Needed for | Size | Brotli | Gzip |
+| --- | --- | --- | --- | --- | --- | --- |
+| `pdfjs-dist` | `>=5.0.0 <7` | 6.4.299 | PDF | 3,699,311 | 1,786,844 | 2,083,171 |
+| `@silurus/ooxml` | `>=0.87.0 <1` | 0.89.3 | Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF | 15,566,588 | 3,980,443 | 5,180,257 |
+| `three` | `>=0.170.0 <1` | 0.186.1 | IFC, STL, OBJ, PLY, glTF | 754,038 | 157,003 | 193,013 |
+| `@exav/unpack-wasm` | `>=0.0.3` | 0.0.3 | Archives | 2,986,252 | 806,421 | 1,168,146 |
+| `react`, `react-dom` | `^19.0.0` |  | The React components (`@exav/viewer/react`); the host's own React, not measured |  |  |  |
+<!-- /sizes:peers -->
 
 ## Vite
 
@@ -141,6 +169,70 @@ or the frame's meta tag carries the policy on a static host.
 The frame does not use `assetBase`, `@exav/viewer/vite`'s copy of the
 host's engines, or the host's peer dependencies: in this mode a host
 installs `@exav/viewer` and, for the default UI, React.
+
+### A frame for some formats only
+
+Published as above, the frame has every engine, and a host that opens PDFs
+and images does not need the Office engines, the CAD renderer or the
+archive reader. The plugin's `formats` option (`--format` for the command
+line) publishes the files of the engines that open the formats it names,
+and nothing else:
+
+```ts
+// vite.config.ts
+exavViewer({ frameDir: "exav-frame", formats: ["pdf", "image"] });
+```
+
+```bash
+# other bundlers
+npx exav-viewer-assets public/exav-viewer --frame public/exav-frame --format pdf --format image
+```
+
+Give the viewer the same list (`sandbox={{ url, formats: ["pdf", "image"] }}`),
+so that it offers a download for the files the frame does not open: the
+viewer decides that in the page, before the frame is asked, so it cannot
+read the list from the frame. A file of a format the frame was published
+without still ends in the viewer's error, not in a request that is never
+answered: the frame says which formats it was published for when it starts,
+and the error names the `formats` option. It builds no plugin for the others.
+
+A frame is made of engines, not formats: one that opens `stl` opens `obj`,
+`ply` and `gltf` too, which share its files, and `dwg` and `dxf`, `xlsx`
+and `csv`, `rtf`, `doc` and `odt` go together in the same way. A converted
+format brings the viewer that shows its result (`ppt` brings PowerPoint,
+`rtf` Word), and, where an `externalConverter` is published with the frame,
+PDF and Excel, which are what an external converter answers with. What
+each costs, as built from the current source (the table is written from the
+build with `npm run sizes`; formats of different engines add up, less what
+they share, the Office viewers' common code above all):
+
+<!-- sizes:frame -->
+| A frame for | `formats` | Size | Brotli | Gzip |
+| --- | --- | --- | --- | --- |
+| The frame itself, in every one |  | 151,790 | 44,316 | 51,129 |
+| PDF | `pdf` | 4,462,648 | 1,991,537 | 2,331,430 |
+| Images: PNG, JPEG, WebP, GIF, SVG and the formats of the image module | `image` | 2,250,383 | 649,816 | 826,592 |
+| DWG, DXF | `dwg` | 2,885,763 | 2,166,151 | 2,264,334 |
+| IFC | `ifc` | 1,366,935 | 372,899 | 451,004 |
+| STL, OBJ, PLY, glTF | `stl` | 1,363,777 | 371,774 | 449,793 |
+| Word | `docx` | 7,493,323 | 1,881,588 | 2,419,599 |
+| Excel, CSV | `xlsx` | 5,547,202 | 1,395,134 | 1,786,733 |
+| PowerPoint | `pptx` | 5,746,511 | 1,415,073 | 1,837,894 |
+| XLS, ODS, Numbers | `xls` | 6,770,821 | 1,885,914 | 2,386,546 |
+| PPT, ODP, Keynote, ODG, Visio | `ppt` | 6,774,169 | 1,853,818 | 2,366,590 |
+| DOC, ODT, RTF | `rtf` | 8,522,717 | 2,301,325 | 2,935,153 |
+| Markdown, text | `text` | 355,429 | 119,385 | 140,646 |
+| Archives | `archive` | 3,174,207 | 861,590 | 1,232,226 |
+| Video, audio | `video` | 151,790 | 44,316 | 51,129 |
+| Every format |  | 32,643,982 | 11,289,223 | 13,838,144 |
+<!-- /sizes:frame -->
+
+The core is the page, its policy and the code that decides which engine
+opens a file; the engines' own code is loaded only when a file of their
+format opens, in a frame with all of them as in one with few. What the
+subset saves is what the host serves and a service worker precaches, and
+the licences it has to carry: `licenses/README.txt` in the frame lists the
+packages that are in it.
 
 ### How the bytes reach the frame
 

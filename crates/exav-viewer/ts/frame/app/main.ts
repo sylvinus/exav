@@ -7,7 +7,7 @@
 import { archive } from "../../archive/index.js";
 // The plugins alone: `cad/index.ts` also re-exports the engine.
 import { dwg, dxf } from "../../cad/plugin.js";
-import { BUILTIN_ORDER, CONVERTED_FORMATS } from "../../core/formats.js";
+import { BUILTIN_ORDER } from "../../core/formats.js";
 import type { BuiltinFormat, Controllers, FormatPlugin, Session, Status } from "../../core/types.js";
 import { createViewer } from "../../core/viewer.js";
 import { ifc } from "../../ifc/index.js";
@@ -41,6 +41,7 @@ import {
 import { pdf } from "../../pdf/index.js";
 import { text } from "../../text/index.js";
 import type { FileSource } from "../../core/types.js";
+import { FRAME_FORMATS_META, pluginFormats } from "../engines.js";
 import { readPolicy } from "../policy.js";
 import type { FrameTheme } from "../../core/theme.js";
 import { asRasterError, RasterError } from "../../core/pictures.js";
@@ -159,10 +160,18 @@ function plugins(formats: readonly BuiltinFormat[], o: FrameOptions, source: Ope
     text,
     archive: () => archive(o.archive),
   };
-  // A converted file is shown as a PDF or an XLSX: their plugins too.
-  const shown: BuiltinFormat[] = formats.some((f) => CONVERTED_FORMATS.includes(f)) ? ["pdf", "xlsx"] : [];
-  return [...formats, ...shown.filter((f) => !formats.includes(f))].map((f) => make[f]());
+  // A converted file is shown as a PDF, an XLSX, a PPTX or a DOCX: their plugins too.
+  return pluginFormats(formats, o.conversion?.externalConverter !== undefined).map((f) => make[f]());
 }
+
+/**
+ * The formats this frame was published for (`formats` of the Vite
+ * plugin), or null for all of them: its files for the others are not here.
+ */
+const shipped = (() => {
+  const list = document.querySelector(`meta[name="${FRAME_FORMATS_META}"]`)?.getAttribute("content");
+  return list && list !== "*" ? new Set(list.split(",")) : null;
+})();
 
 function statusOf(s: Status): StatusSnapshot {
   // The frame's plugins are the package's own: their codes are the built-in ones.
@@ -502,7 +511,8 @@ function receive(data: unknown) {
     if (!open) return;
     opened = true;
     applyTheme(open.theme);
-    const viewer = createViewer({ plugins: plugins(open.formats, open.options, open.source), assetBase: new URL("./exav-viewer/", base).href });
+    const formats = shipped ? open.formats.filter((f) => shipped.has(f)) : open.formats;
+    const viewer = createViewer({ plugins: plugins(formats, open.options, open.source), assetBase: new URL("./exav-viewer/", base).href });
     const host = document.getElementById("root")!;
     const { name, type, path, format } = open.file;
     const s = open.source;
@@ -563,5 +573,5 @@ addEventListener("message", function hello(e: MessageEvent) {
   // The policy in this page, for the host to check against its own origins.
   // One served as a header alone is not readable here.
   const csp = document.querySelector('meta[http-equiv="Content-Security-Policy" i]')?.getAttribute("content");
-  post({ type: "ready", protocol: PROTOCOL, policy: csp ? readPolicy(csp) : null });
+  post({ type: "ready", protocol: PROTOCOL, policy: csp ? readPolicy(csp) : null, formats: shipped && ([...shipped] as BuiltinFormat[]) });
 });
