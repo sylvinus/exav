@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { BUILTIN_ORDER } from "../core/formats.js";
 import { ENGINES, FRAME_FORMATS_META } from "../frame/engines.js";
@@ -48,7 +48,11 @@ describe("a frame for some formats", () => {
 });
 
 describe.runIf(fs.existsSync(path.join(root, "dist", "frame", "files.json")))("the built frame's files", () => {
-  const built = JSON.parse(fs.readFileSync(path.join(root, "dist", "frame", "files.json"), "utf8")) as FrameFilesManifest;
+  // Read when the suite runs: the body of a skipped suite still runs on collection.
+  let built: FrameFilesManifest;
+  beforeAll(() => {
+    built = JSON.parse(fs.readFileSync(path.join(root, "dist", "frame", "files.json"), "utf8")) as FrameFilesManifest;
+  });
   const app = path.join(root, "dist", "frame", "app");
 
   it("exist, and none is the core's and an engine's", () => {
