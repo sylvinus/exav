@@ -128,11 +128,7 @@ fn bbox(loops: &[Loop]) -> Option<[f64; 4]> {
             b[3] = b[3].max(p[1]);
         }
     }
-    if any {
-        Some(b)
-    } else {
-        None
-    }
+    if any { Some(b) } else { None }
 }
 
 /// Parameters along `u` where a line through `origin` crosses the loops,
@@ -235,11 +231,7 @@ pub fn min_spacing(lines: &[PatternLine]) -> f64 {
             best = best.min(step);
         }
     }
-    if best == f64::MAX {
-        0.0
-    } else {
-        best
-    }
+    if best == f64::MAX { 0.0 } else { best }
 }
 
 /// Generate the drawn segments of a hatch pattern, clipped to the region.

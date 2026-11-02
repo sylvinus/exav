@@ -849,7 +849,7 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
         if infos.len() == 1 {
-            if let Expr::LiteralBytes { ref bytes, .. } = infos[0].expr {
+            if let Expr::LiteralBytes { bytes, .. } = infos[0].expr {
                 self.emit_literal_bytes(bytes);
                 return Ok(());
             }
@@ -1898,7 +1898,7 @@ mod tests {
         assert_eq!(prog.len(), 5, "prog: {:?}", prog);
 
         assert_matches!(prog[0], Save(2));
-        assert_matches!(&prog[1], BackwardsDelegate(ReverseBackwardsDelegate { pattern, dfa: _, cache_pool: _, capture_group_extraction_inner: ref inner, capture_groups: Some(CaptureGroupRange(0, 1)) }) if pattern == "a(b+)" && inner.is_some());
+        assert_matches!(&prog[1], BackwardsDelegate(ReverseBackwardsDelegate { pattern, dfa: _, cache_pool: _, capture_group_extraction_inner: inner, capture_groups: Some(CaptureGroupRange(0, 1)) }) if pattern == "a(b+)" && inner.is_some());
         assert_matches!(prog[2], Restore(2));
         assert_matches!(prog[3], Lit(ref l) if l == "x");
         assert_matches!(prog[4], End);

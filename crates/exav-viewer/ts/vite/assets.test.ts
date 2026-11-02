@@ -70,13 +70,57 @@ describe("collectAssets", () => {
     expect(fs.existsSync(path.join(packageDir("pdfjs-dist", root)!, "wasm", "quickjs-eval.wasm"))).toBe(true);
   });
 
-  it("copies nothing for the IFC and STL engines, which are the package's own", () => {
+  it("copies nothing for the IFC and STL engines, which are the package's own, nor any external converter by default", () => {
     expect([...copied].filter((p) => !p.startsWith("pdfjs/"))).toEqual([]);
+    expect(manifest.converters).toBeUndefined();
   });
 
   it("lists every copied file in the manifest, each copied from a file that exists", () => {
     expect([...manifest.all].sort()).toEqual([...copied].sort());
     for (const a of assets) expect(fs.statSync(a.source).isFile()).toBe(true);
+  });
+});
+
+/**
+ * A project with an external converter installed: a package whose
+ * package.json says which files it publishes, and files that it does not.
+ */
+function projectWithConverter(pkg: Record<string, unknown> = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "converter-"));
+  const at = path.join(dir, "node_modules", "@acme", "to-pdf");
+  const put = (f: string, text = f) => {
+    fs.mkdirSync(path.dirname(path.join(at, f)), { recursive: true });
+    fs.writeFileSync(path.join(at, f), text);
+  };
+  put("package.json", JSON.stringify({ name: "@acme/to-pdf", version: "1.2.3", exports: { ".": { types: "./js/index.d.ts", default: "./js/index.js" } }, files: ["js", "pkg/data.bin", "LICENSE", "README.md"], ...pkg }));
+  for (const f of ["js/index.js", "js/run.js", "js/index.d.ts", "pkg/data.bin", "pkg/unpublished.bin", "LICENSE", "NOTICE", "README.md", "js/node_modules/dep/index.js", "tests/t.js"]) put(f);
+  return { dir, remove: () => fs.rmSync(dir, { recursive: true }) };
+}
+
+describe("an external converter's copy", () => {
+  it("copies what the package publishes, under its name and version, and records its entry", () => {
+    const { dir, remove } = projectWithConverter();
+    const { assets, manifest } = collectAssets(dir, { externalConverter: "@acme/to-pdf" });
+    const base = "converters/acme__to-pdf/1.2.3/";
+    expect(manifest.converters).toEqual({ "@acme/to-pdf": `${base}js/index.js` });
+    expect(assets.map((a) => a.path).sort()).toEqual(["js/index.js", "js/run.js", "pkg/data.bin", "LICENSE", "NOTICE"].map((f) => `${base}${f}`).sort());
+    expect(manifest.all).toEqual(assets.map((a) => a.path));
+    remove();
+  });
+
+  it("finds the entry in `exports` as a string, or in `main`", () => {
+    for (const pkg of [{ exports: "./js/index.js" }, { exports: { ".": "./js/index.js" } }, { exports: undefined, main: "js/index.js" }, { exports: { import: "./js/index.js" } }]) {
+      const { dir, remove } = projectWithConverter(pkg);
+      expect(collectAssets(dir, { externalConverter: "@acme/to-pdf" }).manifest.converters).toEqual({ "@acme/to-pdf": "converters/acme__to-pdf/1.2.3/js/index.js" });
+      remove();
+    }
+  });
+
+  it("fails when the package is not installed, or names no module", () => {
+    const { dir, remove } = projectWithConverter({ exports: undefined, main: undefined });
+    expect(() => collectAssets(dir, { externalConverter: "@acme/to-pdf" })).toThrow(/no entry module/);
+    expect(() => collectAssets(dir, { externalConverter: "@acme/absent" })).toThrow(/not installed/);
+    remove();
   });
 });
 
@@ -115,5 +159,22 @@ describe("the frame app's files", () => {
   it.runIf(fs.existsSync(path.join(root, "dist", "frame", "app")))("are the built app, page and scripts", () => {
     const paths = frameFiles().map((f) => f.path);
     for (const f of ["index.html", "app.js", "cad.worker.js", "pdfjs.worker.js", "ranges.worker.js", "exav-viewer/manifest.json"]) expect(paths, f).toContain(f);
+    // No external converter is in the package's frame app: its host adds one.
+    expect(paths.some((p) => p.includes("converters/"))).toBe(false);
+  });
+
+  it.runIf(fs.existsSync(path.join(root, "dist", "frame", "app")))("get an external converter from the host's packages, and a manifest that names it", () => {
+    const { dir, remove } = projectWithConverter();
+    const files = frameFiles(dir, "@acme/to-pdf");
+    const base = "converters/acme__to-pdf/1.2.3/";
+    expect(files.map((f) => f.path)).toContain(`exav-viewer/${base}pkg/data.bin`);
+    const manifestFile = files.find((f) => f.path === "exav-viewer/manifest.json")!;
+    const m = JSON.parse(frameFileBytes(manifestFile).toString("utf8"));
+    expect(m.converters).toEqual({ "@acme/to-pdf": `${base}js/index.js` });
+    expect(m.dirs.pdfjs).toMatch(/^pdfjs\//);
+    expect(m.all).toContain(`${base}js/run.js`);
+    // Without a name, the app's own files alone.
+    expect(frameFiles(dir).some((f) => f.path.includes("converters/"))).toBe(false);
+    remove();
   });
 });

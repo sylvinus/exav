@@ -118,13 +118,18 @@ pub(crate) fn content_reader(
 
 /// Every stream of an `.xz` input read from `input`, decoded as it is read.
 pub(crate) struct XzReader<R> {
-    input: R,
+    /// The input, with a check the decoder does not read taken out
+    /// ([`super::xz_nocheck`]).
+    input: super::xz_nocheck::NoCheck<R>,
     inbuf: Vec<u8>,
     in_pos: usize,
     in_len: usize,
     /// The decoder owns its dictionary allocation, so its lifetime is
     /// independent of the input; `'static` keeps it out of the caller's way.
-    decoder: xz4rust::XzDecoder<'static>,
+    /// Boxed: its tables are about 30 KB, which the frame of whatever holds
+    /// the reader would take for as long as a member is scanned, once per
+    /// level of xz inside xz.
+    decoder: Box<xz4rust::XzDecoder<'static>>,
     /// Decoded bytes not yet handed to the caller. A single `decode` call can
     /// produce more than the caller asked for, and those bytes cannot be
     /// re-derived, so they wait here.
@@ -133,20 +138,50 @@ pub(crate) struct XzReader<R> {
     done: bool,
     /// Input was fed to the decoder since the last end of stream.
     mid_stream: bool,
+    /// The input ended inside a stream, and that is yet to be reported.
+    cut: bool,
 }
 
 impl<R: std::io::Read> XzReader<R> {
     pub(crate) fn new(input: R) -> Self {
         XzReader {
-            input,
+            input: super::xz_nocheck::NoCheck::new(input),
             inbuf: vec![0; 8192],
             in_pos: 0,
             in_len: 0,
-            decoder: xz4rust::XzDecoder::with_alloc_dict_size(8192, XZ_MAX_DICT as usize),
+            decoder: Box::new(xz4rust::XzDecoder::with_alloc_dict_size(
+                8192,
+                XZ_MAX_DICT as usize,
+            )),
             staged: Vec::new(),
             taken: 0,
             done: false,
             mid_stream: false,
+            cut: false,
+        }
+    }
+
+    /// Stage what the decoder holds when the input ends inside a stream. It
+    /// reads ahead of what it writes, so the last bytes it could decode from
+    /// what it was given stay in it until it is given more; `xz -dc` writes
+    /// them. One zero byte stands for the input that is missing, and the
+    /// decoder, having its lookahead, writes them all at once. Output that
+    /// comes out byte for byte with the one zero given is not the stream's:
+    /// an uncompressed chunk copies its input, so the zero is all it makes of
+    /// it. Nothing is read from the decoder after that call, the rest of what
+    /// it writes being made of the padding.
+    fn drain(&mut self) {
+        self.cut = true;
+        let mut buf = [0u8; OUT_STEP];
+        if let Ok(result) = self.decoder.decode(&[0u8], &mut buf) {
+            let n = result.output_produced();
+            if matches!(result, xz4rust::XzNextBlockResult::EndOfStream(_, _)) {
+                // It ended after all: nothing was cut.
+                self.staged.extend_from_slice(&buf[..n]);
+                self.cut = false;
+            } else if n > result.input_consumed() {
+                self.staged.extend_from_slice(&buf[..n]);
+            }
         }
     }
 
@@ -176,20 +211,23 @@ impl<R: std::io::Read> std::io::Read for XzReader<R> {
                 return Ok(n);
             }
             if self.done {
-                return Ok(0);
-            }
-            self.staged.clear();
-            self.taken = 0;
-            if !self.fill()? {
-                self.done = true;
                 // The input ended inside a stream: the rest of it is not here.
-                if self.mid_stream {
+                if std::mem::take(&mut self.cut) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "xz: stream cut short",
                     ));
                 }
                 return Ok(0);
+            }
+            self.staged.clear();
+            self.taken = 0;
+            if !self.fill()? {
+                self.done = true;
+                if self.mid_stream {
+                    self.drain();
+                }
+                continue;
             }
             self.mid_stream = true;
             let mut buf = [0u8; OUT_STEP];

@@ -344,13 +344,13 @@ fn identify(pe: &Pe) -> Option<Packer> {
     // Entry-point signature for FSG (which strips section names). FSG 2.0 stubs
     // begin the decompressor with a distinctive load of the packed-source and
     // destination pointers. Match at the entry-point file offset only.
-    if let Some(off) = pe.rva_to_off(pe.entry_rva) {
-        if let Some(win) = crate::bytes::at(pe.data, off, 2) {
-            // `BE xx xx xx xx` (mov esi, imm32) is the canonical FSG 2.0 stub
-            // opener; require it to sit right at the entry point.
-            if win[0] == 0xBE && fsg_stub_plausible(pe, off) {
-                return Some(Packer::Fsg);
-            }
+    if let Some(off) = pe.rva_to_off(pe.entry_rva)
+        && let Some(win) = crate::bytes::at(pe.data, off, 2)
+    {
+        // `BE xx xx xx xx` (mov esi, imm32) is the canonical FSG 2.0 stub
+        // opener; require it to sit right at the entry point.
+        if win[0] == 0xBE && fsg_stub_plausible(pe, off) {
+            return Some(Packer::Fsg);
         }
     }
     None
@@ -586,8 +586,8 @@ fn looks_random_name(name: &[u8; 8]) -> bool {
         return false;
     }
     let switches = n
-        .windows(2)
-        .filter(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+        .array_windows()
+        .filter(|[a, b]| a.is_ascii_lowercase() && b.is_ascii_uppercase())
         .count();
     digits > 0 || switches >= 2
 }
@@ -798,15 +798,15 @@ fn aplib_unpack<R>(
         if stream.len() < 8 {
             continue;
         }
-        if let Some(out) = aplib::depack(stream, cap) {
-            if looks_like_pe(&out) {
-                budget.commit(out.len() as u64);
-                let name = format!("{}-unpacked", packer_name(packer));
-                return Ok(match visit(Entry::new(name, out), budget) {
-                    Some(r) => Recovered::Halt(r),
-                    None => Recovered::Emitted,
-                });
-            }
+        if let Some(out) = aplib::depack(stream, cap)
+            && looks_like_pe(&out)
+        {
+            budget.commit(out.len() as u64);
+            let name = format!("{}-unpacked", packer_name(packer));
+            return Ok(match visit(Entry::new(name, out), budget) {
+                Some(r) => Recovered::Halt(r),
+                None => Recovered::Emitted,
+            });
         }
     }
     Ok(Recovered::Nothing)
@@ -999,7 +999,7 @@ fn looks_like_pe(out: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{extract, Format, Limits};
+    use crate::{Format, Limits, extract};
 
     /// Build a minimal but structurally valid PE with the given section names
     /// and one section carrying `body` as raw data. Used both as the packed
@@ -1197,9 +1197,11 @@ mod tests {
     fn non_pe_input_is_ignored() {
         let mut b = Budget::new(Limits::default());
         assert!(!is_pepack(b"\x7fELF not a PE"));
-        assert!(extract(Format::PePacked, b"\x7fELF..", &mut b)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::PePacked, b"\x7fELF..", &mut b)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

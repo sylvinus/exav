@@ -13,14 +13,30 @@ does in [How extraction works](/unpack/how-it-works/).
 
 The CLI (which is also the daemon) drives the scanning engine, `exav-core`,
 which also builds its own WASI binary, `exav-wasm` (feature `wasi-bin`). Two
-front ends use only the extractor, `exav-unpack`: the archive grep and
+front ends use the extractor, `exav-unpack`: the archive grep and
 `@exav/unpack-wasm`. `@exav/viewer`'s wasm modules use only `exav-render`.
 
 `exav-core` hashes images through `exav-imagehash` (the `image-hash`
 feature), which decodes them with `exav-render`. exav-render reads DWG and DXF
-with exav-unpack's drawing parsers (its `dwg` feature); the scanner draws
-nothing. `exav-update`, behind the `http-update` feature (part of `http`),
-sits to the side, feeding fresh signatures out of band.
+with exav-unpack's drawing parsers (its `dwg` feature), and its text layer
+reads HTML and the XML parts of documents with exav-unpack's (its `text`
+feature). That layer, the text a reader sees in a document, is also what the
+scanner (`exav-core`'s `visible-text` feature) and the archive grep (its
+`text` feature) read documents through; the scanner draws nothing.
+`exav-update`, behind the `http-update` feature (part of `http`), sits to the
+side, feeding fresh signatures out of band.
+
+`exav-render` is one crate, with the office converters in it as modules:
+spreadsheets (`sheets`) to XLSX, presentations and drawings (`slides`) to
+PPTX and text documents (`docs`) to DOCX, each behind a feature
+(`office-sheets`, `office-slides`, `office-docs`, or `office` for the three),
+and a `common` module they share (ZIP packages, ODF's XML, code pages,
+compound files, iWork archives) that is not public. None is in the default
+feature set. Under the office features the crate adds `zip`, `quick-xml`,
+`encoding_rs`, `md-5` and `sha1` to its dependencies (`flate2`, which they use
+too, is already there for the image decoders). The scanner links all of them
+already, through exav-unpack, so `visible-text-office` adds code but no crate.
+The viewer builds `sheets`, `slides` and `docs` into one wasm module each.
 
 Every arrow points down: nothing calls anything above it, which is what lets
 the extraction, decoding and hashing crates be taken on their own. Dashed
@@ -34,11 +50,14 @@ labelled with.
   half of @exav/viewer), exav-grep and exav-unpack-wasm. exav depends on
   exav-core, and on exav-update behind the http-update feature. exav-core also
   builds exav-wasm, its wasm32-wasip1 binary. exav-core depends on
-  exav-imagehash behind the image-hash feature, on exav-unpack, and on exav-x86
-  for the bytecode disassembly API. exav-imagehash and exav-viewer depend on
-  exav-render, which depends on exav-unpack behind its dwg feature. exav-grep
-  and exav-unpack-wasm depend on exav-unpack, which depends on exav-pe-emu
-  behind its pe-emu feature, which depends on exav-x86.</desc>
+  exav-imagehash behind the image-hash feature, on exav-render behind the
+  visible-text feature, on exav-unpack, and on exav-x86 for the bytecode
+  disassembly API. exav-imagehash and exav-viewer depend on exav-render, and
+  exav-grep does behind its text feature. exav-render, which holds the image
+  decoders, the DWG, DXF, IFC, STL, OBJ, PLY and glTF readers, the office converters and the
+  text layer, depends on exav-unpack behind its dwg and text features.
+  exav-grep and exav-unpack-wasm depend on exav-unpack, which depends on
+  exav-pe-emu behind its pe-emu feature, which depends on exav-x86.</desc>
   <defs>
     <marker id="crate-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0 0 L8 4 L0 8 z" fill="currentColor"/>
@@ -52,8 +71,8 @@ labelled with.
     <rect x="636" y="24" width="150" height="70" rx="6"/>
     <rect x="4" y="150" width="146" height="62" rx="6"/>
     <rect x="160" y="150" width="180" height="96" rx="6"/>
-    <rect x="290" y="270" width="150" height="62" rx="6"/>
-    <rect x="300" y="380" width="220" height="74" rx="6"/>
+    <rect x="326" y="270" width="130" height="62" rx="6"/>
+    <rect x="300" y="380" width="220" height="90" rx="6"/>
     <rect x="190" y="510" width="596" height="78" rx="6"/>
     <rect x="300" y="640" width="190" height="62" rx="6"/>
     <rect x="300" y="750" width="190" height="62" rx="6"/>
@@ -65,7 +84,7 @@ labelled with.
     <text x="711" y="48">exav-unpack-wasm</text>
     <text x="77" y="174">exav-update</text>
     <text x="250" y="174">exav-core</text>
-    <text x="365" y="294">exav-imagehash</text>
+    <text x="391" y="294">exav-imagehash</text>
     <text x="410" y="404">exav-render</text>
     <text x="488" y="538">exav-unpack</text>
     <text x="395" y="664">exav-pe-emu</text>
@@ -84,9 +103,10 @@ labelled with.
     <text x="250" y="196">typing · patterns · hashes</text>
     <text x="250" y="214">YARA · .cbc VM</text>
     <text x="250" y="236">+ exav-wasm (WASI binary)</text>
-    <text x="365" y="316">image hashes</text>
-    <text x="410" y="426">image decoders</text>
-    <text x="410" y="444">DWG · DXF · IFC · STL</text>
+    <text x="391" y="316">image hashes</text>
+    <text x="410" y="426">image decoders · DWG · DXF</text>
+    <text x="410" y="444">IFC · STL · OBJ · PLY · glTF</text>
+    <text x="410" y="462">office converters · text layer</text>
     <text x="488" y="560">archives · disk images · documents</text>
     <text x="488" y="578">packed executables</text>
     <text x="395" y="684">packer stub emulator</text>
@@ -94,25 +114,29 @@ labelled with.
   </g>
   <g fill="currentColor" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" opacity="0.72" text-anchor="start">
     <text x="46" y="134">http-update</text>
-    <text x="328" y="261">image-hash</text>
-    <text x="418" y="486">dwg</text>
+    <text x="346" y="194">image-hash</text>
+    <text x="294" y="362" text-anchor="end">visible-text</text>
+    <text x="506" y="300">text</text>
+    <text x="418" y="496">dwg · text</text>
     <text x="403" y="618">pe-emu</text>
     <text x="183" y="730">bytecode disasm</text>
   </g>
   <g fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#crate-arrow)">
     <path d="M237 94 V146"/>
-    <path d="M462 94 V376"/>
+    <path d="M466 94 V376"/>
     <path d="M553 94 V506"/>
     <path d="M711 94 V506"/>
     <path d="M200 246 V506"/>
     <path d="M175 246 V781 H296"/>
-    <path d="M365 332 V376"/>
+    <path d="M391 332 V376"/>
     <path d="M395 702 V746"/>
   </g>
   <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#crate-arrow)">
     <path d="M40 94 V146"/>
-    <path d="M320 246 V266"/>
-    <path d="M410 454 V506"/>
+    <path d="M340 200 H391 V266"/>
+    <path d="M300 246 V376"/>
+    <path d="M500 94 V376"/>
+    <path d="M410 470 V506"/>
     <path d="M395 588 V636"/>
   </g>
 </svg>

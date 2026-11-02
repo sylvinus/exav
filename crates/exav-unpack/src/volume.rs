@@ -76,28 +76,30 @@ pub fn parse(name: &str) -> Option<VolumeName> {
     let stem = &name[..stem_l.len()];
 
     // `stem.rNN` — continuation of the old RAR scheme. `.r00` is volume 1.
-    if let Some(digits) = ext.strip_prefix('r') {
-        if digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_digit()) {
-            let n: usize = digits.parse().ok()?;
-            return Some(VolumeName {
-                stem: stem.to_string(),
-                index: n + 1,
-                scheme: Scheme::RarOld,
-            });
-        }
+    if let Some(digits) = ext.strip_prefix('r')
+        && digits.len() == 2
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        let n: usize = digits.parse().ok()?;
+        return Some(VolumeName {
+            stem: stem.to_string(),
+            index: n + 1,
+            scheme: Scheme::RarOld,
+        });
     }
 
     // `stem.zNN` — ZIP spanning. `.z01` is volume 0; the bare `.zip` is LAST,
     // because it carries the central directory.
-    if let Some(digits) = ext.strip_prefix('z') {
-        if digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_digit()) {
-            let n: usize = digits.parse().ok()?;
-            return Some(VolumeName {
-                stem: stem.to_string(),
-                index: n.checked_sub(1)?,
-                scheme: Scheme::ZipSplit,
-            });
-        }
+    if let Some(digits) = ext.strip_prefix('z')
+        && digits.len() == 2
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        let n: usize = digits.parse().ok()?;
+        return Some(VolumeName {
+            stem: stem.to_string(),
+            index: n.checked_sub(1)?,
+            scheme: Scheme::ZipSplit,
+        });
     }
 
     // `stem.<ext>.NNN` — the generic numbered split (7z, zip, arj, tar…).
@@ -149,7 +151,14 @@ impl VolumeName {
     /// archive.
     pub fn same_set_as(&self, other: &VolumeName) -> bool {
         self.stem.eq_ignore_ascii_case(&other.stem)
-            && std::mem::discriminant(&self.scheme) == std::mem::discriminant(&other.scheme)
+            && match (&self.scheme, &other.scheme) {
+                // `a.7z.001` and `a.zip.002` are the volumes of two archives.
+                (
+                    Scheme::NumberedSuffix { base_ext: a, .. },
+                    Scheme::NumberedSuffix { base_ext: b, .. },
+                ) => a.eq_ignore_ascii_case(b),
+                (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+            }
     }
 }
 
@@ -177,11 +186,11 @@ pub fn group(names: &[&str]) -> Vec<Vec<usize>> {
             if claimed[j] {
                 continue;
             }
-            if let Some(vj) = item {
-                if vi.same_set_as(vj) {
-                    members.push((vj.index, j));
-                    claimed[j] = true;
-                }
+            if let Some(vj) = item
+                && vi.same_set_as(vj)
+            {
+                members.push((vj.index, j));
+                claimed[j] = true;
             }
         }
         if members.len() < 2 {
@@ -191,7 +200,7 @@ pub fn group(names: &[&str]) -> Vec<Vec<usize>> {
         members.sort_by_key(|(idx, _)| *idx);
         // Duplicate positions mean the names disagree about the set's shape;
         // concatenating them would splice bytes in an order nothing wrote.
-        if members.windows(2).any(|w| w[0].0 == w[1].0) {
+        if members.array_windows().any(|[a, b]| a.0 == b.0) {
             continue;
         }
         sets.push(members.into_iter().map(|(_, j)| j).collect());
@@ -399,7 +408,8 @@ impl Collector {
                 continue;
             }
             let idx: Vec<usize> = set.parts.iter().map(|(i, _, _)| *i).collect();
-            let complete = idx.first() == Some(&0) && idx.windows(2).all(|w| w[1] == w[0] + 1);
+            let complete =
+                idx.first() == Some(&0) && idx.array_windows().all(|[a, b]| *b == *a + 1);
             if !complete {
                 let reason = if idx.first() != Some(&0) {
                     "part of a multi-volume set whose first volume was not present"
@@ -523,6 +533,32 @@ mod tests {
         let names = ["a.part1.rar", "a.part2.rar", "a.7z.001", "a.7z.002"];
         let sets = group(&names);
         assert_eq!(sets.len(), 2, "got {sets:?}");
+    }
+
+    #[test]
+    fn a_shared_stem_with_other_formats_numbered_is_two_archives() {
+        // The same stem and the same kind of numbering, but a 7z and a zip.
+        let names = ["a.7z.001", "a.zip.002", "a.ZIP.001", "a.7z.002"];
+        let sets = group(&names);
+        assert_eq!(sets.len(), 2, "got {sets:?}");
+        for s in &sets {
+            let exts: Vec<_> = s
+                .iter()
+                .map(|&i| {
+                    names[i]
+                        .rsplit_once('.')
+                        .unwrap()
+                        .0
+                        .rsplit('.')
+                        .next()
+                        .unwrap()
+                })
+                .collect();
+            assert!(
+                exts.iter().all(|e| e.eq_ignore_ascii_case(exts[0])),
+                "{exts:?}"
+            );
+        }
     }
 
     #[test]

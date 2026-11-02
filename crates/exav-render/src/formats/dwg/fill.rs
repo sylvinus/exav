@@ -252,8 +252,7 @@ pub fn fill_region(loops: &[Vec<[f64; 2]>], style: IslandStyle) -> Vec<[f64; 2]>
     let mut next = 0;
     let mut active: Vec<usize> = Vec::new();
 
-    for w in ys.windows(2) {
-        let (ya, yb) = (w[0], w[1]);
+    for &[ya, yb] in ys.array_windows() {
         if yb - ya < 1e-12 {
             continue;
         }

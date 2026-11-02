@@ -32,8 +32,8 @@ use regex_syntax::hir::literal::{ExtractKind, Extractor};
 use serde::{Deserialize, Serialize};
 
 use crate::byte_source::ByteSource;
-use crate::grams::{structural, sweep, GramStats, Grams, IndexAnchor};
-use crate::yara::matcher::{parse_hir, widen_hir, Base64Sub, Needle};
+use crate::grams::{GramStats, Grams, IndexAnchor, structural, sweep};
+use crate::yara::matcher::{Base64Sub, Needle, parse_hir, widen_hir};
 
 /// Maximum atom window length taken from a literal / base64 needle. A longer
 /// window is a strictly more selective (rarer) gate; the cap bounds what the

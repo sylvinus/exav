@@ -1,11 +1,12 @@
-import { act } from "react";
+import { act, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { writable } from "../core/store.js";
-import type { FormatPlugin, Status } from "../core/types.js";
+import type { FormatPlugin, Status, Warning } from "../core/types.js";
 import { createViewer } from "../core/viewer.js";
 import { ViewerProvider } from "./context.js";
+import { useFullscreen, usePanel } from "./hooks.js";
 import { ViewerBody } from "./ViewerBody.js";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -113,7 +114,7 @@ it("a plugin's own label and error message replace the stock ones", async () => 
         </ViewerProvider>,
       ),
     );
-    return host.querySelector(".exv-status p")?.textContent;
+    return host.querySelector(".exav-viewer-status p")?.textContent;
   };
   expect(await said(saying("c", { phase: "converting", label: "Decoding the photo" }), "c")).toBe("Decoding the photo");
   expect(await said(saying("l", { phase: "loading", label: "Reading the HEIC" }), "l")).toBe("Reading the HEIC");
@@ -123,6 +124,11 @@ it("a plugin's own label and error message replace the stock ones", async () => 
   expect(await said(saying("f", { phase: "error", error: { code: "file" } }), "f")).not.toBe("Not a HEIC file");
   // A host's own code its table does not word shows the generic message, not the key.
   expect(await said(saying("h", { phase: "error", error: { code: "heic" } }), "h")).toBe("This file could not be shown.");
+  // A step: its message, and a bar when it counts.
+  expect(await said(saying("p", { phase: "converting", step: "convert", progress: 0.4 }), "p")).toBe("Converting the document…");
+  expect(host.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("40");
+  expect(await said(saying("q", { phase: "converting", step: "start" }), "q")).toBe("Starting the viewer…");
+  expect(host.querySelector('[role="progressbar"]')).toBeNull();
   await act(async () => root.unmount());
   host.remove();
 });
@@ -210,7 +216,7 @@ describe("the zoom buttons and the drag toggle", () => {
         </ViewerProvider>,
       ),
     );
-    const button = (label: string) => host.querySelector<HTMLButtonElement>(`.exv-tools button[aria-label="${label}"]`);
+    const button = (label: string) => host.querySelector<HTMLButtonElement>(`.exav-viewer-tools button[aria-label="${label}"]`);
     return { host, button, done: async () => (await act(async () => root.unmount()), host.remove()) };
   }
 
@@ -231,6 +237,202 @@ describe("the zoom buttons and the drag toggle", () => {
     await ui.done();
   });
 
+  it("the fit button is there once the view is not the fitted one, and not before", async () => {
+    const { zoom, withControls } = controls();
+    const ui = await show(withControls);
+    expect(ui.button("Fit to the window")).not.toBeNull();
+    // Leftmost: the buttons right of it do not move as it comes and goes.
+    expect(ui.button("Fit to the window")!.nextElementSibling).toBe(ui.button("Zoom out"));
+    await act(async () => zoom.set({ scale: 1.004, min: 0.25, max: 4 }));
+    expect(ui.button("Fit to the window")).toBeNull();
+    await act(async () => zoom.set({ scale: 0.5, min: 0.25, max: 4 }));
+    expect(ui.button("Fit to the window")).not.toBeNull();
+    await ui.done();
+  });
+
+  describe("the panel toggle", () => {
+    const entries = [
+      { title: "One", page: 1, depth: 0, offset: null },
+      { title: "Two", page: 2, depth: 0, offset: null },
+    ];
+    beforeEach(() => Object.defineProperty(document, "fullscreenEnabled", { configurable: true, get: () => true }));
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      delete (document as unknown as Record<string, unknown>).fullscreenEnabled;
+    });
+    function withOutline(list: readonly (typeof entries)[number][]): FormatPlugin {
+      const { zoom, drag } = controls();
+      const outline = { ...writable(list), goTo: vi.fn() };
+      return {
+        ...plugin,
+        load: async () => ({
+          mount(host, c) {
+            c.controllers({ zoom, drag, outline });
+            c.status({ phase: "ready" });
+            return { controllers: { zoom, drag, outline }, destroy: () => {} };
+          },
+        }),
+      };
+    }
+
+    it("folds and unfolds the rail from the tools, beside the zoom buttons", async () => {
+      vi.stubGlobal("innerWidth", 1400);
+      const ui = await show(withOutline(entries));
+      const rail = () => ui.host.querySelector(".exav-viewer-rail");
+      expect(rail()).not.toBeNull();
+      // After the zoom buttons.
+      const toggle = ui.button("Hide the sections")!;
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      expect(toggle.closest(".exav-viewer-tool-group")!.previousElementSibling).toBe(ui.button("Zoom in")!.closest(".exav-viewer-tool-group"));
+      // In one group with full screen, at the right end of it.
+      expect([...toggle.parentElement!.children].map((b) => b.getAttribute("aria-label"))).toEqual(["Full screen", "Hide the sections"]);
+      await act(async () => toggle.click());
+      expect(rail()).toBeNull();
+      expect(ui.button("Hide the sections")).toBeNull();
+      await act(async () => ui.button("Sections")!.click());
+      expect(rail()).not.toBeNull();
+      expect(ui.button("Hide the sections")!.getAttribute("aria-expanded")).toBe("true");
+      await ui.done();
+    });
+
+    it("starts folded on a narrow screen, and is not there when the rail has nothing to show", async () => {
+      vi.stubGlobal("innerWidth", 800);
+      const narrow = await show(withOutline(entries));
+      expect(narrow.host.querySelector(".exav-viewer-rail")).toBeNull();
+      expect(narrow.button("Sections")!.getAttribute("aria-expanded")).toBe("false");
+      await narrow.done();
+      const alone = await show(withOutline(entries.slice(0, 1)));
+      expect(alone.button("Sections")).toBeNull();
+      expect(alone.button("Hide the sections")).toBeNull();
+      await alone.done();
+    });
+
+    it("a rail of the host's own, given its info to usePanel, brings the default toggle and follows the fold", async () => {
+      vi.stubGlobal("innerWidth", 1400);
+      const Mine = () => {
+        const { open } = usePanel({ title: "Mine", hideLabel: "Hide mine", icon: <i />, controls: "mine" });
+        return open ? <aside id="mine">mine</aside> : null;
+      };
+      const ui = await show(withOutline(entries), { OutlineRail: () => <Mine /> });
+      expect(ui.host.querySelector("#mine")).not.toBeNull();
+      await act(async () => ui.button("Hide mine")!.click());
+      expect(ui.host.querySelector("#mine")).toBeNull();
+      await act(async () => ui.button("Mine")!.click());
+      expect(ui.host.querySelector("#mine")).not.toBeNull();
+      await ui.done();
+    });
+
+    it("a toggle of the host's own reads and sets the state with usePanel", async () => {
+      vi.stubGlobal("innerWidth", 1400);
+      const Toggle = () => {
+        const { open, setOpen } = usePanel();
+        return (
+          <button id="mine" onClick={() => setOpen(!open)}>
+            {String(open)}
+          </button>
+        );
+      };
+      const ui = await show(withOutline(entries), { PanelToggle: Toggle });
+      const mine = () => ui.host.querySelector<HTMLButtonElement>("#mine")!;
+      expect(mine().textContent).toBe("true");
+      await act(async () => mine().click());
+      expect(mine().textContent).toBe("false");
+      expect(ui.host.querySelector(".exav-viewer-rail")).toBeNull();
+      await ui.done();
+    });
+
+    it("is always open outside a viewer", async () => {
+      let state!: ReturnType<typeof usePanel>;
+      const Probe = () => ((state = usePanel()), null);
+      const host = document.createElement("div");
+      const root = createRoot(host);
+      await act(async () => root.render(<Probe />));
+      expect(state.open).toBe(true);
+      expect(() => state.setOpen(false)).not.toThrow();
+      await act(async () => root.unmount());
+    });
+  });
+
+  describe("full screen", () => {
+    function support(enabled: boolean) {
+      const requestFullscreen = vi.fn(async () => {});
+      const exitFullscreen = vi.fn(async () => {});
+      let element: Element | null = null;
+      Object.defineProperties(document, {
+        fullscreenEnabled: { configurable: true, get: () => enabled },
+        fullscreenElement: { configurable: true, get: () => element },
+        exitFullscreen: { configurable: true, value: exitFullscreen },
+      });
+      HTMLElement.prototype.requestFullscreen = requestFullscreen;
+      return {
+        requestFullscreen,
+        exitFullscreen,
+        enter: (el: Element | null) => {
+          element = el;
+          document.dispatchEvent(new Event("fullscreenchange"));
+        },
+      };
+    }
+    afterEach(() => {
+      for (const k of ["fullscreenEnabled", "fullscreenElement", "exitFullscreen"]) delete (document as unknown as Record<string, unknown>)[k];
+      delete (HTMLElement.prototype as { requestFullscreen?: unknown }).requestFullscreen;
+    });
+
+    it("puts the viewer's box in full screen, and leaves it", async () => {
+      const full = support(true);
+      const { withControls } = controls();
+      const ui = await show(withControls);
+      await act(async () => ui.button("Full screen")!.click());
+      expect(full.requestFullscreen).toHaveBeenCalledTimes(1);
+      expect(full.requestFullscreen.mock.contexts[0]).toBe(ui.host.querySelector(".exav-viewer-body"));
+      await act(async () => full.enter(ui.host.querySelector(".exav-viewer-body")));
+      expect(ui.button("Full screen")).toBeNull();
+      await act(async () => ui.button("Leave full screen")!.click());
+      expect(full.exitFullscreen).toHaveBeenCalledTimes(1);
+      await act(async () => full.enter(null));
+      expect(ui.button("Full screen")).not.toBeNull();
+      await ui.done();
+    });
+
+    it("useFullscreen serves a box of the host's own", async () => {
+      const full = support(true);
+      let api!: ReturnType<typeof useFullscreen>;
+      const Box = () => {
+        const ref = useRef<HTMLDivElement>(null);
+        api = useFullscreen(() => ref.current);
+        return <div ref={ref} id="box" />;
+      };
+      const host = document.createElement("div");
+      document.body.append(host);
+      const root = createRoot(host);
+      await act(async () => root.render(<Box />));
+      const box = host.querySelector("#box");
+      expect(api.supported).toBe(true);
+      expect(api.active).toBe(false);
+      await act(async () => api.toggle());
+      expect(full.requestFullscreen.mock.contexts[0]).toBe(box);
+      await act(async () => full.enter(box));
+      expect(api.active).toBe(true);
+      // Another element in full screen is not this one.
+      await act(async () => full.enter(host));
+      expect(api.active).toBe(false);
+      await act(async () => full.enter(box));
+      await act(async () => api.toggle());
+      expect(full.exitFullscreen).toHaveBeenCalledTimes(1);
+      await act(async () => root.unmount());
+      host.remove();
+    });
+
+    it("is not offered where the browser has no full screen", async () => {
+      support(false);
+      const { withControls } = controls();
+      const ui = await show(withControls);
+      expect(ui.button("Full screen")).toBeNull();
+      expect(ui.button("Zoom in")).not.toBeNull();
+      await ui.done();
+    });
+  });
+
   it("the toggle shows the mode, switches it, and is not there when there is no choice", async () => {
     const { state, drag, withControls } = controls();
     const ui = await show(withControls);
@@ -249,7 +451,7 @@ describe("the zoom buttons and the drag toggle", () => {
     const { withControls } = controls();
     const ui = await show(withControls, { ZoomControls: () => null, DragToggle: () => <b id="mine">mine</b> });
     expect(ui.button("Zoom in")).toBeNull();
-    expect(ui.host.querySelector(".exv-tools #mine")).not.toBeNull();
+    expect(ui.host.querySelector(".exav-viewer-tools #mine")).not.toBeNull();
     await ui.done();
   });
 });
@@ -268,7 +470,7 @@ it("a provider given a viewer uses it as it is, whatever plugins it is also give
     ),
   );
   expect(mount).toHaveBeenCalledTimes(1);
-  expect(host.querySelector(".exv-body")?.getAttribute("data-phase")).toBe("ready");
+  expect(host.querySelector(".exav-viewer-body")?.getAttribute("data-phase")).toBe("ready");
   await act(async () => root.unmount());
   host.remove();
 });
@@ -295,12 +497,41 @@ it("the warnings can be dismissed, and come back when they change", async () => 
       </ViewerProvider>,
     ),
   );
-  const box = () => host.querySelector(".exv-warnings");
+  const box = () => host.querySelector(".exav-viewer-warnings");
   expect(box()?.textContent).toMatch(/3/);
-  await act(async () => host.querySelector<HTMLButtonElement>(".exv-warnings button")!.click());
+  await act(async () => host.querySelector<HTMLButtonElement>(".exav-viewer-warnings button")!.click());
   expect(box()).toBeNull();
   await act(async () => warnings.set([{ key: "proxy_without_graphics", count: 4 }]));
   expect(box()?.textContent).toMatch(/4/);
+  await act(async () => root.unmount());
+  host.remove();
+});
+
+it("a warning lists the names it carries after its message", async () => {
+  const warnings = writable<Warning[]>([{ key: "external_references", count: 2, names: ["walls.dwg", "photo.png"] }]);
+  const plugin2: FormatPlugin = {
+    ...plugin,
+    load: async () => ({
+      mount(host, c) {
+        c.controllers({ warnings });
+        c.status({ phase: "ready" });
+        return { controllers: { warnings }, destroy: () => {} };
+      },
+    }),
+  };
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  await act(async () =>
+    root.render(
+      <ViewerProvider plugins={[plugin2]}>
+        <ViewerBody file={file("w")} />
+      </ViewerProvider>,
+    ),
+  );
+  const p = host.querySelector(".exav-viewer-warnings p");
+  expect(p?.textContent).toBe("2 external references are not drawn. walls.dwg, photo.png");
+  expect(p?.querySelector(".exav-viewer-warning-names")?.textContent).toBe(" walls.dwg, photo.png");
   await act(async () => root.unmount());
   host.remove();
 });
@@ -329,10 +560,49 @@ it("the outline rail shows from two entries, not for one", async () => {
         </ViewerProvider>,
       ),
     );
-    return host.querySelectorAll(".exv-outline-entry").length;
+    return host.querySelectorAll(".exav-viewer-outline-entry").length;
   };
   expect(await shown([entry("Only")])).toBe(0);
   expect(await shown([entry("One"), entry("Two")])).toBe(2);
+  await act(async () => root.unmount());
+  host.remove();
+});
+
+it("a workbook's sheets are tabs below it, from two sheets, the current one selected", async () => {
+  const selected: number[] = [];
+  const state = writable({ items: [{ index: 0, name: "Quote" }], current: 0 });
+  const sheets = { ...state, select: async (i: number) => void selected.push(i) };
+  const book: FormatPlugin = {
+    ...plugin,
+    load: async () => ({
+      mount(host, c) {
+        c.status({ phase: "ready" });
+        return { controllers: { sheets }, destroy: () => {} };
+      },
+    }),
+  };
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  await act(async () =>
+    root.render(
+      <ViewerProvider plugins={[book]} locale="de">
+        <ViewerBody file={file("book")} />
+      </ViewerProvider>,
+    ),
+  );
+  expect(host.querySelector(".exav-viewer-sheet-tabs")).toBeNull();
+  await act(async () => state.set({ items: [{ index: 0, name: "Quote" }, { index: 1, name: "Notes" }], current: 0 }));
+  const tabs = [...host.querySelectorAll<HTMLButtonElement>(".exav-viewer-sheet-tab")];
+  expect(tabs.map((t) => [t.textContent, t.getAttribute("aria-selected")])).toEqual([
+    ["Quote", "true"],
+    ["Notes", "false"],
+  ]);
+  expect(host.querySelector(".exav-viewer-sheet-tabs")!.getAttribute("aria-label")).toBe("Tabellenblätter");
+  // Below the surface, in the stage's flow: not over the sheet.
+  expect(host.querySelector(".exav-viewer-stage > .exav-viewer-sheet-tabs")).not.toBeNull();
+  await act(async () => tabs[1]!.click());
+  expect(selected).toEqual([1]);
   await act(async () => root.unmount());
   host.remove();
 });
@@ -371,8 +641,8 @@ it("children are drawn in the stage, and a function of them gets the session's s
       </ViewerProvider>,
     ),
   );
-  expect(host.querySelector(".exv-stage #mine")).not.toBeNull();
-  expect(host.querySelector(".exv-stage #plain")).not.toBeNull();
+  expect(host.querySelector(".exav-viewer-stage #mine")).not.toBeNull();
+  expect(host.querySelector(".exav-viewer-stage #plain")).not.toBeNull();
   expect(seen.at(-1)).toEqual({ phase: "ready", total: 3, session: true });
   await act(async () => root.unmount());
   host.remove();

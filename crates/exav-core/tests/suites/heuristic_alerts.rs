@@ -16,7 +16,7 @@
 
 use std::io::Write;
 
-use exav_core::{analyze, Method, ScanOptions, Scanner, Verdict};
+use exav_core::{Method, ScanOptions, Scanner, Verdict, analyze};
 
 fn builtin_db() -> Scanner {
     // The built-in DB carries only the EICAR signature; the heuristics under

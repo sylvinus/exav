@@ -150,8 +150,10 @@ mod tests {
     #[test]
     fn non_tnef_yields_nothing() {
         let mut budget = Budget::new(Limits::default());
-        assert!(extract(Format::Tnef, b"not a tnef file", &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Tnef, b"not a tnef file", &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

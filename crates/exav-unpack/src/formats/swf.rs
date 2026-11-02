@@ -16,7 +16,7 @@ use std::io::{BufReader, Cursor, Read};
 
 use super::lzma::SansIo;
 use crate::source::{ByteSource, Reader};
-use crate::stream::{emit_stream, MemberMeta, Visit};
+use crate::stream::{MemberMeta, Visit, emit_stream};
 use crate::{Budget, LimitHit};
 
 /// Walk an SWF movie: the rebuilt `FWS` header, then the body decoded as it is
@@ -97,8 +97,8 @@ fn dict_size(declared: u32, want: u64, max_buffer: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{extract, Format, Limits};
-    use flate2::{write::ZlibEncoder, Compression};
+    use crate::{Format, Limits, extract};
+    use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
 
     /// Assemble an 8-byte SWF header for `sig` with a `FileLength` covering the
@@ -178,9 +178,11 @@ mod tests {
     fn short_and_non_swf_input_is_ignored() {
         let mut budget = Budget::new(Limits::default());
         assert!(extract(Format::Swf, b"CW", &mut budget).unwrap().is_empty());
-        assert!(extract(Format::Swf, b"NOTASWF!", &mut budget)
-            .unwrap()
-            .is_empty());
+        assert!(
+            extract(Format::Swf, b"NOTASWF!", &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // A `ZWS` header carries two attacker-chosen sizes, and the LZMA dictionary

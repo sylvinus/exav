@@ -730,18 +730,19 @@ fn run_filter(u: &mut Unpacker, flt: &FilterInfo) -> Result<(), LimitHit> {
 /// apply_filters: emit pending output, running the next filter if its range is
 /// fully unpacked. Returns true if it made progress (should be retried).
 fn apply_filters(u: &mut Unpacker) -> Result<bool, LimitHit> {
-    if let Some(flt) = u.filters.front() {
-        if u.write_ptr > flt.block_start && u.write_ptr >= flt.block_start + flt.block_length {
-            if u.last_write_ptr == flt.block_start {
-                let flt = u.filters.pop_front().unwrap();
+    let Some((bs, len)) = u.filters.front().map(|f| (f.block_start, f.block_length)) else {
+        return Ok(false);
+    };
+    if u.write_ptr > bs && u.write_ptr >= bs + len {
+        if u.last_write_ptr == bs {
+            if let Some(flt) = u.filters.pop_front() {
                 run_filter(u, &flt)?;
-            } else {
-                let bs = flt.block_start;
-                push_window_data(u, u.last_write_ptr, bs)?;
-                u.last_write_ptr = bs;
             }
-            return Ok(true);
+        } else {
+            push_window_data(u, u.last_write_ptr, bs)?;
+            u.last_write_ptr = bs;
         }
+        return Ok(true);
     }
     Ok(false)
 }

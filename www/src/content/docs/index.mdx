@@ -2,6 +2,9 @@
 title: exav
 description: Memory-safe tools for untrusted files, written in Rust. A malware scanner compatible with ClamAV's signatures and protocols, an archive extractor, and a file viewer for the browser.
 template: splash
+head:
+  - tag: title
+    content: "exav: Memory-safe tools for untrusted files"
 hero:
   tagline: Memory-safe tools for untrusted files. Scan them for malware, unpack them, and view them in the browser.
   image:
@@ -49,9 +52,9 @@ Each tool is usable on its own.
     [Start here](/unpack/)
   </Card>
   <Card title="File viewer" icon="document">
-    `@exav/viewer` shows PDF, images, DWG and DXF, Office documents, IFC and
-    STL models, media and archives in the browser, and can open each file in
-    a sandboxed frame of its own.
+    `@exav/viewer` shows PDF, images, DWG and DXF, Office documents (the old
+    formats too), IFC, STL, OBJ, PLY and glTF models, media and archives in
+    the browser, and can open each file in a sandboxed frame of its own.
 
     ```sh
     npm install @exav/viewer

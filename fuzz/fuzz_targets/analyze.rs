@@ -29,6 +29,7 @@ libfuzzer_sys::fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, see
 });
 
 fuzz_target!(|data: &[u8]| {
+    exav_fuzz_support::panics::contained_panics();
     let (body, bits) = frame::trailer(data);
     let _ = analyze(db::scanner(), body, &options::scan_options(bits));
 });

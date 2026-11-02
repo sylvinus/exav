@@ -245,7 +245,11 @@ fn probe_vex(
     // decline the destination-`xmm0` form for every gather, so the registers
     // are chosen per digit instead.
     let mod3 = modrm >= 0xc0;
-    let free = |used: [u8; 3]| (0u8..8).find(|r| !used.contains(r)).expect("8 registers, 3 used");
+    let free = |used: [u8; 3]| {
+        (0u8..8)
+            .find(|r| !used.contains(r))
+            .expect("8 registers, 3 used")
+    };
     let (modrm, sib, vvvv_a, vvvv_b) = if vsib && !mod3 {
         let digit = (modrm >> 3) & 7;
         let index = if digit == 1 { 2 } else { 1 };
@@ -270,7 +274,7 @@ fn probe_vex(
     let mut b = vex_head(pfx, map, w, vvvv_b, l, pp, op, modrm);
     b.extend(sib);
     b.extend_from_slice(&TAIL);
-    let strict_vvvv = decode(&b).map_or(true, |i| format!("{:?}", i.mnemonic()) != name);
+    let strict_vvvv = decode(&b).is_none_or(|i| format!("{:?}", i.mnemonic()) != name);
     Some(VexCell {
         name,
         imm,
@@ -480,10 +484,10 @@ fn probe_shape_at(pfx: &[u8], escape: &[u8], op: u8, digit: u8) -> Option<Shape>
         b.extend_from_slice(&TAIL);
         decode(&b)
     };
-    if let Some(m) = &mem_probe {
-        if m.op_count() < i.op_count() {
-            return None;
-        }
+    if let Some(m) = &mem_probe
+        && m.op_count() < i.op_count()
+    {
+        return None;
     }
     let mem_bytes = match mem_probe.map(|m| m.memory_size().size()) {
         Some(n) if n > 0 && n <= 16 => n as u8,
@@ -724,7 +728,17 @@ fn vsib_mem(digit: u8, vsib: bool) -> (u8, Option<u8>) {
 /// not an encoding at all the probe fails and yields 0, which reads as "do not
 /// scale". An unscaled displacement addresses the wrong memory by up to 64x.
 #[allow(clippy::too_many_arguments)]
-fn evex_disp8_n(mm: u8, w: u8, pp: u8, ll: u8, b: u8, aaa: u8, op: u8, digit: u8, vsib: bool) -> u8 {
+fn evex_disp8_n(
+    mm: u8,
+    w: u8,
+    pp: u8,
+    ll: u8,
+    b: u8,
+    aaa: u8,
+    op: u8,
+    digit: u8,
+    vsib: bool,
+) -> u8 {
     // `mod=01`, so the byte after the addressing bytes is the displacement.
     let (modrm, sib) = vsib_mem(digit, vsib);
     let modrm = 0x40 | (modrm & 0x3f);
@@ -774,7 +788,7 @@ fn probe_evex(
     let strict_vvvv = {
         let mut head = evex_head(mm, w, 0b1110, pp, 0, ll, b, aaa, op, modrm);
         head.extend(sib);
-        probe_counting(&head, head.len()).map_or(true, |(n, _)| n != name)
+        probe_counting(&head, head.len()).is_none_or(|(n, _)| n != name)
     };
     Some(EvexCell {
         name,
@@ -805,7 +819,13 @@ fn imm_code(n: u8) -> u16 {
 }
 
 /// Format one flat table of integers.
-fn emit_table<T: std::fmt::Display>(out: &mut String, doc: &str, name: &str, ty: &str, values: &[T]) {
+fn emit_table<T: std::fmt::Display>(
+    out: &mut String,
+    doc: &str,
+    name: &str,
+    ty: &str,
+    values: &[T],
+) {
     writeln!(out, "\n{doc}").unwrap();
     writeln!(
         out,
@@ -1064,7 +1084,10 @@ fn main() {
             }
         }
     }
-    assert!(evex.windows(2).all(|w| w[0].0 < w[1].0), "keys must sort");
+    assert!(
+        evex.array_windows().all(|[a, b]| a.0 < b.0),
+        "keys must sort"
+    );
     assert!(evex.last().is_none_or(|(k, _)| *k < EVEX_KEYS));
 
     // ---- emit -------------------------------------------------------------

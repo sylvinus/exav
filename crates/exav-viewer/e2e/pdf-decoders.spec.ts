@@ -60,8 +60,8 @@ async function draw(page: Page, pdf: string, original: boolean) {
   }
   await page.goto("./?lang=en&mode=page");
   await page.getByTestId("file-input").setInputFiles({ name: pdf, mimeType: "application/pdf", buffer: fs.readFileSync(path.join(FIXTURES, pdf)) });
-  await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-  const pixels = await settled(page.locator(".demo-frame .exv-pdf-page").first());
+  await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+  const pixels = await settled(page.locator(".demo-frame .exav-viewer-pdf-page").first());
   return { pixels, requests, served };
 }
 
@@ -103,8 +103,8 @@ test.describe("pdf.js's image decoders, replaced", () => {
     });
     await page.goto("./?lang=en&mode=page");
     await page.getByTestId("file-input").setInputFiles({ name: "icc.pdf", mimeType: "application/pdf", buffer: fs.readFileSync(path.join(FIXTURES, "icc.pdf")) });
-    await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
-    await settled(page.locator(".demo-frame .exv-pdf-page").first());
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
+    await settled(page.locator(".demo-frame .exav-viewer-pdf-page").first());
     await expect.poll(() => qcms).toEqual(["200 application/wasm"]);
   });
 

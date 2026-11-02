@@ -28,16 +28,25 @@ fuzz_target!(|data: &[u8]| {
         let subject = hex(&cert.subject_sha1);
         let mut by_subject = CrbDb::default();
         by_subject.parse_into(&format!("Fuzz.Cert;0;{subject};\n"));
-        assert!(by_subject.blocked(cert).is_some(), "a list naming the subject does not block it");
+        assert!(
+            by_subject.blocked(cert).is_some(),
+            "a list naming the subject does not block it"
+        );
 
         let mut by_serial = CrbDb::default();
         by_serial.parse_into(&format!("Fuzz.Cert;0;{subject};{};\n", cert.serial_hex));
-        assert!(by_serial.blocked(cert).is_some(), "a list naming the subject and serial does not block it");
+        assert!(
+            by_serial.blocked(cert).is_some(),
+            "a list naming the subject and serial does not block it"
+        );
 
         let mut other = CrbDb::default();
         let mut elsewhere = cert.subject_sha1;
         elsewhere[0] ^= 1;
         other.parse_into(&format!("Fuzz.Cert;0;{};\n", hex(&elsewhere)));
-        assert!(other.blocked(cert).is_none(), "a list naming another subject blocks it");
+        assert!(
+            other.blocked(cert).is_none(),
+            "a list naming another subject blocks it"
+        );
     }
 });

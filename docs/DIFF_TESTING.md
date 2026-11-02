@@ -215,6 +215,10 @@ Key choices, and why:
 
 ## Interpreting results
 
+Every difference in the 2026-10-23 full run is explained, file by file, in
+[DIFFTEST_TRIAGE.md](DIFFTEST_TRIAGE.md), with the recipes used to settle them.
+Look a file up there before investigating it again.
+
 - **AGREE / clean**: exav matches clamscan. This is the headline metric.
 - **FN** (clamscan found, exav missed): a real gap; investigate the signature
   type (`clamscan --debug` on the file shows what it matched). Known causes

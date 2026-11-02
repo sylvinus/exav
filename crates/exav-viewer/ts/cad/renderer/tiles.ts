@@ -47,6 +47,31 @@ export interface Range {
   count: number
 }
 
+/** Tiles `from` to `to` of the fill or the stroke table, one run of the translucent pass. */
+export interface Run {
+  fills: boolean
+  from: number
+  to: number
+}
+
+export function decodeRuns(bytes: ArrayBuffer): Run[] {
+  const v = new DataView(bytes)
+  const out: Run[] = []
+  for (let o = 0; o + 12 <= bytes.byteLength; o += 12) {
+    out.push({ fills: v.getUint32(o, true) === 1, from: v.getUint32(o + 4, true), to: v.getUint32(o + 8, true) })
+  }
+  return out
+}
+
+/** One tile over the whole buffer, then one over its translucent tail, for a drawing without a table. */
+export function wholeTiles(count: number, opaque: number): Tile[] {
+  const box = { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity }
+  const out: Tile[] = []
+  if (opaque > 0) out.push({ start: 0, count: opaque, ...box })
+  if (count > opaque) out.push({ start: opaque, count: count - opaque, ...box })
+  return out
+}
+
 export function decodeTiles(bytes: ArrayBuffer): Tile[] {
   const v = new DataView(bytes)
   const n = Math.floor(bytes.byteLength / TILE_BYTES)

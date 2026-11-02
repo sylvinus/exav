@@ -80,7 +80,7 @@ describe("the modules built here", () => {
       for (const f of m[1].split("|").map((s) => s.trim())) caps[`exav_viewer_${f.replace("-", "_")}_bg`] = (Number(m[2]) * 1024 * 1024) / 65536;
     }
     expect(caps).toEqual(MEMORY_CAPS);
-    for (const name of ["exav_viewer_image_bg", "exav_viewer_dwg_bg", "exav_viewer_model_bg"]) {
+    for (const name of ["exav_viewer_image_bg", "exav_viewer_dwg_bg", "exav_viewer_model_bg", "exav_viewer_text_bg", "exav_viewer_sheets_bg", "exav_viewer_slides_bg", "exav_viewer_docs_bg"]) {
       expect(memoryLimits(fs.readFileSync(path.join(wasmDir, `${name}.wasm`)))?.max, name).toBe(MEMORY_CAPS[name]);
     }
   });

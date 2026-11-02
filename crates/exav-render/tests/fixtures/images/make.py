@@ -141,6 +141,24 @@ with open(out("bilevel.rle"), "wb") as f:
     f.write(strip(tmp))
 os.remove(tmp)
 
+# A baseline JPEG of one picture twice (libjpeg's cjpeg, Debian's
+# libjpeg-turbo-progs): with its three components in one scan, and with a scan
+# for each. zune-jpeg 0.5.8 draws the second flat.
+ppm = out("jpeg-source.ppm")
+jpeg_source = Image.new("RGB", (48, 40))
+for y in range(40):
+    for x in range(48):
+        jpeg_source.putpixel((x, y), ((x * 5) % 256, (y * 6) % 256, (x * y) % 256 if (x // 8 + y // 8) % 2 else 40))
+jpeg_source.save(ppm)
+scans = out("jpeg-scans.txt")
+with open(scans, "w") as f:
+    f.write("0: 0 63 0 0;\n1: 0 63 0 0;\n2: 0 63 0 0;\n")
+sampling = ["-quality", "85", "-sample", "1x1,1x1,1x1"]
+subprocess.run(["cjpeg", *sampling, "-outfile", out("sequential-interleaved.jpg"), ppm], check=True)
+subprocess.run(["cjpeg", *sampling, "-scans", scans, "-outfile", out("sequential-non-interleaved.jpg"), ppm], check=True)
+os.remove(ppm)
+os.remove(scans)
+
 for name in os.listdir(WORK):
     shutil.copy(out(name), os.path.join(HERE, name))
 shutil.rmtree(WORK)

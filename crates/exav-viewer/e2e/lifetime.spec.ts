@@ -41,7 +41,7 @@ test.beforeEach(async ({ page }) => {
 
 async function show(page: Page, button: RegExp) {
   await page.getByRole("button", { name: button }).first().click();
-  await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+  await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
 }
 
 const ROUND = [/plan\.dwg/, /house\.stl/, /plan\.dxf/, /house\.ifc/, /landscape\.tif/];
@@ -51,10 +51,10 @@ test("walking through drawings and models leaves one context and no stray worker
   // The engines in the page: in the sandboxed frame, a file's workers and
   // contexts go with its frame (frame.spec.ts).
   await openSample(page, "report.pdf", { mode: "page" });
-  await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+  await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
   // Opened by the user, the files are listed in the sidebar, one button each.
   await pick(page, "plan.dwg", "house.stl", "plan.dxf", "house.ifc", "landscape.tif", "report.pdf");
-  await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+  await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
 
   // One round first: each engine's lasting pieces (pdf.js's worker, which
   // every PDF shares) are then in place.

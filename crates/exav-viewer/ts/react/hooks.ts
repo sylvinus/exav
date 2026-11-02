@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { createContext, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
 import { sameSource } from "../core/source.js";
 import type { Store } from "../core/store.js";
@@ -69,4 +69,66 @@ export function useSession(file: ViewerFile | null) {
   const status = useStore(session?.status) ?? LOADING;
   const controllers: Controllers = useStore(session?.controllers) ?? {};
   return { session, status, controllers, ref: setHost };
+}
+
+// ── The tools' state, for the default pieces and for a host's own ───────────
+
+/** Below this width the side panel starts folded. Decided once: turning a tablet must not close it. */
+export const RAIL_FITS = 1024;
+
+/** What the panel's toggle says about the rail it folds. */
+export interface PanelInfo {
+  title: string;
+  hideLabel: string;
+  icon: ReactNode;
+  /** The rail's id, for the toggle's `aria-controls`. */
+  controls: string;
+}
+
+/** Shared by the rails and the toggle among the tools (`ViewerBody` provides it). */
+export const PanelContext = createContext<{ open: boolean; setOpen: (open: boolean) => void; register: (info: PanelInfo | null) => void } | null>(null);
+
+const NO_OP = () => {};
+
+/**
+ * The side panel's fold state, shared by the rails and the toggle among the
+ * tools; outside a viewer, always open. A rail of a host's own gives its
+ * `info` and shows the default toggle for as long as it is mounted; read
+ * `open` to draw or not.
+ */
+export function usePanel(info?: PanelInfo): { open: boolean; setOpen: (open: boolean) => void } {
+  const panel = useContext(PanelContext);
+  const register = panel?.register;
+  // The icon is the same for as long as the rail is: left out of the deps.
+  useEffect(() => {
+    if (!info) return undefined;
+    register?.(info);
+    return () => register?.(null);
+  }, [register, info?.title, info?.hideLabel, info?.controls]);
+  return { open: panel ? panel.open : true, setOpen: panel?.setOpen ?? NO_OP };
+}
+
+/**
+ * Full screen for the element `target` returns (a host's own box, or the
+ * viewer's `.exav-viewer-body`), asked for from the host page, so a sandboxed
+ * frame needs no permission. `supported` is false where the browser has none.
+ */
+export function useFullscreen(target: () => HTMLElement | null): { supported: boolean; active: boolean; toggle: () => void } {
+  const latest = useRef(target);
+  latest.current = target;
+  const [active, setActive] = useState(false);
+  useEffect(() => {
+    const sync = () => setActive(document.fullscreenElement !== null && document.fullscreenElement === latest.current());
+    document.addEventListener("fullscreenchange", sync);
+    sync();
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+  const supported = typeof document !== "undefined" && document.fullscreenEnabled === true;
+  const toggle = () => {
+    const el = latest.current();
+    if (!el) return;
+    // A refusal (a host page in a frame without `allow="fullscreen"`) leaves the view as it was.
+    void (active ? document.exitFullscreen() : el.requestFullscreen()).catch(() => {});
+  };
+  return { supported, active, toggle };
 }

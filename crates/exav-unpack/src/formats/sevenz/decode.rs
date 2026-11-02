@@ -3,8 +3,8 @@
 
 use super::header::Coder;
 use super::parse::*;
-use crate::formats::lzma::SansIo;
 use crate::LimitHit;
+use crate::formats::lzma::SansIo;
 use lzma_rust2::filter::bcj::BcjReader;
 use std::io::{self, Read};
 
@@ -27,13 +27,13 @@ pub(super) fn is_known_codec(id: &[u8]) -> bool {
 /// `password` is the passphrase to try for an AES-encrypted coder (ignored by
 /// every other codec); `None` (or a build without the `decrypt` feature) leaves
 /// AES reported as unsupported.
-pub(super) fn wrap_coder(
-    inner: Box<dyn Read>,
+pub(super) fn wrap_coder<'a>(
+    inner: Box<dyn Read + 'a>,
     coder: &Coder,
     expected_size: usize,
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
-) -> Result<Box<dyn Read>, LimitHit> {
+) -> Result<Box<dyn Read + 'a>, LimitHit> {
     let _ = password;
     match coder.method_id.as_slice() {
         x if x == ID_COPY => Ok(inner),

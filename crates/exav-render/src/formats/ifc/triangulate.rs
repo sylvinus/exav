@@ -2,7 +2,7 @@
 //! bridges (Eberly, "Triangulation by Ear Clipping", 2002), then ear
 //! clipping. The work is bounded: past it, what remains is fanned.
 
-use super::math::{any_perpendicular, cross, dot, sub, unit, V2, V3};
+use super::math::{V2, V3, any_perpendicular, cross, dot, sub, unit};
 
 /// Most point-in-triangle tests one polygon may cost before the rest of it
 /// is fanned.

@@ -10,7 +10,7 @@ targets. For a vulnerability, do not open a public issue: see
 [Security](/project/security/#reporting-a-vulnerability). Contributors follow the
 [code of conduct](https://github.com/sylvinus/exav/blob/main/CODE_OF_CONDUCT.md).
 
-To start, install Rust 1.92 or newer and a C compiler (the `http` build links
+To start, install Rust 1.95 or newer and a C compiler (the `http` build links
 `ring`), clone the repository and run `make test-native`. The rest of
 `make test` also needs `wasmtime`, Node.js and `wasm-pack`
 ([below](#before-submitting)).
@@ -99,9 +99,10 @@ make lint    # CI's clippy passes (-D warnings) and cargo fmt --check
 
 | target | what it covers | needs |
 | --- | --- | --- |
-| `make test-native` | the workspace under every feature pass: default, `http`, `exav-unpack` with `checksums`, `--no-default-features`, `unstable-internals`, `testing-faults` | a C compiler |
+| `make test-native` | the workspace under every feature pass: default, `http`, `exav-unpack` with `checksums`, `--no-default-features`, `unstable-internals`, `testing-faults`, and exav-render's `office-*`, `markdown`, `text-pdf` and `text-office` passes | a C compiler |
 | `make test-wasm` | the extractor and core unit tests on 32-bit `wasm32-wasip1` | `wasmtime` |
 | `make test-js` | the WASM bindings' vitest units and Playwright browser tests | Node.js, `wasm-pack`, python3; downloads Chromium |
+| `make test-viewer` | `@exav/viewer`: its wasm modules rebuilt from the current source, vitest units, the package as `npm publish` would upload it, the sink and wasm-import gates, and the demo driven in headless browsers under its Content-Security-Policy | Node.js, `wasm-bindgen-cli` at the version the viewer pins; downloads browsers |
 | `make test-www` | `astro check`, a docs build (frontmatter, sidebar entries, rendering) and a check that every internal link and anchor resolves | Node.js |
 
 Not in `make test`:
@@ -123,7 +124,7 @@ reports green having checked nothing. Run `make test` before you push.
 
 CI runs, on every pull request and push to `main`: the `make lint` checks,
 `make test-native`, the MSRV check (`make msrv`), `make test-yara-diff`, the WASM
-builds with `make test-wasm` and `make test-js`, `make test-www`, `cargo audit`,
+builds with `make test-wasm` and `make test-js`, `make test-viewer`, `make test-www`, `cargo audit`,
 `cargo deny check`, and a `cargo-fuzz` smoke run of every target.
 
 Add a line to the `[Unreleased]` section of `CHANGELOG.md` for any change a user

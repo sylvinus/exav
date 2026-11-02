@@ -4,8 +4,9 @@
 use std::f64::consts::TAU;
 
 /// Sagitta error target as a fraction of radius. 0.001 gives ~70 segments for a
-/// full circle, which holds up past the zoom levels a viewer reaches before
-/// re-tessellation would kick in.
+/// full circle. The curves that reach here are flattened once and never
+/// refined at a closer zoom; a circle, arc or bulge that nothing prevents is
+/// not flattened at all (see DESIGN.md).
 const SAGITTA_RATIO: f64 = 0.001;
 const MIN_SEGMENTS: usize = 8;
 const MAX_SEGMENTS: usize = 512;
@@ -29,6 +30,58 @@ fn ccw_sweep(sweep: f64) -> Option<f64> {
     }
     let s = sweep.rem_euclid(TAU);
     Some(if s > 0.0 { s } else { TAU })
+}
+
+/// The centre, radius and angles of the arc from `a` to `b` with this
+/// bulge: (cx, cy, r, start, signed sweep). None for a straight one.
+pub fn bulge_arc(a: [f64; 2], b: [f64; 2], bulge: f64) -> Option<(f64, f64, f64, f64, f64)> {
+    let chord = (b[0] - a[0]).hypot(b[1] - a[1]);
+    if bulge == 0.0 || !bulge.is_finite() || chord < 1e-12 {
+        return None;
+    }
+    let sweep = 4.0 * bulge.atan();
+    let r = chord / (2.0 * (sweep / 2.0).sin().abs());
+    // The centre lies off the chord's middle, to its left for a
+    // counter-clockwise arc under half a turn.
+    let (mx, my) = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0);
+    let (ux, uy) = ((b[0] - a[0]) / chord, (b[1] - a[1]) / chord);
+    let d = chord / 2.0 / (sweep / 2.0).tan();
+    let (cx, cy) = (mx - uy * d, my + ux * d);
+    let start = (a[1] - cy).atan2(a[0] - cx);
+    Some((cx, cy, r, start, sweep))
+}
+
+/// `n` + 1 points along the arc from `a` to `b` with this bulge.
+pub fn bulge_points(a: [f64; 2], b: [f64; 2], bulge: f64, n: usize) -> Vec<[f64; 2]> {
+    let Some((cx, cy, r, start, sweep)) = bulge_arc(a, b, bulge) else {
+        return vec![a, b];
+    };
+    let n = n.max(1);
+    let mut out: Vec<[f64; 2]> = (0..=n)
+        .map(|i| {
+            let t = start + sweep * i as f64 / n as f64;
+            [cx + r * t.cos(), cy + r * t.sin()]
+        })
+        .collect();
+    // The ends exactly where they were.
+    out[0] = a;
+    out[n] = b;
+    out
+}
+
+/// Sample a circular arc from `start` over a signed `sweep` (radians,
+/// positive counter-clockwise).
+pub fn arc_points(cx: f64, cy: f64, r: f64, start: f64, sweep: f64) -> Vec<[f64; 2]> {
+    if !r.is_finite() || r <= 0.0 || !sweep.is_finite() || !start.is_finite() {
+        return Vec::new();
+    }
+    let n = segments_for_sweep(sweep);
+    (0..=n)
+        .map(|i| {
+            let a = start + sweep * (i as f64 / n as f64);
+            [cx + r * a.cos(), cy + r * a.sin()]
+        })
+        .collect()
 }
 
 /// Sample a circular arc counter-clockwise from `start` to `end` (radians).
@@ -74,13 +127,67 @@ pub fn flatten_ellipse(
     start_param: f64,
     end_param: f64,
 ) -> Vec<[f64; 2]> {
-    let a = (major_x * major_x + major_y * major_y).sqrt();
-    if !a.is_finite() || a <= 0.0 || !ratio.is_finite() {
+    // The minor axis is the major turned a quarter, times the ratio.
+    let r = ratio.abs();
+    flatten_ellipse_axes(
+        [cx, cy],
+        [major_x, major_y],
+        [-major_y * r, major_x * r],
+        start_param,
+        end_param,
+    )
+}
+
+/// An ellipse as DXF gives it, in world coordinates: the plane's normal
+/// (its extrusion) says which way the parameter runs, and the minor axis is
+/// the normal crossed with the major, times the ratio. Drawn from above, so
+/// a plane that is not flat has an ellipse that is squashed, and one with a
+/// normal of -Z runs the other way round.
+pub fn flatten_ellipse_in_space(
+    center: [f64; 3],
+    major: [f64; 3],
+    normal: [f64; 3],
+    ratio: f64,
+    start_param: f64,
+    end_param: f64,
+) -> Vec<[f64; 2]> {
+    let length = normal.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let n = if length.is_finite() && length > 0.0 {
+        normal.map(|v| v / length)
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let r = ratio.abs();
+    if !r.is_finite() {
         return Vec::new();
     }
-    let b = a * ratio.abs();
-    let rot = major_y.atan2(major_x);
-    let (sin_r, cos_r) = rot.sin_cos();
+    let minor = [
+        (n[1] * major[2] - n[2] * major[1]) * r,
+        (n[2] * major[0] - n[0] * major[2]) * r,
+    ];
+    flatten_ellipse_axes(
+        [center[0], center[1]],
+        [major[0], major[1]],
+        minor,
+        start_param,
+        end_param,
+    )
+}
+
+/// Sample the ellipse `centre + u cos t + v sin t` between two parameters.
+fn flatten_ellipse_axes(
+    c: [f64; 2],
+    u: [f64; 2],
+    v: [f64; 2],
+    start_param: f64,
+    end_param: f64,
+) -> Vec<[f64; 2]> {
+    let a = u[0].hypot(u[1]);
+    let b = v[0].hypot(v[1]);
+    if !a.is_finite() || !b.is_finite() || (a <= 0.0 && b <= 0.0) {
+        return Vec::new();
+    }
+    let (big, small) = (a.max(b), a.min(b));
 
     let sweep = end_param - start_param;
     // A full ellipse is stored as 0..2pi; treat a zero sweep as closed.
@@ -93,14 +200,15 @@ pub fn flatten_ellipse(
     };
 
     // Use the larger semi-axis for the segment budget so flat ellipses stay smooth.
-    let n = segments_for_sweep(sweep * (1.0 + (a / b.max(1e-12)).min(8.0)) / 2.0);
+    let n = segments_for_sweep(sweep * (1.0 + (big / small.max(1e-12)).min(8.0)) / 2.0);
     let mut out = Vec::with_capacity(n + 1);
     for i in 0..=n {
         let t = start_param + sweep * (i as f64 / n as f64);
         let (sin_t, cos_t) = t.sin_cos();
-        let ex = a * cos_t;
-        let ey = b * sin_t;
-        out.push([cx + ex * cos_r - ey * sin_r, cy + ex * sin_r + ey * cos_r]);
+        out.push([
+            c[0] + u[0] * cos_t + v[0] * sin_t,
+            c[1] + u[1] * cos_t + v[1] * sin_t,
+        ]);
     }
     out
 }
@@ -256,8 +364,8 @@ pub fn fit_spline(
     // Chord-length parameters.
     let mut t = Vec::with_capacity(pts.len());
     t.push(0.0);
-    for w in pts.windows(2) {
-        let d = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
+    for [a, b] in pts.array_windows() {
+        let d = (b[0] - a[0]).hypot(b[1] - a[1]);
         t.push(t[t.len() - 1] + d.max(1e-9));
     }
 
@@ -318,7 +426,7 @@ fn second_derivatives(t: &[f64], y: &[f64], d0: Option<f64>, dn: Option<f64>) ->
     if n < 2 {
         return vec![0.0; n];
     }
-    let h: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+    let h: Vec<f64> = t.array_windows().map(|[a, b]| b - a).collect();
 
     // Tridiagonal system, row i: lower[i] * m[i-1] + diag[i] * m[i] + upper[i] * m[i+1] = rhs[i]
     let mut lower = vec![0.0; n];
@@ -529,6 +637,25 @@ mod tests {
         ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
     }
 
+    #[test]
+    fn a_bulge_is_its_arc() {
+        let quarter = (PI / 8.0).tan();
+        // Counter-clockwise from (1,0) to (0,1): about the origin, radius 1.
+        let (cx, cy, r, start, sweep) = bulge_arc([1.0, 0.0], [0.0, 1.0], quarter).unwrap();
+        assert!(cx.abs() < 1e-12 && cy.abs() < 1e-12 && (r - 1.0).abs() < 1e-12);
+        assert!(start.abs() < 1e-12 && (sweep - PI / 2.0).abs() < 1e-12);
+        // Clockwise the other way round: about (1,1).
+        let (cx, cy, _, _, sweep) = bulge_arc([1.0, 0.0], [0.0, 1.0], -quarter).unwrap();
+        assert!((cx - 1.0).abs() < 1e-12 && (cy - 1.0).abs() < 1e-12 && sweep < 0.0);
+        // Three quarters of a turn: its middle point on the far side.
+        let pts = bulge_points([1.0, 0.0], [0.0, -1.0], (3.0 * PI / 8.0).tan(), 2);
+        assert!(
+            dist(pts[1], [-(0.5f64.sqrt()), 0.5f64.sqrt()]) < 1e-12,
+            "{pts:?}"
+        );
+        assert!(bulge_arc([1.0, 0.0], [0.0, 1.0], 0.0).is_none());
+    }
+
     /// `f`'s result, or a failure if it has not returned within five seconds
     /// (the thread is left spinning; the test binary exits anyway).
     fn finishes<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -628,6 +755,56 @@ mod tests {
         // Tolerance covers the sampling step, which need not land on the extreme.
         assert!((max_y - 2.0).abs() < 2e-3, "max_y {max_y}");
         assert!((max_x - 1.0).abs() < 2e-3, "max_x {max_x}");
+    }
+
+    #[test]
+    fn an_ellipse_in_a_tilted_plane_is_drawn_squashed() {
+        // Major axis 10 along x, ratio 0.5, in the plane of normal (0, -.6, .8):
+        // its minor axis is 5 long in that plane, (0, 4, 3), so from above the
+        // ellipse has semi-axes 10 and 4.
+        let pts = flatten_ellipse_in_space(
+            [60.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [0.0, -0.6, 0.8],
+            0.5,
+            0.0,
+            TAU,
+        );
+        assert!(pts.len() > 16);
+        for p in &pts {
+            let on = ((p[0] - 60.0) / 10.0).powi(2) + (p[1] / 4.0).powi(2);
+            assert!((on - 1.0).abs() < 1e-9, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn an_ellipse_with_a_normal_of_minus_z_runs_the_other_way_round() {
+        // A quarter from the major axis' end: with +Z it goes up to (0, 5), with
+        // -Z, which turns the plane over, down to (0, -5).
+        let up = flatten_ellipse_in_space(
+            [0.0; 3],
+            [10.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0.5,
+            0.0,
+            TAU / 4.0,
+        );
+        let down = flatten_ellipse_in_space(
+            [0.0; 3],
+            [10.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            0.5,
+            0.0,
+            TAU / 4.0,
+        );
+        assert!(dist(up[0], [10.0, 0.0]) < 1e-9 && dist(*up.last().unwrap(), [0.0, 5.0]) < 1e-9);
+        assert!(
+            dist(down[0], [10.0, 0.0]) < 1e-9 && dist(*down.last().unwrap(), [0.0, -5.0]) < 1e-9
+        );
+        // A normal of no length is Z.
+        let flat =
+            flatten_ellipse_in_space([0.0; 3], [10.0, 0.0, 0.0], [0.0; 3], 0.5, 0.0, TAU / 4.0);
+        assert_eq!(flat, up);
     }
 
     #[test]

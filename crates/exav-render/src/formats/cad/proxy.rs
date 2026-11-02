@@ -260,11 +260,11 @@ fn item(c: &mut Chunk<'_>, kind: u32, r: &Reading<'_>) -> Option<Option<ProxyIte
                 DwgVersion::R13,
             ] {
                 let mut b = Bits::new(bytes);
-                if let Ok(p) = super::dwg::lwpolyline_bits(&mut b, v, &mut room) {
-                    if b.remaining() < 8 {
-                        found = Some(p);
-                        break;
-                    }
+                if let Ok(p) = super::dwg::lwpolyline_bits(&mut b, v, &mut room)
+                    && b.remaining() < 8
+                {
+                    found = Some(p);
+                    break;
                 }
             }
             ProxyItem::LwPolyline(Box::new(found?))
@@ -335,10 +335,10 @@ fn text2(c: &mut Chunk<'_>, unicode: bool, r: &Reading<'_>) -> Option<ProxyText>
     };
     // The length in characters, -1 when the string ends at its zero.
     let len = c.rl()? as i32;
-    if let Ok(n) = usize::try_from(len) {
-        if let Some((cut, _)) = s.char_indices().nth(n) {
-            s.truncate(cut);
-        }
+    if let Ok(n) = usize::try_from(len)
+        && let Some((cut, _)) = s.char_indices().nth(n)
+    {
+        s.truncate(cut);
     }
     t.value = s;
     // The spec has "0 if raw, 1 if not"; the converter writes the `%%` of

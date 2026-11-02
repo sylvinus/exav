@@ -1,7 +1,9 @@
 /**
  * `@exav/viewer/archive`: what is inside an archive, on `@exav/unpack-wasm`
- * (a peer dependency): zip, 7z, rar, and tar and its compressions (gz, bz2,
- * xz), or plain gz, bz2 and xz. Members open with whatever plugin fits them, in the
+ * (a peer dependency): zip, 7z, rar, tar and its compressions (gz, bz2, xz,
+ * zst, lz4, lz, Z), cab, lzh, arj, ar and deb, cpio, xar and pkg, the packages
+ * that are zips (jar, apk...), comic books, chm, `winmail.dat`, and the iso, dmg,
+ * wim and virtual disk images. Members open with whatever plugin fits them, in the
  * same viewer, an archive inside an archive included.
  */
 import { MATCHERS } from "../core/formats.js";

@@ -10,25 +10,30 @@
 //! Windows uses (first three components byte-swapped).
 //!
 //! Payload blocks are stored uncompressed, so unlike QCOW2 the bytes are
-//! visible to a raw scan wherever they happen to land. Reconstruction still
+//! visible to a raw scan wherever they happen to land. Reading the disk still
 //! matters: blocks are placed in arbitrary file order and sparse ranges are
 //! absent entirely, so a payload spanning a block boundary appears in the file
 //! only as two disjoint fragments — and a filesystem inside cannot be walked at
 //! all until the guest disk is put back in order.
 //!
-//! The reconstructed disk is emitted as a single member for the partition and
-//! filesystem handlers to pick up.
+//! The disk is a [`VDisk`]: one member when it fits the buffer limit, else its
+//! filesystems are walked in place (see `vdisk.rs`). The block allocation table
+//! is read from the source as blocks are reached.
 
 // Every sum and product on a header's number is checked or saturating here; a
 // plain one fails the build, so the next edit cannot add the unchecked kind.
 #![deny(clippy::arithmetic_side_effects)]
 
-use crate::{Budget, Entry, LimitHit, Sink};
+use super::vdisk::{self, Health, Layout, Map, VDisk, bytes_at, le32, le64};
+use super::volumes::report;
+use crate::source::ByteSource;
+use crate::stream::Visit;
+use crate::{Budget, LimitHit};
 
 /// The two region tables, at 192 KiB and 256 KiB. The second is a mirror, read
 /// when the first does not parse.
-const REGION_TABLE_1: usize = 192 * 1024;
-const REGION_TABLE_2: usize = 256 * 1024;
+const REGION_TABLE_1: u64 = 192 * 1024;
+const REGION_TABLE_2: u64 = 256 * 1024;
 const REGION_SIGNATURE: &[u8; 4] = b"regi";
 const METADATA_SIGNATURE: &[u8; 8] = b"metadata";
 
@@ -36,6 +41,8 @@ const METADATA_SIGNATURE: &[u8; 8] = b"metadata";
 const MAX_REGION_ENTRIES: u32 = 2047;
 /// Likewise for metadata items — the table is one 64 KiB region.
 const MAX_METADATA_ENTRIES: u16 = 2047;
+/// Both tables are one 64 KiB region.
+const TABLE_LEN: usize = 64 * 1024;
 
 /// Region GUIDs, in stored (mixed-endian) byte order.
 const BAT_REGION: [u8; 16] = [
@@ -65,6 +72,8 @@ const PAYLOAD_BLOCK_PARTIALLY_PRESENT: u64 = 7;
 /// `FileParameters` flag bit 1: the disk is a delta against a parent image.
 const HAS_PARENT: u32 = 1 << 1;
 
+const NAME: &str = "vhdx-disk";
+
 fn le_u16(d: &[u8], off: usize) -> u16 {
     crate::bytes::at(d, off, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -85,31 +94,36 @@ fn le_u64(d: &[u8], off: usize) -> u64 {
 
 /// Where a region lives in the file, and how long it is.
 struct Region {
-    offset: usize,
-    length: usize,
+    offset: u64,
+    length: u64,
 }
 
 /// Find the BAT and metadata regions in whichever region table parses.
-fn regions(data: &[u8]) -> Option<(Region, Region)> {
+fn regions(src: &dyn ByteSource) -> Option<(Region, Region)> {
     for base in [REGION_TABLE_1, REGION_TABLE_2] {
-        if crate::bytes::at(data, base, 4) != Some(REGION_SIGNATURE.as_slice()) {
+        let Some(t) = bytes_at(src, base, 16) else {
+            continue;
+        };
+        if t[..4] != REGION_SIGNATURE[..] {
             continue;
         }
-        let count = le_u32(data, base.saturating_add(8)).min(MAX_REGION_ENTRIES);
+        let count = le32(src, base.saturating_add(8))
+            .unwrap_or(0)
+            .min(MAX_REGION_ENTRIES);
         let (mut bat, mut meta) = (None, None);
-        for i in 0..count as usize {
+        for i in 0..u64::from(count) {
             let e = base.saturating_add(16).saturating_add(i.saturating_mul(32));
-            let Some(guid) = crate::bytes::at(data, e, 16) else {
+            // Entry: GUID(16), FileOffset u64, Length u32, Required u32.
+            let Some(entry) = bytes_at(src, e, 28) else {
                 break;
             };
-            // Entry: GUID(16), FileOffset u64, Length u32, Required u32.
             let r = Region {
-                offset: crate::bytes::to_usize(le_u64(data, e.saturating_add(16))),
-                length: le_u32(data, e.saturating_add(24)) as usize,
+                offset: le_u64(&entry, 16),
+                length: u64::from(le_u32(&entry, 24)),
             };
-            if guid == BAT_REGION {
+            if entry[..16] == BAT_REGION {
                 bat = Some(r);
-            } else if guid == METADATA_REGION {
+            } else if entry[..16] == METADATA_REGION {
                 meta = Some(r);
             }
         }
@@ -120,7 +134,7 @@ fn regions(data: &[u8]) -> Option<(Region, Region)> {
     None
 }
 
-/// The three metadata items reconstruction needs.
+/// The three metadata items reading the disk needs.
 struct Geometry {
     block_size: u32,
     virtual_size: u64,
@@ -128,12 +142,17 @@ struct Geometry {
     has_parent: bool,
 }
 
-fn geometry(data: &[u8], meta: &Region) -> Option<Geometry> {
+fn geometry(src: &dyn ByteSource, meta: &Region) -> Option<Geometry> {
     let base = meta.offset;
-    if crate::bytes::at(data, base, 8) != Some(METADATA_SIGNATURE.as_slice()) {
+    let table = bytes_at(src, base, TABLE_LEN).or_else(|| {
+        // A table cut short by the end of the file still has its entries.
+        let n = (src.len() as u64).saturating_sub(base);
+        bytes_at(src, base, usize::try_from(n).ok()?.min(TABLE_LEN))
+    })?;
+    if table.get(..8) != Some(METADATA_SIGNATURE.as_slice()) {
         return None;
     }
-    let count = le_u16(data, base.saturating_add(10)).min(MAX_METADATA_ENTRIES);
+    let count = le_u16(&table, 10).min(MAX_METADATA_ENTRIES);
     let mut g = Geometry {
         block_size: 0,
         virtual_size: 0,
@@ -142,22 +161,20 @@ fn geometry(data: &[u8], meta: &Region) -> Option<Geometry> {
         logical_sector_size: 512,
         has_parent: false,
     };
-    for i in 0..count as usize {
-        let Some(e) = base.checked_add(i.saturating_mul(32).saturating_add(32)) else {
-            break;
-        };
-        let Some(guid) = crate::bytes::at(data, e, 16) else {
+    for i in 0..usize::from(count) {
+        let e = i.saturating_mul(32).saturating_add(32);
+        let Some(guid) = crate::bytes::at(&table, e, 16) else {
             break;
         };
         // Item offsets are relative to the start of the metadata region.
-        let item = base.saturating_add(le_u32(data, e.saturating_add(16)) as usize);
+        let item = base.saturating_add(u64::from(le_u32(&table, e.saturating_add(16))));
         if guid == FILE_PARAMETERS {
-            g.block_size = le_u32(data, item);
-            g.has_parent = le_u32(data, item.saturating_add(4)) & HAS_PARENT != 0;
+            g.block_size = le32(src, item).unwrap_or(0);
+            g.has_parent = le32(src, item.saturating_add(4)).unwrap_or(0) & HAS_PARENT != 0;
         } else if guid == VIRTUAL_DISK_SIZE {
-            g.virtual_size = le_u64(data, item);
+            g.virtual_size = le64(src, item).unwrap_or(0);
         } else if guid == LOGICAL_SECTOR_SIZE {
-            let s = le_u32(data, item);
+            let s = le32(src, item).unwrap_or(0);
             if s != 0 {
                 g.logical_sector_size = s;
             }
@@ -166,26 +183,130 @@ fn geometry(data: &[u8], meta: &Region) -> Option<Geometry> {
     (g.block_size != 0 && g.virtual_size != 0).then_some(g)
 }
 
-pub(crate) fn extract_vhdx<R>(
-    data: &[u8],
+/// A VHDX disk: blocks placed by the Block Allocation Table.
+struct Vhdx<'a> {
+    src: &'a dyn ByteSource,
+    bat: Region,
+    block: u64,
+    size: u64,
+    /// Payload entries between the sector-bitmap entries the BAT interleaves.
+    chunk_ratio: u64,
+    file_len: u64,
+    /// Blocks past the end of the table the region declares.
+    unlocatable: u64,
+}
+
+impl Vhdx<'_> {
+    /// The BAT index of block `idx`: one sector-bitmap entry follows every
+    /// `chunk_ratio` payload entries, so it is not the block's index on the
+    /// disk.
+    fn bat_index(&self, idx: u64) -> u64 {
+        idx.saturating_add(idx.checked_div(self.chunk_ratio).unwrap_or(0))
+    }
+
+    /// Whether the region declares an entry for block `idx`.
+    fn has_entry(&self, idx: u64) -> bool {
+        self.bat_index(idx).saturating_mul(8).saturating_add(8) <= self.bat.length
+    }
+
+    /// How many blocks, from the first, the table has an entry for.
+    fn covered(&self, blocks: u64) -> u64 {
+        // The entries needed grow with the index, so the blocks without one
+        // are a suffix.
+        let (mut lo, mut hi) = (0u64, blocks);
+        while lo < hi {
+            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+            if self.has_entry(mid) {
+                lo = mid.saturating_add(1);
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+impl Layout for Vhdx<'_> {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn unit(&self) -> u64 {
+        self.block
+    }
+
+    fn map(&self, idx: u64) -> Map {
+        // Past the end of the declared BAT region the table is short, so this
+        // block and every one after it has no entry to read.
+        if !self.has_entry(idx) {
+            return Map::Zero;
+        }
+        let at = self
+            .bat
+            .offset
+            .saturating_add(self.bat_index(idx).saturating_mul(8));
+        let Some(entry) = le64(self.src, at) else {
+            return Map::Zero;
+        };
+        let state = entry & 7;
+        if state != PAYLOAD_BLOCK_FULLY_PRESENT && state != PAYLOAD_BLOCK_PARTIALLY_PRESENT {
+            return Map::Zero; // unallocated or explicitly zero
+        }
+        // Bits 20..63 hold the file offset in megabytes.
+        let host = (entry >> 20) << 20;
+        let n = self
+            .block
+            .min(self.size.saturating_sub(idx.saturating_mul(self.block)));
+        // An entry pointing past the end of the file names bytes that are
+        // absent rather than hidden, so the block stays zero and stays quiet.
+        host.checked_add(n)
+            .is_some_and(|end| end <= self.file_len)
+            .then_some(host)
+            .map_or(Map::Zero, Map::Plain)
+    }
+
+    fn reports(&self, _health: &Health) -> Vec<(u64, &'static str)> {
+        if self.unlocatable == 0 {
+            return Vec::new();
+        }
+        // Reported alongside the disk, not instead of it: what was read
+        // is still worth scanning, and the hole is still worth knowing about.
+        vec![(
+            self.unlocatable.saturating_mul(self.block),
+            "VHDX block allocation table is shorter than the disk it describes",
+        )]
+    }
+}
+
+/// Walk a VHDX's disk.
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
     budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    if !super::sniff::is(data, crate::Format::Vhdx) {
+    visit: Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let file_len = src.len() as u64;
+    if file_len <= REGION_TABLE_1 || bytes_at(src, 0, 8).as_deref() != Some(b"vhdxfile".as_slice())
+    {
         return Ok(None);
     }
-    let Some((bat, meta)) = regions(data) else {
+    let Some((bat, meta)) = regions(src) else {
         return report(
-            "VHDX region table names no BAT or metadata region",
+            NAME,
             0,
+            "VHDX region table names no BAT or metadata region",
             budget,
             visit,
         );
     };
-    let Some(g) = geometry(data, &meta) else {
+    let Some(g) = geometry(src, &meta) else {
         return report(
-            "VHDX metadata does not give the disk geometry",
+            NAME,
             0,
+            "VHDX metadata does not give the disk geometry",
             budget,
             visit,
         );
@@ -194,8 +315,9 @@ pub(crate) fn extract_vhdx<R>(
         // The blocks this image lacks live in the parent, which is a separate
         // file — the same shape as a differencing VHD.
         return report(
-            "differencing VHDX: the disk is a delta against a parent image not in this file",
+            NAME,
             g.virtual_size,
+            "differencing VHDX: the disk is a delta against a parent image not in this file",
             budget,
             visit,
         );
@@ -203,97 +325,84 @@ pub(crate) fn extract_vhdx<R>(
     // The block size is a power of two between 1 MiB and 256 MiB; outside that
     // the chunk-ratio arithmetic below is meaningless.
     if !g.block_size.is_power_of_two() || !(1 << 20..=1 << 28).contains(&g.block_size) {
-        return report("implausible VHDX block size", g.virtual_size, budget, visit);
-    }
-
-    budget.count_entry()?;
-    let cap = budget.reserve()?;
-    if g.virtual_size > cap {
-        return Ok(visit(
-            Entry::unsupported(
-                "vhdx-disk".to_string(),
-                g.virtual_size,
-                false,
-                "VHDX disk exceeds the per-member size budget",
-            ),
+        return report(
+            NAME,
+            g.virtual_size,
+            "implausible VHDX block size",
             budget,
-        ));
+            visit,
+        );
     }
-
-    // The BAT interleaves one sector-bitmap entry after every `chunk_ratio`
-    // payload entries, so a block's index in the table is not its index on the
-    // disk.
     let chunk_ratio = (1u64 << 23)
         .saturating_mul(u64::from(g.logical_sector_size))
         .checked_div(u64::from(g.block_size))
         .unwrap_or(0);
-    let block_size = g.block_size as usize;
-    let total_blocks = g.virtual_size.div_ceil(u64::from(g.block_size).max(1));
-
-    let mut disk = vec![0u8; crate::bytes::to_usize(g.virtual_size)];
-    // Blocks the BAT says are here but that could not be located. Zero-filling
-    // one and saying nothing would hand the scanner a clean-looking hole where
-    // real content should be.
-    let mut unlocatable_blocks = 0usize;
-
-    for i in 0..total_blocks {
-        let bat_index = i.saturating_add(i.checked_div(chunk_ratio).unwrap_or(0));
-        let bat_at = crate::bytes::to_usize(bat_index).saturating_mul(8);
-        // Past the end of the declared BAT region: the table is short, so this
-        // block and every one after it has no entry to read.
-        if bat_at.saturating_add(8) > bat.length {
-            unlocatable_blocks = unlocatable_blocks
-                .saturating_add(crate::bytes::to_usize(total_blocks.saturating_sub(i)));
-            break;
-        }
-        let entry = le_u64(data, bat.offset.saturating_add(bat_at));
-        let state = entry & 7;
-        if state != PAYLOAD_BLOCK_FULLY_PRESENT && state != PAYLOAD_BLOCK_PARTIALLY_PRESENT {
-            continue; // unallocated or explicitly zero
-        }
-        // Bits 20..63 hold the file offset in megabytes.
-        let host = crate::bytes::to_usize((entry >> 20) << 20);
-        let guest = crate::bytes::to_usize(i).saturating_mul(block_size);
-        if guest >= disk.len() {
-            continue;
-        }
-        // An entry pointing past the end of the file names bytes that are
-        // absent rather than hidden, so the block stays zero and stays quiet.
-        let n = block_size.min(disk.len().saturating_sub(guest));
-        if let Some(src) = crate::bytes::at(data, host, n) {
-            disk[guest..guest.saturating_add(n)].copy_from_slice(src);
-        }
-    }
-
-    if unlocatable_blocks > 0 {
-        // Reported alongside the disk, not instead of it: what was reconstructed
-        // is still worth scanning, and the hole is still worth knowing about.
-        budget.count_entry()?;
-        if let Some(r) = visit(
-            Entry::unsupported(
-                "vhdx-disk".to_string(),
-                (unlocatable_blocks as u64).saturating_mul(g.block_size as u64),
-                false,
-                "VHDX block allocation table is shorter than the disk it describes",
-            ),
-            budget,
-        ) {
-            return Ok(Some(r));
-        }
-    }
-    budget.commit(disk.len() as u64);
-    Ok(visit(Entry::new("vhdx-disk".to_string(), disk), budget))
+    let block = u64::from(g.block_size);
+    let total_blocks = g.virtual_size.div_ceil(block);
+    let mut layout = Vhdx {
+        src,
+        bat,
+        block,
+        size: g.virtual_size,
+        chunk_ratio,
+        file_len,
+        unlocatable: 0,
+    };
+    layout.unlocatable = total_blocks.saturating_sub(layout.covered(total_blocks));
+    let allowance = budget.remaining_scan();
+    vdisk::walk(VDisk::new(src, layout, allowance), budget, visit)
 }
 
-fn report<R>(
-    reason: &'static str,
-    size: u64,
-    budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
-    budget.count_entry()?;
-    Ok(visit(
-        Entry::unsupported("vhdx-disk".to_string(), size, false, reason),
-        budget,
-    ))
+// The tests lay out their inputs by index arithmetic on small constants.
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+mod tests {
+    use super::*;
+
+    fn layout<'a>(src: &'a dyn ByteSource, bat_len: u64, ratio: u64) -> Vhdx<'a> {
+        Vhdx {
+            src,
+            bat: Region {
+                offset: 0,
+                length: bat_len,
+            },
+            block: 1 << 20,
+            size: 1 << 40,
+            chunk_ratio: ratio,
+            file_len: 0,
+            unlocatable: 0,
+        }
+    }
+
+    /// The blocks the table has an entry for are found by search; they are the
+    /// ones a walk over every block would count, whatever the table's length
+    /// and however the sector-bitmap entries are interleaved.
+    #[test]
+    fn the_blocks_a_short_table_covers_are_those_with_an_entry() {
+        let src: &[u8] = &[];
+        for ratio in [0u64, 1, 4, 16] {
+            for entries in 0..40u64 {
+                let l = layout(&src, entries * 8, ratio);
+                for blocks in [0u64, 1, 7, 33, 100] {
+                    let brute = (0..blocks).take_while(|&i| l.has_entry(i)).count() as u64;
+                    assert_eq!(l.covered(blocks), brute, "{ratio} {entries} {blocks}");
+                }
+            }
+        }
+        // An entry is eight bytes: a length that cuts one does not hold it.
+        let l = layout(&src, 8 * 3 + 7, 0);
+        assert_eq!(l.covered(10), 3);
+    }
+
+    /// With a sector-bitmap entry after every four payload entries, block 4
+    /// is at index 5.
+    #[test]
+    fn a_block_is_found_past_the_sector_bitmap_entries() {
+        let src: &[u8] = &[];
+        let l = layout(&src, 1 << 20, 4);
+        assert_eq!(
+            (0..8).map(|i| l.bat_index(i)).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 5, 6, 7, 8]
+        );
+    }
 }

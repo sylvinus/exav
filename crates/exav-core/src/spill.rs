@@ -61,22 +61,24 @@ impl SpillOut {
     }
 
     fn flush(&mut self) {
-        if self.failed.is_none() && !self.batch.is_empty() {
-            if let Err(e) = self.file.write(&self.batch) {
-                self.failed = Some(e);
-            }
+        if self.failed.is_none()
+            && !self.batch.is_empty()
+            && let Err(e) = self.file.write(&self.batch)
+        {
+            self.failed = Some(e);
         }
         self.batch.clear();
     }
 
     /// What was written, to read back.
-    pub(crate) fn finish(mut self) -> Result<Spilled, String> {
+    pub(crate) fn finish(mut self, cache: (usize, usize)) -> Result<Spilled, String> {
         self.flush();
         if let Some(e) = self.failed {
             return Err(e);
         }
         let reader = self.file.finish()?;
-        BlockCache::new(reader).map_err(|e| format!("spill file unreadable: {e}"))
+        BlockCache::with_sizes(reader, cache.0, cache.1)
+            .map_err(|e| format!("spill file unreadable: {e}"))
     }
 }
 
@@ -108,6 +110,7 @@ pub(crate) enum SpillStreamError {
 pub(crate) fn spill_stream(
     spill: &dyn Spill,
     reader: &mut dyn Read,
+    cache: (usize, usize),
 ) -> Result<Spilled, SpillStreamError> {
     let mut out = SpillOut::new(spill.create().map_err(SpillStreamError::Spill)?);
     let mut buf = vec![0u8; CHUNK];
@@ -122,7 +125,7 @@ pub(crate) fn spill_stream(
             return Err(SpillStreamError::Spill(e));
         }
     }
-    out.finish().map_err(SpillStreamError::Spill)
+    out.finish(cache).map_err(SpillStreamError::Spill)
 }
 
 #[cfg(test)]
@@ -168,12 +171,12 @@ pub(crate) mod tests {
             budget: usize::MAX,
             made: Arc::default(),
         };
-        let back = spill_stream(&spill, &mut Cursor::new(&data)).unwrap();
+        let back = spill_stream(&spill, &mut Cursor::new(&data), (64 * 1024, 8 << 20)).unwrap();
         assert_eq!(back.window(0, back.len()), &data[..]);
         let small = MemSpill {
             budget: CHUNK,
             made: Arc::default(),
         };
-        assert!(spill_stream(&small, &mut Cursor::new(&data)).is_err());
+        assert!(spill_stream(&small, &mut Cursor::new(&data), (64 * 1024, 8 << 20)).is_err());
     }
 }

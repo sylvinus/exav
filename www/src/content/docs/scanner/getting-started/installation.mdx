@@ -7,9 +7,8 @@ import { Steps } from '@astrojs/starlight/components';
 
 exav runs on Linux, macOS and Windows and ships as a single binary. The Linux
 release builds are static (musl); the macOS and Windows builds link the system
-libraries. On Windows there is no prefork worker pool, no per-job limits
-(`--max-scan-secs`, `--max-process-bytes`) and no `--auto-update`, which are
-Unix only.
+libraries. The prefork worker pool, the per-job limits (`--max-scan-secs`,
+`--max-process-bytes`) and `--auto-update` are Unix only.
 
 ## Prebuilt binaries
 
@@ -21,25 +20,25 @@ module `exav-wasm-<tag>-wasm32-wasip1.wasm` (see the
 checksum beside it. For example, on 64-bit Linux:
 
 ```sh
-tag=v0.0.2 target=x86_64-unknown-linux-musl
+tag=v0.0.3 target=x86_64-unknown-linux-musl
 curl -fsSLO https://github.com/sylvinus/exav/releases/download/$tag/exav-$tag-$target.tar.gz
 tar xzf exav-$tag-$target.tar.gz
 sudo install -m755 exav /usr/local/bin/exav
 exav --version
 ```
 
-They are the default build, without HTTP support: to fetch signatures with
-`--auto-update` or scan URLs, build with `--features http` below.
+The binaries are the default build, without HTTP support. To fetch signatures
+with `--auto-update` or scan URLs, build with `--features http` (below).
 
 Every archive carries the `LICENSE` and the `NOTICE` of what the binary links.
-The same releases carry the other tools in archives of their own, each
-installed as its page says: [exav-unpack](/unpack/cli/),
+The same releases carry the other tools in archives of their own, installed as
+their pages say: [exav-unpack](/unpack/cli/),
 [exav-grep](/subprojects/exav-grep/), [exav-pe-emu](/subprojects/exav-pe-emu/#cli)
 and [exav-imagehash](/subprojects/exav-imagehash/).
 
 ## From crates.io
 
-Building needs Rust 1.92 or newer (`rustc --version`; `rustup update` to
+Building needs Rust 1.95 or newer (`rustc --version`; `rustup update` to
 upgrade).
 
 ```sh
@@ -61,7 +60,7 @@ See [Feature flags](/scanner/reference/feature-flags/) for all build options.
 
 <Steps>
 
-1. Install a Rust toolchain (1.92 or newer) via [rustup](https://rustup.rs/).
+1. Install a Rust toolchain (1.95 or newer) via [rustup](https://rustup.rs/).
 
 2. Clone and build:
 
@@ -87,7 +86,7 @@ scanning and signature auto-update):
 cargo build --release -p exav --features http
 ```
 
-For a smaller binary without YARA, DLP, the phishing heuristic or ICAP:
+For a smaller binary with only the archive formats and decryption:
 
 ```sh
 cargo build --release -p exav --no-default-features --features all-formats,decrypt

@@ -17,7 +17,7 @@
 //! outputs up to 11 KB — zero disagreements. Treat a pass here as "still
 //! wired up", not as "the codec is correct".
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 fn fixture() -> Vec<u8> {
     let p = format!(

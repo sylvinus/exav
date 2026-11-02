@@ -72,13 +72,13 @@ function Stack({ locale }: { locale: string }) {
   );
 }
 
-const title = () => document.querySelector(".exv-dialog-title")?.textContent;
-const counter = () => document.querySelector(".exv-counter")?.textContent;
+const title = () => document.querySelector(".exav-viewer-dialog-title")?.textContent;
+const counter = () => document.querySelector(".exav-viewer-counter")?.textContent;
 const key = (k: string) => act(async () => void window.dispatchEvent(new KeyboardEvent("keydown", { key: k })));
 
 it("walks the stack with the arrow keys, round from the first to the last", async () => {
   await act(async () => root.render(<Stack locale="en" />));
-  expect(document.querySelector<HTMLDialogElement>("dialog.exv-dialog")?.open).toBe(true);
+  expect(document.querySelector<HTMLDialogElement>("dialog.exav-viewer-dialog")?.open).toBe(true);
   expect([title(), counter()]).toEqual(["AFAKE", "1 / 3"]);
   await key("ArrowRight");
   expect([title(), counter()]).toEqual(["BFAKE", "2 / 3"]);
@@ -90,10 +90,20 @@ it("walks the stack with the arrow keys, round from the first to the last", asyn
 
 it("closes on Escape, which the browser sends to the dialog as cancel", async () => {
   await act(async () => root.render(<Stack locale="en" />));
-  const dialog = document.querySelector("dialog.exv-dialog")!;
+  const dialog = document.querySelector("dialog.exav-viewer-dialog")!;
   await act(async () => void dialog.dispatchEvent(new Event("cancel", { cancelable: true })));
   expect(changes).toEqual([null]);
-  expect(document.querySelector("dialog.exv-dialog")).toBeNull();
+  expect(document.querySelector("dialog.exav-viewer-dialog")).toBeNull();
+});
+
+it("closes on an Escape a sandboxed frame hands back, and on no other made-up one", async () => {
+  await act(async () => root.render(<Stack locale="en" />));
+  await key("Escape");
+  expect(changes).toEqual([]);
+  const frame = document.createElement("iframe");
+  document.querySelector("dialog.exav-viewer-dialog")!.append(frame);
+  await act(async () => void frame.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+  expect(changes).toEqual([null]);
 });
 
 it("speaks the provider's language", async () => {

@@ -3,7 +3,8 @@
  * draws on (annotations, markers) and a way to redraw it sharp past its
  * resolution. With `wasmDecoders`, the formats browsers do not draw (TIFF in
  * most of them, BMP variants, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000,
- * JBIG2) are decoded by exav-render's memory-safe decoders in WebAssembly.
+ * JBIG2, JPEG XL, and camera RAW files, shown by the largest preview they
+ * embed) are decoded by exav-render's memory-safe decoders in WebAssembly.
  */
 import { MATCHERS, WASM_IMAGES } from "../core/formats.js";
 import type { DetailSource, FormatMatcher, FormatPlugin, ImageSurface, OverlayHost, ViewerFile } from "../core/types.js";
@@ -56,15 +57,19 @@ export interface ImageOptions<Meta = unknown> {
   crossOrigin?: "anonymous" | "use-credentials" | null;
 }
 
-function merge(a: FormatMatcher, b: FormatMatcher): FormatMatcher {
-  return { types: [...(a.types ?? []), ...(b.types ?? [])], extensions: [...(a.extensions ?? []), ...(b.extensions ?? [])] };
+function merge(...matchers: FormatMatcher[]): FormatMatcher {
+  return {
+    types: matchers.flatMap((m) => m.types ?? []),
+    extensions: matchers.flatMap((m) => m.extensions ?? []),
+    extensionOverrides: matchers.flatMap((m) => m.extensionOverrides ?? []),
+  };
 }
 
 export function image<Meta = unknown>(options: ImageOptions<Meta> = {}): FormatPlugin<ImageOptions<Meta>> {
   return {
     id: "image",
     match: options.wasmDecoders ? merge(MATCHERS.image, WASM_IMAGES) : MATCHERS.image,
-    capabilities: ["zoom", "image-surface"],
+    capabilities: ["zoom", "image-surface", "pictures", "viewport"],
     options,
     load: () => import("./renderer.js").then((m) => m.renderer as never),
   };

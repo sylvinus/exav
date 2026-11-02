@@ -5,7 +5,7 @@
 
 use exav_core::bytecode::runtime::BytecodeRuntime;
 use exav_core::filetype::FileType;
-use exav_core::{analyze, analyze_all, ScanOptions, Verdict};
+use exav_core::{ScanOptions, Verdict, analyze, analyze_all};
 
 const HEADER_MAGIC: u64 = 0x53e5_493e_9f3d_1c30;
 
@@ -91,7 +91,7 @@ fn synth_cbc_when(name: &str, marker: &[u8], attrs: &str) -> String {
     b.push(nib(2)); // opcode hi nibble
     b.push(nib(0)); // numOps = fixed(1) 0
     b.push_str(&num(5)); // funcid number (decoded = 5-1 = 4 -> global id 5)
-                         // terminator: ret_void (opcode 20 = 0x14).
+    // terminator: ret_void (opcode 20 = 0x14).
     b.push('T');
     b.push(nib(4));
     b.push(nib(1));

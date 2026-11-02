@@ -65,6 +65,22 @@ vec3 contrastFix(vec3 rgb, float bgLuma, uint flags) {
   if (bgLuma <= 0.5 && luma < 0.07) return vec3(1.0);
   return rgb;
 }
+
+// Everything in ink, as monochrome.ctb plots: black on a light ground,
+// white on a dark one.
+uniform bool uMono;
+
+// Lines and text keep some contrast with the ground, their hue kept:
+// yellow, cyan and the lightest indexed colours darkened on a light ground,
+// the darkest blues lightened on a dark one. Fills keep their colours.
+vec3 legible(vec3 rgb, float bgLuma, uint flags) {
+  if (uMono) return bgLuma > 0.5 ? vec3(0.0) : vec3(1.0);
+  rgb = contrastFix(rgb, bgLuma, flags);
+  float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+  if (bgLuma > 0.5 && luma > 0.6) return rgb * (0.6 / luma);
+  if (bgLuma <= 0.5 && luma < 0.25) return mix(rgb, vec3(1.0), (0.25 - luma) / (1.0 - luma));
+  return rgb;
+}
 `
 
 /**
@@ -86,6 +102,7 @@ layout(location = 2) in vec2  aP1;
 layout(location = 3) in vec4  aColor;   // normalised UNSIGNED_BYTE
 layout(location = 4) in uint  aAttr;    // layer | lineweight | flags
 layout(location = 5) in uint  aOrder;
+layout(location = 6) in float aBulge;   // 0 a line; an arc's tan(sweep / 4)
 ${COMMON}
 
 uniform float uLineScale;  // device px per 1/100 mm
@@ -104,6 +121,13 @@ out vec2  vP1;
 out vec4  vColor;
 out float vHalf;
 flat out uint vFlags;
+flat out float vBulge;
+flat out int vEdge;
+
+// The lineweight code of a fill's edge (FILL_EDGE in scene.rs): no width, so
+// that its fringe is the coverage of the pixels just outside the fill, 0.5
+// on its edge to none half a pixel out.
+const uint FILL_EDGE = 255u;
 
 /**
  * Hatch pattern lines carry their spacing in the flags byte.
@@ -117,7 +141,8 @@ flat out uint vFlags;
 float spacingFade(uint attr, float unitsPerPixel) {
   uint code = (attr >> 24) & 0x7Fu;
   if (code == 0u) return 1.0;
-  float spacingWorld = exp2(float(code) / 8.0);
+  // Five steps to the octave from 2^-9 (encode_fade_spacing in scene.rs).
+  float spacingWorld = exp2(float(code) / 5.0 - 9.0);
   return clamp(spacingWorld / unitsPerPixel, 0.08, 1.0);
 }
 
@@ -131,9 +156,10 @@ void main() {
   vec2 s0 = toFb(aP0);
   vec2 s1 = toFb(aP1);
 
+  bool edge = ((aAttr >> 16) & 0xFFu) == FILL_EDGE;
   float lw = float((aAttr >> 16) & 0xFFu);
   float widthPx = uLineWorld > 0.0 ? lw * uLineWorld / uScale : lw * uLineScale;
-  float halfW = max(uMinWidth, widthPx) * 0.5;
+  float halfW = edge ? 0.0 : max(uMinWidth, widthPx) * 0.5;
 
   vec2 d = s1 - s0;
   float len = length(d);
@@ -142,13 +168,18 @@ void main() {
 
   float pad = halfW + 1.0;
   vec2 mid = (s0 + s1) * 0.5;
-  vec2 pos = mid + t * aCorner.x * (len * 0.5 + pad) + n * aCorner.y * pad;
+  // An arc stands off its chord by its sagitta, on one side; the quad
+  // covers both, which costs little at a quarter turn's at most.
+  float sag = abs(aBulge) * len * 0.5;
+  vec2 pos = mid + t * aCorner.x * (len * 0.5 + pad) + n * aCorner.y * (pad + sag);
 
   vP0 = s0;
   vP1 = s1;
+  vBulge = aBulge;
   vColor = vec4(aColor.rgb, aColor.a * spacingFade(aAttr, uScale));
   vFlags = (aAttr >> 24) & 0xFFu;
   vHalf = halfW;
+  vEdge = edge ? 1 : 0;
   gl_Position = toClip(pos, aOrder);
 }
 `
@@ -161,6 +192,8 @@ in vec2  vP1;
 in vec4  vColor;
 in float vHalf;
 flat in uint vFlags;
+flat in float vBulge;
+flat in int vEdge;
 ${CONTRAST}
 
 // AutoCAD colour 7 renders white on a dark background and black on a light
@@ -177,12 +210,44 @@ float segDistance(vec2 p, vec2 a, vec2 b) {
   return length(pa - ba * h);
 }
 
+float cross2(vec2 a, vec2 b) {
+  return a.x * b.y - a.y * b.x;
+}
+
+// Distance to the arc from a to b of this bulge (tan of a quarter of its
+// sweep, positive counter-clockwise, at most a quarter turn's): to its
+// circle within its sector, else to the nearer end.
+float arcDistance(vec2 p, vec2 a, vec2 b, float bulge) {
+  vec2 c = b - a;
+  float len = length(c);
+  if (abs(bulge) < 1e-6 || len < 1e-6) return segDistance(p, a, b);
+  vec2 n = vec2(-c.y, c.x) / len;
+  float s = len * 0.5;
+  float h = bulge * s;
+  float r = (s * s + h * h) / (2.0 * h);
+  vec2 centre = (a + b) * 0.5 + n * (r - h);
+  vec2 q = p - centre;
+  float turn = sign(h);
+  if (turn * cross2(a - centre, q) >= 0.0 && turn * cross2(q, b - centre) >= 0.0) {
+    return abs(length(q) - abs(r));
+  }
+  return min(length(p - a), length(p - b));
+}
+
+// 0 every pixel, 1 the fully covered core, 2 the anti-aliased fringe.
+uniform int uStrokePass;
+
 void main() {
-  float d = segDistance(gl_FragCoord.xy, vP0, vP1);
+  float d = arcDistance(gl_FragCoord.xy, vP0, vP1, vBulge);
   float cov = 1.0 - smoothstep(vHalf - 0.5, vHalf + 0.5, d);
   if (cov <= 0.0) discard;
+  if ((uStrokePass == 1 && cov < 1.0) || (uStrokePass == 2 && cov >= 1.0)) discard;
 
-  outColor = vec4(contrastFix(vColor.rgb, uBgLuma, vFlags), vColor.a * cov);
+  // A fill's edge takes the fill's colour, as FILL_FRAG gives it.
+  vec3 rgb = vEdge == 1
+    ? (uMono ? (uBgLuma > 0.5 ? vec3(0.0) : vec3(1.0)) : contrastFix(vColor.rgb, uBgLuma, vFlags))
+    : legible(vColor.rgb, uBgLuma, vFlags);
+  outColor = vec4(rgb, vColor.a * cov);
 }
 `
 
@@ -229,7 +294,9 @@ void main() {
     outColor = vec4(uBackground, 1.0);
     return;
   }
-  outColor = vec4(contrastFix(vColor.rgb, uBgLuma, vFlags), vColor.a);
+  vec3 rgb = contrastFix(vColor.rgb, uBgLuma, vFlags);
+  if (uMono) rgb = uBgLuma > 0.5 ? vec3(0.0) : vec3(1.0);
+  outColor = vec4(rgb, vColor.a);
 }
 `
 
@@ -282,13 +349,48 @@ flat in uint vFlags;
 
 uniform sampler2D uAtlas;
 uniform float uBgLuma;
+// 0 every pixel of a glyph, 1 those at least half covered, 2 the others.
+uniform int uTextPass;
+// The atlas holds distance fields (sdf.ts): the edge is cut here, a pixel
+// wide whatever the zoom.
+uniform bool uSdf;
 ${CONTRAST}
 
 out vec4 outColor;
 
 void main() {
   float a = texture(uAtlas, vUv).r;
+  if (uSdf) {
+    float w = max(fwidth(a), 1e-4) * 0.5;
+    a = smoothstep(0.5 - w, 0.5 + w, a);
+  }
   if (a <= 0.004) discard;
-  outColor = vec4(contrastFix(vColor.rgb, uBgLuma, vFlags), vColor.a * a);
+  if ((uTextPass == 1 && a < 0.5) || (uTextPass == 2 && a >= 0.5)) discard;
+  outColor = vec4(legible(vColor.rgb, uBgLuma, vFlags), vColor.a * a);
+}
+`
+
+/**
+ * A clip region, drawn into the stencil buffer only: the text runs that
+ * cross a viewport's edge or an XCLIP boundary are then drawn where it is.
+ */
+export const CLIP_VERT = /* glsl */ `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec2 aPos;
+${COMMON}
+
+void main() {
+  gl_Position = vec4(toFb(aPos) / uViewport * 2.0 - 1.0, 0.0, 1.0);
+}
+`
+
+export const CLIP_FRAG = /* glsl */ `#version 300 es
+precision highp float;
+
+out vec4 outColor;
+
+void main() {
+  outColor = vec4(0.0);
 }
 `

@@ -33,7 +33,7 @@ export const External = () => (
   </Svg>
 );
 export const Spinner = () => (
-  <span className="exv-spinner" aria-hidden="true">
+  <span className="exav-viewer-spinner" aria-hidden="true">
     <Svg>
       <path d="M21 12a9 9 0 1 1-6.219-8.56" />
     </Svg>
@@ -65,9 +65,20 @@ export const Minus = () => (
     <path d="M5 12h14" />
   </Svg>
 );
-export const FitIcon = () => (
+/** A counter-clockwise arrow: back to the view the file opened in. */
+export const ResetIcon = () => (
+  <Svg size={18}>
+    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8M3 3v5h5" />
+  </Svg>
+);
+export const FullscreenIcon = () => (
   <Svg size={18}>
     <path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3" />
+  </Svg>
+);
+export const FullscreenExitIcon = () => (
+  <Svg size={18}>
+    <path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3" />
   </Svg>
 );
 export const Hand = () => (

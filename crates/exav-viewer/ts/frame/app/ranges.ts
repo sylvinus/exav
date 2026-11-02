@@ -21,8 +21,15 @@ interface Piece {
   reject(e: Error): void;
 }
 
-export function portRanges(post: (m: FrameMessage) => void, size: number, head: Uint8Array): PortRanges {
-  let next = 1;
+/** Read ids are unique over the frame's life: two documents' reads, and the files fetched, never share one. */
+let nextId = 1;
+export const takeId = () => nextId++;
+
+/**
+ * `generation`: the document these bytes are (see `ReplaceMessage`), named
+ * in each read.
+ */
+export function portRanges(post: (m: FrameMessage) => void, size: number, head: Uint8Array, generation = 0): PortRanges {
   const queue: Piece[] = [];
   const sent = new Map<number, Piece>();
   let bytes = 0;
@@ -33,13 +40,13 @@ export function portRanges(post: (m: FrameMessage) => void, size: number, head: 
       p.sent = true;
       sent.set(p.id, p);
       bytes += p.length;
-      post({ type: "read", id: p.id, offset: p.offset, length: p.length });
+      post({ type: "read", id: p.id, generation, offset: p.offset, length: p.length });
     }
   };
 
   const piece = (offset: number, length: number, signal: AbortSignal) =>
     new Promise<Uint8Array>((resolve, reject) => {
-      const p: Piece = { id: next++, offset, length, sent: false, resolve, reject };
+      const p: Piece = { id: takeId(), offset, length, sent: false, resolve, reject };
       const abort = () => {
         if (p.sent) post({ type: "cancel", id: p.id });
         else queue.splice(queue.indexOf(p), 1);

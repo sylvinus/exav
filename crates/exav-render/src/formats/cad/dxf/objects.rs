@@ -34,10 +34,10 @@ pub(crate) fn object(rec: &Record<'_>, raw: &mut Raw, ctx: &mut Ctx<'_>) {
                     281 => d.cloning = t.i16(),
                     3 => pending = Some(ctx.text(t)),
                     350 | 360 => {
-                        if let Some(n) = pending.take() {
-                            if ctx.room(d.entries.len()) {
-                                d.entries.push((n, Handle(t.handle())));
-                            }
+                        if let Some(n) = pending.take()
+                            && ctx.room(d.entries.len())
+                        {
+                            d.entries.push((n, Handle(t.handle())));
                         }
                     }
                     _ => {}
@@ -46,6 +46,42 @@ pub(crate) fn object(rec: &Record<'_>, raw: &mut Raw, ctx: &mut Ctx<'_>) {
             raw.dictionaries.push(d);
         }
         "LAYOUT" => raw.layouts.push(layout(&parts, handle, ctx)),
+        // An XCLIP boundary: its points (10), clipping on (71), then two
+        // matrices of 12 (40), the inverse insert matrix and the clip
+        // boundary's; the front and back distances are 40 and 41 before
+        // them, so the matrices are the last 24 of the 40s.
+        "SPATIAL_FILTER" => {
+            let mut points: Vec<Vec2> = Vec::new();
+            let mut forties: Vec<f64> = Vec::new();
+            let mut enabled = true;
+            for t in class(&parts, "AcDbSpatialFilter") {
+                match t.code {
+                    10 => {
+                        if ctx.room(points.len()) {
+                            points.push(Vec2::new(t.f64(), 0.0));
+                        }
+                    }
+                    20 => {
+                        if let Some(p) = points.last_mut() {
+                            p.y = t.f64();
+                        }
+                    }
+                    71 => enabled = t.bool(),
+                    40 if ctx.room(forties.len()) => forties.push(t.f64()),
+                    _ => {}
+                }
+            }
+            let at = forties.len().saturating_sub(24);
+            let inverse = forties
+                .get(at..at + 12)
+                .and_then(|m| <[f64; 12]>::try_from(m).ok());
+            if let (Some(inverse), true) = (inverse, forties.len() >= 24 && points.len() >= 2) {
+                ctx.spatial_filters.insert(
+                    handle.0,
+                    InsertClip::from_filter(&points, &inverse, enabled),
+                );
+            }
+        }
         "SORTENTSTABLE" => {
             let mut s = SortEntsTable {
                 handle,
@@ -57,10 +93,10 @@ pub(crate) fn object(rec: &Record<'_>, raw: &mut Raw, ctx: &mut Ctx<'_>) {
                     330 => s.block_record = Handle(t.handle()),
                     331 => entity = Some(Handle(t.handle())),
                     5 => {
-                        if let Some(e) = entity.take() {
-                            if ctx.room(s.entries.len()) {
-                                s.entries.push((e, Handle(t.handle())));
-                            }
+                        if let Some(e) = entity.take()
+                            && ctx.room(s.entries.len())
+                        {
+                            s.entries.push((e, Handle(t.handle())));
                         }
                     }
                     _ => {}

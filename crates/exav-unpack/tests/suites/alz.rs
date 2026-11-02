@@ -17,7 +17,7 @@
 //! confirmed field by field: the first member's declared sizes (1,171,458
 //! compressed, 1,195,080 uncompressed) and its name matched `unalz` exactly.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use sha2::{Digest, Sha256};
 
 /// `(name, uncompressed size, sha256 prefix)` for every member of the fixture, as

@@ -3,11 +3,12 @@
 //! format dispatch in a catch-unwind boundary that turns any such panic
 //! into a clean `LimitHit`.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 /// Regression for a fuzz-found crash: this 291-byte cabinet drove `cab-0.6.0`'s
 /// `seek_to_uncompressed_offset` into an out-of-bounds index (`folder.rs:134`,
-/// "len is 0 but the index is 0"). Patched via [patch.crates-io]; must not panic.
+/// "len is 0 but the index is 0"). The reader is vendored in `formats/cab_parse`
+/// and checks it; must not panic.
 #[test]
 fn malformed_cab_does_not_panic() {
     let data = include_bytes!("../fixtures/cab_folder_panic.cab");
@@ -26,7 +27,7 @@ fn malformed_cab_zero_folder_does_not_panic() {
 
 /// Regression for fuzz-found crash (2026-06-30): CAB triggering underflow in
 /// `FolderReader::read()` (`folder.rs:239`) — `current_offset_within_block`
-/// exceeds `current_block_data.len()`. Patched cab returns 0 gracefully.
+/// exceeds `current_block_data.len()`. The vendored reader returns 0.
 #[test]
 fn malformed_cab_read_underflow_does_not_panic() {
     let data = include_bytes!("../fixtures/cab_read_underflow.cab");

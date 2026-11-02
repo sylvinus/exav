@@ -20,7 +20,7 @@
 //! With checksums verified (`Budget::set_verify_checksums`) the entry also
 //! carries the mismatch.
 
-use super::zoo_parse::{crc16_arc, DirEntry, Header, Method, DIRENT_HEADER_SIZE, ZOO_HEADER_SIZE};
+use super::zoo_parse::{DIRENT_HEADER_SIZE, DirEntry, Header, Method, ZOO_HEADER_SIZE, crc16_arc};
 use crate::{Budget, Entry, LimitHit, Sink};
 
 /// Bound on the directory walk; hitting it is reported, never a quiet stop.

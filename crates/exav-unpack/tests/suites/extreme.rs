@@ -5,7 +5,8 @@
 //! checks, which `walk` turns into a "decoder panicked" error, and wraps in the
 //! WebAssembly builds, where it can defeat the bounds check next to it. Each
 //! test here takes a valid container, sets one field at a time to a value near
-//! the top of its range, and requires that no run ends in a panic.
+//! the top of its range, and requires that no run ends in a panic or fails to
+//! end at all.
 
 use super::extract_each;
 use exav_unpack::{Budget, Entry, Format, Limits};
@@ -28,23 +29,83 @@ const POSITION_OFFSETS: [usize; 4] = [0, 4, 8, 16];
 /// What makes a changed input pass its own checks again.
 type Fixup = dyn Fn(&mut [u8]);
 
-/// Whether the walk of `blob` ended in a panic inside the decoder.
-fn panicked(fmt: Format, blob: &[u8]) -> bool {
-    let mut limits = Limits::default();
-    limits.max_buffer_bytes = 8 * 1024 * 1024;
-    limits.max_extracted_bytes = 16 * 1024 * 1024;
-    let mut budget = Budget::new(limits);
-    match extract_each(fmt, blob, &mut budget, &mut |_: Entry, _: &mut Budget| {
-        None::<()>
-    }) {
-        Err(e) => e.reason.contains("panicked"),
-        Ok(_) => false,
+/// How long a walk of one of these small inputs may take. A real one is
+/// milliseconds; one that wraps a position and loops is not stopped by the
+/// budgets, which count bytes and members, not steps.
+const HANG_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How the walk of `blob` went wrong: a panic inside the decoder, or no end
+/// within [`HANG_AFTER`]. `None` when it ended, however it ended.
+fn broke(fmt: Format, blob: &[u8]) -> Option<&'static str> {
+    let blob = blob.to_vec();
+    bounded(HANG_AFTER, move || {
+        let mut limits = Limits::default();
+        limits.max_buffer_bytes = 8 * 1024 * 1024;
+        limits.max_extracted_bytes = 16 * 1024 * 1024;
+        let mut budget = Budget::new(limits);
+        matches!(
+            extract_each(fmt, &blob, &mut budget, &mut |_: Entry, _: &mut Budget| {
+                None::<()>
+            }),
+            Err(e) if e.reason.contains("panicked")
+        )
+    })
+}
+
+/// Runs `walk`, which says whether the decoder panicked: `Some("panic")` if it
+/// did, `Some("hang")` if it did not end within `limit`, `None` otherwise.
+///
+/// A thread cannot be stopped: a walk that never ends is left running, and the
+/// test reports it. The WebAssembly build has no threads, and can only say
+/// after the fact that a walk took too long.
+fn bounded(
+    limit: std::time::Duration,
+    walk: impl FnOnce() -> bool + Send + 'static,
+) -> Option<&'static str> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(walk());
+        });
+        match rx.recv_timeout(limit) {
+            Ok(true) => Some("panic"),
+            Ok(false) => None,
+            Err(_) => Some("hang"),
+        }
     }
+    #[cfg(target_family = "wasm")]
+    {
+        let start = std::time::Instant::now();
+        if walk() {
+            Some("panic")
+        } else if start.elapsed() > limit {
+            Some("hang")
+        } else {
+            None
+        }
+    }
+}
+
+/// The sweeps are only worth their name if a walk that never ends is seen as
+/// one, and a panic is not taken for it.
+#[test]
+fn a_walk_that_does_not_end_is_a_hang_and_a_panic_is_a_panic() {
+    let short = std::time::Duration::from_millis(100);
+    assert_eq!(bounded(short, || false), None);
+    assert_eq!(bounded(short, || true), Some("panic"));
+    assert_eq!(
+        bounded(short, || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            false
+        }),
+        Some("hang")
+    );
 }
 
 /// Sets every aligned 4- and 8-byte field, and every byte, inside `regions` to
 /// the values above, one at a time, and returns the changes that panicked the
-/// decoder as `"offset width value"`.
+/// decoder or kept it from ending as `"offset width value (how)"`.
 pub fn sweep(fmt: Format, blob: &[u8], regions: &[Range<usize>]) -> Vec<String> {
     sweep_fixing(fmt, blob, regions, None)
 }
@@ -63,7 +124,11 @@ pub fn sweep_fixing(
     regions: &[Range<usize>],
     fix: Option<&Fixup>,
 ) -> Vec<String> {
-    assert!(!panicked(fmt, blob), "the unmodified input already panics");
+    assert_eq!(
+        broke(fmt, blob),
+        None,
+        "the unmodified input already breaks"
+    );
     let mut work = blob.to_vec();
     let mut bad = Vec::new();
     let mut try_set = |work: &mut Vec<u8>, at: usize, bytes: &[u8], what: String| {
@@ -72,15 +137,15 @@ pub fn sweep_fixing(
             let mut trial = work.clone();
             trial[at..at + bytes.len()].copy_from_slice(bytes);
             fix(&mut trial);
-            if panicked(fmt, &trial) {
-                bad.push(what);
+            if let Some(how) = broke(fmt, &trial) {
+                bad.push(format!("{what} ({how})"));
             }
             return;
         }
         let saved = work[at..at + bytes.len()].to_vec();
         work[at..at + bytes.len()].copy_from_slice(bytes);
-        if panicked(fmt, work) {
-            bad.push(what);
+        if let Some(how) = broke(fmt, work) {
+            bad.push(format!("{what} ({how})"));
         }
         work[at..at + bytes.len()].copy_from_slice(&saved);
     };
@@ -127,7 +192,7 @@ pub fn sweep_fixing(
 
 /// The first `len` bytes of up to `cap` evenly spread 512-byte sectors that are
 /// not all zero: where a container keeps its headers and tables.
-fn sectors(blob: &[u8], cap: usize, len: usize) -> Vec<Range<usize>> {
+pub fn sectors(blob: &[u8], cap: usize, len: usize) -> Vec<Range<usize>> {
     let live: Vec<usize> = (0..blob.len() / 512)
         .map(|i| i * 512)
         .filter(|&s| blob[s..s + 512].iter().any(|&b| b != 0))
@@ -246,6 +311,12 @@ fn other_containers_fields_at_their_extremes() {
         (Format::SevenZip, "7z/aes_lzma2.7z"),
         (Format::Zip, "encrypted/zip_aes256_deflate.zip"),
         (Format::Xz, "xz/simple.xz"),
+        (Format::Xz, "xz/multi.xz"),
+        (Format::Lzip, "lzip_simple.lz"),
+        (Format::Zip, "zip/dd_python_stored.zip"),
+        (Format::Zip, "zip/eicar_deflate64.zip"),
+        (Format::SevenZip, "7z/lzma2_solid.7z"),
+        (Format::Binhex, "binhex/eicar.hqx.xor"),
         (Format::Lzw, "lzw/repetitive.b16.Z"),
         (Format::IshieldZ, "ishieldz/demo.z"),
         (Format::Hwp3, "hwp3/tika_testHWP_3.0.hwp"),
@@ -370,7 +441,7 @@ fn lz4_with_a_skippable_frame_fields_at_their_extremes() {
 pub fn none(bad: Vec<String>) {
     assert!(
         bad.is_empty(),
-        "{} field values panic the decoder, first: {:?}",
+        "{} field values panic or hang the decoder, first: {:?}",
         bad.len(),
         &bad[..bad.len().min(12)]
     );

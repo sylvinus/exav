@@ -776,10 +776,11 @@ fn a_clean_reqmod_without_allow_204_gets_its_request_back() {
     assert_eq!(r.code, 200, "{r:?}");
     assert_eq!(r.encapsulated_hdr, REQ_HDR);
     assert_eq!(r.body, payload);
-    assert!(r
-        .header("Encapsulated")
-        .unwrap()
-        .starts_with("req-hdr=0, req-body="));
+    assert!(
+        r.header("Encapsulated")
+            .unwrap()
+            .starts_with("req-hdr=0, req-body=")
+    );
 }
 
 #[test]
@@ -799,10 +800,11 @@ fn eicar_over_reqmod_is_blocked_with_a_response() {
     assert!(r.has_header("X-Infection-Found"));
     // Blocking a REQMOD means handing back an HTTP *response* for the client to
     // serve instead of forwarding the request.
-    assert!(r
-        .header("Encapsulated")
-        .unwrap()
-        .starts_with("res-hdr=0, res-body="));
+    assert!(
+        r.header("Encapsulated")
+            .unwrap()
+            .starts_with("res-hdr=0, res-body=")
+    );
     assert!(String::from_utf8_lossy(&r.encapsulated_hdr).starts_with("HTTP/1.1 403 Forbidden"));
 }
 

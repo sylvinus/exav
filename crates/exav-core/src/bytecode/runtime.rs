@@ -224,11 +224,10 @@ impl BytecodeRuntime {
         let mut out = Vec::new();
         for (idx, bc) in self.programs.iter().enumerate() {
             let o = run_program(bc, &data, pe.as_ref(), pe_missing, Some(&pdf), &[], exec::WriteLimits::NONE);
-            if !o.hit_unsupported {
-                if let Some(d) = o.detection {
+            if !o.hit_unsupported
+                && let Some(d) = o.detection {
                     out.push((d, idx));
                 }
-            }
         }
         out
     }
@@ -257,11 +256,10 @@ fn take_outcome(
     if o.hit_unsupported {
         return;
     }
-    if det.is_none() {
-        if let Some(d) = o.detection {
+    if det.is_none()
+        && let Some(d) = o.detection {
             *det = Some((d, idx));
         }
-    }
 }
 
 /// Run one program's entry function (0) under a bounded, panic-isolated VM.

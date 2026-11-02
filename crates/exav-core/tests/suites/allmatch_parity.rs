@@ -15,7 +15,7 @@
 //!
 //! This test pins the invariant rather than the one bug.
 
-use exav_core::{analyze, analyze_all, loader, ScanOptions, Scanner};
+use exav_core::{ScanOptions, Scanner, analyze, analyze_all, loader};
 use std::io::Write;
 
 /// A macro-stream signature: `Target:2` (OLE2) with a literal body, the exact

@@ -8,26 +8,20 @@ the exav binaries link are in the NOTICE file at the root of the exav
 repository: https://github.com/sylvinus/exav/blob/main/NOTICE
 
 
-image, MIT OR Apache-2.0 (source derivative)
---------------------------------------------
-
-src/image_codecs/jpeg.rs and src/image_codecs/tiff_image.rs are adapted from
-image 0.25.9's JPEG and TIFF decoders. Used under the MIT License, whose text
-is in src/image_codecs/LICENSE-image.
-
-Upstream: https://github.com/image-rs/image
-The image-rs Developers.
+The JPEG and TIFF decoders this crate hashes through (adapted from image
+0.25.9 and tiff 0.10.3) are in exav-render's `src/image_codecs/`, with their
+licenses and notices.
 
 
-tiff, MIT (source derivative)
------------------------------
+rustdct, MIT OR Apache-2.0 (source derivative)
+----------------------------------------------
 
-src/image_codecs/tiff/ is vendored from the decoder of tiff 0.10.3, with its
-byte casts done through bytemuck. The license is in
-src/image_codecs/tiff/LICENSE.
+src/dct.rs holds rustdct 0.7.1's DCT-II for power-of-two lengths, with bounds
+checks where upstream skips them with `unsafe`. Used under the MIT License,
+whose text is in src/LICENSE-rustdct.
 
-Upstream: https://github.com/image-rs/image-tiff
-Copyright (c) 2018 PistonDevelopers
+Upstream: https://github.com/ejmahler/rust_dct
+Copyright (c) 2015 The RustFFT Developers
 
 
 Pillow, MIT-CMU (source derivative)

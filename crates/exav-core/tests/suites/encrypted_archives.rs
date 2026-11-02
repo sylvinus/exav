@@ -11,7 +11,7 @@
 //! With the password the inner EICAR is FOUND (`Infected`); without it the scan
 //! is `PasswordProtected` — never `Clean`, never `Infected`.
 
-use exav_core::{analyze, loader, ScanOptions, Verdict};
+use exav_core::{ScanOptions, Verdict, analyze, loader};
 
 fn builtin_db() -> exav_core::Scanner {
     // The built-in DB carries the EICAR signature, which is all we need.

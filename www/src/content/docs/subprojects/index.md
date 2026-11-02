@@ -12,7 +12,7 @@ are useful without ever running a virus scan.
 
 | Crate | What it is |
 |---|---|
-| [exav-grep](/subprojects/exav-grep/) | grep for the inside of archives: search recursively through zip/rar/7z/tar/iso/OLE/PDF/email members |
+| [exav-grep](/subprojects/exav-grep/) | grep for the inside of archives: search recursively through zip/rar/7z/tar/iso/OLE/PDF/email members, and with `--text` through the words of documents |
 | [exav-imagehash](/subprojects/exav-imagehash/) | Perceptual image hashes with every step a parameter, reproducing ClamAV's `fuzzy_img` hash and Python imagehash's `phash` bit for bit, as a library and a CLI |
 | [exav-pe-emu](/subprojects/exav-pe-emu/) | A sandboxed x86-32 emulator that unpacks packed Windows executables by running their stub, as a library and a CLI |
 
@@ -21,7 +21,7 @@ are useful without ever running a virus scan.
 | Crate | What it is |
 |---|---|
 | [exav-core](/subprojects/exav-core/) | The scanning engine: database parsing, pattern and hash matching, file typing, and the verdict model, to embed in a program |
-| [exav-render](/subprojects/exav-render/) | Memory-safe decoders that turn raster images, DWG and DXF drawings and IFC and STL models into something to draw, behind `@exav/viewer` and exav-imagehash |
+| [exav-render](/subprojects/exav-render/) | Memory-safe decoders that turn raster images (camera RAW previews included), DWG and DXF drawings, 3D models, and spreadsheets, presentations and text documents (to XLSX, PPTX and DOCX) into something to draw, behind `@exav/viewer` and exav-imagehash; and the text a reader sees in a document, for a scanner or a search |
 | [exav-x86](/subprojects/exav-x86/) | A decode-only x86-32 instruction decoder with no dependencies, checked against an independent decoder over real samples |
 | [exav-update](/subprojects/exav-update/) | The signature-fetching library behind `--auto-update` |
 

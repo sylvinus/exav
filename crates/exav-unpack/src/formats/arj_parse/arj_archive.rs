@@ -198,12 +198,10 @@ impl ArjArchive {
                     &buf,
                     header.original_size as usize,
                     &header.compression_method,
-                ) {
-                    if out.len() == header.original_size as usize
-                        && crc32fast::hash(&out) == header.original_crc32
-                    {
-                        return Some(out);
-                    }
+                ) && out.len() == header.original_size as usize
+                    && crc32fast::hash(&out) == header.original_crc32
+                {
+                    return Some(out);
                 }
             }
             return None;

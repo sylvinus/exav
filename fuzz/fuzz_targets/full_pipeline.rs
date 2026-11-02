@@ -27,8 +27,8 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use exav_core::{
-    analyze, analyze_all_with_outcome, database, loader, scan_seekable, AllMatchOutcome, ScanReport,
-    Scanner, Verdict, VerdictCategory,
+    AllMatchOutcome, ScanReport, Scanner, Verdict, VerdictCategory, analyze,
+    analyze_all_with_outcome, database, loader, scan_seekable,
 };
 use exav_fuzz_support::{extreme, frame};
 use libfuzzer_sys::fuzz_target;
@@ -86,6 +86,7 @@ fn roundtrip(db: &Scanner) -> Option<Scanner> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    exav_fuzz_support::panics::contained_panics();
     let Some(f) = frame::parse(data) else {
         return;
     };
@@ -127,8 +128,15 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         VerdictCategory::Clean => {
-            assert!(names.is_empty(), "analyze says clean, analyze_all lists {names:?}");
-            assert_eq!(outcome, AllMatchOutcome::Complete, "analyze says clean, analyze_all did not finish");
+            assert!(
+                names.is_empty(),
+                "analyze says clean, analyze_all lists {names:?}"
+            );
+            assert_eq!(
+                outcome,
+                AllMatchOutcome::Complete,
+                "analyze says clean, analyze_all did not finish"
+            );
         }
         VerdictCategory::Partial => {
             assert!(
@@ -141,9 +149,10 @@ fuzz_target!(|data: &[u8]| {
 
     // One scan from any source, within the limit that decides how it is read.
     let len = scan.len() as u64;
-    if len <= opts.deep_analysis_max && opts.max_scan_size.map_or(true, |m| len <= m) {
+    if len <= opts.deep_analysis_max && opts.max_scan_size.is_none_or(|m| len <= m) {
         let reader = Pieces(Cursor::new(scan), 1 + scan.len() % 7);
-        let streamed = scan_seekable(db, reader, len, &opts).expect("a memory reader does not fail");
+        let streamed =
+            scan_seekable(db, reader, len, &opts).expect("a memory reader does not fail");
         same("a stream and a buffer", &first, &streamed);
     }
 

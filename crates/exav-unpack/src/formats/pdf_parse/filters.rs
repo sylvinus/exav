@@ -248,12 +248,13 @@ pub(crate) fn lzw_decode(data: &[u8], early_change: bool, cap: u64) -> (Vec<u8>,
         }
 
         // Add prev + first-byte-of-entry as the next dictionary entry.
-        if let Some(p) = prev {
-            if (p as usize) < dict.len() && dict.len() < MAX_ENTRIES {
-                let mut new_entry = dict[p as usize].clone();
-                new_entry.push(entry[0]);
-                dict.push(new_entry);
-            }
+        if let Some(p) = prev
+            && (p as usize) < dict.len()
+            && dict.len() < MAX_ENTRIES
+        {
+            let mut new_entry = dict[p as usize].clone();
+            new_entry.push(entry[0]);
+            dict.push(new_entry);
         }
         prev = Some(code);
 

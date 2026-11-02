@@ -1,7 +1,7 @@
 //! A ZIP whose offsets count from the archive's own start while bytes precede
 //! it: a self-extractor's payload, or an archive appended to another file.
 
-use exav_unpack::{walk, Budget, Format, Limits, Member, MemberMeta};
+use exav_unpack::{Budget, Format, Limits, Member, MemberMeta, walk};
 use std::io::Write;
 
 fn zip_of(name: &str, contents: &[u8]) -> Vec<u8> {

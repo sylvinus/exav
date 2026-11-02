@@ -1,0 +1,110 @@
+/* The page's own look: the frame is given these values (`theme: "inherit"`). */
+:root {
+  color-scheme: light;
+  --page-bg: #fbfaf7;
+  --page-text: #2b2a27;
+  --exav-viewer-surface: #ece8df;
+  --exav-viewer-panel: #fffdf8;
+  --exav-viewer-text: #3d3a33;
+  --exav-viewer-text-strong: #1d1b17;
+  --exav-viewer-border: #d9d2c3;
+  --exav-viewer-accent: #9a3412;
+  --exav-viewer-pager-room: 1rem;
+  --exav-viewer-font: Georgia, serif;
+}
+:root.dark {
+  color-scheme: dark;
+  --page-bg: #17161a;
+  --page-text: #e8e6ef;
+  --exav-viewer-surface: #212026;
+  --exav-viewer-panel: #2a2930;
+  --exav-viewer-text: #d6d3df;
+  --exav-viewer-text-strong: #f4f2fa;
+  --exav-viewer-border: #3b3944;
+  --exav-viewer-accent: #f59e0b;
+}
+body {
+  margin: 0;
+  padding: 1rem;
+  background: var(--page-bg);
+  color: var(--page-text);
+  font: 0.9375rem/1.5 system-ui, sans-serif;
+}
+h1 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+main {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+#thumbs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 75vh;
+  overflow-y: auto;
+}
+#thumbs:empty {
+  display: none;
+}
+#thumbs button {
+  padding: 0;
+  border: 1px solid var(--exav-viewer-border);
+  background: white;
+  cursor: pointer;
+}
+#thumbs canvas {
+  display: block;
+  max-width: 80px;
+  height: auto;
+}
+#viewer {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--exav-viewer-surface);
+}
+#stage {
+  position: relative;
+  height: 65vh;
+}
+#viewer:fullscreen #stage {
+  height: auto;
+  flex: 1;
+}
+#sheets {
+  display: flex;
+  gap: 0.25rem;
+  overflow-x: auto;
+}
+#sheets button[aria-selected="true"] {
+  border-bottom: 2px solid var(--exav-viewer-accent);
+  font-weight: 600;
+}
+#controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.5rem;
+  background: var(--exav-viewer-panel);
+}
+#controls .group {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+#controls input[type="number"] {
+  width: 4rem;
+}
+.members {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+#keys {
+  font-size: 0.8125rem;
+  opacity: 0.7;
+}

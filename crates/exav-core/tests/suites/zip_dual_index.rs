@@ -11,7 +11,7 @@
 //! a member exav could not read is content it did not examine, and reporting the
 //! containing file clean on that basis is exactly the silent-clean bug.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()
@@ -309,7 +309,7 @@ fn streamed_orphan_members_carrying_eicar_are_found() {
         env!("CARGO_MANIFEST_DIR"),
         "/../exav-unpack/tests/fixtures/zip/eicar_lzma.zip"
     );
-    let zip = std::fs::read(path).unwrap();
+    let zip = exav_core::unpack::read_fixture(path).unwrap();
     let field = |o: usize| u32::from_le_bytes(zip[o..o + 4].try_into().unwrap()) as usize;
     let start = 30 + usize::from(u16::from_le_bytes([zip[26], zip[27]]));
     assert_eq!((&zip[..4], zip[8], zip[28]), (&b"PK\x03\x04"[..], 14, 0));

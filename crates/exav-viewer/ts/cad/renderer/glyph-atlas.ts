@@ -19,7 +19,8 @@
  * could not honour.
  */
 
-import { CAP_RATIO, cssFont, decodeFace, type Face } from './fonts.js'
+import { CAP_RATIO, DESCENT, cssFont, decodeFace, type Face } from './fonts.js'
+import { convertCells } from './sdf.js'
 
 /**
  * Smallest and largest em to rasterise at.
@@ -42,6 +43,8 @@ const MAX_ATLAS_WIDTH = 4096
 const DEFAULT_MAX_SIZE = 4096
 /** Space between cells, so linear filtering cannot bleed one into the next. */
 const PAD = 3
+/** Longest the distance fields are made without giving the thread back, in ms (`buildAsync`). */
+const FIELD_SLICE_MS = 8
 
 /**
  * Bring an em into the range the atlas will rasterise at.
@@ -127,6 +130,14 @@ export class GlyphAtlas {
     overflowed: boolean,
     contexts: Map<number, CanvasRenderingContext2D>,
     private emPx: number,
+    private fields = false,
+    private fieldWork: {
+      ctx: CanvasRenderingContext2D
+      cells: Cell[]
+      spread: number
+      width: number
+      height: number
+    } | null = null,
   ) {
     this.canvas = canvas
     this.glyphs = glyphs
@@ -148,6 +159,11 @@ export class GlyphAtlas {
    */
   capRatio(faceByte: number): number {
     return CAP_RATIO[decodeFace(faceByte).family]
+  }
+
+  /** How far the face's descenders reach below the baseline, in cap heights. */
+  descent(faceByte: number): number {
+    return DESCENT[decodeFace(faceByte).family]
   }
 
   /**
@@ -200,16 +216,46 @@ export class GlyphAtlas {
     requests: Iterable<GlyphRequest>,
     maxSize = DEFAULT_MAX_SIZE,
     targetEm = 256,
+    sdf = false,
   ): GlyphAtlas {
+    const atlas = GlyphAtlas.fit(requests, maxSize, targetEm, sdf)
+    for (const _ of atlas.convertFields(Infinity)) void _
+    return atlas
+  }
+
+  /**
+   * `build`, giving the thread back through `pause` while the distance fields
+   * are made, which takes longer than a frame: for an atlas built while the
+   * page is in use.
+   */
+  static async buildAsync(
+    requests: Iterable<GlyphRequest>,
+    maxSize: number,
+    targetEm: number,
+    sdf: boolean,
+    pause: () => Promise<void>,
+  ): Promise<GlyphAtlas> {
+    const atlas = GlyphAtlas.fit(requests, maxSize, targetEm, sdf)
+    for (const _ of atlas.convertFields(FIELD_SLICE_MS)) await pause()
+    return atlas
+  }
+
+  /** The page, before its distance fields. */
+  private static fit(requests: Iterable<GlyphRequest>, maxSize: number, targetEm: number, sdf: boolean): GlyphAtlas {
     const unique = [...requests]
     const width = Math.min(maxSize, MAX_ATLAS_WIDTH)
     let em = clampEm(targetEm)
-    let atlas = GlyphAtlas.pack(unique, em, width, maxSize)
+    let atlas = GlyphAtlas.pack(unique, em, width, maxSize, sdf)
     while (atlas.overflowed && em > MIN_EM) {
       em = Math.max(MIN_EM, Math.floor(em / 2))
-      atlas = GlyphAtlas.pack(unique, em, width, maxSize)
+      atlas = GlyphAtlas.pack(unique, em, width, maxSize, sdf)
     }
     return atlas
+  }
+
+  /** The cells hold distance fields (`sdf.ts`) rather than coverage. */
+  get sdf(): boolean {
+    return this.fields
   }
 
   /** Em size this page was rasterised at. */
@@ -222,7 +268,10 @@ export class GlyphAtlas {
     emPx: number,
     atlasWidth: number,
     maxHeight: number,
+    sdf: boolean,
   ): GlyphAtlas {
+    // A field needs room around the ink for the distances it stores.
+    const margin = sdf ? Math.max(2, Math.ceil(emPx / 8)) : INK_MARGIN
     // Deduplicate and order, so an atlas is the same whatever order the runs
     // arrived in.
     const wanted = new Map<string, GlyphRequest>()
@@ -270,8 +319,8 @@ export class GlyphAtlas {
       const inkDescent = m.actualBoundingBoxDescent ?? 0
       const inkW = Math.ceil(inkLeft + inkRight)
       const inkH = Math.ceil(inkAscent + inkDescent)
-      const w = inkW + INK_MARGIN * 2
-      const h = inkH + INK_MARGIN * 2
+      const w = inkW + margin * 2
+      const h = inkH + margin * 2
 
       // Whitespace is judged on the ink, not the padded box, which is never
       // empty.
@@ -325,7 +374,7 @@ export class GlyphAtlas {
     const canvas = document.createElement('canvas')
     canvas.width = atlasWidth
     canvas.height = height
-    const ctx = canvas.getContext('2d')!
+    const ctx = canvas.getContext('2d', { willReadFrequently: sdf })!
     // Opaque black ground: coverage then lands in the red channel.
     ctx.fillStyle = '#000'
     ctx.fillRect(0, 0, atlasWidth, height)
@@ -342,7 +391,7 @@ export class GlyphAtlas {
         currentFace = c.faceByte
       }
       // Inset by the margin, so the ink has blank rows on every side of it.
-      ctx.fillText(c.ch, c.x + INK_MARGIN + c.inkLeft, c.y + INK_MARGIN + c.inkAscent)
+      ctx.fillText(c.ch, c.x + margin + c.inkLeft, c.y + margin + c.inkAscent)
       // The quad covers the whole cell, margin included, so the glyph keeps its
       // place. All four scale about the pen on the baseline, so correcting the
       // rasteriser's size does not move the glyph off it. The advance is not
@@ -353,14 +402,31 @@ export class GlyphAtlas {
         v0: c.y / height,
         u1: (c.x + c.w) / atlasWidth,
         v1: (c.y + c.h) / height,
-        left: (-(c.inkLeft + INK_MARGIN) / emPx) * s,
-        bottom: (-(c.inkDescent + INK_MARGIN) / emPx) * s,
+        left: (-(c.inkLeft + margin) / emPx) * s,
+        bottom: (-(c.inkDescent + margin) / emPx) * s,
         width: (c.w / emPx) * s,
         height: (c.h / emPx) * s,
         advance: c.advance / emPx,
       })
     }
 
-    return new GlyphAtlas(canvas, glyphs, overflowed, contexts, emPx)
+    // Each cell's coverage, in the red channel, becomes its field: `convertFields`.
+    const fields = sdf && cells.length > 0 ? { ctx, cells, spread: margin / 2, width: atlasWidth, height } : null
+    return new GlyphAtlas(canvas, glyphs, overflowed, contexts, emPx, sdf, fields)
+  }
+
+  /**
+   * Turns the page's coverage into distance fields, if it is to hold them. The
+   * page is not to be used before the generator is done. It yields about every
+   * `sliceMs`, for a caller that lets the page run between slices.
+   */
+  *convertFields(sliceMs: number): Generator<void> {
+    const work = this.fieldWork
+    this.fieldWork = null
+    if (!work) return
+    const image = work.ctx.getImageData(0, 0, work.width, work.height)
+    yield
+    yield* convertCells(image.data, work.width, work.cells, work.spread, sliceMs)
+    work.ctx.putImageData(image, 0, 0)
   }
 }

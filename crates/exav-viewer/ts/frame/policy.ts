@@ -116,10 +116,8 @@ export function policyMismatch(policy: FramePolicy | null, origins: FrameOrigins
   return `the frame's policy does not match this viewer's origins (media: ${media.join(" ") || "none"}; connect: ${connect.join(" ") || "none"}): ${problems.join("; ")}`;
 }
 
-/** Every powerful feature, refused. */
-export const FRAME_PERMISSIONS = [
+const REFUSED = [
   "accelerometer",
-  "autoplay",
   "camera",
   "clipboard-read",
   "clipboard-write",
@@ -147,9 +145,13 @@ export const FRAME_PERMISSIONS = [
   "usb",
   "window-management",
   "xr-spatial-tracking",
-]
-  .map((f) => `${f}=()`)
-  .join(", ");
+];
+
+/**
+ * Every powerful feature refused, but autoplay: the host's own player
+ * controls start the player in the frame (the `<iframe>` allows it).
+ */
+export const FRAME_PERMISSIONS = ["autoplay=*", ...REFUSED.map((f) => `${f}=()`)].join(", ");
 
 /**
  * The headers for every file under the frame's directory. `frameAncestors`:

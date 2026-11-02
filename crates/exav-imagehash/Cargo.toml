@@ -29,7 +29,7 @@ required-features = ["cli"]
 # The decoders, at the versions libclamav 1.5.4 links, so that ClamAV's hash is
 # reproduced bit for bit: the hash is the signature. This crate only hashes the
 # pixels they give.
-exav-render = { path = "../exav-render", version = "0.0.2", default-features = false, features = ["image"] }
+exav-render = { path = "../exav-render", version = "0.0.3", default-features = false, features = ["image"] }
 # The resize and the conversions to RGB, as ClamAV runs them; the same `=` pin
 # as exav-render's, since its pixels arrive in this crate's buffers.
 image = { version = "=0.25.9", default-features = false }

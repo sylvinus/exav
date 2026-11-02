@@ -97,10 +97,10 @@ fn main() {
             // A real rule rejection.
             rule_rejects += 1;
             let bucket = normalize(err.message());
-            if bucket == "external variable / unknown identifier" {
-                if let Some(id) = extract_ident(err.message()) {
-                    *ext_idents.entry(id).or_default() += 1;
-                }
+            if bucket == "external variable / unknown identifier"
+                && let Some(id) = extract_ident(err.message())
+            {
+                *ext_idents.entry(id).or_default() += 1;
             }
             *buckets.entry(bucket).or_default() += 1;
         }
@@ -183,10 +183,10 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect(&path, out);
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if ext == "yar" || ext == "yara" {
-                out.push(path);
-            }
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && (ext == "yar" || ext == "yara")
+        {
+            out.push(path);
         }
     }
 }

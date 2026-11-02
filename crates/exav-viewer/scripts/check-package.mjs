@@ -63,8 +63,19 @@ for (const file of files) {
 }
 
 // The frame app: its page, its policy, its code, its workers and its licences.
-for (const file of ["index.html", "app.js", "styles.css", "frame.css", "cad.worker.js", "decode.worker.js", "model.worker.js", "pdfjs.worker.js", "worker.js", "exav-viewer/manifest.json", "licenses/README.txt"]) {
+for (const file of ["index.html", "app.js", "styles.css", "frame.css", "cad.worker.js", "decode.worker.js", "markdown.worker.js", "model.worker.js", "pdfjs.worker.js", "sheets.worker.js", "slides.worker.js", "docs.worker.js", "worker.js", "exav-viewer/manifest.json", "licenses/README.txt"]) {
   need(`dist/frame/app/${file}`, "the frame app");
+}
+// Whose each of those files is, for a frame published for some formats only.
+need("dist/frame/files.json", "the frame app's files by engine");
+{
+  const listed = JSON.parse(fs.readFileSync(path.join(root, "dist", "frame", "files.json"), "utf8"));
+  const names = new Set([...listed.core, ...Object.values(listed.engines).flat()]);
+  for (const file of files) {
+    if (!file.startsWith("dist/frame/app/")) continue;
+    if (!names.has(file.slice("dist/frame/app/".length))) problems.push(`${file} is in no engine's list or the core's (dist/frame/files.json)`);
+  }
+  for (const name of names) need(`dist/frame/app/${name}`, "dist/frame/files.json");
 }
 for (const file of files) {
   if (/\.test\.|(^|\/)(e2e|demo|src|ts|target)\//.test(file) || file.endsWith(".rs")) problems.push(`${file} should not be packed`);

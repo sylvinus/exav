@@ -15,8 +15,8 @@
 //! checked against what the file holds, or, for decompressed data, against
 //! the byte budget the caller gives.
 
-use super::r2004::Inflate;
 use super::Error;
+use super::r2004::Inflate;
 
 /// Spec 5.13: a codeword of 255 bytes, 239 of them data in system pages,
 /// 251 in data pages.

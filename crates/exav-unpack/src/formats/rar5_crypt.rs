@@ -6,6 +6,8 @@
 //! key that tweaks the member's checksum, and the password check, the last
 //! folded to 8 bytes by XOR.
 
+use std::sync::atomic::AtomicU64;
+
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -134,19 +136,28 @@ pub(crate) fn find_keys(
     record: &CryptRecord,
     passwords: &[String],
     cache: &mut Vec<([u8; 16], u8, Vec<u8>, Keys)>,
+    spent: &AtomicU64,
 ) -> Option<Keys> {
-    find_keys_within(record, passwords, cache, MAX_KDF_ROUNDS)
+    find_keys_within(record, passwords, cache, spent, MAX_KDF_ROUNDS)
 }
 
-/// The PBKDF2 iterations all the derivations of one archive may add up to:
-/// every member may carry a salt of its own, and every password is tried over
-/// each. About half a minute of HMACs.
-const MAX_KDF_ROUNDS: u64 = 1 << 25;
+/// The PBKDF2 iterations all the derivations of one scan may add up to, however
+/// many archives it opens: every member may carry a salt of its own, every
+/// password is tried over each, and an archive may hold another. About 0.7 s of
+/// HMACs: 128 derivations at the count RAR writes (15), or one at 22. A
+/// header asking for 2^24 took 2.6 s a scan, and a member with a larger count
+/// than this is reported as encrypted, like one no password opens.
+const MAX_KDF_ROUNDS: u64 = crate::kdf::PBKDF2_MAX_ROUNDS;
 
+use crate::kdf::charge;
+
+/// `spent` counts the iterations derived so far in the scan, `cache` only the
+/// ones of this archive.
 fn find_keys_within(
     record: &CryptRecord,
     passwords: &[String],
     cache: &mut Vec<([u8; 16], u8, Vec<u8>, Keys)>,
+    spent: &AtomicU64,
     max_rounds: u64,
 ) -> Option<Keys> {
     let candidates = passwords
@@ -154,7 +165,6 @@ fn find_keys_within(
         .map(String::as_str)
         .chain(super::DEFAULT_ARCHIVE_PASSWORDS.iter().copied());
     let rounds_of = |count: u8| 1u64 << count.min(MAX_KDF_COUNT);
-    let mut spent: u64 = cache.iter().map(|(_, c, ..)| rounds_of(*c)).sum();
     for pw in candidates {
         let pw = pw.as_bytes();
         let cached = cache
@@ -164,8 +174,8 @@ fn find_keys_within(
         let keys = match cached {
             Some(k) => k,
             None => {
-                spent = spent.saturating_add(rounds_of(record.kdf_count));
-                if spent > max_rounds {
+                let rounds = rounds_of(record.kdf_count);
+                if !charge(spent, rounds, max_rounds) {
                     return None;
                 }
                 let k = derive(pw, &record.salt, record.kdf_count)?;
@@ -228,15 +238,60 @@ mod tests {
         }
     }
 
+    /// Archives inside archives each start a cache of their own, so a bound
+    /// kept in the cache is a bound per archive: a chain of them paid it each
+    /// time (21 s under a sanitizer for one 25 KB file). The bound is the
+    /// scan's.
+    #[test]
+    fn archives_of_one_scan_share_the_derivation_bound() {
+        let passwords: Vec<String> = (0..50).map(|i| format!("password {i}")).collect();
+        let spent = AtomicU64::new(0);
+        // 2^10 iterations a derivation, 2^13 allowed in all: eight of them,
+        // however many archives they are spread over.
+        let mut derived = 0;
+        for archive in 0..10 {
+            let mut cache = Vec::new();
+            let _ = find_keys_within(
+                &record(archive, 10),
+                &passwords,
+                &mut cache,
+                &spent,
+                1 << 13,
+            );
+            derived += cache.len();
+        }
+        assert_eq!(derived, 8);
+    }
+
+    /// A header asking for 2^24 iterations (the largest count RAR writes) cost
+    /// 2.6 s to refuse every password, 20 s under a sanitizer; it is not derived.
+    #[test]
+    fn a_count_whose_derivation_exceeds_the_scan_bound_is_not_derived() {
+        let passwords = vec!["secret".to_string()];
+        let mut cache = Vec::new();
+        let spent = AtomicU64::new(0);
+        let start = std::time::Instant::now();
+        assert!(find_keys(&record(1, 24), &passwords, &mut cache, &spent).is_none());
+        assert!(cache.is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        // Counts RAR writes by default are still derived.
+        let _ = find_keys(&record(1, 15), &passwords, &mut cache, &spent);
+        assert!(!cache.is_empty());
+    }
+
     /// Salts of a member each, and a password list: the derivations stop at
     /// the archive's total, not at the end of the members.
     #[test]
     fn key_derivations_over_many_salts_stop_at_the_total() {
         let passwords: Vec<String> = (0..50).map(|i| format!("password {i}")).collect();
         let mut cache = Vec::new();
+        let spent = AtomicU64::new(0);
         // 2^10 iterations a derivation, 2^13 allowed in all: eight of them.
         for salt in 0..40 {
-            assert!(find_keys_within(&record(salt, 10), &passwords, &mut cache, 1 << 13).is_none());
+            assert!(
+                find_keys_within(&record(salt, 10), &passwords, &mut cache, &spent, 1 << 13)
+                    .is_none()
+            );
         }
         assert_eq!(cache.len(), 8);
     }

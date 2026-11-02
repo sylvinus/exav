@@ -768,14 +768,14 @@ impl Cpu {
         // clearing every slot each time costs more than the decoding it was
         // meant to save. A self-modifying stub turns the cache into pure
         // overhead, by orders of magnitude, unless invalidation is this cheap.
-        let gen = mem.code_generation();
+        let r#gen = mem.code_generation();
         // Indexed by the full address, not `eip >> 1`: consecutive
         // instructions often differ by one byte (`inc ecx; dec ecx`), and
         // folding that bit away maps neighbours onto the same slot, so
         // straight-line code evicts itself every step and never hits.
         let slot = self.eip as usize & (CACHE_SLOTS - 1);
         let insn = match &self.cache[slot] {
-            Some((g, ip, insn)) if *g == gen && *ip == self.eip => insn.clone(),
+            Some((g, ip, insn)) if *g == r#gen && *ip == self.eip => insn.clone(),
             _ => {
                 let mut buf = [0u8; MAX_INSN];
                 let n = mem.read_code(self.eip, &mut buf);
@@ -795,7 +795,7 @@ impl Cpu {
                 // to either one invalidates the cached decode.
                 mem.mark_executed(self.eip);
                 mem.mark_executed(self.eip.wrapping_add(insn.len as u32 - 1));
-                self.cache[slot] = Some((gen, self.eip, insn.clone()));
+                self.cache[slot] = Some((r#gen, self.eip, insn.clone()));
                 insn
             }
         };
@@ -1359,7 +1359,7 @@ impl Cpu {
 
             // Port I/O from ring 3: a fault the program is expected to catch.
             In | Out | Insb | Insw | Insd | Outsb | Outsw | Outsd => {
-                return Err(Stop::Privileged(ip))
+                return Err(Stop::Privileged(ip));
             }
 
             // Packed BCD. No compiler emits these; obfuscators do, precisely
@@ -1559,7 +1559,8 @@ impl Cpu {
                 };
                 self.cf = r & 1 != 0;
                 if count == 1 {
-                    self.of = ((r ^ (r << 1)) & sign_bit(size)) != 0;
+                    // MSB of the result xor the bit rotated into CF.
+                    self.of = (r & sign_bit(size) != 0) != self.cf;
                 }
                 r
             }
@@ -1592,7 +1593,16 @@ impl Cpu {
                     }
                 }
                 self.cf = (acc >> bits) & 1 != 0;
-                (acc as u32) & mask(size)
+                let r = (acc as u32) & mask(size);
+                if count == 1 {
+                    let msb = r & sign_bit(size) != 0;
+                    self.of = if m == Rcl {
+                        msb != self.cf
+                    } else {
+                        msb != (r & (sign_bit(size) >> 1) != 0)
+                    };
+                }
+                r
             }
             _ => unreachable!("shift dispatch"),
         };
@@ -1759,11 +1769,9 @@ impl Cpu {
                 let merges = matches!(m, Movss | Movsd)
                     && matches!(insn.ops[0], Op::Xmm(_))
                     && matches!(insn.ops[1], Op::Xmm(_));
-                if merges {
-                    if let Op::Xmm(r) = insn.ops[0] {
-                        self.xmm[r as usize & 7][..n].copy_from_slice(&v[..n]);
-                        return Ok(true);
-                    }
+                if merges && let Op::Xmm(r) = insn.ops[0] {
+                    self.xmm[r as usize & 7][..n].copy_from_slice(&v[..n]);
+                    return Ok(true);
                 }
                 self.write_simd(mem, insn, 0, &v)?;
                 Ok(true)
@@ -2440,6 +2448,30 @@ mod tests {
         let (cpu, _) = run(&[0xb8, 0x01, 0x00, 0x00, 0x80, 0xd1, 0xc0], |_| {});
         assert_eq!(cpu.regs[EAX], 3);
         assert!(cpu.cf);
+    }
+
+    #[test]
+    fn rotate_by_one_sets_overflow_from_the_result() {
+        // OF after a 1-bit rotate is MSB(result) xor CF-bit-rotated. A tElock
+        // decryptor branches on it; getting it wrong sent the stub into an
+        // `EB FE` self-loop. Values checked against a reference x86.
+        //   rol: 0x80000000 rol 1 -> CF=1, result MSB=0, so OF = 1 ^ 0 = 1.
+        let (cpu, _) = run(&[0xb8, 0, 0, 0, 0x80, 0xd1, 0xc0], |_| {});
+        assert_eq!(cpu.regs[EAX], 1);
+        assert!(cpu.cf && cpu.of, "rol: CF=1, OF=1");
+        //   rol 0x40000000 by 1 -> 0x80000000, CF=0, MSB=1, OF = 1 ^ 0 = 1.
+        let (cpu, _) = run(&[0xb8, 0, 0, 0, 0x40, 0xd1, 0xc0], |_| {});
+        assert_eq!(cpu.regs[EAX], 0x8000_0000);
+        assert!(!cpu.cf && cpu.of, "rol: CF=0, OF=1");
+        //   ror 1 of odd value: 0x00000001 -> 0x80000000, CF=1, top two bits
+        //   10, so OF = MSB xor next-bit = 1 ^ 0 = 1.
+        let (cpu, _) = run(&[0xb8, 1, 0, 0, 0, 0xd1, 0xc8], |_| {});
+        assert_eq!(cpu.regs[EAX], 0x8000_0000);
+        assert!(cpu.cf && cpu.of, "ror: CF=1, OF=1");
+        //   rcr 1 with CF=0 of 1 -> 0, CF out = 1, both top bits 0, OF = 0.
+        let (cpu, _) = run(&[0xb8, 1, 0, 0, 0, 0xd1, 0xd8], |c| c.cf = false);
+        assert_eq!(cpu.regs[EAX], 0);
+        assert!(cpu.cf && !cpu.of, "rcr: CF=1, OF=0");
     }
 
     #[test]

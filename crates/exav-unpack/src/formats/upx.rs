@@ -905,7 +905,7 @@ mod tests {
     fn deflate_block_roundtrips() {
         // UPX method 15 is a raw DEFLATE stream; verify the decoder recovers the
         // original size-bounded payload.
-        use flate2::{write::DeflateEncoder, Compression};
+        use flate2::{Compression, write::DeflateEncoder};
         use std::io::Write as _;
         let orig: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());

@@ -244,6 +244,8 @@ pub struct Header {
     pub lwdisplay: bool,
     pub fillmode: bool,
     pub mirrtext: bool,
+    /// `$XCLIPFRAME`: 0 hidden, 1 shown and plotted, 2 shown only.
+    pub xclipframe: i16,
 }
 
 impl Default for Header {
@@ -286,6 +288,7 @@ impl Default for Header {
             lwdisplay: false,
             fillmode: true,
             mirrtext: false,
+            xclipframe: 2,
         }
     }
 }

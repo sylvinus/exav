@@ -211,6 +211,17 @@ impl<'a> StepFile<'a> {
                     s.skip_space();
                     let start = s.pos;
                     if s.peek() != Some(b'(') || s.skip_balanced().is_none() {
+                        // A header that is not well formed (a stray `;`
+                        // in it, say) says nothing of the instances: the
+                        // schema is what it names before the `;`, and the
+                        // statement ends there.
+                        s.pos = start;
+                        let end = s.rest().iter().position(|&c| c == b';');
+                        if let Some(end) = end {
+                            file.schema = schema_of(&data[start..start + end]);
+                            s.pos = start + end + 1;
+                            continue;
+                        }
                         file.damaged = true;
                         break;
                     }
@@ -260,7 +271,7 @@ impl<'a> StepFile<'a> {
         if file.entries.is_empty() {
             return Err(Error::NoData);
         }
-        if file.entries.windows(2).any(|w| w[0].id >= w[1].id) {
+        if file.entries.array_windows().any(|[a, b]| a.id >= b.id) {
             let mut sorted: Vec<(u32, u32)> = file
                 .entries
                 .iter()
@@ -430,16 +441,25 @@ impl<'a> Scanner<'a> {
         None
     }
 
-    /// From `'` to after the closing one (`''` is a quote inside).
+    /// From `'` to after the closing one (`''` is a quote inside, and so is
+    /// the character `\S\` shifts, a quote too).
     fn skip_string(&mut self) -> Option<()> {
         self.pos += 1;
         loop {
-            let i = self.rest().iter().position(|&c| c == b'\'')?;
-            self.pos += i + 1;
-            if self.peek() == Some(b'\'') {
-                self.pos += 1;
-            } else {
-                return Some(());
+            match self.peek()? {
+                b'\'' => {
+                    self.pos += 1;
+                    if self.peek() == Some(b'\'') {
+                        self.pos += 1;
+                    } else {
+                        return Some(());
+                    }
+                }
+                b'\\' if self.rest().starts_with(b"\\\\") => self.pos += 2,
+                b'\\' if self.rest().starts_with(b"\\S\\") && self.rest().len() >= 4 => {
+                    self.pos += 4;
+                }
+                _ => self.pos += 1,
             }
         }
     }
@@ -671,10 +691,8 @@ impl<'a> Parser<'a> {
                 let text = std::str::from_utf8(&self.src[start..start + n]).ok()?;
                 self.pos += n;
                 let is_real = text.bytes().any(|c| matches!(c, b'.' | b'e' | b'E'));
-                if !is_real {
-                    if let Ok(i) = text.parse::<i64>() {
-                        return Some(Value::Int(i));
-                    }
+                if !is_real && let Ok(i) = text.parse::<i64>() {
+                    return Some(Value::Int(i));
                 }
                 // `1.E5` is STEP; Rust wants a digit after the point.
                 let r = text.parse::<f64>().ok().or_else(|| {
@@ -782,7 +800,9 @@ mod tests {
     use super::*;
 
     fn file(data: &str) -> String {
-        format!("ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}\nENDSEC;\nEND-ISO-10303-21;\n")
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}\nENDSEC;\nEND-ISO-10303-21;\n"
+        )
     }
 
     #[test]
@@ -880,6 +900,30 @@ mod tests {
         let f = StepFile::parse(broken.as_bytes()).unwrap();
         assert!(f.damaged);
         assert_eq!(f.ids().collect::<Vec<_>>(), vec![1, 4]);
+    }
+
+    #[test]
+    fn a_shifted_quote_does_not_end_a_string() {
+        // Vectorworks writes a quote as `\S\'` in a Japanese path.
+        let src = "ISO-10303-21;\r\nHEADER;\r\nFILE_NAME('/a\\S\\c\\S\\'\\X\\82\\S\\$/b.ifc','',(''),(''),'','','');\r\nFILE_SCHEMA(('IFC2X3'));\r\nENDSEC;\r\nDATA;\r\n#1=IFCA(1);\r\nENDSEC;\r\nEND-ISO-10303-21;\r\n";
+        let f = StepFile::parse(src.as_bytes()).unwrap();
+        assert!(!f.damaged);
+        assert_eq!(f.schema, Schema::Ifc2x3);
+        assert_eq!(f.ids().collect::<Vec<_>>(), vec![1]);
+        // A doubled backslash before an `S` is a backslash and an S.
+        let src =
+            "ISO-10303-21;HEADER;FILE_NAME('c:\\\\S\\\\','');ENDSEC;DATA;#1=IFCA('a\\\\');ENDSEC;";
+        let f = StepFile::parse(src.as_bytes()).unwrap();
+        assert_eq!(f.ids().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn a_stray_semicolon_in_the_header_does_not_hide_the_instances() {
+        let src = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'););\nENDSEC;\nDATA;\n#1=IFCA(1);\n#2=IFCB(2);\nENDSEC;\nEND-ISO-10303-21;\n";
+        let f = StepFile::parse(src.as_bytes()).unwrap();
+        assert!(!f.damaged);
+        assert_eq!(f.schema, Schema::Ifc4);
+        assert_eq!(f.ids().collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]

@@ -54,7 +54,9 @@ pub(crate) fn decrypt_aes(body: &[u8], strength: u8, password: &[u8]) -> Option<
     let mac_key = &derived[key_len..key_len * 2];
     let verifier = &derived[key_len * 2..];
 
-    if !constant_time_eq::constant_time_eq(verifier, pw_verify) {
+    // Plain comparisons: the password is the caller's own and the file is the
+    // attacker's, so there is no secret for timing to leak.
+    if verifier != pw_verify {
         return None;
     }
 
@@ -62,7 +64,7 @@ pub(crate) fn decrypt_aes(body: &[u8], strength: u8, password: &[u8]) -> Option<
     let mut mac = HmacSha1::new_from_slice(mac_key).ok()?;
     mac.update(ct);
     let full = mac.finalize().into_bytes();
-    if !constant_time_eq::constant_time_eq(&full[..10], stored_mac) {
+    if full[..10] != *stored_mac {
         return None;
     }
 

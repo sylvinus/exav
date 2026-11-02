@@ -333,11 +333,7 @@ mod tests {
     fn uuencode(name: &str, data: &[u8]) -> Vec<u8> {
         let enc = |v: u8| -> u8 {
             let v = v & 0x3F;
-            if v == 0 {
-                b'`'
-            } else {
-                v + 0x20
-            }
+            if v == 0 { b'`' } else { v + 0x20 }
         };
         let mut out = format!("begin 644 {name}\n").into_bytes();
         for chunk in data.chunks(45) {

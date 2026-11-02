@@ -84,6 +84,21 @@ pub fn read_with_limits(
     let header = parse_header(data)?;
     let payload = &data[512..];
 
+    // A `.cvd` names the md5 of the bytes after its header. A file cut short by
+    // an interrupted download or a full disk, or damaged since, no longer
+    // matches, and the decompressor would hand back the part it could read: a
+    // database with signatures missing and nothing to say so. (A `.cld`, a tar
+    // that updates rewrite in place, does not carry the md5 of its own body.)
+    if payload.starts_with(&[0x1f, 0x8b]) {
+        let got = md5_hex(payload);
+        if !header.md5.trim().eq_ignore_ascii_case(&got) {
+            return Err(format!(
+                "cvd is damaged or incomplete: its header says md5 {}, its contents are {got}",
+                header.md5.trim()
+            ));
+        }
+    }
+
     // A CVD payload is a gzip-compressed tar; a CLD's is a raw tar. Both are
     // unpacked through exav-unpack's gzip/tar extractors. The signature container
     // is TRUSTED, so the budget only caps total size/count to reject a corrupt or
@@ -118,6 +133,11 @@ pub fn read_with_limits(
         })
         .collect();
     Ok((header, files))
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    crate::hexsig::encode_hex(&Md5::digest(data))
 }
 
 /// A permissive [`Budget`] for unpacking the TRUSTED CVD/CLD container: it caps
@@ -164,10 +184,18 @@ mod tests {
         gz.write_all(&tar_buf).unwrap();
         let payload = gz.finish().unwrap();
 
-        let mut header = "ClamAV-VDB:01 Jan 2026 00-00 +0000:58:1234:90:abcdef0123456789:dsig:exav-test:1700000000".to_string()
+        header_for(&payload, 1234)
+    }
+
+    /// A `.cvd` around `payload`: its header names the payload's md5.
+    fn header_for(payload: &[u8], sigs: u32) -> Vec<u8> {
+        let mut header = format!(
+            "ClamAV-VDB:01 Jan 2026 00-00 +0000:58:{sigs}:90:{}:dsig:exav-test:1700000000",
+            md5_hex(payload)
+        )
         .into_bytes();
         header.resize(512, b' ');
-        header.extend_from_slice(&payload);
+        header.extend_from_slice(payload);
         header
     }
 
@@ -203,13 +231,7 @@ mod tests {
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
         gz.write_all(&tar_buf).unwrap();
         let payload = gz.finish().unwrap();
-        let mut header =
-            "ClamAV-VDB:01 Jan 2026 00-00 +0000:58:3:90:abcdef0123456789:dsig:exav-test:1700000000"
-                .to_string()
-                .into_bytes();
-        header.resize(512, b' ');
-        header.extend_from_slice(&payload);
-        header
+        header_for(&payload, 3)
     }
 
     // Regression for the per-entry-only budget (review finding C1): the
@@ -224,5 +246,33 @@ mod tests {
         };
         assert!(read_with_limits(&cvd, &limits).is_err());
         assert!(read(&cvd).is_ok()); // default limits accept it
+    }
+
+    // A database cut short or damaged in place loads fewer signatures without
+    // saying so, unless its header's md5 is checked.
+    #[test]
+    fn a_cvd_cut_short_or_damaged_is_refused() {
+        let cvd = make_cvd();
+        assert!(read(&cvd).is_ok());
+        // Cut inside the compressed payload: the unpacker would still return
+        // the files it reached.
+        for cut in [cvd.len() - 1, cvd.len() - 20, 512 + 40] {
+            let e = read(&cvd[..cut]).err().unwrap_or_default();
+            assert!(e.contains("damaged or incomplete"), "cut at {cut}: {e:?}");
+        }
+        let mut flipped = cvd.clone();
+        let at = flipped.len() - 12;
+        flipped[at] ^= 1;
+        let e = read(&flipped).err().unwrap_or_default();
+        assert!(e.contains("damaged or incomplete"), "{e:?}");
+    }
+
+    #[test]
+    fn the_shipped_header_md5_is_the_md5_of_the_body() {
+        // The rule the check relies on, against a real container's layout: the
+        // md5 is of everything after the 512-byte header.
+        let cvd = make_cvd();
+        let hdr = parse_header(&cvd).unwrap();
+        assert_eq!(hdr.md5, md5_hex(&cvd[512..]));
     }
 }

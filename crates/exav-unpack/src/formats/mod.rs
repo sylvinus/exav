@@ -2,6 +2,8 @@
 //! extractor entry point are gated behind the matching Cargo feature (see the
 //! crate's `[features]`); a disabled format simply isn't compiled in.
 
+#[cfg(feature = "dmg")]
+mod apfs;
 #[cfg(feature = "ar")]
 pub(crate) mod ar;
 #[cfg(feature = "arj")]
@@ -23,16 +25,27 @@ mod bzip2_rs;
 #[cfg(feature = "cab")]
 pub(crate) mod cab;
 #[cfg(feature = "cab")]
+pub(crate) mod cab_join;
+#[cfg(feature = "cab")]
 mod cab_parse;
 #[cfg(feature = "chm")]
 mod chm;
 #[cfg(feature = "cpio")]
 pub(crate) mod cpio;
 #[cfg(feature = "dmg")]
+mod decmpfs;
+#[cfg(feature = "dmg")]
 pub(crate) mod dmg;
+#[cfg(feature = "dmg")]
+mod hfsplus;
 // Code pages of AutoCAD drawings, which DXF and DWG strings are in.
 #[cfg(any(feature = "dxf", feature = "dwg"))]
 mod codepage;
+// Text in a Windows code page number.
+#[cfg(feature = "ole")]
+pub mod charset;
+#[cfg(feature = "ole")]
+mod charset_tables;
 #[cfg(feature = "dwg")]
 pub mod dwg;
 #[cfg(feature = "dxf")]
@@ -49,9 +62,18 @@ pub(crate) mod iso;
 pub(crate) mod lha;
 #[cfg(feature = "lzip")]
 pub(crate) mod lzip;
+#[cfg(feature = "lzma")]
+pub(crate) mod lzmaalone;
+#[cfg(feature = "rpm")]
+pub(crate) mod rpm;
 // Every feature that enables `lzma-rust2`.
+#[cfg(feature = "ole")]
+pub mod biff;
+#[cfg(feature = "ole")]
+pub mod cfb;
 #[cfg(any(
     feature = "lzip",
+    feature = "lzma",
     feature = "sevenz",
     feature = "swf",
     feature = "nsis",
@@ -59,18 +81,18 @@ pub(crate) mod lzip;
     feature = "upx"
 ))]
 pub(crate) mod lzma;
+#[cfg(feature = "offcrypto")]
+pub mod offcrypto;
 #[cfg(feature = "ole")]
 mod ole;
 #[cfg(all(feature = "ole", feature = "decrypt"))]
 mod ole_crypto;
 #[cfg(feature = "pdf")]
-mod pdf;
+pub(crate) mod pdf;
 #[cfg(feature = "pdf")]
-mod pdf_parse;
+pub(crate) mod pdf_parse;
 #[cfg(feature = "ole")]
 mod xlm;
-#[cfg(feature = "ole")]
-mod xlm_functions;
 #[cfg(feature = "zstd")]
 pub(crate) mod zstd;
 // Shared PPMd7 model: used by both RAR (RAR3 PPMd blocks) and 7-Zip.
@@ -90,6 +112,14 @@ pub(crate) mod azo;
 pub(crate) mod azo_tables;
 #[cfg(feature = "binhex")]
 mod binhex;
+#[cfg(feature = "cramfs")]
+pub(crate) mod cramfs;
+#[cfg(feature = "ishieldz")]
+mod dcl_explode;
+#[cfg(feature = "erofs")]
+pub(crate) mod erofs;
+#[cfg(feature = "exfat")]
+pub(crate) mod exfat;
 #[cfg(feature = "ext")]
 pub(crate) mod ext;
 #[cfg(feature = "fat")]
@@ -104,6 +134,10 @@ pub(crate) mod ishield_z;
 mod lnk;
 #[cfg(feature = "lz4")]
 pub(crate) mod lz4;
+#[cfg(feature = "dmg")]
+mod lzfse;
+#[cfg(feature = "squashfs")]
+pub(crate) mod lzo;
 #[cfg(feature = "lzw")]
 pub(crate) mod lzw;
 #[cfg(feature = "machofat")]
@@ -134,6 +168,10 @@ mod rar3_unpack;
 mod rar5_crypt;
 #[cfg(feature = "rar")]
 mod rar5_unpack;
+#[cfg(feature = "romfs")]
+pub(crate) mod romfs;
+#[cfg(feature = "squashfs")]
+pub(crate) mod squashfs;
 
 /// Passwords tried on an encrypted archive member after the caller's: the
 /// conventions of malware distribution. A password-protected dropper is a
@@ -159,21 +197,59 @@ mod udif;
 mod upx;
 #[cfg(feature = "ole")]
 mod vba;
+// Virtual disks read in place, and the partitions and filesystems walked on
+// them: shared by every format that has a disk in it.
+#[cfg(any(feature = "vhd", feature = "diskimage"))]
+pub(crate) mod vdisk;
 #[cfg(feature = "vhd")]
 pub(crate) mod vhd;
 #[cfg(feature = "diskimage")]
 pub(crate) mod vhdx;
 #[cfg(feature = "diskimage")]
 pub(crate) mod vmdk;
+#[cfg(any(
+    feature = "vhd",
+    feature = "diskimage",
+    feature = "partition",
+    feature = "ntfs",
+    feature = "fat",
+    feature = "exfat",
+    feature = "squashfs",
+    feature = "cramfs",
+    feature = "romfs",
+    feature = "erofs",
+    feature = "ext",
+    feature = "dmg"
+))]
+pub(crate) mod volumes;
+// The volume the filesystems read in place are read through, and what they
+// hand their files over as, which the walk of a disk takes from them.
+#[cfg(any(
+    feature = "vhd",
+    feature = "diskimage",
+    feature = "partition",
+    feature = "ntfs",
+    feature = "dmg",
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "squashfs",
+    feature = "cramfs",
+    feature = "romfs",
+    feature = "erofs"
+))]
+mod vol;
 #[cfg(feature = "wim")]
 pub(crate) mod wim;
 #[cfg(feature = "xar")]
-mod xar;
+pub(crate) mod xar;
 // DMG's xz runs use its `XzReader` only.
 #[cfg(any(feature = "xz", feature = "dmg"))]
 #[cfg_attr(not(feature = "xz"), allow(dead_code))]
 #[doc(hidden)]
 pub mod xz;
+#[cfg(any(feature = "xz", feature = "dmg"))]
+mod xz_nocheck;
 #[cfg(feature = "zip")]
 #[doc(hidden)]
 pub mod zip;
@@ -195,7 +271,7 @@ pub(crate) mod pepack;
 #[cfg(feature = "pyc")]
 pub(crate) mod pyc;
 #[cfg(feature = "rtf")]
-mod rtf;
+pub mod rtf;
 #[cfg(feature = "screnc")]
 mod screnc;
 #[cfg(feature = "sfx")]
@@ -217,7 +293,7 @@ pub(crate) use aimodel::{extract_aimodel, is_aimodel};
 #[cfg(feature = "arj")]
 pub(crate) use arj::extract_arj;
 #[cfg(feature = "autoit")]
-pub(crate) use autoit::{extract_autoit, is_autoit, MARKER_EA05, MARKER_EA06};
+pub(crate) use autoit::{MARKER_EA05, MARKER_EA06, extract_autoit, is_autoit};
 #[cfg(feature = "binhex")]
 pub(crate) use binhex::{extract_binhex, looks_like_binhex};
 #[cfg(feature = "chm")]
@@ -233,7 +309,7 @@ pub(crate) use lnk::extract_lnk;
 #[cfg(feature = "machofat")]
 pub(crate) use machofat::looks_like_machofat;
 #[cfg(feature = "nsis")]
-pub(crate) use nsis::{extract_nsis, is_nsis, NSIS_SIG};
+pub(crate) use nsis::{NSIS_SIG, extract_nsis, is_nsis};
 #[cfg(feature = "ole")]
 pub(crate) use ole::extract_ole;
 #[cfg(feature = "onenote")]
@@ -253,7 +329,7 @@ pub(crate) use rar::{extract_rar, join_volumes as join_rar_volumes};
 #[cfg(feature = "rtf")]
 pub(crate) use rtf::extract_rtf;
 #[cfg(feature = "screnc")]
-pub(crate) use screnc::{extract_screnc, looks_like_screnc, MARKER as SCRENC_MARKER};
+pub(crate) use screnc::{MARKER as SCRENC_MARKER, extract_screnc, looks_like_screnc};
 #[cfg(feature = "sfx")]
 pub(crate) use sfx::looks_like_sfx;
 #[cfg(feature = "szdd")]
@@ -262,8 +338,6 @@ pub(crate) use szdd::{extract_szdd, is_szdd};
 pub(crate) use upx::{extract_upx, find_packheader, has_packheader_layout};
 #[cfg(feature = "uuencode")]
 pub(crate) use uuencode::{extract_uuencode, looks_like_uuencode};
-#[cfg(feature = "xar")]
-pub(crate) use xar::extract_xar;
 #[cfg(feature = "xdp")]
 pub(crate) use xdp::{extract_xdp, looks_like_xdp};
 #[cfg(feature = "zip")]

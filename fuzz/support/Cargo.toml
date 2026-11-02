@@ -2,7 +2,7 @@
 name = "exav-fuzz-support"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 description = "What the fuzz targets share: the custom mutator and the input framing. No dependencies, so its tests run without the sanitizer build."
 
 [dependencies]

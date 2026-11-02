@@ -25,7 +25,9 @@ fuzz_target!(|input: &[u8]| {
     let [lo, hi, rest @ ..] = input else {
         return;
     };
-    let len = (u16::from_le_bytes([*lo, *hi]) as usize).min(rest.len()).min(MAX_RULES);
+    let len = (u16::from_le_bytes([*lo, *hi]) as usize)
+        .min(rest.len())
+        .min(MAX_RULES);
     let (text, data) = rest.split_at(len);
     let Ok(text) = std::str::from_utf8(text) else {
         return;

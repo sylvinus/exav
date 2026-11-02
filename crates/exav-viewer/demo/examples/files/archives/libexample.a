@@ -1,0 +1,40 @@
+!<arch>
+README.txt/     0           0     0     644     227       `
+Example archive
+===============
+
+This archive holds a few files of the exav demo. It is in the public domain
+(CC0-1.0). Look at the folders: docs, data, images, src, an empty one, and a
+folder with accented and Japanese names.
+
+field-notes.txt/0           0     0     644     1632      `
+Field notes
+===========
+
+Plain text is shown as it is written: line breaks, indentation, tabs and
+long lines are kept.
+
+	A line that starts with a tab.
+        A line that starts with eight spaces.
+
+A very long line, to see how the viewer wraps or scrolls it: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
+
+Pangrams, one for each script:
+
+  English   The quick brown fox jumps over the lazy dog.
+  Français Portez ce vieux whisky au juge blond qui fume.
+  Deutsch   Zwölf Boxkämpfer jagen Viktor quer über den großen Sylter Deich.
+  Español  El pingüino Wenceslao hizo kilómetros bajo exhaustiva lluvia y frío.
+  Ελληνικά   Ξεσκεπάζω την ψυχοφθόρα βδελυγμία.
+  Русский   Съешь же ещё этих мягких французских булок да выпей чаю.
+  日本語    いろはにほへと ちりぬるを わかよたれそ つねならむ
+  العربية   نص حكيم له سر قاطع وذو شأن عظيم مكتوب على ثوب أخضر ومزخرف
+  עברית    דג סקרן שט בים מאוכזב ולפתע מצא לו חברה איך הקליטה
+
+Symbols and box drawing:
+
+  ┌──────┬──────┐   ← ↑ → ↓   ✓ ✗   ½ ⅓ ¾   ± × ÷ ≠ ≤ ≥ ∞
+  │ a    │ b    │   € £ ¥ ₿   © ® ™   ☀ ☁ ☂ ☃
+  └──────┴──────┘
+
+The last line has no newline at the end.

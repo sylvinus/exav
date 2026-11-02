@@ -131,8 +131,9 @@ On purpose:
   members exits 82; when other members came out, the run exits 1 and each
   member left behind is reported `skipping: NAME  incorrect password`. `-t`
   checks without writing anything.
-- A symbolic link whose target leaves the extraction directory is not made, and
-  nothing is written through a link already there. A member name's `..` and
+- A symbolic link whose target leaves the extraction directory is not made,
+  the target being followed through the links already made, and nothing is
+  written through a link already there. A member name's `..` and
   root (`/`, a drive letter) are dropped, so every file lands under the
   extraction directory. Links are made last, once every member is out.
 - Every member is `extracting:`, whatever its compression.
@@ -143,6 +144,7 @@ It restores what the archive records: modification times, the permission bits
 for ZIP and tar. Other formats record less.
 
 Members are written as they are decoded and the archive is read from disk as
-needed, so neither is held in memory whole, except where a format's decoder
-needs it (a 7z solid block, a RAR archive, a CAB folder). A packed executable
-(UPX, or a PE the emulator unpacks) is read whole, up to `--max-memory`.
+needed, so neither is held in memory whole, except for the formats
+[read whole](/unpack/formats/#size-what-is-read-as-it-goes-and-what-is-read-whole)
+(RAR, OLE and others), up to `--max-memory`. So is a packed executable (UPX, or
+a PE the emulator unpacks).

@@ -14,19 +14,20 @@ mod http {
     use std::io::{self, Read, Seek, SeekFrom};
 
     /// Bytes fetched by a range request that does not continue the previous
-    /// one.
-    const BLOCK: u64 = 64 * 1024;
+    /// one, unless the caller says otherwise: the block of the cache that
+    /// reads through the reader, so that a block is one request.
+    pub const BLOCK: u64 = 1024 * 1024;
 
-    /// Most bytes one range request fetches.
-    const MAX_BLOCK: u64 = 8 * 1024 * 1024;
+    /// Most bytes one range request fetches, unless the caller says otherwise.
+    pub const MAX_BLOCK: u64 = 8 * 1024 * 1024;
 
     /// A `Read + Seek` view over an HTTP(S) resource, served by range
     /// requests, the last one's bytes kept.
     ///
     /// A request that continues the previous one fetches twice as much, up to
-    /// [`MAX_BLOCK`]: a pass through the object costs a request per 8 MiB
-    /// rather than per 64 KiB, while reads scattered through it (a ZIP's
-    /// directory, then its members) stay small.
+    /// the largest request (8 MiB unless set): a pass through the object costs a
+    /// request per 8 MiB rather than per block, while reads scattered through it
+    /// (a ZIP's directory, then its members) stay one block.
     pub struct HttpRangeReader {
         agent: ureq::Agent,
         url: String,
@@ -38,12 +39,25 @@ mod http {
         pub bytes_fetched: u64,
         /// Number of range requests issued.
         pub requests: u64,
+        /// What a request that does not continue the previous one fetches.
+        first: u64,
+        /// The most one request fetches.
+        most: u64,
     }
 
     impl HttpRangeReader {
         /// Open a URL, probing its length and range support with a single
         /// `bytes=0-0` request.
         pub fn open(url: &str) -> io::Result<Self> {
+            Self::open_with(url, BLOCK, MAX_BLOCK)
+        }
+
+        /// [`Self::open`] with the size of a request that does not continue
+        /// the previous one (`first`, at least 1) and the most any request
+        /// fetches (`most`, never below `first`).
+        pub fn open_with(url: &str, first: u64, most: u64) -> io::Result<Self> {
+            let first = first.max(1);
+            let most = most.max(first);
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .user_agent(concat!("exav/", env!("CARGO_PKG_VERSION")))
                 .build()
@@ -74,6 +88,8 @@ mod http {
                 block_start: 0,
                 bytes_fetched: 0,
                 requests: 0,
+                first,
+                most,
             })
         }
 
@@ -93,8 +109,8 @@ mod http {
             let continues =
                 !self.block.is_empty() && start == self.block_start + self.block.len() as u64;
             let size = match continues {
-                true => (self.block.len() as u64 * 2).min(MAX_BLOCK),
-                false => BLOCK,
+                true => (self.block.len() as u64 * 2).min(self.most),
+                false => self.first,
             };
             self.block.clear();
             self.block_start = start;
@@ -115,6 +131,33 @@ mod http {
                     "range request answered with status {}",
                     resp.status()
                 )));
+            }
+            // The range it says it sent, of the object it said it was: a server
+            // that answers another range hands over bytes of another place, and
+            // one whose object has changed since a scan began hands over a
+            // mixture. Neither is the object that was asked to be scanned.
+            let range = resp
+                .headers()
+                .get("Content-Range")
+                .and_then(|cr| cr.to_str().ok())
+                .and_then(|cr| cr.trim().strip_prefix("bytes "))
+                .and_then(|cr| {
+                    let (span, total) = cr.split_once('/')?;
+                    let (from, _) = span.split_once('-')?;
+                    Some((
+                        from.trim().parse::<u64>().ok()?,
+                        total.trim().parse::<u64>().ok(),
+                    ))
+                });
+            match range {
+                Some((from, total)) if from == start && total.is_none_or(|t| t == self.len) => {}
+                other => {
+                    return Err(io::Error::other(format!(
+                        "range request for bytes {start}-{last} of {} answered with {other:?} \
+                         (the object is {} bytes)",
+                        self.url, self.len
+                    )));
+                }
             }
             let mut buf = Vec::new();
             resp.into_body()
@@ -139,7 +182,7 @@ mod http {
                 // holding a position elsewhere.
                 let start = match self.pos == next {
                     true => next,
-                    false => (self.pos / BLOCK) * BLOCK,
+                    false => (self.pos / self.first) * self.first,
                 };
                 self.fetch_block(start)?;
             }
@@ -240,6 +283,68 @@ mod tests {
         url
     }
 
+    /// A server that answers the first request as it should and every later one
+    /// with the range `shift` bytes on from the one asked for (`Offset`), or with
+    /// the range asked for of an object of another size (`Total`).
+    enum Wrong {
+        Offset,
+        Total,
+    }
+
+    fn serve_wrong(body: Vec<u8>, wrong: Wrong) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/obj", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { return };
+                let mut range = (0usize, 0usize);
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        let (a, b) = r.trim().split_once('-').unwrap();
+                        range = (a.parse().unwrap(), b.parse().unwrap());
+                    }
+                }
+                let (a, b) = range;
+                let (from, to, total) = match (&wrong, n) {
+                    (_, 0) => (a, b, body.len()),
+                    (Wrong::Offset, _) => (
+                        (a + 1).min(body.len() - 1),
+                        (b + 1).min(body.len() - 1),
+                        body.len(),
+                    ),
+                    (Wrong::Total, _) => (a, b, body.len() + 7),
+                };
+                let part = &body[from..=to];
+                let h = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{to}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    part.len()
+                );
+                let _ = conn.write_all(&[h.as_bytes(), part].concat());
+            }
+        });
+        url
+    }
+
+    /// The bytes of a range are the bytes of the range that was asked for, of
+    /// the object that was asked about.
+    #[test]
+    fn an_answer_for_another_range_or_another_object_is_refused() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        for wrong in [Wrong::Offset, Wrong::Total] {
+            let mut r = HttpRangeReader::open(&serve_wrong(body.clone(), wrong)).unwrap();
+            let mut all = Vec::new();
+            let e = r
+                .read_to_end(&mut all)
+                .expect_err("the answer is not the range asked for");
+            assert!(e.to_string().contains("answered with"), "{e}");
+        }
+    }
+
     #[test]
     fn ranges_are_read_where_they_are() {
         let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
@@ -253,6 +358,38 @@ mod tests {
         r.seek(SeekFrom::Start(0)).unwrap();
         r.read_to_end(&mut all).unwrap();
         assert_eq!(all, body);
+    }
+
+    /// The size of a request that starts a read, and the most one may grow to,
+    /// are the caller's.
+    #[test]
+    fn the_request_sizes_are_the_callers() {
+        let body = vec![7u8; 3_000_000];
+        let sequential = |first, most| {
+            let mut r =
+                HttpRangeReader::open_with(&serve(body.clone(), false), first, most).unwrap();
+            let mut all = Vec::new();
+            r.read_to_end(&mut all).unwrap();
+            assert_eq!(all, body);
+            r
+        };
+        // One request per 100,000 bytes.
+        assert_eq!(sequential(100_000, 100_000).requests, 30);
+        // 10 KB, doubling up to 1 MB: seven requests to 1,270,000 bytes, two
+        // of 1 MB, the rest.
+        let mut r = sequential(10_000, 1_000_000);
+        assert_eq!(r.requests, 9);
+        // A read elsewhere is one request of the first size, from its block.
+        let (requests, fetched) = (r.requests, r.bytes_fetched);
+        r.seek(SeekFrom::Start(123)).unwrap();
+        r.read_exact(&mut [0u8; 10]).unwrap();
+        assert_eq!(r.requests, requests + 1);
+        assert_eq!(r.bytes_fetched, fetched + 10_000);
+        // The defaults are the ones `open` has.
+        assert_eq!(
+            (super::http::BLOCK, super::http::MAX_BLOCK),
+            (1 << 20, 8 << 20)
+        );
     }
 
     /// A seek past the largest offset is refused, not wrapped to a small one.

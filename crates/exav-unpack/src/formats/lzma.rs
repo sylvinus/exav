@@ -58,9 +58,9 @@ const STEP: usize = 1024;
 /// is everything decoded since the previous `read`. Here a stream that runs
 /// out of input is an `UnexpectedEof` error once the bytes decoded before it
 /// are handed over; only the symbols of its last few bytes, which need input
-/// that is not there, are lost. Damage is an error once the bytes decoded
-/// before it are handed over, but for those of the last [`STEP`] bytes of
-/// input.
+/// that is not there, are lost. [`SansIo::cut_is_damage`] makes that loss an
+/// `InvalidData` error. Damage is an error once the bytes decoded before it are
+/// handed over, but for those of the last [`STEP`] bytes of input.
 pub(crate) struct SansIo<R, S> {
     inner: R,
     stream: S,
@@ -74,6 +74,8 @@ pub(crate) struct SansIo<R, S> {
     done: bool,
     /// The error that ended a call whose output was handed over first.
     failed: Option<io::Error>,
+    /// A stream that runs out of input is damage, not an absent rest.
+    cut_is_damage: bool,
 }
 
 impl<R: Read, S: Process> SansIo<R, S> {
@@ -88,13 +90,40 @@ impl<R: Read, S: Process> SansIo<R, S> {
             finishing: false,
             done: false,
             failed: None,
+            cut_is_damage: false,
         }
+    }
+
+    /// A stream that ends before its end marker is reported as damaged, not as
+    /// one whose rest is absent ([`withheld`]): for a file that is the whole
+    /// stream, where nothing says the last bytes were meant to be there.
+    #[cfg_attr(not(feature = "lzma"), allow(dead_code))]
+    pub(crate) fn cut_is_damage(mut self) -> Self {
+        self.cut_is_damage = true;
+        self
     }
 
     /// The decoder, for what it says once its stream has ended.
     #[cfg_attr(not(feature = "lzip"), allow(dead_code))]
     pub(crate) fn stream(&self) -> &S {
         &self.stream
+    }
+}
+
+/// An end of input inside the stream, as the decoder reports it, is not
+/// `UnexpectedEof` here, which says the rest of the input is absent and nothing
+/// it holds is left: the decoder keeps back the symbols of the last bytes it was
+/// given (hundreds of bytes of output, for text that compresses well), and
+/// `xz -dc` writes them. The error is damage, so the scan says the file was not
+/// fully examined.
+fn withheld(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lzma: stream cut short, the symbols of its last bytes were not decoded",
+        )
+    } else {
+        e
     }
 }
 
@@ -131,6 +160,7 @@ impl<R: Read, S: Process> Read for SansIo<R, S> {
                 Ok(r) => r,
                 Err(e) => {
                     self.done = true;
+                    let e = if self.cut_is_damage { withheld(e) } else { e };
                     let given = (self.stream.total_out() - before) as usize;
                     if given == 0 {
                         return Err(e);
@@ -161,10 +191,8 @@ impl<R: Read, S: Process> Read for SansIo<R, S> {
             }
             if self.finishing {
                 self.done = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "lzma: stream cut short",
-                ));
+                let e = io::Error::new(io::ErrorKind::UnexpectedEof, "lzma: stream cut short");
+                return Err(if self.cut_is_damage { withheld(e) } else { e });
             }
             self.finishing = true;
         }

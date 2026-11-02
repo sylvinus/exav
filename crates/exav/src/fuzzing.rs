@@ -5,7 +5,7 @@
 use exav_core::{ScanOptions, Scanner};
 use std::io::{self, Cursor, Read};
 
-use crate::daemon::{handle_conn, FdSource};
+use crate::daemon::{FdSource, handle_conn};
 
 /// A connection's bytes, from memory. A transport that cannot pass a
 /// descriptor, as TCP cannot.

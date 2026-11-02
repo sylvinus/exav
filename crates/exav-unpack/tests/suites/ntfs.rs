@@ -22,7 +22,8 @@
 //! ```
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use super::fs_tree::{assert_streams_alike, came};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 /// `sha256sum` of what `ntfscat` returns for each file.
 const PAYLOAD: &str = "49c7e4f4b184954a212c78c87c17705cd4c16f0b8c83a5cd6a750369c47957c5";
@@ -161,6 +162,41 @@ fn runs_that_do_not_cover_the_declared_size_are_reported_not_truncated() {
     );
 }
 
+#[test]
+fn a_fragmented_file_over_the_buffer_limit_is_read_as_it_goes_across_both_runs() {
+    let img = fixture();
+    assert_streams_alike(Format::Ntfs, &img, 1000);
+    let (e, end) = came(Format::Ntfs, &img, 1000);
+    end.unwrap();
+    let p = e.iter().find(|x| x.name == "payload.zip").unwrap();
+    assert!(p.streamed, "the payload is past the limit, so not held");
+    assert_eq!(sha256_hex(&p.data), PAYLOAD);
+    assert_eq!(p.read_error, None);
+}
+
+#[test]
+fn runs_that_do_not_cover_the_size_of_a_file_read_as_it_goes_are_reported_with_what_there_is() {
+    let mut img = fixture();
+    let at = img
+        .windows(RUNLIST.len())
+        .position(|w| w == RUNLIST)
+        .expect("the two-run list should be in the fixture");
+    img[at + 1] = 0x02;
+    let (e, end) = came(Format::Ntfs, &img, 1000);
+    end.unwrap();
+    // Reported first, then the file, which ends in an error where its runs do.
+    let at = e.iter().position(|x| x.name == "payload.zip").unwrap();
+    assert!(e[at].unsupported.is_some(), "the shortfall is reported");
+    let stream = &e[at + 1];
+    assert!(stream.streamed && stream.name == "payload.zip");
+    assert!(stream.read_error.is_some(), "and the read says it stops");
+    assert_eq!(
+        stream.data.len(),
+        6 * 4096,
+        "with the six clusters there are"
+    );
+}
+
 // A file fragmented past what its MFT record holds: the runs continue in
 // extension records, and the `$ATTRIBUTE_LIST` that names them is itself outside
 // the record (non-resident). `attribute_list.img.gz` is a 14 MiB volume made by
@@ -263,6 +299,139 @@ fn an_attribute_list_that_reads_short_is_reported_not_half_used() {
     );
 }
 
+/// A volume of 512-byte clusters and 1 MiB records (the format's largest)
+/// whose record 16 is a file with a non-resident `$ATTRIBUTE_LIST` of `entries`
+/// entries of type `kind`, all naming record 2 (a valid file of 1 MiB). 39 MB,
+/// made in memory; the list is the one bytes a reviewer's generator wrote
+/// (`entries * 26` of them).
+fn volume_with_a_list(entries: usize, kind: u32) -> Vec<u8> {
+    const CLUSTER: usize = 512;
+    const REC: usize = 1 << 20;
+    const USA: usize = 0x30;
+    let attr_off = (USA + 2 * (REC / CLUSTER + 1) + 7) & !7;
+    let list_len = entries * 26;
+    let (list_at, mft_at, rec2_data, rec16_data) = (60_000usize, 5usize, 70_000usize, 71_000usize);
+    let mft_bytes = 17 * 1024 * 1024;
+    let mut vol = vec![0u8; (72_000 + 4096) * CLUSTER];
+    vol[..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    vol[3..11].copy_from_slice(b"NTFS    ");
+    vol[11..13].copy_from_slice(&512u16.to_le_bytes());
+    vol[13] = 1;
+    vol[0x30..0x38].copy_from_slice(&(mft_at as u64).to_le_bytes());
+    vol[0x40] = 0xEC;
+    vol[510..512].copy_from_slice(&[0x55, 0xAA]);
+
+    for k in 0..entries {
+        let at = list_at * CLUSTER + k * 26;
+        vol[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        vol[at + 4..at + 6].copy_from_slice(&26u16.to_le_bytes());
+        vol[at + 8..at + 16].copy_from_slice(&(k as u64).to_le_bytes());
+        vol[at + 16..at + 24].copy_from_slice(&2u64.to_le_bytes());
+    }
+
+    let run = |lcn: usize, clusters: usize| {
+        let mut r = vec![0x33];
+        r.extend_from_slice(&clusters.to_le_bytes()[..3]);
+        r.extend_from_slice(&lcn.to_le_bytes()[..3]);
+        r.push(0);
+        r
+    };
+    // A non-resident attribute at `off` of the record; its length.
+    let attribute = |rec: &mut Vec<u8>, off: usize, ty: u32, size: usize, runs: &[u8]| {
+        let len = 64 + runs.len();
+        rec[off..off + 4].copy_from_slice(&ty.to_le_bytes());
+        rec[off + 4..off + 6].copy_from_slice(&(len as u16).to_le_bytes());
+        rec[off + 8] = 1;
+        rec[off + 0x18..off + 0x20].copy_from_slice(&(size.div_ceil(CLUSTER) as u64).to_le_bytes());
+        rec[off + 0x20..off + 0x22].copy_from_slice(&64u16.to_le_bytes());
+        rec[off + 0x28..off + 0x30].copy_from_slice(&(size as u64).to_le_bytes());
+        rec[off + 0x30..off + 0x38].copy_from_slice(&(size as u64).to_le_bytes());
+        rec[off + 0x38..off + 0x40].copy_from_slice(&(size as u64).to_le_bytes());
+        rec[off + 64..off + len].copy_from_slice(runs);
+        len
+    };
+    let mut record = |n: usize, attrs: &[(u32, usize, Vec<u8>)]| {
+        let mut r = vec![0u8; REC];
+        r[..4].copy_from_slice(b"FILE");
+        r[0x14..0x16].copy_from_slice(&(attr_off as u16).to_le_bytes());
+        r[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        r[0x18..0x1C].copy_from_slice(&(REC as u32).to_le_bytes());
+        r[0x1C..0x20].copy_from_slice(&(REC as u32).to_le_bytes());
+        let mut off = attr_off;
+        for (ty, size, runs) in attrs {
+            off += attribute(&mut r, off, *ty, *size, runs);
+        }
+        // The update sequence: its number at the start, and at the end of
+        // each sector (the values they replace are zeros here).
+        let count = REC / CLUSTER + 1;
+        r[4..6].copy_from_slice(&(USA as u16).to_le_bytes());
+        r[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+        r[USA..USA + 2].copy_from_slice(&[0xAA, 0xBB]);
+        for i in 1..count {
+            r[i * CLUSTER - 2..i * CLUSTER].copy_from_slice(&[0xAA, 0xBB]);
+        }
+        let at = mft_at * CLUSTER + n * REC;
+        vol[at..at + REC].copy_from_slice(&r);
+    };
+    record(0, &[(0x80, mft_bytes, run(mft_at, mft_bytes / CLUSTER))]);
+    record(2, &[(0x80, 1 << 20, run(rec2_data, 2048))]);
+    record(
+        16,
+        &[
+            (0x80, 1 << 15, run(rec16_data, 64)),
+            (0x20, list_len, run(list_at, list_len.div_ceil(CLUSTER))),
+        ],
+    );
+    vol
+}
+
+/// One record named by tens of thousands of list entries was read, and its
+/// fix-ups applied, once for each: 40,000 entries took 2 s, 160,000 took 8 s
+/// in a release build, and a 256 MiB list (the most a volume may give) about
+/// 13 minutes. Read once, it costs what one read does.
+#[test]
+fn a_record_named_by_a_list_thousands_of_times_is_read_once() {
+    for kind in [0x30, 0x80] {
+        let start = std::time::Instant::now();
+        let e = members(&volume_with_a_list(40_000, kind));
+        assert!(
+            e.iter()
+                .any(|x| x.name.starts_with("<mft-record-") && x.unsupported.is_none()),
+            "kind {kind:#x}: {:?}",
+            e.iter()
+                .map(|x| (&x.name, x.unsupported))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "kind {kind:#x}: {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+/// A list that names more extents than a file has is not followed, and the file
+/// is reported as not read whole, never passed off as its first extent.
+#[test]
+fn a_list_naming_more_extents_than_exav_follows_is_reported() {
+    let start = std::time::Instant::now();
+    let e = members(&volume_with_a_list(70_000, 0x80));
+    let file = e
+        .iter()
+        .find(|x| x.name.starts_with("<mft-record-"))
+        .unwrap();
+    assert!(
+        file.unsupported.is_some_and(|r| r.contains("more extents")),
+        "{:?}",
+        file.unsupported
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn the_payload_is_absent_from_the_raw_volume() {
     // Guards the premise: if EICAR were visible in the sectors, a raw scan would
@@ -284,4 +453,151 @@ fn the_payload_is_absent_from_the_raw_volume() {
     assert_eq!(sha256_hex(&z.data), PAYLOAD);
     let plain = e.iter().find(|x| x.name == "eicar.com").expect("eicar");
     assert_eq!(sha256_hex(&plain.data), EICAR);
+}
+
+/// A volume of 512-byte clusters and 1,024-byte records whose record 16 is a
+/// file with a non-resident `$ATTRIBUTE_LIST` naming `records` records, each
+/// holding the next extent of its `$DATA`: `runs_each` runs of one cluster.
+/// As [`volume_with_a_list`], made in memory.
+fn volume_with_extents(records: usize, runs_each: usize) -> Vec<u8> {
+    const CLUSTER: usize = 512;
+    const REC: usize = 1024;
+    const USA: usize = 0x30;
+    const FIRST: usize = 17;
+    let attr_off = (USA + 2 * (REC / CLUSTER + 1) + 7) & !7;
+    let list_len = records * 26;
+    let mft_at = 5usize;
+    let mft_bytes = (FIRST + records) * REC;
+    let list_at = mft_at + mft_bytes.div_ceil(CLUSTER) + 8;
+    let mut vol = vec![0u8; (list_at + list_len.div_ceil(CLUSTER) + 8) * CLUSTER];
+    vol[..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    vol[3..11].copy_from_slice(b"NTFS    ");
+    vol[11..13].copy_from_slice(&512u16.to_le_bytes());
+    vol[13] = 1;
+    vol[0x30..0x38].copy_from_slice(&(mft_at as u64).to_le_bytes());
+    vol[0x40] = 0xF6;
+    vol[510..512].copy_from_slice(&[0x55, 0xAA]);
+    assert!(mft_at * CLUSTER + mft_bytes <= list_at * CLUSTER);
+
+    for k in 0..records {
+        let at = list_at * CLUSTER + k * 26;
+        vol[at..at + 4].copy_from_slice(&0x80u32.to_le_bytes());
+        vol[at + 4..at + 6].copy_from_slice(&26u16.to_le_bytes());
+        vol[at + 8..at + 16].copy_from_slice(&((k * runs_each) as u64).to_le_bytes());
+        vol[at + 16..at + 24].copy_from_slice(&((FIRST + k) as u64).to_le_bytes());
+    }
+
+    // `count` runs of one cluster, each a step on from the one before.
+    let run = |lcn: usize, clusters: usize, count: usize| {
+        let mut r = vec![0x33];
+        r.extend_from_slice(&clusters.to_le_bytes()[..3]);
+        r.extend_from_slice(&lcn.to_le_bytes()[..3]);
+        for _ in 1..count {
+            r.extend_from_slice(&[0x11, 1, 1]);
+        }
+        r.push(0);
+        r
+    };
+    // A record of the non-resident attributes `(type, starting VCN, size, runs)`.
+    let mut record = |n: usize, attrs: &[(u32, u64, usize, Vec<u8>)]| {
+        let mut r = vec![0u8; REC];
+        r[..4].copy_from_slice(b"FILE");
+        r[0x14..0x16].copy_from_slice(&(attr_off as u16).to_le_bytes());
+        r[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        r[0x18..0x1C].copy_from_slice(&(REC as u32).to_le_bytes());
+        r[0x1C..0x20].copy_from_slice(&(REC as u32).to_le_bytes());
+        let mut off = attr_off;
+        for (ty, vcn, size, runs) in attrs {
+            let len = 64 + runs.len();
+            r[off..off + 4].copy_from_slice(&ty.to_le_bytes());
+            r[off + 4..off + 6].copy_from_slice(&(len as u16).to_le_bytes());
+            r[off + 8] = 1;
+            r[off + 0x10..off + 0x18].copy_from_slice(&vcn.to_le_bytes());
+            r[off + 0x18..off + 0x20]
+                .copy_from_slice(&(size.div_ceil(CLUSTER) as u64).to_le_bytes());
+            r[off + 0x20..off + 0x22].copy_from_slice(&64u16.to_le_bytes());
+            for at in [0x28, 0x30, 0x38] {
+                r[off + at..off + at + 8].copy_from_slice(&(*size as u64).to_le_bytes());
+            }
+            r[off + 64..off + len].copy_from_slice(runs);
+            off += len;
+        }
+        r[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let count = REC / CLUSTER + 1;
+        r[4..6].copy_from_slice(&(USA as u16).to_le_bytes());
+        r[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+        r[USA..USA + 2].copy_from_slice(&[0xAA, 0xBB]);
+        for i in 1..count {
+            // What the sector ends with is kept in the update sequence array.
+            let kept = [r[i * CLUSTER - 2], r[i * CLUSTER - 1]];
+            r[USA + 2 * i..USA + 2 * i + 2].copy_from_slice(&kept);
+            r[i * CLUSTER - 2..i * CLUSTER].copy_from_slice(&[0xAA, 0xBB]);
+        }
+        let at = mft_at * CLUSTER + n * REC;
+        vol[at..at + REC].copy_from_slice(&r);
+    };
+    record(
+        0,
+        &[(0x80, 0, mft_bytes, run(mft_at, mft_bytes / CLUSTER, 1))],
+    );
+    record(
+        16,
+        &[
+            (0x80, 0, 16 * CLUSTER, run(10, 16, 1)),
+            (
+                0x20,
+                0,
+                list_len,
+                run(list_at, list_len.div_ceil(CLUSTER), 1),
+            ),
+        ],
+    );
+    for k in 0..records {
+        let size = if k == 0 { 16 * CLUSTER } else { 0 };
+        record(
+            FIRST + k,
+            &[(0x80, (k * runs_each) as u64, size, run(10, 1, runs_each))],
+        );
+    }
+    vol
+}
+
+/// Each extent can hold as many runs as a record has room for, and a file can
+/// have thousands of extents: the runs of one file are bounded in all, and the
+/// file past the bound is reported, not read from the part of it that was kept.
+#[test]
+fn the_runs_of_all_the_extents_of_a_file_are_bounded() {
+    let start = std::time::Instant::now();
+    let e = members(&volume_with_extents(4000, 280));
+    let file = e
+        .iter()
+        .find(|x| x.name == "<mft-record-16>")
+        .unwrap_or_else(|| {
+            panic!(
+                "{:?}",
+                e.iter()
+                    .map(|x| (&x.name, x.unsupported))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        file.unsupported.is_some_and(|r| r.contains("more extents")),
+        "{:?}",
+        file.unsupported
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// The same shape within the bound is read.
+#[test]
+fn a_file_of_a_few_extents_with_many_runs_is_read() {
+    let e = members(&volume_with_extents(40, 280));
+    assert!(
+        e.iter()
+            .any(|x| x.name == "<mft-record-16>" && x.unsupported.is_none()),
+        "{:?}",
+        e.iter()
+            .map(|x| (&x.name, x.unsupported))
+            .collect::<Vec<_>>()
+    );
 }

@@ -42,10 +42,10 @@ for (const file of ["house.ifc", "house.stl"]) {
   test(`closing ${file} while it is read stops its worker`, async ({ page }) => {
     await openSample(page, file, { mode: "page" });
     await expect.poll(() => page.evaluate(() => window.modelWorkers().live)).toBe(1);
-    await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "loading");
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "loading");
     // Another file, as the user picks one.
     await pick(page, "report.pdf");
-    await expect(page.locator(".demo-frame .exv-body")).toHaveAttribute("data-phase", "ready");
+    await expect(page.locator(".demo-frame .exav-viewer-body")).toHaveAttribute("data-phase", "ready");
     expect(await page.evaluate(() => window.modelWorkers())).toEqual({ started: 1, live: 0 });
   });
 }

@@ -365,6 +365,12 @@ const EXPLAINED: &[(&[&str], &str, &str, &str)] = &[
         NO_SOURCES,
     ),
     (&["*"], "linetypes.elements[].flags (bit 8)", "", LTYPE_BIT8),
+    (
+        &["ACAD13", "ACAD14", "orig-R13", "orig-R14"],
+        "dim_styles.dimadec",
+        "",
+        R14_DIMADEC,
+    ),
     (&["*"], "entity:", ".block_name (renumbered)", RENUMBERED),
     (&["*"], "blocks.name (renumbered)", "", RENUMBERED),
     (
@@ -454,13 +460,11 @@ const AUDIT: &str = "the converter's audit renames an entry whose name it reject
 const R13_HATCH: &str = "an INSERT with R14_HATCH_DATA extended data, a hatch as R13 keeps it, \
     in AutoCAD 2007 files (2948f53e's 61D4, 258c843b, 330bfec2, 511ba870): the converter's DXF \
     has a HATCH rebuilt from that data under the INSERT's handle; the DWG reader reads the INSERT";
-const FIRST_STYLE: &str =
-    "the converter leaves out group 7 of a text on the drawing's first STYLE \
+const FIRST_STYLE: &str = "the converter leaves out group 7 of a text on the drawing's first STYLE \
     entry whatever its name, which DXF then reads as STANDARD: 69c08825's SIMPLEX (C, the drawing \
     has no STANDARD, the converter adds one), 7802a3cc's ROMANS (154, beside a STANDARD 161), \
     5aba4fe9's ROMANS (R13)";
-const MTEXT_FORMATTING: &str =
-    "the converter writes an MTEXT's spacing and paragraph codes again: \
+const MTEXT_FORMATTING: &str = "the converter writes an MTEXT's spacing and paragraph codes again: \
     the same text once spaces, braces and \\p codes are left out (d744670f's 1101A: 'Notes:      \
     Component' as 'Notes: Component'; 8c78010e's 7B800 indents)";
 const X_DEFAULT: &str = "an MTEXT direction within 1e-12 of (1, 0, 0) (79428019's 1C3: (1, \
@@ -495,8 +499,7 @@ const NO_SOURCES: &str = "an associative HATCH with no source object (7447f770's
     converter's audit makes it not associative";
 const LTYPE_BIT8: &str = "a linetype text element's undocumented 8 bit (08fe5efe's A4: 10), which \
     the converter's DXF leaves out (2)";
-const LAST_HEIGHT: &str =
-    "the converter writes a STYLE's last height 0 as the drawing's text size \
+const LAST_HEIGHT: &str = "the converter writes a STYLE's last height 0 as the drawing's text size \
     (26c068d2: every style 0 in the DWG, 2.5 = $TEXTSIZE in the DXF)";
 const LEADER_HOOK_DIRECTION: &str = "the converter writes the hookline direction (74) of a LEADER \
     from where its annotation lies, not the DWG's bit (499033fa's F2FF: 1 in the DWG, no 74 with \
@@ -600,8 +603,7 @@ const ROUNDTRIP: &str = "data the converter keeps for a round trip through an ol
 const DATA_STORAGE: &str = "the index of R2013's data storage section (AcDsRecords, AcDsSchemas, \
     AcDsDecomposeData, and dictionaries below them whose names are numbers: orig-R2000/\
     02f62c86's 229 and 22A), which AutoCAD writes and the converter leaves out of DXF";
-const MATERIAL_MAP: &str =
-    "the map entries (BUMPTILE, DIFFUSETILE, OPACITYTILE, REFLECTIONTILE...) \
+const MATERIAL_MAP: &str = "the map entries (BUMPTILE, DIFFUSETILE, OPACITYTILE, REFLECTIONTILE...) \
     of the materials' extension dictionaries of AutoCAD's files (orig-R2000/22852ead's 110), \
     which the converter leaves out of DXF";
 const POLYSOLID: &str = "the polysolid variables PSOLWIDTH and PSOLHEIGHT (DICTIONARYVAR 566 and \
@@ -647,6 +649,9 @@ const HAS_ATTRIBUTES: &str = "AutoCAD set the has-attributes flag (2) of two blo
 const R13_CODE_PAGE: &str = "the converter writes R13 DXF's $DWGCODEPAGE in lower case";
 const R13_MEASUREMENT: &str = "R13 DXF has no $MEASUREMENT: the DXF reader gives 0, the DWG's \
     own section (spec 22) says";
+const R14_DIMADEC: &str = "an R13 or R14 DWG's DIMSTYLE has no DIMADEC (spec 20.4.68): the DWG \
+    reader gives 0, the converter's DXF of the same version the style's angular precision from \
+    the drawing it was made from (854c8ebe's 242: 2)";
 const DASH_SCALE: &str = "the converter writes group 46 only for a dash with a shape or text (74 \
     not 0): the DXF reader gives 1 for the others, the DWG holds the stored scale (0.1, 0)";
 const TEMP_REC: &str = "a shape file's STYLE entry of an R11 drawing: the converter names it \

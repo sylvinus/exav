@@ -3,7 +3,7 @@
 // than the fields it claims to hold is ordinary attacker input, and the caller
 // returns `None` for it rather than panicking out through the decoder.
 macro_rules! convert_u32 {
-    ( $t:ident, $x:expr ) => {
+    ( $t:ident, $x:expr_2021 ) => {
         if $x.len() < 4 {
             return None;
         }
@@ -16,7 +16,7 @@ macro_rules! convert_u32 {
 }
 
 macro_rules! convert_u16 {
-    ( $t:ident, $x:expr ) => {
+    ( $t:ident, $x:expr_2021 ) => {
         if $x.len() < 2 {
             return None;
         }
@@ -29,7 +29,7 @@ macro_rules! convert_u16 {
 }
 
 macro_rules! convert_u8 {
-    ( $t:ident, $x:expr ) => {
+    ( $t:ident, $x:expr_2021 ) => {
         if $x.is_empty() {
             return None;
         }
@@ -42,7 +42,7 @@ macro_rules! convert_u8 {
 }
 
 macro_rules! convert_string {
-    ( $t:ident, $x:expr ) => {
+    ( $t:ident, $x:expr_2021 ) => {
         let mut $t = String::new();
         while !$x.is_empty() && $x[0] != 0 {
             $t.push($x[0] as char);
@@ -57,7 +57,7 @@ macro_rules! convert_string {
 }
 
 macro_rules! skip {
-    ( $x:expr, $t:expr ) => {
+    ( $x:expr_2021, $t:expr_2021 ) => {
         #[allow(unused_assignments)]
         {
             let t = $t;

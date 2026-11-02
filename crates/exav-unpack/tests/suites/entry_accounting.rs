@@ -10,7 +10,7 @@
 //! arithmetic to the shape a caller can reason about: a flat archive costs its
 //! member count, and nesting costs the members at each level and nothing more.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use std::io::Write;
 
 /// Extract with `max_members` set to `cap`, and say whether the limit fired.

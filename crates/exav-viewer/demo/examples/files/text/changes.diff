@@ -1,0 +1,31 @@
+diff --git a/src/berths.py b/src/berths.py
+index 3f2a1c4..9b7d0e8 100644
+--- a/src/berths.py
++++ b/src/berths.py
+@@ -10,12 +10,16 @@ class Berth:
+     number: int
+     length_m: float
++    max_draught_m: float = 1.5
+
+     def fits(self, boat):
+-        return boat.length_m <= self.length_m
++        return boat.length_m <= self.length_m and boat.draught_m <= self.max_draught_m
+
+     def label(self):
+-        return "Berth %d" % self.number
++        return f"Berth {self.number} ({self.length_m:.1f} m)"
+@@ -40,7 +44,7 @@ def free_berths(register, boat):
+     for berth in register:
+         if berth.fits(boat):
+             yield berth
+-    return
++    return None
+diff --git a/README.md b/README.md
+index 1e2d3f4..5a6b7c8 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,5 @@
+ # Harbour register
+
+ The mooring register of the east quay.
++Berths now have a maximum draught.

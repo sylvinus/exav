@@ -17,7 +17,7 @@
 //! * **disagree** — both decoded and they differ. The only failure, and the
 //!   tests below assert it never happens.
 
-use exav_x86::{decode, Mn, Op, Size};
+use exav_x86::{Mn, Op, Size, decode};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Register};
 
 #[derive(Default)]

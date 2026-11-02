@@ -14,8 +14,32 @@ drawing renderer uses. The code references each one with
 `new URL("...", import.meta.url)`, so the host's bundler finds them, gives
 them hashed names and emits them with the rest of the build. A host does
 nothing for these. They are fetched when the first file of their format
-opens: the DWG module, 1.9 MB (816 KB gzipped), only when a drawing does;
-the IFC and STL module, 290 KB (131 KB gzipped), only when a model does.
+opens: the DWG module only when a drawing does, the spreadsheet converter
+only when an XLS, ODS or Numbers file does, and so on. The modules, as built
+from the current source:
+
+<!-- sizes:wasm -->
+| Module | Opens | Size | Brotli | Gzip |
+| --- | --- | --- | --- | --- |
+| `exav_viewer_image` | TIFF, BMP, ICO, PNM, QOI, DDS, farbfeld, HDR, JPEG 2000, JBIG2, JPEG XL, camera RAW | 2,082,327 | 599,290 | 768,562 |
+| `exav_viewer_dwg` | DWG, DXF | 921,111 | 369,630 | 461,103 |
+| `exav_viewer_model` | IFC, STL, OBJ, PLY, glTF | 415,447 | 156,293 | 189,171 |
+| `exav_viewer_text` | Markdown | 189,431 | 69,646 | 83,509 |
+| `exav_viewer_sheets` | XLS, ODS, FODS, Numbers, SpreadsheetML 2003, HTML tables, SYLK, to XLSX | 1,215,153 | 487,591 | 596,288 |
+| `exav_viewer_slides` | PPT, ODP, FODP, Keynote, ODG, Visio (VSDX), to PPTX | 1,019,003 | 435,522 | 525,127 |
+| `exav_viewer_docs` | DOC, ODT, FODT, RTF, to DOCX | 1,020,818 | 416,529 | 512,002 |
+| `openjpeg_nowasm_fallback.js` | JPEG 2000 images in PDFs (pdf.js's JPXDecode), the module in base64 | 269,813 | 83,250 | 100,297 |
+| `jbig2_nowasm_fallback.js` | JBIG2 and CCITT fax images in PDFs, the module in base64 | 317,903 | 69,613 | 87,921 |
+<!-- /sizes:wasm -->
+
+Sizes are in bytes, of the files in the package's `wasm/`; a server that
+compresses sends about the brotli or gzip column. pdf.js's two replacement
+decoders are the two JavaScript fallbacks, each holding its module in
+base64. The table is written from the build (`npm run sizes`), not by hand.
+
+**JPEG XL** is in `exav_viewer_image` with the other decoders. Its decoder
+is about 0.8 MB of that module's 2 MB, and a page that opens a TIFF
+fetches it too.
 
 **The engines' runtime files**, which no import reaches: pdf.js's CMaps,
 standard fonts, ICC profiles and image decoders. They come from the host's own `node_modules`, so their
@@ -45,6 +69,27 @@ directory is named after this package's decoders too.
 
 Only the engines installed are copied. A host without `pdfjs-dist` gets no
 `pdfjs/` directory.
+
+## Peer dependencies
+
+The engines the package does not write are peer dependencies, all optional:
+a host installs the ones for the formats it opens, and none for the
+sandboxed frame, which carries its own. What each adds, as the frame bundles
+it (minified, with the workers, wasm and runtime files it brings); a host's
+bundler gives about the same. The Office engines load per format, not
+together: Word, Excel and PowerPoint each load their own code and parser,
+and the [frame table](#a-frame-for-some-formats-only) has the totals per
+format. The table is written from the build (`npm run sizes`):
+
+<!-- sizes:peers -->
+| Peer | Range | Tested with | Needed for | Size | Brotli | Gzip |
+| --- | --- | --- | --- | --- | --- | --- |
+| `pdfjs-dist` | `>=5.0.0 <7` | 6.4.299 | PDF | 3,699,311 | 1,786,844 | 2,083,171 |
+| `@silurus/ooxml` | `>=0.87.0 <1` | 0.89.3 | Word, Excel, PowerPoint, CSV, and the formats converted to them: XLS, ODS, Numbers, PPT, ODP, Keynote, ODG, Visio, DOC, ODT, RTF | 15,566,588 | 3,980,443 | 5,180,257 |
+| `three` | `>=0.170.0 <1` | 0.186.1 | IFC, STL, OBJ, PLY, glTF | 754,038 | 157,003 | 193,013 |
+| `@exav/unpack-wasm` | `>=0.0.3` | 0.0.3 | Archives | 2,986,252 | 806,421 | 1,168,146 |
+| `react`, `react-dom` | `^19.0.0` |  | The React components (`@exav/viewer/react`); the host's own React, not measured |  |  |  |
+<!-- /sizes:peers -->
 
 ## Vite
 
@@ -125,6 +170,70 @@ The frame does not use `assetBase`, `@exav/viewer/vite`'s copy of the
 host's engines, or the host's peer dependencies: in this mode a host
 installs `@exav/viewer` and, for the default UI, React.
 
+### A frame for some formats only
+
+Published as above, the frame has every engine, and a host that opens PDFs
+and images does not need the Office engines, the CAD renderer or the
+archive reader. The plugin's `formats` option (`--format` for the command
+line) publishes the files of the engines that open the formats it names,
+and nothing else:
+
+```ts
+// vite.config.ts
+exavViewer({ frameDir: "exav-frame", formats: ["pdf", "image"] });
+```
+
+```bash
+# other bundlers
+npx exav-viewer-assets public/exav-viewer --frame public/exav-frame --format pdf --format image
+```
+
+Give the viewer the same list (`sandbox={{ url, formats: ["pdf", "image"] }}`),
+so that it offers a download for the files the frame does not open: the
+viewer decides that in the page, before the frame is asked, so it cannot
+read the list from the frame. A file of a format the frame was published
+without still ends in the viewer's error, not in a request that is never
+answered: the frame says which formats it was published for when it starts,
+and the error names the `formats` option. It builds no plugin for the others.
+
+A frame is made of engines, not formats: one that opens `stl` opens `obj`,
+`ply` and `gltf` too, which share its files, and `dwg` and `dxf`, `xlsx`
+and `csv`, `rtf`, `doc` and `odt` go together in the same way. A converted
+format brings the viewer that shows its result (`ppt` brings PowerPoint,
+`rtf` Word), and, where an `externalConverter` is published with the frame,
+PDF and Excel, which are what an external converter answers with. What
+each costs, as built from the current source (the table is written from the
+build with `npm run sizes`; formats of different engines add up, less what
+they share, the Office viewers' common code above all):
+
+<!-- sizes:frame -->
+| A frame for | `formats` | Size | Brotli | Gzip |
+| --- | --- | --- | --- | --- |
+| The frame itself, in every one |  | 151,790 | 44,316 | 51,129 |
+| PDF | `pdf` | 4,462,648 | 1,991,537 | 2,331,430 |
+| Images: PNG, JPEG, WebP, GIF, SVG and the formats of the image module | `image` | 2,250,383 | 649,816 | 826,592 |
+| DWG, DXF | `dwg` | 2,885,763 | 2,166,151 | 2,264,334 |
+| IFC | `ifc` | 1,366,935 | 372,899 | 451,004 |
+| STL, OBJ, PLY, glTF | `stl` | 1,363,777 | 371,774 | 449,793 |
+| Word | `docx` | 7,493,323 | 1,881,588 | 2,419,599 |
+| Excel, CSV | `xlsx` | 5,547,202 | 1,395,134 | 1,786,733 |
+| PowerPoint | `pptx` | 5,746,511 | 1,415,073 | 1,837,894 |
+| XLS, ODS, Numbers | `xls` | 6,770,821 | 1,885,914 | 2,386,546 |
+| PPT, ODP, Keynote, ODG, Visio | `ppt` | 6,774,169 | 1,853,818 | 2,366,590 |
+| DOC, ODT, RTF | `rtf` | 8,522,717 | 2,301,325 | 2,935,153 |
+| Markdown, text | `text` | 355,429 | 119,385 | 140,646 |
+| Archives | `archive` | 3,174,207 | 861,590 | 1,232,226 |
+| Video, audio | `video` | 151,790 | 44,316 | 51,129 |
+| Every format |  | 32,643,982 | 11,289,223 | 13,838,144 |
+<!-- /sizes:frame -->
+
+The core is the page, its policy and the code that decides which engine
+opens a file; the engines' own code is loaded only when a file of their
+format opens, in a frame with all of them as in one with few. What the
+subset saves is what the host serves and a service worker precaches, and
+the licences it has to carry: `licenses/README.txt` in the frame lists the
+packages that are in it.
+
 ### How the bytes reach the frame
 
 By default the host page reads the file (a URL is fetched from there, with
@@ -189,6 +298,44 @@ The frame reports its policy when it starts, and the viewer refuses one
 whose origins differ from its `origins`: rebuild the frame with the same
 flags after changing them.
 
+### A host that draws its own UI
+
+The frame draws the document and nothing else; the rest can be the host's
+own components, from a design system say, with no exav React code and no
+exav stylesheet in the page. `demo/headless.html` in the package is such a
+host, in plain DOM:
+
+```ts
+import { builtinTranslate, printPictures } from "@exav/viewer";
+import { createSandboxedViewer } from "@exav/viewer/frame";
+
+const viewer = createSandboxedViewer({
+  url: "https://viewer-frame.example-files.com/exav-frame/index.html",
+  options: { media: { controls: "none" } }, // the page draws the player's controls
+});
+const session = viewer.mount(element, file); // the frame fills `element`
+session.status.subscribe(showSpinnerOrError);
+session.controllers.subscribe((c) => {
+  // c.pages, c.zoom, c.sheets, c.media, c.pictures, c.outline, c.layers, c.archive...
+});
+```
+
+- Page field, zoom buttons, sheet tabs, player controls, the outline and the
+  layers are the page's, driven by the controllers ([Core API](/viewer/api/#controllers)).
+- Thumbnails: `c.pictures.render(page, longEdge)` gives an `ImageBitmap`
+  drawn by the frame; a `bitmaprenderer` canvas shows it.
+- Printing: `printPictures(c.pictures)`.
+- Fullscreen: the frame may not; request it on the element that holds it.
+- Keys: the arrows and Escape the document does not use reach the page's
+  `keydown` listeners from the `<iframe>`.
+- Colours: the frame takes the `--exav-viewer-*` custom properties in force where
+  it is mounted; map them to the design system's tokens on an ancestor, and
+  call `viewer.restyle()` when the page's theme changes.
+- Strings: `builtinTranslate(locale)` for exav's own (statuses, warnings,
+  archive members), or the host's i18n.
+- An archive's open member is a session of its own, in
+  `c.archive.get().opened.session`: follow its controllers the same way.
+
 ## Choosing the formats
 
 A host imports the plugins of the formats it opens, from their subpaths,
@@ -206,7 +353,142 @@ the host offers a download instead. `viewer.detect(info)` answers from the
 name and type alone, synchronously, to decide before opening anything.
 
 `@exav/viewer/all` imports every plugin, so every peer dependency must be
-installed.
+installed. It leaves out the converted Office formats, which a host names to
+open them: `rtf()`, `doc()`, `odt()`, `ppt()`, `odp()`, `keynote()`,
+`xls()`, `ods()`, `numbers()`, `odg()` and `visio()` from
+`@exav/viewer/office`, with the plugin that shows the result beside them:
+`docx()` for text documents, `xlsx()` for spreadsheets, `pptx()` for
+presentations and drawings.
+
+```ts
+import {
+  doc, docx, keynote, numbers, odg, odp, ods, odt, ppt, pptx, rtf, visio, xls, xlsx,
+} from "@exav/viewer/office";
+
+const plugins = [docx(), xlsx(), pptx(), rtf(), doc(), odt(), ppt(), odp(), keynote(), xls(), ods(), numbers(), odg(), visio()];
+```
+
+The converters are the package's own wasm modules ([above](#two-kinds-of-files)):
+a host installs `@silurus/ooxml`, which draws the result, and copies nothing
+else. Their options (`converter`, `externalConverter`, `timeoutMs`,
+`maxMemory`) are in [Core API](/viewer/api/#plugin-options). In the
+sandboxed frame, `sandbox.formats` must name them: `formats: BUILTIN_ORDER`
+(from `@exav/viewer`) lists every format.
+
+## The external converter
+
+The package's converters do not read every format the plugins above claim.
+These go to an external converter, a module the host installs and names:
+
+- binary Visio (`.vsd`, `.vst`) and Visio 2003 XML (`.vdx`, `.vtx`), CorelDRAW,
+  Publisher, PageMaker, FreeHand, QuarkXPress, Zoner Draw and WordPerfect
+  Graphics (`visio()`, `coreldraw()`, `publisher()`, `pagemaker()`,
+  `freehand()`, `quarkxpress()`, `zonerdraw()`, `wpg()`);
+- a spreadsheet saved as .xls that is not one (a CSV or a DIF, say), through
+  `xls()`.
+
+With none set, such a file ends in the `needs_converter` error, with the
+format's name. A file one of the package's converters recognises and cannot
+convert (encrypted, too large, damaged) is not handed over: it fails with the
+converter's reason.
+
+`converter` chooses the order. `"exav"`, the default, tries the package's
+converters first for spreadsheets, presentations and drawings, and the
+external one for what they do not read. Text documents (DOC, ODT, RTF) are the
+exception: the external converter takes them first when there is one, since
+the package's `docs` converter is a prototype, and the package's converter
+reads them when there is none. `converter: "exav"` set on a plugin asks for
+the package's converter for text documents even where an external one is
+set. `"external"` sends every format to the external converter alone.
+
+### Naming it
+
+`externalConverter` is the URL of an ES module (absolute, rooted, or relative
+to the page), or the name of a package installed beside the viewer, copied
+with the assets:
+
+```ts
+// vite.config.ts
+export default { plugins: [exavViewer({ externalConverter: "my-converter" })] };
+```
+
+```bash
+# other bundlers
+npx exav-viewer-assets public/exav-viewer --external-converter my-converter
+```
+
+The package's published files (`files` in its `package.json`, else all but
+`node_modules`) go under `assetBase` in `converters/<name>/<version>/`, with
+its `LICENSE` and `NOTICE`, and `manifest.json` lists the entry (`converters`;
+the package's `exports["."]` or `main`). The copy fails when the package is
+not installed. Then the plugins take its name:
+
+```ts
+const conversion = { externalConverter: "my-converter" };
+const plugins = [pdf(), xlsx(), visio(conversion), coreldraw(conversion), publisher(conversion), xls(conversion)];
+```
+
+The converter's output is shown by the viewer's own `pdf()` or `xlsx()`: they
+must be registered too.
+
+### The contract
+
+The module exports `convert`, and may export `prefetch`:
+
+```ts
+export function convert(bytes: Uint8Array, options: {
+  hint: string;          // what the viewer took the file for: "rtf", "doc", "odt", "ppt", "odp",
+                         // "keynote", "xls", "ods", "numbers", "odg", "visio", "coreldraw",
+                         // "publisher", "pagemaker", "freehand", "quarkxpress", "zonerdraw" or "wpg".
+                         // A hint: the bytes decide.
+  maxMemory?: number;    // bytes, when the host set the `maxMemory` option
+  signal?: AbortSignal;  // aborted when the file is closed or `timeoutMs` passes: reject
+  onProgress?: (p: ConvertProgress) => void;
+}): Promise<{ format: "pdf" | "xlsx"; bytes: Uint8Array }>;
+
+// URLs, relative to the module, that `viewer.prefetch([...])` fetches with it
+export function prefetch?(hint: string): string[] | Promise<string[]>;
+```
+
+`ConvertProgress` is `{ stage: "download"; loaded; total }` (the module's code
+and data arriving, `total` 0 when not known), `{ stage: "start" }`, and
+`{ stage: "load" | "export"; done; total }`. The viewer shows them as the
+`engine`, `start`, `read` and `convert` [steps](/viewer/api/#status) of its
+status, with a bar where a share is given. A converter that reports nothing
+leaves the status at plain loading until it answers.
+
+The module gets a copy of the bytes. The viewer stops waiting after
+`timeoutMs` (default 120,000) whether or not the module looks at its signal.
+The failures a host can tell apart:
+
+| Error | `kind` | When |
+|---|---|---|
+| `NeedsConverterError`, the cause of the status error with code `needs_converter` | `"needs-converter"` | no external converter is set for a format only one reads; `format` names it |
+| `ExternalConversionError`, the cause of the Office error | `"failed"` | the module rejected, threw, or resolved to something that is not `{ format, bytes }`; its error is the cause |
+| `ExternalConversionError`, the cause of the Office error | `"timeout"` | it did not answer in `timeoutMs` |
+
+Both are exported from `@exav/viewer/office`. A minimal module that implements
+the contract is `e2e/fixtures/fake-converter.js` in the repository.
+
+### In the sandboxed frame
+
+The conversion options are plain data: `sandbox.options.conversion` takes
+`timeoutMs`, `maxMemory`, `converter` and `externalConverter`, and the frame
+checks each. `externalConverter` there is a package name that the frame's
+manifest lists, or a path or an `http(s)` URL; anything else is dropped. The
+module is imported inside the frame, under the frame's policy, which loads
+scripts from the frame's own origin: copy the package beside the frame app
+with `exavViewer({ frameDir, externalConverter: "my-converter" })` (or
+`--frame` with `--external-converter`), which also adds it to the frame's
+manifest.
+
+```tsx
+const sandbox = {
+  url: "https://viewer-frame.example-files.com/exav-frame/index.html",
+  formats: BUILTIN_ORDER,
+  options: { conversion: { externalConverter: "my-converter" } },
+};
+```
 
 ## Caching and the reverse proxy
 
@@ -267,9 +549,9 @@ await viewer.prefetch(["pdf"]);
 What a precache list should keep out is what is large and used only when a
 file of its format is opened: the engines' workers and wasm (`*.worker-*.js`,
 `*_bg-*.wasm`, whose names keep a stable prefix after the bundler hashes
-them), `three`, the `@silurus/ooxml` engines and the CAD fonts. On a real
-app this was 21.8 MB of precache against 3.6 MB without them; the
-runtime cache above takes them when a file needs them.
+them), `three`, the `@silurus/ooxml` engines and the CAD fonts (the wasm
+[sizes](#two-kinds-of-files) are above). The runtime cache above takes them
+when a file needs them.
 
 `prefetch` loads each format's code and fetches the assets its plugin
 lists, six at a time; for PDF, the CMaps, standard fonts, ICC profiles and
@@ -340,6 +622,11 @@ Files from users are untrusted. Every engine bounds what a file may cost:
 the image decoders refuse more than 256 MiB of pixels (`maxDecodeBytes`),
 a drawing's layout stops at eight million strokes and fill vertices
 (`maxPrimitives`; lower it for devices with little memory) and a DWG's
-compressed sections at 512 MiB expanded (`maxDecompressedBytes`), archives stop at 512 MiB extracted, 5000 members and a ratio of 200 (the
-`archive()` options). exav's own decoders run in workers, and one that
-fails on a file is replaced for the next; the page is not affected.
+compressed sections at 512 MiB expanded (`maxDecompressedBytes`) and the
+entities read at a million (`maxEntities`), archives
+stop at 512 MiB extracted, 5000 members and a ratio of 200 (the `archive()`
+options), a document's ZIP at 20000 entries (`maxArchiveEntries`), and a
+conversion at 120 seconds (`timeoutMs`) and 1 GiB of memory (`maxMemory`;
+exav-render's converters count it themselves, up to 1.5 GiB). exav's own
+decoders run in workers, and one that fails on a file is replaced for the
+next; the page is not affected.

@@ -305,7 +305,7 @@ fn parse_query(query: Option<&str>, whole: &str) -> Result<Options, String> {
                 return Err(format!(
                     "`{whole}`: unknown address option `{other}` \
                      (known: mode, max-connections, service)"
-                ))
+                ));
             }
         }
     }
@@ -420,6 +420,11 @@ impl std::fmt::Display for Endpoint {
 /// would leave the published image's default address unremovable from the
 /// environment, which is where a container is configured.
 pub(crate) fn listeners(values: &[String]) -> Result<Vec<Endpoint>, String> {
+    listeners_of("--listen", values)
+}
+
+/// [`listeners`] for the flag `flag`, which the errors name.
+pub(crate) fn listeners_of(flag: &str, values: &[String]) -> Result<Vec<Endpoint>, String> {
     let mut out: Vec<Endpoint> = Vec::new();
     for v in values.iter().filter(|v| !v.trim().is_empty()) {
         let e = Endpoint::parse(v)?;
@@ -428,7 +433,7 @@ pub(crate) fn listeners(values: &[String]) -> Result<Vec<Endpoint>, String> {
         // is simply never bound while appearing in the command line.
         if let Some(prev) = out.iter().find(|p| p.proto == e.proto) {
             return Err(format!(
-                "--listen {e} and --listen {prev} both serve {}; give one",
+                "{flag} {e} and {flag} {prev} both serve {}; give one",
                 e.proto.as_str()
             ));
         }

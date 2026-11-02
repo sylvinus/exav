@@ -5,7 +5,7 @@
 //! no CDB matching, so these detections were silently missed. It also exercises
 //! the 1-based `FilePos` semantics (ClamAV counts members from 1).
 
-use exav_core::{loader, scan_seekable, ScanOptions, Verdict};
+use exav_core::{ScanOptions, Verdict, loader, scan_seekable};
 use std::io::Cursor;
 
 fn db_with_dualext() -> exav_core::Scanner {

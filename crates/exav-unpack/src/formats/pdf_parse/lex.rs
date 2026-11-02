@@ -45,10 +45,24 @@ impl<'a> Lexer<'a> {
         self.data
     }
 
+    /// White space only. A `%` here is the byte it is: a comment is no reason to
+    /// miss an `N G obj` after it on the same line, which a reader that goes by
+    /// the cross-reference table finds, and the scan for objects must too.
+    fn skip_blank(&mut self) {
+        while self.pos < self.data.len()
+            && matches!(
+                self.data[self.pos],
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x00'
+            )
+        {
+            self.pos += 1;
+        }
+    }
+
     fn skip_whitespace(&mut self) {
         while self.pos < self.data.len() {
             match self.data[self.pos] {
-                b' ' | b'\t' | b'\r' | b'\n' | b'\x00' => self.pos += 1,
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'\x00' => self.pos += 1,
                 b'%' => {
                     // PDF comment: skip to end of line
                     self.pos += 1;
@@ -189,10 +203,10 @@ impl<'a> Lexer<'a> {
                 if let Ok(b) = u8::from_str_radix(std::str::from_utf8(pair).unwrap_or("0"), 16) {
                     result.push(b);
                 }
-            } else if pair.len() == 1 {
-                if let Ok(b) = u8::from_str_radix(&format!("{}0", char::from(pair[0])), 16) {
-                    result.push(b);
-                }
+            } else if pair.len() == 1
+                && let Ok(b) = u8::from_str_radix(&format!("{}0", char::from(pair[0])), 16)
+            {
+                result.push(b);
             }
         }
         result
@@ -223,6 +237,8 @@ impl<'a> Lexer<'a> {
                             b'n' => result.push(b'\n'),
                             b'r' => result.push(b'\r'),
                             b't' => result.push(b'\t'),
+                            b'b' => result.push(0x08),
+                            b'f' => result.push(0x0c),
                             b'\\' => result.push(b'\\'),
                             b'(' => result.push(b'('),
                             b')' => result.push(b')'),
@@ -239,18 +255,15 @@ impl<'a> Lexer<'a> {
                             }
                             d @ b'0'..=b'7' => {
                                 let mut octal = (d - b'0') as u16;
+                                // Up to two more digits; a byte that is not one
+                                // belongs to the string, so it is only peeked at.
                                 for _ in 0..2 {
-                                    self.pos += 1;
-                                    if self.pos < self.data.len() {
-                                        if let Some(o) = self.data[self.pos].checked_sub(b'0') {
-                                            if o <= 7 {
-                                                octal = octal * 8 + o as u16;
-                                            } else {
-                                                break;
-                                            }
-                                        } else {
-                                            break;
+                                    match self.data.get(self.pos + 1) {
+                                        Some(&n @ b'0'..=b'7') => {
+                                            octal = octal * 8 + (n - b'0') as u16;
+                                            self.pos += 1;
                                         }
+                                        _ => break,
                                     }
                                 }
                                 result.push(octal as u8);
@@ -273,8 +286,8 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         while self.pos < self.data.len() {
             match self.data[self.pos] {
-                b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'<' | b'>' | b'/' | b'[' | b']'
-                | b'{' | b'}' | b'%' | 0 => break,
+                b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' | b'(' | b')' | b'<' | b'>' | b'/'
+                | b'[' | b']' | b'{' | b'}' | b'%' | 0 => break,
                 _ => self.pos += 1,
             }
         }
@@ -283,14 +296,14 @@ impl<'a> Lexer<'a> {
         let mut name = String::with_capacity(raw.len());
         let mut i = 0;
         while i < raw.len() {
-            if raw[i] == b'#' && i + 2 < raw.len() {
-                if let Ok(b) =
+            if raw[i] == b'#'
+                && i + 2 < raw.len()
+                && let Ok(b) =
                     u8::from_str_radix(std::str::from_utf8(&raw[i + 1..i + 3]).unwrap_or("0"), 16)
-                {
-                    name.push(b as char);
-                    i += 3;
-                    continue;
-                }
+            {
+                name.push(b as char);
+                i += 3;
+                continue;
             }
             name.push(raw[i] as char);
             i += 1;
@@ -330,30 +343,30 @@ impl<'a> Lexer<'a> {
     /// Returns (obj_number, gen_number, offset_of_first_byte_after_obj_keyword) or None.
     pub(crate) fn find_next_obj(&mut self) -> Option<(u32, u32, usize)> {
         while self.pos < self.data.len() {
-            self.skip_whitespace();
+            self.skip_blank();
             if self.pos >= self.data.len() {
                 return None;
             }
             // Try to read: number number obj
             let saved = self.pos;
-            if let Token::Integer(n) = self.read_number() {
-                if n >= 0 {
-                    self.skip_whitespace();
-                    if self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
-                        // This might be the generation number
-                        let gen_start = self.pos;
-                        while self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
-                            self.pos += 1;
-                        }
-                        let gen: u32 = std::str::from_utf8(&self.data[gen_start..self.pos])
-                            .unwrap_or("0")
-                            .parse()
-                            .unwrap_or(0);
-                        self.skip_whitespace();
-                        if self.starts_with(b"obj") {
-                            self.pos += 3;
-                            return Some((n as u32, gen, self.pos));
-                        }
+            if let Token::Integer(n) = self.read_number()
+                && n >= 0
+            {
+                self.skip_blank();
+                if self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
+                    // This might be the generation number
+                    let gen_start = self.pos;
+                    while self.pos < self.data.len() && self.data[self.pos].is_ascii_digit() {
+                        self.pos += 1;
+                    }
+                    let r#gen: u32 = std::str::from_utf8(&self.data[gen_start..self.pos])
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
+                    self.skip_blank();
+                    if self.starts_with(b"obj") {
+                        self.pos += 3;
+                        return Some((n as u32, r#gen, self.pos));
                     }
                 }
             }
@@ -397,6 +410,34 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("did not return within 10 s");
         assert!(none);
+    }
+
+    fn string_of(src: &[u8]) -> Vec<u8> {
+        match Lexer::new(src).next_token() {
+            Token::String(s) => s,
+            other => panic!("not a string: {other:?}"),
+        }
+    }
+
+    /// `\b` and `\f` are backspace and form feed. Read as the letters, an
+    /// `/O` entry that holds one is the wrong key, and an encrypted PDF that
+    /// opens with an empty password is reported password-protected.
+    #[test]
+    fn backspace_and_form_feed_escapes_are_decoded() {
+        assert_eq!(string_of(b"(a\\bb\\fc)"), b"a\x08b\x0cc");
+    }
+
+    /// A short octal escape ended where the next byte is not a digit, and
+    /// that byte was dropped: the `)` after `\0` closed nothing, and the
+    /// string ran on into the rest of the file.
+    #[test]
+    fn a_short_octal_escape_does_not_eat_the_next_byte() {
+        let mut lex = Lexer::new(b"(a\\0) /Next");
+        assert_eq!(lex.next_token(), Token::String(b"a\0".to_vec()));
+        assert_eq!(lex.next_token(), Token::Name("Next".into()));
+        assert_eq!(string_of(b"(\\12x)"), b"\nx");
+        assert_eq!(string_of(b"(\\1234)"), b"S4");
+        assert_eq!(string_of(b"(\\8)"), b"8");
     }
 
     #[test]

@@ -234,10 +234,10 @@ fn parse_polyline(line: &str, line_no: usize) -> Result<Vec<[f32; 2]>, ParseErro
     let mut out: Vec<[f32; 2]> = Vec::with_capacity(pts.len());
     for (i, (p, bulge)) in pts.iter().enumerate() {
         out.push(*p);
-        if let Some((next, _)) = pts.get(i + 1) {
-            if *bulge != 0.0 {
-                flatten_arc(*p, *next, *bulge, &mut out);
-            }
+        if let Some((next, _)) = pts.get(i + 1)
+            && *bulge != 0.0
+        {
+            flatten_arc(*p, *next, *bulge, &mut out);
         }
     }
     Ok(out)
@@ -452,8 +452,8 @@ license = CC0-1.0
         let src = "[font]\n\n---\n\n[0041] A\n0,0,9;18,0\n";
         let g = &parse(src).unwrap().glyphs[&0x41];
         let arc = &g.polylines[0];
-        for w in arc.windows(2) {
-            let mid = [(w[0][0] + w[1][0]) / 2.0, (w[0][1] + w[1][1]) / 2.0];
+        for [a, b] in arc.array_windows() {
+            let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
             // Sagitta is how far the chord midpoint falls inside the circle.
             let r = ((mid[0] - 9.0).powi(2) + mid[1].powi(2)).sqrt();
             assert!(

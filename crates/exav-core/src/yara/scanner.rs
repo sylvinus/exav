@@ -10,7 +10,7 @@ use crate::yara::atoms::PatternGate;
 use crate::yara::compiler::ExternalValue;
 use crate::yara::error::{Error, Result};
 use crate::yara::ir::{Cond, EvalCtx, Value};
-use crate::yara::matcher::{find_all_windowed, Match, PatternDef, PatternMatcher, StreamRegexes};
+use crate::yara::matcher::{Match, PatternDef, PatternMatcher, StreamRegexes, find_all_windowed};
 use crate::yara::modules::{ModuleCtx, ModuleKind};
 
 /// A compiled rule (internal representation).
@@ -293,7 +293,7 @@ impl<'r> Scanner<'r> {
                 .iter()
                 .zip(&results)
                 .enumerate()
-                .filter(|(_, (r, &res))| res && !r.private)
+                .filter(|&(_, (r, &res))| res && !r.private)
                 .map(|(i, _)| i)
                 .collect()
         } else {
@@ -401,7 +401,7 @@ impl<'a, 'r, 'd> Rule<'a, 'r, 'd> {
     }
 
     /// The rule's metadata entries as `(identifier, value-as-string)` pairs.
-    pub fn metadata(&self) -> impl Iterator<Item = (&'a str, &'a str)> {
+    pub fn metadata(&self) -> impl Iterator<Item = (&'a str, &'a str)> + use<'a> {
         self.res.rules.rules[self.idx]
             .meta
             .iter()
@@ -753,7 +753,9 @@ mod source_tests {
             .collect();
         assert_eq!(
             names,
-            ["literals", "b64", "hexes", "regexes", "counts", "reads", "maths", "hashes"]
+            [
+                "literals", "b64", "hexes", "regexes", "counts", "reads", "maths", "hashes"
+            ]
         );
     }
 

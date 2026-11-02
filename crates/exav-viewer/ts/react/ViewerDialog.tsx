@@ -76,14 +76,16 @@ export function ViewerDialog<Meta = unknown>({ items, index, onIndexChange, widt
     [index, n, onIndexChange],
   );
   useEffect(() => {
-    if (!open || n < 2) return;
+    if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "ArrowLeft") go(-1);
       else if (e.key === "ArrowRight") go(1);
+      // Escape handed back by a sandboxed frame: the dialog closes only on one the browser saw.
+      else if (e.key === "Escape" && !e.isTrusted && e.target instanceof HTMLIFrameElement) onIndexChange(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, n, go]);
+  }, [open, go, onIndexChange]);
 
   const url = item ? urlOf(item) : null;
   const save = () => {
@@ -98,7 +100,7 @@ export function ViewerDialog<Meta = unknown>({ items, index, onIndexChange, widt
   const title = item ? (
     <>
       {item.title}
-      {item.hint && <span className="exv-hint">{item.hint}</span>}
+      {item.hint && <span className="exav-viewer-hint">{item.hint}</span>}
     </>
   ) : null;
 
@@ -111,53 +113,53 @@ export function ViewerDialog<Meta = unknown>({ items, index, onIndexChange, widt
         title: item?.title ?? "",
         width,
         children: item && (
-          <div className="exv-dialog-inner">
-            <header className="exv-dialog-head">
-              <h2 className="exv-dialog-title">{title}</h2>
-              <button type="button" className="exv-icon-button" onClick={() => onIndexChange(null)} aria-label={t("close")}>
+          <div className="exav-viewer-dialog-inner">
+            <header className="exav-viewer-dialog-head">
+              <h2 className="exav-viewer-dialog-title">{title}</h2>
+              <button type="button" className="exav-viewer-icon-button" onClick={() => onIndexChange(null)} aria-label={t("close")}>
                 <Close />
               </button>
             </header>
             {notice}
-            <div className="exv-frame">
+            <div className="exav-viewer-frame">
               <ViewerBody key={item.id} file={item} onPages={onPages} />
             </div>
-            <footer className="exv-dialog-foot">
-              <div className="exv-foot-left">
+            <footer className="exav-viewer-dialog-foot">
+              <div className="exav-viewer-foot-left">
                 {n > 1 && (
                   <>
-                    <button type="button" className="exv-icon-button" onClick={() => go(-1)} aria-label={t("prev")}>
+                    <button type="button" className="exav-viewer-icon-button" onClick={() => go(-1)} aria-label={t("prev")}>
                       <ChevronLeft />
                     </button>
-                    <button type="button" className="exv-icon-button" onClick={() => go(1)} aria-label={t("next")}>
+                    <button type="button" className="exav-viewer-icon-button" onClick={() => go(1)} aria-label={t("next")}>
                       <ChevronRight />
                     </button>
-                    <span className="exv-counter" aria-live="polite">
+                    <span className="exav-viewer-counter" aria-live="polite">
                       {t("counter", { current: (index ?? 0) + 1, total: n })}
                     </span>
                   </>
                 )}
                 {pages && pages.total > 1 && (
-                  <span className={`exv-counter exv-muted${n > 1 ? " exv-separated" : ""}`} aria-live="polite">
+                  <span className={`exav-viewer-counter exav-viewer-muted${n > 1 ? " exav-viewer-separated" : ""}`} aria-live="polite">
                     {t("page_of", pages)}
                   </span>
                 )}
               </div>
-              <div className="exv-foot-right">
+              <div className="exav-viewer-foot-right">
                 {actions?.(item)}
                 {canOpenInTab(url) && (
-                  <a className="exv-button exv-button-outline" href={url ?? ""} target="_blank" rel="noreferrer">
+                  <a className="exav-viewer-button exav-viewer-button-outline" href={url ?? ""} target="_blank" rel="noreferrer">
                     <External />
                     {t("open_in_tab")}
                   </a>
                 )}
                 {item.download?.resolveUrl ? (
-                  <button type="button" className="exv-button" disabled={saving} onClick={save}>
+                  <button type="button" className="exav-viewer-button" disabled={saving} onClick={save}>
                     {saving ? <Spinner /> : <Download />}
                     {t("download")}
                   </button>
                 ) : url ? (
-                  <a className="exv-button" href={url} download={item.download?.fileName ?? true}>
+                  <a className="exav-viewer-button" href={url} download={item.download?.fileName ?? true}>
                     <Download />
                     {t("download")}
                   </a>

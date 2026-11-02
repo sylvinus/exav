@@ -132,6 +132,66 @@ Upstream: https://github.com/akolman/EggDotNet
 Copyright (c) Andrew Kolman
 
 
+unshield and explode, MIT (source derivatives)
+----------------------------------------------
+
+src/formats/ishield_z.rs reads InstallShield .z tables of contents as the
+unshield crate 0.2.0 does, and src/formats/dcl_explode.rs decodes their PKWARE
+DCL "implode" members as the explode crate 0.1.2 does, a port of blast.c
+(below).
+
+Upstream: https://github.com/agrif/unshield, https://github.com/agrif/explode
+Copyright (c) 2020 Aaron Griffith
+
+
+cmpfs decmpfs decoder, MIT (source derivative)
+----------------------------------------------
+
+src/formats/decmpfs.rs, the decoder of the files macOS compresses (decmpfs) for
+HFS+ and APFS, follows cmpfs 0.1.0's reading of the attribute and of the
+resource fork (the types, the block tables, the stored-block markers), over
+exav's own codecs and with its own bounds. Used under the MIT License.
+
+Upstream: https://github.com/Dil4rd/dpp
+Copyright (c) 2026 Dil4rd
+
+
+Apple lzfse, BSD-3-Clause (source derivative)
+---------------------------------------------
+
+src/formats/lzfse.rs, the LZFSE and LZVN decoder of DMG runs, is a Rust port of
+the decoder of Apple's reference implementation, changed to decode a whole
+buffer into a capped one.
+
+Upstream: https://github.com/lzfse/lzfse
+Copyright (c) 2015-2016, Apple Inc. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder(s) nor the names of any
+   contributors may be used to endorse or promote products derived from this
+   software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
 AutoIt-Ripper, MIT (reference implementation)
 ---------------------------------------------
 
@@ -143,14 +203,22 @@ Upstream: https://github.com/nazywam/AutoIt-Ripper
 Copyright (c) nazywam and contributors
 
 
-NSIS format headers, zlib
--------------------------
+NSIS format headers and blast.c, zlib
+-------------------------------------
 
 src/formats/nsis.rs implements the installer layout from NSIS's format header
 Source/exehead/fileform.h.
 
 Upstream: https://github.com/kichik/nsis
 Copyright (c) Nullsoft and contributors
+
+src/formats/dcl_explode.rs keeps the algorithm and code-length tables of
+blast.c, through the explode port above, altered to decode a whole buffer.
+
+Upstream: https://github.com/madler/zlib/tree/master/contrib/blast
+Copyright (C) Mark Adler
+
+Each under these terms:
 
 This software is provided 'as-is', without any express or implied warranty.
 In no event will the authors be held liable for any damages arising from the
@@ -191,14 +259,23 @@ Copyright the sevenz-rust2 authors. Licensed under the Apache License, Version
 2.0 (text below).
 
 
-Public-domain sources, recorded for completeness
-------------------------------------------------
+Specifications and public-domain sources, recorded for completeness
+-------------------------------------------------------------------
 
 - src/formats/ppmd7/ is vendored and adapted from ppmd-rust 1.4.0
   (https://crates.io/crates/ppmd-rust), CC0-1.0 OR MIT-0.
 - src/formats/aplib.rs reproduces the bit and gamma readers of the reference
   depack.c from aPLib by Jørgen Ibsen, released free to use
   (https://ibsensoftware.com/products_aPLib.html).
+- The BIFF reader (src/formats/biff/) follows Microsoft's [MS-XLS] under the
+  Microsoft Open Specifications Promise, and, for BIFF2 to BIFF5 formula
+  tokens and the argument counts of the function table (ftab.rs),
+  OpenOffice.org's "Microsoft Excel File Format" documentation (Daniel Rentz,
+  Public Documentation License 1.0).
+- The DOS and Mac code page tables in src/formats/charset_tables.rs (the
+  ones encoding_rs does not have) are generated by scripts/codepages.py from
+  the mapping tables of Python's codecs, which are the Unicode Consortium's
+  published mappings.
 - The decode tables in src/formats/screnc.rs are the Microsoft Script Encoder
   constants as published in Didier Stevens' public-domain decode-vbe.py
   (https://blog.didierstevens.com/programs/).

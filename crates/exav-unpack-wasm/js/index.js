@@ -16,9 +16,11 @@ import init, {
   detectFormat,
   joinVolumes,
   isVolumePart,
+  volumeSet,
+  joinSet,
 } from "../pkg/exav_unpack_wasm.js";
 
-export { detectFormat, joinVolumes, isVolumePart };
+export { detectFormat, joinVolumes, isVolumePart, volumeSet, joinSet };
 
 /**
  * Instantiate the module, once.

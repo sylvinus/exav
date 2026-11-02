@@ -17,7 +17,7 @@
 
 use super::RestoreMethod;
 use crate::formats::ppmd7::common::*;
-use crate::formats::ppmd7::{RangeDec, TaggedOffset, SYM_END, SYM_ERROR};
+use crate::formats::ppmd7::{RangeDec, SYM_END, SYM_ERROR, TaggedOffset};
 
 // Context (12 bytes):
 //   num_stats:u8 @0 (symbol count - 1)  flags:u8 @1
@@ -151,9 +151,9 @@ impl<RC: RangeDec> Ppmd8<RC> {
 
         let align_offset = (4u32.wrapping_sub(mem_size)) & 3;
         let total_size = (align_offset as usize).checked_add(mem_size as usize)?;
-        let mut arena: Vec<u8> = Vec::new();
-        arena.try_reserve_exact(total_size).ok()?;
-        arena.resize(total_size, 0u8);
+        // Not touched to be made: see the PPMd7 arena.
+        Vec::<u8>::new().try_reserve_exact(total_size).ok()?;
+        let arena: Vec<u8> = vec![0u8; total_size];
 
         let mut ppmd = Self {
             min_context: 0,
@@ -1817,10 +1817,6 @@ impl<RC: RangeDec> Ppmd8<RC> {
 
     /// `sym`, unless the model went out of bounds while updating.
     fn finish_symbol(&self, sym: u8) -> i32 {
-        if self.corrupt {
-            SYM_ERROR
-        } else {
-            sym as i32
-        }
+        if self.corrupt { SYM_ERROR } else { sym as i32 }
     }
 }

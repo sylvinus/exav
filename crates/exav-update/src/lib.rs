@@ -269,23 +269,19 @@ fn fetch_into(
     let have_dest = dest.exists();
 
     // HEAD shortcut: unchanged validator -> no body transfer.
-    if have_dest {
-        if let Some(p) = prev {
-            if let Ok(head) = with_auth(agent.head(url)).call() {
-                if validator_of(&head).as_deref() == Some(p) {
-                    return Ok(Fetch::Unchanged {
-                        validator: Some(p.to_string()),
-                    });
-                }
-            }
-        }
+    if have_dest
+        && let Some(p) = prev
+        && let Ok(head) = with_auth(agent.head(url)).call()
+        && validator_of(&head).as_deref() == Some(p)
+    {
+        return Ok(Fetch::Unchanged {
+            validator: Some(p.to_string()),
+        });
     }
 
     let mut req = with_auth(agent.get(url));
-    if have_dest {
-        if let Some(p) = prev {
-            req = req.header(validator_header(p), p);
-        }
+    if have_dest && let Some(p) = prev {
+        req = req.header(validator_header(p), p);
     }
     let resp = req.call().map_err(|e| io::Error::other(e.to_string()))?;
     // ureq surfaces a 304 as `Ok`; treat it as unchanged.
@@ -304,12 +300,12 @@ fn fetch_into(
     // Refuse before allocating, not after. `Content-Length` was already parsed
     // and was previously only consulted once the whole body was in memory, so a
     // server declaring 4 GiB got 4 GiB read before anything objected.
-    if let Some(len) = expected {
-        if len > MAX_FETCH {
-            return Err(io::Error::other(format!(
-                "response declares {len} bytes, over the {MAX_FETCH}-byte cap"
-            )));
-        }
+    if let Some(len) = expected
+        && len > MAX_FETCH
+    {
+        return Err(io::Error::other(format!(
+            "response declares {len} bytes, over the {MAX_FETCH}-byte cap"
+        )));
     }
     let mut body = Vec::new();
     resp.into_body()
@@ -319,13 +315,13 @@ fn fetch_into(
     if body.len() as u64 > MAX_FETCH {
         return Err(io::Error::other("response exceeds size cap"));
     }
-    if let Some(len) = expected {
-        if body.len() as u64 != len {
-            return Err(io::Error::other(format!(
-                "truncated download: got {} of {len} bytes",
-                body.len()
-            )));
-        }
+    if let Some(len) = expected
+        && body.len() as u64 != len
+    {
+        return Err(io::Error::other(format!(
+            "truncated download: got {} of {len} bytes",
+            body.len()
+        )));
     }
     validate(&body).map_err(io::Error::other)?;
 
@@ -642,6 +638,22 @@ fn prune_empty_dirs(dir: &Path, is_root: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The version is written here and in exav-core, which this crate cannot
+    /// depend on: a bump in one only would make every download be refused, or
+    /// accepted and misread. Not checked from a package without the workspace.
+    #[test]
+    fn the_database_version_is_that_of_exav_core() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../exav-core/src/database.rs");
+        let Ok(core) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let line = core
+            .lines()
+            .find(|l| l.starts_with("const VERSION: u32 = "))
+            .expect("exav-core's database::VERSION");
+        assert_eq!(line, format!("const VERSION: u32 = {EXAV_DB_VERSION};"));
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

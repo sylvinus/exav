@@ -16,7 +16,7 @@
 //! the protocol's words (`OK`, `FOUND`, `ERROR` for a verdict that is partial):
 //! the daemon and the library are one scanner (`tests/suites/one_scan.rs`).
 use arbitrary::Arbitrary;
-use exav_core::{analyze, ScanOptions, VerdictCategory};
+use exav_core::{ScanOptions, VerdictCategory, analyze};
 use libfuzzer_sys::fuzz_target;
 
 #[path = "../db.rs"]
@@ -75,7 +75,12 @@ impl Stream {
         {
             return None;
         }
-        Some(self.chunks.iter().flat_map(|c| c.data.iter().copied()).collect())
+        Some(
+            self.chunks
+                .iter()
+                .flat_map(|c| c.data.iter().copied())
+                .collect(),
+        )
     }
 }
 
@@ -190,24 +195,26 @@ fuzz_target!(|data: &[u8]| {
     // A single stream, sent plainly: the daemon's answer is the library's.
     if let ([Command::Instream(s) | Command::ExInstream(s)], Session::None) =
         (connection.commands.as_slice(), &connection.session)
+        && let Some(bytes) = s.honest()
     {
-        if let Some(bytes) = s.honest() {
-            let want = status(analyze(db::scanner(), &bytes, &opts).verdict.category());
-            let reply = String::from_utf8_lossy(&out);
-            let reply = reply.trim_end_matches(['\n', '\0']);
-            let got = if matches!(connection.commands[0], Command::Instream(_)) {
-                reply.rsplit(' ').next().unwrap_or("")
-            } else {
-                // `{"v":1,"status":"OK"}`: the field's value.
-                reply
-                    .split("\"status\":\"")
-                    .nth(1)
-                    .and_then(|s| s.split('"').next())
-                    .unwrap_or("")
-            };
-            // The JSON says PARTIAL where the line says ERROR.
-            let got = if got == "PARTIAL" { "ERROR" } else { got };
-            assert_eq!(got, want, "the daemon said {reply:?} of bytes analyze calls {want}");
-        }
+        let want = status(analyze(db::scanner(), &bytes, &opts).verdict.category());
+        let reply = String::from_utf8_lossy(&out);
+        let reply = reply.trim_end_matches(['\n', '\0']);
+        let got = if matches!(connection.commands[0], Command::Instream(_)) {
+            reply.rsplit(' ').next().unwrap_or("")
+        } else {
+            // `{"v":1,"status":"OK"}`: the field's value.
+            reply
+                .split("\"status\":\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("")
+        };
+        // The JSON says PARTIAL where the line says ERROR.
+        let got = if got == "PARTIAL" { "ERROR" } else { got };
+        assert_eq!(
+            got, want,
+            "the daemon said {reply:?} of bytes analyze calls {want}"
+        );
     }
 });

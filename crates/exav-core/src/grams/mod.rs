@@ -31,11 +31,11 @@
 mod rarity;
 mod sweep;
 
-#[cfg(feature = "yara")]
-pub(crate) use rarity::structural;
 #[cfg(test)]
 pub(crate) use rarity::FILTER_MIN_BODIES;
-pub(crate) use rarity::{anchor_score, GramStats};
+#[cfg(feature = "yara")]
+pub(crate) use rarity::structural;
+pub(crate) use rarity::{GramStats, anchor_score};
 pub(crate) use sweep::sweep;
 #[cfg(test)]
 pub(crate) use sweep::{MIN_SKIP_RUN, NO_RUN_COLLAPSE, SWEEP_WINDOW};
@@ -737,8 +737,8 @@ impl Grams {
             };
             if !list.iter().all(fits)
                 || !list
-                    .windows(2)
-                    .all(|p| window(&pool, &p[0], w) <= window(&pool, &p[1], w))
+                    .array_windows()
+                    .all(|[a, b]| window(&pool, a, w) <= window(&pool, b, w))
             {
                 return Err(bad());
             }

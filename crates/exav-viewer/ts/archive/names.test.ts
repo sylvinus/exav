@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { decompressedName, STREAM_MEMBER } from "./names.js";
+import { decompressedName, folderOf, memberPath, STREAM_MEMBER } from "./names.js";
 
 describe("what a compressed stream's file is called", () => {
   // The names gunzip, bunzip2, unxz and unzstd give what they decompress.
@@ -16,6 +16,26 @@ describe("what a compressed stream's file is called", () => {
     expect(decompressedName("site.tgz", "gzip-content")).toBe("site.tar");
     expect(decompressedName("site.tbz2", "bzip2-content")).toBe("site.tar");
     expect(decompressedName("site.txz", "xz-content")).toBe("site.tar");
+    expect(decompressedName("site.tzst", "zstd-content")).toBe("site.tar");
+    expect(decompressedName("site.tlz", "lzip-content")).toBe("site.tar");
+    expect(decompressedName("site.tar.lzma", "lzma-content")).toBe("site.tar");
+    expect(decompressedName("notes.txt.lzma", "lzma-content")).toBe("notes.txt");
+    expect(decompressedName("site.taz", "lzw-content")).toBe("site.tar");
+    expect(decompressedName("site.tbz", "bzip2-content")).toBe("site.tar");
+  });
+
+  it("drops the suffix of the other compressions too", () => {
+    expect(decompressedName("dump.sql.lz4", "lz4-content")).toBe("dump.sql");
+    expect(decompressedName("dump.sql.lz", "lzip-content")).toBe("dump.sql");
+    expect(decompressedName("DUMP.SQL.Z", "lzw-content")).toBe("DUMP.SQL");
+  });
+
+  it("lists the members of a disk image or a help file as relative paths", () => {
+    expect(memberPath("/docs/index.html")).toBe("docs/index.html");
+    expect(memberPath("/test.txt")).toBe("test.txt");
+    expect(memberPath("docs/a.txt")).toBe("docs/a.txt");
+    expect(memberPath("\\a.txt")).toBe("a.txt");
+    expect(folderOf(memberPath("/docs/index.html"))).toBe("docs");
   });
 
   it("falls back when the name says nothing", () => {
@@ -24,7 +44,7 @@ describe("what a compressed stream's file is called", () => {
   });
 
   it("is told by the library's name for it, and only that", () => {
-    for (const n of ["gzip-content", "bzip2-content", "xz-content", "zstd-content", "lzip-content", "lz4-content", "lzw-content"]) {
+    for (const n of ["gzip-content", "bzip2-content", "xz-content", "zstd-content", "lzip-content", "lzma-content", "lz4-content", "lzw-content"]) {
       expect(STREAM_MEMBER.test(n), n).toBe(true);
     }
     for (const n of ["content", "gzip-content.txt", "docs/gzip-content", "zip-content"]) {

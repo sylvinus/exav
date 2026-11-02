@@ -377,7 +377,6 @@ fn every_flag_named_in_a_message_exists() {
         "max-depth",
         "password",
         // Removed from exav, named in the error that says what replaced it.
-        "max-extracted-bytes",
         "build-shard-bytes",
     ];
 
@@ -553,19 +552,18 @@ fn env_var_names_follow_the_documented_rule() {
     let mut wrong: Vec<String> = Vec::new();
     for line in help.lines() {
         let t = line.trim_start();
-        if line.len() != t.len() {
-            if let Some(rest) = t
+        if line.len() != t.len()
+            && let Some(rest) = t
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.strip_prefix("--"))
-            {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
-                    .collect();
-                if !name.is_empty() {
-                    current = Some(name);
-                }
+        {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+                .collect();
+            if !name.is_empty() {
+                current = Some(name);
             }
         }
         if let Some(rest) = t.strip_prefix("[env: ") {

@@ -11,6 +11,12 @@ export interface AssetManifest {
   };
   /** Single files, relative to `assetBase`, by name. */
   files: Record<string, string>;
+  /**
+   * The external converters copied (`externalConverter`), by package name:
+   * the path of the module each exports `convert` from, relative to
+   * `assetBase`.
+   */
+  converters?: Record<string, string>;
   /** Every file copied, relative to `assetBase`, for prefetching. */
   all: readonly string[];
 }

@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml" xmlns:wx="http://schemas.microsoft.com/office/word/2003/auxHint" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<w:styles><w:style w:type="paragraph" w:default="on" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="H1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style></w:styles>
+<w:body><wx:sect><wx:sub-section>
+<w:p><w:pPr><w:pStyle w:val="H1"/><w:jc w:val="center"/></w:pPr><w:r><w:t>Title</w:t></w:r></w:p>
+<w:p><w:r><w:rPr><w:i/><w:color w:val="0000FF"/></w:rPr><w:t>blue italic </w:t></w:r><w:hlink w:dest="https://example.org/"><w:r><w:t>link</w:t></w:r></w:hlink></w:p>
+<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="dxa"/></w:tblPr><w:tblGrid><w:gridCol w:w="2500"/><w:gridCol w:w="2500"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2500" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>c1</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="2500" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>c2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1000" w:left="1200" w:bottom="1000" w:right="1200" w:header="500" w:footer="500"/></w:sectPr>
+</wx:sub-section></wx:sect></w:body></w:wordDocument>

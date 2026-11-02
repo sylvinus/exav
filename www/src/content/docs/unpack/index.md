@@ -23,7 +23,7 @@ attacker picks the delivery format: ZIP with every method in common use, 7z,
 RAR3 and RAR5, tar, gzip, bzip2, xz, zstd, lzip, LZ4, Unix `compress`, CAB,
 ARJ, LHA, ZOO, ARC, ALZ, EGG, ISO 9660 and UDF, `ar`, cpio, xar, WIM, Apple
 DMG, virtual disks (VHD, VHDX, QCOW2, VMDK) reconstructed to the guest disk,
-with the NTFS, FAT and ext2/3/4 filesystems inside them walked for their
+with the filesystems inside them (NTFS, FAT, exFAT, ext2/3/4, HFS+, APFS) walked for their
 files, OLE2 and PDF documents, MIME email and TNEF, installers, UPX and other
 packed executables, and more.
 

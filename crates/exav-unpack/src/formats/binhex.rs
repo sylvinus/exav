@@ -272,7 +272,7 @@ mod tests {
         hdr.extend_from_slice(&0u16.to_be_bytes()); // headerCRC
         hdr.extend_from_slice(data); // data fork
         hdr.extend_from_slice(&0u16.to_be_bytes()); // data-fork CRC
-                                                    // rsrcLen == 0, so no resource fork bytes.
+        // rsrcLen == 0, so no resource fork bytes.
 
         // RLE90 identity (no 0x90 in `hdr` by construction), then 6-bit encode.
         let encoded = sixbit_encode(&hdr);

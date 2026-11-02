@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<key:presentation xmlns:key="http://developer.apple.com/namespaces/keynote2" xmlns:sf="http://developer.apple.com/namespaces/sf" xmlns:sfa="http://developer.apple.com/namespaces/sfa">
+ <key:size sfa:w="400" sfa:h="300"/>
+ <key:theme-list><key:theme sfa:ID="th"><key:stylesheet sfa:ID="ss"><sf:styles>
+  <sf:shape-style sfa:ID="fill" sf:ident="fill"><sf:property-map><sf:fill><sf:color sfa:r="0" sfa:g="1" sfa:b="0" sfa:a="1"/></sf:fill><sf:stroke><sf:stroke sf:width="2"><sf:color sfa:r="0" sfa:g="0" sfa:b="1" sfa:a="1"/><sf:pattern sf:type="solid"/></sf:stroke></sf:stroke></sf:property-map></sf:shape-style>
+  <sf:paragraphstyle sfa:ID="big" sf:ident="big"><sf:property-map><sf:fontSize><sf:number sfa:number="48"/></sf:fontSize><sf:fontName><sf:string sfa:string="Helvetica-Bold"/></sf:fontName></sf:property-map></sf:paragraphstyle>
+  <sf:paragraphstyle sfa:ID="small" sf:ident="small" sf:parent-ident="big"><sf:property-map><sf:fontSize><sf:number sfa:number="12"/></sf:fontSize></sf:property-map></sf:paragraphstyle>
+ </sf:styles></key:stylesheet></key:theme></key:theme-list>
+ <key:master-slide-list><key:master-slide sfa:ID="m1"><key:stylesheet sfa:ID="ssm"><sf:parent-ref sfa:IDREF="ss"/><sf:styles/></key:stylesheet><key:page><sf:layers><sf:layer><sf:type><sf:string sfa:string="BGMasterSlideLayer"/></sf:type><sf:drawables>
+  <sf:shape sfa:ID="ms"><sf:geometry><sf:size sfa:w="50" sfa:h="20"/><sf:position sfa:x="0" sfa:y="0"/></sf:geometry><sf:style><sf:shape-style-ref sfa:IDREF="fill"/></sf:style></sf:shape>
+ </sf:drawables></sf:layer></sf:layers></key:page></key:master-slide></key:master-slide-list>
+ <key:slide-list><key:slide sfa:ID="s1"><key:master-ref sfa:IDREF="m1"/><key:bullets><key:headline key:depth="0"><key:text><sf:text-storage><sf:stylesheet-ref sfa:IDREF="ss"/><sf:text-body><sf:p sf:style="big">Title<sf:br/></sf:p></sf:text-body></sf:text-storage></key:text></key:headline></key:bullets><key:page><sf:layers><sf:layer><sf:drawables>
+  <sf:shape sfa:ID="a"><sf:geometry><sf:size sfa:w="100" sfa:h="80"/><sf:position sfa:x="40" sfa:y="150"/></sf:geometry><sf:style><sf:shape-style-ref sfa:IDREF="fill"/></sf:style><sf:path><sf:bezier-path><sf:bezier sfa:path="M 0 0 L 100 0 C 100 40 100 60 100 80 Z"/></sf:bezier-path></sf:path><sf:text><sf:text-storage><sf:stylesheet-ref sfa:IDREF="ss"/><sf:text-body><sf:p sf:style="small">Hello<sf:br/>again<sf:span sf:style="big">!</sf:span><sf:br/></sf:p></sf:text-body></sf:text-storage></sf:text></sf:shape>
+  <sf:media sfa:ID="pic"><sf:geometry><sf:size sfa:w="200" sfa:h="100"/><sf:position sfa:x="150" sfa:y="150"/></sf:geometry><sf:crop-geometry><sf:size sfa:w="100" sfa:h="50"/><sf:position sfa:x="200" sfa:y="175"/></sf:crop-geometry><sf:content><sf:movie-media/></sf:content></sf:media>
+ </sf:drawables></sf:layer></sf:layers></key:page></key:slide></key:slide-list>
+</key:presentation>

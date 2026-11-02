@@ -11,7 +11,7 @@
 //!
 //! Usage: `cargo run --example dump_members --all-features -- <file> <outdir>`
 
-use exav_unpack::{detect, Budget, Limits, Member};
+use exav_unpack::{Budget, Limits, Member, detect};
 use std::path::PathBuf;
 
 fn main() {

@@ -12,14 +12,22 @@
 //! Bounded on any input: references are followed to a fixed depth (which
 //! also breaks reference cycles), every curve and surface is sampled with a
 //! fixed number of points per turn, booleans give up past a fixed amount of
-//! work, and all triangles made, kept or not, come out of one budget.
+//! work, and all triangles made, kept or not, come out of one budget. The
+//! evaluations of surfaces and curves that triangles do not count (boundary
+//! points projected on a surface, stations along an alignment, the edges of
+//! a loop) come out of another, `ops`.
 
+mod alignment;
 mod csg;
 mod curves;
+mod directrix;
+mod faces;
+mod grid;
 mod items;
 mod math;
 mod profiles;
 mod solids;
+mod spline;
 pub mod step;
 mod triangulate;
 
@@ -27,9 +35,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
-use self::math::{cross, unit, Xf, V3};
+use self::math::{V3, Xf, cross, unit};
 use self::step::{StepFile, Value};
-use super::mesh::{Element, Node, Part, Scene, SceneBuilder, Warnings, DEFAULT_MAX_TRIANGLES};
+use super::mesh::{DEFAULT_MAX_TRIANGLES, Element, Node, Part, Scene, SceneBuilder, Warnings};
 
 /// How much a reader may produce.
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +79,9 @@ pub(crate) type Color = [f32; 4];
 const MAX_DEPTH: u32 = 32;
 /// Deepest chain of object placements.
 const MAX_PLACEMENT_DEPTH: usize = 256;
+/// Most surface and curve evaluations in one file (about 500 operations
+/// each).
+const MAX_OPS: usize = 20_000_000;
 
 /// Triangles in `f64`, in some coordinate system.
 #[derive(Debug, Clone, Default)]
@@ -122,6 +133,109 @@ impl Mesh {
         }
     }
 
+    /// Whether the mesh has triangles and every edge of it is on exactly two,
+    /// which is what a solid is.
+    pub fn is_closed(&self) -> bool {
+        let mut edges: std::collections::HashMap<(u32, u32), u8> =
+            std::collections::HashMap::with_capacity(self.t.len() * 3 / 2 + 1);
+        for t in &self.t {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let n = edges.entry((a.min(b), a.max(b))).or_insert(0);
+                *n = n.saturating_add(1);
+            }
+        }
+        !edges.is_empty() && edges.values().all(|&n| n == 2)
+    }
+
+    /// Makes the triangles that share edges face the same way round, as the
+    /// faces of a shell written by a careless exporter do not, and then
+    /// turns every closed piece outward. A piece that is not closed keeps the
+    /// way its first triangle faces. Edges shared by other than two
+    /// triangles join nothing.
+    pub fn orient_consistently(&mut self) {
+        let n = self.t.len();
+        // Edge (low, high) -> the triangles on it and whether each runs it
+        // low to high.
+        let mut edges: std::collections::HashMap<(u32, u32), Vec<(u32, bool)>> =
+            std::collections::HashMap::with_capacity(n * 3 / 2 + 1);
+        for (i, t) in self.t.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                if a != b {
+                    edges
+                        .entry((a.min(b), a.max(b)))
+                        .or_default()
+                        .push((i as u32, a < b));
+                }
+            }
+        }
+        // Per triangle: the neighbours across its edges, with whether they
+        // must be turned when it is not.
+        let mut next: Vec<Vec<(u32, bool)>> = vec![Vec::new(); n];
+        let mut open = vec![false; n];
+        for users in edges.values() {
+            if let [(a, da), (b, db)] = users[..] {
+                // Two triangles agree when they run their edge in opposite ways.
+                let opposite = da != db;
+                next[a as usize].push((b, !opposite));
+                next[b as usize].push((a, !opposite));
+            } else {
+                for &(i, _) in users {
+                    open[i as usize] = true;
+                }
+            }
+        }
+        let mut turn = vec![None::<bool>; n];
+        let mut stack = Vec::new();
+        for seed in 0..n {
+            if turn[seed].is_some() {
+                continue;
+            }
+            turn[seed] = Some(false);
+            let mut members = vec![seed];
+            stack.push(seed);
+            while let Some(i) = stack.pop() {
+                let here = turn[i].unwrap_or(false);
+                for &(j, flips) in &next[i] {
+                    let j = j as usize;
+                    if turn[j].is_none() {
+                        turn[j] = Some(here != flips);
+                        members.push(j);
+                        stack.push(j);
+                    }
+                }
+            }
+            // A closed piece faces outward: six times its volume is positive.
+            let closed = members.iter().all(|&i| !open[i]);
+            if closed {
+                let volume: f64 = members
+                    .iter()
+                    .map(|&i| {
+                        let t = self.t[i];
+                        let (a, b, c) = (
+                            self.p[t[0] as usize],
+                            self.p[t[1] as usize],
+                            self.p[t[2] as usize],
+                        );
+                        let v = math::dot(a, cross(b, c));
+                        if turn[i] == Some(true) { -v } else { v }
+                    })
+                    .sum();
+                if volume < 0.0 {
+                    for &i in &members {
+                        turn[i] = turn[i].map(|x| !x);
+                    }
+                }
+            }
+        }
+        for (t, turn) in self.t.iter_mut().zip(&turn) {
+            if *turn == Some(true) {
+                t.swap(1, 2);
+            }
+        }
+    }
+
     pub fn bounds(&self) -> Option<(V3, V3)> {
         let mut lo = [f64::INFINITY; 3];
         let mut hi = [f64::NEG_INFINITY; 3];
@@ -157,6 +271,14 @@ pub(crate) struct Reader<'a> {
     /// the next one twice, thirty levels down, is four billion visits of
     /// thirty instances; the depth limit alone does not stop it.
     visits: usize,
+    /// Surface and curve evaluations still allowed, for the work that
+    /// triangles do not count: projecting boundary points on a surface,
+    /// sampling curves for a station.
+    ops: usize,
+    /// Axis -> grid, made when a grid placement first asks.
+    grids: Option<HashMap<u32, u32>>,
+    /// Multiplier of the chords a curve segment is sampled with.
+    density: usize,
     placements: HashMap<u32, Xf>,
     maps: HashMap<u32, Rc<Vec<Piece>>>,
     /// Item -> style, from `IfcStyledItem`.
@@ -179,6 +301,9 @@ impl<'a> Reader<'a> {
             warnings: Warnings::default(),
             work,
             visits: f.len().saturating_add(64).saturating_mul(64),
+            ops: f.len().saturating_add(64).saturating_mul(256).min(MAX_OPS),
+            grids: None,
+            density: 1,
             placements: HashMap::new(),
             maps: HashMap::new(),
             styled: HashMap::new(),
@@ -208,6 +333,12 @@ impl<'a> Reader<'a> {
     /// Takes one read of an item or profile from the visit budget.
     pub fn visit(&mut self) -> Option<()> {
         self.visits = self.visits.checked_sub(1)?;
+        Some(())
+    }
+
+    /// Takes `n` evaluations from the evaluation budget.
+    pub fn charge(&mut self, n: usize) -> Option<()> {
+        self.ops = self.ops.checked_sub(n)?;
         Some(())
     }
 
@@ -432,24 +563,36 @@ impl<'a> Reader<'a> {
                 b"IFCLOCALPLACEMENT" => {
                     (p.first().and_then(Value::id), self.axis2(p.get(1)?.id()?)?)
                 }
-                // IFC4X3: the placement along an alignment, with its
-                // Cartesian equivalent precomputed by the writer.
-                b"IFCLINEARPLACEMENT" => (
-                    p.first().and_then(Value::id),
-                    p.get(2)
+                // IFC4X3: the placement along an alignment. The writer's
+                // Cartesian equivalent is used when it has one, else the
+                // placement is worked out along the curve.
+                b"IFCLINEARPLACEMENT" => {
+                    let local = p
+                        .get(2)
                         .and_then(Value::id)
                         .and_then(|c| self.axis2(c))
-                        .unwrap_or(Xf::IDENTITY),
-                ),
-                b"IFCGRIDPLACEMENT" => {
-                    self.unsupported(ty);
-                    let parent = if self.f.schema == step::Schema::Ifc4x3 {
-                        p.first().and_then(Value::id)
-                    } else {
-                        None
-                    };
-                    (parent, Xf::IDENTITY)
+                        .or_else(|| {
+                            p.get(1)
+                                .and_then(Value::id)
+                                .and_then(|r| self.axis2_linear(r))
+                        });
+                    if local.is_none() {
+                        self.unsupported(ty);
+                    }
+                    (p.first().and_then(Value::id), local.unwrap_or(Xf::IDENTITY))
                 }
+                b"IFCGRIDPLACEMENT" => match self.grid_placement(&p) {
+                    Some(placed) => placed,
+                    None => {
+                        self.unsupported(ty);
+                        let parent = if self.f.schema == step::Schema::Ifc4x3 {
+                            p.first().and_then(Value::id)
+                        } else {
+                            None
+                        };
+                        (parent, Xf::IDENTITY)
+                    }
+                },
                 _ => return None,
             };
             chain.push((pid, local));
@@ -763,6 +906,8 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
 
     // The spatial tree, from the project down.
     let mut node_of: HashMap<u32, u32> = HashMap::new();
+    // Per node, the storey it is or lies in; parents come first.
+    let mut storey_of_node: Vec<Option<u32>> = Vec::new();
     let mut stack: Vec<(u32, Option<u32>)> = f.of_type(b"IFCPROJECT").map(|p| (p, None)).collect();
     stack.reverse();
     while let Some((id, parent)) = stack.pop() {
@@ -774,11 +919,25 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
             continue;
         }
         let index = out.scene.nodes.len() as u32;
+        let is_storey = ty == b"IFCBUILDINGSTOREY";
+        // IfcBuildingStorey.Elevation follows the nine attributes of
+        // IfcSpatialStructureElement.
+        let elevation = p
+            .get(9)
+            .and_then(Value::num)
+            .map(|e| e * r.length)
+            .filter(|e| is_storey && e.is_finite());
         out.scene.nodes.push(Node {
             id,
             class: String::from_utf8_lossy(ty).into_owned(),
             name: p.get(2).and_then(Value::text).unwrap_or_default(),
             parent,
+            elevation,
+        });
+        storey_of_node.push(if is_storey {
+            Some(index)
+        } else {
+            parent.and_then(|q| storey_of_node[q as usize])
         });
         node_of.insert(id, index);
         if let Some(kids) = children.get(&id) {
@@ -788,11 +947,15 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
         }
     }
 
-    // Products: GlobalId first, a product definition shape in seventh place.
+    // Products: GlobalId first (some exporters leave it null), a product
+    // definition shape in seventh place.
     let mut origin: Option<V3> = None;
+    // Alignments are axes, curves, which are not drawn.
+    let mut alignments = 0u32;
     for &id in &ids {
         let Some(raw) = f.raw(id) else { continue };
-        if !raw.trim_ascii_start().starts_with(b"'") || !raw.contains(&b'#') {
+        let raw_start = raw.trim_ascii_start();
+        if !(raw_start.starts_with(b"'") || raw_start.starts_with(b"$")) || !raw.contains(&b'#') {
             continue;
         }
         let Some((ty, p)) = r.get(id) else { continue };
@@ -816,6 +979,7 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
             .and_then(|m| r.material_color(m, &material_reps, 0));
         let mut pieces = r.product(shape);
         if pieces.is_empty() {
+            alignments += u32::from(ty == b"IFCALIGNMENT");
             continue;
         }
         if let Some(openings) = voids.get(&id) {
@@ -869,11 +1033,18 @@ pub fn read(bytes: &[u8], limits: &Limits) -> Result<Scene, Error> {
             class,
             name: p.get(2).and_then(Value::text).unwrap_or_default(),
             node,
+            storey: node.and_then(|n| storey_of_node[n as usize]),
             ranges: Vec::new(),
         };
         out.add(element, parts);
     }
     out.scene.origin = origin.unwrap_or([0.0; 3]);
+    // A model of nothing else would show nothing and say nothing.
+    if out.scene.elements.is_empty() {
+        for _ in 0..alignments {
+            r.unsupported(b"IFCALIGNMENT");
+        }
+    }
     let mut warnings = r.warnings;
     warnings.truncated = warnings
         .truncated

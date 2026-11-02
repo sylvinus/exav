@@ -4,7 +4,9 @@
  */
 import type { PDFDocumentProxy } from "pdfjs-dist";
 
-import type { ByteRanges } from "../core/types.js";
+import { throwIfAborted } from "../core/pictures.js";
+import { bitmapOf, createCanvas, release } from "../core/raster.js";
+import type { ByteRanges, RasterRect } from "../core/types.js";
 import { linkTarget } from "../frame/protocol.js";
 import { pdfjsAssetDir, pdfjsWasmDir } from "./assets.js";
 
@@ -63,6 +65,13 @@ export interface LoadedPdf {
   pageAspect(page: number): Promise<number>;
   /** The page at `scale`, on white, as PNG. The canvas is freed at once. */
   renderPageToBlob(page: number, scale: number): Promise<Blob>;
+  /**
+   * `region` of the page (fractions of it, which may reach past its edges)
+   * drawn as a picture of `width` by `height` px on `background` (a CSS
+   * colour; transparent where the page draws nothing and it is transparent).
+   * Stops quietly-by-rejection when `signal` aborts.
+   */
+  renderPageRegion(page: number, view: { width: number; height: number; region: RasterRect; background: string; signal?: AbortSignal }): Promise<ImageBitmap>;
   /**
    * Draws `page` into `canvas` as if it were `cssWidth` CSS pixels wide, at
    * `renderDpr()`; with `region`, only that part (CSS pixels of the page at
@@ -260,6 +269,33 @@ function wrap(doc: PDFDocumentProxy, pdfjs: Pdfjs): LoadedPdf {
       } finally {
         canvas.width = 0;
         canvas.height = 0;
+      }
+    },
+    async renderPageRegion(n, { width, height, region, background, signal }) {
+      throwIfAborted(signal);
+      const page = await doc.getPage(n);
+      const natural = page.getViewport({ scale: 1 });
+      // Whole pixels were chosen for the picture; the scale makes the region fill them.
+      const scale = width / (region.width * natural.width);
+      const viewport = page.getViewport({
+        scale,
+        offsetX: -region.x * natural.width * scale,
+        offsetY: -region.y * natural.height * scale,
+      });
+      const { canvas } = createCanvas(width, height, true);
+      try {
+        throwIfAborted(signal);
+        const task = page.render({ canvas: canvas as HTMLCanvasElement, viewport, background });
+        const stop = () => task.cancel();
+        signal?.addEventListener("abort", stop, { once: true });
+        try {
+          await task.promise;
+        } finally {
+          signal?.removeEventListener("abort", stop);
+        }
+        return await bitmapOf(canvas);
+      } finally {
+        release(canvas);
       }
     },
     renderPageTo(canvas, n, cssWidth, region) {

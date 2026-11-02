@@ -1,5 +1,5 @@
 //! `image` 0.25.9's JPEG decoder (`src/codecs/jpeg/decoder.rs`), over
-//! zune-jpeg 0.5.8 built without its SIMD code: see `README.md`. Only what
+//! zune-jpeg 0.5.15 built without its SIMD code: see `README.md`. Only what
 //! decoding uses is kept, and the input is borrowed where upstream copies it.
 
 use image::error::{

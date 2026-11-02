@@ -4,6 +4,7 @@
 // work and nobody's data. The Playwright setup runs it.
 //
 //     node e2e/fixtures/make-samples.mjs
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -286,7 +287,8 @@ function pptx() {
     ["ppt/slides/_rels/slide2.xml.rels", relsOf([["rId1", "slideLayout", "../slideLayouts/slideLayout1.xml"]])],
   ]);
 }
-function xlsx() {
+/** `notes`: a second sheet, "Notes", after "Quote". */
+function xlsx({ notes = false } = {}) {
   const rows = [
     ["Item", "Quantity", "Unit price", "Total"],
     ["Render", 120, 18.5, 2220],
@@ -297,14 +299,18 @@ function xlsx() {
     const ref = `${"ABCD"[c]}${r + 1}`;
     return typeof v === "number" ? `<c r="${ref}"><v>${v}</v></c>` : `<c r="${ref}" t="inlineStr"><is><t>${v}</t></is></c>`;
   };
-  const sheet = rows.map((row, r) => `<row r="${r + 1}">${row.map((v, c) => cell(v, r, c)).join("")}</row>`).join("");
+  const sheetData = (data) => data.map((row, r) => `<row r="${r + 1}">${row.map((v, c) => cell(v, r, c)).join("")}</row>`).join("");
+  const sheet = sheetData(rows);
   const REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const WORKSHEET = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+  const worksheet = (data) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="22" customWidth="1"/><col min="2" max="4" width="12" customWidth="1"/></cols><sheetData>${data}</sheetData></worksheet>`;
   return zip([
-    ["[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`],
+    ["[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="${WORKSHEET}"/>${notes ? `<Override PartName="/xl/worksheets/sheet2.xml" ContentType="${WORKSHEET}"/>` : ""}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`],
     ["_rels/.rels", rels("xl/workbook.xml", "officeDocument")],
-    ["xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="${REL}"><sheets><sheet name="Quote" sheetId="1" r:id="rId1"/></sheets></workbook>`],
-    ["xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${REL}/styles" Target="styles.xml"/></Relationships>`],
-    ["xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="22" customWidth="1"/><col min="2" max="4" width="12" customWidth="1"/></cols><sheetData>${sheet}</sheetData></worksheet>`],
+    ["xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="${REL}"><sheets><sheet name="Quote" sheetId="1" r:id="rId1"/>${notes ? '<sheet name="Notes" sheetId="2" r:id="rId3"/>' : ""}</sheets></workbook>`],
+    ["xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${REL}/styles" Target="styles.xml"/>${notes ? `<Relationship Id="rId3" Type="${REL}/worksheet" Target="worksheets/sheet2.xml"/>` : ""}</Relationships>`],
+    ["xl/worksheets/sheet1.xml", worksheet(sheet)],
+    ...(notes ? [["xl/worksheets/sheet2.xml", worksheet(sheetData([["Note"], ["Access by the north gate"]]))]] : []),
     ["xl/styles.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Arial"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>`],
   ]);
 }
@@ -331,6 +337,151 @@ function stl() {
   quad(r(40, 0, 25), r(40, 30, 25), r(20, 30, 40), r(20, 0, 40));
   const f = (n) => n.toFixed(4);
   return `solid house\n${facets.map((t) => `facet normal 0 0 0\n outer loop\n${t.map((v) => `  vertex ${v.map(f).join(" ")}`).join("\n")}\n endloop\nendfacet`).join("\n")}\nendsolid house\n`;
+}
+
+// ── OBJ, PLY, glTF: the same house, in two parts, Y up ─────────────────────
+// Thirty triangles as the STL has: the main part's 18 and the annex's 12,
+// written as the polygons they are drawn from.
+const ANNEX_AT = [40, 0, -5];
+function houseParts({ local = false } = {}) {
+  const up = (x, y, z) => [x, z, -y];
+  const box = (x0, y0, z0, x1, y1, z1) => {
+    const v = [[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]].map((p) => up(...p));
+    return [[v[0], v[3], v[2], v[1]], [v[4], v[5], v[6], v[7]], [v[0], v[1], v[5], v[4]], [v[1], v[2], v[6], v[5]], [v[2], v[3], v[7], v[6]], [v[3], v[0], v[4], v[7]]];
+  };
+  const r = up;
+  const gable = [
+    [r(0, 0, 25), r(40, 0, 25), r(20, 0, 40)],
+    [r(0, 30, 25), r(20, 30, 40), r(40, 30, 25)],
+    [r(0, 0, 25), r(20, 0, 40), r(20, 30, 40), r(0, 30, 25)],
+    [r(40, 0, 25), r(40, 30, 25), r(20, 30, 40), r(20, 0, 40)],
+  ];
+  const annex = box(40, 5, 0, 60, 25, 15);
+  const shift = (polygons) => polygons.map((poly) => poly.map((p) => p.map((v, k) => v - ANNEX_AT[k])));
+  return [
+    { name: "main", color: [0.85, 0.6, 0.4], polygons: [...box(0, 0, 0, 40, 30, 25), ...gable] },
+    { name: "annex", color: [0.4, 0.6, 0.85], polygons: local ? shift(annex) : annex },
+  ];
+}
+
+/** Vertices shared inside a part, and each polygon as indices into them. */
+function indexed(parts) {
+  const vertices = [];
+  const faces = [];
+  parts.forEach((part, p) => {
+    const seen = new Map();
+    for (const polygon of part.polygons) {
+      faces.push({ part: p, ids: polygon.map((v) => {
+        const key = v.join(",");
+        if (!seen.has(key)) {
+          seen.set(key, vertices.length);
+          vertices.push({ v, part: p });
+        }
+        return seen.get(key);
+      }) });
+    }
+  });
+  return { vertices, faces };
+}
+
+function obj() {
+  const parts = houseParts();
+  const { vertices, faces } = indexed(parts);
+  const lines = ["# exav sample: a small house, Y up", "mtllib house.mtl", "o house"];
+  for (const { v } of vertices) lines.push(`v ${v.join(" ")}`);
+  parts.forEach((part, p) => {
+    lines.push(`g ${part.name}`, `usemtl ${part.name}`);
+    for (const f of faces.filter((f) => f.part === p)) lines.push(`f ${f.ids.map((i) => i + 1).join(" ")}`);
+  });
+  return lines.join("\n") + "\n";
+}
+
+function ply() {
+  const parts = houseParts();
+  const { vertices, faces } = indexed(parts);
+  const header = `ply\nformat binary_little_endian 1.0\ncomment exav sample: a small house, Y up\nelement vertex ${vertices.length}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nelement face ${faces.length}\nproperty list uchar int vertex_indices\nend_header\n`;
+  const body = Buffer.alloc(vertices.length * 15 + faces.reduce((n, f) => n + 1 + 4 * f.ids.length, 0));
+  let at = 0;
+  for (const { v, part } of vertices) {
+    for (const c of v) at = body.writeFloatLE(c, at);
+    for (const c of parts[part].color) at = body.writeUInt8(Math.round(c * 255), at);
+  }
+  for (const f of faces) {
+    at = body.writeUInt8(f.ids.length, at);
+    for (const i of f.ids) at = body.writeInt32LE(i, at);
+  }
+  return Buffer.concat([Buffer.from(header), body]);
+}
+
+/** The glTF document and its binary buffer; the annex is a node of its own, moved. */
+function gltfParts() {
+  const parts = houseParts({ local: true });
+  const chunks = [];
+  const views = [];
+  const accessors = [];
+  const meshes = [];
+  let length = 0;
+  const add = (data, target) => {
+    views.push({ buffer: 0, byteOffset: length, byteLength: data.length, target });
+    chunks.push(data);
+    length += data.length;
+    return views.length - 1;
+  };
+  parts.forEach((part) => {
+    const { vertices, faces } = indexed([part]);
+    const positions = Buffer.alloc(vertices.length * 12);
+    vertices.forEach(({ v }, i) => v.forEach((c, k) => positions.writeFloatLE(c, i * 12 + k * 4)));
+    const triangles = faces.flatMap((f) => f.ids.slice(2).map((_, k) => [f.ids[0], f.ids[k + 1], f.ids[k + 2]])).flat();
+    const indices = Buffer.alloc(triangles.length * 2);
+    triangles.forEach((i, k) => indices.writeUInt16LE(i, k * 2));
+    const lo = [0, 1, 2].map((k) => Math.min(...vertices.map(({ v }) => v[k])));
+    const hi = [0, 1, 2].map((k) => Math.max(...vertices.map(({ v }) => v[k])));
+    accessors.push({ bufferView: add(positions, 34962), componentType: 5126, count: vertices.length, type: "VEC3", min: lo, max: hi });
+    accessors.push({ bufferView: add(indices, 34963), componentType: 5123, count: triangles.length, type: "SCALAR" });
+    meshes.push({ name: part.name, primitives: [{ attributes: { POSITION: accessors.length - 2 }, indices: accessors.length - 1, material: meshes.length }] });
+    if (indices.length % 4) chunks.push(Buffer.alloc(4 - (indices.length % 4))), (length += 4 - (indices.length % 4));
+  });
+  const bin = Buffer.concat(chunks);
+  const json = {
+    asset: { version: "2.0", generator: "exav test samples" },
+    scene: 0,
+    scenes: [{ nodes: [0, 1] }],
+    nodes: [
+      { name: "main", mesh: 0 },
+      { name: "annex", mesh: 1, translation: ANNEX_AT },
+    ],
+    meshes,
+    materials: parts.map((p) => ({ pbrMetallicRoughness: { baseColorFactor: [...p.color.map((c) => c ** 2.2), 1] } })),
+    accessors,
+    bufferViews: views,
+    buffers: [{ byteLength: bin.length }],
+  };
+  return { json, bin };
+}
+
+function glb() {
+  const { json, bin } = gltfParts();
+  const text = Buffer.from(JSON.stringify(json));
+  const jsonChunk = Buffer.concat([text, Buffer.alloc((4 - (text.length % 4)) % 4, 0x20)]);
+  const binChunk = Buffer.concat([bin, Buffer.alloc((4 - (bin.length % 4)) % 4)]);
+  const head = Buffer.alloc(12);
+  head.write("glTF", 0);
+  head.writeUInt32LE(2, 4);
+  head.writeUInt32LE(12 + 8 + jsonChunk.length + 8 + binChunk.length, 8);
+  const chunk = (type, data) => {
+    const h = Buffer.alloc(8);
+    h.writeUInt32LE(data.length, 0);
+    h.writeUInt32LE(type, 4);
+    return Buffer.concat([h, data]);
+  };
+  return Buffer.concat([head, chunk(0x4e4f534a, jsonChunk), chunk(0x004e4942, binChunk)]);
+}
+
+/** The same house with its buffer embedded, or, when `external`, left in a file that is not fetched. */
+function gltf({ external = false } = {}) {
+  const { json, bin } = gltfParts();
+  json.buffers = [{ byteLength: bin.length, uri: external ? "house.bin" : `data:application/octet-stream;base64,${bin.toString("base64")}` }];
+  return JSON.stringify(json, null, 1);
 }
 
 // ── WAV: a two-second chime ─────────────────────────────────────────────────
@@ -423,15 +574,136 @@ write("landscape.png", png(px));
 write("landscape.tif", tiff(px));
 write("quote.csv", "Item;Quantity;Unit price;Total\nRender;120;18,50;2220,00\nGutter joint;1;95,00;95,00\nHandrail fixings;12;4,20;50,40\n");
 write("notes.docx", docx());
+// Text: Markdown with a link, a hostile Markdown, JSON with a number a parse would round, XML, UTF-16, a binary named .txt, a file past the size limit.
+write("notes.txt", "Site visit, north facade\n\tRender cracked above the windows.\n\nNext visit: Monday <b>not bold</b> & more\n");
+write(
+  "survey.md",
+  [
+    "# Site survey",
+    "",
+    "The **north facade** needs *repointing*; see the [guide](https://example.com/guide).",
+    "",
+    "- render",
+    "- gutter joint",
+    "  - north-east corner",
+    "",
+    "| Item | Qty |",
+    "|:-----|----:|",
+    "| Render | 120 |",
+    "",
+    "```",
+    "make survey",
+    "```",
+    "",
+  ].join("\n"),
+);
+write(
+  "hostile.md",
+  [
+    "# Hostile <img src=x onerror=\"document.title='pwned'\">",
+    "",
+    "<script>document.title = 'pwned'</script>",
+    "",
+    "[run](javascript:document.title='pwned') and [data](data:text/html,x) and [relative](/etc/passwd)",
+    "",
+    "![tracker](https://evil.example/pixel.png)",
+    "",
+    "<iframe src=\"https://evil.example/frame\"></iframe>",
+    "",
+    "Safe: [site](https://example.com/site)",
+    "",
+  ].join("\n"),
+);
+write("data.json", '{"id":12345678901234567890,"price":1.10,"items":[{"name":"render","qty":120},{"name":"gutter","qty":1}],"empty":{}}');
+write("feed.xml", '<?xml version="1.0"?><feed><entry id="1"><title>Render</title><summary>Cracked &amp; loose</summary></entry><entry id="2"/></feed>');
+{
+  const text = "Zażółć gęślą jaźń\nsecond line\n";
+  const body = Buffer.alloc(text.length * 2);
+  for (let i = 0; i < text.length; i++) body.writeUInt16LE(text.charCodeAt(i), i * 2);
+  write("utf16.txt", Buffer.concat([Buffer.from([0xff, 0xfe]), body]));
+}
+write("photo.txt", png(px));
+write("page.html", '<!doctype html><html><body onload="document.title=\'pwned\'"><script src="https://evil.example/x.js"></script><img src="https://evil.example/p.png"><p>Hello</p></body></html>');
+write("fix.patch", "--- a/walls.txt\n+++ b/walls.txt\n@@ -1,2 +1,2 @@\n north\n-cracked\n+repointed\n");
+write("huge.log", Array.from({ length: 120_000 }, (_, i) => `line ${i + 1}: inspection entry for the north facade`).join("\n") + "\n");
 write("visit.pptx", pptx());
 write("quote.xlsx", xlsx());
+write("book.xlsx", xlsx({ notes: true }));
+// An SVG with only a viewBox, a script and an image from elsewhere: drawn, neither run nor fetched.
+write(
+  "logo.svg",
+  '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 200 100"><script>parent.postMessage("pwned", "*")</script><rect width="200" height="100" fill="#0a7"/><circle cx="100" cy="50" r="30" fill="#fff"/><image href="https://evil.example/p.png" width="10" height="10"/></svg>',
+);
 write("house.stl", stl());
+write("house.obj", obj());
+write("house.ply", ply());
+write("house.glb", glb());
+write("house.gltf", gltf());
+// Files that must show the error state: a glTF whose buffer is another file,
+// a PLY with no faces, an OBJ that is a binary file.
+write("external.gltf", gltf({ external: true }));
+// Its buffer: given beside it, the model is drawn.
+write("house.bin", gltfParts().bin);
+write("cloud.ply", "ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n1 0 0\n0 1 0\n");
+write("object.obj", Buffer.from([0x4c, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2e, 0x74, 0x65, 0x78, 0x74, 0x00, 0x00, 0x00]));
 write("chime.wav", wav());
 write("house.ifc", ifc());
 write("stray.ifc", ifc({ stray: true }));
 const plan = fs.readFileSync(path.join(here, "plan.dwg"));
 write("plan.dxf", fs.readFileSync(path.join(here, "plan.dxf")));
 write("plan.dwg", plan);
+// exav-render's drawings of what the renderer draws its own way (cad.spec.ts),
+// generated by its tests/fixtures/dwg/make.py.
+const engineDrawings = path.join(here, "..", "..", "..", "exav-render", "tests", "fixtures", "dwg");
+for (const name of ["wide", "sheets", "viewport_text", "transparency", "not_drawn", "solid_only", "text_many", "halo", "circle", "colours", "xref_sheet", "xref_title", "xref_part", "wipeout_triangle"]) {
+  write(`cad-${name}.dxf`, zlib.gunzipSync(fs.readFileSync(path.join(engineDrawings, `${name}.dxf.gz`))));
+}
+// Split archives (volumes.spec.ts): RAR sets written by the official tool
+// (exav-unpack's fixtures; their members are noise.bin and text.txt), a ZIP cut
+// in two at a byte, and, where `zip` exists, one it spans over three files.
+const rarSets = path.join(here, "..", "..", "..", "exav-unpack", "tests", "fixtures", "rar_volumes");
+for (const f of fs.readdirSync(rarSets)) write(f, fs.readFileSync(path.join(rarSets, f)));
+const pair = zip([
+  ["one.txt", "hello"],
+  ["two.txt", "world"],
+]);
+write("docs.zip.001", pair.subarray(0, pair.length >> 1));
+write("docs.zip.002", pair.subarray(pair.length >> 1));
+{
+  const scratch = fs.mkdtempSync(path.join(out, "span-"));
+  try {
+    // Incompressible, so that three parts come of it.
+    let x = 0x9e3779b9;
+    const big = Buffer.alloc(300_000).map(() => ((x = (Math.imul(x, 1664525) + 1013904223) >>> 0), x >>> 24));
+    fs.writeFileSync(path.join(scratch, "big.bin"), big);
+    fs.writeFileSync(path.join(scratch, "small.txt"), "hello\n");
+    execFileSync("zip", ["-q", "-s", "100k", "span.zip", "big.bin", "small.txt"], { cwd: scratch, stdio: "ignore" });
+    for (const f of ["span.z01", "span.z02", "span.zip"]) write(f, fs.readFileSync(path.join(scratch, f)));
+  } catch {
+    console.warn("no zip: the spanned ZIP sample is not written");
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
+// A drawing and the files it refers to, in an archive (cad.spec.ts): the
+// references are found among the members, below the drawing's own folder.
+write(
+  "project.zip",
+  zip([
+    ["plans/sheet.dxf", fs.readFileSync(path.join(out, "cad-xref_sheet.dxf"))],
+    ["plans/xrefs/title.dwg", fs.readFileSync(path.join(out, "cad-xref_title.dxf"))],
+    ["plans/xrefs/part.dwg", fs.readFileSync(path.join(out, "cad-xref_part.dxf"))],
+  ]),
+);
+// A glTF and the buffer it names, in an archive (meshes.spec.ts): in folders,
+// the buffer below the document's own.
+write(
+  "models.zip",
+  zip([
+    ["models/scene.gltf", gltf({ external: true }).replace('"house.bin"', '"data/house.bin"')],
+    ["models/data/house.bin", gltfParts().bin],
+  ]),
+);
 const inner = zip([["photos/landscape.tif", tiff(px)]]);
 write(
   "delivery.zip",

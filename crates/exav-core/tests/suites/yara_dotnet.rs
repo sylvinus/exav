@@ -24,7 +24,7 @@
 //! field offsets, 22 assembly refs — which is too large to commit;
 //! `scripts/yara-dotnet-difftest.sh` reproduces that run.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
 fn fixture() -> Vec<u8> {
     let p = format!(

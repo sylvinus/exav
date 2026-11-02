@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Build the WebAssembly modules into wasm/: exav_viewer_image (raster
-# decoders), exav_viewer_dwg (DWG and DXF) and exav_viewer_model (IFC and
-# STL), and the two decoders pdf.js
+# decoders), exav_viewer_dwg (DWG and DXF) and exav_viewer_model (IFC, STL,
+# OBJ, PLY and glTF), exav_viewer_text (Markdown), exav_viewer_sheets (XLS,
+# ODS and Numbers to XLSX), exav_viewer_slides (PPT, ODP, Keynote, ODG and
+# VSDX to PPTX), exav_viewer_docs (DOC, ODT, RTF and Pages to DOCX), and the
+# two decoders pdf.js
 # loads in place of its C and C++ ones, each embedded in its fallback module
 # (openjpeg_nowasm_fallback.js, jbig2_nowasm_fallback.js; see
 # build-pdf-decoders.mjs). Needs the wasm32-unknown-unknown target and
@@ -37,18 +40,31 @@ optimise() {
 #   at 1.2 GiB.
 # - model: 3 GiB. The file, its index, and the meshes twice (the scene and
 #   the buffers handed over) for the default 6 million triangles fit in 1.5.
+# - text: 256 MiB. A file read is at most 2 MiB; its tree is bounded at
+#   100000 nodes and is written out once as JSON.
+# - sheets: 2 GiB. The file, and the workbook and the XLSX the converter
+#   counts against its own limit (1 GiB by default, ts/office/sheets.ts).
+# - slides: 2 GiB. The file, and the presentation and the PPTX the
+#   converter counts against its own limit (1 GiB by default,
+#   ts/office/slides.ts).
+# - docs: 2 GiB. The file, and the document and the DOCX the converter
+#   counts against its own limit (1 GiB by default, ts/office/docs.ts).
 # - pdf-jpx, pdf-jbig2: 1 GiB for one image of a PDF.
 cap() {
   case "$1" in
+    text) echo $((256 * 1024 * 1024)) ;;
     image) echo $((1024 * 1024 * 1024)) ;;
     dwg) echo $((2048 * 1024 * 1024)) ;;
+    sheets) echo $((2048 * 1024 * 1024)) ;;
+    slides) echo $((2048 * 1024 * 1024)) ;;
+    docs) echo $((2048 * 1024 * 1024)) ;;
     model) echo $((3072 * 1024 * 1024)) ;;
     pdf-jpx | pdf-jbig2) echo $((1024 * 1024 * 1024)) ;;
   esac
 }
 
 mkdir -p "$OUT" "$PDF"
-for feature in image dwg model pdf-jpx pdf-jbig2; do
+for feature in image dwg model text sheets slides docs pdf-jpx pdf-jbig2; do
   # The cdylib's file has no hash in its name, so every feature writes the
   # same one, and a feature cargo finds up to date would leave the module
   # another feature built last: it is removed, so that it is linked again.

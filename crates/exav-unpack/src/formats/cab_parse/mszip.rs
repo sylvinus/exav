@@ -19,15 +19,32 @@ impl MsZipDecompressor {
         }
     }
 
+    /// Decode one CFDATA block. `cut`: the file ended inside the block, so
+    /// `data` is what was there of it.
+    ///
+    /// What came out before a failure is returned with it, so that a block
+    /// damaged or cut part way keeps its decoded start. Once a block has
+    /// failed the history the next one needs is wrong: the caller stops.
     pub(crate) fn decompress_block(
         &mut self,
         data: &[u8],
         uncompressed_size: usize,
-    ) -> io::Result<Vec<u8>> {
-        if data.len() < MSZIP_SIGNATURE_LEN
-            || ((data[0] as u16) | ((data[1] as u16) << 8)) != MSZIP_SIGNATURE
-        {
-            invalid_data!("MSZIP decompression failed: Invalid block signature");
+        cut: bool,
+    ) -> super::ctype::Decoded {
+        use super::ctype::Decoded;
+        let eof = |m: &str| io::Error::new(io::ErrorKind::UnexpectedEof, m.to_string());
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        if data.len() < MSZIP_SIGNATURE_LEN {
+            return Decoded::failed(if cut {
+                eof("MSZIP block cut inside its signature")
+            } else {
+                bad("MSZIP decompression failed: Invalid block signature".into())
+            });
+        }
+        if ((data[0] as u16) | ((data[1] as u16) << 8)) != MSZIP_SIGNATURE {
+            return Decoded::failed(bad(
+                "MSZIP decompression failed: Invalid block signature".into()
+            ));
         }
         let data = &data[MSZIP_SIGNATURE_LEN..];
         // Each CFDATA block is an independent raw-deflate stream, but back-
@@ -59,27 +76,43 @@ impl MsZipDecompressor {
         let mut combined =
             Vec::<u8>::with_capacity(dict_len + crate::cap_prealloc(uncompressed_size));
         let flush = flate2::FlushDecompress::Finish;
-        match self
+        let result = self
             .decompressor
-            .decompress_vec(&input, &mut combined, flush)
-        {
-            Ok(_) => {}
-            Err(error) => {
-                invalid_data!("MSZIP decompression failed: {}", error);
-            }
-        }
+            .decompress_vec(&input, &mut combined, flush);
         // Drop the dictionary prefix we prepended.
         if combined.len() < dict_len {
-            invalid_data!("MSZIP decompression failed: dictionary prefix truncated");
+            return Decoded::failed(bad(
+                "MSZIP decompression failed: dictionary prefix truncated".into(),
+            ));
         }
-        let out = combined.split_off(dict_len);
+        let mut out = combined.split_off(dict_len);
+        if let Err(error) = result {
+            out.truncate(uncompressed_size);
+            return Decoded {
+                data: out,
+                error: Some(bad(format!("MSZIP decompression failed: {error}"))),
+            };
+        }
         if out.len() != uncompressed_size {
-            invalid_data!(
+            let short = out.len() < uncompressed_size;
+            let message = format!(
                 "MSZIP decompression failed: Incorrect uncompressed size \
                  (expected {}, was actually {})",
                 uncompressed_size,
                 out.len()
             );
+            out.truncate(uncompressed_size);
+            // A stream that ends early in a block the file cut is the cut; in
+            // a whole block it is damage.
+            let error = if short && cut {
+                eof(&message)
+            } else {
+                bad(message)
+            };
+            return Decoded {
+                data: out,
+                error: Some(error),
+            };
         }
         if out.len() >= DEFLATE_MAX_DICT_LEN {
             let start = out.len() - DEFLATE_MAX_DICT_LEN;
@@ -91,6 +124,9 @@ impl MsZipDecompressor {
             }
             self.dictionary.extend_from_slice(&out);
         }
-        Ok(out)
+        Decoded {
+            data: out,
+            error: None,
+        }
     }
 }

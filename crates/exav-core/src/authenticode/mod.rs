@@ -154,10 +154,10 @@ impl CrbDb {
             } else {
                 continue;
             }
-            if let Some(ref ser) = e.serial {
-                if ser.trim_start_matches('0') != cser {
-                    continue;
-                }
+            if let Some(ref ser) = e.serial
+                && ser.trim_start_matches('0') != cser
+            {
+                continue;
             }
             return Some(&e.name);
         }

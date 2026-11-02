@@ -103,6 +103,9 @@ const MAX_ALLOC: usize = 256 << 20;
 /// The largest `malloc` ClamAV 1.4.3 grants: it returns NULL from
 /// `(128 << 20) - 8` bytes up, and so does exav.
 const MAX_MALLOC: usize = (128 << 20) - 9;
+/// Bytes one bulk read or write of memory costs one step: a program that
+/// copies megabytes in an instruction is not one step of work.
+const BYTES_PER_STEP: u64 = 16;
 /// Size of `__clambc_pedata`.
 const PEDATA_LEN: usize = 648;
 
@@ -452,12 +455,22 @@ pub struct Ctx<'a> {
 pub struct WriteLimits {
     pub file: u64,
     pub total: u64,
+    /// What a run may hold in all: its `malloc`s (a program frees nothing, and
+    /// a loop of allocations each under the per-allocation limit would take
+    /// the host's memory long before its steps ran out), the frames of the
+    /// calls in progress, and the globals it has read. Past it the run stops as
+    /// incomplete.
+    pub memory: u64,
 }
+
+/// What a run may hold unless the scan says otherwise.
+pub const DEFAULT_MEMORY: u64 = 256 << 20;
 
 impl WriteLimits {
     pub const NONE: Self = WriteLimits {
         file: u64::MAX,
         total: u64::MAX,
+        memory: DEFAULT_MEMORY,
     };
 }
 
@@ -491,11 +504,16 @@ struct Machine<'a> {
     layouts: Vec<Option<(Rc<[Slot]>, usize)>>,
     /// The program's declared APIs, by `CALL_API` id, resolved once per run.
     apis: Vec<(u32, Api)>,
-    /// Globals rendered to bytes once (a global read happens in hot loops, so
-    /// this must not reallocate per access).
-    gcache: Vec<Vec<u8>>,
+    /// Globals rendered to bytes at their first read (a global read happens in
+    /// hot loops, so this must not reallocate per access, and a global the
+    /// program never reads costs nothing).
+    gcache: Vec<Option<Vec<u8>>>,
     /// `malloc` allocations, indexed by region `R_HEAP + i`.
     heaps: Vec<Vec<u8>>,
+    /// What the run holds in all: the `malloc`s, the frames of the calls in
+    /// progress and the globals read, against `memory`.
+    held: usize,
+    memory: usize,
     /// The in-progress extraction buffer (`write` appends here).
     extract_cur: Vec<u8>,
     /// Finalized extracted buffers (`extract_new` flushes `extract_cur` here).
@@ -646,8 +664,8 @@ impl<'a> Machine<'a> {
         match self.ctx.globals.values.get(g as usize).map(|v| v.len()) {
             Some(l) if l >= 2 => self.global_ptr(g),
             Some(_) => self.ctx.globals.values[g as usize]
-                .first()
-                .map(|&v| v as i64)
+                .get(0)
+                .map(|v| v as i64)
                 .unwrap_or(0),
             None => {
                 self.flag();
@@ -714,8 +732,7 @@ impl<'a> Machine<'a> {
             self.flag();
             return R_NULL;
         };
-        if gv.len() >= 2 {
-            let (offset, target) = (gv[0], gv[1]);
+        if let (Some(offset), Some(target)) = (gv.get(0), gv.get(1)) {
             if target & GLOBAL_PREDEFINED != 0 {
                 return match target {
                     GLOBAL_FILESIZE => compose(R_FILESIZE, offset as u32),
@@ -764,7 +781,7 @@ impl<'a> Machine<'a> {
         }
         if region >= R_GLOBAL {
             let g = (region - R_GLOBAL) as usize;
-            let v = self.gcache.get(g).and_then(|b| read_le(b, off as usize, w));
+            let v = read_le(self.global_bytes(g), off as usize, w);
             return v.unwrap_or_else(|| {
                 self.flag();
                 0
@@ -815,12 +832,40 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn global_bytes(&self, g: usize) -> &[u8] {
-        self.gcache.get(g).map(|v| v.as_slice()).unwrap_or(&[])
+    /// Global `g` as bytes, rendered at its first read and held from then on.
+    /// One the run has no memory left for ends it as incomplete.
+    fn global_bytes(&mut self, g: usize) -> &[u8] {
+        if self.gcache.get(g).is_some_and(Option::is_none) {
+            let len = self.ctx.globals.values[g].len();
+            if !self.hold(len) {
+                self.gap();
+                return &[];
+            }
+            self.gcache[g] = Some(self.ctx.globals.values[g].bytes());
+        }
+        self.gcache.get(g).and_then(|v| v.as_deref()).unwrap_or(&[])
+    }
+
+    /// Charges the steps a copy of `n` bytes is worth; the run ends, as it
+    /// does for any other instruction, when they pass `MAX_STEPS`.
+    fn charge_bytes(&mut self, n: usize) {
+        self.steps = self.steps.saturating_add(n as u64 / BYTES_PER_STEP);
+    }
+
+    /// Takes `n` bytes of the run's memory, or says that none is left.
+    fn hold(&mut self, n: usize) -> bool {
+        match self.held.checked_add(n) {
+            Some(held) if held <= self.memory => {
+                self.held = held;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Read `len` bytes through a pointer (for API arguments and memops).
     fn read_region(&mut self, p: i64, len: usize) -> Vec<u8> {
+        self.charge_bytes(len.min(MAX_ALLOC));
         let (region, off) = (ptr_region(p), ptr_off(p) as usize);
         let slice = |buf: &[u8]| {
             buf.get(off..off.saturating_add(len).min(buf.len()))
@@ -866,6 +911,27 @@ impl<'a> Machine<'a> {
         Vec::new()
     }
     fn write_region(&mut self, p: i64, bytes: &[u8]) {
+        self.charge_bytes(bytes.len());
+        // Within one region, in a piece: a program that asks for megabytes
+        // (`get_environment` into a frame) is not megabytes of single stores.
+        let (region, off) = (ptr_region(p), ptr_off(p) as usize);
+        let target = if (R_HEAP..R_GLOBAL).contains(&region) {
+            self.heaps
+                .get_mut((region - R_HEAP) as usize)
+                .map(Vec::as_mut_slice)
+        } else if (R_STACK..R_HEAP).contains(&region) {
+            self.frames
+                .get_mut((region - R_STACK) as usize)
+                .map(|f| f.stack.as_mut_slice())
+        } else {
+            None
+        };
+        if let Some(to) = target.and_then(|t| t.get_mut(off..off.checked_add(bytes.len())?)) {
+            to.copy_from_slice(bytes);
+            return;
+        }
+        // Past the end of the region (the first byte there ends the run, with
+        // the bytes before it written) or in none.
         for (i, &b) in bytes.iter().enumerate() {
             self.store_int(
                 compose(ptr_region(p), ptr_off(p).wrapping_add(i as u32)),
@@ -875,7 +941,7 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn read_cstring(&self, p: i64) -> Option<String> {
+    fn read_cstring(&mut self, p: i64) -> Option<String> {
         let (region, off) = (ptr_region(p), ptr_off(p) as usize);
         let take = |b: &[u8]| -> Option<String> {
             let s: Vec<u8> = b
@@ -1087,6 +1153,10 @@ impl<'a> Machine<'a> {
                 }
                 if self.trace {
                     eprintln!("[trace] malloc({size}) -> heap#{}", self.heaps.len());
+                }
+                if !self.hold(size as usize) {
+                    self.gap();
+                    return 0;
                 }
                 let idx = self.heaps.len();
                 self.heaps.push(vec![0u8; size as usize]);
@@ -1414,7 +1484,7 @@ impl<'a> Machine<'a> {
         let types = self.ctx.types;
         let (slots, nbytes) = self.layouts[idx].get_or_insert_with(|| layout(f, types));
         let (slots, nbytes) = (Rc::clone(slots), *nbytes);
-        if nbytes > MAX_BYTES {
+        if nbytes > MAX_BYTES || !self.hold(nbytes) {
             self.gap();
             return 0;
         }
@@ -1472,6 +1542,7 @@ impl<'a> Machine<'a> {
             }
         }
         self.frames.pop();
+        self.held -= nbytes;
         ret
     }
 
@@ -1851,19 +1922,15 @@ pub fn run_without_pe_data(funcs: &[Function], entry: usize, ctx: &Ctx) -> Outco
 }
 
 fn run_inner(funcs: &[Function], entry: usize, ctx: &Ctx, pe_missing: bool) -> Outcome {
-    let gcache: Vec<Vec<u8>> = ctx
-        .globals
-        .values
-        .iter()
-        .map(|v| v.iter().map(|&c| c as u8).collect())
-        .collect();
     let mut m = Machine {
         ctx,
         frames: Vec::new(),
         layouts: Vec::new(),
         apis: resolve_apis(ctx),
-        gcache,
+        gcache: vec![None; ctx.globals.values.len()],
         heaps: Vec::new(),
+        held: 0,
+        memory: usize::try_from(ctx.write_limits.memory).unwrap_or(usize::MAX),
         extract_cur: Vec::new(),
         extracted: Vec::new(),
         written: 0,
@@ -1910,7 +1977,7 @@ mod tests {
     use crate::bytecode::instr::{
         Body, Function, Inst, OP_BRANCH, OP_CALL_API, OP_JMP, OP_RET, OP_RET_VOID,
     };
-    use crate::bytecode::types::{Globals, TypeTable};
+    use crate::bytecode::types::{Global, Globals, TypeTable};
 
     fn detector() -> Vec<Function> {
         let blocks = vec![
@@ -2011,13 +2078,10 @@ mod tests {
             }],
             layouts: Vec::new(),
             apis: resolve_apis(c),
-            gcache: c
-                .globals
-                .values
-                .iter()
-                .map(|v| v.iter().map(|&x| x as u8).collect())
-                .collect(),
+            gcache: vec![None; c.globals.values.len()],
             heaps: Vec::new(),
+            held: 0,
+            memory: usize::try_from(c.write_limits.memory).unwrap_or(usize::MAX),
             extract_cur: Vec::new(),
             extracted: Vec::new(),
             written: 0,
@@ -2347,12 +2411,75 @@ mod tests {
         assert!(!m.unsupported && !m.gap);
     }
 
+    /// A program frees nothing, so allocations that each fit are held until
+    /// the run ends: past a total the run stops as incomplete, rather than the
+    /// host running out of memory first.
+    #[test]
+    fn globals_of_zeros_cost_nothing_until_read_and_then_count_against_the_memory() {
+        // A thousand globals of 16.7 million components, as 5 KB of signature
+        // declares them: each is 16 MiB once read.
+        let globals = Globals {
+            values: (0..1000).map(|_| Global::zeros(1 << 24)).collect(),
+        };
+        let (apis, types) = (apis(), TypeTable::default());
+        let mut c = ctx(b"", &apis, &globals, &types);
+        c.write_limits.memory = 100 << 20;
+        let mut m = machine(&c);
+        assert_eq!(m.held, 0, "nothing is made before a read");
+        for g in 0..6 {
+            assert_eq!(m.global_bytes(g).len(), 1 << 24);
+        }
+        assert!(!m.gap, "six of them are inside 100 MiB");
+        assert!(m.global_bytes(6).is_empty());
+        assert!(m.gap && m.halt, "the seventh ends the run as incomplete");
+        // One read twice is held once.
+        assert_eq!(m.held, 6 << 24);
+        assert_eq!(m.global_bytes(0).len(), 1 << 24);
+        assert_eq!(m.held, 6 << 24);
+    }
+
+    /// 16 MiB written by one call used to be 16 million single-byte stores that
+    /// no step counted: a loop of calls ran for years inside the step limit.
+    #[test]
+    fn a_bulk_write_is_one_copy_and_costs_steps_by_its_size() {
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        let p = m.call_api(0, Api::Malloc, &[Operand::Const(16 << 20)]);
+        let before = m.steps;
+        let started = std::time::Instant::now();
+        m.write_region(p, &vec![7u8; 16 << 20]);
+        assert!(started.elapsed().as_millis() < 500, "{:?}", started.elapsed());
+        assert_eq!(m.steps - before, (16 << 20) / BYTES_PER_STEP);
+        assert!(!m.halt);
+        assert_eq!(m.read_region(p, 4), [7, 7, 7, 7]);
+        // The bytes before the end of the region are written, and the first
+        // one past it ends the run.
+        m.write_region(p, &vec![9u8; (16 << 20) + 1]);
+        assert!(m.halt);
+        assert_eq!(m.read_region(p, 1), [9]);
+    }
+
+    #[test]
+    fn malloc_in_all_past_the_heap_cap_stops_the_run() {
+        let (apis, globals, types) = (apis(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        let each = Operand::Const(100 << 20);
+        assert_ne!(m.call_api(0, Api::Malloc, &[each]), 0);
+        assert_ne!(m.call_api(0, Api::Malloc, &[each]), 0);
+        assert!(!m.halt);
+        assert_eq!(m.call_api(0, Api::Malloc, &[each]), 0);
+        assert!(m.gap && m.halt, "the run ends as incomplete");
+        assert_eq!(m.held, 200 << 20);
+    }
+
     /// Output past exav's own cap is not dropped silently: the run stops
     /// as incomplete.
     #[test]
     fn write_past_the_extraction_cap_is_a_gap() {
         let globals = Globals {
-            values: vec![vec![0, 1], vec![0x41, 0x42]],
+            values: vec![vec![0, 1].into(), vec![0x41, 0x42].into()],
         };
         let (apis, types) = (apis(), TypeTable::default());
         let c = ctx(b"", &apis, &globals, &types);
@@ -2372,13 +2499,17 @@ mod tests {
     #[test]
     fn write_past_the_scan_limits_fails_and_the_run_goes_on() {
         let globals = Globals {
-            values: vec![vec![0, 1], vec![0x41, 0x42, 0x43]],
+            values: vec![vec![0, 1].into(), vec![0x41, 0x42, 0x43].into()],
         };
         let (apis, types) = (apis(), TypeTable::default());
         let args = [Operand::Global(0), Operand::Const(3)];
         // Three bytes to one file, seven in all.
         let c = Ctx {
-            write_limits: WriteLimits { file: 3, total: 7 },
+            write_limits: WriteLimits {
+                file: 3,
+                total: 7,
+                ..WriteLimits::NONE
+            },
             ..ctx(b"", &apis, &globals, &types)
         };
         let mut m = machine(&c);
@@ -2447,10 +2578,37 @@ mod tests {
         assert!(out.incomplete, "a program cut short is not one that found nothing");
     }
 
+    /// Each call's frame may be large and a program may recurse deep, so the
+    /// frames in progress together are bounded: past it the run ends as
+    /// incomplete, and the frames of calls that returned are given back.
+    #[test]
+    fn frames_in_all_are_bounded() {
+        let funcs = vec![Function {
+            num_args: 0,
+            return_type: 0,
+            types: vec![32],
+            num_insts: 1,
+            num_bb: 1,
+            blocks: vec![vec![]],
+        }];
+        let (apis, globals, types) = (Vec::new(), Globals::default(), TypeTable::default());
+        let c = ctx(b"", &apis, &globals, &types);
+        let mut m = machine(&c);
+        m.exec_fn(&funcs, 0, &[], 0);
+        assert!(!m.gap && m.held == 0, "a returned call's frame is given back");
+        m.held = m.memory;
+        m.exec_fn(&funcs, 0, &[], 1);
+        assert!(m.gap && m.halt, "no room left for another frame");
+    }
+
     #[test]
     fn resolves_global_string() {
         let globals = Globals {
-            values: vec![vec![0], vec![69, 105, 99, 97, 114, 0], vec![0, 1]],
+            values: vec![
+                vec![0].into(),
+                vec![69, 105, 99, 97, 114, 0].into(),
+                vec![0, 1].into(),
+            ],
         };
         let (apis, types) = (Vec::<(u32, String)>::new(), TypeTable::default());
         let c = ctx(b"", &apis, &globals, &types);
@@ -2462,7 +2620,7 @@ mod tests {
     #[test]
     fn resolves_filesize_global() {
         let globals = Globals {
-            values: vec![vec![0, GLOBAL_FILESIZE]],
+            values: vec![vec![0, GLOBAL_FILESIZE].into()],
         };
         let (apis, types) = (Vec::<(u32, String)>::new(), TypeTable::default());
         let c = ctx(b"12345678", &apis, &globals, &types);

@@ -17,7 +17,7 @@
 //! * an untyped binary and a PE carrying the identical bytes — OK. A target-11
 //!   signature must not reach content that merely contains the pattern.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 
 /// A distinctive body, present verbatim in every fixture below. Only the file's
 /// *type* differs between them, so any difference in verdict is attributable to

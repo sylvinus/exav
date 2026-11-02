@@ -1,44 +1,46 @@
 /* @exav/viewer default UI. Every colour, radius and size is a custom property
-   (TOKENS in @exav/viewer/react); set them on an ancestor to restyle. */
+   (TOKENS in @exav/viewer); set them on an ancestor to restyle. The
+   sandboxed frame's page (`.exav-viewer-frame-root`) is given the host's values. */
 
-:where(.exv-body, .exv-dialog) {
-  --exv-surface: #f1f5f9;
-  --exv-panel: #ffffff;
-  --exv-border: #e2e8f0;
-  --exv-text: #334155;
-  --exv-text-strong: #0f172a;
-  --exv-muted: #64748b;
-  --exv-faint: #94a3b8;
-  --exv-hover: #f8fafc;
-  --exv-active: #f1f5f9;
-  --exv-accent: #0f172a;
-  --exv-on-accent: #ffffff;
-  --exv-error: #b91c1c;
-  --exv-warning: #b45309;
-  --exv-media-bg: #0f172a;
-  --exv-model-bg: radial-gradient(circle at 50% 30%, #ffffff 0%, #e2e8f0 55%, #cbd5e1 100%);
-  --exv-radius: 0.375rem;
-  --exv-rail-width: 15rem;
-  --exv-tap: 2.75rem;
-  --exv-font: inherit;
-  font-family: var(--exv-font);
-  color: var(--exv-text);
+:where(.exav-viewer-body, .exav-viewer-dialog, .exav-viewer-frame-root) {
+  --exav-viewer-surface: #f1f5f9;
+  --exav-viewer-panel: #ffffff;
+  --exav-viewer-border: #e2e8f0;
+  --exav-viewer-text: #334155;
+  --exav-viewer-text-strong: #0f172a;
+  --exav-viewer-muted: #64748b;
+  --exav-viewer-faint: #94a3b8;
+  --exav-viewer-hover: #f8fafc;
+  --exav-viewer-active: #f1f5f9;
+  --exav-viewer-accent: #0f172a;
+  --exav-viewer-on-accent: #ffffff;
+  --exav-viewer-error: #b91c1c;
+  --exav-viewer-warning: #b45309;
+  --exav-viewer-media-bg: #0f172a;
+  --exav-viewer-model-bg: radial-gradient(circle at 50% 30%, #ffffff 0%, #e2e8f0 55%, #cbd5e1 100%);
+  --exav-viewer-radius: 0.375rem;
+  --exav-viewer-rail-width: 15rem;
+  --exav-viewer-tap: 2.75rem;
+  --exav-viewer-pager-room: 4.5rem;
+  --exav-viewer-font: inherit;
+  font-family: var(--exav-viewer-font);
+  color: var(--exav-viewer-text);
 }
 
-.exv-body,
-.exv-body * {
+.exav-viewer-body,
+.exav-viewer-body * {
   box-sizing: border-box;
 }
 
 /* ── body ── */
-.exv-body {
+.exav-viewer-body {
   position: relative;
   display: flex;
   height: 100%;
   min-height: 0;
-  background: var(--exv-surface);
+  background: var(--exav-viewer-surface);
 }
-.exv-main {
+.exav-viewer-main {
   position: relative;
   display: flex;
   flex-direction: column;
@@ -46,26 +48,26 @@
   min-width: 0;
   min-height: 0;
 }
-.exv-bars {
+.exav-viewer-bars {
   display: flex;
   flex: none;
   flex-direction: column;
 }
-.exv-stage {
+.exav-viewer-stage {
   position: relative;
   display: flex;
   flex: 1;
   flex-direction: column;
   min-height: 0;
 }
-.exv-surface {
+.exav-viewer-surface {
   position: relative;
   flex: 1;
   min-height: 0;
   overflow: hidden;
 }
 /* The sandboxed frame (`@exav/viewer/frame`), filling the surface. */
-.exv-sandbox {
+.exav-viewer-sandbox {
   position: absolute;
   inset: 0;
   display: block;
@@ -73,19 +75,19 @@
   height: 100%;
   border: 0;
 }
-.exv-stack {
+.exav-viewer-stack {
   flex: none;
 }
-.exv-rails {
+.exav-viewer-rails {
   display: flex;
   flex: none;
 }
-.exv-rails:empty {
+.exav-viewer-rails:empty {
   display: none;
 }
 
 /* ── status ── */
-.exv-status {
+.exav-viewer-status {
   position: absolute;
   inset: 0;
   z-index: 3;
@@ -94,192 +96,201 @@
   justify-content: center;
   gap: 0.5rem;
   padding: 1.5rem;
-  background: var(--exv-surface);
+  background: var(--exav-viewer-surface);
   text-align: center;
   font-size: 0.875rem;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
 }
-.exv-status p {
+.exav-viewer-status p {
   margin: 0;
   max-width: 34rem;
 }
-.exv-status-error {
-  color: var(--exv-error);
+.exav-viewer-status-error {
+  color: var(--exav-viewer-error);
 }
-.exv-spinner {
+.exav-viewer-status-busy {
+  flex-wrap: wrap;
+  align-content: center;
+}
+/* A row of its own, below the message. */
+.exav-viewer-progress {
+  display: flex;
+  justify-content: center;
+  flex: 0 0 100%;
+}
+.exav-viewer-progress > [role="progressbar"] {
+  width: min(16rem, 100%);
+  height: 0.25rem;
+  overflow: hidden;
+  border-radius: 0.125rem;
+  background: var(--exav-viewer-border);
+}
+.exav-viewer-progress > [role="progressbar"] > div {
+  height: 100%;
+  background: var(--exav-viewer-accent);
+  transition: width 0.2s linear;
+}
+@media (prefers-reduced-motion: reduce) {
+  .exav-viewer-progress > [role="progressbar"] > div {
+    transition: none;
+  }
+}
+.exav-viewer-spinner {
   display: inline-flex;
-  animation: exv-spin 1s linear infinite;
+  animation: exav-viewer-spin 1s linear infinite;
 }
-@keyframes exv-spin {
+@keyframes exav-viewer-spin {
   to {
     transform: rotate(360deg);
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .exv-spinner {
+  .exav-viewer-spinner {
     animation-duration: 3s;
   }
 }
 
 /* ── buttons ── */
-.exv-icon-button {
+.exav-viewer-icon-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: var(--exv-tap);
-  height: var(--exv-tap);
+  width: var(--exav-viewer-tap);
+  height: var(--exav-viewer-tap);
   border: 0;
-  border-radius: var(--exv-radius);
+  border-radius: var(--exav-viewer-radius);
   background: transparent;
-  color: var(--exv-text);
+  color: var(--exav-viewer-text);
   cursor: pointer;
 }
-.exv-icon-button:hover {
-  background: var(--exv-active);
+.exav-viewer-icon-button:hover {
+  background: var(--exav-viewer-active);
 }
-.exv-icon-button-small {
+.exav-viewer-icon-button-small {
   width: 2rem;
   height: 2rem;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
 }
-.exv-icon-button-round {
+.exav-viewer-icon-button-round {
   width: 2.25rem;
   height: 2.25rem;
   border-radius: 999px;
 }
-.exv-button {
+.exav-viewer-button {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  min-height: var(--exv-tap);
+  min-height: var(--exav-viewer-tap);
   padding: 0 1rem;
-  border: 1px solid var(--exv-accent);
-  border-radius: var(--exv-radius);
-  background: var(--exv-accent);
-  color: var(--exv-on-accent);
+  border: 1px solid var(--exav-viewer-accent);
+  border-radius: var(--exav-viewer-radius);
+  background: var(--exav-viewer-accent);
+  color: var(--exav-viewer-on-accent);
   font: inherit;
   font-size: 0.875rem;
   text-decoration: none;
   cursor: pointer;
 }
-.exv-button:disabled {
+.exav-viewer-button:disabled {
   opacity: 0.6;
   cursor: default;
 }
-.exv-button-outline {
-  background: var(--exv-panel);
-  border-color: var(--exv-border);
-  color: var(--exv-text);
+.exav-viewer-button-outline {
+  background: var(--exav-viewer-panel);
+  border-color: var(--exav-viewer-border);
+  color: var(--exav-viewer-text);
 }
 
 /* ── rails ── */
-.exv-rail {
+.exav-viewer-rail {
   display: flex;
   flex-direction: column;
-  width: var(--exv-rail-width);
+  width: var(--exav-viewer-rail-width);
   flex: none;
-  border-left: 1px solid var(--exv-border);
-  background: var(--exv-panel);
+  border-left: 1px solid var(--exav-viewer-border);
+  background: var(--exav-viewer-panel);
   min-height: 0;
 }
-.exv-rail-unfold {
-  position: absolute;
-  top: 0;
-  right: 0;
-  z-index: 4;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: var(--exv-tap);
-  height: var(--exv-tap);
-  border: 0;
-  border-left: 1px solid var(--exv-border);
-  border-bottom: 1px solid var(--exv-border);
-  border-bottom-left-radius: var(--exv-radius);
-  background: var(--exv-panel);
-  color: var(--exv-text);
-  cursor: pointer;
-}
-.exv-rail-head {
+.exav-viewer-rail-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
   padding: 0.375rem 0.5rem;
-  border-bottom: 1px solid var(--exv-border);
+  border-bottom: 1px solid var(--exav-viewer-border);
 }
-.exv-rail-title,
-.exv-rail-label {
+.exav-viewer-rail-title,
+.exav-viewer-rail-label {
   margin: 0;
   font-size: 0.75rem;
   font-weight: 500;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.exv-rail-section {
+.exav-viewer-rail-section {
   flex: none;
   padding: 0.5rem 1rem;
-  border-bottom: 1px solid var(--exv-border);
+  border-bottom: 1px solid var(--exav-viewer-border);
   font-size: 0.875rem;
 }
-.exv-rail-section p {
+.exav-viewer-rail-section p {
   margin: 0;
 }
-.exv-rail-inline {
+.exav-viewer-rail-inline {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
 }
-.exv-rail-scroll {
+.exav-viewer-rail-scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   padding: 0.25rem 0;
 }
-.exv-layouts {
+.exav-viewer-layouts {
   max-height: 33vh;
   overflow-y: auto;
   margin-top: 0.25rem;
 }
-.exv-row {
+.exav-viewer-row {
   display: flex;
   width: 100%;
   min-height: 2.25rem;
   align-items: center;
   padding: 0.25rem 0.5rem;
   border: 0;
-  border-radius: var(--exv-radius);
+  border-radius: var(--exav-viewer-radius);
   background: transparent;
-  color: var(--exv-text);
+  color: var(--exav-viewer-text);
   font: inherit;
   font-size: 0.875rem;
   text-align: left;
   cursor: pointer;
 }
-.exv-row:hover {
-  background: var(--exv-hover);
+.exav-viewer-row:hover {
+  background: var(--exav-viewer-hover);
 }
-.exv-row-current {
-  background: var(--exv-active);
-  color: var(--exv-text-strong);
+.exav-viewer-row-current {
+  background: var(--exav-viewer-active);
+  color: var(--exav-viewer-text-strong);
   font-weight: 500;
 }
-.exv-outline {
+.exav-viewer-outline {
   padding: 0.5rem;
 }
-.exv-outline-entry {
+.exav-viewer-outline-entry {
   display: block;
   width: 100%;
   padding: 0.375rem 0.5rem;
   border: 0;
-  border-radius: var(--exv-radius);
+  border-radius: var(--exav-viewer-radius);
   background: transparent;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
   font: inherit;
   font-size: 0.875rem;
   text-align: left;
@@ -288,46 +299,46 @@
   white-space: nowrap;
   cursor: pointer;
 }
-.exv-outline-entry:hover {
-  background: var(--exv-active);
+.exav-viewer-outline-entry:hover {
+  background: var(--exav-viewer-active);
 }
-.exv-outline-top {
-  color: var(--exv-text-strong);
+.exav-viewer-outline-top {
+  color: var(--exav-viewer-text-strong);
   font-weight: 500;
 }
-.exv-segmented {
+.exav-viewer-segmented {
   display: flex;
   overflow: hidden;
-  border: 1px solid var(--exv-border);
-  border-radius: var(--exv-radius);
+  border: 1px solid var(--exav-viewer-border);
+  border-radius: var(--exav-viewer-radius);
 }
-.exv-segmented button {
+.exav-viewer-segmented button {
   padding: 0.25rem 0.5rem;
   border: 0;
-  background: var(--exv-panel);
-  color: var(--exv-muted);
+  background: var(--exav-viewer-panel);
+  color: var(--exav-viewer-muted);
   font: inherit;
   font-size: 0.75rem;
   cursor: pointer;
 }
-.exv-segmented button[aria-pressed="true"] {
-  background: var(--exv-accent);
-  color: var(--exv-on-accent);
+.exav-viewer-segmented button[aria-pressed="true"] {
+  background: var(--exav-viewer-accent);
+  color: var(--exav-viewer-on-accent);
 }
-.exv-layer-all button {
+.exav-viewer-layer-all button {
   padding: 0.25rem 0.5rem;
   border: 0;
-  border-radius: var(--exv-radius);
+  border-radius: var(--exav-viewer-radius);
   background: transparent;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
   font: inherit;
   font-size: 0.75rem;
   cursor: pointer;
 }
-.exv-layer-all button:hover {
-  background: var(--exv-active);
+.exav-viewer-layer-all button:hover {
+  background: var(--exav-viewer-active);
 }
-.exv-layer {
+.exav-viewer-layer {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -336,40 +347,40 @@
   font-size: 0.875rem;
   cursor: pointer;
 }
-.exv-layer:hover {
-  background: var(--exv-hover);
+.exav-viewer-layer:hover {
+  background: var(--exav-viewer-hover);
 }
-.exv-layer input {
+.exav-viewer-layer input {
   flex: none;
   width: 1rem;
   height: 1rem;
-  accent-color: var(--exv-accent);
+  accent-color: var(--exav-viewer-accent);
 }
-.exv-swatch {
+.exav-viewer-swatch {
   flex: none;
   width: 0.75rem;
   height: 0.75rem;
-  border: 1px solid var(--exv-faint);
+  border: 1px solid var(--exav-viewer-faint);
   border-radius: 2px;
 }
-.exv-truncate {
+.exav-viewer-truncate {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.exv-strong {
-  color: var(--exv-text-strong);
+.exav-viewer-strong {
+  color: var(--exav-viewer-text-strong);
 }
-.exv-muted {
-  color: var(--exv-muted);
+.exav-viewer-muted {
+  color: var(--exav-viewer-muted);
 }
-.exv-faint {
-  color: var(--exv-faint);
+.exav-viewer-faint {
+  color: var(--exav-viewer-faint);
 }
 
 /* ── floating ── */
-.exv-pager {
+.exav-viewer-pager {
   position: absolute;
   bottom: 0.75rem;
   left: 50%;
@@ -379,27 +390,52 @@
   gap: 0.25rem;
   padding: 0.25rem;
   transform: translateX(-50%);
-  border: 1px solid var(--exv-border);
+  border: 1px solid var(--exav-viewer-border);
   border-radius: 999px;
-  background: color-mix(in srgb, var(--exv-panel) 95%, transparent);
+  background: color-mix(in srgb, var(--exav-viewer-panel) 95%, transparent);
   font-size: 0.875rem;
   font-variant-numeric: tabular-nums;
 }
-.exv-badge {
-  position: absolute;
-  bottom: 0.5rem;
-  left: 50%;
-  z-index: 2;
-  margin: 0;
-  padding: 0.25rem 0.75rem;
-  transform: translateX(-50%);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--exv-panel) 90%, transparent);
-  font-size: 0.75rem;
-  color: var(--exv-muted);
-  pointer-events: none;
+/* Below the sheet, not over it: the stage's last row stays in sight. */
+.exav-viewer-sheet-tabs {
+  display: flex;
+  flex: none;
+  gap: 0.125rem;
+  height: 2.25rem;
+  padding: 0 0.5rem;
+  overflow-x: auto;
+  border-top: 1px solid var(--exav-viewer-border);
+  background: var(--exav-viewer-panel);
+  scrollbar-width: thin;
 }
-.exv-warnings {
+.exav-viewer-sheet-tab {
+  flex: none;
+  max-width: 14rem;
+  padding: 0 0.875rem;
+  overflow: hidden;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--exav-viewer-muted);
+  font: inherit;
+  font-size: 0.8125rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.exav-viewer-sheet-tab:hover {
+  background: var(--exav-viewer-hover);
+  color: var(--exav-viewer-text);
+}
+.exav-viewer-sheet-tab[aria-selected="true"] {
+  border-bottom-color: var(--exav-viewer-accent);
+  color: var(--exav-viewer-text-strong);
+  font-weight: 600;
+}
+.exav-viewer-stage:has(> .exav-viewer-sheet-tabs) > .exav-viewer-tools {
+  bottom: 3rem;
+}
+.exav-viewer-warnings {
   position: absolute;
   bottom: 0.5rem;
   left: 0.5rem;
@@ -409,80 +445,95 @@
   gap: 0.25rem;
   max-width: calc(100% - 1rem);
   padding: 0.25rem 0.25rem 0.25rem 0.75rem;
-  border: 1px solid var(--exv-border);
-  border-radius: var(--exv-radius);
-  background: var(--exv-panel);
+  border: 1px solid var(--exav-viewer-border);
+  border-radius: var(--exav-viewer-radius);
+  background: var(--exav-viewer-panel);
   font-size: 0.75rem;
-  color: var(--exv-warning);
+  color: var(--exav-viewer-warning);
 }
-.exv-warnings p {
+.exav-viewer-warnings p {
   margin: 0;
 }
+.exav-viewer-warning-names {
+  color: var(--exav-viewer-muted);
+  overflow-wrap: anywhere;
+}
 
-/* The zoom buttons and the drag toggle: for a mouse, or for a browser that
-   reports no pointer at all (a desktop without one detected, headless test
-   browsers). A touch screen pinches and scrolls, and its buttons would only
-   cover the page. The warnings keep clear of them, whose width this allows for. */
+/* The zoom buttons, the drag and full screen toggles: for a mouse, or for a
+   browser that reports no pointer at all (a desktop without one detected,
+   headless test browsers). A touch screen pinches and scrolls, and its buttons
+   would only cover the page; the panel's toggle stays. The warnings keep clear
+   of the tools, whose width this allows for. */
+.exav-viewer-warnings {
+  max-width: calc(100% - 1rem - 4rem);
+}
 @media (any-pointer: fine), (any-pointer: none) {
-  .exv-warnings {
-    max-width: calc(100% - 1rem - 12rem);
+  .exav-viewer-warnings {
+    max-width: calc(100% - 1rem - 19rem);
   }
 }
-.exv-tools {
+.exav-viewer-tools {
   position: absolute;
   right: 0.75rem;
   bottom: 0.75rem;
   z-index: 3;
-  display: none;
+  display: flex;
   gap: 0.375rem;
 }
-@media (any-pointer: fine), (any-pointer: none) {
-  .exv-tools {
-    display: flex;
+/* What carries `data-pointer-only` (the zoom and drag groups, full screen) is
+   for a mouse and goes on a touch screen. A group left with nothing else goes
+   too. A host's own piece sets the attribute for the same. */
+.exav-viewer-tool-end:empty {
+  display: none;
+}
+@media not ((any-pointer: fine) or (any-pointer: none)) {
+  .exav-viewer-tools [data-pointer-only],
+  .exav-viewer-tool-end:not(:has(> :not([data-pointer-only]))) {
+    display: none;
   }
 }
-.exv-tool-group {
+.exav-viewer-tool-group {
   display: flex;
   padding: 0.125rem;
-  border: 1px solid var(--exv-border);
-  border-radius: var(--exv-radius);
-  background: var(--exv-panel);
+  border: 1px solid var(--exav-viewer-border);
+  border-radius: var(--exav-viewer-radius);
+  background: var(--exav-viewer-panel);
   box-shadow: 0 1px 3px rgb(15 23 42 / 0.12);
 }
-.exv-tool-group .exv-icon-button[aria-pressed="true"] {
-  background: var(--exv-active);
-  color: var(--exv-text-strong);
+.exav-viewer-tool-group .exav-viewer-icon-button[aria-pressed="true"] {
+  background: var(--exav-viewer-active);
+  color: var(--exav-viewer-text-strong);
 }
-.exv-tool-group .exv-icon-button:disabled {
+.exav-viewer-tool-group .exav-viewer-icon-button:disabled {
   opacity: 0.4;
   cursor: default;
 }
 
 /* ── archive ── */
-.exv-archive {
+.exav-viewer-archive {
   position: absolute;
   inset: 0;
   z-index: 2;
   display: flex;
   flex-direction: column;
-  background: var(--exv-panel);
+  background: var(--exav-viewer-panel);
 }
-.exv-archive-head {
+.exav-viewer-archive-head {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid var(--exv-border);
+  border-bottom: 1px solid var(--exav-viewer-border);
   font-size: 0.75rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
 }
-.exv-archive-refused {
+.exav-viewer-archive-refused {
   margin: 0;
   padding: 0.5rem 0.75rem;
   font-size: 0.75rem;
-  color: var(--exv-warning);
+  color: var(--exav-viewer-warning);
 }
-.exv-archive-list {
+.exav-viewer-archive-list {
   flex: 1;
   min-height: 0;
   margin: 0;
@@ -490,101 +541,101 @@
   list-style: none;
   overflow-y: auto;
 }
-.exv-archive-list li + li {
-  border-top: 1px solid var(--exv-hover);
+.exav-viewer-archive-list li + li {
+  border-top: 1px solid var(--exav-viewer-hover);
 }
-.exv-member {
+.exav-viewer-member {
   display: flex;
   width: 100%;
-  min-height: var(--exv-tap);
+  min-height: var(--exav-viewer-tap);
   align-items: center;
   gap: 0.5rem;
   padding: 0.375rem 0.75rem;
   border: 0;
   background: transparent;
-  color: var(--exv-text);
+  color: var(--exav-viewer-text);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.exv-member:hover:not(:disabled) {
-  background: var(--exv-hover);
+.exav-viewer-member:hover:not(:disabled) {
+  background: var(--exav-viewer-hover);
 }
-.exv-member:disabled {
+.exav-viewer-member:disabled {
   cursor: default;
 }
-.exv-member-locked {
+.exav-viewer-member-locked {
   opacity: 0.5;
 }
-.exv-member > svg,
-.exv-member > .exv-spinner {
+.exav-viewer-member > svg,
+.exav-viewer-member > .exav-viewer-spinner {
   flex: none;
-  color: var(--exv-faint);
+  color: var(--exav-viewer-faint);
 }
-.exv-member-name {
+.exav-viewer-member-name {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
   font-size: 0.875rem;
 }
-.exv-member-folder {
+.exav-viewer-member-folder {
   display: flex;
   align-items: center;
   gap: 0.25rem;
   font-size: 0.75rem;
-  color: var(--exv-faint);
+  color: var(--exav-viewer-faint);
 }
-.exv-member-size {
+.exav-viewer-member-size {
   flex: none;
   font-size: 0.75rem;
   font-variant-numeric: tabular-nums;
-  color: var(--exv-faint);
+  color: var(--exav-viewer-faint);
 }
-.exv-archive-back {
+.exav-viewer-archive-back {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   padding: 0.375rem 0.5rem;
-  border-bottom: 1px solid var(--exv-border);
-  background: var(--exv-panel);
+  border-bottom: 1px solid var(--exav-viewer-border);
+  background: var(--exav-viewer-panel);
   font-size: 0.875rem;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
 }
-.exv-archive-back button {
+.exav-viewer-archive-back button {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
   min-height: 2.25rem;
   padding: 0 0.5rem;
   border: 0;
-  border-radius: var(--exv-radius);
+  border-radius: var(--exav-viewer-radius);
   background: transparent;
-  color: var(--exv-text);
+  color: var(--exav-viewer-text);
   font: inherit;
   cursor: pointer;
 }
-.exv-archive-back button:hover {
-  background: var(--exv-active);
+.exav-viewer-archive-back button:hover {
+  background: var(--exav-viewer-active);
 }
-.exv-archive-member {
+.exav-viewer-archive-member {
   position: absolute;
   inset: 0;
 }
 
 /* ── engines' surfaces ── */
-.exv-pdf {
+.exav-viewer-pdf {
   position: absolute;
   inset: 0;
   display: flex;
 }
-.exv-pdf-scroller {
+.exav-viewer-pdf-scroller {
   flex: 1;
   min-width: 0;
   overflow: auto;
   padding: 12px;
 }
-.exv-pdf-content {
+.exav-viewer-pdf-content {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -593,17 +644,17 @@
   min-width: 100%;
   margin: 0 auto;
 }
-.exv-pdf-page {
+.exav-viewer-pdf-page {
   position: relative;
   background: #ffffff;
   box-shadow: 0 1px 2px rgb(15 23 42 / 0.12);
 }
-.exv-pdf-bitmap {
+.exav-viewer-pdf-bitmap {
   display: block;
   width: 100%;
   height: 100%;
 }
-.exv-pdf-detail {
+.exav-viewer-pdf-detail {
   position: absolute;
   display: none;
   pointer-events: none;
@@ -612,7 +663,7 @@
    transparent, at its place and size on the page. pdf.js sets the layer's
    size, `--min-font-size`, and each run's `--font-height`, `--scale-x` and
    `--rotate`. */
-.exv-pdf-text {
+.exav-viewer-pdf-text {
   --scale-round-x: 1px;
   --scale-round-y: 1px;
   --min-font-size: 1;
@@ -632,7 +683,7 @@
   caret-color: CanvasText;
   z-index: 0;
 }
-.exv-pdf-text :is(span, br) {
+.exav-viewer-pdf-text :is(span, br) {
   position: absolute;
   color: transparent;
   white-space: pre;
@@ -642,17 +693,17 @@
   user-select: text;
 }
 /* A drag that pans: the hand, over the text and the links too. */
-.exv-pdf[data-drag="pan"] .exv-pdf-scroller,
-.exv-pdf[data-drag="pan"] .exv-pdf-text :is(span, br),
-.exv-pdf[data-drag="pan"] .exv-pdf-link {
+.exav-viewer-pdf[data-drag="pan"] .exav-viewer-pdf-scroller,
+.exav-viewer-pdf[data-drag="pan"] .exav-viewer-pdf-text :is(span, br),
+.exav-viewer-pdf[data-drag="pan"] .exav-viewer-pdf-link {
   cursor: grab;
 }
-.exv-pdf-panning .exv-pdf-scroller,
-.exv-pdf-panning .exv-pdf-text :is(span, br),
-.exv-pdf-panning .exv-pdf-link {
+.exav-viewer-pdf-panning .exav-viewer-pdf-scroller,
+.exav-viewer-pdf-panning .exav-viewer-pdf-text :is(span, br),
+.exav-viewer-pdf-panning .exav-viewer-pdf-link {
   cursor: grabbing !important;
 }
-.exv-pdf-text > span {
+.exav-viewer-pdf-text > span {
   z-index: 1;
   --font-height: 0;
   font-size: calc(var(--text-scale-factor) * var(--font-height));
@@ -660,26 +711,26 @@
   --rotate: 0deg;
   transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
 }
-.exv-pdf-text ::selection {
+.exav-viewer-pdf-text ::selection {
   background: rgb(0 0 255 / 0.25);
   background: color-mix(in srgb, AccentColor, transparent 50%);
   color: transparent;
 }
-.exv-pdf-text br::selection {
+.exav-viewer-pdf-text br::selection {
   background: transparent;
 }
-.exv-pdf-text[data-main-rotation="90"] {
+.exav-viewer-pdf-text[data-main-rotation="90"] {
   transform: rotate(90deg) translateY(-100%);
 }
-.exv-pdf-text[data-main-rotation="180"] {
+.exav-viewer-pdf-text[data-main-rotation="180"] {
   transform: rotate(180deg) translate(-100%, -100%);
 }
-.exv-pdf-text[data-main-rotation="270"] {
+.exav-viewer-pdf-text[data-main-rotation="270"] {
   transform: rotate(270deg) translateX(-100%);
 }
 /* Below the text, out of the way; over the whole layer while a selection
    is dragged, so that the space between runs moves nothing (reader.ts). */
-.exv-pdf-text-end {
+.exav-viewer-pdf-text-end {
   position: absolute;
   inset: 100% 0 0;
   z-index: 0;
@@ -687,66 +738,70 @@
   -webkit-user-select: none;
   user-select: none;
 }
-.exv-pdf-selecting .exv-pdf-text-end {
+.exav-viewer-pdf-selecting .exav-viewer-pdf-text-end {
   top: 0;
 }
-.exv-pdf-links {
+.exav-viewer-pdf-links {
   position: absolute;
   inset: 0;
   pointer-events: none;
 }
-.exv-pdf-link {
+.exav-viewer-pdf-link {
   position: absolute;
   pointer-events: auto;
 }
-.exv-pdf-link:hover {
+.exav-viewer-pdf-link:hover {
   background: rgb(250 204 21 / 0.2);
 }
-.exv-pdf-link:focus-visible {
-  outline: 2px solid var(--exv-accent);
+.exav-viewer-pdf-link:focus-visible {
+  outline: 2px solid var(--exav-viewer-accent);
 }
-.exv-image {
+.exav-viewer-image {
   position: absolute;
   inset: 0;
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
 }
-.exv-image-stage {
+.exav-viewer-image-stage {
   position: absolute;
   top: 0;
   left: 0;
   transform-origin: 0 0;
 }
-.exv-image-picture {
+.exav-viewer-image-picture {
   display: block;
   width: 100%;
   height: 100%;
   pointer-events: none;
 }
-.exv-image-detail {
+.exav-viewer-image-detail {
   position: absolute;
   display: none;
   pointer-events: none;
 }
-.exv-image-page-layer,
-.exv-image-screen-layer {
+.exav-viewer-image-page-layer,
+.exav-viewer-image-screen-layer {
   position: absolute;
   inset: 0;
   pointer-events: none;
 }
-.exv-image-page-layer > *,
-.exv-image-screen-layer > * {
+.exav-viewer-image-page-layer > *,
+.exav-viewer-image-screen-layer > * {
   pointer-events: auto;
 }
-.exv-cad,
-.exv-ifc,
-.exv-model,
-.exv-office {
+.exav-viewer-cad,
+.exav-viewer-ifc,
+.exav-viewer-model,
+.exav-viewer-office {
   position: absolute;
   inset: 0;
 }
-.exv-cad-canvas {
+/* A zoom gesture scales the canvas under it, past the box. */
+.exav-viewer-cad {
+  overflow: hidden;
+}
+.exav-viewer-cad-canvas {
   display: block;
   width: 100%;
   height: 100%;
@@ -754,7 +809,7 @@
   outline: none;
 }
 /* The drawing's thumbnail, over the canvas while the drawing parses. */
-.exv-cad-preview {
+.exav-viewer-cad-preview {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -762,41 +817,41 @@
   object-fit: contain;
   pointer-events: none;
 }
-.exv-model {
-  background: var(--exv-model-bg);
+.exav-viewer-model {
+  background: var(--exav-viewer-model-bg);
 }
-.exv-model-canvas {
+.exav-viewer-model-canvas {
   display: block;
   width: 100%;
   height: 100%;
 }
-.exv-office {
+.exav-viewer-office {
   background: #ffffff;
   overflow: hidden;
 }
-.exv-office-canvas {
+.exav-viewer-office-canvas {
   display: block;
   width: 100%;
   height: 100%;
 }
 /* A slide on the surface, as a PDF's pages are, centred in the stage it is
-   fitted to: clear of the slide pager below it. */
-.exv-office-pptx {
-  background: var(--exv-surface);
+   fitted to: clear of the slide pager below it (`--exav-viewer-pager-room`). */
+.exav-viewer-office-pptx {
+  background: var(--exav-viewer-surface);
 }
-.exv-office-stage {
+.exav-viewer-office-stage {
   position: absolute;
-  inset: 1rem 1rem 4.5rem;
+  inset: 1rem 1rem var(--exav-viewer-pager-room);
   display: flex;
   align-items: center;
   justify-content: center;
 }
-.exv-office-stage .exv-office-canvas {
+.exav-viewer-office-stage .exav-viewer-office-canvas {
   box-shadow: 0 1px 3px rgb(15 23 42 / 0.18);
 }
 /* Under a Word page's or a slide's text runs while a selection is dragged
    (office/selection.ts). */
-.exv-office-text-end {
+.exav-viewer-office-text-end {
   position: absolute;
   inset: 0;
   pointer-events: auto;
@@ -804,7 +859,7 @@
   -webkit-user-select: none;
   user-select: none;
 }
-.exv-media {
+.exav-viewer-media {
   position: absolute;
   inset: 0;
   display: flex;
@@ -812,20 +867,170 @@
   justify-content: center;
   padding: 12px;
 }
-.exv-media-video {
-  background: var(--exv-media-bg);
+.exav-viewer-media-video {
+  background: var(--exav-viewer-media-bg);
 }
-.exv-media video {
+.exav-viewer-media video {
   max-width: 100%;
   max-height: 100%;
 }
-.exv-media audio {
+.exav-viewer-media audio {
   width: 100%;
   max-width: 36rem;
 }
 
+/* ── text (text/renderer.ts) ── */
+.exav-viewer-text {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: 1rem 1.25rem;
+  background: var(--exav-viewer-panel);
+  color: var(--exav-viewer-text-strong);
+  outline: none;
+}
+/* A block of lines the browser may skip while it is off screen. */
+.exav-viewer-text-chunk {
+  margin: 0;
+  font: 0.8125rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 300em;
+}
+.exav-viewer-text-key,
+.exav-viewer-text-tag {
+  color: #1d4ed8;
+}
+.exav-viewer-text-str {
+  color: #047857;
+}
+.exav-viewer-text-num,
+.exav-viewer-text-lit,
+.exav-viewer-text-attr {
+  color: #b45309;
+}
+.exav-viewer-text-comment,
+.exav-viewer-text-meta {
+  color: var(--exav-viewer-muted);
+}
+.exav-viewer-text-add {
+  background: #dcfce7;
+}
+.exav-viewer-text-del {
+  background: #fee2e2;
+}
+.exav-viewer-text-hunk {
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+.exav-viewer-text-link {
+  color: #1d4ed8;
+  text-decoration: underline;
+}
+.exav-viewer-text-link[role="link"] {
+  cursor: pointer;
+}
+.exav-viewer-text-url,
+.exav-viewer-md-image {
+  color: var(--exav-viewer-muted);
+}
+.exav-viewer-text-markdown {
+  font: 0.9375rem/1.6 var(--exav-viewer-font);
+  overflow-wrap: anywhere;
+}
+.exav-viewer-text-markdown > * {
+  max-width: 52rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+.exav-viewer-text-markdown :is(h1, h2, h3, h4, h5, h6) {
+  margin: 1.4em 0 0.5em;
+  line-height: 1.25;
+  color: var(--exav-viewer-text-strong);
+}
+.exav-viewer-text-markdown h1 {
+  font-size: 1.75rem;
+  border-bottom: 1px solid var(--exav-viewer-border);
+  padding-bottom: 0.3em;
+}
+.exav-viewer-text-markdown h2 {
+  font-size: 1.4rem;
+  border-bottom: 1px solid var(--exav-viewer-border);
+  padding-bottom: 0.3em;
+}
+.exav-viewer-text-markdown h3 {
+  font-size: 1.15rem;
+}
+.exav-viewer-text-markdown :is(h4, h5, h6) {
+  font-size: 1rem;
+}
+.exav-viewer-text-markdown p,
+.exav-viewer-text-markdown :is(ul, ol),
+.exav-viewer-text-markdown pre,
+.exav-viewer-text-markdown blockquote,
+.exav-viewer-text-markdown table {
+  margin-top: 0;
+  margin-bottom: 1em;
+}
+.exav-viewer-text-markdown :is(ul, ol) {
+  padding-left: 1.75rem;
+}
+.exav-viewer-text-markdown :is(ul, ol) :is(ul, ol) {
+  margin-bottom: 0;
+}
+.exav-viewer-text-markdown .exav-viewer-md-tight > li > :is(ul, ol) {
+  margin-top: 0.25em;
+}
+.exav-viewer-text-markdown blockquote {
+  padding: 0 1em;
+  border-left: 0.25rem solid var(--exav-viewer-border);
+  color: var(--exav-viewer-muted);
+}
+.exav-viewer-text-markdown code {
+  font: 0.875em ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  padding: 0.15em 0.35em;
+  border-radius: var(--exav-viewer-radius);
+  background: var(--exav-viewer-active);
+}
+.exav-viewer-text-markdown pre {
+  padding: 0.75rem 1rem;
+  overflow: auto;
+  border-radius: var(--exav-viewer-radius);
+  background: var(--exav-viewer-active);
+}
+.exav-viewer-text-markdown pre code {
+  padding: 0;
+  background: none;
+  white-space: pre;
+}
+.exav-viewer-text-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--exav-viewer-border);
+  margin: 1.5em auto;
+}
+.exav-viewer-text-markdown table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.exav-viewer-text-markdown :is(th, td) {
+  padding: 0.35em 0.8em;
+  border: 1px solid var(--exav-viewer-border);
+}
+.exav-viewer-text-markdown .exav-viewer-md-center {
+  text-align: center;
+}
+.exav-viewer-text-markdown .exav-viewer-md-right {
+  text-align: right;
+}
+.exav-viewer-text-markdown .exav-viewer-md-raw {
+  white-space: pre-wrap;
+}
+
 /* ── dialog ── */
-.exv-dialog {
+.exav-viewer-dialog {
   height: calc(100dvh - 4rem);
   width: calc(100vw - 4rem);
   max-width: none;
@@ -833,79 +1038,79 @@
   margin: auto;
   padding: 1rem;
   border: 0;
-  border-radius: calc(var(--exv-radius) * 2);
-  background: var(--exv-panel);
+  border-radius: calc(var(--exav-viewer-radius) * 2);
+  background: var(--exav-viewer-panel);
   box-shadow: 0 10px 40px rgb(15 23 42 / 0.25);
   box-sizing: border-box;
 }
-.exv-dialog::backdrop {
+.exav-viewer-dialog::backdrop {
   background: rgb(15 23 42 / 0.6);
 }
 @media (min-width: 640px) {
-  .exv-dialog-page {
+  .exav-viewer-dialog-page {
     max-width: 72rem;
   }
 }
-.exv-dialog-inner {
+.exav-viewer-dialog-inner {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
   height: 100%;
 }
-.exv-dialog-head {
+.exav-viewer-dialog-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
 }
-.exv-dialog-title {
+.exav-viewer-dialog-title {
   min-width: 0;
   margin: 0;
   font-size: 1.125rem;
   font-weight: 600;
-  color: var(--exv-text-strong);
+  color: var(--exav-viewer-text-strong);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.exv-hint {
+.exav-viewer-hint {
   margin-left: 0.5rem;
   font-size: 0.875rem;
   font-weight: 400;
-  color: var(--exv-muted);
+  color: var(--exav-viewer-muted);
 }
-.exv-frame {
+.exav-viewer-frame {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  border: 1px solid var(--exv-border);
-  border-radius: var(--exv-radius);
-  background: var(--exv-surface);
+  border: 1px solid var(--exav-viewer-border);
+  border-radius: var(--exav-viewer-radius);
+  background: var(--exav-viewer-surface);
 }
-.exv-dialog-foot {
+.exav-viewer-dialog-foot {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
 }
-.exv-foot-left,
-.exv-foot-right {
+.exav-viewer-foot-left,
+.exav-viewer-foot-right {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.25rem;
 }
-.exv-foot-right {
+.exav-viewer-foot-right {
   gap: 0.5rem;
 }
-.exv-counter {
+.exav-viewer-counter {
   margin-left: 0.25rem;
   font-size: 0.875rem;
   font-variant-numeric: tabular-nums;
 }
-.exv-separated {
+.exav-viewer-separated {
   margin-left: 0.75rem;
   padding-left: 0.75rem;
-  border-left: 1px solid var(--exv-border);
+  border-left: 1px solid var(--exav-viewer-border);
 }

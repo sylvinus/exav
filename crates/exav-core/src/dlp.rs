@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     fn integration_structured_cc_verdict() {
-        use crate::{analyze, Method, ScanOptions, Scanner, Verdict};
+        use crate::{Method, ScanOptions, Scanner, Verdict, analyze};
         let db = Scanner::builtin();
         let mut buf = Vec::new();
         for card in [VISA, MC, AMEX, DISCOVER] {
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn counts_read_in_blocks_are_the_counts_from_memory() {
-        use crate::byte_source::{BlockCache, Stepper, CHUNK};
+        use crate::byte_source::{BlockCache, CHUNK, Stepper};
         let plants: &[&[u8]] = &[
             VISA,
             MC,

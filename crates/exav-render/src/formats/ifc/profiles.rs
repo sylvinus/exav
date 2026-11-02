@@ -4,10 +4,10 @@
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use super::curves::{segments, SEGMENTS_PER_TURN};
-use super::math::{Xf, V2, V3};
+use super::curves::{SEGMENTS_PER_TURN, segments};
+use super::math::{V2, V3, Xf};
 use super::step::Value;
-use super::{Reader, MAX_DEPTH};
+use super::{MAX_DEPTH, Reader};
 
 /// Closed areas, each an outer loop (counter-clockwise) and its holes
 /// (clockwise); and open curves, which sweep into surfaces.

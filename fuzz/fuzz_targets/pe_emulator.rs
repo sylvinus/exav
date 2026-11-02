@@ -25,7 +25,7 @@
 //!
 //! Seed corpus: `fuzz/corpus/pe_emulator/` — small packed PEs, so the mutator
 //! starts inside a stub rather than rediscovering the PE header.
-use exav_pe_emu::{unpack, EmuLimits};
+use exav_pe_emu::{EmuLimits, unpack};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

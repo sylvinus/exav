@@ -11,7 +11,7 @@ mod tests;
 
 use std::borrow::Cow;
 
-use exav_unpack::dxf::{looks_like_dxf, Decoder, Parts, Record, Records, Stop, Tag, Value};
+use exav_unpack::dxf::{Decoder, Parts, Record, Records, Stop, Tag, Value, looks_like_dxf};
 
 use super::model::*;
 use super::{Error, Limits};
@@ -64,6 +64,11 @@ pub(crate) struct Ctx<'l> {
     /// Layer names and handles, once the tables are read: R12 viewports
     /// name their frozen layers.
     pub layer_handles: Vec<(String, Handle)>,
+    /// Each INSERT's extension dictionary, by the insert's handle: where its
+    /// clipping boundary is found once the objects are read.
+    pub insert_dictionaries: std::collections::HashMap<u64, u64>,
+    /// SPATIAL_FILTER objects, by handle.
+    pub spatial_filters: std::collections::HashMap<u64, InsertClip>,
 }
 
 impl<'l> Ctx<'l> {
@@ -79,6 +84,8 @@ impl<'l> Ctx<'l> {
             entity_limit_hit: false,
             item_limit_hit: false,
             layer_handles: Vec::new(),
+            insert_dictionaries: Default::default(),
+            spatial_filters: Default::default(),
         }
     }
 
@@ -406,7 +413,7 @@ impl<'a> Reader<'a, '_> {
                         || r.is("SECTION")
                         || r.is("EOF") =>
                 {
-                    return
+                    return;
                 }
                 _ => {}
             }

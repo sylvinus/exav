@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use exav_render::cad::{read_dxf, read_dxf_with, EntityKind, Error, Limits, WarningKind};
+use exav_render::cad::{EntityKind, Error, Limits, WarningKind, read_dxf, read_dxf_with};
 
 fn samples() -> [Vec<u8>; 3] {
     [
@@ -173,10 +173,11 @@ fn limits_bound_what_is_kept() {
     let points = "0\nPOINT\n8\n0\n".repeat(50);
     let d = read_dxf_with(&dxf(&points), &limits).expect("reads");
     assert_eq!(d.model_space().map(|b| b.entities.len()), Some(10));
-    assert!(d
-        .warnings
-        .iter()
-        .any(|w| w.kind == WarningKind::LimitReached));
+    assert!(
+        d.warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::LimitReached)
+    );
 
     let lw = "0\nLWPOLYLINE\n8\n0\n".to_string() + &"10\n1\n20\n2\n".repeat(100);
     let d = read_dxf_with(&dxf(&lw), &limits).expect("reads");

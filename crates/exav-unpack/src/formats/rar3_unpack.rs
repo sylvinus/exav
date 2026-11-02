@@ -15,8 +15,8 @@
 //! Everything is bounds-checked and never panics on malformed input.
 
 use super::ppmd7::{
-    Ppmd7, RarRangeDecoder, PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE,
-    PPMD7_MIN_ORDER, SYM_END,
+    PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7,
+    RarRangeDecoder, SYM_END,
 };
 use crate::{Budget, LimitHit};
 use std::collections::VecDeque;
@@ -1191,10 +1191,11 @@ impl DecodeReader {
                         None => Ok(0),
                     };
                 }
-            } else if let Some(f) = self.filters.front() {
-                if f.offset == 0 && f.length > self.win.buffered() {
-                    self.fill();
-                }
+            } else if let Some(f) = self.filters.front()
+                && f.offset == 0
+                && f.length > self.win.buffered()
+            {
+                self.fill();
             }
             if !self.filters.is_empty() {
                 self.process_filters()?;
@@ -1566,11 +1567,7 @@ fn filter_itanium(mut buf: Vec<u8>, offset: i64) -> Vec<u8> {
 }
 
 fn abs_i(n: i32) -> i32 {
-    if n < 0 {
-        -n
-    } else {
-        n
-    }
+    if n < 0 { -n } else { n }
 }
 
 fn filter_rgb(r0: u32, r1: u32, buf: &[u8]) -> Vec<u8> {

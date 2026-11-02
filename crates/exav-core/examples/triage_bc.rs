@@ -53,11 +53,7 @@ fn input_for(trigger: &str) -> Vec<u8> {
         .and_then(|s| s.split([',', ';']).next())
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0);
-    if target == 1 {
-        benign_pe()
-    } else {
-        benign()
-    }
+    if target == 1 { benign_pe() } else { benign() }
 }
 
 const OP_NAMES: &[&str] = &[
@@ -225,5 +221,7 @@ fn main() {
         "{executed}/{} executed to completion (no unsupported op/API)",
         rows.len()
     );
-    println!("  of which {ran_clean} clean, {false_pos} set a name (trigger-gated programs run standalone — not false positives)");
+    println!(
+        "  of which {ran_clean} clean, {false_pos} set a name (trigger-gated programs run standalone — not false positives)"
+    );
 }

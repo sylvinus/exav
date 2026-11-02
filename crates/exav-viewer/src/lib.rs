@@ -1,6 +1,10 @@
-//! The WebAssembly half of `@exav/viewer`. Built five times (see
+//! The WebAssembly half of `@exav/viewer`. Built nine times (see
 //! `Cargo.toml`): with `image`, exav-render's raster decoders; with `dwg`,
-//! its DWG and DXF engine; with `model`, its IFC and STL meshes; with
+//! its DWG and DXF engine; with `model`, its IFC, STL, OBJ, PLY and glTF meshes;
+//! with `text`, its Markdown reader; with `sheets`, its
+//! XLS, ODS and Numbers to XLSX converter; with `slides`,
+//! its PPT, ODP, Keynote, ODG and VSDX to PPTX converter; with `docs`,
+//! its DOC, ODT, RTF, Word 2003 XML and Pages to DOCX converter; with
 //! `pdf-jpx` and `pdf-jbig2`, the image
 //! decoders pdf.js loads in place of its C and C++ ones. Each runs in a
 //! worker, and only finished pixels or vertex buffers cross back to the
@@ -10,7 +14,7 @@
 
 #[cfg(feature = "image")]
 mod image {
-    use exav_render::image::{decode_any, Error, Format};
+    use exav_render::image::{Error, Format, decode_any};
     use wasm_bindgen::prelude::*;
 
     /// A decoded image, as RGBA8.
@@ -58,6 +62,7 @@ mod image {
             JsError::new(match e {
                 Error::Unsupported => "unsupported",
                 Error::TooLarge => "too-large",
+                Error::NoPreview => "no-preview",
                 _ => "undecodable",
             })
         })?;
@@ -111,6 +116,11 @@ mod dwg {
             std::mem::take(&mut self.0.text_strings)
         }
 
+        #[wasm_bindgen(js_name = takeClips)]
+        pub fn take_clips(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0.clips)
+        }
+
         #[wasm_bindgen(js_name = takeStrokeTiles)]
         pub fn take_stroke_tiles(&mut self) -> Vec<u8> {
             std::mem::take(&mut self.0.stroke_tiles)
@@ -119,6 +129,11 @@ mod dwg {
         #[wasm_bindgen(js_name = takeFillTiles)]
         pub fn take_fill_tiles(&mut self) -> Vec<u8> {
             std::mem::take(&mut self.0.fill_tiles)
+        }
+
+        #[wasm_bindgen(js_name = takeTranslucentRuns)]
+        pub fn take_translucent_runs(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0.translucent_runs)
         }
 
         pub fn origin(&self) -> Vec<f64> {
@@ -163,6 +178,11 @@ mod dwg {
         pub fn warnings_json(&self) -> String {
             self.0.warnings_json()
         }
+
+        #[wasm_bindgen(js_name = sheetJson)]
+        pub fn sheet_json(&self) -> String {
+            self.0.sheet_json()
+        }
     }
 
     /// A parsed DWG or DXF.
@@ -175,6 +195,29 @@ mod dwg {
         #[wasm_bindgen(js_name = layoutsJson)]
         pub fn layouts_json(&self) -> String {
             self.0.layouts_json()
+        }
+
+        /// The files external references name that are not bound yet, as a
+        /// JSON array of the paths the drawing wrote.
+        #[wasm_bindgen(js_name = xrefPathsJson)]
+        pub fn xref_paths_json(&self) -> String {
+            self.0.xref_paths_json()
+        }
+
+        /// Bind the drawing in `bytes`, the file `path` names, into the
+        /// references to it; how many blocks it filled.
+        #[wasm_bindgen(js_name = attachXref)]
+        pub fn attach_xref(
+            &mut self,
+            path: &str,
+            bytes: &[u8],
+            max_decompressed_bytes: f64,
+            max_entities: f64,
+        ) -> Result<u32, JsError> {
+            self.0
+                .attach_xref(path, bytes, &limits(max_decompressed_bytes, max_entities))
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                .map_err(|e| JsError::new(&e.to_string()))
         }
 
         /// One layout; none, empty or unknown is model space. `background` is
@@ -228,18 +271,27 @@ mod dwg {
     }
 
     /// Parse a DWG or a DXF, told apart by its first bytes. A DWG whose
-    /// compressed sections expand past `max_decompressed_bytes` is refused.
+    /// compressed sections expand past `max_decompressed_bytes` is refused,
+    /// and so is a drawing of more than `max_entities` entities.
     #[wasm_bindgen(js_name = parseDrawing)]
-    pub fn parse_drawing(bytes: &[u8], max_decompressed_bytes: f64) -> Result<Document, JsError> {
-        // Saturating: Infinity is no limit, NaN and anything not positive
-        // refuse every compressed section.
-        let limits = exav_render::cad::Limits {
-            max_decompressed_bytes: max_decompressed_bytes as u64,
-            ..exav_render::cad::Limits::default()
-        };
-        dwg::Document::parse_with(bytes, &limits)
+    pub fn parse_drawing(
+        bytes: &[u8],
+        max_decompressed_bytes: f64,
+        max_entities: f64,
+    ) -> Result<Document, JsError> {
+        dwg::Document::parse_with(bytes, &limits(max_decompressed_bytes, max_entities))
             .map(Document)
             .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// The limits of a drawing. Saturating: Infinity is no limit, NaN and
+    /// anything not positive refuse every compressed section and every entity.
+    fn limits(max_decompressed_bytes: f64, max_entities: f64) -> exav_render::cad::Limits {
+        exav_render::cad::Limits {
+            max_decompressed_bytes: max_decompressed_bytes as u64,
+            max_entities: max_entities as usize,
+            ..exav_render::cad::Limits::default()
+        }
     }
 }
 
@@ -292,10 +344,12 @@ mod model {
             std::mem::take(&mut self.colors)
         }
 
-        /// `{origin, bounds, batches: [{class, color, vertex, vertices,
+        /// `{origin, bounds, batches: [{class, color, storey, vertex, vertices,
         /// index, indices, edge, edges, color0}], elements: [{id,
-        /// globalId, class, name, node, ranges: [[batch, first, count]]}],
-        /// nodes: [{id, class, name, parent}], warnings}`; offsets in
+        /// globalId, class, name, node, storey, ranges: [[batch, first,
+        /// count]]}], nodes: [{id, class, name, parent, elevation}],
+        /// warnings}` (`storey` and `parent` index `nodes`; `elevation`
+        /// is a storey's, in metres, or null); offsets in
         /// elements of their arrays (`color0` in bytes, -1 for none).
         #[wasm_bindgen(js_name = metaJson)]
         pub fn meta_json(&self) -> String {
@@ -385,6 +439,10 @@ mod model {
                 }
                 None => -1,
             };
+            match b.storey {
+                Some(s) => o.push_str(&format!(",\"storey\":{s}")),
+                None => o.push_str(",\"storey\":null"),
+            }
             o.push_str(&format!(
                 ",\"vertex\":{},\"vertices\":{},\"index\":{},\"indices\":{},\"edge\":{},\"edges\":{},\"color0\":{}}}",
                 m.positions.len() / 3,
@@ -415,6 +473,10 @@ mod model {
                 Some(n) => o.push_str(&format!(",\"node\":{n}")),
                 None => o.push_str(",\"node\":null"),
             }
+            match e.storey {
+                Some(s) => o.push_str(&format!(",\"storey\":{s}")),
+                None => o.push_str(",\"storey\":null"),
+            }
             o.push_str(",\"ranges\":[");
             for (k, r) in e.ranges.iter().enumerate() {
                 if k > 0 {
@@ -434,8 +496,12 @@ mod model {
             o.push_str(",\"name\":");
             string(o, &n.name);
             match n.parent {
-                Some(p) => o.push_str(&format!(",\"parent\":{p}}}")),
-                None => o.push_str(",\"parent\":null}"),
+                Some(p) => o.push_str(&format!(",\"parent\":{p}")),
+                None => o.push_str(",\"parent\":null"),
+            }
+            match n.elevation {
+                Some(e) => o.push_str(&format!(",\"elevation\":{e}}}")),
+                None => o.push_str(",\"elevation\":null}"),
             }
         }
         let w = &scene.warnings;
@@ -478,6 +544,92 @@ mod model {
             .map(pack)
             .map_err(|e| JsError::new(&e.to_string()))
     }
+
+    /// Reads a Wavefront OBJ within `max_triangles`.
+    #[wasm_bindgen(js_name = parseObj)]
+    pub fn parse_obj(bytes: &[u8], max_triangles: f64) -> Result<Model, JsError> {
+        exav_render::obj::read(bytes, budget(max_triangles))
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Reads a Stanford PLY, ASCII or binary, within `max_triangles`.
+    #[wasm_bindgen(js_name = parsePly)]
+    pub fn parse_ply(bytes: &[u8], max_triangles: f64) -> Result<Model, JsError> {
+        exav_render::ply::read(bytes, budget(max_triangles))
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Reads a glTF 2.0 document or GLB file within `max_triangles`.
+    #[wasm_bindgen(js_name = parseGltf)]
+    pub fn parse_gltf(bytes: &[u8], max_triangles: f64) -> Result<Model, JsError> {
+        exav_render::gltf::read(bytes, budget(max_triangles))
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// The files a glTF document's buffers are in, as the URIs it writes
+    /// them: a JSON array of strings, empty when it needs none.
+    #[wasm_bindgen(js_name = gltfBuffers)]
+    pub fn gltf_buffers(bytes: &[u8]) -> Result<String, JsError> {
+        let names =
+            exav_render::gltf::external_buffers(bytes).map_err(|e| JsError::new(&e.to_string()))?;
+        let quoted: Vec<String> = names
+            .iter()
+            .map(|n| {
+                let mut o = String::new();
+                string(&mut o, n);
+                o
+            })
+            .collect();
+        Ok(format!("[{}]", quoted.join(",")))
+    }
+
+    /// [`parse_gltf`], given the buffer files: `names[i]` is the URI whose
+    /// bytes are the `lengths[i]` bytes of `files` after those before.
+    #[wasm_bindgen(js_name = parseGltfWith)]
+    pub fn parse_gltf_with(
+        bytes: &[u8],
+        max_triangles: f64,
+        names: Vec<String>,
+        files: &[u8],
+        lengths: Vec<u32>,
+    ) -> Result<Model, JsError> {
+        let mut at = 0usize;
+        let mut given: Vec<(&str, &[u8])> = Vec::new();
+        for (name, len) in names.iter().zip(&lengths) {
+            let end = at
+                .checked_add(*len as usize)
+                .filter(|e| *e <= files.len())
+                .ok_or_else(|| JsError::new("a buffer file is longer than the bytes given"))?;
+            given.push((name.as_str(), files.get(at..end).unwrap_or(&[])));
+            at = end;
+        }
+        exav_render::gltf::read_with(bytes, budget(max_triangles), &given)
+            .map(pack)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+}
+
+#[cfg(feature = "sheets")]
+mod sheets;
+
+#[cfg(feature = "slides")]
+mod slides;
+
+#[cfg(feature = "docs")]
+mod docs;
+
+#[cfg(feature = "text")]
+mod text {
+    use wasm_bindgen::prelude::*;
+
+    /// Reads Markdown into the JSON of `exav_render::markdown::Document`.
+    #[wasm_bindgen(js_name = parseMarkdown)]
+    pub fn parse_markdown(source: &str) -> String {
+        exav_render::markdown::parse(source).to_json()
+    }
 }
 
 /// Most bytes a pdf.js image decode may take in the module.
@@ -488,7 +640,7 @@ const PDF_IMAGE_MAX: u64 = 1 << 30;
 /// `_jp2_decode`.
 #[cfg(feature = "pdf-jpx")]
 mod pdf_jpx {
-    use exav_render::pdf_image::{decode_jpx, JpxParams};
+    use exav_render::pdf_image::{JpxParams, decode_jpx};
     use wasm_bindgen::prelude::*;
 
     /// The pixels pdf.js reads, or `undefined` where its decoder gives none.
@@ -517,7 +669,7 @@ mod pdf_jpx {
 /// `_jbig2_decode` and `_ccitt_decode`.
 #[cfg(feature = "pdf-jbig2")]
 mod pdf_jbig2 {
-    use exav_render::pdf_image::{decode_ccitt, decode_jbig2, CcittParams};
+    use exav_render::pdf_image::{CcittParams, decode_ccitt, decode_jbig2};
     use wasm_bindgen::prelude::*;
 
     /// Rows of 1-bit pixels, 1 for white. Empty `globals` is none.

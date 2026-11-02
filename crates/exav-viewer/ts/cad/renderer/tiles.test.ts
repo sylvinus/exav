@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { TILE_BYTES, decodeTiles, rangeTotal, viewMargin, visibleRanges, type Tile } from './tiles'
+import { TILE_BYTES, decodeRuns, decodeTiles, rangeTotal, viewMargin, visibleRanges, wholeTiles, type Tile } from './tiles'
 
 function tile(start: number, count: number, box: [number, number, number, number]): Tile {
   return { start, count, minX: box[0], minY: box[1], maxX: box[2], maxY: box[3] }
@@ -28,6 +28,30 @@ describe('decodeTiles', () => {
 
   it('is empty for an empty table', () => {
     expect(decodeTiles(new ArrayBuffer(0))).toEqual([])
+  })
+})
+
+describe('decodeRuns', () => {
+  it('reads the translucent runs scene.rs writes, a partial one left out', () => {
+    const words = new Uint32Array([1, 0, 2, 0, 3, 5, 1])
+    expect(decodeRuns(words.buffer)).toEqual([
+      { fills: true, from: 0, to: 2 },
+      { fills: false, from: 3, to: 5 },
+    ])
+  })
+})
+
+describe('wholeTiles', () => {
+  it('covers the opaque half and the translucent tail, each one tile seen from anywhere', () => {
+    const t = wholeTiles(10, 4)
+    expect(t.map((x) => [x.start, x.count])).toEqual([
+      [0, 4],
+      [4, 6],
+    ])
+    const view = { minX: 1e9, minY: 1e9, maxX: 1e9 + 1, maxY: 1e9 + 1 }
+    expect(visibleRanges(t, 1, 2, view, NO_MARGIN)).toEqual([{ start: 4, count: 6 }])
+    expect(wholeTiles(3, 3)).toHaveLength(1)
+    expect(wholeTiles(3, 0).map((x) => x.start)).toEqual([0])
   })
 })
 

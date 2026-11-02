@@ -15,10 +15,10 @@ fn main() {
     let mut sources = Vec::new();
     for e in std::fs::read_dir(&dir).unwrap().flatten() {
         let p = e.path();
-        if p.extension().map(|x| x == "cbc").unwrap_or(false) {
-            if let Ok(t) = std::fs::read_to_string(&p) {
-                sources.push(t);
-            }
+        if p.extension().map(|x| x == "cbc").unwrap_or(false)
+            && let Ok(t) = std::fs::read_to_string(&p)
+        {
+            sources.push(t);
         }
     }
     let (rt, triggers) = BytecodeRuntime::standalone(sources);

@@ -13,7 +13,7 @@
 //! Fixtures are the `unshield` project's own examples (MIT); see `NOTICE`.
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!(
@@ -156,6 +156,86 @@ fn a_member_that_expands_past_the_budget_is_reported() {
     );
 }
 
+/// An archive whose table of contents has `dirs` directory records, each
+/// declaring `dir_files` members and each a zero-length chunk, so that every
+/// record and every member reads the same bytes again. 498 bytes of this took
+/// the `unshield` reader 1.5 GB: it builds one entry per declared member before
+/// anything is checked.
+fn declared_member_bomb(dirs: u16, dir_files: u16) -> Vec<u8> {
+    const HEADER: usize = 255;
+    const TOC: usize = 64;
+    let mut d = vec![0u8; HEADER + TOC];
+    d[..4].copy_from_slice(&[0x13, 0x5D, 0x65, 0x8C]);
+    d[12..14].copy_from_slice(&1u16.to_le_bytes());
+    d[18..22].copy_from_slice(&((HEADER + TOC) as u32).to_le_bytes());
+    d[41..45].copy_from_slice(&(HEADER as u32).to_le_bytes());
+    d[49..51].copy_from_slice(&dirs.to_le_bytes());
+    d[HEADER..HEADER + 2].copy_from_slice(&dir_files.to_le_bytes());
+    d
+}
+
+#[test]
+fn a_table_declaring_more_members_than_the_walk_bound_is_reported_not_built() {
+    let blob = declared_member_bomb(1, u16::MAX);
+    assert_eq!(detect(&blob), Some(Format::IshieldZ));
+    let e = members(&blob);
+    assert_eq!(
+        e.len(),
+        1,
+        "got {:?}",
+        e.iter().map(|x| &x.name).collect::<Vec<_>>()
+    );
+    assert!(
+        e[0].unsupported.is_some(),
+        "members left unexamined must be reported"
+    );
+}
+
+#[test]
+fn a_table_of_many_directories_each_declaring_many_members_stays_small() {
+    // 65535 x 65535 declared members: 4 billion entries if built.
+    let blob = declared_member_bomb(u16::MAX, u16::MAX);
+    let e = members(&blob);
+    assert_eq!(e.len(), 1);
+    assert!(e[0].unsupported.is_some());
+}
+
+/// `undhr.z`'s one member twice, under the same path.
+fn same_path_twice() -> Vec<u8> {
+    let z = fixture("undhr.z");
+    let u32at = |o: usize| u32::from_le_bytes(z[o..o + 4].try_into().unwrap()) as usize;
+    let toc = &z[u32at(41)..u32at(18)];
+    let dir_chunk = u16::from_le_bytes([toc[2], toc[3]]) as usize;
+    let (dir, file) = toc.split_at(dir_chunk);
+    let data = &z[255..u32at(41)];
+
+    let mut out = z[..255].to_vec();
+    out.extend_from_slice(data);
+    out.extend_from_slice(data);
+    let toc_at = out.len();
+    out.extend_from_slice(&[2, 0]);
+    out.extend_from_slice(&dir[2..]);
+    out.extend_from_slice(file);
+    out.extend_from_slice(file);
+    let end = out.len() as u32;
+    out[18..22].copy_from_slice(&end.to_le_bytes());
+    out[41..45].copy_from_slice(&(toc_at as u32).to_le_bytes());
+    out
+}
+
+#[test]
+fn members_sharing_a_path_are_all_extracted() {
+    let e = members(&same_path_twice());
+    let want = fixture("undhr.md");
+    assert_eq!(
+        e.len(),
+        2,
+        "one member hid the other: {:?}",
+        e.iter().map(|x| &x.name).collect::<Vec<_>>()
+    );
+    assert!(e.iter().all(|x| x.data == want));
+}
+
 #[test]
 fn a_member_past_the_budget_is_reported_not_skipped() {
     let mut limits = Limits::default();
@@ -178,4 +258,68 @@ fn a_member_past_the_budget_is_reported_not_skipped() {
             .map(|x| (&x.name, x.unsupported))
             .collect::<Vec<_>>()
     );
+}
+
+/// `undhr.z` with its one member's compressed size (in the file record of the
+/// table of contents) set to `size`.
+fn with_member_size(size: u32) -> Vec<u8> {
+    let mut z = fixture("undhr.z");
+    let u32at = |z: &[u8], o: usize| u32::from_le_bytes(z[o..o + 4].try_into().unwrap()) as usize;
+    let toc = u32at(&z, 41);
+    let dir_chunk = u16::from_le_bytes([z[toc + 2], z[toc + 3]]) as usize;
+    let at = toc + dir_chunk + 7;
+    z[at..at + 4].copy_from_slice(&size.to_le_bytes());
+    z
+}
+
+#[test]
+fn a_member_cut_inside_its_stream_keeps_its_prefix_and_is_reported() {
+    let whole = members(&fixture("undhr.z"));
+    let want = fixture("undhr.md");
+    let half = (whole[0].comp_size / 2) as u32;
+    let e = members(&with_member_size(half));
+    assert_eq!(e.len(), 1);
+    assert!(
+        e[0].unsupported.is_some(),
+        "a member whose stream stops short was reported as whole"
+    );
+    assert!(
+        e[0].data.len() > 100 && want.starts_with(&e[0].data),
+        "the decoded prefix is lost: {} bytes",
+        e[0].data.len()
+    );
+    assert!(e[0].data.len() < want.len());
+}
+
+#[test]
+fn a_member_damaged_part_way_keeps_its_prefix_and_is_reported() {
+    // A byte of the compressed data set to each value in turn until one
+    // makes the stream invalid after it has produced output.
+    let z = fixture("undhr.z");
+    let want = fixture("undhr.md");
+    let mut found = false;
+    for at in (300..1500).step_by(7) {
+        let mut bad = z.clone();
+        bad[at] = !bad[at];
+        let e = members(&bad);
+        if e.len() != 1 || e[0].unsupported.is_none() || e[0].data.is_empty() {
+            continue;
+        }
+        found = true;
+        // Output before the damaged byte is the file's own.
+        assert!(e[0].data.starts_with(&want[..20]), "byte {at}");
+        break;
+    }
+    assert!(found, "no damaged member kept a decoded prefix");
+}
+
+#[test]
+fn a_member_whose_range_runs_past_the_file_is_reported() {
+    // Past the end of the file, but within the size budget; its stream still
+    // ends, so only the range says something is wrong.
+    let whole = members(&fixture("undhr.z"));
+    let e = members(&with_member_size(whole[0].comp_size as u32 + 100_000));
+    assert_eq!(e.len(), 1);
+    assert!(e[0].unsupported.is_some());
+    assert_eq!(e[0].data, fixture("undhr.md"));
 }

@@ -29,7 +29,7 @@ mod source;
 
 use exav_unpack::source::BlockCache;
 use exav_unpack::{
-    walk, Budget, ByteSource, Entry as UnpackEntry, Format, LimitHit, Limits, Member, MemberMeta,
+    Budget, ByteSource, Entry as UnpackEntry, Format, LimitHit, Limits, Member, MemberMeta, walk,
 };
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use source::Src;
@@ -248,16 +248,16 @@ fn limits_from_js(v: &JsValue) -> Limits {
     // An unknown name is ignored rather than rejected: a page pinned to an
     // older module should not fail outright because it listed a format that
     // build does not have, and anything not listed is excluded anyway.
-    if let Ok(v) = Reflect::get(v, &JsValue::from_str("allowedFormats")) {
-        if let Some(arr) = v.dyn_ref::<Array>() {
-            let mut set = std::collections::BTreeSet::new();
-            for item in arr.iter() {
-                if let Some(f) = item.as_string().and_then(|n| format_by_name(&n)) {
-                    set.insert(f);
-                }
+    if let Ok(v) = Reflect::get(v, &JsValue::from_str("allowedFormats"))
+        && let Some(arr) = v.dyn_ref::<Array>()
+    {
+        let mut set = std::collections::BTreeSet::new();
+        for item in arr.iter() {
+            if let Some(f) = item.as_string().and_then(|n| format_by_name(&n)) {
+                set.insert(f);
             }
-            l.allowed_formats = Some(set);
         }
+        l.allowed_formats = Some(set);
     }
     l
 }
@@ -587,4 +587,117 @@ pub fn join_volumes(files: &Array) -> Result<Array, JsValue> {
 #[wasm_bindgen(js_name = "isVolumePart")]
 pub fn is_volume_part(name: &str) -> bool {
     exav_unpack::volume::parse(name).is_some_and(|v| v.scheme.is_byte_split())
+}
+
+/// The volumes of the set `name` belongs to, among `names` (the file names of
+/// one directory): `{ parts, scheme, complete }`, `parts` in volume order,
+/// `scheme` "split" (`big.7z.001`), "rar" (`x.part1.rar`, `x.rar` and
+/// `x.r00`) or "zip" (`x.z01` ... `x.zip`), and `complete` whether the set has
+/// every volume from the first to the last. `null` where `name` is not one of
+/// two or more volumes: a lone `x.rar` or `x.zip` is an archive on its own.
+///
+/// Names only, matched as `volume::parse` reads them: nothing is opened, and
+/// nothing outside `names` can be named.
+#[wasm_bindgen(js_name = "volumeSet")]
+pub fn volume_set(name: &str, names: Vec<String>) -> JsValue {
+    use exav_unpack::volume::{self, Scheme};
+    let ci = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    // `x.zip` is the last volume of `x.z01`, `x.z02` ...
+    let zip_last = name
+        .len()
+        .checked_sub(4)
+        .and_then(|at| name.get(..at).zip(name.get(at..)))
+        .filter(|(_, ext)| ci(ext, ".zip"))
+        .map(|(stem, _)| stem.to_string());
+    let seed = match volume::parse(name) {
+        Some(v) => v,
+        None => match zip_last {
+            Some(stem) => volume::VolumeName {
+                stem,
+                index: 0,
+                scheme: Scheme::ZipSplit,
+            },
+            None => return JsValue::NULL,
+        },
+    };
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for n in &names {
+        if let Some(v) = volume::parse(n)
+            && seed.same_set_as(&v)
+        {
+            found.push((v.index, n.clone()));
+        }
+    }
+    let mut last_zip = None;
+    if matches!(seed.scheme, Scheme::ZipSplit) {
+        last_zip = names
+            .iter()
+            .find(|n| ci(n, &format!("{}.zip", seed.stem)))
+            .cloned();
+    }
+    found.sort_by_key(|(i, _)| *i);
+    // Two names for one position: the shape is not the one a writer made.
+    let clash = found.array_windows().any(|[a, b]| a.0 == b.0);
+    let mut parts: Vec<String> = found.iter().map(|(_, n)| n.clone()).collect();
+    let mut complete = !clash && found.iter().enumerate().all(|(k, (i, _))| k == *i);
+    if matches!(seed.scheme, Scheme::ZipSplit) {
+        // The central directory is in the last part: no `.zip`, no archive.
+        complete &= last_zip.is_some();
+        parts.extend(last_zip);
+    }
+    if parts.len() < 2 {
+        return JsValue::NULL;
+    }
+    let scheme = match seed.scheme {
+        Scheme::NumberedSuffix { .. } => "split",
+        Scheme::RarPart { .. } | Scheme::RarOld => "rar",
+        Scheme::ZipSplit => "zip",
+    };
+    let out = Object::new();
+    let list = Array::new();
+    for p in &parts {
+        list.push(&JsValue::from_str(p));
+    }
+    let _ = Reflect::set(&out, &"parts".into(), &list);
+    let _ = Reflect::set(&out, &"scheme".into(), &JsValue::from_str(scheme));
+    let _ = Reflect::set(&out, &"complete".into(), &JsValue::from_bool(complete));
+    out.into()
+}
+
+/// The volumes of a complete set, given in volume order, as the one archive
+/// they make: "split" parts end to end, a "rar" set through the RAR decoder's
+/// joiner, a "zip" set (`.z01` ... `.zip`) read as one stream. The result is
+/// what `Archive.open` takes.
+#[wasm_bindgen(js_name = "joinSet")]
+pub fn join_set(scheme: &str, parts: &Array) -> Result<Uint8Array, JsValue> {
+    let mut volumes: Vec<Vec<u8>> = Vec::new();
+    for p in parts.iter() {
+        let bytes = p
+            .dyn_ref::<Uint8Array>()
+            .ok_or_else(|| JsValue::from_str("each part must be a Uint8Array"))?;
+        volumes.push(bytes.to_vec());
+    }
+    let joined: Vec<u8> = match scheme {
+        "split" => volumes.concat(),
+        #[cfg(feature = "rar")]
+        "rar" => {
+            let slices: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+            exav_unpack::join_rar_volumes(&slices).map_err(err)?
+        }
+        #[cfg(feature = "zip")]
+        "zip" => {
+            let boxed: Vec<Box<dyn ByteSource>> = volumes
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn ByteSource>)
+                .collect();
+            let span = exav_unpack::span::ZipSpan::new(boxed).map_err(err)?;
+            span.window(0, span.len()).into_owned()
+        }
+        other => {
+            return Err(JsValue::from_str(&format!(
+                "a \"{other}\" set cannot be joined by this build"
+            )));
+        }
+    };
+    Ok(Uint8Array::from(joined.as_slice()))
 }

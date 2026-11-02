@@ -39,4 +39,4 @@ pub mod run;
 pub(crate) mod win;
 
 pub use mem::PAGE_SIZE;
-pub use run::{unpack, EmuLimits, Report, Unpacked};
+pub use run::{EmuLimits, Report, Unpacked, unpack};

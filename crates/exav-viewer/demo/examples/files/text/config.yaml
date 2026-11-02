@@ -1,0 +1,28 @@
+# A configuration file, to show YAML as text.
+service:
+  name: harbour-register
+  port: 8080
+  debug: false
+  tags: [boats, berths, "quay east"]
+  limits:
+    requests_per_minute: 600
+    body_bytes: 1048576
+database:
+  url: postgres://register@localhost:5432/harbour
+  pool: {min: 2, max: 10}
+berths:
+  - number: 1
+    length_m: 6.5
+    vessel: Aurora
+  - number: 2
+    length_m: 8.2
+    vessel: Brise
+notes: |
+  A block of text that keeps
+  its line breaks.
+folded: >
+  A block of text that is
+  folded into one line.
+anchors:
+  base: &base {retries: 3, timeout_s: 30}
+  copy: *base

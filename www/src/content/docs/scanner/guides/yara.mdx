@@ -57,9 +57,8 @@ bitwise, float, comparisons, string operators, `matches`); `for … in`,
 
 External variables: `filepath`, `filename` and `extension` (lowercased, with its
 leading dot) are set from the scanned file's path, and undefined when there is
-none. `filetype` and `owner` are
-declared, so rules using them compile, but are never set, so those conditions
-never match.
+none. `filetype` and `owner` are declared, so rules using them compile, but they
+are never set and those conditions never match.
 
 **Not supported**, and rejected as explicit compile errors rather than evaluated
 wrongly: the `macho`, `dex`, `cuckoo`, `androguard` and other modules; `include`;
@@ -83,13 +82,12 @@ out of evaluation steps. See [Limits and tuning](/scanner/reference/limits/).
 
 ## How matching is verified
 
-Matching is cross-checked against the real `yara-x` over varied inputs,
-comparing the set of matching rules (see
-[Differential testing](/scanner/concepts/differential-testing/)). The harness runs
-yara-x as a program (`yr`) rather than linking it, which would bring its
-WebAssembly runtime into exav's build. Install it with
-`cargo install yara-x-cli` and run `make test-yara-diff`; without it the harness
-skips, so read its output rather than only its exit code.
+The set of matching rules is compared with the real `yara-x` over varied inputs
+(see [Differential testing](/scanner/concepts/differential-testing/)). The
+harness runs yara-x as a program (`yr`) instead of linking it, which would bring
+its WebAssembly runtime into exav's build. Install it with
+`cargo install yara-x-cli` and run `make test-yara-diff`. Without `yr` the
+harness skips, so read its output rather than only its exit code.
 
 ## Using the engine directly
 

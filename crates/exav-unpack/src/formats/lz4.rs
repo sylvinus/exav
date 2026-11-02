@@ -53,7 +53,7 @@ fn le_u32(d: &[u8], off: usize) -> Option<u32> {
 /// Decompress one LZ4 block, appending to `out`. Matches may reach back before
 /// `block_start` when blocks are linked, which is why the whole output buffer is
 /// passed rather than a per-block one.
-fn block(src: &[u8], out: &mut Vec<u8>, cap: usize) -> Result<(), &'static str> {
+pub(crate) fn block(src: &[u8], out: &mut Vec<u8>, cap: usize) -> Result<(), &'static str> {
     let mut i = 0usize;
     while i < src.len() {
         let token = src[i];

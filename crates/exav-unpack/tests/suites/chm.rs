@@ -11,7 +11,7 @@
 //!   The tests read them at runtime and **skip when absent** (a fresh clone /
 //!   CI), adding extra real-world hostile-input robustness for local runs.
 
-use exav_unpack::{detect, extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, detect, extract};
 
 /// The committed, benign LZX oracle. Must always be present.
 const BENIGN_LZX: &str = "benign-lzx.chm";

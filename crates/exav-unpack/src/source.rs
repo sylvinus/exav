@@ -310,14 +310,13 @@ impl<R: Read + Seek> BlockCache<R> {
             out.extend_from_slice(&data[skip..end]);
         }
         let whole = end == skip + want;
-        if blocks.len() >= self.max_blocks {
-            if let Some(&old) = blocks
+        if blocks.len() >= self.max_blocks
+            && let Some(&old) = blocks
                 .iter()
                 .min_by_key(|(_, (_, used))| *used)
                 .map(|(k, _)| k)
-            {
-                blocks.remove(&old);
-            }
+        {
+            blocks.remove(&old);
         }
         blocks.insert(idx, (data.into_boxed_slice(), tick));
         whole
@@ -631,7 +630,7 @@ pub fn bytes<'a, B: ByteSource + ?Sized>(
 /// A source that claims `claimed` bytes and delivers only `data`, for tests of
 /// what a failed read does.
 #[cfg(test)]
-pub(crate) fn short_source(data: &[u8], claimed: u64) -> BlockCache<impl Read + Seek> {
+pub(crate) fn short_source(data: &[u8], claimed: u64) -> BlockCache<impl Read + Seek + use<>> {
     struct Short(std::io::Cursor<Vec<u8>>, u64);
     impl Read for Short {
         fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {

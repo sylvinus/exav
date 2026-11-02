@@ -13,12 +13,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use exav_core::{scan_seekable_located, ScanOptions, Scanner};
+use exav_core::{ScanOptions, Scanner, scan_seekable_located};
 
-use super::chunked::{read_chunked_body, Body, BodyEnd, BodyError, BodyOutcome};
+use super::chunked::{Body, BodyEnd, BodyError, BodyOutcome, read_chunked_body};
 use super::config::IcapConfig;
 use super::response::{self, Decision};
-use super::wire::{read_head, Entity, IcapMethod, RequestHead};
+use super::wire::{Entity, IcapMethod, RequestHead, read_head};
 use crate::daemon::Held;
 
 /// Supplies the signature database to scan the next request with.
@@ -112,7 +112,7 @@ impl Server {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                     ) =>
                 {
-                    continue
+                    continue;
                 }
                 // One failed accept (a client that vanished between the SYN and
                 // the accept, say) is not a reason to stop serving.
@@ -532,11 +532,11 @@ fn modify<R: BufRead, W: Write>(
 /// the budget first is the reason, and the later read must not overwrite it with
 /// `None`.
 fn take_rejection(slot: &mut Option<String>, outcome: &BodyOutcome) {
-    if let Some(reason) = &outcome.rejected {
-        if slot.is_none() {
-            eprintln!("exav: icap: cannot buffer this object: {reason}");
-            *slot = Some(reason.clone());
-        }
+    if let Some(reason) = &outcome.rejected
+        && slot.is_none()
+    {
+        eprintln!("exav: icap: cannot buffer this object: {reason}");
+        *slot = Some(reason.clone());
     }
 }
 

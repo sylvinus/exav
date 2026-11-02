@@ -15,24 +15,26 @@ export const SINKS = /\binnerHTML\b|\bouterHTML\b|insertAdjacentHTML|document\.w
 
 /** The reviewed occurrences: which sink, the code around it, and why it is safe. */
 export const ALLOWED = [
-  { sink: "innerHTML", around: /\binnerHTML=""/, why: "an element cleared (@silurus/ooxml, React)" },
+  // The minifier writes a string with double quotes or as a template literal,
+  // whichever the version of the bundler picks, so each entry takes both.
+  { sink: "innerHTML", around: /\binnerHTML=(""|``)/, why: "an element cleared (@silurus/ooxml, React)" },
   {
     sink: "innerHTML",
     around: /\.innerHTML=`<svg width="\$\{\w+\}" height="\$\{\w+\}" viewBox="0 0 10 6"/,
     why: "@silurus/ooxml: the spreadsheet's validation arrow, a constant SVG sized by a number",
   },
-  { sink: "innerHTML", around: /\.innerHTML='<svg viewBox="0 0 24 24" width="100%" height="100%" aria-h/, why: "@silurus/ooxml: the comment icon, a constant SVG" },
-  { sink: "innerHTML", around: /\.innerHTML="<script><\\\/script>"/, why: "React: makes an inert script element to clone" },
+  { sink: "innerHTML", around: /\.innerHTML=['`]<svg viewBox="0 0 24 24" width="100%" height="100%" aria-h/, why: "@silurus/ooxml: the comment icon, a constant SVG" },
+  { sink: "innerHTML", around: /\.innerHTML=["`]<script><\\\/script>["`]/, why: "React: makes an inert script element to clone" },
   { sink: "innerHTML", around: /__html!==\w+&&\(\w+\.innerHTML=\w+\)/, why: "React: dangerouslySetInnerHTML, which no component of the package uses (check-sinks.mjs)" },
-  { sink: "innerHTML", around: /case"innerHTML":/, why: "React: a prop name it skips" },
-  { sink: "dangerouslySetInnerHTML", around: /"dangerouslySetInnerHTML"|\.dangerouslySetInnerHTML[=!.]/, why: "React: its own handling of the prop, unused by the package" },
-  { sink: "javascript:", around: /"javascript:throw new Error\('(React has blocked a javascript: URL|A React form was unexpectedly submitted)/, why: "React: the URLs it puts in place of a javascript: URL" },
+  { sink: "innerHTML", around: /case["`]innerHTML["`]:/, why: "React: a prop name it skips" },
+  { sink: "dangerouslySetInnerHTML", around: /["`]dangerouslySetInnerHTML["`]|\.dangerouslySetInnerHTML[=!.]/, why: "React: its own handling of the prop, unused by the package" },
+  { sink: "javascript:", around: /["`]javascript:throw new Error\('(React has blocked a javascript: URL|A React form was unexpectedly submitted)/, why: "React: the URLs it puts in place of a javascript: URL" },
   { sink: "Function(", around: /`Function\(\$\{\w+\}\)`/, why: "wasm-bindgen's debug string of a function: text" },
   { sink: "importScripts", around: /importScripts\(p \? p\.createScriptURL\(\$\{/, why: "@exav/viewer's frame: the text of a worker's blob (ts/frame/app/workers.ts)" },
   { sink: "parseFromString", around: /parseFromString\(\w+\)\{if\(this\._currentFragment=\[\]/, why: "pdf.js's own XML parser, a method of its class: no DOM" },
   { sink: "parseFromString", around: /new \w+\(\{(lowerCaseName|hasAttributes):!0\}\)\.parseFromString\(/, why: "pdf.js's own XML parser" },
-  { sink: "parseFromString", around: /\w+\.parseFromString\(\w+\["xdp:xdp"\]\)/, why: "pdf.js's own XML parser (XFA, which is off)" },
-  { sink: "parseFromString", around: /case"document":return \w+\.text\(\)\.then\(\w+=>new DOMParser\(\)\.parseFromString\(\w+,\w+\)\)/, why: "three's FileLoader for responseType document, which no loader the package uses asks for" },
+  { sink: "parseFromString", around: /\w+\.parseFromString\(\w+\[["`]xdp:xdp["`]\]\)/, why: "pdf.js's own XML parser (XFA, which is off)" },
+  { sink: "parseFromString", around: /case["`]document["`]:return \w+\.text\(\)\.then\(\w+=>new DOMParser\(\)\.parseFromString\(\w+,\w+\)\)/, why: "three's FileLoader for responseType document, which no loader the package uses asks for" },
 ];
 
 const WINDOW = 60;

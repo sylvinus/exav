@@ -6,7 +6,7 @@
 //! directory walk that ignores the tree structure and recovers the stream
 //! contents anyway, so embedded payloads can't hide behind a broken directory.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 

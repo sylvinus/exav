@@ -78,13 +78,13 @@ where
             tiff::ColorType::RGBA(32) => ColorType::Rgba32F,
 
             tiff::ColorType::Palette(n) | tiff::ColorType::Gray(n) => {
-                return Err(err_unknown_color_type(n))
+                return Err(err_unknown_color_type(n));
             }
             tiff::ColorType::GrayA(n) => return Err(err_unknown_color_type(n.saturating_mul(2))),
             tiff::ColorType::RGB(n) => return Err(err_unknown_color_type(n.saturating_mul(3))),
             tiff::ColorType::YCbCr(n) => return Err(err_unknown_color_type(n.saturating_mul(3))),
             tiff::ColorType::RGBA(n) | tiff::ColorType::CMYK(n) => {
-                return Err(err_unknown_color_type(n.saturating_mul(4)))
+                return Err(err_unknown_color_type(n.saturating_mul(4)));
             }
             tiff::ColorType::Multiband {
                 bit_depth,
@@ -92,7 +92,7 @@ where
             } => {
                 return Err(err_unknown_color_type(
                     bit_depth.saturating_mul(num_samples.min(255) as u8),
-                ))
+                ));
             }
             _ => return Err(err_unknown_color_type(0)),
         };
@@ -127,7 +127,7 @@ where
 }
 
 fn check_sample_format(sample_format: u16, color_type: tiff::ColorType) -> Result<(), ImageError> {
-    use tiff::{tags::SampleFormat, ColorType};
+    use tiff::{ColorType, tags::SampleFormat};
     let num_bits = match color_type {
         ColorType::CMYK(k) => k,
         ColorType::Gray(k) => k,
@@ -142,7 +142,7 @@ fn check_sample_format(sample_format: u16, color_type: tiff::ColorType) -> Resul
                         "Unhandled TIFF color type {color_type:?} for {k} bits",
                     )),
                 ),
-            ))
+            ));
         }
         _ => {
             return Err(ImageError::Unsupported(
@@ -152,7 +152,7 @@ fn check_sample_format(sample_format: u16, color_type: tiff::ColorType) -> Resul
                         "Unhandled TIFF color type {color_type:?}",
                     )),
                 ),
-            ))
+            ));
         }
     };
 

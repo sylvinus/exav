@@ -10,7 +10,7 @@
 //! The seed is a database written by `scripts/fuzz-seeds.sh` from `fuzz/db/`.
 //! Checked beyond "does not panic": a database that reads scans, and writes
 //! back to one that reads and scans the same.
-use exav_core::{analyze, database, ScanOptions};
+use exav_core::{ScanOptions, analyze, database};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -26,5 +26,9 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let back = database::read(again.as_slice()).expect("a database written out reads");
-    assert_eq!(analyze(&back, sample, &opts).verdict, first, "a database read, written and read scans differently");
+    assert_eq!(
+        analyze(&back, sample, &opts).verdict,
+        first,
+        "a database read, written and read scans differently"
+    );
 });

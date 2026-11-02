@@ -21,13 +21,14 @@
 //!
 //! ## Under the worker pool
 //!
-//! The prefork daemon answers each connection from a forked child, so these
-//! counters live in whichever process handled the request and cover that
-//! process's own jobs. `STATS` says so rather than presenting one worker's
-//! numbers as the pool's. The thread-model daemon (`--workers 0`) and the ICAP
-//! listener are single processes, where the totals are the whole story.
+//! The prefork daemon answers each connection from a forked child. The counters
+//! are in memory the supervisor maps shared before it forks, each process
+//! writing its own slot of the in-flight gauge, so `STATS` from any process of
+//! the pool reports the pool's totals. A slot is cleared when its process is
+//! reaped. The thread-model daemon (`--workers 0`) and the ICAP listener are
+//! single processes.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Duration;
 
 use exav_core::profile::Profile;
@@ -74,34 +75,109 @@ const CELLS: usize = MATCHERS.len() + 1;
 /// Index of the catch-all cell.
 const OTHER: usize = MATCHERS.len();
 
-// `AtomicU64` is not `Copy`, so the array cannot be built with `[expr; N]` and
-// the cells have to be listed. The declared length is `CELLS`, derived from
-// `MATCHERS`, so adding a matcher name without adding a cell fails to compile
-// rather than silently dropping that matcher's numbers.
-static MATCHER_CELLS: [MatcherCell; CELLS] = [
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-    MatcherCell::new(),
-];
+/// Processes whose scans in flight are counted apart: the slot of a process is
+/// its pid modulo this.
+const SLOTS: usize = 4096;
 
-static SCANS: AtomicU64 = AtomicU64::new(0);
-static BYTES: AtomicU64 = AtomicU64::new(0);
-static NANOS: AtomicU64 = AtomicU64::new(0);
-static SLOWEST_NS: AtomicU64 = AtomicU64::new(0);
-static SLOW: AtomicU64 = AtomicU64::new(0);
-static INFECTED: AtomicU64 = AtomicU64::new(0);
-static PARTIAL: AtomicU64 = AtomicU64::new(0);
-static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+/// Everything counted, in one block so that it can sit in memory the forked
+/// processes of the pool share.
+struct Counters {
+    scans: AtomicU64,
+    bytes: AtomicU64,
+    nanos: AtomicU64,
+    slowest_ns: AtomicU64,
+    slow: AtomicU64,
+    infected: AtomicU64,
+    partial: AtomicU64,
+    /// Scans running, by process. Apart because a worker killed mid-scan (its
+    /// time ran out) would otherwise leave the gauge one too high for good;
+    /// the supervisor clears the slot of a child it reaps ([`release`]).
+    in_flight: [AtomicU64; SLOTS],
+    cells: [MatcherCell; CELLS],
+}
+
+impl Counters {
+    const fn new() -> Self {
+        Self {
+            scans: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+            slowest_ns: AtomicU64::new(0),
+            slow: AtomicU64::new(0),
+            infected: AtomicU64::new(0),
+            partial: AtomicU64::new(0),
+            in_flight: [const { AtomicU64::new(0) }; SLOTS],
+            cells: [const { MatcherCell::new() }; CELLS],
+        }
+    }
+}
+
+/// This process's own counters: where they are until the supervisor of a pool
+/// puts them somewhere its children share.
+static LOCAL: Counters = Counters::new();
+
+/// The shared block, once there is one.
+static SHARED: AtomicPtr<Counters> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The counters in use.
+fn c() -> &'static Counters {
+    let shared = SHARED.load(Ordering::Acquire);
+    if shared.is_null() {
+        &LOCAL
+    } else {
+        // SAFETY: set only by `share_across_fork`, to a mapping that is never
+        // unmapped, is the size of `Counters`, and holds only atomics, which
+        // are valid at any bit pattern and meant to be used from many processes.
+        unsafe { &*shared }
+    }
+}
+
+/// Put the counters in memory shared with every process forked from here on,
+/// so that `STATS` in any of them (and in the health child) reports the whole
+/// pool and not one worker. Called once, by the supervisor, before it forks.
+/// On failure the counters stay each process's own and the reason is returned.
+#[cfg(unix)]
+pub(crate) fn share_across_fork() -> std::io::Result<()> {
+    // SAFETY: an anonymous shared mapping of the size of `Counters`, which the
+    // kernel zero-fills (every field is an atomic whose zero is its initial
+    // value). Nothing else refers to it, and it is never unmapped.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            std::mem::size_of::<Counters>(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    SHARED.store(ptr.cast(), Ordering::Release);
+    Ok(())
+}
+
+/// Clear the scans in flight of child `pid`, which has exited: whatever it was
+/// doing, it is not doing it now.
+#[cfg(unix)]
+pub(crate) fn release(pid: i32) {
+    c().in_flight[slot_of(pid)].store(0, Ordering::Relaxed);
+}
+
+fn slot_of(pid: i32) -> usize {
+    pid as usize % SLOTS
+}
+
+#[cfg(unix)]
+fn my_slot() -> usize {
+    slot_of(std::process::id() as i32)
+}
+
+#[cfg(not(unix))]
+fn my_slot() -> usize {
+    0
+}
 
 /// Whether the per-matcher breakdown is being collected.
 static PROFILING: AtomicBool = AtomicBool::new(false);
@@ -127,7 +203,10 @@ pub(crate) fn profiling() -> bool {
 /// Scans running right now, for the `QUEUE`/`THREADS` fields a clamd client
 /// polls to see whether the server is saturated.
 pub(crate) fn in_flight() -> u64 {
-    IN_FLIGHT.load(Ordering::Relaxed)
+    c().in_flight
+        .iter()
+        .map(|n| n.load(Ordering::Relaxed))
+        .sum()
 }
 
 /// Log the totals every `interval`, from whichever process is serving.
@@ -146,10 +225,10 @@ pub(crate) fn spawn_reporter(interval: Duration, what: &'static str) {
         return;
     }
     std::thread::spawn(move || {
-        let mut last = SCANS.load(Ordering::Relaxed);
+        let mut last = c().scans.load(Ordering::Relaxed);
         loop {
             std::thread::sleep(interval);
-            let now = SCANS.load(Ordering::Relaxed);
+            let now = c().scans.load(Ordering::Relaxed);
             if now == last {
                 continue;
             }
@@ -165,7 +244,7 @@ pub(crate) fn spawn_reporter(interval: Duration, what: &'static str) {
 /// what it scanned (the daemon's, Unix only).
 #[cfg(all(test, unix))]
 pub(crate) fn scans() -> u64 {
-    SCANS.load(Ordering::Relaxed)
+    c().scans.load(Ordering::Relaxed)
 }
 
 /// A scan in progress, and the counters it will land in when it finishes.
@@ -176,37 +255,54 @@ pub(crate) fn scans() -> u64 {
 /// decrements on the happy path reads as a permanently busy server.
 pub(crate) struct ScanTimer {
     start: std::time::Instant,
+    /// The gauge was given back, by `finish` or by dropping the timer.
+    released: bool,
 }
 
 impl ScanTimer {
     /// Start timing, and enable per-matcher profiling on this thread when it is
     /// switched on.
     pub(crate) fn start() -> Self {
-        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        c().in_flight[my_slot()].fetch_add(1, Ordering::Relaxed);
         if profiling() {
             exav_core::profile::enable();
         }
         Self {
             start: std::time::Instant::now(),
+            released: false,
+        }
+    }
+
+    /// Give the in-flight gauge back, once.
+    fn release(&mut self) {
+        if std::mem::replace(&mut self.released, true) {
+            return;
+        }
+        // Not below zero: a supervisor that cleared this slot after this
+        // process was thought dead must not wrap it.
+        let slot = &c().in_flight[my_slot()];
+        if slot.fetch_sub(1, Ordering::Relaxed) == 0 {
+            slot.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Record the finished scan. `target` names the object for the slow-scan
     /// line; `bytes` is its size.
-    pub(crate) fn finish(self, target: &str, bytes: u64, category: Category) {
+    pub(crate) fn finish(mut self, target: &str, bytes: u64, category: Category) {
         let elapsed = self.start.elapsed();
         let ns = elapsed.as_nanos() as u64;
-        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-        SCANS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(bytes, Ordering::Relaxed);
-        NANOS.fetch_add(ns, Ordering::Relaxed);
-        SLOWEST_NS.fetch_max(ns, Ordering::Relaxed);
+        let k = c();
+        self.release();
+        k.scans.fetch_add(1, Ordering::Relaxed);
+        k.bytes.fetch_add(bytes, Ordering::Relaxed);
+        k.nanos.fetch_add(ns, Ordering::Relaxed);
+        k.slowest_ns.fetch_max(ns, Ordering::Relaxed);
         match category {
             Category::Infected => {
-                INFECTED.fetch_add(1, Ordering::Relaxed);
+                k.infected.fetch_add(1, Ordering::Relaxed);
             }
             Category::Partial => {
-                PARTIAL.fetch_add(1, Ordering::Relaxed);
+                k.partial.fetch_add(1, Ordering::Relaxed);
             }
             Category::Clean => {}
         }
@@ -214,7 +310,7 @@ impl ScanTimer {
         let profile = exav_core::profile::take();
         if let Some(p) = &profile {
             for (name, stat) in p.iter() {
-                let cell = &MATCHER_CELLS[index_of(name)];
+                let cell = &k.cells[index_of(name)];
                 cell.ns.fetch_add(stat.ns, Ordering::Relaxed);
                 cell.calls.fetch_add(stat.calls, Ordering::Relaxed);
                 cell.bytes.fetch_add(stat.bytes, Ordering::Relaxed);
@@ -223,7 +319,7 @@ impl ScanTimer {
 
         let threshold = SLOW_AFTER_NS.load(Ordering::Relaxed);
         if threshold > 0 && ns >= threshold {
-            SLOW.fetch_add(1, Ordering::Relaxed);
+            k.slow.fetch_add(1, Ordering::Relaxed);
             // The point of the line is to name the object, because the next
             // question is always "which one?" and a listener holds nothing to
             // go back to. The breakdown follows when there is one.
@@ -235,6 +331,19 @@ impl ScanTimer {
                     .map(|p| format!(" [{}]", breakdown(&p)))
                     .unwrap_or_default()
             );
+        }
+    }
+}
+
+/// A scan that ends without `finish` (a panic unwinding, an early return)
+/// still gives the gauge back. It is not counted as a scan.
+impl Drop for ScanTimer {
+    fn drop(&mut self) {
+        if !self.released {
+            self.release();
+            // Profiling was enabled on this thread for a scan that did not
+            // report.
+            let _ = exav_core::profile::take();
         }
     }
 }
@@ -298,22 +407,23 @@ pub(crate) struct Snapshot {
 }
 
 fn snapshot() -> Snapshot {
+    let k = c();
     Snapshot {
-        scans: SCANS.load(Ordering::Relaxed),
-        bytes: BYTES.load(Ordering::Relaxed),
-        ns: NANOS.load(Ordering::Relaxed),
-        slowest_ns: SLOWEST_NS.load(Ordering::Relaxed),
-        slow: SLOW.load(Ordering::Relaxed),
-        infected: INFECTED.load(Ordering::Relaxed),
-        partial: PARTIAL.load(Ordering::Relaxed),
-        in_flight: IN_FLIGHT.load(Ordering::Relaxed),
+        scans: k.scans.load(Ordering::Relaxed),
+        bytes: k.bytes.load(Ordering::Relaxed),
+        ns: k.nanos.load(Ordering::Relaxed),
+        slowest_ns: k.slowest_ns.load(Ordering::Relaxed),
+        slow: k.slow.load(Ordering::Relaxed),
+        infected: k.infected.load(Ordering::Relaxed),
+        partial: k.partial.load(Ordering::Relaxed),
+        in_flight: in_flight(),
         profiling: profiling(),
         matchers: MATCHERS
             .iter()
             .chain(std::iter::once(&"other"))
             .enumerate()
             .filter_map(|(i, name)| {
-                let cell = &MATCHER_CELLS[i];
+                let cell = &k.cells[i];
                 let calls = cell.calls.load(Ordering::Relaxed);
                 (calls > 0).then(|| {
                     (
@@ -385,7 +495,7 @@ mod tests {
 
     #[test]
     fn every_matcher_has_a_cell_and_a_home() {
-        assert_eq!(MATCHER_CELLS.len(), CELLS);
+        assert_eq!(c().cells.len(), CELLS);
         for (i, name) in MATCHERS.iter().enumerate() {
             assert_eq!(index_of(name), i, "{name}");
         }
@@ -432,26 +542,65 @@ mod tests {
     fn a_timed_scan_lands_in_the_totals() {
         // Counters are process-global and this binary's tests run in parallel,
         // so the assertions are about movement, not absolute values.
-        let before = SCANS.load(Ordering::Relaxed);
-        let infected_before = INFECTED.load(Ordering::Relaxed);
+        let before = c().scans.load(Ordering::Relaxed);
+        let infected_before = c().infected.load(Ordering::Relaxed);
         let t = ScanTimer::start();
-        assert!(
-            IN_FLIGHT.load(Ordering::Relaxed) >= 1,
-            "a running scan must show as in flight"
-        );
+        assert!(in_flight() >= 1, "a running scan must show as in flight");
         t.finish("some-object", 4096, Category::Infected);
-        assert!(SCANS.load(Ordering::Relaxed) > before);
-        assert!(INFECTED.load(Ordering::Relaxed) > infected_before);
+        assert!(c().scans.load(Ordering::Relaxed) > before);
+        assert!(c().infected.load(Ordering::Relaxed) > infected_before);
+    }
+
+    /// A worker killed mid-scan never finishes it. Its scans in flight are in a
+    /// slot of its own, which the supervisor clears when it reaps the child, so
+    /// the gauge of the pool does not stay one too high for good.
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_died_mid_scan_leaves_no_scan_in_flight() {
+        // A pid no test process has: its slot is nobody's but this test's.
+        let pid = 4096 * 100 + 17;
+        let slot = &c().in_flight[slot_of(pid)];
+        let before = in_flight();
+        slot.store(2, Ordering::Relaxed);
+        assert!(in_flight() >= before + 2);
+        release(pid);
+        assert_eq!(slot.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn the_in_flight_gauge_is_released_even_when_a_scan_leaves_early() {
         // A gauge that only decrements on the happy path reads as a permanently
         // busy server, which is the opposite of what someone polling it wants.
-        let before = IN_FLIGHT.load(Ordering::Relaxed);
+        let before = c().in_flight[my_slot()].load(Ordering::Relaxed);
         let t = ScanTimer::start();
-        assert!(IN_FLIGHT.load(Ordering::Relaxed) > before);
+        assert!(c().in_flight[my_slot()].load(Ordering::Relaxed) > before);
         t.finish("gone", 0, Category::Partial);
-        assert_eq!(IN_FLIGHT.load(Ordering::Relaxed), before);
+        assert_eq!(c().in_flight[my_slot()].load(Ordering::Relaxed), before);
+
+        // A scan that panics, or returns, without reaching `finish`.
+        let slot = &c().in_flight[my_slot()];
+        let before = slot.load(Ordering::Relaxed);
+        let scans = c().scans.load(Ordering::Relaxed);
+        let panicked = std::panic::catch_unwind(|| {
+            let _t = ScanTimer::start();
+            panic!("the scan died");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            before,
+            "the panic leaked the gauge"
+        );
+        assert_eq!(
+            c().scans.load(Ordering::Relaxed),
+            scans,
+            "a dropped timer is not a finished scan"
+        );
+        drop(ScanTimer::start());
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            before,
+            "an early return leaked the gauge"
+        );
     }
 }

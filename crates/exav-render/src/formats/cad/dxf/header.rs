@@ -106,6 +106,7 @@ pub(crate) fn read(tags: &[Tag<'_>], raw: &mut Raw, ctx: &mut Ctx<'_>) {
             "$LWDISPLAY" => h.lwdisplay = v.bool(),
             "$FILLMODE" => h.fillmode = v.bool(),
             "$MIRRTEXT" => h.mirrtext = v.bool(),
+            "$XCLIPFRAME" => h.xclipframe = v.i16(),
             _ => {}
         }
     }

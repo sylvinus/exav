@@ -25,7 +25,11 @@ column is for [library users](/subprojects/exav-core/) (`Limits` in exav-unpack,
 | `--max-pe-emulation-steps` | `Limits::max_pe_emulation_steps` | 1,000,000,000 | Emulator instructions across all packed executables in one file |
 | `--max-unpack-depth` | `Limits::max_recursion` | 16 | Nesting depth, containers inside containers |
 | `--max-members` | `Limits::max_members` | 100000 | Member-count blowup |
-| none (lowered by `--max-process-bytes`) | `Limits::max_extracted_bytes` | 1 GiB | What extractors hold at once across the whole recursion |
+| `--max-extracted-bytes` (lowered by `--max-process-bytes`) | `Limits::max_extracted_bytes` | 1 GiB (400M under `--clamav-compat`) | What formats that decode a member whole have produced so far in one scan; never released. Members streamed to the matcher are not counted (ZIP, 7z, TAR, CAB and the stream codecs scan past it, bounded by `--max-matcher-bytes`) |
+| `--max-bytecode-memory-bytes` (lowered by `--max-process-bytes`) | `Limits::max_bytecode_memory_bytes` | 256 MiB | What one run of a bytecode signature holds: its `malloc`s, its call frames and the globals it reads; past it the run stops as incomplete |
+| `--object-cache-bytes` (lowered by `--max-process-bytes`) | `ScanOptions::object_cache_bytes` | 8 MiB | Memory held by the block cache of each object read in place; not a limit on what is scanned, only on how often the source is read again |
+| `--object-cache-block-bytes` | `ScanOptions::object_cache_block_bytes` | 1 MiB | The unit of that cache, and of a request that does not continue the previous one over HTTP |
+| `--http-request-bytes` (lowered by `--max-process-bytes`) | `ScanOptions::http_request_bytes` | 8 MiB | The most one HTTP range request fetches, and holds while it is read |
 | none | `Limits::max_compression_ratio` | 1000 | One stream that expands past the ratio |
 | none | none (fixed) | 16 of each kind | PE, ELF or Mach-O images [carved](/scanner/reference/formats/#found-inside-other-files) from one object |
 | none | none (fixed) | 32 | Archives carved from one object |
@@ -34,16 +38,20 @@ Each bound has one spelling; `clamscan`'s names (`--max-filesize`,
 `--max-scansize`, `--max-files`) are refused with an error naming the exav flag.
 See [the flag matrix](/scanner/reference/clamav-flag-matrix/).
 
-The total a scan may hold has no flag of its own, and no flag raises it. It is
-1 GiB (400M under `--clamav-compat`), and `--max-process-bytes` can only lower
-it, together with `--max-object-bytes`, to what fits the memory a scan gets (see
+`--max-extracted-bytes` is the total a scan may decode whole. It counts the
+members that a format decodes into memory (RAR, OLE streams, PDF streams, RTF
+objects, installers and the like), added up over the scan; a member streamed to
+the matcher is not in it, so a ZIP, 7z, TAR or CAB that unpacks to several
+gigabytes is scanned, within `--max-matcher-bytes`. It is 1 GiB (400M under
+`--clamav-compat`), `off` or `0` removes it, and `--max-process-bytes` lowers
+it, together with `--max-object-bytes` and `--max-bytecode-memory-bytes`, to what fits
+the memory a scan gets (see
 [the kernel backstops](#the-kernel-backstops)): beside an object held whole, an
 image decoded from it and its grey copy can take as much again twice, so one
 object is kept to a quarter of that memory, and the total to what leaves room
 for those plus a tenth. Matching makes no other copy of an object but a
 lowercase one of at most 16 MiB. The
 default 2 G changes neither the default limits nor `--clamav-compat`'s.
-`--max-extracted-bytes`, which set it before 0.0.2, is refused.
 
 `--clamav-compat` sets `--max-input-bytes` to 100M, `--max-unpack-depth` to 17
 and `--max-members` to 10000, and holds 400M per file, both in total and as the
@@ -113,7 +121,7 @@ a third-party decoder, or a loop that produces no output.
 
 | Flag | Bounds | Default | Where it applies |
 |---|---|---|---|
-| `--max-scan-secs SECS` | Wall clock, and CPU time in the pool | 120 in the pool, unset otherwise | Per job in the clamd worker pool; the whole run in a one-shot scan. Refused on any other listener (`--workers threads`, ICAP alone). |
+| `--max-scan-secs SECS` | Wall clock, and CPU time in the pool | 120 in the pool, unset otherwise | Per job in the clamd worker pool; the whole run in a one-shot scan, which the limit ends where it is, the files after it unscanned, with the exit status of what was found by then (`1` for a detection, `2` for an error) and otherwise the one `--partial-as` gives a `LIMITS-EXCEEDED` (`3`). Refused on any other listener (`--workers threads`, ICAP alone). |
 | `--max-process-bytes SIZE` | Address space (`RLIMIT_AS`) | 2G in the pool, unset otherwise | Per clamd worker in the pool; the whole process in a one-shot scan or any other listener. |
 
 ICAP scans get no `--max-scan-secs` in any mode. Under the pool the ICAP
@@ -123,8 +131,9 @@ budgets, fitted to `--max-process-bytes`, are what bound its scans.
 Setting `--max-process-bytes` also keeps what a scan holds inside it:
 `--max-object-bytes` is lowered to a quarter of it, and the 1 GiB extraction
 total to what leaves room for an image decoded from the largest object and its
-grey copy (twice its size) plus a tenth. The in-core cap then fires first and reports a limit
-instead of the kernel killing the scan. In the pool, the per-worker figure is
+grey copy (twice its size) plus a tenth. `--object-cache-bytes` and
+`--http-request-bytes` are each lowered to an eighth of it. The in-core cap
+then fires first and reports a limit instead of the kernel killing the scan. In the pool, the per-worker figure is
 also lowered to what the host can back: RAM, less a third for the rest of the
 system, less the shared database, divided by `--workers`. A daemon job stopped
 by `--max-scan-secs` is answered `LIMITS-EXCEEDED` before its worker exits.
@@ -163,14 +172,21 @@ The verdict reason names the budget that stopped the scan. Read it first: the
 flags bound different quantities, and raising the wrong one changes nothing.
 
 - A large archive of ordinary files: `--max-members`.
-- The total a scan holds: no flag raises it past 1 GiB (400M under
-  `--clamav-compat`). If `--max-process-bytes` lowered it (exav says so at
-  startup, with the figures), raising that gives the total back (in the pool,
-  only as far as the host's RAM allows); past that point it changes nothing.
+- The total a scan decodes whole: `--max-extracted-bytes`. If
+  `--max-process-bytes` lowered it (exav says so at startup, with the figures),
+  raise that first (in the pool, only as far as the host's RAM allows); past
+  that point raising this one changes nothing.
+- A bytecode signature that stops as incomplete: `--max-bytecode-memory-bytes`.
 - One large file, or one large member of an archive: `--max-object-bytes` (and
   `--max-input-bytes` if you set one). Under `--max-process-bytes` it is also
   capped at a quarter of that.
 - A member streamed past the matcher budget: `--max-matcher-bytes`.
+- A scan of a large file or an `http(s)://` object that works but is slow: not a
+  limit, so no verdict names it. The object is read from its source several times
+  over, and a request or read per block; see `--object-cache-block-bytes`,
+  `--object-cache-bytes` and `--http-request-bytes`, and the
+  [block cache](/scanner/concepts/streaming-memory/#the-block-cache) for the
+  figures.
 - Deeply nested archives: `--max-unpack-depth`.
 - Many packed executables in one file: `--max-pe-emulation-steps`.
 - A stream past a spill budget: `--max-spill-bytes`, `--max-total-spill-bytes`,

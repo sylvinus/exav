@@ -7,7 +7,7 @@
 //! * `aes256_encrypted.pdf` — AES-256 encrypted (user: user123, owner: owner456)
 //! * `rc4_40bit_encrypted.pdf` — RC4 40-bit encrypted (user: test, owner: owner)
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!("{}/test_data/pdf/{name}", env!("CARGO_MANIFEST_DIR"));

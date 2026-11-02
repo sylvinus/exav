@@ -18,7 +18,7 @@
 //! of a stack overflow, and it is worth checking `ulimit -s` before concluding
 //! the parser is at fault.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 use libfuzzer_sys::fuzz_target;
 
 /// Small enough that a bomb cannot make the run about memory instead of depth.
@@ -57,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
     // to build the nesting itself. Capped where a healthy parser is already far
     // past any legitimate document and an unhealthy one has long since died.
     let depth = usize::from(u16::from_le_bytes([data[0], data[1]])) % 20_000;
-    let shape = data[2] % 4;
+    let shape = data[2] % 6;
     let payload = &data[3..];
 
     let body = match shape {
@@ -72,12 +72,27 @@ fuzz_target!(|data: &[u8]| {
             v.extend_from_slice(b"\nendobj\ntrailer<</Root 1 0 R>>\n%%EOF");
             v
         }
+        // RTF groups.
+        3 => {
+            let mut v = b"{\\rtf1 ".to_vec();
+            v.extend_from_slice(&nest(b"{", b"}", payload, depth));
+            v.push(b'}');
+            v
+        }
+        // A message inside a message inside a message: the parser's own nesting
+        // and the drop of what it built.
+        4 => nest(
+            b"Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: message/rfc822\r\n\r\n",
+            b"\r\n--b--\r\n",
+            payload,
+            depth,
+        ),
         // XDP wraps XML around a PDF, so the markup walk and the object parser
         // are both reachable from one nested document.
         _ => nest(b"<a>", b"</a>", payload, depth),
     };
 
-    for fmt in [Format::Pdf, Format::Xdp] {
+    for fmt in [Format::Pdf, Format::Xdp, Format::Rtf, Format::Email] {
         let mut budget = Budget::new(tight_limits());
         let _ = extract(fmt, &body, &mut budget);
     }

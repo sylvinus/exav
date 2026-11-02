@@ -192,6 +192,11 @@ phone browser.
 - `isVolumePart(name)` → whether a *filename* marks one part of a byte-split
   archive. Names only, so it is cheap enough to run over a whole drop.
 - `joinVolumes(files)` → rejoin the split archives among files dropped together.
+- `volumeSet(name, names)` → the volumes of the set `name` belongs to among
+  `names` (the file names of one directory): `{ parts, scheme, complete }`, or
+  `null` for a name that is not one of two or more volumes. Names only.
+- `joinSet(scheme, parts)` → a complete set's volumes, in order, as the one
+  archive they make (`"split"`, `"rar"` or `"zip"`).
 
 ## Split archives
 
@@ -215,9 +220,19 @@ nothing can read any more, and letting them vanish silently is the one outcome
 worth avoiding. Files that are not part of a set are simply absent from the
 result; you already have them.
 
-RAR `.partN` and ZIP `.zNN` volumes are not rejoined here. Each carries its own
-headers and a member's data resumes *past* the next volume's header, so
-concatenating them yields garbage that still looks like an archive.
+`joinVolumes` does not rejoin RAR `.partN` and ZIP `.zNN` volumes. Each carries
+its own headers and a member's data resumes *past* the next volume's header, so
+concatenating them yields garbage that still looks like an archive. `volumeSet`
+and `joinSet` read all three kinds of set, the RAR decoder's joiner and the ZIP
+spanning reader doing what the format needs:
+
+```js
+const set = volumeSet("x.part1.rar", namesInTheFolder);   // { parts, scheme, complete } or null
+if (set?.complete) {
+  const volumes = await Promise.all(set.parts.map(read));  // Uint8Arrays, in order
+  const archive = await Archive.open(joinSet(set.scheme, volumes));
+}
+```
 
 ## Notes
 

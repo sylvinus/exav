@@ -62,7 +62,7 @@ Where a deployment chooses that, with
 [`--partial-as ok`](/scanner/reference/cli/#what-an-unscannable-object-becomes), the
 choice is named per verdict and logged per object on stderr; the ICAP service
 also announces it at startup and keeps `X-Exav-Status: PARTIAL` in its response.
-The rule does not forbid accepting a risk; it forbids hiding one.
+The rule allows accepting a risk and forbids hiding one.
 
 ### Refusing empty coverage
 

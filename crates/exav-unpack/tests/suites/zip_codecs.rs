@@ -3,7 +3,7 @@
 //! decoders and scanned — a payload behind an exotic codec must not hide. And one
 //! undecodable member must never abort the whole archive.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 
@@ -35,7 +35,7 @@ fn zip_lzma_member_is_decoded() {
 #[test]
 #[cfg(feature = "lzip")]
 fn zip_lzma_member_is_decoded_once_when_streamed() {
-    use exav_unpack::{walk, Member, MemberMeta};
+    use exav_unpack::{Member, MemberMeta, walk};
     let blob = fixture("eicar_lzma.zip");
     let mut budget = Budget::new(Limits::default());
     let mut seen = Vec::new();
@@ -177,7 +177,7 @@ const LEGACY: [&str; 3] = [
 
 #[test]
 fn legacy_methods_are_decoded() {
-    use exav_unpack::{walk, Member, MemberMeta};
+    use exav_unpack::{Member, MemberMeta, walk};
     for name in LEGACY {
         let blob = fixture(name);
         let entries = extract(Format::Zip, &blob, &mut Budget::new(Limits::default())).unwrap();
@@ -264,7 +264,7 @@ fn implode_tree_size_255_is_not_a_panic() {
 /// decoded and the limit is reported.
 #[test]
 fn legacy_methods_over_the_buffer_limit_are_a_limit() {
-    use exav_unpack::{walk, Member, MemberMeta};
+    use exav_unpack::{Member, MemberMeta, walk};
     for name in LEGACY {
         let blob = fixture(name);
         let mut limits = Limits::default();
@@ -288,7 +288,7 @@ fn legacy_methods_over_the_buffer_limit_are_a_limit() {
 #[test]
 #[cfg(feature = "bzip2")]
 fn a_large_raw_decoded_member_streams_and_the_walk_goes_on() {
-    use exav_unpack::{walk, Member, MemberMeta};
+    use exav_unpack::{Member, MemberMeta, walk};
     // big.bin: 20000 bytes, bzip2 (method 12); after.txt: deflated.
     let blob = fixture("bzip2_large_then_small.zip");
     let mut limits = Limits::default();
@@ -416,7 +416,7 @@ fn walk_small_buffer(blob: &[u8]) -> Seen {
 }
 
 fn walk_with_buffer(blob: &[u8], max_buffer: u64) -> (Seen, Result<(), exav_unpack::LimitHit>) {
-    use exav_unpack::{walk, Member, MemberMeta};
+    use exav_unpack::{Member, MemberMeta, walk};
     let mut limits = Limits::default();
     limits.max_buffer_bytes = max_buffer;
     let mut seen = Vec::new();
@@ -694,7 +694,7 @@ fn orphan_directory_entry_is_not_reported() {
 /// directory (streamed walk and buffered extraction) and as an orphan.
 #[test]
 fn a_deflated_member_of_zero_bytes_is_empty() {
-    use exav_unpack::{walk, Member, MemberMeta};
+    use exav_unpack::{Member, MemberMeta, walk};
     let blob = zip_of(&[
         ("empty.txt", 8, b"", 0, 0),
         ("after.txt", 0, EICAR, crc(EICAR), EICAR.len() as u32),

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { clampEm } from './glyph-atlas'
 import { TEXT_RECORD_BYTES } from './text-layout'
-import { affordableEm, neededEm, targetEmFor, type ViewRect } from './text-resolution'
+import { affordableEm, cappedByBudget, neededEm, targetEmFor, type ViewRect } from './text-resolution'
 
 /** A text record as `text::encode` writes it; only the fields this reads. */
 function run(opts: { x: number; y: number; height: number; len: number }): ArrayBuffer {
@@ -10,7 +10,9 @@ function run(opts: { x: number; y: number; height: number; len: number }): Array
   const v = new DataView(buf)
   v.setFloat32(0, opts.x, true)
   v.setFloat32(4, opts.y, true)
+  // The frame: a cap height of advance along x, a cap height up.
   v.setFloat32(8, opts.height, true)
+  v.setFloat32(20, opts.height, true)
   v.setUint16(36, opts.len, true)
   return buf
 }
@@ -31,6 +33,12 @@ const VIEW: ViewRect = { minX: -500, minY: -500, maxX: 500, maxY: 500, scale: 1 
 describe('neededEm', () => {
   it('is zero when there is no text', () => {
     expect(neededEm(new ArrayBuffer(0), VIEW)).toBe(0)
+  })
+
+  it('sizes a stretched run by its longer unit', () => {
+    const records = run({ x: 0, y: 0, height: 10, len: 4 })
+    new DataView(records).setFloat32(8, 30, true)
+    expect(neededEm(records, VIEW)).toBe(neededEm(run({ x: 0, y: 0, height: 30, len: 4 }), VIEW))
   })
 
   it('is zero when every run is empty', () => {
@@ -109,6 +117,19 @@ describe('affordableEm', () => {
 
   it('is unbounded when there is nothing to pack', () => {
     expect(affordableEm(0)).toBe(Infinity)
+  })
+})
+
+describe('cappedByBudget', () => {
+  const records = run({ x: 0, y: 0, height: 10, len: 4 })
+
+  it('is set when the page the view wants is past the budget', () => {
+    expect(cappedByBudget(records, VIEW, 40)).toBe(false)
+    expect(cappedByBudget(records, VIEW, 100_000)).toBe(true)
+  })
+
+  it('is never set with nothing to size against', () => {
+    expect(cappedByBudget(new ArrayBuffer(0), VIEW, 100_000)).toBe(false)
   })
 })
 

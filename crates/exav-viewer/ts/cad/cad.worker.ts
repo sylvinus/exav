@@ -3,7 +3,7 @@
 import init, { drawingPreview, parseDrawing, unsupportedDrawingVersion, type Document } from "../../wasm/exav_viewer_dwg.js";
 
 import { serve } from "../core/worker-host.js";
-import type { DrawingPreview, LayerInfo, LayoutInfo, ParsedDrawing, Warnings } from "./types.js";
+import type { DrawingPreview, LayerInfo, LayoutInfo, ParsedDrawing, Sheet, Warnings } from "./types.js";
 
 export type CadRequest =
   /**
@@ -13,7 +13,12 @@ export type CadRequest =
    * (`unsupported`), and not kept.
    */
   | { kind: "load"; bytes: ArrayBuffer }
-  /** Parse a DWG or DXF (the bytes given, else those loaded) and draw a layout; "" is model space. */
+  /**
+   * Parse a DWG or DXF (the bytes given, else those loaded) and draw a
+   * layout; "" is model space. With `draw: false` nothing is drawn: the
+   * answer is the files its external references name (`xrefs`), to be
+   * attached before the first `layout`.
+   */
   | {
       kind: "parse";
       bytes?: ArrayBuffer;
@@ -21,11 +26,19 @@ export type CadRequest =
       background: Uint8Array;
       maxPrimitives: number;
       maxDecompressedBytes: number;
+      maxEntities: number;
+      draw?: boolean;
     }
   /** Draw another layout of the file already parsed. */
-  | { kind: "layout"; layout: string; background: Uint8Array; maxPrimitives: number };
+  | { kind: "layout"; layout: string; background: Uint8Array; maxPrimitives: number }
+  /**
+   * Bind the drawing in `bytes`, the file `path` names (as the parsed
+   * drawing wrote it), into the references to it. Answers how many blocks it
+   * filled and the files still named.
+   */
+  | { kind: "attach"; path: string; bytes: ArrayBuffer; maxDecompressedBytes: number; maxEntities: number };
 
-export type CadAnswer = ParsedDrawing | { preview: DrawingPreview | null; unsupported: string | null };
+export type CadAnswer = ParsedDrawing | { preview: DrawingPreview | null; unsupported: string | null } | { xrefs: string[]; attached: number };
 
 let ready: Promise<unknown> | null = null;
 // The parsed document outlives a request, so a layout switch costs only a
@@ -42,14 +55,17 @@ function draw(d: Document, r: { layout: string; background: Uint8Array; maxPrimi
       fills: drawing.takeFills().buffer as ArrayBuffer,
       texts: drawing.takeTexts().buffer as ArrayBuffer,
       textStrings: drawing.takeTextStrings().buffer as ArrayBuffer,
+      clips: drawing.takeClips().buffer as ArrayBuffer,
       strokeTiles: drawing.takeStrokeTiles().buffer as ArrayBuffer,
       fillTiles: drawing.takeFillTiles().buffer as ArrayBuffer,
+      translucentRuns: drawing.takeTranslucentRuns().buffer as ArrayBuffer,
       layers: JSON.parse(drawing.layersJson()) as LayerInfo[],
       layouts: JSON.parse(d.layoutsJson()) as LayoutInfo[],
       layout: drawing.layout,
       origin: Array.from(drawing.origin()) as [number, number],
       extents: Array.from(drawing.extents()) as [number, number, number, number],
       warnings: JSON.parse(drawing.warningsJson()) as Warnings,
+      sheet: JSON.parse(drawing.sheetJson()) as Sheet,
       maxOrder: drawing.maxOrder(),
       opaqueStrokes: drawing.opaqueStrokes(),
       opaqueFills: drawing.opaqueFills(),
@@ -59,7 +75,16 @@ function draw(d: Document, r: { layout: string; background: Uint8Array; maxPrimi
     };
     return {
       value: out,
-      transfer: [out.strokes, out.fills, out.texts, out.textStrings, out.strokeTiles, out.fillTiles],
+      transfer: [
+        out.strokes,
+        out.fills,
+        out.texts,
+        out.textStrings,
+        out.clips,
+        out.strokeTiles,
+        out.fillTiles,
+        out.translucentRuns,
+      ],
     };
   } finally {
     drawing.free();
@@ -92,9 +117,14 @@ serve<CadRequest, CadAnswer>(async (r) => {
     const bytes = r.bytes ? new Uint8Array(r.bytes) : loaded;
     loaded = null;
     if (!bytes) throw new Error("no drawing loaded");
-    doc = parseDrawing(bytes, r.maxDecompressedBytes);
+    doc = parseDrawing(bytes, r.maxDecompressedBytes, r.maxEntities);
+    if (r.draw === false) return { value: { xrefs: JSON.parse(doc.xrefPathsJson()) as string[], attached: 0 } };
     return draw(doc, r, started);
   }
   if (!doc) throw new Error("no drawing loaded");
+  if (r.kind === "attach") {
+    const attached = doc.attachXref(r.path, new Uint8Array(r.bytes), r.maxDecompressedBytes, r.maxEntities);
+    return { value: { xrefs: JSON.parse(doc.xrefPathsJson()) as string[], attached } };
+  }
   return draw(doc, r, started);
 });

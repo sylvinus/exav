@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Every file in the sandboxed frame: the page itself runs no engine, and needs no 'unsafe-inline' nor 'wasm-unsafe-eval'. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; frame-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <title>exav viewer, the host's own controls</title>
+  </head>
+  <body>
+    <header>
+      <h1>The host's own controls</h1>
+      <p>Each file in the sandboxed frame; every button on this page is the page's, driven by the session's controllers. No React.</p>
+      <input type="file" data-testid="file-input" />
+      <button type="button" id="scheme">Dark</button>
+      <span id="status" aria-live="polite"></span>
+    </header>
+    <main>
+      <nav id="thumbs" aria-label="Pages"></nav>
+      <section id="viewer">
+        <div id="stage"></div>
+        <div id="sheets" role="tablist" aria-label="Sheets"></div>
+        <div id="controls"></div>
+      </section>
+    </main>
+    <ol id="keys" aria-label="Keys this page heard"></ol>
+    <script type="module" src="./src/headless.ts"></script>
+  </body>
+</html>

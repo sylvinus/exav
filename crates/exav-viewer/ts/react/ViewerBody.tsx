@@ -1,8 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 import type { Controllers, Session, Status, ViewerFile } from "../core/types.js";
-import { useSession, useStore } from "./hooks.js";
+import { PanelContext, RAIL_FITS, useSession, useStore, type PanelInfo } from "./hooks.js";
 import { Piece } from "./parts.js";
 
 export interface ViewerBodyProps {
@@ -33,16 +33,19 @@ function Layer({ session, depth, rails, bars }: { session: Session; depth: numbe
   const status = useStore(session.status) ?? { phase: "loading" as const };
   const c = useStore(session.controllers) ?? {};
   const archive = useStore(c.archive);
-  const info = useStore(c.info);
   const warnings = useStore(c.warnings);
   const opened = archive?.opened;
+  // The rail's fold state is here, as its toggle is among the tools. Decided once: turning a tablet must not close it.
+  const [panelOpen, setPanelOpen] = useState(() => typeof window === "undefined" || window.innerWidth >= RAIL_FITS);
+  const [panel, setPanel] = useState<PanelInfo | null>(null);
+  const panelContext = useMemo(() => ({ open: panelOpen, setOpen: setPanelOpen, register: setPanel }), [panelOpen]);
   if (opened && c.archive) {
     return (
       <>
         {bars &&
           createPortal(
             // Portals into one element do not keep their order: `order` does.
-            <div className="exv-stack" style={{ order: depth }}>
+            <div className="exav-viewer-stack" style={{ order: depth }}>
               <Piece name="ArchiveBack" props={{ archive: c.archive, name: opened.member.name }} />
             </div>,
             bars,
@@ -51,17 +54,21 @@ function Layer({ session, depth, rails, bars }: { session: Session; depth: numbe
       </>
     );
   }
-  const drawing = c.layers || c.layouts || c.ground || c.selection;
+  const drawing = c.layers || c.storeys || c.layouts || c.ground || c.selection;
   return (
-    <>
+    <PanelContext.Provider value={panelContext}>
       {c.archive && <Piece name="ArchiveList" props={{ archive: c.archive }} />}
       {c.pages && <Piece name="SlidePager" props={{ pages: c.pages }} />}
-      {info && <Piece name="InfoBadge" props={{ format: session.format, info }} />}
+      {c.sheets && <Piece name="SheetTabs" props={{ sheets: c.sheets }} />}
       {warnings && <Piece name="Warnings" props={{ warnings }} />}
-      {(c.zoom || c.drag) && (
-        <div className="exv-tools">
+      {(c.zoom || c.drag || c.pictures || panel) && (
+        <div className="exav-viewer-tools">
           {c.drag && <Piece name="DragToggle" props={{ drag: c.drag }} />}
           {c.zoom && <Piece name="ZoomControls" props={{ zoom: c.zoom }} />}
+          <div className="exav-viewer-tool-group exav-viewer-tool-end" role="group">
+            <Piece name="FullscreenToggle" props={{}} />
+            {panel && <Piece name="PanelToggle" props={{ ...panel, open: panelOpen, toggle: () => setPanelOpen(!panelOpen) }} />}
+          </div>
         </div>
       )}
       <Piece name="StatusOverlay" props={{ status, format: session.format }} />
@@ -69,11 +76,11 @@ function Layer({ session, depth, rails, bars }: { session: Session; depth: numbe
         createPortal(
           <>
             {c.outline && <Piece name="OutlineRail" props={{ outline: c.outline }} />}
-            {drawing && <Piece name="DrawingRail" props={{ layers: c.layers, layouts: c.layouts, ground: c.ground, selection: c.selection }} />}
+            {drawing && <Piece name="DrawingRail" props={{ layers: c.layers, storeys: c.storeys, layouts: c.layouts, ground: c.ground, selection: c.selection }} />}
           </>,
           rails,
         )}
-    </>
+    </PanelContext.Provider>
   );
 }
 
@@ -116,19 +123,19 @@ export function ViewerBody({ file, chrome = "default", onStatus, onPages, classN
   const pending = !file.source;
   return (
     // `data-phase`: the session's phase, for a host's styles and tests.
-    <div className={`exv-body${className ? ` ${className}` : ""}`} data-phase={pending ? "pending" : status.phase}>
-      <div className="exv-main">
-        {chrome === "default" && <div ref={setBars} className="exv-bars" />}
+    <div className={`exav-viewer-body${className ? ` ${className}` : ""}`} data-phase={pending ? "pending" : status.phase}>
+      <div className="exav-viewer-main">
+        {chrome === "default" && <div ref={setBars} className="exav-viewer-bars" />}
         {/* The overlays cover the stage, never the bars above it. */}
-        <div className="exv-stage">
-          <div ref={ref} className="exv-surface" />
+        <div className="exav-viewer-stage">
+          <div ref={ref} className="exav-viewer-surface" />
           {pending && file.placeholder && <Piece name="Placeholder" props={{ state: file.placeholder.state, label: file.placeholder.label }} />}
           {pending && !file.placeholder && <Piece name="Placeholder" props={{ state: "unavailable" }} />}
           {chrome === "default" && session && <Layer session={session} depth={0} rails={rails} bars={bars} />}
           {typeof children === "function" ? children({ session, status, controllers }) : children}
         </div>
       </div>
-      {chrome === "default" && <div ref={setRails} className="exv-rails" />}
+      {chrome === "default" && <div ref={setRails} className="exav-viewer-rails" />}
       {session && onPages && <PagesOf session={session} onPages={onPages} />}
     </div>
   );

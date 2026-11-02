@@ -40,7 +40,7 @@ fi
 [package]
 name = "uwsz"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 [[bin]]
 name = "uwsz"
 path = "src/main.rs"

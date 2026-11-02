@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+ <office:automatic-styles>
+  <number:date-style style:name="N1"><number:year number:style="long"/><number:text>-</number:text><number:month number:style="long"/><number:text>-</number:text><number:day number:style="long"/></number:date-style>
+  <number:number-style style:name="N2"><number:number number:decimal-places="2" number:min-integer-digits="1" number:grouping="true"/></number:number-style>
+  <style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="1.2in"/></style:style>
+  <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="0.9in"/></style:style>
+  <style:style style:name="head" style:family="table-cell"><style:table-cell-properties fo:background-color="#4472c4" fo:border="0.5pt solid #000000"/><style:text-properties fo:font-weight="bold" fo:color="#ffffff"/></style:style>
+  <style:style style:name="money" style:family="table-cell" style:data-style-name="N2"/>
+  <style:style style:name="day" style:family="table-cell" style:data-style-name="N1"/>
+  <style:style style:name="total" style:family="table-cell" style:data-style-name="N2"><style:table-cell-properties fo:border-top="1.5pt solid #000000"/><style:text-properties fo:font-weight="bold"/></style:style>
+ </office:automatic-styles>
+ <office:body>
+  <office:spreadsheet>
+   <table:table table:name="Budget">
+    <table:table-column table:style-name="co1"/>
+    <table:table-column table:style-name="co2" table:number-columns-repeated="2"/>
+    <table:table-row>
+     <table:table-cell table:style-name="head" office:value-type="string"><text:p>Item</text:p></table:table-cell>
+     <table:table-cell table:style-name="head" office:value-type="string"><text:p>Amount</text:p></table:table-cell>
+     <table:table-cell table:style-name="head" office:value-type="string"><text:p>Date</text:p></table:table-cell>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>Rent</text:p></table:table-cell>
+     <table:table-cell table:style-name="money" office:value-type="float" office:value="1200"><text:p>1,200.00</text:p></table:table-cell>
+     <table:table-cell table:style-name="day" office:value-type="date" office:date-value="2024-01-05"><text:p>2024-01-05</text:p></table:table-cell>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>Food</text:p></table:table-cell>
+     <table:table-cell table:style-name="money" office:value-type="float" office:value="345.5"><text:p>345.50</text:p></table:table-cell>
+     <table:table-cell table:style-name="day" office:value-type="date" office:date-value="2024-01-12"><text:p>2024-01-12</text:p></table:table-cell>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>Travel</text:p></table:table-cell>
+     <table:table-cell table:style-name="money" office:value-type="float" office:value="89.99"><text:p>89.99</text:p></table:table-cell>
+     <table:table-cell table:style-name="day" office:value-type="date" office:date-value="2024-02-01"><text:p>2024-02-01</text:p></table:table-cell>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell table:style-name="total" office:value-type="string"><text:p>Total</text:p></table:table-cell>
+     <table:table-cell table:style-name="total" table:formula="of:=SUM([.B2:.B4])" office:value-type="float" office:value="1635.49"><text:p>1,635.49</text:p></table:table-cell>
+     <table:table-cell table:style-name="total"/>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell office:value-type="string" table:number-columns-spanned="3"><text:p>Merged note across three columns</text:p></table:table-cell>
+     <table:covered-table-cell table:number-columns-repeated="2"/>
+    </table:table-row>
+   </table:table>
+   <table:table table:name="Notes">
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>Second sheet</text:p></table:table-cell>
+     <table:table-cell office:value-type="boolean" office:boolean-value="true"><text:p>TRUE</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+  </office:spreadsheet>
+ </office:body>
+</office:document>

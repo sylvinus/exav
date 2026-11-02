@@ -1,6 +1,6 @@
 //! Public entry point for 7z extraction.
 
-use super::header::{ordered_coder_iter, parse_archive};
+use super::header::ordered_coder_iter;
 use super::parse::SIGNATURE_HEADER_SIZE;
 use crate::*;
 use std::io::{Cursor, Read};
@@ -35,14 +35,14 @@ fn has_unsupported_codec(block: &super::header::Block, has_password: bool) -> Op
 /// data, without decoding it. The streaming path reads this incrementally (skip
 /// to a file's offset, then `take(size)`) so the whole decompressed solid block
 /// is never buffered. `password` is threaded to an AES coder (if any).
-fn decode_block_reader(
+pub(super) fn decode_block_reader<'a>(
     block: &super::header::Block,
-    pack_data: &[u8],
+    pack_data: Box<dyn Read + 'a>,
     expected_total: u64,
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
-) -> Result<Box<dyn Read>, LimitHit> {
-    let mut current: Box<dyn Read> = Box::new(Cursor::new(pack_data.to_vec()));
+) -> Result<Box<dyn Read + 'a>, LimitHit> {
+    let mut current = pack_data;
     for coder_idx in ordered_coder_iter(block) {
         let coder = &block.coders[coder_idx];
         // Each coder decodes to its own declared size, the one for its first
@@ -71,7 +71,7 @@ fn decode_block_reader(
 fn decode_block_graph(
     block: &super::header::Block,
     pack_streams: &[&[u8]],
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
 ) -> Result<Decoded, LimitHit> {
     // Exclusive prefix sums: the global index of each coder's first in/out stream.
@@ -101,7 +101,7 @@ fn decode_block_graph(
         in_base: &'a [u64],
         out_base: &'a [u64],
         producer: &'a dyn Fn(u64) -> Option<usize>,
-        password: Option<&'a str>,
+        password: Option<crate::kdf::Pass<'a>>,
         max_buffer: u64,
     }
 
@@ -226,7 +226,7 @@ fn decode_block(
     pack_data: &[u8],
     pack_sizes: &[u64],
     expected_total: u64,
-    password: Option<&str>,
+    password: Option<crate::kdf::Pass<'_>>,
     max_buffer: u64,
 ) -> Result<Decoded, LimitHit> {
     // A folder whose coders take more inputs than there are coders cannot be a
@@ -248,7 +248,13 @@ fn decode_block(
         }
         return decode_block_graph(block, &slices, password, max_buffer);
     }
-    let mut current = decode_block_reader(block, pack_data, expected_total, password, max_buffer)?;
+    let mut current = decode_block_reader(
+        block,
+        Box::new(Cursor::new(pack_data)),
+        expected_total,
+        password,
+        max_buffer,
+    )?;
     // A 7z block is a *solid* unit that may hold many members; its decompressed
     // size can amplify far beyond the packed input. Bound it by the global
     // peak-buffer limit.
@@ -292,9 +298,9 @@ impl Read for Failed {
 /// bytes have been read. The members of a block follow each other in it, so
 /// the next one starts where this one left off: starting the decoder over for
 /// each is a pass over the block per member.
-struct Solid {
+struct Solid<'a> {
     block: usize,
-    reader: Box<dyn Read>,
+    reader: Box<dyn Read + 'a>,
     pos: u64,
 }
 
@@ -340,15 +346,16 @@ fn skip_reader(r: &mut dyn Read, n: u64) -> (u64, bool) {
     (skipped, false)
 }
 
-/// The packed bytes of folder `block_idx`, and the size of each of its packed
-/// streams. A folder can have several (BCJ2 folders have four), laid end to
-/// end; the sizes let the graph decoder split them apart again. `Err` says
-/// why the header puts them out of reach.
-fn block_pack_data<'a>(
+/// Where the packed bytes of folder `block_idx` are in the archive, as
+/// `[start, end)`, and the size of each of its packed streams. A folder can
+/// have several (BCJ2 folders have four), laid end to end; the sizes let the
+/// graph decoder split them apart again. `Err` says why the header puts them
+/// out of reach.
+fn block_pack_data(
     archive: &super::header::Archive,
     block_idx: usize,
-    data: &'a [u8],
-) -> Result<(&'a [u8], Vec<u64>), &'static str> {
+    len: usize,
+) -> Result<((usize, usize), Vec<u64>), &'static str> {
     const MISSING: &str = "7z: folder names a packed stream the header does not list";
     const PAST_END: &str = "7z: packed data runs past the end of the archive";
     let block = &archive.blocks[block_idx];
@@ -376,37 +383,62 @@ fn block_pack_data<'a>(
         .ok()
         .zip(usize::try_from(end).ok())
         .ok_or(PAST_END)?;
-    data.get(range.0..range.1)
-        .map(|packed| (packed, sizes))
-        .ok_or(PAST_END)
+    (range.1 <= len).then_some((range, sizes)).ok_or(PAST_END)
 }
 
-/// Walk a 7z archive. Its header is at the end, so the container is read whole;
-/// each member's decompressed output then streams, which is where a solid
+/// The packed bytes `range` of `src`, held, for the paths that decode a folder
+/// whole: an encrypted one, and one with several packed streams.
+fn pack_bytes<'a>(
+    src: &'a dyn crate::source::ByteSource,
+    range: (usize, usize),
+    max_buffer: u64,
+) -> Result<std::borrow::Cow<'a, [u8]>, LimitHit> {
+    let len = range.1.saturating_sub(range.0);
+    if len as u64 > max_buffer {
+        return Err(LimitHit::new(format!(
+            "7z folder of {len} packed bytes is decoded whole, over the {max_buffer}-byte buffer limit"
+        )));
+    }
+    let bytes = src.window(range.0, len);
+    if bytes.len() != len {
+        return Err(LimitHit::corrupt(
+            "7z: the packed data could not be read".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Walk a 7z archive. Its header is at the end and is read from there; each
+/// folder's packed bytes are read as its members are, so the archive is never
+/// held, and each member's decompressed output streams, which is where a solid
 /// block can be far larger than the archive.
 pub(crate) fn walk<T>(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    let data = crate::stream::read_whole(Format::SevenZip, src, budget)?;
-    stream_sevenz(&data, budget, visit)
+    stream_sevenz(src, budget, visit)
 }
 
 /// Streaming 7z extraction (pattern A): each file's solid block is built as a
-/// forward-only `Read`; the file is emitted by skipping to its offset and handing
-/// the visitor a `take(size)` window — the decompressed block is never buffered,
-/// so a huge solid archive is scanned in bounded memory. AES members keep the
-/// buffered CRC/password path (rare). The 7z container itself is still parsed
-/// from `data` (the header lives at the end → random access), but its members'
-/// decompressed output streams.
+/// forward-only `Read` over its packed bytes in the source; the file is emitted
+/// by skipping to its offset and handing the visitor a `take(size)` window — the
+/// decompressed block is never buffered, so a huge solid archive is scanned in
+/// bounded memory. AES members and folders with several packed streams (BCJ2)
+/// keep the buffered path, bounded by the buffer limit.
 fn stream_sevenz<T>(
-    data: &[u8],
+    src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use crate::stream::{emit_bytes, emit_stream, MemberMeta};
-    let archive = match parse_archive(data, &budget.passwords) {
+    use crate::stream::{MemberMeta, emit_bytes, emit_stream};
+    let kdf = std::sync::Arc::clone(&budget.kdf);
+    let archive = match super::header::parse_archive_with(
+        src,
+        &budget.passwords,
+        &kdf,
+        budget.limits.max_buffer_bytes,
+    ) {
         Ok(a) => a,
         Err(e) => {
             let reason = e.reason.as_str();
@@ -418,7 +450,7 @@ fn stream_sevenz<T>(
                 budget.count_entry()?;
                 let meta = MemberMeta {
                     name: "encrypted.7z".to_string(),
-                    comp_size: data.len() as u64,
+                    comp_size: src.len() as u64,
                     size: None,
                     encrypted: true,
                     unsupported: Some("7z: encrypted header, unsupported codec"),
@@ -489,7 +521,7 @@ fn stream_sevenz<T>(
             continue;
         }
 
-        let (pack_data, block_pack_sizes) = match block_pack_data(&archive, block_idx, data) {
+        let (pack_range, block_pack_sizes) = match block_pack_data(&archive, block_idx, src.len()) {
             Ok(v) => v,
             Err(reason) => {
                 let meta = out_of_reach(name, reason);
@@ -555,6 +587,7 @@ fn stream_sevenz<T>(
             if let Some(dec) = &state.good {
                 file_data = member(dec);
             } else {
+                let packed = pack_bytes(src, pack_range, max_buffer)?;
                 for (i, pw) in passwords.iter().enumerate() {
                     if state.wrong[i] {
                         continue;
@@ -563,10 +596,13 @@ fn stream_sevenz<T>(
                     // damage: try the next one.
                     match decode_block(
                         block,
-                        pack_data,
+                        &packed,
                         &block_pack_sizes,
                         block_total,
-                        Some(pw.as_str()),
+                        Some(crate::kdf::Pass {
+                            word: pw.as_str(),
+                            kdf: &kdf,
+                        }),
                         max_buffer,
                     ) {
                         Ok((dec, None)) => match member(&dec) {
@@ -612,23 +648,6 @@ fn stream_sevenz<T>(
             continue;
         }
 
-        // Non-AES: stream. A file whose start is past the peak-buffer limit sits
-        // in a block bigger than we would decode buffered. Its bytes are not
-        // reachable, and a member nobody looked at is reported rather than
-        // dropped — the rest of the archive still scans.
-        if bytes_to_skip > max_buffer {
-            let meta = MemberMeta {
-                name,
-                comp_size: file.size,
-                size: Some(file.size),
-                unsupported: Some("7z: member starts past the peak-buffer limit"),
-                ..MemberMeta::default()
-            };
-            if let Some(t) = visit(&meta, None, budget) {
-                return Ok(Some(t));
-            }
-            continue;
-        }
         // A multi-input folder (BCJ2) cannot be streamed as a linear chain: its
         // filter needs all four streams present at once. Decode the block
         // buffered instead, bounded by the same peak-buffer limit.
@@ -636,10 +655,11 @@ fn stream_sevenz<T>(
             .as_ref()
             .is_some_and(|s| s.block == block_idx && s.pos <= bytes_to_skip)
         {
-            let reader: Box<dyn Read> = if block.coders.iter().any(|c| c.num_in_streams > 1) {
+            let reader: Box<dyn Read + '_> = if block.coders.iter().any(|c| c.num_in_streams > 1) {
+                let packed = pack_bytes(src, pack_range, max_buffer)?;
                 let (decoded, failed) = decode_block(
                     block,
-                    pack_data,
+                    &packed,
                     &block_pack_sizes,
                     block_total,
                     None,
@@ -647,7 +667,12 @@ fn stream_sevenz<T>(
                 )?;
                 Box::new(Cursor::new(decoded).chain(Failed(failed)))
             } else {
-                decode_block_reader(block, pack_data, block_total, None, max_buffer)?
+                let packed = Box::new(crate::source::Reader::range(
+                    src,
+                    pack_range.0,
+                    pack_range.1,
+                ));
+                decode_block_reader(block, packed, block_total, None, max_buffer)?
             };
             solid = Some(Solid {
                 block: block_idx,
@@ -658,7 +683,12 @@ fn stream_sevenz<T>(
         let Some(s) = solid.as_mut() else {
             continue;
         };
-        let (skipped, failed) = skip_reader(s.reader.as_mut(), bytes_to_skip - s.pos);
+        // The members before this one in the block are decoded and dropped,
+        // which is the work a scan limit is for: charged before it is done, so
+        // a block that declares more than the limit allows is not decoded.
+        let to_skip = bytes_to_skip.saturating_sub(s.pos);
+        budget.charge_scan(to_skip)?;
+        let (skipped, failed) = skip_reader(s.reader.as_mut(), to_skip);
         s.pos += skipped;
         if s.pos < bytes_to_skip {
             // The block ended before this file's offset: the sub-stream table

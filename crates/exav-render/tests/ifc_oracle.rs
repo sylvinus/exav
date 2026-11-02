@@ -17,21 +17,57 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use exav_render::ifc::{read, Limits};
+use exav_render::ifc::{Limits, read};
 use serde_json::Value;
 
 /// (fixture, element name, why web-ifc 0.0.77 differs). Each of these
 /// elements matches its closed form in tests/ifc.rs.
 const EXPLAINED: &[(&str, &str, &str)] = &[
-    ("profiles.ifc", "rectangle hollow", "web-ifc's section is 0.0136 m2, the definition's 0.4 x 0.3 minus 0.36 x 0.26 is 0.0264"),
-    ("profiles.ifc", "t shape", "web-ifc's section is 0.0044 m2, flange plus web is 0.0063"),
-    ("profiles.ifc", "z shape", "web-ifc draws it 0.1 wide; the figure's flanges are each FlangeWidth wide with the web, 0.19 overall"),
-    ("profiles.ifc", "rounded rectangle", "web-ifc ignores RoundingRadius: square corners"),
-    ("solids.ifc", "tapered", "web-ifc ignores EndSweptArea: a straight prism"),
-    ("solids.ifc", "swept disk", "web-ifc ignores InnerRadius: no inner surface"),
-    ("solids.ifc", "surface curve swept", "web-ifc's solid is 0.16 m3 for a 0.2 x 0.4 section along 3 m"),
-    ("solids.ifc", "fixed reference swept", "web-ifc's solid is flat (no volume)"),
-    ("mapped_units.ifc", "revolved degrees", "web-ifc's quarter tube is 0.272 m3; Pappus gives 0.346"),
+    (
+        "profiles.ifc",
+        "rectangle hollow",
+        "web-ifc's section is 0.0136 m2, the definition's 0.4 x 0.3 minus 0.36 x 0.26 is 0.0264",
+    ),
+    (
+        "profiles.ifc",
+        "t shape",
+        "web-ifc's section is 0.0044 m2, flange plus web is 0.0063",
+    ),
+    (
+        "profiles.ifc",
+        "z shape",
+        "web-ifc draws it 0.1 wide; the figure's flanges are each FlangeWidth wide with the web, 0.19 overall",
+    ),
+    (
+        "profiles.ifc",
+        "rounded rectangle",
+        "web-ifc ignores RoundingRadius: square corners",
+    ),
+    (
+        "solids.ifc",
+        "tapered",
+        "web-ifc ignores EndSweptArea: a straight prism",
+    ),
+    (
+        "solids.ifc",
+        "swept disk",
+        "web-ifc ignores InnerRadius: no inner surface",
+    ),
+    (
+        "solids.ifc",
+        "surface curve swept",
+        "web-ifc's solid is 0.16 m3 for a 0.2 x 0.4 section along 3 m",
+    ),
+    (
+        "solids.ifc",
+        "fixed reference swept",
+        "web-ifc's solid is flat (no volume)",
+    ),
+    (
+        "mapped_units.ifc",
+        "revolved degrees",
+        "web-ifc's quarter tube is 0.272 m3; Pappus gives 0.346",
+    ),
 ];
 
 struct Stat {
@@ -257,7 +293,9 @@ fn elements_agree_with_web_ifc() {
         agree += a;
         total += n;
     }
-    eprintln!("total: {agree}/{total} elements agree; {only_ours} drawn only by exav, {only_theirs} only by web-ifc");
+    eprintln!(
+        "total: {agree}/{total} elements agree; {only_ours} drawn only by exav, {only_theirs} only by web-ifc"
+    );
     assert!(
         failures.is_empty(),
         "unexplained differences in the fixtures:\n{}",

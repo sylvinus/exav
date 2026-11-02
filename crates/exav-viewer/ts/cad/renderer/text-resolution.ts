@@ -82,7 +82,12 @@ export function neededEm(records: ArrayBuffer, view: ViewRect): number {
     const o = i * TEXT_RECORD_BYTES
     const len = v.getUint16(o + 36, true)
     if (len === 0) continue
-    const height = v.getFloat32(o + 8, true)
+    // The longer unit of the run's frame: a cap height, or a cap height of
+    // advance stretched by a width factor or a block's scale.
+    const height = Math.max(
+      Math.hypot(v.getFloat32(o + 8, true), v.getFloat32(o + 12, true)),
+      Math.hypot(v.getFloat32(o + 16, true), v.getFloat32(o + 20, true)),
+    )
     if (!(height > 0) || height <= tallest) continue
 
     // A run's reach from its anchor, generously: `len` is a byte count, so it
@@ -144,4 +149,14 @@ export function targetEmFor(records: ArrayBuffer, view: ViewRect, cells: number)
   // 40 cells can afford an em of 447 and would be handed 256.
   const wanted = 2 ** Math.ceil(Math.log2(needed * ZOOM_HEADROOM))
   return Math.min(wanted, affordableEm(cells))
+}
+
+/**
+ * Whether the budget, not the view, sets the em: a page too small for the
+ * view is then rasterised as distance fields, which stay sharp magnified.
+ */
+export function cappedByBudget(records: ArrayBuffer, view: ViewRect, cells: number): boolean {
+  const needed = neededEm(records, view)
+  if (needed === 0) return false
+  return 2 ** Math.ceil(Math.log2(needed * ZOOM_HEADROOM)) > affordableEm(cells)
 }

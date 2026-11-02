@@ -67,8 +67,8 @@ different things, and raising the wrong one changes nothing (see
 [which one do I change](/scanner/reference/limits/#which-one-do-i-change)).
 
 The common case is a large file. One over `--max-object-bytes` (256 MiB by
-default) gets the full engine, but the checks that parse a file whole (a PE's
-structure, YARA's `pe` module, a RAR, 7z or OLE container) do not run on it.
+default) is scanned through a block cache, but the checks that parse a file whole
+(a PE's structure, YARA's `pe` module, a RAR or OLE container) do not run on it.
 With `--spill-dir off`, a large text file also skips its HTML and script views,
 and an archive member that decodes past the limit is not scanned. Raise
 `--max-object-bytes` to have those checks run, at the cost of memory. See

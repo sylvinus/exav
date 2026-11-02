@@ -5,7 +5,7 @@
 //! examine — and the containing file must not be reportable as clean on that
 //! basis. Each case here was a silent `break`/`continue` before.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const SECTOR: usize = 2048;
 

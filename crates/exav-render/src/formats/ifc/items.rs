@@ -5,9 +5,9 @@
 use std::rc::Rc;
 
 use super::csg::{self, Op, Poly};
-use super::math::{self, cross, dot, sub, unit, Xf, V3};
+use super::math::{self, V3, Xf, cross, dot, sub, unit};
 use super::step::Value;
-use super::{is, Color, Mesh, Piece, Reader, MAX_DEPTH};
+use super::{Color, MAX_DEPTH, Mesh, Piece, Reader, is};
 
 /// Representation identifiers that are not the body: axes, footprints,
 /// boxes, 2D plan symbols and the like.
@@ -218,8 +218,9 @@ impl<'a> Reader<'a> {
             | b"IFCFIXEDREFERENCESWEPTAREASOLID"
             | b"IFCDIRECTRIXCURVESWEPTAREASOLID" => solid(self.swept_area(ty, &p, depth)?),
             b"IFCTRIANGULATEDFACESET" | b"IFCTRIANGULATEDIRREGULARNETWORK" => {
-                let closed = p.get(2).and_then(Value::boolean) == Some(true);
-                let m = self.triangulated_face_set(&p)?;
+                let declared = p.get(2).and_then(Value::boolean);
+                let mut m = self.triangulated_face_set(&p)?;
+                let closed = closed_or_found(&mut m, declared);
                 vec![Piece {
                     color,
                     mesh: m,
@@ -227,8 +228,9 @@ impl<'a> Reader<'a> {
                 }]
             }
             b"IFCPOLYGONALFACESET" => {
-                let closed = p.get(1).and_then(Value::boolean) == Some(true);
-                let m = self.polygonal_face_set(&p)?;
+                let declared = p.get(1).and_then(Value::boolean);
+                let mut m = self.polygonal_face_set(&p)?;
+                let closed = closed_or_found(&mut m, declared);
                 vec![Piece {
                     color,
                     mesh: m,
@@ -240,11 +242,12 @@ impl<'a> Reader<'a> {
             | b"IFCADVANCEDBREP"
             | b"IFCADVANCEDBREPWITHVOIDS" => {
                 let mut m = self.shell(p.first()?.id()?, depth)?;
-                m.orient_outward();
+                // Faces written the wrong way round are common in a shell.
+                m.orient_consistently();
                 for v in ids(p.get(1)) {
                     let mut void = self.shell(v, depth)?;
                     // Inward: a void's volume counts against the solid.
-                    void.orient_outward();
+                    void.orient_consistently();
                     for t in &mut void.t {
                         t.swap(1, 2);
                     }
@@ -581,9 +584,162 @@ fn clipped_box(c: V3, r: f64, o: V3, inside: V3) -> Mesh {
     m
 }
 
+/// Whether a face set is a solid: as it says, and where it says nothing (the
+/// attribute is optional, and Bonsai and others leave it out) as its edges
+/// show, each shared by two faces. A solid has its faces turned outward.
+fn closed_or_found(m: &mut Mesh, declared: Option<bool>) -> bool {
+    let closed = declared.unwrap_or_else(|| m.is_closed());
+    if closed {
+        m.orient_consistently();
+    }
+    closed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cube(lo: f64, hi: f64) -> Mesh {
+        let p = |x: f64, y: f64, z: f64| [x, y, z];
+        Mesh {
+            p: vec![
+                p(lo, lo, lo),
+                p(hi, lo, lo),
+                p(hi, hi, lo),
+                p(lo, hi, lo),
+                p(lo, lo, hi),
+                p(hi, lo, hi),
+                p(hi, hi, hi),
+                p(lo, hi, hi),
+            ],
+            // Outward.
+            t: vec![
+                [0, 2, 1],
+                [0, 3, 2],
+                [4, 5, 6],
+                [4, 6, 7],
+                [0, 1, 5],
+                [0, 5, 4],
+                [1, 2, 6],
+                [1, 6, 5],
+                [2, 3, 7],
+                [2, 7, 6],
+                [3, 0, 4],
+                [3, 4, 7],
+            ],
+        }
+    }
+
+    #[test]
+    fn a_shell_with_faces_the_wrong_way_round_is_turned_outward() {
+        let mut m = cube(1.0, 3.0);
+        assert!((m.volume6() / 6.0 - 8.0).abs() < 1e-9);
+        // The bottom face written the other way: the volume is wrong, and
+        // turning all of it does not help.
+        m.t[0].swap(1, 2);
+        m.t[1].swap(1, 2);
+        m.orient_outward();
+        assert!((m.volume6() / 6.0 - 8.0).abs() > 1.0);
+        m.orient_consistently();
+        assert!((m.volume6() / 6.0 - 8.0).abs() < 1e-9);
+        // A closed piece written inside out, beside one that is not.
+        let mut two = cube(0.0, 1.0);
+        let mut inside_out = cube(5.0, 6.0);
+        for t in &mut inside_out.t {
+            t.swap(1, 2);
+        }
+        two.append(&inside_out);
+        two.orient_consistently();
+        assert!((two.volume6() / 6.0 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_surface_that_is_not_closed_keeps_its_first_triangle_s_side() {
+        let mut m = Mesh {
+            p: vec![[0.0; 3], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            t: vec![[0, 1, 2], [0, 2, 3]],
+        };
+        // The second triangle turned: both are given the first one's.
+        m.t[1].swap(1, 2);
+        m.orient_consistently();
+        assert_eq!(m.t, vec![[0, 1, 2], [0, 2, 3]]);
+    }
+
+    #[test]
+    fn a_wall_of_a_shell_with_a_face_turned_is_cut_by_its_opening() {
+        // 5 x 0.25 x 3.3 from z 0.2, with a window opening 2.2 wide from z 1.7
+        // to 3.2, both shells with their faces written as a sloppy exporter
+        // does, not all outward.
+        let src = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCWALL('a',$,'w',$,$,#93,#7,$,$);\n\
+#6=IFCSHAPEREPRESENTATION(#100,'Body','BRep',(#8));\n#7=IFCPRODUCTDEFINITIONSHAPE($,$,(#6));\n\
+#8=IFCFACETEDBREP(#9);\n#9=IFCCLOSEDSHELL((#18,#21,#24,#27,#30,#33));\n\
+#10=IFCCARTESIANPOINT((0.,0.,0.2));\n#11=IFCCARTESIANPOINT((5.,0.,0.2));\n#12=IFCCARTESIANPOINT((5.,0.25,0.2));\n#13=IFCCARTESIANPOINT((0.,0.25,0.2));\n\
+#14=IFCCARTESIANPOINT((0.,0.,3.5));\n#15=IFCCARTESIANPOINT((5.,0.,3.5));\n#16=IFCCARTESIANPOINT((5.,0.25,3.5));\n#17=IFCCARTESIANPOINT((0.,0.25,3.5));\n\
+#18=IFCFACE((#19));\n#19=IFCFACEOUTERBOUND(#20,.T.);\n#20=IFCPOLYLOOP((#10,#11,#12,#13));\n\
+#21=IFCFACE((#22));\n#22=IFCFACEOUTERBOUND(#23,.T.);\n#23=IFCPOLYLOOP((#14,#15,#16,#17));\n\
+#24=IFCFACE((#25));\n#25=IFCFACEOUTERBOUND(#26,.T.);\n#26=IFCPOLYLOOP((#10,#11,#15,#14));\n\
+#27=IFCFACE((#28));\n#28=IFCFACEOUTERBOUND(#29,.T.);\n#29=IFCPOLYLOOP((#11,#12,#16,#15));\n\
+#30=IFCFACE((#31));\n#31=IFCFACEOUTERBOUND(#32,.T.);\n#32=IFCPOLYLOOP((#12,#13,#17,#16));\n\
+#33=IFCFACE((#34));\n#34=IFCFACEOUTERBOUND(#35,.T.);\n#35=IFCPOLYLOOP((#13,#10,#14,#17));\n\
+#39=IFCOPENINGELEMENT('b',$,$,$,$,#93,#41,$,$);\n#40=IFCSHAPEREPRESENTATION(#100,'Body','BRep',(#42));\n#41=IFCPRODUCTDEFINITIONSHAPE($,$,(#40));\n\
+#42=IFCFACETEDBREP(#43);\n#43=IFCCLOSEDSHELL((#52,#55,#58,#61,#64,#67));\n\
+#44=IFCCARTESIANPOINT((0.3,0.,1.7));\n#45=IFCCARTESIANPOINT((2.5,0.,1.7));\n#46=IFCCARTESIANPOINT((2.5,0.25,1.7));\n#47=IFCCARTESIANPOINT((0.3,0.25,1.7));\n\
+#48=IFCCARTESIANPOINT((0.3,0.,3.2));\n#49=IFCCARTESIANPOINT((2.5,0.,3.2));\n#50=IFCCARTESIANPOINT((2.5,0.25,3.2));\n#51=IFCCARTESIANPOINT((0.3,0.25,3.2));\n\
+#52=IFCFACE((#53));\n#53=IFCFACEOUTERBOUND(#54,.T.);\n#54=IFCPOLYLOOP((#44,#45,#46,#47));\n\
+#55=IFCFACE((#56));\n#56=IFCFACEOUTERBOUND(#57,.T.);\n#57=IFCPOLYLOOP((#48,#49,#50,#51));\n\
+#58=IFCFACE((#59));\n#59=IFCFACEOUTERBOUND(#60,.T.);\n#60=IFCPOLYLOOP((#44,#45,#49,#48));\n\
+#61=IFCFACE((#62));\n#62=IFCFACEOUTERBOUND(#63,.T.);\n#63=IFCPOLYLOOP((#45,#46,#50,#49));\n\
+#64=IFCFACE((#65));\n#65=IFCFACEOUTERBOUND(#66,.T.);\n#66=IFCPOLYLOOP((#46,#47,#51,#50));\n\
+#67=IFCFACE((#68));\n#68=IFCFACEOUTERBOUND(#69,.T.);\n#69=IFCPOLYLOOP((#47,#44,#48,#51));\n\
+#70=IFCRELVOIDSELEMENT('c',$,$,$,#1,#39);\n\
+#79=IFCAXIS2PLACEMENT3D(#80,#81,#82);\n#80=IFCCARTESIANPOINT((0.,0.,0.));\n#81=IFCDIRECTION((0.,0.,1.));\n#82=IFCDIRECTION((1.,0.,0.));\n\
+#93=IFCLOCALPLACEMENT($,#79);\n#98=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n#99=IFCUNITASSIGNMENT((#98));\n\
+#100=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,0.00001,#79,$);\n#71=IFCPROJECT('p',$,$,$,$,$,$,(#100),#99);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let scene = crate::ifc::read(src.as_bytes(), &crate::ifc::Limits::default()).unwrap();
+        let (lo, hi) = {
+            let b = scene.bounds.unwrap();
+            let o = scene.origin;
+            (
+                [0, 1, 2].map(|k| o[k] + f64::from(b[0][k])),
+                [0, 1, 2].map(|k| o[k] + f64::from(b[1][k])),
+            )
+        };
+        // The wall still reaches its foot (0.2) and head (3.5).
+        assert!(
+            (lo[2] - 0.2).abs() < 1e-4 && (hi[2] - 3.5).abs() < 1e-4,
+            "{lo:?} {hi:?}"
+        );
+        assert_eq!(scene.warnings.booleans_skipped, 0);
+    }
+
+    #[test]
+    fn an_opening_that_does_not_say_it_is_closed_is_cut_when_its_edges_show_it_is() {
+        // A 5 x 0.25 x 3 wall with a window hole 1 x 0.5 x 1 through it, the
+        // hole a polygonal face set whose Closed attribute is left out.
+        let src = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCWALL('a',$,'w',$,$,#93,#7,$,$);\n#7=IFCPRODUCTDEFINITIONSHAPE($,$,(#6));\n\
+#6=IFCSHAPEREPRESENTATION(#100,'Body','SweptSolid',(#8));\n\
+#8=IFCEXTRUDEDAREASOLID(#9,#79,#81,3.);\n#9=IFCRECTANGLEPROFILEDEF(.AREA.,$,#10,5.,0.25);\n\
+#10=IFCAXIS2PLACEMENT2D(#11,$);\n#11=IFCCARTESIANPOINT((2.5,0.125));\n\
+#39=IFCOPENINGELEMENT('b',$,$,$,$,#93,#41,$,$);\n#41=IFCPRODUCTDEFINITIONSHAPE($,$,(#40));\n\
+#40=IFCSHAPEREPRESENTATION(#100,'Body','Tessellation',(#42));\n\
+#42=IFCPOLYGONALFACESET(#43,$,(#51,#52,#53,#54,#55,#56),$);\n\
+#43=IFCCARTESIANPOINTLIST3D(((1.,-0.1,1.),(2.,-0.1,1.),(2.,0.4,1.),(1.,0.4,1.),(1.,-0.1,2.),(2.,-0.1,2.),(2.,0.4,2.),(1.,0.4,2.)));\n\
+#51=IFCINDEXEDPOLYGONALFACE((1,4,3,2));\n#52=IFCINDEXEDPOLYGONALFACE((5,6,7,8));\n\
+#53=IFCINDEXEDPOLYGONALFACE((1,2,6,5));\n#54=IFCINDEXEDPOLYGONALFACE((2,3,7,6));\n\
+#55=IFCINDEXEDPOLYGONALFACE((3,4,8,7));\n#56=IFCINDEXEDPOLYGONALFACE((4,1,5,8));\n\
+#70=IFCRELVOIDSELEMENT('c',$,$,$,#1,#39);\n\
+#79=IFCAXIS2PLACEMENT3D(#80,#81,#82);\n#80=IFCCARTESIANPOINT((0.,0.,0.));\n#81=IFCDIRECTION((0.,0.,1.));\n#82=IFCDIRECTION((1.,0.,0.));\n\
+#93=IFCLOCALPLACEMENT($,#79);\n#98=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n#99=IFCUNITASSIGNMENT((#98));\n\
+#100=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,0.00001,#79,$);\n#71=IFCPROJECT('p',$,$,$,$,$,$,(#100),#99);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+        let scene = crate::ifc::read(src.as_bytes(), &crate::ifc::Limits::default()).unwrap();
+        assert_eq!(scene.warnings.booleans_skipped, 0);
+        // A box is 12 triangles: with the hole through it, more.
+        assert!(scene.triangles() > 12, "{}", scene.triangles());
+    }
 
     #[test]
     fn a_box_cut_in_half() {

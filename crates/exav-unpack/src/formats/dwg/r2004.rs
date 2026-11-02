@@ -175,14 +175,18 @@ pub(super) fn decompress(src: &[u8], limit: usize) -> Result<Vec<u8>, Inflate> {
         let op = byte(&mut i)?;
         let (count, offset, lits) = match op {
             0x11 => break,
-            0x10 | 0x12..=0x1F => {
-                let count = if op == 0x10 {
+            0x10..=0x1F => {
+                // As in LZO1X, bit 3 is a distance past 32 KiB (its high
+                // bit, 0x4000) and the length is the low three bits: only
+                // the section map of a large file is long enough to need it.
+                let low = usize::from(op & 7);
+                let count = if low == 0 {
                     long_count(&mut i)? + 9
                 } else {
-                    usize::from(op & 0x0F) + 2
+                    low + 2
                 };
                 let (offset, lits) = two_byte(&mut i)?;
-                (count, offset + 0x3FFF, lits)
+                (count, offset + 0x3FFF + (usize::from(op & 8) << 11), lits)
             }
             0x20..=0x3F => {
                 let count = if op == 0x20 {
@@ -629,6 +633,32 @@ mod tests {
             decompress(&[0x01, b'a', b'b', b'c', b'd', 0x48, 0x10, 0x11], 100),
             Err(Inflate::BadOffset)
         );
+    }
+
+    #[test]
+    fn a_copy_from_more_than_32_kib_back_sets_bit_3_of_its_opcode() {
+        // 40000 literals: 0x00, then 156 zeros (each 0xFF more), then 202.
+        let mut src = vec![0x00];
+        src.extend_from_slice(&[0x00; 156]);
+        src.push(202);
+        let lits: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        src.extend_from_slice(&lits);
+        // 0x1D: bit 3 set, low bits 5: 5 + 2 = 7 bytes, from
+        // (233 + 0x3FFF + 0x4000) + 1 = 33001 back; the low bits of the
+        // offset's first byte say one literal follows.
+        src.extend_from_slice(&[0x1D, (41 << 2) | 1, 3, 0xEE, 0x11]);
+        let out = decompress(&src, 50_000).unwrap();
+        assert_eq!(out.len(), 40_008);
+        assert_eq!(out[..40_000], lits[..]);
+        assert_eq!(out[40_000..40_007], lits[6999..7006]);
+        assert_eq!(out[40_007], 0xEE);
+        // Bit 3 with no length bits: the length follows, as it does for 0x10.
+        let mut longer = src[..src.len() - 5].to_vec();
+        longer.extend_from_slice(&[0x18, 0x00, 11, (41 << 2) | 1, 3, 0xEE, 0x11]);
+        let out = decompress(&longer, 50_000).unwrap();
+        // 255 + 11 + 9 = 275 bytes from 33001 back.
+        assert_eq!(out.len(), 40_000 + 275 + 1);
+        assert_eq!(out[40_000..40_275], lits[6999..7274]);
     }
 
     #[test]

@@ -412,7 +412,7 @@ impl QuantumDecompressor {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Quantum: selector out of range",
-                    ))
+                    ));
                 }
             }
         }

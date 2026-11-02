@@ -22,7 +22,7 @@
 //! The bytes inside are genisoimage's.
 
 use super::extract_each;
-use exav_unpack::{detect, Budget, Entry, Format, Limits};
+use exav_unpack::{Budget, Entry, Format, Limits, detect};
 
 /// `sha256sum` of what `7zz x` writes for each member.
 const README_SHA256: &str = "8d2f3443b4461106fa29ee57260e553ee6acb25cc0a00a28a777013d2420985e";

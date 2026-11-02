@@ -1,0 +1,33 @@
+ID;PWXL;N;E
+P;PGeneral
+P;P#,##0.00
+P;Pyyyy\-mm\-dd
+P;FArial;M200
+P;FArial;M200;SB
+F;P0;DG0G8;M255
+B;Y7;X3;D0 0 6 2
+O;L;D;V0;K47;G100 0.001
+F;W1 1 13
+F;W2 3 10
+C;Y1;X1;K"Item"
+F;SDM1
+C;X2;K"Amount"
+F;SDM1
+C;X3;K"Date"
+F;SDM1
+C;Y2;X1;K"Rent"
+C;X2;K1200
+F;P1;FG0R
+C;X3;K45297
+F;P2
+C;Y3;X1;K"Food"
+C;X2;K345.5
+F;P1;FG0R
+C;Y4;X1;K"Travel"
+C;X2;K89.99
+F;P1;FG0R
+C;Y5;X1;K"Total"
+C;X2;K1635.49;ESUM(R[-3]C:R[-1]C)
+F;P1;FG0R
+C;Y7;X1;K"Merged note across three columns"
+E

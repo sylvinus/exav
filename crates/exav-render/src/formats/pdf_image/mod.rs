@@ -15,13 +15,13 @@ mod jbig2;
 mod jpx;
 
 #[cfg(feature = "ccitt")]
-pub use ccitt::{decode_ccitt, CcittParams};
+pub use ccitt::{CcittParams, decode_ccitt};
 #[cfg(feature = "jbig2")]
 pub use jbig2::decode_jbig2;
 #[cfg(all(feature = "jbig2", feature = "image"))]
 pub(crate) use jbig2::region_pixels;
 #[cfg(feature = "jp2")]
-pub use jpx::{decode_jpx, JpxImage, JpxParams};
+pub use jpx::{JpxImage, JpxParams, decode_jpx};
 
 /// Why a stream has no pixels. The message is what pdf.js reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

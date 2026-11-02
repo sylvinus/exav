@@ -25,6 +25,14 @@ primitives and the `webpki-roots` certificate store. Among the rest:
 - exav also contains code ported or derived from permissively licensed projects
   (RAR, AZO, CAB, DMG, PPMd and bzip2 decoders among them, the HWP3 layout, and
   `iced-x86`'s generated decoder tables), each attributed in `NOTICE`.
+- exav-render's office converters (spreadsheets, presentations, text
+  documents) are written from published specifications, among them
+  Microsoft's Open Specifications and the OASIS OpenDocument standard, and
+  from what other converters do with sample files, used as a black box. No code
+  of another office application is in them. The specifications, the tables and
+  message layouts taken from MIT-licensed projects (numbers-parser and
+  keynote-parser), and the test fixtures are listed in
+  [`crates/exav-render/NOTICE`](https://github.com/sylvinus/exav/blob/main/crates/exav-render/NOTICE).
 - The WASM sandbox runs exav under a WASI runtime you provide, under its own
   license; exav does not bundle it. See the [WASM sandbox guide](/scanner/guides/wasm-sandbox/).
 

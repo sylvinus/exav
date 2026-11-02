@@ -2,7 +2,7 @@
 //! "encrypted" malicious PDFs — they encrypt only to obstruct scanners, and open
 //! with no prompt) must be transparently decrypted and scanned, across every
 //! standard-security revision: R3/R4 (RC4) and R6 (AES-256). No password supplied.
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 fn recovers_eicar(fixture: &str) -> bool {
     let p = format!(

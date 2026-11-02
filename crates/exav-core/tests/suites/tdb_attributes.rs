@@ -15,7 +15,7 @@
 //! * `Container:CL_TYPE_HTML` is satisfiable, which only holds because the
 //!   assets a page carries inline get extracted from it.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 use std::io::Write;
 
 const MARK: &[u8] = b"exav-tdb-probe-marker-0123456789";

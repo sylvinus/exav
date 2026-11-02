@@ -27,8 +27,13 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
+use std::io::{self, Read};
 
-use crate::{Budget, Entry, LimitHit, Sink};
+use sha1::{Digest, Sha1};
+
+use crate::source::{ByteSource, Reader};
+use crate::stream::{MemberMeta, Visit, emit_entry, emit_stream};
+use crate::{Budget, Entry, LimitHit};
 
 /// One offset-table entry: a 24-byte resource header, then part number,
 /// reference count and the 20-byte SHA-1.
@@ -113,105 +118,250 @@ fn resource_header(data: &[u8], off: usize) -> Resource {
     }
 }
 
-fn sha1_of(data: &[u8]) -> [u8; HASH_LEN] {
-    use sha1::{Digest, Sha1};
-    let mut h = Sha1::new();
-    h.update(data);
-    let out = h.finalize();
-    let mut r = [0u8; HASH_LEN];
-    r.copy_from_slice(&out);
-    r
+/// The most a chunk may decode to. The codecs' windows go to 2 MiB; a header
+/// that names more is not a chunk size any image has.
+const MAX_CHUNK: u32 = 1 << 24;
+
+/// A resource's bytes, decoded a chunk at a time as they are read.
+struct ResourceReader<'a> {
+    src: &'a dyn ByteSource,
+    codec: Codec,
+    /// Where the chunks' bytes start in the image, and how many there are.
+    body: usize,
+    body_len: usize,
+    /// The start of chunks 1 to n-1 in the body, as the image gives them.
+    table: Vec<u8>,
+    wide: bool,
+    chunk: usize,
+    n_chunks: usize,
+    original: u64,
+    /// The next chunk to decode, and how many bytes have been decoded.
+    next: usize,
+    given: u64,
+    /// The chunk being served, and how much of it has been.
+    buf: Vec<u8>,
+    at: usize,
 }
 
-/// Decompress one resource. `Err` names a reason worth reporting; `Ok` bytes are
-/// not checked against the recorded hash here.
-fn read_resource(
-    data: &[u8],
+fn bad(why: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, why)
+}
+
+impl ResourceReader<'_> {
+    /// Where chunk `i` starts in the body.
+    fn start(&self, i: usize) -> usize {
+        let entry = if self.wide { 8 } else { 4 };
+        let at = i.saturating_sub(1).saturating_mul(entry);
+        if i == 0 {
+            0
+        } else if self.wide {
+            crate::bytes::to_usize(le_u64(&self.table, at))
+        } else {
+            le_u32(&self.table, at) as usize
+        }
+    }
+
+    /// Decode the chunk that is next into `buf`.
+    fn decode(&mut self) -> io::Result<()> {
+        let i = self.next;
+        let s = self.start(i);
+        let e = if i.saturating_add(1) < self.n_chunks {
+            self.start(i.saturating_add(1))
+        } else {
+            self.body_len
+        };
+        if s > e || e > self.body_len {
+            return Err(bad("WIM chunk lies outside its resource"));
+        }
+        let want = crate::bytes::to_usize(
+            (self.chunk as u64).min(self.original.saturating_sub(self.given)),
+        );
+        // A chunk that did not compress is stored verbatim, and is then exactly
+        // as long as what it decodes to; only that much of it is read.
+        let stored = e.saturating_sub(s) >= want;
+        let len = if stored { want } else { e.saturating_sub(s) };
+        let cdata = self.src.window(self.body.saturating_add(s), len);
+        if cdata.len() != len {
+            return Err(bad("WIM chunk could not be read"));
+        }
+        self.buf = if stored {
+            cdata.into_owned()
+        } else {
+            match self.codec {
+                Codec::Xpress => xpress::decompress(&cdata, want).ok_or(bad("WIM XPRESS chunk"))?,
+                Codec::Lzx => lzx::decompress(&cdata, want).ok_or(bad("WIM LZX chunk"))?,
+                // An uncompressed image should have had the flag clear; if a
+                // resource claims compression anyway there is nothing to
+                // decode it with.
+                Codec::None | Codec::Lzms => return Err(bad("WIM resource names no chunk codec")),
+            }
+        };
+        self.at = 0;
+        self.next = i.saturating_add(1);
+        self.given = self.given.saturating_add(self.buf.len() as u64);
+        Ok(())
+    }
+}
+
+impl Read for ResourceReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if let Some(rest) = self.buf.get(self.at..).filter(|r| !r.is_empty()) {
+                let n = rest.len().min(out.len());
+                out[..n].copy_from_slice(&rest[..n]);
+                self.at = self.at.saturating_add(n);
+                return Ok(n);
+            }
+            if self.next >= self.n_chunks || self.given >= self.original {
+                return Ok(0);
+            }
+            self.decode()?;
+        }
+    }
+}
+
+/// A reader of resource `res`'s bytes. `Err` names a reason worth reporting;
+/// the bytes are not checked against the recorded hash here.
+fn open_resource<'a>(
+    src: &'a dyn ByteSource,
     res: &Resource,
     codec: Codec,
     chunk_size: u32,
-    budget: &mut Budget,
-) -> Result<Vec<u8>, &'static str> {
-    let start = crate::bytes::to_usize(res.offset);
-    let raw = crate::bytes::at(data, start, crate::bytes::to_usize(res.size_in_wim))
-        .ok_or("WIM resource lies outside the image")?;
+    max_buffer: u64,
+) -> Result<Box<dyn Read + 'a>, &'static str> {
+    let outside = "WIM resource lies outside the image";
+    let start = usize::try_from(res.offset).map_err(|_| outside)?;
+    let len = usize::try_from(res.size_in_wim).map_err(|_| outside)?;
+    let end = start.checked_add(len).filter(|&e| e <= src.len());
+    let Some(end) = end else {
+        return Err(outside);
+    };
 
     if res.flags & RESOURCE_COMPRESSED == 0 {
-        return Ok(raw.to_vec());
+        return Ok(Box::new(Reader::range(src, start, end)));
     }
     if codec == Codec::Lzms {
         return Err("WIM LZMS-compressed resource");
     }
-    let cap = budget.limits.max_buffer_bytes;
-    if res.original_size > cap {
-        return Err("WIM resource exceeds max-buffer");
+    let chunk = chunk_size.max(1);
+    if chunk > MAX_CHUNK {
+        return Err("WIM chunk size is larger than any codec's window");
     }
-    let original = crate::bytes::to_usize(res.original_size);
-    let chunk = chunk_size.max(1) as usize;
-    let n_chunks = original.div_ceil(chunk).max(1);
+    let chunk = chunk as usize;
+    let original = res.original_size;
+    let n_chunks = crate::bytes::to_usize(original.div_ceil(chunk as u64)).max(1);
 
     // The chunk table gives the start of chunks 1..n-1 relative to the end of
     // the table; chunk 0 always starts there. Entries are u32 unless the
     // uncompressed resource is over 4 GiB.
-    let wide = res.original_size > u32::MAX as u64;
+    let wide = original > u64::from(u32::MAX);
     let entry = if wide { 8 } else { 4 };
     let table_len = n_chunks.saturating_sub(1).saturating_mul(entry);
-    let table = raw.get(..table_len).ok_or("WIM chunk table is truncated")?;
-    let body = &raw[table_len..];
-
-    let chunk_start = |i: usize| -> usize {
-        let at = i.saturating_sub(1).saturating_mul(entry);
-        if i == 0 {
-            0
-        } else if wide {
-            crate::bytes::to_usize(le_u64(table, at))
-        } else {
-            le_u32(table, at) as usize
-        }
-    };
-
-    let mut out = Vec::with_capacity(original);
-    for i in 0..n_chunks {
-        let s = chunk_start(i);
-        let e = if i.saturating_add(1) < n_chunks {
-            chunk_start(i.saturating_add(1))
-        } else {
-            body.len()
-        };
-        let Some(cdata) = body.get(s..e.max(s)) else {
-            return Err("WIM chunk lies outside its resource");
-        };
-        let want = chunk.min(original.saturating_sub(out.len()));
-        // A chunk that did not compress is stored verbatim, and is then exactly
-        // as long as what it decodes to.
-        if cdata.len() >= want {
-            out.extend_from_slice(&cdata[..want]);
-            continue;
-        }
-        let decoded = match codec {
-            Codec::Xpress => xpress::decompress(cdata, want).ok_or("WIM XPRESS chunk")?,
-            Codec::Lzx => lzx::decompress(cdata, want).ok_or("WIM LZX chunk")?,
-            // An uncompressed image should have had the flag clear; if a
-            // resource claims compression anyway there is nothing to decode it
-            // with.
-            Codec::None | Codec::Lzms => return Err("WIM resource names no chunk codec"),
-        };
-        out.extend_from_slice(&decoded);
+    if table_len > len {
+        return Err("WIM chunk table is truncated");
     }
-    out.truncate(original);
+    if table_len as u64 > max_buffer {
+        return Err("WIM chunk table exceeds max-buffer");
+    }
+    let table = src.window(start, table_len);
+    if table.len() != table_len {
+        return Err("WIM chunk table is truncated");
+    }
+    Ok(Box::new(ResourceReader {
+        src,
+        codec,
+        body: start.saturating_add(table_len),
+        body_len: len.saturating_sub(table_len),
+        table: table.into_owned(),
+        wide,
+        chunk,
+        n_chunks,
+        original,
+        next: 0,
+        given: 0,
+        buf: Vec::new(),
+        at: 0,
+    }))
+}
+
+/// Resource `res` read whole, up to `max_buffer` bytes.
+fn read_resource(
+    src: &dyn ByteSource,
+    res: &Resource,
+    codec: Codec,
+    chunk_size: u32,
+    max_buffer: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let compressed = res.flags & RESOURCE_COMPRESSED != 0;
+    let size = if compressed {
+        res.original_size
+    } else {
+        res.size_in_wim
+    };
+    if size > max_buffer {
+        return Err("WIM resource exceeds max-buffer");
+    }
+    let mut reader = open_resource(src, res, codec, chunk_size, max_buffer)?;
+    let mut out = Vec::new();
+    reader
+        .by_ref()
+        .take(size.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|_| "WIM resource did not decode")?;
     Ok(out)
+}
+
+/// A resource's bytes, hashed as they are read: at the end they are the
+/// resource the image recorded, or they are not.
+struct Checked<'a> {
+    inner: Box<dyn Read + 'a>,
+    hasher: Sha1,
+    expected: [u8; HASH_LEN],
+}
+
+impl Read for Checked<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(out)?;
+        if n > 0 {
+            self.hasher.update(&out[..n]);
+        } else if !out.is_empty() && self.hasher.clone().finalize().as_slice() != self.expected {
+            return Err(crate::checksum_mismatch("WIM SHA-1"));
+        }
+        Ok(n)
+    }
 }
 
 mod lzx;
 
-pub(crate) fn extract_wim<R>(
-    data: &[u8],
+/// A member that is only a report.
+fn report<T>(
+    name: String,
+    size: u64,
+    reason: &'static str,
     budget: &mut Budget,
-    visit: Sink<R>,
-) -> Result<Option<R>, LimitHit> {
+    visit: Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    emit_entry(Entry::unsupported(name, size, false, reason), budget, visit)
+}
+
+/// How much of the image is read to tell it is one and to read its header.
+const HEADER_READ: usize = 256;
+
+/// Walk a WIM image. Its header, its table of resources and its directory
+/// tree are read from where they are in the source; each file resource is then
+/// decoded a chunk at a time as it is read, so neither the image nor a
+/// resource is held.
+pub(crate) fn walk<T>(
+    src: &dyn ByteSource,
+    budget: &mut Budget,
+    visit: Visit<T>,
+) -> Result<Option<T>, LimitHit> {
+    let head = src.window(0, HEADER_READ);
+    let data: &[u8] = &head;
     if !crate::formats::sniff::is(data, crate::Format::Wim) {
         return Ok(None);
     }
+    let max_buffer = budget.limits.max_buffer_bytes;
     let flags = le_u32(data, 16);
     let codec = if flags & FLAG_COMPRESS_LZMS != 0 {
         Codec::Lzms
@@ -229,44 +379,45 @@ pub(crate) fn extract_wim<R>(
 
     // The offset table is itself a resource.
     let table_res = resource_header(data, 48);
-    let Some(table) = crate::bytes::at(
-        data,
-        crate::bytes::to_usize(table_res.offset),
-        crate::bytes::to_usize(table_res.size_in_wim),
-    ) else {
+    let table_at = usize::try_from(table_res.offset).ok();
+    let table_len = usize::try_from(table_res.size_in_wim).ok();
+    let inside = table_at
+        .zip(table_len)
+        .filter(|(at, len)| at.checked_add(*len).is_some_and(|end| end <= src.len()));
+    let Some((table_at, table_len)) = inside else {
         budget.count_entry()?;
-        return Ok(visit(
-            Entry::unsupported(
-                "<wim-offset-table>".to_string(),
-                0,
-                false,
-                "WIM offset table lies outside the image",
-            ),
+        return report(
+            "<wim-offset-table>".to_string(),
+            0,
+            "WIM offset table lies outside the image",
             budget,
-        ));
+            visit,
+        );
     };
+    let listed = table_len.checked_div(TABLE_ENTRY_LEN).unwrap_or(0);
+    let table = src.window(
+        table_at,
+        listed.min(MAX_RESOURCES).saturating_mul(TABLE_ENTRY_LEN),
+    );
 
     let mut resources: Vec<Resource> = Vec::new();
-    let listed = table.len().checked_div(TABLE_ENTRY_LEN).unwrap_or(0);
     for i in 0..listed.min(MAX_RESOURCES) {
         let o = i.saturating_mul(TABLE_ENTRY_LEN);
-        let mut r = resource_header(table, o);
-        if let Some(h) = crate::bytes::at(table, o.saturating_add(30), HASH_LEN) {
+        let mut r = resource_header(&table, o);
+        if let Some(h) = crate::bytes::at(&table, o.saturating_add(30), HASH_LEN) {
             r.hash.copy_from_slice(h);
         }
         resources.push(r);
     }
     if listed > MAX_RESOURCES {
         budget.count_entry()?;
-        if let Some(r) = visit(
-            Entry::unsupported(
-                format!("<wim-resources-beyond-{MAX_RESOURCES}>"),
-                0,
-                false,
-                "too many WIM resources to enumerate them all",
-            ),
+        if let Some(r) = report(
+            format!("<wim-resources-beyond-{MAX_RESOURCES}>"),
+            0,
+            "too many WIM resources to enumerate them all",
             budget,
-        ) {
+            &mut *visit,
+        )? {
             return Ok(Some(r));
         }
     }
@@ -279,7 +430,7 @@ pub(crate) fn extract_wim<R>(
         .iter()
         .filter(|r| r.flags & RESOURCE_METADATA != 0)
     {
-        if let Ok(meta) = read_resource(data, res, codec, chunk_size, budget) {
+        if let Ok(meta) = read_resource(src, res, codec, chunk_size, max_buffer) {
             collect_names(&meta, &mut names);
         }
     }
@@ -297,57 +448,52 @@ pub(crate) fn extract_wim<R>(
             // The rest of this resource is in another part of the image set,
             // which exav is not scanning.
             budget.count_entry()?;
-            if let Some(r) = visit(
-                Entry::unsupported(
-                    name,
-                    res.size_in_wim,
-                    false,
-                    "WIM resource continues in another part of a spanned image",
-                ),
+            if let Some(r) = report(
+                name,
+                res.size_in_wim,
+                "WIM resource continues in another part of a spanned image",
                 budget,
-            ) {
+                &mut *visit,
+            )? {
                 return Ok(Some(r));
             }
             continue;
         }
 
         budget.count_entry()?;
-        let decoded = read_resource(data, res, codec, chunk_size, budget);
-        let bytes = match decoded {
-            // Decoded in full. A SHA-1 mismatch after that hides nothing: the
-            // bytes are scanned, as a ZIP member's are, and reported only when
-            // checksums are verified.
-            Ok(b) if !budget.should_verify_checksums() || sha1_of(&b) == res.hash => b,
-            Ok(_) => {
-                if let Some(r) = visit(
-                    Entry::unsupported(
-                        name,
-                        res.size_in_wim,
-                        false,
-                        "WIM resource did not match its recorded SHA-1 after decoding",
-                    ),
-                    budget,
-                ) {
-                    return Ok(Some(r));
-                }
-                continue;
-            }
+        let opened = open_resource(src, res, codec, chunk_size, max_buffer);
+        let reader = match opened {
+            Ok(r) => r,
             Err(reason) => {
-                if let Some(r) = visit(
-                    Entry::unsupported(name, res.size_in_wim, false, reason),
-                    budget,
-                ) {
+                if let Some(r) = report(name, res.size_in_wim, reason, budget, &mut *visit)? {
                     return Ok(Some(r));
                 }
                 continue;
             }
         };
-        let cap = budget.reserve()?;
-        if bytes.len() as u64 > cap {
-            return Err(LimitHit::new(format!("wim member '{name}' exceeds budget")));
-        }
-        budget.commit(bytes.len() as u64);
-        if let Some(r) = visit(Entry::new(name, bytes), budget) {
+        // A SHA-1 mismatch once the resource has decoded hides nothing: the
+        // bytes are scanned, as a ZIP member's are, and it is an error at the
+        // end of the member only when checksums are verified.
+        let mut reader: Box<dyn Read + '_> = if budget.should_verify_checksums() {
+            Box::new(Checked {
+                inner: reader,
+                hasher: Sha1::new(),
+                expected: res.hash,
+            })
+        } else {
+            reader
+        };
+        let meta = MemberMeta {
+            name,
+            comp_size: res.size_in_wim,
+            size: Some(if res.flags & RESOURCE_COMPRESSED == 0 {
+                res.size_in_wim
+            } else {
+                res.original_size
+            }),
+            ..MemberMeta::default()
+        };
+        if let Some(r) = emit_stream(&meta, &mut *reader, budget, &mut *visit)? {
             return Ok(Some(r));
         }
     }

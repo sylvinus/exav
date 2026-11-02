@@ -51,11 +51,7 @@ const SCALE_N: u32 = 8;
 /// `x == 0` cannot occur at any call site (every argument is `n - 1` for
 /// `n >= 2`, or a positive quotient), but it is defined rather than panicking.
 fn log2(x: u32) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        31 - x.leading_zeros()
-    }
+    if x == 0 { 0 } else { 31 - x.leading_zeros() }
 }
 
 /// Reads individual bits, MSB-first within each byte.

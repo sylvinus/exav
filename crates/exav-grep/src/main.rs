@@ -1,7 +1,7 @@
 //! `exav-grep` — grep that can see inside archives.
 //!
 //! Familiar flags, but every ZIP/RAR/7z/tar/ISO/OLE/PDF/email it meets is
-//! descended into, recursively, in memory. Matches are reported with the nesting
+//! descended into, recursively, in bounded memory. Matches are reported with the nesting
 //! path (`backup.zip!logs.tar!app.log:42:…`) so the output stays greppable.
 //!
 //! Exit codes follow `grep`, with one addition:
@@ -80,7 +80,10 @@ struct Cli {
     #[arg(long = "passwords", value_name = "PASSWORD")]
     passwords: Vec<String>,
 
-    /// Max bytes any single member may decompress to.
+    /// Most bytes held in memory at once for one file or member (default
+    /// 256M). A member up to it is held, so a container in it can be opened;
+    /// a longer one is searched as it is read, and a container in it is
+    /// reported unreadable.
     #[arg(long = "max-object-bytes", value_name = "BYTES")]
     max_object_bytes: Option<u64>,
 
@@ -101,6 +104,15 @@ struct Cli {
     /// hiding them turns "I couldn't look" into an indistinguishable "no match".
     #[arg(long)]
     quiet_unreadable: bool,
+
+    /// Search the text a reader sees rather than the bytes, for the files that
+    /// have one: Markdown, HTML, Office and OpenDocument XML parts, PDF and
+    /// drawings (DXF, DWG). Entities are decoded and each link is followed by
+    /// where it goes; matches are reported under `file.md!text`, with the
+    /// text's line numbers.
+    #[cfg(feature = "text")]
+    #[arg(long)]
+    text: bool,
 }
 
 fn main() -> ExitCode {
@@ -137,6 +149,10 @@ fn main() -> ExitCode {
         after_context: cli.after_context.max(ctx),
         max_count: cli.max_count,
         binary_as_matches: true,
+        #[cfg(feature = "text")]
+        text: cli.text,
+        #[cfg(not(feature = "text"))]
+        text: false,
     };
 
     let mut searcher = Searcher::new(matcher, opts);

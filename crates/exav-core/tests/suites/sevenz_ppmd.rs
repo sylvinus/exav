@@ -1,7 +1,7 @@
 //! A 7z member compressed with PPMd whose stream is cut short, at the verdict
 //! level: the part never decoded leaves the file not clean.
 
-use exav_core::{analyze, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze};
 
 /// `ppmd_plain_header.7z` (see exav-unpack's `sevenz_ppmd` suite): one text
 /// member, PPMd, the header uncompressed.

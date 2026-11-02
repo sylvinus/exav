@@ -2663,12 +2663,12 @@ impl<'a> Iterator for ExprChildrenIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             ExprChildrenIter::Empty => None,
-            ExprChildrenIter::Single(ref mut child) => child.take(),
-            ExprChildrenIter::Vec(ref mut iter) => iter.next(),
+            ExprChildrenIter::Single(child) => child.take(),
+            ExprChildrenIter::Vec(iter) => iter.next(),
             ExprChildrenIter::Triple {
-                ref mut first,
-                ref mut second,
-                ref mut third,
+                first,
+                second,
+                third,
             } => first
                 .take()
                 .or_else(|| second.take())
@@ -2683,12 +2683,12 @@ impl<'a> Iterator for ExprChildrenIterMut<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             ExprChildrenIterMut::Empty => None,
-            ExprChildrenIterMut::Single(ref mut child) => child.take(),
-            ExprChildrenIterMut::Vec(ref mut iter) => iter.next(),
+            ExprChildrenIterMut::Single(child) => child.take(),
+            ExprChildrenIterMut::Vec(iter) => iter.next(),
             ExprChildrenIterMut::Triple {
-                ref mut first,
-                ref mut second,
-                ref mut third,
+                first,
+                second,
+                third,
             } => first
                 .take()
                 .or_else(|| second.take())
@@ -2698,7 +2698,7 @@ impl<'a> Iterator for ExprChildrenIterMut<'a> {
 }
 
 macro_rules! children_iter_match {
-    ($self:expr, $iter:ident, $vec_method:ident, $single_method:ident, $group_method:ident) => {
+    ($self:expr_2021, $iter:ident, $vec_method:ident, $single_method:ident, $group_method:ident) => {
         match $self {
             Expr::Concat(children) | Expr::Alt(children) => $iter::Vec(children.$vec_method()),
             Expr::Group(child) => $iter::Single(Some(Arc::$group_method(child))),

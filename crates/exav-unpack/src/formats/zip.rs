@@ -285,17 +285,24 @@ pub(crate) fn raw_decoder<'a, R: Read + 'a>(
 }
 
 /// [`raw_decoder`] over bytes in hand, read whole up to `cap`. `None` when
-/// there is no decoder or decoding failed; the flag is set when the member
-/// is larger than `cap`.
+/// there is no decoder or the codec's header is unreadable. A stream that
+/// fails part way gives the bytes decoded before the failure, with the
+/// damage in the result ([`crate::Salvaged`]); one larger than `cap` has
+/// `over_cap` set.
 pub(crate) fn decode_zip_raw(
     method: u16,
     raw: &[u8],
     usz: Option<u64>,
     cap: u64,
-) -> Option<(Vec<u8>, bool)> {
+) -> Option<crate::Salvaged> {
     match raw_decoder(method, raw, usz, cap) {
-        Ok(r) => bounded_read(r, cap).ok(),
-        Err(RawRefusal::TooBig) => Some((Vec::new(), true)),
+        Ok(r) => bounded_read_salvage(r, cap, true).ok(),
+        Err(RawRefusal::TooBig) => Some(crate::Salvaged {
+            data: Vec::new(),
+            over_cap: true,
+            undecoded: false,
+            cut_short: false,
+        }),
         Err(RawRefusal::Unsupported(_) | RawRefusal::Truncated) => None,
     }
 }
@@ -507,6 +514,21 @@ fn open_archive<R: Read + Seek + Clone>(
     ::zip::ZipArchive::new(Patched::new(reader))
 }
 
+/// Where a ZIP begins when it is appended to something else: the bytes before
+/// it count in no offset of its, and `unzip` finds it by its end record, which
+/// is at the end of the file. `None` for a file that is not one, or that starts
+/// where its offsets say.
+pub fn appended_start(src: &dyn crate::source::ByteSource) -> Option<u64> {
+    let mut r = crate::source::Reader::new(src);
+    // The longest comment an end record may carry, and the record.
+    match directory_shift_within(&mut r, 2 * 65_536)? {
+        Shift::Prepended(n) if n > 0 && src.window(n as usize, 4).starts_with(b"PK\x03\x04") => {
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
 /// Where a ZIP's central directory is, against where its end record says.
 enum Shift {
     /// `n` bytes precede the archive, and every offset counts from its start.
@@ -565,6 +587,14 @@ impl<R: Seek> Seek for Patched<R> {
 /// crate tries first. `None` for ZIP64, an empty archive, or no central header
 /// where that record puts the directory.
 fn directory_shift<R: Read + Seek>(r: &mut R) -> Option<Shift> {
+    directory_shift_within(r, u64::MAX)
+}
+
+/// [`directory_shift`] looking at the last `reach` bytes of the file and no
+/// further back. An end record that closes an archive stapled to the end of a
+/// file is within the longest comment of it, so a search for one that reads
+/// the whole of a large file is a pass over it for nothing.
+fn directory_shift_within<R: Read + Seek>(r: &mut R, reach: u64) -> Option<Shift> {
     use std::io::SeekFrom;
     const EOCD_LEN: usize = 22;
     const CHUNK: u64 = 1 << 16;
@@ -590,7 +620,7 @@ fn directory_shift<R: Read + Seek>(r: &mut R) -> Option<Shift> {
                 break 'found at;
             }
         }
-        if start == 0 {
+        if start == 0 || len - start >= reach {
             return None;
         }
         end = start + 3;
@@ -663,9 +693,32 @@ fn scan_orphan_locals<R>(
     // Local-header offsets the central directory already covered.
     let mut known = std::collections::HashSet::new();
     if let Ok(mut zip) = open_archive(Cursor::new(data)) {
+        let read = |at: u64, len: usize| {
+            usize::try_from(at)
+                .ok()
+                .and_then(|at| crate::bytes::at(data, at, len))
+                .map_or_else(
+                    || {
+                        let from = usize::try_from(at).unwrap_or(usize::MAX).min(data.len());
+                        data[from..].iter().take(len).copied().collect()
+                    },
+                    <[u8]>::to_vec,
+                )
+        };
         for i in 0..zip.len() {
             if let Ok(f) = zip.by_index_raw(i) {
-                known.insert(f.header_start() as usize);
+                let start = f.header_start();
+                // A member whose local header says otherwise than the
+                // directory is read once more, as the local header says.
+                if local_header_agrees(
+                    &read,
+                    start,
+                    f.name_raw(),
+                    zip_method_code(&f.compression()),
+                    f.compressed_size(),
+                ) {
+                    known.insert(start as usize);
+                }
             }
         }
     }
@@ -691,10 +744,10 @@ fn scan_orphan_locals<R>(
         if !plausible_local_header(data, off) {
             continue;
         }
-        if let Some(entry) = parse_local_member(data, off, true, budget)? {
-            if let Some(r) = visit(entry, budget) {
-                return Ok(Some(r));
-            }
+        if let Some(entry) = parse_local_member(data, off, true, budget)?
+            && let Some(r) = visit(entry, budget)
+        {
+            return Ok(Some(r));
         }
     }
     Ok(None)
@@ -1127,7 +1180,7 @@ fn parse_local_member(
                         "streaming zip member with unrecoverable size (orphan local header)",
                         false,
                         budget,
-                    )
+                    );
                 }
             },
         }
@@ -1224,7 +1277,7 @@ fn parse_local_member(
                     comp,
                     false,
                     "unsupported zip compression method (orphan local header)",
-                )))
+                )));
             }
         },
     };
@@ -1262,6 +1315,7 @@ const PAST_END: &str =
 /// declaring 0 bytes compressed and uncompressed is empty (Civil 3D writes
 /// them; Python's zipfile reads them so), not a stream cut before its first
 /// block.
+#[inline(never)]
 pub(crate) fn member_reader<'a, R: Read + Seek>(
     zip: &'a mut ::zip::ZipArchive<R>,
     i: usize,
@@ -1559,11 +1613,25 @@ pub fn extract_zip_from<Rd: Read + Seek + Clone, R>(
         // metadata-only unsupported member and the archive keeps going — one bad
         // member never aborts the whole ZIP.
         let (buf, truncated, part_way) = if !crate_decodes(method) {
-            let (raw, _) = bounded_read(&mut file, budget.limits.max_buffer_bytes)
+            let (raw, raw_over) = bounded_read(&mut file, budget.limits.max_buffer_bytes)
                 .map_err(|e| LimitHit::new(format!("zip raw read: {e}")))?;
             drop(file);
+            // The compressed bytes themselves past the buffer limit: what is
+            // here is a prefix of the member, not the member.
+            if raw_over {
+                if let Some(r) = oversized(budget, "archive member exceeds size budget") {
+                    return Ok(Some(r));
+                }
+                continue;
+            }
             match decode_zip_raw(method, &raw, Some(usz), cap) {
-                Some((out, truncated)) => (out, truncated, false),
+                // All of the member's compressed bytes were here, so a stream
+                // that ran out of them hides nothing, but it is not the
+                // member the directory declares, whose size it does not reach.
+                Some(s) => {
+                    let part_way = s.undecoded || s.cut_short || s.data.len() as u64 != usz;
+                    (s.data, s.over_cap, part_way)
+                }
                 None => {
                     if let Some(r) = oversized(budget, "archive member: unsupported ZIP codec") {
                         return Ok(Some(r));
@@ -1628,6 +1696,7 @@ pub fn extract_zip_from<Rd: Read + Seek + Clone, R>(
 /// members are laid out end to end, this is empty and costs nothing.
 fn unclaimed_spans<R: Read + Seek>(
     zip: &mut ::zip::ZipArchive<R>,
+    read: &dyn Fn(u64, usize) -> Vec<u8>,
 ) -> (Vec<(u64, u64)>, std::collections::HashSet<u64>) {
     let cd = zip.central_directory_start();
     let mut claimed: Vec<(u64, u64)> = Vec::with_capacity(zip.len());
@@ -1635,6 +1704,18 @@ fn unclaimed_spans<R: Read + Seek>(
     for i in 0..zip.len() {
         if let Ok(f) = zip.by_index_raw(i) {
             let start = f.header_start();
+            // A member the local header describes otherwise is read as the
+            // local header says too, by the orphan scan: it is not known, and
+            // it claims no space, least of all the bytes of another member.
+            if !local_header_agrees(
+                read,
+                start,
+                f.name_raw(),
+                zip_method_code(&f.compression()),
+                f.compressed_size(),
+            ) {
+                continue;
+            }
             known.insert(start);
             // A member using a trailing data descriptor declares no data start,
             // so its extent is not knowable here. Claiming only the header
@@ -1664,6 +1745,41 @@ fn unclaimed_spans<R: Read + Seek>(
     // A local header is 30 bytes; nothing shorter can hold one.
     gaps.retain(|(a, b)| b - a >= LFH_LEN as u64);
     (gaps, known)
+}
+
+/// Whether the local header at `start` says of a member what the central
+/// directory says: its name, its method, and its compressed size when the
+/// header carries one.
+///
+/// Readers differ in which they believe. The `zip` crate decodes with the
+/// directory's method and size, and Info-ZIP `unzip` with the local header's, so
+/// an archive whose two disagree holds one thing for one and another for the
+/// other. `read(offset, len)` returns what is there, short at the end of the
+/// input. A header that cannot be read as one is left to the errors the member's
+/// own open gives.
+fn local_header_agrees(
+    read: &dyn Fn(u64, usize) -> Vec<u8>,
+    start: u64,
+    name_raw: &[u8],
+    method: u16,
+    comp: u64,
+) -> bool {
+    let h = read(start, LFH_LEN);
+    if h.len() < LFH_LEN || h[..4] != *b"PK\x03\x04" {
+        return true;
+    }
+    let flags = u16::from_le_bytes([h[6], h[7]]);
+    if u16::from_le_bytes([h[8], h[9]]) != method {
+        return false;
+    }
+    // The sizes follow the data (bit 3), or are in a ZIP64 field (all ones).
+    let local_comp = u32::from_le_bytes([h[18], h[19], h[20], h[21]]);
+    if flags & 0x08 == 0 && local_comp != u32::MAX && u64::from(local_comp) != comp {
+        return false;
+    }
+    let name_len = usize::from(u16::from_le_bytes([h[26], h[27]]));
+    let name = read(start + LFH_LEN as u64, name_len);
+    name.len() < name_len || name == name_raw
 }
 
 /// Whether the local header at `off` names a member with something to scan:
@@ -1805,12 +1921,63 @@ fn zip_mtime<'a>(
 /// crate's decompressing reader, so a member decompressing to any size is
 /// never held. An encrypted member is decrypted whole (decryption needs the
 /// full ciphertext), bounded by the buffer limit.
+/// What `walk` takes from the directory entry of a member.
+struct RawEntry {
+    name: String,
+    is_dir: bool,
+    encrypted: bool,
+    comp: u64,
+    size: u64,
+    method: u16,
+    mtime: Option<crate::Mtime>,
+    mode: Option<u32>,
+    local: Option<u16>,
+}
+
+// The three below open a `ZipFile`, which holds the decoders of every codec
+// inline: tens of kilobytes. Opened in `walk` itself, one would be in its frame
+// for as long as a member is scanned, and a ZIP inside a ZIP inside a ZIP
+// takes that once for each level.
+
+#[inline(never)]
+fn raw_entry<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    src: &dyn crate::source::ByteSource,
+    i: usize,
+) -> ::zip::result::ZipResult<RawEntry> {
+    let f = zip.by_index_raw(i)?;
+    Ok(RawEntry {
+        name: member_name(&f),
+        is_dir: f.is_dir(),
+        encrypted: f.encrypted(),
+        comp: f.compressed_size(),
+        size: f.size(),
+        method: zip_method_code(&f.compression()),
+        mtime: zip_mtime(f.extra_data_fields(), f.last_modified()),
+        mode: f.unix_mode(),
+        local: local_flags(&src.window(f.header_start() as usize, 8)),
+    })
+}
+
+#[inline(never)]
+fn header_parses<R: Read + Seek>(
+    zip: &mut ::zip::ZipArchive<R>,
+    i: usize,
+) -> ::zip::result::ZipResult<()> {
+    zip.by_index_raw(i).map(|_| ())
+}
+
+#[inline(never)]
+fn member_decodes<R: Read + Seek>(zip: &mut ::zip::ZipArchive<R>, i: usize) -> bool {
+    zip.by_index(i).is_ok()
+}
+
 pub(crate) fn walk<T>(
     src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use crate::stream::{emit_entry, emit_stream, whole, MemberMeta};
+    use crate::stream::{MemberMeta, emit_entry, emit_stream, whole};
     // A forged or corrupt central directory (a bad CDFH offset in the EOCD,
     // say) makes the seekable walk impossible, but the members' local file
     // headers are still in the file. Fall back to reading the archive whole
@@ -1831,7 +1998,7 @@ pub(crate) fn walk<T>(
         // strand every later member: the salvage pass skips them as already
         // covered, so a payload behind one bad directory pointer would never
         // be scanned.
-        if let Err(e) = zip.by_index_raw(i).map(|_| ()) {
+        if let Err(e) = header_parses(&mut zip, i) {
             let hit = zip_entry_error(i, &e);
             if !hit.is_corrupt() {
                 return Err(hit);
@@ -1846,20 +2013,17 @@ pub(crate) fn walk<T>(
             }
             continue;
         }
-        let (name, is_dir, encrypted, comp, size, method, mtime, mode, local) = {
-            let f = zip.by_index_raw(i).map_err(|e| zip_entry_error(i, &e))?;
-            (
-                member_name(&f),
-                f.is_dir(),
-                f.encrypted(),
-                f.compressed_size(),
-                f.size(),
-                zip_method_code(&f.compression()),
-                zip_mtime(f.extra_data_fields(), f.last_modified()),
-                f.unix_mode(),
-                local_flags(&src.window(f.header_start() as usize, 8)),
-            )
-        };
+        let RawEntry {
+            name,
+            is_dir,
+            encrypted,
+            comp,
+            size,
+            method,
+            mtime,
+            mode,
+            local,
+        } = raw_entry(&mut zip, src, i).map_err(|e| zip_entry_error(i, &e))?;
         // `is_dir()` is true purely because the name ends in '/'. A JAR packer
         // buys exactly that: `kingDavid/9.class/` holds a real deflate-compressed
         // class that the JVM loads by name, while every ZIP tool discards it as a
@@ -1913,8 +2077,7 @@ pub(crate) fn walk<T>(
         // decoder, so fall back to the raw bytes and decode them ourselves,
         // as `extract_zip_from` does. Probe first so the borrow of `zip` ends
         // before the fallback needs it.
-        let decodable = zip.by_index(i).is_ok();
-        let mut file = match decodable {
+        let mut file = match member_decodes(&mut zip, i) {
             true => member_reader(&mut zip, i).map_err(|e| zip_entry_error(i, &e))?,
             false => {
                 let out = walk_raw_decode(&mut zip, src, i, meta, budget, visit, &mut deferred)?;
@@ -1930,7 +2093,7 @@ pub(crate) fn walk<T>(
     }
     // Members left out of the central directory while their local headers and
     // data stay in the file, which is what the target extracts.
-    for entry in hidden_members(zip, budget)? {
+    for entry in hidden_members(zip, src, budget)? {
         if let Some(t) = emit_entry(entry, budget, visit)? {
             return Ok(Some(t));
         }
@@ -1938,11 +2101,41 @@ pub(crate) fn walk<T>(
     deferred.map_or(Ok(None), Err)
 }
 
+/// A member's raw bytes behind the decoder for its method.
+struct RawMember<'a> {
+    method: u16,
+    usz: u64,
+    data_start: Option<u64>,
+    decoder: Result<Box<dyn Read + 'a>, RawRefusal>,
+}
+
+/// Opens member `i` raw and puts its decoder on it. Kept out of
+/// `walk_raw_decode`: a `ZipFile` is tens of kilobytes, and a frame that held
+/// one would stay on the stack while the member is scanned.
+#[inline(never)]
+fn raw_member<'a, R: Read + Seek>(
+    zip: &'a mut ::zip::ZipArchive<R>,
+    i: usize,
+    cap: u64,
+) -> Option<RawMember<'a>> {
+    let f = zip.by_index_raw(i).ok()?;
+    let method = zip_method_code(&f.compression());
+    let usz = f.size();
+    let data_start = f.data_start();
+    Some(RawMember {
+        method,
+        usz,
+        data_start,
+        decoder: raw_decoder(method, f, Some(usz), cap),
+    })
+}
+
 /// Decode a member the `zip` crate refused, from its RAW bytes, using exav's own
 /// codec set, as it is read. The member is visited once: decoded, or as a
 /// marker saying why it could not be. A decoder needing more memory than the
 /// buffer limit leaves the member unread, and the limit goes in `deferred`
 /// for the walk to report once the other members are scanned.
+#[inline(never)]
 fn walk_raw_decode<R: Read + Seek, T>(
     zip: &mut ::zip::ZipArchive<R>,
     src: &dyn crate::source::ByteSource,
@@ -1953,17 +2146,17 @@ fn walk_raw_decode<R: Read + Seek, T>(
     deferred: &mut Option<LimitHit>,
 ) -> Result<Option<T>, LimitHit> {
     let cap = budget.limits.max_buffer_bytes;
-    let f = match zip.by_index_raw(i) {
-        Ok(f) => f,
-        Err(_) => {
-            meta.unsupported = Some("ZIP member header will not parse");
-            return Ok(visit(&meta, None, budget));
-        }
+    let Some(RawMember {
+        method,
+        usz,
+        data_start,
+        decoder,
+    }) = raw_member(zip, i, cap)
+    else {
+        meta.unsupported = Some("ZIP member header will not parse");
+        return Ok(visit(&meta, None, budget));
     };
-    let method = zip_method_code(&f.compression());
-    let usz = f.size();
-    let data_start = f.data_start();
-    match raw_decoder(method, f, Some(usz), cap) {
+    match decoder {
         Ok(mut r) => crate::stream::emit_stream(&meta, &mut r, budget, visit),
         Err(RawRefusal::Unsupported(_)) if !defined_method(method) && data_start.is_some() => {
             // A method no ZIP specification defines is no codec at all.
@@ -2006,6 +2199,7 @@ fn walk_raw_decode<R: Read + Seek, T>(
 /// One encrypted ZIP member: try the password pool and hand over the
 /// plaintext on success, else a metadata-only unsupported member, so the
 /// caller reports it without masking later members.
+#[inline(never)]
 fn walk_encrypted<R: Read + Seek, T>(
     zip: &mut ::zip::ZipArchive<R>,
     i: usize,
@@ -2013,7 +2207,7 @@ fn walk_encrypted<R: Read + Seek, T>(
     budget: &mut Budget,
     visit: crate::stream::Visit<T>,
 ) -> Result<Option<T>, LimitHit> {
-    use crate::stream::{emit_bytes, MemberMeta};
+    use crate::stream::{MemberMeta, emit_bytes};
     let unsupported_meta = MemberMeta {
         encrypted: true,
         unsupported: Some("encrypted ZIP member"),
@@ -2067,11 +2261,15 @@ fn walk_encrypted<R: Read + Seek, T>(
 /// bounded search [`ZipMembers`] uses: only the space the directory leaves
 /// unaccounted for is read, up to [`MAX_ORPHAN_SCAN`], and a search that stops
 /// there yields a member saying so.
+#[inline(never)]
 pub(crate) fn hidden_members<Rd: Read + Seek>(
     mut zip: ::zip::ZipArchive<Rd>,
+    src: &dyn crate::source::ByteSource,
     budget: &mut Budget,
 ) -> Result<Vec<Entry>, LimitHit> {
-    let (gaps, known) = unclaimed_spans(&mut zip);
+    let (gaps, known) = unclaimed_spans(&mut zip, &|at, len| {
+        usize::try_from(at).map_or_else(|_| Vec::new(), |at| src.window(at, len).into_owned())
+    });
     if gaps.is_empty() {
         return Ok(Vec::new());
     }
@@ -2099,6 +2297,43 @@ pub(crate) fn hidden_members<Rd: Read + Seek>(
 
 /// The member that says the search for hidden members stopped at its limit.
 const HIDDEN_SEARCH_TRUNCATED: &str = "<hidden-member search stopped at its limit>";
+
+/// The search for a ZIP stapled to the end of a file reads the end of it.
+#[cfg(test)]
+mod appended_start_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Tally(std::io::Cursor<Vec<u8>>, Arc<AtomicU64>);
+    impl Read for Tally {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+    impl Seek for Tally {
+        fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(p)
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_end_record_is_not_read_through_for_one() {
+        let read = Arc::new(AtomicU64::new(0));
+        let cache = crate::source::BlockCache::with_sizes(
+            Tally(std::io::Cursor::new(vec![b'x'; 8 << 20]), read.clone()),
+            64 * 1024,
+            1 << 20,
+        )
+        .unwrap();
+        let before = read.load(Ordering::Relaxed);
+        assert_eq!(appended_start(&cache), None);
+        let used = read.load(Ordering::Relaxed) - before;
+        assert!(used <= 1 << 20, "{used} bytes read for an 8 MiB file");
+    }
+}
 
 #[cfg(test)]
 mod orphan_scan_tests {
@@ -2196,6 +2431,118 @@ mod directory_tests {
     }
 }
 
+/// The buffered path (`extract_zip_from`) over a member of a codec the `zip`
+/// crate does not decode.
+#[cfg(all(test, feature = "bzip2"))]
+mod buffered_raw_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A one-member ZIP, central directory included.
+    fn zip_of(method: u16, raw: &[u8], crc: u32, usz: u32) -> Vec<u8> {
+        let fields = |v: &mut Vec<u8>| {
+            v.extend_from_slice(&20u16.to_le_bytes());
+            v.extend_from_slice(&0u16.to_le_bytes());
+            v.extend_from_slice(&method.to_le_bytes());
+            v.extend_from_slice(&[0; 4]);
+            v.extend_from_slice(&crc.to_le_bytes());
+            v.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            v.extend_from_slice(&usz.to_le_bytes());
+            v.extend_from_slice(&5u16.to_le_bytes());
+            v.extend_from_slice(&0u16.to_le_bytes());
+        };
+        let mut z = b"PK\x03\x04".to_vec();
+        fields(&mut z);
+        z.extend_from_slice(b"m.bin");
+        z.extend_from_slice(raw);
+        let mut cd = b"PK\x01\x02".to_vec();
+        cd.extend_from_slice(&20u16.to_le_bytes());
+        fields(&mut cd);
+        cd.extend_from_slice(&[0; 6]);
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(b"m.bin");
+        let cd_at = z.len() as u32;
+        z.extend_from_slice(&cd);
+        z.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+        z.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+        z.extend_from_slice(&cd_at.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z
+    }
+
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u32 = 0x1234_5678;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn bzip2(data: &[u8]) -> Vec<u8> {
+        let mut w = ::bzip2::write::BzEncoder::new(Vec::new(), ::bzip2::Compression::new(1));
+        w.write_all(data).unwrap();
+        w.finish().unwrap()
+    }
+
+    fn entries(zip: &[u8]) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut budget = Budget::new(crate::Limits::default());
+        extract_zip_from(
+            Cursor::new(zip),
+            &mut budget,
+            &mut |e: Entry, _: &mut Budget| {
+                out.push(e);
+                None::<()>
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    /// Three 100 kB blocks, the last damaged: the first two are scanned and the
+    /// member is reported.
+    #[test]
+    fn a_member_damaged_part_way_keeps_its_prefix_and_is_reported() {
+        let data = noise(270_000);
+        let mut raw = bzip2(&data);
+        let at = raw.len() * 4 / 5;
+        raw[at..].fill(0xff);
+        let e = entries(&zip_of(12, &raw, 0, data.len() as u32));
+        assert_eq!(e.len(), 1);
+        assert!(
+            e[0].data.len() >= 100_000 && data.starts_with(&e[0].data),
+            "the blocks before the damage are lost: {} bytes",
+            e[0].data.len()
+        );
+        assert!(
+            e[0].unsupported.is_some(),
+            "a member damaged part way came out whole"
+        );
+    }
+
+    #[test]
+    fn a_whole_member_is_not_reported() {
+        let data = noise(270_000);
+        let e = entries(&zip_of(12, &bzip2(&data), 0, data.len() as u32));
+        assert!(e[0].unsupported.is_none() && e[0].data == data);
+    }
+
+    /// A stream that ends whole but short of the size the directory declares is
+    /// not that member.
+    #[test]
+    fn a_member_shorter_than_declared_is_reported() {
+        let data = noise(1000);
+        let e = entries(&zip_of(12, &bzip2(&data), 0, 5000));
+        assert_eq!(e[0].data, data);
+        assert!(e[0].unsupported.is_some());
+    }
+}
+
 #[cfg(test)]
 mod zip_ppmd_tests {
     use super::*;
@@ -2239,10 +2586,8 @@ mod zip_ppmd_tests {
     fn ppmd_model_over_the_buffer_limit_is_too_big() {
         // order 6, 256 MB.
         let raw = [0xf5u8, 0x0f, 0xde, 0xad, 0xbe, 0xef];
-        assert_eq!(
-            decode_zip_raw(98, &raw, Some(64), 1 << 20),
-            Some((Vec::new(), true))
-        );
+        let s = decode_zip_raw(98, &raw, Some(64), 1 << 20).unwrap();
+        assert!(s.over_cap && s.data.is_empty() && !s.undecoded);
         assert!(matches!(
             raw_decoder(98, &raw[..], Some(64), 1 << 20),
             Err(RawRefusal::TooBig)
@@ -2256,9 +2601,10 @@ mod zip_ppmd_tests {
         let cap = budget.reserve().unwrap();
         // Valid parameter header, garbage stream.
         let raw = [0x07u8, 0x01, 0xde, 0xad, 0xbe, 0xef];
+        let s = decode_zip_raw(98, &raw, Some(64), cap).expect("a decoder is there");
         assert!(
-            decode_zip_raw(98, &raw, Some(64), cap).is_none(),
-            "a corrupt PPMd stream must decode to nothing, so the caller reports it"
+            s.undecoded || s.cut_short,
+            "a corrupt PPMd stream must say so, for the caller to report it"
         );
     }
 
@@ -2270,7 +2616,7 @@ mod zip_ppmd_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/zip/7z_ppmd_large_then_small.zip"
         );
-        let zip = std::fs::read(path).unwrap();
+        let zip = crate::read_fixture(path).unwrap();
         let u32_at = |o: usize| u32::from_le_bytes(zip[o..o + 4].try_into().unwrap());
         let u16_at = |o: usize| u16::from_le_bytes([zip[o], zip[o + 1]]) as usize;
         let (comp, usz) = (u32_at(18) as usize, Some(u32_at(22) as u64));
@@ -2278,8 +2624,15 @@ mod zip_ppmd_tests {
         let member = &zip[start..start + comp];
         assert_eq!(member[..2], [0x0b, 0x10]);
         let cap = 1 << 20;
-        let (whole, over) = decode_zip_raw(98, member, usz, cap).expect("intact member decodes");
-        assert_eq!((Some(whole.len() as u64), over), (usz, false));
+        let whole = decode_zip_raw(98, member, usz, cap).expect("intact member decodes");
+        assert_eq!(
+            (
+                Some(whole.data.len() as u64),
+                whole.over_cap,
+                whole.undecoded
+            ),
+            (usz, false, false)
+        );
 
         let flips = (2..18)
             .flat_map(|p| (0..8).map(move |b| (p, b)))
@@ -2287,15 +2640,20 @@ mod zip_ppmd_tests {
         for (pos, bit) in flips {
             let mut bad = member.to_vec();
             bad[pos] ^= 1 << bit;
-            if let Some((out, _)) = decode_zip_raw(98, &bad, usz, cap) {
-                assert!(Some(out.len() as u64) <= usz);
+            if let Some(s) = decode_zip_raw(98, &bad, usz, cap) {
+                assert!(Some(s.data.len() as u64) <= usz);
             }
         }
         for cut in (0..member.len()).step_by(97) {
-            assert!(
-                decode_zip_raw(98, &member[..cut], usz, cap).is_none(),
-                "cut at {cut}: a truncated member is not a decoded one"
-            );
+            // The header's two bytes cut, nothing decodes; later, a prefix does
+            // and the cut is the stream's running out, never a whole member.
+            match decode_zip_raw(98, &member[..cut], usz, cap) {
+                None => assert!(cut < 2, "cut at {cut}: no decoder"),
+                Some(s) => assert!(
+                    Some(s.data.len() as u64) < usz && (s.cut_short || s.undecoded),
+                    "cut at {cut}: a truncated member is not a decoded one"
+                ),
+            }
         }
     }
 }

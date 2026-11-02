@@ -3,7 +3,7 @@
 use std::io::{BufReader, Read};
 
 use crate::source::{ByteSource, Reader};
-use crate::stream::{stream_single, Visit};
+use crate::stream::{Visit, stream_single};
 use crate::{Budget, LimitHit};
 
 pub(crate) fn walk<T>(

@@ -1,7 +1,7 @@
 /**
- * The IFC and STL engine: exav-render's readers in a worker
- * (`exav_viewer_model.wasm`), which sends back finished vertex buffers,
- * transferred rather than copied. Shared by `@exav/viewer/ifc` and
+ * The model engine: exav-render's IFC, STL, OBJ, PLY and glTF readers in a
+ * worker (`exav_viewer_model.wasm`), which sends back finished vertex
+ * buffers, transferred rather than copied. Shared by `@exav/viewer/ifc` and
  * `@exav/viewer/model`.
  */
 import { createWorkerHost, type WorkerHost } from "../core/worker-host.js";
@@ -11,17 +11,31 @@ export const DEFAULT_MAX_TRIANGLES = 6_000_000;
 /** A damaged file can declare counts that keep the reader busy. */
 export const DEFAULT_TIMEOUT_MS = 120_000;
 
+/** What the engine reads. */
+export type ModelKind = "ifc" | "stl" | "obj" | "ply" | "gltf";
+
 export interface ModelRequest {
-  kind: "ifc" | "stl";
+  kind: ModelKind;
   bytes: ArrayBuffer;
   maxTriangles: number;
+  /**
+   * glTF: the files its buffers are in, by the URI the document writes them.
+   * With `list`, nothing is read: the answer is those URIs (`{ buffers }`).
+   */
+  files?: { name: string; bytes: ArrayBuffer }[];
+  list?: boolean;
 }
+
+/** What the engine answers: the model, or for a `list` request the buffer files a glTF names. */
+export type ModelAnswer = ParsedModel | { buffers: string[] };
 
 /** One class and colour's part of the buffers; offsets in vertices, indices and edge vertices. */
 export interface BatchMeta {
   class: string;
   /** RGBA in 0..1 (sRGB), or null when the file gives none. */
   color: [number, number, number, number] | null;
+  /** IFC: index into `nodes` of the storey all its elements are in, null for none. */
+  storey?: number | null;
   vertex: number;
   vertices: number;
   index: number;
@@ -39,6 +53,8 @@ export interface ElementMeta {
   name: string;
   /** Index into `nodes`. */
   node: number | null;
+  /** IFC: index into `nodes` of its building storey, null when it is in none. */
+  storey?: number | null;
   /** [batch, first index, index count]. */
   ranges: [number, number, number][];
 }
@@ -49,7 +65,8 @@ export interface ModelMeta {
   bounds: [number, number, number, number, number, number] | null;
   batches: BatchMeta[];
   elements: ElementMeta[];
-  nodes: { id: number; class: string; name: string; parent: number | null }[];
+  /** `elevation`: a storey's, in metres. */
+  nodes: { id: number; class: string; name: string; parent: number | null; elevation?: number | null }[];
   warnings: { unsupported: Record<string, number>; invalid: number; booleansSkipped: number; truncated: number; damaged: boolean };
 }
 
@@ -63,12 +80,12 @@ export interface ParsedModel {
   parseMs: number;
 }
 
-export function createModelEngine(): WorkerHost<ModelRequest, ParsedModel> {
-  return createWorkerHost<ModelRequest, ParsedModel>(() => new Worker(new URL("./model.worker.js", import.meta.url), { type: "module" }));
+export function createModelEngine(): WorkerHost<ModelRequest, ModelAnswer> {
+  return createWorkerHost<ModelRequest, ModelAnswer>(() => new Worker(new URL("./model.worker.js", import.meta.url), { type: "module" }));
 }
 
 /** What is missing from the picture, for the `warnings` controller. */
-export function modelWarnings(meta: ModelMeta, kind: "ifc" | "stl"): { key: string; count: number }[] {
+export function modelWarnings(meta: ModelMeta, kind: ModelKind): { key: string; count: number }[] {
   const w = meta.warnings;
   const unsupported = Object.values(w.unsupported).reduce((a, b) => a + b, 0);
   return [

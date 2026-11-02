@@ -80,7 +80,7 @@ impl<K: Record> Serialize for SortedTable<K> {
         }
         let spans: Vec<u8> = self.spans.iter().flat_map(|&(o, l)| [o.to_le_bytes(), l.to_le_bytes()]).flatten().collect();
         let mut bits = vec![0u8; self.unofficial.len().div_ceil(8)];
-        for (i, _) in self.unofficial.iter().enumerate().filter(|(_, &u)| u) {
+        for (i, _) in self.unofficial.iter().enumerate().filter(|&(_, &u)| u) {
             bits[i / 8] |= 1 << (i % 8);
         }
         (Blob(&keys), Blob(&spans), &self.names, Blob(&bits)).serialize(s)

@@ -1,7 +1,7 @@
 //! One pass over an object, a window at a time, looking up the anchors of a
 //! [`Grams`] at every position but inside long runs of one byte.
 
-use super::{Grams, Scan, GRAM};
+use super::{GRAM, Grams, Scan};
 use crate::byte_source::ByteSource;
 
 /// Bytes of the object [`sweep`] reads at a time; in memory, a slice of it.

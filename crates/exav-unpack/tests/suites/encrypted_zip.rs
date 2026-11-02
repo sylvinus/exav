@@ -14,7 +14,7 @@
 //! member must surface as `unsupported(encrypted=true)` (→ `PasswordProtected`),
 //! never silently clean.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const EICAR_PREFIX: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 
@@ -194,6 +194,50 @@ fn sevenz_encrypted_detected() {
         assert!(
             entries.iter().any(|e| has_eicar(&e.data)),
             "-mhe 7z must decrypt to EICAR with the password"
+        );
+    }
+}
+
+/// A header-encrypted 7z whose header is AES and then LZMA (what 7-Zip's
+/// `-mhe=on` and sevenz-rust2 write; the one above has no compressed layer) is
+/// listed with the right password: each coder of the header's chain decodes to
+/// its own size, not to the sum of them. With a wrong password it is still an
+/// encrypted member and nothing else.
+#[cfg(feature = "decrypt")]
+#[test]
+fn sevenz_header_encrypted_over_lzma_is_listed_with_the_password() {
+    for (name, first, count, content) in [
+        // 7-Zip 25.01, `7z a -phunter2 -mhe=on` (LZMA2) and with `-m0=LZMA`.
+        ("mhe_lzma2.7z", "f0.txt", 5, b'x'),
+        ("mhe_lzma.7z", "f0.txt", 5, b'x'),
+        // sevenz-rust2 0.24.1's writer, 40 members.
+        ("mhe_sevenz_rust2.7z", "m0.txt", 40, b'A'),
+    ] {
+        let p = format!(
+            "{}/tests/fixtures/encrypted/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let blob = std::fs::read(&p).unwrap();
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["hunter2".to_string()]);
+        let entries = extract(Format::SevenZip, &blob, &mut budget).unwrap();
+        assert_eq!(
+            entries.len(),
+            count,
+            "{name}: {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(entries[0].name, first, "{name}");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.unsupported.is_none() && e.data == vec![content; 64]),
+            "{name}"
+        );
+        let mut budget = Budget::with_passwords(Limits::default(), vec!["wrong".to_string()]);
+        let entries = extract(Format::SevenZip, &blob, &mut budget).unwrap();
+        assert!(
+            entries.len() == 1 && entries[0].encrypted && entries[0].unsupported.is_some(),
+            "{name}"
         );
     }
 }

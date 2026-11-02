@@ -14,7 +14,7 @@
 //! detection name from prose is how a reworded message silently becomes a
 //! different alert.
 
-use exav_core::{analyze, loader, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, analyze, loader};
 use std::io::Write;
 
 fn scanner() -> Scanner {

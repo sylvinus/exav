@@ -22,11 +22,10 @@
 //! purely static rewriter: it never executes code, so runtime-assembled payloads
 //! (numeric-array VMs, dynamic dispatch) are intentionally out of scope.
 //!
-//! Not yet implemented (tracked in tmp/GAPS.md):
-//! * **Microsoft Script Encoder** (`#@~^…^#~@`, JScript.Encode/VBScript.Encode)
-//!   decoding — needs the exact published 119×3 translation + 64-entry pick
-//!   tables; deferred rather than ship an unverified table (and near-absent in
-//!   the current corpus).
+//! Not done here: Microsoft Script Encoder (`#@~^…^#~@`) blobs are decoded by
+//! exav-unpack's `screnc`, which surfaces the plaintext as a member of its own.
+//!
+//! Not yet implemented:
 //! * **base64→script rescan** — decoding long base64 runs to *script/text* (not
 //!   just exec-magic payloads, which `exav-unpack::base64_payloads` already
 //!   covers). The higher-yield lever per corpus evidence, but needs a distinct
@@ -805,13 +804,12 @@ fn percent_decode(s: &[u8]) -> Vec<u8> {
                 continue;
             }
         }
-        if s[i] == b'%' && i + 2 < n {
-            if let Some(v) = hex2(s[i + 1], s[i + 2]) {
+        if s[i] == b'%' && i + 2 < n
+            && let Some(v) = hex2(s[i + 1], s[i + 2]) {
                 out.push(v);
                 i += 3;
                 continue;
             }
-        }
         out.push(s[i]);
         i += 1;
     }
@@ -900,11 +898,10 @@ impl Emitter {
             }
             Tok::Punct(b) => std::slice::from_ref(b),
         };
-        if let (Some(&last), Some(&first)) = (self.out.last(), piece.first()) {
-            if is_ident(last) && is_ident(first) {
+        if let (Some(&last), Some(&first)) = (self.out.last(), piece.first())
+            && is_ident(last) && is_ident(first) {
                 self.out.push(b' ');
             }
-        }
         self.out.extend_from_slice(piece);
     }
 

@@ -12,7 +12,7 @@ const H_ALIGNED = 3
 const H_MIDDLE = 4
 const H_FIT = 5
 
-const V_BASELINE = 0
+// Vertical alignment; 0 is the baseline.
 const V_BOTTOM = 1
 const V_MIDDLE = 2
 const V_TOP = 3
@@ -24,6 +24,11 @@ export interface TextLayoutResult {
   glyphCount: number
   /** Runs skipped because no glyph in the run had a rasterised cell. */
   skippedRuns: number
+  /**
+   * The glyphs of each clip region, in glyph instances: those of clip 0
+   * (none) first, then each region's, in increasing id.
+   */
+  clipRanges: { clip: number; start: number; count: number }[]
 }
 
 /**
@@ -71,9 +76,11 @@ export function facesUsed(records: ArrayBuffer): Set<number> {
 /**
  * Turn placement records into positioned glyph quads.
  *
- * Each instance carries an origin plus two edge vectors, so rotation, width
- * factor and oblique slant all fall out of the same two vectors and the shader
- * stays a single multiply-add.
+ * A record's frame is two vectors, `u` one cap height of advance along the
+ * baseline and `v` one cap height up, which carry its rotation, width factor,
+ * slant, mirroring and a block's non-uniform scale. The run is laid out in
+ * cap heights and the frame places it; each instance is an origin plus two
+ * edge vectors, so the shader stays a single multiply-add.
  */
 export function layoutText(
   records: ArrayBuffer,
@@ -89,16 +96,17 @@ export function layoutText(
     text: string
     x: number
     y: number
-    height: number
-    rotation: number
-    widthFactor: number
-    oblique: number
+    ux: number
+    uy: number
+    vx: number
+    vy: number
     rgba: number
     attr: number
     hAlign: number
     vAlign: number
     order: number
     faceByte: number
+    clip: number
   }[] = []
   let glyphTotal = 0
 
@@ -114,16 +122,17 @@ export function layoutText(
       text,
       x: view.getFloat32(o + 0, true),
       y: view.getFloat32(o + 4, true),
-      height: view.getFloat32(o + 8, true),
-      rotation: view.getFloat32(o + 12, true),
-      widthFactor: view.getFloat32(o + 16, true),
-      oblique: view.getFloat32(o + 20, true),
+      ux: view.getFloat32(o + 8, true),
+      uy: view.getFloat32(o + 12, true),
+      vx: view.getFloat32(o + 16, true),
+      vy: view.getFloat32(o + 20, true),
       rgba: view.getUint32(o + 24, true),
       attr: view.getUint32(o + 28, true),
       hAlign: view.getUint8(o + 38),
       vAlign: view.getUint8(o + 39),
       order: view.getUint32(o + 40, true),
       faceByte: view.getUint8(o + 44),
+      clip: view.getUint16(o + 46, true),
     })
     const faceByte = view.getUint8(o + 44)
     for (const ch of text) {
@@ -136,22 +145,25 @@ export function layoutText(
   const out = new DataView(buffer)
   let n = 0
   let skippedRuns = 0
+  // Each clip region's runs together, so it is masked once: the depth test
+  // still puts each glyph in the drawing's order.
+  runs.sort((a, b) => a.clip - b.clip)
+  const clipRanges: TextLayoutResult['clipRanges'] = []
 
   for (const run of runs) {
-    // DWG text height is cap height; the atlas is in em units, and the ratio
-    // between them belongs to the face this run is drawn with.
-    const em = run.height / atlas.capRatio(run.faceByte)
-    if (!(em > 0)) {
+    const last = clipRanges[clipRanges.length - 1]
+    if (!last || last.clip !== run.clip) clipRanges.push({ clip: run.clip, start: n, count: 0 })
+    if (!(Math.hypot(run.vx, run.vy) > 0) || !(Math.hypot(run.ux, run.uy) > 0)) {
       skippedRuns++
       continue
     }
+    // DWG text height is cap height; the atlas is in em units, and the ratio
+    // between them belongs to the face this run is drawn with.
+    const capsPerEm = 1 / atlas.capRatio(run.faceByte)
+    const runWidth = atlas.measure(run.faceByte, run.text) * capsPerEm
 
-    const widthFactor = run.widthFactor > 0 ? run.widthFactor : 1
-    const advanceScale = em * widthFactor
-    const runWidth = atlas.measure(run.faceByte, run.text) * advanceScale
-
-    // Horizontal anchor. Aligned and Fit stretch between two points, which we
-    // do not have here, so they fall back to centred.
+    // Horizontal anchor. Aligned and Fit arrive stretched and left-aligned;
+    // without their second point they fall back to centred.
     let dx = 0
     switch (run.hAlign) {
       case H_CENTER:
@@ -168,27 +180,16 @@ export function layoutText(
         dx = 0
     }
 
-    // Vertical anchor, measured from the baseline.
+    // Where the baseline sits from the anchor: Bottom puts the descenders on
+    // it, Middle centres the capitals, Top their tops, and the Middle
+    // alignment (TEXT's MIDDLE, unlike Middle Center) capitals and descenders
+    // together. `baseline_offset` in text.rs does the same for stroke text.
+    const descent = atlas.descent(run.faceByte)
     let dy = 0
-    switch (run.vAlign) {
-      case V_BOTTOM:
-        dy = 0
-        break
-      case V_MIDDLE:
-        dy = -run.height / 2
-        break
-      case V_TOP:
-        dy = -run.height
-        break
-      case V_BASELINE:
-      default:
-        dy = 0
-    }
-
-    const cos = Math.cos(run.rotation)
-    const sin = Math.sin(run.rotation)
-    // Oblique leans the vertical edge; positive slants to the right.
-    const tanO = Math.tan(run.oblique || 0)
+    if (run.hAlign === H_MIDDLE) dy = -(1 - descent) / 2
+    else if (run.vAlign === V_BOTTOM) dy = descent
+    else if (run.vAlign === V_MIDDLE) dy = -0.5
+    else if (run.vAlign === V_TOP) dy = -1
 
     let pen = dx
     let drew = false
@@ -199,34 +200,22 @@ export function layoutText(
       if (!g) continue
       // Kerning has to move the pen as well as the measured width, or the
       // glyphs stop matching the box the alignment was computed from.
-      if (prev) pen += atlas.kern(run.faceByte, prev, ch) * advanceScale
+      if (prev) pen += atlas.kern(run.faceByte, prev, ch) * capsPerEm
       prev = ch
       if (g.width > 0) {
-        // Glyph box in the run's own unrotated frame.
-        const gx = pen + g.left * advanceScale
-        const gy = dy + g.bottom * em
-        const gw = g.width * advanceScale
-        const gh = g.height * em
-
-        // Skew shifts x by the height above the baseline.
-        const skewLo = gy * tanO
-        const skewHi = (gy + gh) * tanO
-
-        // Origin is the bottom-left corner; the two edges span the quad.
-        const ox = gx + skewLo
-        const oy = gy
-        const ex = gw
-        const ey = 0
-        const fx = skewHi - skewLo
-        const fy = gh
+        // Glyph box in cap heights, along `u` and up `v`.
+        const a = pen + g.left * capsPerEm
+        const b0 = dy + g.bottom * capsPerEm
+        const w = g.width * capsPerEm
+        const h = g.height * capsPerEm
 
         const b = n * GLYPH_BYTES
-        out.setFloat32(b + 0, run.x + ox * cos - oy * sin, true)
-        out.setFloat32(b + 4, run.y + ox * sin + oy * cos, true)
-        out.setFloat32(b + 8, ex * cos - ey * sin, true)
-        out.setFloat32(b + 12, ex * sin + ey * cos, true)
-        out.setFloat32(b + 16, fx * cos - fy * sin, true)
-        out.setFloat32(b + 20, fx * sin + fy * cos, true)
+        out.setFloat32(b + 0, run.x + a * run.ux + b0 * run.vx, true)
+        out.setFloat32(b + 4, run.y + a * run.uy + b0 * run.vy, true)
+        out.setFloat32(b + 8, w * run.ux, true)
+        out.setFloat32(b + 12, w * run.uy, true)
+        out.setFloat32(b + 16, h * run.vx, true)
+        out.setFloat32(b + 20, h * run.vy, true)
         out.setUint16(b + 24, Math.round(g.u0 * 65535), true)
         out.setUint16(b + 26, Math.round(g.v0 * 65535), true)
         out.setUint16(b + 28, Math.round(g.u1 * 65535), true)
@@ -237,11 +226,12 @@ export function layoutText(
         n++
         drew = true
       }
-      pen += g.advance * advanceScale
+      pen += g.advance * capsPerEm
     }
 
     if (!drew) skippedRuns++
+    clipRanges[clipRanges.length - 1]!.count = n - clipRanges[clipRanges.length - 1]!.start
   }
 
-  return { buffer, glyphCount: n, skippedRuns }
+  return { buffer, glyphCount: n, skippedRuns, clipRanges: clipRanges.filter((r) => r.count > 0) }
 }

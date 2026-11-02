@@ -4,8 +4,8 @@
 
 use exav_unpack::dwg::{BitResult, EedValue, Object, Version};
 
-use super::header::Vars;
 use super::Ctx;
+use super::header::Vars;
 use crate::formats::cad::model::*;
 
 /// The fixed type codes of the tables' objects (spec 20.3).
@@ -248,10 +248,10 @@ fn layer(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<Layer> {
             continue;
         }
         for (code, value) in eed.items(ctx.version) {
-            if let (1071, EedValue::Long(v)) = (code, value) {
-                if let Transparency::Alpha(a) = Transparency::from_code(i64::from(v)) {
-                    l.alpha = a;
-                }
+            if let (1071, EedValue::Long(v)) = (code, value)
+                && let Transparency::Alpha(a) = Transparency::from_code(i64::from(v))
+            {
+                l.alpha = a;
             }
         }
     }
@@ -421,9 +421,8 @@ fn dim_style(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<DimStyle> {
         for _ in 0..11 {
             b.b()?;
         }
-        // DIMALTD, DIMZIN
-        b.rc()?;
-        b.rc()?;
+        b.rc()?; // DIMALTD
+        s.dimzin = i16::from(b.rc()?);
         // DIMSD1, DIMSD2
         b.b()?;
         b.b()?;
@@ -432,12 +431,17 @@ fn dim_style(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<DimStyle> {
             b.rc()?;
         }
         b.b()?; // DIMUPT
-                // DIMTZIN, DIMALTZ, DIMALTTZ, DIMTAD
-        for _ in 0..4 {
+        // DIMTZIN, DIMALTZ, DIMALTTZ
+        for _ in 0..3 {
             b.rc()?;
         }
-        // DIMUNIT, DIMAUNIT, DIMDEC, DIMTDEC, DIMALTU, DIMALTTD
-        for _ in 0..6 {
+        s.dimtad = i16::from(b.rc()?);
+        // DIMUNIT, DIMAUNIT
+        b.bs()?;
+        b.bs()?;
+        s.dimdec = b.bs()?;
+        // DIMTDEC, DIMALTU, DIMALTTD
+        for _ in 0..3 {
             b.bs()?;
         }
         s.dimscale = b.bd()?;
@@ -453,10 +457,11 @@ fn dim_style(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<DimStyle> {
         s.dimtxt = b.bd()?;
         b.bd()?; // DIMCEN
         s.dimtsz = b.bd()?;
-        // DIMALTF, DIMLFAC, DIMTVP, DIMTFAC
-        for _ in 0..4 {
-            b.bd()?;
-        }
+        b.bd()?; // DIMALTF
+        s.dimlfac = b.bd()?;
+        // DIMTVP, DIMTFAC
+        b.bd()?;
+        b.bd()?;
         s.dimgap = b.bd()?;
         // DIMPOST, DIMAPOST, DIMBLK, DIMBLK1, DIMBLK2
         for _ in 0..5 {
@@ -497,25 +502,25 @@ fn dim_style(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<DimStyle> {
         for _ in 0..6 {
             b.b()?;
         }
-        // DIMTAD, DIMZIN, DIMAZIN
-        for _ in 0..3 {
-            b.bs()?;
-        }
+        s.dimtad = b.bs()?;
+        s.dimzin = b.bs()?;
+        b.bs()?; // DIMAZIN
         if ctx.version >= Version::R2007 {
             b.bs()?; // DIMARCSYM
         }
         s.dimtxt = b.bd()?;
         b.bd()?; // DIMCEN
         s.dimtsz = b.bd()?;
-        // DIMALTF, DIMLFAC, DIMTVP, DIMTFAC
-        for _ in 0..4 {
-            b.bd()?;
-        }
+        b.bd()?; // DIMALTF
+        s.dimlfac = b.bd()?;
+        // DIMTVP, DIMTFAC
+        b.bd()?;
+        b.bd()?;
         s.dimgap = b.bd()?;
         b.bd()?; // DIMALTRND
         b.b()?; // DIMALT
         b.bs()?; // DIMALTD
-                 // DIMTOFL, DIMSAH, DIMTIX, DIMSOXD
+        // DIMTOFL, DIMSAH, DIMTIX, DIMSOXD
         for _ in 0..4 {
             b.b()?;
         }
@@ -523,11 +528,16 @@ fn dim_style(ctx: &mut Ctx<'_, '_>, o: &mut Object<'_>) -> BitResult<DimStyle> {
         s.dimclre = cmc(o, ctx.version)?.0;
         s.dimclrt = cmc(o, ctx.version)?.0;
         let b = &mut o.data;
-        // DIMADEC, DIMDEC, DIMTDEC, DIMALTU, DIMALTTD, DIMAUNIT, DIMFRAC,
-        // DIMLUNIT, DIMDSEP, DIMTMOVE, DIMJUST
-        for _ in 0..11 {
+        s.dimadec = b.bs()?;
+        s.dimdec = b.bs()?;
+        // DIMTDEC, DIMALTU, DIMALTTD, DIMAUNIT, DIMFRAC, DIMLUNIT
+        for _ in 0..6 {
             b.bs()?;
         }
+        s.dimdsep = b.bs()?;
+        // DIMTMOVE, DIMJUST
+        b.bs()?;
+        b.bs()?;
         // DIMSD1, DIMSD2
         b.b()?;
         b.b()?;

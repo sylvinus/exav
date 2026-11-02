@@ -105,10 +105,10 @@ fn parse_chm(d: &[u8]) -> Option<ChmDir> {
     }
     // Header-section table follows the 0x38-byte ITSF header.
     let off_hs1 = crate::bytes::to_usize(u64at(d, 0x38 + 0x10)?); // ITSP directory
-                                                                  // The directory offset must land inside the file. Bounding it here also keeps
-                                                                  // every `off_hs1 + <small const>` read below from overflowing `usize` on a
-                                                                  // crafted 64-bit offset (a `d.len() <= isize::MAX` invariant makes the adds
-                                                                  // safe once `off_hs1 < d.len()`).
+    // The directory offset must land inside the file. Bounding it here also keeps
+    // every `off_hs1 + <small const>` read below from overflowing `usize` on a
+    // crafted 64-bit offset (a `d.len() <= isize::MAX` invariant makes the adds
+    // safe once `off_hs1 < d.len()`).
     if off_hs1 >= d.len() {
         return None;
     }
@@ -384,31 +384,30 @@ pub(crate) fn extract_chm<R>(
     // Bounded to what the budget still allows so a huge declared length can't OOM.
     let mut decompressed: Vec<u8> = Vec::new();
     let mut frames_ok: Vec<bool> = Vec::new();
-    if let Some(content_e) = content {
-        if let Some(content_bytes) = read_sec0(data, dir.sec0_offset, content_e) {
-            let params = control
-                .and_then(|c| read_sec0(data, dir.sec0_offset, c))
-                .and_then(parse_control);
-            // Reset table gives the frame offsets + true uncompressed length;
-            // fall back to SpanInfo (length only) or the content length itself.
-            let rt = rtable
-                .and_then(|r| read_sec0(data, dir.sec0_offset, r))
-                .and_then(parse_reset_table)
-                .or_else(|| {
-                    spaninfo
-                        .and_then(|s| read_sec0(data, dir.sec0_offset, s))
-                        .and_then(|b| u64at(b, 0))
-                        .map(|uncomp_len| ResetTable {
-                            uncomp_len,
-                            offsets: Vec::new(),
-                        })
-                });
-            if let (Some(params), Some(rt)) = (params, rt) {
-                let cap = budget.reserve().unwrap_or(0) as usize;
-                if cap > 0 {
-                    (decompressed, frames_ok) =
-                        decompress_content(content_bytes, &params, &rt, cap);
-                }
+    if let Some(content_e) = content
+        && let Some(content_bytes) = read_sec0(data, dir.sec0_offset, content_e)
+    {
+        let params = control
+            .and_then(|c| read_sec0(data, dir.sec0_offset, c))
+            .and_then(parse_control);
+        // Reset table gives the frame offsets + true uncompressed length;
+        // fall back to SpanInfo (length only) or the content length itself.
+        let rt = rtable
+            .and_then(|r| read_sec0(data, dir.sec0_offset, r))
+            .and_then(parse_reset_table)
+            .or_else(|| {
+                spaninfo
+                    .and_then(|s| read_sec0(data, dir.sec0_offset, s))
+                    .and_then(|b| u64at(b, 0))
+                    .map(|uncomp_len| ResetTable {
+                        uncomp_len,
+                        offsets: Vec::new(),
+                    })
+            });
+        if let (Some(params), Some(rt)) = (params, rt) {
+            let cap = budget.reserve().unwrap_or(0) as usize;
+            if cap > 0 {
+                (decompressed, frames_ok) = decompress_content(content_bytes, &params, &rt, cap);
             }
         }
     }

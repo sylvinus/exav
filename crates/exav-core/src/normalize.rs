@@ -155,11 +155,10 @@ pub(crate) fn javascript_into<B: Bytes, O: Out>(data: &mut B, out: &mut O) {
         let c = lower(b);
         if pending_ws {
             pending_ws = false;
-            if let Some(last) = out.last() {
-                if is_word(last) && is_word(c) {
+            if let Some(last) = out.last()
+                && is_word(last) && is_word(c) {
                     out.push(b' ');
                 }
-            }
         }
         out.push(c);
     });
@@ -453,11 +452,10 @@ mod tests {
                 let c = lower(b);
                 if pending_ws {
                     pending_ws = false;
-                    if let Some(&last) = out.last() {
-                        if is_word(last) && is_word(c) {
+                    if let Some(&last) = out.last()
+                        && is_word(last) && is_word(c) {
                             out.push(b' ');
                         }
-                    }
                 }
                 out.push(c);
             }

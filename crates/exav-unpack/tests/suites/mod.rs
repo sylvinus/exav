@@ -14,6 +14,8 @@
 mod allowed_formats;
 #[cfg(feature = "alz")]
 mod alz;
+#[cfg(all(feature = "ar", feature = "cpio"))]
+mod ar_cpio_irregular;
 #[cfg(feature = "arc")]
 mod arc;
 #[cfg(feature = "arj")]
@@ -23,10 +25,18 @@ mod broken_media;
 mod bzip2_blocks;
 #[cfg(feature = "cab")]
 mod cab_quantum;
+#[cfg(feature = "cab")]
+mod cab_salvage;
+#[cfg(feature = "cab")]
+mod cab_volumes;
 #[cfg(feature = "chm")]
 mod chm;
 #[cfg(feature = "cpio")]
 mod cpio_never_silent;
+#[cfg(feature = "cramfs")]
+mod cramfs;
+#[cfg(all(feature = "bzip2", feature = "xz"))]
+mod cut_streams;
 #[cfg(all(not(feature = "decrypt"), feature = "zip"))]
 mod decrypt_disabled;
 mod disabled_formats;
@@ -39,15 +49,24 @@ mod dwg;
 #[cfg(feature = "dxf")]
 mod dxf;
 mod egg;
+#[cfg(feature = "email")]
+mod email;
+#[cfg(feature = "email")]
+mod email_readers_agree;
 #[cfg(feature = "decrypt")]
 mod encrypted_zip;
 #[cfg(feature = "tar")]
 mod entry_accounting;
+#[cfg(feature = "erofs")]
+mod erofs;
+#[cfg(feature = "exfat")]
+mod exfat;
 #[cfg(feature = "ext")]
 mod ext;
 mod extreme;
 #[cfg(feature = "fat")]
 mod fat;
+mod fs_tree;
 mod hwp3;
 #[cfg(feature = "ishieldz")]
 mod ishield_z;
@@ -59,8 +78,11 @@ mod iso_never_silent;
 mod lha_header_bounds;
 #[cfg(feature = "lz4")]
 mod lz4;
+#[cfg(feature = "dmg")]
+mod lzfse;
 #[cfg(feature = "lzw")]
 mod lzw;
+mod nesting;
 #[cfg(feature = "nsis")]
 mod nsis;
 #[cfg(feature = "ntfs")]
@@ -78,6 +100,8 @@ mod partition_never_silent;
 mod pdf_empty_password;
 #[cfg(feature = "pdf")]
 mod pdf_parse;
+#[cfg(feature = "pdf")]
+mod pdf_readers_agree;
 #[cfg(feature = "pepack")]
 mod pe_emulation;
 #[cfg(feature = "pepack")]
@@ -95,13 +119,23 @@ mod rar4_compat;
 mod rar5_encryption;
 #[cfg(feature = "rar")]
 mod rar_solid;
+#[cfg(feature = "romfs")]
+mod romfs;
+#[cfg(feature = "rpm")]
+mod rpm;
 #[cfg(feature = "sevenz")]
 mod sevenz_bcj2;
 #[cfg(feature = "sevenz")]
+mod sevenz_entries;
+#[cfg(feature = "sevenz")]
 mod sevenz_ppmd;
 mod silent_skips;
+#[cfg(feature = "squashfs")]
+mod squashfs;
 #[cfg(feature = "all-formats")]
 mod stream_read_errors;
+#[cfg(feature = "text")]
+mod text;
 #[cfg(feature = "iso")]
 mod udf;
 #[cfg(feature = "upx")]
@@ -110,8 +144,19 @@ mod upx_rebuild;
 mod vba_module_source;
 #[cfg(feature = "vhd")]
 mod vhd;
+#[cfg(all(
+    feature = "diskimage",
+    feature = "vhd",
+    feature = "partition",
+    feature = "ntfs",
+    feature = "fat",
+    feature = "ext"
+))]
+mod virtual_disks;
 #[cfg(feature = "wim")]
 mod wim;
+#[cfg(feature = "xz")]
+mod xz_checks;
 #[cfg(feature = "xz")]
 mod xz_dict;
 #[cfg(feature = "zip")]
@@ -123,11 +168,13 @@ mod zip_deflate64;
 #[cfg(feature = "zip")]
 mod zip_disguised_members;
 #[cfg(feature = "zip")]
+mod zip_local_vs_directory;
+#[cfg(feature = "zip")]
 mod zip_overlap;
 #[cfg(feature = "zoo")]
 mod zoo;
 
-use exav_unpack::{walk, Budget, Entry, Format, LimitHit, Member};
+use exav_unpack::{Budget, Entry, Format, LimitHit, Member, walk};
 
 /// A real-malware sample under `tests/fixtures/`, kept locally only (see
 /// `read_fixture`), or `None` when it is absent or this build cannot open its

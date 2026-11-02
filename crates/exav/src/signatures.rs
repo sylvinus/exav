@@ -480,13 +480,13 @@ fn start_prebuilt_db(
         .database
         .clone()
         .unwrap_or_else(|| cli.sigs.join(PULLED_DB_NAME));
-    if let Some(parent) = dest.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "exav: warning: cannot create database dir {}: {e}",
-                parent.display()
-            );
-        }
+    if let Some(parent) = dest.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "exav: warning: cannot create database dir {}: {e}",
+            parent.display()
+        );
     }
 
     let shown = redact_url(url);
@@ -519,17 +519,19 @@ fn start_prebuilt_db(
     };
     let url = url.to_string();
     let watched = dest.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(poll);
-        match exav_update::fetch_db_if_changed(&url, &watched, validator.as_deref()) {
-            Ok(f) => {
-                validator = f.validator().map(String::from);
-                if f.is_updated() {
-                    eprintln!("exav: database updated from {shown}, reloading");
-                    reload.request();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(poll);
+            match exav_update::fetch_db_if_changed(&url, &watched, validator.as_deref()) {
+                Ok(f) => {
+                    validator = f.validator().map(String::from);
+                    if f.is_updated() {
+                        eprintln!("exav: database updated from {shown}, reloading");
+                        reload.request();
+                    }
                 }
+                Err(e) => eprintln!("exav: database poll failed: {e}"),
             }
-            Err(e) => eprintln!("exav: database poll failed: {e}"),
         }
     });
 
@@ -564,10 +566,12 @@ impl AutoUpdate {
             let (Some(dir), Some(interval)) = (dir, interval) else {
                 return;
             };
-            std::thread::spawn(move || loop {
-                std::thread::sleep(interval);
-                if update_signatures(&sources, &dir, &mut validators) {
-                    reload.request();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    if update_signatures(&sources, &dir, &mut validators) {
+                        reload.request();
+                    }
                 }
             });
         }

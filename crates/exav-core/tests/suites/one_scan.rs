@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use exav_core::{scan_path, scan_seekable, ScanOptions, Scanner, Verdict};
+use exav_core::{ScanOptions, Scanner, Verdict, scan_path, scan_seekable};
 
 fn eicar() -> &'static [u8] {
     exav_core::unpack::eicar()

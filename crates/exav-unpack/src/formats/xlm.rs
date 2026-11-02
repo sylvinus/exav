@@ -1,33 +1,29 @@
 //! Excel 4.0 (XLM) macro surfacing from an OLE2 `Workbook`/`Book` BIFF stream.
 //!
-//! XLM macros predate VBA: the macro lives in cells of a dedicated *macro sheet*
-//! rather than a VBA project, so they slip past VBA-only macro detection. A
-//! `BOUNDSHEET` record (`0x0085`) with sheet-type `1` marks an Excel 4.0 macro
-//! sheet; the macro formulas live in `FORMULA` records whose string constants
-//! (URLs, `EXEC`/`CALL` arguments, alert text) are stored as `ptgStr` tokens.
+//! XLM macros predate VBA: the macro lives in cells of a dedicated *macro
+//! sheet* rather than a VBA project, so they slip past VBA-only macro
+//! detection. A `BOUNDSHEET` record with sheet type `1` marks an Excel 4.0
+//! macro sheet; the macro formulas live in `FORMULA` and `ARRAY` records as
+//! `ptg` tokens, where the built-in functions (`EXEC`, `CALL`, `ALERT`, ...)
+//! are numbers, invisible to a scan of the file's bytes.
 //!
-//! We walk the BIFF record stream, detect any macro sheet, and — when present —
-//! surface a synthetic `xlm_macro` artifact carrying the macro-sheet names, the
-//! recovered string constants, and each macro formula's tokens decoded from the
-//! `ptg` stream, including the **built-in function names** (`EXEC`/`CALL`/
-//! `ALERT`/…) which are stored as numeric ids and so are *invisible to a raw
-//! byte scan*. So the engine's `Target:2`/`Doc.*` signatures match the real
-//! function calls and `--alert-macros` fires for XLM the same way it does for
-//! VBA. Every read is bounds-checked; a malformed stream yields `None`, never a
-//! panic.
-//!
-//! The formula tokens are emitted in postfix (RPN) order — full infix
-//! reconstruction with operator precedence and cell-reference formatting is a
-//! follow-up, but every IOC-bearing token (function name, string, number) is
-//! recovered, and the raw `Workbook` stream is scanned regardless.
+//! We read the stream with the BIFF reader exav-render converts workbooks
+//! with, and when a macro sheet is present surface a synthetic `xlm_macro`
+//! artifact: the macro-sheet names, the defined names with what they refer to,
+//! the text cells, and each formula as Excel shows it (`=EXEC("calc.exe")`),
+//! so the engine's `Target:2` and `Doc.*` signatures match the function calls
+//! and `--alert-macros` fires for XLM as it does for VBA. A formula the reader
+//! refuses still gives the calls and constants it read before the token it
+//! could not. Every read is bounds-checked; a malformed stream yields `None`,
+//! never a panic.
 
-/// BIFF record types we care about.
-const R_BOF: u16 = 0x0809;
-const R_BOUNDSHEET: u16 = 0x0085;
+use super::biff::{self, Book, formula};
+use crate::bytes::{Cur, u16_at};
+
 const R_FORMULA: u16 = 0x0006;
 const R_LABEL: u16 = 0x0204;
-const R_NAME: u16 = 0x0018;
 const R_ARRAY: u16 = 0x0221;
+const R_EOF: u16 = 0x000A;
 
 /// Sheet-type (`dt`) byte in a `BOUNDSHEET` record marking an Excel 4.0 macro sheet.
 const DT_EXCEL4_MACRO: u8 = 1;
@@ -35,270 +31,90 @@ const DT_EXCEL4_MACRO: u8 = 1;
 /// Total surfaced-string budget (defensive; the artifact only needs the IOCs).
 const MAX_XLM_ARTIFACT: usize = 512 * 1024;
 
-#[inline]
-fn u16le(d: &[u8], p: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([*d.get(p)?, *d.get(p + 1)?]))
-}
-
-/// Read a `ShortXLUnicodeString` (`cch:u8`, `grbit:u8`, chars) → `String`.
-/// `grbit` bit 0 (`fHighByte`) selects 16-bit UTF-16 vs 8-bit compressed chars.
-fn read_short_string(d: &[u8]) -> Option<String> {
-    let cch = *d.first()? as usize;
-    let grbit = *d.get(1)?;
-    let chars = d.get(2..)?;
-    if grbit & 1 == 0 {
-        // 8-bit compressed: each byte is the low half of a UTF-16 unit.
-        let n = cch.min(chars.len());
-        Some(chars[..n].iter().map(|&b| b as char).collect())
-    } else {
-        let n = cch.min(chars.len() / 2);
-        let units: Vec<u16> = (0..n)
-            .map(|i| u16::from_le_bytes([chars[i * 2], chars[i * 2 + 1]]))
-            .collect();
-        Some(String::from_utf16_lossy(&units))
-    }
-}
-
 /// True if `s` is worth surfacing: non-trivial length and mostly printable.
 fn is_useful(s: &str) -> bool {
     let t = s.trim();
     t.len() >= 3 && t.chars().filter(|c| !c.is_control()).count() * 4 >= t.chars().count() * 3
 }
 
-/// Look up a BIFF/XLM built-in function name by its `ptgFunc`/`ptgFuncVar` id.
-fn func_name(id: u16) -> Option<&'static str> {
-    let t = &super::xlm_functions::XLM_FUNCTIONS;
-    t.binary_search_by_key(&id, |&(k, _)| k)
-        .ok()
-        .map(|i| t[i].1)
-        .or_else(|| {
-            // Command-equivalent (macro) functions carry the 0x8000 bit; try both.
-            t.binary_search_by_key(&(id ^ 0x8000), |&(k, _)| k)
-                .ok()
-                .map(|i| t[i].1)
-        })
-}
-
-/// Read a `ptgStr` string (`cch:u8`, `grbit:u8`, chars) at `rgce[i+1..]`,
-/// returning `(text, bytes_consumed_after_the_token_byte)`.
-fn read_ptgstr(rgce: &[u8], i: usize) -> Option<(String, usize)> {
-    let cch = *rgce.get(i)? as usize;
-    let high = rgce.get(i + 1)? & 1 == 1;
-    let nbytes = if high { cch * 2 } else { cch };
-    let chars = crate::bytes::at(rgce, i + 2, nbytes)?;
-    let s = if high {
-        let units: Vec<u16> = chars
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .copied()
-            .map(u16::from_le_bytes)
-            .collect();
-        String::from_utf16_lossy(&units)
-    } else {
-        chars.iter().map(|&b| b as char).collect()
-    };
-    Some((s, 2 + nbytes))
-}
-
-/// Walk a `FORMULA`/`ARRAY` `rgce` token array, emitting the IOC-bearing tokens
-/// — built-in **function names** (`EXEC`/`CALL`/`ALERT`/…, invisible to a raw
-/// byte scan because they're stored as numeric ids), **string constants**, and
-/// numeric literals — as a single reconstructed formula line. Fully
-/// bounds-checked; an unknown/complex token (`ptgArray`, `ptgMemArea`, …) ends
-/// the walk cleanly (partial line kept). `ptg` class bits (value/ref/array,
-/// `0x20`/`0x40`/`0x60`) are normalised to the base type.
-fn parse_formula(rgce: &[u8], out: &mut Vec<String>) {
-    let mut items: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    let mut guard = 0usize;
-    while i < rgce.len() {
-        guard += 1;
-        if guard > 100_000 || items.len() > 4096 {
-            break;
-        }
-        let tok = rgce[i];
-        let base = if tok >= 0x20 {
-            0x20 | (tok & 0x1f)
-        } else {
-            tok
-        };
-        i += 1;
-        // Operand byte-lengths for the tokens we walk through; `None` = special.
-        let fixed: Option<usize> = match base {
-            0x01 | 0x02 => Some(4),        // ptgExp / ptgTbl
-            0x03..=0x16 => Some(0),        // binary/unary operators, paren, missarg
-            0x1c | 0x1d => Some(1),        // ptgErr / ptgBool
-            0x1e => Some(2),               // ptgInt
-            0x1f => Some(8),               // ptgNum
-            0x23 => Some(4),               // ptgName (BIFF8)
-            0x24 | 0x2a | 0x2c => Some(4), // ptgRef / ptgRefErr / ptgRefN
-            0x25 | 0x2b | 0x2d => Some(8), // ptgArea / ptgAreaErr / ptgAreaN
-            0x39 | 0x3a | 0x3c => Some(6), // ptgNameX / ptgRef3d / ptgRefErr3d
-            0x3b | 0x3d => Some(10),       // ptgArea3d / ptgAreaErr3d
-            _ => None,
-        };
-        if let Some(n) = fixed {
-            if base == 0x1e {
-                if let Some(b) = crate::bytes::at(rgce, i, 2) {
-                    items.push(u16::from_le_bytes([b[0], b[1]]).to_string());
-                }
-            }
-            i += n;
-            continue;
-        }
-        match base {
-            0x17 => match read_ptgstr(rgce, i) {
-                Some((s, consumed)) => {
-                    items.push(format!("\"{}\"", s.replace('"', "\"\"")));
-                    i += consumed;
-                }
-                None => break,
-            },
-            0x19 => {
-                // ptgAttr: grbit + 2 bytes; a `bAttrChoose` jump table is complex.
-                match rgce.get(i) {
-                    Some(&g) if g & 0x04 == 0 => i += 3,
-                    _ => break,
-                }
-            }
-            0x21 => {
-                // ptgFunc: 2-byte function id.
-                match crate::bytes::at(rgce, i, 2) {
-                    Some(b) => {
-                        let id = u16::from_le_bytes([b[0], b[1]]);
-                        items.push(func_name(id).unwrap_or("FUNC").to_string());
-                        i += 2;
-                    }
-                    None => break,
-                }
-            }
-            0x22 => {
-                // ptgFuncVar: 1-byte arg count + 2-byte function id.
-                match rgce.get(i + 1..i + 3) {
-                    Some(b) => {
-                        let id = u16::from_le_bytes([b[0], b[1]]);
-                        items.push(func_name(id).unwrap_or("FUNC").to_string());
-                        i += 3;
-                    }
-                    None => break,
-                }
-            }
-            _ => break, // unknown / complex token — stop cleanly
-        }
-    }
-    if !items.is_empty() {
-        let line = items.join(" ");
-        if is_useful(&line) {
-            out.push(line);
-        }
-    }
-}
-
-/// Compute the `rgce` token slice of a `FORMULA` (0x0006) record body: a 20-byte
-/// header, then `cce:u16`, then the tokens.
-fn formula_rgce(body: &[u8]) -> Option<&[u8]> {
-    let cce = u16le(body, 20)? as usize;
-    crate::bytes::at(body, 22, cce)
-}
-
 /// Parse the OLE2 streams; if a `Workbook`/`Book` stream contains at least one
-/// Excel 4.0 macro sheet, return a surfaced `xlm_macro` artifact (macro-sheet
-/// names + recovered string constants). Returns `None` when no XLM macro sheet
-/// is present or the stream can't be parsed.
+/// Excel 4.0 macro sheet, return a surfaced `xlm_macro` artifact. Returns
+/// `None` when no XLM macro sheet is present or the stream can't be parsed.
 pub(crate) fn xlm_macro_artifact(streams: &[(String, &[u8])]) -> Option<Vec<u8>> {
     // OLE stream names carry a path prefix (e.g. `/Workbook`); match the basename.
     let (_, data) = streams.iter().find(|(n, _)| {
         let base = n.rsplit(['/', '\\']).next().unwrap_or(n);
         base.eq_ignore_ascii_case("Workbook") || base.eq_ignore_ascii_case("Book")
     })?;
-    if u16le(data, 0)? != R_BOF {
+    let mut recs = biff::records(data);
+    let first = recs.next()?;
+    // BIFF8 and BIFF5; the older kinds are not in compound files.
+    if first.id != 0x0809 {
+        return None;
+    }
+    let mut book = Book::new(biff::bof_version(&first));
+    for r in recs.by_ref().take_while(|r| r.id != R_EOF) {
+        book.record(&r);
+    }
+    book.finish();
+    if !book.sheets.iter().any(|s| s.kind == DT_EXCEL4_MACRO) {
         return None;
     }
 
-    let mut macro_sheets: Vec<String> = Vec::new();
-    let mut strings: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     let mut total = 0usize;
-    let mut pos = 0usize;
-    // Bound the number of records walked (defensive against a crafted stream).
-    let mut guard = 0usize;
-
-    while pos + 4 <= data.len() {
-        guard += 1;
-        if guard > 1_000_000 || total > MAX_XLM_ARTIFACT {
+    let ctx = book.ctx(&book.ext5);
+    for n in &book.names {
+        let text = match formula::decode_partial(&ctx, &n.rgce, &n.extra, 0, 0) {
+            p if p.text.is_empty() => n.name.clone(),
+            p => format!("{}={}", n.name, p.text),
+        };
+        if is_useful(&text) {
+            total += text.len();
+            lines.push(text);
+        }
+    }
+    for r in biff::records(data) {
+        if total > MAX_XLM_ARTIFACT {
             break;
         }
-        let typ = u16le(data, pos)?;
-        let len = u16le(data, pos + 2)? as usize;
-        pos += 4;
-        let end = (pos + len).min(data.len());
-        let body = &data[pos..end];
-        pos = end;
-
-        match typ {
-            R_BOUNDSHEET => {
-                // [lbPlyPos:u32][hsState:u8][dt:u8][name: ShortXLUnicodeString]
-                if body.get(5).copied() == Some(DT_EXCEL4_MACRO) {
-                    let name = body
-                        .get(6..)
-                        .and_then(read_short_string)
-                        .unwrap_or_default();
-                    total += name.len();
-                    macro_sheets.push(name);
-                }
-            }
-            R_LABEL => {
-                // [rw:u16][col:u16][ixfe:u16][XLUnicodeString: cch:u16 ...]
-                if let Some(s) = body.get(6..).and_then(|b| {
-                    let cch = u16le(b, 0)? as usize;
-                    read_short_string_wide(b.get(2..)?, cch)
-                }) {
-                    if is_useful(&s) {
-                        total += s.len();
-                        strings.push(s);
-                    }
-                }
-            }
-            R_NAME => {
-                // Defined names (e.g. built-in `Auto_Open`). Name text is a
-                // ShortXLUnicodeString at a fixed offset in the record.
-                if let Some(s) = body.get(15..).and_then(read_short_string) {
-                    if is_useful(&s) {
-                        total += s.len();
-                        strings.push(s);
-                    }
-                }
-            }
+        let body: &[u8] = &r.data;
+        let text = match r.id {
             R_FORMULA => {
-                if let Some(rgce) = formula_rgce(body) {
-                    parse_formula(rgce, &mut strings);
-                }
+                // 20 bytes of cell, value and flags, then cce:u16 and the tokens.
+                let cce = u16_at(body, 20) as usize;
+                crate::bytes::at(body, 22, cce)
+                    .map(|rgce| macro_formula(&ctx, rgce, u16_at(body, 0), u16_at(body, 2)))
             }
             R_ARRAY => {
-                // ARRAY body: 12-byte header, then cce:u16, then rgce.
-                if let Some(cce) = u16le(body, 12) {
-                    if let Some(rgce) = crate::bytes::at(body, 14, cce as usize) {
-                        parse_formula(rgce, &mut strings);
-                    }
-                }
+                // 12 bytes of range and flags, then cce:u16 and the tokens.
+                let cce = u16_at(body, 12) as usize;
+                crate::bytes::at(body, 14, cce)
+                    .map(|rgce| macro_formula(&ctx, rgce, u16_at(body, 0), u16::from(body[4])))
             }
-            _ => {}
+            R_LABEL => {
+                // [rw:u16][col:u16][ixfe:u16][string: cch:u16 ...]
+                let mut c = Cur::at(body, 6);
+                let s = book.string(&mut c, 2);
+                (!c.short && is_useful(&s)).then_some(s)
+            }
+            _ => None,
+        };
+        if let Some(t) = text.filter(|t| !t.is_empty()) {
+            total += t.len();
+            lines.push(t);
         }
-    }
-
-    if macro_sheets.is_empty() {
-        return None;
     }
 
     let mut out = String::from("Excel 4.0 macro (XLM)\n");
-    for m in &macro_sheets {
+    for s in book.sheets.iter().filter(|s| s.kind == DT_EXCEL4_MACRO) {
         out.push_str("macro-sheet: ");
-        out.push_str(m);
+        out.push_str(&s.name);
         out.push('\n');
     }
-    // Dedup adjacent duplicates (SST/shared strings can repeat) cheaply.
-    strings.dedup();
-    for s in &strings {
+    // Adjacent duplicates (a fill-down repeats a formula) say nothing new.
+    lines.dedup();
+    for s in &lines {
         if out.len() + s.len() + 1 > MAX_XLM_ARTIFACT {
             break;
         }
@@ -308,30 +124,24 @@ pub(crate) fn xlm_macro_artifact(streams: &[(String, &[u8])]) -> Option<Vec<u8>>
     Some(out.into_bytes())
 }
 
-/// Read a wide (`cch:u16`-counted) `XLUnicodeString` body: `grbit:u8`, chars.
-fn read_short_string_wide(d: &[u8], cch: usize) -> Option<String> {
-    let grbit = *d.first()?;
-    let chars = d.get(1..)?;
-    if grbit & 1 == 0 {
-        let n = cch.min(chars.len());
-        Some(chars[..n].iter().map(|&b| b as char).collect())
+/// A macro formula as a line: `=` and the formula, as the cell shows it.
+fn macro_formula(ctx: &formula::Ctx, rgce: &[u8], row: u16, col: u16) -> String {
+    let p = formula::decode_partial(ctx, rgce, &[], u32::from(row), u32::from(col));
+    if p.text.is_empty() {
+        String::new()
     } else {
-        let n = cch.min(chars.len() / 2);
-        let units: Vec<u16> = (0..n)
-            .map(|i| u16::from_le_bytes([chars[i * 2], chars[i * 2 + 1]]))
-            .collect();
-        Some(String::from_utf16_lossy(&units))
+        format!("={}", p.text)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{extract, Budget, Format, Limits};
+    use crate::{Budget, Format, Limits, extract};
 
     /// End-to-end against a real Excel 4.0 macro `.xls` (from the `oletools` test
     /// corpus, cross-checked with `olevba`): the OLE path must surface an
-    /// `xlm_macro` member that flags the macro sheet and recovers the macro's
-    /// string constant (`olevba`: `ALERT("This is a sample Excel 4 macro")`).
+    /// `xlm_macro` member that flags the macro sheet and writes the macro as
+    /// `olevba` does: `ALERT("This is a sample Excel 4 macro")`.
     #[test]
     fn real_excel4_macro_is_surfaced() {
         let data = include_bytes!("../../tests/fixtures/xlm_excel4_sample.xls");
@@ -343,15 +153,13 @@ mod tests {
             .expect("an xlm_macro artifact must be surfaced");
         let text = String::from_utf8_lossy(&xlm.data);
         assert!(text.contains("Excel 4.0 macro (XLM)"), "text: {text}");
-        // The plain string constant carrying the payload.
+        // Function names are numbers in the file; the formulas read as in Excel.
         assert!(
-            text.contains("This is a sample Excel 4 macro"),
+            text.lines()
+                .any(|l| l == "=ALERT(\"This is a sample Excel 4 macro\")"),
             "recovered XLM text was: {text}"
         );
-        // The Ptg-decoded function names (invisible to a raw byte scan — stored
-        // as numeric ids). olevba: ALERT("This is a sample Excel 4 macro"), HALT().
-        assert!(text.contains("ALERT"), "expected ALERT in: {text}");
-        assert!(text.contains("HALT"), "expected HALT in: {text}");
+        assert!(text.lines().any(|l| l == "=HALT()"), "text: {text}");
     }
 
     /// A benign OLE document with no macro sheet must NOT surface an xlm_macro.
@@ -362,5 +170,34 @@ mod tests {
         let biff = [0x09u8, 0x08, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]; // BOF only
         let streams: Vec<(String, &[u8])> = vec![("Workbook".to_string(), &biff[..])];
         assert!(super::xlm_macro_artifact(&streams).is_none());
+    }
+
+    /// A formula with a token the reader refuses keeps the calls and strings
+    /// before it, so a writer cannot hide a function behind an odd token.
+    #[test]
+    fn a_formula_the_reader_refuses_still_gives_what_came_before() {
+        let mut stream = Vec::new();
+        let mut rec = |id: u16, body: &[u8]| {
+            stream.extend(id.to_le_bytes());
+            stream.extend((body.len() as u16).to_le_bytes());
+            stream.extend_from_slice(body);
+        };
+        rec(0x0809, &[0, 6, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut sheet = vec![0u8; 4];
+        sheet.extend([0, 1, 6, 0]);
+        sheet.extend(b"Macro1");
+        rec(0x0085, &sheet);
+        rec(0x000A, &[]);
+        // =EXEC("calc") followed by a token that is not one (0x7F).
+        let mut rgce = vec![0x17, 4, 0, b'c', b'a', b'l', b'c'];
+        rgce.extend([0x42, 1, 110, 0, 0x7F]);
+        let mut f = vec![0u8; 20];
+        f.extend((rgce.len() as u16).to_le_bytes());
+        f.extend(rgce);
+        rec(0x0006, &f);
+        let streams: Vec<(String, &[u8])> = vec![("Workbook".to_string(), &stream[..])];
+        let out = super::xlm_macro_artifact(&streams).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.lines().any(|l| l == "=EXEC(\"calc\")"), "text: {text}");
     }
 }

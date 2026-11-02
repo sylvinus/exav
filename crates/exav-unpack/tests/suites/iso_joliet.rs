@@ -4,7 +4,7 @@
 //! that file extracted and scanned. Walking only the primary volume descriptor's
 //! directory tree would silently miss such files.
 
-use exav_unpack::{extract, Budget, Format, Limits};
+use exav_unpack::{Budget, Format, Limits, extract};
 
 const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR";
 const SECTOR: usize = 2048;
@@ -123,5 +123,78 @@ fn file_in_both_trees_is_emitted_once() {
     assert_eq!(
         hits, 1,
         "a file in both trees must be extracted exactly once"
+    );
+}
+
+/// A file is its start and its length. A record of no length at the start of
+/// another file's extent, in either tree, must not stand in for that file: an
+/// extractor that deduplicated on the start alone reported the empty one and
+/// skipped the real one, and the ISO mounted, with the file in it, anywhere.
+#[test]
+fn an_empty_record_in_one_tree_does_not_hide_the_file_of_the_other() {
+    // The Joliet tree lists an empty file at the extent, the primary tree the
+    // real one. The Joliet tree is walked first.
+    let mut iso = joliet_only_iso(&utf16be("empty.txt"), b"");
+    let mut jol = dir_record(20, SECTOR as u32, true, &[0]);
+    jol.extend(dir_record(20, SECTOR as u32, true, &[1]));
+    jol.extend(dir_record(21, 0, false, &utf16be("empty.txt")));
+    let a = 20 * SECTOR;
+    iso[a..a + SECTOR].fill(0);
+    iso[a..a + jol.len()].copy_from_slice(&jol);
+    let mut prim = dir_record(19, SECTOR as u32, true, &[0]);
+    prim.extend(dir_record(19, SECTOR as u32, true, &[1]));
+    prim.extend(dir_record(21, EICAR.len() as u32, false, b"PAYLOAD.BIN;1"));
+    let a = 19 * SECTOR;
+    iso[a..a + prim.len()].copy_from_slice(&prim);
+    iso[21 * SECTOR..21 * SECTOR + EICAR.len()].copy_from_slice(EICAR);
+
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Iso, &iso, &mut budget).expect("iso extract");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.data.windows(EICAR.len()).any(|w| w == EICAR)),
+        "{entries:?}"
+    );
+}
+
+/// In both trees, the file takes the long name the Joliet tree gives it.
+#[test]
+fn a_file_in_both_trees_is_named_by_the_joliet_tree() {
+    let mut iso = joliet_only_iso(&utf16be("a-long-name.bin"), EICAR);
+    let mut prim = dir_record(19, SECTOR as u32, true, &[0]);
+    prim.extend(dir_record(19, SECTOR as u32, true, &[1]));
+    prim.extend(dir_record(21, EICAR.len() as u32, false, b"A_LONG_N.BIN;1"));
+    let a = 19 * SECTOR;
+    iso[a..a + prim.len()].copy_from_slice(&prim);
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Iso, &iso, &mut budget).expect("iso extract");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["a-long-name.bin"]);
+}
+
+/// The same inside one tree: the empty record is listed first.
+#[test]
+fn an_empty_record_before_the_file_in_the_same_directory_does_not_hide_it() {
+    let mut iso = joliet_only_iso(&utf16be("payload.bin"), EICAR);
+    let mut jol = dir_record(20, SECTOR as u32, true, &[0]);
+    jol.extend(dir_record(20, SECTOR as u32, true, &[1]));
+    jol.extend(dir_record(21, 0, false, &utf16be("empty.txt")));
+    jol.extend(dir_record(
+        21,
+        EICAR.len() as u32,
+        false,
+        &utf16be("payload.bin"),
+    ));
+    let a = 20 * SECTOR;
+    iso[a..a + jol.len()].copy_from_slice(&jol);
+
+    let mut budget = Budget::new(Limits::default());
+    let entries = extract(Format::Iso, &iso, &mut budget).expect("iso extract");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.name == "payload.bin" && e.data.windows(EICAR.len()).any(|w| w == EICAR)),
+        "{entries:?}"
     );
 }

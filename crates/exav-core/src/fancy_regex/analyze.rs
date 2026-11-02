@@ -579,7 +579,7 @@ impl<'a> Analyzer<'a> {
             Expr::Absent(ref absent) => {
                 use crate::fancy_regex::Absent::*;
                 match absent {
-                    Repeater(ref child) => {
+                    Repeater(child) => {
                         let child_info =
                             self.visit(child, min_pos_in_group, inside_zero_rep, enclosing_group)?;
                         min_size = 0;
@@ -589,8 +589,8 @@ impl<'a> Analyzer<'a> {
                         children.push(child_info);
                     }
                     Expression {
-                        ref absent,
-                        ref exp,
+                        absent,
+                        exp,
                     } => {
                         let absent_info =
                             self.visit(absent, min_pos_in_group, inside_zero_rep, enclosing_group)?;
@@ -603,7 +603,7 @@ impl<'a> Analyzer<'a> {
                         children.push(absent_info);
                         children.push(exp_info);
                     }
-                    Stopper(ref child) => {
+                    Stopper(child) => {
                         let child_info =
                             self.visit(child, min_pos_in_group, inside_zero_rep, enclosing_group)?;
                         // Absent stopper doesn't consume any characters itself

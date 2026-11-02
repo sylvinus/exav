@@ -14,6 +14,8 @@ const START_TID: u32 = 69;
 /// Predefined pointer types occupying ids 65..69.
 const NUM_STATIC: usize = (START_TID - 65) as usize;
 const MAX_TYPES: usize = 1 << 20;
+/// Most components one global may declare. The memory a run takes for what it
+/// reads of them is counted against the run's memory limit as it is read.
 const MAX_GLOBAL_COMPONENTS: usize = 1 << 24;
 
 #[derive(Debug, Clone)]
@@ -261,7 +263,53 @@ fn read_type_id(r: &mut Reader) -> Result<u32, ParseError> {
 /// Constant globals: a flat list, per global a list of 64-bit components.
 #[derive(Debug, Clone, Default)]
 pub struct Globals {
-    pub values: Vec<Vec<u64>>,
+    pub values: Vec<Global>,
+}
+
+/// One global's components. A zero initializer is two bytes of text whatever
+/// the size of the global, so a global of zeros is kept as its length and
+/// holds nothing until it is read.
+#[derive(Debug, Clone, Default)]
+pub struct Global {
+    len: usize,
+    /// The components, or nothing for a global of zeros.
+    init: Vec<u64>,
+}
+
+impl Global {
+    /// A global of `len` zeros.
+    pub fn zeros(len: usize) -> Global {
+        Global { len, init: vec![] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, i: usize) -> Option<u64> {
+        (i < self.len).then(|| self.init.get(i).copied().unwrap_or(0))
+    }
+
+    /// The first byte of each component.
+    pub fn bytes(&self) -> Vec<u8> {
+        if self.init.is_empty() {
+            return vec![0u8; self.len];
+        }
+        self.init.iter().map(|&c| c as u8).collect()
+    }
+}
+
+impl From<Vec<u64>> for Global {
+    fn from(init: Vec<u64>) -> Global {
+        Global {
+            len: init.len(),
+            init,
+        }
+    }
 }
 
 impl Globals {
@@ -275,7 +323,7 @@ impl Globals {
         if num > MAX_TYPES {
             return Err(perr("too many globals"));
         }
-        let mut values = Vec::with_capacity(num);
+        let mut values = Vec::with_capacity(num.min(rec.len()));
         for _ in 0..num {
             let tid = read_type_id(&mut r)?;
             let comp = types.components(tid)?;
@@ -290,15 +338,16 @@ impl Globals {
 
 /// Read `comp` constant components, or a zero-initializer (`@\``), terminated
 /// by a `` ` `` byte.
-fn read_constant(r: &mut Reader, comp: usize) -> Result<Vec<u64>, ParseError> {
+fn read_constant(r: &mut Reader, comp: usize) -> Result<Global, ParseError> {
     let m = |_| perr("truncated constant");
     // Zero initializer: bytes 0x40 ('@') 0x60 ('`').
     if r.peek() == Some(0x40) && r.peek_at(1) == Some(0x60) {
         r.byte().map_err(m)?;
         r.byte().map_err(m)?;
-        return Ok(vec![0u64; comp]);
+        return Ok(Global::zeros(comp));
     }
-    let mut out = Vec::with_capacity(comp);
+    // The text bounds what is read, not the declared count.
+    let mut out = Vec::with_capacity(comp.min(1 << 16));
     while r.peek() != Some(0x60) {
         if out.len() >= comp {
             return Err(perr("constant has too many components"));
@@ -320,7 +369,7 @@ fn read_constant(r: &mut Reader, comp: usize) -> Result<Vec<u64>, ParseError> {
     if out.len() != comp {
         return Err(perr("constant has too few components"));
     }
-    Ok(out)
+    Ok(out.into())
 }
 
 fn read_nibble(r: &mut Reader) -> Result<u8, ParseError> {
@@ -330,3 +379,4 @@ fn read_nibble(r: &mut Reader) -> Result<u8, ParseError> {
     }
     Ok(b & 0x0f)
 }
+

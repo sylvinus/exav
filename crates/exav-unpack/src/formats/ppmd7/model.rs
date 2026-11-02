@@ -162,10 +162,12 @@ impl<RC: RangeDec> Ppmd7<RC> {
             return None;
         }
         // Bounds-checked byte arena. Zero-initialised, matching `alloc_zeroed`.
-        // `try_reserve` keeps allocation failure non-panicking.
-        let mut arena: Vec<u8> = Vec::new();
-        arena.try_reserve_exact(total_size).ok()?;
-        arena.resize(total_size, 0u8);
+        // The size is a header's to choose, up to the model's largest, so the
+        // arena must not be touched to be made: `vec![0; n]` takes zeroed pages
+        // from the system and a stream pays for the ones its model reaches.
+        // The `try_reserve` first keeps failure to allocate non-panicking.
+        Vec::<u8>::new().try_reserve_exact(total_size).ok()?;
+        let arena: Vec<u8> = vec![0u8; total_size];
 
         let mut ppmd = Self {
             min_context: 0,
@@ -1504,11 +1506,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
     /// an arena-bounds violation was observed while updating the model.
     #[inline(always)]
     fn finish_symbol(&self, sym: i32) -> i32 {
-        if self.corrupt {
-            SYM_ERROR
-        } else {
-            sym
-        }
+        if self.corrupt { SYM_ERROR } else { sym }
     }
 }
 
@@ -1516,7 +1514,7 @@ impl<RC: RangeDec> Ppmd7<RC> {
 mod tests {
     use super::*;
     use crate::formats::ppmd7::SevenZRangeDecoder;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     type Model = Ppmd7<SevenZRangeDecoder>;
 

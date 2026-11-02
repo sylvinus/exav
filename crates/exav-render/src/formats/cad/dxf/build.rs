@@ -223,7 +223,7 @@ pub(crate) fn build(mut raw: Raw, ctx: Ctx<'_>) -> Drawing {
         }
     }
 
-    // The ENTITIES section into the block each entity names as its owner,
+    // The ENTITIES section into the layout each entity names as its owner,
     // or model or paper space by its paper-space flag.
     let mut by_record: HashMap<Handle, usize> = HashMap::new();
     for (i, b) in blocks.iter().enumerate() {
@@ -234,9 +234,17 @@ pub(crate) fn build(mut raw: Raw, ctx: Ctx<'_>) -> Drawing {
         .iter()
         .position(|b| b.name.eq_ignore_ascii_case(PAPER_SPACE));
     for mut e in std::mem::take(&mut raw.entities) {
+        // The owner chooses among the layouts; the section holds no entity of
+        // an ordinary block (a writer that gives the model space's entities
+        // the owner of its first BLOCK is read as the section says).
         let at = by_record
             .get(&e.owner)
             .copied()
+            .filter(|&i| {
+                blocks
+                    .get(i)
+                    .is_some_and(|b| b.is_model_space() || b.is_paper_space())
+            })
             .or(if e.paper_space { paper } else { model });
         let Some(block) = at.and_then(|i| blocks.get_mut(i)) else {
             continue;
@@ -314,6 +322,27 @@ pub(crate) fn build(mut raw: Raw, ctx: Ctx<'_>) -> Drawing {
             .find(|(_, h)| *h == s.handle)
         {
             s.name = n.clone();
+        }
+    }
+
+    // An insert's clipping boundary: its extension dictionary's ACAD_FILTER
+    // dictionary, whose SPATIAL entry is the filter.
+    if !ctx.insert_dictionaries.is_empty() {
+        let dictionaries: HashMap<Handle, &Dictionary> =
+            raw.dictionaries.iter().map(|d| (d.handle, d)).collect();
+        let filter_of = |xdict: u64| -> Option<InsertClip> {
+            let acad = dictionaries.get(&Handle(xdict))?.get("ACAD_FILTER")?;
+            let spatial = dictionaries.get(&acad)?.get("SPATIAL")?;
+            ctx.spatial_filters.get(&spatial.0).cloned()
+        };
+        for b in &mut blocks {
+            for e in &mut b.entities {
+                if let EntityKind::Insert(ins) = &mut e.kind
+                    && let Some(&x) = ctx.insert_dictionaries.get(&e.handle.0)
+                {
+                    ins.clip = filter_of(x);
+                }
+            }
         }
     }
 

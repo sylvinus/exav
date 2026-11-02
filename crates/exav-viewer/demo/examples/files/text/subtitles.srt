@@ -1,0 +1,23 @@
+1
+00:00:02,000 --> 00:00:03,800
+The tide is coming in.
+
+2
+00:00:04,000 --> 00:00:05,800
+Berth fourteen is free.
+
+3
+00:00:06,000 --> 00:00:07,800
+<i>A gull laughs.</i>
+
+4
+00:00:08,000 --> 00:00:09,800
+Take the line, please.
+
+5
+00:00:10,000 --> 00:00:11,800
+Engine off, thank you.
+
+6
+00:00:12,000 --> 00:00:13,800
+Welcome to the east quay.

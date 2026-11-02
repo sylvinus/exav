@@ -48,7 +48,10 @@ JBIG2 image hashes as the same pixels do in a PNG.
 
 **How exact.** Checked against the tools themselves:
 
-- ClamAV preset: equal to `sigtool --fuzzy-img` on 9,751 JPEGs, 372 TIFFs in 31
+- ClamAV preset: equal to `sigtool --fuzzy-img` on 9,751 JPEGs (measured with
+  zune-jpeg 0.5.8; with 0.5.15, which exav now uses, the hashes are the same on
+  every file tried but the baseline JPEGs with a scan for each component, which
+  0.5.8 draws flat, and the files that make it panic), 372 TIFFs in 31
   encodings, and 780 images in every mode of PNG, GIF, BMP, WebP, ICO, PNM and
   QOI; the images it cannot hash, it does not hash either.
 - imagehash preset: equal on those 780 (8-bit and 16-bit, grey, palette,
